@@ -27,39 +27,66 @@ jobs:
       - name: Install Rust toolchain
         run: rustup show active-toolchain
 
-      - name: Apply create-only journal publication repair
+      - name: Apply, verify, and publish create-only repair
+        shell: bash
         run: |
-          python3 .github/apply_journal_create_only.py
-          rm .github/apply_journal_create_only.py
-          cargo fmt --all
-          git diff --check
+          set +e
+          log=/tmp/create-only-verification.log
+          : > "$log"
 
-      - name: Run Clippy
-        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+          run_step() {
+            name="$1"
+            shift
+            {
+              echo
+              echo "===== $name ====="
+              "$@"
+            } >>"$log" 2>&1
+            return $?
+          }
 
-      - name: Run tests
-        run: cargo test --locked --all-targets --all-features
+          status=0
+          run_step "apply create-only repair" python3 .github/apply_journal_create_only.py || status=$?
+          if [ "$status" -eq 0 ]; then
+            run_step "repair in-memory stores" python3 .github/fix_create_only_clippy.py || status=$?
+          fi
+          if [ "$status" -eq 0 ]; then run_step "format" cargo fmt --all || status=$?; fi
+          if [ "$status" -eq 0 ]; then run_step "diff check" git diff --check || status=$?; fi
+          if [ "$status" -eq 0 ]; then
+            run_step "clippy" cargo clippy --locked --all-targets --all-features -- -D warnings || status=$?
+          fi
+          if [ "$status" -eq 0 ]; then
+            run_step "full tests" cargo test --locked --all-targets --all-features || status=$?
+          fi
+          if [ "$status" -eq 0 ]; then
+            run_step "json doctor" cargo run --locked --quiet -- --output json doctor || status=$?
+          fi
+          if [ "$status" -eq 0 ]; then
+            run_step "reference plan" cargo run --locked --quiet -- plan --file examples/quarry.yml || status=$?
+          fi
+          if [ "$status" -eq 0 ]; then
+            run_step "json reference plan" bash -c \
+              "cargo run --locked --quiet -- --output json plan --file examples/glossless.yml | jq -e '.schema_version == 1 and (.actions | length == 4)'" || status=$?
+          fi
+          if [ "$status" -eq 0 ]; then
+            run_step "host plan" bash -c \
+              "cargo run --locked --quiet -- --output json host plan --file examples/quarry.yml | jq -e '.schema_version == 1 and (.actions | length >= 2)'" || status=$?
+          fi
 
-      - name: Exercise machine-readable doctor output
-        run: cargo run --locked --quiet -- --output json doctor
-
-      - name: Validate reference plans
-        run: |
-          cargo run --locked --quiet -- plan --file examples/quarry.yml
-          cargo run --locked --quiet -- --output json plan --file examples/glossless.yml \
-            | jq -e '.schema_version == 1 and (.actions | length == 4)'
-
-      - name: Exercise read-only host planning
-        run: |
-          cargo run --locked --quiet -- --output json host plan --file examples/quarry.yml \
-            | jq -e '.schema_version == 1 and (.actions | length >= 2)'
-
-      - name: Publish verified branch
-        run: |
           git checkout origin/main -- .github/workflows/ci.yml
-          git diff --check
+          rm -f .github/apply_journal_create_only.py .github/fix_create_only_clippy.py
+          if [ "$status" -eq 0 ]; then
+            rm -f .github/create-only-status.txt
+            message="Prevent journal checkpoint ID collisions"
+          else
+            cp "$log" .github/create-only-status.txt
+            message="Record create-only journal verification failure"
+          fi
+
+          cat "$log"
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git add -A
-          git commit -m "Prevent journal checkpoint ID collisions"
+          git commit -m "$message"
           git push origin HEAD:codex/durable-journal-checkpoints
+          exit "$status"
