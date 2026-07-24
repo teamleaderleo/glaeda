@@ -1,4 +1,3 @@
-use std::collections::VecDeque;
 use std::fmt;
 use std::fs;
 use std::io::{self, Read as _};
@@ -15,7 +14,9 @@ use crate::runner_account_plan::{
     DesiredRunnerAccount, PlannedSubordinateRange, PreparationObservation,
     PreparationObservationState, RunnerAccountObservations, RunnerAccountPlanError,
 };
-use crate::runner_user::{PasswdRecord, SubordinateRange, parse_passwd_record, parse_subordinate_ranges};
+use crate::runner_user::{
+    PasswdRecord, SubordinateRange, parse_passwd_record, parse_subordinate_ranges,
+};
 
 const GETENT: &str = "/usr/bin/getent";
 const EXPECTED_SHELL: &str = "/usr/sbin/nologin";
@@ -144,7 +145,11 @@ fn observe_with(
     let user_lookup = lookup(executor, "passwd", desired.username());
 
     let parsed_group = parse_group_lookup(&group_lookup, desired.primary_group());
-    let group = classify_group(&group_lookup, parsed_group.as_ref(), desired.primary_group())?;
+    let group = classify_group(
+        &group_lookup,
+        parsed_group.as_ref(),
+        desired.primary_group(),
+    )?;
     let parsed_user = parse_user_lookup(&user_lookup);
     let user = classify_user(
         &user_lookup,
@@ -156,8 +161,12 @@ fn observe_with(
     let identity = if group.state() == PreparationObservationState::Matching
         && user.state() == PreparationObservationState::Matching
     {
-        let group = parsed_group.as_ref().expect("matching group has parsed record");
-        let user = parsed_user.as_ref().expect("matching user has parsed record");
+        let group = parsed_group
+            .as_ref()
+            .expect("matching group has parsed record");
+        let user = parsed_user
+            .as_ref()
+            .expect("matching user has parsed record");
         Some(ObservedRunnerIdentity {
             uid: user.uid(),
             primary_gid: user.primary_gid(),
@@ -183,7 +192,11 @@ fn observe_with(
         "GID",
     )?;
     let linger_path = paths.linger_directory.join(desired.username().as_str());
-    let linger = classify_linger(filesystem.inspect(&linger_path), identity.is_some(), &linger_path)?;
+    let linger = classify_linger(
+        filesystem.inspect(&linger_path),
+        identity.is_some(),
+        &linger_path,
+    )?;
 
     Ok(RunnerAccountObservationReport {
         observations: RunnerAccountObservations {
@@ -263,7 +276,10 @@ fn parse_group_lookup(lookup: &Lookup, desired: &LinuxAccountName) -> Option<Gro
     let Lookup::Present(input) = lookup else {
         return None;
     };
-    let lines = input.lines().filter(|line| !line.is_empty()).collect::<Vec<_>>();
+    let lines = input
+        .lines()
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
     if lines.len() != 1 {
         return None;
     }
@@ -273,7 +289,7 @@ fn parse_group_lookup(lookup: &Lookup, desired: &LinuxAccountName) -> Option<Gro
     }
     let name = LinuxAccountName::parse(fields[0]).ok()?;
     let gid = canonical_u32(fields[2])?;
-    if gid == 0 || name != *desired || !valid_group_members(fields[3]) {
+    if gid == 0 || &name != desired || !valid_group_members(fields[3]) {
         return None;
     }
     Some(GroupRecord { name, gid })
@@ -318,7 +334,10 @@ fn classify_group(
             ),
             None => (
                 PreparationObservationState::Unknown,
-                format!("getent group {} returned malformed or unsafe data", desired.as_str()),
+                format!(
+                    "getent group {} returned malformed or unsafe data",
+                    desired.as_str()
+                ),
             ),
         },
     };
@@ -334,7 +353,10 @@ fn classify_user(
     let (state, evidence) = match lookup {
         Lookup::Absent => (
             PreparationObservationState::Absent,
-            format!("getent passwd {} returned not found", desired.username().as_str()),
+            format!(
+                "getent passwd {} returned not found",
+                desired.username().as_str()
+            ),
         ),
         Lookup::Unknown => (
             PreparationObservationState::Unknown,
@@ -434,11 +456,17 @@ fn classify_subordinate(
         TrustedFile::Present(input) => match parse_subordinate_ranges(&input, username) {
             Err(_) => (
                 PreparationObservationState::Unknown,
-                format!("subordinate {label} entries for {} are malformed", username.as_str()),
+                format!(
+                    "subordinate {label} entries for {} are malformed",
+                    username.as_str()
+                ),
             ),
             Ok(ranges) if ranges.is_empty() => (
                 PreparationObservationState::Absent,
-                format!("no subordinate {label} range is assigned to {}", username.as_str()),
+                format!(
+                    "no subordinate {label} range is assigned to {}",
+                    username.as_str()
+                ),
             ),
             Ok(ranges) if user_matching && exact_single_range(&ranges, desired) => (
                 PreparationObservationState::Matching,
@@ -548,7 +576,9 @@ impl AccountFilesystem for LinuxAccountFilesystem {
     fn inspect(&self, path: &Path) -> PathObservation {
         let metadata = match fs::symlink_metadata(path) {
             Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return PathObservation::Missing,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return PathObservation::Missing;
+            }
             Err(_) => return PathObservation::Unknown,
         };
         let kind = if metadata.file_type().is_symlink() {
@@ -570,7 +600,9 @@ impl AccountFilesystem for LinuxAccountFilesystem {
     }
 
     fn read_trusted(&self, path: &Path, max_bytes: usize) -> TrustedFile {
-        let flags = OFlags::RDONLY.union(OFlags::NOFOLLOW).union(OFlags::CLOEXEC);
+        let flags = OFlags::RDONLY
+            .union(OFlags::NOFOLLOW)
+            .union(OFlags::CLOEXEC);
         let descriptor = match rustix_fs::open(path, flags, Mode::empty()) {
             Ok(descriptor) => descriptor,
             Err(Errno::NOENT) => return TrustedFile::Missing,
@@ -611,7 +643,9 @@ impl AccountFilesystem for LinuxAccountFilesystem {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, VecDeque};
+    use std::io;
+    use std::path::{Path, PathBuf};
 
     use crate::lane_command::LinuxAccountName;
     use crate::process::{CommandExecutor, CommandSpec, ExecutionRecord};
@@ -767,14 +801,26 @@ mod tests {
         let report = observe_with(&desired(), &executor, &paths(), &matching_filesystem())
             .expect("matching observation");
         let observations = &report.observations;
-        assert_eq!(observations.group.state(), PreparationObservationState::Matching);
-        assert_eq!(observations.user.state(), PreparationObservationState::Matching);
-        assert_eq!(observations.home.state(), PreparationObservationState::Matching);
+        assert_eq!(
+            observations.group.state(),
+            PreparationObservationState::Matching
+        );
+        assert_eq!(
+            observations.user.state(),
+            PreparationObservationState::Matching
+        );
+        assert_eq!(
+            observations.home.state(),
+            PreparationObservationState::Matching
+        );
         assert_eq!(
             observations.subordinate_uids.state(),
             PreparationObservationState::Matching
         );
-        assert_eq!(observations.linger.state(), PreparationObservationState::Matching);
+        assert_eq!(
+            observations.linger.state(),
+            PreparationObservationState::Matching
+        );
         assert_eq!(report.identity().expect("identity").uid(), 1001);
         assert_eq!(executor.calls.borrow().len(), 2);
     }
@@ -786,14 +832,26 @@ mod tests {
         let executor = FakeExecutor::new(vec![absent(group), absent(passwd)]);
         let report = observe_with(&desired(), &executor, &paths(), &FakeFilesystem::default())
             .expect("absent observation");
-        assert_eq!(report.observations.group.state(), PreparationObservationState::Absent);
-        assert_eq!(report.observations.user.state(), PreparationObservationState::Absent);
-        assert_eq!(report.observations.home.state(), PreparationObservationState::Absent);
+        assert_eq!(
+            report.observations.group.state(),
+            PreparationObservationState::Absent
+        );
+        assert_eq!(
+            report.observations.user.state(),
+            PreparationObservationState::Absent
+        );
+        assert_eq!(
+            report.observations.home.state(),
+            PreparationObservationState::Absent
+        );
         assert_eq!(
             report.observations.subordinate_uids.state(),
             PreparationObservationState::Unknown
         );
-        assert_eq!(report.observations.linger.state(), PreparationObservationState::Absent);
+        assert_eq!(
+            report.observations.linger.state(),
+            PreparationObservationState::Absent
+        );
     }
 
     #[test]
@@ -805,7 +863,10 @@ mod tests {
         let executor = FakeExecutor::new(vec![bad_group, absent(passwd)]);
         let report = observe_with(&desired(), &executor, &paths(), &FakeFilesystem::default())
             .expect("unknown observation");
-        assert_eq!(report.observations.group.state(), PreparationObservationState::Unknown);
+        assert_eq!(
+            report.observations.group.state(),
+            PreparationObservationState::Unknown
+        );
         assert!(report.identity().is_none());
     }
 
@@ -856,13 +917,22 @@ mod tests {
         };
         let report = observe_with(&desired(), &executor, &paths(), &filesystem)
             .expect("conflicting observation");
-        assert_eq!(report.observations.user.state(), PreparationObservationState::Conflicting);
-        assert_eq!(report.observations.home.state(), PreparationObservationState::Conflicting);
+        assert_eq!(
+            report.observations.user.state(),
+            PreparationObservationState::Conflicting
+        );
+        assert_eq!(
+            report.observations.home.state(),
+            PreparationObservationState::Conflicting
+        );
         assert_eq!(
             report.observations.subordinate_uids.state(),
             PreparationObservationState::Conflicting
         );
-        assert_eq!(report.observations.linger.state(), PreparationObservationState::Conflicting);
+        assert_eq!(
+            report.observations.linger.state(),
+            PreparationObservationState::Conflicting
+        );
     }
 
     #[test]
