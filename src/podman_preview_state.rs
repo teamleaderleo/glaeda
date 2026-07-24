@@ -8,34 +8,164 @@ use crate::podman_preview_execution::{
 };
 use crate::podman_preview_inspect::{AuthorizedPreviewPodmanCommand, PreviewContainerStatus};
 
-/// Authorize one existing-container mutation only when ownership and observed Podman state match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreviewMutationDisposition {
+    Execute,
+    AlreadySatisfied,
+    Blocked,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PreviewMutationPlan {
+    operation: PreviewPodmanOperation,
+    disposition: PreviewMutationDisposition,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observed_state: Option<String>,
+    reason: String,
+}
+
+impl PreviewMutationPlan {
+    #[must_use]
+    pub const fn operation(&self) -> PreviewPodmanOperation {
+        self.operation
+    }
+
+    #[must_use]
+    pub const fn disposition(&self) -> PreviewMutationDisposition {
+        self.disposition
+    }
+
+    #[must_use]
+    pub fn observed_state(&self) -> Option<&str> {
+        self.observed_state.as_deref()
+    }
+
+    #[must_use]
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
+/// Plan one existing-container operation from the latest observed Podman state.
 ///
-/// Start is accepted for inactive startable states. Stop is accepted only for a running container.
-/// Unforced remove is accepted only for inactive removable states. Missing, paused, transitional,
-/// dead, and unknown states fail closed.
+/// Already satisfied states produce an explicit no-op. Transitional, paused, dead, missing, and
+/// unknown states block execution. The function performs no ownership classification or mutation.
+#[must_use]
+pub fn plan_existing_preview_operation(
+    operation: PreviewPodmanOperation,
+    status: Option<&PreviewContainerStatus>,
+) -> PreviewMutationPlan {
+    let observed_state = status.map(status_name).map(ToOwned::to_owned);
+    let (disposition, reason) = match (operation, status) {
+        (
+            PreviewPodmanOperation::Start,
+            Some(
+                PreviewContainerStatus::Configured
+                | PreviewContainerStatus::Created
+                | PreviewContainerStatus::Initialized
+                | PreviewContainerStatus::Stopped
+                | PreviewContainerStatus::Exited,
+            ),
+        ) => (
+            PreviewMutationDisposition::Execute,
+            "the inactive container may be started",
+        ),
+        (PreviewPodmanOperation::Start, Some(PreviewContainerStatus::Running)) => (
+            PreviewMutationDisposition::AlreadySatisfied,
+            "the container is already running",
+        ),
+        (PreviewPodmanOperation::Stop, Some(PreviewContainerStatus::Running)) => (
+            PreviewMutationDisposition::Execute,
+            "the running container may be stopped",
+        ),
+        (
+            PreviewPodmanOperation::Stop,
+            Some(
+                PreviewContainerStatus::Configured
+                | PreviewContainerStatus::Created
+                | PreviewContainerStatus::Initialized
+                | PreviewContainerStatus::Stopped
+                | PreviewContainerStatus::Exited,
+            ),
+        ) => (
+            PreviewMutationDisposition::AlreadySatisfied,
+            "the container is already inactive",
+        ),
+        (
+            PreviewPodmanOperation::Remove,
+            Some(
+                PreviewContainerStatus::Configured
+                | PreviewContainerStatus::Created
+                | PreviewContainerStatus::Initialized
+                | PreviewContainerStatus::Stopped
+                | PreviewContainerStatus::Exited,
+            ),
+        ) => (
+            PreviewMutationDisposition::Execute,
+            "the inactive container may be removed without force",
+        ),
+        (PreviewPodmanOperation::Create | PreviewPodmanOperation::Inspect, _) => (
+            PreviewMutationDisposition::Blocked,
+            "create and inspect do not use existing-container mutation planning",
+        ),
+        (_, None) => (
+            PreviewMutationDisposition::Blocked,
+            "Podman did not report a container state",
+        ),
+        (_, Some(PreviewContainerStatus::Paused)) => (
+            PreviewMutationDisposition::Blocked,
+            "paused containers require an explicit pause policy",
+        ),
+        (_, Some(PreviewContainerStatus::Removing | PreviewContainerStatus::Stopping)) => (
+            PreviewMutationDisposition::Blocked,
+            "the container is in a transitional state",
+        ),
+        (_, Some(PreviewContainerStatus::Dead)) => (
+            PreviewMutationDisposition::Blocked,
+            "dead containers require an explicit force-removal policy",
+        ),
+        (_, Some(PreviewContainerStatus::Other(_))) => (
+            PreviewMutationDisposition::Blocked,
+            "the observed Podman state is not recognized by this policy",
+        ),
+        (PreviewPodmanOperation::Remove, Some(PreviewContainerStatus::Running)) => (
+            PreviewMutationDisposition::Blocked,
+            "the unforced remove command cannot remove a running container",
+        ),
+    };
+
+    PreviewMutationPlan {
+        operation,
+        disposition,
+        observed_state,
+        reason: reason.to_owned(),
+    }
+}
+
+/// Authorize one existing-container mutation only when state, receipt, and ownership evidence match.
+///
+/// Callers may use [`plan_existing_preview_operation`] first to distinguish executable work from an
+/// already satisfied state. This authorization function accepts only executable plans.
 ///
 /// # Errors
 ///
-/// Returns an error when the receipt lacks a known state, the operation is invalid for that state,
-/// or the receipt does not prove exact ownership of the planned preview generation.
+/// Returns an error when the operation is already satisfied or blocked for the observed state, or
+/// when the receipt does not prove exact ownership of the planned preview generation.
 pub fn authorize_existing_preview_command(
     spec: &PreviewContainerSpec,
     command: &PreviewPodmanCommand,
     receipt: &PreviewInspectExecutionReceipt,
 ) -> Result<AuthorizedPreviewPodmanCommand, PreviewMutationAuthorizationError> {
-    let status = receipt.observation().status().ok_or_else(|| {
-        PreviewMutationAuthorizationError::new(
-            "state",
-            "Podman did not report a container status for mutation authorization",
-        )
-    })?;
-    if !operation_allows_status(command.operation(), status) {
+    let plan = plan_existing_preview_operation(command.operation(), receipt.observation().status());
+    if plan.disposition != PreviewMutationDisposition::Execute {
         return Err(PreviewMutationAuthorizationError::new(
             "state",
             format!(
-                "operation {} is not permitted for observed Podman state {}",
+                "operation {} has disposition {}: {}",
                 operation_name(command.operation()),
-                status_name(status)
+                disposition_name(plan.disposition),
+                plan.reason
             ),
         ));
     }
@@ -67,32 +197,6 @@ impl fmt::Display for PreviewMutationAuthorizationError {
 
 impl std::error::Error for PreviewMutationAuthorizationError {}
 
-const fn operation_allows_status(
-    operation: PreviewPodmanOperation,
-    status: &PreviewContainerStatus,
-) -> bool {
-    match operation {
-        PreviewPodmanOperation::Start => matches!(
-            status,
-            PreviewContainerStatus::Configured
-                | PreviewContainerStatus::Created
-                | PreviewContainerStatus::Initialized
-                | PreviewContainerStatus::Stopped
-                | PreviewContainerStatus::Exited
-        ),
-        PreviewPodmanOperation::Stop => matches!(status, PreviewContainerStatus::Running),
-        PreviewPodmanOperation::Remove => matches!(
-            status,
-            PreviewContainerStatus::Configured
-                | PreviewContainerStatus::Created
-                | PreviewContainerStatus::Initialized
-                | PreviewContainerStatus::Stopped
-                | PreviewContainerStatus::Exited
-        ),
-        PreviewPodmanOperation::Create | PreviewPodmanOperation::Inspect => false,
-    }
-}
-
 const fn operation_name(operation: PreviewPodmanOperation) -> &'static str {
     match operation {
         PreviewPodmanOperation::Create => "create",
@@ -100,6 +204,14 @@ const fn operation_name(operation: PreviewPodmanOperation) -> &'static str {
         PreviewPodmanOperation::Inspect => "inspect",
         PreviewPodmanOperation::Stop => "stop",
         PreviewPodmanOperation::Remove => "remove",
+    }
+}
+
+const fn disposition_name(disposition: PreviewMutationDisposition) -> &'static str {
+    match disposition {
+        PreviewMutationDisposition::Execute => "execute",
+        PreviewMutationDisposition::AlreadySatisfied => "already_satisfied",
+        PreviewMutationDisposition::Blocked => "blocked",
     }
 }
 
@@ -138,7 +250,10 @@ mod tests {
     use crate::process::ExecutionRecord;
     use crate::state::InstallationId;
 
-    use super::{authorize_existing_preview_command, operation_allows_status};
+    use super::{
+        PreviewMutationDisposition, authorize_existing_preview_command,
+        plan_existing_preview_operation,
+    };
 
     fn container_spec() -> PreviewContainerSpec {
         let artifact = ArtifactIdentity::new(
@@ -212,7 +327,7 @@ mod tests {
     }
 
     #[test]
-    fn operation_state_matrix_is_conservative() {
+    fn planner_distinguishes_execute_noop_and_blocked_states() {
         for status in [
             PreviewContainerStatus::Configured,
             PreviewContainerStatus::Created,
@@ -220,31 +335,48 @@ mod tests {
             PreviewContainerStatus::Stopped,
             PreviewContainerStatus::Exited,
         ] {
-            assert!(operation_allows_status(
-                PreviewPodmanOperation::Start,
-                &status
-            ));
-            assert!(operation_allows_status(
-                PreviewPodmanOperation::Remove,
-                &status
-            ));
-            assert!(!operation_allows_status(
-                PreviewPodmanOperation::Stop,
-                &status
-            ));
+            assert_eq!(
+                plan_existing_preview_operation(PreviewPodmanOperation::Start, Some(&status))
+                    .disposition(),
+                PreviewMutationDisposition::Execute
+            );
+            assert_eq!(
+                plan_existing_preview_operation(PreviewPodmanOperation::Stop, Some(&status))
+                    .disposition(),
+                PreviewMutationDisposition::AlreadySatisfied
+            );
+            assert_eq!(
+                plan_existing_preview_operation(PreviewPodmanOperation::Remove, Some(&status))
+                    .disposition(),
+                PreviewMutationDisposition::Execute
+            );
         }
-        assert!(operation_allows_status(
-            PreviewPodmanOperation::Stop,
-            &PreviewContainerStatus::Running
-        ));
-        assert!(!operation_allows_status(
-            PreviewPodmanOperation::Start,
-            &PreviewContainerStatus::Running
-        ));
-        assert!(!operation_allows_status(
-            PreviewPodmanOperation::Remove,
-            &PreviewContainerStatus::Running
-        ));
+
+        assert_eq!(
+            plan_existing_preview_operation(
+                PreviewPodmanOperation::Start,
+                Some(&PreviewContainerStatus::Running),
+            )
+            .disposition(),
+            PreviewMutationDisposition::AlreadySatisfied
+        );
+        assert_eq!(
+            plan_existing_preview_operation(
+                PreviewPodmanOperation::Stop,
+                Some(&PreviewContainerStatus::Running),
+            )
+            .disposition(),
+            PreviewMutationDisposition::Execute
+        );
+        assert_eq!(
+            plan_existing_preview_operation(
+                PreviewPodmanOperation::Remove,
+                Some(&PreviewContainerStatus::Running),
+            )
+            .disposition(),
+            PreviewMutationDisposition::Blocked
+        );
+
         for status in [
             PreviewContainerStatus::Paused,
             PreviewContainerStatus::Removing,
@@ -252,19 +384,21 @@ mod tests {
             PreviewContainerStatus::Dead,
             PreviewContainerStatus::Other("unknown".to_owned()),
         ] {
-            assert!(!operation_allows_status(
+            for operation in [
                 PreviewPodmanOperation::Start,
-                &status
-            ));
-            assert!(!operation_allows_status(
                 PreviewPodmanOperation::Stop,
-                &status
-            ));
-            assert!(!operation_allows_status(
                 PreviewPodmanOperation::Remove,
-                &status
-            ));
+            ] {
+                assert_eq!(
+                    plan_existing_preview_operation(operation, Some(&status)).disposition(),
+                    PreviewMutationDisposition::Blocked
+                );
+            }
         }
+        assert_eq!(
+            plan_existing_preview_operation(PreviewPodmanOperation::Start, None).disposition(),
+            PreviewMutationDisposition::Blocked
+        );
     }
 
     #[test]
@@ -283,21 +417,24 @@ mod tests {
     }
 
     #[test]
-    fn nonsensical_or_missing_states_fail_before_ownership_authorization() {
+    fn already_satisfied_and_blocked_states_do_not_authorize_subprocesses() {
         let spec = container_spec();
         let plan = PreviewPodmanPlan::for_container(&spec, &runner());
 
         let running = receipt(&spec, &plan, Some("running"));
         let error = authorize_existing_preview_command(&spec, &plan.provision()[1], &running)
-            .expect_err("running container must not start");
+            .expect_err("running container must produce a start no-op");
         assert_eq!(error.field, "state");
+        assert!(error.problem.contains("already_satisfied"));
+
+        let stopped = receipt(&spec, &plan, Some("stopped"));
+        let error = authorize_existing_preview_command(&spec, &plan.cleanup()[0], &stopped)
+            .expect_err("stopped container must produce a stop no-op");
+        assert!(error.problem.contains("already_satisfied"));
 
         let paused = receipt(&spec, &plan, Some("paused"));
         assert!(authorize_existing_preview_command(&spec, &plan.cleanup()[0], &paused).is_err());
         assert!(authorize_existing_preview_command(&spec, &plan.cleanup()[1], &paused).is_err());
-
-        let stopped = receipt(&spec, &plan, Some("stopped"));
-        assert!(authorize_existing_preview_command(&spec, &plan.cleanup()[0], &stopped).is_err());
 
         let missing = receipt(&spec, &plan, None);
         assert!(authorize_existing_preview_command(&spec, &plan.cleanup()[1], &missing).is_err());
