@@ -109,6 +109,8 @@ Preview-slot planning now coalesces repeated requests for the same artifact, por
 
 The local Podman command-planning slice binds an OCI artifact to bounded runtime limits, loopback-only publication, fixed ownership labels, and reviewed shell-free create/start/inspect/stop/remove vectors. It remains inert until a later executor proves ownership and authorizes each mutation. See [ADR 0007](docs/adr/0007-rootless-podman-preview-command-planning.md).
 
+Podman inspection now decodes one bounded JSON result, classifies exact container ownership, and authorizes existing-container mutations only when the name, image digest, and every required label match the planned preview generation. Authorized commands target the observed full container ID. See [ADR 0008](docs/adr/0008-podman-preview-inspection-authorization.md).
+
 See [leased execution and previews](docs/LEASED_EXECUTION.md) and the updated [roadmap](docs/ROADMAP.md).
 
 ## Intended workflow
@@ -164,6 +166,7 @@ cargo run --locked --quiet -- --output json host plan --file examples/quarry.yml
 - [ADR 0005: atomic lease stores and artifact identity](docs/adr/0005-lease-store-and-artifact-identity.md)
 - [ADR 0006: preview slot coalescing](docs/adr/0006-preview-slot-coalescing.md)
 - [ADR 0007: rootless Podman preview command planning](docs/adr/0007-rootless-podman-preview-command-planning.md)
+- [ADR 0008: Podman preview inspection and mutation authorization](docs/adr/0008-podman-preview-inspection-authorization.md)
 - [Roadmap](docs/ROADMAP.md)
 - [Agent instructions](AGENTS.md)
 
