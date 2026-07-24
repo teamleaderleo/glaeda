@@ -14,19 +14,19 @@ SmolRunner needs a deterministic decision before any container, route, or provid
 
 A preview request names one explicit slot and one immutable artifact identity. It also declares:
 
-- a nonzero container port;
-- a bounded lease lifetime between one minute and seven days;
-- an optional bounded path-only health endpoint.
+- a validated nonzero container port;
+- a typed lease lifetime bounded between one minute and seven days;
+- an optional bounded path-only health endpoint with validated percent escapes.
 
 The planner compares the request with current state for the same slot and produces one of three actions:
 
 - `create`: no current preview exists; generation 1 begins;
 - `reuse_and_renew`: artifact, port, and health path match; the current generation remains and its lease may be renewed;
-- `replace`: runtime inputs changed; the generation advances exactly once and the old artifact is retained in the plan for cleanup and audit.
+- `replace`: runtime inputs changed; the checked generation advances exactly once and the old artifact is retained in the plan for cleanup and audit.
 
 A changed TTL alone renews the existing preview. It never creates another runtime generation.
 
-Current state from another slot fails closed. Generation overflow fails closed. The planner performs no mutation.
+Current state from another slot fails closed. Generation zero and generation overflow fail closed. Plan fields remain private so callers cannot construct an action, generation, and artifact combination that the planner did not produce. The planner performs no mutation.
 
 ## Consequences
 
