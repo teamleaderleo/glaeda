@@ -482,7 +482,7 @@ fn valid_subordinate_range(value: &str) -> bool {
     let Some(end) = canonical_u32(end) else {
         return false;
     };
-    start > 0 && start <= end
+    start > 0 && start <= end && u64::from(end) - u64::from(start) + 1 >= MIN_SUBORDINATE_ID_COUNT
 }
 
 fn canonical_u32(value: &str) -> Option<u32> {

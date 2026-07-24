@@ -11,6 +11,7 @@ const GROUPADD: &str = "/usr/sbin/groupadd";
 const USERADD: &str = "/usr/sbin/useradd";
 const USERMOD: &str = "/usr/sbin/usermod";
 const INSTALL: &str = "/usr/bin/install";
+const MIN_SUBORDINATE_ID_COUNT: u64 = 65_536;
 const LOGINCTL: &str = "/usr/bin/loginctl";
 const RUNUSER: &str = "/usr/sbin/runuser";
 const ENV: &str = "/usr/bin/env";
@@ -443,9 +444,9 @@ impl fmt::Display for LaneCommandError {
 impl std::error::Error for LaneCommandError {}
 
 fn subordinate_range_argument(start: u32, count: u32) -> Result<String, LaneCommandError> {
-    if start == 0 || count == 0 {
+    if start == 0 || u64::from(count) < MIN_SUBORDINATE_ID_COUNT {
         return Err(LaneCommandError::single(
-            "subordinate-ID range must begin above zero and contain at least one ID",
+            "subordinate-ID range must begin above zero and contain at least 65536 IDs",
         ));
     }
     let end = u64::from(start) + u64::from(count) - 1;
@@ -749,5 +750,12 @@ mod tests {
             2,
         )
         .expect_err("overflowing subordinate range must fail");
+        LaneCommand::ensure_subordinate_uids(
+            &action(ExecutionLane::Root),
+            &account("project-runner"),
+            100_000,
+            1,
+        )
+        .expect_err("undersized subordinate range must fail");
     }
 }

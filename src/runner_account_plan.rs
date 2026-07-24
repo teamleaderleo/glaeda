@@ -836,6 +836,14 @@ mod tests {
         )
         .expect_err("aliased home");
         PlannedSubordinateRange::new(100_000, 1).expect_err("undersized range");
+        DesiredRunnerAccount::new(
+            account("project-runner"),
+            account("project-runner"),
+            &format!("/{}", "a".repeat(4_000)),
+            PlannedSubordinateRange::new(100_000, 65_536).expect("subuid range"),
+            PlannedSubordinateRange::new(200_000, 65_536).expect("subgid range"),
+        )
+        .expect_err("oversized public home path");
         PreparationObservation::new(PreparationObservationState::Absent, Vec::<String>::new())
             .expect_err("missing evidence");
     }
