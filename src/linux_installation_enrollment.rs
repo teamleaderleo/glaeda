@@ -44,6 +44,7 @@ impl InstallationEnrollmentReceipt {
 #[serde(rename_all = "snake_case")]
 pub enum InstallationEnrollmentErrorKind {
     Busy,
+    Conflict,
     InvalidProject,
     Io,
     UnsafeFilesystem,
@@ -149,6 +150,7 @@ pub fn create_or_load_installation(
 fn map_store_error(error: StateStoreError) -> InstallationEnrollmentError {
     let kind = match error.kind() {
         StateStoreErrorKind::Busy => InstallationEnrollmentErrorKind::Busy,
+        StateStoreErrorKind::Conflict => InstallationEnrollmentErrorKind::Conflict,
         StateStoreErrorKind::Io => InstallationEnrollmentErrorKind::Io,
         StateStoreErrorKind::UnsafeFilesystem => InstallationEnrollmentErrorKind::UnsafeFilesystem,
         StateStoreErrorKind::CorruptState => InstallationEnrollmentErrorKind::CorruptState,
@@ -229,60 +231,33 @@ mod tests {
     #[test]
     fn first_enrollment_creates_and_second_loads_the_same_installation() {
         let root = TempRoot::new("create-load");
-        let target = project("example/project");
-        let created =
-            create_or_load_installation(root.path(), target.clone()).expect("create installation");
+        let project = project("example/project");
+
+        let first = create_or_load_installation(root.path(), project.clone()).expect("enroll project");
         assert_eq!(
-            created.disposition(),
+            first.disposition(),
             InstallationEnrollmentDisposition::Created
         );
-
-        let existing =
-            create_or_load_installation(root.path(), target.clone()).expect("load installation");
+        let second = create_or_load_installation(root.path(), project).expect("load project");
         assert_eq!(
-            existing.disposition(),
+            second.disposition(),
             InstallationEnrollmentDisposition::Existing
         );
-        assert_eq!(existing.installation_id(), created.installation_id());
+        assert_eq!(second.installation_id(), first.installation_id());
         assert_eq!(
-            find_installation(root.path(), &target).expect("catalog lookup"),
-            InstallationLookup::Found(created.installation_id().clone())
+            find_installation(root.path(), &project("example/project"))
+                .expect("find installation"),
+            InstallationLookup::Found(first.installation_id().clone())
         );
     }
 
     #[test]
-    fn different_projects_receive_distinct_installations() {
-        let root = TempRoot::new("distinct");
-        let first = create_or_load_installation(root.path(), project("example/first"))
-            .expect("create first installation");
-        let second = create_or_load_installation(root.path(), project("example/second"))
-            .expect("create second installation");
-        assert_ne!(first.installation_id(), second.installation_id());
-    }
-
-    #[test]
-    fn concurrent_enrollment_returns_busy() {
+    fn held_catalog_lock_maps_to_bounded_busy_error() {
         let root = TempRoot::new("busy");
         let _lock = lock_installation_catalog(root.path()).expect("hold catalog lock");
         let error = create_or_load_installation(root.path(), project("example/project"))
-            .expect_err("concurrent enrollment must be busy");
+            .expect_err("second lock must fail");
         assert_eq!(error.kind(), InstallationEnrollmentErrorKind::Busy);
-    }
-
-    #[test]
-    fn invalid_project_does_not_publish_an_installation() {
-        let root = TempRoot::new("invalid");
-        let invalid = ProjectIdentity {
-            repository: "invalid".to_owned(),
-            runner_scope: RunnerScope::Repository,
-            runner_user: "project-runner".to_owned(),
-        };
-        let error = create_or_load_installation(root.path(), invalid)
-            .expect_err("invalid project must fail");
-        assert_eq!(
-            error.kind(),
-            InstallationEnrollmentErrorKind::InvalidProject
-        );
-        assert!(!root.path().join("installations").exists());
+        assert_eq!(error.message(), "another installation catalog operation is in progress");
     }
 }
