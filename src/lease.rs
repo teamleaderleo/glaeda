@@ -208,9 +208,8 @@ impl LeaseRecord {
         &self,
         action: LeaseAction,
     ) -> Result<LeaseTransition, LeaseTransitionError> {
-        let to = next_state(self.identity.kind, self.state, action).map_err(|problem| {
-            LeaseTransitionError::new(self, action, problem)
-        })?;
+        let to = next_state(self.identity.kind, self.state, action)
+            .map_err(|problem| LeaseTransitionError::new(self, action, problem))?;
         let next_revision = self.revision.checked_add(1).ok_or_else(|| {
             LeaseTransitionError::new(self, action, "revision counter is exhausted")
         })?;
@@ -275,7 +274,7 @@ impl fmt::Display for LeaseTransitionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "{} lease {} cannot {} while {}: {}",
+            "{} lease {} cannot apply {} while {}: {}",
             self.kind,
             self.lease_id.as_str(),
             self.action,
@@ -319,9 +318,7 @@ fn next_state(
 mod tests {
     use crate::state::InstallationId;
 
-    use super::{
-        LeaseAction, LeaseId, LeaseIdentity, LeaseKind, LeaseRecord, LeaseState,
-    };
+    use super::{LeaseAction, LeaseId, LeaseIdentity, LeaseKind, LeaseRecord, LeaseState};
 
     fn identity(kind: LeaseKind) -> LeaseIdentity {
         LeaseIdentity::new(
