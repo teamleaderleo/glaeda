@@ -1,0 +1,118 @@
+name: State ownership review fix
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out exact feature branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: feature/state-owner-mode-enforcement
+          fetch-depth: 1
+
+      - name: Revalidate root and test owner mismatches
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/linux_state.rs")
+          text = path.read_text(encoding="utf-8")
+
+          old = '''    pub fn read(&self, path: &StatePath) -> Result<StateRead, StateStoreError> {
+              let Some((file_name, parents)) = path.components().split_last() else {
+          '''
+          new = '''    pub fn read(&self, path: &StatePath) -> Result<StateRead, StateStoreError> {
+              verify_managed_directory(&self.root, "state root", Some(self.owner))?;
+              let Some((file_name, parents)) = path.components().split_last() else {
+          '''
+          if text.count(old) != 1:
+              raise SystemExit("unexpected read entry")
+          text = text.replace(old, new, 1)
+
+          old = '''    ) -> Result<StateWriteReceipt, StateStoreError> {
+              let _lock = self.acquire_installation_lock(record.path())?;
+          '''
+          new = '''    ) -> Result<StateWriteReceipt, StateStoreError> {
+              verify_managed_directory(&self.root, "state root", Some(self.owner))?;
+              let _lock = self.acquire_installation_lock(record.path())?;
+          '''
+          if text.count(old) != 1:
+              raise SystemExit("unexpected write entry")
+          text = text.replace(old, new, 1)
+
+          old = '''    use rustix::fs::{self as rustix_fs, FlockOperation};
+          '''
+          new = '''    use rustix::fs::{self as rustix_fs, FlockOperation, Mode};
+          '''
+          if text.count(old) != 1:
+              raise SystemExit("unexpected rustix test import")
+          text = text.replace(old, new, 1)
+
+          old = '''    use super::{LOCK_FILE_NAME, LinuxStateRoot, TEMP_FILE_PREFIX, WriteFaultInjector, WritePhase};
+          '''
+          new = '''    use super::{
+              FILE_FLAGS, LOCK_FILE_NAME, LinuxStateRoot, TEMP_FILE_PREFIX, WriteFaultInjector,
+              WritePhase, verify_managed_directory, verify_managed_file,
+          };
+          '''
+          if text.count(old) != 1:
+              raise SystemExit("unexpected parent test import")
+          text = text.replace(old, new, 1)
+
+          marker = "    #[test]\n    fn symlinked_root_is_rejected() {\n"
+          test = '''    #[test]
+          fn unexpected_directory_or_file_owner_is_rejected() {
+              let root = TempTree::new("owner-mismatch");
+              let parent = create_project_parent(root.path());
+              let project_path = parent.join("project.json");
+              fs::write(&project_path, b"state").expect("write state file");
+              fs::set_permissions(&project_path, fs::Permissions::from_mode(0o600))
+                  .expect("set state-file mode");
+
+              let reader = LinuxStateRoot::open(root.path()).expect("open state root");
+              let wrong_owner = (reader.owner.0.wrapping_add(1), reader.owner.1);
+              let error = verify_managed_directory(
+                  &reader.root,
+                  "state root",
+                  Some(wrong_owner),
+              )
+              .expect_err("unexpected directory owner must fail");
+              assert_eq!(error.kind(), StateStoreErrorKind::UnsafeFilesystem);
+
+              let file = rustix_fs::open(&project_path, FILE_FLAGS, Mode::empty())
+                  .expect("open state file");
+              let error = verify_managed_file(&file, "state file", wrong_owner, true)
+                  .expect_err("unexpected file owner must fail");
+              assert_eq!(error.kind(), StateStoreErrorKind::UnsafeFilesystem);
+          }
+
+          '''
+          if text.count(marker) != 1:
+              raise SystemExit("expected symlinked-root test marker")
+          text = text.replace(marker, test + marker, 1)
+          path.write_text(text, encoding="utf-8")
+          PY
+          rustfmt --edition 2024 src/linux_state.rs
+          test "$(git diff --name-only)" = "src/linux_state.rs"
+          git diff --check
+
+      - name: Commit bounded review correction
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/linux_state.rs
+          git commit -m 'Harden state ownership revalidation'
+          git push origin HEAD:feature/state-owner-mode-enforcement
