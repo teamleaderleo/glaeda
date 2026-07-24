@@ -23,6 +23,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
+          # One reviewed Python transformation, one Rust source file, no project execution.
           test -f tools/replace_atomic_fault_hook.py
           test ! -L tools/replace_atomic_fault_hook.py
           test -z "$(git status --porcelain)"
