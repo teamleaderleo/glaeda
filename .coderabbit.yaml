@@ -1,0 +1,62 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+language: "en-US"
+early_access: false
+
+reviews:
+  profile: "assertive"
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  review_status: true
+  review_details: false
+
+  auto_review:
+    enabled: true
+    auto_incremental_review: true
+    auto_pause_after_reviewed_commits: 10
+    drafts: false
+    labels:
+      - "!review-exempt"
+    ignore_title_keywords:
+      - "[skip review]"
+
+  path_instructions:
+    - path: "src/lane_*.rs"
+      instructions: |
+        Apply the privilege and execution rules in AGENTS.md strictly.
+        - Require exact typed lanes, absolute executables, reviewed argument vectors, bounded evidence, and empty-to-allowlisted environments.
+        - Flag ambient credential inheritance, implicit shells, authority inferred from names, and execution that proceeds after uncertain evidence.
+        - Preserve complete bounded execution records and redaction as defense in depth.
+
+    - path: "src/linux_*.rs"
+      instructions: |
+        Review Linux state and ownership code as a host-safety boundary.
+        - Require symlink defense, private permissions, installation identity, canonical paths, durable locking, atomic publication, and crash-safe recovery.
+        - Distinguish absent, present, foreign, conflicting, adoptable, and unknown states exactly.
+        - Reject mutation authority derived from mutable names, labels, tags, basenames, or partial observations.
+
+    - path: "src/*journal*.rs"
+      instructions: |
+        Check every uncertain execution and rollback boundary for durable before-and-after checkpoints.
+        Require create-only first publication, revision guards, strict decoding, collision preservation, and explicit interrupted states.
+        Verify reverse-order rollback and compensation reporting without claiming restoration when restoration is unproven.
+
+    - path: "src/*state*.rs"
+      instructions: |
+        Preserve fail-closed state transitions, version validation, ownership evidence, and atomic persistence.
+        Flag speculative mutation, stale revision acceptance, silent migration, lossy recovery, and any write before all preconditions are proven.
+
+    - path: "src/podman_preview*.rs"
+      instructions: |
+        Treat container inspection and mutation as separate authority steps.
+        - Bind evidence to the exact reviewed command and successful execution record.
+        - Require exact container identity, immutable image evidence, ownership labels, compatible observed state, bounded resources, and loopback-only publication.
+        - Keep planning inert unless an explicitly authorized executor receives complete evidence.
+
+    - path: "**/*.rs"
+      instructions: |
+        Enforce AGENTS.md and the accepted ADRs.
+        Check that human and JSON output derive from the same typed reports, unsafe Rust remains absent, dependencies carry concrete justification, and tests cover failure and race paths without requiring privileged host services by default.
+
+chat:
+  auto_reply: true
