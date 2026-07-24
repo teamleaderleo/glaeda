@@ -101,6 +101,8 @@ The runner-steward work remains SmolRunner's foundation. A later optional layer 
 
 The proposed policy keeps frequent verification separate from live deployment: GitHub Actions may verify each eligible push, while a preview starts only after an explicit request or repository policy grants a bounded lease. The local rootless Podman path comes first; worker selection and external deployment targets come later only when useful.
 
+The first implementation slice is a platform-independent, revisioned lease lifecycle for runs, retained workspaces, and previews. It plans legal state transitions without persistence or host mutation. See [ADR 0004](docs/adr/0004-lease-lifecycle-core.md).
+
 See [leased execution and previews](docs/LEASED_EXECUTION.md) and the updated [roadmap](docs/ROADMAP.md).
 
 ## Intended workflow
@@ -152,6 +154,7 @@ cargo run --locked --quiet -- --output json host plan --file examples/quarry.yml
 - [ADR 0001: privilege, adoption, and rollback](docs/adr/0001-privilege-adoption-and-rollback.md)
 - [ADR 0002: durable ownership and state identity](docs/adr/0002-durable-ownership-state.md)
 - [ADR 0003: canonical resource evidence](docs/adr/0003-canonical-resource-evidence.md)
+- [ADR 0004: lease lifecycle core](docs/adr/0004-lease-lifecycle-core.md)
 - [Roadmap](docs/ROADMAP.md)
 - [Agent instructions](AGENTS.md)
 
