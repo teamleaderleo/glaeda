@@ -98,6 +98,7 @@ impl LinuxStateRoot {
     /// Returns `UnsafeFilesystem` for symlinks, non-directory parents, or non-regular final files;
     /// `CorruptState` for oversized files; and `Io` for other bounded read failures.
     pub fn read(&self, path: &StatePath) -> Result<StateRead, StateStoreError> {
+        verify_managed_directory(&self.root, "state root", Some(self.owner))?;
         let Some((file_name, parents)) = path.components().split_last() else {
             return Err(empty_state_path_error());
         };
@@ -150,6 +151,7 @@ impl LinuxStateRoot {
         record: &StateRecord,
         faults: &mut dyn WriteFaultInjector,
     ) -> Result<StateWriteReceipt, StateStoreError> {
+        verify_managed_directory(&self.root, "state root", Some(self.owner))?;
         let _lock = self.acquire_installation_lock(record.path())?;
         let (parent, file_name) = self.open_required_parent(record.path())?;
         let disposition = inspect_destination(&parent, file_name, self.owner)?;
@@ -593,7 +595,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use rustix::fs::{self as rustix_fs, FlockOperation};
+    use rustix::fs::{self as rustix_fs, FlockOperation, Mode};
 
     use crate::manifest::RunnerScope;
     use crate::ownership::ProjectIdentity;
@@ -604,7 +606,10 @@ mod tests {
         StateWriteDisposition,
     };
 
-    use super::{LOCK_FILE_NAME, LinuxStateRoot, TEMP_FILE_PREFIX, WriteFaultInjector, WritePhase};
+    use super::{
+        FILE_FLAGS, LOCK_FILE_NAME, LinuxStateRoot, TEMP_FILE_PREFIX, WriteFaultInjector,
+        WritePhase, verify_managed_directory, verify_managed_file,
+    };
 
     static NEXT_TEMP_ROOT: AtomicU64 = AtomicU64::new(1);
 
@@ -813,6 +818,28 @@ mod tests {
         let error = reader
             .read(&StateLayout::project_document(&installation_id()))
             .expect_err("hard-linked state must fail");
+        assert_eq!(error.kind(), StateStoreErrorKind::UnsafeFilesystem);
+    }
+
+    #[test]
+    fn unexpected_directory_or_file_owner_is_rejected() {
+        let root = TempTree::new("owner-mismatch");
+        let parent = create_project_parent(root.path());
+        let project_path = parent.join("project.json");
+        fs::write(&project_path, b"state").expect("write state file");
+        fs::set_permissions(&project_path, fs::Permissions::from_mode(0o600))
+            .expect("set state-file mode");
+
+        let reader = LinuxStateRoot::open(root.path()).expect("open state root");
+        let wrong_owner = (reader.owner.0.wrapping_add(1), reader.owner.1);
+        let error = verify_managed_directory(&reader.root, "state root", Some(wrong_owner))
+            .expect_err("unexpected directory owner must fail");
+        assert_eq!(error.kind(), StateStoreErrorKind::UnsafeFilesystem);
+
+        let file =
+            rustix_fs::open(&project_path, FILE_FLAGS, Mode::empty()).expect("open state file");
+        let error = verify_managed_file(&file, "state file", wrong_owner, true)
+            .expect_err("unexpected file owner must fail");
         assert_eq!(error.kind(), StateStoreErrorKind::UnsafeFilesystem);
     }
 
