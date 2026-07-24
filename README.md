@@ -95,6 +95,16 @@ The ownership model protects existing infrastructure from name-based adoption. A
 
 Canonical constructors now define exact locators and minimum evidence for Linux users, managed directories, systemd services, official runner installations, rootless Podman images, and GitHub runner registrations. Desired identities cannot be created from names, mutable image tags, or labels alone; partial observations may omit evidence only so ownership classification can return `unknown`. The model also records which execution lane must collect each observation and which evidence survives host restore, repository transfer, or runner re-registration. See [ADR 0003](docs/adr/0003-canonical-resource-evidence.md).
 
+## Exploratory expansion
+
+The runner-steward work remains SmolRunner's foundation. A later optional layer may use the same host ownership and isolation model for leased workspaces and temporary previews.
+
+The proposed policy keeps frequent verification separate from live deployment: GitHub Actions may verify each eligible push, while a preview starts only after an explicit request or repository policy grants a bounded lease. The local rootless Podman path comes first; worker selection and external deployment targets come later only when useful.
+
+The first implementation slice is a platform-independent, revisioned lease lifecycle for runs, retained workspaces, and previews. It plans legal state transitions without persistence or host mutation. See [ADR 0004](docs/adr/0004-lease-lifecycle-core.md).
+
+See [leased execution and previews](docs/LEASED_EXECUTION.md) and the updated [roadmap](docs/ROADMAP.md).
+
 ## Intended workflow
 
 The planned interface is deliberately small:
@@ -140,12 +150,14 @@ cargo run --locked --quiet -- --output json host plan --file examples/quarry.yml
 - [Threat model](docs/THREAT_MODEL.md)
 - [Manifest reference](docs/MANIFEST.md)
 - [Host reconciliation](docs/HOST_RECONCILIATION.md)
+- [Leased execution and previews](docs/LEASED_EXECUTION.md)
 - [ADR 0001: privilege, adoption, and rollback](docs/adr/0001-privilege-adoption-and-rollback.md)
 - [ADR 0002: durable ownership and state identity](docs/adr/0002-durable-ownership-state.md)
 - [ADR 0003: canonical resource evidence](docs/adr/0003-canonical-resource-evidence.md)
+- [ADR 0004: lease lifecycle core](docs/adr/0004-lease-lifecycle-core.md)
 - [Roadmap](docs/ROADMAP.md)
 - [Agent instructions](AGENTS.md)
 
 ## Project status
 
-The first milestone is a dependable diagnostic and desired-state foundation. A dashboard, daemon, cloud autoscaling, and broader distribution support are intentionally deferred until the CLI and security model have proven themselves.
+The first milestone is a dependable diagnostic and desired-state foundation. Runner lifecycle, disposable execution, and small-fleet operations come before leased previews or worker-pool coordination. A dashboard and broader distribution support remain deferred until the CLI and security model have proven themselves.

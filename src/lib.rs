@@ -7,6 +7,7 @@ pub mod journal_document;
 pub mod lane_command;
 #[cfg(target_os = "linux")]
 pub mod lane_executable;
+pub mod lease;
 /// Read-only, fail-closed lookup of persisted project installations.
 #[cfg(target_os = "linux")]
 pub mod linux_installation_catalog;
