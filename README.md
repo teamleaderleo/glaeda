@@ -103,6 +103,8 @@ The proposed policy keeps frequent verification separate from live deployment: G
 
 The first implementation slice is a platform-independent, revisioned lease lifecycle for runs, retained workspaces, and previews. It plans legal state transitions without persistence or host mutation. See [ADR 0004](docs/adr/0004-lease-lifecycle-core.md).
 
+The next slice adds fail-closed lease documents, an atomic no-replace and compare-and-swap storage contract, stale-revision rejection, and immutable artifact identities. The included memory store proves concurrency semantics for tests; process-durable Linux persistence remains deferred to an adapter under the existing installation lock. See [ADR 0005](docs/adr/0005-lease-store-and-artifact-identity.md).
+
 See [leased execution and previews](docs/LEASED_EXECUTION.md) and the updated [roadmap](docs/ROADMAP.md).
 
 ## Intended workflow
@@ -155,6 +157,7 @@ cargo run --locked --quiet -- --output json host plan --file examples/quarry.yml
 - [ADR 0002: durable ownership and state identity](docs/adr/0002-durable-ownership-state.md)
 - [ADR 0003: canonical resource evidence](docs/adr/0003-canonical-resource-evidence.md)
 - [ADR 0004: lease lifecycle core](docs/adr/0004-lease-lifecycle-core.md)
+- [ADR 0005: atomic lease stores and artifact identity](docs/adr/0005-lease-store-and-artifact-identity.md)
 - [Roadmap](docs/ROADMAP.md)
 - [Agent instructions](AGENTS.md)
 
