@@ -23,6 +23,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
+          # One reviewed source transformation, no project execution.
           test -f tools/seal_lane_executor_backends.py
           test ! -L tools/seal_lane_executor_backends.py
           test -z "$(git status --porcelain)"
