@@ -111,6 +111,8 @@ The local Podman command-planning slice binds an OCI artifact to bounded runtime
 
 Podman inspection now decodes one bounded JSON result, classifies exact container ownership, and authorizes existing-container mutations only when the name, image digest, and every required label match the planned preview generation. Authorized commands target the observed full container ID. See [ADR 0008](docs/adr/0008-podman-preview-inspection-authorization.md).
 
+Subprocess execution now captures stdout and stderr concurrently with a one-megabyte limit per stream. Excess output terminates the direct child and fails without producing a successful execution record. See [ADR 0009](docs/adr/0009-bounded-subprocess-output.md).
+
 See [leased execution and previews](docs/LEASED_EXECUTION.md) and the updated [roadmap](docs/ROADMAP.md).
 
 ## Intended workflow
@@ -167,6 +169,7 @@ cargo run --locked --quiet -- --output json host plan --file examples/quarry.yml
 - [ADR 0006: preview slot coalescing](docs/adr/0006-preview-slot-coalescing.md)
 - [ADR 0007: rootless Podman preview command planning](docs/adr/0007-rootless-podman-preview-command-planning.md)
 - [ADR 0008: Podman preview inspection and mutation authorization](docs/adr/0008-podman-preview-inspection-authorization.md)
+- [ADR 0009: bounded subprocess output capture](docs/adr/0009-bounded-subprocess-output.md)
 - [Roadmap](docs/ROADMAP.md)
 - [Agent instructions](AGENTS.md)
 
