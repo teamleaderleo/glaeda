@@ -111,8 +111,7 @@ if text.count(old) != 1:
     raise SystemExit("unexpected test imports")
 text = text.replace(old, new, 1)
 
-replacements = [
-('''        let executor = RootLaneExecutor::new(
+root_zero = '''        let executor = RootLaneExecutor::new(
             process,
             executables,
             FakePrivilege {
@@ -120,30 +119,45 @@ replacements = [
                 fail: false,
             },
         );
-''', '''        let privilege = FakePrivilege {
+'''
+runner_zero = '''        let executor = RunnerUserLaneExecutor::new(
+            process,
+            executables,
+            FakePrivilege {
+                uid: 0,
+                fail: false,
+            },
+        );
+'''
+root_nonzero = '''        let executor = RootLaneExecutor::new(
+            process,
+            executables,
+            FakePrivilege {
+                uid: 1000,
+                fail: false,
+            },
+        );
+'''
+text = text.replace(root_zero, '''        let privilege = FakePrivilege {
             uid: 0,
             fail: false,
         };
-'''),
+''')
+text = text.replace(runner_zero, '''        let privilege = FakePrivilege {
+            uid: 0,
+            fail: false,
+        };
+''')
+text = text.replace(root_nonzero, '''        let privilege = FakePrivilege {
+            uid: 1000,
+            fail: false,
+        };
+''')
+
+specific = [
 ('''        let receipt = executor.execute(&command).expect("execute root lane");
 ''', '''        let receipt = execute_root_lane(&process, &executables, &privilege, &command)
             .expect("execute root lane");
-'''),
-('''        let calls = executor.process.calls.borrow();
-''', '''        let calls = process.calls.borrow();
-'''),
-('''        let executor = RunnerUserLaneExecutor::new(
-            process,
-            executables,
-            FakePrivilege {
-                uid: 0,
-                fail: false,
-            },
-        );
-''', '''        let privilege = FakePrivilege {
-            uid: 0,
-            fail: false,
-        };
 '''),
 ('''        let receipt = executor
             .execute(&command, &runner)
@@ -163,24 +177,6 @@ replacements = [
 ''', '''        let error = execute_root_lane(&process, &executables, &privilege, &command)
             .expect_err("root executor must reject runner command");
 '''),
-('''        assert_eq!(executor.executables.calls.get(), 0);
-        assert!(executor.process.calls.borrow().is_empty());
-''', '''        assert_eq!(executables.calls.get(), 0);
-        assert!(process.calls.borrow().is_empty());
-'''),
-('''        let executor = RootLaneExecutor::new(
-            process,
-            executables,
-            FakePrivilege {
-                uid: 1000,
-                fail: false,
-            },
-        );
-''', '''        let privilege = FakePrivilege {
-            uid: 1000,
-            fail: false,
-        };
-'''),
 ('''        let error = executor
             .execute(&command)
             .expect_err("non-root execution must fail");
@@ -199,37 +195,34 @@ replacements = [
         )
         .expect_err("mismatched runner evidence must fail");
 '''),
-('''        let executor = RootLaneExecutor::new(
-            process,
-            executables,
-            FakePrivilege {
-                uid: 0,
-                fail: false,
-            },
-        );
-''', '''        let privilege = FakePrivilege {
-            uid: 0,
-            fail: false,
-        };
-'''),
 ('''        let error = executor
             .execute(&command)
             .expect_err("untrusted executable must fail");
 ''', '''        let error = execute_root_lane(&process, &executables, &privilege, &command)
             .expect_err("untrusted executable must fail");
 '''),
-('''        assert_eq!(executor.executables.calls.get(), 1);
-        assert!(executor.process.calls.borrow().is_empty());
-''', '''        assert_eq!(executables.calls.get(), 1);
-        assert!(process.calls.borrow().is_empty());
-'''),
 ]
-for old, new in replacements:
-    if old in text:
-        text = text.replace(old, new, 1)
+for old, new in specific:
+    if text.count(old) != 1:
+        raise SystemExit(f"unexpected test execution block: {old.splitlines()[-2].strip()}")
+    text = text.replace(old, new, 1)
+
+text = text.replace("        let calls = executor.process.calls.borrow();", "        let calls = process.calls.borrow();")
+text = text.replace(
+    '''        assert_eq!(executor.executables.calls.get(), 0);
+        assert!(executor.process.calls.borrow().is_empty());''',
+    '''        assert_eq!(executables.calls.get(), 0);
+        assert!(process.calls.borrow().is_empty());''',
+)
+text = text.replace(
+    '''        assert_eq!(executor.executables.calls.get(), 1);
+        assert!(executor.process.calls.borrow().is_empty());''',
+    '''        assert_eq!(executables.calls.get(), 1);
+        assert!(process.calls.borrow().is_empty());''',
+)
 
 if "RootLaneExecutor::new" in text or "RunnerUserLaneExecutor::new" in text:
     raise SystemExit("public injectable executor construction remains")
-if "executor.process" in text or "executor.executables" in text:
+if "executor.process" in text or "executor.executables" in text or ".execute(&command, &runner)" in text:
     raise SystemExit("stale generic executor test access remains")
 path.write_text(text, encoding="utf-8")
