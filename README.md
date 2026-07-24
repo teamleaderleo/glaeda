@@ -113,6 +113,8 @@ Podman inspection now decodes one bounded JSON result, classifies exact containe
 
 Subprocess execution now captures stdout and stderr concurrently with a one-megabyte limit per stream. Excess output terminates the direct child and fails without producing a successful execution record. See [ADR 0009](docs/adr/0009-bounded-subprocess-output.md).
 
+Podman inspect evidence now binds to the exact reviewed command and successful execution record before decoding. The public mutation gate accepts only that typed receipt, while stderr remains diagnostic and carries no authority. See [ADR 0010](docs/adr/0010-podman-inspect-execution-receipts.md).
+
 See [leased execution and previews](docs/LEASED_EXECUTION.md) and the updated [roadmap](docs/ROADMAP.md).
 
 ## Intended workflow
@@ -170,6 +172,7 @@ cargo run --locked --quiet -- --output json host plan --file examples/quarry.yml
 - [ADR 0007: rootless Podman preview command planning](docs/adr/0007-rootless-podman-preview-command-planning.md)
 - [ADR 0008: Podman preview inspection and mutation authorization](docs/adr/0008-podman-preview-inspection-authorization.md)
 - [ADR 0009: bounded subprocess output capture](docs/adr/0009-bounded-subprocess-output.md)
+- [ADR 0010: Podman inspect execution receipts](docs/adr/0010-podman-inspect-execution-receipts.md)
 - [Roadmap](docs/ROADMAP.md)
 - [Agent instructions](AGENTS.md)
 

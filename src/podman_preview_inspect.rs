@@ -369,7 +369,7 @@ impl AuthorizedPreviewPodmanCommand {
 ///
 /// Returns an error unless the command requires ownership evidence, the observation is managed by
 /// the exact preview generation, and the command's planned name target matches the observation.
-pub fn authorize_existing_preview_command(
+pub(crate) fn authorize_existing_preview_command_from_observation(
     spec: &PreviewContainerSpec,
     command: &PreviewPodmanCommand,
     observed: &PreviewContainerObservation,
@@ -512,7 +512,7 @@ mod tests {
 
     use super::{
         MAX_PODMAN_INSPECT_BYTES, PreviewContainerOwnershipClass,
-        assess_preview_container_ownership, authorize_existing_preview_command,
+        assess_preview_container_ownership, authorize_existing_preview_command_from_observation,
         decode_preview_container_inspect,
     };
 
@@ -622,7 +622,8 @@ mod tests {
         let plan = PreviewPodmanPlan::for_container(&spec, &runner());
         let start = &plan.provision()[1];
         let authorized =
-            authorize_existing_preview_command(&spec, start, &observed).expect("authorize start");
+            authorize_existing_preview_command_from_observation(&spec, start, &observed)
+                .expect("authorize start");
         assert_eq!(
             authorized.spec().displayed_argv().last().expect("target"),
             observed.container_id().as_str()
@@ -786,9 +787,21 @@ mod tests {
         .expect("decode inspect");
         let plan = PreviewPodmanPlan::for_container(&spec, &runner());
 
-        assert!(authorize_existing_preview_command(&spec, &plan.cleanup()[0], &observed).is_err());
         assert!(
-            authorize_existing_preview_command(&spec, &plan.provision()[2], &observed).is_err()
+            authorize_existing_preview_command_from_observation(
+                &spec,
+                &plan.cleanup()[0],
+                &observed
+            )
+            .is_err()
+        );
+        assert!(
+            authorize_existing_preview_command_from_observation(
+                &spec,
+                &plan.provision()[2],
+                &observed
+            )
+            .is_err()
         );
     }
 }
