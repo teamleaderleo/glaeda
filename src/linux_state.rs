@@ -42,6 +42,18 @@ enum WritePhase {
     BeforeParentSync,
 }
 
+trait WriteFaultInjector {
+    fn check(&mut self, phase: WritePhase) -> Result<(), StateStoreError>;
+}
+
+struct NoWriteFaults;
+
+impl WriteFaultInjector for NoWriteFaults {
+    fn check(&mut self, _phase: WritePhase) -> Result<(), StateStoreError> {
+        Ok(())
+    }
+}
+
 /// Descriptor-relative access to one trusted SmolRunner state root.
 #[derive(Debug)]
 pub struct LinuxStateRoot {
@@ -125,18 +137,15 @@ impl LinuxStateRoot {
         &mut self,
         record: &StateRecord,
     ) -> Result<StateWriteReceipt, StateStoreError> {
-        let mut hook = |_phase| Ok::<(), StateStoreError>(());
-        self.write_atomic_with_hook(record, &mut hook)
+        let mut faults = NoWriteFaults;
+        self.write_atomic_with_faults(record, &mut faults)
     }
 
-    fn write_atomic_with_hook<F>(
+    fn write_atomic_with_faults(
         &mut self,
         record: &StateRecord,
-        hook: &mut F,
-    ) -> Result<StateWriteReceipt, StateStoreError>
-    where
-        F: FnMut(WritePhase) -> Result<(), StateStoreError>,
-    {
+        faults: &mut dyn WriteFaultInjector,
+    ) -> Result<StateWriteReceipt, StateStoreError> {
         let _lock = self.acquire_installation_lock(record.path())?;
         let (parent, file_name) = self.open_required_parent(record.path())?;
         let disposition = inspect_destination(&parent, file_name)?;
@@ -149,14 +158,14 @@ impl LinuxStateRoot {
                 "could not set private state-file permissions",
             )
         })?;
-        write_and_sync(temporary, record.bytes(), hook)?;
+        write_and_sync(temporary, record.bytes(), faults)?;
 
-        hook(WritePhase::BeforeRename)?;
+        faults.check(WritePhase::BeforeRename)?;
         fs::renameat(&parent, temporary_path.name(), &parent, file_name.as_str())
             .map_err(map_rename_error)?;
         temporary_path.disarm();
 
-        hook(WritePhase::BeforeParentSync)?;
+        faults.check(WritePhase::BeforeParentSync)?;
         fs::fsync(&parent).map_err(|_| {
             StateStoreError::public(
                 StateStoreErrorKind::Io,
@@ -373,19 +382,20 @@ fn random_temporary_name() -> Result<String, StateStoreError> {
     Ok(name)
 }
 
-fn write_and_sync<F>(fd: OwnedFd, bytes: &[u8], hook: &mut F) -> Result<(), StateStoreError>
-where
-    F: FnMut(WritePhase) -> Result<(), StateStoreError>,
-{
+fn write_and_sync(
+    fd: OwnedFd,
+    bytes: &[u8],
+    faults: &mut dyn WriteFaultInjector,
+) -> Result<(), StateStoreError> {
     let mut file = File::from(fd);
-    hook(WritePhase::BeforeWrite)?;
+    faults.check(WritePhase::BeforeWrite)?;
     file.write_all(bytes).map_err(|_| {
         StateStoreError::public(
             StateStoreErrorKind::Io,
             "could not write temporary state file",
         )
     })?;
-    hook(WritePhase::BeforeFileSync)?;
+    faults.check(WritePhase::BeforeFileSync)?;
     fs::fsync(&file).map_err(|_| {
         StateStoreError::public(
             StateStoreErrorKind::Io,
@@ -557,7 +567,7 @@ mod tests {
         StateWriteDisposition,
     };
 
-    use super::{LOCK_FILE_NAME, LinuxStateRoot, TEMP_FILE_PREFIX, WritePhase};
+    use super::{LOCK_FILE_NAME, LinuxStateRoot, TEMP_FILE_PREFIX, WriteFaultInjector, WritePhase};
 
     static NEXT_TEMP_ROOT: AtomicU64 = AtomicU64::new(1);
 
@@ -612,9 +622,11 @@ mod tests {
         .expect("project record")
     }
 
-    fn fail_at(target: WritePhase) -> impl FnMut(WritePhase) -> Result<(), StateStoreError> {
-        move |phase| {
-            if phase != target {
+    struct FailAt(WritePhase);
+
+    impl WriteFaultInjector for FailAt {
+        fn check(&mut self, phase: WritePhase) -> Result<(), StateStoreError> {
+            if phase != self.0 {
                 return Ok(());
             }
             let message = match phase {
@@ -799,9 +811,9 @@ mod tests {
             store.write_atomic(&original).expect("write original state");
 
             let replacement = project_record("example/replacement");
-            let mut hook = fail_at(point);
+            let mut faults = FailAt(point);
             let error = store
-                .write_atomic_with_hook(&replacement, &mut hook)
+                .write_atomic_with_faults(&replacement, &mut faults)
                 .expect_err("injected prepublication failure must fail");
             assert_eq!(error.kind(), StateStoreErrorKind::Io);
             assert_eq!(
@@ -821,9 +833,9 @@ mod tests {
         store.write_atomic(&original).expect("write original state");
 
         let replacement = project_record("example/replacement");
-        let mut hook = fail_at(WritePhase::BeforeParentSync);
+        let mut faults = FailAt(WritePhase::BeforeParentSync);
         let error = store
-            .write_atomic_with_hook(&replacement, &mut hook)
+            .write_atomic_with_faults(&replacement, &mut faults)
             .expect_err("injected parent-sync failure must fail");
         assert_eq!(error.kind(), StateStoreErrorKind::Io);
         assert!(error.message().contains("published"));
