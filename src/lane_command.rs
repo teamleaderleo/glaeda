@@ -311,9 +311,9 @@ impl LaneCommand {
             LaneCommandKind::RunnerGitVersion => {
                 vec![outer, Path::new(ENV), Path::new(GIT)]
             }
+            LaneCommandKind::EnsureSystemUser => vec![outer, Path::new(NOLOGIN)],
             LaneCommandKind::AptInstall
             | LaneCommandKind::EnsureSystemGroup
-            | LaneCommandKind::EnsureSystemUser
             | LaneCommandKind::EnableLinger => vec![outer],
         }
     }
@@ -411,6 +411,8 @@ fn canonical_absolute_path(field: &str, value: &str) -> Result<String, LaneComma
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use crate::journal::{ExecutionLane, PlannedMutation, Preconditions, RollbackClass};
     use crate::process::CommandValue;
 
@@ -495,6 +497,19 @@ mod tests {
                 .spec()
                 .displayed_argv(),
             [LOGINCTL, "enable-linger", "project-runner"]
+        );
+    }
+
+    #[test]
+    fn system_user_command_requires_useradd_and_nologin_verification() {
+        let root = action(ExecutionLane::Root);
+        let account = account("project-runner");
+        let command =
+            LaneCommand::ensure_system_user(&root, &account, &account, "/var/lib/project-runner")
+                .expect("user command");
+        assert_eq!(
+            command.required_programs(),
+            [Path::new(USERADD), Path::new(NOLOGIN)]
         );
     }
 
