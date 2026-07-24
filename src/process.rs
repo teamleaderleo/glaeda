@@ -180,10 +180,22 @@ impl CommandExecutor for ProcessExecutor {
         let mut capture_error = None;
 
         while stdout_bytes.is_none() || stderr_bytes.is_none() {
-            let event = receiver.recv().map_err(|_| {
-                let _ = terminate_child(&mut child);
-                io::Error::other("output capture workers stopped before reporting completion")
-            })?;
+            let event = match receiver.recv() {
+                Ok(event) => event,
+                Err(_) => {
+                    let termination_result = terminate_child(&mut child);
+                    let wait_result = child.wait();
+                    let stdout_join_result = join_capture_reader(stdout_reader);
+                    let stderr_join_result = join_capture_reader(stderr_reader);
+                    termination_result?;
+                    wait_result?;
+                    stdout_join_result?;
+                    stderr_join_result?;
+                    return Err(io::Error::other(
+                        "output capture workers stopped before reporting completion",
+                    ));
+                }
+            };
             match event {
                 CaptureEvent::LimitExceeded(stream) => {
                     exceeded.insert(stream);
