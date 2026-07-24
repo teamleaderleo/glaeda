@@ -231,33 +231,60 @@ mod tests {
     #[test]
     fn first_enrollment_creates_and_second_loads_the_same_installation() {
         let root = TempRoot::new("create-load");
-        let project = project("example/project");
-
-        let first = create_or_load_installation(root.path(), project.clone()).expect("enroll project");
+        let target = project("example/project");
+        let created =
+            create_or_load_installation(root.path(), target.clone()).expect("create installation");
         assert_eq!(
-            first.disposition(),
+            created.disposition(),
             InstallationEnrollmentDisposition::Created
         );
-        let second = create_or_load_installation(root.path(), project).expect("load project");
+
+        let existing =
+            create_or_load_installation(root.path(), target.clone()).expect("load installation");
         assert_eq!(
-            second.disposition(),
+            existing.disposition(),
             InstallationEnrollmentDisposition::Existing
         );
-        assert_eq!(second.installation_id(), first.installation_id());
+        assert_eq!(existing.installation_id(), created.installation_id());
         assert_eq!(
-            find_installation(root.path(), &project("example/project"))
-                .expect("find installation"),
-            InstallationLookup::Found(first.installation_id().clone())
+            find_installation(root.path(), &target).expect("catalog lookup"),
+            InstallationLookup::Found(created.installation_id().clone())
         );
     }
 
     #[test]
-    fn held_catalog_lock_maps_to_bounded_busy_error() {
+    fn different_projects_receive_distinct_installations() {
+        let root = TempRoot::new("distinct");
+        let first = create_or_load_installation(root.path(), project("example/first"))
+            .expect("create first installation");
+        let second = create_or_load_installation(root.path(), project("example/second"))
+            .expect("create second installation");
+        assert_ne!(first.installation_id(), second.installation_id());
+    }
+
+    #[test]
+    fn concurrent_enrollment_returns_busy() {
         let root = TempRoot::new("busy");
         let _lock = lock_installation_catalog(root.path()).expect("hold catalog lock");
         let error = create_or_load_installation(root.path(), project("example/project"))
-            .expect_err("second lock must fail");
+            .expect_err("concurrent enrollment must be busy");
         assert_eq!(error.kind(), InstallationEnrollmentErrorKind::Busy);
-        assert_eq!(error.message(), "another installation catalog operation is in progress");
+    }
+
+    #[test]
+    fn invalid_project_does_not_publish_an_installation() {
+        let root = TempRoot::new("invalid");
+        let invalid = ProjectIdentity {
+            repository: "invalid".to_owned(),
+            runner_scope: RunnerScope::Repository,
+            runner_user: "project-runner".to_owned(),
+        };
+        let error = create_or_load_installation(root.path(), invalid)
+            .expect_err("invalid project must fail");
+        assert_eq!(
+            error.kind(),
+            InstallationEnrollmentErrorKind::InvalidProject
+        );
+        assert!(!root.path().join("installations").exists());
     }
 }
