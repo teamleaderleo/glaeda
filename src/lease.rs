@@ -200,6 +200,9 @@ impl LeaseRecord {
 
     /// Plan one revision-checked state transition without changing durable state.
     ///
+    /// The caller may serialize the returned transition, compare its previous revision with durable
+    /// state, and persist `LeaseTransition::resulting_record` through a later compare-and-swap path.
+    ///
     /// # Errors
     ///
     /// Returns an error when the action is invalid for the current lease kind or state, or when the
