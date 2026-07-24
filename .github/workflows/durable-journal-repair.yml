@@ -1,0 +1,87 @@
+name: Repair and verify durable journal checkpoints
+
+on:
+  push:
+    branches: [codex/durable-journal-checkpoints]
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: codex/durable-journal-checkpoints
+          fetch-depth: 0
+
+      - name: Apply, verify, and publish diagnostics
+        shell: bash
+        run: |
+          set +e
+          log=/tmp/durable-journal-verification.log
+          : > "$log"
+
+          run_step() {
+            name="$1"
+            shift
+            {
+              echo
+              echo "===== $name ====="
+              "$@"
+            } >>"$log" 2>&1
+            return $?
+          }
+
+          status=0
+          run_step "apply source changes" python3 .github/apply_durable_journal.py || status=$?
+          if [ "$status" -eq 0 ]; then
+            run_step "format" cargo fmt --all || status=$?
+          fi
+          if [ "$status" -eq 0 ]; then
+            run_step "diff check" git diff --check || status=$?
+          fi
+          if [ "$status" -eq 0 ]; then
+            run_step "focused journal tests" cargo test --locked --all-features journal || status=$?
+          fi
+          if [ "$status" -eq 0 ]; then
+            run_step "clippy" cargo clippy --locked --all-targets --all-features -- -D warnings || status=$?
+          fi
+          if [ "$status" -eq 0 ]; then
+            run_step "full tests" cargo test --locked --all-targets --all-features || status=$?
+          fi
+          if [ "$status" -eq 0 ]; then
+            run_step "json doctor" cargo run --locked --quiet -- --output json doctor || status=$?
+          fi
+          if [ "$status" -eq 0 ]; then
+            run_step "reference plan" cargo run --locked --quiet -- plan --file examples/quarry.yml || status=$?
+          fi
+          if [ "$status" -eq 0 ]; then
+            run_step "json reference plan" bash -c \
+              "cargo run --locked --quiet -- --output json plan --file examples/glossless.yml | jq -e '.schema_version == 1 and (.actions | length == 4)'" || status=$?
+          fi
+          if [ "$status" -eq 0 ]; then
+            run_step "host plan" bash -c \
+              "cargo run --locked --quiet -- --output json host plan --file examples/quarry.yml | jq -e '.schema_version == 1 and (.actions | length >= 2)'" || status=$?
+          fi
+
+          rm -f .github/workflows/durable-journal-repair.yml .github/apply_durable_journal.py
+          if [ "$status" -eq 0 ]; then
+            rm -f .github/durable-journal-status.txt
+            message="Persist execution journals at uncertain boundaries"
+          else
+            cp "$log" .github/durable-journal-status.txt
+            message="Record durable journal verification failure"
+          fi
+
+          cat "$log"
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          git commit -m "$message"
+          git push origin HEAD:codex/durable-journal-checkpoints
+          exit "$status"
