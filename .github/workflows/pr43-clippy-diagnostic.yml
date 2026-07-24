@@ -1,4 +1,4 @@
-name: PR 43 Clippy diagnostic
+name: PR 43 enum lint fix
 
 on:
   push:
@@ -8,7 +8,7 @@ permissions:
   contents: write
 
 jobs:
-  diagnose:
+  fix:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
 
@@ -19,29 +19,46 @@ jobs:
           ref: test/atomic-state-failure-phases
           fetch-depth: 1
 
-      - name: Capture final Clippy diagnostics
+      - name: Rename private phase variants and remove diagnostic
         shell: bash
         run: |
           set -Eeuo pipefail
-          # Compiler output only; no tests or project commands execute.
-          test -z "$(git status --porcelain)"
-          mkdir -p .tmp
-          set +e
-          cargo clippy --locked --all-targets --all-features -- -D warnings >.tmp/clippy-full.log 2>&1
-          status=$?
-          set -e
-          test "$status" -ne 0
-          tail -n 120 .tmp/clippy-full.log > .tmp/pr43-clippy.log
-          rm .tmp/clippy-full.log
-          test -s .tmp/pr43-clippy.log
-          git add .tmp/pr43-clippy.log
-          test "$(git diff --cached --name-only)" = ".tmp/pr43-clippy.log"
+          test -f src/linux_state.rs
+          test -f .tmp/pr43-clippy.log
+          python3 - <<'PY'
+          from pathlib import Path
 
-      - name: Commit diagnostic only
+          path = Path("src/linux_state.rs")
+          text = path.read_text(encoding="utf-8")
+          replacements = {
+              "WritePhase::BeforeWrite": "WritePhase::Write",
+              "WritePhase::BeforeFileSync": "WritePhase::FileSync",
+              "WritePhase::BeforeRename": "WritePhase::Rename",
+              "WritePhase::BeforeParentSync": "WritePhase::ParentSync",
+              "    BeforeWrite,": "    Write,",
+              "    BeforeFileSync,": "    FileSync,",
+              "    BeforeRename,": "    Rename,",
+              "    BeforeParentSync,": "    ParentSync,",
+          }
+          for old, new in replacements.items():
+              if old not in text:
+                  raise SystemExit(f"missing expected phase spelling: {old}")
+              text = text.replace(old, new)
+          if "BeforeWrite" in text or "BeforeFileSync" in text or "BeforeRename" in text or "BeforeParentSync" in text:
+              raise SystemExit("old phase spelling remains")
+          path.write_text(text, encoding="utf-8")
+          PY
+          rustfmt --edition 2024 src/linux_state.rs
+          rm .tmp/pr43-clippy.log
+          git add -A src/linux_state.rs .tmp/pr43-clippy.log
+          test "$(git diff --cached --name-only | sort)" = $'.tmp/pr43-clippy.log\nsrc/linux_state.rs'
+          git diff --cached --check
+
+      - name: Commit bounded correction
         shell: bash
         run: |
           set -Eeuo pipefail
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git commit -m 'ci: capture PR 43 clippy diagnostic'
+          git commit -m 'fix: rename atomic write phases'
           git push origin HEAD:test/atomic-state-failure-phases
