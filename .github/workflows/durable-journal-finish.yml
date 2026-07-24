@@ -1,6 +1,7 @@
 name: Finish durable journal verification
 
 on:
+  pull_request:
   push:
     branches: [codex/durable-journal-checkpoints]
 
