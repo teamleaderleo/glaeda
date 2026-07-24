@@ -7,7 +7,7 @@
 
 The dependency-aware runner account plan needs more than name existence. It must distinguish a safely matching primary group and runner user from missing, ambiguous, malformed, stale, or conflicting state. It also needs exact evidence for the desired home directory, subordinate UID/GID ranges, and systemd linger marker.
 
-Reading only `/etc/passwd` and `/etc/group` is not sufficient because Debian and Ubuntu may resolve accounts through NSS. Conversely, a failed NSS lookup must never be treated as proof that an account is absent. Subordinate-ID files and filesystem markers also require bounded, no-follow inspection so symlinks or writable authority files cannot authorize mutation.
+Reading only `/etc/passwd` and `/etc/group` is not sufficient because Debian and Ubuntu may resolve accounts through NSS. Conversely, a failed NSS lookup must never be treated as proof that an account is absent. Subordinate-ID files and filesystem markers also require bounded, no-follow inspection so symlinks, hard links, or writable authority files cannot authorize mutation.
 
 ## Decision
 
@@ -24,7 +24,7 @@ A receipt is accepted only when its argv and environment match the reviewed comm
 - exit status `2`, empty stdout, and empty stderr: absent;
 - execution failure, any other status, stderr, oversized output, NUL data, malformed records, or receipt mismatch: unknown.
 
-A matching group has the exact desired name and a nonzero canonical GID. A matching user has the exact desired name, nonzero UID and primary GID, the desired home, `/usr/sbin/nologin`, and a primary GID equal to the matching group GID. An existing incompatible user is conflicting.
+A matching group has the exact desired name and a nonzero canonical GID. A matching user has the exact desired name, nonzero UID and primary GID, the desired home, `/usr/sbin/nologin`, and a primary GID equal to the matching group GID. An existing incompatible user is conflicting. When the user fields match but the primary-group lookup is unknown, the user remains unknown rather than being mislabeled as conflicting.
 
 ### Home directory
 
@@ -54,8 +54,8 @@ The marker at `/var/lib/systemd/linger/USER` is inspected without following a fi
 
 - missing: absent;
 - inspection failure: unknown;
-- protected empty root-owned regular file with a matching user: matching;
-- any other existing state: conflicting.
+- protected empty single-link root-owned regular file with a matching user: matching;
+- any other existing state, including a hard link: conflicting.
 
 ### Partial observation
 
@@ -68,6 +68,6 @@ This ADR adds read-only observation only. It does not allocate subordinate range
 ## Consequences
 
 - NSS-aware account absence can be distinguished from lookup failure.
-- Unsafe authority files, symlinks, residual allocations, and stale linger markers cannot become absence.
+- Unsafe authority files, symlinks, hard links, residual allocations, and stale linger markers cannot become absence.
 - The account planner can consume observations directly without weakening its dependency rules.
 - Host-plan integration and durable execution remain separate reviewed slices.
