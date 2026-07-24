@@ -387,8 +387,17 @@ fn ensure_leases_directory(
             Ok(directory)
         }
         Err(Errno::NOENT) => {
-            fs::mkdirat(installation, LEASES_DIRECTORY, MANAGED_DIRECTORY_MODE)
-                .map_err(map_leases_create_error)?;
+            let created = match fs::mkdirat(installation, LEASES_DIRECTORY, MANAGED_DIRECTORY_MODE)
+            {
+                Ok(()) => true,
+                Err(Errno::EXIST) => false,
+                Err(_) => {
+                    return Err(store_error(
+                        LeaseStoreErrorKind::Io,
+                        "could not create the lease directory",
+                    ));
+                }
+            };
             let directory = fs::openat(
                 installation,
                 LEASES_DIRECTORY,
@@ -396,14 +405,16 @@ fn ensure_leases_directory(
                 Mode::empty(),
             )
             .map_err(map_leases_open_error)?;
-            fs::fchmod(&directory, MANAGED_DIRECTORY_MODE).map_err(|_| {
-                store_error(
-                    LeaseStoreErrorKind::Io,
-                    "could not set lease-directory permissions",
-                )
-            })?;
             inspect_directory(&directory, "lease directory", Some(owner))?;
-            synchronize_directory(installation, "installation directory")?;
+            if created {
+                fs::fchmod(&directory, MANAGED_DIRECTORY_MODE).map_err(|_| {
+                    store_error(
+                        LeaseStoreErrorKind::Io,
+                        "could not set lease-directory permissions",
+                    )
+                })?;
+                synchronize_directory(installation, "installation directory")?;
+            }
             Ok(directory)
         }
         Err(error) => Err(map_leases_open_error(error)),
@@ -605,16 +616,6 @@ fn map_leases_open_error(error: Errno) -> LeaseStoreError {
     }
 }
 
-fn map_leases_create_error(error: Errno) -> LeaseStoreError {
-    match error {
-        Errno::EXIST => map_leases_open_error(error),
-        _ => store_error(
-            LeaseStoreErrorKind::Io,
-            "could not create the lease directory",
-        ),
-    }
-}
-
 fn map_lock_open_error(error: Errno) -> LeaseStoreError {
     match error {
         Errno::LOOP | Errno::NOTDIR | Errno::ISDIR => store_error(
@@ -766,6 +767,22 @@ mod tests {
         symlink(root.path(), &lease_path).expect("create lease symlink");
         let error = store.load(&selector).expect_err("symlink must fail");
         assert_eq!(error.kind, LeaseStoreErrorKind::UnsafeFilesystem);
+    }
+
+    #[test]
+    fn concurrent_mutation_lock_reports_busy() {
+        let root = TempInstallation::new("busy");
+        let first = LinuxLeaseStore::open_or_create(root.path(), installation_id())
+            .expect("open first durable store");
+        let second = LinuxLeaseStore::open_or_create(root.path(), installation_id())
+            .expect("open second durable store");
+        let _guard = first
+            .acquire_mutation_lock()
+            .expect("acquire first mutation lock");
+        let error = second
+            .acquire_mutation_lock()
+            .expect_err("second mutation lock must be busy");
+        assert_eq!(error.kind, LeaseStoreErrorKind::Busy);
     }
 
     #[test]
