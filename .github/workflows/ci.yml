@@ -6,7 +6,7 @@ on:
     branches: [main]
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: verify-${{ github.workflow }}-${{ github.ref }}
@@ -15,53 +15,17 @@ concurrency:
 jobs:
   verify:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 15
 
     steps:
-      - name: Check out repair branch
+      - name: Check out repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          ref: codex/durable-journal-checkpoints
-          fetch-depth: 0
 
       - name: Install Rust toolchain
         run: rustup show active-toolchain
 
-      - name: Repair strict stop validation
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-
-          path = Path("src/journal_document.rs")
-          text = path.read_text()
-          old = '''                ActionOutcome::Skipped => {
-                    if journal.records.iter().enumerate().any(|(index, record)| {
-                        index != stop_index && record.outcome != ActionOutcome::Pending
-                    }) {
-                        problems.push(
-                            "all records other than a skipped preflight stop must remain pending"
-                                .to_owned(),
-                        );
-                    }
-                }
-'''
-          new = '''                ActionOutcome::Skipped
-                    if journal.records.iter().enumerate().any(|(index, record)| {
-                        index != stop_index && record.outcome != ActionOutcome::Pending
-                    }) =>
-                {
-                    problems.push(
-                        "all records other than a skipped preflight stop must remain pending"
-                            .to_owned(),
-                    );
-                }
-'''
-          if text.count(old) != 1:
-              raise SystemExit(f"expected one strict-validator match, found {text.count(old)}")
-          path.write_text(text.replace(old, new, 1))
-          PY
-          cargo fmt --all
-          git diff --check
+      - name: Check formatting
+        run: cargo fmt --all -- --check
 
       - name: Run Clippy
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
@@ -82,15 +46,3 @@ jobs:
         run: |
           cargo run --locked --quiet -- --output json host plan --file examples/quarry.yml \
             | jq -e '.schema_version == 1 and (.actions | length >= 2)'
-
-      - name: Publish verified branch
-        run: |
-          git checkout origin/main -- .github/workflows/ci.yml
-          rm -f .github/workflows/durable-journal-finish.yml
-          rm -f .github/durable-journal-status.txt
-          git diff --check
-          git config user.name github-actions[bot]
-          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add -A
-          git commit -m "Verify durable execution journal checkpoints"
-          git push origin HEAD:codex/durable-journal-checkpoints
