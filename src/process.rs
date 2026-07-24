@@ -318,7 +318,7 @@ fn terminate_child(child: &mut Child) -> io::Result<()> {
     }
     match child.kill() {
         Ok(()) => Ok(()),
-        Err(error) if child.try_wait()?.is_some() => Ok(()),
+        Err(_) if child.try_wait()?.is_some() => Ok(()),
         Err(error) => Err(error),
     }
 }
