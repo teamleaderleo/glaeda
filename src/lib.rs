@@ -30,6 +30,8 @@ pub mod ownership;
 pub mod plan;
 pub mod process;
 pub mod resource;
+#[cfg(target_os = "linux")]
+pub mod runner_user;
 pub mod state;
 pub mod state_document;
 pub mod state_store;
