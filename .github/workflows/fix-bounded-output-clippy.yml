@@ -1,0 +1,46 @@
+name: Fix bounded output Clippy
+
+on:
+  push:
+    branches: [feat/bounded-process-output]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fix-bounded-output-clippy
+  cancel-in-progress: true
+
+jobs:
+  fix:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: feat/bounded-process-output
+
+      - name: Apply Clippy fix
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('src/process.rs')
+          text = path.read_text()
+          old = '        Err(error) if child.try_wait()?.is_some() => Ok(()),\n'
+          new = '        Err(_) if child.try_wait()?.is_some() => Ok(()),\n'
+          if old not in text:
+              raise SystemExit('kill race Clippy anchor missing')
+          path.write_text(text.replace(old, new, 1))
+          PY
+          cargo fmt --all
+
+      - name: Commit fix and remove helper
+        run: |
+          rm .github/workflows/fix-bounded-output-clippy.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/process.rs .github/workflows/fix-bounded-output-clippy.yml
+          git commit -m "Fix bounded output Clippy warning"
+          git push origin HEAD:feat/bounded-process-output
