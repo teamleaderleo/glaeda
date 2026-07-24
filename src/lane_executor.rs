@@ -176,6 +176,46 @@ impl ReviewedExecutableVerifier for SystemExecutableVerifier {
     }
 }
 
+trait RunnerEvidence {
+    fn username(&self) -> &LinuxAccountName;
+    fn uid(&self) -> u32;
+    fn primary_gid(&self) -> u32;
+    fn home(&self) -> &str;
+    fn runtime_directory(&self) -> &Path;
+    fn subordinate_uid_count(&self) -> u64;
+    fn subordinate_gid_count(&self) -> u64;
+}
+
+impl RunnerEvidence for VerifiedRunnerUser {
+    fn username(&self) -> &LinuxAccountName {
+        self.username()
+    }
+
+    fn uid(&self) -> u32 {
+        self.uid()
+    }
+
+    fn primary_gid(&self) -> u32 {
+        self.primary_gid()
+    }
+
+    fn home(&self) -> &str {
+        self.home()
+    }
+
+    fn runtime_directory(&self) -> &Path {
+        self.runtime_directory()
+    }
+
+    fn subordinate_uid_count(&self) -> u64 {
+        self.subordinate_uid_count()
+    }
+
+    fn subordinate_gid_count(&self) -> u64 {
+        self.subordinate_gid_count()
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RootLaneExecutor;
 
@@ -256,7 +296,7 @@ fn execute_runner_user_lane(
     executables: &impl ReviewedExecutableVerifier,
     privilege: &impl PrivilegeProbe,
     command: &LaneCommand,
-    runner: &VerifiedRunnerUser,
+    runner: &impl RunnerEvidence,
 ) -> Result<LaneExecutionRecord, LaneExecutionError> {
     require_lane(command, ExecutionLane::RunnerUser)?;
     validate_runner_evidence(runner)?;
@@ -391,7 +431,7 @@ fn validate_loginctl(spec: &CommandSpec, arguments: &[&str]) -> Result<(), LaneE
     Ok(())
 }
 
-fn validate_runner_evidence(runner: &VerifiedRunnerUser) -> Result<(), LaneExecutionError> {
+fn validate_runner_evidence(runner: &impl RunnerEvidence) -> Result<(), LaneExecutionError> {
     if runner.uid() == 0
         || runner.primary_gid() == 0
         || runner.subordinate_uid_count() < MIN_SUBORDINATE_ID_COUNT
@@ -409,7 +449,7 @@ fn validate_runner_evidence(runner: &VerifiedRunnerUser) -> Result<(), LaneExecu
 
 fn validate_runner_command(
     command: &LaneCommand,
-    runner: &VerifiedRunnerUser,
+    runner: &impl RunnerEvidence,
 ) -> Result<(), LaneExecutionError> {
     let spec = command.spec();
     if !spec.environment.is_empty() || spec.program != Path::new(RUNUSER) {
@@ -539,11 +579,11 @@ mod tests {
     use crate::journal::{ExecutionLane, PlannedMutation, Preconditions, RollbackClass};
     use crate::lane_command::{LaneCommand, LinuxAccountName, PackageName, RunnerUserContext};
     use crate::process::{CommandExecutor, CommandSpec, ExecutionRecord};
-    use crate::runner_user::verified_runner_user_for_test;
+    use crate::runner_user::MIN_SUBORDINATE_ID_COUNT;
 
     use super::{
         ENV, GIT, LaneExecutionError, LaneExecutionErrorKind, PODMAN, PrivilegeProbe,
-        ReviewedExecutableVerifier, execute_root_lane, execute_runner_user_lane,
+        ReviewedExecutableVerifier, RunnerEvidence, execute_root_lane, execute_runner_user_lane,
         parse_effective_uid,
     };
 
@@ -644,6 +684,58 @@ mod tests {
             .expect("runner context")
     }
 
+    struct FakeRunnerEvidence {
+        username: LinuxAccountName,
+        uid: u32,
+        primary_gid: u32,
+        home: String,
+        runtime_directory: String,
+        subordinate_uid_count: u64,
+        subordinate_gid_count: u64,
+    }
+
+    impl RunnerEvidence for FakeRunnerEvidence {
+        fn username(&self) -> &LinuxAccountName {
+            &self.username
+        }
+
+        fn uid(&self) -> u32 {
+            self.uid
+        }
+
+        fn primary_gid(&self) -> u32 {
+            self.primary_gid
+        }
+
+        fn home(&self) -> &str {
+            &self.home
+        }
+
+        fn runtime_directory(&self) -> &std::path::Path {
+            std::path::Path::new(&self.runtime_directory)
+        }
+
+        fn subordinate_uid_count(&self) -> u64 {
+            self.subordinate_uid_count
+        }
+
+        fn subordinate_gid_count(&self) -> u64 {
+            self.subordinate_gid_count
+        }
+    }
+
+    fn runner_evidence(username: &str, uid: u32, gid: u32, home: &str) -> FakeRunnerEvidence {
+        FakeRunnerEvidence {
+            username: account(username),
+            uid,
+            primary_gid: gid,
+            home: home.to_owned(),
+            runtime_directory: format!("/run/user/{uid}"),
+            subordinate_uid_count: MIN_SUBORDINATE_ID_COUNT,
+            subordinate_gid_count: MIN_SUBORDINATE_ID_COUNT,
+        }
+    }
+
     #[test]
     fn root_executor_delivers_exact_empty_environment_and_retains_record() {
         let process = FakeProcess::successful();
@@ -684,8 +776,7 @@ mod tests {
         let executables = FakeVerifier::default();
         let privilege = root_privilege();
         let context = runner_context("project-runner", 1001, 1001);
-        let runner =
-            verified_runner_user_for_test("project-runner", 1001, 1001, "/srv/project-runner");
+        let runner = runner_evidence("project-runner", 1001, 1001, "/srv/project-runner");
         let command = LaneCommand::runner_git_version(
             &action("inspect-git", ExecutionLane::RunnerUser),
             &context,
@@ -768,7 +859,7 @@ mod tests {
         let executables = FakeVerifier::default();
         let privilege = root_privilege();
         let context = runner_context("project-runner", 1001, 1001);
-        let runner = verified_runner_user_for_test("other-runner", 1002, 1002, "/srv/other-runner");
+        let runner = runner_evidence("other-runner", 1002, 1002, "/srv/other-runner");
         let command = LaneCommand::runner_podman_info(
             &action("inspect-podman", ExecutionLane::RunnerUser),
             &context,
@@ -789,7 +880,7 @@ mod tests {
         let executables = FakeVerifier::default();
         let privilege = root_privilege();
         let context = runner_context("project-runner", 1001, 1001);
-        let runner = verified_runner_user_for_test("project-runner", 0, 1001, "/srv/project-runner");
+        let runner = runner_evidence("project-runner", 0, 1001, "/srv/project-runner");
         let command = LaneCommand::runner_git_version(
             &action("inspect-git", ExecutionLane::RunnerUser),
             &context,

@@ -25,7 +25,8 @@ The runner-steward design remains the foundation. Later milestones may extend th
 - [x] Canonical locators, immutable evidence, observation lanes, and survival policy for each resource kind.
 - [ ] Atomic ownership persistence with crash recovery.
 - [x] Atomic execution-journal checkpoints with explicit interrupted states.
-- [ ] Root and runner-user lane implementations.
+- [x] Typed root and runner-user lane executors with sealed command and environment boundaries.
+- [ ] Integrate lane executors with durable reconciliation journals.
 - [ ] Debian and Ubuntu host preparation.
 
 ## Milestone 2 — runner lifecycle

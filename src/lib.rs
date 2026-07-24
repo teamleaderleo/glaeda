@@ -9,6 +9,8 @@ pub mod journal_document;
 pub mod lane_command;
 #[cfg(target_os = "linux")]
 pub mod lane_executable;
+#[cfg(target_os = "linux")]
+pub mod lane_executor;
 pub mod lease;
 pub mod lease_catalog;
 pub mod lease_document;
