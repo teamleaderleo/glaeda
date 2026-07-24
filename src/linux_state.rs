@@ -58,6 +58,7 @@ impl WriteFaultInjector for NoWriteFaults {
 #[derive(Debug)]
 pub struct LinuxStateRoot {
     root: OwnedFd,
+    owner: (u32, u32),
 }
 
 impl LinuxStateRoot {
@@ -83,8 +84,11 @@ impl LinuxStateRoot {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StateStoreError> {
         let root =
             fs::open(path.as_ref(), DIRECTORY_FLAGS, Mode::empty()).map_err(map_root_open_error)?;
-        verify_directory(&root, "state root")?;
-        Ok(Self { root })
+        let stat = verify_managed_directory(&root, "state root", None)?;
+        Ok(Self {
+            root,
+            owner: (stat.st_uid, stat.st_gid),
+        })
     }
 
     /// Read one canonical state path without following symlinks in any component.
@@ -94,6 +98,7 @@ impl LinuxStateRoot {
     /// Returns `UnsafeFilesystem` for symlinks, non-directory parents, or non-regular final files;
     /// `CorruptState` for oversized files; and `Io` for other bounded read failures.
     pub fn read(&self, path: &StatePath) -> Result<StateRead, StateStoreError> {
+        verify_managed_directory(&self.root, "state root", Some(self.owner))?;
         let Some((file_name, parents)) = path.components().split_last() else {
             return Err(empty_state_path_error());
         };
@@ -103,7 +108,7 @@ impl LinuxStateRoot {
             let dirfd = active_directory(&self.root, current.as_ref());
             current = match fs::openat(dirfd, component.as_str(), DIRECTORY_FLAGS, Mode::empty()) {
                 Ok(directory) => {
-                    verify_directory(&directory, "state path parent")?;
+                    verify_managed_directory(&directory, "state path parent", Some(self.owner))?;
                     Some(directory)
                 }
                 Err(Errno::NOENT) => return Ok(StateRead::Missing),
@@ -117,7 +122,7 @@ impl LinuxStateRoot {
             Err(Errno::NOENT) => return Ok(StateRead::Missing),
             Err(error) => return Err(map_component_open_error(error)),
         };
-        verify_regular_file(&file, "state file", true)?;
+        verify_managed_file(&file, "state file", self.owner, true)?;
         read_bounded(file)
     }
 
@@ -146,9 +151,10 @@ impl LinuxStateRoot {
         record: &StateRecord,
         faults: &mut dyn WriteFaultInjector,
     ) -> Result<StateWriteReceipt, StateStoreError> {
+        verify_managed_directory(&self.root, "state root", Some(self.owner))?;
         let _lock = self.acquire_installation_lock(record.path())?;
         let (parent, file_name) = self.open_required_parent(record.path())?;
-        let disposition = inspect_destination(&parent, file_name)?;
+        let disposition = inspect_destination(&parent, file_name, self.owner)?;
         let (temporary, temporary_name) = create_temporary_file(&parent)?;
         let mut temporary_path = TemporaryPath::new(parent.as_fd(), temporary_name);
 
@@ -158,6 +164,7 @@ impl LinuxStateRoot {
                 "could not set private state-file permissions",
             )
         })?;
+        verify_managed_file(&temporary, "temporary state file", self.owner, false)?;
         write_and_sync(temporary, record.bytes(), faults)?;
 
         faults.check(WritePhase::Rename)?;
@@ -189,7 +196,7 @@ impl LinuxStateRoot {
         for component in parents {
             current = fs::openat(&current, component.as_str(), DIRECTORY_FLAGS, Mode::empty())
                 .map_err(map_required_parent_error)?;
-            verify_directory(&current, "state path parent")?;
+            verify_managed_directory(&current, "state path parent", Some(self.owner))?;
         }
         Ok((current, file_name))
     }
@@ -210,7 +217,7 @@ impl LinuxStateRoot {
             Mode::empty(),
         )
         .map_err(map_required_parent_error)?;
-        verify_directory(&installations, "installations directory")?;
+        verify_managed_directory(&installations, "installations directory", Some(self.owner))?;
         let installation = fs::openat(
             &installations,
             components[1].as_str(),
@@ -218,9 +225,9 @@ impl LinuxStateRoot {
             Mode::empty(),
         )
         .map_err(map_required_parent_error)?;
-        verify_directory(&installation, "installation directory")?;
+        verify_managed_directory(&installation, "installation directory", Some(self.owner))?;
 
-        let lock = open_installation_lock(&installation)?;
+        let lock = open_installation_lock(&installation, self.owner)?;
         match fs::flock(&lock, FlockOperation::NonBlockingLockExclusive) {
             Ok(()) => Ok(lock),
             Err(Errno::AGAIN) => Err(StateStoreError::public(
@@ -284,7 +291,10 @@ fn active_directory<'a>(root: &'a OwnedFd, current: Option<&'a OwnedFd>) -> Borr
     }
 }
 
-fn open_installation_lock(installation: &OwnedFd) -> Result<OwnedFd, StateStoreError> {
+fn open_installation_lock(
+    installation: &OwnedFd,
+    owner: (u32, u32),
+) -> Result<OwnedFd, StateStoreError> {
     match fs::openat(
         installation,
         LOCK_FILE_NAME,
@@ -298,6 +308,7 @@ fn open_installation_lock(installation: &OwnedFd) -> Result<OwnedFd, StateStoreE
                     "could not set installation-lock permissions",
                 )
             })?;
+            verify_lock_file(&lock, owner)?;
             Ok(lock)
         }
         Err(Errno::EXIST) => {
@@ -308,8 +319,7 @@ fn open_installation_lock(installation: &OwnedFd) -> Result<OwnedFd, StateStoreE
                 Mode::empty(),
             )
             .map_err(map_lock_open_error)?;
-            verify_regular_file(&lock, "installation lock", false)?;
-            verify_private_mode(&lock, "installation lock")?;
+            verify_lock_file(&lock, owner)?;
             Ok(lock)
         }
         Err(error) => Err(map_lock_open_error(error)),
@@ -319,11 +329,11 @@ fn open_installation_lock(installation: &OwnedFd) -> Result<OwnedFd, StateStoreE
 fn inspect_destination(
     parent: &OwnedFd,
     file_name: &StateComponent,
+    owner: (u32, u32),
 ) -> Result<StateWriteDisposition, StateStoreError> {
     match fs::openat(parent, file_name.as_str(), FILE_FLAGS, Mode::empty()) {
         Ok(file) => {
-            verify_regular_file(&file, "existing state file", true)?;
-            verify_private_mode(&file, "existing state file")?;
+            verify_managed_file(&file, "existing state file", owner, true)?;
             Ok(StateWriteDisposition::Replaced)
         }
         Err(Errno::NOENT) => Ok(StateWriteDisposition::Created),
@@ -404,28 +414,44 @@ fn write_and_sync(
     })
 }
 
-fn verify_directory(fd: &OwnedFd, subject: &str) -> Result<(), StateStoreError> {
+fn verify_managed_directory(
+    fd: &OwnedFd,
+    subject: &str,
+    expected_owner: Option<(u32, u32)>,
+) -> Result<rustix::fs::Stat, StateStoreError> {
     let stat = fs::fstat(fd).map_err(|_| {
         StateStoreError::public(
             StateStoreErrorKind::Io,
             format!("could not inspect {subject}"),
         )
     })?;
-    if FileType::from_raw_mode(stat.st_mode).is_dir() {
-        Ok(())
-    } else {
-        Err(StateStoreError::public(
+    if !FileType::from_raw_mode(stat.st_mode).is_dir() {
+        return Err(StateStoreError::public(
             StateStoreErrorKind::UnsafeFilesystem,
             format!("{subject} is not a directory"),
-        ))
+        ));
     }
+    if stat.st_mode & 0o7777 != 0o750 {
+        return Err(StateStoreError::public(
+            StateStoreErrorKind::UnsafeFilesystem,
+            format!("{subject} does not have mode 0750"),
+        ));
+    }
+    if expected_owner.is_some_and(|owner| owner != (stat.st_uid, stat.st_gid)) {
+        return Err(StateStoreError::public(
+            StateStoreErrorKind::UnsafeFilesystem,
+            format!("{subject} has an unexpected owner or group"),
+        ));
+    }
+    Ok(stat)
 }
 
-fn verify_regular_file(
+fn verify_managed_file(
     fd: &OwnedFd,
     subject: &str,
+    owner: (u32, u32),
     enforce_size_limit: bool,
-) -> Result<(), StateStoreError> {
+) -> Result<rustix::fs::Stat, StateStoreError> {
     let stat = fs::fstat(fd).map_err(|_| {
         StateStoreError::public(
             StateStoreErrorKind::Io,
@@ -438,6 +464,24 @@ fn verify_regular_file(
             format!("{subject} is not a regular file"),
         ));
     }
+    if stat.st_nlink != 1 {
+        return Err(StateStoreError::public(
+            StateStoreErrorKind::UnsafeFilesystem,
+            format!("{subject} has multiple hard links"),
+        ));
+    }
+    if stat.st_mode & 0o7777 != 0o600 {
+        return Err(StateStoreError::public(
+            StateStoreErrorKind::UnsafeFilesystem,
+            format!("{subject} does not have mode 0600"),
+        ));
+    }
+    if owner != (stat.st_uid, stat.st_gid) {
+        return Err(StateStoreError::public(
+            StateStoreErrorKind::UnsafeFilesystem,
+            format!("{subject} has an unexpected owner or group"),
+        ));
+    }
     if enforce_size_limit
         && (stat.st_size < 0 || stat.st_size as u64 > MAX_STATE_DOCUMENT_BYTES as u64)
     {
@@ -446,22 +490,17 @@ fn verify_regular_file(
             format!("{subject} exceeds the configured size limit"),
         ));
     }
-    Ok(())
+    Ok(stat)
 }
 
-fn verify_private_mode(fd: &OwnedFd, subject: &str) -> Result<(), StateStoreError> {
-    let stat = fs::fstat(fd).map_err(|_| {
-        StateStoreError::public(
-            StateStoreErrorKind::Io,
-            format!("could not inspect {subject} permissions"),
-        )
-    })?;
-    if stat.st_mode & 0o7777 == 0o600 {
+fn verify_lock_file(fd: &OwnedFd, owner: (u32, u32)) -> Result<(), StateStoreError> {
+    let stat = verify_managed_file(fd, "installation lock", owner, false)?;
+    if stat.st_size == 0 {
         Ok(())
     } else {
         Err(StateStoreError::public(
-            StateStoreErrorKind::UnsafeFilesystem,
-            format!("{subject} does not have mode 0600"),
+            StateStoreErrorKind::CorruptState,
+            "installation lock contains unexpected data",
         ))
     }
 }
@@ -556,7 +595,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use rustix::fs::{self as rustix_fs, FlockOperation};
+    use rustix::fs::{self as rustix_fs, FlockOperation, Mode};
 
     use crate::manifest::RunnerScope;
     use crate::ownership::ProjectIdentity;
@@ -567,7 +606,10 @@ mod tests {
         StateWriteDisposition,
     };
 
-    use super::{LOCK_FILE_NAME, LinuxStateRoot, TEMP_FILE_PREFIX, WriteFaultInjector, WritePhase};
+    use super::{
+        FILE_FLAGS, LOCK_FILE_NAME, LinuxStateRoot, TEMP_FILE_PREFIX, WriteFaultInjector,
+        WritePhase, verify_managed_directory, verify_managed_file,
+    };
 
     static NEXT_TEMP_ROOT: AtomicU64 = AtomicU64::new(1);
 
@@ -583,6 +625,8 @@ mod tests {
                 std::process::id()
             ));
             fs::create_dir(&path).expect("create isolated temporary root");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o750))
+                .expect("set state-root mode");
             Self { path }
         }
 
@@ -602,8 +646,13 @@ mod tests {
     }
 
     fn create_project_parent(root: &Path) -> PathBuf {
-        let installation = root.join("installations").join(installation_id().as_str());
+        let installations = root.join("installations");
+        let installation = installations.join(installation_id().as_str());
         fs::create_dir_all(&installation).expect("create project parent");
+        for directory in [&installations, &installation] {
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o750))
+                .expect("set managed directory mode");
+        }
         installation
     }
 
@@ -659,8 +708,10 @@ mod tests {
     fn reads_regular_file_through_canonical_components() {
         let root = TempTree::new("regular-read");
         let parent = create_project_parent(root.path());
-        fs::write(parent.join("project.json"), b"{\"schema_version\":1}\n")
-            .expect("write project state");
+        let project_path = parent.join("project.json");
+        fs::write(&project_path, b"{\"schema_version\":1}\n").expect("write project state");
+        fs::set_permissions(&project_path, fs::Permissions::from_mode(0o600))
+            .expect("set project-state mode");
 
         let reader = LinuxStateRoot::open(root.path()).expect("open state root");
         assert_eq!(
@@ -721,6 +772,78 @@ mod tests {
     }
 
     #[test]
+    fn broad_root_parent_or_state_file_is_rejected() {
+        let root = TempTree::new("broad-managed-state");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o755))
+            .expect("broaden state root");
+        let error = LinuxStateRoot::open(root.path()).expect_err("broad root must fail");
+        assert_eq!(error.kind(), StateStoreErrorKind::UnsafeFilesystem);
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o750))
+            .expect("restore state-root mode");
+
+        let parent = create_project_parent(root.path());
+        let installations = root.path().join("installations");
+        fs::set_permissions(&installations, fs::Permissions::from_mode(0o755))
+            .expect("broaden installations directory");
+        let reader = LinuxStateRoot::open(root.path()).expect("open restored state root");
+        let error = reader
+            .read(&StateLayout::project_document(&installation_id()))
+            .expect_err("broad parent must fail");
+        assert_eq!(error.kind(), StateStoreErrorKind::UnsafeFilesystem);
+        fs::set_permissions(&installations, fs::Permissions::from_mode(0o750))
+            .expect("restore installations mode");
+
+        let project_path = parent.join("project.json");
+        fs::write(&project_path, b"state").expect("write state file");
+        fs::set_permissions(&project_path, fs::Permissions::from_mode(0o644))
+            .expect("broaden state-file mode");
+        let error = reader
+            .read(&StateLayout::project_document(&installation_id()))
+            .expect_err("broad state file must fail");
+        assert_eq!(error.kind(), StateStoreErrorKind::UnsafeFilesystem);
+    }
+
+    #[test]
+    fn hard_linked_state_file_is_rejected() {
+        let root = TempTree::new("hard-linked-state");
+        let parent = create_project_parent(root.path());
+        let project_path = parent.join("project.json");
+        fs::write(&project_path, b"state").expect("write state file");
+        fs::set_permissions(&project_path, fs::Permissions::from_mode(0o600))
+            .expect("set state-file mode");
+        fs::hard_link(&project_path, parent.join("project-alias.json"))
+            .expect("create state hard link");
+
+        let reader = LinuxStateRoot::open(root.path()).expect("open state root");
+        let error = reader
+            .read(&StateLayout::project_document(&installation_id()))
+            .expect_err("hard-linked state must fail");
+        assert_eq!(error.kind(), StateStoreErrorKind::UnsafeFilesystem);
+    }
+
+    #[test]
+    fn unexpected_directory_or_file_owner_is_rejected() {
+        let root = TempTree::new("owner-mismatch");
+        let parent = create_project_parent(root.path());
+        let project_path = parent.join("project.json");
+        fs::write(&project_path, b"state").expect("write state file");
+        fs::set_permissions(&project_path, fs::Permissions::from_mode(0o600))
+            .expect("set state-file mode");
+
+        let reader = LinuxStateRoot::open(root.path()).expect("open state root");
+        let wrong_owner = (reader.owner.0.wrapping_add(1), reader.owner.1);
+        let error = verify_managed_directory(&reader.root, "state root", Some(wrong_owner))
+            .expect_err("unexpected directory owner must fail");
+        assert_eq!(error.kind(), StateStoreErrorKind::UnsafeFilesystem);
+
+        let file =
+            rustix_fs::open(&project_path, FILE_FLAGS, Mode::empty()).expect("open state file");
+        let error = verify_managed_file(&file, "state file", wrong_owner, true)
+            .expect_err("unexpected file owner must fail");
+        assert_eq!(error.kind(), StateStoreErrorKind::UnsafeFilesystem);
+    }
+
+    #[test]
     fn symlinked_root_is_rejected() {
         let actual = TempTree::new("actual-root");
         let link_parent = TempTree::new("root-link-parent");
@@ -743,11 +866,11 @@ mod tests {
         assert_eq!(error.kind(), StateStoreErrorKind::UnsafeFilesystem);
 
         fs::remove_dir(parent.join("project.json")).expect("remove directory");
-        fs::write(
-            parent.join("project.json"),
-            vec![0_u8; MAX_STATE_DOCUMENT_BYTES + 1],
-        )
-        .expect("write oversized state");
+        let oversized = parent.join("project.json");
+        fs::write(&oversized, vec![0_u8; MAX_STATE_DOCUMENT_BYTES + 1])
+            .expect("write oversized state");
+        fs::set_permissions(&oversized, fs::Permissions::from_mode(0o600))
+            .expect("set oversized state mode");
         let error = reader
             .read(&StateLayout::project_document(&installation_id()))
             .expect_err("oversized state must fail");
