@@ -36,10 +36,10 @@ const TEMP_FILE_PREFIX: &str = ".smolrunner-tmp-";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WritePhase {
-    BeforeWrite,
-    BeforeFileSync,
-    BeforeRename,
-    BeforeParentSync,
+    Write,
+    FileSync,
+    Rename,
+    ParentSync,
 }
 
 trait WriteFaultInjector {
@@ -160,12 +160,12 @@ impl LinuxStateRoot {
         })?;
         write_and_sync(temporary, record.bytes(), faults)?;
 
-        faults.check(WritePhase::BeforeRename)?;
+        faults.check(WritePhase::Rename)?;
         fs::renameat(&parent, temporary_path.name(), &parent, file_name.as_str())
             .map_err(map_rename_error)?;
         temporary_path.disarm();
 
-        faults.check(WritePhase::BeforeParentSync)?;
+        faults.check(WritePhase::ParentSync)?;
         fs::fsync(&parent).map_err(|_| {
             StateStoreError::public(
                 StateStoreErrorKind::Io,
@@ -388,14 +388,14 @@ fn write_and_sync(
     faults: &mut dyn WriteFaultInjector,
 ) -> Result<(), StateStoreError> {
     let mut file = File::from(fd);
-    faults.check(WritePhase::BeforeWrite)?;
+    faults.check(WritePhase::Write)?;
     file.write_all(bytes).map_err(|_| {
         StateStoreError::public(
             StateStoreErrorKind::Io,
             "could not write temporary state file",
         )
     })?;
-    faults.check(WritePhase::BeforeFileSync)?;
+    faults.check(WritePhase::FileSync)?;
     fs::fsync(&file).map_err(|_| {
         StateStoreError::public(
             StateStoreErrorKind::Io,
@@ -630,16 +630,12 @@ mod tests {
                 return Ok(());
             }
             let message = match phase {
-                WritePhase::BeforeWrite => {
-                    "injected state-write failure before temporary-file write"
-                }
-                WritePhase::BeforeFileSync => {
+                WritePhase::Write => "injected state-write failure before temporary-file write",
+                WritePhase::FileSync => {
                     "injected state-write failure before temporary-file synchronization"
                 }
-                WritePhase::BeforeRename => {
-                    "injected state-write failure before publication rename"
-                }
-                WritePhase::BeforeParentSync => {
+                WritePhase::Rename => "injected state-write failure before publication rename",
+                WritePhase::ParentSync => {
                     "state file was published before an injected parent-sync failure"
                 }
             };
@@ -799,11 +795,7 @@ mod tests {
 
     #[test]
     fn prepublication_failures_preserve_existing_state_and_remove_temporary_files() {
-        for point in [
-            WritePhase::BeforeWrite,
-            WritePhase::BeforeFileSync,
-            WritePhase::BeforeRename,
-        ] {
+        for point in [WritePhase::Write, WritePhase::FileSync, WritePhase::Rename] {
             let root = TempTree::new(&format!("prepublication-{point:?}"));
             let parent = create_project_parent(root.path());
             let mut store = LinuxStateRoot::open(root.path()).expect("open state root");
@@ -833,7 +825,7 @@ mod tests {
         store.write_atomic(&original).expect("write original state");
 
         let replacement = project_record("example/replacement");
-        let mut faults = FailAt(WritePhase::BeforeParentSync);
+        let mut faults = FailAt(WritePhase::ParentSync);
         let error = store
             .write_atomic_with_faults(&replacement, &mut faults)
             .expect_err("injected parent-sync failure must fail");
