@@ -117,6 +117,8 @@ Podman inspect evidence now binds to the exact reviewed command and successful e
 
 Existing-container mutations now require a compatible observed Podman state in addition to exact ownership. Start is limited to inactive startable states, stop to running, and unforced remove to inactive removable states; missing, paused, transitional, dead, and unknown states fail closed. See [ADR 0011](docs/adr/0011-podman-state-aware-mutation-authorization.md).
 
+State reconciliation now distinguishes executable work, an already satisfied goal, and a blocked state before authorization. Running start requests and inactive stop requests become explicit no-ops, while blocked states still cannot produce a subprocess command. See [ADR 0012](docs/adr/0012-podman-state-reconciliation-plans.md).
+
 See [leased execution and previews](docs/LEASED_EXECUTION.md) and the updated [roadmap](docs/ROADMAP.md).
 
 ## Intended workflow
@@ -176,6 +178,7 @@ cargo run --locked --quiet -- --output json host plan --file examples/quarry.yml
 - [ADR 0009: bounded subprocess output capture](docs/adr/0009-bounded-subprocess-output.md)
 - [ADR 0010: Podman inspect execution receipts](docs/adr/0010-podman-inspect-execution-receipts.md)
 - [ADR 0011: Podman state-aware mutation authorization](docs/adr/0011-podman-state-aware-mutation-authorization.md)
+- [ADR 0012: Podman state reconciliation plans](docs/adr/0012-podman-state-reconciliation-plans.md)
 - [Roadmap](docs/ROADMAP.md)
 - [Agent instructions](AGENTS.md)
 
