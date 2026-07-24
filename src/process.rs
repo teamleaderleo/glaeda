@@ -313,10 +313,14 @@ fn capture_stream(
 }
 
 fn terminate_child(child: &mut Child) -> io::Result<()> {
-    if child.try_wait()?.is_none() {
-        child.kill()?;
+    if child.try_wait()?.is_some() {
+        return Ok(());
     }
-    Ok(())
+    match child.kill() {
+        Ok(()) => Ok(()),
+        Err(error) if child.try_wait()?.is_some() => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 fn join_capture_reader(handle: JoinHandle<()>) -> io::Result<()> {
@@ -405,12 +409,9 @@ mod tests {
             return Ok(());
         }
         let chunk = 256 * 1_024;
-        let script = format!(
-            "import os; os.write(1, b'o' * {chunk}); os.write(2, b'e' * {chunk})"
-        );
-        let record = ProcessExecutor.execute(
-            &CommandSpec::new(python).argument("-c").argument(script),
-        )?;
+        let script = format!("import os; os.write(1, b'o' * {chunk}); os.write(2, b'e' * {chunk})");
+        let record =
+            ProcessExecutor.execute(&CommandSpec::new(python).argument("-c").argument(script))?;
 
         assert!(record.success);
         assert_eq!(record.stdout.len(), chunk);
@@ -441,7 +442,11 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains(stream));
-        assert!(error.to_string().contains(&MAX_CAPTURED_STREAM_BYTES.to_string()));
+        assert!(
+            error
+                .to_string()
+                .contains(&MAX_CAPTURED_STREAM_BYTES.to_string())
+        );
         Ok(())
     }
 }
