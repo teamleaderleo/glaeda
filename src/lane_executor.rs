@@ -126,7 +126,7 @@ trait PrivilegeProbe {
 }
 
 #[derive(Debug, Default, Clone, Copy)]
-pub struct ProcStatusPrivilegeProbe;
+struct ProcStatusPrivilegeProbe;
 
 impl PrivilegeProbe for ProcStatusPrivilegeProbe {
     fn effective_uid(&self) -> io::Result<u32> {
@@ -154,7 +154,7 @@ trait ReviewedExecutableVerifier {
 }
 
 #[derive(Debug, Default, Clone, Copy)]
-pub struct SystemExecutableVerifier;
+struct SystemExecutableVerifier;
 
 impl ReviewedExecutableVerifier for SystemExecutableVerifier {
     fn verify(&self, command: &LaneCommand) -> Result<(), LaneExecutionError> {
