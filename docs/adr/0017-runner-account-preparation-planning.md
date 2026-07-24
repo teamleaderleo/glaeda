@@ -55,7 +55,7 @@ Proven absence may produce these root-lane commands:
 - `usermod --add-subgids FIRST-LAST -- USER`;
 - `loginctl enable-linger USER`.
 
-All arguments are constructed from validated typed names, canonical paths, and checked numeric ranges. Commands use absolute executable paths, an empty environment, and no shell.
+All arguments are constructed from validated typed names, canonical paths, and checked numeric ranges. Commands use absolute executable paths, an empty environment, and no shell. Both command construction and root-executor validation reject subordinate ranges containing fewer than 65,536 IDs.
 
 ### Rollback classification
 
