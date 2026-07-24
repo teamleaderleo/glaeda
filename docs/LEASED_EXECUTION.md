@@ -6,6 +6,8 @@ This document records an exploratory product direction. It expands SmolRunner's 
 
 The dependable host, ownership, privilege, rollback, runner-lifecycle, and disposable-execution work remains the foundation. Leased workspaces and previews become optional capabilities built on that foundation after the existing safety model can support mutations.
 
+The first platform-independent implementation slice now exists in `src/lease.rs`: validated lease identities, lease kinds, legal lifecycle transitions, renewal, sleeping, terminal states, and optimistic revisions. [ADR 0004](adr/0004-lease-lifecycle-core.md) records that decision. Persistence, clocks, artifact provenance, host mutation, and preview routing remain future work.
+
 ## Product direction
 
 SmolRunner can grow from a steward for self-hosted GitHub Actions runners into a small execution host for the machines an operator already owns.
