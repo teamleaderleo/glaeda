@@ -7,9 +7,13 @@
 
 The dependency-aware runner account plan needs more than name existence. It must distinguish a safely matching primary group and runner user from missing, ambiguous, malformed, stale, or conflicting state. It also needs exact evidence for the desired home directory, subordinate UID/GID ranges, and systemd linger marker.
 
-Reading only `/etc/passwd` and `/etc/group` is not sufficient because Debian and Ubuntu may resolve accounts through NSS. Conversely, a failed NSS lookup must never be treated as proof that an account is absent. Subordinate-ID files and filesystem markers also require bounded, no-follow inspection so symlinks, hard links, writable authority files, or ranges owned by another account cannot authorize mutation.
+Reading only `/etc/passwd` and `/etc/group` is not sufficient because Debian and Ubuntu may resolve accounts through NSS. Conversely, a failed NSS lookup must never be treated as proof that an account is absent. Subordinate-ID files and filesystem markers also require bounded, no-follow inspection so symlinks, hard links, writable authority files, ranges owned by another account, or relative attacker-controlled paths cannot authorize mutation.
 
 ## Decision
+
+### Observation paths
+
+The default authority paths are `/etc/subuid`, `/etc/subgid`, and `/var/lib/systemd/linger`. Relocated paths are accepted only through a validated constructor requiring canonical, non-root absolute UTF-8 paths without aliases, trailing separators, control characters, or excessive length.
 
 ### NSS lookups
 
