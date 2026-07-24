@@ -341,9 +341,7 @@ fn validate_identity_value(field: &str, value: &str) -> Result<(), DebianPackage
     if value.is_empty()
         || value.len() > 64
         || !value.bytes().all(|byte| {
-            byte.is_ascii_lowercase()
-                || byte.is_ascii_digit()
-                || matches!(byte, b'.' | b'_' | b'-')
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
         })
     {
         return Err(DebianPackagePlanError::single(format!(
@@ -374,8 +372,7 @@ mod tests {
     };
 
     fn ubuntu() -> super::DistributionIdentity {
-        parse_os_release("NAME=Ubuntu\nID=ubuntu\nVERSION_ID=\"24.04\"\n")
-            .expect("Ubuntu identity")
+        parse_os_release("NAME=Ubuntu\nID=ubuntu\nVERSION_ID=\"24.04\"\n").expect("Ubuntu identity")
     }
 
     fn inventory(default: Presence) -> BTreeMap<String, Presence> {
@@ -399,10 +396,8 @@ mod tests {
     #[test]
     fn malformed_unsupported_and_oversized_identity_fails_closed() {
         parse_os_release("ID=fedora\nVERSION_ID=42\n").expect_err("unsupported distribution");
-        parse_os_release("ID=ubuntu\nID=ubuntu\nVERSION_ID=24.04\n")
-            .expect_err("duplicate ID");
-        parse_os_release("ID=ubuntu\nVERSION_ID=\"24.04\n")
-            .expect_err("malformed quote");
+        parse_os_release("ID=ubuntu\nID=ubuntu\nVERSION_ID=24.04\n").expect_err("duplicate ID");
+        parse_os_release("ID=ubuntu\nVERSION_ID=\"24.04\n").expect_err("malformed quote");
         parse_os_release(&"x".repeat(super::MAX_OS_RELEASE_BYTES + 1))
             .expect_err("oversized identity");
     }
