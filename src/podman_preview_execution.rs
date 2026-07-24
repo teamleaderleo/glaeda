@@ -215,10 +215,7 @@ mod tests {
         .expect("runner context")
     }
 
-    fn execution_record(
-        spec: &PreviewContainerSpec,
-        plan: &PreviewPodmanPlan,
-    ) -> ExecutionRecord {
+    fn execution_record(spec: &PreviewContainerSpec, plan: &PreviewPodmanPlan) -> ExecutionRecord {
         let inspect = &plan.provision()[2];
         ExecutionRecord {
             argv: inspect.spec().displayed_argv(),
