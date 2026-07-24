@@ -468,15 +468,15 @@ fn validate_stop_position(journal: &ExecutionJournal, problems: &mut Vec<String>
                         problems.push("records after a failed stop must remain pending".to_owned());
                     }
                 }
-                ActionOutcome::Skipped => {
+                ActionOutcome::Skipped
                     if journal.records.iter().enumerate().any(|(index, record)| {
                         index != stop_index && record.outcome != ActionOutcome::Pending
-                    }) {
-                        problems.push(
-                            "all records other than a skipped preflight stop must remain pending"
-                                .to_owned(),
-                        );
-                    }
+                    }) =>
+                {
+                    problems.push(
+                        "all records other than a skipped preflight stop must remain pending"
+                            .to_owned(),
+                    );
                 }
                 _ => {}
             }
