@@ -23,6 +23,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
+          # One bounded source correction and nonprivileged regression test; no project execution.
           python3 - <<'PY'
           from pathlib import Path
 
