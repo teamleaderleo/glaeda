@@ -58,7 +58,7 @@ The runner-steward design remains the foundation. Later milestones may extend th
 - [x] Record the optional leased-execution and preview direction.
 - [x] Define platform-independent lease kinds, states, legal transitions, terminal behavior, and optimistic revisions.
 - [x] Record the initial lifecycle decision in ADR 0004.
-- [ ] Define crash-safe lease persistence and stale-revision rejection.
+- [x] Define crash-safe lease persistence and stale-revision rejection.
 - [ ] Define source, artifact, preview-slot, and route ownership evidence.
 - [ ] Define expiry deadlines, renewal windows, and clock-recovery behavior.
 - [ ] Map lease cleanup into typed execution-journal actions.
@@ -66,11 +66,11 @@ The runner-steward design remains the foundation. Later milestones may extend th
 
 ## Milestone 6 — local previews
 
-- [ ] Accept a verified immutable OCI image digest or static artifact.
-- [ ] Plan one local preview without mutation.
+- [x] Accept a verified immutable OCI image digest or static artifact.
+- [x] Plan one local preview without mutation.
 - [ ] Start a bounded rootless Podman preview.
 - [ ] Reconcile a temporary route through a narrow reverse-proxy adapter.
-- [ ] Keep a stable preview slot while verified artifacts supersede one another.
+- [x] Keep a stable preview slot while verified artifacts supersede one another.
 - [ ] Expire previews automatically and recover cleanup after host restart.
 - [ ] Measure startup time, idle memory, and retained disk use on a small VPS.
 

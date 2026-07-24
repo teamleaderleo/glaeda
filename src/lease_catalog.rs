@@ -56,8 +56,10 @@ pub enum LeaseStoreErrorKind {
     AlreadyExists,
     Missing,
     Conflict,
+    Busy,
     InvalidTransition,
     CorruptState,
+    UnsafeFilesystem,
     Io,
 }
 

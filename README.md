@@ -103,7 +103,7 @@ The proposed policy keeps frequent verification separate from live deployment: G
 
 The first implementation slice is a platform-independent, revisioned lease lifecycle for runs, retained workspaces, and previews. It plans legal state transitions without persistence or host mutation. See [ADR 0004](docs/adr/0004-lease-lifecycle-core.md).
 
-The next slice adds fail-closed lease documents, an atomic no-replace and compare-and-swap storage contract, stale-revision rejection, and immutable artifact identities. The included memory store proves concurrency semantics for tests; process-durable Linux persistence remains deferred to an adapter under the existing installation lock. See [ADR 0005](docs/adr/0005-lease-store-and-artifact-identity.md).
+The next slice adds fail-closed lease documents, an atomic no-replace and compare-and-swap storage contract, stale-revision rejection, and immutable artifact identities. The included memory store proves concurrency semantics for tests. See [ADR 0005](docs/adr/0005-lease-store-and-artifact-identity.md).
 
 Preview-slot planning now coalesces repeated requests for the same artifact, port, and health endpoint into one runtime generation with a renewed lease. Changed runtime inputs produce one checked replacement generation. Bounded typed ports, lifetimes, health paths, and generation counters prevent callers from forging invalid plans. See [ADR 0006](docs/adr/0006-preview-slot-coalescing.md).
 
@@ -118,6 +118,8 @@ Podman inspect evidence now binds to the exact reviewed command and successful e
 Existing-container mutations now require a compatible observed Podman state in addition to exact ownership. Start is limited to inactive startable states, stop to running, and unforced remove to inactive removable states; missing, paused, transitional, dead, and unknown states fail closed. See [ADR 0011](docs/adr/0011-podman-state-aware-mutation-authorization.md).
 
 State reconciliation now distinguishes executable work, an already satisfied goal, and a blocked state before authorization. Running start requests and inactive stop requests become explicit no-ops, while blocked states still cannot produce a subprocess command. See [ADR 0012](docs/adr/0012-podman-state-reconciliation-plans.md).
+
+Lease records now have a process-durable Linux adapter beneath each installation. It validates filesystem ownership and permissions, serializes writers with a persistent lock, and publishes private versioned documents through synchronized atomic rename. See [ADR 0013](docs/adr/0013-durable-linux-lease-store.md).
 
 See [leased execution and previews](docs/LEASED_EXECUTION.md) and the updated [roadmap](docs/ROADMAP.md).
 
@@ -179,6 +181,7 @@ cargo run --locked --quiet -- --output json host plan --file examples/quarry.yml
 - [ADR 0010: Podman inspect execution receipts](docs/adr/0010-podman-inspect-execution-receipts.md)
 - [ADR 0011: Podman state-aware mutation authorization](docs/adr/0011-podman-state-aware-mutation-authorization.md)
 - [ADR 0012: Podman state reconciliation plans](docs/adr/0012-podman-state-reconciliation-plans.md)
+- [ADR 0013: durable Linux lease store](docs/adr/0013-durable-linux-lease-store.md)
 - [Roadmap](docs/ROADMAP.md)
 - [Agent instructions](AGENTS.md)
 
