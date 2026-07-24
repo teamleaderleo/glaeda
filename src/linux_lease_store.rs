@@ -8,19 +8,23 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use rustix::fs::{self, AtFlags, FileType, FlockOperation, Mode, OFlags, RenameFlags};
 use rustix::io::Errno;
 
-use crate::lease::{LeaseRecord, LEASE_SCHEMA_VERSION};
+use crate::lease::{LEASE_SCHEMA_VERSION, LeaseRecord};
 use crate::lease_catalog::{
     LeaseSelector, LeaseStore, LeaseStoreError, LeaseStoreErrorKind, LeaseWriteDisposition,
     LeaseWriteReceipt,
 };
-use crate::lease_document::{decode_lease_document, encode_lease_document, MAX_LEASE_DOCUMENT_BYTES};
+use crate::lease_document::{
+    MAX_LEASE_DOCUMENT_BYTES, decode_lease_document, encode_lease_document,
+};
 use crate::state::InstallationId;
 
 const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::DIRECTORY)
     .union(OFlags::NOFOLLOW)
     .union(OFlags::CLOEXEC);
-const EXISTING_FILE_FLAGS: OFlags = OFlags::RDONLY.union(OFlags::NOFOLLOW).union(OFlags::CLOEXEC);
+const EXISTING_FILE_FLAGS: OFlags = OFlags::RDONLY
+    .union(OFlags::NOFOLLOW)
+    .union(OFlags::CLOEXEC);
 const EXISTING_LOCK_FLAGS: OFlags = OFlags::RDWR.union(OFlags::NOFOLLOW).union(OFlags::CLOEXEC);
 const NEW_FILE_FLAGS: OFlags = OFlags::WRONLY
     .union(OFlags::CREATE)
@@ -147,7 +151,9 @@ impl LinuxLeaseStore {
         File::from(file)
             .take((MAX_LEASE_DOCUMENT_BYTES + 1) as u64)
             .read_to_end(&mut bytes)
-            .map_err(|_| store_error(LeaseStoreErrorKind::Io, "could not read the lease document"))?;
+            .map_err(|_| {
+                store_error(LeaseStoreErrorKind::Io, "could not read the lease document")
+            })?;
         if bytes.len() > MAX_LEASE_DOCUMENT_BYTES {
             return Err(store_error(
                 LeaseStoreErrorKind::CorruptState,
@@ -293,9 +299,9 @@ impl LeaseStore for LinuxLeaseStore {
         })?;
 
         let _lock = self.acquire_mutation_lock()?;
-        let current = self.load_locked(&selector)?.ok_or_else(|| {
-            store_error(LeaseStoreErrorKind::Missing, "lease does not exist")
-        })?;
+        let current = self
+            .load_locked(&selector)?
+            .ok_or_else(|| store_error(LeaseStoreErrorKind::Missing, "lease does not exist"))?;
         if current.identity != record.identity {
             return Err(store_error(
                 LeaseStoreErrorKind::CorruptState,
@@ -370,7 +376,12 @@ fn ensure_leases_directory(
     installation: &OwnedFd,
     owner: (u32, u32),
 ) -> Result<OwnedFd, LeaseStoreError> {
-    match fs::openat(installation, LEASES_DIRECTORY, DIRECTORY_FLAGS, Mode::empty()) {
+    match fs::openat(
+        installation,
+        LEASES_DIRECTORY,
+        DIRECTORY_FLAGS,
+        Mode::empty(),
+    ) {
         Ok(directory) => {
             inspect_directory(&directory, "lease directory", Some(owner))?;
             Ok(directory)
@@ -460,8 +471,12 @@ fn inspect_directory(
     subject: &str,
     expected_owner: Option<(u32, u32)>,
 ) -> Result<rustix::fs::Stat, LeaseStoreError> {
-    let stat = fs::fstat(directory)
-        .map_err(|_| store_error(LeaseStoreErrorKind::Io, format!("could not inspect {subject}")))?;
+    let stat = fs::fstat(directory).map_err(|_| {
+        store_error(
+            LeaseStoreErrorKind::Io,
+            format!("could not inspect {subject}"),
+        )
+    })?;
     if !FileType::from_raw_mode(stat.st_mode).is_dir() {
         return Err(store_error(
             LeaseStoreErrorKind::UnsafeFilesystem,
@@ -489,8 +504,12 @@ fn inspect_private_file(
     subject: &str,
     expected_size: Option<usize>,
 ) -> Result<(), LeaseStoreError> {
-    let stat = fs::fstat(file.as_fd())
-        .map_err(|_| store_error(LeaseStoreErrorKind::Io, format!("could not inspect {subject}")))?;
+    let stat = fs::fstat(file.as_fd()).map_err(|_| {
+        store_error(
+            LeaseStoreErrorKind::Io,
+            format!("could not inspect {subject}"),
+        )
+    })?;
     if !FileType::from_raw_mode(stat.st_mode).is_file() {
         return Err(store_error(
             LeaseStoreErrorKind::UnsafeFilesystem,
@@ -515,7 +534,8 @@ fn inspect_private_file(
             format!("{subject} has an unexpected owner or group"),
         ));
     }
-    if expected_size.is_some_and(|expected| stat.st_size < 0 || stat.st_size as u64 != expected as u64)
+    if expected_size
+        .is_some_and(|expected| stat.st_size < 0 || stat.st_size as u64 != expected as u64)
     {
         return Err(store_error(
             LeaseStoreErrorKind::CorruptState,
@@ -578,7 +598,10 @@ fn map_leases_open_error(error: Errno) -> LeaseStoreError {
             LeaseStoreErrorKind::UnsafeFilesystem,
             "lease directory is symlinked or invalid",
         ),
-        _ => store_error(LeaseStoreErrorKind::Io, "could not open the lease directory"),
+        _ => store_error(
+            LeaseStoreErrorKind::Io,
+            "could not open the lease directory",
+        ),
     }
 }
 
@@ -705,10 +728,7 @@ mod tests {
 
         let reopened = LinuxLeaseStore::open_or_create(root.path(), installation_id())
             .expect("reopen durable store");
-        assert_eq!(
-            reopened.load(&selector).expect("load lease"),
-            Some(active)
-        );
+        assert_eq!(reopened.load(&selector).expect("load lease"), Some(active));
         assert!(root.path().join(LEASES_DIRECTORY).is_dir());
         assert!(root.path().join(LEASES_LOCK_FILE).is_file());
     }
@@ -758,7 +778,9 @@ mod tests {
             InstallationId::parse("installation-002").expect("foreign installation ID"),
             LeaseKind::Preview,
         ));
-        let error = store.create(&foreign).expect_err("foreign identity must fail");
+        let error = store
+            .create(&foreign)
+            .expect_err("foreign identity must fail");
         assert_eq!(error.kind, LeaseStoreErrorKind::CorruptState);
     }
 }
