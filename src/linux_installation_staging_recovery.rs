@@ -241,12 +241,7 @@ fn inspect_staged_entry(
         StagedInstallationConcern::UnsafeJournals,
         &mut concerns,
     );
-    inspect_project(
-        &directory,
-        owner,
-        installation_id.as_ref(),
-        &mut concerns,
-    );
+    inspect_project(&directory, owner, installation_id.as_ref(), &mut concerns);
     finish_finding(name_bytes, concerns)
 }
 
@@ -290,10 +285,7 @@ fn inspect_entry_directory(
     }
 }
 
-fn inspect_stage_contents(
-    directory: &OwnedFd,
-    concerns: &mut Vec<StagedInstallationConcern>,
-) {
+fn inspect_stage_contents(directory: &OwnedFd, concerns: &mut Vec<StagedInstallationConcern>) {
     let mut entries = match Dir::read_from(directory) {
         Ok(entries) => entries,
         Err(_) => {
@@ -319,10 +311,7 @@ fn inspect_stage_contents(
             concerns.push(StagedInstallationConcern::UnexpectedEntry);
             return;
         }
-        if !matches!(
-            name,
-            b"resources" | b"journals" | b"project.json"
-        ) {
+        if !matches!(name, b"resources" | b"journals" | b"project.json") {
             concerns.push(StagedInstallationConcern::UnexpectedEntry);
         }
     }
@@ -504,8 +493,8 @@ fn inspect_managed_directory(
     subject: &str,
     expected_owner: Option<(u32, u32)>,
 ) -> Result<rustix::fs::Stat, StateStoreError> {
-    let stat = fs::fstat(directory)
-        .map_err(|_| io_error(format!("could not inspect {subject}")))?;
+    let stat =
+        fs::fstat(directory).map_err(|_| io_error(format!("could not inspect {subject}")))?;
     if !FileType::from_raw_mode(stat.st_mode).is_dir() {
         return Err(unsafe_error(format!("{subject} is not a directory")));
     }
@@ -603,9 +592,7 @@ mod tests {
         directory_id: &InstallationId,
         document_id: InstallationId,
     ) -> PathBuf {
-        let stage = root
-            .join(STAGING_DIRECTORY)
-            .join(directory_id.as_str());
+        let stage = root.join(STAGING_DIRECTORY).join(directory_id.as_str());
         fs::create_dir_all(stage.join(RESOURCES_DIRECTORY)).expect("create resources directory");
         fs::create_dir_all(stage.join(JOURNALS_DIRECTORY)).expect("create journals directory");
         for directory in [
@@ -684,11 +671,7 @@ mod tests {
     fn project_id_mismatch_is_incomplete_and_never_promoted() {
         let root = TempRoot::new("mismatch");
         let directory_id = id("3333333333333333");
-        create_complete_stage(
-            root.path(),
-            &directory_id,
-            id("4444444444444444"),
-        );
+        create_complete_stage(root.path(), &directory_id, id("4444444444444444"));
 
         let report = inspect_staged_installations(root.path()).expect("inspect mismatched staging");
         let finding = &report.findings()[0];
@@ -708,8 +691,7 @@ mod tests {
         let root = TempRoot::new("suspicious");
         let staging = root.path().join(STAGING_DIRECTORY);
         fs::create_dir(&staging).expect("create staging directory");
-        fs::set_permissions(&staging, fs::Permissions::from_mode(0o750))
-            .expect("set staging mode");
+        fs::set_permissions(&staging, fs::Permissions::from_mode(0o750)).expect("set staging mode");
 
         let malformed = staging.join("INVALID");
         fs::create_dir(&malformed).expect("create malformed stage");
@@ -728,9 +710,11 @@ mod tests {
 
         let report = inspect_staged_installations(root.path()).expect("inspect suspicious staging");
         assert_eq!(report.findings().len(), 3);
-        assert!(report.findings().iter().all(|finding| {
-            finding.disposition() == StagedInstallationDisposition::Suspicious
-        }));
+        assert!(
+            report.findings().iter().all(|finding| {
+                finding.disposition() == StagedInstallationDisposition::Suspicious
+            })
+        );
     }
 
     #[test]
