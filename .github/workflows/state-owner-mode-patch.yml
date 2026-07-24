@@ -1,0 +1,44 @@
+name: Apply state ownership enforcement
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out exact feature branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: feature/state-owner-mode-enforcement
+          fetch-depth: 1
+
+      - name: Apply reviewed one-file transformation
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test -f tools/patch_state_owner_mode.py
+          test ! -L tools/patch_state_owner_mode.py
+          test -f src/linux_state.rs
+          test ! -L src/linux_state.rs
+          test -z "$(git status --porcelain)"
+          python3 tools/patch_state_owner_mode.py
+          rustfmt --edition 2024 src/linux_state.rs
+          test "$(git diff --name-only)" = "src/linux_state.rs"
+          git diff --check
+
+      - name: Commit bounded result
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/linux_state.rs
+          git commit -m 'Enforce state ownership and modes'
+          git push origin HEAD:feature/state-owner-mode-enforcement
