@@ -11,6 +11,9 @@ pub mod lane_executable;
 pub mod lease;
 pub mod lease_catalog;
 pub mod lease_document;
+/// Durable, revision-checked lease persistence beneath one installation directory.
+#[cfg(target_os = "linux")]
+pub mod linux_lease_store;
 /// Read-only, fail-closed lookup of persisted project installations.
 #[cfg(target_os = "linux")]
 pub mod linux_installation_catalog;
