@@ -405,7 +405,6 @@ fn ensure_leases_directory(
                 Mode::empty(),
             )
             .map_err(map_leases_open_error)?;
-            inspect_directory(&directory, "lease directory", Some(owner))?;
             if created {
                 fs::fchmod(&directory, MANAGED_DIRECTORY_MODE).map_err(|_| {
                     store_error(
@@ -413,6 +412,9 @@ fn ensure_leases_directory(
                         "could not set lease-directory permissions",
                     )
                 })?;
+            }
+            inspect_directory(&directory, "lease directory", Some(owner))?;
+            if created {
                 synchronize_directory(installation, "installation directory")?;
             }
             Ok(directory)
