@@ -35,6 +35,7 @@ pub mod plan;
 pub mod podman_preview;
 pub mod podman_preview_execution;
 pub mod podman_preview_inspect;
+pub mod podman_preview_state;
 pub mod preview;
 pub mod process;
 pub mod resource;

@@ -115,6 +115,8 @@ Subprocess execution now captures stdout and stderr concurrently with a one-mega
 
 Podman inspect evidence now binds to the exact reviewed command and successful execution record before decoding. The public mutation gate accepts only that typed receipt, while stderr remains diagnostic and carries no authority. See [ADR 0010](docs/adr/0010-podman-inspect-execution-receipts.md).
 
+Existing-container mutations now require a compatible observed Podman state in addition to exact ownership. Start is limited to inactive startable states, stop to running, and unforced remove to inactive removable states; missing, paused, transitional, dead, and unknown states fail closed. See [ADR 0011](docs/adr/0011-podman-state-aware-mutation-authorization.md).
+
 See [leased execution and previews](docs/LEASED_EXECUTION.md) and the updated [roadmap](docs/ROADMAP.md).
 
 ## Intended workflow
@@ -173,6 +175,7 @@ cargo run --locked --quiet -- --output json host plan --file examples/quarry.yml
 - [ADR 0008: Podman preview inspection and mutation authorization](docs/adr/0008-podman-preview-inspection-authorization.md)
 - [ADR 0009: bounded subprocess output capture](docs/adr/0009-bounded-subprocess-output.md)
 - [ADR 0010: Podman inspect execution receipts](docs/adr/0010-podman-inspect-execution-receipts.md)
+- [ADR 0011: Podman state-aware mutation authorization](docs/adr/0011-podman-state-aware-mutation-authorization.md)
 - [Roadmap](docs/ROADMAP.md)
 - [Agent instructions](AGENTS.md)
 
