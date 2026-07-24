@@ -123,9 +123,11 @@ pub trait MutationExecutor {
 #[serde(rename_all = "snake_case")]
 pub enum ActionOutcome {
     Pending,
+    Executing,
     Completed,
     Failed,
     Skipped,
+    RollbackInProgress,
     RolledBack,
     Compensated,
     RollbackFailed,

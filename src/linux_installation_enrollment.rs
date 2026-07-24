@@ -44,6 +44,7 @@ impl InstallationEnrollmentReceipt {
 #[serde(rename_all = "snake_case")]
 pub enum InstallationEnrollmentErrorKind {
     Busy,
+    Conflict,
     InvalidProject,
     Io,
     UnsafeFilesystem,
@@ -149,6 +150,7 @@ pub fn create_or_load_installation(
 fn map_store_error(error: StateStoreError) -> InstallationEnrollmentError {
     let kind = match error.kind() {
         StateStoreErrorKind::Busy => InstallationEnrollmentErrorKind::Busy,
+        StateStoreErrorKind::Conflict => InstallationEnrollmentErrorKind::Conflict,
         StateStoreErrorKind::Io => InstallationEnrollmentErrorKind::Io,
         StateStoreErrorKind::UnsafeFilesystem => InstallationEnrollmentErrorKind::UnsafeFilesystem,
         StateStoreErrorKind::CorruptState => InstallationEnrollmentErrorKind::CorruptState,

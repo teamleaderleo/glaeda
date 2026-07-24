@@ -184,6 +184,7 @@ impl StateWriteReceipt {
 #[serde(rename_all = "snake_case")]
 pub enum StateStoreErrorKind {
     Busy,
+    Conflict,
     Io,
     UnsafeFilesystem,
     CorruptState,
@@ -226,6 +227,11 @@ impl std::error::Error for StateStoreError {}
 pub trait StateStore {
     fn read(&self, path: &StatePath) -> Result<StateRead, StateStoreError>;
 
+    /// Atomically create one record without replacing an existing destination.
+    fn create_atomic(&mut self, record: &StateRecord)
+    -> Result<StateWriteReceipt, StateStoreError>;
+
+    /// Atomically create or replace one record.
     fn write_atomic(&mut self, record: &StateRecord) -> Result<StateWriteReceipt, StateStoreError>;
 }
 
@@ -267,6 +273,32 @@ mod tests {
                 .get(&key)
                 .cloned()
                 .map_or(StateRead::Missing, StateRead::Present))
+        }
+
+        fn create_atomic(
+            &mut self,
+            record: &StateRecord,
+        ) -> Result<StateWriteReceipt, StateStoreError> {
+            let key = record
+                .path()
+                .components()
+                .iter()
+                .map(StateComponent::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            match self.entries.entry(key) {
+                std::collections::btree_map::Entry::Occupied(_) => Err(StateStoreError::public(
+                    super::StateStoreErrorKind::Conflict,
+                    "state destination already exists",
+                )),
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(record.bytes().to_vec());
+                    Ok(StateWriteReceipt::new(
+                        StateWriteDisposition::Created,
+                        record.bytes().len(),
+                    ))
+                }
+            }
         }
 
         fn write_atomic(
@@ -377,9 +409,13 @@ mod tests {
         )
         .expect("project record");
         let mut store = MemoryStore::default();
-        let first = store.write_atomic(&record).expect("first write");
+        let first = store.create_atomic(&record).expect("first create");
         assert_eq!(first.disposition(), StateWriteDisposition::Created);
         assert_eq!(first.bytes_written(), record.bytes().len());
+        let conflict = store
+            .create_atomic(&record)
+            .expect_err("create-only publication must not replace");
+        assert_eq!(conflict.kind(), super::StateStoreErrorKind::Conflict);
         let second = store.write_atomic(&record).expect("replacement write");
         assert_eq!(second.disposition(), StateWriteDisposition::Replaced);
         assert_eq!(

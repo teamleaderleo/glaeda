@@ -23,7 +23,8 @@ The runner-steward design remains the foundation. Later milestones may extend th
 - [x] Pure ownership identity and managed/adoptable/foreign/conflicting/unknown classification.
 - [x] ADR for `/var/lib/smolrunner`, marker identity, and name-safe adoption policy.
 - [x] Canonical locators, immutable evidence, observation lanes, and survival policy for each resource kind.
-- [ ] Atomic ownership and journal persistence with crash recovery.
+- [ ] Atomic ownership persistence with crash recovery.
+- [x] Atomic execution-journal checkpoints with explicit interrupted states.
 - [ ] Root and runner-user lane implementations.
 - [ ] Debian and Ubuntu host preparation.
 
