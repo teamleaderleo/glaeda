@@ -14,6 +14,16 @@ impl StateStore for ExternalStore {
         ))
     }
 
+    fn create_atomic(
+        &mut self,
+        record: &StateRecord,
+    ) -> Result<StateWriteReceipt, StateStoreError> {
+        Ok(StateWriteReceipt::new(
+            StateWriteDisposition::Created,
+            record.bytes().len(),
+        ))
+    }
+
     fn write_atomic(&mut self, record: &StateRecord) -> Result<StateWriteReceipt, StateStoreError> {
         Ok(StateWriteReceipt::new(
             StateWriteDisposition::Created,

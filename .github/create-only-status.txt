@@ -1,0 +1,106 @@
+
+===== apply create-only repair =====
+
+===== repair in-memory stores =====
+
+===== format =====
+
+===== diff check =====
+
+===== clippy =====
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded clap v4.6.4
+  Downloaded anstyle-query v1.1.5
+  Downloaded strsim v0.11.1
+  Downloaded is_terminal_polyfill v1.70.2
+  Downloaded utf8parse v0.2.2
+  Downloaded zmij v1.0.23
+  Downloaded equivalent v1.0.2
+  Downloaded errno v0.3.14
+  Downloaded heck v0.5.0
+  Downloaded colorchoice v1.0.5
+  Downloaded anstream v1.0.0
+  Downloaded quote v1.0.47
+  Downloaded anstyle v1.0.14
+  Downloaded bitflags v2.13.1
+  Downloaded anstyle-parse v1.0.0
+  Downloaded itoa v1.0.18
+  Downloaded clap_lex v1.1.0
+  Downloaded proc-macro2 v1.0.107
+  Downloaded clap_derive v4.6.4
+  Downloaded ryu v1.0.23
+  Downloaded serde_derive v1.0.229
+  Downloaded unicode-ident v1.0.24
+  Downloaded serde_core v1.0.229
+  Downloaded serde v1.0.229
+  Downloaded serde_norway v0.9.42
+  Downloaded unsafe-libyaml-norway v0.2.15
+  Downloaded indexmap v2.14.0
+  Downloaded memchr v2.8.3
+  Downloaded hashbrown v0.17.1
+  Downloaded rustix v1.1.4
+  Downloaded serde_json v1.0.151
+  Downloaded clap_builder v4.6.2
+  Downloaded syn v3.0.3
+  Downloaded libc v0.2.189
+  Downloaded linux-raw-sys v0.12.1
+   Compiling proc-macro2 v1.0.107
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.47
+   Compiling serde_core v1.0.229
+    Checking utf8parse v0.2.2
+    Checking anstyle-parse v1.0.0
+    Checking colorchoice v1.0.5
+   Compiling serde v1.0.229
+    Checking anstyle-query v1.1.5
+    Checking anstyle v1.0.14
+    Checking is_terminal_polyfill v1.70.2
+   Compiling zmij v1.0.23
+    Checking anstream v1.0.0
+   Compiling rustix v1.1.4
+   Compiling heck v0.5.0
+    Checking clap_lex v1.1.0
+    Checking itoa v1.0.18
+    Checking strsim v0.11.1
+   Compiling serde_json v1.0.151
+    Checking equivalent v1.0.2
+    Checking hashbrown v0.17.1
+    Checking clap_builder v4.6.2
+   Compiling syn v3.0.3
+    Checking indexmap v2.14.0
+    Checking ryu v1.0.23
+    Checking memchr v2.8.3
+    Checking unsafe-libyaml-norway v0.2.15
+    Checking bitflags v2.13.1
+    Checking linux-raw-sys v0.12.1
+   Compiling serde_derive v1.0.229
+   Compiling clap_derive v4.6.4
+    Checking clap v4.6.4
+    Checking serde_norway v0.9.42
+    Checking smolrunner v0.1.0 (/home/runner/work/smolrunner/smolrunner)
+error[E0004]: non-exhaustive patterns: `state_store::StateStoreErrorKind::Conflict` not covered
+   --> src/linux_installation_enrollment.rs:150:22
+    |
+150 |     let kind = match error.kind() {
+    |                      ^^^^^^^^^^^^ pattern `state_store::StateStoreErrorKind::Conflict` not covered
+    |
+note: `state_store::StateStoreErrorKind` defined here
+   --> src/state_store.rs:185:10
+    |
+185 | pub enum StateStoreErrorKind {
+    |          ^^^^^^^^^^^^^^^^^^^
+186 |     Busy,
+187 |     Conflict,
+    |     -------- not covered
+    = note: the matched value is of type `state_store::StateStoreErrorKind`
+help: ensure that all possible cases are being handled by adding a match arm with a wildcard pattern or an explicit pattern as shown
+    |
+154 ~         StateStoreErrorKind::CorruptState => InstallationEnrollmentErrorKind::CorruptState,
+155 ~         state_store::StateStoreErrorKind::Conflict => todo!(),
+    |
+
+For more information about this error, try `rustc --explain E0004`.
+error: could not compile `smolrunner` (lib) due to 1 previous error
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `smolrunner` (lib test) due to 1 previous error

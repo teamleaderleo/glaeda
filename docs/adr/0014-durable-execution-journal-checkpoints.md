@@ -32,7 +32,7 @@ A checkpoint failure stops execution immediately. No later action or rollback is
 - the attempted next snapshot; and
 - one bounded, redacted persistence failure.
 
-The state-store adapter rebuilds and validates the complete journal document for every checkpoint, then delegates publication to the existing atomic `StateStore` boundary. Linux therefore inherits the existing installation-local lock, private temporary file, file synchronization, atomic rename, and parent-directory synchronization behavior.
+The state-store adapter rebuilds and validates the complete journal document for every checkpoint. Its first publication is create-only: an existing journal ID is a conflict and its recovery evidence is not replaced. Later checkpoints replace only the journal created by that adapter. Linux performs create-only publication with the installation-local lock and `RENAME_NOREPLACE`; both creation and replacement retain private temporary files, file synchronization, atomic rename, and parent-directory synchronization.
 
 An unconfirmed irreversible action blocks the whole batch before mutation. Its record is `skipped`; all other records remain `pending`, including records that appear earlier in plan order.
 
@@ -50,5 +50,6 @@ An interrupted state is evidence of uncertainty, not permission to retry blindly
 - A host crash cannot make an invoked action look definitively unattempted.
 - Every mutation adds multiple durable writes; correctness is preferred over write minimization for the first apply implementation.
 - Persistence failure after an executor returns can leave the durable snapshot intentionally conservative (`executing` or `rollback_in_progress`).
+- A duplicate journal ID fails before existing recovery evidence can be replaced.
 - The same protocol is testable with fake executors and in-memory stores before root or runner-user lanes exist.
 - Real Linux fault injection remains required before enabling host mutation commands.

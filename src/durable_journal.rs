@@ -344,6 +344,7 @@ pub struct StateStoreJournalCheckpoint<'a, S> {
     store: &'a mut S,
     installation_id: InstallationId,
     journal_id: JournalId,
+    initialized: bool,
 }
 
 impl<'a, S> StateStoreJournalCheckpoint<'a, S> {
@@ -353,6 +354,7 @@ impl<'a, S> StateStoreJournalCheckpoint<'a, S> {
             store,
             installation_id,
             journal_id,
+            initialized: false,
         }
     }
 }
@@ -374,12 +376,18 @@ impl<S: StateStore> JournalCheckpoint for StateStoreJournalCheckpoint<'_, S> {
                 "journal snapshot could not be bound to durable state: {error}"
             ))
         })?;
-        self.store.write_atomic(&record).map_err(|error| {
+        let publication = if self.initialized {
+            self.store.write_atomic(&record)
+        } else {
+            self.store.create_atomic(&record)
+        };
+        publication.map_err(|error| {
             JournalCheckpointFailure::public(format!(
                 "journal snapshot could not be atomically persisted: {}",
                 error.message()
             ))
         })?;
+        self.initialized = true;
         Ok(())
     }
 }
@@ -396,8 +404,8 @@ mod tests {
     use crate::journal_document::decode_journal_document;
     use crate::state::{InstallationId, JournalId, StateComponent, StatePath};
     use crate::state_store::{
-        StateRead, StateRecord, StateStore, StateStoreError, StateWriteDisposition,
-        StateWriteReceipt,
+        StateRead, StateRecord, StateStore, StateStoreError, StateStoreErrorKind,
+        StateWriteDisposition, StateWriteReceipt,
     };
 
     use super::{
@@ -647,6 +655,32 @@ mod tests {
                 .map_or(StateRead::Missing, StateRead::Present))
         }
 
+        fn create_atomic(
+            &mut self,
+            record: &StateRecord,
+        ) -> Result<StateWriteReceipt, StateStoreError> {
+            let key = record
+                .path()
+                .components()
+                .iter()
+                .map(StateComponent::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            match self.entries.entry(key) {
+                std::collections::btree_map::Entry::Occupied(_) => Err(StateStoreError::public(
+                    StateStoreErrorKind::Conflict,
+                    "state destination already exists",
+                )),
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(record.bytes().to_vec());
+                    Ok(StateWriteReceipt::new(
+                        StateWriteDisposition::Created,
+                        record.bytes().len(),
+                    ))
+                }
+            }
+        }
+
         fn write_atomic(
             &mut self,
             record: &StateRecord,
@@ -665,6 +699,43 @@ mod tests {
             };
             Ok(StateWriteReceipt::new(disposition, record.bytes().len()))
         }
+    }
+
+    #[test]
+    fn state_store_adapter_refuses_to_clobber_an_existing_journal() {
+        let mut store = MemoryStore::default();
+        let installation_id = InstallationId::parse("0123456789abcdef").expect("installation ID");
+        let journal_id = JournalId::parse("apply-00000001").expect("journal ID");
+        let path = crate::state::StateLayout::journal_document(&installation_id, &journal_id);
+        let key = path
+            .components()
+            .iter()
+            .map(StateComponent::as_str)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let existing = b"existing recovery evidence".to_vec();
+        store.entries.insert(key.clone(), existing.clone());
+
+        let mut executor = FakeExecutor::default();
+        let error = {
+            let mut checkpoint =
+                StateStoreJournalCheckpoint::new(&mut store, installation_id, journal_id);
+            execute_plan_durably(
+                vec![action("one", RollbackClass::Reversible)],
+                &mut executor,
+                &mut checkpoint,
+                false,
+            )
+            .expect_err("journal collision must fail")
+        };
+
+        assert!(executor.executions.is_empty());
+        let DurableExecutionError::Checkpoint(error) = error else {
+            panic!("expected checkpoint error");
+        };
+        assert_eq!(error.phase(), super::JournalCheckpointPhase::Initial);
+        assert!(error.last_durable().is_none());
+        assert_eq!(store.entries.get(&key), Some(&existing));
     }
 
     #[test]
