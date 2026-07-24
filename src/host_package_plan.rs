@@ -86,6 +86,17 @@ impl fmt::Display for HostPackagePlanError {
 
 impl std::error::Error for HostPackagePlanError {}
 
+struct BorrowedExecutor<'a, E: ?Sized>(&'a E);
+
+impl<E: CommandExecutor + ?Sized> CommandExecutor for BorrowedExecutor<'_, E> {
+    fn execute(
+        &self,
+        spec: &crate::process::CommandSpec,
+    ) -> std::io::Result<crate::process::ExecutionRecord> {
+        self.0.execute(spec)
+    }
+}
+
 /// Inspect the existing host plan and Debian-family package state without making changes.
 ///
 /// # Errors
@@ -129,7 +140,7 @@ pub fn inspect_host_package_plan_from_current(
 
     let seed = build_package_plan(distribution.clone(), &BTreeMap::new())
         .map_err(map_package_plan_error)?;
-    let observation = DpkgQueryProbe::new(executor)
+    let observation = DpkgQueryProbe::new(BorrowedExecutor(executor))
         .observe(&seed.required_packages)
         .map_err(map_package_probe_error)?;
     let package_plan =
