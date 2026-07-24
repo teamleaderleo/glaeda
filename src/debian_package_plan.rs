@@ -28,9 +28,26 @@ pub enum DebianFamilyDistribution {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DistributionIdentity {
-    pub distribution: DebianFamilyDistribution,
-    pub id: String,
-    pub version_id: String,
+    distribution: DebianFamilyDistribution,
+    id: String,
+    version_id: String,
+}
+
+impl DistributionIdentity {
+    #[must_use]
+    pub fn distribution(&self) -> DebianFamilyDistribution {
+        self.distribution
+    }
+
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    #[must_use]
+    pub fn version_id(&self) -> &str {
+        &self.version_id
+    }
 }
 
 /// Parse the bounded distribution identity needed for Debian-family package planning.
