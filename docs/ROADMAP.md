@@ -1,8 +1,8 @@
 # Roadmap
 
-SmolRunner should remain useful while it is still small. The roadmap favors a dependable CLI and explicit host state before adding long-running services.
+SmolRunner should remain useful while it is still small. The roadmap favors a dependable CLI and explicit host state over a control-plane service or dashboard.
 
-The runner-steward work remains the foundation. Later milestones may extend the same ownership, isolation, and reconciliation model to leased workspaces and temporary previews. GitHub Actions remains the first scheduler and workflow interface. See [leased execution and previews](LEASED_EXECUTION.md).
+The runner-steward design remains the foundation. Later milestones may extend the same ownership, isolation, and planning model into leased workspaces, temporary previews, and a small pool of execution workers. GitHub Actions remains the first scheduler and workflow language.
 
 ## Milestone 0 — foundation
 
@@ -35,7 +35,7 @@ The runner-steward work remains the foundation. Later milestones may extend the 
 - [ ] Runner status, version inspection, update, disable, and removal.
 - [ ] Short-lived registration-token handling without persistent plaintext storage.
 
-## Milestone 3 — disposable project execution
+## Milestone 3 — project execution
 
 - [ ] Project-owned Containerfile and verification command.
 - [ ] Rootless Podman image build and digest recording.
@@ -43,53 +43,63 @@ The runner-steward work remains the foundation. Later milestones may extend the 
 - [ ] Separate network policy for dependency installation and verification.
 - [ ] Capability dropping, no-new-privileges, and resource limits.
 - [ ] Focused and full suite conventions without inventing a pipeline language.
-- [ ] Typed run identity, status, exit result, log reference, and artifact references.
-- [ ] Explicit cache policy separated from writable workspace state.
+- [ ] Explicit artifact references for successful verification runs.
 
 ## Milestone 4 — small-fleet operations
 
 - [ ] Multi-host inventory over SSH.
 - [ ] Fleet-wide `doctor`, status, and upgrade planning.
-- [ ] Worker capability reporting for architecture, CPU, memory, storage pressure, and optional features.
 - [ ] Disk-pressure and stale-image diagnostics.
 - [ ] Machine-readable remediation suggestions.
 - [ ] Optional terminal UI backed by the same core library.
 
-## Milestone 5 — leased workspaces and previews
+## Milestone 5 — leased execution foundation
 
-This milestone is an optional extension of disposable execution. Verification can continue to run on each eligible push while live previews require an explicit lease or repository policy.
+- [x] Record the optional leased-execution and preview direction.
+- [x] Define platform-independent lease kinds, states, legal transitions, terminal behavior, and optimistic revisions.
+- [x] Record the initial lifecycle decision in ADR 0004.
+- [ ] Define crash-safe lease persistence and stale-revision rejection.
+- [ ] Define source, artifact, preview-slot, and route ownership evidence.
+- [ ] Define expiry deadlines, renewal windows, and clock-recovery behavior.
+- [ ] Map lease cleanup into typed execution-journal actions.
+- [ ] Add read-only lease planning and inspection commands.
 
-- [ ] Typed lease model with owner, expiry, renewal, resource request, and cleanup policy.
-- [ ] Workspace lifecycle with independent Git worktrees and bounded writable state.
-- [ ] Minimal artifact contract for OCI image digests and static output.
-- [ ] Explicit preview request from CLI and GitHub Actions.
-- [ ] Rootless Podman preview lifecycle with health checks and resource limits.
-- [ ] Reverse-proxy adapter with temporary routes and TLS handled by an existing proxy.
-- [ ] Automatic TTL cleanup and crash-safe reconciliation.
-- [ ] Distinguish warm cache, preserved workspace, and live process policy.
-- [ ] Attach preview, run, log, and artifact references to external tools without requiring them.
+## Milestone 6 — local previews
 
-## Milestone 6 — execution pool and target selection
+- [ ] Accept a verified immutable OCI image digest or static artifact.
+- [ ] Plan one local preview without mutation.
+- [ ] Start a bounded rootless Podman preview.
+- [ ] Reconcile a temporary route through a narrow reverse-proxy adapter.
+- [ ] Keep a stable preview slot while verified artifacts supersede one another.
+- [ ] Expire previews automatically and recover cleanup after host restart.
+- [ ] Measure startup time, idle memory, and retained disk use on a small VPS.
 
-Only pursue this after one-host leased execution proves useful.
+## Milestone 7 — retained workspaces
 
-- [ ] Worker heartbeats and availability for always-on and opportunistic machines.
-- [ ] Capacity reservations and bounded concurrent execution.
-- [ ] Selection by architecture, declared resources, cached artifacts, and routing capability.
-- [ ] Remote execution through enrolled SmolRunner workers.
-- [ ] Narrow deployment-target interface with local Podman as the reference backend.
-- [ ] Evaluate one external provider adapter using the same artifact and lease semantics.
-- [ ] Optional Stensibly linkage for claims, handoffs, workspaces, previews, and artifact references.
+- [ ] Create one writable worktree and container boundary per active claim or actor.
+- [ ] Retain selected workspace state under an explicit lease.
+- [ ] Sleep and wake eligible workspace or preview processes.
+- [ ] Share only explicitly scoped package and build caches.
+- [ ] Record commit, log, screenshot, and preview artifact references.
+- [ ] Support optional Stensibly references without making Stensibly a dependency.
+
+## Milestone 8 — worker selection
+
+- [ ] Advertise bounded worker capabilities and current pressure.
+- [ ] Distinguish continuous workers from opportunistic laptop workers.
+- [ ] Select workers by architecture, capacity, cached artifacts, and routing capability.
+- [ ] Preserve explicit operator policy and explain every placement decision.
+- [ ] Avoid promising a general-purpose or multi-tenant scheduler.
 
 ## Later, only with evidence
 
-- Background daemon for lease expiry, service supervision, route reconciliation, and worker heartbeats.
+- External deployment-target adapters for selected static or preview workloads.
+- Per-target budgets and an explicit local-first fallback policy.
 - Web dashboard.
+- Background daemon for lease supervision, heartbeats, and asynchronous cleanup.
 - GitHub App authentication.
 - Ephemeral machine provisioning.
 - Additional Linux distributions and service managers.
-- Idle preview suspension and restart.
-- More deployment-target adapters.
 
 ## Non-goals
 
@@ -97,7 +107,6 @@ Only pursue this after one-host leased execution proves useful.
 - Reimplementing the GitHub Actions runner protocol.
 - Kubernetes runner scale sets.
 - Public-fork execution on persistent personal hosts.
-- Hostile multi-tenant execution.
 - Becoming a generic public deployment platform.
-- Reimplementing a container runtime, reverse proxy, TLS stack, or provider-specific build system.
-- Deploying every successful agent iteration by default.
+- Automatically deploying every successful verification run.
+- Building a custom container runtime, reverse proxy, or TLS stack.
