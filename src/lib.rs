@@ -1,4 +1,6 @@
 pub mod artifact;
+#[cfg(target_os = "linux")]
+pub mod debian_package_plan;
 pub mod doctor;
 pub mod durable_journal;
 pub mod host;
