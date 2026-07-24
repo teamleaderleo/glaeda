@@ -11,6 +11,7 @@ const GROUPADD: &str = "/usr/sbin/groupadd";
 const USERADD: &str = "/usr/sbin/useradd";
 const LOGINCTL: &str = "/usr/bin/loginctl";
 const RUNUSER: &str = "/usr/sbin/runuser";
+const ENV: &str = "/usr/bin/env";
 const PODMAN: &str = "/usr/bin/podman";
 const GIT: &str = "/usr/bin/git";
 const NOLOGIN: &str = "/usr/sbin/nologin";
@@ -304,8 +305,12 @@ impl LaneCommand {
     pub fn required_programs(&self) -> Vec<&Path> {
         let outer = self.spec.program.as_path();
         match self.kind {
-            LaneCommandKind::RunnerPodmanInfo => vec![outer, Path::new(PODMAN)],
-            LaneCommandKind::RunnerGitVersion => vec![outer, Path::new(GIT)],
+            LaneCommandKind::RunnerPodmanInfo => {
+                vec![outer, Path::new(ENV), Path::new(PODMAN)]
+            }
+            LaneCommandKind::RunnerGitVersion => {
+                vec![outer, Path::new(ENV), Path::new(GIT)]
+            }
             LaneCommandKind::AptInstall
             | LaneCommandKind::EnsureSystemGroup
             | LaneCommandKind::EnsureSystemUser
@@ -357,11 +362,13 @@ fn runner_user_spec(
         .argument("--user")
         .argument(runner.username.as_str())
         .argument("--")
-        .argument(inner_program)
-        .environment("HOME", runner.home())
-        .environment("USER", runner.username.as_str())
-        .environment("LOGNAME", runner.username.as_str())
-        .environment("XDG_RUNTIME_DIR", runner.runtime_directory());
+        .argument(ENV)
+        .argument("--ignore-environment")
+        .argument(format!("HOME={}", runner.home()))
+        .argument(format!("USER={}", runner.username.as_str()))
+        .argument(format!("LOGNAME={}", runner.username.as_str()))
+        .argument(format!("XDG_RUNTIME_DIR={}", runner.runtime_directory()))
+        .argument(inner_program);
     for argument in arguments {
         spec = spec.argument(*argument);
     }
@@ -408,8 +415,8 @@ mod tests {
     use crate::process::CommandValue;
 
     use super::{
-        APT_GET, GIT, GROUPADD, LOGINCTL, LaneCommand, LaneCommandKind, LinuxAccountName, NOLOGIN,
-        PODMAN, PackageName, RUNUSER, RunnerUserContext, USERADD,
+        APT_GET, ENV, GIT, GROUPADD, LOGINCTL, LaneCommand, LaneCommandKind, LinuxAccountName,
+        NOLOGIN, PODMAN, PackageName, RUNUSER, RunnerUserContext, USERADD,
     };
 
     fn action(lane: ExecutionLane) -> PlannedMutation {
@@ -504,6 +511,12 @@ mod tests {
                 "--user",
                 "project-runner",
                 "--",
+                ENV,
+                "--ignore-environment",
+                "HOME=/srv/runner",
+                "USER=project-runner",
+                "LOGNAME=project-runner",
+                "XDG_RUNTIME_DIR=/run/user/1001",
                 PODMAN,
                 "info",
                 "--format",
@@ -513,23 +526,27 @@ mod tests {
         let git = LaneCommand::runner_git_version(&action, &runner).expect("git command");
         assert_eq!(
             git.spec().displayed_argv(),
-            [RUNUSER, "--user", "project-runner", "--", GIT, "--version"]
+            [
+                RUNUSER,
+                "--user",
+                "project-runner",
+                "--",
+                ENV,
+                "--ignore-environment",
+                "HOME=/srv/runner",
+                "USER=project-runner",
+                "LOGNAME=project-runner",
+                "XDG_RUNTIME_DIR=/run/user/1001",
+                GIT,
+                "--version",
+            ]
         );
-        assert_eq!(
+        assert!(git.spec().environment.is_empty());
+        assert!(
             git.spec()
-                .environment
-                .keys()
-                .map(String::as_str)
-                .collect::<Vec<_>>(),
-            ["HOME", "LOGNAME", "USER", "XDG_RUNTIME_DIR"]
-        );
-        assert_eq!(
-            git.spec().environment.get("HOME"),
-            Some(&CommandValue::Plain("/srv/runner".to_owned()))
-        );
-        assert_eq!(
-            git.spec().environment.get("XDG_RUNTIME_DIR"),
-            Some(&CommandValue::Plain("/run/user/1001".to_owned()))
+                .arguments
+                .iter()
+                .all(|value| matches!(value, CommandValue::Plain(_)))
         );
     }
 

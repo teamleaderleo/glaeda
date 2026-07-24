@@ -289,8 +289,9 @@ mod tests {
         .expect("runner context");
         let command = LaneCommand::runner_git_version(&action(), &runner).expect("git command");
         let verified = verify_lane_command(&command).expect("verify reviewed programs");
-        assert_eq!(verified.len(), 2);
+        assert_eq!(verified.len(), 3);
         assert_eq!(verified[0].path(), Path::new("/usr/sbin/runuser"));
-        assert_eq!(verified[1].path(), Path::new("/usr/bin/git"));
+        assert_eq!(verified[1].path(), Path::new("/usr/bin/env"));
+        assert_eq!(verified[2].path(), Path::new("/usr/bin/git"));
     }
 }
