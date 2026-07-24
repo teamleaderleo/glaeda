@@ -32,6 +32,7 @@ pub mod linux_state_recovery;
 pub mod manifest;
 pub mod ownership;
 pub mod plan;
+pub mod podman_preview;
 pub mod preview;
 pub mod process;
 pub mod resource;
