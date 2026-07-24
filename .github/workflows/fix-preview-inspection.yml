@@ -22,38 +22,36 @@ jobs:
         with:
           ref: feat/podman-preview-inspection
 
-      - name: Apply reviewed Rust fixes
+      - name: Apply reviewed fixes and canonical formatting
         run: |
           python3 - <<'PY'
           from pathlib import Path
+          import re
 
           path = Path('src/podman_preview_inspect.rs')
           text = path.read_text()
-          old_status = '''    let status = wire
-              .state
-              .and_then(|state| state.status)
-              .as_deref()
-              .map(PreviewContainerStatus::parse)
-              .transpose()?;
-          '''
-          new_status = '''    let status_text = wire.state.and_then(|state| state.status);
-          let status = status_text
-              .as_deref()
-              .map(PreviewContainerStatus::parse)
-              .transpose()?;
-          '''
-          if old_status not in text:
-              raise SystemExit('status parsing anchor missing')
-          text = text.replace(old_status, new_status, 1)
-          old_target = '''    if target != spec.container_name().as_str() || target != observed.name.as_str() {
-          '''
-          new_target = '''    if target.as_str() != spec.container_name().as_str()
-              || target.as_str() != observed.name.as_str()
-          {
-          '''
-          if old_target not in text:
-              raise SystemExit('target comparison anchor missing')
-          text = text.replace(old_target, new_target, 1)
+          text, status_count = re.subn(
+              r'''    let status = wire\n        \.state\n        \.and_then\(\|state\| state\.status\)\n        \.as_deref\(\)\n        \.map\(PreviewContainerStatus::parse\)\n        \.transpose\(\)\?;''',
+              '''    let status_text = wire.state.and_then(|state| state.status);
+              let status = status_text
+                  .as_deref()
+                  .map(PreviewContainerStatus::parse)
+                  .transpose()?;''',
+              text,
+              count=1,
+          )
+          if status_count != 1:
+              raise SystemExit(f'expected one status replacement, found {status_count}')
+          text, target_count = re.subn(
+              r'''    if target != spec\.container_name\(\)\.as_str\(\) \|\| target != observed\.name\.as_str\(\) \{''',
+              '''    if target.as_str() != spec.container_name().as_str()
+                  || target.as_str() != observed.name.as_str()
+              {''',
+              text,
+              count=1,
+          )
+          if target_count != 1:
+              raise SystemExit(f'expected one target replacement, found {target_count}')
           path.write_text(text)
           PY
           cargo fmt --all
