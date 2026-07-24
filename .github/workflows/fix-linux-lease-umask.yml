@@ -68,3 +68,5 @@ jobs:
           git add src/linux_lease_store.rs .github/workflows/fix-linux-lease-umask.yml
           git commit -m "Correct lease directory mode before validation"
           git push origin HEAD:feat/linux-lease-store
+
+# activated after creation
