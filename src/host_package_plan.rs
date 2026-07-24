@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::File;
-use std::io::{Read as _, Take};
+use std::io::Read as _;
 use std::path::Path;
 
 use serde::Serialize;
@@ -103,6 +103,21 @@ pub fn inspect_host_package_plan(
             "failed to inspect bounded host state",
         )
     })?;
+    inspect_host_package_plan_from_current(manifest, current, os_release_path, executor)
+}
+
+/// Build the integrated report from an already inspected current-host snapshot.
+///
+/// # Errors
+///
+/// Returns a bounded error for unsafe os-release, distribution, package plan, or package
+/// probe state.
+pub fn inspect_host_package_plan_from_current(
+    manifest: &Manifest,
+    current: CurrentHostState,
+    os_release_path: impl AsRef<Path>,
+    executor: &impl CommandExecutor,
+) -> Result<HostPackagePlan, HostPackagePlanError> {
     let host = build_host_plan(manifest, current);
     let os_release = read_bounded(os_release_path.as_ref())?;
     let distribution = parse_os_release(&os_release).map_err(|_| {
@@ -117,8 +132,8 @@ pub fn inspect_host_package_plan(
     let observation = DpkgQueryProbe::new(executor)
         .observe(&seed.required_packages)
         .map_err(map_package_probe_error)?;
-    let package_plan = build_package_plan(distribution, observation.packages())
-        .map_err(map_package_plan_error)?;
+    let package_plan =
+        build_package_plan(distribution, observation.packages()).map_err(map_package_plan_error)?;
 
     Ok(HostPackagePlan::new(host, package_plan))
 }
@@ -131,7 +146,8 @@ pub fn render_human(plan: &HostPackagePlan) -> String {
     );
 
     if plan.actions.is_empty() {
-        output.push_str("The inspected host state already matches the desired non-package state.\n");
+        output
+            .push_str("The inspected host state already matches the desired non-package state.\n");
     } else {
         for action in &plan.actions {
             let marker = match action.disposition {
@@ -182,7 +198,7 @@ fn read_bounded(path: &Path) -> Result<String, HostPackagePlanError> {
         )
     })?;
     let mut bytes = Vec::new();
-    Take::new(file, (MAX_OS_RELEASE_BYTES + 1) as u64)
+    file.take((MAX_OS_RELEASE_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
         .map_err(|_| {
             HostPackagePlanError::new(
@@ -229,16 +245,19 @@ fn package_list(packages: &[crate::lane_command::PackageName]) -> String {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::collections::BTreeMap;
     use std::fs;
     use std::io;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use crate::host::{CurrentHostState, Presence};
     use crate::manifest::parse;
     use crate::process::{CommandExecutor, CommandSpec, ExecutionRecord};
 
     use super::{
-        HostPackagePlanErrorKind, MAX_OS_RELEASE_BYTES, inspect_host_package_plan, render_human,
+        HostPackagePlanErrorKind, MAX_OS_RELEASE_BYTES, inspect_host_package_plan_from_current,
+        render_human,
     };
 
     static NEXT_FILE: AtomicU64 = AtomicU64::new(1);
@@ -266,6 +285,22 @@ trust:
   trigger: operator
 "#;
 
+    fn current_host_state() -> CurrentHostState {
+        CurrentHostState {
+            commands: BTreeMap::from([
+                ("git".to_owned(), Presence::Present),
+                ("podman".to_owned(), Presence::Absent),
+                ("systemctl".to_owned(), Presence::Present),
+            ]),
+            runner_user: Presence::Absent,
+            subordinate_uids: Presence::Absent,
+            subordinate_gids: Presence::Absent,
+            linger: Presence::Absent,
+            container_image: Presence::Unknown,
+            runner_registration: Presence::Unknown,
+        }
+    }
+
     struct FakeExecutor {
         calls: RefCell<Vec<CommandSpec>>,
         receipt: RefCell<Option<ExecutionRecord>>,
@@ -291,11 +326,7 @@ trust:
     impl CommandExecutor for FakeExecutor {
         fn execute(&self, spec: &CommandSpec) -> io::Result<ExecutionRecord> {
             self.calls.borrow_mut().push(spec.clone());
-            Ok(self
-                .receipt
-                .borrow_mut()
-                .take()
-                .expect("one fake receipt"))
+            Ok(self.receipt.borrow_mut().take().expect("one fake receipt"))
         }
     }
 
@@ -325,17 +356,19 @@ trust:
             "git\tinstalled\npodman\tnot-installed\nuidmap\tinstalled\nslirp4netns\tinstalled\nfuse-overlayfs\tinstalled\ndbus-user-session\tinstalled\n",
         );
 
-        let report = inspect_host_package_plan(&manifest, &os_release.0, &executor)
-            .expect("integrated host package plan");
+        let report = inspect_host_package_plan_from_current(
+            &manifest,
+            current_host_state(),
+            &os_release.0,
+            &executor,
+        )
+        .expect("integrated host package plan");
         assert!(report.actions.len() >= 2);
         assert_eq!(
             report.package_plan.disposition,
             crate::debian_package_plan::PackagePlanDisposition::Required
         );
-        assert_eq!(
-            report.package_plan.missing_packages[0].as_str(),
-            "podman"
-        );
+        assert_eq!(report.package_plan.missing_packages[0].as_str(), "podman");
         assert_eq!(executor.calls.borrow().len(), 1);
 
         let json = serde_json::to_value(&report).expect("serialize report");
@@ -353,8 +386,13 @@ trust:
         let executor = FakeExecutor::returning(
             "git\tinstalled\npodman\tconfig-files\nuidmap\tinstalled\nslirp4netns\tinstalled\nfuse-overlayfs\tinstalled\ndbus-user-session\tinstalled\n",
         );
-        let report = inspect_host_package_plan(&manifest, &os_release.0, &executor)
-            .expect("integrated host package plan");
+        let report = inspect_host_package_plan_from_current(
+            &manifest,
+            current_host_state(),
+            &os_release.0,
+            &executor,
+        )
+        .expect("integrated host package plan");
         assert_eq!(
             report.package_plan.disposition,
             crate::debian_package_plan::PackagePlanDisposition::NeedsInspection
@@ -367,8 +405,13 @@ trust:
         let manifest = parse(MANIFEST).expect("manifest");
         let os_release = temporary_os_release(&vec![b'x'; MAX_OS_RELEASE_BYTES + 1]);
         let executor = FakeExecutor::returning("git\tinstalled\n");
-        let error = inspect_host_package_plan(&manifest, &os_release.0, &executor)
-            .expect_err("oversized os-release");
+        let error = inspect_host_package_plan_from_current(
+            &manifest,
+            current_host_state(),
+            &os_release.0,
+            &executor,
+        )
+        .expect_err("oversized os-release");
         assert_eq!(error.kind(), HostPackagePlanErrorKind::OsRelease);
         assert!(executor.calls.borrow().is_empty());
     }

@@ -133,30 +133,27 @@ fn run_host_plan(output: OutputFormat, file: &Path) -> ExitCode {
         Ok(manifest) => manifest,
         Err(code) => return code,
     };
-    let report = match inspect_host_package_plan(
-        &manifest,
-        DEFAULT_OS_RELEASE_PATH,
-        &ProcessExecutor,
-    ) {
-        Ok(report) => report,
-        Err(error) => {
-            let message = format!("failed to inspect host and package state: {error}");
-            match output {
-                OutputFormat::Human => eprintln!("{message}"),
-                OutputFormat::Json => {
-                    let report = RuntimeErrorReport {
-                        schema_version: 1,
-                        kind: "host_package_probe",
-                        message,
-                    };
-                    if print_json(&report).is_err() {
-                        return ExitCode::from(2);
+    let report =
+        match inspect_host_package_plan(&manifest, DEFAULT_OS_RELEASE_PATH, &ProcessExecutor) {
+            Ok(report) => report,
+            Err(error) => {
+                let message = format!("failed to inspect host and package state: {error}");
+                match output {
+                    OutputFormat::Human => eprintln!("{message}"),
+                    OutputFormat::Json => {
+                        let report = RuntimeErrorReport {
+                            schema_version: 1,
+                            kind: "host_package_probe",
+                            message,
+                        };
+                        if print_json(&report).is_err() {
+                            return ExitCode::from(2);
+                        }
                     }
                 }
+                return ExitCode::from(2);
             }
-            return ExitCode::from(2);
-        }
-    };
+        };
 
     match output {
         OutputFormat::Human => print!("{}", render_host_plan(&report)),
