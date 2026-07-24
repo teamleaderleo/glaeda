@@ -23,6 +23,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
+          # One reviewed Python transformation and one Rust source file; no project execution.
           test -f tools/patch_state_owner_mode.py
           test ! -L tools/patch_state_owner_mode.py
           test -f src/linux_state.rs
