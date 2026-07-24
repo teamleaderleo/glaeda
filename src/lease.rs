@@ -166,11 +166,7 @@ pub struct LeaseIdentity {
 
 impl LeaseIdentity {
     #[must_use]
-    pub const fn new(
-        lease_id: LeaseId,
-        installation_id: InstallationId,
-        kind: LeaseKind,
-    ) -> Self {
+    pub const fn new(lease_id: LeaseId, installation_id: InstallationId, kind: LeaseKind) -> Self {
         Self {
             lease_id,
             installation_id,
@@ -294,9 +290,7 @@ fn next_state(
     state: LeaseState,
     action: LeaseAction,
 ) -> Result<LeaseState, &'static str> {
-    use LeaseAction::{
-        Activate, BeginRelease, Expire, Fail, FinishRelease, Renew, Sleep, Wake,
-    };
+    use LeaseAction::{Activate, BeginRelease, Expire, Fail, FinishRelease, Renew, Sleep, Wake};
     use LeaseState::{Active, Expired, Failed, Pending, Released, Releasing, Sleeping};
 
     if state.is_terminal() {
