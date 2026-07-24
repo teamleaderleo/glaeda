@@ -120,11 +120,14 @@ pub fn bind_preview_inspect_execution(
 
 /// Authorize one existing-container mutation from a bound inspect execution receipt.
 ///
+/// This crate-visible helper proves exact ownership. The public state-aware gate adds operation and
+/// Podman-state compatibility before exposing an authorized command.
+///
 /// # Errors
 ///
 /// Returns an error unless the receipt's observation is managed by the exact preview generation and
 /// the mutation is a planner-produced start, stop, or remove command.
-pub fn authorize_existing_preview_command(
+pub(crate) fn authorize_existing_preview_command_from_receipt(
     spec: &PreviewContainerSpec,
     command: &PreviewPodmanCommand,
     receipt: &PreviewInspectExecutionReceipt,
@@ -170,7 +173,9 @@ mod tests {
     use crate::process::ExecutionRecord;
     use crate::state::InstallationId;
 
-    use super::{authorize_existing_preview_command, bind_preview_inspect_execution};
+    use super::{
+        authorize_existing_preview_command_from_receipt, bind_preview_inspect_execution,
+    };
 
     fn container_spec() -> PreviewContainerSpec {
         let artifact = ArtifactIdentity::new(
@@ -241,8 +246,12 @@ mod tests {
         let execution = execution_record(&spec, &plan);
         let receipt = bind_preview_inspect_execution(&spec, &plan.provision()[2], &execution)
             .expect("bind inspection");
-        let authorized = authorize_existing_preview_command(&spec, &plan.provision()[1], &receipt)
-            .expect("authorize start");
+        let authorized = authorize_existing_preview_command_from_receipt(
+            &spec,
+            &plan.provision()[1],
+            &receipt,
+        )
+        .expect("authorize start");
 
         assert_eq!(receipt.inspect_command_id(), plan.provision()[2].id());
         assert_eq!(
