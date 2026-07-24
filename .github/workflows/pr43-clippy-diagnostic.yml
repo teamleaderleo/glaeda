@@ -23,6 +23,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
+          # Compiler output only; no tests or project commands execute.
           test -z "$(git status --porcelain)"
           mkdir -p .tmp
           set +e
