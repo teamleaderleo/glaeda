@@ -23,6 +23,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
+          # Two reviewed Rust files, no project execution.
           test -f tools/patch_runner_environment_boundary.py
           test ! -L tools/patch_runner_environment_boundary.py
           test -z "$(git status --porcelain)"
