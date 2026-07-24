@@ -21,7 +21,7 @@ One runner-account plan records:
 - one exact subordinate UID range containing at least 65,536 IDs;
 - one exact subordinate GID range containing at least 65,536 IDs.
 
-Range allocation remains an explicit caller decision. This planner does not scan for or invent free host ranges.
+Range allocation remains an explicit caller decision. This planner does not scan for or invent free host ranges. The home path is capped below the public journal text limit so generated summaries and evidence remain persistable.
 
 ### Observation states
 
