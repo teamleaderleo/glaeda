@@ -4,9 +4,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::artifact::Sha256Digest;
-use crate::podman_preview::{
-    PreviewContainerSpec, PreviewPodmanCommand, PreviewPodmanOperation,
-};
+use crate::podman_preview::{PreviewContainerSpec, PreviewPodmanCommand, PreviewPodmanOperation};
 use crate::process::{CommandSpec, CommandValue};
 
 pub const MAX_PODMAN_INSPECT_BYTES: usize = 1_048_576;
@@ -55,10 +53,11 @@ pub struct ObservedContainerName(String);
 impl ObservedContainerName {
     fn parse(value: &str) -> Result<Self, PreviewInspectError> {
         let mut bytes = value.bytes();
-        let first_is_safe = bytes.next().is_some_and(|byte| byte.is_ascii_alphanumeric());
-        let remainder_is_safe = bytes.all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
-        });
+        let first_is_safe = bytes
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric());
+        let remainder_is_safe =
+            bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
         if value.len() > MAX_CONTAINER_NAME_BYTES || !first_is_safe || !remainder_is_safe {
             return Err(PreviewInspectError::new(
                 "container_name",
@@ -225,9 +224,8 @@ pub fn decode_preview_container_inspect(
         .map(Sha256Digest::parse)
         .transpose()
         .map_err(|error| PreviewInspectError::new("image_digest", error.to_string()))?;
-    let status = wire
-        .state
-        .and_then(|state| state.status)
+    let status_text = wire.state.and_then(|state| state.status);
+    let status = status_text
         .as_deref()
         .map(PreviewContainerStatus::parse)
         .transpose()?;
@@ -407,7 +405,9 @@ pub fn authorize_existing_preview_command(
             "planned Podman command lacks one plain container target",
         ));
     };
-    if target != spec.container_name().as_str() || target != observed.name.as_str() {
+    if target.as_str() != spec.container_name().as_str()
+        || target.as_str() != observed.name.as_str()
+    {
         return Err(PreviewAuthorizationError::new(
             "planned Podman command target does not match the inspected container locator",
         ));
@@ -592,7 +592,8 @@ mod tests {
             spec.container_name().as_str(),
             "created",
         );
-        let observed = decode_preview_container_inspect(encoded.as_bytes()).expect("decode inspect");
+        let observed =
+            decode_preview_container_inspect(encoded.as_bytes()).expect("decode inspect");
 
         assert_eq!(observed.container_id().as_str(), "cd".repeat(32));
         assert_eq!(observed.name().as_str(), spec.container_name().as_str());
@@ -613,7 +614,8 @@ mod tests {
             spec.container_name().as_str(),
             "created",
         );
-        let observed = decode_preview_container_inspect(encoded.as_bytes()).expect("decode inspect");
+        let observed =
+            decode_preview_container_inspect(encoded.as_bytes()).expect("decode inspect");
         let assessment = assess_preview_container_ownership(&spec, &observed);
         assert_eq!(assessment.class, PreviewContainerOwnershipClass::Managed);
 
@@ -626,7 +628,11 @@ mod tests {
             observed.container_id().as_str()
         );
         assert_eq!(
-            start.spec().displayed_argv().last().expect("original target"),
+            start
+                .spec()
+                .displayed_argv()
+                .last()
+                .expect("original target"),
             spec.container_name().as_str()
         );
     }
@@ -781,6 +787,8 @@ mod tests {
         let plan = PreviewPodmanPlan::for_container(&spec, &runner());
 
         assert!(authorize_existing_preview_command(&spec, &plan.cleanup()[0], &observed).is_err());
-        assert!(authorize_existing_preview_command(&spec, &plan.provision()[2], &observed).is_err());
+        assert!(
+            authorize_existing_preview_command(&spec, &plan.provision()[2], &observed).is_err()
+        );
     }
 }
