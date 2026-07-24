@@ -22,7 +22,7 @@ When either stream produces more than the limit:
 4. the executor waits for the child and reader threads;
 5. execution returns a bounded `InvalidData` error without constructing an `ExecutionRecord`.
 
-Child stdin is explicitly disconnected. Existing argument and environment redaction runs only after successful bounded capture. The public `CommandSpec`, `CommandExecutor`, and `ExecutionRecord` interfaces remain unchanged.
+Child stdin is explicitly disconnected. Existing argument and environment redaction runs only after successful bounded capture. The public `CommandSpec`, `CommandExecutor`, and `ExecutionRecord` interfaces remain unchanged. Child termination tolerates the child exiting between the status check and kill request so an output overflow remains classified as an output-limit failure.
 
 ## Security consequences
 
