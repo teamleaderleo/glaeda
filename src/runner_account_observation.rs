@@ -176,7 +176,11 @@ fn observe_with(
         None
     };
 
-    let home = classify_home(filesystem.inspect(desired.home()), identity, desired.home())?;
+    let home = classify_home(
+        filesystem.inspect(Path::new(desired.home())),
+        identity,
+        desired.home(),
+    )?;
     let subordinate_uids = classify_subordinate(
         filesystem.read_trusted(&paths.subordinate_uids, MAX_ACCOUNT_FILE_BYTES),
         desired.username(),
@@ -654,7 +658,7 @@ mod tests {
     };
 
     use super::{
-        AccountFilesystem, ObservedPathKind, ObservedPathMetadata, PathObservation,
+        AccountFilesystem, GETENT, ObservedPathKind, ObservedPathMetadata, PathObservation,
         RunnerAccountObservationPaths, TrustedFile, getent_command, observe_with,
     };
 
