@@ -20,12 +20,12 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: feat/linux-lease-store
-      - name: Reorder mode correction and validation
+      - name: Correct mode before validation
         run: |
           python3 - <<'PY'
           from pathlib import Path
 
-          path = Path('src/linux_lease_store.rs')
+          path = Path("src/linux_lease_store.rs")
           text = path.read_text()
           old = '''            inspect_directory(&directory, "lease directory", Some(owner))?;
               if created {
@@ -38,8 +38,7 @@ jobs:
                   synchronize_directory(installation, "installation directory")?;
               }
               Ok(directory)
-          '''
-          old = old.replace('              ', '            ')
+          '''.replace("              ", "            ")
           new = '''            if created {
                   fs::fchmod(&directory, MANAGED_DIRECTORY_MODE).map_err(|_| {
                       store_error(
@@ -53,10 +52,9 @@ jobs:
                   synchronize_directory(installation, "installation directory")?;
               }
               Ok(directory)
-          '''
-          new = new.replace('              ', '            ')
+          '''.replace("              ", "            ")
           if old not in text:
-              raise SystemExit('lease directory mode anchor missing')
+              raise SystemExit("lease directory mode anchor missing")
           path.write_text(text.replace(old, new, 1))
           PY
           cargo fmt --all
@@ -69,4 +67,4 @@ jobs:
           git commit -m "Correct lease directory mode before validation"
           git push origin HEAD:feat/linux-lease-store
 
-# activated after creation
+# robust anchor revision
