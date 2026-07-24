@@ -31,7 +31,7 @@ The runner-steward design remains the foundation. Later milestones may extend th
   - [x] Conservative prerequisite package planning with exact distribution identity, package observations, rollback class, and reviewed `apt-get` argv.
   - [x] Bounded package-state probing and host-plan CLI integration.
   - [x] Dependency-aware runner account, subordinate-ID, home-directory, and linger preparation planning.
-  - [ ] Bounded account/group/home/subordinate-ID/linger observation.
+  - [x] Bounded account/group/home/subordinate-ID/linger observation.
   - [ ] Runner account observation integration with read-only host plans.
   - [ ] Durable package and account reconciliation execution.
 
