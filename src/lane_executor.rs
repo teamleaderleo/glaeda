@@ -54,7 +54,7 @@ impl LaneExecutionError {
     }
 
     #[must_use]
-    pub fn public(kind: LaneExecutionErrorKind, message: impl Into<String>) -> Self {
+    fn new(kind: LaneExecutionErrorKind, message: impl Into<String>) -> Self {
         Self {
             kind,
             public_message: message.into(),
@@ -116,7 +116,7 @@ impl LaneExecutionReceipt {
     }
 }
 
-pub trait PrivilegeProbe {
+trait PrivilegeProbe {
     /// Return the process's effective Linux UID.
     ///
     /// # Errors
@@ -144,7 +144,7 @@ impl PrivilegeProbe for ProcStatusPrivilegeProbe {
     }
 }
 
-pub trait ReviewedExecutableVerifier {
+trait ReviewedExecutableVerifier {
     /// Verify all reviewed executables required by one typed command.
     ///
     /// # Errors
@@ -159,7 +159,7 @@ pub struct SystemExecutableVerifier;
 impl ReviewedExecutableVerifier for SystemExecutableVerifier {
     fn verify(&self, command: &LaneCommand) -> Result<(), LaneExecutionError> {
         verify_lane_command(command).map(|_| ()).map_err(|error| {
-            LaneExecutionError::public(
+            LaneExecutionError::new(
                 LaneExecutionErrorKind::ExecutableVerification,
                 error.message().to_owned(),
             )
@@ -167,41 +167,15 @@ impl ReviewedExecutableVerifier for SystemExecutableVerifier {
     }
 }
 
-#[derive(Debug)]
-pub struct RootLaneExecutor<E, V, P> {
-    process: E,
-    executables: V,
-    privilege: P,
-}
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RootLaneExecutor;
 
-impl<E, V, P> RootLaneExecutor<E, V, P> {
-    #[must_use]
-    pub const fn new(process: E, executables: V, privilege: P) -> Self {
-        Self {
-            process,
-            executables,
-            privilege,
-        }
-    }
-}
-
-impl RootLaneExecutor<ProcessExecutor, SystemExecutableVerifier, ProcStatusPrivilegeProbe> {
+impl RootLaneExecutor {
     #[must_use]
     pub const fn system() -> Self {
-        Self::new(
-            ProcessExecutor,
-            SystemExecutableVerifier,
-            ProcStatusPrivilegeProbe,
-        )
+        Self
     }
-}
 
-impl<E, V, P> RootLaneExecutor<E, V, P>
-where
-    E: CommandExecutor,
-    V: ReviewedExecutableVerifier,
-    P: PrivilegeProbe,
-{
     /// Execute one reviewed root-lane command after all evidence checks succeed.
     ///
     /// The returned receipt intentionally excludes child stdout and stderr.
@@ -214,49 +188,24 @@ where
         &self,
         command: &LaneCommand,
     ) -> Result<LaneExecutionReceipt, LaneExecutionError> {
-        require_lane(command, ExecutionLane::Root)?;
-        validate_root_command(command)?;
-        require_effective_root(&self.privilege)?;
-        self.executables.verify(command)?;
-        execute_bounded(&self.process, command)
-    }
-}
-
-#[derive(Debug)]
-pub struct RunnerUserLaneExecutor<E, V, P> {
-    process: E,
-    executables: V,
-    privilege: P,
-}
-
-impl<E, V, P> RunnerUserLaneExecutor<E, V, P> {
-    #[must_use]
-    pub const fn new(process: E, executables: V, privilege: P) -> Self {
-        Self {
-            process,
-            executables,
-            privilege,
-        }
-    }
-}
-
-impl RunnerUserLaneExecutor<ProcessExecutor, SystemExecutableVerifier, ProcStatusPrivilegeProbe> {
-    #[must_use]
-    pub const fn system() -> Self {
-        Self::new(
-            ProcessExecutor,
-            SystemExecutableVerifier,
-            ProcStatusPrivilegeProbe,
+        execute_root_lane(
+            &ProcessExecutor,
+            &SystemExecutableVerifier,
+            &ProcStatusPrivilegeProbe,
+            command,
         )
     }
 }
 
-impl<E, V, P> RunnerUserLaneExecutor<E, V, P>
-where
-    E: CommandExecutor,
-    V: ReviewedExecutableVerifier,
-    P: PrivilegeProbe,
-{
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RunnerUserLaneExecutor;
+
+impl RunnerUserLaneExecutor {
+    #[must_use]
+    pub const fn system() -> Self {
+        Self
+    }
+
     /// Execute one reviewed runner-user command through the sealed runuser and environment boundary.
     ///
     /// The caller must supply previously verified account, runtime-directory, and subordinate-ID
@@ -271,13 +220,42 @@ where
         command: &LaneCommand,
         runner: &VerifiedRunnerUser,
     ) -> Result<LaneExecutionReceipt, LaneExecutionError> {
-        require_lane(command, ExecutionLane::RunnerUser)?;
-        validate_runner_evidence(runner)?;
-        validate_runner_command(command, runner)?;
-        require_effective_root(&self.privilege)?;
-        self.executables.verify(command)?;
-        execute_bounded(&self.process, command)
+        execute_runner_user_lane(
+            &ProcessExecutor,
+            &SystemExecutableVerifier,
+            &ProcStatusPrivilegeProbe,
+            command,
+            runner,
+        )
     }
+}
+
+fn execute_root_lane(
+    process: &impl CommandExecutor,
+    executables: &impl ReviewedExecutableVerifier,
+    privilege: &impl PrivilegeProbe,
+    command: &LaneCommand,
+) -> Result<LaneExecutionReceipt, LaneExecutionError> {
+    require_lane(command, ExecutionLane::Root)?;
+    validate_root_command(command)?;
+    require_effective_root(privilege)?;
+    executables.verify(command)?;
+    execute_bounded(process, command)
+}
+
+fn execute_runner_user_lane(
+    process: &impl CommandExecutor,
+    executables: &impl ReviewedExecutableVerifier,
+    privilege: &impl PrivilegeProbe,
+    command: &LaneCommand,
+    runner: &VerifiedRunnerUser,
+) -> Result<LaneExecutionReceipt, LaneExecutionError> {
+    require_lane(command, ExecutionLane::RunnerUser)?;
+    validate_runner_evidence(runner)?;
+    validate_runner_command(command, runner)?;
+    require_effective_root(privilege)?;
+    executables.verify(command)?;
+    execute_bounded(process, command)
 }
 
 fn execute_bounded(
@@ -288,7 +266,7 @@ fn execute_bounded(
         .execute(command.spec())
         .map(|record| LaneExecutionReceipt::from_record(command, record))
         .map_err(|_| {
-            LaneExecutionError::public(
+            LaneExecutionError::new(
                 LaneExecutionErrorKind::Spawn,
                 "reviewed lane process could not be started",
             )
@@ -299,7 +277,7 @@ fn require_lane(command: &LaneCommand, expected: ExecutionLane) -> Result<(), La
     if command.lane() == expected {
         Ok(())
     } else {
-        Err(LaneExecutionError::public(
+        Err(LaneExecutionError::new(
             LaneExecutionErrorKind::LaneMismatch,
             format!(
                 "action {} is assigned to {:?}, but this executor accepts only {:?}",
@@ -313,7 +291,7 @@ fn require_lane(command: &LaneCommand, expected: ExecutionLane) -> Result<(), La
 
 fn require_effective_root(probe: &impl PrivilegeProbe) -> Result<(), LaneExecutionError> {
     let effective_uid = probe.effective_uid().map_err(|_| {
-        LaneExecutionError::public(
+        LaneExecutionError::new(
             LaneExecutionErrorKind::UnsupportedPrivilege,
             "could not verify effective Linux privilege; no mutation was attempted",
         )
@@ -321,7 +299,7 @@ fn require_effective_root(probe: &impl PrivilegeProbe) -> Result<(), LaneExecuti
     if effective_uid == 0 {
         Ok(())
     } else {
-        Err(LaneExecutionError::public(
+        Err(LaneExecutionError::new(
             LaneExecutionErrorKind::UnsupportedPrivilege,
             "mutating lane execution requires effective UID 0; rerun through explicit elevation such as sudo smolrunner apply",
         ))
@@ -413,7 +391,7 @@ fn validate_runner_evidence(runner: &VerifiedRunnerUser) -> Result<(), LaneExecu
         || !canonical_absolute_path(runner.home())
         || runner.runtime_directory() != Path::new(&format!("/run/user/{}", runner.uid()))
     {
-        return Err(LaneExecutionError::public(
+        return Err(LaneExecutionError::new(
             LaneExecutionErrorKind::InvalidRunnerEvidence,
             "runner-user evidence is incomplete or unsafe",
         ));
@@ -499,7 +477,7 @@ fn canonical_absolute_path(value: &str) -> bool {
 }
 
 fn invalid_command(message: impl Into<String>) -> LaneExecutionError {
-    LaneExecutionError::public(LaneExecutionErrorKind::InvalidCommand, message)
+    LaneExecutionError::new(LaneExecutionErrorKind::InvalidCommand, message)
 }
 
 fn parse_effective_uid(input: &str) -> io::Result<u32> {
@@ -557,7 +535,8 @@ mod tests {
 
     use super::{
         ENV, GIT, LaneExecutionError, LaneExecutionErrorKind, PODMAN, PrivilegeProbe,
-        ReviewedExecutableVerifier, RootLaneExecutor, RunnerUserLaneExecutor, parse_effective_uid,
+        ReviewedExecutableVerifier, execute_root_lane, execute_runner_user_lane,
+        parse_effective_uid,
     };
 
     struct FakeProcess {
@@ -604,7 +583,7 @@ mod tests {
         fn verify(&self, _command: &LaneCommand) -> Result<(), LaneExecutionError> {
             self.calls.set(self.calls.get() + 1);
             if self.fail {
-                Err(LaneExecutionError::public(
+                Err(LaneExecutionError::new(
                     LaneExecutionErrorKind::ExecutableVerification,
                     "reviewed executable evidence failed",
                 ))
@@ -652,24 +631,21 @@ mod tests {
     fn root_executor_delivers_exact_empty_environment_command() {
         let process = FakeProcess::successful();
         let executables = FakeVerifier::default();
-        let executor = RootLaneExecutor::new(
-            process,
-            executables,
-            FakePrivilege {
-                uid: 0,
-                fail: false,
-            },
-        );
+        let privilege = FakePrivilege {
+            uid: 0,
+            fail: false,
+        };
         let command = LaneCommand::apt_install(
             &action("install-tools", ExecutionLane::Root),
             &[PackageName::parse("podman").expect("package")],
         )
         .expect("apt command");
 
-        let receipt = executor.execute(&command).expect("execute root lane");
+        let receipt = execute_root_lane(&process, &executables, &privilege, &command)
+            .expect("execute root lane");
         assert!(receipt.success());
         assert_eq!(receipt.status(), Some(0));
-        let calls = executor.process.calls.borrow();
+        let calls = process.calls.borrow();
         assert_eq!(calls.len(), 1);
         assert!(calls[0].environment.is_empty());
         assert_eq!(
@@ -691,14 +667,10 @@ mod tests {
     fn runner_executor_delivers_exact_sealed_environment_boundary() {
         let process = FakeProcess::successful();
         let executables = FakeVerifier::default();
-        let executor = RunnerUserLaneExecutor::new(
-            process,
-            executables,
-            FakePrivilege {
-                uid: 0,
-                fail: false,
-            },
-        );
+        let privilege = FakePrivilege {
+            uid: 0,
+            fail: false,
+        };
         let context = runner_context("project-runner", 1001, 1001);
         let runner =
             verified_runner_user_for_test("project-runner", 1001, 1001, "/srv/project-runner");
@@ -708,11 +680,11 @@ mod tests {
         )
         .expect("runner command");
 
-        let receipt = executor
-            .execute(&command, &runner)
-            .expect("execute runner-user lane");
+        let receipt =
+            execute_runner_user_lane(&process, &executables, &privilege, &command, &runner)
+                .expect("execute runner-user lane");
         assert!(receipt.success());
-        let calls = executor.process.calls.borrow();
+        let calls = process.calls.borrow();
         assert_eq!(calls.len(), 1);
         assert!(calls[0].environment.is_empty());
         assert_eq!(
@@ -738,14 +710,10 @@ mod tests {
     fn lane_mismatch_fails_before_evidence_or_process_execution() {
         let process = FakeProcess::successful();
         let executables = FakeVerifier::default();
-        let executor = RootLaneExecutor::new(
-            process,
-            executables,
-            FakePrivilege {
-                uid: 0,
-                fail: false,
-            },
-        );
+        let privilege = FakePrivilege {
+            uid: 0,
+            fail: false,
+        };
         let context = runner_context("project-runner", 1001, 1001);
         let command = LaneCommand::runner_podman_info(
             &action("inspect-podman", ExecutionLane::RunnerUser),
@@ -753,53 +721,43 @@ mod tests {
         )
         .expect("runner command");
 
-        let error = executor
-            .execute(&command)
+        let error = execute_root_lane(&process, &executables, &privilege, &command)
             .expect_err("root executor must reject runner command");
         assert_eq!(error.kind(), LaneExecutionErrorKind::LaneMismatch);
-        assert_eq!(executor.executables.calls.get(), 0);
-        assert!(executor.process.calls.borrow().is_empty());
+        assert_eq!(executables.calls.get(), 0);
+        assert!(process.calls.borrow().is_empty());
     }
 
     #[test]
     fn unsupported_privilege_fails_with_recovery_instruction_before_mutation() {
         let process = FakeProcess::successful();
         let executables = FakeVerifier::default();
-        let executor = RootLaneExecutor::new(
-            process,
-            executables,
-            FakePrivilege {
-                uid: 1000,
-                fail: false,
-            },
-        );
+        let privilege = FakePrivilege {
+            uid: 1000,
+            fail: false,
+        };
         let command = LaneCommand::apt_install(
             &action("install-tools", ExecutionLane::Root),
             &[PackageName::parse("git").expect("package")],
         )
         .expect("apt command");
 
-        let error = executor
-            .execute(&command)
+        let error = execute_root_lane(&process, &executables, &privilege, &command)
             .expect_err("non-root execution must fail");
         assert_eq!(error.kind(), LaneExecutionErrorKind::UnsupportedPrivilege);
         assert!(error.message().contains("explicit elevation"));
-        assert_eq!(executor.executables.calls.get(), 0);
-        assert!(executor.process.calls.borrow().is_empty());
+        assert_eq!(executables.calls.get(), 0);
+        assert!(process.calls.borrow().is_empty());
     }
 
     #[test]
     fn runner_evidence_mismatch_fails_before_executable_or_process_execution() {
         let process = FakeProcess::successful();
         let executables = FakeVerifier::default();
-        let executor = RunnerUserLaneExecutor::new(
-            process,
-            executables,
-            FakePrivilege {
-                uid: 0,
-                fail: false,
-            },
-        );
+        let privilege = FakePrivilege {
+            uid: 0,
+            fail: false,
+        };
         let context = runner_context("project-runner", 1001, 1001);
         let runner = verified_runner_user_for_test("other-runner", 1002, 1002, "/srv/other-runner");
         let command = LaneCommand::runner_podman_info(
@@ -808,12 +766,11 @@ mod tests {
         )
         .expect("runner command");
 
-        let error = executor
-            .execute(&command, &runner)
+        let error = execute_runner_user_lane(&process, &executables, &privilege, &command, &runner)
             .expect_err("mismatched runner evidence must fail");
         assert_eq!(error.kind(), LaneExecutionErrorKind::InvalidCommand);
-        assert_eq!(executor.executables.calls.get(), 0);
-        assert!(executor.process.calls.borrow().is_empty());
+        assert_eq!(executables.calls.get(), 0);
+        assert!(process.calls.borrow().is_empty());
     }
 
     #[test]
@@ -823,26 +780,21 @@ mod tests {
             calls: Cell::new(0),
             fail: true,
         };
-        let executor = RootLaneExecutor::new(
-            process,
-            executables,
-            FakePrivilege {
-                uid: 0,
-                fail: false,
-            },
-        );
+        let privilege = FakePrivilege {
+            uid: 0,
+            fail: false,
+        };
         let command = LaneCommand::apt_install(
             &action("install-tools", ExecutionLane::Root),
             &[PackageName::parse("git").expect("package")],
         )
         .expect("apt command");
 
-        let error = executor
-            .execute(&command)
+        let error = execute_root_lane(&process, &executables, &privilege, &command)
             .expect_err("untrusted executable must fail");
         assert_eq!(error.kind(), LaneExecutionErrorKind::ExecutableVerification);
-        assert_eq!(executor.executables.calls.get(), 1);
-        assert!(executor.process.calls.borrow().is_empty());
+        assert_eq!(executables.calls.get(), 1);
+        assert!(process.calls.borrow().is_empty());
     }
 
     #[test]
