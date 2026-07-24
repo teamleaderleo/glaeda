@@ -1,6 +1,6 @@
 use std::fmt;
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Component, Path};
 
 use serde::Serialize;
@@ -139,7 +139,9 @@ struct ProcStatusPrivilegeProbe;
 
 impl PrivilegeProbe for ProcStatusPrivilegeProbe {
     fn effective_uid(&self) -> io::Result<u32> {
-        let bytes = fs::read(PROC_SELF_STATUS)?;
+        let mut bytes = Vec::with_capacity(MAX_PROC_STATUS_BYTES + 1);
+        let mut reader = fs::File::open(PROC_SELF_STATUS)?.take((MAX_PROC_STATUS_BYTES + 1) as u64);
+        reader.read_to_end(&mut bytes)?;
         if bytes.len() > MAX_PROC_STATUS_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,

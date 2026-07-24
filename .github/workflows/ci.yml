@@ -6,7 +6,7 @@ on:
     branches: [main]
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: verify-${{ github.workflow }}-${{ github.ref }}
@@ -15,78 +15,34 @@ concurrency:
 jobs:
   verify:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 15
 
     steps:
-      - name: Check out executor branch
+      - name: Check out repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          ref: codex/typed-lane-executors
-          fetch-depth: 0
 
       - name: Install Rust toolchain
         run: rustup show active-toolchain
 
-      - name: Apply, verify, and publish hardening fixes
-        shell: bash
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Run tests
+        run: cargo test --locked --all-targets --all-features
+
+      - name: Exercise machine-readable doctor output
+        run: cargo run --locked --quiet -- --output json doctor
+
+      - name: Validate reference plans
         run: |
-          set +e
-          log=/tmp/typed-lane-hardening.log
-          : > "$log"
+          cargo run --locked --quiet -- plan --file examples/quarry.yml
+          cargo run --locked --quiet -- --output json plan --file examples/glossless.yml \
+            | jq -e '.schema_version == 1 and (.actions | length == 4)'
 
-          run_step() {
-            name="$1"
-            shift
-            {
-              echo
-              echo "===== $name ====="
-              "$@"
-            } >>"$log" 2>&1
-            return $?
-          }
-
-          status=0
-          run_step "apply self-review fixes" python3 .github/apply_typed_lane_self_review.py || status=$?
-          rm -f .github/apply_typed_lane_self_review.py
-          if [ "$status" -eq 0 ]; then run_step "format" cargo fmt --all || status=$?; fi
-          if [ "$status" -eq 0 ]; then run_step "diff check" git diff --check || status=$?; fi
-          if [ "$status" -eq 0 ]; then
-            run_step "focused lane tests" cargo test --locked --all-features lane_ || status=$?
-          fi
-          if [ "$status" -eq 0 ]; then
-            run_step "clippy" cargo clippy --locked --all-targets --all-features -- -D warnings || status=$?
-          fi
-          if [ "$status" -eq 0 ]; then
-            run_step "full tests" cargo test --locked --all-targets --all-features || status=$?
-          fi
-          if [ "$status" -eq 0 ]; then
-            run_step "json doctor" cargo run --locked --quiet -- --output json doctor || status=$?
-          fi
-          if [ "$status" -eq 0 ]; then
-            run_step "reference plan" cargo run --locked --quiet -- plan --file examples/quarry.yml || status=$?
-          fi
-          if [ "$status" -eq 0 ]; then
-            run_step "json reference plan" bash -c \
-              "cargo run --locked --quiet -- --output json plan --file examples/glossless.yml | jq -e '.schema_version == 1 and (.actions | length == 4)'" || status=$?
-          fi
-          if [ "$status" -eq 0 ]; then
-            run_step "host plan" bash -c \
-              "cargo run --locked --quiet -- --output json host plan --file examples/quarry.yml | jq -e '.schema_version == 1 and (.actions | length >= 2)'" || status=$?
-          fi
-
-          git checkout origin/main -- .github/workflows/ci.yml
-          if [ "$status" -eq 0 ]; then
-            rm -f .github/typed-lane-status.txt
-            message="Harden typed lane executor evidence checks"
-          else
-            cp "$log" .github/typed-lane-status.txt
-            message="Update typed lane hardening diagnostics"
-          fi
-
-          cat "$log"
-          git config user.name github-actions[bot]
-          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add -A
-          git commit -m "$message"
-          git push origin HEAD:codex/typed-lane-executors
-          exit "$status"
+      - name: Exercise read-only host planning
+        run: |
+          cargo run --locked --quiet -- --output json host plan --file examples/quarry.yml \
+            | jq -e '.schema_version == 1 and (.actions | length >= 2)'

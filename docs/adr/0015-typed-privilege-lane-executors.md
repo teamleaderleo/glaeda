@@ -26,10 +26,10 @@ Both executors:
 1. require the command's typed lane to match the executor;
 2. revalidate the command kind, exact absolute program, argv shape, and empty outer environment;
 3. require effective UID zero through bounded `/proc/self/status` evidence;
-4. verify every required executable immediately before process creation; and
+4. verify every required executable immediately before process creation, including the configured `nologin` shell for user creation; and
 5. delegate only to the shell-free bounded `ProcessExecutor`.
 
-The root executor accepts only reviewed root command kinds. Its `CommandSpec` environment must be empty, and no manifest value can choose the program or introduce a shell, `sudo`, `su`, `runuser`, or arbitrary environment variable.
+The root executor accepts only reviewed root command kinds. Its `CommandSpec` environment must be empty, and no manifest value can choose the program or introduce a shell, `sudo`, `su`, `runuser`, or arbitrary environment variable. Effective-UID evidence is read through a fixed-size reader, so even malformed process-status input cannot cause an unbounded allocation.
 
 The runner-user executor additionally requires a previously verified nonroot `VerifiedRunnerUser`. It rechecks UID, primary GID, canonical home, exact `/run/user/UID` runtime directory, and minimum subordinate UID/GID capacity. The command must exactly match:
 
