@@ -34,6 +34,14 @@ const LOCK_FILE_NAME: &str = "write.lock";
 const TEMP_FILE_ATTEMPTS: usize = 8;
 const TEMP_FILE_PREFIX: &str = ".smolrunner-tmp-";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WritePhase {
+    BeforeWrite,
+    BeforeFileSync,
+    BeforeRename,
+    BeforeParentSync,
+}
+
 /// Descriptor-relative access to one trusted SmolRunner state root.
 #[derive(Debug)]
 pub struct LinuxStateRoot {
@@ -117,6 +125,18 @@ impl LinuxStateRoot {
         &mut self,
         record: &StateRecord,
     ) -> Result<StateWriteReceipt, StateStoreError> {
+        let mut hook = |_phase| Ok::<(), StateStoreError>(());
+        self.write_atomic_with_hook(record, &mut hook)
+    }
+
+    fn write_atomic_with_hook<F>(
+        &mut self,
+        record: &StateRecord,
+        hook: &mut F,
+    ) -> Result<StateWriteReceipt, StateStoreError>
+    where
+        F: FnMut(WritePhase) -> Result<(), StateStoreError>,
+    {
         let _lock = self.acquire_installation_lock(record.path())?;
         let (parent, file_name) = self.open_required_parent(record.path())?;
         let disposition = inspect_destination(&parent, file_name)?;
@@ -129,12 +149,14 @@ impl LinuxStateRoot {
                 "could not set private state-file permissions",
             )
         })?;
-        write_and_sync(temporary, record.bytes())?;
+        write_and_sync(temporary, record.bytes(), hook)?;
 
+        hook(WritePhase::BeforeRename)?;
         fs::renameat(&parent, temporary_path.name(), &parent, file_name.as_str())
             .map_err(map_rename_error)?;
         temporary_path.disarm();
 
+        hook(WritePhase::BeforeParentSync)?;
         fs::fsync(&parent).map_err(|_| {
             StateStoreError::public(
                 StateStoreErrorKind::Io,
@@ -351,14 +373,19 @@ fn random_temporary_name() -> Result<String, StateStoreError> {
     Ok(name)
 }
 
-fn write_and_sync(fd: OwnedFd, bytes: &[u8]) -> Result<(), StateStoreError> {
+fn write_and_sync<F>(fd: OwnedFd, bytes: &[u8], hook: &mut F) -> Result<(), StateStoreError>
+where
+    F: FnMut(WritePhase) -> Result<(), StateStoreError>,
+{
     let mut file = File::from(fd);
+    hook(WritePhase::BeforeWrite)?;
     file.write_all(bytes).map_err(|_| {
         StateStoreError::public(
             StateStoreErrorKind::Io,
             "could not write temporary state file",
         )
     })?;
+    hook(WritePhase::BeforeFileSync)?;
     fs::fsync(&file).map_err(|_| {
         StateStoreError::public(
             StateStoreErrorKind::Io,
@@ -526,11 +553,11 @@ mod tests {
     use crate::state::{InstallationId, StateLayout};
     use crate::state_document::ProjectStateDocument;
     use crate::state_store::{
-        MAX_STATE_DOCUMENT_BYTES, StateRead, StateRecord, StateStoreErrorKind,
+        MAX_STATE_DOCUMENT_BYTES, StateRead, StateRecord, StateStoreError, StateStoreErrorKind,
         StateWriteDisposition,
     };
 
-    use super::{LOCK_FILE_NAME, LinuxStateRoot, TEMP_FILE_PREFIX};
+    use super::{LOCK_FILE_NAME, LinuxStateRoot, TEMP_FILE_PREFIX, WritePhase};
 
     static NEXT_TEMP_ROOT: AtomicU64 = AtomicU64::new(1);
 
@@ -583,6 +610,41 @@ mod tests {
             .expect("project document"),
         )
         .expect("project record")
+    }
+
+    fn fail_at(target: WritePhase) -> impl FnMut(WritePhase) -> Result<(), StateStoreError> {
+        move |phase| {
+            if phase != target {
+                return Ok(());
+            }
+            let message = match phase {
+                WritePhase::BeforeWrite => {
+                    "injected state-write failure before temporary-file write"
+                }
+                WritePhase::BeforeFileSync => {
+                    "injected state-write failure before temporary-file synchronization"
+                }
+                WritePhase::BeforeRename => {
+                    "injected state-write failure before publication rename"
+                }
+                WritePhase::BeforeParentSync => {
+                    "state file was published before an injected parent-sync failure"
+                }
+            };
+            Err(StateStoreError::public(StateStoreErrorKind::Io, message))
+        }
+    }
+
+    fn assert_no_temporary_files(parent: &Path) {
+        assert!(
+            fs::read_dir(parent)
+                .expect("list state directory")
+                .all(|entry| !entry
+                    .expect("directory entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(TEMP_FILE_PREFIX))
+        );
     }
 
     #[test]
@@ -721,6 +783,57 @@ mod tests {
                     .to_string_lossy()
                     .starts_with(TEMP_FILE_PREFIX))
         );
+    }
+
+    #[test]
+    fn prepublication_failures_preserve_existing_state_and_remove_temporary_files() {
+        for point in [
+            WritePhase::BeforeWrite,
+            WritePhase::BeforeFileSync,
+            WritePhase::BeforeRename,
+        ] {
+            let root = TempTree::new(&format!("prepublication-{point:?}"));
+            let parent = create_project_parent(root.path());
+            let mut store = LinuxStateRoot::open(root.path()).expect("open state root");
+            let original = project_record("example/original");
+            store.write_atomic(&original).expect("write original state");
+
+            let replacement = project_record("example/replacement");
+            let mut hook = fail_at(point);
+            let error = store
+                .write_atomic_with_hook(&replacement, &mut hook)
+                .expect_err("injected prepublication failure must fail");
+            assert_eq!(error.kind(), StateStoreErrorKind::Io);
+            assert_eq!(
+                store.read(original.path()).expect("read preserved state"),
+                StateRead::Present(original.bytes().to_vec())
+            );
+            assert_no_temporary_files(&parent);
+        }
+    }
+
+    #[test]
+    fn parent_sync_failure_reports_published_state_and_removes_temporary_file() {
+        let root = TempTree::new("parent-sync-failure");
+        let parent = create_project_parent(root.path());
+        let mut store = LinuxStateRoot::open(root.path()).expect("open state root");
+        let original = project_record("example/original");
+        store.write_atomic(&original).expect("write original state");
+
+        let replacement = project_record("example/replacement");
+        let mut hook = fail_at(WritePhase::BeforeParentSync);
+        let error = store
+            .write_atomic_with_hook(&replacement, &mut hook)
+            .expect_err("injected parent-sync failure must fail");
+        assert_eq!(error.kind(), StateStoreErrorKind::Io);
+        assert!(error.message().contains("published"));
+        assert_eq!(
+            store
+                .read(replacement.path())
+                .expect("read published state"),
+            StateRead::Present(replacement.bytes().to_vec())
+        );
+        assert_no_temporary_files(&parent);
     }
 
     #[test]
