@@ -23,6 +23,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
+          # Formatting only; no project commands or tests execute.
           for path in src/lib.rs src/linux_installation_staging_recovery.rs; do
             test -f "$path"
             test ! -L "$path"
