@@ -40,9 +40,8 @@ pub fn authorize_existing_preview_command(
         ));
     }
 
-    authorize_existing_preview_command_from_receipt(spec, command, receipt).map_err(|error| {
-        PreviewMutationAuthorizationError::new("ownership", error.to_string())
-    })
+    authorize_existing_preview_command_from_receipt(spec, command, receipt)
+        .map_err(|error| PreviewMutationAuthorizationError::new("ownership", error.to_string()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -221,9 +220,18 @@ mod tests {
             PreviewContainerStatus::Stopped,
             PreviewContainerStatus::Exited,
         ] {
-            assert!(operation_allows_status(PreviewPodmanOperation::Start, &status));
-            assert!(operation_allows_status(PreviewPodmanOperation::Remove, &status));
-            assert!(!operation_allows_status(PreviewPodmanOperation::Stop, &status));
+            assert!(operation_allows_status(
+                PreviewPodmanOperation::Start,
+                &status
+            ));
+            assert!(operation_allows_status(
+                PreviewPodmanOperation::Remove,
+                &status
+            ));
+            assert!(!operation_allows_status(
+                PreviewPodmanOperation::Stop,
+                &status
+            ));
         }
         assert!(operation_allows_status(
             PreviewPodmanOperation::Stop,
@@ -244,9 +252,18 @@ mod tests {
             PreviewContainerStatus::Dead,
             PreviewContainerStatus::Other("unknown".to_owned()),
         ] {
-            assert!(!operation_allows_status(PreviewPodmanOperation::Start, &status));
-            assert!(!operation_allows_status(PreviewPodmanOperation::Stop, &status));
-            assert!(!operation_allows_status(PreviewPodmanOperation::Remove, &status));
+            assert!(!operation_allows_status(
+                PreviewPodmanOperation::Start,
+                &status
+            ));
+            assert!(!operation_allows_status(
+                PreviewPodmanOperation::Stop,
+                &status
+            ));
+            assert!(!operation_allows_status(
+                PreviewPodmanOperation::Remove,
+                &status
+            ));
         }
     }
 
@@ -256,9 +273,7 @@ mod tests {
         let plan = PreviewPodmanPlan::for_container(&spec, &runner());
 
         let created = receipt(&spec, &plan, Some("created"));
-        assert!(
-            authorize_existing_preview_command(&spec, &plan.provision()[1], &created).is_ok()
-        );
+        assert!(authorize_existing_preview_command(&spec, &plan.provision()[1], &created).is_ok());
 
         let running = receipt(&spec, &plan, Some("running"));
         assert!(authorize_existing_preview_command(&spec, &plan.cleanup()[0], &running).is_ok());
