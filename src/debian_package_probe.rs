@@ -118,7 +118,10 @@ impl<E: CommandExecutor> DpkgQueryProbe<E> {
     ) -> Result<DebianPackageObservation, DebianPackageProbeError> {
         validate_request(packages)?;
         let command = dpkg_inventory_command();
-        let receipt = self.executor.execute(&command).map_err(map_execution_error)?;
+        let receipt = self
+            .executor
+            .execute(&command)
+            .map_err(map_execution_error)?;
         let observed = decode_inventory(&command, &receipt, packages)?;
         Ok(DebianPackageObservation {
             command,
@@ -140,7 +143,10 @@ fn validate_request(packages: &[PackageName]) -> Result<(), DebianPackageProbeEr
         if !unique.insert(package.as_str()) {
             return Err(DebianPackageProbeError::new(
                 DebianPackageProbeErrorKind::InvalidRequest,
-                format!("package observation contains duplicate package {:?}", package.as_str()),
+                format!(
+                    "package observation contains duplicate package {:?}",
+                    package.as_str()
+                ),
             ));
         }
     }
@@ -171,7 +177,8 @@ fn decode_inventory(
             "dpkg package inventory did not complete cleanly",
         ));
     }
-    if receipt.stdout.is_empty() || !receipt.stdout.ends_with('\n') || receipt.stdout.contains('\0') {
+    if receipt.stdout.is_empty() || !receipt.stdout.ends_with('\n') || receipt.stdout.contains('\0')
+    {
         return Err(DebianPackageProbeError::new(
             DebianPackageProbeErrorKind::InvalidOutput,
             "dpkg package inventory is empty, truncated, or contains a NUL byte",
@@ -194,9 +201,7 @@ fn decode_inventory(
         if records > MAX_INVENTORY_RECORDS {
             return Err(DebianPackageProbeError::new(
                 DebianPackageProbeErrorKind::InvalidOutput,
-                format!(
-                    "dpkg package inventory exceeds {MAX_INVENTORY_RECORDS} records"
-                ),
+                format!("dpkg package inventory exceeds {MAX_INVENTORY_RECORDS} records"),
             ));
         }
         if line.is_empty() || line.len() > MAX_INVENTORY_LINE_BYTES {
@@ -349,7 +354,12 @@ mod tests {
         ));
         let probe = DpkgQueryProbe::new(executor);
         let observation = probe
-            .observe(&[package("git"), package("podman"), package("uidmap"), package("slirp4netns")])
+            .observe(&[
+                package("git"),
+                package("podman"),
+                package("uidmap"),
+                package("slirp4netns"),
+            ])
             .expect("package observation");
 
         assert_eq!(observation.packages()["git"], Presence::Present);
