@@ -23,6 +23,151 @@ jobs:
           ref: codex/host-package-plan-output
           fetch-depth: 0
 
+      - name: Repair bounded reading and deterministic tests
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/host_package_plan.rs")
+          text = path.read_text()
+          text = text.replace("use std::io::{Read as _, Take};", "use std::io::Read as _;")
+
+          old = '''pub fn inspect_host_package_plan(
+              manifest: &Manifest,
+              os_release_path: impl AsRef<Path>,
+              executor: &impl CommandExecutor,
+          ) -> Result<HostPackagePlan, HostPackagePlanError> {
+              let current = LinuxFilesystemProbe.inspect(manifest).map_err(|_| {
+                  HostPackagePlanError::new(
+                      HostPackagePlanErrorKind::HostProbe,
+                      "failed to inspect bounded host state",
+                  )
+              })?;
+              let host = build_host_plan(manifest, current);
+              let os_release = read_bounded(os_release_path.as_ref())?;
+              let distribution = parse_os_release(&os_release).map_err(|_| {
+                  HostPackagePlanError::new(
+                      HostPackagePlanErrorKind::Distribution,
+                      "host distribution is not a supported, valid Debian or Ubuntu identity",
+                  )
+              })?;
+
+              let seed = build_package_plan(distribution.clone(), &BTreeMap::new())
+                  .map_err(map_package_plan_error)?;
+              let observation = DpkgQueryProbe::new(executor)
+                  .observe(&seed.required_packages)
+                  .map_err(map_package_probe_error)?;
+              let package_plan = build_package_plan(distribution, observation.packages())
+                  .map_err(map_package_plan_error)?;
+
+              Ok(HostPackagePlan::new(host, package_plan))
+          }
+          '''
+          new = '''pub fn inspect_host_package_plan(
+              manifest: &Manifest,
+              os_release_path: impl AsRef<Path>,
+              executor: &impl CommandExecutor,
+          ) -> Result<HostPackagePlan, HostPackagePlanError> {
+              let current = LinuxFilesystemProbe.inspect(manifest).map_err(|_| {
+                  HostPackagePlanError::new(
+                      HostPackagePlanErrorKind::HostProbe,
+                      "failed to inspect bounded host state",
+                  )
+              })?;
+              inspect_host_package_plan_from_current(
+                  manifest,
+                  current,
+                  os_release_path,
+                  executor,
+              )
+          }
+
+          /// Build the integrated report from an already inspected current-host snapshot.
+          ///
+          /// This entry point keeps tests and higher-level orchestrators deterministic while the public
+          /// host command continues to use `LinuxFilesystemProbe` exactly once.
+          ///
+          /// # Errors
+          ///
+          /// Returns a bounded error for unsafe os-release, distribution, package plan, or package probe
+          /// state.
+          pub fn inspect_host_package_plan_from_current(
+              manifest: &Manifest,
+              current: CurrentHostState,
+              os_release_path: impl AsRef<Path>,
+              executor: &impl CommandExecutor,
+          ) -> Result<HostPackagePlan, HostPackagePlanError> {
+              let host = build_host_plan(manifest, current);
+              let os_release = read_bounded(os_release_path.as_ref())?;
+              let distribution = parse_os_release(&os_release).map_err(|_| {
+                  HostPackagePlanError::new(
+                      HostPackagePlanErrorKind::Distribution,
+                      "host distribution is not a supported, valid Debian or Ubuntu identity",
+                  )
+              })?;
+
+              let seed = build_package_plan(distribution.clone(), &BTreeMap::new())
+                  .map_err(map_package_plan_error)?;
+              let observation = DpkgQueryProbe::new(executor)
+                  .observe(&seed.required_packages)
+                  .map_err(map_package_probe_error)?;
+              let package_plan = build_package_plan(distribution, observation.packages())
+                  .map_err(map_package_plan_error)?;
+
+              Ok(HostPackagePlan::new(host, package_plan))
+          }
+          '''
+          if text.count(old) != 1:
+              raise SystemExit("expected inspect_host_package_plan block once")
+          text = text.replace(old, new)
+          text = text.replace(
+              "Take::new(file, (MAX_OS_RELEASE_BYTES + 1) as u64)",
+              "file.take((MAX_OS_RELEASE_BYTES + 1) as u64)",
+          )
+
+          text = text.replace(
+              "    use std::cell::RefCell;\n",
+              "    use std::cell::RefCell;\n    use std::collections::BTreeMap;\n",
+          )
+          text = text.replace(
+              "    use crate::manifest::parse;\n",
+              "    use crate::host::{CurrentHostState, Presence};\n    use crate::manifest::parse;\n",
+          )
+          text = text.replace(
+              "        HostPackagePlanErrorKind, MAX_OS_RELEASE_BYTES, inspect_host_package_plan, render_human,\n",
+              "        HostPackagePlanErrorKind, MAX_OS_RELEASE_BYTES,\n        inspect_host_package_plan_from_current, render_human,\n",
+          )
+
+          marker = '''    struct FakeExecutor {
+          '''
+          helper = '''    fn current_host_state() -> CurrentHostState {
+              CurrentHostState {
+                  commands: BTreeMap::from([
+                      ("git".to_owned(), Presence::Present),
+                      ("podman".to_owned(), Presence::Absent),
+                      ("systemctl".to_owned(), Presence::Present),
+                  ]),
+                  runner_user: Presence::Absent,
+                  subordinate_uids: Presence::Absent,
+                  subordinate_gids: Presence::Absent,
+                  linger: Presence::Absent,
+                  container_image: Presence::Unknown,
+                  runner_registration: Presence::Unknown,
+              }
+          }
+
+          struct FakeExecutor {
+          '''
+          if text.count(marker) != 1:
+              raise SystemExit("expected FakeExecutor marker once")
+          text = text.replace(marker, helper)
+          text = text.replace(
+              "inspect_host_package_plan(&manifest, &os_release.0, &executor)",
+              "inspect_host_package_plan_from_current(\n            &manifest,\n            current_host_state(),\n            &os_release.0,\n            &executor,\n        )",
+          )
+          path.write_text(text)
+          PY
+
       - name: Format source
         run: cargo fmt --all
 
@@ -43,11 +188,11 @@ jobs:
           cargo run --locked --quiet -- --output json host plan --file examples/quarry.yml \
             | jq -e '.schema_version == 1 and (.actions | length >= 2) and .package_plan.schema_version == 1'
 
-      - name: Publish verified formatting and remove helper
+      - name: Publish verified repair and remove helper
         run: |
           rm .github/workflows/host-package-plan-repair.yml
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git add src/host_package_plan.rs src/main.rs .github/workflows/host-package-plan-repair.yml
-          git commit -m "Format host package plan integration"
+          git commit -m "Repair host package plan integration"
           git push origin HEAD:codex/host-package-plan-output
