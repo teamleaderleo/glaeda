@@ -1,0 +1,76 @@
+name: Harden dpkg residual state classification
+
+on:
+  push:
+    branches: [codex/bounded-dpkg-query-probe]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: harden-dpkg-config-state
+  cancel-in-progress: false
+
+jobs:
+  harden:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: codex/bounded-dpkg-query-probe
+          fetch-depth: 0
+
+      - name: Protect residual configuration state
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("src/debian_package_probe.rs")
+          text = path.read_text()
+          old = '''        "installed" => Presence::Present,
+                  "not-installed" | "config-files" => Presence::Absent,
+                  _ => Presence::Unknown,
+          '''
+          new = '''        "installed" => Presence::Present,
+                  "not-installed" => Presence::Absent,
+                  _ => Presence::Unknown,
+          '''
+          if text.count(old) != 1:
+              raise SystemExit("expected status classification block once")
+          text = text.replace(old, new)
+          old_assert = 'assert_eq!(observation.packages()["podman"], Presence::Absent);'
+          new_assert = 'assert_eq!(observation.packages()["podman"], Presence::Unknown);'
+          if text.count(old_assert) != 1:
+              raise SystemExit("expected config-files assertion once")
+          path.write_text(text.replace(old_assert, new_assert))
+          PY
+
+      - name: Format source
+        run: cargo fmt --all
+
+      - name: Run focused probe tests
+        run: cargo test --locked --all-targets --all-features debian_package_probe
+
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Run full tests
+        run: cargo test --locked --all-targets --all-features
+
+      - name: Exercise required CLI checks
+        run: |
+          cargo run --locked --quiet -- --output json doctor
+          cargo run --locked --quiet -- plan --file examples/quarry.yml
+          cargo run --locked --quiet -- --output json plan --file examples/glossless.yml
+          cargo run --locked --quiet -- --output json host plan --file examples/quarry.yml
+
+      - name: Publish verified hardening and remove helper
+        run: |
+          rm .github/workflows/harden-dpkg-config-state.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/debian_package_probe.rs .github/workflows/harden-dpkg-config-state.yml
+          git commit -m "Protect residual dpkg configuration state"
+          git push origin HEAD:codex/bounded-dpkg-query-probe
