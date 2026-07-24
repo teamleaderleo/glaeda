@@ -1,0 +1,63 @@
+name: Wire Podman inspect receipts
+
+on:
+  push:
+    branches: [feat/podman-inspect-receipts]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: wire-podman-inspect-receipts
+  cancel-in-progress: true
+
+jobs:
+  wire:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: feat/podman-inspect-receipts
+
+      - name: Close raw authorization and export receipt layer
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          inspect = Path('src/podman_preview_inspect.rs')
+          text = inspect.read_text()
+          old_name = 'authorize_existing_preview_command'
+          new_name = 'authorize_existing_preview_command_from_observation'
+          if old_name not in text:
+              raise SystemExit('raw authorization symbol missing')
+          text = text.replace(old_name, new_name)
+          public = f'pub fn {new_name}('
+          crate_visible = f'pub(crate) fn {new_name}('
+          if public not in text:
+              raise SystemExit('authorization definition missing')
+          text = text.replace(public, crate_visible, 1)
+          inspect.write_text(text)
+
+          lib = Path('src/lib.rs')
+          text = lib.read_text()
+          anchor = 'pub mod podman_preview_inspect;\n'
+          addition = 'pub mod podman_preview_execution;\n'
+          if addition not in text:
+              if anchor not in text:
+                  raise SystemExit('lib export anchor missing')
+              text = text.replace(anchor, addition + anchor, 1)
+          lib.write_text(text)
+          PY
+          cargo fmt --all
+
+      - name: Commit wiring and remove helper
+        run: |
+          rm .github/workflows/wire-podman-inspect-receipts.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/podman_preview_execution.rs src/podman_preview_inspect.rs src/lib.rs .github/workflows/wire-podman-inspect-receipts.yml
+          git commit -m "Wire Podman inspect execution receipts"
+          git push origin HEAD:feat/podman-inspect-receipts
