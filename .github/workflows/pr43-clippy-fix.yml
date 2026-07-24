@@ -23,6 +23,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
+          # Compiler fixes only; no tests or project commands execute.
           test -f src/linux_state.rs
           test ! -L src/linux_state.rs
           test -z "$(git status --porcelain)"
