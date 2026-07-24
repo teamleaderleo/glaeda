@@ -348,6 +348,28 @@ fn inspect_expected_directory(
         || owner != (stat.st_uid, stat.st_gid)
     {
         concerns.push(unsafe_concern);
+        return;
+    }
+    let mut entries = match Dir::read_from(&directory) {
+        Ok(entries) => entries,
+        Err(_) => {
+            concerns.push(StagedInstallationConcern::InspectionFailed);
+            return;
+        }
+    };
+    for entry in &mut entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                concerns.push(StagedInstallationConcern::InspectionFailed);
+                return;
+            }
+        };
+        let entry_name = entry.file_name().to_bytes();
+        if entry_name != b"." && entry_name != b".." {
+            concerns.push(unsafe_concern);
+            return;
+        }
     }
 }
 
@@ -683,6 +705,31 @@ mod tests {
             finding
                 .concerns()
                 .contains(&StagedInstallationConcern::ProjectIdMismatch)
+        );
+    }
+
+    #[test]
+    fn nested_resource_or_journal_state_is_suspicious() {
+        let root = TempRoot::new("nested-state");
+        let installation_id = id("7777777777777777");
+        let stage = create_complete_stage(root.path(), &installation_id, installation_id.clone());
+        fs::write(
+            stage.join(RESOURCES_DIRECTORY).join("unexpected.json"),
+            b"foreign",
+        )
+        .expect("write unexpected resource state");
+
+        let report =
+            inspect_staged_installations(root.path()).expect("inspect nested staged state");
+        let finding = &report.findings()[0];
+        assert_eq!(
+            finding.disposition(),
+            StagedInstallationDisposition::Suspicious
+        );
+        assert!(
+            finding
+                .concerns()
+                .contains(&StagedInstallationConcern::UnsafeResources)
         );
     }
 
