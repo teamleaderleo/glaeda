@@ -23,6 +23,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
+          # Three reviewed Rust files, no project execution.
           test -f tools/patch_lane_executor_wiring.py
           test ! -L tools/patch_lane_executor_wiring.py
           test -z "$(git status --porcelain)"
