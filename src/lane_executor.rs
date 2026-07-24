@@ -1,4 +1,3 @@
-use std::cell::Cell;
 use std::fmt;
 use std::fs;
 use std::io;
@@ -7,11 +6,11 @@ use std::path::{Component, Path};
 use serde::Serialize;
 
 use crate::journal::ExecutionLane;
-use crate::lane_command::{
-    LaneCommand, LaneCommandKind, LinuxAccountName, PackageName,
-};
+use crate::lane_command::{LaneCommand, LaneCommandKind, LinuxAccountName, PackageName};
 use crate::lane_executable::verify_lane_command;
-use crate::process::{CommandExecutor, CommandSpec, CommandValue, ExecutionRecord, ProcessExecutor};
+use crate::process::{
+    CommandExecutor, CommandSpec, CommandValue, ExecutionRecord, ProcessExecutor,
+};
 use crate::runner_user::{MIN_SUBORDINATE_ID_COUNT, VerifiedRunnerUser};
 
 const PROC_SELF_STATUS: &str = "/proc/self/status";
@@ -211,7 +210,10 @@ where
     ///
     /// Returns a bounded error for lane mismatch, malformed command shape, unsupported privilege,
     /// untrusted executables, or process startup failure.
-    pub fn execute(&self, command: &LaneCommand) -> Result<LaneExecutionReceipt, LaneExecutionError> {
+    pub fn execute(
+        &self,
+        command: &LaneCommand,
+    ) -> Result<LaneExecutionReceipt, LaneExecutionError> {
         require_lane(command, ExecutionLane::Root)?;
         validate_root_command(command)?;
         require_effective_root(&self.privilege)?;
@@ -364,7 +366,9 @@ fn validate_groupadd(spec: &CommandSpec, arguments: &[&str]) -> Result<(), LaneE
         || arguments[0] != "--system"
         || LinuxAccountName::parse(arguments[1]).is_err()
     {
-        return Err(invalid_command("group creation command shape is not reviewed"));
+        return Err(invalid_command(
+            "group creation command shape is not reviewed",
+        ));
     }
     Ok(())
 }
@@ -384,7 +388,9 @@ fn validate_useradd(spec: &CommandSpec, arguments: &[&str]) -> Result<(), LaneEx
     if valid {
         Ok(())
     } else {
-        Err(invalid_command("user creation command shape is not reviewed"))
+        Err(invalid_command(
+            "user creation command shape is not reviewed",
+        ))
     }
 }
 
@@ -405,8 +411,7 @@ fn validate_runner_evidence(runner: &VerifiedRunnerUser) -> Result<(), LaneExecu
         || runner.subordinate_uid_count() < MIN_SUBORDINATE_ID_COUNT
         || runner.subordinate_gid_count() < MIN_SUBORDINATE_ID_COUNT
         || !canonical_absolute_path(runner.home())
-        || runner.runtime_directory()
-            != Path::new(&format!("/run/user/{}", runner.uid()))
+        || runner.runtime_directory() != Path::new(&format!("/run/user/{}", runner.uid()))
     {
         return Err(LaneExecutionError::public(
             LaneExecutionErrorKind::InvalidRunnerEvidence,
@@ -451,7 +456,11 @@ fn validate_runner_command(
         format!("XDG_RUNTIME_DIR={}", runner.runtime_directory().display()),
         inner_program.to_owned(),
     ];
-    expected.extend(inner_arguments.iter().map(|argument| (*argument).to_owned()));
+    expected.extend(
+        inner_arguments
+            .iter()
+            .map(|argument| (*argument).to_owned()),
+    );
     let arguments = plain_arguments(spec)?;
     if arguments
         .iter()
@@ -538,7 +547,8 @@ fn parse_effective_uid(input: &str) -> io::Result<u32> {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
+    use std::io;
 
     use crate::journal::{ExecutionLane, PlannedMutation, Preconditions, RollbackClass};
     use crate::lane_command::{LaneCommand, LinuxAccountName, PackageName, RunnerUserContext};
@@ -690,12 +700,8 @@ mod tests {
             },
         );
         let context = runner_context("project-runner", 1001, 1001);
-        let runner = verified_runner_user_for_test(
-            "project-runner",
-            1001,
-            1001,
-            "/srv/project-runner",
-        );
+        let runner =
+            verified_runner_user_for_test("project-runner", 1001, 1001, "/srv/project-runner");
         let command = LaneCommand::runner_git_version(
             &action("inspect-git", ExecutionLane::RunnerUser),
             &context,
@@ -795,12 +801,7 @@ mod tests {
             },
         );
         let context = runner_context("project-runner", 1001, 1001);
-        let runner = verified_runner_user_for_test(
-            "other-runner",
-            1002,
-            1002,
-            "/srv/other-runner",
-        );
+        let runner = verified_runner_user_for_test("other-runner", 1002, 1002, "/srv/other-runner");
         let command = LaneCommand::runner_podman_info(
             &action("inspect-podman", ExecutionLane::RunnerUser),
             &context,
@@ -839,10 +840,7 @@ mod tests {
         let error = executor
             .execute(&command)
             .expect_err("untrusted executable must fail");
-        assert_eq!(
-            error.kind(),
-            LaneExecutionErrorKind::ExecutableVerification
-        );
+        assert_eq!(error.kind(), LaneExecutionErrorKind::ExecutableVerification);
         assert_eq!(executor.executables.calls.get(), 1);
         assert!(executor.process.calls.borrow().is_empty());
     }

@@ -515,6 +515,24 @@ fn canonical_absolute_path(
 }
 
 #[cfg(test)]
+pub(crate) fn verified_runner_user_for_test(
+    username: &str,
+    uid: u32,
+    primary_gid: u32,
+    home: &str,
+) -> VerifiedRunnerUser {
+    VerifiedRunnerUser {
+        username: LinuxAccountName::parse(username).expect("test runner username"),
+        uid,
+        primary_gid,
+        home: home.to_owned(),
+        runtime_directory: PathBuf::from(format!("/run/user/{uid}")),
+        subordinate_uid_count: MIN_SUBORDINATE_ID_COUNT,
+        subordinate_gid_count: MIN_SUBORDINATE_ID_COUNT,
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::fs;
     use std::os::unix::fs::MetadataExt;
