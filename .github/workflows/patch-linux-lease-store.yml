@@ -24,85 +24,86 @@ jobs:
         run: |
           python3 - <<'PY'
           from pathlib import Path
+          import re
 
           path = Path('src/linux_lease_store.rs')
           text = path.read_text()
 
-          old_create = '''        Err(Errno::NOENT) => {
-              fs::mkdirat(installation, LEASES_DIRECTORY, MANAGED_DIRECTORY_MODE)
-                  .map_err(map_leases_create_error)?;
-              let directory = fs::openat(
-          '''
-          new_create = '''        Err(Errno::NOENT) => {
-              let created = match fs::mkdirat(
+          function_pattern = re.compile(
+              r'''fn ensure_leases_directory\(\n.*?\n\}\n\nfn ensure_lock_file''',
+              re.S,
+          )
+          replacement = '''fn ensure_leases_directory(
+              installation: &OwnedFd,
+              owner: (u32, u32),
+          ) -> Result<OwnedFd, LeaseStoreError> {
+              match fs::openat(
                   installation,
                   LEASES_DIRECTORY,
-                  MANAGED_DIRECTORY_MODE,
+                  DIRECTORY_FLAGS,
+                  Mode::empty(),
               ) {
-                  Ok(()) => true,
-                  Err(Errno::EXIST) => false,
-                  Err(_) => {
-                      return Err(store_error(
-                          LeaseStoreErrorKind::Io,
-                          "could not create the lease directory",
-                      ));
+                  Ok(directory) => {
+                      inspect_directory(&directory, "lease directory", Some(owner))?;
+                      Ok(directory)
                   }
-              };
-              let directory = fs::openat(
-          '''
-          if old_create not in text:
-              raise SystemExit('lease directory creation anchor missing')
-          text = text.replace(old_create, new_create, 1)
-
-          old_sync = '''            inspect_directory(&directory, "lease directory", Some(owner))?;
-              synchronize_directory(installation, "installation directory")?;
-              Ok(directory)
-          '''
-          new_sync = '''            inspect_directory(&directory, "lease directory", Some(owner))?;
-              if created {
-                  fs::fchmod(&directory, MANAGED_DIRECTORY_MODE).map_err(|_| {
-                      store_error(
-                          LeaseStoreErrorKind::Io,
-                          "could not set lease-directory permissions",
+                  Err(Errno::NOENT) => {
+                      let created = match fs::mkdirat(
+                          installation,
+                          LEASES_DIRECTORY,
+                          MANAGED_DIRECTORY_MODE,
+                      ) {
+                          Ok(()) => true,
+                          Err(Errno::EXIST) => false,
+                          Err(_) => {
+                              return Err(store_error(
+                                  LeaseStoreErrorKind::Io,
+                                  "could not create the lease directory",
+                              ));
+                          }
+                      };
+                      let directory = fs::openat(
+                          installation,
+                          LEASES_DIRECTORY,
+                          DIRECTORY_FLAGS,
+                          Mode::empty(),
                       )
-                  })?;
-                  synchronize_directory(installation, "installation directory")?;
-              }
-              Ok(directory)
-          '''
-          if old_sync not in text:
-              raise SystemExit('lease directory synchronization anchor missing')
-          text = text.replace(old_sync, new_sync, 1)
-
-          old_fchmod = '''            fs::fchmod(&directory, MANAGED_DIRECTORY_MODE).map_err(|_| {
-                  store_error(
-                      LeaseStoreErrorKind::Io,
-                      "could not set lease-directory permissions",
-                  )
-              })?;
-          '''
-          if old_fchmod not in text:
-              raise SystemExit('old lease directory chmod anchor missing')
-          text = text.replace(old_fchmod, '', 1)
-
-          old_mapper = '''fn map_leases_create_error(error: Errno) -> LeaseStoreError {
-              match error {
-                  Errno::EXIST => map_leases_open_error(error),
-                  _ => store_error(
-                      LeaseStoreErrorKind::Io,
-                      "could not create the lease directory",
-                  ),
+                      .map_err(map_leases_open_error)?;
+                      inspect_directory(&directory, "lease directory", Some(owner))?;
+                      if created {
+                          fs::fchmod(&directory, MANAGED_DIRECTORY_MODE).map_err(|_| {
+                              store_error(
+                                  LeaseStoreErrorKind::Io,
+                                  "could not set lease-directory permissions",
+                              )
+                          })?;
+                          synchronize_directory(installation, "installation directory")?;
+                      }
+                      Ok(directory)
+                  }
+                  Err(error) => Err(map_leases_open_error(error)),
               }
           }
 
-          '''
-          if old_mapper not in text:
+          fn ensure_lock_file'''
+          text, count = function_pattern.subn(replacement, text, count=1)
+          if count != 1:
+              raise SystemExit('lease directory function anchor missing')
+
+          text, count = re.subn(
+              r'''fn map_leases_create_error\(.*?\n\}\n\n''',
+              '',
+              text,
+              count=1,
+              flags=re.S,
+          )
+          if count != 1:
               raise SystemExit('obsolete create mapper anchor missing')
-          text = text.replace(old_mapper, '', 1)
 
           insert_before = '''    #[test]
               fn mismatched_installation_selector_is_rejected() {
           '''
+          insert_before = insert_before.replace('              ', '    ')
           lock_test = '''    #[test]
               fn concurrent_mutation_lock_reports_busy() {
                   let root = TempInstallation::new("busy");
@@ -120,6 +121,7 @@ jobs:
               }
 
           '''
+          lock_test = lock_test.replace('              ', '    ')
           if insert_before not in text:
               raise SystemExit('test insertion anchor missing')
           text = text.replace(insert_before, lock_test + insert_before, 1)
