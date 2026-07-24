@@ -23,6 +23,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
+          # One bounded source replacement and one regression test; no project execution.
           python3 - <<'PY'
           from pathlib import Path
 
@@ -71,7 +72,7 @@ jobs:
           text = text.replace(old, new, 1)
 
           marker = '''    #[test]
-              fn malformed_symlinked_or_broad_entries_are_suspicious() {
+          fn malformed_symlinked_or_broad_entries_are_suspicious() {
           '''
           test = '''    #[test]
           fn nested_resource_or_journal_state_is_suspicious() {
