@@ -23,6 +23,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
+          # This workflow copies one reviewed source file and runs no project code.
           test ! -e src/runner_user.rs
           git fetch --no-tags --depth=1 origin fda2b19900fd549cbab33ea1d891da669a99a732
           git show FETCH_HEAD:src/runner_user.rs > src/runner_user.rs
