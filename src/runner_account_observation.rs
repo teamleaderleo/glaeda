@@ -155,6 +155,7 @@ fn observe_with(
         &user_lookup,
         parsed_user.as_ref(),
         parsed_group.as_ref(),
+        group.state(),
         desired,
     )?;
 
@@ -352,6 +353,7 @@ fn classify_user(
     lookup: &Lookup,
     parsed: Option<&PasswdRecord>,
     group: Option<&GroupRecord>,
+    group_state: PreparationObservationState,
     desired: &DesiredRunnerAccount,
 ) -> Result<PreparationObservation, RunnerAccountObservationError> {
     let (state, evidence) = match lookup {
@@ -377,34 +379,55 @@ fn classify_user(
                     desired.username().as_str()
                 ),
             ),
-            Some(record)
-                if record.username() == desired.username()
-                    && record.uid() > 0
-                    && record.primary_gid() > 0
-                    && record.home() == desired.home()
-                    && record.shell() == EXPECTED_SHELL
-                    && group.is_some_and(|group| group.gid == record.primary_gid()) =>
-            {
-                (
-                    PreparationObservationState::Matching,
+            Some(record) if user_record_matches_desired(record, desired) => match group_state {
+                PreparationObservationState::Matching
+                    if group.is_some_and(|group| group.gid == record.primary_gid()) =>
+                {
+                    (
+                        PreparationObservationState::Matching,
+                        format!(
+                            "getent passwd {} matched UID {}, primary GID {}, home, and nologin shell",
+                            record.username().as_str(),
+                            record.uid(),
+                            record.primary_gid()
+                        ),
+                    )
+                }
+                PreparationObservationState::Unknown => (
+                    PreparationObservationState::Unknown,
                     format!(
-                        "getent passwd {} matched UID {}, primary GID {}, home, and nologin shell",
-                        record.username().as_str(),
-                        record.uid(),
-                        record.primary_gid()
+                        "getent passwd {} matched its local fields but the primary group is unknown",
+                        desired.username().as_str()
                     ),
-                )
-            }
+                ),
+                PreparationObservationState::Matching
+                | PreparationObservationState::Absent
+                | PreparationObservationState::Conflicting => (
+                    PreparationObservationState::Conflicting,
+                    format!(
+                        "getent passwd {} conflicts with the desired primary group",
+                        desired.username().as_str()
+                    ),
+                ),
+            },
             Some(_) => (
                 PreparationObservationState::Conflicting,
                 format!(
-                    "getent passwd {} conflicts with the desired identity or primary group",
+                    "getent passwd {} conflicts with the desired account fields",
                     desired.username().as_str()
                 ),
             ),
         },
     };
     Ok(PreparationObservation::new(state, [evidence])?)
+}
+
+fn user_record_matches_desired(record: &PasswdRecord, desired: &DesiredRunnerAccount) -> bool {
+    record.username() == desired.username()
+        && record.uid() > 0
+        && record.primary_gid() > 0
+        && record.home() == desired.home()
+        && record.shell() == EXPECTED_SHELL
 }
 
 fn classify_home(
@@ -519,7 +542,8 @@ fn classify_linger(
                 && metadata.uid == 0
                 && metadata.gid == 0
                 && metadata.mode & 0o022 == 0
-                && metadata.size == 0 =>
+                && metadata.size == 0
+                && metadata.nlink == 1 =>
         {
             (
                 PreparationObservationState::Matching,
@@ -553,6 +577,7 @@ struct ObservedPathMetadata {
     gid: u32,
     mode: u32,
     size: u64,
+    nlink: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -600,6 +625,7 @@ impl AccountFilesystem for LinuxAccountFilesystem {
             gid: metadata.gid(),
             mode: metadata.mode() & 0o7777,
             size: metadata.size(),
+            nlink: metadata.nlink(),
         })
     }
 
@@ -773,6 +799,7 @@ mod tests {
                         gid: 1001,
                         mode: 0o750,
                         size: 0,
+                        nlink: 1,
                     }),
                 ),
                 (
@@ -783,6 +810,7 @@ mod tests {
                         gid: 0,
                         mode: 0o644,
                         size: 0,
+                        nlink: 1,
                     }),
                 ),
             ]),
@@ -875,6 +903,27 @@ mod tests {
     }
 
     #[test]
+    fn matching_user_fields_remain_unknown_when_group_lookup_is_unknown() {
+        let group_command =
+            getent_command("group", &account("project-runner")).expect("group command");
+        let mut group = absent(group_command);
+        group.status = Some(1);
+        let passwd = success(
+            getent_command("passwd", &account("project-runner")).expect("passwd command"),
+            "project-runner:x:1001:1001::/var/lib/project-runner:/usr/sbin/nologin
+",
+        );
+        let executor = FakeExecutor::new(vec![group, passwd]);
+        let report = observe_with(&desired(), &executor, &paths(), &matching_filesystem())
+            .expect("unknown group observation");
+        assert_eq!(
+            report.observations.user.state(),
+            PreparationObservationState::Unknown
+        );
+        assert!(report.identity().is_none());
+    }
+
+    #[test]
     fn incompatible_user_home_ranges_and_linger_are_conflicting() {
         let group = success(
             getent_command("group", &account("project-runner")).expect("group command"),
@@ -895,6 +944,7 @@ mod tests {
                         gid: 55,
                         mode: 0o777,
                         size: 0,
+                        nlink: 1,
                     }),
                 ),
                 (
@@ -905,6 +955,7 @@ mod tests {
                         gid: 0,
                         mode: 0o777,
                         size: 1,
+                        nlink: 2,
                     }),
                 ),
             ]),
