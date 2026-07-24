@@ -7,7 +7,7 @@
 
 The dependency-aware runner account plan needs more than name existence. It must distinguish a safely matching primary group and runner user from missing, ambiguous, malformed, stale, or conflicting state. It also needs exact evidence for the desired home directory, subordinate UID/GID ranges, and systemd linger marker.
 
-Reading only `/etc/passwd` and `/etc/group` is not sufficient because Debian and Ubuntu may resolve accounts through NSS. Conversely, a failed NSS lookup must never be treated as proof that an account is absent. Subordinate-ID files and filesystem markers also require bounded, no-follow inspection so symlinks, hard links, or writable authority files cannot authorize mutation.
+Reading only `/etc/passwd` and `/etc/group` is not sufficient because Debian and Ubuntu may resolve accounts through NSS. Conversely, a failed NSS lookup must never be treated as proof that an account is absent. Subordinate-ID files and filesystem markers also require bounded, no-follow inspection so symlinks, hard links, writable authority files, or ranges owned by another account cannot authorize mutation.
 
 ## Decision
 
@@ -24,7 +24,7 @@ A receipt is accepted only when its argv and environment match the reviewed comm
 - exit status `2`, empty stdout, and empty stderr: absent;
 - execution failure, any other status, stderr, oversized output, NUL data, malformed records, or receipt mismatch: unknown.
 
-A matching group has the exact desired name and a nonzero canonical GID. A matching user has the exact desired name, nonzero UID and primary GID, the desired home, `/usr/sbin/nologin`, and a primary GID equal to the matching group GID. An existing incompatible user is conflicting. When the user fields match but the primary-group lookup is unknown, the user remains unknown rather than being mislabeled as conflicting.
+A matching group has the exact desired name, a nonzero canonical GID, and no supplementary members. A group containing other users is conflicting because it is not dedicated to the runner. A matching user has the exact desired name, nonzero UID and primary GID, the desired home, `/usr/sbin/nologin`, and a primary GID equal to the matching group GID. An existing incompatible user is conflicting. When the user fields match but the primary-group lookup is unknown, the user remains unknown rather than being mislabeled as conflicting.
 
 ### Home directory
 
@@ -41,12 +41,12 @@ An existing home cannot be considered matching until the group and user identiti
 
 The configured subordinate UID and GID files are opened with `O_NOFOLLOW`, bounded to one mebibyte, and accepted only as single-link regular files owned by root:root and not writable by group or others. Missing or unsafe authority files are unknown, not absent.
 
-Matching entries are parsed through the existing strict subordinate-range parser.
+The whole trusted authority is parsed, not only lines naming the desired user. Every nonempty entry must have a bounded valid owner and canonical, nonempty, nonoverflowing range. This is required to prove that the desired allocation does not overlap another account.
 
-- no entry for the desired user in a trusted authority: absent;
-- exactly one range equal to the desired allocation, with a matching user: matching;
-- malformed matching entries: unknown;
-- additional, stale, or different ranges: conflicting.
+- no entry for the desired user and no cross-owner overlap: absent;
+- exactly one desired-user range equal to the desired allocation, no additional desired-user ranges, no cross-owner overlap, and a matching user: matching;
+- malformed data anywhere in the authority: unknown;
+- cross-owner overlap, additional desired-user ranges, stale ranges, or different ranges: conflicting.
 
 ### Linger marker
 
@@ -68,6 +68,6 @@ This ADR adds read-only observation only. It does not allocate subordinate range
 ## Consequences
 
 - NSS-aware account absence can be distinguished from lookup failure.
-- Unsafe authority files, symlinks, hard links, residual allocations, and stale linger markers cannot become absence.
+- Unsafe authority files, symlinks, hard links, residual allocations, cross-owner overlaps, and stale linger markers cannot become absence.
 - The account planner can consume observations directly without weakening its dependency rules.
 - Host-plan integration and durable execution remain separate reviewed slices.
