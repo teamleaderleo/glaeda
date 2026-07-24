@@ -276,9 +276,11 @@ impl From<WireRollbackClass> for RollbackClass {
 #[serde(rename_all = "snake_case")]
 enum WireActionOutcome {
     Pending,
+    Executing,
     Completed,
     Failed,
     Skipped,
+    RollbackInProgress,
     RolledBack,
     Compensated,
     RollbackFailed,
@@ -288,9 +290,11 @@ impl From<WireActionOutcome> for ActionOutcome {
     fn from(wire: WireActionOutcome) -> Self {
         match wire {
             WireActionOutcome::Pending => Self::Pending,
+            WireActionOutcome::Executing => Self::Executing,
             WireActionOutcome::Completed => Self::Completed,
             WireActionOutcome::Failed => Self::Failed,
             WireActionOutcome::Skipped => Self::Skipped,
+            WireActionOutcome::RollbackInProgress => Self::RollbackInProgress,
             WireActionOutcome::RolledBack => Self::RolledBack,
             WireActionOutcome::Compensated => Self::Compensated,
             WireActionOutcome::RollbackFailed => Self::RollbackFailed,
@@ -325,6 +329,7 @@ fn validate_execution_journal(journal: &ExecutionJournal) -> Result<(), JournalD
         validate_record(index, record, &mut problems);
     }
     validate_stop_position(journal, &mut problems);
+    validate_recovery_position(journal, &mut problems);
 
     if problems.is_empty() {
         Ok(())
@@ -360,9 +365,15 @@ fn validate_record(index: usize, record: &JournalRecord, problems: &mut Vec<Stri
                 problems.push(format!("{prefix}.message must be absent while pending"));
             }
         }
+        ActionOutcome::Executing => {
+            if record.message.is_some() {
+                problems.push(format!("{prefix}.message must be absent while executing"));
+            }
+        }
         ActionOutcome::Completed
         | ActionOutcome::Failed
         | ActionOutcome::Skipped
+        | ActionOutcome::RollbackInProgress
         | ActionOutcome::RolledBack
         | ActionOutcome::Compensated
         | ActionOutcome::RollbackFailed => match record.message.as_deref() {
@@ -385,9 +396,11 @@ fn validate_record(index: usize, record: &JournalRecord, problems: &mut Vec<Stri
                 "{prefix} can be compensated only for a compensating action"
             ));
         }
-        ActionOutcome::RollbackFailed if record.action.rollback == RollbackClass::Irreversible => {
+        ActionOutcome::RollbackInProgress | ActionOutcome::RollbackFailed
+            if record.action.rollback == RollbackClass::Irreversible =>
+        {
             problems.push(format!(
-                "{prefix} cannot report rollback_failed for an irreversible action"
+                "{prefix} cannot report rollback state for an irreversible action"
             ));
         }
         _ => {}
@@ -439,19 +452,83 @@ fn validate_stop_position(journal: &ExecutionJournal, problems: &mut Vec<String>
                 problems
                     .push("stopped_after must name the failed or skipped stop record".to_owned());
             }
-            if journal.records[..stop_index]
-                .iter()
-                .any(|record| record.outcome == ActionOutcome::Pending)
-            {
-                problems.push("records before stopped_after cannot remain pending".to_owned());
+            match journal.records[stop_index].outcome {
+                ActionOutcome::Failed => {
+                    if journal.records[..stop_index]
+                        .iter()
+                        .any(|record| record.outcome == ActionOutcome::Pending)
+                    {
+                        problems
+                            .push("records before a failed stop cannot remain pending".to_owned());
+                    }
+                    if journal.records[stop_index + 1..]
+                        .iter()
+                        .any(|record| record.outcome != ActionOutcome::Pending)
+                    {
+                        problems.push("records after a failed stop must remain pending".to_owned());
+                    }
+                }
+                ActionOutcome::Skipped => {
+                    if journal.records.iter().enumerate().any(|(index, record)| {
+                        index != stop_index && record.outcome != ActionOutcome::Pending
+                    }) {
+                        problems.push(
+                            "all records other than a skipped preflight stop must remain pending"
+                                .to_owned(),
+                        );
+                    }
+                }
+                _ => {}
             }
-            if journal.records[stop_index + 1..]
+        }
+    }
+}
+
+fn validate_recovery_position(journal: &ExecutionJournal, problems: &mut Vec<String>) {
+    let active = journal
+        .records
+        .iter()
+        .enumerate()
+        .filter(|(_, record)| {
+            matches!(
+                record.outcome,
+                ActionOutcome::Executing | ActionOutcome::RollbackInProgress
+            )
+        })
+        .collect::<Vec<_>>();
+    if active.len() > 1 {
+        problems.push("execution journal contains more than one in-progress record".to_owned());
+        return;
+    }
+
+    let Some((active_index, active_record)) = active.first().copied() else {
+        return;
+    };
+    match active_record.outcome {
+        ActionOutcome::Executing => {
+            if journal.stopped_after.is_some() {
+                problems
+                    .push("an executing journal cannot also contain a stop position".to_owned());
+            }
+            if journal.records[..active_index]
+                .iter()
+                .any(|record| record.outcome != ActionOutcome::Completed)
+            {
+                problems.push("records before an executing action must be completed".to_owned());
+            }
+            if journal.records[active_index + 1..]
                 .iter()
                 .any(|record| record.outcome != ActionOutcome::Pending)
             {
-                problems.push("records after stopped_after must remain pending".to_owned());
+                problems.push("records after an executing action must remain pending".to_owned());
             }
         }
+        ActionOutcome::RollbackInProgress => {
+            if journal.stopped_after.is_none() {
+                problems.push("rollback_in_progress requires a failed stop position".to_owned());
+            }
+        }
+        _ => unreachable!(),
     }
 }
 
@@ -580,6 +657,67 @@ mod tests {
                 .iter()
                 .any(|problem| problem.contains("does not name"))
         );
+    }
+
+    #[test]
+    fn skipped_irreversible_preflight_allows_earlier_records_to_remain_pending() {
+        let journal = ExecutionJournal {
+            schema_version: JOURNAL_SCHEMA_VERSION,
+            records: vec![
+                JournalRecord {
+                    action: action("one", RollbackClass::Reversible),
+                    outcome: ActionOutcome::Pending,
+                    message: None,
+                },
+                JournalRecord {
+                    action: action("two", RollbackClass::Irreversible),
+                    outcome: ActionOutcome::Skipped,
+                    message: Some("irreversible action requires explicit confirmation".to_owned()),
+                },
+                JournalRecord {
+                    action: action("three", RollbackClass::Reversible),
+                    outcome: ActionOutcome::Pending,
+                    message: None,
+                },
+            ],
+            stopped_after: Some("two".to_owned()),
+        };
+
+        document(journal);
+    }
+
+    #[test]
+    fn executing_state_round_trips_and_rejects_a_second_active_record() {
+        let mut journal = ExecutionJournal {
+            schema_version: JOURNAL_SCHEMA_VERSION,
+            records: vec![
+                JournalRecord {
+                    action: action("one", RollbackClass::Reversible),
+                    outcome: ActionOutcome::Executing,
+                    message: None,
+                },
+                JournalRecord {
+                    action: action("two", RollbackClass::Reversible),
+                    outcome: ActionOutcome::Pending,
+                    message: None,
+                },
+            ],
+            stopped_after: None,
+        };
+        let document = document(journal.clone());
+        let encoded = encode_journal_document(&document).expect("encode journal");
+        assert_eq!(
+            decode_journal_document(&encoded).expect("decode journal"),
+            document
+        );
+
+        journal.records[1].outcome = ActionOutcome::Executing;
+        JournalStateDocument::new(
+            InstallationId::parse("0123456789abcdef").expect("installation ID"),
+            JournalId::parse("apply-00000001").expect("journal ID"),
+            journal,
+        )
+        .expect_err("two active records must fail");
     }
 
     #[test]

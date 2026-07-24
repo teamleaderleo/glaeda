@@ -1,5 +1,6 @@
 pub mod artifact;
 pub mod doctor;
+pub mod durable_journal;
 pub mod host;
 #[cfg(target_os = "linux")]
 pub mod installation_id;

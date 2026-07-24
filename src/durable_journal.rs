@@ -124,7 +124,7 @@ impl std::error::Error for DurableCheckpointError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DurableExecutionError {
     Plan(PlanValidationError),
-    Checkpoint(DurableCheckpointError),
+    Checkpoint(Box<DurableCheckpointError>),
 }
 
 impl fmt::Display for DurableExecutionError {
@@ -326,13 +326,15 @@ fn persist_checkpoint(
             *last_durable = Some(journal.clone());
             Ok(())
         }
-        Err(failure) => Err(DurableExecutionError::Checkpoint(DurableCheckpointError {
-            phase,
-            action_id: action_index.map(|index| journal.records[index].action.id.clone()),
-            last_durable: last_durable.clone(),
-            attempted: journal.clone(),
-            failure,
-        })),
+        Err(failure) => Err(DurableExecutionError::Checkpoint(Box::new(
+            DurableCheckpointError {
+                phase,
+                action_id: action_index.map(|index| journal.records[index].action.id.clone()),
+                last_durable: last_durable.clone(),
+                attempted: journal.clone(),
+                failure,
+            },
+        ))),
     }
 }
 
@@ -346,11 +348,7 @@ pub struct StateStoreJournalCheckpoint<'a, S> {
 
 impl<'a, S> StateStoreJournalCheckpoint<'a, S> {
     #[must_use]
-    pub fn new(
-        store: &'a mut S,
-        installation_id: InstallationId,
-        journal_id: JournalId,
-    ) -> Self {
+    pub fn new(store: &'a mut S, installation_id: InstallationId, journal_id: JournalId) -> Self {
         Self {
             store,
             installation_id,
@@ -421,7 +419,9 @@ mod tests {
         ) -> Result<(), JournalCheckpointFailure> {
             self.calls += 1;
             if self.fail_on_call == Some(self.calls) {
-                return Err(JournalCheckpointFailure::public("bounded checkpoint failure"));
+                return Err(JournalCheckpointFailure::public(
+                    "bounded checkpoint failure",
+                ));
             }
             self.snapshots.push(journal.clone());
             Ok(())
@@ -475,7 +475,11 @@ mod tests {
     }
 
     fn outcomes(journal: &super::ExecutionJournal) -> Vec<super::ActionOutcome> {
-        journal.records.iter().map(|record| record.outcome).collect()
+        journal
+            .records
+            .iter()
+            .map(|record| record.outcome)
+            .collect()
     }
 
     #[test]
