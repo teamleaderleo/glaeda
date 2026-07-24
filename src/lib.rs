@@ -1,3 +1,4 @@
+pub mod artifact;
 pub mod doctor;
 pub mod host;
 #[cfg(target_os = "linux")]
@@ -8,6 +9,8 @@ pub mod lane_command;
 #[cfg(target_os = "linux")]
 pub mod lane_executable;
 pub mod lease;
+pub mod lease_catalog;
+pub mod lease_document;
 /// Read-only, fail-closed lookup of persisted project installations.
 #[cfg(target_os = "linux")]
 pub mod linux_installation_catalog;
@@ -20,9 +23,6 @@ pub mod linux_installation_enrollment;
 /// Staged, durable, no-replace publication of complete project installations.
 #[cfg(target_os = "linux")]
 pub mod linux_installation_publication;
-/// Read-only classification of abandoned installation-publication staging trees.
-#[cfg(target_os = "linux")]
-pub mod linux_installation_staging_recovery;
 #[cfg(target_os = "linux")]
 pub mod linux_state;
 #[cfg(target_os = "linux")]
