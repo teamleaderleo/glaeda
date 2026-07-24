@@ -107,6 +107,8 @@ The next slice adds fail-closed lease documents, an atomic no-replace and compar
 
 Preview-slot planning now coalesces repeated requests for the same artifact, port, and health endpoint into one runtime generation with a renewed lease. Changed runtime inputs produce one checked replacement generation. Bounded typed ports, lifetimes, health paths, and generation counters prevent callers from forging invalid plans. See [ADR 0006](docs/adr/0006-preview-slot-coalescing.md).
 
+The local Podman command-planning slice binds an OCI artifact to bounded runtime limits, loopback-only publication, fixed ownership labels, and reviewed shell-free create/start/inspect/stop/remove vectors. It remains inert until a later executor proves ownership and authorizes each mutation. See [ADR 0007](docs/adr/0007-rootless-podman-preview-command-planning.md).
+
 See [leased execution and previews](docs/LEASED_EXECUTION.md) and the updated [roadmap](docs/ROADMAP.md).
 
 ## Intended workflow
@@ -161,6 +163,7 @@ cargo run --locked --quiet -- --output json host plan --file examples/quarry.yml
 - [ADR 0004: lease lifecycle core](docs/adr/0004-lease-lifecycle-core.md)
 - [ADR 0005: atomic lease stores and artifact identity](docs/adr/0005-lease-store-and-artifact-identity.md)
 - [ADR 0006: preview slot coalescing](docs/adr/0006-preview-slot-coalescing.md)
+- [ADR 0007: rootless Podman preview command planning](docs/adr/0007-rootless-podman-preview-command-planning.md)
 - [Roadmap](docs/ROADMAP.md)
 - [Agent instructions](AGENTS.md)
 
