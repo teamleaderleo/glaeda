@@ -29,44 +29,37 @@ jobs:
 
           path = Path("src/linux_state.rs")
           text = path.read_text(encoding="utf-8")
+          lines = text.splitlines()
 
-          old = '''    pub fn read(&self, path: &StatePath) -> Result<StateRead, StateStoreError> {
-              let Some((file_name, parents)) = path.components().split_last() else {
-          '''
-          new = '''    pub fn read(&self, path: &StatePath) -> Result<StateRead, StateStoreError> {
-              verify_managed_directory(&self.root, "state root", Some(self.owner))?;
-              let Some((file_name, parents)) = path.components().split_last() else {
-          '''
-          if text.count(old) != 1:
-              raise SystemExit("unexpected read entry")
-          text = text.replace(old, new, 1)
+          read_signature = "    pub fn read(&self, path: &StatePath) -> Result<StateRead, StateStoreError> {"
+          read_index = lines.index(read_signature)
+          read_check = '        verify_managed_directory(&self.root, "state root", Some(self.owner))?;'
+          if lines[read_index + 1].strip() != 'verify_managed_directory(&self.root, "state root", Some(self.owner))?;':
+              lines.insert(read_index + 1, read_check)
 
-          old = '''    ) -> Result<StateWriteReceipt, StateStoreError> {
-              let _lock = self.acquire_installation_lock(record.path())?;
-          '''
-          new = '''    ) -> Result<StateWriteReceipt, StateStoreError> {
-              verify_managed_directory(&self.root, "state root", Some(self.owner))?;
-              let _lock = self.acquire_installation_lock(record.path())?;
-          '''
-          if text.count(old) != 1:
-              raise SystemExit("unexpected write entry")
-          text = text.replace(old, new, 1)
+          write_signature = "    fn write_atomic_with_faults("
+          write_start = lines.index(write_signature)
+          lock_index = next(
+              index
+              for index in range(write_start, len(lines))
+              if lines[index].strip() == "let _lock = self.acquire_installation_lock(record.path())?;"
+          )
+          write_check = '        verify_managed_directory(&self.root, "state root", Some(self.owner))?;'
+          if lines[lock_index - 1].strip() != 'verify_managed_directory(&self.root, "state root", Some(self.owner))?;':
+              lines.insert(lock_index, write_check)
 
-          old = '''    use rustix::fs::{self as rustix_fs, FlockOperation};
-          '''
-          new = '''    use rustix::fs::{self as rustix_fs, FlockOperation, Mode};
-          '''
+          text = "\n".join(lines) + "\n"
+          old = "    use rustix::fs::{self as rustix_fs, FlockOperation};"
+          new = "    use rustix::fs::{self as rustix_fs, FlockOperation, Mode};"
           if text.count(old) != 1:
               raise SystemExit("unexpected rustix test import")
           text = text.replace(old, new, 1)
 
-          old = '''    use super::{LOCK_FILE_NAME, LinuxStateRoot, TEMP_FILE_PREFIX, WriteFaultInjector, WritePhase};
-          '''
+          old = "    use super::{LOCK_FILE_NAME, LinuxStateRoot, TEMP_FILE_PREFIX, WriteFaultInjector, WritePhase};"
           new = '''    use super::{
               FILE_FLAGS, LOCK_FILE_NAME, LinuxStateRoot, TEMP_FILE_PREFIX, WriteFaultInjector,
               WritePhase, verify_managed_directory, verify_managed_file,
-          };
-          '''
+          };'''
           if text.count(old) != 1:
               raise SystemExit("unexpected parent test import")
           text = text.replace(old, new, 1)
@@ -83,12 +76,8 @@ jobs:
 
               let reader = LinuxStateRoot::open(root.path()).expect("open state root");
               let wrong_owner = (reader.owner.0.wrapping_add(1), reader.owner.1);
-              let error = verify_managed_directory(
-                  &reader.root,
-                  "state root",
-                  Some(wrong_owner),
-              )
-              .expect_err("unexpected directory owner must fail");
+              let error = verify_managed_directory(&reader.root, "state root", Some(wrong_owner))
+                  .expect_err("unexpected directory owner must fail");
               assert_eq!(error.kind(), StateStoreErrorKind::UnsafeFilesystem);
 
               let file = rustix_fs::open(&project_path, FILE_FLAGS, Mode::empty())
