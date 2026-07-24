@@ -1,0 +1,35 @@
+name: Format Podman state authorization
+
+on:
+  push:
+    branches: [feat/podman-state-authorization]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: format-podman-state-authorization
+  cancel-in-progress: true
+
+jobs:
+  format:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: feat/podman-state-authorization
+
+      - name: Format Rust sources
+        run: cargo fmt --all
+
+      - name: Commit formatting and remove helper
+        run: |
+          rm .github/workflows/format-podman-state-authorization.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/podman_preview_state.rs src/podman_preview_execution.rs src/lib.rs .github/workflows/format-podman-state-authorization.yml
+          git commit -m "Format Podman state authorization"
+          git push origin HEAD:feat/podman-state-authorization
