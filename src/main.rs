@@ -4,12 +4,14 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use smolrunner::doctor::{inspect_host, render_human as render_doctor};
-use smolrunner::host::{
-    HostProbe, LinuxFilesystemProbe, build_plan as build_host_plan,
-    render_human as render_host_plan,
+#[cfg(target_os = "linux")]
+use smolrunner::host_package_plan::{
+    DEFAULT_OS_RELEASE_PATH, inspect_host_package_plan, render_human as render_host_plan,
 };
 use smolrunner::manifest::{ManifestError, load};
 use smolrunner::plan::{build, render_human as render_plan};
+#[cfg(target_os = "linux")]
+use smolrunner::process::ProcessExecutor;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -125,32 +127,33 @@ fn run_plan(output: OutputFormat, file: &Path) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+#[cfg(target_os = "linux")]
 fn run_host_plan(output: OutputFormat, file: &Path) -> ExitCode {
     let manifest = match load_manifest(output, file) {
         Ok(manifest) => manifest,
         Err(code) => return code,
     };
-    let current = match LinuxFilesystemProbe.inspect(&manifest) {
-        Ok(current) => current,
-        Err(error) => {
-            let message = format!("failed to inspect host state: {error}");
-            match output {
-                OutputFormat::Human => eprintln!("{message}"),
-                OutputFormat::Json => {
-                    let report = RuntimeErrorReport {
-                        schema_version: 1,
-                        kind: "host_probe",
-                        message,
-                    };
-                    if print_json(&report).is_err() {
-                        return ExitCode::from(2);
+    let report =
+        match inspect_host_package_plan(&manifest, DEFAULT_OS_RELEASE_PATH, &ProcessExecutor) {
+            Ok(report) => report,
+            Err(error) => {
+                let message = format!("failed to inspect host and package state: {error}");
+                match output {
+                    OutputFormat::Human => eprintln!("{message}"),
+                    OutputFormat::Json => {
+                        let report = RuntimeErrorReport {
+                            schema_version: 1,
+                            kind: "host_package_probe",
+                            message,
+                        };
+                        if print_json(&report).is_err() {
+                            return ExitCode::from(2);
+                        }
                     }
                 }
+                return ExitCode::from(2);
             }
-            return ExitCode::from(2);
-        }
-    };
-    let report = build_host_plan(&manifest, current);
+        };
 
     match output {
         OutputFormat::Human => print!("{}", render_host_plan(&report)),
@@ -162,6 +165,28 @@ fn run_host_plan(output: OutputFormat, file: &Path) -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_host_plan(output: OutputFormat, file: &Path) -> ExitCode {
+    if let Err(code) = load_manifest(output, file) {
+        return code;
+    }
+    let message = "host planning currently supports Linux only".to_owned();
+    match output {
+        OutputFormat::Human => eprintln!("{message}"),
+        OutputFormat::Json => {
+            let report = RuntimeErrorReport {
+                schema_version: 1,
+                kind: "host_package_probe",
+                message,
+            };
+            if print_json(&report).is_err() {
+                return ExitCode::from(2);
+            }
+        }
+    }
+    ExitCode::from(2)
 }
 
 fn load_manifest(

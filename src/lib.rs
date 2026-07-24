@@ -7,6 +7,8 @@ pub mod doctor;
 pub mod durable_journal;
 pub mod host;
 #[cfg(target_os = "linux")]
+pub mod host_package_plan;
+#[cfg(target_os = "linux")]
 pub mod installation_id;
 pub mod journal;
 pub mod journal_document;
