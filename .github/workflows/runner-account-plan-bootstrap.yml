@@ -1,0 +1,466 @@
+name: Bootstrap runner account preparation plan
+
+on:
+  push:
+    branches: [codex/runner-account-preparation-plan]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bootstrap-runner-account-plan
+  cancel-in-progress: false
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: codex/runner-account-preparation-plan
+          fetch-depth: 0
+
+      - name: Add reviewed account preparation commands
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/lane_command.rs")
+          text = path.read_text()
+
+          old = '''const USERADD: &str = "/usr/sbin/useradd";
+          const LOGINCTL: &str = "/usr/bin/loginctl";
+          '''
+          new = '''const USERADD: &str = "/usr/sbin/useradd";
+          const USERMOD: &str = "/usr/sbin/usermod";
+          const INSTALL: &str = "/usr/bin/install";
+          const LOGINCTL: &str = "/usr/bin/loginctl";
+          '''
+          if text.count(old) != 1:
+              raise SystemExit("expected lane command constants once")
+          text = text.replace(old, new)
+
+          old = '''    EnsureSystemUser,
+              EnableLinger,
+          '''
+          new = '''    EnsureSystemUser,
+              EnsureHomeDirectory,
+              EnsureSubordinateUids,
+              EnsureSubordinateGids,
+              EnableLinger,
+          '''
+          if text.count(old) != 1:
+              raise SystemExit("expected lane command enum block once")
+          text = text.replace(old, new)
+
+          marker = '''    /// Build the reviewed linger-enablement command.
+          '''
+          methods = '''    /// Build the reviewed runner home-directory creation command.
+              ///
+              /// # Errors
+              ///
+              /// Returns an error when the action is not assigned to the root lane or the home path is
+              /// not canonical and absolute.
+              pub fn ensure_home_directory(
+                  action: &PlannedMutation,
+                  user: &LinuxAccountName,
+                  primary_group: &LinuxAccountName,
+                  home: &str,
+              ) -> Result<Self, LaneCommandError> {
+                  require_lane(action, ExecutionLane::Root)?;
+                  let home = canonical_absolute_path("runner home", home)?;
+                  let spec = CommandSpec::new(INSTALL)
+                      .argument("--directory")
+                      .argument("--mode")
+                      .argument("0750")
+                      .argument("--owner")
+                      .argument(user.as_str())
+                      .argument("--group")
+                      .argument(primary_group.as_str())
+                      .argument("--")
+                      .argument(home);
+                  Ok(Self::new(
+                      action,
+                      LaneCommandKind::EnsureHomeDirectory,
+                      spec,
+                  ))
+              }
+
+              /// Build the reviewed subordinate-UID assignment command.
+              ///
+              /// # Errors
+              ///
+              /// Returns an error for a lane mismatch or an empty, overflowing subordinate range.
+              pub fn ensure_subordinate_uids(
+                  action: &PlannedMutation,
+                  user: &LinuxAccountName,
+                  start: u32,
+                  count: u32,
+              ) -> Result<Self, LaneCommandError> {
+                  require_lane(action, ExecutionLane::Root)?;
+                  let range = subordinate_range_argument(start, count)?;
+                  let spec = CommandSpec::new(USERMOD)
+                      .argument("--add-subuids")
+                      .argument(range)
+                      .argument("--")
+                      .argument(user.as_str());
+                  Ok(Self::new(
+                      action,
+                      LaneCommandKind::EnsureSubordinateUids,
+                      spec,
+                  ))
+              }
+
+              /// Build the reviewed subordinate-GID assignment command.
+              ///
+              /// # Errors
+              ///
+              /// Returns an error for a lane mismatch or an empty, overflowing subordinate range.
+              pub fn ensure_subordinate_gids(
+                  action: &PlannedMutation,
+                  user: &LinuxAccountName,
+                  start: u32,
+                  count: u32,
+              ) -> Result<Self, LaneCommandError> {
+                  require_lane(action, ExecutionLane::Root)?;
+                  let range = subordinate_range_argument(start, count)?;
+                  let spec = CommandSpec::new(USERMOD)
+                      .argument("--add-subgids")
+                      .argument(range)
+                      .argument("--")
+                      .argument(user.as_str());
+                  Ok(Self::new(
+                      action,
+                      LaneCommandKind::EnsureSubordinateGids,
+                      spec,
+                  ))
+              }
+
+              /// Build the reviewed linger-enablement command.
+          '''
+          if text.count(marker) != 1:
+              raise SystemExit("expected linger method marker once")
+          text = text.replace(marker, methods)
+
+          old = '''            LaneCommandKind::EnsureSystemUser => vec![outer, Path::new(NOLOGIN)],
+                  LaneCommandKind::AptInstall
+                  | LaneCommandKind::EnsureSystemGroup
+                  | LaneCommandKind::EnableLinger => vec![outer],
+          '''
+          new = '''            LaneCommandKind::EnsureSystemUser => vec![outer, Path::new(NOLOGIN)],
+                  LaneCommandKind::AptInstall
+                  | LaneCommandKind::EnsureSystemGroup
+                  | LaneCommandKind::EnsureHomeDirectory
+                  | LaneCommandKind::EnsureSubordinateUids
+                  | LaneCommandKind::EnsureSubordinateGids
+                  | LaneCommandKind::EnableLinger => vec![outer],
+          '''
+          if text.count(old) != 1:
+              raise SystemExit("expected required programs match once")
+          text = text.replace(old, new)
+
+          marker = '''fn runner_user_spec(
+          '''
+          helper = '''fn subordinate_range_argument(start: u32, count: u32) -> Result<String, LaneCommandError> {
+              if start == 0 || count == 0 {
+                  return Err(LaneCommandError::single(
+                      "subordinate-ID range must begin above zero and contain at least one ID",
+                  ));
+              }
+              let end = u64::from(start) + u64::from(count) - 1;
+              let end = u32::try_from(end).map_err(|_| {
+                  LaneCommandError::single("subordinate-ID range exceeds the 32-bit ID space")
+              })?;
+              Ok(format!("{start}-{end}"))
+          }
+
+          fn runner_user_spec(
+          '''
+          if text.count(marker) != 1:
+              raise SystemExit("expected runner_user_spec marker once")
+          text = text.replace(marker, helper)
+
+          old = '''        APT_GET, ENV, GIT, GROUPADD, LOGINCTL, LaneCommand, LaneCommandKind, LinuxAccountName,
+                  NOLOGIN, PODMAN, PackageName, RUNUSER, RunnerUserContext, USERADD,
+          '''
+          new = '''        APT_GET, ENV, GIT, GROUPADD, INSTALL, LOGINCTL, LaneCommand, LaneCommandKind,
+                  LinuxAccountName, NOLOGIN, PODMAN, PackageName, RUNUSER, RunnerUserContext, USERADD,
+                  USERMOD,
+          '''
+          if text.count(old) != 1:
+              raise SystemExit("expected lane command test imports once")
+          text = text.replace(old, new)
+
+          marker = '''        assert_eq!(
+                  LaneCommand::enable_linger(&root, &user)
+          '''
+          assertions = '''        assert_eq!(
+                  LaneCommand::ensure_home_directory(
+                      &root,
+                      &user,
+                      &group,
+                      "/var/lib/project-runner",
+                  )
+                  .expect("home command")
+                  .spec()
+                  .displayed_argv(),
+                  [
+                      INSTALL,
+                      "--directory",
+                      "--mode",
+                      "0750",
+                      "--owner",
+                      "project-runner",
+                      "--group",
+                      "project-runner",
+                      "--",
+                      "/var/lib/project-runner",
+                  ]
+              );
+              assert_eq!(
+                  LaneCommand::ensure_subordinate_uids(&root, &user, 100_000, 65_536)
+                      .expect("subuid command")
+                      .spec()
+                      .displayed_argv(),
+                  [
+                      USERMOD,
+                      "--add-subuids",
+                      "100000-165535",
+                      "--",
+                      "project-runner",
+                  ]
+              );
+              assert_eq!(
+                  LaneCommand::ensure_subordinate_gids(&root, &user, 200_000, 65_536)
+                      .expect("subgid command")
+                      .spec()
+                      .displayed_argv(),
+                  [
+                      USERMOD,
+                      "--add-subgids",
+                      "200000-265535",
+                      "--",
+                      "project-runner",
+                  ]
+              );
+              assert_eq!(
+                  LaneCommand::enable_linger(&root, &user)
+          '''
+          if text.count(marker) != 1:
+              raise SystemExit("expected linger assertion marker once")
+          text = text.replace(marker, assertions)
+
+          old = '''        RunnerUserContext::new(account("project-runner"), 1001, 1001, "/srv/../root")
+                  .expect_err("aliased home must fail");
+          '''
+          new = '''        RunnerUserContext::new(account("project-runner"), 1001, 1001, "/srv/../root")
+                  .expect_err("aliased home must fail");
+              LaneCommand::ensure_home_directory(
+                  &action(ExecutionLane::Root),
+                  &account("project-runner"),
+                  &account("project-runner"),
+                  "/var/lib/../root",
+              )
+              .expect_err("aliased home command must fail");
+              LaneCommand::ensure_subordinate_uids(
+                  &action(ExecutionLane::Root),
+                  &account("project-runner"),
+                  u32::MAX,
+                  2,
+              )
+              .expect_err("overflowing subordinate range must fail");
+          '''
+          if text.count(old) != 1:
+              raise SystemExit("expected unsafe command test marker once")
+          path.write_text(text.replace(old, new))
+          PY
+
+      - name: Extend root-lane command validation
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/lane_executor.rs")
+          text = path.read_text()
+
+          old = '''const USERADD: &str = "/usr/sbin/useradd";
+          const LOGINCTL: &str = "/usr/bin/loginctl";
+          '''
+          new = '''const USERADD: &str = "/usr/sbin/useradd";
+          const USERMOD: &str = "/usr/sbin/usermod";
+          const INSTALL: &str = "/usr/bin/install";
+          const LOGINCTL: &str = "/usr/bin/loginctl";
+          '''
+          if text.count(old) != 1:
+              raise SystemExit("expected executor constants once")
+          text = text.replace(old, new)
+
+          old = '''        LaneCommandKind::EnsureSystemUser => validate_useradd(spec, &arguments),
+                  LaneCommandKind::EnableLinger => validate_loginctl(spec, &arguments),
+          '''
+          new = '''        LaneCommandKind::EnsureSystemUser => validate_useradd(spec, &arguments),
+                  LaneCommandKind::EnsureHomeDirectory => validate_install(spec, &arguments),
+                  LaneCommandKind::EnsureSubordinateUids => {
+                      validate_usermod(spec, &arguments, "--add-subuids")
+                  }
+                  LaneCommandKind::EnsureSubordinateGids => {
+                      validate_usermod(spec, &arguments, "--add-subgids")
+                  }
+                  LaneCommandKind::EnableLinger => validate_loginctl(spec, &arguments),
+          '''
+          if text.count(old) != 1:
+              raise SystemExit("expected root validator match once")
+          text = text.replace(old, new)
+
+          old = '''        | LaneCommandKind::EnsureSystemUser
+                  | LaneCommandKind::EnableLinger => {
+          '''
+          new = '''        | LaneCommandKind::EnsureSystemUser
+                  | LaneCommandKind::EnsureHomeDirectory
+                  | LaneCommandKind::EnsureSubordinateUids
+                  | LaneCommandKind::EnsureSubordinateGids
+                  | LaneCommandKind::EnableLinger => {
+          '''
+          if text.count(old) != 1:
+              raise SystemExit("expected runner validator root kinds once")
+          text = text.replace(old, new)
+
+          marker = '''fn validate_loginctl(spec: &CommandSpec, arguments: &[&str]) -> Result<(), LaneExecutionError> {
+          '''
+          validators = '''fn validate_install(spec: &CommandSpec, arguments: &[&str]) -> Result<(), LaneExecutionError> {
+              let valid = spec.program == Path::new(INSTALL)
+                  && arguments.len() == 9
+                  && arguments[0] == "--directory"
+                  && arguments[1] == "--mode"
+                  && arguments[2] == "0750"
+                  && arguments[3] == "--owner"
+                  && LinuxAccountName::parse(arguments[4]).is_ok()
+                  && arguments[5] == "--group"
+                  && LinuxAccountName::parse(arguments[6]).is_ok()
+                  && arguments[7] == "--"
+                  && canonical_absolute_path(arguments[8]);
+              if valid {
+                  Ok(())
+              } else {
+                  Err(invalid_command(
+                      "runner home-directory command shape is not reviewed",
+                  ))
+              }
+          }
+
+          fn validate_usermod(
+              spec: &CommandSpec,
+              arguments: &[&str],
+              expected_option: &str,
+          ) -> Result<(), LaneExecutionError> {
+              let valid = spec.program == Path::new(USERMOD)
+                  && arguments.len() == 4
+                  && arguments[0] == expected_option
+                  && valid_subordinate_range(arguments[1])
+                  && arguments[2] == "--"
+                  && LinuxAccountName::parse(arguments[3]).is_ok();
+              if valid {
+                  Ok(())
+              } else {
+                  Err(invalid_command(
+                      "subordinate-ID command shape is not reviewed",
+                  ))
+              }
+          }
+
+          fn valid_subordinate_range(value: &str) -> bool {
+              let Some((start, end)) = value.split_once('-') else {
+                  return false;
+              };
+              let Some(start) = canonical_u32(start) else {
+                  return false;
+              };
+              let Some(end) = canonical_u32(end) else {
+                  return false;
+              };
+              start > 0 && start <= end
+          }
+
+          fn canonical_u32(value: &str) -> Option<u32> {
+              let parsed = value.parse::<u32>().ok()?;
+              (parsed.to_string() == value).then_some(parsed)
+          }
+
+          fn validate_loginctl(spec: &CommandSpec, arguments: &[&str]) -> Result<(), LaneExecutionError> {
+          '''
+          if text.count(marker) != 1:
+              raise SystemExit("expected loginctl validator marker once")
+          text = text.replace(marker, validators)
+
+          old = '''        ReviewedExecutableVerifier, RunnerEvidence, execute_root_lane, execute_runner_user_lane,
+                  parse_effective_uid,
+          '''
+          new = '''        ReviewedExecutableVerifier, RunnerEvidence, execute_root_lane, execute_runner_user_lane,
+                  parse_effective_uid, validate_root_command,
+          '''
+          if text.count(old) != 1:
+              raise SystemExit("expected executor test imports once")
+          text = text.replace(old, new)
+
+          marker = '''    #[test]
+              fn root_executor_delivers_exact_empty_environment_and_retains_record() {
+          '''
+          test = '''    #[test]
+              fn root_validator_accepts_reviewed_account_preparation_commands() {
+                  let root = action("prepare-account", ExecutionLane::Root);
+                  let account = account("project-runner");
+                  for command in [
+                      LaneCommand::ensure_home_directory(
+                          &root,
+                          &account,
+                          &account,
+                          "/var/lib/project-runner",
+                      )
+                      .expect("home command"),
+                      LaneCommand::ensure_subordinate_uids(&root, &account, 100_000, 65_536)
+                          .expect("subuid command"),
+                      LaneCommand::ensure_subordinate_gids(&root, &account, 200_000, 65_536)
+                          .expect("subgid command"),
+                  ] {
+                      validate_root_command(&command).expect("reviewed root command");
+                  }
+              }
+
+              #[test]
+              fn root_executor_delivers_exact_empty_environment_and_retains_record() {
+          '''
+          if text.count(marker) != 1:
+              raise SystemExit("expected root executor test marker once")
+          path.write_text(text.replace(marker, test))
+          PY
+
+      - name: Format source
+        run: cargo fmt --all
+
+      - name: Run focused account planning tests
+        run: cargo test --locked --all-targets --all-features runner_account_plan
+
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Run full tests
+        run: cargo test --locked --all-targets --all-features
+
+      - name: Exercise required CLI checks
+        run: |
+          cargo run --locked --quiet -- --output json doctor
+          cargo run --locked --quiet -- plan --file examples/quarry.yml
+          cargo run --locked --quiet -- --output json plan --file examples/glossless.yml
+          cargo run --locked --quiet -- --output json host plan --file examples/quarry.yml
+
+      - name: Publish verified implementation and remove helper
+        run: |
+          rm .github/workflows/runner-account-plan-bootstrap.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/runner_account_plan.rs src/lane_command.rs src/lane_executor.rs .github/workflows/runner-account-plan-bootstrap.yml
+          git commit -m "Add reviewed runner account preparation commands"
+          git push origin HEAD:codex/runner-account-preparation-plan
