@@ -29,8 +29,9 @@ The runner-steward design remains the foundation. Later milestones may extend th
 - [ ] Integrate lane executors with durable reconciliation journals.
 - [ ] Debian and Ubuntu host preparation.
   - [x] Conservative prerequisite package planning with exact distribution identity, package observations, rollback class, and reviewed `apt-get` argv.
-  - [ ] Bounded package-state probing and host-plan CLI integration.
-  - [ ] Runner account, subordinate-ID, home-directory, and linger preparation planning.
+  - [x] Bounded package-state probing and host-plan CLI integration.
+  - [x] Dependency-aware runner account, subordinate-ID, home-directory, and linger preparation planning.
+  - [ ] Bounded account/group/home/subordinate-ID/linger observation and host-plan integration.
   - [ ] Durable package and account reconciliation execution.
 
 ## Milestone 2 — runner lifecycle

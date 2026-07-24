@@ -18,6 +18,8 @@ const MAX_PROC_STATUS_BYTES: usize = 64 * 1024;
 const APT_GET: &str = "/usr/bin/apt-get";
 const GROUPADD: &str = "/usr/sbin/groupadd";
 const USERADD: &str = "/usr/sbin/useradd";
+const USERMOD: &str = "/usr/sbin/usermod";
+const INSTALL: &str = "/usr/bin/install";
 const LOGINCTL: &str = "/usr/bin/loginctl";
 const RUNUSER: &str = "/usr/sbin/runuser";
 const ENV: &str = "/usr/bin/env";
@@ -368,6 +370,13 @@ fn validate_root_command(command: &LaneCommand) -> Result<(), LaneExecutionError
         LaneCommandKind::AptInstall => validate_apt(spec, &arguments),
         LaneCommandKind::EnsureSystemGroup => validate_groupadd(spec, &arguments),
         LaneCommandKind::EnsureSystemUser => validate_useradd(spec, &arguments),
+        LaneCommandKind::EnsureHomeDirectory => validate_install(spec, &arguments),
+        LaneCommandKind::EnsureSubordinateUids => {
+            validate_usermod(spec, &arguments, "--add-subuids")
+        }
+        LaneCommandKind::EnsureSubordinateGids => {
+            validate_usermod(spec, &arguments, "--add-subgids")
+        }
         LaneCommandKind::EnableLinger => validate_loginctl(spec, &arguments),
         LaneCommandKind::RunnerPodmanInfo | LaneCommandKind::RunnerGitVersion => Err(
             invalid_command("runner-user command kind cannot execute in the root lane"),
@@ -422,6 +431,65 @@ fn validate_useradd(spec: &CommandSpec, arguments: &[&str]) -> Result<(), LaneEx
     }
 }
 
+fn validate_install(spec: &CommandSpec, arguments: &[&str]) -> Result<(), LaneExecutionError> {
+    let valid = spec.program == Path::new(INSTALL)
+        && arguments.len() == 9
+        && arguments[0] == "--directory"
+        && arguments[1] == "--mode"
+        && arguments[2] == "0750"
+        && arguments[3] == "--owner"
+        && LinuxAccountName::parse(arguments[4]).is_ok()
+        && arguments[5] == "--group"
+        && LinuxAccountName::parse(arguments[6]).is_ok()
+        && arguments[7] == "--"
+        && canonical_absolute_path(arguments[8]);
+    if valid {
+        Ok(())
+    } else {
+        Err(invalid_command(
+            "runner home-directory command shape is not reviewed",
+        ))
+    }
+}
+
+fn validate_usermod(
+    spec: &CommandSpec,
+    arguments: &[&str],
+    expected_option: &str,
+) -> Result<(), LaneExecutionError> {
+    let valid = spec.program == Path::new(USERMOD)
+        && arguments.len() == 4
+        && arguments[0] == expected_option
+        && valid_subordinate_range(arguments[1])
+        && arguments[2] == "--"
+        && LinuxAccountName::parse(arguments[3]).is_ok();
+    if valid {
+        Ok(())
+    } else {
+        Err(invalid_command(
+            "subordinate-ID command shape is not reviewed",
+        ))
+    }
+}
+
+fn valid_subordinate_range(value: &str) -> bool {
+    let Some((start, end)) = value.split_once('-') else {
+        return false;
+    };
+    let Some(start) = canonical_u32(start) else {
+        return false;
+    };
+    let Some(end) = canonical_u32(end) else {
+        return false;
+    };
+    start > 0 && start <= end && u64::from(end) - u64::from(start) + 1 >= MIN_SUBORDINATE_ID_COUNT
+}
+
+fn canonical_u32(value: &str) -> Option<u32> {
+    let parsed = value.parse::<u32>().ok()?;
+    (parsed.to_string() == value).then_some(parsed)
+}
+
 fn validate_loginctl(spec: &CommandSpec, arguments: &[&str]) -> Result<(), LaneExecutionError> {
     if spec.program != Path::new(LOGINCTL)
         || arguments.len() != 2
@@ -465,6 +533,9 @@ fn validate_runner_command(
         LaneCommandKind::AptInstall
         | LaneCommandKind::EnsureSystemGroup
         | LaneCommandKind::EnsureSystemUser
+        | LaneCommandKind::EnsureHomeDirectory
+        | LaneCommandKind::EnsureSubordinateUids
+        | LaneCommandKind::EnsureSubordinateGids
         | LaneCommandKind::EnableLinger => {
             return Err(invalid_command(
                 "root command kind cannot execute in the runner-user lane",
@@ -586,7 +657,7 @@ mod tests {
     use super::{
         ENV, GIT, LaneExecutionError, LaneExecutionErrorKind, PODMAN, PrivilegeProbe,
         ReviewedExecutableVerifier, RunnerEvidence, execute_root_lane, execute_runner_user_lane,
-        parse_effective_uid,
+        parse_effective_uid, validate_root_command,
     };
 
     struct FakeProcess {
@@ -735,6 +806,27 @@ mod tests {
             runtime_directory: format!("/run/user/{uid}"),
             subordinate_uid_count: MIN_SUBORDINATE_ID_COUNT,
             subordinate_gid_count: MIN_SUBORDINATE_ID_COUNT,
+        }
+    }
+
+    #[test]
+    fn root_validator_accepts_reviewed_account_preparation_commands() {
+        let root = action("prepare-account", ExecutionLane::Root);
+        let account = account("project-runner");
+        for command in [
+            LaneCommand::ensure_home_directory(
+                &root,
+                &account,
+                &account,
+                "/var/lib/project-runner",
+            )
+            .expect("home command"),
+            LaneCommand::ensure_subordinate_uids(&root, &account, 100_000, 65_536)
+                .expect("subuid command"),
+            LaneCommand::ensure_subordinate_gids(&root, &account, 200_000, 65_536)
+                .expect("subgid command"),
+        ] {
+            validate_root_command(&command).expect("reviewed root command");
         }
     }
 

@@ -9,6 +9,9 @@ use crate::process::CommandSpec;
 const APT_GET: &str = "/usr/bin/apt-get";
 const GROUPADD: &str = "/usr/sbin/groupadd";
 const USERADD: &str = "/usr/sbin/useradd";
+const USERMOD: &str = "/usr/sbin/usermod";
+const INSTALL: &str = "/usr/bin/install";
+const MIN_SUBORDINATE_ID_COUNT: u64 = 65_536;
 const LOGINCTL: &str = "/usr/bin/loginctl";
 const RUNUSER: &str = "/usr/sbin/runuser";
 const ENV: &str = "/usr/bin/env";
@@ -155,6 +158,9 @@ pub enum LaneCommandKind {
     AptInstall,
     EnsureSystemGroup,
     EnsureSystemUser,
+    EnsureHomeDirectory,
+    EnsureSubordinateUids,
+    EnsureSubordinateGids,
     EnableLinger,
     RunnerPodmanInfo,
     RunnerGitVersion,
@@ -237,6 +243,87 @@ impl LaneCommand {
         Ok(Self::new(action, LaneCommandKind::EnsureSystemUser, spec))
     }
 
+    /// Build the reviewed runner home-directory creation command.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the action is not assigned to the root lane or the home path is not
+    /// canonical and absolute.
+    pub fn ensure_home_directory(
+        action: &PlannedMutation,
+        user: &LinuxAccountName,
+        primary_group: &LinuxAccountName,
+        home: &str,
+    ) -> Result<Self, LaneCommandError> {
+        require_lane(action, ExecutionLane::Root)?;
+        let home = canonical_absolute_path("runner home", home)?;
+        let spec = CommandSpec::new(INSTALL)
+            .argument("--directory")
+            .argument("--mode")
+            .argument("0750")
+            .argument("--owner")
+            .argument(user.as_str())
+            .argument("--group")
+            .argument(primary_group.as_str())
+            .argument("--")
+            .argument(home);
+        Ok(Self::new(
+            action,
+            LaneCommandKind::EnsureHomeDirectory,
+            spec,
+        ))
+    }
+
+    /// Build the reviewed subordinate-UID assignment command.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a lane mismatch or an empty, overflowing subordinate range.
+    pub fn ensure_subordinate_uids(
+        action: &PlannedMutation,
+        user: &LinuxAccountName,
+        start: u32,
+        count: u32,
+    ) -> Result<Self, LaneCommandError> {
+        require_lane(action, ExecutionLane::Root)?;
+        let range = subordinate_range_argument(start, count)?;
+        let spec = CommandSpec::new(USERMOD)
+            .argument("--add-subuids")
+            .argument(range)
+            .argument("--")
+            .argument(user.as_str());
+        Ok(Self::new(
+            action,
+            LaneCommandKind::EnsureSubordinateUids,
+            spec,
+        ))
+    }
+
+    /// Build the reviewed subordinate-GID assignment command.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a lane mismatch or an empty, overflowing subordinate range.
+    pub fn ensure_subordinate_gids(
+        action: &PlannedMutation,
+        user: &LinuxAccountName,
+        start: u32,
+        count: u32,
+    ) -> Result<Self, LaneCommandError> {
+        require_lane(action, ExecutionLane::Root)?;
+        let range = subordinate_range_argument(start, count)?;
+        let spec = CommandSpec::new(USERMOD)
+            .argument("--add-subgids")
+            .argument(range)
+            .argument("--")
+            .argument(user.as_str());
+        Ok(Self::new(
+            action,
+            LaneCommandKind::EnsureSubordinateGids,
+            spec,
+        ))
+    }
+
     /// Build the reviewed linger-enablement command.
     ///
     /// # Errors
@@ -314,6 +401,9 @@ impl LaneCommand {
             LaneCommandKind::EnsureSystemUser => vec![outer, Path::new(NOLOGIN)],
             LaneCommandKind::AptInstall
             | LaneCommandKind::EnsureSystemGroup
+            | LaneCommandKind::EnsureHomeDirectory
+            | LaneCommandKind::EnsureSubordinateUids
+            | LaneCommandKind::EnsureSubordinateGids
             | LaneCommandKind::EnableLinger => vec![outer],
         }
     }
@@ -352,6 +442,19 @@ impl fmt::Display for LaneCommandError {
 }
 
 impl std::error::Error for LaneCommandError {}
+
+fn subordinate_range_argument(start: u32, count: u32) -> Result<String, LaneCommandError> {
+    if start == 0 || u64::from(count) < MIN_SUBORDINATE_ID_COUNT {
+        return Err(LaneCommandError::single(
+            "subordinate-ID range must begin above zero and contain at least 65536 IDs",
+        ));
+    }
+    let end = u64::from(start) + u64::from(count) - 1;
+    let end = u32::try_from(end).map_err(|_| {
+        LaneCommandError::single("subordinate-ID range exceeds the 32-bit ID space")
+    })?;
+    Ok(format!("{start}-{end}"))
+}
 
 fn runner_user_spec(
     runner: &RunnerUserContext,
@@ -417,8 +520,9 @@ mod tests {
     use crate::process::CommandValue;
 
     use super::{
-        APT_GET, ENV, GIT, GROUPADD, LOGINCTL, LaneCommand, LaneCommandKind, LinuxAccountName,
-        NOLOGIN, PODMAN, PackageName, RUNUSER, RunnerUserContext, USERADD,
+        APT_GET, ENV, GIT, GROUPADD, INSTALL, LOGINCTL, LaneCommand, LaneCommandKind,
+        LinuxAccountName, NOLOGIN, PODMAN, PackageName, RUNUSER, RunnerUserContext, USERADD,
+        USERMOD,
     };
 
     fn action(lane: ExecutionLane) -> PlannedMutation {
@@ -488,6 +592,50 @@ mod tests {
                 "--shell",
                 NOLOGIN,
                 "--no-create-home",
+                "project-runner",
+            ]
+        );
+        assert_eq!(
+            LaneCommand::ensure_home_directory(&root, &user, &group, "/var/lib/project-runner",)
+                .expect("home command")
+                .spec()
+                .displayed_argv(),
+            [
+                INSTALL,
+                "--directory",
+                "--mode",
+                "0750",
+                "--owner",
+                "project-runner",
+                "--group",
+                "project-runner",
+                "--",
+                "/var/lib/project-runner",
+            ]
+        );
+        assert_eq!(
+            LaneCommand::ensure_subordinate_uids(&root, &user, 100_000, 65_536)
+                .expect("subuid command")
+                .spec()
+                .displayed_argv(),
+            [
+                USERMOD,
+                "--add-subuids",
+                "100000-165535",
+                "--",
+                "project-runner",
+            ]
+        );
+        assert_eq!(
+            LaneCommand::ensure_subordinate_gids(&root, &user, 200_000, 65_536)
+                .expect("subgid command")
+                .spec()
+                .displayed_argv(),
+            [
+                USERMOD,
+                "--add-subgids",
+                "200000-265535",
+                "--",
                 "project-runner",
             ]
         );
@@ -588,5 +736,26 @@ mod tests {
             .expect_err("root primary group must fail");
         RunnerUserContext::new(account("project-runner"), 1001, 1001, "/srv/../root")
             .expect_err("aliased home must fail");
+        LaneCommand::ensure_home_directory(
+            &action(ExecutionLane::Root),
+            &account("project-runner"),
+            &account("project-runner"),
+            "/var/lib/../root",
+        )
+        .expect_err("aliased home command must fail");
+        LaneCommand::ensure_subordinate_uids(
+            &action(ExecutionLane::Root),
+            &account("project-runner"),
+            u32::MAX,
+            2,
+        )
+        .expect_err("overflowing subordinate range must fail");
+        LaneCommand::ensure_subordinate_uids(
+            &action(ExecutionLane::Root),
+            &account("project-runner"),
+            100_000,
+            1,
+        )
+        .expect_err("undersized subordinate range must fail");
     }
 }
