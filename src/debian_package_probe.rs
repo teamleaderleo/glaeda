@@ -273,7 +273,7 @@ fn valid_inventory_status(value: &str) -> bool {
 fn classify_status(status: &str) -> Presence {
     match status {
         "installed" => Presence::Present,
-        "not-installed" | "config-files" => Presence::Absent,
+        "not-installed" => Presence::Absent,
         _ => Presence::Unknown,
     }
 }
@@ -363,7 +363,7 @@ mod tests {
             .expect("package observation");
 
         assert_eq!(observation.packages()["git"], Presence::Present);
-        assert_eq!(observation.packages()["podman"], Presence::Absent);
+        assert_eq!(observation.packages()["podman"], Presence::Unknown);
         assert_eq!(observation.packages()["uidmap"], Presence::Unknown);
         assert_eq!(observation.packages()["slirp4netns"], Presence::Absent);
         assert_eq!(observation.receipt().status, Some(0));
