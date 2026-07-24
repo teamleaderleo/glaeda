@@ -23,6 +23,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
+          # The helper edits one reviewed Rust file and runs no repository code.
           test -f tools/patch_atomic_faults.py
           test ! -L tools/patch_atomic_faults.py
           test -z "$(git status --porcelain)"
