@@ -4,9 +4,7 @@ use std::path::{Component, Path};
 use serde::Serialize;
 
 use crate::journal::{ExecutionLane, PlannedMutation, Preconditions, RollbackClass};
-use crate::lane_command::{
-    LaneCommand, LaneCommandError, LinuxAccountName,
-};
+use crate::lane_command::{LaneCommand, LaneCommandError, LinuxAccountName};
 use crate::runner_user::MIN_SUBORDINATE_ID_COUNT;
 
 pub const RUNNER_ACCOUNT_PLAN_SCHEMA_VERSION: u8 = 1;
@@ -394,10 +392,7 @@ fn plan_user(
         },
         [
             format!("desired runner user {}", desired.username.as_str()),
-            format!(
-                "desired primary group {}",
-                desired.primary_group.as_str()
-            ),
+            format!("desired primary group {}", desired.primary_group.as_str()),
             format!("desired home {}", desired.home),
             "desired shell /usr/sbin/nologin".to_owned(),
         ],
@@ -628,10 +623,7 @@ fn validate_evidence(evidence: &[String]) -> Result<(), RunnerAccountPlanError> 
         )));
     }
     for item in evidence {
-        if item.is_empty()
-            || item.len() > MAX_EVIDENCE_LEN
-            || item.chars().any(char::is_control)
-        {
+        if item.is_empty() || item.len() > MAX_EVIDENCE_LEN || item.chars().any(char::is_control) {
             return Err(RunnerAccountPlanError::single(format!(
                 "observation evidence entries must be nonempty, contain no control characters, and not exceed {MAX_EVIDENCE_LEN} bytes"
             )));
@@ -643,7 +635,7 @@ fn validate_evidence(evidence: &[String]) -> Result<(), RunnerAccountPlanError> 
 fn canonical_home(value: &str) -> Result<String, RunnerAccountPlanError> {
     if value.is_empty()
         || value == "/"
-        || value.len() > 4_096
+        || value.len() > 4_000
         || value.ends_with('/')
         || value.chars().any(char::is_control)
     {
@@ -691,8 +683,7 @@ mod tests {
     }
 
     fn observation(state: PreparationObservationState, name: &str) -> PreparationObservation {
-        PreparationObservation::new(state, [format!("observed {name} state")])
-            .expect("observation")
+        PreparationObservation::new(state, [format!("observed {name} state")]).expect("observation")
     }
 
     fn observations(state: PreparationObservationState) -> RunnerAccountObservations {
@@ -719,16 +710,17 @@ mod tests {
                 && item.mutation.is_none()
                 && item.command.is_none()
         }));
-        assert_eq!(render_human(&plan).matches("No changes were made.").count(), 1);
+        assert_eq!(
+            render_human(&plan).matches("No changes were made.").count(),
+            1
+        );
     }
 
     #[test]
     fn proven_absence_builds_six_ordered_compensating_root_commands() {
-        let plan = build_runner_account_plan(
-            desired(),
-            observations(PreparationObservationState::Absent),
-        )
-        .expect("absent plan");
+        let plan =
+            build_runner_account_plan(desired(), observations(PreparationObservationState::Absent))
+                .expect("absent plan");
         assert_eq!(
             plan.items.iter().map(|item| item.kind).collect::<Vec<_>>(),
             [
@@ -807,11 +799,16 @@ mod tests {
         observed.group = observation(PreparationObservationState::Matching, "group");
         observed.user = observation(PreparationObservationState::Conflicting, "user");
         let plan = build_runner_account_plan(desired(), observed).expect("blocked plan");
-        assert_eq!(plan.items[0].disposition, RunnerAccountPlanDisposition::Satisfied);
-        assert_eq!(plan.items[1].disposition, RunnerAccountPlanDisposition::Blocked);
+        assert_eq!(
+            plan.items[0].disposition,
+            RunnerAccountPlanDisposition::Satisfied
+        );
+        assert_eq!(
+            plan.items[1].disposition,
+            RunnerAccountPlanDisposition::Blocked
+        );
         assert!(plan.items[2..].iter().all(|item| {
-            item.disposition == RunnerAccountPlanDisposition::Blocked
-                && item.command.is_none()
+            item.disposition == RunnerAccountPlanDisposition::Blocked && item.command.is_none()
         }));
     }
 
