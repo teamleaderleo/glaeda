@@ -47,7 +47,19 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run Clippy
-        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+        run: |
+          set +e
+          cargo clippy --locked --all-targets --all-features -- -D warnings 2>&1 | tee /tmp/clippy.log
+          status=${PIPESTATUS[0]}
+          exit "$status"
+
+      - name: Upload Clippy diagnostics for local verification bootstrap
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: clippy-diagnostics
+          path: /tmp/clippy.log
+          retention-days: 1
 
       - name: Run tests
         run: cargo test --locked --all-targets --all-features
