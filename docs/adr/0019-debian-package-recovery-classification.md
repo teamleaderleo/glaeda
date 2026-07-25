@@ -54,7 +54,7 @@ The classifier produces bounded public journal material:
 - uncertain execution produces failure code `debian-package-install-uncertain`;
 - a pre-execution refusal produces failure code `debian-package-install-not-started`.
 
-The durable reconciliation layer must enforce the observation barrier rather than treating the successful receipt as permission to continue directly to dependent mutations.
+The durable reconciliation layer must enforce the observation barrier rather than treating the successful receipt as permission to continue directly to dependent mutations. It must not persist the package action as completed solely from the attempt receipt.
 
 ### Compensation
 
