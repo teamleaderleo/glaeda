@@ -469,7 +469,7 @@ fn read_linux_config(path: &Path, expected_owner: ExpectedOwner) -> TrustedConfi
         uid: stat.st_uid,
         gid: stat.st_gid,
         mode: stat.st_mode & 0o7777,
-        nlink: u64::from(stat.st_nlink),
+        nlink: u128::from(stat.st_nlink),
         size: stat.st_size,
     };
     if let Err(problem) = validate_file_metadata(metadata, expected_owner) {
@@ -527,7 +527,7 @@ struct ConfigMetadata {
     uid: u32,
     gid: u32,
     mode: u32,
-    nlink: u64,
+    nlink: u128,
     size: i64,
 }
 
