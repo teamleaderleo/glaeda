@@ -16,15 +16,14 @@ jobs:
     timeout-minutes: 25
 
     steps:
-      - name: Check out observation branch
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          ref: codex/runner-account-observation
-          fetch-depth: 1
-          show-progress: false
-
-      - name: Install Rust toolchain
-        run: rustup show active-toolchain
+      - name: Check out observation branch quietly
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git init --quiet .
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git fetch --quiet --depth=1 origin codex/runner-account-observation
+          git checkout --quiet -B codex/runner-account-observation FETCH_HEAD
 
       - name: Apply canonical-path and no-follow traversal hardening
         run: python3 .github/seal-observation-paths.py
@@ -57,7 +56,7 @@ jobs:
 
       - name: Publish verified source and restore ordinary CI
         run: |
-          git fetch origin main --depth=1
+          git fetch --quiet origin main --depth=1
           git show origin/main:.github/workflows/ci.yml > .github/workflows/ci.yml
           rm -f .github/workflows/seal-observation-paths.yml
           rm -f .github/seal-observation-paths.py
