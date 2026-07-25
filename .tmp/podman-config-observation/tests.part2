@@ -1,0 +1,138 @@
+    #[test]
+    fn unknown_runner_source_hides_lower_precedence_values() {
+        let mut filesystem = FakeFilesystem::default();
+        filesystem.files.insert(
+            "/etc/containers/containers.conf".into(),
+            TrustedConfigFile::Present(
+                b"[engine]\ncgroup_manager = \"systemd\"\n[network]\nnetwork_backend = \"netavark\"\n"
+                    .to_vec(),
+            ),
+        );
+        filesystem.files.insert(
+            "/var/lib/project-runner/.config/containers/containers.conf".into(),
+            TrustedConfigFile::Unknown(TrustedConfigFileProblem::ReadFailed),
+        );
+
+        let report = observe_with(
+            &account_observations(PreparationObservationState::Matching),
+            Some(identity()),
+            Path::new("/var/lib/project-runner"),
+            &policy(),
+            &paths(),
+            &filesystem,
+        )
+        .expect("report");
+
+        assert_eq!(
+            report.assessment.state,
+            RootlessPodmanConfigAssessmentState::Unknown
+        );
+        assert_eq!(
+            source(&report, RootlessPodmanConfigSourceRole::RunnerContainers).state,
+            RootlessPodmanConfigSourceObservationState::Unknown
+        );
+        assert!(
+            report
+                .resolved
+                .containers
+                .network_backend
+                .value
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn runner_sources_are_not_read_until_identity_and_home_match() {
+        let filesystem = FakeFilesystem::default();
+        let report = observe_with(
+            &account_observations(PreparationObservationState::Unknown),
+            None,
+            Path::new("/var/lib/project-runner"),
+            &policy(),
+            &paths(),
+            &filesystem,
+        )
+        .expect("report");
+
+        assert_eq!(filesystem.calls.borrow().len(), 3);
+        assert_eq!(
+            source(&report, RootlessPodmanConfigSourceRole::RunnerContainers).state,
+            RootlessPodmanConfigSourceObservationState::Unknown
+        );
+        assert_eq!(
+            source(&report, RootlessPodmanConfigSourceRole::RunnerStorage).state,
+            RootlessPodmanConfigSourceObservationState::Unknown
+        );
+    }
+
+    #[test]
+    fn invalid_utf8_and_malformed_relevant_values_become_unknown() {
+        let mut filesystem = FakeFilesystem::default();
+        filesystem.files.insert(
+            "/etc/containers/containers.conf".into(),
+            TrustedConfigFile::Present(vec![0xff, 0xfe]),
+        );
+        filesystem.files.insert(
+            "/etc/containers/storage.conf".into(),
+            TrustedConfigFile::Present(b"[storage]\ndriver = overlay\n".to_vec()),
+        );
+
+        let report = observe_with(
+            &account_observations(PreparationObservationState::Matching),
+            Some(identity()),
+            Path::new("/var/lib/project-runner"),
+            &policy(),
+            &paths(),
+            &filesystem,
+        )
+        .expect("report");
+
+        assert_eq!(
+            source(&report, RootlessPodmanConfigSourceRole::SystemContainers).state,
+            RootlessPodmanConfigSourceObservationState::Unknown
+        );
+        assert_eq!(
+            source(&report, RootlessPodmanConfigSourceRole::SystemStorage).state,
+            RootlessPodmanConfigSourceObservationState::Unknown
+        );
+    }
+
+    #[test]
+    fn reports_never_serialize_raw_configuration_or_os_errors() {
+        let mut filesystem = FakeFilesystem::default();
+        filesystem.files.insert(
+            "/etc/containers/containers.conf".into(),
+            TrustedConfigFile::Present(
+                b"[containers]\nsecret_material = \"DO-NOT-LEAK\"\n".to_vec(),
+            ),
+        );
+        filesystem.files.insert(
+            "/var/lib/project-runner/.config/containers/storage.conf".into(),
+            TrustedConfigFile::Unknown(TrustedConfigFileProblem::UnsafeTraversal),
+        );
+
+        let report = observe_with(
+            &account_observations(PreparationObservationState::Matching),
+            Some(identity()),
+            Path::new("/var/lib/project-runner"),
+            &policy(),
+            &paths(),
+            &filesystem,
+        )
+        .expect("report");
+        let json = serde_json::to_string(&report).expect("serialize report");
+        let human = render_human(&report);
+
+        for forbidden in ["DO-NOT-LEAK", "permission denied", "raw configuration"] {
+            assert!(!json.contains(forbidden), "{forbidden}");
+            assert!(!human.contains(forbidden), "{forbidden}");
+        }
+    }
+
+    #[test]
+    fn metadata_failures_are_fail_closed() {
+        let cases = [
+            TrustedConfigFileProblem::UnsafeTraversal,
+            TrustedConfigFileProblem::MetadataUnavailable,
+            TrustedConfigFileProblem::NotRegularFile,
+            TrustedConfigFileProblem::WrongOwner,
