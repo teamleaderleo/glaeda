@@ -43,7 +43,7 @@ require_instance() {
 }
 
 vm_is_running() {
-  limactl shell "${instance}" -- /usr/bin/true >/dev/null 2>&1
+  [ "$(limactl list --quiet --filter '.status == "Running"' "${instance}" 2>/dev/null)" = "${instance}" ]
 }
 
 start_vm() {
@@ -93,7 +93,8 @@ case "${command_name}" in
     ;;
   status)
     require_lima
-    limactl list
+    require_instance
+    limactl list "${instance}"
     show_git_status
     ;;
   sync)
