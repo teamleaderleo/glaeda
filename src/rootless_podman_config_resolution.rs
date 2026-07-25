@@ -5,6 +5,7 @@ use serde::Serialize;
 use crate::rootless_podman_config::{RootlessPodmanContainersConfig, RootlessPodmanStorageConfig};
 
 pub const ROOTLESS_PODMAN_CONFIG_RESOLUTION_SCHEMA_VERSION: u8 = 1;
+const MAX_ROOTLESS_PODMAN_CONFIG_EVIDENCE_BYTES: usize = 512;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RootlessPodmanConfigSourceState<T> {
@@ -24,11 +25,20 @@ impl<T> RootlessPodmanConfigSource<T> {
     ///
     /// # Errors
     ///
-    /// Returns an error unless the source path is a canonical non-root absolute path.
+    /// Returns an error unless the source path is canonical and unknown evidence is bounded,
+    /// single-line, and free of control characters.
     pub fn new(
         path: impl Into<PathBuf>,
         state: RootlessPodmanConfigSourceState<T>,
     ) -> Result<Self, String> {
+        let state = match state {
+            RootlessPodmanConfigSourceState::Unknown { evidence } => {
+                RootlessPodmanConfigSourceState::Unknown {
+                    evidence: reviewed_evidence(evidence)?,
+                }
+            }
+            state => state,
+        };
         Ok(Self {
             path: canonical_absolute_path(path.into())?,
             state,
@@ -617,6 +627,7 @@ fn canonical_absolute_path(path: PathBuf) -> Result<PathBuf, String> {
         || value == "/"
         || value.len() > 4_096
         || value.ends_with('/')
+        || value.contains("//")
         || value.chars().any(char::is_control)
         || !path.is_absolute()
         || path
@@ -626,6 +637,18 @@ fn canonical_absolute_path(path: PathBuf) -> Result<PathBuf, String> {
         return Err("path must be a canonical non-root absolute path".to_owned());
     }
     Ok(path)
+}
+
+fn reviewed_evidence(value: String) -> Result<String, String> {
+    if value.is_empty()
+        || value.len() > MAX_ROOTLESS_PODMAN_CONFIG_EVIDENCE_BYTES
+        || value.chars().any(char::is_control)
+    {
+        return Err(format!(
+            "configuration source evidence must be one nonempty line of at most {MAX_ROOTLESS_PODMAN_CONFIG_EVIDENCE_BYTES} bytes"
+        ));
+    }
+    Ok(value)
 }
 
 fn reviewed_identifier(label: &str, value: String) -> Result<String, String> {
@@ -1038,6 +1061,36 @@ mod tests {
                 "/etc/project-runner",
                 "/var/lib/project-runner/.local/share",
                 "/run/user/1001",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn unknown_source_evidence_is_bounded_and_single_line() {
+        for evidence in [
+            String::new(),
+            "permission denied
+raw configuration follows"
+                .to_owned(),
+            "x".repeat(MAX_ROOTLESS_PODMAN_CONFIG_EVIDENCE_BYTES + 1),
+        ] {
+            assert!(
+                RootlessPodmanConfigSource::<RootlessPodmanContainersConfig>::new(
+                    "/etc/containers/containers.conf",
+                    RootlessPodmanConfigSourceState::Unknown { evidence },
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_paths_reject_repeated_separator_aliases() {
+        assert!(
+            RootlessPodmanConfigSource::<RootlessPodmanContainersConfig>::new(
+                "/etc//containers/containers.conf",
+                RootlessPodmanConfigSourceState::Missing,
             )
             .is_err()
         );

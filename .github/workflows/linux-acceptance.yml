@@ -14,39 +14,13 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: linux-acceptance-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  apply-pr-124-hardening:
-    if: github.event_name == 'pull_request' && github.head_ref == 'codex/rootless-podman-config-resolution'
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Check out resolver branch
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          ref: codex/rootless-podman-config-resolution
-          fetch-depth: 0
-      - name: Apply, verify, and publish hardening
-        run: |
-          python3 scripts/harden_pr124.py
-          cargo fmt --all
-          grep -q 'MAX_ROOTLESS_PODMAN_CONFIG_EVIDENCE_BYTES' src/rootless_podman_config_resolution.rs
-          grep -q 'value.contains("//")' src/rootless_podman_config_resolution.rs
-          grep -q 'assessment summary conflicts with its field results' src/rootless_podman_preflight.rs
-          grep -q 'inconsistent_configuration_assessment_blocks_preflight' src/rootless_podman_preflight/tests.rs
-          git fetch origin main
-          git checkout origin/main -- .github/workflows/linux-acceptance.yml
-          rm scripts/harden_pr124.py
-          git config user.name github-actions[bot]
-          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add -A
-          git commit -m 'Harden Podman config evidence boundaries'
-          git push origin HEAD:codex/rootless-podman-config-resolution
-
   disposable-linux:
     runs-on: ubuntu-24.04
     timeout-minutes: 30

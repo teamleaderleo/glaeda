@@ -5,7 +5,8 @@ use crate::debian_package_plan::{build_package_plan, parse_os_release};
 use crate::host::Presence;
 use crate::rootless_podman_config_resolution::{
     ROOTLESS_PODMAN_CONFIG_RESOLUTION_SCHEMA_VERSION, RootlessPodmanConfigAssessment,
-    RootlessPodmanConfigAssessmentState,
+    RootlessPodmanConfigAssessmentState, RootlessPodmanConfigField,
+    RootlessPodmanConfigFieldAssessment,
 };
 use crate::runner_account_plan::{
     PreparationObservation, PreparationObservationState, RunnerAccountObservations,
@@ -279,6 +280,45 @@ fn absent_configuration_requires_changes() {
     assert_eq!(
         report.disposition,
         RootlessPodmanPreflightDisposition::ChangesRequired
+    );
+}
+
+#[test]
+fn inconsistent_configuration_assessment_blocks_preflight() {
+    let assessment = RootlessPodmanConfigAssessment {
+        schema_version: ROOTLESS_PODMAN_CONFIG_RESOLUTION_SCHEMA_VERSION,
+        state: RootlessPodmanConfigAssessmentState::Matching,
+        fields: vec![RootlessPodmanConfigFieldAssessment {
+            field: RootlessPodmanConfigField::NetworkBackend,
+            state: RootlessPodmanConfigAssessmentState::Conflicting,
+            expected: "netavark".to_owned(),
+            observed: Some("cni".to_owned()),
+            evidence: vec!["bounded test evidence".to_owned()],
+        }],
+    };
+    let report = observe_with(
+        &package_plan(Presence::Present),
+        &account_observations(PreparationObservationState::Matching),
+        Some(RuntimeIdentity { uid: 1001 }),
+        &assessment,
+        &RootlessPodmanPreflightPaths::system_default(),
+        &FakeFilesystem {
+            observation: RuntimePathObservation::Present(RuntimePathMetadata {
+                kind: RuntimePathKind::Directory,
+                uid: 1001,
+                mode: 0o700,
+            }),
+        },
+        &matching_executable,
+    );
+
+    assert_eq!(
+        report.configuration.state,
+        RootlessPodmanPreflightState::Conflicting
+    );
+    assert_eq!(
+        report.disposition,
+        RootlessPodmanPreflightDisposition::Blocked
     );
 }
 

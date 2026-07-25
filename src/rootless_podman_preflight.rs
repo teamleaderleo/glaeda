@@ -314,6 +314,13 @@ fn classify_runtime_directory(
 fn classify_configuration(
     assessment: &RootlessPodmanConfigAssessment,
 ) -> RootlessPodmanPreflightObservation {
+    let derived_state = assessment.fields.iter().map(|field| field.state).max();
+    if derived_state.is_some_and(|state| state != assessment.state) {
+        return observation(
+            RootlessPodmanPreflightState::Conflicting,
+            "rootless Podman configuration assessment summary conflicts with its field results",
+        );
+    }
     let state = match assessment.state {
         RootlessPodmanConfigAssessmentState::Matching => RootlessPodmanPreflightState::Matching,
         RootlessPodmanConfigAssessmentState::Absent => RootlessPodmanPreflightState::Absent,
