@@ -1,0 +1,138 @@
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use crate::rootless_podman_config_resolution::{
+        RootlessPodmanConfigAssessmentState, RootlessPodmanConfigPolicy,
+    };
+    use crate::runner_account_plan::{
+        PreparationObservation, PreparationObservationState, RunnerAccountObservations,
+    };
+
+    use super::{
+        ConfigFilesystem, ExpectedOwner, LinuxConfigFilesystem,
+        ROOTLESS_PODMAN_CONFIG_OBSERVATION_SCHEMA_VERSION, RootlessPodmanConfigObservationPaths,
+        RootlessPodmanConfigSourceObservationState, RootlessPodmanConfigSourceRole,
+        RunnerConfigIdentity, TrustedConfigFile, TrustedConfigFileProblem, observe_with,
+        render_human,
+    };
+
+    #[derive(Default)]
+    struct FakeFilesystem {
+        files: BTreeMap<PathBuf, TrustedConfigFile>,
+        calls: RefCell<Vec<PathBuf>>,
+    }
+
+    impl ConfigFilesystem for FakeFilesystem {
+        fn read_trusted(
+            &self,
+            path: &Path,
+            _owner: ExpectedOwner,
+            _max_bytes: usize,
+        ) -> TrustedConfigFile {
+            self.calls.borrow_mut().push(path.to_path_buf());
+            self.files
+                .get(path)
+                .cloned()
+                .unwrap_or(TrustedConfigFile::Missing)
+        }
+    }
+
+    fn account_observations(state: PreparationObservationState) -> RunnerAccountObservations {
+        let make = || PreparationObservation::new(state, ["bounded evidence"]).expect("observation");
+        RunnerAccountObservations {
+            group: make(),
+            user: make(),
+            home: make(),
+            subordinate_uids: make(),
+            subordinate_gids: make(),
+            linger: make(),
+        }
+    }
+
+    fn paths() -> RootlessPodmanConfigObservationPaths {
+        RootlessPodmanConfigObservationPaths::new(
+            "/usr/share/containers/containers.conf",
+            "/etc/containers/containers.conf",
+            "/etc/containers/storage.conf",
+        )
+        .expect("paths")
+    }
+
+    fn policy() -> RootlessPodmanConfigPolicy {
+        RootlessPodmanConfigPolicy::new(
+            "overlay",
+            "/var/lib/project-runner/.local/share/containers/storage",
+            "/run/user/1001/containers",
+            "/usr/bin/fuse-overlayfs",
+            "systemd",
+            "netavark",
+        )
+        .expect("policy")
+    }
+
+    fn identity() -> RunnerConfigIdentity {
+        RunnerConfigIdentity {
+            uid: 1001,
+            gid: 1001,
+            group_gid: 1001,
+        }
+    }
+
+    fn source(report: &super::RootlessPodmanConfigObservationReport, role: RootlessPodmanConfigSourceRole) -> &super::RootlessPodmanConfigSourceObservation {
+        report
+            .sources
+            .iter()
+            .find(|source| source.role == role)
+            .expect("source observation")
+    }
+
+    #[test]
+    fn safe_sources_resolve_to_matching_policy() {
+        let mut filesystem = FakeFilesystem::default();
+        filesystem.files.insert(
+            "/etc/containers/containers.conf".into(),
+            TrustedConfigFile::Present(
+                b"[engine]\ncgroup_manager = \"systemd\"\n[network]\nnetwork_backend = \"netavark\"\n"
+                    .to_vec(),
+            ),
+        );
+        filesystem.files.insert(
+            "/var/lib/project-runner/.config/containers/storage.conf".into(),
+            TrustedConfigFile::Present(
+                b"[storage]\ndriver = \"overlay\"\nrunroot = \"$XDG_RUNTIME_DIR/containers\"\ngraphroot = \"$XDG_DATA_HOME/containers/storage\"\n[storage.options.overlay]\nmount_program = \"/usr/bin/fuse-overlayfs\"\n"
+                    .to_vec(),
+            ),
+        );
+
+        let report = observe_with(
+            &account_observations(PreparationObservationState::Matching),
+            Some(identity()),
+            Path::new("/var/lib/project-runner"),
+            &policy(),
+            &paths(),
+            &filesystem,
+        )
+        .expect("report");
+
+        assert_eq!(
+            report.schema_version,
+            ROOTLESS_PODMAN_CONFIG_OBSERVATION_SCHEMA_VERSION
+        );
+        assert_eq!(
+            report.assessment.state,
+            RootlessPodmanConfigAssessmentState::Matching
+        );
+        assert_eq!(
+            source(&report, RootlessPodmanConfigSourceRole::SystemContainers).state,
+            RootlessPodmanConfigSourceObservationState::Present
+        );
+        assert_eq!(
+            source(&report, RootlessPodmanConfigSourceRole::RunnerStorage).state,
+            RootlessPodmanConfigSourceObservationState::Present
+        );
+    }
+
