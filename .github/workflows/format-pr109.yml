@@ -1,0 +1,37 @@
+name: Format PR 109
+
+on:
+  pull_request:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: format-pr-109-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  format:
+    if: github.head_ref == 'codex/rootless-podman-config-parser'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out parser branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: codex/rootless-podman-config-parser
+
+      - name: Format parser and remove one-use workflow
+        run: |
+          set -euo pipefail
+          expected_head="$(git rev-parse HEAD)"
+          cargo fmt --all
+          rm .github/workflows/format-pr109.yml
+          git add --all
+          git diff --cached --check
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'Format bounded Podman config parser'
+          git push --force-with-lease=refs/heads/codex/rootless-podman-config-parser:${expected_head} \
+            origin HEAD:refs/heads/codex/rootless-podman-config-parser
