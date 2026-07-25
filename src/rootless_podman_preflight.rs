@@ -1,13 +1,19 @@
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
-use rustix::fs::{self as rustix_fs, FileType, Mode, OFlags};
-use rustix::io::Errno;
 use serde::Serialize;
 
 use crate::debian_package_plan::{DebianPackagePlan, PackagePlanDisposition};
-use crate::lane_executable::{ExecutableVerificationErrorKind, verify_executable};
 use crate::runner_account_observation::ObservedRunnerIdentity;
 use crate::runner_account_plan::{PreparationObservationState, RunnerAccountObservations};
+
+mod support;
+#[cfg(test)]
+mod tests;
+
+use support::{
+    ExecutableProbe, LinuxRuntimeFilesystem, RuntimeFilesystem, RuntimeIdentity, RuntimePathKind,
+    RuntimePathObservation, canonical_non_root_path, verify_reviewed_executable,
+};
 
 pub const ROOTLESS_PODMAN_PREFLIGHT_SCHEMA_VERSION: u8 = 1;
 
@@ -304,5 +310,15 @@ fn disposition(
         RootlessPodmanPreflightDisposition::NeedsInspection
     } else {
         RootlessPodmanPreflightDisposition::ReadyForSmokeVerification
+    }
+}
+
+fn observation(
+    state: RootlessPodmanPreflightState,
+    evidence: impl Into<String>,
+) -> RootlessPodmanPreflightObservation {
+    RootlessPodmanPreflightObservation {
+        state,
+        evidence: vec![evidence.into()],
     }
 }
