@@ -3,9 +3,7 @@ use std::fmt;
 
 use serde::Serialize;
 
-use crate::durable_journal::{
-    DurableExecutionError, JournalCheckpoint, execute_plan_durably,
-};
+use crate::durable_journal::{DurableExecutionError, JournalCheckpoint, execute_plan_durably};
 use crate::journal::{
     ActionFailure, ActionReceipt, ExecutionJournal, ExecutionLane, MutationExecutor,
     PlannedMutation, RollbackClass, validate_plan,
@@ -161,9 +159,7 @@ impl LaneCommandRunner for SystemLaneCommandRunner<'_> {
                         "runner-user lane execution requires exact verified account, runtime-directory, and subordinate-ID evidence; re-observe before retry",
                     ));
                 };
-                map_lane_execution(
-                    RunnerUserLaneExecutor::system().execute(command, runner_user),
-                )
+                map_lane_execution(RunnerUserLaneExecutor::system().execute(command, runner_user))
             }
             ExecutionLane::Operator | ExecutionLane::Github => Err(ActionFailure::public(
                 "unsupported_lane",
@@ -291,8 +287,7 @@ mod tests {
     use crate::lane_command::{LaneCommand, LinuxAccountName, RunnerUserContext};
 
     use super::{
-        DurableLanePlan, LaneCommandRunner, SystemLaneCommandRunner,
-        execute_lane_plan_durably,
+        DurableLanePlan, LaneCommandRunner, SystemLaneCommandRunner, execute_lane_plan_durably,
     };
 
     #[derive(Default)]
@@ -376,29 +371,54 @@ mod tests {
         let extra_command = root_command(&extra);
 
         let missing = DurableLanePlan::new(vec![root.clone()], Vec::new()).expect_err("missing");
-        assert!(missing.problems.iter().any(|problem| problem.contains("no bound")));
+        assert!(
+            missing
+                .problems
+                .iter()
+                .any(|problem| problem.contains("no bound"))
+        );
 
         let extra_result = DurableLanePlan::new(
             vec![root.clone()],
             vec![root_command.clone(), extra_command],
         )
         .expect_err("extra");
-        assert!(extra_result.problems.iter().any(|problem| problem.contains("no matching")));
+        assert!(
+            extra_result
+                .problems
+                .iter()
+                .any(|problem| problem.contains("no matching"))
+        );
 
         let duplicate = DurableLanePlan::new(
             vec![root.clone()],
             vec![root_command.clone(), root_command.clone()],
         )
         .expect_err("duplicate");
-        assert!(duplicate.problems.iter().any(|problem| problem.contains("duplicate")));
+        assert!(
+            duplicate
+                .problems
+                .iter()
+                .any(|problem| problem.contains("duplicate"))
+        );
 
         let lane = DurableLanePlan::new(vec![runner_lane], vec![root_command.clone()])
             .expect_err("lane mismatch");
-        assert!(lane.problems.iter().any(|problem| problem.contains("assigned")));
+        assert!(
+            lane.problems
+                .iter()
+                .any(|problem| problem.contains("assigned"))
+        );
 
-        let rollback = DurableLanePlan::new(vec![reversible.clone()], vec![root_command(&reversible)])
-            .expect_err("rollback");
-        assert!(rollback.problems.iter().any(|problem| problem.contains("irreversible")));
+        let rollback =
+            DurableLanePlan::new(vec![reversible.clone()], vec![root_command(&reversible)])
+                .expect_err("rollback");
+        assert!(
+            rollback
+                .problems
+                .iter()
+                .any(|problem| problem.contains("irreversible"))
+        );
     }
 
     #[test]
@@ -418,11 +438,26 @@ mod tests {
 
         assert_eq!(runner.calls, ["one", "two"]);
         assert!(journal.completed());
-        assert_eq!(checkpoint.snapshots[0].records[0].outcome, ActionOutcome::Pending);
-        assert_eq!(checkpoint.snapshots[1].records[0].outcome, ActionOutcome::Executing);
-        assert_eq!(checkpoint.snapshots[2].records[0].outcome, ActionOutcome::Completed);
-        assert_eq!(checkpoint.snapshots[3].records[1].outcome, ActionOutcome::Executing);
-        assert_eq!(checkpoint.snapshots[4].records[1].outcome, ActionOutcome::Completed);
+        assert_eq!(
+            checkpoint.snapshots[0].records[0].outcome,
+            ActionOutcome::Pending
+        );
+        assert_eq!(
+            checkpoint.snapshots[1].records[0].outcome,
+            ActionOutcome::Executing
+        );
+        assert_eq!(
+            checkpoint.snapshots[2].records[0].outcome,
+            ActionOutcome::Completed
+        );
+        assert_eq!(
+            checkpoint.snapshots[3].records[1].outcome,
+            ActionOutcome::Executing
+        );
+        assert_eq!(
+            checkpoint.snapshots[4].records[1].outcome,
+            ActionOutcome::Completed
+        );
     }
 
     #[test]
@@ -469,8 +504,14 @@ mod tests {
         let DurableExecutionError::Checkpoint(error) = error else {
             panic!("checkpoint error");
         };
-        assert_eq!(error.last_durable().expect("initial snapshot").records[0].outcome, ActionOutcome::Pending);
-        assert_eq!(error.attempted().records[0].outcome, ActionOutcome::Executing);
+        assert_eq!(
+            error.last_durable().expect("initial snapshot").records[0].outcome,
+            ActionOutcome::Pending
+        );
+        assert_eq!(
+            error.attempted().records[0].outcome,
+            ActionOutcome::Executing
+        );
     }
 
     #[test]
