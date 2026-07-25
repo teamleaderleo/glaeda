@@ -98,10 +98,10 @@ pub struct RootlessPodmanContainersConfig {
 
 /// Parse the bounded subset of `storage.conf` needed by static rootless Podman preflight.
 ///
-/// Unknown tables and keys are ignored. Relevant keys must be unique and use one-line quoted TOML
-/// strings. Multiline strings, computed interpolation, and unbounded values are deliberately not
-/// accepted. The parser does not execute Podman or attempt to reproduce its complete configuration
-/// engine.
+/// Unknown tables and keys are ignored. Relevant keys may use equivalent supported bare dotted
+/// paths, must be unique, and must use one-line quoted TOML strings. Multiline strings, computed
+/// interpolation, and unbounded values are deliberately not accepted. The parser does not execute
+/// Podman or attempt to reproduce its complete configuration engine.
 ///
 /// # Errors
 ///
@@ -122,9 +122,9 @@ pub fn parse_rootless_podman_storage_config(
 
 /// Parse the bounded subset of `containers.conf` needed by static rootless Podman preflight.
 ///
-/// Unknown tables and keys are ignored. Relevant keys must be unique and use one-line quoted TOML
-/// strings. The absence of a key is preserved as `None`; this parser does not guess a distribution
-/// or build-specific default.
+/// Unknown tables and keys are ignored. Relevant keys may use equivalent supported bare dotted
+/// paths, must be unique, and must use one-line quoted TOML strings. The absence of a key is
+/// preserved as `None`; this parser does not guess a distribution or build-specific default.
 ///
 /// # Errors
 ///
