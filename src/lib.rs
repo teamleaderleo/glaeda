@@ -6,6 +6,8 @@ pub mod debian_package_probe;
 #[cfg(target_os = "linux")]
 pub mod debian_package_recovery;
 pub mod doctor;
+#[cfg(target_os = "linux")]
+pub mod durable_lane_execution;
 pub mod durable_journal;
 pub mod host;
 #[cfg(target_os = "linux")]
