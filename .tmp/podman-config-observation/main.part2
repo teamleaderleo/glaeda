@@ -1,0 +1,146 @@
+        Self {
+            problems: vec![problem.into()],
+        }
+    }
+
+    fn from_problem(problem: String) -> Self {
+        Self::single(problem)
+    }
+}
+
+impl fmt::Display for RootlessPodmanConfigObservationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(formatter, "rootless Podman configuration observation failed")?;
+        for problem in &self.problems {
+            writeln!(formatter, "- {problem}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for RootlessPodmanConfigObservationError {}
+
+/// Observe reviewed rootless Podman configuration sources without invoking Podman or a child process.
+///
+/// System files must be root-owned. Runner files are inspected only after the exact non-root runner
+/// identity and a matching reviewed home have been proven. Missing, present, and unknown source
+/// states remain distinct through parsing, precedence resolution, and policy assessment.
+///
+/// # Errors
+///
+/// Returns an error only when caller-supplied reviewed paths or the derived XDG context are invalid.
+pub fn observe_rootless_podman_configuration(
+    account_observations: &RunnerAccountObservations,
+    identity: Option<ObservedRunnerIdentity>,
+    reviewed_home: &Path,
+    policy: &RootlessPodmanConfigPolicy,
+    paths: &RootlessPodmanConfigObservationPaths,
+) -> Result<RootlessPodmanConfigObservationReport, RootlessPodmanConfigObservationError> {
+    let identity = identity.map(RunnerConfigIdentity::from);
+    observe_with(
+        account_observations,
+        identity,
+        reviewed_home,
+        policy,
+        paths,
+        &LinuxConfigFilesystem,
+    )
+}
+
+/// Observe configuration and compose it into the existing static-preflight report.
+///
+/// This entrypoint performs bounded filesystem inspection only. It accepts no command executor and
+/// never invokes Podman, user services, a shell, or another child process.
+///
+/// # Errors
+///
+/// Returns an error when the reviewed configuration path context is invalid.
+pub fn observe_rootless_podman_static_preflight_from_sources(
+    package_plan: &DebianPackagePlan,
+    account_observations: &RunnerAccountObservations,
+    identity: Option<ObservedRunnerIdentity>,
+    reviewed_home: &Path,
+    policy: &RootlessPodmanConfigPolicy,
+    config_paths: &RootlessPodmanConfigObservationPaths,
+    preflight_paths: &RootlessPodmanPreflightPaths,
+) -> Result<RootlessPodmanObservedStaticPreflightReport, RootlessPodmanConfigObservationError> {
+    let configuration = observe_rootless_podman_configuration(
+        account_observations,
+        identity,
+        reviewed_home,
+        policy,
+        config_paths,
+    )?;
+    let preflight = observe_rootless_podman_static_preflight(
+        package_plan,
+        account_observations,
+        identity,
+        configuration.assessment(),
+        preflight_paths,
+    );
+    Ok(RootlessPodmanObservedStaticPreflightReport {
+        schema_version: ROOTLESS_PODMAN_CONFIG_OBSERVATION_SCHEMA_VERSION,
+        configuration,
+        preflight,
+    })
+}
+
+#[must_use]
+pub fn render_human(report: &RootlessPodmanConfigObservationReport) -> String {
+    let mut output = format!(
+        "Rootless Podman configuration assessment: {}\nSources:\n",
+        assessment_state_name(report.assessment.state)
+    );
+    for source in &report.sources {
+        output.push_str(&format!(
+            "- {} {}: {}\n",
+            source_role_name(source.role),
+            source.path.display(),
+            source_state_name(source.state)
+        ));
+        for evidence in &source.evidence {
+            output.push_str(&format!("  - {evidence}\n"));
+        }
+    }
+    output
+}
+
+fn observe_with(
+    account_observations: &RunnerAccountObservations,
+    identity: Option<RunnerConfigIdentity>,
+    reviewed_home: &Path,
+    policy: &RootlessPodmanConfigPolicy,
+    paths: &RootlessPodmanConfigObservationPaths,
+    filesystem: &impl ConfigFilesystem,
+) -> Result<RootlessPodmanConfigObservationReport, RootlessPodmanConfigObservationError> {
+    let home = canonical_observation_path("reviewed runner home", reviewed_home.to_path_buf())?;
+    let trusted_identity = trusted_runner_identity(account_observations, identity);
+    let context_identity = trusted_identity.unwrap_or(RunnerConfigIdentity {
+        uid: u32::MAX,
+        gid: u32::MAX,
+        group_gid: u32::MAX,
+    });
+    let runtime_uid = context_identity.uid;
+    let context = RootlessPodmanConfigContext::new(
+        home.clone(),
+        home.join(".config"),
+        home.join(".local/share"),
+        PathBuf::from(format!("/run/user/{runtime_uid}")),
+    )
+    .map_err(|problem| {
+        RootlessPodmanConfigObservationError::single(format!(
+            "reviewed rootless Podman path context is invalid: {problem}"
+        ))
+    })?;
+    let runner_containers_path = context
+        .xdg_config_home()
+        .join("containers/containers.conf");
+    let runner_storage_path = context.xdg_config_home().join("containers/storage.conf");
+
+    let vendor_containers = observe_source(
+        RootlessPodmanConfigSourceRole::VendorContainers,
+        paths.vendor_containers(),
+        ExpectedOwner::Root,
+        filesystem,
+        parse_rootless_podman_containers_config,
+    )?;
