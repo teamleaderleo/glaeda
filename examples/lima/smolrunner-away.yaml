@@ -1,0 +1,41 @@
+minimumLimaVersion: "2.1.1"
+
+base:
+  - template:_images/ubuntu-24.04
+
+vmType: vz
+arch: aarch64
+plain: true
+
+cpus: 8
+memory: 8GiB
+disk: 80GiB
+
+user:
+  name: lima
+  home: /home/lima
+  shell: /bin/bash
+
+mounts: []
+portForwards: []
+
+ssh:
+  loadDotSSHPubKeys: false
+  forwardAgent: false
+  forwardX11: false
+  forwardX11Trusted: false
+
+containerd:
+  system: false
+  user: false
+
+vmOpts:
+  vz:
+    rosetta:
+      enabled: false
+      binfmt: false
+
+video:
+  display: none
+
+propagateProxyEnv: false
