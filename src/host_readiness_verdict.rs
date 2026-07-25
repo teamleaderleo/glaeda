@@ -2,6 +2,10 @@ use serde::Serialize;
 
 use crate::debian_package_plan::PackagePlanDisposition;
 use crate::host_readiness::{HostObservationState, HostReadinessReport, RunnerAccountReadiness};
+use crate::host_rootless_podman::HostRootlessPodmanReadiness;
+use crate::rootless_podman_preflight::{
+    RootlessPodmanPreflightDisposition, RootlessPodmanPreflightState,
+};
 use crate::runner_account_plan::{RunnerAccountPlanDisposition, RunnerAccountResourceKind};
 use crate::subordinate_id::{PodmanMigrationPlan, SubordinateIdKind, SubordinatePlanDisposition};
 
@@ -172,6 +176,36 @@ pub fn assess(report: &HostReadinessReport) -> HostReadinessAssessment<'_> {
         }
     }
 
+    match &report.rootless_podman {
+        HostRootlessPodmanReadiness::Deferred { state, evidence } => {
+            let disposition = preflight_state_disposition(*state);
+            if disposition != HostReadinessDisposition::Ready {
+                findings.push(HostReadinessFinding {
+                    id: "rootless-podman-static-preflight".to_owned(),
+                    domain: HostReadinessDomain::RootlessPodman,
+                    disposition,
+                    summary: evidence.first().cloned().unwrap_or_else(|| {
+                        "rootless Podman static preflight is deferred".to_owned()
+                    }),
+                });
+            }
+        }
+        HostRootlessPodmanReadiness::Observed { preflight, .. } => {
+            let disposition = preflight_disposition(preflight.disposition);
+            if disposition != HostReadinessDisposition::Ready {
+                findings.push(HostReadinessFinding {
+                    id: "rootless-podman-static-preflight".to_owned(),
+                    domain: HostReadinessDomain::RootlessPodman,
+                    disposition,
+                    summary: format!(
+                        "rootless Podman static preflight is {}",
+                        disposition.as_str()
+                    ),
+                });
+            }
+        }
+    }
+
     HostReadinessAssessment {
         schema_version: HOST_READINESS_VERDICT_SCHEMA_VERSION,
         disposition: overall_disposition(&findings),
@@ -225,6 +259,34 @@ fn subordinate_disposition(
     }
 }
 
+fn preflight_disposition(
+    disposition: RootlessPodmanPreflightDisposition,
+) -> HostReadinessDisposition {
+    match disposition {
+        RootlessPodmanPreflightDisposition::ReadyForSmokeVerification => {
+            HostReadinessDisposition::Ready
+        }
+        RootlessPodmanPreflightDisposition::ChangesRequired => {
+            HostReadinessDisposition::ChangesRequired
+        }
+        RootlessPodmanPreflightDisposition::NeedsInspection => {
+            HostReadinessDisposition::NeedsInspection
+        }
+        RootlessPodmanPreflightDisposition::Blocked => HostReadinessDisposition::Blocked,
+    }
+}
+
+fn preflight_state_disposition(state: RootlessPodmanPreflightState) -> HostReadinessDisposition {
+    match state {
+        RootlessPodmanPreflightState::Matching => HostReadinessDisposition::Ready,
+        RootlessPodmanPreflightState::Absent => HostReadinessDisposition::ChangesRequired,
+        RootlessPodmanPreflightState::Unknown => HostReadinessDisposition::NeedsInspection,
+        RootlessPodmanPreflightState::Conflicting | RootlessPodmanPreflightState::Blocked => {
+            HostReadinessDisposition::Blocked
+        }
+    }
+}
+
 fn observation_state_name(state: HostObservationState) -> &'static str {
     match state {
         HostObservationState::Matching => "matching",
@@ -262,11 +324,14 @@ fn package_names(packages: &[crate::lane_command::PackageName]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::rootless_podman_preflight::{
+        RootlessPodmanPreflightDisposition, RootlessPodmanPreflightState,
+    };
     use crate::subordinate_id::{PodmanMigrationPlan, SubordinatePlanDisposition};
 
     use super::{
         HostReadinessDisposition, HostReadinessDomain, HostReadinessFinding, overall_disposition,
-        subordinate_disposition,
+        preflight_disposition, preflight_state_disposition, subordinate_disposition,
     };
 
     fn finding(disposition: HostReadinessDisposition) -> HostReadinessFinding {
@@ -313,6 +378,26 @@ mod tests {
         assert_eq!(
             subordinate_disposition(SubordinatePlanDisposition::Blocked),
             Some(HostReadinessDisposition::Blocked)
+        );
+    }
+
+    #[test]
+    fn rootless_podman_states_feed_the_verdict() {
+        assert_eq!(
+            preflight_state_disposition(RootlessPodmanPreflightState::Absent),
+            HostReadinessDisposition::ChangesRequired
+        );
+        assert_eq!(
+            preflight_state_disposition(RootlessPodmanPreflightState::Unknown),
+            HostReadinessDisposition::NeedsInspection
+        );
+        assert_eq!(
+            preflight_disposition(RootlessPodmanPreflightDisposition::Blocked),
+            HostReadinessDisposition::Blocked
+        );
+        assert_eq!(
+            preflight_disposition(RootlessPodmanPreflightDisposition::ReadyForSmokeVerification),
+            HostReadinessDisposition::Ready
         );
     }
 
