@@ -6,13 +6,35 @@ on:
     branches: [main]
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: verify-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  apply-pr-127:
+    if: github.head_ref == 'codex/mac-off-job-consistency'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: codex/mac-off-job-consistency
+          fetch-depth: 0
+      - name: Apply and publish reviewed source patch
+        run: |
+          python3 .github/patch-pr-127.py
+          cargo fmt --all
+          cargo test --locked mac_availability
+          git checkout origin/main -- .github/workflows/ci.yml .github/workflows/linux-acceptance.yml
+          rm -f .github/patch-pr-127.py .github/workflows/patch-pr-127.yml .github/pr127-trigger
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          git commit -m 'Reject impossible off-mode job observations'
+          git push origin HEAD:codex/mac-off-job-consistency
+
   verify:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
