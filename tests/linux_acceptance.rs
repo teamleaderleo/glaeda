@@ -9,9 +9,7 @@ use std::path::Path;
 use smolrunner::debian_package_probe::DpkgQueryProbe;
 use smolrunner::host::Presence;
 use smolrunner::journal::{ExecutionLane, PlannedMutation, Preconditions, RollbackClass};
-use smolrunner::lane_command::{
-    LaneCommand, LinuxAccountName, PackageName, RunnerUserContext,
-};
+use smolrunner::lane_command::{LaneCommand, LinuxAccountName, PackageName, RunnerUserContext};
 use smolrunner::lane_executable::verify_executable;
 use smolrunner::lane_executor::{RootLaneExecutor, RunnerUserLaneExecutor};
 use smolrunner::process::{CommandExecutor, CommandSpec, ProcessExecutor};
@@ -122,7 +120,10 @@ fn process_execution_starts_empty_and_adds_only_explicit_environment_values() {
         .execute(&allowlisted_spec)
         .expect("execute env with an allowlist");
     let lines = allowlisted.stdout.lines().collect::<BTreeSet<_>>();
-    assert_eq!(lines, BTreeSet::from(["HOME=/var/empty", "SMOLRUNNER_ACCEPTANCE=allowed"]));
+    assert_eq!(
+        lines,
+        BTreeSet::from(["HOME=/var/empty", "SMOLRUNNER_ACCEPTANCE=allowed"])
+    );
     assert_eq!(
         allowlisted.environment_keys,
         ["HOME".to_owned(), "SMOLRUNNER_ACCEPTANCE".to_owned()]
@@ -332,13 +333,8 @@ fn account_preparation_observation_and_runner_user_transition_work_in_a_containe
         &username,
     )
     .expect("parse subordinate GID evidence");
-    let context = RunnerUserContext::new(
-        username,
-        identity.uid(),
-        identity.primary_gid(),
-        HOME,
-    )
-    .expect("build runner-user context");
+    let context = RunnerUserContext::new(username, identity.uid(), identity.primary_gid(), HOME)
+        .expect("build runner-user context");
     let runtime = inspect_runtime_directory(&context).expect("inspect runtime directory");
     let verified = verify_runner_user(
         &context,
