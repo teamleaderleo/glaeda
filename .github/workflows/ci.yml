@@ -2,9 +2,11 @@ name: Verify
 
 on:
   pull_request:
+  push:
+    branches: [main]
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: verify-${{ github.workflow }}-${{ github.ref }}
@@ -13,34 +15,23 @@ concurrency:
 jobs:
   verify:
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 15
 
     steps:
-      - name: Check out observation branch quietly
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          git init --quiet .
-          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-          git fetch --quiet --depth=1 origin codex/runner-account-observation
-          git checkout --quiet -B codex/runner-account-observation FETCH_HEAD
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 
-      - name: Apply canonical-path and no-follow traversal hardening
-        run: |
-          python3 .github/seal-observation-paths.py
-          sed -i 's/use std::io::{self, Read as _};/use std::io::Read as _;/' src/runner_account_observation.rs
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain
 
-      - name: Format source
-        run: cargo fmt --all
+      - name: Check formatting
+        run: cargo fmt --all -- --check
 
       - name: Run Clippy
-        run: cargo clippy --quiet --locked --all-targets --all-features -- -D warnings
-
-      - name: Run focused observation tests
-        run: cargo test --quiet --locked --all-targets --all-features runner_account_observation
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
       - name: Run tests
-        run: cargo test --quiet --locked --all-targets --all-features
+        run: cargo test --locked --all-targets --all-features
 
       - name: Exercise machine-readable doctor output
         run: cargo run --locked --quiet -- --output json doctor
@@ -55,15 +46,3 @@ jobs:
         run: |
           cargo run --locked --quiet -- --output json host plan --file examples/quarry.yml \
             | jq -e '.schema_version == 1 and (.actions | length >= 2)'
-
-      - name: Publish verified source and restore ordinary CI
-        run: |
-          git fetch --quiet origin main --depth=1
-          git show origin/main:.github/workflows/ci.yml > .github/workflows/ci.yml
-          rm -f .github/workflows/seal-observation-paths.yml
-          rm -f .github/seal-observation-paths.py
-          git config user.name github-actions[bot]
-          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add src/runner_account_observation.rs .github/workflows/ci.yml .github/workflows/seal-observation-paths.yml .github/seal-observation-paths.py
-          git commit -m "Harden runner account observation traversal"
-          git push origin HEAD:codex/runner-account-observation

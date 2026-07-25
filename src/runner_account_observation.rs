@@ -1,8 +1,7 @@
 use std::fmt;
-use std::fs;
-use std::io::{self, Read as _};
-use std::os::unix::fs::MetadataExt as _;
-use std::path::{Path, PathBuf};
+use std::io::Read as _;
+use std::os::fd::OwnedFd;
+use std::path::{Component, Path, PathBuf};
 
 use rustix::fs::{self as rustix_fs, FileType, Mode, OFlags};
 use rustix::io::Errno;
@@ -39,17 +38,30 @@ impl RunnerAccountObservationPaths {
         }
     }
 
-    #[must_use]
+    /// Build relocated observation paths for an explicitly trusted host root.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless every path is a canonical absolute path without aliases.
     pub fn new(
         subordinate_uids: impl Into<PathBuf>,
         subordinate_gids: impl Into<PathBuf>,
         linger_directory: impl Into<PathBuf>,
-    ) -> Self {
-        Self {
-            subordinate_uids: subordinate_uids.into(),
-            subordinate_gids: subordinate_gids.into(),
-            linger_directory: linger_directory.into(),
-        }
+    ) -> Result<Self, RunnerAccountObservationError> {
+        Ok(Self {
+            subordinate_uids: canonical_observation_path(
+                "subordinate UID authority",
+                subordinate_uids.into(),
+            )?,
+            subordinate_gids: canonical_observation_path(
+                "subordinate GID authority",
+                subordinate_gids.into(),
+            )?,
+            linger_directory: canonical_observation_path(
+                "linger directory",
+                linger_directory.into(),
+            )?,
+        })
     }
 }
 
@@ -94,6 +106,14 @@ impl RunnerAccountObservationReport {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RunnerAccountObservationError {
     pub problems: Vec<String>,
+}
+
+impl RunnerAccountObservationError {
+    fn single(problem: impl Into<String>) -> Self {
+        Self {
+            problems: vec![problem.into()],
+        }
+    }
 }
 
 impl From<RunnerAccountPlanError> for RunnerAccountObservationError {
@@ -627,6 +647,32 @@ fn classify_linger(
     Ok(PreparationObservation::new(state, [evidence])?)
 }
 
+fn canonical_observation_path(
+    field: &str,
+    path: PathBuf,
+) -> Result<PathBuf, RunnerAccountObservationError> {
+    let Some(value) = path.to_str() else {
+        return Err(RunnerAccountObservationError::single(format!(
+            "{field} must be valid UTF-8"
+        )));
+    };
+    if value.is_empty()
+        || value == "/"
+        || value.len() > 4_096
+        || value.ends_with('/')
+        || value.chars().any(char::is_control)
+        || !path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::RootDir | Component::Normal(_)))
+    {
+        return Err(RunnerAccountObservationError::single(format!(
+            "{field} must be a canonical non-root absolute path"
+        )));
+    }
+    Ok(path)
+}
+
 fn canonical_u32(value: &str) -> Option<u32> {
     let parsed = value.parse::<u32>().ok()?;
     (parsed.to_string() == value).then_some(parsed)
@@ -672,37 +718,35 @@ struct LinuxAccountFilesystem;
 
 impl AccountFilesystem for LinuxAccountFilesystem {
     fn inspect(&self, path: &Path) -> PathObservation {
-        let metadata = match fs::symlink_metadata(path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return PathObservation::Missing;
-            }
+        let descriptor = match open_traversed(path, OFlags::PATH) {
+            Ok(descriptor) => descriptor,
+            Err(Errno::NOENT) => return PathObservation::Missing,
             Err(_) => return PathObservation::Unknown,
         };
-        let kind = if metadata.file_type().is_symlink() {
-            ObservedPathKind::Other
-        } else if metadata.is_file() {
-            ObservedPathKind::File
-        } else if metadata.is_dir() {
-            ObservedPathKind::Directory
-        } else {
-            ObservedPathKind::Other
+        let stat = match rustix_fs::fstat(&descriptor) {
+            Ok(stat) => stat,
+            Err(_) => return PathObservation::Unknown,
+        };
+        let kind = match FileType::from_raw_mode(stat.st_mode) {
+            FileType::RegularFile => ObservedPathKind::File,
+            FileType::Directory => ObservedPathKind::Directory,
+            _ => ObservedPathKind::Other,
+        };
+        let Ok(size) = u64::try_from(stat.st_size) else {
+            return PathObservation::Unknown;
         };
         PathObservation::Present(ObservedPathMetadata {
             kind,
-            uid: metadata.uid(),
-            gid: metadata.gid(),
-            mode: metadata.mode() & 0o7777,
-            size: metadata.size(),
-            nlink: metadata.nlink(),
+            uid: stat.st_uid,
+            gid: stat.st_gid,
+            mode: stat.st_mode & 0o7777,
+            size,
+            nlink: stat.st_nlink,
         })
     }
 
     fn read_trusted(&self, path: &Path, max_bytes: usize) -> TrustedFile {
-        let flags = OFlags::RDONLY
-            .union(OFlags::NOFOLLOW)
-            .union(OFlags::CLOEXEC);
-        let descriptor = match rustix_fs::open(path, flags, Mode::empty()) {
+        let descriptor = match open_traversed(path, OFlags::RDONLY) {
             Ok(descriptor) => descriptor,
             Err(Errno::NOENT) => return TrustedFile::Missing,
             Err(_) => return TrustedFile::Unknown,
@@ -739,12 +783,43 @@ impl AccountFilesystem for LinuxAccountFilesystem {
     }
 }
 
+fn open_traversed(path: &Path, final_flags: OFlags) -> Result<OwnedFd, Errno> {
+    let mut components = path.components();
+    if components.next() != Some(Component::RootDir) {
+        return Err(Errno::INVAL);
+    }
+    let mut current = rustix_fs::open(
+        "/",
+        OFlags::PATH.union(OFlags::DIRECTORY).union(OFlags::CLOEXEC),
+        Mode::empty(),
+    )?;
+    let mut remaining = components.peekable();
+    while let Some(component) = remaining.next() {
+        let Component::Normal(name) = component else {
+            return Err(Errno::INVAL);
+        };
+        let flags = if remaining.peek().is_some() {
+            OFlags::PATH
+                .union(OFlags::DIRECTORY)
+                .union(OFlags::NOFOLLOW)
+                .union(OFlags::CLOEXEC)
+        } else {
+            final_flags.union(OFlags::NOFOLLOW).union(OFlags::CLOEXEC)
+        };
+        current = rustix_fs::openat(&current, name, flags, Mode::empty())?;
+    }
+    Ok(current)
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
     use std::collections::{BTreeMap, VecDeque};
+    use std::fs;
     use std::io;
+    use std::os::unix::fs::symlink;
     use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::lane_command::LinuxAccountName;
     use crate::process::{CommandExecutor, CommandSpec, ExecutionRecord};
@@ -753,8 +828,8 @@ mod tests {
     };
 
     use super::{
-        AccountFilesystem, GETENT, ObservedPathKind, ObservedPathMetadata, PathObservation,
-        RunnerAccountObservationPaths, TrustedFile, getent_command, observe_with,
+        AccountFilesystem, GETENT, LinuxAccountFilesystem, ObservedPathKind, ObservedPathMetadata,
+        PathObservation, RunnerAccountObservationPaths, TrustedFile, getent_command, observe_with,
     };
 
     struct FakeExecutor {
@@ -820,6 +895,7 @@ mod tests {
 
     fn paths() -> RunnerAccountObservationPaths {
         RunnerAccountObservationPaths::new("/test/subuid", "/test/subgid", "/test/linger")
+            .expect("observation paths")
     }
 
     fn success(command: CommandSpec, stdout: &str) -> ExecutionRecord {
@@ -1114,6 +1190,35 @@ mod tests {
             report.observations.linger.state(),
             PreparationObservationState::Conflicting
         );
+    }
+
+    #[test]
+    fn relocated_observation_paths_must_be_canonical_and_absolute() {
+        RunnerAccountObservationPaths::new("relative/subuid", "/test/subgid", "/test/linger")
+            .expect_err("relative authority path");
+        RunnerAccountObservationPaths::new("/test/subuid", "/test/../subgid", "/test/linger")
+            .expect_err("aliased authority path");
+    }
+
+    #[test]
+    fn linux_filesystem_rejects_symlinked_parent_traversal() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "smolrunner-account-observation-{}-{suffix}",
+            std::process::id()
+        ));
+        let real = root.join("real");
+        fs::create_dir_all(&real).expect("create real directory");
+        fs::write(real.join("marker"), b"").expect("create marker");
+        symlink(&real, root.join("link")).expect("create parent symlink");
+
+        let observation = LinuxAccountFilesystem.inspect(&root.join("link/marker"));
+        assert_eq!(observation, PathObservation::Unknown);
+
+        fs::remove_dir_all(&root).expect("remove test tree");
     }
 
     #[test]
