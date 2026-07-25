@@ -1,9 +1,9 @@
 name: Materialize issue 103 patch
 
 on:
-  push:
+  pull_request:
     branches:
-      - codex/issue-103-subordinate-id-plan-v2
+      - main
 
 permissions:
   contents: write
@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   materialize:
-    if: hashFiles('.smolrunner-bootstrap/ready') != ''
+    if: hashFiles('.smolrunner-bootstrap/ready') != '' && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
     timeout-minutes: 15
 
