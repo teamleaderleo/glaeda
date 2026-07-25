@@ -1,0 +1,187 @@
+use std::collections::BTreeMap;
+use std::path::Path;
+
+use crate::debian_package_plan::{build_package_plan, parse_os_release};
+use crate::host::Presence;
+use crate::runner_account_plan::{
+    PreparationObservation, PreparationObservationState, RunnerAccountObservations,
+};
+
+use super::support::{
+    ExecutableProbe, RuntimeFilesystem, RuntimeIdentity, RuntimePathKind, RuntimePathMetadata,
+    RuntimePathObservation,
+};
+use super::{
+    RootlessPodmanPreflightDisposition, RootlessPodmanPreflightPaths,
+    RootlessPodmanPreflightState, observe_with,
+};
+
+struct FakeFilesystem {
+    observation: RuntimePathObservation,
+}
+
+impl RuntimeFilesystem for FakeFilesystem {
+    fn inspect(&self, _path: &Path) -> RuntimePathObservation {
+        self.observation
+    }
+}
+
+fn package_plan(state: Presence) -> crate::debian_package_plan::DebianPackagePlan {
+    let distribution = parse_os_release("ID=ubuntu\nVERSION_ID=24.04\n").expect("distribution");
+    let observed = [
+        "git",
+        "podman",
+        "uidmap",
+        "slirp4netns",
+        "fuse-overlayfs",
+        "dbus-user-session",
+    ]
+    .into_iter()
+    .map(|package| (package.to_owned(), state))
+    .collect::<BTreeMap<_, _>>();
+    build_package_plan(distribution, &observed).expect("package plan")
+}
+
+fn account_observations(state: PreparationObservationState) -> RunnerAccountObservations {
+    let make =
+        || PreparationObservation::new(state, ["bounded evidence"]).expect("observation");
+    RunnerAccountObservations {
+        group: make(),
+        user: make(),
+        home: make(),
+        subordinate_uids: make(),
+        subordinate_gids: make(),
+        linger: make(),
+    }
+}
+
+fn matching_executable(_path: &Path) -> ExecutableProbe {
+    ExecutableProbe {
+        state: RootlessPodmanPreflightState::Matching,
+        evidence: vec!["matching executable".to_owned()],
+    }
+}
+
+#[test]
+fn matching_static_state_is_ready_only_for_later_smoke_verification() {
+    let report = observe_with(
+        &package_plan(Presence::Present),
+        &account_observations(PreparationObservationState::Matching),
+        Some(RuntimeIdentity { uid: 1001 }),
+        &RootlessPodmanPreflightPaths::new("/run/user").expect("paths"),
+        &FakeFilesystem {
+            observation: RuntimePathObservation::Present(RuntimePathMetadata {
+                kind: RuntimePathKind::Directory,
+                uid: 1001,
+                mode: 0o700,
+            }),
+        },
+        &matching_executable,
+    );
+
+    assert_eq!(
+        report.disposition,
+        RootlessPodmanPreflightDisposition::ReadyForSmokeVerification
+    );
+    assert_eq!(report.executables.len(), 8);
+    assert!(report.executables.iter().all(|item| {
+        item.state == RootlessPodmanPreflightState::Matching
+            && item.path.is_absolute()
+            && item.path.as_path() != Path::new("podman")
+    }));
+}
+
+#[test]
+fn unknown_account_blocks_runtime_inspection_and_fails_closed() {
+    let report = observe_with(
+        &package_plan(Presence::Present),
+        &account_observations(PreparationObservationState::Unknown),
+        None,
+        &RootlessPodmanPreflightPaths::system_default(),
+        &FakeFilesystem {
+            observation: RuntimePathObservation::Present(RuntimePathMetadata {
+                kind: RuntimePathKind::Directory,
+                uid: 1001,
+                mode: 0o700,
+            }),
+        },
+        &matching_executable,
+    );
+
+    assert_eq!(
+        report.runner_account.state,
+        RootlessPodmanPreflightState::Unknown
+    );
+    assert_eq!(
+        report.runtime_directory.state,
+        RootlessPodmanPreflightState::Blocked
+    );
+    assert_eq!(
+        report.disposition,
+        RootlessPodmanPreflightDisposition::NeedsInspection
+    );
+}
+
+#[test]
+fn conflicting_runtime_directory_blocks_preflight() {
+    let report = observe_with(
+        &package_plan(Presence::Present),
+        &account_observations(PreparationObservationState::Matching),
+        Some(RuntimeIdentity { uid: 1001 }),
+        &RootlessPodmanPreflightPaths::system_default(),
+        &FakeFilesystem {
+            observation: RuntimePathObservation::Present(RuntimePathMetadata {
+                kind: RuntimePathKind::Directory,
+                uid: 2000,
+                mode: 0o777,
+            }),
+        },
+        &matching_executable,
+    );
+
+    assert_eq!(
+        report.runtime_directory.state,
+        RootlessPodmanPreflightState::Conflicting
+    );
+    assert_eq!(
+        report.disposition,
+        RootlessPodmanPreflightDisposition::Blocked
+    );
+}
+
+#[test]
+fn missing_packages_and_helpers_require_changes_without_running_podman() {
+    let report = observe_with(
+        &package_plan(Presence::Absent),
+        &account_observations(PreparationObservationState::Absent),
+        None,
+        &RootlessPodmanPreflightPaths::system_default(),
+        &FakeFilesystem {
+            observation: RuntimePathObservation::Missing,
+        },
+        &|path| ExecutableProbe {
+            state: if path == Path::new("/usr/bin/podman") {
+                RootlessPodmanPreflightState::Absent
+            } else {
+                RootlessPodmanPreflightState::Matching
+            },
+            evidence: vec!["fixed fake metadata result".to_owned()],
+        },
+    );
+
+    assert_eq!(
+        report.disposition,
+        RootlessPodmanPreflightDisposition::ChangesRequired
+    );
+    assert_eq!(
+        report.executables[0].state,
+        RootlessPodmanPreflightState::Absent
+    );
+}
+
+#[test]
+fn unsafe_runtime_root_is_rejected() {
+    for path in ["run/user", "/", "/run/../user", "/run/user/"] {
+        assert!(RootlessPodmanPreflightPaths::new(path).is_err());
+    }
+}
