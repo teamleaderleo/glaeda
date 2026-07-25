@@ -13,7 +13,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  capture-clippy:
+  apply-clippy-fix:
     if: github.head_ref == 'codex/durable-lane-journal-adapter'
     runs-on: ubuntu-24.04
     steps:
@@ -22,20 +22,19 @@ jobs:
         with:
           ref: codex/durable-lane-journal-adapter
           fetch-depth: 0
-      - name: Capture bounded Clippy output
+      - name: Apply focused fix and publish clean branch
         run: |
-          set +e
-          cargo clippy --locked --all-targets --all-features -- -D warnings > .github/pr137-clippy.txt 2>&1
-          status=$?
-          set -e
-          tail -c 32768 .github/pr137-clippy.txt > .github/pr137-clippy.tail
-          mv .github/pr137-clippy.tail .github/pr137-clippy.txt
+          python3 .github/fix-pr137-clippy.py
+          cargo fmt --all
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cargo test --locked --all-targets --all-features
+          git checkout origin/main -- .github/workflows/ci.yml
+          rm -f .github/fix-pr137-clippy.py .github/pr137-clippy.txt
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add .github/pr137-clippy.txt
-          git commit -m 'Capture durable lane Clippy diagnostic'
+          git add -A
+          git commit -m 'Fix durable lane adapter test binding'
           git push origin HEAD:codex/durable-lane-journal-adapter
-          exit $status
 
   verify:
     runs-on: ubuntu-24.04
@@ -53,3 +52,5 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Run Clippy
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Run tests
+        run: cargo test --locked --all-targets --all-features
