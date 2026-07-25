@@ -24,6 +24,7 @@ jobs:
       - name: Install Rust toolchain
         run: rustup show active-toolchain
 
+      # Cross-check the documented Apple Silicon Lima guest target.
       - name: Install ARM64 Linux target
         run: rustup target add aarch64-unknown-linux-gnu
 
