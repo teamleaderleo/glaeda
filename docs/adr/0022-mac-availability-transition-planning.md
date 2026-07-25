@@ -63,6 +63,7 @@ Concurrency remains one until field measurements justify changing it.
 - Away mode initially requires AC power and normal memory pressure.
 - Active mode may tolerate elevated memory pressure but does not start while pressure is critical or unknown.
 - Off remains available under resource pressure, but still requires fresh idle-job evidence.
+- An effective off observation requires a stopped VM and proven idle job activity; active activity is conflicting and unknown activity remains blocking uncertainty.
 - Operator hold, stale observation, unknown VM state, unknown job activity, or mode/power inconsistency fails closed.
 - Auto mode returns a stable `manual_policy_required` disposition until idle detection, power and memory observation, hysteresis, dwell time, and drain behaviour are implemented and reviewed.
 
