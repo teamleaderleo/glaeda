@@ -5,7 +5,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use smolrunner::doctor::{inspect_host, render_human as render_doctor};
 #[cfg(target_os = "linux")]
-use smolrunner::host_readiness::{inspect_host_readiness, render_human as render_host_plan};
+use smolrunner::host_readiness::inspect_host_readiness;
+#[cfg(target_os = "linux")]
+use smolrunner::host_readiness_verdict::{assess, render_human as render_host_plan};
 use smolrunner::manifest::{ManifestError, load};
 use smolrunner::plan::{build, render_human as render_plan};
 #[cfg(target_os = "linux")]
@@ -156,11 +158,12 @@ fn run_host_plan(output: OutputFormat, file: &Path, account_file: Option<&Path>)
             return ExitCode::from(2);
         }
     };
+    let assessment = assess(&report);
 
     match output {
-        OutputFormat::Human => print!("{}", render_host_plan(&report)),
+        OutputFormat::Human => print!("{}", render_host_plan(&assessment)),
         OutputFormat::Json => {
-            if print_json(&report).is_err() {
+            if print_json(&assessment).is_err() {
                 return ExitCode::from(2);
             }
         }
