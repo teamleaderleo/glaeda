@@ -3,8 +3,9 @@ use smolrunner::durable_journal::{
     execute_plan_durably,
 };
 use smolrunner::journal::{
-    ActionFailure, ActionOutcome, ActionReceipt, ExecutionJournal, ExecutionLane, JournalRecord,
-    MutationExecutor, PlannedMutation, Preconditions, RollbackClass, JOURNAL_SCHEMA_VERSION,
+    ActionFailure, ActionOutcome, ActionReceipt, ExecutionJournal, ExecutionLane,
+    JOURNAL_SCHEMA_VERSION, JournalRecord, MutationExecutor, PlannedMutation, Preconditions,
+    RollbackClass,
 };
 
 #[derive(Debug, Default)]
@@ -234,7 +235,10 @@ fn rerun_refuses_to_replace_interrupted_evidence_before_execution() {
     assert_eq!(error.last_durable(), None);
     assert_eq!(checkpoint.existing, interrupted);
     assert_eq!(checkpoint.attempted.len(), 1);
-    assert_eq!(checkpoint.attempted[0].records[0].outcome, ActionOutcome::Pending);
+    assert_eq!(
+        checkpoint.attempted[0].records[0].outcome,
+        ActionOutcome::Pending
+    );
     assert!(executor.execute_calls.is_empty());
     assert!(executor.rollback_calls.is_empty());
 }
