@@ -182,6 +182,8 @@ pub fn plan_availability_transition(
         ));
     }
 
+    classify_off_job_consistency(observation, &mut blockers);
+
     if requested_mode == AvailabilityRequest::Auto {
         if blockers.is_empty() {
             blockers.push(blocker(
@@ -269,6 +271,26 @@ pub fn render_human(plan: &MacAvailabilityPlan) -> String {
     output
 }
 
+fn classify_off_job_consistency(
+    observation: MacAvailabilityObservation,
+    blockers: &mut Vec<AvailabilityBlocker>,
+) {
+    if observation.effective_mode != EffectiveAvailabilityMode::Off {
+        return;
+    }
+    match observation.job_activity {
+        JobActivity::Idle => {}
+        JobActivity::Active => blockers.push(blocker(
+            AvailabilityBlockerKind::InconsistentEffectiveState,
+            "the VM is off but runner job activity is reported as active",
+        )),
+        JobActivity::Unknown => blockers.push(blocker(
+            AvailabilityBlockerKind::UnknownJobActivity,
+            "the VM is off but runner job activity is unknown; prove the listener idle",
+        )),
+    }
+}
+
 fn classify_start_capacity(
     observation: MacAvailabilityObservation,
     requested_mode: AvailabilityRequest,
@@ -325,7 +347,9 @@ fn classify_job_barrier(
     requested_mode: AvailabilityRequest,
     blockers: &mut Vec<AvailabilityBlocker>,
 ) {
-    if request_matches_effective(requested_mode, observation.effective_mode) {
+    if observation.effective_mode == EffectiveAvailabilityMode::Off
+        || request_matches_effective(requested_mode, observation.effective_mode)
+    {
         return;
     }
     match observation.job_activity {
@@ -545,6 +569,56 @@ mod tests {
 
         assert_eq!(plan.disposition, AvailabilityDisposition::NoChange);
         assert!(plan.actions.is_empty());
+        assert!(plan.blockers.is_empty());
+    }
+
+    #[test]
+    fn off_idle_matching_request_is_no_change() {
+        let plan = plan_availability_transition(
+            observation(EffectiveAvailabilityMode::Off),
+            AvailabilityRequest::Off,
+        );
+
+        assert_eq!(plan.disposition, AvailabilityDisposition::NoChange);
+        assert!(plan.blockers.is_empty());
+    }
+
+    #[test]
+    fn off_active_job_is_inconsistent_and_blocked() {
+        let mut facts = observation(EffectiveAvailabilityMode::Off);
+        facts.job_activity = JobActivity::Active;
+
+        let plan = plan_availability_transition(facts, AvailabilityRequest::Off);
+
+        assert_eq!(plan.disposition, AvailabilityDisposition::Blocked);
+        assert!(plan.blockers.iter().any(|blocker| {
+            blocker.kind == AvailabilityBlockerKind::InconsistentEffectiveState
+        }));
+    }
+
+    #[test]
+    fn off_unknown_job_activity_is_explicitly_blocked() {
+        let mut facts = observation(EffectiveAvailabilityMode::Off);
+        facts.job_activity = JobActivity::Unknown;
+
+        let plan = plan_availability_transition(facts, AvailabilityRequest::Off);
+
+        assert_eq!(plan.disposition, AvailabilityDisposition::Blocked);
+        assert!(
+            plan.blockers
+                .iter()
+                .any(|blocker| blocker.kind == AvailabilityBlockerKind::UnknownJobActivity)
+        );
+    }
+
+    #[test]
+    fn matching_running_mode_allows_an_active_job() {
+        let mut facts = observation(EffectiveAvailabilityMode::Active);
+        facts.job_activity = JobActivity::Active;
+
+        let plan = plan_availability_transition(facts, AvailabilityRequest::Active);
+
+        assert_eq!(plan.disposition, AvailabilityDisposition::NoChange);
         assert!(plan.blockers.is_empty());
     }
 
