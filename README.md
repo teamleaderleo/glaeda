@@ -193,3 +193,7 @@ cargo run --locked --quiet -- --output json host plan --file examples/quarry.yml
 ## Project status
 
 The first milestone is a dependable diagnostic and desired-state foundation. Runner lifecycle, disposable execution, and small-fleet operations come before leased previews or worker-pool coordination. A dashboard and broader distribution support remain deferred until the CLI and security model have proven themselves.
+
+## License
+
+SmolRunner is licensed under the [Apache License, Version 2.0](LICENSE).
