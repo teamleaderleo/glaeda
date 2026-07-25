@@ -161,8 +161,8 @@ notify_doctor() {
     *) body="Doctor failed with exit status ${status}." ;;
   esac
 
-  [ -n "${CMUX_WORKSPACE_ID:-}" ] || return
-  cmux_cli="$(find_cmux_cli)" || return
+  [ -n "${CMUX_WORKSPACE_ID:-}" ] || return 0
+  cmux_cli="$(find_cmux_cli)" || return 0
   "${cmux_cli}" notify --title 'SmolRunner doctor' --body "${body}" >/dev/null
 }
 
