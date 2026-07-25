@@ -4,7 +4,7 @@ This is the short operator path for the existing `smolrunner` Lima development V
 
 Run commands from the SmolRunner checkout on the Mac.
 
-## One-command workspace
+## Default tmux workspace
 
 ```bash
 make work
@@ -36,6 +36,41 @@ Override the tmux session name when needed:
 SMOLRUNNER_WORK_SESSION=another-session make work
 ```
 
+`make work-tmux` remains an explicit alias for this compatibility path.
+
+## Opt-in cmux workspace
+
+cmux remains opt-in until the launcher completes hands-on acceptance on the target Apple Silicon Mac.
+
+Install cmux explicitly, start the existing VM, and open the workspace:
+
+```bash
+make work-cmux-setup
+```
+
+The setup command:
+
+- installs cmux through the reviewed `manaflow-ai/cmux` Homebrew cask when missing;
+- installs Lima through Homebrew when `limactl` is missing;
+- starts the existing `smolrunner` Lima instance;
+- opens a cmux workspace named `smolrunner` with a `Mac host` terminal and a `Lima VM` terminal.
+
+After cmux is installed, open or select that workspace with:
+
+```bash
+make work-cmux
+```
+
+Override the workspace name when needed:
+
+```bash
+SMOLRUNNER_WORK_SESSION=another-session make work-cmux
+```
+
+cmux may trigger the standard macOS Automation permission prompt when the invoking terminal first asks cmux to create or select the workspace. The launcher uses cmux's macOS scripting interface to find or create the human-facing workspace. Commands that rename the workspace and terminal tabs run inside cmux, so the helper leaves socket access unchanged and never enables broad external control.
+
+The Lima guest receives no cmux socket, Mac filesystem mount, SSH agent, or copied credential. cmux provides the vertical workspace sidebar, split panes, session restoration, and attention indicators while remaining a human-facing view over SmolRunner commands.
+
 ## Open only the VM
 
 ```bash
@@ -48,7 +83,7 @@ This starts the existing `smolrunner` instance when needed and opens an interact
 limactl shell smolrunner
 ```
 
-`make vm-tmux` remains available for an optional tmux session inside the Linux guest. The default `make work` flow intentionally runs tmux on macOS instead.
+`make vm-tmux` remains available for an optional tmux session inside the Linux guest.
 
 ## Everyday commands
 
@@ -60,10 +95,12 @@ make vm-observe  # read-only Mac and guest resource report
 make vm-stop     # graceful VM stop
 ```
 
+When `make vm-doctor` runs from a cmux terminal, completion or failure also produces a fixed cmux notification. The notification contains only the bounded result and exit status; doctor output remains in the terminal. Outside cmux, notification delivery is a silent no-op.
+
 The full wrappers are also available directly:
 
 ```bash
-bash scripts/macbook-workspace.sh
+bash scripts/macbook-workspace.sh help
 bash scripts/macbook-runner-vm.sh help
 bash scripts/macbook-runner-vm.sh exec -- /usr/bin/uname -m
 ```
@@ -105,6 +142,7 @@ The VM is currently a development and field-validation environment:
 - ARM64 Ubuntu, systemd, cgroup v2, Rust, and rootless Podman are working;
 - GitHub-hosted runners still execute the repository's ordinary Actions workflows;
 - no official Actions listener is registered in this Lima VM;
+- cmux remains a human-facing view and never becomes privileged execution transport;
 - no project bootstrap, runner registration, automatic update, or production deployment authority is implied by these shortcuts.
 
 Repository-specific dependency installation and verification remain repository-owned. SmolRunner will eventually provide the surrounding one-command host, runner, release-channel, rollback, and disposable-execution lifecycle after the reviewed preparation and registration paths exist.

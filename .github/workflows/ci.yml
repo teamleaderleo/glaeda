@@ -26,8 +26,15 @@ jobs:
           bash -n \
             scripts/macbook-runner-bootstrap.sh \
             scripts/macbook-runner-observe.sh \
+            scripts/macbook-workspace.sh \
             scripts/test-macbook-runner-bootstrap.sh
           bash scripts/test-macbook-runner-bootstrap.sh
+          bash scripts/macbook-workspace.sh help >/dev/null
+          bash scripts/macbook-workspace.sh notify-doctor 0
+          if grep -Eq 'allowAll|openAccess|CMUX_SOCKET_(PATH|PASSWORD)' scripts/macbook-workspace.sh; then
+            printf 'error: Mac workspace helper widens cmux socket authority\n' >&2
+            exit 1
+          fi
 
       - name: Install Rust toolchain
         run: rustup show active-toolchain
