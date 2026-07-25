@@ -1,0 +1,27 @@
+name: Format Mac availability
+
+on:
+  push:
+    branches: [feat/mac-availability-planning]
+
+permissions:
+  contents: read
+
+jobs:
+  format:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Format source
+        run: cargo fmt --all
+
+      - name: Upload formatted source
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: formatted-mac-availability
+          path: src/mac_availability.rs
+          retention-days: 1
