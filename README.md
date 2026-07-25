@@ -95,6 +95,8 @@ The ownership model protects existing infrastructure from name-based adoption. A
 
 Canonical constructors now define exact locators and minimum evidence for Linux users, managed directories, systemd services, official runner installations, rootless Podman images, and GitHub runner registrations. Desired identities cannot be created from names, mutable image tags, or labels alone; partial observations may omit evidence only so ownership classification can return `unknown`. The model also records which execution lane must collect each observation and which evidence survives host restore, repository transfer, or runner re-registration. See [ADR 0003](docs/adr/0003-canonical-resource-evidence.md).
 
+The long-term [reliable control-loop operating model](docs/OPERATING_MODEL.md) keeps the external interface small while separating development, canary, and stable releases; defining drain and rollback; bounding incident evidence; preserving backup and recovery; and requiring host-local vetoes, repair budgets, fresh verification, and circuit breakers before any self-healing or fleet-directed mutation.
+
 ## Exploratory expansion
 
 The runner-steward work remains SmolRunner's foundation. A later optional layer may use the same host ownership and isolation model for leased workspaces and temporary previews.
@@ -121,7 +123,7 @@ State reconciliation now distinguishes executable work, an already satisfied goa
 
 Lease records now have a process-durable Linux adapter beneath each installation. It validates filesystem ownership and permissions, serializes writers with a persistent lock, and publishes private versioned documents through synchronized atomic rename. See [ADR 0013](docs/adr/0013-durable-linux-lease-store.md).
 
-See [leased execution and previews](docs/LEASED_EXECUTION.md) and the updated [roadmap](docs/ROADMAP.md).
+See [leased execution and previews](docs/LEASED_EXECUTION.md), the [reliable control-loop operating model](docs/OPERATING_MODEL.md), and the updated [roadmap](docs/ROADMAP.md).
 
 ## Intended workflow
 
@@ -138,6 +140,8 @@ smolrunner status
 smolrunner remove
 ```
 
+Later reliability commands such as upgrade, rollback, incident, backup, restore, and quarantine should preserve the same plan-before-mutation and stable-JSON contract rather than exposing the internal machinery directly.
+
 ## Design principles
 
 - **Official runner, managed safely.** SmolRunner does not reimplement the GitHub Actions protocol.
@@ -147,7 +151,7 @@ smolrunner remove
 - **Secure defaults.** Fork execution, host sockets, untracked files, and secret inheritance are denied by default.
 - **Boring infrastructure.** Debian or Ubuntu, systemd, cgroup v2, Podman, and one native binary.
 - **Human and agent friendly.** Stable JSON is a first-class interface, not terminal output scraped after the fact.
-- **Stay smol.** No mandatory daemon, database, dashboard, cloud controller, or Kubernetes cluster.
+- **Stay smol.** No mandatory daemon, database, dashboard, cloud controller, or Kubernetes cluster; reliability machinery stays behind an explicit compact interface.
 
 ## Development
 
@@ -168,6 +172,7 @@ cargo run --locked --quiet -- --output json host plan --file examples/quarry.yml
 - [Threat model](docs/THREAT_MODEL.md)
 - [Manifest reference](docs/MANIFEST.md)
 - [Host reconciliation](docs/HOST_RECONCILIATION.md)
+- [Reliable control loop and fleet operating model](docs/OPERATING_MODEL.md)
 - [Leased execution and previews](docs/LEASED_EXECUTION.md)
 - [ADR 0001: privilege, adoption, and rollback](docs/adr/0001-privilege-adoption-and-rollback.md)
 - [ADR 0002: durable ownership and state identity](docs/adr/0002-durable-ownership-state.md)
