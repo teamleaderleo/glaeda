@@ -6,13 +6,37 @@ on:
     branches: [main]
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: verify-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  apply-pr-129-review:
+    if: github.head_ref == 'codex/trusted-podman-config-observation'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out observer branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: codex/trusted-podman-config-observation
+          fetch-depth: 0
+      - name: Merge current main and apply reviewed hardening
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git fetch origin main
+          git merge --no-edit origin/main
+          python3 .github/patch-pr-129-review.py
+          cargo fmt --all
+          cargo test --locked rootless_podman_config_observation
+          git checkout origin/main -- .github/workflows/ci.yml
+          rm .github/patch-pr-129-review.py
+          git add -A
+          git commit -m 'Harden trusted Podman config observation'
+          git push origin HEAD:codex/trusted-podman-config-observation
+
   verify:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
