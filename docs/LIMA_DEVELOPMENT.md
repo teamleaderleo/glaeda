@@ -14,17 +14,19 @@ make vm
 make vm-stop
 ```
 
-`vm-create` installs Lima with Homebrew when necessary and creates the `smolrunner` instance from `examples/lima/smolrunner-interactive.yaml`. It preserves an existing instance and never deletes or replaces one.
+`vm-create` installs Lima with Homebrew when necessary and creates the `smolrunner` instance from `examples/lima/smolrunner-interactive.yaml`. It preserves an existing instance and never deletes or replaces one. Existence is checked through `limactl`; a stray or stale directory is not accepted as an instance.
 
-`vm-bootstrap` starts the instance and idempotently prepares a development guest. It installs Ubuntu build and rootless-Podman prerequisites, disables unused rootful Podman socket and automatic-update units, installs the stable Rust toolchain with rustup when absent, creates or safely fast-forwards the guest checkout, builds with the committed lockfile, and runs `smolrunner doctor`.
+`vm-bootstrap` starts the instance and idempotently prepares a development guest. Before package installation or repository execution, it verifies that the running guest is ARM64 and has no Lima host-filesystem mounts. It then installs Ubuntu build and rootless-Podman prerequisites, disables unused rootful Podman socket and automatic-update units, installs the stable Rust toolchain with rustup when absent, creates or safely fast-forwards the guest checkout, builds with the committed lockfile, and runs `smolrunner doctor`.
 
-`vm-check` is read-only. It reports host and guest resource use, rejects broad host mounts and an active rootful Podman socket, prints the rootless Podman execution mode, checks the guest checkout, and runs `smolrunner doctor`.
+`vm-check` is read-only. It repeats the guest-isolation check, reports host and guest resource use, rejects an active rootful Podman socket, prints the rootless Podman execution mode, checks the guest checkout, and runs `smolrunner doctor`.
 
 The existing `vm`, `vm-up`, `vm-tmux`, `vm-status`, `vm-sync`, `vm-doctor`, `vm-observe`, and `vm-stop` commands remain available for normal operation.
 
 ## Safety boundary
 
 The checked-in template deliberately uses native Apple Virtualization (`vz`) with an ARM64 Ubuntu guest, no host directory mounts, no port forwarding, no Rosetta, no containerd, no SSH-agent forwarding, and no inherited proxy environment.
+
+An existing instance is not assumed to match that template merely because its name is `smolrunner`. `vm-bootstrap` fails before `apt`, Git, Cargo, or Podman execution when the guest exposes a Lima host mount or is not ARM64. This matters because the Lima login user has passwordless sudo and repository builds may execute build scripts.
 
 The bootstrap does not:
 
@@ -50,6 +52,15 @@ SMOLRUNNER_LIMA_CONFIG
 ```
 
 The defaults are the `smolrunner` instance, `/home/lima/smolrunner`, this repository's HTTPS URL, the `main` branch, and the checked-in Lima template.
+
+Overrides are deliberately narrow:
+
+- the instance name must be a simple non-option Lima name;
+- the checkout must be a lexical child of `/home/lima`;
+- the repository URL must be public HTTPS without embedded credentials;
+- the branch must pass a safe host-side subset and Git's exact `check-ref-format --branch` validation before checkout.
+
+These checks prevent option injection, accidental credential persistence in `.git/config`, and cloning or building into arbitrary guest paths. An override still identifies trusted development input; the helper does not authenticate arbitrary source code.
 
 ## Future convergence
 
