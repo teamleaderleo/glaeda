@@ -36,6 +36,7 @@ The runner-steward design remains the foundation. Later milestones may extend th
   - [x] Runner account observation integration with read-only host plans.
   - [x] Define the read-only rootless Podman readiness contract and fail-closed probe sequence.
   - [ ] Implement rootless Podman readiness observation in `host plan`.
+  - [ ] Reconcile non-overlapping subordinate UID/GID ranges and refresh rootless Podman after mapping changes ([#103](https://github.com/teamleaderleo/smolrunner/issues/103)).
   - [ ] Durable package and account reconciliation execution.
 
 ## Milestone 2 — runner lifecycle
