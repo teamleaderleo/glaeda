@@ -29,12 +29,6 @@ reviews:
       - "[skip review]"
 
   path_instructions:
-    - path: "**/*.rs"
-      instructions: |
-        Do not request doc comments or ordinary comments that merely restate names, types, parameters, or implementation.
-        Treat missing documentation alone as non-actionable.
-        Request documentation only for a public contract, a non-obvious safety or lifecycle invariant, a persisted or wire format, a compatibility constraint, or behavior that cannot be understood reliably from the code and tests.
-
     - path: "src/lane_*.rs"
       instructions: |
         Apply the privilege and execution rules in AGENTS.md strictly.
