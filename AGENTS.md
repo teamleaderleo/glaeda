@@ -70,3 +70,13 @@ A doctor warning is acceptable on a development machine that lacks Podman or sys
 ## Pull requests
 
 Keep changes small enough to review. State the security impact, commands run, and any host assumptions. Do not claim a VPS, GitHub runner, Podman preview, route, or provider path passed unless the exact tested commit and result are available.
+
+## Automated review workflow
+
+- CodeRabbit is already configured to review non-draft pull requests automatically. Do not manually invoke it after every push.
+- Keep implementation and temporary verification pull requests in draft while actively iterating. Mark the final coherent pull request ready only after the required checks pass.
+- Do not request Codex GitHub reviews or mention `@codex review`. Codex usage is reserved for explicit implementation work requested by the human operator.
+- Retrigger CodeRabbit only when the human operator asks or when a required review failed for a transient service reason.
+- Verify every automated finding against the current code and accepted ADRs. Prioritize demonstrated privilege, ownership, persistence, rollback, race, security, data-loss, and correctness failures.
+- Ignore or explain away speculative style, blanket documentation, duplication, and refactoring suggestions that do not improve behavior or reduce a concrete maintenance risk.
+- Use the `review-exempt` label or `[skip review]` in the title for temporary verification pull requests, mechanical configuration changes, and other changes where automated review would add little value.
