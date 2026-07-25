@@ -1,10 +1,19 @@
-.PHONY: work vm vm-up vm-tmux vm-status vm-sync vm-doctor vm-observe vm-stop
+.PHONY: work vm vm-create vm-bootstrap vm-check vm-up vm-tmux vm-status vm-sync vm-doctor vm-observe vm-stop
 
 work:
 	@bash scripts/macbook-workspace.sh
 
 vm:
 	@bash scripts/macbook-runner-vm.sh shell
+
+vm-create:
+	@bash scripts/macbook-runner-bootstrap.sh create
+
+vm-bootstrap:
+	@bash scripts/macbook-runner-bootstrap.sh bootstrap
+
+vm-check:
+	@bash scripts/macbook-runner-bootstrap.sh check
 
 vm-up:
 	@bash scripts/macbook-runner-vm.sh up
