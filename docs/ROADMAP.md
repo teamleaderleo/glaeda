@@ -30,9 +30,10 @@ The runner-steward design remains the foundation. Later milestones may extend th
 - [ ] Debian and Ubuntu host preparation.
   - [x] Conservative prerequisite package planning with exact distribution identity, package observations, rollback class, and reviewed `apt-get` argv.
   - [x] Bounded package-state probing and host-plan CLI integration.
+  - [x] Classify successful, nonzero, refused, and uncertain package attempts with mandatory fresh-observation recovery barriers.
   - [x] Dependency-aware runner account, subordinate-ID, home-directory, and linger preparation planning.
   - [x] Bounded account/group/home/subordinate-ID/linger observation.
-  - [ ] Runner account observation integration with read-only host plans.
+  - [x] Runner account observation integration with read-only host plans.
   - [ ] Durable package and account reconciliation execution.
 
 ## Milestone 2 — runner lifecycle
