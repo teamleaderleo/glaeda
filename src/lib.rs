@@ -60,7 +60,7 @@ pub mod process;
 pub mod resource;
 #[cfg(target_os = "linux")]
 pub mod rootless_podman_config;
-/// Pure, bounded, fail-closed resolution and preflight assessment of reviewed Podman config.
+/// Pure, bounded, fail-closed precedence resolution and preflight assessment of Podman config.
 #[cfg(target_os = "linux")]
 pub mod rootless_podman_config_resolution;
 #[cfg(target_os = "linux")]
