@@ -31,14 +31,35 @@ jobs:
           block = '\n'.join(line[10:] if line.startswith('          ') else line for line in source[run_line + 1:end])
           Path('/tmp/apply-host-podman-composition.sh').write_text(block + '\n')
           PY
-          bash /tmp/apply-host-podman-composition.sh
+          set +e
+          bash /tmp/apply-host-podman-composition.sh > composition.log 2>&1
+          status=$?
+          set -e
+          printf '%s\n' "$status" > composition.status
+
+      - name: Upload bounded composition diagnostic
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: host-podman-composition-diagnostic
+          path: |
+            composition.log
+            composition.status
+          retention-days: 1
 
       - name: Commit exact composed output
         run: |
           set -euo pipefail
+          if [[ "$(cat composition.status)" != 0 ]]; then
+            exit 0
+          fi
           git diff --check
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add src/lib.rs src/host_readiness.rs src/host_readiness_verdict.rs src/host_rootless_podman.rs src/host_rootless_podman/tests.rs
           git commit -m 'Compose Podman configuration into host planning'
           git push origin HEAD:feat/compose-podman-config-host-plan
+
+      - name: Fail when composition failed
+        run: |
+          set -euo pipefail
+          test "$(cat composition.status)" = 0
