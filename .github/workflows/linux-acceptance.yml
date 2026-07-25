@@ -1,5 +1,6 @@
 name: Linux acceptance
 
+# One-use PR 127 materialisation; restored from main by the patch job.
 on:
   pull_request:
     paths:
