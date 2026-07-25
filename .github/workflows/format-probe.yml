@@ -1,8 +1,11 @@
 name: Format probe
 
 on:
-  push:
-    branches: [codex/linux-acceptance-format-probe]
+  pull_request:
+    paths:
+      - .github/workflows/format-probe.yml
+      - tests/durable_journal_recovery.rs
+      - tests/linux_acceptance.rs
 
 permissions:
   contents: read
