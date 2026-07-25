@@ -220,7 +220,10 @@ fn conflicting_configuration_blocks_preflight() {
         report.configuration.state,
         RootlessPodmanPreflightState::Conflicting
     );
-    assert_eq!(report.disposition, RootlessPodmanPreflightDisposition::Blocked);
+    assert_eq!(
+        report.disposition,
+        RootlessPodmanPreflightDisposition::Blocked
+    );
 }
 
 #[test]
@@ -269,7 +272,10 @@ fn absent_configuration_requires_changes() {
         &matching_executable,
     );
 
-    assert_eq!(report.configuration.state, RootlessPodmanPreflightState::Absent);
+    assert_eq!(
+        report.configuration.state,
+        RootlessPodmanPreflightState::Absent
+    );
     assert_eq!(
         report.disposition,
         RootlessPodmanPreflightDisposition::ChangesRequired
