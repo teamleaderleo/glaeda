@@ -1,7 +1,41 @@
 use std::collections::BTreeMap;
+use std::fs;
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::*;
 use crate::rootless_podman_config_resolution::RootlessPodmanConfigAssessmentState;
+
+static NEXT_TEMP_TREE: AtomicU64 = AtomicU64::new(1);
+
+struct TempTree(PathBuf);
+
+impl TempTree {
+    fn new() -> Self {
+        let sequence = NEXT_TEMP_TREE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::current_dir()
+            .expect("current directory")
+            .join("target")
+            .join(format!(
+                "smolrunner-podman-config-observation-{}-{sequence}",
+                std::process::id()
+            ));
+        fs::create_dir_all(&path).expect("create temporary tree");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+            .expect("secure temporary tree");
+        Self(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempTree {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
 
 #[derive(Default)]
 struct FakeFilesystem {
@@ -238,6 +272,116 @@ fn context_derives_runner_sources_beneath_reviewed_xdg_config_home() {
     assert_eq!(
         context.runner_storage_path(),
         Path::new("/var/lib/project-runner/.config/containers/storage.conf")
+    );
+}
+
+#[test]
+fn linux_reader_enforces_no_follow_metadata_and_size_policy() {
+    let tree = TempTree::new();
+    let home = tree.path().join("home");
+    let config_home = home.join(".config");
+    let containers = config_home.join("containers");
+    let data_home = home.join(".local/share");
+    fs::create_dir_all(&containers).expect("create config directories");
+    fs::create_dir_all(&data_home).expect("create data directories");
+    for directory in [&home, &config_home, &containers, &data_home] {
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
+            .expect("secure directory");
+    }
+
+    let metadata = fs::metadata(tree.path()).expect("temporary tree metadata");
+    let uid = metadata.uid();
+    let gid = metadata.gid();
+    if uid == 0 || gid == 0 {
+        return;
+    }
+    let expected_owner = ExpectedOwner::Runner { uid, gid };
+    let source = containers.join("containers.conf");
+    let valid = b"[engine]\ncgroup_manager = \"systemd\"\n";
+
+    assert_eq!(
+        read_linux_config(&source, expected_owner),
+        TrustedConfigRead::Missing
+    );
+
+    fs::write(&source, valid).expect("write safe source");
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).expect("secure source");
+    assert_eq!(
+        read_linux_config(&source, expected_owner),
+        TrustedConfigRead::Present(valid.to_vec())
+    );
+
+    let wrong_uid = if uid == u32::MAX { uid - 1 } else { uid + 1 };
+    assert_eq!(
+        read_linux_config(
+            &source,
+            ExpectedOwner::Runner {
+                uid: wrong_uid,
+                gid,
+            },
+        ),
+        TrustedConfigRead::Unknown(RootlessPodmanConfigSourceProblemKind::WrongOwner)
+    );
+
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o620))
+        .expect("make source group writable");
+    assert_eq!(
+        read_linux_config(&source, expected_owner),
+        TrustedConfigRead::Unknown(RootlessPodmanConfigSourceProblemKind::WritableByUntrusted)
+    );
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).expect("restore source mode");
+
+    let hard_link = containers.join("linked.conf");
+    fs::hard_link(&source, &hard_link).expect("create hard link");
+    assert_eq!(
+        read_linux_config(&source, expected_owner),
+        TrustedConfigRead::Unknown(RootlessPodmanConfigSourceProblemKind::MultipleHardLinks)
+    );
+    fs::remove_file(&hard_link).expect("remove hard link");
+
+    fs::write(&source, vec![b'x'; MAX_ROOTLESS_PODMAN_CONFIG_BYTES + 1])
+        .expect("write oversized source");
+    assert_eq!(
+        read_linux_config(&source, expected_owner),
+        TrustedConfigRead::Unknown(RootlessPodmanConfigSourceProblemKind::Oversized)
+    );
+
+    fs::remove_file(&source).expect("remove oversized source");
+    fs::create_dir(&source).expect("create directory at source path");
+    assert_eq!(
+        read_linux_config(&source, expected_owner),
+        TrustedConfigRead::Unknown(RootlessPodmanConfigSourceProblemKind::NonRegularFile)
+    );
+    fs::remove_dir(&source).expect("remove source directory");
+
+    symlink("/etc/passwd", &source).expect("create final symlink");
+    assert_eq!(
+        read_linux_config(&source, expected_owner),
+        TrustedConfigRead::Unknown(
+            RootlessPodmanConfigSourceProblemKind::SymlinkOrInvalidObject
+        )
+    );
+    fs::remove_file(&source).expect("remove final symlink");
+
+    fs::write(&source, valid).expect("rewrite safe source");
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).expect("secure source");
+    fs::set_permissions(&containers, fs::Permissions::from_mode(0o720))
+        .expect("make parent group writable");
+    assert_eq!(
+        read_linux_config(&source, expected_owner),
+        TrustedConfigRead::Unknown(RootlessPodmanConfigSourceProblemKind::UnsafeParentDirectory)
+    );
+    fs::set_permissions(&containers, fs::Permissions::from_mode(0o700))
+        .expect("restore parent mode");
+
+    let real_containers = config_home.join("real-containers");
+    fs::rename(&containers, &real_containers).expect("move real directory");
+    symlink(&real_containers, &containers).expect("create parent symlink");
+    assert_eq!(
+        read_linux_config(&source, expected_owner),
+        TrustedConfigRead::Unknown(
+            RootlessPodmanConfigSourceProblemKind::SymlinkOrInvalidObject
+        )
     );
 }
 
