@@ -31,6 +31,26 @@ jobs:
           end = next(i for i in range(run_line + 1, len(source)) if source[i].startswith('      - name:'))
           block = '\n'.join(line[10:] if line.startswith('          ') else line for line in source[run_line + 1:end])
           block = re.sub(r"\n[ \t]+'''\n", "\n'''\n", block)
+          exact_marker = (
+              "marker = '''    fn executable(state: HostObservationState) -> ExactExecutableObservation {\n"
+              "        ExactExecutableObservation {\n"
+              "            name: \"git\".to_owned(),\n"
+              "            path: \"/usr/bin/git\".into(),\n"
+              "            state,\n"
+              "            evidence: vec![\"deterministic executable evidence\".to_owned()],\n"
+              "        }\n"
+              "    }\n"
+              "'''\nhelper ="
+          )
+          block, replacements = re.subn(
+              r"marker = '''    fn executable\(state: HostObservationState\) -> ExactExecutableObservation \{.*?'''\nhelper =",
+              exact_marker,
+              block,
+              count=1,
+              flags=re.DOTALL,
+          )
+          if replacements != 1:
+              raise SystemExit(f'executable marker repair: expected one match, found {replacements}')
           Path('composition-script.txt').write_text(block + '\n')
           Path('/tmp/apply-host-podman-composition.sh').write_text(block + '\n')
           PY
