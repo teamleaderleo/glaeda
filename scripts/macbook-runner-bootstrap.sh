@@ -51,6 +51,10 @@ ensure_brew() {
   die 'Homebrew is required to install Lima'
 }
 
+require_lima() {
+  command -v limactl >/dev/null 2>&1 || die 'limactl is unavailable'
+}
+
 ensure_lima() {
   if command -v limactl >/dev/null 2>&1; then
     return
@@ -139,8 +143,6 @@ fi
 # shellcheck disable=SC1091
 . "${HOME}/.cargo/env"
 rustup set profile minimal
-rustup toolchain install stable
-rustup default stable
 
 repo="${SMOLRUNNER_GUEST_REPO}"
 repo_url="${SMOLRUNNER_REPO_URL}"
@@ -165,9 +167,9 @@ else
   git -C "${repo}" merge --ff-only "origin/${repo_ref}"
 fi
 
-cargo build --locked --manifest-path "${repo}/Cargo.toml"
-cargo run --locked --quiet --manifest-path "${repo}/Cargo.toml" -- \
-  --output json doctor
+cd "${repo}"
+cargo build --locked
+cargo run --locked --quiet -- --output json doctor
 
 podman info --format json | jq -e '
   .host.security.rootless == true and
@@ -181,7 +183,7 @@ GUEST
 
 check_environment() {
   require_macos
-  ensure_lima
+  require_lima
   instance_exists || die "Lima instance '${instance}' does not exist"
   instance_running || die "Lima instance '${instance}' is stopped; run make vm-up first"
 
@@ -223,8 +225,8 @@ check_environment() {
         exit 1
       }
       git -C "$repo" status --short --branch
-      cargo run --locked --quiet --manifest-path "$repo/Cargo.toml" -- \
-        --output json doctor
+      cd "$repo"
+      cargo run --locked --quiet -- --output json doctor
     '
 }
 
