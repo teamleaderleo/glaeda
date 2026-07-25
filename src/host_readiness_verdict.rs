@@ -3,9 +3,7 @@ use serde::Serialize;
 use crate::debian_package_plan::PackagePlanDisposition;
 use crate::host_readiness::{HostObservationState, HostReadinessReport, RunnerAccountReadiness};
 use crate::runner_account_plan::{RunnerAccountPlanDisposition, RunnerAccountResourceKind};
-use crate::subordinate_id::{
-    PodmanMigrationPlan, SubordinateIdKind, SubordinatePlanDisposition,
-};
+use crate::subordinate_id::{PodmanMigrationPlan, SubordinateIdKind, SubordinatePlanDisposition};
 
 pub const HOST_READINESS_VERDICT_SCHEMA_VERSION: u8 = 1;
 
@@ -102,14 +100,14 @@ pub fn assess(report: &HostReadinessReport) -> HostReadinessAssessment<'_> {
     }
 
     match &report.runner_account {
-        RunnerAccountReadiness::NeedsConfiguration { .. } => findings.push(
-            HostReadinessFinding {
+        RunnerAccountReadiness::NeedsConfiguration { .. } => {
+            findings.push(HostReadinessFinding {
                 id: "runner-account-policy".to_owned(),
                 domain: HostReadinessDomain::RunnerAccount,
                 disposition: HostReadinessDisposition::Blocked,
                 summary: "exact runner account policy is missing".to_owned(),
-            },
-        ),
+            });
+        }
         RunnerAccountReadiness::Planned {
             plan,
             subordinate_ids,
@@ -158,8 +156,8 @@ pub fn assess(report: &HostReadinessReport) -> HostReadinessAssessment<'_> {
                     summary: "rootless Podman namespace migration is required after mapping reconciliation"
                         .to_owned(),
                 }),
-                PodmanMigrationPlan::Blocked { evidence } => findings.push(
-                    HostReadinessFinding {
+                PodmanMigrationPlan::Blocked { evidence } => {
+                    findings.push(HostReadinessFinding {
                         id: "rootless-podman-migration".to_owned(),
                         domain: HostReadinessDomain::RootlessPodman,
                         disposition: HostReadinessDisposition::Blocked,
@@ -168,8 +166,8 @@ pub fn assess(report: &HostReadinessReport) -> HostReadinessAssessment<'_> {
                         } else {
                             evidence.join("; ")
                         },
-                    },
-                ),
+                    });
+                }
             }
         }
     }
