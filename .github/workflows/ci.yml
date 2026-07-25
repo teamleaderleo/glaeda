@@ -24,6 +24,13 @@ jobs:
       - name: Install Rust toolchain
         run: rustup show active-toolchain
 
+      # Cross-check the documented Apple Silicon Lima guest target.
+      - name: Install ARM64 Linux target
+        run: rustup target add aarch64-unknown-linux-gnu
+
+      - name: Check ARM64 Linux build
+        run: cargo check --locked --target aarch64-unknown-linux-gnu
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
@@ -45,4 +52,4 @@ jobs:
       - name: Exercise read-only host planning
         run: |
           cargo run --locked --quiet -- --output json host plan --file examples/quarry.yml \
-            | jq -e '.schema_version == 1 and (.actions | length >= 2)'
+            | jq -e '.schema_version == 1 and (.executables | length == 3) and .package_plan and .runner_account'

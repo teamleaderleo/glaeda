@@ -11,6 +11,8 @@ pub mod host;
 #[cfg(target_os = "linux")]
 pub mod host_package_plan;
 #[cfg(target_os = "linux")]
+pub mod host_readiness;
+#[cfg(target_os = "linux")]
 pub mod installation_id;
 pub mod journal;
 pub mod journal_document;
@@ -53,6 +55,8 @@ pub mod podman_preview_state;
 pub mod preview;
 pub mod process;
 pub mod resource;
+#[cfg(target_os = "linux")]
+pub mod rootless_podman_preflight;
 #[cfg(target_os = "linux")]
 pub mod runner_account_observation;
 #[cfg(target_os = "linux")]

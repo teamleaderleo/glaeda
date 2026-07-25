@@ -33,7 +33,11 @@ The runner-steward design remains the foundation. Later milestones may extend th
   - [x] Classify successful, nonzero, refused, and uncertain package attempts with mandatory fresh-observation recovery barriers.
   - [x] Dependency-aware runner account, subordinate-ID, home-directory, and linger preparation planning.
   - [x] Bounded account/group/home/subordinate-ID/linger observation.
-  - [ ] Runner account observation integration with read-only host plans.
+  - [x] Runner account observation integration with read-only host plans.
+  - [x] Split non-mutating rootless Podman static preflight from journaled first-run smoke verification.
+  - [ ] Implement static rootless Podman prerequisites in `host plan` without invoking Podman.
+  - [ ] Journal first-run runner-user Podman initialization and smoke verification after durable host reconciliation exists.
+  - [ ] Reconcile non-overlapping subordinate UID/GID ranges and refresh rootless Podman after mapping changes ([#103](https://github.com/teamleaderleo/smolrunner/issues/103)).
   - [ ] Durable package and account reconciliation execution.
 
 ## Milestone 2 — runner lifecycle
