@@ -1,14 +1,15 @@
 name: Harden PR 124
 
 on:
-  pull_request:
+  push:
+    branches:
+      - codex/rootless-podman-config-resolution
 
 permissions:
   contents: write
 
 jobs:
   harden:
-    if: github.head_ref == 'codex/rootless-podman-config-resolution'
     runs-on: ubuntu-24.04
     steps:
       - name: Check out resolver branch
