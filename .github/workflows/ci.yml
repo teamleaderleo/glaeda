@@ -25,6 +25,22 @@ jobs:
           git fetch --quiet --depth=1 origin codex/debian-package-recovery
           git checkout --quiet -B codex/debian-package-recovery FETCH_HEAD
 
+      - name: Remove redundant must-use attribute
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("src/debian_package_recovery.rs")
+          text = path.read_text()
+          old = '''impl DebianPackageRecoveryReport {
+              #[must_use]
+              pub fn journal_result'''
+          new = '''impl DebianPackageRecoveryReport {
+              pub fn journal_result'''
+          if text.count(old) != 1:
+              raise SystemExit(f"expected journal_result attribute once, found {text.count(old)}")
+          path.write_text(text.replace(old, new, 1))
+          PY
+
       - name: Format source
         run: cargo fmt --all
 
