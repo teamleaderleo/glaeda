@@ -191,6 +191,7 @@ sudo apt-get install -y --no-install-recommends \
   curl \
   fuse-overlayfs \
   git \
+  iproute2 \
   jq \
   libssl-dev \
   pkg-config \
@@ -198,6 +199,25 @@ sudo apt-get install -y --no-install-recommends \
   slirp4netns \
   tmux \
   uidmap
+
+systemctl_value() {
+  systemctl "$1" "$2" 2>/dev/null || true
+}
+
+rootful_socket="/run/podman/podman.sock"
+
+socket_is_listening() {
+  sudo ss -xlHn | awk -v path="${rootful_socket}" '
+    {
+      for (field = 1; field <= NF; field++) {
+        if ($field == path) {
+          found = 1
+        }
+      }
+    }
+    END { exit(found ? 0 : 1) }
+  '
+}
 
 # SmolRunner invokes rootless Podman directly. Do not keep an unused
 # privileged API socket or tag-based auto-update path enabled.
@@ -207,7 +227,69 @@ sudo systemctl disable --now \
   podman-auto-update.timer \
   podman-auto-update.service \
   podman-restart.service >/dev/null 2>&1 || true
-sudo systemctl reset-failed podman-restart.service >/dev/null 2>&1 || true
+sudo systemctl reset-failed podman.service podman.socket podman-restart.service \
+  >/dev/null 2>&1 || true
+
+socket_enabled="$(systemctl_value is-enabled podman.socket)"
+service_enabled="$(systemctl_value is-enabled podman.service)"
+socket_active="$(systemctl_value is-active podman.socket)"
+service_active="$(systemctl_value is-active podman.service)"
+
+case "${socket_enabled}" in
+  disabled|masked) ;;
+  *)
+    printf 'error: system podman.socket has unsafe enablement state: %s\n' \
+      "${socket_enabled:-unknown}" >&2
+    exit 1
+    ;;
+esac
+case "${service_enabled}" in
+  disabled|masked) ;;
+  *)
+    printf 'error: system podman.service has unsafe enablement state: %s\n' \
+      "${service_enabled:-unknown}" >&2
+    exit 1
+    ;;
+esac
+case "${socket_active}" in
+  inactive|failed) ;;
+  *)
+    printf 'error: system podman.socket has unsafe active state: %s\n' \
+      "${socket_active:-unknown}" >&2
+    exit 1
+    ;;
+esac
+case "${service_active}" in
+  inactive|failed) ;;
+  *)
+    printf 'error: system podman.service has unsafe active state: %s\n' \
+      "${service_active:-unknown}" >&2
+    exit 1
+    ;;
+esac
+
+if socket_is_listening; then
+  printf 'error: a privileged process is listening on %s\n' "${rootful_socket}" >&2
+  exit 1
+fi
+if sudo test -L "${rootful_socket}"; then
+  printf 'error: privileged Podman socket path is a symlink: %s\n' \
+    "${rootful_socket}" >&2
+  exit 1
+fi
+if sudo test -e "${rootful_socket}"; then
+  socket_metadata="$(sudo stat -Lc '%u:%g:%F' "${rootful_socket}")"
+  IFS=: read -r socket_uid socket_gid socket_type <<<"${socket_metadata}"
+  if [ "${socket_uid}" != "0" ] || [ "${socket_gid}" != "0" ] || \
+     [ "${socket_type}" != "socket" ]; then
+    printf 'error: refusing to remove ambiguous privileged socket entry: %s (%s)\n' \
+      "${rootful_socket}" "${socket_metadata}" >&2
+    exit 1
+  fi
+  sudo rm -- "${rootful_socket}"
+  printf 'Removed proven-stale root-owned Podman socket entry: %s\n' \
+    "${rootful_socket}"
+fi
 
 if ! command -v rustup >/dev/null 2>&1; then
   printf 'Installing the Rust development toolchain with rustup.\n'
@@ -282,12 +364,92 @@ check_environment() {
     /usr/bin/bash -lc '
       set -euo pipefail
 
-      printf "rootful-podman-socket="
-      if sudo test -S /run/podman/podman.sock; then
-        printf "present\n"
+      systemctl_value() {
+        systemctl "$1" "$2" 2>/dev/null || true
+      }
+
+      rootful_socket="/run/podman/podman.sock"
+
+      socket_is_listening() {
+        sudo ss -xlHn | awk -v path="${rootful_socket}" '\''
+          {
+            for (field = 1; field <= NF; field++) {
+              if ($field == path) {
+                found = 1
+              }
+            }
+          }
+          END { exit(found ? 0 : 1) }
+        '\''
+      }
+
+      socket_enabled="$(systemctl_value is-enabled podman.socket)"
+      service_enabled="$(systemctl_value is-enabled podman.service)"
+      socket_active="$(systemctl_value is-active podman.socket)"
+      service_active="$(systemctl_value is-active podman.service)"
+
+      printf "rootful-podman-socket-unit-enabled=%s\n" \
+        "${socket_enabled:-unknown}"
+      printf "rootful-podman-service-unit-enabled=%s\n" \
+        "${service_enabled:-unknown}"
+      printf "rootful-podman-socket-unit-active=%s\n" \
+        "${socket_active:-unknown}"
+      printf "rootful-podman-service-unit-active=%s\n" \
+        "${service_active:-unknown}"
+
+      case "${socket_enabled}" in
+        disabled|masked) ;;
+        *)
+          printf "error: unsafe podman.socket enablement state\n" >&2
+          exit 1
+          ;;
+      esac
+      case "${service_enabled}" in
+        disabled|masked) ;;
+        *)
+          printf "error: unsafe podman.service enablement state\n" >&2
+          exit 1
+          ;;
+      esac
+      case "${socket_active}" in
+        inactive|failed) ;;
+        *)
+          printf "error: unsafe podman.socket active state\n" >&2
+          exit 1
+          ;;
+      esac
+      case "${service_active}" in
+        inactive|failed) ;;
+        *)
+          printf "error: unsafe podman.service active state\n" >&2
+          exit 1
+          ;;
+      esac
+
+      if socket_is_listening; then
+        printf "rootful-podman-listener=present\n"
         exit 1
       else
-        printf "absent\n"
+        printf "rootful-podman-listener=absent\n"
+      fi
+
+      if sudo test -L "${rootful_socket}"; then
+        printf "error: privileged Podman socket path is a symlink\n" >&2
+        exit 1
+      fi
+      if sudo test -e "${rootful_socket}"; then
+        socket_metadata="$(sudo stat -Lc "%u:%g:%F" "${rootful_socket}")"
+        IFS=: read -r socket_uid socket_gid socket_type <<<"${socket_metadata}"
+        if [ "${socket_uid}" = "0" ] && [ "${socket_gid}" = "0" ] && \
+           [ "${socket_type}" = "socket" ]; then
+          printf "rootful-podman-socket-entry=stale-root-owned\n"
+        else
+          printf "error: ambiguous privileged socket entry: %s\n" \
+            "${socket_metadata}" >&2
+          exit 1
+        fi
+      else
+        printf "rootful-podman-socket-entry=absent\n"
       fi
 
       podman info --format json | jq -r \
