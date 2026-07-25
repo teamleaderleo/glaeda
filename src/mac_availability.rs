@@ -197,10 +197,16 @@ pub fn plan_availability_transition(
                 blockers,
             );
         }
-        return blocked_plan(observation.effective_mode, requested_mode, target_profile, blockers);
+        return blocked_plan(
+            observation.effective_mode,
+            requested_mode,
+            target_profile,
+            blockers,
+        );
     }
 
-    if request_matches_effective(requested_mode, observation.effective_mode) && blockers.is_empty() {
+    if request_matches_effective(requested_mode, observation.effective_mode) && blockers.is_empty()
+    {
         return plan(
             observation.effective_mode,
             requested_mode,
@@ -217,7 +223,12 @@ pub fn plan_availability_transition(
     classify_job_barrier(observation, requested_mode, &mut blockers);
 
     if !blockers.is_empty() {
-        return blocked_plan(observation.effective_mode, requested_mode, target_profile, blockers);
+        return blocked_plan(
+            observation.effective_mode,
+            requested_mode,
+            target_profile,
+            blockers,
+        );
     }
 
     plan(
@@ -336,33 +347,78 @@ fn transition_actions(
 ) -> Vec<AvailabilityAction> {
     match (effective_mode, requested_mode) {
         (EffectiveAvailabilityMode::Off, AvailabilityRequest::Active) => vec![
-            action(AvailabilityActionKind::ApplyProfile, "apply the interactive Lima profile"),
+            action(
+                AvailabilityActionKind::ApplyProfile,
+                "apply the interactive Lima profile",
+            ),
             action(AvailabilityActionKind::StartVm, "start the Lima VM"),
-            action(AvailabilityActionKind::VerifyTransition, "freshly verify VM profile and runner admission state"),
+            action(
+                AvailabilityActionKind::VerifyTransition,
+                "freshly verify VM profile and runner admission state",
+            ),
         ],
         (EffectiveAvailabilityMode::Off, AvailabilityRequest::Away) => vec![
-            action(AvailabilityActionKind::ApplyProfile, "apply the away Lima profile"),
+            action(
+                AvailabilityActionKind::ApplyProfile,
+                "apply the away Lima profile",
+            ),
             action(AvailabilityActionKind::StartVm, "start the Lima VM"),
-            action(AvailabilityActionKind::VerifyTransition, "freshly verify VM profile and runner admission state"),
+            action(
+                AvailabilityActionKind::VerifyTransition,
+                "freshly verify VM profile and runner admission state",
+            ),
         ],
-        (EffectiveAvailabilityMode::Active | EffectiveAvailabilityMode::Away, AvailabilityRequest::Off) => vec![
-            action(AvailabilityActionKind::DrainRunner, "drain the runner and prove no job is active"),
+        (
+            EffectiveAvailabilityMode::Active | EffectiveAvailabilityMode::Away,
+            AvailabilityRequest::Off,
+        ) => vec![
+            action(
+                AvailabilityActionKind::DrainRunner,
+                "drain the runner and prove no job is active",
+            ),
             action(AvailabilityActionKind::StopVm, "stop the Lima VM"),
-            action(AvailabilityActionKind::VerifyTransition, "freshly verify the VM is stopped and admission remains disabled"),
+            action(
+                AvailabilityActionKind::VerifyTransition,
+                "freshly verify the VM is stopped and admission remains disabled",
+            ),
         ],
         (EffectiveAvailabilityMode::Active, AvailabilityRequest::Away) => vec![
-            action(AvailabilityActionKind::DrainRunner, "drain the runner and prove no job is active"),
-            action(AvailabilityActionKind::StopVm, "stop the Lima VM before changing its resource profile"),
-            action(AvailabilityActionKind::ApplyProfile, "apply the away Lima profile"),
+            action(
+                AvailabilityActionKind::DrainRunner,
+                "drain the runner and prove no job is active",
+            ),
+            action(
+                AvailabilityActionKind::StopVm,
+                "stop the Lima VM before changing its resource profile",
+            ),
+            action(
+                AvailabilityActionKind::ApplyProfile,
+                "apply the away Lima profile",
+            ),
             action(AvailabilityActionKind::StartVm, "start the Lima VM"),
-            action(AvailabilityActionKind::VerifyTransition, "freshly verify VM profile and runner admission state"),
+            action(
+                AvailabilityActionKind::VerifyTransition,
+                "freshly verify VM profile and runner admission state",
+            ),
         ],
         (EffectiveAvailabilityMode::Away, AvailabilityRequest::Active) => vec![
-            action(AvailabilityActionKind::DrainRunner, "drain the runner and prove no job is active"),
-            action(AvailabilityActionKind::StopVm, "stop the Lima VM before changing its resource profile"),
-            action(AvailabilityActionKind::ApplyProfile, "apply the interactive Lima profile"),
+            action(
+                AvailabilityActionKind::DrainRunner,
+                "drain the runner and prove no job is active",
+            ),
+            action(
+                AvailabilityActionKind::StopVm,
+                "stop the Lima VM before changing its resource profile",
+            ),
+            action(
+                AvailabilityActionKind::ApplyProfile,
+                "apply the interactive Lima profile",
+            ),
             action(AvailabilityActionKind::StartVm, "start the Lima VM"),
-            action(AvailabilityActionKind::VerifyTransition, "freshly verify VM profile and runner admission state"),
+            action(
+                AvailabilityActionKind::VerifyTransition,
+                "freshly verify VM profile and runner admission state",
+            ),
         ],
         (_, AvailabilityRequest::Auto)
         | (EffectiveAvailabilityMode::Active, AvailabilityRequest::Active)
@@ -385,8 +441,10 @@ const fn request_matches_effective(
 ) -> bool {
     matches!(
         (requested_mode, effective_mode),
-        (AvailabilityRequest::Active, EffectiveAvailabilityMode::Active)
-            | (AvailabilityRequest::Away, EffectiveAvailabilityMode::Away)
+        (
+            AvailabilityRequest::Active,
+            EffectiveAvailabilityMode::Active
+        ) | (AvailabilityRequest::Away, EffectiveAvailabilityMode::Away)
             | (AvailabilityRequest::Off, EffectiveAvailabilityMode::Off)
     )
 }
@@ -522,9 +580,11 @@ mod tests {
 
         assert_eq!(plan.disposition, AvailabilityDisposition::Blocked);
         assert!(plan.actions.is_empty());
-        assert!(plan.blockers.iter().any(|blocker| {
-            blocker.kind == AvailabilityBlockerKind::ActiveJob
-        }));
+        assert!(
+            plan.blockers
+                .iter()
+                .any(|blocker| { blocker.kind == AvailabilityBlockerKind::ActiveJob })
+        );
     }
 
     #[test]
@@ -535,9 +595,11 @@ mod tests {
         let plan = plan_availability_transition(facts, AvailabilityRequest::Active);
 
         assert_eq!(plan.disposition, AvailabilityDisposition::Blocked);
-        assert!(plan.blockers.iter().any(|blocker| {
-            blocker.kind == AvailabilityBlockerKind::StaleObservation
-        }));
+        assert!(
+            plan.blockers
+                .iter()
+                .any(|blocker| { blocker.kind == AvailabilityBlockerKind::StaleObservation })
+        );
     }
 
     #[test]
@@ -549,12 +611,16 @@ mod tests {
         let plan = plan_availability_transition(facts, AvailabilityRequest::Away);
 
         assert_eq!(plan.disposition, AvailabilityDisposition::Blocked);
-        assert!(plan.blockers.iter().any(|blocker| {
-            blocker.kind == AvailabilityBlockerKind::BatteryPower
-        }));
-        assert!(plan.blockers.iter().any(|blocker| {
-            blocker.kind == AvailabilityBlockerKind::ElevatedMemoryPressure
-        }));
+        assert!(
+            plan.blockers
+                .iter()
+                .any(|blocker| { blocker.kind == AvailabilityBlockerKind::BatteryPower })
+        );
+        assert!(
+            plan.blockers
+                .iter()
+                .any(|blocker| { blocker.kind == AvailabilityBlockerKind::ElevatedMemoryPressure })
+        );
     }
 
     #[test]
@@ -580,9 +646,11 @@ mod tests {
             plan.disposition,
             AvailabilityDisposition::ManualPolicyRequired
         );
-        assert!(plan.blockers.iter().any(|blocker| {
-            blocker.kind == AvailabilityBlockerKind::AutoPolicyUnavailable
-        }));
+        assert!(
+            plan.blockers
+                .iter()
+                .any(|blocker| { blocker.kind == AvailabilityBlockerKind::AutoPolicyUnavailable })
+        );
     }
 
     #[test]
