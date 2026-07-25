@@ -1,0 +1,33 @@
+name: Capture host Podman Clippy
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'feat/compose-podman-config-host-plan'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out synthetic merge commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Capture Clippy output
+        run: |
+          set +e
+          cargo clippy --locked --all-targets --all-features -- -D warnings > clippy.log 2>&1
+          printf '%s\n' "$?" > clippy.status
+          exit 0
+
+      - name: Upload bounded diagnostic
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: host-podman-clippy
+          path: |
+            clippy.log
+            clippy.status
+          retention-days: 1
