@@ -1,7 +1,11 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 use super::*;
 use crate::rootless_podman_config_resolution::RootlessPodmanConfigAssessmentState;
@@ -252,6 +256,16 @@ fn root_and_runner_ownership_are_not_interchangeable() {
     assert!(validate_file_metadata(root_file, ExpectedOwner::Root).is_ok());
     assert_eq!(
         validate_file_metadata(
+            ConfigMetadata {
+                gid: 1,
+                ..root_file
+            },
+            ExpectedOwner::Root,
+        ),
+        Err(RootlessPodmanConfigSourceProblemKind::WrongOwner)
+    );
+    assert_eq!(
+        validate_file_metadata(
             root_file,
             ExpectedOwner::Runner {
                 uid: 1001,
@@ -353,6 +367,24 @@ fn linux_reader_enforces_no_follow_metadata_and_size_policy() {
         TrustedConfigRead::Unknown(RootlessPodmanConfigSourceProblemKind::NonRegularFile)
     );
     fs::remove_dir(&source).expect("remove source directory");
+
+    let status = Command::new("/usr/bin/mkfifo")
+        .arg(&source)
+        .status()
+        .expect("create FIFO source");
+    assert!(status.success());
+    let (sender, receiver) = mpsc::channel();
+    let fifo_source = source.clone();
+    thread::spawn(move || {
+        let _ = sender.send(read_linux_config(&fifo_source, expected_owner));
+    });
+    assert_eq!(
+        receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("FIFO observation must not block waiting for a writer"),
+        TrustedConfigRead::Unknown(RootlessPodmanConfigSourceProblemKind::NonRegularFile)
+    );
+    fs::remove_file(&source).expect("remove FIFO source");
 
     symlink("/etc/passwd", &source).expect("create final symlink");
     assert_eq!(

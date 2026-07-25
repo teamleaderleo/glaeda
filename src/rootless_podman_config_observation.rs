@@ -26,6 +26,7 @@ const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::NOFOLLOW)
     .union(OFlags::CLOEXEC);
 const FILE_FLAGS: OFlags = OFlags::RDONLY
+    .union(OFlags::NONBLOCK)
     .union(OFlags::NOFOLLOW)
     .union(OFlags::CLOEXEC);
 
@@ -542,7 +543,7 @@ fn validate_file_metadata(
         return Err(RootlessPodmanConfigSourceProblemKind::MultipleHardLinks);
     }
     let owner_matches = match expected_owner {
-        ExpectedOwner::Root => metadata.uid == 0,
+        ExpectedOwner::Root => metadata.uid == 0 && metadata.gid == 0,
         ExpectedOwner::Runner { uid, gid } => metadata.uid == uid && metadata.gid == gid,
     };
     if !owner_matches {
