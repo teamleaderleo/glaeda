@@ -4,47 +4,51 @@ This is the short operator path for the existing `smolrunner` Lima development V
 
 Run commands from the SmolRunner checkout on the Mac.
 
-## Open the VM
+## One-command workspace
+
+```bash
+make work
+```
+
+This command:
+
+- installs Mac-side `tmux` and Lima through Homebrew when either command is missing;
+- starts the existing `smolrunner` Lima instance when needed;
+- creates or reattaches to a Mac-side tmux session named `smolrunner`;
+- opens a `host` window rooted in the Mac checkout;
+- opens a `vm` window containing an interactive Lima guest shell.
+
+Re-running `make work` reattaches to the same session and recreates either standard window if it was closed. The helper does not create a missing VM, provision the guest, register an Actions listener, or copy Mac credentials into Linux.
+
+Useful default tmux keys use the `Ctrl-b` prefix:
+
+- `Ctrl-b n` / `Ctrl-b p`: next or previous window;
+- `Ctrl-b 0` / `Ctrl-b 1`: select the host or VM window directly;
+- `Ctrl-b c`: create another Mac-side window;
+- `Ctrl-b %`: split vertically;
+- `Ctrl-b "`: split horizontally;
+- `Ctrl-b d`: detach while leaving the session running;
+- `Ctrl-b [`: enter scroll/copy mode; press `q` to leave it.
+
+Override the tmux session name when needed:
+
+```bash
+SMOLRUNNER_WORK_SESSION=another-session make work
+```
+
+## Open only the VM
 
 ```bash
 make vm
 ```
 
-This starts the existing `smolrunner` instance when needed and opens an interactive guest shell.
-
-The underlying direct command remains:
+This starts the existing `smolrunner` instance when needed and opens an interactive guest shell. The underlying direct command remains:
 
 ```bash
 limactl shell smolrunner
 ```
 
-## Use one persistent terminal workspace
-
-Install `tmux` once inside the guest:
-
-```bash
-make vm
-sudo apt-get update
-sudo apt-get install -y tmux
-exit
-```
-
-Then use:
-
-```bash
-make vm-tmux
-```
-
-That attaches to or creates the guest session named `smolrunner`. The session survives closing the Mac Terminal window, but not stopping or deleting the VM.
-
-Useful default tmux keys use the `Ctrl-b` prefix:
-
-- `Ctrl-b c`: new window;
-- `Ctrl-b %`: split vertically;
-- `Ctrl-b "`: split horizontally;
-- `Ctrl-b n` / `Ctrl-b p`: next or previous window;
-- `Ctrl-b d`: detach while leaving the session running;
-- `Ctrl-b [`: enter scroll/copy mode; press `q` to leave it.
+`make vm-tmux` remains available for an optional tmux session inside the Linux guest. The default `make work` flow intentionally runs tmux on macOS instead.
 
 ## Everyday commands
 
@@ -56,14 +60,15 @@ make vm-observe  # read-only Mac and guest resource report
 make vm-stop     # graceful VM stop
 ```
 
-The full wrapper is also available directly:
+The full wrappers are also available directly:
 
 ```bash
+bash scripts/macbook-workspace.sh
 bash scripts/macbook-runner-vm.sh help
 bash scripts/macbook-runner-vm.sh exec -- /usr/bin/uname -m
 ```
 
-Override the defaults when operating another instance or checkout:
+Override the VM defaults when operating another instance or checkout:
 
 ```bash
 SMOLRUNNER_VM=another-instance \
@@ -73,7 +78,7 @@ SMOLRUNNER_GUEST_REPO=/home/lima/another-checkout \
 
 ## Avoid ambiguous `git pull`
 
-The wrapper deliberately uses separate fetch and fast-forward steps:
+The VM sync helper deliberately uses separate fetch and fast-forward steps:
 
 ```bash
 git switch main
@@ -102,4 +107,4 @@ The VM is currently a development and field-validation environment:
 - no official Actions listener is registered in this Lima VM;
 - no project bootstrap, runner registration, automatic update, or production deployment authority is implied by these shortcuts.
 
-Repository-specific dependency installation and verification should remain repository-owned. SmolRunner will eventually provide the surrounding one-command host, runner, and disposable-execution lifecycle after the reviewed preparation and registration paths exist.
+Repository-specific dependency installation and verification remain repository-owned. SmolRunner will eventually provide the surrounding one-command host, runner, release-channel, rollback, and disposable-execution lifecycle after the reviewed preparation and registration paths exist.
