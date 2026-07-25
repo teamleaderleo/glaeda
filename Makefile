@@ -1,6 +1,9 @@
-.PHONY: work work-cmux-setup work-tmux vm vm-create vm-bootstrap vm-check vm-up vm-tmux vm-status vm-sync vm-doctor vm-observe vm-stop
+.PHONY: work work-cmux work-cmux-setup work-tmux vm vm-create vm-bootstrap vm-check vm-up vm-tmux vm-status vm-sync vm-doctor vm-observe vm-stop
 
 work:
+	@bash scripts/macbook-workspace.sh tmux
+
+work-cmux:
 	@bash scripts/macbook-workspace.sh cmux
 
 work-cmux-setup:
