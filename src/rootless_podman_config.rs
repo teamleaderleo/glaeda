@@ -12,7 +12,7 @@ use parser::{ConfigField, parse_relevant_fields};
 pub const MAX_ROOTLESS_PODMAN_CONFIG_BYTES: usize = 65_536;
 pub const MAX_ROOTLESS_PODMAN_CONFIG_LINES: usize = 2_048;
 pub const MAX_ROOTLESS_PODMAN_CONFIG_LINE_BYTES: usize = 4_096;
-pub const MAX_ROOTLESS_PODMAN_CONFIG_VALUE_BYTES: usize = 4_096;
+pub const MAX_ROOTLESS_PODMAN_CONFIG_VALUE_BYTES: usize = 2_048;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
