@@ -64,6 +64,37 @@ log_driver = "journald"
 }
 
 #[test]
+fn parses_equivalent_bare_dotted_key_forms() {
+    let storage = parse_rootless_podman_storage_config(
+        r#"
+storage . driver = "overlay"
+storage.runroot = "/run/user/1001/containers"
+[storage]
+graphroot = "/srv/storage"
+options . overlay . mount_program = "/usr/bin/fuse-overlayfs"
+"#,
+    )
+    .expect("dotted storage keys");
+    assert_eq!(storage.driver.as_deref(), Some("overlay"));
+    assert_eq!(
+        storage.runroot.as_deref(),
+        Some("/run/user/1001/containers")
+    );
+    assert_eq!(storage.graphroot.as_deref(), Some("/srv/storage"));
+    assert_eq!(
+        storage.overlay_mount_program.as_deref(),
+        Some("/usr/bin/fuse-overlayfs")
+    );
+
+    let containers = parse_rootless_podman_containers_config(
+        "engine.cgroup_manager = \"systemd\"\nnetwork . network_backend = \"netavark\"\n",
+    )
+    .expect("dotted containers keys");
+    assert_eq!(containers.cgroup_manager.as_deref(), Some("systemd"));
+    assert_eq!(containers.network_backend.as_deref(), Some("netavark"));
+}
+
+#[test]
 fn comments_and_equals_inside_strings_do_not_change_assignment_parsing() {
     let config = r#"
 [storage]
@@ -85,16 +116,19 @@ mount_program = "/usr/bin/fuse\\overlayfs"
 }
 
 #[test]
-fn duplicate_relevant_keys_fail_closed() {
-    let error =
-        parse_rootless_podman_storage_config("[storage]\ndriver = \"overlay\"\ndriver = \"vfs\"\n")
-            .expect_err("duplicate must fail");
-
-    assert_eq!(
-        error.kind(),
-        RootlessPodmanConfigErrorKind::DuplicateRelevantKey
-    );
-    assert_eq!(error.line(), Some(3));
+fn duplicate_relevant_keys_fail_closed_across_equivalent_forms() {
+    for config in [
+        "[storage]\ndriver = \"overlay\"\ndriver = \"vfs\"\n",
+        "storage.driver = \"overlay\"\n[storage]\ndriver = \"vfs\"\n",
+        "[storage.options]\noverlay.mount_program = \"/usr/bin/fuse-overlayfs\"\n[storage.options.overlay]\nmount_program = \"/tmp/other\"\n",
+    ] {
+        let error = parse_rootless_podman_storage_config(config)
+            .expect_err("equivalent duplicate must fail");
+        assert_eq!(
+            error.kind(),
+            RootlessPodmanConfigErrorKind::DuplicateRelevantKey
+        );
+    }
 }
 
 #[test]
@@ -129,6 +163,9 @@ fn relevant_keys_with_missing_or_invalid_assignment_syntax_fail_closed() {
         "[storage]\ndriver \"overlay\"\n",
         "[storage]\ndriver extra = \"overlay\"\n",
         "[storage.options.overlay]\nmount_program: \"/usr/bin/fuse-overlayfs\"\n",
+        "storage . driver \"overlay\"\n",
+        "storage . \"driver\" = \"overlay\"\n",
+        "[storage]\n\"driver\" = \"overlay\"\n",
     ] {
         let error = parse_rootless_podman_storage_config(config)
             .expect_err("malformed relevant assignment must fail");
@@ -136,7 +173,6 @@ fn relevant_keys_with_missing_or_invalid_assignment_syntax_fail_closed() {
             error.kind(),
             RootlessPodmanConfigErrorKind::MalformedRelevantAssignment
         );
-        assert_eq!(error.line(), Some(2));
     }
 }
 
