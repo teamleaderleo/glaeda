@@ -27,24 +27,34 @@ jobs:
       - name: Install Rust toolchain
         run: rustup show active-toolchain
 
-      - name: Format diagnostic working tree
+      - name: Capture formatted source and compiler diagnostics
         run: |
           cargo fmt --all
-          git diff --binary > rustfmt.patch
+          set +e
+          cargo clippy --locked --all-targets --all-features -- -D warnings > clippy.log 2>&1
+          echo "$?" > clippy.status
+          cargo test --locked --all-targets --all-features > test.log 2>&1
+          echo "$?" > test.status
+          exit 0
 
-      - name: Upload rustfmt patch
+      - name: Upload diagnostics
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: rustfmt-patch
-          path: rustfmt.patch
+          name: host-readiness-diagnostics
+          path: |
+            src/host_readiness.rs
+            src/main.rs
+            clippy.log
+            clippy.status
+            test.log
+            test.status
           if-no-files-found: error
           retention-days: 1
 
-      - name: Run Clippy
-        run: cargo clippy --locked --all-targets --all-features -- -D warnings
-
-      - name: Run tests
-        run: cargo test --locked --all-targets --all-features
+      - name: Enforce compiler diagnostics
+        run: |
+          test "$(cat clippy.status)" = 0
+          test "$(cat test.status)" = 0
 
       - name: Exercise machine-readable doctor output
         run: cargo run --locked --quiet -- --output json doctor
