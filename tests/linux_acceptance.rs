@@ -73,6 +73,10 @@ fn require_effective_root() {
 }
 
 fn prepare_empty_system_authorities() {
+    assert!(
+        Path::new("/.dockerenv").exists(),
+        "refusing to reset /etc/subuid and /etc/subgid outside a disposable Docker container"
+    );
     for path in ["/etc/subuid", "/etc/subgid"] {
         fs::write(path, "").unwrap_or_else(|error| panic!("reset {path}: {error}"));
         fs::set_permissions(path, fs::Permissions::from_mode(0o644))
