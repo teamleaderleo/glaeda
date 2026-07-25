@@ -12,8 +12,8 @@ use super::support::{
     RuntimePathObservation,
 };
 use super::{
-    RootlessPodmanPreflightDisposition, RootlessPodmanPreflightPaths,
-    RootlessPodmanPreflightState, observe_with,
+    RootlessPodmanPreflightDisposition, RootlessPodmanPreflightPaths, RootlessPodmanPreflightState,
+    observe_with,
 };
 
 struct FakeFilesystem {
@@ -43,8 +43,7 @@ fn package_plan(state: Presence) -> crate::debian_package_plan::DebianPackagePla
 }
 
 fn account_observations(state: PreparationObservationState) -> RunnerAccountObservations {
-    let make =
-        || PreparationObservation::new(state, ["bounded evidence"]).expect("observation");
+    let make = || PreparationObservation::new(state, ["bounded evidence"]).expect("observation");
     RunnerAccountObservations {
         group: make(),
         user: make(),
