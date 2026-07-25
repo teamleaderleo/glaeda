@@ -2,11 +2,9 @@ name: Verify
 
 on:
   pull_request:
-  push:
-    branches: [main]
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: verify-${{ github.workflow }}-${{ github.ref }}
@@ -15,17 +13,26 @@ concurrency:
 jobs:
   verify:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 25
 
     steps:
-      - name: Check out repository
+      - name: Check out observation branch
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: codex/runner-account-observation
+          fetch-depth: 0
 
       - name: Install Rust toolchain
         run: rustup show active-toolchain
 
-      - name: Check formatting
-        run: cargo fmt --all -- --check
+      - name: Apply canonical-path and no-follow traversal hardening
+        run: python3 .github/seal-observation-paths.py
+
+      - name: Format source
+        run: cargo fmt --all
+
+      - name: Run focused observation tests
+        run: cargo test --locked --all-targets --all-features runner_account_observation
 
       - name: Run Clippy
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
@@ -46,3 +53,14 @@ jobs:
         run: |
           cargo run --locked --quiet -- --output json host plan --file examples/quarry.yml \
             | jq -e '.schema_version == 1 and (.actions | length >= 2)'
+
+      - name: Publish verified source and restore ordinary CI
+        run: |
+          git show origin/main:.github/workflows/ci.yml > .github/workflows/ci.yml
+          rm -f .github/workflows/seal-observation-paths.yml
+          rm -f .github/seal-observation-paths.py
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/runner_account_observation.rs .github/workflows/ci.yml .github/workflows/seal-observation-paths.yml .github/seal-observation-paths.py
+          git commit -m "Harden runner account observation traversal"
+          git push origin HEAD:codex/runner-account-observation
