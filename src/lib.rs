@@ -13,6 +13,8 @@ pub mod host;
 #[cfg(target_os = "linux")]
 pub mod host_package_plan;
 #[cfg(target_os = "linux")]
+pub mod host_preparation_command;
+#[cfg(target_os = "linux")]
 pub mod host_preparation_plan;
 #[cfg(target_os = "linux")]
 pub mod host_readiness;
