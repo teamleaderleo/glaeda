@@ -21,6 +21,14 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 
+      - name: Validate Mac helper scripts
+        run: |
+          bash -n \
+            scripts/macbook-runner-bootstrap.sh \
+            scripts/macbook-runner-observe.sh \
+            scripts/test-macbook-runner-bootstrap.sh
+          bash scripts/test-macbook-runner-bootstrap.sh
+
       - name: Install Rust toolchain
         run: rustup show active-toolchain
 
