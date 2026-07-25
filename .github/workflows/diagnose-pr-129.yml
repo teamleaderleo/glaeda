@@ -1,0 +1,18 @@
+name: Diagnose PR 129
+
+on:
+  push:
+    branches:
+      - codex/trusted-podman-config-observation
+
+permissions:
+  contents: read
+
+jobs:
+  compile:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - run: rustup target add aarch64-unknown-linux-gnu
+      - name: Print concise ARM64 diagnostics
+        run: cargo check --locked --target aarch64-unknown-linux-gnu --message-format short
