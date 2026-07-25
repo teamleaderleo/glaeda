@@ -16,9 +16,9 @@ make vm-stop
 
 `vm-create` installs Lima with Homebrew when necessary and creates the `smolrunner` instance from `examples/lima/smolrunner-interactive.yaml`. It preserves an existing instance and never deletes or replaces one. Existence is checked through `limactl`; a stray or stale directory is not accepted as an instance.
 
-`vm-bootstrap` starts the instance and idempotently prepares a development guest. Before package installation or repository execution, it verifies that the running guest is ARM64 and has no Lima host-filesystem mounts. It then installs Ubuntu build and rootless-Podman prerequisites, disables unused rootful Podman socket and automatic-update units, installs the stable Rust toolchain with rustup when absent, creates or safely fast-forwards the guest checkout, builds with the committed lockfile, and runs `smolrunner doctor`.
+`vm-bootstrap` starts the instance and idempotently prepares a development guest. Before package installation or repository execution, it verifies that the running guest is ARM64 and has no Lima host-filesystem mounts. It then installs Ubuntu build and rootless-Podman prerequisites, disables unused rootful Podman socket and automatic-update units, verifies that the system Podman service and socket are disabled and non-active, verifies that no privileged process is listening on `/run/podman/podman.sock`, and removes that path only when it is a proven-stale, non-symlink, root-owned socket inode. It then installs the stable Rust toolchain with rustup when absent, creates or safely fast-forwards the guest checkout, builds with the committed lockfile, and runs `smolrunner doctor`.
 
-`vm-check` is read-only. It repeats the guest-isolation check, reports host and guest resource use, rejects an active rootful Podman socket, prints the rootless Podman execution mode, checks the guest checkout, and runs `smolrunner doctor`.
+`vm-check` is read-only. It repeats the guest-isolation check, reports host and guest resource use, reports the system Podman unit states, rejects an enabled or active rootful Podman control path, rejects a live listener, and fails closed on a symlink or ambiguous filesystem entry. A non-listening root-owned stale socket inode is reported distinctly rather than treated as an exposed API. The check also prints the rootless Podman execution mode, checks the guest checkout, and runs `smolrunner doctor`.
 
 The existing `vm`, `vm-up`, `vm-tmux`, `vm-status`, `vm-sync`, `vm-doctor`, `vm-observe`, and `vm-stop` commands remain available for normal operation.
 
@@ -27,6 +27,8 @@ The existing `vm`, `vm-up`, `vm-tmux`, `vm-status`, `vm-sync`, `vm-doctor`, `vm-
 The checked-in template deliberately uses native Apple Virtualization (`vz`) with an ARM64 Ubuntu guest, no host directory mounts, no port forwarding, no Rosetta, no containerd, no SSH-agent forwarding, and no inherited proxy environment.
 
 An existing instance is not assumed to match that template merely because its name is `smolrunner`. `vm-bootstrap` fails before `apt`, Git, Cargo, or Podman execution when the guest exposes a Lima host mount or is not ARM64. This matters because the Lima login user has passwordless sudo and repository builds may execute build scripts.
+
+The privileged Podman check relies on three independent facts: systemd enablement, systemd active state, and the kernel's Unix-listener table. Filesystem presence alone is not treated as proof of exposure because systemd may leave a stale socket inode behind after deactivation. Bootstrap mutates that stale entry only after proving its exact type, ownership, non-symlink status, and absence from the listener table.
 
 The bootstrap does not:
 
