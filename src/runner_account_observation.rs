@@ -741,7 +741,7 @@ impl AccountFilesystem for LinuxAccountFilesystem {
             gid: stat.st_gid,
             mode: stat.st_mode & 0o7777,
             size,
-            nlink: stat.st_nlink,
+            nlink: u64::from(stat.st_nlink),
         })
     }
 
