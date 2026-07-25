@@ -11,9 +11,8 @@ use crate::rootless_podman_config_observation::{
 };
 use crate::rootless_podman_config_resolution::RootlessPodmanConfigPolicy;
 use crate::rootless_podman_preflight::{
-    RootlessPodmanPreflightDisposition, RootlessPodmanPreflightPaths,
-    RootlessPodmanPreflightState, RootlessPodmanStaticPreflightReport,
-    observe_rootless_podman_static_preflight,
+    RootlessPodmanPreflightDisposition, RootlessPodmanPreflightPaths, RootlessPodmanPreflightState,
+    RootlessPodmanStaticPreflightReport, observe_rootless_podman_static_preflight,
 };
 use crate::runner_account_observation::{ObservedRunnerIdentity, RunnerAccountObservationReport};
 use crate::runner_account_plan::{
@@ -168,14 +167,13 @@ pub fn observe_host_rootless_podman_with_paths(
         )
     })?;
 
-    let configuration = observe_rootless_podman_config(&context, config_paths, &policy).map_err(
-        |_| {
+    let configuration =
+        observe_rootless_podman_config(&context, config_paths, &policy).map_err(|_| {
             HostRootlessPodmanError::new(
                 HostRootlessPodmanErrorKind::SourceObservation,
                 "failed to observe reviewed rootless Podman configuration sources",
             )
-        },
-    )?;
+        })?;
     let preflight = observe_rootless_podman_static_preflight(
         package_plan,
         &account_report.observations,
@@ -283,9 +281,7 @@ fn deferred_account_readiness(
     }
 }
 
-fn account_states(
-    observations: &RunnerAccountObservations,
-) -> [PreparationObservationState; 6] {
+fn account_states(observations: &RunnerAccountObservations) -> [PreparationObservationState; 6] {
     [
         observations.group.state(),
         observations.user.state(),

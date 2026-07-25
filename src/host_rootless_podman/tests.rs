@@ -16,9 +16,7 @@ use crate::runner_account_plan::{
     PreparationObservation, PreparationObservationState, RunnerAccountObservations,
 };
 
-use super::{
-    HostRootlessPodmanReadiness, deferred_account_readiness, render_human,
-};
+use super::{HostRootlessPodmanReadiness, deferred_account_readiness, render_human};
 
 fn observation(state: PreparationObservationState) -> PreparationObservation {
     PreparationObservation::new(state, ["bounded account evidence"]).expect("observation")
@@ -35,7 +33,9 @@ fn account_observations(state: PreparationObservationState) -> RunnerAccountObse
     }
 }
 
-fn preflight_observation(state: RootlessPodmanPreflightState) -> RootlessPodmanPreflightObservation {
+fn preflight_observation(
+    state: RootlessPodmanPreflightState,
+) -> RootlessPodmanPreflightObservation {
     RootlessPodmanPreflightObservation {
         state,
         evidence: vec!["bounded preflight evidence".to_owned()],
@@ -54,9 +54,7 @@ fn observed_readiness(
             schema_version: 1,
             sources: vec![RootlessPodmanConfigSourceObservation {
                 kind: RootlessPodmanObservedSourceKind::RunnerContainers,
-                path: PathBuf::from(
-                    "/var/lib/project-runner/.config/containers/containers.conf",
-                ),
+                path: PathBuf::from("/var/lib/project-runner/.config/containers/containers.conf"),
                 state: source_state,
                 problem,
             }],
@@ -151,7 +149,10 @@ fn missing_source_and_absent_assessment_remain_changes_required() {
 
 #[test]
 fn unreadable_runner_override_is_normalized_unknown() {
-    assert_unknown_problem(RootlessPodmanConfigSourceProblemKind::Unreadable, "unreadable");
+    assert_unknown_problem(
+        RootlessPodmanConfigSourceProblemKind::Unreadable,
+        "unreadable",
+    );
 }
 
 #[test]

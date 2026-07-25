@@ -9,10 +9,15 @@ use serde::{Deserialize, Serialize};
 use crate::debian_package_plan::{DebianPackagePlan, PackagePlanDisposition};
 use crate::host::{CurrentHostState, Presence};
 use crate::host_package_plan::{DEFAULT_OS_RELEASE_PATH, inspect_host_package_plan_from_current};
+use crate::host_rootless_podman::{
+    HostRootlessPodmanReadiness, observe_host_rootless_podman,
+    render_human as render_rootless_podman,
+};
 use crate::lane_command::LinuxAccountName;
 use crate::lane_executable::{ExecutableVerificationErrorKind, verify_executable};
 use crate::manifest::Manifest;
 use crate::process::CommandExecutor;
+use crate::rootless_podman_preflight::RootlessPodmanPreflightState;
 use crate::runner_account_observation::{RunnerAccountObservationPaths, observe_runner_account};
 use crate::runner_account_plan::{
     DesiredRunnerAccount, PlannedSubordinateRange, RunnerAccountObservations, RunnerAccountPlan,
@@ -68,6 +73,7 @@ pub struct HostReadinessReport {
     pub repository: String,
     pub executables: Vec<ExactExecutableObservation>,
     pub package_plan: DebianPackagePlan,
+    pub rootless_podman: HostRootlessPodmanReadiness,
     pub runner_account: RunnerAccountReadiness,
 }
 
@@ -78,6 +84,7 @@ pub enum HostReadinessErrorKind {
     PackagePlan,
     RunnerAccountObservation,
     RunnerAccountPlan,
+    RootlessPodman,
     SubordinateIdPlan,
 }
 
@@ -252,57 +259,80 @@ pub fn inspect_host_readiness_with_os_release(
         .map(Path::to_path_buf)
         .unwrap_or_else(|| default_account_policy_path(manifest_path));
     let policy = read_account_policy(&policy_path, account_policy_path.is_some())?;
-    let runner_account = match policy {
+    let (runner_account, rootless_podman) = match policy {
         Some(policy) => {
-            let desired = policy.desired_account(manifest)?;
-            let report = observe_runner_account(
-                &desired,
-                executor,
-                &RunnerAccountObservationPaths::system_default(),
-            )
-            .map_err(|_| {
-                HostReadinessError::new(
-                    HostReadinessErrorKind::RunnerAccountObservation,
-                    "failed to classify bounded runner account observations",
-                )
-            })?;
-            let identity = report
-                .identity()
-                .map(|identity| (identity.uid(), identity.primary_gid()));
-            let observations = report.observations;
-            let subordinate_ids = build_exact_subordinate_id_plan(
-                &desired,
-                &observations,
-                identity,
-                Path::new("/etc/subuid"),
-                Path::new("/etc/subgid"),
-            )
-            .map_err(|_| {
-                HostReadinessError::new(
-                    HostReadinessErrorKind::SubordinateIdPlan,
-                    "failed to build a dependency-safe subordinate-ID reconciliation plan",
-                )
-            })?;
-            let plan = without_subordinate_mapping_items(
-                build_runner_account_plan(desired, observations.clone()).map_err(|_| {
-                    HostReadinessError::new(
-                        HostReadinessErrorKind::RunnerAccountPlan,
-                        "failed to build a dependency-safe runner account plan",
-                    )
-                })?,
-            );
-            RunnerAccountReadiness::Planned {
-                observations: Box::new(observations),
-                plan,
-                subordinate_ids: Box::new(subordinate_ids),
-            }
+  let desired = policy.desired_account(manifest)?;
+  let account_report = observe_runner_account(
+      &desired,
+      executor,
+      &RunnerAccountObservationPaths::system_default(),
+  )
+  .map_err(|_| {
+      HostReadinessError::new(
+          HostReadinessErrorKind::RunnerAccountObservation,
+          "failed to classify bounded runner account observations",
+      )
+  })?;
+  let rootless_podman = observe_host_rootless_podman(
+      &package_plan,
+      &desired,
+      &account_report,
+  )
+  .map_err(|_| {
+      HostReadinessError::new(
+          HostReadinessErrorKind::RootlessPodman,
+          "failed to compose trusted rootless Podman configuration readiness",
+      )
+  })?;
+  let identity = account_report
+      .identity()
+      .map(|identity| (identity.uid(), identity.primary_gid()));
+  let observations = account_report.observations;
+  let subordinate_ids = build_exact_subordinate_id_plan(
+      &desired,
+      &observations,
+      identity,
+      Path::new("/etc/subuid"),
+      Path::new("/etc/subgid"),
+  )
+  .map_err(|_| {
+      HostReadinessError::new(
+          HostReadinessErrorKind::SubordinateIdPlan,
+          "failed to build a dependency-safe subordinate-ID reconciliation plan",
+      )
+  })?;
+  let plan = without_subordinate_mapping_items(
+      build_runner_account_plan(desired, observations.clone()).map_err(|_| {
+          HostReadinessError::new(
+              HostReadinessErrorKind::RunnerAccountPlan,
+              "failed to build a dependency-safe runner account plan",
+          )
+      })?,
+  );
+  (
+      RunnerAccountReadiness::Planned {
+          observations: Box::new(observations),
+          plan,
+          subordinate_ids: Box::new(subordinate_ids),
+      },
+      rootless_podman,
+  )
         }
-        None => RunnerAccountReadiness::NeedsConfiguration {
-            evidence: vec![format!(
-                "runner account policy is missing at {}; exact home and subordinate-ID ranges remain unconfigured",
-                policy_path.display()
-            )],
-        },
+        None => (
+  RunnerAccountReadiness::NeedsConfiguration {
+      evidence: vec![format!(
+          "runner account policy is missing at {}; exact home and subordinate-ID ranges remain unconfigured",
+          policy_path.display()
+      )],
+  },
+  HostRootlessPodmanReadiness::Deferred {
+      state: RootlessPodmanPreflightState::Blocked,
+      evidence: vec![
+          "rootless Podman configuration observation is blocked until exact runner account policy exists"
+              .to_owned(),
+      ],
+  },
+        ),
     };
 
     Ok(HostReadinessReport {
@@ -310,6 +340,7 @@ pub fn inspect_host_readiness_with_os_release(
         repository: manifest.repository.clone(),
         executables: observe_required_executables(),
         package_plan,
+        rootless_podman,
         runner_account,
     })
 }
@@ -453,6 +484,9 @@ pub fn render_human(report: &HostReadinessReport) -> String {
         }
     }
 
+    output.push_str("\nRootless Podman static preflight\n");
+    output.push_str(&render_rootless_podman(&report.rootless_podman));
+
     output.push_str("\nNo changes were made.\n");
     output
 }
@@ -574,7 +608,11 @@ mod tests {
 
     use crate::debian_package_plan::{build_package_plan, parse_os_release};
     use crate::host::Presence;
+    use crate::host_rootless_podman::HostRootlessPodmanReadiness;
     use crate::lane_command::LinuxAccountName;
+    use crate::rootless_podman_preflight::{
+        RootlessPodmanPreflightDisposition, RootlessPodmanPreflightState,
+    };
     use crate::runner_account_plan::{
         DesiredRunnerAccount, PlannedSubordinateRange, PreparationObservation,
         PreparationObservationState, RunnerAccountObservations, RunnerAccountPlanDisposition,
@@ -635,6 +673,22 @@ mod tests {
         }
     }
 
+    fn deferred_rootless(
+        account_state: PreparationObservationState,
+    ) -> HostRootlessPodmanReadiness {
+        let state = match account_state {
+            PreparationObservationState::Matching | PreparationObservationState::Unknown => {
+                RootlessPodmanPreflightState::Unknown
+            }
+            PreparationObservationState::Absent => RootlessPodmanPreflightState::Absent,
+            PreparationObservationState::Conflicting => RootlessPodmanPreflightState::Conflicting,
+        };
+        HostRootlessPodmanReadiness::Deferred {
+            state,
+            evidence: vec!["deterministic rootless Podman evidence".to_owned()],
+        }
+    }
+
     fn report(
         package_presence: Presence,
         executable_state: HostObservationState,
@@ -658,6 +712,7 @@ mod tests {
             repository: "example/project".to_owned(),
             executables: vec![executable(executable_state)],
             package_plan: package_plan(package_presence),
+            rootless_podman: deferred_rootless(account_state),
             runner_account: RunnerAccountReadiness::Planned {
                 observations: Box::new(account_observations),
                 plan: account_plan,
@@ -676,6 +731,10 @@ mod tests {
         let json = serde_json::to_value(&report).expect("serialize report");
         assert_eq!(json["executables"][0]["state"], "matching");
         assert_eq!(json["package_plan"]["disposition"], "ready");
+        assert_eq!(
+            report.rootless_podman.preflight_disposition(),
+            None::<RootlessPodmanPreflightDisposition>
+        );
         assert!(
             report
                 .runner_account_plan()
@@ -752,6 +811,7 @@ mod tests {
             repository: "example/project".to_owned(),
             executables: vec![executable(HostObservationState::Conflicting)],
             package_plan: package_plan(Presence::Unknown),
+            rootless_podman: deferred_rootless(PreparationObservationState::Conflicting),
             runner_account: RunnerAccountReadiness::Planned {
                 subordinate_ids: Box::new(
                     build_exact_subordinate_id_plan(
