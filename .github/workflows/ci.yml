@@ -2,9 +2,11 @@ name: Verify
 
 on:
   pull_request:
+  push:
+    branches: [main]
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: verify-${{ github.workflow }}-${{ github.ref }}
@@ -13,45 +15,23 @@ concurrency:
 jobs:
   verify:
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 15
 
     steps:
-      - name: Check out recovery branch quietly
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          git init --quiet .
-          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-          git fetch --quiet --depth=1 origin codex/debian-package-recovery
-          git checkout --quiet -B codex/debian-package-recovery FETCH_HEAD
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 
-      - name: Remove redundant must-use attribute
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          path = Path("src/debian_package_recovery.rs")
-          text = path.read_text()
-          old = '''impl DebianPackageRecoveryReport {
-              #[must_use]
-              pub fn journal_result'''
-          new = '''impl DebianPackageRecoveryReport {
-              pub fn journal_result'''
-          if text.count(old) != 1:
-              raise SystemExit(f"expected journal_result attribute once, found {text.count(old)}")
-          path.write_text(text.replace(old, new, 1))
-          PY
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain
 
-      - name: Format source
-        run: cargo fmt --all
-
-      - name: Run focused recovery tests
-        run: cargo test --quiet --locked --all-targets --all-features debian_package_recovery
+      - name: Check formatting
+        run: cargo fmt --all -- --check
 
       - name: Run Clippy
-        run: cargo clippy --quiet --locked --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
       - name: Run tests
-        run: cargo test --quiet --locked --all-targets --all-features
+        run: cargo test --locked --all-targets --all-features
 
       - name: Exercise machine-readable doctor output
         run: cargo run --locked --quiet -- --output json doctor
@@ -66,13 +46,3 @@ jobs:
         run: |
           cargo run --locked --quiet -- --output json host plan --file examples/quarry.yml \
             | jq -e '.schema_version == 1 and (.actions | length >= 2)'
-
-      - name: Publish verified formatting and restore ordinary CI
-        run: |
-          git fetch --quiet origin main --depth=1
-          git show origin/main:.github/workflows/ci.yml > .github/workflows/ci.yml
-          git config user.name github-actions[bot]
-          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add src/debian_package_recovery.rs src/lib.rs docs/ROADMAP.md docs/adr/0019-debian-package-recovery-classification.md .github/workflows/ci.yml
-          git commit -m "Verify Debian package recovery classification"
-          git push origin HEAD:codex/debian-package-recovery

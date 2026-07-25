@@ -2,9 +2,7 @@ use std::fmt;
 
 use serde::Serialize;
 
-use crate::journal::{
-    ActionFailure, ActionReceipt, ExecutionLane, PlannedMutation, RollbackClass,
-};
+use crate::journal::{ActionFailure, ActionReceipt, ExecutionLane, PlannedMutation, RollbackClass};
 use crate::lane_command::{LaneCommand, LaneCommandKind};
 use crate::lane_executor::LaneExecutionErrorKind;
 use crate::process::{ExecutionRecord, MAX_CAPTURED_STREAM_BYTES};
@@ -54,7 +52,6 @@ pub struct DebianPackageRecoveryReport {
 }
 
 impl DebianPackageRecoveryReport {
-    #[must_use]
     pub fn journal_result(&self) -> Result<ActionReceipt, ActionFailure> {
         match self.state {
             DebianPackageAttemptState::ExitedSuccessfully => {
@@ -155,7 +152,9 @@ fn validate_boundary(
         problems.push("Debian package installation must be classified as compensating".to_owned());
     }
     if command.kind() != LaneCommandKind::AptInstall {
-        problems.push("recovery classification accepts only the reviewed apt install command".to_owned());
+        problems.push(
+            "recovery classification accepts only the reviewed apt install command".to_owned(),
+        );
     }
     if problems.is_empty() {
         Ok(())
@@ -317,10 +316,7 @@ mod tests {
             DebianPackageAttemptEvidence::ProcessRecord(&process),
         )
         .expect("success report");
-        assert_eq!(
-            report.state,
-            DebianPackageAttemptState::ExitedSuccessfully
-        );
+        assert_eq!(report.state, DebianPackageAttemptState::ExitedSuccessfully);
         assert!(report.fresh_package_observation_required);
         assert!(!report.automatic_rollback_allowed);
         assert_eq!(
@@ -356,7 +352,10 @@ mod tests {
     fn interrupted_or_inconsistent_evidence_is_uncertain() {
         let action = action(RollbackClass::Compensating);
         let command = command(&action);
-        for process in [record(&command, None, false), record(&command, Some(0), false)] {
+        for process in [
+            record(&command, None, false),
+            record(&command, Some(0), false),
+        ] {
             let report = classify_debian_package_attempt(
                 &action,
                 &command,
