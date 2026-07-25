@@ -5,8 +5,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use smolrunner::doctor::{inspect_host, render_human as render_doctor};
 #[cfg(target_os = "linux")]
-use smolrunner::host_package_plan::{
-    DEFAULT_OS_RELEASE_PATH, inspect_host_package_plan, render_human as render_host_plan,
+use smolrunner::host_readiness::{
+    inspect_host_readiness, render_human as render_host_plan,
 };
 use smolrunner::manifest::{ManifestError, load};
 use smolrunner::plan::{build, render_human as render_plan};
@@ -61,6 +61,9 @@ enum HostCommand {
         /// Manifest to inspect against the current host.
         #[arg(long, default_value = "smolrunner.yml")]
         file: PathBuf,
+        /// Explicit runner account policy. Defaults to MANIFEST.account.yml when present.
+        #[arg(long)]
+        account_file: Option<PathBuf>,
     },
 }
 
@@ -84,7 +87,9 @@ fn main() -> ExitCode {
         Command::Doctor { strict } => run_doctor(cli.output, strict),
         Command::Plan { file } => run_plan(cli.output, &file),
         Command::Host { command } => match command {
-            HostCommand::Plan { file } => run_host_plan(cli.output, &file),
+            HostCommand::Plan { file, account_file } => {
+                run_host_plan(cli.output, &file, account_file.as_deref())
+            }
         },
     }
 }
@@ -128,32 +133,40 @@ fn run_plan(output: OutputFormat, file: &Path) -> ExitCode {
 }
 
 #[cfg(target_os = "linux")]
-fn run_host_plan(output: OutputFormat, file: &Path) -> ExitCode {
+fn run_host_plan(
+    output: OutputFormat,
+    file: &Path,
+    account_file: Option<&Path>,
+) -> ExitCode {
     let manifest = match load_manifest(output, file) {
         Ok(manifest) => manifest,
         Err(code) => return code,
     };
-    let report =
-        match inspect_host_package_plan(&manifest, DEFAULT_OS_RELEASE_PATH, &ProcessExecutor) {
-            Ok(report) => report,
-            Err(error) => {
-                let message = format!("failed to inspect host and package state: {error}");
-                match output {
-                    OutputFormat::Human => eprintln!("{message}"),
-                    OutputFormat::Json => {
-                        let report = RuntimeErrorReport {
-                            schema_version: 1,
-                            kind: "host_package_probe",
-                            message,
-                        };
-                        if print_json(&report).is_err() {
-                            return ExitCode::from(2);
-                        }
+    let report = match inspect_host_readiness(
+        &manifest,
+        file,
+        account_file,
+        &ProcessExecutor,
+    ) {
+        Ok(report) => report,
+        Err(error) => {
+            let message = format!("failed to inspect host readiness: {error}");
+            match output {
+                OutputFormat::Human => eprintln!("{message}"),
+                OutputFormat::Json => {
+                    let report = RuntimeErrorReport {
+                        schema_version: 1,
+                        kind: "host_readiness_probe",
+                        message,
+                    };
+                    if print_json(&report).is_err() {
+                        return ExitCode::from(2);
                     }
                 }
-                return ExitCode::from(2);
             }
-        };
+            return ExitCode::from(2);
+        }
+    };
 
     match output {
         OutputFormat::Human => print!("{}", render_host_plan(&report)),
@@ -168,7 +181,11 @@ fn run_host_plan(output: OutputFormat, file: &Path) -> ExitCode {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn run_host_plan(output: OutputFormat, file: &Path) -> ExitCode {
+fn run_host_plan(
+    output: OutputFormat,
+    file: &Path,
+    _account_file: Option<&Path>,
+) -> ExitCode {
     if let Err(code) = load_manifest(output, file) {
         return code;
     }
@@ -178,7 +195,7 @@ fn run_host_plan(output: OutputFormat, file: &Path) -> ExitCode {
         OutputFormat::Json => {
             let report = RuntimeErrorReport {
                 schema_version: 1,
-                kind: "host_package_probe",
+                kind: "host_readiness_probe",
                 message,
             };
             if print_json(&report).is_err() {
