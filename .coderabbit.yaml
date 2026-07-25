@@ -18,8 +18,10 @@ reviews:
     docstrings:
       mode: "off"
 
+  # Reviews are deliberately requested only for unusually high-risk or
+  # cross-cutting changes. Routine work relies on local self-review and CI.
   auto_review:
-    enabled: true
+    enabled: false
     auto_incremental_review: false
     auto_pause_after_reviewed_commits: 10
     drafts: false
