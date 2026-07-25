@@ -2,7 +2,7 @@
 name = "smolrunner"
 version = "0.1.0"
 edition = "2024"
-description = "A small-fleet steward for self-hosted GitHub Actions on ordinary Linux servers"
+description = "SmolRunner, pronounced small runner, tends small fleets of self-hosted GitHub Actions runners on ordinary Linux servers"
 repository = "https://github.com/teamleaderleo/smolrunner"
 license = "Apache-2.0"
 keywords = ["github-actions", "self-hosted", "runner", "podman", "devops"]
