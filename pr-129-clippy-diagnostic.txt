@@ -1,0 +1,77 @@
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded anstyle-query v1.1.5
+  Downloaded anstyle v1.0.14
+  Downloaded anstyle-parse v1.0.0
+  Downloaded anstream v1.0.0
+  Downloaded bitflags v2.13.1
+  Downloaded serde v1.0.229
+  Downloaded quote v1.0.47
+  Downloaded clap_builder v4.6.2
+  Downloaded serde_norway v0.9.42
+  Downloaded colorchoice v1.0.5
+  Downloaded heck v0.5.0
+  Downloaded utf8parse v0.2.2
+  Downloaded unsafe-libyaml-norway v0.2.15
+  Downloaded unicode-ident v1.0.24
+  Downloaded is_terminal_polyfill v1.70.2
+  Downloaded strsim v0.11.1
+  Downloaded zmij v1.0.23
+  Downloaded equivalent v1.0.2
+  Downloaded itoa v1.0.18
+  Downloaded clap_lex v1.1.0
+  Downloaded errno v0.3.14
+  Downloaded clap_derive v4.6.4
+  Downloaded serde_core v1.0.229
+  Downloaded serde_derive v1.0.229
+  Downloaded clap v4.6.4
+  Downloaded ryu v1.0.23
+  Downloaded syn v3.0.3
+  Downloaded memchr v2.8.3
+  Downloaded proc-macro2 v1.0.107
+  Downloaded indexmap v2.14.0
+  Downloaded serde_json v1.0.151
+  Downloaded hashbrown v0.17.1
+  Downloaded rustix v1.1.4
+  Downloaded libc v0.2.189
+  Downloaded linux-raw-sys v0.12.1
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.24
+   Compiling serde_core v1.0.229
+    Checking utf8parse v0.2.2
+    Checking anstyle-parse v1.0.0
+    Checking anstyle v1.0.14
+    Checking colorchoice v1.0.5
+    Checking is_terminal_polyfill v1.70.2
+   Compiling serde v1.0.229
+    Checking anstyle-query v1.1.5
+   Compiling zmij v1.0.23
+    Checking anstream v1.0.0
+    Checking hashbrown v0.17.1
+    Checking clap_lex v1.1.0
+   Compiling rustix v1.1.4
+    Checking equivalent v1.0.2
+   Compiling serde_json v1.0.151
+   Compiling syn v3.0.3
+    Checking itoa v1.0.18
+   Compiling heck v0.5.0
+    Checking strsim v0.11.1
+    Checking indexmap v2.14.0
+    Checking clap_builder v4.6.2
+    Checking bitflags v2.13.1
+    Checking unsafe-libyaml-norway v0.2.15
+    Checking ryu v1.0.23
+    Checking memchr v2.8.3
+    Checking linux-raw-sys v0.12.1
+   Compiling serde_derive v1.0.229
+   Compiling clap_derive v4.6.4
+    Checking clap v4.6.4
+    Checking serde_norway v0.9.42
+    Checking smolrunner v0.1.0 (/home/runner/work/smolrunner/smolrunner)
+src/rootless_podman_config_observation.rs:472:16: error: useless conversion to the same type: `u64`: help: consider removing `u64::from()`: `stat.st_nlink`
+error: could not compile `smolrunner` (lib) due to 1 previous error
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `smolrunner` (lib test) due to 1 previous error
+
+exit_status=101
