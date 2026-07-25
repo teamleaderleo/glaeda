@@ -5,16 +5,16 @@ script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 repo_root="$(CDPATH= cd -- "${script_dir}/.." && pwd)"
 session="${SMOLRUNNER_WORK_SESSION:-smolrunner}"
 vm_helper="${repo_root}/scripts/macbook-runner-vm.sh"
-command="${1:-cmux}"
+command="${1:-tmux}"
 
 usage() {
   cat <<'USAGE'
 Usage: bash scripts/macbook-workspace.sh COMMAND
 
 Commands:
-  cmux        Open or select the cmux Mac/Lima workspace. cmux must already be installed.
+  cmux        Open or select the opt-in cmux Mac/Lima workspace.
   setup-cmux  Install cmux through its reviewed Homebrew cask, then open the workspace.
-  tmux        Open or select the compatibility tmux workspace.
+  tmux        Open or select the default compatibility tmux workspace.
   notify-doctor STATUS
               Emit a fixed cmux notification for a completed doctor run.
 
@@ -202,19 +202,21 @@ launch_tmux() {
 }
 
 validate_session
-require_macos
 
 case "${command}" in
   cmux)
-    cmux_cli="$(find_cmux_cli)" || die 'cmux is unavailable; run make work-cmux-setup once or use make work-tmux'
+    require_macos
+    cmux_cli="$(find_cmux_cli)" || die 'cmux is unavailable; run make work-cmux-setup once or use make work'
     launch_cmux "${cmux_cli}"
     ;;
   setup-cmux)
+    require_macos
     install_cmux
     cmux_cli="$(find_cmux_cli)"
     launch_cmux "${cmux_cli}"
     ;;
   tmux)
+    require_macos
     launch_tmux
     ;;
   notify-doctor)
