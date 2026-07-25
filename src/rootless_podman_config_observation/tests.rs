@@ -74,7 +74,7 @@ fn matching_sources_compose_through_parser_resolver_and_policy() {
         .with(
             "/usr/share/containers/containers.conf",
             TrustedConfigRead::Present(
-                b"[engine]\ncgroup_manager = \"systemd\"\nnetwork_backend = \"netavark\"\n"
+                b"[engine]\ncgroup_manager = \"systemd\"\n[network]\nnetwork_backend = \"netavark\"\n"
                     .to_vec(),
             ),
         )
@@ -99,7 +99,7 @@ fn unknown_runner_source_hides_lower_precedence_without_leaking_error_text() {
         .with(
             "/usr/share/containers/containers.conf",
             TrustedConfigRead::Present(
-                b"[engine]\ncgroup_manager = \"systemd\"\nnetwork_backend = \"netavark\"\n"
+                b"[engine]\ncgroup_manager = \"systemd\"\n[network]\nnetwork_backend = \"netavark\"\n"
                     .to_vec(),
             ),
         )
