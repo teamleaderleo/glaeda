@@ -1,0 +1,48 @@
+name: Refine portable link-count conversion
+
+on:
+  push:
+    branches: [fix/aarch64-nlink]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out repair branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: fix/aarch64-nlink
+
+      - name: Refine conversion and remove bootstrap workflow
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/runner_account_observation.rs")
+          text = path.read_text()
+
+          old_assignment = "            nlink: u64::from(stat.st_nlink),\n"
+          new_assignment = "            nlink: canonical_nlink(stat.st_nlink),\n"
+          if text.count(old_assignment) != 1:
+              raise SystemExit("expected exactly one converted nlink assignment")
+          text = text.replace(old_assignment, new_assignment)
+
+          old_helper = "fn canonical_u32(value: &str) -> Option<u32> {\n    let parsed = value.parse::<u32>().ok()?;\n    (parsed.to_string() == value).then_some(parsed)\n}\n"
+          new_helper = old_helper + "\nfn canonical_nlink(value: impl Into<u64>) -> u64 {\n    value.into()\n}\n"
+          if text.count(old_helper) != 1:
+              raise SystemExit("expected exactly one canonical_u32 helper")
+          text = text.replace(old_helper, new_helper)
+
+          path.write_text(text)
+          PY
+          cargo fmt --all
+          rm .github/workflows/bootstrap-aarch64-fix.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/runner_account_observation.rs .github/workflows/bootstrap-aarch64-fix.yml
+          git commit -m "Normalise platform link counts generically"
+          git push origin HEAD:fix/aarch64-nlink
