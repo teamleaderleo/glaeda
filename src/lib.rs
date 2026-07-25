@@ -60,6 +60,8 @@ pub mod resource;
 #[cfg(target_os = "linux")]
 pub mod rootless_podman_config;
 #[cfg(target_os = "linux")]
+pub mod rootless_podman_config_resolution;
+#[cfg(target_os = "linux")]
 pub mod rootless_podman_preflight;
 #[cfg(target_os = "linux")]
 pub mod runner_account_observation;
