@@ -1,0 +1,41 @@
+name: Linux acceptance
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/linux-acceptance.yml
+      - scripts/run-linux-acceptance.sh
+      - tests/durable_journal_recovery.rs
+      - tests/linux_acceptance.rs
+      - src/**
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-acceptance-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  disposable-linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Install native musl linker
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends musl-tools
+
+      - name: Run external durable-journal recovery tests
+        run: cargo test --locked --test durable_journal_recovery
+
+      - name: Run disposable Debian and Ubuntu acceptance tests
+        run: bash scripts/run-linux-acceptance.sh
