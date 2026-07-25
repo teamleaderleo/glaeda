@@ -261,77 +261,74 @@ pub fn inspect_host_readiness_with_os_release(
     let policy = read_account_policy(&policy_path, account_policy_path.is_some())?;
     let (runner_account, rootless_podman) = match policy {
         Some(policy) => {
-  let desired = policy.desired_account(manifest)?;
-  let account_report = observe_runner_account(
-      &desired,
-      executor,
-      &RunnerAccountObservationPaths::system_default(),
-  )
-  .map_err(|_| {
-      HostReadinessError::new(
-          HostReadinessErrorKind::RunnerAccountObservation,
-          "failed to classify bounded runner account observations",
-      )
-  })?;
-  let rootless_podman = observe_host_rootless_podman(
-      &package_plan,
-      &desired,
-      &account_report,
-  )
-  .map_err(|_| {
-      HostReadinessError::new(
-          HostReadinessErrorKind::RootlessPodman,
-          "failed to compose trusted rootless Podman configuration readiness",
-      )
-  })?;
-  let identity = account_report
-      .identity()
-      .map(|identity| (identity.uid(), identity.primary_gid()));
-  let observations = account_report.observations;
-  let subordinate_ids = build_exact_subordinate_id_plan(
-      &desired,
-      &observations,
-      identity,
-      Path::new("/etc/subuid"),
-      Path::new("/etc/subgid"),
-  )
-  .map_err(|_| {
-      HostReadinessError::new(
-          HostReadinessErrorKind::SubordinateIdPlan,
-          "failed to build a dependency-safe subordinate-ID reconciliation plan",
-      )
-  })?;
-  let plan = without_subordinate_mapping_items(
-      build_runner_account_plan(desired, observations.clone()).map_err(|_| {
-          HostReadinessError::new(
-              HostReadinessErrorKind::RunnerAccountPlan,
-              "failed to build a dependency-safe runner account plan",
-          )
-      })?,
-  );
-  (
-      RunnerAccountReadiness::Planned {
-          observations: Box::new(observations),
-          plan,
-          subordinate_ids: Box::new(subordinate_ids),
-      },
-      rootless_podman,
-  )
+            let desired = policy.desired_account(manifest)?;
+            let account_report = observe_runner_account(
+                &desired,
+                executor,
+                &RunnerAccountObservationPaths::system_default(),
+            )
+            .map_err(|_| {
+                HostReadinessError::new(
+                    HostReadinessErrorKind::RunnerAccountObservation,
+                    "failed to classify bounded runner account observations",
+                )
+            })?;
+            let rootless_podman =
+                observe_host_rootless_podman(&package_plan, &desired, &account_report)
+                    .map_err(|_| {
+                        HostReadinessError::new(
+                            HostReadinessErrorKind::RootlessPodman,
+                            "failed to compose trusted rootless Podman configuration readiness",
+                        )
+                    })?;
+            let identity = account_report
+                .identity()
+                .map(|identity| (identity.uid(), identity.primary_gid()));
+            let observations = account_report.observations;
+            let subordinate_ids = build_exact_subordinate_id_plan(
+                &desired,
+                &observations,
+                identity,
+                Path::new("/etc/subuid"),
+                Path::new("/etc/subgid"),
+            )
+            .map_err(|_| {
+                HostReadinessError::new(
+                    HostReadinessErrorKind::SubordinateIdPlan,
+                    "failed to build a dependency-safe subordinate-ID reconciliation plan",
+                )
+            })?;
+            let plan = without_subordinate_mapping_items(
+                build_runner_account_plan(desired, observations.clone()).map_err(|_| {
+                    HostReadinessError::new(
+                        HostReadinessErrorKind::RunnerAccountPlan,
+                        "failed to build a dependency-safe runner account plan",
+                    )
+                })?,
+            );
+            (
+                RunnerAccountReadiness::Planned {
+                    observations: Box::new(observations),
+                    plan,
+                    subordinate_ids: Box::new(subordinate_ids),
+                },
+                rootless_podman,
+            )
         }
         None => (
-  RunnerAccountReadiness::NeedsConfiguration {
-      evidence: vec![format!(
-          "runner account policy is missing at {}; exact home and subordinate-ID ranges remain unconfigured",
-          policy_path.display()
-      )],
-  },
-  HostRootlessPodmanReadiness::Deferred {
-      state: RootlessPodmanPreflightState::Blocked,
-      evidence: vec![
-          "rootless Podman configuration observation is blocked until exact runner account policy exists"
-              .to_owned(),
-      ],
-  },
+            RunnerAccountReadiness::NeedsConfiguration {
+                evidence: vec![format!(
+                    "runner account policy is missing at {}; exact home and subordinate-ID ranges remain unconfigured",
+                    policy_path.display()
+                )],
+            },
+            HostRootlessPodmanReadiness::Deferred {
+                state: RootlessPodmanPreflightState::Blocked,
+                evidence: vec![
+                    "rootless Podman configuration observation is blocked until exact runner account policy exists"
+                        .to_owned(),
+                ],
+            },
         ),
     };
 
