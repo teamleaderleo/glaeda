@@ -58,7 +58,7 @@ pub enum RunnerAccountReadiness {
     Planned {
         observations: Box<RunnerAccountObservations>,
         plan: RunnerAccountPlan,
-        subordinate_ids: SubordinateIdReconciliationPlan,
+        subordinate_ids: Box<SubordinateIdReconciliationPlan>,
     },
 }
 
@@ -294,7 +294,7 @@ pub fn inspect_host_readiness_with_os_release(
             RunnerAccountReadiness::Planned {
                 observations: Box::new(observations),
                 plan,
-                subordinate_ids,
+                subordinate_ids: Box::new(subordinate_ids),
             }
         }
         None => RunnerAccountReadiness::NeedsConfiguration {
@@ -661,7 +661,7 @@ mod tests {
             runner_account: RunnerAccountReadiness::Planned {
                 observations: Box::new(account_observations),
                 plan: account_plan,
-                subordinate_ids,
+                subordinate_ids: Box::new(subordinate_ids),
             },
         }
     }
@@ -753,14 +753,16 @@ mod tests {
             executables: vec![executable(HostObservationState::Conflicting)],
             package_plan: package_plan(Presence::Unknown),
             runner_account: RunnerAccountReadiness::Planned {
-                subordinate_ids: build_exact_subordinate_id_plan(
-                    &desired(),
-                    &account_observations,
-                    None,
-                    std::path::Path::new("/etc/subuid"),
-                    std::path::Path::new("/etc/subgid"),
-                )
-                .expect("subordinate plan"),
+                subordinate_ids: Box::new(
+                    build_exact_subordinate_id_plan(
+                        &desired(),
+                        &account_observations,
+                        None,
+                        std::path::Path::new("/etc/subuid"),
+                        std::path::Path::new("/etc/subgid"),
+                    )
+                    .expect("subordinate plan"),
+                ),
                 observations: Box::new(account_observations),
                 plan,
             },
