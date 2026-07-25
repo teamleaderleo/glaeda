@@ -1,0 +1,142 @@
+trait ConfigFilesystem {
+    fn read_trusted(
+        &self,
+        path: &Path,
+        owner: ExpectedOwner,
+        max_bytes: usize,
+    ) -> TrustedConfigFile;
+}
+
+struct LinuxConfigFilesystem;
+
+impl ConfigFilesystem for LinuxConfigFilesystem {
+    fn read_trusted(
+        &self,
+        path: &Path,
+        owner: ExpectedOwner,
+        max_bytes: usize,
+    ) -> TrustedConfigFile {
+        let descriptor = match open_traversed(path, OFlags::RDONLY) {
+            Ok(descriptor) => descriptor,
+            Err(Errno::NOENT) => return TrustedConfigFile::Missing,
+            Err(_) => {
+                return TrustedConfigFile::Unknown(TrustedConfigFileProblem::UnsafeTraversal);
+            }
+        };
+        let stat = match rustix_fs::fstat(&descriptor) {
+            Ok(stat) => stat,
+            Err(_) => {
+                return TrustedConfigFile::Unknown(TrustedConfigFileProblem::MetadataUnavailable);
+            }
+        };
+        if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+            return TrustedConfigFile::Unknown(TrustedConfigFileProblem::NotRegularFile);
+        }
+        if !owner.matches(stat.st_uid, stat.st_gid) {
+            return TrustedConfigFile::Unknown(TrustedConfigFileProblem::WrongOwner);
+        }
+        if canonical_nlink(stat.st_nlink) != 1 {
+            return TrustedConfigFile::Unknown(TrustedConfigFileProblem::MultipleLinks);
+        }
+        if stat.st_mode & 0o022 != 0 {
+            return TrustedConfigFile::Unknown(TrustedConfigFileProblem::WritableByUntrusted);
+        }
+        if stat.st_size < 0
+            || usize::try_from(stat.st_size).map_or(true, |size| size > max_bytes)
+        {
+            return TrustedConfigFile::Unknown(TrustedConfigFileProblem::Oversized);
+        }
+
+        let mut bytes = Vec::new();
+        if std::fs::File::from(descriptor)
+            .take((max_bytes as u64).saturating_add(1))
+            .read_to_end(&mut bytes)
+            .is_err()
+            || bytes.len() > max_bytes
+        {
+            return TrustedConfigFile::Unknown(TrustedConfigFileProblem::ReadFailed);
+        }
+        TrustedConfigFile::Present(bytes)
+    }
+}
+
+fn canonical_nlink(value: impl Into<u64>) -> u64 {
+    value.into()
+}
+
+fn open_traversed(path: &Path, final_flags: OFlags) -> Result<OwnedFd, Errno> {
+    let mut components = path.components();
+    if components.next() != Some(Component::RootDir) {
+        return Err(Errno::INVAL);
+    }
+    let mut current = rustix_fs::open(
+        "/",
+        OFlags::PATH.union(OFlags::DIRECTORY).union(OFlags::CLOEXEC),
+        Mode::empty(),
+    )?;
+    let mut remaining = components.peekable();
+    while let Some(component) = remaining.next() {
+        let Component::Normal(name) = component else {
+            return Err(Errno::INVAL);
+        };
+        let flags = if remaining.peek().is_some() {
+            OFlags::PATH
+                .union(OFlags::DIRECTORY)
+                .union(OFlags::NOFOLLOW)
+                .union(OFlags::CLOEXEC)
+        } else {
+            final_flags.union(OFlags::NOFOLLOW).union(OFlags::CLOEXEC)
+        };
+        current = rustix_fs::openat(&current, name, flags, Mode::empty())?;
+    }
+    Ok(current)
+}
+
+const fn source_role_name(role: RootlessPodmanConfigSourceRole) -> &'static str {
+    match role {
+        RootlessPodmanConfigSourceRole::VendorContainers => "vendor containers.conf",
+        RootlessPodmanConfigSourceRole::SystemContainers => "system containers.conf",
+        RootlessPodmanConfigSourceRole::RunnerContainers => "runner containers.conf",
+        RootlessPodmanConfigSourceRole::SystemStorage => "system storage.conf",
+        RootlessPodmanConfigSourceRole::RunnerStorage => "runner storage.conf",
+    }
+}
+
+const fn source_state_name(state: RootlessPodmanConfigSourceObservationState) -> &'static str {
+    match state {
+        RootlessPodmanConfigSourceObservationState::Missing => "missing",
+        RootlessPodmanConfigSourceObservationState::Present => "present",
+        RootlessPodmanConfigSourceObservationState::Unknown => "unknown",
+    }
+}
+
+const fn assessment_state_name(
+    state: crate::rootless_podman_config_resolution::RootlessPodmanConfigAssessmentState,
+) -> &'static str {
+    use crate::rootless_podman_config_resolution::RootlessPodmanConfigAssessmentState;
+    match state {
+        RootlessPodmanConfigAssessmentState::Matching => "matching",
+        RootlessPodmanConfigAssessmentState::Absent => "absent",
+        RootlessPodmanConfigAssessmentState::Unknown => "unknown",
+        RootlessPodmanConfigAssessmentState::Conflicting => "conflicting",
+    }
+}
+
+const fn config_error_kind_name(kind: RootlessPodmanConfigErrorKind) -> &'static str {
+    match kind {
+        RootlessPodmanConfigErrorKind::Oversized => "oversized configuration",
+        RootlessPodmanConfigErrorKind::TooManyLines => "too many configuration lines",
+        RootlessPodmanConfigErrorKind::LineTooLong => "an oversized configuration line",
+        RootlessPodmanConfigErrorKind::InvalidControlCharacter => {
+            "an invalid configuration control character"
+        }
+        RootlessPodmanConfigErrorKind::MalformedTable => "a malformed relevant table",
+        RootlessPodmanConfigErrorKind::MalformedRelevantAssignment => {
+            "a malformed relevant assignment"
+        }
+        RootlessPodmanConfigErrorKind::DuplicateRelevantKey => "a duplicate relevant key",
+    }
+}
+
+#[cfg(test)]
+mod tests;
