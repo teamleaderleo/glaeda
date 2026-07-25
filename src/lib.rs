@@ -59,7 +59,7 @@ pub mod process;
 pub mod resource;
 #[cfg(target_os = "linux")]
 pub mod rootless_podman_config;
-/// Pure fail-closed precedence resolution and static-preflight policy assessment for Podman config.
+/// Pure, bounded, fail-closed precedence resolution and static-preflight policy assessment.
 #[cfg(target_os = "linux")]
 pub mod rootless_podman_config_resolution;
 #[cfg(target_os = "linux")]
