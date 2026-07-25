@@ -1,33 +1,43 @@
-name: Capture host Podman Clippy
+name: Fix host Podman Clippy
 
 on:
   pull_request:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  capture:
-    if: github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'feat/compose-podman-config-host-plan'
+  fix:
+    if: github.actor != 'github-actions[bot]' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'feat/compose-podman-config-host-plan'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
 
     steps:
-      - name: Check out synthetic merge commit
+      - name: Check out implementation branch
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-
-      - name: Capture Clippy output
-        run: |
-          set +e
-          cargo clippy --locked --all-targets --all-features -- -D warnings > clippy.log 2>&1
-          printf '%s\n' "$?" > clippy.status
-          exit 0
-
-      - name: Upload bounded diagnostic
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: host-podman-clippy
-          path: |
-            clippy.log
-            clippy.status
-          retention-days: 1
+          ref: feat/compose-podman-config-host-plan
+
+      - name: Remove unused import and format
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('src/host_rootless_podman.rs')
+          text = path.read_text()
+          old = 'use std::path::{Path, PathBuf};\n'
+          if text.count(old) != 1:
+              raise SystemExit(f'expected one unused import, found {text.count(old)}')
+          path.write_text(text.replace(old, 'use std::path::PathBuf;\n', 1))
+          PY
+          cargo fmt --all
+          git diff --check
+
+      - name: Commit exact fix
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/host_rootless_podman.rs src/host_readiness.rs src/host_readiness_verdict.rs src/host_rootless_podman/tests.rs src/lib.rs
+          git commit -m 'Fix host Podman composition lint'
+          git push origin HEAD:feat/compose-podman-config-host-plan
