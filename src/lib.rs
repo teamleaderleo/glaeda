@@ -60,7 +60,7 @@ pub mod process;
 pub mod resource;
 #[cfg(target_os = "linux")]
 pub mod rootless_podman_config;
-/// Strict, bounded, nonblocking, identity-bound observation of reviewed Podman sources.
+/// Strict, bounded, nonblocking, descriptor-relative, identity-bound observation of reviewed Podman sources.
 #[cfg(target_os = "linux")]
 pub mod rootless_podman_config_observation;
 /// Pure, bounded, fail-closed precedence resolution and static-preflight assessment of Podman config.
