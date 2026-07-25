@@ -1,8 +1,7 @@
 name: Format Mac availability
 
 on:
-  push:
-    branches: [feat/mac-availability-planning]
+  pull_request:
 
 permissions:
   contents: read
