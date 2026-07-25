@@ -1,0 +1,146 @@
+        observation: RootlessPodmanConfigSourceObservation {
+            role,
+            path: path.to_path_buf(),
+            state: observation_state,
+            evidence: vec![evidence],
+        },
+    })
+}
+
+fn blocked_runner_source<T>(
+    role: RootlessPodmanConfigSourceRole,
+    path: &Path,
+) -> Result<ObservedConfigSource<T>, RootlessPodmanConfigObservationError> {
+    let evidence = "runner-specific source inspection is blocked until an exact non-root runner identity and matching reviewed home are proven".to_owned();
+    let source = RootlessPodmanConfigSource::new(
+        path.to_path_buf(),
+        RootlessPodmanConfigSourceState::Unknown {
+            evidence: evidence.clone(),
+        },
+    )
+    .map_err(RootlessPodmanConfigObservationError::from_problem)?;
+    Ok(ObservedConfigSource {
+        source,
+        observation: RootlessPodmanConfigSourceObservation {
+            role,
+            path: path.to_path_buf(),
+            state: RootlessPodmanConfigSourceObservationState::Unknown,
+            evidence: vec![evidence],
+        },
+    })
+}
+
+fn parse_failure_evidence(
+    role: RootlessPodmanConfigSourceRole,
+    error: &RootlessPodmanConfigError,
+) -> String {
+    let line = error
+        .line()
+        .map_or_else(String::new, |line| format!(" at line {line}"));
+    format!(
+        "{} source has {}{}",
+        source_role_name(role),
+        config_error_kind_name(error.kind()),
+        line
+    )
+}
+
+fn canonical_observation_path(
+    field: &str,
+    path: PathBuf,
+) -> Result<PathBuf, RootlessPodmanConfigObservationError> {
+    let Some(value) = path.to_str() else {
+        return Err(RootlessPodmanConfigObservationError::single(format!(
+            "{field} must be valid UTF-8"
+        )));
+    };
+    if value.is_empty()
+        || value == "/"
+        || value.len() > 4_096
+        || value.ends_with('/')
+        || value.contains("//")
+        || value.chars().any(char::is_control)
+        || !path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::RootDir | Component::Normal(_)))
+    {
+        return Err(RootlessPodmanConfigObservationError::single(format!(
+            "{field} must be a canonical non-root absolute path"
+        )));
+    }
+    Ok(path)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RunnerConfigIdentity {
+    uid: u32,
+    gid: u32,
+    group_gid: u32,
+}
+
+impl From<ObservedRunnerIdentity> for RunnerConfigIdentity {
+    fn from(identity: ObservedRunnerIdentity) -> Self {
+        Self {
+            uid: identity.uid(),
+            gid: identity.primary_gid(),
+            group_gid: identity.group_gid(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExpectedOwner {
+    Root,
+    Runner(RunnerConfigIdentity),
+}
+
+impl ExpectedOwner {
+    fn matches(self, uid: u32, gid: u32) -> bool {
+        match self {
+            Self::Root => uid == 0 && gid == 0,
+            Self::Runner(identity) => uid == identity.uid && gid == identity.gid,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrustedConfigFileProblem {
+    UnsafeTraversal,
+    MetadataUnavailable,
+    NotRegularFile,
+    WrongOwner,
+    MultipleLinks,
+    WritableByUntrusted,
+    Oversized,
+    ReadFailed,
+}
+
+impl TrustedConfigFileProblem {
+    const fn evidence(self) -> &'static str {
+        match self {
+            Self::UnsafeTraversal => {
+                "configuration source could not be opened through the reviewed no-symlink path"
+            }
+            Self::MetadataUnavailable => {
+                "configuration source metadata could not be inspected safely"
+            }
+            Self::NotRegularFile => "configuration source is not a regular file",
+            Self::WrongOwner => "configuration source ownership does not match the reviewed source",
+            Self::MultipleLinks => "configuration source does not have exactly one hard link",
+            Self::WritableByUntrusted => {
+                "configuration source is writable by group or other users"
+            }
+            Self::Oversized => "configuration source exceeds the bounded size limit",
+            Self::ReadFailed => "configuration source could not be read within the bounded limit",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TrustedConfigFile {
+    Missing,
+    Present(Vec<u8>),
+    Unknown(TrustedConfigFileProblem),
+}
+
