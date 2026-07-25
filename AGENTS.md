@@ -71,12 +71,14 @@ A doctor warning is acceptable on a development machine that lacks Podman or sys
 
 Keep changes small enough to review. State the security impact, commands run, and any host assumptions. Do not claim a VPS, GitHub runner, Podman preview, route, or provider path passed unless the exact tested commit and result are available.
 
-## Automated review workflow
+## Review workflow
 
-- CodeRabbit is already configured to review non-draft pull requests automatically. Do not manually invoke it after every push.
-- Keep implementation and temporary verification pull requests in draft while actively iterating. Mark the final coherent pull request ready only after the required checks pass.
+- Review your own diff continuously while implementing. Before declaring a change ready, read the complete final diff once for correctness, accidental scope, stale comments, duplicated logic, missing failure cases, and violations of the accepted ADRs.
+- Treat that final once-over plus the required checks as the normal review path. Avoid spawning extra review agents or external review services for routine changes.
+- CodeRabbit automatic reviews are disabled. Request `@coderabbitai review` only for unusually high-value cases: privilege-boundary changes, ownership or adoption logic, durable persistence and recovery, rollback or compensation, secret handling, concurrency or race-sensitive code, destructive operations, or a large cross-cutting change whose failure could cause data loss or host compromise.
+- A large diff alone does not justify CodeRabbit. Documentation, mechanical configuration, formatting, temporary verification work, focused tests, and ordinary typed refactors stay self-reviewed.
+- Request at most one CodeRabbit review for a coherent final diff. Retrigger only after material changes to the high-risk area, when the human operator asks, or when the review failed for a transient service reason.
 - Do not request Codex GitHub reviews or mention `@codex review`. Codex usage is reserved for explicit implementation work requested by the human operator.
-- Retrigger CodeRabbit only when the human operator asks or when a required review failed for a transient service reason.
 - Verify every automated finding against the current code and accepted ADRs. Prioritize demonstrated privilege, ownership, persistence, rollback, race, security, data-loss, and correctness failures.
 - Ignore or explain away speculative style, blanket documentation, duplication, and refactoring suggestions that do not improve behavior or reduce a concrete maintenance risk.
 - Use the `review-exempt` label or `[skip review]` in the title for temporary verification pull requests, mechanical configuration changes, and other changes where automated review would add little value.
