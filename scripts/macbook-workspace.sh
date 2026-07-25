@@ -133,7 +133,8 @@ on run argv
         set targetTab to new tab in targetWindow
       end if
       set hostTerminal to focused terminal of targetTab
-      set hostCommand to "cd -- " & quoted form of repoPath & " && " & quoted form of cmuxPath & " rename-workspace --workspace \"$CMUX_WORKSPACE_ID\" -- " & quoted form of workspaceName & " && " & quoted form of cmuxPath & " rename-tab --surface \"$CMUX_SURFACE_ID\" -- \"Mac host\"; clear"
+      set pullsURL to "https://github.com/teamleaderleo/smolrunner/pulls"
+      set hostCommand to "cd -- " & quoted form of repoPath & " && " & quoted form of cmuxPath & " rename-workspace --workspace \"$CMUX_WORKSPACE_ID\" -- " & quoted form of workspaceName & " && " & quoted form of cmuxPath & " rename-tab --surface \"$CMUX_SURFACE_ID\" -- \"Mac host\" && " & quoted form of cmuxPath & " set-status lima \"running\" --workspace \"$CMUX_WORKSPACE_ID\" --icon \"server.rack\" --color \"#30d158\" && " & quoted form of cmuxPath & " log --workspace \"$CMUX_WORKSPACE_ID\" --level info -- " & quoted form of ("Mac checkout: " & repoPath) & " && " & quoted form of cmuxPath & " log --workspace \"$CMUX_WORKSPACE_ID\" --level info -- " & quoted form of ("Pull requests: " & pullsURL)
       input text (hostCommand & linefeed) to hostTerminal
 
       set vmTerminal to split hostTerminal direction right
