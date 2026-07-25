@@ -4,6 +4,8 @@ SmolRunner should remain useful while it is still small. The roadmap favors a de
 
 The runner-steward design remains the foundation. Later milestones may extend the same ownership, isolation, and planning model into leased workspaces, temporary previews, and a small pool of execution workers. GitHub Actions remains the first scheduler and workflow language.
 
+The long-term reliability and fleet direction is recorded in [the reliable control-loop operating model](OPERATING_MODEL.md). It keeps the public surface small while sequencing release channels, rollback, bounded incident evidence, backup and restore, fleet policy, and narrowly authorised self-repair.
+
 ## Milestone 0 — foundation
 
 - [x] Rust CLI with human and JSON output.
@@ -46,6 +48,8 @@ The runner-steward design remains the foundation. Later milestones may extend th
 - [ ] Repository and organization registration scopes.
 - [ ] Dedicated Linux user and systemd service management.
 - [ ] Runner status, version inspection, update, disable, and removal.
+- [ ] Define development, canary, and stable release channels with draining, exact binary identity, state compatibility, promotion, and rollback ([#110](https://github.com/teamleaderleo/smolrunner/issues/110)).
+- [ ] Retain an independent build and repair path for SmolRunner itself while self-hosted canaries provide supplementary real-host evidence.
 - [ ] Short-lived registration-token handling without persistent plaintext storage.
 
 ## Milestone 3 — project execution
@@ -58,12 +62,17 @@ The runner-steward design remains the foundation. Later milestones may extend th
 - [ ] Focused and full suite conventions without inventing a pipeline language.
 - [ ] Explicit artifact references for successful verification runs.
 
-## Milestone 4 — small-fleet operations
+## Milestone 4 — small-fleet reliability and operations
 
 - [ ] Multi-host inventory over SSH.
 - [ ] Fleet-wide `doctor`, status, and upgrade planning.
 - [ ] Disk-pressure and stale-image diagnostics.
 - [ ] Machine-readable remediation suggestions.
+- [ ] Versioned bounded local incident bundles, coalescing, retention, export, and proposal-only upstream issue preparation ([#111](https://github.com/teamleaderleo/smolrunner/issues/111)).
+- [ ] Versioned backup manifests, tested restore, recovery quarantine, and fresh ownership/GitHub re-observation ([#113](https://github.com/teamleaderleo/smolrunner/issues/113)).
+- [ ] Read-only fleet policy directives with host-local vetoes, maintenance windows, release targets, and resource ceilings ([#112](https://github.com/teamleaderleo/smolrunner/issues/112)).
+- [ ] Add explicit autonomy levels, repair budgets, circuit breakers, quarantine, and escalation before enabling any automatic mutation ([#112](https://github.com/teamleaderleo/smolrunner/issues/112)).
+- [ ] Enable automatic repair one narrowly reviewed action class at a time only after exact ownership, durable journals, fresh verification, rollback or compensation, canary evidence, and incident capture exist.
 - [ ] Optional terminal UI backed by the same core library.
 
 ## Milestone 5 — leased execution foundation
@@ -109,7 +118,8 @@ The runner-steward design remains the foundation. Later milestones may extend th
 - External deployment-target adapters for selected static or preview workloads.
 - Per-target budgets and an explicit local-first fallback policy.
 - Web dashboard.
-- Background daemon for lease supervision, heartbeats, and asynchronous cleanup.
+- Background daemon for lease supervision, heartbeats, asynchronous cleanup, and bounded policy reconciliation.
+- Opt-in authenticated incident submission after local incident contracts, duplicate detection, redaction validation, rate limits, and durable GitHub submission journals exist.
 - GitHub App authentication.
 - Ephemeral machine provisioning.
 - Additional Linux distributions and service managers.
@@ -123,3 +133,4 @@ The runner-steward design remains the foundation. Later milestones may extend th
 - Becoming a generic public deployment platform.
 - Automatically deploying every successful verification run.
 - Building a custom container runtime, reverse proxy, or TLS stack.
+- Granting a fleet coordinator, telemetry service, or agent unrestricted shell or self-expanded mutation authority.
