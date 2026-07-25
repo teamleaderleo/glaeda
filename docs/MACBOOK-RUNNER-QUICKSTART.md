@@ -4,7 +4,43 @@ This is the short operator path for the existing `smolrunner` Lima development V
 
 Run commands from the SmolRunner checkout on the Mac.
 
-## First-time cmux setup
+## Default tmux workspace
+
+```bash
+make work
+```
+
+This command:
+
+- installs Mac-side `tmux` and Lima through Homebrew when either command is missing;
+- starts the existing `smolrunner` Lima instance when needed;
+- creates or reattaches to a Mac-side tmux session named `smolrunner`;
+- opens a `host` window rooted in the Mac checkout;
+- opens a `vm` window containing an interactive Lima guest shell.
+
+Re-running `make work` reattaches to the same session and recreates either standard window if it was closed. The helper does not create a missing VM, provision the guest, register an Actions listener, or copy Mac credentials into Linux.
+
+Useful default tmux keys use the `Ctrl-b` prefix:
+
+- `Ctrl-b n` / `Ctrl-b p`: next or previous window;
+- `Ctrl-b 0` / `Ctrl-b 1`: select the host or VM window directly;
+- `Ctrl-b c`: create another Mac-side window;
+- `Ctrl-b %`: split vertically;
+- `Ctrl-b "`: split horizontally;
+- `Ctrl-b d`: detach while leaving the session running;
+- `Ctrl-b [`: enter scroll/copy mode; press `q` to leave it.
+
+Override the tmux session name when needed:
+
+```bash
+SMOLRUNNER_WORK_SESSION=another-session make work
+```
+
+`make work-tmux` remains an explicit alias for this compatibility path.
+
+## Opt-in cmux workspace
+
+cmux remains opt-in until the launcher completes hands-on acceptance on the target Apple Silicon Mac.
 
 Install cmux explicitly, start the existing VM, and open the workspace:
 
@@ -19,45 +55,21 @@ The setup command:
 - starts the existing `smolrunner` Lima instance;
 - opens a cmux workspace named `smolrunner` with a `Mac host` terminal and a `Lima VM` terminal.
 
-cmux may trigger the standard macOS Automation permission prompt when the invoking terminal first asks cmux to create or select the workspace. The helper leaves cmux socket access unchanged. Keep cmux automation in its process-only mode; broad modes such as `allowAll` are outside the SmolRunner boundary.
-
-## Everyday workspace
-
-After cmux is installed:
+After cmux is installed, open or select that workspace with:
 
 ```bash
-make work
+make work-cmux
 ```
-
-This command starts the existing VM when needed, selects the named cmux workspace when it already exists, and creates the two-terminal workspace when it is absent. cmux provides the vertical workspace sidebar, split panes, session restoration, and attention indicators.
 
 Override the workspace name when needed:
 
 ```bash
-SMOLRUNNER_WORK_SESSION=another-session make work
+SMOLRUNNER_WORK_SESSION=another-session make work-cmux
 ```
 
-The launcher uses cmux's macOS scripting interface to find or create the human-facing workspace. Commands that rename the workspace and terminal tabs run inside cmux, so the helper never enables broad external socket control. The Lima guest receives no cmux socket, Mac filesystem mount, SSH agent, or copied credential.
+cmux may trigger the standard macOS Automation permission prompt when the invoking terminal first asks cmux to create or select the workspace. The launcher uses cmux's macOS scripting interface to find or create the human-facing workspace. Commands that rename the workspace and terminal tabs run inside cmux, so the helper leaves socket access unchanged and never enables broad external control.
 
-## tmux fallback
-
-The previous Mac-side tmux workspace remains available:
-
-```bash
-make work-tmux
-```
-
-This installs missing Mac-side `tmux` and Lima packages through Homebrew, starts the existing VM, and creates or reattaches to a tmux session with `host` and `vm` windows.
-
-Useful default tmux keys use the `Ctrl-b` prefix:
-
-- `Ctrl-b n` / `Ctrl-b p`: next or previous window;
-- `Ctrl-b 0` / `Ctrl-b 1`: select the host or VM window directly;
-- `Ctrl-b c`: create another Mac-side window;
-- `Ctrl-b %`: split vertically;
-- `Ctrl-b "`: split horizontally;
-- `Ctrl-b d`: detach while leaving the session running;
-- `Ctrl-b [`: enter scroll/copy mode; press `q` to leave it.
+The Lima guest receives no cmux socket, Mac filesystem mount, SSH agent, or copied credential. cmux provides the vertical workspace sidebar, split panes, session restoration, and attention indicators while remaining a human-facing view over SmolRunner commands.
 
 ## Open only the VM
 
@@ -83,7 +95,7 @@ make vm-observe  # read-only Mac and guest resource report
 make vm-stop     # graceful VM stop
 ```
 
-When `make vm-doctor` runs from a cmux terminal, completion or failure also produces a fixed cmux notification. The notification contains only the bounded result and exit status; doctor output remains in the terminal.
+When `make vm-doctor` runs from a cmux terminal, completion or failure also produces a fixed cmux notification. The notification contains only the bounded result and exit status; doctor output remains in the terminal. Outside cmux, notification delivery is a silent no-op.
 
 The full wrappers are also available directly:
 
