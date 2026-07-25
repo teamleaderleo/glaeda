@@ -1,8 +1,12 @@
 # ADR 0019: Rootless Podman readiness observation
 
-- Status: Accepted
+- Status: Superseded by ADR 0020
 - Date: 2026-07-25
 - Related: issue #77, ADR 0017, ADR 0018
+
+## Supersession note
+
+ADR 0020 supersedes this decision because invoking `podman info` is not reliably read-only: Podman may initialize graph-root state, lock files, and the libpod database while answering the query. This document remains as the historical design that exposed the requirement, but its command sequence must not be integrated into `host plan`.
 
 ## Context
 
@@ -112,4 +116,4 @@ Implementation must include:
 
 ## Follow-up
 
-A subsequent implementation slice will add the typed observer and integrate its report into `host plan`. Mutation remains blocked until durable reconciliation journals and reviewed apply actions are complete.
+ADR 0020 replaces this follow-up with a non-mutating static preflight plus a separately journaled first-run Podman smoke verification. No Podman command may be added to `host plan`.
