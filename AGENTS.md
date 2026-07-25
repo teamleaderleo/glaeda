@@ -15,10 +15,11 @@ Do not turn SmolRunner into a new pipeline language, runner protocol, Kubernetes
 3. Build a dependable CLI and structured state model before adding a daemon, TUI, or web dashboard.
 4. Prefer idempotent plans and explicit reconciliation over one-shot shell setup.
 5. Keep project-specific build and test behavior inside each enrolled repository.
-6. Unknown manifest, ownership-marker, fingerprint, lease, and artifact fields or versions must fail closed.
+6. Unknown manifest, ownership-marker, fingerprint, lease, artifact, fleet-directive, incident, backup, and release-policy fields or versions must fail closed.
 7. Distinguish proven absence from unknown state; never mutate based on an unproven assumption.
 8. Keep frequent verification separate from live preview creation. A successful check does not imply a deployment.
 9. Prove one local execution and preview backend before worker selection or external provider adapters.
+10. Keep the public surface small while implementing reliability through the explicit release, incident, backup, fleet-policy, repair-budget, and recovery contracts in `docs/OPERATING_MODEL.md`.
 
 ## Required checks
 
@@ -34,7 +35,7 @@ cargo run --locked --quiet -- --output json plan --file examples/glossless.yml
 cargo run --locked --quiet -- --output json host plan --file examples/quarry.yml
 ```
 
-A doctor warning is acceptable on a development machine that lacks Podman or systemd. A doctor failure must be understood and documented. Planning must never mutate the filesystem, users, services, containers, routes, leases, or GitHub state.
+A doctor warning is acceptable on a development machine that lacks Podman or systemd. A doctor failure must be understood and documented. Planning must never mutate the filesystem, users, services, containers, routes, leases, GitHub state, release state, incident stores, backup stores, or fleet policy.
 
 ## Implementation rules
 
@@ -48,7 +49,7 @@ A doctor warning is acceptable on a development machine that lacks Podman or sys
 - Irreversible actions must block the entire batch before the first mutation unless explicitly confirmed.
 - Rollback and compensation run in reverse completion order; do not describe compensation as restoration.
 - Public journals may contain only public receipts and public failures.
-- Names, labels, mutable tags, preview slots, and path basenames never prove ownership.
+- Names, labels, mutable tags, preview slots, release channels, and path basenames never prove ownership or exact release identity.
 - Production planning and probing must use kind-specific canonical resource constructors; do not build free-form locators or fingerprints.
 - Desired identities require their kind's minimum immutable evidence. Observations may omit evidence only so classification can report `unknown`; present evidence must validate canonically.
 - An unmarked exact-evidence match is adoptable only after explicit confirmation; it is never automatically managed.
@@ -66,10 +67,16 @@ A doctor warning is acceptable on a development machine that lacks Podman or sys
 - Tests must not require root, systemd, Podman, a reverse proxy, or live GitHub credentials unless explicitly marked as integration tests.
 - Keep manifests limited to host and execution policy. Language-specific build behavior belongs in repository-owned scripts and Containerfiles.
 - Keep the initial target local and explicit. Provider routing belongs behind a narrow adapter after local lifecycle and cleanup prove dependable.
+- No self-update may replace privileged control logic while a job or reconciliation journal is active. Exact binary digest, state compatibility, drain state, previous verified version, and post-switch health evidence are required before an upgrade can complete.
+- No automatic repair path may exist without an explicit action-class policy, repair budget, circuit breaker, exact ownership, durable checkpoint, fresh post-action observation, and defined rollback or compensation class.
+- Fleet directives are desired-state inputs, not remote-shell authority. Host-local ownership conflicts, unknown state, active work, recovery mode, and operator holds remain vetoes.
+- Incident evidence is local-first, bounded, versioned, and redacted. It must exclude raw repository contents, arbitrary logs, environment dumps, tokens, credentials, and unrelated machine data.
+- Agent diagnosis and recommendations remain separate from observed facts. Agents may propose issues, tests, patches, and pull requests but may not expand their own authority, approve their own privileged mutation, or treat a generated fix as verified before reproducing and clearing the original failure.
+- Restore begins quarantined. Restored names and documents do not authorise adoption until fresh host and GitHub observations satisfy the canonical ownership contract.
 
 ## Pull requests
 
-Keep changes small enough to review. State the security impact, commands run, and any host assumptions. Do not claim a VPS, GitHub runner, Podman preview, route, or provider path passed unless the exact tested commit and result are available.
+Keep changes small enough to review. State the security impact, commands run, and any host assumptions. Do not claim a VPS, GitHub runner, Podman preview, route, provider path, automatic repair, rollback, restore, incident upload, or fleet directive passed unless the exact tested commit and result are available.
 
 ## Review workflow
 
