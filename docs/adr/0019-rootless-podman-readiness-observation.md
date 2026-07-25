@@ -20,7 +20,7 @@ SmolRunner will add one typed, read-only rootless Podman readiness report after 
 
 The observer runs only when all of the following are proven:
 
-1. the exact `/usr/bin/podman`, `/usr/sbin/runuser`, `/usr/bin/env`, and `/usr/bin/systemctl` executables pass reviewed ownership and file-type verification;
+1. the exact `/usr/bin/podman`, `/usr/sbin/runuser`, `/usr/bin/env`, `/usr/bin/systemctl`, and `/usr/bin/cat` executables pass reviewed ownership and file-type verification;
 2. the runner account, primary group, home directory, subordinate UID range, subordinate GID range, and linger state are matching;
 3. the runner UID and primary GID are nonzero;
 4. `/run/user/<uid>` exists, is a directory, is owned by the runner UID, and is not group- or world-writable;
@@ -46,7 +46,7 @@ The observer executes the following bounded sequence in order and stops when a d
 1. **Podman engine and storage**
    - `/usr/bin/podman info --format json`
    - Parse only bounded JSON fields needed to establish rootless mode, graph root, run root, storage driver, cgroup manager, and network backend.
-   - Require the report to identify rootless operation and paths within reviewed runner-owned locations.
+   - Require the report to identify rootless operation. The run root must be beneath the reviewed runtime directory. The graph root must be beneath the reviewed runner home or another separately reviewed runner-owned storage root.
 
 2. **User namespace mapping**
    - `/usr/bin/podman unshare /usr/bin/cat /proc/self/uid_map`
@@ -60,8 +60,7 @@ The observer executes the following bounded sequence in order and stops when a d
 
 4. **User systemd session**
    - `/usr/bin/systemctl --user is-system-running`
-   - `/usr/bin/systemctl --user show-environment`
-   - Accept `running` or `degraded` only when the command reached the exact user manager and `XDG_RUNTIME_DIR` remains the reviewed value. Do not require systemd to be PID 1 in container-only tests.
+   - Accept `running` or `degraded` only when the command reaches the exact user manager through the reviewed runtime directory. Do not inspect or serialize the user manager environment. Do not require systemd to be PID 1 in container-only tests.
 
 5. **Read-only container smoke check**
    - Deferred from the initial observer. Pulling an image, creating a container, writing storage, or starting a service is mutation and belongs to a later explicit reconciliation action.
