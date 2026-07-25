@@ -1,0 +1,44 @@
+name: Trigger host Podman composition
+
+on:
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'feat/compose-podman-config-host-plan'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out implementation branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: feat/compose-podman-config-host-plan
+
+      - name: Execute reviewed composition block
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          source = Path('.github/workflows/apply-host-podman-composition.yml').read_text().splitlines()
+          start = source.index('      - name: Compose Podman readiness into host report')
+          run_line = next(i for i in range(start, len(source)) if source[i] == '        run: |')
+          end = next(i for i in range(run_line + 1, len(source)) if source[i].startswith('      - name:'))
+          block = '\n'.join(line[10:] if line.startswith('          ') else line for line in source[run_line + 1:end])
+          Path('/tmp/apply-host-podman-composition.sh').write_text(block + '\n')
+          PY
+          bash /tmp/apply-host-podman-composition.sh
+
+      - name: Commit exact composed output
+        run: |
+          set -euo pipefail
+          git diff --check
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/lib.rs src/host_readiness.rs src/host_readiness_verdict.rs src/host_rootless_podman.rs src/host_rootless_podman/tests.rs
+          git commit -m 'Compose Podman configuration into host planning'
+          git push origin HEAD:feat/compose-podman-config-host-plan
