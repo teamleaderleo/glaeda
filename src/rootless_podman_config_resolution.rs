@@ -2,9 +2,7 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::Serialize;
 
-use crate::rootless_podman_config::{
-    RootlessPodmanContainersConfig, RootlessPodmanStorageConfig,
-};
+use crate::rootless_podman_config::{RootlessPodmanContainersConfig, RootlessPodmanStorageConfig};
 
 pub const ROOTLESS_PODMAN_CONFIG_RESOLUTION_SCHEMA_VERSION: u8 = 1;
 
@@ -260,11 +258,7 @@ pub fn resolve_rootless_podman_config(
 ) -> RootlessPodmanResolvedConfig {
     RootlessPodmanResolvedConfig {
         schema_version: ROOTLESS_PODMAN_CONFIG_RESOLUTION_SCHEMA_VERSION,
-        containers: resolve_containers([
-            vendor_containers,
-            system_containers,
-            runner_containers,
-        ]),
+        containers: resolve_containers([vendor_containers, system_containers, runner_containers]),
         storage: resolve_storage(context, system_storage, runner_storage),
     }
 }
@@ -713,10 +707,7 @@ mod tests {
             &context(),
             &source(
                 "/usr/share/containers/containers.conf",
-                RootlessPodmanConfigSourceState::Present(containers(
-                    Some("cgroupfs"),
-                    Some("cni"),
-                )),
+                RootlessPodmanConfigSourceState::Present(containers(Some("cgroupfs"), Some("cni"))),
             ),
             &source(
                 "/etc/containers/containers.conf",
@@ -752,10 +743,7 @@ mod tests {
             &context(),
             &source(
                 "/usr/share/containers/containers.conf",
-                RootlessPodmanConfigSourceState::Present(containers(
-                    Some("cgroupfs"),
-                    Some("cni"),
-                )),
+                RootlessPodmanConfigSourceState::Present(containers(Some("cgroupfs"), Some("cni"))),
             ),
             &source(
                 "/etc/containers/containers.conf",
