@@ -228,11 +228,7 @@ fn relevant_field(
     relevant_field_for_full_path(kind, &full)
 }
 
-fn looks_like_relevant_key(
-    kind: RootlessPodmanConfigKind,
-    section: Section,
-    source: &str,
-) -> bool {
+fn looks_like_relevant_key(kind: RootlessPodmanConfigKind, section: Section, source: &str) -> bool {
     let Some(relative) = normalize_leading_key_path(source) else {
         return false;
     };
@@ -251,35 +247,25 @@ fn full_key_path(section: Section, relative: &str) -> Option<String> {
     }
 }
 
-fn relevant_field_for_full_path(
-    kind: RootlessPodmanConfigKind,
-    full: &str,
-) -> Option<ConfigField> {
+fn relevant_field_for_full_path(kind: RootlessPodmanConfigKind, full: &str) -> Option<ConfigField> {
     match (kind, full) {
-        (RootlessPodmanConfigKind::Storage, "storage.driver") => {
-            Some(ConfigField::StorageDriver)
-        }
-        (RootlessPodmanConfigKind::Storage, "storage.runroot") => {
-            Some(ConfigField::StorageRunroot)
-        }
+        (RootlessPodmanConfigKind::Storage, "storage.driver") => Some(ConfigField::StorageDriver),
+        (RootlessPodmanConfigKind::Storage, "storage.runroot") => Some(ConfigField::StorageRunroot),
         (RootlessPodmanConfigKind::Storage, "storage.graphroot") => {
             Some(ConfigField::StorageGraphroot)
         }
-        (
-            RootlessPodmanConfigKind::Storage,
-            "storage.rootless_storage_path",
-        ) => Some(ConfigField::RootlessStoragePath),
-        (
-            RootlessPodmanConfigKind::Storage,
-            "storage.options.overlay.mount_program",
-        ) => Some(ConfigField::OverlayMountProgram),
+        (RootlessPodmanConfigKind::Storage, "storage.rootless_storage_path") => {
+            Some(ConfigField::RootlessStoragePath)
+        }
+        (RootlessPodmanConfigKind::Storage, "storage.options.overlay.mount_program") => {
+            Some(ConfigField::OverlayMountProgram)
+        }
         (RootlessPodmanConfigKind::Containers, "engine.cgroup_manager") => {
             Some(ConfigField::CgroupManager)
         }
-        (
-            RootlessPodmanConfigKind::Containers,
-            "network.network_backend",
-        ) => Some(ConfigField::NetworkBackend),
+        (RootlessPodmanConfigKind::Containers, "network.network_backend") => {
+            Some(ConfigField::NetworkBackend)
+        }
         _ => None,
     }
 }
