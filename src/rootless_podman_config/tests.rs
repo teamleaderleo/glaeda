@@ -26,10 +26,7 @@ mountopt = "nodev"
 
     let parsed = parse_rootless_podman_storage_config(config).expect("storage config");
     assert_eq!(parsed.driver.as_deref(), Some("overlay"));
-    assert_eq!(
-        parsed.runroot.as_deref(),
-        Some("/run/user/1001/containers")
-    );
+    assert_eq!(parsed.runroot.as_deref(), Some("/run/user/1001/containers"));
     assert_eq!(
         parsed.graphroot.as_deref(),
         Some("$HOME/.local/share/containers/storage")
@@ -89,10 +86,9 @@ mount_program = "/usr/bin/fuse\\overlayfs"
 
 #[test]
 fn duplicate_relevant_keys_fail_closed() {
-    let error = parse_rootless_podman_storage_config(
-        "[storage]\ndriver = \"overlay\"\ndriver = \"vfs\"\n",
-    )
-    .expect_err("duplicate must fail");
+    let error =
+        parse_rootless_podman_storage_config("[storage]\ndriver = \"overlay\"\ndriver = \"vfs\"\n")
+            .expect_err("duplicate must fail");
 
     assert_eq!(
         error.kind(),
@@ -151,8 +147,8 @@ fn malformed_tables_fail_while_well_formed_array_tables_remain_outside_the_subse
         "[[storage]\ndriver = \"overlay\"\n",
         "[[]]\ndriver = \"overlay\"\n",
     ] {
-        let error = parse_rootless_podman_storage_config(config)
-            .expect_err("malformed table must fail");
+        let error =
+            parse_rootless_podman_storage_config(config).expect_err("malformed table must fail");
         assert_eq!(error.kind(), RootlessPodmanConfigErrorKind::MalformedTable);
         assert_eq!(error.line(), Some(1));
     }

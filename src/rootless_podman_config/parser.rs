@@ -40,9 +40,7 @@ pub(super) fn parse_relevant_fields(
             return Err(RootlessPodmanConfigError::new(
                 RootlessPodmanConfigErrorKind::LineTooLong,
                 Some(line_number),
-                format!(
-                    "configuration line exceeds {MAX_ROOTLESS_PODMAN_CONFIG_LINE_BYTES} bytes"
-                ),
+                format!("configuration line exceeds {MAX_ROOTLESS_PODMAN_CONFIG_LINE_BYTES} bytes"),
             ));
         }
         let line = strip_comment(raw_line).trim();
@@ -90,23 +88,20 @@ fn validate_document(input: &str) -> Result<(), RootlessPodmanConfigError> {
         return Err(RootlessPodmanConfigError::new(
             RootlessPodmanConfigErrorKind::Oversized,
             None,
-            format!(
-                "configuration input exceeds {MAX_ROOTLESS_PODMAN_CONFIG_BYTES} bytes"
-            ),
+            format!("configuration input exceeds {MAX_ROOTLESS_PODMAN_CONFIG_BYTES} bytes"),
         ));
     }
     if input.lines().count() > MAX_ROOTLESS_PODMAN_CONFIG_LINES {
         return Err(RootlessPodmanConfigError::new(
             RootlessPodmanConfigErrorKind::TooManyLines,
             None,
-            format!(
-                "configuration input exceeds {MAX_ROOTLESS_PODMAN_CONFIG_LINES} lines"
-            ),
+            format!("configuration input exceeds {MAX_ROOTLESS_PODMAN_CONFIG_LINES} lines"),
         ));
     }
-    if input.chars().any(|character| {
-        character.is_control() && !matches!(character, '\n' | '\r' | '\t')
-    }) {
+    if input
+        .chars()
+        .any(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
+    {
         return Err(RootlessPodmanConfigError::new(
             RootlessPodmanConfigErrorKind::InvalidControlCharacter,
             None,
@@ -133,9 +128,9 @@ fn parse_section(line: &str, line_number: usize) -> Result<Section, RootlessPodm
 
     let name = name.trim();
     if name.is_empty()
-        || !name.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')
-        })
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
     {
         return Err(malformed_table(line_number));
     }
@@ -206,11 +201,7 @@ fn strip_comment(line: &str) -> &str {
     line
 }
 
-fn starts_with_relevant_key(
-    kind: RootlessPodmanConfigKind,
-    section: Section,
-    line: &str,
-) -> bool {
+fn starts_with_relevant_key(kind: RootlessPodmanConfigKind, section: Section, line: &str) -> bool {
     relevant_field(kind, section, leading_bare_key(line)).is_some()
 }
 
@@ -242,11 +233,9 @@ fn relevant_field(
         (RootlessPodmanConfigKind::Storage, Section::Storage, "rootless_storage_path") => {
             Some(ConfigField::RootlessStoragePath)
         }
-        (
-            RootlessPodmanConfigKind::Storage,
-            Section::StorageOptionsOverlay,
-            "mount_program",
-        ) => Some(ConfigField::OverlayMountProgram),
+        (RootlessPodmanConfigKind::Storage, Section::StorageOptionsOverlay, "mount_program") => {
+            Some(ConfigField::OverlayMountProgram)
+        }
         (RootlessPodmanConfigKind::Containers, Section::Engine, "cgroup_manager") => {
             Some(ConfigField::CgroupManager)
         }
