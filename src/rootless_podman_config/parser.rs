@@ -19,11 +19,27 @@ pub(super) enum ConfigField {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Section {
+    Root,
     Storage,
+    StorageOptions,
     StorageOptionsOverlay,
     Engine,
     Network,
     Other,
+}
+
+impl Section {
+    const fn prefix(self) -> Option<&'static str> {
+        match self {
+            Self::Root => Some(""),
+            Self::Storage => Some("storage"),
+            Self::StorageOptions => Some("storage.options"),
+            Self::StorageOptionsOverlay => Some("storage.options.overlay"),
+            Self::Engine => Some("engine"),
+            Self::Network => Some("network"),
+            Self::Other => None,
+        }
+    }
 }
 
 pub(super) fn parse_relevant_fields(
@@ -32,7 +48,7 @@ pub(super) fn parse_relevant_fields(
 ) -> Result<BTreeMap<ConfigField, String>, RootlessPodmanConfigError> {
     validate_document(input)?;
 
-    let mut section = Section::Other;
+    let mut section = Section::Root;
     let mut fields = BTreeMap::new();
     for (index, raw_line) in input.lines().enumerate() {
         let line_number = index + 1;
@@ -53,7 +69,7 @@ pub(super) fn parse_relevant_fields(
         }
 
         let Some((raw_key, raw_value)) = split_assignment(line) else {
-            if starts_with_relevant_key(kind, section, line) {
+            if looks_like_relevant_key(kind, section, line) {
                 return Err(malformed_assignment(
                     line_number,
                     "relevant configuration key must use a key = \"value\" assignment",
@@ -63,7 +79,7 @@ pub(super) fn parse_relevant_fields(
         };
         let key = raw_key.trim();
         let Some(field) = relevant_field(kind, section, key) else {
-            if starts_with_relevant_key(kind, section, key) {
+            if looks_like_relevant_key(kind, section, key) {
                 return Err(malformed_assignment(
                     line_number,
                     "relevant configuration key contains unsupported assignment syntax",
@@ -140,6 +156,7 @@ fn parse_section(line: &str, line_number: usize) -> Result<Section, RootlessPodm
 
     Ok(match name {
         "storage" => Section::Storage,
+        "storage.options" => Section::StorageOptions,
         "storage.options.overlay" => Section::StorageOptionsOverlay,
         "engine" => Section::Engine,
         "network" => Section::Network,
@@ -201,49 +218,151 @@ fn strip_comment(line: &str) -> &str {
     line
 }
 
-fn starts_with_relevant_key(kind: RootlessPodmanConfigKind, section: Section, line: &str) -> bool {
-    relevant_field(kind, section, leading_bare_key(line)).is_some()
-}
-
-fn leading_bare_key(line: &str) -> &str {
-    let end = line
-        .char_indices()
-        .find(|(_, character)| {
-            !(character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
-        })
-        .map_or(line.len(), |(index, _)| index);
-    &line[..end]
-}
-
 fn relevant_field(
     kind: RootlessPodmanConfigKind,
     section: Section,
     key: &str,
 ) -> Option<ConfigField> {
-    match (kind, section, key) {
-        (RootlessPodmanConfigKind::Storage, Section::Storage, "driver") => {
+    let relative = normalize_complete_key_path(key, false)?;
+    let full = full_key_path(section, &relative)?;
+    relevant_field_for_full_path(kind, &full)
+}
+
+fn looks_like_relevant_key(
+    kind: RootlessPodmanConfigKind,
+    section: Section,
+    source: &str,
+) -> bool {
+    let Some(relative) = normalize_leading_key_path(source) else {
+        return false;
+    };
+    let Some(full) = full_key_path(section, &relative) else {
+        return false;
+    };
+    relevant_field_for_full_path(kind, &full).is_some()
+}
+
+fn full_key_path(section: Section, relative: &str) -> Option<String> {
+    let prefix = section.prefix()?;
+    if prefix.is_empty() {
+        Some(relative.to_owned())
+    } else {
+        Some(format!("{prefix}.{relative}"))
+    }
+}
+
+fn relevant_field_for_full_path(
+    kind: RootlessPodmanConfigKind,
+    full: &str,
+) -> Option<ConfigField> {
+    match (kind, full) {
+        (RootlessPodmanConfigKind::Storage, "storage.driver") => {
             Some(ConfigField::StorageDriver)
         }
-        (RootlessPodmanConfigKind::Storage, Section::Storage, "runroot") => {
+        (RootlessPodmanConfigKind::Storage, "storage.runroot") => {
             Some(ConfigField::StorageRunroot)
         }
-        (RootlessPodmanConfigKind::Storage, Section::Storage, "graphroot") => {
+        (RootlessPodmanConfigKind::Storage, "storage.graphroot") => {
             Some(ConfigField::StorageGraphroot)
         }
-        (RootlessPodmanConfigKind::Storage, Section::Storage, "rootless_storage_path") => {
-            Some(ConfigField::RootlessStoragePath)
-        }
-        (RootlessPodmanConfigKind::Storage, Section::StorageOptionsOverlay, "mount_program") => {
-            Some(ConfigField::OverlayMountProgram)
-        }
-        (RootlessPodmanConfigKind::Containers, Section::Engine, "cgroup_manager") => {
+        (
+            RootlessPodmanConfigKind::Storage,
+            "storage.rootless_storage_path",
+        ) => Some(ConfigField::RootlessStoragePath),
+        (
+            RootlessPodmanConfigKind::Storage,
+            "storage.options.overlay.mount_program",
+        ) => Some(ConfigField::OverlayMountProgram),
+        (RootlessPodmanConfigKind::Containers, "engine.cgroup_manager") => {
             Some(ConfigField::CgroupManager)
         }
-        (RootlessPodmanConfigKind::Containers, Section::Network, "network_backend") => {
-            Some(ConfigField::NetworkBackend)
-        }
+        (
+            RootlessPodmanConfigKind::Containers,
+            "network.network_backend",
+        ) => Some(ConfigField::NetworkBackend),
         _ => None,
     }
+}
+
+fn normalize_complete_key_path(input: &str, allow_quoted: bool) -> Option<String> {
+    let (path, consumed) = parse_key_path_prefix(input, allow_quoted)?;
+    input[consumed..].trim().is_empty().then_some(path)
+}
+
+fn normalize_leading_key_path(input: &str) -> Option<String> {
+    parse_key_path_prefix(input, true).map(|(path, _)| path)
+}
+
+fn parse_key_path_prefix(input: &str, allow_quoted: bool) -> Option<(String, usize)> {
+    let mut offset = 0;
+    let mut segments = Vec::new();
+
+    loop {
+        offset += input[offset..]
+            .char_indices()
+            .take_while(|(_, character)| matches!(character, ' ' | '\t'))
+            .map(|(_, character)| character.len_utf8())
+            .sum::<usize>();
+        if offset >= input.len() {
+            return None;
+        }
+
+        let remaining = &input[offset..];
+        let first = remaining.chars().next()?;
+        let (segment, consumed) = if matches!(first, '\'' | '"') {
+            if !allow_quoted {
+                return None;
+            }
+            parse_simple_quoted_key_segment(remaining, first)?
+        } else {
+            let consumed = remaining
+                .char_indices()
+                .take_while(|(_, character)| is_bare_key_character(*character))
+                .map(|(_, character)| character.len_utf8())
+                .sum::<usize>();
+            if consumed == 0 {
+                return None;
+            }
+            (&remaining[..consumed], consumed)
+        };
+        if segment.is_empty() || !segment.chars().all(is_bare_key_character) {
+            return None;
+        }
+        segments.push(segment.to_owned());
+        offset += consumed;
+
+        let whitespace = input[offset..]
+            .char_indices()
+            .take_while(|(_, character)| matches!(character, ' ' | '\t'))
+            .map(|(_, character)| character.len_utf8())
+            .sum::<usize>();
+        offset += whitespace;
+        if input[offset..].starts_with('.') {
+            offset += 1;
+            continue;
+        }
+        break;
+    }
+
+    Some((segments.join("."), offset))
+}
+
+fn parse_simple_quoted_key_segment(input: &str, quote: char) -> Option<(&str, usize)> {
+    let start = quote.len_utf8();
+    for (offset, character) in input[start..].char_indices() {
+        if character == quote {
+            let end = start + offset;
+            return Some((&input[start..end], end + character.len_utf8()));
+        }
+        if character.is_control() || (quote == '"' && character == '\\') {
+            return None;
+        }
+    }
+    None
+}
+
+fn is_bare_key_character(character: char) -> bool {
+    character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
 }
 
 fn parse_quoted_value(
