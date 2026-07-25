@@ -367,7 +367,7 @@ mod tests {
             ExecutionLane::RunnerUser,
             RollbackClass::Irreversible,
         );
-        let root_command = root_command(&root);
+        let bound_root_command = root_command(&root);
         let extra_command = root_command(&extra);
 
         let missing = DurableLanePlan::new(vec![root.clone()], Vec::new()).expect_err("missing");
@@ -380,7 +380,7 @@ mod tests {
 
         let extra_result = DurableLanePlan::new(
             vec![root.clone()],
-            vec![root_command.clone(), extra_command],
+            vec![bound_root_command.clone(), extra_command],
         )
         .expect_err("extra");
         assert!(
@@ -392,7 +392,7 @@ mod tests {
 
         let duplicate = DurableLanePlan::new(
             vec![root.clone()],
-            vec![root_command.clone(), root_command.clone()],
+            vec![bound_root_command.clone(), bound_root_command.clone()],
         )
         .expect_err("duplicate");
         assert!(
@@ -402,7 +402,7 @@ mod tests {
                 .any(|problem| problem.contains("duplicate"))
         );
 
-        let lane = DurableLanePlan::new(vec![runner_lane], vec![root_command.clone()])
+        let lane = DurableLanePlan::new(vec![runner_lane], vec![bound_root_command.clone()])
             .expect_err("lane mismatch");
         assert!(
             lane.problems
