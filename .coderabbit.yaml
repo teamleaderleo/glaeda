@@ -10,6 +10,14 @@ reviews:
   review_status: false
   review_details: false
 
+  finishing_touches:
+    docstrings:
+      enabled: false
+
+  pre_merge_checks:
+    docstrings:
+      mode: "off"
+
   auto_review:
     enabled: true
     auto_incremental_review: true
@@ -57,6 +65,7 @@ reviews:
       instructions: |
         Enforce AGENTS.md and the accepted ADRs.
         Check that human and JSON output derive from the same typed reports, unsafe Rust remains absent, dependencies carry concrete justification, and tests cover failure and race paths without requiring privileged host services by default.
+        Do not request doc comments or ordinary comments that merely restate names, types, parameters, or implementation. Missing documentation alone is not a finding; request it only for public contracts, safety invariants, persisted formats, compatibility constraints, or genuinely non-obvious behavior.
 
 chat:
   auto_reply: true
