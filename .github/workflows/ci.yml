@@ -26,7 +26,9 @@ jobs:
           git checkout --quiet -B codex/runner-account-observation FETCH_HEAD
 
       - name: Apply canonical-path and no-follow traversal hardening
-        run: python3 .github/seal-observation-paths.py
+        run: |
+          python3 .github/seal-observation-paths.py
+          sed -i 's/use std::io::{self, Read as _};/use std::io::Read as _;/' src/runner_account_observation.rs
 
       - name: Format source
         run: cargo fmt --all
