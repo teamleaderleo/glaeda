@@ -6,47 +6,13 @@ on:
     branches: [main]
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: verify-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  apply-issue-132:
-    if: github.head_ref == 'codex/compose-podman-host-plan'
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Check out composition branch
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          ref: codex/compose-podman-host-plan
-          fetch-depth: 0
-      - name: Apply and publish typed host composition
-        run: |
-          set +e
-          python3 .github/patch-issue-132.py > /tmp/issue-132.out 2>&1
-          status=$?
-          set -e
-          if [ "$status" -ne 0 ]; then
-            cp /tmp/issue-132.out .github/issue-132-materializer-error.txt
-            git checkout origin/main -- .github/workflows/ci.yml
-            git config user.name github-actions[bot]
-            git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-            git add .github/workflows/ci.yml .github/issue-132-materializer-error.txt
-            git commit -m 'Record issue 132 materializer diagnostic'
-            git push origin HEAD:codex/compose-podman-host-plan
-            exit 0
-          fi
-          cargo fmt --all
-          git checkout origin/main -- .github/workflows/ci.yml
-          rm -f .github/patch-issue-132.py .github/issue-132-materializer-error.txt
-          git config user.name github-actions[bot]
-          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add -A
-          git commit -m 'Compose Podman configuration into host planning'
-          git push origin HEAD:codex/compose-podman-host-plan
-
   verify:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -86,4 +52,4 @@ jobs:
       - name: Exercise read-only host planning
         run: |
           cargo run --locked --quiet -- --output json host plan --file examples/quarry.yml \
-            | jq -e '.schema_version == 1 and .disposition and (.findings | type == "array") and (.report.executables | length == 3) and .report.package_plan and .report.runner_account and .report.rootless_podman'
+            | jq -e '.schema_version == 1 and .disposition and (.findings | type == "array") and (.report.executables | length == 3) and .report.package_plan and .report.runner_account'
