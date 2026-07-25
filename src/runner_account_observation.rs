@@ -678,6 +678,10 @@ fn canonical_u32(value: &str) -> Option<u32> {
     (parsed.to_string() == value).then_some(parsed)
 }
 
+fn canonical_nlink(value: impl Into<u64>) -> u64 {
+    value.into()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ObservedPathKind {
     File,
@@ -741,7 +745,7 @@ impl AccountFilesystem for LinuxAccountFilesystem {
             gid: stat.st_gid,
             mode: stat.st_mode & 0o7777,
             size,
-            nlink: u64::from(stat.st_nlink),
+            nlink: canonical_nlink(stat.st_nlink),
         })
     }
 
