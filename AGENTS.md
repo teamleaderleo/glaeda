@@ -1,5 +1,7 @@
 # SmolRunner agent instructions
 
+SmolRunner is pronounced “small runner.” Treat “SmallRunner” and “small runner” as references to this project when context points here.
+
 ## Product boundary
 
 SmolRunner is a Rust-based steward for a small number of self-hosted GitHub Actions runners and an exploratory leased execution host for ordinary Linux servers. It manages desired host state, official runner lifecycle, project isolation, diagnostics, and later optional runs, retained workspaces, and temporary previews.
