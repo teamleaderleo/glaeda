@@ -1,0 +1,146 @@
+use std::fmt;
+use std::io::Read as _;
+use std::os::fd::OwnedFd;
+use std::path::{Component, Path, PathBuf};
+
+use rustix::fs::{self as rustix_fs, FileType, Mode, OFlags};
+use rustix::io::Errno;
+use serde::Serialize;
+
+use crate::debian_package_plan::DebianPackagePlan;
+use crate::rootless_podman_config::{
+    MAX_ROOTLESS_PODMAN_CONFIG_BYTES, RootlessPodmanConfigError, RootlessPodmanConfigErrorKind,
+    RootlessPodmanContainersConfig, RootlessPodmanStorageConfig,
+    parse_rootless_podman_containers_config, parse_rootless_podman_storage_config,
+};
+use crate::rootless_podman_config_resolution::{
+    RootlessPodmanConfigAssessment, RootlessPodmanConfigContext, RootlessPodmanConfigPolicy,
+    RootlessPodmanConfigSource, RootlessPodmanConfigSourceState, RootlessPodmanResolvedConfig,
+    assess_rootless_podman_config, resolve_rootless_podman_config,
+};
+use crate::rootless_podman_preflight::{
+    RootlessPodmanPreflightPaths, RootlessPodmanStaticPreflightReport,
+    observe_rootless_podman_static_preflight,
+};
+use crate::runner_account_observation::ObservedRunnerIdentity;
+use crate::runner_account_plan::{PreparationObservationState, RunnerAccountObservations};
+
+pub const ROOTLESS_PODMAN_CONFIG_OBSERVATION_SCHEMA_VERSION: u8 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RootlessPodmanConfigObservationPaths {
+    vendor_containers: PathBuf,
+    system_containers: PathBuf,
+    system_storage: PathBuf,
+}
+
+impl RootlessPodmanConfigObservationPaths {
+    #[must_use]
+    pub fn system_default() -> Self {
+        Self {
+            vendor_containers: "/usr/share/containers/containers.conf".into(),
+            system_containers: "/etc/containers/containers.conf".into(),
+            system_storage: "/etc/containers/storage.conf".into(),
+        }
+    }
+
+    /// Build relocated system configuration paths for an explicitly trusted host root.
+    ///
+    /// Runner-specific paths are always derived from the reviewed runner home and cannot be
+    /// supplied independently.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless every path is a canonical non-root absolute path.
+    pub fn new(
+        vendor_containers: impl Into<PathBuf>,
+        system_containers: impl Into<PathBuf>,
+        system_storage: impl Into<PathBuf>,
+    ) -> Result<Self, RootlessPodmanConfigObservationError> {
+        Ok(Self {
+            vendor_containers: canonical_observation_path(
+                "vendor containers configuration",
+                vendor_containers.into(),
+            )?,
+            system_containers: canonical_observation_path(
+                "system containers configuration",
+                system_containers.into(),
+            )?,
+            system_storage: canonical_observation_path(
+                "system storage configuration",
+                system_storage.into(),
+            )?,
+        })
+    }
+
+    #[must_use]
+    pub fn vendor_containers(&self) -> &Path {
+        &self.vendor_containers
+    }
+
+    #[must_use]
+    pub fn system_containers(&self) -> &Path {
+        &self.system_containers
+    }
+
+    #[must_use]
+    pub fn system_storage(&self) -> &Path {
+        &self.system_storage
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RootlessPodmanConfigSourceRole {
+    VendorContainers,
+    SystemContainers,
+    RunnerContainers,
+    SystemStorage,
+    RunnerStorage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RootlessPodmanConfigSourceObservationState {
+    Missing,
+    Present,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RootlessPodmanConfigSourceObservation {
+    pub role: RootlessPodmanConfigSourceRole,
+    pub path: PathBuf,
+    pub state: RootlessPodmanConfigSourceObservationState,
+    pub evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RootlessPodmanConfigObservationReport {
+    pub schema_version: u8,
+    pub sources: Vec<RootlessPodmanConfigSourceObservation>,
+    pub resolved: RootlessPodmanResolvedConfig,
+    pub assessment: RootlessPodmanConfigAssessment,
+}
+
+impl RootlessPodmanConfigObservationReport {
+    #[must_use]
+    pub fn assessment(&self) -> &RootlessPodmanConfigAssessment {
+        &self.assessment
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RootlessPodmanObservedStaticPreflightReport {
+    pub schema_version: u8,
+    pub configuration: RootlessPodmanConfigObservationReport,
+    pub preflight: RootlessPodmanStaticPreflightReport,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RootlessPodmanConfigObservationError {
+    pub problems: Vec<String>,
+}
+
+impl RootlessPodmanConfigObservationError {
+    fn single(problem: impl Into<String>) -> Self {
