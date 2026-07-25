@@ -46,13 +46,18 @@ pub struct DebianPackageRecoveryReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_status: Option<i32>,
     pub fresh_package_observation_required: bool,
+    pub package_action_satisfied: bool,
     pub automatic_rollback_allowed: bool,
     pub next_step: DebianPackageRecoveryStep,
     pub public_summary: String,
 }
 
 impl DebianPackageRecoveryReport {
-    pub fn journal_result(&self) -> Result<ActionReceipt, ActionFailure> {
+    /// Convert the process attempt classification into bounded journal material.
+    ///
+    /// A successful value records only the apt process attempt. It does not mean the package action
+    /// is satisfied; callers must enforce `fresh_package_observation_required` before completion.
+    pub fn attempt_journal_result(&self) -> Result<ActionReceipt, ActionFailure> {
         match self.state {
             DebianPackageAttemptState::ExitedSuccessfully => {
                 Ok(ActionReceipt::public(self.public_summary.clone()))
@@ -106,6 +111,7 @@ pub fn classify_debian_package_attempt(
         rollback_class: RollbackClass::Compensating,
         exit_status,
         fresh_package_observation_required: observation_required,
+        package_action_satisfied: false,
         automatic_rollback_allowed: false,
         next_step,
         public_summary,
@@ -318,12 +324,13 @@ mod tests {
         .expect("success report");
         assert_eq!(report.state, DebianPackageAttemptState::ExitedSuccessfully);
         assert!(report.fresh_package_observation_required);
+        assert!(!report.package_action_satisfied);
         assert!(!report.automatic_rollback_allowed);
         assert_eq!(
             report.next_step,
             DebianPackageRecoveryStep::ReobserveBeforeContinue
         );
-        assert!(report.journal_result().is_ok());
+        assert!(report.attempt_journal_result().is_ok());
     }
 
     #[test]
@@ -344,7 +351,9 @@ mod tests {
             report.next_step,
             DebianPackageRecoveryStep::ReobserveBeforeRetry
         );
-        let failure = report.journal_result().expect_err("journal failure");
+        let failure = report
+            .attempt_journal_result()
+            .expect_err("journal failure");
         assert_eq!(failure.code(), "debian-package-install-nonzero");
     }
 

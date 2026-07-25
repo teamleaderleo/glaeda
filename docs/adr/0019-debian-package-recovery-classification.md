@@ -49,7 +49,7 @@ A pre-execution refusal does not imply that package state changed, but the bound
 
 The classifier produces bounded public journal material:
 
-- a successful exit produces a public receipt stating that dependent work remains blocked pending fresh observation;
+- a successful exit produces an attempt-only public receipt stating that dependent work remains blocked pending fresh observation; the report keeps `package_action_satisfied` false;
 - a nonzero exit produces failure code `debian-package-install-nonzero`;
 - uncertain execution produces failure code `debian-package-install-uncertain`;
 - a pre-execution refusal produces failure code `debian-package-install-not-started`.
