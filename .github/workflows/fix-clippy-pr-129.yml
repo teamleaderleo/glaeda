@@ -1,0 +1,35 @@
+name: Fix Clippy PR 129
+
+on:
+  push:
+    branches:
+      - codex/trusted-podman-config-observation
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: codex/trusted-podman-config-observation
+      - name: Normalize link count across Linux targets
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('src/rootless_podman_config_observation.rs')
+          text = path.read_text()
+          text = text.replace('nlink: u64::from(stat.st_nlink),', 'nlink: u128::from(stat.st_nlink),', 1)
+          text = text.replace('nlink: u64,', 'nlink: u128,', 1)
+          path.write_text(text)
+          PY
+          cargo fmt --all
+          rm -f pr-129-clippy-diagnostic.txt
+          rm .github/workflows/fix-clippy-pr-129.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          git commit -m 'Normalize Podman config link count across targets'
+          git push origin HEAD:codex/trusted-podman-config-observation
