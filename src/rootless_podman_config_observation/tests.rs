@@ -85,8 +85,7 @@ fn matching_sources_compose_through_parser_resolver_and_policy() {
                     .to_vec(),
             ),
         );
-    let report =
-        observe_with(&context(), &paths(), &policy(), &filesystem).expect("observation");
+    let report = observe_with(&context(), &paths(), &policy(), &filesystem).expect("observation");
     assert_eq!(
         report.assessment.state,
         RootlessPodmanConfigAssessmentState::Matching
@@ -108,8 +107,7 @@ fn unknown_runner_source_hides_lower_precedence_without_leaking_error_text() {
             "/var/lib/project-runner/.config/containers/containers.conf",
             TrustedConfigRead::Unknown(RootlessPodmanConfigSourceProblemKind::Unreadable),
         );
-    let report =
-        observe_with(&context(), &paths(), &policy(), &filesystem).expect("observation");
+    let report = observe_with(&context(), &paths(), &policy(), &filesystem).expect("observation");
     assert_eq!(
         report.assessment.state,
         RootlessPodmanConfigAssessmentState::Unknown
@@ -130,8 +128,7 @@ fn invalid_utf8_and_malformed_relevant_values_are_unknown() {
             "/etc/containers/storage.conf",
             TrustedConfigRead::Present(b"[storage]\ndriver = [\"overlay\"]\n".to_vec()),
         );
-    let report =
-        observe_with(&context(), &paths(), &policy(), &filesystem).expect("observation");
+    let report = observe_with(&context(), &paths(), &policy(), &filesystem).expect("observation");
     assert_eq!(
         report.sources[1].problem,
         Some(RootlessPodmanConfigSourceProblemKind::InvalidUtf8)
@@ -180,7 +177,10 @@ fn metadata_policy_rejects_unsafe_file_shapes() {
             RootlessPodmanConfigSourceProblemKind::WrongOwner,
         ),
         (
-            ConfigMetadata { mode: 0o620, ..valid },
+            ConfigMetadata {
+                mode: 0o620,
+                ..valid
+            },
             RootlessPodmanConfigSourceProblemKind::WritableByUntrusted,
         ),
         (

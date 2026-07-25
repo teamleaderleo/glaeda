@@ -55,13 +55,9 @@ impl RootlessPodmanConfigObservationContext {
                 "rootless Podman configuration observation requires a non-root runner identity",
             ));
         }
-        let resolution = RootlessPodmanConfigContext::new(
-            home,
-            xdg_config_home,
-            xdg_data_home,
-            xdg_runtime_dir,
-        )
-        .map_err(RootlessPodmanConfigObservationError::single)?;
+        let resolution =
+            RootlessPodmanConfigContext::new(home, xdg_config_home, xdg_data_home, xdg_runtime_dir)
+                .map_err(RootlessPodmanConfigObservationError::single)?;
         Ok(Self {
             resolution,
             runner_uid,
@@ -170,9 +166,7 @@ impl RootlessPodmanConfigSourceProblemKind {
     const fn evidence(self) -> &'static str {
         match self {
             Self::InvalidPath => "configuration source path is not canonical",
-            Self::UnsafeParentDirectory => {
-                "configuration source has an unsafe parent directory"
-            }
+            Self::UnsafeParentDirectory => "configuration source has an unsafe parent directory",
             Self::SymlinkOrInvalidObject => {
                 "configuration source path is symlinked or has an invalid object type"
             }
@@ -223,7 +217,10 @@ impl RootlessPodmanConfigObservationError {
 
 impl fmt::Display for RootlessPodmanConfigObservationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(formatter, "rootless Podman configuration observation failed")?;
+        writeln!(
+            formatter,
+            "rootless Podman configuration observation failed"
+        )?;
         for problem in &self.problems {
             writeln!(formatter, "- {problem}")?;
         }
@@ -445,7 +442,7 @@ fn read_linux_config(path: &Path, expected_owner: ExpectedOwner) -> TrustedConfi
         };
     }
 
-    let file = match fs::openat(directory.as_fd(), file_name, FILE_FLAGS, Mode::empty()) {
+    let file = match fs::openat(directory.as_fd(), *file_name, FILE_FLAGS, Mode::empty()) {
         Ok(file) => file,
         Err(Errno::NOENT) => return TrustedConfigRead::Missing,
         Err(Errno::LOOP | Errno::NOTDIR) => {
@@ -472,7 +469,7 @@ fn read_linux_config(path: &Path, expected_owner: ExpectedOwner) -> TrustedConfi
         uid: stat.st_uid,
         gid: stat.st_gid,
         mode: stat.st_mode & 0o7777,
-        nlink: stat.st_nlink,
+        nlink: u64::from(stat.st_nlink),
         size: stat.st_size,
     };
     if let Err(problem) = validate_file_metadata(metadata, expected_owner) {
@@ -494,8 +491,8 @@ fn open_directory_component(
         }
         Err(_) => return Err(RootlessPodmanConfigSourceProblemKind::Unreadable),
     };
-    let stat = fs::fstat(&directory)
-        .map_err(|_| RootlessPodmanConfigSourceProblemKind::Unreadable)?;
+    let stat =
+        fs::fstat(&directory).map_err(|_| RootlessPodmanConfigSourceProblemKind::Unreadable)?;
     if !FileType::from_raw_mode(stat.st_mode).is_dir()
         || stat.st_mode & 0o022 != 0
         || !directory_owner_is_trusted(stat.st_uid, stat.st_gid, expected_owner)
