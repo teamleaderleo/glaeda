@@ -4,23 +4,32 @@ on:
   pull_request:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   format:
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'feat/mac-availability-planning'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
 
     steps:
-      - name: Check out branch
+      - name: Check out implementation branch
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: feat/mac-availability-planning
 
       - name: Format source
         run: cargo fmt --all
 
-      - name: Upload formatted source
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: formatted-mac-availability
-          path: src/mac_availability.rs
-          retention-days: 1
+      - name: Commit exact formatter output
+        run: |
+          set -euo pipefail
+          git diff --check -- src/mac_availability.rs
+          if git diff --quiet -- src/mac_availability.rs; then
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- src/mac_availability.rs
+          git commit -m 'Format Mac availability planner'
+          git push origin HEAD:feat/mac-availability-planning
