@@ -1,4 +1,7 @@
-.PHONY: vm vm-up vm-tmux vm-status vm-sync vm-doctor vm-observe vm-stop
+.PHONY: work vm vm-up vm-tmux vm-status vm-sync vm-doctor vm-observe vm-stop
+
+work:
+	@bash scripts/macbook-workspace.sh
 
 vm:
 	@bash scripts/macbook-runner-vm.sh shell
