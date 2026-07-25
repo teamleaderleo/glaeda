@@ -1,0 +1,33 @@
+name: Issue 103 Clippy diagnostic
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  clippy-diagnostic:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Capture Clippy output
+        run: |
+          set +e
+          cargo clippy --locked --all-targets --all-features -- -D warnings > /tmp/clippy.log 2>&1
+          status=$?
+          printf '\nexit_status=%s\n' "$status" >> /tmp/clippy.log
+          exit 0
+
+      - name: Upload Clippy diagnostic
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: issue-103-clippy-diagnostic
+          path: /tmp/clippy.log
+          retention-days: 1
