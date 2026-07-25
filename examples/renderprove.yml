@@ -1,0 +1,26 @@
+version: 1
+repository: example/renderprove-app
+
+runner:
+  scope: repository
+  user: renderprove-runner
+  labels:
+    - renderprove-ci
+
+container:
+  image: localhost/renderprove-app-ci:review
+  file: build/renderprove/Containerfile
+
+verify:
+  command: examples/renderprove/run-renderprove-review.sh
+  suites:
+    render: render
+
+limits:
+  memory: 4GiB
+  cpus: 2
+  pids: 1024
+
+trust:
+  forks: deny
+  trigger: operator

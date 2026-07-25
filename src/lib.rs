@@ -65,6 +65,7 @@ pub mod podman_preview_inspect;
 pub mod podman_preview_state;
 pub mod preview;
 pub mod process;
+pub mod renderprove_verification;
 pub mod resource;
 #[cfg(target_os = "linux")]
 pub mod rootless_podman_config;

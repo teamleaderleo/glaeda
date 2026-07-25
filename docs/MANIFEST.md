@@ -34,7 +34,11 @@ The repository owns the Containerfile. SmolRunner should record the resulting im
 - `command`: project-relative verification entry point.
 - `suites`: stable names mapped to one command argument each.
 
-SmolRunner does not interpret npm, Maven, Python, Convex, Blender, or other project-specific concepts. It invokes the repository-owned entry point inside the disposable execution boundary.
+SmolRunner does not interpret npm, Maven, Python, Convex, Blender, Renderprove, or other project-specific concepts. It invokes the repository-owned entry point inside the disposable execution boundary.
+
+A Renderprove enrolment uses the same generic command boundary. `examples/renderprove.yml` points to the checked-in `examples/renderprove/run-renderprove-review.sh` wrapper. The wrapper accepts one stable `render` suite, requires an explicit trusted Renderprove checkout, selects one project-relative evidence directory, and delegates browser policy and receipt generation to Renderprove.
+
+The typed contract in `renderprove_verification` keeps source revision, project image, worker image, Renderprove manifest, sanitized receipt, approved screenshots, private worker identity, private diagnostics, failure traces, and later approved visual diffs as distinct identities. A successful process alone cannot satisfy verification; one matching passing sanitized receipt and successful cleanup are required. App-readiness and browser failures remain explicit bounded outcomes.
 
 ### `limits`
 
