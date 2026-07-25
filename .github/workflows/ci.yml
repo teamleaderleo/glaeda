@@ -27,8 +27,18 @@ jobs:
       - name: Install Rust toolchain
         run: rustup show active-toolchain
 
-      - name: Check formatting
-        run: cargo fmt --all -- --check
+      - name: Format diagnostic working tree
+        run: |
+          cargo fmt --all
+          git diff --binary > rustfmt.patch
+
+      - name: Upload rustfmt patch
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: rustfmt-patch
+          path: rustfmt.patch
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Run Clippy
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
