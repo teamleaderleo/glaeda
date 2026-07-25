@@ -357,9 +357,7 @@ fn linux_reader_enforces_no_follow_metadata_and_size_policy() {
     symlink("/etc/passwd", &source).expect("create final symlink");
     assert_eq!(
         read_linux_config(&source, expected_owner),
-        TrustedConfigRead::Unknown(
-            RootlessPodmanConfigSourceProblemKind::SymlinkOrInvalidObject
-        )
+        TrustedConfigRead::Unknown(RootlessPodmanConfigSourceProblemKind::SymlinkOrInvalidObject)
     );
     fs::remove_file(&source).expect("remove final symlink");
 
@@ -379,9 +377,7 @@ fn linux_reader_enforces_no_follow_metadata_and_size_policy() {
     symlink(&real_containers, &containers).expect("create parent symlink");
     assert_eq!(
         read_linux_config(&source, expected_owner),
-        TrustedConfigRead::Unknown(
-            RootlessPodmanConfigSourceProblemKind::SymlinkOrInvalidObject
-        )
+        TrustedConfigRead::Unknown(RootlessPodmanConfigSourceProblemKind::SymlinkOrInvalidObject)
     );
 }
 
