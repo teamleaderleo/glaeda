@@ -1,0 +1,9 @@
+version: 1
+primary_group: quarry-runner
+home: /var/lib/quarry-runner
+subordinate_uids:
+  start: 100000
+  count: 65536
+subordinate_gids:
+  start: 200000
+  count: 65536
