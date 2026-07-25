@@ -22,8 +22,10 @@ use crate::rootless_podman_preflight::{
     RootlessPodmanPreflightPaths, RootlessPodmanStaticPreflightReport,
     observe_rootless_podman_static_preflight,
 };
-use crate::runner_account_observation::ObservedRunnerIdentity;
-use crate::runner_account_plan::{PreparationObservationState, RunnerAccountObservations};
+use crate::runner_account_observation::{ObservedRunnerIdentity, RunnerAccountObservationReport};
+use crate::runner_account_plan::{
+    DesiredRunnerAccount, PreparationObservationState, RunnerAccountObservations,
+};
 
 pub const ROOTLESS_PODMAN_CONFIG_OBSERVATION_SCHEMA_VERSION: u8 = 1;
 
@@ -156,7 +158,10 @@ impl RootlessPodmanConfigObservationError {
 
 impl fmt::Display for RootlessPodmanConfigObservationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(formatter, "rootless Podman configuration observation failed")?;
+        writeln!(
+            formatter,
+            "rootless Podman configuration observation failed"
+        )?;
         for problem in &self.problems {
             writeln!(formatter, "- {problem}")?;
         }
@@ -176,17 +181,16 @@ impl std::error::Error for RootlessPodmanConfigObservationError {}
 ///
 /// Returns an error only when caller-supplied reviewed paths or the derived XDG context are invalid.
 pub fn observe_rootless_podman_configuration(
-    account_observations: &RunnerAccountObservations,
-    identity: Option<ObservedRunnerIdentity>,
-    reviewed_home: &Path,
+    desired: &DesiredRunnerAccount,
+    account_report: &RunnerAccountObservationReport,
     policy: &RootlessPodmanConfigPolicy,
     paths: &RootlessPodmanConfigObservationPaths,
 ) -> Result<RootlessPodmanConfigObservationReport, RootlessPodmanConfigObservationError> {
-    let identity = identity.map(RunnerConfigIdentity::from);
+    let identity = account_report.identity().map(RunnerConfigIdentity::from);
     observe_with(
-        account_observations,
+        &account_report.observations,
         identity,
-        reviewed_home,
+        Path::new(desired.home()),
         policy,
         paths,
         &LinuxConfigFilesystem,
@@ -203,23 +207,18 @@ pub fn observe_rootless_podman_configuration(
 /// Returns an error when the reviewed configuration path context is invalid.
 pub fn observe_rootless_podman_static_preflight_from_sources(
     package_plan: &DebianPackagePlan,
-    account_observations: &RunnerAccountObservations,
-    identity: Option<ObservedRunnerIdentity>,
-    reviewed_home: &Path,
+    desired: &DesiredRunnerAccount,
+    account_report: &RunnerAccountObservationReport,
     policy: &RootlessPodmanConfigPolicy,
     config_paths: &RootlessPodmanConfigObservationPaths,
     preflight_paths: &RootlessPodmanPreflightPaths,
 ) -> Result<RootlessPodmanObservedStaticPreflightReport, RootlessPodmanConfigObservationError> {
-    let configuration = observe_rootless_podman_configuration(
-        account_observations,
-        identity,
-        reviewed_home,
-        policy,
-        config_paths,
-    )?;
+    let identity = account_report.identity();
+    let configuration =
+        observe_rootless_podman_configuration(desired, account_report, policy, config_paths)?;
     let preflight = observe_rootless_podman_static_preflight(
         package_plan,
-        account_observations,
+        &account_report.observations,
         identity,
         configuration.assessment(),
         preflight_paths,
@@ -278,9 +277,7 @@ fn observe_with(
             "reviewed rootless Podman path context is invalid: {problem}"
         ))
     })?;
-    let runner_containers_path = context
-        .xdg_config_home()
-        .join("containers/containers.conf");
+    let runner_containers_path = context.xdg_config_home().join("containers/containers.conf");
     let runner_storage_path = context.xdg_config_home().join("containers/storage.conf");
 
     let vendor_containers = observe_source(
@@ -417,8 +414,7 @@ fn observe_source<T>(
                 }
             },
             Err(_) => {
-                let evidence =
-                    "reviewed configuration source is not valid UTF-8".to_owned();
+                let evidence = "reviewed configuration source is not valid UTF-8".to_owned();
                 (
                     RootlessPodmanConfigSourceState::Unknown {
                         evidence: evidence.clone(),
@@ -566,9 +562,7 @@ impl TrustedConfigFileProblem {
             Self::NotRegularFile => "configuration source is not a regular file",
             Self::WrongOwner => "configuration source ownership does not match the reviewed source",
             Self::MultipleLinks => "configuration source does not have exactly one hard link",
-            Self::WritableByUntrusted => {
-                "configuration source is writable by group or other users"
-            }
+            Self::WritableByUntrusted => "configuration source is writable by group or other users",
             Self::Oversized => "configuration source exceeds the bounded size limit",
             Self::ReadFailed => "configuration source could not be read within the bounded limit",
         }
@@ -625,9 +619,7 @@ impl ConfigFilesystem for LinuxConfigFilesystem {
         if stat.st_mode & 0o022 != 0 {
             return TrustedConfigFile::Unknown(TrustedConfigFileProblem::WritableByUntrusted);
         }
-        if stat.st_size < 0
-            || usize::try_from(stat.st_size).map_or(true, |size| size > max_bytes)
-        {
+        if stat.st_size < 0 || usize::try_from(stat.st_size).map_or(true, |size| size > max_bytes) {
             return TrustedConfigFile::Unknown(TrustedConfigFileProblem::Oversized);
         }
 
