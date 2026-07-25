@@ -163,6 +163,7 @@ pub enum LaneCommandKind {
     EnsureSubordinateGids,
     EnableLinger,
     RunnerPodmanInfo,
+    RunnerPodmanMigrate,
     RunnerGitVersion,
 }
 
@@ -354,6 +355,24 @@ impl LaneCommand {
         Ok(Self::new(action, LaneCommandKind::RunnerPodmanInfo, spec))
     }
 
+    /// Build a runner-user `podman system migrate` command behind the reviewed sealed boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the action is not assigned to the runner-user lane.
+    pub fn runner_podman_migrate(
+        action: &PlannedMutation,
+        runner: &RunnerUserContext,
+    ) -> Result<Self, LaneCommandError> {
+        require_lane(action, ExecutionLane::RunnerUser)?;
+        let spec = runner_user_spec(runner, PODMAN, &["system", "migrate"]);
+        Ok(Self::new(
+            action,
+            LaneCommandKind::RunnerPodmanMigrate,
+            spec,
+        ))
+    }
+
     /// Build a runner-user `git --version` command behind the reviewed `runuser` boundary.
     ///
     /// # Errors
@@ -392,7 +411,7 @@ impl LaneCommand {
     pub fn required_programs(&self) -> Vec<&Path> {
         let outer = self.spec.program.as_path();
         match self.kind {
-            LaneCommandKind::RunnerPodmanInfo => {
+            LaneCommandKind::RunnerPodmanInfo | LaneCommandKind::RunnerPodmanMigrate => {
                 vec![outer, Path::new(ENV), Path::new(PODMAN)]
             }
             LaneCommandKind::RunnerGitVersion => {
@@ -684,6 +703,26 @@ mod tests {
                 "info",
                 "--format",
                 "json",
+            ]
+        );
+        let migrate =
+            LaneCommand::runner_podman_migrate(&action, &runner).expect("migration command");
+        assert_eq!(
+            migrate.spec().displayed_argv(),
+            [
+                RUNUSER,
+                "--user",
+                "project-runner",
+                "--",
+                ENV,
+                "--ignore-environment",
+                "HOME=/srv/runner",
+                "USER=project-runner",
+                "LOGNAME=project-runner",
+                "XDG_RUNTIME_DIR=/run/user/1001",
+                PODMAN,
+                "system",
+                "migrate",
             ]
         );
         let git = LaneCommand::runner_git_version(&action, &runner).expect("git command");

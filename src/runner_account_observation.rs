@@ -14,6 +14,11 @@ use crate::runner_account_plan::{
     PreparationObservationState, RunnerAccountObservations, RunnerAccountPlanError,
 };
 use crate::runner_user::{PasswdRecord, parse_passwd_record};
+use crate::subordinate_id::{
+    SubordinateAuthorityErrorKind, SubordinateIdOwner, SubordinateIdRange, SubordinateIdRequest,
+    SubordinateMappingDisposition, parse_subordinate_authority,
+    reconcile_subordinate_mapping_for_identity,
+};
 
 const GETENT: &str = "/usr/bin/getent";
 const EXPECTED_SHELL: &str = "/usr/sbin/nologin";
@@ -204,14 +209,14 @@ fn observe_with(
         filesystem.read_trusted(&paths.subordinate_uids, MAX_ACCOUNT_FILE_BYTES),
         desired.username(),
         desired.subordinate_uids(),
-        identity.is_some(),
+        identity,
         "UID",
     )?;
     let subordinate_gids = classify_subordinate(
         filesystem.read_trusted(&paths.subordinate_gids, MAX_ACCOUNT_FILE_BYTES),
         desired.username(),
         desired.subordinate_gids(),
-        identity.is_some(),
+        identity,
         "GID",
     )?;
     let linger_path = paths.linger_directory.join(desired.username().as_str());
@@ -508,7 +513,7 @@ fn classify_subordinate(
     file: TrustedFile,
     username: &LinuxAccountName,
     desired: PlannedSubordinateRange,
-    user_matching: bool,
+    identity: Option<ObservedRunnerIdentity>,
     label: &str,
 ) -> Result<PreparationObservation, RunnerAccountObservationError> {
     let (state, evidence) = match file {
@@ -516,98 +521,71 @@ fn classify_subordinate(
             PreparationObservationState::Unknown,
             format!("subordinate {label} authority could not be read safely"),
         ),
-        TrustedFile::Present(input) => {
-            match inspect_subordinate_authority(&input, username, desired) {
-                AuthorityResult::Malformed => (
-                    PreparationObservationState::Unknown,
-                    format!("subordinate {label} authority contains malformed data"),
-                ),
-                AuthorityResult::Absent => (
-                    PreparationObservationState::Absent,
-                    format!(
-                        "no subordinate {label} range is assigned to {} and the desired allocation does not overlap another owner",
-                        username.as_str()
-                    ),
-                ),
-                AuthorityResult::Exact if user_matching => (
-                    PreparationObservationState::Matching,
-                    format!(
-                        "subordinate {label} range {}-{} exactly matches the desired allocation without cross-owner overlap",
-                        desired.start(),
-                        desired.end_inclusive()
-                    ),
-                ),
-                AuthorityResult::Exact | AuthorityResult::Conflicting => (
+        TrustedFile::Present(input) => match parse_subordinate_authority(&input) {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    SubordinateAuthorityErrorKind::DuplicateOwner
+                        | SubordinateAuthorityErrorKind::Overlap
+                ) =>
+            {
+                (
                     PreparationObservationState::Conflicting,
                     format!(
-                        "subordinate {label} authority conflicts with the desired single allocation for {}",
-                        username.as_str()
+                        "subordinate {label} authority contains conflicting global allocation state: {}",
+                        error.message()
                     ),
-                ),
+                )
             }
-        }
+            Err(error) => (
+                PreparationObservationState::Unknown,
+                format!(
+                    "subordinate {label} authority could not be parsed completely: {}",
+                    error.message()
+                ),
+            ),
+            Ok(authority) => {
+                let owner = SubordinateIdOwner::from(username);
+                let range = SubordinateIdRange::new(desired.start(), desired.count())
+                    .expect("planned subordinate range is already validated");
+                let decision = reconcile_subordinate_mapping_for_identity(
+                    &authority,
+                    &owner,
+                    identity.map(|identity| identity.uid),
+                    SubordinateIdRequest::Exact { range },
+                );
+                match decision.disposition {
+                    SubordinateMappingDisposition::Matching if identity.is_some() => (
+                        PreparationObservationState::Matching,
+                        format!(
+                            "subordinate {label} range {}-{} exactly matches the desired allocation in a globally non-overlapping authority",
+                            range.start(),
+                            range.end_inclusive()
+                        ),
+                    ),
+                    SubordinateMappingDisposition::Required => (
+                        PreparationObservationState::Absent,
+                        format!(
+                            "no subordinate {label} range is assigned to {} and exact range {}-{} is globally free",
+                            username.as_str(),
+                            range.start(),
+                            range.end_inclusive()
+                        ),
+                    ),
+                    SubordinateMappingDisposition::Matching
+                    | SubordinateMappingDisposition::Conflicting
+                    | SubordinateMappingDisposition::Exhausted => (
+                        PreparationObservationState::Conflicting,
+                        format!(
+                            "subordinate {label} authority conflicts with the desired single allocation for {}",
+                            username.as_str()
+                        ),
+                    ),
+                }
+            }
+        },
     };
     Ok(PreparationObservation::new(state, [evidence])?)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AuthorityResult {
-    Absent,
-    Exact,
-    Conflicting,
-    Malformed,
-}
-
-fn inspect_subordinate_authority(
-    input: &str,
-    username: &LinuxAccountName,
-    desired: PlannedSubordinateRange,
-) -> AuthorityResult {
-    let desired_start = u64::from(desired.start());
-    let desired_end = desired_start + u64::from(desired.count());
-    let mut owned_ranges = Vec::new();
-    let mut foreign_overlap = false;
-
-    for line in input.lines().filter(|line| !line.is_empty()) {
-        let fields = line.split(':').collect::<Vec<_>>();
-        if fields.len() != 3 || !valid_subordinate_owner(fields[0]) {
-            return AuthorityResult::Malformed;
-        }
-        let Some(start) = canonical_u32(fields[1]) else {
-            return AuthorityResult::Malformed;
-        };
-        let Some(count) = canonical_u32(fields[2]) else {
-            return AuthorityResult::Malformed;
-        };
-        if count == 0 {
-            return AuthorityResult::Malformed;
-        }
-        let end = u64::from(start) + u64::from(count);
-        if end > u64::from(u32::MAX) + 1 {
-            return AuthorityResult::Malformed;
-        }
-
-        if fields[0] == username.as_str() {
-            owned_ranges.push((start, count));
-        } else if u64::from(start) < desired_end && desired_start < end {
-            foreign_overlap = true;
-        }
-    }
-
-    if foreign_overlap {
-        AuthorityResult::Conflicting
-    } else if owned_ranges.is_empty() {
-        AuthorityResult::Absent
-    } else if owned_ranges == [(desired.start(), desired.count())] {
-        AuthorityResult::Exact
-    } else {
-        AuthorityResult::Conflicting
-    }
-}
-
-fn valid_subordinate_owner(value: &str) -> bool {
-    LinuxAccountName::parse(value).is_ok()
-        || canonical_u32(value).is_some_and(|identifier| identifier > 0)
 }
 
 fn classify_linger(
@@ -1126,6 +1104,56 @@ mod tests {
         assert_eq!(
             report.observations.subordinate_uids.state(),
             PreparationObservationState::Unknown
+        );
+    }
+
+    #[test]
+    fn duplicate_owner_and_unrelated_global_overlap_are_conflicting() {
+        for authority in [
+            "other-user:500000:65536\nother-user:600000:65536\n",
+            "other-user:500000:65536\nthird-user:520000:65536\n",
+        ] {
+            let mut filesystem = matching_filesystem();
+            filesystem.files.insert(
+                "/test/subuid".into(),
+                TrustedFile::Present(authority.to_owned()),
+            );
+            let report = observe_with(&desired(), &matching_executor(), &paths(), &filesystem)
+                .expect("conflicting authority observation");
+            assert_eq!(
+                report.observations.subordinate_uids.state(),
+                PreparationObservationState::Conflicting
+            );
+        }
+    }
+
+    #[test]
+    fn proven_numeric_owner_alias_matches_runner_identity() {
+        let mut filesystem = matching_filesystem();
+        filesystem.files.insert(
+            "/test/subuid".into(),
+            TrustedFile::Present("1001:100000:65536\n".to_owned()),
+        );
+        let report = observe_with(&desired(), &matching_executor(), &paths(), &filesystem)
+            .expect("numeric alias observation");
+        assert_eq!(
+            report.observations.subordinate_uids.state(),
+            PreparationObservationState::Matching
+        );
+    }
+
+    #[test]
+    fn username_and_numeric_owner_aliases_are_conflicting() {
+        let mut filesystem = matching_filesystem();
+        filesystem.files.insert(
+            "/test/subuid".into(),
+            TrustedFile::Present("project-runner:100000:65536\n1001:300000:65536\n".to_owned()),
+        );
+        let report = observe_with(&desired(), &matching_executor(), &paths(), &filesystem)
+            .expect("duplicate alias observation");
+        assert_eq!(
+            report.observations.subordinate_uids.state(),
+            PreparationObservationState::Conflicting
         );
     }
 

@@ -378,9 +378,11 @@ fn validate_root_command(command: &LaneCommand) -> Result<(), LaneExecutionError
             validate_usermod(spec, &arguments, "--add-subgids")
         }
         LaneCommandKind::EnableLinger => validate_loginctl(spec, &arguments),
-        LaneCommandKind::RunnerPodmanInfo | LaneCommandKind::RunnerGitVersion => Err(
-            invalid_command("runner-user command kind cannot execute in the root lane"),
-        ),
+        LaneCommandKind::RunnerPodmanInfo
+        | LaneCommandKind::RunnerPodmanMigrate
+        | LaneCommandKind::RunnerGitVersion => Err(invalid_command(
+            "runner-user command kind cannot execute in the root lane",
+        )),
     }
 }
 
@@ -529,6 +531,7 @@ fn validate_runner_command(
     }
     let (inner_program, inner_arguments): (&str, &[&str]) = match command.kind() {
         LaneCommandKind::RunnerPodmanInfo => (PODMAN, &["info", "--format", "json"]),
+        LaneCommandKind::RunnerPodmanMigrate => (PODMAN, &["system", "migrate"]),
         LaneCommandKind::RunnerGitVersion => (GIT, &["--version"]),
         LaneCommandKind::AptInstall
         | LaneCommandKind::EnsureSystemGroup
@@ -871,8 +874,8 @@ mod tests {
         let privilege = root_privilege();
         let context = runner_context("project-runner", 1001, 1001);
         let runner = runner_evidence("project-runner", 1001, 1001, "/srv/project-runner");
-        let command = LaneCommand::runner_git_version(
-            &action("inspect-git", ExecutionLane::RunnerUser),
+        let command = LaneCommand::runner_podman_migrate(
+            &action("migrate-podman", ExecutionLane::RunnerUser),
             &context,
         )
         .expect("runner command");
@@ -897,8 +900,9 @@ mod tests {
                 "USER=project-runner",
                 "LOGNAME=project-runner",
                 "XDG_RUNTIME_DIR=/run/user/1001",
-                GIT,
-                "--version",
+                PODMAN,
+                "system",
+                "migrate",
             ]
         );
     }

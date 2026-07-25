@@ -16,7 +16,11 @@ use crate::process::CommandExecutor;
 use crate::runner_account_observation::{RunnerAccountObservationPaths, observe_runner_account};
 use crate::runner_account_plan::{
     DesiredRunnerAccount, PlannedSubordinateRange, RunnerAccountObservations, RunnerAccountPlan,
-    RunnerAccountPlanDisposition, build_runner_account_plan,
+    RunnerAccountPlanDisposition, RunnerAccountResourceKind, build_runner_account_plan,
+};
+use crate::subordinate_id::{
+    PodmanMigrationPlan, SubordinateIdReconciliationPlan, SubordinatePlanDisposition,
+    build_exact_subordinate_id_plan,
 };
 
 pub const HOST_READINESS_SCHEMA_VERSION: u8 = 1;
@@ -54,6 +58,7 @@ pub enum RunnerAccountReadiness {
     Planned {
         observations: Box<RunnerAccountObservations>,
         plan: RunnerAccountPlan,
+        subordinate_ids: Box<SubordinateIdReconciliationPlan>,
     },
 }
 
@@ -73,6 +78,7 @@ pub enum HostReadinessErrorKind {
     PackagePlan,
     RunnerAccountObservation,
     RunnerAccountPlan,
+    SubordinateIdPlan,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -260,16 +266,35 @@ pub fn inspect_host_readiness_with_os_release(
                     "failed to classify bounded runner account observations",
                 )
             })?;
+            let identity = report
+                .identity()
+                .map(|identity| (identity.uid(), identity.primary_gid()));
             let observations = report.observations;
-            let plan = build_runner_account_plan(desired, observations.clone()).map_err(|_| {
+            let subordinate_ids = build_exact_subordinate_id_plan(
+                &desired,
+                &observations,
+                identity,
+                Path::new("/etc/subuid"),
+                Path::new("/etc/subgid"),
+            )
+            .map_err(|_| {
                 HostReadinessError::new(
-                    HostReadinessErrorKind::RunnerAccountPlan,
-                    "failed to build a dependency-safe runner account plan",
+                    HostReadinessErrorKind::SubordinateIdPlan,
+                    "failed to build a dependency-safe subordinate-ID reconciliation plan",
                 )
             })?;
+            let plan = without_subordinate_mapping_items(
+                build_runner_account_plan(desired, observations.clone()).map_err(|_| {
+                    HostReadinessError::new(
+                        HostReadinessErrorKind::RunnerAccountPlan,
+                        "failed to build a dependency-safe runner account plan",
+                    )
+                })?,
+            );
             RunnerAccountReadiness::Planned {
                 observations: Box::new(observations),
                 plan,
+                subordinate_ids: Box::new(subordinate_ids),
             }
         }
         None => RunnerAccountReadiness::NeedsConfiguration {
@@ -287,6 +312,16 @@ pub fn inspect_host_readiness_with_os_release(
         package_plan,
         runner_account,
     })
+}
+
+fn without_subordinate_mapping_items(mut plan: RunnerAccountPlan) -> RunnerAccountPlan {
+    plan.items.retain(|item| {
+        !matches!(
+            item.kind,
+            RunnerAccountResourceKind::SubordinateUids | RunnerAccountResourceKind::SubordinateGids
+        )
+    });
+    plan
 }
 
 #[must_use]
@@ -349,7 +384,11 @@ pub fn render_human(report: &HostReadinessReport) -> String {
                 output.push_str(&format!("  {item}\n"));
             }
         }
-        RunnerAccountReadiness::Planned { plan, .. } => {
+        RunnerAccountReadiness::Planned {
+            plan,
+            subordinate_ids,
+            ..
+        } => {
             output.push_str(&format!(
                 "Runner user: {}\nPrimary group: {}\nHome: {}\n",
                 plan.desired.username().as_str(),
@@ -368,6 +407,47 @@ pub fn render_human(report: &HostReadinessReport) -> String {
                     output.push_str("  Reviewed command: ");
                     output.push_str(&command.spec().displayed_argv().join(" "));
                     output.push('\n');
+                }
+            }
+
+            output.push_str("\nSubordinate-ID reconciliation barriers\n");
+            for item in [
+                &subordinate_ids.subordinate_uids,
+                &subordinate_ids.subordinate_gids,
+            ] {
+                let marker = match item.disposition {
+                    SubordinatePlanDisposition::Satisfied => "READY",
+                    SubordinatePlanDisposition::Required => "REQUIRED",
+                    SubordinatePlanDisposition::NeedsInspection => "INSPECT",
+                    SubordinatePlanDisposition::Blocked => "BLOCKED",
+                };
+                output.push_str(&format!("[{marker}] {}\n", item.summary));
+                if let Some(command) = &item.command {
+                    output.push_str("  Reviewed command: ");
+                    output.push_str(&command.spec().displayed_argv().join(" "));
+                    output.push('\n');
+                }
+                if let Some(barrier) = &item.fresh_observation {
+                    output.push_str(&format!("  Fresh observation: {}\n", barrier.summary));
+                }
+            }
+            match &subordinate_ids.podman_migration {
+                PodmanMigrationPlan::NotRequired => {
+                    output.push_str("[READY] Rootless Podman migration is unnecessary.\n");
+                }
+                PodmanMigrationPlan::Required { command, .. } => {
+                    output.push_str(
+                        "[REQUIRED] Refresh rootless Podman after fresh mapping observations.\n",
+                    );
+                    output.push_str("  Reviewed command: ");
+                    output.push_str(&command.spec().displayed_argv().join(" "));
+                    output.push('\n');
+                }
+                PodmanMigrationPlan::Blocked { evidence } => {
+                    output.push_str("[BLOCKED] Rootless Podman migration cannot be planned yet.\n");
+                    for item in evidence {
+                        output.push_str(&format!("  {item}\n"));
+                    }
                 }
             }
         }
@@ -498,12 +578,14 @@ mod tests {
     use crate::runner_account_plan::{
         DesiredRunnerAccount, PlannedSubordinateRange, PreparationObservation,
         PreparationObservationState, RunnerAccountObservations, RunnerAccountPlanDisposition,
-        build_runner_account_plan,
+        RunnerAccountResourceKind, build_runner_account_plan,
     };
+    use crate::subordinate_id::build_exact_subordinate_id_plan;
 
     use super::{
         ExactExecutableObservation, HostObservationState, HostReadinessReport,
         RunnerAccountPolicyFile, RunnerAccountReadiness, SubordinateRangePolicy, render_human,
+        without_subordinate_mapping_items,
     };
 
     fn desired() -> DesiredRunnerAccount {
@@ -559,8 +641,18 @@ mod tests {
         account_state: PreparationObservationState,
     ) -> HostReadinessReport {
         let account_observations = observations(account_state);
-        let account_plan = build_runner_account_plan(desired(), account_observations.clone())
-            .expect("account plan");
+        let account_plan = without_subordinate_mapping_items(
+            build_runner_account_plan(desired(), account_observations.clone())
+                .expect("account plan"),
+        );
+        let subordinate_ids = build_exact_subordinate_id_plan(
+            &desired(),
+            &account_observations,
+            Some((1001, 1001)),
+            std::path::Path::new("/etc/subuid"),
+            std::path::Path::new("/etc/subgid"),
+        )
+        .expect("subordinate plan");
         HostReadinessReport {
             schema_version: 1,
             repository: "example/project".to_owned(),
@@ -569,6 +661,7 @@ mod tests {
             runner_account: RunnerAccountReadiness::Planned {
                 observations: Box::new(account_observations),
                 plan: account_plan,
+                subordinate_ids: Box::new(subordinate_ids),
             },
         }
     }
@@ -591,6 +684,30 @@ mod tests {
                 .all(|item| { item.disposition == RunnerAccountPlanDisposition::Satisfied })
         );
         assert!(render_human(&report).contains("[READY] ensure dedicated runner group"));
+    }
+
+    #[test]
+    fn host_plan_has_one_barriered_source_for_subordinate_mutations() {
+        let report = report(
+            Presence::Absent,
+            HostObservationState::Absent,
+            PreparationObservationState::Absent,
+        );
+        assert!(report.runner_account_plan().items.iter().all(|item| {
+            !matches!(
+                item.kind,
+                RunnerAccountResourceKind::SubordinateUids
+                    | RunnerAccountResourceKind::SubordinateGids
+            )
+        }));
+        let RunnerAccountReadiness::Planned {
+            subordinate_ids, ..
+        } = &report.runner_account
+        else {
+            panic!("configured test report");
+        };
+        assert!(subordinate_ids.subordinate_uids.fresh_observation.is_some());
+        assert!(subordinate_ids.subordinate_gids.fresh_observation.is_some());
     }
 
     #[test]
@@ -617,8 +734,10 @@ mod tests {
         let mut account_observations = observations(PreparationObservationState::Absent);
         account_observations.group = observation(PreparationObservationState::Conflicting, "group");
         account_observations.user = observation(PreparationObservationState::Unknown, "user");
-        let plan = build_runner_account_plan(desired(), account_observations.clone())
-            .expect("blocked account plan");
+        let plan = without_subordinate_mapping_items(
+            build_runner_account_plan(desired(), account_observations.clone())
+                .expect("blocked account plan"),
+        );
         assert_eq!(
             plan.items[0].disposition,
             RunnerAccountPlanDisposition::Blocked
@@ -634,6 +753,16 @@ mod tests {
             executables: vec![executable(HostObservationState::Conflicting)],
             package_plan: package_plan(Presence::Unknown),
             runner_account: RunnerAccountReadiness::Planned {
+                subordinate_ids: Box::new(
+                    build_exact_subordinate_id_plan(
+                        &desired(),
+                        &account_observations,
+                        None,
+                        std::path::Path::new("/etc/subuid"),
+                        std::path::Path::new("/etc/subgid"),
+                    )
+                    .expect("subordinate plan"),
+                ),
                 observations: Box::new(account_observations),
                 plan,
             },
