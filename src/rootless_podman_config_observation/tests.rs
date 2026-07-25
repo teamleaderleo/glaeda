@@ -320,9 +320,7 @@ fn linux_reader_enforces_no_follow_metadata_and_size_policy() {
                 gid,
             },
         ),
-        TrustedConfigRead::Unknown(
-            RootlessPodmanConfigSourceProblemKind::UnsafeParentDirectory
-        )
+        TrustedConfigRead::Unknown(RootlessPodmanConfigSourceProblemKind::UnsafeParentDirectory)
     );
 
     fs::set_permissions(&source, fs::Permissions::from_mode(0o620))
