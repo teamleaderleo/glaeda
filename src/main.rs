@@ -5,9 +5,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use smolrunner::doctor::{inspect_host, render_human as render_doctor};
 #[cfg(target_os = "linux")]
-use smolrunner::host_readiness::{
-    inspect_host_readiness, render_human as render_host_plan,
-};
+use smolrunner::host_readiness::{inspect_host_readiness, render_human as render_host_plan};
 use smolrunner::manifest::{ManifestError, load};
 use smolrunner::plan::{build, render_human as render_plan};
 #[cfg(target_os = "linux")]
@@ -133,21 +131,12 @@ fn run_plan(output: OutputFormat, file: &Path) -> ExitCode {
 }
 
 #[cfg(target_os = "linux")]
-fn run_host_plan(
-    output: OutputFormat,
-    file: &Path,
-    account_file: Option<&Path>,
-) -> ExitCode {
+fn run_host_plan(output: OutputFormat, file: &Path, account_file: Option<&Path>) -> ExitCode {
     let manifest = match load_manifest(output, file) {
         Ok(manifest) => manifest,
         Err(code) => return code,
     };
-    let report = match inspect_host_readiness(
-        &manifest,
-        file,
-        account_file,
-        &ProcessExecutor,
-    ) {
+    let report = match inspect_host_readiness(&manifest, file, account_file, &ProcessExecutor) {
         Ok(report) => report,
         Err(error) => {
             let message = format!("failed to inspect host readiness: {error}");
@@ -181,11 +170,7 @@ fn run_host_plan(
 }
 
 #[cfg(not(target_os = "linux"))]
-fn run_host_plan(
-    output: OutputFormat,
-    file: &Path,
-    _account_file: Option<&Path>,
-) -> ExitCode {
+fn run_host_plan(output: OutputFormat, file: &Path, _account_file: Option<&Path>) -> ExitCode {
     if let Err(code) = load_manifest(output, file) {
         return code;
     }
