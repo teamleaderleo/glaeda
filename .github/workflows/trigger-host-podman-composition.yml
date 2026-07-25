@@ -29,6 +29,7 @@ jobs:
           run_line = next(i for i in range(start, len(source)) if source[i] == '        run: |')
           end = next(i for i in range(run_line + 1, len(source)) if source[i].startswith('      - name:'))
           block = '\n'.join(line[10:] if line.startswith('          ') else line for line in source[run_line + 1:end])
+          block = block.replace("\n '''\n", "\n'''\n")
           Path('/tmp/apply-host-podman-composition.sh').write_text(block + '\n')
           PY
           set +e
