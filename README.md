@@ -2,7 +2,7 @@
 
 **GitHub Actions on the Linux boxes you already own.**
 
-SmolRunner is a Rust-based steward for small fleets of self-hosted GitHub Actions runners. It is aimed at solo developers and small teams who have ordinary Linux servers, several repositories, and no desire to operate Kubernetes or inherit a full platform-engineering stack.
+SmolRunner, pronounced “small runner,” is a Rust-based steward for small fleets of self-hosted GitHub Actions runners. It is aimed at solo developers and small teams who have ordinary Linux servers, several repositories, and no desire to operate Kubernetes or inherit a full platform-engineering stack.
 
 > [!IMPORTANT]
 > SmolRunner is pre-alpha. The current executable provides host diagnostics and read-only desired-state and host-state planning; runner installation and reconciliation are roadmap work.
