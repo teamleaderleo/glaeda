@@ -8,16 +8,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::debian_package_plan::{DebianPackagePlan, PackagePlanDisposition};
 use crate::host::{CurrentHostState, Presence};
-use crate::host_package_plan::{
-    DEFAULT_OS_RELEASE_PATH, inspect_host_package_plan_from_current,
-};
+use crate::host_package_plan::{DEFAULT_OS_RELEASE_PATH, inspect_host_package_plan_from_current};
 use crate::lane_command::LinuxAccountName;
 use crate::lane_executable::{ExecutableVerificationErrorKind, verify_executable};
 use crate::manifest::Manifest;
 use crate::process::CommandExecutor;
-use crate::runner_account_observation::{
-    RunnerAccountObservationPaths, observe_runner_account,
-};
+use crate::runner_account_observation::{RunnerAccountObservationPaths, observe_runner_account};
 use crate::runner_account_plan::{
     DesiredRunnerAccount, PlannedSubordinateRange, RunnerAccountObservations, RunnerAccountPlan,
     RunnerAccountPlanDisposition, build_runner_account_plan,
@@ -52,9 +48,11 @@ pub struct ExactExecutableObservation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "disposition", rename_all = "snake_case")]
 pub enum RunnerAccountReadiness {
-    NeedsConfiguration { evidence: Vec<String> },
+    NeedsConfiguration {
+        evidence: Vec<String>,
+    },
     Planned {
-        observations: RunnerAccountObservations,
+        observations: Box<RunnerAccountObservations>,
         plan: RunnerAccountPlan,
     },
 }
@@ -153,26 +151,22 @@ impl RunnerAccountPolicyFile {
                 "runner account policy primary group is not a valid reviewed Linux account name",
             )
         })?;
-        let subordinate_uids = PlannedSubordinateRange::new(
-            self.subordinate_uids.start,
-            self.subordinate_uids.count,
-        )
-        .map_err(|_| {
-            HostReadinessError::new(
-                HostReadinessErrorKind::AccountPolicy,
-                "runner account policy subordinate UID range is invalid",
-            )
-        })?;
-        let subordinate_gids = PlannedSubordinateRange::new(
-            self.subordinate_gids.start,
-            self.subordinate_gids.count,
-        )
-        .map_err(|_| {
-            HostReadinessError::new(
-                HostReadinessErrorKind::AccountPolicy,
-                "runner account policy subordinate GID range is invalid",
-            )
-        })?;
+        let subordinate_uids =
+            PlannedSubordinateRange::new(self.subordinate_uids.start, self.subordinate_uids.count)
+                .map_err(|_| {
+                    HostReadinessError::new(
+                        HostReadinessErrorKind::AccountPolicy,
+                        "runner account policy subordinate UID range is invalid",
+                    )
+                })?;
+        let subordinate_gids =
+            PlannedSubordinateRange::new(self.subordinate_gids.start, self.subordinate_gids.count)
+                .map_err(|_| {
+                    HostReadinessError::new(
+                        HostReadinessErrorKind::AccountPolicy,
+                        "runner account policy subordinate GID range is invalid",
+                    )
+                })?;
         DesiredRunnerAccount::new(
             username,
             primary_group,
@@ -273,7 +267,10 @@ pub fn inspect_host_readiness_with_os_release(
                     "failed to build a dependency-safe runner account plan",
                 )
             })?;
-            RunnerAccountReadiness::Planned { observations, plan }
+            RunnerAccountReadiness::Planned {
+                observations: Box::new(observations),
+                plan,
+            }
         }
         None => RunnerAccountReadiness::NeedsConfiguration {
             evidence: vec![format!(
@@ -326,7 +323,9 @@ pub fn render_human(report: &HostReadinessReport) -> String {
             output.push_str("[READY] All reviewed prerequisite packages are present.\n");
         }
         PackagePlanDisposition::NeedsInspection => {
-            output.push_str("[INSPECT] Package mutation is blocked until these packages are inspected: ");
+            output.push_str(
+                "[INSPECT] Package mutation is blocked until these packages are inspected: ",
+            );
             output.push_str(&package_list(&report.package_plan.unknown_packages));
             output.push('\n');
         }
@@ -415,7 +414,10 @@ fn read_account_policy(
     let contents = String::from_utf8(bytes).map_err(|_| {
         HostReadinessError::new(
             HostReadinessErrorKind::AccountPolicy,
-            format!("runner account policy {} is not valid UTF-8", path.display()),
+            format!(
+                "runner account policy {} is not valid UTF-8",
+                path.display()
+            ),
         )
     })?;
     serde_yaml::from_str(&contents).map(Some).map_err(|_| {
@@ -515,10 +517,7 @@ mod tests {
         .expect("desired account")
     }
 
-    fn observation(
-        state: PreparationObservationState,
-        label: &str,
-    ) -> PreparationObservation {
+    fn observation(state: PreparationObservationState, label: &str) -> PreparationObservation {
         PreparationObservation::new(state, [format!("observed {label}")])
             .expect("bounded observation")
     }
@@ -535,8 +534,7 @@ mod tests {
     }
 
     fn package_plan(presence: Presence) -> crate::debian_package_plan::DebianPackagePlan {
-        let distribution = parse_os_release("ID=ubuntu\nVERSION_ID=24.04\n")
-            .expect("distribution");
+        let distribution = parse_os_release("ID=ubuntu\nVERSION_ID=24.04\n").expect("distribution");
         let seed = build_package_plan(distribution.clone(), &BTreeMap::new()).expect("seed");
         let observed = seed
             .required_packages
@@ -569,7 +567,7 @@ mod tests {
             executables: vec![executable(executable_state)],
             package_plan: package_plan(package_presence),
             runner_account: RunnerAccountReadiness::Planned {
-                observations: account_observations,
+                observations: Box::new(account_observations),
                 plan: account_plan,
             },
         }
@@ -585,9 +583,13 @@ mod tests {
         let json = serde_json::to_value(&report).expect("serialize report");
         assert_eq!(json["executables"][0]["state"], "matching");
         assert_eq!(json["package_plan"]["disposition"], "ready");
-        assert!(report.runner_account_plan().items.iter().all(|item| {
-            item.disposition == RunnerAccountPlanDisposition::Satisfied
-        }));
+        assert!(
+            report
+                .runner_account_plan()
+                .items
+                .iter()
+                .all(|item| { item.disposition == RunnerAccountPlanDisposition::Satisfied })
+        );
         assert!(render_human(&report).contains("[READY] ensure dedicated runner group"));
     }
 
@@ -598,9 +600,13 @@ mod tests {
             HostObservationState::Absent,
             PreparationObservationState::Absent,
         );
-        assert!(report.runner_account_plan().items.iter().all(|item| {
-            item.disposition == RunnerAccountPlanDisposition::Required
-        }));
+        assert!(
+            report
+                .runner_account_plan()
+                .items
+                .iter()
+                .all(|item| { item.disposition == RunnerAccountPlanDisposition::Required })
+        );
         let human = render_human(&report);
         assert!(human.contains("[REQUIRED] git at /usr/bin/git"));
         assert!(human.contains("proven absent"));
@@ -617,22 +623,30 @@ mod tests {
             plan.items[0].disposition,
             RunnerAccountPlanDisposition::Blocked
         );
-        assert!(plan.items[1..].iter().all(|item| {
-            item.disposition == RunnerAccountPlanDisposition::Blocked
-        }));
+        assert!(
+            plan.items[1..]
+                .iter()
+                .all(|item| { item.disposition == RunnerAccountPlanDisposition::Blocked })
+        );
         let report = HostReadinessReport {
             schema_version: 1,
             repository: "example/project".to_owned(),
             executables: vec![executable(HostObservationState::Conflicting)],
             package_plan: package_plan(Presence::Unknown),
             runner_account: RunnerAccountReadiness::Planned {
-                observations: account_observations,
+                observations: Box::new(account_observations),
                 plan,
             },
         };
         let json = serde_json::to_value(&report).expect("serialize report");
-        assert_eq!(json["runner_account"]["observations"]["group"]["state"], "conflicting");
-        assert_eq!(json["runner_account"]["observations"]["user"]["state"], "unknown");
+        assert_eq!(
+            json["runner_account"]["observations"]["group"]["state"],
+            "conflicting"
+        );
+        assert_eq!(
+            json["runner_account"]["observations"]["user"]["state"],
+            "unknown"
+        );
         assert!(render_human(&report).contains("[BLOCKED] git at /usr/bin/git"));
     }
 
