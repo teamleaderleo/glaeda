@@ -1,0 +1,110 @@
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded bitflags v2.13.1
+  Downloaded utf8parse v0.2.2
+  Downloaded anstyle-parse v1.0.0
+  Downloaded anstream v1.0.0
+  Downloaded clap_lex v1.1.0
+  Downloaded hashbrown v0.17.1
+  Downloaded itoa v1.0.18
+  Downloaded clap v4.6.4
+  Downloaded anstyle v1.0.14
+  Downloaded ryu v1.0.23
+  Downloaded indexmap v2.14.0
+  Downloaded syn v3.0.3
+  Downloaded anstyle-query v1.1.5
+  Downloaded serde_core v1.0.229
+  Downloaded equivalent v1.0.2
+  Downloaded serde_norway v0.9.42
+  Downloaded unsafe-libyaml-norway v0.2.15
+  Downloaded is_terminal_polyfill v1.70.2
+  Downloaded strsim v0.11.1
+  Downloaded heck v0.5.0
+  Downloaded proc-macro2 v1.0.107
+  Downloaded unicode-ident v1.0.24
+  Downloaded zmij v1.0.23
+  Downloaded errno v0.3.14
+  Downloaded memchr v2.8.3
+  Downloaded serde v1.0.229
+  Downloaded serde_json v1.0.151
+  Downloaded libc v0.2.189
+  Downloaded clap_builder v4.6.2
+  Downloaded quote v1.0.47
+  Downloaded clap_derive v4.6.4
+  Downloaded serde_derive v1.0.229
+  Downloaded rustix v1.1.4
+  Downloaded colorchoice v1.0.5
+  Downloaded linux-raw-sys v0.12.1
+   Compiling proc-macro2 v1.0.107
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.47
+   Compiling serde_core v1.0.229
+   Compiling utf8parse v0.2.2
+   Compiling anstyle-parse v1.0.0
+   Compiling colorchoice v1.0.5
+   Compiling is_terminal_polyfill v1.70.2
+   Compiling zmij v1.0.23
+   Compiling anstyle v1.0.14
+   Compiling anstyle-query v1.1.5
+   Compiling serde v1.0.229
+   Compiling anstream v1.0.0
+   Compiling rustix v1.1.4
+   Compiling itoa v1.0.18
+   Compiling strsim v0.11.1
+   Compiling heck v0.5.0
+   Compiling syn v3.0.3
+   Compiling serde_json v1.0.151
+   Compiling equivalent v1.0.2
+   Compiling clap_lex v1.1.0
+   Compiling hashbrown v0.17.1
+   Compiling clap_builder v4.6.2
+   Compiling indexmap v2.14.0
+   Compiling linux-raw-sys v0.12.1
+   Compiling unsafe-libyaml-norway v0.2.15
+   Compiling memchr v2.8.3
+   Compiling ryu v1.0.23
+   Compiling serde_derive v1.0.229
+   Compiling clap_derive v4.6.4
+   Compiling bitflags v2.13.1
+   Compiling clap v4.6.4
+   Compiling serde_norway v0.9.42
+   Compiling smolrunner v0.1.0 (/home/runner/work/smolrunner/smolrunner)
+error[E0433]: cannot find type `PreparationObservationState` in this scope
+   --> src/host_readiness.rs:369:52
+    |
+369 |     if account_report.observations.home.state() != PreparationObservationState::Matching {
+    |                                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^ use of undeclared type `PreparationObservationState`
+    |
+help: consider importing this enum
+    |
+  1 + use crate::runner_account_plan::PreparationObservationState;
+    |
+
+error[E0425]: cannot find function `render_human` in module `crate::rootless_podman_config_observation`
+   --> src/host_readiness.rs:597:73
+    |
+597 |             output.push_str(&crate::rootless_podman_config_observation::render_human(
+    |                                                                         ^^^^^^^^^^^^ not found in `crate::rootless_podman_config_observation`
+    |
+help: consider importing one of these functions
+    |
+  1 + use crate::debian_package_plan::render_human;
+    |
+  1 + use crate::doctor::render_human;
+    |
+  1 + use crate::host::render_human;
+    |
+  1 + use crate::host_package_plan::render_human;
+    |
+    = and 4 other candidates
+help: if you import `render_human`, refer to it directly
+    |
+597 -             output.push_str(&crate::rootless_podman_config_observation::render_human(
+597 +             output.push_str(&render_human(
+    |
+
+Some errors have detailed explanations: E0425, E0433.
+For more information about an error, try `rustc --explain E0425`.
+error: could not compile `smolrunner` (lib) due to 2 previous errors
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `smolrunner` (lib test) due to 2 previous errors
