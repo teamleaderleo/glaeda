@@ -59,6 +59,7 @@ pub mod process;
 pub mod resource;
 #[cfg(target_os = "linux")]
 pub mod rootless_podman_config;
+/// Pure precedence resolution and explicit-policy assessment for reviewed Podman configuration.
 #[cfg(target_os = "linux")]
 pub mod rootless_podman_config_resolution;
 #[cfg(target_os = "linux")]
