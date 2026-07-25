@@ -31,6 +31,7 @@ jobs:
           end = next(i for i in range(run_line + 1, len(source)) if source[i].startswith('      - name:'))
           block = '\n'.join(line[10:] if line.startswith('          ') else line for line in source[run_line + 1:end])
           block = re.sub(r"\n[ \t]+'''\n", "\n'''\n", block)
+          Path('composition-script.txt').write_text(block + '\n')
           Path('/tmp/apply-host-podman-composition.sh').write_text(block + '\n')
           PY
           set +e
@@ -46,6 +47,7 @@ jobs:
           path: |
             composition.log
             composition.status
+            composition-script.txt
           retention-days: 1
 
       - name: Commit exact composed output
