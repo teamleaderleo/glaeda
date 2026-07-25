@@ -52,6 +52,8 @@ pub mod preview;
 pub mod process;
 pub mod resource;
 #[cfg(target_os = "linux")]
+pub mod runner_account_observation;
+#[cfg(target_os = "linux")]
 pub mod runner_account_plan;
 #[cfg(target_os = "linux")]
 pub mod runner_user;
