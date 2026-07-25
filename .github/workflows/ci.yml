@@ -45,4 +45,4 @@ jobs:
       - name: Exercise read-only host planning
         run: |
           cargo run --locked --quiet -- --output json host plan --file examples/quarry.yml \
-            | jq -e '.schema_version == 1 and (.actions | length >= 2)'
+            | jq -e '.schema_version == 1 and (.executables | length == 3) and .package_plan and .runner_account'
