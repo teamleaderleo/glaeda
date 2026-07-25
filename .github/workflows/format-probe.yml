@@ -1,0 +1,33 @@
+name: Format probe
+
+on:
+  push:
+    branches: [codex/linux-acceptance-format-probe]
+
+permissions:
+  contents: read
+
+jobs:
+  format:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Apply rustfmt
+        run: cargo fmt --all
+
+      - name: Collect formatted files
+        run: |
+          mkdir formatted
+          cp tests/durable_journal_recovery.rs formatted/
+          cp tests/linux_acceptance.rs formatted/
+          git diff -- tests/durable_journal_recovery.rs tests/linux_acceptance.rs > formatted/rustfmt.patch
+
+      - name: Upload formatter output
+        uses: actions/upload-artifact@84480863f228bb9747b473957fcc9e309aa96097
+        with:
+          name: rustfmt-output
+          path: formatted
+          if-no-files-found: error
