@@ -3,6 +3,9 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::debian_package_plan::{DebianPackagePlan, PackagePlanDisposition};
+use crate::rootless_podman_config_resolution::{
+    RootlessPodmanConfigAssessment, RootlessPodmanConfigAssessmentState, RootlessPodmanConfigField,
+};
 use crate::runner_account_observation::ObservedRunnerIdentity;
 use crate::runner_account_plan::{PreparationObservationState, RunnerAccountObservations};
 
@@ -68,6 +71,7 @@ pub struct RootlessPodmanStaticPreflightReport {
     pub packages: RootlessPodmanPreflightObservation,
     pub runner_account: RootlessPodmanPreflightObservation,
     pub runtime_directory: RootlessPodmanPreflightObservation,
+    pub configuration: RootlessPodmanPreflightObservation,
     pub executables: Vec<RootlessPodmanExecutableObservation>,
 }
 
@@ -103,13 +107,15 @@ impl RootlessPodmanPreflightPaths {
 /// Inspect non-mutating prerequisites for a later rootless Podman smoke verification.
 ///
 /// This function never executes Podman or another child process. It classifies the existing package
-/// plan, runner-account evidence, exact helper metadata, and the runner runtime directory. A
-/// matching report proves only that an explicit, journaled first-run smoke action may be planned.
+/// plan, runner-account evidence, exact helper metadata, runner runtime directory, and a pure
+/// reviewed configuration assessment. A matching report proves only that an explicit, journaled
+/// first-run smoke action may be planned.
 #[must_use]
 pub fn observe_rootless_podman_static_preflight(
     package_plan: &DebianPackagePlan,
     account_observations: &RunnerAccountObservations,
     identity: Option<ObservedRunnerIdentity>,
+    configuration: &RootlessPodmanConfigAssessment,
     paths: &RootlessPodmanPreflightPaths,
 ) -> RootlessPodmanStaticPreflightReport {
     let runtime_identity = identity.map(|identity| RuntimeIdentity {
@@ -119,6 +125,7 @@ pub fn observe_rootless_podman_static_preflight(
         package_plan,
         account_observations,
         runtime_identity,
+        configuration,
         paths,
         &LinuxRuntimeFilesystem,
         &verify_reviewed_executable,
@@ -129,6 +136,7 @@ fn observe_with(
     package_plan: &DebianPackagePlan,
     account_observations: &RunnerAccountObservations,
     identity: Option<RuntimeIdentity>,
+    configuration_assessment: &RootlessPodmanConfigAssessment,
     paths: &RootlessPodmanPreflightPaths,
     filesystem: &impl RuntimeFilesystem,
     executable_probe: &impl Fn(&Path) -> ExecutableProbe,
@@ -136,6 +144,7 @@ fn observe_with(
     let packages = classify_packages(package_plan);
     let runner_account = classify_runner_account(account_observations, identity);
     let runtime_directory = classify_runtime_directory(identity, paths, filesystem);
+    let configuration = classify_configuration(configuration_assessment);
     let executables = REVIEWED_EXECUTABLES
         .into_iter()
         .map(|(name, path)| {
@@ -151,10 +160,15 @@ fn observe_with(
         .collect::<Vec<_>>();
 
     let disposition = disposition(
-        [&packages, &runner_account, &runtime_directory]
-            .into_iter()
-            .map(|observation| observation.state)
-            .chain(executables.iter().map(|observation| observation.state)),
+        [
+            &packages,
+            &runner_account,
+            &runtime_directory,
+            &configuration,
+        ]
+        .into_iter()
+        .map(|observation| observation.state)
+        .chain(executables.iter().map(|observation| observation.state)),
     );
 
     RootlessPodmanStaticPreflightReport {
@@ -163,6 +177,7 @@ fn observe_with(
         packages,
         runner_account,
         runtime_directory,
+        configuration,
         executables,
     }
 }
@@ -293,6 +308,76 @@ fn classify_runtime_directory(
                 path.display()
             ),
         ),
+    }
+}
+
+fn classify_configuration(
+    assessment: &RootlessPodmanConfigAssessment,
+) -> RootlessPodmanPreflightObservation {
+    let derived_state = assessment.fields.iter().map(|field| field.state).max();
+    if derived_state.is_some_and(|state| state != assessment.state) {
+        return observation(
+            RootlessPodmanPreflightState::Conflicting,
+            "rootless Podman configuration assessment summary conflicts with its field results",
+        );
+    }
+    let state = match assessment.state {
+        RootlessPodmanConfigAssessmentState::Matching => RootlessPodmanPreflightState::Matching,
+        RootlessPodmanConfigAssessmentState::Absent => RootlessPodmanPreflightState::Absent,
+        RootlessPodmanConfigAssessmentState::Unknown => RootlessPodmanPreflightState::Unknown,
+        RootlessPodmanConfigAssessmentState::Conflicting => {
+            RootlessPodmanPreflightState::Conflicting
+        }
+    };
+    let mut evidence = assessment
+        .fields
+        .iter()
+        .filter(|field| field.state != RootlessPodmanConfigAssessmentState::Matching)
+        .map(|field| {
+            format!(
+                "{} is {} for the reviewed rootless Podman policy",
+                configuration_field_name(field.field),
+                configuration_state_name(field.state)
+            )
+        })
+        .collect::<Vec<_>>();
+    if evidence.is_empty() {
+        evidence.push(match state {
+            RootlessPodmanPreflightState::Matching => {
+                "all reviewed rootless Podman configuration fields match explicit policy".to_owned()
+            }
+            RootlessPodmanPreflightState::Absent => {
+                "required rootless Podman configuration is absent".to_owned()
+            }
+            RootlessPodmanPreflightState::Unknown => {
+                "rootless Podman configuration precedence could not be resolved safely".to_owned()
+            }
+            RootlessPodmanPreflightState::Conflicting => {
+                "rootless Podman configuration conflicts with explicit policy".to_owned()
+            }
+            RootlessPodmanPreflightState::Blocked => unreachable!("configuration is never blocked"),
+        });
+    }
+    RootlessPodmanPreflightObservation { state, evidence }
+}
+
+fn configuration_field_name(field: RootlessPodmanConfigField) -> &'static str {
+    match field {
+        RootlessPodmanConfigField::StorageDriver => "storage driver",
+        RootlessPodmanConfigField::GraphRoot => "graph root",
+        RootlessPodmanConfigField::RunRoot => "run root",
+        RootlessPodmanConfigField::OverlayMountProgram => "overlay mount program",
+        RootlessPodmanConfigField::CgroupManager => "cgroup manager",
+        RootlessPodmanConfigField::NetworkBackend => "network backend",
+    }
+}
+
+fn configuration_state_name(state: RootlessPodmanConfigAssessmentState) -> &'static str {
+    match state {
+        RootlessPodmanConfigAssessmentState::Matching => "matching",
+        RootlessPodmanConfigAssessmentState::Absent => "absent",
+        RootlessPodmanConfigAssessmentState::Unknown => "unknown",
+        RootlessPodmanConfigAssessmentState::Conflicting => "conflicting",
     }
 }
 
