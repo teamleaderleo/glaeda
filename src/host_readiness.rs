@@ -13,7 +13,18 @@ use crate::lane_command::LinuxAccountName;
 use crate::lane_executable::{ExecutableVerificationErrorKind, verify_executable};
 use crate::manifest::Manifest;
 use crate::process::CommandExecutor;
-use crate::runner_account_observation::{RunnerAccountObservationPaths, observe_runner_account};
+use crate::rootless_podman_config_observation::{
+    RootlessPodmanConfigObservationContext, RootlessPodmanConfigObservationPaths,
+    RootlessPodmanConfigObservationReport, observe_rootless_podman_config,
+};
+use crate::rootless_podman_config_resolution::RootlessPodmanConfigPolicy;
+use crate::rootless_podman_preflight::{
+    RootlessPodmanPreflightDisposition, RootlessPodmanPreflightPaths,
+    RootlessPodmanStaticPreflightReport, observe_rootless_podman_static_preflight,
+};
+use crate::runner_account_observation::{
+    RunnerAccountObservationPaths, RunnerAccountObservationReport, observe_runner_account,
+};
 use crate::runner_account_plan::{
     DesiredRunnerAccount, PlannedSubordinateRange, RunnerAccountObservations, RunnerAccountPlan,
     RunnerAccountPlanDisposition, RunnerAccountResourceKind, build_runner_account_plan,
@@ -63,12 +74,25 @@ pub enum RunnerAccountReadiness {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "disposition", rename_all = "snake_case")]
+pub enum RootlessPodmanHostReadiness {
+    NeedsAccountEvidence {
+        evidence: Vec<String>,
+    },
+    Observed {
+        configuration: Box<RootlessPodmanConfigObservationReport>,
+        preflight: Box<RootlessPodmanStaticPreflightReport>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct HostReadinessReport {
     pub schema_version: u8,
     pub repository: String,
     pub executables: Vec<ExactExecutableObservation>,
     pub package_plan: DebianPackagePlan,
     pub runner_account: RunnerAccountReadiness,
+    pub rootless_podman: RootlessPodmanHostReadiness,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -79,6 +103,7 @@ pub enum HostReadinessErrorKind {
     RunnerAccountObservation,
     RunnerAccountPlan,
     SubordinateIdPlan,
+    RootlessPodmanObservation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -252,10 +277,10 @@ pub fn inspect_host_readiness_with_os_release(
         .map(Path::to_path_buf)
         .unwrap_or_else(|| default_account_policy_path(manifest_path));
     let policy = read_account_policy(&policy_path, account_policy_path.is_some())?;
-    let runner_account = match policy {
+    let (runner_account, rootless_podman) = match policy {
         Some(policy) => {
             let desired = policy.desired_account(manifest)?;
-            let report = observe_runner_account(
+            let account_report = observe_runner_account(
                 &desired,
                 executor,
                 &RunnerAccountObservationPaths::system_default(),
@@ -266,10 +291,12 @@ pub fn inspect_host_readiness_with_os_release(
                     "failed to classify bounded runner account observations",
                 )
             })?;
-            let identity = report
+            let rootless_podman =
+                inspect_rootless_podman_readiness(&desired, &account_report, &package_plan)?;
+            let identity = account_report
                 .identity()
                 .map(|identity| (identity.uid(), identity.primary_gid()));
-            let observations = report.observations;
+            let observations = account_report.observations;
             let subordinate_ids = build_exact_subordinate_id_plan(
                 &desired,
                 &observations,
@@ -291,18 +318,29 @@ pub fn inspect_host_readiness_with_os_release(
                     )
                 })?,
             );
-            RunnerAccountReadiness::Planned {
-                observations: Box::new(observations),
-                plan,
-                subordinate_ids: Box::new(subordinate_ids),
-            }
+            (
+                RunnerAccountReadiness::Planned {
+                    observations: Box::new(observations),
+                    plan,
+                    subordinate_ids: Box::new(subordinate_ids),
+                },
+                rootless_podman,
+            )
         }
-        None => RunnerAccountReadiness::NeedsConfiguration {
-            evidence: vec![format!(
+        None => {
+            let evidence = format!(
                 "runner account policy is missing at {}; exact home and subordinate-ID ranges remain unconfigured",
                 policy_path.display()
-            )],
-        },
+            );
+            (
+                RunnerAccountReadiness::NeedsConfiguration {
+                    evidence: vec![evidence.clone()],
+                },
+                RootlessPodmanHostReadiness::NeedsAccountEvidence {
+                    evidence: vec![evidence],
+                },
+            )
+        }
     };
 
     Ok(HostReadinessReport {
@@ -311,6 +349,97 @@ pub fn inspect_host_readiness_with_os_release(
         executables: observe_required_executables(),
         package_plan,
         runner_account,
+        rootless_podman,
+    })
+}
+
+fn inspect_rootless_podman_readiness(
+    desired: &DesiredRunnerAccount,
+    account_report: &RunnerAccountObservationReport,
+    package_plan: &DebianPackagePlan,
+) -> Result<RootlessPodmanHostReadiness, HostReadinessError> {
+    let Some(identity) = account_report.identity() else {
+        return Ok(RootlessPodmanHostReadiness::NeedsAccountEvidence {
+            evidence: vec![
+                "rootless Podman configuration observation is blocked until the exact runner identity is proven"
+                    .to_owned(),
+            ],
+        });
+    };
+    if account_report.observations.home.state() != PreparationObservationState::Matching {
+        return Ok(RootlessPodmanHostReadiness::NeedsAccountEvidence {
+            evidence: vec![
+                "rootless Podman configuration observation is blocked until the reviewed runner home matches policy"
+                    .to_owned(),
+            ],
+        });
+    }
+    if identity.uid() == 0
+        || identity.primary_gid() == 0
+        || identity.primary_gid() != identity.group_gid()
+    {
+        return Ok(RootlessPodmanHostReadiness::NeedsAccountEvidence {
+            evidence: vec![
+                "rootless Podman configuration observation requires one exact non-root runner UID and primary GID"
+                    .to_owned(),
+            ],
+        });
+    }
+
+    let home = PathBuf::from(desired.home());
+    let xdg_config_home = home.join(".config");
+    let xdg_data_home = home.join(".local/share");
+    let xdg_runtime_dir = PathBuf::from(format!("/run/user/{}", identity.uid()));
+    let context = RootlessPodmanConfigObservationContext::new(
+        home.clone(),
+        xdg_config_home,
+        xdg_data_home.clone(),
+        xdg_runtime_dir.clone(),
+        identity.uid(),
+        identity.primary_gid(),
+    )
+    .map_err(|_| {
+        HostReadinessError::new(
+            HostReadinessErrorKind::RootlessPodmanObservation,
+            "failed to construct the reviewed rootless Podman observation context",
+        )
+    })?;
+    let policy = RootlessPodmanConfigPolicy::new(
+        "overlay",
+        xdg_data_home.join("containers/storage"),
+        xdg_runtime_dir.join("containers"),
+        "/usr/bin/fuse-overlayfs",
+        "systemd",
+        "netavark",
+    )
+    .map_err(|_| {
+        HostReadinessError::new(
+            HostReadinessErrorKind::RootlessPodmanObservation,
+            "failed to construct the explicit rootless Podman host policy",
+        )
+    })?;
+    let configuration = observe_rootless_podman_config(
+        &context,
+        &RootlessPodmanConfigObservationPaths::system_default(),
+        &policy,
+    )
+    .map_err(|_| {
+        HostReadinessError::new(
+            HostReadinessErrorKind::RootlessPodmanObservation,
+            "failed to represent trusted rootless Podman configuration observations",
+        )
+    })?;
+    let preflight = observe_rootless_podman_static_preflight(
+        package_plan,
+        &account_report.observations,
+        Some(identity),
+        &configuration.assessment,
+        &RootlessPodmanPreflightPaths::system_default(),
+    );
+
+    Ok(RootlessPodmanHostReadiness::Observed {
+        configuration: Box::new(configuration),
+        preflight: Box::new(preflight),
     })
 }
 
@@ -453,8 +582,46 @@ pub fn render_human(report: &HostReadinessReport) -> String {
         }
     }
 
+    output.push_str("\nRootless Podman static preflight\n");
+    match &report.rootless_podman {
+        RootlessPodmanHostReadiness::NeedsAccountEvidence { evidence } => {
+            output.push_str("[BLOCKED] Exact runner identity and home evidence are required.\n");
+            for item in evidence {
+                output.push_str(&format!("  {item}\n"));
+            }
+        }
+        RootlessPodmanHostReadiness::Observed {
+            configuration,
+            preflight,
+        } => {
+            output.push_str(&crate::rootless_podman_config_observation::render_human(
+                configuration,
+            ));
+            output.push_str(&format!(
+                "Static preflight disposition: {}\n",
+                rootless_preflight_disposition_name(preflight.disposition)
+            ));
+            for item in &preflight.configuration.evidence {
+                output.push_str(&format!("  {item}\n"));
+            }
+        }
+    }
+
     output.push_str("\nNo changes were made.\n");
     output
+}
+
+fn rootless_preflight_disposition_name(
+    disposition: RootlessPodmanPreflightDisposition,
+) -> &'static str {
+    match disposition {
+        RootlessPodmanPreflightDisposition::ReadyForSmokeVerification => {
+            "ready_for_smoke_verification"
+        }
+        RootlessPodmanPreflightDisposition::ChangesRequired => "changes_required",
+        RootlessPodmanPreflightDisposition::NeedsInspection => "needs_inspection",
+        RootlessPodmanPreflightDisposition::Blocked => "blocked",
+    }
 }
 
 fn read_account_policy(

@@ -1,7 +1,10 @@
 use serde::Serialize;
 
 use crate::debian_package_plan::PackagePlanDisposition;
-use crate::host_readiness::{HostObservationState, HostReadinessReport, RunnerAccountReadiness};
+use crate::host_readiness::{
+    HostObservationState, HostReadinessReport, RootlessPodmanHostReadiness, RunnerAccountReadiness,
+};
+use crate::rootless_podman_preflight::RootlessPodmanPreflightDisposition;
 use crate::runner_account_plan::{RunnerAccountPlanDisposition, RunnerAccountResourceKind};
 use crate::subordinate_id::{PodmanMigrationPlan, SubordinateIdKind, SubordinatePlanDisposition};
 
@@ -168,6 +171,47 @@ pub fn assess(report: &HostReadinessReport) -> HostReadinessAssessment<'_> {
                         },
                     });
                 }
+            }
+        }
+    }
+
+    match &report.rootless_podman {
+        RootlessPodmanHostReadiness::NeedsAccountEvidence { evidence } => {
+            findings.push(HostReadinessFinding {
+                id: "rootless-podman-static-preflight".to_owned(),
+                domain: HostReadinessDomain::RootlessPodman,
+                disposition: HostReadinessDisposition::Blocked,
+                summary: if evidence.is_empty() {
+                    "rootless Podman static preflight requires exact runner account evidence"
+                        .to_owned()
+                } else {
+                    evidence.join("; ")
+                },
+            });
+        }
+        RootlessPodmanHostReadiness::Observed { preflight, .. } => {
+            let finding = match preflight.disposition {
+                RootlessPodmanPreflightDisposition::ReadyForSmokeVerification => None,
+                RootlessPodmanPreflightDisposition::ChangesRequired => Some((
+                    HostReadinessDisposition::ChangesRequired,
+                    "rootless Podman static preflight requires reviewed host changes",
+                )),
+                RootlessPodmanPreflightDisposition::NeedsInspection => Some((
+                    HostReadinessDisposition::NeedsInspection,
+                    "rootless Podman static preflight requires additional inspection",
+                )),
+                RootlessPodmanPreflightDisposition::Blocked => Some((
+                    HostReadinessDisposition::Blocked,
+                    "rootless Podman static preflight is blocked by conflicting evidence",
+                )),
+            };
+            if let Some((disposition, summary)) = finding {
+                findings.push(HostReadinessFinding {
+                    id: "rootless-podman-static-preflight".to_owned(),
+                    domain: HostReadinessDomain::RootlessPodman,
+                    disposition,
+                    summary: summary.to_owned(),
+                });
             }
         }
     }
