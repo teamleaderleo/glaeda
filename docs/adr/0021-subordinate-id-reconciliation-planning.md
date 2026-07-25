@@ -14,7 +14,7 @@ A mapping change also invalidates assumptions held by existing rootless Podman s
 
 ### Complete bounded authority parsing
 
-SmolRunner parses each trusted authority snapshot as a whole. Input is capped at 1 MiB, 16,384 records and 4,096 bytes per row. Every row must contain one reviewed account name or canonical positive numeric owner, one canonical positive start, and one canonical nonempty nonoverflowing count.
+SmolRunner parses each trusted authority snapshot as a whole. Input is capped at 1 MiB, 16,384 records, and 4,096 bytes per row. Every row must contain one reviewed account name or canonical positive numeric owner, one canonical positive start, and one canonical nonempty nonoverflowing count.
 
 Empty authority files are valid. Empty rows, NUL data, missing final newlines, extra fields, noncanonical numbers and overflowing ranges are malformed. Any owner appearing more than once is conflicting. When the runner UID is freshly proven, its numeric owner form and username form are aliases; multiple records across those aliases are also conflicting. Any pair of ranges that intersects is conflicting. Exactly adjacent ranges are valid.
 
