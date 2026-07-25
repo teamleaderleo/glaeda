@@ -50,8 +50,18 @@ limactl shell "${instance}" -- /usr/bin/cat /proc/loadavg
 limactl shell "${instance}" -- /usr/bin/uptime
 limactl shell "${instance}" -- /usr/bin/df -h /
 limactl shell "${instance}" -- /usr/bin/systemctl is-system-running || true
-limactl shell "${instance}" -- /usr/bin/cat /sys/fs/cgroup/memory.current || true
-limactl shell "${instance}" -- /usr/bin/cat /sys/fs/cgroup/memory.peak || true
+limactl shell "${instance}" -- /usr/bin/bash -lc '
+  cgroup_path="$(awk -F: '\''$1 == "0" { print $3 }'\'' /proc/self/cgroup)"
+  for metric in memory.current memory.peak; do
+    file="/sys/fs/cgroup${cgroup_path}/${metric}"
+    printf "%s: " "${metric}"
+    if [ -r "${file}" ]; then
+      cat "${file}"
+    else
+      printf "unavailable (%s)\n" "${file}"
+    fi
+  done
+' || true
 
 if limactl shell "${instance}" -- /usr/bin/test -x /usr/bin/podman; then
   limactl shell "${instance}" -- /usr/bin/podman system df
