@@ -3,6 +3,10 @@ use std::path::Path;
 
 use crate::debian_package_plan::{build_package_plan, parse_os_release};
 use crate::host::Presence;
+use crate::rootless_podman_config_resolution::{
+    ROOTLESS_PODMAN_CONFIG_RESOLUTION_SCHEMA_VERSION, RootlessPodmanConfigAssessment,
+    RootlessPodmanConfigAssessmentState,
+};
 use crate::runner_account_plan::{
     PreparationObservation, PreparationObservationState, RunnerAccountObservations,
 };
@@ -54,6 +58,14 @@ fn account_observations(state: PreparationObservationState) -> RunnerAccountObse
     }
 }
 
+fn config_assessment(state: RootlessPodmanConfigAssessmentState) -> RootlessPodmanConfigAssessment {
+    RootlessPodmanConfigAssessment {
+        schema_version: ROOTLESS_PODMAN_CONFIG_RESOLUTION_SCHEMA_VERSION,
+        state,
+        fields: Vec::new(),
+    }
+}
+
 fn matching_executable(_path: &Path) -> ExecutableProbe {
     ExecutableProbe {
         state: RootlessPodmanPreflightState::Matching,
@@ -67,6 +79,7 @@ fn matching_static_state_is_ready_only_for_later_smoke_verification() {
         &package_plan(Presence::Present),
         &account_observations(PreparationObservationState::Matching),
         Some(RuntimeIdentity { uid: 1001 }),
+        &config_assessment(RootlessPodmanConfigAssessmentState::Matching),
         &RootlessPodmanPreflightPaths::new("/run/user").expect("paths"),
         &FakeFilesystem {
             observation: RuntimePathObservation::Present(RuntimePathMetadata {
@@ -82,6 +95,10 @@ fn matching_static_state_is_ready_only_for_later_smoke_verification() {
         report.disposition,
         RootlessPodmanPreflightDisposition::ReadyForSmokeVerification
     );
+    assert_eq!(
+        report.configuration.state,
+        RootlessPodmanPreflightState::Matching
+    );
     assert_eq!(report.executables.len(), 8);
     assert!(report.executables.iter().all(|item| {
         item.state == RootlessPodmanPreflightState::Matching
@@ -96,6 +113,7 @@ fn unknown_account_blocks_runtime_inspection_and_fails_closed() {
         &package_plan(Presence::Present),
         &account_observations(PreparationObservationState::Unknown),
         None,
+        &config_assessment(RootlessPodmanConfigAssessmentState::Matching),
         &RootlessPodmanPreflightPaths::system_default(),
         &FakeFilesystem {
             observation: RuntimePathObservation::Present(RuntimePathMetadata {
@@ -127,6 +145,7 @@ fn conflicting_runtime_directory_blocks_preflight() {
         &package_plan(Presence::Present),
         &account_observations(PreparationObservationState::Matching),
         Some(RuntimeIdentity { uid: 1001 }),
+        &config_assessment(RootlessPodmanConfigAssessmentState::Matching),
         &RootlessPodmanPreflightPaths::system_default(),
         &FakeFilesystem {
             observation: RuntimePathObservation::Present(RuntimePathMetadata {
@@ -154,6 +173,7 @@ fn missing_packages_and_helpers_require_changes_without_running_podman() {
         &package_plan(Presence::Absent),
         &account_observations(PreparationObservationState::Absent),
         None,
+        &config_assessment(RootlessPodmanConfigAssessmentState::Matching),
         &RootlessPodmanPreflightPaths::system_default(),
         &FakeFilesystem {
             observation: RuntimePathObservation::Missing,
@@ -175,6 +195,84 @@ fn missing_packages_and_helpers_require_changes_without_running_podman() {
     assert_eq!(
         report.executables[0].state,
         RootlessPodmanPreflightState::Absent
+    );
+}
+
+#[test]
+fn conflicting_configuration_blocks_preflight() {
+    let report = observe_with(
+        &package_plan(Presence::Present),
+        &account_observations(PreparationObservationState::Matching),
+        Some(RuntimeIdentity { uid: 1001 }),
+        &config_assessment(RootlessPodmanConfigAssessmentState::Conflicting),
+        &RootlessPodmanPreflightPaths::system_default(),
+        &FakeFilesystem {
+            observation: RuntimePathObservation::Present(RuntimePathMetadata {
+                kind: RuntimePathKind::Directory,
+                uid: 1001,
+                mode: 0o700,
+            }),
+        },
+        &matching_executable,
+    );
+
+    assert_eq!(
+        report.configuration.state,
+        RootlessPodmanPreflightState::Conflicting
+    );
+    assert_eq!(report.disposition, RootlessPodmanPreflightDisposition::Blocked);
+}
+
+#[test]
+fn unknown_configuration_requires_inspection() {
+    let report = observe_with(
+        &package_plan(Presence::Present),
+        &account_observations(PreparationObservationState::Matching),
+        Some(RuntimeIdentity { uid: 1001 }),
+        &config_assessment(RootlessPodmanConfigAssessmentState::Unknown),
+        &RootlessPodmanPreflightPaths::system_default(),
+        &FakeFilesystem {
+            observation: RuntimePathObservation::Present(RuntimePathMetadata {
+                kind: RuntimePathKind::Directory,
+                uid: 1001,
+                mode: 0o700,
+            }),
+        },
+        &matching_executable,
+    );
+
+    assert_eq!(
+        report.configuration.state,
+        RootlessPodmanPreflightState::Unknown
+    );
+    assert_eq!(
+        report.disposition,
+        RootlessPodmanPreflightDisposition::NeedsInspection
+    );
+}
+
+#[test]
+fn absent_configuration_requires_changes() {
+    let report = observe_with(
+        &package_plan(Presence::Present),
+        &account_observations(PreparationObservationState::Matching),
+        Some(RuntimeIdentity { uid: 1001 }),
+        &config_assessment(RootlessPodmanConfigAssessmentState::Absent),
+        &RootlessPodmanPreflightPaths::system_default(),
+        &FakeFilesystem {
+            observation: RuntimePathObservation::Present(RuntimePathMetadata {
+                kind: RuntimePathKind::Directory,
+                uid: 1001,
+                mode: 0o700,
+            }),
+        },
+        &matching_executable,
+    );
+
+    assert_eq!(report.configuration.state, RootlessPodmanPreflightState::Absent);
+    assert_eq!(
+        report.disposition,
+        RootlessPodmanPreflightDisposition::ChangesRequired
     );
 }
 
