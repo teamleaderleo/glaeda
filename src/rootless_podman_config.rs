@@ -106,7 +106,7 @@ pub struct RootlessPodmanContainersConfig {
 /// # Errors
 ///
 /// Returns an error for oversized input, unsafe control characters, malformed tables, malformed
-/// relevant values, or duplicate relevant keys.
+/// relevant assignments, or duplicate relevant keys.
 pub fn parse_rootless_podman_storage_config(
     input: &str,
 ) -> Result<RootlessPodmanStorageConfig, RootlessPodmanConfigError> {
@@ -129,7 +129,7 @@ pub fn parse_rootless_podman_storage_config(
 /// # Errors
 ///
 /// Returns an error for oversized input, unsafe control characters, malformed tables, malformed
-/// relevant values, or duplicate relevant keys.
+/// relevant assignments, or duplicate relevant keys.
 pub fn parse_rootless_podman_containers_config(
     input: &str,
 ) -> Result<RootlessPodmanContainersConfig, RootlessPodmanConfigError> {
