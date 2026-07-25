@@ -24,6 +24,21 @@ jobs:
       - name: Install Rust toolchain
         run: rustup show active-toolchain
 
+      - name: Format preflight sources for local verification bootstrap
+        run: |
+          cargo fmt --all
+          tar -czf /tmp/preflight-source.tar.gz \
+            src/rootless_podman_preflight.rs \
+            src/rootless_podman_preflight/support.rs \
+            src/rootless_podman_preflight/tests.rs
+
+      - name: Upload formatted preflight sources
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: preflight-source
+          path: /tmp/preflight-source.tar.gz
+          retention-days: 1
+
       # Cross-check the documented Apple Silicon Lima guest target.
       - name: Install ARM64 Linux target
         run: rustup target add aarch64-unknown-linux-gnu
@@ -35,7 +50,19 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run Clippy
-        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+        run: |
+          set +e
+          cargo clippy --locked --all-targets --all-features -- -D warnings 2>&1 | tee /tmp/clippy.log
+          status=${PIPESTATUS[0]}
+          exit "$status"
+
+      - name: Upload Clippy diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: preflight-clippy
+          path: /tmp/clippy.log
+          retention-days: 1
 
       - name: Run tests
         run: cargo test --locked --all-targets --all-features
