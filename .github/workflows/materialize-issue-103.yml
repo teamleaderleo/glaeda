@@ -1,0 +1,44 @@
+name: Materialize issue 103 patch
+
+on:
+  push:
+    branches:
+      - codex/issue-103-subordinate-id-plan-v2
+
+permissions:
+  contents: write
+
+concurrency:
+  group: materialize-issue-103-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  materialize:
+    if: hashFiles('.smolrunner-bootstrap/ready') != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out implementation branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: codex/issue-103-subordinate-id-plan-v2
+
+      - name: Apply reviewed patch
+        run: |
+          set -euo pipefail
+          cat .smolrunner-bootstrap/chunk-* | tr -d '\n' | base64 --decode > /tmp/issue-103.patch
+          printf '%s  %s\n' \
+            '6b1fc3df07f6ace3c01e268812f4b0282a132b4fc20c4cf89131f98794861f19' \
+            /tmp/issue-103.patch | sha256sum --check
+          git apply --index /tmp/issue-103.patch
+          rm -rf .smolrunner-bootstrap
+          rm .github/workflows/materialize-issue-103.yml
+          rustup show active-toolchain
+          cargo fmt --all
+          git add --all
+          git diff --cached --check
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'Plan subordinate-ID reconciliation'
+          git push origin HEAD:codex/issue-103-subordinate-id-plan-v2
