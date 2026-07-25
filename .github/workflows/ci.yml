@@ -26,6 +26,7 @@ jobs:
           bash -n \
             scripts/macbook-runner-bootstrap.sh \
             scripts/macbook-runner-observe.sh \
+            scripts/macbook-workspace.sh \
             scripts/test-macbook-runner-bootstrap.sh
           bash scripts/test-macbook-runner-bootstrap.sh
 
