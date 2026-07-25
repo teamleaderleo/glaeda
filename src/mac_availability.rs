@@ -667,7 +667,7 @@ mod tests {
     }
 
     #[test]
-    fn JSON_contract_uses_versioned_snake_case_fields() {
+    fn json_contract_uses_versioned_snake_case_fields() {
         let plan = plan_availability_transition(
             observation(EffectiveAvailabilityMode::Off),
             AvailabilityRequest::Active,
