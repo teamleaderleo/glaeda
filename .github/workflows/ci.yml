@@ -20,7 +20,8 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: codex/runner-account-observation
-          fetch-depth: 0
+          fetch-depth: 1
+          show-progress: false
 
       - name: Install Rust toolchain
         run: rustup show active-toolchain
@@ -56,6 +57,7 @@ jobs:
 
       - name: Publish verified source and restore ordinary CI
         run: |
+          git fetch origin main --depth=1
           git show origin/main:.github/workflows/ci.yml > .github/workflows/ci.yml
           rm -f .github/workflows/seal-observation-paths.yml
           rm -f .github/seal-observation-paths.py
