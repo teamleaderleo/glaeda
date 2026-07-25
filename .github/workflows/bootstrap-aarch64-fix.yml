@@ -1,0 +1,38 @@
+name: Bootstrap ARM64 stat portability fix
+
+on:
+  push:
+    branches: [fix/aarch64-nlink]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out repair branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: fix/aarch64-nlink
+
+      - name: Apply portability fix and remove bootstrap workflow
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/runner_account_observation.rs")
+          text = path.read_text()
+          old = "            nlink: stat.st_nlink,\n"
+          new = "            nlink: u64::from(stat.st_nlink),\n"
+          if text.count(old) != 1:
+              raise SystemExit("expected exactly one nlink assignment")
+          path.write_text(text.replace(old, new))
+          PY
+          rm .github/workflows/bootstrap-aarch64-fix.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/runner_account_observation.rs .github/workflows/bootstrap-aarch64-fix.yml
+          git commit -m "Fix ARM64 link-count conversion"
+          git push origin HEAD:fix/aarch64-nlink
