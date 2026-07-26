@@ -6,12 +6,11 @@ use smolrunner::execution_admission::{
     ReservationGeneration, ReservationId, RunnerProfileId,
 };
 use smolrunner::personal_worker_queue::{
-    PersonalWorkerActiveReservation, PersonalWorkerCacheAccessMode,
-    PersonalWorkerCacheLeaseState, PersonalWorkerCacheNamespace,
-    PersonalWorkerCancellationState, PersonalWorkerJobRequest, PersonalWorkerPendingProfileChange,
-    PersonalWorkerPriority, PersonalWorkerProfile, PersonalWorkerQueueEntryState,
-    PersonalWorkerQueueGeneration, PersonalWorkerQueueInput, PersonalWorkerSourceIdentity,
-    evaluate_personal_worker_queue,
+    PersonalWorkerActiveReservation, PersonalWorkerCacheAccessMode, PersonalWorkerCacheLeaseState,
+    PersonalWorkerCacheNamespace, PersonalWorkerCancellationState, PersonalWorkerJobRequest,
+    PersonalWorkerPendingProfileChange, PersonalWorkerPriority, PersonalWorkerProfile,
+    PersonalWorkerQueueEntryState, PersonalWorkerQueueGeneration, PersonalWorkerQueueInput,
+    PersonalWorkerSourceIdentity, evaluate_personal_worker_queue,
 };
 use smolrunner::verification_profile::{CacheId, VerificationProfileId};
 
@@ -239,11 +238,9 @@ fn one_heavy_job_excludes_other_work_while_two_light_jobs_can_share() {
         limits(1_000, 1),
         PersonalWorkerCacheAccessMode::Read,
     );
-    let heavy_decision = evaluate_personal_worker_queue(
-        &input(1, observed_at, vec![light, heavy], vec![]),
-        None,
-    )
-    .expect("heavy decision");
+    let heavy_decision =
+        evaluate_personal_worker_queue(&input(1, observed_at, vec![light, heavy], vec![]), None)
+            .expect("heavy decision");
     assert_eq!(heavy_decision.selected.len(), 1);
     assert_eq!(heavy_decision.selected[0].request_id.as_str(), "heavy");
 
@@ -285,11 +282,9 @@ fn aggregate_reservations_preserve_the_fixed_guest_and_cache_reserve() {
         limits(7_001, 8),
         PersonalWorkerCacheAccessMode::Read,
     );
-    let error = evaluate_personal_worker_queue(
-        &input(1, observed_at, vec![oversized], vec![]),
-        None,
-    )
-    .expect_err("capacity refusal");
+    let error =
+        evaluate_personal_worker_queue(&input(1, observed_at, vec![oversized], vec![]), None)
+            .expect_err("capacity refusal");
     assert_eq!(error.code, "personal_worker_reserve_violation");
 }
 
@@ -314,11 +309,9 @@ fn cache_writers_are_exclusive_but_readers_can_share() {
         limits(2_000, 2),
         PersonalWorkerCacheAccessMode::Read,
     );
-    let decision = evaluate_personal_worker_queue(
-        &input(1, observed_at, vec![writer, reader], vec![]),
-        None,
-    )
-    .expect("writer decision");
+    let decision =
+        evaluate_personal_worker_queue(&input(1, observed_at, vec![writer, reader], vec![]), None)
+            .expect("writer decision");
     assert_eq!(decision.selected.len(), 1);
     let blocked = decision
         .visibility
@@ -348,11 +341,9 @@ fn cache_writers_are_exclusive_but_readers_can_share() {
         limits(2_000, 2),
         PersonalWorkerCacheAccessMode::Read,
     );
-    let read_decision = evaluate_personal_worker_queue(
-        &input(1, observed_at, vec![read_a, read_b], vec![]),
-        None,
-    )
-    .expect("reader decision");
+    let read_decision =
+        evaluate_personal_worker_queue(&input(1, observed_at, vec![read_a, read_b], vec![]), None)
+            .expect("reader decision");
     assert_eq!(read_decision.selected.len(), 2);
 }
 
@@ -371,11 +362,9 @@ fn cancelled_work_remains_visible_and_never_receives_a_reservation() {
     cancelled.cancellation = PersonalWorkerCancellationState::Cancelled {
         cancelled_at: time(observed_at - 1_000),
     };
-    let decision = evaluate_personal_worker_queue(
-        &input(1, observed_at, vec![cancelled], vec![]),
-        None,
-    )
-    .expect("cancelled decision");
+    let decision =
+        evaluate_personal_worker_queue(&input(1, observed_at, vec![cancelled], vec![]), None)
+            .expect("cancelled decision");
     assert!(decision.selected.is_empty());
     assert_eq!(
         decision.visibility[0].state,
@@ -390,16 +379,11 @@ fn cancelled_work_remains_visible_and_never_receives_a_reservation() {
 #[test]
 fn queue_generation_must_advance_exactly_once() {
     let observed_at = 10_000_000;
-    let first = evaluate_personal_worker_queue(
-        &input(1, observed_at, vec![], vec![]),
-        None,
-    )
-    .expect("first generation");
-    let error = evaluate_personal_worker_queue(
-        &input(3, observed_at + 1, vec![], vec![]),
-        Some(&first),
-    )
-    .expect_err("generation gap");
+    let first = evaluate_personal_worker_queue(&input(1, observed_at, vec![], vec![]), None)
+        .expect("first generation");
+    let error =
+        evaluate_personal_worker_queue(&input(3, observed_at + 1, vec![], vec![]), Some(&first))
+            .expect_err("generation gap");
     assert_eq!(error.code, "stale_or_skipped_queue_generation");
 }
 
@@ -439,8 +423,7 @@ fn desired_profile_uses_work_interactive_and_stopped_cooldowns() {
     let mut stopped_input = input(1, observed_at, vec![], vec![]);
     stopped_input.current_profile = PersonalWorkerProfile::Interactive;
     stopped_input.last_activity_at = time(observed_at - 31 * 60 * 1_000);
-    let stopped =
-        evaluate_personal_worker_queue(&stopped_input, None).expect("stopped profile");
+    let stopped = evaluate_personal_worker_queue(&stopped_input, None).expect("stopped profile");
     assert_eq!(stopped.desired_profile, PersonalWorkerProfile::Stopped);
 }
 
@@ -456,11 +439,9 @@ fn visibility_is_bounded_and_contains_no_private_execution_material() {
         limits(2_000, 2),
         PersonalWorkerCacheAccessMode::Read,
     );
-    let decision = evaluate_personal_worker_queue(
-        &input(1, observed_at, vec![queued], vec![]),
-        None,
-    )
-    .expect("decision");
+    let decision =
+        evaluate_personal_worker_queue(&input(1, observed_at, vec![queued], vec![]), None)
+            .expect("decision");
     let encoded = serde_json::to_string(&decision).expect("JSON");
     for private in [
         "/Users/operator/private",

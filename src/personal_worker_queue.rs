@@ -84,8 +84,8 @@ impl PersonalWorkerPriority {
     }
 
     fn effective_rank(self, age_millis: u64) -> u8 {
-        let promotions = u8::try_from(age_millis / PERSONAL_WORKER_PRIORITY_AGING_MILLIS)
-            .unwrap_or(u8::MAX);
+        let promotions =
+            u8::try_from(age_millis / PERSONAL_WORKER_PRIORITY_AGING_MILLIS).unwrap_or(u8::MAX);
         self.base_rank().saturating_add(promotions).min(2)
     }
 }
@@ -369,7 +369,9 @@ pub fn evaluate_personal_worker_queue(
         .iter()
         .filter(|request| !request.cancellation.is_cancelled())
         .collect::<Vec<_>>();
-    candidates.sort_by(|left, right| compare_candidates(left, right, input.observed_at, &repository_load));
+    candidates.sort_by(|left, right| {
+        compare_candidates(left, right, input.observed_at, &repository_load)
+    });
 
     let mut selected = Vec::new();
     let mut used_cpu = active_limits.cpu_millis;
@@ -385,7 +387,10 @@ pub fn evaluate_personal_worker_queue(
             break;
         }
         let job_class = request.job_class();
-        if active_heavy || selected_heavy || (job_class == PersonalWorkerJobClass::Heavy && !input.active.is_empty()) {
+        if active_heavy
+            || selected_heavy
+            || (job_class == PersonalWorkerJobClass::Heavy && !input.active.is_empty())
+        {
             continue;
         }
         if job_class == PersonalWorkerJobClass::Heavy && !selected.is_empty() {
@@ -577,7 +582,9 @@ fn validate_request(
         ));
     }
     validate_limits(request.requested_limits)?;
-    request.cache_namespace.validate_for_source(&request.source)?;
+    request
+        .cache_namespace
+        .validate_for_source(&request.source)?;
     validate_fallback(&request.identity, &request.fallback_eligibility)
 }
 
@@ -671,9 +678,10 @@ fn validate_active(
         ExecutionAdmissionState::Starting
         | ExecutionAdmissionState::Running
         | ExecutionAdmissionState::Draining => {
-            if reservation.started_at.is_none_or(|started| {
-                started < evidence.reserved_at || started > observed_at
-            }) {
+            if reservation
+                .started_at
+                .is_none_or(|started| started < evidence.reserved_at || started > observed_at)
+            {
                 return Err(PersonalWorkerQueueError::new(
                     "started_at",
                     "invalid_active_start_time",
@@ -731,13 +739,15 @@ fn aggregate_active_limits(
                 "active CPU reservations exceed the bounded aggregate",
             )
         })?;
-        memory_bytes = memory_bytes.checked_add(limits.memory_bytes).ok_or_else(|| {
-            PersonalWorkerQueueError::new(
-                "active.requested_limits.memory_bytes",
-                "active_memory_overflow",
-                "active memory reservations exceed the bounded aggregate",
-            )
-        })?;
+        memory_bytes = memory_bytes
+            .checked_add(limits.memory_bytes)
+            .ok_or_else(|| {
+                PersonalWorkerQueueError::new(
+                    "active.requested_limits.memory_bytes",
+                    "active_memory_overflow",
+                    "active memory reservations exceed the bounded aggregate",
+                )
+            })?;
         pids = pids.saturating_add(limits.pids);
         if reservation.request.job_class() == PersonalWorkerJobClass::Heavy {
             heavy_count += 1;
@@ -764,7 +774,8 @@ fn aggregate_active_limits(
 fn validate_active_leases(
     active: &[PersonalWorkerActiveReservation],
 ) -> Result<(), PersonalWorkerQueueError> {
-    let mut leases = BTreeMap::<PersonalWorkerCacheNamespace, Vec<PersonalWorkerCacheAccessMode>>::new();
+    let mut leases =
+        BTreeMap::<PersonalWorkerCacheNamespace, Vec<PersonalWorkerCacheAccessMode>>::new();
     for reservation in active {
         let modes = leases
             .entry(reservation.request.cache_namespace.clone())
@@ -844,11 +855,9 @@ fn compare_deadline(left: Option<EpochMillis>, right: Option<EpochMillis>) -> Or
 }
 
 fn effective_priority(request: &PersonalWorkerJobRequest, observed_at: EpochMillis) -> u8 {
-    request.priority.effective_rank(
-        observed_at
-            .get()
-            .saturating_sub(request.submitted_at.get()),
-    )
+    request
+        .priority
+        .effective_rank(observed_at.get().saturating_sub(request.submitted_at.get()))
 }
 
 fn lease_conflict(
@@ -856,7 +865,10 @@ fn lease_conflict(
     namespace: &PersonalWorkerCacheNamespace,
     requested: PersonalWorkerCacheAccessMode,
 ) -> Option<PersonalWorkerCacheLeaseState> {
-    lease_conflict_for_modes(held.get(namespace).map(Vec::as_slice).unwrap_or_default(), requested)
+    lease_conflict_for_modes(
+        held.get(namespace).map(Vec::as_slice).unwrap_or_default(),
+        requested,
+    )
 }
 
 fn lease_conflict_for_modes(
@@ -950,13 +962,15 @@ fn build_visibility(
         } else if selected {
             held_lease_state(request.cache_access)
         } else {
-            lease_conflict(&held, &request.cache_namespace, request.cache_access).unwrap_or_else(|| {
-                if request.cache_access == PersonalWorkerCacheAccessMode::Read {
-                    PersonalWorkerCacheLeaseState::SharedRead
-                } else {
-                    PersonalWorkerCacheLeaseState::Available
-                }
-            })
+            lease_conflict(&held, &request.cache_namespace, request.cache_access).unwrap_or_else(
+                || {
+                    if request.cache_access == PersonalWorkerCacheAccessMode::Read {
+                        PersonalWorkerCacheLeaseState::SharedRead
+                    } else {
+                        PersonalWorkerCacheLeaseState::Available
+                    }
+                },
+            )
         };
         visibility.push(visibility_for_request(
             request,
@@ -1025,9 +1039,7 @@ fn visibility_for_request(
         runner_profile_id: request.identity.runner_profile_id.clone(),
         priority: request.priority,
         effective_priority_rank: effective_priority(request, observed_at),
-        age_millis: observed_at
-            .get()
-            .saturating_sub(request.submitted_at.get()),
+        age_millis: observed_at.get().saturating_sub(request.submitted_at.get()),
         state,
         queue_position,
         requested_cpu_millis: request.requested_limits.cpu_millis,
