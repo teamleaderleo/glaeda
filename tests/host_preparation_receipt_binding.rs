@@ -1,5 +1,7 @@
 use smolrunner::debian_package_plan::{DEBIAN_PACKAGE_PLAN_SCHEMA_VERSION, PackagePlanDisposition};
-use smolrunner::execution_receipt::{ExecutionReceiptOperation, ReceiptTimestamp, encode_execution_receipt};
+use smolrunner::execution_receipt::{
+    ExecutionReceiptOperation, ReceiptTimestamp, encode_execution_receipt,
+};
 use smolrunner::host_preparation_execution::{
     HOST_PREPARATION_EXECUTION_SCHEMA_VERSION, HostPreparationExecutionDisposition,
     HostPreparationExecutionReport,
@@ -112,7 +114,12 @@ fn begin_binds_exact_source_phase_execution_and_start_before_terminal_mapping() 
     assert_eq!(source_digest, &expected_digest);
 
     let encoded = encode_execution_receipt(&receipt).expect("encode receipt");
-    for private in [PRIVATE_PATH, PRIVATE_EVIDENCE, PRIVATE_MESSAGE, "private action summary"] {
+    for private in [
+        PRIVATE_PATH,
+        PRIVATE_EVIDENCE,
+        PRIVATE_MESSAGE,
+        "private action summary",
+    ] {
         assert!(!encoded.contains(private), "receipt disclosed {private}");
     }
 }
@@ -140,10 +147,16 @@ fn terminal_source_mismatch_fails_without_disclosing_private_source_values() {
     )
     .expect("begin binding");
     let error = binding
-        .finish(&report(source(CHANGED_PRIVATE_PATH), PHASE_ID), terminal_at())
+        .finish(
+            &report(source(CHANGED_PRIVATE_PATH), PHASE_ID),
+            terminal_at(),
+        )
         .expect_err("changed source must fail");
 
-    assert_eq!(error.kind(), HostPreparationReceiptBindingErrorKind::SourceMismatch);
+    assert_eq!(
+        error.kind(),
+        HostPreparationReceiptBindingErrorKind::SourceMismatch
+    );
     assert!(!error.message().contains(PRIVATE_PATH));
     assert!(!error.message().contains(CHANGED_PRIVATE_PATH));
 }
@@ -158,9 +171,15 @@ fn terminal_phase_mismatch_and_backwards_time_fail_closed() {
     )
     .expect("begin phase binding");
     let error = binding
-        .finish(&report(source(PRIVATE_PATH), "different-phase"), terminal_at())
+        .finish(
+            &report(source(PRIVATE_PATH), "different-phase"),
+            terminal_at(),
+        )
         .expect_err("changed phase must fail");
-    assert_eq!(error.kind(), HostPreparationReceiptBindingErrorKind::PhaseMismatch);
+    assert_eq!(
+        error.kind(),
+        HostPreparationReceiptBindingErrorKind::PhaseMismatch
+    );
 
     let binding = HostPreparationReceiptBinding::begin(
         execution_id(),

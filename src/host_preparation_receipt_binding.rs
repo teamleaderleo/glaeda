@@ -161,8 +161,7 @@ pub fn digest_host_preparation_source(
         value.push(HEX[(byte >> 4) as usize] as char);
         value.push(HEX[(byte & 0x0f) as usize] as char);
     }
-    Sha256Digest::parse(&value)
-        .map_err(|_| HostPreparationReceiptBindingError::source_encoding())
+    Sha256Digest::parse(&value).map_err(|_| HostPreparationReceiptBindingError::source_encoding())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
