@@ -22,6 +22,8 @@ pub mod host_preparation_execution;
 #[cfg(target_os = "linux")]
 pub mod host_preparation_plan;
 #[cfg(target_os = "linux")]
+pub mod host_preparation_receipt;
+#[cfg(target_os = "linux")]
 pub mod host_readiness;
 #[cfg(target_os = "linux")]
 pub mod host_readiness_verdict;
