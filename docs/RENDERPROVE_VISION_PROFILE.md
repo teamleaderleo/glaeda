@@ -71,6 +71,19 @@ A caller cannot construct a wider policy through this module. Resource and timeo
 
 The caller supplies the content digest of the exact retained preview bytes through SmolRunner's existing artifact boundary. The source screenshot, canonical image bytes, brief contents, raw receipt, private paths, logs, environment, and credentials are not part of the public profile or preview evidence.
 
+## Admission and terminal result
+
+`RenderproveVisionTerminalEvidence` carries only typed terminal facts:
+
+- the existing `ExecutionAdmissionIdentity`;
+- exact tested-source, project-command, and Renderprove-tool identities;
+- typed process and cleanup outcomes;
+- zero or one already validated public preview.
+
+`finalize_renderprove_vision_result` refuses profile, admission, source, command, or tool drift. A successful result requires a successful process, completed cleanup, and a validated preview. Missing output becomes `malformed_preview`; process, timeout, output-limit, identity, and cleanup failures retain stable codes without raw diagnostics.
+
+The public result includes fixed evidence coverage. It identifies the public preview as included or unavailable and declares screenshot pixels, brief contents, receipt contents, process output, environment, and credentials omitted. A failed packet process cannot claim a validated preview.
+
 ## Private packet boundary
 
 Renderprove keeps canonical image bytes in an in-process private store and returns copies only through an integrity-checking accessor. Its dry-run CLI emits a public preview; it does not serialize a reusable private packet.
@@ -79,6 +92,6 @@ SmolRunner must not invent a packet file, environment payload, cross-process byt
 
 ## Current scope
 
-This module contains pure identities, slot validation, fixed argv projection, and preview identity validation. It adds no executor, process environment, persistence, provider transport, credential handling, CLI surface, or SmolRunner manifest field.
+The modules contain pure identities, slot validation, fixed argv projection, preview identity validation, admission binding, and terminal result projection. They add no executor, process environment, persistence, provider transport, credential handling, CLI surface, or SmolRunner manifest field.
 
-The later implementation under issue #173 still needs a typed terminal result projection and integration with admission/execution receipts before the issue can close.
+A later issue may add an executor only after it specifies absolute executable resolution, empty environment construction, read-only workspace enforcement, bounded capture, cleanup, and durable receipt storage. Provider execution remains a separate gated contract.
