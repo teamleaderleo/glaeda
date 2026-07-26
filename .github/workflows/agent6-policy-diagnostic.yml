@@ -36,7 +36,7 @@ jobs:
           changed="$(git diff --name-only)"
           while IFS= read -r path; do
             case "$path" in
-              src/personal_worker_queue.rs|tests/personal_worker_queue_contract.rs) ;;
+              src/personal_worker_queue.rs|tests/personal_worker_queue_contract.rs|src/lib.rs) ;;
               '') ;;
               *) printf 'unexpected policy path: %s\n' "$path" >&2; exit 1 ;;
             esac
@@ -46,7 +46,7 @@ jobs:
           if [ -n "$changed" ]; then
             git config user.name 'smolrunner-agent-6'
             git config user.email 'smolrunner-agent-6@users.noreply.github.com'
-            git add src/personal_worker_queue.rs tests/personal_worker_queue_contract.rs
+            git add src/personal_worker_queue.rs tests/personal_worker_queue_contract.rs src/lib.rs
             git commit -m 'Refine personal worker queue policy semantics'
             git push origin HEAD:${{ github.head_ref }}
           fi
