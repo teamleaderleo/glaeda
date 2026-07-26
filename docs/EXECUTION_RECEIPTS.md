@@ -17,6 +17,8 @@ The first supported operation family is `host_preparation`. This module defines 
 
 Those steps follow after the document contract is accepted.
 
+The intended delivery order is: map one live host-preparation report through stable public failure codes, publish the receipt atomically beside its durable journal, add exact execution-ID read-back, then expose the same typed document through JSON CLI output. Stensibly and Proofwake integrations begin only after those local boundaries are reviewed.
+
 ## Exact identity
 
 Every receipt binds:
