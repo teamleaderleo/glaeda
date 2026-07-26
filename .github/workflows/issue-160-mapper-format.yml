@@ -21,12 +21,26 @@ jobs:
       - name: Format mapper
         run: cargo fmt --all
 
-      - name: Verify formatted mapper
-        run: |
-          cargo check --locked --all-targets --all-features
-          cargo test --locked --all-targets --all-features
+      - name: Capture compiler diagnostic
+        id: check
+        continue-on-error: true
+        run: cargo check --locked --all-targets --all-features > mapper-check.txt 2>&1
+
+      - name: Upload compiler diagnostic
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: issue-160-mapper-check
+          path: mapper-check.txt
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Run tests
+        if: steps.check.outcome == 'success'
+        run: cargo test --locked --all-targets --all-features
 
       - name: Commit only mapper formatting
+        if: steps.check.outcome == 'success'
         run: |
           changed="$(git diff --name-only)"
           if [ -z "${changed}" ]; then
@@ -49,3 +63,7 @@ jobs:
           git add src/host_preparation_receipt.rs tests/host_preparation_receipt_mapper.rs
           git commit -m 'Format host preparation receipt mapper'
           git push origin HEAD:${{ github.head_ref }}
+
+      - name: Preserve compiler result
+        if: steps.check.outcome != 'success'
+        run: exit 1
