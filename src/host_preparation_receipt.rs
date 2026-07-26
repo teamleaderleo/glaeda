@@ -154,12 +154,9 @@ pub fn map_host_preparation_execution_receipt(
         .iter()
         .map(|action| action.id.as_str())
         .collect::<Vec<_>>();
-    let continuation = ExecutionReceiptContinuation::new(
-        fresh_observation_required,
-        barriers,
-        deferred_actions,
-    )
-    .map_err(map_receipt_error)?;
+    let continuation =
+        ExecutionReceiptContinuation::new(fresh_observation_required, barriers, deferred_actions)
+            .map_err(map_receipt_error)?;
 
     ExecutionReceipt::new_host_preparation(
         context.execution_id,

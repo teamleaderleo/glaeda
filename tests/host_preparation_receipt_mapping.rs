@@ -1,8 +1,6 @@
 use serde_json::Value;
 use smolrunner::artifact::Sha256Digest;
-use smolrunner::debian_package_plan::{
-    DEBIAN_PACKAGE_PLAN_SCHEMA_VERSION, PackagePlanDisposition,
-};
+use smolrunner::debian_package_plan::{DEBIAN_PACKAGE_PLAN_SCHEMA_VERSION, PackagePlanDisposition};
 use smolrunner::execution_receipt::{
     ExecutionReceiptActionOutcome, ExecutionReceiptDisposition, ReceiptTimestamp,
     encode_execution_receipt,
@@ -92,8 +90,7 @@ fn context() -> HostPreparationReceiptContext {
         execution_id: JournalId::parse("host-prepare-0123456789abcdef").expect("journal ID"),
         source_digest: Sha256Digest::parse(&format!("sha256:{}", "ab".repeat(32)))
             .expect("source digest"),
-        started_at: ReceiptTimestamp::parse("2026-07-26T18:00:00.000Z")
-            .expect("start timestamp"),
+        started_at: ReceiptTimestamp::parse("2026-07-26T18:00:00.000Z").expect("start timestamp"),
         terminal_at: ReceiptTimestamp::parse("2026-07-26T18:00:03.000Z")
             .expect("terminal timestamp"),
     }
@@ -113,7 +110,10 @@ fn completed_report_maps_to_one_content_minimised_receipt() {
     let encoded = encode_execution_receipt(&receipt).expect("encoded receipt");
     let value = serde_json::from_str::<Value>(&encoded).expect("receipt JSON");
 
-    assert_eq!(receipt.disposition(), ExecutionReceiptDisposition::Completed);
+    assert_eq!(
+        receipt.disposition(),
+        ExecutionReceiptDisposition::Completed
+    );
     assert_eq!(receipt.summary().completed(), 1);
     assert_eq!(value["operation"]["family"], "host_preparation");
     assert_eq!(value["operation"]["repository"], "example/project");
@@ -121,7 +121,10 @@ fn completed_report_maps_to_one_content_minimised_receipt() {
         value["operation"]["source_digest"],
         format!("sha256:{}", "ab".repeat(32))
     );
-    assert_eq!(value["operation"]["phase_id"], "host-preparation-root-phase");
+    assert_eq!(
+        value["operation"]["phase_id"],
+        "host-preparation-root-phase"
+    );
     for private in [
         PRIVATE_EXECUTABLE_PATH,
         PRIVATE_PRECONDITION,
@@ -137,10 +140,22 @@ fn failure_mapping_uses_generic_codes_and_terminal_public_outcomes() {
     let report = report(
         HostPreparationExecutionDisposition::ActionFailed,
         vec![
-            record("rolled-back", ActionOutcome::RolledBack, RollbackClass::Reversible),
-            record("compensated", ActionOutcome::Compensated, RollbackClass::Compensating),
+            record(
+                "rolled-back",
+                ActionOutcome::RolledBack,
+                RollbackClass::Reversible,
+            ),
+            record(
+                "compensated",
+                ActionOutcome::Compensated,
+                RollbackClass::Compensating,
+            ),
             record("failed", ActionOutcome::Failed, RollbackClass::Irreversible),
-            record("not-run", ActionOutcome::Pending, RollbackClass::Irreversible),
+            record(
+                "not-run",
+                ActionOutcome::Pending,
+                RollbackClass::Irreversible,
+            ),
             record(
                 "rollback-failed",
                 ActionOutcome::RollbackFailed,
@@ -150,12 +165,30 @@ fn failure_mapping_uses_generic_codes_and_terminal_public_outcomes() {
     );
     let receipt = map_host_preparation_execution_receipt(&report, context()).expect("receipt");
 
-    assert_eq!(receipt.disposition(), ExecutionReceiptDisposition::ActionFailed);
-    assert_eq!(receipt.actions()[0].outcome(), ExecutionReceiptActionOutcome::RolledBack);
-    assert_eq!(receipt.actions()[1].outcome(), ExecutionReceiptActionOutcome::Compensated);
-    assert_eq!(receipt.actions()[2].failure_code(), Some("action-execution-failed"));
-    assert_eq!(receipt.actions()[3].outcome(), ExecutionReceiptActionOutcome::NotRun);
-    assert_eq!(receipt.actions()[4].failure_code(), Some("action-rollback-failed"));
+    assert_eq!(
+        receipt.disposition(),
+        ExecutionReceiptDisposition::ActionFailed
+    );
+    assert_eq!(
+        receipt.actions()[0].outcome(),
+        ExecutionReceiptActionOutcome::RolledBack
+    );
+    assert_eq!(
+        receipt.actions()[1].outcome(),
+        ExecutionReceiptActionOutcome::Compensated
+    );
+    assert_eq!(
+        receipt.actions()[2].failure_code(),
+        Some("action-execution-failed")
+    );
+    assert_eq!(
+        receipt.actions()[3].outcome(),
+        ExecutionReceiptActionOutcome::NotRun
+    );
+    assert_eq!(
+        receipt.actions()[4].failure_code(),
+        Some("action-rollback-failed")
+    );
     assert_eq!(receipt.summary().failed(), 1);
     assert_eq!(receipt.summary().rollback_failed(), 1);
     assert_eq!(receipt.summary().not_run(), 1);
@@ -232,7 +265,11 @@ fn non_terminal_journal_records_fail_closed() {
 fn unsupported_schema_and_invalid_repository_errors_are_bounded() {
     let mut unsupported_execution = report(
         HostPreparationExecutionDisposition::Completed,
-        vec![record("one", ActionOutcome::Completed, RollbackClass::Irreversible)],
+        vec![record(
+            "one",
+            ActionOutcome::Completed,
+            RollbackClass::Irreversible,
+        )],
     );
     unsupported_execution.schema_version = 99;
     assert_eq!(
@@ -244,7 +281,11 @@ fn unsupported_schema_and_invalid_repository_errors_are_bounded() {
 
     let mut unsupported_journal = report(
         HostPreparationExecutionDisposition::Completed,
-        vec![record("one", ActionOutcome::Completed, RollbackClass::Irreversible)],
+        vec![record(
+            "one",
+            ActionOutcome::Completed,
+            RollbackClass::Irreversible,
+        )],
     );
     unsupported_journal.journal.schema_version = 99;
     assert_eq!(
@@ -256,7 +297,11 @@ fn unsupported_schema_and_invalid_repository_errors_are_bounded() {
 
     let mut private_repository = report(
         HostPreparationExecutionDisposition::Completed,
-        vec![record("one", ActionOutcome::Completed, RollbackClass::Irreversible)],
+        vec![record(
+            "one",
+            ActionOutcome::Completed,
+            RollbackClass::Irreversible,
+        )],
     );
     private_repository.source = source("/private/repository/path");
     let error = map_host_preparation_execution_receipt(&private_repository, context())
@@ -272,7 +317,11 @@ fn unsupported_schema_and_invalid_repository_errors_are_bounded() {
 fn inconsistent_report_semantics_become_one_generic_receipt_error() {
     let completed_with_failure = report(
         HostPreparationExecutionDisposition::Completed,
-        vec![record("failed", ActionOutcome::Failed, RollbackClass::Irreversible)],
+        vec![record(
+            "failed",
+            ActionOutcome::Failed,
+            RollbackClass::Irreversible,
+        )],
     );
     let error = map_host_preparation_execution_receipt(&completed_with_failure, context())
         .expect_err("inconsistent completed report");
