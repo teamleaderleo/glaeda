@@ -1,0 +1,290 @@
+name: Agent 6 queue policy review
+
+on:
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  correct:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.head_ref }}
+          show-progress: false
+
+      - name: Apply reviewed policy corrections
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          source = Path('src/personal_worker_queue.rs')
+          text = source.read_text()
+          start = text.index('    let mut candidates = input\n')
+          end = text.index('\n    let desired_profile = desired_profile(input);', start)
+          replacement = '''    let mut remaining = input
+                  .queued
+                  .iter()
+                  .filter(|request| !request.cancellation.is_cancelled())
+                  .collect::<Vec<_>>();
+
+              let mut selected = Vec::new();
+              let mut used_cpu = active_limits.cpu_millis;
+              let mut used_memory = active_limits.memory_bytes;
+              let active_heavy = input
+                  .active
+                  .iter()
+                  .any(|reservation| reservation.request.job_class() == PersonalWorkerJobClass::Heavy);
+              let mut selected_heavy = false;
+
+              while selected.len() + input.active.len() < MAX_PERSONAL_WORKER_ACTIVE_RESERVATIONS {
+                  remaining.sort_by(|left, right| {
+                      compare_candidates(left, right, input.observed_at, &repository_load)
+                  });
+                  let chosen = remaining.iter().position(|request| {
+                      let job_class = request.job_class();
+                      if active_heavy
+                          || selected_heavy
+                          || (job_class == PersonalWorkerJobClass::Heavy && !input.active.is_empty())
+                          || (job_class == PersonalWorkerJobClass::Heavy && !selected.is_empty())
+                      {
+                          return false;
+                      }
+                      let next_cpu = used_cpu.saturating_add(request.requested_limits.cpu_millis);
+                      let next_memory =
+                          used_memory.saturating_add(request.requested_limits.memory_bytes);
+                      next_cpu <= PERSONAL_WORKER_SCHEDULABLE_CPU_MILLIS
+                          && next_memory <= PERSONAL_WORKER_SCHEDULABLE_MEMORY_BYTES
+                          && lease_conflict(
+                              &held_leases,
+                              &request.cache_namespace,
+                              request.cache_access,
+                          )
+                          .is_none()
+                  });
+                  let Some(chosen) = chosen else {
+                      break;
+                  };
+                  let request = remaining.remove(chosen);
+                  let job_class = request.job_class();
+                  held_leases
+                      .entry(request.cache_namespace.clone())
+                      .or_default()
+                      .push(request.cache_access);
+                  *repository_load
+                      .entry(request.source.repository.clone())
+                      .or_default() += 1;
+                  used_cpu = used_cpu.saturating_add(request.requested_limits.cpu_millis);
+                  used_memory = used_memory.saturating_add(request.requested_limits.memory_bytes);
+                  selected_heavy = job_class == PersonalWorkerJobClass::Heavy;
+                  selected.push(PersonalWorkerSelection {
+                      request_id: request.identity.request_id.clone(),
+                      repository: request.source.repository.clone(),
+                      verification_profile_id: request.identity.verification_profile_id.clone(),
+                      runner_profile_id: request.identity.runner_profile_id.clone(),
+                      priority: request.priority,
+                      effective_priority_rank: effective_priority(request, input.observed_at),
+                      job_class,
+                      reserved_limits: request.requested_limits,
+                      cache_namespace: request.cache_namespace.clone(),
+                      cache_access: request.cache_access,
+                  });
+              }
+
+              let has_queued_work = input
+                  .queued
+                  .iter()
+                  .any(|request| !request.cancellation.is_cancelled());
+              let has_work = has_queued_work || !input.active.is_empty();
+              let desired_profile = desired_profile(input, has_work);'''
+          text = text[:start] + replacement + text[end + len('\n    let desired_profile = desired_profile(input);'):]
+
+          pending = '''        if !input.active.is_empty() && pending.target != PersonalWorkerProfile::Work {
+                      return Err(PersonalWorkerQueueError::new(
+                          "pending_profile_change.target",
+                          "downscale_while_active",
+                          "profile downscale must wait for every active reservation to drain",
+                      ));
+                  }
+          '''
+          if text.count(pending) != 1:
+              raise SystemExit('pending-downscale anchor drift')
+          text = text.replace(pending, '', 1)
+          text = text.replace(
+              'fn desired_profile(input: &PersonalWorkerQueueInput) -> PersonalWorkerProfile {\n    if !input.queued.is_empty() || !input.active.is_empty() {',
+              'fn desired_profile(\n    input: &PersonalWorkerQueueInput,\n    has_work: bool,\n) -> PersonalWorkerProfile {\n    if has_work {',
+              1,
+          )
+          text = text.replace(
+              '    let visibility = build_visibility(input, &selected);',
+              '    let visibility = build_visibility(input, &selected, desired_profile);',
+              1,
+          )
+          text = text.replace(
+              'fn build_visibility(\n    input: &PersonalWorkerQueueInput,\n    selected: &[PersonalWorkerSelection],\n) -> Vec<PersonalWorkerQueueVisibility> {',
+              'fn build_visibility(\n    input: &PersonalWorkerQueueInput,\n    selected: &[PersonalWorkerSelection],\n    desired_profile: PersonalWorkerProfile,\n) -> Vec<PersonalWorkerQueueVisibility> {',
+              1,
+          )
+          old_sort = '''    let mut queued = input.queued.iter().collect::<Vec<_>>();
+              queued.sort_by(|left, right| {
+                  compare_candidates(
+                      left,
+                      right,
+                      input.observed_at,
+                      &active_repository_load(&input.active),
+                  )
+              });'''
+          new_sort = '''    let mut queue_repository_load = active_repository_load(&input.active);
+              for selection in selected {
+                  *queue_repository_load
+                      .entry(selection.repository.clone())
+                      .or_default() += 1;
+              }
+              let mut queued = input.queued.iter().collect::<Vec<_>>();
+              queued.sort_by(|left, right| {
+                  compare_candidates(left, right, input.observed_at, &queue_repository_load)
+              });'''
+          if text.count(old_sort) != 1:
+              raise SystemExit('queue visibility sort anchor drift')
+          text = text.replace(old_sort, new_sort, 1)
+          text = text.replace(
+              '            PersonalWorkerProfile::Work,\n        ));\n    }\n    for active in &input.active {',
+              '            desired_profile,\n        ));\n    }\n    for active in &input.active {',
+              1,
+          )
+          source.write_text(text)
+
+          tests = Path('tests/personal_worker_queue_contract.rs')
+          test_text = tests.read_text()
+          addition = r'''
+
+          #[test]
+          fn fairness_is_recomputed_after_each_selected_repository() {
+              let observed_at = 13_000_000;
+              let same_oldest = request(
+                  "same-oldest",
+                  "example/same",
+                  'a',
+                  PersonalWorkerPriority::Normal,
+                  observed_at - 3_000,
+                  limits(2_000, 2),
+                  PersonalWorkerCacheAccessMode::Read,
+              );
+              let same_second = request(
+                  "same-second",
+                  "example/same",
+                  'b',
+                  PersonalWorkerPriority::Normal,
+                  observed_at - 2_000,
+                  limits(2_000, 2),
+                  PersonalWorkerCacheAccessMode::Read,
+              );
+              let other = request(
+                  "other",
+                  "example/other",
+                  'c',
+                  PersonalWorkerPriority::Normal,
+                  observed_at - 1_000,
+                  limits(2_000, 2),
+                  PersonalWorkerCacheAccessMode::Read,
+              );
+              let decision = evaluate_personal_worker_queue(
+                  &input(
+                      1,
+                      observed_at,
+                      vec![same_oldest, same_second, other],
+                      vec![],
+                  ),
+                  None,
+              )
+              .expect("fair decision");
+              let selected = decision
+                  .selected
+                  .iter()
+                  .map(|entry| entry.request_id.as_str())
+                  .collect::<Vec<_>>();
+              assert_eq!(selected, ["same-oldest", "other"]);
+          }
+
+          #[test]
+          fn pending_downscale_waits_for_active_drain_and_is_cancelled_by_work() {
+              let observed_at = 14_000_000;
+              let running = active(
+                  "running",
+                  "example/running",
+                  'a',
+                  observed_at,
+                  limits(2_000, 2),
+                  PersonalWorkerCacheAccessMode::Read,
+              );
+              let mut queue = input(1, observed_at, vec![], vec![running]);
+              queue.pending_profile_change = Some(PersonalWorkerPendingProfileChange {
+                  target: PersonalWorkerProfile::Stopped,
+                  requested_at: time(observed_at - 1_000),
+              });
+              let decision = evaluate_personal_worker_queue(&queue, None).expect("drain decision");
+              assert_eq!(decision.desired_profile, PersonalWorkerProfile::Work);
+              assert!(decision.cancel_pending_downscale);
+              assert!(!decision.profile_change_permitted);
+          }
+
+          #[test]
+          fn cancelled_only_queue_does_not_hold_the_work_profile() {
+              let observed_at = 15_000_000;
+              let mut cancelled = request(
+                  "cancelled-idle",
+                  "example/idle",
+                  'a',
+                  PersonalWorkerPriority::Normal,
+                  observed_at - 60_000,
+                  limits(2_000, 2),
+                  PersonalWorkerCacheAccessMode::Read,
+              );
+              cancelled.cancellation = PersonalWorkerCancellationState::Cancelled {
+                  cancelled_at: time(observed_at - 1_000),
+              };
+              let mut queue = input(1, observed_at, vec![cancelled], vec![]);
+              queue.last_activity_at = time(observed_at - 31 * 60 * 1_000);
+              let decision = evaluate_personal_worker_queue(&queue, None).expect("idle decision");
+              assert!(decision.selected.is_empty());
+              assert_eq!(decision.desired_profile, PersonalWorkerProfile::Stopped);
+              assert_eq!(decision.visibility[0].worker_profile, PersonalWorkerProfile::Stopped);
+          }
+          '''
+          if 'fairness_is_recomputed_after_each_selected_repository' in test_text:
+              raise SystemExit('review tests already present')
+          tests.write_text(test_text + addition)
+          PY
+
+      - name: Verify reviewed policy
+        run: |
+          cargo fmt --all
+          cargo fmt --all -- --check
+          cargo check --locked --all-targets --all-features
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cargo test --locked --all-targets --all-features
+
+      - name: Commit source-only review
+        run: |
+          rm .github/workflows/agent6-semantic-review.yml
+          changed="$(git status --short)"
+          while IFS= read -r line; do
+            path="${line#???}"
+            case "$path" in
+              src/personal_worker_queue.rs|tests/personal_worker_queue_contract.rs|.github/workflows/agent6-semantic-review.yml) ;;
+              '') ;;
+              *) printf 'unexpected changed path: %s\n' "$path" >&2; exit 1 ;;
+            esac
+          done <<EOF
+          $changed
+          EOF
+          git config user.name 'smolrunner-agent-6'
+          git config user.email 'smolrunner-agent-6@users.noreply.github.com'
+          git add src/personal_worker_queue.rs tests/personal_worker_queue_contract.rs .github/workflows/agent6-semantic-review.yml
+          git commit -m 'Refine personal worker queue policy semantics'
+          git push origin HEAD:${{ github.head_ref }}
