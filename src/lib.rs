@@ -85,6 +85,8 @@ pub mod runner_account_observation;
 pub mod runner_account_plan;
 #[cfg(target_os = "linux")]
 pub mod runner_user;
+#[cfg(target_os = "linux")]
+pub mod runner_user_observation;
 pub mod state;
 pub mod state_document;
 pub mod state_store;

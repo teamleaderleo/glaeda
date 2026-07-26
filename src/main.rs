@@ -21,13 +21,15 @@ use smolrunner::host_preparation_execution::{
     execute_confirmed_host_preparation, render_human as render_host_prepare_execution,
 };
 #[cfg(target_os = "linux")]
-use smolrunner::host_preparation_plan::plan_host_preparation;
+use smolrunner::host_preparation_plan::{ExecutableHostPreparationAction, plan_host_preparation};
 #[cfg(target_os = "linux")]
-use smolrunner::host_readiness::inspect_host_readiness;
+use smolrunner::host_readiness::{RunnerAccountReadiness, inspect_host_readiness};
 #[cfg(target_os = "linux")]
 use smolrunner::host_readiness_verdict::{assess, render_human as render_host_plan};
 #[cfg(target_os = "linux")]
 use smolrunner::journal::ExecutionLane;
+#[cfg(target_os = "linux")]
+use smolrunner::lane_command::LaneCommandKind;
 #[cfg(target_os = "linux")]
 use smolrunner::linux_installation_catalog::{InstallationLookup, find_default_installation};
 #[cfg(target_os = "linux")]
@@ -38,6 +40,8 @@ use smolrunner::ownership::ProjectIdentity;
 use smolrunner::plan::{build, render_human as render_plan};
 #[cfg(target_os = "linux")]
 use smolrunner::process::ProcessExecutor;
+#[cfg(target_os = "linux")]
+use smolrunner::runner_user_observation::observe_verified_runner_user;
 #[cfg(target_os = "linux")]
 use smolrunner::state::JournalId;
 
@@ -93,7 +97,7 @@ enum HostCommand {
         #[arg(long)]
         account_file: Option<PathBuf>,
     },
-    /// Execute one exactly confirmed root-lane host-preparation phase.
+    /// Execute one exactly confirmed reviewed host-preparation phase.
     Prepare {
         /// Manifest to inspect and prepare against the current host.
         #[arg(long, default_value = "smolrunner.yml")]
@@ -272,22 +276,47 @@ fn run_host_prepare(
     let confirmed_phase = decision
         .confirmed_phase()
         .expect("confirmed host-preparation decisions contain one executable phase");
-    if confirmed_phase
-        .actions
-        .iter()
-        .any(|action| action.lane != ExecutionLane::Root)
-    {
-        return emit_runtime_error(
-            output,
-            "runner_user_phase_unsupported",
-            "this host-preparation slice executes root-lane phases only; re-observe after root preparation and use the reviewed runner-user evidence adapter once available"
-                .to_owned(),
-        );
-    }
+    let phase_kind = match classify_host_prepare_actions(&confirmed_phase.actions) {
+        Ok(kind) => kind,
+        Err(message) => {
+            return emit_runtime_error(
+                output,
+                "unsupported_host_preparation_phase",
+                message.to_owned(),
+            );
+        }
+    };
 
     if emit_pre_mutation_decision(output, &decision).is_err() {
         return ExitCode::from(2);
     }
+
+    let verified_runner_user = match phase_kind {
+        HostPreparePhaseKind::Root => None,
+        HostPreparePhaseKind::RunnerUserMigration => {
+            let desired = match &decision.proposal().source.report().runner_account {
+                RunnerAccountReadiness::Planned { plan, .. } => &plan.desired,
+                RunnerAccountReadiness::NeedsConfiguration { .. } => {
+                    return emit_runtime_error(
+                        output,
+                        "runner_user_evidence",
+                        "runner-user migration requires an exact configured runner account"
+                            .to_owned(),
+                    );
+                }
+            };
+            match observe_verified_runner_user(desired, &ProcessExecutor) {
+                Ok(verified) => Some(verified),
+                Err(error) => {
+                    return emit_runtime_error(
+                        output,
+                        "runner_user_evidence",
+                        error.message().to_owned(),
+                    );
+                }
+            }
+        }
+    };
 
     let project = ProjectIdentity::from(&manifest);
     let installation_id = match find_default_installation(&project) {
@@ -329,7 +358,10 @@ fn run_host_prepare(
         }
     };
     let mut checkpoint = StateStoreJournalCheckpoint::new(&mut store, installation_id, journal_id);
-    let mut runner = SystemLaneCommandRunner::root_only();
+    let mut runner = match verified_runner_user.as_ref() {
+        Some(verified) => SystemLaneCommandRunner::with_runner_user(verified),
+        None => SystemLaneCommandRunner::root_only(),
+    };
     let report = match execute_confirmed_host_preparation(decision, &mut runner, &mut checkpoint) {
         Ok(report) => report,
         Err(error) => return emit_host_prepare_execution_error(output, &error),
@@ -349,6 +381,35 @@ fn run_host_prepare(
         HostPreparationExecutionDisposition::Completed
         | HostPreparationExecutionDisposition::FreshObservationRequired => ExitCode::SUCCESS,
     }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostPreparePhaseKind {
+    Root,
+    RunnerUserMigration,
+}
+
+#[cfg(target_os = "linux")]
+fn classify_host_prepare_actions(
+    actions: &[ExecutableHostPreparationAction],
+) -> Result<HostPreparePhaseKind, &'static str> {
+    if !actions.is_empty()
+        && actions
+            .iter()
+            .all(|action| action.lane == ExecutionLane::Root)
+    {
+        return Ok(HostPreparePhaseKind::Root);
+    }
+    if actions.len() == 1
+        && actions[0].lane == ExecutionLane::RunnerUser
+        && actions[0].command_kind == LaneCommandKind::RunnerPodmanMigrate
+    {
+        return Ok(HostPreparePhaseKind::RunnerUserMigration);
+    }
+    Err(
+        "host preparation executes only an all-root phase or exactly one reviewed runner-user Podman migration action",
+    )
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -524,7 +585,11 @@ mod tests {
 
     use clap::Parser;
 
-    use super::{Cli, Command, HostCommand};
+    use smolrunner::host_preparation_plan::ExecutableHostPreparationAction;
+    use smolrunner::journal::{ExecutionLane, RollbackClass};
+    use smolrunner::lane_command::LaneCommandKind;
+
+    use super::{Cli, Command, HostCommand, HostPreparePhaseKind, classify_host_prepare_actions};
 
     #[test]
     fn host_prepare_accepts_explicit_confirmation_and_account_policy() {
@@ -555,5 +620,55 @@ mod tests {
         assert_eq!(file, PathBuf::from("project.yml"));
         assert_eq!(account_file, Some(PathBuf::from("runner.account.yml")));
         assert_eq!(confirm.as_deref(), Some("host-preparation-v1.00"));
+    }
+
+    fn phase_action(
+        lane: ExecutionLane,
+        command_kind: LaneCommandKind,
+    ) -> ExecutableHostPreparationAction {
+        ExecutableHostPreparationAction {
+            id: "test-action".to_owned(),
+            lane,
+            command_kind,
+            rollback: RollbackClass::Irreversible,
+            summary: "test action".to_owned(),
+            depends_on: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn host_prepare_phase_classification_is_narrow() {
+        assert_eq!(
+            classify_host_prepare_actions(&[phase_action(
+                ExecutionLane::Root,
+                LaneCommandKind::AptInstall,
+            )]),
+            Ok(HostPreparePhaseKind::Root)
+        );
+        assert_eq!(
+            classify_host_prepare_actions(&[phase_action(
+                ExecutionLane::RunnerUser,
+                LaneCommandKind::RunnerPodmanMigrate,
+            )]),
+            Ok(HostPreparePhaseKind::RunnerUserMigration)
+        );
+        assert!(
+            classify_host_prepare_actions(&[phase_action(
+                ExecutionLane::RunnerUser,
+                LaneCommandKind::RunnerGitVersion,
+            )])
+            .is_err()
+        );
+        assert!(
+            classify_host_prepare_actions(&[
+                phase_action(ExecutionLane::Root, LaneCommandKind::AptInstall),
+                phase_action(
+                    ExecutionLane::RunnerUser,
+                    LaneCommandKind::RunnerPodmanMigrate,
+                ),
+            ])
+            .is_err()
+        );
+        assert!(classify_host_prepare_actions(&[]).is_err());
     }
 }
