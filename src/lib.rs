@@ -12,6 +12,7 @@ pub mod durable_lane_execution;
 #[cfg_attr(test, allow(clippy::too_many_arguments))]
 pub mod execution_admission;
 pub mod execution_receipt;
+pub mod personal_worker_queue;
 pub mod host;
 #[cfg(target_os = "linux")]
 pub mod host_package_plan;
