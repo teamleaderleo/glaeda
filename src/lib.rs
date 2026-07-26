@@ -13,6 +13,7 @@ pub mod durable_lane_execution;
 pub mod execution_admission;
 pub mod execution_receipt;
 pub mod execution_receipt_store;
+pub mod personal_worker_queue;
 pub mod host;
 #[cfg(target_os = "linux")]
 pub mod host_package_plan;
