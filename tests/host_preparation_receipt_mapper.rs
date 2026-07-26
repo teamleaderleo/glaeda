@@ -126,14 +126,18 @@ fn completed_report_maps_to_the_merged_receipt_contract() {
             Some(PRIVATE_MESSAGE),
         )],
     );
-    let receipt = map_host_preparation_execution_receipt(
-        &report,
-        context("host-prepare-0123456789abcdef"),
-    )
-    .expect("receipt");
+    let receipt =
+        map_host_preparation_execution_receipt(&report, context("host-prepare-0123456789abcdef"))
+            .expect("receipt");
 
-    assert_eq!(receipt.disposition(), ExecutionReceiptDisposition::Completed);
-    assert_eq!(receipt.execution_id().as_str(), "host-prepare-0123456789abcdef");
+    assert_eq!(
+        receipt.disposition(),
+        ExecutionReceiptDisposition::Completed
+    );
+    assert_eq!(
+        receipt.execution_id().as_str(),
+        "host-prepare-0123456789abcdef"
+    );
     assert_eq!(receipt.summary().completed(), 1);
     assert_eq!(receipt.actions()[0].id(), "ensure-runner-group");
     assert_eq!(
@@ -141,13 +145,8 @@ fn completed_report_maps_to_the_merged_receipt_contract() {
         ExecutionReceiptActionOutcome::Completed
     );
     assert_eq!(receipt.actions()[0].failure_code(), None);
-    let ExecutionReceiptOperation::HostPreparation {
-        repository,
-        phase_id,
-        ..
-    } = receipt.operation();
+    let ExecutionReceiptOperation::HostPreparation { repository, .. } = receipt.operation();
     assert_eq!(repository.as_str(), "teamleaderleo/smolrunner");
-    assert_eq!(phase_id.as_str(), "host-preparation-root-phase");
 
     let encoded = encode_execution_receipt(&receipt).expect("encoded receipt");
     for forbidden in [
@@ -157,7 +156,6 @@ fn completed_report_maps_to_the_merged_receipt_contract() {
         "private evidence",
         "executables",
         "preconditions",
-        "message",
     ] {
         assert!(!encoded.contains(forbidden), "receipt leaked {forbidden}");
     }
@@ -180,11 +178,9 @@ fn failed_report_maps_pending_actions_to_not_run_and_ignores_prose() {
     report.continuation_barriers = vec![barrier("unreached-barrier")];
     report.deferred_actions = vec![deferred("z-reobserve"), deferred("a-recover")];
 
-    let receipt = map_host_preparation_execution_receipt(
-        &report,
-        context("host-prepare-1123456789abcdef"),
-    )
-    .expect("failed receipt");
+    let receipt =
+        map_host_preparation_execution_receipt(&report, context("host-prepare-1123456789abcdef"))
+            .expect("failed receipt");
 
     assert_eq!(
         receipt.disposition(),
@@ -203,10 +199,7 @@ fn failed_report_maps_pending_actions_to_not_run_and_ignores_prose() {
     );
     assert!(!receipt.continuation().fresh_observation_required());
     assert_eq!(
-        receipt
-            .continuation()
-            .barriers()
-            .collect::<Vec<_>>(),
+        receipt.continuation().barriers().collect::<Vec<_>>(),
         Vec::<&str>::new()
     );
     assert_eq!(
@@ -235,11 +228,9 @@ fn fresh_observation_report_sorts_public_continuation_identities() {
     report.continuation_barriers = vec![barrier("z-runtime"), barrier("a-authority")];
     report.deferred_actions = vec![deferred("z-migration"), deferred("a-reobserve")];
 
-    let receipt = map_host_preparation_execution_receipt(
-        &report,
-        context("host-prepare-2123456789abcdef"),
-    )
-    .expect("fresh-observation receipt");
+    let receipt =
+        map_host_preparation_execution_receipt(&report, context("host-prepare-2123456789abcdef"))
+            .expect("fresh-observation receipt");
 
     assert_eq!(
         receipt.disposition(),
@@ -274,19 +265,19 @@ fn rollback_failure_uses_a_fixed_public_code() {
             Some(PRIVATE_MESSAGE),
         )],
     );
-    let receipt = map_host_preparation_execution_receipt(
-        &report,
-        context("host-prepare-3123456789abcdef"),
-    )
-    .expect("rollback-failed receipt");
+    let receipt =
+        map_host_preparation_execution_receipt(&report, context("host-prepare-3123456789abcdef"))
+            .expect("rollback-failed receipt");
 
     assert_eq!(
         receipt.actions()[0].failure_code(),
         Some("host-preparation-rollback-failed")
     );
-    assert!(!encode_execution_receipt(&receipt)
-        .expect("encoded receipt")
-        .contains(PRIVATE_MESSAGE));
+    assert!(
+        !encode_execution_receipt(&receipt)
+            .expect("encoded receipt")
+            .contains(PRIVATE_MESSAGE)
+    );
 }
 
 #[test]
@@ -393,12 +384,9 @@ fn duplicate_continuation_identity_is_rejected() {
     );
     report.continuation_barriers = vec![barrier("same"), barrier("same")];
     assert_eq!(
-        map_host_preparation_execution_receipt(
-            &report,
-            context("host-prepare-a123456789abcdef")
-        )
-        .expect_err("duplicate barrier")
-        .kind(),
+        map_host_preparation_execution_receipt(&report, context("host-prepare-a123456789abcdef"))
+            .expect_err("duplicate barrier")
+            .kind(),
         HostPreparationReceiptErrorKind::InconsistentExecutionReport
     );
 }

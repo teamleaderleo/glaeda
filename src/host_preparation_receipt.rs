@@ -220,21 +220,16 @@ fn map_action(
 
 fn map_terminal_state(
     report: &HostPreparationExecutionReport,
-) -> Result<
-    (ExecutionReceiptDisposition, ExecutionReceiptContinuation),
-    HostPreparationReceiptError,
-> {
+) -> Result<(ExecutionReceiptDisposition, ExecutionReceiptContinuation), HostPreparationReceiptError>
+{
     match report.disposition {
         HostPreparationExecutionDisposition::Completed => {
             if !report.continuation_barriers.is_empty() || !report.deferred_actions.is_empty() {
                 return Err(HostPreparationReceiptError::inconsistent_execution_report());
             }
-            let continuation = ExecutionReceiptContinuation::new(
-                false,
-                [] as [&str; 0],
-                [] as [&str; 0],
-            )
-            .map_err(|_| HostPreparationReceiptError::receipt_validation())?;
+            let continuation =
+                ExecutionReceiptContinuation::new(false, [] as [&str; 0], [] as [&str; 0])
+                    .map_err(|_| HostPreparationReceiptError::receipt_validation())?;
             Ok((ExecutionReceiptDisposition::Completed, continuation))
         }
         HostPreparationExecutionDisposition::ActionFailed => {
