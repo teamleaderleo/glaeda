@@ -1,0 +1,69 @@
+name: Temporary execution receipt staging patch
+
+on:
+  pull_request:
+    branches: [main]
+    types: [synchronize, reopened]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.event.pull_request.head.ref == 'feat/execution-receipt-state-store'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/execution-receipt-state-store
+          fetch-depth: 0
+      - name: Add receipt staging identities
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/linux_installation_staging_recovery.rs'); t=p.read_text()
+          def r(old,new):
+              global t
+              assert t.count(old)==1, t.count(old)
+              t=t.replace(old,new,1)
+          r('const JOURNALS_DIRECTORY: &str = "journals";\n','const JOURNALS_DIRECTORY: &str = "journals";\nconst RECEIPTS_DIRECTORY: &str = "receipts";\n')
+          r('''    MissingJournals,\n    UnsafeJournals,\n    MissingProject,\n''','''    MissingJournals,\n    UnsafeJournals,\n    MissingReceipts,\n    UnsafeReceipts,\n    MissingProject,\n''')
+          r('''            | Self::UnsafeJournals\n            | Self::UnsafeProject\n''','''            | Self::UnsafeJournals\n            | Self::UnsafeReceipts\n            | Self::UnsafeProject\n''')
+          p.write_text(t)
+          PY
+      - name: Add receipt staging inspection
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/linux_installation_staging_recovery.rs'); t=p.read_text()
+          def r(old,new):
+              global t
+              assert t.count(old)==1, t.count(old)
+              t=t.replace(old,new,1)
+          r('''/// `resources`, `journals`, and `project.json` entries, and a strict project document whose embedded\n''','''/// `resources`, `journals`, `receipts`, and `project.json` entries, and a strict project document whose embedded\n''')
+          r('''    inspect_expected_directory(\n        &directory,\n        JOURNALS_DIRECTORY,\n        owner,\n        StagedInstallationConcern::MissingJournals,\n        StagedInstallationConcern::UnsafeJournals,\n        &mut concerns,\n    );\n    inspect_project(&directory, owner, installation_id.as_ref(), &mut concerns);\n''','''    inspect_expected_directory(\n        &directory,\n        JOURNALS_DIRECTORY,\n        owner,\n        StagedInstallationConcern::MissingJournals,\n        StagedInstallationConcern::UnsafeJournals,\n        &mut concerns,\n    );\n    inspect_expected_directory(\n        &directory,\n        RECEIPTS_DIRECTORY,\n        owner,\n        StagedInstallationConcern::MissingReceipts,\n        StagedInstallationConcern::UnsafeReceipts,\n        &mut concerns,\n    );\n    inspect_project(&directory, owner, installation_id.as_ref(), &mut concerns);\n''')
+          r('''        if !matches!(name, b"resources" | b"journals" | b"project.json") {\n''','''        if !matches!(\n            name,\n            b"resources" | b"journals" | b"receipts" | b"project.json"\n        ) {\n''')
+          p.write_text(t)
+          PY
+      - name: Update receipt staging fixtures
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/linux_installation_staging_recovery.rs'); t=p.read_text()
+          def r(old,new):
+              global t
+              assert t.count(old)==1, t.count(old)
+              t=t.replace(old,new,1)
+          r('''        JOURNALS_DIRECTORY, PROJECT_FILE, RESOURCES_DIRECTORY, STAGING_DIRECTORY,\n        StagedInstallationConcern, StagedInstallationDisposition, inspect_staged_installations,\n''','''        JOURNALS_DIRECTORY, PROJECT_FILE, RECEIPTS_DIRECTORY, RESOURCES_DIRECTORY,\n        STAGING_DIRECTORY, StagedInstallationConcern, StagedInstallationDisposition,\n        inspect_staged_installations,\n''')
+          r('''        fs::create_dir_all(stage.join(JOURNALS_DIRECTORY)).expect("create journals directory");\n        for directory in [\n            root.join(STAGING_DIRECTORY),\n            stage.clone(),\n            stage.join(RESOURCES_DIRECTORY),\n            stage.join(JOURNALS_DIRECTORY),\n        ] {\n''','''        fs::create_dir_all(stage.join(JOURNALS_DIRECTORY)).expect("create journals directory");\n        fs::create_dir_all(stage.join(RECEIPTS_DIRECTORY)).expect("create receipts directory");\n        for directory in [\n            root.join(STAGING_DIRECTORY),\n            stage.clone(),\n            stage.join(RESOURCES_DIRECTORY),\n            stage.join(JOURNALS_DIRECTORY),\n            stage.join(RECEIPTS_DIRECTORY),\n        ] {\n''')
+          p.write_text(t)
+          PY
+      - name: Format and publish staging recovery
+        run: |
+          rm .github/workflows/temp-execution-receipt-staging-patch.yml
+          cargo fmt --all
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Recognize receipt state in staging recovery"
+          git push origin HEAD:feat/execution-receipt-state-store
