@@ -17,14 +17,16 @@ fn receipt() -> ExecutionReceipt {
         ReceiptTimestamp::parse("2026-07-26T18:00:00.000Z").expect("started"),
         ReceiptTimestamp::parse("2026-07-26T18:00:02.000Z").expect("terminal"),
         ExecutionReceiptDisposition::Completed,
-        vec![ExecutionReceiptAction::new(
-            "ensure-system-user",
-            ExecutionLane::Root,
-            RollbackClass::Irreversible,
-            ExecutionReceiptActionOutcome::Completed,
-            None,
-        )
-        .expect("action")],
+        vec![
+            ExecutionReceiptAction::new(
+                "ensure-system-user",
+                ExecutionLane::Root,
+                RollbackClass::Irreversible,
+                ExecutionReceiptActionOutcome::Completed,
+                None,
+            )
+            .expect("action"),
+        ],
         ExecutionReceiptContinuation::new(false, [] as [&str; 0], [] as [&str; 0])
             .expect("continuation"),
     )
@@ -43,7 +45,10 @@ fn typed_operation_exposes_the_reviewed_public_binding() {
         } => {
             assert_eq!(*schema_version, 1);
             assert_eq!(repository.as_str(), "example/project");
-            assert_eq!(source_digest.as_str(), format!("sha256:{}", "ab".repeat(32)));
+            assert_eq!(
+                source_digest.as_str(),
+                format!("sha256:{}", "ab".repeat(32))
+            );
             assert_eq!(
                 serde_json::to_value(phase_id).expect("phase JSON"),
                 Value::String("host-preparation-root-phase".to_owned())
@@ -76,7 +81,9 @@ fn producer_versions_require_an_alphanumeric_leading_character() {
     value["producer"]["version"] = Value::String("...".to_owned());
 
     let error = decode_execution_receipt(&value.to_string()).expect_err("punctuation version");
-    assert!(error
-        .to_string()
-        .contains("producer version must be a bounded ASCII version token"));
+    assert!(
+        error
+            .to_string()
+            .contains("producer version must be a bounded ASCII version token")
+    );
 }
