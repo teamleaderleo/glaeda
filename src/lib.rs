@@ -90,6 +90,7 @@ pub mod state_document;
 pub mod state_store;
 #[cfg(target_os = "linux")]
 pub mod subordinate_id;
+pub mod verification_profile;
 
 use serde::Serialize;
 
