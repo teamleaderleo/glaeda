@@ -456,3 +456,99 @@ fn visibility_is_bounded_and_contains_no_private_execution_material() {
     assert!(encoded.contains("teamleaderleo/smolrunner"));
     assert!(encoded.contains("smolrunner.required"));
 }
+
+#[test]
+fn fairness_is_recomputed_after_each_selected_repository() {
+    let observed_at = 13_000_000;
+    let same_oldest = request(
+        "same-oldest",
+        "example/same",
+        'a',
+        PersonalWorkerPriority::Normal,
+        observed_at - 3_000,
+        limits(2_000, 2),
+        PersonalWorkerCacheAccessMode::Read,
+    );
+    let same_second = request(
+        "same-second",
+        "example/same",
+        'b',
+        PersonalWorkerPriority::Normal,
+        observed_at - 2_000,
+        limits(2_000, 2),
+        PersonalWorkerCacheAccessMode::Read,
+    );
+    let other = request(
+        "other",
+        "example/other",
+        'c',
+        PersonalWorkerPriority::Normal,
+        observed_at - 1_000,
+        limits(2_000, 2),
+        PersonalWorkerCacheAccessMode::Read,
+    );
+    let decision = evaluate_personal_worker_queue(
+        &input(
+            1,
+            observed_at,
+            vec![same_oldest, same_second, other],
+            vec![],
+        ),
+        None,
+    )
+    .expect("fair decision");
+    let selected = decision
+        .selected
+        .iter()
+        .map(|entry| entry.request_id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(selected, ["same-oldest", "other"]);
+}
+
+#[test]
+fn pending_downscale_waits_for_active_drain_and_is_cancelled_by_work() {
+    let observed_at = 14_000_000;
+    let running = active(
+        "running",
+        "example/running",
+        'a',
+        observed_at,
+        limits(2_000, 2),
+        PersonalWorkerCacheAccessMode::Read,
+    );
+    let mut queue = input(1, observed_at, vec![], vec![running]);
+    queue.pending_profile_change = Some(PersonalWorkerPendingProfileChange {
+        target: PersonalWorkerProfile::Stopped,
+        requested_at: time(observed_at - 1_000),
+    });
+    let decision = evaluate_personal_worker_queue(&queue, None).expect("drain decision");
+    assert_eq!(decision.desired_profile, PersonalWorkerProfile::Work);
+    assert!(decision.cancel_pending_downscale);
+    assert!(!decision.profile_change_permitted);
+}
+
+#[test]
+fn cancelled_only_queue_does_not_hold_the_work_profile() {
+    let observed_at = 15_000_000;
+    let mut cancelled = request(
+        "cancelled-idle",
+        "example/idle",
+        'a',
+        PersonalWorkerPriority::Normal,
+        observed_at - 60_000,
+        limits(2_000, 2),
+        PersonalWorkerCacheAccessMode::Read,
+    );
+    cancelled.cancellation = PersonalWorkerCancellationState::Cancelled {
+        cancelled_at: time(observed_at - 1_000),
+    };
+    let mut queue = input(1, observed_at, vec![cancelled], vec![]);
+    queue.last_activity_at = time(observed_at - 31 * 60 * 1_000);
+    let decision = evaluate_personal_worker_queue(&queue, None).expect("idle decision");
+    assert!(decision.selected.is_empty());
+    assert_eq!(decision.desired_profile, PersonalWorkerProfile::Stopped);
+    assert_eq!(
+        decision.visibility[0].worker_profile,
+        PersonalWorkerProfile::Stopped
+    );
+}

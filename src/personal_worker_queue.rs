@@ -364,14 +364,11 @@ pub fn evaluate_personal_worker_queue(
     let active_limits = aggregate_active_limits(&input.active)?;
     let mut held_leases = active_leases(&input.active);
     let mut repository_load = active_repository_load(&input.active);
-    let mut candidates = input
+    let mut remaining = input
         .queued
         .iter()
         .filter(|request| !request.cancellation.is_cancelled())
         .collect::<Vec<_>>();
-    candidates.sort_by(|left, right| {
-        compare_candidates(left, right, input.observed_at, &repository_load)
-    });
 
     let mut selected = Vec::new();
     let mut used_cpu = active_limits.cpu_millis;
@@ -382,30 +379,31 @@ pub fn evaluate_personal_worker_queue(
         .any(|reservation| reservation.request.job_class() == PersonalWorkerJobClass::Heavy);
     let mut selected_heavy = false;
 
-    for request in candidates {
-        if selected.len() + input.active.len() >= MAX_PERSONAL_WORKER_ACTIVE_RESERVATIONS {
+    while selected.len() + input.active.len() < MAX_PERSONAL_WORKER_ACTIVE_RESERVATIONS {
+        remaining.sort_by(|left, right| {
+            compare_candidates(left, right, input.observed_at, &repository_load)
+        });
+        let chosen = remaining.iter().position(|request| {
+            let job_class = request.job_class();
+            if active_heavy
+                || selected_heavy
+                || (job_class == PersonalWorkerJobClass::Heavy && !input.active.is_empty())
+                || (job_class == PersonalWorkerJobClass::Heavy && !selected.is_empty())
+            {
+                return false;
+            }
+            let next_cpu = used_cpu.saturating_add(request.requested_limits.cpu_millis);
+            let next_memory = used_memory.saturating_add(request.requested_limits.memory_bytes);
+            next_cpu <= PERSONAL_WORKER_SCHEDULABLE_CPU_MILLIS
+                && next_memory <= PERSONAL_WORKER_SCHEDULABLE_MEMORY_BYTES
+                && lease_conflict(&held_leases, &request.cache_namespace, request.cache_access)
+                    .is_none()
+        });
+        let Some(chosen) = chosen else {
             break;
-        }
+        };
+        let request = remaining.remove(chosen);
         let job_class = request.job_class();
-        if active_heavy
-            || selected_heavy
-            || (job_class == PersonalWorkerJobClass::Heavy && !input.active.is_empty())
-        {
-            continue;
-        }
-        if job_class == PersonalWorkerJobClass::Heavy && !selected.is_empty() {
-            continue;
-        }
-        let next_cpu = used_cpu.saturating_add(request.requested_limits.cpu_millis);
-        let next_memory = used_memory.saturating_add(request.requested_limits.memory_bytes);
-        if next_cpu > PERSONAL_WORKER_SCHEDULABLE_CPU_MILLIS
-            || next_memory > PERSONAL_WORKER_SCHEDULABLE_MEMORY_BYTES
-        {
-            continue;
-        }
-        if lease_conflict(&held_leases, &request.cache_namespace, request.cache_access).is_some() {
-            continue;
-        }
         held_leases
             .entry(request.cache_namespace.clone())
             .or_default()
@@ -413,8 +411,8 @@ pub fn evaluate_personal_worker_queue(
         *repository_load
             .entry(request.source.repository.clone())
             .or_default() += 1;
-        used_cpu = next_cpu;
-        used_memory = next_memory;
+        used_cpu = used_cpu.saturating_add(request.requested_limits.cpu_millis);
+        used_memory = used_memory.saturating_add(request.requested_limits.memory_bytes);
         selected_heavy = job_class == PersonalWorkerJobClass::Heavy;
         selected.push(PersonalWorkerSelection {
             request_id: request.identity.request_id.clone(),
@@ -430,14 +428,19 @@ pub fn evaluate_personal_worker_queue(
         });
     }
 
-    let desired_profile = desired_profile(input);
+    let has_queued_work = input
+        .queued
+        .iter()
+        .any(|request| !request.cancellation.is_cancelled());
+    let has_work = has_queued_work || !input.active.is_empty();
+    let desired_profile = desired_profile(input, has_work);
     let has_work = !input.queued.is_empty() || !input.active.is_empty();
     let cancel_pending_downscale = has_work
         && input
             .pending_profile_change
             .is_some_and(|pending| pending.target != PersonalWorkerProfile::Work);
     let profile_change_permitted = input.active.is_empty();
-    let visibility = build_visibility(input, &selected);
+    let visibility = build_visibility(input, &selected, desired_profile);
 
     Ok(PersonalWorkerQueueDecision {
         schema_version: PERSONAL_WORKER_QUEUE_SCHEMA_VERSION,
@@ -513,13 +516,6 @@ fn validate_input(input: &PersonalWorkerQueueInput) -> Result<(), PersonalWorker
                 "pending_profile_change.requested_at",
                 "future_profile_change_request",
                 "profile-change request cannot be newer than the queue observation",
-            ));
-        }
-        if !input.active.is_empty() && pending.target != PersonalWorkerProfile::Work {
-            return Err(PersonalWorkerQueueError::new(
-                "pending_profile_change.target",
-                "downscale_while_active",
-                "profile downscale must wait for every active reservation to drain",
             ));
         }
     }
@@ -892,8 +888,8 @@ fn lease_conflict_for_modes(
     None
 }
 
-fn desired_profile(input: &PersonalWorkerQueueInput) -> PersonalWorkerProfile {
-    if !input.queued.is_empty() || !input.active.is_empty() {
+fn desired_profile(input: &PersonalWorkerQueueInput, has_work: bool) -> PersonalWorkerProfile {
+    if has_work {
         return PersonalWorkerProfile::Work;
     }
     let idle_millis = input
@@ -912,6 +908,7 @@ fn desired_profile(input: &PersonalWorkerQueueInput) -> PersonalWorkerProfile {
 fn build_visibility(
     input: &PersonalWorkerQueueInput,
     selected: &[PersonalWorkerSelection],
+    desired_profile: PersonalWorkerProfile,
 ) -> Vec<PersonalWorkerQueueVisibility> {
     let selected_ids = selected
         .iter()
@@ -923,14 +920,15 @@ fn build_visibility(
             .or_default()
             .push(selection.cache_access);
     }
+    let mut queue_repository_load = active_repository_load(&input.active);
+    for selection in selected {
+        *queue_repository_load
+            .entry(selection.repository.clone())
+            .or_default() += 1;
+    }
     let mut queued = input.queued.iter().collect::<Vec<_>>();
     queued.sort_by(|left, right| {
-        compare_candidates(
-            left,
-            right,
-            input.observed_at,
-            &active_repository_load(&input.active),
-        )
+        compare_candidates(left, right, input.observed_at, &queue_repository_load)
     });
     let queue_positions = queued
         .iter()
@@ -981,7 +979,7 @@ fn build_visibility(
             },
             cache_lease,
             None,
-            PersonalWorkerProfile::Work,
+            desired_profile,
         ));
     }
     for active in &input.active {
