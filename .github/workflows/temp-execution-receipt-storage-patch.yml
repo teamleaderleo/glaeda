@@ -1,0 +1,460 @@
+name: Temporary execution receipt storage patch
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.event.pull_request.head.ref == 'feat/execution-receipt-state-store'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/execution-receipt-state-store
+          fetch-depth: 0
+      - name: Apply exact storage edits
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              file = Path(path)
+              text = file.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected one anchor, found {count}")
+              file.write_text(text.replace(old, new, 1))
+
+          replace_once(
+              "src/state.rs",
+              '''    #[must_use]
+              pub fn journal_document(installation_id: &InstallationId, journal_id: &JournalId) -> StatePath {
+                  let mut components = Self::installation(installation_id).components;
+                  components.push(StateComponent::fixed("journals"));
+                  components.push(StateComponent::json_file(&journal_id.0));
+                  StatePath::new(components)
+              }
+          }
+          ''',
+              '''    #[must_use]
+              pub fn journal_document(installation_id: &InstallationId, journal_id: &JournalId) -> StatePath {
+                  let mut components = Self::installation(installation_id).components;
+                  components.push(StateComponent::fixed("journals"));
+                  components.push(StateComponent::json_file(&journal_id.0));
+                  StatePath::new(components)
+              }
+
+              #[must_use]
+              pub fn execution_receipt_document(
+                  installation_id: &InstallationId,
+                  execution_id: &JournalId,
+              ) -> StatePath {
+                  let mut components = Self::installation(installation_id).components;
+                  components.push(StateComponent::fixed("receipts"));
+                  components.push(StateComponent::json_file(&execution_id.0));
+                  StatePath::new(components)
+              }
+          }
+          ''')
+
+          replace_once(
+              "src/state.rs",
+              '''        assert_eq!(
+                  component_strings(&StateLayout::journal_document(&installation, &journal)),
+                  [
+                      "installations",
+                      "0123456789abcdef",
+                      "journals",
+                      "apply-00000001.json"
+                  ]
+              );
+          ''',
+              '''        assert_eq!(
+                  component_strings(&StateLayout::journal_document(&installation, &journal)),
+                  [
+                      "installations",
+                      "0123456789abcdef",
+                      "journals",
+                      "apply-00000001.json"
+                  ]
+              );
+              assert_eq!(
+                  component_strings(&StateLayout::execution_receipt_document(
+                      &installation,
+                      &journal,
+                  )),
+                  [
+                      "installations",
+                      "0123456789abcdef",
+                      "receipts",
+                      "apply-00000001.json"
+                  ]
+              );
+          ''')
+
+          replace_once(
+              "src/state_store.rs",
+              '''use crate::journal_document::{
+              ''',
+              '''use crate::execution_receipt::{
+                  ExecutionReceipt, ExecutionReceiptError, encode_execution_receipt,
+              };
+              use crate::journal_document::{
+              ''')
+          replace_once(
+              "src/state_store.rs",
+              '''    Journal,
+          }
+          ''',
+              '''    Journal,
+              ExecutionReceipt,
+          }
+          ''')
+          replace_once(
+              "src/state_store.rs",
+              '''    pub fn journal(document: JournalStateDocument) -> Result<Self, StateRecordError> {
+                  let path = StateLayout::journal_document(document.installation_id(), document.journal_id());
+                  let encoded = encode_journal_document(&document)?;
+                  Self::finish(StateRecordKind::Journal, path, encoded)
+              }
+
+              #[must_use]
+          ''',
+              '''    pub fn journal(document: JournalStateDocument) -> Result<Self, StateRecordError> {
+                  let path = StateLayout::journal_document(document.installation_id(), document.journal_id());
+                  let encoded = encode_journal_document(&document)?;
+                  Self::finish(StateRecordKind::Journal, path, encoded)
+              }
+
+              /// Bind one validated execution receipt to its canonical installation receipt path.
+              ///
+              /// # Errors
+              ///
+              /// Returns an error when canonical receipt encoding fails or exceeds the store limit.
+              pub fn execution_receipt(
+                  installation_id: &InstallationId,
+                  receipt: &ExecutionReceipt,
+              ) -> Result<Self, StateRecordError> {
+                  let path = StateLayout::execution_receipt_document(
+                      installation_id,
+                      receipt.execution_id(),
+                  );
+                  let encoded = encode_execution_receipt(receipt)?;
+                  Self::finish(StateRecordKind::ExecutionReceipt, path, encoded)
+              }
+
+              #[must_use]
+          ''')
+          replace_once(
+              "src/state_store.rs",
+              '''impl From<JournalDocumentError> for StateRecordError {
+                  fn from(error: JournalDocumentError) -> Self {
+                      Self {
+                          problems: error.problems,
+                      }
+                  }
+              }
+
+              impl fmt::Display for StateRecordError {
+          ''',
+              '''impl From<JournalDocumentError> for StateRecordError {
+                  fn from(error: JournalDocumentError) -> Self {
+                      Self {
+                          problems: error.problems,
+                      }
+                  }
+              }
+
+              impl From<ExecutionReceiptError> for StateRecordError {
+                  fn from(error: ExecutionReceiptError) -> Self {
+                      Self {
+                          problems: error.problems,
+                      }
+                  }
+              }
+
+              impl fmt::Display for StateRecordError {
+          ''')
+
+          replace_once(
+              "src/lib.rs",
+              '''pub mod execution_receipt;
+          ''',
+              '''pub mod execution_receipt;
+              pub mod execution_receipt_store;
+          ''')
+
+          replace_once(
+              "src/linux_state_prepare.rs",
+              '''/// `installations/ID/resources` and `installations/ID/journals` hierarchy. Existing compatible
+          ''',
+              '''/// `installations/ID/resources`, `installations/ID/journals`, and
+              /// `installations/ID/receipts` hierarchy. Existing compatible
+          ''')
+          replace_once(
+              "src/linux_state_prepare.rs",
+              '''    let (_, resources_created) = ensure_directory(&installation, "resources", owner)?;
+              let (_, journals_created) = ensure_directory(&installation, "journals", owner)?;
+
+              Ok(StatePreparationReceipt {
+                  created_directories: [
+                      installations_created,
+                      installation_created,
+                      resources_created,
+                      journals_created,
+                  ]
+          ''',
+              '''    let (_, resources_created) = ensure_directory(&installation, "resources", owner)?;
+              let (_, journals_created) = ensure_directory(&installation, "journals", owner)?;
+              let (_, receipts_created) = ensure_directory(&installation, "receipts", owner)?;
+
+              Ok(StatePreparationReceipt {
+                  created_directories: [
+                      installations_created,
+                      installation_created,
+                      resources_created,
+                      journals_created,
+                      receipts_created,
+                  ]
+          ''')
+          replace_once("src/linux_state_prepare.rs", "assert_eq!(receipt.created_directories(), 4);", "assert_eq!(receipt.created_directories(), 5);")
+          replace_once(
+              "src/linux_state_prepare.rs",
+              '''        assert_managed_directory(&installation.join("journals"), root_owner);
+          ''',
+              '''        assert_managed_directory(&installation.join("journals"), root_owner);
+              assert_managed_directory(&installation.join("receipts"), root_owner);
+          ''')
+          replace_once("src/linux_state_prepare.rs", "assert_eq!(receipt.created_directories(), 3);", "assert_eq!(receipt.created_directories(), 4);")
+
+          replace_once(
+              "src/linux_installation_publication.rs",
+              '''const JOURNALS_DIRECTORY: &str = "journals";
+          ''',
+              '''const JOURNALS_DIRECTORY: &str = "journals";
+              const RECEIPTS_DIRECTORY: &str = "receipts";
+          ''')
+          replace_once(
+              "src/linux_installation_publication.rs",
+              '''    let journals =
+                  create_empty_directory(staged.directory(), JOURNALS_DIRECTORY, catalog_lock.owner())?;
+              write_project_document(staged.directory(), encoded.as_bytes(), catalog_lock.owner())?;
+
+              synchronize_directory(&resources, "resource state directory")?;
+              synchronize_directory(&journals, "journal state directory")?;
+          ''',
+              '''    let journals =
+                  create_empty_directory(staged.directory(), JOURNALS_DIRECTORY, catalog_lock.owner())?;
+              let receipts =
+                  create_empty_directory(staged.directory(), RECEIPTS_DIRECTORY, catalog_lock.owner())?;
+              write_project_document(staged.directory(), encoded.as_bytes(), catalog_lock.owner())?;
+
+              synchronize_directory(&resources, "resource state directory")?;
+              synchronize_directory(&journals, "journal state directory")?;
+              synchronize_directory(&receipts, "execution receipt directory")?;
+          ''')
+          replace_once(
+              "src/linux_installation_publication.rs",
+              '''            let _ = fs::unlinkat(&self.directory, JOURNALS_DIRECTORY, AtFlags::REMOVEDIR);
+          ''',
+              '''            let _ = fs::unlinkat(&self.directory, JOURNALS_DIRECTORY, AtFlags::REMOVEDIR);
+                  let _ = fs::unlinkat(&self.directory, RECEIPTS_DIRECTORY, AtFlags::REMOVEDIR);
+          ''')
+          replace_once(
+              "src/linux_installation_publication.rs",
+              '''        INSTALLATIONS_DIRECTORY, InstallationPublicationErrorKind, JOURNALS_DIRECTORY,
+                  PROJECT_FILE, RESOURCES_DIRECTORY, STAGING_DIRECTORY, publish_new_installation,
+          ''',
+              '''        INSTALLATIONS_DIRECTORY, InstallationPublicationErrorKind, JOURNALS_DIRECTORY,
+                  PROJECT_FILE, RECEIPTS_DIRECTORY, RESOURCES_DIRECTORY, STAGING_DIRECTORY,
+                  publish_new_installation,
+          ''')
+          replace_once(
+              "src/linux_installation_publication.rs",
+              '''        assert_directory(&installation.join(JOURNALS_DIRECTORY), owner);
+          ''',
+              '''        assert_directory(&installation.join(JOURNALS_DIRECTORY), owner);
+              assert_directory(&installation.join(RECEIPTS_DIRECTORY), owner);
+          ''')
+
+          replace_once(
+              "src/linux_installation_staging_recovery.rs",
+              '''const JOURNALS_DIRECTORY: &str = "journals";
+          ''',
+              '''const JOURNALS_DIRECTORY: &str = "journals";
+              const RECEIPTS_DIRECTORY: &str = "receipts";
+          ''')
+          replace_once(
+              "src/linux_installation_staging_recovery.rs",
+              '''    MissingJournals,
+                  UnsafeJournals,
+                  MissingProject,
+          ''',
+              '''    MissingJournals,
+                  UnsafeJournals,
+                  MissingReceipts,
+                  UnsafeReceipts,
+                  MissingProject,
+          ''')
+          replace_once(
+              "src/linux_installation_staging_recovery.rs",
+              '''                | Self::UnsafeJournals
+                  | Self::UnsafeProject
+          ''',
+              '''                | Self::UnsafeJournals
+                  | Self::UnsafeReceipts
+                  | Self::UnsafeProject
+          ''')
+          replace_once(
+              "src/linux_installation_staging_recovery.rs",
+              '''/// `resources`, `journals`, and `project.json` entries, and a strict project document whose embedded
+          ''',
+              '''/// `resources`, `journals`, `receipts`, and `project.json` entries, and a strict project document whose embedded
+          ''')
+          replace_once(
+              "src/linux_installation_staging_recovery.rs",
+              '''    inspect_expected_directory(
+                  &directory,
+                  JOURNALS_DIRECTORY,
+                  owner,
+                  StagedInstallationConcern::MissingJournals,
+                  StagedInstallationConcern::UnsafeJournals,
+                  &mut concerns,
+              );
+              inspect_project(&directory, owner, installation_id.as_ref(), &mut concerns);
+          ''',
+              '''    inspect_expected_directory(
+                  &directory,
+                  JOURNALS_DIRECTORY,
+                  owner,
+                  StagedInstallationConcern::MissingJournals,
+                  StagedInstallationConcern::UnsafeJournals,
+                  &mut concerns,
+              );
+              inspect_expected_directory(
+                  &directory,
+                  RECEIPTS_DIRECTORY,
+                  owner,
+                  StagedInstallationConcern::MissingReceipts,
+                  StagedInstallationConcern::UnsafeReceipts,
+                  &mut concerns,
+              );
+              inspect_project(&directory, owner, installation_id.as_ref(), &mut concerns);
+          ''')
+          replace_once(
+              "src/linux_installation_staging_recovery.rs",
+              '''        if !matches!(name, b"resources" | b"journals" | b"project.json") {
+          ''',
+              '''        if !matches!(
+                  name,
+                  b"resources" | b"journals" | b"receipts" | b"project.json"
+              ) {
+          ''')
+          replace_once(
+              "src/linux_installation_staging_recovery.rs",
+              '''        JOURNALS_DIRECTORY, PROJECT_FILE, RESOURCES_DIRECTORY, STAGING_DIRECTORY,
+          ''',
+              '''        JOURNALS_DIRECTORY, PROJECT_FILE, RECEIPTS_DIRECTORY, RESOURCES_DIRECTORY,
+                  STAGING_DIRECTORY,
+          ''')
+          replace_once(
+              "src/linux_installation_staging_recovery.rs",
+              '''        fs::create_dir_all(stage.join(JOURNALS_DIRECTORY)).expect("create journals directory");
+              for directory in [
+                  root.join(STAGING_DIRECTORY),
+                  stage.clone(),
+                  stage.join(RESOURCES_DIRECTORY),
+                  stage.join(JOURNALS_DIRECTORY),
+              ] {
+          ''',
+              '''        fs::create_dir_all(stage.join(JOURNALS_DIRECTORY)).expect("create journals directory");
+              fs::create_dir_all(stage.join(RECEIPTS_DIRECTORY)).expect("create receipts directory");
+              for directory in [
+                  root.join(STAGING_DIRECTORY),
+                  stage.clone(),
+                  stage.join(RESOURCES_DIRECTORY),
+                  stage.join(JOURNALS_DIRECTORY),
+                  stage.join(RECEIPTS_DIRECTORY),
+              ] {
+          ''')
+
+          replace_once(
+              "src/linux_state_recovery.rs",
+              '''    Journals,
+          }
+          ''',
+              '''    Journals,
+              Receipts,
+          }
+          ''')
+          replace_once(
+              "src/linux_state_recovery.rs",
+              '''    let journals = open_directory_at(&installation, "journals", "journals directory")?;
+              inspect_directory_owner(&journals, "journals directory", root_owner)?;
+
+              let mut findings = Vec::new();
+          ''',
+              '''    let journals = open_directory_at(&installation, "journals", "journals directory")?;
+              inspect_directory_owner(&journals, "journals directory", root_owner)?;
+              let receipts = open_directory_at(&installation, "receipts", "receipts directory")?;
+              inspect_directory_owner(&receipts, "receipts directory", root_owner)?;
+
+              let mut findings = Vec::new();
+          ''')
+          replace_once(
+              "src/linux_state_recovery.rs",
+              '''    if !truncated {
+                  scan_directory(
+                      &journals,
+                      RecoveryArea::Journals,
+                      root_uid,
+                      &mut findings,
+                      &mut truncated,
+                  )?;
+              }
+
+              findings.sort_by(|left, right| {
+          ''',
+              '''    if !truncated {
+                  scan_directory(
+                      &journals,
+                      RecoveryArea::Journals,
+                      root_uid,
+                      &mut findings,
+                      &mut truncated,
+                  )?;
+              }
+              if !truncated {
+                  scan_directory(
+                      &receipts,
+                      RecoveryArea::Receipts,
+                      root_uid,
+                      &mut findings,
+                      &mut truncated,
+                  )?;
+              }
+
+              findings.sort_by(|left, right| {
+          ''')
+          replace_once(
+              "src/linux_state_recovery.rs",
+              '''        RecoveryArea::Journals => 2,
+          ''',
+              '''        RecoveryArea::Journals => 2,
+                  RecoveryArea::Receipts => 3,
+          ''')
+
+          Path('.github/workflows/temp-execution-receipt-storage-patch.yml').unlink()
+          PY
+          cargo fmt --all
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Add durable execution receipt state storage"
+          git push origin HEAD:feat/execution-receipt-state-store
