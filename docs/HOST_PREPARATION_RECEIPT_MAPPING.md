@@ -13,7 +13,7 @@ The durable execution report does not currently carry every external receipt ide
 - the canonical start time;
 - the canonical terminal time.
 
-The mapper does not generate substitute identities from phase names, action summaries, filesystem paths, or mutable host state.
+The mapper does not generate substitute identities from phase names, action summaries, filesystem paths, or mutable host state. A later execution-boundary slice must prove that the supplied journal ID, digest, and timestamps came from the same durable execution before publishing the receipt.
 
 ## Public mapping
 
