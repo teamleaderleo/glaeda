@@ -27,6 +27,7 @@ const INSTALLATIONS_DIRECTORY: &str = "installations";
 const STAGING_DIRECTORY: &str = "staging";
 const RESOURCES_DIRECTORY: &str = "resources";
 const JOURNALS_DIRECTORY: &str = "journals";
+const RECEIPTS_DIRECTORY: &str = "receipts";
 const PROJECT_FILE: &str = "project.json";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -134,10 +135,13 @@ pub fn publish_new_installation(
     )?;
     let journals =
         create_empty_directory(staged.directory(), JOURNALS_DIRECTORY, catalog_lock.owner())?;
+    let receipts =
+        create_empty_directory(staged.directory(), RECEIPTS_DIRECTORY, catalog_lock.owner())?;
     write_project_document(staged.directory(), encoded.as_bytes(), catalog_lock.owner())?;
 
     synchronize_directory(&resources, "resource state directory")?;
     synchronize_directory(&journals, "journal state directory")?;
+    synchronize_directory(&receipts, "execution receipt directory")?;
     synchronize_directory(staged.directory(), "staged installation directory")?;
 
     fs::renameat_with(
@@ -409,6 +413,7 @@ impl Drop for StagedInstallation<'_> {
             let _ = fs::unlinkat(&self.directory, PROJECT_FILE, AtFlags::empty());
             let _ = fs::unlinkat(&self.directory, RESOURCES_DIRECTORY, AtFlags::REMOVEDIR);
             let _ = fs::unlinkat(&self.directory, JOURNALS_DIRECTORY, AtFlags::REMOVEDIR);
+            let _ = fs::unlinkat(&self.directory, RECEIPTS_DIRECTORY, AtFlags::REMOVEDIR);
             let _ = fs::unlinkat(self.parent, &self.name, AtFlags::REMOVEDIR);
             let _ = fs::fsync(self.parent);
         }
@@ -489,7 +494,8 @@ mod tests {
 
     use super::{
         INSTALLATIONS_DIRECTORY, InstallationPublicationErrorKind, JOURNALS_DIRECTORY,
-        PROJECT_FILE, RESOURCES_DIRECTORY, STAGING_DIRECTORY, publish_new_installation,
+        PROJECT_FILE, RECEIPTS_DIRECTORY, RESOURCES_DIRECTORY, STAGING_DIRECTORY,
+        publish_new_installation,
     };
 
     static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
@@ -561,6 +567,7 @@ mod tests {
         assert_directory(&installation, owner);
         assert_directory(&installation.join(RESOURCES_DIRECTORY), owner);
         assert_directory(&installation.join(JOURNALS_DIRECTORY), owner);
+        assert_directory(&installation.join(RECEIPTS_DIRECTORY), owner);
         assert!(!staging.join(id.as_str()).exists());
 
         let project_path = installation.join(PROJECT_FILE);
