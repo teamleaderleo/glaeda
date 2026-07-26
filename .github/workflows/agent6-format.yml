@@ -1,4 +1,4 @@
-name: Agent 6 queue diagnostic
+name: Agent 6 queue correction
 
 on:
   pull_request:
@@ -7,7 +7,7 @@ permissions:
   contents: write
 
 jobs:
-  diagnose:
+  correct:
     if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -18,15 +18,56 @@ jobs:
           ref: ${{ github.head_ref }}
           show-progress: false
 
-      - name: Capture Clippy diagnostic
+      - name: Apply reviewed Clippy corrections
         run: |
-          set +e
-          cargo clippy --locked --all-targets --all-features -- -D warnings > .agent6-clippy.log 2>&1
-          status=$?
-          set -e
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('src/personal_worker_queue.rs')
+          text = path.read_text()
+          old_exclusive = '''    if held
+                  .iter()
+                  .any(|mode| *mode == PersonalWorkerCacheAccessMode::Exclusive)
+              {'''
+          new_exclusive = '''    if held.contains(&PersonalWorkerCacheAccessMode::Exclusive) {'''
+          old_write = '''    if held
+                  .iter()
+                  .any(|mode| *mode == PersonalWorkerCacheAccessMode::Write)
+                  || requested == PersonalWorkerCacheAccessMode::Write
+              {'''
+          new_write = '''    if held.contains(&PersonalWorkerCacheAccessMode::Write)
+                  || requested == PersonalWorkerCacheAccessMode::Write
+              {'''
+          if text.count(old_exclusive) != 1 or text.count(old_write) != 1:
+              raise SystemExit('unexpected Clippy correction anchors')
+          text = text.replace(old_exclusive, new_exclusive, 1)
+          text = text.replace(old_write, new_write, 1)
+          path.write_text(text)
+          PY
+          rm .agent6-clippy.log
+
+      - name: Verify corrected contract
+        run: |
+          cargo fmt --all -- --check
+          cargo check --locked --all-targets --all-features
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cargo test --locked --all-targets --all-features
+
+      - name: Commit source-only correction
+        run: |
+          rm .github/workflows/agent6-format.yml
+          changed="$(git status --short)"
+          while IFS= read -r line; do
+            path="${line#???}"
+            case "$path" in
+              src/personal_worker_queue.rs|.agent6-clippy.log|.github/workflows/agent6-format.yml) ;;
+              '') ;;
+              *) printf 'unexpected changed path: %s\n' "$path" >&2; exit 1 ;;
+            esac
+          done <<EOF
+          $changed
+          EOF
           git config user.name 'smolrunner-agent-6'
           git config user.email 'smolrunner-agent-6@users.noreply.github.com'
-          git add .agent6-clippy.log
-          git commit -m 'Capture queue Clippy diagnostic'
+          git add src/personal_worker_queue.rs .agent6-clippy.log .github/workflows/agent6-format.yml
+          git commit -m 'Finish personal worker queue contract'
           git push origin HEAD:${{ github.head_ref }}
-          exit "$status"
