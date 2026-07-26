@@ -1,0 +1,35 @@
+name: Temporary execution receipt Clippy diagnostics
+
+on:
+  push:
+    branches:
+      - feat/execution-receipt-contract-v1
+
+permissions:
+  contents: write
+
+jobs:
+  diagnose:
+    if: github.actor == 'teamleaderleo'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: feat/execution-receipt-contract-v1
+          show-progress: false
+      - name: Capture Clippy diagnostics
+        run: |
+          rustup component add clippy
+          set +e
+          cargo clippy --locked --all-targets --all-features -- -D warnings > execution-receipt-clippy.log 2>&1
+          status=$?
+          set -e
+          printf '\nexit_status=%s\n' "$status" >> execution-receipt-clippy.log
+      - name: Commit diagnostics
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add execution-receipt-clippy.log
+          git commit -m "Capture execution receipt Clippy diagnostics"
+          git push origin HEAD:feat/execution-receipt-contract-v1
