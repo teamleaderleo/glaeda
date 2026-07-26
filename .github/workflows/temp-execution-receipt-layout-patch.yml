@@ -1,0 +1,96 @@
+name: Temporary execution receipt layout patch
+
+on:
+  pull_request:
+    branches: [main]
+    types: [synchronize, reopened]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.event.pull_request.head.ref == 'feat/execution-receipt-state-store'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/execution-receipt-state-store
+          fetch-depth: 0
+      - name: Patch existing installation preparation
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/linux_state_prepare.rs'); t=p.read_text()
+          def r(old,new):
+              global t
+              assert t.count(old)==1, t.count(old)
+              t=t.replace(old,new,1)
+          r('''/// `installations/ID/resources` and `installations/ID/journals` hierarchy. Existing compatible\n''','''/// `installations/ID/resources`, `installations/ID/journals`, and\n/// `installations/ID/receipts` hierarchy. Existing compatible\n''')
+          r('''    let (_, resources_created) = ensure_directory(&installation, "resources", owner)?;\n    let (_, journals_created) = ensure_directory(&installation, "journals", owner)?;\n\n    Ok(StatePreparationReceipt {\n        created_directories: [\n            installations_created,\n            installation_created,\n            resources_created,\n            journals_created,\n        ]\n''','''    let (_, resources_created) = ensure_directory(&installation, "resources", owner)?;\n    let (_, journals_created) = ensure_directory(&installation, "journals", owner)?;\n    let (_, receipts_created) = ensure_directory(&installation, "receipts", owner)?;\n\n    Ok(StatePreparationReceipt {\n        created_directories: [\n            installations_created,\n            installation_created,\n            resources_created,\n            journals_created,\n            receipts_created,\n        ]\n''')
+          r('assert_eq!(receipt.created_directories(), 4);','assert_eq!(receipt.created_directories(), 5);')
+          r('''        assert_managed_directory(&installation.join("journals"), root_owner);\n''','''        assert_managed_directory(&installation.join("journals"), root_owner);\n        assert_managed_directory(&installation.join("receipts"), root_owner);\n''')
+          r('assert_eq!(receipt.created_directories(), 3);','assert_eq!(receipt.created_directories(), 4);')
+          p.write_text(t)
+          PY
+      - name: Patch new installation publication
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/linux_installation_publication.rs'); t=p.read_text()
+          def r(old,new):
+              global t
+              assert t.count(old)==1, t.count(old)
+              t=t.replace(old,new,1)
+          r('const JOURNALS_DIRECTORY: &str = "journals";\n','const JOURNALS_DIRECTORY: &str = "journals";\nconst RECEIPTS_DIRECTORY: &str = "receipts";\n')
+          r('''    let journals =\n        create_empty_directory(staged.directory(), JOURNALS_DIRECTORY, catalog_lock.owner())?;\n    write_project_document(staged.directory(), encoded.as_bytes(), catalog_lock.owner())?;\n\n    synchronize_directory(&resources, "resource state directory")?;\n    synchronize_directory(&journals, "journal state directory")?;\n''','''    let journals =\n        create_empty_directory(staged.directory(), JOURNALS_DIRECTORY, catalog_lock.owner())?;\n    let receipts =\n        create_empty_directory(staged.directory(), RECEIPTS_DIRECTORY, catalog_lock.owner())?;\n    write_project_document(staged.directory(), encoded.as_bytes(), catalog_lock.owner())?;\n\n    synchronize_directory(&resources, "resource state directory")?;\n    synchronize_directory(&journals, "journal state directory")?;\n    synchronize_directory(&receipts, "execution receipt directory")?;\n''')
+          r('''            let _ = fs::unlinkat(&self.directory, JOURNALS_DIRECTORY, AtFlags::REMOVEDIR);\n''','''            let _ = fs::unlinkat(&self.directory, JOURNALS_DIRECTORY, AtFlags::REMOVEDIR);\n            let _ = fs::unlinkat(&self.directory, RECEIPTS_DIRECTORY, AtFlags::REMOVEDIR);\n''')
+          r('''        INSTALLATIONS_DIRECTORY, InstallationPublicationErrorKind, JOURNALS_DIRECTORY,\n        PROJECT_FILE, RESOURCES_DIRECTORY, STAGING_DIRECTORY, publish_new_installation,\n''','''        INSTALLATIONS_DIRECTORY, InstallationPublicationErrorKind, JOURNALS_DIRECTORY,\n        PROJECT_FILE, RECEIPTS_DIRECTORY, RESOURCES_DIRECTORY, STAGING_DIRECTORY,\n        publish_new_installation,\n''')
+          r('''        assert_directory(&installation.join(JOURNALS_DIRECTORY), owner);\n''','''        assert_directory(&installation.join(JOURNALS_DIRECTORY), owner);\n        assert_directory(&installation.join(RECEIPTS_DIRECTORY), owner);\n''')
+          p.write_text(t)
+          PY
+      - name: Patch abandoned staging inspection
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/linux_installation_staging_recovery.rs'); t=p.read_text()
+          def r(old,new):
+              global t
+              assert t.count(old)==1, t.count(old)
+              t=t.replace(old,new,1)
+          r('const JOURNALS_DIRECTORY: &str = "journals";\n','const JOURNALS_DIRECTORY: &str = "journals";\nconst RECEIPTS_DIRECTORY: &str = "receipts";\n')
+          r('''    MissingJournals,\n    UnsafeJournals,\n    MissingProject,\n''','''    MissingJournals,\n    UnsafeJournals,\n    MissingReceipts,\n    UnsafeReceipts,\n    MissingProject,\n''')
+          r('''            | Self::UnsafeJournals\n            | Self::UnsafeProject\n''','''            | Self::UnsafeJournals\n            | Self::UnsafeReceipts\n            | Self::UnsafeProject\n''')
+          r('''/// `resources`, `journals`, and `project.json` entries, and a strict project document whose embedded\n''','''/// `resources`, `journals`, `receipts`, and `project.json` entries, and a strict project document whose embedded\n''')
+          r('''    inspect_expected_directory(\n        &directory,\n        JOURNALS_DIRECTORY,\n        owner,\n        StagedInstallationConcern::MissingJournals,\n        StagedInstallationConcern::UnsafeJournals,\n        &mut concerns,\n    );\n    inspect_project(&directory, owner, installation_id.as_ref(), &mut concerns);\n''','''    inspect_expected_directory(\n        &directory,\n        JOURNALS_DIRECTORY,\n        owner,\n        StagedInstallationConcern::MissingJournals,\n        StagedInstallationConcern::UnsafeJournals,\n        &mut concerns,\n    );\n    inspect_expected_directory(\n        &directory,\n        RECEIPTS_DIRECTORY,\n        owner,\n        StagedInstallationConcern::MissingReceipts,\n        StagedInstallationConcern::UnsafeReceipts,\n        &mut concerns,\n    );\n    inspect_project(&directory, owner, installation_id.as_ref(), &mut concerns);\n''')
+          r('''        if !matches!(name, b"resources" | b"journals" | b"project.json") {\n''','''        if !matches!(\n            name,\n            b"resources" | b"journals" | b"receipts" | b"project.json"\n        ) {\n''')
+          r('''        JOURNALS_DIRECTORY, PROJECT_FILE, RESOURCES_DIRECTORY, STAGING_DIRECTORY,\n''','''        JOURNALS_DIRECTORY, PROJECT_FILE, RECEIPTS_DIRECTORY, RESOURCES_DIRECTORY,\n        STAGING_DIRECTORY,\n''')
+          r('''        fs::create_dir_all(stage.join(JOURNALS_DIRECTORY)).expect("create journals directory");\n        for directory in [\n            root.join(STAGING_DIRECTORY),\n            stage.clone(),\n            stage.join(RESOURCES_DIRECTORY),\n            stage.join(JOURNALS_DIRECTORY),\n        ] {\n''','''        fs::create_dir_all(stage.join(JOURNALS_DIRECTORY)).expect("create journals directory");\n        fs::create_dir_all(stage.join(RECEIPTS_DIRECTORY)).expect("create receipts directory");\n        for directory in [\n            root.join(STAGING_DIRECTORY),\n            stage.clone(),\n            stage.join(RESOURCES_DIRECTORY),\n            stage.join(JOURNALS_DIRECTORY),\n            stage.join(RECEIPTS_DIRECTORY),\n        ] {\n''')
+          p.write_text(t)
+          PY
+      - name: Patch orphan receipt recovery
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/linux_state_recovery.rs'); t=p.read_text()
+          def r(old,new):
+              global t
+              assert t.count(old)==1, t.count(old)
+              t=t.replace(old,new,1)
+          r('''    Journals,\n}\n''','''    Journals,\n    Receipts,\n}\n''')
+          r('''    let journals = open_directory_at(&installation, "journals", "journals directory")?;\n    inspect_directory_owner(&journals, "journals directory", root_owner)?;\n\n    let mut findings = Vec::new();\n''','''    let journals = open_directory_at(&installation, "journals", "journals directory")?;\n    inspect_directory_owner(&journals, "journals directory", root_owner)?;\n    let receipts = open_directory_at(&installation, "receipts", "receipts directory")?;\n    inspect_directory_owner(&receipts, "receipts directory", root_owner)?;\n\n    let mut findings = Vec::new();\n''')
+          r('''    if !truncated {\n        scan_directory(\n            &journals,\n            RecoveryArea::Journals,\n            root_uid,\n            &mut findings,\n            &mut truncated,\n        )?;\n    }\n\n    findings.sort_by(|left, right| {\n''','''    if !truncated {\n        scan_directory(\n            &journals,\n            RecoveryArea::Journals,\n            root_uid,\n            &mut findings,\n            &mut truncated,\n        )?;\n    }\n    if !truncated {\n        scan_directory(\n            &receipts,\n            RecoveryArea::Receipts,\n            root_uid,\n            &mut findings,\n            &mut truncated,\n        )?;\n    }\n\n    findings.sort_by(|left, right| {\n''')
+          r('''        RecoveryArea::Journals => 2,\n''','''        RecoveryArea::Journals => 2,\n        RecoveryArea::Receipts => 3,\n''')
+          r('''        private_write(\n            &journals.join(".smolrunner-tmp-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),\n            &vec![0_u8; MAX_STATE_DOCUMENT_BYTES + 1],\n        );\n\n        let report = inspect_orphans(root.path(), &installation_id()).expect("inspect orphans");\n        assert_eq!(report.findings().len(), 4);\n''','''        private_write(\n            &journals.join(".smolrunner-tmp-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),\n            &vec![0_u8; MAX_STATE_DOCUMENT_BYTES + 1],\n        );\n        let receipts = root.installation().join("receipts");\n        private_write(\n            &receipts.join(".smolrunner-tmp-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),\n            b"receipt",\n        );\n\n        let report = inspect_orphans(root.path(), &installation_id()).expect("inspect orphans");\n        assert_eq!(report.findings().len(), 5);\n''')
+          r('''        assert!(\n            report\n                .findings()\n                .iter()\n                .any(|finding| { finding.concerns().contains(&RecoveryConcern::Oversized) })\n        );\n''','''        assert!(\n            report\n                .findings()\n                .iter()\n                .any(|finding| { finding.concerns().contains(&RecoveryConcern::Oversized) })\n        );\n        assert!(\n            report\n                .findings()\n                .iter()\n                .any(|finding| finding.area() == RecoveryArea::Receipts)\n        );\n''')
+          p.write_text(t)
+          PY
+      - name: Format and publish receipt layout
+        run: |
+          rm .github/workflows/temp-execution-receipt-layout-patch.yml
+          cargo fmt --all
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Add managed execution receipt directory lifecycle"
+          git push origin HEAD:feat/execution-receipt-state-store
