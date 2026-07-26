@@ -136,6 +136,7 @@ fn atomic_publication_creates_then_exact_replay_is_duplicate() {
         duplicate.disposition(),
         ExecutionReceiptPublicationDisposition::Duplicate
     );
+    assert_eq!(duplicate.bytes_written(), 0);
     assert_eq!(store.entries.len(), 1);
 
     let read = read_execution_receipt(&store, &installation_id(), value.execution_id())

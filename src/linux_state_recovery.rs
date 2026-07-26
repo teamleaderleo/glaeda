@@ -519,12 +519,24 @@ mod tests {
 
         let report = inspect_orphans(root.path(), &installation_id()).expect("inspect orphans");
         assert_eq!(report.findings().len(), 5);
-        assert!(
+        assert_eq!(
             report
                 .findings()
                 .iter()
-                .all(|finding| { finding.disposition() == RecoveryDisposition::Suspicious })
+                .filter(|finding| finding.disposition() == RecoveryDisposition::Suspicious)
+                .count(),
+            4
         );
+        let receipt_finding = report
+            .findings()
+            .iter()
+            .find(|finding| finding.area() == RecoveryArea::Receipts)
+            .expect("receipt orphan finding");
+        assert_eq!(
+            receipt_finding.disposition(),
+            RecoveryDisposition::RecoverableOrphan
+        );
+        assert!(receipt_finding.concerns().is_empty());
         assert!(report.findings().iter().any(|finding| {
             finding
                 .concerns()

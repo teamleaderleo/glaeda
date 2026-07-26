@@ -141,7 +141,7 @@ pub fn publish_execution_receipt(
                 Some(existing) if existing == *receipt => Ok(ExecutionReceiptPublication {
                     disposition: ExecutionReceiptPublicationDisposition::Duplicate,
                     execution_id: receipt.execution_id().clone(),
-                    bytes_written: record.bytes().len(),
+                    bytes_written: 0,
                 }),
                 Some(_) | None => Err(ExecutionReceiptStoreError::conflict()),
             }
