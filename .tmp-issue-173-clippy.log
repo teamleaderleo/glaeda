@@ -1,0 +1,92 @@
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded anstyle-query v1.1.5
+  Downloaded utf8parse v0.2.2
+  Downloaded strsim v0.11.1
+  Downloaded heck v0.5.0
+  Downloaded errno v0.3.14
+  Downloaded is_terminal_polyfill v1.70.2
+  Downloaded itoa v1.0.18
+  Downloaded clap_lex v1.1.0
+  Downloaded colorchoice v1.0.5
+  Downloaded equivalent v1.0.2
+  Downloaded anstyle v1.0.14
+  Downloaded quote v1.0.47
+  Downloaded anstream v1.0.0
+  Downloaded anstyle-parse v1.0.0
+  Downloaded clap_derive v4.6.4
+  Downloaded zmij v1.0.23
+  Downloaded proc-macro2 v1.0.107
+  Downloaded ryu v1.0.23
+  Downloaded bitflags v2.13.1
+  Downloaded clap v4.6.4
+  Downloaded serde_derive v1.0.229
+  Downloaded serde_core v1.0.229
+  Downloaded serde_norway v0.9.42
+  Downloaded unicode-ident v1.0.24
+  Downloaded unsafe-libyaml-norway v0.2.15
+  Downloaded serde v1.0.229
+  Downloaded indexmap v2.14.0
+  Downloaded memchr v2.8.3
+  Downloaded hashbrown v0.17.1
+  Downloaded serde_json v1.0.151
+  Downloaded clap_builder v4.6.2
+  Downloaded syn v3.0.3
+  Downloaded rustix v1.1.4
+  Downloaded libc v0.2.189
+  Downloaded linux-raw-sys v0.12.1
+   Compiling proc-macro2 v1.0.107
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.47
+   Compiling serde_core v1.0.229
+    Checking utf8parse v0.2.2
+    Checking anstyle-parse v1.0.0
+   Compiling zmij v1.0.23
+    Checking is_terminal_polyfill v1.70.2
+    Checking colorchoice v1.0.5
+    Checking anstyle v1.0.14
+    Checking anstyle-query v1.1.5
+   Compiling serde v1.0.229
+    Checking anstream v1.0.0
+    Checking clap_lex v1.1.0
+    Checking itoa v1.0.18
+    Checking equivalent v1.0.2
+   Compiling rustix v1.1.4
+   Compiling heck v0.5.0
+    Checking hashbrown v0.17.1
+   Compiling syn v3.0.3
+   Compiling serde_json v1.0.151
+    Checking strsim v0.11.1
+    Checking clap_builder v4.6.2
+    Checking indexmap v2.14.0
+    Checking linux-raw-sys v0.12.1
+    Checking ryu v1.0.23
+    Checking bitflags v2.13.1
+    Checking memchr v2.8.3
+    Checking unsafe-libyaml-norway v0.2.15
+   Compiling serde_derive v1.0.229
+   Compiling clap_derive v4.6.4
+    Checking clap v4.6.4
+    Checking serde_norway v0.9.42
+    Checking smolrunner v0.1.0 (/home/runner/work/smolrunner/smolrunner)
+error: this function has too many arguments (8/7)
+   --> src/renderprove_vision_profile.rs:422:5
+    |
+422 | /     pub fn new(
+423 | |         profile_id: VerificationProfileId,
+424 | |         project_repository: RepositoryRef,
+425 | |         tested_source: TestedSourceIdentity,
+...   |
+430 | |         timeout: TimeoutPolicy,
+431 | |     ) -> Result<Self, RenderproveVisionProfileError> {
+    | |____________________________________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#too_many_arguments
+    = note: `-D clippy::too-many-arguments` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::too_many_arguments)]`
+
+error: could not compile `smolrunner` (lib) due to 1 previous error
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `smolrunner` (lib test) due to 1 previous error
+
+exit_status=101
