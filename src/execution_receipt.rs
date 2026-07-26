@@ -146,6 +146,11 @@ impl ExecutionReceipt {
     }
 
     #[must_use]
+    pub const fn operation(&self) -> &ExecutionReceiptOperation {
+        &self.operation
+    }
+
+    #[must_use]
     pub fn actions(&self) -> &[ExecutionReceiptAction] {
         &self.actions
     }
@@ -182,6 +187,7 @@ impl ExecutionReceiptProducer {
     fn new(version: &str) -> Result<Self, ExecutionReceiptError> {
         if version.is_empty()
             || version.len() > MAX_PRODUCER_VERSION_LEN
+            || !version.as_bytes()[0].is_ascii_alphanumeric()
             || !version
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+'))
@@ -627,8 +633,8 @@ pub fn decode_execution_receipt(input: &str) -> Result<ExecutionReceipt, Executi
             "execution receipt exceeds {MAX_EXECUTION_RECEIPT_BYTES} bytes"
         )));
     }
-    let wire: WireExecutionReceipt = serde_json::from_str(input).map_err(|error| {
-        ExecutionReceiptError::single(format!("execution receipt JSON is invalid: {error}"))
+    let wire: WireExecutionReceipt = serde_json::from_str(input).map_err(|_| {
+        ExecutionReceiptError::single("execution receipt JSON or schema is invalid")
     })?;
     wire.try_into()
 }
@@ -889,7 +895,7 @@ struct WireExecutionReceiptProducer {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(tag = "family", rename_all = "snake_case")]
+#[serde(tag = "family", rename_all = "snake_case", deny_unknown_fields)]
 enum WireExecutionReceiptOperation {
     HostPreparation {
         schema_version: u8,
