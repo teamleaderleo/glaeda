@@ -1,0 +1,31 @@
+name: Temporary host preparation receipt formatting
+
+on:
+  push:
+    branches:
+      - feat/host-preparation-receipt-mapper
+
+permissions:
+  contents: write
+
+jobs:
+  format:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: feat/host-preparation-receipt-mapper
+          show-progress: false
+      - name: Format and remove helper
+        run: |
+          rustup component add rustfmt
+          cargo fmt --all
+          rm .github/workflows/temporary-format-host-preparation-receipt.yml
+      - name: Commit exact rustfmt result
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Format host preparation receipt mapper"
+          git push origin HEAD:feat/host-preparation-receipt-mapper
