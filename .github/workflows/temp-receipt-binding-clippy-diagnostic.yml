@@ -1,0 +1,31 @@
+name: Temporary receipt binding Clippy diagnostic
+
+on:
+  pull_request:
+    branches: [main]
+    types: [synchronize, reopened]
+
+permissions:
+  contents: write
+
+jobs:
+  diagnose:
+    if: github.event.pull_request.head.ref == 'feat/host-preparation-receipt-binding'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/host-preparation-receipt-binding
+          fetch-depth: 0
+      - name: Capture complete Clippy output
+        run: |
+          set +e
+          cargo clippy --locked --all-targets --all-features -- -D warnings > .receipt-binding-clippy.log 2>&1
+          status=$?
+          rm .github/workflows/temp-receipt-binding-clippy-diagnostic.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Capture receipt binding Clippy failure"
+          git push origin HEAD:feat/host-preparation-receipt-binding
+          exit $status
