@@ -102,6 +102,21 @@ impl RuntimeDirectoryObservation {
     pub fn mode(&self) -> u32 {
         self.mode
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        path: impl Into<PathBuf>,
+        owner_uid: u32,
+        owner_gid: u32,
+        mode: u32,
+    ) -> Self {
+        Self {
+            path: path.into(),
+            owner_uid,
+            owner_gid,
+            mode,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -149,6 +164,45 @@ impl VerifiedRunnerUser {
     #[must_use]
     pub fn subordinate_gid_count(&self) -> u64 {
         self.subordinate_gid_count
+    }
+
+    pub(crate) fn from_fresh_account_observation(
+        context: &RunnerUserContext,
+        observed_group_gid: u32,
+        runtime: RuntimeDirectoryObservation,
+        subordinate_uid_start: u32,
+        subordinate_uid_count: u32,
+        subordinate_gid_start: u32,
+        subordinate_gid_count: u32,
+    ) -> Result<Self, RunnerUserVerificationError> {
+        if observed_group_gid != context.primary_gid() {
+            return Err(RunnerUserVerificationError::new(
+                RunnerUserVerificationErrorKind::IdentityMismatch,
+                "runner-user primary-group evidence does not match the requested identity",
+            ));
+        }
+        verify_runtime_directory_observation(context, &runtime)?;
+        let subordinate_uid_count = verify_exact_subordinate_range(
+            subordinate_uid_start,
+            subordinate_uid_count,
+            context.uid(),
+            "UID",
+        )?;
+        let subordinate_gid_count = verify_exact_subordinate_range(
+            subordinate_gid_start,
+            subordinate_gid_count,
+            context.primary_gid(),
+            "GID",
+        )?;
+        Ok(Self {
+            username: context.username().clone(),
+            uid: context.uid(),
+            primary_gid: context.primary_gid(),
+            home: context.home().to_owned(),
+            runtime_directory: runtime.path,
+            subordinate_uid_count,
+            subordinate_gid_count,
+        })
     }
 }
 
@@ -354,6 +408,62 @@ pub fn inspect_runtime_directory(
     })
 }
 
+fn verify_runtime_directory_observation(
+    context: &RunnerUserContext,
+    runtime: &RuntimeDirectoryObservation,
+) -> Result<(), RunnerUserVerificationError> {
+    if runtime.path != Path::new(context.runtime_directory()) {
+        return Err(RunnerUserVerificationError::new(
+            RunnerUserVerificationErrorKind::IdentityMismatch,
+            "runner-user runtime-directory evidence names another path",
+        ));
+    }
+    if runtime.owner_uid != context.uid() {
+        return Err(RunnerUserVerificationError::new(
+            RunnerUserVerificationErrorKind::RuntimeDirectoryOwner,
+            "runner-user runtime directory has an unexpected owner",
+        ));
+    }
+    if runtime.owner_gid != context.primary_gid() {
+        return Err(RunnerUserVerificationError::new(
+            RunnerUserVerificationErrorKind::RuntimeDirectoryGroup,
+            "runner-user runtime directory has an unexpected group",
+        ));
+    }
+    if runtime.mode != 0o700 {
+        return Err(RunnerUserVerificationError::new(
+            RunnerUserVerificationErrorKind::RuntimeDirectoryMode,
+            "runner-user runtime directory does not have mode 0700",
+        ));
+    }
+    Ok(())
+}
+
+fn verify_exact_subordinate_range(
+    start: u32,
+    count: u32,
+    own_id: u32,
+    label: &str,
+) -> Result<u64, RunnerUserVerificationError> {
+    let end_exclusive = u64::from(start) + u64::from(count);
+    if start == 0
+        || u64::from(count) < MIN_SUBORDINATE_ID_COUNT
+        || end_exclusive > u64::from(u32::MAX) + 1
+    {
+        return Err(RunnerUserVerificationError::new(
+            RunnerUserVerificationErrorKind::MalformedSubordinateRange,
+            format!("runner-user subordinate {label} range is invalid"),
+        ));
+    }
+    if u64::from(own_id) >= u64::from(start) && u64::from(own_id) < end_exclusive {
+        return Err(RunnerUserVerificationError::new(
+            RunnerUserVerificationErrorKind::SubordinateIdentityOverlap,
+            format!("runner-user subordinate {label} range overlaps its own identity"),
+        ));
+    }
+    Ok(u64::from(count))
+}
+
 /// Verify exact account, runtime-directory, and subordinate-ID evidence for one runner user.
 ///
 /// # Errors
@@ -383,30 +493,7 @@ pub fn verify_runner_user(
             "runner-user account does not use the reviewed nologin shell",
         ));
     }
-    if runtime.path != Path::new(context.runtime_directory()) {
-        return Err(RunnerUserVerificationError::new(
-            RunnerUserVerificationErrorKind::IdentityMismatch,
-            "runner-user runtime-directory evidence names another path",
-        ));
-    }
-    if runtime.owner_uid != context.uid() {
-        return Err(RunnerUserVerificationError::new(
-            RunnerUserVerificationErrorKind::RuntimeDirectoryOwner,
-            "runner-user runtime directory has an unexpected owner",
-        ));
-    }
-    if runtime.owner_gid != context.primary_gid() {
-        return Err(RunnerUserVerificationError::new(
-            RunnerUserVerificationErrorKind::RuntimeDirectoryGroup,
-            "runner-user runtime directory has an unexpected group",
-        ));
-    }
-    if runtime.mode != 0o700 {
-        return Err(RunnerUserVerificationError::new(
-            RunnerUserVerificationErrorKind::RuntimeDirectoryMode,
-            "runner-user runtime directory does not have mode 0700",
-        ));
-    }
+    verify_runtime_directory_observation(context, runtime)?;
 
     let subordinate_uid_count =
         verify_subordinate_capacity(subordinate_uids, context.uid(), "UID")?;
