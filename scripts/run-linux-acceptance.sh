@@ -39,21 +39,36 @@ cleanup() {
 trap cleanup EXIT
 
 rustup target add "$rust_target"
+# Build both acceptance crates against the same exact static target before entering the guests.
 env \
   "$linker_variable=musl-gcc" \
   CARGO_TARGET_DIR="$target_dir" \
-  cargo test --locked --test linux_acceptance --target "$rust_target" --no-run
+  cargo test --locked \
+    --test linux_acceptance \
+    --test host_prepare_acceptance \
+    --target "$rust_target" \
+    --no-run
 
-acceptance_binary=$(find "$target_dir/$rust_target/debug/deps" \
-  -maxdepth 1 \
-  -type f \
-  -name 'linux_acceptance-*' \
-  -perm -111 \
-  -print \
-  -quit)
+find_acceptance_binary() {
+  local test_name=$1
+  find "$target_dir/$rust_target/debug/deps" \
+    -maxdepth 1 \
+    -type f \
+    -name "${test_name}-*" \
+    -perm -111 \
+    -print \
+    -quit
+}
 
-if [[ -z "$acceptance_binary" ]]; then
+linux_acceptance_binary=$(find_acceptance_binary linux_acceptance)
+host_prepare_acceptance_binary=$(find_acceptance_binary host_prepare_acceptance)
+
+if [[ -z "$linux_acceptance_binary" ]]; then
   printf 'could not locate the compiled Linux acceptance test binary\n' >&2
+  exit 1
+fi
+if [[ -z "$host_prepare_acceptance_binary" ]]; then
+  printf 'could not locate the compiled host-prepare acceptance test binary\n' >&2
   exit 1
 fi
 
@@ -74,7 +89,8 @@ for image in "${images[@]}"; do
   docker run --rm \
     --tmpfs /run:rw,nosuid,nodev,mode=0755 \
     --tmpfs /tmp:rw,nosuid,nodev,mode=1777 \
-    --mount "type=bind,src=$acceptance_binary,dst=/usr/local/bin/smolrunner-linux-acceptance,readonly" \
+    --mount "type=bind,src=$linux_acceptance_binary,dst=/usr/local/bin/smolrunner-linux-acceptance,readonly" \
+    --mount "type=bind,src=$host_prepare_acceptance_binary,dst=/usr/local/bin/smolrunner-host-prepare-acceptance,readonly" \
     --env SMOLRUNNER_LINUX_ACCEPTANCE=1 \
     --env "SMOLRUNNER_EXPECTED_OS=$expected_os" \
     "$image" \
@@ -92,5 +108,6 @@ for image in "${images[@]}"; do
         util-linux
       rm -rf /var/lib/apt/lists/*
       /usr/local/bin/smolrunner-linux-acceptance --test-threads=1 --nocapture
+      /usr/local/bin/smolrunner-host-prepare-acceptance --test-threads=1 --nocapture
     '
 done
