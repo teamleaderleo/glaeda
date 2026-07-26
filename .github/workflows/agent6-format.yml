@@ -1,0 +1,51 @@
+name: Agent 6 queue formatting
+
+on:
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  format:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.head_ref }}
+          show-progress: false
+
+      - name: Format queue contract
+        run: cargo fmt --all
+
+      - name: Commit only formatter output
+        run: |
+          changed="$(git diff --name-only)"
+          while IFS= read -r path; do
+            case "$path" in
+              src/personal_worker_queue.rs|tests/personal_worker_queue_contract.rs) ;;
+              '') ;;
+              *) printf 'unexpected formatter path: %s\n' "$path" >&2; exit 1 ;;
+            esac
+          done <<EOF
+          $changed
+          EOF
+          if [ -n "$changed" ]; then
+            git config user.name 'smolrunner-agent-6'
+            git config user.email 'smolrunner-agent-6@users.noreply.github.com'
+            git add src/personal_worker_queue.rs tests/personal_worker_queue_contract.rs
+            git commit -m 'Format personal worker queue contract'
+            git push origin HEAD:${{ github.head_ref }}
+          fi
+
+      - name: Check formatted queue contract
+        run: cargo check --locked --all-targets --all-features
+
+      - name: Lint formatted queue contract
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Test formatted queue contract
+        run: cargo test --locked --all-targets --all-features
