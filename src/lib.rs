@@ -9,6 +9,8 @@ pub mod doctor;
 pub mod durable_journal;
 #[cfg(target_os = "linux")]
 pub mod durable_lane_execution;
+/// Pure exact-commit runner-to-publisher handoff contracts and reports.
+pub mod exact_commit_handoff;
 #[cfg_attr(test, allow(clippy::too_many_arguments))]
 pub mod execution_admission;
 pub mod execution_receipt;
