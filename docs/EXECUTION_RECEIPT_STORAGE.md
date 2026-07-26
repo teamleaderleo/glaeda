@@ -18,6 +18,8 @@ Receipts use their own managed directory. They are not placed beside journal fil
 - malformed, noncanonical, identity-mismatched, or invalid existing bytes return `corrupt_state`;
 - existing state is never replaced.
 
+A duplicate result is not inferred from filename existence. The existing bytes are decoded, rebound to the requested execution ID, canonically re-encoded, and compared as typed receipt semantics before replay is accepted.
+
 The Linux store uses the existing installation-local writer lock, a private synchronized temporary file, no-replace rename, and parent-directory synchronization.
 
 ## Read-back contract
