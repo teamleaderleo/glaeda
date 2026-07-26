@@ -182,9 +182,9 @@ impl ExecutionReceiptProducer {
     fn new(version: &str) -> Result<Self, ExecutionReceiptError> {
         if version.is_empty()
             || version.len() > MAX_PRODUCER_VERSION_LEN
-            || !version.bytes().all(|byte| {
-                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+')
-            })
+            || !version
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+'))
         {
             return Err(ExecutionReceiptError::single(
                 "producer version must be a bounded ASCII version token",
@@ -247,8 +247,7 @@ impl ExecutionReceiptAction {
         let failure_code = failure_code.map(ReceiptFailureCode::parse).transpose()?;
         let requires_code = matches!(
             outcome,
-            ExecutionReceiptActionOutcome::Failed
-                | ExecutionReceiptActionOutcome::RollbackFailed
+            ExecutionReceiptActionOutcome::Failed | ExecutionReceiptActionOutcome::RollbackFailed
         );
         if requires_code != failure_code.is_some() {
             return Err(ExecutionReceiptError::single(
@@ -665,8 +664,7 @@ fn validate_disposition(
     let has_failure = actions.iter().any(|action| {
         matches!(
             action.outcome,
-            ExecutionReceiptActionOutcome::Failed
-                | ExecutionReceiptActionOutcome::RollbackFailed
+            ExecutionReceiptActionOutcome::Failed | ExecutionReceiptActionOutcome::RollbackFailed
         )
     });
     match disposition {
@@ -732,7 +730,9 @@ fn canonical_timestamp(value: &str) -> bool {
     {
         return false;
     }
-    for index in [0_usize, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18, 20, 21, 22] {
+    for index in [
+        0_usize, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18, 20, 21, 22,
+    ] {
         if !bytes[index].is_ascii_digit() {
             return false;
         }

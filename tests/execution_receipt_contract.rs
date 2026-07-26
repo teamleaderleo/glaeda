@@ -138,12 +138,8 @@ fn failed_receipt_requires_typed_codes_and_derives_all_counts() {
                 Some("rollback-failed"),
             ),
         ],
-        ExecutionReceiptContinuation::new(
-            false,
-            [] as [&str; 0],
-            ["reobserve-host-state"],
-        )
-        .expect("continuation"),
+        ExecutionReceiptContinuation::new(false, [] as [&str; 0], ["reobserve-host-state"])
+            .expect("continuation"),
     )
     .expect("receipt");
 
@@ -238,12 +234,8 @@ fn timestamps_reject_invalid_calendar_values_offsets_precision_and_order() {
 
 #[test]
 fn disposition_and_continuation_must_match_terminal_actions() {
-    assert!(
-        ExecutionReceiptContinuation::new(true, [] as [&str; 0], [] as [&str; 0]).is_err()
-    );
-    assert!(
-        ExecutionReceiptContinuation::new(false, ["barrier"], [] as [&str; 0]).is_err()
-    );
+    assert!(ExecutionReceiptContinuation::new(true, [] as [&str; 0], [] as [&str; 0]).is_err());
+    assert!(ExecutionReceiptContinuation::new(false, ["barrier"], [] as [&str; 0]).is_err());
     assert!(
         build_receipt(
             ExecutionReceiptDisposition::Completed,
@@ -316,12 +308,8 @@ fn duplicate_and_excessive_action_or_continuation_sets_fail_closed() {
         .is_err()
     );
     assert!(
-        ExecutionReceiptContinuation::new(
-            true,
-            ["duplicate", "duplicate"],
-            [] as [&str; 0]
-        )
-        .is_err()
+        ExecutionReceiptContinuation::new(true, ["duplicate", "duplicate"], [] as [&str; 0])
+            .is_err()
     );
 }
 
@@ -365,12 +353,8 @@ fn encoded_receipt_contains_only_bounded_public_evidence() {
             ExecutionReceiptActionOutcome::Failed,
             Some("lane-process-failed"),
         )],
-        ExecutionReceiptContinuation::new(
-            false,
-            [] as [&str; 0],
-            ["reobserve-host-state"],
-        )
-        .expect("continuation"),
+        ExecutionReceiptContinuation::new(false, [] as [&str; 0], ["reobserve-host-state"])
+            .expect("continuation"),
     )
     .expect("receipt");
     let encoded = encode_execution_receipt(&receipt).expect("encoded");
