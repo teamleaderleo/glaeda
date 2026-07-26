@@ -79,6 +79,8 @@ pub mod podman_preview_state;
 pub mod preview;
 pub mod process;
 pub mod renderprove_execution;
+#[cfg(target_os = "linux")]
+pub mod renderprove_subprocess;
 pub mod renderprove_verification;
 pub mod renderprove_vision_profile;
 pub mod renderprove_vision_result;

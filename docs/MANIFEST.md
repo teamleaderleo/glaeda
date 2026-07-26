@@ -44,6 +44,10 @@ The pure adapter in `renderprove_execution` binds that contract to one fixed run
 
 A typed execution observation retains the exact private `CommandSpec` used for execution and the explicit normalized absolute working directory. Receipt binding compares the full private specification before checking the redacted argv and environment-key views, so changing the Renderprove checkout, evidence directory, wrapper path, home, runtime directory, or another private value fails closed even when the public command shape is unchanged. The private specification, working directory, raw stdout, and raw stderr are excluded from receipt serialization and redacted from `Debug` output.
 
+The Linux-only `renderprove_subprocess` adapter accepts only an already constructed `RenderproveCommand`. It verifies the exact physical working directory and every required executable before and after execution, clears the inherited environment, invokes the reviewed `CommandSpec` directly without a shell, applies fixed stdout and stderr limits, and returns one `RenderproveExecutionObservation`. Spawn, status, filesystem-identity, output-capture, and output-limit failures are typed and path-minimised.
+
+This subprocess slice grants no generic command selection, browser or container authority, evidence reading, artifact export, networking, credentials, deployment, publication, cancellation, or cleanup authority.
+
 ### `limits`
 
 - `memory`: positive integer followed by `KiB`, `MiB`, or `GiB`.

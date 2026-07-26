@@ -49,7 +49,7 @@ pub enum CommandValue {
 }
 
 impl CommandValue {
-    fn exposed(&self) -> &str {
+    pub(crate) fn exposed(&self) -> &str {
         match self {
             Self::Plain(value) => value,
             Self::Secret(value) => value.expose(),
@@ -63,7 +63,7 @@ impl CommandValue {
         }
     }
 
-    fn secret(&self) -> Option<&str> {
+    pub(crate) fn secret(&self) -> Option<&str> {
         match self {
             Self::Plain(_) => None,
             Self::Secret(value) if value.expose().is_empty() => None,
