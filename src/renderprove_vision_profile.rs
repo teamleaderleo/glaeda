@@ -17,8 +17,7 @@ pub const RENDERPROVE_VISION_COMMAND_ID: &str = "renderprove.vision-check.v1";
 pub const RENDERPROVE_VISION_COMMAND_CONTRACT_DIGEST: &str =
     "sha256:8025df77cfcfd743f3007fd129239bed417ff2095b9f744d23bb7c0e5ec56e4f";
 pub const RENDERPROVE_VISION_REQUEST_SCHEMA: &str = "vision-request-v1";
-pub const RENDERPROVE_VISION_REQUEST_SCHEMA_URI: &str =
-    "https://raw.githubusercontent.com/teamleaderleo/renderprove/main/schema/vision-request-v1.schema.json";
+pub const RENDERPROVE_VISION_REQUEST_SCHEMA_URI: &str = "https://raw.githubusercontent.com/teamleaderleo/renderprove/main/schema/vision-request-v1.schema.json";
 pub const RENDERPROVE_VISION_PROMPT_POLICY: &str = "vision-prompt-policy-v1";
 pub const RENDERPROVE_VISION_CANONICALIZATION_PROFILE: &str = "rgba8-png-zlib9-v1";
 pub const MAX_VISION_SCREENSHOT_BYTES: u64 = 8_000_000;
@@ -191,7 +190,12 @@ impl RenderproveVisionInputSlot {
         bytes: u64,
         digest: Sha256Digest,
     ) -> Result<Self, RenderproveVisionProfileError> {
-        Self::new(RenderproveVisionInputKind::ScreenshotPng, path, bytes, digest)
+        Self::new(
+            RenderproveVisionInputKind::ScreenshotPng,
+            path,
+            bytes,
+            digest,
+        )
     }
 
     pub fn operator_brief_utf8(
@@ -310,10 +314,7 @@ impl RenderproveVisionInputSlots {
             ));
         }
         let mut paths = BTreeSet::new();
-        for slot in [&screenshot, &brief]
-            .into_iter()
-            .chain(receipt.as_ref())
-        {
+        for slot in [&screenshot, &brief].into_iter().chain(receipt.as_ref()) {
             if !paths.insert(slot.path.clone()) {
                 return Err(RenderproveVisionProfileError::new(
                     "inputs",
@@ -594,11 +595,7 @@ impl RenderproveVisionPreviewEvidence {
         })?;
 
         require_preview_string(object, "$schema", RENDERPROVE_VISION_REQUEST_SCHEMA_URI)?;
-        require_preview_string(
-            object,
-            "schemaVersion",
-            RENDERPROVE_VISION_REQUEST_SCHEMA,
-        )?;
+        require_preview_string(object, "schemaVersion", RENDERPROVE_VISION_REQUEST_SCHEMA)?;
         require_preview_string(object, "mode", "dry-run")?;
         require_preview_string(object, "authority", "advisory")?;
         require_preview_string(object, "commandContractId", RENDERPROVE_VISION_COMMAND_ID)?;
@@ -637,8 +634,8 @@ impl RenderproveVisionPreviewEvidence {
                 "must contain one lowercase SHA-256 digest",
             ));
         }
-        let request_digest = Sha256Digest::parse(&format!("sha256:{request_digest}"))
-            .map_err(|_| {
+        let request_digest =
+            Sha256Digest::parse(&format!("sha256:{request_digest}")).map_err(|_| {
                 RenderproveVisionProfileError::new(
                     "preview.requestDigest",
                     "invalid_request_digest",
@@ -693,11 +690,7 @@ pub struct RenderproveVisionProfileError {
 }
 
 impl RenderproveVisionProfileError {
-    fn new(
-        field: impl Into<String>,
-        code: impl Into<String>,
-        problem: impl Into<String>,
-    ) -> Self {
+    fn new(field: impl Into<String>, code: impl Into<String>, problem: impl Into<String>) -> Self {
         Self {
             field: field.into(),
             code: code.into(),

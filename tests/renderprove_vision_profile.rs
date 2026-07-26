@@ -19,32 +19,21 @@ fn tool() -> RenderproveVisionToolIdentity {
         commit("ab"),
         digest("cd"),
         RepositoryCommandId::parse(RENDERPROVE_VISION_COMMAND_ID).expect("command ID"),
-        Sha256Digest::parse(RENDERPROVE_VISION_COMMAND_CONTRACT_DIGEST)
-            .expect("contract digest"),
+        Sha256Digest::parse(RENDERPROVE_VISION_COMMAND_CONTRACT_DIGEST).expect("contract digest"),
     )
     .expect("tool identity")
 }
 
 fn slots(with_receipt: bool) -> RenderproveVisionInputSlots {
-    let screenshot = RenderproveVisionInputSlot::screenshot_png(
-        "evidence/screen.png",
-        1_024,
-        digest("11"),
-    )
-    .expect("screenshot");
-    let brief = RenderproveVisionInputSlot::operator_brief_utf8(
-        "evidence/brief.txt",
-        120,
-        digest("22"),
-    )
-    .expect("brief");
+    let screenshot =
+        RenderproveVisionInputSlot::screenshot_png("evidence/screen.png", 1_024, digest("11"))
+            .expect("screenshot");
+    let brief =
+        RenderproveVisionInputSlot::operator_brief_utf8("evidence/brief.txt", 120, digest("22"))
+            .expect("brief");
     let receipt = with_receipt.then(|| {
-        RenderproveVisionInputSlot::receipt_v1(
-            "evidence/receipt.json",
-            2_048,
-            digest("33"),
-        )
-        .expect("receipt")
+        RenderproveVisionInputSlot::receipt_v1("evidence/receipt.json", 2_048, digest("33"))
+            .expect("receipt")
     });
     RenderproveVisionInputSlots::new(screenshot, brief, receipt).expect("input slots")
 }
@@ -106,9 +95,15 @@ fn preview_json(contract_digest: &str, request_digest: &str) -> Vec<u8> {
 fn separates_project_command_from_external_renderprove_tool() {
     let profile = profile(true);
     assert_eq!(profile.project_repository().as_str(), "example/project");
-    assert_eq!(profile.project_command().repository().as_str(), "example/project");
+    assert_eq!(
+        profile.project_command().repository().as_str(),
+        "example/project"
+    );
     assert_eq!(profile.tool().repository().as_str(), RENDERPROVE_REPOSITORY);
-    assert_ne!(profile.project_command().repository(), profile.tool().repository());
+    assert_ne!(
+        profile.project_command().repository(),
+        profile.tool().repository()
+    );
 
     let public = serde_json::to_string(&profile).expect("public profile");
     for private in [
@@ -169,8 +164,7 @@ fn rejects_tool_repository_command_and_contract_drift() {
             commit("ab"),
             digest("cd"),
             RepositoryCommandId::parse(RENDERPROVE_VISION_COMMAND_ID).expect("command"),
-            Sha256Digest::parse(RENDERPROVE_VISION_COMMAND_CONTRACT_DIGEST)
-                .expect("contract"),
+            Sha256Digest::parse(RENDERPROVE_VISION_COMMAND_CONTRACT_DIGEST).expect("contract"),
         )
         .is_err()
     );
@@ -180,8 +174,7 @@ fn rejects_tool_repository_command_and_contract_drift() {
             commit("ab"),
             digest("cd"),
             RepositoryCommandId::parse("renderprove.vision-check.v2").expect("command"),
-            Sha256Digest::parse(RENDERPROVE_VISION_COMMAND_CONTRACT_DIGEST)
-                .expect("contract"),
+            Sha256Digest::parse(RENDERPROVE_VISION_COMMAND_CONTRACT_DIGEST).expect("contract"),
         )
         .is_err()
     );
@@ -232,8 +225,8 @@ fn rejects_unsafe_paths_duplicate_paths_and_input_exhaustion() {
 
     let screenshot =
         RenderproveVisionInputSlot::screenshot_png("same", 1, digest("11")).expect("slot");
-    let brief = RenderproveVisionInputSlot::operator_brief_utf8("same", 1, digest("22"))
-        .expect("slot");
+    let brief =
+        RenderproveVisionInputSlot::operator_brief_utf8("same", 1, digest("22")).expect("slot");
     assert!(RenderproveVisionInputSlots::new(screenshot, brief, None).is_err());
 }
 
@@ -271,12 +264,9 @@ fn validates_preview_contract_and_request_identity() {
         .strip_prefix("sha256:")
         .expect("prefix");
     let bytes = preview_json(contract_hex, &"ab".repeat(32));
-    let evidence = RenderproveVisionPreviewEvidence::from_public_preview(
-        &bytes,
-        digest("55"),
-        &tool,
-    )
-    .expect("preview evidence");
+    let evidence =
+        RenderproveVisionPreviewEvidence::from_public_preview(&bytes, digest("55"), &tool)
+            .expect("preview evidence");
     assert_eq!(
         evidence.request_digest().as_str(),
         format!("sha256:{}", "ab".repeat(32))
@@ -285,12 +275,8 @@ fn validates_preview_contract_and_request_identity() {
 
     let drifted = preview_json(&"cd".repeat(32), &"ab".repeat(32));
     assert!(
-        RenderproveVisionPreviewEvidence::from_public_preview(
-            &drifted,
-            digest("55"),
-            &tool,
-        )
-        .is_err()
+        RenderproveVisionPreviewEvidence::from_public_preview(&drifted, digest("55"), &tool,)
+            .is_err()
     );
 }
 
@@ -301,8 +287,7 @@ fn refuses_invalid_utf8_json_and_preview_overflow() {
             .is_err()
     );
     assert!(
-        RenderproveVisionPreviewEvidence::from_public_preview(b"{", digest("55"), &tool())
-            .is_err()
+        RenderproveVisionPreviewEvidence::from_public_preview(b"{", digest("55"), &tool()).is_err()
     );
     assert!(
         RenderproveVisionPreviewEvidence::from_public_preview(
