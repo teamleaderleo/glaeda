@@ -56,7 +56,7 @@ pub enum RenderproveVisionEvidenceDisclosure {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct RenderproveVisionEvidenceCoverage {
-    pub public_preview: RenderproveVisionEvidenceDisclosure,
+    pub public_preview_evidence: RenderproveVisionEvidenceDisclosure,
     pub screenshot_pixels: RenderproveVisionEvidenceDisclosure,
     pub brief_contents: RenderproveVisionEvidenceDisclosure,
     pub receipt_contents: RenderproveVisionEvidenceDisclosure,
@@ -68,7 +68,7 @@ pub struct RenderproveVisionEvidenceCoverage {
 impl RenderproveVisionEvidenceCoverage {
     const fn for_preview(preview_present: bool) -> Self {
         Self {
-            public_preview: if preview_present {
+            public_preview_evidence: if preview_present {
                 RenderproveVisionEvidenceDisclosure::Included
             } else {
                 RenderproveVisionEvidenceDisclosure::Unavailable

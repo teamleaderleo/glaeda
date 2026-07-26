@@ -281,6 +281,40 @@ fn validates_preview_contract_and_request_identity() {
 }
 
 #[test]
+fn rejects_duplicate_and_unknown_top_level_preview_fields() {
+    let tool = tool();
+    let contract_hex = RENDERPROVE_VISION_COMMAND_CONTRACT_DIGEST
+        .strip_prefix("sha256:")
+        .expect("prefix");
+    let valid =
+        String::from_utf8(preview_json(contract_hex, &"ab".repeat(32))).expect("UTF-8 preview");
+    let duplicate = valid.replacen(
+        "\"authority\":\"advisory\"",
+        "\"authority\":\"advisory\",\"authority\":\"advisory\"",
+        1,
+    );
+    assert!(
+        RenderproveVisionPreviewEvidence::from_public_preview(
+            duplicate.as_bytes(),
+            digest("55"),
+            &tool,
+        )
+        .is_err()
+    );
+
+    let mut unknown: serde_json::Value = serde_json::from_str(&valid).expect("JSON");
+    unknown
+        .as_object_mut()
+        .expect("object")
+        .insert("unexpected".to_owned(), serde_json::Value::Bool(true));
+    let unknown = serde_json::to_vec(&unknown).expect("JSON");
+    assert!(
+        RenderproveVisionPreviewEvidence::from_public_preview(&unknown, digest("55"), &tool,)
+            .is_err()
+    );
+}
+
+#[test]
 fn refuses_invalid_utf8_json_and_preview_overflow() {
     assert!(
         RenderproveVisionPreviewEvidence::from_public_preview(&[0xff], digest("55"), &tool())

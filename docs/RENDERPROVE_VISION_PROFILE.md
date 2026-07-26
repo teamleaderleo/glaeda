@@ -82,7 +82,7 @@ The caller supplies the content digest of the exact retained preview bytes throu
 
 `finalize_renderprove_vision_result` refuses profile, admission, source, command, or tool drift. A successful result requires a successful process, completed cleanup, and a validated preview. Missing output becomes `malformed_preview`; process, timeout, output-limit, identity, and cleanup failures retain stable codes without raw diagnostics.
 
-The public result includes fixed evidence coverage. It identifies the public preview as included or unavailable and declares screenshot pixels, brief contents, receipt contents, process output, environment, and credentials omitted. A failed packet process cannot claim a validated preview.
+The public result includes fixed evidence coverage. It identifies the public preview evidence as included or unavailable and declares screenshot pixels, brief contents, receipt contents, process output, environment, and credentials omitted. A failed packet process cannot claim a validated preview.
 
 ## Private packet boundary
 

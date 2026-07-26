@@ -126,7 +126,7 @@ fn finalizes_success_against_exact_admission_and_profile_identities() {
     );
     assert!(result.preview().is_some());
     assert_eq!(
-        result.coverage().public_preview,
+        result.coverage().public_preview_evidence,
         RenderproveVisionEvidenceDisclosure::Included
     );
     assert_eq!(
@@ -207,7 +207,7 @@ fn derives_stable_failure_dispositions_without_private_diagnostics() {
         }
     );
     assert_eq!(
-        result.coverage().public_preview,
+        result.coverage().public_preview_evidence,
         RenderproveVisionEvidenceDisclosure::Unavailable
     );
 

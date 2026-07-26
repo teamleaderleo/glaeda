@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::path::{Component, PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::artifact::{CommitId, RepositoryRef, Sha256Digest};
@@ -556,6 +556,33 @@ impl fmt::Debug for RenderproveVisionCommandPlan {
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RenderproveVisionPreviewEnvelope {
+    #[serde(rename = "$schema")]
+    schema: String,
+    schema_version: String,
+    mode: String,
+    authority: String,
+    command_contract_id: String,
+    command_contract_digest: String,
+    prompt_policy_version: String,
+    canonicalization_profile: String,
+    request_digest: String,
+    #[serde(rename = "inputs")]
+    _inputs: serde_json::Map<String, Value>,
+    #[serde(rename = "receiptSummary")]
+    _receipt_summary: Value,
+    #[serde(rename = "includedFactNames")]
+    _included_fact_names: Vec<String>,
+    #[serde(rename = "exclusions")]
+    _exclusions: Vec<String>,
+    #[serde(rename = "promptSafety")]
+    _prompt_safety: serde_json::Map<String, Value>,
+    #[serde(rename = "limits")]
+    _limits: serde_json::Map<String, Value>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RenderproveVisionPreviewEvidence {
     schema_version: &'static str,
@@ -594,54 +621,51 @@ impl RenderproveVisionPreviewEvidence {
                 "must be valid UTF-8",
             )
         })?;
-        let value: Value = serde_json::from_str(text).map_err(|_| {
-            RenderproveVisionProfileError::new(
-                "preview",
-                "invalid_preview_json",
-                "must be valid JSON",
-            )
-        })?;
-        let object = value.as_object().ok_or_else(|| {
-            RenderproveVisionProfileError::new(
-                "preview",
-                "invalid_preview_shape",
-                "must be a JSON object",
-            )
-        })?;
+        let preview: RenderproveVisionPreviewEnvelope =
+            serde_json::from_str(text).map_err(|_| {
+                RenderproveVisionProfileError::new(
+                    "preview",
+                    "invalid_preview_json",
+                    "must be one exact top-level vision-request-v1 JSON object",
+                )
+            })?;
 
-        require_preview_string(object, "$schema", RENDERPROVE_VISION_REQUEST_SCHEMA_URI)?;
-        require_preview_string(object, "schemaVersion", RENDERPROVE_VISION_REQUEST_SCHEMA)?;
-        require_preview_string(object, "mode", "dry-run")?;
-        require_preview_string(object, "authority", "advisory")?;
-        require_preview_string(object, "commandContractId", RENDERPROVE_VISION_COMMAND_ID)?;
         require_preview_string(
-            object,
+            "$schema",
+            &preview.schema,
+            RENDERPROVE_VISION_REQUEST_SCHEMA_URI,
+        )?;
+        require_preview_string(
+            "schemaVersion",
+            &preview.schema_version,
+            RENDERPROVE_VISION_REQUEST_SCHEMA,
+        )?;
+        require_preview_string("mode", &preview.mode, "dry-run")?;
+        require_preview_string("authority", &preview.authority, "advisory")?;
+        require_preview_string(
+            "commandContractId",
+            &preview.command_contract_id,
+            RENDERPROVE_VISION_COMMAND_ID,
+        )?;
+        require_preview_string(
             "commandContractDigest",
+            &preview.command_contract_digest,
             tool.command_contract_digest()
                 .as_str()
                 .strip_prefix("sha256:")
                 .expect("validated SHA-256 digest has prefix"),
         )?;
         require_preview_string(
-            object,
             "promptPolicyVersion",
+            &preview.prompt_policy_version,
             RENDERPROVE_VISION_PROMPT_POLICY,
         )?;
         require_preview_string(
-            object,
             "canonicalizationProfile",
+            &preview.canonicalization_profile,
             RENDERPROVE_VISION_CANONICALIZATION_PROFILE,
         )?;
-        let request_digest = object
-            .get("requestDigest")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                RenderproveVisionProfileError::new(
-                    "preview.requestDigest",
-                    "missing_request_digest",
-                    "must contain one lowercase SHA-256 digest",
-                )
-            })?;
+        let request_digest = preview.request_digest.as_str();
         if request_digest.len() != 64 || !request_digest.bytes().all(is_lower_hex) {
             return Err(RenderproveVisionProfileError::new(
                 "preview.requestDigest",
@@ -679,11 +703,11 @@ impl RenderproveVisionPreviewEvidence {
 }
 
 fn require_preview_string(
-    object: &serde_json::Map<String, Value>,
     field: &'static str,
+    actual: &str,
     expected: &str,
 ) -> Result<(), RenderproveVisionProfileError> {
-    if object.get(field).and_then(Value::as_str) != Some(expected) {
+    if actual != expected {
         return Err(RenderproveVisionProfileError::new(
             format!("preview.{field}"),
             "preview_identity_mismatch",
