@@ -25,6 +25,7 @@ pub enum RecoveryArea {
     Project,
     Resources,
     Journals,
+    Receipts,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -145,6 +146,8 @@ pub fn inspect_orphans(
     inspect_directory_owner(&resources, "resources directory", root_owner)?;
     let journals = open_directory_at(&installation, "journals", "journals directory")?;
     inspect_directory_owner(&journals, "journals directory", root_owner)?;
+    let receipts = open_directory_at(&installation, "receipts", "receipts directory")?;
+    inspect_directory_owner(&receipts, "receipts directory", root_owner)?;
 
     let mut findings = Vec::new();
     let mut truncated = false;
@@ -168,6 +171,15 @@ pub fn inspect_orphans(
         scan_directory(
             &journals,
             RecoveryArea::Journals,
+            root_uid,
+            &mut findings,
+            &mut truncated,
+        )?;
+    }
+    if !truncated {
+        scan_directory(
+            &receipts,
+            RecoveryArea::Receipts,
             root_uid,
             &mut findings,
             &mut truncated,
@@ -396,6 +408,7 @@ const fn area_rank(area: RecoveryArea) -> u8 {
         RecoveryArea::Project => 0,
         RecoveryArea::Resources => 1,
         RecoveryArea::Journals => 2,
+        RecoveryArea::Receipts => 3,
     }
 }
 
@@ -498,9 +511,14 @@ mod tests {
             &journals.join(".smolrunner-tmp-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
             &vec![0_u8; MAX_STATE_DOCUMENT_BYTES + 1],
         );
+        let receipts = root.installation().join("receipts");
+        private_write(
+            &receipts.join(".smolrunner-tmp-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            b"receipt",
+        );
 
         let report = inspect_orphans(root.path(), &installation_id()).expect("inspect orphans");
-        assert_eq!(report.findings().len(), 4);
+        assert_eq!(report.findings().len(), 5);
         assert!(
             report
                 .findings()
@@ -529,6 +547,12 @@ mod tests {
                 .findings()
                 .iter()
                 .any(|finding| { finding.concerns().contains(&RecoveryConcern::Oversized) })
+        );
+        assert!(
+            report
+                .findings()
+                .iter()
+                .any(|finding| finding.area() == RecoveryArea::Receipts)
         );
     }
 
