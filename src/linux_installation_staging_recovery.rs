@@ -21,6 +21,7 @@ const FILE_FLAGS: OFlags = OFlags::RDONLY
 const STAGING_DIRECTORY: &str = "staging";
 const RESOURCES_DIRECTORY: &str = "resources";
 const JOURNALS_DIRECTORY: &str = "journals";
+const RECEIPTS_DIRECTORY: &str = "receipts";
 const PROJECT_FILE: &str = "project.json";
 const MAX_STAGED_INSTALLATIONS: usize = 1_024;
 const MAX_STAGE_ENTRIES: usize = 16;
@@ -46,6 +47,8 @@ pub enum StagedInstallationConcern {
     UnsafeResources,
     MissingJournals,
     UnsafeJournals,
+    MissingReceipts,
+    UnsafeReceipts,
     MissingProject,
     UnsafeProject,
     ProjectHardLinked,
@@ -70,6 +73,7 @@ impl StagedInstallationConcern {
                 | Self::UnexpectedEntry
                 | Self::UnsafeResources
                 | Self::UnsafeJournals
+                | Self::UnsafeReceipts
                 | Self::UnsafeProject
                 | Self::ProjectHardLinked
                 | Self::ProjectWrongMode
