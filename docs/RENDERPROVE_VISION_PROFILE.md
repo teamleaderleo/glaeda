@@ -55,7 +55,7 @@ The first executor must resolve the `renderprove` program to one explicit absolu
 - local commits forbidden;
 - publication forbidden.
 
-A caller cannot construct a wider policy through this module. Resource and timeout values reuse SmolRunner's existing validated profile types.
+A caller cannot construct a wider policy through this module. Resource and timeout values reuse SmolRunner's existing validated profile types. The complete profile remains provider-free even when a later executor is added.
 
 ## Preview evidence
 
