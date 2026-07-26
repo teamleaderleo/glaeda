@@ -1,0 +1,214 @@
+name: Harden issue 173 preview
+
+on:
+  push:
+    branches:
+      - feat/issue-173-renderprove-vision-profile
+
+permissions:
+  contents: write
+
+concurrency:
+  group: harden-issue-173-preview
+  cancel-in-progress: true
+
+jobs:
+  harden:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: feat/issue-173-renderprove-vision-profile
+          show-progress: false
+      - name: Apply strict preview envelope and validate
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          source_path = Path('src/renderprove_vision_profile.rs')
+          source = source_path.read_text()
+          source = source.replace('use serde::Serialize;', 'use serde::{Deserialize, Serialize};', 1)
+
+          marker = '#[derive(Debug, Clone, PartialEq, Eq, Serialize)]\npub struct RenderproveVisionPreviewEvidence {'
+          envelope = '''#[derive(Debug, Deserialize)]
+          #[serde(rename_all = "camelCase", deny_unknown_fields)]
+          struct RenderproveVisionPreviewEnvelope {
+              #[serde(rename = "$schema")]
+              schema: String,
+              schema_version: String,
+              mode: String,
+              authority: String,
+              command_contract_id: String,
+              command_contract_digest: String,
+              prompt_policy_version: String,
+              canonicalization_profile: String,
+              request_digest: String,
+              #[serde(rename = "inputs")]
+              _inputs: serde_json::Map<String, Value>,
+              #[serde(rename = "receiptSummary")]
+              _receipt_summary: Value,
+              #[serde(rename = "includedFactNames")]
+              _included_fact_names: Vec<String>,
+              #[serde(rename = "exclusions")]
+              _exclusions: Vec<String>,
+              #[serde(rename = "promptSafety")]
+              _prompt_safety: serde_json::Map<String, Value>,
+              #[serde(rename = "limits")]
+              _limits: serde_json::Map<String, Value>,
+          }
+
+          #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+          pub struct RenderproveVisionPreviewEvidence {'''
+          if marker in source:
+              source = source.replace(marker, envelope, 1)
+
+          start = source.index('        let value: Value = serde_json::from_str(text)')
+          end = source.index('        if request_digest.len()', start)
+          replacement = '''        let preview: RenderproveVisionPreviewEnvelope =
+              serde_json::from_str(text).map_err(|_| {
+                  RenderproveVisionProfileError::new(
+                      "preview",
+                      "invalid_preview_json",
+                      "must be one exact top-level vision-request-v1 JSON object",
+                  )
+              })?;
+
+          require_preview_string("$schema", &preview.schema, RENDERPROVE_VISION_REQUEST_SCHEMA_URI)?;
+          require_preview_string(
+              "schemaVersion",
+              &preview.schema_version,
+              RENDERPROVE_VISION_REQUEST_SCHEMA,
+          )?;
+          require_preview_string("mode", &preview.mode, "dry-run")?;
+          require_preview_string("authority", &preview.authority, "advisory")?;
+          require_preview_string(
+              "commandContractId",
+              &preview.command_contract_id,
+              RENDERPROVE_VISION_COMMAND_ID,
+          )?;
+          require_preview_string(
+              "commandContractDigest",
+              &preview.command_contract_digest,
+              tool.command_contract_digest()
+                  .as_str()
+                  .strip_prefix("sha256:")
+                  .expect("validated SHA-256 digest has prefix"),
+          )?;
+          require_preview_string(
+              "promptPolicyVersion",
+              &preview.prompt_policy_version,
+              RENDERPROVE_VISION_PROMPT_POLICY,
+          )?;
+          require_preview_string(
+              "canonicalizationProfile",
+              &preview.canonicalization_profile,
+              RENDERPROVE_VISION_CANONICALIZATION_PROFILE,
+          )?;
+          let request_digest = preview.request_digest.as_str();
+          '''
+          source = source[:start] + replacement + source[end:]
+
+          helper_start = source.index('fn require_preview_string(')
+          helper_end = source.index('const fn is_lower_hex', helper_start)
+          helper = '''fn require_preview_string(
+              field: &'static str,
+              actual: &str,
+              expected: &str,
+          ) -> Result<(), RenderproveVisionProfileError> {
+              if actual != expected {
+                  return Err(RenderproveVisionProfileError::new(
+                      format!("preview.{field}"),
+                      "preview_identity_mismatch",
+                      "must match the reviewed Renderprove vision packet contract",
+                  ));
+              }
+              Ok(())
+          }
+
+          '''
+          source = source[:helper_start] + helper + source[helper_end:]
+          source_path.write_text(source)
+
+          test_path = Path('tests/renderprove_vision_profile.rs')
+          tests = test_path.read_text()
+          test_marker = '#[test]\nfn refuses_invalid_utf8_json_and_preview_overflow() {'
+          strict_test = '''#[test]
+          fn rejects_duplicate_and_unknown_top_level_preview_fields() {
+              let tool = tool();
+              let contract_hex = RENDERPROVE_VISION_COMMAND_CONTRACT_DIGEST
+                  .strip_prefix("sha256:")
+                  .expect("prefix");
+              let valid = String::from_utf8(preview_json(contract_hex, &"ab".repeat(32)))
+                  .expect("UTF-8 preview");
+              let duplicate = valid.replacen(
+                  "\\\"authority\\\":\\\"advisory\\\"",
+                  "\\\"authority\\\":\\\"advisory\\\",\\\"authority\\\":\\\"advisory\\\"",
+                  1,
+              );
+              assert!(
+                  RenderproveVisionPreviewEvidence::from_public_preview(
+                      duplicate.as_bytes(),
+                      digest("55"),
+                      &tool,
+                  )
+                  .is_err()
+              );
+
+              let mut unknown: serde_json::Value = serde_json::from_str(&valid).expect("JSON");
+              unknown
+                  .as_object_mut()
+                  .expect("object")
+                  .insert("unexpected".to_owned(), serde_json::Value::Bool(true));
+              let unknown = serde_json::to_vec(&unknown).expect("JSON");
+              assert!(
+                  RenderproveVisionPreviewEvidence::from_public_preview(
+                      &unknown,
+                      digest("55"),
+                      &tool,
+                  )
+                  .is_err()
+              );
+          }
+
+          #[test]
+          fn refuses_invalid_utf8_json_and_preview_overflow() {'''
+          if test_marker in tests:
+              tests = tests.replace(test_marker, strict_test, 1)
+          test_path.write_text(tests)
+
+          result_path = Path('src/renderprove_vision_result.rs')
+          result = result_path.read_text().replace('public_preview:', 'public_preview_evidence:')
+          result_path.write_text(result)
+
+          result_test_path = Path('tests/renderprove_vision_result.rs')
+          result_tests = result_test_path.read_text().replace(
+              '.public_preview',
+              '.public_preview_evidence',
+          )
+          result_test_path.write_text(result_tests)
+
+          docs_path = Path('docs/RENDERPROVE_VISION_PROFILE.md')
+          docs = docs_path.read_text().replace(
+              'It identifies the public preview as included or unavailable',
+              'It identifies the public preview evidence as included or unavailable',
+          )
+          docs_path.write_text(docs)
+          PY
+
+          cargo fmt --all
+          set +e
+          cargo clippy --locked --all-targets --all-features -- -D warnings >.tmp-issue-173-preview-clippy.log 2>&1
+          status=$?
+          printf '\nexit_status=%s\n' "$status" >>.tmp-issue-173-preview-clippy.log
+          if [ "$status" -eq 0 ]; then
+            rm -f .tmp-issue-173-preview-clippy.log .github/workflows/harden-issue-173-preview.yml
+          fi
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m 'Harden Renderprove preview identity parsing'
+            git push origin HEAD:feat/issue-173-renderprove-vision-profile
+          fi
