@@ -1,0 +1,53 @@
+name: Temporary receipt storage compatibility
+
+on:
+  pull_request:
+    branches: [main]
+    types: [synchronize, reopened]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.event.pull_request.head.ref == 'feat/execution-receipt-state-store'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/execution-receipt-state-store
+          fetch-depth: 0
+      - name: Tolerate legacy installations during read-only recovery
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/linux_state_recovery.rs'); t=p.read_text()
+          def r(old,new):
+              global t
+              assert t.count(old)==1, t.count(old)
+              t=t.replace(old,new,1)
+          r('''    let receipts = open_directory_at(&installation, "receipts", "receipts directory")?;\n    inspect_directory_owner(&receipts, "receipts directory", root_owner)?;\n''','''    let receipts = open_optional_directory_at(&installation, "receipts", "receipts directory")?;\n    if let Some(receipts) = &receipts {\n        inspect_directory_owner(receipts, "receipts directory", root_owner)?;\n    }\n''')
+          r('''    if !truncated {\n        scan_directory(\n            &receipts,\n            RecoveryArea::Receipts,\n            root_uid,\n            &mut findings,\n            &mut truncated,\n        )?;\n    }\n''','''    if !truncated && let Some(receipts) = receipts.as_ref() {\n        scan_directory(\n            receipts,\n            RecoveryArea::Receipts,\n            root_uid,\n            &mut findings,\n            &mut truncated,\n        )?;\n    }\n''')
+          r('''fn inspect_directory(\n    directory: &OwnedFd,\n    subject: &str,\n) -> Result<rustix::fs::Stat, StateStoreError> {\n''','''fn open_optional_directory_at(\n    parent: &OwnedFd,\n    name: &str,\n    subject: &str,\n) -> Result<Option<OwnedFd>, StateStoreError> {\n    match fs::openat(parent, name, DIRECTORY_FLAGS, Mode::empty()) {\n        Ok(directory) => {\n            inspect_directory(&directory, subject)?;\n            Ok(Some(directory))\n        }\n        Err(Errno::NOENT) => Ok(None),\n        Err(error) => Err(map_directory_open_error(error, subject)),\n    }\n}\n\nfn inspect_directory(\n    directory: &OwnedFd,\n    subject: &str,\n) -> Result<rustix::fs::Stat, StateStoreError> {\n''')
+          r('''    #[test]\n    fn mismatched_directory_group_is_rejected() {\n''','''    #[test]\n    fn missing_legacy_receipts_directory_is_treated_as_empty() {\n        let root = TempRoot::new("legacy-no-receipts");\n        fs::remove_dir(root.installation().join("receipts")).expect("remove receipts directory");\n\n        let report = inspect_orphans(root.path(), &installation_id()).expect("inspect legacy tree");\n        assert!(report.findings().is_empty());\n        assert!(!report.truncated());\n    }\n\n    #[test]\n    fn mismatched_directory_group_is_rejected() {\n''')
+          p.write_text(t)
+          PY
+      - name: Exercise the real Linux receipt store
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('tests/execution_receipt_state_store.rs'); t=p.read_text()
+          t=t.replace('use std::collections::BTreeMap;\n','''use std::collections::BTreeMap;\n\n#[cfg(target_os = "linux")]\nuse std::fs;\n#[cfg(target_os = "linux")]\nuse std::os::unix::fs::PermissionsExt;\n#[cfg(target_os = "linux")]\nuse std::path::{Path, PathBuf};\n#[cfg(target_os = "linux")]\nuse std::sync::atomic::{AtomicU64, Ordering};\n''',1)
+          t=t.replace('use smolrunner::journal::{ExecutionLane, RollbackClass};\n','''use smolrunner::journal::{ExecutionLane, RollbackClass};\n#[cfg(target_os = "linux")]\nuse smolrunner::linux_state::LinuxStateRoot;\n#[cfg(target_os = "linux")]\nuse smolrunner::linux_state_prepare::prepare_installation;\n''',1)
+          t += '''\n#[cfg(target_os = "linux")]\nstatic NEXT_LINUX_ROOT: AtomicU64 = AtomicU64::new(1);\n\n#[cfg(target_os = "linux")]\nstruct TempLinuxRoot(PathBuf);\n\n#[cfg(target_os = "linux")]\nimpl TempLinuxRoot {\n    fn new() -> Self {\n        let sequence = NEXT_LINUX_ROOT.fetch_add(1, Ordering::Relaxed);\n        let path = std::env::temp_dir().join(format!(\n            "smolrunner-receipt-store-{}-{sequence}",\n            std::process::id()\n        ));\n        fs::create_dir(&path).expect("create Linux state root");\n        fs::set_permissions(&path, fs::Permissions::from_mode(0o750))\n            .expect("set Linux state-root mode");\n        Self(path)\n    }\n\n    fn path(&self) -> &Path {\n        &self.0\n    }\n}\n\n#[cfg(target_os = "linux")]\nimpl Drop for TempLinuxRoot {\n    fn drop(&mut self) {\n        let _ = fs::remove_dir_all(&self.0);\n    }\n}\n\n#[cfg(target_os = "linux")]\n#[test]\nfn linux_state_store_publishes_private_receipt_and_replays_without_replacement() {\n    let root = TempLinuxRoot::new();\n    let installation = installation_id();\n    prepare_installation(root.path(), &installation).expect("prepare receipt state");\n    let mut store = LinuxStateRoot::open(root.path()).expect("open Linux state store");\n    let value = receipt("ensure-host", "2026-07-26T20:00:01.000Z");\n\n    let created = publish_execution_receipt(&mut store, &installation, &value)\n        .expect("publish Linux receipt");\n    assert_eq!(\n        created.disposition(),\n        ExecutionReceiptPublicationDisposition::Created\n    );\n\n    let path = root\n        .path()\n        .join("installations")\n        .join(installation.as_str())\n        .join("receipts")\n        .join("host-prepare-0001.json");\n    let metadata = fs::metadata(&path).expect("inspect published receipt");\n    assert_eq!(metadata.permissions().mode() & 0o7777, 0o600);\n    assert_eq!(\n        read_execution_receipt(&store, &installation, value.execution_id())\n            .expect("read Linux receipt"),\n        Some(value.clone())\n    );\n\n    let duplicate = publish_execution_receipt(&mut store, &installation, &value)\n        .expect("replay Linux receipt");\n    assert_eq!(\n        duplicate.disposition(),\n        ExecutionReceiptPublicationDisposition::Duplicate\n    );\n    assert_eq!(duplicate.bytes_written(), 0);\n    assert_eq!(\n        fs::read(&path).expect("read persisted bytes"),\n        encode_execution_receipt(&value).expect("encode receipt").into_bytes()\n    );\n}\n'''
+          p.write_text(t)
+          PY
+      - name: Format and publish compatibility coverage
+        run: |
+          rm .github/workflows/temp-receipt-storage-compatibility.yml
+          cargo fmt --all
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Harden receipt storage compatibility and Linux coverage"
+          git push origin HEAD:feat/execution-receipt-state-store
