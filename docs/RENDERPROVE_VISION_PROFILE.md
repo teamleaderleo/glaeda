@@ -69,6 +69,8 @@ A caller cannot construct a wider policy through this module. Resource and timeo
 - canonicalization-profile identity;
 - one lowercase SHA-256 request digest.
 
+Deserialization denies unknown top-level fields and rejects duplicate or missing top-level fields before the reviewed identities are compared. This validates the exact public envelope shape without claiming to reimplement Renderprove's complete nested JSON Schema.
+
 The caller supplies the content digest of the exact retained preview bytes through SmolRunner's existing artifact boundary. The source screenshot, canonical image bytes, brief contents, raw receipt, private paths, logs, environment, and credentials are not part of the public profile or preview evidence.
 
 ## Admission and terminal result
