@@ -1,0 +1,266 @@
+name: Agent 6 queue temporal review
+
+on:
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  review:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.head_ref }}
+          show-progress: false
+
+      - name: Apply temporal and schema review
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          source = Path('src/personal_worker_queue.rs')
+          text = source.read_text()
+          generation_anchor = '''    if let Some(previous) = previous {
+                  let expected = previous.generation.next()?;'''
+          generation_replacement = '''    if let Some(previous) = previous {
+                  if previous.schema_version != PERSONAL_WORKER_QUEUE_SCHEMA_VERSION {
+                      return Err(PersonalWorkerQueueError::new(
+                          "previous.schema_version",
+                          "unsupported_previous_queue_schema",
+                          "previous queue decision schema is not supported",
+                      ));
+                  }
+                  let expected = previous.generation.next()?;'''
+          if text.count(generation_anchor) != 1:
+              raise SystemExit('generation schema anchor drift')
+          text = text.replace(generation_anchor, generation_replacement, 1)
+
+          active_anchor = '''    validate_request(&reservation.request, observed_at)?;
+              if reservation.request.cancellation.is_cancelled()
+                  && reservation.admission.state() != ExecutionAdmissionState::Draining
+              {'''
+          active_replacement = '''    validate_request(&reservation.request, observed_at)?;
+              let admission_observed_at = reservation.admission.observed_at();
+              if admission_observed_at < reservation.request.submitted_at
+                  || admission_observed_at > observed_at
+              {
+                  return Err(PersonalWorkerQueueError::new(
+                      "admission.observed_at",
+                      "active_admission_time_out_of_bounds",
+                      "active admission observation must be between submission and queue observation",
+                  ));
+              }
+              if let PersonalWorkerCancellationState::Cancelled { cancelled_at } =
+                  reservation.request.cancellation
+                  && cancelled_at > admission_observed_at
+              {
+                  return Err(PersonalWorkerQueueError::new(
+                      "cancellation.cancelled_at",
+                      "cancellation_after_admission_observation",
+                      "draining admission must be observed at or after cancellation",
+                  ));
+              }
+              if reservation.request.cancellation.is_cancelled()
+                  && reservation.admission.state() != ExecutionAdmissionState::Draining
+              {'''
+          if text.count(active_anchor) != 1:
+              raise SystemExit('active temporal anchor drift')
+          text = text.replace(active_anchor, active_replacement, 1)
+
+          expiry_anchor = '    if evidence.expires_at < observed_at {'
+          if text.count(expiry_anchor) != 1:
+              raise SystemExit('expiry anchor drift')
+          text = text.replace(expiry_anchor, '    if evidence.expires_at <= observed_at {', 1)
+
+          start_anchor = '''                .is_none_or(|started| started < evidence.reserved_at || started > observed_at)'''
+          start_replacement = '''                .is_none_or(|started| {
+                      started < evidence.reserved_at || started > admission_observed_at
+                  })'''
+          if text.count(start_anchor) != 1:
+              raise SystemExit('start temporal anchor drift')
+          text = text.replace(start_anchor, start_replacement, 1)
+          text = text.replace(
+              '"started work requires a bounded time after reservation and before observation",',
+              '"started work requires a bounded time after reservation and before admission observation",',
+              1,
+          )
+          source.write_text(text)
+
+          tests = Path('tests/personal_worker_queue_contract.rs')
+          test_text = tests.read_text()
+          addition = r'''
+
+          #[test]
+          fn previous_queue_schema_must_match() {
+              let observed_at = 16_000_000;
+              let mut previous = evaluate_personal_worker_queue(
+                  &input(1, observed_at, vec![], vec![]),
+                  None,
+              )
+              .expect("previous decision");
+              previous.schema_version = 99;
+              let error = evaluate_personal_worker_queue(
+                  &input(2, observed_at + 1, vec![], vec![]),
+                  Some(&previous),
+              )
+              .expect_err("schema drift");
+              assert_eq!(error.code, "unsupported_previous_queue_schema");
+          }
+
+          #[test]
+          fn active_admission_time_is_bound_to_submission_and_queue_observation() {
+              let observed_at = 17_000_000;
+              let future = active(
+                  "future-admission",
+                  "example/future",
+                  'a',
+                  observed_at + 1_000,
+                  limits(2_000, 2),
+                  PersonalWorkerCacheAccessMode::Read,
+              );
+              let error = evaluate_personal_worker_queue(
+                  &input(1, observed_at, vec![], vec![future]),
+                  None,
+              )
+              .expect_err("future admission");
+              assert_eq!(error.code, "active_admission_time_out_of_bounds");
+
+              let mut before_submission = active(
+                  "before-submission",
+                  "example/before",
+                  'b',
+                  observed_at - 1_000,
+                  limits(2_000, 2),
+                  PersonalWorkerCacheAccessMode::Read,
+              );
+              before_submission.request.submitted_at = time(observed_at);
+              let error = evaluate_personal_worker_queue(
+                  &input(1, observed_at, vec![], vec![before_submission]),
+                  None,
+              )
+              .expect_err("admission before submission");
+              assert_eq!(error.code, "active_admission_time_out_of_bounds");
+          }
+
+          #[test]
+          fn cancellation_and_start_cannot_postdate_active_admission() {
+              let observed_at = 18_000_000;
+              let mut cancelled = active(
+                  "late-cancellation",
+                  "example/cancel",
+                  'a',
+                  observed_at - 1_000,
+                  limits(2_000, 2),
+                  PersonalWorkerCacheAccessMode::Read,
+              );
+              cancelled.request.cancellation = PersonalWorkerCancellationState::Cancelled {
+                  cancelled_at: time(observed_at),
+              };
+              let error = evaluate_personal_worker_queue(
+                  &input(1, observed_at, vec![], vec![cancelled]),
+                  None,
+              )
+              .expect_err("late cancellation");
+              assert_eq!(error.code, "cancellation_after_admission_observation");
+
+              let mut late_start = active(
+                  "late-start",
+                  "example/start",
+                  'b',
+                  observed_at - 1_000,
+                  limits(2_000, 2),
+                  PersonalWorkerCacheAccessMode::Read,
+              );
+              late_start.started_at = Some(time(observed_at));
+              let error = evaluate_personal_worker_queue(
+                  &input(1, observed_at, vec![], vec![late_start]),
+                  None,
+              )
+              .expect_err("late start");
+              assert_eq!(error.code, "invalid_active_start_time");
+          }
+
+          #[test]
+          fn active_reservation_expiry_must_be_strictly_future() {
+              let observed_at = 19_000_000;
+              let request = request(
+                  "expiry-boundary",
+                  "example/expiry",
+                  'a',
+                  PersonalWorkerPriority::Normal,
+                  observed_at - 60_000,
+                  limits(2_000, 2),
+                  PersonalWorkerCacheAccessMode::Read,
+              );
+              let admission_observed_at = observed_at - 1_000;
+              let admission = ExecutionAdmissionRecord::from_input(ExecutionAdmissionInput {
+                  identity: request.identity.clone(),
+                  state: ExecutionAdmissionState::Running,
+                  observed_at: time(admission_observed_at),
+                  requested_limits: request.requested_limits,
+                  host_capacity: Some(HostCapacityObservation::new(
+                      time(admission_observed_at),
+                      limits(8_000, 10),
+                  )),
+                  applied_limits: Some(request.requested_limits),
+                  queue_position: None,
+                  reservation: Some(ReservationEvidence::new(
+                      ReservationId::parse("reservation-expiry-boundary")
+                          .expect("reservation"),
+                      ReservationGeneration::new(1).expect("generation"),
+                      time(observed_at - 30_000),
+                      time(observed_at),
+                  )),
+                  acknowledgement: None,
+                  fallback_eligibility: FallbackProfileEligibility::ineligible(),
+                  unavailable_reason: None,
+              })
+              .expect("active admission");
+              let reservation = PersonalWorkerActiveReservation {
+                  request,
+                  admission,
+                  started_at: Some(time(observed_at - 20_000)),
+              };
+              let error = evaluate_personal_worker_queue(
+                  &input(1, observed_at, vec![], vec![reservation]),
+                  None,
+              )
+              .expect_err("expiry boundary");
+              assert_eq!(error.code, "expired_active_reservation");
+          }
+          '''
+          if 'previous_queue_schema_must_match' in test_text:
+              raise SystemExit('temporal review tests already present')
+          tests.write_text(test_text + addition)
+          PY
+          cargo fmt --all
+
+      - name: Verify reviewed temporal policy
+        run: |
+          cargo fmt --all -- --check
+          cargo check --locked --all-targets --all-features
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cargo test --locked --all-targets --all-features
+
+      - name: Commit verified temporal review
+        run: |
+          changed="$(git diff --name-only)"
+          while IFS= read -r path; do
+            case "$path" in
+              src/personal_worker_queue.rs|tests/personal_worker_queue_contract.rs|src/lib.rs) ;;
+              '') ;;
+              *) printf 'unexpected temporal-review path: %s\n' "$path" >&2; exit 1 ;;
+            esac
+          done <<EOF
+          $changed
+          EOF
+          git config user.name 'smolrunner-agent-6'
+          git config user.email 'smolrunner-agent-6@users.noreply.github.com'
+          git add src/personal_worker_queue.rs tests/personal_worker_queue_contract.rs src/lib.rs
+          git commit -m 'Bind queue decisions to exact temporal evidence'
+          git push origin HEAD:${{ github.head_ref }}
