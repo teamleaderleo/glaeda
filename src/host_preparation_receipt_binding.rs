@@ -1,4 +1,5 @@
 use std::fmt;
+use std::io::{self, Write as _};
 
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
@@ -149,12 +150,15 @@ pub fn digest_host_preparation_source(
         schema_version: HOST_PREPARATION_SOURCE_DIGEST_SCHEMA_VERSION,
         source,
     };
-    let encoded = serde_json::to_vec(&document)
-        .map_err(|_| HostPreparationReceiptBindingError::source_encoding())?;
-    if encoded.len() > MAX_HOST_PREPARATION_SOURCE_DIGEST_BYTES {
-        return Err(HostPreparationReceiptBindingError::source_too_large());
+    let mut writer = BoundedDigestWriter::new();
+    if serde_json::to_writer(&mut writer, &document).is_err() {
+        return Err(if writer.exceeded {
+            HostPreparationReceiptBindingError::source_too_large()
+        } else {
+            HostPreparationReceiptBindingError::source_encoding()
+        });
     }
-    let digest = Sha256::digest(&encoded);
+    let digest = writer.finish();
     let mut value = String::with_capacity(SHA256_PREFIX.len() + digest.len() * 2);
     value.push_str(SHA256_PREFIX);
     for byte in digest {
@@ -162,6 +166,46 @@ pub fn digest_host_preparation_source(
         value.push(HEX[(byte & 0x0f) as usize] as char);
     }
     Sha256Digest::parse(&value).map_err(|_| HostPreparationReceiptBindingError::source_encoding())
+}
+
+struct BoundedDigestWriter {
+    hasher: Sha256,
+    bytes_written: usize,
+    exceeded: bool,
+}
+
+impl BoundedDigestWriter {
+    fn new() -> Self {
+        Self {
+            hasher: Sha256::new(),
+            bytes_written: 0,
+            exceeded: false,
+        }
+    }
+
+    fn finish(self) -> sha2::digest::Output<Sha256> {
+        self.hasher.finalize()
+    }
+}
+
+impl io::Write for BoundedDigestWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let Some(next_size) = self.bytes_written.checked_add(buffer.len()) else {
+            self.exceeded = true;
+            return Err(io::Error::other("source digest input exceeds its bound"));
+        };
+        if next_size > MAX_HOST_PREPARATION_SOURCE_DIGEST_BYTES {
+            self.exceeded = true;
+            return Err(io::Error::other("source digest input exceeds its bound"));
+        }
+        self.hasher.update(buffer);
+        self.bytes_written = next_size;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

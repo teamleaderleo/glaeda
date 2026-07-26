@@ -133,6 +133,10 @@ fn source_digest_is_deterministic_domain_separated_and_sensitive_to_private_sour
 
     assert_eq!(first, replay);
     assert_ne!(first, changed);
+    assert_eq!(
+        first.as_str(),
+        "sha256:6578b2a8eaedf9f7894da5eba4072cc137ac7148b8d27c51db1098b9ac087c36"
+    );
     assert!(first.as_str().starts_with("sha256:"));
     assert_eq!(first.as_str().len(), 71);
 }
