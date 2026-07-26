@@ -11,7 +11,7 @@ This layer binds receipt authority to one reviewed execution before the first du
 - the exact executable phase ID;
 - an explicit canonical start timestamp captured before the first checkpoint.
 
-It validates the phase identity and computes one domain-separated SHA-256 digest over a versioned canonical source document. The private source document is discarded after hashing.
+It validates the phase identity and computes one domain-separated SHA-256 digest over a versioned deterministic source document. The private source is streamed through a bounded digest writer and is never retained as a serialized byte buffer.
 
 `finish()` consumes the binding after terminal execution and accepts:
 
@@ -39,11 +39,11 @@ The digest input is deterministic JSON for this fixed document:
 }
 ```
 
-The `source` value is the exact typed `HostReadinessSourceIdentity`, including private reviewed executable paths and bounded host-readiness state. It is hashed in memory and never returned or persisted by this layer.
+The `source` value is the exact typed `HostReadinessSourceIdentity`, including private reviewed executable paths and bounded host-readiness state. JSON bytes are streamed directly into SHA-256 and are never returned or persisted by this layer.
 
-The encoded source document is capped at 65,536 bytes before hashing. The public result uses canonical `sha256:<64 lowercase hex>` form.
+The streaming writer stops once the digest input would exceed 65,536 bytes. Oversized input returns one fixed `source_too_large` error without disclosing source content. The public result uses canonical `sha256:<64 lowercase hex>` form.
 
-Changing any retained source field—including a private executable path—changes the digest and causes terminal source mismatch.
+The v1 compatibility fixture pins the complete digest for one representative source document. Changing schema identity, field ordering, serialization, or any retained source field—including a private executable path—changes the digest and causes either a compatibility-test failure or terminal source mismatch.
 
 ## Privacy boundary
 
@@ -61,6 +61,10 @@ Its public errors and `Debug` output exclude:
 - action summaries and precondition evidence;
 - journal messages;
 - command values, environment values, process output, and credentials.
+
+## Dependency boundary
+
+SHA-256 uses `sha2 0.10`, backed by the standard RustCrypto `digest` stack. This adds no network transport, external process, dynamic provider, credential access, or operating-system command dependency.
 
 ## Boundary of this slice
 
