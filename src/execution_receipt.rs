@@ -428,12 +428,10 @@ impl ExecutionReceiptContinuation {
         self.fresh_observation_required
     }
 
-    #[must_use]
     pub fn barriers(&self) -> impl Iterator<Item = &str> {
         self.barriers.iter().map(ReceiptToken::as_str)
     }
 
-    #[must_use]
     pub fn deferred_actions(&self) -> impl Iterator<Item = &str> {
         self.deferred_actions.iter().map(ReceiptToken::as_str)
     }
