@@ -9,6 +9,7 @@ pub mod doctor;
 pub mod durable_journal;
 #[cfg(target_os = "linux")]
 pub mod durable_lane_execution;
+pub mod execution_receipt;
 pub mod host;
 #[cfg(target_os = "linux")]
 pub mod host_package_plan;
