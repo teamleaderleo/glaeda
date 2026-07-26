@@ -1,1 +1,0 @@
-Exact-commit handoff success recorded in docs/experiments/codex-exact-commit-handoff-2026-07-26.md at commit 3a580706241fbe65fea052fb51934684e3c8c9db.
