@@ -42,7 +42,8 @@ pub fn prepare_default_installation(
 /// Prepare one installation beneath an existing trusted state root.
 ///
 /// The root itself must already exist with mode `0750`. This function creates only the fixed
-/// `installations/ID/resources` and `installations/ID/journals` hierarchy. Existing compatible
+/// `installations/ID/resources`, `installations/ID/journals`, and
+/// `installations/ID/receipts` hierarchy. Existing compatible
 /// directories are retained, while incompatible state is protected from mutation.
 ///
 /// # Errors
@@ -63,6 +64,7 @@ pub fn prepare_installation(
         ensure_directory(&installations, installation_id.as_str(), owner)?;
     let (_, resources_created) = ensure_directory(&installation, "resources", owner)?;
     let (_, journals_created) = ensure_directory(&installation, "journals", owner)?;
+    let (_, receipts_created) = ensure_directory(&installation, "receipts", owner)?;
 
     Ok(StatePreparationReceipt {
         created_directories: [
@@ -70,6 +72,7 @@ pub fn prepare_installation(
             installation_created,
             resources_created,
             journals_created,
+            receipts_created,
         ]
         .into_iter()
         .filter(|created| *created)
@@ -281,7 +284,7 @@ mod tests {
         let root_owner = (root_metadata.uid(), root_metadata.gid());
         let receipt = prepare_installation(root.path(), &installation_id())
             .expect("prepare installation state");
-        assert_eq!(receipt.created_directories(), 4);
+        assert_eq!(receipt.created_directories(), 5);
 
         let installations = root.path().join("installations");
         let installation = installations.join(installation_id().as_str());
@@ -289,6 +292,7 @@ mod tests {
         assert_managed_directory(&installation, root_owner);
         assert_managed_directory(&installation.join("resources"), root_owner);
         assert_managed_directory(&installation.join("journals"), root_owner);
+        assert_managed_directory(&installation.join("receipts"), root_owner);
 
         let receipt = prepare_installation(root.path(), &installation_id())
             .expect("repeat installation preparation");
@@ -305,7 +309,7 @@ mod tests {
 
         let receipt =
             prepare_installation(root.path(), &installation_id()).expect("complete partial tree");
-        assert_eq!(receipt.created_directories(), 3);
+        assert_eq!(receipt.created_directories(), 4);
     }
 
     #[test]
