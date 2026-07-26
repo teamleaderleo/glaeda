@@ -878,18 +878,13 @@ fn lease_conflict_for_modes(
     if held.is_empty() {
         return None;
     }
-    if held
-        .iter()
-        .any(|mode| *mode == PersonalWorkerCacheAccessMode::Exclusive)
-    {
+    if held.contains(&PersonalWorkerCacheAccessMode::Exclusive) {
         return Some(PersonalWorkerCacheLeaseState::BlockedByExclusive);
     }
     if requested == PersonalWorkerCacheAccessMode::Exclusive {
         return Some(PersonalWorkerCacheLeaseState::BlockedByExclusive);
     }
-    if held
-        .iter()
-        .any(|mode| *mode == PersonalWorkerCacheAccessMode::Write)
+    if held.contains(&PersonalWorkerCacheAccessMode::Write)
         || requested == PersonalWorkerCacheAccessMode::Write
     {
         return Some(PersonalWorkerCacheLeaseState::BlockedByWriter);
