@@ -46,34 +46,29 @@ jobs:
               raise SystemExit('pending profile Clippy anchor drift')
           path.write_text(text.replace(old, new, 1))
           PY
+          cargo fmt --all
 
       - name: Verify final queue policy
         run: |
-          cargo fmt --all
           cargo fmt --all -- --check
           cargo check --locked --all-targets --all-features
           cargo clippy --locked --all-targets --all-features -- -D warnings
           cargo test --locked --all-targets --all-features
 
-      - name: Commit source-only finalization
+      - name: Commit verified source
         run: |
-          rm .agent6-policy-clippy.log
-          rm .github/workflows/agent6-semantic-review.yml
-          rm .github/workflows/agent6-policy-diagnostic.yml
-          rm .github/workflows/agent6-finalize.yml
-          changed="$(git status --short)"
-          while IFS= read -r line; do
-            path="${line#???}"
+          changed="$(git diff --name-only)"
+          while IFS= read -r path; do
             case "$path" in
-              src/personal_worker_queue.rs|tests/personal_worker_queue_contract.rs|src/lib.rs|.agent6-policy-clippy.log|.github/workflows/agent6-semantic-review.yml|.github/workflows/agent6-policy-diagnostic.yml|.github/workflows/agent6-finalize.yml) ;;
+              src/personal_worker_queue.rs|tests/personal_worker_queue_contract.rs|src/lib.rs) ;;
               '') ;;
-              *) printf 'unexpected finalization path: %s\n' "$path" >&2; exit 1 ;;
+              *) printf 'unexpected source path: %s\n' "$path" >&2; exit 1 ;;
             esac
           done <<EOF
           $changed
           EOF
           git config user.name 'smolrunner-agent-6'
           git config user.email 'smolrunner-agent-6@users.noreply.github.com'
-          git add src/personal_worker_queue.rs tests/personal_worker_queue_contract.rs src/lib.rs .agent6-policy-clippy.log .github/workflows/agent6-semantic-review.yml .github/workflows/agent6-policy-diagnostic.yml .github/workflows/agent6-finalize.yml
+          git add src/personal_worker_queue.rs tests/personal_worker_queue_contract.rs src/lib.rs
           git commit -m 'Finish personal worker queue policy review'
           git push origin HEAD:${{ github.head_ref }}
