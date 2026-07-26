@@ -71,6 +71,36 @@ impl CommitId {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
+pub struct GitTreeId(String);
+
+impl GitTreeId {
+    /// Validate an immutable Git tree object identifier.
+    ///
+    /// Both 40-character SHA-1 and 64-character SHA-256 object identifiers are accepted so the
+    /// contract survives Git's hash transition.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for abbreviated, uppercase, or non-hexadecimal values.
+    pub fn parse(value: &str) -> Result<Self, ArtifactIdentityError> {
+        if !matches!(value.len(), SHA1_HEX_LEN | SHA256_HEX_LEN) || !value.bytes().all(is_lower_hex)
+        {
+            return Err(ArtifactIdentityError::new(
+                "tree",
+                "must be a complete 40- or 64-character lowercase hexadecimal Git object ID",
+            ));
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
 pub struct Sha256Digest(String);
 
 impl Sha256Digest {
@@ -171,7 +201,7 @@ const fn is_lower_hex(byte: u8) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{ArtifactIdentity, ArtifactKind, CommitId, RepositoryRef, Sha256Digest};
+    use super::{ArtifactIdentity, ArtifactKind, CommitId, GitTreeId, RepositoryRef, Sha256Digest};
 
     fn digest() -> String {
         format!("sha256:{}", "ab".repeat(32))
@@ -196,6 +226,15 @@ mod tests {
         assert!(CommitId::parse("abc123").is_err());
         assert!(CommitId::parse(&"AB".repeat(20)).is_err());
         assert!(CommitId::parse(&"ab".repeat(32)).is_ok());
+    }
+
+    #[test]
+    fn git_tree_ids_accept_complete_hashes_and_reject_invalid_forms() {
+        assert!(GitTreeId::parse(&"ab".repeat(20)).is_ok());
+        assert!(GitTreeId::parse(&"ab".repeat(32)).is_ok());
+        assert!(GitTreeId::parse("abc123").is_err());
+        assert!(GitTreeId::parse(&"AB".repeat(20)).is_err());
+        assert!(GitTreeId::parse(&format!("{}g", "ab".repeat(19))).is_err());
     }
 
     #[test]

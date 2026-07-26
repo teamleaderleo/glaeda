@@ -4,7 +4,7 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::Serialize;
 
-use crate::artifact::{CommitId, RepositoryRef, Sha256Digest};
+use crate::artifact::{CommitId, GitTreeId, RepositoryRef, Sha256Digest};
 
 pub const VERIFICATION_PROFILE_SCHEMA_VERSION: u8 = 1;
 pub const MAX_PROFILE_REFS: usize = 16;
@@ -243,33 +243,6 @@ impl RepositoryRefName {
                 "source.ref",
                 "invalid_ref_name",
                 "must be one bounded unambiguous Git ref name",
-            ));
-        }
-        Ok(Self(value.to_owned()))
-    }
-
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-#[serde(transparent)]
-pub struct GitTreeId(String);
-
-impl GitTreeId {
-    /// Parse one complete immutable Git tree object identifier.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for abbreviated, uppercase, or non-hexadecimal values.
-    pub fn parse(value: &str) -> Result<Self, VerificationProfileError> {
-        if !valid_git_object_id(value) {
-            return Err(VerificationProfileError::new(
-                "source.tree",
-                "invalid_git_tree_id",
-                "must be a complete 40- or 64-character lowercase hexadecimal Git object ID",
             ));
         }
         Ok(Self(value.to_owned()))
@@ -2251,13 +2224,6 @@ fn valid_absolute_path(path: &Path) -> bool {
                 Component::Prefix(_) | Component::RootDir | Component::Normal(_)
             )
         })
-}
-
-fn valid_git_object_id(value: &str) -> bool {
-    matches!(value.len(), 40 | 64)
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
