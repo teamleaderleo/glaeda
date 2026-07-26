@@ -74,6 +74,7 @@ pub mod preview;
 pub mod process;
 pub mod renderprove_verification;
 pub mod renderprove_vision_profile;
+pub mod renderprove_vision_result;
 pub mod resource;
 #[cfg(target_os = "linux")]
 pub mod rootless_podman_config;
