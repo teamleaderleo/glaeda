@@ -167,6 +167,17 @@ impl StateLayout {
         components.push(StateComponent::json_file(&journal_id.0));
         StatePath::new(components)
     }
+
+    #[must_use]
+    pub fn execution_receipt_document(
+        installation_id: &InstallationId,
+        execution_id: &JournalId,
+    ) -> StatePath {
+        let mut components = Self::installation(installation_id).components;
+        components.push(StateComponent::fixed("receipts"));
+        components.push(StateComponent::json_file(&execution_id.0));
+        StatePath::new(components)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -301,6 +312,18 @@ mod tests {
                 "installations",
                 "0123456789abcdef",
                 "journals",
+                "apply-00000001.json"
+            ]
+        );
+        assert_eq!(
+            component_strings(&StateLayout::execution_receipt_document(
+                &installation,
+                &journal,
+            )),
+            [
+                "installations",
+                "0123456789abcdef",
+                "receipts",
                 "apply-00000001.json"
             ]
         );

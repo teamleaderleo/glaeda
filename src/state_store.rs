@@ -2,6 +2,7 @@ use std::fmt;
 
 use serde::Serialize;
 
+use crate::execution_receipt::{ExecutionReceipt, ExecutionReceiptError, encode_execution_receipt};
 use crate::journal_document::{
     JournalDocumentError, JournalStateDocument, encode_journal_document,
 };
@@ -19,6 +20,7 @@ pub enum StateRecordKind {
     Project,
     Resource,
     Journal,
+    ExecutionReceipt,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -66,6 +68,20 @@ impl StateRecord {
         let path = StateLayout::journal_document(document.installation_id(), document.journal_id());
         let encoded = encode_journal_document(&document)?;
         Self::finish(StateRecordKind::Journal, path, encoded)
+    }
+
+    /// Bind one validated execution receipt to its canonical installation receipt path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when canonical receipt encoding fails or exceeds the store limit.
+    pub fn execution_receipt(
+        installation_id: &InstallationId,
+        receipt: &ExecutionReceipt,
+    ) -> Result<Self, StateRecordError> {
+        let path = StateLayout::execution_receipt_document(installation_id, receipt.execution_id());
+        let encoded = encode_execution_receipt(receipt)?;
+        Self::finish(StateRecordKind::ExecutionReceipt, path, encoded)
     }
 
     #[must_use]
@@ -124,6 +140,14 @@ impl From<StateDocumentError> for StateRecordError {
 
 impl From<JournalDocumentError> for StateRecordError {
     fn from(error: JournalDocumentError) -> Self {
+        Self {
+            problems: error.problems,
+        }
+    }
+}
+
+impl From<ExecutionReceiptError> for StateRecordError {
+    fn from(error: ExecutionReceiptError) -> Self {
         Self {
             problems: error.problems,
         }

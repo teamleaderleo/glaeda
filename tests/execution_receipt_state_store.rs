@@ -60,10 +60,7 @@ impl StateStore for MemoryStore {
         }
     }
 
-    fn write_atomic(
-        &mut self,
-        record: &StateRecord,
-    ) -> Result<StateWriteReceipt, StateStoreError> {
+    fn write_atomic(&mut self, record: &StateRecord) -> Result<StateWriteReceipt, StateStoreError> {
         let replaced = self
             .entries
             .insert(Self::key(record.path()), record.bytes().to_vec())
@@ -96,16 +93,22 @@ fn receipt(action_id: &str, terminal_at: &str) -> ExecutionReceipt {
         ReceiptTimestamp::parse("2026-07-26T20:00:00.000Z").expect("start time"),
         ReceiptTimestamp::parse(terminal_at).expect("terminal time"),
         ExecutionReceiptDisposition::Completed,
-        vec![ExecutionReceiptAction::new(
-            action_id,
-            ExecutionLane::Root,
-            RollbackClass::Reversible,
-            ExecutionReceiptActionOutcome::Completed,
-            None,
+        vec![
+            ExecutionReceiptAction::new(
+                action_id,
+                ExecutionLane::Root,
+                RollbackClass::Reversible,
+                ExecutionReceiptActionOutcome::Completed,
+                None,
+            )
+            .expect("receipt action"),
+        ],
+        ExecutionReceiptContinuation::new(
+            false,
+            std::iter::empty::<&str>(),
+            std::iter::empty::<&str>(),
         )
-        .expect("receipt action")],
-        ExecutionReceiptContinuation::new(false, std::iter::empty::<&str>(), std::iter::empty::<&str>())
-            .expect("continuation"),
+        .expect("continuation"),
     )
     .expect("execution receipt")
 }
@@ -115,14 +118,17 @@ fn atomic_publication_creates_then_exact_replay_is_duplicate() {
     let mut store = MemoryStore::default();
     let value = receipt("ensure-host", "2026-07-26T20:00:01.000Z");
 
-    let created = publish_execution_receipt(&mut store, &installation_id(), &value)
-        .expect("publish receipt");
+    let created =
+        publish_execution_receipt(&mut store, &installation_id(), &value).expect("publish receipt");
     assert_eq!(
         created.disposition(),
         ExecutionReceiptPublicationDisposition::Created
     );
     assert_eq!(created.execution_id(), value.execution_id());
-    assert_eq!(created.bytes_written(), encode_execution_receipt(&value).unwrap().len());
+    assert_eq!(
+        created.bytes_written(),
+        encode_execution_receipt(&value).unwrap().len()
+    );
 
     let duplicate = publish_execution_receipt(&mut store, &installation_id(), &value)
         .expect("replay exact receipt");
@@ -172,7 +178,9 @@ fn restart_read_back_requires_exact_canonical_bytes() {
     let key = MemoryStore::key(record.path());
 
     let mut restarted = MemoryStore::default();
-    restarted.entries.insert(key.clone(), record.bytes().to_vec());
+    restarted
+        .entries
+        .insert(key.clone(), record.bytes().to_vec());
     assert_eq!(
         read_execution_receipt(&restarted, &installation_id(), value.execution_id())
             .expect("read after restart"),

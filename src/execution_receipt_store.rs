@@ -8,8 +8,7 @@ use crate::execution_receipt::{
 };
 use crate::state::{InstallationId, JournalId, StateLayout};
 use crate::state_store::{
-    StateRead, StateRecord, StateStore, StateStoreError, StateStoreErrorKind,
-    StateWriteDisposition,
+    StateRead, StateRecord, StateStore, StateStoreError, StateStoreErrorKind, StateWriteDisposition,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
