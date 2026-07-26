@@ -581,10 +581,7 @@ mod tests {
         execution_with_spec(command, command.spec().clone())
     }
 
-    fn assert_private_command_rejected(
-        command: &RenderproveCommand,
-        altered_spec: CommandSpec,
-    ) {
+    fn assert_private_command_rejected(command: &RenderproveCommand, altered_spec: CommandSpec) {
         assert_eq!(
             altered_spec.displayed_argv(),
             command.spec().displayed_argv(),
@@ -804,8 +801,7 @@ mod tests {
         .expect("command");
         let observation = execution(&command);
         let observation_debug = format!("{observation:?}");
-        let receipt =
-            bind_renderprove_execution(command, observation, None).expect("receipt");
+        let receipt = bind_renderprove_execution(command, observation, None).expect("receipt");
 
         assert_eq!(receipt.command_id(), RENDERPROVE_COMMAND_ID);
         assert_eq!(receipt.process(), &RenderproveProcessOutcome::Succeeded);
