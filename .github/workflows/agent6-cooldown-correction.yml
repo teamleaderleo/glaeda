@@ -1,0 +1,86 @@
+name: Agent 6 cooldown correction
+
+on:
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  correct:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.head_ref }}
+          show-progress: false
+
+      - name: Apply cooldown correction and boundary tests
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          source = Path('src/personal_worker_queue.rs')
+          text = source.read_text()
+          old = 'pub const PERSONAL_WORKER_INTERACTIVE_COOLDOWN_MILLIS: u64 = 5 * 60 * 1_000;'
+          new = 'pub const PERSONAL_WORKER_INTERACTIVE_COOLDOWN_MILLIS: u64 = 10 * 60 * 1_000;'
+          if text.count(old) != 1:
+              raise SystemExit('interactive cooldown anchor drift')
+          source.write_text(text.replace(old, new, 1))
+
+          tests = Path('tests/personal_worker_queue_contract.rs')
+          test_text = tests.read_text()
+          if 'work_to_interactive_and_stopped_boundaries_are_exact' in test_text:
+              raise SystemExit('cooldown boundary test already present')
+          test_text += r'''
+
+          #[test]
+          fn work_to_interactive_and_stopped_boundaries_are_exact() {
+              let observed_at = 20_000_000;
+              for (idle_millis, expected) in [
+                  (10 * 60 * 1_000 - 1, PersonalWorkerProfile::Work),
+                  (10 * 60 * 1_000, PersonalWorkerProfile::Interactive),
+                  (30 * 60 * 1_000 - 1, PersonalWorkerProfile::Interactive),
+                  (30 * 60 * 1_000, PersonalWorkerProfile::Stopped),
+              ] {
+                  let mut queue = input(1, observed_at, vec![], vec![]);
+                  queue.current_profile = PersonalWorkerProfile::Work;
+                  queue.last_activity_at = time(observed_at - idle_millis);
+                  let decision = evaluate_personal_worker_queue(&queue, None)
+                      .expect("cooldown boundary decision");
+                  assert_eq!(decision.desired_profile, expected, "idle_millis={idle_millis}");
+              }
+          }
+          '''
+          tests.write_text(test_text)
+          PY
+
+      - name: Verify corrected queue policy
+        run: |
+          cargo fmt --all
+          cargo fmt --all -- --check
+          cargo check --locked --all-targets --all-features
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cargo test --locked --all-targets --all-features
+
+      - name: Commit verified product changes
+        run: |
+          changed="$(git status --short)"
+          while IFS= read -r line; do
+            path="${line#???}"
+            case "$path" in
+              src/personal_worker_queue.rs|tests/personal_worker_queue_contract.rs) ;;
+              '') ;;
+              *) printf 'unexpected changed path: %s\n' "$path" >&2; exit 1 ;;
+            esac
+          done <<EOF
+          $changed
+          EOF
+          git config user.name 'smolrunner-agent-6'
+          git config user.email 'smolrunner-agent-6@users.noreply.github.com'
+          git add src/personal_worker_queue.rs tests/personal_worker_queue_contract.rs
+          git commit -m 'Use ten-minute interactive cooldown'
+          git push origin HEAD:${{ github.head_ref }}
