@@ -461,6 +461,13 @@ fn validate_generation(
     previous: Option<&PersonalWorkerQueueDecision>,
 ) -> Result<(), PersonalWorkerQueueError> {
     if let Some(previous) = previous {
+        if previous.schema_version != PERSONAL_WORKER_QUEUE_SCHEMA_VERSION {
+            return Err(PersonalWorkerQueueError::new(
+                "previous.schema_version",
+                "unsupported_previous_queue_schema",
+                "previous queue decision schema is not supported",
+            ));
+        }
         let expected = previous.generation.next()?;
         if input.generation != expected {
             return Err(PersonalWorkerQueueError::new(
@@ -588,6 +595,26 @@ fn validate_active(
     observed_at: EpochMillis,
 ) -> Result<(), PersonalWorkerQueueError> {
     validate_request(&reservation.request, observed_at)?;
+    let admission_observed_at = reservation.admission.observed_at();
+    if admission_observed_at < reservation.request.submitted_at
+        || admission_observed_at > observed_at
+    {
+        return Err(PersonalWorkerQueueError::new(
+            "admission.observed_at",
+            "active_admission_time_out_of_bounds",
+            "active admission observation must be between submission and queue observation",
+        ));
+    }
+    if let PersonalWorkerCancellationState::Cancelled { cancelled_at } =
+        reservation.request.cancellation
+        && cancelled_at > admission_observed_at
+    {
+        return Err(PersonalWorkerQueueError::new(
+            "cancellation.cancelled_at",
+            "cancellation_after_admission_observation",
+            "draining admission must be observed at or after cancellation",
+        ));
+    }
     if reservation.request.cancellation.is_cancelled()
         && reservation.admission.state() != ExecutionAdmissionState::Draining
     {
@@ -638,7 +665,7 @@ fn validate_active(
             "active admission requires exact reservation evidence",
         )
     })?;
-    if evidence.expires_at < observed_at {
+    if evidence.expires_at <= observed_at {
         return Err(PersonalWorkerQueueError::new(
             "admission.reservation.expires_at",
             "expired_active_reservation",
@@ -673,14 +700,13 @@ fn validate_active(
         ExecutionAdmissionState::Starting
         | ExecutionAdmissionState::Running
         | ExecutionAdmissionState::Draining => {
-            if reservation
-                .started_at
-                .is_none_or(|started| started < evidence.reserved_at || started > observed_at)
-            {
+            if reservation.started_at.is_none_or(|started| {
+                started < evidence.reserved_at || started > admission_observed_at
+            }) {
                 return Err(PersonalWorkerQueueError::new(
                     "started_at",
                     "invalid_active_start_time",
-                    "started work requires a bounded time after reservation and before observation",
+                    "started work requires a bounded time after reservation and before admission observation",
                 ));
             }
         }

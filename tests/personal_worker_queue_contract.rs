@@ -552,3 +552,127 @@ fn cancelled_only_queue_does_not_hold_the_work_profile() {
         PersonalWorkerProfile::Stopped
     );
 }
+
+#[test]
+fn previous_queue_schema_must_match() {
+    let observed_at = 16_000_000;
+    let mut previous = evaluate_personal_worker_queue(&input(1, observed_at, vec![], vec![]), None)
+        .expect("previous decision");
+    previous.schema_version = 99;
+    let error =
+        evaluate_personal_worker_queue(&input(2, observed_at + 1, vec![], vec![]), Some(&previous))
+            .expect_err("schema drift");
+    assert_eq!(error.code, "unsupported_previous_queue_schema");
+}
+
+#[test]
+fn active_admission_time_is_bound_to_submission_and_queue_observation() {
+    let observed_at = 17_000_000;
+    let future = active(
+        "future-admission",
+        "example/future",
+        'a',
+        observed_at + 1_000,
+        limits(2_000, 2),
+        PersonalWorkerCacheAccessMode::Read,
+    );
+    let error = evaluate_personal_worker_queue(&input(1, observed_at, vec![], vec![future]), None)
+        .expect_err("future admission");
+    assert_eq!(error.code, "active_admission_time_out_of_bounds");
+
+    let mut before_submission = active(
+        "before-submission",
+        "example/before",
+        'b',
+        observed_at - 1_000,
+        limits(2_000, 2),
+        PersonalWorkerCacheAccessMode::Read,
+    );
+    before_submission.request.submitted_at = time(observed_at);
+    let error = evaluate_personal_worker_queue(
+        &input(1, observed_at, vec![], vec![before_submission]),
+        None,
+    )
+    .expect_err("admission before submission");
+    assert_eq!(error.code, "active_admission_time_out_of_bounds");
+}
+
+#[test]
+fn cancellation_and_start_cannot_postdate_active_admission() {
+    let observed_at = 18_000_000;
+    let mut cancelled = active(
+        "late-cancellation",
+        "example/cancel",
+        'a',
+        observed_at - 1_000,
+        limits(2_000, 2),
+        PersonalWorkerCacheAccessMode::Read,
+    );
+    cancelled.request.cancellation = PersonalWorkerCancellationState::Cancelled {
+        cancelled_at: time(observed_at),
+    };
+    let error =
+        evaluate_personal_worker_queue(&input(1, observed_at, vec![], vec![cancelled]), None)
+            .expect_err("late cancellation");
+    assert_eq!(error.code, "cancellation_after_admission_observation");
+
+    let mut late_start = active(
+        "late-start",
+        "example/start",
+        'b',
+        observed_at - 1_000,
+        limits(2_000, 2),
+        PersonalWorkerCacheAccessMode::Read,
+    );
+    late_start.started_at = Some(time(observed_at));
+    let error =
+        evaluate_personal_worker_queue(&input(1, observed_at, vec![], vec![late_start]), None)
+            .expect_err("late start");
+    assert_eq!(error.code, "invalid_active_start_time");
+}
+
+#[test]
+fn active_reservation_expiry_must_be_strictly_future() {
+    let observed_at = 19_000_000;
+    let request = request(
+        "expiry-boundary",
+        "example/expiry",
+        'a',
+        PersonalWorkerPriority::Normal,
+        observed_at - 60_000,
+        limits(2_000, 2),
+        PersonalWorkerCacheAccessMode::Read,
+    );
+    let admission_observed_at = observed_at - 1_000;
+    let admission = ExecutionAdmissionRecord::from_input(ExecutionAdmissionInput {
+        identity: request.identity.clone(),
+        state: ExecutionAdmissionState::Running,
+        observed_at: time(admission_observed_at),
+        requested_limits: request.requested_limits,
+        host_capacity: Some(HostCapacityObservation::new(
+            time(admission_observed_at),
+            limits(8_000, 10),
+        )),
+        applied_limits: Some(request.requested_limits),
+        queue_position: None,
+        reservation: Some(ReservationEvidence::new(
+            ReservationId::parse("reservation-expiry-boundary").expect("reservation"),
+            ReservationGeneration::new(1).expect("generation"),
+            time(observed_at - 30_000),
+            time(observed_at),
+        )),
+        acknowledgement: None,
+        fallback_eligibility: FallbackProfileEligibility::ineligible(),
+        unavailable_reason: None,
+    })
+    .expect("active admission");
+    let reservation = PersonalWorkerActiveReservation {
+        request,
+        admission,
+        started_at: Some(time(observed_at - 20_000)),
+    };
+    let error =
+        evaluate_personal_worker_queue(&input(1, observed_at, vec![], vec![reservation]), None)
+            .expect_err("expiry boundary");
+    assert_eq!(error.code, "expired_active_reservation");
+}
