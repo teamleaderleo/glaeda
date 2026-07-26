@@ -57,16 +57,16 @@ fn profile(with_receipt: bool) -> RenderproveVisionPacketProfile {
         RepositoryCommandId::parse("renderprove-vision-packet").expect("project command"),
         digest("44"),
     );
-    RenderproveVisionPacketProfile::new(
-        VerificationProfileId::parse("renderprove-vision-packet").expect("profile ID"),
-        repository,
+    RenderproveVisionPacketProfile::new(RenderproveVisionPacketProfileDefinition {
+        profile_id: VerificationProfileId::parse("renderprove-vision-packet").expect("profile ID"),
+        project_repository: repository,
         tested_source,
         project_command,
-        tool(),
-        slots(with_receipt),
-        resources(),
-        TimeoutPolicy::new(300, Vec::new()).expect("timeout"),
-    )
+        tool: tool(),
+        inputs: slots(with_receipt),
+        resources: resources(),
+        timeout: TimeoutPolicy::new(300, Vec::new()).expect("timeout"),
+    })
     .expect("profile")
 }
 
@@ -243,16 +243,16 @@ fn rejects_project_command_repository_mismatch() {
         tree: GitTreeId::parse(&"34".repeat(20)).expect("tree"),
     };
     assert!(
-        RenderproveVisionPacketProfile::new(
-            VerificationProfileId::parse("renderprove-vision-packet").expect("profile"),
-            repository,
+        RenderproveVisionPacketProfile::new(RenderproveVisionPacketProfileDefinition {
+            profile_id: VerificationProfileId::parse("renderprove-vision-packet").expect("profile"),
+            project_repository: repository,
             tested_source,
-            foreign_command,
-            tool(),
-            slots(false),
-            resources(),
-            TimeoutPolicy::new(300, Vec::new()).expect("timeout"),
-        )
+            project_command: foreign_command,
+            tool: tool(),
+            inputs: slots(false),
+            resources: resources(),
+            timeout: TimeoutPolicy::new(300, Vec::new()).expect("timeout"),
+        })
         .is_err()
     );
 }

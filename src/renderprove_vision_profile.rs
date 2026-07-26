@@ -398,6 +398,18 @@ impl RenderproveVisionExecutionPolicy {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderproveVisionPacketProfileDefinition {
+    pub profile_id: VerificationProfileId,
+    pub project_repository: RepositoryRef,
+    pub tested_source: TestedSourceIdentity,
+    pub project_command: RepositoryCommandIdentity,
+    pub tool: RenderproveVisionToolIdentity,
+    pub inputs: RenderproveVisionInputSlots,
+    pub resources: ResourceDefaults,
+    pub timeout: TimeoutPolicy,
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct RenderproveVisionPacketProfile {
     schema_version: u8,
@@ -420,15 +432,18 @@ impl RenderproveVisionPacketProfile {
     /// Returns an error unless the project-owned command identity belongs to the exact project
     /// repository. The external Renderprove tool identity remains deliberately separate.
     pub fn new(
-        profile_id: VerificationProfileId,
-        project_repository: RepositoryRef,
-        tested_source: TestedSourceIdentity,
-        project_command: RepositoryCommandIdentity,
-        tool: RenderproveVisionToolIdentity,
-        inputs: RenderproveVisionInputSlots,
-        resources: ResourceDefaults,
-        timeout: TimeoutPolicy,
+        definition: RenderproveVisionPacketProfileDefinition,
     ) -> Result<Self, RenderproveVisionProfileError> {
+        let RenderproveVisionPacketProfileDefinition {
+            profile_id,
+            project_repository,
+            tested_source,
+            project_command,
+            tool,
+            inputs,
+            resources,
+            timeout,
+        } = definition;
         if project_command.repository() != &project_repository {
             return Err(RenderproveVisionProfileError::new(
                 "project_command.repository",
