@@ -1,5 +1,5 @@
 use std::fmt;
-use std::io::{self, Write as _};
+use std::io;
 
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
