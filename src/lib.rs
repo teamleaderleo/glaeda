@@ -24,6 +24,7 @@ pub mod host_preparation_execution;
 pub mod host_preparation_plan;
 #[cfg(target_os = "linux")]
 pub mod host_preparation_receipt;
+pub mod host_preparation_receipt_binding;
 #[cfg(target_os = "linux")]
 pub mod host_readiness;
 #[cfg(target_os = "linux")]

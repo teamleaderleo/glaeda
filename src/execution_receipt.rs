@@ -16,6 +16,13 @@ pub const MAX_EXECUTION_RECEIPT_CONTINUATIONS: usize = 64;
 const MAX_TOKEN_LEN: usize = 128;
 const MAX_PRODUCER_VERSION_LEN: usize = 64;
 
+pub(crate) fn validate_receipt_token(
+    field: &str,
+    value: &str,
+) -> Result<(), ExecutionReceiptError> {
+    ReceiptToken::parse(field, value).map(|_| ())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ExecutionReceipt {
     document_type: ExecutionReceiptDocumentType,
