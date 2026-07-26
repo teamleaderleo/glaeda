@@ -1,0 +1,98 @@
+name: Temporary execution receipt refinements
+
+on:
+  push:
+    branches:
+      - feat/execution-receipt-contract-v1
+
+permissions:
+  contents: write
+
+jobs:
+  refine:
+    if: github.actor == 'teamleaderleo'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: feat/execution-receipt-contract-v1
+          show-progress: false
+      - name: Apply exact contract refinements
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('src/execution_receipt.rs')
+          text = path.read_text()
+
+          old = '''        if version.is_empty()
+            || version.len() > MAX_PRODUCER_VERSION_LEN
+            || !version
+'''
+          new = '''        if version.is_empty()
+            || version.len() > MAX_PRODUCER_VERSION_LEN
+            || !version.as_bytes()[0].is_ascii_alphanumeric()
+            || !version
+'''
+          if old not in text:
+              raise SystemExit('producer validation anchor missing')
+          text = text.replace(old, new, 1)
+
+          old = '''    pub const fn disposition(&self) -> ExecutionReceiptDisposition {
+        self.disposition
+    }
+
+    #[must_use]
+    pub fn actions(&self) -> &[ExecutionReceiptAction] {
+'''
+          new = '''    pub const fn disposition(&self) -> ExecutionReceiptDisposition {
+        self.disposition
+    }
+
+    #[must_use]
+    pub const fn operation(&self) -> &ExecutionReceiptOperation {
+        &self.operation
+    }
+
+    #[must_use]
+    pub fn actions(&self) -> &[ExecutionReceiptAction] {
+'''
+          if old not in text:
+              raise SystemExit('operation getter anchor missing')
+          text = text.replace(old, new, 1)
+
+          old = '''    let wire: WireExecutionReceipt = serde_json::from_str(input).map_err(|error| {
+        ExecutionReceiptError::single(format!("execution receipt JSON is invalid: {error}"))
+    })?;
+'''
+          new = '''    let wire: WireExecutionReceipt = serde_json::from_str(input).map_err(|_| {
+        ExecutionReceiptError::single("execution receipt JSON or schema is invalid")
+    })?;
+'''
+          if old not in text:
+              raise SystemExit('decoder error anchor missing')
+          text = text.replace(old, new, 1)
+
+          old = '''#[derive(Debug, Deserialize)]
+#[serde(tag = "family", rename_all = "snake_case")]
+enum WireExecutionReceiptOperation {
+'''
+          new = '''#[derive(Debug, Deserialize)]
+#[serde(tag = "family", rename_all = "snake_case", deny_unknown_fields)]
+enum WireExecutionReceiptOperation {
+'''
+          if old not in text:
+              raise SystemExit('wire operation anchor missing')
+          text = text.replace(old, new, 1)
+
+          path.write_text(text)
+          PY
+          cargo fmt --all
+          rm -f .github/workflows/temporary-refine-execution-receipt.yml
+      - name: Commit refined contract
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Refine execution receipt validation boundary"
+          git push origin HEAD:feat/execution-receipt-contract-v1
