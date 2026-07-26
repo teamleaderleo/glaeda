@@ -1,0 +1,37 @@
+name: Diagnose issue 173
+
+on:
+  push:
+    branches:
+      - feat/issue-173-renderprove-vision-profile
+
+permissions:
+  contents: write
+
+concurrency:
+  group: diagnose-issue-173
+  cancel-in-progress: true
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: feat/issue-173-renderprove-vision-profile
+          show-progress: false
+      - name: Capture Clippy diagnostics
+        run: |
+          set +e
+          cargo clippy --locked --all-targets --all-features -- -D warnings >.tmp-issue-173-clippy.log 2>&1
+          status=$?
+          printf '\nexit_status=%s\n' "$status" >>.tmp-issue-173-clippy.log
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add .tmp-issue-173-clippy.log
+          if ! git diff --cached --quiet; then
+            git commit -m 'Capture issue 173 Clippy diagnostics'
+            git push origin HEAD:feat/issue-173-renderprove-vision-profile
+          fi
