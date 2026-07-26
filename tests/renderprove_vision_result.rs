@@ -23,26 +23,17 @@ fn tool() -> RenderproveVisionToolIdentity {
         commit("ab"),
         digest("cd"),
         RepositoryCommandId::parse(RENDERPROVE_VISION_COMMAND_ID).expect("command ID"),
-        Sha256Digest::parse(RENDERPROVE_VISION_COMMAND_CONTRACT_DIGEST)
-            .expect("contract digest"),
+        Sha256Digest::parse(RENDERPROVE_VISION_COMMAND_CONTRACT_DIGEST).expect("contract digest"),
     )
     .expect("tool identity")
 }
 
 fn slots() -> RenderproveVisionInputSlots {
     RenderproveVisionInputSlots::new(
-        RenderproveVisionInputSlot::screenshot_png(
-            "private/screen.png",
-            1_024,
-            digest("11"),
-        )
-        .expect("screenshot"),
-        RenderproveVisionInputSlot::operator_brief_utf8(
-            "private/brief.txt",
-            120,
-            digest("22"),
-        )
-        .expect("brief"),
+        RenderproveVisionInputSlot::screenshot_png("private/screen.png", 1_024, digest("11"))
+            .expect("screenshot"),
+        RenderproveVisionInputSlot::operator_brief_utf8("private/brief.txt", 120, digest("22"))
+            .expect("brief"),
         None,
     )
     .expect("slots")
@@ -158,8 +149,8 @@ fn rejects_admission_profile_and_terminal_identity_drift() {
         VerificationProfileId::parse("other-profile").expect("profile"),
         RunnerProfileId::parse("local-linux").expect("runner profile"),
     );
-    let evidence = RenderproveVisionTerminalEvidence::new(
-        RenderproveVisionTerminalEvidenceDefinition {
+    let evidence =
+        RenderproveVisionTerminalEvidence::new(RenderproveVisionTerminalEvidenceDefinition {
             admission: wrong_admission,
             tested_source: profile.tested_source().clone(),
             project_command: profile.project_command().clone(),
@@ -167,9 +158,8 @@ fn rejects_admission_profile_and_terminal_identity_drift() {
             process: RenderproveVisionProcessOutcome::Succeeded,
             cleanup: RenderproveVisionCleanupOutcome::Completed,
             preview: Some(preview(profile.tool())),
-        },
-    )
-    .expect("evidence");
+        })
+        .expect("evidence");
     assert!(finalize_renderprove_vision_result(&profile, evidence).is_err());
 
     let drifted_command = RepositoryCommandIdentity::new(
@@ -177,8 +167,8 @@ fn rejects_admission_profile_and_terminal_identity_drift() {
         RepositoryCommandId::parse("different-command").expect("command"),
         digest("77"),
     );
-    let evidence = RenderproveVisionTerminalEvidence::new(
-        RenderproveVisionTerminalEvidenceDefinition {
+    let evidence =
+        RenderproveVisionTerminalEvidence::new(RenderproveVisionTerminalEvidenceDefinition {
             admission: admission(&profile),
             tested_source: profile.tested_source().clone(),
             project_command: drifted_command,
@@ -188,17 +178,16 @@ fn rejects_admission_profile_and_terminal_identity_drift() {
             },
             cleanup: RenderproveVisionCleanupOutcome::Completed,
             preview: None,
-        },
-    )
-    .expect("evidence");
+        })
+        .expect("evidence");
     assert!(finalize_renderprove_vision_result(&profile, evidence).is_err());
 }
 
 #[test]
 fn derives_stable_failure_dispositions_without_private_diagnostics() {
     let profile = profile();
-    let process_failure = RenderproveVisionTerminalEvidence::new(
-        RenderproveVisionTerminalEvidenceDefinition {
+    let process_failure =
+        RenderproveVisionTerminalEvidence::new(RenderproveVisionTerminalEvidenceDefinition {
             admission: admission(&profile),
             tested_source: profile.tested_source().clone(),
             project_command: profile.project_command().clone(),
@@ -208,9 +197,8 @@ fn derives_stable_failure_dispositions_without_private_diagnostics() {
             },
             cleanup: RenderproveVisionCleanupOutcome::Completed,
             preview: None,
-        },
-    )
-    .expect("evidence");
+        })
+        .expect("evidence");
     let result = finalize_renderprove_vision_result(&profile, process_failure).expect("result");
     assert_eq!(
         result.disposition(),
@@ -223,8 +211,8 @@ fn derives_stable_failure_dispositions_without_private_diagnostics() {
         RenderproveVisionEvidenceDisclosure::Unavailable
     );
 
-    let cleanup_failure = RenderproveVisionTerminalEvidence::new(
-        RenderproveVisionTerminalEvidenceDefinition {
+    let cleanup_failure =
+        RenderproveVisionTerminalEvidence::new(RenderproveVisionTerminalEvidenceDefinition {
             admission: admission(&profile),
             tested_source: profile.tested_source().clone(),
             project_command: profile.project_command().clone(),
@@ -232,9 +220,8 @@ fn derives_stable_failure_dispositions_without_private_diagnostics() {
             process: RenderproveVisionProcessOutcome::Succeeded,
             cleanup: RenderproveVisionCleanupOutcome::Failed,
             preview: Some(preview(profile.tool())),
-        },
-    )
-    .expect("evidence");
+        })
+        .expect("evidence");
     let result = finalize_renderprove_vision_result(&profile, cleanup_failure).expect("result");
     assert_eq!(
         result.disposition(),
@@ -248,8 +235,8 @@ fn derives_stable_failure_dispositions_without_private_diagnostics() {
 #[test]
 fn treats_missing_preview_as_malformed_and_refuses_preview_after_process_failure() {
     let profile = profile();
-    let missing_preview = RenderproveVisionTerminalEvidence::new(
-        RenderproveVisionTerminalEvidenceDefinition {
+    let missing_preview =
+        RenderproveVisionTerminalEvidence::new(RenderproveVisionTerminalEvidenceDefinition {
             admission: admission(&profile),
             tested_source: profile.tested_source().clone(),
             project_command: profile.project_command().clone(),
@@ -257,9 +244,8 @@ fn treats_missing_preview_as_malformed_and_refuses_preview_after_process_failure
             process: RenderproveVisionProcessOutcome::Succeeded,
             cleanup: RenderproveVisionCleanupOutcome::Completed,
             preview: None,
-        },
-    )
-    .expect("evidence");
+        })
+        .expect("evidence");
     let result = finalize_renderprove_vision_result(&profile, missing_preview).expect("result");
     assert_eq!(
         result.disposition(),

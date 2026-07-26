@@ -5,8 +5,7 @@ use serde::Serialize;
 use crate::artifact::RepositoryRef;
 use crate::execution_admission::ExecutionAdmissionIdentity;
 use crate::renderprove_vision_profile::{
-    RenderproveVisionPacketProfile, RenderproveVisionPreviewEvidence,
-    RenderproveVisionToolIdentity,
+    RenderproveVisionPacketProfile, RenderproveVisionPreviewEvidence, RenderproveVisionToolIdentity,
 };
 use crate::verification_profile::{
     RepositoryCommandIdentity, TestedSourceIdentity, VerificationProfileId,
@@ -116,8 +115,10 @@ impl RenderproveVisionTerminalEvidence {
     pub fn new(
         definition: RenderproveVisionTerminalEvidenceDefinition,
     ) -> Result<Self, RenderproveVisionResultError> {
-        if matches!(definition.process, RenderproveVisionProcessOutcome::Failed { .. })
-            && definition.preview.is_some()
+        if matches!(
+            definition.process,
+            RenderproveVisionProcessOutcome::Failed { .. }
+        ) && definition.preview.is_some()
         {
             return Err(RenderproveVisionResultError::new(
                 "evidence.preview",
@@ -210,17 +211,23 @@ pub fn finalize_renderprove_vision_result(
         ));
     }
 
-    let disposition = match (evidence.process, evidence.cleanup, evidence.preview.as_ref()) {
+    let disposition = match (
+        evidence.process,
+        evidence.cleanup,
+        evidence.preview.as_ref(),
+    ) {
         (
             RenderproveVisionProcessOutcome::Succeeded,
             RenderproveVisionCleanupOutcome::Completed,
             Some(_),
         ) => RenderproveVisionDisposition::Succeeded,
-        (RenderproveVisionProcessOutcome::Succeeded, RenderproveVisionCleanupOutcome::Failed, _) => {
-            RenderproveVisionDisposition::Failed {
-                code: RenderproveVisionFailureCode::CleanupFailed,
-            }
-        }
+        (
+            RenderproveVisionProcessOutcome::Succeeded,
+            RenderproveVisionCleanupOutcome::Failed,
+            _,
+        ) => RenderproveVisionDisposition::Failed {
+            code: RenderproveVisionFailureCode::CleanupFailed,
+        },
         (RenderproveVisionProcessOutcome::Succeeded, _, None) => {
             RenderproveVisionDisposition::Failed {
                 code: RenderproveVisionFailureCode::MalformedPreview,
@@ -263,11 +270,7 @@ pub struct RenderproveVisionResultError {
 }
 
 impl RenderproveVisionResultError {
-    fn new(
-        field: impl Into<String>,
-        code: impl Into<String>,
-        problem: impl Into<String>,
-    ) -> Self {
+    fn new(field: impl Into<String>, code: impl Into<String>, problem: impl Into<String>) -> Self {
         Self {
             field: field.into(),
             code: code.into(),
