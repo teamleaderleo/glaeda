@@ -15,6 +15,7 @@ pub mod exact_commit_handoff;
 pub mod execution_admission;
 pub mod execution_receipt;
 pub mod execution_receipt_store;
+pub mod personal_worker_queue;
 pub mod host;
 #[cfg(target_os = "linux")]
 pub mod host_package_plan;
