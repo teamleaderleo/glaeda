@@ -71,6 +71,8 @@ The v1 coverage declaration is fixed as partial, redacted, and not truncated. It
 
 Free-form strings are not accepted as action IDs, phase IDs, continuation IDs, or failure codes. Public identity fields use existing validated `JournalId`, `RepositoryRef`, and `Sha256Digest` types.
 
+Untrusted JSON and schema failures use one bounded generic diagnostic. Unknown attacker-controlled field names or values are not copied into the public error text.
+
 ## Limits
 
 - maximum encoded receipt: 65,536 bytes;
