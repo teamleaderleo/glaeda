@@ -76,6 +76,16 @@ A doctor warning is acceptable on a development machine that lacks Podman or sys
 - Agent diagnosis and recommendations remain separate from observed facts. Agents may propose issues, tests, patches, and pull requests but may not expand their own authority, approve their own privileged mutation, or treat a generated fix as verified before reproducing and clearing the original failure.
 - Restore begins quarantined. Restored names and documents do not authorise adoption until fresh host and GitHub observations satisfy the canonical ownership contract.
 
+## Multi-agent coordination
+
+- Follow `docs/AGENT_COORDINATION.md` whenever work is delegated between agents.
+- Repository implementation must finish in the active work session with an observable artifact or an explicit blocked or failed result.
+- Do not create scheduled tasks, reminders, recurring checks, or condition watches to wake, poll, or coordinate implementation agents.
+- Define the exact base SHA, owned scope, deliverable, checks, completion signal, and recovery rule before delegation.
+- Git branches, exact commit SHAs, pull requests, comments, and workflow conclusions are valid signals. Hidden chat state and silence are not.
+- Check a delegated completion signal at most twice during one coordination pass. After the second miss, classify the work as stalled and take over, reassign, or reduce the scope.
+- A dependent agent completes all independent work, reports the exact dependency, and stops. It must not remain indefinitely in a waiting or listening state.
+
 ## Pull requests
 
 Keep changes small enough to review. State the security impact, commands run, and any host assumptions. Do not claim a VPS, GitHub runner, Podman preview, route, provider path, automatic repair, rollback, restore, incident upload, or fleet directive passed unless the exact tested commit and result are available.
