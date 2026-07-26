@@ -10,7 +10,6 @@ permissions:
 
 jobs:
   refine:
-    if: github.actor == 'teamleaderleo'
     runs-on: ubuntu-24.04
     steps:
       - name: Check out branch
@@ -18,78 +17,39 @@ jobs:
         with:
           ref: feat/execution-receipt-contract-v1
           show-progress: false
-      - name: Apply exact contract refinements
+      - name: Refine contract
         run: |
           python3 - <<'PY'
           from pathlib import Path
-          path = Path('src/execution_receipt.rs')
+          path = Path("src/execution_receipt.rs")
           text = path.read_text()
-
-          old = '''        if version.is_empty()
-            || version.len() > MAX_PRODUCER_VERSION_LEN
-            || !version
-'''
-          new = '''        if version.is_empty()
-            || version.len() > MAX_PRODUCER_VERSION_LEN
-            || !version.as_bytes()[0].is_ascii_alphanumeric()
-            || !version
-'''
-          if old not in text:
-              raise SystemExit('producer validation anchor missing')
-          text = text.replace(old, new, 1)
-
-          old = '''    pub const fn disposition(&self) -> ExecutionReceiptDisposition {
-        self.disposition
-    }
-
-    #[must_use]
-    pub fn actions(&self) -> &[ExecutionReceiptAction] {
-'''
-          new = '''    pub const fn disposition(&self) -> ExecutionReceiptDisposition {
-        self.disposition
-    }
-
-    #[must_use]
-    pub const fn operation(&self) -> &ExecutionReceiptOperation {
-        &self.operation
-    }
-
-    #[must_use]
-    pub fn actions(&self) -> &[ExecutionReceiptAction] {
-'''
-          if old not in text:
-              raise SystemExit('operation getter anchor missing')
-          text = text.replace(old, new, 1)
-
-          old = '''    let wire: WireExecutionReceipt = serde_json::from_str(input).map_err(|error| {
-        ExecutionReceiptError::single(format!("execution receipt JSON is invalid: {error}"))
-    })?;
-'''
-          new = '''    let wire: WireExecutionReceipt = serde_json::from_str(input).map_err(|_| {
-        ExecutionReceiptError::single("execution receipt JSON or schema is invalid")
-    })?;
-'''
-          if old not in text:
-              raise SystemExit('decoder error anchor missing')
-          text = text.replace(old, new, 1)
-
-          old = '''#[derive(Debug, Deserialize)]
-#[serde(tag = "family", rename_all = "snake_case")]
-enum WireExecutionReceiptOperation {
-'''
-          new = '''#[derive(Debug, Deserialize)]
-#[serde(tag = "family", rename_all = "snake_case", deny_unknown_fields)]
-enum WireExecutionReceiptOperation {
-'''
-          if old not in text:
-              raise SystemExit('wire operation anchor missing')
-          text = text.replace(old, new, 1)
-
+          changes = [
+              (
+                  "            || version.len() > MAX_PRODUCER_VERSION_LEN\n            || !version\n",
+                  "            || version.len() > MAX_PRODUCER_VERSION_LEN\n            || !version.as_bytes()[0].is_ascii_alphanumeric()\n            || !version\n",
+              ),
+              (
+                  "    pub const fn disposition(&self) -> ExecutionReceiptDisposition {\n        self.disposition\n    }\n\n    #[must_use]\n    pub fn actions(&self) -> &[ExecutionReceiptAction] {\n",
+                  "    pub const fn disposition(&self) -> ExecutionReceiptDisposition {\n        self.disposition\n    }\n\n    #[must_use]\n    pub const fn operation(&self) -> &ExecutionReceiptOperation {\n        &self.operation\n    }\n\n    #[must_use]\n    pub fn actions(&self) -> &[ExecutionReceiptAction] {\n",
+              ),
+              (
+                  "    let wire: WireExecutionReceipt = serde_json::from_str(input).map_err(|error| {\n        ExecutionReceiptError::single(format!(\"execution receipt JSON is invalid: {error}\"))\n    })?;\n",
+                  "    let wire: WireExecutionReceipt = serde_json::from_str(input).map_err(|_| {\n        ExecutionReceiptError::single(\"execution receipt JSON or schema is invalid\")\n    })?;\n",
+              ),
+              (
+                  "#[serde(tag = \"family\", rename_all = \"snake_case\")]\nenum WireExecutionReceiptOperation {\n",
+                  "#[serde(tag = \"family\", rename_all = \"snake_case\", deny_unknown_fields)]\nenum WireExecutionReceiptOperation {\n",
+              ),
+          ]
+          for old, new in changes:
+              if old not in text:
+                  raise SystemExit(f"missing exact refinement anchor: {old!r}")
+              text = text.replace(old, new, 1)
           path.write_text(text)
           PY
           cargo fmt --all
-          rm -f .github/workflows/temporary-refine-execution-receipt.yml
-      - name: Commit refined contract
+          rm .github/workflows/temporary-refine-execution-receipt.yml
+      - name: Commit final contract
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
