@@ -143,7 +143,7 @@ pub fn inspect_default_staged_installations()
 /// Inspect abandoned installation-publication staging trees beneath one trusted state root.
 ///
 /// A complete orphan has a canonical installation ID, exact owner and mode, only the expected
-/// `resources`, `journals`, and `project.json` entries, and a strict project document whose embedded
+/// `resources`, `journals`, `receipts`, and `project.json` entries, and a strict project document whose embedded
 /// installation ID matches its directory. Structurally trusted but incomplete content is reported
 /// as incomplete. Symlinks, foreign ownership, broad modes, hard links, unexpected entries, and
 /// inspection failures are suspicious. No finding is changed automatically.
@@ -245,6 +245,14 @@ fn inspect_staged_entry(
         StagedInstallationConcern::UnsafeJournals,
         &mut concerns,
     );
+    inspect_expected_directory(
+        &directory,
+        RECEIPTS_DIRECTORY,
+        owner,
+        StagedInstallationConcern::MissingReceipts,
+        StagedInstallationConcern::UnsafeReceipts,
+        &mut concerns,
+    );
     inspect_project(&directory, owner, installation_id.as_ref(), &mut concerns);
     finish_finding(name_bytes, concerns)
 }
@@ -315,7 +323,10 @@ fn inspect_stage_contents(directory: &OwnedFd, concerns: &mut Vec<StagedInstalla
             concerns.push(StagedInstallationConcern::UnexpectedEntry);
             return;
         }
-        if !matches!(name, b"resources" | b"journals" | b"project.json") {
+        if !matches!(
+            name,
+            b"resources" | b"journals" | b"receipts" | b"project.json"
+        ) {
             concerns.push(StagedInstallationConcern::UnexpectedEntry);
         }
     }
@@ -569,8 +580,9 @@ mod tests {
     use crate::state_store::StateStoreErrorKind;
 
     use super::{
-        JOURNALS_DIRECTORY, PROJECT_FILE, RESOURCES_DIRECTORY, STAGING_DIRECTORY,
-        StagedInstallationConcern, StagedInstallationDisposition, inspect_staged_installations,
+        JOURNALS_DIRECTORY, PROJECT_FILE, RECEIPTS_DIRECTORY, RESOURCES_DIRECTORY,
+        STAGING_DIRECTORY, StagedInstallationConcern, StagedInstallationDisposition,
+        inspect_staged_installations,
     };
 
     static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
@@ -621,11 +633,13 @@ mod tests {
         let stage = root.join(STAGING_DIRECTORY).join(directory_id.as_str());
         fs::create_dir_all(stage.join(RESOURCES_DIRECTORY)).expect("create resources directory");
         fs::create_dir_all(stage.join(JOURNALS_DIRECTORY)).expect("create journals directory");
+        fs::create_dir_all(stage.join(RECEIPTS_DIRECTORY)).expect("create receipts directory");
         for directory in [
             root.join(STAGING_DIRECTORY),
             stage.clone(),
             stage.join(RESOURCES_DIRECTORY),
             stage.join(JOURNALS_DIRECTORY),
+            stage.join(RECEIPTS_DIRECTORY),
         ] {
             fs::set_permissions(directory, fs::Permissions::from_mode(0o750))
                 .expect("set staged directory mode");
