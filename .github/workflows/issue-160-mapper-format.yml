@@ -41,12 +41,30 @@ jobs:
       - name: Format mapper
         run: cargo fmt --all
 
-      - name: Verify formatted mapper
+      - name: Capture mapper verification
+        id: verify
+        continue-on-error: true
         run: |
-          cargo check --locked --all-targets --all-features
-          cargo test --locked --all-targets --all-features
+          set +e
+          cargo check --locked --all-targets --all-features > mapper-verify.txt 2>&1
+          status=$?
+          if [ "${status}" -eq 0 ]; then
+            cargo test --locked --all-targets --all-features >> mapper-verify.txt 2>&1
+            status=$?
+          fi
+          exit "${status}"
+
+      - name: Upload mapper verification
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: issue-160-mapper-verify
+          path: mapper-verify.txt
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Commit only reviewed mapper changes
+        if: steps.verify.outcome == 'success'
         run: |
           changed="$(git diff --name-only)"
           if [ -z "${changed}" ]; then
@@ -69,3 +87,7 @@ jobs:
           git add src/host_preparation_receipt.rs tests/host_preparation_receipt_mapper.rs
           git commit -m 'Format and verify host preparation receipt mapper'
           git push origin HEAD:${{ github.head_ref }}
+
+      - name: Preserve mapper verification result
+        if: steps.verify.outcome != 'success'
+        run: exit 1
