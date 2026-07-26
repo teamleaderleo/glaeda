@@ -5,7 +5,7 @@
 SmolRunner, pronounced “small runner,” is a Rust-based steward for small fleets of self-hosted GitHub Actions runners. It is aimed at solo developers and small teams who have ordinary Linux servers, several repositories, and no desire to operate Kubernetes or inherit a full platform-engineering stack.
 
 > [!IMPORTANT]
-> SmolRunner is pre-alpha. The current executable provides host diagnostics and read-only desired-state and host-state planning; runner installation and reconciliation are roadmap work.
+> SmolRunner is pre-alpha. The current executable provides host diagnostics, read-only desired-state and host-state planning, and a Linux-only path that executes exactly one explicitly confirmed host-preparation phase through a durable journal. Runner registration, runner-service lifecycle, project reconciliation, and unattended control remain roadmap work.
 
 ## The problem
 
@@ -44,7 +44,17 @@ cargo run --locked -- host plan --file examples/quarry.yml
 cargo run --locked -- --output json host plan --file examples/glossless.yml
 ```
 
-`doctor` probes Linux support, architecture, systemd, cgroup v2, Podman, and Git. `plan` validates the versioned manifest and describes the runner user, registration, container image, and disposable verification boundary SmolRunner would eventually reconcile. `host plan` additionally reads bounded host state and distinguishes proven absence from facts that still need a privileged or authenticated inspection path. All commands are read-only, and human and JSON output come from the same typed reports.
+On Linux, propose one host-preparation phase and require its exact deterministic confirmation before mutation:
+
+```bash
+sudo cargo run --locked -- host prepare --file examples/quarry.yml
+sudo cargo run --locked -- host prepare --file examples/quarry.yml --confirm EXACT_CONFIRMATION
+sudo cargo run --locked -- --output json host prepare --file examples/quarry.yml --confirm EXACT_CONFIRMATION
+```
+
+The first command re-observes the host, prints the reviewed proposal and confirmation requirement, and performs no mutation. The confirmed command re-observes and replans in the same elevated process, executes only the matching single phase, checkpoints the journal before and after each action, and stops at any fresh-observation barrier. Initial host mutations are deliberately treated as irreversible; there is no generic `apply`, multi-phase continuation, automatic retry, or unattended repair path.
+
+`doctor` probes Linux support, architecture, systemd, cgroup v2, Podman, and Git. `plan` validates the versioned manifest and describes the runner user, registration, container image, and disposable verification boundary SmolRunner would eventually reconcile. `host plan` additionally reads bounded host state and distinguishes proven absence from facts that still need a privileged or authenticated inspection path. These three commands are read-only. `host prepare` is the narrow mutating exception and requires explicit elevation plus an exact confirmation derived from the immediately preceding public proposal. Human and JSON output come from the same typed reports.
 
 ## Manifest boundary
 
@@ -87,11 +97,11 @@ See the [manifest reference](docs/MANIFEST.md) and the redacted [Quarry](example
 
 SmolRunner models desired state, current state, proposed actions, execution, and ownership separately. Current observations are reported as `present`, `absent`, or `unknown`; unknown facts produce inspection actions rather than speculative mutations.
 
-The process layer is shell-free, clears ambient environment variables, requires absolute program paths, captures structured results, and redacts explicitly marked secret values. It is not yet connected to any mutation command. See [host reconciliation](docs/HOST_RECONCILIATION.md).
+The process layer is shell-free, clears ambient environment variables, requires absolute program paths, captures structured results, and redacts explicitly marked secret values. The public mutation path consumes only reviewed typed root or runner-user commands from one confirmed host-preparation phase. It does not accept free-form commands or continue through a fresh-observation barrier. See [host reconciliation](docs/HOST_RECONCILIATION.md).
 
 The execution-journal model assigns every future mutation an immutable ID, execution lane, rollback class, and precondition evidence. Invalid plans never reach an executor, unconfirmed irreversible work blocks the whole batch before its first mutation, and partial failures retain reverse-order rollback, compensation, and rollback-failure outcomes. The accepted architecture is recorded in [ADR 0001](docs/adr/0001-privilege-adoption-and-rollback.md).
 
-The ownership model protects existing infrastructure from name-based adoption. A resource is managed only when its versioned marker, project identity, host installation identity, locator, and required immutable evidence all match. An exact unmarked match is merely adoptable and still requires explicit confirmation; foreign, conflicting, and unknown state remains protected. The planned system state root is `/var/lib/smolrunner`, but no state-writing path exists yet. See [ADR 0002](docs/adr/0002-durable-ownership-state.md).
+The ownership model protects existing infrastructure from name-based adoption. A resource is managed only when its versioned marker, project identity, host installation identity, locator, and required immutable evidence all match. An exact unmarked match is merely adoptable and still requires explicit confirmation; foreign, conflicting, and unknown state remains protected. Durable installation, lease, and execution-journal state is stored beneath the reviewed Linux state root at `/var/lib/smolrunner` through symlink-safe, permission-checked, atomic adapters. See [ADR 0002](docs/adr/0002-durable-ownership-state.md).
 
 Canonical constructors now define exact locators and minimum evidence for Linux users, managed directories, systemd services, official runner installations, rootless Podman images, and GitHub runner registrations. Desired identities cannot be created from names, mutable image tags, or labels alone; partial observations may omit evidence only so ownership classification can return `unknown`. The model also records which execution lane must collect each observation and which evidence survives host restore, repository transfer, or runner re-registration. See [ADR 0003](docs/adr/0003-canonical-resource-evidence.md).
 
@@ -167,6 +177,8 @@ cargo run --locked --quiet -- --output json plan --file examples/glossless.yml
 cargo run --locked --quiet -- --output json host plan --file examples/quarry.yml
 ```
 
+Live `host prepare` acceptance additionally belongs in disposable Debian and Ubuntu environments because it requires Linux privilege, a reviewed state root, and exact host evidence.
+
 ## Project documents
 
 - [Threat model](docs/THREAT_MODEL.md)
@@ -192,7 +204,7 @@ cargo run --locked --quiet -- --output json host plan --file examples/quarry.yml
 
 ## Project status
 
-The first milestone is a dependable diagnostic and desired-state foundation. Runner lifecycle, disposable execution, and small-fleet operations come before leased previews or worker-pool coordination. A dashboard and broader distribution support remain deferred until the CLI and security model have proven themselves.
+SmolRunner has a dependable diagnostic and desired-state foundation plus its first explicitly confirmed, one-phase durable host-mutation path. It can prepare reviewed portions of Linux host state and stop at fresh-observation barriers; it does not yet register the official runner, reconcile runner services, enroll projects through the public CLI, or operate an unattended control loop. Runner lifecycle, disposable execution, and small-fleet operations remain the next product milestones. A dashboard and broader distribution support remain deferred until the CLI and security model have proven themselves.
 
 ## License
 
