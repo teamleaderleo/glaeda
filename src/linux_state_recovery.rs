@@ -146,8 +146,10 @@ pub fn inspect_orphans(
     inspect_directory_owner(&resources, "resources directory", root_owner)?;
     let journals = open_directory_at(&installation, "journals", "journals directory")?;
     inspect_directory_owner(&journals, "journals directory", root_owner)?;
-    let receipts = open_directory_at(&installation, "receipts", "receipts directory")?;
-    inspect_directory_owner(&receipts, "receipts directory", root_owner)?;
+    let receipts = open_optional_directory_at(&installation, "receipts", "receipts directory")?;
+    if let Some(receipts) = &receipts {
+        inspect_directory_owner(receipts, "receipts directory", root_owner)?;
+    }
 
     let mut findings = Vec::new();
     let mut truncated = false;
@@ -176,9 +178,9 @@ pub fn inspect_orphans(
             &mut truncated,
         )?;
     }
-    if !truncated {
+    if !truncated && let Some(receipts) = receipts.as_ref() {
         scan_directory(
-            &receipts,
+            receipts,
             RecoveryArea::Receipts,
             root_uid,
             &mut findings,
@@ -347,6 +349,21 @@ fn open_directory_at(
         .map_err(|error| map_directory_open_error(error, subject))?;
     inspect_directory(&directory, subject)?;
     Ok(directory)
+}
+
+fn open_optional_directory_at(
+    parent: &OwnedFd,
+    name: &str,
+    subject: &str,
+) -> Result<Option<OwnedFd>, StateStoreError> {
+    match fs::openat(parent, name, DIRECTORY_FLAGS, Mode::empty()) {
+        Ok(directory) => {
+            inspect_directory(&directory, subject)?;
+            Ok(Some(directory))
+        }
+        Err(Errno::NOENT) => Ok(None),
+        Err(error) => Err(map_directory_open_error(error, subject)),
+    }
 }
 
 fn inspect_directory(
@@ -584,6 +601,16 @@ mod tests {
                 .concerns()
                 .contains(&RecoveryConcern::MalformedTemporaryName)
         );
+    }
+
+    #[test]
+    fn missing_legacy_receipts_directory_is_treated_as_empty() {
+        let root = TempRoot::new("legacy-no-receipts");
+        fs::remove_dir(root.installation().join("receipts")).expect("remove receipts directory");
+
+        let report = inspect_orphans(root.path(), &installation_id()).expect("inspect legacy tree");
+        assert!(report.findings().is_empty());
+        assert!(!report.truncated());
     }
 
     #[test]

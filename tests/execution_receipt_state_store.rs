@@ -1,5 +1,14 @@
 use std::collections::BTreeMap;
 
+#[cfg(target_os = "linux")]
+use std::fs;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(target_os = "linux")]
+use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use smolrunner::artifact::{RepositoryRef, Sha256Digest};
 use smolrunner::execution_receipt::{
     ExecutionReceipt, ExecutionReceiptAction, ExecutionReceiptActionOutcome,
@@ -11,6 +20,10 @@ use smolrunner::execution_receipt_store::{
     publish_execution_receipt, read_execution_receipt,
 };
 use smolrunner::journal::{ExecutionLane, RollbackClass};
+#[cfg(target_os = "linux")]
+use smolrunner::linux_state::LinuxStateRoot;
+#[cfg(target_os = "linux")]
+use smolrunner::linux_state_prepare::prepare_installation;
 use smolrunner::state::{InstallationId, JournalId, StateComponent, StatePath};
 use smolrunner::state_store::{
     StateRead, StateRecord, StateStore, StateStoreError, StateStoreErrorKind,
@@ -208,5 +221,82 @@ fn missing_receipt_is_distinct_from_corrupt_or_conflicting_state() {
         read_execution_receipt(&store, &installation_id(), &execution_id())
             .expect("read missing receipt"),
         None
+    );
+}
+
+#[cfg(target_os = "linux")]
+static NEXT_LINUX_ROOT: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(target_os = "linux")]
+struct TempLinuxRoot(PathBuf);
+
+#[cfg(target_os = "linux")]
+impl TempLinuxRoot {
+    fn new() -> Self {
+        let sequence = NEXT_LINUX_ROOT.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "smolrunner-receipt-store-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir(&path).expect("create Linux state root");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o750))
+            .expect("set Linux state-root mode");
+        Self(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for TempLinuxRoot {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_state_store_publishes_private_receipt_and_replays_without_replacement() {
+    let root = TempLinuxRoot::new();
+    let installation = installation_id();
+    prepare_installation(root.path(), &installation).expect("prepare receipt state");
+    let mut store = LinuxStateRoot::open(root.path()).expect("open Linux state store");
+    let value = receipt("ensure-host", "2026-07-26T20:00:01.000Z");
+
+    let created = publish_execution_receipt(&mut store, &installation, &value)
+        .expect("publish Linux receipt");
+    assert_eq!(
+        created.disposition(),
+        ExecutionReceiptPublicationDisposition::Created
+    );
+
+    let path = root
+        .path()
+        .join("installations")
+        .join(installation.as_str())
+        .join("receipts")
+        .join("host-prepare-0001.json");
+    let metadata = fs::metadata(&path).expect("inspect published receipt");
+    assert_eq!(metadata.permissions().mode() & 0o7777, 0o600);
+    assert_eq!(
+        read_execution_receipt(&store, &installation, value.execution_id())
+            .expect("read Linux receipt"),
+        Some(value.clone())
+    );
+
+    let duplicate =
+        publish_execution_receipt(&mut store, &installation, &value).expect("replay Linux receipt");
+    assert_eq!(
+        duplicate.disposition(),
+        ExecutionReceiptPublicationDisposition::Duplicate
+    );
+    assert_eq!(duplicate.bytes_written(), 0);
+    assert_eq!(
+        fs::read(&path).expect("read persisted bytes"),
+        encode_execution_receipt(&value)
+            .expect("encode receipt")
+            .into_bytes()
     );
 }
