@@ -39,6 +39,8 @@ New installation publication creates and synchronizes `receipts/` together with 
 
 `prepare_installation()` creates the directory for compatible existing installations and refuses symlinks, broad modes, or foreign ownership. Staging and temporary-file recovery inspection includes the new directory rather than treating it as an unexpected entry.
 
+Read-only orphan inspection treats a missing `receipts/` directory in a pre-receipt installation as empty, allowing recovery review before migration. A present receipt directory must still satisfy the normal owner, mode, directory, and no-symlink checks.
+
 ## Boundary of this slice
 
 This storage layer does not:
