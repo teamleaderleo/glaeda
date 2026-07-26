@@ -676,3 +676,24 @@ fn active_reservation_expiry_must_be_strictly_future() {
             .expect_err("expiry boundary");
     assert_eq!(error.code, "expired_active_reservation");
 }
+
+#[test]
+fn work_to_interactive_and_stopped_boundaries_are_exact() {
+    let observed_at = 20_000_000;
+    for (idle_millis, expected) in [
+        (10 * 60 * 1_000 - 1, PersonalWorkerProfile::Work),
+        (10 * 60 * 1_000, PersonalWorkerProfile::Interactive),
+        (30 * 60 * 1_000 - 1, PersonalWorkerProfile::Interactive),
+        (30 * 60 * 1_000, PersonalWorkerProfile::Stopped),
+    ] {
+        let mut queue = input(1, observed_at, vec![], vec![]);
+        queue.current_profile = PersonalWorkerProfile::Work;
+        queue.last_activity_at = time(observed_at - idle_millis);
+        let decision =
+            evaluate_personal_worker_queue(&queue, None).expect("cooldown boundary decision");
+        assert_eq!(
+            decision.desired_profile, expected,
+            "idle_millis={idle_millis}"
+        );
+    }
+}
