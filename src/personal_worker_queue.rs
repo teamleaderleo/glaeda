@@ -434,7 +434,6 @@ pub fn evaluate_personal_worker_queue(
         .any(|request| !request.cancellation.is_cancelled());
     let has_work = has_queued_work || !input.active.is_empty();
     let desired_profile = desired_profile(input, has_work);
-    let has_work = !input.queued.is_empty() || !input.active.is_empty();
     let cancel_pending_downscale = has_work
         && input
             .pending_profile_change
@@ -510,14 +509,14 @@ fn validate_input(input: &PersonalWorkerQueueInput) -> Result<(), PersonalWorker
             "active reservations require the work worker profile",
         ));
     }
-    if let Some(pending) = input.pending_profile_change {
-        if pending.requested_at > input.observed_at {
-            return Err(PersonalWorkerQueueError::new(
-                "pending_profile_change.requested_at",
-                "future_profile_change_request",
-                "profile-change request cannot be newer than the queue observation",
-            ));
-        }
+    if let Some(pending) = input.pending_profile_change
+        && pending.requested_at > input.observed_at
+    {
+        return Err(PersonalWorkerQueueError::new(
+            "pending_profile_change.requested_at",
+            "future_profile_change_request",
+            "profile-change request cannot be newer than the queue observation",
+        ));
     }
 
     let mut request_ids = BTreeSet::new();

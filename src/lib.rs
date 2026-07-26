@@ -15,7 +15,6 @@ pub mod exact_commit_handoff;
 pub mod execution_admission;
 pub mod execution_receipt;
 pub mod execution_receipt_store;
-pub mod personal_worker_queue;
 pub mod host;
 #[cfg(target_os = "linux")]
 pub mod host_package_plan;
@@ -71,6 +70,7 @@ pub mod mac_availability;
 pub mod macos_resource_observation;
 pub mod manifest;
 pub mod ownership;
+pub mod personal_worker_queue;
 pub mod plan;
 pub mod podman_preview;
 pub mod podman_preview_execution;
