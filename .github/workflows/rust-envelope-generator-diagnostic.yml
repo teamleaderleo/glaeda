@@ -1,0 +1,69 @@
+name: Generate Rust verification envelope diagnostic
+
+on:
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  generate:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out exact head
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          show-progress: false
+          fetch-depth: 1
+      - name: Recover generated source
+        run: |
+          git fetch --depth=1 origin integration/issue-199-rust-envelope-generator-base
+          git show FETCH_HEAD:.github/workflows/rust-envelope-generator.yml > /tmp/generator.yml
+          python3 - <<'PY'
+          from pathlib import Path
+          import base64
+          import gzip
+          import re
+
+          workflow = Path('/tmp/generator.yml').read_text(encoding='utf-8')
+          match = re.search(r'payload = """\n(.*?)\n\s*"""\.replace', workflow, re.S)
+          if match is None:
+              raise SystemExit('generator payload not found')
+          payload = ''.join(match.group(1).split())
+          Path('src/rust_verification_envelope.rs').write_bytes(
+              gzip.decompress(base64.b64decode(payload))
+          )
+
+          lib = Path('src/lib.rs')
+          text = lib.read_text(encoding='utf-8')
+          marker = 'pub mod renderprove_vision_result;\n'
+          addition = (
+              marker
+              + '/// Pure repository-declared Rust build-scope and resource envelope contracts.\n'
+              + 'pub mod rust_verification_envelope;\n'
+          )
+          if text.count(marker) != 1:
+              raise SystemExit('lib export marker mismatch')
+          lib.write_text(text.replace(marker, addition), encoding='utf-8')
+          PY
+          cargo fmt --all
+      - name: Run focused tests with bounded log
+        run: |
+          set +e
+          cargo test --locked rust_verification_envelope > /tmp/rust-envelope-test.log 2>&1
+          status=$?
+          set -e
+          tail -n 180 /tmp/rust-envelope-test.log
+          exit "$status"
+      - name: Publish generated contract
+        env:
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          git add src/lib.rs src/rust_verification_envelope.rs
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git commit -m 'Add typed Rust verification envelope contract'
+          git push origin "HEAD:${HEAD_REF}"
