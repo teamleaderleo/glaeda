@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 jobs:
-  concurrency-diagnostics:
+  spawn-errno:
     runs-on: ubuntu-24.04
     steps:
       - name: Check out branch
@@ -18,31 +18,36 @@ jobs:
           show-progress: false
       - name: Install Rust toolchain
         run: rustup toolchain install stable --profile minimal
-      - name: Run isolated and serial diagnostics
+      - name: Add private diagnostic and run parallel suite
+        shell: python
+        run: |
+          from pathlib import Path
+          path = Path("src/descriptor_bound_launcher/executor.rs")
+          text = path.read_text()
+          old = '''    let mut child = command.spawn().map_err(|_| {
+              DescriptorBoundLaunchError::spawn("descriptor-bound reviewed process could not be spawned")
+          })?;
+          '''
+          new = '''    let mut child = command.spawn().map_err(|error| {
+              eprintln!("ISSUE225_PRIVATE_SPAWN_ERROR: {error:?}");
+              DescriptorBoundLaunchError::spawn("descriptor-bound reviewed process could not be spawned")
+          })?;
+          '''
+          if old not in text:
+              raise SystemExit("spawn error anchor changed")
+          path.write_text(text.replace(old, new))
+      - name: Capture full parallel suite
         run: |
           set +e
-          cargo +stable test --lib descriptor_bound_launcher::tests::nonzero_exit_is_a_typed_receipt_not_an_executor_error -- --exact --nocapture > issue225-isolated.txt 2>&1
-          echo $? > issue225-isolated-status.txt
-          cargo +stable test --lib descriptor_bound_launcher -- --test-threads=1 --nocapture > issue225-launcher-serial.txt 2>&1
-          echo $? > issue225-launcher-serial-status.txt
-          cargo +stable test --all-targets --all-features -- --test-threads=1 --nocapture > issue225-full-serial.txt 2>&1
-          echo $? > issue225-full-serial-status.txt
+          cargo +stable test --all-targets --all-features -- --nocapture > issue225-parallel-private.txt 2>&1
+          echo $? > issue225-parallel-private-status.txt
           set -e
-      - name: Upload concurrency diagnostics
+      - name: Upload private diagnostic log
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: issue225-concurrency-diagnostics
+          name: issue225-private-spawn-log
           path: |
-            issue225-isolated.txt
-            issue225-isolated-status.txt
-            issue225-launcher-serial.txt
-            issue225-launcher-serial-status.txt
-            issue225-full-serial.txt
-            issue225-full-serial-status.txt
+            issue225-parallel-private.txt
+            issue225-parallel-private-status.txt
           if-no-files-found: error
           retention-days: 1
-      - name: Report results
-        run: |
-          echo "isolated=$(cat issue225-isolated-status.txt)"
-          echo "launcher_serial=$(cat issue225-launcher-serial-status.txt)"
-          echo "full_serial=$(cat issue225-full-serial-status.txt)"
