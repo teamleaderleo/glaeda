@@ -1,0 +1,52 @@
+name: Agent 3 replay GitHub reconciliation
+
+on:
+  pull_request:
+    types: [synchronize]
+
+permissions:
+  contents: write
+  pull-requests: read
+
+jobs:
+  replay:
+    if: github.event.pull_request.head.ref == 'repair/issue-187-github-reconciliation-current-mapper' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Check out exact replay branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+          show-progress: false
+      - name: Replay source and verify against repaired mapper
+        run: |
+          git checkout 7e5157fdaeb9eae06897ff0e93bf6aec36dd17c0 -- src/github_workflow_job_reconciliation.rs
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('src/lib.rs')
+          lines = path.read_text(encoding='utf-8').splitlines()
+          marker = 'pub mod github_workflow_job_mapper;'
+          index = lines.index(marker)
+          addition = [
+              '/// Pure, bounded normalization of complete GitHub workflow-job reconciliation snapshots.',
+              'pub mod github_workflow_job_reconciliation;',
+          ]
+          assert 'pub mod github_workflow_job_reconciliation;' not in lines
+          lines[index + 1:index + 1] = addition
+          path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+          PY
+          cargo fmt --all
+          cargo test --all-targets --all-features github_workflow_job_reconciliation
+          cargo clippy --all-targets --all-features -- -D warnings
+          cargo test --all-targets --all-features
+      - name: Commit clean source-only replay
+        run: |
+          git config user.name "Agent 3"
+          git config user.email "agent3@users.noreply.github.com"
+          git rm .github/workflows/agent3-replay-github-reconciliation.yml
+          git add src/lib.rs src/github_workflow_job_reconciliation.rs
+          git diff --cached --check
+          git commit -m "Replay GitHub reconciliation on repaired mapper"
+          git push origin HEAD:${{ github.event.pull_request.head.ref }}
