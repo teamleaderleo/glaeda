@@ -428,3 +428,34 @@ fn bounded_revision_and_queue_generation_spaces_fail_closed() {
         .expect_err("queue generation exhaustion");
     assert_eq!(error.kind(), PersonalWorkerStoreErrorKind::RevisionConflict);
 }
+
+#[test]
+fn canonical_decode_rejects_missing_or_skipped_history() {
+    let initial = PersonalWorkerStoreDocument::new(empty_queue(1, 7_000_000), vec![])
+        .expect("initial document");
+    let next = initial
+        .advance(empty_queue(2, 7_000_001), vec![])
+        .expect("next document");
+    let encoded =
+        encode_personal_worker_store_document(&next).expect("encode revision with history");
+
+    let mut missing: serde_json::Value =
+        serde_json::from_slice(&encoded).expect("parse missing-history fixture");
+    missing["history"] = serde_json::Value::Array(vec![]);
+    let mut missing_bytes =
+        serde_json::to_vec_pretty(&missing).expect("encode missing-history fixture");
+    missing_bytes.push(b'\n');
+    let error =
+        decode_personal_worker_store_document(&missing_bytes).expect_err("missing bounded history");
+    assert_eq!(error.kind(), PersonalWorkerStoreErrorKind::CorruptState);
+
+    let mut skipped: serde_json::Value =
+        serde_json::from_slice(&encoded).expect("parse skipped-generation fixture");
+    skipped["queue"]["generation"] = serde_json::Value::from(3_u64);
+    let mut skipped_bytes =
+        serde_json::to_vec_pretty(&skipped).expect("encode skipped-generation fixture");
+    skipped_bytes.push(b'\n');
+    let error = decode_personal_worker_store_document(&skipped_bytes)
+        .expect_err("skipped current queue generation");
+    assert_eq!(error.kind(), PersonalWorkerStoreErrorKind::CorruptState);
+}

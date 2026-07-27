@@ -282,7 +282,12 @@ impl PersonalWorkerStoreDocument {
             )
         })?;
         validate_cache_leases(&self.queue, &self.cache_leases)?;
-        validate_history(self.revision, &self.history)
+        validate_history(
+            self.revision,
+            self.queue.generation,
+            self.queue.observed_at,
+            &self.history,
+        )
     }
 
     fn summary(&self) -> Result<PersonalWorkerHistoryEntry, PersonalWorkerStoreError> {
@@ -589,16 +594,20 @@ fn cache_modes_conflict(
 
 fn validate_history(
     revision: PersonalWorkerStoreRevision,
+    current_generation: PersonalWorkerQueueGeneration,
+    current_observed_at: EpochMillis,
     history: &[PersonalWorkerHistoryEntry],
 ) -> Result<(), PersonalWorkerStoreError> {
-    if history.len() > MAX_PERSONAL_WORKER_HISTORY_ENTRIES {
+    let retained_revisions = revision.get().saturating_sub(1);
+    let expected_len_u64 = retained_revisions.min(MAX_PERSONAL_WORKER_HISTORY_ENTRIES as u64);
+    let expected_len = usize::try_from(expected_len_u64).map_err(|_| {
+        PersonalWorkerStoreError::invalid_document(
+            "personal worker store history length is not representable",
+        )
+    })?;
+    if history.len() != expected_len {
         return Err(PersonalWorkerStoreError::invalid_document(
-            "personal worker store history exceeds the bounded entry limit",
-        ));
-    }
-    if revision.get() == 1 && !history.is_empty() {
-        return Err(PersonalWorkerStoreError::invalid_document(
-            "initial personal worker store revision cannot carry history",
+            "personal worker store history does not cover the bounded revision window",
         ));
     }
     let history_len = u64::try_from(history.len()).map_err(|_| {
@@ -611,7 +620,7 @@ fn validate_history(
             "personal worker store history exceeds its current revision",
         )
     })?;
-    let mut previous_generation = None;
+    let mut previous_generation: Option<u64> = None;
     let mut previous_observed_at = None;
     for (index, entry) in history.iter().enumerate() {
         let offset = u64::try_from(index).map_err(|_| {
@@ -624,10 +633,17 @@ fn validate_history(
                 "personal worker store history revisions are not consecutive",
             ));
         }
-        if previous_generation.is_some_and(|value| entry.queue_generation.get() <= value) {
-            return Err(PersonalWorkerStoreError::invalid_document(
-                "personal worker store history queue generations do not advance",
-            ));
+        if let Some(previous) = previous_generation {
+            let expected = previous.checked_add(1).ok_or_else(|| {
+                PersonalWorkerStoreError::invalid_document(
+                    "personal worker store history queue generation is exhausted",
+                )
+            })?;
+            if entry.queue_generation.get() != expected {
+                return Err(PersonalWorkerStoreError::invalid_document(
+                    "personal worker store history queue generations are not consecutive",
+                ));
+            }
         }
         if previous_observed_at.is_some_and(|value| entry.observed_at.get() < value) {
             return Err(PersonalWorkerStoreError::invalid_document(
@@ -636,6 +652,28 @@ fn validate_history(
         }
         previous_generation = Some(entry.queue_generation.get());
         previous_observed_at = Some(entry.observed_at.get());
+    }
+    if let Some(last) = history.last() {
+        let expected_generation = last
+            .queue_generation
+            .get()
+            .checked_add(1)
+            .and_then(|value| PersonalWorkerQueueGeneration::new(value).ok())
+            .ok_or_else(|| {
+                PersonalWorkerStoreError::invalid_document(
+                    "personal worker store current queue generation cannot follow history",
+                )
+            })?;
+        if current_generation != expected_generation {
+            return Err(PersonalWorkerStoreError::invalid_document(
+                "personal worker store current queue generation does not follow history",
+            ));
+        }
+        if current_observed_at < last.observed_at {
+            return Err(PersonalWorkerStoreError::invalid_document(
+                "personal worker store current observation predates retained history",
+            ));
+        }
     }
     Ok(())
 }
