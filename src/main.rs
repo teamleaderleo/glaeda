@@ -1,9 +1,13 @@
+mod personal_worker_cancel_command;
 mod personal_worker_read_command;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
+use personal_worker_cancel_command::{
+    PersonalWorkerCancelCommandError, cancel_queued_job, render_cancel_receipt_human,
+};
 use personal_worker_read_command::{
     PersonalWorkerReadCommandError, read_job, read_queue_page, read_status, render_job_human,
     render_queue_page_human, render_status_human,
@@ -100,7 +104,7 @@ enum Command {
         #[command(subcommand)]
         command: QueueCommand,
     },
-    /// Inspect one queued, active, or retained-terminal personal-worker job.
+    /// Inspect or cancel one exact personal-worker job.
     Job {
         #[command(subcommand)]
         command: JobCommand,
@@ -180,6 +184,23 @@ enum JobCommand {
         /// Exact bounded personal-worker request ID.
         request_id: String,
     },
+    /// Cancel one exact queued job using caller-supplied durable evidence.
+    Cancel {
+        /// Explicit absolute normalized personal-worker state root.
+        #[arg(long)]
+        store_root: PathBuf,
+        /// Exact expected durable store revision.
+        #[arg(long)]
+        revision: u64,
+        /// Exact expected queue generation.
+        #[arg(long)]
+        generation: u64,
+        /// Explicit cancellation observation in epoch milliseconds.
+        #[arg(long)]
+        cancelled_at: u64,
+        /// Exact bounded personal-worker request ID.
+        request_id: String,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -235,6 +256,20 @@ fn main() -> ExitCode {
                 generation,
                 request_id,
             } => run_job_show(cli.output, &store_root, revision, generation, &request_id),
+            JobCommand::Cancel {
+                store_root,
+                revision,
+                generation,
+                cancelled_at,
+                request_id,
+            } => run_job_cancel(
+                cli.output,
+                &store_root,
+                revision,
+                generation,
+                cancelled_at,
+                &request_id,
+            ),
         },
     }
 }
@@ -338,9 +373,48 @@ fn run_job_show(
     ExitCode::SUCCESS
 }
 
+fn run_job_cancel(
+    output: OutputFormat,
+    store_root: &Path,
+    revision: u64,
+    generation: u64,
+    cancelled_at: u64,
+    request_id: &str,
+) -> ExitCode {
+    let receipt =
+        match cancel_queued_job(store_root, revision, generation, cancelled_at, request_id) {
+            Ok(receipt) => receipt,
+            Err(error) => return emit_personal_worker_cancel_error(output, &error),
+        };
+    match output {
+        OutputFormat::Human => print!("{}", render_cancel_receipt_human(&receipt)),
+        OutputFormat::Json => {
+            if print_json(&receipt).is_err() {
+                return ExitCode::from(2);
+            }
+        }
+    }
+    ExitCode::SUCCESS
+}
+
 fn emit_personal_worker_read_error(
     output: OutputFormat,
     error: &PersonalWorkerReadCommandError,
+) -> ExitCode {
+    match output {
+        OutputFormat::Human => eprintln!("{}", error.message()),
+        OutputFormat::Json => {
+            if print_json(error).is_err() {
+                return ExitCode::from(2);
+            }
+        }
+    }
+    ExitCode::from(2)
+}
+
+fn emit_personal_worker_cancel_error(
+    output: OutputFormat,
+    error: &PersonalWorkerCancelCommandError,
 ) -> ExitCode {
     match output {
         OutputFormat::Human => eprintln!("{}", error.message()),
@@ -873,6 +947,40 @@ mod tests {
         assert_eq!(store_root, PathBuf::from("/tmp/worker-state"));
         assert_eq!(revision, 7);
         assert_eq!(generation, 11);
+        assert_eq!(request_id, "job-one");
+
+        let cancel = Cli::try_parse_from([
+            "smolrunner",
+            "job",
+            "cancel",
+            "--store-root",
+            "/tmp/worker-state",
+            "--revision",
+            "7",
+            "--generation",
+            "11",
+            "--cancelled-at",
+            "123456",
+            "job-one",
+        ])
+        .expect("parse job cancel");
+        let Command::Job {
+            command:
+                JobCommand::Cancel {
+                    store_root,
+                    revision,
+                    generation,
+                    cancelled_at,
+                    request_id,
+                },
+        } = cancel.command
+        else {
+            panic!("expected job cancel command");
+        };
+        assert_eq!(store_root, PathBuf::from("/tmp/worker-state"));
+        assert_eq!(revision, 7);
+        assert_eq!(generation, 11);
+        assert_eq!(cancelled_at, 123456);
         assert_eq!(request_id, "job-one");
     }
 
