@@ -1,0 +1,31 @@
+name: Agent 6 rustfmt diagnostic
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rustfmt-patch:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.head_ref }}
+          show-progress: false
+      - name: Produce rustfmt patch
+        run: |
+          cargo fmt --all
+          git diff --binary -- . ':(exclude).github/workflows/agent6-format-diagnostic.yml' > rustfmt.patch
+          test -s rustfmt.patch
+      - name: Upload rustfmt patch
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: agent6-rustfmt-patch
+          path: rustfmt.patch
+          if-no-files-found: error
+          retention-days: 1
