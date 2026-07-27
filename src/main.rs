@@ -1,7 +1,13 @@
+mod personal_worker_read_command;
+
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
+use personal_worker_read_command::{
+    PersonalWorkerReadCommandError, read_job, read_queue_page, read_status, render_job_human,
+    render_queue_page_human, render_status_human,
+};
 #[cfg(target_os = "linux")]
 use rustix::rand::{GetRandomFlags, getrandom};
 use serde::Serialize;
@@ -84,6 +90,21 @@ enum Command {
         #[command(subcommand)]
         command: HostCommand,
     },
+    /// Inspect one exact durable personal-worker snapshot.
+    Worker {
+        #[command(subcommand)]
+        command: WorkerCommand,
+    },
+    /// Inspect the exact live personal-worker queue.
+    Queue {
+        #[command(subcommand)]
+        command: QueueCommand,
+    },
+    /// Inspect one queued, active, or retained-terminal personal-worker job.
+    Job {
+        #[command(subcommand)]
+        command: JobCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -108,6 +129,56 @@ enum HostCommand {
         /// Exact deterministic confirmation emitted by an immediately preceding prepare proposal.
         #[arg(long)]
         confirm: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum WorkerCommand {
+    /// Show bounded status for one already-published durable snapshot.
+    Status {
+        /// Explicit absolute normalized personal-worker state root.
+        #[arg(long)]
+        store_root: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum QueueCommand {
+    /// List one bounded page of the exact live queue.
+    List {
+        /// Explicit absolute normalized personal-worker state root.
+        #[arg(long)]
+        store_root: PathBuf,
+        /// Exact expected durable store revision.
+        #[arg(long)]
+        revision: u64,
+        /// Exact expected queue generation.
+        #[arg(long)]
+        generation: u64,
+        /// Zero-based offset within the exact live snapshot.
+        #[arg(long, default_value_t = 0)]
+        offset: u32,
+        /// Positive bounded page size.
+        #[arg(long, default_value_t = 100)]
+        limit: u16,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum JobCommand {
+    /// Show one exact queued, active, or retained-terminal job.
+    Show {
+        /// Explicit absolute normalized personal-worker state root.
+        #[arg(long)]
+        store_root: PathBuf,
+        /// Exact expected durable store revision.
+        #[arg(long)]
+        revision: u64,
+        /// Exact expected queue generation.
+        #[arg(long)]
+        generation: u64,
+        /// Exact bounded personal-worker request ID.
+        request_id: String,
     },
 }
 
@@ -143,6 +214,41 @@ fn main() -> ExitCode {
                 &file,
                 account_file.as_deref(),
                 confirm.as_deref(),
+            ),
+        },
+        Command::Worker { command } => match command {
+            WorkerCommand::Status { store_root } => {
+                run_worker_status(cli.output, &store_root)
+            }
+        },
+        Command::Queue { command } => match command {
+            QueueCommand::List {
+                store_root,
+                revision,
+                generation,
+                offset,
+                limit,
+            } => run_queue_list(
+                cli.output,
+                &store_root,
+                revision,
+                generation,
+                offset,
+                limit,
+            ),
+        },
+        Command::Job { command } => match command {
+            JobCommand::Show {
+                store_root,
+                revision,
+                generation,
+                request_id,
+            } => run_job_show(
+                cli.output,
+                &store_root,
+                revision,
+                generation,
+                &request_id,
             ),
         },
     }
@@ -184,6 +290,82 @@ fn run_plan(output: OutputFormat, file: &Path) -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+fn run_worker_status(output: OutputFormat, store_root: &Path) -> ExitCode {
+    let view = match read_status(store_root) {
+        Ok(view) => view,
+        Err(error) => return emit_personal_worker_read_error(output, &error),
+    };
+    match output {
+        OutputFormat::Human => print!("{}", render_status_human(&view)),
+        OutputFormat::Json => {
+            if print_json(&view).is_err() {
+                return ExitCode::from(2);
+            }
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+fn run_queue_list(
+    output: OutputFormat,
+    store_root: &Path,
+    revision: u64,
+    generation: u64,
+    offset: u32,
+    limit: u16,
+) -> ExitCode {
+    let view = match read_queue_page(store_root, revision, generation, offset, limit) {
+        Ok(view) => view,
+        Err(error) => return emit_personal_worker_read_error(output, &error),
+    };
+    match output {
+        OutputFormat::Human => print!("{}", render_queue_page_human(&view)),
+        OutputFormat::Json => {
+            if print_json(&view).is_err() {
+                return ExitCode::from(2);
+            }
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+fn run_job_show(
+    output: OutputFormat,
+    store_root: &Path,
+    revision: u64,
+    generation: u64,
+    request_id: &str,
+) -> ExitCode {
+    let view = match read_job(store_root, revision, generation, request_id) {
+        Ok(view) => view,
+        Err(error) => return emit_personal_worker_read_error(output, &error),
+    };
+    match output {
+        OutputFormat::Human => print!("{}", render_job_human(&view)),
+        OutputFormat::Json => {
+            if print_json(&view).is_err() {
+                return ExitCode::from(2);
+            }
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+fn emit_personal_worker_read_error(
+    output: OutputFormat,
+    error: &PersonalWorkerReadCommandError,
+) -> ExitCode {
+    match output {
+        OutputFormat::Human => eprintln!("{}", error.message()),
+        OutputFormat::Json => {
+            if print_json(error).is_err() {
+                return ExitCode::from(2);
+            }
+        }
+    }
+    ExitCode::from(2)
 }
 
 #[cfg(target_os = "linux")]
@@ -589,7 +771,10 @@ mod tests {
     use smolrunner::journal::{ExecutionLane, RollbackClass};
     use smolrunner::lane_command::LaneCommandKind;
 
-    use super::{Cli, Command, HostCommand, HostPreparePhaseKind, classify_host_prepare_actions};
+    use super::{
+        Cli, Command, HostCommand, HostPreparePhaseKind, JobCommand, QueueCommand, WorkerCommand,
+        classify_host_prepare_actions,
+    };
 
     #[test]
     fn host_prepare_accepts_explicit_confirmation_and_account_policy() {
@@ -620,6 +805,90 @@ mod tests {
         assert_eq!(file, PathBuf::from("project.yml"));
         assert_eq!(account_file, Some(PathBuf::from("runner.account.yml")));
         assert_eq!(confirm.as_deref(), Some("host-preparation-v1.00"));
+    }
+
+    #[test]
+    fn personal_worker_read_commands_parse_exact_snapshot_arguments() {
+        let status = Cli::try_parse_from([
+            "smolrunner",
+            "worker",
+            "status",
+            "--store-root",
+            "/tmp/worker-state",
+        ])
+        .expect("parse worker status");
+        let Command::Worker {
+            command: WorkerCommand::Status { store_root },
+        } = status.command
+        else {
+            panic!("expected worker status command");
+        };
+        assert_eq!(store_root, PathBuf::from("/tmp/worker-state"));
+
+        let queue = Cli::try_parse_from([
+            "smolrunner",
+            "queue",
+            "list",
+            "--store-root",
+            "/tmp/worker-state",
+            "--revision",
+            "7",
+            "--generation",
+            "11",
+            "--offset",
+            "2",
+            "--limit",
+            "5",
+        ])
+        .expect("parse queue list");
+        let Command::Queue {
+            command:
+                QueueCommand::List {
+                    store_root,
+                    revision,
+                    generation,
+                    offset,
+                    limit,
+                },
+        } = queue.command
+        else {
+            panic!("expected queue list command");
+        };
+        assert_eq!(store_root, PathBuf::from("/tmp/worker-state"));
+        assert_eq!(revision, 7);
+        assert_eq!(generation, 11);
+        assert_eq!(offset, 2);
+        assert_eq!(limit, 5);
+
+        let job = Cli::try_parse_from([
+            "smolrunner",
+            "job",
+            "show",
+            "--store-root",
+            "/tmp/worker-state",
+            "--revision",
+            "7",
+            "--generation",
+            "11",
+            "job-one",
+        ])
+        .expect("parse job show");
+        let Command::Job {
+            command:
+                JobCommand::Show {
+                    store_root,
+                    revision,
+                    generation,
+                    request_id,
+                },
+        } = job.command
+        else {
+            panic!("expected job show command");
+        };
+        assert_eq!(store_root, PathBuf::from("/tmp/worker-state"));
+        assert_eq!(revision, 7);
+        assert_eq!(generation, 11);
+        assert_eq!(request_id, "job-one");
     }
 
     fn phase_action(
