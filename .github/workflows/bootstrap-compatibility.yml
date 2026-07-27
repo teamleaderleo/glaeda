@@ -1,0 +1,34 @@
+name: Bootstrap compatibility
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bootstrap-compatibility-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          show-progress: false
+      - name: Validate pure profile compatibility mapper
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("scripts/workspace_bootstrap/profile_bridge.py")
+          compile(path.read_text(encoding="utf-8"), str(path), "exec")
+          PY
+          test ! -e scripts/bootstrap-profile-compatibility
+          bash -n scripts/test-bootstrap-profile-compatibility.sh
+          bash scripts/test-bootstrap-profile-compatibility.sh
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
