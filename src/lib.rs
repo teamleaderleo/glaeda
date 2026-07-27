@@ -71,6 +71,7 @@ pub mod macos_resource_observation;
 pub mod manifest;
 pub mod ownership;
 pub mod personal_worker_queue;
+pub mod personal_worker_store;
 pub mod plan;
 pub mod podman_preview;
 pub mod podman_preview_execution;
@@ -108,6 +109,8 @@ pub mod state_document;
 pub mod state_store;
 #[cfg(target_os = "linux")]
 pub mod subordinate_id;
+#[cfg(unix)]
+pub mod unix_personal_worker_store;
 pub mod verification_profile;
 pub mod verification_profile_preflight_adapter;
 pub mod verification_profile_registry;
