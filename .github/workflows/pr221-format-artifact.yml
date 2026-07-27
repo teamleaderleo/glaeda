@@ -1,0 +1,36 @@
+name: PR221 format artifact
+
+on:
+  push:
+    branches:
+      - feat/issue-219-personal-worker-read-cli
+
+permissions:
+  contents: read
+
+jobs:
+  format:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          show-progress: false
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal --component rustfmt
+      - name: Apply formatter
+        run: cargo +stable fmt --all
+      - name: Package formatted files
+        run: |
+          tar -czf pr221-formatted.tar.gz \
+            src/main.rs \
+            src/personal_worker_read_command.rs \
+            src/unix_personal_worker_store.rs \
+            tests/personal_worker_read_cli.rs
+      - name: Upload formatted files
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: pr221-formatted
+          path: pr221-formatted.tar.gz
+          if-no-files-found: error
+          retention-days: 1
