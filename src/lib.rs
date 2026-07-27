@@ -116,6 +116,8 @@ pub mod runner_export;
 pub mod runner_user;
 #[cfg(target_os = "linux")]
 pub mod runner_user_observation;
+/// Pure exact Rust build-scope, concurrency, memory-headroom, and bounded retry contract.
+pub mod rust_verification_envelope;
 pub mod state;
 pub mod state_document;
 pub mod state_store;
