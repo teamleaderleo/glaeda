@@ -292,13 +292,7 @@ fn conflicts_stale_expectations_and_missing_identity_are_bounded() {
     for (revision, generation, cancelled_at, request_id, expected_kind) in [
         ("2", "2", "9002000", "queued-one", "conflict"),
         ("1", "2", "9001000", "queued-one", "stale_revision"),
-        (
-            "2",
-            "1",
-            "9001000",
-            "queued-one",
-            "stale_queue_generation",
-        ),
+        ("2", "1", "9001000", "queued-one", "stale_queue_generation"),
         ("2", "2", "9001000", "missing-one", "not_found"),
     ] {
         let output = run_smolrunner(&cancel_arguments(
@@ -359,13 +353,7 @@ fn missing_state_invalid_inputs_and_lock_contention_do_not_mutate() {
         ("0", "queued-one", "invalid_cancellation_time"),
         ("9001000", "../private-id", "invalid_request_id"),
     ] {
-        let output = run_smolrunner(&cancel_arguments(
-            &root,
-            "1",
-            "1",
-            cancelled_at,
-            request_id,
-        ));
+        let output = run_smolrunner(&cancel_arguments(&root, "1", "1", cancelled_at, request_id));
         assert!(!output.status.success());
         let text = String::from_utf8(output.stdout).expect("UTF-8 error JSON");
         let json: serde_json::Value = serde_json::from_str(&text).expect("error JSON");
@@ -418,8 +406,7 @@ fn staged_successor_is_recovered_before_cancellation() {
         encode_personal_worker_store_document(&staged).expect("encode staged successor"),
     )
     .expect("write staged successor");
-    fs::set_permissions(&staged_path, fs::Permissions::from_mode(0o600))
-        .expect("set staged mode");
+    fs::set_permissions(&staged_path, fs::Permissions::from_mode(0o600)).expect("set staged mode");
 
     let output = run_smolrunner(&cancel_arguments(
         &root,
