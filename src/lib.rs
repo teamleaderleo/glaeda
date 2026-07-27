@@ -1,3 +1,5 @@
+/// Read-only observation of one configured official Actions runner.
+pub mod actions_runner_readiness;
 pub mod artifact;
 #[cfg(target_os = "linux")]
 pub mod debian_package_plan;
