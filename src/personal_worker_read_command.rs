@@ -25,6 +25,7 @@ pub const PERSONAL_WORKER_READ_COMMAND_SCHEMA_VERSION: u8 = 1;
 #[serde(rename_all = "snake_case")]
 pub(crate) enum PersonalWorkerReadCommandErrorKind {
     InvalidStoreRoot,
+    #[cfg(not(unix))]
     UnsupportedPlatform,
     MissingStore,
     UnsafeStore,
@@ -49,6 +50,7 @@ pub(crate) struct PersonalWorkerReadCommandError {
 }
 
 impl PersonalWorkerReadCommandError {
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn kind(&self) -> PersonalWorkerReadCommandErrorKind {
         self.kind
