@@ -88,6 +88,8 @@ pub mod ownership;
 /// Pure composition of durable queue, Lima lifecycle, and runner-readiness evidence.
 pub mod personal_worker_host_broker;
 pub mod personal_worker_queue;
+/// Pure bounded projection of durable personal-worker status, queue pages, and job state.
+pub mod personal_worker_read_model;
 pub mod personal_worker_store;
 pub mod personal_worker_store_transaction;
 pub mod plan;
