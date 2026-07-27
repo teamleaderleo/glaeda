@@ -18,24 +18,26 @@ jobs:
           show-progress: false
       - name: Install Rust toolchain
         run: rustup toolchain install stable --profile minimal
-      - name: Add private diagnostic and run parallel suite
+      - name: Add private diagnostic
         shell: python
         run: |
+          import re
           from pathlib import Path
           path = Path("src/descriptor_bound_launcher/executor.rs")
           text = path.read_text()
-          old = '''    let mut child = command.spawn().map_err(|_| {
-              DescriptorBoundLaunchError::spawn("descriptor-bound reviewed process could not be spawned")
-          })?;
-          '''
-          new = '''    let mut child = command.spawn().map_err(|error| {
+          pattern = re.compile(
+              r'let mut child = command\.spawn\(\)\.map_err\(\|_\| \{\n'
+              r'\s*DescriptorBoundLaunchError::spawn\("descriptor-bound reviewed process could not be spawned"\)\n'
+              r'\s*\}\)\?;'
+          )
+          replacement = '''let mut child = command.spawn().map_err(|error| {
               eprintln!("ISSUE225_PRIVATE_SPAWN_ERROR: {error:?}");
               DescriptorBoundLaunchError::spawn("descriptor-bound reviewed process could not be spawned")
-          })?;
-          '''
-          if old not in text:
-              raise SystemExit("spawn error anchor changed")
-          path.write_text(text.replace(old, new))
+          })?;'''
+          text, count = pattern.subn(replacement, text, count=1)
+          if count != 1:
+              raise SystemExit(f"spawn error anchor matches={count}")
+          path.write_text(text)
       - name: Capture full parallel suite
         run: |
           set +e
