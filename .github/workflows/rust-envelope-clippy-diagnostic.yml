@@ -1,0 +1,37 @@
+name: Rust envelope Clippy diagnostic
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  clippy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out exact head
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          show-progress: false
+      - name: Capture Clippy output
+        run: |
+          set +e
+          cargo clippy --locked --all-targets --all-features -- -D warnings > /tmp/rust-envelope-clippy.log 2>&1
+          status=$?
+          set -e
+          echo "$status" > /tmp/rust-envelope-clippy-status
+          exit 0
+      - name: Upload Clippy diagnostic
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-envelope-clippy
+          path: /tmp/rust-envelope-clippy.log
+          if-no-files-found: error
+          retention-days: 1
+      - name: Enforce Clippy status
+        run: |
+          exit "$(cat /tmp/rust-envelope-clippy-status)"
