@@ -16,27 +16,33 @@ jobs:
           ref: fix/issue-198-durable-authority
           fetch-depth: 0
           show-progress: false
-      - name: Format or capture exact diagnostic
+      - name: Repair module path, format, and remove helper
         shell: bash
         run: |
-          set +e
-          cargo fmt --all > /tmp/format-output.txt 2>&1
-          status=$?
-          set -e
+          python3 - <<'PY'
+          from pathlib import Path
 
-          git config user.name github-actions[bot]
-          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          path = Path('src/lima_lifecycle_executor_inner.rs')
+          source = path.read_text()
+          old = '#[cfg(test)]\nmod tests;\n'
+          new = '#[cfg(test)]\n#[path = "lima_lifecycle_executor_inner/tests.rs"]\nmod tests;\n'
+          if source.count(old) != 1:
+              raise SystemExit('expected one private executor test module declaration')
+          path.write_text(source.replace(old, new, 1))
+          PY
 
-          if test "$status" -ne 0; then
-            cp /tmp/format-output.txt .github/format-issue-215-error.txt
-            git add .github/format-issue-215-error.txt
-            git commit -m 'chore: capture issue 215 formatter error'
-            git push origin HEAD:fix/issue-198-durable-authority
-            exit 0
-          fi
+          cargo fmt --all
 
           rm -f .github/format-issue-215-error.txt
           rm .github/workflows/format-issue-215.yml
-          git add src/lima_lifecycle_executor.rs src/lima_lifecycle_executor/tests.rs .github/format-issue-215-error.txt .github/workflows/format-issue-215.yml
-          git commit -m 'style: format durable Lima authority guard'
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add \
+            src/lima_lifecycle_executor.rs \
+            src/lima_lifecycle_executor/tests.rs \
+            src/lima_lifecycle_executor_inner.rs \
+            src/lima_lifecycle_executor_inner/tests.rs \
+            .github/format-issue-215-error.txt \
+            .github/workflows/format-issue-215.yml
+          git commit -m 'fix: format durable Lima authority guard'
           git push origin HEAD:fix/issue-198-durable-authority
