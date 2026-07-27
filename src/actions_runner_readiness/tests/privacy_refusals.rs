@@ -1,17 +1,3 @@
-            &request(),
-            &source(LimaRuntimeState::Running, true, 130),
-            &ScriptedExecutor::new([ScriptedStep::Output(ScriptedOutput::success(
-                "x".repeat(MAX_ACTIONS_RUNNER_OUTPUT_BYTES + 1),
-            ))]),
-            &FakeClock::new([100]),
-        )
-        .expect_err("output bound");
-    assert_eq!(
-        oversized.code,
-        ActionsRunnerReadinessRefusalCode::UnboundedOutput
-    );
-}
-
 #[test]
 fn public_json_and_debug_suppress_private_paths_processes_and_raw_output() {
     let private_marker = "PRIVATE_RUNNER_RAW_OUTPUT";
