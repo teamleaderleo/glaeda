@@ -780,20 +780,20 @@ fn validate_common(
         ));
     }
     if input.current_broker_state_revision != input.accepted.state_revision {
-    return Err(ExecutionProblem::new(
-        LimaLifecycleExecutionRefusalCode::StateRevisionMismatch,
-        LimaLifecycleExecutionPhase::InputValidation,
-        "the current broker state revision does not match the accepted lifecycle action",
-    ));
-}
-if input.current_queue_generation != input.accepted.queue_generation {
-    return Err(ExecutionProblem::new(
-        LimaLifecycleExecutionRefusalCode::QueueGenerationMismatch,
-        LimaLifecycleExecutionPhase::InputValidation,
-        "the current queue generation does not match the accepted lifecycle action",
-    ));
-}
-let execution_millis = execution_unix_seconds.checked_mul(1_000).ok_or_else(|| {
+        return Err(ExecutionProblem::new(
+            LimaLifecycleExecutionRefusalCode::StateRevisionMismatch,
+            LimaLifecycleExecutionPhase::InputValidation,
+            "the current broker state revision does not match the accepted lifecycle action",
+        ));
+    }
+    if input.current_queue_generation != input.accepted.queue_generation {
+        return Err(ExecutionProblem::new(
+            LimaLifecycleExecutionRefusalCode::QueueGenerationMismatch,
+            LimaLifecycleExecutionPhase::InputValidation,
+            "the current queue generation does not match the accepted lifecycle action",
+        ));
+    }
+    let execution_millis = execution_unix_seconds.checked_mul(1_000).ok_or_else(|| {
         ExecutionProblem::new(
             LimaLifecycleExecutionRefusalCode::ClockFailure,
             LimaLifecycleExecutionPhase::InputValidation,
@@ -811,22 +811,22 @@ let execution_millis = execution_unix_seconds.checked_mul(1_000).ok_or_else(|| {
         ));
     }
     let lifecycle_age_millis = execution_millis
-    .checked_sub(input.lifecycle.observed_at().get())
-    .ok_or_else(|| {
-        ExecutionProblem::new(
+        .checked_sub(input.lifecycle.observed_at().get())
+        .ok_or_else(|| {
+            ExecutionProblem::new(
+                LimaLifecycleExecutionRefusalCode::StaleObservation,
+                LimaLifecycleExecutionPhase::InputValidation,
+                "the lifecycle observation is newer than lifecycle mutation time",
+            )
+        })?;
+    if lifecycle_age_millis > input.lifecycle_policy.max_observation_age_millis() {
+        return Err(ExecutionProblem::new(
             LimaLifecycleExecutionRefusalCode::StaleObservation,
             LimaLifecycleExecutionPhase::InputValidation,
-            "the lifecycle observation is newer than lifecycle mutation time",
-        )
-    })?;
-if lifecycle_age_millis > input.lifecycle_policy.max_observation_age_millis() {
-    return Err(ExecutionProblem::new(
-        LimaLifecycleExecutionRefusalCode::StaleObservation,
-        LimaLifecycleExecutionPhase::InputValidation,
-        "the lifecycle observation is not fresh at lifecycle mutation time",
-    ));
-}
-if input.current.timing.freshness_at(execution_unix_seconds) != LimaObservationFreshness::Fresh
+            "the lifecycle observation is not fresh at lifecycle mutation time",
+        ));
+    }
+    if input.current.timing.freshness_at(execution_unix_seconds) != LimaObservationFreshness::Fresh
     {
         return Err(ExecutionProblem::new(
             LimaLifecycleExecutionRefusalCode::StaleObservation,

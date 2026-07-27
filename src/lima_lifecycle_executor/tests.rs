@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::io;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use super::*;
 use crate::artifact::Sha256Digest;
@@ -157,6 +157,11 @@ fn executor() -> LimaLifecycleExecutor {
     .expect("executor")
 }
 
+fn lifecycle_policy() -> &'static LimaLifecyclePolicy {
+    static POLICY: OnceLock<LimaLifecyclePolicy> = OnceLock::new();
+    POLICY.get_or_init(|| LimaLifecyclePolicy::new(300_000).expect("lifecycle policy"))
+}
+
 fn accepted(action: HostBrokerAction) -> AcceptedLimaLifecycleAction {
     AcceptedLimaLifecycleAction {
         state_revision: HostBrokerStateRevision::new(7).expect("revision"),
@@ -264,6 +269,9 @@ fn input<'a>(
 ) -> LimaLifecycleExecutionInput<'a> {
     LimaLifecycleExecutionInput {
         accepted,
+        current_broker_state_revision: accepted.state_revision,
+        current_queue_generation: accepted.queue_generation,
+        lifecycle_policy: lifecycle_policy(),
         lifecycle,
         current,
         expected_persistent_identity: persistent,
@@ -612,6 +620,90 @@ fn old_action_refuses_with_fresh_observation_before_mutation() {
         .expect_err("expired action refusal");
 
     assert_eq!(error.code, LimaLifecycleExecutionRefusalCode::ExpiredAction);
+    assert!(commands.calls().is_empty());
+}
+
+#[test]
+fn durable_revision_and_queue_generation_drift_refuse_before_mutation() {
+    let persistent = persistent_identity('b');
+    let lifecycle = lifecycle(
+        LimaLifecycleState::Stopped,
+        LimaResourceProfile::Interactive,
+        1,
+        false,
+    );
+    let current = report(
+        LimaRuntimeState::Stopped,
+        LimaResourceProfile::Interactive,
+        None,
+    );
+    let action = accepted(HostBrokerAction::Start {
+        identity: lifecycle.identity().clone(),
+        profile: LimaResourceProfile::Interactive,
+        profile_generation: generation(1),
+    });
+    let request = request();
+    let observations = ScriptedObservationSource::new(Vec::new());
+    let commands = ScriptedExecutor::new(ExecutorMode::Match);
+
+    let mut revision_input = input(&action, &lifecycle, &current, &persistent, &request);
+    revision_input.current_broker_state_revision =
+        HostBrokerStateRevision::new(8).expect("drifted revision");
+    let error = executor()
+        .execute(revision_input, &observations, &commands, &FixedClock(100))
+        .expect_err("revision drift refusal");
+    assert_eq!(
+        error.code,
+        LimaLifecycleExecutionRefusalCode::StateRevisionMismatch
+    );
+    assert!(commands.calls().is_empty());
+
+    let mut generation_input = input(&action, &lifecycle, &current, &persistent, &request);
+    generation_input.current_queue_generation =
+        PersonalWorkerQueueGeneration::new(12).expect("drifted generation");
+    let error = executor()
+        .execute(generation_input, &observations, &commands, &FixedClock(100))
+        .expect_err("queue generation drift refusal");
+    assert_eq!(
+        error.code,
+        LimaLifecycleExecutionRefusalCode::QueueGenerationMismatch
+    );
+    assert!(commands.calls().is_empty());
+}
+
+#[test]
+fn stale_lifecycle_observation_refuses_inside_action_window() {
+    let persistent = persistent_identity('b');
+    let lifecycle = lifecycle(
+        LimaLifecycleState::Stopped,
+        LimaResourceProfile::Interactive,
+        1,
+        false,
+    );
+    let current = report(
+        LimaRuntimeState::Stopped,
+        LimaResourceProfile::Interactive,
+        None,
+    );
+    let action = accepted(HostBrokerAction::Start {
+        identity: lifecycle.identity().clone(),
+        profile: LimaResourceProfile::Interactive,
+        profile_generation: generation(1),
+    });
+    let request = request();
+    let observations = ScriptedObservationSource::new(Vec::new());
+    let commands = ScriptedExecutor::new(ExecutorMode::Match);
+    let short_policy = LimaLifecyclePolicy::new(5_000).expect("short policy");
+    let mut execution_input = input(&action, &lifecycle, &current, &persistent, &request);
+    execution_input.lifecycle_policy = &short_policy;
+
+    let error = executor()
+        .execute(execution_input, &observations, &commands, &FixedClock(106))
+        .expect_err("stale lifecycle refusal");
+    assert_eq!(
+        error.code,
+        LimaLifecycleExecutionRefusalCode::StaleObservation
+    );
     assert!(commands.calls().is_empty());
 }
 
