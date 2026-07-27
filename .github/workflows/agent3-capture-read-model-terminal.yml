@@ -1,0 +1,51 @@
+name: Agent 3 capture personal worker terminal read model
+
+on:
+  pull_request:
+    types: [synchronize]
+
+permissions:
+  contents: write
+  pull-requests: read
+
+jobs:
+  capture:
+    if: github.event.pull_request.head.ref == 'repair/issue-187-personal-worker-read-model-terminal' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out exact repair branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+          show-progress: false
+      - name: Apply existing repair and capture result
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          workflow = Path('.github/workflows/agent3-repair-read-model-terminal.yml').read_text(encoding='utf-8')
+          start_marker = '      - name: Replay and repair read model\n        run: |\n'
+          start = workflow.index(start_marker) + len(start_marker)
+          end = workflow.index('      - name: Commit source-only read-model repair\n', start)
+          lines = workflow[start:end].splitlines()
+          script = '\n'.join(line[10:] if line.startswith('          ') else line for line in lines) + '\n'
+          Path('/tmp/agent3-read-model-repair.sh').write_text(script, encoding='utf-8')
+          PY
+          set +e
+          bash /tmp/agent3-read-model-repair.sh >/tmp/agent3-read-model-full.log 2>&1
+          status=$?
+          tail -n 300 /tmp/agent3-read-model-full.log >.agent3-read-model-repair.log
+          printf '\nagent3_repair_status=%s\n' "$status" >>.agent3-read-model-repair.log
+          exit 0
+      - name: Commit patched tree and compact diagnostic
+        run: |
+          git config user.name "Agent 3"
+          git config user.email "agent3@users.noreply.github.com"
+          git rm .github/workflows/agent3-repair-read-model-terminal.yml
+          git rm .github/workflows/agent3-capture-read-model-terminal.yml
+          git rm .agent3-read-model-trigger
+          git add src/lib.rs src/personal_worker_read_model.rs tests/personal_worker_read_model.rs .agent3-read-model-repair.log
+          git diff --cached --check
+          git commit -m "Capture terminal read-model repair result"
+          git push origin HEAD:${{ github.event.pull_request.head.ref }}
