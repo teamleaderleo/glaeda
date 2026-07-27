@@ -1,22 +1,23 @@
 name: Agent 3 rebuild Lima lifecycle executor
 
 on:
-  push:
-    branches:
-      - repair/issue-187-lima-executor-authority
+  pull_request:
+    types: [synchronize]
 
 permissions:
   contents: write
+  pull-requests: read
 
 jobs:
   rebuild:
+    if: github.event.pull_request.number == 206 && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
       - name: Check out clean repair branch
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: repair/issue-187-lima-executor-authority
+          ref: ${{ github.event.pull_request.head.ref }}
           fetch-depth: 0
           show-progress: false
       - name: Replay and repair executor
@@ -289,4 +290,4 @@ jobs:
           git add src/lib.rs src/lima_lifecycle_executor.rs src/lima_lifecycle_executor/tests.rs
           git diff --cached --check
           git commit -m "Rebuild revision-bound Lima lifecycle executor"
-          git push origin HEAD:repair/issue-187-lima-executor-authority
+          git push origin HEAD:${{ github.event.pull_request.head.ref }}
