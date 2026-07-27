@@ -4,6 +4,9 @@ on:
   pull_request:
     paths:
       - .github/workflows/linux-acceptance.yml
+      - scripts/macbook-runner-vm.sh
+      - scripts/test-macbook-runner-vm.sh
+      - scripts/test-macbook-runner-vm-paths.sh
       - scripts/run-linux-acceptance.sh
       - tests/durable_journal_recovery.rs
       - tests/linux_acceptance.rs

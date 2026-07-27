@@ -4,6 +4,25 @@ This is the short operator path for the existing `smolrunner` Lima development V
 
 Run commands from the SmolRunner checkout on the Mac.
 
+## Reviewed resource profiles
+
+```bash
+bash scripts/macbook-runner-vm.sh profile interactive  # 3 GiB / 4 vCPU
+bash scripts/macbook-runner-vm.sh profile work         # 10 GiB / 8 vCPU
+```
+
+A real change uses graceful `stop -> limactl edit -> start -> verify`. Re-selecting the exact running profile is idempotent but still proves no operator run or `Runner.Worker` is active before re-verifying guest CPU and memory.
+
+Run one explicit command under a reviewed profile:
+
+```bash
+bash scripts/macbook-runner-vm.sh run work -- /usr/bin/nproc
+```
+
+`run` forwards only the supplied argument vector through `limactl shell ... --`, reports its exit status, and leaves shutdown explicit.
+
+The fresh-instance references are `examples/lima/smolrunner-interactive.yaml` and `examples/lima/smolrunner-work.yaml`.
+
 ## Default tmux workspace
 
 ```bash
@@ -103,6 +122,8 @@ The full wrappers are also available directly:
 bash scripts/macbook-workspace.sh help
 bash scripts/macbook-runner-vm.sh help
 bash scripts/macbook-runner-vm.sh exec -- /usr/bin/uname -m
+bash scripts/macbook-runner-vm.sh profile work
+bash scripts/macbook-runner-vm.sh run work -- /usr/bin/nproc
 ```
 
 Override the VM defaults when operating another instance or checkout:
@@ -112,6 +133,14 @@ SMOLRUNNER_VM=another-instance \
 SMOLRUNNER_GUEST_REPO=/home/lima/another-checkout \
   bash scripts/macbook-runner-vm.sh status
 ```
+
+## Stop while preserving warm caches
+
+```bash
+bash scripts/macbook-runner-vm.sh stop
+```
+
+A graceful stop releases the VM RAM envelope back to macOS while retaining the persistent instance disk. Runner-owned Cargo registry/Git data, `CARGO_TARGET_DIR`, repository build caches, explicitly owned package-manager caches, reviewed Podman layers, and guest checkout data survive stop/start and profile changes. The helper never deletes or recreates the instance and never prunes caches.
 
 ## Avoid ambiguous `git pull`
 
@@ -142,6 +171,7 @@ The VM is currently a development and field-validation environment:
 - ARM64 Ubuntu, systemd, cgroup v2, Rust, and rootless Podman are working;
 - GitHub-hosted runners still execute the repository's ordinary Actions workflows;
 - no official Actions listener is registered in this Lima VM;
+- no daemon, timer, queue polling, webhook, automatic wake-up/shutdown, cache deletion, host-home mount, or credential propagation is added by the profile helper;
 - cmux remains a human-facing view and never becomes privileged execution transport;
 - no project bootstrap, runner registration, automatic update, or production deployment authority is implied by these shortcuts.
 
