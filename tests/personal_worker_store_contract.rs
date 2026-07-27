@@ -408,3 +408,23 @@ fn unsafe_and_corrupt_filesystem_state_fails_closed() {
         .expect_err("corrupt current state");
     assert_eq!(error.kind(), PersonalWorkerStoreErrorKind::CorruptState);
 }
+
+#[test]
+fn bounded_revision_and_queue_generation_spaces_fail_closed() {
+    let exhausted = PersonalWorkerStoreRevision::new(1_000_000_000_000)
+        .expect("maximum store revision")
+        .next()
+        .expect_err("store revision exhaustion");
+    assert_eq!(
+        exhausted.kind(),
+        PersonalWorkerStoreErrorKind::RevisionConflict
+    );
+
+    let document =
+        PersonalWorkerStoreDocument::new(empty_queue(1_000_000_000_000, 6_000_000), vec![])
+            .expect("maximum queue generation document");
+    let error = document
+        .advance(empty_queue(1_000_000_000_000, 6_000_001), vec![])
+        .expect_err("queue generation exhaustion");
+    assert_eq!(error.kind(), PersonalWorkerStoreErrorKind::RevisionConflict);
+}

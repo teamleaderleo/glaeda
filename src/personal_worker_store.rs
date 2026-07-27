@@ -45,7 +45,16 @@ impl PersonalWorkerStoreRevision {
     }
 
     pub fn next(self) -> Result<Self, PersonalWorkerStoreError> {
-        Self::new(self.0.saturating_add(1))
+        let next = self
+            .0
+            .checked_add(1)
+            .filter(|value| *value <= MAX_PERSONAL_WORKER_STORE_REVISION)
+            .ok_or_else(|| {
+                PersonalWorkerStoreError::revision_conflict(
+                    "personal worker store revision space is exhausted",
+                )
+            })?;
+        Ok(Self(next))
     }
 }
 
@@ -170,11 +179,7 @@ impl PersonalWorkerStoreDocument {
         queue: PersonalWorkerQueueInput,
         cache_leases: Vec<PersonalWorkerDurableCacheLease>,
     ) -> Result<Self, PersonalWorkerStoreError> {
-        let expected_generation = self.queue.generation.next().map_err(|_| {
-            PersonalWorkerStoreError::revision_conflict(
-                "personal worker queue generation cannot advance",
-            )
-        })?;
+        let expected_generation = next_queue_generation(self.queue.generation)?;
         if queue.generation != expected_generation {
             return Err(PersonalWorkerStoreError::revision_conflict(
                 "personal worker queue generation must advance exactly once",
@@ -241,11 +246,7 @@ impl PersonalWorkerStoreDocument {
                 "replacement store revision must advance exactly once",
             ));
         }
-        let expected_generation = previous.queue.generation.next().map_err(|_| {
-            PersonalWorkerStoreError::revision_conflict(
-                "replacement queue generation cannot advance",
-            )
-        })?;
+        let expected_generation = next_queue_generation(previous.queue.generation)?;
         if self.queue.generation != expected_generation {
             return Err(PersonalWorkerStoreError::revision_conflict(
                 "replacement queue generation must advance exactly once",
@@ -491,6 +492,21 @@ pub fn decode_personal_worker_store_document(
         return Err(PersonalWorkerStoreError::corrupt_state());
     }
     Ok(document)
+}
+
+fn next_queue_generation(
+    generation: PersonalWorkerQueueGeneration,
+) -> Result<PersonalWorkerQueueGeneration, PersonalWorkerStoreError> {
+    let next = generation.get().checked_add(1).ok_or_else(|| {
+        PersonalWorkerStoreError::revision_conflict(
+            "personal worker queue generation space is exhausted",
+        )
+    })?;
+    PersonalWorkerQueueGeneration::new(next).map_err(|_| {
+        PersonalWorkerStoreError::revision_conflict(
+            "personal worker queue generation space is exhausted",
+        )
+    })
 }
 
 fn validate_cache_leases(

@@ -222,11 +222,7 @@ impl UnixPersonalWorkerStore {
                 if staged.revision().get() != 1 || !staged.history().is_empty() {
                     return Err(PersonalWorkerStoreError::corrupt_state());
                 }
-                let mut staged_guard = StagedDocument {
-                    directory: self.directory.as_fd(),
-                    file: None,
-                    armed: true,
-                };
+                let mut staged_guard = StagedDocument::existing(self.directory.as_fd());
                 self.publish_staged(&mut staged_guard, true)?;
                 Ok(PersonalWorkerStoreRecovery::new(
                     PersonalWorkerStoreRecoveryDisposition::PublishedStaged,
@@ -244,11 +240,7 @@ impl UnixPersonalWorkerStore {
                 staged
                     .validate_successor_of(&current)
                     .map_err(|_| PersonalWorkerStoreError::corrupt_state())?;
-                let mut staged_guard = StagedDocument {
-                    directory: self.directory.as_fd(),
-                    file: None,
-                    armed: true,
-                };
+                let mut staged_guard = StagedDocument::existing(self.directory.as_fd());
                 self.publish_staged(&mut staged_guard, false)?;
                 Ok(PersonalWorkerStoreRecovery::new(
                     PersonalWorkerStoreRecoveryDisposition::PublishedStaged,
@@ -339,7 +331,15 @@ struct StagedDocument<'a> {
     armed: bool,
 }
 
-impl StagedDocument<'_> {
+impl<'a> StagedDocument<'a> {
+    fn existing(directory: BorrowedFd<'a>) -> Self {
+        Self {
+            directory,
+            file: None,
+            armed: false,
+        }
+    }
+
     fn disarm(&mut self) {
         self.armed = false;
     }
