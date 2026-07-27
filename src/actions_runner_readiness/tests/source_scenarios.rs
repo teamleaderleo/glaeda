@@ -1,3 +1,13 @@
+#[test]
+fn offline_starting_busy_and_draining_are_distinct() {
+    let offline_executor = ScriptedExecutor::default();
+    let offline = adapter()
+        .observe(
+            &request(),
+            &source(LimaRuntimeState::Stopped, false, 130),
+            &offline_executor,
+            &FakeClock::new([100]),
+        )
         .expect("offline observation");
     assert_eq!(offline.report().state, ActionsRunnerReadinessState::Offline);
     assert!(offline.report().configured_identity.is_none());
