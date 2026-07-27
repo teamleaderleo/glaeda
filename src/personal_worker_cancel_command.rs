@@ -91,19 +91,11 @@ pub(crate) fn cancel_queued_job(
             "personal worker request ID is invalid",
         )
     })?;
-    apply_cancel(
-        store_root,
-        revision,
-        generation,
-        request_id,
-        cancelled_at,
-    )
+    apply_cancel(store_root, revision, generation, request_id, cancelled_at)
 }
 
 #[must_use]
-pub(crate) fn render_cancel_receipt_human(
-    receipt: &PersonalWorkerStoreMutationReceipt,
-) -> String {
+pub(crate) fn render_cancel_receipt_human(receipt: &PersonalWorkerStoreMutationReceipt) -> String {
     let mut output = String::new();
     writeln!(output, "Personal worker cancellation").expect("writing to a String cannot fail");
     writeln!(
@@ -112,8 +104,12 @@ pub(crate) fn render_cancel_receipt_human(
         serialized_label(&receipt.disposition())
     )
     .expect("writing to a String cannot fail");
-    writeln!(output, "  mutation: {}", serialized_label(&receipt.mutation()))
-        .expect("writing to a String cannot fail");
+    writeln!(
+        output,
+        "  mutation: {}",
+        serialized_label(&receipt.mutation())
+    )
+    .expect("writing to a String cannot fail");
     writeln!(
         output,
         "  store revision: {} -> {}",
@@ -147,8 +143,8 @@ fn apply_cancel(
     request_id: ExecutionRequestId,
     cancelled_at: EpochMillis,
 ) -> Result<PersonalWorkerStoreMutationReceipt, PersonalWorkerCancelCommandError> {
-    let mut store = UnixPersonalWorkerStore::open_existing_read_only(store_root)
-        .map_err(map_store_error)?;
+    let mut store =
+        UnixPersonalWorkerStore::open_existing_read_only(store_root).map_err(map_store_error)?;
     apply_personal_worker_store_mutation(
         &mut store,
         revision,
@@ -220,9 +216,7 @@ fn map_store_error(error: PersonalWorkerStoreError) -> PersonalWorkerCancelComma
     }
 }
 
-fn map_mutation_error(
-    error: PersonalWorkerStoreMutationError,
-) -> PersonalWorkerCancelCommandError {
+fn map_mutation_error(error: PersonalWorkerStoreMutationError) -> PersonalWorkerCancelCommandError {
     let kind = match error.kind() {
         PersonalWorkerStoreMutationErrorKind::MissingState => {
             PersonalWorkerCancelCommandErrorKind::MissingStore
@@ -271,9 +265,7 @@ const fn command_error(
 mod tests {
     use std::path::Path;
 
-    use super::{
-        PersonalWorkerCancelCommandErrorKind, cancel_queued_job, validate_store_root,
-    };
+    use super::{PersonalWorkerCancelCommandErrorKind, cancel_queued_job, validate_store_root};
 
     #[test]
     fn cancellation_root_requires_an_absolute_normalized_path() {
