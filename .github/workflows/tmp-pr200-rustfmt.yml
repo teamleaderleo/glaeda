@@ -1,0 +1,32 @@
+name: Temporary PR 200 rustfmt
+
+on:
+  push:
+    branches:
+      - tmp/pr200-rustfmt
+
+permissions:
+  contents: write
+
+jobs:
+  format:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: tmp/pr200-rustfmt
+          show-progress: false
+      - name: Format product files
+        run: cargo fmt --all
+      - name: Commit formatter output
+        run: |
+          if git diff --quiet -- src/lib.rs src/personal_worker_read_model.rs tests/personal_worker_read_model.rs; then
+            exit 0
+          fi
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/lib.rs src/personal_worker_read_model.rs tests/personal_worker_read_model.rs
+          git commit -m 'Apply rustfmt to PR 200 product files'
+          git push origin HEAD:tmp/pr200-rustfmt
