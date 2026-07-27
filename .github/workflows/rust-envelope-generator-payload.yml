@@ -1,0 +1,90 @@
+name: Generate Rust verification envelope payload
+
+on:
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  generate:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out exact product head
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: product
+          show-progress: false
+      - name: Check out exact source payload
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: integration/issue-199-rust-envelope-generator-base
+          path: generator
+          show-progress: false
+      - name: Generate, format, and test contract
+        working-directory: product
+        run: |
+          set +e
+          python3 - <<'PY' > /tmp/rust-envelope-diagnostic.log 2>&1
+          from pathlib import Path
+          import base64
+          import gzip
+
+          payload = ''.join(
+              Path('../generator/.github/rust-envelope.payload').read_text(encoding='utf-8').split()
+          )
+          Path('src/rust_verification_envelope.rs').write_bytes(
+              gzip.decompress(base64.b64decode(payload))
+          )
+
+          lib = Path('src/lib.rs')
+          text = lib.read_text(encoding='utf-8')
+          marker = 'pub mod renderprove_vision_result;\n'
+          addition = (
+              marker
+              + '/// Pure repository-declared Rust build-scope and resource envelope contracts.\n'
+              + 'pub mod rust_verification_envelope;\n'
+          )
+          if text.count(marker) != 1:
+              raise SystemExit('lib export marker mismatch')
+          lib.write_text(text.replace(marker, addition), encoding='utf-8')
+          PY
+          status=$?
+          if [ "$status" -eq 0 ]; then
+            cargo fmt --all >> /tmp/rust-envelope-diagnostic.log 2>&1
+            status=$?
+          fi
+          if [ "$status" -eq 0 ]; then
+            cargo test --locked rust_verification_envelope >> /tmp/rust-envelope-diagnostic.log 2>&1
+            status=$?
+          fi
+          echo "$status" > /tmp/rust-envelope-status
+          exit 0
+      - name: Upload bounded diagnostic
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-envelope-payload-diagnostic
+          path: /tmp/rust-envelope-diagnostic.log
+          if-no-files-found: error
+          retention-days: 1
+      - name: Publish generated contract
+        working-directory: product
+        env:
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          status=$(cat /tmp/rust-envelope-status)
+          if [ "$status" -ne 0 ]; then
+            exit 0
+          fi
+          git add src/lib.rs src/rust_verification_envelope.rs
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git commit -m 'Add typed Rust verification envelope contract'
+          git push origin "HEAD:${HEAD_REF}"
+      - name: Enforce diagnostic status
+        run: |
+          exit "$(cat /tmp/rust-envelope-status)"
