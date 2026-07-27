@@ -1,0 +1,34 @@
+name: PR223 format diff
+
+on:
+  pull_request:
+    paths:
+      - src/main.rs
+      - src/personal_worker_cancel_command.rs
+      - tests/personal_worker_cancel_cli.rs
+      - .github/workflows/pr223-format-diff.yml
+
+permissions:
+  contents: read
+
+jobs:
+  format-diff:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          show-progress: false
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal --component rustfmt
+      - name: Capture exact formatter diff
+        run: |
+          cargo +stable fmt --all
+          git diff -- src/main.rs src/personal_worker_cancel_command.rs tests/personal_worker_cancel_cli.rs > pr223-format.diff
+      - name: Upload formatter diff
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: pr223-format-diff
+          path: pr223-format.diff
+          if-no-files-found: error
+          retention-days: 1
