@@ -45,6 +45,10 @@ pub mod lane_executor;
 pub mod lease;
 pub mod lease_catalog;
 pub mod lease_document;
+/// Pure, fail-closed lifecycle and idle-cooldown policy for one persistent Lima worker VM.
+pub mod lima_lifecycle;
+/// Read-only, bounded exact Lima instance and guest-resource observation.
+pub mod lima_observation;
 /// Read-only, fail-closed lookup of persisted project installations.
 #[cfg(target_os = "linux")]
 pub mod linux_installation_catalog;
@@ -70,6 +74,8 @@ pub mod mac_availability;
 pub mod macos_resource_observation;
 pub mod manifest;
 pub mod ownership;
+/// Pure composition of queue, lifecycle, and runner evidence into one broker action.
+pub mod personal_worker_host_broker;
 pub mod personal_worker_queue;
 pub mod plan;
 pub mod podman_preview;
