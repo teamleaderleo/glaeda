@@ -1,0 +1,62 @@
+name: Agent 3 repair PR 196 privacy contract
+
+on:
+  push:
+    branches:
+      - agent3/196-self-review-repair
+    paths:
+      - .github/workflows/agent3-self-review-196.yml
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out PR branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: feat/issue-187-github-workflow-job-mapper
+          fetch-depth: 0
+      - name: Redact delivery and reviewed names from public debug surfaces
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('src/github_workflow_job_mapper.rs')
+          text = path.read_text()
+          text = text.replace(
+              'identifier_type!(GitHubWorkflowJobRouteId, "route.id");\nidentifier_type!(GitHubDeliveryId, "origin.delivery_id");\n',
+              '''identifier_type!(GitHubWorkflowJobRouteId, "route.id");\n\n#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]\npub struct GitHubDeliveryId(String);\n\nimpl GitHubDeliveryId {\n    /// Parse one bounded private GitHub delivery identifier.\n    ///\n    /// # Errors\n    ///\n    /// Returns an error for an empty, oversized, non-ASCII, or path-shaped value.\n    pub fn parse(value: &str) -> Result<Self, GitHubWorkflowJobMapperError> {\n        validate_identifier("origin.delivery_id", value)?;\n        Ok(Self(value.to_owned()))\n    }\n\n    #[must_use]\n    pub fn as_str(&self) -> &str {\n        &self.0\n    }\n}\n\nimpl fmt::Debug for GitHubDeliveryId {\n    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {\n        formatter.write_str("<github-delivery-id>")\n    }\n}\n''',
+              1,
+          )
+          text = text.replace(
+              '#[derive(Debug, Clone, PartialEq, Eq)]\npub enum GitHubWorkflowJobEvidenceOrigin {',
+              '#[derive(Clone, PartialEq, Eq)]\npub enum GitHubWorkflowJobEvidenceOrigin {',
+              1,
+          )
+          marker = '''impl GitHubWorkflowJobEvidenceOrigin {\n    fn kind(&self) -> GitHubWorkflowJobEvidenceOriginKind {'''
+          replacement = '''impl fmt::Debug for GitHubWorkflowJobEvidenceOrigin {\n    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {\n        formatter\n            .debug_struct("GitHubWorkflowJobEvidenceOrigin")\n            .field("kind", &self.kind())\n            .field("private_evidence", &"<redacted>")\n            .finish()\n    }\n}\n\nimpl GitHubWorkflowJobEvidenceOrigin {\n    fn kind(&self) -> GitHubWorkflowJobEvidenceOriginKind {'''
+          text = text.replace(marker, replacement, 1)
+          text = text.replace(
+              '#[derive(Debug, Clone, PartialEq, Eq)]\npub struct GitHubWorkflowJobEventDefinition {',
+              '#[derive(Clone, PartialEq, Eq)]\npub struct GitHubWorkflowJobEventDefinition {',
+              1,
+          )
+          marker = '''#[derive(Clone, PartialEq, Eq)]\npub struct GitHubWorkflowJobEvent {'''
+          debug_impl = '''impl fmt::Debug for GitHubWorkflowJobEventDefinition {\n    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {\n        formatter\n            .debug_struct("GitHubWorkflowJobEventDefinition")\n            .field("origin", &self.origin.kind())\n            .field("workflow_job_id", &self.workflow_job_id)\n            .field("run_id", &self.run_id)\n            .field("run_attempt", &self.run_attempt)\n            .field("action", &self.action)\n            .field("repository", &self.repository)\n            .field("workflow_name", &"<reviewed-github-name>")\n            .field("job_name", &"<reviewed-github-name>")\n            .field("head_commit", &self.head_commit)\n            .field("head_tree", &self.head_tree)\n            .field("created_at", &self.created_at)\n            .field("started_at", &self.started_at)\n            .field("completed_at", &self.completed_at)\n            .field("conclusion", &self.conclusion)\n            .field("observed_at", &self.observed_at)\n            .finish()\n    }\n}\n\n#[derive(Clone, PartialEq, Eq)]\npub struct GitHubWorkflowJobEvent {'''
+          text = text.replace(marker, debug_impl, 1)
+          test_marker = '''    #[test]\n    fn public_mapping_omits_private_names_and_delivery_evidence() {'''
+          if test_marker not in text:
+              raise SystemExit('privacy test marker missing')
+          insert = '''    #[test]\n    fn public_debug_surfaces_redact_private_event_evidence() {\n        let definition = event_definition(GitHubWorkflowJobAction::Queued);\n        let rendered = format!("{definition:?}");\n        assert!(!rendered.contains(PRIVATE_WORKFLOW));\n        assert!(!rendered.contains(PRIVATE_JOB));\n        assert!(!rendered.contains(PRIVATE_DELIVERY));\n\n        let delivery = GitHubDeliveryId::parse(PRIVATE_DELIVERY).expect("delivery");\n        assert_eq!(format!("{delivery:?}"), "<github-delivery-id>");\n        let origin = GitHubWorkflowJobEvidenceOrigin::VerifiedWebhook { delivery_id: delivery };\n        assert!(!format!("{origin:?}").contains(PRIVATE_DELIVERY));\n    }\n\n'''
+          text = text.replace(test_marker, insert + test_marker, 1)
+          path.write_text(text)
+          PY
+          cargo fmt --all
+          cargo test github_workflow_job_mapper --lib
+          git config user.name 'Agent 3'
+          git config user.email 'agent3@users.noreply.github.com'
+          git add src/github_workflow_job_mapper.rs
+          git commit -m 'Redact GitHub delivery evidence from public debug surfaces'
+          git push origin HEAD:feat/issue-187-github-workflow-job-mapper
