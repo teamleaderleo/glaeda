@@ -1,0 +1,221 @@
+name: Cargo target-selection research
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  reproduce:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out trigger head
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          show-progress: false
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal
+      - name: Run controlled target-selection reproduction
+        env:
+          CARGO_BUILD_JOBS: '1'
+          CARGO_INCREMENTAL: '0'
+        run: |
+          set -euo pipefail
+          root=/tmp/cargo-target-selection
+          rm -rf "$root"
+          mkdir -p "$root/workspace/fixture/src" "$root/workspace/fixture/tests" "$root/results"
+
+          cat > "$root/workspace/Cargo.toml" <<'TOML'
+          [workspace]
+          members = ["fixture"]
+          resolver = "2"
+          TOML
+
+          cat > "$root/workspace/fixture/Cargo.toml" <<'TOML'
+          [package]
+          name = "fixture"
+          version = "0.1.0"
+          edition = "2021"
+          publish = false
+
+          [dependencies]
+          TOML
+
+          cat > "$root/workspace/fixture/src/lib.rs" <<'RS'
+          pub fn marker() -> bool {
+              true
+          }
+
+          #[cfg(test)]
+          mod tests {
+              #[test]
+              fn marker_library() {
+                  assert!(super::marker());
+              }
+          }
+          RS
+
+          cat > "$root/workspace/fixture/tests/alpha.rs" <<'RS'
+          #[test]
+          fn marker_alpha() {
+              assert!(fixture::marker());
+          }
+          RS
+
+          cat > "$root/workspace/fixture/tests/beta.rs" <<'RS'
+          #[test]
+          fn marker_beta() {
+              assert!(fixture::marker());
+          }
+          RS
+
+          cd "$root/workspace"
+          cargo +1.88.0 generate-lockfile --offline
+          cargo +1.88.0 metadata --locked --offline --no-deps --format-version=1 > "$root/results/metadata.json"
+
+          uname -a > "$root/results/uname.txt"
+          nproc > "$root/results/nproc.txt"
+          free -b > "$root/results/free-bytes.txt"
+          rustc +1.88.0 -Vv > "$root/results/rustc-version.txt"
+          cargo +1.88.0 -V > "$root/results/cargo-version.txt"
+          cp /etc/os-release "$root/results/os-release.txt"
+
+          cat > "$root/run.py" <<'PY'
+          import json
+          import os
+          import pathlib
+          import subprocess
+          import time
+
+          root = pathlib.Path('/tmp/cargo-target-selection')
+          workspace = root / 'workspace'
+          results = root / 'results'
+
+          variants = [
+              ('package_filter', []),
+              ('library_filter', ['--lib']),
+              ('exact_alpha_filter', ['--test', 'alpha']),
+          ]
+
+          report = {
+              'schema_version': 1,
+              'controls': {
+                  'toolchain': '1.88.0',
+                  'cargo_build_jobs': 1,
+                  'cargo_incremental': False,
+                  'cache_state': 'cold independent target directory per command',
+                  'package': 'fixture',
+                  'test_filter': 'marker',
+                  'no_run': True,
+                  'offline': True,
+              },
+              'variants': [],
+          }
+
+          for name, selector in variants:
+              target_dir = root / f'target-{name}'
+              command = [
+                  'cargo', '+1.88.0', 'test', '--locked', '--offline',
+                  '-p', 'fixture', *selector, '--no-run',
+                  '--message-format=json', 'marker',
+              ]
+              env = os.environ.copy()
+              env['CARGO_TARGET_DIR'] = str(target_dir)
+              started = time.monotonic_ns()
+              completed = subprocess.run(
+                  command,
+                  cwd=workspace,
+                  env=env,
+                  text=True,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+                  check=False,
+              )
+              elapsed_ms = (time.monotonic_ns() - started) // 1_000_000
+              (results / f'{name}.stdout.jsonl').write_text(completed.stdout, encoding='utf-8')
+              (results / f'{name}.stderr.txt').write_text(completed.stderr, encoding='utf-8')
+
+              artifacts = []
+              test_executables = []
+              for line in completed.stdout.splitlines():
+                  try:
+                      message = json.loads(line)
+                  except json.JSONDecodeError:
+                      continue
+                  if message.get('reason') != 'compiler-artifact':
+                      continue
+                  target = message.get('target', {})
+                  profile = message.get('profile', {})
+                  artifact = {
+                      'name': target.get('name'),
+                      'kind': target.get('kind', []),
+                      'crate_types': target.get('crate_types', []),
+                      'profile_test': bool(profile.get('test')),
+                      'executable': pathlib.Path(message['executable']).name
+                          if message.get('executable') else None,
+                  }
+                  artifacts.append(artifact)
+                  if artifact['profile_test'] and artifact['executable']:
+                      test_executables.append({
+                          'name': artifact['name'],
+                          'kind': artifact['kind'],
+                          'executable': artifact['executable'],
+                      })
+
+              variant = {
+                  'name': name,
+                  'command': command,
+                  'exit_code': completed.returncode,
+                  'elapsed_ms': elapsed_ms,
+                  'compiler_artifacts': artifacts,
+                  'test_executables': test_executables,
+                  'test_executable_names': sorted(item['name'] for item in test_executables),
+              }
+              report['variants'].append(variant)
+              if completed.returncode != 0:
+                  raise SystemExit(
+                      f"{name} failed with {completed.returncode}: {completed.stderr[-2000:]}"
+                  )
+
+          (results / 'summary.json').write_text(
+              json.dumps(report, indent=2, sort_keys=True) + '\n',
+              encoding='utf-8',
+          )
+
+          by_name = {item['name']: item for item in report['variants']}
+          lines = [
+              '# Cargo target-selection reproduction',
+              '',
+              'Pinned controls: Rust/Cargo 1.88.0, Ubuntu 24.04 hosted runner, '
+              '`CARGO_BUILD_JOBS=1`, `CARGO_INCREMENTAL=0`, dependency-free fixture, '
+              'cold independent target directories, `--locked --offline --no-run`, '
+              'and test filter `marker`.',
+              '',
+              '| Variant | Test executables built | Elapsed ms |',
+              '|---|---|---:|',
+          ]
+          for name in ('package_filter', 'library_filter', 'exact_alpha_filter'):
+              item = by_name[name]
+              targets = ', '.join(item['test_executable_names']) or '(none)'
+              lines.append(f"| `{name}` | `{targets}` | {item['elapsed_ms']} |")
+          lines += [
+              '',
+              'The raw JSON Cargo messages and complete compiler-artifact list are included '
+              'beside this report.',
+          ]
+          (results / 'summary.md').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+          PY
+
+          python3 "$root/run.py"
+          cat "$root/results/summary.md"
+      - name: Upload research artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-target-selection-research
+          path: /tmp/cargo-target-selection/results
+          if-no-files-found: error
+          retention-days: 7
