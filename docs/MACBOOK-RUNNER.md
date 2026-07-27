@@ -9,12 +9,12 @@ SmolRunner remains pre-alpha. The current CLI provides read-only diagnostics and
 | Profile | VM memory | VM vCPUs | Initial runner concurrency | Default disposable-job cap | Intended use |
 | --- | ---: | ---: | ---: | --- | --- |
 | Interactive | 3 GiB | 4 | 1 job | 2 CPUs, 2 GiB RAM | Normal use while the Mac is active |
-| Away | 8 GiB | 8 | 1 job | 2 CPUs, 2 GiB RAM | One heavier job after active work finishes |
+| Work | 10 GiB | 8 | 1 job | 2 CPUs, 2 GiB RAM | Codex, builds, and tests after active work finishes |
 
 The repository contains two fresh-instance templates:
 
 - `examples/lima/smolrunner-interactive.yaml`
-- `examples/lima/smolrunner-away.yaml`
+- `examples/lima/smolrunner-work.yaml`
 
 Both profiles use:
 
@@ -101,6 +101,22 @@ du -sh "$HOME/.cache/lima"
 
 The first command reports allocated host storage for the VM directory. The configured 80 GiB virtual disk is sparse and can grow as guest data accumulates.
 
+## Manual profile and run helper
+
+Use only the two reviewed profile names:
+
+```bash
+bash scripts/macbook-runner-vm.sh profile interactive
+bash scripts/macbook-runner-vm.sh profile work
+bash scripts/macbook-runner-vm.sh run work -- /usr/bin/nproc
+```
+
+A real profile change observes exact Lima state, CPU, and memory; refuses an active operator marker or observed `Runner.Worker`; gracefully stops the VM; applies the fixed `limactl edit --tty=false` CPU/memory values; starts it; and verifies both configured and guest-observed resources. Selecting an already exact running profile is idempotent but still checks the idle boundary before verification.
+
+`run PROFILE -- CMD...` selects the exact profile, creates a private bounded active marker, forwards only the explicit command argument vector through `limactl shell ... --`, reports the command exit status, and removes the marker. It leaves shutdown explicit.
+
+The marker and process checks are a conservative manual boundary, not a durable race-free scheduler. Automated queue wake-up, reservations, runner readiness, cooldown, and shutdown require a separately reviewed control-plane adapter.
+
 ## Read-only observation helper
 
 Run the included helper before and after a workload:
@@ -130,13 +146,13 @@ cpus = 2
 memory = 2 GiB
 ```
 
-The 3 GiB interactive VM leaves about 1 GiB for the guest kernel, systemd, the Actions listener, Podman, and filesystem cache. A workload that regularly consumes the entire 2 GiB job cap belongs in the away profile or a separate heavy-worker VM.
+The 3 GiB interactive VM leaves about 1 GiB for the guest kernel, systemd, the Actions listener, Podman, and filesystem cache. A workload that regularly consumes the entire 2 GiB job cap belongs in the work profile or a separate heavy-worker VM.
 
-The 8 GiB away profile keeps the same initial job cap. Increase a job’s container CPU or memory cap only after a clean baseline run. Container limits and job admission policy can change before the next job while the VM stays running. VM memory and exposed vCPU changes use a stop/edit/start cycle.
+The 10 GiB work profile keeps the same initial job cap. Increase a job’s container CPU or memory cap only after a clean baseline run. Container limits and job admission policy can change before the next job while the VM stays running. VM memory and exposed vCPU changes use a stop/edit/start cycle.
 
 One official Actions runner accepts one job at a time. Running two light jobs requires two independently registered runner listeners with separate dedicated accounts and ownership records. Defer that expansion until the single-runner path is dependable and measured.
 
-## Switch to the away profile
+## Switch to the work profile
 
 Finish every active job first. Confirm the runner appears idle in GitHub and retain the final job receipt.
 
@@ -144,7 +160,7 @@ Stop the VM, edit the resource envelope, and start it again:
 
 ```bash
 limactl stop smolrunner
-limactl edit smolrunner --cpus 8 --memory 8
+limactl edit smolrunner --cpus 8 --memory 10
 limactl start smolrunner
 ```
 
@@ -165,6 +181,16 @@ limactl start smolrunner
 ```
 
 Keep the two YAML files as fresh-instance references. Avoid registering both templates as copies of the same GitHub runner.
+
+## Stop and persistent cache retention
+
+```bash
+bash scripts/macbook-runner-vm.sh stop
+```
+
+Graceful stop releases the VM's runtime memory reservation back to macOS while retaining the instance disk. Cargo registry/Git data, `CARGO_TARGET_DIR`, repository build caches, explicitly owned package-manager caches, reviewed Podman image/layer caches, and guest checkout data survive stop/start and interactive/work transitions.
+
+The helper never calls `limactl delete`, `factory-reset`, or `prune`, never recreates the instance, and never removes cache paths. Cache identity remains separate from proof that source passed verification.
 
 ## Disk sizing and cleanup
 
@@ -258,7 +284,7 @@ Use the same job caps for both profiles during the first comparison.
 
 Every value below awaits execution on the target 24 GiB Apple-silicon MacBook Air. The profiles and documentation have received static review only.
 
-| Measurement | Interactive: 3 GiB / 4 vCPU | Away: 8 GiB / 8 vCPU | Collection method |
+| Measurement | Interactive: 3 GiB / 4 vCPU | Work: 10 GiB / 8 vCPU | Collection method |
 | --- | --- | --- | --- |
 | VM idle memory | Awaiting real run | Awaiting real run | Guest `free -h`, cgroup counters, host VM-process RSS |
 | Light Rust CI peak memory | Awaiting real run | Awaiting real run | Exact commit, 2-CPU/2-GiB cap, peak cgroup memory |
@@ -274,7 +300,7 @@ Every value below awaits execution on the target 24 GiB Apple-silicon MacBook Ai
 Move a workload to a separate temporary heavy-worker VM when any of these provisional guardrails repeats across two comparable runs:
 
 - the job reaches its 2 GiB cap and requires a larger limit;
-- the 8 GiB guest leaves less than 1 GiB available for the listener, Podman, and the OS;
+- the 10 GiB guest leaves less than 1 GiB available for the listener, Podman, and the OS;
 - host swap grows by more than 1 GiB during one job;
 - macOS memory pressure enters a warning or critical state;
 - the Mac becomes visibly sluggish during normal interactive work;

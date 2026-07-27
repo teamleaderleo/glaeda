@@ -8,7 +8,7 @@ arch: aarch64
 plain: true
 
 cpus: 8
-memory: 8GiB
+memory: 10GiB
 disk: 80GiB
 
 user:
