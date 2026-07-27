@@ -1,0 +1,111 @@
+name: Executor action-age correction
+
+on:
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  correct:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out exact head
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          show-progress: false
+      - name: Bind accepted action to a bounded execution window
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          source = Path("src/lima_lifecycle_executor.rs")
+          text = source.read_text(encoding="utf-8")
+          replacements = [
+              (
+                  "pub const LIMA_LIFECYCLE_EXECUTOR_SCHEMA_VERSION: u8 = 1;\npub const MAX_LIMA_LIFECYCLE_EXECUTOR_OUTPUT_BYTES: usize = 65_536;\n",
+                  "pub const LIMA_LIFECYCLE_EXECUTOR_SCHEMA_VERSION: u8 = 1;\npub const MAX_LIMA_LIFECYCLE_ACTION_AGE_MILLIS: u64 = 30_000;\npub const MAX_LIMA_LIFECYCLE_EXECUTOR_OUTPUT_BYTES: usize = 65_536;\n",
+              ),
+              (
+                  "    ClockFailure,\n    UnsupportedAction,\n",
+                  "    ClockFailure,\n    ExpiredAction,\n    UnsupportedAction,\n",
+              ),
+              (
+                  "    let decision_seconds = input.accepted.decision_at.get() / 1_000;\n    if execution_unix_seconds < decision_seconds\n        || input.current.timing.freshness_at(execution_unix_seconds)\n            != LimaObservationFreshness::Fresh\n    {\n        return Err(ExecutionProblem::new(\n            LimaLifecycleExecutionRefusalCode::StaleObservation,\n            LimaLifecycleExecutionPhase::InputValidation,\n            \"the current Lima observation is not fresh at lifecycle mutation time\",\n        ));\n    }\n",
+                  "    let execution_millis = execution_unix_seconds.checked_mul(1_000).ok_or_else(|| {\n        ExecutionProblem::new(\n            LimaLifecycleExecutionRefusalCode::ClockFailure,\n            LimaLifecycleExecutionPhase::InputValidation,\n            \"the lifecycle execution clock exceeded the supported range\",\n        )\n    })?;\n    let decision_millis = input.accepted.decision_at.get();\n    if execution_millis < decision_millis\n        || execution_millis - decision_millis > MAX_LIMA_LIFECYCLE_ACTION_AGE_MILLIS\n    {\n        return Err(ExecutionProblem::new(\n            LimaLifecycleExecutionRefusalCode::ExpiredAction,\n            LimaLifecycleExecutionPhase::InputValidation,\n            \"the accepted lifecycle action is outside its bounded execution window\",\n        ));\n    }\n    if input.current.timing.freshness_at(execution_unix_seconds)\n        != LimaObservationFreshness::Fresh\n    {\n        return Err(ExecutionProblem::new(\n            LimaLifecycleExecutionRefusalCode::StaleObservation,\n            LimaLifecycleExecutionPhase::InputValidation,\n            \"the current Lima observation is not fresh at lifecycle mutation time\",\n        ));\n    }\n",
+              ),
+          ]
+          for old, new in replacements:
+              if text.count(old) != 1:
+                  raise SystemExit(f"source replacement count was {text.count(old)} for {old[:48]!r}")
+              text = text.replace(old, new)
+          source.write_text(text, encoding="utf-8")
+
+          tests = Path("src/lima_lifecycle_executor/tests.rs")
+          text = tests.read_text(encoding="utf-8")
+          marker = "#[test]\nfn command_identity_output_and_status_fail_closed() {\n"
+          test_lines = [
+              "#[test]",
+              "fn old_action_refuses_with_fresh_observation_before_mutation() {",
+              "    let persistent = persistent_identity('b');",
+              "    let lifecycle = lifecycle(",
+              "        LimaLifecycleState::Stopped,",
+              "        LimaResourceProfile::Interactive,",
+              "        1,",
+              "        false,",
+              "    );",
+              "    let current = report(",
+              "        LimaRuntimeState::Stopped,",
+              "        LimaResourceProfile::Interactive,",
+              "        None,",
+              "    );",
+              "    let mut action = accepted(HostBrokerAction::Start {",
+              "        identity: lifecycle.identity().clone(),",
+              "        profile: LimaResourceProfile::Interactive,",
+              "        profile_generation: generation(1),",
+              "    });",
+              "    action.decision_at = epoch(60_000);",
+              "    let request = request();",
+              "    let observations = ScriptedObservationSource::new(Vec::new());",
+              "    let commands = ScriptedExecutor::new(ExecutorMode::Match);",
+              "",
+              "    let error = executor()",
+              "        .execute(",
+              "            input(&action, &lifecycle, &current, &persistent, &request),",
+              "            &observations,",
+              "            &commands,",
+              "            &FixedClock(100),",
+              "        )",
+              "        .expect_err(\"expired action refusal\");",
+              "",
+              "    assert_eq!(",
+              "        error.code,",
+              "        LimaLifecycleExecutionRefusalCode::ExpiredAction",
+              "    );",
+              "    assert!(commands.calls().is_empty());",
+              "}",
+              "",
+              "",
+          ]
+          test = "\n".join(test_lines)
+          if text.count(marker) != 1:
+              raise SystemExit("test insertion marker mismatch")
+          text = text.replace(marker, test + marker)
+          tests.write_text(text, encoding="utf-8")
+          PY
+          cargo fmt --all
+          cargo test --locked lima_lifecycle_executor
+      - name: Publish action-age correction
+        env:
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          git add \
+            src/lima_lifecycle_executor.rs \
+            src/lima_lifecycle_executor/tests.rs
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git commit -m 'Bound accepted Lima lifecycle action age'
+          git push origin "HEAD:${HEAD_REF}"
