@@ -1,0 +1,35 @@
+name: Agent 6 Clippy diagnostic
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out exact branch head
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.head_ref }}
+          show-progress: false
+      - name: Capture Clippy diagnostics
+        run: |
+          set +e
+          cargo clippy --locked --all-targets --all-features -- -D warnings > clippy.log 2>&1
+          status=$?
+          printf '%s\n' "$status" > clippy.status
+          exit 0
+      - name: Upload diagnostics
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: agent6-clippy-diagnostic
+          path: |
+            clippy.log
+            clippy.status
+          if-no-files-found: error
+          retention-days: 1
