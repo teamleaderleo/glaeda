@@ -1,17 +1,3 @@
-        }
-    }
-}
-
-impl LimaObservationClock for FakeClock {
-    fn unix_seconds(&self) -> io::Result<u64> {
-        self.values
-            .lock()
-            .expect("clock lock")
-            .pop_front()
-            .expect("scripted readiness clock")
-    }
-}
-
 #[test]
 fn idle_ready_observation_binds_exact_commands_identity_and_freshness() {
     let executor = ScriptedExecutor::new(running_steps(false, false));
@@ -128,14 +114,3 @@ fn idle_ready_observation_binds_exact_commands_identity_and_freshness() {
         }));
     }
 }
-
-#[test]
-fn offline_starting_busy_and_draining_are_distinct() {
-    let offline_executor = ScriptedExecutor::default();
-    let offline = adapter()
-        .observe(
-            &request(),
-            &source(LimaRuntimeState::Stopped, false, 130),
-            &offline_executor,
-            &FakeClock::new([100]),
-        )
