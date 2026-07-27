@@ -1,9 +1,13 @@
 name: PR221 format artifact
 
 on:
-  push:
-    branches:
-      - feat/issue-219-personal-worker-read-cli
+  pull_request:
+    paths:
+      - src/main.rs
+      - src/personal_worker_read_command.rs
+      - src/unix_personal_worker_store.rs
+      - tests/personal_worker_read_cli.rs
+      - .github/workflows/pr221-format-artifact.yml
 
 permissions:
   contents: read
