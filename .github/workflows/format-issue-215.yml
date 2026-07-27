@@ -16,16 +16,27 @@ jobs:
           ref: fix/issue-198-durable-authority
           fetch-depth: 0
           show-progress: false
-      - run: cargo fmt --all
-      - name: Commit formatted source and remove formatter
+      - name: Format or capture exact diagnostic
         shell: bash
         run: |
-          rm .github/workflows/format-issue-215.yml
+          set +e
+          cargo fmt --all > /tmp/format-output.txt 2>&1
+          status=$?
+          set -e
+
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add src/lima_lifecycle_executor.rs src/lima_lifecycle_executor/tests.rs .github/workflows/format-issue-215.yml
-          if git diff --cached --quiet; then
-            exit 1
+
+          if test "$status" -ne 0; then
+            cp /tmp/format-output.txt .github/format-issue-215-error.txt
+            git add .github/format-issue-215-error.txt
+            git commit -m 'chore: capture issue 215 formatter error'
+            git push origin HEAD:fix/issue-198-durable-authority
+            exit 0
           fi
+
+          rm -f .github/format-issue-215-error.txt
+          rm .github/workflows/format-issue-215.yml
+          git add src/lima_lifecycle_executor.rs src/lima_lifecycle_executor/tests.rs .github/format-issue-215-error.txt .github/workflows/format-issue-215.yml
           git commit -m 'style: format durable Lima authority guard'
           git push origin HEAD:fix/issue-198-durable-authority
