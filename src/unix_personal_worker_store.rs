@@ -67,6 +67,27 @@ impl UnixPersonalWorkerStore {
         Ok((store, recovery))
     }
 
+    /// Open one already-created personal-worker store without taking the writer lock or recovering.
+    ///
+    /// This constructor never creates the managed directory, lock, current document, or staged
+    /// document. Callers receive only the existing canonical `current.json` view through `load`.
+    pub fn open_existing_read_only(
+        root_path: impl AsRef<Path>,
+    ) -> Result<Self, PersonalWorkerStoreError> {
+        let root = fs::open(root_path.as_ref(), DIRECTORY_FLAGS, Mode::empty())
+            .map_err(map_root_open_error)?;
+        let root_stat = inspect_directory(&root, "personal worker state root", None)?;
+        let owner = (root_stat.st_uid, root_stat.st_gid);
+        let directory = fs::openat(&root, STORE_DIRECTORY, DIRECTORY_FLAGS, Mode::empty())
+            .map_err(map_existing_store_directory_open_error)?;
+        inspect_directory(&directory, "personal worker store directory", Some(owner))?;
+        Ok(Self {
+            _root: root,
+            directory,
+            owner,
+        })
+    }
+
     fn acquire_mutation_lock(&self) -> Result<StoreMutationLock, PersonalWorkerStoreError> {
         let lock = fs::openat(
             &self.directory,
@@ -568,6 +589,23 @@ fn map_root_open_error(error: Errno) -> PersonalWorkerStoreError {
 
 fn map_store_directory_open_error(error: Errno) -> PersonalWorkerStoreError {
     match error {
+        Errno::LOOP | Errno::NOTDIR => store_error(
+            PersonalWorkerStoreErrorKind::UnsafeFilesystem,
+            "personal worker store directory is symlinked or invalid",
+        ),
+        _ => store_error(
+            PersonalWorkerStoreErrorKind::Io,
+            "could not open the personal worker store directory",
+        ),
+    }
+}
+
+fn map_existing_store_directory_open_error(error: Errno) -> PersonalWorkerStoreError {
+    match error {
+        Errno::NOENT => store_error(
+            PersonalWorkerStoreErrorKind::Missing,
+            "personal worker store directory does not exist",
+        ),
         Errno::LOOP | Errno::NOTDIR => store_error(
             PersonalWorkerStoreErrorKind::UnsafeFilesystem,
             "personal worker store directory is symlinked or invalid",
