@@ -562,3 +562,293 @@ fn terminal_ledger_successor_cannot_replace_retained_proof() {
         .expect_err("retained proof replacement must fail closed");
     assert_eq!(error.kind(), PersonalWorkerStoreErrorKind::RevisionConflict);
 }
+
+#[test]
+fn successor_validation_rejects_early_terminal_proof_loss_and_fabrication() {
+    let (retained, _, _) = terminal_tombstone("retained-job", BASE);
+    let (document, _, _, _) = active_document("live-job", BASE + 100_000, vec![retained.clone()]);
+
+    let mut next_queue = document.queue().clone();
+    next_queue.generation = next_queue.generation.next().expect("next generation");
+    next_queue.observed_at = time(BASE + 100_061);
+    assert_eq!(
+        document
+            .advance_with_terminal_tombstones(
+                next_queue.clone(),
+                document.cache_leases().to_vec(),
+                vec![],
+            )
+            .expect_err("retained terminal proof must not disappear early")
+            .kind(),
+        PersonalWorkerStoreErrorKind::RevisionConflict
+    );
+
+    let (fabricated, _, _) = terminal_tombstone("fabricated-job", BASE + 100_000);
+    next_queue.observed_at = fabricated.completed_at();
+    let fabricated_successor = document
+        .advance_with_terminal_tombstones(
+            next_queue,
+            document.cache_leases().to_vec(),
+            vec![retained, fabricated],
+        )
+        .expect("internally valid fabricated-ledger document");
+    assert_eq!(
+        fabricated_successor
+            .validate_successor_of(&document)
+            .expect_err("terminal proof must derive from the previous active reservation")
+            .kind(),
+        PersonalWorkerStoreErrorKind::RevisionConflict
+    );
+}
+
+#[test]
+fn successor_validation_rejects_active_release_without_terminal_proof() {
+    let (document, _, _, terminal) = active_document("missing-proof-job", BASE, vec![]);
+    let mut queue = document.queue().clone();
+    queue.generation = queue.generation.next().expect("next generation");
+    queue.observed_at = terminal.observed_at();
+    queue.active.clear();
+    let successor = document
+        .advance_with_terminal_tombstones(queue, vec![], vec![])
+        .expect("internally valid proof-free release document");
+    assert_eq!(
+        successor
+            .validate_successor_of(&document)
+            .expect_err("active release must append exact terminal proof")
+            .kind(),
+        PersonalWorkerStoreErrorKind::RevisionConflict
+    );
+}
+
+fn terminal_release_parts(
+    document: &PersonalWorkerStoreDocument,
+    request_id: &ExecutionRequestId,
+    terminal: &ExecutionAdmissionRecord,
+) -> (
+    PersonalWorkerQueueInput,
+    Vec<PersonalWorkerDurableCacheLease>,
+    Vec<PersonalWorkerTerminalTombstone>,
+) {
+    let active_index = document
+        .queue()
+        .active
+        .iter()
+        .position(|active| &active.request.identity.request_id == request_id)
+        .expect("active release target");
+    let active = document.queue().active[active_index].clone();
+    let transition = active
+        .admission
+        .plan_transition(terminal.clone())
+        .expect("terminal transition");
+    let lease_index = document
+        .cache_leases()
+        .iter()
+        .position(|lease| lease.request_id() == request_id)
+        .expect("release lease");
+    let lease = document.cache_leases()[lease_index].clone();
+    let tombstone = PersonalWorkerTerminalTombstone::new(
+        active.request,
+        transition.resulting_record().clone(),
+        active.started_at,
+        lease,
+    )
+    .expect("terminal evidence");
+
+    let mut queue = document.queue().clone();
+    queue.active.remove(active_index);
+    queue.generation = queue.generation.next().expect("next generation");
+    queue.observed_at = tombstone.completed_at();
+    let mut leases = document.cache_leases().to_vec();
+    leases.remove(lease_index);
+    let mut tombstones = document.terminal_tombstones().to_vec();
+    tombstones.push(tombstone);
+    if tombstones.len() > MAX_PERSONAL_WORKER_TERMINAL_TOMBSTONES {
+        tombstones.remove(0);
+    }
+    (queue, leases, tombstones)
+}
+
+fn assert_terminal_successor_rejected(
+    previous: &PersonalWorkerStoreDocument,
+    queue: PersonalWorkerQueueInput,
+    leases: Vec<PersonalWorkerDurableCacheLease>,
+    tombstones: Vec<PersonalWorkerTerminalTombstone>,
+    message: &str,
+) {
+    let successor = previous
+        .advance_with_terminal_tombstones(queue, leases, tombstones)
+        .expect("mutated terminal document remains internally valid");
+    assert_eq!(
+        successor
+            .validate_successor_of(previous)
+            .expect_err(message)
+            .kind(),
+        PersonalWorkerStoreErrorKind::RevisionConflict
+    );
+}
+
+fn multi_active_document(
+    ids: &[&str],
+    base: u64,
+) -> (
+    PersonalWorkerStoreDocument,
+    Vec<ExecutionAdmissionRecord>,
+    Vec<ExecutionRequestId>,
+) {
+    let mut active = Vec::new();
+    let mut leases = Vec::new();
+    let mut terminals = Vec::new();
+    let mut request_ids = Vec::new();
+    let common_observed_at = base + ids.len() as u64 * 1_000 + 60;
+    for (index, id) in ids.iter().enumerate() {
+        let offset = index as u64 * 1_000;
+        let mut request = request(id, base + offset);
+        request.cache_access = PersonalWorkerCacheAccessMode::Read;
+        let reservation = reservation(id, base + offset + 20);
+        let cache_lease = lease(&request, &reservation);
+        let draining = admission(
+            &request,
+            &reservation,
+            ExecutionAdmissionState::Draining,
+            common_observed_at,
+            Some(DrainAcknowledgement::Drain),
+            None,
+        );
+        let terminal = admission(
+            &request,
+            &reservation,
+            ExecutionAdmissionState::Unavailable,
+            common_observed_at + 10,
+            Some(DrainAcknowledgement::Drain),
+            Some(UnavailableReason::Drained),
+        );
+        request_ids.push(request.identity.request_id.clone());
+        terminals.push(terminal);
+        active.push(PersonalWorkerActiveReservation {
+            request,
+            admission: draining,
+            started_at: Some(time(base + offset + 40)),
+        });
+        leases.push(cache_lease);
+    }
+    let queue = PersonalWorkerQueueInput {
+        generation: PersonalWorkerQueueGeneration::new(1).expect("generation"),
+        observed_at: time(common_observed_at),
+        current_profile: PersonalWorkerProfile::Work,
+        last_activity_at: time(common_observed_at),
+        queued: vec![],
+        active,
+        pending_profile_change: None,
+    };
+    let document = PersonalWorkerStoreDocument::new_with_terminal_tombstones(queue, leases, vec![])
+        .expect("multi-active document");
+    (document, terminals, request_ids)
+}
+
+#[test]
+fn terminal_successor_rejects_unrelated_queue_profile_activity_intent_and_time_drift() {
+    let (document, release_request, _, terminal) =
+        active_document("exact-delta-job", BASE + 200_000, vec![]);
+
+    let (mut queue, leases, tombstones) =
+        terminal_release_parts(&document, &release_request.identity.request_id, &terminal);
+    queue
+        .queued
+        .push(request("unrelated-queued", BASE + 199_000));
+    assert_terminal_successor_rejected(
+        &document,
+        queue,
+        leases,
+        tombstones,
+        "terminal release must not submit unrelated work",
+    );
+
+    let (mut queue, leases, tombstones) =
+        terminal_release_parts(&document, &release_request.identity.request_id, &terminal);
+    queue.current_profile = PersonalWorkerProfile::Interactive;
+    assert_terminal_successor_rejected(
+        &document,
+        queue,
+        leases,
+        tombstones,
+        "terminal release must not change current profile",
+    );
+
+    let (mut queue, leases, tombstones) =
+        terminal_release_parts(&document, &release_request.identity.request_id, &terminal);
+    queue.last_activity_at = time(terminal.observed_at().get() - 1);
+    assert_terminal_successor_rejected(
+        &document,
+        queue,
+        leases,
+        tombstones,
+        "terminal release must not rewrite last activity",
+    );
+
+    let (mut queue, leases, tombstones) =
+        terminal_release_parts(&document, &release_request.identity.request_id, &terminal);
+    queue.pending_profile_change = Some(
+        smolrunner::personal_worker_queue::PersonalWorkerPendingProfileChange {
+            target: PersonalWorkerProfile::Interactive,
+            requested_at: terminal.observed_at(),
+        },
+    );
+    assert_terminal_successor_rejected(
+        &document,
+        queue,
+        leases,
+        tombstones,
+        "terminal release must not create profile intent",
+    );
+
+    let (mut queue, leases, tombstones) =
+        terminal_release_parts(&document, &release_request.identity.request_id, &terminal);
+    queue.observed_at = time(terminal.observed_at().get() + 1);
+    assert_terminal_successor_rejected(
+        &document,
+        queue,
+        leases,
+        tombstones,
+        "terminal observation must equal completion",
+    );
+}
+
+#[test]
+fn terminal_successor_rejects_retained_active_and_lease_mutation() {
+    let (document, terminals, request_ids) =
+        multi_active_document(&["release-a", "retain-b"], BASE + 300_000);
+
+    let (mut queue, leases, tombstones) =
+        terminal_release_parts(&document, &request_ids[0], &terminals[0]);
+    queue.active[0].started_at = Some(time(BASE + 301_041));
+    assert_terminal_successor_rejected(
+        &document,
+        queue,
+        leases,
+        tombstones,
+        "terminal release must preserve retained active evidence",
+    );
+
+    let (queue, mut leases, tombstones) =
+        terminal_release_parts(&document, &request_ids[0], &terminals[0]);
+    let retained = &queue.active[0];
+    let reservation = retained
+        .admission
+        .reservation()
+        .expect("retained reservation");
+    leases[0] = PersonalWorkerDurableCacheLease::new(
+        retained.request.identity.request_id.clone(),
+        retained.request.cache_namespace.clone(),
+        retained.request.cache_access,
+        reservation.id.clone(),
+        reservation.generation,
+        time(reservation.reserved_at.get() + 1),
+    );
+    assert_terminal_successor_rejected(
+        &document,
+        queue,
+        leases,
+        tombstones,
+        "terminal release must preserve retained lease evidence",
+    );
+}

@@ -365,7 +365,7 @@ impl PersonalWorkerStoreDocument {
                 "personal worker store observation cannot move backwards",
             ));
         }
-        validate_terminal_tombstone_successor(&self.terminal_tombstones, &terminal_tombstones)?;
+        validate_terminal_tombstone_ledger_shape(&self.terminal_tombstones, &terminal_tombstones)?;
         let mut history = self.history.clone();
         history.push(self.summary()?);
         if history.len() > MAX_PERSONAL_WORKER_HISTORY_ENTRIES {
@@ -446,10 +446,7 @@ impl PersonalWorkerStoreDocument {
                 "replacement observation cannot move backwards",
             ));
         }
-        validate_terminal_tombstone_successor(
-            &previous.terminal_tombstones,
-            &self.terminal_tombstones,
-        )?;
+        validate_terminal_tombstone_successor(previous, self)?;
         let mut expected_history = previous.history.clone();
         expected_history.push(previous.summary()?);
         if expected_history.len() > MAX_PERSONAL_WORKER_HISTORY_ENTRIES {
@@ -791,7 +788,7 @@ fn cache_modes_conflict(
         || requested == PersonalWorkerCacheAccessMode::Write
 }
 
-fn validate_terminal_tombstone_successor(
+fn validate_terminal_tombstone_ledger_shape(
     previous: &[PersonalWorkerTerminalTombstone],
     next: &[PersonalWorkerTerminalTombstone],
 ) -> Result<(), PersonalWorkerStoreError> {
@@ -810,6 +807,126 @@ fn validate_terminal_tombstone_successor(
     Err(PersonalWorkerStoreError::revision_conflict(
         "terminal tombstone ledger must remain exact or advance by one FIFO entry",
     ))
+}
+
+fn validate_terminal_tombstone_successor(
+    previous: &PersonalWorkerStoreDocument,
+    next: &PersonalWorkerStoreDocument,
+) -> Result<(), PersonalWorkerStoreError> {
+    let removed_active = previous
+        .queue
+        .active
+        .iter()
+        .filter(|active| {
+            !next.queue.active.iter().any(|next_active| {
+                next_active.request.identity.request_id == active.request.identity.request_id
+            })
+        })
+        .collect::<Vec<_>>();
+
+    if next.terminal_tombstones == previous.terminal_tombstones {
+        if removed_active.is_empty() {
+            return Ok(());
+        }
+        return Err(PersonalWorkerStoreError::revision_conflict(
+            "active reservation removal requires exact appended terminal evidence",
+        ));
+    }
+
+    validate_terminal_tombstone_ledger_shape(
+        &previous.terminal_tombstones,
+        &next.terminal_tombstones,
+    )?;
+    let appended = next.terminal_tombstones.last().ok_or_else(|| {
+        PersonalWorkerStoreError::revision_conflict(
+            "terminal tombstone append is missing exact evidence",
+        )
+    })?;
+    if removed_active.len() != 1
+        || removed_active[0].request.identity.request_id != appended.request.identity.request_id
+    {
+        return Err(PersonalWorkerStoreError::revision_conflict(
+            "terminal tombstone append must bind the one exact removed active reservation",
+        ));
+    }
+    let active = removed_active[0];
+    if active.request != appended.request || active.started_at != appended.started_at {
+        return Err(PersonalWorkerStoreError::revision_conflict(
+            "terminal tombstone request or start evidence differs from the removed reservation",
+        ));
+    }
+    let transition = active
+        .admission
+        .plan_transition(appended.terminal_admission.clone())
+        .map_err(|_| {
+            PersonalWorkerStoreError::revision_conflict(
+                "terminal tombstone admission is not an allowed exact transition",
+            )
+        })?;
+    if transition.resulting_record() != &appended.terminal_admission {
+        return Err(PersonalWorkerStoreError::revision_conflict(
+            "terminal tombstone admission differs from the exact transition result",
+        ));
+    }
+    let previous_lease = previous
+        .cache_leases
+        .iter()
+        .find(|lease| lease.request_id() == &appended.request.identity.request_id)
+        .ok_or_else(|| {
+            PersonalWorkerStoreError::revision_conflict(
+                "terminal tombstone append requires the exact previous cache lease",
+            )
+        })?;
+    if previous_lease != &appended.cache_lease
+        || next
+            .cache_leases
+            .iter()
+            .any(|lease| lease.request_id() == &appended.request.identity.request_id)
+    {
+        return Err(PersonalWorkerStoreError::revision_conflict(
+            "terminal tombstone cache evidence does not match exact lease release",
+        ));
+    }
+    if next.queue.queued != previous.queue.queued
+        || next.queue.current_profile != previous.queue.current_profile
+        || next.queue.last_activity_at != previous.queue.last_activity_at
+        || next.queue.pending_profile_change != previous.queue.pending_profile_change
+    {
+        return Err(PersonalWorkerStoreError::revision_conflict(
+            "terminal release successor changed unrelated queue policy state",
+        ));
+    }
+    if next.queue.observed_at != appended.completed_at() {
+        return Err(PersonalWorkerStoreError::revision_conflict(
+            "terminal release successor observation must equal exact completion time",
+        ));
+    }
+    let expected_active = previous
+        .queue
+        .active
+        .iter()
+        .filter(|candidate| {
+            candidate.request.identity.request_id != appended.request.identity.request_id
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if next.queue.active != expected_active {
+        return Err(PersonalWorkerStoreError::revision_conflict(
+            "terminal release successor must preserve every retained active reservation exactly",
+        ));
+    }
+    let expected_leases = previous
+        .cache_leases
+        .iter()
+        .filter(|lease| lease.request_id() != &appended.request.identity.request_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    if next.cache_leases != expected_leases {
+        return Err(PersonalWorkerStoreError::revision_conflict(
+            "terminal release successor must preserve every retained cache lease exactly",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_terminal_tombstones(
