@@ -23,6 +23,7 @@ use crate::verification_profile::{CacheId, VerificationProfileId};
 pub const PERSONAL_WORKER_STORE_SCHEMA_VERSION: u8 = 1;
 pub const MAX_PERSONAL_WORKER_STORE_BYTES: usize = 1_048_576;
 pub const MAX_PERSONAL_WORKER_HISTORY_ENTRIES: usize = 32;
+pub const MAX_PERSONAL_WORKER_TERMINAL_TOMBSTONES: usize = 32;
 const MAX_PERSONAL_WORKER_STORE_REVISION: u64 = 1_000_000_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -119,6 +120,154 @@ impl PersonalWorkerDurableCacheLease {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersonalWorkerTerminalMutationClass {
+    ReleaseCompletionAndCacheLease,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersonalWorkerTerminalTombstone {
+    mutation_class: PersonalWorkerTerminalMutationClass,
+    request: PersonalWorkerJobRequest,
+    terminal_admission: ExecutionAdmissionRecord,
+    started_at: Option<EpochMillis>,
+    cache_lease: PersonalWorkerDurableCacheLease,
+    evidence_digest: Sha256Digest,
+}
+
+impl PersonalWorkerTerminalTombstone {
+    pub fn new(
+        request: PersonalWorkerJobRequest,
+        terminal_admission: ExecutionAdmissionRecord,
+        started_at: Option<EpochMillis>,
+        cache_lease: PersonalWorkerDurableCacheLease,
+    ) -> Result<Self, PersonalWorkerStoreError> {
+        let mutation_class = PersonalWorkerTerminalMutationClass::ReleaseCompletionAndCacheLease;
+        let evidence_digest = terminal_evidence_digest(
+            mutation_class,
+            &request,
+            &terminal_admission,
+            started_at,
+            &cache_lease,
+        )?;
+        let tombstone = Self {
+            mutation_class,
+            request,
+            terminal_admission,
+            started_at,
+            cache_lease,
+            evidence_digest,
+        };
+        tombstone.validate()?;
+        Ok(tombstone)
+    }
+
+    #[must_use]
+    pub const fn mutation_class(&self) -> PersonalWorkerTerminalMutationClass {
+        self.mutation_class
+    }
+
+    #[must_use]
+    pub const fn request(&self) -> &PersonalWorkerJobRequest {
+        &self.request
+    }
+
+    #[must_use]
+    pub const fn terminal_admission(&self) -> &ExecutionAdmissionRecord {
+        &self.terminal_admission
+    }
+
+    #[must_use]
+    pub const fn started_at(&self) -> Option<EpochMillis> {
+        self.started_at
+    }
+
+    #[must_use]
+    pub const fn cache_lease(&self) -> &PersonalWorkerDurableCacheLease {
+        &self.cache_lease
+    }
+
+    #[must_use]
+    pub const fn evidence_digest(&self) -> &Sha256Digest {
+        &self.evidence_digest
+    }
+
+    #[must_use]
+    pub const fn completed_at(&self) -> EpochMillis {
+        self.terminal_admission.observed_at()
+    }
+
+    fn validate(&self) -> Result<(), PersonalWorkerStoreError> {
+        if self.terminal_admission.state() != ExecutionAdmissionState::Unavailable {
+            return Err(PersonalWorkerStoreError::invalid_document(
+                "terminal tombstone requires unavailable admission evidence",
+            ));
+        }
+        if self.terminal_admission.identity() != &self.request.identity
+            || self.cache_lease.request_id() != &self.request.identity.request_id
+        {
+            return Err(PersonalWorkerStoreError::invalid_document(
+                "terminal tombstone request identity does not match its evidence",
+            ));
+        }
+        if self.terminal_admission.requested_limits() != self.request.requested_limits
+            || self.terminal_admission.fallback_eligibility() != &self.request.fallback_eligibility
+        {
+            return Err(PersonalWorkerStoreError::invalid_document(
+                "terminal tombstone admission semantics drift from the exact request",
+            ));
+        }
+        if self.cache_lease.namespace() != &self.request.cache_namespace
+            || self.cache_lease.access() != self.request.cache_access
+        {
+            return Err(PersonalWorkerStoreError::invalid_document(
+                "terminal tombstone cache lease does not match the exact request",
+            ));
+        }
+        let reservation = self.terminal_admission.reservation().ok_or_else(|| {
+            PersonalWorkerStoreError::invalid_document(
+                "terminal tombstone requires exact reservation evidence",
+            )
+        })?;
+        if self.cache_lease.reservation_id() != &reservation.id
+            || self.cache_lease.reservation_generation() != reservation.generation
+        {
+            return Err(PersonalWorkerStoreError::invalid_document(
+                "terminal tombstone cache lease is bound to different reservation evidence",
+            ));
+        }
+        if self.cache_lease.acquired_at() < reservation.reserved_at
+            || self.cache_lease.acquired_at() > self.terminal_admission.observed_at()
+        {
+            return Err(PersonalWorkerStoreError::invalid_document(
+                "terminal tombstone cache lease time is outside reservation evidence",
+            ));
+        }
+        if self.started_at.is_some_and(|started_at| {
+            started_at < reservation.reserved_at
+                || started_at > self.terminal_admission.observed_at()
+        }) {
+            return Err(PersonalWorkerStoreError::invalid_document(
+                "terminal tombstone start time is outside reservation evidence",
+            ));
+        }
+        let expected = terminal_evidence_digest(
+            self.mutation_class,
+            &self.request,
+            &self.terminal_admission,
+            self.started_at,
+            &self.cache_lease,
+        )?;
+        if expected != self.evidence_digest {
+            return Err(PersonalWorkerStoreError::invalid_document(
+                "terminal tombstone evidence digest does not match its exact evidence",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PersonalWorkerHistoryEntry {
     revision: PersonalWorkerStoreRevision,
@@ -127,6 +276,7 @@ pub struct PersonalWorkerHistoryEntry {
     queued_count: u32,
     active_count: u32,
     cache_lease_count: u32,
+    terminal_tombstone_count: u32,
     state_digest: Sha256Digest,
 }
 
@@ -158,6 +308,7 @@ pub struct PersonalWorkerStoreDocument {
     revision: PersonalWorkerStoreRevision,
     queue: PersonalWorkerQueueInput,
     cache_leases: Vec<PersonalWorkerDurableCacheLease>,
+    terminal_tombstones: Vec<PersonalWorkerTerminalTombstone>,
     history: Vec<PersonalWorkerHistoryEntry>,
 }
 
@@ -171,6 +322,21 @@ impl PersonalWorkerStoreDocument {
             queue,
             cache_leases,
             Vec::new(),
+            Vec::new(),
+        )
+    }
+
+    pub fn new_with_terminal_tombstones(
+        queue: PersonalWorkerQueueInput,
+        cache_leases: Vec<PersonalWorkerDurableCacheLease>,
+        terminal_tombstones: Vec<PersonalWorkerTerminalTombstone>,
+    ) -> Result<Self, PersonalWorkerStoreError> {
+        Self::from_parts(
+            PersonalWorkerStoreRevision::new(1)?,
+            queue,
+            cache_leases,
+            terminal_tombstones,
+            Vec::new(),
         )
     }
 
@@ -178,6 +344,15 @@ impl PersonalWorkerStoreDocument {
         &self,
         queue: PersonalWorkerQueueInput,
         cache_leases: Vec<PersonalWorkerDurableCacheLease>,
+    ) -> Result<Self, PersonalWorkerStoreError> {
+        self.advance_with_terminal_tombstones(queue, cache_leases, self.terminal_tombstones.clone())
+    }
+
+    pub fn advance_with_terminal_tombstones(
+        &self,
+        queue: PersonalWorkerQueueInput,
+        cache_leases: Vec<PersonalWorkerDurableCacheLease>,
+        terminal_tombstones: Vec<PersonalWorkerTerminalTombstone>,
     ) -> Result<Self, PersonalWorkerStoreError> {
         let expected_generation = next_queue_generation(self.queue.generation)?;
         if queue.generation != expected_generation {
@@ -195,13 +370,20 @@ impl PersonalWorkerStoreDocument {
         if history.len() > MAX_PERSONAL_WORKER_HISTORY_ENTRIES {
             history.remove(0);
         }
-        Self::from_parts(self.revision.next()?, queue, cache_leases, history)
+        Self::from_parts(
+            self.revision.next()?,
+            queue,
+            cache_leases,
+            terminal_tombstones,
+            history,
+        )
     }
 
     fn from_parts(
         revision: PersonalWorkerStoreRevision,
         queue: PersonalWorkerQueueInput,
         cache_leases: Vec<PersonalWorkerDurableCacheLease>,
+        terminal_tombstones: Vec<PersonalWorkerTerminalTombstone>,
         history: Vec<PersonalWorkerHistoryEntry>,
     ) -> Result<Self, PersonalWorkerStoreError> {
         let document = Self {
@@ -209,6 +391,7 @@ impl PersonalWorkerStoreDocument {
             revision,
             queue,
             cache_leases,
+            terminal_tombstones,
             history,
         };
         document.validate()?;
@@ -233,6 +416,11 @@ impl PersonalWorkerStoreDocument {
     #[must_use]
     pub fn cache_leases(&self) -> &[PersonalWorkerDurableCacheLease] {
         &self.cache_leases
+    }
+
+    #[must_use]
+    pub fn terminal_tombstones(&self) -> &[PersonalWorkerTerminalTombstone] {
+        &self.terminal_tombstones
     }
 
     #[must_use]
@@ -282,6 +470,7 @@ impl PersonalWorkerStoreDocument {
             )
         })?;
         validate_cache_leases(&self.queue, &self.cache_leases)?;
+        validate_terminal_tombstones(&self.queue, &self.terminal_tombstones)?;
         validate_history(
             self.revision,
             self.queue.generation,
@@ -298,7 +487,12 @@ impl PersonalWorkerStoreDocument {
             queued_count: bounded_count(self.queue.queued.len())?,
             active_count: bounded_count(self.queue.active.len())?,
             cache_lease_count: bounded_count(self.cache_leases.len())?,
-            state_digest: snapshot_digest(&self.queue, &self.cache_leases)?,
+            terminal_tombstone_count: bounded_count(self.terminal_tombstones.len())?,
+            state_digest: snapshot_digest(
+                &self.queue,
+                &self.cache_leases,
+                &self.terminal_tombstones,
+            )?,
         })
     }
 }
@@ -592,6 +786,51 @@ fn cache_modes_conflict(
         || requested == PersonalWorkerCacheAccessMode::Write
 }
 
+fn validate_terminal_tombstones(
+    queue: &PersonalWorkerQueueInput,
+    tombstones: &[PersonalWorkerTerminalTombstone],
+) -> Result<(), PersonalWorkerStoreError> {
+    if tombstones.len() > MAX_PERSONAL_WORKER_TERMINAL_TOMBSTONES {
+        return Err(PersonalWorkerStoreError::invalid_document(
+            "personal worker terminal tombstone ledger exceeds its bounded entry limit",
+        ));
+    }
+    let live_ids = queue
+        .queued
+        .iter()
+        .map(|request| request.identity.request_id.clone())
+        .chain(
+            queue
+                .active
+                .iter()
+                .map(|active| active.request.identity.request_id.clone()),
+        )
+        .collect::<BTreeSet<_>>();
+    let mut terminal_ids = BTreeSet::new();
+    let mut previous_completed_at = None;
+    for tombstone in tombstones {
+        tombstone.validate()?;
+        let request_id = tombstone.request.identity.request_id.clone();
+        if live_ids.contains(&request_id) {
+            return Err(PersonalWorkerStoreError::invalid_document(
+                "terminal tombstone request is still present in live queue state",
+            ));
+        }
+        if !terminal_ids.insert(request_id) {
+            return Err(PersonalWorkerStoreError::invalid_document(
+                "terminal tombstone request identity is duplicated",
+            ));
+        }
+        if previous_completed_at.is_some_and(|previous| tombstone.completed_at() < previous) {
+            return Err(PersonalWorkerStoreError::invalid_document(
+                "terminal tombstone completion observations move backwards",
+            ));
+        }
+        previous_completed_at = Some(tombstone.completed_at());
+    }
+    Ok(())
+}
+
 fn validate_history(
     revision: PersonalWorkerStoreRevision,
     current_generation: PersonalWorkerQueueGeneration,
@@ -689,8 +928,9 @@ fn bounded_count(value: usize) -> Result<u32, PersonalWorkerStoreError> {
 fn snapshot_digest(
     queue: &PersonalWorkerQueueInput,
     leases: &[PersonalWorkerDurableCacheLease],
+    terminal_tombstones: &[PersonalWorkerTerminalTombstone],
 ) -> Result<Sha256Digest, PersonalWorkerStoreError> {
-    let wire = WireSnapshot::from_parts(queue, leases);
+    let wire = WireSnapshot::from_parts(queue, leases, terminal_tombstones);
     let encoded = serde_json::to_vec(&wire).map_err(|_| {
         PersonalWorkerStoreError::invalid_document(
             "personal worker snapshot digest input could not be encoded",
@@ -700,6 +940,33 @@ fn snapshot_digest(
     Sha256Digest::parse(&format!("sha256:{digest:x}")).map_err(|_| {
         PersonalWorkerStoreError::invalid_document(
             "personal worker snapshot digest could not be represented",
+        )
+    })
+}
+
+fn terminal_evidence_digest(
+    mutation_class: PersonalWorkerTerminalMutationClass,
+    request: &PersonalWorkerJobRequest,
+    terminal_admission: &ExecutionAdmissionRecord,
+    started_at: Option<EpochMillis>,
+    cache_lease: &PersonalWorkerDurableCacheLease,
+) -> Result<Sha256Digest, PersonalWorkerStoreError> {
+    let wire = WireTerminalEvidence::from_parts(
+        mutation_class,
+        request,
+        terminal_admission,
+        started_at,
+        cache_lease,
+    );
+    let encoded = serde_json::to_vec(&wire).map_err(|_| {
+        PersonalWorkerStoreError::invalid_document(
+            "terminal tombstone digest input could not be encoded",
+        )
+    })?;
+    let digest = Sha256::digest(encoded);
+    Sha256Digest::parse(&format!("sha256:{digest:x}")).map_err(|_| {
+        PersonalWorkerStoreError::invalid_document(
+            "terminal tombstone digest could not be represented",
         )
     })
 }
@@ -767,6 +1034,11 @@ wire_enum!(WireUnavailableReason, UnavailableReason, {
     Cancelled,
     Drained,
 });
+wire_enum!(
+    WireTerminalMutationClass,
+    PersonalWorkerTerminalMutationClass,
+    { ReleaseCompletionAndCacheLease }
+);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1346,6 +1618,82 @@ impl TryFrom<WireCacheLease> for PersonalWorkerDurableCacheLease {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct WireTerminalEvidence {
+    mutation_class: WireTerminalMutationClass,
+    request: WireRequest,
+    terminal_admission: WireAdmission,
+    started_at: Option<u64>,
+    cache_lease: WireCacheLease,
+}
+
+impl WireTerminalEvidence {
+    fn from_parts(
+        mutation_class: PersonalWorkerTerminalMutationClass,
+        request: &PersonalWorkerJobRequest,
+        terminal_admission: &ExecutionAdmissionRecord,
+        started_at: Option<EpochMillis>,
+        cache_lease: &PersonalWorkerDurableCacheLease,
+    ) -> Self {
+        Self {
+            mutation_class: mutation_class.into(),
+            request: WireRequest::from(request),
+            terminal_admission: WireAdmission::from(terminal_admission),
+            started_at: started_at.map(EpochMillis::get),
+            cache_lease: WireCacheLease::from(cache_lease),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireTerminalTombstone {
+    mutation_class: WireTerminalMutationClass,
+    request: WireRequest,
+    terminal_admission: WireAdmission,
+    started_at: Option<u64>,
+    cache_lease: WireCacheLease,
+    evidence_digest: String,
+}
+
+impl From<&PersonalWorkerTerminalTombstone> for WireTerminalTombstone {
+    fn from(value: &PersonalWorkerTerminalTombstone) -> Self {
+        Self {
+            mutation_class: value.mutation_class.into(),
+            request: WireRequest::from(&value.request),
+            terminal_admission: WireAdmission::from(&value.terminal_admission),
+            started_at: value.started_at.map(EpochMillis::get),
+            cache_lease: WireCacheLease::from(&value.cache_lease),
+            evidence_digest: value.evidence_digest.as_str().to_owned(),
+        }
+    }
+}
+
+impl TryFrom<WireTerminalTombstone> for PersonalWorkerTerminalTombstone {
+    type Error = PersonalWorkerStoreError;
+
+    fn try_from(value: WireTerminalTombstone) -> Result<Self, Self::Error> {
+        let mutation_class: PersonalWorkerTerminalMutationClass = value.mutation_class.into();
+        if mutation_class != PersonalWorkerTerminalMutationClass::ReleaseCompletionAndCacheLease {
+            return Err(PersonalWorkerStoreError::corrupt_state());
+        }
+        let expected_digest = Sha256Digest::parse(&value.evidence_digest)
+            .map_err(|_| PersonalWorkerStoreError::corrupt_state())?;
+        let tombstone = PersonalWorkerTerminalTombstone::new(
+            value.request.try_into()?,
+            value.terminal_admission.try_into()?,
+            value.started_at.map(epoch).transpose()?,
+            value.cache_lease.try_into()?,
+        )
+        .map_err(|_| PersonalWorkerStoreError::corrupt_state())?;
+        if tombstone.evidence_digest != expected_digest {
+            return Err(PersonalWorkerStoreError::corrupt_state());
+        }
+        Ok(tombstone)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WireHistoryEntry {
     revision: u64,
     queue_generation: u64,
@@ -1353,6 +1701,8 @@ struct WireHistoryEntry {
     queued_count: u32,
     active_count: u32,
     cache_lease_count: u32,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    terminal_tombstone_count: u32,
     state_digest: String,
 }
 
@@ -1365,6 +1715,7 @@ impl From<&PersonalWorkerHistoryEntry> for WireHistoryEntry {
             queued_count: value.queued_count,
             active_count: value.active_count,
             cache_lease_count: value.cache_lease_count,
+            terminal_tombstone_count: value.terminal_tombstone_count,
             state_digest: value.state_digest.as_str().to_owned(),
         }
     }
@@ -1383,6 +1734,7 @@ impl TryFrom<WireHistoryEntry> for PersonalWorkerHistoryEntry {
             queued_count: value.queued_count,
             active_count: value.active_count,
             cache_lease_count: value.cache_lease_count,
+            terminal_tombstone_count: value.terminal_tombstone_count,
             state_digest: Sha256Digest::parse(&value.state_digest)
                 .map_err(|_| PersonalWorkerStoreError::corrupt_state())?,
         })
@@ -1394,16 +1746,20 @@ impl TryFrom<WireHistoryEntry> for PersonalWorkerHistoryEntry {
 struct WireSnapshot {
     queue: WireQueue,
     cache_leases: Vec<WireCacheLease>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    terminal_tombstones: Vec<WireTerminalTombstone>,
 }
 
 impl WireSnapshot {
     fn from_parts(
         queue: &PersonalWorkerQueueInput,
         cache_leases: &[PersonalWorkerDurableCacheLease],
+        terminal_tombstones: &[PersonalWorkerTerminalTombstone],
     ) -> Self {
         Self {
             queue: WireQueue::from(queue),
             cache_leases: cache_leases.iter().map(Into::into).collect(),
+            terminal_tombstones: terminal_tombstones.iter().map(Into::into).collect(),
         }
     }
 }
@@ -1415,6 +1771,8 @@ struct WireDocument {
     revision: u64,
     queue: WireQueue,
     cache_leases: Vec<WireCacheLease>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    terminal_tombstones: Vec<WireTerminalTombstone>,
     history: Vec<WireHistoryEntry>,
 }
 
@@ -1425,6 +1783,7 @@ impl From<&PersonalWorkerStoreDocument> for WireDocument {
             revision: value.revision.get(),
             queue: WireQueue::from(&value.queue),
             cache_leases: value.cache_leases.iter().map(Into::into).collect(),
+            terminal_tombstones: value.terminal_tombstones.iter().map(Into::into).collect(),
             history: value.history.iter().map(Into::into).collect(),
         }
     }
@@ -1447,6 +1806,11 @@ impl TryFrom<WireDocument> for PersonalWorkerStoreDocument {
                 .map(TryInto::try_into)
                 .collect::<Result<_, _>>()?,
             value
+                .terminal_tombstones
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?,
+            value
                 .history
                 .into_iter()
                 .map(TryInto::try_into)
@@ -1454,6 +1818,10 @@ impl TryFrom<WireDocument> for PersonalWorkerStoreDocument {
         )
         .map_err(|_| PersonalWorkerStoreError::corrupt_state())
     }
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
 }
 
 fn epoch(value: u64) -> Result<EpochMillis, PersonalWorkerStoreError> {

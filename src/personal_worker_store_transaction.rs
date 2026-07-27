@@ -11,9 +11,10 @@ use crate::personal_worker_queue::{
     PersonalWorkerQueueInput,
 };
 use crate::personal_worker_store::{
-    PersonalWorkerDurableCacheLease, PersonalWorkerStore, PersonalWorkerStoreDocument,
-    PersonalWorkerStoreError, PersonalWorkerStoreErrorKind, PersonalWorkerStoreRevision,
-    PersonalWorkerStoreWriteDisposition,
+    MAX_PERSONAL_WORKER_TERMINAL_TOMBSTONES, PersonalWorkerDurableCacheLease, PersonalWorkerStore,
+    PersonalWorkerStoreDocument, PersonalWorkerStoreError, PersonalWorkerStoreErrorKind,
+    PersonalWorkerStoreRevision, PersonalWorkerStoreWriteDisposition,
+    PersonalWorkerTerminalTombstone,
 };
 
 pub const PERSONAL_WORKER_STORE_TRANSACTION_SCHEMA_VERSION: u8 = 1;
@@ -234,7 +235,7 @@ impl std::error::Error for PersonalWorkerStoreMutationError {}
 ///
 /// The caller must supply the exact current store revision and queue generation. Exact duplicate
 /// intents return a bounded duplicate receipt without advancing durable state. Applied mutations
-/// advance both counters exactly once and publish through the store's revision-checked CAS boundary.
+/// advance both counters exactly once and publish through the store's revision-checked cooperative-writer boundary.
 ///
 /// # Errors
 ///
@@ -273,6 +274,7 @@ pub fn apply_personal_worker_store_mutation(
     let MutationApplication::Applied {
         mut queue,
         leases,
+        terminal_tombstones,
         observed_at,
     } = application
     else {
@@ -298,11 +300,13 @@ pub fn apply_personal_worker_store_mutation(
             "personal worker queue generation cannot advance for this mutation",
         )
     })?;
-    let next = current.advance(queue, leases).map_err(|_| {
-        PersonalWorkerStoreMutationError::invalid(
-            "personal worker mutation does not produce a valid durable successor",
-        )
-    })?;
+    let next = current
+        .advance_with_terminal_tombstones(queue, leases, terminal_tombstones)
+        .map_err(|_| {
+            PersonalWorkerStoreMutationError::invalid(
+                "personal worker mutation does not produce a valid durable successor",
+            )
+        })?;
     let write = store
         .replace_if_revision(expected_revision, &next)
         .map_err(map_store_error)?;
@@ -331,6 +335,7 @@ enum MutationApplication {
     Applied {
         queue: PersonalWorkerQueueInput,
         leases: Vec<PersonalWorkerDurableCacheLease>,
+        terminal_tombstones: Vec<PersonalWorkerTerminalTombstone>,
         observed_at: EpochMillis,
     },
 }
@@ -341,11 +346,19 @@ fn apply_to_snapshot(
 ) -> Result<MutationApplication, PersonalWorkerStoreMutationError> {
     let mut queue = current.queue().clone();
     let mut leases = current.cache_leases().to_vec();
+    let mut terminal_tombstones = current.terminal_tombstones().to_vec();
     let observed_at = match mutation {
         PersonalWorkerStoreMutation::Submit {
             request,
             observed_at,
         } => {
+            if terminal_tombstones.iter().any(|tombstone| {
+                tombstone.request().identity.request_id == request.identity.request_id
+            }) {
+                return Err(PersonalWorkerStoreMutationError::conflict(
+                    "personal worker request identity already has durable terminal evidence",
+                ));
+            }
             if let Some(existing) = queue
                 .queued
                 .iter()
@@ -554,9 +567,28 @@ fn apply_to_snapshot(
                     "release mutation requires terminal unavailable admission evidence",
                 ));
             }
-            let index = active_index(&queue, &request_id)
-                .ok_or_else(PersonalWorkerStoreMutationError::not_found)?;
-            let transition = queue.active[index]
+            if terminal_admission.identity().request_id != request_id {
+                return Err(PersonalWorkerStoreMutationError::conflict(
+                    "release mutation request identity does not match terminal admission evidence",
+                ));
+            }
+            let Some(index) = active_index(&queue, &request_id) else {
+                if let Some(existing) = terminal_tombstones
+                    .iter()
+                    .find(|tombstone| tombstone.request().identity.request_id == request_id)
+                {
+                    return if existing.terminal_admission() == &terminal_admission {
+                        Ok(MutationApplication::Duplicate)
+                    } else {
+                        Err(PersonalWorkerStoreMutationError::conflict(
+                            "personal worker terminal identity is already bound to different evidence",
+                        ))
+                    };
+                }
+                return Err(PersonalWorkerStoreMutationError::not_found());
+            };
+            let active = queue.active[index].clone();
+            let transition = active
                 .admission
                 .plan_transition(terminal_admission)
                 .map_err(|_| {
@@ -564,8 +596,6 @@ fn apply_to_snapshot(
                         "release mutation violates admission transition ordering",
                     )
                 })?;
-            let observed_at = transition.resulting_record().observed_at();
-            queue.active.remove(index);
             let lease_index = leases
                 .iter()
                 .position(|lease| lease.request_id() == &request_id)
@@ -575,7 +605,25 @@ fn apply_to_snapshot(
                         "active personal worker reservation is missing its durable cache lease",
                     )
                 })?;
+            let lease = leases[lease_index].clone();
+            let tombstone = PersonalWorkerTerminalTombstone::new(
+                active.request,
+                transition.resulting_record().clone(),
+                active.started_at,
+                lease,
+            )
+            .map_err(|_| {
+                PersonalWorkerStoreMutationError::invalid(
+                    "release mutation does not produce valid durable terminal evidence",
+                )
+            })?;
+            let observed_at = tombstone.completed_at();
+            queue.active.remove(index);
             leases.remove(lease_index);
+            terminal_tombstones.push(tombstone);
+            if terminal_tombstones.len() > MAX_PERSONAL_WORKER_TERMINAL_TOMBSTONES {
+                terminal_tombstones.remove(0);
+            }
             observed_at
         }
         PersonalWorkerStoreMutation::SetProfileIntent {
@@ -628,6 +676,7 @@ fn apply_to_snapshot(
     Ok(MutationApplication::Applied {
         queue,
         leases,
+        terminal_tombstones,
         observed_at,
     })
 }
