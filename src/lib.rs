@@ -56,6 +56,8 @@ pub mod lease_catalog;
 pub mod lease_document;
 /// Pure Lima policy: work while active, interactive after 10 idle minutes, stopped after 30.
 pub mod lima_lifecycle;
+/// Fixed direct executor for accepted personal-worker Lima lifecycle actions.
+pub mod lima_lifecycle_executor;
 /// Read-only, bounded exact observation of one Lima instance and running guest.
 pub mod lima_observation;
 /// Read-only, fail-closed lookup of persisted project installations.
