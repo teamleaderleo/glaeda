@@ -1,0 +1,37 @@
+name: Issue 225 full test diagnostics
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/issue225-full-test-log.yml
+
+permissions:
+  contents: read
+
+jobs:
+  full-test-log:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          show-progress: false
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+      - name: Capture complete full-test output
+        run: |
+          set +e
+          cargo +stable test --all-targets --all-features -- --nocapture > issue225-full-test.txt 2>&1
+          echo $? > issue225-full-test-status.txt
+          set -e
+      - name: Upload complete test diagnostics
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: issue225-full-test-log
+          path: |
+            issue225-full-test.txt
+            issue225-full-test-status.txt
+          if-no-files-found: error
+          retention-days: 1
+      - name: Enforce full-test result
+        run: exit "$(cat issue225-full-test-status.txt)"
