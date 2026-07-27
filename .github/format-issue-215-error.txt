@@ -1,0 +1,1 @@
+Error writing files: failed to resolve mod `tests`: /home/runner/work/smolrunner/smolrunner/src/tests.rs does not exist
