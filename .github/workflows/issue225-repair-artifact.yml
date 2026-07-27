@@ -78,7 +78,6 @@ jobs:
 
           tests = Path("src/descriptor_bound_launcher/tests.rs")
           text = tests.read_text()
-          text = text.replace("use rustix::process;", "use rustix::process;")
           addition = r'''
 
           #[test]
@@ -142,20 +141,27 @@ jobs:
           if anchor not in text:
               raise SystemExit("test anchor changed")
           tests.write_text(text.replace(anchor, addition + "\n" + anchor))
-      - name: Format and test focused repair
+      - name: Format and capture focused test result
         run: |
           cargo fmt --all
-          cargo test --all-targets --all-features descriptor_bound_launcher
-      - name: Package exact repaired files
+          set +e
+          cargo test --all-targets --all-features descriptor_bound_launcher > issue225-test.txt 2>&1
+          echo $? > issue225-status.txt
+          set -e
+      - name: Package exact repaired files and diagnostics
         run: |
           tar -czf issue225-repair.tar.gz \
             Cargo.toml \
             src/descriptor_bound_launcher.rs \
-            src/descriptor_bound_launcher/tests.rs
-      - name: Upload repaired files
+            src/descriptor_bound_launcher/tests.rs \
+            issue225-test.txt \
+            issue225-status.txt
+      - name: Upload repaired files and diagnostics
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: issue225-repair
           path: issue225-repair.tar.gz
           if-no-files-found: error
           retention-days: 1
+      - name: Enforce focused test result
+        run: exit "$(cat issue225-status.txt)"
