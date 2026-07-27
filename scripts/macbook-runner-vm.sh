@@ -6,6 +6,42 @@ guest_repo="${SMOLRUNNER_GUEST_REPO:-/home/lima/smolrunner}"
 script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 repo_root="$(CDPATH= cd -- "${script_dir}/.." && pwd)"
 lima_home="${LIMA_HOME:-${HOME}/.lima}"
+
+case "${instance}" in
+  [a-z0-9]*) ;;
+  *)
+    printf 'error: SMOLRUNNER_VM must begin with a lowercase ASCII letter or digit\n' >&2
+    exit 1
+    ;;
+esac
+case "${instance}" in
+  *[!a-z0-9._-]*)
+    printf 'error: SMOLRUNNER_VM must be one simple lowercase ASCII Lima instance name\n' >&2
+    exit 1
+    ;;
+esac
+[ "${#instance}" -le 64 ] || {
+  printf 'error: SMOLRUNNER_VM exceeds the reviewed instance-name bound\n' >&2
+  exit 1
+}
+case "${lima_home}" in
+  /*) ;;
+  *)
+    printf 'error: LIMA_HOME must be an absolute path\n' >&2
+    exit 1
+    ;;
+esac
+case "${lima_home}" in
+  /|*/|*//*|*/./*|*/../*|*/.|*/..)
+    printf 'error: LIMA_HOME must be a lexically canonical non-root path\n' >&2
+    exit 1
+    ;;
+esac
+[ "${#lima_home}" -le 1024 ] || {
+  printf 'error: LIMA_HOME exceeds the reviewed path bound\n' >&2
+  exit 1
+}
+
 instance_dir="${lima_home}/${instance}"
 operation_lock="${instance_dir}/smolrunner-vm-helper.lock"
 active_run_marker="${instance_dir}/smolrunner-operator-run.active"
