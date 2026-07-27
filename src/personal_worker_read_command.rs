@@ -1,5 +1,5 @@
 use std::fmt::Write as _;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 use serde::Serialize;
 use smolrunner::execution_admission::ExecutionRequestId;
@@ -321,7 +321,9 @@ fn serialized_label(value: &impl Serialize) -> String {
 }
 
 fn validate_store_root(store_root: &Path) -> Result<(), PersonalWorkerReadCommandError> {
+    let normalized = store_root.components().collect::<PathBuf>();
     if !store_root.is_absolute()
+        || normalized.as_os_str() != store_root.as_os_str()
         || store_root
             .components()
             .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
@@ -426,6 +428,18 @@ mod tests {
         assert_eq!(
             validate_store_root(Path::new("relative/root"))
                 .expect_err("relative path")
+                .kind(),
+            PersonalWorkerReadCommandErrorKind::InvalidStoreRoot
+        );
+        assert_eq!(
+            validate_store_root(Path::new("/tmp/./private-root"))
+                .expect_err("current-directory component")
+                .kind(),
+            PersonalWorkerReadCommandErrorKind::InvalidStoreRoot
+        );
+        assert_eq!(
+            validate_store_root(Path::new("/tmp//private-root"))
+                .expect_err("repeated separator")
                 .kind(),
             PersonalWorkerReadCommandErrorKind::InvalidStoreRoot
         );
