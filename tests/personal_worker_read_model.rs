@@ -390,18 +390,6 @@ fn job_view_exposes_exact_queued_and_active_evidence() {
     assert!(queued.admission().is_none());
     assert!(queued.durable_cache_lease().is_none());
 
-    let terminal_job = serde_json::to_string(
-        &personal_worker_job_view(
-            &terminal_document(),
-            PersonalWorkerJobReadRequest::new(
-                revision(),
-                generation(),
-                ExecutionRequestId::parse("terminal-one").expect("terminal ID"),
-            ),
-        )
-        .expect("terminal job"),
-    )
-    .expect("serialize terminal job");
     let error = personal_worker_job_view(
         &document,
         PersonalWorkerJobReadRequest::new(
@@ -541,6 +529,18 @@ fn public_json_and_errors_exclude_private_runtime_material() {
         .expect("job"),
     )
     .expect("serialize job");
+    let terminal_job = serde_json::to_string(
+        &personal_worker_job_view(
+            &terminal_document(),
+            PersonalWorkerJobReadRequest::new(
+                revision(),
+                generation(),
+                ExecutionRequestId::parse("terminal-one").expect("terminal ID"),
+            ),
+        )
+        .expect("terminal job"),
+    )
+    .expect("serialize terminal job");
     let error = personal_worker_job_view(
         &document,
         PersonalWorkerJobReadRequest::new(
