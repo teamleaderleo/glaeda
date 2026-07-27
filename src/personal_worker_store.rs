@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 
 use crate::artifact::{CommitId, GitTreeId, RepositoryRef, Sha256Digest};
 use crate::execution_admission::{
-    EXECUTION_ADMISSION_SCHEMA_VERSION, DrainAcknowledgement, EpochMillis,
+    DrainAcknowledgement, EXECUTION_ADMISSION_SCHEMA_VERSION, EpochMillis,
     ExecutionAdmissionIdentity, ExecutionAdmissionInput, ExecutionAdmissionRecord,
     ExecutionAdmissionState, ExecutionRequestId, ExecutionResourceLimits,
     FallbackProfileEligibility, HostCapacityObservation, QueuePosition, ReservationEvidence,
@@ -235,10 +235,7 @@ impl PersonalWorkerStoreDocument {
         &self.history
     }
 
-    pub fn validate_successor_of(
-        &self,
-        previous: &Self,
-    ) -> Result<(), PersonalWorkerStoreError> {
+    pub fn validate_successor_of(&self, previous: &Self) -> Result<(), PersonalWorkerStoreError> {
         if self.revision != previous.revision.next()? {
             return Err(PersonalWorkerStoreError::revision_conflict(
                 "replacement store revision must advance exactly once",
@@ -508,18 +505,11 @@ fn validate_cache_leases(
     let active = queue
         .active
         .iter()
-        .map(|reservation| {
-            (
-                reservation.request.identity.request_id.clone(),
-                reservation,
-            )
-        })
+        .map(|reservation| (reservation.request.identity.request_id.clone(), reservation))
         .collect::<BTreeMap<_, _>>();
     let mut owners = BTreeSet::new();
-    let mut held = BTreeMap::<
-        PersonalWorkerCacheNamespace,
-        Vec<PersonalWorkerCacheAccessMode>,
-    >::new();
+    let mut held =
+        BTreeMap::<PersonalWorkerCacheNamespace, Vec<PersonalWorkerCacheAccessMode>>::new();
     for lease in leases {
         if !owners.insert(lease.request_id.clone()) {
             return Err(PersonalWorkerStoreError::invalid_document(
@@ -811,8 +801,7 @@ impl TryFrom<WireSource> for PersonalWorkerSourceIdentity {
                 .map_err(|_| PersonalWorkerStoreError::corrupt_state())?,
             CommitId::parse(&value.commit)
                 .map_err(|_| PersonalWorkerStoreError::corrupt_state())?,
-            GitTreeId::parse(&value.tree)
-                .map_err(|_| PersonalWorkerStoreError::corrupt_state())?,
+            GitTreeId::parse(&value.tree).map_err(|_| PersonalWorkerStoreError::corrupt_state())?,
         ))
     }
 }

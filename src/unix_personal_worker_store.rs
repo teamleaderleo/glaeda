@@ -146,7 +146,12 @@ impl UnixPersonalWorkerStore {
                 "could not set private staged-state permissions",
             )
         })?;
-        inspect_private_file(opened, self.owner, "staged personal worker document", Some(0))?;
+        inspect_private_file(
+            opened,
+            self.owner,
+            "staged personal worker document",
+            Some(0),
+        )?;
         let mut file = File::from(staged.file.take().expect("staged file is present"));
         file.write_all(&encoded).map_err(|_| {
             store_error(
@@ -207,7 +212,8 @@ impl UnixPersonalWorkerStore {
         let Some(staged) = self.load_named(STAGED_DOCUMENT)? else {
             return Ok(PersonalWorkerStoreRecovery::new(
                 PersonalWorkerStoreRecoveryDisposition::Clean,
-                self.load_named(CURRENT_DOCUMENT)?.map(|document| document.revision()),
+                self.load_named(CURRENT_DOCUMENT)?
+                    .map(|document| document.revision()),
             ));
         };
         let current = self.load_named(CURRENT_DOCUMENT)?;
@@ -353,11 +359,7 @@ fn ensure_store_directory(
 ) -> Result<OwnedFd, PersonalWorkerStoreError> {
     match fs::openat(root, STORE_DIRECTORY, DIRECTORY_FLAGS, Mode::empty()) {
         Ok(directory) => {
-            inspect_directory(
-                &directory,
-                "personal worker store directory",
-                Some(owner),
-            )?;
+            inspect_directory(&directory, "personal worker store directory", Some(owner))?;
             Ok(directory)
         }
         Err(Errno::NOENT) => {
@@ -381,11 +383,7 @@ fn ensure_store_directory(
                     )
                 })?;
             }
-            inspect_directory(
-                &directory,
-                "personal worker store directory",
-                Some(owner),
-            )?;
+            inspect_directory(&directory, "personal worker store directory", Some(owner))?;
             if created {
                 synchronize_directory(root, "personal worker state root")?;
             }

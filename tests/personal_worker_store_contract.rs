@@ -42,8 +42,7 @@ impl TempRoot {
             std::process::id()
         ));
         fs::create_dir(&path).expect("create temporary state root");
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o750))
-            .expect("set state root mode");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o750)).expect("set state root mode");
         Self(path)
     }
 
@@ -114,10 +113,13 @@ fn active_reservation(
     id: &str,
     repository: &str,
     observed_at: u64,
-) -> (PersonalWorkerActiveReservation, PersonalWorkerDurableCacheLease) {
+) -> (
+    PersonalWorkerActiveReservation,
+    PersonalWorkerDurableCacheLease,
+) {
     let request = request(id, repository, observed_at);
-    let reservation_id = ReservationId::parse(&format!("reservation-{id}"))
-        .expect("reservation ID");
+    let reservation_id =
+        ReservationId::parse(&format!("reservation-{id}")).expect("reservation ID");
     let reservation_generation = ReservationGeneration::new(1).expect("reservation generation");
     let reserved_at = time(observed_at - 30_000);
     let admission = ExecutionAdmissionRecord::from_input(ExecutionAdmissionInput {
@@ -172,10 +174,10 @@ fn empty_queue(generation: u64, observed_at: u64) -> PersonalWorkerQueueInput {
     }
 }
 
-fn active_queue(generation: u64, observed_at: u64) -> (
-    PersonalWorkerQueueInput,
-    PersonalWorkerDurableCacheLease,
-) {
+fn active_queue(
+    generation: u64,
+    observed_at: u64,
+) -> (PersonalWorkerQueueInput, PersonalWorkerDurableCacheLease) {
     let (active, lease) = active_reservation("active-one", "example/project", observed_at);
     (
         PersonalWorkerQueueInput {
@@ -233,9 +235,20 @@ fn exact_revisions_advance_with_bounded_consecutive_history() {
             .expect("advance document");
     }
     assert_eq!(document.revision().get(), 41);
-    assert_eq!(document.history().len(), MAX_PERSONAL_WORKER_HISTORY_ENTRIES);
+    assert_eq!(
+        document.history().len(),
+        MAX_PERSONAL_WORKER_HISTORY_ENTRIES
+    );
     assert_eq!(document.history()[0].revision().get(), 9);
-    assert_eq!(document.history().last().expect("last history").revision().get(), 40);
+    assert_eq!(
+        document
+            .history()
+            .last()
+            .expect("last history")
+            .revision()
+            .get(),
+        40
+    );
 
     let skipped = document.advance(empty_queue(43, 3_000_000), vec![]);
     assert_eq!(
@@ -275,7 +288,10 @@ fn durable_store_reopens_and_replaces_only_the_expected_revision() {
     let initial = PersonalWorkerStoreDocument::new(empty_queue(1, 4_000_000), vec![])
         .expect("initial document");
     let created = store.create(&initial).expect("create durable state");
-    assert_eq!(created.disposition(), PersonalWorkerStoreWriteDisposition::Created);
+    assert_eq!(
+        created.disposition(),
+        PersonalWorkerStoreWriteDisposition::Created
+    );
     drop(store);
 
     let (mut reopened, recovery) =
@@ -290,7 +306,10 @@ fn durable_store_reopens_and_replaces_only_the_expected_revision() {
         .advance(empty_queue(2, 4_000_001), vec![])
         .expect("next document");
     let error = reopened
-        .replace_if_revision(PersonalWorkerStoreRevision::new(2).expect("stale revision"), &next)
+        .replace_if_revision(
+            PersonalWorkerStoreRevision::new(2).expect("stale revision"),
+            &next,
+        )
         .expect_err("stale expected revision");
     assert_eq!(error.kind(), PersonalWorkerStoreErrorKind::RevisionConflict);
     let replaced = reopened
@@ -321,8 +340,7 @@ fn recovery_publishes_an_exact_successor_and_removes_a_stale_stage() {
         encode_personal_worker_store_document(&next).expect("encode next state"),
     )
     .expect("write staged successor");
-    fs::set_permissions(&staged_path, fs::Permissions::from_mode(0o600))
-        .expect("set staged mode");
+    fs::set_permissions(&staged_path, fs::Permissions::from_mode(0o600)).expect("set staged mode");
 
     let (store, recovery) =
         UnixPersonalWorkerStore::open_or_create(root.path()).expect("recover successor");
@@ -330,7 +348,10 @@ fn recovery_publishes_an_exact_successor_and_removes_a_stale_stage() {
         recovery.disposition(),
         PersonalWorkerStoreRecoveryDisposition::PublishedStaged
     );
-    assert_eq!(store.load().expect("load recovered state"), Some(next.clone()));
+    assert_eq!(
+        store.load().expect("load recovered state"),
+        Some(next.clone())
+    );
     drop(store);
 
     fs::write(
@@ -369,8 +390,7 @@ fn unsafe_and_corrupt_filesystem_state_fails_closed() {
     let root = TempRoot::new("symlink");
     let target = root.path().join("redirected");
     fs::create_dir(&target).expect("create redirected directory");
-    fs::set_permissions(&target, fs::Permissions::from_mode(0o750))
-        .expect("set redirected mode");
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o750)).expect("set redirected mode");
     symlink(&target, root.store_directory()).expect("symlink store directory");
     let error = UnixPersonalWorkerStore::open_or_create(root.path())
         .expect_err("symlinked store directory");
