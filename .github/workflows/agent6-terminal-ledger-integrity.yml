@@ -1,0 +1,201 @@
+name: Agent 6 terminal ledger integrity
+
+on:
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  finalize:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Check out exact branch head
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.head_ref }}
+          show-progress: false
+      - name: Tighten terminal ledger successor contract
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(text: str, old: str, new: str, label: str) -> str:
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected one match, found {count}")
+              return text.replace(old, new, 1)
+
+          path = Path('src/personal_worker_store.rs')
+          text = path.read_text()
+          text = replace_once(
+              text,
+              '''        if queue.observed_at < self.queue.observed_at {
+                      return Err(PersonalWorkerStoreError::revision_conflict(
+                          "personal worker store observation cannot move backwards",
+                      ));
+                  }
+                  let mut history = self.history.clone();''',
+              '''        if queue.observed_at < self.queue.observed_at {
+                      return Err(PersonalWorkerStoreError::revision_conflict(
+                          "personal worker store observation cannot move backwards",
+                      ));
+                  }
+                  validate_terminal_tombstone_successor(
+                      &self.terminal_tombstones,
+                      &terminal_tombstones,
+                  )?;
+                  let mut history = self.history.clone();''',
+              'advance ledger validation',
+          )
+          text = replace_once(
+              text,
+              '''        if self.queue.observed_at < previous.queue.observed_at {
+                      return Err(PersonalWorkerStoreError::revision_conflict(
+                          "replacement observation cannot move backwards",
+                      ));
+                  }
+                  let mut expected_history = previous.history.clone();''',
+              '''        if self.queue.observed_at < previous.queue.observed_at {
+                      return Err(PersonalWorkerStoreError::revision_conflict(
+                          "replacement observation cannot move backwards",
+                      ));
+                  }
+                  validate_terminal_tombstone_successor(
+                      &previous.terminal_tombstones,
+                      &self.terminal_tombstones,
+                  )?;
+                  let mut expected_history = previous.history.clone();''',
+              'replacement ledger validation',
+          )
+          helper = '''fn validate_terminal_tombstone_successor(
+              previous: &[PersonalWorkerTerminalTombstone],
+              next: &[PersonalWorkerTerminalTombstone],
+          ) -> Result<(), PersonalWorkerStoreError> {
+              if next == previous {
+                  return Ok(());
+              }
+              let exact_append = previous.len() < MAX_PERSONAL_WORKER_TERMINAL_TOMBSTONES
+                  && next.len() == previous.len() + 1
+                  && next[..previous.len()] == *previous;
+              let exact_fifo_eviction = previous.len() == MAX_PERSONAL_WORKER_TERMINAL_TOMBSTONES
+                  && next.len() == MAX_PERSONAL_WORKER_TERMINAL_TOMBSTONES
+                  && next[..MAX_PERSONAL_WORKER_TERMINAL_TOMBSTONES - 1] == previous[1..];
+              if exact_append || exact_fifo_eviction {
+                  return Ok(());
+              }
+              Err(PersonalWorkerStoreError::revision_conflict(
+                  "terminal tombstone ledger must remain exact or advance by one FIFO entry",
+              ))
+          }
+
+          '''
+          text = replace_once(
+              text,
+              'fn validate_terminal_tombstones(\n',
+              helper + 'fn validate_terminal_tombstones(\n',
+              'ledger successor helper',
+          )
+          path.write_text(text)
+
+          test = Path('tests/personal_worker_terminal_replay.rs')
+          test.write_text(test.read_text() + r'''
+
+          #[test]
+          fn terminal_ledger_successor_cannot_replace_retained_proof() {
+              let (first, _, _) = terminal_tombstone("retained-one", BASE);
+              let (replacement, _, _) = terminal_tombstone("replacement-one", BASE + 1_000);
+              let initial_queue = PersonalWorkerQueueInput {
+                  generation: PersonalWorkerQueueGeneration::new(1).expect("generation"),
+                  observed_at: time(BASE + 100),
+                  current_profile: PersonalWorkerProfile::Interactive,
+                  last_activity_at: time(BASE + 90),
+                  queued: vec![],
+                  active: vec![],
+                  pending_profile_change: None,
+              };
+              let initial = PersonalWorkerStoreDocument::new_with_terminal_tombstones(
+                  initial_queue,
+                  vec![],
+                  vec![first],
+              )
+              .expect("initial terminal ledger");
+              let next_queue = PersonalWorkerQueueInput {
+                  generation: PersonalWorkerQueueGeneration::new(2).expect("generation"),
+                  observed_at: time(BASE + 1_100),
+                  current_profile: PersonalWorkerProfile::Interactive,
+                  last_activity_at: time(BASE + 1_090),
+                  queued: vec![],
+                  active: vec![],
+                  pending_profile_change: None,
+              };
+              let error = initial
+                  .advance_with_terminal_tombstones(next_queue, vec![], vec![replacement])
+                  .expect_err("retained proof replacement must fail closed");
+              assert_eq!(error.kind(), PersonalWorkerStoreErrorKind::RevisionConflict);
+          }
+          ''')
+          PY
+          cargo fmt --all
+          cargo fmt --all -- --check
+          cargo check --locked --all-targets --all-features
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cargo test --locked --all-targets --all-features
+      - name: Create unreferenced clean commit object
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -eu
+          parent_sha="$(git rev-parse HEAD)"
+          base_tree="$(git rev-parse HEAD^{tree})"
+          create_blob() {
+            path="$1"
+            jq -Rs '{content: ., encoding: "utf-8"}' "$path" > blob-request.json
+            curl -fsSL -X POST \
+              -H 'Accept: application/vnd.github+json' \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              --data-binary @blob-request.json \
+              "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/git/blobs" | jq -er '.sha'
+          }
+          store_blob="$(create_blob src/personal_worker_store.rs)"
+          test_blob="$(create_blob tests/personal_worker_terminal_replay.rs)"
+          jq -n \
+            --arg base_tree "$base_tree" \
+            --arg store_blob "$store_blob" \
+            --arg test_blob "$test_blob" \
+            '{base_tree: $base_tree, tree: [
+              {path: "src/personal_worker_store.rs", mode: "100644", type: "blob", sha: $store_blob},
+              {path: "tests/personal_worker_terminal_replay.rs", mode: "100644", type: "blob", sha: $test_blob},
+              {path: ".github/workflows/agent6-terminal-ledger-integrity.yml", mode: "100644", type: "blob", sha: null}
+            ]}' > tree-request.json
+          tree_sha="$(curl -fsSL -X POST \
+            -H 'Accept: application/vnd.github+json' \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            --data-binary @tree-request.json \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/git/trees" | jq -er '.sha')"
+          jq -n --arg message 'Enforce terminal ledger successor integrity' \
+            --arg tree "$tree_sha" --arg parent "$parent_sha" \
+            '{message: $message, tree: $tree, parents: [$parent]}' > commit-request.json
+          commit_sha="$(curl -fsSL -X POST \
+            -H 'Accept: application/vnd.github+json' \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            --data-binary @commit-request.json \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/git/commits" | jq -er '.sha')"
+          jq -n --arg parent_sha "$parent_sha" --arg commit_sha "$commit_sha" \
+            --arg store_blob "$store_blob" --arg test_blob "$test_blob" \
+            '{parent_sha: $parent_sha, commit_sha: $commit_sha, store_blob: $store_blob, test_blob: $test_blob}' \
+            > commit-object.json
+      - name: Upload commit object coordinates
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: agent6-terminal-ledger-integrity-object
+          path: commit-object.json
+          if-no-files-found: error
+          retention-days: 1
