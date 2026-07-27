@@ -1,0 +1,120 @@
+name: Executor freshness correction
+
+on:
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  correct:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out exact head
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          show-progress: false
+      - name: Revalidate freshness at mutation time
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          source = Path("src/lima_lifecycle_executor.rs")
+          text = source.read_text(encoding="utf-8")
+          replacements = [
+              (
+                  "    InvalidInput,\n    UnsupportedAction,\n",
+                  "    InvalidInput,\n    ClockFailure,\n    UnsupportedAction,\n",
+              ),
+              (
+                  "    {\n        validate_common(self, &input)?;\n        let before_disk = input.current.configured.primary_disk_bytes;\n",
+                  "    {\n        let execution_unix_seconds = clock.unix_seconds().map_err(|_| {\n            ExecutionProblem::new(\n                LimaLifecycleExecutionRefusalCode::ClockFailure,\n                LimaLifecycleExecutionPhase::InputValidation,\n                \"the lifecycle execution clock could not be read\",\n            )\n        })?;\n        validate_common(self, &input, execution_unix_seconds)?;\n        let before_disk = input.current.configured.primary_disk_bytes;\n",
+              ),
+              (
+                  "fn validate_common(\n    executor: &LimaLifecycleExecutor,\n    input: &LimaLifecycleExecutionInput<'_>,\n) -> Result<(), ExecutionProblem> {\n",
+                  "fn validate_common(\n    executor: &LimaLifecycleExecutor,\n    input: &LimaLifecycleExecutionInput<'_>,\n    execution_unix_seconds: u64,\n) -> Result<(), ExecutionProblem> {\n",
+              ),
+              (
+                  "    let decision_seconds = input.accepted.decision_at.get() / 1_000;\n    if input.current.timing.freshness_at(decision_seconds) != LimaObservationFreshness::Fresh {\n        return Err(ExecutionProblem::new(\n            LimaLifecycleExecutionRefusalCode::StaleObservation,\n            LimaLifecycleExecutionPhase::InputValidation,\n            \"the current Lima observation is not fresh at the accepted broker decision time\",\n        ));\n    }\n",
+                  "    let decision_seconds = input.accepted.decision_at.get() / 1_000;\n    if execution_unix_seconds < decision_seconds\n        || input.current.timing.freshness_at(execution_unix_seconds)\n            != LimaObservationFreshness::Fresh\n    {\n        return Err(ExecutionProblem::new(\n            LimaLifecycleExecutionRefusalCode::StaleObservation,\n            LimaLifecycleExecutionPhase::InputValidation,\n            \"the current Lima observation is not fresh at lifecycle mutation time\",\n        ));\n    }\n",
+              ),
+          ]
+          for old, new in replacements:
+              if text.count(old) != 1:
+                  raise SystemExit(f"source replacement count was {text.count(old)} for {old[:48]!r}")
+              text = text.replace(old, new)
+          source.write_text(text, encoding="utf-8")
+
+          tests = Path("src/lima_lifecycle_executor/tests.rs")
+          text = tests.read_text(encoding="utf-8")
+          old = "#[derive(Debug, Clone, Copy)]\nstruct FixedClock;\n\nimpl LimaObservationClock for FixedClock {\n    fn unix_seconds(&self) -> io::Result<u64> {\n        Ok(100)\n    }\n}\n"
+          new = "#[derive(Debug, Clone, Copy)]\nstruct FixedClock(u64);\n\nimpl LimaObservationClock for FixedClock {\n    fn unix_seconds(&self) -> io::Result<u64> {\n        Ok(self.0)\n    }\n}\n"
+          if text.count(old) != 1:
+              raise SystemExit("fixed clock definition mismatch")
+          text = text.replace(old, new).replace("&FixedClock,", "&FixedClock(100),")
+          marker = "#[test]\nfn command_identity_output_and_status_fail_closed() {\n"
+          test_lines = [
+              "#[test]",
+              "fn delayed_execution_refuses_expired_evidence_before_mutation() {",
+              "    let persistent = persistent_identity('b');",
+              "    let lifecycle = lifecycle(",
+              "        LimaLifecycleState::Stopped,",
+              "        LimaResourceProfile::Interactive,",
+              "        1,",
+              "        false,",
+              "    );",
+              "    let mut current = report(",
+              "        LimaRuntimeState::Stopped,",
+              "        LimaResourceProfile::Interactive,",
+              "        None,",
+              "    );",
+              "    current.timing.expires_at_unix_seconds = 101;",
+              "    let action = accepted(HostBrokerAction::Start {",
+              "        identity: lifecycle.identity().clone(),",
+              "        profile: LimaResourceProfile::Interactive,",
+              "        profile_generation: generation(1),",
+              "    });",
+              "    let request = request();",
+              "    let observations = ScriptedObservationSource::new(Vec::new());",
+              "    let commands = ScriptedExecutor::new(ExecutorMode::Match);",
+              "",
+              "    let error = executor()",
+              "        .execute(",
+              "            input(&action, &lifecycle, &current, &persistent, &request),",
+              "            &observations,",
+              "            &commands,",
+              "            &FixedClock(102),",
+              "        )",
+              "        .expect_err(\"delayed stale refusal\");",
+              "",
+              "    assert_eq!(",
+              "        error.code,",
+              "        LimaLifecycleExecutionRefusalCode::StaleObservation",
+              "    );",
+              "    assert!(commands.calls().is_empty());",
+              "}",
+              "",
+              "",
+          ]
+          test = "\n".join(test_lines)
+          if text.count(marker) != 1:
+              raise SystemExit("test insertion marker mismatch")
+          text = text.replace(marker, test + marker)
+          tests.write_text(text, encoding="utf-8")
+          PY
+          cargo fmt --all
+          cargo test --locked lima_lifecycle_executor
+      - name: Publish freshness correction
+        env:
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          git add \
+            src/lima_lifecycle_executor.rs \
+            src/lima_lifecycle_executor/tests.rs
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git commit -m 'Revalidate Lima evidence at lifecycle mutation time'
+          git push origin "HEAD:${HEAD_REF}"
