@@ -528,3 +528,37 @@ fn unix_staged_recovery_preserves_exact_terminal_replay_authority() {
         PersonalWorkerStoreMutationDisposition::Duplicate
     );
 }
+
+#[test]
+fn terminal_ledger_successor_cannot_replace_retained_proof() {
+    let (first, _, _) = terminal_tombstone("retained-one", BASE);
+    let (replacement, _, _) = terminal_tombstone("replacement-one", BASE + 1_000);
+    let initial_queue = PersonalWorkerQueueInput {
+        generation: PersonalWorkerQueueGeneration::new(1).expect("generation"),
+        observed_at: time(BASE + 100),
+        current_profile: PersonalWorkerProfile::Interactive,
+        last_activity_at: time(BASE + 90),
+        queued: vec![],
+        active: vec![],
+        pending_profile_change: None,
+    };
+    let initial = PersonalWorkerStoreDocument::new_with_terminal_tombstones(
+        initial_queue,
+        vec![],
+        vec![first],
+    )
+    .expect("initial terminal ledger");
+    let next_queue = PersonalWorkerQueueInput {
+        generation: PersonalWorkerQueueGeneration::new(2).expect("generation"),
+        observed_at: time(BASE + 1_100),
+        current_profile: PersonalWorkerProfile::Interactive,
+        last_activity_at: time(BASE + 1_090),
+        queued: vec![],
+        active: vec![],
+        pending_profile_change: None,
+    };
+    let error = initial
+        .advance_with_terminal_tombstones(next_queue, vec![], vec![replacement])
+        .expect_err("retained proof replacement must fail closed");
+    assert_eq!(error.kind(), PersonalWorkerStoreErrorKind::RevisionConflict);
+}

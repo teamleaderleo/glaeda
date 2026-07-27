@@ -365,6 +365,7 @@ impl PersonalWorkerStoreDocument {
                 "personal worker store observation cannot move backwards",
             ));
         }
+        validate_terminal_tombstone_successor(&self.terminal_tombstones, &terminal_tombstones)?;
         let mut history = self.history.clone();
         history.push(self.summary()?);
         if history.len() > MAX_PERSONAL_WORKER_HISTORY_ENTRIES {
@@ -445,6 +446,10 @@ impl PersonalWorkerStoreDocument {
                 "replacement observation cannot move backwards",
             ));
         }
+        validate_terminal_tombstone_successor(
+            &previous.terminal_tombstones,
+            &self.terminal_tombstones,
+        )?;
         let mut expected_history = previous.history.clone();
         expected_history.push(previous.summary()?);
         if expected_history.len() > MAX_PERSONAL_WORKER_HISTORY_ENTRIES {
@@ -784,6 +789,27 @@ fn cache_modes_conflict(
         || requested == PersonalWorkerCacheAccessMode::Exclusive
         || held.contains(&PersonalWorkerCacheAccessMode::Write)
         || requested == PersonalWorkerCacheAccessMode::Write
+}
+
+fn validate_terminal_tombstone_successor(
+    previous: &[PersonalWorkerTerminalTombstone],
+    next: &[PersonalWorkerTerminalTombstone],
+) -> Result<(), PersonalWorkerStoreError> {
+    if next == previous {
+        return Ok(());
+    }
+    let exact_append = previous.len() < MAX_PERSONAL_WORKER_TERMINAL_TOMBSTONES
+        && next.len() == previous.len() + 1
+        && next[..previous.len()] == *previous;
+    let exact_fifo_eviction = previous.len() == MAX_PERSONAL_WORKER_TERMINAL_TOMBSTONES
+        && next.len() == MAX_PERSONAL_WORKER_TERMINAL_TOMBSTONES
+        && next[..MAX_PERSONAL_WORKER_TERMINAL_TOMBSTONES - 1] == previous[1..];
+    if exact_append || exact_fifo_eviction {
+        return Ok(());
+    }
+    Err(PersonalWorkerStoreError::revision_conflict(
+        "terminal tombstone ledger must remain exact or advance by one FIFO entry",
+    ))
 }
 
 fn validate_terminal_tombstones(
