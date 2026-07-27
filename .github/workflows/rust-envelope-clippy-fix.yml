@@ -1,0 +1,42 @@
+name: Fix Rust envelope Clippy import
+
+on:
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out exact head
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          show-progress: false
+      - name: Remove exact unused import and verify
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('src/rust_verification_envelope.rs')
+          text = path.read_text(encoding='utf-8')
+          old = 'use std::collections::BTreeSet;\n'
+          if text.count(old) != 1:
+              raise SystemExit('unexpected BTreeSet import count')
+          path.write_text(text.replace(old, '', 1), encoding='utf-8')
+          PY
+          cargo fmt --all
+          cargo test --locked rust_verification_envelope
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Publish exact correction
+        env:
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          git add src/rust_verification_envelope.rs
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git commit -m 'Remove unused Rust envelope import'
+          git push origin "HEAD:${HEAD_REF}"
