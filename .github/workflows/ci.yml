@@ -23,6 +23,79 @@ jobs:
         with:
           show-progress: false
 
+      - name: Validate workspace bootstrap
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          paths = [Path("scripts/bootstrap"), *Path("scripts/workspace_bootstrap").glob("*.py")]
+          for path in paths:
+              compile(path.read_text(encoding="utf-8"), str(path), "exec")
+          PY
+          bash -n scripts/test-bootstrap.sh
+          bash scripts/test-bootstrap.sh
+
+          first_receipt=$(mktemp)
+          second_receipt=$(mktemp)
+          bootstrap_cache_root=$(mktemp -d)
+          mkdir -p \
+            "$bootstrap_cache_root/cargo-home" \
+            "$bootstrap_cache_root/cargo-target"
+          trap 'rm -f "$first_receipt" "$second_receipt" "$first_receipt.stable" "$second_receipt.stable"; rm -rf "$bootstrap_cache_root"' EXIT
+          CARGO_HOME="$bootstrap_cache_root/cargo-home" \
+            CARGO_TARGET_DIR="$bootstrap_cache_root/cargo-target" \
+            ./scripts/bootstrap --output json > "$first_receipt"
+          CARGO_HOME="$bootstrap_cache_root/cargo-home" \
+            CARGO_TARGET_DIR="$bootstrap_cache_root/cargo-target" \
+            ./scripts/bootstrap --output json > "$second_receipt"
+
+          jq -e '
+            .schema_version == 1 and
+            .receipt_type == "smolrunner-workspace-capability-receipt" and
+            (.state == "ready" or .state == "ready_with_declared_deviations") and
+            .source.clean_before == true and
+            .source.clean_after == true and
+            .source.cleanliness_unchanged == true and
+            (.source.commit | test("^[0-9a-f]{40}$")) and
+            (.source.tree | test("^[0-9a-f]{40}$")) and
+            .repository_root.private_path_exposed == false and
+            (all(.declared_cache_paths[];
+              .path_class == "external-private" and
+              .ownership == "current-user" and
+              .path_exposed == false)) and
+            (.next_verification_profiles == ["smolrunner.required", "smolrunner.doctor", "smolrunner.plan"])
+          ' "$first_receipt"
+          jq -S 'del(
+            .capability_fingerprint,
+            .resources.available_memory_mib,
+            .resources.available_swap_mib,
+            .resources.available_memory_bytes,
+            .resources.available_swap_bytes,
+            .verification_profile_compatibility.resources.available_memory_bytes,
+            .verification_profile_compatibility.resources.available_swap_bytes
+          )' "$first_receipt" > "$first_receipt.stable"
+          jq -S 'del(
+            .capability_fingerprint,
+            .resources.available_memory_mib,
+            .resources.available_swap_mib,
+            .resources.available_memory_bytes,
+            .resources.available_swap_bytes,
+            .verification_profile_compatibility.resources.available_memory_bytes,
+            .verification_profile_compatibility.resources.available_swap_bytes
+          )' "$second_receipt" > "$second_receipt.stable"
+          cmp "$first_receipt.stable" "$second_receipt.stable"
+          if test "$(jq -r '.resources.available_memory_bytes, .resources.available_swap_bytes' "$first_receipt")" = \
+            "$(jq -r '.resources.available_memory_bytes, .resources.available_swap_bytes' "$second_receipt")"; then
+            test "$(jq -r .capability_fingerprint "$first_receipt")" = \
+              "$(jq -r .capability_fingerprint "$second_receipt")"
+          fi
+          if grep -Fq "$HOME" "$first_receipt"; then
+            printf 'error: workspace receipt exposed HOME\n' >&2
+            exit 1
+          fi
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          cat "$first_receipt"
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 

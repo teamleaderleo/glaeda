@@ -23,11 +23,16 @@ Do not turn SmolRunner into a new pipeline language, runner protocol, Kubernetes
 9. Prove one local execution and preview backend before worker selection or external provider adapters.
 10. Keep the public surface small while implementing reliability through the explicit release, incident, backup, fleet-policy, repair-budget, and recovery contracts in `docs/OPERATING_MODEL.md`.
 
+## Workspace bootstrap
+
+Run `./scripts/bootstrap` from the repository root before selecting a verification profile. Use `./scripts/bootstrap --output json` for the versioned capability receipt. The command is read-only: it observes the checkout, toolchain, resource envelope, cache classes, and operation-specific Git readiness while preserving source, lockfiles, Git configuration, credentials, and host state. See `docs/WORKSPACE_BOOTSTRAP.md`.
+
 ## Required checks
 
 Before declaring a change ready:
 
 ```bash
+./scripts/bootstrap --output json
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-targets --all-features
@@ -37,7 +42,7 @@ cargo run --locked --quiet -- --output json plan --file examples/glossless.yml
 cargo run --locked --quiet -- --output json host plan --file examples/quarry.yml
 ```
 
-A doctor warning is acceptable on a development machine that lacks Podman or systemd. A doctor failure must be understood and documented. Planning must never mutate the filesystem, users, services, containers, routes, leases, GitHub state, release state, incident stores, backup stores, or fleet policy.
+A bootstrap result of `ready_with_declared_deviations` is acceptable when every deviation is recorded and irrelevant to the selected repository verification profile. `blocked` must be resolved before verification. A doctor warning is acceptable on a development machine that lacks Podman or systemd. A doctor failure must be understood and documented. Planning must never mutate the filesystem, users, services, containers, routes, leases, GitHub state, release state, incident stores, backup stores, or fleet policy.
 
 ## Implementation rules
 
