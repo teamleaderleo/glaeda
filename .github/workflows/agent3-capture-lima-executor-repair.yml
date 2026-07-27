@@ -1,0 +1,49 @@
+name: Agent 3 capture Lima executor repair
+
+on:
+  pull_request:
+    types: [synchronize]
+
+permissions:
+  contents: write
+  pull-requests: read
+
+jobs:
+  capture:
+    if: github.event.pull_request.number == 206 && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Check out exact repair branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+          show-progress: false
+      - name: Run exact replay script and capture result
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          workflow = Path('.github/workflows/agent3-rebuild-lima-executor.yml').read_text(encoding='utf-8')
+          start = workflow.index('      - name: Replay and repair executor\n        run: |\n')
+          start = workflow.index('        run: |\n', start) + len('        run: |\n')
+          end = workflow.index('      - name: Commit source-only clean replay\n', start)
+          lines = workflow[start:end].splitlines()
+          script = '\n'.join(line[10:] if line.startswith('          ') else line for line in lines) + '\n'
+          Path('/tmp/agent3-replay.sh').write_text(script, encoding='utf-8')
+          PY
+          set +e
+          bash /tmp/agent3-replay.sh >.agent3-executor-repair.log 2>&1
+          status=$?
+          printf '\nagent3_repair_status=%s\n' "$status" >>.agent3-executor-repair.log
+          exit 0
+      - name: Commit diagnostic state
+        run: |
+          git config user.name "Agent 3"
+          git config user.email "agent3@users.noreply.github.com"
+          git rm .github/workflows/agent3-rebuild-lima-executor.yml
+          git rm .github/workflows/agent3-capture-lima-executor-repair.yml
+          git add -A
+          git diff --cached --check
+          git commit -m "Capture Lima executor repair result"
+          git push origin HEAD:${{ github.event.pull_request.head.ref }}
