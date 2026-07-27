@@ -45,6 +45,8 @@ pub mod lane_executor;
 pub mod lease;
 pub mod lease_catalog;
 pub mod lease_document;
+/// Pure Lima policy: work while active, interactive after 10 idle minutes, stopped after 30.
+pub mod lima_lifecycle;
 /// Read-only, fail-closed lookup of persisted project installations.
 #[cfg(target_os = "linux")]
 pub mod linux_installation_catalog;
