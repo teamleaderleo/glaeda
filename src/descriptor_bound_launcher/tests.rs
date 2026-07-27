@@ -530,6 +530,64 @@ fn plan_rejects_unbounded_or_noncanonical_inputs() {
 }
 
 #[test]
+fn drop_privileges_clears_groups_and_all_root_ids_without_mutating_caller() {
+    if process::geteuid().as_raw() != 0 || process::getegid().as_raw() != 0 {
+        return;
+    }
+
+    let caller_groups = process::getgroups().expect("read caller supplementary groups");
+    let fixture = Fixture::new("credential-drop");
+    let working_directory = fixture.directory("cwd");
+    let executable = fixture.copy_binary("cat", &["/usr/bin/cat", "/bin/cat"]);
+    let target_uid = 65534;
+    let target_gid = 65534;
+    let launch = ReviewedLinuxLaunchPlan::new(
+        "descriptor.credential_drop",
+        &executable,
+        identity(&executable),
+        &working_directory,
+        identity(&working_directory),
+        vec![ReviewedLaunchValue::plain("/proc/self/status")],
+        BTreeMap::new(),
+        ReviewedLaunchCredentials::DropPrivileges {
+            launcher_uid: 0,
+            launcher_gid: 0,
+            target_uid,
+            target_gid,
+        },
+    )
+    .expect("reviewed credential-drop plan");
+
+    let receipt = execute_reviewed_linux_launch(&launch).expect("credential drop must execute");
+
+    assert!(receipt.success());
+    let uid = status_values(&receipt.diagnostics.stdout, "Uid:");
+    let gid = status_values(&receipt.diagnostics.stdout, "Gid:");
+    let groups = status_values(&receipt.diagnostics.stdout, "Groups:");
+    assert_eq!(uid, vec![target_uid; 4]);
+    assert_eq!(gid, vec![target_gid; 4]);
+    assert!(
+        groups.is_empty(),
+        "supplementary groups remained: {groups:?}"
+    );
+    assert_eq!(
+        process::getgroups().expect("read caller groups after launch"),
+        caller_groups,
+        "the caller thread's supplementary groups must remain unchanged"
+    );
+}
+
+fn status_values(output: &str, prefix: &str) -> Vec<u32> {
+    output
+        .lines()
+        .find_map(|line| line.strip_prefix(prefix))
+        .unwrap_or_else(|| panic!("missing {prefix} status line"))
+        .split_whitespace()
+        .map(|value| value.parse::<u32>().expect("numeric status credential"))
+        .collect()
+}
+
+#[test]
 fn drop_privileges_contract_rejects_nonroot_launcher_and_root_target() {
     assert!(
         ReviewedLaunchCredentials::DropPrivileges {
