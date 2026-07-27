@@ -1,0 +1,59 @@
+name: Clean replay Rust verification envelope
+
+on:
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  replay:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out reviewed source head
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: source
+          show-progress: false
+      - name: Check out current main
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: main
+          path: product
+          show-progress: false
+      - name: Replay exact two-file product
+        working-directory: product
+        run: |
+          cp ../source/src/rust_verification_envelope.rs src/rust_verification_envelope.rs
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('src/lib.rs')
+          text = path.read_text(encoding='utf-8')
+          marker = 'pub mod renderprove_vision_result;\n'
+          addition = (
+              marker
+              + '/// Pure repository-declared Rust build-scope and bounded resource-envelope contracts.\n'
+              + 'pub mod rust_verification_envelope;\n'
+          )
+          if text.count(marker) != 1:
+              raise SystemExit('current-main export marker mismatch')
+          if 'pub mod rust_verification_envelope;' in text:
+              raise SystemExit('current main already exports the Rust envelope')
+          path.write_text(text.replace(marker, addition), encoding='utf-8')
+          PY
+          cargo fmt --all
+          cargo test --locked rust_verification_envelope
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Publish clean replay
+        working-directory: product
+        env:
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          git add src/lib.rs src/rust_verification_envelope.rs
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git commit -m 'Add typed Rust verification envelope contract'
+          git push --force origin "HEAD:${HEAD_REF}"
