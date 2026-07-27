@@ -70,6 +70,7 @@ pub mod mac_availability;
 pub mod macos_resource_observation;
 pub mod manifest;
 pub mod ownership;
+pub mod personal_worker_queue;
 pub mod plan;
 pub mod podman_preview;
 pub mod podman_preview_execution;
