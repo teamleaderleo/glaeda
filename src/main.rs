@@ -217,9 +217,7 @@ fn main() -> ExitCode {
             ),
         },
         Command::Worker { command } => match command {
-            WorkerCommand::Status { store_root } => {
-                run_worker_status(cli.output, &store_root)
-            }
+            WorkerCommand::Status { store_root } => run_worker_status(cli.output, &store_root),
         },
         Command::Queue { command } => match command {
             QueueCommand::List {
@@ -228,14 +226,7 @@ fn main() -> ExitCode {
                 generation,
                 offset,
                 limit,
-            } => run_queue_list(
-                cli.output,
-                &store_root,
-                revision,
-                generation,
-                offset,
-                limit,
-            ),
+            } => run_queue_list(cli.output, &store_root, revision, generation, offset, limit),
         },
         Command::Job { command } => match command {
             JobCommand::Show {
@@ -243,13 +234,7 @@ fn main() -> ExitCode {
                 revision,
                 generation,
                 request_id,
-            } => run_job_show(
-                cli.output,
-                &store_root,
-                revision,
-                generation,
-                &request_id,
-            ),
+            } => run_job_show(cli.output, &store_root, revision, generation, &request_id),
         },
     }
 }

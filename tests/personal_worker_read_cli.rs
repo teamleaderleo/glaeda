@@ -94,12 +94,7 @@ fn namespace(repository: &str, digest_byte: &str) -> PersonalWorkerCacheNamespac
     }
 }
 
-fn request(
-    id: &str,
-    repository: &str,
-    digit: char,
-    submitted_at: u64,
-) -> PersonalWorkerJobRequest {
+fn request(id: &str, repository: &str, digit: char, submitted_at: u64) -> PersonalWorkerJobRequest {
     PersonalWorkerJobRequest {
         identity: identity(id),
         source: source(repository, digit),
@@ -183,8 +178,7 @@ fn live_document() -> PersonalWorkerStoreDocument {
 
 fn terminal_tombstone() -> PersonalWorkerTerminalTombstone {
     let request = request("terminal-one", "example/terminal", 'd', BASE - 120_000);
-    let reservation_id =
-        ReservationId::parse("reservation-terminal-one").expect("reservation ID");
+    let reservation_id = ReservationId::parse("reservation-terminal-one").expect("reservation ID");
     let generation = ReservationGeneration::new(11).expect("reservation generation");
     let reserved_at = time(BASE - 30_000);
     let terminal_admission = ExecutionAdmissionRecord::from_input(ExecutionAdmissionInput {
@@ -319,10 +313,12 @@ fn installed_cli_reads_status_queue_and_active_job_without_lock_or_writes() {
         OsStr::new("1"),
     ]);
     assert!(queue.status.success(), "{}", output_text(&queue.stderr));
-    let queue_json: serde_json::Value =
-        serde_json::from_slice(&queue.stdout).expect("queue JSON");
+    let queue_json: serde_json::Value = serde_json::from_slice(&queue.stdout).expect("queue JSON");
     assert_eq!(queue_json["total"], 3);
-    assert_eq!(queue_json["items"].as_array().expect("queue items").len(), 1);
+    assert_eq!(
+        queue_json["items"].as_array().expect("queue items").len(),
+        1
+    );
     assert_eq!(queue_json["next_offset"], 1);
 
     let job = run_smolrunner(&[
@@ -363,7 +359,11 @@ fn installed_cli_projects_retained_terminal_and_bounds_errors() {
         OsStr::new("1"),
         OsStr::new("terminal-one"),
     ]);
-    assert!(terminal.status.success(), "{}", output_text(&terminal.stderr));
+    assert!(
+        terminal.status.success(),
+        "{}",
+        output_text(&terminal.stderr)
+    );
     let terminal_json: serde_json::Value =
         serde_json::from_slice(&terminal.stdout).expect("terminal JSON");
     assert_eq!(terminal_json["job"]["state"], "terminal");
@@ -449,8 +449,7 @@ fn installed_cli_does_not_create_or_recover_durable_state() {
         encode_personal_worker_store_document(&successor).expect("encode successor"),
     )
     .expect("write staged state");
-    fs::set_permissions(&staged_path, fs::Permissions::from_mode(0o600))
-        .expect("set staged mode");
+    fs::set_permissions(&staged_path, fs::Permissions::from_mode(0o600)).expect("set staged mode");
 
     let before = store_snapshot(&root);
     let status = run_smolrunner(&[

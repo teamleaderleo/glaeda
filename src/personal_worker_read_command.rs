@@ -151,8 +151,7 @@ pub(crate) fn render_status_human(view: &PersonalWorkerStatusView) -> String {
         .expect("writing to a String cannot fail");
     writeln!(output, "  selected: {}", view.selected_count())
         .expect("writing to a String cannot fail");
-    writeln!(output, "  active: {}", view.active_count())
-        .expect("writing to a String cannot fail");
+    writeln!(output, "  active: {}", view.active_count()).expect("writing to a String cannot fail");
     writeln!(output, "  draining: {}", view.draining_count())
         .expect("writing to a String cannot fail");
     writeln!(output, "  cache leases: {}", view.cache_lease_count())
@@ -338,8 +337,8 @@ fn load_snapshot(
     store_root: &Path,
 ) -> Result<PersonalWorkerStoreDocument, PersonalWorkerReadCommandError> {
     validate_store_root(store_root)?;
-    let store = UnixPersonalWorkerStore::open_existing_read_only(store_root)
-        .map_err(map_store_error)?;
+    let store =
+        UnixPersonalWorkerStore::open_existing_read_only(store_root).map_err(map_store_error)?;
     store.load().map_err(map_store_error)?.ok_or_else(|| {
         command_error(
             PersonalWorkerReadCommandErrorKind::MissingStore,
@@ -391,9 +390,7 @@ fn map_read_error(error: PersonalWorkerReadError) -> PersonalWorkerReadCommandEr
         PersonalWorkerReadErrorKind::StaleQueueGeneration => {
             PersonalWorkerReadCommandErrorKind::StaleQueueGeneration
         }
-        PersonalWorkerReadErrorKind::InvalidPage => {
-            PersonalWorkerReadCommandErrorKind::InvalidPage
-        }
+        PersonalWorkerReadErrorKind::InvalidPage => PersonalWorkerReadCommandErrorKind::InvalidPage,
         PersonalWorkerReadErrorKind::OffsetOutOfBounds => {
             PersonalWorkerReadCommandErrorKind::OffsetOutOfBounds
         }
@@ -420,9 +417,7 @@ const fn command_error(
 mod tests {
     use std::path::Path;
 
-    use super::{
-        PersonalWorkerReadCommandErrorKind, read_status, validate_store_root,
-    };
+    use super::{PersonalWorkerReadCommandErrorKind, read_status, validate_store_root};
 
     #[test]
     fn store_root_requires_an_absolute_normalized_path() {

@@ -80,11 +80,7 @@ impl UnixPersonalWorkerStore {
         let owner = (root_stat.st_uid, root_stat.st_gid);
         let directory = fs::openat(&root, STORE_DIRECTORY, DIRECTORY_FLAGS, Mode::empty())
             .map_err(map_existing_store_directory_open_error)?;
-        inspect_directory(
-            &directory,
-            "personal worker store directory",
-            Some(owner),
-        )?;
+        inspect_directory(&directory, "personal worker store directory", Some(owner))?;
         Ok(Self {
             _root: root,
             directory,
