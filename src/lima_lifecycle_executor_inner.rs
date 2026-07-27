@@ -998,4 +998,5 @@ fn receipt(
 }
 
 #[cfg(test)]
+#[path = "lima_lifecycle_executor_inner/tests.rs"]
 mod tests;

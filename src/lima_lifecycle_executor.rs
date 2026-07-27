@@ -20,11 +20,11 @@ mod lima_lifecycle_executor_inner;
 use self::lima_lifecycle_executor_inner as inner;
 
 pub use inner::{
-    LimaLifecycleExecution, LimaLifecycleExecutionAction, LimaLifecycleExecutionPhase,
-    LimaLifecycleExecutionPrivateEvidence, LimaLifecycleExecutionReceipt,
-    LimaLifecycleExecutionRefusalCode, LimaLifecycleObservationSource,
-    LimaLifecycleObservationSourceError, LimaLifecyclePrivateCommandEvidence,
-    LIMA_LIFECYCLE_EXECUTOR_SCHEMA_VERSION, MAX_LIMA_LIFECYCLE_ACTION_AGE_MILLIS,
+    LIMA_LIFECYCLE_EXECUTOR_SCHEMA_VERSION, LimaLifecycleExecution, LimaLifecycleExecutionAction,
+    LimaLifecycleExecutionPhase, LimaLifecycleExecutionPrivateEvidence,
+    LimaLifecycleExecutionReceipt, LimaLifecycleExecutionRefusalCode,
+    LimaLifecycleObservationSource, LimaLifecycleObservationSourceError,
+    LimaLifecyclePrivateCommandEvidence, MAX_LIMA_LIFECYCLE_ACTION_AGE_MILLIS,
     MAX_LIMA_LIFECYCLE_EXECUTOR_OUTPUT_BYTES,
 };
 
@@ -253,12 +253,14 @@ where
         )
     })?;
     let observed_millis = lifecycle_observed_at.get();
-    let age = execution_millis.checked_sub(observed_millis).ok_or_else(|| {
-        LimaLifecycleExecutionFailure::guard(
-            LimaLifecycleExecutionRefusalCode::StaleObservation,
-            "the lifecycle observation is from the future at execution time",
-        )
-    })?;
+    let age = execution_millis
+        .checked_sub(observed_millis)
+        .ok_or_else(|| {
+            LimaLifecycleExecutionFailure::guard(
+                LimaLifecycleExecutionRefusalCode::StaleObservation,
+                "the lifecycle observation is from the future at execution time",
+            )
+        })?;
     if age > MAX_LIMA_OBSERVATION_AGE_MILLIS {
         return Err(LimaLifecycleExecutionFailure::guard(
             LimaLifecycleExecutionRefusalCode::StaleObservation,
