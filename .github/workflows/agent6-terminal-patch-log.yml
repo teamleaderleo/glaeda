@@ -1,0 +1,42 @@
+name: Agent 6 terminal patch log
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out exact branch head
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.head_ref }}
+          show-progress: false
+      - name: Extract and run patch script
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          workflow = Path('.github/workflows/agent6-terminal-replay-repair.yml').read_text().splitlines()
+          start = next(i for i, line in enumerate(workflow) if "python3 - <<'PY'" in line) + 1
+          end = next(i for i in range(start, len(workflow)) if workflow[i].strip() == 'PY')
+          lines = workflow[start:end]
+          indent = min(len(line) - len(line.lstrip()) for line in lines if line.strip())
+          Path('/tmp/terminal-patch.py').write_text('\n'.join(line[indent:] for line in lines) + '\n')
+          PY
+          set +e
+          python3 /tmp/terminal-patch.py > patch.log 2>&1
+          echo "status=$?" >> patch.log
+          exit 0
+      - name: Upload patch log
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: agent6-terminal-patch-log
+          path: patch.log
+          if-no-files-found: error
+          retention-days: 1
