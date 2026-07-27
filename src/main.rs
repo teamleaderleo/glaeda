@@ -381,16 +381,11 @@ fn run_job_cancel(
     cancelled_at: u64,
     request_id: &str,
 ) -> ExitCode {
-    let receipt = match cancel_queued_job(
-        store_root,
-        revision,
-        generation,
-        cancelled_at,
-        request_id,
-    ) {
-        Ok(receipt) => receipt,
-        Err(error) => return emit_personal_worker_cancel_error(output, &error),
-    };
+    let receipt =
+        match cancel_queued_job(store_root, revision, generation, cancelled_at, request_id) {
+            Ok(receipt) => receipt,
+            Err(error) => return emit_personal_worker_cancel_error(output, &error),
+        };
     match output {
         OutputFormat::Human => print!("{}", render_cancel_receipt_human(&receipt)),
         OutputFormat::Json => {
