@@ -45,7 +45,7 @@ pub mod lane_executor;
 pub mod lease;
 pub mod lease_catalog;
 pub mod lease_document;
-/// Read-only, bounded exact Lima instance and guest-resource observation.
+/// Read-only, bounded exact observation of one Lima instance and running guest.
 pub mod lima_observation;
 /// Read-only, fail-closed lookup of persisted project installations.
 #[cfg(target_os = "linux")]
