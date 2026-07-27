@@ -5,6 +5,9 @@ pub mod debian_package_plan;
 pub mod debian_package_probe;
 #[cfg(target_os = "linux")]
 pub mod debian_package_recovery;
+/// Descriptor-bound execution of already reviewed Linux launch plans.
+#[cfg(target_os = "linux")]
+pub mod descriptor_bound_launcher;
 pub mod doctor;
 pub mod durable_journal;
 #[cfg(target_os = "linux")]
