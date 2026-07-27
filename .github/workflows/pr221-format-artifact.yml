@@ -3,38 +3,31 @@ name: PR221 format artifact
 on:
   pull_request:
     paths:
-      - src/main.rs
-      - src/personal_worker_read_command.rs
-      - src/unix_personal_worker_store.rs
-      - tests/personal_worker_read_cli.rs
       - .github/workflows/pr221-format-artifact.yml
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   format:
     runs-on: ubuntu-24.04
     steps:
-      - name: Check out branch
+      - name: Check out head branch
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
+          ref: ${{ github.event.pull_request.head.ref }}
           show-progress: false
       - name: Install Rust toolchain
         run: rustup toolchain install stable --profile minimal --component rustfmt
-      - name: Apply formatter
-        run: cargo +stable fmt --all
-      - name: Package formatted files
+      - name: Apply formatter and remove helper
         run: |
-          tar -czf pr221-formatted.tar.gz \
-            src/main.rs \
-            src/personal_worker_read_command.rs \
-            src/unix_personal_worker_store.rs \
-            tests/personal_worker_read_cli.rs
-      - name: Upload formatted files
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: pr221-formatted
-          path: pr221-formatted.tar.gz
-          if-no-files-found: error
-          retention-days: 1
+          cargo +stable fmt --all
+          rm .github/workflows/pr221-format-artifact.yml
+      - name: Commit exact formatter output
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/main.rs src/personal_worker_read_command.rs src/unix_personal_worker_store.rs tests/personal_worker_read_cli.rs .github/workflows/pr221-format-artifact.yml
+          git diff --cached --quiet && exit 0
+          git commit -m "Format personal worker read CLI"
+          git push origin HEAD:${{ github.event.pull_request.head.ref }}
