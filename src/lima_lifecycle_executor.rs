@@ -15,7 +15,9 @@ use crate::personal_worker_queue::PersonalWorkerQueueGeneration;
 use crate::process::CommandExecutor;
 
 #[path = "lima_lifecycle_executor_inner.rs"]
-mod inner;
+mod lima_lifecycle_executor_inner;
+
+use self::lima_lifecycle_executor_inner as inner;
 
 pub use inner::{
     LimaLifecycleExecution, LimaLifecycleExecutionAction, LimaLifecycleExecutionPhase,
