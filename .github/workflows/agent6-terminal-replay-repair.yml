@@ -1,0 +1,1463 @@
+name: Agent 6 terminal replay repair diagnostic
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out exact branch head
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.head_ref }}
+          show-progress: false
+      - name: Apply terminal replay repair
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(text: str, old: str, new: str, label: str) -> str:
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected one match, found {count}")
+              return text.replace(old, new, 1)
+
+          store_path = Path("src/personal_worker_store.rs")
+          store = store_path.read_text()
+          store = replace_once(
+              store,
+              "pub const MAX_PERSONAL_WORKER_HISTORY_ENTRIES: usize = 32;\nconst MAX_PERSONAL_WORKER_STORE_REVISION: u64 = 1_000_000_000_000;",
+              "pub const MAX_PERSONAL_WORKER_HISTORY_ENTRIES: usize = 32;\npub const MAX_PERSONAL_WORKER_TERMINAL_TOMBSTONES: usize = 32;\nconst MAX_PERSONAL_WORKER_STORE_REVISION: u64 = 1_000_000_000_000;",
+              "terminal tombstone bound",
+          )
+          terminal_types = r'''
+          #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+          #[serde(rename_all = "snake_case")]
+          pub enum PersonalWorkerTerminalMutationClass {
+              ReleaseCompletionAndCacheLease,
+          }
+
+          #[derive(Debug, Clone, PartialEq, Eq)]
+          pub struct PersonalWorkerTerminalTombstone {
+              mutation_class: PersonalWorkerTerminalMutationClass,
+              request: PersonalWorkerJobRequest,
+              terminal_admission: ExecutionAdmissionRecord,
+              started_at: Option<EpochMillis>,
+              cache_lease: PersonalWorkerDurableCacheLease,
+              evidence_digest: Sha256Digest,
+          }
+
+          impl PersonalWorkerTerminalTombstone {
+              pub fn new(
+                  request: PersonalWorkerJobRequest,
+                  terminal_admission: ExecutionAdmissionRecord,
+                  started_at: Option<EpochMillis>,
+                  cache_lease: PersonalWorkerDurableCacheLease,
+              ) -> Result<Self, PersonalWorkerStoreError> {
+                  let mutation_class =
+                      PersonalWorkerTerminalMutationClass::ReleaseCompletionAndCacheLease;
+                  let evidence_digest = terminal_evidence_digest(
+                      mutation_class,
+                      &request,
+                      &terminal_admission,
+                      started_at,
+                      &cache_lease,
+                  )?;
+                  let tombstone = Self {
+                      mutation_class,
+                      request,
+                      terminal_admission,
+                      started_at,
+                      cache_lease,
+                      evidence_digest,
+                  };
+                  tombstone.validate()?;
+                  Ok(tombstone)
+              }
+
+              #[must_use]
+              pub const fn mutation_class(&self) -> PersonalWorkerTerminalMutationClass {
+                  self.mutation_class
+              }
+
+              #[must_use]
+              pub const fn request(&self) -> &PersonalWorkerJobRequest {
+                  &self.request
+              }
+
+              #[must_use]
+              pub const fn terminal_admission(&self) -> &ExecutionAdmissionRecord {
+                  &self.terminal_admission
+              }
+
+              #[must_use]
+              pub const fn started_at(&self) -> Option<EpochMillis> {
+                  self.started_at
+              }
+
+              #[must_use]
+              pub const fn cache_lease(&self) -> &PersonalWorkerDurableCacheLease {
+                  &self.cache_lease
+              }
+
+              #[must_use]
+              pub const fn evidence_digest(&self) -> &Sha256Digest {
+                  &self.evidence_digest
+              }
+
+              #[must_use]
+              pub const fn completed_at(&self) -> EpochMillis {
+                  self.terminal_admission.observed_at()
+              }
+
+              fn validate(&self) -> Result<(), PersonalWorkerStoreError> {
+                  if self.terminal_admission.state() != ExecutionAdmissionState::Unavailable {
+                      return Err(PersonalWorkerStoreError::invalid_document(
+                          "terminal tombstone requires unavailable admission evidence",
+                      ));
+                  }
+                  if self.terminal_admission.identity() != &self.request.identity
+                      || self.cache_lease.request_id() != &self.request.identity.request_id
+                  {
+                      return Err(PersonalWorkerStoreError::invalid_document(
+                          "terminal tombstone request identity does not match its evidence",
+                      ));
+                  }
+                  if self.terminal_admission.requested_limits() != self.request.requested_limits
+                      || self.terminal_admission.fallback_eligibility()
+                          != &self.request.fallback_eligibility
+                  {
+                      return Err(PersonalWorkerStoreError::invalid_document(
+                          "terminal tombstone admission semantics drift from the exact request",
+                      ));
+                  }
+                  if self.cache_lease.namespace() != &self.request.cache_namespace
+                      || self.cache_lease.access() != self.request.cache_access
+                  {
+                      return Err(PersonalWorkerStoreError::invalid_document(
+                          "terminal tombstone cache lease does not match the exact request",
+                      ));
+                  }
+                  let reservation = self.terminal_admission.reservation().ok_or_else(|| {
+                      PersonalWorkerStoreError::invalid_document(
+                          "terminal tombstone requires exact reservation evidence",
+                      )
+                  })?;
+                  if self.cache_lease.reservation_id() != &reservation.id
+                      || self.cache_lease.reservation_generation() != reservation.generation
+                  {
+                      return Err(PersonalWorkerStoreError::invalid_document(
+                          "terminal tombstone cache lease is bound to different reservation evidence",
+                      ));
+                  }
+                  if self.cache_lease.acquired_at() < reservation.reserved_at
+                      || self.cache_lease.acquired_at() > self.terminal_admission.observed_at()
+                  {
+                      return Err(PersonalWorkerStoreError::invalid_document(
+                          "terminal tombstone cache lease time is outside reservation evidence",
+                      ));
+                  }
+                  if self.started_at.is_some_and(|started_at| {
+                      started_at < reservation.reserved_at
+                          || started_at > self.terminal_admission.observed_at()
+                  }) {
+                      return Err(PersonalWorkerStoreError::invalid_document(
+                          "terminal tombstone start time is outside reservation evidence",
+                      ));
+                  }
+                  let expected = terminal_evidence_digest(
+                      self.mutation_class,
+                      &self.request,
+                      &self.terminal_admission,
+                      self.started_at,
+                      &self.cache_lease,
+                  )?;
+                  if expected != self.evidence_digest {
+                      return Err(PersonalWorkerStoreError::invalid_document(
+                          "terminal tombstone evidence digest does not match its exact evidence",
+                      ));
+                  }
+                  Ok(())
+              }
+          }
+
+          '''
+          store = replace_once(
+              store,
+              "#[derive(Debug, Clone, PartialEq, Eq, Serialize)]\npub struct PersonalWorkerHistoryEntry {",
+              terminal_types + "#[derive(Debug, Clone, PartialEq, Eq, Serialize)]\npub struct PersonalWorkerHistoryEntry {",
+              "terminal tombstone types",
+          )
+          store = replace_once(
+              store,
+              "    cache_lease_count: u32,\n    state_digest: Sha256Digest,",
+              "    cache_lease_count: u32,\n    terminal_tombstone_count: u32,\n    state_digest: Sha256Digest,",
+              "history terminal count",
+          )
+          store = replace_once(
+              store,
+              "    queue: PersonalWorkerQueueInput,\n    cache_leases: Vec<PersonalWorkerDurableCacheLease>,\n    history: Vec<PersonalWorkerHistoryEntry>,",
+              "    queue: PersonalWorkerQueueInput,\n    cache_leases: Vec<PersonalWorkerDurableCacheLease>,\n    terminal_tombstones: Vec<PersonalWorkerTerminalTombstone>,\n    history: Vec<PersonalWorkerHistoryEntry>,",
+              "document terminal field",
+          )
+          old_new = '''    pub fn new(
+              queue: PersonalWorkerQueueInput,
+              cache_leases: Vec<PersonalWorkerDurableCacheLease>,
+          ) -> Result<Self, PersonalWorkerStoreError> {
+              Self::from_parts(
+                  PersonalWorkerStoreRevision::new(1)?,
+                  queue,
+                  cache_leases,
+                  Vec::new(),
+              )
+          }
+          '''
+          new_new = '''    pub fn new(
+              queue: PersonalWorkerQueueInput,
+              cache_leases: Vec<PersonalWorkerDurableCacheLease>,
+          ) -> Result<Self, PersonalWorkerStoreError> {
+              Self::from_parts(
+                  PersonalWorkerStoreRevision::new(1)?,
+                  queue,
+                  cache_leases,
+                  Vec::new(),
+                  Vec::new(),
+              )
+          }
+
+              pub fn new_with_terminal_tombstones(
+                  queue: PersonalWorkerQueueInput,
+                  cache_leases: Vec<PersonalWorkerDurableCacheLease>,
+                  terminal_tombstones: Vec<PersonalWorkerTerminalTombstone>,
+              ) -> Result<Self, PersonalWorkerStoreError> {
+                  Self::from_parts(
+                      PersonalWorkerStoreRevision::new(1)?,
+                      queue,
+                      cache_leases,
+                      terminal_tombstones,
+                      Vec::new(),
+                  )
+              }
+          '''
+          store = replace_once(store, old_new, new_new, "document constructors")
+          old_advance = '''    pub fn advance(
+              &self,
+              queue: PersonalWorkerQueueInput,
+              cache_leases: Vec<PersonalWorkerDurableCacheLease>,
+          ) -> Result<Self, PersonalWorkerStoreError> {
+              let expected_generation = next_queue_generation(self.queue.generation)?;
+              if queue.generation != expected_generation {
+                  return Err(PersonalWorkerStoreError::revision_conflict(
+                      "personal worker queue generation must advance exactly once",
+                  ));
+              }
+              if queue.observed_at < self.queue.observed_at {
+                  return Err(PersonalWorkerStoreError::revision_conflict(
+                      "personal worker store observation cannot move backwards",
+                  ));
+              }
+              let mut history = self.history.clone();
+              history.push(self.summary()?);
+              if history.len() > MAX_PERSONAL_WORKER_HISTORY_ENTRIES {
+                  history.remove(0);
+              }
+              Self::from_parts(self.revision.next()?, queue, cache_leases, history)
+          }
+          '''
+          new_advance = '''    pub fn advance(
+              &self,
+              queue: PersonalWorkerQueueInput,
+              cache_leases: Vec<PersonalWorkerDurableCacheLease>,
+          ) -> Result<Self, PersonalWorkerStoreError> {
+              self.advance_with_terminal_tombstones(
+                  queue,
+                  cache_leases,
+                  self.terminal_tombstones.clone(),
+              )
+          }
+
+              pub fn advance_with_terminal_tombstones(
+                  &self,
+                  queue: PersonalWorkerQueueInput,
+                  cache_leases: Vec<PersonalWorkerDurableCacheLease>,
+                  terminal_tombstones: Vec<PersonalWorkerTerminalTombstone>,
+              ) -> Result<Self, PersonalWorkerStoreError> {
+                  let expected_generation = next_queue_generation(self.queue.generation)?;
+                  if queue.generation != expected_generation {
+                      return Err(PersonalWorkerStoreError::revision_conflict(
+                          "personal worker queue generation must advance exactly once",
+                      ));
+                  }
+                  if queue.observed_at < self.queue.observed_at {
+                      return Err(PersonalWorkerStoreError::revision_conflict(
+                          "personal worker store observation cannot move backwards",
+                      ));
+                  }
+                  let mut history = self.history.clone();
+                  history.push(self.summary()?);
+                  if history.len() > MAX_PERSONAL_WORKER_HISTORY_ENTRIES {
+                      history.remove(0);
+                  }
+                  Self::from_parts(
+                      self.revision.next()?,
+                      queue,
+                      cache_leases,
+                      terminal_tombstones,
+                      history,
+                  )
+              }
+          '''
+          store = replace_once(store, old_advance, new_advance, "document advance")
+          store = replace_once(
+              store,
+              "        cache_leases: Vec<PersonalWorkerDurableCacheLease>,\n        history: Vec<PersonalWorkerHistoryEntry>,",
+              "        cache_leases: Vec<PersonalWorkerDurableCacheLease>,\n        terminal_tombstones: Vec<PersonalWorkerTerminalTombstone>,\n        history: Vec<PersonalWorkerHistoryEntry>,",
+              "from parts signature",
+          )
+          store = replace_once(
+              store,
+              "            queue,\n            cache_leases,\n            history,",
+              "            queue,\n            cache_leases,\n            terminal_tombstones,\n            history,",
+              "from parts fields",
+          )
+          store = replace_once(
+              store,
+              '''    pub fn cache_leases(&self) -> &[PersonalWorkerDurableCacheLease] {
+                  &self.cache_leases
+              }
+
+              #[must_use]
+              pub fn history(&self) -> &[PersonalWorkerHistoryEntry] {''',
+              '''    pub fn cache_leases(&self) -> &[PersonalWorkerDurableCacheLease] {
+                  &self.cache_leases
+              }
+
+              #[must_use]
+              pub fn terminal_tombstones(&self) -> &[PersonalWorkerTerminalTombstone] {
+                  &self.terminal_tombstones
+              }
+
+              #[must_use]
+              pub fn history(&self) -> &[PersonalWorkerHistoryEntry] {''',
+              "terminal accessor",
+          )
+          store = replace_once(
+              store,
+              "        validate_cache_leases(&self.queue, &self.cache_leases)?;\n        validate_history(",
+              "        validate_cache_leases(&self.queue, &self.cache_leases)?;\n        validate_terminal_tombstones(&self.queue, &self.terminal_tombstones)?;\n        validate_history(",
+              "terminal validation call",
+          )
+          store = replace_once(
+              store,
+              "            cache_lease_count: bounded_count(self.cache_leases.len())?,\n            state_digest: snapshot_digest(&self.queue, &self.cache_leases)?,",
+              "            cache_lease_count: bounded_count(self.cache_leases.len())?,\n            terminal_tombstone_count: bounded_count(self.terminal_tombstones.len())?,\n            state_digest: snapshot_digest(\n                &self.queue,\n                &self.cache_leases,\n                &self.terminal_tombstones,\n            )?,",
+              "summary tombstones",
+          )
+          validation = r'''
+          fn validate_terminal_tombstones(
+              queue: &PersonalWorkerQueueInput,
+              tombstones: &[PersonalWorkerTerminalTombstone],
+          ) -> Result<(), PersonalWorkerStoreError> {
+              if tombstones.len() > MAX_PERSONAL_WORKER_TERMINAL_TOMBSTONES {
+                  return Err(PersonalWorkerStoreError::invalid_document(
+                      "personal worker terminal tombstone ledger exceeds its bounded entry limit",
+                  ));
+              }
+              let live_ids = queue
+                  .queued
+                  .iter()
+                  .map(|request| request.identity.request_id.clone())
+                  .chain(
+                      queue
+                          .active
+                          .iter()
+                          .map(|active| active.request.identity.request_id.clone()),
+                  )
+                  .collect::<BTreeSet<_>>();
+              let mut terminal_ids = BTreeSet::new();
+              let mut previous_completed_at = None;
+              for tombstone in tombstones {
+                  tombstone.validate()?;
+                  let request_id = tombstone.request.identity.request_id.clone();
+                  if live_ids.contains(&request_id) {
+                      return Err(PersonalWorkerStoreError::invalid_document(
+                          "terminal tombstone request is still present in live queue state",
+                      ));
+                  }
+                  if !terminal_ids.insert(request_id) {
+                      return Err(PersonalWorkerStoreError::invalid_document(
+                          "terminal tombstone request identity is duplicated",
+                      ));
+                  }
+                  if previous_completed_at
+                      .is_some_and(|previous| tombstone.completed_at() < previous)
+                  {
+                      return Err(PersonalWorkerStoreError::invalid_document(
+                          "terminal tombstone completion observations move backwards",
+                      ));
+                  }
+                  previous_completed_at = Some(tombstone.completed_at());
+              }
+              Ok(())
+          }
+
+          '''
+          store = replace_once(
+              store,
+              "fn validate_history(\n",
+              validation + "fn validate_history(\n",
+              "terminal ledger validation",
+          )
+          store = replace_once(
+              store,
+              '''fn snapshot_digest(
+              queue: &PersonalWorkerQueueInput,
+              leases: &[PersonalWorkerDurableCacheLease],
+          ) -> Result<Sha256Digest, PersonalWorkerStoreError> {
+              let wire = WireSnapshot::from_parts(queue, leases);''',
+              '''fn snapshot_digest(
+              queue: &PersonalWorkerQueueInput,
+              leases: &[PersonalWorkerDurableCacheLease],
+              terminal_tombstones: &[PersonalWorkerTerminalTombstone],
+          ) -> Result<Sha256Digest, PersonalWorkerStoreError> {
+              let wire = WireSnapshot::from_parts(queue, leases, terminal_tombstones);''',
+              "snapshot digest signature",
+          )
+          terminal_digest = r'''
+          fn terminal_evidence_digest(
+              mutation_class: PersonalWorkerTerminalMutationClass,
+              request: &PersonalWorkerJobRequest,
+              terminal_admission: &ExecutionAdmissionRecord,
+              started_at: Option<EpochMillis>,
+              cache_lease: &PersonalWorkerDurableCacheLease,
+          ) -> Result<Sha256Digest, PersonalWorkerStoreError> {
+              let wire = WireTerminalEvidence::from_parts(
+                  mutation_class,
+                  request,
+                  terminal_admission,
+                  started_at,
+                  cache_lease,
+              );
+              let encoded = serde_json::to_vec(&wire).map_err(|_| {
+                  PersonalWorkerStoreError::invalid_document(
+                      "terminal tombstone digest input could not be encoded",
+                  )
+              })?;
+              let digest = Sha256::digest(encoded);
+              Sha256Digest::parse(&format!("sha256:{digest:x}")).map_err(|_| {
+                  PersonalWorkerStoreError::invalid_document(
+                      "terminal tombstone digest could not be represented",
+                  )
+              })
+          }
+
+          '''
+          store = replace_once(
+              store,
+              "macro_rules! wire_enum {",
+              terminal_digest + "macro_rules! wire_enum {",
+              "terminal digest function",
+          )
+          store = replace_once(
+              store,
+              '''wire_enum!(WireUnavailableReason, UnavailableReason, {
+              AdmissionRejected,
+              CapacityUnavailable,
+              HostUnavailable,
+              ReservationExpired,
+              Cancelled,
+              Drained,
+          });''',
+              '''wire_enum!(WireUnavailableReason, UnavailableReason, {
+              AdmissionRejected,
+              CapacityUnavailable,
+              HostUnavailable,
+              ReservationExpired,
+              Cancelled,
+              Drained,
+          });
+          wire_enum!(
+              WireTerminalMutationClass,
+              PersonalWorkerTerminalMutationClass,
+              { ReleaseCompletionAndCacheLease }
+          );''',
+              "wire terminal class",
+          )
+          wire_terminal = r'''
+          #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+          #[serde(deny_unknown_fields)]
+          struct WireTerminalEvidence {
+              mutation_class: WireTerminalMutationClass,
+              request: WireRequest,
+              terminal_admission: WireAdmission,
+              started_at: Option<u64>,
+              cache_lease: WireCacheLease,
+          }
+
+          impl WireTerminalEvidence {
+              fn from_parts(
+                  mutation_class: PersonalWorkerTerminalMutationClass,
+                  request: &PersonalWorkerJobRequest,
+                  terminal_admission: &ExecutionAdmissionRecord,
+                  started_at: Option<EpochMillis>,
+                  cache_lease: &PersonalWorkerDurableCacheLease,
+              ) -> Self {
+                  Self {
+                      mutation_class: mutation_class.into(),
+                      request: WireRequest::from(request),
+                      terminal_admission: WireAdmission::from(terminal_admission),
+                      started_at: started_at.map(EpochMillis::get),
+                      cache_lease: WireCacheLease::from(cache_lease),
+                  }
+              }
+          }
+
+          #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+          #[serde(deny_unknown_fields)]
+          struct WireTerminalTombstone {
+              mutation_class: WireTerminalMutationClass,
+              request: WireRequest,
+              terminal_admission: WireAdmission,
+              started_at: Option<u64>,
+              cache_lease: WireCacheLease,
+              evidence_digest: String,
+          }
+
+          impl From<&PersonalWorkerTerminalTombstone> for WireTerminalTombstone {
+              fn from(value: &PersonalWorkerTerminalTombstone) -> Self {
+                  Self {
+                      mutation_class: value.mutation_class.into(),
+                      request: WireRequest::from(&value.request),
+                      terminal_admission: WireAdmission::from(&value.terminal_admission),
+                      started_at: value.started_at.map(EpochMillis::get),
+                      cache_lease: WireCacheLease::from(&value.cache_lease),
+                      evidence_digest: value.evidence_digest.as_str().to_owned(),
+                  }
+              }
+          }
+
+          impl TryFrom<WireTerminalTombstone> for PersonalWorkerTerminalTombstone {
+              type Error = PersonalWorkerStoreError;
+
+              fn try_from(value: WireTerminalTombstone) -> Result<Self, Self::Error> {
+                  let mutation_class: PersonalWorkerTerminalMutationClass =
+                      value.mutation_class.into();
+                  if mutation_class
+                      != PersonalWorkerTerminalMutationClass::ReleaseCompletionAndCacheLease
+                  {
+                      return Err(PersonalWorkerStoreError::corrupt_state());
+                  }
+                  let expected_digest = Sha256Digest::parse(&value.evidence_digest)
+                      .map_err(|_| PersonalWorkerStoreError::corrupt_state())?;
+                  let tombstone = PersonalWorkerTerminalTombstone::new(
+                      value.request.try_into()?,
+                      value.terminal_admission.try_into()?,
+                      value.started_at.map(epoch).transpose()?,
+                      value.cache_lease.try_into()?,
+                  )
+                  .map_err(|_| PersonalWorkerStoreError::corrupt_state())?;
+                  if tombstone.evidence_digest != expected_digest {
+                      return Err(PersonalWorkerStoreError::corrupt_state());
+                  }
+                  Ok(tombstone)
+              }
+          }
+
+          '''
+          store = replace_once(
+              store,
+              "#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]\n#[serde(deny_unknown_fields)]\nstruct WireHistoryEntry {",
+              wire_terminal + "#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]\n#[serde(deny_unknown_fields)]\nstruct WireHistoryEntry {",
+              "wire terminal tombstone",
+          )
+          store = replace_once(
+              store,
+              "    cache_lease_count: u32,\n    state_digest: String,",
+              "    cache_lease_count: u32,\n    #[serde(default, skip_serializing_if = \"is_zero_u32\")]\n    terminal_tombstone_count: u32,\n    state_digest: String,",
+              "wire history terminal count",
+          )
+          store = replace_once(
+              store,
+              "            cache_lease_count: value.cache_lease_count,\n            state_digest: value.state_digest.as_str().to_owned(),",
+              "            cache_lease_count: value.cache_lease_count,\n            terminal_tombstone_count: value.terminal_tombstone_count,\n            state_digest: value.state_digest.as_str().to_owned(),",
+              "history wire from",
+          )
+          store = replace_once(
+              store,
+              "            cache_lease_count: value.cache_lease_count,\n            state_digest: Sha256Digest::parse(&value.state_digest)",
+              "            cache_lease_count: value.cache_lease_count,\n            terminal_tombstone_count: value.terminal_tombstone_count,\n            state_digest: Sha256Digest::parse(&value.state_digest)",
+              "history wire tryfrom",
+          )
+          store = replace_once(
+              store,
+              '''struct WireSnapshot {
+              queue: WireQueue,
+              cache_leases: Vec<WireCacheLease>,
+          }''',
+              '''struct WireSnapshot {
+              queue: WireQueue,
+              cache_leases: Vec<WireCacheLease>,
+              #[serde(default, skip_serializing_if = "Vec::is_empty")]
+              terminal_tombstones: Vec<WireTerminalTombstone>,
+          }''',
+              "wire snapshot field",
+          )
+          store = replace_once(
+              store,
+              '''    fn from_parts(
+                  queue: &PersonalWorkerQueueInput,
+                  cache_leases: &[PersonalWorkerDurableCacheLease],
+              ) -> Self {
+                  Self {
+                      queue: WireQueue::from(queue),
+                      cache_leases: cache_leases.iter().map(Into::into).collect(),
+                  }
+              }''',
+              '''    fn from_parts(
+                  queue: &PersonalWorkerQueueInput,
+                  cache_leases: &[PersonalWorkerDurableCacheLease],
+                  terminal_tombstones: &[PersonalWorkerTerminalTombstone],
+              ) -> Self {
+                  Self {
+                      queue: WireQueue::from(queue),
+                      cache_leases: cache_leases.iter().map(Into::into).collect(),
+                      terminal_tombstones: terminal_tombstones.iter().map(Into::into).collect(),
+                  }
+              }''',
+              "wire snapshot constructor",
+          )
+          store = replace_once(
+              store,
+              "    cache_leases: Vec<WireCacheLease>,\n    history: Vec<WireHistoryEntry>,",
+              "    cache_leases: Vec<WireCacheLease>,\n    #[serde(default, skip_serializing_if = \"Vec::is_empty\")]\n    terminal_tombstones: Vec<WireTerminalTombstone>,\n    history: Vec<WireHistoryEntry>,",
+              "wire document terminal field",
+          )
+          store = replace_once(
+              store,
+              "            cache_leases: value.cache_leases.iter().map(Into::into).collect(),\n            history: value.history.iter().map(Into::into).collect(),",
+              "            cache_leases: value.cache_leases.iter().map(Into::into).collect(),\n            terminal_tombstones: value.terminal_tombstones.iter().map(Into::into).collect(),\n            history: value.history.iter().map(Into::into).collect(),",
+              "wire document from",
+          )
+          store = replace_once(
+              store,
+              '''            value
+                  .cache_leases
+                  .into_iter()
+                  .map(TryInto::try_into)
+                  .collect::<Result<_, _>>()?,
+              value
+                  .history''',
+              '''            value
+                  .cache_leases
+                  .into_iter()
+                  .map(TryInto::try_into)
+                  .collect::<Result<_, _>>()?,
+              value
+                  .terminal_tombstones
+                  .into_iter()
+                  .map(TryInto::try_into)
+                  .collect::<Result<_, _>>()?,
+              value
+                  .history''',
+              "wire document tryfrom",
+          )
+          store = replace_once(
+              store,
+              "fn epoch(value: u64) -> Result<EpochMillis, PersonalWorkerStoreError> {",
+              "fn is_zero_u32(value: &u32) -> bool {\n    *value == 0\n}\n\nfn epoch(value: u64) -> Result<EpochMillis, PersonalWorkerStoreError> {",
+              "zero helper",
+          )
+          store_path.write_text(store)
+
+          transaction_path = Path("src/personal_worker_store_transaction.rs")
+          transaction = transaction_path.read_text()
+          transaction = replace_once(
+              transaction,
+              '''use crate::personal_worker_store::{
+              PersonalWorkerDurableCacheLease, PersonalWorkerStore, PersonalWorkerStoreDocument,
+              PersonalWorkerStoreError, PersonalWorkerStoreErrorKind, PersonalWorkerStoreRevision,
+              PersonalWorkerStoreWriteDisposition,
+          };''',
+              '''use crate::personal_worker_store::{
+              MAX_PERSONAL_WORKER_TERMINAL_TOMBSTONES, PersonalWorkerDurableCacheLease,
+              PersonalWorkerStore, PersonalWorkerStoreDocument, PersonalWorkerStoreError,
+              PersonalWorkerStoreErrorKind, PersonalWorkerStoreRevision,
+              PersonalWorkerStoreWriteDisposition, PersonalWorkerTerminalTombstone,
+          };''',
+              "transaction imports",
+          )
+          transaction = replace_once(
+              transaction,
+              "advance both counters exactly once and publish through the store's revision-checked CAS boundary.",
+              "advance both counters exactly once and publish through the store's revision-checked cooperative-writer boundary.",
+              "cooperative writer wording",
+          )
+          transaction = replace_once(
+              transaction,
+              '''    let MutationApplication::Applied {
+              mut queue,
+              leases,
+              observed_at,
+          } = application''',
+              '''    let MutationApplication::Applied {
+              mut queue,
+              leases,
+              terminal_tombstones,
+              observed_at,
+          } = application''',
+              "application destructure",
+          )
+          transaction = replace_once(
+              transaction,
+              "    let next = current.advance(queue, leases).map_err(|_| {",
+              "    let next = current\n        .advance_with_terminal_tombstones(queue, leases, terminal_tombstones)\n        .map_err(|_| {",
+              "advance with tombstones",
+          )
+          transaction = replace_once(
+              transaction,
+              '''    Applied {
+              queue: PersonalWorkerQueueInput,
+              leases: Vec<PersonalWorkerDurableCacheLease>,
+              observed_at: EpochMillis,
+          },''',
+              '''    Applied {
+              queue: PersonalWorkerQueueInput,
+              leases: Vec<PersonalWorkerDurableCacheLease>,
+              terminal_tombstones: Vec<PersonalWorkerTerminalTombstone>,
+              observed_at: EpochMillis,
+          },''',
+              "application terminal field",
+          )
+          transaction = replace_once(
+              transaction,
+              "    let mut leases = current.cache_leases().to_vec();\n    let observed_at = match mutation {",
+              "    let mut leases = current.cache_leases().to_vec();\n    let mut terminal_tombstones = current.terminal_tombstones().to_vec();\n    let observed_at = match mutation {",
+              "terminal local",
+          )
+          transaction = replace_once(
+              transaction,
+              '''        } => {
+              if let Some(existing) = queue
+                  .queued''',
+              '''        } => {
+              if terminal_tombstones.iter().any(|tombstone| {
+                  tombstone.request().identity.request_id == request.identity.request_id
+              }) {
+                  return Err(PersonalWorkerStoreMutationError::conflict(
+                      "personal worker request identity already has durable terminal evidence",
+                  ));
+              }
+              if let Some(existing) = queue
+                  .queued''',
+              "submit terminal conflict",
+          )
+          old_release = '''        PersonalWorkerStoreMutation::ReleaseCompletionAndCacheLease {
+              request_id,
+              terminal_admission,
+          } => {
+              if terminal_admission.state() != ExecutionAdmissionState::Unavailable {
+                  return Err(PersonalWorkerStoreMutationError::invalid(
+                      "release mutation requires terminal unavailable admission evidence",
+                  ));
+              }
+              let index = active_index(&queue, &request_id)
+                  .ok_or_else(PersonalWorkerStoreMutationError::not_found)?;
+              let transition = queue.active[index]
+                  .admission
+                  .plan_transition(terminal_admission)
+                  .map_err(|_| {
+                      PersonalWorkerStoreMutationError::invalid(
+                          "release mutation violates admission transition ordering",
+                      )
+                  })?;
+              let observed_at = transition.resulting_record().observed_at();
+              queue.active.remove(index);
+              let lease_index = leases
+                  .iter()
+                  .position(|lease| lease.request_id() == &request_id)
+                  .ok_or_else(|| {
+                      PersonalWorkerStoreMutationError::new(
+                          PersonalWorkerStoreMutationErrorKind::CorruptState,
+                          "active personal worker reservation is missing its durable cache lease",
+                      )
+                  })?;
+              leases.remove(lease_index);
+              observed_at
+          }'''
+          new_release = '''        PersonalWorkerStoreMutation::ReleaseCompletionAndCacheLease {
+              request_id,
+              terminal_admission,
+          } => {
+              if terminal_admission.state() != ExecutionAdmissionState::Unavailable {
+                  return Err(PersonalWorkerStoreMutationError::invalid(
+                      "release mutation requires terminal unavailable admission evidence",
+                  ));
+              }
+              if terminal_admission.identity().request_id != request_id {
+                  return Err(PersonalWorkerStoreMutationError::conflict(
+                      "release mutation request identity does not match terminal admission evidence",
+                  ));
+              }
+              let Some(index) = active_index(&queue, &request_id) else {
+                  if let Some(existing) = terminal_tombstones.iter().find(|tombstone| {
+                      tombstone.request().identity.request_id == request_id
+                  }) {
+                      return if existing.terminal_admission() == &terminal_admission {
+                          Ok(MutationApplication::Duplicate)
+                      } else {
+                          Err(PersonalWorkerStoreMutationError::conflict(
+                              "personal worker terminal identity is already bound to different evidence",
+                          ))
+                      };
+                  }
+                  return Err(PersonalWorkerStoreMutationError::not_found());
+              };
+              let active = queue.active[index].clone();
+              let transition = active
+                  .admission
+                  .plan_transition(terminal_admission)
+                  .map_err(|_| {
+                      PersonalWorkerStoreMutationError::invalid(
+                          "release mutation violates admission transition ordering",
+                      )
+                  })?;
+              let lease_index = leases
+                  .iter()
+                  .position(|lease| lease.request_id() == &request_id)
+                  .ok_or_else(|| {
+                      PersonalWorkerStoreMutationError::new(
+                          PersonalWorkerStoreMutationErrorKind::CorruptState,
+                          "active personal worker reservation is missing its durable cache lease",
+                      )
+                  })?;
+              let lease = leases[lease_index].clone();
+              let tombstone = PersonalWorkerTerminalTombstone::new(
+                  active.request,
+                  transition.resulting_record().clone(),
+                  active.started_at,
+                  lease,
+              )
+              .map_err(|_| {
+                  PersonalWorkerStoreMutationError::invalid(
+                      "release mutation does not produce valid durable terminal evidence",
+                  )
+              })?;
+              let observed_at = tombstone.completed_at();
+              queue.active.remove(index);
+              leases.remove(lease_index);
+              terminal_tombstones.push(tombstone);
+              if terminal_tombstones.len() > MAX_PERSONAL_WORKER_TERMINAL_TOMBSTONES {
+                  terminal_tombstones.remove(0);
+              }
+              observed_at
+          }'''
+          transaction = replace_once(
+              transaction,
+              old_release,
+              new_release,
+              "terminal release replay",
+          )
+          transaction = replace_once(
+              transaction,
+              '''    Ok(MutationApplication::Applied {
+              queue,
+              leases,
+              observed_at,
+          })''',
+              '''    Ok(MutationApplication::Applied {
+              queue,
+              leases,
+              terminal_tombstones,
+              observed_at,
+          })''',
+              "application return",
+          )
+          transaction_path.write_text(transaction)
+          PY
+
+          cat > tests/personal_worker_terminal_replay.rs <<'RS'
+          #![cfg(unix)]
+
+          use std::fs::{self, Permissions};
+          use std::os::unix::fs::PermissionsExt;
+          use std::path::{Path, PathBuf};
+          use std::sync::atomic::{AtomicU64, Ordering};
+
+          use smolrunner::artifact::{CommitId, GitTreeId, RepositoryRef, Sha256Digest};
+          use smolrunner::execution_admission::{
+              DrainAcknowledgement, EpochMillis, ExecutionAdmissionIdentity, ExecutionAdmissionInput,
+              ExecutionAdmissionRecord, ExecutionAdmissionState, ExecutionRequestId,
+              ExecutionResourceLimits, FallbackProfileEligibility, HostCapacityObservation,
+              ReservationEvidence, ReservationGeneration, ReservationId, RunnerProfileId,
+              UnavailableReason,
+          };
+          use smolrunner::personal_worker_queue::{
+              PersonalWorkerActiveReservation, PersonalWorkerCacheAccessMode,
+              PersonalWorkerCacheNamespace, PersonalWorkerCancellationState,
+              PersonalWorkerJobRequest, PersonalWorkerPriority, PersonalWorkerProfile,
+              PersonalWorkerQueueGeneration, PersonalWorkerQueueInput, PersonalWorkerSourceIdentity,
+          };
+          use smolrunner::personal_worker_store::{
+              MAX_PERSONAL_WORKER_TERMINAL_TOMBSTONES, PersonalWorkerDurableCacheLease,
+              PersonalWorkerStore, PersonalWorkerStoreDocument, PersonalWorkerStoreError,
+              PersonalWorkerStoreErrorKind, PersonalWorkerStoreRecovery,
+              PersonalWorkerStoreRecoveryDisposition, PersonalWorkerStoreRevision,
+              PersonalWorkerStoreWriteDisposition, PersonalWorkerStoreWriteReceipt,
+              PersonalWorkerTerminalTombstone, decode_personal_worker_store_document,
+              encode_personal_worker_store_document,
+          };
+          use smolrunner::personal_worker_store_transaction::{
+              PersonalWorkerStoreMutation, PersonalWorkerStoreMutationDisposition,
+              PersonalWorkerStoreMutationErrorKind, apply_personal_worker_store_mutation,
+          };
+          use smolrunner::unix_personal_worker_store::UnixPersonalWorkerStore;
+          use smolrunner::verification_profile::{CacheId, VerificationProfileId};
+
+          const GIB: u64 = 1_024 * 1_024 * 1_024;
+          const BASE: u64 = 10_000_000;
+          static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
+
+          #[derive(Default)]
+          struct MemoryStore {
+              current: Option<PersonalWorkerStoreDocument>,
+              staged: Option<PersonalWorkerStoreDocument>,
+          }
+
+          impl MemoryStore {
+              fn with_current(current: PersonalWorkerStoreDocument) -> Self {
+                  Self {
+                      current: Some(current),
+                      staged: None,
+                  }
+              }
+          }
+
+          impl PersonalWorkerStore for MemoryStore {
+              fn load(&self) -> Result<Option<PersonalWorkerStoreDocument>, PersonalWorkerStoreError> {
+                  Ok(self.current.clone())
+              }
+
+              fn create(
+                  &mut self,
+                  document: &PersonalWorkerStoreDocument,
+              ) -> Result<PersonalWorkerStoreWriteReceipt, PersonalWorkerStoreError> {
+                  if self.current.is_some() {
+                      return Err(PersonalWorkerStoreError::new(
+                          PersonalWorkerStoreErrorKind::RevisionConflict,
+                          "state already exists",
+                      ));
+                  }
+                  self.current = Some(document.clone());
+                  Ok(PersonalWorkerStoreWriteReceipt::new(
+                      PersonalWorkerStoreWriteDisposition::Created,
+                      document.revision(),
+                      1,
+                  ))
+              }
+
+              fn replace_if_revision(
+                  &mut self,
+                  expected_revision: PersonalWorkerStoreRevision,
+                  document: &PersonalWorkerStoreDocument,
+              ) -> Result<PersonalWorkerStoreWriteReceipt, PersonalWorkerStoreError> {
+                  let current = self.current.as_ref().ok_or_else(|| {
+                      PersonalWorkerStoreError::new(PersonalWorkerStoreErrorKind::Missing, "missing")
+                  })?;
+                  if current.revision() != expected_revision {
+                      return Err(PersonalWorkerStoreError::new(
+                          PersonalWorkerStoreErrorKind::RevisionConflict,
+                          "stale",
+                      ));
+                  }
+                  document.validate_successor_of(current)?;
+                  self.current = Some(document.clone());
+                  Ok(PersonalWorkerStoreWriteReceipt::new(
+                      PersonalWorkerStoreWriteDisposition::Replaced,
+                      document.revision(),
+                      1,
+                  ))
+              }
+
+              fn recover(&mut self) -> Result<PersonalWorkerStoreRecovery, PersonalWorkerStoreError> {
+                  if let Some(staged) = self.staged.take() {
+                      if let Some(current) = &self.current {
+                          staged.validate_successor_of(current)?;
+                      }
+                      let revision = staged.revision();
+                      self.current = Some(staged);
+                      return Ok(PersonalWorkerStoreRecovery::new(
+                          PersonalWorkerStoreRecoveryDisposition::PublishedStaged,
+                          Some(revision),
+                      ));
+                  }
+                  Ok(PersonalWorkerStoreRecovery::new(
+                      PersonalWorkerStoreRecoveryDisposition::Clean,
+                      self.current.as_ref().map(PersonalWorkerStoreDocument::revision),
+                  ))
+              }
+          }
+
+          struct TempRoot(PathBuf);
+
+          impl TempRoot {
+              fn new(label: &str) -> Self {
+                  let sequence = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
+                  let path = std::env::temp_dir().join(format!(
+                      "smolrunner-terminal-replay-{label}-{}-{sequence}",
+                      std::process::id()
+                  ));
+                  fs::create_dir(&path).expect("create root");
+                  fs::set_permissions(&path, Permissions::from_mode(0o750)).expect("set root mode");
+                  Self(path)
+              }
+
+              fn path(&self) -> &Path {
+                  &self.0
+              }
+
+              fn store_directory(&self) -> PathBuf {
+                  self.0.join("personal-worker")
+              }
+          }
+
+          impl Drop for TempRoot {
+              fn drop(&mut self) {
+                  let _ = fs::remove_dir_all(&self.0);
+              }
+          }
+
+          fn time(value: u64) -> EpochMillis {
+              EpochMillis::new(value).expect("time")
+          }
+
+          fn limits() -> ExecutionResourceLimits {
+              ExecutionResourceLimits::new(2_000, 2 * GIB, 2_048).expect("limits")
+          }
+
+          fn request(id: &str, submitted_at: u64) -> PersonalWorkerJobRequest {
+              PersonalWorkerJobRequest {
+                  identity: ExecutionAdmissionIdentity::new(
+                      ExecutionRequestId::parse(id).expect("request ID"),
+                      VerificationProfileId::parse("smolrunner.required")
+                          .expect("verification profile"),
+                      RunnerProfileId::parse("personal-lima-work").expect("runner profile"),
+                  ),
+                  source: PersonalWorkerSourceIdentity::new(
+                      RepositoryRef::parse("example/project").expect("repository"),
+                      CommitId::parse(&"a".repeat(40)).expect("commit"),
+                      GitTreeId::parse(&"b".repeat(40)).expect("tree"),
+                  ),
+                  priority: PersonalWorkerPriority::Normal,
+                  requested_limits: limits(),
+                  cache_namespace: PersonalWorkerCacheNamespace::RepositoryBuild {
+                      cache_id: CacheId::parse("build-cache").expect("cache ID"),
+                      repository: RepositoryRef::parse("example/project")
+                          .expect("cache repository"),
+                      namespace_digest: Sha256Digest::parse(&format!(
+                          "sha256:{}",
+                          "ab".repeat(32)
+                      ))
+                      .expect("namespace digest"),
+                  },
+                  cache_access: PersonalWorkerCacheAccessMode::Write,
+                  submitted_at: time(submitted_at),
+                  operator_deadline: None,
+                  cancellation: PersonalWorkerCancellationState::Active,
+                  fallback_eligibility: FallbackProfileEligibility::ineligible(),
+              }
+          }
+
+          fn reservation(id: &str, reserved_at: u64) -> ReservationEvidence {
+              ReservationEvidence::new(
+                  ReservationId::parse(&format!("reservation-{id}")).expect("reservation ID"),
+                  ReservationGeneration::new(1).expect("reservation generation"),
+                  time(reserved_at),
+                  time(reserved_at + 100_000),
+              )
+          }
+
+          fn admission(
+              request: &PersonalWorkerJobRequest,
+              reservation: &ReservationEvidence,
+              state: ExecutionAdmissionState,
+              observed_at: u64,
+              acknowledgement: Option<DrainAcknowledgement>,
+              unavailable_reason: Option<UnavailableReason>,
+          ) -> ExecutionAdmissionRecord {
+              ExecutionAdmissionRecord::from_input(ExecutionAdmissionInput {
+                  identity: request.identity.clone(),
+                  state,
+                  observed_at: time(observed_at),
+                  requested_limits: request.requested_limits,
+                  host_capacity: Some(HostCapacityObservation::new(
+                      reservation.reserved_at,
+                      ExecutionResourceLimits::new(8_000, 10 * GIB, 8_192)
+                          .expect("host limits"),
+                  )),
+                  applied_limits: Some(request.requested_limits),
+                  queue_position: None,
+                  reservation: Some(reservation.clone()),
+                  acknowledgement,
+                  fallback_eligibility: request.fallback_eligibility.clone(),
+                  unavailable_reason,
+              })
+              .expect("admission")
+          }
+
+          fn lease(
+              request: &PersonalWorkerJobRequest,
+              reservation: &ReservationEvidence,
+          ) -> PersonalWorkerDurableCacheLease {
+              PersonalWorkerDurableCacheLease::new(
+                  request.identity.request_id.clone(),
+                  request.cache_namespace.clone(),
+                  request.cache_access,
+                  reservation.id.clone(),
+                  reservation.generation,
+                  reservation.reserved_at,
+              )
+          }
+
+          fn terminal_tombstone(
+              id: &str,
+              base: u64,
+          ) -> (
+              PersonalWorkerTerminalTombstone,
+              ExecutionAdmissionRecord,
+              ExecutionRequestId,
+          ) {
+              let request = request(id, base);
+              let reservation = reservation(id, base + 20);
+              let cache_lease = lease(&request, &reservation);
+              let terminal = admission(
+                  &request,
+                  &reservation,
+                  ExecutionAdmissionState::Unavailable,
+                  base + 70,
+                  Some(DrainAcknowledgement::Drain),
+                  Some(UnavailableReason::Drained),
+              );
+              let request_id = request.identity.request_id.clone();
+              let tombstone = PersonalWorkerTerminalTombstone::new(
+                  request,
+                  terminal.clone(),
+                  Some(time(base + 40)),
+                  cache_lease,
+              )
+              .expect("terminal tombstone");
+              (tombstone, terminal, request_id)
+          }
+
+          fn active_document(
+              id: &str,
+              base: u64,
+              terminal_tombstones: Vec<PersonalWorkerTerminalTombstone>,
+          ) -> (
+              PersonalWorkerStoreDocument,
+              PersonalWorkerJobRequest,
+              ReservationEvidence,
+              ExecutionAdmissionRecord,
+          ) {
+              let request = request(id, base);
+              let reservation = reservation(id, base + 20);
+              let cache_lease = lease(&request, &reservation);
+              let draining = admission(
+                  &request,
+                  &reservation,
+                  ExecutionAdmissionState::Draining,
+                  base + 60,
+                  Some(DrainAcknowledgement::Drain),
+                  None,
+              );
+              let terminal = admission(
+                  &request,
+                  &reservation,
+                  ExecutionAdmissionState::Unavailable,
+                  base + 70,
+                  Some(DrainAcknowledgement::Drain),
+                  Some(UnavailableReason::Drained),
+              );
+              let queue = PersonalWorkerQueueInput {
+                  generation: PersonalWorkerQueueGeneration::new(1).expect("generation"),
+                  observed_at: time(base + 60),
+                  current_profile: PersonalWorkerProfile::Work,
+                  last_activity_at: time(base + 60),
+                  queued: vec![],
+                  active: vec![PersonalWorkerActiveReservation {
+                      request: request.clone(),
+                      admission: draining,
+                      started_at: Some(time(base + 40)),
+                  }],
+                  pending_profile_change: None,
+              };
+              let document = PersonalWorkerStoreDocument::new_with_terminal_tombstones(
+                  queue,
+                  vec![cache_lease],
+                  terminal_tombstones,
+              )
+              .expect("active document");
+              (document, request, reservation, terminal)
+          }
+
+          #[test]
+          fn exact_terminal_replay_is_duplicate_and_conflicting_evidence_fails_closed() {
+              let (document, request, reservation, terminal) =
+                  active_document("job-one", BASE, vec![]);
+              let mut store = MemoryStore::with_current(document);
+              let applied = apply_personal_worker_store_mutation(
+                  &mut store,
+                  PersonalWorkerStoreRevision::new(1).expect("revision"),
+                  PersonalWorkerQueueGeneration::new(1).expect("generation"),
+                  PersonalWorkerStoreMutation::ReleaseCompletionAndCacheLease {
+                      request_id: request.identity.request_id.clone(),
+                      terminal_admission: terminal.clone(),
+                  },
+              )
+              .expect("release");
+              assert_eq!(
+                  applied.disposition(),
+                  PersonalWorkerStoreMutationDisposition::Applied
+              );
+              let current = store.current.clone().expect("current");
+              assert!(current.queue().active.is_empty());
+              assert!(current.cache_leases().is_empty());
+              assert_eq!(current.terminal_tombstones().len(), 1);
+
+              let duplicate = apply_personal_worker_store_mutation(
+                  &mut store,
+                  applied.new_revision(),
+                  applied.new_queue_generation(),
+                  PersonalWorkerStoreMutation::ReleaseCompletionAndCacheLease {
+                      request_id: request.identity.request_id.clone(),
+                      terminal_admission: terminal,
+                  },
+              )
+              .expect("duplicate terminal replay");
+              assert_eq!(
+                  duplicate.disposition(),
+                  PersonalWorkerStoreMutationDisposition::Duplicate
+              );
+              assert_eq!(duplicate.old_revision(), duplicate.new_revision());
+              assert_eq!(
+                  duplicate.old_queue_generation(),
+                  duplicate.new_queue_generation()
+              );
+
+              let conflicting = admission(
+                  &request,
+                  &reservation,
+                  ExecutionAdmissionState::Unavailable,
+                  BASE + 80,
+                  None,
+                  Some(UnavailableReason::HostUnavailable),
+              );
+              let error = apply_personal_worker_store_mutation(
+                  &mut store,
+                  duplicate.new_revision(),
+                  duplicate.new_queue_generation(),
+                  PersonalWorkerStoreMutation::ReleaseCompletionAndCacheLease {
+                      request_id: request.identity.request_id,
+                      terminal_admission: conflicting,
+                  },
+              )
+              .expect_err("conflicting terminal replay");
+              assert_eq!(error.kind(), PersonalWorkerStoreMutationErrorKind::Conflict);
+          }
+
+          #[test]
+          fn terminal_tombstone_wire_is_canonical_and_digest_bound() {
+              let (tombstone, _, _) = terminal_tombstone("wire-job", BASE);
+              let queue = PersonalWorkerQueueInput {
+                  generation: PersonalWorkerQueueGeneration::new(1).expect("generation"),
+                  observed_at: time(BASE + 100),
+                  current_profile: PersonalWorkerProfile::Interactive,
+                  last_activity_at: time(BASE + 90),
+                  queued: vec![],
+                  active: vec![],
+                  pending_profile_change: None,
+              };
+              let document = PersonalWorkerStoreDocument::new_with_terminal_tombstones(
+                  queue,
+                  vec![],
+                  vec![tombstone],
+              )
+              .expect("terminal document");
+              let encoded = encode_personal_worker_store_document(&document).expect("encode");
+              assert_eq!(
+                  decode_personal_worker_store_document(&encoded).expect("decode"),
+                  document
+              );
+
+              let mut altered: serde_json::Value =
+                  serde_json::from_slice(&encoded).expect("parse document");
+              altered["terminal_tombstones"][0]["evidence_digest"] =
+                  serde_json::Value::String(format!("sha256:{}", "00".repeat(32)));
+              let mut bytes = serde_json::to_vec_pretty(&altered).expect("encode altered");
+              bytes.push(b'\n');
+              let error = decode_personal_worker_store_document(&bytes)
+                  .expect_err("digest mismatch must fail closed");
+              assert_eq!(error.kind(), PersonalWorkerStoreErrorKind::CorruptState);
+          }
+
+          #[test]
+          fn bounded_eviction_makes_old_terminal_replay_unprovable() {
+              let mut tombstones = Vec::new();
+              let mut oldest = None;
+              for index in 0..MAX_PERSONAL_WORKER_TERMINAL_TOMBSTONES {
+                  let id = format!("old-job-{index:02}");
+                  let evidence = terminal_tombstone(&id, BASE + index as u64 * 1_000);
+                  if index == 0 {
+                      oldest = Some((evidence.1.clone(), evidence.2.clone()));
+                  }
+                  tombstones.push(evidence.0);
+              }
+              let base = BASE + 100_000;
+              let (document, request, _, terminal) =
+                  active_document("new-job", base, tombstones);
+              let mut store = MemoryStore::with_current(document);
+              let applied = apply_personal_worker_store_mutation(
+                  &mut store,
+                  PersonalWorkerStoreRevision::new(1).expect("revision"),
+                  PersonalWorkerQueueGeneration::new(1).expect("generation"),
+                  PersonalWorkerStoreMutation::ReleaseCompletionAndCacheLease {
+                      request_id: request.identity.request_id.clone(),
+                      terminal_admission: terminal.clone(),
+                  },
+              )
+              .expect("release with eviction");
+              let current = store.current.clone().expect("current");
+              assert_eq!(
+                  current.terminal_tombstones().len(),
+                  MAX_PERSONAL_WORKER_TERMINAL_TOMBSTONES
+              );
+              let (oldest_terminal, oldest_request_id) = oldest.expect("oldest evidence");
+              assert!(current.terminal_tombstones().iter().all(|entry| {
+                  entry.request().identity.request_id != oldest_request_id
+              }));
+
+              let error = apply_personal_worker_store_mutation(
+                  &mut store,
+                  applied.new_revision(),
+                  applied.new_queue_generation(),
+                  PersonalWorkerStoreMutation::ReleaseCompletionAndCacheLease {
+                      request_id: oldest_request_id,
+                      terminal_admission: oldest_terminal,
+                  },
+              )
+              .expect_err("evicted replay is unprovable");
+              assert_eq!(error.kind(), PersonalWorkerStoreMutationErrorKind::NotFound);
+
+              let duplicate = apply_personal_worker_store_mutation(
+                  &mut store,
+                  applied.new_revision(),
+                  applied.new_queue_generation(),
+                  PersonalWorkerStoreMutation::ReleaseCompletionAndCacheLease {
+                      request_id: request.identity.request_id,
+                      terminal_admission: terminal,
+                  },
+              )
+              .expect("retained replay");
+              assert_eq!(
+                  duplicate.disposition(),
+                  PersonalWorkerStoreMutationDisposition::Duplicate
+              );
+          }
+
+          #[test]
+          fn unix_staged_recovery_preserves_exact_terminal_replay_authority() {
+              let (initial, request, _, terminal) = active_document("unix-job", BASE, vec![]);
+              let mut memory = MemoryStore::with_current(initial.clone());
+              let applied = apply_personal_worker_store_mutation(
+                  &mut memory,
+                  initial.revision(),
+                  initial.queue().generation,
+                  PersonalWorkerStoreMutation::ReleaseCompletionAndCacheLease {
+                      request_id: request.identity.request_id.clone(),
+                      terminal_admission: terminal.clone(),
+                  },
+              )
+              .expect("build staged successor");
+              let staged = memory.current.clone().expect("staged document");
+
+              let root = TempRoot::new("staged");
+              let (mut store, _) =
+                  UnixPersonalWorkerStore::open_or_create(root.path()).expect("open store");
+              store.create(&initial).expect("create initial");
+              drop(store);
+
+              let staged_path = root.store_directory().join(".next.json");
+              fs::write(
+                  &staged_path,
+                  encode_personal_worker_store_document(&staged).expect("encode staged"),
+              )
+              .expect("write staged");
+              fs::set_permissions(&staged_path, Permissions::from_mode(0o600))
+                  .expect("set staged mode");
+
+              let (mut recovered, recovery) =
+                  UnixPersonalWorkerStore::open_or_create(root.path()).expect("recover staged");
+              assert_eq!(
+                  recovery.disposition(),
+                  PersonalWorkerStoreRecoveryDisposition::PublishedStaged
+              );
+              assert_eq!(recovered.load().expect("load recovered"), Some(staged));
+
+              let duplicate = apply_personal_worker_store_mutation(
+                  &mut recovered,
+                  applied.new_revision(),
+                  applied.new_queue_generation(),
+                  PersonalWorkerStoreMutation::ReleaseCompletionAndCacheLease {
+                      request_id: request.identity.request_id,
+                      terminal_admission: terminal,
+                  },
+              )
+              .expect("replay after recovery");
+              assert_eq!(
+                  duplicate.disposition(),
+                  PersonalWorkerStoreMutationDisposition::Duplicate
+              );
+          }
+          RS
+
+          cargo fmt --all
+      - name: Run split checks
+        shell: bash
+        run: |
+          set +e
+          cargo fmt --all -- --check > format.log 2>&1
+          format_status=$?
+          cargo check --locked --all-targets --all-features > check.log 2>&1
+          check_status=$?
+          cargo clippy --locked --all-targets --all-features -- -D warnings > clippy.log 2>&1
+          clippy_status=$?
+          cargo test --locked --all-targets --all-features > test.log 2>&1
+          test_status=$?
+          printf 'format=%s\ncheck=%s\nclippy=%s\ntest=%s\n' \
+            "$format_status" "$check_status" "$clippy_status" "$test_status" > status.txt
+          test "$format_status" -eq 0 \
+            -a "$check_status" -eq 0 \
+            -a "$clippy_status" -eq 0 \
+            -a "$test_status" -eq 0
+      - name: Upload repair sources and diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: agent6-terminal-replay-repair-diagnostic
+          path: |
+            src/personal_worker_store.rs
+            src/personal_worker_store_transaction.rs
+            tests/personal_worker_terminal_replay.rs
+            format.log
+            check.log
+            clippy.log
+            test.log
+            status.txt
+          if-no-files-found: error
+          retention-days: 1
