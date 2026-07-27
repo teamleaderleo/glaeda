@@ -17,15 +17,19 @@ jobs:
         with:
           ref: ${{ github.head_ref }}
           show-progress: false
-      - name: Produce rustfmt patch
+      - name: Produce rustfmt output
         run: |
           cargo fmt --all
           git diff --binary -- . ':(exclude).github/workflows/agent6-format-diagnostic.yml' > rustfmt.patch
           test -s rustfmt.patch
-      - name: Upload rustfmt patch
+      - name: Upload rustfmt output
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: agent6-rustfmt-patch
-          path: rustfmt.patch
+          name: agent6-rustfmt-output
+          path: |
+            rustfmt.patch
+            src/personal_worker_store.rs
+            src/unix_personal_worker_store.rs
+            tests/personal_worker_store_contract.rs
           if-no-files-found: error
           retention-days: 1
