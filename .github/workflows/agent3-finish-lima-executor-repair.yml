@@ -1,0 +1,180 @@
+name: Agent 3 finish Lima executor repair
+
+on:
+  pull_request:
+    types: [synchronize]
+
+permissions:
+  contents: write
+  pull-requests: read
+
+jobs:
+  finish:
+    if: github.event.pull_request.number == 206 && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out exact repair branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+          show-progress: false
+      - name: Patch tests and export, then verify
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          tests_path = Path('src/lima_lifecycle_executor/tests.rs')
+          tests = tests_path.read_text(encoding='utf-8')
+          assert tests.count('use std::sync::Mutex;') == 1
+          tests = tests.replace('use std::sync::Mutex;', 'use std::sync::{Mutex, OnceLock};')
+          lines = tests.splitlines()
+
+          accepted_index = next(i for i, line in enumerate(lines) if line.startswith('fn accepted('))
+          policy_block = [
+              "fn lifecycle_policy() -> &'static LimaLifecyclePolicy {",
+              '    static POLICY: OnceLock<LimaLifecyclePolicy> = OnceLock::new();',
+              '    POLICY.get_or_init(|| LimaLifecyclePolicy::new(300_000).expect("lifecycle policy"))',
+              '}',
+              '',
+          ]
+          lines[accepted_index:accepted_index] = policy_block
+
+          input_index = next(i for i, line in enumerate(lines) if line == '    LimaLifecycleExecutionInput {')
+          assert lines[input_index + 1].strip() == 'accepted,'
+          lines[input_index + 2:input_index + 2] = [
+              '        current_broker_state_revision: accepted.state_revision,',
+              '        current_queue_generation: accepted.queue_generation,',
+              '        lifecycle_policy: lifecycle_policy(),',
+          ]
+
+          marker = next(i for i, line in enumerate(lines) if line == 'fn command_identity_output_and_status_fail_closed() {')
+          assert lines[marker - 1] == '#[test]'
+          insert_at = marker - 1
+          new_tests = '''#[test]
+          fn durable_revision_and_queue_generation_drift_refuse_before_mutation() {
+              let persistent = persistent_identity('b');
+              let lifecycle = lifecycle(
+                  LimaLifecycleState::Stopped,
+                  LimaResourceProfile::Interactive,
+                  1,
+                  false,
+              );
+              let current = report(
+                  LimaRuntimeState::Stopped,
+                  LimaResourceProfile::Interactive,
+                  None,
+              );
+              let action = accepted(HostBrokerAction::Start {
+                  identity: lifecycle.identity().clone(),
+                  profile: LimaResourceProfile::Interactive,
+                  profile_generation: generation(1),
+              });
+              let request = request();
+              let observations = ScriptedObservationSource::new(Vec::new());
+              let commands = ScriptedExecutor::new(ExecutorMode::Match);
+
+              let mut revision_input = input(&action, &lifecycle, &current, &persistent, &request);
+              revision_input.current_broker_state_revision =
+                  HostBrokerStateRevision::new(8).expect("drifted revision");
+              let error = executor()
+                  .execute(
+                      revision_input,
+                      &observations,
+                      &commands,
+                      &FixedClock(100),
+                  )
+                  .expect_err("revision drift refusal");
+              assert_eq!(
+                  error.code,
+                  LimaLifecycleExecutionRefusalCode::StateRevisionMismatch
+              );
+              assert!(commands.calls().is_empty());
+
+              let mut generation_input = input(&action, &lifecycle, &current, &persistent, &request);
+              generation_input.current_queue_generation =
+                  PersonalWorkerQueueGeneration::new(12).expect("drifted generation");
+              let error = executor()
+                  .execute(
+                      generation_input,
+                      &observations,
+                      &commands,
+                      &FixedClock(100),
+                  )
+                  .expect_err("queue generation drift refusal");
+              assert_eq!(
+                  error.code,
+                  LimaLifecycleExecutionRefusalCode::QueueGenerationMismatch
+              );
+              assert!(commands.calls().is_empty());
+          }
+
+          #[test]
+          fn stale_lifecycle_observation_refuses_inside_action_window() {
+              let persistent = persistent_identity('b');
+              let lifecycle = lifecycle(
+                  LimaLifecycleState::Stopped,
+                  LimaResourceProfile::Interactive,
+                  1,
+                  false,
+              );
+              let current = report(
+                  LimaRuntimeState::Stopped,
+                  LimaResourceProfile::Interactive,
+                  None,
+              );
+              let action = accepted(HostBrokerAction::Start {
+                  identity: lifecycle.identity().clone(),
+                  profile: LimaResourceProfile::Interactive,
+                  profile_generation: generation(1),
+              });
+              let request = request();
+              let observations = ScriptedObservationSource::new(Vec::new());
+              let commands = ScriptedExecutor::new(ExecutorMode::Match);
+              let short_policy = LimaLifecyclePolicy::new(5_000).expect("short policy");
+              let mut execution_input = input(&action, &lifecycle, &current, &persistent, &request);
+              execution_input.lifecycle_policy = &short_policy;
+
+              let error = executor()
+                  .execute(
+                      execution_input,
+                      &observations,
+                      &commands,
+                      &FixedClock(106),
+                  )
+                  .expect_err("stale lifecycle refusal");
+              assert_eq!(
+                  error.code,
+                  LimaLifecycleExecutionRefusalCode::StaleObservation
+              );
+              assert!(commands.calls().is_empty());
+          }
+
+          '''.splitlines()
+          lines[insert_at:insert_at] = new_tests
+          tests_path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+
+          lib_path = Path('src/lib.rs')
+          lib_lines = lib_path.read_text(encoding='utf-8').splitlines()
+          lifecycle_index = lib_lines.index('pub mod lima_lifecycle;')
+          lib_lines[lifecycle_index + 1:lifecycle_index + 1] = [
+              '/// Execute only accepted, revision-bound Lima lifecycle actions with exact verification.',
+              'pub mod lima_lifecycle_executor;',
+          ]
+          lib_path.write_text('\n'.join(lib_lines) + '\n', encoding='utf-8')
+          PY
+          cargo fmt --all
+          cargo test --all-targets --all-features lima_lifecycle_executor
+          cargo clippy --all-targets --all-features -- -D warnings
+          cargo test --all-targets --all-features
+      - name: Commit clean source-only repair
+        run: |
+          git config user.name "Agent 3"
+          git config user.email "agent3@users.noreply.github.com"
+          git rm .github/workflows/agent3-finish-lima-executor-repair.yml
+          git rm .agent3-executor-repair.log
+          git add src/lib.rs src/lima_lifecycle_executor.rs src/lima_lifecycle_executor/tests.rs
+          git diff --cached --check
+          git commit -m "Complete revision-bound Lima lifecycle executor"
+          git push origin HEAD:${{ github.event.pull_request.head.ref }}
