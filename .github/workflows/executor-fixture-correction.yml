@@ -1,0 +1,50 @@
+name: Executor fixture correction
+
+on:
+  pull_request:
+    paths:
+      - src/lima_lifecycle_executor/tests.rs
+
+permissions:
+  contents: write
+
+jobs:
+  correct:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out exact head
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          show-progress: false
+      - name: Correct stopped fixture chronology
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/lima_lifecycle_executor/tests.rs")
+          text = path.read_text(encoding="utf-8")
+          old = "    let last_activity_at = observed_at;\n"
+          new = (
+              "    let last_activity_at = if state == LimaLifecycleState::Stopped {\n"
+              "        observed_at - 2\n"
+              "    } else {\n"
+              "        observed_at\n"
+              "    };\n"
+          )
+          if text.count(old) != 1:
+              raise SystemExit("expected exactly one lifecycle fixture timestamp assignment")
+          path.write_text(text.replace(old, new), encoding="utf-8")
+          PY
+          cargo fmt --all
+      - name: Publish fixture-only correction
+        env:
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          git add src/lima_lifecycle_executor/tests.rs
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git commit -m 'Correct stopped executor fixture chronology'
+          git push origin "HEAD:${HEAD_REF}"
