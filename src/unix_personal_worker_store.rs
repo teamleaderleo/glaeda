@@ -43,7 +43,7 @@ const STAGED_DOCUMENT: &str = ".next.json";
 
 #[derive(Debug)]
 pub struct UnixPersonalWorkerStore {
-    root: OwnedFd,
+    _root: OwnedFd,
     directory: OwnedFd,
     owner: (u32, u32),
 }
@@ -59,7 +59,7 @@ impl UnixPersonalWorkerStore {
         let directory = ensure_store_directory(&root, owner)?;
         ensure_lock_file(&directory, owner)?;
         let mut store = Self {
-            root,
+            _root: root,
             directory,
             owner,
         };
