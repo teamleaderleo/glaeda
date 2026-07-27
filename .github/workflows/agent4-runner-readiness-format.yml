@@ -1,0 +1,56 @@
+name: Agent 4 runner readiness read-only replay
+
+on:
+  pull_request:
+    branches:
+      - feat/issue-171-lima-observation
+    paths:
+      - .github/workflows/agent4-runner-readiness-format.yml
+      - src/actions_runner_readiness.rs
+      - src/actions_runner_readiness/tests.rs
+      - src/lib.rs
+
+permissions:
+  contents: read
+
+jobs:
+  replay:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Check out stacked branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: feat/issue-187-actions-runner-readiness-observation
+          show-progress: false
+      - name: Format and verify product source
+        id: verify
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo fmt --all
+          {
+            cargo fmt --all -- --check
+            cargo clippy --locked --all-targets --all-features -- -D warnings
+            cargo test --locked --all-targets --all-features
+          } 2>&1 | tee /tmp/agent4-runner-readiness.log
+      - name: Package formatted source and diagnostics
+        if: always()
+        run: |
+          tar -czf /tmp/agent4-runner-readiness.tar.gz \
+            src/actions_runner_readiness.rs \
+            src/actions_runner_readiness/tests.rs \
+            src/lib.rs \
+            -C /tmp agent4-runner-readiness.log
+      - name: Upload formatted source and diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: agent4-runner-readiness-formatted
+          path: /tmp/agent4-runner-readiness.tar.gz
+          retention-days: 1
+          if-no-files-found: error
+      - name: Preserve verification result
+        if: steps.verify.outcome != 'success'
+        run: exit 1
