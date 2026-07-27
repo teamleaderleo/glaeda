@@ -80,6 +80,7 @@ pub mod ownership;
 /// Pure composition of durable queue, Lima lifecycle, and runner-readiness evidence.
 pub mod personal_worker_host_broker;
 pub mod personal_worker_queue;
+pub mod personal_worker_store;
 pub mod plan;
 pub mod podman_preview;
 pub mod podman_preview_execution;
@@ -121,6 +122,8 @@ pub mod subordinate_id;
 /// Descriptor-relative trusted producer for runner workspace and cache identity receipts.
 #[cfg(target_os = "linux")]
 pub mod trusted_workspace_receipt;
+#[cfg(unix)]
+pub mod unix_personal_worker_store;
 pub mod verification_profile;
 pub mod verification_profile_preflight_adapter;
 pub mod verification_profile_registry;
