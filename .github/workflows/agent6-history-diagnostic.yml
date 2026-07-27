@@ -1,0 +1,53 @@
+name: Agent 6 durable history diagnostic
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out exact branch head
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.head_ref }}
+          show-progress: false
+      - name: Apply embedded reviewed patch
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          from textwrap import dedent
+          workflow = Path('.github/workflows/agent6-history-review.yml').read_text()
+          marker = "          python3 - <<'PY'\n"
+          body = workflow.split(marker, 1)[1].split("\n          PY", 1)[0]
+          exec(compile(dedent(body), 'agent6-history-review', 'exec'))
+          PY
+          cargo fmt --all
+      - name: Capture split verification
+        run: |
+          set +e
+          cargo check --locked --all-targets --all-features > check.log 2>&1
+          printf '%s\n' "$?" > check.status
+          cargo clippy --locked --all-targets --all-features -- -D warnings > clippy.log 2>&1
+          printf '%s\n' "$?" > clippy.status
+          cargo test --locked --all-targets --all-features > test.log 2>&1
+          printf '%s\n' "$?" > test.status
+          exit 0
+      - name: Upload split diagnostics
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: agent6-history-diagnostic
+          path: |
+            check.log
+            check.status
+            clippy.log
+            clippy.status
+            test.log
+            test.status
+          if-no-files-found: error
+          retention-days: 1
