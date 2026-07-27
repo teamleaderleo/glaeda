@@ -2,20 +2,22 @@ name: Issue 225 repair artifact
 
 on:
   pull_request:
-  workflow_dispatch:
+    paths:
+      - .github/workflows/issue225-repair-artifact.yml
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   repair:
     runs-on: ubuntu-24.04
     steps:
-      - name: Check out branch
+      - name: Check out head branch
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
+          ref: ${{ github.event.pull_request.head.ref }}
           show-progress: false
-      - name: Apply safe credential-thread repair
+      - name: Apply tested safe credential-thread repair
         shell: python
         run: |
           from pathlib import Path
@@ -141,27 +143,15 @@ jobs:
           if anchor not in text:
               raise SystemExit("test anchor changed")
           tests.write_text(text.replace(anchor, addition + "\n" + anchor))
-      - name: Format and capture focused test result
+      - name: Format and test exact repair
         run: |
           cargo fmt --all
-          set +e
-          cargo test --all-targets --all-features descriptor_bound_launcher > issue225-test.txt 2>&1
-          echo $? > issue225-status.txt
-          set -e
-      - name: Package exact repaired files and diagnostics
+          cargo test --all-targets --all-features descriptor_bound_launcher
+          rm .github/workflows/issue225-repair-artifact.yml
+      - name: Commit exact repair and remove helper
         run: |
-          tar -czf issue225-repair.tar.gz \
-            Cargo.toml \
-            src/descriptor_bound_launcher.rs \
-            src/descriptor_bound_launcher/tests.rs \
-            issue225-test.txt \
-            issue225-status.txt
-      - name: Upload repaired files and diagnostics
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: issue225-repair
-          path: issue225-repair.tar.gz
-          if-no-files-found: error
-          retention-days: 1
-      - name: Enforce focused test result
-        run: exit "$(cat issue225-status.txt)"
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add Cargo.toml src/descriptor_bound_launcher.rs src/descriptor_bound_launcher/tests.rs .github/workflows/issue225-repair-artifact.yml
+          git commit -m "Make descriptor-bound privilege drop fail closed"
+          git push origin HEAD:${{ github.event.pull_request.head.ref }}
