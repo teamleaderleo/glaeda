@@ -20,6 +20,8 @@ pub mod exact_commit_handoff;
 pub mod execution_admission;
 pub mod execution_receipt;
 pub mod execution_receipt_store;
+/// Pure, fail-closed mapping of reviewed GitHub workflow-job evidence into typed broker intents.
+pub mod github_workflow_job_mapper;
 pub mod host;
 #[cfg(target_os = "linux")]
 pub mod host_package_plan;
