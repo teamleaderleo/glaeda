@@ -22,6 +22,8 @@ pub mod execution_receipt;
 pub mod execution_receipt_store;
 /// Pure, fail-closed mapping of reviewed GitHub workflow-job evidence into typed broker intents.
 pub mod github_workflow_job_mapper;
+/// Pure, bounded normalization of complete GitHub workflow-job reconciliation snapshots.
+pub mod github_workflow_job_reconciliation;
 pub mod host;
 #[cfg(target_os = "linux")]
 pub mod host_package_plan;
