@@ -1,0 +1,68 @@
+name: Agent 3 structurally fix terminal read-model fixture
+
+on:
+  pull_request:
+    types: [synchronize]
+
+permissions:
+  contents: write
+  pull-requests: read
+
+jobs:
+  fix:
+    if: github.event.pull_request.head.ref == 'repair/issue-187-personal-worker-read-model-terminal' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out exact repair branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+          show-progress: false
+      - name: Structurally move terminal privacy fixture and verify
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('tests/personal_worker_read_model.rs')
+          lines = path.read_text(encoding='utf-8').splitlines()
+          privacy_index = next(
+              index for index, line in enumerate(lines)
+              if line == 'fn public_json_and_errors_exclude_private_runtime_material() {'
+          )
+          start = next(
+              index for index, line in enumerate(lines[:privacy_index])
+              if line.strip() == 'let terminal_job = serde_json::to_string('
+          )
+          end = next(
+              index for index in range(start, privacy_index)
+              if lines[index].strip() == '.expect("serialize terminal job");'
+          ) + 1
+          block = lines[start:end]
+          del lines[start:end]
+          privacy_index -= end - start
+          insert_after = next(
+              index for index in range(privacy_index, len(lines))
+              if lines[index].strip() == '.expect("serialize job");'
+          ) + 1
+          lines[insert_after:insert_after] = block
+          path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+          PY
+          cargo fmt --all
+          cargo test --all-targets --all-features personal_worker_read_model
+          cargo clippy --all-targets --all-features -- -D warnings
+          cargo test --all-targets --all-features
+      - name: Commit clean source-only repair
+        run: |
+          git config user.name "Agent 3"
+          git config user.email "agent3@users.noreply.github.com"
+          git rm .github/workflows/agent3-fix-read-model-terminal-test.yml
+          git rm .github/workflows/agent3-line-fix-read-model-terminal.yml
+          git rm .agent3-read-model-repair.log
+          git rm .agent3-read-model-capture-trigger
+          git rm .agent3-read-model-fix-trigger
+          git rm .agent3-read-model-line-fix-trigger
+          git add src/lib.rs src/personal_worker_read_model.rs tests/personal_worker_read_model.rs
+          git diff --cached --check
+          git commit -m "Complete retained terminal personal worker read views"
+          git push origin HEAD:${{ github.event.pull_request.head.ref }}
