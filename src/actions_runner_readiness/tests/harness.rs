@@ -117,3 +117,16 @@ impl FakeClock {
     fn new(values: impl IntoIterator<Item = u64>) -> Self {
         Self {
             values: Mutex::new(values.into_iter().map(Ok).collect()),
+        }
+    }
+}
+
+impl LimaObservationClock for FakeClock {
+    fn unix_seconds(&self) -> io::Result<u64> {
+        self.values
+            .lock()
+            .expect("clock lock")
+            .pop_front()
+            .expect("scripted readiness clock")
+    }
+}
