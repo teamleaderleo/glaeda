@@ -89,6 +89,7 @@ pub mod ownership;
 pub mod personal_worker_host_broker;
 pub mod personal_worker_queue;
 pub mod personal_worker_store;
+pub mod personal_worker_store_transaction;
 pub mod plan;
 pub mod podman_preview;
 pub mod podman_preview_execution;
