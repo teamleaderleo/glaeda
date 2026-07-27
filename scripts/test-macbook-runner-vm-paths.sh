@@ -48,7 +48,7 @@ run_invalid() {
   }
 }
 
-run_invalid instance-traversal 'simple lowercase ASCII Lima instance name' "${home}/.lima" '../escape'
+run_invalid instance-traversal 'must begin with a lowercase ASCII letter or digit' "${home}/.lima" '../escape'
 run_invalid instance-option 'must begin with a lowercase ASCII letter or digit' "${home}/.lima" '--debug'
 run_invalid instance-uppercase 'must begin with a lowercase ASCII letter or digit' "${home}/.lima" 'SmolRunner'
 run_invalid relative-home 'LIMA_HOME must be an absolute path' 'relative/lima' 'smolrunner'
