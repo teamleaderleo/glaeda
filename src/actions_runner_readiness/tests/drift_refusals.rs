@@ -143,3 +143,16 @@ fn ambiguity_worker_without_listener_spawn_record_and_output_bounds_fail_closed(
 
     let oversized = adapter()
         .observe(
+            &request(),
+            &source(LimaRuntimeState::Running, true, 130),
+            &ScriptedExecutor::new([ScriptedStep::Output(ScriptedOutput::success(
+                "x".repeat(MAX_ACTIONS_RUNNER_OUTPUT_BYTES + 1),
+            ))]),
+            &FakeClock::new([100]),
+        )
+        .expect_err("output bound");
+    assert_eq!(
+        oversized.code,
+        ActionsRunnerReadinessRefusalCode::UnboundedOutput
+    );
+}
