@@ -1,0 +1,738 @@
+name: Agent 3 repair personal worker terminal read model
+
+on:
+  pull_request:
+    types: [synchronize]
+
+permissions:
+  contents: write
+  pull-requests: read
+
+jobs:
+  repair:
+    if: github.event.pull_request.head.ref == 'repair/issue-187-personal-worker-read-model-terminal' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out exact repair branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+          show-progress: false
+      - name: Replay and repair read model
+        run: |
+          git checkout 37748ea1069cb5870a2b53ce8e2aad086adf28c8 -- \
+            src/personal_worker_read_model.rs \
+            tests/personal_worker_read_model.rs
+          python3 - <<'PY'
+          from pathlib import Path
+
+          source_path = Path('src/personal_worker_read_model.rs')
+          source = source_path.read_text(encoding='utf-8')
+          source = source.replace(
+              '''use serde::Serialize;
+
+          use crate::execution_admission::{
+              EpochMillis, ExecutionAdmissionState, ExecutionRequestId, ReservationGeneration, ReservationId,
+          };
+          use crate::personal_worker_queue::{
+              PersonalWorkerCancellationState, PersonalWorkerProfile, PersonalWorkerQueueGeneration,
+              PersonalWorkerQueueVisibility, evaluate_personal_worker_queue,
+          };
+          use crate::personal_worker_store::{PersonalWorkerStoreDocument, PersonalWorkerStoreRevision};''',
+              '''use serde::Serialize;
+
+          use crate::artifact::Sha256Digest;
+          use crate::execution_admission::{
+              DrainAcknowledgement, EpochMillis, ExecutionAdmissionIdentity, ExecutionAdmissionState,
+              ExecutionRequestId, ExecutionResourceLimits, FallbackProfileEligibility,
+              ReservationGeneration, ReservationId, UnavailableReason,
+          };
+          use crate::personal_worker_queue::{
+              PersonalWorkerCacheAccessMode, PersonalWorkerCacheNamespace,
+              PersonalWorkerCancellationState, PersonalWorkerPriority, PersonalWorkerProfile,
+              PersonalWorkerQueueGeneration, PersonalWorkerQueueVisibility,
+              PersonalWorkerSourceIdentity, evaluate_personal_worker_queue,
+          };
+          use crate::personal_worker_store::{
+              PersonalWorkerStoreDocument, PersonalWorkerStoreRevision,
+              PersonalWorkerTerminalMutationClass,
+          };''',
+          )
+          assert 'PersonalWorkerTerminalMutationClass' in source
+
+          source = source.replace(
+              '''    draining_count: u32,
+              cache_lease_count: u32,
+          }''',
+              '''    draining_count: u32,
+              cache_lease_count: u32,
+              terminal_tombstone_count: u32,
+          }''',
+              1,
+          )
+          source = source.replace(
+              '''    pub const fn cache_lease_count(&self) -> u32 {
+                  self.cache_lease_count
+              }
+          }''',
+              '''    pub const fn cache_lease_count(&self) -> u32 {
+                  self.cache_lease_count
+              }
+
+              #[must_use]
+              pub const fn terminal_tombstone_count(&self) -> u32 {
+                  self.terminal_tombstone_count
+              }
+          }''',
+              1,
+          )
+
+          start = source.index('#[derive(Debug, Clone, PartialEq, Eq, Serialize)]\npub struct PersonalWorkerJobView')
+          end = source.index('#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]\n#[serde(rename_all = "snake_case")]\npub enum PersonalWorkerReadErrorKind', start)
+          replacement = '''#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+          pub struct PersonalWorkerTerminalRequestView {
+              identity: ExecutionAdmissionIdentity,
+              source: PersonalWorkerSourceIdentity,
+              priority: PersonalWorkerPriority,
+              requested_limits: ExecutionResourceLimits,
+              cache_namespace: PersonalWorkerCacheNamespace,
+              cache_access: PersonalWorkerCacheAccessMode,
+              fallback_eligibility: FallbackProfileEligibility,
+          }
+
+          impl PersonalWorkerTerminalRequestView {
+              #[must_use]
+              pub const fn identity(&self) -> &ExecutionAdmissionIdentity {
+                  &self.identity
+              }
+
+              #[must_use]
+              pub const fn source(&self) -> &PersonalWorkerSourceIdentity {
+                  &self.source
+              }
+
+              #[must_use]
+              pub const fn priority(&self) -> PersonalWorkerPriority {
+                  self.priority
+              }
+
+              #[must_use]
+              pub const fn requested_limits(&self) -> ExecutionResourceLimits {
+                  self.requested_limits
+              }
+
+              #[must_use]
+              pub const fn cache_namespace(&self) -> &PersonalWorkerCacheNamespace {
+                  &self.cache_namespace
+              }
+
+              #[must_use]
+              pub const fn cache_access(&self) -> PersonalWorkerCacheAccessMode {
+                  self.cache_access
+              }
+
+              #[must_use]
+              pub const fn fallback_eligibility(&self) -> &FallbackProfileEligibility {
+                  &self.fallback_eligibility
+              }
+          }
+
+          #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+          pub struct PersonalWorkerTerminalJobView {
+              mutation_class: PersonalWorkerTerminalMutationClass,
+              request: PersonalWorkerTerminalRequestView,
+              admission_state: ExecutionAdmissionState,
+              completed_at: EpochMillis,
+              #[serde(skip_serializing_if = "Option::is_none")]
+              started_at: Option<EpochMillis>,
+              unavailable_reason: UnavailableReason,
+              #[serde(skip_serializing_if = "Option::is_none")]
+              acknowledgement: Option<DrainAcknowledgement>,
+              reservation: PersonalWorkerReservationView,
+              durable_cache_lease: PersonalWorkerDurableCacheLeaseView,
+              evidence_digest: Sha256Digest,
+          }
+
+          impl PersonalWorkerTerminalJobView {
+              #[must_use]
+              pub const fn mutation_class(&self) -> PersonalWorkerTerminalMutationClass {
+                  self.mutation_class
+              }
+
+              #[must_use]
+              pub const fn request(&self) -> &PersonalWorkerTerminalRequestView {
+                  &self.request
+              }
+
+              #[must_use]
+              pub const fn admission_state(&self) -> ExecutionAdmissionState {
+                  self.admission_state
+              }
+
+              #[must_use]
+              pub const fn completed_at(&self) -> EpochMillis {
+                  self.completed_at
+              }
+
+              #[must_use]
+              pub const fn started_at(&self) -> Option<EpochMillis> {
+                  self.started_at
+              }
+
+              #[must_use]
+              pub const fn unavailable_reason(&self) -> UnavailableReason {
+                  self.unavailable_reason
+              }
+
+              #[must_use]
+              pub const fn acknowledgement(&self) -> Option<DrainAcknowledgement> {
+                  self.acknowledgement
+              }
+
+              #[must_use]
+              pub const fn reservation(&self) -> &PersonalWorkerReservationView {
+                  &self.reservation
+              }
+
+              #[must_use]
+              pub const fn durable_cache_lease(&self) -> &PersonalWorkerDurableCacheLeaseView {
+                  &self.durable_cache_lease
+              }
+
+              #[must_use]
+              pub const fn evidence_digest(&self) -> &Sha256Digest {
+                  &self.evidence_digest
+              }
+          }
+
+          #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+          #[serde(tag = "state", rename_all = "snake_case")]
+          pub enum PersonalWorkerJobStateView {
+              Queued {
+                  entry: PersonalWorkerQueueVisibility,
+              },
+              Active {
+                  entry: PersonalWorkerQueueVisibility,
+                  admission: PersonalWorkerAdmissionView,
+                  durable_cache_lease: PersonalWorkerDurableCacheLeaseView,
+              },
+              Terminal {
+                  terminal: Box<PersonalWorkerTerminalJobView>,
+              },
+          }
+
+          #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+          pub struct PersonalWorkerJobView {
+              schema_version: u8,
+              store_revision: PersonalWorkerStoreRevision,
+              queue_generation: PersonalWorkerQueueGeneration,
+              observed_at: EpochMillis,
+              submitted_at: EpochMillis,
+              #[serde(skip_serializing_if = "Option::is_none")]
+              operator_deadline: Option<EpochMillis>,
+              cancellation: PersonalWorkerCancellationState,
+              job: PersonalWorkerJobStateView,
+          }
+
+          impl PersonalWorkerJobView {
+              #[must_use]
+              pub const fn store_revision(&self) -> PersonalWorkerStoreRevision {
+                  self.store_revision
+              }
+
+              #[must_use]
+              pub const fn queue_generation(&self) -> PersonalWorkerQueueGeneration {
+                  self.queue_generation
+              }
+
+              #[must_use]
+              pub const fn submitted_at(&self) -> EpochMillis {
+                  self.submitted_at
+              }
+
+              #[must_use]
+              pub const fn cancellation(&self) -> PersonalWorkerCancellationState {
+                  self.cancellation
+              }
+
+              #[must_use]
+              pub const fn state(&self) -> &PersonalWorkerJobStateView {
+                  &self.job
+              }
+
+              #[must_use]
+              pub fn entry(&self) -> Option<&PersonalWorkerQueueVisibility> {
+                  match &self.job {
+                      PersonalWorkerJobStateView::Queued { entry }
+                      | PersonalWorkerJobStateView::Active { entry, .. } => Some(entry),
+                      PersonalWorkerJobStateView::Terminal { .. } => None,
+                  }
+              }
+
+              #[must_use]
+              pub fn admission(&self) -> Option<&PersonalWorkerAdmissionView> {
+                  match &self.job {
+                      PersonalWorkerJobStateView::Active { admission, .. } => Some(admission),
+                      PersonalWorkerJobStateView::Queued { .. }
+                      | PersonalWorkerJobStateView::Terminal { .. } => None,
+                  }
+              }
+
+              #[must_use]
+              pub fn durable_cache_lease(&self) -> Option<&PersonalWorkerDurableCacheLeaseView> {
+                  match &self.job {
+                      PersonalWorkerJobStateView::Active {
+                          durable_cache_lease,
+                          ..
+                      } => Some(durable_cache_lease),
+                      PersonalWorkerJobStateView::Queued { .. }
+                      | PersonalWorkerJobStateView::Terminal { .. } => None,
+                  }
+              }
+
+              #[must_use]
+              pub fn terminal(&self) -> Option<&PersonalWorkerTerminalJobView> {
+                  match &self.job {
+                      PersonalWorkerJobStateView::Terminal { terminal } => Some(terminal),
+                      PersonalWorkerJobStateView::Queued { .. }
+                      | PersonalWorkerJobStateView::Active { .. } => None,
+                  }
+              }
+          }
+
+          '''
+          source = source[:start] + replacement + source[end:]
+          source = source.replace(
+              '''        cache_lease_count: bounded_count(document.cache_leases().len())?,
+              })''',
+              '''        cache_lease_count: bounded_count(document.cache_leases().len())?,
+                  terminal_tombstone_count: bounded_count(document.terminal_tombstones().len())?,
+              })''',
+              1,
+          )
+
+          job_start = source.index('/// Derive one exact job view from queued or active durable state.')
+          job_end = source.index('fn validate_snapshot(', job_start)
+          job_function = '''/// Derive one exact job view from queued, active, or retained terminal durable state.
+          ///
+          /// Queue pagination remains live-state-only. Terminal views are projected only from the exact
+          /// bounded durable tombstone ledger and never fabricate queue visibility.
+          ///
+          /// # Errors
+          ///
+          /// Returns a fixed error for stale snapshot expectations, an unprovable or evicted request,
+          /// or invalid durable reservation, cache-lease, or terminal evidence.
+          pub fn personal_worker_job_view(
+              document: &PersonalWorkerStoreDocument,
+              request: PersonalWorkerJobReadRequest,
+          ) -> Result<PersonalWorkerJobView, PersonalWorkerReadError> {
+              validate_snapshot(
+                  document,
+                  request.expected_revision,
+                  request.expected_queue_generation,
+              )?;
+              let decision = evaluate_personal_worker_queue(document.queue(), None)
+                  .map_err(|_| PersonalWorkerReadError::invalid_document())?;
+
+              if let Some(queued) = document
+                  .queue()
+                  .queued
+                  .iter()
+                  .find(|queued| queued.identity.request_id == request.request_id)
+              {
+                  let entry = decision
+                      .visibility
+                      .iter()
+                      .find(|entry| entry.request_id == request.request_id)
+                      .cloned()
+                      .ok_or_else(PersonalWorkerReadError::invalid_document)?;
+                  return Ok(PersonalWorkerJobView {
+                      schema_version: PERSONAL_WORKER_READ_MODEL_SCHEMA_VERSION,
+                      store_revision: document.revision(),
+                      queue_generation: document.queue().generation,
+                      observed_at: document.queue().observed_at,
+                      submitted_at: queued.submitted_at,
+                      operator_deadline: queued.operator_deadline,
+                      cancellation: queued.cancellation,
+                      job: PersonalWorkerJobStateView::Queued { entry },
+                  });
+              }
+
+              if let Some(active) = document
+                  .queue()
+                  .active
+                  .iter()
+                  .find(|active| active.request.identity.request_id == request.request_id)
+              {
+                  let entry = decision
+                      .visibility
+                      .iter()
+                      .find(|entry| entry.request_id == request.request_id)
+                      .cloned()
+                      .ok_or_else(PersonalWorkerReadError::invalid_document)?;
+                  let reservation = active
+                      .admission
+                      .reservation()
+                      .ok_or_else(PersonalWorkerReadError::invalid_document)?;
+                  let lease = document
+                      .cache_leases()
+                      .iter()
+                      .find(|lease| lease.request_id() == &request.request_id)
+                      .ok_or_else(PersonalWorkerReadError::invalid_document)?;
+                  return Ok(PersonalWorkerJobView {
+                      schema_version: PERSONAL_WORKER_READ_MODEL_SCHEMA_VERSION,
+                      store_revision: document.revision(),
+                      queue_generation: document.queue().generation,
+                      observed_at: document.queue().observed_at,
+                      submitted_at: active.request.submitted_at,
+                      operator_deadline: active.request.operator_deadline,
+                      cancellation: active.request.cancellation,
+                      job: PersonalWorkerJobStateView::Active {
+                          entry,
+                          admission: PersonalWorkerAdmissionView {
+                              state: active.admission.state(),
+                              observed_at: active.admission.observed_at(),
+                              reservation: PersonalWorkerReservationView {
+                                  id: reservation.id.clone(),
+                                  generation: reservation.generation,
+                                  reserved_at: reservation.reserved_at,
+                                  expires_at: reservation.expires_at,
+                              },
+                          },
+                          durable_cache_lease: PersonalWorkerDurableCacheLeaseView {
+                              reservation_id: lease.reservation_id().clone(),
+                              reservation_generation: lease.reservation_generation(),
+                              acquired_at: lease.acquired_at(),
+                          },
+                      },
+                  });
+              }
+
+              if let Some(tombstone) = document
+                  .terminal_tombstones()
+                  .iter()
+                  .find(|terminal| terminal.request().identity.request_id == request.request_id)
+              {
+                  let terminal_request = tombstone.request();
+                  let terminal_admission = tombstone.terminal_admission();
+                  let reservation = terminal_admission
+                      .reservation()
+                      .ok_or_else(PersonalWorkerReadError::invalid_document)?;
+                  let unavailable_reason = terminal_admission
+                      .unavailable_reason()
+                      .ok_or_else(PersonalWorkerReadError::invalid_document)?;
+                  let lease = tombstone.cache_lease();
+                  return Ok(PersonalWorkerJobView {
+                      schema_version: PERSONAL_WORKER_READ_MODEL_SCHEMA_VERSION,
+                      store_revision: document.revision(),
+                      queue_generation: document.queue().generation,
+                      observed_at: document.queue().observed_at,
+                      submitted_at: terminal_request.submitted_at,
+                      operator_deadline: terminal_request.operator_deadline,
+                      cancellation: terminal_request.cancellation,
+                      job: PersonalWorkerJobStateView::Terminal {
+                          terminal: Box::new(PersonalWorkerTerminalJobView {
+                              mutation_class: tombstone.mutation_class(),
+                              request: PersonalWorkerTerminalRequestView {
+                                  identity: terminal_request.identity.clone(),
+                                  source: terminal_request.source.clone(),
+                                  priority: terminal_request.priority,
+                                  requested_limits: terminal_request.requested_limits,
+                                  cache_namespace: terminal_request.cache_namespace.clone(),
+                                  cache_access: terminal_request.cache_access,
+                                  fallback_eligibility: terminal_request.fallback_eligibility.clone(),
+                              },
+                              admission_state: terminal_admission.state(),
+                              completed_at: tombstone.completed_at(),
+                              started_at: tombstone.started_at(),
+                              unavailable_reason,
+                              acknowledgement: terminal_admission.acknowledgement(),
+                              reservation: PersonalWorkerReservationView {
+                                  id: reservation.id.clone(),
+                                  generation: reservation.generation,
+                                  reserved_at: reservation.reserved_at,
+                                  expires_at: reservation.expires_at,
+                              },
+                              durable_cache_lease: PersonalWorkerDurableCacheLeaseView {
+                                  reservation_id: lease.reservation_id().clone(),
+                                  reservation_generation: lease.reservation_generation(),
+                                  acquired_at: lease.acquired_at(),
+                              },
+                              evidence_digest: tombstone.evidence_digest().clone(),
+                          }),
+                      },
+                  });
+              }
+
+              Err(PersonalWorkerReadError::new(
+                  PersonalWorkerReadErrorKind::NotFound,
+                  "personal worker job is not provable in the exact durable snapshot",
+              ))
+          }
+
+          '''
+          source = source[:job_start] + job_function + source[job_end:]
+          source_path.write_text(source, encoding='utf-8')
+
+          tests_path = Path('tests/personal_worker_read_model.rs')
+          tests = tests_path.read_text(encoding='utf-8')
+          tests = tests.replace(
+              '''    EpochMillis, ExecutionAdmissionIdentity, ExecutionAdmissionInput, ExecutionAdmissionRecord,
+              ExecutionAdmissionState, ExecutionRequestId, ExecutionResourceLimits,
+              FallbackProfileEligibility, HostCapacityObservation, ReservationEvidence,
+              ReservationGeneration, ReservationId, RunnerProfileId,
+          };''',
+              '''    DrainAcknowledgement, EpochMillis, ExecutionAdmissionIdentity,
+              ExecutionAdmissionInput, ExecutionAdmissionRecord, ExecutionAdmissionState,
+              ExecutionRequestId, ExecutionResourceLimits, FallbackProfileEligibility,
+              HostCapacityObservation, ReservationEvidence, ReservationGeneration, ReservationId,
+              RunnerProfileId, UnavailableReason,
+          };''',
+          )
+          tests = tests.replace(
+              '''    MAX_PERSONAL_WORKER_QUEUE_PAGE_SIZE, PersonalWorkerJobReadRequest,
+              PersonalWorkerQueuePageRequest, PersonalWorkerReadErrorKind, personal_worker_job_view,
+              personal_worker_queue_page, personal_worker_status,
+          };''',
+              '''    MAX_PERSONAL_WORKER_QUEUE_PAGE_SIZE, PersonalWorkerJobReadRequest,
+              PersonalWorkerJobStateView, PersonalWorkerQueuePageRequest,
+              PersonalWorkerReadErrorKind, personal_worker_job_view, personal_worker_queue_page,
+              personal_worker_status,
+          };''',
+          )
+          tests = tests.replace(
+              '''    PersonalWorkerDurableCacheLease, PersonalWorkerStoreDocument, PersonalWorkerStoreRevision,
+          };''',
+              '''    PersonalWorkerDurableCacheLease, PersonalWorkerStoreDocument,
+              PersonalWorkerStoreRevision, PersonalWorkerTerminalMutationClass,
+              PersonalWorkerTerminalTombstone,
+          };''',
+          )
+
+          document_index = tests.index('fn document() -> PersonalWorkerStoreDocument {')
+          terminal_helpers = '''fn terminal_tombstone(completed_at: u64) -> PersonalWorkerTerminalTombstone {
+              let request = request(
+                  "terminal-one",
+                  "example/terminal",
+                  'd',
+                  BASE - 120_000,
+                  PersonalWorkerPriority::Normal,
+                  PersonalWorkerCancellationState::Active,
+              );
+              let reservation_id =
+                  ReservationId::parse("reservation-terminal-one").expect("reservation ID");
+              let generation = ReservationGeneration::new(11).expect("reservation generation");
+              let reserved_at = time(BASE - 30_000);
+              let terminal_admission = ExecutionAdmissionRecord::from_input(ExecutionAdmissionInput {
+                  identity: request.identity.clone(),
+                  state: ExecutionAdmissionState::Unavailable,
+                  observed_at: time(completed_at),
+                  requested_limits: request.requested_limits,
+                  host_capacity: Some(HostCapacityObservation::new(
+                      time(completed_at - 1_000),
+                      limits(8_000, 10),
+                  )),
+                  applied_limits: Some(request.requested_limits),
+                  queue_position: None,
+                  reservation: Some(ReservationEvidence::new(
+                      reservation_id.clone(),
+                      generation,
+                      reserved_at,
+                      time(BASE + 3_600_000),
+                  )),
+                  acknowledgement: Some(DrainAcknowledgement::Drain),
+                  fallback_eligibility: FallbackProfileEligibility::ineligible(),
+                  unavailable_reason: Some(UnavailableReason::Drained),
+              })
+              .expect("terminal admission");
+              let lease = PersonalWorkerDurableCacheLease::new(
+                  request.identity.request_id.clone(),
+                  request.cache_namespace.clone(),
+                  request.cache_access,
+                  reservation_id,
+                  generation,
+                  reserved_at,
+              );
+              PersonalWorkerTerminalTombstone::new(
+                  request,
+                  terminal_admission,
+                  Some(time(BASE - 20_000)),
+                  lease,
+              )
+              .expect("terminal tombstone")
+          }
+
+          fn terminal_document() -> PersonalWorkerStoreDocument {
+              PersonalWorkerStoreDocument::new_with_terminal_tombstones(
+                  PersonalWorkerQueueInput {
+                      generation: PersonalWorkerQueueGeneration::new(1).expect("queue generation"),
+                      observed_at: time(BASE),
+                      current_profile: PersonalWorkerProfile::Interactive,
+                      last_activity_at: time(BASE),
+                      queued: vec![],
+                      active: vec![],
+                      pending_profile_change: None,
+                  },
+                  vec![],
+                  vec![terminal_tombstone(BASE)],
+              )
+              .expect("terminal document")
+          }
+
+          '''
+          tests = tests[:document_index] + terminal_helpers + tests[document_index:]
+          tests = tests.replace(
+              '    assert_eq!(status.cache_lease_count(), 1);',
+              '    assert_eq!(status.cache_lease_count(), 1);\n    assert_eq!(status.terminal_tombstone_count(), 0);',
+              1,
+          )
+          tests = tests.replace(
+              '    assert_eq!(active.entry().request_id.as_str(), "active-one");',
+              '    assert_eq!(active.entry().expect("active entry").request_id.as_str(), "active-one");',
+              1,
+          )
+
+          privacy_index = tests.index('#[test]\nfn public_json_and_errors_exclude_private_runtime_material()')
+          terminal_tests = '''#[test]
+          fn terminal_job_view_projects_exact_proof_without_queue_visibility() {
+              let document = terminal_document();
+              let status = personal_worker_status(&document).expect("terminal status");
+              assert_eq!(status.terminal_tombstone_count(), 1);
+              assert_eq!(status.active_count(), 0);
+
+              let page = personal_worker_queue_page(
+                  &document,
+                  PersonalWorkerQueuePageRequest::new(revision(), generation(), 0, 10)
+                      .expect("terminal page request"),
+              )
+              .expect("terminal queue page");
+              assert_eq!(page.total(), 0);
+              assert!(page.items().is_empty());
+              assert_eq!(page.next_offset(), None);
+
+              let job = personal_worker_job_view(
+                  &document,
+                  PersonalWorkerJobReadRequest::new(
+                      revision(),
+                      generation(),
+                      ExecutionRequestId::parse("terminal-one").expect("terminal ID"),
+                  ),
+              )
+              .expect("terminal job");
+              assert!(job.entry().is_none());
+              assert!(job.admission().is_none());
+              assert!(job.durable_cache_lease().is_none());
+              let terminal = job.terminal().expect("terminal evidence");
+              assert_eq!(
+                  terminal.mutation_class(),
+                  PersonalWorkerTerminalMutationClass::ReleaseCompletionAndCacheLease
+              );
+              assert_eq!(
+                  terminal.request().identity().request_id.as_str(),
+                  "terminal-one"
+              );
+              assert_eq!(terminal.admission_state(), ExecutionAdmissionState::Unavailable);
+              assert_eq!(terminal.completed_at(), time(BASE));
+              assert_eq!(terminal.started_at(), Some(time(BASE - 20_000)));
+              assert_eq!(terminal.unavailable_reason(), UnavailableReason::Drained);
+              assert_eq!(
+                  terminal.acknowledgement(),
+                  Some(DrainAcknowledgement::Drain)
+              );
+              assert_eq!(
+                  terminal.reservation().id().as_str(),
+                  "reservation-terminal-one"
+              );
+              assert_eq!(terminal.reservation().generation().get(), 11);
+              assert_eq!(
+                  terminal.durable_cache_lease().reservation_id().as_str(),
+                  "reservation-terminal-one"
+              );
+              assert_eq!(terminal.durable_cache_lease().reservation_generation().get(), 11);
+              assert!(matches!(job.state(), PersonalWorkerJobStateView::Terminal { .. }));
+          }
+
+          #[test]
+          fn ambiguous_terminal_proof_is_rejected_and_evicted_identity_is_not_found() {
+              let duplicate_error = PersonalWorkerStoreDocument::new_with_terminal_tombstones(
+                  PersonalWorkerQueueInput {
+                      generation: PersonalWorkerQueueGeneration::new(1).expect("queue generation"),
+                      observed_at: time(BASE + 1),
+                      current_profile: PersonalWorkerProfile::Interactive,
+                      last_activity_at: time(BASE + 1),
+                      queued: vec![],
+                      active: vec![],
+                      pending_profile_change: None,
+                  },
+                  vec![],
+                  vec![terminal_tombstone(BASE), terminal_tombstone(BASE + 1)],
+              )
+              .expect_err("duplicate terminal identity");
+              assert!(!format!("{duplicate_error:?}").contains("terminal-one"));
+
+              let error = personal_worker_job_view(
+                  &terminal_document(),
+                  PersonalWorkerJobReadRequest::new(
+                      revision(),
+                      generation(),
+                      ExecutionRequestId::parse("evicted-terminal").expect("evicted ID"),
+                  ),
+              )
+              .expect_err("unprovable terminal identity");
+              assert_eq!(error.kind(), PersonalWorkerReadErrorKind::NotFound);
+          }
+
+          '''
+          tests = tests[:privacy_index] + terminal_tests + tests[privacy_index:]
+          tests = tests.replace(
+              '''    let error = personal_worker_job_view(
+                  &document,''',
+              '''    let terminal_job = serde_json::to_string(
+                  &personal_worker_job_view(
+                      &terminal_document(),
+                      PersonalWorkerJobReadRequest::new(
+                          revision(),
+                          generation(),
+                          ExecutionRequestId::parse("terminal-one").expect("terminal ID"),
+                      ),
+                  )
+                  .expect("terminal job"),
+              )
+              .expect("serialize terminal job");
+              let error = personal_worker_job_view(
+                  &document,''',
+              1,
+          )
+          tests = tests.replace(
+              '    let public = format!("{status}\\n{page}\\n{job}\\n{error:?}\\n{error}");',
+              '    let public = format!("{status}\\n{page}\\n{job}\\n{terminal_job}\\n{error:?}\\n{error}");',
+              1,
+          )
+          tests_path.write_text(tests, encoding='utf-8')
+
+          lib_path = Path('src/lib.rs')
+          lib_lines = lib_path.read_text(encoding='utf-8').splitlines()
+          marker = 'pub mod personal_worker_queue;'
+          marker_index = lib_lines.index(marker)
+          assert 'pub mod personal_worker_read_model;' not in lib_lines
+          lib_lines[marker_index + 1:marker_index + 1] = [
+              '/// Pure bounded live and retained-terminal personal-worker read views.',
+              'pub mod personal_worker_read_model;',
+          ]
+          lib_path.write_text('\n'.join(lib_lines) + '\n', encoding='utf-8')
+          PY
+          cargo fmt --all
+          cargo test --all-targets --all-features personal_worker_read_model
+          cargo clippy --all-targets --all-features -- -D warnings
+          cargo test --all-targets --all-features
+      - name: Commit source-only read-model repair
+        run: |
+          git config user.name "Agent 3"
+          git config user.email "agent3@users.noreply.github.com"
+          git rm .github/workflows/agent3-repair-read-model-terminal.yml
+          git add src/lib.rs src/personal_worker_read_model.rs tests/personal_worker_read_model.rs
+          git diff --cached --check
+          git commit -m "Project retained terminal jobs in personal worker read model"
+          git push origin HEAD:${{ github.event.pull_request.head.ref }}
