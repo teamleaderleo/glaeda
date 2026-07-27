@@ -109,6 +109,9 @@ pub mod state_document;
 pub mod state_store;
 #[cfg(target_os = "linux")]
 pub mod subordinate_id;
+/// Descriptor-relative trusted producer for runner workspace and cache identity receipts.
+#[cfg(target_os = "linux")]
+pub mod trusted_workspace_receipt;
 pub mod verification_profile;
 pub mod verification_profile_preflight_adapter;
 pub mod verification_profile_registry;
