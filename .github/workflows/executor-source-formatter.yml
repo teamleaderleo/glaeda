@@ -1,0 +1,41 @@
+name: Executor source formatter
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/executor-source-formatter.yml
+      - src/lib.rs
+      - src/lima_lifecycle_executor.rs
+      - src/lima_lifecycle_executor/tests.rs
+
+permissions:
+  contents: write
+
+jobs:
+  format:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out exact head
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          show-progress: false
+      - name: Format only executor sources
+        run: cargo fmt --all
+      - name: Publish formatting-only correction
+        env:
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          git add \
+            src/lib.rs \
+            src/lima_lifecycle_executor.rs \
+            src/lima_lifecycle_executor/tests.rs
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git commit -m 'Format Lima lifecycle executor sources'
+          git push origin "HEAD:${HEAD_REF}"
