@@ -47,6 +47,8 @@ pub mod lease_catalog;
 pub mod lease_document;
 /// Pure, fail-closed lifecycle and idle-cooldown policy for one persistent Lima worker VM.
 pub mod lima_lifecycle;
+/// Fixed direct executor for accepted personal-worker Lima lifecycle actions.
+pub mod lima_lifecycle_executor;
 /// Read-only, bounded exact Lima instance and guest-resource observation.
 pub mod lima_observation;
 /// Read-only, fail-closed lookup of persisted project installations.
