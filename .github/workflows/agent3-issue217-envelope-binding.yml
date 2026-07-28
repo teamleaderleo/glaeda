@@ -35,14 +35,11 @@ jobs:
         run: |
           git config user.name "Agent 3"
           git config user.email "agent3@users.noreply.github.com"
-          git rm .github/issue217-envelope-binding.py
-          git rm .github/workflows/agent3-issue217-envelope-binding.yml
-          git rm -f .github/agent3-issue217-trigger
-          git add \
-            src/lib.rs \
-            src/rust_verification_envelope.rs \
-            src/rust_memory_diagnostic.rs \
-            src/rust_memory_diagnostic
+          rm -f \
+            .github/issue217-envelope-binding.py \
+            .github/workflows/agent3-issue217-envelope-binding.yml \
+            .github/agent3-issue217-trigger
+          git add -A
           git diff --cached --check
           git commit -m "Bind Rust memory diagnostics to one exact envelope"
           git push origin HEAD:${{ github.event.pull_request.head.ref }}
