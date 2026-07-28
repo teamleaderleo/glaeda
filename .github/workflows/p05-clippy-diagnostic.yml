@@ -1,0 +1,22 @@
+name: P05 Clippy diagnostic
+
+on:
+  pull_request:
+    paths:
+      - "src/operator_error.rs"
+      - "src/operator_error/catalog.rs"
+      - "tests/operator_error_contract.rs"
+      - ".github/workflows/p05-clippy-diagnostic.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          show-progress: false
+      - name: Run focused Clippy
+        run: cargo clippy --locked --test operator_error_contract --all-features -- -D warnings
