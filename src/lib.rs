@@ -103,6 +103,9 @@ pub mod renderprove_artifact_binding;
 pub mod renderprove_execution;
 #[cfg(target_os = "linux")]
 pub mod renderprove_native_probe;
+/// Descriptor-bound protected project/evidence mount lease for native Renderprove probes.
+#[cfg(target_os = "linux")]
+pub mod renderprove_protected_mount;
 pub mod renderprove_verification;
 pub mod renderprove_vision_profile;
 pub mod renderprove_vision_result;
