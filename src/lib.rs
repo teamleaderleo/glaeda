@@ -127,6 +127,8 @@ pub mod runner_export;
 pub mod runner_user;
 #[cfg(target_os = "linux")]
 pub mod runner_user_observation;
+/// Pure classification of trusted bounded Rust memory-pressure observations.
+pub mod rust_memory_diagnostic;
 /// Pure repository-declared Rust build-scope and bounded resource-envelope contracts.
 pub mod rust_verification_envelope;
 pub mod state;
