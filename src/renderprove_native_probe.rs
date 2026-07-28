@@ -1,3 +1,4 @@
+#[allow(dead_code)]
 mod inner {
     include!("renderprove_native_probe_body.rs");
     include!("renderprove_native_probe_read_only.rs");
