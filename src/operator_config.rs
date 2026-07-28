@@ -653,8 +653,7 @@ fn digest_operator_config(
 }
 
 fn placeholder_digest() -> Result<Sha256Digest, OperatorConfigError> {
-    Sha256Digest::parse(&format!("{SHA256_PREFIX}{}", "0".repeat(64)))
-        .map_err(|_| encoding_error())
+    Sha256Digest::parse(&format!("{SHA256_PREFIX}{}", "0".repeat(64))).map_err(|_| encoding_error())
 }
 
 const fn encoding_error() -> OperatorConfigError {
