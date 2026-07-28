@@ -1,4 +1,4 @@
-name: P03 Clippy diagnostics
+name: P03 test diagnostics
 
 on:
   push:
@@ -12,29 +12,29 @@ permissions:
 jobs:
   diagnose:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - name: Check out exact P03 source head
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: a31f5f572a7b5b6c12903c804f0637eace4a6785
+          ref: 31816833c9a3eff86ab39abc5229b9e52229c6d6
           show-progress: false
       - name: Install Rust toolchain
         run: rustup show
-      - name: Capture Clippy diagnostics
+      - name: Capture test diagnostics
         shell: bash
         run: |
           set +e
-          cargo clippy --locked --all-targets --all-features -- -D warnings 2>&1 | tee p03-clippy.log
+          cargo test --locked --all-targets --all-features 2>&1 | tee p03-test.log
           status=${PIPESTATUS[0]}
-          echo "$status" > p03-clippy-status.txt
+          echo "$status" > p03-test-status.txt
           exit 0
       - name: Upload diagnostics
         uses: actions/upload-artifact@v4
         with:
-          name: p03-clippy-diagnostics
+          name: p03-test-diagnostics
           path: |
-            p03-clippy.log
-            p03-clippy-status.txt
+            p03-test.log
+            p03-test-status.txt
           if-no-files-found: error
           retention-days: 1
