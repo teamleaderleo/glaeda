@@ -1,3 +1,5 @@
+#![rustfmt::skip::macros(define_operator_errors)]
+
 use std::fmt;
 
 use serde::Serialize;
@@ -112,6 +114,7 @@ impl OperatorErrorSpec {
     }
 }
 
+#[rustfmt::skip]
 macro_rules! define_operator_errors {
     (
         $(
