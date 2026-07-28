@@ -132,10 +132,10 @@ pub mod runner_user;
 pub mod runner_user_observation;
 /// Pure classification of trusted bounded Rust memory-pressure observations.
 pub mod rust_memory_diagnostic;
-/// Canonical digest binding for reviewed Rust verification envelopes.
-pub mod rust_verification_envelope_digest;
 /// Pure repository-declared Rust build-scope and bounded resource-envelope contracts.
 pub mod rust_verification_envelope;
+/// Canonical digest binding for reviewed Rust verification envelopes.
+pub mod rust_verification_envelope_digest;
 pub mod state;
 pub mod state_document;
 pub mod state_store;
