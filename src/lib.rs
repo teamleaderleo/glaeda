@@ -101,6 +101,9 @@ pub mod preview;
 pub mod process;
 pub mod renderprove_artifact_binding;
 pub mod renderprove_execution;
+/// Pure direct-Podman planning for the native Renderprove probe boundary.
+#[cfg(target_os = "linux")]
+pub mod renderprove_native_probe;
 pub mod renderprove_verification;
 pub mod renderprove_vision_profile;
 pub mod renderprove_vision_result;
