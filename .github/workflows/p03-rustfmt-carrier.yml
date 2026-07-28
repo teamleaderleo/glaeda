@@ -22,6 +22,7 @@ jobs:
         run: |
           cargo fmt --all
           mkdir formatted
+          git diff -- src/operator_config.rs tests/operator_config_contract.rs > formatted/format.patch
           cp src/operator_config.rs tests/operator_config_contract.rs formatted/
       - name: Upload formatted files
         uses: actions/upload-artifact@v4
