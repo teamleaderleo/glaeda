@@ -673,7 +673,42 @@ fn validate_environment(
 
 mod executor;
 
-pub use executor::execute_reviewed_linux_launch;
+/// Execute one exact descriptor-bound Linux launch.
+///
+/// Privilege-dropping launches run on a short-lived helper thread whose supplementary
+/// groups are cleared before the child is spawned. This makes group clearing fail-closed
+/// without changing the caller thread's credentials or introducing unsafe Rust.
+pub fn execute_reviewed_linux_launch(
+    plan: &ReviewedLinuxLaunchPlan,
+) -> Result<DescriptorBoundLaunchReceipt, DescriptorBoundLaunchError> {
+    match plan.credentials() {
+        ReviewedLaunchCredentials::Inherit { .. } => executor::execute_reviewed_linux_launch(plan),
+        ReviewedLaunchCredentials::DropPrivileges { .. } => {
+            let plan = plan.clone();
+            std::thread::Builder::new()
+                .name("smolrunner-credential-launch".to_owned())
+                .spawn(move || {
+                    rustix::thread::set_thread_groups(&[]).map_err(|_| {
+                        DescriptorBoundLaunchError::credentials(
+                            "could not clear supplementary groups for the reviewed launch",
+                        )
+                    })?;
+                    executor::execute_reviewed_linux_launch(&plan)
+                })
+                .map_err(|_| {
+                    DescriptorBoundLaunchError::spawn(
+                        "could not create the isolated credential launch thread",
+                    )
+                })?
+                .join()
+                .map_err(|_| {
+                    DescriptorBoundLaunchError::spawn(
+                        "the isolated credential launch thread failed",
+                    )
+                })?
+        }
+    }
+}
 
 #[cfg(test)]
 use executor::execute_with_hooks;

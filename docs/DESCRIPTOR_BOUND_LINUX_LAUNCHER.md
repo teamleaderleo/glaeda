@@ -39,11 +39,16 @@ Only direct ELF executables are supported. Scripts are rejected before spawn so 
 - the launcher does not forward ambient signals;
 - capture failure or output exhaustion sends `SIGKILL` to the child process group;
 - normal exits from 0 through 255 and terminating signals from 1 through 255 are represented explicitly;
-- a root privilege drop sets the reviewed GID and UID through `CommandExt`; because no supplementary groups are supplied, the standard-library UID transition clears supplementary groups.
+- an inherited-credential launch executes on the caller thread with the exact reviewed effective UID/GID;
+- a root-to-nonroot launch moves the complete launch operation to a short-lived helper thread;
+- the helper thread clears its supplementary group list through rustix and fails before spawn if that cannot be proved;
+- the child then applies the reviewed GID and UID transition through `CommandExt` and enters the reviewed ELF with no inherited supplementary groups;
+- the helper thread exits after capture, so the caller thread's credentials and supplementary groups are unchanged;
+- no unsafe Rust or process-wide credential mutation is introduced.
 
 Public JSON and `Debug` output contain no executable path, cwd path, device, inode, descriptor number, raw diagnostics, or secret command value. Errors use fixed classifications without raw operating-system text.
 
-## Replacement and ABA coverage
+## Replacement, ABA, and credential coverage
 
 Focused tests deliberately:
 
@@ -51,7 +56,9 @@ Focused tests deliberately:
 - replace the working directory after its descriptor is held, restore the original name after spawn, and prove the child entered the held reviewed directory;
 - replace an object before acquisition and require exact-identity refusal;
 - reject symlink and hard-link aliases;
-- reject scripts, credential drift, unbounded output, and private evidence disclosure.
+- reject scripts, credential drift, unbounded output, and private evidence disclosure;
+- under a root launcher, execute a descriptor-bound direct ELF that reads `/proc/self/status` and prove all real/effective/saved/filesystem UID and GID fields equal the reviewed non-root targets;
+- prove the child supplementary group list is empty and the caller thread's group list is unchanged after launch.
 
 ## PR #183 refactor requirement
 
