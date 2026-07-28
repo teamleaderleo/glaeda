@@ -103,6 +103,9 @@ pub mod renderprove_artifact_binding;
 pub mod renderprove_execution;
 #[cfg(target_os = "linux")]
 pub mod renderprove_native_probe;
+/// Descriptor-bound protected project/evidence mount lease for native Renderprove probes.
+#[cfg(target_os = "linux")]
+pub mod renderprove_protected_mount;
 pub mod renderprove_verification;
 pub mod renderprove_vision_profile;
 pub mod renderprove_vision_result;
@@ -129,6 +132,8 @@ pub mod runner_user;
 pub mod runner_user_observation;
 /// Pure classification of trusted bounded Rust memory-pressure observations.
 pub mod rust_memory_diagnostic;
+/// Canonical digest binding for reviewed Rust verification envelopes.
+pub mod rust_verification_envelope_digest;
 /// Pure repository-declared Rust build-scope and bounded resource-envelope contracts.
 pub mod rust_verification_envelope;
 pub mod state;
