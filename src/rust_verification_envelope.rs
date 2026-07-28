@@ -938,6 +938,16 @@ impl RustVerificationEnvelope {
     }
 
     #[must_use]
+    pub const fn source(&self) -> &RustVerificationSourceIdentity {
+        &self.source
+    }
+
+    #[must_use]
+    pub const fn command(&self) -> &RepositoryCommandIdentity {
+        &self.command
+    }
+
+    #[must_use]
     pub const fn scope(&self) -> &RustVerificationScope {
         &self.scope
     }
