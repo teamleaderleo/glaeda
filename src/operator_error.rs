@@ -251,13 +251,13 @@ mod tests {
     use super::{
         ALL_OPERATOR_ERROR_CODES, ALL_OPERATOR_SUGGESTED_COMMANDS,
         MAX_OPERATOR_PUBLIC_ERROR_SUMMARY_BYTES, OPERATOR_PUBLIC_ERROR_SCHEMA_VERSION,
-        OperatorApprovalClass, OperatorErrorCode, OperatorPublicError, OperatorRemediationClass,
-        OperatorRetryClass, OperatorSuggestedCommand,
+        OperatorApprovalClass, OperatorDependencyClass, OperatorErrorCode, OperatorPublicError,
+        OperatorRemediationClass, OperatorRetryClass, OperatorSuggestedCommand,
     };
 
     #[test]
     fn every_code_has_one_unique_complete_mapping() {
-        assert_eq!(ALL_OPERATOR_ERROR_CODES.len(), 55);
+        assert_eq!(ALL_OPERATOR_ERROR_CODES.len(), 61);
         let mut encoded_codes = BTreeSet::new();
 
         for &code in ALL_OPERATOR_ERROR_CODES {
@@ -337,6 +337,75 @@ mod tests {
                 "dependency": "durable_state"
             })
         );
+    }
+
+    #[test]
+    fn accepted_product_failure_classes_have_distinct_codes_and_tuples() {
+        let cases = [
+            (
+                OperatorErrorCode::DurableStateRecoveryRequired,
+                OperatorRetryClass::AfterRepair,
+                OperatorRemediationClass::Repair,
+                Some(OperatorSuggestedCommand::WorkerRunOnce),
+                Some(OperatorDependencyClass::DurableState),
+            ),
+            (
+                OperatorErrorCode::UnsupportedPlatform,
+                OperatorRetryClass::Never,
+                OperatorRemediationClass::Terminal,
+                Some(OperatorSuggestedCommand::Status),
+                None,
+            ),
+            (
+                OperatorErrorCode::LimaIdentityMismatch,
+                OperatorRetryClass::AfterRepair,
+                OperatorRemediationClass::Repair,
+                Some(OperatorSuggestedCommand::Status),
+                Some(OperatorDependencyClass::Lima),
+            ),
+            (
+                OperatorErrorCode::CapacityRefused,
+                OperatorRetryClass::AfterRefresh,
+                OperatorRemediationClass::Refresh,
+                Some(OperatorSuggestedCommand::WorkerRunOnce),
+                Some(OperatorDependencyClass::RunnerReadiness),
+            ),
+            (
+                OperatorErrorCode::TerminalClassificationInconclusive,
+                OperatorRetryClass::Never,
+                OperatorRemediationClass::Terminal,
+                Some(OperatorSuggestedCommand::Status),
+                None,
+            ),
+            (
+                OperatorErrorCode::DurableStateVersionIncompatible,
+                OperatorRetryClass::AfterRepair,
+                OperatorRemediationClass::Repair,
+                Some(OperatorSuggestedCommand::Status),
+                Some(OperatorDependencyClass::DurableState),
+            ),
+        ];
+
+        for (code, retry, remediation, command, dependency) in cases {
+            let public = OperatorPublicError::from_code(code);
+            assert_eq!(public.retry(), retry, "retry mismatch: {code:?}");
+            assert_eq!(
+                public.remediation(),
+                remediation,
+                "remediation mismatch: {code:?}"
+            );
+            assert_eq!(
+                public.suggested_command(),
+                command,
+                "command mismatch: {code:?}"
+            );
+            assert_eq!(
+                public.dependency(),
+                dependency,
+                "dependency mismatch: {code:?}"
+            );
+            assert!(public.approval().is_none());
+        }
     }
 
     #[test]
