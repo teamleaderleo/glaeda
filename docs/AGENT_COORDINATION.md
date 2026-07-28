@@ -16,7 +16,7 @@ Before delegating implementation, record all of the following:
 - issue or objective;
 - files or subsystem owned by the agent;
 - files and authority explicitly outside its scope;
-- concrete deliverable, normally a branch, commit, pull request, review, or issue comment;
+- concrete deliverable, normally a branch, commit, pull request, review, merge, or issue comment;
 - required checks;
 - completion signal;
 - bounded recovery rule when the signal does not appear.
@@ -26,7 +26,8 @@ A useful completion signal is externally observable and exact, for example:
 - branch name plus head commit SHA;
 - pull request number plus exact tested head SHA;
 - review or issue comment that names the exact commit inspected;
-- workflow run IDs and conclusions for that exact commit.
+- workflow run IDs and conclusions for that exact commit;
+- merge commit SHA tied to the exact accepted pull-request head.
 
 A private chat state, an agent saying it is waiting, or an unspecified future event is not a completion signal.
 
@@ -41,6 +42,25 @@ An implementation agent has only three valid terminal states:
 `Waiting`, `scheduled`, `listening`, and `monitoring` are not terminal states for repository implementation.
 
 The coordinator must continue independent work rather than pause for delegated agents. It may check the declared completion signal at most twice during the active coordination pass. When the artifact is still absent after the second check, classify the delegation as stalled and immediately take over, reassign, or reduce the scope. Do not create a scheduled task as a third check.
+
+## Merge authority
+
+Repository merge is an ordinary reversible repository action. A separate human merge approval is never required.
+
+An agent may merge when:
+
+- the pull request is tied to an exact current head;
+- required checks for that exact head have passed;
+- the complete final diff remains inside the declared file and authority fence;
+- the applicable review requirement is satisfied;
+- GitHub reports the candidate mergeable;
+- the merge operation names the expected head SHA so head movement fails closed.
+
+Routine low-risk changes may be self-reviewed and merged by their author. High-risk changes require an independent exact-head acceptance, and the acceptance reviewer does not author the final repair it accepts. After acceptance, any eligible agent may merge the accepted head.
+
+Human approval can remain a prerequisite for effects beyond repository merge, such as credential configuration or rotation, operator-machine service installation or removal, paid-capacity changes, external publication or contact, release signing, destructive non-test data changes, or irreversible migrations without a proven recovery path.
+
+After merge, update the canonical roster and dependent lanes immediately. Any head movement before merge expires prior acceptance.
 
 ## Dependency signalling
 
@@ -88,7 +108,7 @@ Base: <exact SHA>
 Objective: <one concrete outcome>
 Owned scope: <files/subsystem>
 Excluded scope: <authority and files>
-Deliverable: <branch/PR/review/comment>
+Deliverable: <branch/PR/review/merge/comment>
 Checks: <exact commands or workflows>
 Completion signal: <observable artifact and exact identity>
 Recovery: after two missing-signal checks, coordinator takes over or reassigns
@@ -98,6 +118,7 @@ Recovery: after two missing-signal checks, coordinator takes over or reassigns
 
 Do not:
 
+- add a human merge-approval gate after the accepted review and exact-head checks are complete;
 - tell another agent to wait indefinitely for an unspecified signal;
 - create reminders or condition watches to coordinate implementation agents;
 - leave an agent in a listening state after its independent work is complete;
@@ -107,4 +128,4 @@ Do not:
 - assume a scheduled task was received, executed, or understood;
 - treat silence as success.
 
-The repository is the coordination surface. Exact commits, pull requests, comments, and workflow conclusions are the signals.
+The repository is the coordination surface. Exact commits, pull requests, comments, merges, and workflow conclusions are the signals.

@@ -95,6 +95,16 @@ A bootstrap result of `ready_with_declared_deviations` is acceptable when every 
 
 Keep changes small enough to review. State the security impact, commands run, and any host assumptions. Do not claim a VPS, GitHub runner, Podman preview, route, provider path, automatic repair, rollback, restore, incident upload, or fleet directive passed unless the exact tested commit and result are available.
 
+## Merge authority
+
+- Repository merge is an ordinary reversible repository action. Agents may merge an exact pull-request head once required checks pass, declared review requirements are satisfied, the complete final diff remains within scope, and GitHub reports the candidate mergeable.
+- A separate human merge approval is never required.
+- Routine low-risk changes may be self-reviewed and merged by their author after the required checks and complete-final-diff review.
+- Privilege, ownership, adoption, durable persistence and recovery, rollback or compensation, secret handling, concurrency, destructive-operation, or comparable high-risk changes require an independent exact-head acceptance. After acceptance, an eligible agent may merge the accepted head. The acceptance reviewer does not author the final repair it accepts.
+- Merge with an expected head SHA. Any head movement expires prior acceptance and requires the applicable review again.
+- Update canonical trackers and dependent lanes immediately after merge.
+- Human approval may still be required for effects beyond repository merge, including credential configuration or rotation, operator-machine service installation or removal, paid-capacity changes, external publication or contact, release signing, destructive non-test data changes, and irreversible migrations without a proven recovery path.
+
 ## Review workflow
 
 - Review your own diff continuously while implementing. Before declaring a change ready, read the complete final diff once for correctness, accidental scope, stale comments, duplicated logic, missing failure cases, and violations of the accepted ADRs.
