@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - tmp/p03-rustfmt-carrier
+  pull_request:
 
 permissions:
   contents: read
