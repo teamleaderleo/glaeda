@@ -31,15 +31,15 @@ jobs:
           cargo test --locked rust_memory_diagnostic
           cargo clippy --locked --all-targets --all-features -- -D warnings
           cargo test --locked --all-targets --all-features -- --test-threads=1
-      - name: Commit source-only repair
+      - name: Publish validated product tree
         run: |
           git config user.name "Agent 3"
           git config user.email "agent3@users.noreply.github.com"
-          rm -f \
-            .github/issue217-envelope-binding.py \
-            .github/workflows/agent3-issue217-envelope-binding.yml \
-            .github/agent3-issue217-trigger
-          git add -A
+          git add \
+            src/lib.rs \
+            src/rust_verification_envelope.rs \
+            src/rust_memory_diagnostic.rs \
+            src/rust_memory_diagnostic
           git diff --cached --check
           git commit -m "Bind Rust memory diagnostics to one exact envelope"
           git push origin HEAD:${{ github.event.pull_request.head.ref }}
