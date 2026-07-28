@@ -7,6 +7,7 @@ use crate::execution_admission::EpochMillis;
 use crate::rust_verification_envelope::{
     RustRuntimeConcurrency, RustVerificationEnvelope, RustVerificationSourceIdentity,
 };
+use crate::rust_verification_envelope_digest::digest_rust_verification_envelope;
 use crate::verification_profile::{RepositoryCommandIdentity, VerificationProfileId};
 
 pub const RUST_MEMORY_DIAGNOSTIC_SCHEMA_VERSION: u8 = 1;
@@ -226,14 +227,28 @@ pub struct RustMemoryDiagnosticEnvelopeBinding {
 }
 
 impl RustMemoryDiagnosticEnvelopeBinding {
-    #[must_use]
+    /// Bind one diagnostic identity and authority snapshot to the same exact envelope.
+    ///
+    /// The envelope digest is derived canonically inside this constructor. Callers supply only the
+    /// attempt and process-group identities, so a digest from another envelope cannot label the
+    /// retained profile, source, command, resource, concurrency, or duration authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded diagnostic error when the exact envelope cannot be canonically digested.
     pub fn from_envelope(
         envelope: &RustVerificationEnvelope,
-        envelope_digest: Sha256Digest,
         attempt_id: RustVerificationAttemptId,
         process_group: RustProcessGroupIdentity,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, RustMemoryDiagnosticError> {
+        let envelope_digest = digest_rust_verification_envelope(envelope).map_err(|_| {
+            RustMemoryDiagnosticError::new(
+                "identity.envelope_digest",
+                "envelope_digest_unavailable",
+                "exact Rust verification envelope could not be canonically digested",
+            )
+        })?;
+        Ok(Self {
             identity: RustMemoryDiagnosticIdentity::from_envelope(
                 envelope,
                 envelope_digest,
@@ -241,7 +256,7 @@ impl RustMemoryDiagnosticEnvelopeBinding {
                 process_group,
             ),
             authority: RustMemoryAuthoritySnapshot::from_envelope(envelope),
-        }
+        })
     }
 
     #[must_use]
