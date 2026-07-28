@@ -35,6 +35,8 @@ The command passes one typed `Submit` mutation to `apply_personal_worker_store_m
 
 A first exact submission advances the store revision and queue generation once. Replaying the same request semantics against the resulting snapshot returns `duplicate` without changing durable bytes. Reusing the request ID with different semantics returns `conflict`. Retained terminal identity also returns `conflict`.
 
+The live queue accepts at most 256 typed requests. A submission against an already-full valid queue is refused as `invalid_mutation` without publishing new durable bytes. Bounded request fields make this semantic queue cap the CLI-reachable capacity boundary before one additional submission could exceed the 1 MiB store document limit. Canonical document encoding remains the final byte-bound guard for every store mutation.
+
 The command constructs only a repository-build cache namespace tied to the exact submitted repository. Cancellation defaults to active and fallback eligibility defaults to ineligible. No admission, reservation, cache lease, lifecycle transition, profile intent, or last-activity evidence can be supplied.
 
 ## Observation and submission time
