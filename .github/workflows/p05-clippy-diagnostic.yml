@@ -12,15 +12,15 @@ jobs:
   diagnose:
     runs-on: ubuntu-24.04
     steps:
-      - name: Run focused Clippy without checkout
+      - name: Prepare exact focused crate
         shell: bash
         run: |
           set -euo pipefail
           root=/tmp/p05
           mkdir -p "$root/src/operator_error" "$root/tests"
-          curl -fsSL "https://raw.githubusercontent.com/teamleaderleo/smolrunner/daeb23b7a728ad0958ceb44441765e7f6bb97072/src/operator_error.rs" > "$root/src/operator_error.rs"
-          curl -fsSL "https://raw.githubusercontent.com/teamleaderleo/smolrunner/daeb23b7a728ad0958ceb44441765e7f6bb97072/src/operator_error/catalog.rs" > "$root/src/operator_error/catalog.rs"
-          curl -fsSL "https://raw.githubusercontent.com/teamleaderleo/smolrunner/daeb23b7a728ad0958ceb44441765e7f6bb97072/tests/operator_error_contract.rs" > "$root/tests/operator_error_contract.rs"
+          curl -fsSL "https://raw.githubusercontent.com/teamleaderleo/smolrunner/dc39248e48dc754f953f8d223e84f119b7afc543/src/operator_error.rs" > "$root/src/operator_error.rs"
+          curl -fsSL "https://raw.githubusercontent.com/teamleaderleo/smolrunner/dc39248e48dc754f953f8d223e84f119b7afc543/src/operator_error/catalog.rs" > "$root/src/operator_error/catalog.rs"
+          curl -fsSL "https://raw.githubusercontent.com/teamleaderleo/smolrunner/dc39248e48dc754f953f8d223e84f119b7afc543/tests/operator_error_contract.rs" > "$root/tests/operator_error_contract.rs"
           cat > "$root/Cargo.toml" <<'EOF'
           [package]
           name = "p05-diagnostic"
@@ -36,4 +36,22 @@ jobs:
           all = "warn"
           EOF
           cd "$root"
+          cargo fmt --all
+
+      - name: Run focused Clippy
+        shell: bash
+        run: |
+          cd /tmp/p05
           cargo clippy --quiet --test operator_error_contract -- -D warnings
+
+      - name: Upload canonical formatted files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: p05-formatted
+          path: |
+            /tmp/p05/src/operator_error.rs
+            /tmp/p05/src/operator_error/catalog.rs
+            /tmp/p05/tests/operator_error_contract.rs
+          if-no-files-found: error
+          retention-days: 1
