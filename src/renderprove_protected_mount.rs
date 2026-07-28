@@ -333,8 +333,10 @@ pub fn acquire_renderprove_protected_mount_lease(
     let evidence_alias = match create_alias_directory(&mount_root, "evidence") {
         Ok(alias) => alias,
         Err(error) => {
-            let _ = remove_alias_directory(&mount_root, &project_alias.name, &project_alias.base);
-            return Err(error);
+            return Err(prefer_cleanup_error(
+                error,
+                cleanup_created_aliases(&mount_root, &[&project_alias]),
+            ));
         }
     };
 
@@ -348,9 +350,10 @@ pub fn acquire_renderprove_protected_mount_lease(
         &evidence_alias.name,
         &project_alias.path,
     ) {
-        let _ = remove_alias_directory(&mount_root, &evidence_alias.name, &evidence_alias.base);
-        let _ = remove_alias_directory(&mount_root, &project_alias.name, &project_alias.base);
-        return Err(error);
+        return Err(prefer_cleanup_error(
+            error,
+            cleanup_created_aliases(&mount_root, &[&evidence_alias, &project_alias]),
+        ));
     }
 
     let project_alias_mount = match open_alias_mount(
@@ -361,11 +364,10 @@ pub fn acquire_renderprove_protected_mount_lease(
     ) {
         Ok(alias) => alias,
         Err(error) => {
-            let _ = detach_mount(&evidence_alias.path);
-            let _ = detach_mount(&project_alias.path);
-            let _ = remove_alias_directory(&mount_root, &evidence_alias.name, &evidence_alias.base);
-            let _ = remove_alias_directory(&mount_root, &project_alias.name, &project_alias.base);
-            return Err(error);
+            return Err(prefer_cleanup_error(
+                error,
+                cleanup_attached_aliases(&mount_root, &[&evidence_alias, &project_alias]),
+            ));
         }
     };
     let evidence_alias_mount = match open_alias_mount(
@@ -376,11 +378,10 @@ pub fn acquire_renderprove_protected_mount_lease(
     ) {
         Ok(alias) => alias,
         Err(error) => {
-            let _ = detach_mount(&evidence_alias.path);
-            let _ = detach_mount(&project_alias.path);
-            let _ = remove_alias_directory(&mount_root, &evidence_alias.name, &evidence_alias.base);
-            let _ = remove_alias_directory(&mount_root, &project_alias.name, &project_alias.base);
-            return Err(error);
+            return Err(prefer_cleanup_error(
+                error,
+                cleanup_attached_aliases(&mount_root, &[&evidence_alias, &project_alias]),
+            ));
         }
     };
 
@@ -643,6 +644,53 @@ impl MountOperations for LinuxMountOperations {
     }
 }
 
+fn record_cleanup_error(
+    first_error: &mut Option<RenderproveProtectedMountError>,
+    result: Result<(), RenderproveProtectedMountError>,
+) {
+    if let Err(error) = result {
+        first_error.get_or_insert(error);
+    }
+}
+
+fn cleanup_created_aliases(
+    mount_root: &OwnedFd,
+    aliases: &[&CreatedAlias],
+) -> Result<(), RenderproveProtectedMountError> {
+    let mut first_error = None;
+    for alias in aliases {
+        record_cleanup_error(
+            &mut first_error,
+            remove_alias_directory(mount_root, &alias.name, &alias.base),
+        );
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+fn cleanup_attached_aliases(
+    mount_root: &OwnedFd,
+    aliases: &[&CreatedAlias],
+) -> Result<(), RenderproveProtectedMountError> {
+    let mut first_error = None;
+    for alias in aliases {
+        record_cleanup_error(&mut first_error, detach_mount(&alias.path));
+    }
+    for alias in aliases {
+        record_cleanup_error(
+            &mut first_error,
+            remove_alias_directory(mount_root, &alias.name, &alias.base),
+        );
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+fn prefer_cleanup_error(
+    original: RenderproveProtectedMountError,
+    cleanup: Result<(), RenderproveProtectedMountError>,
+) -> RenderproveProtectedMountError {
+    cleanup.err().unwrap_or(original)
+}
+
 fn attach_mount_pair<B: MountOperations>(
     backend: &mut B,
     project_source: &OwnedFd,
@@ -657,13 +705,17 @@ fn attach_mount_pair<B: MountOperations>(
     let evidence_mount = match backend.clone_mount(evidence_source) {
         Ok(mount) => mount,
         Err(error) => {
-            let _ = backend.detach_mount(project_alias_path);
-            return Err(error);
+            return Err(prefer_cleanup_error(
+                error,
+                backend.detach_mount(project_alias_path),
+            ));
         }
     };
     if let Err(error) = backend.attach_mount(&evidence_mount, mount_root, evidence_alias) {
-        let _ = backend.detach_mount(project_alias_path);
-        return Err(error);
+        return Err(prefer_cleanup_error(
+            error,
+            backend.detach_mount(project_alias_path),
+        ));
     }
     Ok(())
 }
@@ -1227,6 +1279,7 @@ mod tests {
         events: Vec<&'static str>,
         attach_calls: usize,
         fail_second_attach: bool,
+        fail_detach: bool,
     }
 
     impl MountOperations for FakeMountOperations {
@@ -1263,6 +1316,13 @@ mod tests {
             _alias_path: &Path,
         ) -> Result<(), RenderproveProtectedMountError> {
             self.events.push("detach");
+            if self.fail_detach {
+                return Err(RenderproveProtectedMountError::new(
+                    RenderproveProtectedMountErrorKind::CleanupFailed,
+                    "cleanup",
+                    "injected rollback failure",
+                ));
+            }
             Ok(())
         }
     }
@@ -1313,6 +1373,36 @@ mod tests {
         )
         .expect_err("second attach fails");
         assert_eq!(error.stage(), "mount");
+        assert_eq!(
+            backend.events,
+            ["clone", "attach", "clone", "attach", "detach"]
+        );
+    }
+
+    #[test]
+    fn attached_pair_reports_cleanup_failure_when_project_rollback_fails() {
+        let root = TempRoot::new("rollback-failure");
+        let descriptor = root.open();
+        let mut backend = FakeMountOperations {
+            fail_second_attach: true,
+            fail_detach: true,
+            ..FakeMountOperations::default()
+        };
+        let error = attach_mount_pair(
+            &mut backend,
+            &descriptor,
+            &descriptor,
+            &descriptor,
+            OsStr::new("project-00000000000000000000000000000000"),
+            OsStr::new("evidence-00000000000000000000000000000000"),
+            Path::new("/private/project-alias"),
+        )
+        .expect_err("rollback failure must fail closed");
+        assert_eq!(
+            error.kind(),
+            RenderproveProtectedMountErrorKind::CleanupFailed
+        );
+        assert_eq!(error.stage(), "cleanup");
         assert_eq!(
             backend.events,
             ["clone", "attach", "clone", "attach", "detach"]
