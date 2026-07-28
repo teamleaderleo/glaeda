@@ -1,0 +1,55 @@
+name: Agent 3 serial Renderprove mount validation
+
+on:
+  pull_request:
+    types: [synchronize]
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    if: github.event.pull_request.head.ref == 'repair/issue-224-clean-replay' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Check out exact replay branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+          show-progress: false
+      - name: Run replay with serial full suite
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import textwrap
+
+          template = Path('.github/issue224-replay-template.yml').read_text(encoding='utf-8')
+          start_marker = '      - name: Replay and capture validation\n        run: |\n'
+          end_marker = '      - name: Publish result or diagnostic\n'
+          start = template.index(start_marker) + len(start_marker)
+          end = template.index(end_marker, start)
+          script = textwrap.dedent(template[start:end])
+          old = 'cargo test --locked --all-targets --all-features\n'
+          new = 'cargo test --locked --all-targets --all-features -- --test-threads=1\n'
+          if script.count(old) != 1:
+              raise SystemExit(f'full-suite command count: {script.count(old)}')
+          Path('/tmp/issue224-replay.sh').write_text(script.replace(old, new, 1), encoding='utf-8')
+          PY
+          bash /tmp/issue224-replay.sh
+          status=$(sed -n 's/^agent3_status=//p' .github/issue224-replay.log | tail -n 1)
+          test "$status" = 0
+      - name: Commit clean product replay
+        run: |
+          git config user.name "Agent 3"
+          git config user.email "agent3@users.noreply.github.com"
+          git rm .github/issue224-hardening.py
+          git rm .github/issue224-replay-template.yml
+          git rm .github/workflows/agent3-issue224-serial.yml
+          git rm -f .github/agent3-issue224-trigger
+          git rm -f .github/issue224-replay.log
+          git add Cargo.toml Cargo.lock src/lib.rs src/renderprove_native_probe.rs src/renderprove_protected_mount.rs
+          git diff --cached --check
+          git commit -m "Create hardened Renderprove protected mount lease"
+          git push origin HEAD:${{ github.event.pull_request.head.ref }}
