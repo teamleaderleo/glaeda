@@ -232,8 +232,14 @@ fn different_envelopes_cannot_substitute_digest_or_authority() {
         longer_binding.identity().envelope_digest(),
         &digest_rust_verification_envelope(&longer).expect("longer envelope digest")
     );
-    assert_eq!(shorter_binding.authority().maximum_execution_millis(), 12_345);
-    assert_eq!(longer_binding.authority().maximum_execution_millis(), 54_321);
+    assert_eq!(
+        shorter_binding.authority().maximum_execution_millis(),
+        12_345
+    );
+    assert_eq!(
+        longer_binding.authority().maximum_execution_millis(),
+        54_321
+    );
 }
 
 #[test]
