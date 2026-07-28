@@ -247,7 +247,7 @@ mod tests {
         ALL_OPERATOR_ERROR_CODES, ALL_OPERATOR_SUGGESTED_COMMANDS,
         MAX_OPERATOR_PUBLIC_ERROR_SUMMARY_BYTES, OPERATOR_PUBLIC_ERROR_SCHEMA_VERSION,
         OperatorApprovalClass, OperatorErrorCode, OperatorPublicError, OperatorRemediationClass,
-        OperatorRetryClass,
+        OperatorRetryClass, OperatorSuggestedCommand,
     };
 
     #[test]
@@ -292,18 +292,20 @@ mod tests {
             "smolrunner worker run-once",
             "smolrunner queue list",
         ];
-        let observed = ALL_OPERATOR_SUGGESTED_COMMANDS
-            .iter()
-            .map(OperatorSuggestedCommand::as_str)
-            .collect::<Vec<_>>();
-        assert_eq!(observed, expected);
 
-        for command in ALL_OPERATOR_SUGGESTED_COMMANDS {
+        for (command, expected) in ALL_OPERATOR_SUGGESTED_COMMANDS.iter().zip(expected) {
+            assert_eq!(command.as_str(), expected);
             assert_eq!(
-                serde_json::to_value(command).expect("serialize command"),
-                json!(command.as_str())
+                serde_json::to_value(*command).expect("serialize command"),
+                json!(expected)
             );
         }
+
+        assert_eq!(ALL_OPERATOR_SUGGESTED_COMMANDS.len(), expected.len());
+        assert_eq!(
+            OperatorSuggestedCommand::Status.as_str(),
+            "smolrunner status"
+        );
     }
 
     #[test]
