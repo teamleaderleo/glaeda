@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - diag/c01-test-78d5bd3
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
