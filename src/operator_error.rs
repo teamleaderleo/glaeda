@@ -74,7 +74,7 @@ pub const ALL_OPERATOR_SUGGESTED_COMMANDS: &[OperatorSuggestedCommand] = &[
 
 impl OperatorSuggestedCommand {
     #[must_use]
-    pub const fn as_str(self) -> &'static str {
+    pub const fn as_str(&self) -> &'static str {
         match self {
             Self::Status => "smolrunner status",
             Self::WorkerInit => "smolrunner worker init",
@@ -294,7 +294,7 @@ mod tests {
         ];
         let observed = ALL_OPERATOR_SUGGESTED_COMMANDS
             .iter()
-            .map(|command| command.as_str())
+            .map(OperatorSuggestedCommand::as_str)
             .collect::<Vec<_>>();
         assert_eq!(observed, expected);
 
