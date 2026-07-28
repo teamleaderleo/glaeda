@@ -88,6 +88,62 @@ jobs:
           if count != 1:
               raise SystemExit(f'mount root policy anchor count: {count}')
 
+          pattern = re.compile(r'fn validate_absolute_path\(path: PathBuf\) -> Result<PathBuf, RenderproveProtectedMountError> \{[\s\S]*?\n}\n\nfn absolute_components')
+          absolute = '''fn validate_absolute_path(path: PathBuf) -> Result<PathBuf, RenderproveProtectedMountError> {
+              let valid = path.to_str().is_some_and(|value| {
+                  value.starts_with('/')
+                      && value != "/"
+                      && !value.ends_with('/')
+                      && value[1..]
+                          .split('/')
+                          .all(|component| !component.is_empty() && component != "." && component != "..")
+              });
+              if !valid {
+                  return Err(RenderproveProtectedMountError::new(
+                      RenderproveProtectedMountErrorKind::InvalidSource,
+                      "source",
+                      "reviewed Renderprove project path must be absolute, normalized, non-root, and UTF-8",
+                  ));
+              }
+              Ok(path)
+          }
+
+          fn absolute_components'''
+          text, count = pattern.subn(absolute, text, count=1)
+          if count != 1:
+              raise SystemExit(f'absolute path validation anchor count: {count}')
+
+          pattern = re.compile(r'fn relative_components\(path: &Path\) -> Result<Vec<&OsStr>, RenderproveProtectedMountError> \{[\s\S]*?\n}\n\n#\[cfg\(test\)\]')
+          relative = '''fn relative_components(path: &Path) -> Result<Vec<&OsStr>, RenderproveProtectedMountError> {
+              let valid = path.to_str().is_some_and(|value| {
+                  !value.is_empty()
+                      && !value.starts_with('/')
+                      && !value.ends_with('/')
+                      && value
+                          .split('/')
+                          .all(|component| !component.is_empty() && component != "." && component != "..")
+              });
+              if !valid {
+                  return Err(RenderproveProtectedMountError::new(
+                      RenderproveProtectedMountErrorKind::InvalidSource,
+                      "evidence",
+                      "Renderprove evidence directory must be one normalized project-relative path",
+                  ));
+              }
+              Ok(path
+                  .components()
+                  .filter_map(|component| match component {
+                      Component::Normal(value) => Some(value),
+                      _ => None,
+                  })
+                  .collect())
+          }
+
+          #[cfg(test)]'''
+          text, count = pattern.subn(relative, text, count=1)
+          if count != 1:
+              raise SystemExit(f'relative path validation anchor count: {count}')
+
           pattern = re.compile(r'(\n    #\[test\]\n    fn errors_and_cleanup_receipts_are_bounded\(\) \{)')
           tests = '''
               #[test]
@@ -104,6 +160,20 @@ jobs:
           text, count = pattern.subn(tests, text, count=1)
           if count != 1:
               raise SystemExit(f'mount root test anchor count: {count}')
+
+          old_invalid = 'for invalid in ["relative", "/", "/tmp/./project", "/tmp/../project"] {'
+          new_invalid = '''for invalid in [
+                  "relative",
+                  "/",
+                  "//tmp/project",
+                  "/tmp/project/",
+                  "/tmp//project",
+                  "/tmp/./project",
+                  "/tmp/../project",
+              ] {'''
+          if text.count(old_invalid) != 1:
+              raise SystemExit(f'invalid path test anchor count: {text.count(old_invalid)}')
+          text = text.replace(old_invalid, new_invalid, 1)
           mount.write_text(text, encoding='utf-8')
 
           cargo = Path('Cargo.toml')
@@ -170,7 +240,7 @@ jobs:
             git rm .github/issue224-hardening.py
             git rm .github/workflows/agent3-issue224-replay.yml
             git rm -f .github/agent3-issue224-trigger
-            rm -f .github/issue224-replay.log
+            git rm -f .github/issue224-replay.log
             git add Cargo.toml Cargo.lock src/lib.rs src/renderprove_native_probe.rs src/renderprove_protected_mount.rs
             git diff --cached --check
             git commit -m "Create hardened Renderprove protected mount lease"
