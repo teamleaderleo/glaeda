@@ -1,16 +1,21 @@
 mod personal_worker_cancel_command;
 mod personal_worker_read_command;
+mod personal_worker_submit_command;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use personal_worker_cancel_command::{
     PersonalWorkerCancelCommandError, cancel_queued_job, render_cancel_receipt_human,
 };
 use personal_worker_read_command::{
     PersonalWorkerReadCommandError, read_job, read_queue_page, read_status, render_job_human,
     render_queue_page_human, render_status_human,
+};
+use personal_worker_submit_command::{
+    PersonalWorkerSubmitCommandError, PersonalWorkerSubmitCommandInput,
+    render_submit_receipt_human, submit_queued_job,
 };
 #[cfg(target_os = "linux")]
 use rustix::rand::{GetRandomFlags, getrandom};
@@ -166,6 +171,69 @@ enum QueueCommand {
         #[arg(long, default_value_t = 100)]
         limit: u16,
     },
+    /// Submit one exact queued request using caller-supplied durable evidence.
+    Submit(Box<QueueSubmitArgs>),
+}
+
+#[derive(Debug, Args)]
+struct QueueSubmitArgs {
+    /// Explicit absolute normalized personal-worker state root.
+    #[arg(long)]
+    store_root: PathBuf,
+    /// Exact expected durable store revision.
+    #[arg(long)]
+    revision: String,
+    /// Exact expected queue generation.
+    #[arg(long)]
+    generation: String,
+    /// Explicit queue observation in epoch milliseconds.
+    #[arg(long)]
+    observed_at: String,
+    /// Exact bounded personal-worker request ID.
+    #[arg(long)]
+    request_id: String,
+    /// Exact verification-profile ID.
+    #[arg(long)]
+    verification_profile: String,
+    /// Exact runner-profile ID.
+    #[arg(long)]
+    runner_profile: String,
+    /// Exact owner/name repository identity.
+    #[arg(long)]
+    repository: String,
+    /// Complete immutable Git commit object ID.
+    #[arg(long)]
+    commit: String,
+    /// Complete immutable Git tree object ID.
+    #[arg(long)]
+    tree: String,
+    /// Fixed priority: background, normal, or interactive.
+    #[arg(long)]
+    priority: String,
+    /// Positive bounded requested CPU millicores.
+    #[arg(long)]
+    cpu_millis: String,
+    /// Positive bounded requested memory bytes.
+    #[arg(long)]
+    memory_bytes: String,
+    /// Positive bounded requested PID count.
+    #[arg(long)]
+    pids: String,
+    /// Exact bounded cache ID.
+    #[arg(long)]
+    cache_id: String,
+    /// Canonical cache namespace digest.
+    #[arg(long)]
+    cache_namespace_digest: String,
+    /// Fixed cache access: read, write, or exclusive.
+    #[arg(long)]
+    cache_access: String,
+    /// Explicit submission time in epoch milliseconds.
+    #[arg(long)]
+    submitted_at: String,
+    /// Optional explicit operator deadline in epoch milliseconds.
+    #[arg(long)]
+    operator_deadline: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -248,6 +316,30 @@ fn main() -> ExitCode {
                 offset,
                 limit,
             } => run_queue_list(cli.output, &store_root, revision, generation, offset, limit),
+            QueueCommand::Submit(arguments) => run_queue_submit(
+                cli.output,
+                &arguments.store_root,
+                PersonalWorkerSubmitCommandInput {
+                    revision: &arguments.revision,
+                    generation: &arguments.generation,
+                    observed_at: &arguments.observed_at,
+                    request_id: &arguments.request_id,
+                    verification_profile: &arguments.verification_profile,
+                    runner_profile: &arguments.runner_profile,
+                    repository: &arguments.repository,
+                    commit: &arguments.commit,
+                    tree: &arguments.tree,
+                    priority: &arguments.priority,
+                    cpu_millis: &arguments.cpu_millis,
+                    memory_bytes: &arguments.memory_bytes,
+                    pids: &arguments.pids,
+                    cache_id: &arguments.cache_id,
+                    cache_namespace_digest: &arguments.cache_namespace_digest,
+                    cache_access: &arguments.cache_access,
+                    submitted_at: &arguments.submitted_at,
+                    operator_deadline: arguments.operator_deadline.as_deref(),
+                },
+            ),
         },
         Command::Job { command } => match command {
             JobCommand::Show {
@@ -351,6 +443,26 @@ fn run_queue_list(
     ExitCode::SUCCESS
 }
 
+fn run_queue_submit(
+    output: OutputFormat,
+    store_root: &Path,
+    input: PersonalWorkerSubmitCommandInput<'_>,
+) -> ExitCode {
+    let receipt = match submit_queued_job(store_root, input) {
+        Ok(receipt) => receipt,
+        Err(error) => return emit_personal_worker_submit_error(output, &error),
+    };
+    match output {
+        OutputFormat::Human => print!("{}", render_submit_receipt_human(&receipt)),
+        OutputFormat::Json => {
+            if print_json(&receipt).is_err() {
+                return ExitCode::from(2);
+            }
+        }
+    }
+    ExitCode::SUCCESS
+}
+
 fn run_job_show(
     output: OutputFormat,
     store_root: &Path,
@@ -400,6 +512,21 @@ fn run_job_cancel(
 fn emit_personal_worker_read_error(
     output: OutputFormat,
     error: &PersonalWorkerReadCommandError,
+) -> ExitCode {
+    match output {
+        OutputFormat::Human => eprintln!("{}", error.message()),
+        OutputFormat::Json => {
+            if print_json(error).is_err() {
+                return ExitCode::from(2);
+            }
+        }
+    }
+    ExitCode::from(2)
+}
+
+fn emit_personal_worker_submit_error(
+    output: OutputFormat,
+    error: &PersonalWorkerSubmitCommandError,
 ) -> ExitCode {
     match output {
         OutputFormat::Human => eprintln!("{}", error.message()),
