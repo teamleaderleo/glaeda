@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - feat/issue-217-rust-memory-classifier
+  pull_request:
 
 permissions:
   contents: read
