@@ -1,0 +1,55 @@
+name: C01 test diagnostic
+
+on:
+  push:
+    branches:
+      - diag/c01-test-78d5bd3
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: c01-test-diagnostic-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-diagnostic:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          show-progress: false
+
+      - name: Install Rust toolchain
+        shell: bash
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Capture full test output
+        shell: bash
+        run: |
+          set +e
+          cargo test --locked --all-targets --all-features -- --nocapture > c01-test.log 2>&1
+          status=$?
+          printf '%s\n' "$status" > c01-test.status
+          exit 0
+
+      - name: Upload test log
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: c01-test-log-${{ github.sha }}
+          path: |
+            c01-test.log
+            c01-test.status
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Preserve test conclusion
+        if: always()
+        shell: bash
+        run: |
+          cat c01-test.log
+          exit "$(cat c01-test.status)"
