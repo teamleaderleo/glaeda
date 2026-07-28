@@ -1,4 +1,4 @@
-#![rustfmt::skip::macros(define_operator_errors)]
+#![rustfmt::skip]
 
 use std::fmt;
 
