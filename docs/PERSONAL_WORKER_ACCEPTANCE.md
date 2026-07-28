@@ -1,6 +1,6 @@
 # Personal worker alpha acceptance contract
 
-Status: W01 contract draft  
+Status: W01 cross-reviewed contract candidate  
 Schema: `personal_worker_acceptance/v1`  
 Exact drafting base: `3aa7c8f0341c6dd9138f7b0b5f2e2470140430ae`  
 Owners: P06 issue #249; product vocabulary cross-review with P01 issue #244
@@ -56,7 +56,7 @@ Every acceptance step MUST identify the command class so current implementation 
 | Continuous supervision | none | `smolrunner worker serve` and service commands | W06; excluded here |
 | Availability controls | none | `smolrunner availability active|away|off|auto` | W06; excluded here |
 
-The final P01/P06 cross-review MUST decide whether `smolrunner worker status` remains an advanced alias after `smolrunner status` exists. This document uses **unified status** and **exact worker snapshot** as distinct concepts until that decision is accepted.
+`smolrunner status` is the routine unified operator report. `smolrunner worker status --store-root ...` remains the strict exact durable-snapshot surface and MUST NOT silently observe Lima, processes, GitHub, a checkout, or unrelated host state.
 
 ## System model and invariants
 
@@ -81,7 +81,25 @@ The persistent Lima instance uses separate machine/profile states:
 - `interactive`: reviewed 3 GiB / 4 vCPU envelope;
 - `work`: reviewed 10 GiB / 8 vCPU envelope.
 
-Profile state MUST NOT be used as a job state. A profile change or stop MUST be refused while a reservation is active, job outcome is uncertain, drain evidence is incomplete, or observations are stale.
+Any eligible queued or active job requests `work`. When the queue is empty and no reservation remains, the desired profile becomes `interactive` after 10 minutes of accepted idle evidence and `stopped` after 30 total idle minutes.
+
+New work cancels a pending downscale. A profile change or stop MUST be refused while a reservation is active, job outcome is uncertain, drain evidence is incomplete, or observations are stale.
+
+Profile state MUST NOT be used as a job state.
+
+### Run-once result
+
+Every `worker run-once` invocation returns exactly one accepted result class:
+
+| Result | Meaning |
+| --- | --- |
+| `satisfied` | The accepted desired state already holds and no mutation was required. |
+| `action_applied` | One exact accepted action completed and was re-observed or durably recorded. |
+| `continuation` | Progress or observation occurred, but another invocation with fresh evidence is required before the next action. |
+| `blocked` | No safe action can proceed until a named dependency, approval, resource, recovery step, or operator decision is supplied. |
+| `failed` | The attempted bounded action ended in a typed failure and no hidden retry is running. |
+
+A continuation is not background work. A blocked result names the blocker and suggested next action.
 
 ### One-shot action boundary
 
@@ -92,9 +110,9 @@ One `worker run-once` invocation MUST:
 3. compute one exact next action;
 4. perform at most one accepted lifecycle or job action, plus the publication inseparable from that action;
 5. re-observe the authority state needed to describe the result;
-6. return a typed result or continuation.
+6. return one accepted result class.
 
-It MUST NOT hide an unbounded polling loop. Work that needs new evidence returns a continuation and requires another operator invocation.
+It MUST NOT hide an unbounded polling loop. Work that needs new evidence returns `continuation` and requires another operator invocation.
 
 ### Immutable identity boundary
 
@@ -121,8 +139,6 @@ Stopping or changing the Lima profile MUST preserve the persistent instance disk
 Human and JSON output MUST derive from the same typed report. Public output MUST remain bounded and MUST NOT include private paths, credentials, environment dumps, arbitrary repository contents, raw child output, unreviewed command lines, PIDs, cgroup paths, or raw operating-system prose.
 
 ## Evidence classes
-
-Acceptance evidence is divided into four classes.
 
 | Evidence class | Purpose | Required producer |
 | --- | --- | --- |
@@ -170,483 +186,355 @@ Exact JSON field names remain owned by P03-P05. Until those schemas merge, predi
 
 Setup: valid accepted configuration; no managed state directory or durable document.
 
-Action: routine unified status.
-
-Required predicates:
+Required result:
 
 - supported report schema;
-- state classified as uninitialised or blocked on missing state;
-- suggested next action is `worker init`;
-- no state directory, lock, current document, or staged document is created;
-- no Lima, process, repository, or credential action occurs.
-
-Durable expectation: no files created.
+- uninitialised or missing-state blocker;
+- suggested next action `worker init`;
+- no state directory, lock, current document, or staged document created;
+- no Lima, process, repository, or credential action.
 
 #### A02 — first initialisation
 
-Setup: A01 predecessor.
+Action: `worker init` from A01.
 
-Action: `worker init`.
+Required result:
 
-Required predicates:
-
-- one valid initial durable document is published;
-- store revision and queue generation are exact positive initial values;
-- queue and active sets are empty;
-- initial machine/profile intent matches the accepted P01 contract;
-- public receipt contains no private state-root path.
-
-Durable expectation: one canonical initial document and required lock metadata only.
+- one valid initial canonical durable document;
+- exact positive initial revision and queue generation;
+- empty queued and active sets;
+- initial machine/profile intent matches the accepted configuration contract;
+- bounded receipt with no private state-root path.
 
 #### A03 — repeated initialisation
 
-Setup: exact A02 successor.
+Action: repeat `worker init` on A02.
 
-Action: repeat `worker init`.
-
-Required predicates:
-
-- disposition is idempotent/already initialised;
-- revision, generation, and durable bytes remain unchanged;
-- no Lima or process action occurs.
+Required result: `satisfied` or the accepted idempotent init disposition; revision, generation, and durable bytes unchanged; no Lima or process action.
 
 #### A04 — unified empty status
 
-Setup: exact initialised empty state.
+Required result:
 
-Action: routine unified status.
-
-Required predicates:
-
-- exact configuration identity and current store revision/generation;
-- empty queue and no active or terminal job selected as current work;
-- current and desired machine/profile state are distinct fields;
-- blocker and next action are explicit;
-- report is observational and leaves durable bytes unchanged.
+- exact configuration identity and durable revision/generation;
+- empty queue and no active work;
+- current and desired profile represented separately;
+- blocker and next action explicit;
+- read-only durable bytes.
 
 ### Submission identity, replay, and conflict
 
 #### A05 — first routine submission
 
-Setup: initialised empty state and clean immutable checkout evidence.
+Action: `queue submit --profile PROFILE --repository CHECKOUT` from initialised empty state.
 
-Action: `queue submit --profile PROFILE --repository CHECKOUT`.
+Required result:
 
-Required predicates:
-
-- repository, commit, tree, profile, runner profile, resources, cache identity, and request identity are exact;
-- one queued request is published;
-- store revision and queue generation advance exactly once;
-- cancellation defaults active and fallback eligibility follows accepted policy;
-- no job execution or Lima lifecycle action occurs.
-
-Durable expectation: one canonical successor.
+- exact repository, commit, tree, verification profile, runner profile, resources, cache, and request identity;
+- one queued request;
+- revision and generation advance exactly once;
+- cancellation active and fallback eligibility per accepted policy;
+- no execution or Lima action.
 
 #### A06 — exact submission replay
 
-Setup: exact A05 successor.
+Replay A05 with identical semantics.
 
-Action: replay semantically identical submission with the accepted idempotency/request identity.
-
-Required predicates:
-
-- disposition is `duplicate` or the exact accepted replay term;
-- old and new revision/generation are equal;
-- durable bytes are byte-for-byte unchanged;
-- no host or process action occurs.
+Required result: exact duplicate disposition; old/new revision and generation equal; byte-for-byte unchanged durable state; no host or process action.
 
 #### A07 — changed semantics under the same request ID
 
-Setup: exact A05 successor.
+Change immutable source, profile, resource, cache, or deadline evidence.
 
-Action: reuse the request ID while changing at least one immutable source, profile, resource, cache, or deadline field.
-
-Required predicates:
-
-- disposition is `conflict`;
-- the changed private value is not echoed;
-- durable bytes are unchanged;
-- no host or process action occurs.
+Required result: `conflict`; changed private value not echoed; durable bytes unchanged; no host or process action.
 
 #### A08 — strict stale revision
 
-Setup: current state newer than the supplied expected revision.
+Use a stale expected revision.
 
-Action: strict advanced submission or cancellation.
-
-Required predicates:
-
-- stale revision is distinguishable from conflict and not-found;
-- current state is not disclosed beyond the accepted bounded report;
-- durable bytes are unchanged.
+Required result: stale revision distinguishable from conflict and not-found; no automatic widened retry; durable bytes unchanged.
 
 #### A09 — strict stale queue generation
 
-Setup and action: as A08, with current revision and stale generation.
+Use current revision and stale generation.
 
-Required predicates:
-
-- stale queue generation is distinct from stale revision;
-- durable bytes are unchanged;
-- no inferred retry silently widens authority.
+Required result: stale generation distinct from stale revision; durable bytes unchanged; no inferred retry.
 
 #### A10 — semantic queue capacity
 
-Setup: one valid document with the maximum accepted live queue entries.
+Start from a valid document at the accepted live queue limit and submit one additional request.
 
-Action: submit one additional exact request.
-
-Required predicates:
-
-- bounded capacity/invalid-mutation result;
-- durable bytes unchanged;
-- JSON and human output omit request and path sentinels;
-- the semantic queue cap remains distinct from the canonical durable-document byte guard.
+Required result: bounded capacity/invalid-mutation result; durable bytes unchanged; human/JSON omit request and path sentinels; semantic queue cap distinguished from the canonical document byte guard.
 
 ### Bounded run-once progression
 
 #### A11 — queued work while machine is stopped
 
-Setup: one eligible queued request; Lima observed stopped; no active reservation.
+Required result:
 
-Action: `worker run-once`.
-
-Required predicates:
-
-- exactly one accepted action or continuation is reported;
-- no request is reported running;
-- the result either records work-profile intent or performs the first accepted lifecycle action according to the final I01 decomposition;
-- action count proves no hidden stop/edit/start/readiness polling chain occurred in one invocation unless that chain is one reviewed atomic executor action;
-- fresh evidence is required before the next step.
+- exactly one `action_applied` or `continuation` outcome;
+- no request reported running;
+- work-profile intent or the first accepted lifecycle action only;
+- action-count proof against a hidden lifecycle/readiness loop;
+- fresh evidence required before another action.
 
 #### A12 — profile transition refusal with active or uncertain work
 
-Setup: active reservation, draining work, uncertain prior attempt, or stale job evidence; requested profile change/downscale/stop.
+Setup: active reservation, draining work, uncertain prior attempt, or stale evidence.
 
-Action: `worker run-once`.
-
-Required predicates:
-
-- lifecycle mutation is refused or blocked;
-- active work is not killed implicitly;
-- blocker identifies active, uncertain, drain, or stale-evidence class;
-- durable request/attempt evidence remains intact;
-- no `limactl edit`, stop, or start adapter action occurs.
+Required result: `blocked`; no job killed; blocker class exact; request/attempt evidence retained; no stop/edit/start action.
 
 #### A13 — reviewed work-profile transition
 
-Setup: eligible queue, no active/uncertain work, exact stopped or interactive observation, fixed accepted work envelope.
+Repeated run-once invocations transition stopped/interactive to `work`.
 
-Action: repeated run-once invocations as required by the accepted action boundary.
+Required result across the sequence:
 
-Required predicates across the sequence:
-
-- only reviewed `work` CPU/memory values are selected;
-- transition uses the accepted graceful stop/edit/start/verify contract;
-- each step is idempotent against exact observation;
-- profile generation and instance identity do not drift;
-- persistent disk/cache identity is unchanged;
-- final current profile is `work` before readiness can pass.
+- only reviewed 10 GiB / 8 vCPU values;
+- accepted graceful stop/edit/start/verify contract;
+- each step idempotent against exact observation;
+- instance/profile generation stable;
+- persistent disk/cache identity unchanged;
+- current profile `work` before readiness succeeds.
 
 #### A14 — readiness debt
 
-Setup: work profile selected; official runner/listener readiness is offline, starting, stale, or otherwise incomplete.
+Setup: work profile selected; runner readiness offline, starting, stale, or incomplete.
 
-Action: `worker run-once`.
-
-Required predicates:
-
-- result is blocked/continuation with explicit readiness class;
-- no job execution or terminal-success claim occurs;
-- no new reservation is created from stale readiness evidence;
-- next action requires fresh observation.
+Required result: `continuation` or `blocked` with exact readiness class; no reservation from stale evidence; no execution or success claim.
 
 #### A15 — reservation and starting transition
 
-Setup: eligible queued request, fresh exact capacity/readiness evidence, no conflicting cache lease or reservation.
+Setup: eligible request, fresh capacity/readiness, no conflicting lease/reservation.
 
-Action: run-once.
+Required result:
 
-Required predicates:
-
-- exactly one request is selected by accepted queue policy;
-- reservation identity/generation and applied limits match the request;
-- cache lease is exact and conflict checked;
-- durable revision/generation advance atomically;
-- job state is reserved or starting, never prematurely running;
-- a replay cannot create a second reservation.
+- exactly one selected request;
+- reservation identity/generation and applied limits exact;
+- cache lease exact and conflict checked;
+- atomic durable advance;
+- state reserved or starting, never prematurely running;
+- replay cannot create a second reservation.
 
 #### A16 — accepted named-profile execution
 
-Setup: exact reserved/starting request and reviewed immutable execution plan.
+Required result:
 
-Action: the accepted run-once execution step.
+- exact request, attempt, source, profile, command, workspace/cache, and resource authority retained;
+- repository-owned bootstrap/verification commands run only in the reviewed execution boundary;
+- bounded output, timeout, descendant cleanup, and exit evidence;
+- moving refs, dirty/wrong workspace, undeclared arguments, profile/cache drift, and authority widening fail closed;
+- process start never represented as terminal completion.
 
-Required predicates:
+#### A17 — successful terminal publication
 
-- exact request, attempt, source, verification profile, command identity, workspace/cache identity, and resource authority are retained;
-- repository-owned bootstrap/verification entry points run only inside the reviewed execution boundary;
-- output, timeout, descendant cleanup, and exit evidence are bounded;
-- moving refs, dirty or wrong workspace, undeclared arguments, profile drift, cache drift, and authority widening fail closed;
-- process start is never represented as terminal completion.
+Required result:
 
-#### A17 — deterministic successful terminal publication
+- terminal evidence binds request, attempt, profile, source, execution, and cleanup;
+- active reservation/cache lease release atomic with terminal retention;
+- one exact durable advance;
+- request no longer live;
+- unified status projects retained success.
 
-Setup: A16 execution observation proves successful completion and cleanup.
+#### A18 — failed terminal publication
 
-Action: terminal completion transaction.
+Required result:
 
-Required predicates:
-
-- terminal evidence binds request, attempt, profile, immutable source, execution result, and cleanup result;
-- active reservation and cache lease release are atomic with terminal retention;
-- store revision/generation advance exactly once;
-- queue no longer presents the request as live;
-- unified status can project the retained terminal result.
-
-#### A18 — deterministic failed terminal publication
-
-Setup: reviewed execution produces a typed compile/test/process/timeout/cleanup or other accepted failure.
-
-Required predicates:
-
-- failure remains typed and bounded;
-- unsuccessful execution is never reported as successful because cleanup or publication succeeded;
-- terminal evidence and release semantics remain the same identity-safe transaction as A17;
-- retry eligibility is explicit and does not silently re-execute.
+- typed bounded compile/link/test/process/timeout/runner-loss/cleanup or other accepted failure;
+- failed execution never converted to success by cleanup or publication;
+- identity-safe terminal/release transaction;
+- retry eligibility explicit and no hidden re-execution.
 
 ### Interruption, replay, and recovery
 
 #### A19 — interruption before durable mutation
 
-Inject failure after planning but before any durable write or host action.
-
-Required result: predecessor bytes remain exact; replay recomputes from fresh evidence; no duplicate effect exists.
+Failure after planning but before write/action leaves predecessor bytes exact. Replay recomputes from fresh evidence with no duplicate effect.
 
 #### A20 — interruption with a valid staged successor
 
-Inject failure after a canonical successor is staged but before final publication.
-
-Required result: store recovery validates and publishes only the exact successor; the next command observes the recovered revision/generation before deciding; staged residue is removed.
+Recovery validates and publishes only the exact successor, observes recovered revision/generation before deciding, and removes staged residue.
 
 #### A21 — interruption after durable publication but before response
 
-Inject response loss after an exact state mutation commits.
-
-Required result: replay detects the published successor and returns duplicate/already-satisfied/continuation without applying the mutation again.
+Replay detects the published successor and returns duplicate/`satisfied`/`continuation` without repeating the effect.
 
 #### A22 — interruption during execution
 
-Inject runner/process loss while an owned attempt may still be active.
-
-Required result:
-
-- restart classifies exact attempt/process ownership before any new execution;
-- uncertain work blocks profile stop/downscale and duplicate execution;
-- stale or missing process evidence cannot be converted to success;
-- the accepted recovery path either rejoins, drains, or publishes one typed interrupted/runner-lost terminal result.
+Restart classifies exact attempt/process ownership before new execution; uncertain work blocks downscale and duplicate execution; stale/missing process evidence cannot become success; recovery rejoins, drains, or publishes one typed interrupted/runner-lost terminal result.
 
 #### A23 — terminal response loss
 
-Inject response loss after A17 or A18 terminal publication.
-
-Required result: replay returns the already-published terminal result and does not execute again.
+Replay returns the already-published terminal result without re-execution.
 
 #### A24 — process restart
 
-Restart the command process between every accepted continuation in the golden path.
-
-Required result: all authority comes from durable state and fresh injected observations; no required state lives only in process memory.
+Restart the command process between each accepted continuation. All authority comes from durable state and fresh observations, not process memory.
 
 #### A25 — machine restart
 
-Simulate host restart with persistent durable state and Lima disk identity retained.
-
-Required result: state/store recovery completes before action; active/uncertain evidence is classified; no new job starts until readiness and prior-attempt state are fresh.
+Persistent state and Lima disk identity survive. Recovery completes before action; active/uncertain evidence is classified; no new job starts before readiness and prior-attempt state are fresh.
 
 #### A26 — cancellation before reservation
 
-Setup: queued request.
-
-Action: cancellation with exact current expectations.
-
-Required result: one exact cancellation successor; request is not selected; replay is idempotent; changed or stale cancellation fails without publication.
+Exact cancellation publishes once; request is not selected; replay is idempotent; changed or stale cancellation fails without publication.
 
 #### A27 — cancellation race with reservation or completion
 
-Run cancellation and reservation/completion transactions against the same predecessor expectations.
-
-Required result: exactly one wins; the loser receives bounded stale/duplicate/conflict evidence; no request exists simultaneously as cancelled queued work and active/terminal work.
+Exactly one transaction wins. The loser receives bounded stale/duplicate/conflict evidence. A request cannot be simultaneously cancelled queued work and active/terminal work.
 
 #### A28 — writer lock contention
 
-Hold the durable writer lock and attempt mutation.
-
-Required result: immediate bounded busy result; no partial file, staged successor, or host action; public output omits lock path and OS prose.
+Immediate bounded busy result; no partial/staged file or host action; public output omits lock path and OS prose.
 
 #### A29 — corrupt or unsafe durable state
 
-Inject noncanonical bytes, wrong permissions/ownership, symlink redirection, or invalid history.
-
-Required result: fail closed before mutation or host action; public output contains a stable corruption/unsafe-state class only.
+Noncanonical bytes, wrong permissions/ownership, symlink redirection, or invalid history fail closed before mutation/action. Public output uses a stable corruption/unsafe-state class.
 
 ### Status and final idle
 
 #### A30 — terminal unified status
 
-Setup: retained successful or failed terminal result and current Lima/readiness observations.
+Required result:
 
-Action: `smolrunner status`.
+- coherent configuration, revision/generation, queue, active/latest terminal job, current/desired profile, readiness, blocker, and next action;
+- terminal public identity and evidence digest;
+- human/JSON semantic agreement;
+- read-only state.
 
-Required predicates:
+#### A31 — work-to-interactive after 10 idle minutes
 
-- configuration, exact durable revision/generation, queue summary, active or latest terminal job, current/desired profile, readiness, blocker, and next action are coherent;
-- terminal result includes exact public identity and evidence digest;
-- human and JSON views agree semantically;
-- status remains read-only.
+Setup: queue empty, no active/uncertain attempt, exactly 10 accepted idle minutes, current profile `work`.
 
-#### A31 — work-to-interactive cooldown
+Required result across repeated run-once invocations:
 
-Setup: empty queue, no active/uncertain attempt, cooldown threshold reached according to injected time, current profile work.
-
-Action: repeated run-once invocations.
-
-Required predicates:
-
-- pending downscale is cancelled if new eligible work appears;
-- transition occurs only with fresh idle evidence;
-- fixed interactive envelope is selected;
+- pending downscale cancelled if new work appears;
+- transition only with fresh idle evidence;
+- fixed 3 GiB / 4 vCPU interactive envelope;
 - cache/disk identity persists;
-- no active job is interrupted.
+- no active job interrupted.
 
-#### A32 — final stopped idle
+#### A32 — stopped after 30 total idle minutes
 
-Setup: total accepted idle threshold reached; no queue, reservation, active/uncertain work, or operator hold; fresh runner and Lima evidence.
+Setup: exactly 30 total accepted idle minutes, no queue/reservation/active/uncertain work/operator hold, and fresh runner/Lima evidence.
 
-Action: repeated run-once invocations until stopped.
+Required result:
 
-Required predicates:
-
-- graceful stop occurs only after the accepted idle barrier;
-- VM runtime memory reservation is released;
-- durable worker state, Lima instance disk, checkout, and accepted warm-cache identities persist;
-- no Lima delete, factory reset, prune, or cache deletion occurs;
-- final status explains stopped current state and next action.
+- graceful stop only after the idle barrier;
+- VM runtime memory released;
+- durable state, Lima disk, checkout, and accepted warm-cache identities persist;
+- no delete, factory reset, prune, or cache deletion;
+- final status explains stopped state and next action.
 
 #### A33 — new work cancels pending idle transition
 
-Setup: pending downscale/stop and a newly queued eligible request.
-
-Required result: pending idle transition is cancelled before profile mutation; desired profile becomes work; the request remains exact and is not lost.
+New eligible work cancels pending downscale/stop before profile mutation; desired profile becomes `work`; request remains exact and is not lost.
 
 ## Installed-CLI acceptance
 
-Installed-binary tests MUST cover both human and JSON modes for every public command class used in A01-A33.
+Installed-binary tests MUST cover human and JSON modes for every public command class used in A01-A33.
 
 At minimum they MUST prove:
 
 - supported schema versions and stable machine classifications;
-- exact exit classes for success, continuation, blocked/retryable, conflict/stale, and terminal failure;
-- current strict flags preserve no-create, exact expectation, and caller-evidence boundaries;
+- exact exit classes for success, `satisfied`, `action_applied`, `continuation`, `blocked`, conflict/stale, and terminal failure;
+- strict flags preserve no-create, exact-expectation, and caller-evidence boundaries;
 - routine discovery never guesses among ambiguous configurations, stores, repositories, or profiles;
-- `--help` and parse errors contain no private runtime values;
-- JSON output is one bounded document and human output does not contradict it;
-- no command uses the system clock when its contract requires injected or caller-supplied time;
-- no convenience command silently retries a stale mutation with broader authority.
+- help/parse errors contain no private runtime values;
+- JSON is one bounded document and human output does not contradict it;
+- no clock read when the contract requires injected/caller time;
+- no stale mutation is silently retried with broader authority.
 
 ## Privacy acceptance
 
-Each injected and installed-CLI case MUST seed unique sentinels into every private channel available to that case.
-
-The scan covers stdout, stderr, serialized JSON, public receipts, `Debug`, panic/error text captured by the harness, and the physical receipt.
+Each case MUST seed unique sentinels into every available private channel. Scan stdout, stderr, JSON, public receipts, `Debug`, captured panic/error text, and the physical receipt.
 
 Forbidden output classes:
 
 - absolute state, workspace, checkout, cache, Lima, home, temporary, `/proc`, or cgroup paths;
-- repository file contents, arbitrary Git output, patches, or unbounded refs;
+- repository contents, arbitrary Git output, patches, or unbounded refs;
 - environment variables or dumps;
-- GitHub tokens, SSH material, Keychain values, authorization headers, cloud credentials, or credential-shaped sentinels;
-- raw child stdout/stderr beyond reviewed bounded diagnostics;
-- PIDs, process-group or cgroup names, raw kernel messages, and raw OS error prose;
+- tokens, SSH material, Keychain values, authorization headers, cloud credentials, or credential-shaped sentinels;
+- raw child stdout/stderr beyond reviewed diagnostics;
+- PIDs, process-group/cgroup names, kernel messages, or raw OS prose;
 - generic command lines, shell fragments, or undeclared arguments;
 - unrelated hardware, account, application, browser, network, or filesystem facts.
 
-A test MUST assert absence of the exact sentinel, not merely inspect a sample output manually.
+Tests MUST assert absence of exact sentinels, not rely on manual inspection.
 
 ## Physical M5 MacBook Air acceptance
 
 ### Approval boundary
 
-The physical run is a consequential host effect and requires contemporaneous operator approval. The approval MUST name:
+The physical run is a consequential host effect and requires contemporaneous operator approval naming:
 
 - exact SmolRunner commit and binary digest;
-- this acceptance schema/version and exact document digest;
+- acceptance schema/version and document digest;
 - exact harness commit;
 - Lima version and accepted instance identity;
 - profiles the harness may select (`interactive`, `work`, `stopped`);
 - repository and named verification profile;
 - maximum runtime, CPU, memory, PID, and disk-growth bounds;
 - whether `caffeinate` may be used while work is active;
-- expected final idle state and cache-retention check;
-- cleanup actions allowed.
+- expected final idle/cache-retention check;
+- allowed cleanup actions.
 
 Approval authorises only the named run. It does not authorise credentials, GitHub registration, LaunchAgent/service installation, external publication/contact, paid capacity, signing, deployment, Lima deletion, cache deletion, or unrelated host mutation.
 
 ### Physical preconditions
 
-The harness MUST refuse to start unless it proves:
+The harness MUST refuse unless it proves:
 
-- Apple-silicon host and bounded 24 GiB resource class expected by the contract;
-- accepted macOS and Lima compatibility versions;
-- exact SmolRunner binary digest and clean acceptance checkout;
+- Apple-silicon host and bounded 24 GiB resource class;
+- accepted macOS/Lima compatibility;
+- exact binary digest and clean acceptance checkout;
 - exact persistent Lima instance identity and no host-home mount;
 - reviewed plain-mode security settings;
-- no forwarded SSH agent, host SSH keys, proxy credentials, or ambient GitHub/cloud tokens in the guest;
-- no active or uncertain job and no conflicting operator marker;
-- sufficient host and guest disk headroom;
-- exact repository and verification-profile identities;
+- no forwarded SSH agent, host keys, proxy credentials, or ambient GitHub/cloud tokens in the guest;
+- no active/uncertain job or conflicting marker;
+- sufficient host/guest disk headroom;
+- exact repository/profile identities;
 - one-job concurrency and reviewed resource envelope;
-- receipt output path is private during construction and public fields are allowlisted.
+- private receipt construction path and allowlisted public fields.
 
 ### Physical sequence
 
-The physical harness MUST perform and record:
+The harness MUST record:
 
-1. pre-run host, Lima, durable-state, readiness, and cache identity observations;
-2. A01-A10 applicable initialisation/submission/replay/conflict checks on a dedicated acceptance state root;
+1. pre-run host, Lima, durable-state, readiness, and cache observations;
+2. applicable A01-A10 initialisation/submission/replay/conflict checks on a dedicated state root;
 3. stopped or interactive starting condition;
-4. repeated explicit `worker run-once` invocations through work-profile selection and readiness;
-5. one named verification-profile execution against the exact immutable source;
+4. repeated explicit run-once invocations through work-profile selection/readiness;
+5. one named profile execution against exact immutable source;
 6. terminal publication and unified status;
-7. selected interruption/recovery cases that are safe on the physical machine, at minimum command-process restart and completion-response replay;
-8. cancellation and stale-expectation checks that cannot affect unrelated work;
-9. cooldown/downscale/stop sequence using accepted injected time controls or a clearly recorded physical timing method;
+7. safe interruption/recovery cases, at minimum process restart and terminal-response replay;
+8. cancellation/stale checks isolated from unrelated work;
+9. 10-minute interactive and 30-total-minute stopped idle sequence, using accepted injected controls or recorded physical timing;
 10. final proof that durable state and cache/disk identities persist while VM runtime memory is released;
 11. privacy scan and receipt finalisation.
 
-The harness MUST stop without claiming acceptance on any identity drift, stale or uncertain job evidence, unapproved prompt for credentials/permissions, unmodelled host mutation, resource-bound breach, cleanup uncertainty, or privacy failure.
+The harness MUST stop without claiming acceptance on identity drift, stale/uncertain work, unapproved credential/permission prompts, unmodelled host mutation, resource breach, cleanup uncertainty, or privacy failure.
 
 ### Physical public receipt
 
-The public receipt is versioned and allowlisted. It records only:
+The versioned allowlisted receipt records only:
 
 - receipt schema and acceptance-contract version/digest;
-- exact SmolRunner commit and binary/build digest;
-- exact harness commit;
-- bounded Apple-silicon host/resource class, not serial numbers or account names;
+- exact SmolRunner commit, binary/build digest, and harness commit;
+- bounded Apple-silicon host/resource class;
 - Lima version, opaque instance identity digest, guest identity, and selected profiles;
-- repository, verification-profile, request, attempt, commit, and tree identities;
-- requested and applied resource envelopes;
+- repository, profile, request, reservation, attempt, command, commit, and tree identities;
+- requested/applied resource and concurrency envelopes;
 - lifecycle actions and bounded phase timings;
+- readiness evidence class;
 - terminal classification and evidence digest;
 - injected/physical case IDs completed;
-- replay, recovery, cancellation, and stale-state assertions passed;
-- privacy sentinel classes passed;
-- cache identity before/after and retention disposition, without private paths or contents;
-- final worker and Lima state;
+- replay, recovery, cancellation, stale-state, and privacy assertions;
+- cache identity before/after and retention disposition, without paths/contents;
+- final queue, reservation, worker, runner, Lima profile, and idle state;
 - operator attestation that the named run occurred under the recorded approval.
 
-The receipt MUST NOT include arbitrary logs. Private diagnostics remain separately retained under the operator-controlled boundary and are referenced only by an opaque local evidence ID when needed.
+The receipt MUST NOT include arbitrary logs. Private diagnostics remain operator-controlled and may be referenced only by an opaque local evidence ID if the accepted schema permits it.
 
 ## W04 acceptance traceability
 
@@ -654,67 +542,64 @@ The receipt MUST NOT include arbitrary logs. Private diagnostics remain separate
 | --- | --- |
 | `worker init` creates or reports accepted state idempotently | A01-A04 plus installed CLI |
 | routine submission publishes one exact request | A05-A10 plus installed CLI |
-| `worker run-once` advances through bounded continuations | A11-A16 and action-count assertions |
+| run-once advances through bounded continuations | A11-A16 and action-count assertions |
 | named profile completes durably | A16-A18 |
-| unified status explains current and terminal state | A04 and A30 |
+| unified status explains current/terminal state | A04 and A30 |
 | replay, conflict, interruption, restart, and privacy pass | A06-A10, A19-A29, privacy suite |
-| physical receipt names exact current-main commit | physical approval, sequence, and public receipt |
-| final idle follows policy and preserves caches | A31-A33 plus physical final-state evidence |
+| physical receipt names exact current-main commit | physical approval, sequence, receipt |
+| final idle follows policy and preserves caches | A31-A33 plus physical evidence |
 | roster records receipt and activates W06 | exact receipt ID/digest and #234 update |
-| after-action records friction and timings | W04 issue comment linked from receipt |
+| after-action records friction and timings | W04 comment linked from receipt |
 
 ## Cross-lane gates
 
 ### P01 product vocabulary
 
-Before P01 or P06 merges, the two exact heads MUST agree on:
+P01 exact candidate `90d043a0d79114f9ce79f577b2f0cefaa820cc49` and this contract agree on:
 
-- routine `status` versus exact `worker status` naming;
-- accepted one-shot result terms, including `blocked`, `continuation`, `satisfied`, and terminal result;
-- job lifecycle versus machine-profile terms;
-- initial profile after `worker init`;
-- work-to-interactive and interactive-to-stopped idle policy;
-- which physical actions require approval;
-- explicit exclusion of W06 service and availability commands.
+- routine unified `status` and strict exact `worker status`;
+- five run-once result classes;
+- separate work/profile/result/outcome types;
+- 10-minute interactive and 30-total-minute stopped idle policy;
+- approval boundaries and W06 exclusions.
+
+A moved P01 or P06 head requires a fresh terminology cross-review.
 
 ### P03 configuration
 
-P03 MUST provide typed identities sufficient to express the common fixture and physical approval without public private paths. P06 semantic configuration predicates become exact only after that schema is accepted.
+P03 MUST provide typed identities sufficient for the fixture and physical approval without public private paths. Semantic configuration predicates become exact after that schema is accepted.
 
 ### P04 status
 
-P04 MUST map every status predicate in A01, A04, A11-A18, and A30-A33 into one coherent human/JSON report. It MUST keep current state, desired state, blocker, and next action distinct.
+P04 MUST map A01, A04, A11-A18, and A30-A33 into one coherent human/JSON report, keeping current state, desired state, blocker, and next action distinct.
 
 ### P05 errors and remediation
 
-P05 MUST provide stable public classes for every blocked/error result in this matrix, including uninitialised, stale revision, stale generation, conflict, busy, unsafe/corrupt state, readiness debt, active/uncertain work, profile/lifecycle failure, execution failure, cleanup failure, approval required, and unsupported version.
+P05 MUST provide stable public classes for all blocked/error results, including uninitialised, stale revision/generation, conflict, busy, unsafe/corrupt state, readiness debt, active/uncertain work, lifecycle/execution/cleanup failure, approval required, and unsupported version.
 
 ## Completion and stop rules
 
 The alpha is accepted only when:
 
 - all applicable deterministic cases pass on one exact integrated head;
-- installed CLI tests pass on that same head;
+- installed CLI tests pass on that head;
 - the approved physical run passes and emits one valid public receipt for that head;
-- the final receipt and test results pass privacy scanning;
-- the final state is accepted idle/stopped with persistent state and cache identity retained;
+- receipt and test results pass privacy scanning;
+- final state is stopped after 30 total idle minutes with persistent state/cache identity retained;
 - the canonical roster records the exact receipt and commit.
 
-Any failed required case leaves W04 incomplete. A bounded typed failure may itself be the expected result of a negative case, but an unexpected test/harness failure, stale evidence, identity drift, private disclosure, unapproved mutation, or uncertain cleanup invalidates the physical run and requires a new receipt after repair.
+Any unexpected harness/test failure, stale evidence, identity drift, disclosure, unapproved mutation, or uncertain cleanup invalidates the physical run and requires a new receipt after repair.
 
-## Open terms reserved for cross-review
+## Open terms reserved for downstream schemas
 
-The following are intentionally unresolved in this P06 draft and MUST be replaced by accepted P01/P03-P05 vocabulary before merge:
+The following remain intentionally unresolved until their owning lanes merge:
 
-1. exact initial profile and status wording after first initialisation;
-2. final enum names for one-shot `satisfied`, `blocked`, and `continuation` results;
-3. exact JSON field names and exit-code numbers;
-4. exact cooldown durations represented by policy rather than hard-coded in acceptance tests;
-5. whether exact `worker status` remains a public advanced alias;
-6. exact terminal-result selection when multiple retained terminal jobs exist;
-7. exact opaque local diagnostic-reference type allowed in the physical receipt.
+1. exact initial profile/intent after first initialisation;
+2. exact JSON field names and exit-code numbers;
+3. exact terminal-result selection when multiple retained terminal jobs exist;
+4. exact opaque local diagnostic-reference type allowed in the physical receipt.
 
-These open terms do not weaken the required observable behaviour or authority boundaries above.
+These open terms do not weaken the required observable behaviour or authority boundaries.
 
 ## Related contracts
 
