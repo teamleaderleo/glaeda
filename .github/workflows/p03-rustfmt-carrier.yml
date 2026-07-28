@@ -1,4 +1,4 @@
-name: P03 rustfmt carrier
+name: P03 Clippy diagnostics
 
 on:
   push:
@@ -6,26 +6,34 @@ on:
       - tmp/p03-rustfmt-carrier
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  format-and-publish:
+  diagnose:
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 15
     steps:
       - name: Check out exact P03 source head
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: feat/p03-operator-config
-          fetch-depth: 0
+          ref: a31f5f572a7b5b6c12903c804f0637eace4a6785
           show-progress: false
-      - name: Format and publish one guarded child commit
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Capture Clippy diagnostics
+        shell: bash
         run: |
-          test "$(git rev-parse HEAD)" = "7fe0e2a65f6aaa231b4c0b3abb6a66deb0ef792c"
-          cargo fmt --all
-          git diff --check
-          git config user.name "smolrunner-format-carrier"
-          git config user.email "smolrunner-format-carrier@users.noreply.github.com"
-          git add src/operator_config.rs tests/operator_config_contract.rs
-          git commit -m "Format operator configuration contract"
-          git push origin HEAD:refs/heads/feat/p03-operator-config
+          set +e
+          cargo clippy --locked --all-targets --all-features -- -D warnings 2>&1 | tee p03-clippy.log
+          status=${PIPESTATUS[0]}
+          echo "$status" > p03-clippy-status.txt
+          exit 0
+      - name: Upload diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: p03-clippy-diagnostics
+          path: |
+            p03-clippy.log
+            p03-clippy-status.txt
+          if-no-files-found: error
+          retention-days: 1
