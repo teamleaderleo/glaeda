@@ -1,0 +1,239 @@
+# Implementation capability map
+
+This document maps every public library module exported by `src/lib.rs` on exact W01 activation base
+`3aa7c8f0341c6dd9138f7b0b5f2e2470140430ae`. It distinguishes what the installed binary already
+reaches from reviewed foundations that still need W02–W04 composition. It is an inventory and
+integration guide, not authority to refactor, delete, rename, expose, or call a module.
+
+Evidence reviewed:
+
+- exact-base `src/lib.rs` and `src/main.rs`;
+- the current [README](../README.md), [roadmap](ROADMAP.md), and
+  [MacBook runner quickstart](MACBOOK-RUNNER-QUICKSTART.md);
+- merged W00 results in PRs #226, #230, and #231;
+- programme waves #233–#239 and P02 preflight comment `5104870676`.
+
+## Reading the map
+
+Primary classifications use this precedence:
+
+1. **CLI reachable** — the exact-base binary dispatch reaches the module directly or through a named
+   command path.
+2. **integration-ready** — a reviewed capability has a named W02–W04 consumer and lacks only
+   operator service, adapter, or orchestration composition.
+3. **pure foundation** — accepted types, policy, persistence, or execution machinery has no complete
+   W02–W04 user step yet.
+4. **experimental** — preview or lease work has no accepted personal-worker alpha consumer.
+5. **superseded** — reserved for a current-main canonical replacement. No exported module qualifies
+   on this base.
+
+Classification is separate from product track. A mature Linux-steward or Renderprove module remains
+a foundation for its own product track even when the personal Mac alpha does not consume it.
+
+## Inventory totals
+
+- Public modules: **90**
+- Classification: **48 CLI reachable**, **17 integration-ready**,
+  **17 pure foundation**, **8 experimental**,
+  **0 superseded**
+- Product track: **24 personal Mac**, **39 Linux runner steward**,
+  **11 shared**, **8 Renderprove**,
+  **8 research**
+- Compile gate: **53 all targets**, **36 Linux-only**,
+  **1 Unix-only**
+
+## Exact-base command reachability
+
+| Current command | Direct binary modules | Important transitive public foundations | Product status |
+| --- | --- | --- | --- |
+| `smolrunner doctor [--strict]` | `doctor` | shared report types in `lib.rs` | current read-only surface |
+| `smolrunner plan --file ...` | `manifest`, `plan` | `host`, `resource`, `artifact` | current read-only surface |
+| `smolrunner host plan ...` | Linux host readiness/planning family | package, account, state, ownership, Podman, journal models | current Linux read-only surface |
+| `smolrunner host prepare ...` | host command/plan/execution/receipt family | durable journal, sealed lane execution, Linux state and account adapters | current exact confirmed Linux mutation surface |
+| `smolrunner worker status --store-root ...` | binary read wrapper | `personal_worker_read_model`, `personal_worker_store`, `unix_personal_worker_store` | current strict snapshot surface |
+| `smolrunner queue list ...` | binary read wrapper | queue/read/store modules | current strict snapshot surface |
+| `smolrunner queue submit ...` | binary submit wrapper | artifact, admission, profile, queue/store/transaction modules | current strict exact mutation surface; merged in PR #230 |
+| `smolrunner job show ...` | binary read wrapper | queue/read/store modules | current strict snapshot surface |
+| `smolrunner job cancel ...` | binary cancel wrapper | queue/store/transaction modules | current strict exact mutation surface |
+
+The routine alpha commands described by W02–W04—configuration discovery, `worker init`,
+top-level `status`, repository discovery, and `worker run-once`—remain integration work. Existing
+strict commands are evidence-bearing advanced surfaces and should survive convenience wrappers.
+
+## Personal Mac worker modules
+
+| module | cfg/platform | primary classification | product track | public entry point | current CLI command (or none) | authority/effect class | required upstream evidence | user step unlocked | W02–W04 consumer (or none) | current tests/evidence | missing integration proof | canonical issue/PR | consolidation note |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `actions_runner_readiness` | all | integration-ready | personal_mac | `smolrunner::actions_runner_readiness` | none | read | expected runner identity and bounded listener/service evidence | official runner listener/service readiness evidence | B04, O06 | focused readiness core/privacy tests | compose exact Lima/profile/registration identity | #171; #238 B04 | candidate for later internalisation behind operator service |
+| `exact_commit_handoff` | all | integration-ready | personal_mac | `smolrunner::exact_commit_handoff` | none | pure | typed caller-owned identities/evidence | exact source handoff contracts and public reports | B05, B06 | focused tests; Verify; W00/W03 evidence where applicable | join workspace/profile plan and executor | #157; #238 B05/B06 | candidate for later internalisation behind operator service |
+| `execution_admission` | all | CLI reachable | personal_mac | `smolrunner::execution_admission` | `worker status`; `queue list/submit`; `job show/cancel` | pure | typed caller-owned identities/evidence | request, capacity, reservation, and lifecycle evidence | B01, B04, B07 | focused tests; Verify; W00/W03 evidence where applicable | compose personal-worker broker and completion transitions | #187; #238 B01/B04/B07 | candidate for later internalisation behind operator service |
+| `execution_receipt` | all | integration-ready | personal_mac | `smolrunner::execution_receipt` | none | pure | typed caller-owned identities/evidence | bounded process-attempt terminal evidence | B06, B07, O06 | focused tests; Verify; W00/W03 evidence where applicable | produce from B06 and join exact completion | #199; #238 B06/B07 | candidate for later internalisation behind operator service |
+| `execution_receipt_store` | all | integration-ready | personal_mac | `smolrunner::execution_receipt_store` | none | durable_mutation | exact ownership/revision; safe filesystem/lock evidence | durable terminal receipt retention | B07, O06 | focused tests; Verify; W00/W03 evidence where applicable | select retention/current-terminal input for status | #199; #238 B07 | candidate for later internalisation behind operator service |
+| `lima_lifecycle` | all | integration-ready | personal_mac | `smolrunner::lima_lifecycle` | none | pure | typed caller-owned identities/evidence | pure work/interactive/stopped policy | B01, B03, I01 | focused tests; Verify; W00/W03 evidence where applicable | compose broker evidence and accepted action | #171; #238 B01/B03 | candidate for later internalisation behind operator service |
+| `lima_lifecycle_executor` | all | integration-ready | personal_mac | `smolrunner::lima_lifecycle_executor` | none | process | accepted lifecycle action and exact pre-state | execute accepted Lima profile/start/stop actions | B03, I01 | focused tests; Verify; W00/W03 evidence where applicable | add stale broker identity adapter | #171; #238 B03 | candidate for later internalisation behind operator service |
+| `lima_observation` | all | integration-ready | personal_mac | `smolrunner::lima_observation` | none | read | expected Lima instance and bounded guest probe evidence | bounded exact Lima/guest observation | B02, B04, O06 | focused tests; Verify; W00/W03 evidence where applicable | bind accepted operator configuration and instance identity | #171; #238 B02/B04 | candidate for later internalisation behind operator service |
+| `mac_availability` | all | integration-ready | personal_mac | `smolrunner::mac_availability` | none | pure | typed caller-owned identities/evidence | pure active/away/off host-local policy | B01, B02 | focused tests; Verify; W00/W03 evidence where applicable | add operator mode and observation adapter | #120; #238 B01/B02 | candidate for later internalisation behind operator service |
+| `macos_resource_observation` | all | integration-ready | personal_mac | `smolrunner::macos_resource_observation` | none | read | injected clock/command sources and public caps | bounded Mac power, CPU, and memory evidence | B02 | focused tests; Verify; W00/W03 evidence where applicable | product adapter plus privacy review | #120; #238 B02 | candidate for later internalisation behind operator service |
+| `personal_worker_host_broker` | all | integration-ready | personal_mac | `smolrunner::personal_worker_host_broker` | none | pure | typed caller-owned identities/evidence | pure queue/Lima/readiness next-action decision | B01, I01 | focused tests; Verify; W00/W03 evidence where applicable | compose typed observations in one tick | #187; #238 B01 | candidate for later internalisation behind operator service |
+| `personal_worker_queue` | all | CLI reachable | personal_mac | `smolrunner::personal_worker_queue` | `worker status`; `queue list/submit`; `job show/cancel` | pure | exact observation time, identities, resources, cache state | typed queue, priority, resource, cache, and profile policy | O03, O04, B01, B07 | queue tests; installed CLI suites; Verify | ergonomic services and terminal completion adapter | #187; #237/#238 | core public policy contract |
+| `personal_worker_read_model` | all | CLI reachable | personal_mac | `smolrunner::personal_worker_read_model` | `worker status`; `queue list/submit`; `job show/cancel` | read | exact target identity; bounded observation source | bounded status, queue-page, and job projections | O03, O06, I02 | read-model + installed CLI tests; Verify | current-store discovery and unified status | #222; #237 O03/O06 | retain bounded public projections |
+| `personal_worker_store` | all | CLI reachable | personal_mac | `smolrunner::personal_worker_store` | `worker status`; `queue list/submit`; `job show/cancel` | pure | valid queue/lease/tombstone document | versioned durable worker document and codec | O02, O03, O04, B07 | store/recovery/codec tests; Linux acceptance | explicit init/discovery service | #187; #237 O02 | keep codec/store contract public for adapters |
+| `personal_worker_store_transaction` | all | CLI reachable | personal_mac | `smolrunner::personal_worker_store_transaction` | `worker status`; `queue list/submit`; `job show/cancel` | durable_mutation | current revision/generation plus typed mutation | exact replay-safe durable queue/lifecycle mutations | O04, B07 | transaction + installed CLI replay tests; Verify | ergonomic mutation and B07 completion wrappers | #223; #228; #237 O04; #238 B07 | retain exact strict mutation API |
+| `runner_export` | all | integration-ready | personal_mac | `smolrunner::runner_export` | none | process | exact clean commit/tree and bounded export plan | credentialless exact-commit Git bundle export | B05/B06 decision | focused tests; Verify; W00/W03 evidence where applicable | decide full bundle use versus identity-only contract | #157; #238 B05/B06 | decide contract-only versus execution use in B05/B06 |
+| `rust_memory_diagnostic` | all | integration-ready | personal_mac | `smolrunner::rust_memory_diagnostic` | none | pure | atomic envelope binding plus trusted bounded observations | classify typed Rust memory-pressure evidence | B06, B07, O06 | PR #231 focused tests; Verify/Linux acceptance | trusted B06 observation producer and durable result join | #199; #217; PR #231 | accepted pure classifier |
+| `rust_verification_envelope` | all | integration-ready | personal_mac | `smolrunner::rust_verification_envelope` | none | pure | exact source/command/toolchain/resource declarations | reviewed Rust scope, resources, concurrency, and retry authority | B05, B06 | envelope tests; PR #231 integration | resolve checked-in profile into exact execution plan | #199; PR #231; #238 B05 | accepted authority contract |
+| `rust_verification_envelope_digest` | all | integration-ready | personal_mac | `smolrunner::rust_verification_envelope_digest` | none | pure | validated exact envelope | canonical domain-separated envelope digest | B05, B06 | canonical digest regressions; PR #231 | use canonical digest in B05 plan identity | PR #231; #238 B05 | keep digest construction single-source |
+| `trusted_workspace_receipt` | linux | integration-ready | personal_mac | `smolrunner::trusted_workspace_receipt` | none | pure | descriptor-bound workspace/cache ownership | descriptor-bound workspace/cache identity receipt | B05, B06 | focused tests; Verify; W00/W03 evidence where applicable | produce/consume exact workspace receipt in B05/B06 | #157; #238 B05/B06 | candidate for later internalisation behind operator service |
+| `unix_personal_worker_store` | unix | CLI reachable | personal_mac | `smolrunner::unix_personal_worker_store` | `worker status`; `queue list/submit`; `job show/cancel` | durable_mutation | absolute safe root and existing/explicit create intent | safe Unix worker persistence, locking, and recovery | O02, O03, O04, B07 | Unix store integration/recovery tests; Linux acceptance | accepted config path resolution | #187; #237 O02–O04 | platform adapter; hide paths from public reports |
+| `verification_profile` | all | CLI reachable | personal_mac | `smolrunner::verification_profile` | `worker status`; `queue list/submit`; `job show/cancel` | pure | typed caller-owned identities/evidence | named repository command/profile contract | O04, O05, B05 | focused tests; Verify; W00/W03 evidence where applicable | operator profile selection and source binding | #148; #237 O05; #238 B05 | shared accepted profile vocabulary |
+| `verification_profile_preflight_adapter` | all | integration-ready | personal_mac | `smolrunner::verification_profile_preflight_adapter` | none | pure | typed caller-owned identities/evidence | typed profile preflight evidence | B05, B06 | focused tests; Verify; W00/W03 evidence where applicable | compose immutable B05 plan | #148; #238 B05/B06 | candidate for later internalisation behind operator service |
+| `verification_profile_registry` | all | integration-ready | personal_mac | `smolrunner::verification_profile_registry` | none | pure | checked-in registry and exact profile ID | checked-in profile resolution | O05, B05 | registry/profile tests; bootstrap compatibility | repository/profile discovery binding | #148; #237 O05; #238 B05 | candidate for later internalisation behind operator service |
+
+## Linux runner steward modules
+
+| module | cfg/platform | primary classification | product track | public entry point | current CLI command (or none) | authority/effect class | required upstream evidence | user step unlocked | W02–W04 consumer (or none) | current tests/evidence | missing integration proof | canonical issue/PR | consolidation note |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `debian_package_plan` | linux | CLI reachable | linux_runner_steward | `smolrunner::debian_package_plan` | `host plan`; `host prepare` (direct or transitive) | pure | typed caller-owned identities/evidence | reviewed Debian/Ubuntu package actions | none | module/integration tests; Verify; Linux acceptance where gated | outside W02–W04; continue Linux steward integration | README; ROADMAP | keep visible as continuing Linux product track |
+| `debian_package_probe` | linux | CLI reachable | linux_runner_steward | `smolrunner::debian_package_probe` | `host plan`; `host prepare` (direct or transitive) | read | exact target identity; bounded observation source | bounded installed-package observation | none | module/integration tests; Verify; Linux acceptance where gated | outside W02–W04; continue Linux steward integration | README; ROADMAP | keep visible as continuing Linux product track |
+| `debian_package_recovery` | linux | CLI reachable | linux_runner_steward | `smolrunner::debian_package_recovery` | `host plan`; `host prepare` (direct or transitive) | pure | typed caller-owned identities/evidence | post-attempt package recovery classification | none | module/integration tests; Verify; Linux acceptance where gated | outside W02–W04; continue Linux steward integration | README; ROADMAP | keep visible as continuing Linux product track |
+| `durable_journal` | all | CLI reachable | linux_runner_steward | `smolrunner::durable_journal` | `host plan`; `host prepare` (direct or transitive) | durable_mutation | exact ownership/revision; safe filesystem/lock evidence | crash-safe execution-journal checkpointing | none | module/integration tests; Verify; Linux acceptance where gated | outside W02–W04; continue Linux steward integration | README; ROADMAP | keep visible as continuing Linux product track |
+| `durable_lane_execution` | linux | CLI reachable | linux_runner_steward | `smolrunner::durable_lane_execution` | `host plan`; `host prepare` (direct or transitive) | process | reviewed plan/argv; empty env; timeout/output bounds | journalled sealed execution-lane orchestration | none | module/integration tests; Verify; Linux acceptance where gated | outside W02–W04; continue Linux steward integration | README; ROADMAP | keep visible as continuing Linux product track |
+| `host` | all | CLI reachable | linux_runner_steward | `smolrunner::host` | `host plan`; `host prepare` (direct or transitive) | pure | typed caller-owned identities/evidence | typed desired/current host model | none | module/integration tests; Verify; Linux acceptance where gated | outside W02–W04; continue Linux steward integration | README; ROADMAP | keep visible as continuing Linux product track |
+| `host_package_plan` | linux | CLI reachable | linux_runner_steward | `smolrunner::host_package_plan` | `host plan`; `host prepare` (direct or transitive) | pure | typed caller-owned identities/evidence | host-level package prerequisite composition | none | module/integration tests; Verify; Linux acceptance where gated | outside W02–W04; continue Linux steward integration | README; ROADMAP | keep visible as continuing Linux product track |
+| `host_preparation_command` | linux | CLI reachable | linux_runner_steward | `smolrunner::host_preparation_command` | `host plan`; `host prepare` (direct or transitive) | pure | typed caller-owned identities/evidence | proposal/confirmation decision for one host phase | none | module/integration tests; Verify; Linux acceptance where gated | outside W02–W04; continue Linux steward integration | README; ROADMAP | keep visible as continuing Linux product track |
+| `host_preparation_execution` | linux | CLI reachable | linux_runner_steward | `smolrunner::host_preparation_execution` | `host plan`; `host prepare` (direct or transitive) | host_mutation | fresh host evidence plus exact confirmation | execute one confirmed host-preparation phase | none | disposable Debian/Ubuntu acceptance | outside W02–W04; continue Linux steward integration | README; ROADMAP | keep visible as continuing Linux product track |
+| `host_preparation_plan` | linux | CLI reachable | linux_runner_steward | `smolrunner::host_preparation_plan` | `host plan`; `host prepare` (direct or transitive) | pure | typed caller-owned identities/evidence | typed host-preparation action plan | none | module/integration tests; Verify; Linux acceptance where gated | outside W02–W04; continue Linux steward integration | README; ROADMAP | keep visible as continuing Linux product track |
+| `host_preparation_receipt` | linux | CLI reachable | linux_runner_steward | `smolrunner::host_preparation_receipt` | `host plan`; `host prepare` (direct or transitive) | pure | typed caller-owned identities/evidence | bounded host-preparation result | none | module/integration tests; Verify; Linux acceptance where gated | outside W02–W04; continue Linux steward integration | README; ROADMAP | keep visible as continuing Linux product track |
+| `host_preparation_receipt_binding` | all | CLI reachable | linux_runner_steward | `smolrunner::host_preparation_receipt_binding` | `host plan`; `host prepare` (direct or transitive) | pure | typed caller-owned identities/evidence | bind a receipt to exact proposal/evidence | none | module/integration tests; Verify; Linux acceptance where gated | outside W02–W04; continue Linux steward integration | README; ROADMAP | keep visible as continuing Linux product track |
+| `host_readiness` | linux | CLI reachable | linux_runner_steward | `smolrunner::host_readiness` | `host plan`; `host prepare` (direct or transitive) | read | exact target identity; bounded observation source | bounded current Linux host observation | none | module/integration tests; Verify; Linux acceptance where gated | outside W02–W04; continue Linux steward integration | README; ROADMAP | keep visible as continuing Linux product track |
+| `host_readiness_verdict` | linux | CLI reachable | linux_runner_steward | `smolrunner::host_readiness_verdict` | `host plan`; `host prepare` (direct or transitive) | read | exact target identity; bounded observation source | readiness findings and recommended inspections | none | module/integration tests; Verify; Linux acceptance where gated | outside W02–W04; continue Linux steward integration | README; ROADMAP | keep visible as continuing Linux product track |
+| `host_rootless_podman` | linux | CLI reachable | linux_runner_steward | `smolrunner::host_rootless_podman` | `host plan`; `host prepare` (direct or transitive) | pure | typed caller-owned identities/evidence | host-level rootless Podman readiness model | none | module/integration tests; Verify; Linux acceptance where gated | outside W02–W04; continue Linux steward integration | README; ROADMAP | keep visible as continuing Linux product track |
+| `installation_id` | linux | CLI reachable | linux_runner_steward | `smolrunner::installation_id` | `host plan`; `host prepare` (direct or transitive) | read | exact target identity; bounded observation source | stable installation identity and locator | none | module/integration tests; Verify; Linux acceptance where gated | outside W02–W04; continue Linux steward integration | README; ROADMAP | keep visible as continuing Linux product track |
+| `journal` | all | CLI reachable | linux_runner_steward | `smolrunner::journal` | `host plan`; `host prepare` (direct or transitive) | pure | typed caller-owned identities/evidence | execution lanes, actions, rollback, and outcomes | none | module/integration tests; Verify; Linux acceptance where gated | outside W02–W04; continue Linux steward integration | README; ROADMAP | generic journal vocabulary underlies Linux path |
+| `journal_document` | all | CLI reachable | linux_runner_steward | `smolrunner::journal_document` | `host plan`; `host prepare` (direct or transitive) | durable_mutation | exact ownership/revision; safe filesystem/lock evidence | versioned journal wire document | none | module/integration tests; Verify; Linux acceptance where gated | outside W02–W04; continue Linux steward integration | README; ROADMAP | generic journal document underlies durable adapter |
+| `lane_command` | all | CLI reachable | linux_runner_steward | `smolrunner::lane_command` | `host plan`; `host prepare` (direct or transitive) | pure | typed caller-owned identities/evidence | sealed root/runner-user command vocabulary | none | module/integration tests; Verify; Linux acceptance where gated | outside W02–W04; continue Linux steward integration | README; ROADMAP | keep visible as continuing Linux product track |
+| `lane_executable` | linux | CLI reachable | linux_runner_steward | `smolrunner::lane_executable` | `host plan`; `host prepare` (direct or transitive) | pure | typed caller-owned identities/evidence | reviewed command to executable translation | none | module/integration tests; Verify; Linux acceptance where gated | outside W02–W04; continue Linux steward integration | README; ROADMAP | keep visible as continuing Linux product track |
+| `lane_executor` | linux | CLI reachable | linux_runner_steward | `smolrunner::lane_executor` | `host plan`; `host prepare` (direct or transitive) | process | reviewed plan/argv; empty env; timeout/output bounds | bounded shell-free lane command execution | none | module/integration tests; Verify; Linux acceptance where gated | outside W02–W04; continue Linux steward integration | README; ROADMAP | keep visible as continuing Linux product track |
+| `linux_installation_catalog` | linux | CLI reachable | linux_runner_steward | `smolrunner::linux_installation_catalog` | `host plan`; `host prepare` (direct or transitive) | read | exact target identity; bounded observation source | read persisted installation records | none | catalog tests plus host-plan exercise | outside W02–W04; continue Linux steward integration | README; ROADMAP | keep visible as continuing Linux product track |
+| `linux_installation_catalog_lock` | linux | pure foundation | linux_runner_steward | `smolrunner::linux_installation_catalog_lock` | none | durable_mutation | exact ownership/revision; safe filesystem/lock evidence | nonblocking installation-catalog writer lock | none | module/integration tests; Verify; Linux acceptance where gated | outside W02–W04; continue Linux steward integration | README; ROADMAP | keep visible as continuing Linux product track |
+| `linux_installation_enrollment` | linux | pure foundation | linux_runner_steward | `smolrunner::linux_installation_enrollment` | none | durable_mutation | exact ownership/revision; safe filesystem/lock evidence | race-free create-or-load installation orchestration | none | module/integration tests; Verify; Linux acceptance where gated | outside W02–W04; continue Linux steward integration | README; ROADMAP | keep visible as continuing Linux product track |
+| `linux_installation_publication` | linux | pure foundation | linux_runner_steward | `smolrunner::linux_installation_publication` | none | durable_mutation | exact ownership/revision; safe filesystem/lock evidence | atomic no-replace installation publication | none | module/integration tests; Verify; Linux acceptance where gated | outside W02–W04; continue Linux steward integration | README; ROADMAP | keep visible as continuing Linux product track |
+| `linux_lease_store` | linux | pure foundation | linux_runner_steward | `smolrunner::linux_lease_store` | none | durable_mutation | exact ownership/revision; safe filesystem/lock evidence | durable revision-checked lease persistence | none | module/integration tests; Verify; Linux acceptance where gated | outside W02–W04; continue Linux steward integration | README; ROADMAP | keep visible as continuing Linux product track |
+| `linux_state` | linux | CLI reachable | linux_runner_steward | `smolrunner::linux_state` | `host plan`; `host prepare` (direct or transitive) | pure | typed caller-owned identities/evidence | reviewed Linux state-root identity | none | module/integration tests; Verify; Linux acceptance where gated | outside W02–W04; continue Linux steward integration | README; ROADMAP | keep visible as continuing Linux product track |
+| `linux_state_prepare` | linux | CLI reachable | linux_runner_steward | `smolrunner::linux_state_prepare` | `host plan`; `host prepare` (direct or transitive) | durable_mutation | exact ownership/revision; safe filesystem/lock evidence | prepare private Linux state directories | none | module/integration tests; Verify; Linux acceptance where gated | outside W02–W04; continue Linux steward integration | README; ROADMAP | keep visible as continuing Linux product track |
+| `linux_state_recovery` | linux | CLI reachable | linux_runner_steward | `smolrunner::linux_state_recovery` | `host plan`; `host prepare` (direct or transitive) | durable_mutation | exact ownership/revision; safe filesystem/lock evidence | recover interrupted Linux state publication | none | module/integration tests; Verify; Linux acceptance where gated | outside W02–W04; continue Linux steward integration | README; ROADMAP | keep visible as continuing Linux product track |
+| `ownership` | all | CLI reachable | linux_runner_steward | `smolrunner::ownership` | `host plan`; `host prepare` (direct or transitive) | pure | typed caller-owned identities/evidence | exact managed/adoptable/foreign ownership classification | none | module/integration tests; Verify; Linux acceptance where gated | outside W02–W04; continue Linux steward integration | README; ROADMAP | keep visible as continuing Linux product track |
+| `rootless_podman_config` | linux | CLI reachable | linux_runner_steward | `smolrunner::rootless_podman_config` | `host plan`; `host prepare` (direct or transitive) | pure | typed caller-owned identities/evidence | reviewed rootless Podman config contract | none | module/integration tests; Verify; Linux acceptance where gated | outside W02–W04; continue Linux steward integration | README; ROADMAP | keep visible as continuing Linux product track |
+| `rootless_podman_config_observation` | linux | CLI reachable | linux_runner_steward | `smolrunner::rootless_podman_config_observation` | `host plan`; `host prepare` (direct or transitive) | read | exact target identity; bounded observation source | descriptor-relative config observation | none | module/integration tests; Verify; Linux acceptance where gated | outside W02–W04; continue Linux steward integration | README; ROADMAP | keep visible as continuing Linux product track |
+| `rootless_podman_config_resolution` | linux | CLI reachable | linux_runner_steward | `smolrunner::rootless_podman_config_resolution` | `host plan`; `host prepare` (direct or transitive) | pure | typed caller-owned identities/evidence | pure precedence and static assessment | none | module/integration tests; Verify; Linux acceptance where gated | outside W02–W04; continue Linux steward integration | README; ROADMAP | keep visible as continuing Linux product track |
+| `rootless_podman_preflight` | linux | CLI reachable | linux_runner_steward | `smolrunner::rootless_podman_preflight` | `host plan`; `host prepare` (direct or transitive) | pure | typed caller-owned identities/evidence | rootless Podman prerequisite/smoke boundary | none | module/integration tests; Verify; Linux acceptance where gated | outside W02–W04; continue Linux steward integration | README; ROADMAP | keep visible as continuing Linux product track |
+| `runner_account_observation` | linux | CLI reachable | linux_runner_steward | `smolrunner::runner_account_observation` | `host plan`; `host prepare` (direct or transitive) | read | exact target identity; bounded observation source | bounded Linux runner-account observation | none | module/integration tests; Verify; Linux acceptance where gated | outside W02–W04; continue Linux steward integration | README; ROADMAP | keep visible as continuing Linux product track |
+| `runner_account_plan` | linux | CLI reachable | linux_runner_steward | `smolrunner::runner_account_plan` | `host plan`; `host prepare` (direct or transitive) | pure | typed caller-owned identities/evidence | runner account and home/subordinate-ID plan | none | module/integration tests; Verify; Linux acceptance where gated | outside W02–W04; continue Linux steward integration | README; ROADMAP | keep visible as continuing Linux product track |
+| `runner_user` | linux | CLI reachable | linux_runner_steward | `smolrunner::runner_user` | `host plan`; `host prepare` (direct or transitive) | pure | typed caller-owned identities/evidence | sealed runner-user mutations and command types | none | module/integration tests; Verify; Linux acceptance where gated | outside W02–W04; continue Linux steward integration | README; ROADMAP | keep visible as continuing Linux product track |
+| `runner_user_observation` | linux | CLI reachable | linux_runner_steward | `smolrunner::runner_user_observation` | `host plan`; `host prepare` (direct or transitive) | read | exact target identity; bounded observation source | verified runner-user/group/home observation | none | module/integration tests; Verify; Linux acceptance where gated | outside W02–W04; continue Linux steward integration | README; ROADMAP | keep visible as continuing Linux product track |
+| `subordinate_id` | linux | CLI reachable | linux_runner_steward | `smolrunner::subordinate_id` | `host plan`; `host prepare` (direct or transitive) | pure | typed caller-owned identities/evidence | subordinate UID/GID observation and planning | none | module/integration tests; Verify; Linux acceptance where gated | outside W02–W04; continue Linux steward integration | README; ROADMAP | keep visible as continuing Linux product track |
+
+## Shared foundations modules
+
+| module | cfg/platform | primary classification | product track | public entry point | current CLI command (or none) | authority/effect class | required upstream evidence | user step unlocked | W02–W04 consumer (or none) | current tests/evidence | missing integration proof | canonical issue/PR | consolidation note |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `artifact` | all | CLI reachable | shared | `smolrunner::artifact` | `queue submit`; planning paths | pure | typed caller-owned identities/evidence | bounded repository, commit, tree, digest, and artifact identities | O04, O05, B05 | module tests or compile coverage; Verify | bind ergonomic source discovery to existing exact IDs | #157; #187; #238 B05 | review public visibility after W04 export pass |
+| `doctor` | all | CLI reachable | shared | `smolrunner::doctor` | `doctor` | read | exact target identity; bounded observation source | host prerequisite diagnostics | none | installed doctor JSON exercise; Verify | retain exact route; ergonomic composition belongs to later lane | README; ROADMAP | stable current CLI surface |
+| `github_workflow_job_mapper` | all | pure foundation | shared | `smolrunner::github_workflow_job_mapper` | none | pure | typed caller-owned identities/evidence | workflow-job evidence to broker-intent mapping | none (W06) | module tests or compile coverage; Verify | W06 GitHub observation adapter | #241 | reserve for W06; avoid alpha coupling |
+| `github_workflow_job_reconciliation` | all | pure foundation | shared | `smolrunner::github_workflow_job_reconciliation` | none | read | exact target identity; bounded observation source | complete workflow-job snapshot normalization | none (W06) | module tests or compile coverage; Verify | W06 durable reconciliation consumer | #241 | reserve for W06; avoid alpha coupling |
+| `manifest` | all | CLI reachable | shared | `smolrunner::manifest` | `plan`; `host plan`; `host prepare` | pure | typed caller-owned identities/evidence | versioned desired-state manifest parser | none | plan fixtures and parser tests; Verify | retain exact route; ergonomic composition belongs to later lane | README; ROADMAP | stable current CLI contract |
+| `plan` | all | CLI reachable | shared | `smolrunner::plan` | `plan`; `host plan`; `host prepare` | pure | typed caller-owned identities/evidence | deterministic desired-state plan rendering | none | reference-plan exercises; Verify | retain exact route; ergonomic composition belongs to later lane | README; ROADMAP | stable current CLI surface |
+| `process` | all | CLI reachable | shared | `smolrunner::process` | `host plan`; `host prepare` (direct or transitive) | process | absolute program, reviewed argv, cwd, empty env, bounds | shell-free bounded subprocess executor | O05, B06 | bounded-output/process tests; Verify | exact source/profile plan and descendant cleanup join | ADR 0009; #205; #237 O05; #238 B06 | review public visibility after W04 export pass |
+| `resource` | all | CLI reachable | shared | `smolrunner::resource` | `plan`; `host plan`; `host prepare` | pure | typed caller-owned identities/evidence | typed desired resource kinds and identities | none | module tests or compile coverage; Verify | retain exact route; ergonomic composition belongs to later lane | README; ROADMAP | review public visibility after W04 export pass |
+| `state` | all | pure foundation | shared | `smolrunner::state` | none | pure | typed caller-owned identities/evidence | generic ownership/current-state model | none | module tests or compile coverage; Verify | no accepted W02–W04 composition yet | README; ROADMAP | generic state overlaps Linux/personal stores; assess later consolidation |
+| `state_document` | all | pure foundation | shared | `smolrunner::state_document` | none | pure | typed caller-owned identities/evidence | versioned generic ownership state document | none | module tests or compile coverage; Verify | no accepted W02–W04 composition yet | README; ROADMAP | generic document overlaps specialised stores; assess later consolidation |
+| `state_store` | all | pure foundation | shared | `smolrunner::state_store` | none | durable_mutation | exact ownership/revision; safe filesystem/lock evidence | atomic generic state-store contract | none | module tests or compile coverage; Verify | no accepted W02–W04 composition yet | README; ROADMAP | generic store overlaps specialised adapters; assess later consolidation |
+
+## Renderprove modules
+
+| module | cfg/platform | primary classification | product track | public entry point | current CLI command (or none) | authority/effect class | required upstream evidence | user step unlocked | W02–W04 consumer (or none) | current tests/evidence | missing integration proof | canonical issue/PR | consolidation note |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `descriptor_bound_launcher` | linux | pure foundation | renderprove | `smolrunner::descriptor_bound_launcher` | none | process | reviewed plan/argv; empty env; timeout/output bounds | descriptor-relative reviewed Linux launch execution | none | focused tests; PRs #226/#229; Linux acceptance | separate Renderprove product route; no W02–W04 consumer | #224; PRs #226/#229 | keep separate from personal-worker alpha |
+| `renderprove_artifact_binding` | all | pure foundation | renderprove | `smolrunner::renderprove_artifact_binding` | none | pure | typed caller-owned identities/evidence | bind Renderprove outputs to exact source/artifacts | none | focused tests; PRs #226/#229; Linux acceptance | separate Renderprove product route; no W02–W04 consumer | #224; PRs #226/#229 | keep separate from personal-worker alpha |
+| `renderprove_execution` | all | pure foundation | renderprove | `smolrunner::renderprove_execution` | none | process | reviewed plan/argv; empty env; timeout/output bounds | reviewed Renderprove execution records | none | focused tests; PRs #226/#229; Linux acceptance | separate Renderprove product route; no W02–W04 consumer | #224; PRs #226/#229 | keep separate from personal-worker alpha |
+| `renderprove_native_probe` | linux | pure foundation | renderprove | `smolrunner::renderprove_native_probe` | none | process | reviewed plan/argv; empty env; timeout/output bounds | native Linux Renderprove probe adapter | none | focused tests; PRs #226/#229; Linux acceptance | separate Renderprove product route; no W02–W04 consumer | #224; PRs #226/#229 | keep separate from personal-worker alpha |
+| `renderprove_protected_mount` | linux | pure foundation | renderprove | `smolrunner::renderprove_protected_mount` | none | pure | typed caller-owned identities/evidence | descriptor-bound protected mount lease | none | focused tests; PRs #226/#229; Linux acceptance | separate Renderprove product route; no W02–W04 consumer | #224; PRs #226/#229 | keep separate from personal-worker alpha |
+| `renderprove_verification` | all | pure foundation | renderprove | `smolrunner::renderprove_verification` | none | pure | typed caller-owned identities/evidence | typed Renderprove verification contract | none | focused tests; PRs #226/#229; Linux acceptance | separate Renderprove product route; no W02–W04 consumer | #224; PRs #226/#229 | keep separate from personal-worker alpha |
+| `renderprove_vision_profile` | all | pure foundation | renderprove | `smolrunner::renderprove_vision_profile` | none | pure | typed caller-owned identities/evidence | bounded vision model/profile identity | none | focused tests; PRs #226/#229; Linux acceptance | separate Renderprove product route; no W02–W04 consumer | #224; PRs #226/#229 | keep separate from personal-worker alpha |
+| `renderprove_vision_result` | all | pure foundation | renderprove | `smolrunner::renderprove_vision_result` | none | pure | typed caller-owned identities/evidence | bounded vision result and evidence | none | focused tests; PRs #226/#229; Linux acceptance | separate Renderprove product route; no W02–W04 consumer | #224; PRs #226/#229 | keep separate from personal-worker alpha |
+
+## Research and preview modules
+
+| module | cfg/platform | primary classification | product track | public entry point | current CLI command (or none) | authority/effect class | required upstream evidence | user step unlocked | W02–W04 consumer (or none) | current tests/evidence | missing integration proof | canonical issue/PR | consolidation note |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `lease` | all | experimental | research | `smolrunner::lease` | none | pure | typed caller-owned identities/evidence | revisioned lease lifecycle policy | none | module tests; ADR/roadmap evidence | no accepted personal-worker alpha consumer | ROADMAP; ADRs 0004–0013 | research lease vocabulary; no alpha coupling |
+| `lease_catalog` | all | experimental | research | `smolrunner::lease_catalog` | none | pure | typed caller-owned identities/evidence | in-memory lease CAS/catalogue contract | none | module tests; ADR/roadmap evidence | no accepted personal-worker alpha consumer | ROADMAP; ADRs 0004–0013 | research in-memory catalogue; no alpha coupling |
+| `lease_document` | all | experimental | research | `smolrunner::lease_document` | none | pure | typed caller-owned identities/evidence | versioned lease persistence document | none | module tests; ADR/roadmap evidence | no accepted personal-worker alpha consumer | ROADMAP; ADRs 0004–0013 | research persistence schema; no alpha coupling |
+| `podman_preview` | all | experimental | research | `smolrunner::podman_preview` | none | pure | typed caller-owned identities/evidence | reviewed Podman preview command planning | none | module tests; ADR/roadmap evidence | no accepted personal-worker alpha consumer | ROADMAP; ADRs 0004–0013 | keep experimental until a canonical consumer exists |
+| `podman_preview_execution` | all | experimental | research | `smolrunner::podman_preview_execution` | none | process | reviewed plan/argv; empty env; timeout/output bounds | execute bounded preview commands | none | module tests; ADR/roadmap evidence | no accepted personal-worker alpha consumer | ROADMAP; ADRs 0004–0013 | keep experimental until a canonical consumer exists |
+| `podman_preview_inspect` | all | experimental | research | `smolrunner::podman_preview_inspect` | none | pure | typed caller-owned identities/evidence | bind and decode Podman inspect evidence | none | module tests; ADR/roadmap evidence | no accepted personal-worker alpha consumer | ROADMAP; ADRs 0004–0013 | keep experimental until a canonical consumer exists |
+| `podman_preview_state` | all | experimental | research | `smolrunner::podman_preview_state` | none | pure | typed caller-owned identities/evidence | state-aware preview reconciliation | none | module tests; ADR/roadmap evidence | no accepted personal-worker alpha consumer | ROADMAP; ADRs 0004–0013 | keep experimental until a canonical consumer exists |
+| `preview` | all | experimental | research | `smolrunner::preview` | none | pure | typed caller-owned identities/evidence | preview-slot generation and coalescing policy | none | module tests; ADR/roadmap evidence | no accepted personal-worker alpha consumer | ROADMAP; ADRs 0004–0013 | keep experimental until a canonical consumer exists |
+
+## W02–W04 integration summary
+
+The smallest accepted product route uses existing foundations in this order:
+
+1. **W02 discovery and convenience services** bind accepted configuration to
+   `unix_personal_worker_store`, expose current read projections, construct exact submit/cancel
+   mutations, derive immutable repository source, and aggregate typed status.
+2. **W03 broker and execution adapters** compose `personal_worker_host_broker`,
+   `mac_availability`, Mac/Lima observations, runner readiness, verification registry/envelope,
+   hardened `process` execution, memory diagnostics, and one exact terminal transaction.
+3. **W04 integration** performs one bounded run-once action per invocation, registers routine CLI
+   commands, exports accepted modules once, proves replay/restart/privacy in injected tests, and
+   records physical M5 MacBook Air evidence.
+
+The existing MacBook scripts and quickstart are field-validation helpers. They start, inspect, edit,
+or stop an existing Lima instance; they do not constitute the personal-worker product journey,
+runner registration, configuration discovery, durable orchestration, or physical acceptance receipt.
+
+## Consolidation findings
+
+These are findings for later owners, not changes authorised by P02:
+
+- `README.md` and `docs/ROADMAP.md` lag current `src/main.rs`: the exact worker/queue/job command
+  family merged during W00 but is absent from their current-command summaries.
+- `state`, `state_document`, and `state_store` coexist with specialised Linux and personal-worker
+  stores. Keep them stable through W04, then assess whether their public visibility still serves a
+  consumer.
+- `journal`/`journal_document`, `durable_journal`, and personal-worker transactions represent
+  different layers. Preserve the distinction between generic action history, its durable Linux
+  adapter, and exact worker snapshot mutation.
+- `runner_export` is reviewed and integration-ready, but B05/B06 must decide whether the alpha uses
+  full bundle export or only its exact-source identity contract.
+- `github_workflow_job_mapper` and `github_workflow_job_reconciliation` belong to W06. Coupling them
+  to the run-once alpha would prematurely import GitHub observation and credential concerns.
+- Renderprove modules are mature within their own track. They should remain separate from the
+  personal-worker journey unless a later canonical lane names an exact shared contract.
+- Lease and preview modules remain experimental for this programme. Their accepted ADRs do not make
+  them personal-worker alpha dependencies.
+- Broad implementation modules can move behind narrower operator services after W04 API review.
+  `src/lib.rs` integration remains owned by W04 I03; this document grants no visibility change.
+- No current public module has canonical evidence of supersession. Historical PRs alone are
+  insufficient to classify one as superseded.
+
+## Mechanical completeness check
+
+The table was generated from the exact-base export list. A reviewer can repeat the module extraction:
+
+```bash
+python3 - <<'PY'
+import re
+from pathlib import Path
+
+source = Path("src/lib.rs").read_text(encoding="utf-8")
+modules = re.findall(r"^pub mod ([a-zA-Z0-9_]+);$", source, flags=re.MULTILINE)
+assert len(modules) == len(set(modules))
+print("\n".join(modules))
+print(f"count={len(modules)}")
+PY
+```
+
+For this revision the command must print `count=90`. Review should compare that sorted output with
+the 90 `module` cells above and fail on a missing, duplicate, or extra name.
