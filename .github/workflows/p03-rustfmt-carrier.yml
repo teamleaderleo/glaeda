@@ -4,30 +4,28 @@ on:
   push:
     branches:
       - tmp/p03-rustfmt-carrier
-  pull_request:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  format:
+  format-and-publish:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - name: Check out repository
+      - name: Check out exact P03 source head
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
+          ref: feat/p03-operator-config
+          fetch-depth: 0
           show-progress: false
-      - name: Format candidate files
+      - name: Format and publish one guarded child commit
         run: |
+          test "$(git rev-parse HEAD)" = "7fe0e2a65f6aaa231b4c0b3abb6a66deb0ef792c"
           cargo fmt --all
-          mkdir formatted
-          git diff -- src/operator_config.rs tests/operator_config_contract.rs > formatted/format.patch
-          cp src/operator_config.rs tests/operator_config_contract.rs formatted/
-      - name: Upload formatted files
-        uses: actions/upload-artifact@v4
-        with:
-          name: p03-rustfmt
-          path: formatted
-          if-no-files-found: error
-          retention-days: 1
+          git diff --check
+          git config user.name "smolrunner-format-carrier"
+          git config user.email "smolrunner-format-carrier@users.noreply.github.com"
+          git add src/operator_config.rs tests/operator_config_contract.rs
+          git commit -m "Format operator configuration contract"
+          git push origin HEAD:refs/heads/feat/p03-operator-config
