@@ -19,9 +19,11 @@ jobs:
           ref: ${{ github.event.pull_request.head.ref }}
           fetch-depth: 0
           show-progress: false
-      - name: Replay and validate protected mount source
+      - name: Replay and capture validation
         run: |
-          python3 - <<'PY'
+          set +e
+          {
+            python3 - <<'PY'
           from pathlib import Path
           import re
 
@@ -42,21 +44,18 @@ jobs:
           text = text.replace('Errno::ACCES', 'Errno::ACCESS')
           path.write_text(text, encoding='utf-8')
           PY
-          python3 .github/issue224-hardening.py
-          python3 - <<'PY'
+            python3 .github/issue224-hardening.py
+            python3 - <<'PY'
           from pathlib import Path
           import re
 
           mount = Path('src/renderprove_protected_mount.rs')
           text = mount.read_text(encoding='utf-8')
-          anchor = '''                pending.disarm();
-          return Ok(CreatedAlias {'''
-          replacement = '''                pending.disarm();
-          drop(pending);
-          return Ok(CreatedAlias {'''
-          if text.count(anchor) != 1:
-              raise SystemExit(f'pending alias lifetime anchor count: {text.count(anchor)}')
-          text = text.replace(anchor, replacement, 1)
+
+          pattern = re.compile(r'(\s+pending\.disarm\(\);)\s+(return Ok\(CreatedAlias \{)')
+          text, count = pattern.subn(r'\1\n                drop(pending);\n                \2', text, count=1)
+          if count != 1:
+              raise SystemExit(f'pending alias lifetime anchor count: {count}')
 
           pattern = re.compile(r'fn require_root_owned_mount_root\(root: &OwnedFd\) -> Result<\(\), RenderproveProtectedMountError> \{[\s\S]*?\n}\n\nfn inspect_directory_identity')
           root_policy = '''fn require_root_owned_mount_root(root: &OwnedFd) -> Result<(), RenderproveProtectedMountError> {
@@ -88,22 +87,24 @@ jobs:
           text, count = pattern.subn(root_policy, text, count=1)
           if count != 1:
               raise SystemExit(f'mount root policy anchor count: {count}')
-          test_anchor = '''    #[test]
-          fn errors_and_cleanup_receipts_are_bounded() {'''
-          tests = '''    #[test]
-          fn mount_root_is_private_but_runner_traversable() {
-              assert!(mount_root_metadata_is_safe(0, 0, 0o040711));
-              assert!(!mount_root_metadata_is_safe(0, 0, 0o040700));
-              assert!(!mount_root_metadata_is_safe(0, 0, 0o040755));
-              assert!(!mount_root_metadata_is_safe(0, 0, 0o040733));
-              assert!(!mount_root_metadata_is_safe(1000, 0, 0o040711));
-          }
 
-          #[test]
-          fn errors_and_cleanup_receipts_are_bounded() {'''
-          if text.count(test_anchor) != 1:
-              raise SystemExit(f'mount root test anchor count: {text.count(test_anchor)}')
-          mount.write_text(text.replace(test_anchor, tests, 1), encoding='utf-8')
+          pattern = re.compile(r'(\n    #\[test\]\n    fn errors_and_cleanup_receipts_are_bounded\(\) \{)')
+          tests = '''
+              #[test]
+              fn mount_root_is_private_but_runner_traversable() {
+                  assert!(mount_root_metadata_is_safe(0, 0, 0o040711));
+                  assert!(!mount_root_metadata_is_safe(0, 0, 0o040700));
+                  assert!(!mount_root_metadata_is_safe(0, 0, 0o040755));
+                  assert!(!mount_root_metadata_is_safe(0, 0, 0o040733));
+                  assert!(!mount_root_metadata_is_safe(1000, 0, 0o040711));
+              }
+
+              #[test]
+              fn errors_and_cleanup_receipts_are_bounded() {'''
+          text, count = pattern.subn(tests, text, count=1)
+          if count != 1:
+              raise SystemExit(f'mount root test anchor count: {count}')
+          mount.write_text(text, encoding='utf-8')
 
           cargo = Path('Cargo.toml')
           text = cargo.read_text(encoding='utf-8')
@@ -115,20 +116,11 @@ jobs:
 
           lib = Path('src/lib.rs')
           text = lib.read_text(encoding='utf-8')
-          old = '''/// Pure direct-Podman planning for the native Renderprove probe boundary.
-          #[cfg(target_os = "linux")]
-          pub mod renderprove_native_probe;
-          pub mod renderprove_verification;'''
-          new = '''/// Pure direct-Podman planning for the native Renderprove probe boundary.
-          #[cfg(target_os = "linux")]
-          pub mod renderprove_native_probe;
-          /// Descriptor-bound protected project/evidence mount lease for native Renderprove probes.
-          #[cfg(target_os = "linux")]
-          pub mod renderprove_protected_mount;
-          pub mod renderprove_verification;'''
-          if text.count(old) != 1:
-              raise SystemExit(f'lib export anchor count: {text.count(old)}')
-          lib.write_text(text.replace(old, new, 1), encoding='utf-8')
+          marker = 'pub mod renderprove_native_probe;\n'
+          addition = marker + '/// Descriptor-bound protected project/evidence mount lease for native Renderprove probes.\n#[cfg(target_os = "linux")]\npub mod renderprove_protected_mount;\n'
+          if text.count(marker) != 1 or 'pub mod renderprove_protected_mount;' in text:
+              raise SystemExit('lib export marker is missing or duplicated')
+          lib.write_text(text.replace(marker, addition, 1), encoding='utf-8')
 
           probe = Path('src/renderprove_native_probe.rs')
           text = probe.read_text(encoding='utf-8')
@@ -158,19 +150,32 @@ jobs:
               raise SystemExit(f'broker constructor anchor count: {text.count(anchor)}')
           probe.write_text(text.replace(anchor, insertion, 1), encoding='utf-8')
           PY
-          cargo fmt --all
-          rustup target add aarch64-unknown-linux-gnu >/dev/null
-          cargo check --locked --target aarch64-unknown-linux-gnu
-          cargo test --locked renderprove_protected_mount
-          cargo clippy --locked --all-targets --all-features -- -D warnings
-          cargo test --locked --all-targets --all-features
-      - name: Commit clean product replay
+            cargo fmt --all
+            rustup target add aarch64-unknown-linux-gnu >/dev/null
+            cargo check --locked --target aarch64-unknown-linux-gnu
+            cargo test --locked renderprove_protected_mount
+            cargo clippy --locked --all-targets --all-features -- -D warnings
+            cargo test --locked --all-targets --all-features
+          } > .github/issue224-replay.log 2>&1
+          status=$?
+          set -e
+          printf '\nagent3_status=%s\n' "$status" >> .github/issue224-replay.log
+          tail -n 180 .github/issue224-replay.log
+      - name: Publish result or diagnostic
         run: |
+          status=$(sed -n 's/^agent3_status=//p' .github/issue224-replay.log | tail -n 1)
           git config user.name "Agent 3"
           git config user.email "agent3@users.noreply.github.com"
-          git rm .github/issue224-hardening.py
-          git rm .github/workflows/agent3-issue224-replay.yml
-          git add Cargo.toml Cargo.lock src/lib.rs src/renderprove_native_probe.rs src/renderprove_protected_mount.rs
-          git diff --cached --check
-          git commit -m "Create hardened Renderprove protected mount lease"
+          if test "$status" = 0; then
+            git rm .github/issue224-hardening.py
+            git rm .github/workflows/agent3-issue224-replay.yml
+            git rm -f .github/agent3-issue224-trigger
+            rm -f .github/issue224-replay.log
+            git add Cargo.toml Cargo.lock src/lib.rs src/renderprove_native_probe.rs src/renderprove_protected_mount.rs
+            git diff --cached --check
+            git commit -m "Create hardened Renderprove protected mount lease"
+          else
+            git add .github/issue224-replay.log
+            git commit -m "Capture protected mount replay diagnostics"
+          fi
           git push origin HEAD:${{ github.event.pull_request.head.ref }}
