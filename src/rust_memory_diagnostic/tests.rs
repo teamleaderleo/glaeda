@@ -9,6 +9,7 @@ use crate::rust_verification_envelope::{
     RustTargetDirectoryId, RustTargetTriple, RustToolchainId, RustToolchainIdentity,
     RustVerificationEnvelopeDefinition, RustVerificationScope,
 };
+use crate::rust_verification_envelope_digest::digest_rust_verification_envelope;
 use crate::verification_profile::{
     CacheId, CapabilityId, PackageId, RepositoryCommandId, RepositoryCommandIdentity,
     VerificationProfileId,
@@ -112,10 +113,10 @@ fn process_group(generation: u64) -> RustProcessGroupIdentity {
 fn envelope_binding(envelope: &RustVerificationEnvelope) -> RustMemoryDiagnosticEnvelopeBinding {
     RustMemoryDiagnosticEnvelopeBinding::from_envelope(
         envelope,
-        digest('f'),
         RustVerificationAttemptId::parse("attempt-1").expect("attempt"),
         process_group(1),
     )
+    .expect("envelope binding")
 }
 
 fn counters(oom: u64, oom_kill: u64) -> RustMemoryEventCounters {
@@ -204,9 +205,35 @@ fn envelope_binding_derives_identity_and_authority_atomically() {
     );
     assert_eq!(binding.identity().source(), envelope.source());
     assert_eq!(binding.identity().command(), envelope.command());
-    assert_eq!(binding.identity().envelope_digest(), &digest('f'));
+    assert_eq!(
+        binding.identity().envelope_digest(),
+        &digest_rust_verification_envelope(&envelope).expect("canonical envelope digest")
+    );
     assert_eq!(binding.authority().maximum_execution_millis(), 12_345);
     assert_eq!(binding.authority().reserved_memory_bytes(), 6 * GIB);
+}
+
+#[test]
+fn different_envelopes_cannot_substitute_digest_or_authority() {
+    let shorter = envelope(12_345);
+    let longer = envelope(54_321);
+    let shorter_binding = envelope_binding(&shorter);
+    let longer_binding = envelope_binding(&longer);
+
+    assert_ne!(
+        shorter_binding.identity().envelope_digest(),
+        longer_binding.identity().envelope_digest()
+    );
+    assert_eq!(
+        shorter_binding.identity().envelope_digest(),
+        &digest_rust_verification_envelope(&shorter).expect("shorter envelope digest")
+    );
+    assert_eq!(
+        longer_binding.identity().envelope_digest(),
+        &digest_rust_verification_envelope(&longer).expect("longer envelope digest")
+    );
+    assert_eq!(shorter_binding.authority().maximum_execution_millis(), 12_345);
+    assert_eq!(longer_binding.authority().maximum_execution_millis(), 54_321);
 }
 
 #[test]
