@@ -46,6 +46,25 @@ pub struct RenderproveProtectedMountReceipt {
 }
 
 impl RenderproveProtectedMountReceipt {
+    pub(crate) fn from_broker(
+        source: RenderproveSourceIdentity,
+        project_alias: PathBuf,
+        project_identity: ReviewedFilesystemIdentity,
+        evidence_alias: PathBuf,
+        evidence_identity: ReviewedFilesystemIdentity,
+        evidence_directory: PathBuf,
+    ) -> Self {
+        Self {
+            schema_version: RENDERPROVE_NATIVE_PROBE_SCHEMA_VERSION,
+            source,
+            project_alias,
+            project_identity,
+            evidence_alias,
+            evidence_identity,
+            evidence_directory,
+        }
+    }
+
     /// Bind one protected project alias and one separate protected evidence alias.
     ///
     /// This constructor is crate-private because only a later descriptor-relative mount producer may

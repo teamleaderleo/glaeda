@@ -17,7 +17,8 @@ serde_yaml = { package = "serde_norway", version = "0.9.42" }
 sha2 = "0.10"
 
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1.1.4", features = ["fs", "process", "rand", "thread"] }
+# `mount` exposes Linux open_tree/move_mount through rustix without unsafe project code.
+rustix = { version = "1.1.4", features = ["fs", "mount", "process", "rand", "thread"] }
 
 [lints.rust]
 unsafe_code = "forbid"
