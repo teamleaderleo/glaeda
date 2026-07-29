@@ -1,0 +1,67 @@
+name: O02 store recovery carrier runner
+
+on:
+  pull_request:
+    branches: [fix/o02-store-recovery-evidence]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: o02-store-recovery-carrier-run
+  cancel-in-progress: false
+
+jobs:
+  patch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out carrier definition
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: automation/o02-store-recovery-patch
+          fetch-depth: 0
+          show-progress: false
+
+      - name: Preserve carrier and check out canonical branch
+        run: |
+          cp .github/workflows/o02-store-recovery-patch.yml /tmp/o02-carrier.yml
+          git fetch origin fix/o02-store-recovery-evidence
+          git checkout -B fix/o02-store-recovery-evidence origin/fix/o02-store-recovery-evidence
+
+      - name: Execute reviewed carrier blocks
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import subprocess
+
+          lines = Path('/tmp/o02-carrier.yml').read_text(encoding='utf-8').splitlines()
+          blocks = []
+          index = 0
+          while index < len(lines):
+              line = lines[index]
+              if line.strip() != 'run: |':
+                  index += 1
+                  continue
+              base_indent = len(line) - len(line.lstrip())
+              index += 1
+              block = []
+              while index < len(lines):
+                  current = lines[index]
+                  if current.strip():
+                      indent = len(current) - len(current.lstrip())
+                      if indent <= base_indent:
+                          break
+                      block.append(current[base_indent + 2:])
+                  else:
+                      block.append('')
+                  index += 1
+              blocks.append('\n'.join(block).rstrip() + '\n')
+          if len(blocks) != 3:
+              raise SystemExit(f'expected exactly three carrier run blocks, found {len(blocks)}')
+          for number, block in enumerate(blocks, start=1):
+              print(f'::group::carrier block {number}')
+              subprocess.run(['bash', '-euo', 'pipefail', '-c', block], check=True)
+              print('::endgroup::')
+          PY
