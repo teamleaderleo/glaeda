@@ -1,0 +1,61 @@
+name: Q03 benchmark diagnostic
+
+on:
+  push:
+    branches: [diagnostic/q03-benchmark-run]
+  pull_request:
+    branches: [perf/q03-personal-worker-benchmarks]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: q03-benchmark-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          show-progress: false
+
+      - name: Validate benchmark runner syntax
+        run: python3 -m py_compile scripts/benchmark-personal-worker.py
+
+      - name: Record toolchain
+        run: rustup show active-toolchain
+
+      - name: Run bounded release benchmark
+        run: |
+          python3 scripts/benchmark-personal-worker.py \
+            --profile release \
+            --samples 7 \
+            --warmups 2 \
+            --output /tmp/q03-report.json
+
+      - name: Validate public report
+        run: |
+          jq -e '
+            .schema_version == 1 and
+            .receipt_type == "smolrunner-personal-worker-benchmark-report" and
+            .source.dirty == false and
+            .settings.sample_count == 7 and
+            .settings.warmup_count == 2 and
+            .settings.queue_sizes == [10, 100, 256] and
+            .privacy.private_path_exposed == false and
+            .privacy.environment_dumped == false and
+            .privacy.credentials_read == false and
+            (.benchmarks | length) == 15 and
+            (.blocked_measurements | length) == 5 and
+            (all(.benchmarks[]; .sample_count == 7 and .median_ms >= 0 and .p95_ms >= 0))
+          ' /tmp/q03-report.json
+          if grep -Eq '/home/runner|/tmp/smolrunner-q03-private-|Authorization:|PRIVATE_TOKEN' /tmp/q03-report.json; then
+            printf 'error: Q03 public report contains a private sentinel\n' >&2
+            exit 1
+          fi
+          cat /tmp/q03-report.json
