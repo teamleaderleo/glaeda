@@ -1,0 +1,593 @@
+name: O02 store recovery patch v2
+
+on:
+  pull_request:
+    branches: [fix/o02-store-recovery-evidence]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: o02-store-recovery-patch-v2
+  cancel-in-progress: false
+
+jobs:
+  patch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out canonical O02 branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: fix/o02-store-recovery-evidence
+          fetch-depth: 0
+          show-progress: false
+
+      - name: Apply bounded source transformations
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def read(path: str) -> str:
+              return Path(path).read_text(encoding="utf-8")
+
+          def write(path: str, text: str) -> None:
+              Path(path).write_text(text, encoding="utf-8")
+
+          def replace_once(path: str, old: str, new: str) -> None:
+              text = read(path)
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected one replacement anchor, found {count}")
+              write(path, text.replace(old, new, 1))
+
+          def insert_before(path: str, marker: str, addition: str) -> None:
+              text = read(path)
+              count = text.count(marker)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected one insertion marker, found {count}")
+              write(path, text.replace(marker, addition + marker, 1))
+
+          store_path = "src/personal_worker_store.rs"
+          error_marker = '''#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+          #[serde(rename_all = "snake_case")]
+          pub enum PersonalWorkerStoreErrorKind {
+          '''.replace("          ", "")
+          init_types = '''#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+          #[serde(rename_all = "snake_case")]
+          pub enum PersonalWorkerStoreInitializationDisposition {
+              Created,
+              AlreadyExists,
+              RecoveryRequired,
+          }
+
+          #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+          pub struct PersonalWorkerStoreInitializationReceipt {
+              disposition: PersonalWorkerStoreInitializationDisposition,
+              revision: Option<PersonalWorkerStoreRevision>,
+              bytes_written: usize,
+          }
+
+          impl PersonalWorkerStoreInitializationReceipt {
+              #[must_use]
+              pub const fn new(
+                  disposition: PersonalWorkerStoreInitializationDisposition,
+                  revision: Option<PersonalWorkerStoreRevision>,
+                  bytes_written: usize,
+              ) -> Self {
+                  Self {
+                      disposition,
+                      revision,
+                      bytes_written,
+                  }
+              }
+
+              #[must_use]
+              pub const fn disposition(&self) -> PersonalWorkerStoreInitializationDisposition {
+                  self.disposition
+              }
+
+              #[must_use]
+              pub const fn revision(&self) -> Option<PersonalWorkerStoreRevision> {
+                  self.revision
+              }
+
+              #[must_use]
+              pub const fn bytes_written(&self) -> usize {
+                  self.bytes_written
+              }
+          }
+
+          '''.replace("          ", "")
+          insert_before(store_path, error_marker, init_types)
+          replace_once(
+              store_path,
+              "    UnsafeFilesystem,\n    CorruptState,\n",
+              "    UnsafeFilesystem,\n    VersionIncompatible,\n    CorruptState,\n",
+          )
+          insert_before(
+              store_path,
+              "    #[must_use]\n    pub const fn corrupt_state() -> Self {\n",
+              '''    #[must_use]
+              pub const fn version_incompatible() -> Self {
+                  Self::new(
+                      PersonalWorkerStoreErrorKind::VersionIncompatible,
+                      "durable personal worker state schema is incompatible",
+                  )
+              }
+
+          '''.replace("          ", ""),
+          )
+          replace_once(
+              store_path,
+              '''        if value.schema_version != PERSONAL_WORKER_STORE_SCHEMA_VERSION {
+                  return Err(PersonalWorkerStoreError::corrupt_state());
+              }
+          '''.replace("          ", ""),
+              '''        if value.schema_version != PERSONAL_WORKER_STORE_SCHEMA_VERSION {
+                  return Err(PersonalWorkerStoreError::version_incompatible());
+              }
+          '''.replace("          ", ""),
+          )
+
+          unix_path = "src/unix_personal_worker_store.rs"
+          replace_once(
+              unix_path,
+              '''    PersonalWorkerStoreError, PersonalWorkerStoreErrorKind, PersonalWorkerStoreRecovery,
+              PersonalWorkerStoreRecoveryDisposition, PersonalWorkerStoreRevision,
+              PersonalWorkerStoreWriteDisposition, PersonalWorkerStoreWriteReceipt,
+          '''.replace("          ", ""),
+              '''    PersonalWorkerStoreError, PersonalWorkerStoreErrorKind,
+              PersonalWorkerStoreInitializationDisposition, PersonalWorkerStoreInitializationReceipt,
+              PersonalWorkerStoreRecovery, PersonalWorkerStoreRecoveryDisposition,
+              PersonalWorkerStoreRevision, PersonalWorkerStoreWriteDisposition,
+              PersonalWorkerStoreWriteReceipt,
+          '''.replace("          ", ""),
+          )
+          replace_once(
+              unix_path,
+              '''        decode_personal_worker_store_document(&bytes)
+                  .map(Some)
+                  .map_err(|_| PersonalWorkerStoreError::corrupt_state())
+          '''.replace("          ", ""),
+              "        decode_personal_worker_store_document(&bytes).map(Some)\n",
+          )
+
+          init_method_marker = (
+              "    fn acquire_mutation_lock(&self) -> Result<StoreMutationLock, "
+              "PersonalWorkerStoreError> {\n"
+          )
+          init_method = '''    /// Create the exact initial document only when no current or staged state exists.
+              ///
+              /// The writer lock is acquired before inspecting durable state. Any valid staged
+              /// recovery state is reported without publication or cleanup, and an existing current
+              /// document is returned as an idempotent result without changing its bytes.
+              pub fn initialize_if_clean(
+                  root_path: impl AsRef<Path>,
+                  document: &PersonalWorkerStoreDocument,
+              ) -> Result<PersonalWorkerStoreInitializationReceipt, PersonalWorkerStoreError> {
+                  if document.revision().get() != 1 || !document.history().is_empty() {
+                      return Err(store_error(
+                          PersonalWorkerStoreErrorKind::RevisionConflict,
+                          "initial personal worker state must use revision one without history",
+                      ));
+                  }
+                  let root = fs::open(root_path.as_ref(), DIRECTORY_FLAGS, Mode::empty())
+                      .map_err(map_root_open_error)?;
+                  let root_stat = inspect_directory(&root, "personal worker state root", None)?;
+                  let owner = (root_stat.st_uid, root_stat.st_gid);
+                  let directory = ensure_store_directory(&root, owner)?;
+                  ensure_lock_file(&directory, owner)?;
+                  let store = Self {
+                      _root: root,
+                      directory,
+                      owner,
+                  };
+                  let _lock = store.acquire_mutation_lock()?;
+                  match store.recovery_plan()? {
+                      StoreRecoveryPlan::Clean {
+                          revision: Some(revision),
+                      } => Ok(PersonalWorkerStoreInitializationReceipt::new(
+                          PersonalWorkerStoreInitializationDisposition::AlreadyExists,
+                          Some(revision),
+                          0,
+                      )),
+                      StoreRecoveryPlan::Clean { revision: None } => {
+                          let bytes_written = encode_personal_worker_store_document(document)?.len();
+                          let mut staged = store.stage_document(document)?;
+                          store.publish_staged(&mut staged, true)?;
+                          Ok(PersonalWorkerStoreInitializationReceipt::new(
+                              PersonalWorkerStoreInitializationDisposition::Created,
+                              Some(document.revision()),
+                              bytes_written,
+                          ))
+                      }
+                      StoreRecoveryPlan::PublishStaged { revision, .. }
+                      | StoreRecoveryPlan::RemoveStaleStaged { revision } => {
+                          Ok(PersonalWorkerStoreInitializationReceipt::new(
+                              PersonalWorkerStoreInitializationDisposition::RecoveryRequired,
+                              Some(revision),
+                              0,
+                          ))
+                      }
+                  }
+              }
+
+          '''.replace("          ", "")
+          insert_before(unix_path, init_method_marker, init_method)
+
+          unix_text = read(unix_path)
+          recover_start = unix_text.find(
+              "    fn recover_locked(&mut self) -> Result<PersonalWorkerStoreRecovery, "
+              "PersonalWorkerStoreError> {\n"
+          )
+          recover_end = unix_text.find("\n}\n\nimpl PersonalWorkerStore for UnixPersonalWorkerStore", recover_start)
+          if recover_start < 0 or recover_end < 0:
+              raise SystemExit("unix store: recover_locked structural boundary not found")
+          recovery_methods = '''    fn recovery_plan(&self) -> Result<StoreRecoveryPlan, PersonalWorkerStoreError> {
+              let Some(staged) = self.load_named(STAGED_DOCUMENT)? else {
+                  return Ok(StoreRecoveryPlan::Clean {
+                      revision: self
+                          .load_named(CURRENT_DOCUMENT)?
+                          .map(|document| document.revision()),
+                  });
+              };
+              let current = self.load_named(CURRENT_DOCUMENT)?;
+              match current {
+                  None => {
+                      if staged.revision().get() != 1 || !staged.history().is_empty() {
+                          return Err(PersonalWorkerStoreError::corrupt_state());
+                      }
+                      Ok(StoreRecoveryPlan::PublishStaged {
+                          revision: staged.revision(),
+                          no_replace: true,
+                      })
+                  }
+                  Some(current) if staged.revision() <= current.revision() => {
+                      Ok(StoreRecoveryPlan::RemoveStaleStaged {
+                          revision: current.revision(),
+                      })
+                  }
+                  Some(current) => {
+                      staged
+                          .validate_successor_of(&current)
+                          .map_err(|_| PersonalWorkerStoreError::corrupt_state())?;
+                      Ok(StoreRecoveryPlan::PublishStaged {
+                          revision: staged.revision(),
+                          no_replace: false,
+                      })
+                  }
+              }
+          }
+
+              fn recover_locked(&mut self) -> Result<PersonalWorkerStoreRecovery, PersonalWorkerStoreError> {
+                  match self.recovery_plan()? {
+                      StoreRecoveryPlan::Clean { revision } => Ok(PersonalWorkerStoreRecovery::new(
+                          PersonalWorkerStoreRecoveryDisposition::Clean,
+                          revision,
+                      )),
+                      StoreRecoveryPlan::PublishStaged {
+                          revision,
+                          no_replace,
+                      } => {
+                          let mut staged_guard = StagedDocument::existing(self.directory.as_fd());
+                          self.publish_staged(&mut staged_guard, no_replace)?;
+                          Ok(PersonalWorkerStoreRecovery::new(
+                              PersonalWorkerStoreRecoveryDisposition::PublishedStaged,
+                              Some(revision),
+                          ))
+                      }
+                      StoreRecoveryPlan::RemoveStaleStaged { revision } => {
+                          self.remove_staged()?;
+                          Ok(PersonalWorkerStoreRecovery::new(
+                              PersonalWorkerStoreRecoveryDisposition::RemovedStaleStaged,
+                              Some(revision),
+                          ))
+                      }
+                  }
+              }'''.replace("          ", "")
+          write(unix_path, unix_text[:recover_start] + recovery_methods + unix_text[recover_end:])
+          insert_before(
+              unix_path,
+              "#[derive(Debug)]\nstruct StoreMutationLock {\n",
+              '''#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+              enum StoreRecoveryPlan {
+                  Clean {
+                      revision: Option<PersonalWorkerStoreRevision>,
+                  },
+                  PublishStaged {
+                      revision: PersonalWorkerStoreRevision,
+                      no_replace: bool,
+                  },
+                  RemoveStaleStaged {
+                      revision: PersonalWorkerStoreRevision,
+                  },
+              }
+
+          '''.replace("          ", ""),
+          )
+
+          for path in (
+              "src/personal_worker_read_command.rs",
+              "src/personal_worker_submit_command.rs",
+              "src/personal_worker_cancel_command.rs",
+          ):
+              replace_once(
+                  path,
+                  '''        PersonalWorkerStoreErrorKind::CorruptState
+                  | PersonalWorkerStoreErrorKind::InvalidDocument =>
+          '''.replace("          ", ""),
+                  '''        PersonalWorkerStoreErrorKind::VersionIncompatible
+                  | PersonalWorkerStoreErrorKind::CorruptState
+                  | PersonalWorkerStoreErrorKind::InvalidDocument =>
+          '''.replace("          ", ""),
+              )
+          replace_once(
+              "src/personal_worker_store_transaction.rs",
+              '''        PersonalWorkerStoreErrorKind::CorruptState => PersonalWorkerStoreMutationError::new(
+                  PersonalWorkerStoreMutationErrorKind::CorruptState,
+                  "durable personal worker state is corrupt or noncanonical",
+              ),
+          '''.replace("          ", ""),
+              '''        PersonalWorkerStoreErrorKind::VersionIncompatible
+              | PersonalWorkerStoreErrorKind::CorruptState => PersonalWorkerStoreMutationError::new(
+                  PersonalWorkerStoreMutationErrorKind::CorruptState,
+                  "durable personal worker state is corrupt or noncanonical",
+              ),
+          '''.replace("          ", ""),
+          )
+
+          Path("tests/personal_worker_initialization_contract.rs").write_text(r'''#![cfg(unix)]
+
+          use std::fs::{self, OpenOptions};
+          use std::os::unix::fs::PermissionsExt;
+          use std::path::{Path, PathBuf};
+          use std::sync::atomic::{AtomicU64, Ordering};
+
+          use rustix::fs::{FlockOperation, flock};
+          use smolrunner::execution_admission::EpochMillis;
+          use smolrunner::personal_worker_queue::{
+              PersonalWorkerProfile, PersonalWorkerQueueGeneration, PersonalWorkerQueueInput,
+          };
+          use smolrunner::personal_worker_store::{
+              PersonalWorkerStore, PersonalWorkerStoreDocument, PersonalWorkerStoreErrorKind,
+              PersonalWorkerStoreInitializationDisposition, decode_personal_worker_store_document,
+              encode_personal_worker_store_document,
+          };
+          use smolrunner::unix_personal_worker_store::UnixPersonalWorkerStore;
+
+          static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
+
+          struct TempRoot(PathBuf);
+
+          impl TempRoot {
+              fn new(label: &str) -> Self {
+                  let sequence = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
+                  let path = std::env::temp_dir().join(format!(
+                      "smolrunner-personal-worker-initialization-{label}-{}-{sequence}",
+                      std::process::id()
+                  ));
+                  fs::create_dir(&path).expect("create temporary state root");
+                  fs::set_permissions(&path, fs::Permissions::from_mode(0o750))
+                      .expect("set state root mode");
+                  Self(path)
+              }
+
+              fn path(&self) -> &Path {
+                  &self.0
+              }
+
+              fn store_directory(&self) -> PathBuf {
+                  self.0.join("personal-worker")
+              }
+          }
+
+          impl Drop for TempRoot {
+              fn drop(&mut self) {
+                  let _ = fs::remove_dir_all(&self.0);
+              }
+          }
+
+          fn time(value: u64) -> EpochMillis {
+              EpochMillis::new(value).expect("time")
+          }
+
+          fn queue(generation: u64, observed_at: u64) -> PersonalWorkerQueueInput {
+              PersonalWorkerQueueInput {
+                  generation: PersonalWorkerQueueGeneration::new(generation)
+                      .expect("queue generation"),
+                  observed_at: time(observed_at),
+                  current_profile: PersonalWorkerProfile::Interactive,
+                  last_activity_at: time(observed_at),
+                  queued: vec![],
+                  active: vec![],
+                  pending_profile_change: None,
+              }
+          }
+
+          fn initial_document(observed_at: u64) -> PersonalWorkerStoreDocument {
+              PersonalWorkerStoreDocument::new(queue(1, observed_at), vec![])
+                  .expect("initial document")
+          }
+
+          fn write_private(path: &Path, bytes: &[u8]) {
+              fs::write(path, bytes).expect("write private fixture");
+              fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+                  .expect("set private fixture mode");
+          }
+
+          #[test]
+          fn top_level_store_version_is_distinct_from_corruption() {
+              let encoded = encode_personal_worker_store_document(&initial_document(1_000_000))
+                  .expect("encode initial document");
+              let mut incompatible: serde_json::Value =
+                  serde_json::from_slice(&encoded).expect("parse document");
+              incompatible["schema_version"] = serde_json::Value::from(2_u64);
+              let incompatible_bytes =
+                  serde_json::to_vec(&incompatible).expect("encode incompatible document");
+              assert_eq!(
+                  decode_personal_worker_store_document(&incompatible_bytes)
+                      .expect_err("unsupported top-level version")
+                      .kind(),
+                  PersonalWorkerStoreErrorKind::VersionIncompatible
+              );
+              assert_eq!(
+                  decode_personal_worker_store_document(b"not-json")
+                      .expect_err("malformed state")
+                      .kind(),
+                  PersonalWorkerStoreErrorKind::CorruptState
+              );
+          }
+
+          #[test]
+          fn initialize_if_clean_creates_once_and_replays_without_byte_changes() {
+              let root = TempRoot::new("create-replay");
+              let initial = initial_document(2_000_000);
+              let created = UnixPersonalWorkerStore::initialize_if_clean(root.path(), &initial)
+                  .expect("create initial state");
+              assert_eq!(
+                  created.disposition(),
+                  PersonalWorkerStoreInitializationDisposition::Created
+              );
+              assert_eq!(created.revision(), Some(initial.revision()));
+              assert!(created.bytes_written() > 0);
+
+              let current = root.store_directory().join("current.json");
+              let before = fs::read(&current).expect("read current bytes");
+              let replay = UnixPersonalWorkerStore::initialize_if_clean(root.path(), &initial)
+                  .expect("replay initialisation");
+              assert_eq!(
+                  replay.disposition(),
+                  PersonalWorkerStoreInitializationDisposition::AlreadyExists
+              );
+              assert_eq!(replay.revision(), Some(initial.revision()));
+              assert_eq!(replay.bytes_written(), 0);
+              assert_eq!(fs::read(&current).expect("read replay bytes"), before);
+
+              let reopened = UnixPersonalWorkerStore::open_existing_read_only(root.path())
+                  .expect("open initialised store");
+              assert_eq!(reopened.load().expect("load state"), Some(initial));
+          }
+
+          #[test]
+          fn initialize_if_clean_refuses_every_valid_recovery_shape_without_mutation() {
+              let initial_only = TempRoot::new("staged-initial");
+              let initial = initial_document(3_000_000);
+              UnixPersonalWorkerStore::initialize_if_clean(initial_only.path(), &initial)
+                  .expect("create initial state");
+              let initial_current = initial_only.store_directory().join("current.json");
+              let initial_stage = initial_only.store_directory().join(".next.json");
+              fs::rename(&initial_current, &initial_stage).expect("stage initial document");
+              let initial_stage_bytes = fs::read(&initial_stage).expect("read initial stage");
+              let receipt =
+                  UnixPersonalWorkerStore::initialize_if_clean(initial_only.path(), &initial)
+                      .expect("inspect staged initial");
+              assert_eq!(
+                  receipt.disposition(),
+                  PersonalWorkerStoreInitializationDisposition::RecoveryRequired
+              );
+              assert_eq!(receipt.revision(), Some(initial.revision()));
+              assert!(!initial_current.exists());
+              assert_eq!(
+                  fs::read(&initial_stage).expect("re-read initial stage"),
+                  initial_stage_bytes
+              );
+
+              let successor_root = TempRoot::new("staged-successor");
+              let current = initial_document(4_000_000);
+              UnixPersonalWorkerStore::initialize_if_clean(successor_root.path(), &current)
+                  .expect("create current state");
+              let successor = current
+                  .advance(queue(2, 4_000_001), vec![])
+                  .expect("successor document");
+              let current_path = successor_root.store_directory().join("current.json");
+              let stage_path = successor_root.store_directory().join(".next.json");
+              let current_bytes = fs::read(&current_path).expect("read current bytes");
+              let successor_bytes =
+                  encode_personal_worker_store_document(&successor).expect("encode successor");
+              write_private(&stage_path, &successor_bytes);
+              let receipt =
+                  UnixPersonalWorkerStore::initialize_if_clean(successor_root.path(), &current)
+                      .expect("inspect staged successor");
+              assert_eq!(
+                  receipt.disposition(),
+                  PersonalWorkerStoreInitializationDisposition::RecoveryRequired
+              );
+              assert_eq!(receipt.revision(), Some(successor.revision()));
+              assert_eq!(fs::read(&current_path).expect("re-read current"), current_bytes);
+              assert_eq!(fs::read(&stage_path).expect("re-read successor"), successor_bytes);
+
+              let stale_root = TempRoot::new("stale-stage");
+              let stale = initial_document(5_000_000);
+              UnixPersonalWorkerStore::initialize_if_clean(stale_root.path(), &stale)
+                  .expect("create stale current");
+              let stale_current = stale_root.store_directory().join("current.json");
+              let stale_stage = stale_root.store_directory().join(".next.json");
+              let stale_bytes = fs::read(&stale_current).expect("read stale current");
+              write_private(&stale_stage, &stale_bytes);
+              let receipt = UnixPersonalWorkerStore::initialize_if_clean(stale_root.path(), &stale)
+                  .expect("inspect stale stage");
+              assert_eq!(
+                  receipt.disposition(),
+                  PersonalWorkerStoreInitializationDisposition::RecoveryRequired
+              );
+              assert_eq!(receipt.revision(), Some(stale.revision()));
+              assert_eq!(fs::read(&stale_current).expect("re-read stale current"), stale_bytes);
+              assert_eq!(fs::read(&stale_stage).expect("re-read stale stage"), stale_bytes);
+          }
+
+          #[test]
+          fn initialize_if_clean_preserves_corrupt_stage_and_reports_busy_without_blocking() {
+              let root = TempRoot::new("corrupt-stage");
+              let initial = initial_document(6_000_000);
+              UnixPersonalWorkerStore::initialize_if_clean(root.path(), &initial)
+                  .expect("create current state");
+              let current_path = root.store_directory().join("current.json");
+              let stage_path = root.store_directory().join(".next.json");
+              let current_bytes = fs::read(&current_path).expect("read current bytes");
+              write_private(&stage_path, b"not-json");
+              let stage_bytes = fs::read(&stage_path).expect("read corrupt stage");
+              let error = UnixPersonalWorkerStore::initialize_if_clean(root.path(), &initial)
+                  .expect_err("corrupt stage must fail closed");
+              assert_eq!(error.kind(), PersonalWorkerStoreErrorKind::CorruptState);
+              assert_eq!(fs::read(&current_path).expect("re-read current"), current_bytes);
+              assert_eq!(fs::read(&stage_path).expect("re-read corrupt stage"), stage_bytes);
+
+              fs::remove_file(&stage_path).expect("remove test stage");
+              let lock = OpenOptions::new()
+                  .read(true)
+                  .write(true)
+                  .open(root.store_directory().join("store.lock"))
+                  .expect("open lock file");
+              flock(&lock, FlockOperation::NonBlockingLockExclusive).expect("hold writer lock");
+              let error = UnixPersonalWorkerStore::initialize_if_clean(root.path(), &initial)
+                  .expect_err("busy store must return immediately");
+              assert_eq!(error.kind(), PersonalWorkerStoreErrorKind::Busy);
+              assert_eq!(fs::read(&current_path).expect("read busy current"), current_bytes);
+          }
+          '''.replace("          ", ""), encoding="utf-8")
+          PY
+
+      - name: Format and validate focused contracts
+        run: |
+          cargo fmt --all
+          git diff --check
+          cargo test --locked --test personal_worker_initialization_contract
+          cargo test --locked --test personal_worker_store_contract
+          cargo test --locked --test personal_worker_store_transaction
+
+      - name: Commit and push canonical branch
+        run: |
+          git config user.name "smolrunner-o02-patch"
+          git config user.email "actions@users.noreply.github.com"
+          git add \
+            src/personal_worker_store.rs \
+            src/unix_personal_worker_store.rs \
+            src/personal_worker_read_command.rs \
+            src/personal_worker_submit_command.rs \
+            src/personal_worker_cancel_command.rs \
+            src/personal_worker_store_transaction.rs \
+            tests/personal_worker_initialization_contract.rs
+          git commit -m "Preserve worker store recovery evidence"
+          git push origin HEAD:fix/o02-store-recovery-evidence
