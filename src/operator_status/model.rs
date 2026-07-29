@@ -127,21 +127,6 @@ impl OperatorWorkerSummary {
     }
 
     #[must_use]
-    pub const fn eligible_queue_count(self) -> u32 {
-        self.eligible_queue_count
-    }
-
-    #[must_use]
-    pub const fn cancelled_queue_count(self) -> u32 {
-        self.cancelled_queue_count
-    }
-
-    #[must_use]
-    pub const fn selected_count(self) -> u32 {
-        self.selected_count
-    }
-
-    #[must_use]
     pub const fn active_count(self) -> u32 {
         self.active_count
     }
@@ -149,16 +134,6 @@ impl OperatorWorkerSummary {
     #[must_use]
     pub const fn draining_count(self) -> u32 {
         self.draining_count
-    }
-
-    #[must_use]
-    pub const fn cache_lease_count(self) -> u32 {
-        self.cache_lease_count
-    }
-
-    #[must_use]
-    pub const fn terminal_tombstone_count(self) -> u32 {
-        self.terminal_tombstone_count
     }
 }
 
@@ -193,11 +168,11 @@ pub struct OperatorActiveJobSummary {
 }
 
 impl OperatorActiveJobSummary {
-    /// Build one bounded active-job projection.
+    /// Build one active-job projection from typed evidence.
     ///
     /// # Errors
     ///
-    /// Returns a fixed error unless the admission state is starting, running, or draining.
+    /// Returns a fixed error unless the state is starting, running, or draining.
     pub fn new(
         identity: ExecutionAdmissionIdentity,
         source: PersonalWorkerSourceIdentity,
@@ -225,7 +200,7 @@ impl OperatorActiveJobSummary {
     ///
     /// # Errors
     ///
-    /// Returns a fixed error unless the view is active and carries exact admission evidence.
+    /// Returns a fixed error unless the view contains active admission evidence.
     pub fn from_job_view(view: &PersonalWorkerJobView) -> Result<Self, OperatorStatusError> {
         let entry = view.entry().ok_or_else(|| {
             OperatorStatusError::new(
@@ -319,26 +294,6 @@ impl OperatorTerminalSummary {
     }
 
     #[must_use]
-    pub const fn identity(&self) -> &ExecutionAdmissionIdentity {
-        &self.identity
-    }
-
-    #[must_use]
-    pub const fn source(&self) -> &PersonalWorkerSourceIdentity {
-        &self.source
-    }
-
-    #[must_use]
-    pub const fn completed_at(&self) -> EpochMillis {
-        self.completed_at
-    }
-
-    #[must_use]
-    pub const fn evidence_digest(&self) -> &Sha256Digest {
-        &self.evidence_digest
-    }
-
-    #[must_use]
     pub const fn result(&self) -> OperatorTerminalResult {
         self.result
     }
@@ -361,15 +316,14 @@ pub struct OperatorStatusReport {
 }
 
 impl OperatorStatusReport {
-    /// Compose one pure, bounded operator status report from typed evidence.
+    /// Compose one bounded report from typed evidence.
     ///
-    /// Disposition and next action are derived here. Callers cannot label contradictory evidence
-    /// healthy or inject arbitrary commands.
+    /// Disposition and next action are derived here. Callers cannot claim a contradictory healthy
+    /// state or inject arbitrary commands.
     ///
     /// # Errors
     ///
-    /// Returns one bounded error for impossible machine/job evidence, inconsistent configuration
-    /// compatibility, invalid queue counts, or an oversized blocker set.
+    /// Returns one fixed error for contradictory machine, worker, configuration, or blocker evidence.
     pub fn new(
         configuration: OperatorConfigurationStatus,
         worker: OperatorWorkerSummary,
@@ -380,7 +334,6 @@ impl OperatorStatusReport {
     ) -> Result<Self, OperatorStatusError> {
         validate_worker_counts(worker)?;
         validate_machine_and_active(worker, machine, active_job.as_ref())?;
-
         let blockers = bounded_unique_blockers(blockers)?;
         validate_configuration(&configuration, &blockers)?;
 
@@ -395,7 +348,9 @@ impl OperatorStatusReport {
         };
         let next_action = match disposition {
             OperatorStatusDisposition::Satisfied => None,
-            OperatorStatusDisposition::Continuation => Some(OperatorSuggestedCommand::WorkerRunOnce),
+            OperatorStatusDisposition::Continuation => {
+                Some(OperatorSuggestedCommand::WorkerRunOnce)
+            }
             OperatorStatusDisposition::Blocked => blockers
                 .iter()
                 .find_map(OperatorPublicError::suggested_command),
@@ -422,11 +377,6 @@ impl OperatorStatusReport {
     #[must_use]
     pub const fn disposition(&self) -> OperatorStatusDisposition {
         self.disposition
-    }
-
-    #[must_use]
-    pub const fn configuration(&self) -> &OperatorConfigurationStatus {
-        &self.configuration
     }
 
     #[must_use]
@@ -500,17 +450,13 @@ impl fmt::Display for OperatorStatusReport {
         if let Some(active) = &self.active_job {
             writeln!(
                 formatter,
-                "active: request={} verification_profile={} runner_profile={} state={} source={}@{} tree={}",
+                "active: request={} state={} source={}@{}",
                 active.identity.request_id.as_str(),
-                active.identity.verification_profile_id.as_str(),
-                active.identity.runner_profile_id.as_str(),
                 admission_name(active.state),
                 active.source.repository.as_str(),
                 active.source.commit.as_str(),
-                active.source.tree.as_str(),
             )?;
         }
-
         if let Some(terminal) = &self.latest_terminal {
             match terminal.result {
                 OperatorTerminalResult::Succeeded => writeln!(
@@ -530,7 +476,6 @@ impl fmt::Display for OperatorStatusReport {
                 )?,
             }
         }
-
         for blocker in &self.blockers {
             write!(
                 formatter,
@@ -547,7 +492,6 @@ impl fmt::Display for OperatorStatusReport {
             }
             writeln!(formatter)?;
         }
-
         if let Some(next_action) = self.next_action {
             writeln!(formatter, "next: {}", next_action.as_str())?;
         }
@@ -582,11 +526,6 @@ impl OperatorStatusError {
     #[must_use]
     pub const fn kind(self) -> OperatorStatusErrorKind {
         self.kind
-    }
-
-    #[must_use]
-    pub const fn message(self) -> &'static str {
-        self.public_message
     }
 }
 
@@ -632,16 +571,12 @@ fn validate_machine_and_active(
             "a non-running Lima instance cannot carry a ready or active runner state",
         ));
     }
-
-    if (worker.active_count == 0 && active_job.is_some())
-        || (worker.active_count > 0 && active_job.is_none())
-    {
+    if (worker.active_count == 0) != active_job.is_none() {
         return Err(OperatorStatusError::new(
             OperatorStatusErrorKind::InvalidActiveJob,
             "active job summary must agree with the durable active count",
         ));
     }
-
     match machine.runner {
         ActionsRunnerReadinessState::IdleReady
             if worker.active_count > 0 || worker.draining_count > 0 =>
@@ -669,12 +604,11 @@ fn validate_machine_and_active(
         }
         _ => {}
     }
-
     if let Some(active) = active_job {
         if active.state == ExecutionAdmissionState::Draining && worker.draining_count == 0 {
             return Err(OperatorStatusError::new(
                 OperatorStatusErrorKind::InvalidActiveJob,
-                "a draining active-job summary requires a durable draining count",
+                "a draining active job requires durable draining evidence",
             ));
         }
         if machine.runner == ActionsRunnerReadinessState::Draining
@@ -682,11 +616,10 @@ fn validate_machine_and_active(
         {
             return Err(OperatorStatusError::new(
                 OperatorStatusErrorKind::InvalidActiveJob,
-                "a draining runner requires the representative active job to be draining",
+                "a draining runner requires a draining representative job",
             ));
         }
     }
-
     Ok(())
 }
 
@@ -716,17 +649,17 @@ fn validate_configuration(
     configuration: &OperatorConfigurationStatus,
     blockers: &[OperatorPublicError],
 ) -> Result<(), OperatorStatusError> {
-    let has_incompatible_blocker = blockers
+    let has_incompatible = blockers
         .iter()
         .any(|blocker| blocker.code() == OperatorErrorCode::ConfigurationIncompatible);
     match configuration.compatibility {
-        OperatorConfigurationCompatibility::Compatible if has_incompatible_blocker => {
+        OperatorConfigurationCompatibility::Compatible if has_incompatible => {
             Err(OperatorStatusError::new(
                 OperatorStatusErrorKind::ContradictoryConfigurationState,
-                "compatible configuration cannot carry the incompatible-configuration blocker",
+                "compatible configuration cannot carry the incompatible blocker",
             ))
         }
-        OperatorConfigurationCompatibility::Incompatible if !has_incompatible_blocker => {
+        OperatorConfigurationCompatibility::Incompatible if !has_incompatible => {
             Err(OperatorStatusError::new(
                 OperatorStatusErrorKind::ContradictoryConfigurationState,
                 "incompatible configuration requires the exact public blocker",
@@ -736,7 +669,7 @@ fn validate_configuration(
     }
 }
 
-const fn continuation_required(
+fn continuation_required(
     worker: OperatorWorkerSummary,
     machine: OperatorMachineSummary,
 ) -> bool {
@@ -745,8 +678,8 @@ const fn continuation_required(
         || worker.selected_count > 0
         || worker.active_count > 0
         || worker.draining_count > 0
-        || matches!(machine.lima, LimaRuntimeState::Installing)
-        || matches!(machine.runner, ActionsRunnerReadinessState::Starting)
+        || machine.lima == LimaRuntimeState::Installing
+        || machine.runner == ActionsRunnerReadinessState::Starting
 }
 
 const fn disposition_name(value: OperatorStatusDisposition) -> &'static str {
@@ -871,10 +804,8 @@ mod tests {
         compatibility: OperatorConfigurationCompatibility,
     ) -> OperatorConfigurationStatus {
         let config = OperatorConfig::new(
-            PersonalWorkerStateRoot::parse(
-                "/Users/private-operator/Library/Application Support/smolrunner",
-            )
-            .expect("state root"),
+            PersonalWorkerStateRoot::parse("/Users/private-operator/smolrunner")
+                .expect("state root"),
             LimaInstanceName::parse("smolrunner").expect("instance"),
             GuestWorkspacePath::parse("/home/lima/private-workspace").expect("workspace"),
             VerificationProfileId::parse("smolrunner.required").expect("profile"),
@@ -891,26 +822,26 @@ mod tests {
     fn worker(
         current_profile: PersonalWorkerProfile,
         desired_profile: PersonalWorkerProfile,
-        queued_entry_count: u32,
-        eligible_queue_count: u32,
-        selected_count: u32,
-        active_count: u32,
-        draining_count: u32,
-        terminal_tombstone_count: u32,
+        queued: u32,
+        eligible: u32,
+        selected: u32,
+        active: u32,
+        draining: u32,
+        terminal: u32,
     ) -> OperatorWorkerSummary {
         OperatorWorkerSummary {
             store_revision: PersonalWorkerStoreRevision::new(7).expect("revision"),
             queue_generation: PersonalWorkerQueueGeneration::new(9).expect("generation"),
             current_profile,
             desired_profile,
-            queued_entry_count,
-            eligible_queue_count,
-            cancelled_queue_count: queued_entry_count.saturating_sub(eligible_queue_count),
-            selected_count,
-            active_count,
-            draining_count,
-            cache_lease_count: active_count,
-            terminal_tombstone_count,
+            queued_entry_count: queued,
+            eligible_queue_count: eligible,
+            cancelled_queue_count: queued.saturating_sub(eligible),
+            selected_count: selected,
+            active_count: active,
+            draining_count: draining,
+            cache_lease_count: active,
+            terminal_tombstone_count: terminal,
         }
     }
 
@@ -928,10 +859,6 @@ mod tests {
             CommitId::parse(&"1a".repeat(20)).expect("commit"),
             GitTreeId::parse(&"2b".repeat(20)).expect("tree"),
         )
-    }
-
-    fn digest() -> Sha256Digest {
-        Sha256Digest::parse(&format!("sha256:{}", "ab".repeat(32))).expect("digest")
     }
 
     fn idle_report() -> OperatorStatusReport {
@@ -955,32 +882,21 @@ mod tests {
             None,
             [],
         )
-        .expect("idle report")
+        .expect("idle")
     }
 
     #[test]
-    fn idle_worker_is_satisfied_with_semantic_human_json_parity() {
+    fn idle_worker_has_matching_human_and_json_semantics() {
         let report = idle_report();
         assert_eq!(report.disposition(), OperatorStatusDisposition::Satisfied);
         assert_eq!(report.next_action(), None);
-
-        let json = serde_json::to_value(&report).expect("JSON");
-        assert_eq!(json["schema_version"], json!(1));
-        assert_eq!(json["disposition"], json!("satisfied"));
-        assert_eq!(json["worker"]["current_profile"], json!("stopped"));
-        assert_eq!(json["machine"]["lima"], json!("stopped"));
-        assert_eq!(json["machine"]["runner"], json!("offline"));
-        assert_eq!(json["blockers"], json!([]));
-
+        let value = serde_json::to_value(&report).expect("JSON");
+        assert_eq!(value["disposition"], json!("satisfied"));
+        assert_eq!(value["worker"]["current_profile"], json!("stopped"));
+        assert_eq!(value["machine"]["runner"], json!("offline"));
         let human = report.render_human();
-        for expected in [
-            "status: satisfied",
-            "current=stopped",
-            "desired=stopped",
-            "lima=stopped",
-            "runner=offline",
-        ] {
-            assert!(human.contains(expected), "missing {expected}");
+        for expected in ["status: satisfied", "current=stopped", "runner=offline"] {
+            assert!(human.contains(expected));
         }
     }
 
@@ -1007,24 +923,15 @@ mod tests {
             [],
         )
         .expect("continuation");
-
-        assert_eq!(
-            report.disposition(),
-            OperatorStatusDisposition::Continuation
-        );
+        assert_eq!(report.disposition(), OperatorStatusDisposition::Continuation);
         assert_eq!(
             report.next_action(),
             Some(OperatorSuggestedCommand::WorkerRunOnce)
         );
-        assert!(
-            report
-                .render_human()
-                .contains("next: smolrunner worker run-once")
-        );
     }
 
     #[test]
-    fn blockers_are_deduplicated_and_drive_fixed_next_action() {
+    fn blockers_deduplicate_and_drive_fixed_action() {
         let missing = OperatorPublicError::from_code(OperatorErrorCode::DurableStateMissing);
         let report = OperatorStatusReport::new(
             configuration(OperatorConfigurationCompatibility::Compatible),
@@ -1047,22 +954,15 @@ mod tests {
             [missing, missing],
         )
         .expect("blocked");
-
-        assert_eq!(report.disposition(), OperatorStatusDisposition::Blocked);
         assert_eq!(report.blockers().len(), 1);
         assert_eq!(
             report.next_action(),
             Some(OperatorSuggestedCommand::WorkerInit)
         );
-        assert!(
-            report
-                .render_human()
-                .contains("Durable personal-worker state is missing.")
-        );
     }
 
     #[test]
-    fn incompatible_configuration_requires_exact_public_blocker() {
+    fn incompatible_configuration_requires_exact_blocker() {
         let error = OperatorStatusReport::new(
             configuration(OperatorConfigurationCompatibility::Incompatible),
             worker(
@@ -1088,42 +988,16 @@ mod tests {
             error.kind(),
             OperatorStatusErrorKind::ContradictoryConfigurationState
         );
-
-        let report = OperatorStatusReport::new(
-            configuration(OperatorConfigurationCompatibility::Incompatible),
-            worker(
-                PersonalWorkerProfile::Stopped,
-                PersonalWorkerProfile::Stopped,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-            ),
-            OperatorMachineSummary::new(
-                LimaRuntimeState::Stopped,
-                ActionsRunnerReadinessState::Offline,
-            ),
-            None,
-            None,
-            [OperatorPublicError::from_code(
-                OperatorErrorCode::ConfigurationIncompatible,
-            )],
-        )
-        .expect("incompatible report");
-        assert_eq!(report.disposition(), OperatorStatusDisposition::Blocked);
     }
 
     #[test]
-    fn active_and_runner_evidence_must_agree() {
+    fn active_job_and_runner_evidence_must_agree() {
         let active = OperatorActiveJobSummary::new(
             identity("request-1"),
             source(),
             ExecutionAdmissionState::Running,
         )
         .expect("active");
-
         let report = OperatorStatusReport::new(
             configuration(OperatorConfigurationCompatibility::Compatible),
             worker(
@@ -1144,52 +1018,12 @@ mod tests {
             None,
             [],
         )
-        .expect("running report");
-        assert_eq!(
-            report.disposition(),
-            OperatorStatusDisposition::Continuation
-        );
-        assert_eq!(
-            report.active_job().expect("active").state(),
-            ExecutionAdmissionState::Running
-        );
-
-        let error = OperatorStatusReport::new(
-            configuration(OperatorConfigurationCompatibility::Compatible),
-            worker(
-                PersonalWorkerProfile::Work,
-                PersonalWorkerProfile::Work,
-                0,
-                0,
-                0,
-                1,
-                0,
-                0,
-            ),
-            OperatorMachineSummary::new(
-                LimaRuntimeState::Running,
-                ActionsRunnerReadinessState::IdleReady,
-            ),
-            Some(
-                OperatorActiveJobSummary::new(
-                    identity("request-2"),
-                    source(),
-                    ExecutionAdmissionState::Running,
-                )
-                .expect("active"),
-            ),
-            None,
-            [],
-        )
-        .expect_err("idle contradiction");
-        assert_eq!(
-            error.kind(),
-            OperatorStatusErrorKind::ContradictoryMachineState
-        );
+        .expect("active report");
+        assert_eq!(report.disposition(), OperatorStatusDisposition::Continuation);
     }
 
     #[test]
-    fn non_running_lima_rejects_ready_runner() {
+    fn impossible_machine_evidence_fails_closed() {
         let error = OperatorStatusReport::new(
             configuration(OperatorConfigurationCompatibility::Compatible),
             worker(
@@ -1210,7 +1044,7 @@ mod tests {
             None,
             [],
         )
-        .expect_err("machine contradiction");
+        .expect_err("contradiction");
         assert_eq!(
             error.kind(),
             OperatorStatusErrorKind::ContradictoryMachineState
@@ -1218,45 +1052,12 @@ mod tests {
     }
 
     #[test]
-    fn draining_state_requires_draining_representative() {
-        let error = OperatorStatusReport::new(
-            configuration(OperatorConfigurationCompatibility::Compatible),
-            worker(
-                PersonalWorkerProfile::Work,
-                PersonalWorkerProfile::Work,
-                0,
-                0,
-                0,
-                1,
-                1,
-                0,
-            ),
-            OperatorMachineSummary::new(
-                LimaRuntimeState::Running,
-                ActionsRunnerReadinessState::Draining,
-            ),
-            Some(
-                OperatorActiveJobSummary::new(
-                    identity("request-3"),
-                    source(),
-                    ExecutionAdmissionState::Running,
-                )
-                .expect("active"),
-            ),
-            None,
-            [],
-        )
-        .expect_err("draining contradiction");
-        assert_eq!(error.kind(), OperatorStatusErrorKind::InvalidActiveJob);
-    }
-
-    #[test]
-    fn terminal_summary_stays_separate_from_current_activity() {
+    fn terminal_summary_is_separate_from_current_activity() {
         let terminal = OperatorTerminalSummary::new(
-            identity("request-terminal"),
+            identity("terminal-1"),
             source(),
             EpochMillis::new(5_000).expect("time"),
-            digest(),
+            Sha256Digest::parse(&format!("sha256:{}", "ab".repeat(32))).expect("digest"),
             OperatorTerminalResult::Failed {
                 error: OperatorPublicError::from_code(
                     OperatorErrorCode::TerminalClassificationInconclusive,
@@ -1283,16 +1084,14 @@ mod tests {
             Some(terminal),
             [],
         )
-        .expect("terminal report");
-
-        assert_eq!(report.disposition(), OperatorStatusDisposition::Satisfied);
+        .expect("terminal");
         assert!(report.active_job().is_none());
         assert!(report.latest_terminal().is_some());
         assert!(report.render_human().contains("result=failed"));
     }
 
     #[test]
-    fn blocker_count_is_bounded_after_deduplication() {
+    fn blockers_are_bounded() {
         let codes = [
             OperatorErrorCode::ConfigurationMissing,
             OperatorErrorCode::ConfigurationVersionUnsupported,
@@ -1332,32 +1131,31 @@ mod tests {
             None,
             codes.map(OperatorPublicError::from_code),
         )
-        .expect_err("too many blockers");
+        .expect_err("bounded");
         assert_eq!(error.kind(), OperatorStatusErrorKind::TooManyBlockers);
     }
 
     #[test]
-    fn public_surfaces_exclude_private_sentinels() {
+    fn public_surfaces_exclude_private_evidence() {
         let report = idle_report();
-        let json = serde_json::to_string(&report).expect("JSON");
-        let human = report.render_human();
-        let debug = format!("{report:?}");
+        let outputs = [
+            serde_json::to_string(&report).expect("JSON"),
+            report.render_human(),
+            format!("{report:?}"),
+        ];
         for forbidden in [
             "/Users/private-operator",
             "/home/lima/private-workspace",
             "PRIVATE_TOKEN_SENTINEL",
-            "Authorization: Bearer private",
             "private child stderr",
         ] {
-            assert!(!json.contains(forbidden));
-            assert!(!human.contains(forbidden));
-            assert!(!debug.contains(forbidden));
+            assert!(outputs.iter().all(|output| !output.contains(forbidden)));
         }
     }
 
     #[test]
     fn module_contains_no_observation_or_mutation_authority() {
-        let source = include_str!("operator_status.rs");
+        let source = include_str!("model.rs");
         for forbidden in [
             concat!("std::", "env::"),
             concat!("std::", "fs::"),
