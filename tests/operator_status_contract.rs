@@ -34,9 +34,11 @@ mod verification_profile {
     pub use smolrunner::verification_profile::*;
 }
 
+#[allow(dead_code)]
 #[path = "../src/operator_config.rs"]
 mod operator_config;
 
+#[allow(dead_code)]
 #[path = "../src/operator_error.rs"]
 mod operator_error;
 
