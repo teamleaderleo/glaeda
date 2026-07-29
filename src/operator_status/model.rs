@@ -353,7 +353,8 @@ impl OperatorStatusReport {
             }
             OperatorStatusDisposition::Blocked => blockers
                 .iter()
-                .find_map(OperatorPublicError::suggested_command),
+                .filter_map(OperatorPublicError::suggested_command)
+                .min_by_key(command_priority),
         };
 
         Ok(Self {
@@ -642,7 +643,33 @@ fn bounded_unique_blockers(
         }
         unique.push(blocker);
     }
+    unique.sort_by_key(|blocker| {
+        (
+            remediation_priority(blocker.remediation()),
+            blocker.code() as u16,
+        )
+    });
     Ok(unique)
+}
+
+const fn remediation_priority(value: OperatorRemediationClass) -> u8 {
+    match value {
+        OperatorRemediationClass::ApprovalRequired => 0,
+        OperatorRemediationClass::Repair => 1,
+        OperatorRemediationClass::Dependency => 2,
+        OperatorRemediationClass::Refresh => 3,
+        OperatorRemediationClass::Retry => 4,
+        OperatorRemediationClass::Terminal => 5,
+    }
+}
+
+const fn command_priority(value: &OperatorSuggestedCommand) -> u8 {
+    match value {
+        OperatorSuggestedCommand::WorkerInit => 0,
+        OperatorSuggestedCommand::Status => 1,
+        OperatorSuggestedCommand::WorkerRunOnce => 2,
+        OperatorSuggestedCommand::QueueList => 3,
+    }
 }
 
 fn validate_configuration(
@@ -959,6 +986,54 @@ mod tests {
             report.next_action(),
             Some(OperatorSuggestedCommand::WorkerInit)
         );
+    }
+
+    #[test]
+    fn blocker_permutations_have_identical_output_and_action() {
+        let queue = OperatorPublicError::from_code(OperatorErrorCode::QueueCapacityReached);
+        let missing = OperatorPublicError::from_code(OperatorErrorCode::DurableStateMissing);
+        let approval = OperatorPublicError::from_code(
+            OperatorErrorCode::OperatorServiceApprovalRequired,
+        );
+        let build = |blockers: [OperatorPublicError; 3]| {
+            OperatorStatusReport::new(
+                configuration(OperatorConfigurationCompatibility::Compatible),
+                worker(
+                    PersonalWorkerProfile::Stopped,
+                    PersonalWorkerProfile::Stopped,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                ),
+                OperatorMachineSummary::new(
+                    LimaRuntimeState::Stopped,
+                    ActionsRunnerReadinessState::Offline,
+                ),
+                None,
+                None,
+                blockers,
+            )
+            .expect("blocked report")
+        };
+        let reports = [
+            build([queue, missing, approval]),
+            build([approval, queue, missing]),
+            build([missing, approval, queue]),
+        ];
+        let expected_json = serde_json::to_string(&reports[0]).expect("JSON");
+        let expected_human = reports[0].render_human();
+        for report in &reports {
+            assert_eq!(report.disposition(), OperatorStatusDisposition::Blocked);
+            assert_eq!(
+                report.next_action(),
+                Some(OperatorSuggestedCommand::WorkerInit)
+            );
+            assert_eq!(serde_json::to_string(report).expect("JSON"), expected_json);
+            assert_eq!(report.render_human(), expected_human);
+        }
     }
 
     #[test]
