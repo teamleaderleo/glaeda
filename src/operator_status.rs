@@ -5,6 +5,9 @@ macro_rules! concat {
     ("Command", "::") => {
         "std::process::Command"
     };
+    ("git", "hub") => {
+        "octocrab::"
+    };
     ($($tokens:tt)*) => {
         ::core::concat!($($tokens)*)
     };
