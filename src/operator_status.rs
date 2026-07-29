@@ -1,3 +1,5 @@
+//! Pure unified personal-worker operator status model.
+
 #[cfg(test)]
 macro_rules! concat {
     ("Command", "::") => {
