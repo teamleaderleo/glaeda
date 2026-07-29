@@ -1,0 +1,53 @@
+name: W01 export formatting
+
+on:
+  push:
+    branches:
+      - integrate/w01-operator-exports
+
+permissions:
+  contents: write
+
+jobs:
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: integrate/w01-operator-exports
+      - name: Apply exact rustfmt ordering
+        shell: python
+        run: |
+          from pathlib import Path
+
+          path = Path("src/lib.rs")
+          source = path.read_text()
+          old = '''pub mod manifest;
+pub mod ownership;
+/// Pure schema-versioned personal-worker operator configuration and public identity.
+pub mod operator_config;
+/// Closed public operator error, retry, remediation, dependency, approval, and command vocabulary.
+pub mod operator_error;
+/// Pure unified personal-worker operator status report and human renderer.
+pub mod operator_status;
+'''
+          new = '''pub mod manifest;
+/// Pure schema-versioned personal-worker operator configuration and public identity.
+pub mod operator_config;
+/// Closed public operator error, retry, remediation, dependency, approval, and command vocabulary.
+pub mod operator_error;
+/// Pure unified personal-worker operator status report and human renderer.
+pub mod operator_status;
+pub mod ownership;
+'''
+          if old not in source:
+              raise SystemExit("expected module block not found")
+          path.write_text(source.replace(old, new, 1))
+          Path(".github/workflows/w01-export-format.yml").unlink()
+      - name: Commit exact formatting
+        run: |
+          git config user.name "smolrunner-automation"
+          git config user.email "actions@users.noreply.github.com"
+          git add src/lib.rs .github/workflows/w01-export-format.yml
+          git commit -m "Format W01 operator exports"
+          git push origin HEAD:integrate/w01-operator-exports
