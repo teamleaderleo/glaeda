@@ -756,7 +756,8 @@ fn map_store_error(error: PersonalWorkerStoreError) -> PersonalWorkerStoreMutati
             PersonalWorkerStoreMutationErrorKind::UnsafeFilesystem,
             "durable personal worker state contains an unsafe filesystem object",
         ),
-        PersonalWorkerStoreErrorKind::CorruptState => PersonalWorkerStoreMutationError::new(
+        PersonalWorkerStoreErrorKind::VersionIncompatible
+        | PersonalWorkerStoreErrorKind::CorruptState => PersonalWorkerStoreMutationError::new(
             PersonalWorkerStoreMutationErrorKind::CorruptState,
             "durable personal worker state is corrupt or noncanonical",
         ),

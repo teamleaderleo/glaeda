@@ -372,7 +372,8 @@ fn map_store_error(error: PersonalWorkerStoreError) -> PersonalWorkerReadCommand
             PersonalWorkerReadCommandErrorKind::UnsafeStore,
             "durable personal worker state filesystem is unsafe",
         ),
-        PersonalWorkerStoreErrorKind::CorruptState
+        PersonalWorkerStoreErrorKind::VersionIncompatible
+        | PersonalWorkerStoreErrorKind::CorruptState
         | PersonalWorkerStoreErrorKind::InvalidDocument => command_error(
             PersonalWorkerReadCommandErrorKind::CorruptStore,
             "durable personal worker state is corrupt or noncanonical",

@@ -8,10 +8,12 @@ use rustix::io::Errno;
 
 use crate::personal_worker_store::{
     MAX_PERSONAL_WORKER_STORE_BYTES, PersonalWorkerStore, PersonalWorkerStoreDocument,
-    PersonalWorkerStoreError, PersonalWorkerStoreErrorKind, PersonalWorkerStoreRecovery,
-    PersonalWorkerStoreRecoveryDisposition, PersonalWorkerStoreRevision,
-    PersonalWorkerStoreWriteDisposition, PersonalWorkerStoreWriteReceipt,
-    decode_personal_worker_store_document, encode_personal_worker_store_document,
+    PersonalWorkerStoreError, PersonalWorkerStoreErrorKind,
+    PersonalWorkerStoreInitializationDisposition, PersonalWorkerStoreInitializationReceipt,
+    PersonalWorkerStoreRecovery, PersonalWorkerStoreRecoveryDisposition,
+    PersonalWorkerStoreRevision, PersonalWorkerStoreWriteDisposition,
+    PersonalWorkerStoreWriteReceipt, decode_personal_worker_store_document,
+    encode_personal_worker_store_document,
 };
 
 const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
@@ -88,6 +90,62 @@ impl UnixPersonalWorkerStore {
         })
     }
 
+    /// Create the exact initial document only when no current or staged state exists.
+    ///
+    /// The writer lock is acquired before inspecting durable state. Any valid staged
+    /// recovery state is reported without publication or cleanup, and an existing current
+    /// document is returned as an idempotent result without changing its bytes.
+    pub fn initialize_if_clean(
+        root_path: impl AsRef<Path>,
+        document: &PersonalWorkerStoreDocument,
+    ) -> Result<PersonalWorkerStoreInitializationReceipt, PersonalWorkerStoreError> {
+        if document.revision().get() != 1 || !document.history().is_empty() {
+            return Err(store_error(
+                PersonalWorkerStoreErrorKind::RevisionConflict,
+                "initial personal worker state must use revision one without history",
+            ));
+        }
+        let root = fs::open(root_path.as_ref(), DIRECTORY_FLAGS, Mode::empty())
+            .map_err(map_root_open_error)?;
+        let root_stat = inspect_directory(&root, "personal worker state root", None)?;
+        let owner = (root_stat.st_uid, root_stat.st_gid);
+        let directory = ensure_store_directory(&root, owner)?;
+        ensure_lock_file(&directory, owner)?;
+        let store = Self {
+            _root: root,
+            directory,
+            owner,
+        };
+        let _lock = store.acquire_mutation_lock()?;
+        match store.recovery_plan()? {
+            StoreRecoveryPlan::Clean {
+                revision: Some(revision),
+            } => Ok(PersonalWorkerStoreInitializationReceipt::new(
+                PersonalWorkerStoreInitializationDisposition::AlreadyExists,
+                Some(revision),
+                0,
+            )),
+            StoreRecoveryPlan::Clean { revision: None } => {
+                let bytes_written = encode_personal_worker_store_document(document)?.len();
+                let mut staged = store.stage_document(document)?;
+                store.publish_staged(&mut staged, true)?;
+                Ok(PersonalWorkerStoreInitializationReceipt::new(
+                    PersonalWorkerStoreInitializationDisposition::Created,
+                    Some(document.revision()),
+                    bytes_written,
+                ))
+            }
+            StoreRecoveryPlan::PublishStaged { revision, .. }
+            | StoreRecoveryPlan::RemoveStaleStaged { revision } => {
+                Ok(PersonalWorkerStoreInitializationReceipt::new(
+                    PersonalWorkerStoreInitializationDisposition::RecoveryRequired,
+                    Some(revision),
+                    0,
+                ))
+            }
+        }
+    }
+
     fn acquire_mutation_lock(&self) -> Result<StoreMutationLock, PersonalWorkerStoreError> {
         let lock = fs::openat(
             &self.directory,
@@ -138,9 +196,7 @@ impl UnixPersonalWorkerStore {
         if bytes.len() > MAX_PERSONAL_WORKER_STORE_BYTES {
             return Err(PersonalWorkerStoreError::corrupt_state());
         }
-        decode_personal_worker_store_document(&bytes)
-            .map(Some)
-            .map_err(|_| PersonalWorkerStoreError::corrupt_state())
+        decode_personal_worker_store_document(&bytes).map(Some)
     }
 
     fn stage_document(
@@ -229,13 +285,13 @@ impl UnixPersonalWorkerStore {
         }
     }
 
-    fn recover_locked(&mut self) -> Result<PersonalWorkerStoreRecovery, PersonalWorkerStoreError> {
+    fn recovery_plan(&self) -> Result<StoreRecoveryPlan, PersonalWorkerStoreError> {
         let Some(staged) = self.load_named(STAGED_DOCUMENT)? else {
-            return Ok(PersonalWorkerStoreRecovery::new(
-                PersonalWorkerStoreRecoveryDisposition::Clean,
-                self.load_named(CURRENT_DOCUMENT)?
+            return Ok(StoreRecoveryPlan::Clean {
+                revision: self
+                    .load_named(CURRENT_DOCUMENT)?
                     .map(|document| document.revision()),
-            ));
+            });
         };
         let current = self.load_named(CURRENT_DOCUMENT)?;
         match current {
@@ -243,29 +299,50 @@ impl UnixPersonalWorkerStore {
                 if staged.revision().get() != 1 || !staged.history().is_empty() {
                     return Err(PersonalWorkerStoreError::corrupt_state());
                 }
-                let mut staged_guard = StagedDocument::existing(self.directory.as_fd());
-                self.publish_staged(&mut staged_guard, true)?;
-                Ok(PersonalWorkerStoreRecovery::new(
-                    PersonalWorkerStoreRecoveryDisposition::PublishedStaged,
-                    Some(staged.revision()),
-                ))
+                Ok(StoreRecoveryPlan::PublishStaged {
+                    revision: staged.revision(),
+                    no_replace: true,
+                })
             }
             Some(current) if staged.revision() <= current.revision() => {
-                self.remove_staged()?;
-                Ok(PersonalWorkerStoreRecovery::new(
-                    PersonalWorkerStoreRecoveryDisposition::RemovedStaleStaged,
-                    Some(current.revision()),
-                ))
+                Ok(StoreRecoveryPlan::RemoveStaleStaged {
+                    revision: current.revision(),
+                })
             }
             Some(current) => {
                 staged
                     .validate_successor_of(&current)
                     .map_err(|_| PersonalWorkerStoreError::corrupt_state())?;
+                Ok(StoreRecoveryPlan::PublishStaged {
+                    revision: staged.revision(),
+                    no_replace: false,
+                })
+            }
+        }
+    }
+
+    fn recover_locked(&mut self) -> Result<PersonalWorkerStoreRecovery, PersonalWorkerStoreError> {
+        match self.recovery_plan()? {
+            StoreRecoveryPlan::Clean { revision } => Ok(PersonalWorkerStoreRecovery::new(
+                PersonalWorkerStoreRecoveryDisposition::Clean,
+                revision,
+            )),
+            StoreRecoveryPlan::PublishStaged {
+                revision,
+                no_replace,
+            } => {
                 let mut staged_guard = StagedDocument::existing(self.directory.as_fd());
-                self.publish_staged(&mut staged_guard, false)?;
+                self.publish_staged(&mut staged_guard, no_replace)?;
                 Ok(PersonalWorkerStoreRecovery::new(
                     PersonalWorkerStoreRecoveryDisposition::PublishedStaged,
-                    Some(staged.revision()),
+                    Some(revision),
+                ))
+            }
+            StoreRecoveryPlan::RemoveStaleStaged { revision } => {
+                self.remove_staged()?;
+                Ok(PersonalWorkerStoreRecovery::new(
+                    PersonalWorkerStoreRecoveryDisposition::RemovedStaleStaged,
+                    Some(revision),
                 ))
             }
         }
@@ -339,6 +416,20 @@ impl PersonalWorkerStore for UnixPersonalWorkerStore {
         let _lock = self.acquire_mutation_lock()?;
         self.recover_locked()
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoreRecoveryPlan {
+    Clean {
+        revision: Option<PersonalWorkerStoreRevision>,
+    },
+    PublishStaged {
+        revision: PersonalWorkerStoreRevision,
+        no_replace: bool,
+    },
+    RemoveStaleStaged {
+        revision: PersonalWorkerStoreRevision,
+    },
 }
 
 #[derive(Debug)]
