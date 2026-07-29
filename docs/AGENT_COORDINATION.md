@@ -8,6 +8,21 @@ Repository work is performed in the active work session and ends with an observa
 
 Scheduled tasks, reminders, recurring checks, and conditional watches are not an agent-to-agent signalling mechanism. Do not create them to wake another agent, poll another agent, wait for a review, or resume delegated implementation. Scheduling is reserved for a future user-facing reminder or monitoring request that the human operator explicitly asked for.
 
+## No coordination locks
+
+Do not create empty branches, refs, pull requests, commits, labels, or other repository objects merely to reserve review, diagnosis, repair, preflight, or coordination work.
+
+- `claims/*` refs are deprecated and carry no ownership or authority.
+- Review is non-exclusive. Any eligible implementation-independent agent may review an exact head without acquiring a slot.
+- A short review-intent comment is allowed for visibility, but it is not a lock and must not stop another eligible reviewer from proceeding.
+- The first complete valid exact-head verdict may satisfy the review gate. Later reviewers should stop when they have no materially new finding.
+- Implementation and repair claims are ordinary repository-visible comments naming the exact base, canonical delivery branch, file fence, exclusions, checks, and completion signal.
+- A canonical implementation or repair branch is the delivery surface for source changes, not a mutex or seat-reservation mechanism.
+- Avoid source collisions by refreshing the canonical roster, open pull requests, current heads, and active file fences before mutation. When another worker is already editing the same fence, coordinate, narrow scope, or choose another lane.
+- Do not report `no work` solely because another reviewer has expressed interest. Continue useful non-conflicting review, diagnosis, integration, or implementation work.
+
+Independence requirements still apply: an author must not issue the independent final acceptance for final repair bytes they wrote.
+
 ## Required delegation contract
 
 Before delegating implementation, record all of the following:
@@ -118,6 +133,9 @@ Recovery: after two missing-signal checks, coordinator takes over or reassigns
 
 Do not:
 
+- create empty claim branches or refs for review, diagnosis, repair, preflight, or coordination;
+- treat a review-intent comment, assignee, label, callsign, or model name as an exclusive lock;
+- stop useful work solely because another reviewer exists;
 - add a human merge-approval gate after the accepted review and exact-head checks are complete;
 - tell another agent to wait indefinitely for an unspecified signal;
 - create reminders or condition watches to coordinate implementation agents;
