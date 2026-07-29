@@ -29,8 +29,7 @@ impl TempRoot {
             std::process::id()
         ));
         fs::create_dir(&path).expect("create temporary state root");
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o750))
-            .expect("set state root mode");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o750)).expect("set state root mode");
         Self(path)
     }
 
@@ -71,8 +70,7 @@ fn initial_document(observed_at: u64) -> PersonalWorkerStoreDocument {
 
 fn write_private(path: &Path, bytes: &[u8]) {
     fs::write(path, bytes).expect("write private fixture");
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-        .expect("set private fixture mode");
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("set private fixture mode");
 }
 
 #[test]
@@ -171,8 +169,14 @@ fn initialize_if_clean_refuses_every_valid_recovery_shape_without_mutation() {
         PersonalWorkerStoreInitializationDisposition::RecoveryRequired
     );
     assert_eq!(receipt.revision(), Some(successor.revision()));
-    assert_eq!(fs::read(&current_path).expect("re-read current"), current_bytes);
-    assert_eq!(fs::read(&stage_path).expect("re-read successor"), successor_bytes);
+    assert_eq!(
+        fs::read(&current_path).expect("re-read current"),
+        current_bytes
+    );
+    assert_eq!(
+        fs::read(&stage_path).expect("re-read successor"),
+        successor_bytes
+    );
 
     let stale_root = TempRoot::new("stale-stage");
     let stale = initial_document(5_000_000);
@@ -189,8 +193,14 @@ fn initialize_if_clean_refuses_every_valid_recovery_shape_without_mutation() {
         PersonalWorkerStoreInitializationDisposition::RecoveryRequired
     );
     assert_eq!(receipt.revision(), Some(stale.revision()));
-    assert_eq!(fs::read(&stale_current).expect("re-read stale current"), stale_bytes);
-    assert_eq!(fs::read(&stale_stage).expect("re-read stale stage"), stale_bytes);
+    assert_eq!(
+        fs::read(&stale_current).expect("re-read stale current"),
+        stale_bytes
+    );
+    assert_eq!(
+        fs::read(&stale_stage).expect("re-read stale stage"),
+        stale_bytes
+    );
 }
 
 #[test]
@@ -207,8 +217,14 @@ fn initialize_if_clean_preserves_corrupt_stage_and_reports_busy_without_blocking
     let error = UnixPersonalWorkerStore::initialize_if_clean(root.path(), &initial)
         .expect_err("corrupt stage must fail closed");
     assert_eq!(error.kind(), PersonalWorkerStoreErrorKind::CorruptState);
-    assert_eq!(fs::read(&current_path).expect("re-read current"), current_bytes);
-    assert_eq!(fs::read(&stage_path).expect("re-read corrupt stage"), stage_bytes);
+    assert_eq!(
+        fs::read(&current_path).expect("re-read current"),
+        current_bytes
+    );
+    assert_eq!(
+        fs::read(&stage_path).expect("re-read corrupt stage"),
+        stage_bytes
+    );
 
     fs::remove_file(&stage_path).expect("remove test stage");
     let lock = OpenOptions::new()
@@ -220,5 +236,8 @@ fn initialize_if_clean_preserves_corrupt_stage_and_reports_busy_without_blocking
     let error = UnixPersonalWorkerStore::initialize_if_clean(root.path(), &initial)
         .expect_err("busy store must return immediately");
     assert_eq!(error.kind(), PersonalWorkerStoreErrorKind::Busy);
-    assert_eq!(fs::read(&current_path).expect("read busy current"), current_bytes);
+    assert_eq!(
+        fs::read(&current_path).expect("read busy current"),
+        current_bytes
+    );
 }
