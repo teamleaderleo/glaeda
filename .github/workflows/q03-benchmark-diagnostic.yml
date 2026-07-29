@@ -25,7 +25,13 @@ jobs:
           show-progress: false
 
       - name: Validate benchmark runner syntax
-        run: python3 -m py_compile scripts/benchmark-personal-worker.py
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("scripts/benchmark-personal-worker.py")
+          compile(path.read_text(encoding="utf-8"), str(path), "exec")
+          PY
 
       - name: Record toolchain
         run: rustup show active-toolchain
@@ -40,6 +46,7 @@ jobs:
 
       - name: Validate public report
         run: |
+          cat /tmp/q03-report.json
           jq -e '
             .schema_version == 1 and
             .receipt_type == "smolrunner-personal-worker-benchmark-report" and
@@ -58,4 +65,3 @@ jobs:
             printf 'error: Q03 public report contains a private sentinel\n' >&2
             exit 1
           fi
-          cat /tmp/q03-report.json
