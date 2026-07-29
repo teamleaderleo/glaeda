@@ -1,0 +1,86 @@
+name: O02 store recovery patch v4
+
+on:
+  pull_request:
+    branches: [fix/o02-store-recovery-evidence]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: o02-store-recovery-patch-v4
+  cancel-in-progress: false
+
+jobs:
+  patch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out carrier definitions
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: automation/o02-store-recovery-patch
+          fetch-depth: 0
+          show-progress: false
+
+      - name: Correct generator and check out canonical branch
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          source = Path('.github/workflows/o02-store-recovery-patch-v3.yml')
+          lines = source.read_text(encoding='utf-8').splitlines(keepends=True)
+          matches = [
+              index
+              for index, line in enumerate(lines)
+              if 'lines.insert(index, f"{indent}PersonalWorkerStoreErrorKind::VersionIncompatible' in line
+          ]
+          if len(matches) != 1:
+              raise SystemExit(f'expected one compatibility generator line, found {len(matches)}')
+          index = matches[0]
+          lines[index] = lines[index].replace(
+              'PersonalWorkerStoreErrorKind::VersionIncompatible',
+              'PersonalWorkerStoreErrorKind::VersionIncompatible |',
+              1,
+          )
+          Path('/tmp/o02-v3-corrected.yml').write_text(''.join(lines), encoding='utf-8')
+          PY
+          git fetch origin fix/o02-store-recovery-evidence
+          git checkout -B fix/o02-store-recovery-evidence origin/fix/o02-store-recovery-evidence
+
+      - name: Execute corrected v3 carrier blocks
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import subprocess
+
+          lines = Path('/tmp/o02-v3-corrected.yml').read_text(encoding='utf-8').splitlines()
+          blocks = []
+          index = 0
+          while index < len(lines):
+              line = lines[index]
+              if line.strip() != 'run: |':
+                  index += 1
+                  continue
+              base_indent = len(line) - len(line.lstrip())
+              index += 1
+              block = []
+              while index < len(lines):
+                  current = lines[index]
+                  if current.strip():
+                      indent = len(current) - len(current.lstrip())
+                      if indent <= base_indent:
+                          break
+                      block.append(current[base_indent + 2:])
+                  else:
+                      block.append('')
+                  index += 1
+              blocks.append('\n'.join(block).rstrip() + '\n')
+          if len(blocks) != 3:
+              raise SystemExit(f'expected exactly three v3 run blocks, found {len(blocks)}')
+          for number, block in enumerate(blocks, start=1):
+              print(f'::group::corrected v3 block {number}')
+              subprocess.run(['bash', '-euo', 'pipefail', '-c', block], check=True)
+              print('::endgroup::')
+          PY
