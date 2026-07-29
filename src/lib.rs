@@ -85,6 +85,12 @@ pub mod mac_availability;
 pub mod macos_resource_observation;
 pub mod manifest;
 pub mod ownership;
+/// Pure schema-versioned personal-worker operator configuration and public identity.
+pub mod operator_config;
+/// Closed public operator error, retry, remediation, dependency, approval, and command vocabulary.
+pub mod operator_error;
+/// Pure unified personal-worker operator status report and human renderer.
+pub mod operator_status;
 /// Pure composition of durable queue, Lima lifecycle, and runner-readiness evidence.
 pub mod personal_worker_host_broker;
 pub mod personal_worker_queue;
