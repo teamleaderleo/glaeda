@@ -1,0 +1,95 @@
+name: unit-24-codex-abf61e5
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - .github/workflows/unit-24-codex-abf61e5.yml
+
+concurrency:
+  group: unit-24-codex-abf61e5
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  SOURCE_REPO: teamleaderleo/codex
+  SOURCE_HEAD: abf61e5fb8505181e071674ce224faff17e79d77
+  SOURCE_BASE: e4e0c7070e53cf9535fd0083d8fb840b6cd410cf
+  RUST_MIN_STACK: 16777216
+
+jobs:
+  exact-head:
+    name: exact current Responses Lite controls
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - name: Check out carrier
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - name: Check out exact Codex source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.SOURCE_HEAD }}
+          path: codex-source
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Verify immutable source fence
+        working-directory: codex-source
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_HEAD"
+          test "$(git rev-parse HEAD^)" = "$SOURCE_BASE"
+          actual="$(git diff --name-only "$SOURCE_BASE" "$SOURCE_HEAD" | sort)"
+          expected="$(printf '%s\n' \
+            codex-rs/core/src/client.rs \
+            codex-rs/core/tests/suite/agent_websocket.rs \
+            codex-rs/core/tests/suite/client_websockets.rs | sort)"
+          test "$actual" = "$expected"
+          echo 'FIELDWORK_LITE_SOURCE_FENCE=3/3'
+
+      - name: Set up Codex CI tools
+        uses: ./codex-source/.github/actions/setup-ci
+
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582
+        with:
+          toolchain: 1.95.0
+          components: rustfmt
+
+      - name: Check formatting
+        working-directory: codex-source/codex-rs
+        run: cargo fmt --all -- --check
+
+      - name: Run exact client controls
+        working-directory: codex-source/codex-rs
+        run: |
+          set -euo pipefail
+          cargo test -p codex-core --test all responses_lite_reuses_generated_response_after_full_first_turn -- --nocapture
+          cargo test -p codex-core --test all responses_lite_retries_full_first_turn_after_failed_generation -- --nocapture
+          echo 'FIELDWORK_LITE_CLIENT_EXACT=2/2'
+
+      - name: Run exact full-agent control
+        working-directory: codex-source/codex-rs
+        run: |
+          set -euo pipefail
+          cargo test -p codex-core --test all websocket_first_responses_lite_turn_sends_exact_current_request_after_startup_prewarm -- --nocapture
+          echo 'FIELDWORK_LITE_AGENT_EXACT=1/1'
+
+      - name: Run scoped fix gate
+        working-directory: codex-source/codex-rs
+        run: just fix -p codex-core
+
+      - name: Verify clean source worktree
+        working-directory: codex-source
+        run: |
+          set -euo pipefail
+          git diff --check
+          test -z "$(git status --porcelain)"
+          echo 'FIELDWORK_LITE_WORKTREE=clean'
