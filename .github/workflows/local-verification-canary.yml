@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       commit:
-        description: Exact 40-hex SmolRunner commit to verify
+        description: Exact 40-hex SmolRunner main-history commit to verify
         required: true
         type: string
 
@@ -36,19 +36,24 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ inputs.commit }}
+          fetch-depth: 0
           persist-credentials: false
           clean: true
           show-progress: false
 
-      - name: Bind immutable source identity
+      - name: Bind trusted immutable source identity
         id: source
         shell: /bin/bash --noprofile --norc -euo pipefail {0}
         env:
           SOURCE_COMMIT: ${{ inputs.commit }}
+          CONTROL_SHA: ${{ github.sha }}
         run: |
           commit="$(/usr/bin/git rev-parse --verify HEAD)"
           tree="$(/usr/bin/git rev-parse --verify 'HEAD^{tree}')"
           test "$commit" = "$SOURCE_COMMIT"
+          [[ "$CONTROL_SHA" =~ ^[0-9a-f]{40}$ ]]
+          /usr/bin/git cat-file -e "${CONTROL_SHA}^{commit}"
+          /usr/bin/git merge-base --is-ancestor "$commit" "$CONTROL_SHA"
           test -z "$(/usr/bin/git status --porcelain=v1 --untracked-files=all)"
           printf 'commit=%s\n' "$commit" >> "$GITHUB_OUTPUT"
           printf 'tree=%s\n' "$tree" >> "$GITHUB_OUTPUT"
