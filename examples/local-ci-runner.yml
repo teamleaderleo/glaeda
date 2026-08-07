@@ -1,0 +1,27 @@
+version: 1
+repository: teamleaderleo/smolrunner
+
+runner:
+  scope: repository
+  user: smolrunner-runner
+  labels:
+    - smolrunner-local-arm64
+
+container:
+  image: localhost/smolrunner-local-ci:rust-1.97.1-v1
+  file: containers/local-ci/Containerfile
+
+verify:
+  command: scripts/local-ci-verify.sh
+  suites:
+    focused: verify
+    full: verify
+
+limits:
+  memory: 2GiB
+  cpus: 2
+  pids: 768
+
+trust:
+  forks: deny
+  trigger: operator
