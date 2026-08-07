@@ -15,6 +15,8 @@ target_cache="smolrunner-local-target-v1"
 cpus="2"
 memory="2g"
 memory_mib=2048
+memory_swap="2560m"
+memory_swap_mib=2560
 pids=768
 prepare_network="slirp4netns"
 verify_network="none"
@@ -168,7 +170,7 @@ run_container() {
     --pids-limit="${pids}" \
     --cpus="${cpus}" \
     --memory="${memory}" \
-    --memory-swap="${memory}" \
+    --memory-swap="${memory_swap}" \
     --tmpfs=/tmp:rw,nosuid,nodev,size=536870912 \
     --mount "type=bind,source=${repo_root},destination=/workspace,ro=true" \
     --mount "type=volume,source=${cargo_cache},destination=/cargo" \
@@ -199,7 +201,8 @@ emit_receipt() {
   printf '"phase":"%s",' "${phase}"
   printf '"source":{"commit":"%s","tree":"%s"},' "${expected_commit}" "${expected_tree}"
   printf '"image":{"tag":"%s","id":"%s"},' "${image}" "${exact_image}"
-  printf '"resources":{"cpus":2,"memory_mib":%s,"pids":%s,"concurrency":1},' "${memory_mib}" "${pids}"
+  printf '"resources":{"cpus":2,"memory_mib":%s,"memory_swap_mib":%s,"pids":%s,"concurrency":1},' \
+    "${memory_mib}" "${memory_swap_mib}" "${pids}"
   printf '"network":{"prepare":"enabled","verify":"disabled"},'
   printf '"cache":{"cargo":"persistent_private","target":"persistent_private"},'
   printf '"source_mount":"read_only",'
@@ -279,7 +282,7 @@ verify_source() {
 
 print_contract() {
   cat <<'JSON'
-{"schema_version":1,"contract":"smolrunner.required-local","concurrency":1,"resources":{"cpus":2,"memory_mib":2048,"pids":768},"source":{"committed_only":true,"mount":"read_only"},"network":{"prepare":"enabled","verify":"disabled"},"cache":{"cargo":"persistent_private","target":"persistent_private"},"container":{"rootless":true,"capabilities":"dropped","no_new_privileges":true,"rootfs":"read_only"},"commands":["cargo fetch --locked","cargo fmt --all -- --check","cargo check --locked --all-targets --all-features --offline","cargo clippy --locked --all-targets --all-features --offline -- -D warnings","cargo test --locked --all-targets --all-features --offline"]}
+{"schema_version":1,"contract":"smolrunner.required-local","concurrency":1,"resources":{"cpus":2,"memory_mib":2048,"memory_swap_mib":2560,"pids":768},"source":{"committed_only":true,"mount":"read_only"},"network":{"prepare":"enabled","verify":"disabled"},"cache":{"cargo":"persistent_private","target":"persistent_private"},"container":{"rootless":true,"capabilities":"dropped","no_new_privileges":true,"rootfs":"read_only"},"commands":["cargo fetch --locked","cargo fmt --all -- --check","cargo check --locked --all-targets --all-features --offline","cargo clippy --locked --all-targets --all-features --offline -- -D warnings","cargo test --locked --all-targets --all-features --offline"]}
 JSON
 }
 
