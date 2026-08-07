@@ -96,4 +96,6 @@ do
   fi
 done
 
+bash "${repo_root}/scripts/test-local-ci-verify.sh"
+
 printf 'macbook runner bootstrap safety tests passed\n'
