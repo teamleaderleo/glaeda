@@ -3,6 +3,7 @@ set -euo pipefail
 
 script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 source_token_bridge="${script_dir}/local-actions-token-bridge.sh"
+expected_token_bridge_blob="08c6efa27c3faf40729056c4d797317054058565"
 
 expected_user="smolrunner-runner"
 expected_home="/home/smolrunner-runner"
@@ -28,6 +29,8 @@ rm=/usr/bin/rm
 mkdir=/usr/bin/mkdir
 chmod=/usr/bin/chmod
 cp=/usr/bin/cp
+git=/usr/bin/git
+jq=/usr/bin/jq
 
 usage() {
   cat <<'USAGE'
@@ -195,19 +198,22 @@ file_sha256() {
   "${sha256sum}" "${path}" | "${awk}" 'NR == 1 { print $1 }'
 }
 
+source_token_bridge_blob() {
+  "${git}" hash-object --no-filters -- "${source_token_bridge}"
+}
+
 binary_version() {
   build_clean_env
   "${clean_env[@]}" "${install_dir}/bin/Runner.Listener" --version 2>/dev/null | /usr/bin/head -n 1
 }
 
 verify_installation() {
-  [ -d "${install_dir}" ] || die 'Actions runner installation is missing'
-  [ -f "${marker}" ] || die 'Actions runner installation marker is missing'
-  [ -x "${install_dir}/config.sh" ] || die 'Actions runner config.sh is missing or non-executable'
-  [ -x "${install_dir}/run.sh" ] || die 'Actions runner run.sh is missing or non-executable'
-  [ -x "${install_dir}/bin/Runner.Listener" ] || die 'Actions runner listener binary is missing or non-executable'
-  [ -f "${installed_token_bridge}" ] && [ ! -L "${installed_token_bridge}" ] \
-    || die 'installed runner token bridge is missing or unsafe'
+  [ -d "${install_dir}" ] && [ ! -L "${install_dir}" ] || die 'Actions runner installation is missing or unsafe'
+  [ -f "${marker}" ] && [ ! -L "${marker}" ] || die 'Actions runner installation marker is missing or unsafe'
+  [ -x "${install_dir}/config.sh" ] && [ ! -L "${install_dir}/config.sh" ] || die 'Actions runner config.sh is missing or unsafe'
+  [ -x "${install_dir}/run.sh" ] && [ ! -L "${install_dir}/run.sh" ] || die 'Actions runner run.sh is missing or unsafe'
+  [ -x "${install_dir}/bin/Runner.Listener" ] && [ ! -L "${install_dir}/bin/Runner.Listener" ] || die 'Actions runner listener binary is missing or unsafe'
+  [ -f "${installed_token_bridge}" ] && [ ! -L "${installed_token_bridge}" ] || die 'installed runner token bridge is missing or unsafe'
 
   local version digest bridge_digest actual_bridge_digest actual_version
   version="$(installed_version)" || die 'installation marker has no version'
@@ -220,6 +226,23 @@ verify_installation() {
   [ "${actual_bridge_digest}" = "${bridge_digest}" ] || die 'installed token bridge differs from the reviewed marker'
   actual_version="$(binary_version)"
   [ "${actual_version}" = "${version}" ] || die 'installed runner binary version differs from the reviewed marker'
+}
+
+verify_registration_identity() {
+  local settings="${install_dir}/.runner"
+  [ -f "${settings}" ] && [ ! -L "${settings}" ] || die 'runner registration settings are missing or unsafe'
+  [ "$(${stat} -c '%u' "${settings}")" = "$(listener_uid)" ] || die 'runner registration settings have the wrong owner'
+  "${jq}" -e \
+    --arg expected_name "${runner_name}" \
+    --arg expected_url "${repository_url}" \
+    --arg expected_work "${work_dir}" '
+      ((.AgentId // .agentId // 0) > 0) and
+      ((.AgentName // .agentName // "") == $expected_name) and
+      ((.GitHubUrl // .gitHubUrl // "") == $expected_url) and
+      ((.WorkFolder // .workFolder // "") == $expected_work) and
+      ((.DisableUpdate // .disableUpdate // false) == true) and
+      ((.Ephemeral // .ephemeral // false) == false)
+    ' "${settings}" >/dev/null || die 'runner registration settings differ from the reviewed repository/name/work/update identity'
 }
 
 archive_is_safe() {
@@ -241,8 +264,8 @@ archive_is_safe() {
 install_runner() {
   parse_install_args "$@"
   assert_guest_boundary
-  [ -f "${source_token_bridge}" ] && [ ! -L "${source_token_bridge}" ] \
-    || die 'reviewed token bridge source is missing or unsafe'
+  [ -f "${source_token_bridge}" ] && [ ! -L "${source_token_bridge}" ] || die 'reviewed token bridge source is missing or unsafe'
+  [ "$(source_token_bridge_blob)" = "${expected_token_bridge_blob}" ] || die 'token bridge source differs from the reviewed Git blob'
 
   if [ -e "${install_dir}" ] || [ -L "${install_dir}" ]; then
     verify_installation
@@ -319,6 +342,7 @@ register_runner() {
   assert_guest_boundary
   verify_installation
   if [ -f "${install_dir}/.runner" ]; then
+    verify_registration_identity
     printf '{"schema_version":1,"operation":"register","disposition":"already_registered","name":"%s","label":"%s","auto_update":false}\n' \
       "${runner_name}" "${custom_label}"
     return 0
@@ -339,7 +363,7 @@ register_runner() {
   status=$?
   set -e
   [ "${status}" -eq 0 ] || return "${status}"
-  [ -f "${install_dir}/.runner" ] || die 'runner configuration returned success without registration state'
+  verify_registration_identity
 
   printf '{"schema_version":1,"operation":"register","disposition":"registered","name":"%s","label":"%s","auto_update":false}\n' \
     "${runner_name}" "${custom_label}"
@@ -349,7 +373,7 @@ run_runner() {
   [ "$#" -eq 0 ] || die 'run accepts no arguments'
   assert_guest_boundary
   verify_installation
-  [ -f "${install_dir}/.runner" ] || die 'runner is not registered'
+  verify_registration_identity
   build_clean_env
   cd "${install_dir}"
   exec "${clean_env[@]}" ./run.sh
@@ -363,6 +387,7 @@ remove_runner() {
     printf '{"schema_version":1,"operation":"remove","disposition":"already_removed"}\n'
     return 0
   fi
+  verify_registration_identity
 
   build_clean_env
   local status
@@ -387,7 +412,10 @@ status_runner() {
   fi
   verify_installation
   local registered=false
-  [ -f "${install_dir}/.runner" ] && registered=true
+  if [ -f "${install_dir}/.runner" ]; then
+    verify_registration_identity
+    registered=true
+  fi
   printf '{"schema_version":1,"installed":true,"registered":%s,"version":"%s","package_sha256":"%s","token_bridge_sha256":"%s","name":"%s","label":"%s","auto_update":false}\n' \
     "${registered}" "$(installed_version)" "$(installed_sha256)" "$(installed_token_bridge_sha256)" \
     "${runner_name}" "${custom_label}"
@@ -398,6 +426,9 @@ check_runner() {
   assert_guest_boundary
   if [ -d "${install_dir}" ]; then
     verify_installation
+    if [ -f "${install_dir}/.runner" ]; then
+      verify_registration_identity
+    fi
   fi
   printf '{"schema_version":1,"user":"%s","architecture":"arm64","rootless_podman":true,"privileged_groups":false,"subordinate_ids":true}\n' \
     "${expected_user}"
@@ -405,7 +436,7 @@ check_runner() {
 
 print_contract() {
   cat <<'JSON'
-{"schema_version":1,"contract":"smolrunner-local-actions-listener","user":"smolrunner-runner","repository":"teamleaderleo/smolrunner","runner_name":"smolrunner-local-arm64","custom_label":"smolrunner-local-arm64","default_labels":["self-hosted","linux","ARM64"],"installation":{"source":"actions/runner","platform":"linux-arm64","exact_version_required":true,"sha256_required":true,"token_bridge_pinned":true,"auto_update":false},"registration":{"token_source":"stdin_to_installed_bridge_to_secret_environment","persistent_token":false,"token_in_argv":false,"service_install":false},"execution":{"environment":"allowlist","rootless_podman_required":true,"privileged_groups":false},"trust":{"forks":"deny","trigger":"operator"}}
+{"schema_version":1,"contract":"smolrunner-local-actions-listener","user":"smolrunner-runner","repository":"teamleaderleo/smolrunner","runner_name":"smolrunner-local-arm64","custom_label":"smolrunner-local-arm64","default_labels":["self-hosted","linux","ARM64"],"installation":{"source":"actions/runner","platform":"linux-arm64","exact_version_required":true,"sha256_required":true,"token_bridge_blob_pinned":true,"token_bridge_pinned":true,"auto_update":false},"registration":{"identity_fields_verified":true,"token_source":"stdin_to_installed_bridge_to_secret_environment","persistent_token":false,"token_in_argv":false,"service_install":false},"execution":{"environment":"allowlist","rootless_podman_required":true,"privileged_groups":false},"trust":{"forks":"deny","trigger":"operator"}}
 JSON
 }
 
