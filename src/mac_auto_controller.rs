@@ -8,7 +8,7 @@ pub use crate::mac_auto_availability::{
     WORK_PROFILE,
 };
 use crate::mac_auto_availability::{
-    MacAutoAvailabilityObservation, MacAutoAvailabilityError, MacQueuedJob,
+    MacAutoAvailabilityError, MacAutoAvailabilityObservation, MacQueuedJob,
     plan_mac_auto_availability,
 };
 use crate::mac_availability::{
@@ -115,10 +115,9 @@ impl std::error::Error for MacAutoControllerError {}
 
 /// Plan automatic personal-Mac admission with the exact initial R0 execution cap.
 ///
-/// This facade is the #288 integration surface. The lower-level availability reducer remains
-/// useful for policy tests, while this layer additionally proves that the next job fits the
-/// current local container envelope and fails closed on incomplete automatic activity/power
-/// evidence.
+/// The lower-level availability reducer remains reusable policy machinery. This facade is the
+/// #288 integration surface: it additionally proves that the next job fits the current local
+/// container envelope and disables automatic admission when required host evidence is incomplete.
 ///
 /// # Errors
 ///
@@ -127,22 +126,7 @@ pub fn plan_mac_auto_controller(
     policy: MacAutoAvailabilityPolicy,
     observation: MacAutoControllerObservation,
 ) -> Result<MacAutoControllerPlan, MacAutoControllerError> {
-    if let Some(job) = observation.next_job {
-        if job.requested_cpu_millis == 0 {
-            return Err(MacAutoControllerError::new(
-                "next_job.requested_cpu_millis",
-                "invalid_cpu_request",
-                "local job CPU request must be greater than zero",
-            ));
-        }
-        if job.requested_memory_bytes == 0 {
-            return Err(MacAutoControllerError::new(
-                "next_job.requested_memory_bytes",
-                "invalid_memory_request",
-                "local job memory request must be greater than zero",
-            ));
-        }
-    }
+    validate_job_request(observation.next_job)?;
 
     let core_next_job = observation.next_job.map(|job| MacQueuedJob {
         class: match job.class {
@@ -151,6 +135,7 @@ pub fn plan_mac_auto_controller(
         },
         trust: job.trust,
     });
+
     let mut policy_plan = plan_mac_auto_availability(
         policy,
         MacAutoAvailabilityObservation {
@@ -210,12 +195,35 @@ pub fn plan_mac_auto_controller(
     })
 }
 
+fn validate_job_request(
+    next_job: Option<MacLocalJobRequest>,
+) -> Result<(), MacAutoControllerError> {
+    let Some(job) = next_job else {
+        return Ok(());
+    };
+    if job.requested_cpu_millis == 0 {
+        return Err(MacAutoControllerError::new(
+            "next_job.requested_cpu_millis",
+            "invalid_cpu_request",
+            "local job CPU request must be greater than zero",
+        ));
+    }
+    if job.requested_memory_bytes == 0 {
+        return Err(MacAutoControllerError::new(
+            "next_job.requested_memory_bytes",
+            "invalid_memory_request",
+            "local job memory request must be greater than zero",
+        ));
+    }
+    Ok(())
+}
+
 const fn local_job_fits_initial_envelope(job: MacLocalJobRequest) -> bool {
     job.requested_cpu_millis <= INITIAL_LOCAL_JOB_CPU_MILLIS
         && job.requested_memory_bytes <= INITIAL_LOCAL_JOB_MEMORY_BYTES
 }
 
-const fn auto_evidence_incomplete(observation: MacAutoControllerObservation) -> bool {
+fn auto_evidence_incomplete(observation: MacAutoControllerObservation) -> bool {
     observation.resource_freshness == ObservationFreshness::Stale
         || observation.activity_freshness == ObservationFreshness::Stale
         || observation.queue_freshness == ObservationFreshness::Stale
@@ -231,10 +239,6 @@ mod tests {
 
     const MINUTE: u64 = 60 * 1_000;
     const GIB: u64 = 1_024 * 1_024 * 1_024;
-
-    fn policy() -> MacAutoAvailabilityPolicy {
-        MacAutoAvailabilityPolicy::initial()
-    }
 
     fn observation() -> MacAutoControllerObservation {
         MacAutoControllerObservation {
@@ -257,8 +261,8 @@ mod tests {
             next_job: Some(MacLocalJobRequest {
                 class: MacWorkloadClass::Light,
                 trust: MacJobTrust::Trusted,
-                requested_cpu_millis: 2_000,
-                requested_memory_bytes: 2 * GIB,
+                requested_cpu_millis: INITIAL_LOCAL_JOB_CPU_MILLIS,
+                requested_memory_bytes: INITIAL_LOCAL_JOB_MEMORY_BYTES,
             }),
             healthy_observation_streak: 3,
             last_transition_at_millis: 10 * MINUTE,
@@ -268,7 +272,8 @@ mod tests {
 
     #[test]
     fn fitting_light_job_runs_locally_while_operator_is_active() {
-        let plan = plan_mac_auto_controller(policy(), observation()).expect("plan");
+        let plan = plan_mac_auto_controller(MacAutoAvailabilityPolicy::initial(), observation())
+            .expect("plan");
 
         assert_eq!(plan.local_resource_fit, Some(true));
         assert_eq!(
@@ -283,11 +288,12 @@ mod tests {
         facts.next_job = Some(MacLocalJobRequest {
             class: MacWorkloadClass::Work,
             trust: MacJobTrust::Trusted,
-            requested_cpu_millis: 2_000,
-            requested_memory_bytes: 2 * GIB,
+            requested_cpu_millis: INITIAL_LOCAL_JOB_CPU_MILLIS,
+            requested_memory_bytes: INITIAL_LOCAL_JOB_MEMORY_BYTES,
         });
 
-        let active = plan_mac_auto_controller(policy(), facts).expect("active plan");
+        let active = plan_mac_auto_controller(MacAutoAvailabilityPolicy::initial(), facts)
+            .expect("active plan");
         assert_eq!(
             active.policy.dispatch,
             Some(LocalDispatchDecision::OverflowRecommended)
@@ -295,13 +301,14 @@ mod tests {
 
         facts.operator_activity = OperatorActivityState::Idle;
         facts.operator_idle_millis = Some(20 * MINUTE);
-        let idle = plan_mac_auto_controller(policy(), facts).expect("idle plan");
+        let idle = plan_mac_auto_controller(MacAutoAvailabilityPolicy::initial(), facts)
+            .expect("idle plan");
         assert_eq!(idle.policy.resolved_mode, EffectiveAvailabilityMode::Away);
         assert_eq!(idle.policy.dispatch, Some(LocalDispatchDecision::QueueLocal));
     }
 
     #[test]
-    fn oversized_job_overflows_even_when_policy_would_admit_work() {
+    fn oversized_job_overflows_even_when_work_mode_is_available() {
         let mut facts = observation();
         facts.effective_mode = EffectiveAvailabilityMode::Away;
         facts.operator_activity = OperatorActivityState::Idle;
@@ -309,11 +316,12 @@ mod tests {
         facts.next_job = Some(MacLocalJobRequest {
             class: MacWorkloadClass::Work,
             trust: MacJobTrust::Trusted,
-            requested_cpu_millis: 2_001,
-            requested_memory_bytes: 2 * GIB,
+            requested_cpu_millis: INITIAL_LOCAL_JOB_CPU_MILLIS + 1,
+            requested_memory_bytes: INITIAL_LOCAL_JOB_MEMORY_BYTES,
         });
 
-        let plan = plan_mac_auto_controller(policy(), facts).expect("plan");
+        let plan = plan_mac_auto_controller(MacAutoAvailabilityPolicy::initial(), facts)
+            .expect("plan");
 
         assert_eq!(plan.local_resource_fit, Some(false));
         assert_eq!(
@@ -331,7 +339,8 @@ mod tests {
         facts.operator_activity = OperatorActivityState::Unknown;
         facts.operator_idle_millis = None;
 
-        let plan = plan_mac_auto_controller(policy(), facts).expect("plan");
+        let plan = plan_mac_auto_controller(MacAutoAvailabilityPolicy::initial(), facts)
+            .expect("plan");
 
         assert_eq!(plan.policy.admission, MacAdmissionClass::None);
         assert_eq!(
@@ -346,7 +355,8 @@ mod tests {
         let mut facts = observation();
         facts.host_power = HostPowerSource::Unknown;
 
-        let plan = plan_mac_auto_controller(policy(), facts).expect("plan");
+        let plan = plan_mac_auto_controller(MacAutoAvailabilityPolicy::initial(), facts)
+            .expect("plan");
 
         assert_eq!(plan.policy.admission, MacAdmissionClass::None);
         assert_eq!(
@@ -356,13 +366,14 @@ mod tests {
     }
 
     #[test]
-    fn explicit_active_mode_can_ignore_operator_activity_unknown_but_keeps_resource_cap() {
+    fn explicit_active_can_ignore_unknown_activity_but_keeps_resource_cap() {
         let mut facts = observation();
         facts.requested_mode = AvailabilityRequest::Active;
         facts.operator_activity = OperatorActivityState::Unknown;
         facts.operator_idle_millis = None;
 
-        let plan = plan_mac_auto_controller(policy(), facts).expect("plan");
+        let plan = plan_mac_auto_controller(MacAutoAvailabilityPolicy::initial(), facts)
+            .expect("plan");
 
         assert_eq!(plan.policy.admission, MacAdmissionClass::Light);
         assert_eq!(plan.local_resource_fit, Some(true));
@@ -378,7 +389,8 @@ mod tests {
             requested_memory_bytes: GIB,
         });
 
-        let error = plan_mac_auto_controller(policy(), facts).expect_err("invalid request");
+        let error = plan_mac_auto_controller(MacAutoAvailabilityPolicy::initial(), facts)
+            .expect_err("invalid request");
         assert_eq!(error.code, "invalid_cpu_request");
     }
 }
