@@ -60,8 +60,9 @@ for required in \
   'ACTIONS_RUNNER_INPUT_TOKEN=${secret_token}' \
   '--labels "${custom_label}"' \
   '--disableupdate' \
-  'exec "${clean_env[@]}" ./run.sh' \
+  'clean_env=(' \
   '"${env_bin}" -i' \
+  'exec "${clean_env[@]}" ./run.sh' \
   'assert_subordinate_ids' \
   'assert_no_privileged_groups' \
   "if [ -e /run/podman/podman.sock ] || [ -L /run/podman/podman.sock ]; then"
@@ -74,20 +75,27 @@ done
 
 for forbidden in \
   ' --token ' \
-  'sudo ' \
   'svc.sh' \
   '--replace' \
   '--no-default-labels' \
   '--privileged' \
   'SSH_AUTH_SOCK' \
   'GITHUB_TOKEN' \
-  'GH_TOKEN'
+  'GH_TOKEN' \
+  'CONTAINER_HOST=' \
+  'DOCKER_HOST=' \
+  'PODMAN_HOST='
 do
   if grep -F -- "${forbidden}" "${helper}" >/dev/null; then
     printf 'forbidden listener authority found: %s\n' "${forbidden}" >&2
     exit 1
   fi
 done
+
+if grep -Eq '^[[:space:]]*(sudo|doas)([[:space:]]|$)' "${helper}"; then
+  printf 'listener helper unexpectedly contains a privilege-elevation command\n' >&2
+  exit 1
+fi
 
 grep -F 'repository: teamleaderleo/smolrunner' "${manifest}" >/dev/null
 grep -F 'user: smolrunner-runner' "${manifest}" >/dev/null
