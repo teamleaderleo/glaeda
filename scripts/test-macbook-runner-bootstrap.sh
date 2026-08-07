@@ -97,5 +97,6 @@ do
 done
 
 bash "${repo_root}/scripts/test-local-ci-verify.sh"
+bash "${repo_root}/scripts/test-local-actions-canary.sh"
 
 printf 'macbook runner bootstrap safety tests passed\n'
