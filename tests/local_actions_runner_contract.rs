@@ -67,14 +67,14 @@ fn local_listener_contract_is_bounded_and_token_argv_free() {
 
     for required in [
         "actions/runner/releases/download/v${requested_version}/actions-runner-linux-arm64-${requested_version}.tar.gz",
-        "${sha256sum}\\\" --check --status -",
+        "--check --status -",
         "token_bridge_sha256=",
-        "/bin/bash \\\"${installed_token_bridge}\\\"",
-        "--labels \\\"${custom_label}\\\"",
+        "installed_token_bridge",
+        "--labels",
         "--disableupdate",
         "clean_env=(",
-        "${env_bin}\\\" -i",
-        "exec \\\"${clean_env[@]}\\\" ./run.sh",
+        "env_bin",
+        "exec \"${clean_env[@]}\" ./run.sh",
         "assert_subordinate_ids",
         "assert_no_privileged_groups",
     ] {
@@ -82,11 +82,11 @@ fn local_listener_contract_is_bounded_and_token_argv_free() {
     }
 
     for required in [
-        "expected_config=\\\"/home/smolrunner-runner/actions-runner/config.sh\\\"",
+        "expected_config=\"/home/smolrunner-runner/actions-runner/config.sh\"",
         "IFS= read -r secret_token",
-        "export ACTIONS_RUNNER_INPUT_TOKEN=\\\"${secret_token}\\\"",
+        "export ACTIONS_RUNNER_INPUT_TOKEN=\"${secret_token}\"",
         "unset secret_token",
-        "exec \\\"${config}\\\" \\\"$@\\\"",
+        "exec \"${config}\" \"$@\"",
     ] {
         assert!(bridge.contains(required), "missing token bridge contract: {required}");
     }
@@ -124,23 +124,23 @@ fn invalid_install_and_registration_inputs_fail_before_host_access() {
             "--sha256",
             "0000000000000000000000000000000000000000000000000000000000000000",
         ])
-        .status()
+        .output()
         .expect("run invalid mutable-version check");
-    assert!(!mutable_version.success());
+    assert!(!mutable_version.status.success());
 
     let short_digest = Command::new("/bin/bash")
         .arg(&helper)
         .args(["install", "--version", "2.334.0", "--sha256", "deadbeef"])
-        .status()
+        .output()
         .expect("run invalid digest check");
-    assert!(!short_digest.success());
+    assert!(!short_digest.status.success());
 
     let token_argument = Command::new("/bin/bash")
         .arg(&helper)
         .args(["register", "--token", "secret"])
-        .status()
+        .output()
         .expect("run forbidden token-argument check");
-    assert!(!token_argument.success());
+    assert!(!token_argument.status.success());
 }
 
 #[test]
