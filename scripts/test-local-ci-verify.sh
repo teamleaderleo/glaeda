@@ -14,6 +14,7 @@ printf '%s\n' "${contract}" | jq -e '
   .concurrency == 1 and
   .resources.cpus == 2 and
   .resources.memory_mib == 2048 and
+  .resources.memory_swap_mib == 2560 and
   .resources.pids == 768 and
   .source.committed_only == true and
   .source.mount == "read_only" and
@@ -51,7 +52,7 @@ for required in \
   '--pids-limit="${pids}"' \
   '--cpus="${cpus}"' \
   '--memory="${memory}"' \
-  '--memory-swap="${memory}"' \
+  '--memory-swap="${memory_swap}"' \
   'destination=/workspace,ro=true' \
   'run_container "${verify_network}" cargo test --locked --all-targets --all-features --offline'
 do
