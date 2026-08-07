@@ -11,7 +11,8 @@ The wrapper is `scripts/local-ci-verify.sh`. It accepts only the fixed profile `
 Repository source is mounted read-only into a disposable rootless Podman container. The container receives:
 
 - 2 CPUs;
-- 2 GiB memory with the same memory+swap ceiling;
+- 2 GiB memory;
+- 2.5 GiB combined memory+swap limit, allowing at most 512 MiB swap above the memory cap;
 - 768 PIDs;
 - a read-only container root filesystem;
 - all Linux capabilities dropped;
