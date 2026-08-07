@@ -64,6 +64,22 @@ runtime_dir() {
   printf '/run/user/%s\n' "$(listener_uid)"
 }
 
+build_clean_env() {
+  local run_dir
+  run_dir="$(runtime_dir)"
+  clean_env=(
+    "${env_bin}" -i
+    "HOME=${expected_home}"
+    "USER=${expected_user}"
+    "LOGNAME=${expected_user}"
+    "SHELL=/bin/bash"
+    "LANG=C.UTF-8"
+    "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    "XDG_RUNTIME_DIR=${run_dir}"
+    "DBUS_SESSION_BUS_ADDRESS=unix:path=${run_dir}/bus"
+  )
+}
+
 assert_no_privileged_groups() {
   local groups
   groups="$(${id} -nG)"
@@ -108,17 +124,13 @@ assert_listener_identity() {
 }
 
 assert_rootless_podman() {
-  local run_dir rootless
+  local rootless
   [ -x "${podman}" ] || die 'rootless Podman is unavailable at /usr/bin/podman'
   if [ -e /run/podman/podman.sock ] || [ -L /run/podman/podman.sock ]; then
     die 'privileged Podman socket path is present; repair the guest before listener activation'
   fi
-  run_dir="$(runtime_dir)"
-  rootless="$(
-    XDG_RUNTIME_DIR="${run_dir}" \
-    DBUS_SESSION_BUS_ADDRESS="unix:path=${run_dir}/bus" \
-      "${podman}" info --format '{{.Host.Security.Rootless}}' 2>/dev/null || true
-  )"
+  build_clean_env
+  rootless="$("${clean_env[@]}" "${podman}" info --format '{{.Host.Security.Rootless}}' 2>/dev/null || true)"
   [ "${rootless}" = "true" ] || die 'listener account did not prove a rootless Podman boundary'
 }
 
@@ -169,6 +181,11 @@ installed_sha256() {
   read_marker_value sha256
 }
 
+binary_version() {
+  build_clean_env
+  "${clean_env[@]}" "${install_dir}/bin/Runner.Listener" --version 2>/dev/null | /usr/bin/head -n 1
+}
+
 verify_installation() {
   [ -d "${install_dir}" ] || die 'Actions runner installation is missing'
   [ -f "${marker}" ] || die 'Actions runner installation marker is missing'
@@ -176,18 +193,19 @@ verify_installation() {
   [ -x "${install_dir}/run.sh" ] || die 'Actions runner run.sh is missing or non-executable'
   [ -x "${install_dir}/bin/Runner.Listener" ] || die 'Actions runner listener binary is missing or non-executable'
 
-  local version binary_version
+  local version digest actual_version
   version="$(installed_version)" || die 'installation marker has no version'
+  digest="$(installed_sha256)" || die 'installation marker has no package SHA-256'
   validate_version "${version}"
-  validate_sha256 "$(installed_sha256)" || true
-  binary_version="$("${install_dir}/bin/Runner.Listener" --version 2>/dev/null | /usr/bin/head -n 1)"
-  [ "${binary_version}" = "${version}" ] || die 'installed runner binary version differs from the reviewed marker'
+  validate_sha256 "${digest}"
+  actual_version="$(binary_version)"
+  [ "${actual_version}" = "${version}" ] || die 'installed runner binary version differs from the reviewed marker'
 }
 
 archive_is_safe() {
   local list_file="$1"
   "${awk}" '
-    function bad_component(path, count, parts, i) {
+    function has_parent_component(path, count, parts, i) {
       count = split(path, parts, "/")
       for (i = 1; i <= count; i++) {
         if (parts[i] == "..") return 1
@@ -195,7 +213,7 @@ archive_is_safe() {
       return 0
     }
     /^\// { bad = 1 }
-    { if (bad_component($0)) bad = 1 }
+    { if (has_parent_component($0)) bad = 1 }
     END { exit(bad ? 1 : 0) }
   ' "${list_file}"
 }
@@ -216,16 +234,17 @@ install_runner() {
   fi
 
   umask 077
-  local temp archive list url lock_dir install_created
+  local temp archive list url lock_dir install_created published
   lock_dir="${expected_home}/.smolrunner-actions-runner-install.lock"
   "${mkdir}" "${lock_dir}" 2>/dev/null || die 'another listener installation operation is active or left recovery debt'
   temp="$(${mktemp} -d "${expected_home}/.smolrunner-actions-runner.XXXXXX")"
   archive="${temp}/runner.tar.gz"
   list="${temp}/archive.list"
   install_created=0
+  published=0
   cleanup_install() {
     "${rm}" -rf -- "${temp}"
-    if [ "${install_created}" -eq 1 ] && [ ! -f "${marker}" ]; then
+    if [ "${install_created}" -eq 1 ] && [ "${published}" -eq 0 ]; then
       "${rm}" -rf -- "${install_dir}"
     fi
     /usr/bin/rmdir -- "${lock_dir}" 2>/dev/null || true
@@ -233,7 +252,8 @@ install_runner() {
   trap cleanup_install EXIT
 
   url="https://github.com/actions/runner/releases/download/v${requested_version}/actions-runner-linux-arm64-${requested_version}.tar.gz"
-  "${curl}" --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
+  build_clean_env
+  "${clean_env[@]}" "${curl}" --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
     --output "${archive}" -- "${url}"
   printf '%s  %s\n' "${requested_sha256}" "${archive}" | "${sha256sum}" --check --status - \
     || die 'downloaded Actions runner package SHA-256 differs from the reviewed digest'
@@ -246,10 +266,18 @@ install_runner() {
   "${tar}" -xzf "${archive}" -C "${install_dir}" --no-same-owner
   [ ! -e "${install_dir}/.runner" ] || die 'release archive unexpectedly contains runner registration state'
   [ ! -e "${install_dir}/.credentials" ] || die 'release archive unexpectedly contains runner credentials'
+  [ -x "${install_dir}/config.sh" ] || die 'release archive is missing config.sh'
+  [ -x "${install_dir}/run.sh" ] || die 'release archive is missing run.sh'
+  [ -x "${install_dir}/bin/Runner.Listener" ] || die 'release archive is missing Runner.Listener'
+
+  build_clean_env
+  [ "$("${clean_env[@]}" "${install_dir}/bin/Runner.Listener" --version 2>/dev/null | /usr/bin/head -n 1)" = "${requested_version}" ] \
+    || die 'downloaded runner binary version differs from the reviewed version'
 
   printf 'version=%s\nsha256=%s\n' "${requested_version}" "${requested_sha256}" >"${marker}"
   "${chmod}" 0600 "${marker}"
   verify_installation
+  published=1
 
   printf '{"schema_version":1,"operation":"install","disposition":"installed","version":"%s","package_sha256":"%s","auto_update":false}\n' \
     "${requested_version}" "${requested_sha256}"
@@ -265,19 +293,6 @@ read_secret_token() {
   esac
 }
 
-registration_env() {
-  local run_dir
-  run_dir="$(runtime_dir)"
-  printf '%s\n' \
-    "HOME=${expected_home}" \
-    "USER=${expected_user}" \
-    "LOGNAME=${expected_user}" \
-    'SHELL=/bin/bash' \
-    'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' \
-    "XDG_RUNTIME_DIR=${run_dir}" \
-    "DBUS_SESSION_BUS_ADDRESS=unix:path=${run_dir}/bus"
-}
-
 register_runner() {
   [ "$#" -eq 0 ] || die 'register accepts no command-line arguments'
   assert_guest_boundary
@@ -289,17 +304,11 @@ register_runner() {
   fi
 
   read_secret_token
-  local run_dir status
-  run_dir="$(runtime_dir)"
+  build_clean_env
+  local status
   set +e
-  ACTIONS_RUNNER_INPUT_TOKEN="${secret_token}" \
-  HOME="${expected_home}" \
-  USER="${expected_user}" \
-  LOGNAME="${expected_user}" \
-  SHELL=/bin/bash \
-  PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-  XDG_RUNTIME_DIR="${run_dir}" \
-  DBUS_SESSION_BUS_ADDRESS="unix:path=${run_dir}/bus" \
+  "${clean_env[@]}" \
+    "ACTIONS_RUNNER_INPUT_TOKEN=${secret_token}" \
     "${install_dir}/config.sh" \
       --unattended \
       --url "${repository_url}" \
@@ -322,19 +331,9 @@ run_runner() {
   assert_guest_boundary
   verify_installation
   [ -f "${install_dir}/.runner" ] || die 'runner is not registered'
-  local run_dir
-  run_dir="$(runtime_dir)"
-
+  build_clean_env
   cd "${install_dir}"
-  exec "${env_bin}" -i \
-    HOME="${expected_home}" \
-    USER="${expected_user}" \
-    LOGNAME="${expected_user}" \
-    SHELL=/bin/bash \
-    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-    XDG_RUNTIME_DIR="${run_dir}" \
-    DBUS_SESSION_BUS_ADDRESS="unix:path=${run_dir}/bus" \
-    ./run.sh
+  exec "${clean_env[@]}" ./run.sh
 }
 
 remove_runner() {
@@ -347,17 +346,11 @@ remove_runner() {
   fi
 
   read_secret_token
-  local run_dir status
-  run_dir="$(runtime_dir)"
+  build_clean_env
+  local status
   set +e
-  ACTIONS_RUNNER_INPUT_TOKEN="${secret_token}" \
-  HOME="${expected_home}" \
-  USER="${expected_user}" \
-  LOGNAME="${expected_user}" \
-  SHELL=/bin/bash \
-  PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-  XDG_RUNTIME_DIR="${run_dir}" \
-  DBUS_SESSION_BUS_ADDRESS="unix:path=${run_dir}/bus" \
+  "${clean_env[@]}" \
+    "ACTIONS_RUNNER_INPUT_TOKEN=${secret_token}" \
     "${install_dir}/config.sh" remove --unattended
   status=$?
   set -e
