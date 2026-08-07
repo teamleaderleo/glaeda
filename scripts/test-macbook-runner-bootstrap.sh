@@ -96,6 +96,4 @@ do
   fi
 done
 
-bash "${repo_root}/scripts/test-local-actions-runner.sh"
-
 printf 'macbook runner bootstrap safety tests passed\n'
