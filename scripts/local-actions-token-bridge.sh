@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 expected_config="/home/smolrunner-runner/actions-runner/config.sh"
 
