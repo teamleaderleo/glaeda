@@ -3,10 +3,10 @@ use std::fmt;
 use serde::Serialize;
 
 use crate::mac_availability::{
-    ACTIVE_PROFILE, AWAY_PROFILE, AvailabilityActionKind, AvailabilityDisposition,
-    AvailabilityRequest, EffectiveAvailabilityMode, HostPowerSource, JobActivity,
-    MacAvailabilityObservation, MacAvailabilityPlan, MacVmProfile, MemoryPressure,
-    ObservationFreshness, VmPowerState, plan_availability_transition,
+    ACTIVE_PROFILE, AvailabilityActionKind, AvailabilityDisposition, AvailabilityRequest,
+    EffectiveAvailabilityMode, HostPowerSource, JobActivity, MacAvailabilityObservation,
+    MacAvailabilityPlan, MacVmProfile, MemoryPressure, ObservationFreshness, VmPowerState,
+    plan_availability_transition,
 };
 use crate::personal_worker_queue::{
     PERSONAL_WORKER_INTERACTIVE_COOLDOWN_MILLIS, PERSONAL_WORKER_STOPPED_COOLDOWN_MILLIS,
@@ -19,6 +19,11 @@ pub const INITIAL_AUTO_MAX_SWAP_GROWTH_BYTES: u64 = 512 * 1_024 * 1_024;
 pub const INITIAL_AUTO_BATTERY_FLOOR_PERCENT: u8 = 30;
 pub const INITIAL_AUTO_REQUIRED_HEALTHY_OBSERVATIONS: u8 = 3;
 pub const INITIAL_AUTO_MAX_LOCAL_QUEUE_DEPTH: u16 = 2;
+pub const WORK_PROFILE: MacVmProfile = MacVmProfile {
+    cpus: 8,
+    memory_mib: 10 * 1024,
+    max_concurrent_jobs: 1,
+};
 const MAX_AUTO_POLICY_MILLIS: u64 = 7 * 24 * 60 * 60 * 1_000;
 const MAX_AUTO_QUEUE_DEPTH: u16 = 256;
 
@@ -297,7 +302,7 @@ pub fn plan_mac_auto_availability(
     };
 
     let explicit_request = request_for_effective_mode(resolved_mode);
-    let transition = plan_availability_transition(
+    let mut transition = plan_availability_transition(
         MacAvailabilityObservation {
             effective_mode: observation.effective_mode,
             vm_power: observation.vm_power,
@@ -309,6 +314,7 @@ pub fn plan_mac_auto_availability(
         },
         explicit_request,
     );
+    transition.target_profile = vm_profile(resolved_mode);
 
     let admission = desired_admission(policy, observation, resolved_mode, swap_growth_bytes);
     let dispatch = observation.next_job.map(|job| {
@@ -718,12 +724,6 @@ fn decide_dispatch(
         return LocalDispatchDecision::QueueLocal;
     }
 
-    if admission == MacAdmissionClass::None
-        && observation.requested_mode == AvailabilityRequest::Off
-    {
-        return LocalDispatchDecision::OverflowRecommended;
-    }
-
     LocalDispatchDecision::OverflowRecommended
 }
 
@@ -789,7 +789,7 @@ const fn desired_profile(mode: EffectiveAvailabilityMode) -> DesiredLimaProfile 
 const fn vm_profile(mode: EffectiveAvailabilityMode) -> Option<MacVmProfile> {
     match mode {
         EffectiveAvailabilityMode::Active => Some(ACTIVE_PROFILE),
-        EffectiveAvailabilityMode::Away => Some(AWAY_PROFILE),
+        EffectiveAvailabilityMode::Away => Some(WORK_PROFILE),
         EffectiveAvailabilityMode::Off => None,
     }
 }
@@ -885,6 +885,7 @@ mod tests {
         assert_eq!(plan.dispatch, Some(LocalDispatchDecision::QueueLocal));
         assert_eq!(plan.next_action, Some(AvailabilityActionKind::DrainRunner));
         assert_eq!(plan.desired_vm_profile.expect("profile").memory_mib, 10 * 1024);
+        assert_eq!(plan.transition.target_profile.expect("profile").memory_mib, 10 * 1024);
     }
 
     #[test]
@@ -1130,7 +1131,7 @@ mod tests {
     }
 
     #[test]
-    fn JSON_contract_is_bounded_and_contains_no_application_identity() {
+    fn json_contract_is_bounded_and_contains_no_application_identity() {
         let plan = plan_mac_auto_availability(policy(), observation(EffectiveAvailabilityMode::Active))
             .expect("plan");
         let json = serde_json::to_string(&plan).expect("serialize");
