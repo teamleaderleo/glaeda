@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+source_token_bridge="${script_dir}/local-actions-token-bridge.sh"
+
 expected_user="smolrunner-runner"
 expected_home="/home/smolrunner-runner"
 repository_url="https://github.com/teamleaderleo/smolrunner"
@@ -8,6 +11,7 @@ runner_name="smolrunner-local-arm64"
 custom_label="smolrunner-local-arm64"
 install_dir="${expected_home}/actions-runner"
 marker="${install_dir}/.smolrunner-install"
+installed_token_bridge="${install_dir}/.smolrunner-token-bridge.sh"
 work_dir="_work"
 
 id=/usr/bin/id
@@ -23,6 +27,7 @@ env_bin=/usr/bin/env
 rm=/usr/bin/rm
 mkdir=/usr/bin/mkdir
 chmod=/usr/bin/chmod
+cp=/usr/bin/cp
 
 usage() {
   cat <<'USAGE'
@@ -36,8 +41,8 @@ Usage:
   bash scripts/local-actions-runner.sh status
 
 This helper must run as the dedicated `smolrunner-runner` guest user. Account creation, subordinate-ID
-allocation, and linger belong to SmolRunner host preparation. The helper never uses sudo and never
-installs a system service.
+allocation, and linger belong to SmolRunner host preparation. The helper never elevates privilege and
+never installs a system service.
 USAGE
 }
 
@@ -53,7 +58,7 @@ validate_version() {
 
 validate_sha256() {
   local digest="$1"
-  [[ "${digest}" =~ ^[0-9a-f]{64}$ ]] || die 'runner SHA-256 must be exactly 64 lowercase hexadecimal characters'
+  [[ "${digest}" =~ ^[0-9a-f]{64}$ ]] || die 'SHA-256 must be exactly 64 lowercase hexadecimal characters'
 }
 
 listener_uid() {
@@ -181,6 +186,15 @@ installed_sha256() {
   read_marker_value sha256
 }
 
+installed_token_bridge_sha256() {
+  read_marker_value token_bridge_sha256
+}
+
+file_sha256() {
+  local path="$1"
+  "${sha256sum}" "${path}" | "${awk}" 'NR == 1 { print $1 }'
+}
+
 binary_version() {
   build_clean_env
   "${clean_env[@]}" "${install_dir}/bin/Runner.Listener" --version 2>/dev/null | /usr/bin/head -n 1
@@ -192,12 +206,18 @@ verify_installation() {
   [ -x "${install_dir}/config.sh" ] || die 'Actions runner config.sh is missing or non-executable'
   [ -x "${install_dir}/run.sh" ] || die 'Actions runner run.sh is missing or non-executable'
   [ -x "${install_dir}/bin/Runner.Listener" ] || die 'Actions runner listener binary is missing or non-executable'
+  [ -f "${installed_token_bridge}" ] && [ ! -L "${installed_token_bridge}" ] \
+    || die 'installed runner token bridge is missing or unsafe'
 
-  local version digest actual_version
+  local version digest bridge_digest actual_bridge_digest actual_version
   version="$(installed_version)" || die 'installation marker has no version'
   digest="$(installed_sha256)" || die 'installation marker has no package SHA-256'
+  bridge_digest="$(installed_token_bridge_sha256)" || die 'installation marker has no token-bridge SHA-256'
   validate_version "${version}"
   validate_sha256 "${digest}"
+  validate_sha256 "${bridge_digest}"
+  actual_bridge_digest="$(file_sha256 "${installed_token_bridge}")"
+  [ "${actual_bridge_digest}" = "${bridge_digest}" ] || die 'installed token bridge differs from the reviewed marker'
   actual_version="$(binary_version)"
   [ "${actual_version}" = "${version}" ] || die 'installed runner binary version differs from the reviewed marker'
 }
@@ -221,23 +241,28 @@ archive_is_safe() {
 install_runner() {
   parse_install_args "$@"
   assert_guest_boundary
+  [ -f "${source_token_bridge}" ] && [ ! -L "${source_token_bridge}" ] \
+    || die 'reviewed token bridge source is missing or unsafe'
 
   if [ -e "${install_dir}" ] || [ -L "${install_dir}" ]; then
     verify_installation
     if [ "$(installed_version)" = "${requested_version}" ] \
       && [ "$(installed_sha256)" = "${requested_sha256}" ]; then
-      printf '{"schema_version":1,"operation":"install","disposition":"already_installed","version":"%s","package_sha256":"%s"}\n' \
-        "${requested_version}" "${requested_sha256}"
+      printf '{"schema_version":1,"operation":"install","disposition":"already_installed","version":"%s","package_sha256":"%s","token_bridge_sha256":"%s"}\n' \
+        "${requested_version}" "${requested_sha256}" "$(installed_token_bridge_sha256)"
       return 0
     fi
     die 'a different Actions runner installation already exists; update requires a separately reviewed replacement'
   fi
 
   umask 077
-  local temp archive list url lock_dir install_created published
-  lock_dir="${expected_home}/.smolrunner-actions-runner-install.lock"
-  "${mkdir}" "${lock_dir}" 2>/dev/null || die 'another listener installation operation is active or left recovery debt'
+  local temp archive list url lock_dir install_created published bridge_digest
   temp="$(${mktemp} -d "${expected_home}/.smolrunner-actions-runner.XXXXXX")"
+  lock_dir="${expected_home}/.smolrunner-actions-runner-install.lock"
+  if ! "${mkdir}" "${lock_dir}" 2>/dev/null; then
+    "${rm}" -rf -- "${temp}"
+    die 'another listener installation operation is active or left recovery debt'
+  fi
   archive="${temp}/runner.tar.gz"
   list="${temp}/archive.list"
   install_created=0
@@ -274,23 +299,19 @@ install_runner() {
   [ "$("${clean_env[@]}" "${install_dir}/bin/Runner.Listener" --version 2>/dev/null | /usr/bin/head -n 1)" = "${requested_version}" ] \
     || die 'downloaded runner binary version differs from the reviewed version'
 
-  printf 'version=%s\nsha256=%s\n' "${requested_version}" "${requested_sha256}" >"${marker}"
+  "${cp}" -- "${source_token_bridge}" "${installed_token_bridge}"
+  "${chmod}" 0700 "${installed_token_bridge}"
+  bridge_digest="$(file_sha256 "${installed_token_bridge}")"
+  validate_sha256 "${bridge_digest}"
+
+  printf 'version=%s\nsha256=%s\ntoken_bridge_sha256=%s\n' \
+    "${requested_version}" "${requested_sha256}" "${bridge_digest}" >"${marker}"
   "${chmod}" 0600 "${marker}"
   verify_installation
   published=1
 
-  printf '{"schema_version":1,"operation":"install","disposition":"installed","version":"%s","package_sha256":"%s","auto_update":false}\n' \
-    "${requested_version}" "${requested_sha256}"
-}
-
-read_secret_token() {
-  secret_token=""
-  IFS= read -r secret_token || die 'expected one short-lived GitHub runner token on stdin'
-  [ -n "${secret_token}" ] || die 'GitHub runner token is empty'
-  [ "${#secret_token}" -le 4096 ] || die 'GitHub runner token exceeds the bounded input length'
-  case "${secret_token}" in
-    *$'\r'*|*$'\n'*|*$'\t'*) die 'GitHub runner token contains unsupported control whitespace' ;;
-  esac
+  printf '{"schema_version":1,"operation":"install","disposition":"installed","version":"%s","package_sha256":"%s","token_bridge_sha256":"%s","auto_update":false}\n' \
+    "${requested_version}" "${requested_sha256}" "${bridge_digest}"
 }
 
 register_runner() {
@@ -303,12 +324,11 @@ register_runner() {
     return 0
   fi
 
-  read_secret_token
   build_clean_env
   local status
   set +e
   "${clean_env[@]}" \
-    "ACTIONS_RUNNER_INPUT_TOKEN=${secret_token}" \
+    /bin/bash "${installed_token_bridge}" \
     "${install_dir}/config.sh" \
       --unattended \
       --url "${repository_url}" \
@@ -318,7 +338,6 @@ register_runner() {
       --disableupdate
   status=$?
   set -e
-  secret_token=""
   [ "${status}" -eq 0 ] || return "${status}"
   [ -f "${install_dir}/.runner" ] || die 'runner configuration returned success without registration state'
 
@@ -345,16 +364,14 @@ remove_runner() {
     return 0
   fi
 
-  read_secret_token
   build_clean_env
   local status
   set +e
   "${clean_env[@]}" \
-    "ACTIONS_RUNNER_INPUT_TOKEN=${secret_token}" \
+    /bin/bash "${installed_token_bridge}" \
     "${install_dir}/config.sh" remove --unattended
   status=$?
   set -e
-  secret_token=""
   [ "${status}" -eq 0 ] || return "${status}"
   [ ! -f "${install_dir}/.runner" ] || die 'runner removal returned success but registration state remains'
 
@@ -371,8 +388,9 @@ status_runner() {
   verify_installation
   local registered=false
   [ -f "${install_dir}/.runner" ] && registered=true
-  printf '{"schema_version":1,"installed":true,"registered":%s,"version":"%s","package_sha256":"%s","name":"%s","label":"%s","auto_update":false}\n' \
-    "${registered}" "$(installed_version)" "$(installed_sha256)" "${runner_name}" "${custom_label}"
+  printf '{"schema_version":1,"installed":true,"registered":%s,"version":"%s","package_sha256":"%s","token_bridge_sha256":"%s","name":"%s","label":"%s","auto_update":false}\n' \
+    "${registered}" "$(installed_version)" "$(installed_sha256)" "$(installed_token_bridge_sha256)" \
+    "${runner_name}" "${custom_label}"
 }
 
 check_runner() {
@@ -387,7 +405,7 @@ check_runner() {
 
 print_contract() {
   cat <<'JSON'
-{"schema_version":1,"contract":"smolrunner-local-actions-listener","user":"smolrunner-runner","repository":"teamleaderleo/smolrunner","runner_name":"smolrunner-local-arm64","custom_label":"smolrunner-local-arm64","default_labels":["self-hosted","linux","ARM64"],"installation":{"source":"actions/runner","platform":"linux-arm64","exact_version_required":true,"sha256_required":true,"auto_update":false},"registration":{"token_source":"stdin_to_secret_environment","persistent_token":false,"service_install":false},"execution":{"environment":"allowlist","rootless_podman_required":true,"privileged_groups":false},"trust":{"forks":"deny","trigger":"operator"}}
+{"schema_version":1,"contract":"smolrunner-local-actions-listener","user":"smolrunner-runner","repository":"teamleaderleo/smolrunner","runner_name":"smolrunner-local-arm64","custom_label":"smolrunner-local-arm64","default_labels":["self-hosted","linux","ARM64"],"installation":{"source":"actions/runner","platform":"linux-arm64","exact_version_required":true,"sha256_required":true,"token_bridge_pinned":true,"auto_update":false},"registration":{"token_source":"stdin_to_installed_bridge_to_secret_environment","persistent_token":false,"token_in_argv":false,"service_install":false},"execution":{"environment":"allowlist","rootless_podman_required":true,"privileged_groups":false},"trust":{"forks":"deny","trigger":"operator"}}
 JSON
 }
 
