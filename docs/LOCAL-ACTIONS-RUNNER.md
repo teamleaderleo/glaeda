@@ -51,13 +51,14 @@ bash scripts/local-actions-runner.sh install \
 The install path is fixed below `/home/smolrunner-runner`. The helper:
 
 - downloads only from the official `actions/runner` release URL derived from the exact version;
-- starts from a scrubbed environment;
+- starts network/runtime probes from a scrubbed environment;
 - verifies the supplied SHA-256 before extraction;
 - rejects absolute or parent-traversing archive paths;
 - refuses archive-contained registration state or credentials;
 - verifies `config.sh`, `run.sh`, and `Runner.Listener`;
 - proves the extracted listener reports the requested version;
-- records only version and package SHA-256 in a private installation marker;
+- copies the reviewed token bridge into the private installation and records its exact SHA-256;
+- records only runner version, runner package SHA-256, and token-bridge SHA-256 in the private installation marker;
 - removes an unpublished partial install on failure;
 - treats a different pre-existing installation as an explicit update/recovery case.
 
@@ -67,7 +68,9 @@ The helper does not run `installdependencies.sh` with privilege and does not ins
 
 Use GitHub's repository runner-add flow for `teamleaderleo/smolrunner` at activation time. Keep the registration token outside files, shell history, issue comments, workflow YAML, environment files, and repository state.
 
-Registration reads exactly one token line from standard input. The wrapper places it only in the official runner's supported `ACTIONS_RUNNER_INPUT_TOKEN` environment input for the `config.sh` child. The upstream runner consumes and clears that secret input. The token is never passed as a command-line `--token` argument by SmolRunner's helper.
+Registration reads exactly one token line from standard input. The helper launches the **installed, SHA-pinned** `.smolrunner-token-bridge.sh` under the scrubbed listener environment. That bridge reads the token from stdin, validates its bounded form, exports the official runner's supported `ACTIONS_RUNNER_INPUT_TOKEN` variable in-process, clears the shell variable, and `exec`s only the fixed `/home/smolrunner-runner/actions-runner/config.sh` path.
+
+The token therefore never appears in the helper's or bridge's command-line arguments. The upstream runner consumes and clears its secret environment input during configuration.
 
 One operator pattern is to copy the short-lived token into a shell variable without echo and pipe it once:
 
@@ -109,11 +112,14 @@ The first slice intentionally has no systemd service. Keep the terminal/session 
 
 ## 6. Run the manual canary
 
-After R0 and the canary workflow are merged and the exact runner appears idle/online with the expected labels, manually dispatch `Local verification canary`.
+After R0 and the canary workflow are merged and the exact runner appears idle/online with the expected labels, manually dispatch `Local verification canary` **from the `main` workflow ref** with one exact main-history commit.
+
+The first canary deliberately accepts only source already reachable from the exact main control commit. Feature-branch and fork source remain outside the personal runner until a later reviewed trusted-branch policy exists.
 
 The canary must prove:
 
-- exact workflow source commit/tree;
+- exact main workflow-control identity;
+- exact requested source commit/tree and main-history ancestry;
 - exact approved listener-side verification-wrapper blob before execution;
 - the prebuilt reviewed local CI image exists;
 - dependency preparation is the only networked project phase;
@@ -135,7 +141,7 @@ To unregister it, obtain a fresh short-lived removal token and pipe it to:
 printf '%s\n' "$runner_remove_token" | bash scripts/local-actions-runner.sh remove
 ```
 
-Removal unregisters the GitHub runner and retains the installed package, private cache volumes, and SmolRunner account state. Package deletion, account deletion, cache deletion, and VM deletion remain separate actions with their own ownership checks.
+Removal uses the same installed, digest-checked token bridge. It unregisters the GitHub runner and retains the installed package, private cache volumes, and SmolRunner account state. Package deletion, account deletion, cache deletion, and VM deletion remain separate actions with their own ownership checks.
 
 Inspect local state at any time with:
 
@@ -143,4 +149,4 @@ Inspect local state at any time with:
 bash scripts/local-actions-runner.sh status
 ```
 
-The public helper receipts expose the exact runner package identity and registration disposition without exposing tokens, credentials, private filesystem paths, or runner credential files.
+The public helper receipts expose the exact runner package identity, installed token-bridge identity, and registration disposition without exposing tokens, credentials, private filesystem paths, or runner credential files.
