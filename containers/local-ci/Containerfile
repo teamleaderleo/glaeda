@@ -1,0 +1,12 @@
+FROM docker.io/library/rust:1.97.1-bookworm
+
+RUN rustup component add clippy rustfmt
+
+WORKDIR /workspace
+ENV CARGO_HOME=/cargo \
+    CARGO_TARGET_DIR=/target \
+    HOME=/cargo
+
+LABEL org.opencontainers.image.title="SmolRunner local verification" \
+      org.opencontainers.image.description="Toolchain image for the bounded personal-Mac verification lane" \
+      org.opencontainers.image.source="https://github.com/teamleaderleo/smolrunner"
