@@ -22,8 +22,10 @@ printf '%s\n' "${contract}" | jq -e '
   .installation.platform == "linux-arm64" and
   .installation.exact_version_required == true and
   .installation.sha256_required == true and
+  .installation.token_bridge_blob_pinned == true and
   .installation.token_bridge_pinned == true and
   .installation.auto_update == false and
+  .registration.identity_fields_verified == true and
   .registration.token_source == "stdin_to_installed_bridge_to_secret_environment" and
   .registration.persistent_token == false and
   .registration.token_in_argv == false and
@@ -59,9 +61,16 @@ for required in \
   'expected_user="smolrunner-runner"' \
   'repository_url="https://github.com/teamleaderleo/smolrunner"' \
   'custom_label="smolrunner-local-arm64"' \
+  'expected_token_bridge_blob="08c6efa27c3faf40729056c4d797317054058565"' \
+  'hash-object --no-filters' \
   'actions/runner/releases/download/v${requested_version}/actions-runner-linux-arm64-${requested_version}.tar.gz' \
   '"${sha256sum}" --check --status -' \
   'token_bridge_sha256=' \
+  'verify_registration_identity' \
+  '(.AgentName // .agentName // "") == $expected_name' \
+  '(.GitHubUrl // .gitHubUrl // "") == $expected_url' \
+  '(.WorkFolder // .workFolder // "") == $expected_work' \
+  '(.DisableUpdate // .disableUpdate // false) == true' \
   '/bin/bash "${installed_token_bridge}"' \
   '--labels "${custom_label}"' \
   '--disableupdate' \
@@ -79,6 +88,7 @@ do
 done
 
 for required in \
+  'umask 077' \
   'expected_config="/home/smolrunner-runner/actions-runner/config.sh"' \
   'IFS= read -r secret_token' \
   'export ACTIONS_RUNNER_INPUT_TOKEN="${secret_token}"' \
