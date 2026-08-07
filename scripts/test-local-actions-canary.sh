@@ -18,9 +18,13 @@ for required in \
   'runs-on: [self-hosted, linux, ARM64, smolrunner-local-arm64]' \
   'contents: read' \
   'persist-credentials: false' \
+  'fetch-depth: 0' \
   'actions/checkout@11d5960a326750d5838078e36cf38b85af677262' \
   'SOURCE_COMMIT: ${{ inputs.commit }}' \
+  'CONTROL_SHA: ${{ github.sha }}' \
   '[[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]' \
+  '/usr/bin/git cat-file -e "${CONTROL_SHA}^{commit}"' \
+  '/usr/bin/git merge-base --is-ancestor "$commit" "$CONTROL_SHA"' \
   "expected_wrapper_blob='ce493a2a7e7230f90db5ceb8b90d1fa6f9d5305f'" \
   '/usr/bin/git hash-object -- scripts/local-ci-verify.sh' \
   '/bin/bash scripts/local-ci-verify.sh prepare' \
