@@ -2,6 +2,11 @@ name: Local verification canary
 
 on:
   workflow_dispatch:
+    inputs:
+      commit:
+        description: Exact 40-hex SmolRunner commit to verify
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -12,45 +17,54 @@ concurrency:
 
 jobs:
   canary:
-    if: github.repository == 'teamleaderleo/smolrunner' && github.event_name == 'workflow_dispatch'
+    if: >-
+      github.repository == 'teamleaderleo/smolrunner' &&
+      github.event_name == 'workflow_dispatch' &&
+      github.ref == 'refs/heads/main'
     runs-on: [self-hosted, linux, ARM64, smolrunner-local-arm64]
     timeout-minutes: 45
 
     steps:
-      - name: Check out exact dispatched source
+      - name: Validate immutable source request
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        env:
+          SOURCE_COMMIT: ${{ inputs.commit }}
+        run: |
+          [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+
+      - name: Check out exact requested source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ inputs.commit }}
           persist-credentials: false
           clean: true
           show-progress: false
 
       - name: Bind immutable source identity
         id: source
-        shell: bash
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        env:
+          SOURCE_COMMIT: ${{ inputs.commit }}
         run: |
-          set -euo pipefail
           commit="$(/usr/bin/git rev-parse --verify HEAD)"
           tree="$(/usr/bin/git rev-parse --verify 'HEAD^{tree}')"
-          test "$commit" = "$GITHUB_SHA"
+          test "$commit" = "$SOURCE_COMMIT"
           test -z "$(/usr/bin/git status --porcelain=v1 --untracked-files=all)"
           printf 'commit=%s\n' "$commit" >> "$GITHUB_OUTPUT"
           printf 'tree=%s\n' "$tree" >> "$GITHUB_OUTPUT"
 
       - name: Prove reviewed local verification wrapper
-        shell: bash
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
         run: |
-          set -euo pipefail
           expected_wrapper_blob='ce493a2a7e7230f90db5ceb8b90d1fa6f9d5305f'
           actual_wrapper_blob="$(/usr/bin/git hash-object -- scripts/local-ci-verify.sh)"
           test "$actual_wrapper_blob" = "$expected_wrapper_blob"
 
       - name: Validate fixed local verification contract
-        shell: bash
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
         run: |
-          set -euo pipefail
-          bash scripts/local-ci-verify.sh contract \
-            | jq -e '
+          /bin/bash scripts/local-ci-verify.sh contract \
+            | /usr/bin/jq -e '
                 .schema_version == 1 and
                 .contract == "smolrunner.required-local" and
                 .concurrency == 1 and
@@ -63,23 +77,20 @@ jobs:
               ' >/dev/null
 
       - name: Require prebuilt local verification image
-        shell: bash
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
         run: |
-          set -euo pipefail
           /usr/bin/podman image exists localhost/smolrunner-local-ci:rust-1.97.1-v1
 
       - name: Prepare locked dependency cache
-        shell: bash
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
         run: |
-          set -euo pipefail
-          bash scripts/local-ci-verify.sh prepare \
+          /bin/bash scripts/local-ci-verify.sh prepare \
             --commit '${{ steps.source.outputs.commit }}' \
             --tree '${{ steps.source.outputs.tree }}'
 
       - name: Verify offline in rootless Podman
-        shell: bash
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
         run: |
-          set -euo pipefail
-          bash scripts/local-ci-verify.sh verify \
+          /bin/bash scripts/local-ci-verify.sh verify \
             --commit '${{ steps.source.outputs.commit }}' \
             --tree '${{ steps.source.outputs.tree }}'
