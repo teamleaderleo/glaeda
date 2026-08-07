@@ -3,9 +3,11 @@ set -euo pipefail
 
 repo_root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 helper="${repo_root}/scripts/local-actions-runner.sh"
+token_bridge="${repo_root}/scripts/local-actions-token-bridge.sh"
 manifest="${repo_root}/examples/local-ci-runner.yml"
 
 bash -n "${helper}"
+bash -n "${token_bridge}"
 
 contract="$(bash "${helper}" contract)"
 printf '%s\n' "${contract}" | jq -e '
@@ -20,9 +22,11 @@ printf '%s\n' "${contract}" | jq -e '
   .installation.platform == "linux-arm64" and
   .installation.exact_version_required == true and
   .installation.sha256_required == true and
+  .installation.token_bridge_pinned == true and
   .installation.auto_update == false and
-  .registration.token_source == "stdin_to_secret_environment" and
+  .registration.token_source == "stdin_to_installed_bridge_to_secret_environment" and
   .registration.persistent_token == false and
+  .registration.token_in_argv == false and
   .registration.service_install == false and
   .execution.environment == "allowlist" and
   .execution.rootless_podman_required == true and
@@ -57,7 +61,8 @@ for required in \
   'custom_label="smolrunner-local-arm64"' \
   'actions/runner/releases/download/v${requested_version}/actions-runner-linux-arm64-${requested_version}.tar.gz' \
   '"${sha256sum}" --check --status -' \
-  'ACTIONS_RUNNER_INPUT_TOKEN=${secret_token}' \
+  'token_bridge_sha256=' \
+  '/bin/bash "${installed_token_bridge}"' \
   '--labels "${custom_label}"' \
   '--disableupdate' \
   'clean_env=(' \
@@ -69,6 +74,19 @@ for required in \
 do
   grep -F -- "${required}" "${helper}" >/dev/null || {
     printf 'missing listener boundary: %s\n' "${required}" >&2
+    exit 1
+  }
+done
+
+for required in \
+  'expected_config="/home/smolrunner-runner/actions-runner/config.sh"' \
+  'IFS= read -r secret_token' \
+  'export ACTIONS_RUNNER_INPUT_TOKEN="${secret_token}"' \
+  'unset secret_token' \
+  'exec "${config}" "$@"'
+do
+  grep -F -- "${required}" "${token_bridge}" >/dev/null || {
+    printf 'missing token-bridge boundary: %s\n' "${required}" >&2
     exit 1
   }
 done
@@ -86,14 +104,14 @@ for forbidden in \
   'DOCKER_HOST=' \
   'PODMAN_HOST='
 do
-  if grep -F -- "${forbidden}" "${helper}" >/dev/null; then
+  if grep -F -- "${forbidden}" "${helper}" "${token_bridge}" >/dev/null; then
     printf 'forbidden listener authority found: %s\n' "${forbidden}" >&2
     exit 1
   fi
 done
 
-if grep -Eq '^[[:space:]]*(sudo|doas)([[:space:]]|$)' "${helper}"; then
-  printf 'listener helper unexpectedly contains a privilege-elevation command\n' >&2
+if grep -Eq '^[[:space:]]*(sudo|doas)([[:space:]]|$)' "${helper}" "${token_bridge}"; then
+  printf 'listener control unexpectedly contains a privilege-elevation command\n' >&2
   exit 1
 fi
 
