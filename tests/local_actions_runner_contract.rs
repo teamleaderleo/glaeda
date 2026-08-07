@@ -47,8 +47,10 @@ fn local_listener_contract_is_bounded_and_token_argv_free() {
     assert_eq!(contract["installation"]["platform"], "linux-arm64");
     assert_eq!(contract["installation"]["exact_version_required"], true);
     assert_eq!(contract["installation"]["sha256_required"], true);
+    assert_eq!(contract["installation"]["token_bridge_blob_pinned"], true);
     assert_eq!(contract["installation"]["token_bridge_pinned"], true);
     assert_eq!(contract["installation"]["auto_update"], false);
+    assert_eq!(contract["registration"]["identity_fields_verified"], true);
     assert_eq!(
         contract["registration"]["token_source"],
         "stdin_to_installed_bridge_to_secret_environment"
@@ -66,9 +68,16 @@ fn local_listener_contract_is_bounded_and_token_argv_free() {
     let bridge = fs::read_to_string(&bridge_path).expect("read token bridge");
 
     for required in [
+        "expected_token_bridge_blob=\"08c6efa27c3faf40729056c4d797317054058565\"",
+        "hash-object --no-filters",
         "actions/runner/releases/download/v${requested_version}/actions-runner-linux-arm64-${requested_version}.tar.gz",
         "--check --status -",
         "token_bridge_sha256=",
+        "verify_registration_identity",
+        "(.AgentName // .agentName // \"\") == $expected_name",
+        "(.GitHubUrl // .gitHubUrl // \"\") == $expected_url",
+        "(.WorkFolder // .workFolder // \"\") == $expected_work",
+        "(.DisableUpdate // .disableUpdate // false) == true",
         "installed_token_bridge",
         "--labels",
         "--disableupdate",
@@ -82,6 +91,7 @@ fn local_listener_contract_is_bounded_and_token_argv_free() {
     }
 
     for required in [
+        "umask 077",
         "expected_config=\"/home/smolrunner-runner/actions-runner/config.sh\"",
         "IFS= read -r secret_token",
         "export ACTIONS_RUNNER_INPUT_TOKEN=\"${secret_token}\"",
