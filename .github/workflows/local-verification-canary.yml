@@ -30,12 +30,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          commit="$(git rev-parse --verify HEAD)"
-          tree="$(git rev-parse --verify 'HEAD^{tree}')"
+          commit="$(/usr/bin/git rev-parse --verify HEAD)"
+          tree="$(/usr/bin/git rev-parse --verify 'HEAD^{tree}')"
           test "$commit" = "$GITHUB_SHA"
-          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          test -z "$(/usr/bin/git status --porcelain=v1 --untracked-files=all)"
           printf 'commit=%s\n' "$commit" >> "$GITHUB_OUTPUT"
           printf 'tree=%s\n' "$tree" >> "$GITHUB_OUTPUT"
+
+      - name: Prove reviewed local verification wrapper
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_wrapper_blob='ce493a2a7e7230f90db5ceb8b90d1fa6f9d5305f'
+          actual_wrapper_blob="$(/usr/bin/git hash-object -- scripts/local-ci-verify.sh)"
+          test "$actual_wrapper_blob" = "$expected_wrapper_blob"
 
       - name: Validate fixed local verification contract
         shell: bash
