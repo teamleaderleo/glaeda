@@ -263,9 +263,7 @@ mod tests {
     }
 
     fn output_with_idle_nanos(nanos: u128) -> String {
-        format!(
-            "+-o IOHIDSystem  <class IOHIDSystem>\n  |   \"HIDIdleTime\" = {nanos}\n"
-        )
+        format!("+-o IOHIDSystem  <class IOHIDSystem>\n  |   \"HIDIdleTime\" = {nanos}\n")
     }
 
     #[test]
@@ -342,15 +340,10 @@ mod tests {
 
     #[test]
     fn command_failure_becomes_unknown_evidence() {
-        let report = observe_macos_operator_activity(
-            &FakeExecutor::missing(),
-            1_000,
-            1_001,
-            30_000,
-            30_000,
-        )
-        .expect("observation")
-        .into_report();
+        let report =
+            observe_macos_operator_activity(&FakeExecutor::missing(), 1_000, 1_001, 30_000, 30_000)
+                .expect("observation")
+                .into_report();
 
         assert_eq!(report.activity, OperatorActivityState::Unknown);
         assert_eq!(report.idle_millis, None);
@@ -400,9 +393,7 @@ mod tests {
     #[test]
     fn debug_redacts_raw_evidence() {
         let observation = observe_macos_operator_activity(
-            &FakeExecutor::success(
-                "  |   \"HIDIdleTime\" = 1000000\nPRIVATE_RAW_IOREG_SENTINEL\n",
-            ),
+            &FakeExecutor::success("  |   \"HIDIdleTime\" = 1000000\nPRIVATE_RAW_IOREG_SENTINEL\n"),
             1_000,
             1_001,
             30_000,

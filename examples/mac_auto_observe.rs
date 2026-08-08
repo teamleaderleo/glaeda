@@ -1,5 +1,5 @@
 use std::error::Error;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
 use smolrunner::macos_operator_activity::{
@@ -9,11 +9,11 @@ use smolrunner::macos_operator_activity::{
 use smolrunner::macos_resource_observation::{
     DEFAULT_FRESHNESS_WINDOW_MILLIS, observe_macos_resources,
 };
-use smolrunner::process::ShellFreeExecutor;
+use smolrunner::process::ProcessExecutor;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let now_millis = current_epoch_millis()?;
-    let executor = ShellFreeExecutor::new(Duration::from_secs(5), 524_288);
+    let executor = ProcessExecutor;
 
     let activity = observe_macos_operator_activity(
         &executor,

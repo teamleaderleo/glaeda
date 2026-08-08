@@ -4,8 +4,8 @@ use serde::Serialize;
 
 pub use crate::mac_auto_availability::{
     DesiredLimaProfile, LocalDispatchDecision, MacAdmissionClass, MacAutoAvailabilityPlan,
-    MacAutoAvailabilityPolicy, MacAutoReason, MacAutoReasonKind, MacJobTrust, OperatorActivityState,
-    WORK_PROFILE,
+    MacAutoAvailabilityPolicy, MacAutoReason, MacAutoReasonKind, MacJobTrust,
+    OperatorActivityState, WORK_PROFILE,
 };
 use crate::mac_auto_availability::{
     MacAutoAvailabilityError, MacAutoAvailabilityObservation, MacQueuedJob,
@@ -304,7 +304,10 @@ mod tests {
         let idle = plan_mac_auto_controller(MacAutoAvailabilityPolicy::initial(), facts)
             .expect("idle plan");
         assert_eq!(idle.policy.resolved_mode, EffectiveAvailabilityMode::Away);
-        assert_eq!(idle.policy.dispatch, Some(LocalDispatchDecision::QueueLocal));
+        assert_eq!(
+            idle.policy.dispatch,
+            Some(LocalDispatchDecision::QueueLocal)
+        );
     }
 
     #[test]
@@ -320,8 +323,8 @@ mod tests {
             requested_memory_bytes: INITIAL_LOCAL_JOB_MEMORY_BYTES,
         });
 
-        let plan = plan_mac_auto_controller(MacAutoAvailabilityPolicy::initial(), facts)
-            .expect("plan");
+        let plan =
+            plan_mac_auto_controller(MacAutoAvailabilityPolicy::initial(), facts).expect("plan");
 
         assert_eq!(plan.local_resource_fit, Some(false));
         assert_eq!(
@@ -339,8 +342,8 @@ mod tests {
         facts.operator_activity = OperatorActivityState::Unknown;
         facts.operator_idle_millis = None;
 
-        let plan = plan_mac_auto_controller(MacAutoAvailabilityPolicy::initial(), facts)
-            .expect("plan");
+        let plan =
+            plan_mac_auto_controller(MacAutoAvailabilityPolicy::initial(), facts).expect("plan");
 
         assert_eq!(plan.policy.admission, MacAdmissionClass::None);
         assert_eq!(
@@ -355,8 +358,8 @@ mod tests {
         let mut facts = observation();
         facts.host_power = HostPowerSource::Unknown;
 
-        let plan = plan_mac_auto_controller(MacAutoAvailabilityPolicy::initial(), facts)
-            .expect("plan");
+        let plan =
+            plan_mac_auto_controller(MacAutoAvailabilityPolicy::initial(), facts).expect("plan");
 
         assert_eq!(plan.policy.admission, MacAdmissionClass::None);
         assert_eq!(
@@ -372,8 +375,8 @@ mod tests {
         facts.operator_activity = OperatorActivityState::Unknown;
         facts.operator_idle_millis = None;
 
-        let plan = plan_mac_auto_controller(MacAutoAvailabilityPolicy::initial(), facts)
-            .expect("plan");
+        let plan =
+            plan_mac_auto_controller(MacAutoAvailabilityPolicy::initial(), facts).expect("plan");
 
         assert_eq!(plan.policy.admission, MacAdmissionClass::Light);
         assert_eq!(plan.local_resource_fit, Some(true));

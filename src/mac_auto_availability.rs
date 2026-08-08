@@ -384,7 +384,10 @@ fn validate_observation(
             "decision time cannot precede the last effective-mode transition",
         ));
     }
-    if observation.battery_percent.is_some_and(|percent| percent > 100) {
+    if observation
+        .battery_percent
+        .is_some_and(|percent| percent > 100)
+    {
         return Err(MacAutoAvailabilityError::new(
             "battery_percent",
             "invalid_battery_percent",
@@ -414,7 +417,9 @@ fn validate_observation(
             ));
         }
         OperatorActivityState::Active
-            if observation.operator_idle_millis.is_some_and(|idle| idle > 0) =>
+            if observation
+                .operator_idle_millis
+                .is_some_and(|idle| idle > 0) =>
         {
             return Err(MacAutoAvailabilityError::new(
                 "operator_idle_millis",
@@ -803,9 +808,9 @@ fn push_reason(reasons: &mut Vec<MacAutoReason>, kind: MacAutoReasonKind, messag
 #[cfg(test)]
 mod tests {
     use super::{
-        DesiredLimaProfile, LocalDispatchDecision, MacAdmissionClass, MacAutoAvailabilityObservation,
-        MacAutoAvailabilityPolicy, MacJobTrust, MacQueuedJob, OperatorActivityState,
-        plan_mac_auto_availability,
+        DesiredLimaProfile, LocalDispatchDecision, MacAdmissionClass,
+        MacAutoAvailabilityObservation, MacAutoAvailabilityPolicy, MacJobTrust, MacQueuedJob,
+        OperatorActivityState, plan_mac_auto_availability,
     };
     use crate::mac_availability::{
         AvailabilityActionKind, AvailabilityDisposition, AvailabilityRequest,
@@ -856,15 +861,22 @@ mod tests {
 
     #[test]
     fn active_operator_keeps_interactive_and_runs_one_light_job() {
-        let plan = plan_mac_auto_availability(policy(), observation(EffectiveAvailabilityMode::Active))
-            .expect("plan");
+        let plan =
+            plan_mac_auto_availability(policy(), observation(EffectiveAvailabilityMode::Active))
+                .expect("plan");
 
         assert_eq!(plan.resolved_mode, EffectiveAvailabilityMode::Active);
         assert_eq!(plan.desired_profile, DesiredLimaProfile::Interactive);
         assert_eq!(plan.admission, MacAdmissionClass::Light);
         assert_eq!(plan.dispatch, Some(LocalDispatchDecision::RunLocalNow));
-        assert_eq!(plan.transition.disposition, AvailabilityDisposition::NoChange);
-        assert_eq!(plan.desired_vm_profile.expect("profile").memory_mib, 3 * 1024);
+        assert_eq!(
+            plan.transition.disposition,
+            AvailabilityDisposition::NoChange
+        );
+        assert_eq!(
+            plan.desired_vm_profile.expect("profile").memory_mib,
+            3 * 1024
+        );
     }
 
     #[test]
@@ -884,8 +896,14 @@ mod tests {
         assert_eq!(plan.admission, MacAdmissionClass::Work);
         assert_eq!(plan.dispatch, Some(LocalDispatchDecision::QueueLocal));
         assert_eq!(plan.next_action, Some(AvailabilityActionKind::DrainRunner));
-        assert_eq!(plan.desired_vm_profile.expect("profile").memory_mib, 10 * 1024);
-        assert_eq!(plan.transition.target_profile.expect("profile").memory_mib, 10 * 1024);
+        assert_eq!(
+            plan.desired_vm_profile.expect("profile").memory_mib,
+            10 * 1024
+        );
+        assert_eq!(
+            plan.transition.target_profile.expect("profile").memory_mib,
+            10 * 1024
+        );
     }
 
     #[test]
@@ -919,7 +937,10 @@ mod tests {
         assert_eq!(plan.resolved_mode, EffectiveAvailabilityMode::Active);
         assert_eq!(plan.admission, MacAdmissionClass::Light);
         assert_eq!(plan.dispatch, Some(LocalDispatchDecision::QueueLocal));
-        assert_eq!(plan.transition.disposition, AvailabilityDisposition::Blocked);
+        assert_eq!(
+            plan.transition.disposition,
+            AvailabilityDisposition::Blocked
+        );
         assert!(plan.next_action.is_none());
     }
 
@@ -947,7 +968,10 @@ mod tests {
 
         assert_eq!(plan.resolved_mode, EffectiveAvailabilityMode::Active);
         assert_eq!(plan.admission, MacAdmissionClass::None);
-        assert_eq!(plan.dispatch, Some(LocalDispatchDecision::OverflowRecommended));
+        assert_eq!(
+            plan.dispatch,
+            Some(LocalDispatchDecision::OverflowRecommended)
+        );
     }
 
     #[test]
@@ -966,7 +990,10 @@ mod tests {
 
         assert_eq!(plan.resolved_mode, EffectiveAvailabilityMode::Active);
         assert_eq!(plan.admission, MacAdmissionClass::None);
-        assert_eq!(plan.dispatch, Some(LocalDispatchDecision::OverflowRecommended));
+        assert_eq!(
+            plan.dispatch,
+            Some(LocalDispatchDecision::OverflowRecommended)
+        );
     }
 
     #[test]
@@ -1038,7 +1065,10 @@ mod tests {
         let plan = plan_mac_auto_availability(policy(), facts).expect("plan");
 
         assert_eq!(plan.resolved_mode, EffectiveAvailabilityMode::Active);
-        assert_eq!(plan.dispatch, Some(LocalDispatchDecision::OverflowRecommended));
+        assert_eq!(
+            plan.dispatch,
+            Some(LocalDispatchDecision::OverflowRecommended)
+        );
     }
 
     #[test]
@@ -1056,7 +1086,10 @@ mod tests {
 
         assert_eq!(plan.resolved_mode, EffectiveAvailabilityMode::Active);
         assert_eq!(plan.admission, MacAdmissionClass::None);
-        assert_eq!(plan.dispatch, Some(LocalDispatchDecision::OverflowRecommended));
+        assert_eq!(
+            plan.dispatch,
+            Some(LocalDispatchDecision::OverflowRecommended)
+        );
     }
 
     #[test]
@@ -1075,7 +1108,10 @@ mod tests {
         facts.memory_pressure = MemoryPressure::Elevated;
         let blocked = plan_mac_auto_availability(policy(), facts).expect("blocked plan");
         assert_eq!(blocked.resolved_mode, EffectiveAvailabilityMode::Away);
-        assert_eq!(blocked.transition.disposition, AvailabilityDisposition::Blocked);
+        assert_eq!(
+            blocked.transition.disposition,
+            AvailabilityDisposition::Blocked
+        );
         assert_eq!(blocked.admission, MacAdmissionClass::None);
     }
 
@@ -1088,7 +1124,10 @@ mod tests {
 
         assert_eq!(plan.resolved_mode, EffectiveAvailabilityMode::Active);
         assert_eq!(plan.admission, MacAdmissionClass::None);
-        assert_eq!(plan.dispatch, Some(LocalDispatchDecision::OverflowRecommended));
+        assert_eq!(
+            plan.dispatch,
+            Some(LocalDispatchDecision::OverflowRecommended)
+        );
         assert!(plan.next_action.is_none());
     }
 
@@ -1102,7 +1141,10 @@ mod tests {
 
         let plan = plan_mac_auto_availability(policy(), facts).expect("plan");
 
-        assert_eq!(plan.dispatch, Some(LocalDispatchDecision::OverflowRecommended));
+        assert_eq!(
+            plan.dispatch,
+            Some(LocalDispatchDecision::OverflowRecommended)
+        );
     }
 
     #[test]
@@ -1118,7 +1160,10 @@ mod tests {
 
         let plan = plan_mac_auto_availability(policy(), facts).expect("plan");
 
-        assert_eq!(plan.dispatch, Some(LocalDispatchDecision::OverflowRecommended));
+        assert_eq!(
+            plan.dispatch,
+            Some(LocalDispatchDecision::OverflowRecommended)
+        );
     }
 
     #[test]
@@ -1132,8 +1177,9 @@ mod tests {
 
     #[test]
     fn json_contract_is_bounded_and_contains_no_application_identity() {
-        let plan = plan_mac_auto_availability(policy(), observation(EffectiveAvailabilityMode::Active))
-            .expect("plan");
+        let plan =
+            plan_mac_auto_availability(policy(), observation(EffectiveAvailabilityMode::Active))
+                .expect("plan");
         let json = serde_json::to_string(&plan).expect("serialize");
 
         assert!(json.contains("\"schema_version\":1"));
