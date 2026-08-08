@@ -14,7 +14,11 @@ fn assert_bash_syntax(path: &Path) {
         .arg(path)
         .status()
         .expect("run bash syntax check");
-    assert!(status.success(), "bash syntax failed for {}", path.display());
+    assert!(
+        status.success(),
+        "bash syntax failed for {}",
+        path.display()
+    );
 }
 
 #[test]
@@ -87,7 +91,10 @@ fn local_listener_contract_is_bounded_and_token_argv_free() {
         "assert_subordinate_ids",
         "assert_no_privileged_groups",
     ] {
-        assert!(helper.contains(required), "missing helper contract: {required}");
+        assert!(
+            helper.contains(required),
+            "missing helper contract: {required}"
+        );
     }
 
     for required in [
@@ -98,7 +105,10 @@ fn local_listener_contract_is_bounded_and_token_argv_free() {
         "unset secret_token",
         "exec \"${config}\" \"$@\"",
     ] {
-        assert!(bridge.contains(required), "missing token bridge contract: {required}");
+        assert!(
+            bridge.contains(required),
+            "missing token bridge contract: {required}"
+        );
     }
 
     for forbidden in [
@@ -168,6 +178,9 @@ fn local_listener_manifest_keeps_trust_and_resource_limits_explicit() {
         "forks: deny",
         "trigger: operator",
     ] {
-        assert!(manifest.contains(required), "missing manifest contract: {required}");
+        assert!(
+            manifest.contains(required),
+            "missing manifest contract: {required}"
+        );
     }
 }
