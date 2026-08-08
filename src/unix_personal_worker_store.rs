@@ -1,3 +1,4 @@
+use std::fmt;
 use std::fs::File;
 use std::io::{Read as _, Write as _};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
@@ -53,6 +54,42 @@ pub struct UnixPersonalWorkerStore {
     owner: (u32, u32),
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub enum PersonalWorkerStoreReadOnlyInspection {
+    Missing,
+    Current(PersonalWorkerStoreDocument),
+    RecoveryRequired {
+        revision: PersonalWorkerStoreRevision,
+    },
+}
+
+impl fmt::Debug for PersonalWorkerStoreReadOnlyInspection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Missing => formatter.write_str("Missing"),
+            Self::Current(document) => formatter
+                .debug_struct("Current")
+                .field("revision", &document.revision())
+                .finish(),
+            Self::RecoveryRequired { revision } => formatter
+                .debug_struct("RecoveryRequired")
+                .field("revision", revision)
+                .finish(),
+        }
+    }
+}
+
+impl PersonalWorkerStoreReadOnlyInspection {
+    #[must_use]
+    pub const fn revision(&self) -> Option<PersonalWorkerStoreRevision> {
+        match self {
+            Self::Missing => None,
+            Self::Current(document) => Some(document.revision()),
+            Self::RecoveryRequired { revision } => Some(*revision),
+        }
+    }
+}
+
 impl UnixPersonalWorkerStore {
     pub fn open_or_create(
         root_path: impl AsRef<Path>,
@@ -91,6 +128,39 @@ impl UnixPersonalWorkerStore {
             directory,
             owner,
         })
+    }
+
+    /// Inspect one existing store without creating, recovering, cleaning, or publishing state.
+    ///
+    /// A nonblocking shared lock makes the current/staged classification atomic with respect to
+    /// cooperative writers while preserving this operation's read-only authority.
+    pub fn inspect_read_only(
+        &self,
+    ) -> Result<PersonalWorkerStoreReadOnlyInspection, PersonalWorkerStoreError> {
+        let _lock = self.acquire_read_lock()?;
+        match self.recovery_plan()? {
+            StoreRecoveryPlan::Clean { revision: None } => {
+                Ok(PersonalWorkerStoreReadOnlyInspection::Missing)
+            }
+            StoreRecoveryPlan::Clean {
+                revision: Some(revision),
+            } => {
+                let document = self.load_named(CURRENT_DOCUMENT)?.ok_or_else(|| {
+                    PersonalWorkerStoreError::new(
+                        PersonalWorkerStoreErrorKind::CorruptState,
+                        "durable personal worker state changed during read-only inspection",
+                    )
+                })?;
+                if document.revision() != revision {
+                    return Err(PersonalWorkerStoreError::corrupt_state());
+                }
+                Ok(PersonalWorkerStoreReadOnlyInspection::Current(document))
+            }
+            StoreRecoveryPlan::PublishStaged { revision, .. }
+            | StoreRecoveryPlan::RemoveStaleStaged { revision } => {
+                Ok(PersonalWorkerStoreReadOnlyInspection::RecoveryRequired { revision })
+            }
+        }
     }
 
     /// Create the exact initial document only when no current or staged state exists.
@@ -242,6 +312,28 @@ impl UnixPersonalWorkerStore {
 
     fn acquire_mutation_lock(&self) -> Result<StoreMutationLock, PersonalWorkerStoreError> {
         acquire_mutation_lock_in(&self.directory, self.owner)
+    }
+
+    fn acquire_read_lock(&self) -> Result<StoreReadLock, PersonalWorkerStoreError> {
+        let lock = fs::openat(
+            &self.directory,
+            STORE_LOCK_FILE,
+            EXISTING_FILE_FLAGS,
+            Mode::empty(),
+        )
+        .map_err(map_existing_initialization_lock_open_error)?;
+        inspect_private_file(&lock, self.owner, "personal worker store lock", Some(0))?;
+        match fs::flock(&lock, FlockOperation::NonBlockingLockShared) {
+            Ok(()) => Ok(StoreReadLock { _lock: lock }),
+            Err(Errno::AGAIN) => Err(store_error(
+                PersonalWorkerStoreErrorKind::Busy,
+                "another personal worker store mutation holds the writer lock",
+            )),
+            Err(_) => Err(store_error(
+                PersonalWorkerStoreErrorKind::Io,
+                "could not acquire the personal worker store reader lock",
+            )),
+        }
     }
 
     fn load_named(
@@ -516,6 +608,11 @@ enum StoreRecoveryPlan {
 
 #[derive(Debug)]
 struct StoreMutationLock {
+    _lock: OwnedFd,
+}
+
+#[derive(Debug)]
+struct StoreReadLock {
     _lock: OwnedFd,
 }
 
