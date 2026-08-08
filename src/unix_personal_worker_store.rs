@@ -111,13 +111,16 @@ impl UnixPersonalWorkerStore {
             .map_err(map_root_open_error)?;
         let root_stat = inspect_directory(&root, "personal worker state root", None)?;
         let owner = (root_stat.st_uid, root_stat.st_gid);
-        let directory = open_or_publish_initialization_directory(&root, owner)?;
+        let (directory, publication_lock) = open_or_publish_initialization_directory(&root, owner)?;
         let store = Self {
             _root: root,
             directory,
             owner,
         };
-        let _lock = store.acquire_mutation_lock()?;
+        let _lock = match publication_lock {
+            Some(lock) => lock,
+            None => store.acquire_mutation_lock()?,
+        };
         match store.recovery_plan()? {
             StoreRecoveryPlan::Clean {
                 revision: Some(revision),
@@ -148,25 +151,7 @@ impl UnixPersonalWorkerStore {
     }
 
     fn acquire_mutation_lock(&self) -> Result<StoreMutationLock, PersonalWorkerStoreError> {
-        let lock = fs::openat(
-            &self.directory,
-            STORE_LOCK_FILE,
-            EXISTING_LOCK_FLAGS,
-            Mode::empty(),
-        )
-        .map_err(map_lock_open_error)?;
-        inspect_private_file(&lock, self.owner, "personal worker store lock", Some(0))?;
-        match fs::flock(&lock, FlockOperation::NonBlockingLockExclusive) {
-            Ok(()) => Ok(StoreMutationLock { _lock: lock }),
-            Err(Errno::AGAIN) => Err(store_error(
-                PersonalWorkerStoreErrorKind::Busy,
-                "another personal worker store mutation holds the writer lock",
-            )),
-            Err(_) => Err(store_error(
-                PersonalWorkerStoreErrorKind::Io,
-                "could not acquire the personal worker store writer lock",
-            )),
-        }
+        acquire_mutation_lock_in(&self.directory, self.owner)
     }
 
     fn load_named(
@@ -438,6 +423,31 @@ struct StoreMutationLock {
     _lock: OwnedFd,
 }
 
+fn acquire_mutation_lock_in(
+    directory: &OwnedFd,
+    owner: (u32, u32),
+) -> Result<StoreMutationLock, PersonalWorkerStoreError> {
+    let lock = fs::openat(
+        directory,
+        STORE_LOCK_FILE,
+        EXISTING_LOCK_FLAGS,
+        Mode::empty(),
+    )
+    .map_err(map_lock_open_error)?;
+    inspect_private_file(&lock, owner, "personal worker store lock", Some(0))?;
+    match fs::flock(&lock, FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => Ok(StoreMutationLock { _lock: lock }),
+        Err(Errno::AGAIN) => Err(store_error(
+            PersonalWorkerStoreErrorKind::Busy,
+            "another personal worker store mutation holds the writer lock",
+        )),
+        Err(_) => Err(store_error(
+            PersonalWorkerStoreErrorKind::Io,
+            "could not acquire the personal worker store writer lock",
+        )),
+    }
+}
+
 struct StagedDocument<'a> {
     directory: BorrowedFd<'a>,
     file: Option<OwnedFd>,
@@ -553,9 +563,9 @@ fn ensure_lock_file(
 fn open_or_publish_initialization_directory(
     root: &OwnedFd,
     owner: (u32, u32),
-) -> Result<OwnedFd, PersonalWorkerStoreError> {
+) -> Result<(OwnedFd, Option<StoreMutationLock>), PersonalWorkerStoreError> {
     match open_existing_initialization_directory(root, owner) {
-        Ok(directory) => return Ok(directory),
+        Ok(directory) => return Ok((directory, None)),
         Err(error) if error.kind() != PersonalWorkerStoreErrorKind::Missing => return Err(error),
         Err(_) => {}
     }
@@ -590,6 +600,7 @@ fn open_or_publish_initialization_directory(
         Some(owner),
     )?;
     ensure_lock_file(&directory, owner)?;
+    let publication_lock = acquire_mutation_lock_in(&directory, owner)?;
     synchronize_directory(
         &directory,
         "private personal worker initialization directory",
@@ -606,12 +617,13 @@ fn open_or_publish_initialization_directory(
             staged.armed = false;
             synchronize_directory(root, "personal worker state root")?;
             inspect_directory(&directory, "personal worker store directory", Some(owner))?;
-            Ok(directory)
+            Ok((directory, Some(publication_lock)))
         }
         Err(Errno::EXIST) => {
+            drop(publication_lock);
             drop(directory);
             drop(staged);
-            open_existing_initialization_directory(root, owner)
+            open_existing_initialization_directory(root, owner).map(|directory| (directory, None))
         }
         Err(_) => Err(store_error(
             PersonalWorkerStoreErrorKind::Io,
