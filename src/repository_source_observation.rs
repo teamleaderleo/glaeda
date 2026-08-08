@@ -154,18 +154,22 @@ impl RepositorySourceObserver {
             return Err(unavailable());
         }
 
-        let first = self.snapshot(&checkout, SnapshotPhase::First, executor)?;
-        if first.top_level != checkout {
-            return Err(unavailable());
-        }
-        if first.repository != *expected_repository {
-            return Err(identity_mismatch());
-        }
+        let first = self.snapshot(
+            &checkout,
+            expected_repository,
+            SnapshotPhase::First,
+            executor,
+        )?;
         if !first.clean {
             return Err(dirty());
         }
 
-        let second = self.snapshot(&checkout, SnapshotPhase::Second, executor)?;
+        let second = self.snapshot(
+            &checkout,
+            expected_repository,
+            SnapshotPhase::Second,
+            executor,
+        )?;
         if second != first {
             return Err(source_changed());
         }
@@ -181,16 +185,42 @@ impl RepositorySourceObserver {
     fn snapshot(
         &self,
         checkout: &Path,
+        expected_repository: &RepositoryRef,
         phase: SnapshotPhase,
         executor: &impl TimedCommandExecutor,
     ) -> Result<RepositorySnapshot, RepositorySourceObservationError> {
         let top_level = self.git(checkout, &["rev-parse", "--show-toplevel"], executor)?;
         require_success(&top_level, phase)?;
         let top_level = parse_for_phase(parse_top_level(&top_level.stdout), phase)?;
+        if top_level != checkout {
+            return Err(if phase == SnapshotPhase::Second {
+                source_changed()
+            } else {
+                unavailable()
+            });
+        }
 
         let branch = self.git(checkout, &["symbolic-ref", "--quiet", "HEAD"], executor)?;
         require_success(&branch, phase)?;
         let branch = parse_for_phase(parse_branch(&branch.stdout), phase)?;
+
+        let local_config = self.git(
+            checkout,
+            &["config", "--no-includes", "--null", "--list"],
+            executor,
+        )?;
+        let local_config = parse_for_phase(parse_local_config(&local_config), phase)?;
+        if local_config.repository != *expected_repository {
+            return Err(if phase == SnapshotPhase::Second {
+                source_changed()
+            } else {
+                identity_mismatch()
+            });
+        }
+
+        let index_modes = self.git(checkout, &["ls-files", "--format=%(objectmode)"], executor)?;
+        require_success(&index_modes, phase)?;
+        parse_for_phase(refuse_gitlinks(&index_modes.stdout), phase)?;
 
         let commit = self.git(
             checkout,
@@ -216,13 +246,8 @@ impl RepositorySourceObserver {
             phase,
         )?;
 
-        let local_config = self.git(
-            checkout,
-            &["config", "--no-includes", "--null", "--list"],
-            executor,
-        )?;
-        let local_config = parse_for_phase(parse_local_config(&local_config), phase)?;
-
+        // Gitlinks were refused from index-only evidence above. Ignoring submodules here prevents
+        // status from recursively reading a nested repository's separate executable Git config.
         let status = self.git(
             checkout,
             &[
@@ -230,7 +255,7 @@ impl RepositorySourceObserver {
                 "--porcelain=v1",
                 "-z",
                 "--untracked-files=all",
-                "--ignore-submodules=none",
+                "--ignore-submodules=all",
             ],
             executor,
         )?;
@@ -269,6 +294,7 @@ impl RepositorySourceObserver {
             .environment("GIT_CONFIG_NOSYSTEM", "1")
             .environment("GIT_CONFIG_GLOBAL", "/dev/null")
             .environment("GIT_NO_REPLACE_OBJECTS", "1")
+            .environment("GIT_NO_LAZY_FETCH", "1")
             .environment("GIT_TERMINAL_PROMPT", "0")
             .environment("GIT_ASKPASS", "/bin/false")
             .environment("GIT_ALLOW_PROTOCOL", "file")
@@ -392,6 +418,20 @@ fn parse_single_line(value: &str) -> Result<&str, RepositorySourceObservationErr
     }
 }
 
+fn refuse_gitlinks(value: &str) -> Result<(), RepositorySourceObservationError> {
+    if !value.is_empty() && !value.ends_with('\n') {
+        return Err(unavailable());
+    }
+    for mode in value.lines() {
+        match mode {
+            "100644" | "100755" | "120000" => {}
+            "160000" => return Err(unavailable()),
+            _ => return Err(unavailable()),
+        }
+    }
+    Ok(())
+}
+
 fn parse_local_config(
     record: &ExecutionRecord,
 ) -> Result<LocalConfigObservation, RepositorySourceObservationError> {
@@ -415,6 +455,9 @@ fn parse_local_config(
         if canonical_key.starts_with("include.")
             || canonical_key.starts_with("includeif.")
             || canonical_key.starts_with("filter.")
+            || canonical_key.starts_with("url.")
+                && (canonical_key.ends_with(".insteadof")
+                    || canonical_key.ends_with(".pushinsteadof"))
         {
             return Err(unavailable());
         }

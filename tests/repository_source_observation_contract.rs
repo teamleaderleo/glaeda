@@ -163,9 +163,10 @@ fn snapshot(root: &Path, remote: &str) -> Vec<ScriptedResponse> {
     vec![
         ScriptedResponse::success(format!("{}\n", root.display())),
         ScriptedResponse::success("refs/heads/main\n"),
+        ScriptedResponse::success(remote),
+        ScriptedResponse::success("100644\n100755\n120000\n"),
         ScriptedResponse::success(format!("{COMMIT}\n")),
         ScriptedResponse::success(format!("{TREE}\n")),
-        ScriptedResponse::success(remote),
         ScriptedResponse::success(""),
     ]
 }
@@ -193,21 +194,22 @@ fn clean_exact_source_uses_two_fixed_credentialless_snapshots() {
     assert_eq!(observation.source().commit.as_str(), COMMIT);
     assert_eq!(observation.source().tree.as_str(), TREE);
     assert_eq!(observation.cleanliness(), RepositoryCleanliness::Clean);
-    assert_eq!(executor.command_count(), 12);
+    assert_eq!(executor.command_count(), 14);
 
     let commands = executor.commands.borrow();
     let expected_suffixes = [
         ["rev-parse", "--show-toplevel"].as_slice(),
         ["symbolic-ref", "--quiet", "HEAD"].as_slice(),
+        ["config", "--no-includes", "--null", "--list"].as_slice(),
+        ["ls-files", "--format=%(objectmode)"].as_slice(),
         ["rev-parse", "--verify", "HEAD^{commit}"].as_slice(),
         ["rev-parse", "--verify", "HEAD^{tree}"].as_slice(),
-        ["config", "--no-includes", "--null", "--list"].as_slice(),
         [
             "status",
             "--porcelain=v1",
             "-z",
             "--untracked-files=all",
-            "--ignore-submodules=none",
+            "--ignore-submodules=all",
         ]
         .as_slice(),
     ];
@@ -229,6 +231,7 @@ fn clean_exact_source_uses_two_fixed_credentialless_snapshots() {
                 ("GIT_ASKPASS", "/bin/false"),
                 ("GIT_CONFIG_GLOBAL", "/dev/null"),
                 ("GIT_CONFIG_NOSYSTEM", "1"),
+                ("GIT_NO_LAZY_FETCH", "1"),
                 ("GIT_NO_REPLACE_OBJECTS", "1"),
                 ("GIT_PROTOCOL_FROM_USER", "0"),
                 ("GIT_TERMINAL_PROMPT", "0"),
@@ -304,6 +307,24 @@ fn production_executor_observes_a_disposable_local_git_fixture() {
     assert_eq!(observation.source().commit.as_str().len(), 40);
     assert_eq!(observation.source().tree.as_str().len(), 40);
 
+    for rewrite_key in [
+        "url.file:///private/repository/.insteadOf",
+        "url.file:///private/repository/.pushInsteadOf",
+    ] {
+        run_fixture_git(
+            checkout.path(),
+            &["config", rewrite_key, "https://github.com/"],
+        );
+        let error = observer()
+            .observe(checkout.path(), &profile(), &ProcessExecutor)
+            .expect_err("effective URL rewrites must fail before object resolution");
+        assert_eq!(
+            error.kind(),
+            RepositorySourceObservationErrorKind::RepositoryUnavailable
+        );
+        run_fixture_git(checkout.path(), &["config", "--unset-all", rewrite_key]);
+    }
+
     let marker = checkout.path().join("filter-command-ran");
     let filter_command = format!("/usr/bin/touch {}", marker.display());
     run_fixture_git(
@@ -328,6 +349,90 @@ fn production_executor_observes_a_disposable_local_git_fixture() {
         RepositorySourceObservationErrorKind::RepositoryUnavailable
     );
     assert!(!marker.exists(), "Git filter command must never execute");
+}
+
+#[test]
+fn initialized_submodule_filters_are_never_recursively_executed() {
+    let git = Path::new("/usr/bin/git");
+    if !git.is_file() {
+        return;
+    }
+    let child = TempCheckout::new("submodule-child");
+    run_fixture_git(child.path(), &["init", "-b", "main"]);
+    run_fixture_git(child.path(), &["config", "user.name", "SmolRunner Test"]);
+    run_fixture_git(
+        child.path(),
+        &["config", "user.email", "smolrunner@example.invalid"],
+    );
+    fs::write(
+        child.path().join(".gitattributes"),
+        b"*.txt filter=hidden\n",
+    )
+    .expect("write submodule attributes");
+    fs::write(
+        child.path().join("nested.txt"),
+        b"committed nested source\n",
+    )
+    .expect("write nested source");
+    run_fixture_git(child.path(), &["add", ".gitattributes", "nested.txt"]);
+    run_fixture_git(child.path(), &["commit", "-m", "nested fixture"]);
+
+    let checkout = TempCheckout::new("submodule-parent");
+    run_fixture_git(checkout.path(), &["init", "-b", "main"]);
+    run_fixture_git(checkout.path(), &["config", "user.name", "SmolRunner Test"]);
+    run_fixture_git(
+        checkout.path(),
+        &["config", "user.email", "smolrunner@example.invalid"],
+    );
+    run_fixture_git(
+        checkout.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/teamleaderleo/smolrunner.git",
+        ],
+    );
+    run_fixture_git(
+        checkout.path(),
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            child.path().to_str().expect("UTF-8 child path"),
+            "nested",
+        ],
+    );
+    run_fixture_git(checkout.path(), &["commit", "-am", "parent fixture"]);
+
+    let nested = checkout.path().join("nested");
+    let marker = checkout.path().join("nested-filter-command-ran");
+    let filter_command = format!("/usr/bin/touch {}", marker.display());
+    run_fixture_git(&nested, &["config", "extensions.worktreeConfig", "true"]);
+    run_fixture_git(
+        &nested,
+        &[
+            "config",
+            "--worktree",
+            "filter.hidden.clean",
+            &filter_command,
+        ],
+    );
+    fs::write(nested.join("nested.txt"), b"modified nested source\n")
+        .expect("modify nested worktree");
+
+    let error = observer()
+        .observe(checkout.path(), &profile(), &ProcessExecutor)
+        .expect_err("gitlinks are refused before recursive worktree inspection");
+    assert_eq!(
+        error.kind(),
+        RepositorySourceObservationErrorKind::RepositoryUnavailable
+    );
+    assert!(
+        !marker.exists(),
+        "nested Git filter command must never execute"
+    );
 }
 
 fn run_fixture_git(checkout: &Path, arguments: &[&str]) {
@@ -411,32 +516,37 @@ fn profile_detached_unborn_dirty_and_identity_refusals_are_exact() {
             RepositorySourceObservationErrorKind::RepositoryUnavailable,
         ),
         (
-            2,
+            4,
             ScriptedResponse::failed(128),
             RepositorySourceObservationErrorKind::RepositoryUnavailable,
         ),
         (
-            2,
+            4,
             ScriptedResponse::success(format!("{}\n", "A".repeat(40))),
             RepositorySourceObservationErrorKind::RepositoryUnavailable,
         ),
         (
-            3,
+            5,
             ScriptedResponse::success("2222222\n"),
             RepositorySourceObservationErrorKind::RepositoryUnavailable,
         ),
         (
-            4,
+            3,
+            ScriptedResponse::success("100644\n160000\n"),
+            RepositorySourceObservationErrorKind::RepositoryUnavailable,
+        ),
+        (
+            2,
             ScriptedResponse::success("user.name\nSmolRunner Test\0"),
             RepositorySourceObservationErrorKind::RepositoryIdentityMismatch,
         ),
         (
-            4,
+            2,
             ScriptedResponse::success("remote.origin.url\nhttps://github.com/example/other.git\0"),
             RepositorySourceObservationErrorKind::RepositoryIdentityMismatch,
         ),
         (
-            5,
+            6,
             ScriptedResponse::success("?? private-file\0"),
             RepositorySourceObservationErrorKind::RepositoryDirty,
         ),
@@ -463,9 +573,17 @@ fn profile_detached_unborn_dirty_and_identity_refusals_are_exact() {
             "remote.origin.url\nhttps://github.com/teamleaderleo/smolrunner.git\0",
             "include.path\n/private/included-config\0"
         ),
+        concat!(
+            "remote.origin.url\nhttps://github.com/teamleaderleo/smolrunner.git\0",
+            "url.file:///private/repository/.insteadOf\nhttps://github.com/\0"
+        ),
+        concat!(
+            "remote.origin.url\nhttps://github.com/teamleaderleo/smolrunner.git\0",
+            "url.file:///private/repository/.pushInsteadOf\nhttps://github.com/\0"
+        ),
     ] {
         let mut responses = clean_script(checkout.path());
-        responses[4] = ScriptedResponse::success(unsafe_config);
+        responses[2] = ScriptedResponse::success(unsafe_config);
         let executor = ScriptedExecutor::new(responses);
         let error = observer()
             .observe(checkout.path(), &profile(), &executor)
@@ -474,7 +592,7 @@ fn profile_detached_unborn_dirty_and_identity_refusals_are_exact() {
             error.kind(),
             RepositorySourceObservationErrorKind::RepositoryUnavailable
         );
-        assert_eq!(executor.command_count(), 5);
+        assert_eq!(executor.command_count(), 3);
     }
 }
 
@@ -482,30 +600,31 @@ fn profile_detached_unborn_dirty_and_identity_refusals_are_exact() {
 fn every_second_snapshot_identity_or_cleanliness_change_is_source_drift() {
     let checkout = TempCheckout::new("drift");
     let changes = [
-        (6, ScriptedResponse::success("/different/absolute/root\n")),
-        (7, ScriptedResponse::success("refs/heads/other\n")),
+        (7, ScriptedResponse::success("/different/absolute/root\n")),
+        (8, ScriptedResponse::success("refs/heads/other\n")),
         (
-            8,
+            11,
             ScriptedResponse::success(format!("{}\n", "3".repeat(40))),
         ),
         (
-            9,
+            12,
             ScriptedResponse::success(format!("{}\n", "4".repeat(40))),
         ),
         (
-            10,
+            9,
             ScriptedResponse::success("remote.origin.url\nhttps://github.com/example/other.git\0"),
         ),
-        (7, ScriptedResponse::success("HEAD\n")),
+        (8, ScriptedResponse::success("HEAD\n")),
+        (10, ScriptedResponse::success("100644\n160000\n")),
         (
-            8,
+            11,
             ScriptedResponse::success(format!("{}\n", "A".repeat(40))),
         ),
         (
-            10,
+            9,
             ScriptedResponse::success("remote.origin.url\nfile:///private/repository\0"),
         ),
-        (11, ScriptedResponse::success(" M private-file\0")),
+        (13, ScriptedResponse::success(" M private-file\0")),
     ];
     for (index, response) in changes {
         let mut responses = clean_script(checkout.path());
@@ -524,7 +643,7 @@ fn every_second_snapshot_identity_or_cleanliness_change_is_source_drift() {
     }
 
     let mut responses = clean_script(checkout.path());
-    responses[10] = ScriptedResponse::success(
+    responses[9] = ScriptedResponse::success(
         "remote.origin.url\ngit@github.com:teamleaderleo/smolrunner.git\0",
     );
     let error = observer()
