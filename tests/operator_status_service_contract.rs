@@ -666,6 +666,18 @@ fn stale_broken_and_incompatible_evidence_become_deduplicated_blockers() {
     assert!(codes.contains(&OperatorErrorCode::LimaBroken));
     assert!(codes.contains(&OperatorErrorCode::LimaObservationStale));
     assert!(codes.contains(&OperatorErrorCode::RunnerObservationStale));
+
+    let error = OperatorStatusService::compose(OperatorStatusServiceEvidence::new(
+        config.clone(),
+        OperatorConfigurationCompatibility::Compatible,
+        OperatorStatusWorkerEvidence::new(status_read(&config), None, None),
+        lima(LimaRuntimeState::Stopped),
+        runner(ActionsRunnerReadinessState::Offline),
+        110,
+        vec![OperatorPublicError::from_code(OperatorErrorCode::ServiceUnavailable,); 17],
+    ))
+    .expect_err("unbounded blocker input");
+    assert_eq!(error.kind(), OperatorStatusServiceErrorKind::InvalidStatus);
 }
 
 #[test]

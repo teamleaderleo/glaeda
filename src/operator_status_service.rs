@@ -13,9 +13,9 @@ use crate::lima_observation::{
 use crate::operator_config::OperatorConfig;
 use crate::operator_error::{OperatorErrorCode, OperatorPublicError};
 use crate::operator_status::{
-    OperatorActiveJobSummary, OperatorConfigurationCompatibility, OperatorConfigurationStatus,
-    OperatorMachineSummary, OperatorStatusReport, OperatorTerminalResult, OperatorTerminalSummary,
-    OperatorWorkerSummary,
+    MAX_OPERATOR_STATUS_BLOCKERS, OperatorActiveJobSummary, OperatorConfigurationCompatibility,
+    OperatorConfigurationStatus, OperatorMachineSummary, OperatorStatusReport,
+    OperatorTerminalResult, OperatorTerminalSummary, OperatorWorkerSummary,
 };
 use crate::personal_worker_operator_read::{
     PersonalWorkerOperatorJobRead, PersonalWorkerOperatorStatusRead,
@@ -280,6 +280,12 @@ impl OperatorStatusService {
         validate_job_shape(&evidence)?;
         validate_machine_identity(&evidence)?;
         validate_timing(&evidence)?;
+        if evidence.blockers.len() > MAX_OPERATOR_STATUS_BLOCKERS {
+            return Err(OperatorStatusServiceError::new(
+                OperatorStatusServiceErrorKind::InvalidStatus,
+                OperatorErrorCode::ServiceUnavailable,
+            ));
+        }
 
         let worker = OperatorWorkerSummary::from_status(evidence.worker.status().view());
         let active_job = evidence
