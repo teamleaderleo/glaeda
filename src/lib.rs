@@ -87,10 +87,14 @@ pub mod macos_resource_observation;
 pub mod manifest;
 /// Pure schema-versioned personal-worker operator configuration and public identity.
 pub mod operator_config;
+/// Private-path-safe discovery and atomic persistence of operator configuration.
+pub mod operator_config_store;
 /// Closed public operator error, retry, remediation, dependency, approval, and command vocabulary.
 pub mod operator_error;
 /// Pure unified personal-worker operator status report and human renderer.
 pub mod operator_status;
+/// Typed, read-only aggregation of one coherent operator status evidence bundle.
+pub mod operator_status_service;
 pub mod ownership;
 /// Pure composition of durable queue, Lima lifecycle, and runner-readiness evidence.
 pub mod personal_worker_host_broker;
@@ -122,6 +126,8 @@ pub mod renderprove_protected_mount;
 pub mod renderprove_verification;
 pub mod renderprove_vision_profile;
 pub mod renderprove_vision_result;
+/// Credentialless, bounded observation of one immutable reviewed repository source.
+pub mod repository_source_observation;
 pub mod resource;
 #[cfg(target_os = "linux")]
 pub mod rootless_podman_config;
