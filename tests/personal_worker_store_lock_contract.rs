@@ -8,7 +8,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use rustix::fs::{FlockOperation, flock};
 use smolrunner::execution_admission::EpochMillis;
 use smolrunner::personal_worker_queue::{
-    PersonalWorkerProfile, PersonalWorkerQueueGeneration, PersonalWorkerQueueInput,
+    PersonalWorkerActivityEvidence, PersonalWorkerProfile, PersonalWorkerProfileObservation,
+    PersonalWorkerQueueGeneration, PersonalWorkerQueueInput,
 };
 use smolrunner::personal_worker_store::{
     PersonalWorkerStore, PersonalWorkerStoreDocument, PersonalWorkerStoreErrorKind,
@@ -55,8 +56,10 @@ fn empty_queue(generation: u64, observed_at: u64) -> PersonalWorkerQueueInput {
     PersonalWorkerQueueInput {
         generation: PersonalWorkerQueueGeneration::new(generation).expect("queue generation"),
         observed_at: time(observed_at),
-        current_profile: PersonalWorkerProfile::Interactive,
-        last_activity_at: time(observed_at - 1),
+        profile_observation: PersonalWorkerProfileObservation::observed(
+            PersonalWorkerProfile::Interactive,
+        ),
+        activity_evidence: PersonalWorkerActivityEvidence::observed(time(observed_at - 1)),
         queued: vec![],
         active: vec![],
         pending_profile_change: None,

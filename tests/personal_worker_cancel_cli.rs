@@ -16,10 +16,10 @@ use smolrunner::execution_admission::{
     ReservationGeneration, ReservationId, RunnerProfileId,
 };
 use smolrunner::personal_worker_queue::{
-    PersonalWorkerActiveReservation, PersonalWorkerCacheAccessMode, PersonalWorkerCacheNamespace,
-    PersonalWorkerCancellationState, PersonalWorkerJobRequest, PersonalWorkerPriority,
-    PersonalWorkerProfile, PersonalWorkerQueueGeneration, PersonalWorkerQueueInput,
-    PersonalWorkerSourceIdentity,
+    PersonalWorkerActiveReservation, PersonalWorkerActivityEvidence, PersonalWorkerCacheAccessMode,
+    PersonalWorkerCacheNamespace, PersonalWorkerCancellationState, PersonalWorkerJobRequest,
+    PersonalWorkerPriority, PersonalWorkerProfile, PersonalWorkerProfileObservation,
+    PersonalWorkerQueueGeneration, PersonalWorkerQueueInput, PersonalWorkerSourceIdentity,
 };
 use smolrunner::personal_worker_store::{
     PersonalWorkerDurableCacheLease, PersonalWorkerStore, PersonalWorkerStoreDocument,
@@ -112,8 +112,10 @@ fn queued_document() -> PersonalWorkerStoreDocument {
         PersonalWorkerQueueInput {
             generation: PersonalWorkerQueueGeneration::new(1).expect("queue generation"),
             observed_at: time(BASE),
-            current_profile: PersonalWorkerProfile::Interactive,
-            last_activity_at: time(BASE - 1_000),
+            profile_observation: PersonalWorkerProfileObservation::observed(
+                PersonalWorkerProfile::Interactive,
+            ),
+            activity_evidence: PersonalWorkerActivityEvidence::observed(time(BASE - 1_000)),
             queued: vec![request("queued-one", "example/queued", 'a')],
             active: vec![],
             pending_profile_change: None,
@@ -159,8 +161,10 @@ fn active_document() -> PersonalWorkerStoreDocument {
         PersonalWorkerQueueInput {
             generation: PersonalWorkerQueueGeneration::new(1).expect("queue generation"),
             observed_at: time(BASE),
-            current_profile: PersonalWorkerProfile::Work,
-            last_activity_at: time(BASE),
+            profile_observation: PersonalWorkerProfileObservation::observed(
+                PersonalWorkerProfile::Work,
+            ),
+            activity_evidence: PersonalWorkerActivityEvidence::observed(time(BASE)),
             queued: vec![],
             active: vec![PersonalWorkerActiveReservation {
                 request,
@@ -391,8 +395,8 @@ fn staged_successor_is_recovered_before_cancellation() {
             PersonalWorkerQueueInput {
                 generation: PersonalWorkerQueueGeneration::new(2).expect("queue generation"),
                 observed_at: time(BASE + 500),
-                current_profile: current.queue().current_profile,
-                last_activity_at: current.queue().last_activity_at,
+                profile_observation: current.queue().profile_observation,
+                activity_evidence: current.queue().activity_evidence,
                 queued: current.queue().queued.clone(),
                 active: current.queue().active.clone(),
                 pending_profile_change: current.queue().pending_profile_change,

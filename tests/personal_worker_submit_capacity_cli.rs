@@ -13,9 +13,10 @@ use smolrunner::execution_admission::{
     FallbackProfileEligibility, RunnerProfileId,
 };
 use smolrunner::personal_worker_queue::{
-    MAX_PERSONAL_WORKER_QUEUE_ENTRIES, PersonalWorkerCacheAccessMode, PersonalWorkerCacheNamespace,
-    PersonalWorkerCancellationState, PersonalWorkerJobRequest, PersonalWorkerPriority,
-    PersonalWorkerProfile, PersonalWorkerQueueGeneration, PersonalWorkerQueueInput,
+    MAX_PERSONAL_WORKER_QUEUE_ENTRIES, PersonalWorkerActivityEvidence,
+    PersonalWorkerCacheAccessMode, PersonalWorkerCacheNamespace, PersonalWorkerCancellationState,
+    PersonalWorkerJobRequest, PersonalWorkerPriority, PersonalWorkerProfile,
+    PersonalWorkerProfileObservation, PersonalWorkerQueueGeneration, PersonalWorkerQueueInput,
     PersonalWorkerSourceIdentity,
 };
 use smolrunner::personal_worker_store::{PersonalWorkerStore, PersonalWorkerStoreDocument};
@@ -97,8 +98,10 @@ fn full_queue_document() -> PersonalWorkerStoreDocument {
         PersonalWorkerQueueInput {
             generation: PersonalWorkerQueueGeneration::new(1).expect("queue generation"),
             observed_at: time(BASE),
-            current_profile: PersonalWorkerProfile::Interactive,
-            last_activity_at: time(BASE - 1_000),
+            profile_observation: PersonalWorkerProfileObservation::observed(
+                PersonalWorkerProfile::Interactive,
+            ),
+            activity_evidence: PersonalWorkerActivityEvidence::observed(time(BASE - 1_000)),
             queued,
             active: vec![],
             pending_profile_change: None,

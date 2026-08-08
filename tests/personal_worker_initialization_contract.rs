@@ -10,12 +10,14 @@ use std::thread;
 use rustix::fs::{FlockOperation, flock};
 use smolrunner::execution_admission::EpochMillis;
 use smolrunner::personal_worker_queue::{
-    PersonalWorkerProfile, PersonalWorkerQueueGeneration, PersonalWorkerQueueInput,
+    PersonalWorkerActivityEvidence, PersonalWorkerProfileObservation,
+    PersonalWorkerQueueGeneration, PersonalWorkerQueueInput,
 };
 use smolrunner::personal_worker_store::{
     PersonalWorkerStore, PersonalWorkerStoreDocument, PersonalWorkerStoreErrorKind,
-    PersonalWorkerStoreInitializationDisposition, decode_personal_worker_store_document,
-    encode_personal_worker_store_document,
+    PersonalWorkerStoreInitializationDisposition, PersonalWorkerStoreMigrationDisposition,
+    decode_personal_worker_store_document, encode_personal_worker_store_document,
+    migrate_personal_worker_store_v1_document,
 };
 use smolrunner::unix_personal_worker_store::UnixPersonalWorkerStore;
 
@@ -58,8 +60,8 @@ fn queue(generation: u64, observed_at: u64) -> PersonalWorkerQueueInput {
     PersonalWorkerQueueInput {
         generation: PersonalWorkerQueueGeneration::new(generation).expect("queue generation"),
         observed_at: time(observed_at),
-        current_profile: PersonalWorkerProfile::Interactive,
-        last_activity_at: time(observed_at),
+        profile_observation: PersonalWorkerProfileObservation::Unobserved,
+        activity_evidence: PersonalWorkerActivityEvidence::Never,
         queued: vec![],
         active: vec![],
         pending_profile_change: None,
@@ -81,7 +83,7 @@ fn top_level_store_version_is_distinct_from_corruption() {
         .expect("encode initial document");
     let mut incompatible: serde_json::Value =
         serde_json::from_slice(&encoded).expect("parse document");
-    incompatible["schema_version"] = serde_json::Value::from(2_u64);
+    incompatible["schema_version"] = serde_json::Value::from(3_u64);
     let incompatible_bytes =
         serde_json::to_vec(&incompatible).expect("encode incompatible document");
     assert_eq!(
@@ -95,6 +97,186 @@ fn top_level_store_version_is_distinct_from_corruption() {
             .expect_err("malformed state")
             .kind(),
         PersonalWorkerStoreErrorKind::CorruptState
+    );
+}
+
+fn canonical_v1_initial_document(observed_at: u64) -> Vec<u8> {
+    format!(
+        concat!(
+            "{{\n",
+            "  \"schema_version\": 1,\n",
+            "  \"revision\": 1,\n",
+            "  \"queue\": {{\n",
+            "    \"generation\": 1,\n",
+            "    \"observed_at\": {observed_at},\n",
+            "    \"current_profile\": \"interactive\",\n",
+            "    \"last_activity_at\": {observed_at},\n",
+            "    \"queued\": [],\n",
+            "    \"active\": [],\n",
+            "    \"pending_profile_change\": null\n",
+            "  }},\n",
+            "  \"cache_leases\": [],\n",
+            "  \"history\": []\n",
+            "}}\n"
+        ),
+        observed_at = observed_at
+    )
+    .into_bytes()
+}
+
+fn canonical_v1_revision_two_document(observed_at: u64) -> Vec<u8> {
+    format!(
+        concat!(
+            "{{\n",
+            "  \"schema_version\": 1,\n",
+            "  \"revision\": 2,\n",
+            "  \"queue\": {{\n",
+            "    \"generation\": 2,\n",
+            "    \"observed_at\": {observed_at},\n",
+            "    \"current_profile\": \"work\",\n",
+            "    \"last_activity_at\": {observed_at},\n",
+            "    \"queued\": [],\n",
+            "    \"active\": [],\n",
+            "    \"pending_profile_change\": null\n",
+            "  }},\n",
+            "  \"cache_leases\": [],\n",
+            "  \"history\": [\n",
+            "    {{\n",
+            "      \"revision\": 1,\n",
+            "      \"queue_generation\": 1,\n",
+            "      \"observed_at\": {previous_observed_at},\n",
+            "      \"queued_count\": 0,\n",
+            "      \"active_count\": 0,\n",
+            "      \"cache_lease_count\": 0,\n",
+            "      \"state_digest\": \"sha256:{digest}\"\n",
+            "    }}\n",
+            "  ]\n",
+            "}}\n"
+        ),
+        observed_at = observed_at,
+        previous_observed_at = observed_at - 1,
+        digest = "00".repeat(32),
+    )
+    .into_bytes()
+}
+
+#[test]
+fn v1_mapping_preserves_revision_generation_history_and_exact_observed_values() {
+    let v1 = canonical_v1_revision_two_document(1_900_000);
+    let migrated = migrate_personal_worker_store_v1_document(&v1).expect("map canonical v1");
+    assert_eq!(migrated.revision().get(), 2);
+    assert_eq!(migrated.queue().generation.get(), 2);
+    assert_eq!(migrated.queue().observed_at, time(1_900_000));
+    assert_eq!(
+        migrated.queue().profile_observation.profile(),
+        Some(smolrunner::personal_worker_queue::PersonalWorkerProfile::Work)
+    );
+    assert_eq!(
+        migrated.queue().activity_evidence.last_activity_at(),
+        Some(time(1_900_000))
+    );
+    assert_eq!(migrated.history().len(), 1);
+    assert_eq!(migrated.history()[0].revision().get(), 1);
+    assert_eq!(migrated.history()[0].queue_generation().get(), 1);
+    assert_eq!(migrated.history()[0].observed_at(), time(1_899_999));
+}
+
+#[test]
+fn explicit_v1_migration_preserves_evidence_and_replays_without_writes() {
+    let root = TempRoot::new("v1-migration");
+    let initial = initial_document(2_000_000);
+    UnixPersonalWorkerStore::initialize_if_clean(root.path(), &initial)
+        .expect("create store authority");
+    let current_path = root.store_directory().join("current.json");
+    let v1 = canonical_v1_initial_document(2_000_000);
+    write_private(&current_path, &v1);
+
+    let ordinary_read = UnixPersonalWorkerStore::open_existing_read_only(root.path())
+        .expect("open read-only store")
+        .load()
+        .expect_err("ordinary read must not migrate v1");
+    assert_eq!(
+        ordinary_read.kind(),
+        PersonalWorkerStoreErrorKind::VersionIncompatible
+    );
+
+    let receipt = UnixPersonalWorkerStore::migrate_v1(root.path()).expect("migrate v1");
+    assert_eq!(
+        receipt.disposition(),
+        PersonalWorkerStoreMigrationDisposition::Migrated
+    );
+    assert_eq!(receipt.from_schema_version(), 1);
+    assert_eq!(receipt.to_schema_version(), 2);
+    assert_eq!(receipt.revision().get(), 1);
+    assert_eq!(receipt.queue_generation().get(), 1);
+    assert!(receipt.bytes_written() > 0);
+
+    let migrated_bytes = fs::read(&current_path).expect("read migrated current");
+    let migrated =
+        decode_personal_worker_store_document(&migrated_bytes).expect("decode migrated current");
+    assert_eq!(
+        migrated.queue().profile_observation.profile(),
+        Some(smolrunner::personal_worker_queue::PersonalWorkerProfile::Interactive)
+    );
+    assert_eq!(
+        migrated.queue().activity_evidence.last_activity_at(),
+        Some(time(2_000_000))
+    );
+
+    let replay = UnixPersonalWorkerStore::migrate_v1(root.path()).expect("replay migration");
+    assert_eq!(
+        replay.disposition(),
+        PersonalWorkerStoreMigrationDisposition::AlreadyCurrent
+    );
+    assert_eq!(replay.bytes_written(), 0);
+    assert_eq!(
+        fs::read(&current_path).expect("re-read migrated current"),
+        migrated_bytes
+    );
+}
+
+#[test]
+fn explicit_v1_migration_publishes_only_the_exact_staged_candidate() {
+    let root = TempRoot::new("v1-staged-migration");
+    let initial = initial_document(2_100_000);
+    UnixPersonalWorkerStore::initialize_if_clean(root.path(), &initial)
+        .expect("create store authority");
+    let current_path = root.store_directory().join("current.json");
+    let stage_path = root.store_directory().join(".next.json");
+    let v1 = canonical_v1_initial_document(2_100_000);
+    write_private(&current_path, &v1);
+    let candidate = migrate_personal_worker_store_v1_document(&v1).expect("map v1 candidate");
+    let candidate_bytes = encode_personal_worker_store_document(&candidate).expect("encode v2");
+    write_private(&stage_path, &candidate_bytes);
+
+    let receipt = UnixPersonalWorkerStore::migrate_v1(root.path()).expect("publish exact stage");
+    assert_eq!(
+        receipt.disposition(),
+        PersonalWorkerStoreMigrationDisposition::Migrated
+    );
+    assert_eq!(receipt.bytes_written(), 0);
+    assert_eq!(
+        fs::read(&current_path).expect("read published current"),
+        candidate_bytes
+    );
+    assert!(!stage_path.exists());
+
+    write_private(&current_path, &v1);
+    write_private(&stage_path, b"foreign staged bytes");
+    let current_before = fs::read(&current_path).expect("read current before refusal");
+    let stage_before = fs::read(&stage_path).expect("read stage before refusal");
+    let refused = UnixPersonalWorkerStore::migrate_v1(root.path()).expect("classify foreign stage");
+    assert_eq!(
+        refused.disposition(),
+        PersonalWorkerStoreMigrationDisposition::RecoveryRequired
+    );
+    assert_eq!(
+        fs::read(&current_path).expect("current preserved"),
+        current_before
+    );
+    assert_eq!(
+        fs::read(&stage_path).expect("stage preserved"),
+        stage_before
     );
 }
 

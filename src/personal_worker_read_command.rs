@@ -141,7 +141,9 @@ pub(crate) fn render_status_human(view: &PersonalWorkerStatusView) -> String {
     writeln!(
         output,
         "  profile: {} -> {}",
-        serialized_label(&view.current_profile()),
+        view.current_profile()
+            .map(|profile| serialized_label(&profile))
+            .unwrap_or_else(|| "unobserved".to_owned()),
         serialized_label(&view.desired_profile())
     )
     .expect("writing to a String cannot fail");

@@ -16,10 +16,10 @@ use smolrunner::execution_admission::{
     ReservationGeneration, ReservationId, RunnerProfileId, UnavailableReason,
 };
 use smolrunner::personal_worker_queue::{
-    PersonalWorkerActiveReservation, PersonalWorkerCacheAccessMode, PersonalWorkerCacheNamespace,
-    PersonalWorkerCancellationState, PersonalWorkerJobRequest, PersonalWorkerPriority,
-    PersonalWorkerProfile, PersonalWorkerQueueGeneration, PersonalWorkerQueueInput,
-    PersonalWorkerSourceIdentity,
+    PersonalWorkerActiveReservation, PersonalWorkerActivityEvidence, PersonalWorkerCacheAccessMode,
+    PersonalWorkerCacheNamespace, PersonalWorkerCancellationState, PersonalWorkerJobRequest,
+    PersonalWorkerPriority, PersonalWorkerProfile, PersonalWorkerProfileObservation,
+    PersonalWorkerQueueGeneration, PersonalWorkerQueueInput, PersonalWorkerSourceIdentity,
 };
 use smolrunner::personal_worker_store::{
     PersonalWorkerDurableCacheLease, PersonalWorkerStore, PersonalWorkerStoreDocument,
@@ -165,8 +165,10 @@ fn live_document() -> PersonalWorkerStoreDocument {
         PersonalWorkerQueueInput {
             generation: PersonalWorkerQueueGeneration::new(1).expect("queue generation"),
             observed_at: time(BASE),
-            current_profile: PersonalWorkerProfile::Work,
-            last_activity_at: time(BASE - 1_000),
+            profile_observation: PersonalWorkerProfileObservation::observed(
+                PersonalWorkerProfile::Work,
+            ),
+            activity_evidence: PersonalWorkerActivityEvidence::observed(time(BASE - 1_000)),
             queued: vec![queued_one, queued_two],
             active: vec![active],
             pending_profile_change: None,
@@ -225,8 +227,10 @@ fn terminal_document() -> PersonalWorkerStoreDocument {
         PersonalWorkerQueueInput {
             generation: PersonalWorkerQueueGeneration::new(1).expect("queue generation"),
             observed_at: time(BASE),
-            current_profile: PersonalWorkerProfile::Interactive,
-            last_activity_at: time(BASE),
+            profile_observation: PersonalWorkerProfileObservation::observed(
+                PersonalWorkerProfile::Interactive,
+            ),
+            activity_evidence: PersonalWorkerActivityEvidence::observed(time(BASE)),
             queued: vec![],
             active: vec![],
             pending_profile_change: None,
@@ -341,6 +345,65 @@ fn installed_cli_reads_status_queue_and_active_job_without_lock_or_writes() {
 }
 
 #[test]
+fn installed_cli_renders_unobserved_never_active_status_without_guessing() {
+    let root = TempRoot::new("unobserved");
+    let document = PersonalWorkerStoreDocument::new(
+        PersonalWorkerQueueInput {
+            generation: PersonalWorkerQueueGeneration::new(1).expect("queue generation"),
+            observed_at: time(BASE),
+            profile_observation: PersonalWorkerProfileObservation::Unobserved,
+            activity_evidence: PersonalWorkerActivityEvidence::Never,
+            queued: vec![],
+            active: vec![],
+            pending_profile_change: None,
+        },
+        vec![],
+    )
+    .expect("unobserved document");
+    create_store(&root, &document);
+
+    let json_output = run_smolrunner(&[
+        OsStr::new("--output"),
+        OsStr::new("json"),
+        OsStr::new("worker"),
+        OsStr::new("status"),
+        OsStr::new("--store-root"),
+        root.path().as_os_str(),
+    ]);
+    assert!(
+        json_output.status.success(),
+        "{}",
+        output_text(&json_output.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_slice(&json_output.stdout).expect("status JSON");
+    assert_eq!(
+        value["profile_observation"],
+        serde_json::json!({"state": "unobserved"})
+    );
+    assert_eq!(
+        value["activity_evidence"],
+        serde_json::json!({"state": "never"})
+    );
+    assert_eq!(value["desired_profile"], "stopped");
+
+    let human_output = run_smolrunner(&[
+        OsStr::new("worker"),
+        OsStr::new("status"),
+        OsStr::new("--store-root"),
+        root.path().as_os_str(),
+    ]);
+    assert!(
+        human_output.status.success(),
+        "{}",
+        output_text(&human_output.stderr)
+    );
+    let human = output_text(&human_output.stdout);
+    assert!(human.contains("profile: unobserved -> stopped"));
+    assert!(!human.contains("profile: null"));
+}
+
+#[test]
 fn installed_cli_projects_retained_terminal_and_bounds_errors() {
     let root = TempRoot::new("terminal");
     create_store(&root, &terminal_document());
@@ -434,8 +497,10 @@ fn installed_cli_does_not_create_or_recover_durable_state() {
             PersonalWorkerQueueInput {
                 generation: PersonalWorkerQueueGeneration::new(2).expect("queue generation"),
                 observed_at: time(BASE + 1_000),
-                current_profile: PersonalWorkerProfile::Work,
-                last_activity_at: time(BASE),
+                profile_observation: PersonalWorkerProfileObservation::observed(
+                    PersonalWorkerProfile::Work,
+                ),
+                activity_evidence: PersonalWorkerActivityEvidence::observed(time(BASE)),
                 queued: current.queue().queued.clone(),
                 active: current.queue().active.clone(),
                 pending_profile_change: None,

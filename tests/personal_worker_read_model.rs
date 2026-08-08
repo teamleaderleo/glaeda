@@ -6,10 +6,11 @@ use smolrunner::execution_admission::{
     ReservationGeneration, ReservationId, RunnerProfileId, UnavailableReason,
 };
 use smolrunner::personal_worker_queue::{
-    PersonalWorkerActiveReservation, PersonalWorkerCacheAccessMode, PersonalWorkerCacheNamespace,
-    PersonalWorkerCancellationState, PersonalWorkerJobRequest, PersonalWorkerPendingProfileChange,
-    PersonalWorkerPriority, PersonalWorkerProfile, PersonalWorkerQueueGeneration,
-    PersonalWorkerQueueInput, PersonalWorkerSourceIdentity,
+    PersonalWorkerActiveReservation, PersonalWorkerActivityEvidence, PersonalWorkerCacheAccessMode,
+    PersonalWorkerCacheNamespace, PersonalWorkerCancellationState, PersonalWorkerJobRequest,
+    PersonalWorkerPendingProfileChange, PersonalWorkerPriority, PersonalWorkerProfile,
+    PersonalWorkerProfileObservation, PersonalWorkerQueueGeneration, PersonalWorkerQueueInput,
+    PersonalWorkerSourceIdentity,
 };
 use smolrunner::personal_worker_read_model::{
     MAX_PERSONAL_WORKER_QUEUE_PAGE_SIZE, PersonalWorkerJobReadRequest, PersonalWorkerJobStateView,
@@ -191,8 +192,10 @@ fn terminal_document() -> PersonalWorkerStoreDocument {
         PersonalWorkerQueueInput {
             generation: PersonalWorkerQueueGeneration::new(1).expect("queue generation"),
             observed_at: time(BASE),
-            current_profile: PersonalWorkerProfile::Interactive,
-            last_activity_at: time(BASE),
+            profile_observation: PersonalWorkerProfileObservation::observed(
+                PersonalWorkerProfile::Interactive,
+            ),
+            activity_evidence: PersonalWorkerActivityEvidence::observed(time(BASE)),
             queued: vec![],
             active: vec![],
             pending_profile_change: None,
@@ -227,8 +230,10 @@ fn document() -> PersonalWorkerStoreDocument {
         PersonalWorkerQueueInput {
             generation: PersonalWorkerQueueGeneration::new(1).expect("queue generation"),
             observed_at: time(BASE),
-            current_profile: PersonalWorkerProfile::Work,
-            last_activity_at: time(BASE - 1_000),
+            profile_observation: PersonalWorkerProfileObservation::observed(
+                PersonalWorkerProfile::Work,
+            ),
+            activity_evidence: PersonalWorkerActivityEvidence::observed(time(BASE - 1_000)),
             queued: vec![cancelled, queued],
             active: vec![active],
             pending_profile_change: Some(PersonalWorkerPendingProfileChange {
@@ -255,7 +260,7 @@ fn status_binds_exact_snapshot_and_reports_bounded_counts() {
 
     assert_eq!(status.store_revision(), revision());
     assert_eq!(status.queue_generation(), generation());
-    assert_eq!(status.current_profile(), PersonalWorkerProfile::Work);
+    assert_eq!(status.current_profile(), Some(PersonalWorkerProfile::Work));
     assert_eq!(status.desired_profile(), PersonalWorkerProfile::Work);
     assert_eq!(status.queued_entry_count(), 2);
     assert_eq!(status.eligible_queue_count(), 1);
@@ -479,8 +484,10 @@ fn ambiguous_terminal_proof_is_rejected_and_evicted_identity_is_not_found() {
         PersonalWorkerQueueInput {
             generation: PersonalWorkerQueueGeneration::new(1).expect("queue generation"),
             observed_at: time(BASE + 1),
-            current_profile: PersonalWorkerProfile::Interactive,
-            last_activity_at: time(BASE + 1),
+            profile_observation: PersonalWorkerProfileObservation::observed(
+                PersonalWorkerProfile::Interactive,
+            ),
+            activity_evidence: PersonalWorkerActivityEvidence::observed(time(BASE + 1)),
             queued: vec![],
             active: vec![],
             pending_profile_change: None,

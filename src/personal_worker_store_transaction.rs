@@ -6,8 +6,9 @@ use crate::execution_admission::{
     EpochMillis, ExecutionAdmissionRecord, ExecutionAdmissionState, ExecutionRequestId,
 };
 use crate::personal_worker_queue::{
-    PersonalWorkerActiveReservation, PersonalWorkerCancellationState, PersonalWorkerJobRequest,
-    PersonalWorkerPendingProfileChange, PersonalWorkerProfile, PersonalWorkerQueueGeneration,
+    PersonalWorkerActiveReservation, PersonalWorkerActivityEvidence,
+    PersonalWorkerCancellationState, PersonalWorkerJobRequest, PersonalWorkerPendingProfileChange,
+    PersonalWorkerProfile, PersonalWorkerProfileObservation, PersonalWorkerQueueGeneration,
     PersonalWorkerQueueInput,
 };
 use crate::personal_worker_store::{
@@ -31,6 +32,7 @@ pub enum PersonalWorkerStoreMutationClass {
     ReleaseCompletionAndCacheLease,
     SetProfileIntent,
     CancelProfileIntent,
+    ObserveProfile,
     UpdateLastActivity,
 }
 
@@ -75,6 +77,10 @@ pub enum PersonalWorkerStoreMutation {
     CancelProfileIntent {
         observed_at: EpochMillis,
     },
+    ObserveProfile {
+        profile: PersonalWorkerProfile,
+        observed_at: EpochMillis,
+    },
     UpdateLastActivity {
         last_activity_at: EpochMillis,
         observed_at: EpochMillis,
@@ -100,6 +106,7 @@ impl PersonalWorkerStoreMutation {
             Self::CancelProfileIntent { .. } => {
                 PersonalWorkerStoreMutationClass::CancelProfileIntent
             }
+            Self::ObserveProfile { .. } => PersonalWorkerStoreMutationClass::ObserveProfile,
             Self::UpdateLastActivity { .. } => PersonalWorkerStoreMutationClass::UpdateLastActivity,
         }
     }
@@ -347,7 +354,7 @@ fn apply_to_snapshot(
     let mut queue = current.queue().clone();
     let mut leases = current.cache_leases().to_vec();
     let mut terminal_tombstones = current.terminal_tombstones().to_vec();
-    let observed_at = match mutation {
+    let (observed_at, activity_at) = match mutation {
         PersonalWorkerStoreMutation::Submit {
             request,
             observed_at,
@@ -382,7 +389,7 @@ fn apply_to_snapshot(
                 };
             }
             queue.queued.push(request);
-            observed_at
+            (observed_at, Some(observed_at))
         }
         PersonalWorkerStoreMutation::Cancel {
             request_id,
@@ -409,7 +416,7 @@ fn apply_to_snapshot(
                         ));
                     }
                 }
-                cancelled_at
+                (cancelled_at, Some(cancelled_at))
             } else if let Some(index) = active_index(&queue, &request_id) {
                 let next = draining_admission.ok_or_else(|| {
                     PersonalWorkerStoreMutationError::invalid(
@@ -443,7 +450,7 @@ fn apply_to_snapshot(
                 active.request.cancellation =
                     PersonalWorkerCancellationState::Cancelled { cancelled_at };
                 active.admission = transition.resulting_record().clone();
-                active.admission.observed_at()
+                (active.admission.observed_at(), Some(cancelled_at))
             } else {
                 return Err(PersonalWorkerStoreMutationError::not_found());
             }
@@ -494,12 +501,13 @@ fn apply_to_snapshot(
                 started_at: None,
             });
             leases.push(cache_lease);
-            queue
+            let observed_at = queue
                 .active
                 .last()
                 .expect("active reservation was pushed")
                 .admission
-                .observed_at()
+                .observed_at();
+            (observed_at, Some(observed_at))
         }
         PersonalWorkerStoreMutation::MarkStarting {
             request_id,
@@ -530,7 +538,8 @@ fn apply_to_snapshot(
             })?;
             active.admission = transition.resulting_record().clone();
             active.started_at = Some(started_at);
-            active.admission.observed_at()
+            let observed_at = active.admission.observed_at();
+            (observed_at, Some(observed_at))
         }
         PersonalWorkerStoreMutation::MarkRunning {
             request_id,
@@ -542,7 +551,7 @@ fn apply_to_snapshot(
             ExecutionAdmissionState::Running,
             "running mutation violates admission transition ordering",
         )? {
-            Some(observed_at) => observed_at,
+            Some(observed_at) => (observed_at, Some(observed_at)),
             None => return Ok(MutationApplication::Duplicate),
         },
         PersonalWorkerStoreMutation::MarkDraining {
@@ -555,7 +564,7 @@ fn apply_to_snapshot(
             ExecutionAdmissionState::Draining,
             "draining mutation violates admission transition ordering",
         )? {
-            Some(observed_at) => observed_at,
+            Some(observed_at) => (observed_at, Some(observed_at)),
             None => return Ok(MutationApplication::Duplicate),
         },
         PersonalWorkerStoreMutation::ReleaseCompletionAndCacheLease {
@@ -624,7 +633,7 @@ fn apply_to_snapshot(
             if terminal_tombstones.len() > MAX_PERSONAL_WORKER_TERMINAL_TOMBSTONES {
                 terminal_tombstones.remove(0);
             }
-            observed_at
+            (observed_at, Some(observed_at))
         }
         PersonalWorkerStoreMutation::SetProfileIntent {
             target,
@@ -647,31 +656,60 @@ fn apply_to_snapshot(
                 ));
             }
             queue.pending_profile_change = Some(next);
-            observed_at
+            (observed_at, Some(observed_at))
         }
         PersonalWorkerStoreMutation::CancelProfileIntent { observed_at } => {
             if queue.pending_profile_change.is_none() {
                 return Ok(MutationApplication::Duplicate);
             }
             queue.pending_profile_change = None;
-            observed_at
+            (observed_at, Some(observed_at))
+        }
+        PersonalWorkerStoreMutation::ObserveProfile {
+            profile,
+            observed_at,
+        } => {
+            let next = PersonalWorkerProfileObservation::observed(profile);
+            if queue.profile_observation == next && queue.observed_at == observed_at {
+                return Ok(MutationApplication::Duplicate);
+            }
+            queue.profile_observation = next;
+            (observed_at, None)
         }
         PersonalWorkerStoreMutation::UpdateLastActivity {
             last_activity_at,
             observed_at,
         } => {
-            if last_activity_at < queue.last_activity_at {
+            if queue
+                .activity_evidence
+                .last_activity_at()
+                .is_some_and(|current| last_activity_at < current)
+            {
                 return Err(PersonalWorkerStoreMutationError::invalid(
                     "last-activity evidence cannot move backwards",
                 ));
             }
-            if last_activity_at == queue.last_activity_at && observed_at == queue.observed_at {
+            if queue.activity_evidence.last_activity_at() == Some(last_activity_at)
+                && observed_at == queue.observed_at
+            {
                 return Ok(MutationApplication::Duplicate);
             }
-            queue.last_activity_at = last_activity_at;
-            observed_at
+            (observed_at, Some(last_activity_at))
         }
     };
+
+    if let Some(activity_at) = activity_at {
+        if queue
+            .activity_evidence
+            .last_activity_at()
+            .is_some_and(|current| activity_at < current)
+        {
+            return Err(PersonalWorkerStoreMutationError::invalid(
+                "personal worker activity evidence cannot move backwards",
+            ));
+        }
+        queue.activity_evidence = PersonalWorkerActivityEvidence::observed(activity_at);
+    }
 
     Ok(MutationApplication::Applied {
         queue,

@@ -6,11 +6,12 @@ use smolrunner::execution_admission::{
     ReservationGeneration, ReservationId, RunnerProfileId,
 };
 use smolrunner::personal_worker_queue::{
-    PersonalWorkerActiveReservation, PersonalWorkerCacheAccessMode, PersonalWorkerCacheLeaseState,
-    PersonalWorkerCacheNamespace, PersonalWorkerCancellationState, PersonalWorkerJobRequest,
-    PersonalWorkerPendingProfileChange, PersonalWorkerPriority, PersonalWorkerProfile,
-    PersonalWorkerQueueEntryState, PersonalWorkerQueueGeneration, PersonalWorkerQueueInput,
-    PersonalWorkerSourceIdentity, evaluate_personal_worker_queue,
+    PersonalWorkerActiveReservation, PersonalWorkerActivityEvidence, PersonalWorkerCacheAccessMode,
+    PersonalWorkerCacheLeaseState, PersonalWorkerCacheNamespace, PersonalWorkerCancellationState,
+    PersonalWorkerJobRequest, PersonalWorkerPendingProfileChange, PersonalWorkerPriority,
+    PersonalWorkerProfile, PersonalWorkerProfileObservation, PersonalWorkerQueueEntryState,
+    PersonalWorkerQueueGeneration, PersonalWorkerQueueInput, PersonalWorkerSourceIdentity,
+    evaluate_personal_worker_queue,
 };
 use smolrunner::verification_profile::{CacheId, VerificationProfileId};
 
@@ -127,12 +128,12 @@ fn input(
     PersonalWorkerQueueInput {
         generation: PersonalWorkerQueueGeneration::new(generation).expect("queue generation"),
         observed_at: time(observed_at),
-        current_profile: if active.is_empty() {
+        profile_observation: PersonalWorkerProfileObservation::observed(if active.is_empty() {
             PersonalWorkerProfile::Interactive
         } else {
             PersonalWorkerProfile::Work
-        },
-        last_activity_at: time(observed_at - 1_000),
+        }),
+        activity_evidence: PersonalWorkerActivityEvidence::observed(time(observed_at - 1_000)),
         queued,
         active,
         pending_profile_change: None,
@@ -400,7 +401,8 @@ fn desired_profile_uses_work_interactive_and_stopped_cooldowns() {
         PersonalWorkerCacheAccessMode::Read,
     );
     let mut work_input = input(1, observed_at, vec![queued], vec![]);
-    work_input.current_profile = PersonalWorkerProfile::Interactive;
+    work_input.profile_observation =
+        PersonalWorkerProfileObservation::observed(PersonalWorkerProfile::Interactive);
     work_input.pending_profile_change = Some(PersonalWorkerPendingProfileChange {
         target: PersonalWorkerProfile::Stopped,
         requested_at: time(observed_at - 500),
@@ -411,8 +413,10 @@ fn desired_profile_uses_work_interactive_and_stopped_cooldowns() {
     assert!(work.profile_change_permitted);
 
     let mut interactive_input = input(1, observed_at, vec![], vec![]);
-    interactive_input.current_profile = PersonalWorkerProfile::Work;
-    interactive_input.last_activity_at = time(observed_at - 10 * 60 * 1_000);
+    interactive_input.profile_observation =
+        PersonalWorkerProfileObservation::observed(PersonalWorkerProfile::Work);
+    interactive_input.activity_evidence =
+        PersonalWorkerActivityEvidence::observed(time(observed_at - 10 * 60 * 1_000));
     let interactive =
         evaluate_personal_worker_queue(&interactive_input, None).expect("interactive profile");
     assert_eq!(
@@ -421,8 +425,10 @@ fn desired_profile_uses_work_interactive_and_stopped_cooldowns() {
     );
 
     let mut stopped_input = input(1, observed_at, vec![], vec![]);
-    stopped_input.current_profile = PersonalWorkerProfile::Interactive;
-    stopped_input.last_activity_at = time(observed_at - 31 * 60 * 1_000);
+    stopped_input.profile_observation =
+        PersonalWorkerProfileObservation::observed(PersonalWorkerProfile::Interactive);
+    stopped_input.activity_evidence =
+        PersonalWorkerActivityEvidence::observed(time(observed_at - 31 * 60 * 1_000));
     let stopped = evaluate_personal_worker_queue(&stopped_input, None).expect("stopped profile");
     assert_eq!(stopped.desired_profile, PersonalWorkerProfile::Stopped);
 }
@@ -543,7 +549,8 @@ fn cancelled_only_queue_does_not_hold_the_work_profile() {
         cancelled_at: time(observed_at - 1_000),
     };
     let mut queue = input(1, observed_at, vec![cancelled], vec![]);
-    queue.last_activity_at = time(observed_at - 31 * 60 * 1_000);
+    queue.activity_evidence =
+        PersonalWorkerActivityEvidence::observed(time(observed_at - 31 * 60 * 1_000));
     let decision = evaluate_personal_worker_queue(&queue, None).expect("idle decision");
     assert!(decision.selected.is_empty());
     assert_eq!(decision.desired_profile, PersonalWorkerProfile::Stopped);
@@ -687,8 +694,10 @@ fn work_to_interactive_and_stopped_boundaries_are_exact() {
         (30 * 60 * 1_000, PersonalWorkerProfile::Stopped),
     ] {
         let mut queue = input(1, observed_at, vec![], vec![]);
-        queue.current_profile = PersonalWorkerProfile::Work;
-        queue.last_activity_at = time(observed_at - idle_millis);
+        queue.profile_observation =
+            PersonalWorkerProfileObservation::observed(PersonalWorkerProfile::Work);
+        queue.activity_evidence =
+            PersonalWorkerActivityEvidence::observed(time(observed_at - idle_millis));
         let decision =
             evaluate_personal_worker_queue(&queue, None).expect("cooldown boundary decision");
         assert_eq!(
@@ -696,4 +705,52 @@ fn work_to_interactive_and_stopped_boundaries_are_exact() {
             "idle_millis={idle_millis}"
         );
     }
+}
+
+#[test]
+fn unobserved_never_active_state_stays_stopped_at_every_time_boundary() {
+    for observed_at in [1_001, 10 * 60 * 1_000, 30 * 60 * 1_000, 86_400_000] {
+        let mut queue = input(1, observed_at, vec![], vec![]);
+        queue.profile_observation = PersonalWorkerProfileObservation::Unobserved;
+        queue.activity_evidence = PersonalWorkerActivityEvidence::Never;
+        let decision = evaluate_personal_worker_queue(&queue, None)
+            .expect("unobserved never-active queue is valid");
+        assert_eq!(decision.desired_profile, PersonalWorkerProfile::Stopped);
+        assert_eq!(
+            decision.profile_observation,
+            PersonalWorkerProfileObservation::Unobserved
+        );
+        assert_eq!(
+            decision.activity_evidence,
+            PersonalWorkerActivityEvidence::Never
+        );
+    }
+}
+
+#[test]
+fn active_and_pending_state_require_observed_profile_evidence() {
+    let observed_at = 21_000_000;
+    let reservation = active(
+        "unobserved-active",
+        "example/active",
+        'a',
+        observed_at - 1_000,
+        limits(2_000, 2),
+        PersonalWorkerCacheAccessMode::Read,
+    );
+    let mut active_queue = input(1, observed_at, vec![], vec![reservation]);
+    active_queue.profile_observation = PersonalWorkerProfileObservation::Unobserved;
+    let error = evaluate_personal_worker_queue(&active_queue, None)
+        .expect_err("active work without observed profile");
+    assert_eq!(error.code, "active_work_requires_work_profile");
+
+    let mut pending_queue = input(1, observed_at, vec![], vec![]);
+    pending_queue.profile_observation = PersonalWorkerProfileObservation::Unobserved;
+    pending_queue.pending_profile_change = Some(PersonalWorkerPendingProfileChange {
+        target: PersonalWorkerProfile::Stopped,
+        requested_at: time(observed_at),
+    });
+    let error = evaluate_personal_worker_queue(&pending_queue, None)
+        .expect_err("profile intent without observed profile");
+    assert_eq!(error.code, "profile_intent_requires_observation");
 }

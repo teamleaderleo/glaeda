@@ -9,15 +9,16 @@ use crate::execution_admission::{
     ReservationId, UnavailableReason,
 };
 use crate::personal_worker_queue::{
-    PersonalWorkerCacheAccessMode, PersonalWorkerCacheNamespace, PersonalWorkerCancellationState,
-    PersonalWorkerPriority, PersonalWorkerProfile, PersonalWorkerQueueGeneration,
-    PersonalWorkerQueueVisibility, PersonalWorkerSourceIdentity, evaluate_personal_worker_queue,
+    PersonalWorkerActivityEvidence, PersonalWorkerCacheAccessMode, PersonalWorkerCacheNamespace,
+    PersonalWorkerCancellationState, PersonalWorkerPriority, PersonalWorkerProfile,
+    PersonalWorkerProfileObservation, PersonalWorkerQueueGeneration, PersonalWorkerQueueVisibility,
+    PersonalWorkerSourceIdentity, evaluate_personal_worker_queue,
 };
 use crate::personal_worker_store::{
     PersonalWorkerStoreDocument, PersonalWorkerStoreRevision, PersonalWorkerTerminalMutationClass,
 };
 
-pub const PERSONAL_WORKER_READ_MODEL_SCHEMA_VERSION: u8 = 1;
+pub const PERSONAL_WORKER_READ_MODEL_SCHEMA_VERSION: u8 = 2;
 pub const MAX_PERSONAL_WORKER_QUEUE_PAGE_SIZE: u16 = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -44,9 +45,9 @@ pub struct PersonalWorkerStatusView {
     store_revision: PersonalWorkerStoreRevision,
     queue_generation: PersonalWorkerQueueGeneration,
     observed_at: EpochMillis,
-    current_profile: PersonalWorkerProfile,
+    profile_observation: PersonalWorkerProfileObservation,
+    activity_evidence: PersonalWorkerActivityEvidence,
     desired_profile: PersonalWorkerProfile,
-    last_activity_at: EpochMillis,
     #[serde(skip_serializing_if = "Option::is_none")]
     pending_profile_change: Option<PersonalWorkerProfileIntentView>,
     queued_entry_count: u32,
@@ -71,8 +72,23 @@ impl PersonalWorkerStatusView {
     }
 
     #[must_use]
-    pub const fn current_profile(&self) -> PersonalWorkerProfile {
-        self.current_profile
+    pub const fn profile_observation(&self) -> PersonalWorkerProfileObservation {
+        self.profile_observation
+    }
+
+    #[must_use]
+    pub const fn current_profile(&self) -> Option<PersonalWorkerProfile> {
+        self.profile_observation.profile()
+    }
+
+    #[must_use]
+    pub const fn activity_evidence(&self) -> PersonalWorkerActivityEvidence {
+        self.activity_evidence
+    }
+
+    #[must_use]
+    pub const fn last_activity_at(&self) -> Option<EpochMillis> {
+        self.activity_evidence.last_activity_at()
     }
 
     #[must_use]
@@ -596,9 +612,9 @@ pub fn personal_worker_status(
         store_revision: document.revision(),
         queue_generation: queue.generation,
         observed_at: queue.observed_at,
-        current_profile: queue.current_profile,
+        profile_observation: queue.profile_observation,
+        activity_evidence: queue.activity_evidence,
         desired_profile: decision.desired_profile,
-        last_activity_at: queue.last_activity_at,
         pending_profile_change: queue.pending_profile_change.map(|pending| {
             PersonalWorkerProfileIntentView {
                 target: pending.target,
