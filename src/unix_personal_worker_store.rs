@@ -616,6 +616,22 @@ struct StoreReadLock {
     _lock: OwnedFd,
 }
 
+impl Drop for StoreMutationLock {
+    fn drop(&mut self) {
+        // `CLOEXEC` closes this descriptor at exec, but a concurrent fork can briefly inherit the
+        // same open-file description after this guard is dropped. Explicitly unlocking prevents
+        // that inherited duplicate from extending the mutation boundary.
+        let _ = fs::flock(&self._lock, FlockOperation::Unlock);
+    }
+}
+
+impl Drop for StoreReadLock {
+    fn drop(&mut self) {
+        // Keep read-only inspection from leaving the same transient inherited-lock window.
+        let _ = fs::flock(&self._lock, FlockOperation::Unlock);
+    }
+}
+
 fn acquire_mutation_lock_in(
     directory: &OwnedFd,
     owner: (u32, u32),
@@ -1087,5 +1103,79 @@ fn map_publish_error(error: Errno, no_replace: bool) -> PersonalWorkerStoreError
             PersonalWorkerStoreErrorKind::Io,
             "could not atomically publish the personal worker state document",
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use rustix::io::dup;
+
+    use super::UnixPersonalWorkerStore;
+
+    static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
+
+    struct TempRoot(PathBuf);
+
+    impl TempRoot {
+        fn new(label: &str) -> Self {
+            let sequence = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "smolrunner-personal-worker-lock-drop-{label}-{}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).expect("create temporary state root");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o750))
+                .expect("set temporary root mode");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn mutation_guard_drop_unlocks_an_inherited_open_file_description() {
+        let root = TempRoot::new("mutation");
+        let (store, _) = UnixPersonalWorkerStore::open_or_create(root.path()).expect("open store");
+        let guard = store
+            .acquire_mutation_lock()
+            .expect("acquire mutation lock");
+        let inherited = dup(&guard._lock).expect("duplicate inherited lock descriptor");
+
+        drop(guard);
+        let reacquired = store
+            .acquire_mutation_lock()
+            .expect("guard drop must explicitly unlock inherited description");
+
+        drop(reacquired);
+        drop(inherited);
+    }
+
+    #[test]
+    fn read_guard_drop_unlocks_an_inherited_open_file_description() {
+        let root = TempRoot::new("read");
+        let (store, _) = UnixPersonalWorkerStore::open_or_create(root.path()).expect("open store");
+        let guard = store.acquire_read_lock().expect("acquire read lock");
+        let inherited = dup(&guard._lock).expect("duplicate inherited lock descriptor");
+
+        drop(guard);
+        let mutation = store
+            .acquire_mutation_lock()
+            .expect("read guard drop must explicitly unlock inherited description");
+
+        drop(mutation);
+        drop(inherited);
     }
 }
