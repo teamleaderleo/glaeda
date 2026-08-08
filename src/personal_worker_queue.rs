@@ -11,7 +11,7 @@ use crate::execution_admission::{
 };
 use crate::verification_profile::{CacheId, VerificationProfileId};
 
-pub const PERSONAL_WORKER_QUEUE_SCHEMA_VERSION: u8 = 1;
+pub const PERSONAL_WORKER_QUEUE_SCHEMA_VERSION: u8 = 2;
 pub const MAX_PERSONAL_WORKER_QUEUE_ENTRIES: usize = 256;
 pub const MAX_PERSONAL_WORKER_ACTIVE_RESERVATIONS: usize = 2;
 pub const PERSONAL_WORKER_TOTAL_CPU_MILLIS: u32 = 8_000;
@@ -96,6 +96,50 @@ pub enum PersonalWorkerProfile {
     Stopped,
     Interactive,
     Work,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum PersonalWorkerProfileObservation {
+    Unobserved,
+    Observed { profile: PersonalWorkerProfile },
+}
+
+impl PersonalWorkerProfileObservation {
+    #[must_use]
+    pub const fn observed(profile: PersonalWorkerProfile) -> Self {
+        Self::Observed { profile }
+    }
+
+    #[must_use]
+    pub const fn profile(self) -> Option<PersonalWorkerProfile> {
+        match self {
+            Self::Unobserved => None,
+            Self::Observed { profile } => Some(profile),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum PersonalWorkerActivityEvidence {
+    Never,
+    Observed { last_activity_at: EpochMillis },
+}
+
+impl PersonalWorkerActivityEvidence {
+    #[must_use]
+    pub const fn observed(last_activity_at: EpochMillis) -> Self {
+        Self::Observed { last_activity_at }
+    }
+
+    #[must_use]
+    pub const fn last_activity_at(self) -> Option<EpochMillis> {
+        match self {
+            Self::Never => None,
+            Self::Observed { last_activity_at } => Some(last_activity_at),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -230,8 +274,8 @@ pub struct PersonalWorkerPendingProfileChange {
 pub struct PersonalWorkerQueueInput {
     pub generation: PersonalWorkerQueueGeneration,
     pub observed_at: EpochMillis,
-    pub current_profile: PersonalWorkerProfile,
-    pub last_activity_at: EpochMillis,
+    pub profile_observation: PersonalWorkerProfileObservation,
+    pub activity_evidence: PersonalWorkerActivityEvidence,
     pub queued: Vec<PersonalWorkerJobRequest>,
     pub active: Vec<PersonalWorkerActiveReservation>,
     pub pending_profile_change: Option<PersonalWorkerPendingProfileChange>,
@@ -308,7 +352,8 @@ pub struct PersonalWorkerQueueDecision {
     pub schema_version: u8,
     pub generation: PersonalWorkerQueueGeneration,
     pub observed_at: EpochMillis,
-    pub current_profile: PersonalWorkerProfile,
+    pub profile_observation: PersonalWorkerProfileObservation,
+    pub activity_evidence: PersonalWorkerActivityEvidence,
     pub desired_profile: PersonalWorkerProfile,
     pub cancel_pending_downscale: bool,
     pub profile_change_permitted: bool,
@@ -445,7 +490,8 @@ pub fn evaluate_personal_worker_queue(
         schema_version: PERSONAL_WORKER_QUEUE_SCHEMA_VERSION,
         generation: input.generation,
         observed_at: input.observed_at,
-        current_profile: input.current_profile,
+        profile_observation: input.profile_observation,
+        activity_evidence: input.activity_evidence,
         desired_profile,
         cancel_pending_downscale,
         profile_change_permitted,
@@ -502,28 +548,53 @@ fn validate_input(input: &PersonalWorkerQueueInput) -> Result<(), PersonalWorker
             "personal worker allows at most two active light reservations",
         ));
     }
-    if input.last_activity_at > input.observed_at {
+    if input
+        .activity_evidence
+        .last_activity_at()
+        .is_some_and(|last_activity_at| last_activity_at > input.observed_at)
+    {
         return Err(PersonalWorkerQueueError::new(
-            "last_activity_at",
+            "activity_evidence.last_activity_at",
             "future_last_activity",
             "last activity cannot be newer than the queue observation",
         ));
     }
-    if !input.active.is_empty() && input.current_profile != PersonalWorkerProfile::Work {
-        return Err(PersonalWorkerQueueError::new(
-            "current_profile",
-            "active_work_requires_work_profile",
-            "active reservations require the work worker profile",
-        ));
-    }
-    if let Some(pending) = input.pending_profile_change
-        && pending.requested_at > input.observed_at
+    if input.activity_evidence == PersonalWorkerActivityEvidence::Never
+        && (!input.queued.is_empty()
+            || !input.active.is_empty()
+            || input.pending_profile_change.is_some())
     {
         return Err(PersonalWorkerQueueError::new(
-            "pending_profile_change.requested_at",
-            "future_profile_change_request",
-            "profile-change request cannot be newer than the queue observation",
+            "activity_evidence",
+            "activity_evidence_required",
+            "durable work and profile intents require observed activity evidence",
         ));
+    }
+    if !input.active.is_empty()
+        && input.profile_observation
+            != PersonalWorkerProfileObservation::observed(PersonalWorkerProfile::Work)
+    {
+        return Err(PersonalWorkerQueueError::new(
+            "profile_observation",
+            "active_work_requires_work_profile",
+            "active reservations require an observed work worker profile",
+        ));
+    }
+    if let Some(pending) = input.pending_profile_change {
+        if input.profile_observation.profile().is_none() {
+            return Err(PersonalWorkerQueueError::new(
+                "profile_observation",
+                "profile_intent_requires_observation",
+                "profile-change intent requires an observed current profile",
+            ));
+        }
+        if pending.requested_at > input.observed_at {
+            return Err(PersonalWorkerQueueError::new(
+                "pending_profile_change.requested_at",
+                "future_profile_change_request",
+                "profile-change request cannot be newer than the queue observation",
+            ));
+        }
     }
 
     let mut request_ids = BTreeSet::new();
@@ -917,10 +988,13 @@ fn desired_profile(input: &PersonalWorkerQueueInput, has_work: bool) -> Personal
     if has_work {
         return PersonalWorkerProfile::Work;
     }
+    let Some(last_activity_at) = input.activity_evidence.last_activity_at() else {
+        return PersonalWorkerProfile::Stopped;
+    };
     let idle_millis = input
         .observed_at
         .get()
-        .saturating_sub(input.last_activity_at.get());
+        .saturating_sub(last_activity_at.get());
     if idle_millis < PERSONAL_WORKER_INTERACTIVE_COOLDOWN_MILLIS {
         PersonalWorkerProfile::Work
     } else if idle_millis < PERSONAL_WORKER_STOPPED_COOLDOWN_MILLIS {

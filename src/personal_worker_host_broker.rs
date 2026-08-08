@@ -464,9 +464,16 @@ fn validate_queue_lifecycle_alignment(
         | LimaLifecycleState::Stopping
         | LimaLifecycleState::Unavailable => map_lima_profile(lifecycle.profile()),
     };
-    if queue.current_profile != expected_current {
+    let current_profile = queue.profile_observation.profile().ok_or_else(|| {
+        HostBrokerReducerError::new(
+            "queue.profile_observation",
+            "queue_profile_unobserved",
+            "queue profile must be observed before lifecycle planning",
+        )
+    })?;
+    if current_profile != expected_current {
         return Err(HostBrokerReducerError::new(
-            "queue.current_profile",
+            "queue.profile_observation",
             "queue_lifecycle_profile_mismatch",
             "queue current profile must match the exact Lima lifecycle observation",
         ));
@@ -866,6 +873,9 @@ mod tests {
         PersonalWorkerCacheAccessMode, PersonalWorkerCacheNamespace, PersonalWorkerJobClass,
         PersonalWorkerPriority, PersonalWorkerQueueVisibility,
     };
+    use crate::personal_worker_queue::{
+        PersonalWorkerActivityEvidence, PersonalWorkerProfileObservation,
+    };
     use crate::verification_profile::{CacheId, VerificationProfileId};
 
     const FRESHNESS: u64 = 30_000;
@@ -922,7 +932,8 @@ mod tests {
             schema_version: PERSONAL_WORKER_QUEUE_SCHEMA_VERSION,
             generation: PersonalWorkerQueueGeneration::new(1).expect("queue generation"),
             observed_at: time(observed_at),
-            current_profile: current,
+            profile_observation: PersonalWorkerProfileObservation::observed(current),
+            activity_evidence: PersonalWorkerActivityEvidence::observed(time(observed_at - 1)),
             desired_profile: desired,
             cancel_pending_downscale: false,
             profile_change_permitted: true,
@@ -1283,6 +1294,29 @@ mod tests {
             .expect_err("skipped revision")
             .code,
             "stale_or_skipped_state_revision"
+        );
+    }
+
+    #[test]
+    fn unobserved_durable_profile_refuses_lima_mutation_planning() {
+        let mut queue = decision(
+            650_000,
+            PersonalWorkerProfile::Stopped,
+            PersonalWorkerProfile::Stopped,
+        );
+        queue.profile_observation = PersonalWorkerProfileObservation::Unobserved;
+        let stopped = lifecycle(
+            LimaLifecycleState::Stopped,
+            LimaResourceProfile::Work,
+            650_000,
+            649_000,
+            false,
+        );
+        assert_eq!(
+            reduce(1, 650_000, &queue, Some(&stopped), None, None)
+                .expect_err("unobserved durable profile")
+                .code,
+            "queue_profile_unobserved"
         );
     }
 

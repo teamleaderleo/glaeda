@@ -13,10 +13,10 @@ use smolrunner::execution_admission::{
     ReservationGeneration, ReservationId, RunnerProfileId, UnavailableReason,
 };
 use smolrunner::personal_worker_queue::{
-    PersonalWorkerActiveReservation, PersonalWorkerCacheAccessMode, PersonalWorkerCacheNamespace,
-    PersonalWorkerCancellationState, PersonalWorkerJobRequest, PersonalWorkerPriority,
-    PersonalWorkerProfile, PersonalWorkerQueueGeneration, PersonalWorkerQueueInput,
-    PersonalWorkerSourceIdentity,
+    PersonalWorkerActiveReservation, PersonalWorkerActivityEvidence, PersonalWorkerCacheAccessMode,
+    PersonalWorkerCacheNamespace, PersonalWorkerCancellationState, PersonalWorkerJobRequest,
+    PersonalWorkerPriority, PersonalWorkerProfile, PersonalWorkerProfileObservation,
+    PersonalWorkerQueueGeneration, PersonalWorkerQueueInput, PersonalWorkerSourceIdentity,
 };
 use smolrunner::personal_worker_store::{
     MAX_PERSONAL_WORKER_TERMINAL_TOMBSTONES, PersonalWorkerDurableCacheLease, PersonalWorkerStore,
@@ -296,8 +296,10 @@ fn active_document(
     let queue = PersonalWorkerQueueInput {
         generation: PersonalWorkerQueueGeneration::new(1).expect("generation"),
         observed_at: time(base + 60),
-        current_profile: PersonalWorkerProfile::Work,
-        last_activity_at: time(base + 60),
+        profile_observation: PersonalWorkerProfileObservation::observed(
+            PersonalWorkerProfile::Work,
+        ),
+        activity_evidence: PersonalWorkerActivityEvidence::observed(time(base + 60)),
         queued: vec![],
         active: vec![PersonalWorkerActiveReservation {
             request: request.clone(),
@@ -385,8 +387,10 @@ fn terminal_tombstone_wire_is_canonical_and_digest_bound() {
     let queue = PersonalWorkerQueueInput {
         generation: PersonalWorkerQueueGeneration::new(1).expect("generation"),
         observed_at: time(BASE + 100),
-        current_profile: PersonalWorkerProfile::Interactive,
-        last_activity_at: time(BASE + 90),
+        profile_observation: PersonalWorkerProfileObservation::observed(
+            PersonalWorkerProfile::Interactive,
+        ),
+        activity_evidence: PersonalWorkerActivityEvidence::observed(time(BASE + 90)),
         queued: vec![],
         active: vec![],
         pending_profile_change: None,
@@ -536,8 +540,10 @@ fn terminal_ledger_successor_cannot_replace_retained_proof() {
     let initial_queue = PersonalWorkerQueueInput {
         generation: PersonalWorkerQueueGeneration::new(1).expect("generation"),
         observed_at: time(BASE + 100),
-        current_profile: PersonalWorkerProfile::Interactive,
-        last_activity_at: time(BASE + 90),
+        profile_observation: PersonalWorkerProfileObservation::observed(
+            PersonalWorkerProfile::Interactive,
+        ),
+        activity_evidence: PersonalWorkerActivityEvidence::observed(time(BASE + 90)),
         queued: vec![],
         active: vec![],
         pending_profile_change: None,
@@ -551,8 +557,10 @@ fn terminal_ledger_successor_cannot_replace_retained_proof() {
     let next_queue = PersonalWorkerQueueInput {
         generation: PersonalWorkerQueueGeneration::new(2).expect("generation"),
         observed_at: time(BASE + 1_100),
-        current_profile: PersonalWorkerProfile::Interactive,
-        last_activity_at: time(BASE + 1_090),
+        profile_observation: PersonalWorkerProfileObservation::observed(
+            PersonalWorkerProfile::Interactive,
+        ),
+        activity_evidence: PersonalWorkerActivityEvidence::observed(time(BASE + 1_090)),
         queued: vec![],
         active: vec![],
         pending_profile_change: None,
@@ -734,8 +742,10 @@ fn multi_active_document(
     let queue = PersonalWorkerQueueInput {
         generation: PersonalWorkerQueueGeneration::new(1).expect("generation"),
         observed_at: time(common_observed_at),
-        current_profile: PersonalWorkerProfile::Work,
-        last_activity_at: time(common_observed_at),
+        profile_observation: PersonalWorkerProfileObservation::observed(
+            PersonalWorkerProfile::Work,
+        ),
+        activity_evidence: PersonalWorkerActivityEvidence::observed(time(common_observed_at)),
         queued: vec![],
         active,
         pending_profile_change: None,
@@ -765,7 +775,8 @@ fn terminal_successor_rejects_unrelated_queue_profile_activity_intent_and_time_d
 
     let (mut queue, leases, tombstones) =
         terminal_release_parts(&document, &release_request.identity.request_id, &terminal);
-    queue.current_profile = PersonalWorkerProfile::Interactive;
+    queue.profile_observation =
+        PersonalWorkerProfileObservation::observed(PersonalWorkerProfile::Interactive);
     assert_terminal_successor_rejected(
         &document,
         queue,
@@ -776,7 +787,8 @@ fn terminal_successor_rejects_unrelated_queue_profile_activity_intent_and_time_d
 
     let (mut queue, leases, tombstones) =
         terminal_release_parts(&document, &release_request.identity.request_id, &terminal);
-    queue.last_activity_at = time(terminal.observed_at().get() - 1);
+    queue.activity_evidence =
+        PersonalWorkerActivityEvidence::observed(time(terminal.observed_at().get() - 1));
     assert_terminal_successor_rejected(
         &document,
         queue,

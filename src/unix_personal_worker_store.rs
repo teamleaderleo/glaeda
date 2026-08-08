@@ -11,10 +11,11 @@ use crate::personal_worker_store::{
     MAX_PERSONAL_WORKER_STORE_BYTES, PersonalWorkerStore, PersonalWorkerStoreDocument,
     PersonalWorkerStoreError, PersonalWorkerStoreErrorKind,
     PersonalWorkerStoreInitializationDisposition, PersonalWorkerStoreInitializationReceipt,
+    PersonalWorkerStoreMigrationDisposition, PersonalWorkerStoreMigrationReceipt,
     PersonalWorkerStoreRecovery, PersonalWorkerStoreRecoveryDisposition,
     PersonalWorkerStoreRevision, PersonalWorkerStoreWriteDisposition,
     PersonalWorkerStoreWriteReceipt, decode_personal_worker_store_document,
-    encode_personal_worker_store_document,
+    encode_personal_worker_store_document, migrate_personal_worker_store_v1_document,
 };
 
 const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
@@ -155,6 +156,90 @@ impl UnixPersonalWorkerStore {
         }
     }
 
+    /// Explicitly migrate one canonical schema-v1 store to schema v2 under its durable writer lock.
+    ///
+    /// This operation never creates missing store authority. A pre-existing staged file is
+    /// published only when it is the exact canonical v2 image of the current canonical v1 state;
+    /// every other staged shape is preserved and reported as recovery-required.
+    pub fn migrate_v1(
+        root_path: impl AsRef<Path>,
+    ) -> Result<PersonalWorkerStoreMigrationReceipt, PersonalWorkerStoreError> {
+        let root = fs::open(root_path.as_ref(), DIRECTORY_FLAGS, Mode::empty())
+            .map_err(map_root_open_error)?;
+        let root_stat = inspect_directory(&root, "personal worker state root", None)?;
+        let owner = (root_stat.st_uid, root_stat.st_gid);
+        let directory = open_existing_initialization_directory(&root, owner)?;
+        let store = Self {
+            _root: root,
+            directory,
+            owner,
+        };
+        let _lock = store.acquire_mutation_lock()?;
+        synchronize_directory(&store._root, "personal worker state root")?;
+
+        let current_bytes = store.read_named_bytes(CURRENT_DOCUMENT)?.ok_or_else(|| {
+            store_error(
+                PersonalWorkerStoreErrorKind::Missing,
+                "personal worker state does not exist",
+            )
+        })?;
+        let staged_bytes = store.read_named_bytes(STAGED_DOCUMENT)?;
+
+        match decode_personal_worker_store_document(&current_bytes) {
+            Ok(current) => {
+                synchronize_directory(&store.directory, "personal worker store directory")?;
+                Ok(PersonalWorkerStoreMigrationReceipt::new(
+                    if staged_bytes.is_some() {
+                        PersonalWorkerStoreMigrationDisposition::RecoveryRequired
+                    } else {
+                        PersonalWorkerStoreMigrationDisposition::AlreadyCurrent
+                    },
+                    current.schema_version(),
+                    current.revision(),
+                    current.queue().generation,
+                    0,
+                ))
+            }
+            Err(error) if error.kind() == PersonalWorkerStoreErrorKind::VersionIncompatible => {
+                let migrated = migrate_personal_worker_store_v1_document(&current_bytes)?;
+                let encoded = encode_personal_worker_store_document(&migrated)?;
+                if let Some(staged_bytes) = staged_bytes {
+                    let exact_stage = decode_personal_worker_store_document(&staged_bytes)
+                        .is_ok_and(|staged| staged == migrated);
+                    if !exact_stage || staged_bytes != encoded {
+                        return Ok(PersonalWorkerStoreMigrationReceipt::new(
+                            PersonalWorkerStoreMigrationDisposition::RecoveryRequired,
+                            1,
+                            migrated.revision(),
+                            migrated.queue().generation,
+                            0,
+                        ));
+                    }
+                    let mut staged = StagedDocument::existing(store.directory.as_fd());
+                    store.publish_staged(&mut staged, false)?;
+                    return Ok(PersonalWorkerStoreMigrationReceipt::new(
+                        PersonalWorkerStoreMigrationDisposition::Migrated,
+                        1,
+                        migrated.revision(),
+                        migrated.queue().generation,
+                        0,
+                    ));
+                }
+                let bytes_written = encoded.len();
+                let mut staged = store.stage_document(&migrated)?;
+                store.publish_staged(&mut staged, false)?;
+                Ok(PersonalWorkerStoreMigrationReceipt::new(
+                    PersonalWorkerStoreMigrationDisposition::Migrated,
+                    1,
+                    migrated.revision(),
+                    migrated.queue().generation,
+                    bytes_written,
+                ))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     fn acquire_mutation_lock(&self) -> Result<StoreMutationLock, PersonalWorkerStoreError> {
         acquire_mutation_lock_in(&self.directory, self.owner)
     }
@@ -163,6 +248,12 @@ impl UnixPersonalWorkerStore {
         &self,
         name: &str,
     ) -> Result<Option<PersonalWorkerStoreDocument>, PersonalWorkerStoreError> {
+        self.read_named_bytes(name)?
+            .map(|bytes| decode_personal_worker_store_document(&bytes))
+            .transpose()
+    }
+
+    fn read_named_bytes(&self, name: &str) -> Result<Option<Vec<u8>>, PersonalWorkerStoreError> {
         inspect_directory(
             &self.directory,
             "personal worker store directory",
@@ -187,7 +278,7 @@ impl UnixPersonalWorkerStore {
         if bytes.len() > MAX_PERSONAL_WORKER_STORE_BYTES {
             return Err(PersonalWorkerStoreError::corrupt_state());
         }
-        decode_personal_worker_store_document(&bytes).map(Some)
+        Ok(Some(bytes))
     }
 
     fn stage_document(

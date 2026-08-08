@@ -14,10 +14,10 @@ use smolrunner::execution_admission::{
     ReservationGeneration, ReservationId, RunnerProfileId,
 };
 use smolrunner::personal_worker_queue::{
-    PersonalWorkerActiveReservation, PersonalWorkerCacheAccessMode, PersonalWorkerCacheNamespace,
-    PersonalWorkerCancellationState, PersonalWorkerJobRequest, PersonalWorkerPriority,
-    PersonalWorkerProfile, PersonalWorkerQueueGeneration, PersonalWorkerQueueInput,
-    PersonalWorkerSourceIdentity,
+    PersonalWorkerActiveReservation, PersonalWorkerActivityEvidence, PersonalWorkerCacheAccessMode,
+    PersonalWorkerCacheNamespace, PersonalWorkerCancellationState, PersonalWorkerJobRequest,
+    PersonalWorkerPriority, PersonalWorkerProfile, PersonalWorkerProfileObservation,
+    PersonalWorkerQueueGeneration, PersonalWorkerQueueInput, PersonalWorkerSourceIdentity,
 };
 use smolrunner::personal_worker_store::{
     MAX_PERSONAL_WORKER_HISTORY_ENTRIES, PersonalWorkerDurableCacheLease, PersonalWorkerStore,
@@ -166,8 +166,10 @@ fn empty_queue(generation: u64, observed_at: u64) -> PersonalWorkerQueueInput {
     PersonalWorkerQueueInput {
         generation: PersonalWorkerQueueGeneration::new(generation).expect("queue generation"),
         observed_at: time(observed_at),
-        current_profile: PersonalWorkerProfile::Interactive,
-        last_activity_at: time(observed_at - 1_000),
+        profile_observation: PersonalWorkerProfileObservation::observed(
+            PersonalWorkerProfile::Interactive,
+        ),
+        activity_evidence: PersonalWorkerActivityEvidence::observed(time(observed_at - 1_000)),
         queued: vec![],
         active: vec![],
         pending_profile_change: None,
@@ -183,8 +185,10 @@ fn active_queue(
         PersonalWorkerQueueInput {
             generation: PersonalWorkerQueueGeneration::new(generation).expect("queue generation"),
             observed_at: time(observed_at),
-            current_profile: PersonalWorkerProfile::Work,
-            last_activity_at: time(observed_at),
+            profile_observation: PersonalWorkerProfileObservation::observed(
+                PersonalWorkerProfile::Work,
+            ),
+            activity_evidence: PersonalWorkerActivityEvidence::observed(time(observed_at)),
             queued: vec![],
             active: vec![active],
             pending_profile_change: None,

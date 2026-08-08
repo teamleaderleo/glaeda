@@ -13,14 +13,15 @@ use crate::execution_admission::{
     ReservationGeneration, ReservationId, RunnerProfileId, UnavailableReason,
 };
 use crate::personal_worker_queue::{
-    PersonalWorkerActiveReservation, PersonalWorkerCacheAccessMode, PersonalWorkerCacheNamespace,
-    PersonalWorkerCancellationState, PersonalWorkerJobRequest, PersonalWorkerPendingProfileChange,
-    PersonalWorkerPriority, PersonalWorkerProfile, PersonalWorkerQueueGeneration,
-    PersonalWorkerQueueInput, PersonalWorkerSourceIdentity, evaluate_personal_worker_queue,
+    PersonalWorkerActiveReservation, PersonalWorkerActivityEvidence, PersonalWorkerCacheAccessMode,
+    PersonalWorkerCacheNamespace, PersonalWorkerCancellationState, PersonalWorkerJobRequest,
+    PersonalWorkerPendingProfileChange, PersonalWorkerPriority, PersonalWorkerProfile,
+    PersonalWorkerProfileObservation, PersonalWorkerQueueGeneration, PersonalWorkerQueueInput,
+    PersonalWorkerSourceIdentity, evaluate_personal_worker_queue,
 };
 use crate::verification_profile::{CacheId, VerificationProfileId};
 
-pub const PERSONAL_WORKER_STORE_SCHEMA_VERSION: u8 = 1;
+pub const PERSONAL_WORKER_STORE_SCHEMA_VERSION: u8 = 2;
 pub const MAX_PERSONAL_WORKER_STORE_BYTES: usize = 1_048_576;
 pub const MAX_PERSONAL_WORKER_HISTORY_ENTRIES: usize = 32;
 pub const MAX_PERSONAL_WORKER_TERMINAL_TOMBSTONES: usize = 32;
@@ -473,6 +474,13 @@ impl PersonalWorkerStoreDocument {
         })?;
         validate_cache_leases(&self.queue, &self.cache_leases)?;
         validate_terminal_tombstones(&self.queue, &self.terminal_tombstones)?;
+        if !self.terminal_tombstones.is_empty()
+            && self.queue.activity_evidence == PersonalWorkerActivityEvidence::Never
+        {
+            return Err(PersonalWorkerStoreError::invalid_document(
+                "terminal worker evidence requires observed activity evidence",
+            ));
+        }
         validate_history(
             self.revision,
             self.queue.generation,
@@ -593,6 +601,74 @@ pub struct PersonalWorkerStoreInitializationReceipt {
     disposition: PersonalWorkerStoreInitializationDisposition,
     revision: Option<PersonalWorkerStoreRevision>,
     bytes_written: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersonalWorkerStoreMigrationDisposition {
+    Migrated,
+    AlreadyCurrent,
+    RecoveryRequired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct PersonalWorkerStoreMigrationReceipt {
+    disposition: PersonalWorkerStoreMigrationDisposition,
+    from_schema_version: u8,
+    to_schema_version: u8,
+    revision: PersonalWorkerStoreRevision,
+    queue_generation: PersonalWorkerQueueGeneration,
+    bytes_written: usize,
+}
+
+impl PersonalWorkerStoreMigrationReceipt {
+    #[must_use]
+    pub const fn new(
+        disposition: PersonalWorkerStoreMigrationDisposition,
+        from_schema_version: u8,
+        revision: PersonalWorkerStoreRevision,
+        queue_generation: PersonalWorkerQueueGeneration,
+        bytes_written: usize,
+    ) -> Self {
+        Self {
+            disposition,
+            from_schema_version,
+            to_schema_version: PERSONAL_WORKER_STORE_SCHEMA_VERSION,
+            revision,
+            queue_generation,
+            bytes_written,
+        }
+    }
+
+    #[must_use]
+    pub const fn disposition(&self) -> PersonalWorkerStoreMigrationDisposition {
+        self.disposition
+    }
+
+    #[must_use]
+    pub const fn from_schema_version(&self) -> u8 {
+        self.from_schema_version
+    }
+
+    #[must_use]
+    pub const fn to_schema_version(&self) -> u8 {
+        self.to_schema_version
+    }
+
+    #[must_use]
+    pub const fn revision(&self) -> PersonalWorkerStoreRevision {
+        self.revision
+    }
+
+    #[must_use]
+    pub const fn queue_generation(&self) -> PersonalWorkerQueueGeneration {
+        self.queue_generation
+    }
+
+    #[must_use]
+    pub const fn bytes_written(&self) -> usize {
+        self.bytes_written
+    }
 }
 
 impl PersonalWorkerStoreInitializationReceipt {
@@ -738,6 +814,11 @@ pub fn decode_personal_worker_store_document(
     if bytes.len() > MAX_PERSONAL_WORKER_STORE_BYTES {
         return Err(PersonalWorkerStoreError::corrupt_state());
     }
+    let version: WireVersion =
+        serde_json::from_slice(bytes).map_err(|_| PersonalWorkerStoreError::corrupt_state())?;
+    if version.schema_version != PERSONAL_WORKER_STORE_SCHEMA_VERSION {
+        return Err(PersonalWorkerStoreError::version_incompatible());
+    }
     let wire: WireDocument =
         serde_json::from_slice(bytes).map_err(|_| PersonalWorkerStoreError::corrupt_state())?;
     let document = PersonalWorkerStoreDocument::try_from(wire)?;
@@ -747,6 +828,33 @@ pub fn decode_personal_worker_store_document(
         return Err(PersonalWorkerStoreError::corrupt_state());
     }
     Ok(document)
+}
+
+/// Decode one canonical v1 document and deterministically map its evidence into schema v2.
+///
+/// This function does not write state. Ordinary reads intentionally continue to report v1 as
+/// version-incompatible; callers must use an explicit durable migration operation to publish the
+/// returned v2 document.
+pub fn migrate_personal_worker_store_v1_document(
+    bytes: &[u8],
+) -> Result<PersonalWorkerStoreDocument, PersonalWorkerStoreError> {
+    if bytes.len() > MAX_PERSONAL_WORKER_STORE_BYTES {
+        return Err(PersonalWorkerStoreError::corrupt_state());
+    }
+    let version: WireVersion =
+        serde_json::from_slice(bytes).map_err(|_| PersonalWorkerStoreError::corrupt_state())?;
+    if version.schema_version != 1 {
+        return Err(PersonalWorkerStoreError::version_incompatible());
+    }
+    let wire: WireDocumentV1 =
+        serde_json::from_slice(bytes).map_err(|_| PersonalWorkerStoreError::corrupt_state())?;
+    let mut canonical =
+        serde_json::to_vec_pretty(&wire).map_err(|_| PersonalWorkerStoreError::corrupt_state())?;
+    canonical.push(b'\n');
+    if canonical != bytes {
+        return Err(PersonalWorkerStoreError::corrupt_state());
+    }
+    wire.try_into()
 }
 
 fn next_queue_generation(
@@ -942,12 +1050,18 @@ fn validate_terminal_tombstone_successor(
         ));
     }
     if next.queue.queued != previous.queue.queued
-        || next.queue.current_profile != previous.queue.current_profile
-        || next.queue.last_activity_at != previous.queue.last_activity_at
+        || next.queue.profile_observation != previous.queue.profile_observation
         || next.queue.pending_profile_change != previous.queue.pending_profile_change
     {
         return Err(PersonalWorkerStoreError::revision_conflict(
             "terminal release successor changed unrelated queue policy state",
+        ));
+    }
+    if next.queue.activity_evidence
+        != PersonalWorkerActivityEvidence::observed(appended.completed_at())
+    {
+        return Err(PersonalWorkerStoreError::revision_conflict(
+            "terminal release successor must record exact completion activity evidence",
         ));
     }
     if next.queue.observed_at != appended.completed_at() {
@@ -1204,6 +1318,64 @@ wire_enum!(WireProfile, PersonalWorkerProfile, {
     Interactive,
     Work,
 });
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum WireProfileObservation {
+    Unobserved,
+    Observed { profile: WireProfile },
+}
+
+impl From<PersonalWorkerProfileObservation> for WireProfileObservation {
+    fn from(value: PersonalWorkerProfileObservation) -> Self {
+        match value {
+            PersonalWorkerProfileObservation::Unobserved => Self::Unobserved,
+            PersonalWorkerProfileObservation::Observed { profile } => Self::Observed {
+                profile: profile.into(),
+            },
+        }
+    }
+}
+
+impl From<WireProfileObservation> for PersonalWorkerProfileObservation {
+    fn from(value: WireProfileObservation) -> Self {
+        match value {
+            WireProfileObservation::Unobserved => Self::Unobserved,
+            WireProfileObservation::Observed { profile } => Self::observed(profile.into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum WireActivityEvidence {
+    Never,
+    Observed { last_activity_at: u64 },
+}
+
+impl From<PersonalWorkerActivityEvidence> for WireActivityEvidence {
+    fn from(value: PersonalWorkerActivityEvidence) -> Self {
+        match value {
+            PersonalWorkerActivityEvidence::Never => Self::Never,
+            PersonalWorkerActivityEvidence::Observed { last_activity_at } => Self::Observed {
+                last_activity_at: last_activity_at.get(),
+            },
+        }
+    }
+}
+
+impl TryFrom<WireActivityEvidence> for PersonalWorkerActivityEvidence {
+    type Error = PersonalWorkerStoreError;
+
+    fn try_from(value: WireActivityEvidence) -> Result<Self, Self::Error> {
+        match value {
+            WireActivityEvidence::Never => Ok(Self::Never),
+            WireActivityEvidence::Observed { last_activity_at } => {
+                Ok(Self::observed(epoch(last_activity_at)?))
+            }
+        }
+    }
+}
 wire_enum!(WireCacheAccess, PersonalWorkerCacheAccessMode, {
     Read,
     Write,
@@ -1722,6 +1894,18 @@ impl TryFrom<WirePendingProfileChange> for PersonalWorkerPendingProfileChange {
 struct WireQueue {
     generation: u64,
     observed_at: u64,
+    profile_observation: WireProfileObservation,
+    activity_evidence: WireActivityEvidence,
+    queued: Vec<WireRequest>,
+    active: Vec<WireActive>,
+    pending_profile_change: Option<WirePendingProfileChange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireQueueV1 {
+    generation: u64,
+    observed_at: u64,
     current_profile: WireProfile,
     last_activity_at: u64,
     queued: Vec<WireRequest>,
@@ -1729,13 +1913,45 @@ struct WireQueue {
     pending_profile_change: Option<WirePendingProfileChange>,
 }
 
+impl TryFrom<WireQueueV1> for PersonalWorkerQueueInput {
+    type Error = PersonalWorkerStoreError;
+
+    fn try_from(value: WireQueueV1) -> Result<Self, Self::Error> {
+        Ok(Self {
+            generation: PersonalWorkerQueueGeneration::new(value.generation)
+                .map_err(|_| PersonalWorkerStoreError::corrupt_state())?,
+            observed_at: epoch(value.observed_at)?,
+            profile_observation: PersonalWorkerProfileObservation::observed(
+                value.current_profile.into(),
+            ),
+            activity_evidence: PersonalWorkerActivityEvidence::observed(epoch(
+                value.last_activity_at,
+            )?),
+            queued: value
+                .queued
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?,
+            active: value
+                .active
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?,
+            pending_profile_change: value
+                .pending_profile_change
+                .map(TryInto::try_into)
+                .transpose()?,
+        })
+    }
+}
+
 impl From<&PersonalWorkerQueueInput> for WireQueue {
     fn from(value: &PersonalWorkerQueueInput) -> Self {
         Self {
             generation: value.generation.get(),
             observed_at: value.observed_at.get(),
-            current_profile: value.current_profile.into(),
-            last_activity_at: value.last_activity_at.get(),
+            profile_observation: value.profile_observation.into(),
+            activity_evidence: value.activity_evidence.into(),
             queued: value.queued.iter().map(Into::into).collect(),
             active: value.active.iter().map(Into::into).collect(),
             pending_profile_change: value.pending_profile_change.map(Into::into),
@@ -1751,8 +1967,8 @@ impl TryFrom<WireQueue> for PersonalWorkerQueueInput {
             generation: PersonalWorkerQueueGeneration::new(value.generation)
                 .map_err(|_| PersonalWorkerStoreError::corrupt_state())?,
             observed_at: epoch(value.observed_at)?,
-            current_profile: value.current_profile.into(),
-            last_activity_at: epoch(value.last_activity_at)?,
+            profile_observation: value.profile_observation.into(),
+            activity_evidence: value.activity_evidence.try_into()?,
             queued: value
                 .queued
                 .into_iter()
@@ -1971,6 +2187,54 @@ struct WireDocument {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     terminal_tombstones: Vec<WireTerminalTombstone>,
     history: Vec<WireHistoryEntry>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+struct WireVersion {
+    schema_version: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireDocumentV1 {
+    schema_version: u8,
+    revision: u64,
+    queue: WireQueueV1,
+    cache_leases: Vec<WireCacheLease>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    terminal_tombstones: Vec<WireTerminalTombstone>,
+    history: Vec<WireHistoryEntry>,
+}
+
+impl TryFrom<WireDocumentV1> for PersonalWorkerStoreDocument {
+    type Error = PersonalWorkerStoreError;
+
+    fn try_from(value: WireDocumentV1) -> Result<Self, Self::Error> {
+        if value.schema_version != 1 {
+            return Err(PersonalWorkerStoreError::version_incompatible());
+        }
+        Self::from_parts(
+            PersonalWorkerStoreRevision::new(value.revision)
+                .map_err(|_| PersonalWorkerStoreError::corrupt_state())?,
+            value.queue.try_into()?,
+            value
+                .cache_leases
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?,
+            value
+                .terminal_tombstones
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?,
+            value
+                .history
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?,
+        )
+        .map_err(|_| PersonalWorkerStoreError::corrupt_state())
+    }
 }
 
 impl From<&PersonalWorkerStoreDocument> for WireDocument {

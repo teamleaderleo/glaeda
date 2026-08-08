@@ -6,9 +6,10 @@ use smolrunner::execution_admission::{
     ReservationGeneration, ReservationId, RunnerProfileId, UnavailableReason,
 };
 use smolrunner::personal_worker_queue::{
-    PersonalWorkerCacheAccessMode, PersonalWorkerCacheNamespace, PersonalWorkerCancellationState,
-    PersonalWorkerJobRequest, PersonalWorkerPriority, PersonalWorkerProfile,
-    PersonalWorkerQueueGeneration, PersonalWorkerQueueInput, PersonalWorkerSourceIdentity,
+    PersonalWorkerActivityEvidence, PersonalWorkerCacheAccessMode, PersonalWorkerCacheNamespace,
+    PersonalWorkerCancellationState, PersonalWorkerJobRequest, PersonalWorkerPriority,
+    PersonalWorkerProfile, PersonalWorkerProfileObservation, PersonalWorkerQueueGeneration,
+    PersonalWorkerQueueInput, PersonalWorkerSourceIdentity,
 };
 use smolrunner::personal_worker_store::{
     PersonalWorkerDurableCacheLease, PersonalWorkerStore, PersonalWorkerStoreDocument,
@@ -162,8 +163,10 @@ fn empty_queue(generation: u64, observed_at: u64) -> PersonalWorkerQueueInput {
     PersonalWorkerQueueInput {
         generation: PersonalWorkerQueueGeneration::new(generation).expect("generation"),
         observed_at: time(observed_at),
-        current_profile: PersonalWorkerProfile::Interactive,
-        last_activity_at: time(observed_at - 1),
+        profile_observation: PersonalWorkerProfileObservation::observed(
+            PersonalWorkerProfile::Interactive,
+        ),
+        activity_evidence: PersonalWorkerActivityEvidence::observed(time(observed_at - 1)),
         queued: vec![],
         active: vec![],
         pending_profile_change: None,
@@ -174,8 +177,10 @@ fn work_queue(requests: Vec<PersonalWorkerJobRequest>) -> PersonalWorkerQueueInp
     PersonalWorkerQueueInput {
         generation: PersonalWorkerQueueGeneration::new(1).expect("generation"),
         observed_at: time(BASE + 10),
-        current_profile: PersonalWorkerProfile::Work,
-        last_activity_at: time(BASE + 10),
+        profile_observation: PersonalWorkerProfileObservation::observed(
+            PersonalWorkerProfile::Work,
+        ),
+        activity_evidence: PersonalWorkerActivityEvidence::observed(time(BASE + 10)),
         queued: requests,
         active: vec![],
         pending_profile_change: None,
@@ -515,7 +520,10 @@ fn draining_release_and_profile_activity_mutations_are_atomic() {
         },
     )
     .expect("update activity");
-    assert_eq!(current(&store).queue().last_activity_at, time(BASE + 95));
+    assert_eq!(
+        current(&store).queue().activity_evidence.last_activity_at(),
+        Some(time(BASE + 95))
+    );
     assert_eq!(receipt.new_revision().get(), 9);
 }
 
@@ -550,4 +558,51 @@ fn recovery_runs_before_exact_expectation_and_receipts_are_private() {
     assert!(!public.contains("path"));
     assert!(!public.contains("environment"));
     assert!(!public.contains("credential"));
+}
+
+#[test]
+fn first_profile_observation_does_not_invent_activity_and_submission_records_it() {
+    let mut initial_queue = empty_queue(1, BASE);
+    initial_queue.profile_observation = PersonalWorkerProfileObservation::Unobserved;
+    initial_queue.activity_evidence = PersonalWorkerActivityEvidence::Never;
+    let initial =
+        PersonalWorkerStoreDocument::new(initial_queue, vec![]).expect("initial document");
+    let mut store = MemoryStore::with_current(initial);
+
+    let observed = apply_personal_worker_store_mutation(
+        &mut store,
+        PersonalWorkerStoreRevision::new(1).expect("revision"),
+        PersonalWorkerQueueGeneration::new(1).expect("generation"),
+        PersonalWorkerStoreMutation::ObserveProfile {
+            profile: PersonalWorkerProfile::Stopped,
+            observed_at: time(BASE + 10),
+        },
+    )
+    .expect("record first profile observation");
+    assert_eq!(observed.new_revision().get(), 2);
+    let after_observation = current(&store);
+    assert_eq!(
+        after_observation.queue().profile_observation,
+        PersonalWorkerProfileObservation::observed(PersonalWorkerProfile::Stopped)
+    );
+    assert_eq!(
+        after_observation.queue().activity_evidence,
+        PersonalWorkerActivityEvidence::Never
+    );
+
+    let submitted = apply_personal_worker_store_mutation(
+        &mut store,
+        observed.new_revision(),
+        observed.new_queue_generation(),
+        PersonalWorkerStoreMutation::Submit {
+            request: request("first-activity"),
+            observed_at: time(BASE + 20),
+        },
+    )
+    .expect("submit first activity");
+    assert_eq!(submitted.new_revision().get(), 3);
+    assert_eq!(
+        current(&store).queue().activity_evidence,
+        PersonalWorkerActivityEvidence::observed(time(BASE + 20))
+    );
 }

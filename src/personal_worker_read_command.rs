@@ -4,7 +4,7 @@ use std::path::{Component, Path, PathBuf};
 use serde::Serialize;
 use smolrunner::execution_admission::ExecutionRequestId;
 use smolrunner::personal_worker_queue::{
-    PersonalWorkerQueueGeneration, PersonalWorkerQueueVisibility,
+    PersonalWorkerActivityEvidence, PersonalWorkerQueueGeneration, PersonalWorkerQueueVisibility,
 };
 use smolrunner::personal_worker_read_model::{
     PersonalWorkerJobReadRequest, PersonalWorkerJobStateView, PersonalWorkerJobView,
@@ -29,6 +29,7 @@ pub(crate) enum PersonalWorkerReadCommandErrorKind {
     UnsupportedPlatform,
     MissingStore,
     UnsafeStore,
+    DurableStateVersionIncompatible,
     CorruptStore,
     StoreUnavailable,
     InvalidRevision,
@@ -138,10 +139,21 @@ pub(crate) fn render_status_human(view: &PersonalWorkerStatusView) -> String {
         view.queue_generation().get()
     )
     .expect("writing to a String cannot fail");
+    match view.activity_evidence() {
+        PersonalWorkerActivityEvidence::Never => {
+            writeln!(output, "  activity: never").expect("writing to a String cannot fail");
+        }
+        PersonalWorkerActivityEvidence::Observed { last_activity_at } => {
+            writeln!(output, "  activity: observed at {}", last_activity_at.get())
+                .expect("writing to a String cannot fail");
+        }
+    }
     writeln!(
         output,
         "  profile: {} -> {}",
-        serialized_label(&view.current_profile()),
+        view.current_profile()
+            .map(|profile| serialized_label(&profile))
+            .unwrap_or_else(|| "unobserved".to_owned()),
         serialized_label(&view.desired_profile())
     )
     .expect("writing to a String cannot fail");
@@ -372,8 +384,11 @@ fn map_store_error(error: PersonalWorkerStoreError) -> PersonalWorkerReadCommand
             PersonalWorkerReadCommandErrorKind::UnsafeStore,
             "durable personal worker state filesystem is unsafe",
         ),
-        PersonalWorkerStoreErrorKind::VersionIncompatible
-        | PersonalWorkerStoreErrorKind::CorruptState
+        PersonalWorkerStoreErrorKind::VersionIncompatible => command_error(
+            PersonalWorkerReadCommandErrorKind::DurableStateVersionIncompatible,
+            "durable personal worker state schema is incompatible; explicit migration is required",
+        ),
+        PersonalWorkerStoreErrorKind::CorruptState
         | PersonalWorkerStoreErrorKind::InvalidDocument => command_error(
             PersonalWorkerReadCommandErrorKind::CorruptStore,
             "durable personal worker state is corrupt or noncanonical",

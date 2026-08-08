@@ -12,14 +12,15 @@ use crate::operator_error::{
     OperatorRemediationClass, OperatorRetryClass, OperatorSuggestedCommand,
 };
 use crate::personal_worker_queue::{
-    PersonalWorkerProfile, PersonalWorkerQueueGeneration, PersonalWorkerSourceIdentity,
+    PersonalWorkerActivityEvidence, PersonalWorkerProfile, PersonalWorkerProfileObservation,
+    PersonalWorkerQueueGeneration, PersonalWorkerSourceIdentity,
 };
 use crate::personal_worker_read_model::{
     PersonalWorkerJobView, PersonalWorkerStatusView, PersonalWorkerTerminalJobView,
 };
 use crate::personal_worker_store::PersonalWorkerStoreRevision;
 
-pub const OPERATOR_STATUS_SCHEMA_VERSION: u8 = 1;
+pub const OPERATOR_STATUS_SCHEMA_VERSION: u8 = 2;
 pub const MAX_OPERATOR_STATUS_BLOCKERS: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -70,7 +71,8 @@ impl OperatorConfigurationStatus {
 pub struct OperatorWorkerSummary {
     store_revision: PersonalWorkerStoreRevision,
     queue_generation: PersonalWorkerQueueGeneration,
-    current_profile: PersonalWorkerProfile,
+    profile_observation: PersonalWorkerProfileObservation,
+    activity_evidence: PersonalWorkerActivityEvidence,
     desired_profile: PersonalWorkerProfile,
     queued_entry_count: u32,
     eligible_queue_count: u32,
@@ -88,7 +90,8 @@ impl OperatorWorkerSummary {
         Self {
             store_revision: status.store_revision(),
             queue_generation: status.queue_generation(),
-            current_profile: status.current_profile(),
+            profile_observation: status.profile_observation(),
+            activity_evidence: status.activity_evidence(),
             desired_profile: status.desired_profile(),
             queued_entry_count: status.queued_entry_count(),
             eligible_queue_count: status.eligible_queue_count(),
@@ -112,8 +115,18 @@ impl OperatorWorkerSummary {
     }
 
     #[must_use]
-    pub const fn current_profile(self) -> PersonalWorkerProfile {
-        self.current_profile
+    pub const fn profile_observation(self) -> PersonalWorkerProfileObservation {
+        self.profile_observation
+    }
+
+    #[must_use]
+    pub const fn current_profile(self) -> Option<PersonalWorkerProfile> {
+        self.profile_observation.profile()
+    }
+
+    #[must_use]
+    pub const fn activity_evidence(self) -> PersonalWorkerActivityEvidence {
+        self.activity_evidence
     }
 
     #[must_use]
@@ -430,7 +443,7 @@ impl fmt::Display for OperatorStatusReport {
             "worker: revision={} generation={} current={} desired={} queued={} eligible={} cancelled={} selected={} active={} draining={} cache_leases={} terminal_results={}",
             self.worker.store_revision.get(),
             self.worker.queue_generation.get(),
-            profile_name(self.worker.current_profile),
+            profile_observation_name(self.worker.profile_observation),
             profile_name(self.worker.desired_profile),
             self.worker.queued_entry_count,
             self.worker.eligible_queue_count,
@@ -447,6 +460,18 @@ impl fmt::Display for OperatorStatusReport {
             lima_name(self.machine.lima),
             runner_name(self.machine.runner)
         )?;
+        match self.worker.activity_evidence {
+            PersonalWorkerActivityEvidence::Never => {
+                writeln!(formatter, "worker activity: never")?;
+            }
+            PersonalWorkerActivityEvidence::Observed { last_activity_at } => {
+                writeln!(
+                    formatter,
+                    "worker activity: observed at {}",
+                    last_activity_at.get()
+                )?;
+            }
+        }
 
         if let Some(active) = &self.active_job {
             writeln!(
@@ -700,7 +725,7 @@ fn continuation_required(
     worker: OperatorWorkerSummary,
     machine: OperatorMachineSummary,
 ) -> bool {
-    worker.current_profile != worker.desired_profile
+    worker.profile_observation.profile() != Some(worker.desired_profile)
         || worker.queued_entry_count > 0
         || worker.selected_count > 0
         || worker.active_count > 0
@@ -729,6 +754,13 @@ const fn profile_name(value: PersonalWorkerProfile) -> &'static str {
         PersonalWorkerProfile::Stopped => "stopped",
         PersonalWorkerProfile::Interactive => "interactive",
         PersonalWorkerProfile::Work => "work",
+    }
+}
+
+const fn profile_observation_name(value: PersonalWorkerProfileObservation) -> &'static str {
+    match value {
+        PersonalWorkerProfileObservation::Unobserved => "unobserved",
+        PersonalWorkerProfileObservation::Observed { profile } => profile_name(profile),
     }
 }
 
@@ -859,7 +891,10 @@ mod tests {
         OperatorWorkerSummary {
             store_revision: PersonalWorkerStoreRevision::new(7).expect("revision"),
             queue_generation: PersonalWorkerQueueGeneration::new(9).expect("generation"),
-            current_profile,
+            profile_observation: PersonalWorkerProfileObservation::observed(current_profile),
+            activity_evidence: PersonalWorkerActivityEvidence::observed(
+                EpochMillis::new(1).expect("activity time"),
+            ),
             desired_profile,
             queued_entry_count: queued,
             eligible_queue_count: eligible,
@@ -919,12 +954,64 @@ mod tests {
         assert_eq!(report.next_action(), None);
         let value = serde_json::to_value(&report).expect("JSON");
         assert_eq!(value["disposition"], json!("satisfied"));
-        assert_eq!(value["worker"]["current_profile"], json!("stopped"));
+        assert_eq!(
+            value["worker"]["profile_observation"],
+            json!({"state": "observed", "profile": "stopped"})
+        );
         assert_eq!(value["machine"]["runner"], json!("offline"));
         let human = report.render_human();
         for expected in ["status: satisfied", "current=stopped", "runner=offline"] {
             assert!(human.contains(expected));
         }
+    }
+
+    #[test]
+    fn unobserved_never_active_worker_requires_run_once_without_invented_values() {
+        let mut worker = worker(
+            PersonalWorkerProfile::Stopped,
+            PersonalWorkerProfile::Stopped,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        );
+        worker.profile_observation = PersonalWorkerProfileObservation::Unobserved;
+        worker.activity_evidence = PersonalWorkerActivityEvidence::Never;
+        let report = OperatorStatusReport::new(
+            configuration(OperatorConfigurationCompatibility::Compatible),
+            worker,
+            OperatorMachineSummary::new(
+                LimaRuntimeState::Uninitialized,
+                ActionsRunnerReadinessState::Offline,
+            ),
+            None,
+            None,
+            [],
+        )
+        .expect("unobserved worker status");
+        assert_eq!(
+            report.disposition(),
+            OperatorStatusDisposition::Continuation
+        );
+        assert_eq!(
+            report.next_action(),
+            Some(OperatorSuggestedCommand::WorkerRunOnce)
+        );
+        let value = serde_json::to_value(&report).expect("JSON");
+        assert_eq!(
+            value["worker"]["profile_observation"],
+            json!({"state": "unobserved"})
+        );
+        assert_eq!(
+            value["worker"]["activity_evidence"],
+            json!({"state": "never"})
+        );
+        let human = report.render_human();
+        assert!(human.contains("current=unobserved"));
+        assert!(human.contains("worker activity: never"));
+        assert!(human.contains("next: smolrunner worker run-once"));
     }
 
     #[test]
