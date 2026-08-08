@@ -539,12 +539,12 @@ impl PersonalWorkerTickPolicy {
                 target: PersonalWorkerTickObservationTarget::Runner,
             });
         }
-        if input
-            .queue
-            .visibility
-            .iter()
-            .any(|entry| entry.state == PersonalWorkerQueueEntryState::Starting)
-        {
+        if input.queue.visibility.iter().any(|entry| {
+            matches!(
+                entry.state,
+                PersonalWorkerQueueEntryState::Starting | PersonalWorkerQueueEntryState::Running
+            )
+        }) {
             return Ok(PersonalWorkerTickAction::Observe {
                 target: PersonalWorkerTickObservationTarget::Runner,
             });

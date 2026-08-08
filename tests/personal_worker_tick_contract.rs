@@ -581,6 +581,16 @@ fn existing_reservation_executes_without_selecting_a_second_job() {
             target: PersonalWorkerTickObservationTarget::Runner,
         }
     );
+
+    evidence.queue.visibility[0].state = PersonalWorkerQueueEntryState::Running;
+    evidence.runner = Some(runner(1_000, HostBrokerRunnerState::IdleReady));
+    let lost_process = plan(&evidence).expect("running attempt without busy runner evidence");
+    assert_eq!(
+        lost_process.action(),
+        &PersonalWorkerTickAction::Observe {
+            target: PersonalWorkerTickObservationTarget::Runner,
+        }
+    );
 }
 
 #[test]
