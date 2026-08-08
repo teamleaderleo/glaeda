@@ -6,10 +6,10 @@ use crate::execution_admission::{
     EpochMillis, ExecutionAdmissionRecord, ExecutionAdmissionState, ExecutionRequestId,
 };
 use crate::personal_worker_queue::{
-    PersonalWorkerActiveReservation, PersonalWorkerActivityEvidence,
-    PersonalWorkerCancellationState, PersonalWorkerJobRequest, PersonalWorkerPendingProfileChange,
-    PersonalWorkerProfile, PersonalWorkerProfileObservation, PersonalWorkerQueueGeneration,
-    PersonalWorkerQueueInput,
+    MAX_PERSONAL_WORKER_QUEUE_ENTRIES, PersonalWorkerActiveReservation,
+    PersonalWorkerActivityEvidence, PersonalWorkerCancellationState, PersonalWorkerJobRequest,
+    PersonalWorkerPendingProfileChange, PersonalWorkerProfile, PersonalWorkerProfileObservation,
+    PersonalWorkerQueueGeneration, PersonalWorkerQueueInput,
 };
 use crate::personal_worker_store::{
     MAX_PERSONAL_WORKER_TERMINAL_TOMBSTONES, PersonalWorkerDurableCacheLease, PersonalWorkerStore,
@@ -180,6 +180,7 @@ pub enum PersonalWorkerStoreMutationErrorKind {
     StaleQueueGeneration,
     NotFound,
     Conflict,
+    CapacityReached,
     InvalidMutation,
     Busy,
     Io,
@@ -388,6 +389,12 @@ fn apply_to_snapshot(
                         "personal worker request identity is already bound to different semantics",
                     ))
                 };
+            }
+            if queue.queued.len() >= MAX_PERSONAL_WORKER_QUEUE_ENTRIES {
+                return Err(PersonalWorkerStoreMutationError::new(
+                    PersonalWorkerStoreMutationErrorKind::CapacityReached,
+                    "personal worker queue has reached its accepted capacity",
+                ));
             }
             queue.queued.push(request);
             (observed_at, Some(observed_at))

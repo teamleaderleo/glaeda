@@ -454,6 +454,9 @@ fn map_mutation_error(error: PersonalWorkerStoreMutationError) -> PersonalWorker
         PersonalWorkerStoreMutationErrorKind::Conflict => {
             PersonalWorkerSubmitCommandErrorKind::Conflict
         }
+        PersonalWorkerStoreMutationErrorKind::CapacityReached => {
+            PersonalWorkerSubmitCommandErrorKind::InvalidMutation
+        }
         PersonalWorkerStoreMutationErrorKind::InvalidMutation => {
             PersonalWorkerSubmitCommandErrorKind::InvalidMutation
         }
