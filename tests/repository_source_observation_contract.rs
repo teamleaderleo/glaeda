@@ -227,7 +227,7 @@ fn clean_exact_source_uses_two_fixed_credentialless_snapshots() {
                 })
                 .collect::<Vec<_>>(),
             vec![
-                ("GIT_ALLOW_PROTOCOL", "file"),
+                ("GIT_ALLOW_PROTOCOL", ""),
                 ("GIT_ASKPASS", "/bin/false"),
                 ("GIT_CONFIG_GLOBAL", "/dev/null"),
                 ("GIT_CONFIG_NOSYSTEM", "1"),

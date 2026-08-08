@@ -299,7 +299,9 @@ impl RepositorySourceObserver {
             .environment("GIT_NO_LAZY_FETCH", "1")
             .environment("GIT_TERMINAL_PROMPT", "0")
             .environment("GIT_ASKPASS", "/bin/false")
-            .environment("GIT_ALLOW_PROTOCOL", "file")
+            // An empty allowlist disables every transport, including `file`, on the Ubuntu 24.04
+            // Git baseline. `GIT_NO_LAZY_FETCH` remains defense in depth for newer Git versions.
+            .environment("GIT_ALLOW_PROTOCOL", "")
             .environment("GIT_PROTOCOL_FROM_USER", "0")
             .environment("LC_ALL", "C")
             .environment("LANG", "C");
