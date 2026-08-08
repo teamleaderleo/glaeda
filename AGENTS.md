@@ -109,6 +109,7 @@ Keep changes small enough to review. State the security impact, commands run, an
 
 - Review your own diff continuously while implementing. Before declaring a change ready, read the complete final diff once for correctness, accidental scope, stale comments, duplicated logic, missing failure cases, and violations of the accepted ADRs.
 - Treat that final once-over plus the required checks as the normal review path. Avoid spawning extra review agents or external review services for routine changes.
+- CodeDriver usage is exhausted. Do not contact CodeDriver, request work from it, or make repository progress depend on it.
 - CodeRabbit is unavailable because the operator has no remaining usage. Do not request `@coderabbitai review`, wait for CodeRabbit, or treat a stale CodeRabbit status as acceptance.
 - For privilege-boundary, ownership or adoption, durable persistence and recovery, rollback or compensation, secret handling, concurrency or race-sensitive, destructive, or comparable high-risk changes, use an implementation-independent Codex agent to review the complete exact-head diff. Record its evidence-based verdict on the pull request.
 - Do not request GitHub-hosted Codex reviews or mention `@codex review`. Use locally coordinated Codex review agents only when the repository's independent-review rule requires them or the human operator explicitly asks for them.
