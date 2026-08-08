@@ -418,7 +418,8 @@ fn map_store_error(error: PersonalWorkerStoreError) -> PersonalWorkerSubmitComma
             PersonalWorkerSubmitCommandErrorKind::Busy,
             "another personal worker store mutation holds the writer lock",
         ),
-        PersonalWorkerStoreErrorKind::CorruptState
+        PersonalWorkerStoreErrorKind::VersionIncompatible
+        | PersonalWorkerStoreErrorKind::CorruptState
         | PersonalWorkerStoreErrorKind::InvalidDocument => command_error(
             PersonalWorkerSubmitCommandErrorKind::CorruptStore,
             "durable personal worker state is corrupt or noncanonical",

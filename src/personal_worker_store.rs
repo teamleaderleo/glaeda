@@ -582,6 +582,51 @@ impl PersonalWorkerStoreRecovery {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
+pub enum PersonalWorkerStoreInitializationDisposition {
+    Created,
+    AlreadyExists,
+    RecoveryRequired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct PersonalWorkerStoreInitializationReceipt {
+    disposition: PersonalWorkerStoreInitializationDisposition,
+    revision: Option<PersonalWorkerStoreRevision>,
+    bytes_written: usize,
+}
+
+impl PersonalWorkerStoreInitializationReceipt {
+    #[must_use]
+    pub const fn new(
+        disposition: PersonalWorkerStoreInitializationDisposition,
+        revision: Option<PersonalWorkerStoreRevision>,
+        bytes_written: usize,
+    ) -> Self {
+        Self {
+            disposition,
+            revision,
+            bytes_written,
+        }
+    }
+
+    #[must_use]
+    pub const fn disposition(&self) -> PersonalWorkerStoreInitializationDisposition {
+        self.disposition
+    }
+
+    #[must_use]
+    pub const fn revision(&self) -> Option<PersonalWorkerStoreRevision> {
+        self.revision
+    }
+
+    #[must_use]
+    pub const fn bytes_written(&self) -> usize {
+        self.bytes_written
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PersonalWorkerStoreErrorKind {
     InvalidDocument,
     RevisionConflict,
@@ -589,6 +634,7 @@ pub enum PersonalWorkerStoreErrorKind {
     Missing,
     Io,
     UnsafeFilesystem,
+    VersionIncompatible,
     CorruptState,
 }
 
@@ -623,6 +669,14 @@ impl PersonalWorkerStoreError {
 
     const fn revision_conflict(message: &'static str) -> Self {
         Self::new(PersonalWorkerStoreErrorKind::RevisionConflict, message)
+    }
+
+    #[must_use]
+    pub const fn version_incompatible() -> Self {
+        Self::new(
+            PersonalWorkerStoreErrorKind::VersionIncompatible,
+            "durable personal worker state schema is incompatible",
+        )
     }
 
     #[must_use]
@@ -1937,7 +1991,7 @@ impl TryFrom<WireDocument> for PersonalWorkerStoreDocument {
 
     fn try_from(value: WireDocument) -> Result<Self, Self::Error> {
         if value.schema_version != PERSONAL_WORKER_STORE_SCHEMA_VERSION {
-            return Err(PersonalWorkerStoreError::corrupt_state());
+            return Err(PersonalWorkerStoreError::version_incompatible());
         }
         Self::from_parts(
             PersonalWorkerStoreRevision::new(value.revision)

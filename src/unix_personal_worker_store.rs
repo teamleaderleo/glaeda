@@ -2,16 +2,19 @@ use std::fs::File;
 use std::io::{Read as _, Write as _};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rustix::fs::{self, AtFlags, FileType, FlockOperation, Mode, OFlags, RenameFlags};
 use rustix::io::Errno;
 
 use crate::personal_worker_store::{
     MAX_PERSONAL_WORKER_STORE_BYTES, PersonalWorkerStore, PersonalWorkerStoreDocument,
-    PersonalWorkerStoreError, PersonalWorkerStoreErrorKind, PersonalWorkerStoreRecovery,
-    PersonalWorkerStoreRecoveryDisposition, PersonalWorkerStoreRevision,
-    PersonalWorkerStoreWriteDisposition, PersonalWorkerStoreWriteReceipt,
-    decode_personal_worker_store_document, encode_personal_worker_store_document,
+    PersonalWorkerStoreError, PersonalWorkerStoreErrorKind,
+    PersonalWorkerStoreInitializationDisposition, PersonalWorkerStoreInitializationReceipt,
+    PersonalWorkerStoreRecovery, PersonalWorkerStoreRecoveryDisposition,
+    PersonalWorkerStoreRevision, PersonalWorkerStoreWriteDisposition,
+    PersonalWorkerStoreWriteReceipt, decode_personal_worker_store_document,
+    encode_personal_worker_store_document,
 };
 
 const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
@@ -40,6 +43,7 @@ const STORE_DIRECTORY: &str = "personal-worker";
 const STORE_LOCK_FILE: &str = "store.lock";
 const CURRENT_DOCUMENT: &str = "current.json";
 const STAGED_DOCUMENT: &str = ".next.json";
+static NEXT_INITIALIZATION_STAGE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
 pub struct UnixPersonalWorkerStore {
@@ -88,26 +92,71 @@ impl UnixPersonalWorkerStore {
         })
     }
 
-    fn acquire_mutation_lock(&self) -> Result<StoreMutationLock, PersonalWorkerStoreError> {
-        let lock = fs::openat(
-            &self.directory,
-            STORE_LOCK_FILE,
-            EXISTING_LOCK_FLAGS,
-            Mode::empty(),
-        )
-        .map_err(map_lock_open_error)?;
-        inspect_private_file(&lock, self.owner, "personal worker store lock", Some(0))?;
-        match fs::flock(&lock, FlockOperation::NonBlockingLockExclusive) {
-            Ok(()) => Ok(StoreMutationLock { _lock: lock }),
-            Err(Errno::AGAIN) => Err(store_error(
-                PersonalWorkerStoreErrorKind::Busy,
-                "another personal worker store mutation holds the writer lock",
-            )),
-            Err(_) => Err(store_error(
-                PersonalWorkerStoreErrorKind::Io,
-                "could not acquire the personal worker store writer lock",
-            )),
+    /// Create the exact initial document only when no current or staged state exists.
+    ///
+    /// The writer lock is acquired before inspecting durable state. Any valid staged
+    /// recovery state is reported without publication or cleanup, and an existing current
+    /// document is returned as an idempotent result without changing its bytes.
+    pub fn initialize_if_clean(
+        root_path: impl AsRef<Path>,
+        document: &PersonalWorkerStoreDocument,
+    ) -> Result<PersonalWorkerStoreInitializationReceipt, PersonalWorkerStoreError> {
+        if document.revision().get() != 1 || !document.history().is_empty() {
+            return Err(store_error(
+                PersonalWorkerStoreErrorKind::RevisionConflict,
+                "initial personal worker state must use revision one without history",
+            ));
         }
+        let root = fs::open(root_path.as_ref(), DIRECTORY_FLAGS, Mode::empty())
+            .map_err(map_root_open_error)?;
+        let root_stat = inspect_directory(&root, "personal worker state root", None)?;
+        let owner = (root_stat.st_uid, root_stat.st_gid);
+        let (directory, publication_lock) = open_or_publish_initialization_directory(&root, owner)?;
+        let store = Self {
+            _root: root,
+            directory,
+            owner,
+        };
+        let _lock = match publication_lock {
+            Some(lock) => lock,
+            None => store.acquire_mutation_lock()?,
+        };
+        // A previous initializer may have crashed or received an fsync error after publishing the
+        // managed directory but before its parent entry became durable. Every initializer closes
+        // that recovery window under the canonical lock before it can inspect, publish, or report
+        // success from the store.
+        synchronize_directory(&store._root, "personal worker state root")?;
+        match store.recovery_plan()? {
+            StoreRecoveryPlan::Clean {
+                revision: Some(revision),
+            } => Ok(PersonalWorkerStoreInitializationReceipt::new(
+                PersonalWorkerStoreInitializationDisposition::AlreadyExists,
+                Some(revision),
+                0,
+            )),
+            StoreRecoveryPlan::Clean { revision: None } => {
+                let bytes_written = encode_personal_worker_store_document(document)?.len();
+                let mut staged = store.stage_document(document)?;
+                store.publish_staged(&mut staged, true)?;
+                Ok(PersonalWorkerStoreInitializationReceipt::new(
+                    PersonalWorkerStoreInitializationDisposition::Created,
+                    Some(document.revision()),
+                    bytes_written,
+                ))
+            }
+            StoreRecoveryPlan::PublishStaged { revision, .. }
+            | StoreRecoveryPlan::RemoveStaleStaged { revision } => {
+                Ok(PersonalWorkerStoreInitializationReceipt::new(
+                    PersonalWorkerStoreInitializationDisposition::RecoveryRequired,
+                    Some(revision),
+                    0,
+                ))
+            }
+        }
+    }
+
+    fn acquire_mutation_lock(&self) -> Result<StoreMutationLock, PersonalWorkerStoreError> {
+        acquire_mutation_lock_in(&self.directory, self.owner)
     }
 
     fn load_named(
@@ -138,9 +187,7 @@ impl UnixPersonalWorkerStore {
         if bytes.len() > MAX_PERSONAL_WORKER_STORE_BYTES {
             return Err(PersonalWorkerStoreError::corrupt_state());
         }
-        decode_personal_worker_store_document(&bytes)
-            .map(Some)
-            .map_err(|_| PersonalWorkerStoreError::corrupt_state())
+        decode_personal_worker_store_document(&bytes).map(Some)
     }
 
     fn stage_document(
@@ -229,13 +276,13 @@ impl UnixPersonalWorkerStore {
         }
     }
 
-    fn recover_locked(&mut self) -> Result<PersonalWorkerStoreRecovery, PersonalWorkerStoreError> {
+    fn recovery_plan(&self) -> Result<StoreRecoveryPlan, PersonalWorkerStoreError> {
         let Some(staged) = self.load_named(STAGED_DOCUMENT)? else {
-            return Ok(PersonalWorkerStoreRecovery::new(
-                PersonalWorkerStoreRecoveryDisposition::Clean,
-                self.load_named(CURRENT_DOCUMENT)?
+            return Ok(StoreRecoveryPlan::Clean {
+                revision: self
+                    .load_named(CURRENT_DOCUMENT)?
                     .map(|document| document.revision()),
-            ));
+            });
         };
         let current = self.load_named(CURRENT_DOCUMENT)?;
         match current {
@@ -243,29 +290,50 @@ impl UnixPersonalWorkerStore {
                 if staged.revision().get() != 1 || !staged.history().is_empty() {
                     return Err(PersonalWorkerStoreError::corrupt_state());
                 }
-                let mut staged_guard = StagedDocument::existing(self.directory.as_fd());
-                self.publish_staged(&mut staged_guard, true)?;
-                Ok(PersonalWorkerStoreRecovery::new(
-                    PersonalWorkerStoreRecoveryDisposition::PublishedStaged,
-                    Some(staged.revision()),
-                ))
+                Ok(StoreRecoveryPlan::PublishStaged {
+                    revision: staged.revision(),
+                    no_replace: true,
+                })
             }
             Some(current) if staged.revision() <= current.revision() => {
-                self.remove_staged()?;
-                Ok(PersonalWorkerStoreRecovery::new(
-                    PersonalWorkerStoreRecoveryDisposition::RemovedStaleStaged,
-                    Some(current.revision()),
-                ))
+                Ok(StoreRecoveryPlan::RemoveStaleStaged {
+                    revision: current.revision(),
+                })
             }
             Some(current) => {
                 staged
                     .validate_successor_of(&current)
                     .map_err(|_| PersonalWorkerStoreError::corrupt_state())?;
+                Ok(StoreRecoveryPlan::PublishStaged {
+                    revision: staged.revision(),
+                    no_replace: false,
+                })
+            }
+        }
+    }
+
+    fn recover_locked(&mut self) -> Result<PersonalWorkerStoreRecovery, PersonalWorkerStoreError> {
+        match self.recovery_plan()? {
+            StoreRecoveryPlan::Clean { revision } => Ok(PersonalWorkerStoreRecovery::new(
+                PersonalWorkerStoreRecoveryDisposition::Clean,
+                revision,
+            )),
+            StoreRecoveryPlan::PublishStaged {
+                revision,
+                no_replace,
+            } => {
                 let mut staged_guard = StagedDocument::existing(self.directory.as_fd());
-                self.publish_staged(&mut staged_guard, false)?;
+                self.publish_staged(&mut staged_guard, no_replace)?;
                 Ok(PersonalWorkerStoreRecovery::new(
                     PersonalWorkerStoreRecoveryDisposition::PublishedStaged,
-                    Some(staged.revision()),
+                    Some(revision),
+                ))
+            }
+            StoreRecoveryPlan::RemoveStaleStaged { revision } => {
+                self.remove_staged()?;
+                Ok(PersonalWorkerStoreRecovery::new(
+                    PersonalWorkerStoreRecoveryDisposition::RemovedStaleStaged,
+                    Some(revision),
                 ))
             }
         }
@@ -341,9 +409,48 @@ impl PersonalWorkerStore for UnixPersonalWorkerStore {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoreRecoveryPlan {
+    Clean {
+        revision: Option<PersonalWorkerStoreRevision>,
+    },
+    PublishStaged {
+        revision: PersonalWorkerStoreRevision,
+        no_replace: bool,
+    },
+    RemoveStaleStaged {
+        revision: PersonalWorkerStoreRevision,
+    },
+}
+
 #[derive(Debug)]
 struct StoreMutationLock {
     _lock: OwnedFd,
+}
+
+fn acquire_mutation_lock_in(
+    directory: &OwnedFd,
+    owner: (u32, u32),
+) -> Result<StoreMutationLock, PersonalWorkerStoreError> {
+    let lock = fs::openat(
+        directory,
+        STORE_LOCK_FILE,
+        EXISTING_LOCK_FLAGS,
+        Mode::empty(),
+    )
+    .map_err(map_lock_open_error)?;
+    inspect_private_file(&lock, owner, "personal worker store lock", Some(0))?;
+    match fs::flock(&lock, FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => Ok(StoreMutationLock { _lock: lock }),
+        Err(Errno::AGAIN) => Err(store_error(
+            PersonalWorkerStoreErrorKind::Busy,
+            "another personal worker store mutation holds the writer lock",
+        )),
+        Err(_) => Err(store_error(
+            PersonalWorkerStoreErrorKind::Io,
+            "could not acquire the personal worker store writer lock",
+        )),
+    }
 }
 
 struct StagedDocument<'a> {
@@ -425,10 +532,9 @@ fn ensure_lock_file(
         PRIVATE_FILE_MODE,
     ) {
         Ok(lock) => {
-            let mut created = CreatedLockFile {
-                directory: directory.as_fd(),
-                armed: true,
-            };
+            // The canonical lock inode becomes synchronization authority as soon as the directory
+            // entry is visible. Never unlink it after that point: another process may already hold
+            // this inode, and replacing its name would split exclusive-writer authority.
             fs::fchmod(&lock, PRIVATE_FILE_MODE).map_err(|_| {
                 store_error(
                     PersonalWorkerStoreErrorKind::Io,
@@ -443,7 +549,6 @@ fn ensure_lock_file(
                 )
             })?;
             synchronize_directory(directory, "personal worker store directory")?;
-            created.armed = false;
             Ok(())
         }
         Err(Errno::EXIST) => {
@@ -460,15 +565,122 @@ fn ensure_lock_file(
     }
 }
 
-struct CreatedLockFile<'a> {
-    directory: BorrowedFd<'a>,
+fn open_or_publish_initialization_directory(
+    root: &OwnedFd,
+    owner: (u32, u32),
+) -> Result<(OwnedFd, Option<StoreMutationLock>), PersonalWorkerStoreError> {
+    match open_existing_initialization_directory(root, owner) {
+        Ok(directory) => return Ok((directory, None)),
+        Err(error) if error.kind() != PersonalWorkerStoreErrorKind::Missing => return Err(error),
+        Err(_) => {}
+    }
+
+    let stage_name = create_initialization_stage_name()?;
+    fs::mkdirat(root, stage_name.as_str(), MANAGED_DIRECTORY_MODE).map_err(|error| {
+        store_error(
+            if error == Errno::EXIST {
+                PersonalWorkerStoreErrorKind::Busy
+            } else {
+                PersonalWorkerStoreErrorKind::Io
+            },
+            "could not create a private personal worker initialization directory",
+        )
+    })?;
+    let mut staged = StagedStoreDirectory {
+        root: root.as_fd(),
+        name: stage_name,
+        armed: true,
+    };
+    let directory = fs::openat(root, staged.name.as_str(), DIRECTORY_FLAGS, Mode::empty())
+        .map_err(map_store_directory_open_error)?;
+    fs::fchmod(&directory, MANAGED_DIRECTORY_MODE).map_err(|_| {
+        store_error(
+            PersonalWorkerStoreErrorKind::Io,
+            "could not set private personal worker initialization directory permissions",
+        )
+    })?;
+    inspect_directory(
+        &directory,
+        "private personal worker initialization directory",
+        Some(owner),
+    )?;
+    ensure_lock_file(&directory, owner)?;
+    let publication_lock = acquire_mutation_lock_in(&directory, owner)?;
+    synchronize_directory(
+        &directory,
+        "private personal worker initialization directory",
+    )?;
+
+    match fs::renameat_with(
+        root,
+        staged.name.as_str(),
+        root,
+        STORE_DIRECTORY,
+        RenameFlags::NOREPLACE,
+    ) {
+        Ok(()) => {
+            staged.armed = false;
+            synchronize_directory(root, "personal worker state root")?;
+            inspect_directory(&directory, "personal worker store directory", Some(owner))?;
+            Ok((directory, Some(publication_lock)))
+        }
+        Err(Errno::EXIST) => {
+            drop(publication_lock);
+            drop(directory);
+            drop(staged);
+            open_existing_initialization_directory(root, owner).map(|directory| (directory, None))
+        }
+        Err(_) => Err(store_error(
+            PersonalWorkerStoreErrorKind::Io,
+            "could not publish the personal worker store directory",
+        )),
+    }
+}
+
+fn open_existing_initialization_directory(
+    root: &OwnedFd,
+    owner: (u32, u32),
+) -> Result<OwnedFd, PersonalWorkerStoreError> {
+    let directory = fs::openat(root, STORE_DIRECTORY, DIRECTORY_FLAGS, Mode::empty())
+        .map_err(map_existing_store_directory_open_error)?;
+    inspect_directory(&directory, "personal worker store directory", Some(owner))?;
+    let lock = fs::openat(
+        &directory,
+        STORE_LOCK_FILE,
+        EXISTING_LOCK_FLAGS,
+        Mode::empty(),
+    )
+    .map_err(map_existing_initialization_lock_open_error)?;
+    inspect_private_file(&lock, owner, "personal worker store lock", Some(0))?;
+    Ok(directory)
+}
+
+fn create_initialization_stage_name() -> Result<String, PersonalWorkerStoreError> {
+    let sequence = NEXT_INITIALIZATION_STAGE.fetch_add(1, Ordering::Relaxed);
+    Ok(format!(
+        ".personal-worker.init-{}-{sequence}",
+        std::process::id()
+    ))
+}
+
+struct StagedStoreDirectory<'a> {
+    root: BorrowedFd<'a>,
+    name: String,
     armed: bool,
 }
 
-impl Drop for CreatedLockFile<'_> {
+impl Drop for StagedStoreDirectory<'_> {
     fn drop(&mut self) {
         if self.armed {
-            let _ = fs::unlinkat(self.directory, STORE_LOCK_FILE, AtFlags::empty());
+            if let Ok(directory) = fs::openat(
+                self.root,
+                self.name.as_str(),
+                DIRECTORY_FLAGS,
+                Mode::empty(),
+            ) {
+                let _ = fs::unlinkat(&directory, STORE_LOCK_FILE, AtFlags::empty());
+            }
+            let _ = fs::unlinkat(self.root, self.name.as_str(), AtFlags::REMOVEDIR);
         }
     }
 }
@@ -626,6 +838,19 @@ fn map_lock_open_error(error: Errno) -> PersonalWorkerStoreError {
         _ => store_error(
             PersonalWorkerStoreErrorKind::Io,
             "could not open the personal worker store lock",
+        ),
+    }
+}
+
+fn map_existing_initialization_lock_open_error(error: Errno) -> PersonalWorkerStoreError {
+    match error {
+        Errno::NOENT | Errno::LOOP | Errno::NOTDIR | Errno::ISDIR => store_error(
+            PersonalWorkerStoreErrorKind::UnsafeFilesystem,
+            "existing personal worker store synchronization metadata is missing or unsafe",
+        ),
+        _ => store_error(
+            PersonalWorkerStoreErrorKind::Io,
+            "could not open existing personal worker store synchronization metadata",
         ),
     }
 }
