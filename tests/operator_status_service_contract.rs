@@ -173,21 +173,33 @@ fn runner(state: ActionsRunnerReadinessState) -> ActionsRunnerReadinessReport {
             | ActionsRunnerReadinessState::Busy
             | ActionsRunnerReadinessState::Draining
     )
-    .then(|| ActionsRunnerConfiguredIdentity {
-        runner_name: ActionsRunnerName::parse("smolrunner-local").expect("runner name"),
-        configuration_digest: digest("b"),
-        runner_root: LimaFilesystemObjectIdentity {
-            device_id: 1,
-            inode: 4,
-        },
-    });
+    .then(configured_runner_identity);
+    let timing = if matches!(
+        state,
+        ActionsRunnerReadinessState::Offline | ActionsRunnerReadinessState::Starting
+    ) {
+        timing(102, 102, 200)
+    } else {
+        timing(102, 103, 200)
+    };
     ActionsRunnerReadinessReport {
         schema_version: ACTIONS_RUNNER_READINESS_SCHEMA_VERSION,
         instance: LimaInstanceName::parse("smolrunner").expect("instance"),
         runner_name: ActionsRunnerName::parse("smolrunner-local").expect("runner name"),
         state,
         configured_identity,
-        timing: timing(102, 103, 200),
+        timing,
+    }
+}
+
+fn configured_runner_identity() -> ActionsRunnerConfiguredIdentity {
+    ActionsRunnerConfiguredIdentity {
+        runner_name: ActionsRunnerName::parse("smolrunner-local").expect("runner name"),
+        configuration_digest: digest("b"),
+        runner_root: LimaFilesystemObjectIdentity {
+            device_id: 1,
+            inode: 4,
+        },
     }
 }
 
@@ -674,6 +686,43 @@ fn future_or_noncanonical_timing_and_machine_identity_fail_closed() {
     let error = OperatorStatusService::compose(future).expect_err("future evidence");
     assert_eq!(error.kind(), OperatorStatusServiceErrorKind::InvalidTiming);
 
+    let mut overlong_lima = lima(LimaRuntimeState::Stopped);
+    overlong_lima.timing.started_at_unix_seconds = 0;
+    overlong_lima.timing.duration_seconds = 101;
+    let error = OperatorStatusService::compose(evidence(
+        config.clone(),
+        overlong_lima,
+        runner(ActionsRunnerReadinessState::Offline),
+    ))
+    .expect_err("Lima probe duration exceeds its source freshness window");
+    assert_eq!(error.kind(), OperatorStatusServiceErrorKind::InvalidTiming);
+
+    let mut delayed_offline = runner(ActionsRunnerReadinessState::Offline);
+    delayed_offline.timing.observed_at_unix_seconds = 103;
+    delayed_offline.timing.duration_seconds = 1;
+    let error = OperatorStatusService::compose(evidence(
+        config.clone(),
+        lima(LimaRuntimeState::Stopped),
+        delayed_offline,
+    ))
+    .expect_err("stopped-source runner observation must return immediately");
+    assert_eq!(error.kind(), OperatorStatusServiceErrorKind::InvalidTiming);
+
+    let mut delayed_stale = stale_runner();
+    delayed_stale.timing.observed_at_unix_seconds = 202;
+    delayed_stale.timing.duration_seconds = 1;
+    let error = OperatorStatusService::compose(OperatorStatusServiceEvidence::new(
+        config.clone(),
+        OperatorConfigurationCompatibility::Compatible,
+        OperatorStatusWorkerEvidence::new(status_read(&config), None, None),
+        lima(LimaRuntimeState::Broken),
+        delayed_stale,
+        202,
+        vec![],
+    ))
+    .expect_err("already-stale runner source must return immediately");
+    assert_eq!(error.kind(), OperatorStatusServiceErrorKind::InvalidTiming);
+
     let mut wrong_instance = lima(LimaRuntimeState::Stopped);
     wrong_instance.instance = LimaInstanceName::parse("foreign").expect("foreign instance");
     let error = OperatorStatusService::compose(evidence(
@@ -698,6 +747,24 @@ fn future_or_noncanonical_timing_and_machine_identity_fail_closed() {
         OperatorStatusServiceErrorKind::RunnerIdentityMismatch
     );
 
+    let mut running_starting = runner(ActionsRunnerReadinessState::Starting);
+    running_starting.configured_identity = Some(configured_runner_identity());
+    running_starting.timing = timing(102, 103, 200);
+    let report = OperatorStatusService::compose(evidence(
+        config.clone(),
+        lima(LimaRuntimeState::Running),
+        running_starting,
+    ))
+    .expect("running-source starting runner");
+    assert_eq!(
+        report.disposition(),
+        OperatorStatusDisposition::Continuation
+    );
+    assert_eq!(
+        report.machine().runner(),
+        ActionsRunnerReadinessState::Starting
+    );
+
     let error = OperatorStatusService::compose(evidence(
         config.clone(),
         lima(LimaRuntimeState::Stopped),
@@ -710,14 +777,7 @@ fn future_or_noncanonical_timing_and_machine_identity_fail_closed() {
     );
 
     let mut wrong_runner = runner(ActionsRunnerReadinessState::Offline);
-    wrong_runner.configured_identity = Some(ActionsRunnerConfiguredIdentity {
-        runner_name: ActionsRunnerName::parse("smolrunner-local").expect("runner name"),
-        configuration_digest: digest("b"),
-        runner_root: LimaFilesystemObjectIdentity {
-            device_id: 1,
-            inode: 4,
-        },
-    });
+    wrong_runner.configured_identity = Some(configured_runner_identity());
     let error = OperatorStatusService::compose(evidence(
         config,
         lima(LimaRuntimeState::Stopped),

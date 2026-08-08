@@ -435,7 +435,7 @@ fn validate_machine_identity(
     if evidence.runner.schema_version != ACTIONS_RUNNER_READINESS_SCHEMA_VERSION
         || evidence.runner.instance != *evidence.config.lima_instance()
         || evidence.runner.instance != evidence.lima.instance
-        || !runner_identity_matches_state(&evidence.runner)
+        || !runner_identity_matches_lima_source(&evidence.runner, &evidence.lima)
         || !runner_state_matches_lima_source(&evidence.runner, &evidence.lima)
     {
         return Err(OperatorStatusServiceError::new(
@@ -483,17 +483,28 @@ fn lima_guest_matches_state(report: &LimaInstanceObservationReport) -> bool {
     }
 }
 
-fn runner_identity_matches_state(report: &ActionsRunnerReadinessReport) -> bool {
-    match report.state {
-        ActionsRunnerReadinessState::IdleReady
-        | ActionsRunnerReadinessState::Busy
-        | ActionsRunnerReadinessState::Draining => report
+fn runner_identity_matches_lima_source(
+    runner: &ActionsRunnerReadinessReport,
+    lima: &LimaInstanceObservationReport,
+) -> bool {
+    let configured_name_matches = || {
+        runner
             .configured_identity
             .as_ref()
-            .is_some_and(|identity| identity.runner_name == report.runner_name),
-        ActionsRunnerReadinessState::Offline
-        | ActionsRunnerReadinessState::Starting
-        | ActionsRunnerReadinessState::Stale => report.configured_identity.is_none(),
+            .is_some_and(|identity| identity.runner_name == runner.runner_name)
+    };
+    match runner.state {
+        ActionsRunnerReadinessState::IdleReady
+        | ActionsRunnerReadinessState::Busy
+        | ActionsRunnerReadinessState::Draining => configured_name_matches(),
+        ActionsRunnerReadinessState::Starting
+            if lima.configured.runtime_state == LimaRuntimeState::Running =>
+        {
+            configured_name_matches()
+        }
+        ActionsRunnerReadinessState::Starting
+        | ActionsRunnerReadinessState::Offline
+        | ActionsRunnerReadinessState::Stale => runner.configured_identity.is_none(),
     }
 }
 
@@ -505,10 +516,12 @@ fn validate_timing(
     if !canonical_timing(lima)
         || !canonical_timing(runner)
         || lima.observed_at_unix_seconds >= lima.expires_at_unix_seconds
+        || !lima_duration_within_freshness_window(lima)
         || lima.freshness != LimaObservationFreshness::Fresh
         || runner.started_at_unix_seconds < lima.observed_at_unix_seconds
         || runner.expires_at_unix_seconds != lima.expires_at_unix_seconds
         || runner.freshness != lima.freshness_at(runner.observed_at_unix_seconds)
+        || !runner_timing_matches_source(&evidence.runner, &evidence.lima)
         || (evidence.runner.state == ActionsRunnerReadinessState::Stale)
             != (runner.freshness != LimaObservationFreshness::Fresh)
         || lima.freshness_at(evidence.observed_at_unix_seconds) == LimaObservationFreshness::Future
@@ -521,6 +534,39 @@ fn validate_timing(
         ));
     }
     Ok(())
+}
+
+fn runner_timing_matches_source(
+    runner: &ActionsRunnerReadinessReport,
+    lima: &LimaInstanceObservationReport,
+) -> bool {
+    let immediate = runner.timing.duration_seconds == 0;
+    match runner.state {
+        ActionsRunnerReadinessState::Offline => immediate,
+        ActionsRunnerReadinessState::Starting
+            if lima.configured.runtime_state != LimaRuntimeState::Running =>
+        {
+            immediate
+        }
+        ActionsRunnerReadinessState::Stale
+            if lima.configured.runtime_state != LimaRuntimeState::Running
+                || runner.timing.started_at_unix_seconds > lima.timing.expires_at_unix_seconds =>
+        {
+            immediate
+        }
+        ActionsRunnerReadinessState::Starting
+        | ActionsRunnerReadinessState::IdleReady
+        | ActionsRunnerReadinessState::Busy
+        | ActionsRunnerReadinessState::Draining
+        | ActionsRunnerReadinessState::Stale => true,
+    }
+}
+
+fn lima_duration_within_freshness_window(timing: &LimaObservationTiming) -> bool {
+    timing
+        .expires_at_unix_seconds
+        .checked_sub(timing.observed_at_unix_seconds)
+        .is_some_and(|window| timing.duration_seconds <= window)
 }
 
 fn canonical_timing(timing: &LimaObservationTiming) -> bool {
