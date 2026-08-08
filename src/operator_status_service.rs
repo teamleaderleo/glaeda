@@ -10,68 +10,34 @@ use crate::lima_observation::{
     LIMA_OBSERVATION_SCHEMA_VERSION, LimaGuestObservation, LimaInstanceObservationReport,
     LimaObservationFreshness, LimaObservationTiming, LimaRuntimeState,
 };
-use crate::operator_config::{OperatorConfig, OperatorConfigIdentity};
+use crate::operator_config::OperatorConfig;
 use crate::operator_error::{OperatorErrorCode, OperatorPublicError};
 use crate::operator_status::{
     OperatorActiveJobSummary, OperatorConfigurationCompatibility, OperatorConfigurationStatus,
     OperatorMachineSummary, OperatorStatusReport, OperatorTerminalResult, OperatorTerminalSummary,
     OperatorWorkerSummary,
 };
-use crate::personal_worker_read_model::{PersonalWorkerJobView, PersonalWorkerStatusView};
+use crate::personal_worker_operator_read::{
+    PersonalWorkerOperatorJobRead, PersonalWorkerOperatorStatusRead,
+};
 
 pub const OPERATOR_STATUS_SERVICE_SCHEMA_VERSION: u8 = 1;
 const REDACTED_EVIDENCE: &str = "<validated-operator-status-evidence>";
 
 #[derive(Clone, PartialEq, Eq)]
-pub struct OperatorStatusJobEvidence {
-    config_identity: OperatorConfigIdentity,
-    view: PersonalWorkerJobView,
-}
-
-impl OperatorStatusJobEvidence {
-    #[must_use]
-    pub const fn new(config_identity: OperatorConfigIdentity, view: PersonalWorkerJobView) -> Self {
-        Self {
-            config_identity,
-            view,
-        }
-    }
-
-    #[must_use]
-    pub const fn config_identity(&self) -> &OperatorConfigIdentity {
-        &self.config_identity
-    }
-
-    #[must_use]
-    pub const fn view(&self) -> &PersonalWorkerJobView {
-        &self.view
-    }
-}
-
-impl fmt::Debug for OperatorStatusJobEvidence {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("OperatorStatusJobEvidence")
-            .field("config_identity", &self.config_identity)
-            .field("view", &REDACTED_EVIDENCE)
-            .finish()
-    }
-}
-
-#[derive(Clone, PartialEq, Eq)]
 pub struct OperatorStatusTerminalEvidence {
-    job: OperatorStatusJobEvidence,
+    job: PersonalWorkerOperatorJobRead,
     result: OperatorTerminalResult,
 }
 
 impl OperatorStatusTerminalEvidence {
     #[must_use]
-    pub const fn new(job: OperatorStatusJobEvidence, result: OperatorTerminalResult) -> Self {
+    pub const fn new(job: PersonalWorkerOperatorJobRead, result: OperatorTerminalResult) -> Self {
         Self { job, result }
     }
 
     #[must_use]
-    pub const fn job(&self) -> &OperatorStatusJobEvidence {
+    pub const fn job(&self) -> &PersonalWorkerOperatorJobRead {
         &self.job
     }
 
@@ -85,7 +51,8 @@ impl fmt::Debug for OperatorStatusTerminalEvidence {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("OperatorStatusTerminalEvidence")
-            .field("job", &self.job)
+            .field("config_identity", self.job.config_identity())
+            .field("job", &REDACTED_EVIDENCE)
             .field("result", &self.result)
             .finish()
     }
@@ -93,22 +60,19 @@ impl fmt::Debug for OperatorStatusTerminalEvidence {
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct OperatorStatusWorkerEvidence {
-    config_identity: OperatorConfigIdentity,
-    status: PersonalWorkerStatusView,
-    active_job: Option<OperatorStatusJobEvidence>,
+    status: PersonalWorkerOperatorStatusRead,
+    active_job: Option<PersonalWorkerOperatorJobRead>,
     latest_terminal: Option<OperatorStatusTerminalEvidence>,
 }
 
 impl OperatorStatusWorkerEvidence {
     #[must_use]
     pub const fn new(
-        config_identity: OperatorConfigIdentity,
-        status: PersonalWorkerStatusView,
-        active_job: Option<OperatorStatusJobEvidence>,
+        status: PersonalWorkerOperatorStatusRead,
+        active_job: Option<PersonalWorkerOperatorJobRead>,
         latest_terminal: Option<OperatorStatusTerminalEvidence>,
     ) -> Self {
         Self {
-            config_identity,
             status,
             active_job,
             latest_terminal,
@@ -116,17 +80,12 @@ impl OperatorStatusWorkerEvidence {
     }
 
     #[must_use]
-    pub const fn config_identity(&self) -> &OperatorConfigIdentity {
-        &self.config_identity
-    }
-
-    #[must_use]
-    pub const fn status(&self) -> &PersonalWorkerStatusView {
+    pub const fn status(&self) -> &PersonalWorkerOperatorStatusRead {
         &self.status
     }
 
     #[must_use]
-    pub const fn active_job(&self) -> Option<&OperatorStatusJobEvidence> {
+    pub const fn active_job(&self) -> Option<&PersonalWorkerOperatorJobRead> {
         self.active_job.as_ref()
     }
 
@@ -140,7 +99,7 @@ impl fmt::Debug for OperatorStatusWorkerEvidence {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("OperatorStatusWorkerEvidence")
-            .field("config_identity", &self.config_identity)
+            .field("config_identity", self.status.config_identity())
             .field("status", &REDACTED_EVIDENCE)
             .field("has_active_job", &self.active_job.is_some())
             .field("has_latest_terminal", &self.latest_terminal.is_some())
@@ -322,7 +281,7 @@ impl OperatorStatusService {
         validate_machine_identity(&evidence)?;
         validate_timing(&evidence)?;
 
-        let worker = OperatorWorkerSummary::from_status(evidence.worker.status());
+        let worker = OperatorWorkerSummary::from_status(evidence.worker.status().view());
         let active_job = evidence
             .worker
             .active_job()
@@ -391,7 +350,7 @@ fn validate_configuration_identity(
     evidence: &OperatorStatusServiceEvidence,
 ) -> Result<(), OperatorStatusServiceError> {
     let expected = evidence.config.identity();
-    if evidence.worker.config_identity() != expected
+    if evidence.worker.status().config_identity() != expected
         || evidence
             .worker
             .active_job()
@@ -412,19 +371,16 @@ fn validate_configuration_identity(
 fn validate_job_snapshots(
     evidence: &OperatorStatusServiceEvidence,
 ) -> Result<(), OperatorStatusServiceError> {
-    let status = evidence.worker.status();
-    for job in evidence.worker.active_job().into_iter().chain(
-        evidence
-            .worker
-            .latest_terminal()
-            .map(OperatorStatusTerminalEvidence::job),
-    ) {
+    let status = evidence.worker.status().view();
+    for job in worker_job_reads(&evidence.worker) {
         if job.view().store_revision() != status.store_revision() {
             return Err(OperatorStatusServiceError::new(
                 OperatorStatusServiceErrorKind::StaleRevision,
                 OperatorErrorCode::DurableStateRevisionStale,
             ));
         }
+    }
+    for job in worker_job_reads(&evidence.worker) {
         if job.view().queue_generation() != status.queue_generation() {
             return Err(OperatorStatusServiceError::new(
                 OperatorStatusServiceErrorKind::StaleGeneration,
@@ -435,14 +391,26 @@ fn validate_job_snapshots(
     Ok(())
 }
 
+fn worker_job_reads(
+    worker: &OperatorStatusWorkerEvidence,
+) -> impl Iterator<Item = &PersonalWorkerOperatorJobRead> {
+    worker.active_job().into_iter().chain(
+        worker
+            .latest_terminal()
+            .map(OperatorStatusTerminalEvidence::job),
+    )
+}
+
 fn validate_job_shape(
     evidence: &OperatorStatusServiceEvidence,
 ) -> Result<(), OperatorStatusServiceError> {
-    if (evidence.worker.status().active_count() == 0) != evidence.worker.active_job().is_none() {
+    if (evidence.worker.status().view().active_count() == 0)
+        != evidence.worker.active_job().is_none()
+    {
         return Err(invalid_active_job());
     }
     if evidence.worker.latest_terminal().is_some()
-        && evidence.worker.status().terminal_tombstone_count() == 0
+        && evidence.worker.status().view().terminal_tombstone_count() == 0
     {
         return Err(OperatorStatusServiceError::new(
             OperatorStatusServiceErrorKind::InvalidTerminal,
@@ -468,6 +436,7 @@ fn validate_machine_identity(
         || evidence.runner.instance != *evidence.config.lima_instance()
         || evidence.runner.instance != evidence.lima.instance
         || !runner_identity_matches_state(&evidence.runner)
+        || !runner_state_matches_lima_source(&evidence.runner, &evidence.lima)
     {
         return Err(OperatorStatusServiceError::new(
             OperatorStatusServiceErrorKind::RunnerIdentityMismatch,
@@ -475,6 +444,29 @@ fn validate_machine_identity(
         ));
     }
     Ok(())
+}
+
+fn runner_state_matches_lima_source(
+    runner: &ActionsRunnerReadinessReport,
+    lima: &LimaInstanceObservationReport,
+) -> bool {
+    if runner.state == ActionsRunnerReadinessState::Stale {
+        return true;
+    }
+    match lima.configured.runtime_state {
+        LimaRuntimeState::Uninitialized | LimaRuntimeState::Installing => {
+            runner.state == ActionsRunnerReadinessState::Starting
+        }
+        LimaRuntimeState::Stopped => runner.state == ActionsRunnerReadinessState::Offline,
+        LimaRuntimeState::Running => matches!(
+            runner.state,
+            ActionsRunnerReadinessState::Starting
+                | ActionsRunnerReadinessState::IdleReady
+                | ActionsRunnerReadinessState::Busy
+                | ActionsRunnerReadinessState::Draining
+        ),
+        LimaRuntimeState::Broken => false,
+    }
 }
 
 fn lima_guest_matches_state(report: &LimaInstanceObservationReport) -> bool {
@@ -545,7 +537,7 @@ fn project_terminal(
     let Some(terminal) = evidence.worker.latest_terminal() else {
         return Ok(None);
     };
-    if evidence.worker.status().terminal_tombstone_count() == 0 {
+    if evidence.worker.status().view().terminal_tombstone_count() == 0 {
         return Err(OperatorStatusServiceError::new(
             OperatorStatusServiceErrorKind::InvalidTerminal,
             OperatorErrorCode::DurableStateCorrupt,

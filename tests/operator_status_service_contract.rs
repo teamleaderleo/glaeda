@@ -1,21 +1,24 @@
+#![cfg(unix)]
 #![allow(dead_code)]
 
 pub use smolrunner::{
     actions_runner_readiness, artifact, execution_admission, lima_observation, mac_availability,
-    operator_config, operator_error, operator_status, personal_worker_queue,
-    personal_worker_read_model, personal_worker_store, verification_profile,
+    operator_config, operator_error, operator_status, personal_worker_operator_read,
+    personal_worker_queue, personal_worker_read_model, personal_worker_store,
+    unix_personal_worker_store, verification_profile,
 };
 
 #[path = "../src/operator_status_service.rs"]
 mod operator_status_service;
 
-use std::fs;
-use std::path::PathBuf;
+use std::fs::{self, Permissions};
+use std::os::unix::fs::PermissionsExt as _;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use operator_status_service::{
-    OperatorStatusEvidenceReader, OperatorStatusJobEvidence, OperatorStatusService,
-    OperatorStatusServiceErrorKind, OperatorStatusServiceEvidence, OperatorStatusTerminalEvidence,
-    OperatorStatusWorkerEvidence,
+    OperatorStatusEvidenceReader, OperatorStatusService, OperatorStatusServiceErrorKind,
+    OperatorStatusServiceEvidence, OperatorStatusTerminalEvidence, OperatorStatusWorkerEvidence,
 };
 use smolrunner::actions_runner_readiness::{
     ACTIONS_RUNNER_READINESS_SCHEMA_VERSION, ActionsRunnerConfiguredIdentity, ActionsRunnerName,
@@ -43,23 +46,52 @@ use smolrunner::operator_error::{OperatorErrorCode, OperatorPublicError};
 use smolrunner::operator_status::{
     OperatorConfigurationCompatibility, OperatorStatusDisposition, OperatorTerminalResult,
 };
+use smolrunner::personal_worker_operator_read::{
+    PersonalWorkerOperatorJobRead, PersonalWorkerOperatorReadService,
+    PersonalWorkerOperatorStatusRead,
+};
 use smolrunner::personal_worker_queue::{
     PersonalWorkerActiveReservation, PersonalWorkerActivityEvidence, PersonalWorkerCacheAccessMode,
     PersonalWorkerCacheNamespace, PersonalWorkerCancellationState, PersonalWorkerJobRequest,
     PersonalWorkerPriority, PersonalWorkerProfile, PersonalWorkerProfileObservation,
     PersonalWorkerQueueGeneration, PersonalWorkerQueueInput, PersonalWorkerSourceIdentity,
 };
-use smolrunner::personal_worker_read_model::{
-    PersonalWorkerJobReadRequest, PersonalWorkerJobView, personal_worker_job_view,
-    personal_worker_status,
-};
+use smolrunner::personal_worker_read_model::PersonalWorkerJobReadRequest;
 use smolrunner::personal_worker_store::{
-    PersonalWorkerDurableCacheLease, PersonalWorkerStoreDocument, PersonalWorkerTerminalTombstone,
+    PersonalWorkerDurableCacheLease, PersonalWorkerStore, PersonalWorkerStoreDocument,
+    PersonalWorkerTerminalTombstone,
 };
+use smolrunner::unix_personal_worker_store::UnixPersonalWorkerStore;
 use smolrunner::verification_profile::{CacheId, VerificationProfileId};
 
 const BASE_MILLIS: u64 = 5_000_000;
 const GIB: u64 = 1_024 * 1_024 * 1_024;
+static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
+
+struct TempRoot(PathBuf);
+
+impl TempRoot {
+    fn new(label: &str) -> Self {
+        let sequence = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "smolrunner-status-service-{label}-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir(&path).expect("create state root");
+        fs::set_permissions(&path, Permissions::from_mode(0o750)).expect("set state root mode");
+        Self(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempRoot {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
 
 fn millis(value: u64) -> EpochMillis {
     EpochMillis::new(value).expect("time")
@@ -69,10 +101,9 @@ fn digest(byte: &str) -> Sha256Digest {
     Sha256Digest::parse(&format!("sha256:{}", byte.repeat(64))).expect("digest")
 }
 
-fn config(workspace: &str) -> OperatorConfig {
+fn config(root: &TempRoot, workspace: &str) -> OperatorConfig {
     OperatorConfig::new(
-        PersonalWorkerStateRoot::parse(PathBuf::from("/var/lib/smolrunner-test"))
-            .expect("state root"),
+        PersonalWorkerStateRoot::parse(root.path()).expect("state root"),
         LimaInstanceName::parse("smolrunner").expect("instance"),
         GuestWorkspacePath::parse(workspace).expect("workspace"),
         VerificationProfileId::parse("smolrunner.required").expect("profile"),
@@ -158,6 +189,18 @@ fn runner(state: ActionsRunnerReadinessState) -> ActionsRunnerReadinessReport {
         configured_identity,
         timing: timing(102, 103, 200),
     }
+}
+
+fn stale_runner() -> ActionsRunnerReadinessReport {
+    let mut report = runner(ActionsRunnerReadinessState::Stale);
+    report.timing = LimaObservationTiming {
+        started_at_unix_seconds: 201,
+        observed_at_unix_seconds: 201,
+        expires_at_unix_seconds: 200,
+        duration_seconds: 0,
+        freshness: LimaObservationFreshness::Stale,
+    };
+    report
 }
 
 fn empty_document() -> PersonalWorkerStoreDocument {
@@ -329,33 +372,39 @@ fn active_terminal_document() -> PersonalWorkerStoreDocument {
     .expect("active terminal document")
 }
 
-fn job_view(document: &PersonalWorkerStoreDocument, id: &str) -> PersonalWorkerJobView {
-    personal_worker_job_view(
-        document,
+fn initialize(root: &TempRoot, document: &PersonalWorkerStoreDocument) {
+    UnixPersonalWorkerStore::initialize_if_clean(root.path(), document).expect("initialize store");
+}
+
+fn status_read(config: &OperatorConfig) -> PersonalWorkerOperatorStatusRead {
+    PersonalWorkerOperatorReadService::read_status(config, None).expect("operator status read")
+}
+
+fn job_read(
+    config: &OperatorConfig,
+    document: &PersonalWorkerStoreDocument,
+    id: &str,
+) -> PersonalWorkerOperatorJobRead {
+    PersonalWorkerOperatorReadService::read_job(
+        config,
         PersonalWorkerJobReadRequest::new(
             document.revision(),
             document.queue().generation,
             ExecutionRequestId::parse(id).expect("request ID"),
         ),
     )
-    .expect("job view")
+    .expect("operator job read")
 }
 
 fn evidence(
     config: OperatorConfig,
-    document: &PersonalWorkerStoreDocument,
     lima: LimaInstanceObservationReport,
     runner: ActionsRunnerReadinessReport,
 ) -> OperatorStatusServiceEvidence {
     OperatorStatusServiceEvidence::new(
         config.clone(),
         OperatorConfigurationCompatibility::Compatible,
-        OperatorStatusWorkerEvidence::new(
-            config.identity().clone(),
-            personal_worker_status(document).expect("status"),
-            None,
-            None,
-        ),
+        OperatorStatusWorkerEvidence::new(status_read(&config), None, None),
         lima,
         runner,
         110,
@@ -377,11 +426,12 @@ fn idle_snapshot_is_satisfied_and_reader_is_called_exactly_once() {
         }
     }
 
+    let root = TempRoot::new("idle");
+    initialize(&root, &empty_document());
     let mut reader = Reader {
         calls: 0,
         evidence: Some(evidence(
-            config("/home/lima/smolrunner-workspace"),
-            &empty_document(),
+            config(&root, "/home/lima/smolrunner-workspace"),
             lima(LimaRuntimeState::Stopped),
             runner(ActionsRunnerReadinessState::Offline),
         )),
@@ -424,23 +474,18 @@ fn reader_failure_is_preserved_without_fabricating_status() {
 
 #[test]
 fn active_and_terminal_views_project_only_from_the_exact_snapshot() {
-    let config = config("/home/lima/smolrunner-workspace");
+    let root = TempRoot::new("active-terminal");
     let document = active_terminal_document();
+    initialize(&root, &document);
+    let config = config(&root, "/home/lima/smolrunner-workspace");
     let bundle = OperatorStatusServiceEvidence::new(
         config.clone(),
         OperatorConfigurationCompatibility::Compatible,
         OperatorStatusWorkerEvidence::new(
-            config.identity().clone(),
-            personal_worker_status(&document).expect("status"),
-            Some(OperatorStatusJobEvidence::new(
-                config.identity().clone(),
-                job_view(&document, "active-one"),
-            )),
+            status_read(&config),
+            Some(job_read(&config, &document, "active-one")),
             Some(OperatorStatusTerminalEvidence::new(
-                OperatorStatusJobEvidence::new(
-                    config.identity().clone(),
-                    job_view(&document, "terminal-one"),
-                ),
+                job_read(&config, &document, "terminal-one"),
                 OperatorTerminalResult::Succeeded,
             )),
         ),
@@ -467,18 +512,15 @@ fn active_and_terminal_views_project_only_from_the_exact_snapshot() {
 }
 
 #[test]
-fn missing_active_or_unretained_terminal_evidence_fails_closed() {
-    let config = config("/home/lima/smolrunner-workspace");
+fn missing_active_or_nonterminal_terminal_evidence_fails_closed() {
+    let root = TempRoot::new("invalid-jobs");
     let active_document = active_terminal_document();
+    initialize(&root, &active_document);
+    let config = config(&root, "/home/lima/smolrunner-workspace");
     let missing_active = OperatorStatusServiceEvidence::new(
         config.clone(),
         OperatorConfigurationCompatibility::Compatible,
-        OperatorStatusWorkerEvidence::new(
-            config.identity().clone(),
-            personal_worker_status(&active_document).expect("status"),
-            None,
-            None,
-        ),
+        OperatorStatusWorkerEvidence::new(status_read(&config), None, None),
         lima(LimaRuntimeState::Running),
         runner(ActionsRunnerReadinessState::Busy),
         110,
@@ -494,19 +536,14 @@ fn missing_active_or_unretained_terminal_evidence_fails_closed() {
         OperatorErrorCode::DurableStateCorrupt
     );
 
-    let empty = empty_document();
-    let unretained_terminal = OperatorStatusServiceEvidence::new(
+    let invalid_terminal = OperatorStatusServiceEvidence::new(
         config.clone(),
         OperatorConfigurationCompatibility::Compatible,
         OperatorStatusWorkerEvidence::new(
-            config.identity().clone(),
-            personal_worker_status(&empty).expect("status"),
-            None,
+            status_read(&config),
+            Some(job_read(&config, &active_document, "active-one")),
             Some(OperatorStatusTerminalEvidence::new(
-                OperatorStatusJobEvidence::new(
-                    config.identity().clone(),
-                    job_view(&active_document, "terminal-one"),
-                ),
+                job_read(&config, &active_document, "active-one"),
                 OperatorTerminalResult::Succeeded,
             )),
         ),
@@ -515,8 +552,7 @@ fn missing_active_or_unretained_terminal_evidence_fails_closed() {
         110,
         vec![],
     );
-    let error =
-        OperatorStatusService::compose(unretained_terminal).expect_err("unretained terminal");
+    let error = OperatorStatusService::compose(invalid_terminal).expect_err("invalid terminal");
     assert_eq!(
         error.kind(),
         OperatorStatusServiceErrorKind::InvalidTerminal
@@ -525,16 +561,17 @@ fn missing_active_or_unretained_terminal_evidence_fails_closed() {
 
 #[test]
 fn configuration_and_snapshot_drift_fail_closed_in_precedence_order() {
-    let accepted = config("/home/lima/accepted");
-    let foreign = config("/home/lima/foreign");
+    let root = TempRoot::new("drift");
     let document = active_terminal_document();
-    let status = personal_worker_status(&document).expect("status");
-    let active = job_view(&document, "active-one");
+    initialize(&root, &document);
+    let accepted = config(&root, "/home/lima/accepted");
+    let foreign = config(&root, "/home/lima/foreign");
+    let active = job_read(&accepted, &document, "active-one");
 
     let mismatched = OperatorStatusServiceEvidence::new(
         accepted.clone(),
         OperatorConfigurationCompatibility::Compatible,
-        OperatorStatusWorkerEvidence::new(foreign.identity().clone(), status.clone(), None, None),
+        OperatorStatusWorkerEvidence::new(status_read(&foreign), None, None),
         lima(LimaRuntimeState::Stopped),
         runner(ActionsRunnerReadinessState::Offline),
         110,
@@ -565,18 +602,14 @@ fn configuration_and_snapshot_drift_fail_closed_in_precedence_order() {
             document.terminal_tombstones().to_vec(),
         )
         .expect("advance snapshot");
+    let (mut store, _) = UnixPersonalWorkerStore::open_or_create(root.path()).expect("open store");
+    store
+        .replace_if_revision(document.revision(), &advanced)
+        .expect("replace store");
     let stale = OperatorStatusServiceEvidence::new(
         accepted.clone(),
         OperatorConfigurationCompatibility::Compatible,
-        OperatorStatusWorkerEvidence::new(
-            accepted.identity().clone(),
-            personal_worker_status(&advanced).expect("advanced status"),
-            Some(OperatorStatusJobEvidence::new(
-                accepted.identity().clone(),
-                active,
-            )),
-            None,
-        ),
+        OperatorStatusWorkerEvidence::new(status_read(&accepted), Some(active), None),
         lima(LimaRuntimeState::Running),
         runner(ActionsRunnerReadinessState::Busy),
         110,
@@ -592,19 +625,16 @@ fn configuration_and_snapshot_drift_fail_closed_in_precedence_order() {
 
 #[test]
 fn stale_broken_and_incompatible_evidence_become_deduplicated_blockers() {
-    let config = config("/home/lima/smolrunner-workspace");
+    let root = TempRoot::new("blocked");
     let document = empty_document();
+    initialize(&root, &document);
+    let config = config(&root, "/home/lima/smolrunner-workspace");
     let bundle = OperatorStatusServiceEvidence::new(
         config.clone(),
         OperatorConfigurationCompatibility::Incompatible,
-        OperatorStatusWorkerEvidence::new(
-            config.identity().clone(),
-            personal_worker_status(&document).expect("status"),
-            None,
-            None,
-        ),
+        OperatorStatusWorkerEvidence::new(status_read(&config), None, None),
         lima(LimaRuntimeState::Broken),
-        runner(ActionsRunnerReadinessState::Offline),
+        stale_runner(),
         201,
         vec![
             OperatorPublicError::from_code(OperatorErrorCode::LimaBroken),
@@ -628,17 +658,14 @@ fn stale_broken_and_incompatible_evidence_become_deduplicated_blockers() {
 
 #[test]
 fn future_or_noncanonical_timing_and_machine_identity_fail_closed() {
-    let config = config("/home/lima/smolrunner-workspace");
+    let root = TempRoot::new("machine-drift");
     let document = empty_document();
+    initialize(&root, &document);
+    let config = config(&root, "/home/lima/smolrunner-workspace");
     let future = OperatorStatusServiceEvidence::new(
         config.clone(),
         OperatorConfigurationCompatibility::Compatible,
-        OperatorStatusWorkerEvidence::new(
-            config.identity().clone(),
-            personal_worker_status(&document).expect("status"),
-            None,
-            None,
-        ),
+        OperatorStatusWorkerEvidence::new(status_read(&config), None, None),
         lima(LimaRuntimeState::Stopped),
         runner(ActionsRunnerReadinessState::Offline),
         100,
@@ -651,7 +678,6 @@ fn future_or_noncanonical_timing_and_machine_identity_fail_closed() {
     wrong_instance.instance = LimaInstanceName::parse("foreign").expect("foreign instance");
     let error = OperatorStatusService::compose(evidence(
         config.clone(),
-        &empty_document(),
         wrong_instance,
         runner(ActionsRunnerReadinessState::Offline),
     ))
@@ -659,6 +685,28 @@ fn future_or_noncanonical_timing_and_machine_identity_fail_closed() {
     assert_eq!(
         error.kind(),
         OperatorStatusServiceErrorKind::LimaIdentityMismatch
+    );
+
+    let error = OperatorStatusService::compose(evidence(
+        config.clone(),
+        lima(LimaRuntimeState::Running),
+        runner(ActionsRunnerReadinessState::Offline),
+    ))
+    .expect_err("running Lima cannot produce an offline runner report");
+    assert_eq!(
+        error.kind(),
+        OperatorStatusServiceErrorKind::RunnerIdentityMismatch
+    );
+
+    let error = OperatorStatusService::compose(evidence(
+        config.clone(),
+        lima(LimaRuntimeState::Stopped),
+        runner(ActionsRunnerReadinessState::Starting),
+    ))
+    .expect_err("stopped Lima cannot produce a starting runner report");
+    assert_eq!(
+        error.kind(),
+        OperatorStatusServiceErrorKind::RunnerIdentityMismatch
     );
 
     let mut wrong_runner = runner(ActionsRunnerReadinessState::Offline);
@@ -672,7 +720,6 @@ fn future_or_noncanonical_timing_and_machine_identity_fail_closed() {
     });
     let error = OperatorStatusService::compose(evidence(
         config,
-        &empty_document(),
         lima(LimaRuntimeState::Stopped),
         wrong_runner,
     ))
@@ -685,15 +732,16 @@ fn future_or_noncanonical_timing_and_machine_identity_fail_closed() {
 
 #[test]
 fn debug_and_source_keep_private_authority_out_of_the_service_surface() {
+    let root = TempRoot::new("debug");
+    initialize(&root, &empty_document());
     let bundle = evidence(
-        config("/home/lima/private-workspace"),
-        &empty_document(),
+        config(&root, "/home/lima/private-workspace"),
         lima(LimaRuntimeState::Stopped),
         runner(ActionsRunnerReadinessState::Offline),
     );
     let debug = format!("{bundle:?}");
     assert!(!debug.contains("private-workspace"));
-    assert!(!debug.contains("/var/lib/smolrunner-test"));
+    assert!(!debug.contains(root.path().to_str().expect("UTF-8 root")));
 
     let source = fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
