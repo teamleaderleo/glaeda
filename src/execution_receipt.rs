@@ -16,6 +16,7 @@ pub const MAX_EXECUTION_RECEIPT_CONTINUATIONS: usize = 64;
 const MAX_TOKEN_LEN: usize = 128;
 const MAX_PRODUCER_VERSION_LEN: usize = 64;
 
+#[cfg(target_os = "linux")]
 pub(crate) fn validate_receipt_token(
     field: &str,
     value: &str,

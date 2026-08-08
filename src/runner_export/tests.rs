@@ -139,7 +139,10 @@ fn exact_bundle_export_reobserves_and_builds_existing_receipt() {
     assert_eq!(record.changed_paths(), repository.changed_paths.as_slice());
     assert!(record.package_bytes() > 0);
     assert!(record.package_digest().as_str().starts_with("sha256:"));
-    assert_eq!(record.package_path(), package);
+    assert_eq!(
+        record.package_path(),
+        fs::canonicalize(&package).expect("canonical package path")
+    );
     let receipt = record.to_handoff_receipt(&plan).expect("receipt");
     assert_eq!(receipt.package_digest(), record.package_digest());
 
