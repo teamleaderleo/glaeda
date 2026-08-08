@@ -765,19 +765,15 @@ mod tests {
 
     #[test]
     fn timed_execution_preserves_output_limit_precedence() -> io::Result<()> {
-        let python = Path::new("/usr/bin/python3");
-        if !python.is_file() {
+        let yes = Path::new("/usr/bin/yes");
+        if !yes.is_file() {
             return Ok(());
         }
 
-        let script = format!(
-            "import sys,time; sys.stdout.buffer.write(b'x' * {}); sys.stdout.flush(); time.sleep(10)",
-            MAX_CAPTURED_STREAM_BYTES + 1
-        );
         let error = ProcessExecutor
             .execute_with_timeout(
-                &CommandSpec::new(python).argument("-c").argument(script),
-                Duration::from_secs(1),
+                &CommandSpec::new(yes).argument("x"),
+                Duration::from_secs(10),
             )
             .expect_err("output exhaustion must abort before the later deadline");
 
