@@ -1,3 +1,5 @@
+#![cfg(target_os = "linux")]
+
 use smolrunner::debian_package_plan::{DEBIAN_PACKAGE_PLAN_SCHEMA_VERSION, PackagePlanDisposition};
 use smolrunner::host_preparation_plan::{
     HostReadinessSourceIdentity, SourceExecutableIdentity, SourceRootlessPodmanIdentity,

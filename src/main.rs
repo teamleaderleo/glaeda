@@ -953,14 +953,16 @@ mod tests {
 
     use clap::Parser;
 
+    #[cfg(target_os = "linux")]
     use smolrunner::host_preparation_plan::ExecutableHostPreparationAction;
+    #[cfg(target_os = "linux")]
     use smolrunner::journal::{ExecutionLane, RollbackClass};
+    #[cfg(target_os = "linux")]
     use smolrunner::lane_command::LaneCommandKind;
 
-    use super::{
-        Cli, Command, HostCommand, HostPreparePhaseKind, JobCommand, QueueCommand, WorkerCommand,
-        classify_host_prepare_actions,
-    };
+    use super::{Cli, Command, HostCommand, JobCommand, QueueCommand, WorkerCommand};
+    #[cfg(target_os = "linux")]
+    use super::{HostPreparePhaseKind, classify_host_prepare_actions};
 
     #[test]
     fn host_prepare_accepts_explicit_confirmation_and_account_policy() {
@@ -1111,6 +1113,7 @@ mod tests {
         assert_eq!(request_id, "job-one");
     }
 
+    #[cfg(target_os = "linux")]
     fn phase_action(
         lane: ExecutionLane,
         command_kind: LaneCommandKind,
@@ -1125,6 +1128,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn host_prepare_phase_classification_is_narrow() {
         assert_eq!(
