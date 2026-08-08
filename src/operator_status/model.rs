@@ -460,6 +460,18 @@ impl fmt::Display for OperatorStatusReport {
             lima_name(self.machine.lima),
             runner_name(self.machine.runner)
         )?;
+        match self.worker.activity_evidence {
+            PersonalWorkerActivityEvidence::Never => {
+                writeln!(formatter, "worker activity: never")?;
+            }
+            PersonalWorkerActivityEvidence::Observed { last_activity_at } => {
+                writeln!(
+                    formatter,
+                    "worker activity: observed at {}",
+                    last_activity_at.get()
+                )?;
+            }
+        }
 
         if let Some(active) = &self.active_job {
             writeln!(
@@ -998,6 +1010,7 @@ mod tests {
         );
         let human = report.render_human();
         assert!(human.contains("current=unobserved"));
+        assert!(human.contains("worker activity: never"));
         assert!(human.contains("next: smolrunner worker run-once"));
     }
 

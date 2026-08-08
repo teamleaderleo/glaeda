@@ -400,7 +400,60 @@ fn installed_cli_renders_unobserved_never_active_status_without_guessing() {
     );
     let human = output_text(&human_output.stdout);
     assert!(human.contains("profile: unobserved -> stopped"));
+    assert!(human.contains("activity: never"));
     assert!(!human.contains("profile: null"));
+}
+
+#[test]
+fn installed_cli_distinguishes_canonical_v1_from_corrupt_state() {
+    let root = TempRoot::new("v1-incompatible");
+    create_store(&root, &terminal_document());
+    let v1 = format!(
+        concat!(
+            "{{\n",
+            "  \"schema_version\": 1,\n",
+            "  \"revision\": 1,\n",
+            "  \"queue\": {{\n",
+            "    \"generation\": 1,\n",
+            "    \"observed_at\": {base},\n",
+            "    \"current_profile\": \"interactive\",\n",
+            "    \"last_activity_at\": {base},\n",
+            "    \"queued\": [],\n",
+            "    \"active\": [],\n",
+            "    \"pending_profile_change\": null\n",
+            "  }},\n",
+            "  \"cache_leases\": [],\n",
+            "  \"history\": []\n",
+            "}}\n"
+        ),
+        base = BASE,
+    );
+    fs::write(root.store_directory().join("current.json"), v1).expect("write canonical v1");
+
+    let output = run_smolrunner(&[
+        OsStr::new("--output"),
+        OsStr::new("json"),
+        OsStr::new("worker"),
+        OsStr::new("status"),
+        OsStr::new("--store-root"),
+        root.path().as_os_str(),
+    ]);
+    assert!(!output.status.success());
+    let error: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("version error JSON");
+    assert_eq!(error["kind"], "durable_state_version_incompatible");
+    assert!(
+        error["message"]
+            .as_str()
+            .expect("message")
+            .contains("explicit migration is required")
+    );
+    assert!(
+        !error["message"]
+            .as_str()
+            .expect("message")
+            .contains("corrupt")
+    );
 }
 
 #[test]

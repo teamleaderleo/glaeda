@@ -57,6 +57,7 @@ pub(crate) enum PersonalWorkerSubmitCommandErrorKind {
     Conflict,
     InvalidMutation,
     Busy,
+    DurableStateVersionIncompatible,
     CorruptStore,
 }
 
@@ -418,8 +419,11 @@ fn map_store_error(error: PersonalWorkerStoreError) -> PersonalWorkerSubmitComma
             PersonalWorkerSubmitCommandErrorKind::Busy,
             "another personal worker store mutation holds the writer lock",
         ),
-        PersonalWorkerStoreErrorKind::VersionIncompatible
-        | PersonalWorkerStoreErrorKind::CorruptState
+        PersonalWorkerStoreErrorKind::VersionIncompatible => command_error(
+            PersonalWorkerSubmitCommandErrorKind::DurableStateVersionIncompatible,
+            "durable personal worker state schema is incompatible; explicit migration is required",
+        ),
+        PersonalWorkerStoreErrorKind::CorruptState
         | PersonalWorkerStoreErrorKind::InvalidDocument => command_error(
             PersonalWorkerSubmitCommandErrorKind::CorruptStore,
             "durable personal worker state is corrupt or noncanonical",
@@ -459,6 +463,9 @@ fn map_mutation_error(error: PersonalWorkerStoreMutationError) -> PersonalWorker
         }
         PersonalWorkerStoreMutationErrorKind::UnsafeFilesystem => {
             PersonalWorkerSubmitCommandErrorKind::UnsafeStore
+        }
+        PersonalWorkerStoreMutationErrorKind::VersionIncompatible => {
+            PersonalWorkerSubmitCommandErrorKind::DurableStateVersionIncompatible
         }
         PersonalWorkerStoreMutationErrorKind::CorruptState => {
             PersonalWorkerSubmitCommandErrorKind::CorruptStore

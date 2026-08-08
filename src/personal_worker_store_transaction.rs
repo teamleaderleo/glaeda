@@ -184,6 +184,7 @@ pub enum PersonalWorkerStoreMutationErrorKind {
     Busy,
     Io,
     UnsafeFilesystem,
+    VersionIncompatible,
     CorruptState,
 }
 
@@ -794,8 +795,11 @@ fn map_store_error(error: PersonalWorkerStoreError) -> PersonalWorkerStoreMutati
             PersonalWorkerStoreMutationErrorKind::UnsafeFilesystem,
             "durable personal worker state contains an unsafe filesystem object",
         ),
-        PersonalWorkerStoreErrorKind::VersionIncompatible
-        | PersonalWorkerStoreErrorKind::CorruptState => PersonalWorkerStoreMutationError::new(
+        PersonalWorkerStoreErrorKind::VersionIncompatible => PersonalWorkerStoreMutationError::new(
+            PersonalWorkerStoreMutationErrorKind::VersionIncompatible,
+            "durable personal worker state schema is incompatible; explicit migration is required",
+        ),
+        PersonalWorkerStoreErrorKind::CorruptState => PersonalWorkerStoreMutationError::new(
             PersonalWorkerStoreMutationErrorKind::CorruptState,
             "durable personal worker state is corrupt or noncanonical",
         ),
