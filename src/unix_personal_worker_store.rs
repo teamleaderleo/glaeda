@@ -121,6 +121,11 @@ impl UnixPersonalWorkerStore {
             Some(lock) => lock,
             None => store.acquire_mutation_lock()?,
         };
+        // A previous initializer may have crashed or received an fsync error after publishing the
+        // managed directory but before its parent entry became durable. Every initializer closes
+        // that recovery window under the canonical lock before it can inspect, publish, or report
+        // success from the store.
+        synchronize_directory(&store._root, "personal worker state root")?;
         match store.recovery_plan()? {
             StoreRecoveryPlan::Clean {
                 revision: Some(revision),
