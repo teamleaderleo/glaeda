@@ -201,7 +201,7 @@ fn clean_exact_source_uses_two_fixed_credentialless_snapshots() {
         ["symbolic-ref", "--quiet", "HEAD"].as_slice(),
         ["rev-parse", "--verify", "HEAD^{commit}"].as_slice(),
         ["rev-parse", "--verify", "HEAD^{tree}"].as_slice(),
-        ["config", "--local", "--no-includes", "--null", "--list"].as_slice(),
+        ["config", "--no-includes", "--null", "--list"].as_slice(),
         [
             "status",
             "--porcelain=v1",
@@ -284,8 +284,13 @@ fn production_executor_observes_a_disposable_local_git_fixture() {
             "https://github.com/teamleaderleo/smolrunner.git",
         ],
     );
+    fs::write(
+        checkout.path().join(".gitattributes"),
+        b"fixture.txt filter=hidden\n",
+    )
+    .expect("write attributes fixture");
     fs::write(checkout.path().join("fixture.txt"), b"exact fixture\n").expect("write fixture");
-    run_fixture_git(checkout.path(), &["add", "fixture.txt"]);
+    run_fixture_git(checkout.path(), &["add", ".gitattributes", "fixture.txt"]);
     run_fixture_git(checkout.path(), &["commit", "-m", "fixture"]);
 
     let observation = observer()
@@ -298,6 +303,31 @@ fn production_executor_observes_a_disposable_local_git_fixture() {
     );
     assert_eq!(observation.source().commit.as_str().len(), 40);
     assert_eq!(observation.source().tree.as_str().len(), 40);
+
+    let marker = checkout.path().join("filter-command-ran");
+    let filter_command = format!("/usr/bin/touch {}", marker.display());
+    run_fixture_git(
+        checkout.path(),
+        &["config", "extensions.worktreeConfig", "true"],
+    );
+    run_fixture_git(
+        checkout.path(),
+        &[
+            "config",
+            "--worktree",
+            "filter.hidden.clean",
+            &filter_command,
+        ],
+    );
+
+    let error = observer()
+        .observe(checkout.path(), &profile(), &ProcessExecutor)
+        .expect_err("per-worktree filter configuration must fail before status");
+    assert_eq!(
+        error.kind(),
+        RepositorySourceObservationErrorKind::RepositoryUnavailable
+    );
+    assert!(!marker.exists(), "Git filter command must never execute");
 }
 
 fn run_fixture_git(checkout: &Path, arguments: &[&str]) {

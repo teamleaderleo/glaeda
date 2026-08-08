@@ -218,7 +218,7 @@ impl RepositorySourceObserver {
 
         let local_config = self.git(
             checkout,
-            &["config", "--local", "--no-includes", "--null", "--list"],
+            &["config", "--no-includes", "--null", "--list"],
             executor,
         )?;
         let local_config = parse_for_phase(parse_local_config(&local_config), phase)?;
