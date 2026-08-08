@@ -2,6 +2,7 @@ use std::fs::File;
 use std::io::{Read as _, Write as _};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rustix::fs::{self, AtFlags, FileType, FlockOperation, Mode, OFlags, RenameFlags};
 use rustix::io::Errno;
@@ -42,6 +43,7 @@ const STORE_DIRECTORY: &str = "personal-worker";
 const STORE_LOCK_FILE: &str = "store.lock";
 const CURRENT_DOCUMENT: &str = "current.json";
 const STAGED_DOCUMENT: &str = ".next.json";
+static NEXT_INITIALIZATION_STAGE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
 pub struct UnixPersonalWorkerStore {
@@ -109,8 +111,7 @@ impl UnixPersonalWorkerStore {
             .map_err(map_root_open_error)?;
         let root_stat = inspect_directory(&root, "personal worker state root", None)?;
         let owner = (root_stat.st_uid, root_stat.st_gid);
-        let directory = ensure_store_directory(&root, owner)?;
-        ensure_lock_file(&directory, owner)?;
+        let directory = open_or_publish_initialization_directory(&root, owner)?;
         let store = Self {
             _root: root,
             directory,
@@ -516,10 +517,9 @@ fn ensure_lock_file(
         PRIVATE_FILE_MODE,
     ) {
         Ok(lock) => {
-            let mut created = CreatedLockFile {
-                directory: directory.as_fd(),
-                armed: true,
-            };
+            // The canonical lock inode becomes synchronization authority as soon as the directory
+            // entry is visible. Never unlink it after that point: another process may already hold
+            // this inode, and replacing its name would split exclusive-writer authority.
             fs::fchmod(&lock, PRIVATE_FILE_MODE).map_err(|_| {
                 store_error(
                     PersonalWorkerStoreErrorKind::Io,
@@ -534,7 +534,6 @@ fn ensure_lock_file(
                 )
             })?;
             synchronize_directory(directory, "personal worker store directory")?;
-            created.armed = false;
             Ok(())
         }
         Err(Errno::EXIST) => {
@@ -551,15 +550,120 @@ fn ensure_lock_file(
     }
 }
 
-struct CreatedLockFile<'a> {
-    directory: BorrowedFd<'a>,
+fn open_or_publish_initialization_directory(
+    root: &OwnedFd,
+    owner: (u32, u32),
+) -> Result<OwnedFd, PersonalWorkerStoreError> {
+    match open_existing_initialization_directory(root, owner) {
+        Ok(directory) => return Ok(directory),
+        Err(error) if error.kind() != PersonalWorkerStoreErrorKind::Missing => return Err(error),
+        Err(_) => {}
+    }
+
+    let stage_name = create_initialization_stage_name()?;
+    fs::mkdirat(root, stage_name.as_str(), MANAGED_DIRECTORY_MODE).map_err(|error| {
+        store_error(
+            if error == Errno::EXIST {
+                PersonalWorkerStoreErrorKind::Busy
+            } else {
+                PersonalWorkerStoreErrorKind::Io
+            },
+            "could not create a private personal worker initialization directory",
+        )
+    })?;
+    let mut staged = StagedStoreDirectory {
+        root: root.as_fd(),
+        name: stage_name,
+        armed: true,
+    };
+    let directory = fs::openat(root, staged.name.as_str(), DIRECTORY_FLAGS, Mode::empty())
+        .map_err(map_store_directory_open_error)?;
+    fs::fchmod(&directory, MANAGED_DIRECTORY_MODE).map_err(|_| {
+        store_error(
+            PersonalWorkerStoreErrorKind::Io,
+            "could not set private personal worker initialization directory permissions",
+        )
+    })?;
+    inspect_directory(
+        &directory,
+        "private personal worker initialization directory",
+        Some(owner),
+    )?;
+    ensure_lock_file(&directory, owner)?;
+    synchronize_directory(
+        &directory,
+        "private personal worker initialization directory",
+    )?;
+
+    match fs::renameat_with(
+        root,
+        staged.name.as_str(),
+        root,
+        STORE_DIRECTORY,
+        RenameFlags::NOREPLACE,
+    ) {
+        Ok(()) => {
+            staged.armed = false;
+            synchronize_directory(root, "personal worker state root")?;
+            inspect_directory(&directory, "personal worker store directory", Some(owner))?;
+            Ok(directory)
+        }
+        Err(Errno::EXIST) => {
+            drop(directory);
+            drop(staged);
+            open_existing_initialization_directory(root, owner)
+        }
+        Err(_) => Err(store_error(
+            PersonalWorkerStoreErrorKind::Io,
+            "could not publish the personal worker store directory",
+        )),
+    }
+}
+
+fn open_existing_initialization_directory(
+    root: &OwnedFd,
+    owner: (u32, u32),
+) -> Result<OwnedFd, PersonalWorkerStoreError> {
+    let directory = fs::openat(root, STORE_DIRECTORY, DIRECTORY_FLAGS, Mode::empty())
+        .map_err(map_existing_store_directory_open_error)?;
+    inspect_directory(&directory, "personal worker store directory", Some(owner))?;
+    let lock = fs::openat(
+        &directory,
+        STORE_LOCK_FILE,
+        EXISTING_LOCK_FLAGS,
+        Mode::empty(),
+    )
+    .map_err(map_existing_initialization_lock_open_error)?;
+    inspect_private_file(&lock, owner, "personal worker store lock", Some(0))?;
+    Ok(directory)
+}
+
+fn create_initialization_stage_name() -> Result<String, PersonalWorkerStoreError> {
+    let sequence = NEXT_INITIALIZATION_STAGE.fetch_add(1, Ordering::Relaxed);
+    Ok(format!(
+        ".personal-worker.init-{}-{sequence}",
+        std::process::id()
+    ))
+}
+
+struct StagedStoreDirectory<'a> {
+    root: BorrowedFd<'a>,
+    name: String,
     armed: bool,
 }
 
-impl Drop for CreatedLockFile<'_> {
+impl Drop for StagedStoreDirectory<'_> {
     fn drop(&mut self) {
         if self.armed {
-            let _ = fs::unlinkat(self.directory, STORE_LOCK_FILE, AtFlags::empty());
+            if let Ok(directory) = fs::openat(
+                self.root,
+                self.name.as_str(),
+                DIRECTORY_FLAGS,
+                Mode::empty(),
+            ) {
+                let _ = fs::unlinkat(&directory, STORE_LOCK_FILE, AtFlags::empty());
+            }
+            let _ = fs::unlinkat(self.root, self.name.as_str(), AtFlags::REMOVEDIR);
         }
     }
 }
@@ -717,6 +821,19 @@ fn map_lock_open_error(error: Errno) -> PersonalWorkerStoreError {
         _ => store_error(
             PersonalWorkerStoreErrorKind::Io,
             "could not open the personal worker store lock",
+        ),
+    }
+}
+
+fn map_existing_initialization_lock_open_error(error: Errno) -> PersonalWorkerStoreError {
+    match error {
+        Errno::NOENT | Errno::LOOP | Errno::NOTDIR | Errno::ISDIR => store_error(
+            PersonalWorkerStoreErrorKind::UnsafeFilesystem,
+            "existing personal worker store synchronization metadata is missing or unsafe",
+        ),
+        _ => store_error(
+            PersonalWorkerStoreErrorKind::Io,
+            "could not open existing personal worker store synchronization metadata",
         ),
     }
 }

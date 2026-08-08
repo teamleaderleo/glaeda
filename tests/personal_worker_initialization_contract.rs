@@ -4,6 +4,8 @@ use std::fs::{self, OpenOptions};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Barrier};
+use std::thread;
 
 use rustix::fs::{FlockOperation, flock};
 use smolrunner::execution_admission::EpochMillis;
@@ -240,4 +242,82 @@ fn initialize_if_clean_preserves_corrupt_stage_and_reports_busy_without_blocking
         fs::read(&current_path).expect("read busy current"),
         current_bytes
     );
+}
+
+#[test]
+fn initialize_if_clean_refuses_missing_existing_lock_without_mutation() {
+    let root = TempRoot::new("missing-existing-lock");
+    let initial = initial_document(7_000_000);
+    UnixPersonalWorkerStore::initialize_if_clean(root.path(), &initial)
+        .expect("create current state");
+    let current_path = root.store_directory().join("current.json");
+    let lock_path = root.store_directory().join("store.lock");
+    let current_bytes = fs::read(&current_path).expect("read current bytes");
+    fs::remove_file(&lock_path).expect("remove existing lock fixture");
+
+    let error = UnixPersonalWorkerStore::initialize_if_clean(root.path(), &initial)
+        .expect_err("missing synchronization metadata must fail closed");
+    assert_eq!(error.kind(), PersonalWorkerStoreErrorKind::UnsafeFilesystem);
+    assert!(!lock_path.exists());
+    assert_eq!(
+        fs::read(&current_path).expect("re-read current bytes"),
+        current_bytes
+    );
+}
+
+#[test]
+fn concurrent_initializers_share_one_published_lock_and_document() {
+    let root = TempRoot::new("concurrent");
+    let root_path = root.path().to_path_buf();
+    let initial = initial_document(8_000_000);
+    let barrier = Arc::new(Barrier::new(2));
+    let mut handles = Vec::new();
+    for _ in 0..2 {
+        let barrier = Arc::clone(&barrier);
+        let root_path = root_path.clone();
+        let initial = initial.clone();
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            UnixPersonalWorkerStore::initialize_if_clean(root_path, &initial)
+                .map(|receipt| receipt.disposition())
+                .map_err(|error| error.kind())
+        }));
+    }
+
+    let results: Vec<_> = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("initializer thread"))
+        .collect();
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| {
+                **result == Ok(PersonalWorkerStoreInitializationDisposition::Created)
+            })
+            .count(),
+        1
+    );
+    assert!(results.iter().all(|result| {
+        matches!(
+            result,
+            Ok(PersonalWorkerStoreInitializationDisposition::Created)
+                | Ok(PersonalWorkerStoreInitializationDisposition::AlreadyExists)
+                | Err(PersonalWorkerStoreErrorKind::Busy)
+        )
+    }));
+
+    let replay = UnixPersonalWorkerStore::initialize_if_clean(root.path(), &initial)
+        .expect("replay after concurrent initialization");
+    assert_eq!(
+        replay.disposition(),
+        PersonalWorkerStoreInitializationDisposition::AlreadyExists
+    );
+    let reopened = UnixPersonalWorkerStore::open_existing_read_only(root.path())
+        .expect("open concurrently initialized store");
+    assert_eq!(reopened.load().expect("load state"), Some(initial));
+    let names: Vec<_> = fs::read_dir(root.path())
+        .expect("read state root")
+        .map(|entry| entry.expect("directory entry").file_name())
+        .collect();
+    assert_eq!(names, vec!["personal-worker"]);
 }
