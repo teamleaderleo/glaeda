@@ -238,6 +238,9 @@ fn map_mutation_error(error: PersonalWorkerStoreMutationError) -> PersonalWorker
         PersonalWorkerStoreMutationErrorKind::Conflict => {
             PersonalWorkerCancelCommandErrorKind::Conflict
         }
+        PersonalWorkerStoreMutationErrorKind::CapacityReached => {
+            PersonalWorkerCancelCommandErrorKind::InvalidMutation
+        }
         PersonalWorkerStoreMutationErrorKind::InvalidMutation => {
             PersonalWorkerCancelCommandErrorKind::InvalidMutation
         }

@@ -94,6 +94,8 @@ pub mod operator_status;
 pub mod ownership;
 /// Pure composition of durable queue, Lima lifecycle, and runner-readiness evidence.
 pub mod personal_worker_host_broker;
+/// Config-bound ergonomic submission and queued cancellation.
+pub mod personal_worker_operator_mutation;
 /// Config-bound, current-snapshot status, queue, and job reads.
 pub mod personal_worker_operator_read;
 /// Config-bound read-only discovery and explicit first initialization of durable worker state.
