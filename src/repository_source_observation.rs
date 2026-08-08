@@ -210,13 +210,6 @@ impl RepositorySourceObserver {
             executor,
         )?;
         let local_config = parse_for_phase(parse_local_config(&local_config), phase)?;
-        if local_config.repository != *expected_repository {
-            return Err(if phase == SnapshotPhase::Second {
-                source_changed()
-            } else {
-                identity_mismatch()
-            });
-        }
 
         let index_modes = self.git(checkout, &["ls-files", "--format=%(objectmode)"], executor)?;
         require_success(&index_modes, phase)?;
@@ -246,6 +239,15 @@ impl RepositorySourceObserver {
             phase,
         )?;
 
+        let repository = parse_for_phase(resolve_repository(&local_config), phase)?;
+        if repository != *expected_repository {
+            return Err(if phase == SnapshotPhase::Second {
+                source_changed()
+            } else {
+                identity_mismatch()
+            });
+        }
+
         // Gitlinks were refused from index-only evidence above. Ignoring submodules here prevents
         // status from recursively reading a nested repository's separate executable Git config.
         let status = self.git(
@@ -266,7 +268,7 @@ impl RepositorySourceObserver {
             branch,
             commit,
             tree,
-            repository: local_config.repository,
+            repository,
             remote_bindings: local_config.remote_bindings,
             clean: status.stdout.is_empty(),
         })
@@ -347,7 +349,6 @@ struct RemoteBinding {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LocalConfigObservation {
-    repository: RepositoryRef,
     remote_bindings: Vec<RemoteBinding>,
 }
 
@@ -436,20 +437,15 @@ fn parse_local_config(
     record: &ExecutionRecord,
 ) -> Result<LocalConfigObservation, RepositorySourceObservationError> {
     if !record.success || record.status != Some(0) {
-        if record.status == Some(1) && record.stdout.is_empty() {
-            return Err(identity_mismatch());
-        }
         return Err(unavailable());
     }
 
-    let mut repositories = BTreeSet::new();
     let mut remote_bindings = Vec::new();
     let mut count = 0;
-    let mut remote_count = 0;
     for entry in record.stdout.split_terminator('\0') {
         count += 1;
         let Some((key, url)) = entry.split_once('\n') else {
-            return Err(identity_mismatch());
+            return Err(unavailable());
         };
         let canonical_key = key.to_ascii_lowercase();
         if canonical_key.starts_with("include.")
@@ -462,29 +458,37 @@ fn parse_local_config(
             return Err(unavailable());
         }
         if canonical_key.starts_with("remote.") && canonical_key.ends_with(".url") {
-            remote_count += 1;
-            if remote_count > MAX_REMOTE_URLS {
-                return Err(identity_mismatch());
-            }
-            repositories.insert(parse_github_remote(url)?);
             remote_bindings.push(RemoteBinding {
                 key: key.to_owned(),
                 url: url.to_owned(),
             });
         }
     }
-    if count == 0 || repositories.len() != 1 || !record.stdout.ends_with('\0') {
+    if count == 0 || !record.stdout.ends_with('\0') {
+        return Err(unavailable());
+    }
+    remote_bindings.sort();
+    Ok(LocalConfigObservation { remote_bindings })
+}
+
+fn resolve_repository(
+    config: &LocalConfigObservation,
+) -> Result<RepositoryRef, RepositorySourceObservationError> {
+    if config.remote_bindings.is_empty() || config.remote_bindings.len() > MAX_REMOTE_URLS {
         return Err(identity_mismatch());
     }
-    let repository = repositories
+    let repositories = config
+        .remote_bindings
+        .iter()
+        .map(|binding| parse_github_remote(&binding.url))
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    if repositories.len() != 1 {
+        return Err(identity_mismatch());
+    }
+    repositories
         .into_iter()
         .next()
-        .ok_or_else(identity_mismatch)?;
-    remote_bindings.sort();
-    Ok(LocalConfigObservation {
-        repository,
-        remote_bindings,
-    })
+        .ok_or_else(identity_mismatch)
 }
 
 fn parse_github_remote(value: &str) -> Result<RepositoryRef, RepositorySourceObservationError> {

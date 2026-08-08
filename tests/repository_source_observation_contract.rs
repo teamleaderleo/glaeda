@@ -564,6 +564,32 @@ fn profile_detached_unborn_dirty_and_identity_refusals_are_exact() {
         assert_eq!(error.kind(), expected);
     }
 
+    for (remote, commit) in [
+        (
+            "user.name\nSmolRunner Test\0",
+            ScriptedResponse::failed(128),
+        ),
+        (
+            "remote.origin.url\nfile:///private/repository\0",
+            ScriptedResponse::success(format!("{}\n", "A".repeat(40))),
+        ),
+    ] {
+        let mut responses = clean_script(checkout.path());
+        responses[2] = ScriptedResponse::success(remote);
+        responses[4] = commit;
+        let error = observer()
+            .observe(
+                checkout.path(),
+                &profile(),
+                &ScriptedExecutor::new(responses),
+            )
+            .expect_err("repository availability must precede remote identity");
+        assert_eq!(
+            error.kind(),
+            RepositorySourceObservationErrorKind::RepositoryUnavailable
+        );
+    }
+
     for unsafe_config in [
         concat!(
             "remote.origin.url\nhttps://github.com/teamleaderleo/smolrunner.git\0",
