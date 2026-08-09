@@ -1,14 +1,14 @@
 # Ubuntu 24.04 Podman container-fixture evidence
 
-Status: partial R02/R03 disposable-fixture evidence only. This is not a hostile-repository
+Status: partial R01/R02/R03 disposable-fixture evidence only. This is not a hostile-repository
 execution backend and does not authorize a physical Lima or host mutation.
 
 ## Exact evidence
 
-- Fixture commit: `72e92ce64a4c42028fe4431d32c040837b3c81a8`
-- Workflow run: [31312693012](https://github.com/teamleaderleo/smolrunner/actions/runs/31312693012)
-- ARM64 job: [93242855635](https://github.com/teamleaderleo/smolrunner/actions/runs/31312693012/job/93242855635)
-- x86_64 job: [93242855661](https://github.com/teamleaderleo/smolrunner/actions/runs/31312693012/job/93242855661)
+- Fixture commit: `0ab48073ed49db91a5c592116d96723a8f5b6195`
+- Workflow run: [31314184600](https://github.com/teamleaderleo/smolrunner/actions/runs/31314184600)
+- ARM64 job: [93246643074](https://github.com/teamleaderleo/smolrunner/actions/runs/31314184600/job/93246643074)
+- x86_64 job: [93246643125](https://github.com/teamleaderleo/smolrunner/actions/runs/31314184600/job/93246643125)
 - Date: 2026-08-09
 - Result: both jobs passed on fresh GitHub-hosted Ubuntu 24.04 VMs.
 
@@ -21,8 +21,15 @@ contacts nor mutates the personal Mac/Lima worker.
 The exact fixture proves only these facts on both admitted architectures:
 
 1. An offline root filesystem made from the installed `busybox-static` executable plus fixed
-   numeric image-owned account files can be imported into one fresh transient rootless Podman store.
-   The returned image identity and the bounded image-inspection result agree exactly.
+   numeric image-owned account files can be imported into one fresh rootless Podman store by a
+   separately bounded transient service. The returned image identity and bounded inspection agree
+   exactly. After that service, unit, cgroup, and disposable-UID process are absent, root hides the
+   writable backing store below a root-owned `0700` parent and exposes the same directory identity
+   only through an exact `ro,nosuid,nodev` bind mount. The exposed store is the only configured
+   additional image store; the execution graph is empty before the exact-digest lookup, and no
+   transport is admitted. The complete exposed tree is fingerprinted in
+   deterministic path order with content, numeric ownership, mode, symlink, mtime, and xattr
+   metadata. Rootless subordinate-ID-mapped layer ownership is intentionally preserved.
 2. Noble Podman 4.9.3 accepts the contract's stopped-create controls exercised by this fixture:
    `--pull=never`, fixed init/runtime/conmon paths, no network or hosts generation, private IPC/PID/UTS
    namespaces, read-only rootfs, ignored image volumes, all capabilities dropped, no-new-privileges,
@@ -67,13 +74,16 @@ The exact fixture proves only these facts on both admitted architectures:
    the kill only after every pressure signal, observes `populated 0`, and then requires one nonzero
    stopped result. Exact removal deletes the leaf; the final single-link runner-owned log remains
    non-group/world-writable and below one MiB.
-10. Exact trusted and hostile container removal succeeds, followed by exact image removal. The
-    payload parent reports no process and `populated 0`; systemd collection removes the entire exact
-    service cgroup; root unmounts the exact target; the two precreated network lock inodes remain the
-    only network-directory entries; no process for the disposable UID or mount below the attempt
-    root remains.
+10. The execution service begins with one empty writable graph root and an absent effective run root,
+    then finds the exact image only through the additional store with `--pull=never`. Exact trusted
+    and hostile container removal succeeds, while an image-removal attempt is refused. The complete
+    store fingerprint remains identical. The payload parent reports no process and `populated 0`;
+    systemd collection removes the entire exact service cgroup; root unmounts the protected image
+    store and exact target; the two precreated network lock inodes remain the only network-directory
+    entries; no process for the disposable UID or mount below the attempt root remains.
 
-The successful markers included `hostile_abort=cgroup-kill`,
+The successful markers included `offline_image_install=exact`, `readonly_image_store=sealed`,
+`readonly_image_store=unchanged`, `hostile_abort=cgroup-kill`,
 `target_tmpfs=byte-and-inode-bounded`, `offline_image=exact`, `stopped_create=closed`,
 `account_files=image-owned`, `cgroup=bounded`, and `apparmor=rootless-unavailable`, followed by
 `podman_container_closure_probe=pass`.
@@ -108,6 +118,12 @@ Earlier disposable runs were intentionally allowed to fail and corrected these a
 - PID exhaustion must happen after starting the fixed output producer; otherwise the shell cannot
   create the producer it is meant to bound. The 64-KiB abort threshold remains fixed, while its
   bounded ARM64 observation window is twenty seconds.
+- Recursively changing rootless image-layer ownership to host root makes container initialization
+  fail on both architectures; failed run
+  [31313807733](https://github.com/teamleaderleo/smolrunner/actions/runs/31313807733) captured that
+  invalid model. Rootless layer bytes must retain their subordinate-ID mapping. Immutability instead
+  comes from a root-controlled read-only mount whose writable backing is unreachable below a
+  root-owned `0700` parent.
 
 These are contract corrections, not compatibility relaxations. The trusted fixture remains unable
 to authorize hostile repository code until every blocking boundary below is independently closed.
@@ -116,7 +132,8 @@ to authorize hostile repository code until every blocking boundary below is inde
 
 This fixture does **not** prove any of the following and must not be cited as if it did:
 
-- installation, digest verification, and read-only use of the production immutable image store or
+- journaled production image installation, complete manifest/config/layer and runtime-generation
+  verification, authoritative backing/mount handles, crash-safe publication/recovery, or the
   reviewed in-image gate;
 - selection and installation of the production seccomp policy, syscall-denial behavior, or any
   outer-service AppArmor confinement;
