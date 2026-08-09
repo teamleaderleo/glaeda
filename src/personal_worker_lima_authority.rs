@@ -1,4 +1,5 @@
 use std::fmt;
+use std::ops::Deref;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -174,6 +175,34 @@ pub struct PersonalWorkerLimaEnrollmentConfirmation {
     value: String,
 }
 
+/// Sealed proof that the exact enrollment candidate passed explicit confirmation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfirmedPersonalWorkerLimaEnrollment {
+    document: PersonalWorkerLimaAuthorityDocument,
+    observed_at_millis: u64,
+    expires_at_millis: u64,
+}
+
+impl ConfirmedPersonalWorkerLimaEnrollment {
+    pub(crate) fn is_fresh_at(&self, current_time: EpochMillis) -> bool {
+        current_time.get() >= self.observed_at_millis
+            && current_time.get() <= self.expires_at_millis
+    }
+
+    #[must_use]
+    pub fn into_document(self) -> PersonalWorkerLimaAuthorityDocument {
+        self.document
+    }
+}
+
+impl Deref for ConfirmedPersonalWorkerLimaEnrollment {
+    type Target = PersonalWorkerLimaAuthorityDocument;
+
+    fn deref(&self) -> &Self::Target {
+        &self.document
+    }
+}
+
 impl PersonalWorkerLimaEnrollmentConfirmation {
     #[must_use]
     pub const fn schema_version(&self) -> u8 {
@@ -271,7 +300,7 @@ impl PersonalWorkerLimaAuthorityDocument {
         request: &LimaObservationRequest,
         approved_identity: LimaInstanceIdentity,
         supplied_confirmation: Option<&str>,
-    ) -> Result<Self, PersonalWorkerLimaAuthorityError> {
+    ) -> Result<ConfirmedPersonalWorkerLimaEnrollment, PersonalWorkerLimaAuthorityError> {
         let candidate = enrollment_candidate(config, mac, request, approved_identity)?;
         let confirmation = confirmation_for_document(&candidate)?;
         let Some(supplied_confirmation) = supplied_confirmation else {
@@ -285,7 +314,11 @@ impl PersonalWorkerLimaAuthorityDocument {
                 "the supplied Lima enrollment confirmation does not match the exact candidate",
             ));
         }
-        Ok(candidate)
+        Ok(ConfirmedPersonalWorkerLimaEnrollment {
+            document: candidate,
+            observed_at_millis: mac.report().timing.observed_at_millis,
+            expires_at_millis: mac.report().timing.expires_at_millis,
+        })
     }
 
     #[must_use]
@@ -306,6 +339,52 @@ impl PersonalWorkerLimaAuthorityDocument {
     #[must_use]
     pub const fn attempt(&self) -> Option<&PersonalWorkerLimaAttempt> {
         self.attempt.as_ref()
+    }
+
+    pub(crate) fn validate_successor_of(
+        &self,
+        previous: &Self,
+    ) -> Result<(), PersonalWorkerLimaAuthorityError> {
+        let generation_advances = previous
+            .authority_generation
+            .next()
+            .is_ok_and(|generation| generation == self.authority_generation);
+        if self.config_identity != previous.config_identity
+            || self.request_identity_digest != previous.request_identity_digest
+            || self.lima_instance != previous.lima_instance
+            || self.identity != previous.identity
+            || self.expected_vm_type != previous.expected_vm_type
+            || self.expected_architecture != previous.expected_architecture
+            || self.persistent_identity != previous.persistent_identity
+            || !generation_advances
+        {
+            return Err(PersonalWorkerLimaAuthorityError::conflict(
+                "Lima authority successor changes enrolled ownership or skips a generation",
+            ));
+        }
+        match (&previous.attempt, &self.attempt) {
+            (None, Some(next))
+                if next.phase == PersonalWorkerLimaAttemptPhase::Prepared
+                    && next.generation.get() == previous.authority_generation.get() =>
+            {
+                Ok(())
+            }
+            (Some(previous_attempt), Some(next_attempt))
+                if same_attempt_identity(previous_attempt, next_attempt)
+                    && valid_persisted_phase_edge(
+                        previous_attempt.action,
+                        previous_attempt.before_state,
+                        previous_attempt.phase,
+                        next_attempt.phase,
+                    )
+                    && next_attempt.checkpoint_at >= previous_attempt.checkpoint_at =>
+            {
+                Ok(())
+            }
+            _ => Err(PersonalWorkerLimaAuthorityError::conflict(
+                "Lima authority successor does not follow the exact durable attempt",
+            )),
+        }
     }
 
     /// Start one exact attempt in the durable `Prepared` phase.
@@ -485,6 +564,38 @@ impl PersonalWorkerLimaAuthorityDocument {
             ));
         }
         Ok(attempt)
+    }
+}
+
+fn same_attempt_identity(
+    previous: &PersonalWorkerLimaAttempt,
+    next: &PersonalWorkerLimaAttempt,
+) -> bool {
+    previous.generation == next.generation
+        && previous.store_revision == next.store_revision
+        && previous.queue_generation == next.queue_generation
+        && previous.decision_at == next.decision_at
+        && previous.action == next.action
+        && previous.identity == next.identity
+        && previous.before_state == next.before_state
+        && previous.before_profile == next.before_profile
+        && previous.before_profile_generation == next.before_profile_generation
+        && previous.before_resources == next.before_resources
+        && previous.after_state == next.after_state
+        && previous.after_profile == next.after_profile
+        && previous.after_profile_generation == next.after_profile_generation
+}
+
+fn valid_persisted_phase_edge(
+    action: PersonalWorkerLimaAction,
+    before_state: LimaLifecycleState,
+    current: PersonalWorkerLimaAttemptPhase,
+    next: PersonalWorkerLimaAttemptPhase,
+) -> bool {
+    if next == PersonalWorkerLimaAttemptPhase::Completed {
+        current == PersonalWorkerLimaAttemptPhase::VerifyStarted
+    } else {
+        valid_phase_edge(action, before_state, current, next)
     }
 }
 

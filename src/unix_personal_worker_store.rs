@@ -19,6 +19,9 @@ use crate::personal_worker_store::{
     encode_personal_worker_store_document, migrate_personal_worker_store_v1_document,
 };
 
+/// Same-lock durable persistence for the personal-worker Lima lifecycle authority.
+pub mod lima_authority;
+
 const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::DIRECTORY)
     .union(OFlags::NOFOLLOW)
@@ -197,6 +200,7 @@ impl UnixPersonalWorkerStore {
         // that recovery window under the canonical lock before it can inspect, publish, or report
         // success from the store.
         synchronize_directory(&store._root, "personal worker state root")?;
+        lima_authority::refuse_unsettled_lima_authority(&store)?;
         match store.recovery_plan()? {
             StoreRecoveryPlan::Clean {
                 revision: Some(revision),
@@ -246,6 +250,7 @@ impl UnixPersonalWorkerStore {
         };
         let _lock = store.acquire_mutation_lock()?;
         synchronize_directory(&store._root, "personal worker state root")?;
+        lima_authority::refuse_unsettled_lima_authority(&store)?;
 
         let current_bytes = store.read_named_bytes(CURRENT_DOCUMENT)?.ok_or_else(|| {
             store_error(
@@ -539,6 +544,7 @@ impl PersonalWorkerStore for UnixPersonalWorkerStore {
             ));
         }
         let _lock = self.acquire_mutation_lock()?;
+        lima_authority::refuse_unsettled_lima_authority(self)?;
         self.recover_locked()?;
         if self.load_named(CURRENT_DOCUMENT)?.is_some() {
             return Err(store_error(
@@ -562,6 +568,7 @@ impl PersonalWorkerStore for UnixPersonalWorkerStore {
         document: &PersonalWorkerStoreDocument,
     ) -> Result<PersonalWorkerStoreWriteReceipt, PersonalWorkerStoreError> {
         let _lock = self.acquire_mutation_lock()?;
+        lima_authority::refuse_unsettled_lima_authority(self)?;
         self.recover_locked()?;
         let current = self.load_named(CURRENT_DOCUMENT)?.ok_or_else(|| {
             store_error(
@@ -588,6 +595,7 @@ impl PersonalWorkerStore for UnixPersonalWorkerStore {
 
     fn recover(&mut self) -> Result<PersonalWorkerStoreRecovery, PersonalWorkerStoreError> {
         let _lock = self.acquire_mutation_lock()?;
+        lima_authority::refuse_unsettled_lima_authority(self)?;
         self.recover_locked()
     }
 }
