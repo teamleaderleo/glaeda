@@ -514,7 +514,7 @@ $PROBE_GROUP_SHA  /etc/group"
     exit 1
   fi
   PROBE_OWNED_CONTAINER_ID=
-  if [[ -n $(/usr/bin/find "$PROBE_PAYLOAD_CGROUP_DIR" -mindepth 1 -maxdepth 1 -print -quit) ]] ||
+  if [[ -n $(/usr/bin/find "$PROBE_PAYLOAD_CGROUP_DIR" -mindepth 1 -maxdepth 1 -type d -print -quit) ]] ||
     [[ -n $(< "$PROBE_PAYLOAD_CGROUP_DIR/cgroup.procs") ]] ||
     ! /usr/bin/grep -Fxq 'populated 0' "$PROBE_PAYLOAD_CGROUP_DIR/cgroup.events"; then
     payload_child_count=$(/usr/bin/find "$PROBE_PAYLOAD_CGROUP_DIR" -mindepth 1 -maxdepth 1 -type d | /usr/bin/awk 'END { print NR + 0 }')
