@@ -5,7 +5,7 @@ execution backend and does not authorize a physical Lima or host mutation.
 
 ## Exact evidence
 
-- Fixture commit: `72e92ce26254829c374583f64ec26cd8f955227a`
+- Fixture commit: `72e92ce64a4c42028fe4431d32c040837b3c81a8`
 - Workflow run: [31312693012](https://github.com/teamleaderleo/smolrunner/actions/runs/31312693012)
 - ARM64 job: [93242855635](https://github.com/teamleaderleo/smolrunner/actions/runs/31312693012/job/93242855635)
 - x86_64 job: [93242855661](https://github.com/teamleaderleo/smolrunner/actions/runs/31312693012/job/93242855661)
