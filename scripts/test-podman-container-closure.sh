@@ -31,9 +31,9 @@ validate_network_lock() {
 
 run_user_probe() {
   local image_id image_hex container_id container_output expected_output
-  local start_output start_status wait_output wait_status logs_status
+  local start_output start_status inspect_status logs_status completion_seen=0
   local image_size container_size spec_size spec_path apparmor_profile
-  local log_owner log_group log_mode log_links log_size stderr_size
+  local log_owner log_group log_mode log_links log_size stderr_size exit_code
 
   mapfile -d '' network_entries_before < <(
     /usr/bin/find "$PROBE_NETWORK" -mindepth 1 -maxdepth 1 -print0
@@ -184,20 +184,52 @@ run_user_probe() {
     exit 1
   fi
 
+  for _ in {1..200}; do
+    set +e
+    /usr/bin/timeout --signal=KILL 2s \
+      /usr/bin/podman \
+      --remote=false \
+      --runtime=/usr/bin/crun \
+      --conmon=/usr/bin/conmon \
+      --events-backend=none \
+      --hooks-dir="$PROBE_HOOKS" \
+      --network-config-dir="$PROBE_NETWORK" \
+      --cgroup-manager=cgroupfs \
+      --tmpdir="$TMPDIR" \
+      --transient-store \
+      container inspect "$container_id" </dev/null > "$PROBE_CONTAINER_JSON"
+    inspect_status=$?
+    set -e
+    if (( inspect_status != 0 )); then
+      printf 'inspect_status=%s\n' "$inspect_status" >&2
+      printf 'error: bounded completion inspection failed\n' >&2
+      exit 1
+    fi
+    container_size=$(/usr/bin/stat -Lc %s "$PROBE_CONTAINER_JSON")
+    if (( container_size == 0 || container_size > 1048576 )); then
+      printf 'error: bounded completion inspection was absent or oversized\n' >&2
+      exit 1
+    fi
+    if /usr/bin/jq -e 'length == 1 and .[0].State.Status == "stopped" and .[0].State.Running == false' \
+      "$PROBE_CONTAINER_JSON" >/dev/null; then
+      completion_seen=1
+      exit_code=$(/usr/bin/jq -r '.[0].State.ExitCode' "$PROBE_CONTAINER_JSON")
+      break
+    fi
+    if ! /usr/bin/jq -e 'length == 1 and .[0].State.Status == "running" and .[0].State.Running == true' \
+      "$PROBE_CONTAINER_JSON" >/dev/null; then
+      printf 'error: completion inspection observed an unexpected container state\n' >&2
+      exit 1
+    fi
+    /usr/bin/sleep 0.05
+  done
+  if (( completion_seen != 1 )) || [[ ${exit_code:-} != 0 ]]; then
+    printf 'completion_seen=%s exit_code=%s\n' "$completion_seen" "${exit_code:-unknown}" >&2
+    printf 'error: bounded inspection did not report one clean payload exit\n' >&2
+    exit 1
+  fi
+
   set +e
-  wait_output=$(/usr/bin/timeout --signal=KILL 20s \
-    /usr/bin/podman \
-    --remote=false \
-    --runtime=/usr/bin/crun \
-    --conmon=/usr/bin/conmon \
-    --events-backend=none \
-    --hooks-dir="$PROBE_HOOKS" \
-    --network-config-dir="$PROBE_NETWORK" \
-    --cgroup-manager=cgroupfs \
-    --tmpdir="$TMPDIR" \
-    --transient-store \
-    wait "$container_id" </dev/null)
-  wait_status=$?
   container_output=$(/usr/bin/timeout --signal=KILL 20s \
     /usr/bin/podman \
     --remote=false \
@@ -213,11 +245,9 @@ run_user_probe() {
   logs_status=$?
   set -e
   stderr_size=$(/usr/bin/stat -Lc %s "$PROBE_CAPTURE_STDERR")
-  if (( wait_status != 0 )) || [[ $wait_output != 0 ]] ||
-    (( logs_status != 0 || stderr_size != 0 )); then
-    printf 'wait_status=%s wait_output=%q logs_status=%s logs_stderr_bytes=%s\n' \
-      "$wait_status" "$wait_output" "$logs_status" "$stderr_size" >&2
-    printf 'error: bounded wait/log retrieval did not report one clean payload exit\n' >&2
+  if (( logs_status != 0 || stderr_size != 0 )); then
+    printf 'logs_status=%s logs_stderr_bytes=%s\n' "$logs_status" "$stderr_size" >&2
+    printf 'error: bounded log retrieval did not report one clean payload exit\n' >&2
     exit 1
   fi
 

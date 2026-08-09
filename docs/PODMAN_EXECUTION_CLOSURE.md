@@ -284,19 +284,20 @@ queue generation, ownership, holds/cancellation, every bound identity, and an in
 then atomically consumes/checkpoints start authority. The deadline remains the original B05
 `not_after`/maximum-duration budget with preparation time already consumed; it is never restarted or
 extended. Any refusal leaves the exact stopped container unstarted and recovery-classified. Only
-after that successful checkpoint does R02 invoke fixed `podman start <exact-id>`,
-`podman wait <exact-id>`, and `podman logs <exact-id>` forms. Each command is independently
-deadline- and output-bounded. R02 monitors the authoritative payload cgroup and exact
-attempt-private log while `wait` is active; timeout, cancellation, log-ceiling contact, or capture
-failure triggers the journaled abort path and can never become success. `wait`, stopped-state
-inspection, and the durable attempt must agree on the exit code before `logs` is parsed into
-separately bounded stdout/stderr. A name or CID file remains lookup evidence only. The displayed
-paths are private plan values, never public receipt fields. Source refers only to the protected
-immutable materialization, never the live checkout. The read-only dependency-cache mount is omitted
-when no independently verified generation exists.
+after that successful checkpoint does R02 invoke fixed `podman start <exact-id>`, repeated
+`podman container inspect <exact-id>`, and final `podman logs <exact-id>` forms. Each command and the
+whole polling sequence are independently deadline- and output-bounded. R02 monitors the
+authoritative payload cgroup and exact attempt-private log while polling; timeout, cancellation,
+log-ceiling contact, or capture failure triggers the journaled abort path and can never become
+success. Final stopped-state inspection, cgroup emptiness, and the durable attempt must agree on the
+exit code before `logs` is parsed into separately bounded stdout/stderr. A name or CID file remains
+lookup evidence only. The displayed paths are private plan values, never public receipt fields.
+Source refers only to the protected immutable materialization, never the live checkout. The
+read-only dependency-cache mount is omitted when no independently verified generation exists.
 
-Noble Podman 4.9.3 leaves the local `start --attach` client waiting after this fixture's payload and
-container have both exited cleanly, so attach is not an admitted execution primitive. The fixed
+Noble Podman 4.9.3 leaves both `start --attach` and `wait` clients waiting after this fixture's
+payload and container have exited cleanly; its `WaitForExit` path explicitly continues while the
+container is `stopped`. Neither command is an admitted execution primitive. The fixed
 `k8s-file` driver instead writes one exact attempt-private regular file with a hard aggregate byte
 ceiling passed to conmon. R02 validates the stopped container's exact driver, path, and limit before
 start and rejects an unsafe owner, mode, type, link count, or parent binding. Reaching the ceiling
