@@ -264,7 +264,6 @@ run_user_probe() {
       .[0].HostConfig.ReadonlyRootfs == true and
       .[0].HostConfig.Privileged == false and
       .[0].HostConfig.CgroupParent == $cgroup_parent and
-      .[0].HostConfig.CgroupnsMode == "private" and
       .[0].HostConfig.PidsLimit == 32 and
       .[0].HostConfig.Memory == 67108864 and
       .[0].HostConfig.MemorySwap == 67108864 and
@@ -281,7 +280,6 @@ run_user_probe() {
       readonly: .HostConfig.ReadonlyRootfs,
       privileged: .HostConfig.Privileged,
       cgroup_parent_matches: (.HostConfig.CgroupParent == $cgroup_parent),
-      cgroupns: .HostConfig.CgroupnsMode,
       pids: .HostConfig.PidsLimit,
       memory: .HostConfig.Memory,
       swap: .HostConfig.MemorySwap,
@@ -360,6 +358,7 @@ run_user_probe() {
       one_pathless_namespace("ipc") and
       one_pathless_namespace("pid") and
       one_pathless_namespace("uts") and
+      one_pathless_namespace("cgroup") and
       ([.process.env[] | select(forbidden_environment)] | length) == 0 and
       ([.mounts[] | select(.destination == "/etc/passwd" or .destination == "/etc/group")] | length) == 0 and
       .linux.seccomp != null
