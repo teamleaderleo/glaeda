@@ -3,7 +3,9 @@
 //! This module does not open `/etc/ld.so.cache`, resolve or open a library, inspect a search
 //! directory, execute `ldconfig`/`ldd`, or construct runtime evidence. It only validates
 //! already-bounded bytes from the current little-endian glibc 1.1 cache format for a later
-//! descriptor-bound R01 observer.
+//! descriptor-bound R01 observer. It can also reproduce cache selection from an explicitly
+//! supplied, caller-owned capability profile, but that profile is not host evidence and the
+//! selected path remains untrusted.
 
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
@@ -126,6 +128,225 @@ impl fmt::Debug for LinuxDynamicLoaderCache {
             .field("glibc_hwcap_name_count", &self.glibc_hwcap_names.len())
             .finish()
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LinuxDynamicLoaderCapabilityProfile {
+    Aarch64Baseline,
+    X86_64Baseline,
+    X86_64V2,
+    X86_64V3,
+    X86_64V4,
+}
+
+impl LinuxDynamicLoaderCapabilityProfile {
+    #[must_use]
+    pub const fn architecture(self) -> PersonalWorkerRuntimeArchitecture {
+        match self {
+            Self::Aarch64Baseline => PersonalWorkerRuntimeArchitecture::Aarch64,
+            Self::X86_64Baseline | Self::X86_64V2 | Self::X86_64V3 | Self::X86_64V4 => {
+                PersonalWorkerRuntimeArchitecture::X86_64
+            }
+        }
+    }
+
+    const fn supports_isa_level(self, level: u16) -> bool {
+        let maximum = match self {
+            Self::Aarch64Baseline | Self::X86_64Baseline => 0,
+            Self::X86_64V2 => 1,
+            Self::X86_64V3 => 2,
+            Self::X86_64V4 => 3,
+        };
+        level <= maximum
+    }
+
+    const fn hwcap_priority(self, name: &str) -> Option<u8> {
+        match (self, name.as_bytes()) {
+            (Self::X86_64V4, b"x86-64-v4") => Some(0),
+            (Self::X86_64V4 | Self::X86_64V3, b"x86-64-v3") => Some(1),
+            (Self::X86_64V4 | Self::X86_64V3 | Self::X86_64V2, b"x86-64-v2") => Some(2),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LinuxDynamicLoaderCacheSelection {
+    Baseline,
+    X86_64V2,
+    X86_64V3,
+    X86_64V4,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct LinuxDynamicLoaderCacheResolutionSummary {
+    architecture: PersonalWorkerRuntimeArchitecture,
+    selection: LinuxDynamicLoaderCacheSelection,
+}
+
+impl LinuxDynamicLoaderCacheResolutionSummary {
+    #[must_use]
+    pub const fn architecture(self) -> PersonalWorkerRuntimeArchitecture {
+        self.architecture
+    }
+
+    #[must_use]
+    pub const fn selection(self) -> LinuxDynamicLoaderCacheSelection {
+        self.selection
+    }
+}
+
+/// Opaque semantic result of one glibc 2.39 cache lookup.
+///
+/// This result is not filesystem evidence. The retained path is crate-private so a later Linux
+/// observer can open it beneath a held root and prove the complete symlink/file binding before it
+/// contributes to runtime evidence.
+pub struct LinuxDynamicLoaderCacheResolution {
+    summary: LinuxDynamicLoaderCacheResolutionSummary,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the next descriptor-bound observer consumes the selected private identity"
+        )
+    )]
+    pub(crate) library_name: String,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the next descriptor-bound observer consumes the selected private identity"
+        )
+    )]
+    pub(crate) library_path: String,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the next descriptor-bound observer consumes the selected private identity"
+        )
+    )]
+    pub(crate) isa_level: u16,
+}
+
+impl LinuxDynamicLoaderCacheResolution {
+    #[must_use]
+    pub const fn summary(&self) -> LinuxDynamicLoaderCacheResolutionSummary {
+        self.summary
+    }
+}
+
+impl fmt::Debug for LinuxDynamicLoaderCacheResolution {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LinuxDynamicLoaderCacheResolution")
+            .field("summary", &self.summary)
+            .field(
+                "private_cache_identity",
+                &"<private-loader-cache-resolution>",
+            )
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LinuxDynamicLoaderCacheResolutionErrorKind {
+    IdentityMismatch,
+    InvalidLibraryName,
+    Missing,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize)]
+pub struct LinuxDynamicLoaderCacheResolutionError {
+    pub kind: LinuxDynamicLoaderCacheResolutionErrorKind,
+    pub code: &'static str,
+    pub message: &'static str,
+}
+
+impl fmt::Debug for LinuxDynamicLoaderCacheResolutionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LinuxDynamicLoaderCacheResolutionError")
+            .field("kind", &self.kind)
+            .field("code", &self.code)
+            .field("message", &self.message)
+            .finish()
+    }
+}
+
+impl fmt::Display for LinuxDynamicLoaderCacheResolutionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.message)
+    }
+}
+
+impl std::error::Error for LinuxDynamicLoaderCacheResolutionError {}
+
+/// Reproduce one glibc 2.39 cache selection from already-validated semantic input.
+///
+/// The supplied capability profile is caller-owned semantics, not observation evidence. The
+/// returned cache path remains untrusted until a later descriptor-bound observer opens and
+/// revalidates it beneath the exact protected runtime root.
+///
+/// # Errors
+///
+/// Returns a fixed path-free error for architecture mismatch, a noncanonical library basename,
+/// or absence of a cache entry usable by the supplied capability profile.
+pub fn resolve_linux_dynamic_loader_cache(
+    cache: &LinuxDynamicLoaderCache,
+    profile: LinuxDynamicLoaderCapabilityProfile,
+    library_name: &str,
+) -> Result<LinuxDynamicLoaderCacheResolution, LinuxDynamicLoaderCacheResolutionError> {
+    if cache.architecture != profile.architecture() {
+        return Err(resolution_identity_error());
+    }
+    validate_component(library_name, MAX_LIBRARY_NAME_BYTES)
+        .map_err(|_| resolution_name_error())?;
+
+    let mut best_named: Option<(&LinuxDynamicLoaderCacheEntry, u8)> = None;
+    let mut baseline = None;
+    for entry in cache
+        .entries
+        .iter()
+        .filter(|entry| entry.library_name == library_name)
+    {
+        let Some(name) = entry.hwcap_name.as_deref() else {
+            baseline.get_or_insert(entry);
+            continue;
+        };
+        let Some(priority) = profile.hwcap_priority(name) else {
+            continue;
+        };
+        if !profile.supports_isa_level(entry.isa_level) {
+            continue;
+        }
+        if best_named.is_none_or(|(_, best_priority)| priority < best_priority) {
+            best_named = Some((entry, priority));
+        }
+    }
+    let selected = best_named
+        .map(|(entry, _)| entry)
+        .or(baseline)
+        .ok_or_else(resolution_missing_error)?;
+    let selection = match selected.hwcap_name.as_deref() {
+        None => LinuxDynamicLoaderCacheSelection::Baseline,
+        Some("x86-64-v2") => LinuxDynamicLoaderCacheSelection::X86_64V2,
+        Some("x86-64-v3") => LinuxDynamicLoaderCacheSelection::X86_64V3,
+        Some("x86-64-v4") => LinuxDynamicLoaderCacheSelection::X86_64V4,
+        Some(_) => return Err(resolution_missing_error()),
+    };
+    Ok(LinuxDynamicLoaderCacheResolution {
+        summary: LinuxDynamicLoaderCacheResolutionSummary {
+            architecture: cache.architecture,
+            selection,
+        },
+        library_name: selected.library_name.clone(),
+        library_path: selected.library_path.clone(),
+        isa_level: selected.isa_level,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -710,6 +931,42 @@ const fn unsupported_capability_error() -> LinuxDynamicLoaderCacheError {
     )
 }
 
+const fn resolution_error(
+    kind: LinuxDynamicLoaderCacheResolutionErrorKind,
+    code: &'static str,
+    message: &'static str,
+) -> LinuxDynamicLoaderCacheResolutionError {
+    LinuxDynamicLoaderCacheResolutionError {
+        kind,
+        code,
+        message,
+    }
+}
+
+const fn resolution_identity_error() -> LinuxDynamicLoaderCacheResolutionError {
+    resolution_error(
+        LinuxDynamicLoaderCacheResolutionErrorKind::IdentityMismatch,
+        "dynamic_loader_cache_resolution_identity_mismatch",
+        "dynamic-loader cache and capability profile identities do not match",
+    )
+}
+
+const fn resolution_name_error() -> LinuxDynamicLoaderCacheResolutionError {
+    resolution_error(
+        LinuxDynamicLoaderCacheResolutionErrorKind::InvalidLibraryName,
+        "dynamic_loader_cache_resolution_invalid_name",
+        "dynamic-loader cache lookup requires one canonical library basename",
+    )
+}
+
+const fn resolution_missing_error() -> LinuxDynamicLoaderCacheResolutionError {
+    resolution_error(
+        LinuxDynamicLoaderCacheResolutionErrorKind::Missing,
+        "dynamic_loader_cache_resolution_missing",
+        "dynamic-loader cache contains no usable entry for the requested library",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -741,6 +998,159 @@ mod tests {
         let debug = format!("{parsed:?} {:?}", parsed.entries()[0]);
         assert!(!debug.contains("/lib/"));
         assert!(!debug.contains("libz"));
+    }
+
+    #[test]
+    fn cache_resolution_matches_glibc_hwcaps_and_isa_priority() {
+        let bytes = fixture(
+            PersonalWorkerRuntimeArchitecture::X86_64,
+            &[
+                FixtureEntry::hwcap(
+                    "libc.so.6",
+                    "/lib/x86_64-linux-gnu/glibc-hwcaps/x86-64-v2/libc.so.6",
+                    0,
+                    1,
+                ),
+                FixtureEntry::hwcap(
+                    "libc.so.6",
+                    "/lib/x86_64-linux-gnu/glibc-hwcaps/x86-64-v3/libc.so.6",
+                    1,
+                    2,
+                ),
+                FixtureEntry::hwcap(
+                    "libc.so.6",
+                    "/lib/x86_64-linux-gnu/glibc-hwcaps/x86-64-v4/libc.so.6",
+                    2,
+                    3,
+                ),
+                FixtureEntry::plain("libc.so.6", "/lib/x86_64-linux-gnu/libc.so.6"),
+            ],
+            &["x86-64-v2", "x86-64-v3", "x86-64-v4"],
+        );
+        let parsed =
+            parse_linux_dynamic_loader_cache(&bytes, PersonalWorkerRuntimeArchitecture::X86_64)
+                .expect("x86 cache");
+        for (profile, expected) in [
+            (
+                LinuxDynamicLoaderCapabilityProfile::X86_64Baseline,
+                LinuxDynamicLoaderCacheSelection::Baseline,
+            ),
+            (
+                LinuxDynamicLoaderCapabilityProfile::X86_64V2,
+                LinuxDynamicLoaderCacheSelection::X86_64V2,
+            ),
+            (
+                LinuxDynamicLoaderCapabilityProfile::X86_64V3,
+                LinuxDynamicLoaderCacheSelection::X86_64V3,
+            ),
+            (
+                LinuxDynamicLoaderCapabilityProfile::X86_64V4,
+                LinuxDynamicLoaderCacheSelection::X86_64V4,
+            ),
+        ] {
+            let resolution = resolve_linux_dynamic_loader_cache(&parsed, profile, "libc.so.6")
+                .expect("resolve supported profile");
+            assert_eq!(resolution.summary().selection(), expected);
+            assert_eq!(resolution.summary().architecture(), profile.architecture());
+            assert!(!format!("{resolution:?}").contains("/lib"));
+        }
+    }
+
+    #[test]
+    fn cache_resolution_requires_both_active_name_and_isa_level() {
+        let bytes = fixture(
+            PersonalWorkerRuntimeArchitecture::X86_64,
+            &[
+                FixtureEntry::hwcap(
+                    "libc.so.6",
+                    "/lib/x86_64-linux-gnu/glibc-hwcaps/x86-64-v2/libc.so.6",
+                    0,
+                    1,
+                ),
+                FixtureEntry::hwcap(
+                    "libc.so.6",
+                    "/lib/x86_64-linux-gnu/glibc-hwcaps/x86-64-v3/libc.so.6",
+                    1,
+                    3,
+                ),
+                FixtureEntry::plain("libc.so.6", "/lib/x86_64-linux-gnu/libc.so.6"),
+            ],
+            &["x86-64-v2", "x86-64-v3"],
+        );
+        let parsed =
+            parse_linux_dynamic_loader_cache(&bytes, PersonalWorkerRuntimeArchitecture::X86_64)
+                .expect("x86 cache");
+        let resolution = resolve_linux_dynamic_loader_cache(
+            &parsed,
+            LinuxDynamicLoaderCapabilityProfile::X86_64V3,
+            "libc.so.6",
+        )
+        .expect("fall back from incompatible v3 object to v2");
+        assert_eq!(
+            resolution.summary().selection(),
+            LinuxDynamicLoaderCacheSelection::X86_64V2
+        );
+        assert_eq!(resolution.isa_level, 1);
+    }
+
+    #[test]
+    fn cache_resolution_identity_name_and_missing_fail_path_free() {
+        let bytes = fixture(
+            PersonalWorkerRuntimeArchitecture::Aarch64,
+            &[FixtureEntry::plain(
+                "libc.so.6",
+                "/lib/aarch64-linux-gnu/libc.so.6",
+            )],
+            &[],
+        );
+        let parsed =
+            parse_linux_dynamic_loader_cache(&bytes, PersonalWorkerRuntimeArchitecture::Aarch64)
+                .expect("AArch64 cache");
+        let resolution = resolve_linux_dynamic_loader_cache(
+            &parsed,
+            LinuxDynamicLoaderCapabilityProfile::Aarch64Baseline,
+            "libc.so.6",
+        )
+        .expect("resolve AArch64 baseline");
+        assert_eq!(resolution.library_name, "libc.so.6");
+        assert_eq!(resolution.library_path, "/lib/aarch64-linux-gnu/libc.so.6");
+        assert_eq!(
+            resolution.summary().selection(),
+            LinuxDynamicLoaderCacheSelection::Baseline
+        );
+
+        for (result, expected) in [
+            (
+                resolve_linux_dynamic_loader_cache(
+                    &parsed,
+                    LinuxDynamicLoaderCapabilityProfile::X86_64Baseline,
+                    "libc.so.6",
+                ),
+                LinuxDynamicLoaderCacheResolutionErrorKind::IdentityMismatch,
+            ),
+            (
+                resolve_linux_dynamic_loader_cache(
+                    &parsed,
+                    LinuxDynamicLoaderCapabilityProfile::Aarch64Baseline,
+                    "../libc.so.6",
+                ),
+                LinuxDynamicLoaderCacheResolutionErrorKind::InvalidLibraryName,
+            ),
+            (
+                resolve_linux_dynamic_loader_cache(
+                    &parsed,
+                    LinuxDynamicLoaderCapabilityProfile::Aarch64Baseline,
+                    "libmissing.so.1",
+                ),
+                LinuxDynamicLoaderCacheResolutionErrorKind::Missing,
+            ),
+        ] {
+            let error = result.expect_err("cache resolution refusal");
+            assert_eq!(error.kind, expected);
+            let debug = format!("{error:?}");
+            assert!(!debug.contains('/'));
+            assert!(!debug.contains("libc"));
+        }
     }
 
     #[test]
@@ -999,6 +1409,21 @@ mod tests {
         let parsed = parse_linux_dynamic_loader_cache(&bytes, architecture)
             .expect("parse Noble loader cache");
         assert!(!parsed.entries().is_empty());
+        let profile = match architecture {
+            PersonalWorkerRuntimeArchitecture::Aarch64 => {
+                LinuxDynamicLoaderCapabilityProfile::Aarch64Baseline
+            }
+            PersonalWorkerRuntimeArchitecture::X86_64 => {
+                LinuxDynamicLoaderCapabilityProfile::X86_64Baseline
+            }
+        };
+        let resolution = resolve_linux_dynamic_loader_cache(&parsed, profile, "libc.so.6")
+            .expect("resolve Noble baseline libc cache entry");
+        assert_eq!(
+            resolution.summary().selection(),
+            LinuxDynamicLoaderCacheSelection::Baseline
+        );
+        assert!(!format!("{resolution:?}").contains("/lib"));
     }
 
     #[derive(Clone, Copy)]
