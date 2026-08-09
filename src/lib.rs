@@ -97,6 +97,9 @@ pub mod linux_personal_worker_runtime_executable_prerequisite;
 /// Direct command-free Linux kernel and cgroup-v2 prerequisites for the personal-worker runtime.
 #[cfg(target_os = "linux")]
 pub mod linux_personal_worker_runtime_kernel_prerequisite;
+/// Read-only, descriptor-bound observation of the fixed GNU dynamic-loader object.
+#[cfg(target_os = "linux")]
+pub mod linux_personal_worker_runtime_loader_object_prerequisite;
 /// Descriptor-bound prerequisite for fixed loader configuration, cache, and preload absence.
 #[cfg(target_os = "linux")]
 pub mod linux_personal_worker_runtime_loader_state_prerequisite;
