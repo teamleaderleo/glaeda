@@ -5,10 +5,10 @@ execution backend and does not authorize a physical Lima or host mutation.
 
 ## Exact evidence
 
-- Fixture commit: `ae305d6636a9e7ae318269d58f4ead38dc6b88a6`
-- Workflow run: [31312378954](https://github.com/teamleaderleo/smolrunner/actions/runs/31312378954)
-- ARM64 job: [93242034326](https://github.com/teamleaderleo/smolrunner/actions/runs/31312378954/job/93242034326)
-- x86_64 job: [93242034293](https://github.com/teamleaderleo/smolrunner/actions/runs/31312378954/job/93242034293)
+- Fixture commit: `72e92ce26254829c374583f64ec26cd8f955227a`
+- Workflow run: [31312693012](https://github.com/teamleaderleo/smolrunner/actions/runs/31312693012)
+- ARM64 job: [93242855635](https://github.com/teamleaderleo/smolrunner/actions/runs/31312693012/job/93242855635)
+- x86_64 job: [93242855661](https://github.com/teamleaderleo/smolrunner/actions/runs/31312693012/job/93242855661)
 - Date: 2026-08-09
 - Result: both jobs passed on fresh GitHub-hosted Ubuntu 24.04 VMs.
 
@@ -61,11 +61,12 @@ The exact fixture proves only these facts on both admitted architectures:
    and an empty root before Podman. The hostile stopped OCI spec binds that exact source read-write at
    `/target` below the exact payload leaf.
 9. A fixed image-owned hostile payload exhausts both target ceilings, increments the exact leaf's
-   `pids.events max`, raises that leaf's `memory.current` at least 7 MiB above its pre-start baseline,
-   and grows only its bounded private log past the 64-KiB abort threshold. The fixture opens the exact
-   leaf's `cgroup.kill` before start, writes the kill only after every pressure signal, observes
-   `populated 0`, and then requires one nonzero stopped result. Exact removal deletes the leaf; the
-   final single-link runner-owned log remains non-group/world-writable and below one MiB.
+   `pids.events max`, and raises both that leaf's `memory.current` and `memory.stat shmem` at least
+   7 MiB above their pre-start baselines while the target is full. Its bounded private log crosses
+   the 64-KiB abort threshold. The fixture opens the exact leaf's `cgroup.kill` before start, writes
+   the kill only after every pressure signal, observes `populated 0`, and then requires one nonzero
+   stopped result. Exact removal deletes the leaf; the final single-link runner-owned log remains
+   non-group/world-writable and below one MiB.
 10. Exact trusted and hostile container removal succeeds, followed by exact image removal. The
     payload parent reports no process and `populated 0`; systemd collection removes the entire exact
     service cgroup; root unmounts the exact target; the two precreated network lock inodes remain the
