@@ -110,6 +110,32 @@ prepare_cgroup_hierarchy() {
 PROBE_OWNED_CONTAINER_ID=
 PROBE_OWNED_IMAGE_ID=
 
+validate_target_tmpfs() {
+  local block_size blocks free_blocks free_inodes fs_type inode_limit mode owner group
+  fs_type=$(/usr/bin/findmnt --noheadings --output FSTYPE --target "$PROBE_TARGET")
+  read -r block_size blocks free_blocks inode_limit free_inodes < <(
+    /usr/bin/stat -f -c '%S %b %f %c %d' "$PROBE_TARGET"
+  )
+  read -r owner group mode < <(/usr/bin/stat -Lc '%u %g %a' "$PROBE_TARGET")
+  [[ $fs_type == tmpfs ]] &&
+    [[ $owner == "$PROBE_UID" ]] &&
+    [[ $group == "$PROBE_GID" ]] &&
+    [[ $mode == 700 ]] &&
+    (( block_size * blocks == 8388608 )) &&
+    (( free_blocks <= blocks )) &&
+    (( inode_limit == 64 )) &&
+    (( free_inodes <= inode_limit )) &&
+    /usr/bin/findmnt --noheadings --output OPTIONS --target "$PROBE_TARGET" |
+      /usr/bin/awk -F, '
+        {
+          for (i = 1; i <= NF; i += 1) option[$i] = 1
+        }
+        END {
+          exit !(option["rw"] && option["nosuid"] && option["nodev"] && !option["noexec"])
+        }
+      '
+}
+
 cleanup_user_probe() {
   local status=$?
   trap - EXIT
@@ -123,6 +149,223 @@ cleanup_user_probe() {
   exit "$status"
 }
 
+run_hostile_probe() {
+  local image_id=$1
+  local container_id cgroup_leaf cgroup_leaf_name init_output init_status start_output start_status
+  local container_size exit_code free_blocks free_inodes kill_fd log_size memory_current pids_max_events
+  local payload_empty=0 resource_pressure_seen=0 stopped_seen=0
+  local -a matching_cgroups matching_specs
+
+  if ! validate_target_tmpfs ||
+    [[ -n $(/usr/bin/find "$PROBE_TARGET" -mindepth 1 -maxdepth 1 -print -quit) ]]; then
+    printf 'error: hostile attempt target did not begin as one empty bounded tmpfs\n' >&2
+    exit 1
+  fi
+
+  container_id=$(podman_probe create \
+    --pull=never \
+    --init \
+    --init-path=/usr/bin/catatonit \
+    --network=none \
+    --no-hosts \
+    --ipc=private \
+    --shm-size=1048576 \
+    --pid=private \
+    --uts=private \
+    --hostname=smolrunner-verification \
+    --read-only \
+    --read-only-tmpfs=false \
+    --image-volume=ignore \
+    --cap-drop=all \
+    --security-opt=no-new-privileges \
+    --security-opt="seccomp=$PROBE_SECCOMP_PROFILE" \
+    --cgroup-parent="$PROBE_CGROUP_PARENT" \
+    --cgroupns=private \
+    --pids-limit=32 \
+    --memory=67108864 \
+    --memory-swap=67108864 \
+    --cpus=0.5 \
+    --env-host=false \
+    --http-proxy=false \
+    --log-driver=k8s-file \
+    --log-opt="path=$PROBE_HOSTILE_LOGFILE" \
+    --log-opt=max-size=1048576 \
+    --privileged=false \
+    --systemd=false \
+    --restart=no \
+    --no-healthcheck \
+    --name=smolrunner-hostile-fixture \
+    --cidfile="$PROBE_HOSTILE_CIDFILE" \
+    --userns=keep-id:uid=1000,gid=1000 \
+    --user=1000:1000 \
+    --workdir=/target \
+    --entrypoint=/bin/hostile \
+    --mount="type=bind,src=$PROBE_TARGET,target=/target,rw" \
+    --tmpfs=/tmp:rw,noexec,nosuid,nodev,size=1048576,mode=1777 \
+    "$image_id")
+  if [[ ! $container_id =~ ^[0-9a-f]{64}$ ]] ||
+    [[ $(< "$PROBE_HOSTILE_CIDFILE") != "$container_id" ]]; then
+    printf 'error: hostile stopped create returned a noncanonical container identity\n' >&2
+    exit 1
+  fi
+  PROBE_OWNED_CONTAINER_ID=$container_id
+
+  set +e
+  /usr/bin/timeout --signal=KILL 20s \
+    /usr/bin/podman \
+    --remote=false \
+    --runtime=/usr/bin/crun \
+    --conmon=/usr/bin/conmon \
+    --events-backend=none \
+    --hooks-dir="$PROBE_HOOKS" \
+    --network-config-dir="$PROBE_NETWORK" \
+    --cgroup-manager=cgroupfs \
+    --tmpdir="$TMPDIR" \
+    --transient-store \
+    container init "$container_id" </dev/null \
+    > "$PROBE_HOSTILE_INIT_STDOUT" 2> "$PROBE_HOSTILE_INIT_STDERR"
+  init_status=$?
+  set -e
+  init_output=$(< "$PROBE_HOSTILE_INIT_STDOUT")
+  if (( init_status != 0 )) || [[ $init_output != "$container_id" ]] ||
+    [[ -s $PROBE_HOSTILE_INIT_STDERR ]]; then
+    printf 'init_status=%s init_output=%q\n' "$init_status" "$init_output" >&2
+    printf 'error: hostile bounded init did not return the exact container identity\n' >&2
+    exit 1
+  fi
+
+  mapfile -d '' matching_cgroups < <(
+    /usr/bin/find "$PROBE_PAYLOAD_CGROUP_DIR" -mindepth 1 -maxdepth 1 -type d -print0
+  )
+  if [[ ${#matching_cgroups[@]} -ne 1 ]]; then
+    printf 'error: hostile initialized container lacks one exact payload cgroup leaf\n' >&2
+    exit 1
+  fi
+  cgroup_leaf=${matching_cgroups[0]}
+  cgroup_leaf_name=${cgroup_leaf##*/}
+  if [[ -L $cgroup_leaf ]] || [[ $cgroup_leaf_name != *"$container_id"* ]] ||
+    ! validate_cgroup_limits "$cgroup_leaf"; then
+    printf 'error: hostile payload cgroup identity or limits drifted\n' >&2
+    exit 1
+  fi
+
+  mapfile -d '' matching_specs < <(
+    /usr/bin/find "$PROBE_ROOT" -xdev -type f -name config.json \
+      -path "*$container_id*" -print0 2>/dev/null
+  )
+  if [[ ${#matching_specs[@]} -ne 1 ]] ||
+    ! /usr/bin/jq -e \
+      --arg cgroup_leaf "$cgroup_leaf_name" \
+      --arg cgroup_parent "$PROBE_CGROUP_PARENT" \
+      --arg target "$PROBE_TARGET" '
+      (.linux.cgroupsPath == ($cgroup_parent + "/" + $cgroup_leaf) or
+        .linux.cgroupsPath == (($cgroup_parent | ltrimstr("/")) + "/" + $cgroup_leaf)) and
+      ([.mounts[] | select(.destination == "/target" and .source == $target and
+        (.options | index("rw")) != null and (.options | index("rbind")) != null)] | length) == 1
+    ' "${matching_specs[0]:-/dev/null}" >/dev/null; then
+    printf 'error: hostile OCI spec did not bind the exact target and cgroup leaf\n' >&2
+    exit 1
+  fi
+
+  exec {kill_fd}> "$cgroup_leaf/cgroup.kill"
+
+  set +e
+  start_output=$(/usr/bin/timeout --signal=KILL 20s \
+    /usr/bin/podman \
+    --remote=false \
+    --runtime=/usr/bin/crun \
+    --conmon=/usr/bin/conmon \
+    --events-backend=none \
+    --hooks-dir="$PROBE_HOOKS" \
+    --network-config-dir="$PROBE_NETWORK" \
+    --cgroup-manager=cgroupfs \
+    --tmpdir="$TMPDIR" \
+    --transient-store \
+    start "$container_id" </dev/null)
+  start_status=$?
+  set -e
+  if (( start_status != 0 )) || [[ $start_output != "$container_id" ]]; then
+    printf 'start_status=%s start_output=%q\n' "$start_status" "$start_output" >&2
+    printf 'error: hostile detached start did not return the exact container identity\n' >&2
+    exit 1
+  fi
+
+  for _ in {1..400}; do
+    log_size=0
+    [[ -f $PROBE_HOSTILE_LOGFILE ]] && log_size=$(/usr/bin/stat -Lc %s "$PROBE_HOSTILE_LOGFILE")
+    pids_max_events=$(/usr/bin/awk '$1 == "max" { print $2 }' "$cgroup_leaf/pids.events")
+    memory_current=$(< "$cgroup_leaf/memory.current")
+    read -r free_blocks free_inodes < <(/usr/bin/stat -f -c '%f %d' "$PROBE_TARGET")
+    if (( log_size >= 65536 && log_size <= 1048576 && pids_max_events > 0 &&
+      memory_current >= 8388608 && free_blocks == 0 && free_inodes == 0 )); then
+      resource_pressure_seen=1
+      break
+    fi
+    /usr/bin/sleep 0.025
+  done
+  if (( resource_pressure_seen != 1 )); then
+    printf 'hostile_log_bytes=%s pids_max_events=%s memory_current=%s free_blocks=%s free_inodes=%s\n' \
+      "$log_size" "$pids_max_events" "$memory_current" "$free_blocks" "$free_inodes" >&2
+    printf 'error: hostile payload did not reach every bounded pressure signal\n' >&2
+    exit 1
+  fi
+
+  printf '1\n' >&"$kill_fd"
+  exec {kill_fd}>&-
+  for _ in {1..200}; do
+    if /usr/bin/grep -Fxq 'populated 0' "$cgroup_leaf/cgroup.events"; then
+      payload_empty=1
+      break
+    fi
+    /usr/bin/sleep 0.025
+  done
+  if (( payload_empty != 1 )); then
+    printf 'error: authoritative hostile cgroup kill did not empty the exact leaf\n' >&2
+    exit 1
+  fi
+
+  for _ in {1..200}; do
+    podman_probe container inspect "$container_id" > "$PROBE_HOSTILE_CONTAINER_JSON"
+    container_size=$(/usr/bin/stat -Lc %s "$PROBE_HOSTILE_CONTAINER_JSON")
+    if (( container_size == 0 || container_size > 1048576 )); then
+      printf 'error: hostile completion inspection was absent or oversized\n' >&2
+      exit 1
+    fi
+    if /usr/bin/jq -e 'length == 1 and .[0].State.Status == "stopped" and .[0].State.Running == false' \
+      "$PROBE_HOSTILE_CONTAINER_JSON" >/dev/null; then
+      stopped_seen=1
+      exit_code=$(/usr/bin/jq -r '.[0].State.ExitCode' "$PROBE_HOSTILE_CONTAINER_JSON")
+      break
+    fi
+    /usr/bin/sleep 0.025
+  done
+  if (( stopped_seen != 1 )) || [[ ${exit_code:-0} == 0 ]]; then
+    printf 'stopped_seen=%s exit_code=%s\n' "$stopped_seen" "${exit_code:-unknown}" >&2
+    printf 'error: hostile cgroup abort did not produce one failed stopped container\n' >&2
+    exit 1
+  fi
+
+  podman_probe rm "$container_id" >/dev/null
+  PROBE_OWNED_CONTAINER_ID=
+  if [[ -e $cgroup_leaf ]] || [[ -L $cgroup_leaf ]] ||
+    [[ -n $(< "$PROBE_PAYLOAD_CGROUP_DIR/cgroup.procs") ]] ||
+    ! /usr/bin/grep -Fxq 'populated 0' "$PROBE_PAYLOAD_CGROUP_DIR/cgroup.events"; then
+    printf 'error: hostile payload cgroup debt remained after exact removal\n' >&2
+    exit 1
+  fi
+  if ! validate_target_tmpfs; then
+    printf 'error: hostile payload changed the bounded target filesystem identity\n' >&2
+    exit 1
+  fi
+  read -r free_blocks free_inodes < <(/usr/bin/stat -f -c '%f %d' "$PROBE_TARGET")
+  if (( free_blocks != 0 || free_inodes != 0 )); then
+    printf 'error: hostile payload did not prove both target byte and inode ceilings\n' >&2
+    exit 1
+  fi
+
+  printf 'hostile_abort=cgroup-kill target_tmpfs=byte-and-inode-bounded\n'
+}
+
 run_user_probe() {
   local image_id image_hex container_id container_output expected_output
   local init_output init_status start_output start_status inspect_status logs_status completion_seen=0
@@ -132,6 +375,12 @@ run_user_probe() {
   local -a matching_cgroups
 
   prepare_cgroup_hierarchy
+
+  if ! validate_target_tmpfs ||
+    [[ -n $(/usr/bin/find "$PROBE_TARGET" -mindepth 1 -maxdepth 1 -print -quit) ]]; then
+    printf 'error: bounded writable target is not one exact empty executable tmpfs\n' >&2
+    exit 1
+  fi
 
   mapfile -d '' network_entries_before < <(
     /usr/bin/find "$PROBE_NETWORK" -mindepth 1 -maxdepth 1 -print0
@@ -525,6 +774,7 @@ $PROBE_GROUP_SHA  /etc/group"
     printf 'error: exact payload cgroup was not empty after container removal\n' >&2
     exit 1
   fi
+  run_hostile_probe "$image_id"
   podman_probe image rm "$image_id" >/dev/null
   PROBE_OWNED_IMAGE_ID=
 
@@ -561,13 +811,15 @@ for command in \
   /usr/bin/mkdir \
   /usr/bin/findmnt \
   /usr/bin/jq \
+  /usr/bin/mount \
   /usr/bin/podman \
   /usr/bin/sha256sum \
   /usr/bin/stat \
   /usr/bin/systemctl \
   /usr/bin/systemd-run \
   /usr/bin/tar \
-  /usr/bin/timeout; do
+  /usr/bin/timeout \
+  /usr/bin/umount; do
   if [[ ! -x $command ]]; then
     printf 'error: required executable is absent: %s\n' "$command" >&2
     exit 1
@@ -609,15 +861,20 @@ probe_user="smolctr_$probe_nonce"
 probe_unit="smolrunner-podman-container-$probe_nonce.service"
 probe_user_created=0
 probe_unit_owned=0
+probe_target_mounted=0
 probe_script=$(/usr/bin/readlink -f "$0")
 probe_user_script="$probe_root/user-probe.sh"
 probe_seccomp_profile="$probe_root/seccomp.json"
+probe_target="$probe_root/target"
 
 cleanup() {
   local status=$?
   set +e
   if [[ $probe_unit_owned -eq 1 ]]; then
     /usr/bin/systemctl stop "$probe_unit" >/dev/null 2>&1
+  fi
+  if [[ $probe_target_mounted -eq 1 ]]; then
+    /usr/bin/umount -- "$probe_target" >/dev/null 2>&1
   fi
   if [[ $probe_user_created -eq 1 ]]; then
     /usr/sbin/userdel "$probe_user" >/dev/null 2>&1
@@ -670,11 +927,32 @@ mkdir -p \
   "$probe_root/rootfs/etc" \
   "$probe_root/rootfs/tmp" \
   "$probe_root/runtime" \
+  "$probe_target" \
   "$probe_root/tmp"
 chmod 0755 "$probe_root"
 install -o 0 -g 0 -m 0555 "$probe_script" "$probe_user_script"
 install -o 0 -g 0 -m 0555 /usr/bin/busybox "$probe_root/rootfs/bin/busybox"
 install -o 0 -g 0 -m 0444 "$probe_seccomp_source" "$probe_seccomp_profile"
+printf '%s\n' \
+  '#!/bin/busybox sh' \
+  'set +e' \
+  ': > /target/fill' \
+  'index=0' \
+  'while [ "$index" -lt 256 ]; do' \
+  '  /bin/busybox touch "/target/inode-$index" || break' \
+  '  index=$((index + 1))' \
+  'done' \
+  '/bin/busybox dd if=/dev/zero of=/target/fill bs=1048576 count=16 conv=notrunc' \
+  'index=0' \
+  'while [ "$index" -lt 64 ]; do' \
+  '  /bin/busybox sleep 60 &' \
+  '  index=$((index + 1))' \
+  'done' \
+  'while :; do' \
+  '  printf "smolrunner-hostile-output-0123456789abcdef\\n"' \
+  'done' \
+  > "$probe_root/rootfs/bin/hostile"
+chmod 0555 "$probe_root/rootfs/bin/hostile"
 seccomp_sha=$(/usr/bin/sha256sum "$probe_seccomp_profile" | /usr/bin/awk '{ print $1 }')
 read -r seccomp_owner seccomp_group seccomp_mode seccomp_links seccomp_size < <(
   /usr/bin/stat -Lc '%u %g %a %h %s' "$probe_seccomp_profile"
@@ -721,6 +999,11 @@ chmod 0600 "$probe_root/network/cni.lock" "$probe_root/network/netavark.lock"
 chmod 0555 "$probe_root/network"
 chmod -R a-w "$probe_root/auth" "$probe_root/config" "$probe_root/hooks" "$probe_root/rootfs"
 
+/usr/bin/mount --types tmpfs \
+  --options "rw,nosuid,nodev,size=8388608,nr_inodes=64,uid=$probe_uid,gid=$probe_gid,mode=0700" \
+  smolrunner-target "$probe_target"
+probe_target_mounted=1
+
 probe_unit_owned=1
 /usr/bin/systemd-run \
   --wait \
@@ -751,6 +1034,11 @@ probe_unit_owned=1
   PROBE_GRAPHROOT="$probe_root/graphroot" \
   PROBE_GROUP_SHA="$group_sha" \
   PROBE_HOOKS="$probe_root/hooks" \
+  PROBE_HOSTILE_CIDFILE="$probe_root/runtime/hostile.cid" \
+  PROBE_HOSTILE_CONTAINER_JSON="$probe_root/runtime/hostile-container.json" \
+  PROBE_HOSTILE_INIT_STDERR="$probe_root/runtime/hostile-init.stderr" \
+  PROBE_HOSTILE_INIT_STDOUT="$probe_root/runtime/hostile-init.stdout" \
+  PROBE_HOSTILE_LOGFILE="$probe_root/runtime/hostile.log" \
   PROBE_IMAGE_JSON="$probe_root/runtime/image.json" \
   PROBE_INIT_STDERR="$probe_root/runtime/init.stderr" \
   PROBE_INIT_STDOUT="$probe_root/runtime/init.stdout" \
@@ -762,6 +1050,7 @@ probe_unit_owned=1
   PROBE_RUNROOT="$probe_root/runtime/containers" \
   PROBE_SECCOMP_PROFILE="$probe_seccomp_profile" \
   PROBE_SECCOMP_SHA="$seccomp_sha" \
+  PROBE_TARGET="$probe_target" \
   PROBE_GID="$probe_gid" \
   PROBE_UID="$probe_uid" \
   PROBE_USER="$probe_user" \
@@ -772,6 +1061,9 @@ probe_unit_owned=1
   XDG_RUNTIME_DIR="$probe_root/runtime" \
   /usr/bin/bash "$probe_user_script" --user-probe
 probe_unit_owned=0
+
+/usr/bin/umount -- "$probe_target"
+probe_target_mounted=0
 
 service_cgroup=$(< "$probe_root/runtime/service.cgroup")
 if [[ $service_cgroup != "/system.slice/$probe_unit" ]] ||
