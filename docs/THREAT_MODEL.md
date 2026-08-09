@@ -1,56 +1,65 @@
 # Threat model
 
-SmolRunner manages persistent GitHub Actions runner listeners and disposable project execution environments on ordinary Linux hosts. That makes its defaults security-sensitive even when the fleet is small.
+SmolRunner automatically runs GitHub Actions jobs from operator-enrolled repositories on resources provisioned on an operator-owned Mac. Repository code is untrusted even when it comes from the operator's repository or a known open-source project.
+
+The detailed product boundary and milestone sequence are in [Disposable autoscaling CI](DISPOSABLE_AUTOSCALING_CI.md).
 
 ## Assets to protect
 
-- The host operating system and its service accounts.
-- GitHub registration tokens, app credentials, and repository credentials.
-- Secrets belonging to other projects on the same host.
-- The integrity of runner services, project images, and verification results.
-- The operator's ability to understand and reverse every change SmolRunner makes.
+- The Mac host, its operating system, user data, applications, and availability.
+- GitHub App credentials, just-in-time runner configuration, workflow secrets, and unrelated credentials.
+- Other workers, their jobs, state, and network traffic.
+- Other devices and services on the host's private networks.
+- The integrity of SmolRunner's controller, durable state, capacity decisions, and public results.
+- The operator's ability to understand recovery debt and stop automatic mutation.
 
-## Trust boundaries
+## Adversary
 
-1. GitHub schedules a job and sends it to the official Actions runner.
-2. The official runner is persistent and therefore treated as part of the host control plane.
-3. Checked-out repository code is treated as untrusted input, even for private repositories.
-4. Repository code executes only in a project-owned, disposable rootless container.
-5. A container shares the host kernel and is not equivalent to a virtual machine.
+Treat workflow steps, actions, checked-out source, build scripts, dependencies, test code, generated binaries, and nested containers as malicious. The adversary may try to escape, persist, steal credentials, reach the host or LAN, attack other systems, exhaust resources, confuse lifecycle observations, race cleanup, or induce controller crashes at any checkpoint.
+
+The adversary is allowed to gain complete control of its disposable guest. Security must not depend on repository code cooperating with cleanup or preserving the runner process.
+
+## Trusted computing base
+
+The initial trusted computing base is macOS, Apple Virtualization Framework, Lima's controller, a pinned Ubuntu guest image, the pinned official GitHub Actions runner, the selected network-enforcement component, GitHub Actions, and SmolRunner's host controller. Their exact versions and configuration are managed inputs, and security updates require deliberate rollout.
+
+SmolRunner does not independently re-prove every Linux, glibc, container-runtime, or network-stack semantic that a mature trusted component already owns. It verifies the configuration and lifecycle facts needed to use that component within this boundary.
 
 ## Required security invariants
 
-SmolRunner must preserve these invariants unless the operator explicitly selects a weaker mode:
+Unless an operator explicitly selects a separately documented weaker backend:
 
-- Never expose a Docker or Podman control socket to repository code.
-- Never copy untracked files or host environment files into a job workspace.
-- Resolve mutable Git references to an immutable commit before execution.
-- Deny fork pull requests on persistent self-hosted runners.
-- Do not add automatic `pull_request` execution to a persistent runner by default.
-- Use a dedicated, unprivileged Linux account for each runner security boundary.
-- Keep runner accounts out of `sudo` and unrelated project groups.
-- Drop container capabilities, disable privilege escalation, and apply CPU, memory, and PID limits.
-- Pass only the minimum environment required by a job.
-- Keep dependency installation and verification network policy independently configurable.
-- Verify official runner downloads before installation.
-- Make host changes idempotent, inspectable, and reversible.
+- One potentially hostile job runs in one freshly provisioned virtual machine and the VM is destroyed after the job or any terminal failure.
+- The job never executes in a Mac host namespace and receives no host filesystem mount, SSH agent, credential socket, host environment, dynamic port forward, or container-control socket.
+- A GitHub runner is just-in-time/ephemeral, uniquely bound to the admitted attempt, and cannot receive a second job.
+- Long-lived GitHub credentials stay on the Mac control plane. Ephemeral configuration is bounded, redacted, never public-journal data, and destroyed with the VM.
+- The job has no inbound reachability. Outbound policy denies the host, private/LAN, link-local, metadata, controller, and peer-worker destinations while allowing the explicit internet access ordinary CI requires.
+- Admission reserves host-wide CPU, memory, disk, and concurrency capacity before provisioning. VM and wall-time limits are hard ceilings. No work means no running worker VM.
+- The guest runner user has no sudo or equivalent administrative authority. Nested containers, when enabled, are rootless inside the guest and expose no host runtime socket.
+- Every provision, registration, start, terminal observation, deregistration, destruction, and capacity-release transition is durably checkpointed or safely rediscovered after a crash.
+- Unknown ownership, conflicting identity, stale authority, partial cleanup, and ambiguous external mutation block reuse. Recovery prefers destroying the disposable worker over adopting uncertain state.
+- A job's result is not success until GitHub terminal evidence and SmolRunner cleanup state are classified truthfully. Cleanup failure remains visible and retryable.
+- Bounded diagnostics exclude raw repository contents, environment dumps, secrets, credentials, and unrelated host data.
 
-## Initial supported trust model
+## Network policy
 
-The first release targets a solo developer or small trusted team running private repositories on Debian or Ubuntu hosts. Operator-triggered jobs from same-repository branches are supported. Public fork workloads and mutually hostile tenants are not.
+Ordinary CI needs DNS, HTTPS, HTTP, package registries, source hosts, and sometimes explicitly approved Git SSH or service endpoints. The default policy therefore is controlled outbound internet, not a blanket offline sandbox.
 
-## Out of scope for the first release
+The enforcement point is outside repository authority. It denies host gateway addresses, RFC1918/private ranges, IPv6 private/link-local ranges, cloud metadata and link-local services, peer-worker networks, and controller endpoints. Inbound and worker-to-worker access are denied. Project exceptions are explicit, scoped, observable, and do not grant generic LAN access. Connection, rate, and byte ceilings are hardening requirements before broad unattended use.
 
-- Protection against Linux kernel or container-runtime vulnerabilities.
-- Safe execution of arbitrary public pull requests.
-- Strong tenant isolation between mutually hostile users.
-- Secret management for deployment workloads.
-- Cloud autoscaling or Kubernetes runner scale sets.
-- Reimplementing the GitHub Actions runner protocol.
+## Secrets and GitHub trust
+
+Host credentials and unrelated repository credentials never enter the guest. A workflow may intentionally receive its own GitHub job token or configured repository secret; protecting the job from secrets deliberately granted by that workflow is outside SmolRunner's boundary. Repository enrollment and GitHub policy should therefore avoid granting powerful secrets to unreviewed pull-request contexts.
 
 ## Failure behavior
 
-When SmolRunner cannot prove that a security invariant holds, it should stop before executing repository code and explain the failing check. Repair commands must support a dry-run or plan mode before changing the host.
+When SmolRunner cannot establish a required boundary or lifecycle fact, it does not start repository code. Once a job may have run, uncertainty triggers teardown and stale-runner cleanup rather than worker reuse. Automatic retries are bounded, preserve the same job and authority, use backoff and circuit breakers, and never exceed the host resource budget.
+
+## Deferred high-assurance hardening
+
+The existing R01 account, kernel, ELF, loader, filesystem, Podman, and cgroup evidence remains valuable for a future Linux/container backend and defense in depth. Completing that custom attestation graph is not required for the VM-first production path unless a concrete attack crosses the VM/control/network boundary above.
+
+Also deferred are mutually hostile public multi-tenancy, protection from vulnerabilities in the trusted VM stack, arbitrary public-fork secret safety, cloud/Kubernetes autoscaling, deployment credentials, and automatic production deployment.
 
 ## Reporting vulnerabilities
 

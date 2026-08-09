@@ -1,5 +1,7 @@
 # Lima development environment
 
+> **Historical development environment:** this persistent guest remains useful for development, but it is not the current one-job production worker design. See [Disposable autoscaling CI](DISPOSABLE_AUTOSCALING_CI.md).
+
 The Lima integration is an optional macOS development and live-integration convenience. It is not SmolRunner's production installation contract. SmolRunner itself continues to target an ordinary Debian or Ubuntu host with systemd, cgroup v2, rootless Podman, and a native SmolRunner binary.
 
 ## Commands

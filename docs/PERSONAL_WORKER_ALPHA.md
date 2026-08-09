@@ -1,5 +1,7 @@
 # Personal worker alpha contract
 
+> **Superseded product direction.** This persistent-worker, local named-verification alpha is retained as design history and for reusable typed contracts. The current product path is the one-job disposable VM autoscaler in [Disposable autoscaling CI](DISPOSABLE_AUTOSCALING_CI.md). It must not block JIT registration, disposable execution, teardown, or supervised reconciliation.
+
 This document defines the first supported SmolRunner product journey: one operator-owned Apple-silicon Mac running one persistent Lima worker for trusted, named verification profiles.
 
 It is the user-facing contract for W01 through W04 of programme #233. Later implementation must preserve the command vocabulary, lifecycle distinctions, authority boundaries, persistence promises, and acceptance requirements defined here. Current implementation status is stated separately from the target alpha experience so documentation never presents planned behaviour as already available.

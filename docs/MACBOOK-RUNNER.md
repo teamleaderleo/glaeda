@@ -1,5 +1,7 @@
 # MacBook runner operator guide
 
+> **Historical design:** this persistent-guest/rootless-Podman design is not the current hostile-CI production path. See [Disposable autoscaling CI](DISPOSABLE_AUTOSCALING_CI.md) for the one-job disposable Lima/VZ boundary. Reusable observation and lifecycle contracts in this document remain relevant.
+
 This guide defines a conservative Lima boundary for running SmolRunner experiments on an Apple-silicon MacBook Air with 24 GiB of unified memory. It covers VM creation, resource-profile transitions, measurement, sleep handling, and cleanup. It stops before live GitHub runner registration.
 
 SmolRunner remains pre-alpha. The current CLI provides read-only diagnostics and planning. Runner installation, registration, reconciliation, and disposable job execution remain roadmap work.

@@ -1,5 +1,7 @@
 # Personal worker alpha acceptance contract
 
+> **Superseded acceptance path:** this persistent-worker acceptance plan is retained for its reusable lifecycle and failure fixtures. Current production acceptance is defined by [Disposable autoscaling CI](DISPOSABLE_AUTOSCALING_CI.md).
+
 Status: W01 cross-reviewed contract candidate  
 Schema: `personal_worker_acceptance/v1`  
 Exact drafting base: `3aa7c8f0341c6dd9138f7b0b5f2e2470140430ae`  
