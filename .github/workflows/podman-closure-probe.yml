@@ -50,6 +50,11 @@ jobs:
           # The hosted image preinstalls fakeroot and its extra ld.so.conf.d search directory.
           # It is not part of the reviewed personal-worker runtime closure.
           sudo apt-get purge --yes fakeroot libfakeroot
+          if dpkg-query --show --showformat='${db:Status-Status}' libc6-i386 2>/dev/null \
+            | grep -qx installed; then
+            # The personal worker admits only its native 64-bit architecture.
+            sudo apt-get purge --yes libc6-i386
+          fi
           sudo apt-get install --yes --no-install-recommends \
             aardvark-dns \
             busybox-static \
