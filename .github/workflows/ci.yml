@@ -23,6 +23,13 @@ jobs:
         with:
           show-progress: false
 
+      - name: Install pinned Rust toolchain
+        run: >-
+          rustup toolchain install 1.97.1
+          --profile minimal
+          --component clippy,rustfmt
+          --no-self-update
+
       - name: Validate workspace bootstrap
         run: |
           python3 - <<'PY'
