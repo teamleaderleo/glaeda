@@ -1194,8 +1194,8 @@ if [[ -L $probe_root/image-backing ]] || [[ ! -d $probe_root/image-backing ]] ||
   exit 1
 fi
 image_store_identity=$(/usr/bin/stat -Lc '%d:%i' "$probe_image_backing")
-/usr/bin/mount --bind "$probe_image_backing" "$probe_image_store"
 probe_image_store_mounted=1
+/usr/bin/mount --bind "$probe_image_backing" "$probe_image_store"
 /usr/bin/mount --options remount,bind,ro,nosuid,nodev "$probe_image_store"
 image_store_digest_before=$(snapshot_read_only_image_store "$probe_image_store" "$image_store_identity")
 printf 'readonly_image_store=sealed\n'
