@@ -7,6 +7,7 @@ on:
       - scripts/test-podman-closure-package.sh
       - src/linux_elf_runtime_dependency.rs
       - src/linux_dynamic_loader_config.rs
+      - src/linux_dynamic_loader_cache.rs
       - docs/PODMAN_EXECUTION_CLOSURE.md
       - docs/PODMAN_EXECUTION_CLOSURE_EVIDENCE.md
   workflow_dispatch:
@@ -87,4 +88,12 @@ jobs:
         run: >-
           cargo test --locked --lib
           linux_dynamic_loader_config::tests::disposable_noble_loader_configs_match_the_closed_model
+          -- --exact
+
+      - name: Parse admitted dynamic-loader cache
+        env:
+          SMOLRUNNER_ELF_PACKAGE_PROBE: github-hosted-ubuntu
+        run: >-
+          cargo test --locked --lib
+          linux_dynamic_loader_cache::tests::disposable_noble_loader_cache_matches_the_closed_model
           -- --exact
