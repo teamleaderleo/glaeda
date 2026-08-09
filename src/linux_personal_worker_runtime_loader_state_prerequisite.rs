@@ -95,6 +95,28 @@ impl PersonalWorkerRuntimeLoaderStatePrerequisite {
     pub const fn summary(&self) -> PersonalWorkerRuntimeLoaderStatePrerequisiteSummary {
         self.summary
     }
+
+    pub(crate) fn reconfirm(
+        &mut self,
+    ) -> Result<(), PersonalWorkerRuntimeLoaderStatePrerequisiteError> {
+        let sources = &mut self._sources;
+        sources.etc_chain.revalidate()?;
+        sources.config_chain.revalidate()?;
+        sources.root_config.revalidate()?;
+        for fragment in &mut sources.fragments {
+            fragment.file.revalidate()?;
+        }
+        sources.cache.revalidate()?;
+        let fragment_names = sources
+            .fragments
+            .iter()
+            .map(|fragment| fragment.name.clone())
+            .collect::<Vec<_>>();
+        revalidate_fragment_names(sources.config_chain.leaf(), &fragment_names)?;
+        revalidate_preload_absent(sources.etc_chain.leaf())?;
+        sources.config_chain.revalidate()?;
+        sources.etc_chain.revalidate()
+    }
 }
 
 impl fmt::Debug for PersonalWorkerRuntimeLoaderStatePrerequisite {
@@ -948,8 +970,24 @@ mod tests {
             rustix::process::geteuid().as_raw(),
             rustix::process::getegid().as_raw(),
         );
-        observe_at(&fixture.root, owner, &project(), architecture, || {})
-            .expect("observe copied loader state");
+        let mut fixture_observation =
+            observe_at(&fixture.root, owner, &project(), architecture, || {})
+                .expect("observe copied loader state");
+        fixture_observation
+            .reconfirm()
+            .expect("reconfirm stable loader state");
+        let cache = fixture.etc().join(CACHE_FILE);
+        stdfs::set_permissions(&cache, stdfs::Permissions::from_mode(0o0664))
+            .expect("change cache mode after observation");
+        let reconfirmed = fixture_observation
+            .reconfirm()
+            .expect_err("post-observation loader-state drift");
+        assert_eq!(
+            reconfirmed.kind,
+            PersonalWorkerRuntimeLoaderStatePrerequisiteErrorKind::ChangedDuringRead
+        );
+        stdfs::set_permissions(&cache, stdfs::Permissions::from_mode(0o0644))
+            .expect("restore cache mode");
 
         let hidden_fragment = fixture.config_dir().join(".not-globbed.conf");
         stdfs::write(&hidden_fragment, b"/tmp/not-loader-authority\n")
@@ -992,7 +1030,6 @@ mod tests {
         );
         stdfs::remove_file(unsafe_fragment).expect("remove unsafe config fragment");
 
-        let cache = fixture.etc().join(CACHE_FILE);
         let changed = observe_at(&fixture.root, owner, &project(), architecture, || {
             stdfs::set_permissions(&cache, stdfs::Permissions::from_mode(0o0664))
                 .expect("change cache mode during observation");

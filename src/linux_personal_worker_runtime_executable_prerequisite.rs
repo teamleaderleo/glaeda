@@ -85,6 +85,21 @@ impl PersonalWorkerRuntimeExecutablePrerequisite {
     pub const fn summary(&self) -> PersonalWorkerRuntimeExecutablePrerequisiteSummary {
         self.summary
     }
+
+    pub(crate) fn reconfirm(
+        &mut self,
+    ) -> Result<(), PersonalWorkerRuntimeExecutablePrerequisiteError> {
+        for source in &self._sources {
+            source.chain.revalidate()?;
+        }
+        for source in &mut self._sources {
+            source.file.revalidate()?;
+        }
+        for source in &self._sources {
+            source.chain.revalidate()?;
+        }
+        Ok(())
+    }
 }
 
 impl fmt::Debug for PersonalWorkerRuntimeExecutablePrerequisite {
@@ -783,7 +798,7 @@ mod tests {
             rustix::process::getegid().as_raw(),
         );
         fixture.populate();
-        let observed = observe_at(&fixture.root, owner, &project, architecture, || {})
+        let mut observed = observe_at(&fixture.root, owner, &project, architecture, || {})
             .expect("observe copied executable fixture");
         let debug = format!("{observed:?}");
         assert!(debug.contains(REDACTED));
@@ -793,6 +808,16 @@ mod tests {
             observed.summary().disposition(),
             PersonalWorkerRuntimeExecutablePrerequisiteDisposition::ObservedPrerequisite
         );
+        observed.reconfirm().expect("reconfirm stable executables");
+        fixture.set_mode(ExecutableKind::Podman, 0o0775);
+        let reconfirmed = observed
+            .reconfirm()
+            .expect_err("post-observation executable drift");
+        assert_eq!(
+            reconfirmed.kind,
+            PersonalWorkerRuntimeExecutablePrerequisiteErrorKind::ChangedDuringRead
+        );
+        fixture.restore_mode(ExecutableKind::Podman);
 
         let changed = observe_at(&fixture.root, owner, &project, architecture, || {
             let path = fixture.root.join("usr/bin/podman");
