@@ -390,6 +390,16 @@ mapfile -d '' network_entries < <(
 )
 if [[ ${#network_entries[@]} -ne 1 ]] ||
   [[ ${network_entries[0]##*/} != netavark.lock ]]; then
+  printf 'network_entry_count=%s\n' "${#network_entries[@]}" >&2
+  if (( ${#network_entries[@]} <= 8 )); then
+    for network_entry in "${network_entries[@]}"; do
+      network_name=${network_entry##*/}
+      if (( ${#network_name} <= 64 )); then
+        printf 'network_entry_name=%q kind=%s\n' \
+          "$network_name" "$(/usr/bin/stat -Lc %F "$network_entry")" >&2
+      fi
+    done
+  fi
   printf 'error: Podman created unexpected run-private network state\n' >&2
   exit 1
 fi
