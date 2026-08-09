@@ -35,6 +35,24 @@ authority, path-bearing dependencies, executable stacks, writable-executable loa
 ambiguous runtime mappings. This proves compatibility of the parser with those package bytes only;
 it is not path, package, loader, library, configuration, cache, or transitive dependency evidence.
 
+### Dynamic-loader object parser evidence
+
+- Parser implementation commit: `f95b74f0318f7d1f061df2e1c610ec0ad8240481`
+- Workflow run: [31337151663](https://github.com/teamleaderleo/smolrunner/actions/runs/31337151663)
+- ARM64 job: [93304773282](https://github.com/teamleaderleo/smolrunner/actions/runs/31337151663/job/93304773282)
+- x86_64 job: [93304773257](https://github.com/teamleaderleo/smolrunner/actions/runs/31337151663/job/93304773257)
+- Date: 2026-08-10
+- Result: both jobs parsed the exact architecture-specific GNU dynamic-loader object installed
+  from the Noble package baseline below.
+
+The pure parser shares the bounded ELF64 safety envelope used for the admitted top-level
+executables and additionally requires `ET_DYN`, no interpreter, one dynamic segment, no external
+dependency, and default dynamic search. It rejects loader-side `RPATH`, `RUNPATH`, audit, filter,
+configuration, text-relocation, and nodefaultlib authority. This proves compatibility with those
+loader bytes only. It follows the fixed loader pathname in a disposable package fixture and does
+not prove path, symlink, inode, owner, mode, package, configuration, cache, transitive-library, or
+revalidation evidence; it constructs no R01 class or runtime readiness.
+
 ### Dynamic-loader configuration parser evidence
 
 - Parser implementation commit: `8805b36169ec5c56afc0dacdb41fc56b149b7131`

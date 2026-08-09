@@ -92,6 +92,14 @@ jobs:
           linux_elf_runtime_dependency::tests::disposable_noble_packages_use_only_the_admitted_elf_shapes
           -- --exact
 
+      - name: Parse admitted dynamic-loader ELF object
+        env:
+          SMOLRUNNER_ELF_PACKAGE_PROBE: github-hosted-ubuntu
+        run: >-
+          cargo test --locked --lib
+          linux_elf_runtime_dependency::tests::disposable_noble_dynamic_loader_has_the_admitted_object_shape
+          -- --exact
+
       - name: Parse admitted dynamic-loader configuration
         env:
           SMOLRUNNER_ELF_PACKAGE_PROBE: github-hosted-ubuntu

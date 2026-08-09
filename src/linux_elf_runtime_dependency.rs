@@ -108,6 +108,38 @@ pub struct LinuxRuntimeElfDependency {
     needed_libraries: Vec<String>,
 }
 
+/// Canonical shape parsed from one Linux dynamic-loader ELF object.
+///
+/// This is not observation evidence: it contains no path, file identity, content digest, package
+/// identity, loader configuration, cache state, or revalidation proof.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct LinuxRuntimeLoaderObject {
+    architecture: PersonalWorkerRuntimeArchitecture,
+    loader: LinuxRuntimeDynamicLoader,
+}
+
+impl LinuxRuntimeLoaderObject {
+    #[must_use]
+    pub const fn architecture(self) -> PersonalWorkerRuntimeArchitecture {
+        self.architecture
+    }
+
+    #[must_use]
+    pub const fn loader(self) -> LinuxRuntimeDynamicLoader {
+        self.loader
+    }
+}
+
+impl fmt::Debug for LinuxRuntimeLoaderObject {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LinuxRuntimeLoaderObject")
+            .field("architecture", &self.architecture)
+            .field("loader", &self.loader)
+            .finish()
+    }
+}
+
 impl LinuxRuntimeElfDependency {
     #[must_use]
     pub const fn architecture(&self) -> PersonalWorkerRuntimeArchitecture {
@@ -194,6 +226,89 @@ pub fn parse_linux_runtime_elf_dependency(
     bytes: &[u8],
     expected_architecture: PersonalWorkerRuntimeArchitecture,
 ) -> Result<LinuxRuntimeElfDependency, LinuxRuntimeElfError> {
+    let parsed = parse_runtime_elf(bytes, expected_architecture)?;
+    let loader = match parsed.interpreter {
+        Some(header) => Some(parse_interpreter(bytes, header, parsed.architecture)?),
+        None => None,
+    };
+    let has_dynamic = parsed.dynamic.is_some();
+    let dynamic_values = match parsed.dynamic {
+        Some(header) => parse_dynamic(bytes, header, &parsed.loads)?,
+        None => DynamicValues::default(),
+    };
+    if loader.is_some() != has_dynamic || (loader.is_none() && !dynamic_values.needed.is_empty()) {
+        return Err(format_error());
+    }
+
+    let (linkage, needed_libraries) = if let Some(loader) = loader {
+        let (needed_libraries, dynamic_search) =
+            resolve_dynamic_strings(bytes, &parsed.loads, parsed.architecture, dynamic_values)?;
+        return Ok(LinuxRuntimeElfDependency {
+            architecture: parsed.architecture,
+            linkage: LinuxRuntimeElfLinkage::Dynamic,
+            loader: Some(loader),
+            dynamic_search: Some(dynamic_search),
+            needed_libraries,
+        });
+    } else {
+        (LinuxRuntimeElfLinkage::Static, Vec::new())
+    };
+    Ok(LinuxRuntimeElfDependency {
+        architecture: parsed.architecture,
+        linkage,
+        loader: None,
+        dynamic_search: None,
+        needed_libraries,
+    })
+}
+
+/// Parse one bounded, little-endian ELF64 dynamic-loader object without resolving or executing it.
+///
+/// # Errors
+///
+/// Rejects malformed or wrong-architecture bytes, non-`ET_DYN` objects, executable stacks or
+/// writable-executable load segments, an interpreter, external dependencies, alternate runtime
+/// search authority, and ambiguous virtual-address mappings.
+pub fn parse_linux_runtime_loader_object(
+    bytes: &[u8],
+    expected_architecture: PersonalWorkerRuntimeArchitecture,
+) -> Result<LinuxRuntimeLoaderObject, LinuxRuntimeElfError> {
+    let parsed = parse_runtime_elf(bytes, expected_architecture)?;
+    if parsed.elf_type != ET_DYN || parsed.interpreter.is_some() || parsed.dynamic.is_none() {
+        return Err(format_error());
+    }
+    let dynamic = parse_dynamic(
+        bytes,
+        parsed.dynamic.ok_or_else(format_error)?,
+        &parsed.loads,
+    )?;
+    let (needed, dynamic_search) =
+        resolve_dynamic_strings(bytes, &parsed.loads, parsed.architecture, dynamic)?;
+    if !needed.is_empty() || dynamic_search != LinuxRuntimeDynamicSearchPolicy::Default {
+        return Err(unsafe_search_error());
+    }
+    let loader = match parsed.architecture {
+        PersonalWorkerRuntimeArchitecture::Aarch64 => LinuxRuntimeDynamicLoader::Aarch64Gnu,
+        PersonalWorkerRuntimeArchitecture::X86_64 => LinuxRuntimeDynamicLoader::X86_64Gnu,
+    };
+    Ok(LinuxRuntimeLoaderObject {
+        architecture: parsed.architecture,
+        loader,
+    })
+}
+
+struct ParsedRuntimeElf {
+    elf_type: u16,
+    architecture: PersonalWorkerRuntimeArchitecture,
+    loads: Vec<ProgramHeader>,
+    interpreter: Option<ProgramHeader>,
+    dynamic: Option<ProgramHeader>,
+}
+
+fn parse_runtime_elf(
+    bytes: &[u8],
+    expected_architecture: PersonalWorkerRuntimeArchitecture,
+) -> Result<ParsedRuntimeElf, LinuxRuntimeElfError> {
     if bytes.len() < ELF_HEADER_BYTES || bytes.len() > LINUX_RUNTIME_ELF_MAX_BYTES {
         return Err(size_error());
     }
@@ -296,39 +411,12 @@ pub fn parse_linux_runtime_elf_dependency(
         return Err(format_error());
     }
 
-    let loader = match interpreter {
-        Some(header) => Some(parse_interpreter(bytes, header, architecture)?),
-        None => None,
-    };
-    let dynamic_values = match dynamic {
-        Some(header) => parse_dynamic(bytes, header, &loads)?,
-        None => DynamicValues::default(),
-    };
-    if loader.is_some() != dynamic.is_some()
-        || (loader.is_none() && !dynamic_values.needed.is_empty())
-    {
-        return Err(format_error());
-    }
-
-    let (linkage, needed_libraries) = if let Some(loader) = loader {
-        let (needed_libraries, dynamic_search) =
-            resolve_dynamic_strings(bytes, &loads, architecture, dynamic_values)?;
-        return Ok(LinuxRuntimeElfDependency {
-            architecture,
-            linkage: LinuxRuntimeElfLinkage::Dynamic,
-            loader: Some(loader),
-            dynamic_search: Some(dynamic_search),
-            needed_libraries,
-        });
-    } else {
-        (LinuxRuntimeElfLinkage::Static, Vec::new())
-    };
-    Ok(LinuxRuntimeElfDependency {
+    Ok(ParsedRuntimeElf {
+        elf_type,
         architecture,
-        linkage,
-        loader: None,
-        dynamic_search: None,
-        needed_libraries,
+        loads,
+        interpreter,
+        dynamic,
     })
 }
 
@@ -725,6 +813,134 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_loader_object_has_exact_architecture_and_no_external_authority() {
+        for architecture in [
+            PersonalWorkerRuntimeArchitecture::Aarch64,
+            PersonalWorkerRuntimeArchitecture::X86_64,
+        ] {
+            let elf = loader_elf(architecture, &[]);
+            let parsed = parse_linux_runtime_loader_object(&elf, architecture)
+                .expect("parse dynamic-loader object");
+            assert_eq!(parsed.architecture(), architecture);
+            assert_eq!(
+                parsed.loader(),
+                match architecture {
+                    PersonalWorkerRuntimeArchitecture::Aarch64 => {
+                        LinuxRuntimeDynamicLoader::Aarch64Gnu
+                    }
+                    PersonalWorkerRuntimeArchitecture::X86_64 => {
+                        LinuxRuntimeDynamicLoader::X86_64Gnu
+                    }
+                }
+            );
+            let debug = format!("{parsed:?}");
+            assert!(!debug.contains("/lib"));
+            assert!(!debug.contains("0x"));
+        }
+    }
+
+    #[test]
+    fn loader_object_refuses_wrong_architecture_type_interpreter_and_dependencies() {
+        let architecture = PersonalWorkerRuntimeArchitecture::X86_64;
+        let elf = loader_elf(architecture, &[]);
+        assert_eq!(
+            parse_linux_runtime_loader_object(&elf, PersonalWorkerRuntimeArchitecture::Aarch64)
+                .expect_err("wrong loader architecture")
+                .kind,
+            LinuxRuntimeElfErrorKind::Architecture
+        );
+
+        let mut executable = elf.clone();
+        write_u16(&mut executable, 16, ET_EXEC);
+        assert_eq!(
+            parse_linux_runtime_loader_object(&executable, architecture)
+                .expect_err("loader must be ET_DYN")
+                .kind,
+            LinuxRuntimeElfErrorKind::Format
+        );
+
+        let mut interpreted = elf;
+        write_u16(&mut interpreted, 56, 4);
+        let interpreter = b"/lib64/ld-linux-x86-64.so.2\0";
+        interpreted[INTERPRETER_OFFSET..INTERPRETER_OFFSET + interpreter.len()]
+            .copy_from_slice(interpreter);
+        write_program_header(
+            &mut interpreted,
+            3,
+            PT_INTERP,
+            4,
+            INTERPRETER_OFFSET as u64,
+            BASE_ADDRESS + INTERPRETER_OFFSET as u64,
+            interpreter.len() as u64,
+            interpreter.len() as u64,
+            1,
+        );
+        assert_eq!(
+            parse_linux_runtime_loader_object(&interpreted, architecture)
+                .expect_err("loader must not select another interpreter")
+                .kind,
+            LinuxRuntimeElfErrorKind::Format
+        );
+
+        let dependency = loader_elf(architecture, &["libc.so.6"]);
+        assert_eq!(
+            parse_linux_runtime_loader_object(&dependency, architecture)
+                .expect_err("loader dependency")
+                .kind,
+            LinuxRuntimeElfErrorKind::UnsafeRuntimeSearch
+        );
+    }
+
+    #[test]
+    fn loader_object_refuses_runtime_search_and_text_relocations() {
+        let architecture = PersonalWorkerRuntimeArchitecture::X86_64;
+        for tag in [
+            DT_RPATH,
+            DT_CONFIG,
+            DT_DEPAUDIT,
+            DT_AUDIT,
+            DT_AUXILIARY,
+            DT_FILTER,
+        ] {
+            let mut elf = loader_elf(architecture, &[]);
+            write_dynamic(&mut elf, 0, tag, 0);
+            assert_eq!(
+                parse_linux_runtime_loader_object(&elf, architecture)
+                    .expect_err("loader search authority")
+                    .kind,
+                LinuxRuntimeElfErrorKind::UnsafeRuntimeSearch
+            );
+        }
+        for (tag, value, expected_kind) in [
+            (DT_TEXTREL, 0, LinuxRuntimeElfErrorKind::Format),
+            (DT_FLAGS, DF_TEXTREL, LinuxRuntimeElfErrorKind::Format),
+            (
+                DT_FLAGS_1,
+                DF_1_NODEFLIB,
+                LinuxRuntimeElfErrorKind::UnsafeRuntimeSearch,
+            ),
+        ] {
+            let mut elf = loader_elf(architecture, &[]);
+            write_dynamic(&mut elf, 0, tag, value);
+            assert_eq!(
+                parse_linux_runtime_loader_object(&elf, architecture)
+                    .expect_err("loader relocation or search authority")
+                    .kind,
+                expected_kind
+            );
+        }
+
+        let mut runpath = loader_elf(architecture, &[]);
+        add_loader_runpath(&mut runpath, "/usr/lib/x86_64-linux-gnu/systemd");
+        assert_eq!(
+            parse_linux_runtime_loader_object(&runpath, architecture)
+                .expect_err("loader runpath")
+                .kind,
+            LinuxRuntimeElfErrorKind::UnsafeRuntimeSearch
+        );
+    }
+
+    #[test]
     fn wrong_architecture_and_alternate_interpreter_fail_closed() {
         let mut elf = dynamic_elf(PersonalWorkerRuntimeArchitecture::Aarch64, &["libc.so.6"]);
         assert_eq!(
@@ -744,6 +960,27 @@ mod tests {
         assert_eq!(
             parse_linux_runtime_elf_dependency(&elf, PersonalWorkerRuntimeArchitecture::Aarch64)
                 .expect_err("alternate interpreter")
+                .kind,
+            LinuxRuntimeElfErrorKind::UnsafeRuntimeSearch
+        );
+    }
+
+    #[test]
+    fn unsafe_interpreter_precedes_malformed_dynamic_metadata() {
+        let architecture = PersonalWorkerRuntimeArchitecture::X86_64;
+        let mut elf = dynamic_elf(architecture, &["libc.so.6"]);
+        let interpreter = b"/tmp/ld-linux-x86-64.so.2\0";
+        elf[INTERPRETER_OFFSET..INTERPRETER_OFFSET + interpreter.len()]
+            .copy_from_slice(interpreter);
+        write_u64(
+            &mut elf,
+            ELF_HEADER_BYTES + PROGRAM_HEADER_BYTES + 32,
+            interpreter.len() as u64,
+        );
+        write_dynamic(&mut elf, 0, DT_TEXTREL, 0);
+        assert_eq!(
+            parse_linux_runtime_elf_dependency(&elf, architecture)
+                .expect_err("unsafe interpreter precedes invalid dynamic metadata")
                 .kind,
             LinuxRuntimeElfErrorKind::UnsafeRuntimeSearch
         );
@@ -994,6 +1231,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn disposable_noble_dynamic_loader_has_the_admitted_object_shape() {
+        if std::env::var("SMOLRUNNER_ELF_PACKAGE_PROBE").as_deref() != Ok("github-hosted-ubuntu") {
+            return;
+        }
+        let (architecture, path) = match std::env::consts::ARCH {
+            "aarch64" => (
+                PersonalWorkerRuntimeArchitecture::Aarch64,
+                LinuxRuntimeDynamicLoader::Aarch64Gnu.expected_path(),
+            ),
+            "x86_64" => (
+                PersonalWorkerRuntimeArchitecture::X86_64,
+                LinuxRuntimeDynamicLoader::X86_64Gnu.expected_path(),
+            ),
+            other => panic!("unsupported package-probe architecture: {other}"),
+        };
+        let metadata = std::fs::metadata(path)
+            .unwrap_or_else(|error| panic!("read loader metadata for {path}: {error}"));
+        assert!(metadata.len() <= LINUX_RUNTIME_ELF_MAX_BYTES as u64);
+        let bytes = std::fs::read(path)
+            .unwrap_or_else(|error| panic!("read loader object {path}: {error}"));
+        let parsed = parse_linux_runtime_loader_object(&bytes, architecture)
+            .unwrap_or_else(|error| panic!("parse loader object {path}: {error}"));
+        assert_eq!(parsed.architecture(), architecture);
+    }
+
     fn static_elf(architecture: PersonalWorkerRuntimeArchitecture) -> Vec<u8> {
         let mut bytes = vec![0; 0x0400];
         write_header(&mut bytes, architecture, 2);
@@ -1089,6 +1352,85 @@ mod tests {
         );
         write_program_header(&mut bytes, 3, PT_GNU_STACK, PF_W, 0, 0, 0, 0, 16);
         bytes
+    }
+
+    fn loader_elf(architecture: PersonalWorkerRuntimeArchitecture, needed: &[&str]) -> Vec<u8> {
+        let mut bytes = vec![0; 0x0800];
+        write_header(&mut bytes, architecture, 3);
+
+        let mut string_table = vec![0];
+        let mut needed_offsets = Vec::new();
+        for name in needed {
+            needed_offsets.push(string_table.len() as u64);
+            string_table.extend_from_slice(name.as_bytes());
+            string_table.push(0);
+        }
+        bytes[STRING_TABLE_OFFSET..STRING_TABLE_OFFSET + string_table.len()]
+            .copy_from_slice(&string_table);
+
+        for (index, offset) in needed_offsets.into_iter().enumerate() {
+            write_dynamic(&mut bytes, index, DT_NEEDED, offset);
+        }
+        write_dynamic(
+            &mut bytes,
+            needed.len(),
+            DT_STRTAB,
+            BASE_ADDRESS + STRING_TABLE_OFFSET as u64,
+        );
+        write_dynamic(
+            &mut bytes,
+            needed.len() + 1,
+            DT_STRSZ,
+            string_table.len() as u64,
+        );
+        write_dynamic(&mut bytes, needed.len() + 2, DT_NULL, 0);
+        let dynamic_size = (needed.len() + 3) as u64 * 16;
+
+        let length = bytes.len() as u64;
+        write_program_header(
+            &mut bytes,
+            0,
+            PT_LOAD,
+            5,
+            0,
+            BASE_ADDRESS,
+            length,
+            length,
+            0x1000,
+        );
+        write_program_header(
+            &mut bytes,
+            1,
+            PT_DYNAMIC,
+            PF_W,
+            DYNAMIC_OFFSET as u64,
+            BASE_ADDRESS + DYNAMIC_OFFSET as u64,
+            dynamic_size,
+            dynamic_size,
+            8,
+        );
+        write_program_header(&mut bytes, 2, PT_GNU_STACK, PF_W, 0, 0, 0, 0, 16);
+        bytes
+    }
+
+    fn add_loader_runpath(bytes: &mut [u8], runpath: &str) {
+        bytes[STRING_TABLE_OFFSET + 1..STRING_TABLE_OFFSET + 1 + runpath.len()]
+            .copy_from_slice(runpath.as_bytes());
+        bytes[STRING_TABLE_OFFSET + 1 + runpath.len()] = 0;
+        write_dynamic(bytes, 1, DT_STRSZ, runpath.len() as u64 + 2);
+        write_dynamic(bytes, 2, DT_RUNPATH, 1);
+        write_dynamic(bytes, 3, DT_NULL, 0);
+        let dynamic_size = 4_u64 * 16;
+        write_u64(
+            bytes,
+            ELF_HEADER_BYTES + PROGRAM_HEADER_BYTES + 32,
+            dynamic_size,
+        );
+        write_u64(
+            bytes,
+            ELF_HEADER_BYTES + PROGRAM_HEADER_BYTES + 40,
+            dynamic_size,
+        );
     }
 
     fn add_runpath(bytes: &mut [u8], needed_count: usize, runpath: &str) {
