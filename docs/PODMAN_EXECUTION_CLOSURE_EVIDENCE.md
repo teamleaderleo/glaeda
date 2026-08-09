@@ -111,6 +111,28 @@ compatibility with those live cache bytes only. It does not open or revalidate t
 owner or package, enumerate or open search directories or libraries, resolve a dependency,
 construct evidence, or seal runtime readiness.
 
+### Dynamic-loader cache selection evidence
+
+- Selection implementation commit: `14c11c38a2eb80c638f19a27dda177a347207e41`
+- Package workflow run: [31340230776](https://github.com/teamleaderleo/smolrunner/actions/runs/31340230776)
+- ARM64 package job: [93312678226](https://github.com/teamleaderleo/smolrunner/actions/runs/31340230776/job/93312678226)
+- x86_64 package job: [93312678178](https://github.com/teamleaderleo/smolrunner/actions/runs/31340230776/job/93312678178)
+- Verify run: [31340230750](https://github.com/teamleaderleo/smolrunner/actions/runs/31340230750), job
+  [93312677934](https://github.com/teamleaderleo/smolrunner/actions/runs/31340230750/job/93312677934)
+- Date: 2026-08-10
+- Result: both package jobs parsed their complete live cache and selected the baseline `libc.so.6`
+  entry; Verify passed the synthetic baseline/x86-64-v2/v3/v4 priority and ISA-compatibility
+  matrix plus comparator-equivalent numeric lookup-name coverage.
+
+The pure selector reproduces the admitted glibc 2.39 rule that a usable active named hwcap beats
+the baseline entry, with lower subdirectory priority preferred and the entry's ISA level checked
+independently. Lookup names use glibc's numeric comparator equivalence while comparator-overflowing
+names fail closed. The supplied capability profile is caller-owned input rather than observed host
+evidence. The resolution retains its selected cache path crate-privately as untrusted data for a
+later descriptor-bound observer. This evidence therefore does not prove the current host capability
+profile, open or
+revalidate any selected library, construct classes 8–18, or seal runtime readiness.
+
 ### Top-level executable prerequisite evidence
 
 - Observer implementation commit: `7f903fa84912ccec5ea21579201c99900947f83a`
