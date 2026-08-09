@@ -5,7 +5,7 @@ and does not authorize a physical Lima or host mutation.
 
 ## Exact evidence
 
-- Fixture commit: `fe75d821cd0c7079849c8fc01f1bc2908a993f83`
+- Fixture commit: `fe75d821eff323cfb07b0e44cc7ddbdc131cb959`
 - Workflow run: [31308056627](https://github.com/teamleaderleo/smolrunner/actions/runs/31308056627)
 - ARM64 job: [93231445385](https://github.com/teamleaderleo/smolrunner/actions/runs/31308056627/job/93231445385)
 - x86_64 job: [93231445377](https://github.com/teamleaderleo/smolrunner/actions/runs/31308056627/job/93231445377)
