@@ -5,10 +5,10 @@ and does not authorize a physical Lima or host mutation.
 
 ## Exact evidence
 
-- Fixture commit: `8ab211306c1f79deb66141ea8165cda1f51f5bd4`
-- Workflow run: [31307058274](https://github.com/teamleaderleo/smolrunner/actions/runs/31307058274)
-- ARM64 job: [93228977220](https://github.com/teamleaderleo/smolrunner/actions/runs/31307058274/job/93228977220)
-- x86_64 job: [93228977230](https://github.com/teamleaderleo/smolrunner/actions/runs/31307058274/job/93228977230)
+- Fixture commit: `fe75d821cd0c7079849c8fc01f1bc2908a993f83`
+- Workflow run: [31308056627](https://github.com/teamleaderleo/smolrunner/actions/runs/31308056627)
+- ARM64 job: [93231445385](https://github.com/teamleaderleo/smolrunner/actions/runs/31308056627/job/93231445385)
+- x86_64 job: [93231445377](https://github.com/teamleaderleo/smolrunner/actions/runs/31308056627/job/93231445377)
 - Date: 2026-08-09
 - Result: both jobs passed on fresh GitHub-hosted Ubuntu 24.04 VMs.
 
@@ -84,6 +84,9 @@ Earlier disposable runs were intentionally allowed to fail and corrected these f
 - Noble rootless storage requires `rootless_storage_path`; generic `graphroot` is ignored.
 - Noble rootless `runroot` is derived from `XDG_RUNTIME_DIR`, not the generic config field.
 - First use needs both exact network lock files even when no workload network is admitted.
+- Noble Podman 4.9.3 exposes `--passwd` only on `run`, not `create`; the stopped-container flow
+  must instead use explicit numeric keep-id mapping and fail closed on generated passwd/group
+  state.
 
 These are contract changes, not compatibility relaxations: each ambient or mutable edge is now
 either made exact or remains blocking.
