@@ -218,7 +218,27 @@ run_user_probe() {
   spec_path=${matching_specs[0]}
   spec_size=$(/usr/bin/stat -Lc %s "$spec_path")
   if (( spec_size == 0 || spec_size > 1048576 )) ||
-    ! /usr/bin/jq -e '
+    ! /usr/bin/jq -e \
+      --arg probe_root "$PROBE_ROOT" '
+      def one_pathless_namespace($kind):
+        [.linux.namespaces[] | select(.type == $kind)] as $entries |
+        ($entries | length) == 1 and ($entries[0].path? == null);
+      def forbidden_environment:
+        startswith("PROBE_") or
+        startswith("CONTAINERS_") or
+        startswith("REGISTRY_AUTH_FILE=") or
+        startswith("DBUS_SESSION_BUS_ADDRESS=") or
+        startswith("XDG_CONFIG_HOME=") or
+        startswith("XDG_RUNTIME_DIR=") or
+        startswith("HTTP_PROXY=") or
+        startswith("HTTPS_PROXY=") or
+        startswith("ALL_PROXY=") or
+        startswith("NO_PROXY=") or
+        startswith("http_proxy=") or
+        startswith("https_proxy=") or
+        startswith("all_proxy=") or
+        startswith("no_proxy=") or
+        contains($probe_root);
       .process.user.uid == 1000 and
       .process.user.gid == 1000 and
       .process.user.umask == 18 and
@@ -226,6 +246,10 @@ run_user_probe() {
       .process.noNewPrivileges == true and
       (.process.capabilities | type == "object" and length == 0) and
       (.process.apparmorProfile // "") == "" and
+      one_pathless_namespace("ipc") and
+      one_pathless_namespace("pid") and
+      one_pathless_namespace("uts") and
+      ([.process.env[] | select(forbidden_environment)] | length) == 0 and
       ([.mounts[] | select(.destination == "/etc/passwd" or .destination == "/etc/group")] | length) == 0 and
       .linux.seccomp != null
     ' "$spec_path" >/dev/null; then
@@ -233,6 +257,8 @@ run_user_probe() {
       user: .process.user,
       no_new_privileges: .process.noNewPrivileges,
       capabilities: .process.capabilities,
+      namespaces: [.linux.namespaces[] | {type, path_present: has("path")}],
+      environment_names: [.process.env[] | split("=")[0]],
       account_mounts: [.mounts[] | select(.destination == "/etc/passwd" or .destination == "/etc/group") | .destination],
       seccomp_present: (.linux.seccomp != null),
       apparmor: (.process.apparmorProfile // "")
