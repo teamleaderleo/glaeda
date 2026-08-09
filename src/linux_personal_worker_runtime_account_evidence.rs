@@ -754,14 +754,10 @@ fn same_snapshot(left: &rustix::fs::Stat, right: &rustix::fs::Stat) -> bool {
 }
 
 fn hash_stat(hasher: &mut Sha256, stat: &rustix::fs::Stat) {
-    for value in [
-        stat.st_dev,
-        stat.st_ino,
-        stat.st_nlink as u64,
-        stat.st_size as u64,
-    ] {
+    for value in [stat.st_dev, stat.st_ino, stat.st_size as u64] {
         hash_field(hasher, &value.to_be_bytes());
     }
+    hash_field(hasher, &stat.st_nlink.to_be_bytes());
     for value in [stat.st_uid, stat.st_gid, stat.st_mode] {
         hash_field(hasher, &value.to_be_bytes());
     }
