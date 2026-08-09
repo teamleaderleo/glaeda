@@ -124,6 +124,16 @@ impl PersonalWorkerRunnerReadinessObservation {
             PrivateRunnerEvidence::Failure(_) | PrivateRunnerEvidence::NotAttempted => None,
         }
     }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) const fn from_report_for_verification_plan_test(
+        report: PersonalWorkerRunnerReadinessReport,
+    ) -> Self {
+        Self {
+            report,
+            private_runner_evidence: PrivateRunnerEvidence::NotAttempted,
+        }
+    }
 }
 
 impl fmt::Debug for PersonalWorkerRunnerReadinessObservation {

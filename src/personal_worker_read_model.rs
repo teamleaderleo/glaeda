@@ -482,6 +482,11 @@ impl PersonalWorkerJobView {
     }
 
     #[must_use]
+    pub const fn observed_at(&self) -> EpochMillis {
+        self.observed_at
+    }
+
+    #[must_use]
     pub const fn submitted_at(&self) -> EpochMillis {
         self.submitted_at
     }
@@ -537,6 +542,57 @@ impl PersonalWorkerJobView {
             PersonalWorkerJobStateView::Terminal { terminal } => Some(terminal),
             PersonalWorkerJobStateView::Queued { .. }
             | PersonalWorkerJobStateView::Active { .. } => None,
+        }
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn active_for_verification_plan_test(
+        store_revision: PersonalWorkerStoreRevision,
+        queue_generation: PersonalWorkerQueueGeneration,
+        observed_at: EpochMillis,
+        submitted_at: EpochMillis,
+        operator_deadline: Option<EpochMillis>,
+        cancellation: PersonalWorkerCancellationState,
+        entry: PersonalWorkerQueueVisibility,
+        admission_state: ExecutionAdmissionState,
+        admission_observed_at: EpochMillis,
+        requested_limits: ExecutionResourceLimits,
+        applied_limits: ExecutionResourceLimits,
+        reservation_id: ReservationId,
+        reservation_generation: ReservationGeneration,
+        reserved_at: EpochMillis,
+        expires_at: EpochMillis,
+        cache_acquired_at: EpochMillis,
+    ) -> Self {
+        Self {
+            schema_version: PERSONAL_WORKER_READ_MODEL_SCHEMA_VERSION,
+            store_revision,
+            queue_generation,
+            observed_at,
+            submitted_at,
+            operator_deadline,
+            cancellation,
+            job: PersonalWorkerJobStateView::Active {
+                entry,
+                admission: PersonalWorkerAdmissionView {
+                    state: admission_state,
+                    observed_at: admission_observed_at,
+                    requested_limits,
+                    applied_limits,
+                    reservation: PersonalWorkerReservationView {
+                        id: reservation_id.clone(),
+                        generation: reservation_generation,
+                        reserved_at,
+                        expires_at,
+                    },
+                },
+                durable_cache_lease: PersonalWorkerDurableCacheLeaseView {
+                    reservation_id,
+                    reservation_generation,
+                    acquired_at: cache_acquired_at,
+                },
+            },
         }
     }
 }
