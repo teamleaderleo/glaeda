@@ -240,9 +240,7 @@ or image string.
   --cpus=<applied-limit>
   --env-host=false
   --http-proxy=false
-  --log-driver=k8s-file
-  --log-opt=path=<attempt-private-log>
-  --log-opt=max-size=<bounded-log-bytes>
+  --log-driver=none
   --privileged=false
   --systemd=false
   --restart=no
@@ -273,6 +271,10 @@ executes no repository code and is never a verification success.
 
 Before `image inspect`, `create`, `inspect`, or `start`, the launcher joins the already-created
 outer attempt cgroup; it supplies null stdin, pipes only bounded stdout/stderr, and allocates no TTY.
+For Podman 4.9.3, `start --attach` internally attaches stdin even when `--interactive` is absent, so
+the start process's file descriptor 0 must be the already-open `/dev/null`; an inherited service,
+terminal, or caller pipe is forbidden because it can keep the attach session alive after payload
+exit.
 After `create` returns, R02 matches the stopped container and generated specification to the durable
 attempt, image, protected source/cache/target objects, target-tmpfs limits, namespaces, cgroup,
 environment, and security policy. It durably checkpoints that exact stopped object, reconfirms
@@ -289,16 +291,6 @@ an inherited pipe. A name or CID file remains lookup evidence only. The displaye
 plan values, never public receipt fields. Source refers only to the protected immutable
 materialization, never the live checkout. The read-only dependency-cache mount is omitted when no
 independently verified generation exists.
-
-Noble Podman 4.9.3 does not complete the attached client after a short successful payload when the
-container uses `--log-driver=none`. The admitted fixed driver is therefore `k8s-file`, with one
-exact attempt-private path and an explicit aggregate byte ceiling passed to conmon. R02 must inspect
-the stopped container's exact driver, path, and limit before start; reject a symlink, non-regular or
-multiply linked log object; and require runner ownership with no group/world write. The log is
-bounded transient capture state, not a cache, durable receipt, or source of verification authority.
-It is removed only after the container is stopped, the authoritative cgroup is empty, and bounded
-capture has completed. The normal-output fixture proves attached EOF and the configured limit; an
-adversarial overflow fixture remains mandatory before R02 can claim hostile-output closure.
 
 The attempt name and CID file are recovery lookups only; neither proves ownership, and both must be
 matched to the durable attempt, exact run-private store, and authoritative cgroup before inspect or
