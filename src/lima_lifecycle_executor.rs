@@ -10,14 +10,17 @@ use crate::lima_lifecycle::{
 };
 use crate::lima_observation::{
     LimaGuestObservation, LimaInstanceName, LimaInstanceObservationReport, LimaObservationAdapter,
-    LimaObservationClock, LimaObservationFreshness, LimaObservationRequest, LimaPersistentIdentity,
-    LimaRuntimeState,
+    LimaObservationClock, LimaObservationFreshness, LimaObservationRequest,
+    LimaObservationSourceIdentity, LimaPersistentIdentity, LimaRuntimeState,
 };
 use crate::personal_worker_host_broker::{
     HostBrokerAction, HostBrokerPlan, HostBrokerStateRevision,
     PERSONAL_WORKER_HOST_BROKER_SCHEMA_VERSION,
 };
 use crate::personal_worker_queue::{PersonalWorkerProfile, PersonalWorkerQueueGeneration};
+use crate::personal_worker_tick::{
+    PERSONAL_WORKER_TICK_SCHEMA_VERSION, PersonalWorkerTickAction, PersonalWorkerTickPlan,
+};
 use crate::process::{CommandExecutor, CommandSpec, ExecutionRecord};
 
 pub const LIMA_LIFECYCLE_EXECUTOR_SCHEMA_VERSION: u8 = 1;
@@ -285,6 +288,73 @@ impl AcceptedLimaLifecycleAction {
             queue_generation: plan.queue_generation(),
             decision_at: plan.decision_at(),
             action: plan.action().clone(),
+        })
+    }
+
+    /// Retain one executable lifecycle action from the sealed personal-worker tick.
+    pub(crate) fn from_personal_worker_tick(
+        plan: &PersonalWorkerTickPlan,
+    ) -> Result<Self, LimaLifecycleExecutionFailure> {
+        if plan.schema_version() != PERSONAL_WORKER_TICK_SCHEMA_VERSION {
+            return Err(input_failure(
+                LimaLifecycleExecutionRefusalCode::InvalidInput,
+                "the personal-worker tick schema is not supported by the Lima executor",
+            ));
+        }
+        let action = match plan.action() {
+            PersonalWorkerTickAction::StartVm {
+                identity,
+                profile,
+                profile_generation,
+                ..
+            } => HostBrokerAction::Start {
+                identity: identity.clone(),
+                profile: *profile,
+                profile_generation: *profile_generation,
+            },
+            PersonalWorkerTickAction::StopVm {
+                identity,
+                current_profile,
+                profile_generation,
+                target_after_stop,
+            } => HostBrokerAction::Stop {
+                identity: identity.clone(),
+                current_profile: *current_profile,
+                profile_generation: *profile_generation,
+                target_after_stop: *target_after_stop,
+            },
+            PersonalWorkerTickAction::ChangeProfile {
+                identity,
+                from_profile,
+                to_profile,
+                current_generation,
+                next_generation,
+            } => HostBrokerAction::ChangeProfile {
+                identity: identity.clone(),
+                from_profile: *from_profile,
+                to_profile: *to_profile,
+                current_generation: *current_generation,
+                next_generation: *next_generation,
+            },
+            _ => {
+                return Err(input_failure(
+                    LimaLifecycleExecutionRefusalCode::UnsupportedAction,
+                    "the personal-worker tick action is not executable by the Lima lifecycle executor",
+                ));
+            }
+        };
+        let state_revision =
+            HostBrokerStateRevision::new(plan.store_revision().get()).map_err(|_| {
+                input_failure(
+                    LimaLifecycleExecutionRefusalCode::InvalidInput,
+                    "the personal-worker store revision is not supported by the Lima executor",
+                )
+            })?;
+        Ok(Self {
+            state_revision,
+            queue_generation: plan.queue_generation(),
+            decision_at: plan.decision_at(),
+            action,
         })
     }
 
@@ -625,6 +695,10 @@ impl LimaLifecycleExecutor {
         }
     }
 
+    fn source_identity(&self) -> LimaObservationSourceIdentity {
+        LimaObservationSourceIdentity::from_validated(self.instance.clone(), self.lima_home.clone())
+    }
+
     fn base_command(&self) -> CommandSpec {
         CommandSpec::new(&self.limactl_program)
             .secret_environment("LIMA_HOME", exact_private_path(&self.lima_home))
@@ -776,6 +850,13 @@ fn validate_common(
             LimaLifecycleExecutionRefusalCode::IdentityMismatch,
             LimaLifecycleExecutionPhase::InputValidation,
             "broker, lifecycle, observation, and executor instance identities must match exactly",
+        ));
+    }
+    if input.observation_request.source_identity() != executor.source_identity() {
+        return Err(ExecutionProblem::new(
+            LimaLifecycleExecutionRefusalCode::IdentityMismatch,
+            LimaLifecycleExecutionPhase::InputValidation,
+            "the observation request and lifecycle executor must use the same private Lima source",
         ));
     }
     let execution_millis = execution_unix_seconds.checked_mul(1_000).ok_or_else(|| {

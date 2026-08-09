@@ -793,6 +793,53 @@ fn durable_revision_and_queue_generation_drift_refuse_before_mutation() {
 }
 
 #[test]
+fn private_lima_source_drift_refuses_before_mutation() {
+    let persistent = persistent_identity('b');
+    let lifecycle = lifecycle(
+        LimaLifecycleState::Stopped,
+        LimaResourceProfile::Interactive,
+        1,
+        false,
+    );
+    let current = report(
+        LimaRuntimeState::Stopped,
+        LimaResourceProfile::Interactive,
+        None,
+    );
+    let action = accepted(HostBrokerAction::Start {
+        identity: lifecycle.identity().clone(),
+        profile: LimaResourceProfile::Interactive,
+        profile_generation: generation(1),
+    });
+    let other_request = LimaObservationRequest::new(
+        LimaInstanceName::parse("smolrunner").expect("instance name"),
+        "/private/var/lib/other-lima",
+        LimaVmType::Vz,
+        LimaArchitecture::Aarch64,
+        "/home/runner/.cache/smolrunner",
+        300,
+    )
+    .expect("other request");
+    let observations = ScriptedObservationSource::new(Vec::new());
+    let commands = ScriptedExecutor::new(ExecutorMode::Match);
+
+    let error = executor()
+        .execute(
+            input(&action, &lifecycle, &current, &persistent, &other_request),
+            &observations,
+            &commands,
+            &FixedClock(100),
+        )
+        .expect_err("private Lima source drift");
+
+    assert_eq!(
+        error.code,
+        LimaLifecycleExecutionRefusalCode::IdentityMismatch
+    );
+    assert!(commands.calls().is_empty());
+}
+
+#[test]
 fn stale_lifecycle_observation_refuses_before_mutation() {
     let persistent = persistent_identity('b');
     let lifecycle = lifecycle(
