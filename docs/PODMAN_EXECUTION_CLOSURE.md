@@ -117,7 +117,7 @@ runtime/conmon/init paths and prove the effective configuration contains no alte
 | OCI hook directories | a `precreate` hook can alter the OCI spec and add mounts | Pass one explicit root-owned empty `--hooks-dir`; prove it remains empty and same-object through spawn. Any hook is conflicting. |
 | CDI spec directories | selected devices can add host devices, mounts, env, and hooks | The 4.9.3 global CLI has no CDI-directory override. Fix the versioned `containers.conf` field to one exact empty root-owned directory, reject any CDI entry or caller device, and verify package behavior. |
 | seccomp profile | controls syscall filtering | Bind an exact root-owned profile digest selected explicitly by the admitted config; reject unconfined or image-selected policy. |
-| AppArmor policy | controls mandatory access confinement on Ubuntu | Bind the exact admitted profile name plus root-owned loaded-policy/config generation. `unconfined` is prohibited. |
+| AppArmor policy | could add mandatory access confinement on Ubuntu | containers/common 0.57.4 rejects every named profile in rootless mode, so the initial backend neither accepts a caller-selected profile nor claims AppArmor confinement. The stopped OCI spec must contain no AppArmor profile. A future outer-service profile is a separate root-installed boundary and cannot be inferred from a loaded host profile. |
 | default container environment | may inject proxies, credentials, or host values | Configuration has `env=[]`, `env_host=false`, and `http_proxy=false`; command repeats the negative flags where Podman supports them. Only immutable image-config env plus the fixed checked-in command env is admitted. |
 | image-declared volumes, health checks, entrypoint, user, and working directory | may create hidden writable volumes or select a different in-image process | Ignore image volumes, disable health checks/restarts, and pass the exact checked-in absolute entrypoint, user, and working directory. The immutable image config is still bound and reviewed. |
 | passwd/group synthesis | numeric `--user`, plain `keep-id`, `--hostuser`, or entry templates can copy host NSS identity into new bind-mounted files | Use `--userns=keep-id:uid=<fixed>,gid=<fixed>` with the same numeric `--user`; the digest-bound image must already contain exactly that numeric user/group. Omit `--hostuser`, `--passwd-entry`, and `--group-entry`. Noble 4.9.3 has no `create --passwd` control, so R02 must inspect the stopped container and generated OCI spec for no runtime passwd/group bind mount, and the immutable gate must compare `/etc/passwd` and `/etc/group` to their exact image-owned digests before repository code. Any synthesis, host-derived name/content, or mismatch blocks. |
@@ -137,6 +137,7 @@ helper/runtime selection, automatic mounts, and powerful precreate hooks:
 - [Podman 4.9.3 pause-process systemd move](https://github.com/containers/podman/blob/v4.9.3/utils/utils.go)
 - [containers/common 0.57.4 containers.conf contract](https://github.com/containers/common/blob/v0.57.4/docs/containers.conf.5.md)
 - [containers/common automatic mounts implementation](https://github.com/containers/common/blob/v0.57.4/pkg/subscriptions/subscriptions.go)
+- [containers/common 0.57.4 rootless AppArmor refusal](https://github.com/containers/common/blob/v0.57.4/pkg/apparmor/apparmor_linux.go)
 
 ### Kernel and host identity inputs
 
@@ -230,7 +231,6 @@ or image string.
   --image-volume=ignore
   --cap-drop=all
   --security-opt=no-new-privileges
-  --security-opt=apparmor=<exact-apparmor-profile>
   --security-opt=seccomp=<exact-seccomp-profile>
   --cgroup-parent=<sealed-payload-child>
   --cgroupns=private
@@ -240,7 +240,9 @@ or image string.
   --cpus=<applied-limit>
   --env-host=false
   --http-proxy=false
-  --log-driver=none
+  --log-driver=k8s-file
+  --log-opt=path=<attempt-private-log>
+  --log-opt=max-size=<bounded-log-bytes>
   --privileged=false
   --systemd=false
   --restart=no
@@ -269,24 +271,52 @@ passwd/group bind mounts or host-derived identity. Only then may the gate `exec`
 Cargo command and fixed argument vector selected by the sealed Rust envelope. A gate failure
 executes no repository code and is never a verification success.
 
-Before `image inspect`, `create`, `inspect`, or `start`, the launcher joins the already-created
-outer attempt cgroup; it supplies null stdin, pipes only bounded stdout/stderr, and allocates no TTY.
-After `create` returns, R02 matches the stopped container and generated specification to the durable
-attempt, image, protected source/cache/target objects, target-tmpfs limits, namespaces, cgroup,
-environment, and security policy. It durably checkpoints that exact stopped object, reconfirms
-protected host objects, and then takes the canonical durable-store lock for one final admission
-barrier. Under that lock it reopens the exact B05 plan/reservation, checks current store revision and
-queue generation, ownership, holds/cancellation, every bound identity, and an injected current time,
-then atomically consumes/checkpoints start authority. The deadline remains the original B05
-`not_after`/maximum-duration budget with preparation time already consumed; it is never restarted or
-extended. Any refusal leaves the exact stopped container unstarted and recovery-classified. Only
-after that successful checkpoint does R02 invoke the fixed
-`podman start --attach <exact-id>` form. Podman 4.9.3 exposes one boolean attach flag for both stdout
-and stderr; the fixture must prove both streams remain separately bounded and cleanup cannot wait on
-an inherited pipe. A name or CID file remains lookup evidence only. The displayed paths are private
-plan values, never public receipt fields. Source refers only to the protected immutable
-materialization, never the live checkout. The read-only dependency-cache mount is omitted when no
-independently verified generation exists.
+Before `image inspect`, `create`, `init`, `inspect`, `start`, or `logs`, the launcher joins the
+already-created outer attempt cgroup; it supplies null stdin, pipes only bounded stdout/stderr, and
+allocates no TTY.
+Every Podman process's file descriptor 0 is the already-open `/dev/null`; an inherited service,
+terminal, or caller pipe is forbidden.
+After `create` returns, R02 durably checkpoints the exact configured container, invokes fixed
+`podman container init <exact-id>`, and checkpoints that exact non-running initialized object before
+inspection. `init` may establish mounts and conmon state but cannot execute the payload; failure or
+ambiguity is recovery debt. From the first successful `init` through exact removal, an inner cleanup
+guard owns that exact container ID so a later gate failure cannot strand conmon and prevent the
+outer transient service/cgroup from terminating. R02 then matches the initialized container and
+generated specification to the durable attempt, image, protected source/cache/target objects,
+target-tmpfs limits, namespaces, cgroup, environment, and security policy. It durably checkpoints
+that exact stopped object, reconfirms protected host objects, and then takes the canonical
+durable-store lock for one final admission barrier. Under that lock it reopens the exact B05
+plan/reservation, checks current
+store revision and queue generation, ownership, holds/cancellation, every bound identity, and an
+injected current time, then atomically consumes/checkpoints start authority. The deadline remains
+the original B05 `not_after`/maximum-duration budget with preparation time already consumed; it is
+never restarted or extended. Any refusal leaves the exact stopped container unstarted and
+recovery-classified. Only after that successful checkpoint does R02 invoke fixed
+`podman start <exact-id>`, repeated
+`podman container inspect <exact-id>`, and final `podman logs <exact-id>` forms. Each command and the
+whole polling sequence are independently deadline- and output-bounded. R02 monitors the
+authoritative payload cgroup and exact attempt-private log while polling; timeout, cancellation,
+log-ceiling contact, or capture failure triggers the journaled abort path and can never become
+success. Final stopped-state inspection, cgroup emptiness, and the durable attempt must agree on the
+exit code before `logs` is parsed into separately bounded stdout/stderr. A name or CID file remains
+lookup evidence only. The displayed paths are private plan values, never public receipt fields.
+Source refers only to the protected immutable materialization, never the live checkout. The
+read-only dependency-cache mount is omitted when no independently verified generation exists.
+
+Because `init` launches stopped-container conmon, its expected tiny output goes to bounded
+attempt-private regular files rather than inherited pipes; R02 reads those files only after the
+client exits and requires the exact container ID plus empty stderr.
+
+Noble Podman 4.9.3 leaves both `start --attach` and `wait` clients waiting after this fixture's
+payload and container have exited cleanly; its `WaitForExit` path explicitly continues while the
+container is `stopped`. Neither command is an admitted execution primitive. The fixed
+`k8s-file` driver instead writes one exact attempt-private regular file with a hard aggregate byte
+ceiling passed to conmon. R02 validates the stopped container's exact driver, path, and limit before
+start and rejects an unsafe owner, mode, type, link count, or parent binding. Reaching the ceiling
+is an output-limit failure even if conmon truncates or rotates bytes. This log is transient capture
+state, not a cache, receipt, or verification authority, and cleanup removes it only after the cgroup
+is empty and capture is complete. The normal-output fixture does not by itself prove hostile
+overflow; that adversarial case remains mandatory before R02 readiness.
 
 The attempt name and CID file are recovery lookups only; neither proves ownership, and both must be
 matched to the durable attempt, exact run-private store, and authoritative cgroup before inspect or
@@ -441,8 +471,9 @@ temporary fixture, and each test proves the marker remains absent.
   free-space preflight is not sufficient.
 - Confirm that `--network=none` plus the fixed hosts/resolver/hostname/timezone policy copies no host
   content; Podman 4.9.3 rejects the otherwise tempting `--dns=none` combination.
-- Select the exact root-owned AppArmor and seccomp profiles and prove they are effective for a
-  rootless cgroup-v2 run.
+- Select the exact root-owned seccomp profile and prove it is effective for a rootless cgroup-v2
+  run. Per-container AppArmor is unavailable through the pinned rootless Podman stack; adding an
+  outer-service AppArmor profile requires a separate root-installed policy and inheritance proof.
 - Prove a root-owned read-only additional image store works with a fresh run-private graph root and
   `--pull=never` without writes to the image store.
 - Decide whether the host catatonit edge is retained or replaced by an init inside the immutable

@@ -1,0 +1,63 @@
+name: Podman container closure probe
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/podman-container-closure-probe.yml
+      - scripts/test-podman-container-closure.sh
+      - docs/PODMAN_EXECUTION_CLOSURE.md
+      - docs/PODMAN_CONTAINER_CLOSURE_EVIDENCE.md
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: podman-container-closure-probe-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ubuntu-container:
+    name: Ubuntu 24.04 ${{ matrix.architecture }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: arm64
+            runner: ubuntu-24.04-arm
+          - architecture: x86_64
+            runner: ubuntu-24.04
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          show-progress: false
+
+      - name: Install Ubuntu closure packages
+        run: |
+          while IFS= read -r source; do
+            sudo mv -- "$source" "$source.smolrunner-disabled"
+          done < <(sudo grep -rl 'ppa.launchpadcontent.net/git-core/ppa' /etc/apt/sources.list.d || true)
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            aardvark-dns \
+            busybox-static \
+            catatonit \
+            conmon \
+            crun \
+            jq \
+            netavark \
+            podman \
+            uidmap
+
+      - name: Probe offline stopped-container closure
+        run: >-
+          sudo /usr/bin/env -i
+          PATH=/usr/sbin:/usr/bin:/sbin:/bin
+          LC_ALL=C
+          SMOLRUNNER_DISPOSABLE_PROBE=github-hosted-ubuntu
+          /usr/bin/bash scripts/test-podman-container-closure.sh
