@@ -94,6 +94,28 @@ struct ScriptedExecutor {
     commands: RefCell<Vec<CommandSpec>>,
 }
 
+struct SamePathRebindingExecutor {
+    inner: ScriptedExecutor,
+    checkout: PathBuf,
+    displaced: PathBuf,
+}
+
+impl SamePathRebindingExecutor {
+    fn new(checkout: &Path, responses: Vec<ScriptedResponse>) -> Self {
+        Self {
+            inner: ScriptedExecutor::new(responses),
+            checkout: checkout.to_path_buf(),
+            displaced: checkout.with_extension("displaced"),
+        }
+    }
+}
+
+impl Drop for SamePathRebindingExecutor {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.displaced);
+    }
+}
+
 impl ScriptedExecutor {
     fn new(responses: Vec<ScriptedResponse>) -> Self {
         Self {
@@ -148,6 +170,27 @@ impl TimedCommandExecutor for ScriptedExecutor {
                 })
             }
         }
+    }
+}
+
+impl CommandExecutor for SamePathRebindingExecutor {
+    fn execute(&self, _spec: &CommandSpec) -> io::Result<ExecutionRecord> {
+        panic!("repository observation must use the timed executor boundary")
+    }
+}
+
+impl TimedCommandExecutor for SamePathRebindingExecutor {
+    fn execute_with_timeout(
+        &self,
+        spec: &CommandSpec,
+        timeout: Duration,
+    ) -> io::Result<ExecutionRecord> {
+        let record = self.inner.execute_with_timeout(spec, timeout)?;
+        if self.inner.command_count() == 14 {
+            fs::rename(&self.checkout, &self.displaced).expect("displace observed checkout");
+            fs::create_dir(&self.checkout).expect("replace checkout at the same path");
+        }
+        Ok(record)
     }
 }
 
@@ -295,6 +338,22 @@ fn identical_source_from_different_workspace_roots_retains_distinct_private_iden
     let public = format!("{first_observation:?}{second_observation:?}");
     assert!(!public.contains(first.path().to_string_lossy().as_ref()));
     assert!(!public.contains(second.path().to_string_lossy().as_ref()));
+}
+
+#[test]
+fn same_path_directory_rebind_after_git_snapshots_is_source_drift() {
+    let checkout = TempCheckout::new("same-path-rebind");
+    let executor = SamePathRebindingExecutor::new(checkout.path(), clean_script(checkout.path()));
+
+    let error = observer()
+        .observe(checkout.path(), &profile(), &executor)
+        .expect_err("a replacement directory at the same path must not retain source authority");
+
+    assert_eq!(
+        error.kind(),
+        RepositorySourceObservationErrorKind::RepositorySourceChanged
+    );
+    assert_eq!(executor.inner.command_count(), 14);
 }
 
 #[test]

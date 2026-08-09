@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::fmt;
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
@@ -18,17 +19,29 @@ const MAX_GIT_OBSERVATION_OUTPUT_BYTES: usize = 65_536;
 const MAX_REMOTE_URLS: usize = 16;
 const MAX_BRANCH_BYTES: usize = 512;
 
-/// Opaque equality-only identity for one exact private repository workspace location.
+/// Opaque equality-only identity for one exact private repository workspace object.
 ///
-/// The path has no serialization or accessor. Higher-level planners can prove that repository
-/// source and descriptor-derived workspace evidence refer to the same canonical location without
-/// disclosing that location.
+/// The canonical path and filesystem object identity have no serialization or accessors.
+/// Higher-level planners can prove that repository source and descriptor-derived workspace
+/// evidence refer to the same opened directory without disclosing its location.
 #[derive(Clone, PartialEq, Eq)]
-pub struct RepositoryWorkspaceLocationIdentity(PathBuf);
+pub struct RepositoryWorkspaceLocationIdentity {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+}
 
 impl RepositoryWorkspaceLocationIdentity {
-    pub(crate) const fn from_validated(path: PathBuf) -> Self {
-        Self(path)
+    pub(crate) const fn from_validated(path: PathBuf, device: u64, inode: u64) -> Self {
+        Self {
+            path,
+            device,
+            inode,
+        }
+    }
+
+    fn matches_metadata(&self, metadata: &std::fs::Metadata) -> bool {
+        metadata.is_dir() && metadata.dev() == self.device && metadata.ino() == self.inode
     }
 }
 
@@ -180,6 +193,15 @@ impl RepositorySourceObserver {
         if !is_normalized_absolute_path(&checkout) || checkout.to_str().is_none() {
             return Err(unavailable());
         }
+        let initial_metadata = std::fs::metadata(&checkout).map_err(|_| unavailable())?;
+        if !initial_metadata.is_dir() {
+            return Err(unavailable());
+        }
+        let workspace_location_identity = RepositoryWorkspaceLocationIdentity::from_validated(
+            checkout.clone(),
+            initial_metadata.dev(),
+            initial_metadata.ino(),
+        );
 
         let first = self.snapshot(
             &checkout,
@@ -200,15 +222,17 @@ impl RepositorySourceObserver {
         if second != first {
             return Err(source_changed());
         }
+        let final_metadata = std::fs::metadata(&checkout).map_err(|_| source_changed())?;
+        if !workspace_location_identity.matches_metadata(&final_metadata) {
+            return Err(source_changed());
+        }
 
         Ok(RepositorySourceObservation {
             schema_version: REPOSITORY_SOURCE_OBSERVATION_SCHEMA_VERSION,
             source: PersonalWorkerSourceIdentity::new(first.repository, first.commit, first.tree),
             verification_profile: profile_id.clone(),
             cleanliness: RepositoryCleanliness::Clean,
-            workspace_location_identity: RepositoryWorkspaceLocationIdentity::from_validated(
-                checkout,
-            ),
+            workspace_location_identity,
         })
     }
 

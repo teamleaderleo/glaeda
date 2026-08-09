@@ -123,6 +123,8 @@ pub struct TrustedWorkspaceCacheReceipt {
     cache_present: bool,
     trusted_evidence_digest: Sha256Digest,
     #[serde(skip)]
+    workspace_location_identity: RepositoryWorkspaceLocationIdentity,
+    #[serde(skip)]
     workspace_root: PathBuf,
     #[serde(skip)]
     cache_path: PathBuf,
@@ -160,8 +162,8 @@ impl TrustedWorkspaceCacheReceipt {
     }
 
     #[must_use]
-    pub fn workspace_location_identity(&self) -> RepositoryWorkspaceLocationIdentity {
-        RepositoryWorkspaceLocationIdentity::from_validated(self.workspace_root.clone())
+    pub const fn workspace_location_identity(&self) -> &RepositoryWorkspaceLocationIdentity {
+        &self.workspace_location_identity
     }
 
     /// Combine descriptor-derived identity with separately observed non-identity preflight evidence.
@@ -422,6 +424,11 @@ fn produce_with_hook(
         ],
     );
     let trusted_evidence_digest = parse_digest(evidence_bytes, "evidence")?;
+    let workspace_location_identity = RepositoryWorkspaceLocationIdentity::from_validated(
+        workspace_path.clone(),
+        workspace.stat.st_dev,
+        workspace.stat.st_ino,
+    );
 
     Ok(TrustedWorkspaceCacheReceipt {
         schema_version: TRUSTED_WORKSPACE_RECEIPT_SCHEMA_VERSION,
@@ -433,6 +440,7 @@ fn produce_with_hook(
         cache_namespace_digest,
         cache_present: true,
         trusted_evidence_digest,
+        workspace_location_identity,
         workspace_root: workspace_path,
         cache_path,
     })
