@@ -92,6 +92,11 @@ impl PersonalWorkerRuntimeManifest {
             architecture: self.architecture,
         }
     }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) const fn installation_id(&self) -> &InstallationId {
+        &self.installation_id
+    }
 }
 
 impl fmt::Debug for PersonalWorkerRuntimeManifest {
