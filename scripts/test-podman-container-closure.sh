@@ -29,6 +29,84 @@ validate_network_lock() {
     (( size == 0 ))
 }
 
+validate_cgroup_limits() {
+  local cgroup_dir=$1
+  local cpu_max memory_max memory_swap_max pids_max
+  cpu_max=$(< "$cgroup_dir/cpu.max")
+  memory_max=$(< "$cgroup_dir/memory.max")
+  memory_swap_max=$(< "$cgroup_dir/memory.swap.max")
+  pids_max=$(< "$cgroup_dir/pids.max")
+  [[ $cpu_max == '50000 100000' ]] &&
+    [[ $memory_max == 67108864 ]] &&
+    [[ $memory_swap_max == 0 ]] &&
+    [[ $pids_max == 32 ]]
+}
+
+prepare_cgroup_hierarchy() {
+  local controller service_cgroup service_cgroup_dir
+  local -a available_controllers enabled_controllers unified_cgroups
+
+  mapfile -t unified_cgroups < <(
+    /usr/bin/awk -F: '$1 == "0" && $2 == "" { print $3 }' /proc/self/cgroup
+  )
+  if [[ ${#unified_cgroups[@]} -ne 1 ]]; then
+    printf 'error: disposable service lacks one exact unified cgroup identity\n' >&2
+    exit 1
+  fi
+  service_cgroup=${unified_cgroups[0]}
+  if [[ ! $service_cgroup =~ ^/[A-Za-z0-9_.@:-]+(/[A-Za-z0-9_.@:-]+)*$ ]] ||
+    [[ $service_cgroup == *'/../'* ]] || [[ $service_cgroup == */.. ]] ||
+    [[ $service_cgroup == *'/./'* ]] || [[ $service_cgroup == */. ]]; then
+    printf 'error: disposable service cgroup identity is noncanonical\n' >&2
+    exit 1
+  fi
+  service_cgroup_dir="/sys/fs/cgroup$service_cgroup"
+  if [[ -L $service_cgroup_dir ]] || [[ ! -d $service_cgroup_dir ]]; then
+    printf 'error: disposable service cgroup is absent or rebound\n' >&2
+    exit 1
+  fi
+  if [[ $(< "$service_cgroup_dir/cpu.max") != '75000 100000' ]] ||
+    [[ $(< "$service_cgroup_dir/memory.max") != 100663296 ]] ||
+    [[ $(< "$service_cgroup_dir/memory.swap.max") != 0 ]] ||
+    [[ $(< "$service_cgroup_dir/pids.max") != 64 ]]; then
+    printf 'error: disposable outer cgroup limits are not exact\n' >&2
+    exit 1
+  fi
+
+  read -r -a available_controllers < "$service_cgroup_dir/cgroup.controllers"
+  for controller in cpu memory pids; do
+    if [[ ! " ${available_controllers[*]} " =~ [[:space:]]$controller[[:space:]] ]]; then
+      printf 'error: required delegated cgroup controller is absent: %s\n' "$controller" >&2
+      exit 1
+    fi
+  done
+
+  PROBE_SUPERVISOR_CGROUP_DIR="$service_cgroup_dir/supervisor"
+  PROBE_PAYLOAD_CGROUP_DIR="$service_cgroup_dir/payload"
+  /usr/bin/mkdir "$PROBE_SUPERVISOR_CGROUP_DIR" "$PROBE_PAYLOAD_CGROUP_DIR"
+  printf '%s\n' "$BASHPID" > "$PROBE_SUPERVISOR_CGROUP_DIR/cgroup.procs"
+  printf '+cpu +memory +pids\n' > "$service_cgroup_dir/cgroup.subtree_control"
+  read -r -a enabled_controllers < "$service_cgroup_dir/cgroup.subtree_control"
+  for controller in cpu memory pids; do
+    if [[ ! " ${enabled_controllers[*]} " =~ [[:space:]]$controller[[:space:]] ]]; then
+      printf 'error: required delegated cgroup controller was not enabled: %s\n' "$controller" >&2
+      exit 1
+    fi
+  done
+
+  printf '50000 100000\n' > "$PROBE_PAYLOAD_CGROUP_DIR/cpu.max"
+  printf '67108864\n' > "$PROBE_PAYLOAD_CGROUP_DIR/memory.max"
+  printf '0\n' > "$PROBE_PAYLOAD_CGROUP_DIR/memory.swap.max"
+  printf '32\n' > "$PROBE_PAYLOAD_CGROUP_DIR/pids.max"
+  if ! validate_cgroup_limits "$PROBE_PAYLOAD_CGROUP_DIR"; then
+    printf 'error: payload cgroup limits did not persist exactly\n' >&2
+    exit 1
+  fi
+
+  PROBE_CGROUP_PARENT="$service_cgroup/payload"
+  printf '%s\n' "$service_cgroup" > "$PROBE_CGROUP_RECORD"
+}
+
 PROBE_OWNED_CONTAINER_ID=
 PROBE_OWNED_IMAGE_ID=
 
@@ -48,9 +126,12 @@ cleanup_user_probe() {
 run_user_probe() {
   local image_id image_hex container_id container_output expected_output
   local init_output init_status start_output start_status inspect_status logs_status completion_seen=0
-  local image_size container_size spec_size spec_path
+  local image_size container_size spec_size spec_path cgroup_leaf cgroup_leaf_name
   local log_owner log_group log_mode log_links log_size stderr_size exit_code
   local seccomp_sha_now
+  local -a matching_cgroups
+
+  prepare_cgroup_hierarchy
 
   mapfile -d '' network_entries_before < <(
     /usr/bin/find "$PROBE_NETWORK" -mindepth 1 -maxdepth 1 -print0
@@ -108,6 +189,8 @@ run_user_probe() {
     --cap-drop=all \
     --security-opt=no-new-privileges \
     --security-opt="seccomp=$PROBE_SECCOMP_PROFILE" \
+    --cgroup-parent="$PROBE_CGROUP_PARENT" \
+    --cgroupns=private \
     --pids-limit=32 \
     --memory=67108864 \
     --memory-swap=67108864 \
@@ -168,6 +251,7 @@ run_user_probe() {
     ! /usr/bin/jq -e \
       --arg container_id "$container_id" \
       --arg image_hex "$image_hex" \
+      --arg cgroup_parent "$PROBE_CGROUP_PARENT" \
       --arg log_path "$PROBE_LOGFILE" '
       length == 1 and
       .[0].Id == $container_id and
@@ -179,9 +263,12 @@ run_user_probe() {
       .[0].HostConfig.NetworkMode == "none" and
       .[0].HostConfig.ReadonlyRootfs == true and
       .[0].HostConfig.Privileged == false and
+      .[0].HostConfig.CgroupParent == $cgroup_parent and
+      .[0].HostConfig.CgroupnsMode == "private" and
       .[0].HostConfig.PidsLimit == 32 and
       .[0].HostConfig.Memory == 67108864 and
       .[0].HostConfig.MemorySwap == 67108864 and
+      .[0].HostConfig.NanoCpus == 500000000 and
       .[0].HostConfig.LogConfig.Type == "k8s-file" and
       .[0].HostConfig.LogConfig.Path == $log_path and
       .[0].HostConfig.LogConfig.Size == "1.049MB"
@@ -193,9 +280,12 @@ run_user_probe() {
       network: .HostConfig.NetworkMode,
       readonly: .HostConfig.ReadonlyRootfs,
       privileged: .HostConfig.Privileged,
+      cgroup_parent_matches: (.HostConfig.CgroupParent == $cgroup_parent),
+      cgroupns: .HostConfig.CgroupnsMode,
       pids: .HostConfig.PidsLimit,
       memory: .HostConfig.Memory,
       swap: .HostConfig.MemorySwap,
+      nanocpus: .HostConfig.NanoCpus,
       log: .HostConfig.LogConfig
     }' "$PROBE_CONTAINER_JSON" >&2 || true
     printf 'error: stopped container inspection did not match the closed fixture\n' >&2
@@ -203,6 +293,23 @@ run_user_probe() {
   fi
   if /usr/bin/grep -Fq "$PROBE_USER" "$PROBE_CONTAINER_JSON"; then
     printf 'error: stopped container inspection contains the host account name\n' >&2
+    exit 1
+  fi
+
+  mapfile -d '' matching_cgroups < <(
+    /usr/bin/find "$PROBE_PAYLOAD_CGROUP_DIR" -mindepth 1 -maxdepth 1 -type d -print0
+  )
+  if [[ ${#matching_cgroups[@]} -ne 1 ]]; then
+    printf 'payload_cgroup_children=%s\n' "${#matching_cgroups[@]}" >&2
+    printf 'error: initialized container lacks one exact payload cgroup leaf\n' >&2
+    exit 1
+  fi
+  cgroup_leaf=${matching_cgroups[0]}
+  cgroup_leaf_name=${cgroup_leaf##*/}
+  if [[ -L $cgroup_leaf ]] || [[ $cgroup_leaf_name != *"$container_id"* ]] ||
+    ! validate_cgroup_limits "$cgroup_leaf"; then
+    printf 'cgroup_leaf_name=%q\n' "$cgroup_leaf_name" >&2
+    printf 'error: initialized container payload cgroup identity or limits drifted\n' >&2
     exit 1
   fi
 
@@ -219,6 +326,8 @@ run_user_probe() {
   spec_size=$(/usr/bin/stat -Lc %s "$spec_path")
   if (( spec_size == 0 || spec_size > 1048576 )) ||
     ! /usr/bin/jq -e \
+      --arg cgroup_leaf "$cgroup_leaf_name" \
+      --arg cgroup_parent "$PROBE_CGROUP_PARENT" \
       --arg probe_root "$PROBE_ROOT" '
       def one_pathless_namespace($kind):
         [.linux.namespaces[] | select(.type == $kind)] as $entries |
@@ -246,6 +355,8 @@ run_user_probe() {
       .process.noNewPrivileges == true and
       (.process.capabilities | type == "object" and length == 0) and
       (.process.apparmorProfile // "") == "" and
+      (.linux.cgroupsPath == ($cgroup_parent + "/" + $cgroup_leaf) or
+        .linux.cgroupsPath == (($cgroup_parent | ltrimstr("/")) + "/" + $cgroup_leaf)) and
       one_pathless_namespace("ipc") and
       one_pathless_namespace("pid") and
       one_pathless_namespace("uts") and
@@ -253,10 +364,14 @@ run_user_probe() {
       ([.mounts[] | select(.destination == "/etc/passwd" or .destination == "/etc/group")] | length) == 0 and
       .linux.seccomp != null
     ' "$spec_path" >/dev/null; then
-    /usr/bin/jq -c '{
+    /usr/bin/jq -c \
+      --arg cgroup_leaf "$cgroup_leaf_name" \
+      --arg cgroup_parent "$PROBE_CGROUP_PARENT" '{
       user: .process.user,
       no_new_privileges: .process.noNewPrivileges,
       capabilities: .process.capabilities,
+      cgroup_path_matches: (.linux.cgroupsPath == ($cgroup_parent + "/" + $cgroup_leaf) or
+        .linux.cgroupsPath == (($cgroup_parent | ltrimstr("/")) + "/" + $cgroup_leaf)),
       namespaces: [.linux.namespaces[] | {type, path_present: has("path")}],
       environment_names: [.process.env[] | split("=")[0]],
       account_mounts: [.mounts[] | select(.destination == "/etc/passwd" or .destination == "/etc/group") | .destination],
@@ -400,6 +515,12 @@ $PROBE_GROUP_SHA  /etc/group"
     exit 1
   fi
   PROBE_OWNED_CONTAINER_ID=
+  if [[ -n $(/usr/bin/find "$PROBE_PAYLOAD_CGROUP_DIR" -mindepth 1 -maxdepth 1 -print -quit) ]] ||
+    [[ -n $(< "$PROBE_PAYLOAD_CGROUP_DIR/cgroup.procs") ]] ||
+    ! /usr/bin/grep -Fxq 'populated 0' "$PROBE_PAYLOAD_CGROUP_DIR/cgroup.events"; then
+    printf 'error: exact payload cgroup was not empty after container removal\n' >&2
+    exit 1
+  fi
   podman_probe image rm "$image_id" >/dev/null
   PROBE_OWNED_IMAGE_ID=
 
@@ -413,7 +534,7 @@ $PROBE_GROUP_SHA  /etc/group"
     exit 1
   fi
 
-  printf 'offline_image=exact stopped_create=closed account_files=image-owned apparmor=rootless-unavailable\n'
+  printf 'offline_image=exact stopped_create=closed account_files=image-owned cgroup=bounded apparmor=rootless-unavailable\n'
 }
 
 if [[ ${1:-} == --user-probe ]]; then
@@ -433,6 +554,7 @@ fi
 
 for command in \
   /usr/bin/busybox \
+  /usr/bin/mkdir \
   /usr/bin/findmnt \
   /usr/bin/jq \
   /usr/bin/podman \
@@ -605,6 +727,10 @@ probe_unit_owned=1
   --uid="$probe_user" \
   --property=Delegate=yes \
   --property=KillMode=control-group \
+  --property=CPUQuota=75% \
+  --property=MemoryMax=100663296 \
+  --property=MemorySwapMax=0 \
+  --property=TasksMax=64 \
   /usr/bin/env -i \
   CONTAINERS_CONF="$probe_root/config/containers.conf" \
   CONTAINERS_REGISTRIES_CONF="$probe_root/config/registries.conf" \
@@ -614,6 +740,7 @@ probe_unit_owned=1
   LC_ALL=C \
   LOGNAME="$probe_user" \
   PATH=/usr/bin \
+  PROBE_CGROUP_RECORD="$probe_root/runtime/service.cgroup" \
   PROBE_CIDFILE="$probe_root/runtime/container.cid" \
   PROBE_CAPTURE_STDERR="$probe_root/runtime/logs.stderr" \
   PROBE_CONTAINER_JSON="$probe_root/runtime/container.json" \
@@ -641,6 +768,13 @@ probe_unit_owned=1
   XDG_RUNTIME_DIR="$probe_root/runtime" \
   /usr/bin/bash "$probe_user_script" --user-probe
 probe_unit_owned=0
+
+service_cgroup=$(< "$probe_root/runtime/service.cgroup")
+if [[ $service_cgroup != "/system.slice/$probe_unit" ]] ||
+  [[ -e "/sys/fs/cgroup$service_cgroup" ]] || [[ -L "/sys/fs/cgroup$service_cgroup" ]]; then
+  printf 'error: disposable service cgroup identity remained after collection\n' >&2
+  exit 1
+fi
 
 if /usr/bin/pgrep -u "$probe_uid" >/dev/null 2>&1; then
   printf 'error: offline container probe left an idle process\n' >&2
