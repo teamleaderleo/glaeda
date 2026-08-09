@@ -82,6 +82,9 @@ pub mod linux_lease_store;
 /// Direct command-free observation of the five account-related personal-worker runtime classes.
 #[cfg(target_os = "linux")]
 pub mod linux_personal_worker_runtime_account_evidence;
+/// Direct command-free Linux kernel and cgroup-v2 prerequisites for the personal-worker runtime.
+#[cfg(target_os = "linux")]
+pub mod linux_personal_worker_runtime_kernel_prerequisite;
 /// Read-only, locked discovery of one protected recorded personal-worker runtime manifest.
 #[cfg(target_os = "linux")]
 pub mod linux_personal_worker_runtime_manifest;
