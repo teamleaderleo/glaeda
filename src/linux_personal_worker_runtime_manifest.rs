@@ -216,30 +216,52 @@ fn observe_at<T, E>(
 
 enum LockedManifestRead {
     Missing,
-    Found(OpenedLockedManifest),
+    Found(Box<OpenedLockedManifest>),
 }
 
 struct OpenedLockedManifest {
     guard: CatalogReadGuard,
     installations: OwnedFd,
     matched: MatchedInstallation,
-    manifest_file: File,
+    manifest_file: OpenedFile,
     manifest: PersonalWorkerRuntimeManifest,
 }
 
 impl OpenedLockedManifest {
     fn finish(
-        self,
+        mut self,
         root_path: &Path,
     ) -> Result<PersonalWorkerRuntimeManifest, PersonalWorkerRuntimeManifestDiscoveryError> {
-        verify_file_entry(
-            self.matched.directory.as_fd(),
-            RUNTIME_MANIFEST_FILE,
-            self.manifest_file.as_fd(),
+        reread_unchanged_private_file(
+            &mut self.manifest_file,
             self.guard.owner(),
             MAX_PERSONAL_WORKER_RUNTIME_MANIFEST_BYTES,
         )?;
-        verify_matched_installation(&self.installations, &self.matched, self.guard.owner())?;
+        reread_unchanged_private_file(
+            &mut self.matched.project_file,
+            self.guard.owner(),
+            MAX_STATE_DOCUMENT_BYTES,
+        )?;
+        verify_unchanged_file_entry(
+            self.matched.directory.as_fd(),
+            RUNTIME_MANIFEST_FILE,
+            &self.manifest_file,
+            self.guard.owner(),
+            MAX_PERSONAL_WORKER_RUNTIME_MANIFEST_BYTES,
+        )?;
+        verify_unchanged_file_entry(
+            self.matched.directory.as_fd(),
+            PROJECT_FILE,
+            &self.matched.project_file,
+            self.guard.owner(),
+            MAX_STATE_DOCUMENT_BYTES,
+        )?;
+        verify_directory_entry(
+            self.installations.as_fd(),
+            self.matched.installation_id.as_str(),
+            self.matched.directory.as_fd(),
+            self.guard.owner(),
+        )?;
         verify_directory_entry(
             self.guard.root(),
             INSTALLATIONS_DIRECTORY,
@@ -308,13 +330,13 @@ fn open_locked_manifest(
     if manifest.installation_id() != &matched.installation_id {
         return Err(corrupt_error());
     }
-    Ok(LockedManifestRead::Found(OpenedLockedManifest {
+    Ok(LockedManifestRead::Found(Box::new(OpenedLockedManifest {
         guard,
         installations,
         matched,
-        manifest_file: manifest_file.file,
+        manifest_file,
         manifest,
-    }))
+    })))
 }
 
 struct CatalogReadGuard {
@@ -372,7 +394,7 @@ fn open_catalog_read_guard(
 struct MatchedInstallation {
     installation_id: InstallationId,
     directory: OwnedFd,
-    project_file: File,
+    project_file: OpenedFile,
 }
 
 fn find_project_installation(
@@ -432,7 +454,7 @@ fn find_project_installation(
             matched = Some(MatchedInstallation {
                 installation_id,
                 directory,
-                project_file: project_file.file,
+                project_file,
             });
         }
     }
@@ -442,6 +464,7 @@ fn find_project_installation(
 struct OpenedFile {
     file: File,
     bytes: Vec<u8>,
+    snapshot: rustix::fs::Stat,
 }
 
 fn open_required_private_file(
@@ -490,7 +513,43 @@ fn read_stable_private_file(
     if first != second || !same_file_snapshot(&before, &after) {
         return Err(changed_error());
     }
-    Ok(OpenedFile { file, bytes: first })
+    Ok(OpenedFile {
+        file,
+        bytes: first,
+        snapshot: after,
+    })
+}
+
+fn reread_unchanged_private_file(
+    opened: &mut OpenedFile,
+    owner: (u32, u32),
+    max_bytes: usize,
+) -> Result<(), PersonalWorkerRuntimeManifestDiscoveryError> {
+    let before = fs::fstat(&opened.file).map_err(|_| io_error())?;
+    inspect_private_file_stat(&before, owner, max_bytes)?;
+    if !same_file_snapshot(&opened.snapshot, &before) {
+        return Err(changed_error());
+    }
+    opened
+        .file
+        .seek(SeekFrom::Start(0))
+        .map_err(|_| io_error())?;
+    let first = read_bounded(&mut opened.file, max_bytes)?;
+    opened
+        .file
+        .seek(SeekFrom::Start(0))
+        .map_err(|_| io_error())?;
+    let second = read_bounded(&mut opened.file, max_bytes)?;
+    let after = fs::fstat(&opened.file).map_err(|_| io_error())?;
+    inspect_private_file_stat(&after, owner, max_bytes)?;
+    if first != opened.bytes
+        || second != opened.bytes
+        || !same_file_snapshot(&opened.snapshot, &after)
+        || !same_file_snapshot(&before, &after)
+    {
+        return Err(changed_error());
+    }
+    Ok(())
 }
 
 fn read_bounded(
@@ -592,7 +651,7 @@ fn verify_matched_installation(
     verify_file_entry(
         matched.directory.as_fd(),
         PROJECT_FILE,
-        matched.project_file.as_fd(),
+        matched.project_file.file.as_fd(),
         owner,
         MAX_STATE_DOCUMENT_BYTES,
     )?;
@@ -673,6 +732,24 @@ fn verify_file_entry(
     Ok(())
 }
 
+fn verify_unchanged_file_entry(
+    parent: BorrowedFd<'_>,
+    name: &str,
+    opened: &OpenedFile,
+    owner: (u32, u32),
+    max_bytes: usize,
+) -> Result<(), PersonalWorkerRuntimeManifestDiscoveryError> {
+    let held = fs::fstat(&opened.file).map_err(|_| io_error())?;
+    inspect_private_file_stat(&held, owner, max_bytes)?;
+    let path = fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW).map_err(|_| changed_error())?;
+    inspect_private_file_stat(&path, owner, max_bytes)?;
+    if !same_file_snapshot(&opened.snapshot, &held) || !same_file_snapshot(&opened.snapshot, &path)
+    {
+        return Err(changed_error());
+    }
+    Ok(())
+}
+
 fn same_object(left: &rustix::fs::Stat, right: &rustix::fs::Stat) -> bool {
     left.st_dev == right.st_dev
         && left.st_ino == right.st_ino
@@ -683,7 +760,12 @@ fn same_object(left: &rustix::fs::Stat, right: &rustix::fs::Stat) -> bool {
 }
 
 fn same_file_snapshot(left: &rustix::fs::Stat, right: &rustix::fs::Stat) -> bool {
-    same_object(left, right) && left.st_size == right.st_size
+    same_object(left, right)
+        && left.st_size == right.st_size
+        && left.st_mtime == right.st_mtime
+        && left.st_mtime_nsec == right.st_mtime_nsec
+        && left.st_ctime == right.st_ctime
+        && left.st_ctime_nsec == right.st_ctime_nsec
 }
 
 fn map_required_directory_open_error(error: Errno) -> PersonalWorkerRuntimeManifestDiscoveryError {
@@ -1075,6 +1157,73 @@ mod tests {
                 assert_eq!(error, "observer_failed");
             }
             _ => panic!("stable state must preserve the observer failure"),
+        }
+    }
+
+    #[test]
+    fn same_size_manifest_or_project_rewrite_during_callback_is_rejected() {
+        let root = prepare_root("manifest-content-drift");
+        let installation = add_installation(&root, INSTALLATION_ID, project(), true);
+        let manifest_path = installation.join(RUNTIME_MANIFEST_FILE);
+        let replacement = String::from_utf8(manifest_bytes(INSTALLATION_ID))
+            .expect("manifest UTF-8")
+            .replace(
+                "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+                "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+            )
+            .into_bytes();
+        assert_eq!(
+            replacement.len(),
+            std_fs::metadata(&manifest_path)
+                .expect("manifest metadata")
+                .len() as usize
+        );
+        let result = observe_at(root.path(), geteuid().as_raw(), &project(), |_| {
+            write_private(&manifest_path, &replacement);
+            Ok::<(), ()>(())
+        });
+        match result {
+            Err(LockedPersonalWorkerRuntimeManifestObservationError::State(error)) => {
+                assert_eq!(
+                    error.kind,
+                    PersonalWorkerRuntimeManifestDiscoveryErrorKind::ChangedDuringRead
+                );
+            }
+            _ => panic!("same-size manifest rewrite must not release callback success"),
+        }
+
+        let root = prepare_root("project-content-drift");
+        let installation = add_installation(&root, INSTALLATION_ID, project(), true);
+        let project_path = installation.join(PROJECT_FILE);
+        let replacement_project = ProjectIdentity {
+            repository: "example/runtimf".to_owned(),
+            ..project()
+        };
+        let replacement_document = ProjectStateDocument::new(
+            InstallationId::parse(INSTALLATION_ID).expect("installation ID"),
+            replacement_project,
+        )
+        .expect("replacement project document");
+        let replacement = encode_state_document(&StateDocument::Project(replacement_document))
+            .expect("encode replacement project");
+        assert_eq!(
+            replacement.len(),
+            std_fs::metadata(&project_path)
+                .expect("project metadata")
+                .len() as usize
+        );
+        let result = observe_at(root.path(), geteuid().as_raw(), &project(), |_| {
+            write_private(&project_path, replacement.as_bytes());
+            Err::<(), _>("observer_failed")
+        });
+        match result {
+            Err(LockedPersonalWorkerRuntimeManifestObservationError::State(error)) => {
+                assert_eq!(
+                    error.kind,
+                    PersonalWorkerRuntimeManifestDiscoveryErrorKind::ChangedDuringRead
+                );
+            }
+            _ => panic!("same-size project rewrite must override callback failure"),
         }
     }
 
