@@ -84,23 +84,6 @@ printf 'probe_architecture=%s\n' "$(/usr/bin/uname -m)"
 /usr/bin/dpkg-query -W -f='package=${Package} version=${Version}\n' \
   aardvark-dns busybox-static catatonit conmon crun fuse-overlayfs git netavark podman uidmap
 
-podman_version=$(/usr/bin/podman --version)
-git_version=$(/usr/bin/git --version)
-case "$podman_version" in
-  'podman version 4.9.3'*) ;;
-  *)
-    printf 'error: unexpected Podman baseline: %s\n' "$podman_version" >&2
-    exit 1
-    ;;
-esac
-case "$git_version" in
-  'git version 2.43.'*) ;;
-  *)
-    printf 'error: unexpected Git baseline: %s\n' "$git_version" >&2
-    exit 1
-    ;;
-esac
-
 for path in \
   /usr/bin/podman \
   /usr/bin/git \
@@ -140,6 +123,23 @@ for hook_directory in /usr/libexec/podman/pre-exec-hooks /etc/containers/pre-exe
     exit 1
   fi
 done
+
+podman_version=$(/usr/bin/podman --version)
+git_version=$(/usr/bin/git --version)
+case "$podman_version" in
+  'podman version 4.9.3'*) ;;
+  *)
+    printf 'error: unexpected Podman baseline: %s\n' "$podman_version" >&2
+    exit 1
+    ;;
+esac
+case "$git_version" in
+  'git version 2.43.'*) ;;
+  *)
+    printf 'error: unexpected Git baseline: %s\n' "$git_version" >&2
+    exit 1
+    ;;
+esac
 
 /usr/sbin/useradd --create-home --home-dir "$probe_root/hostile-home" --shell /bin/bash "$probe_user"
 probe_uid=$(/usr/bin/id -u "$probe_user")
