@@ -339,8 +339,9 @@ chmod 0700 \
 printf '' > "$probe_root/config/containers.conf"
 printf 'unqualified-search-registries = []\nshort-name-mode = "enforcing"\n' \
   > "$probe_root/config/registries.conf"
-printf '[storage]\ndriver = "overlay"\nrunroot = "%s"\ngraphroot = "%s"\n\n[storage.options]\nadditionalimagestores = []\n' \
-  "$probe_root/runroot" "$probe_root/graphroot" > "$probe_root/config/storage.conf"
+printf '[storage]\ndriver = "overlay"\nrunroot = "%s"\ngraphroot = "%s"\nrootless_storage_path = "%s"\n\n[storage.options]\nadditionalimagestores = []\n' \
+  "$probe_root/runroot" "$probe_root/graphroot" "$probe_root/graphroot" \
+  > "$probe_root/config/storage.conf"
 printf '{}\n' > "$probe_root/auth/auth.json"
 chmod -R a-w "$probe_root/auth" "$probe_root/config" "$probe_root/hooks" "$probe_root/network"
 
@@ -360,8 +361,12 @@ set -euo pipefail
   --transient-store \
   info --format json > "$PROBE_INFO"
 
-if ! /usr/bin/jq -e '.host.security.rootless == true' "$PROBE_INFO" >/dev/null; then
-  printf 'error: Podman did not report rootless operation\n' >&2
+if ! /usr/bin/jq -e \
+  --arg graphroot "$PROBE_GRAPHROOT" \
+  --arg runroot "$PROBE_RUNROOT" \
+  '.host.security.rootless == true and .store.graphRoot == $graphroot and .store.runRoot == $runroot' \
+  "$PROBE_INFO" >/dev/null; then
+  printf 'error: Podman did not report the exact rootless run-private storage roots\n' >&2
   exit 1
 fi
 
@@ -404,8 +409,10 @@ chmod 0555 "$probe_root/user-probe.sh"
   LOGNAME="$probe_user" \
   PATH=/usr/bin \
   PROBE_HOOKS="$probe_root/hooks" \
+  PROBE_GRAPHROOT="$probe_root/graphroot" \
   PROBE_INFO="$probe_root/runtime/info.json" \
   PROBE_NETWORK="$probe_root/network" \
+  PROBE_RUNROOT="$probe_root/runroot" \
   PROBE_UID="$probe_uid" \
   PROBE_UNIT="$probe_unit" \
   REGISTRY_AUTH_FILE="$probe_root/auth/auth.json" \
