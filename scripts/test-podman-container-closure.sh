@@ -517,6 +517,11 @@ $PROBE_GROUP_SHA  /etc/group"
   if [[ -n $(/usr/bin/find "$PROBE_PAYLOAD_CGROUP_DIR" -mindepth 1 -maxdepth 1 -print -quit) ]] ||
     [[ -n $(< "$PROBE_PAYLOAD_CGROUP_DIR/cgroup.procs") ]] ||
     ! /usr/bin/grep -Fxq 'populated 0' "$PROBE_PAYLOAD_CGROUP_DIR/cgroup.events"; then
+    payload_child_count=$(/usr/bin/find "$PROBE_PAYLOAD_CGROUP_DIR" -mindepth 1 -maxdepth 1 -type d | /usr/bin/awk 'END { print NR + 0 }')
+    payload_process_count=$(/usr/bin/awk 'END { print NR + 0 }' "$PROBE_PAYLOAD_CGROUP_DIR/cgroup.procs")
+    payload_populated=$(/usr/bin/awk '$1 == "populated" { print $2 }' "$PROBE_PAYLOAD_CGROUP_DIR/cgroup.events")
+    printf 'payload_child_count=%s payload_process_count=%s payload_populated=%s\n' \
+      "$payload_child_count" "$payload_process_count" "${payload_populated:-unknown}" >&2
     printf 'error: exact payload cgroup was not empty after container removal\n' >&2
     exit 1
   fi
