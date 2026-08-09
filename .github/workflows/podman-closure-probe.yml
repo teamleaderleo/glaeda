@@ -106,3 +106,11 @@ jobs:
           cargo test --locked --lib
           linux_personal_worker_runtime_executable_prerequisite::tests::disposable_noble_executables_are_descriptor_bound_prerequisites
           -- --exact
+
+      - name: Observe admitted dynamic-loader state prerequisites
+        env:
+          SMOLRUNNER_ELF_PACKAGE_PROBE: github-hosted-ubuntu
+        run: >-
+          cargo test --locked --lib
+          linux_personal_worker_runtime_loader_state_prerequisite::tests::disposable_noble_loader_state_is_descriptor_bound
+          -- --exact
