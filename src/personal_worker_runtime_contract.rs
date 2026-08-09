@@ -15,7 +15,7 @@ use crate::state::InstallationId;
 
 pub const PERSONAL_WORKER_RUNTIME_CONTRACT_SCHEMA_VERSION: u8 = 1;
 
-const MAX_RUNTIME_GENERATION: u64 = 1_000_000_000_000;
+pub(crate) const MAX_RUNTIME_GENERATION: u64 = 1_000_000_000_000;
 const RUNTIME_IDENTITY_DOMAIN: &[u8] = b"smolrunner-personal-worker-runtime-readiness-v1";
 const RUNTIME_POLICY_DOMAIN: &[u8] = b"smolrunner-personal-worker-runtime-required-policy-v1";
 const REDACTED_PRIVATE_RUNTIME_EVIDENCE: &str = "<private-runtime-closure-evidence>";
