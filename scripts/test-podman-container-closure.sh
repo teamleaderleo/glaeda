@@ -291,7 +291,7 @@ run_hostile_probe() {
     exit 1
   fi
 
-  for _ in {1..400}; do
+  for _ in {1..800}; do
     log_size=0
     [[ -f $PROBE_HOSTILE_LOGFILE ]] && log_size=$(/usr/bin/stat -Lc %s "$PROBE_HOSTILE_LOGFILE")
     pids_max_events=$(/usr/bin/awk '$1 == "max" { print $2 }' "$cgroup_leaf/pids.events")
