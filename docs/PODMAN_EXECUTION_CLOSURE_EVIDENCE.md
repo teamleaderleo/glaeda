@@ -53,6 +53,26 @@ loader bytes only. It follows the fixed loader pathname in a disposable package 
 not prove path, symlink, inode, owner, mode, package, configuration, cache, transitive-library, or
 revalidation evidence; it constructs no R01 class or runtime readiness.
 
+### Dynamic-loader object prerequisite evidence
+
+- Observer implementation commit: `6b3b3c7267e01b94544524fbc18ec5c49f8f5045`
+- Workflow run: [31338102869](https://github.com/teamleaderleo/smolrunner/actions/runs/31338102869)
+- ARM64 job: [93307161473](https://github.com/teamleaderleo/smolrunner/actions/runs/31338102869/job/93307161473)
+- x86_64 job: [93307161455](https://github.com/teamleaderleo/smolrunner/actions/runs/31338102869/job/93307161455)
+- Date: 2026-08-10
+- Result: both jobs descriptor-opened, parsed, and revalidated the exact Noble GNU loader object
+  through its architecture-specific usr-merge symlink route.
+
+The observer requires the exact root-owned single-link top-level and loader symlinks, their exact
+target texts, protected canonical source and target directory chains, and the exact root-owned
+single-link executable target. Root-confined `openat2` resolution rejects root escape and magic
+links, while independent no-follow canonical opens prove the logical parent and loader resolve to
+the reviewed directory and target inode. The bounded target bytes are double-read, parsed, and
+digest-bound before final held/path/content/symlink/resolution/root revalidation. The copied-state
+fixture proves logical-route replacement, writable-target, and hard-link refusal. This is an opaque
+current prerequisite only. It does not resolve a `DT_NEEDED` library, inspect package identity,
+construct classes 8–18, execute a command, or seal runtime readiness.
+
 ### Dynamic-loader configuration parser evidence
 
 - Parser implementation commit: `8805b36169ec5c56afc0dacdb41fc56b149b7131`
