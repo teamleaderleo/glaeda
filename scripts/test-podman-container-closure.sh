@@ -32,6 +32,7 @@ validate_network_lock() {
 run_user_probe() {
   local image_id image_hex container_id container_output expected_output start_status
   local image_size container_size spec_size spec_path apparmor_profile
+  local log_owner log_group log_mode log_links log_size
 
   mapfile -d '' network_entries_before < <(
     /usr/bin/find "$PROBE_NETWORK" -mindepth 1 -maxdepth 1 -print0
@@ -87,7 +88,9 @@ run_user_probe() {
     --cpus=0.5 \
     --env-host=false \
     --http-proxy=false \
-    --log-driver=none \
+    --log-driver=k8s-file \
+    --log-opt="path=$PROBE_LOGFILE" \
+    --log-opt=max-size=1048576 \
     --privileged=false \
     --systemd=false \
     --restart=no \
@@ -110,7 +113,10 @@ run_user_probe() {
   podman_probe container inspect "$container_id" > "$PROBE_CONTAINER_JSON"
   container_size=$(/usr/bin/stat -Lc %s "$PROBE_CONTAINER_JSON")
   if (( container_size == 0 || container_size > 1048576 )) ||
-    ! /usr/bin/jq -e --arg container_id "$container_id" --arg image_hex "$image_hex" '
+    ! /usr/bin/jq -e \
+      --arg container_id "$container_id" \
+      --arg image_hex "$image_hex" \
+      --arg log_path "$PROBE_LOGFILE" '
       length == 1 and
       .[0].Id == $container_id and
       .[0].Image == $image_hex and
@@ -123,7 +129,10 @@ run_user_probe() {
       .[0].HostConfig.Privileged == false and
       .[0].HostConfig.PidsLimit == 32 and
       .[0].HostConfig.Memory == 67108864 and
-      .[0].HostConfig.MemorySwap == 67108864
+      .[0].HostConfig.MemorySwap == 67108864 and
+      .[0].HostConfig.LogConfig.Type == "k8s-file" and
+      .[0].HostConfig.LogConfig.Path == $log_path and
+      .[0].HostConfig.LogConfig.Size == "1.049MB"
     ' "$PROBE_CONTAINER_JSON" >/dev/null; then
     /usr/bin/jq -c '.[0] | {
       state: .State.Status,
@@ -134,7 +143,8 @@ run_user_probe() {
       privileged: .HostConfig.Privileged,
       pids: .HostConfig.PidsLimit,
       memory: .HostConfig.Memory,
-      swap: .HostConfig.MemorySwap
+      swap: .HostConfig.MemorySwap,
+      log: .HostConfig.LogConfig
     }' "$PROBE_CONTAINER_JSON" >&2 || true
     printf 'error: stopped container inspection did not match the closed fixture\n' >&2
     exit 1
@@ -176,6 +186,17 @@ run_user_probe() {
 $PROBE_GROUP_SHA  /etc/group"
   if [[ $container_output != "$expected_output" ]]; then
     printf 'error: in-container account files differ from exact image-owned bytes\n' >&2
+    exit 1
+  fi
+
+  read -r log_owner log_group log_mode log_links log_size < <(
+    /usr/bin/stat -Lc '%u %g %a %h %s' "$PROBE_LOGFILE"
+  )
+  if [[ -L $PROBE_LOGFILE ]] || [[ ! -f $PROBE_LOGFILE ]] ||
+    [[ $log_owner != "$PROBE_UID" ]] || [[ $log_group != "$PROBE_GID" ]] ||
+    (( (8#$log_mode & 0022) != 0 )) || [[ $log_links != 1 ]] ||
+    (( log_size == 0 || log_size > 1048576 )); then
+    printf 'error: attached output log was absent, unsafe, or exceeded its exact bound\n' >&2
     exit 1
   fi
 
@@ -419,10 +440,12 @@ probe_unit_owned=1
   PROBE_GROUP_SHA="$group_sha" \
   PROBE_HOOKS="$probe_root/hooks" \
   PROBE_IMAGE_JSON="$probe_root/runtime/image.json" \
+  PROBE_LOGFILE="$probe_root/runtime/container.log" \
   PROBE_NETWORK="$probe_root/network" \
   PROBE_PASSWD_SHA="$passwd_sha" \
   PROBE_ROOTFS_TAR="$probe_root/rootfs.tar" \
   PROBE_RUNROOT="$probe_root/runtime/containers" \
+  PROBE_GID="$probe_gid" \
   PROBE_UID="$probe_uid" \
   PROBE_USER="$probe_user" \
   REGISTRY_AUTH_FILE="$probe_root/auth/auth.json" \
