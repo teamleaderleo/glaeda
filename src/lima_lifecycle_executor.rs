@@ -19,6 +19,9 @@ use crate::personal_worker_host_broker::{
     PERSONAL_WORKER_HOST_BROKER_SCHEMA_VERSION,
 };
 use crate::personal_worker_queue::{PersonalWorkerProfile, PersonalWorkerQueueGeneration};
+use crate::personal_worker_tick::{
+    PERSONAL_WORKER_TICK_SCHEMA_VERSION, PersonalWorkerTickAction, PersonalWorkerTickPlan,
+};
 use crate::process::{CommandExecutor, CommandSpec, ExecutionRecord, TimedCommandExecutor};
 
 pub const LIMA_LIFECYCLE_EXECUTOR_SCHEMA_VERSION: u8 = 1;
@@ -324,6 +327,72 @@ impl AcceptedLimaLifecycleAction {
         })
     }
 
+    pub(crate) fn from_personal_worker_tick(
+        plan: &PersonalWorkerTickPlan,
+    ) -> Result<Self, LimaLifecycleExecutionFailure> {
+        if plan.schema_version() != PERSONAL_WORKER_TICK_SCHEMA_VERSION {
+            return Err(input_failure(
+                LimaLifecycleExecutionRefusalCode::InvalidInput,
+                "the personal-worker tick schema is not supported by the Lima executor",
+            ));
+        }
+        let state_revision =
+            HostBrokerStateRevision::new(plan.store_revision().get()).map_err(|_| {
+                input_failure(
+                    LimaLifecycleExecutionRefusalCode::InvalidInput,
+                    "the personal-worker store revision is not supported by the Lima executor",
+                )
+            })?;
+        let action = match plan.action() {
+            PersonalWorkerTickAction::StartVm {
+                identity,
+                profile,
+                profile_generation,
+                ..
+            } => HostBrokerAction::Start {
+                identity: identity.clone(),
+                profile: *profile,
+                profile_generation: *profile_generation,
+            },
+            PersonalWorkerTickAction::StopVm {
+                identity,
+                current_profile,
+                profile_generation,
+                target_after_stop,
+            } => HostBrokerAction::Stop {
+                identity: identity.clone(),
+                current_profile: *current_profile,
+                profile_generation: *profile_generation,
+                target_after_stop: *target_after_stop,
+            },
+            PersonalWorkerTickAction::ChangeProfile {
+                identity,
+                from_profile,
+                to_profile,
+                current_generation,
+                next_generation,
+            } => HostBrokerAction::ChangeProfile {
+                identity: identity.clone(),
+                from_profile: *from_profile,
+                to_profile: *to_profile,
+                current_generation: *current_generation,
+                next_generation: *next_generation,
+            },
+            _ => {
+                return Err(input_failure(
+                    LimaLifecycleExecutionRefusalCode::UnsupportedAction,
+                    "the personal-worker tick is not executable by the Lima lifecycle executor",
+                ));
+            }
+        };
+        Ok(Self {
+            state_revision,
+            queue_generation: plan.queue_generation(),
+            decision_at: plan.decision_at(),
+            action,
+        })
+    }
+
     #[must_use]
     pub const fn action(&self) -> &HostBrokerAction {
         &self.action
@@ -455,6 +524,63 @@ impl LimaLifecycleExecutor {
         C: LimaObservationClock,
         J: LimaLifecycleExecutionJournal,
     {
+        let execution_millis = clock
+            .unix_seconds()
+            .map_err(|_| {
+                input_failure(
+                    LimaLifecycleExecutionRefusalCode::ClockFailure,
+                    "the lifecycle execution clock could not be read",
+                )
+            })?
+            .checked_mul(1_000)
+            .ok_or_else(|| {
+                input_failure(
+                    LimaLifecycleExecutionRefusalCode::ClockFailure,
+                    "the lifecycle execution clock exceeded the supported range",
+                )
+            })?;
+        self.execute_with_journal_at(
+            input,
+            observation_source,
+            command_executor,
+            clock,
+            journal,
+            EpochMillis::new(execution_millis).map_err(|_| {
+                input_failure(
+                    LimaLifecycleExecutionRefusalCode::ClockFailure,
+                    "the lifecycle execution clock exceeded the supported range",
+                )
+            })?,
+        )
+    }
+
+    pub(crate) fn validate_input_at(
+        &self,
+        input: &LimaLifecycleExecutionInput<'_>,
+        execution_time: EpochMillis,
+    ) -> Result<(), LimaLifecycleExecutionFailure> {
+        validate_common(self, input, execution_time.get())
+            .and_then(|()| validate_action_preconditions(input))
+            .map_err(|problem| {
+                LimaLifecycleExecutionFailure::from_problem(problem, Default::default())
+            })
+    }
+
+    pub(crate) fn execute_with_journal_at<O, E, C, J>(
+        &self,
+        input: LimaLifecycleExecutionInput<'_>,
+        observation_source: &O,
+        command_executor: &E,
+        clock: &C,
+        journal: &mut J,
+        execution_time: EpochMillis,
+    ) -> Result<LimaLifecycleExecution, LimaLifecycleExecutionFailure>
+    where
+        O: LimaLifecycleObservationSource,
+        E: TimedCommandExecutor,
+        C: LimaObservationClock,
+        J: LimaLifecycleExecutionJournal,
+    {
         let mut evidence = LimaLifecycleExecutionPrivateEvidence::default();
         let result = self.execute_inner(
             input,
@@ -462,6 +588,7 @@ impl LimaLifecycleExecutor {
             command_executor,
             clock,
             journal,
+            execution_time,
             &mut evidence,
         );
         match result {
@@ -476,6 +603,7 @@ impl LimaLifecycleExecutor {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn execute_inner<O, E, C, J>(
         &self,
         input: LimaLifecycleExecutionInput<'_>,
@@ -483,6 +611,7 @@ impl LimaLifecycleExecutor {
         command_executor: &E,
         clock: &C,
         journal: &mut J,
+        execution_time: EpochMillis,
         evidence: &mut LimaLifecycleExecutionPrivateEvidence,
     ) -> Result<(LimaLifecycleExecutionReceipt, LimaInstanceObservationReport), ExecutionProblem>
     where
@@ -491,28 +620,16 @@ impl LimaLifecycleExecutor {
         C: LimaObservationClock,
         J: LimaLifecycleExecutionJournal,
     {
-        let execution_unix_seconds = clock.unix_seconds().map_err(|_| {
-            ExecutionProblem::new(
-                LimaLifecycleExecutionRefusalCode::ClockFailure,
-                LimaLifecycleExecutionPhase::InputValidation,
-                "the lifecycle execution clock could not be read",
-            )
-        })?;
-        validate_common(self, &input, execution_unix_seconds)?;
+        validate_common(self, &input, execution_time.get())?;
+        validate_action_preconditions(&input)?;
         let before_disk = input.current.configured.primary_disk_bytes;
 
         match input.accepted.action() {
             HostBrokerAction::Start {
-                identity,
+                identity: _,
                 profile,
                 profile_generation,
             } => {
-                validate_action_identity(identity, input.lifecycle)?;
-                require_no_reservation(input.lifecycle)?;
-                require_lifecycle_state(input.lifecycle, LimaLifecycleState::Stopped)?;
-                require_profile_and_generation(input.lifecycle, *profile, *profile_generation)?;
-                validate_report(input.current, LimaRuntimeState::Stopped, *profile, None)?;
-
                 self.run_checkpointed_command(
                     command_executor,
                     evidence,
@@ -551,54 +668,16 @@ impl LimaLifecycleExecutor {
                 ))
             }
             HostBrokerAction::Stop {
-                identity,
+                identity: _,
                 current_profile,
                 profile_generation,
                 target_after_stop,
             } => {
-                validate_action_identity(identity, input.lifecycle)?;
-                require_no_reservation(input.lifecycle)?;
-                require_lifecycle_state(input.lifecycle, LimaLifecycleState::Running)?;
-                require_profile_and_generation(
-                    input.lifecycle,
+                let transition = validated_stop_transition(
                     *current_profile,
                     *profile_generation,
+                    *target_after_stop,
                 )?;
-                validate_report(
-                    input.current,
-                    LimaRuntimeState::Running,
-                    *current_profile,
-                    Some(input.expected_persistent_identity),
-                )?;
-                let transition = match target_after_stop {
-                    PersonalWorkerProfile::Stopped => None,
-                    PersonalWorkerProfile::Interactive | PersonalWorkerProfile::Work => {
-                        let target_profile = match target_after_stop {
-                            PersonalWorkerProfile::Interactive => LimaResourceProfile::Interactive,
-                            PersonalWorkerProfile::Work => LimaResourceProfile::Work,
-                            PersonalWorkerProfile::Stopped => unreachable!(),
-                        };
-                        if target_profile == *current_profile {
-                            return Err(ExecutionProblem::new(
-                                LimaLifecycleExecutionRefusalCode::ProfileMismatch,
-                                LimaLifecycleExecutionPhase::InputValidation,
-                                "a stop profile transition must select a different reviewed profile",
-                            ));
-                        }
-                        let next_generation = profile_generation
-                            .get()
-                            .checked_add(1)
-                            .and_then(|value| LimaProfileGeneration::new(value).ok())
-                            .ok_or_else(|| {
-                                ExecutionProblem::new(
-                                    LimaLifecycleExecutionRefusalCode::GenerationMismatch,
-                                    LimaLifecycleExecutionPhase::InputValidation,
-                                    "a stop profile transition generation cannot advance",
-                                )
-                            })?;
-                        Some((target_profile, next_generation))
-                    }
-                };
 
                 self.run_checkpointed_command(
                     command_executor,
@@ -696,41 +775,12 @@ impl LimaLifecycleExecutor {
                 ))
             }
             HostBrokerAction::ChangeProfile {
-                identity,
-                from_profile,
+                identity: _,
+                from_profile: _,
                 to_profile,
-                current_generation,
                 next_generation,
+                current_generation: _,
             } => {
-                validate_action_identity(identity, input.lifecycle)?;
-                require_no_reservation(input.lifecycle)?;
-                require_lifecycle_state(input.lifecycle, LimaLifecycleState::Stopped)?;
-                require_profile_and_generation(
-                    input.lifecycle,
-                    *from_profile,
-                    *current_generation,
-                )?;
-                if from_profile == to_profile {
-                    return Err(ExecutionProblem::new(
-                        LimaLifecycleExecutionRefusalCode::ProfileMismatch,
-                        LimaLifecycleExecutionPhase::InputValidation,
-                        "profile-change action must select a different reviewed profile",
-                    ));
-                }
-                if current_generation.get().checked_add(1) != Some(next_generation.get()) {
-                    return Err(ExecutionProblem::new(
-                        LimaLifecycleExecutionRefusalCode::GenerationMismatch,
-                        LimaLifecycleExecutionPhase::InputValidation,
-                        "profile-change generation must advance by exactly one",
-                    ));
-                }
-                validate_report(
-                    input.current,
-                    LimaRuntimeState::Stopped,
-                    *from_profile,
-                    None,
-                )?;
-
                 self.run_checkpointed_command(
                     command_executor,
                     evidence,
@@ -962,25 +1012,19 @@ fn exact_private_path(path: &Path) -> String {
 fn validate_common(
     executor: &LimaLifecycleExecutor,
     input: &LimaLifecycleExecutionInput<'_>,
-    execution_unix_seconds: u64,
+    execution_millis: u64,
 ) -> Result<(), ExecutionProblem> {
     if input.lifecycle.identity().instance_id().as_str() != executor.instance.as_str()
         || input.current.instance.as_str() != executor.instance.as_str()
         || input.observation_request.instance().as_str() != executor.instance.as_str()
+        || input.observation_request.lima_home() != executor.lima_home
     {
         return Err(ExecutionProblem::new(
             LimaLifecycleExecutionRefusalCode::IdentityMismatch,
             LimaLifecycleExecutionPhase::InputValidation,
-            "broker, lifecycle, observation, and executor instance identities must match exactly",
+            "broker, lifecycle, observation, and executor Lima sources must match exactly",
         ));
     }
-    let execution_millis = execution_unix_seconds.checked_mul(1_000).ok_or_else(|| {
-        ExecutionProblem::new(
-            LimaLifecycleExecutionRefusalCode::ClockFailure,
-            LimaLifecycleExecutionPhase::InputValidation,
-            "the lifecycle execution clock exceeded the supported range",
-        )
-    })?;
     let decision_millis = input.accepted.decision_at.get();
     if execution_millis < decision_millis
         || execution_millis - decision_millis > MAX_LIMA_LIFECYCLE_ACTION_AGE_MILLIS
@@ -1021,6 +1065,7 @@ fn validate_common(
             "the lifecycle observation is not fresh at lifecycle mutation time",
         ));
     }
+    let execution_unix_seconds = execution_millis / 1_000;
     if input.current.timing.freshness_at(execution_unix_seconds) != LimaObservationFreshness::Fresh
     {
         return Err(ExecutionProblem::new(
@@ -1030,6 +1075,115 @@ fn validate_common(
         ));
     }
     Ok(())
+}
+
+fn validate_action_preconditions(
+    input: &LimaLifecycleExecutionInput<'_>,
+) -> Result<(), ExecutionProblem> {
+    match input.accepted.action() {
+        HostBrokerAction::Start {
+            identity,
+            profile,
+            profile_generation,
+        } => {
+            validate_action_identity(identity, input.lifecycle)?;
+            require_no_reservation(input.lifecycle)?;
+            require_lifecycle_state(input.lifecycle, LimaLifecycleState::Stopped)?;
+            require_profile_and_generation(input.lifecycle, *profile, *profile_generation)?;
+            validate_report(input.current, LimaRuntimeState::Stopped, *profile, None)
+        }
+        HostBrokerAction::Stop {
+            identity,
+            current_profile,
+            profile_generation,
+            target_after_stop,
+        } => {
+            validate_action_identity(identity, input.lifecycle)?;
+            require_no_reservation(input.lifecycle)?;
+            require_lifecycle_state(input.lifecycle, LimaLifecycleState::Running)?;
+            require_profile_and_generation(input.lifecycle, *current_profile, *profile_generation)?;
+            validate_report(
+                input.current,
+                LimaRuntimeState::Running,
+                *current_profile,
+                Some(input.expected_persistent_identity),
+            )?;
+            let _ = validated_stop_transition(
+                *current_profile,
+                *profile_generation,
+                *target_after_stop,
+            )?;
+            Ok(())
+        }
+        HostBrokerAction::ChangeProfile {
+            identity,
+            from_profile,
+            to_profile,
+            current_generation,
+            next_generation,
+        } => {
+            validate_action_identity(identity, input.lifecycle)?;
+            require_no_reservation(input.lifecycle)?;
+            require_lifecycle_state(input.lifecycle, LimaLifecycleState::Stopped)?;
+            require_profile_and_generation(input.lifecycle, *from_profile, *current_generation)?;
+            if from_profile == to_profile {
+                return Err(ExecutionProblem::new(
+                    LimaLifecycleExecutionRefusalCode::ProfileMismatch,
+                    LimaLifecycleExecutionPhase::InputValidation,
+                    "profile-change action must select a different reviewed profile",
+                ));
+            }
+            if current_generation.get().checked_add(1) != Some(next_generation.get()) {
+                return Err(ExecutionProblem::new(
+                    LimaLifecycleExecutionRefusalCode::GenerationMismatch,
+                    LimaLifecycleExecutionPhase::InputValidation,
+                    "profile-change generation must advance by exactly one",
+                ));
+            }
+            validate_report(
+                input.current,
+                LimaRuntimeState::Stopped,
+                *from_profile,
+                None,
+            )
+        }
+        _ => Err(ExecutionProblem::new(
+            LimaLifecycleExecutionRefusalCode::UnsupportedAction,
+            LimaLifecycleExecutionPhase::InputValidation,
+            "the accepted broker action is outside the Lima lifecycle executor boundary",
+        )),
+    }
+}
+
+fn validated_stop_transition(
+    current_profile: LimaResourceProfile,
+    profile_generation: LimaProfileGeneration,
+    target_after_stop: PersonalWorkerProfile,
+) -> Result<Option<(LimaResourceProfile, LimaProfileGeneration)>, ExecutionProblem> {
+    let target_profile = match target_after_stop {
+        PersonalWorkerProfile::Stopped => return Ok(None),
+        PersonalWorkerProfile::Interactive => LimaResourceProfile::Interactive,
+        PersonalWorkerProfile::Work => LimaResourceProfile::Work,
+    };
+    if target_profile == current_profile {
+        return Err(ExecutionProblem::new(
+            LimaLifecycleExecutionRefusalCode::ProfileMismatch,
+            LimaLifecycleExecutionPhase::InputValidation,
+            "a stop profile transition must select a different reviewed profile",
+        ));
+    }
+    let next_generation = profile_generation
+        .get()
+        .checked_add(1)
+        .and_then(|value| LimaProfileGeneration::new(value).ok())
+        .ok_or_else(|| {
+            ExecutionProblem::new(
+                LimaLifecycleExecutionRefusalCode::GenerationMismatch,
+                LimaLifecycleExecutionPhase::InputValidation,
+                "a stop profile transition generation cannot advance",
+            )
+        })?;
+    Ok(Some((target_profile, next_generation)))
 }
 
 fn validate_action_identity(

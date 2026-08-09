@@ -101,6 +101,8 @@ pub mod operator_status_service;
 pub mod ownership;
 /// Pure composition of durable queue, Lima lifecycle, and runner-readiness evidence.
 pub mod personal_worker_host_broker;
+/// Same-lock durable execution of one exact personal-worker Lima lifecycle tick.
+pub mod personal_worker_lima_adapter;
 /// Pure, path-private durable ownership and crash-phase authority for personal-worker Lima.
 pub mod personal_worker_lima_authority;
 /// Read-only Mac/Lima observation composed for personal-worker planning.
