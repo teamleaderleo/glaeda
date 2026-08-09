@@ -798,8 +798,23 @@ mod tests {
             other => panic!("unsupported package-probe architecture: {other}"),
         };
         let bytes = std::fs::read("/etc/ld.so.cache").expect("read Noble loader cache");
-        let parsed = parse_linux_dynamic_loader_cache(&bytes, architecture)
-            .expect("parse Noble loader cache");
+        let parsed =
+            parse_linux_dynamic_loader_cache(&bytes, architecture).unwrap_or_else(|error| {
+                if error.kind == LinuxDynamicLoaderCacheErrorKind::Architecture {
+                    let entry_count =
+                        usize::try_from(read_u32(&bytes, 20).expect("cache entry count"))
+                            .expect("cache entry count usize");
+                    assert!(entry_count <= MAX_ENTRIES, "bounded cache entry count");
+                    let mut cache_id_counts = std::collections::BTreeMap::new();
+                    for index in 0..entry_count {
+                        let cache_id = read_i32(&bytes, HEADER_BYTES + index * ENTRY_BYTES)
+                            .expect("cache entry id");
+                        *cache_id_counts.entry(cache_id).or_insert(0_usize) += 1;
+                    }
+                    panic!("parse Noble loader cache; numeric cache IDs: {cache_id_counts:x?}");
+                }
+                panic!("parse Noble loader cache: {error:?}");
+            });
         assert!(!parsed.entries().is_empty());
     }
 
