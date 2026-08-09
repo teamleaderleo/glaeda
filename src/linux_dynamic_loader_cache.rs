@@ -293,7 +293,7 @@ impl std::error::Error for LinuxDynamicLoaderCacheResolutionError {}
 ///
 /// # Errors
 ///
-/// Returns a fixed path-free error for architecture mismatch, a noncanonical library basename,
+/// Returns a fixed path-free error for architecture mismatch, an invalid library basename,
 /// or absence of a cache entry usable by the supplied capability profile.
 pub fn resolve_linux_dynamic_loader_cache(
     cache: &LinuxDynamicLoaderCache,
@@ -305,14 +305,17 @@ pub fn resolve_linux_dynamic_loader_cache(
     }
     validate_component(library_name, MAX_LIBRARY_NAME_BYTES)
         .map_err(|_| resolution_name_error())?;
+    cache_library_cmp(library_name, library_name).map_err(|_| resolution_name_error())?;
 
     let mut best_named: Option<(&LinuxDynamicLoaderCacheEntry, u8)> = None;
     let mut baseline = None;
-    for entry in cache
-        .entries
-        .iter()
-        .filter(|entry| entry.library_name == library_name)
-    {
+    for entry in &cache.entries {
+        if cache_library_cmp(library_name, &entry.library_name)
+            .map_err(|_| resolution_name_error())?
+            != Ordering::Equal
+        {
+            continue;
+        }
         let Some(name) = entry.hwcap_name.as_deref() else {
             baseline.get_or_insert(entry);
             continue;
@@ -465,6 +468,7 @@ pub fn parse_linux_dynamic_loader_cache(
             MAX_LIBRARY_NAME_BYTES,
         )?;
         validate_component(library_name, MAX_LIBRARY_NAME_BYTES)?;
+        cache_library_cmp(library_name, library_name)?;
         let library_path = read_cache_string(
             bytes,
             usize::try_from(read_u32(bytes, offset + 8)?).map_err(|_| size_error())?,
@@ -955,7 +959,7 @@ const fn resolution_name_error() -> LinuxDynamicLoaderCacheResolutionError {
     resolution_error(
         LinuxDynamicLoaderCacheResolutionErrorKind::InvalidLibraryName,
         "dynamic_loader_cache_resolution_invalid_name",
-        "dynamic-loader cache lookup requires one canonical library basename",
+        "dynamic-loader cache lookup requires one valid bounded library basename",
     )
 }
 
@@ -1119,6 +1123,27 @@ mod tests {
             LinuxDynamicLoaderCacheSelection::Baseline
         );
 
+        let numeric_alias_bytes = fixture(
+            PersonalWorkerRuntimeArchitecture::Aarch64,
+            &[FixtureEntry::plain(
+                "lib1.so",
+                "/lib/aarch64-linux-gnu/lib1.so",
+            )],
+            &[],
+        );
+        let numeric_alias_cache = parse_linux_dynamic_loader_cache(
+            &numeric_alias_bytes,
+            PersonalWorkerRuntimeArchitecture::Aarch64,
+        )
+        .expect("numeric cache name");
+        let numeric_alias = resolve_linux_dynamic_loader_cache(
+            &numeric_alias_cache,
+            LinuxDynamicLoaderCapabilityProfile::Aarch64Baseline,
+            "lib01.so",
+        )
+        .expect("glibc comparison-equivalent lookup name");
+        assert_eq!(numeric_alias.library_name, "lib1.so");
+
         for (result, expected) in [
             (
                 resolve_linux_dynamic_loader_cache(
@@ -1263,6 +1288,24 @@ mod tests {
                 PersonalWorkerRuntimeArchitecture::X86_64,
             )
             .expect_err("numeric comparison alias")
+            .kind,
+            LinuxDynamicLoaderCacheErrorKind::Format,
+        );
+
+        let numeric_overflow = fixture(
+            PersonalWorkerRuntimeArchitecture::X86_64,
+            &[FixtureEntry::plain(
+                "lib2147483648.so",
+                "/lib/x86_64-linux-gnu/lib2147483648.so",
+            )],
+            &[],
+        );
+        assert_eq!(
+            parse_linux_dynamic_loader_cache(
+                &numeric_overflow,
+                PersonalWorkerRuntimeArchitecture::X86_64,
+            )
+            .expect_err("numeric comparator overflow")
             .kind,
             LinuxDynamicLoaderCacheErrorKind::Format,
         );
