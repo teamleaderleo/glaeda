@@ -514,12 +514,13 @@ pub fn plan_personal_worker_verification(
         return Err(cache_mismatch());
     }
     let envelope_capabilities = rust_envelope.required_capabilities();
-    if envelope_capabilities.len() != profile.required_capabilities().len()
-        || !envelope_capabilities
-            .iter()
-            .zip(profile.required_capabilities())
-            .all(|(envelope, registered)| envelope == &registered.capability)
-    {
+    let mut registered_capabilities = profile
+        .required_capabilities()
+        .iter()
+        .map(|required| required.capability.clone())
+        .collect::<Vec<_>>();
+    registered_capabilities.sort();
+    if envelope_capabilities != registered_capabilities {
         return Err(profile_mismatch());
     }
 
@@ -1020,6 +1021,15 @@ mod tests {
         assert_eq!(
             report.rust_envelope().resources().reserved_resources,
             limits(4_000, 4 * GIB)
+        );
+        assert_eq!(
+            report
+                .rust_envelope()
+                .required_capabilities()
+                .iter()
+                .map(|capability| capability.as_str())
+                .collect::<Vec<_>>(),
+            ["cargo", "clippy", "rustc", "rustfmt"]
         );
         assert_eq!(
             digest_rust_verification_envelope(report.rust_envelope())

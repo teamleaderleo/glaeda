@@ -785,6 +785,7 @@ mod tests {
                 2_048,
                 2,
                 2,
+                ["cargo", "clippy", "rustc", "rustfmt"].as_slice(),
                 "sha256:a8169b6dd94905418011fc04fbe01a1c94bc730a94498eab64805d0cbe8940c7",
             ),
             (
@@ -794,6 +795,7 @@ mod tests {
                 512,
                 1,
                 1,
+                ["cargo", "rustc"].as_slice(),
                 "sha256:06f63fd4887beb67ad749469d0d5cf071604c6aa9112d603b07a84ca605eda9f",
             ),
             (
@@ -803,10 +805,21 @@ mod tests {
                 512,
                 1,
                 1,
+                ["cargo", "rustc"].as_slice(),
                 "sha256:a4a1e50e5df93cf7d66ecabe24be8587fce4d5752b2f1e825c72d09ff604df2e",
             ),
         ];
-        for (profile_id, cpu, memory, pids, build_jobs, test_threads, expected_digest) in expected {
+        for (
+            profile_id,
+            cpu,
+            memory,
+            pids,
+            build_jobs,
+            test_threads,
+            expected_capabilities,
+            expected_digest,
+        ) in expected
+        {
             let profile_id = VerificationProfileId::parse(profile_id).expect("profile ID");
             let envelope = registry
                 .resolve_rust_envelope(&profile_id, rust_source(), namespace.clone())
@@ -838,6 +851,14 @@ mod tests {
             assert_eq!(
                 envelope.cache().cargo_target_directory.namespace_digest,
                 namespace
+            );
+            assert_eq!(
+                envelope
+                    .required_capabilities()
+                    .iter()
+                    .map(|capability| capability.as_str())
+                    .collect::<Vec<_>>(),
+                expected_capabilities
             );
             assert_eq!(
                 envelope.resources().required_worker_profile,
