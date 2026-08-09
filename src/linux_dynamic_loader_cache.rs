@@ -273,6 +273,7 @@ pub fn parse_linux_dynamic_loader_cache(
                 u16::try_from((raw_hwcap >> 32) & HWCAP_ISA_MASK).map_err(|_| format_error())?;
             (Some(name), isa_level)
         };
+        validate_capability(architecture, hwcap_name.as_deref(), isa_level)?;
 
         let duplicate_key = (
             flags,
@@ -344,6 +345,29 @@ fn cache_id_is_compatible(
         (PersonalWorkerRuntimeArchitecture::X86_64, GENERIC_ELF_LIBC6_CACHE_ID) => Ok(false),
         _ => Err(architecture_error()),
     }
+}
+
+fn validate_capability(
+    architecture: PersonalWorkerRuntimeArchitecture,
+    hwcap_name: Option<&str>,
+    isa_level: u16,
+) -> Result<(), LinuxDynamicLoaderCacheError> {
+    match architecture {
+        PersonalWorkerRuntimeArchitecture::X86_64 => {
+            if isa_level > 3
+                || hwcap_name
+                    .is_some_and(|name| !matches!(name, "x86-64-v2" | "x86-64-v3" | "x86-64-v4"))
+            {
+                return Err(unsupported_capability_error());
+            }
+        }
+        PersonalWorkerRuntimeArchitecture::Aarch64 => {
+            if hwcap_name.is_some() || isa_level != 0 {
+                return Err(unsupported_capability_error());
+            }
+        }
+    }
+    Ok(())
 }
 
 struct ParsedExtensions {
@@ -474,7 +498,11 @@ fn validate_entry_order(entries: &[ParsedCacheEntry]) -> Result<(), LinuxDynamic
         match cache_library_cmp(&previous.library_name, &current.library_name)? {
             Ordering::Less => return Err(format_error()),
             Ordering::Greater => continue,
-            Ordering::Equal => {}
+            Ordering::Equal => {
+                if previous.library_name != current.library_name {
+                    return Err(format_error());
+                }
+            }
         }
         match previous.cache_id.cmp(&current.cache_id) {
             Ordering::Less => return Err(format_error()),
@@ -760,6 +788,73 @@ mod tests {
                 .expect_err("unreviewed cache ID")
                 .kind,
             LinuxDynamicLoaderCacheErrorKind::Architecture,
+        );
+    }
+
+    #[test]
+    fn architecture_capabilities_and_numeric_name_aliases_fail_closed() {
+        let unknown_x86_hwcap = fixture(
+            PersonalWorkerRuntimeArchitecture::X86_64,
+            &[FixtureEntry::hwcap(
+                "libc.so.6",
+                "/lib/x86_64-linux-gnu/glibc-hwcaps/future/libc.so.6",
+                0,
+                0,
+            )],
+            &["future"],
+        );
+        let excessive_x86_isa = fixture(
+            PersonalWorkerRuntimeArchitecture::X86_64,
+            &[FixtureEntry::hwcap(
+                "libc.so.6",
+                "/lib/x86_64-linux-gnu/glibc-hwcaps/x86-64-v4/libc.so.6",
+                0,
+                4,
+            )],
+            &["x86-64-v4"],
+        );
+        let aarch64_named_hwcap = fixture(
+            PersonalWorkerRuntimeArchitecture::Aarch64,
+            &[FixtureEntry::hwcap(
+                "libc.so.6",
+                "/lib/aarch64-linux-gnu/glibc-hwcaps/future/libc.so.6",
+                0,
+                0,
+            )],
+            &["future"],
+        );
+        for (bytes, architecture) in [
+            (unknown_x86_hwcap, PersonalWorkerRuntimeArchitecture::X86_64),
+            (excessive_x86_isa, PersonalWorkerRuntimeArchitecture::X86_64),
+            (
+                aarch64_named_hwcap,
+                PersonalWorkerRuntimeArchitecture::Aarch64,
+            ),
+        ] {
+            assert_eq!(
+                parse_linux_dynamic_loader_cache(&bytes, architecture)
+                    .expect_err("unselectable architecture capability")
+                    .kind,
+                LinuxDynamicLoaderCacheErrorKind::UnsupportedCapability,
+            );
+        }
+
+        let numeric_alias = fixture(
+            PersonalWorkerRuntimeArchitecture::X86_64,
+            &[
+                FixtureEntry::plain("lib1.so", "/lib/x86_64-linux-gnu/lib1.so"),
+                FixtureEntry::plain("lib01.so", "/lib/x86_64-linux-gnu/lib01.so"),
+            ],
+            &[],
+        );
+        assert_eq!(
+            parse_linux_dynamic_loader_cache(
+                &numeric_alias,
+                PersonalWorkerRuntimeArchitecture::X86_64,
+            )
+            .expect_err("numeric comparison alias")
+            .kind,
+            LinuxDynamicLoaderCacheErrorKind::Format,
         );
     }
 
