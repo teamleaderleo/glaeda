@@ -510,7 +510,8 @@ fn enumerate_fragment_names(
         if entry_count > MAX_DIRECTORY_ENTRY_COUNT {
             return Err(invalid_error());
         }
-        if !bytes.ends_with(b".conf") {
+        // glibc's ordinary `glob` expansion does not select leading-dot entries for `*.conf`.
+        if bytes.first() == Some(&b'.') || !bytes.ends_with(b".conf") {
             continue;
         }
         if bytes.is_empty()
@@ -949,6 +950,13 @@ mod tests {
         );
         observe_at(&fixture.root, owner, &project(), architecture, || {})
             .expect("observe copied loader state");
+
+        let hidden_fragment = fixture.config_dir().join(".not-globbed.conf");
+        stdfs::write(&hidden_fragment, b"/tmp/not-loader-authority\n")
+            .expect("create hidden non-glob fragment");
+        observe_at(&fixture.root, owner, &project(), architecture, || {})
+            .expect("ignore hidden fragment outside the fixed glob");
+        stdfs::remove_file(hidden_fragment).expect("remove hidden non-glob fragment");
 
         fixture.set_mode(ROOT_CONFIG, 0o0664);
         let writable = observe_at(&fixture.root, owner, &project(), architecture, || {})
