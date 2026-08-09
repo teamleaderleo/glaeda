@@ -137,8 +137,9 @@ Earlier disposable runs were intentionally allowed to fail and corrected these f
   later descriptor-bound directory and library proof mandatory.
 - Noble's root loader configuration uses exactly one semantic space in
   `include /etc/ld.so.conf.d/*.conf` and ends with two line feeds. Alternate `include` directives
-  are unsafe search authority even when their whitespace is otherwise noncanonical, so unsafe
-  classification must precede the generic active-line format check.
+  preceded by leading SP, HT, VT, or FF are unsafe search authority even though their whitespace
+  is noncanonical; CR remains a whole-file format refusal. Semantic unsafe-search classification
+  must therefore precede the generic active-line format check.
 
 These are contract changes, not compatibility relaxations: each ambient or mutable edge is now
 either made exact or remains blocking.

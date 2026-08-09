@@ -185,7 +185,9 @@ pub fn parse_linux_dynamic_loader_config(
             includes_system_fragments = true;
             continue;
         }
-        if line.starts_with("include") {
+        let semantic_line =
+            line.trim_start_matches(|character: char| character.is_ascii_whitespace());
+        if semantic_line.starts_with("include") {
             return Err(unsafe_search_error());
         }
         if line.bytes().any(|byte| !matches!(byte, b'!'..=b'~')) {
@@ -321,6 +323,30 @@ mod tests {
         for (bytes, architecture, role, expected) in [
             (
                 b"include /tmp/*.conf\n".as_slice(),
+                PersonalWorkerRuntimeArchitecture::X86_64,
+                LinuxDynamicLoaderConfigRole::Root,
+                LinuxDynamicLoaderConfigErrorKind::UnsafeSearch,
+            ),
+            (
+                b"  include /tmp/*.conf\n".as_slice(),
+                PersonalWorkerRuntimeArchitecture::X86_64,
+                LinuxDynamicLoaderConfigRole::Root,
+                LinuxDynamicLoaderConfigErrorKind::UnsafeSearch,
+            ),
+            (
+                b"\tinclude /etc/ld.so.conf.d/*.conf\n".as_slice(),
+                PersonalWorkerRuntimeArchitecture::X86_64,
+                LinuxDynamicLoaderConfigRole::Root,
+                LinuxDynamicLoaderConfigErrorKind::UnsafeSearch,
+            ),
+            (
+                b"\x0binclude /tmp/*.conf\n".as_slice(),
+                PersonalWorkerRuntimeArchitecture::X86_64,
+                LinuxDynamicLoaderConfigRole::Root,
+                LinuxDynamicLoaderConfigErrorKind::UnsafeSearch,
+            ),
+            (
+                b"\x0cinclude /tmp/*.conf\n".as_slice(),
                 PersonalWorkerRuntimeArchitecture::X86_64,
                 LinuxDynamicLoaderConfigRole::Root,
                 LinuxDynamicLoaderConfigErrorKind::UnsafeSearch,
