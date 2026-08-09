@@ -445,6 +445,7 @@ if [[ -L $probe_seccomp_profile ]] || [[ ! -f $probe_seccomp_profile ]]; then
   printf 'error: exact packaged seccomp profile is absent or not a regular file\n' >&2
   exit 1
 fi
+seccomp_sha=$(/usr/bin/sha256sum "$probe_seccomp_profile" | /usr/bin/awk '{ print $1 }')
 read -r seccomp_owner seccomp_group seccomp_mode seccomp_links seccomp_size < <(
   /usr/bin/stat -Lc '%u %g %a %h %s' "$probe_seccomp_profile"
 )
@@ -453,10 +454,10 @@ if [[ $seccomp_owner != 0 ]] || [[ $seccomp_group != 0 ]] ||
   (( seccomp_size == 0 || seccomp_size > 1048576 )); then
   printf 'seccomp_owner=%s seccomp_group=%s seccomp_mode=%s seccomp_links=%s seccomp_size=%s\n' \
     "$seccomp_owner" "$seccomp_group" "$seccomp_mode" "$seccomp_links" "$seccomp_size" >&2
+  printf 'seccomp_sha256=%s\n' "$seccomp_sha" >&2
   printf 'error: exact packaged seccomp profile metadata is unsafe or unbounded\n' >&2
   exit 1
 fi
-seccomp_sha=$(/usr/bin/sha256sum "$probe_seccomp_profile" | /usr/bin/awk '{ print $1 }')
 if [[ ! $seccomp_sha =~ ^[0-9a-f]{64}$ ]]; then
   printf 'error: exact packaged seccomp profile digest is noncanonical\n' >&2
   exit 1
