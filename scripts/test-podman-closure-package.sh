@@ -538,27 +538,46 @@ if [[ ${#network_entries[@]} -ne 2 ]] ||
 fi
 printf 'network_state=precreated-and-stable entries=2\n'
 
-pause_file=$(/usr/bin/find "$XDG_RUNTIME_DIR" -type f -name pause.pid -print -quit)
-if [[ -z $pause_file ]]; then
-  printf 'rootless_info=success pause=not-created-by-info\n'
-  exit 0
+pause_file="$XDG_RUNTIME_DIR/libpod/tmp/pause.pid"
+if [[ -L $pause_file ]] || [[ ! -f $pause_file ]]; then
+  printf 'error: first use did not create the exact rootless pause PID file\n' >&2
+  exit 1
 fi
+read -r pause_owner pause_group pause_mode pause_links pause_size pause_identity pause_kind < <(
+  /usr/bin/stat -Lc '%u %g %a %h %s %d:%i %F' "$pause_file"
+)
 pause_pid=$(/usr/bin/tr -d '\n' < "$pause_file")
-if [[ ! $pause_pid =~ ^[1-9][0-9]*$ ]] || [[ ! -r /proc/$pause_pid/status ]]; then
-  printf 'error: pause PID evidence is invalid\n' >&2
+if [[ $pause_owner != "$PROBE_UID" ]] || [[ $pause_group != "$PROBE_GID" ]] ||
+  [[ $pause_mode != 600 ]] || [[ $pause_links != 1 ]] ||
+  (( pause_size == 0 || pause_size > 20 )) || [[ $pause_kind != 'regular file' ]] ||
+  [[ ! $pause_pid =~ ^[1-9][0-9]*$ ]] || [[ ! -r /proc/$pause_pid/status ]]; then
+  printf 'error: pause PID file identity or process evidence is invalid\n' >&2
   exit 1
 fi
 pause_uid=$(/usr/bin/awk '/^Uid:/ { print $2 }' "/proc/$pause_pid/status")
-if [[ $pause_uid != "$PROBE_UID" ]] ||
-  ! /usr/bin/grep -Fq "/$PROBE_UNIT" "/proc/$pause_pid/cgroup"; then
+mapfile -t pause_cgroups < <(
+  /usr/bin/awk -F: '$1 == "0" && $2 == "" { print $3 }' "/proc/$pause_pid/cgroup"
+)
+mapfile -t service_cgroups < <(
+  /usr/bin/awk -F: '$1 == "0" && $2 == "" { print $3 }' /proc/self/cgroup
+)
+if [[ $pause_uid != "$PROBE_UID" ]] || [[ ${#pause_cgroups[@]} -ne 1 ]] ||
+  [[ ${#service_cgroups[@]} -ne 1 ]] || [[ ${pause_cgroups[0]} != "${service_cgroups[0]}" ]] ||
+  [[ ${service_cgroups[0]} != "/system.slice/$PROBE_UNIT" ]]; then
   printf 'error: rootless pause process escaped the disposable service cgroup\n' >&2
   exit 1
 fi
-printf 'rootless_info=success pause=contained\n'
+printf '%s %s\n' "$pause_pid" "$pause_identity" > "$PROBE_PAUSE_RECORD"
+printf '%s\n' "${service_cgroups[0]}" > "$PROBE_SERVICE_CGROUP_RECORD"
+printf 'rootless_info=success pause=contained crash=armed\n'
+kill -KILL "$BASHPID"
+printf 'error: disposable crash injection unexpectedly returned\n' >&2
+exit 1
 USER_PROBE
 chmod 0555 "$probe_root/user-probe.sh"
 
 probe_unit_owned=1
+set +e
 /usr/bin/systemd-run \
   --wait \
   --collect \
@@ -581,7 +600,10 @@ probe_unit_owned=1
   PROBE_GRAPHROOT="$probe_root/graphroot" \
   PROBE_INFO="$probe_root/runtime/info.json" \
   PROBE_NETWORK="$probe_root/network" \
+  PROBE_PAUSE_RECORD="$probe_root/runtime/pause.record" \
   PROBE_RUNROOT="$probe_root/runtime/containers" \
+  PROBE_SERVICE_CGROUP_RECORD="$probe_root/runtime/service.cgroup" \
+  PROBE_GID="$probe_gid" \
   PROBE_UID="$probe_uid" \
   PROBE_UNIT="$probe_unit" \
   REGISTRY_AUTH_FILE="$probe_root/auth/auth.json" \
@@ -590,10 +612,84 @@ probe_unit_owned=1
   XDG_CONFIG_HOME="$probe_root/empty-xdg" \
   XDG_RUNTIME_DIR="$probe_root/runtime" \
   /usr/bin/bash "$probe_root/user-probe.sh"
+probe_status=$?
+set -e
+
+if (( probe_status != 255 )); then
+  printf 'probe_status=%s\n' "$probe_status" >&2
+  printf 'error: disposable pause-process crash injection did not report exact SIGKILL status\n' >&2
+  exit 1
+fi
+
+service_cgroup=$(< "$probe_root/runtime/service.cgroup")
+if [[ $service_cgroup != "/system.slice/$probe_unit" ]] ||
+  [[ -e "/sys/fs/cgroup$service_cgroup" ]] || [[ -L "/sys/fs/cgroup$service_cgroup" ]]; then
+  printf 'error: crashed disposable service cgroup was not collected exactly\n' >&2
+  exit 1
+fi
+if ! unit_load_state=$(/usr/bin/systemctl show --property=LoadState --value "$probe_unit" 2>/dev/null) ||
+  [[ $unit_load_state != not-found ]]; then
+  printf 'error: crashed disposable service unit remained after collection\n' >&2
+  exit 1
+fi
 probe_unit_owned=0
 
 if /usr/bin/pgrep -u "$probe_uid" >/dev/null 2>&1; then
-  printf 'error: rootless first-use probe left an idle process\n' >&2
+  printf 'error: crashed rootless first-use probe left an idle process\n' >&2
+  exit 1
+fi
+
+pause_parent="$probe_root/runtime/libpod/tmp"
+pause_file="$pause_parent/pause.pid"
+for pause_directory in \
+  "$probe_root/runtime" \
+  "$probe_root/runtime/libpod" \
+  "$pause_parent"; do
+  if [[ -L $pause_directory ]] || [[ ! -d $pause_directory ]]; then
+    printf 'error: pause recovery directory is absent or rebound\n' >&2
+    exit 1
+  fi
+  read -r directory_owner directory_group directory_mode < <(
+    /usr/bin/stat -Lc '%u %g %a' "$pause_directory"
+  )
+  if [[ $directory_owner != "$probe_uid" ]] || [[ $directory_group != "$probe_gid" ]] ||
+    (( (8#$directory_mode & 0022) != 0 )); then
+    printf 'error: pause recovery directory metadata is unsafe\n' >&2
+    exit 1
+  fi
+done
+read -r recorded_pause_pid recorded_pause_identity record_extra < "$probe_root/runtime/pause.record"
+if [[ -n ${record_extra:-} ]] || [[ ! $recorded_pause_pid =~ ^[1-9][0-9]*$ ]] ||
+  [[ ! $recorded_pause_identity =~ ^[0-9]+:[0-9]+$ ]] ||
+  [[ -L $pause_file ]] || [[ ! -f $pause_file ]]; then
+  printf 'error: stale pause recovery record or fixed PID file is unsafe\n' >&2
+  exit 1
+fi
+read -r pause_owner pause_group pause_mode pause_links pause_size pause_identity pause_kind < <(
+  /usr/bin/stat -Lc '%u %g %a %h %s %d:%i %F' "$pause_file"
+)
+pause_pid=$(< "$pause_file")
+if [[ $pause_owner != "$probe_uid" ]] || [[ $pause_group != "$probe_gid" ]] ||
+  [[ $pause_mode != 600 ]] || [[ $pause_links != 1 ]] ||
+  (( pause_size == 0 || pause_size > 20 )) || [[ $pause_kind != 'regular file' ]] ||
+  [[ $pause_identity != "$recorded_pause_identity" ]] || [[ $pause_pid != "$recorded_pause_pid" ]]; then
+  printf 'error: stale pause PID file no longer matches the pre-crash exact inode\n' >&2
+  exit 1
+fi
+/usr/bin/rm -- "$pause_file"
+/usr/bin/env -i PATH=/usr/bin /usr/bin/python3 -I -S -c '
+import os
+import sys
+
+fd = os.open(sys.argv[1], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+try:
+    os.fsync(fd)
+finally:
+    os.close(fd)
+' "$pause_parent"
+if [[ -e $pause_file ]] || [[ -L $pause_file ]] ||
+  /usr/bin/find "$probe_root/runtime" -type f -name pause.pid -print -quit | /usr/bin/grep -q .; then
+  printf 'error: stale pause PID file remained after exact recovery cleanup\n' >&2
   exit 1
 fi
 if /usr/bin/findmnt -rn -o TARGET | /usr/bin/grep -Fq "$probe_root"; then
@@ -601,4 +697,5 @@ if /usr/bin/findmnt -rn -o TARGET | /usr/bin/grep -Fq "$probe_root"; then
   exit 1
 fi
 
+printf 'pause_crash_recovery=stale-pid-removed-and-synced\n'
 printf 'podman_closure_package_probe=pass\n'

@@ -5,10 +5,10 @@ and does not authorize a physical Lima or host mutation.
 
 ## Exact evidence
 
-- Fixture commit: `fe75d821eff323cfb07b0e44cc7ddbdc131cb959`
-- Workflow run: [31308056627](https://github.com/teamleaderleo/smolrunner/actions/runs/31308056627)
-- ARM64 job: [93231445385](https://github.com/teamleaderleo/smolrunner/actions/runs/31308056627/job/93231445385)
-- x86_64 job: [93231445377](https://github.com/teamleaderleo/smolrunner/actions/runs/31308056627/job/93231445377)
+- Fixture commit: `81bac8c2672ae04e6750feeb4fa896d3f320dbaa`
+- Workflow run: [31313212518](https://github.com/teamleaderleo/smolrunner/actions/runs/31313212518)
+- ARM64 job: [93244186699](https://github.com/teamleaderleo/smolrunner/actions/runs/31313212518/job/93244186699)
+- x86_64 job: [93244186729](https://github.com/teamleaderleo/smolrunner/actions/runs/31313212518/job/93244186729)
 - Date: 2026-08-09
 - Result: both jobs passed on fresh GitHub-hosted Ubuntu 24.04 VMs.
 
@@ -66,12 +66,19 @@ The exact fixture proves only these facts on both admitted architectures:
    replaces/resizes them nor creates another network entry.
 8. First use reaches the rootless pause-process path. The deliberately absent per-attempt user D-Bus
    socket makes the systemd scope move fail, and the pause process remains inside the exact
-   disposable service cgroup. After the service exits, no process for the probe UID and no mount
-   beneath the probe root remains.
+   disposable service cgroup. The fixture records the exact runner-owned single-link `0600`
+   `pause.pid` inode and canonical numeric contents, then deliberately SIGKILLs the service main.
+   Packaged `systemd-run --wait --collect --pipe` reports that signalled unit as status 255 on both
+   architectures; collection removes the exact service cgroup and unit and leaves no process for
+   the probe UID. Only then does the root fixture revalidate the fixed run-private hierarchy and
+   the same stale PID-file inode, remove that fixed file without signalling its numeric PID, fsync
+   the exact parent directory, and prove that no PID file or mount beneath the probe root remains.
 
 The successful log markers were `git_materializer=closed`, `target_tmpfs=bounded`,
 `podman_cli_surface=expected`, `network_state=precreated-and-stable`,
-`rootless_info=success pause=contained`, and `podman_closure_package_probe=pass`.
+`rootless_info=success pause=contained crash=armed`,
+`pause_crash_recovery=stale-pid-removed-and-synced`, and
+`podman_closure_package_probe=pass`.
 
 ## Corrections learned from fail-closed probes
 
@@ -87,6 +94,9 @@ Earlier disposable runs were intentionally allowed to fail and corrected these f
 - Noble Podman 4.9.3 exposes `--passwd` only on `run`, not `create`; the stopped-container flow
   must instead use explicit numeric keep-id mapping and fail closed on generated passwd/group
   state.
+- When a transient unit's main is deliberately killed by SIGKILL, packaged
+  `systemd-run --wait --collect --pipe` returns status 255 rather than the shell-style status 137;
+  the journal/service result must remain the authoritative crash classification.
 
 These are contract changes, not compatibility relaxations: each ambient or mutable edge is now
 either made exact or remains blocking.
@@ -104,8 +114,8 @@ This fixture does **not** prove any of the following and must not be cited as if
   or alternate runtimes remain unexecuted through a complete container attempt;
 - the final delegated cgroup hierarchy, exact CPU/memory/swap/PID controls, control rereads,
   aggregate tmpfs charging, or group-empty cleanup implementation;
-- durable attempt journaling, crash recovery, cancellation, reservation/deadline recheck,
-  ownership persistence, or ambiguous-cleanup handling;
+- production durable attempt journaling, crash recovery, cancellation, reservation/deadline
+  recheck, ownership persistence, authoritative cgroup/file handles, or ambiguous-cleanup handling;
 - the Rust R01 readiness object, R02 hostile-payload executor, R03 public receipt, B06 service, B07
   CLI, or a physical stopped-VM run-once acceptance.
 

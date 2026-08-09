@@ -477,9 +477,11 @@ temporary fixture, and each test proves the marker remains absent.
   `--pull=never` without writes to the image store.
 - Decide whether the host catatonit edge is retained or replaced by an init inside the immutable
   image; either choice is exact and non-optional.
-- Prove the packaged pre-exec indicator/compiled hook paths and rootless pause re-exec/fallback paths;
-  verify that the exact absent user-bus socket prevents a systemd move without delaying or failing
-  Podman, and that crash recovery leaves no pause process or PID file.
+- Extend the disposable proof of the packaged pre-exec indicator/compiled hook paths, rootless pause
+  re-exec/fallback path, exact absent user-bus refusal, service-cgroup containment, and stale
+  PID-file cleanup into production durable ownership, journal checkpoints, authoritative handles,
+  ambiguous-crash classification, and whole-attempt recovery. A numeric PID never authorizes a
+  signal or cleanup target.
 - Extend the proven `cgroupfs` pre-created outer/payload hierarchy and disposable shell-held
   leaf-`cgroup.kill` abort into sealed authoritative handle retention, whole-attempt hostile kill,
   crash recovery, and cleanup classification without Podman/systemd creating an unowned sibling
