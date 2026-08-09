@@ -240,7 +240,9 @@ or image string.
   --cpus=<applied-limit>
   --env-host=false
   --http-proxy=false
-  --log-driver=none
+  --log-driver=k8s-file
+  --log-opt=path=<attempt-private-log>
+  --log-opt=max-size=<bounded-log-bytes>
   --privileged=false
   --systemd=false
   --restart=no
@@ -271,10 +273,8 @@ executes no repository code and is never a verification success.
 
 Before `image inspect`, `create`, `inspect`, or `start`, the launcher joins the already-created
 outer attempt cgroup; it supplies null stdin, pipes only bounded stdout/stderr, and allocates no TTY.
-For Podman 4.9.3, `start --attach` internally attaches stdin even when `--interactive` is absent, so
-the start process's file descriptor 0 must be the already-open `/dev/null`; an inherited service,
-terminal, or caller pipe is forbidden because it can keep the attach session alive after payload
-exit.
+Every Podman process's file descriptor 0 is the already-open `/dev/null`; an inherited service,
+terminal, or caller pipe is forbidden.
 After `create` returns, R02 matches the stopped container and generated specification to the durable
 attempt, image, protected source/cache/target objects, target-tmpfs limits, namespaces, cgroup,
 environment, and security policy. It durably checkpoints that exact stopped object, reconfirms
@@ -284,13 +284,26 @@ queue generation, ownership, holds/cancellation, every bound identity, and an in
 then atomically consumes/checkpoints start authority. The deadline remains the original B05
 `not_after`/maximum-duration budget with preparation time already consumed; it is never restarted or
 extended. Any refusal leaves the exact stopped container unstarted and recovery-classified. Only
-after that successful checkpoint does R02 invoke the fixed
-`podman start --attach <exact-id>` form. Podman 4.9.3 exposes one boolean attach flag for both stdout
-and stderr; the fixture must prove both streams remain separately bounded and cleanup cannot wait on
-an inherited pipe. A name or CID file remains lookup evidence only. The displayed paths are private
-plan values, never public receipt fields. Source refers only to the protected immutable
-materialization, never the live checkout. The read-only dependency-cache mount is omitted when no
-independently verified generation exists.
+after that successful checkpoint does R02 invoke fixed `podman start <exact-id>`,
+`podman wait <exact-id>`, and `podman logs <exact-id>` forms. Each command is independently
+deadline- and output-bounded. R02 monitors the authoritative payload cgroup and exact
+attempt-private log while `wait` is active; timeout, cancellation, log-ceiling contact, or capture
+failure triggers the journaled abort path and can never become success. `wait`, stopped-state
+inspection, and the durable attempt must agree on the exit code before `logs` is parsed into
+separately bounded stdout/stderr. A name or CID file remains lookup evidence only. The displayed
+paths are private plan values, never public receipt fields. Source refers only to the protected
+immutable materialization, never the live checkout. The read-only dependency-cache mount is omitted
+when no independently verified generation exists.
+
+Noble Podman 4.9.3 leaves the local `start --attach` client waiting after this fixture's payload and
+container have both exited cleanly, so attach is not an admitted execution primitive. The fixed
+`k8s-file` driver instead writes one exact attempt-private regular file with a hard aggregate byte
+ceiling passed to conmon. R02 validates the stopped container's exact driver, path, and limit before
+start and rejects an unsafe owner, mode, type, link count, or parent binding. Reaching the ceiling
+is an output-limit failure even if conmon truncates or rotates bytes. This log is transient capture
+state, not a cache, receipt, or verification authority, and cleanup removes it only after the cgroup
+is empty and capture is complete. The normal-output fixture does not by itself prove hostile
+overflow; that adversarial case remains mandatory before R02 readiness.
 
 The attempt name and CID file are recovery lookups only; neither proves ownership, and both must be
 matched to the durable attempt, exact run-private store, and authoritative cgroup before inspect or

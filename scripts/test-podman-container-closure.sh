@@ -30,8 +30,10 @@ validate_network_lock() {
 }
 
 run_user_probe() {
-  local image_id image_hex container_id container_output expected_output start_status
+  local image_id image_hex container_id container_output expected_output
+  local start_output start_status wait_output wait_status logs_status
   local image_size container_size spec_size spec_path apparmor_profile
+  local log_owner log_group log_mode log_links log_size stderr_size
 
   mapfile -d '' network_entries_before < <(
     /usr/bin/find "$PROBE_NETWORK" -mindepth 1 -maxdepth 1 -print0
@@ -87,7 +89,9 @@ run_user_probe() {
     --cpus=0.5 \
     --env-host=false \
     --http-proxy=false \
-    --log-driver=none \
+    --log-driver=k8s-file \
+    --log-opt="path=$PROBE_LOGFILE" \
+    --log-opt=max-size=1048576 \
     --privileged=false \
     --systemd=false \
     --restart=no \
@@ -110,7 +114,10 @@ run_user_probe() {
   podman_probe container inspect "$container_id" > "$PROBE_CONTAINER_JSON"
   container_size=$(/usr/bin/stat -Lc %s "$PROBE_CONTAINER_JSON")
   if (( container_size == 0 || container_size > 1048576 )) ||
-    ! /usr/bin/jq -e --arg container_id "$container_id" --arg image_hex "$image_hex" '
+    ! /usr/bin/jq -e \
+      --arg container_id "$container_id" \
+      --arg image_hex "$image_hex" \
+      --arg log_path "$PROBE_LOGFILE" '
       length == 1 and
       .[0].Id == $container_id and
       .[0].Image == $image_hex and
@@ -123,7 +130,10 @@ run_user_probe() {
       .[0].HostConfig.Privileged == false and
       .[0].HostConfig.PidsLimit == 32 and
       .[0].HostConfig.Memory == 67108864 and
-      .[0].HostConfig.MemorySwap == 67108864
+      .[0].HostConfig.MemorySwap == 67108864 and
+      .[0].HostConfig.LogConfig.Type == "k8s-file" and
+      .[0].HostConfig.LogConfig.Path == $log_path and
+      .[0].HostConfig.LogConfig.Size == "1.049MB"
     ' "$PROBE_CONTAINER_JSON" >/dev/null; then
     /usr/bin/jq -c '.[0] | {
       state: .State.Status,
@@ -134,7 +144,8 @@ run_user_probe() {
       privileged: .HostConfig.Privileged,
       pids: .HostConfig.PidsLimit,
       memory: .HostConfig.Memory,
-      swap: .HostConfig.MemorySwap
+      swap: .HostConfig.MemorySwap,
+      log: .HostConfig.LogConfig
     }' "$PROBE_CONTAINER_JSON" >&2 || true
     printf 'error: stopped container inspection did not match the closed fixture\n' >&2
     exit 1
@@ -145,6 +156,48 @@ run_user_probe() {
   fi
 
   set +e
+  start_output=$(/usr/bin/timeout --signal=KILL 20s \
+    /usr/bin/podman \
+    --remote=false \
+    --runtime=/usr/bin/crun \
+    --conmon=/usr/bin/conmon \
+    --events-backend=none \
+    --hooks-dir="$PROBE_HOOKS" \
+    --network-config-dir="$PROBE_NETWORK" \
+    --cgroup-manager=cgroupfs \
+    --tmpdir="$TMPDIR" \
+    --transient-store \
+    start "$container_id" </dev/null)
+  start_status=$?
+  set -e
+  if (( start_status != 0 )) || [[ $start_output != "$container_id" ]]; then
+    podman_probe container inspect "$container_id" > "$PROBE_CONTAINER_JSON" || true
+    printf 'start_status=%s start_output=%q\n' "$start_status" "$start_output" >&2
+    /usr/bin/jq -c 'if length == 1 then {
+      state: .[0].State.Status,
+      running: .[0].State.Running,
+      exit_code: .[0].State.ExitCode,
+      error: .[0].State.Error,
+      oom: .[0].State.OOMKilled
+    } else {count: length} end' "$PROBE_CONTAINER_JSON" >&2 || true
+    printf 'error: bounded detached start did not return the exact container identity\n' >&2
+    exit 1
+  fi
+
+  set +e
+  wait_output=$(/usr/bin/timeout --signal=KILL 20s \
+    /usr/bin/podman \
+    --remote=false \
+    --runtime=/usr/bin/crun \
+    --conmon=/usr/bin/conmon \
+    --events-backend=none \
+    --hooks-dir="$PROBE_HOOKS" \
+    --network-config-dir="$PROBE_NETWORK" \
+    --cgroup-manager=cgroupfs \
+    --tmpdir="$TMPDIR" \
+    --transient-store \
+    wait "$container_id" </dev/null)
+  wait_status=$?
   container_output=$(/usr/bin/timeout --signal=KILL 20s \
     /usr/bin/podman \
     --remote=false \
@@ -156,22 +209,18 @@ run_user_probe() {
     --cgroup-manager=cgroupfs \
     --tmpdir="$TMPDIR" \
     --transient-store \
-    start --attach "$container_id" </dev/null)
-  start_status=$?
+    logs "$container_id" </dev/null 2>"$PROBE_CAPTURE_STDERR")
+  logs_status=$?
   set -e
-  if (( start_status != 0 )); then
-    podman_probe container inspect "$container_id" > "$PROBE_CONTAINER_JSON" || true
-    printf 'start_attach_status=%s\n' "$start_status" >&2
-    /usr/bin/jq -c 'if length == 1 then {
-      state: .[0].State.Status,
-      running: .[0].State.Running,
-      exit_code: .[0].State.ExitCode,
-      error: .[0].State.Error,
-      oom: .[0].State.OOMKilled
-    } else {count: length} end' "$PROBE_CONTAINER_JSON" >&2 || true
-    printf 'error: bounded attached start did not complete\n' >&2
+  stderr_size=$(/usr/bin/stat -Lc %s "$PROBE_CAPTURE_STDERR")
+  if (( wait_status != 0 )) || [[ $wait_output != 0 ]] ||
+    (( logs_status != 0 || stderr_size != 0 )); then
+    printf 'wait_status=%s wait_output=%q logs_status=%s logs_stderr_bytes=%s\n' \
+      "$wait_status" "$wait_output" "$logs_status" "$stderr_size" >&2
+    printf 'error: bounded wait/log retrieval did not report one clean payload exit\n' >&2
     exit 1
   fi
+
   expected_output="$PROBE_PASSWD_SHA  /etc/passwd
 $PROBE_GROUP_SHA  /etc/group"
   if [[ $container_output != "$expected_output" ]]; then
@@ -179,8 +228,19 @@ $PROBE_GROUP_SHA  /etc/group"
     exit 1
   fi
 
+  read -r log_owner log_group log_mode log_links log_size < <(
+    /usr/bin/stat -Lc '%u %g %a %h %s' "$PROBE_LOGFILE"
+  )
+  if [[ -L $PROBE_LOGFILE ]] || [[ ! -f $PROBE_LOGFILE ]] ||
+    [[ $log_owner != "$PROBE_UID" ]] || [[ $log_group != "$PROBE_GID" ]] ||
+    (( (8#$log_mode & 0022) != 0 )) || [[ $log_links != 1 ]] ||
+    (( log_size == 0 || log_size >= 1048576 )); then
+    printf 'error: payload log was absent, unsafe, or reached its exact overflow boundary\n' >&2
+    exit 1
+  fi
+
   podman_probe container inspect "$container_id" > "$PROBE_CONTAINER_JSON"
-  if ! /usr/bin/jq -e 'length == 1 and .[0].State.Status == "exited" and .[0].State.ExitCode == 0' \
+  if ! /usr/bin/jq -e 'length == 1 and .[0].State.Status == "stopped" and .[0].State.ExitCode == 0' \
     "$PROBE_CONTAINER_JSON" >/dev/null; then
     printf 'error: trusted account gate did not exit successfully\n' >&2
     exit 1
@@ -414,15 +474,18 @@ probe_unit_owned=1
   LOGNAME="$probe_user" \
   PATH=/usr/bin \
   PROBE_CIDFILE="$probe_root/runtime/container.cid" \
+  PROBE_CAPTURE_STDERR="$probe_root/runtime/logs.stderr" \
   PROBE_CONTAINER_JSON="$probe_root/runtime/container.json" \
   PROBE_GRAPHROOT="$probe_root/graphroot" \
   PROBE_GROUP_SHA="$group_sha" \
   PROBE_HOOKS="$probe_root/hooks" \
   PROBE_IMAGE_JSON="$probe_root/runtime/image.json" \
+  PROBE_LOGFILE="$probe_root/runtime/container.log" \
   PROBE_NETWORK="$probe_root/network" \
   PROBE_PASSWD_SHA="$passwd_sha" \
   PROBE_ROOTFS_TAR="$probe_root/rootfs.tar" \
   PROBE_RUNROOT="$probe_root/runtime/containers" \
+  PROBE_GID="$probe_gid" \
   PROBE_UID="$probe_uid" \
   PROBE_USER="$probe_user" \
   REGISTRY_AUTH_FILE="$probe_root/auth/auth.json" \
