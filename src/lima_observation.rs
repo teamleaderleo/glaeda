@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use serde::de::{self, Deserialize, Deserializer, IgnoredAny, MapAccess, Visitor};
+use sha2::{Digest as _, Sha256};
 
 use crate::artifact::Sha256Digest;
 use crate::process::{CommandExecutor, CommandSpec, ExecutionRecord};
@@ -22,6 +23,8 @@ const GUEST_SHA256SUM: &str = "/usr/bin/sha256sum";
 const GUEST_STAT: &str = "/usr/bin/stat";
 const GUEST_MACHINE_ID: &str = "/etc/machine-id";
 const REDACTED_PRIVATE_EVIDENCE: &str = "<private-lima-command-evidence>";
+const LIMA_OBSERVATION_REQUEST_IDENTITY_DOCUMENT_TYPE: &str =
+    "smolrunner-lima-observation-request-identity";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -191,6 +194,32 @@ pub struct LimaObservationSourceIdentity {
     lima_home: PathBuf,
 }
 
+/// Opaque canonical digest for every semantic field in one validated Lima observation request.
+///
+/// Unlike [`LimaObservationSourceIdentity`], this identity also binds the expected VM type,
+/// architecture, guest cache path, and freshness window. It exposes only a SHA-256 digest and
+/// never the private paths used to derive it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct LimaObservationRequestIdentity {
+    digest: Sha256Digest,
+}
+
+impl LimaObservationRequestIdentity {
+    #[must_use]
+    pub const fn digest(&self) -> &Sha256Digest {
+        &self.digest
+    }
+}
+
+impl fmt::Debug for LimaObservationRequestIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LimaObservationRequestIdentity")
+            .field("digest", &self.digest)
+            .finish()
+    }
+}
+
 impl LimaObservationSourceIdentity {
     pub(crate) const fn from_validated(instance: LimaInstanceName, lima_home: PathBuf) -> Self {
         Self {
@@ -219,6 +248,7 @@ pub struct LimaObservationRequest {
     expected_architecture: LimaArchitecture,
     guest_cache_path: PathBuf,
     max_age_seconds: u64,
+    request_identity: LimaObservationRequestIdentity,
 }
 
 impl LimaObservationRequest {
@@ -244,6 +274,14 @@ impl LimaObservationRequest {
             ));
         }
         let expected_instance_directory = lima_home.join(instance.as_str());
+        let request_identity = digest_observation_request(
+            &instance,
+            &lima_home,
+            expected_vm_type,
+            expected_architecture,
+            &guest_cache_path,
+            max_age_seconds,
+        )?;
         Ok(Self {
             instance,
             lima_home,
@@ -252,6 +290,7 @@ impl LimaObservationRequest {
             expected_architecture,
             guest_cache_path,
             max_age_seconds,
+            request_identity,
         })
     }
 
@@ -279,6 +318,11 @@ impl LimaObservationRequest {
     pub fn source_identity(&self) -> LimaObservationSourceIdentity {
         LimaObservationSourceIdentity::from_validated(self.instance.clone(), self.lima_home.clone())
     }
+
+    #[must_use]
+    pub const fn request_identity(&self) -> &LimaObservationRequestIdentity {
+        &self.request_identity
+    }
 }
 
 impl fmt::Debug for LimaObservationRequest {
@@ -297,6 +341,49 @@ impl fmt::Debug for LimaObservationRequest {
             .field("max_age_seconds", &self.max_age_seconds)
             .finish()
     }
+}
+
+#[derive(Serialize)]
+struct LimaObservationRequestIdentityDocument<'a> {
+    document_type: &'static str,
+    schema_version: u8,
+    instance: &'a str,
+    lima_home: &'a str,
+    expected_vm_type: LimaVmType,
+    expected_architecture: LimaArchitecture,
+    guest_cache_path: &'a str,
+    max_age_seconds: u64,
+}
+
+fn digest_observation_request(
+    instance: &LimaInstanceName,
+    lima_home: &Path,
+    expected_vm_type: LimaVmType,
+    expected_architecture: LimaArchitecture,
+    guest_cache_path: &Path,
+    max_age_seconds: u64,
+) -> Result<LimaObservationRequestIdentity, LimaObservationFailure> {
+    let document = LimaObservationRequestIdentityDocument {
+        document_type: LIMA_OBSERVATION_REQUEST_IDENTITY_DOCUMENT_TYPE,
+        schema_version: LIMA_OBSERVATION_SCHEMA_VERSION,
+        instance: instance.as_str(),
+        lima_home: lima_home
+            .to_str()
+            .expect("validated Lima home remains exact UTF-8"),
+        expected_vm_type,
+        expected_architecture,
+        guest_cache_path: guest_cache_path
+            .to_str()
+            .expect("validated guest cache path remains exact UTF-8"),
+        max_age_seconds,
+    };
+    let bytes = serde_json::to_vec(&document)
+        .map_err(|_| input_failure("the Lima observation request identity could not be encoded"))?;
+    let digest = Sha256::digest(bytes);
+    let digest = Sha256Digest::parse(&format!("sha256:{digest:x}")).map_err(|_| {
+        input_failure("the Lima observation request identity could not be represented")
+    })?;
+    Ok(LimaObservationRequestIdentity { digest })
 }
 
 #[derive(Clone, PartialEq, Eq)]

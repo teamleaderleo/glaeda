@@ -1,0 +1,931 @@
+use std::cell::RefCell;
+use std::collections::VecDeque;
+use std::io;
+use std::time::Duration;
+
+use smolrunner::artifact::{CommitId, GitTreeId, RepositoryRef, Sha256Digest};
+use smolrunner::execution_admission::{
+    EpochMillis, ExecutionRequestId, ExecutionResourceLimits, HostCapacityObservation,
+    RunnerProfileId,
+};
+use smolrunner::lima_lifecycle::{
+    LimaCacheDiskId, LimaCacheDiskIdentity, LimaInstanceId, LimaInstanceIdentity,
+    LimaLifecycleObservation, LimaLifecycleObservationDefinition, LimaLifecyclePolicy,
+    LimaLifecycleState, LimaObservedResources, LimaProfileGeneration, LimaResourceProfile,
+};
+use smolrunner::lima_observation::{
+    LimaArchitecture, LimaInstanceName, LimaObservationAdapter, LimaObservationRequest, LimaVmType,
+};
+use smolrunner::mac_availability::{
+    AvailabilityRequest, EffectiveAvailabilityMode, HostPowerSource, JobActivity,
+    MacAvailabilityObservation, MemoryPressure, ObservationFreshness, VmPowerState,
+};
+use smolrunner::macos_resource_observation::{
+    lima_process_command, memory_pressure_command, power_command, swap_command,
+};
+use smolrunner::operator_config::{
+    GuestWorkspacePath, OperatorConfig, OperatorIdlePolicy, OperatorOutputPreference,
+    OperatorRemediationPreference, PersonalWorkerStateRoot,
+};
+use smolrunner::personal_worker_host_broker::{HostBrokerRunnerObservation, HostBrokerRunnerState};
+use smolrunner::personal_worker_lima_authority::{
+    PersonalWorkerLimaAttemptInput, PersonalWorkerLimaAttemptPhase,
+    PersonalWorkerLimaAuthorityDocument, PersonalWorkerLimaAuthorityErrorKind,
+    decode_personal_worker_lima_authority, encode_personal_worker_lima_authority,
+    personal_worker_lima_enrollment_confirmation,
+};
+use smolrunner::personal_worker_mac_observation::{
+    PersonalWorkerMacObservation, PersonalWorkerMacObservationAdapter,
+    PersonalWorkerMacObservationClock, logical_cpu_command, vm_stat_command,
+};
+use smolrunner::personal_worker_queue::{
+    PERSONAL_WORKER_QUEUE_SCHEMA_VERSION, PERSONAL_WORKER_SCHEDULABLE_CPU_MILLIS,
+    PERSONAL_WORKER_SCHEDULABLE_MEMORY_BYTES, PersonalWorkerActivityEvidence,
+    PersonalWorkerCacheAccessMode, PersonalWorkerCacheLeaseState, PersonalWorkerCacheNamespace,
+    PersonalWorkerJobClass, PersonalWorkerPriority, PersonalWorkerProfile,
+    PersonalWorkerProfileObservation, PersonalWorkerQueueDecision, PersonalWorkerQueueEntryState,
+    PersonalWorkerQueueGeneration, PersonalWorkerQueueVisibility, PersonalWorkerSelection,
+};
+use smolrunner::personal_worker_store::PersonalWorkerStoreRevision;
+use smolrunner::personal_worker_tick::{
+    PersonalWorkerTickInput, PersonalWorkerTickPlan, PersonalWorkerTickPolicy,
+};
+use smolrunner::process::{CommandExecutor, CommandSpec, ExecutionRecord, TimedCommandExecutor};
+use smolrunner::verification_profile::{CacheId, VerificationProfileId};
+
+const LIMA_HOME: &str = "/Users/operator/.lima";
+const CACHE_PATH: &str = "/home/runner/.cache/cargo";
+const INSTANCE_DIRECTORY: &str = "/Users/operator/.lima/smolrunner";
+const DISK_BYTES: u64 = 80 * 1024 * 1024 * 1024;
+
+struct ScriptedExecutor {
+    outputs: RefCell<VecDeque<String>>,
+    seen: RefCell<Vec<(CommandSpec, Duration)>>,
+}
+
+impl ScriptedExecutor {
+    fn new(outputs: Vec<String>) -> Self {
+        Self {
+            outputs: RefCell::new(outputs.into()),
+            seen: RefCell::new(Vec::new()),
+        }
+    }
+}
+
+impl CommandExecutor for ScriptedExecutor {
+    fn execute(&self, _spec: &CommandSpec) -> io::Result<ExecutionRecord> {
+        Err(io::Error::other("untimed execution is forbidden"))
+    }
+}
+
+impl TimedCommandExecutor for ScriptedExecutor {
+    fn execute_with_timeout(
+        &self,
+        spec: &CommandSpec,
+        timeout: Duration,
+    ) -> io::Result<ExecutionRecord> {
+        self.seen.borrow_mut().push((spec.clone(), timeout));
+        let stdout = self
+            .outputs
+            .borrow_mut()
+            .pop_front()
+            .ok_or_else(|| io::Error::other("missing scripted observation output"))?;
+        Ok(ExecutionRecord {
+            argv: spec.displayed_argv(),
+            environment_keys: spec.environment.keys().cloned().collect(),
+            status: Some(0),
+            success: true,
+            stdout,
+            stderr: String::new(),
+        })
+    }
+}
+
+struct ScriptedClock(RefCell<VecDeque<u64>>);
+
+impl PersonalWorkerMacObservationClock for ScriptedClock {
+    fn unix_millis(&self) -> io::Result<u64> {
+        self.0
+            .borrow_mut()
+            .pop_front()
+            .ok_or_else(|| io::Error::other("missing scripted observation time"))
+    }
+}
+
+fn digest(byte: &str) -> Sha256Digest {
+    Sha256Digest::parse(&format!("sha256:{}", byte.repeat(64))).expect("digest")
+}
+
+fn epoch(value: u64) -> EpochMillis {
+    EpochMillis::new(value).expect("epoch")
+}
+
+fn config() -> OperatorConfig {
+    OperatorConfig::new(
+        PersonalWorkerStateRoot::parse("/Users/operator/Library/Application Support/SmolRunner")
+            .expect("state root"),
+        LimaInstanceName::parse("smolrunner").expect("instance"),
+        GuestWorkspacePath::parse("/home/runner/workspace").expect("workspace"),
+        VerificationProfileId::parse("smolrunner.required").expect("profile"),
+        AvailabilityRequest::Away,
+        OperatorIdlePolicy::new(600_000, 1_800_000).expect("idle policy"),
+        OperatorOutputPreference::Json,
+        OperatorRemediationPreference::CodesOnly,
+    )
+    .expect("config")
+}
+
+fn request(home: &str, cache: &str) -> LimaObservationRequest {
+    LimaObservationRequest::new(
+        LimaInstanceName::parse("smolrunner").expect("instance"),
+        home,
+        LimaVmType::Vz,
+        LimaArchitecture::Aarch64,
+        cache,
+        30,
+    )
+    .expect("request")
+}
+
+fn broker_identity() -> LimaInstanceIdentity {
+    LimaInstanceIdentity::new(
+        LimaInstanceId::parse("smolrunner").expect("instance ID"),
+        LimaCacheDiskIdentity::new(
+            LimaCacheDiskId::parse("smolrunner-cache").expect("cache disk ID"),
+            digest("b"),
+        ),
+    )
+}
+
+fn lifecycle_profile(
+    state: LimaLifecycleState,
+    profile: LimaResourceProfile,
+    observed_at: u64,
+) -> LimaLifecycleObservation {
+    lifecycle_with_generation(state, profile, observed_at, 1)
+}
+
+fn lifecycle_with_generation(
+    state: LimaLifecycleState,
+    profile: LimaResourceProfile,
+    observed_at: u64,
+    generation: u64,
+) -> LimaLifecycleObservation {
+    let last_activity_at = epoch(1_000);
+    LimaLifecycleObservation::new(LimaLifecycleObservationDefinition {
+        identity: broker_identity(),
+        state,
+        profile,
+        profile_generation: LimaProfileGeneration::new(generation).expect("generation"),
+        observed_resources: LimaObservedResources::for_profile(profile),
+        observed_at: epoch(observed_at),
+        active_reservation_id: None,
+        last_activity_at,
+        idle_deadline: epoch(last_activity_at.get() + profile.idle_deadline_offset_millis()),
+        graceful_stop_acknowledgement: None,
+    })
+    .expect("lifecycle")
+}
+
+fn host_outputs() -> Vec<String> {
+    vec![
+        "1\n".to_owned(),
+        "total = 4096.00M used = 1024.00M free = 3072.00M (encrypted)\n".to_owned(),
+        "Now drawing from 'AC Power'\n -InternalBattery-0\t100%; charged;\n".to_owned(),
+        " 100 1 1.0 2048 00:05 /opt/homebrew/bin/limactl\n".to_owned(),
+        concat!(
+            "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n",
+            "Pages free: 100000.\n",
+            "Pages active: 200000.\n",
+            "Pages inactive: 300000.\n",
+            "Pages speculative: 100000.\n",
+            "Pages purgeable: 50000.\n",
+        )
+        .to_owned(),
+        "10\n".to_owned(),
+    ]
+}
+
+fn instance_json(state: &str, profile: LimaResourceProfile) -> String {
+    let envelope = profile.envelope();
+    format!(
+        "{{\"name\":\"smolrunner\",\"status\":\"{state}\",\"dir\":\"{INSTANCE_DIRECTORY}\",\"vmType\":\"vz\",\"arch\":\"aarch64\",\"cpus\":{},\"memory\":{},\"disk\":{DISK_BYTES},\"errors\":[]}}\n",
+        envelope.vcpus, envelope.memory_bytes
+    )
+}
+
+fn running_outputs(profile: LimaResourceProfile) -> Vec<String> {
+    let envelope = profile.envelope();
+    let mut outputs = host_outputs();
+    outputs.extend([
+        instance_json("Running", profile),
+        "aarch64\n".to_owned(),
+        format!("{}\n", envelope.vcpus),
+        "4096\n".to_owned(),
+        format!("{}\n", (envelope.memory_bytes - 16 * 1024 * 1024) / 4_096),
+        format!("{}  /etc/machine-id\n", "a".repeat(64)),
+        "2049:2\n".to_owned(),
+        "2049:12345\n".to_owned(),
+        instance_json("Running", profile),
+    ]);
+    outputs
+}
+
+fn stopped_outputs(profile: LimaResourceProfile) -> Vec<String> {
+    let mut outputs = host_outputs();
+    outputs.extend([
+        instance_json("Stopped", profile),
+        instance_json("Stopped", profile),
+    ]);
+    outputs
+}
+
+fn mac_observation(running: bool, start: u64) -> PersonalWorkerMacObservation {
+    mac_observation_profile(running, start, LimaResourceProfile::Interactive)
+}
+
+fn mac_observation_profile(
+    running: bool,
+    start: u64,
+    profile: LimaResourceProfile,
+) -> PersonalWorkerMacObservation {
+    let executor = ScriptedExecutor::new(if running {
+        running_outputs(profile)
+    } else {
+        stopped_outputs(profile)
+    });
+    let clock = ScriptedClock(RefCell::new(
+        [start, start + 1_000, start + 2_000, start + 3_000].into(),
+    ));
+    let observation = PersonalWorkerMacObservationAdapter::new(30_000, Duration::from_secs(5))
+        .expect("Mac adapter")
+        .observe(
+            &config(),
+            &request(LIMA_HOME, CACHE_PATH),
+            &LimaObservationAdapter::new("/opt/homebrew/bin/limactl").expect("Lima adapter"),
+            &executor,
+            &clock,
+        )
+        .expect("sealed B02 observation");
+    assert!(executor.outputs.borrow().is_empty());
+    assert!(
+        executor
+            .seen
+            .borrow()
+            .iter()
+            .all(|(_, timeout)| *timeout == Duration::from_secs(5))
+    );
+    observation
+}
+
+fn worker_tick(lifecycle: &LimaLifecycleObservation) -> PersonalWorkerTickPlan {
+    let current_profile = if lifecycle.state() == LimaLifecycleState::Stopped {
+        PersonalWorkerProfile::Stopped
+    } else {
+        match lifecycle.profile() {
+            LimaResourceProfile::Interactive => PersonalWorkerProfile::Interactive,
+            LimaResourceProfile::Work => PersonalWorkerProfile::Work,
+        }
+    };
+    let request_id = ExecutionRequestId::parse("request-one").expect("request ID");
+    let repository = RepositoryRef::parse("teamleaderleo/smolrunner").expect("repository");
+    let profile_id = VerificationProfileId::parse("smolrunner.required").expect("profile");
+    let runner_profile = RunnerProfileId::parse("work").expect("runner profile");
+    let namespace = PersonalWorkerCacheNamespace::RepositoryBuild {
+        cache_id: CacheId::parse("cargo-build").expect("cache ID"),
+        repository: repository.clone(),
+        namespace_digest: digest("c"),
+    };
+    let limits = ExecutionResourceLimits::new(2_000, 2 * 1024 * 1024 * 1024, 768).expect("limits");
+    let selection = PersonalWorkerSelection {
+        request_id: request_id.clone(),
+        repository: repository.clone(),
+        verification_profile_id: profile_id.clone(),
+        runner_profile_id: runner_profile.clone(),
+        priority: PersonalWorkerPriority::Normal,
+        effective_priority_rank: 1,
+        job_class: PersonalWorkerJobClass::Light,
+        reserved_limits: limits,
+        cache_namespace: namespace.clone(),
+        cache_access: PersonalWorkerCacheAccessMode::Write,
+    };
+    let visibility = PersonalWorkerQueueVisibility {
+        request_id,
+        repository,
+        commit: CommitId::parse(&"12".repeat(20)).expect("commit"),
+        tree: GitTreeId::parse(&"34".repeat(20)).expect("tree"),
+        verification_profile_id: profile_id,
+        runner_profile_id: runner_profile,
+        priority: PersonalWorkerPriority::Normal,
+        effective_priority_rank: 1,
+        age_millis: 10,
+        state: PersonalWorkerQueueEntryState::Selected,
+        queue_position: None,
+        requested_cpu_millis: limits.cpu_millis,
+        requested_memory_bytes: limits.memory_bytes,
+        reserved_cpu_millis: None,
+        reserved_memory_bytes: None,
+        cache_namespace: namespace,
+        cache_access: PersonalWorkerCacheAccessMode::Write,
+        cache_lease: PersonalWorkerCacheLeaseState::Available,
+        start_time: None,
+        worker_profile: PersonalWorkerProfile::Work,
+    };
+    let queue = PersonalWorkerQueueDecision {
+        schema_version: PERSONAL_WORKER_QUEUE_SCHEMA_VERSION,
+        generation: PersonalWorkerQueueGeneration::new(7).expect("queue generation"),
+        observed_at: epoch(204_000),
+        profile_observation: PersonalWorkerProfileObservation::observed(current_profile),
+        activity_evidence: PersonalWorkerActivityEvidence::observed(epoch(203_000)),
+        desired_profile: PersonalWorkerProfile::Work,
+        cancel_pending_downscale: false,
+        profile_change_permitted: true,
+        schedulable_cpu_millis: PERSONAL_WORKER_SCHEDULABLE_CPU_MILLIS,
+        schedulable_memory_bytes: PERSONAL_WORKER_SCHEDULABLE_MEMORY_BYTES,
+        selected: vec![selection],
+        visibility: vec![visibility],
+    };
+    let stopped = lifecycle.state() == LimaLifecycleState::Stopped;
+    let availability = MacAvailabilityObservation {
+        effective_mode: if stopped {
+            EffectiveAvailabilityMode::Off
+        } else {
+            EffectiveAvailabilityMode::Away
+        },
+        vm_power: if stopped {
+            VmPowerState::Stopped
+        } else {
+            VmPowerState::Running
+        },
+        job_activity: JobActivity::Idle,
+        freshness: ObservationFreshness::Fresh,
+        host_power: HostPowerSource::Ac,
+        memory_pressure: MemoryPressure::Normal,
+        operator_hold: false,
+    };
+    let capacity = HostCapacityObservation::new(
+        epoch(204_000),
+        ExecutionResourceLimits::new(8_000, 12 * 1024 * 1024 * 1024, 4_096).expect("capacity"),
+    );
+    let runner = (!stopped).then(|| {
+        HostBrokerRunnerObservation::new(
+            broker_identity().instance_id().clone(),
+            lifecycle.profile_generation(),
+            epoch(204_000),
+            HostBrokerRunnerState::IdleReady,
+        )
+    });
+    PersonalWorkerTickPolicy::new(30_000, 30_000, 30_000)
+        .expect("tick policy")
+        .plan(PersonalWorkerTickInput {
+            store_revision: PersonalWorkerStoreRevision::new(5).expect("revision"),
+            decision_at: epoch(205_000),
+            queue: &queue,
+            lifecycle_policy: &LimaLifecyclePolicy::new(30_000).expect("lifecycle policy"),
+            lifecycle: Some(lifecycle),
+            runner: runner.as_ref(),
+            capacity: Some(capacity),
+            availability_request: AvailabilityRequest::Active,
+            availability: Some(availability),
+        })
+        .expect("sealed B01 lifecycle tick")
+}
+
+fn stop_tick(lifecycle: &LimaLifecycleObservation) -> PersonalWorkerTickPlan {
+    let queue = PersonalWorkerQueueDecision {
+        schema_version: PERSONAL_WORKER_QUEUE_SCHEMA_VERSION,
+        generation: PersonalWorkerQueueGeneration::new(7).expect("queue generation"),
+        observed_at: epoch(1_900_000),
+        profile_observation: PersonalWorkerProfileObservation::observed(
+            PersonalWorkerProfile::Work,
+        ),
+        activity_evidence: PersonalWorkerActivityEvidence::observed(epoch(1_000)),
+        desired_profile: PersonalWorkerProfile::Stopped,
+        cancel_pending_downscale: false,
+        profile_change_permitted: true,
+        schedulable_cpu_millis: PERSONAL_WORKER_SCHEDULABLE_CPU_MILLIS,
+        schedulable_memory_bytes: PERSONAL_WORKER_SCHEDULABLE_MEMORY_BYTES,
+        selected: Vec::new(),
+        visibility: Vec::new(),
+    };
+    let runner = HostBrokerRunnerObservation::new(
+        broker_identity().instance_id().clone(),
+        LimaProfileGeneration::new(1).expect("generation"),
+        epoch(1_900_000),
+        HostBrokerRunnerState::Offline,
+    );
+    PersonalWorkerTickPolicy::new(30_000, 30_000, 30_000)
+        .expect("tick policy")
+        .plan(PersonalWorkerTickInput {
+            store_revision: PersonalWorkerStoreRevision::new(5).expect("revision"),
+            decision_at: epoch(1_900_001),
+            queue: &queue,
+            lifecycle_policy: &LimaLifecyclePolicy::new(30_000).expect("lifecycle policy"),
+            lifecycle: Some(lifecycle),
+            runner: Some(&runner),
+            capacity: None,
+            availability_request: AvailabilityRequest::Off,
+            availability: Some(MacAvailabilityObservation {
+                effective_mode: EffectiveAvailabilityMode::Active,
+                vm_power: VmPowerState::Running,
+                job_activity: JobActivity::Idle,
+                freshness: ObservationFreshness::Fresh,
+                host_power: HostPowerSource::Ac,
+                memory_pressure: MemoryPressure::Normal,
+                operator_hold: false,
+            }),
+        })
+        .expect("sealed B01 stop tick")
+}
+
+fn enrolled() -> PersonalWorkerLimaAuthorityDocument {
+    let config = config();
+    let running = mac_observation(true, 100_000);
+    let request = request(LIMA_HOME, CACHE_PATH);
+    let confirmation = personal_worker_lima_enrollment_confirmation(
+        &config,
+        &running,
+        &request,
+        broker_identity(),
+    )
+    .expect("confirmation");
+    PersonalWorkerLimaAuthorityDocument::enroll(
+        &config,
+        &running,
+        &request,
+        broker_identity(),
+        Some(confirmation.value()),
+    )
+    .expect("enrollment")
+}
+
+#[test]
+fn enrollment_uses_sealed_running_identity_and_has_canonical_private_encoding() {
+    let running = mac_observation(true, 100_000);
+    let request = request(LIMA_HOME, CACHE_PATH);
+    let confirmation = personal_worker_lima_enrollment_confirmation(
+        &config(),
+        &running,
+        &request,
+        broker_identity(),
+    )
+    .expect("confirmation");
+    let document = PersonalWorkerLimaAuthorityDocument::enroll(
+        &config(),
+        &running,
+        &request,
+        broker_identity(),
+        Some(confirmation.value()),
+    )
+    .expect("enrollment");
+    assert_eq!(
+        document.persistent_identity(),
+        match &running.report().lima.guest {
+            smolrunner::lima_observation::LimaGuestObservation::Observed(guest) => {
+                &guest.persistent_identity
+            }
+            _ => panic!("running guest"),
+        }
+    );
+
+    let bytes = encode_personal_worker_lima_authority(&document).expect("encode");
+    let decoded = decode_personal_worker_lima_authority(&bytes).expect("decode");
+    assert_eq!(decoded, document);
+    let text = String::from_utf8(bytes).expect("JSON");
+    let debug = format!("{document:?}");
+    for private in [LIMA_HOME, CACHE_PATH, INSTANCE_DIRECTORY, "/Users/operator"] {
+        assert!(!text.contains(private), "encoding leaked {private}");
+        assert!(!debug.contains(private), "Debug leaked {private}");
+    }
+
+    let unconfirmed = PersonalWorkerLimaAuthorityDocument::enroll(
+        &config(),
+        &running,
+        &request,
+        broker_identity(),
+        None,
+    )
+    .expect_err("confirmation required");
+    assert_eq!(
+        unconfirmed.kind,
+        PersonalWorkerLimaAuthorityErrorKind::ConfirmationRequired
+    );
+    let stopped = personal_worker_lima_enrollment_confirmation(
+        &config(),
+        &mac_observation(false, 200_000),
+        &request,
+        broker_identity(),
+    )
+    .expect_err("stopped evidence cannot enroll");
+    assert_eq!(
+        stopped.kind,
+        PersonalWorkerLimaAuthorityErrorKind::InvalidInput
+    );
+
+    let other_identity = LimaInstanceIdentity::new(
+        LimaInstanceId::parse("other").expect("other instance"),
+        broker_identity().cache_disk().clone(),
+    );
+    let mismatch =
+        personal_worker_lima_enrollment_confirmation(&config(), &running, &request, other_identity)
+            .expect_err("logical and physical instances must match");
+    assert_eq!(
+        mismatch.kind,
+        PersonalWorkerLimaAuthorityErrorKind::Conflict
+    );
+}
+
+#[test]
+fn complete_private_request_drift_is_refused_before_an_attempt() {
+    let authority = enrolled();
+    let stopped = mac_observation_profile(false, 200_000, LimaResourceProfile::Work);
+    let stopped_lifecycle = lifecycle_profile(
+        LimaLifecycleState::Stopped,
+        LimaResourceProfile::Work,
+        204_000,
+    );
+    let tick = worker_tick(&stopped_lifecycle);
+    for drifted in [
+        request("/Users/operator/.other-lima", CACHE_PATH),
+        request(LIMA_HOME, "/home/runner/.cache/other"),
+    ] {
+        let error = authority
+            .begin_attempt(PersonalWorkerLimaAttemptInput {
+                config: &config(),
+                mac: &stopped,
+                request: &drifted,
+                lifecycle: &stopped_lifecycle,
+                tick: &tick,
+            })
+            .expect_err("request drift");
+        assert_eq!(error.kind, PersonalWorkerLimaAuthorityErrorKind::Conflict);
+    }
+    assert!(authority.attempt().is_none());
+}
+
+#[test]
+fn prepared_attempt_blocks_replay_and_follows_exact_durable_phase_graph() {
+    let authority = enrolled();
+    let before_mac = mac_observation_profile(true, 200_000, LimaResourceProfile::Interactive);
+    let before = lifecycle_profile(
+        LimaLifecycleState::Running,
+        LimaResourceProfile::Interactive,
+        204_000,
+    );
+    let tick = worker_tick(&before);
+    assert!(
+        matches!(
+            tick.action(),
+            smolrunner::personal_worker_tick::PersonalWorkerTickAction::StopVm {
+                current_profile: LimaResourceProfile::Interactive,
+                target_after_stop: PersonalWorkerProfile::Work,
+                ..
+            }
+        ),
+        "unexpected running profile tick: {:?}",
+        tick.action()
+    );
+    let prepared = authority
+        .begin_attempt(PersonalWorkerLimaAttemptInput {
+            config: &config(),
+            mac: &before_mac,
+            request: &request(LIMA_HOME, CACHE_PATH),
+            lifecycle: &before,
+            tick: &tick,
+        })
+        .expect("prepared attempt");
+    let attempt = prepared.attempt().expect("attempt");
+    assert_eq!(
+        attempt.action(),
+        smolrunner::personal_worker_lima_authority::PersonalWorkerLimaAction::StopToWork
+    );
+    assert_eq!(attempt.store_revision().get(), 5);
+    assert_eq!(attempt.queue_generation().get(), 7);
+    assert_eq!(attempt.phase(), PersonalWorkerLimaAttemptPhase::Prepared);
+
+    let replay = prepared
+        .begin_attempt(PersonalWorkerLimaAttemptInput {
+            config: &config(),
+            mac: &before_mac,
+            request: &request(LIMA_HOME, CACHE_PATH),
+            lifecycle: &before,
+            tick: &tick,
+        })
+        .expect_err("existing attempt blocks replay");
+    assert_eq!(
+        replay.kind,
+        PersonalWorkerLimaAuthorityErrorKind::RecoveryRequired
+    );
+
+    let generation = attempt.generation();
+    let stopping = prepared
+        .checkpoint(
+            generation,
+            PersonalWorkerLimaAttemptPhase::StopStarted,
+            epoch(206_000),
+        )
+        .expect("stop began");
+    let stopped = stopping
+        .checkpoint(
+            generation,
+            PersonalWorkerLimaAttemptPhase::StopCompleted,
+            epoch(207_000),
+        )
+        .expect("stop completed");
+    let editing = stopped
+        .checkpoint(
+            generation,
+            PersonalWorkerLimaAttemptPhase::EditStarted,
+            epoch(208_000),
+        )
+        .expect("edit began");
+    let edited = editing
+        .checkpoint(
+            generation,
+            PersonalWorkerLimaAttemptPhase::EditCompleted,
+            epoch(209_000),
+        )
+        .expect("edit completed");
+    let starting = edited
+        .checkpoint(
+            generation,
+            PersonalWorkerLimaAttemptPhase::StartStarted,
+            epoch(210_000),
+        )
+        .expect("start began");
+    let started = starting
+        .checkpoint(
+            generation,
+            PersonalWorkerLimaAttemptPhase::StartCompleted,
+            epoch(211_000),
+        )
+        .expect("start completed");
+    let verifying = started
+        .checkpoint(
+            generation,
+            PersonalWorkerLimaAttemptPhase::VerifyStarted,
+            epoch(212_000),
+        )
+        .expect("verification began");
+    let running = mac_observation_profile(true, 214_000, LimaResourceProfile::Work);
+    let completed = verifying
+        .complete_attempt(
+            generation,
+            &config(),
+            &running,
+            &request(LIMA_HOME, CACHE_PATH),
+            &lifecycle_with_generation(
+                LimaLifecycleState::Running,
+                LimaResourceProfile::Work,
+                218_000,
+                2,
+            ),
+            epoch(219_000),
+        )
+        .expect("verified completion");
+    assert_eq!(
+        completed.attempt().expect("attempt").phase(),
+        PersonalWorkerLimaAttemptPhase::Completed
+    );
+    assert_eq!(
+        decode_personal_worker_lima_authority(
+            &encode_personal_worker_lima_authority(&completed).expect("encode")
+        )
+        .expect("decode"),
+        completed
+    );
+}
+
+#[test]
+fn stopped_start_and_profile_change_refuse_without_current_immutable_ownership() {
+    let authority = enrolled();
+    let before = lifecycle_profile(
+        LimaLifecycleState::Stopped,
+        LimaResourceProfile::Interactive,
+        204_000,
+    );
+    let tick = worker_tick(&before);
+    assert!(matches!(
+        tick.action(),
+        smolrunner::personal_worker_tick::PersonalWorkerTickAction::ChangeProfile {
+            from_profile: LimaResourceProfile::Interactive,
+            to_profile: LimaResourceProfile::Work,
+            ..
+        }
+    ));
+    let error = authority
+        .begin_attempt(PersonalWorkerLimaAttemptInput {
+            config: &config(),
+            mac: &mac_observation(false, 200_000),
+            request: &request(LIMA_HOME, CACHE_PATH),
+            lifecycle: &before,
+            tick: &tick,
+        })
+        .expect_err("stopped edit lacks current immutable ownership proof");
+    assert_eq!(
+        error.kind,
+        PersonalWorkerLimaAuthorityErrorKind::InvalidInput
+    );
+    assert!(authority.attempt().is_none());
+
+    let stopped_work = lifecycle_profile(
+        LimaLifecycleState::Stopped,
+        LimaResourceProfile::Work,
+        204_000,
+    );
+    let start_tick = worker_tick(&stopped_work);
+    assert!(matches!(
+        start_tick.action(),
+        smolrunner::personal_worker_tick::PersonalWorkerTickAction::StartVm { .. }
+    ));
+    let error = authority
+        .begin_attempt(PersonalWorkerLimaAttemptInput {
+            config: &config(),
+            mac: &mac_observation_profile(false, 200_000, LimaResourceProfile::Work),
+            request: &request(LIMA_HOME, CACHE_PATH),
+            lifecycle: &stopped_work,
+            tick: &start_tick,
+        })
+        .expect_err("stopped start lacks current immutable ownership proof");
+    assert_eq!(
+        error.kind,
+        PersonalWorkerLimaAuthorityErrorKind::InvalidInput
+    );
+}
+
+#[test]
+fn stop_attempt_preserves_the_exact_b01_target_after_stop() {
+    let authority = enrolled();
+    let before = lifecycle_profile(
+        LimaLifecycleState::Running,
+        LimaResourceProfile::Work,
+        1_900_000,
+    );
+    let tick = stop_tick(&before);
+    assert!(matches!(
+        tick.action(),
+        smolrunner::personal_worker_tick::PersonalWorkerTickAction::StopVm {
+            target_after_stop: PersonalWorkerProfile::Stopped,
+            ..
+        }
+    ));
+    let prepared = authority
+        .begin_attempt(PersonalWorkerLimaAttemptInput {
+            config: &config(),
+            mac: &mac_observation_profile(true, 1_896_000, LimaResourceProfile::Work),
+            request: &request(LIMA_HOME, CACHE_PATH),
+            lifecycle: &before,
+            tick: &tick,
+        })
+        .expect("prepared exact stop");
+    assert!(matches!(
+        prepared.attempt().expect("attempt").action(),
+        smolrunner::personal_worker_lima_authority::PersonalWorkerLimaAction::StopToStopped
+    ));
+    assert!(
+        String::from_utf8(encode_personal_worker_lima_authority(&prepared).expect("encode"))
+            .expect("JSON")
+            .contains("stop_to_stopped")
+    );
+}
+
+#[test]
+fn exhausted_authority_generation_refuses_without_reusing_a_generation() {
+    let canonical = String::from_utf8(
+        encode_personal_worker_lima_authority(&enrolled()).expect("canonical authority"),
+    )
+    .expect("UTF-8 JSON");
+    let exhausted_bytes = canonical
+        .replacen(
+            "\"authority_generation\":1",
+            "\"authority_generation\":1000000000000",
+            1,
+        )
+        .into_bytes();
+    let exhausted =
+        decode_personal_worker_lima_authority(&exhausted_bytes).expect("bounded maximum decodes");
+    let before_mac = mac_observation_profile(true, 200_000, LimaResourceProfile::Interactive);
+    let before = lifecycle_profile(
+        LimaLifecycleState::Running,
+        LimaResourceProfile::Interactive,
+        204_000,
+    );
+    let tick = worker_tick(&before);
+    let error = exhausted
+        .begin_attempt(PersonalWorkerLimaAttemptInput {
+            config: &config(),
+            mac: &before_mac,
+            request: &request(LIMA_HOME, CACHE_PATH),
+            lifecycle: &before,
+            tick: &tick,
+        })
+        .expect_err("an exhausted generation must not saturate and replay");
+    assert_eq!(
+        error.kind,
+        PersonalWorkerLimaAuthorityErrorKind::InvalidInput
+    );
+    assert_eq!(exhausted.authority_generation().get(), 1_000_000_000_000);
+    assert!(exhausted.attempt().is_none());
+}
+
+#[test]
+fn strict_decode_binds_each_phase_to_its_exact_durable_generation_delta() {
+    let authority = enrolled();
+    let before_mac = mac_observation_profile(true, 200_000, LimaResourceProfile::Interactive);
+    let before = lifecycle_profile(
+        LimaLifecycleState::Running,
+        LimaResourceProfile::Interactive,
+        204_000,
+    );
+    let tick = worker_tick(&before);
+    let prepared = authority
+        .begin_attempt(PersonalWorkerLimaAttemptInput {
+            config: &config(),
+            mac: &before_mac,
+            request: &request(LIMA_HOME, CACHE_PATH),
+            lifecycle: &before,
+            tick: &tick,
+        })
+        .expect("prepared attempt");
+    let canonical = String::from_utf8(
+        encode_personal_worker_lima_authority(&prepared).expect("canonical prepared authority"),
+    )
+    .expect("UTF-8 JSON");
+
+    let forged_phase = canonical
+        .replacen("\"phase\":\"prepared\"", "\"phase\":\"stop_completed\"", 1)
+        .into_bytes();
+    assert_eq!(
+        decode_personal_worker_lima_authority(&forged_phase)
+            .expect_err("phase cannot advance without its durable generations")
+            .kind,
+        PersonalWorkerLimaAuthorityErrorKind::CorruptDocument
+    );
+
+    let forged_generation = canonical
+        .replacen(
+            "\"authority_generation\":2",
+            "\"authority_generation\":999",
+            1,
+        )
+        .into_bytes();
+    assert_eq!(
+        decode_personal_worker_lima_authority(&forged_generation)
+            .expect_err("prepared must be exactly one generation after its attempt")
+            .kind,
+        PersonalWorkerLimaAuthorityErrorKind::CorruptDocument
+    );
+}
+
+#[test]
+fn unknown_version_unknown_fields_and_noncanonical_bytes_fail_closed() {
+    let bytes = encode_personal_worker_lima_authority(&enrolled()).expect("encode");
+    let mut value: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON");
+    value["schema_version"] = serde_json::json!(2);
+    let version = serde_json::to_vec(&value).expect("version bytes");
+    assert_eq!(
+        decode_personal_worker_lima_authority(&version)
+            .expect_err("unknown version")
+            .kind,
+        PersonalWorkerLimaAuthorityErrorKind::VersionIncompatible
+    );
+
+    value["schema_version"] = serde_json::json!(1);
+    value["identity"]["instance_id"] = serde_json::json!("other");
+    assert_eq!(
+        decode_personal_worker_lima_authority(
+            &serde_json::to_vec(&value).expect("identity drift bytes")
+        )
+        .expect_err("logical and physical persisted instances must match")
+        .kind,
+        PersonalWorkerLimaAuthorityErrorKind::CorruptDocument
+    );
+
+    value["identity"]["instance_id"] = serde_json::json!("smolrunner");
+    value["unknown"] = serde_json::json!(true);
+    assert_eq!(
+        decode_personal_worker_lima_authority(&serde_json::to_vec(&value).expect("unknown bytes"))
+            .expect_err("unknown field")
+            .kind,
+        PersonalWorkerLimaAuthorityErrorKind::CorruptDocument
+    );
+
+    let mut noncanonical = bytes;
+    noncanonical.push(b'\n');
+    assert_eq!(
+        decode_personal_worker_lima_authority(&noncanonical)
+            .expect_err("noncanonical bytes")
+            .kind,
+        PersonalWorkerLimaAuthorityErrorKind::CorruptDocument
+    );
+}
+
+#[test]
+fn fixture_uses_only_reviewed_observation_commands() {
+    assert!(memory_pressure_command().environment.is_empty());
+    assert!(swap_command().environment.is_empty());
+    assert!(power_command().environment.is_empty());
+    assert!(lima_process_command().environment.is_empty());
+    assert!(vm_stat_command().environment.is_empty());
+    assert!(logical_cpu_command().environment.is_empty());
+}
