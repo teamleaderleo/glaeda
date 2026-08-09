@@ -273,7 +273,7 @@ run_user_probe() {
       .[0].HostConfig.LogConfig.Path == $log_path and
       .[0].HostConfig.LogConfig.Size == "1.049MB"
     ' "$PROBE_CONTAINER_JSON" >/dev/null; then
-    /usr/bin/jq -c '.[0] | {
+    /usr/bin/jq -c --arg cgroup_parent "$PROBE_CGROUP_PARENT" '.[0] | {
       state: .State.Status,
       user: .Config.User,
       entrypoint: .Config.Entrypoint,
