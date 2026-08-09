@@ -282,11 +282,11 @@ inspection. `init` may establish mounts and conmon state but cannot execute the 
 ambiguity is recovery debt. From the first successful `init` through exact removal, an inner cleanup
 guard owns that exact container ID so a later gate failure cannot strand conmon and prevent the
 outer transient service/cgroup from terminating. R02 then matches the initialized container and
-generated specification
-to the durable attempt, image, protected source/cache/target objects, target-tmpfs limits,
-namespaces, cgroup, environment, and security policy. It durably checkpoints that exact stopped
-object, reconfirms protected host objects, and then takes the canonical durable-store lock for one
-final admission barrier. Under that lock it reopens the exact B05 plan/reservation, checks current
+generated specification to the durable attempt, image, protected source/cache/target objects,
+target-tmpfs limits, namespaces, cgroup, environment, and security policy. It durably checkpoints
+that exact stopped object, reconfirms protected host objects, and then takes the canonical
+durable-store lock for one final admission barrier. Under that lock it reopens the exact B05
+plan/reservation, checks current
 store revision and queue generation, ownership, holds/cancellation, every bound identity, and an
 injected current time, then atomically consumes/checkpoints start authority. The deadline remains
 the original B05 `not_after`/maximum-duration budget with preparation time already consumed; it is
@@ -302,6 +302,10 @@ exit code before `logs` is parsed into separately bounded stdout/stderr. A name 
 lookup evidence only. The displayed paths are private plan values, never public receipt fields.
 Source refers only to the protected immutable materialization, never the live checkout. The
 read-only dependency-cache mount is omitted when no independently verified generation exists.
+
+Because `init` launches stopped-container conmon, its expected tiny output goes to bounded
+attempt-private regular files rather than inherited pipes; R02 reads those files only after the
+client exits and requires the exact container ID plus empty stderr.
 
 Noble Podman 4.9.3 leaves both `start --attach` and `wait` clients waiting after this fixture's
 payload and container have exited cleanly; its `WaitForExit` path explicitly continues while the

@@ -130,7 +130,7 @@ run_user_probe() {
   PROBE_OWNED_CONTAINER_ID=$container_id
 
   set +e
-  init_output=$(/usr/bin/timeout --signal=KILL 20s \
+  /usr/bin/timeout --signal=KILL 20s \
     /usr/bin/podman \
     --remote=false \
     --runtime=/usr/bin/crun \
@@ -141,11 +141,15 @@ run_user_probe() {
     --cgroup-manager=cgroupfs \
     --tmpdir="$TMPDIR" \
     --transient-store \
-    container init "$container_id" </dev/null)
+    container init "$container_id" </dev/null \
+    > "$PROBE_INIT_STDOUT" 2> "$PROBE_INIT_STDERR"
   init_status=$?
   set -e
-  if (( init_status != 0 )) || [[ $init_output != "$container_id" ]]; then
-    printf 'init_status=%s init_output=%q\n' "$init_status" "$init_output" >&2
+  init_output=$(< "$PROBE_INIT_STDOUT")
+  stderr_size=$(/usr/bin/stat -Lc %s "$PROBE_INIT_STDERR")
+  if (( init_status != 0 || stderr_size != 0 )) || [[ $init_output != "$container_id" ]]; then
+    printf 'init_status=%s init_output=%q init_stderr_bytes=%s\n' \
+      "$init_status" "$init_output" "$stderr_size" >&2
     printf 'error: bounded init did not return the exact stopped container identity\n' >&2
     exit 1
   fi
@@ -552,6 +556,8 @@ probe_unit_owned=1
   PROBE_GROUP_SHA="$group_sha" \
   PROBE_HOOKS="$probe_root/hooks" \
   PROBE_IMAGE_JSON="$probe_root/runtime/image.json" \
+  PROBE_INIT_STDERR="$probe_root/runtime/init.stderr" \
+  PROBE_INIT_STDOUT="$probe_root/runtime/init.stdout" \
   PROBE_LOGFILE="$probe_root/runtime/container.log" \
   PROBE_NETWORK="$probe_root/network" \
   PROBE_PASSWD_SHA="$passwd_sha" \
