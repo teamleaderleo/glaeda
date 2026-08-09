@@ -12,9 +12,11 @@ and does not authorize a physical Lima or host mutation.
 - Date: 2026-08-09
 - Result: both jobs passed on fresh GitHub-hosted Ubuntu 24.04 VMs.
 
-The workflow has read-only repository permission, persists no checkout credential, receives no
-secret, and deletes only the exact disposable probe user, systemd unit, mount, and temporary root
-that it creates. It does not contact or mutate the personal Mac/Lima worker.
+The workflow has read-only repository permission and persists no checkout credential. The checkout
+action receives only GitHub's ephemeral read-only workflow token; no repository or organization
+secret is passed to the probe. Probe cleanup deletes only the exact disposable user, systemd unit,
+mount, and temporary root that it creates. It does not contact or mutate the personal Mac/Lima
+worker.
 
 ## Package baseline
 
@@ -91,8 +93,8 @@ either made exact or remains blocking.
 This fixture does **not** prove any of the following and must not be cited as if it did:
 
 - installation and digest verification of the immutable read-only image store;
-- `image inspect`, stopped `create`, generated OCI-spec inspection, the pre-start gate, `start
-  --attach`, bounded output capture, exit receipt, or exact container removal;
+- `image inspect`, stopped `create`, generated OCI-spec inspection, the pre-start gate,
+  `start --attach`, bounded output capture, exit receipt, or exact container removal;
 - AppArmor, seccomp, capability, device, host-file, hostname, resolver, timezone, or `/dev/shm`
   closure in the generated and running container;
 - proof that Netavark/Aardvark, fuse-overlayfs, remote transports, auth helpers, hooks, CDI, plugins,
