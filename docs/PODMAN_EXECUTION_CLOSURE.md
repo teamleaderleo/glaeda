@@ -21,7 +21,8 @@ The initial personal-worker runtime must instead use:
 
 - one exact root-owned runtime closure and immutable verification image generation;
 - a root-owned empty configuration home and explicit configuration files;
-- a fresh execution-private graph root, run root, temporary directory, and libpod database;
+- a fresh execution-private graph root, `XDG_RUNTIME_DIR`-derived run root, temporary directory,
+  and libpod database;
 - a root-owned read-only additional image store;
 - one steward-created attempt-private, byte-and-inode-bounded Cargo target tmpfs plus separately
   verified read-only cache inputs;
@@ -108,7 +109,7 @@ runtime/conmon/init paths and prove the effective configuration contains no alte
 | Edge | Effect | Required disposition |
 | --- | --- | --- |
 | `containers.conf` and modules | selects runtime, conmon, helpers, hooks, CDI, init, env, privileges, mounts, devices, cgroups, logging, and remote mode | Set `CONTAINERS_CONF` to one exact root-owned file; prohibit drop-ins, modules, `CONTAINERS_CONF_OVERRIDE`, and runner config. The file fixes empty CDI/plugin/device/volume lists as well as the admitted runtime settings. Parse and canonicalize the admitted subset, then content-bind it. |
-| `storage.conf` | selects graph/run roots, driver, mount program, additional stores, and mutable options | Set `CONTAINERS_STORAGE_CONF` to one exact root-owned file. It fixes both generic `graphroot` and the rootless-specific `rootless_storage_path` to the same run-private graph root, fixes the run root, and names only one root-owned read-only image store plus native overlay with no helper. The fixture must match Podman's reported effective roots; a generic graphroot alone does not override Noble rootless storage. |
+| `storage.conf` | selects graph/run roots, driver, mount program, additional stores, and mutable options | Set `CONTAINERS_STORAGE_CONF` to one exact root-owned file. It fixes both generic `graphroot` and the rootless-specific `rootless_storage_path` to the same run-private graph root, sets generic `runroot` to the same exact value derived below, and names only one root-owned read-only image store plus native overlay with no helper. Noble rootless Podman ignores generic `graphroot`/`runroot`: the effective graph root comes from `rootless_storage_path`, and the effective run root is exactly `<XDG_RUNTIME_DIR>/containers`. Bind both inputs to those values and require Podman's report to match; a generic field alone is not authority. |
 | `registries.conf` and drop-ins | changes name resolution, mirrors, and transports | Set `CONTAINERS_REGISTRIES_CONF` to one exact root-owned file and bind its associated drop-in directory as empty. Admit no search registries, mirrors, short-name aliases, or insecure transport. The command still uses a full digest reference and `--pull=never`. |
 | signature policy | can admit alternate transport/signature behavior | The 4.9.3 `run` surface has no global signature-policy selector. Prove the policy path is not opened when the exact local image exists and `--pull=never`; until then bind the applicable root-owned policy as reject-by-default and prohibit runner overrides. |
 | `mounts.conf` | silently copies or mounts host paths into every container | Use a root-owned empty `HOME` and `XDG_CONFIG_HOME`; prove the runner override absent and bind system/vendor files as absent or empty. Any entry is conflicting. |
@@ -158,7 +159,7 @@ kernel, account, or cgroup evidence current.
 | --- | --- | --- |
 | root-owned verification image store | installation-owned persistent, read-only to runner | Created only by an explicit journaled image-install operation. Bind installation ID, runtime generation, complete image manifest/config/layer identity, owner/mode, and store metadata. Unknown content blocks. |
 | execution graph root | run-private | Fresh empty directory under one durable attempt. It holds writable container layers only. Remove after cgroup emptiness, Podman/conmon exit, unmount proof, and exact ownership revalidation. |
-| execution run root | run-private | Fresh empty directory under the same attempt. It holds locks and transient libpod state. Never reused. |
+| execution run root | run-private | Exactly `<XDG_RUNTIME_DIR>/containers`, derived by Noble rootless Podman beneath a fresh empty attempt runtime directory. The generic `storage.conf` value is set identically but does not establish the effective root. It holds locks and transient libpod state. Never reused. |
 | libpod database/static/tmp/volume state | run-private | Use transient store and explicit run-private roots. A crash leaves recovery debt; it never becomes the next attempt's input. |
 | Cargo target output | run-private steward-mounted tmpfs, writable and executable only inside one attempt | Before Podman, the privileged steward uses the mount syscall rather than a discovered helper to create a new tmpfs beneath an exact protected mountpoint with hard `size` and `nr_inodes` ceilings, runner UID/GID, mode `0700`, `nosuid`, and `nodev`; Cargo requires `exec`. Hold and revalidate the mount/filesystem identity and empty root, then bind only that protected path into the container. Writes are charged to the same outer memory/swap cgroup as the payload. The immutable in-image gate verifies the actual filesystem, empty pre-state, mount flags, byte/inode limits, and cgroup controls before executing Cargo. Cleanup unmounts the exact filesystem only after container mount release and group emptiness; it is never promoted, persisted, or reused as verification input. |
 | dependency/cache inputs | optional installation-owned persistent, root-owned read-only | Initial R02 admits only content independently verified against the exact lock/toolchain/image generation. The container cannot write it, and no extracted source, compiler output, fingerprint, proc macro, build-script output, or test binary becomes trusted merely because a previous run created it. Absence is valid and changes performance only. |
@@ -297,9 +298,9 @@ and validated in the sealed config. No caller may append an option.
 The child environment starts empty and contains only exact private locations and identity strings:
 
 - root-owned empty `HOME` and `XDG_CONFIG_HOME`;
-- run-private `XDG_RUNTIME_DIR` and `TMPDIR`; the exact per-attempt `storage.conf` carries the
-  graph root and run root so the explicit additional image store is not discarded by a global
-  `--root` override;
+- run-private `XDG_RUNTIME_DIR` and `TMPDIR`; Noble derives the exact run root as
+  `<XDG_RUNTIME_DIR>/containers`, while the exact per-attempt `storage.conf` carries the matching
+  generic value and rootless-specific graph root so no global `--root` override is needed;
 - exact `CONTAINERS_CONF`, `CONTAINERS_STORAGE_CONF`,
   `CONTAINERS_REGISTRIES_CONF`, and empty `REGISTRY_AUTH_FILE`;
 - `DBUS_SESSION_BUS_ADDRESS=unix:path:<exact-absent-attempt-socket>` so the 4.9.3 pause-process move

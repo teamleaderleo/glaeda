@@ -323,26 +323,23 @@ mkdir -p \
   "$probe_root/graphroot" \
   "$probe_root/hooks" \
   "$probe_root/network" \
-  "$probe_root/runroot" \
   "$probe_root/runtime" \
   "$probe_root/tmp"
 chown -R "$probe_uid:$probe_gid" \
   "$probe_root/graphroot" \
   "$probe_root/network" \
-  "$probe_root/runroot" \
   "$probe_root/runtime" \
   "$probe_root/tmp"
 chmod 0700 \
   "$probe_root/graphroot" \
   "$probe_root/network" \
-  "$probe_root/runroot" \
   "$probe_root/runtime" \
   "$probe_root/tmp"
 printf '' > "$probe_root/config/containers.conf"
 printf 'unqualified-search-registries = []\nshort-name-mode = "enforcing"\n' \
   > "$probe_root/config/registries.conf"
 printf '[storage]\ndriver = "overlay"\nrunroot = "%s"\ngraphroot = "%s"\nrootless_storage_path = "%s"\n\n[storage.options]\nadditionalimagestores = []\n' \
-  "$probe_root/runroot" "$probe_root/graphroot" "$probe_root/graphroot" \
+  "$probe_root/runtime/containers" "$probe_root/graphroot" "$probe_root/graphroot" \
   > "$probe_root/config/storage.conf"
 printf '{}\n' > "$probe_root/auth/auth.json"
 chmod -R a-w "$probe_root/auth" "$probe_root/config" "$probe_root/hooks"
@@ -452,7 +449,7 @@ chmod 0555 "$probe_root/user-probe.sh"
   PROBE_GRAPHROOT="$probe_root/graphroot" \
   PROBE_INFO="$probe_root/runtime/info.json" \
   PROBE_NETWORK="$probe_root/network" \
-  PROBE_RUNROOT="$probe_root/runroot" \
+  PROBE_RUNROOT="$probe_root/runtime/containers" \
   PROBE_UID="$probe_uid" \
   PROBE_UNIT="$probe_unit" \
   REGISTRY_AUTH_FILE="$probe_root/auth/auth.json" \
