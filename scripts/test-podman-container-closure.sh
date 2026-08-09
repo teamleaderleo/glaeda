@@ -153,7 +153,7 @@ run_hostile_probe() {
   local image_id=$1
   local container_id cgroup_leaf cgroup_leaf_name init_output init_status start_output start_status
   local container_size exit_code free_blocks free_inodes kill_fd log_group log_links log_mode
-  local log_owner log_size memory_baseline memory_current pids_max_events
+  local log_owner log_size memory_baseline memory_current pids_max_events shmem_baseline shmem_current
   local payload_empty=0 resource_pressure_seen=0 stopped_seen=0
   local -a matching_cgroups matching_specs
 
@@ -269,8 +269,10 @@ run_hostile_probe() {
   fi
 
   memory_baseline=$(< "$cgroup_leaf/memory.current")
+  shmem_baseline=$(/usr/bin/awk '$1 == "shmem" { print $2 }' "$cgroup_leaf/memory.stat")
   pids_max_events=$(/usr/bin/awk '$1 == "max" { print $2 }' "$cgroup_leaf/pids.events")
-  if [[ ! $memory_baseline =~ ^[0-9]+$ ]] || [[ $pids_max_events != 0 ]]; then
+  if [[ ! $memory_baseline =~ ^[0-9]+$ ]] || [[ ! $shmem_baseline =~ ^[0-9]+$ ]] ||
+    [[ $pids_max_events != 0 ]]; then
     printf 'error: hostile payload cgroup did not begin with canonical fresh resource evidence\n' >&2
     exit 1
   fi
@@ -303,18 +305,20 @@ run_hostile_probe() {
     [[ -f $PROBE_HOSTILE_LOGFILE ]] && log_size=$(/usr/bin/stat -Lc %s "$PROBE_HOSTILE_LOGFILE")
     pids_max_events=$(/usr/bin/awk '$1 == "max" { print $2 }' "$cgroup_leaf/pids.events")
     memory_current=$(< "$cgroup_leaf/memory.current")
+    shmem_current=$(/usr/bin/awk '$1 == "shmem" { print $2 }' "$cgroup_leaf/memory.stat")
     read -r free_blocks free_inodes < <(/usr/bin/stat -f -c '%f %d' "$PROBE_TARGET")
     if (( log_size >= 65536 && log_size <= 1048576 && pids_max_events > 0 &&
-      memory_current >= memory_baseline + 7340032 && free_blocks == 0 && free_inodes == 0 )); then
+      memory_current >= memory_baseline + 7340032 && shmem_current >= shmem_baseline + 7340032 &&
+      free_blocks == 0 && free_inodes == 0 )); then
       resource_pressure_seen=1
       break
     fi
     /usr/bin/sleep 0.025
   done
   if (( resource_pressure_seen != 1 )); then
-    printf 'hostile_log_bytes=%s pids_max_events=%s memory_baseline=%s memory_current=%s free_blocks=%s free_inodes=%s\n' \
-      "$log_size" "$pids_max_events" "$memory_baseline" "$memory_current" "$free_blocks" \
-      "$free_inodes" >&2
+    printf 'hostile_log_bytes=%s pids_max_events=%s memory_baseline=%s memory_current=%s shmem_baseline=%s shmem_current=%s free_blocks=%s free_inodes=%s\n' \
+      "$log_size" "$pids_max_events" "$memory_baseline" "$memory_current" "$shmem_baseline" \
+      "$shmem_current" "$free_blocks" "$free_inodes" >&2
     printf 'error: hostile payload did not reach every bounded pressure signal\n' >&2
     exit 1
   fi
