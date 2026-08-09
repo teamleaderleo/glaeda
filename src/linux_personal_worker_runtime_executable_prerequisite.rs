@@ -290,10 +290,20 @@ impl ExecutableKind {
         }
     }
 
-    const fn expected_search(self) -> LinuxRuntimeDynamicSearchPolicy {
+    const fn expected_linkage(self) -> LinuxRuntimeElfLinkage {
         match self {
-            Self::Systemctl | Self::SystemdRun => LinuxRuntimeDynamicSearchPolicy::SystemdPrivate,
-            _ => LinuxRuntimeDynamicSearchPolicy::Default,
+            Self::Catatonit => LinuxRuntimeElfLinkage::Static,
+            _ => LinuxRuntimeElfLinkage::Dynamic,
+        }
+    }
+
+    const fn expected_search(self) -> Option<LinuxRuntimeDynamicSearchPolicy> {
+        match self {
+            Self::Catatonit => None,
+            Self::Systemctl | Self::SystemdRun => {
+                Some(LinuxRuntimeDynamicSearchPolicy::SystemdPrivate)
+            }
+            _ => Some(LinuxRuntimeDynamicSearchPolicy::Default),
         }
     }
 }
@@ -309,7 +319,7 @@ impl BoundExecutable {
         &mut self,
         architecture: PersonalWorkerRuntimeArchitecture,
     ) -> Result<(), PersonalWorkerRuntimeExecutablePrerequisiteError> {
-        self.file.load(architecture, self.kind.expected_search())
+        self.file.load(architecture, self.kind)
     }
 
     fn semantic_digest(
@@ -362,12 +372,12 @@ impl BoundExecutableFile {
     fn load(
         &mut self,
         architecture: PersonalWorkerRuntimeArchitecture,
-        expected_search: LinuxRuntimeDynamicSearchPolicy,
+        kind: ExecutableKind,
     ) -> Result<(), PersonalWorkerRuntimeExecutablePrerequisiteError> {
         let first = read_bounded(&mut self.file)?;
         let dependency = parse_linux_runtime_elf_dependency(&first, architecture)
             .map_err(|_| invalid_error())?;
-        validate_dependency(&dependency, expected_search)?;
+        validate_dependency(&dependency, kind)?;
         let content_digest: [u8; 32] = Sha256::digest(&first).into();
         let dependency_digest = dependency_digest(&dependency);
         self.file.seek(SeekFrom::Start(0)).map_err(|_| io_error())?;
@@ -521,12 +531,18 @@ impl DirectoryChain {
 
 fn validate_dependency(
     dependency: &LinuxRuntimeElfDependency,
-    expected_search: LinuxRuntimeDynamicSearchPolicy,
+    kind: ExecutableKind,
 ) -> Result<(), PersonalWorkerRuntimeExecutablePrerequisiteError> {
-    if dependency.linkage() != LinuxRuntimeElfLinkage::Dynamic
-        || dependency.loader().is_none()
-        || dependency.dynamic_search() != Some(expected_search)
-        || dependency.needed_libraries().is_empty()
+    if dependency.linkage() != kind.expected_linkage()
+        || dependency.dynamic_search() != kind.expected_search()
+        || match kind.expected_linkage() {
+            LinuxRuntimeElfLinkage::Static => {
+                dependency.loader().is_some() || !dependency.needed_libraries().is_empty()
+            }
+            LinuxRuntimeElfLinkage::Dynamic => {
+                dependency.loader().is_none() || dependency.needed_libraries().is_empty()
+            }
+        }
     {
         return Err(invalid_error());
     }
@@ -753,7 +769,7 @@ mod tests {
                     .unwrap_or_else(|error| {
                         panic!("open executable file kind {}: {error:?}", kind.tag())
                     });
-            file.load(architecture, kind.expected_search())
+            file.load(architecture, kind)
                 .unwrap_or_else(|error| panic!("load executable kind {}: {error:?}", kind.tag()));
         }
         let live = observe_personal_worker_runtime_executable_prerequisite(&project, architecture)
@@ -906,6 +922,11 @@ mod tests {
         assert_eq!(paths[10], "/usr/bin/newgidmap");
         assert_eq!(ExecutableKind::Newuidmap.expected_mode(), 0o4755);
         assert_eq!(ExecutableKind::Newgidmap.expected_mode(), 0o4755);
+        assert_eq!(
+            ExecutableKind::Catatonit.expected_linkage(),
+            LinuxRuntimeElfLinkage::Static
+        );
+        assert_eq!(ExecutableKind::Catatonit.expected_search(), None);
         assert!(
             ExecutableKind::ALL[..9]
                 .iter()
