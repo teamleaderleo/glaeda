@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rustix::process;
@@ -46,7 +47,16 @@ impl Fixture {
             .find(|candidate| candidate.is_file())
             .unwrap_or_else(|| panic!("no reviewed fixture binary for {name}"));
         let destination = self.path(name);
-        fs::copy(source, &destination).expect("copy fixture binary");
+        // Keep the writable destination descriptor out of this multithreaded test process.
+        // Otherwise a concurrent fork can briefly inherit it and make an immediate exec of the
+        // copied inode fail with ETXTBSY even though `fs::copy` has returned in this thread.
+        let status = Command::new("/usr/bin/cp")
+            .arg("--")
+            .arg(source)
+            .arg(&destination)
+            .status()
+            .expect("spawn fixture copy");
+        assert!(status.success(), "copy fixture binary");
         fs::set_permissions(&destination, fs::Permissions::from_mode(0o755))
             .expect("set fixture executable mode");
         destination
