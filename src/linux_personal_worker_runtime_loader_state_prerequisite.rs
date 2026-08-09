@@ -832,7 +832,14 @@ const fn io_error() -> PersonalWorkerRuntimeLoaderStatePrerequisiteError {
 
 #[cfg(test)]
 mod tests {
+    use std::fs as stdfs;
+    use std::io::ErrorKind;
+    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
+
+    static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
     fn project() -> ProjectIdentity {
         ProjectIdentity {
@@ -932,6 +939,175 @@ mod tests {
         assert!(debug.contains(REDACTED));
         for forbidden in ["/etc", "ld.so", "sha256:", "example/runtime"] {
             assert!(!debug.contains(forbidden));
+        }
+
+        let fixture = Fixture::new();
+        fixture.populate();
+        let owner = (
+            rustix::process::geteuid().as_raw(),
+            rustix::process::getegid().as_raw(),
+        );
+        observe_at(&fixture.root, owner, &project(), architecture, || {})
+            .expect("observe copied loader state");
+
+        fixture.set_mode(ROOT_CONFIG, 0o0664);
+        let writable = observe_at(&fixture.root, owner, &project(), architecture, || {})
+            .expect_err("group-writable root loader configuration");
+        assert_eq!(
+            writable.kind,
+            PersonalWorkerRuntimeLoaderStatePrerequisiteErrorKind::UnsafeFilesystem
+        );
+        fixture.set_mode(ROOT_CONFIG, 0o0644);
+
+        let preload = fixture.etc().join(PRELOAD_FILE);
+        stdfs::write(&preload, b"forbidden\n").expect("create preload fixture");
+        stdfs::set_permissions(&preload, stdfs::Permissions::from_mode(0o0644))
+            .expect("set preload mode");
+        let preloaded = observe_at(&fixture.root, owner, &project(), architecture, || {})
+            .expect_err("preload presence");
+        assert_eq!(
+            preloaded.kind,
+            PersonalWorkerRuntimeLoaderStatePrerequisiteErrorKind::UnsafeConfiguration
+        );
+        stdfs::remove_file(preload).expect("remove preload fixture");
+
+        let unsafe_fragment = fixture.config_dir().join("zz-unsafe.conf");
+        stdfs::write(&unsafe_fragment, b"/tmp/unreviewed\n")
+            .expect("create unsafe config fragment");
+        stdfs::set_permissions(&unsafe_fragment, stdfs::Permissions::from_mode(0o0644))
+            .expect("set unsafe config mode");
+        let unsafe_search = observe_at(&fixture.root, owner, &project(), architecture, || {})
+            .expect_err("unsafe loader search fragment");
+        assert_eq!(
+            unsafe_search.kind,
+            PersonalWorkerRuntimeLoaderStatePrerequisiteErrorKind::UnsafeConfiguration
+        );
+        stdfs::remove_file(unsafe_fragment).expect("remove unsafe config fragment");
+
+        let cache = fixture.etc().join(CACHE_FILE);
+        let changed = observe_at(&fixture.root, owner, &project(), architecture, || {
+            stdfs::set_permissions(&cache, stdfs::Permissions::from_mode(0o0664))
+                .expect("change cache mode during observation");
+        })
+        .expect_err("cache metadata drift");
+        assert_eq!(
+            changed.kind,
+            PersonalWorkerRuntimeLoaderStatePrerequisiteErrorKind::ChangedDuringRead
+        );
+        fixture.set_mode(CACHE_FILE, 0o0644);
+    }
+
+    struct Fixture {
+        parent: std::path::PathBuf,
+        parent_identity: (u64, u64),
+        root: std::path::PathBuf,
+        root_identity: (u64, u64),
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let parent = std::env::current_dir()
+                .expect("current directory")
+                .join("target/r01-loader-state-fixtures");
+            stdfs::create_dir_all(&parent).expect("create loader fixture parent");
+            let parent_metadata =
+                stdfs::symlink_metadata(&parent).expect("inspect loader fixture parent");
+            assert!(
+                parent_metadata.file_type().is_dir() && !parent_metadata.file_type().is_symlink(),
+                "loader fixture parent must be a real directory"
+            );
+            let parent_identity = (parent_metadata.dev(), parent_metadata.ino());
+            for _ in 0..128 {
+                let nonce = FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed);
+                let root = parent.join(format!("{}-{nonce}", std::process::id()));
+                let mut builder = stdfs::DirBuilder::new();
+                builder.mode(0o0700);
+                match builder.create(&root) {
+                    Ok(()) => {
+                        let root_metadata = stdfs::symlink_metadata(&root)
+                            .expect("inspect created loader fixture root");
+                        let fixture = Self {
+                            parent: parent.clone(),
+                            parent_identity,
+                            root,
+                            root_identity: (root_metadata.dev(), root_metadata.ino()),
+                        };
+                        stdfs::create_dir_all(fixture.config_dir())
+                            .expect("create loader config fixture directory");
+                        return fixture;
+                    }
+                    Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("create private loader fixture root: {error}"),
+                }
+            }
+            panic!("allocate unique loader fixture root")
+        }
+
+        fn populate(&self) {
+            for name in [ROOT_CONFIG, CACHE_FILE] {
+                stdfs::copy(Path::new("/etc").join(name), self.etc().join(name))
+                    .unwrap_or_else(|error| panic!("copy loader fixture {name}: {error}"));
+                self.set_mode(name, 0o0644);
+            }
+            for entry in
+                stdfs::read_dir("/etc/ld.so.conf.d").expect("enumerate live loader fragments")
+            {
+                let entry = entry.expect("read live loader fragment entry");
+                let name = entry.file_name();
+                if !name.as_encoded_bytes().ends_with(b".conf") {
+                    continue;
+                }
+                let destination = self.config_dir().join(&name);
+                stdfs::copy(entry.path(), &destination).expect("copy loader fragment");
+                stdfs::set_permissions(&destination, stdfs::Permissions::from_mode(0o0644))
+                    .expect("set loader fragment mode");
+            }
+        }
+
+        fn etc(&self) -> std::path::PathBuf {
+            self.root.join("etc")
+        }
+
+        fn config_dir(&self) -> std::path::PathBuf {
+            self.etc().join("ld.so.conf.d")
+        }
+
+        fn set_mode(&self, name: &str, mode: u32) {
+            stdfs::set_permissions(self.etc().join(name), stdfs::Permissions::from_mode(mode))
+                .unwrap_or_else(|error| panic!("set loader fixture mode for {name}: {error}"));
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            assert_eq!(self.root.parent(), Some(self.parent.as_path()));
+            let parent_metadata =
+                stdfs::symlink_metadata(&self.parent).expect("revalidate loader fixture parent");
+            assert_eq!(
+                (parent_metadata.dev(), parent_metadata.ino()),
+                self.parent_identity,
+                "loader fixture parent was rebound"
+            );
+            let root_metadata =
+                stdfs::symlink_metadata(&self.root).expect("revalidate loader fixture root");
+            assert!(
+                root_metadata.file_type().is_dir() && !root_metadata.file_type().is_symlink(),
+                "loader fixture root must remain a real directory"
+            );
+            assert_eq!(
+                (root_metadata.dev(), root_metadata.ino()),
+                self.root_identity,
+                "loader fixture root was rebound"
+            );
+            stdfs::remove_dir_all(&self.root).expect("remove owned loader fixture");
+            if let Err(error) = stdfs::remove_dir(&self.parent)
+                && !matches!(
+                    error.kind(),
+                    ErrorKind::NotFound | ErrorKind::DirectoryNotEmpty
+                )
+            {
+                panic!("remove empty loader fixture parent: {error}");
+            }
         }
     }
 }
