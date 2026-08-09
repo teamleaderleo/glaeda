@@ -50,6 +50,7 @@ run_user_probe() {
   local init_output init_status start_output start_status inspect_status logs_status completion_seen=0
   local image_size container_size spec_size spec_path apparmor_profile
   local log_owner log_group log_mode log_links log_size stderr_size exit_code
+  local seccomp_sha_now
 
   mapfile -d '' network_entries_before < <(
     /usr/bin/find "$PROBE_NETWORK" -mindepth 1 -maxdepth 1 -print0
@@ -58,6 +59,12 @@ run_user_probe() {
     ! validate_network_lock "$PROBE_NETWORK/cni.lock" ||
     ! validate_network_lock "$PROBE_NETWORK/netavark.lock"; then
     printf 'error: exact precreated network lock state was absent before image installation\n' >&2
+    exit 1
+  fi
+
+  seccomp_sha_now=$(/usr/bin/sha256sum "$PROBE_SECCOMP_PROFILE" | /usr/bin/awk '{ print $1 }')
+  if [[ $seccomp_sha_now != "$PROBE_SECCOMP_SHA" ]]; then
+    printf 'error: exact packaged seccomp profile changed before container creation\n' >&2
     exit 1
   fi
 
@@ -100,6 +107,8 @@ run_user_probe() {
     --image-volume=ignore \
     --cap-drop=all \
     --security-opt=no-new-privileges \
+    --security-opt="apparmor=$PROBE_APPARMOR_PROFILE" \
+    --security-opt="seccomp=$PROBE_SECCOMP_PROFILE" \
     --pids-limit=32 \
     --memory=67108864 \
     --memory-swap=67108864 \
@@ -210,15 +219,15 @@ run_user_probe() {
   spec_path=${matching_specs[0]}
   spec_size=$(/usr/bin/stat -Lc %s "$spec_path")
   if (( spec_size == 0 || spec_size > 1048576 )) ||
-    ! /usr/bin/jq -e '
+    ! /usr/bin/jq -e \
+      --arg apparmor_profile "$PROBE_APPARMOR_PROFILE" '
       .process.user.uid == 1000 and
       .process.user.gid == 1000 and
+      .process.user.umask == 18 and
+      .process.user.additionalGids == [1000] and
       .process.noNewPrivileges == true and
-      .process.capabilities.bounding == [] and
-      .process.capabilities.effective == [] and
-      .process.capabilities.inheritable == [] and
-      .process.capabilities.permitted == [] and
-      .process.capabilities.ambient == [] and
+      (.process.capabilities | type == "object" and length == 0) and
+      .process.apparmorProfile == $apparmor_profile and
       ([.mounts[] | select(.destination == "/etc/passwd" or .destination == "/etc/group")] | length) == 0 and
       .linux.seccomp != null
     ' "$spec_path" >/dev/null; then
@@ -234,8 +243,7 @@ run_user_probe() {
     exit 1
   fi
   apparmor_profile=$(/usr/bin/jq -r '.process.apparmorProfile // ""' "$spec_path")
-  if [[ -z $apparmor_profile || $apparmor_profile == unconfined ]] ||
-    [[ ! $apparmor_profile =~ ^containers-default-[0-9]+([.][0-9]+){2}$ ]]; then
+  if [[ $apparmor_profile != "$PROBE_APPARMOR_PROFILE" ]]; then
     printf 'apparmor_profile=%q\n' "$apparmor_profile" >&2
     printf 'error: generated OCI spec lacks a bounded AppArmor profile\n' >&2
     exit 1
@@ -424,6 +432,34 @@ for command in \
   fi
 done
 
+probe_apparmor_profile=docker-default
+probe_apparmor_profiles=/sys/kernel/security/apparmor/profiles
+if [[ ! -r $probe_apparmor_profiles ]] ||
+  ! /usr/bin/grep -Fxq "$probe_apparmor_profile (enforce)" "$probe_apparmor_profiles"; then
+  printf 'error: exact disposable AppArmor profile is not loaded in enforce mode\n' >&2
+  exit 1
+fi
+
+probe_seccomp_profile=/usr/share/containers/seccomp.json
+if [[ -L $probe_seccomp_profile ]] || [[ ! -f $probe_seccomp_profile ]]; then
+  printf 'error: exact packaged seccomp profile is absent or not a regular file\n' >&2
+  exit 1
+fi
+read -r seccomp_owner seccomp_group seccomp_mode seccomp_links seccomp_size < <(
+  /usr/bin/stat -Lc '%u %g %a %h %s' "$probe_seccomp_profile"
+)
+if [[ $seccomp_owner != 0 ]] || [[ $seccomp_group != 0 ]] ||
+  (( (8#$seccomp_mode & 0022) != 0 )) || [[ $seccomp_links != 1 ]] ||
+  (( seccomp_size == 0 || seccomp_size > 1048576 )); then
+  printf 'error: exact packaged seccomp profile metadata is unsafe or unbounded\n' >&2
+  exit 1
+fi
+seccomp_sha=$(/usr/bin/sha256sum "$probe_seccomp_profile" | /usr/bin/awk '{ print $1 }')
+if [[ ! $seccomp_sha =~ ^[0-9a-f]{64}$ ]]; then
+  printf 'error: exact packaged seccomp profile digest is noncanonical\n' >&2
+  exit 1
+fi
+
 case "$(/usr/bin/uname -m)" in
   aarch64 | x86_64) ;;
   *)
@@ -557,6 +593,7 @@ probe_unit_owned=1
   LC_ALL=C \
   LOGNAME="$probe_user" \
   PATH=/usr/bin \
+  PROBE_APPARMOR_PROFILE="$probe_apparmor_profile" \
   PROBE_CIDFILE="$probe_root/runtime/container.cid" \
   PROBE_CAPTURE_STDERR="$probe_root/runtime/logs.stderr" \
   PROBE_CONTAINER_JSON="$probe_root/runtime/container.json" \
@@ -572,6 +609,8 @@ probe_unit_owned=1
   PROBE_ROOT="$probe_root" \
   PROBE_ROOTFS_TAR="$probe_root/rootfs.tar" \
   PROBE_RUNROOT="$probe_root/runtime/containers" \
+  PROBE_SECCOMP_PROFILE="$probe_seccomp_profile" \
+  PROBE_SECCOMP_SHA="$seccomp_sha" \
   PROBE_GID="$probe_gid" \
   PROBE_UID="$probe_uid" \
   PROBE_USER="$probe_user" \
