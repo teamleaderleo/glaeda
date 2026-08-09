@@ -23,8 +23,8 @@ pub mod personal_worker_mac_observation;
 mod personal_worker_runner_readiness;
 
 use personal_worker_mac_observation::{
-    MacHostHeadroomEvidence, PERSONAL_WORKER_MAC_OBSERVATION_SCHEMA_VERSION,
-    PersonalWorkerMacObservationReport, PersonalWorkerMacObservationTiming,
+    PersonalWorkerMacObservation, PersonalWorkerMacObservationAdapter,
+    PersonalWorkerMacObservationClock, logical_cpu_command, vm_stat_command,
 };
 use personal_worker_runner_readiness::{
     PersonalWorkerRunnerReadinessAdapter, PersonalWorkerRunnerReadinessDisposition,
@@ -43,18 +43,12 @@ use smolrunner::execution_admission::{
 };
 use smolrunner::lima_lifecycle::LimaResourceProfile;
 use smolrunner::lima_observation::{
-    LIMA_OBSERVATION_SCHEMA_VERSION, LimaArchitecture, LimaConfiguredInstance,
-    LimaFilesystemObjectIdentity, LimaGuestObservation, LimaGuestResources, LimaInstanceName,
-    LimaInstanceObservationReport, LimaObservationClock, LimaObservationFreshness,
-    LimaObservationRequest, LimaObservationTiming, LimaObservedGuest, LimaPersistentIdentity,
-    LimaRuntimeState, LimaVmType,
+    LimaArchitecture, LimaFilesystemObjectIdentity, LimaInstanceName, LimaObservationAdapter,
+    LimaObservationClock, LimaObservationRequest, LimaRuntimeState, LimaVmType,
 };
-use smolrunner::mac_availability::{
-    AvailabilityRequest, HostPowerSource, MemoryPressure, ObservationFreshness,
-};
+use smolrunner::mac_availability::AvailabilityRequest;
 use smolrunner::macos_resource_observation::{
-    BatteryChargeState, MACOS_RESOURCE_OBSERVATION_SCHEMA_VERSION, MacOsResourceReport,
-    MacPowerObservation, ObservationCompleteness,
+    lima_process_command, memory_pressure_command, power_command, swap_command,
 };
 use smolrunner::operator_config::{
     GuestWorkspacePath, OperatorConfig, OperatorIdlePolicy, OperatorOutputPreference,
@@ -214,6 +208,128 @@ impl LimaObservationClock for Clock {
     }
 }
 
+struct MacClock(Mutex<VecDeque<u64>>);
+
+impl MacClock {
+    fn new(values: impl IntoIterator<Item = u64>) -> Self {
+        Self(Mutex::new(values.into_iter().collect()))
+    }
+}
+
+impl PersonalWorkerMacObservationClock for MacClock {
+    fn unix_millis(&self) -> io::Result<u64> {
+        self.0
+            .lock()
+            .expect("Mac clock lock")
+            .pop_front()
+            .ok_or_else(|| io::Error::other("private Mac clock fixture exhausted"))
+    }
+}
+
+struct MacExecutor {
+    state: LimaRuntimeState,
+    profile: LimaResourceProfile,
+    lima_home: String,
+}
+
+impl CommandExecutor for MacExecutor {
+    fn execute(&self, _spec: &CommandSpec) -> io::Result<ExecutionRecord> {
+        Err(io::Error::other("untimed Mac observation is forbidden"))
+    }
+}
+
+impl TimedCommandExecutor for MacExecutor {
+    fn execute_with_timeout(
+        &self,
+        spec: &CommandSpec,
+        _timeout: Duration,
+    ) -> io::Result<ExecutionRecord> {
+        let argv = spec.displayed_argv();
+        let output = self.output_for(&argv)?;
+        Ok(ExecutionRecord {
+            argv,
+            environment_keys: spec.environment.keys().cloned().collect(),
+            status: Some(0),
+            success: true,
+            stdout: output,
+            stderr: String::new(),
+        })
+    }
+}
+
+impl MacExecutor {
+    fn output_for(&self, argv: &[String]) -> io::Result<String> {
+        let envelope = self.profile.envelope();
+        if argv == memory_pressure_command().displayed_argv() {
+            return Ok("1\n".to_owned());
+        }
+        if argv == swap_command().displayed_argv() {
+            return Ok("total = 4096.00M used = 1024.00M free = 3072.00M (encrypted)\n".to_owned());
+        }
+        if argv == power_command().displayed_argv() {
+            return Ok(
+                "Now drawing from 'AC Power'\n -InternalBattery-0\t100%; charged;\n".to_owned(),
+            );
+        }
+        if argv == lima_process_command().displayed_argv() {
+            return Ok(" 100 1 1.0 2048 00:05 /opt/homebrew/bin/limactl\n".to_owned());
+        }
+        if argv == vm_stat_command().displayed_argv() {
+            return Ok(concat!(
+                "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n",
+                "Pages free: 100000.\n",
+                "Pages active: 200000.\n",
+                "Pages inactive: 300000.\n",
+                "Pages speculative: 100000.\n",
+                "Pages purgeable: 50000.\n",
+            )
+            .to_owned());
+        }
+        if argv == logical_cpu_command().displayed_argv() {
+            return Ok("10\n".to_owned());
+        }
+        if argv.get(2).map(String::as_str) == Some("list") {
+            let state = match self.state {
+                LimaRuntimeState::Uninitialized => "Uninitialized",
+                LimaRuntimeState::Installing => "Installing",
+                LimaRuntimeState::Broken => "Broken",
+                LimaRuntimeState::Stopped => "Stopped",
+                LimaRuntimeState::Running => "Running",
+            };
+            return Ok(format!(
+                "{{\"name\":\"smolrunner\",\"status\":\"{state}\",\"dir\":\"{}/smolrunner\",\"vmType\":\"vz\",\"arch\":\"aarch64\",\"cpus\":{},\"memory\":{},\"disk\":{},\"errors\":[]}}\n",
+                self.lima_home,
+                envelope.vcpus,
+                envelope.memory_bytes,
+                80 * GIB,
+            ));
+        }
+        match argv.get(5).map(String::as_str) {
+            Some("/usr/bin/uname") => Ok("aarch64\n".to_owned()),
+            Some("/usr/bin/getconf")
+                if argv.get(6).map(String::as_str) == Some("_NPROCESSORS_ONLN") =>
+            {
+                Ok(format!("{}\n", envelope.vcpus))
+            }
+            Some("/usr/bin/getconf") if argv.get(6).map(String::as_str) == Some("PAGE_SIZE") => {
+                Ok("4096\n".to_owned())
+            }
+            Some("/usr/bin/getconf") if argv.get(6).map(String::as_str) == Some("_PHYS_PAGES") => {
+                Ok(format!("{}\n", envelope.memory_bytes / 4096))
+            }
+            Some("/usr/bin/sha256sum") => Ok(format!("{}  /etc/machine-id\n", "a".repeat(64))),
+            Some("/usr/bin/stat") if argv.last().map(String::as_str) == Some("/") => {
+                Ok("2049:2\n".to_owned())
+            }
+            Some("/usr/bin/stat") => Ok("2049:3\n".to_owned()),
+            _ => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "private Mac command fixture missing",
+            )),
+        }
+    }
+}
+
 fn digest(hex: &str) -> Sha256Digest {
     Sha256Digest::parse(&format!("sha256:{}", hex.repeat(64))).expect("digest")
 }
@@ -237,10 +353,14 @@ fn config_with_availability(root: &Path, availability: AvailabilityRequest) -> O
 }
 
 fn runner_request() -> ActionsRunnerReadinessRequest {
+    runner_request_for(LIMA_HOME)
+}
+
+fn runner_request_for(lima_home: &str) -> ActionsRunnerReadinessRequest {
     ActionsRunnerReadinessRequest::new(
         LimaInstanceName::parse("smolrunner").expect("instance"),
         ActionsRunnerName::parse("smolrunner-macbook").expect("runner name"),
-        LIMA_HOME,
+        lima_home,
         RUNNER_ROOT,
         DRAIN_MARKER,
         digest("b"),
@@ -248,14 +368,14 @@ fn runner_request() -> ActionsRunnerReadinessRequest {
     .expect("runner request")
 }
 
-fn lima_request() -> LimaObservationRequest {
+fn lima_request_for(lima_home: &str, max_age_seconds: u64) -> LimaObservationRequest {
     LimaObservationRequest::new(
         LimaInstanceName::parse("smolrunner").expect("instance"),
-        LIMA_HOME,
+        lima_home,
         LimaVmType::Vz,
         LimaArchitecture::Aarch64,
         CACHE_PATH,
-        35,
+        max_age_seconds,
     )
     .expect("Lima request")
 }
@@ -271,94 +391,50 @@ fn expected_runner_identity() -> ActionsRunnerConfiguredIdentity {
     }
 }
 
-fn mac_report(
+fn sealed_mac_observation(
     config: &OperatorConfig,
     state: LimaRuntimeState,
-) -> PersonalWorkerMacObservationReport {
-    mac_report_for_profile(config, state, LimaResourceProfile::Interactive)
+) -> PersonalWorkerMacObservation {
+    sealed_mac_observation_with(
+        config,
+        state,
+        LimaResourceProfile::Interactive,
+        LIMA_HOME,
+        35_000,
+        35,
+    )
 }
 
-fn mac_report_for_profile(
+fn sealed_mac_observation_for_profile(
     config: &OperatorConfig,
     state: LimaRuntimeState,
     profile: LimaResourceProfile,
-) -> PersonalWorkerMacObservationReport {
-    let envelope = profile.envelope();
-    let guest = if state == LimaRuntimeState::Running {
-        LimaGuestObservation::Observed(LimaObservedGuest {
-            resources: LimaGuestResources {
-                architecture: LimaArchitecture::Aarch64,
-                cpus: envelope.vcpus,
-                memory_bytes: envelope.memory_bytes,
+) -> PersonalWorkerMacObservation {
+    sealed_mac_observation_with(config, state, profile, LIMA_HOME, 35_000, 35)
+}
+
+fn sealed_mac_observation_with(
+    config: &OperatorConfig,
+    state: LimaRuntimeState,
+    profile: LimaResourceProfile,
+    lima_home: &str,
+    freshness_window_millis: u64,
+    lima_max_age_seconds: u64,
+) -> PersonalWorkerMacObservation {
+    PersonalWorkerMacObservationAdapter::new(freshness_window_millis, Duration::from_secs(5))
+        .expect("Mac adapter")
+        .observe(
+            config,
+            &lima_request_for(lima_home, lima_max_age_seconds),
+            &LimaObservationAdapter::new("/opt/homebrew/bin/limactl").expect("Lima adapter"),
+            &MacExecutor {
+                state,
+                profile,
+                lima_home: lima_home.to_owned(),
             },
-            persistent_identity: LimaPersistentIdentity {
-                guest_machine_id_digest: digest("a"),
-                root_filesystem: LimaFilesystemObjectIdentity {
-                    device_id: 2049,
-                    inode: 2,
-                },
-                cache_directory: LimaFilesystemObjectIdentity {
-                    device_id: 2049,
-                    inode: 3,
-                },
-            },
-        })
-    } else {
-        LimaGuestObservation::NotRunning {
-            runtime_state: state,
-        }
-    };
-    PersonalWorkerMacObservationReport {
-        schema_version: PERSONAL_WORKER_MAC_OBSERVATION_SCHEMA_VERSION,
-        config_identity: config.identity().clone(),
-        requested_availability: config.availability(),
-        timing: PersonalWorkerMacObservationTiming {
-            started_at_millis: 90_000,
-            observed_at_millis: 95_000,
-            expires_at_millis: 130_000,
-            duration_millis: 5_000,
-        },
-        host_headroom: MacHostHeadroomEvidence {
-            available_memory_bytes: 16 * GIB,
-            logical_cpu_count: 10,
-        },
-        host_resources: MacOsResourceReport {
-            schema_version: MACOS_RESOURCE_OBSERVATION_SCHEMA_VERSION,
-            observed_at_millis: 95_000,
-            freshness: ObservationFreshness::Fresh,
-            completeness: ObservationCompleteness::Complete,
-            memory_pressure: MemoryPressure::Normal,
-            swap: None,
-            power: MacPowerObservation {
-                source: HostPowerSource::Ac,
-                battery_percent: None,
-                charge_state: BatteryChargeState::Charged,
-            },
-            lima_processes: vec![],
-            problems: vec![],
-        },
-        lima: LimaInstanceObservationReport {
-            schema_version: LIMA_OBSERVATION_SCHEMA_VERSION,
-            instance: LimaInstanceName::parse("smolrunner").expect("instance"),
-            configured: LimaConfiguredInstance {
-                runtime_state: state,
-                vm_type: LimaVmType::Vz,
-                architecture: LimaArchitecture::Aarch64,
-                cpus: envelope.vcpus,
-                memory_bytes: envelope.memory_bytes,
-                primary_disk_bytes: 80 * GIB,
-            },
-            guest,
-            timing: LimaObservationTiming {
-                started_at_unix_seconds: 90,
-                observed_at_unix_seconds: 95,
-                expires_at_unix_seconds: 130,
-                duration_seconds: 5,
-                freshness: LimaObservationFreshness::Fresh,
-            },
-        },
-        lima_profile: profile,
-    }
+            &MacClock::new([90_000, 91_000, 95_000, 95_000]),
+        )
+        .expect("sealed Mac observation")
 }
 
 fn millis(value: u64) -> EpochMillis {
@@ -567,8 +643,7 @@ fn idle_ready_binds_exact_sources_timeout_and_private_evidence() {
     let executor = TimedExecutor::new(running_steps(false, false));
     let observation = adapter().observe(
         &config,
-        &mac_report(&config, LimaRuntimeState::Running),
-        &lima_request(),
+        &sealed_mac_observation(&config, LimaRuntimeState::Running),
         &runner_request(),
         &expected_runner_identity(),
         &status,
@@ -635,12 +710,11 @@ fn coherent_busy_and_draining_states_bind_the_exact_active_job() {
         let (status, job) = durable_reads(&root, &config, &document, true);
         let observation = adapter().observe(
             &config,
-            &mac_report_for_profile(
+            &sealed_mac_observation_for_profile(
                 &config,
                 LimaRuntimeState::Running,
                 LimaResourceProfile::Work,
             ),
-            &lima_request(),
             &runner_request(),
             &expected_runner_identity(),
             &status,
@@ -672,12 +746,11 @@ fn reserved_job_with_idle_listener_is_ready_for_the_bounded_execution_step() {
     let (status, job) = durable_reads(&root, &config, &document, true);
     let observation = adapter().observe(
         &config,
-        &mac_report_for_profile(
+        &sealed_mac_observation_for_profile(
             &config,
             LimaRuntimeState::Running,
             LimaResourceProfile::Work,
         ),
-        &lima_request(),
         &runner_request(),
         &expected_runner_identity(),
         &status,
@@ -724,8 +797,7 @@ fn stopped_and_installing_lima_create_observation_debt_without_commands() {
         let executor = TimedExecutor::default();
         let observation = adapter().observe(
             &config,
-            &mac_report(&config, state),
-            &lima_request(),
+            &sealed_mac_observation(&config, state),
             &runner_request(),
             &expected_runner_identity(),
             &status,
@@ -744,19 +816,17 @@ fn stopped_and_installing_lima_create_observation_debt_without_commands() {
 }
 
 #[test]
-fn mismatched_config_or_mac_evidence_fails_before_runner_commands() {
+fn mismatched_private_lima_source_fails_before_runner_commands() {
     let root = TempRoot::new("mismatch");
     let config = config(&root.0);
     let document = active_document(None);
     let (status, _) = durable_reads(&root, &config, &document, false);
-    let mut mac = mac_report(&config, LimaRuntimeState::Running);
-    mac.host_headroom.available_memory_bytes = 0;
+    let mac = sealed_mac_observation(&config, LimaRuntimeState::Running);
     let executor = TimedExecutor::default();
     let observation = adapter().observe(
         &config,
         &mac,
-        &lima_request(),
-        &runner_request(),
+        &runner_request_for("/Users/operator/.lima-other"),
         &expected_runner_identity(),
         &status,
         None,
@@ -770,9 +840,12 @@ fn mismatched_config_or_mac_evidence_fails_before_runner_commands() {
     );
     assert_eq!(
         observation.report().reason,
-        PersonalWorkerRunnerReadinessReason::MacEvidenceInvalid
+        PersonalWorkerRunnerReadinessReason::ConfigurationMismatch
     );
     assert!(executor.seen().is_empty());
+    let source_debug = format!("{:?}", mac.lima_source_identity());
+    assert!(!source_debug.contains(LIMA_HOME));
+    assert!(source_debug.contains("<private-lima-home>"));
 }
 
 #[test]
@@ -783,8 +856,7 @@ fn runner_command_failure_is_observation_debt_with_private_failure_only() {
     let (status, _) = durable_reads(&root, &config, &document, false);
     let observation = adapter().observe(
         &config,
-        &mac_report(&config, LimaRuntimeState::Running),
-        &lima_request(),
+        &sealed_mac_observation(&config, LimaRuntimeState::Running),
         &runner_request(),
         &expected_runner_identity(),
         &status,
@@ -816,12 +888,17 @@ fn stale_source_is_observation_debt_without_runner_commands() {
     let document = active_document(None);
     let (status, _) = durable_reads(&root, &config, &document, false);
     let executor = TimedExecutor::default();
-    let mut mac = mac_report(&config, LimaRuntimeState::Running);
-    mac.timing.expires_at_millis = 140_000;
+    let mac = sealed_mac_observation_with(
+        &config,
+        LimaRuntimeState::Running,
+        LimaResourceProfile::Interactive,
+        LIMA_HOME,
+        45_000,
+        35,
+    );
     let observation = adapter().observe(
         &config,
         &mac,
-        &lima_request(),
         &runner_request(),
         &expected_runner_identity(),
         &status,
@@ -847,12 +924,17 @@ fn enclosing_mac_evidence_expiring_during_runner_observation_is_observation_debt
     let config = config(&root.0);
     let document = active_document(None);
     let (status, _) = durable_reads(&root, &config, &document, false);
-    let mut mac = mac_report(&config, LimaRuntimeState::Running);
-    mac.timing.expires_at_millis = 104_000;
+    let mac = sealed_mac_observation_with(
+        &config,
+        LimaRuntimeState::Running,
+        LimaResourceProfile::Interactive,
+        LIMA_HOME,
+        9_000,
+        35,
+    );
     let observation = adapter().observe(
         &config,
         &mac,
-        &lima_request(),
         &runner_request(),
         &expected_runner_identity(),
         &status,
@@ -881,8 +963,7 @@ fn sealed_status_from_another_config_is_repair_debt_before_commands() {
     let executor = TimedExecutor::default();
     let observation = adapter().observe(
         &accepted,
-        &mac_report(&accepted, LimaRuntimeState::Running),
-        &lima_request(),
+        &sealed_mac_observation(&accepted, LimaRuntimeState::Running),
         &runner_request(),
         &expected_runner_identity(),
         &status,
@@ -911,12 +992,11 @@ fn durable_profile_drift_is_repair_debt_before_commands() {
     let executor = TimedExecutor::default();
     let observation = adapter().observe(
         &config,
-        &mac_report_for_profile(
+        &sealed_mac_observation_for_profile(
             &config,
             LimaRuntimeState::Running,
             LimaResourceProfile::Work,
         ),
-        &lima_request(),
         &runner_request(),
         &expected_runner_identity(),
         &status,
@@ -945,12 +1025,11 @@ fn active_job_on_nonrunning_or_broken_lima_does_not_become_ready() {
     let executor = TimedExecutor::default();
     let observation = adapter().observe(
         &active_config,
-        &mac_report_for_profile(
+        &sealed_mac_observation_for_profile(
             &active_config,
             LimaRuntimeState::Installing,
             LimaResourceProfile::Work,
         ),
-        &lima_request(),
         &runner_request(),
         &expected_runner_identity(),
         &status,
@@ -975,8 +1054,7 @@ fn active_job_on_nonrunning_or_broken_lima_does_not_become_ready() {
     let (status, _) = durable_reads(&root, &broken_config, &document, false);
     let observation = adapter().observe(
         &broken_config,
-        &mac_report(&broken_config, LimaRuntimeState::Broken),
-        &lima_request(),
+        &sealed_mac_observation(&broken_config, LimaRuntimeState::Broken),
         &runner_request(),
         &expected_runner_identity(),
         &status,
@@ -1003,12 +1081,11 @@ fn impossible_idle_with_running_job_requires_repair() {
     let (status, job) = durable_reads(&root, &config, &document, true);
     let observation = adapter().observe(
         &config,
-        &mac_report_for_profile(
+        &sealed_mac_observation_for_profile(
             &config,
             LimaRuntimeState::Running,
             LimaResourceProfile::Work,
         ),
-        &lima_request(),
         &runner_request(),
         &expected_runner_identity(),
         &status,

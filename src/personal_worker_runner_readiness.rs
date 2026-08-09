@@ -15,13 +15,14 @@ use crate::lima_lifecycle::LimaResourceProfile;
 use crate::lima_observation::{
     LIMA_OBSERVATION_SCHEMA_VERSION, LimaGuestObservation, LimaInstanceName,
     LimaInstanceObservationReport, LimaObservationClock, LimaObservationFreshness,
-    LimaObservationRequest, LimaObservationTiming, LimaRuntimeState,
+    LimaObservationTiming, LimaRuntimeState,
 };
 use crate::mac_availability::ObservationFreshness;
 use crate::macos_resource_observation::MACOS_RESOURCE_OBSERVATION_SCHEMA_VERSION;
 use crate::operator_config::{OperatorConfig, OperatorConfigIdentity};
 use crate::personal_worker_mac_observation::{
-    PERSONAL_WORKER_MAC_OBSERVATION_SCHEMA_VERSION, PersonalWorkerMacObservationReport,
+    PERSONAL_WORKER_MAC_OBSERVATION_SCHEMA_VERSION, PersonalWorkerMacObservation,
+    PersonalWorkerMacObservationReport,
 };
 use crate::personal_worker_operator_read::{
     PERSONAL_WORKER_OPERATOR_READ_SCHEMA_VERSION, PersonalWorkerOperatorJobRead,
@@ -192,17 +193,17 @@ impl PersonalWorkerRunnerReadinessAdapter {
 
     /// Observe and classify one exact personal-worker runner state without mutation.
     ///
-    /// The supplied Mac/Lima report and durable reads must come from the accepted B02 and O03
-    /// boundaries. Every runner subprocess is delegated to the accepted official-runner observer
-    /// through the same bounded timeout. Operational observation failures become one of the closed
-    /// dispositions while the raw failure remains private.
+    /// The sealed Mac/Lima observation and durable reads come from the accepted B02 and O03
+    /// boundaries. Its opaque private Lima-source identity must equal the runner request source
+    /// before any command. Every runner subprocess is delegated to the accepted official-runner
+    /// observer through the same bounded timeout. Operational observation failures become one of
+    /// the closed dispositions while the raw failure remains private.
     #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn observe(
         &self,
         config: &OperatorConfig,
-        mac: &PersonalWorkerMacObservationReport,
-        lima_request: &LimaObservationRequest,
+        mac_observation: &PersonalWorkerMacObservation,
         runner_request: &ActionsRunnerReadinessRequest,
         expected_runner_identity: &ActionsRunnerConfiguredIdentity,
         status: &PersonalWorkerOperatorStatusRead,
@@ -211,21 +212,13 @@ impl PersonalWorkerRunnerReadinessAdapter {
         executor: &impl TimedCommandExecutor,
         clock: &impl LimaObservationClock,
     ) -> PersonalWorkerRunnerReadinessObservation {
+        let mac = mac_observation.report();
         let snapshot = durable_snapshot(status, active_job);
 
         if mac.schema_version != PERSONAL_WORKER_MAC_OBSERVATION_SCHEMA_VERSION
             || mac.config_identity != *config.identity()
             || mac.requested_availability != config.availability()
             || mac.lima.instance != *config.lima_instance()
-            || lima_request.instance() != config.lima_instance()
-            || mac.lima.configured.vm_type != lima_request.expected_vm_type()
-            || mac.lima.configured.architecture != lima_request.expected_architecture()
-            || mac
-                .lima
-                .timing
-                .expires_at_unix_seconds
-                .checked_sub(mac.lima.timing.observed_at_unix_seconds)
-                != Some(lima_request.max_age_seconds())
             || !valid_mac_evidence(mac)
         {
             return observation(
@@ -270,6 +263,7 @@ impl PersonalWorkerRunnerReadinessAdapter {
         }
         if runner_request.instance() != config.lima_instance()
             || runner_request.runner_name() != &expected_runner_identity.runner_name
+            || mac_observation.lima_source_identity() != &runner_request.source_identity()
         {
             return observation(
                 config,

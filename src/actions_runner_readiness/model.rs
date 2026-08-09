@@ -7,7 +7,7 @@ use crate::artifact::Sha256Digest;
 use crate::lima_observation::{
     LimaFilesystemObjectIdentity, LimaGuestObservation, LimaInstanceName,
     LimaInstanceObservationReport, LimaObservationClock, LimaObservationFreshness,
-    LimaObservationTiming, LimaRuntimeState,
+    LimaObservationSourceIdentity, LimaObservationTiming, LimaRuntimeState,
 };
 use crate::process::{CommandExecutor, CommandSpec, ExecutionRecord};
 
@@ -241,6 +241,14 @@ impl ActionsRunnerReadinessRequest {
     #[must_use]
     pub const fn runner_name(&self) -> &ActionsRunnerName {
         &self.runner_name
+    }
+
+    #[must_use]
+    pub fn source_identity(&self) -> LimaObservationSourceIdentity {
+        LimaObservationSourceIdentity::from_validated(
+            self.instance.clone(),
+            self.lima_home.clone(),
+        )
     }
 }
 
