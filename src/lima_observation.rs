@@ -323,6 +323,10 @@ impl LimaObservationRequest {
     pub const fn request_identity(&self) -> &LimaObservationRequestIdentity {
         &self.request_identity
     }
+
+    pub(crate) fn lima_home(&self) -> &Path {
+        &self.lima_home
+    }
 }
 
 impl fmt::Debug for LimaObservationRequest {
