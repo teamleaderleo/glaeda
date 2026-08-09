@@ -114,7 +114,7 @@ run_user_probe() {
       length == 1 and
       .[0].Id == $container_id and
       .[0].Image == $image_hex and
-      .[0].State.Status == "configured" and
+      .[0].State.Status == "created" and
       .[0].Config.User == "1000:1000" and
       .[0].Config.WorkingDir == "/" and
       .[0].Config.Entrypoint == "/bin/busybox" and
