@@ -30,7 +30,7 @@ validate_network_lock() {
 }
 
 run_user_probe() {
-  local image_id container_id container_output expected_output
+  local image_id image_hex container_id container_output expected_output
   local image_size container_size spec_size spec_path apparmor_profile
 
   mapfile -d '' network_entries_before < <(
@@ -48,13 +48,14 @@ run_user_probe() {
     printf 'error: offline image import returned a noncanonical identity\n' >&2
     exit 1
   fi
+  image_hex=${image_id#sha256:}
 
   podman_probe image inspect "$image_id" > "$PROBE_IMAGE_JSON"
   image_size=$(/usr/bin/stat -Lc %s "$PROBE_IMAGE_JSON")
   if (( image_size == 0 || image_size > 1048576 )) ||
-    ! /usr/bin/jq -e --arg image_id "$image_id" '
+    ! /usr/bin/jq -e --arg image_hex "$image_hex" '
       length == 1 and
-      .[0].Id == $image_id and
+      .[0].Id == $image_hex and
       (.[0].RepoTags | index("localhost/smolrunner-closure-fixture:local")) != null
     ' "$PROBE_IMAGE_JSON" >/dev/null; then
     printf 'image_inspect_bytes=%s\n' "$image_size" >&2
@@ -109,10 +110,10 @@ run_user_probe() {
   podman_probe container inspect "$container_id" > "$PROBE_CONTAINER_JSON"
   container_size=$(/usr/bin/stat -Lc %s "$PROBE_CONTAINER_JSON")
   if (( container_size == 0 || container_size > 1048576 )) ||
-    ! /usr/bin/jq -e --arg container_id "$container_id" --arg image_id "$image_id" '
+    ! /usr/bin/jq -e --arg container_id "$container_id" --arg image_hex "$image_hex" '
       length == 1 and
       .[0].Id == $container_id and
-      .[0].Image == $image_id and
+      .[0].Image == $image_hex and
       .[0].State.Status == "configured" and
       .[0].Config.User == "1000:1000" and
       .[0].Config.WorkingDir == "/" and
