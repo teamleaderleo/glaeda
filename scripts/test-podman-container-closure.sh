@@ -57,6 +57,9 @@ run_user_probe() {
       .[0].Id == $image_id and
       (.[0].RepoTags | index("localhost/smolrunner-closure-fixture:local")) != null
     ' "$PROBE_IMAGE_JSON" >/dev/null; then
+    printf 'image_inspect_bytes=%s\n' "$image_size" >&2
+    /usr/bin/jq -c 'if length == 1 then {id: .[0].Id, tags: .[0].RepoTags} else {count: length} end' \
+      "$PROBE_IMAGE_JSON" >&2 || true
     printf 'error: offline image inspection was absent, oversized, or mismatched\n' >&2
     exit 1
   fi
