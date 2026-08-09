@@ -374,6 +374,11 @@ if ! /usr/bin/jq -e \
   --arg runroot "$PROBE_RUNROOT" \
   '.host.security.rootless == true and .store.graphRoot == $graphroot and .store.runRoot == $runroot' \
   "$PROBE_INFO" >/dev/null; then
+  /usr/bin/jq -r \
+    --arg graphroot "$PROBE_GRAPHROOT" \
+    --arg runroot "$PROBE_RUNROOT" \
+    '"rootless=\(.host.security.rootless == true) graphroot_match=\(.store.graphRoot == $graphroot) runroot_match=\(.store.runRoot == $runroot)"' \
+    "$PROBE_INFO" >&2
   printf 'error: Podman did not report the exact rootless run-private storage roots\n' >&2
   exit 1
 fi
