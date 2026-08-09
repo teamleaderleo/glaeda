@@ -47,6 +47,9 @@ jobs:
             sudo mv -- "$source" "$source.smolrunner-disabled"
           done < <(sudo grep -rl 'ppa.launchpadcontent.net/git-core/ppa' /etc/apt/sources.list.d || true)
           sudo apt-get update
+          # The hosted image preinstalls fakeroot and its extra ld.so.conf.d search directory.
+          # It is not part of the reviewed personal-worker runtime closure.
+          sudo apt-get purge --yes fakeroot libfakeroot
           sudo apt-get install --yes --no-install-recommends \
             aardvark-dns \
             busybox-static \
