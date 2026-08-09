@@ -39,6 +39,9 @@ jobs:
 
       - name: Install Ubuntu closure packages
         run: |
+          while IFS= read -r source; do
+            sudo mv -- "$source" "$source.smolrunner-disabled"
+          done < <(sudo grep -rl 'ppa.launchpadcontent.net/git-core/ppa' /etc/apt/sources.list.d || true)
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends \
             aardvark-dns \
@@ -46,12 +49,19 @@ jobs:
             catatonit \
             conmon \
             crun \
-            git \
             jq \
             netavark \
             podman \
             uidmap \
             fuse-overlayfs
+          stock_git_version=$(apt-cache madison git | awk '$3 ~ /^1:2[.]43[.]0-/ { print $3; exit }')
+          if test -z "$stock_git_version"; then
+            printf 'error: stock Ubuntu 24.04 Git 2.43 package is unavailable\n' >&2
+            exit 1
+          fi
+          sudo apt-get install --yes --no-install-recommends --allow-downgrades \
+            "git=$stock_git_version" \
+            "git-man=$stock_git_version"
 
       - name: Probe exact package and first-use closure
         run: >-
