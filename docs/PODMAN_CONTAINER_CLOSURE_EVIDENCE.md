@@ -5,10 +5,10 @@ execution backend and does not authorize a physical Lima or host mutation.
 
 ## Exact evidence
 
-- Fixture commit: `0ab48073ed49db91a5c592116d96723a8f5b6195`
-- Workflow run: [31314184600](https://github.com/teamleaderleo/smolrunner/actions/runs/31314184600)
-- ARM64 job: [93246643074](https://github.com/teamleaderleo/smolrunner/actions/runs/31314184600/job/93246643074)
-- x86_64 job: [93246643125](https://github.com/teamleaderleo/smolrunner/actions/runs/31314184600/job/93246643125)
+- Fixture commit: `36ed8ace4dc65a70e83ca4e06d5dfdbf4475b259`
+- Workflow run: [31314578562](https://github.com/teamleaderleo/smolrunner/actions/runs/31314578562)
+- ARM64 job: [93247648188](https://github.com/teamleaderleo/smolrunner/actions/runs/31314578562/job/93247648188)
+- x86_64 job: [93247648165](https://github.com/teamleaderleo/smolrunner/actions/runs/31314578562/job/93247648165)
 - Date: 2026-08-09
 - Result: both jobs passed on fresh GitHub-hosted Ubuntu 24.04 VMs.
 
