@@ -1,0 +1,61 @@
+name: Podman closure probe
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/podman-closure-probe.yml
+      - scripts/test-podman-closure-package.sh
+      - docs/PODMAN_EXECUTION_CLOSURE.md
+      - docs/PODMAN_EXECUTION_CLOSURE_EVIDENCE.md
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: podman-closure-probe-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ubuntu-package:
+    name: Ubuntu 24.04 ${{ matrix.architecture }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: arm64
+            runner: ubuntu-24.04-arm
+          - architecture: x86_64
+            runner: ubuntu-24.04
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          show-progress: false
+
+      - name: Install Ubuntu closure packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            aardvark-dns \
+            busybox-static \
+            catatonit \
+            conmon \
+            crun \
+            git \
+            jq \
+            netavark \
+            podman \
+            uidmap \
+            fuse-overlayfs
+
+      - name: Probe exact package and first-use closure
+        run: >-
+          sudo /usr/bin/env -i
+          PATH=/usr/sbin:/usr/bin:/sbin:/bin
+          LC_ALL=C
+          /usr/bin/bash scripts/test-podman-closure-package.sh
