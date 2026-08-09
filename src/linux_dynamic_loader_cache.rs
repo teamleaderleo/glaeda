@@ -27,6 +27,7 @@ const MAX_GENERATOR_BYTES: usize = 1_024;
 const CACHE_MAGIC: &[u8; 17] = b"glibc-ld.so.cache";
 const CACHE_VERSION: &[u8; 3] = b"1.1";
 const LITTLE_ENDIAN_FLAG: u8 = 2;
+const GENERIC_ELF_LIBC6_CACHE_ID: i32 = 0x0003;
 const X86_64_CACHE_ID: i32 = 0x0303;
 const AARCH64_CACHE_ID: i32 = 0x0a03;
 const HWCAP_EXTENSION_BIT: u64 = 1_u64 << 62;
@@ -85,6 +86,7 @@ impl fmt::Debug for LinuxDynamicLoaderCacheEntry {
 pub struct LinuxDynamicLoaderCache {
     architecture: PersonalWorkerRuntimeArchitecture,
     entries: Vec<LinuxDynamicLoaderCacheEntry>,
+    ignored_incompatible_entry_count: usize,
     glibc_hwcap_names: Vec<String>,
 }
 
@@ -99,6 +101,12 @@ impl LinuxDynamicLoaderCache {
         &self.entries
     }
 
+    /// Number of fully validated cache entries that the admitted loader ignores by architecture.
+    #[must_use]
+    pub const fn ignored_incompatible_entry_count(&self) -> usize {
+        self.ignored_incompatible_entry_count
+    }
+
     #[must_use]
     pub fn glibc_hwcap_names(&self) -> &[String] {
         &self.glibc_hwcap_names
@@ -111,6 +119,10 @@ impl fmt::Debug for LinuxDynamicLoaderCache {
             .debug_struct("LinuxDynamicLoaderCache")
             .field("architecture", &self.architecture)
             .field("entry_count", &self.entries.len())
+            .field(
+                "ignored_incompatible_entry_count",
+                &self.ignored_incompatible_entry_count,
+            )
             .field("glibc_hwcap_name_count", &self.glibc_hwcap_names.len())
             .finish()
     }
@@ -157,8 +169,9 @@ impl std::error::Error for LinuxDynamicLoaderCacheError {}
 ///
 /// # Errors
 ///
-/// Rejects old, mixed, wrong-endian, malformed, wrong-architecture, unbounded, unsorted,
-/// path-unsafe, or unsupported capability/extension input.
+/// Rejects old, mixed, wrong-endian, malformed, unknown-architecture, unbounded, unsorted,
+/// path-unsafe, or unsupported capability/extension input. Known generic x86 compatibility
+/// entries are fully validated but omitted from the compatible entry view.
 pub fn parse_linux_dynamic_loader_cache(
     bytes: &[u8],
     architecture: PersonalWorkerRuntimeArchitecture,
@@ -213,19 +226,13 @@ pub fn parse_linux_dynamic_loader_cache(
     }
 
     let extensions = parse_extensions(bytes, extension_offset, entries_end, string_end)?;
-    let expected_cache_id = match architecture {
-        PersonalWorkerRuntimeArchitecture::Aarch64 => AARCH64_CACHE_ID,
-        PersonalWorkerRuntimeArchitecture::X86_64 => X86_64_CACHE_ID,
-    };
-    let mut entries = Vec::with_capacity(entry_count);
+    let mut parsed_entries = Vec::with_capacity(entry_count);
     let mut seen_entries = BTreeSet::new();
     let mut referenced_hwcaps = BTreeSet::new();
     for index in 0..entry_count {
         let offset = HEADER_BYTES + index * ENTRY_BYTES;
         let flags = read_i32(bytes, offset)?;
-        if flags != expected_cache_id {
-            return Err(architecture_error());
-        }
+        let compatible = cache_id_is_compatible(flags, architecture)?;
         if read_u32(bytes, offset + 12)? != 0 {
             return Err(format_error());
         }
@@ -268,6 +275,7 @@ pub fn parse_linux_dynamic_loader_cache(
         };
 
         let duplicate_key = (
+            flags,
             library_name.to_owned(),
             library_path.to_owned(),
             hwcap_name.clone(),
@@ -276,23 +284,66 @@ pub fn parse_linux_dynamic_loader_cache(
         if !seen_entries.insert(duplicate_key.clone()) {
             return Err(format_error());
         }
-        entries.push(LinuxDynamicLoaderCacheEntry {
-            library_name: duplicate_key.0,
-            library_path: duplicate_key.1,
-            hwcap_name: duplicate_key.2,
+        parsed_entries.push(ParsedCacheEntry {
+            cache_id: duplicate_key.0,
+            compatible,
+            library_name: duplicate_key.1,
+            library_path: duplicate_key.2,
+            hwcap_name: duplicate_key.3,
             isa_level,
         });
     }
     if referenced_hwcaps.len() != extensions.hwcap_names.len() {
         return Err(format_error());
     }
-    validate_entry_order(&entries)?;
+    validate_entry_order(&parsed_entries)?;
+
+    let ignored_incompatible_entry_count = parsed_entries
+        .iter()
+        .filter(|entry| !entry.compatible)
+        .count();
+    let entries = parsed_entries
+        .into_iter()
+        .filter(|entry| entry.compatible)
+        .map(|entry| LinuxDynamicLoaderCacheEntry {
+            library_name: entry.library_name,
+            library_path: entry.library_path,
+            hwcap_name: entry.hwcap_name,
+            isa_level: entry.isa_level,
+        })
+        .collect();
 
     Ok(LinuxDynamicLoaderCache {
         architecture,
         entries,
+        ignored_incompatible_entry_count,
         glibc_hwcap_names: extensions.hwcap_names,
     })
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct ParsedCacheEntry {
+    cache_id: i32,
+    compatible: bool,
+    library_name: String,
+    library_path: String,
+    hwcap_name: Option<String>,
+    isa_level: u16,
+}
+
+fn cache_id_is_compatible(
+    cache_id: i32,
+    architecture: PersonalWorkerRuntimeArchitecture,
+) -> Result<bool, LinuxDynamicLoaderCacheError> {
+    match (architecture, cache_id) {
+        (PersonalWorkerRuntimeArchitecture::Aarch64, AARCH64_CACHE_ID)
+        | (PersonalWorkerRuntimeArchitecture::X86_64, X86_64_CACHE_ID) => Ok(true),
+        // Noble's x86_64 cache contains generic ELF/libc6 entries for its installed i386
+        // compatibility libraries. The admitted 64-bit loader compares flags to 0x303 and
+        // ignores these entries, so retain them only while validating the complete cache.
+        (PersonalWorkerRuntimeArchitecture::X86_64, GENERIC_ELF_LIBC6_CACHE_ID) => Ok(false),
+        _ => Err(architecture_error()),
+    }
 }
 
 struct ParsedExtensions {
@@ -416,13 +467,16 @@ fn read_extension_section(
     })
 }
 
-fn validate_entry_order(
-    entries: &[LinuxDynamicLoaderCacheEntry],
-) -> Result<(), LinuxDynamicLoaderCacheError> {
+fn validate_entry_order(entries: &[ParsedCacheEntry]) -> Result<(), LinuxDynamicLoaderCacheError> {
     for pair in entries.windows(2) {
         let previous = &pair[0];
         let current = &pair[1];
         match cache_library_cmp(&previous.library_name, &current.library_name)? {
+            Ordering::Less => return Err(format_error()),
+            Ordering::Greater => continue,
+            Ordering::Equal => {}
+        }
+        match previous.cache_id.cmp(&current.cache_id) {
             Ordering::Less => return Err(format_error()),
             Ordering::Greater => continue,
             Ordering::Equal => {}
@@ -655,9 +709,58 @@ mod tests {
         assert_eq!(parsed.glibc_hwcap_names(), &["x86-64-v3"]);
         assert_eq!(parsed.entries()[1].hwcap_name(), Some("x86-64-v3"));
         assert_eq!(parsed.entries()[1].isa_level(), 3);
+        assert_eq!(parsed.ignored_incompatible_entry_count(), 0);
         let debug = format!("{parsed:?} {:?}", parsed.entries()[0]);
         assert!(!debug.contains("/lib/"));
         assert!(!debug.contains("libz"));
+    }
+
+    #[test]
+    fn x86_64_validates_but_does_not_expose_generic_compatibility_entries() {
+        let bytes = fixture(
+            PersonalWorkerRuntimeArchitecture::X86_64,
+            &[
+                FixtureEntry::plain("libz.so.1", "/lib/x86_64-linux-gnu/libz.so.1"),
+                FixtureEntry::plain("libc.so.6", "/lib/x86_64-linux-gnu/libc.so.6"),
+                FixtureEntry::generic_x86_compat("libc.so.6", "/lib/i386-linux-gnu/libc.so.6"),
+            ],
+            &[],
+        );
+        let parsed =
+            parse_linux_dynamic_loader_cache(&bytes, PersonalWorkerRuntimeArchitecture::X86_64)
+                .expect("mixed Noble x86 cache");
+        assert_eq!(parsed.entries().len(), 2);
+        assert_eq!(parsed.ignored_incompatible_entry_count(), 1);
+        assert!(
+            parsed
+                .entries()
+                .iter()
+                .all(|entry| !entry.library_path().contains("i386"))
+        );
+
+        let mut wrong_order = bytes.clone();
+        wrong_order[HEADER_BYTES + ENTRY_BYTES..HEADER_BYTES + ENTRY_BYTES + 4]
+            .copy_from_slice(&GENERIC_ELF_LIBC6_CACHE_ID.to_le_bytes());
+        wrong_order[HEADER_BYTES + 2 * ENTRY_BYTES..HEADER_BYTES + 2 * ENTRY_BYTES + 4]
+            .copy_from_slice(&X86_64_CACHE_ID.to_le_bytes());
+        assert_eq!(
+            parse_linux_dynamic_loader_cache(
+                &wrong_order,
+                PersonalWorkerRuntimeArchitecture::X86_64,
+            )
+            .expect_err("same-name cache IDs must be descending")
+            .kind,
+            LinuxDynamicLoaderCacheErrorKind::Format,
+        );
+
+        let mut unknown = bytes;
+        unknown[HEADER_BYTES..HEADER_BYTES + 4].copy_from_slice(&0x0803_i32.to_le_bytes());
+        assert_eq!(
+            parse_linux_dynamic_loader_cache(&unknown, PersonalWorkerRuntimeArchitecture::X86_64)
+                .expect_err("unreviewed cache ID")
+                .kind,
+            LinuxDynamicLoaderCacheErrorKind::Architecture,
+        );
     }
 
     #[test]
@@ -798,23 +901,8 @@ mod tests {
             other => panic!("unsupported package-probe architecture: {other}"),
         };
         let bytes = std::fs::read("/etc/ld.so.cache").expect("read Noble loader cache");
-        let parsed =
-            parse_linux_dynamic_loader_cache(&bytes, architecture).unwrap_or_else(|error| {
-                if error.kind == LinuxDynamicLoaderCacheErrorKind::Architecture {
-                    let entry_count =
-                        usize::try_from(read_u32(&bytes, 20).expect("cache entry count"))
-                            .expect("cache entry count usize");
-                    assert!(entry_count <= MAX_ENTRIES, "bounded cache entry count");
-                    let mut cache_id_counts = std::collections::BTreeMap::new();
-                    for index in 0..entry_count {
-                        let cache_id = read_i32(&bytes, HEADER_BYTES + index * ENTRY_BYTES)
-                            .expect("cache entry id");
-                        *cache_id_counts.entry(cache_id).or_insert(0_usize) += 1;
-                    }
-                    panic!("parse Noble loader cache; numeric cache IDs: {cache_id_counts:x?}");
-                }
-                panic!("parse Noble loader cache: {error:?}");
-            });
+        let parsed = parse_linux_dynamic_loader_cache(&bytes, architecture)
+            .expect("parse Noble loader cache");
         assert!(!parsed.entries().is_empty());
     }
 
@@ -822,6 +910,7 @@ mod tests {
     struct FixtureEntry<'a> {
         name: &'a str,
         path: &'a str,
+        cache_id: Option<i32>,
         hwcap_index: Option<u32>,
         isa_level: u16,
     }
@@ -831,6 +920,17 @@ mod tests {
             Self {
                 name,
                 path,
+                cache_id: None,
+                hwcap_index: None,
+                isa_level: 0,
+            }
+        }
+
+        const fn generic_x86_compat(name: &'a str, path: &'a str) -> Self {
+            Self {
+                name,
+                path,
+                cache_id: Some(GENERIC_ELF_LIBC6_CACHE_ID),
                 hwcap_index: None,
                 isa_level: 0,
             }
@@ -840,6 +940,7 @@ mod tests {
             Self {
                 name,
                 path,
+                cache_id: None,
                 hwcap_index: Some(index),
                 isa_level,
             }
@@ -901,7 +1002,8 @@ mod tests {
         };
         for (index, entry) in entries.iter().enumerate() {
             let offset = HEADER_BYTES + index * ENTRY_BYTES;
-            bytes[offset..offset + 4].copy_from_slice(&cache_id.to_le_bytes());
+            bytes[offset..offset + 4]
+                .copy_from_slice(&entry.cache_id.unwrap_or(cache_id).to_le_bytes());
             write_u32(
                 &mut bytes,
                 offset + 4,
