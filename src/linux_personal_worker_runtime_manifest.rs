@@ -4,6 +4,7 @@
 //! strict protected state, and reads the fixed manifest descriptor-relatively. It never creates
 //! state and returns only the manifest's recorded-not-observed declaration.
 
+use std::convert::Infallible;
 use std::ffi::CStr;
 use std::fmt;
 use std::fs::File;
@@ -120,24 +121,151 @@ impl std::error::Error for PersonalWorkerRuntimeManifestDiscoveryError {}
 pub fn discover_personal_worker_runtime_manifest(
     project: &ProjectIdentity,
 ) -> Result<PersonalWorkerRuntimeManifestDiscovery, PersonalWorkerRuntimeManifestDiscoveryError> {
-    discover_at(Path::new(STATE_ROOT), 0, project)
+    map_recorded_manifest(with_locked_personal_worker_runtime_manifest(
+        project,
+        |_| Ok::<(), Infallible>(()),
+    ))
 }
 
+pub(crate) enum LockedPersonalWorkerRuntimeManifestObservation<T> {
+    Missing,
+    Found {
+        manifest: PersonalWorkerRuntimeManifest,
+        observation: T,
+    },
+}
+
+pub(crate) enum LockedPersonalWorkerRuntimeManifestObservationError<E> {
+    State(PersonalWorkerRuntimeManifestDiscoveryError),
+    Observer(E),
+}
+
+/// Run one internal static observation while the exact recorded manifest remains locked.
+///
+/// The callback receives declaration evidence only. Its result cannot escape until the manifest,
+/// project, installation, catalog lock, and state root have all been revalidated. This boundary is
+/// crate-private so only a reviewed in-crate observer can compose live evidence with durable state.
+pub(crate) fn with_locked_personal_worker_runtime_manifest<T, E>(
+    project: &ProjectIdentity,
+    observer: impl FnOnce(&PersonalWorkerRuntimeManifest) -> Result<T, E>,
+) -> Result<
+    LockedPersonalWorkerRuntimeManifestObservation<T>,
+    LockedPersonalWorkerRuntimeManifestObservationError<E>,
+> {
+    observe_at(Path::new(STATE_ROOT), 0, project, observer)
+}
+
+#[cfg(test)]
 fn discover_at(
     root_path: &Path,
     expected_root_uid: u32,
     project: &ProjectIdentity,
 ) -> Result<PersonalWorkerRuntimeManifestDiscovery, PersonalWorkerRuntimeManifestDiscoveryError> {
+    map_recorded_manifest(observe_at(root_path, expected_root_uid, project, |_| {
+        Ok::<(), Infallible>(())
+    }))
+}
+
+fn map_recorded_manifest(
+    result: Result<
+        LockedPersonalWorkerRuntimeManifestObservation<()>,
+        LockedPersonalWorkerRuntimeManifestObservationError<Infallible>,
+    >,
+) -> Result<PersonalWorkerRuntimeManifestDiscovery, PersonalWorkerRuntimeManifestDiscoveryError> {
+    match result {
+        Ok(LockedPersonalWorkerRuntimeManifestObservation::Missing) => {
+            Ok(PersonalWorkerRuntimeManifestDiscovery::Missing)
+        }
+        Ok(LockedPersonalWorkerRuntimeManifestObservation::Found {
+            manifest,
+            observation,
+        }) => {
+            let () = observation;
+            Ok(PersonalWorkerRuntimeManifestDiscovery::Found(manifest))
+        }
+        Err(LockedPersonalWorkerRuntimeManifestObservationError::State(error)) => Err(error),
+        Err(LockedPersonalWorkerRuntimeManifestObservationError::Observer(never)) => match never {},
+    }
+}
+
+fn observe_at<T, E>(
+    root_path: &Path,
+    expected_root_uid: u32,
+    project: &ProjectIdentity,
+    observer: impl FnOnce(&PersonalWorkerRuntimeManifest) -> Result<T, E>,
+) -> Result<
+    LockedPersonalWorkerRuntimeManifestObservation<T>,
+    LockedPersonalWorkerRuntimeManifestObservationError<E>,
+> {
+    let opened = open_locked_manifest(root_path, expected_root_uid, project)
+        .map_err(LockedPersonalWorkerRuntimeManifestObservationError::State)?;
+    let LockedManifestRead::Found(opened) = opened else {
+        return Ok(LockedPersonalWorkerRuntimeManifestObservation::Missing);
+    };
+    let observation = observer(&opened.manifest);
+    let manifest = opened
+        .finish(root_path)
+        .map_err(LockedPersonalWorkerRuntimeManifestObservationError::State)?;
+    let observation =
+        observation.map_err(LockedPersonalWorkerRuntimeManifestObservationError::Observer)?;
+    Ok(LockedPersonalWorkerRuntimeManifestObservation::Found {
+        manifest,
+        observation,
+    })
+}
+
+enum LockedManifestRead {
+    Missing,
+    Found(OpenedLockedManifest),
+}
+
+struct OpenedLockedManifest {
+    guard: CatalogReadGuard,
+    installations: OwnedFd,
+    matched: MatchedInstallation,
+    manifest_file: File,
+    manifest: PersonalWorkerRuntimeManifest,
+}
+
+impl OpenedLockedManifest {
+    fn finish(
+        self,
+        root_path: &Path,
+    ) -> Result<PersonalWorkerRuntimeManifest, PersonalWorkerRuntimeManifestDiscoveryError> {
+        verify_file_entry(
+            self.matched.directory.as_fd(),
+            RUNTIME_MANIFEST_FILE,
+            self.manifest_file.as_fd(),
+            self.guard.owner(),
+            MAX_PERSONAL_WORKER_RUNTIME_MANIFEST_BYTES,
+        )?;
+        verify_matched_installation(&self.installations, &self.matched, self.guard.owner())?;
+        verify_directory_entry(
+            self.guard.root(),
+            INSTALLATIONS_DIRECTORY,
+            self.installations.as_fd(),
+            self.guard.owner(),
+        )?;
+        finish_catalog_read(&self.guard, root_path)?;
+        Ok(self.manifest)
+    }
+}
+
+fn open_locked_manifest(
+    root_path: &Path,
+    expected_root_uid: u32,
+    project: &ProjectIdentity,
+) -> Result<LockedManifestRead, PersonalWorkerRuntimeManifestDiscoveryError> {
     let Some(guard) = open_catalog_read_guard(root_path, expected_root_uid)? else {
         verify_root_absent(root_path)?;
-        return Ok(PersonalWorkerRuntimeManifestDiscovery::Missing);
+        return Ok(LockedManifestRead::Missing);
     };
     let Some(installations) =
         open_optional_directory(guard.root(), INSTALLATIONS_DIRECTORY, guard.owner())?
     else {
         verify_entry_absent(guard.root(), INSTALLATIONS_DIRECTORY)?;
         finish_catalog_read(&guard, root_path)?;
-        return Ok(PersonalWorkerRuntimeManifestDiscovery::Missing);
+        return Ok(LockedManifestRead::Missing);
     };
 
     let matched = find_project_installation(&installations, guard.owner(), project)?;
@@ -149,7 +277,7 @@ fn discover_at(
             guard.owner(),
         )?;
         finish_catalog_read(&guard, root_path)?;
-        return Ok(PersonalWorkerRuntimeManifestDiscovery::Missing);
+        return Ok(LockedManifestRead::Missing);
     };
 
     let Some(manifest_file) = open_optional_private_file(
@@ -168,7 +296,7 @@ fn discover_at(
             guard.owner(),
         )?;
         finish_catalog_read(&guard, root_path)?;
-        return Ok(PersonalWorkerRuntimeManifestDiscovery::Missing);
+        return Ok(LockedManifestRead::Missing);
     };
     let manifest = decode_personal_worker_runtime_manifest(&manifest_file.bytes).map_err(
         |error| match error.kind {
@@ -180,23 +308,13 @@ fn discover_at(
     if manifest.installation_id() != &matched.installation_id {
         return Err(corrupt_error());
     }
-
-    verify_file_entry(
-        matched.directory.as_fd(),
-        RUNTIME_MANIFEST_FILE,
-        manifest_file.file.as_fd(),
-        guard.owner(),
-        MAX_PERSONAL_WORKER_RUNTIME_MANIFEST_BYTES,
-    )?;
-    verify_matched_installation(&installations, &matched, guard.owner())?;
-    verify_directory_entry(
-        guard.root(),
-        INSTALLATIONS_DIRECTORY,
-        installations.as_fd(),
-        guard.owner(),
-    )?;
-    finish_catalog_read(&guard, root_path)?;
-    Ok(PersonalWorkerRuntimeManifestDiscovery::Found(manifest))
+    Ok(LockedManifestRead::Found(OpenedLockedManifest {
+        guard,
+        installations,
+        matched,
+        manifest_file: manifest_file.file,
+        manifest,
+    }))
 }
 
 struct CatalogReadGuard {
@@ -895,6 +1013,69 @@ mod tests {
         drop(guard);
         fs::flock(&retained, FlockOperation::NonBlockingLockExclusive)
             .expect("shared lock must be explicitly released");
+    }
+
+    #[test]
+    fn callback_runs_under_shared_lock_and_returns_only_after_revalidation() {
+        let root = prepare_root("locked-callback");
+        add_installation(&root, INSTALLATION_ID, project(), true);
+        let result = observe_at(root.path(), geteuid().as_raw(), &project(), |manifest| {
+            assert_eq!(
+                    manifest.summary().disposition(),
+                    crate::personal_worker_runtime_manifest::PersonalWorkerRuntimeManifestDisposition::RecordedNotObserved
+                );
+            let competing = fs::open(
+                root.path().join(CATALOG_LOCK_FILE),
+                FILE_FLAGS,
+                Mode::empty(),
+            )
+            .expect("open competing lock descriptor");
+            assert_eq!(
+                fs::flock(&competing, FlockOperation::NonBlockingLockExclusive),
+                Err(Errno::AGAIN),
+                "callback must run while the separate shared lock is held"
+            );
+            Ok::<u64, &'static str>(41)
+        });
+        match result {
+            Ok(LockedPersonalWorkerRuntimeManifestObservation::Found { observation, .. }) => {
+                assert_eq!(observation, 41)
+            }
+            _ => panic!("locked callback result must escape after final revalidation"),
+        }
+    }
+
+    #[test]
+    fn final_state_failure_precedes_callback_success_or_failure() {
+        for (label, callback_result) in [("success", Ok(7_u64)), ("failure", Err("failed"))] {
+            let root = prepare_root(label);
+            let installation = add_installation(&root, INSTALLATION_ID, project(), true);
+            let result = observe_at(root.path(), geteuid().as_raw(), &project(), |_| {
+                set_mode(&installation.join(RUNTIME_MANIFEST_FILE), 0o644);
+                callback_result
+            });
+            match result {
+                Err(LockedPersonalWorkerRuntimeManifestObservationError::State(error)) => {
+                    assert_eq!(
+                        error.kind,
+                        PersonalWorkerRuntimeManifestDiscoveryErrorKind::UnsafeFilesystem
+                    );
+                }
+                _ => panic!("final state failure must suppress the callback result"),
+            }
+        }
+
+        let root = prepare_root("callback-failure");
+        add_installation(&root, INSTALLATION_ID, project(), true);
+        let result = observe_at(root.path(), geteuid().as_raw(), &project(), |_| {
+            Err::<(), _>("observer_failed")
+        });
+        match result {
+            Err(LockedPersonalWorkerRuntimeManifestObservationError::Observer(error)) => {
+                assert_eq!(error, "observer_failed");
+            }
+            _ => panic!("stable state must preserve the observer failure"),
+        }
     }
 
     #[test]
