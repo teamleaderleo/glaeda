@@ -6,24 +6,30 @@ use std::path::Path;
 
 use rustix::fs::{self, AtFlags, Mode, RenameFlags};
 use rustix::io::Errno;
+use sha2::{Digest as _, Sha256};
 
 use super::{
     CURRENT_DOCUMENT, DIRECTORY_FLAGS, EXISTING_FILE_FLAGS, NEW_FILE_FLAGS, PRIVATE_FILE_MODE,
-    STORE_DIRECTORY, StoreMutationLock, UnixPersonalWorkerStore, acquire_mutation_lock_in,
-    inspect_directory, inspect_private_file, map_existing_store_directory_open_error,
-    map_root_open_error, store_error, synchronize_directory,
+    STAGED_DOCUMENT, STORE_DIRECTORY, StagedDocument, StoreMutationLock, UnixPersonalWorkerStore,
+    acquire_mutation_lock_in, inspect_directory, inspect_private_file,
+    map_existing_store_directory_open_error, map_root_open_error, store_error,
+    synchronize_directory,
 };
+use crate::artifact::Sha256Digest;
 use crate::execution_admission::EpochMillis;
+use crate::lima_lifecycle::{LimaLifecycleState, LimaResourceProfile};
 use crate::personal_worker_lima_authority::{
     ConfirmedPersonalWorkerLimaEnrollment, MAX_PERSONAL_WORKER_LIMA_AUTHORITY_BYTES,
-    PersonalWorkerLimaAuthorityDocument, PersonalWorkerLimaAuthorityErrorKind,
-    PersonalWorkerLimaAuthorityGeneration, decode_personal_worker_lima_authority,
-    encode_personal_worker_lima_authority,
+    PersonalWorkerLimaAttemptPhase, PersonalWorkerLimaAuthorityDocument,
+    PersonalWorkerLimaAuthorityErrorKind, PersonalWorkerLimaAuthorityGeneration,
+    decode_personal_worker_lima_authority, encode_personal_worker_lima_authority,
 };
-use crate::personal_worker_queue::PersonalWorkerQueueGeneration;
+use crate::personal_worker_queue::{
+    PersonalWorkerProfile, PersonalWorkerProfileObservation, PersonalWorkerQueueGeneration,
+};
 use crate::personal_worker_store::{
     PersonalWorkerStoreDocument, PersonalWorkerStoreError, PersonalWorkerStoreErrorKind,
-    PersonalWorkerStoreRevision,
+    PersonalWorkerStoreRevision, encode_personal_worker_store_document,
 };
 
 const AUTHORITY_DOCUMENT: &str = "lima-authority.json";
@@ -149,20 +155,47 @@ impl UnixPersonalWorkerLimaAuthorityGuard {
         if authority_present && current_worker.is_none() {
             return Err(authority_recovery_required());
         }
-        if authority_unsettled && !matches!(worker_plan, super::StoreRecoveryPlan::Clean { .. }) {
+        let settlement_prepared = current_authority
+            .as_ref()
+            .is_some_and(|document| document.settlement().is_some());
+        if authority_unsettled
+            && !settlement_prepared
+            && !matches!(worker_plan, super::StoreRecoveryPlan::Clean { .. })
+        {
             return Err(authority_recovery_required());
         }
-        if !authority_unsettled {
+        if !authority_unsettled && !settlement_prepared {
             store.recover_locked()?;
         }
-        let worker = store.load_named(CURRENT_DOCUMENT)?.ok_or_else(|| {
+        let mut worker = store.load_named(CURRENT_DOCUMENT)?.ok_or_else(|| {
             store_error(
                 PersonalWorkerStoreErrorKind::Missing,
                 "personal worker state does not exist",
             )
         })?;
-        recover_authority(&store, &worker)?;
-        let authority = load_authority(&store, AUTHORITY_DOCUMENT)?;
+        if settlement_prepared {
+            recover_prepared_settlement(
+                &mut store,
+                &mut worker,
+                current_authority
+                    .as_ref()
+                    .expect("settlement authority exists"),
+            )?;
+        } else {
+            recover_authority(&store, &worker)?;
+        }
+        let mut authority = load_authority(&store, AUTHORITY_DOCUMENT)?;
+        if authority
+            .as_ref()
+            .is_some_and(|document| document.settlement().is_some())
+        {
+            recover_prepared_settlement(
+                &mut store,
+                &mut worker,
+                authority.as_ref().expect("settlement authority exists"),
+            )?;
+            authority = load_authority(&store, AUTHORITY_DOCUMENT)?;
+        }
         if authority
             .as_ref()
             .is_some_and(|document| !attempt_matches_worker(document, &worker))
@@ -243,6 +276,9 @@ impl UnixPersonalWorkerLimaAuthorityGuard {
         if current.authority_generation() != expected_generation {
             return Err(authority_conflict());
         }
+        if current.settlement().is_some() || document.settlement().is_some() {
+            return Err(authority_conflict());
+        }
         document
             .validate_successor_of(current)
             .map_err(|_| authority_conflict())?;
@@ -262,6 +298,164 @@ impl UnixPersonalWorkerLimaAuthorityGuard {
         self.authority = Some(document.clone());
         Ok(())
     }
+
+    /// Publish the exact completed profile observation and clear its lifecycle attempt.
+    pub fn settle_completed_attempt(&mut self) -> AuthorityResult<()> {
+        if self.uncertain {
+            return Err(authority_recovery_required());
+        }
+        let current = self.authority.as_ref().ok_or_else(authority_missing)?;
+        if current.settlement().is_some() {
+            return Err(authority_recovery_required());
+        }
+        let successor = settlement_worker_successor(&self.worker, current)?;
+        let prepared = current
+            .prepare_settlement(
+                worker_document_digest(&self.worker)?,
+                worker_document_digest(&successor)?,
+            )
+            .map_err(|_| authority_conflict())?;
+        if let Err(error) = publish_authority(&self.store, &prepared, false) {
+            self.uncertain = true;
+            return Err(error);
+        }
+        self.authority = Some(prepared.clone());
+        if let Err(error) =
+            recover_prepared_settlement(&mut self.store, &mut self.worker, &prepared)
+        {
+            self.uncertain = true;
+            return Err(error);
+        }
+        self.authority = load_authority(&self.store, AUTHORITY_DOCUMENT)?;
+        Ok(())
+    }
+}
+
+fn recover_prepared_settlement(
+    store: &mut UnixPersonalWorkerStore,
+    worker: &mut PersonalWorkerStoreDocument,
+    authority: &PersonalWorkerLimaAuthorityDocument,
+) -> AuthorityResult<()> {
+    let settlement = authority
+        .settlement()
+        .ok_or_else(authority_recovery_required)?;
+    let cleared = authority
+        .clear_settled_attempt()
+        .map_err(|_| authority_recovery_required())?;
+    let mut staged_authority = load_open_authority(store, STAGED_AUTHORITY_DOCUMENT)?;
+    if staged_authority
+        .as_ref()
+        .is_some_and(|staged| staged.document != *authority && staged.document != cleared)
+    {
+        return Err(authority_recovery_required());
+    }
+    if staged_authority
+        .as_ref()
+        .is_some_and(|staged| staged.document == *authority)
+    {
+        remove_authority_stage(store)?;
+        staged_authority = None;
+    }
+
+    let current_digest = worker_document_digest(worker)?;
+    if current_digest == *settlement.previous_worker_digest() {
+        if staged_authority.is_some() {
+            return Err(authority_recovery_required());
+        }
+        let successor = settlement_worker_successor(worker, authority)?;
+        if worker_document_digest(&successor)? != *settlement.successor_worker_digest()
+            || successor.revision() != settlement.successor_store_revision()
+            || successor.queue().generation != settlement.successor_queue_generation()
+        {
+            return Err(authority_recovery_required());
+        }
+        if let Some(staged_worker) = store.load_named(STAGED_DOCUMENT)? {
+            if staged_worker != successor {
+                return Err(authority_recovery_required());
+            }
+            store.synchronize_existing_staged(&staged_worker)?;
+            let mut stage = StagedDocument::existing(store.directory.as_fd());
+            store.publish_staged(&mut stage, false)?;
+        } else {
+            let mut stage = store.stage_document(&successor)?;
+            store.publish_staged(&mut stage, false)?;
+        }
+        *worker = successor;
+    } else if current_digest == *settlement.successor_worker_digest()
+        && worker.revision() == settlement.successor_store_revision()
+        && worker.queue().generation == settlement.successor_queue_generation()
+    {
+        if let Some(staged_worker) = store.load_named(STAGED_DOCUMENT)? {
+            if staged_worker != *worker {
+                return Err(authority_recovery_required());
+            }
+            store.remove_staged()?;
+        }
+    } else {
+        return Err(authority_recovery_required());
+    }
+
+    match staged_authority {
+        Some(staged) if staged.document == cleared => publish_existing_stage(store, &staged, false),
+        Some(_) => Err(authority_recovery_required()),
+        None => publish_authority(store, &cleared, false),
+    }
+}
+
+fn settlement_worker_successor(
+    worker: &PersonalWorkerStoreDocument,
+    authority: &PersonalWorkerLimaAuthorityDocument,
+) -> AuthorityResult<PersonalWorkerStoreDocument> {
+    let attempt = authority
+        .attempt()
+        .filter(|attempt| attempt.phase() == PersonalWorkerLimaAttemptPhase::Completed)
+        .ok_or_else(authority_recovery_required)?;
+    if !worker.queue().active.is_empty()
+        || worker.revision() != attempt.store_revision()
+        || worker.queue().generation != attempt.queue_generation()
+    {
+        return Err(authority_recovery_required());
+    }
+    let profile = match attempt.after_state() {
+        LimaLifecycleState::Stopped => PersonalWorkerProfile::Stopped,
+        LimaLifecycleState::Running => match attempt.after_profile() {
+            LimaResourceProfile::Interactive => PersonalWorkerProfile::Interactive,
+            LimaResourceProfile::Work => PersonalWorkerProfile::Work,
+        },
+        LimaLifecycleState::Starting
+        | LimaLifecycleState::Draining
+        | LimaLifecycleState::Stopping
+        | LimaLifecycleState::Unavailable => {
+            return Err(authority_recovery_required());
+        }
+    };
+    if worker
+        .queue()
+        .pending_profile_change
+        .is_some_and(|pending| pending.target != profile)
+    {
+        return Err(authority_recovery_required());
+    }
+    let completed_at = attempt
+        .completed_at()
+        .ok_or_else(authority_recovery_required)?;
+    let mut queue = worker.queue().clone();
+    queue.generation = queue
+        .generation
+        .next()
+        .map_err(|_| authority_recovery_required())?;
+    queue.observed_at = completed_at;
+    queue.profile_observation = PersonalWorkerProfileObservation::observed(profile);
+    queue.pending_profile_change = None;
+    worker
+        .advance(queue, worker.cache_leases().to_vec())
+        .map_err(Into::into)
+}
+
+fn worker_document_digest(document: &PersonalWorkerStoreDocument) -> AuthorityResult<Sha256Digest> {
+    let encoded = encode_personal_worker_store_document(document)?;
+    let digest = Sha256::digest(encoded);
+    Sha256Digest::parse(&format!("sha256:{digest:x}")).map_err(|_| authority_corrupt())
 }
 
 fn recover_authority(

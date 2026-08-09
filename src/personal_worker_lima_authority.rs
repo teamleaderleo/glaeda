@@ -23,12 +23,12 @@ use crate::personal_worker_queue::{PersonalWorkerProfile, PersonalWorkerQueueGen
 use crate::personal_worker_store::PersonalWorkerStoreRevision;
 use crate::personal_worker_tick::{PersonalWorkerTickAction, PersonalWorkerTickPlan};
 
-pub const PERSONAL_WORKER_LIMA_AUTHORITY_SCHEMA_VERSION: u8 = 1;
+pub const PERSONAL_WORKER_LIMA_AUTHORITY_SCHEMA_VERSION: u8 = 2;
 pub const MAX_PERSONAL_WORKER_LIMA_AUTHORITY_BYTES: usize = 16_384;
 const PERSONAL_WORKER_LIMA_AUTHORITY_DOCUMENT_TYPE: &str =
     "smolrunner.personal_worker_lima_authority";
 const PERSONAL_WORKER_LIMA_ENROLLMENT_CONFIRMATION_PREFIX: &str =
-    "personal-worker-lima-enrollment-v1.sha256:";
+    "personal-worker-lima-enrollment-v2.sha256:";
 const MAX_AUTHORITY_GENERATION: u64 = 1_000_000_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -161,6 +161,36 @@ pub struct PersonalWorkerLimaAttempt {
     completed_at: Option<EpochMillis>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PersonalWorkerLimaSettlement {
+    previous_worker_digest: Sha256Digest,
+    successor_worker_digest: Sha256Digest,
+    successor_store_revision: PersonalWorkerStoreRevision,
+    successor_queue_generation: PersonalWorkerQueueGeneration,
+}
+
+impl PersonalWorkerLimaSettlement {
+    #[must_use]
+    pub const fn previous_worker_digest(&self) -> &Sha256Digest {
+        &self.previous_worker_digest
+    }
+
+    #[must_use]
+    pub const fn successor_worker_digest(&self) -> &Sha256Digest {
+        &self.successor_worker_digest
+    }
+
+    #[must_use]
+    pub const fn successor_store_revision(&self) -> PersonalWorkerStoreRevision {
+        self.successor_store_revision
+    }
+
+    #[must_use]
+    pub const fn successor_queue_generation(&self) -> PersonalWorkerQueueGeneration {
+        self.successor_queue_generation
+    }
+}
+
 pub struct PersonalWorkerLimaAttemptInput<'a> {
     pub config: &'a OperatorConfig,
     pub mac: &'a PersonalWorkerMacObservation,
@@ -247,6 +277,11 @@ impl PersonalWorkerLimaAttempt {
     }
 
     #[must_use]
+    pub const fn after_state(&self) -> LimaLifecycleState {
+        self.after_state
+    }
+
+    #[must_use]
     pub const fn completed_at(&self) -> Option<EpochMillis> {
         self.completed_at
     }
@@ -263,6 +298,7 @@ pub struct PersonalWorkerLimaAuthorityDocument {
     expected_architecture: LimaArchitecture,
     persistent_identity: LimaPersistentIdentity,
     attempt: Option<PersonalWorkerLimaAttempt>,
+    settlement: Option<PersonalWorkerLimaSettlement>,
 }
 
 impl fmt::Debug for PersonalWorkerLimaAuthorityDocument {
@@ -278,6 +314,7 @@ impl fmt::Debug for PersonalWorkerLimaAuthorityDocument {
             .field("expected_architecture", &self.expected_architecture)
             .field("persistent_identity", &self.persistent_identity)
             .field("attempt", &self.attempt)
+            .field("settlement", &self.settlement)
             .finish()
     }
 }
@@ -341,6 +378,11 @@ impl PersonalWorkerLimaAuthorityDocument {
         self.attempt.as_ref()
     }
 
+    #[must_use]
+    pub const fn settlement(&self) -> Option<&PersonalWorkerLimaSettlement> {
+        self.settlement.as_ref()
+    }
+
     pub(crate) fn validate_successor_of(
         &self,
         previous: &Self,
@@ -367,7 +409,13 @@ impl PersonalWorkerLimaAuthorityDocument {
                 if next.phase == PersonalWorkerLimaAttemptPhase::Prepared
                     && next.generation.get() == previous.authority_generation.get() =>
             {
-                Ok(())
+                if previous.settlement.is_none() && self.settlement.is_none() {
+                    Ok(())
+                } else {
+                    Err(PersonalWorkerLimaAuthorityError::conflict(
+                        "Lima authority attempt cannot begin with settlement evidence",
+                    ))
+                }
             }
             (Some(previous_attempt), Some(next_attempt))
                 if same_attempt_identity(previous_attempt, next_attempt)
@@ -377,7 +425,24 @@ impl PersonalWorkerLimaAuthorityDocument {
                         previous_attempt.phase,
                         next_attempt.phase,
                     )
-                    && next_attempt.checkpoint_at >= previous_attempt.checkpoint_at =>
+                    && next_attempt.checkpoint_at >= previous_attempt.checkpoint_at
+                    && previous.settlement.is_none()
+                    && self.settlement.is_none() =>
+            {
+                Ok(())
+            }
+            (Some(previous_attempt), Some(next_attempt))
+                if previous_attempt == next_attempt
+                    && previous_attempt.phase == PersonalWorkerLimaAttemptPhase::Completed
+                    && previous.settlement.is_none()
+                    && self.settlement.is_some() =>
+            {
+                Ok(())
+            }
+            (Some(previous_attempt), None)
+                if previous_attempt.phase == PersonalWorkerLimaAttemptPhase::Completed
+                    && previous.settlement.is_some()
+                    && self.settlement.is_none() =>
             {
                 Ok(())
             }
@@ -431,6 +496,7 @@ impl PersonalWorkerLimaAuthorityDocument {
         let mut next = self.clone();
         next.authority_generation = self.authority_generation.next()?;
         next.attempt = Some(attempt);
+        next.settlement = None;
         Ok(next)
     }
 
@@ -527,6 +593,61 @@ impl PersonalWorkerLimaAuthorityDocument {
         attempt.phase = PersonalWorkerLimaAttemptPhase::Completed;
         attempt.checkpoint_at = completed_at;
         attempt.completed_at = Some(completed_at);
+        Ok(next)
+    }
+
+    pub(crate) fn prepare_settlement(
+        &self,
+        previous_worker_digest: Sha256Digest,
+        successor_worker_digest: Sha256Digest,
+    ) -> Result<Self, PersonalWorkerLimaAuthorityError> {
+        let attempt = self.attempt.as_ref().ok_or_else(|| {
+            PersonalWorkerLimaAuthorityError::invalid("no Lima lifecycle attempt exists")
+        })?;
+        if attempt.phase != PersonalWorkerLimaAttemptPhase::Completed
+            || self.settlement.is_some()
+            || previous_worker_digest == successor_worker_digest
+        {
+            return Err(PersonalWorkerLimaAuthorityError::invalid(
+                "only an exact completed lifecycle attempt can prepare worker settlement",
+            ));
+        }
+        let successor_store_revision = attempt.store_revision.next().map_err(|_| {
+            PersonalWorkerLimaAuthorityError::invalid(
+                "worker revision cannot advance for Lima settlement",
+            )
+        })?;
+        let successor_queue_generation = attempt.queue_generation.next().map_err(|_| {
+            PersonalWorkerLimaAuthorityError::invalid(
+                "worker queue generation cannot advance for Lima settlement",
+            )
+        })?;
+        let mut next = self.clone();
+        next.authority_generation = self.authority_generation.next()?;
+        next.settlement = Some(PersonalWorkerLimaSettlement {
+            previous_worker_digest,
+            successor_worker_digest,
+            successor_store_revision,
+            successor_queue_generation,
+        });
+        Ok(next)
+    }
+
+    pub(crate) fn clear_settled_attempt(&self) -> Result<Self, PersonalWorkerLimaAuthorityError> {
+        if self
+            .attempt
+            .as_ref()
+            .is_none_or(|attempt| attempt.phase != PersonalWorkerLimaAttemptPhase::Completed)
+            || self.settlement.is_none()
+        {
+            return Err(PersonalWorkerLimaAuthorityError::invalid(
+                "Lima lifecycle attempt is not durably settled",
+            ));
+        }
+        let mut next = self.clone();
+        next.authority_generation = self.authority_generation.next()?;
+        next.attempt = None;
+        next.settlement = None;
         Ok(next)
     }
 
@@ -653,6 +774,7 @@ fn enrollment_candidate(
         expected_architecture: request.expected_architecture(),
         persistent_identity: guest.persistent_identity.clone(),
         attempt: None,
+        settlement: None,
     })
 }
 
@@ -1028,6 +1150,8 @@ struct AuthorityWire<'a> {
     expected_architecture: &'static str,
     persistent_identity: PersistentIdentityWire<'a>,
     attempt: Option<AttemptWire<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    settlement: Option<SettlementWire<'a>>,
 }
 
 #[derive(Serialize)]
@@ -1073,6 +1197,14 @@ struct AttemptWire<'a> {
     completed_at: Option<u64>,
 }
 
+#[derive(Serialize)]
+struct SettlementWire<'a> {
+    previous_worker_digest: &'a str,
+    successor_worker_digest: &'a str,
+    successor_store_revision: u64,
+    successor_queue_generation: u64,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawAuthority {
@@ -1087,6 +1219,7 @@ struct RawAuthority {
     expected_architecture: String,
     persistent_identity: RawPersistentIdentity,
     attempt: Option<RawAttempt>,
+    settlement: Option<RawSettlement>,
 }
 
 #[derive(Deserialize)]
@@ -1134,6 +1267,15 @@ struct RawAttempt {
     phase: String,
     checkpoint_at: u64,
     completed_at: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSettlement {
+    previous_worker_digest: String,
+    successor_worker_digest: String,
+    successor_store_revision: u64,
+    successor_queue_generation: u64,
 }
 
 /// Encode one canonical bounded lifecycle-authority document.
@@ -1206,6 +1348,7 @@ fn authority_wire(document: &PersonalWorkerLimaAuthorityDocument) -> AuthorityWi
         expected_architecture: architecture_name(document.expected_architecture),
         persistent_identity: persistent_wire(&document.persistent_identity),
         attempt: document.attempt.as_ref().map(attempt_wire),
+        settlement: document.settlement.as_ref().map(settlement_wire),
     }
 }
 
@@ -1249,11 +1392,21 @@ fn attempt_wire(attempt: &PersonalWorkerLimaAttempt) -> AttemptWire<'_> {
     }
 }
 
+fn settlement_wire(settlement: &PersonalWorkerLimaSettlement) -> SettlementWire<'_> {
+    SettlementWire {
+        previous_worker_digest: settlement.previous_worker_digest.as_str(),
+        successor_worker_digest: settlement.successor_worker_digest.as_str(),
+        successor_store_revision: settlement.successor_store_revision.get(),
+        successor_queue_generation: settlement.successor_queue_generation.get(),
+    }
+}
+
 fn parse_raw_authority(
     raw: RawAuthority,
 ) -> Result<PersonalWorkerLimaAuthorityDocument, PersonalWorkerLimaAuthorityError> {
     let identity = parse_instance(raw.identity)?;
     let attempt = raw.attempt.map(parse_attempt).transpose()?;
+    let settlement = raw.settlement.map(parse_settlement).transpose()?;
     let document = PersonalWorkerLimaAuthorityDocument {
         authority_generation: PersonalWorkerLimaAuthorityGeneration::new(raw.authority_generation)?,
         config_identity: EnrolledConfigIdentity {
@@ -1280,9 +1433,25 @@ fn parse_raw_authority(
             },
         },
         attempt,
+        settlement,
     };
     validate_document_shape(&document)?;
     Ok(document)
+}
+
+fn parse_settlement(
+    raw: RawSettlement,
+) -> Result<PersonalWorkerLimaSettlement, PersonalWorkerLimaAuthorityError> {
+    Ok(PersonalWorkerLimaSettlement {
+        previous_worker_digest: parse_digest(&raw.previous_worker_digest)?,
+        successor_worker_digest: parse_digest(&raw.successor_worker_digest)?,
+        successor_store_revision: PersonalWorkerStoreRevision::new(raw.successor_store_revision)
+            .map_err(|_| corrupt_document())?,
+        successor_queue_generation: PersonalWorkerQueueGeneration::new(
+            raw.successor_queue_generation,
+        )
+        .map_err(|_| corrupt_document())?,
+    })
 }
 
 fn parse_attempt(
@@ -1323,6 +1492,9 @@ fn validate_document_shape(
     {
         return Err(corrupt_document());
     }
+    if document.attempt.is_none() && document.settlement.is_some() {
+        return Err(corrupt_document());
+    }
     if let Some(attempt) = &document.attempt {
         let completed_shape = match attempt.phase {
             PersonalWorkerLimaAttemptPhase::Completed => {
@@ -1331,7 +1503,11 @@ fn validate_document_shape(
             _ => attempt.completed_at.is_none(),
         };
         if attempt.identity != document.identity
-            || !authority_generation_matches_attempt(document.authority_generation, attempt)
+            || !authority_generation_matches_attempt(
+                document.authority_generation,
+                attempt,
+                document.settlement.is_some(),
+            )
             || attempt.checkpoint_at < attempt.decision_at
             || !completed_shape
             || attempt.before_resources
@@ -1347,6 +1523,23 @@ fn validate_document_shape(
         {
             return Err(corrupt_document());
         }
+        if let Some(settlement) = &document.settlement {
+            let successor_revision = attempt
+                .store_revision
+                .next()
+                .map_err(|_| corrupt_document())?;
+            let successor_generation = attempt
+                .queue_generation
+                .next()
+                .map_err(|_| corrupt_document())?;
+            if attempt.phase != PersonalWorkerLimaAttemptPhase::Completed
+                || settlement.previous_worker_digest == settlement.successor_worker_digest
+                || settlement.successor_store_revision != successor_revision
+                || settlement.successor_queue_generation != successor_generation
+            {
+                return Err(corrupt_document());
+            }
+        }
     }
     Ok(())
 }
@@ -1354,8 +1547,9 @@ fn validate_document_shape(
 fn authority_generation_matches_attempt(
     authority_generation: PersonalWorkerLimaAuthorityGeneration,
     attempt: &PersonalWorkerLimaAttempt,
+    settlement_prepared: bool,
 ) -> bool {
-    let delta = match (attempt.action, attempt.phase) {
+    let mut delta = match (attempt.action, attempt.phase) {
         (PersonalWorkerLimaAction::StopToStopped, PersonalWorkerLimaAttemptPhase::Prepared) => 1,
         (PersonalWorkerLimaAction::StopToStopped, PersonalWorkerLimaAttemptPhase::StopStarted) => 2,
         (
@@ -1405,6 +1599,9 @@ fn authority_generation_matches_attempt(
         ) => 9,
         _ => return false,
     };
+    if settlement_prepared {
+        delta += 1;
+    }
     attempt
         .generation
         .get()

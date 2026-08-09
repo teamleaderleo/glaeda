@@ -290,6 +290,7 @@ impl UnixPersonalWorkerStore {
                             0,
                         ));
                     }
+                    store.synchronize_existing_staged(&migrated)?;
                     let mut staged = StagedDocument::existing(store.directory.as_fd());
                     store.publish_staged(&mut staged, false)?;
                     return Ok(PersonalWorkerStoreMigrationReceipt::new(
@@ -453,6 +454,49 @@ impl UnixPersonalWorkerStore {
         synchronize_directory(&self.directory, "personal worker store directory")
     }
 
+    fn synchronize_existing_staged(
+        &self,
+        expected: &PersonalWorkerStoreDocument,
+    ) -> Result<(), PersonalWorkerStoreError> {
+        let file = fs::openat(
+            &self.directory,
+            STAGED_DOCUMENT,
+            EXISTING_FILE_FLAGS,
+            Mode::empty(),
+        )
+        .map_err(map_document_open_error)?;
+        inspect_private_file(&file, self.owner, "staged personal worker document", None)?;
+        let mut file = File::from(file);
+        let mut bytes = Vec::new();
+        std::io::Read::by_ref(&mut file)
+            .take((MAX_PERSONAL_WORKER_STORE_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|_| {
+                store_error(
+                    PersonalWorkerStoreErrorKind::Io,
+                    "could not read the staged personal worker document",
+                )
+            })?;
+        if bytes.len() > MAX_PERSONAL_WORKER_STORE_BYTES
+            || decode_personal_worker_store_document(&bytes).as_ref() != Ok(expected)
+        {
+            return Err(PersonalWorkerStoreError::corrupt_state());
+        }
+        file.sync_all().map_err(|_| {
+            store_error(
+                PersonalWorkerStoreErrorKind::Io,
+                "could not synchronize the staged personal worker document",
+            )
+        })?;
+        inspect_private_file(
+            file.as_fd(),
+            self.owner,
+            "staged personal worker document",
+            Some(bytes.len()),
+        )?;
+        Ok(())
+    }
+
     fn remove_staged(&self) -> Result<(), PersonalWorkerStoreError> {
         match fs::unlinkat(&self.directory, STAGED_DOCUMENT, AtFlags::empty()) {
             Ok(()) => synchronize_directory(&self.directory, "personal worker store directory"),
@@ -510,6 +554,10 @@ impl UnixPersonalWorkerStore {
                 revision,
                 no_replace,
             } => {
+                let staged = self
+                    .load_named(STAGED_DOCUMENT)?
+                    .ok_or_else(PersonalWorkerStoreError::corrupt_state)?;
+                self.synchronize_existing_staged(&staged)?;
                 let mut staged_guard = StagedDocument::existing(self.directory.as_fd());
                 self.publish_staged(&mut staged_guard, no_replace)?;
                 Ok(PersonalWorkerStoreRecovery::new(

@@ -54,7 +54,8 @@ use smolrunner::personal_worker_queue::{
     PersonalWorkerSelection,
 };
 use smolrunner::personal_worker_store::{
-    PersonalWorkerStoreDocument, PersonalWorkerStoreErrorKind, PersonalWorkerStoreRevision,
+    PersonalWorkerStore, PersonalWorkerStoreDocument, PersonalWorkerStoreErrorKind,
+    PersonalWorkerStoreRevision,
 };
 use smolrunner::personal_worker_tick::{
     PersonalWorkerTickInput, PersonalWorkerTickPlan, PersonalWorkerTickPolicy,
@@ -507,6 +508,76 @@ fn enrolled() -> PersonalWorkerLimaAuthorityDocument {
     .into_document()
 }
 
+fn persist_completed_work_attempt(
+    guard: &mut UnixPersonalWorkerLimaAuthorityGuard,
+) -> PersonalWorkerLimaAuthorityDocument {
+    let config = config();
+    let request = request(LIMA_HOME, CACHE_PATH);
+    let before = lifecycle_profile(
+        LimaLifecycleState::Running,
+        LimaResourceProfile::Interactive,
+        204_000,
+    );
+    let before_mac = mac_observation_profile(true, 200_000, LimaResourceProfile::Interactive);
+    let tick = worker_tick_with_snapshot(
+        &before,
+        guard.store_revision().get(),
+        guard.queue_generation().get(),
+    );
+    let mut current = guard.authority().expect("enrollment").clone();
+    let prepared = current
+        .begin_attempt(PersonalWorkerLimaAttemptInput {
+            config: &config,
+            mac: &before_mac,
+            request: &request,
+            lifecycle: &before,
+            tick: &tick,
+        })
+        .expect("prepare work transition");
+    guard
+        .replace_authority(current.authority_generation(), &prepared)
+        .expect("persist prepared");
+    current = prepared;
+    let generation = current.attempt().expect("attempt").generation();
+    for (phase, at) in [
+        (PersonalWorkerLimaAttemptPhase::StopStarted, 206_000),
+        (PersonalWorkerLimaAttemptPhase::StopCompleted, 207_000),
+        (PersonalWorkerLimaAttemptPhase::EditStarted, 208_000),
+        (PersonalWorkerLimaAttemptPhase::EditCompleted, 209_000),
+        (PersonalWorkerLimaAttemptPhase::StartStarted, 210_000),
+        (PersonalWorkerLimaAttemptPhase::StartCompleted, 211_000),
+        (PersonalWorkerLimaAttemptPhase::VerifyStarted, 212_000),
+    ] {
+        let next = current
+            .checkpoint(generation, phase, epoch(at))
+            .expect("checkpoint work transition");
+        guard
+            .replace_authority(current.authority_generation(), &next)
+            .expect("persist checkpoint");
+        current = next;
+    }
+    let post_mac = mac_observation_profile(true, 214_000, LimaResourceProfile::Work);
+    let completed = current
+        .complete_attempt(
+            generation,
+            &config,
+            &post_mac,
+            &request,
+            &lifecycle_with_generation(
+                LimaLifecycleState::Running,
+                LimaResourceProfile::Work,
+                218_000,
+                2,
+            ),
+            epoch(219_000),
+        )
+        .expect("complete work transition");
+    guard
+        .replace_authority(current.authority_generation(), &completed)
+        .expect("persist completion");
+    completed
+}
+
 #[test]
 fn enrollment_uses_sealed_running_identity_and_has_canonical_private_encoding() {
     let running = mac_observation(true, 100_000);
@@ -930,7 +1001,7 @@ fn strict_decode_binds_each_phase_to_its_exact_durable_generation_delta() {
 fn unknown_version_unknown_fields_and_noncanonical_bytes_fail_closed() {
     let bytes = encode_personal_worker_lima_authority(&enrolled()).expect("encode");
     let mut value: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON");
-    value["schema_version"] = serde_json::json!(2);
+    value["schema_version"] = serde_json::json!(3);
     let version = serde_json::to_vec(&value).expect("version bytes");
     assert_eq!(
         decode_personal_worker_lima_authority(&version)
@@ -940,6 +1011,15 @@ fn unknown_version_unknown_fields_and_noncanonical_bytes_fail_closed() {
     );
 
     value["schema_version"] = serde_json::json!(1);
+    let previous = serde_json::to_vec(&value).expect("previous version bytes");
+    assert_eq!(
+        decode_personal_worker_lima_authority(&previous)
+            .expect_err("previous version requires explicit migration")
+            .kind,
+        PersonalWorkerLimaAuthorityErrorKind::VersionIncompatible
+    );
+
+    value["schema_version"] = serde_json::json!(2);
     value["identity"]["instance_id"] = serde_json::json!("other");
     assert_eq!(
         decode_personal_worker_lima_authority(
@@ -1243,6 +1323,98 @@ fn unix_sidecar_refuses_to_splice_orphan_authority_onto_a_fresh_worker() {
     assert_eq!(
         reopen.kind(),
         UnixPersonalWorkerLimaAuthorityErrorKind::RecoveryRequired
+    );
+}
+
+#[test]
+fn unix_completed_settlement_recovers_exact_worker_successor_before_clearing_authority() {
+    let root = TempStateRoot::new();
+    let worker = PersonalWorkerStoreDocument::new(
+        PersonalWorkerQueueInput {
+            generation: PersonalWorkerQueueGeneration::new(1).expect("generation"),
+            observed_at: epoch(90_000),
+            profile_observation: PersonalWorkerProfileObservation::Unobserved,
+            activity_evidence: PersonalWorkerActivityEvidence::Never,
+            queued: Vec::new(),
+            active: Vec::new(),
+            pending_profile_change: None,
+        },
+        Vec::new(),
+    )
+    .expect("initial worker");
+    UnixPersonalWorkerStore::initialize_if_clean(root.path(), &worker)
+        .expect("initialize worker store");
+
+    let config = config();
+    let mac = mac_observation(true, 100_000);
+    let request = request(LIMA_HOME, CACHE_PATH);
+    let confirmation =
+        personal_worker_lima_enrollment_confirmation(&config, &mac, &request, broker_identity())
+            .expect("confirmation");
+    let enrollment = PersonalWorkerLimaAuthorityDocument::enroll(
+        &config,
+        &mac,
+        &request,
+        broker_identity(),
+        Some(confirmation.value()),
+    )
+    .expect("confirmed enrollment");
+    let mut guard = UnixPersonalWorkerLimaAuthorityGuard::open(root.path()).expect("guard");
+    guard
+        .publish_enrollment(enrollment, epoch(104_000))
+        .expect("publish enrollment");
+    let completed = persist_completed_work_attempt(&mut guard);
+    assert_eq!(
+        completed.attempt().expect("attempt").phase(),
+        PersonalWorkerLimaAttemptPhase::Completed
+    );
+
+    let worker_stage = root.path().join("personal-worker/.next.json");
+    fs::write(&worker_stage, []).expect("inject conflicting worker stage");
+    fs::set_permissions(&worker_stage, fs::Permissions::from_mode(0o600))
+        .expect("private worker stage");
+    let interrupted = guard
+        .settle_completed_attempt()
+        .expect_err("conflicting worker stage interrupts settlement after its checkpoint");
+    assert_eq!(
+        interrupted.kind(),
+        UnixPersonalWorkerLimaAuthorityErrorKind::CorruptState
+    );
+    assert!(guard.recovery_required());
+    assert!(
+        guard
+            .authority()
+            .expect("prepared settlement authority")
+            .settlement()
+            .is_some()
+    );
+    fs::remove_file(&worker_stage).expect("remove test-only conflicting stage");
+    drop(guard);
+
+    let recovered = UnixPersonalWorkerLimaAuthorityGuard::open(root.path())
+        .expect("reopen deterministically finishes exact settlement");
+    assert_eq!(recovered.store_revision().get(), 2);
+    assert_eq!(recovered.queue_generation().get(), 2);
+    let authority = recovered.authority().expect("settled enrollment remains");
+    assert!(authority.attempt().is_none());
+    assert!(authority.settlement().is_none());
+    let busy = UnixPersonalWorkerStore::open_or_create(root.path())
+        .expect_err("settlement guard still owns the canonical writer lock");
+    assert_eq!(busy.kind(), PersonalWorkerStoreErrorKind::Busy);
+    drop(recovered);
+
+    let (store, _) = UnixPersonalWorkerStore::open_or_create(root.path()).expect("settled store");
+    let settled_worker = store.load().expect("load settled worker").expect("worker");
+    assert_eq!(settled_worker.revision().get(), 2);
+    assert_eq!(settled_worker.queue().generation.get(), 2);
+    assert_eq!(
+        settled_worker.queue().profile_observation,
+        PersonalWorkerProfileObservation::observed(PersonalWorkerProfile::Work)
+    );
+    assert_eq!(settled_worker.queue().observed_at, epoch(219_000));
+    assert_eq!(
+        settled_worker.queue().activity_evidence,
+        PersonalWorkerActivityEvidence::Never
     );
 }
 
