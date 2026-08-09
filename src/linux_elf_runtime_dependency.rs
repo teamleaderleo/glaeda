@@ -980,8 +980,17 @@ mod tests {
             );
             let bytes = std::fs::read(path)
                 .unwrap_or_else(|error| panic!("read package ELF {path}: {error}"));
-            parse_linux_runtime_elf_dependency(&bytes, architecture)
+            let parsed = parse_linux_runtime_elf_dependency(&bytes, architecture)
                 .unwrap_or_else(|error| panic!("parse package ELF {path}: {error}"));
+            let selects_systemd_private = matches!(
+                parsed.dynamic_search(),
+                Some(LinuxRuntimeDynamicSearchPolicy::SystemdPrivate)
+            );
+            assert_eq!(
+                selects_systemd_private,
+                matches!(path, "/usr/bin/systemctl" | "/usr/bin/systemd-run"),
+                "unexpected systemd-private search policy: {path}"
+            );
         }
     }
 
