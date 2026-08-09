@@ -419,6 +419,12 @@ run_user_probe() {
 
   prepare_cgroup_hierarchy
 
+  if [[ -L $PROBE_GRAPHROOT ]] || [[ ! -d $PROBE_GRAPHROOT ]] ||
+    [[ -n $(/usr/bin/find "$PROBE_GRAPHROOT" -mindepth 1 -maxdepth 1 -print -quit) ]] ||
+    [[ -e $PROBE_RUNROOT ]] || [[ -L $PROBE_RUNROOT ]]; then
+    printf 'error: execution graph/run roots were not fresh before image inspection\n' >&2
+    exit 1
+  fi
   if ! validate_target_tmpfs ||
     [[ -n $(/usr/bin/find "$PROBE_TARGET" -mindepth 1 -maxdepth 1 -print -quit) ]]; then
     printf 'error: bounded writable target is not one exact empty executable tmpfs\n' >&2
@@ -1179,6 +1185,14 @@ chmod 0444 "$probe_root/config/image.id"
 /usr/bin/chown 0:0 "$probe_root/image-backing" "$probe_image_store"
 /usr/bin/chmod 0700 "$probe_root/image-backing"
 /usr/bin/chmod 0555 "$probe_image_store"
+read -r backing_owner backing_group backing_mode < <(
+  /usr/bin/stat -Lc '%u %g %a' "$probe_root/image-backing"
+)
+if [[ -L $probe_root/image-backing ]] || [[ ! -d $probe_root/image-backing ]] ||
+  [[ $backing_owner != 0 ]] || [[ $backing_group != 0 ]] || [[ $backing_mode != 700 ]]; then
+  printf 'error: writable image backing is not hidden behind one exact root-only parent\n' >&2
+  exit 1
+fi
 image_store_identity=$(/usr/bin/stat -Lc '%d:%i' "$probe_image_backing")
 /usr/bin/mount --bind "$probe_image_backing" "$probe_image_store"
 /usr/bin/mount --options remount,bind,ro,nosuid,nodev "$probe_image_store"
