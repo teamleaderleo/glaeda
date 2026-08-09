@@ -860,15 +860,20 @@ if [[ ${SMOLRUNNER_DISPOSABLE_PROBE:-} != github-hosted-ubuntu ]]; then
 fi
 
 snapshot_read_only_image_store() {
-  local store=$1 link target
+  local store=$1 expected_identity=$2 identity link mount_target target
+  local -a mount_options
 
-  if [[ -L $store ]] || [[ ! -d $store ]] ||
-    [[ -n $(/usr/bin/find "$store" -xdev \( ! -user root -o ! -group root \) -print -quit) ]] ||
-    [[ -n $(/usr/bin/find "$store" -xdev -type d ! -perm 0555 -print -quit) ]] ||
-    [[ -n $(/usr/bin/find "$store" -xdev -type f ! -perm 0444 -print -quit) ]] ||
+  identity=$(/usr/bin/stat -Lc '%d:%i' "$store")
+  mount_target=$(/usr/bin/findmnt -rn -o TARGET --target "$store")
+  IFS=, read -r -a mount_options <<< "$(/usr/bin/findmnt -rn -o OPTIONS --target "$store")"
+  if [[ -L $store ]] || [[ ! -d $store ]] || [[ $identity != "$expected_identity" ]] ||
+    [[ $mount_target != "$store" ]] ||
+    [[ ! " ${mount_options[*]} " =~ [[:space:]]ro[[:space:]] ]] ||
+    [[ ! " ${mount_options[*]} " =~ [[:space:]]nosuid[[:space:]] ]] ||
+    [[ ! " ${mount_options[*]} " =~ [[:space:]]nodev[[:space:]] ]] ||
     [[ -n $(/usr/bin/find "$store" -xdev -type f ! -links 1 -print -quit) ]] ||
     [[ -n $(/usr/bin/find "$store" -xdev ! -type d ! -type f ! -type l -print -quit) ]]; then
-    printf 'error: installed image store is not one exact root-owned read-only tree\n' >&2
+    printf 'error: installed image store is not one exact root-controlled read-only mount\n' >&2
     exit 1
   fi
   while IFS= read -r -d '' link; do
@@ -883,8 +888,8 @@ snapshot_read_only_image_store() {
     --sort=name \
     --format=gnu \
     --numeric-owner \
-    --owner=0 \
-    --group=0 \
+    --xattrs \
+    --xattrs-include='*' \
     --mtime=@0 \
     -C "$store" -cf - . |
     /usr/bin/sha256sum |
@@ -950,10 +955,12 @@ probe_user_created=0
 probe_install_unit_owned=0
 probe_unit_owned=0
 probe_target_mounted=0
+probe_image_store_mounted=0
 probe_script=$(/usr/bin/readlink -f "$0")
 probe_user_script="$probe_root/user-probe.sh"
 probe_seccomp_profile="$probe_root/seccomp.json"
 probe_target="$probe_root/target"
+probe_image_backing="$probe_root/image-backing/store"
 probe_image_store="$probe_root/image-store"
 
 cleanup() {
@@ -967,6 +974,9 @@ cleanup() {
   fi
   if [[ $probe_target_mounted -eq 1 ]]; then
     /usr/bin/umount -- "$probe_target" >/dev/null 2>&1
+  fi
+  if [[ $probe_image_store_mounted -eq 1 ]]; then
+    /usr/bin/umount -- "$probe_image_store" >/dev/null 2>&1
   fi
   if [[ $probe_user_created -eq 1 ]]; then
     /usr/sbin/userdel "$probe_user" >/dev/null 2>&1
@@ -1016,6 +1026,8 @@ mkdir -p \
   "$probe_root/empty-xdg" \
   "$probe_root/graphroot" \
   "$probe_root/hooks" \
+  "$probe_root/image-backing" \
+  "$probe_image_backing" \
   "$probe_image_store" \
   "$probe_root/image-network" \
   "$probe_root/image-runtime" \
@@ -1079,7 +1091,7 @@ printf '' > "$probe_root/config/containers.conf"
 printf 'unqualified-search-registries = []\nshort-name-mode = "enforcing"\n' \
   > "$probe_root/config/registries.conf"
 printf '[storage]\ndriver = "overlay"\nrunroot = "%s"\ngraphroot = "%s"\nrootless_storage_path = "%s"\n\n[storage.options]\nadditionalimagestores = []\n' \
-  "$probe_root/image-runtime/containers" "$probe_image_store" "$probe_image_store" \
+  "$probe_root/image-runtime/containers" "$probe_image_backing" "$probe_image_backing" \
   > "$probe_root/config/image-storage.conf"
 printf '[storage]\ndriver = "overlay"\nrunroot = "%s"\ngraphroot = "%s"\nrootless_storage_path = "%s"\n\n[storage.options]\nadditionalimagestores = ["%s"]\n' \
   "$probe_root/runtime/containers" "$probe_root/graphroot" "$probe_root/graphroot" \
@@ -1092,7 +1104,7 @@ printf '' > "$probe_root/network/netavark.lock"
 
 chown -R "$probe_uid:$probe_gid" \
   "$probe_root/graphroot" \
-  "$probe_image_store" \
+  "$probe_image_backing" \
   "$probe_root/image-runtime" \
   "$probe_root/image-tmp" \
   "$probe_root/runtime" \
@@ -1105,7 +1117,7 @@ chown "$probe_uid:$probe_gid" \
 chmod 0555 "$probe_root/empty-home" "$probe_root/empty-xdg"
 chmod 0700 \
   "$probe_root/graphroot" \
-  "$probe_image_store" \
+  "$probe_image_backing" \
   "$probe_root/image-runtime" \
   "$probe_root/image-tmp" \
   "$probe_root/runtime" \
@@ -1165,10 +1177,14 @@ if [[ ! $image_id =~ ^sha256:[0-9a-f]{64}$ ]]; then
 fi
 printf '%s\n' "$image_id" > "$probe_root/config/image.id"
 chmod 0444 "$probe_root/config/image.id"
-/usr/bin/chown -hR 0:0 "$probe_image_store"
-/usr/bin/find "$probe_image_store" -xdev -type d -exec /usr/bin/chmod 0555 {} +
-/usr/bin/find "$probe_image_store" -xdev -type f -exec /usr/bin/chmod 0444 {} +
-image_store_digest_before=$(snapshot_read_only_image_store "$probe_image_store")
+/usr/bin/chown 0:0 "$probe_root/image-backing" "$probe_image_store"
+/usr/bin/chmod 0700 "$probe_root/image-backing"
+/usr/bin/chmod 0555 "$probe_image_store"
+image_store_identity=$(/usr/bin/stat -Lc '%d:%i' "$probe_image_backing")
+/usr/bin/mount --bind "$probe_image_backing" "$probe_image_store"
+/usr/bin/mount --options remount,bind,ro,nosuid,nodev "$probe_image_store"
+probe_image_store_mounted=1
+image_store_digest_before=$(snapshot_read_only_image_store "$probe_image_store" "$image_store_identity")
 printf 'readonly_image_store=sealed\n'
 
 /usr/bin/mount --types tmpfs \
@@ -1236,12 +1252,14 @@ probe_unit_owned=1
   /usr/bin/bash "$probe_user_script" --user-probe
 probe_unit_owned=0
 
-image_store_digest_after=$(snapshot_read_only_image_store "$probe_image_store")
+image_store_digest_after=$(snapshot_read_only_image_store "$probe_image_store" "$image_store_identity")
 if [[ $image_store_digest_after != "$image_store_digest_before" ]]; then
   printf 'error: read-only additional image store changed during container execution\n' >&2
   exit 1
 fi
 printf 'readonly_image_store=unchanged\n'
+/usr/bin/umount -- "$probe_image_store"
+probe_image_store_mounted=0
 
 /usr/bin/umount -- "$probe_target"
 probe_target_mounted=0
