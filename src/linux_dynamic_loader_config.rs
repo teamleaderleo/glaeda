@@ -185,8 +185,9 @@ pub fn parse_linux_dynamic_loader_config(
             includes_system_fragments = true;
             continue;
         }
-        let semantic_line =
-            line.trim_start_matches(|character: char| character.is_ascii_whitespace());
+        let semantic_line = line.trim_start_matches(|character| {
+            matches!(character, ' ' | '\t' | '\u{000b}' | '\u{000c}')
+        });
         if semantic_line.starts_with("include") {
             return Err(unsafe_search_error());
         }
