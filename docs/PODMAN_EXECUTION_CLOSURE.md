@@ -23,7 +23,8 @@ The initial personal-worker runtime must instead use:
 - a root-owned empty configuration home and explicit configuration files;
 - a fresh execution-private graph root, run root, temporary directory, and libpod database;
 - a root-owned read-only additional image store;
-- one fresh attempt-private writable Cargo target plus separately verified read-only cache inputs;
+- one steward-created attempt-private, byte-and-inode-bounded Cargo target tmpfs plus separately
+  verified read-only cache inputs;
 - a dedicated pre-created cgroup-v2 execution identity; and
 - no persistent runner home, user configuration, auth file, remote connection, hook, plugin,
   device, or network-helper discovery.
@@ -37,8 +38,8 @@ creation, image installation, container execution, or cleanup mutation.
 The audit covers only these future operations:
 
 1. inspect one already-installed, digest-pinned verification image;
-2. run one checked-in verification command in the same image with `--pull=never` and
-   `--network=none`; and
+2. create one stopped container for a checked-in verification command with `--pull=never` and
+   `--network=none`, inspect its exact generated configuration, then start and attach to it; and
 3. inspect or remove only the exact container created by that attempt during durable recovery.
 
 Pull, build, login, remote mode, system service, arbitrary `exec`, caller-provided arguments,
@@ -53,6 +54,7 @@ The ARM64 baseline also provides the following relevant versions:
 | Component | Ubuntu 24.04 baseline | Expected executable |
 | --- | --- | --- |
 | Podman | `4.9.3+ds1` series | `/usr/bin/podman` |
+| Git | `2.43.0` series | `/usr/bin/git` |
 | containers/common | `0.57.4+ds1` series | configuration data, no executable |
 | conmon | `2.1.10+ds1` series | `/usr/bin/conmon` |
 | crun | `1.14.1` series | `/usr/bin/crun` |
@@ -68,6 +70,7 @@ readiness receipt before another workload. It must not silently accept a version
 Primary package references:
 
 - [Ubuntu 24.04 Podman package](https://packages.ubuntu.com/noble/podman)
+- [Ubuntu 24.04 Git package](https://packages.ubuntu.com/noble/git)
 - [Ubuntu 24.04 conmon package](https://packages.ubuntu.com/noble/conmon)
 - [Ubuntu 24.04 crun package](https://packages.ubuntu.com/noble/crun)
 - [Ubuntu 24.04 catatonit package](https://packages.ubuntu.com/noble/catatonit)
@@ -91,6 +94,7 @@ select persistent state, or merely provide bounded host facts.
 | rootless pause process | first rootless use double-forks a persistent namespace holder, re-executes Podman, and falls back to compile-time and `/usr/bin` catatonit paths | The journaled attempt places the Podman launcher in the authoritative outer cgroup before exec, binds the Podman re-exec and both catatonit candidates, makes the user D-Bus address an exact absent run-private socket, and proves the pause process never leaves the outer group. Retain it only for that attempt, then cgroup-kill, prove empty, remove and sync `pause.pid`, and refuse success or reuse on any ambiguity. |
 | `/usr/libexec/podman/catatonit` and `/usr/bin/catatonit` | `--init` and the rootless pause fallback may execute them | Select the container init with explicit `--init-path`; bind every compiled pause fallback as an exact executable or proven absence and reject aliases/ambiguity. If the image supplies the reviewed init instead, omit `--init` without weakening the separate pause-process closure. |
 | `/usr/bin/newuidmap`, `/usr/bin/newgidmap` | setuid helpers establish the rootless user namespace | Exact root-owned executables, setuid/mode/package evidence, content digest, loader closure, exact runner subordinate ranges, and no `$PATH` ambiguity. |
+| `/usr/bin/git` used by source materialization | object access can consume config, replacements, alternates, promisor state, credentials, and transports before the container exists | Bind its exact ELF/loader closure and invoke only one fixed `cat-file --batch` protocol under the unprivileged runner in the authoritative outer cgroup, with bounded input/time/output and the same empty-protocol environment as O05. Use a protected synthetic bare Git directory plus an inherited descriptor for the already-observed object directory, never repository discovery or its config. Reject replacements, grafts, shallow/promisor/partial-clone state, alternates, unsupported object formats, and unsafe effective config; a missing local object is a bounded failure and can never fetch. |
 | netavark and aardvark-dns | the configured backend may resolve helpers while libpod initializes, even for a no-network run | Fix `network_backend="netavark"` and one root-owned helper directory; bind exact content and loader closure until the package fixture proves an edge unreachable. `--network=none` must keep both unexecuted. |
 | fuse-overlayfs | storage config can execute it as `mount_program` | Initial R01 selects native rootless overlay and requires no mount program. Presence of any configured mount program is conflicting. A later fuse backend requires a separate exact executable closure. |
 | helper search directories | may select netavark, catatonit, pasta, or slirp4netns | One exact root-owned directory set; reject `/usr/local`, runner-owned, missing, extra, symlinked, group-writable, or world-writable candidates. |
@@ -139,6 +143,7 @@ helper/runtime selection, automatic mounts, and powerful precreate hooks:
 | `/etc/subuid`, `/etc/subgid` | authorizes the rootless UID/GID map | Exact single non-overlapping runner ranges, content/object revalidation, and the accepted account policy. Unknown or duplicate authority blocks. |
 | account/NSS inputs | can change UID/GID/name and supplementary-group resolution | Bind the runner's exact numeric account and primary group plus the applicable root-owned `/etc/passwd`, `/etc/group`, `/etc/nsswitch.conf`, and NSS library closure. The launcher still clears supplementary groups before Podman. |
 | cgroup-v2 mount and delegated parent | controls resource isolation and group ownership | Exact cgroup2 filesystem, controller set, delegated parent object, owner/mode, and no unexpected processes. Reread applied files before workload start and group membership through cleanup. |
+| tmpfs mount API and mount namespace | creates the only writable/executable build-output filesystem | The privileged steward uses the Linux mount API directly, not `/bin/mount` or a helper, beneath a no-follow protected empty mountpoint. It supplies only fixed tmpfs type, size, inode, UID/GID, mode, `nosuid`, and `nodev` values; captures the resulting mount ID/statfs evidence; and refuses propagation, pre-existing mounts, or namespace drift. Unmount targets that exact held identity only after payload mount release and group emptiness. |
 | user/mount namespaces and kernel capability | defines whether rootless isolation is actually available | Bind boot ID, kernel release, architecture, namespace support, and the exact successful journaled smoke generation. A reboot or kernel change invalidates readiness. |
 | `/proc`, `/sys`, `/dev` facts | consulted while constructing namespaces, devices, mounts, and limits | Admit only the fixed kernel interfaces and minimal device set required by the reviewed spec. `/dev/fuse`, KVM, GPUs, host sockets, and caller devices are prohibited in the native-overlay first slice. |
 | user systemd and D-Bus | rootless startup attempts to move the pause process into a random `podman-pause-*.scope` even with `cgroupfs` | Set `DBUS_SESSION_BUS_ADDRESS` to an exact nonexistent socket below the protected attempt root, prove that entry remains absent, and verify no user-systemd unit or cgroup appears. Any successful move or sibling scope is cleanup debt and blocks repository execution. |
@@ -155,12 +160,13 @@ kernel, account, or cgroup evidence current.
 | execution graph root | run-private | Fresh empty directory under one durable attempt. It holds writable container layers only. Remove after cgroup emptiness, Podman/conmon exit, unmount proof, and exact ownership revalidation. |
 | execution run root | run-private | Fresh empty directory under the same attempt. It holds locks and transient libpod state. Never reused. |
 | libpod database/static/tmp/volume state | run-private | Use transient store and explicit run-private roots. A crash leaves recovery debt; it never becomes the next attempt's input. |
-| Cargo target output | run-private, writable and executable only inside one attempt | Create one empty NOREPLACE child under the exact protected cache lease and never mount its parent or a prior child. Cargo must execute build scripts, proc macros, and test binaries here, so `noexec` is invalid. After any outcome it is untrusted output: remove it only after group-empty and mount-release proof; never promote or reuse it as verification input. |
+| Cargo target output | run-private steward-mounted tmpfs, writable and executable only inside one attempt | Before Podman, the privileged steward uses the mount syscall rather than a discovered helper to create a new tmpfs beneath an exact protected mountpoint with hard `size` and `nr_inodes` ceilings, runner UID/GID, mode `0700`, `nosuid`, and `nodev`; Cargo requires `exec`. Hold and revalidate the mount/filesystem identity and empty root, then bind only that protected path into the container. Writes are charged to the same outer memory/swap cgroup as the payload. The immutable in-image gate verifies the actual filesystem, empty pre-state, mount flags, byte/inode limits, and cgroup controls before executing Cargo. Cleanup unmounts the exact filesystem only after container mount release and group emptiness; it is never promoted, persisted, or reused as verification input. |
 | dependency/cache inputs | optional installation-owned persistent, root-owned read-only | Initial R02 admits only content independently verified against the exact lock/toolchain/image generation. The container cannot write it, and no extracted source, compiler output, fingerprint, proc macro, build-script output, or test binary becomes trusted merely because a previous run created it. Absence is valid and changes performance only. |
-| source checkout | observation source only; never passed to Podman | Reopen and match canonical path/device/inode plus commit/tree/cleanliness, then materialize the exact Git tree into a fresh protected run-private directory before any cache/container mutation. The materializer uses fixed non-transport Git plumbing, recomputes every tree/blob object ID, bounds total entries/path/bytes, accepts only canonical tracked file modes and non-escaping links, publishes root-owned read-only bytes with fsync/NOREPLACE, and reopens the published directory. Podman receives only this protected snapshot path/device/inode, so later live-checkout rebind or writes cannot change the mounted tree. |
+| source checkout | observation source only; never passed to Podman | Reopen and match canonical path/device/inode plus commit/tree/cleanliness, then materialize the exact Git tree into a fresh protected run-private directory before any cache/container mutation. The only Git child is a fixed, absolute `cat-file --batch` process executed as the unprivileged runner inside the outer cgroup with bounded input/time/output. It sees a protected synthetic bare Git directory and an inherited `/proc/self/fd` reference to the exact held object-directory descriptor—not the repository path, worktree, remotes, or local config—and has an empty transport allowlist, lazy fetch/replacements disabled, system/global config disabled, and no credentials. Before spawn, refuse alternates, grafts, shallow/promisor/partial-clone state, unsupported object formats, and unsafe effective local/worktree config; missing local objects fail under the empty protocol allowlist. The steward parses raw tree objects, recomputes every tree/blob object ID, bounds total entries/path/bytes, accepts only canonical tracked file modes and non-escaping links, publishes root-owned read-only bytes with fsync/NOREPLACE, and reopens the published directory. Podman receives only this protected snapshot path/device/inode, so later live-checkout rebind or writes cannot change the mounted tree. |
 | outer cgroup-v2 attempt subtree | run-private authoritative execution identity | Pre-create under an exact delegated parent and move the Podman launcher into it before exec. Podman, conmon, rootless pause, runtime, and payload must remain in this subtree; the container gets a pre-created child. Apply and reread aggregate plus child CPU, memory, swap, and PID controls before repository code. Retain authoritative handles until every child is empty and removed. |
 | rootless `pause.pid` and namespace holder | run-private process state | First `image inspect` may create it. Journal before that call, verify it is inside the outer attempt cgroup without trusting the numeric PID, retain it only across commands in the same attempt, then terminate via the authoritative cgroup and durably remove the exact PID file. A crash, stale file, outside-group process, or systemd move is recovery debt; never call generic `podman system migrate` or kill a PID by number alone. |
 | auth, config, hooks, CDI, network, empty home | run-private control state | Created by the privileged steward as exact empty or exact-content root-owned objects, readable but not replaceable by the runner. Destroy only after full cleanup. |
+| Git materializer control state | run-private, root-owned and read-only to runner | The steward creates the canonical minimal synthetic bare-directory files directly, without `git init`, for the sole admitted SHA-1 object format. They contain no remote, worktree, hook, replace, alternates, promisor, include, credential, or maintenance configuration. The only external object access is through the inherited held-directory descriptor, and all control entries are rebound before spawn. |
 | `XDG_RUNTIME_DIR` and temporary state | run-private mutable state | Fresh leased directories writable by the runner beneath an exact steward-owned parent. Their contents are never reused or trusted as configuration; non-empty pre-state blocks and cleanup waits for group emptiness. |
 
 Persistent runner-owned Podman storage is not adoptable. A matching path, UID, image name, image
@@ -170,9 +176,10 @@ or config rewrite is permitted.
 
 Persistent read-only dependency/cache inputs are disk state, not a live service: they hold no
 process, cgroup, Podman database, or VM-liveness lease. Keeping them must not keep the Lima guest
-running or reserve guest RAM. Writable Cargo target output is fresh for every attempt and is never
-reused. The personal-worker store admits at most one active verification attempt, so no second
-container or second Lima instance may be created to improve throughput.
+running or reserve guest RAM. Writable Cargo target output exists only as an active attempt tmpfs,
+is bounded by both its own byte/inode ceilings and the aggregate cgroup memory/swap limit,
+and is never reused. The personal-worker store admits at most one active verification attempt, so
+no second container or second Lima instance may be created to improve throughput.
 
 This deliberately means the first secure slice does not provide cross-run writable Cargo target
 reuse. Persistent acceleration is limited to the immutable image and independently verified
@@ -186,11 +193,12 @@ closed global intent. Exact option support is verified against the admitted Podm
 can issue readiness.
 
 The image-readiness operation uses the same executable, environment, config, storage, remote,
-helper, and transient-state closure as the run below. Its only subcommand is one fixed `image
-inspect` form against the sealed fully qualified digest; output is bounded and parsed into private
-typed evidence. Because the packaged command may initialize storage or a libpod database, it is
-never part of static planning: the first call and every recovery call are journaled mutations until
-the Ubuntu fixture proves a narrower effect set. No caller supplies a Go template or image string.
+helper, and transient-state closure as the container sequence below. Its only subcommand is one
+fixed `image inspect` form against the sealed fully qualified digest; output is bounded and parsed
+into private typed evidence. Because the packaged command may initialize storage or a libpod
+database, it is never part of static planning: the first call and every recovery call are journaled
+mutations until the Ubuntu fixture proves a narrower effect set. No caller supplies a Go template
+or image string.
 
 ```text
 /usr/bin/podman
@@ -203,11 +211,8 @@ the Ubuntu fixture proves a narrower effect set. No caller supplies a Go templat
   --cgroup-manager=cgroupfs
   --tmpdir=<attempt-tmpdir>
   --transient-store
-  run
+  create
   --pull=never
-  --rm
-  --attach=stdout
-  --attach=stderr
   --init
   --init-path=/usr/libexec/podman/catatonit
   --network=none
@@ -245,27 +250,40 @@ the Ubuntu fixture proves a narrower effect set. No caller supplies a Go templat
   --workdir=<fixed-source-path>
   --entrypoint=<checked-in-absolute-image-program>
   --mount=type=bind,src=<protected-materialized-source>,dst=<fixed-source-path>,ro,nosuid,nodev,noexec
-  --mount=type=bind,src=<fresh-attempt-target>,dst=<fixed-target-path>,rw,exec,nosuid,nodev
+  --mount=type=bind,src=<protected-target-tmpfs>,dst=<fixed-target-path>,rw,exec,nosuid,nodev
   --mount=type=bind,src=<verified-read-only-dependency-cache>,dst=<fixed-input-cache-path>,ro,nosuid,nodev,noexec
   --tmpfs=/tmp:rw,noexec,nosuid,nodev,size=<bounded-scratch-bytes>,mode=1777
   <exact-image>@sha256:<manifest>
   <checked-in-arguments...>
 ```
 
-Before either `image inspect` or `run`, the launcher joins the already-created outer attempt cgroup;
-it then supplies null stdin, pipes only stdout/stderr, and allocates no TTY. The displayed paths above
-are private plan values, never public receipt fields. Source refers only to the protected immutable
-materialization, never the live checkout; target refers only to the fresh empty attempt child. The
-read-only dependency-cache mount is omitted when no independently verified generation exists.
+The absolute image entrypoint is a reviewed immutable gate, not Cargo or repository code. It has no
+caller-selected command surface. On start it verifies the actual source/cache mount identities and
+read-only/noexec flags, proves the target is the empty steward-mounted tmpfs with the exact
+byte/inode and executable mount policy, and rereads the cgroup CPU/memory/swap/PID controls. Only
+then may it `exec` the one absolute Cargo command and fixed argument vector selected by the sealed
+Rust envelope. A gate failure executes no repository code and is never a verification success.
+
+Before `image inspect`, `create`, `inspect`, or `start`, the launcher joins the already-created
+outer attempt cgroup; it supplies null stdin, pipes only bounded stdout/stderr, and allocates no TTY.
+After `create` returns, R02 matches the stopped container and generated specification to the durable
+attempt, image, protected source/cache/target objects, target-tmpfs limits, namespaces, cgroup,
+environment, and security policy. It durably checkpoints that exact stopped object, reconfirms
+protected host objects, and only then invokes the fixed
+`podman start --attach=stdout --attach=stderr <exact-id>` form. A name or CID file remains lookup
+evidence only. The displayed paths are private plan values, never public receipt fields. Source
+refers only to the protected immutable materialization, never the live checkout. The read-only
+dependency-cache mount is omitted when no independently verified generation exists.
 
 The attempt name and CID file are recovery lookups only; neither proves ownership, and both must be
 matched to the durable attempt, exact run-private store, and authoritative cgroup before inspect or
 removal. `--dns=none` is deliberately absent because Podman 4.9.3 rejects it in combination with
-`--network=none`. The bounded scratch and shared-memory tmpfs allocations are charged to the same
-outer memory cgroup and are created only on demand; they do not create an idle RAM floor. R02 must
-verify that 4.9.3 option precedence makes each command-line value authoritative over the sealed
-config. Any unsupported negative flag is removed only after the same property is fixed and validated
-in the sealed config. No caller may append an option.
+`--network=none`. The bounded target, scratch, and shared-memory tmpfs allocations are charged to
+the same outer memory/swap cgroup and are created only on demand; their combined ceilings plus the
+process working-set allowance must fit the applied aggregate limit, and they create no idle RAM
+floor. R02 must verify that 4.9.3 option precedence makes each command-line value authoritative over
+the sealed config. Any unsupported negative flag is removed only after the same property is fixed
+and validated in the sealed config. No caller may append an option.
 
 The child environment starts empty and contains only exact private locations and identity strings:
 
@@ -279,6 +297,18 @@ The child environment starts empty and contains only exact private locations and
   cannot reach the runner's real user bus;
 - fixed `USER` and `LOGNAME`; and
 - `PATH=/usr/bin` only if a proven Podman 4.9.3 edge cannot accept an absolute helper path.
+
+The source-materialization Git environment also starts empty and admits only fixed identity plus
+private location values. The fixed argv supplies `--git-dir=<protected-synthetic-bare-directory>`
+before `cat-file --batch`; `GIT_OBJECT_DIRECTORY` is the sole intentional object environment value
+and names `/proc/self/fd/<inherited-held-directory-fd>`. It sets `GIT_CONFIG_NOSYSTEM=1`,
+`GIT_CONFIG_GLOBAL=/dev/null`, `GIT_ATTR_NOSYSTEM=1`, `GIT_NO_REPLACE_OBJECTS=1`,
+`GIT_ALLOW_PROTOCOL=` (an empty allowlist), `GIT_NO_LAZY_FETCH=1`, `GIT_TERMINAL_PROMPT=0`, and
+`GIT_OPTIONAL_LOCKS=0`; no `HOME`, credential, askpass, proxy, SSH, alternates, worktree, or
+repository-supplied environment value is present. The Ubuntu 24.04 fixture must prove the fixed
+protocol succeeds with already-local objects while every helper/transport marker stays absent.
+`GIT_NO_LAZY_FETCH` is defense in depth; the empty protocol allowlist is the Git 2.43-compatible
+transport barrier.
 
 The in-container environment is separately closed: it contains only the reviewed immutable image
 environment plus fixed values required by the checked-in Rust envelope, including UTC and the exact
@@ -306,8 +336,8 @@ inode, UID, package version, or digest accessor. Internally it binds:
    user-bus socket, auth/config home, and run-private roots;
 6. exact runner account, primary group, subordinate ranges, runtime directory, and cgroup
    delegation;
-7. exact image-store generation and immutable image identity;
-8. exact supported option/capability set for the admitted Podman build; and
+7. exact image-store generation and immutable image identity, including the reviewed in-image gate;
+8. exact supported option/capability set for the admitted Podman and Git builds; and
 9. a canonical domain-separated digest over the complete closure.
 
 R02/B06 must re-confirm held or reopened objects immediately before the first materialization,
@@ -338,31 +368,38 @@ temporary fixture, and each test proves the marker remains absent.
 | image store | manifest/config/layer or store-generation substitution | Image identity/runtime readiness refusal. |
 | network helper | hostile netavark/CNI configuration while command says none | Empty network config and `--network=none`; marker absent. |
 | host-file injection | hostile host resolver/hosts/hostname/timezone content | Generated spec and container fixture contain only fixed image/runtime values; no host marker appears. |
-| source rebind | replace or modify checkout after planning, during materialization, or before Podman resolves mounts | The materializer either rejects drift/object mismatch or publishes the exact sealed tree; Podman mounts only that protected object. Replacement after publication cannot affect it. |
-| target poisoning | leave valid-looking Cargo fingerprints and test/build executables from a failed same-source run | Prior target output is never mounted. The new target child is proven empty and NOREPLACE; a non-empty or replayed child blocks rather than producing success. |
+| materializer helper/transport | configure replacements, alternates, promisor fetch, credential helper, filter, SSH command, or transport marker | Unsafe state blocks before Git, or the empty environment/protocol allowlist makes it unreachable; no marker executes and no nonlocal object is read. |
+| source rebind | replace or modify checkout after planning, during materialization, or before Podman resolves mounts | The materializer either rejects drift/object mismatch or publishes the exact sealed tree; `create` and the in-image gate bind only that protected object. Replacement after publication cannot affect it. |
+| target poisoning | leave valid-looking Cargo fingerprints and test/build executables from a failed same-source run | Prior target output is never mounted. The steward creates and verifies a new empty tmpfs, and the gate refuses any non-empty, rebound, or incorrectly mounted target before Cargo. |
+| target exhaustion | repository code writes past the target byte or inode ceiling | The target filesystem returns exhaustion without growing persistent host storage; aggregate memory/swap remains cgroup-bounded, and cleanup removes the mount. No success receipt is possible. |
 | dependency-cache poisoning | alter an archive, extracted source, compiler artifact, proc macro, or build-script output | Digest/lock/runtime mismatch blocks, writable prior outputs are never admitted, and absence falls back to a clean build without changing verification semantics. |
 | cgroup drift | controller/limit/parent changes between plan and spawn | Refusal before repository code; no fallback cgroup. |
 | rootless pause escape | first-use pause double-forks, re-execs/falls back, or attempts a random user-systemd scope | All admitted executables are bound, the systemd move is unreachable, every process remains below the outer cgroup, `pause.pid` is durably cleaned, and no process remains after the attempt. Any contrary result blocks. |
 | descendant escape | fork, double-fork, ignore TERM, retain pipe or deleted file | Complete owned group is killed and proven empty, or receipt is cleanup-incomplete. Never success. |
-| response loss | crash after create/start/exit/remove checkpoint | Durable recovery classifies exact run-private state; no second workload starts. |
+| response loss | crash after create/inspect/start/exit/remove checkpoint | Durable recovery classifies exact run-private state; no second workload starts. |
 
 ## Implementation sequence
 
 1. **Static closure observation:** add a Linux-only observer for exact files, configuration, empty
-   directories, package capability, runner identity, image-store generation, and cgroup delegation.
-   It invokes no Podman command.
+   directories, Podman/Git package capability, runner identity, image-store generation, and cgroup
+   delegation. It invokes no Podman or Git command.
 2. **Journaled installation/smoke:** explicitly create the root-owned config/image generation and
    run-private smoke state under ADR 0020. Unknown existing state blocks; rollback never deletes
    unclassified storage. The smoke proves the pause process remains containable and leaves no idle
    process, PID file, systemd scope, or writable Podman state.
-3. **Protected source and output:** materialize and fsync the exact Git tree under a protected
-   run-private parent, then create one empty attempt target. Prior writable target bytes are never an
-   input. Invalid, stale, ambiguous, or noncanonical evidence fails before Podman.
-4. **Closed container plan:** map one B05 plan to the exact invocation envelope using only the
-   protected source, fresh target, and optional verified read-only dependency inputs.
-5. **Execution group:** create and retain the outer cgroup-v2 identity before the first Podman
-   process; integrate issue #205 group-empty and cleanup evidence plus bounded stdout/stderr capture
-   and a fixed wall-clock deadline for Podman, conmon, pause, runtime, and payload.
+3. **Execution group:** create and retain the outer cgroup-v2 identity before the materializer or
+   first Podman process; integrate issue #205 group-empty and cleanup evidence plus bounded
+   stdout/stderr capture and a fixed wall-clock deadline for Git, Podman, conmon, pause, runtime,
+   and payload.
+4. **Protected source and target:** inside that cgroup, run only the fixed, closed Git plumbing forms
+   and recompute/fsync the exact tree under a protected run-private parent. Use the steward's narrow
+   mount-syscall boundary to create and verify one protected target tmpfs with exact byte/inode
+   limits. Prior writable target bytes are never an input. Invalid, stale, ambiguous, or
+   noncanonical evidence fails before Podman.
+5. **Closed container plan:** map one B05 plan to the invocation envelope using only the protected
+   source/target and optional verified read-only dependency inputs. Create the container without
+   starting it, inspect and checkpoint the exact generated object, then start through the immutable
+   gate that verifies applied mounts and limits before repository code.
 6. **B06 composition:** recheck durable/source/runtime/deadline/cache evidence, run the closed plan,
    and emit the bounded attempt/cleanup/resource receipt consumed by B07.
 
@@ -374,9 +411,13 @@ temporary fixture, and each test proves the marker remains absent.
   storage on the packaged build; treat all as reachable until the fixture proves otherwise.
 - Confirm native rootless overlay works on the admitted Lima kernel with no `mount_program`; a
   failure blocks rather than selecting fuse-overlayfs automatically.
-- Confirm the exact protected-source/fresh-target bind option syntax and bounded `/tmp`/`/dev/shm`
-  behavior; target output must remain executable for Cargo while `nosuid`/`nodev`, and all scratch
-  allocation must remain inside the applied outer memory limit.
+- Confirm the steward can create and safely expose the protected target tmpfs with exact `size` and
+  `nr_inodes` ceilings, Podman preserves that bind without remount weakening, the immutable gate can
+  reread both limits before Cargo, and writes plus bounded `/tmp`/`/dev/shm` allocations are charged
+  inside the applied aggregate memory/swap limit. Podman 4.9.3 does not admit `nr_inodes` on its own
+  `--tmpfs` parser, so that CLI surface is not an alternative. If the fixture cannot enforce and
+  expose both hard ceilings, R01 stays blocked pending a quota-backed disposable filesystem; a
+  free-space preflight is not sufficient.
 - Confirm that `--network=none` plus the fixed hosts/resolver/hostname/timezone policy copies no host
   content; Podman 4.9.3 rejects the otherwise tempting `--dns=none` combination.
 - Select the exact root-owned AppArmor and seccomp profiles and prove they are effective for a
@@ -390,7 +431,8 @@ temporary fixture, and each test proves the marker remains absent.
   Podman, and that crash recovery leaves no pause process or PID file.
 - Prove `cgroupfs` can use the pre-created delegated outer/child cgroups without Podman/systemd
   creating an unowned sibling scope.
-- Specify and test the exact non-transport Git tree materializer, including object-ID recomputation,
+- Specify and test the exact closed Git tree materializer, including the bound Git/loader closure,
+  empty protocol/environment, unsafe repository-state refusal, object-ID recomputation,
   symlink/mode/path bounds, fsync publication, live-checkout replacement, and cleanup recovery.
 
 Until those fixture results are recorded and the exact closure is independently reviewed, #319/R01
