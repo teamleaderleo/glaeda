@@ -96,6 +96,16 @@ impl PersonalWorkerMacObservation {
     pub const fn lima_host_identity(&self) -> &LimaHostInstanceIdentity {
         &self.lima_host_identity
     }
+
+    pub(crate) fn confirm_lima_host_identity(
+        &self,
+        request: &LimaObservationRequest,
+    ) -> Result<(), PersonalWorkerMacObservationError> {
+        self.private_evidence
+            .lima_host_identity
+            .confirm(request)
+            .map_err(PersonalWorkerMacObservationError::from_lima_host_identity)
+    }
 }
 
 impl fmt::Debug for PersonalWorkerMacObservation {
