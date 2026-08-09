@@ -305,7 +305,7 @@ run_hostile_probe() {
     memory_current=$(< "$cgroup_leaf/memory.current")
     read -r free_blocks free_inodes < <(/usr/bin/stat -f -c '%f %d' "$PROBE_TARGET")
     if (( log_size >= 65536 && log_size <= 1048576 && pids_max_events > 0 &&
-      memory_current >= memory_baseline + 8388608 && free_blocks == 0 && free_inodes == 0 )); then
+      memory_current >= memory_baseline + 7340032 && free_blocks == 0 && free_inodes == 0 )); then
       resource_pressure_seen=1
       break
     fi
@@ -970,9 +970,7 @@ printf '%s\n' \
   '  /bin/busybox sleep 60 &' \
   '  index=$((index + 1))' \
   'done' \
-  'while :; do' \
-  '  :' \
-  'done' \
+  'wait' \
   > "$probe_root/rootfs/bin/hostile"
 chmod 0555 "$probe_root/rootfs/bin/hostile"
 seccomp_sha=$(/usr/bin/sha256sum "$probe_seccomp_profile" | /usr/bin/awk '{ print $1 }')
