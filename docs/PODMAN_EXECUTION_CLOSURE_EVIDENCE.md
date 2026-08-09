@@ -35,6 +35,23 @@ authority, path-bearing dependencies, executable stacks, writable-executable loa
 ambiguous runtime mappings. This proves compatibility of the parser with those package bytes only;
 it is not path, package, loader, library, configuration, cache, or transitive dependency evidence.
 
+### Dynamic-loader configuration parser evidence
+
+- Parser implementation commit: `8805b36169ec5c56afc0dacdb41fc56b149b7131`
+- Workflow run: [31329004262](https://github.com/teamleaderleo/smolrunner/actions/runs/31329004262)
+- ARM64 job: [93284062710](https://github.com/teamleaderleo/smolrunner/actions/runs/31329004262/job/93284062710)
+- x86_64 job: [93284062672](https://github.com/teamleaderleo/smolrunner/actions/runs/31329004262/job/93284062672)
+- Date: 2026-08-09
+- Result: both jobs parsed the exact root and fragment loader-configuration bytes installed from
+  the Noble package baseline below.
+
+The pure parser accepted exactly the root system-fragment include and the closed ordered Noble
+search-directory identities for the selected architecture. It rejects oversized or noncanonical
+syntax, duplicate directories, wrong-role directives, wrong-architecture paths, and every other
+include or search directory. This proves compatibility with those package bytes only; it does not
+expand includes, enumerate configuration files, open or revalidate a path, prove file or directory
+ownership, parse `ld.so.cache`, resolve a library, construct evidence, or seal runtime readiness.
+
 ## Package baseline
 
 Both architectures reported the same Ubuntu Noble package versions:
@@ -118,6 +135,10 @@ Earlier disposable runs were intentionally allowed to fail and corrected these f
   library directory with `DT_RUNPATH`; rejecting every runpath makes the reviewed command graph
   unusable. The parser now represents only that exact runpath as typed unresolved policy, leaving
   later descriptor-bound directory and library proof mandatory.
+- Noble's root loader configuration uses exactly one semantic space in
+  `include /etc/ld.so.conf.d/*.conf` and ends with two line feeds. Alternate `include` directives
+  are unsafe search authority even when their whitespace is otherwise noncanonical, so unsafe
+  classification must precede the generic active-line format check.
 
 These are contract changes, not compatibility relaxations: each ambient or mutable edge is now
 either made exact or remains blocking.
