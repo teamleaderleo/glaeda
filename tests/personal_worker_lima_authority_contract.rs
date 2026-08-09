@@ -27,6 +27,7 @@ use smolrunner::operator_config::{
     GuestWorkspacePath, OperatorConfig, OperatorIdlePolicy, OperatorOutputPreference,
     OperatorRemediationPreference, PersonalWorkerStateRoot,
 };
+use smolrunner::personal_worker_host_broker::{HostBrokerRunnerObservation, HostBrokerRunnerState};
 use smolrunner::personal_worker_lima_authority::{
     PersonalWorkerLimaAttemptInput, PersonalWorkerLimaAttemptPhase,
     PersonalWorkerLimaAuthorityDocument, PersonalWorkerLimaAuthorityErrorKind,
@@ -221,7 +222,7 @@ fn running_outputs(profile: LimaResourceProfile) -> Vec<String> {
         "aarch64\n".to_owned(),
         format!("{}\n", envelope.vcpus),
         "4096\n".to_owned(),
-        format!("{}\n", envelope.memory_bytes / 4_096),
+        format!("{}\n", (envelope.memory_bytes - 16 * 1024 * 1024) / 4_096),
         format!("{}  /etc/machine-id\n", "a".repeat(64)),
         "2049:2\n".to_owned(),
         "2049:12345\n".to_owned(),
@@ -278,6 +279,14 @@ fn mac_observation_profile(
 }
 
 fn worker_tick(lifecycle: &LimaLifecycleObservation) -> PersonalWorkerTickPlan {
+    let current_profile = if lifecycle.state() == LimaLifecycleState::Stopped {
+        PersonalWorkerProfile::Stopped
+    } else {
+        match lifecycle.profile() {
+            LimaResourceProfile::Interactive => PersonalWorkerProfile::Interactive,
+            LimaResourceProfile::Work => PersonalWorkerProfile::Work,
+        }
+    };
     let request_id = ExecutionRequestId::parse("request-one").expect("request ID");
     let repository = RepositoryRef::parse("teamleaderleo/smolrunner").expect("repository");
     let profile_id = VerificationProfileId::parse("smolrunner.required").expect("profile");
@@ -326,9 +335,7 @@ fn worker_tick(lifecycle: &LimaLifecycleObservation) -> PersonalWorkerTickPlan {
         schema_version: PERSONAL_WORKER_QUEUE_SCHEMA_VERSION,
         generation: PersonalWorkerQueueGeneration::new(7).expect("queue generation"),
         observed_at: epoch(204_000),
-        profile_observation: PersonalWorkerProfileObservation::observed(
-            PersonalWorkerProfile::Stopped,
-        ),
+        profile_observation: PersonalWorkerProfileObservation::observed(current_profile),
         activity_evidence: PersonalWorkerActivityEvidence::observed(epoch(203_000)),
         desired_profile: PersonalWorkerProfile::Work,
         cancel_pending_downscale: false,
@@ -338,9 +345,18 @@ fn worker_tick(lifecycle: &LimaLifecycleObservation) -> PersonalWorkerTickPlan {
         selected: vec![selection],
         visibility: vec![visibility],
     };
+    let stopped = lifecycle.state() == LimaLifecycleState::Stopped;
     let availability = MacAvailabilityObservation {
-        effective_mode: EffectiveAvailabilityMode::Off,
-        vm_power: VmPowerState::Stopped,
+        effective_mode: if stopped {
+            EffectiveAvailabilityMode::Off
+        } else {
+            EffectiveAvailabilityMode::Away
+        },
+        vm_power: if stopped {
+            VmPowerState::Stopped
+        } else {
+            VmPowerState::Running
+        },
         job_activity: JobActivity::Idle,
         freshness: ObservationFreshness::Fresh,
         host_power: HostPowerSource::Ac,
@@ -351,6 +367,14 @@ fn worker_tick(lifecycle: &LimaLifecycleObservation) -> PersonalWorkerTickPlan {
         epoch(204_000),
         ExecutionResourceLimits::new(8_000, 12 * 1024 * 1024 * 1024, 4_096).expect("capacity"),
     );
+    let runner = (!stopped).then(|| {
+        HostBrokerRunnerObservation::new(
+            broker_identity().instance_id().clone(),
+            lifecycle.profile_generation(),
+            epoch(204_000),
+            HostBrokerRunnerState::IdleReady,
+        )
+    });
     PersonalWorkerTickPolicy::new(30_000, 30_000, 30_000)
         .expect("tick policy")
         .plan(PersonalWorkerTickInput {
@@ -359,12 +383,59 @@ fn worker_tick(lifecycle: &LimaLifecycleObservation) -> PersonalWorkerTickPlan {
             queue: &queue,
             lifecycle_policy: &LimaLifecyclePolicy::new(30_000).expect("lifecycle policy"),
             lifecycle: Some(lifecycle),
-            runner: None,
+            runner: runner.as_ref(),
             capacity: Some(capacity),
             availability_request: AvailabilityRequest::Active,
             availability: Some(availability),
         })
         .expect("sealed B01 lifecycle tick")
+}
+
+fn stop_tick(lifecycle: &LimaLifecycleObservation) -> PersonalWorkerTickPlan {
+    let queue = PersonalWorkerQueueDecision {
+        schema_version: PERSONAL_WORKER_QUEUE_SCHEMA_VERSION,
+        generation: PersonalWorkerQueueGeneration::new(7).expect("queue generation"),
+        observed_at: epoch(1_900_000),
+        profile_observation: PersonalWorkerProfileObservation::observed(
+            PersonalWorkerProfile::Work,
+        ),
+        activity_evidence: PersonalWorkerActivityEvidence::observed(epoch(1_000)),
+        desired_profile: PersonalWorkerProfile::Stopped,
+        cancel_pending_downscale: false,
+        profile_change_permitted: true,
+        schedulable_cpu_millis: PERSONAL_WORKER_SCHEDULABLE_CPU_MILLIS,
+        schedulable_memory_bytes: PERSONAL_WORKER_SCHEDULABLE_MEMORY_BYTES,
+        selected: Vec::new(),
+        visibility: Vec::new(),
+    };
+    let runner = HostBrokerRunnerObservation::new(
+        broker_identity().instance_id().clone(),
+        LimaProfileGeneration::new(1).expect("generation"),
+        epoch(1_900_000),
+        HostBrokerRunnerState::Offline,
+    );
+    PersonalWorkerTickPolicy::new(30_000, 30_000, 30_000)
+        .expect("tick policy")
+        .plan(PersonalWorkerTickInput {
+            store_revision: PersonalWorkerStoreRevision::new(5).expect("revision"),
+            decision_at: epoch(1_900_001),
+            queue: &queue,
+            lifecycle_policy: &LimaLifecyclePolicy::new(30_000).expect("lifecycle policy"),
+            lifecycle: Some(lifecycle),
+            runner: Some(&runner),
+            capacity: None,
+            availability_request: AvailabilityRequest::Off,
+            availability: Some(MacAvailabilityObservation {
+                effective_mode: EffectiveAvailabilityMode::Active,
+                vm_power: VmPowerState::Running,
+                job_activity: JobActivity::Idle,
+                freshness: ObservationFreshness::Fresh,
+                host_power: HostPowerSource::Ac,
+                memory_pressure: MemoryPressure::Normal,
+                operator_hold: false,
+            }),
+        })
+        .expect("sealed B01 stop tick")
 }
 
 fn enrolled() -> PersonalWorkerLimaAuthorityDocument {
@@ -450,6 +521,18 @@ fn enrollment_uses_sealed_running_identity_and_has_canonical_private_encoding() 
         stopped.kind,
         PersonalWorkerLimaAuthorityErrorKind::InvalidInput
     );
+
+    let other_identity = LimaInstanceIdentity::new(
+        LimaInstanceId::parse("other").expect("other instance"),
+        broker_identity().cache_disk().clone(),
+    );
+    let mismatch =
+        personal_worker_lima_enrollment_confirmation(&config(), &running, &request, other_identity)
+            .expect_err("logical and physical instances must match");
+    assert_eq!(
+        mismatch.kind,
+        PersonalWorkerLimaAuthorityErrorKind::Conflict
+    );
 }
 
 #[test]
@@ -483,23 +566,39 @@ fn complete_private_request_drift_is_refused_before_an_attempt() {
 #[test]
 fn prepared_attempt_blocks_replay_and_follows_exact_durable_phase_graph() {
     let authority = enrolled();
-    let stopped = mac_observation_profile(false, 200_000, LimaResourceProfile::Work);
-    let stopped_lifecycle = lifecycle_profile(
-        LimaLifecycleState::Stopped,
-        LimaResourceProfile::Work,
+    let before_mac = mac_observation_profile(true, 200_000, LimaResourceProfile::Interactive);
+    let before = lifecycle_profile(
+        LimaLifecycleState::Running,
+        LimaResourceProfile::Interactive,
         204_000,
     );
-    let tick = worker_tick(&stopped_lifecycle);
+    let tick = worker_tick(&before);
+    assert!(
+        matches!(
+            tick.action(),
+            smolrunner::personal_worker_tick::PersonalWorkerTickAction::StopVm {
+                current_profile: LimaResourceProfile::Interactive,
+                target_after_stop: PersonalWorkerProfile::Work,
+                ..
+            }
+        ),
+        "unexpected running profile tick: {:?}",
+        tick.action()
+    );
     let prepared = authority
         .begin_attempt(PersonalWorkerLimaAttemptInput {
             config: &config(),
-            mac: &stopped,
+            mac: &before_mac,
             request: &request(LIMA_HOME, CACHE_PATH),
-            lifecycle: &stopped_lifecycle,
+            lifecycle: &before,
             tick: &tick,
         })
         .expect("prepared attempt");
     let attempt = prepared.attempt().expect("attempt");
+    assert_eq!(
+        attempt.action(),
+        smolrunner::personal_worker_lima_authority::PersonalWorkerLimaAction::StopToWork
+    );
     assert_eq!(attempt.store_revision().get(), 5);
     assert_eq!(attempt.queue_generation().get(), 7);
     assert_eq!(attempt.phase(), PersonalWorkerLimaAttemptPhase::Prepared);
@@ -507,9 +606,9 @@ fn prepared_attempt_blocks_replay_and_follows_exact_durable_phase_graph() {
     let replay = prepared
         .begin_attempt(PersonalWorkerLimaAttemptInput {
             config: &config(),
-            mac: &stopped,
+            mac: &before_mac,
             request: &request(LIMA_HOME, CACHE_PATH),
-            lifecycle: &stopped_lifecycle,
+            lifecycle: &before,
             tick: &tick,
         })
         .expect_err("existing attempt blocks replay");
@@ -519,49 +618,69 @@ fn prepared_attempt_blocks_replay_and_follows_exact_durable_phase_graph() {
     );
 
     let generation = attempt.generation();
-    assert!(
-        prepared
-            .checkpoint(
-                generation,
-                PersonalWorkerLimaAttemptPhase::StopStarted,
-                epoch(206_000),
-            )
-            .is_err()
-    );
-    let started = prepared
+    let stopping = prepared
+        .checkpoint(
+            generation,
+            PersonalWorkerLimaAttemptPhase::StopStarted,
+            epoch(206_000),
+        )
+        .expect("stop began");
+    let stopped = stopping
+        .checkpoint(
+            generation,
+            PersonalWorkerLimaAttemptPhase::StopCompleted,
+            epoch(207_000),
+        )
+        .expect("stop completed");
+    let editing = stopped
+        .checkpoint(
+            generation,
+            PersonalWorkerLimaAttemptPhase::EditStarted,
+            epoch(208_000),
+        )
+        .expect("edit began");
+    let edited = editing
+        .checkpoint(
+            generation,
+            PersonalWorkerLimaAttemptPhase::EditCompleted,
+            epoch(209_000),
+        )
+        .expect("edit completed");
+    let starting = edited
         .checkpoint(
             generation,
             PersonalWorkerLimaAttemptPhase::StartStarted,
-            epoch(206_000),
+            epoch(210_000),
         )
         .expect("start began");
-    let command_done = started
+    let started = starting
         .checkpoint(
             generation,
             PersonalWorkerLimaAttemptPhase::StartCompleted,
-            epoch(207_000),
+            epoch(211_000),
         )
         .expect("start completed");
-    let verifying = command_done
+    let verifying = started
         .checkpoint(
             generation,
             PersonalWorkerLimaAttemptPhase::VerifyStarted,
-            epoch(208_000),
+            epoch(212_000),
         )
         .expect("verification began");
-    let running = mac_observation_profile(true, 210_000, LimaResourceProfile::Work);
+    let running = mac_observation_profile(true, 214_000, LimaResourceProfile::Work);
     let completed = verifying
         .complete_attempt(
             generation,
             &config(),
             &running,
             &request(LIMA_HOME, CACHE_PATH),
-            &lifecycle_profile(
+            &lifecycle_with_generation(
                 LimaLifecycleState::Running,
                 LimaResourceProfile::Work,
-                214_000,
+                218_000,
+                2,
             ),
-            epoch(215_000),
+            epoch(219_000),
         )
         .expect("verified completion");
     assert_eq!(
@@ -578,7 +697,7 @@ fn prepared_attempt_blocks_replay_and_follows_exact_durable_phase_graph() {
 }
 
 #[test]
-fn stopped_profile_change_is_edit_only_and_does_not_invent_a_vm_start() {
+fn stopped_start_and_profile_change_refuse_without_current_immutable_ownership() {
     let authority = enrolled();
     let before = lifecycle_profile(
         LimaLifecycleState::Stopped,
@@ -594,7 +713,7 @@ fn stopped_profile_change_is_edit_only_and_does_not_invent_a_vm_start() {
             ..
         }
     ));
-    let prepared = authority
+    let error = authority
         .begin_attempt(PersonalWorkerLimaAttemptInput {
             config: &config(),
             mac: &mac_observation(false, 200_000),
@@ -602,65 +721,111 @@ fn stopped_profile_change_is_edit_only_and_does_not_invent_a_vm_start() {
             lifecycle: &before,
             tick: &tick,
         })
-        .expect("prepared stopped profile edit");
-    let generation = prepared.attempt().expect("attempt").generation();
-    assert!(
-        prepared
-            .checkpoint(
-                generation,
-                PersonalWorkerLimaAttemptPhase::StopStarted,
-                epoch(206_000),
-            )
-            .is_err()
+        .expect_err("stopped edit lacks current immutable ownership proof");
+    assert_eq!(
+        error.kind,
+        PersonalWorkerLimaAuthorityErrorKind::InvalidInput
     );
-    let editing = prepared
-        .checkpoint(
-            generation,
-            PersonalWorkerLimaAttemptPhase::EditStarted,
-            epoch(206_000),
-        )
-        .expect("edit started");
-    let edited = editing
-        .checkpoint(
-            generation,
-            PersonalWorkerLimaAttemptPhase::EditCompleted,
-            epoch(207_000),
-        )
-        .expect("edit completed");
-    assert!(
-        edited
-            .checkpoint(
-                generation,
-                PersonalWorkerLimaAttemptPhase::StartStarted,
-                epoch(208_000),
-            )
-            .is_err()
+    assert!(authority.attempt().is_none());
+
+    let stopped_work = lifecycle_profile(
+        LimaLifecycleState::Stopped,
+        LimaResourceProfile::Work,
+        204_000,
     );
-    let verifying = edited
-        .checkpoint(
-            generation,
-            PersonalWorkerLimaAttemptPhase::VerifyStarted,
-            epoch(208_000),
+    let start_tick = worker_tick(&stopped_work);
+    assert!(matches!(
+        start_tick.action(),
+        smolrunner::personal_worker_tick::PersonalWorkerTickAction::StartVm { .. }
+    ));
+    let error = authority
+        .begin_attempt(PersonalWorkerLimaAttemptInput {
+            config: &config(),
+            mac: &mac_observation_profile(false, 200_000, LimaResourceProfile::Work),
+            request: &request(LIMA_HOME, CACHE_PATH),
+            lifecycle: &stopped_work,
+            tick: &start_tick,
+        })
+        .expect_err("stopped start lacks current immutable ownership proof");
+    assert_eq!(
+        error.kind,
+        PersonalWorkerLimaAuthorityErrorKind::InvalidInput
+    );
+}
+
+#[test]
+fn stop_attempt_preserves_the_exact_b01_target_after_stop() {
+    let authority = enrolled();
+    let before = lifecycle_profile(
+        LimaLifecycleState::Running,
+        LimaResourceProfile::Work,
+        1_900_000,
+    );
+    let tick = stop_tick(&before);
+    assert!(matches!(
+        tick.action(),
+        smolrunner::personal_worker_tick::PersonalWorkerTickAction::StopVm {
+            target_after_stop: PersonalWorkerProfile::Stopped,
+            ..
+        }
+    ));
+    let prepared = authority
+        .begin_attempt(PersonalWorkerLimaAttemptInput {
+            config: &config(),
+            mac: &mac_observation_profile(true, 1_896_000, LimaResourceProfile::Work),
+            request: &request(LIMA_HOME, CACHE_PATH),
+            lifecycle: &before,
+            tick: &tick,
+        })
+        .expect("prepared exact stop");
+    assert!(matches!(
+        prepared.attempt().expect("attempt").action(),
+        smolrunner::personal_worker_lima_authority::PersonalWorkerLimaAction::StopToStopped
+    ));
+    assert!(
+        String::from_utf8(encode_personal_worker_lima_authority(&prepared).expect("encode"))
+            .expect("JSON")
+            .contains("stop_to_stopped")
+    );
+}
+
+#[test]
+fn exhausted_authority_generation_refuses_without_reusing_a_generation() {
+    let canonical = String::from_utf8(
+        encode_personal_worker_lima_authority(&enrolled()).expect("canonical authority"),
+    )
+    .expect("UTF-8 JSON");
+    let exhausted_bytes = canonical
+        .replacen(
+            "\"authority_generation\":1",
+            "\"authority_generation\":1000000000000",
+            1,
         )
-        .expect("verification started");
-    let completed = verifying
-        .complete_attempt(
-            generation,
-            &config(),
-            &mac_observation_profile(false, 210_000, LimaResourceProfile::Work),
-            &request(LIMA_HOME, CACHE_PATH),
-            &lifecycle_with_generation(
-                LimaLifecycleState::Stopped,
-                LimaResourceProfile::Work,
-                214_000,
-                2,
-            ),
-            epoch(215_000),
-        )
-        .expect("stopped edit verified");
-    let attempt = completed.attempt().expect("attempt");
-    assert_eq!(attempt.after_profile(), LimaResourceProfile::Work);
-    assert_eq!(attempt.phase(), PersonalWorkerLimaAttemptPhase::Completed);
+        .into_bytes();
+    let exhausted =
+        decode_personal_worker_lima_authority(&exhausted_bytes).expect("bounded maximum decodes");
+    let before_mac = mac_observation_profile(true, 200_000, LimaResourceProfile::Interactive);
+    let before = lifecycle_profile(
+        LimaLifecycleState::Running,
+        LimaResourceProfile::Interactive,
+        204_000,
+    );
+    let tick = worker_tick(&before);
+    let error = exhausted
+        .begin_attempt(PersonalWorkerLimaAttemptInput {
+            config: &config(),
+            mac: &before_mac,
+            request: &request(LIMA_HOME, CACHE_PATH),
+            lifecycle: &before,
+            tick: &tick,
+        })
+        .expect_err("an exhausted generation must not saturate and replay");
+    assert_eq!(
+        error.kind,
+        PersonalWorkerLimaAuthorityErrorKind::InvalidInput
+    );
+    assert_eq!(exhausted.authority_generation().get(), 1_000_000_000_000);
+    assert!(exhausted.attempt().is_none());
 }
 
 #[test]
@@ -677,6 +842,17 @@ fn unknown_version_unknown_fields_and_noncanonical_bytes_fail_closed() {
     );
 
     value["schema_version"] = serde_json::json!(1);
+    value["identity"]["instance_id"] = serde_json::json!("other");
+    assert_eq!(
+        decode_personal_worker_lima_authority(
+            &serde_json::to_vec(&value).expect("identity drift bytes")
+        )
+        .expect_err("logical and physical persisted instances must match")
+        .kind,
+        PersonalWorkerLimaAuthorityErrorKind::CorruptDocument
+    );
+
+    value["identity"]["instance_id"] = serde_json::json!("smolrunner");
     value["unknown"] = serde_json::json!(true);
     assert_eq!(
         decode_personal_worker_lima_authority(&serde_json::to_vec(&value).expect("unknown bytes"))

@@ -11,14 +11,14 @@ use crate::lima_lifecycle::{
     LimaResourceProfile,
 };
 use crate::lima_observation::{
-    LimaArchitecture, LimaFilesystemObjectIdentity, LimaGuestObservation, LimaObservationRequest,
-    LimaPersistentIdentity, LimaRuntimeState, LimaVmType,
+    LimaArchitecture, LimaFilesystemObjectIdentity, LimaGuestObservation, LimaInstanceName,
+    LimaObservationRequest, LimaPersistentIdentity, LimaRuntimeState, LimaVmType,
 };
 use crate::operator_config::{
     OPERATOR_CONFIG_SCHEMA_VERSION, OperatorConfig, OperatorConfigIdentity,
 };
 use crate::personal_worker_mac_observation::PersonalWorkerMacObservation;
-use crate::personal_worker_queue::PersonalWorkerQueueGeneration;
+use crate::personal_worker_queue::{PersonalWorkerProfile, PersonalWorkerQueueGeneration};
 use crate::personal_worker_store::PersonalWorkerStoreRevision;
 use crate::personal_worker_tick::{PersonalWorkerTickAction, PersonalWorkerTickPlan};
 
@@ -50,7 +50,10 @@ impl PersonalWorkerLimaAuthorityGeneration {
     }
 
     fn next(self) -> Result<Self, PersonalWorkerLimaAuthorityError> {
-        Self::new(self.0.saturating_add(1))
+        let next = self.0.checked_add(1).ok_or_else(|| {
+            PersonalWorkerLimaAuthorityError::invalid("Lima authority generation cannot advance")
+        })?;
+        Self::new(next)
     }
 }
 
@@ -78,25 +81,25 @@ impl PersonalWorkerLimaAttemptGeneration {
 #[serde(rename_all = "snake_case")]
 pub enum PersonalWorkerLimaAction {
     Start,
-    Stop,
-    ChangeToInteractive,
-    ChangeToWork,
+    StopToStopped,
+    StopToInteractive,
+    StopToWork,
 }
 
 impl PersonalWorkerLimaAction {
     const fn target_profile(self, before: LimaResourceProfile) -> LimaResourceProfile {
         match self {
-            Self::Start | Self::Stop => before,
-            Self::ChangeToInteractive => LimaResourceProfile::Interactive,
-            Self::ChangeToWork => LimaResourceProfile::Work,
+            Self::Start | Self::StopToStopped => before,
+            Self::StopToInteractive => LimaResourceProfile::Interactive,
+            Self::StopToWork => LimaResourceProfile::Work,
         }
     }
 
-    const fn target_state(self, before: LimaLifecycleState) -> LimaLifecycleState {
+    const fn target_state(self) -> LimaLifecycleState {
         match self {
-            Self::Stop => LimaLifecycleState::Stopped,
+            Self::StopToStopped => LimaLifecycleState::Stopped,
+            Self::StopToInteractive | Self::StopToWork => LimaLifecycleState::Running,
             Self::Start => LimaLifecycleState::Running,
-            Self::ChangeToInteractive | Self::ChangeToWork => before,
         }
     }
 
@@ -105,9 +108,14 @@ impl PersonalWorkerLimaAction {
         before: LimaProfileGeneration,
     ) -> Result<LimaProfileGeneration, PersonalWorkerLimaAuthorityError> {
         match self {
-            Self::Start | Self::Stop => Ok(before),
-            Self::ChangeToInteractive | Self::ChangeToWork => {
-                LimaProfileGeneration::new(before.get().saturating_add(1)).map_err(|_| {
+            Self::Start | Self::StopToStopped => Ok(before),
+            Self::StopToInteractive | Self::StopToWork => {
+                let next = before.get().checked_add(1).ok_or_else(|| {
+                    PersonalWorkerLimaAuthorityError::invalid(
+                        "attempt.after_profile_generation cannot advance",
+                    )
+                })?;
+                LimaProfileGeneration::new(next).map_err(|_| {
                     PersonalWorkerLimaAuthorityError::invalid(
                         "attempt.after_profile_generation cannot advance",
                     )
@@ -220,6 +228,7 @@ pub struct PersonalWorkerLimaAuthorityDocument {
     authority_generation: PersonalWorkerLimaAuthorityGeneration,
     config_identity: EnrolledConfigIdentity,
     request_identity_digest: Sha256Digest,
+    lima_instance: LimaInstanceName,
     identity: LimaInstanceIdentity,
     expected_vm_type: LimaVmType,
     expected_architecture: LimaArchitecture,
@@ -234,6 +243,7 @@ impl fmt::Debug for PersonalWorkerLimaAuthorityDocument {
             .field("authority_generation", &self.authority_generation)
             .field("config_identity", &self.config_identity)
             .field("request_identity_digest", &self.request_identity_digest)
+            .field("lima_instance", &self.lima_instance)
             .field("identity", &self.identity)
             .field("expected_vm_type", &self.expected_vm_type)
             .field("expected_architecture", &self.expected_architecture)
@@ -332,7 +342,7 @@ impl PersonalWorkerLimaAuthorityDocument {
             before_profile: input.lifecycle.profile(),
             before_profile_generation: input.lifecycle.profile_generation(),
             before_resources: input.lifecycle.observed_resources(),
-            after_state: action.target_state(input.lifecycle.state()),
+            after_state: action.target_state(),
             after_profile,
             after_profile_generation,
             phase: PersonalWorkerLimaAttemptPhase::Prepared,
@@ -450,6 +460,8 @@ impl PersonalWorkerLimaAuthorityDocument {
         validate_exact_source(config, mac, request)?;
         if !self.config_identity.matches(config.identity())
             || self.request_identity_digest != *request.request_identity().digest()
+            || self.lima_instance != *request.instance()
+            || self.identity.instance_id().as_str() != request.instance().as_str()
             || self.expected_vm_type != request.expected_vm_type()
             || self.expected_architecture != request.expected_architecture()
         {
@@ -510,19 +522,21 @@ fn enrollment_candidate(
             "Lima enrollment requires an observed running guest",
         ));
     };
-    let expected = report.lima_profile.envelope();
-    if guest.resources.architecture != request.expected_architecture()
-        || guest.resources.cpus != expected.vcpus
-        || guest.resources.memory_bytes != expected.memory_bytes
-    {
+    if approved_identity.instance_id().as_str() != request.instance().as_str() {
+        return Err(PersonalWorkerLimaAuthorityError::conflict(
+            "the approved broker instance does not match the sealed physical Lima instance",
+        ));
+    }
+    if guest.resources.architecture != request.expected_architecture() {
         return Err(PersonalWorkerLimaAuthorityError::invalid(
-            "sealed Lima guest resources do not match the enrolled request and profile",
+            "sealed Lima guest architecture does not match the enrolled request",
         ));
     }
     Ok(PersonalWorkerLimaAuthorityDocument {
         authority_generation: PersonalWorkerLimaAuthorityGeneration::new(1)?,
         config_identity: EnrolledConfigIdentity::from_config(config.identity()),
         request_identity_digest: request.request_identity().digest().clone(),
+        lima_instance: request.instance().clone(),
         identity: approved_identity,
         expected_vm_type: request.expected_vm_type(),
         expected_architecture: request.expected_architecture(),
@@ -671,23 +685,22 @@ fn validate_pre_lifecycle(
         ));
     }
     let state_ok = match action {
-        PersonalWorkerLimaAction::Start => lifecycle.state() == LimaLifecycleState::Stopped,
-        PersonalWorkerLimaAction::Stop => lifecycle.state() == LimaLifecycleState::Running,
-        PersonalWorkerLimaAction::ChangeToInteractive | PersonalWorkerLimaAction::ChangeToWork => {
-            matches!(
-                lifecycle.state(),
-                LimaLifecycleState::Running | LimaLifecycleState::Stopped
-            )
-        }
+        // A stopped B02 report cannot prove that the currently named instance still owns the
+        // enrolled machine/root/cache. Start remains blocked until stopped-host identity is
+        // independently re-observable.
+        PersonalWorkerLimaAction::Start => false,
+        PersonalWorkerLimaAction::StopToStopped
+        | PersonalWorkerLimaAction::StopToInteractive
+        | PersonalWorkerLimaAction::StopToWork => lifecycle.state() == LimaLifecycleState::Running,
     };
     let profile_ok = match action {
-        PersonalWorkerLimaAction::ChangeToInteractive => {
+        PersonalWorkerLimaAction::StopToInteractive => {
             lifecycle.profile() == LimaResourceProfile::Work
         }
-        PersonalWorkerLimaAction::ChangeToWork => {
+        PersonalWorkerLimaAction::StopToWork => {
             lifecycle.profile() == LimaResourceProfile::Interactive
         }
-        PersonalWorkerLimaAction::Start | PersonalWorkerLimaAction::Stop => true,
+        PersonalWorkerLimaAction::Start | PersonalWorkerLimaAction::StopToStopped => true,
     };
     if !state_ok || !profile_ok {
         return Err(PersonalWorkerLimaAuthorityError::invalid(
@@ -718,32 +731,24 @@ fn action_from_tick(
             identity,
             current_profile,
             profile_generation,
-            ..
-        } => (
-            identity,
-            PersonalWorkerLimaAction::Stop,
-            *current_profile == lifecycle.profile(),
-            *profile_generation == lifecycle.profile_generation(),
-        ),
-        PersonalWorkerTickAction::ChangeProfile {
-            identity,
-            from_profile,
-            to_profile,
-            current_generation,
-            next_generation,
+            target_after_stop,
         } => {
-            let action = match to_profile {
-                LimaResourceProfile::Interactive => PersonalWorkerLimaAction::ChangeToInteractive,
-                LimaResourceProfile::Work => PersonalWorkerLimaAction::ChangeToWork,
+            let action = match target_after_stop {
+                PersonalWorkerProfile::Stopped => PersonalWorkerLimaAction::StopToStopped,
+                PersonalWorkerProfile::Interactive => PersonalWorkerLimaAction::StopToInteractive,
+                PersonalWorkerProfile::Work => PersonalWorkerLimaAction::StopToWork,
             };
-            let generation_ok = *current_generation == lifecycle.profile_generation()
-                && next_generation.get() == current_generation.get().saturating_add(1);
             (
                 identity,
                 action,
-                *from_profile == lifecycle.profile() && *to_profile != *from_profile,
-                generation_ok,
+                *current_profile == lifecycle.profile(),
+                *profile_generation == lifecycle.profile_generation(),
             )
+        }
+        PersonalWorkerTickAction::ChangeProfile { .. } => {
+            return Err(PersonalWorkerLimaAuthorityError::invalid(
+                "a stopped profile edit lacks current immutable ownership evidence",
+            ));
         }
         _ => {
             return Err(PersonalWorkerLimaAuthorityError::invalid(
@@ -794,9 +799,7 @@ fn validate_pre_report(
     match (&report.guest, expected_runtime) {
         (LimaGuestObservation::Observed(guest), LimaRuntimeState::Running)
             if guest.persistent_identity == authority.persistent_identity
-                && guest.resources.architecture == authority.expected_architecture
-                && guest.resources.cpus == envelope.vcpus
-                && guest.resources.memory_bytes == envelope.memory_bytes =>
+                && guest.resources.architecture == authority.expected_architecture =>
         {
             Ok(())
         }
@@ -834,9 +837,7 @@ fn validate_post_report(
     match (&report.guest, expected_runtime) {
         (LimaGuestObservation::Observed(guest), LimaRuntimeState::Running)
             if guest.persistent_identity == authority.persistent_identity
-                && guest.resources.architecture == authority.expected_architecture
-                && guest.resources.cpus == envelope.vcpus
-                && guest.resources.memory_bytes == envelope.memory_bytes =>
+                && guest.resources.architecture == authority.expected_architecture =>
         {
             Ok(())
         }
@@ -865,21 +866,14 @@ const fn valid_phase_edge(
                 | (Phase::StartStarted, Phase::StartCompleted)
                 | (Phase::StartCompleted, Phase::VerifyStarted)
         ),
-        PersonalWorkerLimaAction::Stop => matches!(
+        PersonalWorkerLimaAction::StopToStopped => matches!(
             (current, next),
             (Phase::Prepared, Phase::StopStarted)
                 | (Phase::StopStarted, Phase::StopCompleted)
                 | (Phase::StopCompleted, Phase::VerifyStarted)
         ),
-        PersonalWorkerLimaAction::ChangeToInteractive | PersonalWorkerLimaAction::ChangeToWork => {
-            if matches!(before_state, LimaLifecycleState::Stopped) {
-                matches!(
-                    (current, next),
-                    (Phase::Prepared, Phase::EditStarted)
-                        | (Phase::EditStarted, Phase::EditCompleted)
-                        | (Phase::EditCompleted, Phase::VerifyStarted)
-                )
-            } else {
+        PersonalWorkerLimaAction::StopToInteractive | PersonalWorkerLimaAction::StopToWork => {
+            if matches!(before_state, LimaLifecycleState::Running) {
                 matches!(
                     (current, next),
                     (Phase::Prepared, Phase::StopStarted)
@@ -890,6 +884,8 @@ const fn valid_phase_edge(
                         | (Phase::StartStarted, Phase::StartCompleted)
                         | (Phase::StartCompleted, Phase::VerifyStarted)
                 )
+            } else {
+                false
             }
         }
     }
@@ -915,6 +911,7 @@ struct AuthorityWire<'a> {
     authority_generation: u64,
     config_identity: ConfigIdentityWire<'a>,
     request_identity_digest: &'a str,
+    lima_instance: &'a str,
     identity: InstanceIdentityWire<'a>,
     expected_vm_type: &'static str,
     expected_architecture: &'static str,
@@ -973,6 +970,7 @@ struct RawAuthority {
     authority_generation: u64,
     config_identity: RawConfigIdentity,
     request_identity_digest: String,
+    lima_instance: String,
     identity: RawInstanceIdentity,
     expected_vm_type: String,
     expected_architecture: String,
@@ -1091,6 +1089,7 @@ fn authority_wire(document: &PersonalWorkerLimaAuthorityDocument) -> AuthorityWi
             digest: document.config_identity.digest.as_str(),
         },
         request_identity_digest: document.request_identity_digest.as_str(),
+        lima_instance: document.lima_instance.as_str(),
         identity: instance_wire(&document.identity),
         expected_vm_type: vm_type_name(document.expected_vm_type),
         expected_architecture: architecture_name(document.expected_architecture),
@@ -1151,6 +1150,8 @@ fn parse_raw_authority(
             digest: parse_digest(&raw.config_identity.digest)?,
         },
         request_identity_digest: parse_digest(&raw.request_identity_digest)?,
+        lima_instance: LimaInstanceName::parse(&raw.lima_instance)
+            .map_err(|_| corrupt_document())?,
         identity,
         expected_vm_type: parse_vm_type(&raw.expected_vm_type)?,
         expected_architecture: parse_architecture(&raw.expected_architecture)?,
@@ -1203,6 +1204,7 @@ fn validate_document_shape(
     document: &PersonalWorkerLimaAuthorityDocument,
 ) -> Result<(), PersonalWorkerLimaAuthorityError> {
     if document.config_identity.schema_version != OPERATOR_CONFIG_SCHEMA_VERSION
+        || document.identity.instance_id().as_str() != document.lima_instance.as_str()
         || document.persistent_identity.root_filesystem.device_id == 0
         || document.persistent_identity.root_filesystem.inode == 0
         || document.persistent_identity.cache_directory.device_id == 0
@@ -1224,7 +1226,7 @@ fn validate_document_shape(
             || attempt.before_resources
                 != LimaObservedResources::for_profile(attempt.before_profile)
             || attempt.after_profile != attempt.action.target_profile(attempt.before_profile)
-            || attempt.after_state != attempt.action.target_state(attempt.before_state)
+            || attempt.after_state != attempt.action.target_state()
             || attempt.after_profile_generation
                 != attempt
                     .action
@@ -1240,19 +1242,19 @@ fn validate_document_shape(
 
 fn valid_attempt_endpoints(attempt: &PersonalWorkerLimaAttempt) -> bool {
     match attempt.action {
-        PersonalWorkerLimaAction::Start => attempt.before_state == LimaLifecycleState::Stopped,
-        PersonalWorkerLimaAction::Stop => attempt.before_state == LimaLifecycleState::Running,
-        PersonalWorkerLimaAction::ChangeToInteractive => {
-            matches!(
-                attempt.before_state,
-                LimaLifecycleState::Running | LimaLifecycleState::Stopped
-            ) && attempt.before_profile == LimaResourceProfile::Work
+        // Schema v1 cannot prove immutable ownership while an instance is stopped, so no Start
+        // attempt is a valid persisted producer state yet.
+        PersonalWorkerLimaAction::Start => false,
+        PersonalWorkerLimaAction::StopToStopped => {
+            attempt.before_state == LimaLifecycleState::Running
         }
-        PersonalWorkerLimaAction::ChangeToWork => {
-            matches!(
-                attempt.before_state,
-                LimaLifecycleState::Running | LimaLifecycleState::Stopped
-            ) && attempt.before_profile == LimaResourceProfile::Interactive
+        PersonalWorkerLimaAction::StopToInteractive => {
+            matches!(attempt.before_state, LimaLifecycleState::Running)
+                && attempt.before_profile == LimaResourceProfile::Work
+        }
+        PersonalWorkerLimaAction::StopToWork => {
+            matches!(attempt.before_state, LimaLifecycleState::Running)
+                && attempt.before_profile == LimaResourceProfile::Interactive
         }
     }
 }
@@ -1264,15 +1266,8 @@ const fn phase_is_reachable(
 ) -> bool {
     use PersonalWorkerLimaAttemptPhase as Phase;
     match action {
-        PersonalWorkerLimaAction::Start => matches!(
-            phase,
-            Phase::Prepared
-                | Phase::StartStarted
-                | Phase::StartCompleted
-                | Phase::VerifyStarted
-                | Phase::Completed
-        ),
-        PersonalWorkerLimaAction::Stop => matches!(
+        PersonalWorkerLimaAction::Start => false,
+        PersonalWorkerLimaAction::StopToStopped => matches!(
             phase,
             Phase::Prepared
                 | Phase::StopStarted
@@ -1280,19 +1275,8 @@ const fn phase_is_reachable(
                 | Phase::VerifyStarted
                 | Phase::Completed
         ),
-        PersonalWorkerLimaAction::ChangeToInteractive | PersonalWorkerLimaAction::ChangeToWork => {
-            if matches!(before_state, LimaLifecycleState::Stopped) {
-                matches!(
-                    phase,
-                    Phase::Prepared
-                        | Phase::EditStarted
-                        | Phase::EditCompleted
-                        | Phase::VerifyStarted
-                        | Phase::Completed
-                )
-            } else {
-                true
-            }
+        PersonalWorkerLimaAction::StopToInteractive | PersonalWorkerLimaAction::StopToWork => {
+            matches!(before_state, LimaLifecycleState::Running)
         }
     }
 }
@@ -1353,9 +1337,9 @@ name_parser!(parse_profile, profile_name, LimaResourceProfile, {
 });
 name_parser!(parse_action, action_name, PersonalWorkerLimaAction, {
     "start" => PersonalWorkerLimaAction::Start,
-    "stop" => PersonalWorkerLimaAction::Stop,
-    "change_to_interactive" => PersonalWorkerLimaAction::ChangeToInteractive,
-    "change_to_work" => PersonalWorkerLimaAction::ChangeToWork,
+    "stop_to_stopped" => PersonalWorkerLimaAction::StopToStopped,
+    "stop_to_interactive" => PersonalWorkerLimaAction::StopToInteractive,
+    "stop_to_work" => PersonalWorkerLimaAction::StopToWork,
 });
 name_parser!(parse_state, state_name, LimaLifecycleState, {
     "stopped" => LimaLifecycleState::Stopped,
