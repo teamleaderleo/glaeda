@@ -29,6 +29,22 @@ validate_network_lock() {
     (( size == 0 ))
 }
 
+PROBE_OWNED_CONTAINER_ID=
+PROBE_OWNED_IMAGE_ID=
+
+cleanup_user_probe() {
+  local status=$?
+  trap - EXIT
+  set +e
+  if [[ $PROBE_OWNED_CONTAINER_ID =~ ^[0-9a-f]{64}$ ]]; then
+    podman_probe rm --force "$PROBE_OWNED_CONTAINER_ID" >/dev/null 2>&1
+  fi
+  if [[ $PROBE_OWNED_IMAGE_ID =~ ^sha256:[0-9a-f]{64}$ ]]; then
+    podman_probe image rm --force "$PROBE_OWNED_IMAGE_ID" >/dev/null 2>&1
+  fi
+  exit "$status"
+}
+
 run_user_probe() {
   local image_id image_hex container_id container_output expected_output
   local init_output init_status start_output start_status inspect_status logs_status completion_seen=0
@@ -50,6 +66,7 @@ run_user_probe() {
     printf 'error: offline image import returned a noncanonical identity\n' >&2
     exit 1
   fi
+  PROBE_OWNED_IMAGE_ID=$image_id
   image_hex=${image_id#sha256:}
 
   podman_probe image inspect "$image_id" > "$PROBE_IMAGE_JSON"
@@ -110,6 +127,7 @@ run_user_probe() {
     printf 'error: stopped create returned a noncanonical container identity\n' >&2
     exit 1
   fi
+  PROBE_OWNED_CONTAINER_ID=$container_id
 
   set +e
   init_output=$(/usr/bin/timeout --signal=KILL 20s \
@@ -344,7 +362,9 @@ $PROBE_GROUP_SHA  /etc/group"
     printf 'error: exact fixture container still exists after removal\n' >&2
     exit 1
   fi
+  PROBE_OWNED_CONTAINER_ID=
   podman_probe image rm "$image_id" >/dev/null
+  PROBE_OWNED_IMAGE_ID=
 
   mapfile -d '' network_entries_after < <(
     /usr/bin/find "$PROBE_NETWORK" -mindepth 1 -maxdepth 1 -print0
@@ -361,6 +381,7 @@ $PROBE_GROUP_SHA  /etc/group"
 }
 
 if [[ ${1:-} == --user-probe ]]; then
+  trap cleanup_user_probe EXIT
   run_user_probe
   exit 0
 fi

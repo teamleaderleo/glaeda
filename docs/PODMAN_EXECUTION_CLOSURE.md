@@ -279,7 +279,10 @@ terminal, or caller pipe is forbidden.
 After `create` returns, R02 durably checkpoints the exact configured container, invokes fixed
 `podman container init <exact-id>`, and checkpoints that exact non-running initialized object before
 inspection. `init` may establish mounts and conmon state but cannot execute the payload; failure or
-ambiguity is recovery debt. R02 then matches the initialized container and generated specification
+ambiguity is recovery debt. From the first successful `init` through exact removal, an inner cleanup
+guard owns that exact container ID so a later gate failure cannot strand conmon and prevent the
+outer transient service/cgroup from terminating. R02 then matches the initialized container and
+generated specification
 to the durable attempt, image, protected source/cache/target objects, target-tmpfs limits,
 namespaces, cgroup, environment, and security policy. It durably checkpoints that exact stopped
 object, reconfirms protected host objects, and then takes the canonical durable-store lock for one
