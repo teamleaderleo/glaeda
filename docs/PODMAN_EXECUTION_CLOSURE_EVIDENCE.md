@@ -113,20 +113,21 @@ construct evidence, or seal runtime readiness.
 
 ### Dynamic-loader cache selection evidence
 
-- Selection implementation commit: `ff24cf4136816a191d8b14cc9809d5137b71aac4`
-- Package workflow run: [31339849166](https://github.com/teamleaderleo/smolrunner/actions/runs/31339849166)
-- ARM64 package job: [93311718767](https://github.com/teamleaderleo/smolrunner/actions/runs/31339849166/job/93311718767)
-- x86_64 package job: [93311718799](https://github.com/teamleaderleo/smolrunner/actions/runs/31339849166/job/93311718799)
-- Verify run: [31339849158](https://github.com/teamleaderleo/smolrunner/actions/runs/31339849158), job
-  [93311718641](https://github.com/teamleaderleo/smolrunner/actions/runs/31339849158/job/93311718641)
+- Selection implementation commit: `14c11c38a2eb80c638f19a27dda177a347207e41`
+- Package workflow run: [31340230776](https://github.com/teamleaderleo/smolrunner/actions/runs/31340230776)
+- ARM64 package job: [93312678226](https://github.com/teamleaderleo/smolrunner/actions/runs/31340230776/job/93312678226)
+- x86_64 package job: [93312678178](https://github.com/teamleaderleo/smolrunner/actions/runs/31340230776/job/93312678178)
+- Verify run: [31340230750](https://github.com/teamleaderleo/smolrunner/actions/runs/31340230750), job
+  [93312677934](https://github.com/teamleaderleo/smolrunner/actions/runs/31340230750/job/93312677934)
 - Date: 2026-08-10
 - Result: both package jobs parsed their complete live cache and selected the baseline `libc.so.6`
   entry; Verify passed the synthetic baseline/x86-64-v2/v3/v4 priority and ISA-compatibility
-  matrix.
+  matrix plus comparator-equivalent numeric lookup-name coverage.
 
 The pure selector reproduces the admitted glibc 2.39 rule that a usable active named hwcap beats
 the baseline entry, with lower subdirectory priority preferred and the entry's ISA level checked
-independently. The supplied capability profile is caller-owned input rather than observed host
+independently. Lookup names use glibc's numeric comparator equivalence while comparator-overflowing
+names fail closed. The supplied capability profile is caller-owned input rather than observed host
 evidence. The resolution retains its selected cache path crate-privately as untrusted data for a
 later descriptor-bound observer. This evidence therefore does not prove the current host capability
 profile, open or
