@@ -16,6 +16,7 @@ use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
 use crate::artifact::Sha256Digest;
+use crate::lane_command::LinuxAccountName;
 use crate::manifest::RunnerScope;
 use crate::ownership::ProjectIdentity;
 use crate::runner_account_plan::DesiredRunnerAccount;
@@ -182,8 +183,20 @@ fn observe_at(
     if passwd_record.primary_gid() != group_gid {
         return Err(identity_error());
     }
-    require_subordinate(&subuid.bytes, desired, passwd_record.uid(), true)?;
-    require_subordinate(&subgid.bytes, desired, passwd_record.uid(), false)?;
+    require_subordinate(
+        &subuid.bytes,
+        desired,
+        passwd_record.uid(),
+        passwd_record.uid(),
+        true,
+    )?;
+    require_subordinate(
+        &subgid.bytes,
+        desired,
+        passwd_record.uid(),
+        passwd_record.primary_gid(),
+        false,
+    )?;
 
     let home = DirectoryChain::open(
         root_path,
@@ -357,7 +370,7 @@ impl BoundFile {
     fn digest(&self, label: &[u8]) -> Vec<u8> {
         let mut hasher = Sha256::new();
         hash_field(&mut hasher, label);
-        hash_stat(&mut hasher, &self.snapshot);
+        hash_file_semantics(&mut hasher, &self.snapshot);
         hash_field(&mut hasher, &self.bytes);
         hasher.finalize().to_vec()
     }
@@ -465,7 +478,7 @@ impl DirectoryChain {
         hash_field(&mut hasher, label);
         for node in &self.nodes {
             hash_field(&mut hasher, node.name.as_deref().unwrap_or("/").as_bytes());
-            hash_stat(&mut hasher, &node.snapshot);
+            hash_directory_semantics(&mut hasher, &node.snapshot);
         }
         hasher.finalize().to_vec()
     }
@@ -522,7 +535,7 @@ fn require_local_nss(bytes: &[u8]) -> Result<(), PersonalWorkerRuntimeAccountEvi
         let Some((database, sources)) = line.split_once(':') else {
             continue;
         };
-        if database != "passwd" && database != "group" {
+        if database != "passwd" && database != "group" && database != "initgroups" {
             continue;
         }
         if !seen.insert(database) {
@@ -533,7 +546,7 @@ fn require_local_nss(bytes: &[u8]) -> Result<(), PersonalWorkerRuntimeAccountEvi
             return Err(authority_error());
         }
     }
-    if seen.len() != 2 {
+    if !seen.contains("passwd") || !seen.contains("group") {
         return Err(authority_error());
     }
     Ok(())
@@ -587,9 +600,22 @@ fn require_group(
         if fields.len() != 4 || fields[0].is_empty() {
             return Err(authority_error());
         }
+        LinuxAccountName::parse(fields[0]).map_err(|_| authority_error())?;
         let gid = canonical_u32(fields[2]).ok_or_else(authority_error)?;
         if !names.insert(fields[0]) || !gids.insert(gid) {
             return Err(authority_error());
+        }
+        let mut members = BTreeSet::new();
+        if !fields[3].is_empty() {
+            for member in fields[3].split(',') {
+                let member = LinuxAccountName::parse(member).map_err(|_| authority_error())?;
+                if !members.insert(member.as_str().to_owned()) {
+                    return Err(authority_error());
+                }
+            }
+        }
+        if members.contains(desired.username().as_str()) {
+            return Err(identity_error());
         }
         if fields[0] == desired.primary_group().as_str() {
             if !fields[3].is_empty() {
@@ -608,10 +634,11 @@ fn require_group(
 fn require_subordinate(
     bytes: &[u8],
     desired: &DesiredRunnerAccount,
-    runner_uid: u32,
+    owner_uid: u32,
+    reserved_identity: u32,
     uids: bool,
 ) -> Result<(), PersonalWorkerRuntimeAccountEvidenceError> {
-    let input = authority_text(bytes)?;
+    let input = std::str::from_utf8(bytes).map_err(|_| authority_error())?;
     let authority = parse_subordinate_authority(input).map_err(|_| authority_error())?;
     let owner = SubordinateIdOwner::from(desired.username());
     let expected = if uids {
@@ -623,7 +650,12 @@ fn require_subordinate(
     if observed.start() != expected.start() || observed.count() != expected.count() {
         return Err(identity_error());
     }
-    let numeric_owner = runner_uid.to_string();
+    let start = u64::from(expected.start());
+    let end = start + u64::from(expected.count());
+    if (start..end).contains(&u64::from(reserved_identity)) {
+        return Err(identity_error());
+    }
+    let numeric_owner = owner_uid.to_string();
     if authority
         .records()
         .iter()
@@ -753,18 +785,15 @@ fn same_snapshot(left: &rustix::fs::Stat, right: &rustix::fs::Stat) -> bool {
         && left.st_ctime_nsec == right.st_ctime_nsec
 }
 
-fn hash_stat(hasher: &mut Sha256, stat: &rustix::fs::Stat) {
-    for value in [stat.st_dev, stat.st_ino, stat.st_size as u64] {
-        hash_field(hasher, &value.to_be_bytes());
-    }
-    hash_field(hasher, &stat.st_nlink.to_be_bytes());
+fn hash_file_semantics(hasher: &mut Sha256, stat: &rustix::fs::Stat) {
     for value in [stat.st_uid, stat.st_gid, stat.st_mode] {
         hash_field(hasher, &value.to_be_bytes());
     }
-    for value in [stat.st_mtime, stat.st_ctime] {
-        hash_field(hasher, &value.to_be_bytes());
-    }
-    for value in [stat.st_mtime_nsec, stat.st_ctime_nsec] {
+    hash_field(hasher, &(stat.st_size as u64).to_be_bytes());
+}
+
+fn hash_directory_semantics(hasher: &mut Sha256, stat: &rustix::fs::Stat) {
+    for value in [stat.st_uid, stat.st_gid, stat.st_mode] {
         hash_field(hasher, &value.to_be_bytes());
     }
 }
@@ -983,14 +1012,7 @@ mod tests {
                 b"",
             );
 
-            let desired = DesiredRunnerAccount::new(
-                LinuxAccountName::parse("runtime-runner").expect("username"),
-                LinuxAccountName::parse("runtime-runner").expect("group"),
-                "/home/runtime-runner",
-                PlannedSubordinateRange::new(100_000, 65_536).expect("subuids"),
-                PlannedSubordinateRange::new(200_000, 65_536).expect("subgids"),
-            )
-            .expect("desired account");
+            let desired = desired_with_ranges(100_000, 200_000);
             let project = ProjectIdentity {
                 repository: "example/runtime".to_owned(),
                 runner_scope: RunnerScope::Repository,
@@ -1028,6 +1050,17 @@ mod tests {
     fn write_authority(path: &Path, bytes: &[u8]) {
         std_fs::write(path, bytes).expect("write authority file");
         set_mode(path, ROOT_FILE_MODE);
+    }
+
+    fn desired_with_ranges(subuid_start: u32, subgid_start: u32) -> DesiredRunnerAccount {
+        DesiredRunnerAccount::new(
+            LinuxAccountName::parse("runtime-runner").expect("username"),
+            LinuxAccountName::parse("runtime-runner").expect("group"),
+            "/home/runtime-runner",
+            PlannedSubordinateRange::new(subuid_start, 65_536).expect("subuids"),
+            PlannedSubordinateRange::new(subgid_start, 65_536).expect("subgids"),
+        )
+        .expect("desired account")
     }
 
     #[test]
@@ -1102,6 +1135,23 @@ mod tests {
             error.kind,
             PersonalWorkerRuntimeAccountEvidenceErrorKind::InvalidAuthority
         );
+
+        write_authority(
+            &fixture.root.path().join("etc/nsswitch.conf"),
+            b"passwd: files\ngroup: files\ninitgroups: ldap\n",
+        );
+        assert_eq!(
+            fixture.observe().expect_err("remote initgroups").kind,
+            PersonalWorkerRuntimeAccountEvidenceErrorKind::InvalidAuthority
+        );
+        write_authority(
+            &fixture.root.path().join("etc/nsswitch.conf"),
+            b"passwd: files\ngroup: files\ninitgroups: files\ninitgroups: files\n",
+        );
+        assert_eq!(
+            fixture.observe().expect_err("duplicate initgroups").kind,
+            PersonalWorkerRuntimeAccountEvidenceErrorKind::InvalidAuthority
+        );
     }
 
     #[test]
@@ -1141,6 +1191,42 @@ mod tests {
     }
 
     #[test]
+    fn self_overlapping_subordinate_ranges_and_empty_authority_fail_truthfully() {
+        let desired = desired_with_ranges(150_000, 150_000);
+        let authority = b"runtime-runner:150000:65536\n";
+        for uids in [true, false] {
+            let owner_uid = if uids { 200_000 } else { 1_000 };
+            let error = require_subordinate(authority, &desired, owner_uid, 200_000, uids)
+                .expect_err("range reserves the host UID or GID");
+            assert_eq!(
+                error.kind,
+                PersonalWorkerRuntimeAccountEvidenceErrorKind::IdentityMismatch
+            );
+            let error = require_subordinate(b"", &desired, owner_uid, 200_000, uids)
+                .expect_err("empty authority has no allocation");
+            assert_eq!(
+                error.kind,
+                PersonalWorkerRuntimeAccountEvidenceErrorKind::Missing
+            );
+        }
+    }
+
+    #[test]
+    fn unrelated_supplementary_membership_is_refused() {
+        let fixture = Fixture::new("supplementary-group");
+        let group =
+            std_fs::read_to_string(fixture.root.path().join("etc/group")).expect("read group");
+        write_authority(
+            &fixture.root.path().join("etc/group"),
+            format!("{group}sudo:x:4000000000:runtime-runner\n").as_bytes(),
+        );
+        assert_eq!(
+            fixture.observe().expect_err("supplementary group").kind,
+            PersonalWorkerRuntimeAccountEvidenceErrorKind::IdentityMismatch
+        );
+    }
+
+    #[test]
     fn retained_file_detects_in_place_and_path_replacement_drift() {
         let fixture = Fixture::new("file-drift");
         let etc = DirectoryChain::open(fixture.root.path(), "etc", fixture.authority_uid, None)
@@ -1176,13 +1262,73 @@ mod tests {
         let first = fixture.observe().expect("first observation");
         write_authority(
             &fixture.root.path().join("etc/nsswitch.conf"),
-            b"passwd: files\ngroup: files\nhosts: files dns\n",
+            b"passwd: files\ngroup: files\ninitgroups: files\nhosts: files dns\n",
         );
         let second = fixture.observe().expect("second observation");
         assert_ne!(first.runner_account, second.runner_account);
         assert_ne!(first.primary_group, second.primary_group);
         assert_eq!(first.subordinate_uids, second.subordinate_uids);
         assert_eq!(first.subordinate_gids, second.subordinate_gids);
+    }
+
+    #[test]
+    fn volatile_metadata_and_unrelated_siblings_do_not_change_class_identity() {
+        let fixture = Fixture::new("stable-semantics");
+        let first = fixture.observe().expect("first observation");
+        let nsswitch = fixture.root.path().join("etc/nsswitch.conf");
+        let same_bytes = std_fs::read(&nsswitch).expect("read NSS authority");
+        write_authority(&nsswitch, &same_bytes);
+        let home_sibling = fixture.root.path().join("home/unrelated");
+        std_fs::create_dir(&home_sibling).expect("create home sibling");
+        set_mode(&home_sibling, 0o755);
+        let runtime_sibling = fixture.root.path().join("run/user/unrelated");
+        std_fs::create_dir(&runtime_sibling).expect("create runtime sibling");
+        set_mode(&runtime_sibling, 0o755);
+        let second = fixture.observe().expect("second observation");
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn retained_directory_detects_mode_drift_and_path_replacement() {
+        let fixture = Fixture::new("directory-drift");
+        let home_path = fixture.root.path().join("home/runtime-runner");
+        let bound = DirectoryChain::open(
+            fixture.root.path(),
+            "home/runtime-runner",
+            fixture.authority_uid,
+            Some((
+                fs::stat(&home_path).expect("home stat").st_uid,
+                fs::stat(&home_path).expect("home stat").st_gid,
+                HOME_MODE,
+            )),
+        )
+        .expect("bind home");
+        set_mode(&home_path, 0o700);
+        assert_eq!(
+            bound.revalidate().expect_err("mode drift").kind,
+            PersonalWorkerRuntimeAccountEvidenceErrorKind::ChangedDuringRead
+        );
+
+        set_mode(&home_path, HOME_MODE);
+        let stat = fs::stat(&home_path).expect("restored home stat");
+        let rebound = DirectoryChain::open(
+            fixture.root.path(),
+            "home/runtime-runner",
+            fixture.authority_uid,
+            Some((stat.st_uid, stat.st_gid, HOME_MODE)),
+        )
+        .expect("bind restored home");
+        let displaced = fixture.root.path().join("home/runtime-runner.displaced");
+        std_fs::rename(&home_path, &displaced).expect("displace home");
+        std_fs::create_dir(&home_path).expect("replace home");
+        set_mode(&home_path, HOME_MODE);
+        if fixture.authority_uid == 0 {
+            set_owner(&home_path, stat.st_uid, stat.st_gid);
+        }
+        assert_eq!(
+            rebound.revalidate().expect_err("directory rebind").kind,
+            PersonalWorkerRuntimeAccountEvidenceErrorKind::ChangedDuringRead
+        );
     }
 
     #[test]
