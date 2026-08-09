@@ -388,21 +388,27 @@ fn wrong_launcher_identity_fails_before_spawn() {
 
 #[test]
 fn output_limit_terminates_the_child_process_group() {
-    let fixture = Fixture::new("output-limit");
-    let working_directory = fixture.directory("cwd");
-    let executable = fixture.copy_binary("yes", &["/usr/bin/yes", "/bin/yes"]);
-    let launch = plan(
-        "descriptor.output_limit",
-        &executable,
-        &working_directory,
-        Vec::new(),
-        BTreeMap::new(),
-    );
+    for attempt in 0..32 {
+        let fixture = Fixture::new("output-limit");
+        let working_directory = fixture.directory("cwd");
+        let executable = fixture.copy_binary("yes", &["/usr/bin/yes", "/bin/yes"]);
+        let launch = plan(
+            "descriptor.output_limit",
+            &executable,
+            &working_directory,
+            Vec::new(),
+            BTreeMap::new(),
+        );
 
-    let error = execute_reviewed_linux_launch(&launch).expect_err("unbounded output must fail");
+        let error = execute_reviewed_linux_launch(&launch).expect_err("unbounded output must fail");
 
-    assert_eq!(error.kind(), DescriptorBoundLaunchErrorKind::OutputLimit);
-    assert_eq!(error.stage(), "stdout");
+        assert_eq!(
+            error.kind(),
+            DescriptorBoundLaunchErrorKind::OutputLimit,
+            "diagnostic attempt {attempt}"
+        );
+        assert_eq!(error.stage(), "stdout", "diagnostic attempt {attempt}");
+    }
 }
 
 #[test]
