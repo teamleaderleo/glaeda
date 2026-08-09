@@ -440,26 +440,23 @@ if [[ ! -r $probe_apparmor_profiles ]] ||
   exit 1
 fi
 
-probe_seccomp_profile=/usr/share/containers/seccomp.json
-if [[ -L $probe_seccomp_profile ]] || [[ ! -f $probe_seccomp_profile ]]; then
+probe_seccomp_source=/usr/share/containers/seccomp.json
+probe_seccomp_expected_sha=cc374cf23846ce1f62f4dc807a8e2b8673c783c6f56cb475467621035d281e6c
+if [[ -L $probe_seccomp_source ]] || [[ ! -f $probe_seccomp_source ]]; then
   printf 'error: exact packaged seccomp profile is absent or not a regular file\n' >&2
   exit 1
 fi
-seccomp_sha=$(/usr/bin/sha256sum "$probe_seccomp_profile" | /usr/bin/awk '{ print $1 }')
-read -r seccomp_owner seccomp_group seccomp_mode seccomp_links seccomp_size < <(
-  /usr/bin/stat -Lc '%u %g %a %h %s' "$probe_seccomp_profile"
+seccomp_source_sha=$(/usr/bin/sha256sum "$probe_seccomp_source" | /usr/bin/awk '{ print $1 }')
+read -r seccomp_owner seccomp_group seccomp_links seccomp_size < <(
+  /usr/bin/stat -Lc '%u %g %h %s' "$probe_seccomp_source"
 )
-if [[ $seccomp_owner != 0 ]] || [[ $seccomp_group != 0 ]] ||
-  (( (8#$seccomp_mode & 0022) != 0 )) || [[ $seccomp_links != 1 ]] ||
-  (( seccomp_size == 0 || seccomp_size > 1048576 )); then
-  printf 'seccomp_owner=%s seccomp_group=%s seccomp_mode=%s seccomp_links=%s seccomp_size=%s\n' \
-    "$seccomp_owner" "$seccomp_group" "$seccomp_mode" "$seccomp_links" "$seccomp_size" >&2
-  printf 'seccomp_sha256=%s\n' "$seccomp_sha" >&2
-  printf 'error: exact packaged seccomp profile metadata is unsafe or unbounded\n' >&2
-  exit 1
-fi
-if [[ ! $seccomp_sha =~ ^[0-9a-f]{64}$ ]]; then
-  printf 'error: exact packaged seccomp profile digest is noncanonical\n' >&2
+if [[ $seccomp_owner != 0 ]] || [[ $seccomp_group != 0 ]] || [[ $seccomp_links != 1 ]] ||
+  (( seccomp_size == 0 || seccomp_size > 1048576 )) ||
+  [[ $seccomp_source_sha != "$probe_seccomp_expected_sha" ]]; then
+  printf 'seccomp_owner=%s seccomp_group=%s seccomp_links=%s seccomp_size=%s seccomp_sha256=%s\n' \
+    "$seccomp_owner" "$seccomp_group" "$seccomp_links" "$seccomp_size" \
+    "$seccomp_source_sha" >&2
+  printf 'error: packaged seccomp source does not match the pinned disposable fixture\n' >&2
   exit 1
 fi
 
@@ -480,6 +477,7 @@ probe_user_created=0
 probe_unit_owned=0
 probe_script=$(/usr/bin/readlink -f "$0")
 probe_user_script="$probe_root/user-probe.sh"
+probe_seccomp_profile="$probe_root/seccomp.json"
 
 cleanup() {
   local status=$?
@@ -542,6 +540,18 @@ mkdir -p \
 chmod 0755 "$probe_root"
 install -o 0 -g 0 -m 0555 "$probe_script" "$probe_user_script"
 install -o 0 -g 0 -m 0555 /usr/bin/busybox "$probe_root/rootfs/bin/busybox"
+install -o 0 -g 0 -m 0444 "$probe_seccomp_source" "$probe_seccomp_profile"
+seccomp_sha=$(/usr/bin/sha256sum "$probe_seccomp_profile" | /usr/bin/awk '{ print $1 }')
+read -r seccomp_owner seccomp_group seccomp_mode seccomp_links seccomp_size < <(
+  /usr/bin/stat -Lc '%u %g %a %h %s' "$probe_seccomp_profile"
+)
+if [[ -L $probe_seccomp_profile ]] || [[ ! -f $probe_seccomp_profile ]] ||
+  [[ $seccomp_owner != 0 ]] || [[ $seccomp_group != 0 ]] || [[ $seccomp_mode != 444 ]] ||
+  [[ $seccomp_links != 1 ]] || [[ $seccomp_sha != "$probe_seccomp_expected_sha" ]] ||
+  (( seccomp_size == 0 || seccomp_size > 1048576 )); then
+  printf 'error: attempt-private seccomp snapshot is not exact and immutable\n' >&2
+  exit 1
+fi
 printf 'root:x:0:0:root:/root:/bin/busybox\nsmolgate:x:1000:1000:SmolRunner gate:/:/bin/busybox\n' \
   > "$probe_root/rootfs/etc/passwd"
 printf 'root:x:0:\nsmolgate:x:1000:\n' > "$probe_root/rootfs/etc/group"
