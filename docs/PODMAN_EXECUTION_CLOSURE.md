@@ -271,20 +271,25 @@ passwd/group bind mounts or host-derived identity. Only then may the gate `exec`
 Cargo command and fixed argument vector selected by the sealed Rust envelope. A gate failure
 executes no repository code and is never a verification success.
 
-Before `image inspect`, `create`, `inspect`, or `start`, the launcher joins the already-created
-outer attempt cgroup; it supplies null stdin, pipes only bounded stdout/stderr, and allocates no TTY.
+Before `image inspect`, `create`, `init`, `inspect`, `start`, or `logs`, the launcher joins the
+already-created outer attempt cgroup; it supplies null stdin, pipes only bounded stdout/stderr, and
+allocates no TTY.
 Every Podman process's file descriptor 0 is the already-open `/dev/null`; an inherited service,
 terminal, or caller pipe is forbidden.
-After `create` returns, R02 matches the stopped container and generated specification to the durable
-attempt, image, protected source/cache/target objects, target-tmpfs limits, namespaces, cgroup,
-environment, and security policy. It durably checkpoints that exact stopped object, reconfirms
-protected host objects, and then takes the canonical durable-store lock for one final admission
-barrier. Under that lock it reopens the exact B05 plan/reservation, checks current store revision and
-queue generation, ownership, holds/cancellation, every bound identity, and an injected current time,
-then atomically consumes/checkpoints start authority. The deadline remains the original B05
-`not_after`/maximum-duration budget with preparation time already consumed; it is never restarted or
-extended. Any refusal leaves the exact stopped container unstarted and recovery-classified. Only
-after that successful checkpoint does R02 invoke fixed `podman start <exact-id>`, repeated
+After `create` returns, R02 durably checkpoints the exact configured container, invokes fixed
+`podman container init <exact-id>`, and checkpoints that exact non-running initialized object before
+inspection. `init` may establish mounts and conmon state but cannot execute the payload; failure or
+ambiguity is recovery debt. R02 then matches the initialized container and generated specification
+to the durable attempt, image, protected source/cache/target objects, target-tmpfs limits,
+namespaces, cgroup, environment, and security policy. It durably checkpoints that exact stopped
+object, reconfirms protected host objects, and then takes the canonical durable-store lock for one
+final admission barrier. Under that lock it reopens the exact B05 plan/reservation, checks current
+store revision and queue generation, ownership, holds/cancellation, every bound identity, and an
+injected current time, then atomically consumes/checkpoints start authority. The deadline remains
+the original B05 `not_after`/maximum-duration budget with preparation time already consumed; it is
+never restarted or extended. Any refusal leaves the exact stopped container unstarted and
+recovery-classified. Only after that successful checkpoint does R02 invoke fixed
+`podman start <exact-id>`, repeated
 `podman container inspect <exact-id>`, and final `podman logs <exact-id>` forms. Each command and the
 whole polling sequence are independently deadline- and output-bounded. R02 monitors the
 authoritative payload cgroup and exact attempt-private log while polling; timeout, cancellation,

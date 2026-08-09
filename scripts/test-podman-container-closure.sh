@@ -31,7 +31,7 @@ validate_network_lock() {
 
 run_user_probe() {
   local image_id image_hex container_id container_output expected_output
-  local start_output start_status inspect_status logs_status completion_seen=0
+  local init_output init_status start_output start_status inspect_status logs_status completion_seen=0
   local image_size container_size spec_size spec_path apparmor_profile
   local log_owner log_group log_mode log_links log_size stderr_size exit_code
 
@@ -111,6 +111,27 @@ run_user_probe() {
     exit 1
   fi
 
+  set +e
+  init_output=$(/usr/bin/timeout --signal=KILL 20s \
+    /usr/bin/podman \
+    --remote=false \
+    --runtime=/usr/bin/crun \
+    --conmon=/usr/bin/conmon \
+    --events-backend=none \
+    --hooks-dir="$PROBE_HOOKS" \
+    --network-config-dir="$PROBE_NETWORK" \
+    --cgroup-manager=cgroupfs \
+    --tmpdir="$TMPDIR" \
+    --transient-store \
+    container init "$container_id" </dev/null)
+  init_status=$?
+  set -e
+  if (( init_status != 0 )) || [[ $init_output != "$container_id" ]]; then
+    printf 'init_status=%s init_output=%q\n' "$init_status" "$init_output" >&2
+    printf 'error: bounded init did not return the exact stopped container identity\n' >&2
+    exit 1
+  fi
+
   podman_probe container inspect "$container_id" > "$PROBE_CONTAINER_JSON"
   container_size=$(/usr/bin/stat -Lc %s "$PROBE_CONTAINER_JSON")
   if (( container_size == 0 || container_size > 1048576 )) ||
@@ -152,6 +173,48 @@ run_user_probe() {
   fi
   if /usr/bin/grep -Fq "$PROBE_USER" "$PROBE_CONTAINER_JSON"; then
     printf 'error: stopped container inspection contains the host account name\n' >&2
+    exit 1
+  fi
+
+  mapfile -d '' matching_specs < <(
+    /usr/bin/find "$PROBE_GRAPHROOT" "$PROBE_RUNROOT" -type f \
+      -path "*/$container_id/userdata/config.json" -print0 2>/dev/null
+  )
+  if [[ ${#matching_specs[@]} -ne 1 ]]; then
+    printf 'spec_count=%s\n' "${#matching_specs[@]}" >&2
+    printf 'error: exact generated OCI specification was not uniquely available before start\n' >&2
+    exit 1
+  fi
+  spec_path=${matching_specs[0]}
+  spec_size=$(/usr/bin/stat -Lc %s "$spec_path")
+  if (( spec_size == 0 || spec_size > 1048576 )) ||
+    ! /usr/bin/jq -e '
+      .process.user.uid == 1000 and
+      .process.user.gid == 1000 and
+      .process.noNewPrivileges == true and
+      .process.capabilities.bounding == [] and
+      .process.capabilities.effective == [] and
+      .process.capabilities.inheritable == [] and
+      .process.capabilities.permitted == [] and
+      .process.capabilities.ambient == [] and
+      ([.mounts[] | select(.destination == "/etc/passwd" or .destination == "/etc/group")] | length) == 0 and
+      .linux.seccomp != null
+    ' "$spec_path" >/dev/null; then
+    printf 'error: generated OCI spec weakened identity, capabilities, seccomp, or account-file ownership\n' >&2
+    exit 1
+  fi
+  apparmor_profile=$(/usr/bin/jq -r '.process.apparmorProfile // ""' "$spec_path")
+  if [[ -z $apparmor_profile || $apparmor_profile == unconfined ]] ||
+    [[ ! $apparmor_profile =~ ^containers-default-[0-9]+([.][0-9]+){2}$ ]]; then
+    printf 'apparmor_profile=%q\n' "$apparmor_profile" >&2
+    printf 'error: generated OCI spec lacks a bounded AppArmor profile\n' >&2
+    exit 1
+  fi
+
+  if /usr/bin/find "$PROBE_GRAPHROOT" "$PROBE_RUNROOT" -type f \
+    \( -path "*/$container_id/userdata/passwd" -o -path "*/$container_id/userdata/group" \) \
+    -print -quit 2>/dev/null | /usr/bin/grep -q .; then
+    printf 'error: Podman synthesized runtime passwd/group files\n' >&2
     exit 1
   fi
 
@@ -273,48 +336,6 @@ $PROBE_GROUP_SHA  /etc/group"
   if ! /usr/bin/jq -e 'length == 1 and .[0].State.Status == "stopped" and .[0].State.ExitCode == 0' \
     "$PROBE_CONTAINER_JSON" >/dev/null; then
     printf 'error: trusted account gate did not exit successfully\n' >&2
-    exit 1
-  fi
-
-  mapfile -d '' matching_specs < <(
-    /usr/bin/find "$PROBE_GRAPHROOT" "$PROBE_RUNROOT" -type f \
-      -path "*/$container_id/userdata/config.json" -print0 2>/dev/null
-  )
-  if [[ ${#matching_specs[@]} -ne 1 ]]; then
-    printf 'spec_count=%s\n' "${#matching_specs[@]}" >&2
-    printf 'error: exact generated OCI specification was not uniquely available\n' >&2
-    exit 1
-  fi
-  spec_path=${matching_specs[0]}
-  spec_size=$(/usr/bin/stat -Lc %s "$spec_path")
-  if (( spec_size == 0 || spec_size > 1048576 )) ||
-    ! /usr/bin/jq -e '
-      .process.user.uid == 1000 and
-      .process.user.gid == 1000 and
-      .process.noNewPrivileges == true and
-      .process.capabilities.bounding == [] and
-      .process.capabilities.effective == [] and
-      .process.capabilities.inheritable == [] and
-      .process.capabilities.permitted == [] and
-      .process.capabilities.ambient == [] and
-      ([.mounts[] | select(.destination == "/etc/passwd" or .destination == "/etc/group")] | length) == 0 and
-      .linux.seccomp != null
-    ' "$spec_path" >/dev/null; then
-    printf 'error: generated OCI spec weakened identity, capabilities, seccomp, or account-file ownership\n' >&2
-    exit 1
-  fi
-  apparmor_profile=$(/usr/bin/jq -r '.process.apparmorProfile // ""' "$spec_path")
-  if [[ -z $apparmor_profile || $apparmor_profile == unconfined ]] ||
-    [[ ! $apparmor_profile =~ ^containers-default-[0-9]+([.][0-9]+){2}$ ]]; then
-    printf 'apparmor_profile=%q\n' "$apparmor_profile" >&2
-    printf 'error: generated OCI spec lacks a bounded AppArmor profile\n' >&2
-    exit 1
-  fi
-
-  if /usr/bin/find "$PROBE_GRAPHROOT" "$PROBE_RUNROOT" -type f \
-    \( -path "*/$container_id/userdata/passwd" -o -path "*/$container_id/userdata/group" \) \
-    -print -quit 2>/dev/null | /usr/bin/grep -q .; then
-    printf 'error: Podman synthesized runtime passwd/group files\n' >&2
     exit 1
   fi
 
