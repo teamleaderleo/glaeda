@@ -222,6 +222,14 @@ run_user_probe() {
       ([.mounts[] | select(.destination == "/etc/passwd" or .destination == "/etc/group")] | length) == 0 and
       .linux.seccomp != null
     ' "$spec_path" >/dev/null; then
+    /usr/bin/jq -c '{
+      user: .process.user,
+      no_new_privileges: .process.noNewPrivileges,
+      capabilities: .process.capabilities,
+      account_mounts: [.mounts[] | select(.destination == "/etc/passwd" or .destination == "/etc/group") | .destination],
+      seccomp_present: (.linux.seccomp != null),
+      apparmor: (.process.apparmorProfile // "")
+    }' "$spec_path" >&2 || true
     printf 'error: generated OCI spec weakened identity, capabilities, seccomp, or account-file ownership\n' >&2
     exit 1
   fi
