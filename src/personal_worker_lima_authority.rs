@@ -24,6 +24,7 @@ use crate::personal_worker_store::PersonalWorkerStoreRevision;
 use crate::personal_worker_tick::{PersonalWorkerTickAction, PersonalWorkerTickPlan};
 
 pub const PERSONAL_WORKER_LIMA_AUTHORITY_SCHEMA_VERSION: u8 = 2;
+pub const PERSONAL_WORKER_LIMA_RECOVERY_SCHEMA_VERSION: u8 = 1;
 pub const MAX_PERSONAL_WORKER_LIMA_AUTHORITY_BYTES: usize = 16_384;
 const PERSONAL_WORKER_LIMA_AUTHORITY_DOCUMENT_TYPE: &str =
     "smolrunner.personal_worker_lima_authority";
@@ -167,6 +168,96 @@ pub struct PersonalWorkerLimaSettlement {
     successor_worker_digest: Sha256Digest,
     successor_store_revision: PersonalWorkerStoreRevision,
     successor_queue_generation: PersonalWorkerQueueGeneration,
+}
+
+/// The next evidence boundary for one validated durable Lima authority document.
+///
+/// These dispositions never authorize a Lima command or durable write. In particular, a started
+/// command is classified as uncertain rather than retryable, and a completed command checkpoint
+/// still requires fresh observation before any later phase may proceed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersonalWorkerLimaRecoveryDisposition {
+    Clean,
+    ReobserveBeforeFirstMutation,
+    ReobserveUncertainMutation,
+    ReobserveCheckpointedMutation,
+    Reverify,
+    SettleCompletedAttempt,
+    RecoverPreparedSettlement,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PersonalWorkerLimaRecoveryAttemptBinding {
+    generation: PersonalWorkerLimaAttemptGeneration,
+    store_revision: PersonalWorkerStoreRevision,
+    queue_generation: PersonalWorkerQueueGeneration,
+    action: PersonalWorkerLimaAction,
+    phase: PersonalWorkerLimaAttemptPhase,
+    checkpoint_at: EpochMillis,
+}
+
+impl PersonalWorkerLimaRecoveryAttemptBinding {
+    #[must_use]
+    pub const fn generation(&self) -> PersonalWorkerLimaAttemptGeneration {
+        self.generation
+    }
+
+    #[must_use]
+    pub const fn store_revision(&self) -> PersonalWorkerStoreRevision {
+        self.store_revision
+    }
+
+    #[must_use]
+    pub const fn queue_generation(&self) -> PersonalWorkerQueueGeneration {
+        self.queue_generation
+    }
+
+    #[must_use]
+    pub const fn action(&self) -> PersonalWorkerLimaAction {
+        self.action
+    }
+
+    #[must_use]
+    pub const fn phase(&self) -> PersonalWorkerLimaAttemptPhase {
+        self.phase
+    }
+
+    #[must_use]
+    pub const fn checkpoint_at(&self) -> EpochMillis {
+        self.checkpoint_at
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PersonalWorkerLimaRecoveryReport {
+    schema_version: u8,
+    authority_generation: PersonalWorkerLimaAuthorityGeneration,
+    disposition: PersonalWorkerLimaRecoveryDisposition,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attempt: Option<PersonalWorkerLimaRecoveryAttemptBinding>,
+}
+
+impl PersonalWorkerLimaRecoveryReport {
+    #[must_use]
+    pub const fn schema_version(&self) -> u8 {
+        self.schema_version
+    }
+
+    #[must_use]
+    pub const fn authority_generation(&self) -> PersonalWorkerLimaAuthorityGeneration {
+        self.authority_generation
+    }
+
+    #[must_use]
+    pub const fn disposition(&self) -> PersonalWorkerLimaRecoveryDisposition {
+        self.disposition
+    }
+
+    #[must_use]
+    pub const fn attempt(&self) -> Option<&PersonalWorkerLimaRecoveryAttemptBinding> {
+        self.attempt.as_ref()
+    }
 }
 
 impl PersonalWorkerLimaSettlement {
@@ -381,6 +472,55 @@ impl PersonalWorkerLimaAuthorityDocument {
     #[must_use]
     pub const fn settlement(&self) -> Option<&PersonalWorkerLimaSettlement> {
         self.settlement.as_ref()
+    }
+
+    /// Classify the next evidence boundary for this validated durable authority document.
+    ///
+    /// The returned report is descriptive only. It does not authorize command replay, phase
+    /// advancement, settlement, or any other mutation.
+    #[must_use]
+    pub fn recovery_report(&self) -> PersonalWorkerLimaRecoveryReport {
+        let disposition = if self.settlement.is_some() {
+            PersonalWorkerLimaRecoveryDisposition::RecoverPreparedSettlement
+        } else {
+            match self.attempt.as_ref().map(|attempt| attempt.phase) {
+                None => PersonalWorkerLimaRecoveryDisposition::Clean,
+                Some(PersonalWorkerLimaAttemptPhase::Prepared) => {
+                    PersonalWorkerLimaRecoveryDisposition::ReobserveBeforeFirstMutation
+                }
+                Some(
+                    PersonalWorkerLimaAttemptPhase::StopStarted
+                    | PersonalWorkerLimaAttemptPhase::EditStarted
+                    | PersonalWorkerLimaAttemptPhase::StartStarted,
+                ) => PersonalWorkerLimaRecoveryDisposition::ReobserveUncertainMutation,
+                Some(
+                    PersonalWorkerLimaAttemptPhase::StopCompleted
+                    | PersonalWorkerLimaAttemptPhase::EditCompleted
+                    | PersonalWorkerLimaAttemptPhase::StartCompleted,
+                ) => PersonalWorkerLimaRecoveryDisposition::ReobserveCheckpointedMutation,
+                Some(PersonalWorkerLimaAttemptPhase::VerifyStarted) => {
+                    PersonalWorkerLimaRecoveryDisposition::Reverify
+                }
+                Some(PersonalWorkerLimaAttemptPhase::Completed) => {
+                    PersonalWorkerLimaRecoveryDisposition::SettleCompletedAttempt
+                }
+            }
+        };
+        PersonalWorkerLimaRecoveryReport {
+            schema_version: PERSONAL_WORKER_LIMA_RECOVERY_SCHEMA_VERSION,
+            authority_generation: self.authority_generation,
+            disposition,
+            attempt: self.attempt.as_ref().map(|attempt| {
+                PersonalWorkerLimaRecoveryAttemptBinding {
+                    generation: attempt.generation,
+                    store_revision: attempt.store_revision,
+                    queue_generation: attempt.queue_generation,
+                    action: attempt.action,
+                    phase: attempt.phase,
+                    checkpoint_at: attempt.checkpoint_at,
+                }
+            }),
+        }
     }
 
     pub(crate) fn validate_successor_of(
