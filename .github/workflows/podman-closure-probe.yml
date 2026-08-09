@@ -9,6 +9,7 @@ on:
       - src/linux_dynamic_loader_config.rs
       - src/linux_dynamic_loader_cache.rs
       - src/linux_personal_worker_runtime_executable_prerequisite.rs
+      - src/linux_personal_worker_runtime_loader_state_prerequisite.rs
       - docs/PODMAN_EXECUTION_CLOSURE.md
       - docs/PODMAN_EXECUTION_CLOSURE_EVIDENCE.md
   workflow_dispatch:
