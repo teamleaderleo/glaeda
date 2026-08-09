@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::io;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use super::*;
 use crate::artifact::Sha256Digest;
@@ -172,11 +173,12 @@ enum ExecutorMode {
     IdentityMismatch,
     Failed,
     Oversized,
+    TimedOut,
 }
 
 struct ScriptedExecutor {
     mode: ExecutorMode,
-    calls: Mutex<Vec<CommandSpec>>,
+    calls: Mutex<Vec<(CommandSpec, Duration)>>,
 }
 
 impl ScriptedExecutor {
@@ -188,13 +190,48 @@ impl ScriptedExecutor {
     }
 
     fn calls(&self) -> Vec<CommandSpec> {
-        self.calls.lock().expect("calls lock").clone()
+        self.calls
+            .lock()
+            .expect("calls lock")
+            .iter()
+            .map(|(command, _)| command.clone())
+            .collect()
+    }
+
+    fn timeouts(&self) -> Vec<Duration> {
+        self.calls
+            .lock()
+            .expect("calls lock")
+            .iter()
+            .map(|(_, timeout)| *timeout)
+            .collect()
     }
 }
 
 impl CommandExecutor for ScriptedExecutor {
-    fn execute(&self, spec: &CommandSpec) -> io::Result<ExecutionRecord> {
-        self.calls.lock().expect("calls lock").push(spec.clone());
+    fn execute(&self, _spec: &CommandSpec) -> io::Result<ExecutionRecord> {
+        Err(io::Error::other(
+            "untimed Lima lifecycle mutation is forbidden",
+        ))
+    }
+}
+
+impl TimedCommandExecutor for ScriptedExecutor {
+    fn execute_with_timeout(
+        &self,
+        spec: &CommandSpec,
+        timeout: Duration,
+    ) -> io::Result<ExecutionRecord> {
+        self.calls
+            .lock()
+            .expect("calls lock")
+            .push((spec.clone(), timeout));
+        if self.mode == ExecutorMode::TimedOut {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "reviewed timeout elapsed",
+            ));
+        }
         let mut argv = spec.displayed_argv();
         if self.mode == ExecutorMode::IdentityMismatch {
             argv.push("unexpected".to_owned());
@@ -318,6 +355,7 @@ fn start_uses_one_fixed_command_and_verifies_running_identity() {
         calls[0].displayed_argv(),
         vec![LIMACTL, "start", "smolrunner"]
     );
+    assert_eq!(commands.timeouts(), vec![LIMA_LIFECYCLE_COMMAND_TIMEOUT]);
     assert_eq!(
         calls[0].environment.keys().cloned().collect::<Vec<_>>(),
         vec!["LANG", "LC_ALL", "LIMA_HOME"]
@@ -373,6 +411,7 @@ fn stop_is_separate_from_profile_edit_and_preserves_disk_identity() {
         commands.calls()[0].displayed_argv(),
         vec![LIMACTL, "stop", "smolrunner"]
     );
+    assert_eq!(commands.timeouts(), vec![LIMA_LIFECYCLE_COMMAND_TIMEOUT]);
 }
 
 #[test]
@@ -423,6 +462,13 @@ fn change_profile_edits_fixed_values_then_starts_and_verifies() {
     );
     let calls = commands.calls();
     assert_eq!(calls.len(), 2);
+    assert_eq!(
+        commands.timeouts(),
+        vec![
+            LIMA_LIFECYCLE_COMMAND_TIMEOUT,
+            LIMA_LIFECYCLE_COMMAND_TIMEOUT
+        ]
+    );
     assert_eq!(
         calls[0].displayed_argv(),
         vec![
@@ -638,18 +684,26 @@ fn command_identity_output_and_status_fail_closed() {
     });
     let request = request();
 
-    for (mode, expected) in [
+    for (mode, expected, evidence_count) in [
         (
             ExecutorMode::IdentityMismatch,
             LimaLifecycleExecutionRefusalCode::CommandIdentityMismatch,
+            1,
         ),
         (
             ExecutorMode::Failed,
             LimaLifecycleExecutionRefusalCode::CommandFailed,
+            1,
         ),
         (
             ExecutorMode::Oversized,
             LimaLifecycleExecutionRefusalCode::UnboundedOutput,
+            1,
+        ),
+        (
+            ExecutorMode::TimedOut,
+            LimaLifecycleExecutionRefusalCode::CommandFailed,
+            0,
         ),
     ] {
         let observations = ScriptedObservationSource::new(Vec::new());
@@ -663,7 +717,8 @@ fn command_identity_output_and_status_fail_closed() {
             )
             .expect_err("command refusal");
         assert_eq!(error.code, expected);
-        assert_eq!(error.private_evidence().commands().len(), 1);
+        assert_eq!(error.private_evidence().commands().len(), evidence_count);
+        assert_eq!(commands.timeouts(), vec![LIMA_LIFECYCLE_COMMAND_TIMEOUT]);
         let public = serde_json::to_string(&error).expect("public error JSON");
         assert!(!public.contains(PRIVATE_HOME));
         assert!(!public.contains(LIMACTL));

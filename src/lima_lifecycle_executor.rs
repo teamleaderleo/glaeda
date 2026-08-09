@@ -1,5 +1,6 @@
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 
 use serde::Serialize;
 
@@ -18,12 +19,13 @@ use crate::personal_worker_host_broker::{
     PERSONAL_WORKER_HOST_BROKER_SCHEMA_VERSION,
 };
 use crate::personal_worker_queue::{PersonalWorkerProfile, PersonalWorkerQueueGeneration};
-use crate::process::{CommandExecutor, CommandSpec, ExecutionRecord};
+use crate::process::{CommandExecutor, CommandSpec, ExecutionRecord, TimedCommandExecutor};
 
 pub const LIMA_LIFECYCLE_EXECUTOR_SCHEMA_VERSION: u8 = 1;
 pub const MAX_LIMA_LIFECYCLE_ACTION_AGE_MILLIS: u64 = 30_000;
 pub const MAX_LIMA_LIFECYCLE_EXECUTOR_OUTPUT_BYTES: usize = 65_536;
 
+const LIMA_LIFECYCLE_COMMAND_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const MAX_PRIVATE_PATH_BYTES: usize = 1_024;
 const REDACTED_EXECUTION_EVIDENCE: &str = "<private-lima-lifecycle-execution-evidence>";
 
@@ -376,7 +378,9 @@ impl LimaLifecycleExecutor {
     /// Execute one accepted broker lifecycle action and verify the exact resulting Lima state.
     ///
     /// This method accepts no generic resource values, shell command, queue decision, clock policy,
-    /// GitHub authority, runner registration, cache mutation, or arbitrary environment.
+    /// GitHub authority, runner registration, cache mutation, arbitrary environment, or
+    /// caller-selected command timeout. Each lifecycle mutation receives the same fixed five-minute
+    /// wall-clock deadline through the reviewed timed executor boundary.
     ///
     /// # Errors
     ///
@@ -391,7 +395,7 @@ impl LimaLifecycleExecutor {
     ) -> Result<LimaLifecycleExecution, LimaLifecycleExecutionFailure>
     where
         O: LimaLifecycleObservationSource,
-        E: CommandExecutor,
+        E: TimedCommandExecutor,
         C: LimaObservationClock,
     {
         let mut evidence = LimaLifecycleExecutionPrivateEvidence::default();
@@ -424,7 +428,7 @@ impl LimaLifecycleExecutor {
     ) -> Result<(LimaLifecycleExecutionReceipt, LimaInstanceObservationReport), ExecutionProblem>
     where
         O: LimaLifecycleObservationSource,
-        E: CommandExecutor,
+        E: TimedCommandExecutor,
         C: LimaObservationClock,
     {
         let execution_unix_seconds = clock.unix_seconds().map_err(|_| {
@@ -667,15 +671,17 @@ impl LimaLifecycleExecutor {
         command: CommandSpec,
     ) -> Result<(), ExecutionProblem>
     where
-        E: CommandExecutor,
+        E: TimedCommandExecutor,
     {
-        let record = executor.execute(&command).map_err(|_| {
-            ExecutionProblem::new(
-                LimaLifecycleExecutionRefusalCode::CommandFailed,
-                phase,
-                "the reviewed Lima lifecycle command could not be executed",
-            )
-        })?;
+        let record = executor
+            .execute_with_timeout(&command, LIMA_LIFECYCLE_COMMAND_TIMEOUT)
+            .map_err(|_| {
+                ExecutionProblem::new(
+                    LimaLifecycleExecutionRefusalCode::CommandFailed,
+                    phase,
+                    "the reviewed Lima lifecycle command could not be executed",
+                )
+            })?;
         evidence.commands.push(LimaLifecyclePrivateCommandEvidence {
             phase,
             record: record.clone(),
