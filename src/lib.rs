@@ -64,6 +64,9 @@ pub mod lima_lifecycle;
 pub mod lima_lifecycle_executor;
 /// Read-only, bounded exact observation of one Lima instance and running guest.
 pub mod lima_observation;
+/// Pure bounded ELF64 dependency parsing for the Linux runtime closure.
+#[cfg(target_os = "linux")]
+pub mod linux_elf_runtime_dependency;
 /// Read-only, fail-closed lookup of persisted project installations.
 #[cfg(target_os = "linux")]
 pub mod linux_installation_catalog;

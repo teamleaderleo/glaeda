@@ -18,6 +18,23 @@ secret is passed to the probe. Probe cleanup deletes only the exact disposable u
 mount, and temporary root that it creates. It does not contact or mutate the personal Mac/Lima
 worker.
 
+### ELF dependency parser evidence
+
+- Parser implementation commit: `eb602552ca483dc62595f135c7238a30a6fc7e32`
+- Workflow run: [31327938385](https://github.com/teamleaderleo/smolrunner/actions/runs/31327938385)
+- ARM64 job: [93281301455](https://github.com/teamleaderleo/smolrunner/actions/runs/31327938385/job/93281301455)
+- x86_64 job: [93281301434](https://github.com/teamleaderleo/smolrunner/actions/runs/31327938385/job/93281301434)
+- Date: 2026-08-09
+- Result: both jobs parsed every admitted top-level executable from the exact package baseline
+  below.
+
+The pure parser accepted the fixed GNU interpreter, exact ordered `DT_NEEDED` basenames, and either
+default search or Noble systemd's exact architecture-specific private runpath for `/usr/bin/systemctl`
+and `/usr/bin/systemd-run`. It rejects `RPATH`, every other `RUNPATH`, loader audit/filter/config
+authority, path-bearing dependencies, executable stacks, writable-executable load segments, and
+ambiguous runtime mappings. This proves compatibility of the parser with those package bytes only;
+it is not path, package, loader, library, configuration, cache, or transitive dependency evidence.
+
 ## Package baseline
 
 Both architectures reported the same Ubuntu Noble package versions:
@@ -97,6 +114,10 @@ Earlier disposable runs were intentionally allowed to fail and corrected these f
 - When a transient unit's main is deliberately killed by SIGKILL, packaged
   `systemd-run --wait --collect --pipe` returns status 255 rather than the shell-style status 137;
   the journal/service result must remain the authoritative crash classification.
+- Noble's packaged `systemctl` and `systemd-run` select the architecture-specific private systemd
+  library directory with `DT_RUNPATH`; rejecting every runpath makes the reviewed command graph
+  unusable. The parser now represents only that exact runpath as typed unresolved policy, leaving
+  later descriptor-bound directory and library proof mandatory.
 
 These are contract changes, not compatibility relaxations: each ambient or mutable edge is now
 either made exact or remains blocking.
