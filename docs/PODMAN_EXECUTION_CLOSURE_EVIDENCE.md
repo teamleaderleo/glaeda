@@ -73,6 +73,27 @@ compatibility with those live cache bytes only. It does not open or revalidate t
 owner or package, enumerate or open search directories or libraries, resolve a dependency,
 construct evidence, or seal runtime readiness.
 
+### Top-level executable prerequisite evidence
+
+- Observer implementation commit: `7f903fa84912ccec5ea21579201c99900947f83a`
+- Workflow run: [31333397603](https://github.com/teamleaderleo/smolrunner/actions/runs/31333397603)
+- ARM64 job: [93295096762](https://github.com/teamleaderleo/smolrunner/actions/runs/31333397603/job/93295096762)
+- x86_64 job: [93295096748](https://github.com/teamleaderleo/smolrunner/actions/runs/31333397603/job/93295096748)
+- Date: 2026-08-09
+- Result: both jobs descriptor-opened, parsed, and revalidated all eleven fixed top-level
+  executable prerequisites from the exact Noble package baseline below.
+
+The observer requires protected root-owned directory chains and exact root/group, mode, regular
+file, single-link, per-file, and aggregate byte policy before parsing held inodes. It double-reads
+the bounded bytes, binds the path-specific ELF/search semantics, and revalidates held descriptors,
+bytes, pathname entries, and every directory chain around the complete observation. The fixture
+also proves refusal of hardlinks, symlinks, writable mode, wrong architecture before filesystem
+access, and mid-observation metadata drift. Catatonit is the one exact static executable; every
+other admitted top-level executable is dynamic, and only systemctl/systemd-run use the reviewed
+systemd-private runpath. This is an opaque current prerequisite only. It does not resolve or open
+the interpreter or any transitive library, inspect loader configuration/cache ownership, prove
+package identity, construct classes 8–18, execute a command, or seal runtime readiness.
+
 ## Package baseline
 
 Both architectures reported the same Ubuntu Noble package versions:
@@ -165,6 +186,9 @@ Earlier disposable runs were intentionally allowed to fail and corrected these f
   exact x86-64 entries. The admitted 64-bit loader ignores the generic cache ID; the parser must
   still validate those entries and the complete cache ordering while withholding them from future
   compatible-library resolution. Unknown cache IDs remain fail-closed.
+- Noble catatonit is a static ELF with no interpreter, dynamic search policy, or `DT_NEEDED`
+  dependency. Treating all eleven fixed top-level executables as dynamic makes the prerequisite
+  unusable; the exception is exact to catatonit, while the other ten remain dynamic.
 
 These are contract changes, not compatibility relaxations: each ambient or mutable edge is now
 either made exact or remains blocking.
