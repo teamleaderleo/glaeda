@@ -5,10 +5,10 @@ backend and does not authorize a physical Lima or host mutation.
 
 ## Exact evidence
 
-- Fixture commit: `a3381f37bd24c82d8542d88a64e762f7c6b67068`
-- Workflow run: [31310912737](https://github.com/teamleaderleo/smolrunner/actions/runs/31310912737)
-- ARM64 job: [93238494231](https://github.com/teamleaderleo/smolrunner/actions/runs/31310912737/job/93238494231)
-- x86_64 job: [93238494193](https://github.com/teamleaderleo/smolrunner/actions/runs/31310912737/job/93238494193)
+- Fixture commit: `9fd0908316061383531133df2c7e043436122283`
+- Workflow run: [31311454193](https://github.com/teamleaderleo/smolrunner/actions/runs/31311454193)
+- ARM64 job: [93239791103](https://github.com/teamleaderleo/smolrunner/actions/runs/31311454193/job/93239791103)
+- x86_64 job: [93239791136](https://github.com/teamleaderleo/smolrunner/actions/runs/31311454193/job/93239791136)
 - Date: 2026-08-09
 - Result: both jobs passed on fresh GitHub-hosted Ubuntu 24.04 VMs.
 
@@ -45,17 +45,25 @@ The exact fixture proves only these facts on both admitted architectures:
 5. The stopped-container inspection preserves the exact image/container IDs, numeric user,
    entrypoint, workdir, no-network/read-only/unprivileged state, PID and memory limits, and bounded
    attempt-private log configuration. It contains no host account name.
-6. Detached `podman start <exact-id>` returns the exact ID. Bounded exact-ID inspection polling
+6. A transient systemd service with `Delegate=yes` exposes CPU, memory, and PID controllers on both
+   architectures. The fixture creates sibling supervisor and payload groups, moves the launcher to
+   the supervisor, enables and rereads those required controllers, and rereads exact outer limits of
+   75% CPU, 96 MiB memory, zero swap, and 64 tasks. It precreates the payload parent with 50% CPU,
+   64 MiB memory, zero swap, and 32 PIDs before Podman runs. Stopped inspect preserves that exact parent
+   and the requested container limits; the generated OCI spec carries the exact Podman leaf below
+   that parent and one pathless private cgroup namespace. The live leaf exposes the same exact limits.
+7. Detached `podman start <exact-id>` returns the exact ID. Bounded exact-ID inspection polling
    reaches one stopped exit with code zero, and bounded `podman logs` returns only the expected
    SHA-256 results for the image-owned account files. The single-link log remains runner-owned,
    non-group/world-writable, nonempty, and below its one-MiB ceiling.
-7. Exact container and image removal succeeds. The two precreated network lock inodes remain the only
-   network-directory entries, no process for the disposable UID remains, and no mount remains below
-   the attempt root.
+8. Exact container and image removal succeeds. Podman removes its leaf, the payload parent reports
+   no process and `populated 0`, and systemd collection removes the entire exact service cgroup. The
+   two precreated network lock inodes remain the only network-directory entries, no process for the
+   disposable UID remains, and no mount remains below the attempt root.
 
-The successful marker was
-`offline_image=exact stopped_create=closed account_files=image-owned apparmor=rootless-unavailable`,
-followed by `podman_container_closure_probe=pass`.
+The successful marker included `offline_image=exact`, `stopped_create=closed`,
+`account_files=image-owned`, `cgroup=bounded`, and `apparmor=rootless-unavailable`, followed by
+`podman_container_closure_probe=pass`.
 
 ## Corrections learned from fail-closed probes
 
@@ -80,6 +88,10 @@ Earlier disposable runs were intentionally allowed to fail and corrected these a
   [31310381494](https://github.com/teamleaderleo/smolrunner/actions/runs/31310381494) confirmed the
   packaged behavior on both architectures. The initial backend makes no AppArmor claim; a future
   outer-service profile requires a separate root-installed and inherited-policy proof.
+- Noble stopped-container inspect preserves the cgroup parent and resource values but reports no
+  `CgroupnsMode`; the generated OCI spec is the effective private-cgroup-namespace evidence.
+- cgroup-v2 controller pseudo-files are entries below every cgroup. Emptiness checks must count only
+  child cgroup directories and separately require an empty `cgroup.procs` plus `populated 0`.
 
 These are contract corrections, not compatibility relaxations. The trusted fixture remains unable
 to authorize hostile repository code until every blocking boundary below is independently closed.
@@ -94,8 +106,8 @@ This fixture does **not** prove any of the following and must not be cited as if
   outer-service AppArmor confinement;
 - descriptor-bound exact Git-tree materialization, read-only source mounting, bounded target tmpfs,
   verified dependency inputs, Cargo/test command expansion, or cache non-authority;
-- the final delegated outer/payload cgroup hierarchy, exact aggregate and child CPU/memory/swap/PID
-  controls, control rereads, tmpfs charging, group-empty cleanup, or pause-process/PID-file recovery;
+- authoritative descriptor/handle retention for the delegated cgroups, aggregate tmpfs charging,
+  hostile cgroup kill, crash recovery, or pause-process/PID-file recovery;
 - hostile payload behavior, timeout, cancellation, output overflow, descendant escape attempts,
   network syscall denial, mount/device/host-file closure, or log-ceiling failure classification;
 - durable attempt journaling, crash recovery, final reservation/deadline recheck, ownership

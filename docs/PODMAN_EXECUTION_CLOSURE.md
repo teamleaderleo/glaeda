@@ -481,8 +481,9 @@ temporary fixture, and each test proves the marker remains absent.
 - Prove the packaged pre-exec indicator/compiled hook paths and rootless pause re-exec/fallback paths;
   verify that the exact absent user-bus socket prevents a systemd move without delaying or failing
   Podman, and that crash recovery leaves no pause process or PID file.
-- Prove `cgroupfs` can use the pre-created delegated outer/child cgroups without Podman/systemd
-  creating an unowned sibling scope.
+- Extend the proven `cgroupfs` pre-created outer/payload hierarchy from trusted clean exit to
+  authoritative handle retention, hostile group kill, crash recovery, and aggregate target-tmpfs
+  charging without Podman/systemd creating an unowned sibling scope.
 - Specify and test the exact closed Git tree materializer, including the bound Git/loader closure,
   empty protocol/environment, unsafe repository-state refusal, object-ID recomputation,
   symlink/mode/path bounds, fsync publication, live-checkout replacement, and cleanup recovery.
