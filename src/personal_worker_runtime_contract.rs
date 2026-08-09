@@ -521,21 +521,37 @@ fn hash_field(hasher: &mut Sha256, value: &[u8]) {
 }
 
 const fn policy_tags(policy: PersonalWorkerRuntimePolicy) -> [u8; 14] {
+    let PersonalWorkerRuntimePolicy {
+        image,
+        filesystem,
+        writable_target,
+        dependency_cache,
+        temporary_filesystems,
+        network,
+        credentials,
+        environment,
+        privilege,
+        namespaces,
+        execution_group,
+        detached_processes,
+        output,
+        deadline,
+    } = policy;
     [
-        policy.image as u8,
-        policy.filesystem as u8,
-        policy.writable_target as u8,
-        policy.dependency_cache as u8,
-        policy.temporary_filesystems as u8,
-        policy.network as u8,
-        policy.credentials as u8,
-        policy.environment as u8,
-        policy.privilege as u8,
-        policy.namespaces as u8,
-        policy.execution_group as u8,
-        policy.detached_processes as u8,
-        policy.output as u8,
-        policy.deadline as u8,
+        image as u8,
+        filesystem as u8,
+        writable_target as u8,
+        dependency_cache as u8,
+        temporary_filesystems as u8,
+        network as u8,
+        credentials as u8,
+        environment as u8,
+        privilege as u8,
+        namespaces as u8,
+        execution_group as u8,
+        detached_processes as u8,
+        output as u8,
+        deadline as u8,
     ]
 }
 
