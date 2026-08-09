@@ -967,7 +967,7 @@ printf '%s\n' \
   'done' \
   '/bin/busybox dd if=/dev/zero of=/target/fill bs=1048576 count=16 conv=notrunc' \
   'while :; do' \
-  '  printf "smolrunner-hostile-output-0123456789abcdef\\n"' \
+  '  printf "smolrunner-hostile-output-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\\n"' \
   'done &' \
   'index=0' \
   'while [ "$index" -lt 64 ]; do' \
