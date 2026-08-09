@@ -1,14 +1,14 @@
 # Ubuntu 24.04 Podman container-fixture evidence
 
-Status: partial R02 trusted-fixture evidence only. This is not a hostile-repository execution
-backend and does not authorize a physical Lima or host mutation.
+Status: partial R02/R03 disposable-fixture evidence only. This is not a hostile-repository
+execution backend and does not authorize a physical Lima or host mutation.
 
 ## Exact evidence
 
-- Fixture commit: `9fd0908316061383531133df2c7e043436122283`
-- Workflow run: [31311454193](https://github.com/teamleaderleo/smolrunner/actions/runs/31311454193)
-- ARM64 job: [93239791103](https://github.com/teamleaderleo/smolrunner/actions/runs/31311454193/job/93239791103)
-- x86_64 job: [93239791136](https://github.com/teamleaderleo/smolrunner/actions/runs/31311454193/job/93239791136)
+- Fixture commit: `ae305d6636a9e7ae318269d58f4ead38dc6b88a6`
+- Workflow run: [31312378954](https://github.com/teamleaderleo/smolrunner/actions/runs/31312378954)
+- ARM64 job: [93242034326](https://github.com/teamleaderleo/smolrunner/actions/runs/31312378954/job/93242034326)
+- x86_64 job: [93242034293](https://github.com/teamleaderleo/smolrunner/actions/runs/31312378954/job/93242034293)
 - Date: 2026-08-09
 - Result: both jobs passed on fresh GitHub-hosted Ubuntu 24.04 VMs.
 
@@ -56,12 +56,24 @@ The exact fixture proves only these facts on both admitted architectures:
    reaches one stopped exit with code zero, and bounded `podman logs` returns only the expected
    SHA-256 results for the image-owned account files. The single-link log remains runner-owned,
    non-group/world-writable, nonempty, and below its one-MiB ceiling.
-8. Exact container and image removal succeeds. Podman removes its leaf, the payload parent reports
-   no process and `populated 0`, and systemd collection removes the entire exact service cgroup. The
-   two precreated network lock inodes remain the only network-directory entries, no process for the
-   disposable UID remains, and no mount remains below the attempt root.
+8. Root creates one attempt-private executable tmpfs with exact 8-MiB and 64-inode ceilings, runner
+   ownership and mode `0700`, `nosuid`, and `nodev`. The unprivileged phase rereads those exact facts
+   and an empty root before Podman. The hostile stopped OCI spec binds that exact source read-write at
+   `/target` below the exact payload leaf.
+9. A fixed image-owned hostile payload exhausts both target ceilings, increments the exact leaf's
+   `pids.events max`, raises that leaf's `memory.current` at least 7 MiB above its pre-start baseline,
+   and grows only its bounded private log past the 64-KiB abort threshold. The fixture opens the exact
+   leaf's `cgroup.kill` before start, writes the kill only after every pressure signal, observes
+   `populated 0`, and then requires one nonzero stopped result. Exact removal deletes the leaf; the
+   final single-link runner-owned log remains non-group/world-writable and below one MiB.
+10. Exact trusted and hostile container removal succeeds, followed by exact image removal. The
+    payload parent reports no process and `populated 0`; systemd collection removes the entire exact
+    service cgroup; root unmounts the exact target; the two precreated network lock inodes remain the
+    only network-directory entries; no process for the disposable UID or mount below the attempt
+    root remains.
 
-The successful marker included `offline_image=exact`, `stopped_create=closed`,
+The successful markers included `hostile_abort=cgroup-kill`,
+`target_tmpfs=byte-and-inode-bounded`, `offline_image=exact`, `stopped_create=closed`,
 `account_files=image-owned`, `cgroup=bounded`, and `apparmor=rootless-unavailable`, followed by
 `podman_container_closure_probe=pass`.
 
@@ -92,6 +104,9 @@ Earlier disposable runs were intentionally allowed to fail and corrected these a
   `CgroupnsMode`; the generated OCI spec is the effective private-cgroup-namespace evidence.
 - cgroup-v2 controller pseudo-files are entries below every cgroup. Emptiness checks must count only
   child cgroup directories and separately require an empty `cgroup.procs` plus `populated 0`.
+- PID exhaustion must happen after starting the fixed output producer; otherwise the shell cannot
+  create the producer it is meant to bound. The 64-KiB abort threshold remains fixed, while its
+  bounded ARM64 observation window is twenty seconds.
 
 These are contract corrections, not compatibility relaxations. The trusted fixture remains unable
 to authorize hostile repository code until every blocking boundary below is independently closed.
@@ -104,12 +119,14 @@ This fixture does **not** prove any of the following and must not be cited as if
   reviewed in-image gate;
 - selection and installation of the production seccomp policy, syscall-denial behavior, or any
   outer-service AppArmor confinement;
-- descriptor-bound exact Git-tree materialization, read-only source mounting, bounded target tmpfs,
-  verified dependency inputs, Cargo/test command expansion, or cache non-authority;
-- authoritative descriptor/handle retention for the delegated cgroups, aggregate tmpfs charging,
-  hostile cgroup kill, crash recovery, or pause-process/PID-file recovery;
-- hostile payload behavior, timeout, cancellation, output overflow, descendant escape attempts,
-  network syscall denial, mount/device/host-file closure, or log-ceiling failure classification;
+- descriptor-bound exact Git-tree materialization, read-only source mounting, the production direct
+  mount API and held mount identity, verified dependency inputs, Cargo/test command expansion, or
+  cache non-authority;
+- production sealed cgroup-handle authority, whole-attempt kill across Podman/conmon/pause processes,
+  crash recovery, or pause-process/PID-file recovery;
+- production timeout, cancellation, output-overflow and cleanup-incomplete classification; memory
+  limit/OOM behavior; descendant escape attempts; network syscall denial; or complete mount/device/
+  host-file closure;
 - durable attempt journaling, crash recovery, final reservation/deadline recheck, ownership
   persistence, or ambiguous-cleanup handling;
 - the Rust R01 readiness object, R02 hostile-payload executor, R03 public receipt, B06 service, B07

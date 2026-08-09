@@ -462,13 +462,12 @@ temporary fixture, and each test proves the marker remains absent.
   storage on the packaged build; treat all as reachable until the fixture proves otherwise.
 - Confirm native rootless overlay works on the admitted Lima kernel with no `mount_program`; a
   failure blocks rather than selecting fuse-overlayfs automatically.
-- Confirm the steward can create and safely expose the protected target tmpfs with exact `size` and
-  `nr_inodes` ceilings, Podman preserves that bind without remount weakening, the immutable gate can
-  reread both limits before Cargo, and writes plus bounded `/tmp`/`/dev/shm` allocations are charged
-  inside the applied aggregate memory/swap limit. Podman 4.9.3 does not admit `nr_inodes` on its own
-  `--tmpfs` parser, so that CLI surface is not an alternative. If the fixture cannot enforce and
-  expose both hard ceilings, R01 stays blocked pending a quota-backed disposable filesystem; a
-  free-space preflight is not sufficient.
+- Extend the disposable proof that a root-created 8-MiB/64-inode target tmpfs stays executable,
+  `nosuid`/`nodev`, exact-bound into the stopped OCI spec, leaf-memory-charged, and hard-exhaustible.
+  Production still needs the direct mount API, authoritative mount/filesystem handles, immutable
+  in-container gate rereads before Cargo, bounded `/tmp`/`/dev/shm` aggregate charging, and crash-safe
+  unmount recovery. Podman 4.9.3 does not admit `nr_inodes` on its own `--tmpfs` parser, so that CLI
+  surface is not an alternative.
 - Confirm that `--network=none` plus the fixed hosts/resolver/hostname/timezone policy copies no host
   content; Podman 4.9.3 rejects the otherwise tempting `--dns=none` combination.
 - Select the exact root-owned seccomp profile and prove it is effective for a rootless cgroup-v2
@@ -481,9 +480,10 @@ temporary fixture, and each test proves the marker remains absent.
 - Prove the packaged pre-exec indicator/compiled hook paths and rootless pause re-exec/fallback paths;
   verify that the exact absent user-bus socket prevents a systemd move without delaying or failing
   Podman, and that crash recovery leaves no pause process or PID file.
-- Extend the proven `cgroupfs` pre-created outer/payload hierarchy from trusted clean exit to
-  authoritative handle retention, hostile group kill, crash recovery, and aggregate target-tmpfs
-  charging without Podman/systemd creating an unowned sibling scope.
+- Extend the proven `cgroupfs` pre-created outer/payload hierarchy and disposable shell-held
+  leaf-`cgroup.kill` abort into sealed authoritative handle retention, whole-attempt hostile kill,
+  crash recovery, and cleanup classification without Podman/systemd creating an unowned sibling
+  scope.
 - Specify and test the exact closed Git tree materializer, including the bound Git/loader closure,
   empty protocol/environment, unsafe repository-state refusal, object-ID recomputation,
   symlink/mode/path bounds, fsync publication, live-checkout replacement, and cleanup recovery.
