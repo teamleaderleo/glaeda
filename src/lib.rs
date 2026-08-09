@@ -118,6 +118,8 @@ pub mod personal_worker_queue;
 pub mod personal_worker_read_model;
 /// Read-only official-runner readiness composed with exact personal-worker evidence.
 pub mod personal_worker_runner_readiness;
+/// Pure sealed authority for the exact personal-worker Linux verification-runtime closure.
+pub mod personal_worker_runtime_contract;
 pub mod personal_worker_store;
 pub mod personal_worker_store_transaction;
 /// Pure, one-action personal-worker planning over accepted queue and host evidence.
