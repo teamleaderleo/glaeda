@@ -829,6 +829,55 @@ fn exhausted_authority_generation_refuses_without_reusing_a_generation() {
 }
 
 #[test]
+fn strict_decode_binds_each_phase_to_its_exact_durable_generation_delta() {
+    let authority = enrolled();
+    let before_mac = mac_observation_profile(true, 200_000, LimaResourceProfile::Interactive);
+    let before = lifecycle_profile(
+        LimaLifecycleState::Running,
+        LimaResourceProfile::Interactive,
+        204_000,
+    );
+    let tick = worker_tick(&before);
+    let prepared = authority
+        .begin_attempt(PersonalWorkerLimaAttemptInput {
+            config: &config(),
+            mac: &before_mac,
+            request: &request(LIMA_HOME, CACHE_PATH),
+            lifecycle: &before,
+            tick: &tick,
+        })
+        .expect("prepared attempt");
+    let canonical = String::from_utf8(
+        encode_personal_worker_lima_authority(&prepared).expect("canonical prepared authority"),
+    )
+    .expect("UTF-8 JSON");
+
+    let forged_phase = canonical
+        .replacen("\"phase\":\"prepared\"", "\"phase\":\"stop_completed\"", 1)
+        .into_bytes();
+    assert_eq!(
+        decode_personal_worker_lima_authority(&forged_phase)
+            .expect_err("phase cannot advance without its durable generations")
+            .kind,
+        PersonalWorkerLimaAuthorityErrorKind::CorruptDocument
+    );
+
+    let forged_generation = canonical
+        .replacen(
+            "\"authority_generation\":2",
+            "\"authority_generation\":999",
+            1,
+        )
+        .into_bytes();
+    assert_eq!(
+        decode_personal_worker_lima_authority(&forged_generation)
+            .expect_err("prepared must be exactly one generation after its attempt")
+            .kind,
+        PersonalWorkerLimaAuthorityErrorKind::CorruptDocument
+    );
+}
+
+#[test]
 fn unknown_version_unknown_fields_and_noncanonical_bytes_fail_closed() {
     let bytes = encode_personal_worker_lima_authority(&enrolled()).expect("encode");
     let mut value: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON");

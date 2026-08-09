@@ -1220,7 +1220,7 @@ fn validate_document_shape(
             _ => attempt.completed_at.is_none(),
         };
         if attempt.identity != document.identity
-            || attempt.generation.get() >= document.authority_generation.get()
+            || !authority_generation_matches_attempt(document.authority_generation, attempt)
             || attempt.checkpoint_at < attempt.decision_at
             || !completed_shape
             || attempt.before_resources
@@ -1238,6 +1238,67 @@ fn validate_document_shape(
         }
     }
     Ok(())
+}
+
+fn authority_generation_matches_attempt(
+    authority_generation: PersonalWorkerLimaAuthorityGeneration,
+    attempt: &PersonalWorkerLimaAttempt,
+) -> bool {
+    let delta = match (attempt.action, attempt.phase) {
+        (PersonalWorkerLimaAction::StopToStopped, PersonalWorkerLimaAttemptPhase::Prepared) => 1,
+        (PersonalWorkerLimaAction::StopToStopped, PersonalWorkerLimaAttemptPhase::StopStarted) => 2,
+        (
+            PersonalWorkerLimaAction::StopToStopped,
+            PersonalWorkerLimaAttemptPhase::StopCompleted,
+        ) => 3,
+        (
+            PersonalWorkerLimaAction::StopToStopped,
+            PersonalWorkerLimaAttemptPhase::VerifyStarted,
+        ) => 4,
+        (PersonalWorkerLimaAction::StopToStopped, PersonalWorkerLimaAttemptPhase::Completed) => 5,
+        (
+            PersonalWorkerLimaAction::StopToInteractive | PersonalWorkerLimaAction::StopToWork,
+            PersonalWorkerLimaAttemptPhase::Prepared,
+        ) => 1,
+        (
+            PersonalWorkerLimaAction::StopToInteractive | PersonalWorkerLimaAction::StopToWork,
+            PersonalWorkerLimaAttemptPhase::StopStarted,
+        ) => 2,
+        (
+            PersonalWorkerLimaAction::StopToInteractive | PersonalWorkerLimaAction::StopToWork,
+            PersonalWorkerLimaAttemptPhase::StopCompleted,
+        ) => 3,
+        (
+            PersonalWorkerLimaAction::StopToInteractive | PersonalWorkerLimaAction::StopToWork,
+            PersonalWorkerLimaAttemptPhase::EditStarted,
+        ) => 4,
+        (
+            PersonalWorkerLimaAction::StopToInteractive | PersonalWorkerLimaAction::StopToWork,
+            PersonalWorkerLimaAttemptPhase::EditCompleted,
+        ) => 5,
+        (
+            PersonalWorkerLimaAction::StopToInteractive | PersonalWorkerLimaAction::StopToWork,
+            PersonalWorkerLimaAttemptPhase::StartStarted,
+        ) => 6,
+        (
+            PersonalWorkerLimaAction::StopToInteractive | PersonalWorkerLimaAction::StopToWork,
+            PersonalWorkerLimaAttemptPhase::StartCompleted,
+        ) => 7,
+        (
+            PersonalWorkerLimaAction::StopToInteractive | PersonalWorkerLimaAction::StopToWork,
+            PersonalWorkerLimaAttemptPhase::VerifyStarted,
+        ) => 8,
+        (
+            PersonalWorkerLimaAction::StopToInteractive | PersonalWorkerLimaAction::StopToWork,
+            PersonalWorkerLimaAttemptPhase::Completed,
+        ) => 9,
+        _ => return false,
+    };
+    attempt
+        .generation
+        .get()
+        .checked_add(delta)
+        .is_some_and(|expected| expected == authority_generation.get())
 }
 
 fn valid_attempt_endpoints(attempt: &PersonalWorkerLimaAttempt) -> bool {
