@@ -251,21 +251,10 @@ def run(arguments):
         check=False,
     )
 
-unsafe = run(["/usr/bin/git", f"--git-dir={synthetic}", "cat-file", "--batch"])
-if unsafe.returncode == 0 or b"dubious ownership" not in unsafe.stderr:
-    raise SystemExit("root-owned synthetic Git directory was not refused without safe.directory")
-
-safe = run([
-    "/usr/bin/git",
-    "-c",
-    f"safe.directory={synthetic}",
-    f"--git-dir={synthetic}",
-    "cat-file",
-    "--batch",
-])
-if safe.returncode != 0:
-    raise SystemExit("exact command-scoped safe.directory did not admit the synthetic Git directory")
-header, payload = safe.stdout.split(b"\n", 1)
+explicit = run(["/usr/bin/git", f"--git-dir={synthetic}", "cat-file", "--batch"])
+if explicit.returncode != 0:
+    raise SystemExit("explicit root-owned synthetic Git directory was not admitted")
+header, payload = explicit.stdout.split(b"\n", 1)
 object_name, object_type, object_size = header.decode("ascii").split(" ")
 size = int(object_size)
 content = payload[:size]
@@ -275,18 +264,11 @@ digest = hashlib.sha1(b"tree " + str(size).encode("ascii") + b"\0" + content).he
 if digest != tree:
     raise SystemExit("materializer tree object digest mismatch")
 
-drift = run([
-    "/usr/bin/git",
-    "-c",
-    f"safe.directory={synthetic}",
-    f"--git-dir={other}",
-    "cat-file",
-    "--batch",
-])
-if drift.returncode == 0 or b"dubious ownership" not in drift.stderr:
-    raise SystemExit("safe.directory admitted a different synthetic Git path")
+other_explicit = run(["/usr/bin/git", f"--git-dir={other}", "cat-file", "--batch"])
+if other_explicit.returncode != 0:
+    raise SystemExit("Git unexpectedly enforced owner safety for another explicit bare directory")
 
-print("git_materializer=closed")
+print("git_materializer=closed explicit_owner_gate=smolrunner")
 PY
 
 /usr/bin/mount -t tmpfs \
