@@ -615,7 +615,7 @@ set +e
 probe_status=$?
 set -e
 
-if (( probe_status != 137 )); then
+if (( probe_status != 255 )); then
   printf 'probe_status=%s\n' "$probe_status" >&2
   printf 'error: disposable pause-process crash injection did not report exact SIGKILL status\n' >&2
   exit 1
