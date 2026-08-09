@@ -1,5 +1,7 @@
 # Leased execution and previews
 
+> **Deferred product track:** leased workspaces, previews, and the host-rootless-Podman backend are not on the current CI critical path. See [Disposable autoscaling CI](DISPOSABLE_AUTOSCALING_CI.md).
+
 ## Status
 
 This document records an exploratory product direction. It expands SmolRunner's existing runner-steward work without discarding it.

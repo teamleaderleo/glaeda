@@ -1,136 +1,88 @@
 # Roadmap
 
-SmolRunner should remain useful while it is still small. The roadmap favors a dependable CLI and explicit host state over a control-plane service or dashboard.
+SmolRunner's primary outcome is unattended, disposable GitHub Actions capacity on an operator-owned Mac. The governing boundary and acceptance criteria are in [Disposable autoscaling CI](DISPOSABLE_AUTOSCALING_CI.md).
 
-The runner-steward design remains the foundation. Later milestones may extend the same ownership, isolation, and planning model into leased workspaces, temporary previews, and a small pool of execution workers. GitHub Actions remains the first scheduler and workflow language.
+GitHub Actions remains the scheduler and workflow language. The first complete backend is one fresh Lima/VZ virtual machine and one just-in-time official runner per job. Rootless host containers, previews, deployment, and multi-host placement are not on the critical path.
 
-The long-term reliability and fleet direction is recorded in [the reliable control-loop operating model](OPERATING_MODEL.md). It keeps the public surface small while sequencing release channels, rollback, bounded incident evidence, backup and restore, fleet policy, and narrowly authorised self-repair.
+## Useful foundation already built
 
-## Milestone 0 — foundation
+- [x] Rust CLI with shared typed human/JSON reports.
+- [x] Canonical configuration, host observations, ownership classifications, and public error vocabulary.
+- [x] Bounded shell-free process execution with an empty explicit environment.
+- [x] Crash-safe durable stores, atomic journals, recovery classification, revisions, and queue generations.
+- [x] Typed personal-worker queue, admission, reservations, resource limits, cancellation, and terminal identities.
+- [x] Mac capacity observation and Lima observation/lifecycle authority.
+- [x] GitHub workflow-job mapping and snapshot reconciliation foundations.
+- [x] Extensive optional Linux/rootless-Podman R01 prerequisite and closure evidence.
 
-- [x] Rust CLI with human and JSON output.
-- [x] Host `doctor` checks for Linux, systemd, cgroup v2, Podman, and required commands.
-- [x] Threat model and non-goals.
-- [x] Continuous formatting, linting, and test verification.
+The R01 implementation is preserved, but no additional narrow OS/runtime proof slice is scheduled before the disposable VM path works end to end.
 
-## Milestone 1 — desired state
+## Milestone 1 — disposable-attempt reconciliation
 
-- [x] Versioned `smolrunner.yml` manifest.
-- [x] Typed host, runner, project, and resource-limit models.
-- [x] `smolrunner plan` that makes no changes.
-- [x] Typed current-host observations with present, absent, and unknown state.
-- [x] Shell-free command execution records with an empty child environment and explicit secret redaction.
-- [x] Typed execution lanes, precondition evidence, rollback classes, and partial-failure journals.
-- [x] ADR for privilege separation, adoption, token handling, and rollback semantics.
-- [x] Pure ownership identity and managed/adoptable/foreign/conflicting/unknown classification.
-- [x] ADR for `/var/lib/smolrunner`, marker identity, and name-safe adoption policy.
-- [x] Canonical locators, immutable evidence, observation lanes, and survival policy for each resource kind.
-- [ ] Atomic ownership persistence with crash recovery.
-- [x] Atomic execution-journal checkpoints with explicit interrupted states.
-- [x] Typed root and runner-user lane executors with sealed command and environment boundaries.
-- [ ] Integrate lane executors with durable reconciliation journals.
-- [ ] Debian and Ubuntu host preparation.
-  - [x] Conservative prerequisite package planning with exact distribution identity, package observations, rollback class, and reviewed `apt-get` argv.
-  - [x] Bounded package-state probing and host-plan CLI integration.
-  - [x] Classify successful, nonzero, refused, and uncertain package attempts with mandatory fresh-observation recovery barriers.
-  - [x] Dependency-aware runner account, subordinate-ID, home-directory, and linger preparation planning.
-  - [x] Bounded account/group/home/subordinate-ID/linger observation.
-  - [x] Runner account observation integration with read-only host plans.
-  - [x] Split non-mutating rootless Podman static preflight from journaled first-run smoke verification.
-  - [ ] Implement static rootless Podman prerequisites in `host plan` without invoking Podman.
-  - [ ] Journal first-run runner-user Podman initialization and smoke verification after durable host reconciliation exists.
-  - [ ] Reconcile non-overlapping subordinate UID/GID ranges and refresh rootless Podman after mapping changes ([#103](https://github.com/teamleaderleo/smolrunner/issues/103)).
-  - [ ] Durable package and account reconciliation execution.
+- [ ] Define one durable identity joining a scale-set capacity claim, reservation, VM, runner, actual assigned GitHub job, and attempt.
+- [ ] Define a small crash-recoverable phase graph from admission through cleanup and release.
+- [ ] Emit exactly one idempotent next action per reconciliation tick.
+- [ ] Enforce global concurrency, memory, CPU, and disk budgets before provisioning.
+- [ ] Cover cancellation, expiry, runner loss, orphan VM, stale registration, every checkpoint interruption, bounded retry, and scale-to-zero in deterministic tests.
 
-## Milestone 2 — runner lifecycle
+## Milestone 2 — disposable Lima/VZ worker
 
-- [ ] Install a checksum-verified official GitHub Actions runner.
-- [ ] Repository and organization registration scopes.
-- [ ] Dedicated Linux user and systemd service management.
-- [ ] Runner status, version inspection, update, disable, and removal.
-- [ ] Define development, canary, and stable release channels with draining, exact binary identity, state compatibility, promotion, and rollback ([#110](https://github.com/teamleaderleo/smolrunner/issues/110)).
-- [ ] Retain an independent build and repair path for SmolRunner itself while self-hosted canaries provide supplementary real-host evidence.
-- [ ] Short-lived registration-token handling without persistent plaintext storage.
+- [ ] Pin a reviewed Apple-silicon Ubuntu template and official runner image contents.
+- [ ] Create, start, observe, and destroy a unique one-job VM through bounded Lima commands.
+- [ ] Use Lima plain mode or an equivalent exact configuration with no host mounts, SSH-agent forwarding, dynamic port forwarding, guest agent, Rosetta, or inherited host environment.
+- [ ] Apply exact CPU, memory, disk, and wall-time ceilings.
+- [ ] Discover and destroy owned orphan VMs after controller crash or reboot.
+- [ ] Prove the lifecycle on the physical acceptance Mac only after fake-executor tests pass.
 
-## Milestone 3 — project execution
+## Milestone 3 — GitHub just-in-time execution
 
-- [ ] Project-owned Containerfile and verification command.
-- [ ] Rootless Podman image build and digest recording.
-- [ ] Immutable committed-source archives.
-- [ ] Separate network policy for dependency installation and verification.
-- [ ] Capability dropping, no-new-privileges, and resource limits.
-- [ ] Focused and full suite conventions without inventing a pipeline language.
-- [ ] Explicit artifact references for successful verification runs.
+- [ ] Store a least-privilege GitHub App credential in the Mac Keychain.
+- [ ] Integrate a pinned GitHub Runner Scale Set Client behind a narrow local adapter for demand, sessions, acknowledgement, and JIT configuration.
+- [ ] Bind the scale-set claim, runner ID/name/labels, actual assigned job, and VM to the durable attempt.
+- [ ] Transfer the JIT configuration without argv, logs, public journals, or reusable guest storage.
+- [ ] Run the pinned official runner for one job and collect bounded external lifecycle logs.
+- [ ] Observe the terminal job, delete stale runner registrations, destroy the VM, and release capacity automatically.
+- [ ] Demonstrate the full path against an enrolled test repository without operator commands.
 
-## Milestone 4 — small-fleet reliability and operations
+## Milestone 4 — hostile-CI network and container policy
 
-- [ ] Multi-host inventory over SSH.
-- [ ] Fleet-wide `doctor`, status, and upgrade planning.
-- [ ] Disk-pressure and stale-image diagnostics.
-- [ ] Machine-readable remediation suggestions.
-- [ ] Versioned bounded local incident bundles, coalescing, retention, export, and proposal-only upstream issue preparation ([#111](https://github.com/teamleaderleo/smolrunner/issues/111)).
-- [ ] Versioned backup manifests, tested restore, recovery quarantine, and fresh ownership/GitHub re-observation ([#113](https://github.com/teamleaderleo/smolrunner/issues/113)).
-- [ ] Read-only fleet policy directives with host-local vetoes, maintenance windows, release targets, and resource ceilings ([#112](https://github.com/teamleaderleo/smolrunner/issues/112)).
-- [ ] Add explicit autonomy levels, repair budgets, circuit breakers, quarantine, and escalation before enabling any automatic mutation ([#112](https://github.com/teamleaderleo/smolrunner/issues/112)).
-- [ ] Enable automatic repair one narrowly reviewed action class at a time only after exact ownership, durable journals, fresh verification, rollback or compensation, canary evidence, and incident capture exist.
-- [ ] Optional terminal UI backed by the same core library.
+- [ ] Deny inbound access and outbound host, private/LAN, link-local, metadata, controller, and peer-worker destinations outside workload authority.
+- [ ] Preserve DNS and ordinary outbound clone/package/build access.
+- [ ] Add bounded connection/rate/byte policy and explicit project exceptions.
+- [ ] Allow rootless nested containers inside the disposable VM where workflows need container actions or service containers.
+- [ ] Verify benign CI and hostile network/resource fixtures.
 
-## Milestone 5 — leased execution foundation
+## Milestone 5 — supervised autoscaling and recovery
 
-- [x] Record the optional leased-execution and preview direction.
-- [x] Define platform-independent lease kinds, states, legal transitions, terminal behavior, and optimistic revisions.
-- [x] Record the initial lifecycle decision in ADR 0004.
-- [x] Define crash-safe lease persistence and stale-revision rejection.
-- [ ] Define source, artifact, preview-slot, and route ownership evidence.
-- [ ] Define expiry deadlines, renewal windows, and clock-recovery behavior.
-- [ ] Map lease cleanup into typed execution-journal actions.
-- [ ] Add read-only lease planning and inspection commands.
+- [ ] Add `smolrunner worker serve` as a bounded reconciler supervised by `launchd`.
+- [ ] Run the scale-set long-polling listener with durable acknowledgement and session recovery; do not add an inbound webhook for the first path.
+- [ ] Scale within host-wide concurrency/resource limits and return to zero running workers when idle.
+- [ ] Add backoff, retry budgets, circuit breakers, operator holds, and precise status/remediation.
+- [ ] Reconcile controller kill, sleep/wake, reboot, GitHub outage, failed provisioning, stuck job, and failed teardown.
+- [ ] Keep secrets and raw repository data out of durable diagnostics.
 
-## Milestone 6 — local previews
+## Milestone 6 — production acceptance and optimization
 
-- [x] Accept a verified immutable OCI image digest or static artifact.
-- [x] Plan one local preview without mutation.
-- [ ] Start a bounded rootless Podman preview.
-- [ ] Reconcile a temporary route through a narrow reverse-proxy adapter.
-- [x] Keep a stable preview slot while verified artifacts supersede one another.
-- [ ] Expire previews automatically and recover cleanup after host restart.
-- [ ] Measure startup time, idle memory, and retained disk use on a small VPS.
+- [ ] Repeatedly run a known repository and intentionally hostile fixtures.
+- [ ] Measure queue-to-start time, job overhead, peak RAM/disk, teardown time, failure convergence, and idle footprint.
+- [ ] Use GitHub Actions cache/artifacts as the initial cache path.
+- [ ] Optimize template/image warming only after the one-job disposal boundary is stable.
+- [ ] Add local dependency caches only with quotas, namespace isolation, poisoning tests, and no reuse of authoritative compiled outputs.
 
-## Milestone 7 — retained workspaces
+## Deferred
 
-- [ ] Create one writable worktree and container boundary per active claim or actor.
-- [ ] Retain selected workspace state under an explicit lease.
-- [ ] Sleep and wake eligible workspace or preview processes.
-- [ ] Share only explicitly scoped package and build caches.
-- [ ] Record commit, log, screenshot, and preview artifact references.
-- [ ] Support optional Stensibly references without making Stensibly a dependency.
-
-## Milestone 8 — worker selection
-
-- [ ] Advertise bounded worker capabilities and current pressure.
-- [ ] Distinguish continuous workers from opportunistic laptop workers.
-- [ ] Select workers by architecture, capacity, cached artifacts, and routing capability.
-- [ ] Preserve explicit operator policy and explain every placement decision.
-- [ ] Avoid promising a general-purpose or multi-tenant scheduler.
-
-## Later, only with evidence
-
-- External deployment-target adapters for selected static or preview workloads.
-- Per-target budgets and an explicit local-first fallback policy.
-- Web dashboard.
-- Background daemon for lease supervision, heartbeats, asynchronous cleanup, and bounded policy reconciliation.
-- Opt-in authenticated incident submission after local incident contracts, duplicate detection, redaction validation, rate limits, and durable GitHub submission journals exist.
-- GitHub App authentication.
-- Ephemeral machine provisioning.
-- Additional Linux distributions and service managers.
+- Completion of the custom 40-class R01 runtime-readiness graph and host-rootless-Podman hostile-code backend.
+- Persistent workers, retained writable workspaces, and shared compiled-output caches.
+- Linux fleet stewardship as the primary product path.
+- Multi-host selection, cloud providers, Kubernetes, and public multi-tenancy.
+- Previews, routing, deployment, and production credentials.
+- Automatic self-update, fleet policy, dashboard, and broad automatic repair.
 
 ## Non-goals
 
-- Replacing GitHub Actions workflow YAML.
-- Reimplementing the GitHub Actions runner protocol.
-- Kubernetes runner scale sets.
-- Public-fork execution on persistent personal hosts.
-- Becoming a generic public deployment platform.
-- Automatically deploying every successful verification run.
-- Building a custom container runtime, reverse proxy, or TLS stack.
-- Granting a fleet coordinator, telemetry service, or agent unrestricted shell or self-expanded mutation authority.
+- Replacing GitHub Actions workflow YAML or the official runner protocol.
+- Building a custom VM, container, firewall, package-manager, init, or service-supervision implementation.
+- Weakening the isolation boundary to produce a demo.
+- Treating known repositories as trusted code.
+- Treating successful verification as deployment authority.
+- Giving a fleet coordinator, agent, or generated patch unrestricted shell or self-expanded mutation authority.

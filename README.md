@@ -1,24 +1,24 @@
 # SmolRunner
 
-**GitHub Actions on the Linux boxes you already own.**
+**Disposable GitHub Actions capacity on the Mac you already own.**
 
-SmolRunner, pronounced “small runner,” is a Rust-based steward for small fleets of self-hosted GitHub Actions runners. It is aimed at solo developers and small teams who have ordinary Linux servers, several repositories, and no desire to operate Kubernetes or inherit a full platform-engineering stack.
+SmolRunner, pronounced “small runner,” automatically provisions isolated, one-job GitHub Actions workers on an operator-owned Mac and scales them back to zero. It is aimed at developers who want their own repositories and known open-source projects to use local compute without babysitting runners or exposing the host to potentially hostile CI code.
 
 > [!IMPORTANT]
-> SmolRunner is pre-alpha. The current executable provides host diagnostics, read-only desired-state and host-state planning, and a Linux-only path that executes exactly one explicitly confirmed host-preparation phase through a durable journal. Runner registration, runner-service lifecycle, project reconciliation, and unattended control remain roadmap work.
+> SmolRunner is pre-alpha. The current executable has substantial durable state, queue, resource-admission, Lima lifecycle, GitHub observation, and recovery foundations, but it does not yet register a disposable JIT runner or run the unattended control loop. The governing path to that outcome is [Disposable autoscaling CI](docs/DISPOSABLE_AUTOSCALING_CI.md). The older Linux/rootless-Podman path is preserved as optional hardening, not the product critical path.
 
 ## The problem
 
-The official GitHub Actions runner is straightforward to install once. The operational burden appears afterward:
+GitHub Actions is easy to use until local capacity becomes another system to operate:
 
-- several repositories and organizations share one server;
-- persistent runner services need upgrades and repair;
-- repository code should not inherit host credentials or state;
-- container limits, cgroup delegation, users, and systemd units drift;
-- agents and humans need a trustworthy answer to “what is broken?”;
-- setup should be repeatable on the next boring VPS.
+- queued jobs need capacity without ten idle VMs consuming RAM;
+- persistent runners retain compromise and state across jobs;
+- repository code must not inherit host credentials, files, sockets, or LAN access;
+- failed provisioning, crashes, stale registrations, and orphan workers need automatic recovery;
+- agents and humans need a trustworthy answer to “what is running, blocked, or being cleaned up?”;
+- normal clones, dependency downloads, builds, tests, and nested containers still need to work.
 
-SmolRunner keeps GitHub as the workflow scheduler, status UI, and log store. It focuses on host desired state, official runner lifecycle, disposable project execution, and diagnostics.
+SmolRunner keeps GitHub as the workflow scheduler, status UI, and primary job log store. It focuses on bounded admission, disposable Lima/VZ workers, the official JIT runner lifecycle, hostile-CI network policy, automatic teardown, and recovery.
 
 ## Current commands
 
@@ -107,11 +107,11 @@ Canonical constructors now define exact locators and minimum evidence for Linux 
 
 The long-term [reliable control-loop operating model](docs/OPERATING_MODEL.md) keeps the external interface small while separating development, canary, and stable releases; defining drain and rollback; bounding incident evidence; preserving backup and recovery; and requiring host-local vetoes, repair budgets, fresh verification, and circuit breakers before any self-healing or fleet-directed mutation.
 
-## Exploratory expansion
+## Historical and optional expansion
 
-The runner-steward work remains SmolRunner's foundation. A later optional layer may use the same host ownership and isolation model for leased workspaces and temporary previews.
+The Linux runner-steward, rootless-Podman, leased-workspace, and preview work remains useful foundation and optional future scope. It is not the first production path.
 
-The proposed policy keeps frequent verification separate from live deployment: GitHub Actions may verify each eligible push, while a preview starts only after an explicit request or repository policy grants a bounded lease. The local rootless Podman path comes first; worker selection and external deployment targets come later only when useful.
+The current policy keeps verification separate from deployment and puts a disposable Lima/VZ VM before host containers. Preview or deployment authority remains explicit and later.
 
 The first implementation slice is a platform-independent, revisioned lease lifecycle for runs, retained workspaces, and previews. It plans legal state transitions without persistence or host mutation. See [ADR 0004](docs/adr/0004-lease-lifecycle-core.md).
 

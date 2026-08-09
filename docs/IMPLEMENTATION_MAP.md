@@ -1,5 +1,7 @@
 # Implementation capability map
 
+> **Product-direction note:** the critical path is now [Disposable autoscaling CI](DISPOSABLE_AUTOSCALING_CI.md). Existing R01 modules remain reviewed optional hardening/future Linux-container work; their listed "missing integration proof" cells are not an instruction to add more R01 slices before the disposable Lima/JIT path is complete.
+
 This document maps every public library module exported by `src/lib.rs` on exact W01 activation base
 `3aa7c8f0341c6dd9138f7b0b5f2e2470140430ae`. It distinguishes what the installed binary already
 reaches from reviewed foundations that still need W02–W04 composition. It is an inventory and

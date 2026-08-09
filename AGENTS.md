@@ -4,24 +4,24 @@ SmolRunner is pronounced “small runner.” Treat “SmallRunner” and “smal
 
 ## Product boundary
 
-SmolRunner is a Rust-based steward for a small number of self-hosted GitHub Actions runners and an exploratory leased execution host for ordinary Linux servers. It manages desired host state, official runner lifecycle, project isolation, diagnostics, and later optional runs, retained workspaces, and temporary previews.
+SmolRunner is a Rust-based steward for automatically provisioned, disposable GitHub Actions workers on an operator-owned Mac. It admits bounded capacity, provisions one isolated worker per job, manages the official runner lifecycle, destroys workers after use, and reconciles crashes and orphaned state without routine operator intervention. An exploratory Linux runner steward and leased execution model remain secondary tracks.
 
-GitHub Actions remains the first scheduler and workflow language. SmolRunner may eventually broker execution and preview targets, but it should begin with local rootless Podman and an explicit verify-often, deploy-deliberately policy.
+GitHub Actions remains the scheduler and workflow language. The first hostile-workload boundary is a disposable Lima/VZ virtual machine with no host integration, a one-job just-in-time official runner, controlled network egress, and hard host-wide resource limits. Rootless Podman on the host is not the critical path; nested containers may run inside the disposable VM.
 
 Do not turn SmolRunner into a new pipeline language, runner protocol, Kubernetes controller, public multi-tenant platform, custom container runtime, custom reverse proxy, or automatic production deployment system.
 
 ## Current priorities
 
-1. Preserve the threat-model invariants in `docs/THREAT_MODEL.md`.
-2. Follow the privilege, adoption, rollback, ownership, canonical-evidence, and lease-lifecycle decisions in `docs/adr/`.
-3. Build a dependable CLI and structured state model before adding a daemon, TUI, or web dashboard.
-4. Prefer idempotent plans and explicit reconciliation over one-shot shell setup.
-5. Keep project-specific build and test behavior inside each enrolled repository.
-6. Unknown manifest, ownership-marker, fingerprint, lease, artifact, fleet-directive, incident, backup, and release-policy fields or versions must fail closed.
-7. Distinguish proven absence from unknown state; never mutate based on an unproven assumption.
-8. Keep frequent verification separate from live preview creation. A successful check does not imply a deployment.
-9. Prove one local execution and preview backend before worker selection or external provider adapters.
-10. Keep the public surface small while implementing reliability through the explicit release, incident, backup, fleet-policy, repair-budget, and recovery contracts in `docs/OPERATING_MODEL.md`.
+1. Deliver the end-to-end disposable autoscaling path in `docs/DISPOSABLE_AUTOSCALING_CI.md` before additional narrow R01 proof slices.
+2. Preserve the practical threat-model invariants in `docs/THREAT_MODEL.md`: hostile jobs stay inside a disposable VM, receive no host integrations or unrelated secrets, have controlled network access and hard resource ceilings, and leave no useful persistence after destruction.
+3. Reuse mature components for workflow semantics, VM isolation, guest boot, networking, and service supervision. Add custom proof only for a realistic escape, persistence, secret, lateral-movement, network-abuse, resource-exhaustion, or recovery path that those boundaries do not own.
+4. Preserve and integrate the existing durable store, queue/admission, Lima lifecycle, GitHub observation, journal, and recovery work.
+5. Prefer idempotent reconciliation over one-shot setup. Provisioning, JIT registration, execution, teardown, stale-runner cleanup, reboot recovery, and scale-to-zero must become automatic.
+6. Keep project-specific build and test behavior in GitHub Actions and enrolled repositories. Do not invent a pipeline language or runner protocol.
+7. Unknown durable schemas, ownership evidence, attempt identities, or external state remain fail-closed. Distinguish proven absence from unknown state.
+8. Enforce one job per disposable VM, least-privilege ephemeral credentials, host-wide concurrency/resource budgets, and a hostile-CI network policy before production acceptance.
+9. Use GitHub Actions cache/artifact services first. Reusable host-local writable build outputs are deferred until poisoning, quota, and authority boundaries are proven.
+10. Defer previews, deployment, multi-host placement, providers, Kubernetes, retained workspaces, and dashboards until the single-Mac unattended lifecycle is dependable.
 
 ## Workspace bootstrap
 

@@ -1,0 +1,131 @@
+# Disposable autoscaling CI
+
+This document is the product direction for SmolRunner. It supersedes the persistent personal-worker sequence in `PERSONAL_WORKER_ALPHA.md` and the rootless-Podman-first sequence in the older roadmap.
+
+## Product outcome
+
+An operator enrolls a repository and leaves SmolRunner running. For each eligible GitHub Actions job, SmolRunner admits capacity, creates one isolated worker on the operator's Mac, registers a just-in-time runner, waits for exactly one job, records the result, destroys the worker, and returns the reserved capacity. Crashes, reboots, stale GitHub registrations, and partial provisioning are reconciled automatically.
+
+The first production path is:
+
+```text
+queued GitHub job assigned to the SmolRunner scale set
+-> durable capacity reservation
+-> fresh Lima/VZ VM
+-> just-in-time GitHub runner registration
+-> one job
+-> terminal observation and bounded diagnostics
+-> VM destruction and stale-runner cleanup
+-> reservation release and scale to zero
+```
+
+GitHub Actions remains the scheduler and workflow language. SmolRunner does not interpret workflow steps or reimplement the runner protocol.
+
+## Actual threat model
+
+Repository content, workflow steps, actions, build scripts, dependencies, test code, and nested containers are hostile. This includes the operator's repositories and known open-source repositories. GitHub, the pinned official runner distribution, Lima, Apple Virtualization Framework, the pinned guest image, macOS, and SmolRunner's controller are trusted components whose security updates must be applied deliberately.
+
+The protected assets are the Mac host, host credentials and personal data, other workers, other network services, the controller's GitHub App credential, and the availability of the host and surrounding network.
+
+The realistic attacker goals are host escape, persistence after a job, theft of host or unrelated credentials, access to other workers, lateral movement to the LAN, abuse of outbound connectivity, and resource exhaustion. A job is allowed to corrupt its own guest completely. Destroying that guest is the recovery mechanism.
+
+The first release does not promise protection from a vulnerability in macOS or Apple Virtualization Framework, a malicious pinned guest image or official runner distribution, a compromised SmolRunner controller, or secrets intentionally supplied to that job by its GitHub workflow. Those are explicit trusted-computing-base and workflow-policy risks, not facts SmolRunner can prove away.
+
+## Smallest credible security boundary
+
+The following controls are release blockers.
+
+1. **One fresh VM per job.** Potentially hostile repository code never runs in the Mac host namespace or in a long-lived worker. The VM is destroyed after one job, timeout, cancellation, runner loss, or controller recovery.
+2. **No host integration.** The VM has no host filesystem mount, SSH-agent forwarding, credential socket, dynamic port forwarding, host environment inheritance, or container-control socket. Lima plain mode is the preferred starting configuration because it disables mounts, dynamic forwarding, built-in containerd, guest agent, Rosetta, and SSH-agent forwarding. Any required static control channel is explicit and controller-owned.
+3. **One just-in-time runner.** SmolRunner uses GitHub's supported runner scale-set and JIT/ephemeral interfaces with a unique runner identity. The runner receives at most one job. GitHub owns label matching and assignment; SmolRunner binds the actual assigned job from the scale-set lifecycle message before accepting terminal evidence. The official runner archive and guest template are pinned and verified outside the workload.
+4. **Credentials stay in the control plane.** A least-privilege GitHub App credential is stored on the Mac. Only the short-lived JIT configuration needed by the one runner enters the VM. It is never logged, persisted in public journals, exposed in argv, or reused. Workflow-provided job secrets remain GitHub/workflow responsibility.
+5. **Hostile-CI network policy.** Inbound connectivity is denied. Outbound internet needed for ordinary builds is allowed, while host, private, link-local, metadata, peer-worker, and controller networks are denied. The policy is enforced outside workload authority by a mature firewall or egress gateway. Connection/rate limits and project-specific exceptions follow after the base deny policy works.
+6. **Hard resource and concurrency ceilings.** Admission reserves CPU, memory, disk, and one concurrency slot before provisioning. The VM has fixed CPU, RAM, and disk limits plus a wall deadline. A host-wide budget prevents concurrent workers from exhausting the Mac. Zero admitted jobs means zero running worker VMs.
+7. **Durable lifecycle and recovery.** Every externally visible mutation has a durable attempt identity and checkpoint. Reconciliation is idempotent: it may finish cleanup, remove a stale runner, destroy an orphan VM, or retry a bounded provisioning failure, but never silently widens authority or starts a second worker for the same job.
+8. **Unprivileged guest workload.** The runner user has no sudo or equivalent guest administrative authority. Nested containers, when enabled, are rootless inside the disposable VM. Guest compromise is expected; the VM boundary, network policy, credentials policy, resource limits, and destruction contain it.
+9. **Bounded external diagnostics.** Runner lifecycle logs needed to diagnose ephemeral runners are copied to bounded controller-owned storage. Raw repository contents, environment dumps, job secrets, and arbitrary logs are not durable SmolRunner state.
+
+These controls are stronger and simpler than treating a rootless host container as the primary hostile-code boundary. A container backend can remain available later for lower-risk or high-throughput work, but it is not the default hostile-CI backend.
+
+## Existing work to keep
+
+The following implementation is directly useful:
+
+- canonical configuration, identities, public error vocabulary, and human/JSON report discipline;
+- the durable personal-worker store, locking, atomic publication, recovery, revision, and queue-generation rules;
+- queue admission, reservations, concurrency/resource policy, cancellation, and terminal tombstones;
+- the broker tick and read models;
+- Mac capacity observation and the Lima observation, ownership, lifecycle authority, and bounded command executor;
+- GitHub workflow-job mapping and snapshot reconciliation foundations;
+- typed execution receipts, journals, bounded subprocess handling, and privacy rules;
+- the reviewed R01 modules and evidence as optional hardening or a future Linux/container backend.
+
+Existing proofs do not become false because they leave the critical path. They stop blocking the first complete product.
+
+## Work to drop or defer
+
+Do not add more ELF, glibc, loader-cache, package-layout, account-authority, or descriptor-attestation slices merely to complete R01. Defer the remaining 40-class runtime-readiness proof, the host-rootless-Podman execution path, custom checked-out-source materialization, reusable writable build-output caches, and custom descendant/cgroup proof for hostile jobs.
+
+Also defer multi-host placement, Kubernetes, cloud providers, public multi-tenancy, previews, deployment, retained workspaces, hot profile resizing, automatic self-update, and a dashboard until the single-Mac disposable path is dependable.
+
+The initial cache policy is intentionally conservative: use GitHub Actions cache/artifact services and normal upstream dependency registries. Do not retain a writable Cargo target directory or equivalent compiled output across hostile jobs. Later cache work must separate non-authoritative dependency inputs from executable build outputs and have explicit poisoning and quota tests.
+
+## Delegated mature components
+
+SmolRunner deliberately delegates:
+
+- workflow semantics, job routing, scale-set demand, message acknowledgement, JIT configuration, job tokens, and one-job runner behavior to GitHub Actions, the official [Runner Scale Set Client](https://github.com/actions/scaleset), and the official runner;
+- VM isolation and lifecycle to Apple Virtualization Framework through Lima;
+- guest bootstrapping to a pinned Ubuntu cloud image and cloud-init/provisioning;
+- guest package/container behavior to Ubuntu and a rootless container engine inside the VM when required;
+- network enforcement to a reviewed host-side firewall/egress gateway or protected guest firewall configuration, rather than executable-by-executable network attestation;
+- Mac service supervision to `launchd`;
+- initial cache/artifact transport to GitHub Actions.
+
+SmolRunner still owns the exact configuration of those components, admission, scoped credential acquisition, durable orchestration, drift handling, cleanup, and truthful reporting.
+
+## Shortest milestones
+
+### M1 — disposable-attempt control contract
+
+Add the small durable lifecycle that joins one scale-set capacity claim, one capacity reservation, one VM identity, one runner registration, and the actual GitHub job when GitHub assigns it. Its pure reconciler must cover every crash point and emit one next action: provision, register, wait, destroy, deregister, release, retry with bounded backoff, or stop for operator policy. Enforce host-wide concurrency and memory/disk ceilings before provisioning.
+
+Acceptance: deterministic tests cover duplicate observations, crash-after-each-checkpoint, cancellation, expiry, runner loss, orphan VM, stale GitHub runner, and scale-to-zero. No host or GitHub mutation is in this slice.
+
+### M2 — disposable Lima backend
+
+Create, start, observe, and destroy a uniquely named pinned Lima/VZ VM with fixed resources and no host integrations. Provision the pinned runner and minimal build tools into the image/template, not from repository-controlled input.
+
+Acceptance: fake/injected executor tests first; then an explicit physical-Mac test proves create, boot, bounded control access, forced failure, destroy, orphan discovery, and zero residual VM/process/disk allocation outside the documented image cache.
+
+### M3 — GitHub JIT job path
+
+Integrate a pinned build of GitHub's Runner Scale Set Client behind a narrow local adapter. Add Keychain-backed GitHub App authentication, scale-set session recovery, current-capacity reporting, JIT configuration generation, exact runner/VM binding, actual-job lifecycle binding, one-job execution, stale-runner deletion, and bounded log collection. Its long-polling session avoids an inbound webhook and avoids recreating GitHub's assignment semantics in Rust.
+
+Acceptance: an enrolled test repository targets the SmolRunner scale-set label, queues a job, and receives its result without operator commands; the JIT runner cannot accept a second job and its credential is absent after VM destruction.
+
+### M4 — hostile-CI network and nested-container policy
+
+Enforce denial of host, LAN, link-local, metadata, control-plane, and peer-worker destinations while preserving DNS and ordinary outbound build access. Enable rootless nested containers inside the guest only after this policy and guest resource limits are verified.
+
+Acceptance: ordinary clone/download/build/test fixtures pass; hostile fixtures cannot reach denied destinations, listen inbound, exceed resource ceilings, or leave a reachable process after teardown.
+
+### M5 — supervised reconciliation and autoscaling
+
+Add `smolrunner worker serve` under `launchd`: observe demand, reserve bounded capacity, advance attempts, back off transient failures, enforce circuit breakers and operator holds, clean orphans, reconcile after reboot, remove stale runners, and scale to zero. Status must explain current capacity, attempts, blockers, retries, and cleanup debt without exposing secrets.
+
+Acceptance: sleep/wake, controller kill, Mac reboot, network loss, GitHub outage, failed provisioning, stuck job, and failed teardown tests all converge automatically or stop behind a precise durable blocker.
+
+### M6 — production acceptance and safe optimization
+
+Run a known repository plus intentionally hostile fixtures repeatedly. Measure cold-start latency, queue-to-start time, RAM/disk ceilings, teardown time, and idle footprint. Only then optimize template cloning, image warming, polling, or safe dependency caches. Every optimization must preserve one-job disposal and the security boundary above.
+
+## Decision rule
+
+New proof or infrastructure belongs on the critical path only when it closes a realistic route from hostile CI to host compromise, persistence, secret theft, cross-worker access, dangerous network activity, resource exhaustion, or unrecoverable operation. If a mature boundary can own the property more simply, use it. The release criterion is an unattended, recoverable job lifecycle—not the number of host facts proven.
+
+## Supported-interface basis
+
+- GitHub [recommends ephemeral runners for autoscaling](https://docs.github.com/en/actions/reference/runners/self-hosted-runners#ephemeral-runners-for-autoscaling) because each runner receives one job and can then be wiped.
+- GitHub's [Runner Scale Set Client](https://github.com/actions/scaleset) is the supported standalone Go client for non-Kubernetes autoscalers. It supplies current assigned-job statistics, long-polling sessions, acknowledgement, and JIT configuration while leaving VM creation and destruction to SmolRunner.
+- Lima [plain mode](https://lima-vm.io/docs/config/plain/) disables filesystem mounts, dynamic port forwarding, built-in containerd, the guest agent, Rosetta, and SSH-agent forwarding. SmolRunner still needs an independently enforced outbound network policy because Lima's default user-mode network exposes the host gateway to the guest.
