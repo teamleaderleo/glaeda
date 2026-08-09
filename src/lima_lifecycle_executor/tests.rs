@@ -263,6 +263,10 @@ impl ScriptedObservationSource {
             reports: Mutex::new(reports.into()),
         }
     }
+
+    fn remaining(&self) -> usize {
+        self.reports.lock().expect("reports lock").len()
+    }
 }
 
 impl LimaLifecycleObservationSource for ScriptedObservationSource {
@@ -290,6 +294,34 @@ struct FixedClock(u64);
 impl LimaObservationClock for FixedClock {
     fn unix_seconds(&self) -> io::Result<u64> {
         Ok(self.0)
+    }
+}
+
+struct RecordingJournal {
+    checkpoints: Vec<LimaLifecycleExecutionCheckpoint>,
+    fail_at: Option<LimaLifecycleExecutionCheckpoint>,
+}
+
+impl RecordingJournal {
+    fn new(fail_at: Option<LimaLifecycleExecutionCheckpoint>) -> Self {
+        Self {
+            checkpoints: Vec::new(),
+            fail_at,
+        }
+    }
+}
+
+impl LimaLifecycleExecutionJournal for RecordingJournal {
+    fn checkpoint(
+        &mut self,
+        checkpoint: LimaLifecycleExecutionCheckpoint,
+    ) -> Result<(), LimaLifecycleExecutionJournalError> {
+        self.checkpoints.push(checkpoint);
+        if self.fail_at == Some(checkpoint) {
+            Err(LimaLifecycleExecutionJournalError)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -373,7 +405,7 @@ fn start_uses_one_fixed_command_and_verifies_running_identity() {
 }
 
 #[test]
-fn stop_is_separate_from_profile_edit_and_preserves_disk_identity() {
+fn stop_to_stopped_is_one_fixed_command_and_preserves_disk_identity() {
     let persistent = persistent_identity('b');
     let lifecycle = lifecycle(
         LimaLifecycleState::Running,
@@ -390,7 +422,7 @@ fn stop_is_separate_from_profile_edit_and_preserves_disk_identity() {
         identity: lifecycle.identity().clone(),
         current_profile: LimaResourceProfile::Work,
         profile_generation: generation(3),
-        target_after_stop: PersonalWorkerProfile::Interactive,
+        target_after_stop: PersonalWorkerProfile::Stopped,
     });
     let request = request();
     let observations = ScriptedObservationSource::new(vec![report(
@@ -420,7 +452,7 @@ fn stop_is_separate_from_profile_edit_and_preserves_disk_identity() {
 }
 
 #[test]
-fn change_profile_edits_fixed_values_then_starts_and_verifies() {
+fn change_profile_edits_fixed_values_and_remains_stopped() {
     let persistent = persistent_identity('b');
     let lifecycle = lifecycle(
         LimaLifecycleState::Stopped,
@@ -437,18 +469,11 @@ fn change_profile_edits_fixed_values_then_starts_and_verifies() {
         next_generation: generation(5),
     });
     let request = request();
-    let observations = ScriptedObservationSource::new(vec![
-        report(
-            LimaRuntimeState::Stopped,
-            LimaResourceProfile::Interactive,
-            None,
-        ),
-        report(
-            LimaRuntimeState::Running,
-            LimaResourceProfile::Interactive,
-            Some(persistent.clone()),
-        ),
-    ]);
+    let observations = ScriptedObservationSource::new(vec![report(
+        LimaRuntimeState::Stopped,
+        LimaResourceProfile::Interactive,
+        None,
+    )]);
     let commands = ScriptedExecutor::new(ExecutorMode::Match);
 
     let execution = executor()
@@ -465,15 +490,10 @@ fn change_profile_edits_fixed_values_then_starts_and_verifies() {
         execution.receipt().after_profile,
         LimaResourceProfile::Interactive
     );
+    assert_eq!(execution.receipt().after_state, LimaLifecycleState::Stopped);
     let calls = commands.calls();
-    assert_eq!(calls.len(), 2);
-    assert_eq!(
-        commands.timeouts(),
-        vec![
-            LIMA_LIFECYCLE_COMMAND_TIMEOUT,
-            LIMA_LIFECYCLE_COMMAND_TIMEOUT
-        ]
-    );
+    assert_eq!(calls.len(), 1);
+    assert_eq!(commands.timeouts(), vec![LIMA_LIFECYCLE_COMMAND_TIMEOUT]);
     assert_eq!(
         calls[0].displayed_argv(),
         vec![
@@ -487,15 +507,486 @@ fn change_profile_edits_fixed_values_then_starts_and_verifies() {
             "smolrunner",
         ]
     );
-    assert_eq!(
-        calls[1].displayed_argv(),
-        vec![LIMACTL, "start", "smolrunner"]
-    );
     assert!(
         !calls
             .iter()
-            .any(|call| call.displayed_argv().contains(&"stop".to_owned()))
+            .any(|call| call.displayed_argv().contains(&"start".to_owned()))
     );
+}
+
+#[test]
+fn stop_to_profile_runs_the_exact_stop_edit_start_sequence() {
+    let persistent = persistent_identity('b');
+    let lifecycle = lifecycle(
+        LimaLifecycleState::Running,
+        LimaResourceProfile::Work,
+        3,
+        false,
+    );
+    let current = report(
+        LimaRuntimeState::Running,
+        LimaResourceProfile::Work,
+        Some(persistent.clone()),
+    );
+    let action = accepted(HostBrokerAction::Stop {
+        identity: lifecycle.identity().clone(),
+        current_profile: LimaResourceProfile::Work,
+        profile_generation: generation(3),
+        target_after_stop: PersonalWorkerProfile::Interactive,
+    });
+    let observations = ScriptedObservationSource::new(vec![
+        report(LimaRuntimeState::Stopped, LimaResourceProfile::Work, None),
+        report(
+            LimaRuntimeState::Stopped,
+            LimaResourceProfile::Interactive,
+            None,
+        ),
+        report(
+            LimaRuntimeState::Running,
+            LimaResourceProfile::Interactive,
+            Some(persistent.clone()),
+        ),
+    ]);
+    let commands = ScriptedExecutor::new(ExecutorMode::Match);
+    let execution = executor()
+        .execute(
+            input(&action, &lifecycle, &current, &persistent, &request()),
+            &observations,
+            &commands,
+            &FixedClock(100),
+        )
+        .expect("stop profile transition");
+
+    assert_eq!(execution.receipt().after_state, LimaLifecycleState::Running);
+    assert_eq!(
+        execution.receipt().after_profile,
+        LimaResourceProfile::Interactive
+    );
+    assert_eq!(execution.receipt().after_generation, generation(4));
+    assert_eq!(
+        commands
+            .calls()
+            .iter()
+            .map(CommandSpec::displayed_argv)
+            .collect::<Vec<_>>(),
+        vec![
+            vec![LIMACTL, "stop", "smolrunner"],
+            vec![
+                LIMACTL,
+                "edit",
+                "--tty=false",
+                "--cpus",
+                "4",
+                "--memory",
+                "3",
+                "smolrunner",
+            ],
+            vec![LIMACTL, "start", "smolrunner"],
+        ]
+    );
+    assert_eq!(commands.timeouts(), vec![LIMA_LIFECYCLE_COMMAND_TIMEOUT; 3]);
+}
+
+#[test]
+fn durable_checkpoint_order_brackets_every_composite_command_and_final_verification() {
+    let persistent = persistent_identity('b');
+    let lifecycle = lifecycle(
+        LimaLifecycleState::Running,
+        LimaResourceProfile::Work,
+        3,
+        false,
+    );
+    let current = report(
+        LimaRuntimeState::Running,
+        LimaResourceProfile::Work,
+        Some(persistent.clone()),
+    );
+    let action = accepted(HostBrokerAction::Stop {
+        identity: lifecycle.identity().clone(),
+        current_profile: LimaResourceProfile::Work,
+        profile_generation: generation(3),
+        target_after_stop: PersonalWorkerProfile::Interactive,
+    });
+    let observations = ScriptedObservationSource::new(vec![
+        report(LimaRuntimeState::Stopped, LimaResourceProfile::Work, None),
+        report(
+            LimaRuntimeState::Stopped,
+            LimaResourceProfile::Interactive,
+            None,
+        ),
+        report(
+            LimaRuntimeState::Running,
+            LimaResourceProfile::Interactive,
+            Some(persistent.clone()),
+        ),
+    ]);
+    let commands = ScriptedExecutor::new(ExecutorMode::Match);
+    let mut journal = RecordingJournal::new(None);
+    executor()
+        .execute_with_journal(
+            input(&action, &lifecycle, &current, &persistent, &request()),
+            &observations,
+            &commands,
+            &FixedClock(100),
+            &mut journal,
+        )
+        .expect("checkpointed transition");
+    assert_eq!(
+        journal.checkpoints,
+        vec![
+            LimaLifecycleExecutionCheckpoint::StopStarted,
+            LimaLifecycleExecutionCheckpoint::StopCompleted,
+            LimaLifecycleExecutionCheckpoint::EditStarted,
+            LimaLifecycleExecutionCheckpoint::EditCompleted,
+            LimaLifecycleExecutionCheckpoint::StartStarted,
+            LimaLifecycleExecutionCheckpoint::StartCompleted,
+            LimaLifecycleExecutionCheckpoint::VerifyStarted,
+        ]
+    );
+}
+
+#[test]
+fn durable_checkpoint_order_covers_each_single_command_sequence() {
+    let persistent = persistent_identity('b');
+
+    let stopped_lifecycle = lifecycle(
+        LimaLifecycleState::Stopped,
+        LimaResourceProfile::Interactive,
+        1,
+        false,
+    );
+    let stopped_current = report(
+        LimaRuntimeState::Stopped,
+        LimaResourceProfile::Interactive,
+        None,
+    );
+    let start = accepted(HostBrokerAction::Start {
+        identity: stopped_lifecycle.identity().clone(),
+        profile: LimaResourceProfile::Interactive,
+        profile_generation: generation(1),
+    });
+    let mut start_journal = RecordingJournal::new(None);
+    executor()
+        .execute_with_journal(
+            input(
+                &start,
+                &stopped_lifecycle,
+                &stopped_current,
+                &persistent,
+                &request(),
+            ),
+            &ScriptedObservationSource::new(vec![report(
+                LimaRuntimeState::Running,
+                LimaResourceProfile::Interactive,
+                Some(persistent.clone()),
+            )]),
+            &ScriptedExecutor::new(ExecutorMode::Match),
+            &FixedClock(100),
+            &mut start_journal,
+        )
+        .expect("checkpointed start");
+    assert_eq!(
+        start_journal.checkpoints,
+        vec![
+            LimaLifecycleExecutionCheckpoint::StartStarted,
+            LimaLifecycleExecutionCheckpoint::StartCompleted,
+            LimaLifecycleExecutionCheckpoint::VerifyStarted,
+        ]
+    );
+
+    let running_lifecycle = lifecycle(
+        LimaLifecycleState::Running,
+        LimaResourceProfile::Work,
+        3,
+        false,
+    );
+    let running_current = report(
+        LimaRuntimeState::Running,
+        LimaResourceProfile::Work,
+        Some(persistent.clone()),
+    );
+    let stop = accepted(HostBrokerAction::Stop {
+        identity: running_lifecycle.identity().clone(),
+        current_profile: LimaResourceProfile::Work,
+        profile_generation: generation(3),
+        target_after_stop: PersonalWorkerProfile::Stopped,
+    });
+    let mut stop_journal = RecordingJournal::new(None);
+    executor()
+        .execute_with_journal(
+            input(
+                &stop,
+                &running_lifecycle,
+                &running_current,
+                &persistent,
+                &request(),
+            ),
+            &ScriptedObservationSource::new(vec![report(
+                LimaRuntimeState::Stopped,
+                LimaResourceProfile::Work,
+                None,
+            )]),
+            &ScriptedExecutor::new(ExecutorMode::Match),
+            &FixedClock(100),
+            &mut stop_journal,
+        )
+        .expect("checkpointed stop");
+    assert_eq!(
+        stop_journal.checkpoints,
+        vec![
+            LimaLifecycleExecutionCheckpoint::StopStarted,
+            LimaLifecycleExecutionCheckpoint::StopCompleted,
+            LimaLifecycleExecutionCheckpoint::VerifyStarted,
+        ]
+    );
+
+    let edit_lifecycle = lifecycle(
+        LimaLifecycleState::Stopped,
+        LimaResourceProfile::Work,
+        4,
+        false,
+    );
+    let edit_current = report(LimaRuntimeState::Stopped, LimaResourceProfile::Work, None);
+    let edit = accepted(HostBrokerAction::ChangeProfile {
+        identity: edit_lifecycle.identity().clone(),
+        from_profile: LimaResourceProfile::Work,
+        to_profile: LimaResourceProfile::Interactive,
+        current_generation: generation(4),
+        next_generation: generation(5),
+    });
+    let mut edit_journal = RecordingJournal::new(None);
+    executor()
+        .execute_with_journal(
+            input(
+                &edit,
+                &edit_lifecycle,
+                &edit_current,
+                &persistent,
+                &request(),
+            ),
+            &ScriptedObservationSource::new(vec![report(
+                LimaRuntimeState::Stopped,
+                LimaResourceProfile::Interactive,
+                None,
+            )]),
+            &ScriptedExecutor::new(ExecutorMode::Match),
+            &FixedClock(100),
+            &mut edit_journal,
+        )
+        .expect("checkpointed edit");
+    assert_eq!(
+        edit_journal.checkpoints,
+        vec![
+            LimaLifecycleExecutionCheckpoint::EditStarted,
+            LimaLifecycleExecutionCheckpoint::EditCompleted,
+            LimaLifecycleExecutionCheckpoint::VerifyStarted,
+        ]
+    );
+}
+
+#[test]
+fn durable_checkpoint_failure_blocks_before_or_immediately_after_the_command_boundary() {
+    let persistent = persistent_identity('b');
+    let lifecycle = lifecycle(
+        LimaLifecycleState::Stopped,
+        LimaResourceProfile::Interactive,
+        1,
+        false,
+    );
+    let current = report(
+        LimaRuntimeState::Stopped,
+        LimaResourceProfile::Interactive,
+        None,
+    );
+    let action = accepted(HostBrokerAction::Start {
+        identity: lifecycle.identity().clone(),
+        profile: LimaResourceProfile::Interactive,
+        profile_generation: generation(1),
+    });
+
+    let before_commands = ScriptedExecutor::new(ExecutorMode::Match);
+    let mut before_journal =
+        RecordingJournal::new(Some(LimaLifecycleExecutionCheckpoint::StartStarted));
+    let before = executor()
+        .execute_with_journal(
+            input(&action, &lifecycle, &current, &persistent, &request()),
+            &ScriptedObservationSource::new(Vec::new()),
+            &before_commands,
+            &FixedClock(100),
+            &mut before_journal,
+        )
+        .expect_err("pre-command checkpoint failure");
+    assert_eq!(
+        before.code,
+        LimaLifecycleExecutionRefusalCode::CheckpointFailed
+    );
+    assert_eq!(before.phase, LimaLifecycleExecutionPhase::Start);
+    assert!(before_commands.calls().is_empty());
+
+    let after_commands = ScriptedExecutor::new(ExecutorMode::Match);
+    let mut after_journal =
+        RecordingJournal::new(Some(LimaLifecycleExecutionCheckpoint::StartCompleted));
+    let after = executor()
+        .execute_with_journal(
+            input(&action, &lifecycle, &current, &persistent, &request()),
+            &ScriptedObservationSource::new(Vec::new()),
+            &after_commands,
+            &FixedClock(100),
+            &mut after_journal,
+        )
+        .expect_err("post-command checkpoint failure");
+    assert_eq!(
+        after.code,
+        LimaLifecycleExecutionRefusalCode::CheckpointFailed
+    );
+    assert_eq!(after.phase, LimaLifecycleExecutionPhase::Start);
+    assert_eq!(after_commands.calls().len(), 1);
+    assert_eq!(
+        after_journal.checkpoints,
+        vec![
+            LimaLifecycleExecutionCheckpoint::StartStarted,
+            LimaLifecycleExecutionCheckpoint::StartCompleted,
+        ]
+    );
+
+    let failed_commands = ScriptedExecutor::new(ExecutorMode::Failed);
+    let mut command_journal = RecordingJournal::new(None);
+    let command_failure = executor()
+        .execute_with_journal(
+            input(&action, &lifecycle, &current, &persistent, &request()),
+            &ScriptedObservationSource::new(Vec::new()),
+            &failed_commands,
+            &FixedClock(100),
+            &mut command_journal,
+        )
+        .expect_err("command validation failure");
+    assert_eq!(
+        command_failure.code,
+        LimaLifecycleExecutionRefusalCode::CommandFailed
+    );
+    assert_eq!(
+        command_journal.checkpoints,
+        vec![LimaLifecycleExecutionCheckpoint::StartStarted]
+    );
+
+    let verify_commands = ScriptedExecutor::new(ExecutorMode::Match);
+    let verify_observations = ScriptedObservationSource::new(vec![report(
+        LimaRuntimeState::Running,
+        LimaResourceProfile::Interactive,
+        Some(persistent.clone()),
+    )]);
+    let mut verify_journal =
+        RecordingJournal::new(Some(LimaLifecycleExecutionCheckpoint::VerifyStarted));
+    let verify_failure = executor()
+        .execute_with_journal(
+            input(&action, &lifecycle, &current, &persistent, &request()),
+            &verify_observations,
+            &verify_commands,
+            &FixedClock(100),
+            &mut verify_journal,
+        )
+        .expect_err("verification checkpoint failure");
+    assert_eq!(
+        verify_failure.code,
+        LimaLifecycleExecutionRefusalCode::CheckpointFailed
+    );
+    assert_eq!(verify_failure.phase, LimaLifecycleExecutionPhase::Verify);
+    assert_eq!(verify_commands.calls().len(), 1);
+    assert_eq!(verify_observations.remaining(), 1);
+}
+
+#[test]
+fn composite_intermediate_observation_failure_stops_before_the_next_command() {
+    let persistent = persistent_identity('b');
+    let lifecycle = lifecycle(
+        LimaLifecycleState::Running,
+        LimaResourceProfile::Work,
+        3,
+        false,
+    );
+    let current = report(
+        LimaRuntimeState::Running,
+        LimaResourceProfile::Work,
+        Some(persistent.clone()),
+    );
+    let action = accepted(HostBrokerAction::Stop {
+        identity: lifecycle.identity().clone(),
+        current_profile: LimaResourceProfile::Work,
+        profile_generation: generation(3),
+        target_after_stop: PersonalWorkerProfile::Interactive,
+    });
+    let commands = ScriptedExecutor::new(ExecutorMode::Match);
+    let mut journal = RecordingJournal::new(None);
+    let failure = executor()
+        .execute_with_journal(
+            input(&action, &lifecycle, &current, &persistent, &request()),
+            &ScriptedObservationSource::new(Vec::new()),
+            &commands,
+            &FixedClock(100),
+            &mut journal,
+        )
+        .expect_err("missing intermediate stop observation");
+    assert_eq!(
+        failure.code,
+        LimaLifecycleExecutionRefusalCode::VerificationFailed
+    );
+    assert_eq!(commands.calls().len(), 1);
+    assert_eq!(
+        journal.checkpoints,
+        vec![
+            LimaLifecycleExecutionCheckpoint::StopStarted,
+            LimaLifecycleExecutionCheckpoint::StopCompleted,
+        ]
+    );
+}
+
+#[test]
+fn invalid_stop_transition_refuses_before_the_first_checkpoint_or_command() {
+    let persistent = persistent_identity('b');
+    for (generation_value, target, expected) in [
+        (
+            3,
+            PersonalWorkerProfile::Work,
+            LimaLifecycleExecutionRefusalCode::ProfileMismatch,
+        ),
+        (
+            u64::MAX,
+            PersonalWorkerProfile::Interactive,
+            LimaLifecycleExecutionRefusalCode::GenerationMismatch,
+        ),
+    ] {
+        let lifecycle = lifecycle(
+            LimaLifecycleState::Running,
+            LimaResourceProfile::Work,
+            generation_value,
+            false,
+        );
+        let current = report(
+            LimaRuntimeState::Running,
+            LimaResourceProfile::Work,
+            Some(persistent.clone()),
+        );
+        let action = accepted(HostBrokerAction::Stop {
+            identity: lifecycle.identity().clone(),
+            current_profile: LimaResourceProfile::Work,
+            profile_generation: generation(generation_value),
+            target_after_stop: target,
+        });
+        let commands = ScriptedExecutor::new(ExecutorMode::Match);
+        let mut journal = RecordingJournal::new(None);
+        let error = executor()
+            .execute_with_journal(
+                input(&action, &lifecycle, &current, &persistent, &request()),
+                &ScriptedObservationSource::new(Vec::new()),
+                &commands,
+                &FixedClock(100),
+                &mut journal,
+            )
+            .expect_err("invalid stop transition");
+        assert_eq!(error.code, expected);
+        assert!(journal.checkpoints.is_empty());
+        assert!(commands.calls().is_empty());
+    }
 }
 
 #[test]

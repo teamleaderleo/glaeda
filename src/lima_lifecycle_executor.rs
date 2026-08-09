@@ -39,6 +39,39 @@ pub enum LimaLifecycleExecutionPhase {
     Verify,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LimaLifecycleExecutionCheckpoint {
+    StopStarted,
+    StopCompleted,
+    EditStarted,
+    EditCompleted,
+    StartStarted,
+    StartCompleted,
+    VerifyStarted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LimaLifecycleExecutionJournalError;
+
+pub(crate) trait LimaLifecycleExecutionJournal {
+    fn checkpoint(
+        &mut self,
+        checkpoint: LimaLifecycleExecutionCheckpoint,
+    ) -> Result<(), LimaLifecycleExecutionJournalError>;
+}
+
+#[derive(Debug, Default)]
+struct NoopExecutionJournal;
+
+impl LimaLifecycleExecutionJournal for NoopExecutionJournal {
+    fn checkpoint(
+        &mut self,
+        _checkpoint: LimaLifecycleExecutionCheckpoint,
+    ) -> Result<(), LimaLifecycleExecutionJournalError> {
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LimaLifecycleExecutionRefusalCode {
@@ -56,6 +89,7 @@ pub enum LimaLifecycleExecutionRefusalCode {
     ProfileMismatch,
     ResourceMismatch,
     PersistentIdentityMismatch,
+    CheckpointFailed,
     CommandFailed,
     CommandIdentityMismatch,
     UnboundedOutput,
@@ -398,12 +432,36 @@ impl LimaLifecycleExecutor {
         E: TimedCommandExecutor,
         C: LimaObservationClock,
     {
+        self.execute_with_journal(
+            input,
+            observation_source,
+            command_executor,
+            clock,
+            &mut NoopExecutionJournal,
+        )
+    }
+
+    pub(crate) fn execute_with_journal<O, E, C, J>(
+        &self,
+        input: LimaLifecycleExecutionInput<'_>,
+        observation_source: &O,
+        command_executor: &E,
+        clock: &C,
+        journal: &mut J,
+    ) -> Result<LimaLifecycleExecution, LimaLifecycleExecutionFailure>
+    where
+        O: LimaLifecycleObservationSource,
+        E: TimedCommandExecutor,
+        C: LimaObservationClock,
+        J: LimaLifecycleExecutionJournal,
+    {
         let mut evidence = LimaLifecycleExecutionPrivateEvidence::default();
         let result = self.execute_inner(
             input,
             observation_source,
             command_executor,
             clock,
+            journal,
             &mut evidence,
         );
         match result {
@@ -418,18 +476,20 @@ impl LimaLifecycleExecutor {
         }
     }
 
-    fn execute_inner<O, E, C>(
+    fn execute_inner<O, E, C, J>(
         &self,
         input: LimaLifecycleExecutionInput<'_>,
         observation_source: &O,
         command_executor: &E,
         clock: &C,
+        journal: &mut J,
         evidence: &mut LimaLifecycleExecutionPrivateEvidence,
     ) -> Result<(LimaLifecycleExecutionReceipt, LimaInstanceObservationReport), ExecutionProblem>
     where
         O: LimaLifecycleObservationSource,
         E: TimedCommandExecutor,
         C: LimaObservationClock,
+        J: LimaLifecycleExecutionJournal,
     {
         let execution_unix_seconds = clock.unix_seconds().map_err(|_| {
             ExecutionProblem::new(
@@ -453,12 +513,16 @@ impl LimaLifecycleExecutor {
                 require_profile_and_generation(input.lifecycle, *profile, *profile_generation)?;
                 validate_report(input.current, LimaRuntimeState::Stopped, *profile, None)?;
 
-                self.run_command(
+                self.run_checkpointed_command(
                     command_executor,
                     evidence,
+                    journal,
                     LimaLifecycleExecutionPhase::Start,
+                    LimaLifecycleExecutionCheckpoint::StartStarted,
+                    LimaLifecycleExecutionCheckpoint::StartCompleted,
                     self.start_command(),
                 )?;
+                checkpoint_execution(journal, LimaLifecycleExecutionCheckpoint::VerifyStarted)?;
                 let post = observe_verified(
                     observation_source,
                     input.observation_request,
@@ -506,21 +570,115 @@ impl LimaLifecycleExecutor {
                     *current_profile,
                     Some(input.expected_persistent_identity),
                 )?;
+                let transition = match target_after_stop {
+                    PersonalWorkerProfile::Stopped => None,
+                    PersonalWorkerProfile::Interactive | PersonalWorkerProfile::Work => {
+                        let target_profile = match target_after_stop {
+                            PersonalWorkerProfile::Interactive => LimaResourceProfile::Interactive,
+                            PersonalWorkerProfile::Work => LimaResourceProfile::Work,
+                            PersonalWorkerProfile::Stopped => unreachable!(),
+                        };
+                        if target_profile == *current_profile {
+                            return Err(ExecutionProblem::new(
+                                LimaLifecycleExecutionRefusalCode::ProfileMismatch,
+                                LimaLifecycleExecutionPhase::InputValidation,
+                                "a stop profile transition must select a different reviewed profile",
+                            ));
+                        }
+                        let next_generation = profile_generation
+                            .get()
+                            .checked_add(1)
+                            .and_then(|value| LimaProfileGeneration::new(value).ok())
+                            .ok_or_else(|| {
+                                ExecutionProblem::new(
+                                    LimaLifecycleExecutionRefusalCode::GenerationMismatch,
+                                    LimaLifecycleExecutionPhase::InputValidation,
+                                    "a stop profile transition generation cannot advance",
+                                )
+                            })?;
+                        Some((target_profile, next_generation))
+                    }
+                };
 
-                self.run_command(
+                self.run_checkpointed_command(
                     command_executor,
                     evidence,
+                    journal,
                     LimaLifecycleExecutionPhase::Stop,
+                    LimaLifecycleExecutionCheckpoint::StopStarted,
+                    LimaLifecycleExecutionCheckpoint::StopCompleted,
                     self.stop_command(),
                 )?;
-                let post = observe_verified(
+                if transition.is_none() {
+                    checkpoint_execution(journal, LimaLifecycleExecutionCheckpoint::VerifyStarted)?;
+                }
+                let stopped = observe_verified(
                     observation_source,
                     input.observation_request,
                     command_executor,
                     clock,
                 )?;
-                validate_static_identity(input.current, &post)?;
-                validate_report(&post, LimaRuntimeState::Stopped, *current_profile, None)?;
+                validate_static_identity(input.current, &stopped)?;
+                validate_report(&stopped, LimaRuntimeState::Stopped, *current_profile, None)?;
+                let (post, after_state, after_generation, after_profile) = match transition {
+                    None => (
+                        stopped,
+                        LimaLifecycleState::Stopped,
+                        *profile_generation,
+                        *current_profile,
+                    ),
+                    Some((target_profile, next_generation)) => {
+                        self.run_checkpointed_command(
+                            command_executor,
+                            evidence,
+                            journal,
+                            LimaLifecycleExecutionPhase::Edit,
+                            LimaLifecycleExecutionCheckpoint::EditStarted,
+                            LimaLifecycleExecutionCheckpoint::EditCompleted,
+                            self.edit_command(target_profile),
+                        )?;
+                        let edited = observe_verified(
+                            observation_source,
+                            input.observation_request,
+                            command_executor,
+                            clock,
+                        )?;
+                        validate_static_identity(&stopped, &edited)?;
+                        validate_report(&edited, LimaRuntimeState::Stopped, target_profile, None)?;
+                        self.run_checkpointed_command(
+                            command_executor,
+                            evidence,
+                            journal,
+                            LimaLifecycleExecutionPhase::Start,
+                            LimaLifecycleExecutionCheckpoint::StartStarted,
+                            LimaLifecycleExecutionCheckpoint::StartCompleted,
+                            self.start_command(),
+                        )?;
+                        checkpoint_execution(
+                            journal,
+                            LimaLifecycleExecutionCheckpoint::VerifyStarted,
+                        )?;
+                        let running = observe_verified(
+                            observation_source,
+                            input.observation_request,
+                            command_executor,
+                            clock,
+                        )?;
+                        validate_static_identity(&edited, &running)?;
+                        validate_report(
+                            &running,
+                            LimaRuntimeState::Running,
+                            target_profile,
+                            Some(input.expected_persistent_identity),
+                        )?;
+                        (
+                            running,
+                            LimaLifecycleState::Running,
+                            next_generation,
+                            target_profile,
+                        )
+                    }
+                };
                 Ok((
                     receipt(
                         input.accepted,
@@ -528,9 +686,9 @@ impl LimaLifecycleExecutor {
                             target_after_stop: *target_after_stop,
                         },
                         input.lifecycle,
-                        LimaLifecycleState::Stopped,
-                        *profile_generation,
-                        *current_profile,
+                        after_state,
+                        after_generation,
+                        after_profile,
                         before_disk,
                         input.expected_persistent_identity.clone(),
                     ),
@@ -573,46 +731,30 @@ impl LimaLifecycleExecutor {
                     None,
                 )?;
 
-                self.run_command(
+                self.run_checkpointed_command(
                     command_executor,
                     evidence,
+                    journal,
                     LimaLifecycleExecutionPhase::Edit,
+                    LimaLifecycleExecutionCheckpoint::EditStarted,
+                    LimaLifecycleExecutionCheckpoint::EditCompleted,
                     self.edit_command(*to_profile),
                 )?;
-                let edited = observe_verified(
-                    observation_source,
-                    input.observation_request,
-                    command_executor,
-                    clock,
-                )?;
-                validate_static_identity(input.current, &edited)?;
-                validate_report(&edited, LimaRuntimeState::Stopped, *to_profile, None)?;
-
-                self.run_command(
-                    command_executor,
-                    evidence,
-                    LimaLifecycleExecutionPhase::Start,
-                    self.start_command(),
-                )?;
+                checkpoint_execution(journal, LimaLifecycleExecutionCheckpoint::VerifyStarted)?;
                 let post = observe_verified(
                     observation_source,
                     input.observation_request,
                     command_executor,
                     clock,
                 )?;
-                validate_static_identity(&edited, &post)?;
-                validate_report(
-                    &post,
-                    LimaRuntimeState::Running,
-                    *to_profile,
-                    Some(input.expected_persistent_identity),
-                )?;
+                validate_static_identity(input.current, &post)?;
+                validate_report(&post, LimaRuntimeState::Stopped, *to_profile, None)?;
                 Ok((
                     receipt(
                         input.accepted,
                         LimaLifecycleExecutionAction::ChangeProfile,
                         input.lifecycle,
-                        LimaLifecycleState::Running,
+                        LimaLifecycleState::Stopped,
                         *next_generation,
                         *to_profile,
                         before_disk,
@@ -662,6 +804,26 @@ impl LimaLifecycleExecutor {
             .argument("--memory")
             .argument(memory_gib)
             .argument(self.instance.as_str())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_checkpointed_command<E, J>(
+        &self,
+        executor: &E,
+        evidence: &mut LimaLifecycleExecutionPrivateEvidence,
+        journal: &mut J,
+        phase: LimaLifecycleExecutionPhase,
+        started: LimaLifecycleExecutionCheckpoint,
+        completed: LimaLifecycleExecutionCheckpoint,
+        command: CommandSpec,
+    ) -> Result<(), ExecutionProblem>
+    where
+        E: TimedCommandExecutor,
+        J: LimaLifecycleExecutionJournal,
+    {
+        checkpoint_execution(journal, started)?;
+        self.run_command(executor, evidence, phase, command)?;
+        checkpoint_execution(journal, completed)
     }
 
     fn run_command<E>(
@@ -714,6 +876,33 @@ impl LimaLifecycleExecutor {
         }
         Ok(())
     }
+}
+
+fn checkpoint_execution<J>(
+    journal: &mut J,
+    checkpoint: LimaLifecycleExecutionCheckpoint,
+) -> Result<(), ExecutionProblem>
+where
+    J: LimaLifecycleExecutionJournal,
+{
+    journal.checkpoint(checkpoint).map_err(|_| {
+        let phase = match checkpoint {
+            LimaLifecycleExecutionCheckpoint::StopStarted
+            | LimaLifecycleExecutionCheckpoint::StopCompleted => LimaLifecycleExecutionPhase::Stop,
+            LimaLifecycleExecutionCheckpoint::EditStarted
+            | LimaLifecycleExecutionCheckpoint::EditCompleted => LimaLifecycleExecutionPhase::Edit,
+            LimaLifecycleExecutionCheckpoint::StartStarted
+            | LimaLifecycleExecutionCheckpoint::StartCompleted => {
+                LimaLifecycleExecutionPhase::Start
+            }
+            LimaLifecycleExecutionCheckpoint::VerifyStarted => LimaLifecycleExecutionPhase::Verify,
+        };
+        ExecutionProblem::new(
+            LimaLifecycleExecutionRefusalCode::CheckpointFailed,
+            phase,
+            "the durable Lima lifecycle checkpoint could not be published",
+        )
+    })
 }
 
 impl fmt::Debug for LimaLifecycleExecutor {
