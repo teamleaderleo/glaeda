@@ -16,7 +16,7 @@ for command in \
   /usr/bin/mount \
   /usr/bin/podman \
   /usr/bin/python3 \
-  /usr/bin/runuser \
+  /usr/sbin/runuser \
   /usr/bin/stat \
   /usr/bin/systemd-run \
   /usr/bin/umount; do
@@ -163,26 +163,26 @@ printf 'this is deliberately invalid persistent runner configuration\n' \
   > "$probe_root/hostile-home/.config/containers/containers.conf"
 chown -R "$probe_uid:$probe_gid" "$probe_root/hostile-home"
 
-/usr/bin/runuser -u "$probe_user" -- /usr/bin/env -i \
+/usr/sbin/runuser -u "$probe_user" -- /usr/bin/env -i \
   HOME="$probe_root/hostile-home" \
   LC_ALL=C \
   PATH=/usr/bin \
   /usr/bin/git init --quiet "$probe_root/git-source"
 printf 'smolrunner closure probe\n' > "$probe_root/git-source/input.txt"
 chown "$probe_uid:$probe_gid" "$probe_root/git-source/input.txt"
-/usr/bin/runuser -u "$probe_user" -- /usr/bin/env -i \
+/usr/sbin/runuser -u "$probe_user" -- /usr/bin/env -i \
   HOME="$probe_root/hostile-home" \
   LC_ALL=C \
   PATH=/usr/bin \
   /usr/bin/git -C "$probe_root/git-source" -c user.name=probe -c user.email=probe.invalid \
   add input.txt
-/usr/bin/runuser -u "$probe_user" -- /usr/bin/env -i \
+/usr/sbin/runuser -u "$probe_user" -- /usr/bin/env -i \
   HOME="$probe_root/hostile-home" \
   LC_ALL=C \
   PATH=/usr/bin \
   /usr/bin/git -C "$probe_root/git-source" -c user.name=probe -c user.email=probe.invalid \
   commit --quiet -m probe
-probe_tree=$(/usr/bin/runuser -u "$probe_user" -- /usr/bin/env -i \
+probe_tree=$(/usr/sbin/runuser -u "$probe_user" -- /usr/bin/env -i \
   HOME="$probe_root/hostile-home" LC_ALL=C PATH=/usr/bin \
   /usr/bin/git -C "$probe_root/git-source" rev-parse 'HEAD^{tree}')
 
