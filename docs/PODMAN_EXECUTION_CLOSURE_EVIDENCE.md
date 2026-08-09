@@ -94,6 +94,33 @@ systemd-private runpath. This is an opaque current prerequisite only. It does no
 the interpreter or any transitive library, inspect loader configuration/cache ownership, prove
 package identity, construct classes 8–18, execute a command, or seal runtime readiness.
 
+### Dynamic-loader state prerequisite evidence
+
+- Observer implementation commit: `0d57507bbea68ed558bc02eca9bb2f48ff4bb9d1`
+- Workflow run: [31336046923](https://github.com/teamleaderleo/smolrunner/actions/runs/31336046923)
+- ARM64 job: [93301971865](https://github.com/teamleaderleo/smolrunner/actions/runs/31336046923/job/93301971865)
+- x86_64 job: [93301971848](https://github.com/teamleaderleo/smolrunner/actions/runs/31336046923/job/93301971848)
+- Date: 2026-08-09
+- Result: both jobs descriptor-opened, parsed, and revalidated the fixed Noble root loader
+  configuration, every included non-hidden `.conf` fragment, and the current loader cache while
+  proving `ld.so.preload` absent before and after observation.
+
+The observer bounds the complete fragment enumeration before opening every matched file, requires
+protected root-owned directory chains and exact root/group, mode, regular-file, single-link, and
+byte policy, and uses independent directory descriptions so the confirming enumeration starts at
+the beginning. It double-reads every held file, binds project/architecture/config/cache semantics,
+and revalidates held descriptors, bytes, pathname entries, included names, preload absence, and
+every directory chain around the complete observation. The copied-state fixture also proves
+refusal of writable configuration, explicit preload state, an unreviewed search fragment, and
+mid-observation cache metadata drift; a leading-dot `.conf` remains outside glibc's fixed glob.
+
+The disposable workflow removes the hosted image's preinstalled `fakeroot` loader fragment and,
+when installed, the x86 `libc6-i386` biarch fragment before testing. Neither search directory is
+part of the native-64-bit personal-worker closure, and the production observer continues to refuse
+them. This is an opaque current prerequisite only. It does not open a configured search directory,
+trust or resolve a cached path, open the ELF interpreter or any transitive library, inspect package
+identity, construct classes 8–18, execute a command, or seal runtime readiness.
+
 ## Package baseline
 
 Both architectures reported the same Ubuntu Noble package versions:
@@ -189,6 +216,10 @@ Earlier disposable runs were intentionally allowed to fail and corrected these f
 - Noble catatonit is a static ELF with no interpreter, dynamic search policy, or `DT_NEEDED`
   dependency. Treating all eleven fixed top-level executables as dynamic makes the prerequisite
   unusable; the exception is exact to catatonit, while the other ten remain dynamic.
+- The GitHub-hosted image adds `fakeroot` and x86 biarch loader fragments that are absent from the
+  native-64-bit target closure. Parser-only checks failed to reveal that ambient authority; the
+  descriptor-bound observer refused it until the disposable fixture removed the unrelated
+  packages.
 
 These are contract changes, not compatibility relaxations: each ambient or mutable edge is now
 either made exact or remains blocking.
