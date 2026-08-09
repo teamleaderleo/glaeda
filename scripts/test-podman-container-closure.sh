@@ -451,6 +451,8 @@ read -r seccomp_owner seccomp_group seccomp_mode seccomp_links seccomp_size < <(
 if [[ $seccomp_owner != 0 ]] || [[ $seccomp_group != 0 ]] ||
   (( (8#$seccomp_mode & 0022) != 0 )) || [[ $seccomp_links != 1 ]] ||
   (( seccomp_size == 0 || seccomp_size > 1048576 )); then
+  printf 'seccomp_owner=%s seccomp_group=%s seccomp_mode=%s seccomp_links=%s seccomp_size=%s\n' \
+    "$seccomp_owner" "$seccomp_group" "$seccomp_mode" "$seccomp_links" "$seccomp_size" >&2
   printf 'error: exact packaged seccomp profile metadata is unsafe or unbounded\n' >&2
   exit 1
 fi
