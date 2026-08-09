@@ -5,6 +5,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
+use crate::lima_host_identity::{
+    LimaHostIdentityAdapter, LimaHostIdentityError, LimaHostIdentityErrorKind,
+    LimaHostIdentityObservation, LimaHostInstanceIdentity,
+};
 use crate::lima_lifecycle::LimaResourceProfile;
 use crate::lima_observation::{
     LimaInstanceObservation, LimaInstanceObservationReport, LimaObservationAdapter,
@@ -61,6 +65,7 @@ pub struct PersonalWorkerMacObservationReport {
 
 pub struct PersonalWorkerMacObservation {
     report: PersonalWorkerMacObservationReport,
+    lima_host_identity: LimaHostInstanceIdentity,
     lima_source_identity: LimaObservationSourceIdentity,
     lima_request_identity: LimaObservationRequestIdentity,
     private_evidence: PrivateEvidence,
@@ -86,6 +91,11 @@ impl PersonalWorkerMacObservation {
     pub const fn lima_request_identity(&self) -> &LimaObservationRequestIdentity {
         &self.lima_request_identity
     }
+
+    #[must_use]
+    pub const fn lima_host_identity(&self) -> &LimaHostInstanceIdentity {
+        &self.lima_host_identity
+    }
 }
 
 impl fmt::Debug for PersonalWorkerMacObservation {
@@ -107,6 +117,7 @@ struct PrivateEvidence {
     logical_cpu: ExecutionRecord,
     host_resources: MacOsResourceObservation,
     lima: LimaInstanceObservation,
+    lima_host_identity: LimaHostIdentityObservation,
 }
 
 impl PrivateEvidence {
@@ -116,8 +127,9 @@ impl PrivateEvidence {
             &self.logical_cpu,
             &self.host_resources,
             &self.lima,
+            &self.lima_host_identity,
         );
-        4
+        5
     }
 }
 
@@ -130,6 +142,7 @@ pub enum PersonalWorkerMacObservationErrorKind {
     Command,
     HostEvidence,
     LimaEvidence,
+    LimaHostIdentityEvidence,
 }
 
 #[derive(Serialize)]
@@ -142,8 +155,12 @@ pub struct PersonalWorkerMacObservationError {
     pub lima_code: Option<LimaObservationRefusalCode>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lima_phase: Option<LimaObservationPhase>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lima_host_identity_kind: Option<LimaHostIdentityErrorKind>,
     #[serde(skip)]
     private_lima_failure: Option<Box<LimaObservationFailure>>,
+    #[serde(skip)]
+    private_lima_host_identity_failure: Option<Box<LimaHostIdentityError>>,
 }
 
 impl PersonalWorkerMacObservationError {
@@ -160,7 +177,9 @@ impl PersonalWorkerMacObservationError {
             message,
             lima_code: None,
             lima_phase: None,
+            lima_host_identity_kind: None,
             private_lima_failure: None,
+            private_lima_host_identity_failure: None,
         }
     }
 
@@ -172,13 +191,34 @@ impl PersonalWorkerMacObservationError {
             message: "the exact Lima observation could not be established",
             lima_code: Some(error.code),
             lima_phase: Some(error.phase),
+            lima_host_identity_kind: None,
             private_lima_failure: Some(Box::new(error)),
+            private_lima_host_identity_failure: None,
+        }
+    }
+
+    fn from_lima_host_identity(error: LimaHostIdentityError) -> Self {
+        Self {
+            kind: PersonalWorkerMacObservationErrorKind::LimaHostIdentityEvidence,
+            field: "lima_host_identity",
+            code: "lima_host_identity_observation_failed",
+            message: "the exact Lima host identity observation could not be established",
+            lima_code: None,
+            lima_phase: None,
+            lima_host_identity_kind: Some(error.kind),
+            private_lima_failure: None,
+            private_lima_host_identity_failure: Some(Box::new(error)),
         }
     }
 
     #[must_use]
     pub fn private_lima_failure(&self) -> Option<&LimaObservationFailure> {
         self.private_lima_failure.as_deref()
+    }
+
+    #[must_use]
+    pub fn private_lima_host_identity_failure(&self) -> Option<&LimaHostIdentityError> {
+        self.private_lima_host_identity_failure.as_deref()
     }
 }
 
@@ -192,7 +232,12 @@ impl fmt::Debug for PersonalWorkerMacObservationError {
             .field("message", &self.message)
             .field("lima_code", &self.lima_code)
             .field("lima_phase", &self.lima_phase)
+            .field("lima_host_identity_kind", &self.lima_host_identity_kind)
             .field("private_lima_failure", &REDACTED_PRIVATE_EVIDENCE)
+            .field(
+                "private_lima_host_identity_failure",
+                &REDACTED_PRIVATE_EVIDENCE,
+            )
             .finish()
     }
 }
@@ -276,6 +321,9 @@ impl PersonalWorkerMacObservationAdapter {
         }
 
         let started_at_millis = read_clock(clock, "timing.started_at_millis")?;
+        let lima_host_identity = LimaHostIdentityAdapter
+            .observe(lima_request)
+            .map_err(PersonalWorkerMacObservationError::from_lima_host_identity)?;
         let bounded = TimeoutExecutor {
             executor,
             timeout: self.command_timeout,
@@ -320,6 +368,18 @@ impl PersonalWorkerMacObservationAdapter {
             .observe(lima_request, &bounded, &lima_clock)
             .map_err(PersonalWorkerMacObservationError::from_lima)?;
         let lima_profile = exact_lima_profile(lima.report())?;
+        if lima.report().configured.primary_disk_bytes != lima_host_identity.root_disk_bytes() {
+            return Err(PersonalWorkerMacObservationError::new(
+                PersonalWorkerMacObservationErrorKind::LimaHostIdentityEvidence,
+                "lima_host_identity.root_disk",
+                "lima_host_disk_size_mismatch",
+                "the host root disk length did not match the exact Lima observation",
+            ));
+        }
+
+        lima_host_identity
+            .confirm(lima_request)
+            .map_err(PersonalWorkerMacObservationError::from_lima_host_identity)?;
 
         let observed_at_millis = read_clock(clock, "timing.observed_at_millis")?;
         let duration_millis = observed_at_millis
@@ -376,6 +436,7 @@ impl PersonalWorkerMacObservationAdapter {
 
         Ok(PersonalWorkerMacObservation {
             report,
+            lima_host_identity: lima_host_identity.identity().clone(),
             lima_source_identity: lima_request.source_identity(),
             lima_request_identity: lima_request.request_identity().clone(),
             private_evidence: PrivateEvidence {
@@ -383,6 +444,7 @@ impl PersonalWorkerMacObservationAdapter {
                 logical_cpu,
                 host_resources,
                 lima,
+                lima_host_identity,
             },
         })
     }

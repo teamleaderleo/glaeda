@@ -470,6 +470,7 @@ impl ActionsRunnerReadinessAdapter {
 
     fn base_command(&self, request: &ActionsRunnerReadinessRequest) -> CommandSpec {
         CommandSpec::new(&self.limactl_program)
+            .environment("HOME", LIMACTL_SAFE_HOME)
             .environment("LIMA_HOME", exact_path(&request.lima_home))
             .environment("LANG", "C")
             .environment("LC_ALL", "C")

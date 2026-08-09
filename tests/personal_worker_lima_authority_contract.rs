@@ -9,6 +9,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+mod lima_host_identity_support;
+
+use lima_host_identity_support::LimaHostIdentityFixture;
+
 use smolrunner::artifact::{CommitId, GitTreeId, RepositoryRef, Sha256Digest};
 use smolrunner::execution_admission::{
     EpochMillis, ExecutionRequestId, ExecutionResourceLimits, HostCapacityObservation,
@@ -68,11 +72,17 @@ use smolrunner::unix_personal_worker_store::lima_authority::{
 };
 use smolrunner::verification_profile::{CacheId, VerificationProfileId};
 
-const LIMA_HOME: &str = "/Users/operator/.lima";
 const CACHE_PATH: &str = "/home/runner/.cache/cargo";
-const INSTANCE_DIRECTORY: &str = "/Users/operator/.lima/smolrunner";
 const DISK_BYTES: u64 = 80 * 1024 * 1024 * 1024;
 static NEXT_STATE_ROOT: AtomicU64 = AtomicU64::new(1);
+thread_local! {
+    static LIMA_HOST_FIXTURE: LimaHostIdentityFixture =
+        LimaHostIdentityFixture::new("lima-authority", "smolrunner");
+}
+
+fn lima_home() -> String {
+    LIMA_HOST_FIXTURE.with(LimaHostIdentityFixture::lima_home_string)
+}
 
 struct TempStateRoot(PathBuf);
 
@@ -250,8 +260,10 @@ fn host_outputs() -> Vec<String> {
 fn instance_json(state: &str, profile: LimaResourceProfile) -> String {
     let envelope = profile.envelope();
     format!(
-        "{{\"name\":\"smolrunner\",\"status\":\"{state}\",\"dir\":\"{INSTANCE_DIRECTORY}\",\"vmType\":\"vz\",\"arch\":\"aarch64\",\"cpus\":{},\"memory\":{},\"disk\":{DISK_BYTES},\"errors\":[]}}\n",
-        envelope.vcpus, envelope.memory_bytes
+        "{{\"name\":\"smolrunner\",\"status\":\"{state}\",\"dir\":\"{}/smolrunner\",\"vmType\":\"vz\",\"arch\":\"aarch64\",\"cpus\":{},\"memory\":{},\"disk\":{DISK_BYTES},\"errors\":[]}}\n",
+        lima_home(),
+        envelope.vcpus,
+        envelope.memory_bytes
     )
 }
 
@@ -302,7 +314,7 @@ fn mac_observation_profile(
         .expect("Mac adapter")
         .observe(
             &config(),
-            &request(LIMA_HOME, CACHE_PATH),
+            &request(&lima_home(), CACHE_PATH),
             &LimaObservationAdapter::new("/opt/homebrew/bin/limactl").expect("Lima adapter"),
             &executor,
             &clock,
@@ -490,7 +502,7 @@ fn stop_tick(lifecycle: &LimaLifecycleObservation) -> PersonalWorkerTickPlan {
 fn enrolled() -> PersonalWorkerLimaAuthorityDocument {
     let config = config();
     let running = mac_observation(true, 100_000);
-    let request = request(LIMA_HOME, CACHE_PATH);
+    let request = request(&lima_home(), CACHE_PATH);
     let confirmation = personal_worker_lima_enrollment_confirmation(
         &config,
         &running,
@@ -539,7 +551,7 @@ fn persist_completed_work_attempt(
     guard: &mut UnixPersonalWorkerLimaAuthorityGuard,
 ) -> PersonalWorkerLimaAuthorityDocument {
     let config = config();
-    let request = request(LIMA_HOME, CACHE_PATH);
+    let request = request(&lima_home(), CACHE_PATH);
     let before = lifecycle_profile(
         LimaLifecycleState::Running,
         LimaResourceProfile::Interactive,
@@ -608,7 +620,7 @@ fn persist_completed_work_attempt(
 #[test]
 fn enrollment_uses_sealed_running_identity_and_has_canonical_private_encoding() {
     let running = mac_observation(true, 100_000);
-    let request = request(LIMA_HOME, CACHE_PATH);
+    let request = request(&lima_home(), CACHE_PATH);
     let confirmation = personal_worker_lima_enrollment_confirmation(
         &config(),
         &running,
@@ -640,7 +652,14 @@ fn enrollment_uses_sealed_running_identity_and_has_canonical_private_encoding() 
     assert_eq!(decoded, document);
     let text = String::from_utf8(bytes).expect("JSON");
     let debug = format!("{document:?}");
-    for private in [LIMA_HOME, CACHE_PATH, INSTANCE_DIRECTORY, "/Users/operator"] {
+    let instance_directory = format!("{}/smolrunner", lima_home());
+    let lima_home_path = lima_home();
+    for private in [
+        lima_home_path.as_str(),
+        CACHE_PATH,
+        instance_directory.as_str(),
+        "/Users/operator",
+    ] {
         assert!(!text.contains(private), "encoding leaked {private}");
         assert!(!debug.contains(private), "Debug leaked {private}");
     }
@@ -694,7 +713,7 @@ fn complete_private_request_drift_is_refused_before_an_attempt() {
     let tick = worker_tick(&stopped_lifecycle);
     for drifted in [
         request("/Users/operator/.other-lima", CACHE_PATH),
-        request(LIMA_HOME, "/home/runner/.cache/other"),
+        request(&lima_home(), "/home/runner/.cache/other"),
     ] {
         let error = authority
             .begin_attempt(PersonalWorkerLimaAttemptInput {
@@ -742,7 +761,7 @@ fn prepared_attempt_blocks_replay_and_follows_exact_durable_phase_graph() {
         .begin_attempt(PersonalWorkerLimaAttemptInput {
             config: &config(),
             mac: &before_mac,
-            request: &request(LIMA_HOME, CACHE_PATH),
+            request: &request(&lima_home(), CACHE_PATH),
             lifecycle: &before,
             tick: &tick,
         })
@@ -766,7 +785,7 @@ fn prepared_attempt_blocks_replay_and_follows_exact_durable_phase_graph() {
         .begin_attempt(PersonalWorkerLimaAttemptInput {
             config: &config(),
             mac: &before_mac,
-            request: &request(LIMA_HOME, CACHE_PATH),
+            request: &request(&lima_home(), CACHE_PATH),
             lifecycle: &before,
             tick: &tick,
         })
@@ -872,10 +891,12 @@ fn prepared_attempt_blocks_replay_and_follows_exact_durable_phase_graph() {
     let recovery_debug = format!("{:?}", verifying.recovery_report());
     let machine_identity = "a".repeat(64);
     let cache_identity = "b".repeat(64);
+    let instance_directory = format!("{}/smolrunner", lima_home());
+    let lima_home_path = lima_home();
     for forbidden in [
-        LIMA_HOME,
+        lima_home_path.as_str(),
         CACHE_PATH,
-        INSTANCE_DIRECTORY,
+        instance_directory.as_str(),
         machine_identity.as_str(),
         cache_identity.as_str(),
         "/proc/self/fd",
@@ -889,7 +910,7 @@ fn prepared_attempt_blocks_replay_and_follows_exact_durable_phase_graph() {
             generation,
             &config(),
             &running,
-            &request(LIMA_HOME, CACHE_PATH),
+            &request(&lima_home(), CACHE_PATH),
             &lifecycle_with_generation(
                 LimaLifecycleState::Running,
                 LimaResourceProfile::Work,
@@ -939,7 +960,7 @@ fn stopped_start_and_profile_change_refuse_without_current_immutable_ownership()
         .begin_attempt(PersonalWorkerLimaAttemptInput {
             config: &config(),
             mac: &mac_observation(false, 200_000),
-            request: &request(LIMA_HOME, CACHE_PATH),
+            request: &request(&lima_home(), CACHE_PATH),
             lifecycle: &before,
             tick: &tick,
         })
@@ -964,7 +985,7 @@ fn stopped_start_and_profile_change_refuse_without_current_immutable_ownership()
         .begin_attempt(PersonalWorkerLimaAttemptInput {
             config: &config(),
             mac: &mac_observation_profile(false, 200_000, LimaResourceProfile::Work),
-            request: &request(LIMA_HOME, CACHE_PATH),
+            request: &request(&lima_home(), CACHE_PATH),
             lifecycle: &stopped_work,
             tick: &start_tick,
         })
@@ -995,7 +1016,7 @@ fn stop_attempt_preserves_the_exact_b01_target_after_stop() {
         .begin_attempt(PersonalWorkerLimaAttemptInput {
             config: &config(),
             mac: &mac_observation_profile(true, 1_896_000, LimaResourceProfile::Work),
-            request: &request(LIMA_HOME, CACHE_PATH),
+            request: &request(&lima_home(), CACHE_PATH),
             lifecycle: &before,
             tick: &tick,
         })
@@ -1037,7 +1058,7 @@ fn exhausted_authority_generation_refuses_without_reusing_a_generation() {
         .begin_attempt(PersonalWorkerLimaAttemptInput {
             config: &config(),
             mac: &before_mac,
-            request: &request(LIMA_HOME, CACHE_PATH),
+            request: &request(&lima_home(), CACHE_PATH),
             lifecycle: &before,
             tick: &tick,
         })
@@ -1071,7 +1092,7 @@ fn settlement_reserves_its_clear_generation_before_publishing() {
 
     let config = config();
     let mac = mac_observation(true, 100_000);
-    let request = request(LIMA_HOME, CACHE_PATH);
+    let request = request(&lima_home(), CACHE_PATH);
     let confirmation =
         personal_worker_lima_enrollment_confirmation(&config, &mac, &request, broker_identity())
             .expect("confirmation");
@@ -1139,7 +1160,7 @@ fn strict_decode_binds_each_phase_to_its_exact_durable_generation_delta() {
         .begin_attempt(PersonalWorkerLimaAttemptInput {
             config: &config(),
             mac: &before_mac,
-            request: &request(LIMA_HOME, CACHE_PATH),
+            request: &request(&lima_home(), CACHE_PATH),
             lifecycle: &before,
             tick: &tick,
         })
@@ -1247,7 +1268,7 @@ fn unix_sidecar_publishes_only_confirmed_enrollment_under_the_canonical_store_lo
 
     let config = config();
     let mac = mac_observation(true, 100_000);
-    let request = request(LIMA_HOME, CACHE_PATH);
+    let request = request(&lima_home(), CACHE_PATH);
     let confirmation =
         personal_worker_lima_enrollment_confirmation(&config, &mac, &request, broker_identity())
             .expect("confirmation");
@@ -1405,7 +1426,7 @@ fn unix_sidecar_requires_fresh_enrollment_evidence_at_publication() {
 
     let config = config();
     let mac = mac_observation(true, 100_000);
-    let request = request(LIMA_HOME, CACHE_PATH);
+    let request = request(&lima_home(), CACHE_PATH);
     let confirmation =
         personal_worker_lima_enrollment_confirmation(&config, &mac, &request, broker_identity())
             .expect("confirmation");
@@ -1463,7 +1484,7 @@ fn unix_sidecar_refuses_to_splice_orphan_authority_onto_a_fresh_worker() {
 
     let config = config();
     let mac = mac_observation(true, 100_000);
-    let request = request(LIMA_HOME, CACHE_PATH);
+    let request = request(&lima_home(), CACHE_PATH);
     let confirmation =
         personal_worker_lima_enrollment_confirmation(&config, &mac, &request, broker_identity())
             .expect("confirmation");
@@ -1524,7 +1545,7 @@ fn unix_completed_settlement_recovers_exact_worker_successor_before_clearing_aut
 
     let config = config();
     let mac = mac_observation(true, 100_000);
-    let request = request(LIMA_HOME, CACHE_PATH);
+    let request = request(&lima_home(), CACHE_PATH);
     let confirmation =
         personal_worker_lima_enrollment_confirmation(&config, &mac, &request, broker_identity())
             .expect("confirmation");
@@ -1628,7 +1649,7 @@ fn unix_sidecar_poisoned_publication_guard_cannot_retry_after_ambiguous_failure(
 
     let config = config();
     let mac = mac_observation(true, 100_000);
-    let request = request(LIMA_HOME, CACHE_PATH);
+    let request = request(&lima_home(), CACHE_PATH);
     let confirmation =
         personal_worker_lima_enrollment_confirmation(&config, &mac, &request, broker_identity())
             .expect("confirmation");
