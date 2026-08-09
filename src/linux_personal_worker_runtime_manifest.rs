@@ -548,7 +548,8 @@ fn verify_file_entry(
     let held = fs::fstat(file).map_err(|_| io_error())?;
     inspect_private_file_stat(&held, owner, max_bytes)?;
     let path = fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW).map_err(|_| changed_error())?;
-    if !same_object(&held, &path) {
+    inspect_private_file_stat(&path, owner, max_bytes)?;
+    if !same_file_snapshot(&held, &path) {
         return Err(changed_error());
     }
     Ok(())
