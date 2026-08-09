@@ -231,10 +231,12 @@ pub fn parse_linux_runtime_elf_dependency(
         Some(header) => Some(parse_interpreter(bytes, header, parsed.architecture)?),
         None => None,
     };
-    let dynamic_values = parsed.dynamic.unwrap_or_default();
-    if loader.is_some() != parsed.has_dynamic
-        || (loader.is_none() && !dynamic_values.needed.is_empty())
-    {
+    let has_dynamic = parsed.dynamic.is_some();
+    let dynamic_values = match parsed.dynamic {
+        Some(header) => parse_dynamic(bytes, header, &parsed.loads)?,
+        None => DynamicValues::default(),
+    };
+    if loader.is_some() != has_dynamic || (loader.is_none() && !dynamic_values.needed.is_empty()) {
         return Err(format_error());
     }
 
@@ -272,10 +274,14 @@ pub fn parse_linux_runtime_loader_object(
     expected_architecture: PersonalWorkerRuntimeArchitecture,
 ) -> Result<LinuxRuntimeLoaderObject, LinuxRuntimeElfError> {
     let parsed = parse_runtime_elf(bytes, expected_architecture)?;
-    if parsed.elf_type != ET_DYN || parsed.interpreter.is_some() || !parsed.has_dynamic {
+    if parsed.elf_type != ET_DYN || parsed.interpreter.is_some() || parsed.dynamic.is_none() {
         return Err(format_error());
     }
-    let dynamic = parsed.dynamic.ok_or_else(format_error)?;
+    let dynamic = parse_dynamic(
+        bytes,
+        parsed.dynamic.ok_or_else(format_error)?,
+        &parsed.loads,
+    )?;
     let (needed, dynamic_search) =
         resolve_dynamic_strings(bytes, &parsed.loads, parsed.architecture, dynamic)?;
     if !needed.is_empty() || dynamic_search != LinuxRuntimeDynamicSearchPolicy::Default {
@@ -296,8 +302,7 @@ struct ParsedRuntimeElf {
     architecture: PersonalWorkerRuntimeArchitecture,
     loads: Vec<ProgramHeader>,
     interpreter: Option<ProgramHeader>,
-    has_dynamic: bool,
-    dynamic: Option<DynamicValues>,
+    dynamic: Option<ProgramHeader>,
 }
 
 fn parse_runtime_elf(
@@ -406,16 +411,11 @@ fn parse_runtime_elf(
         return Err(format_error());
     }
 
-    let has_dynamic = dynamic.is_some();
-    let dynamic = dynamic
-        .map(|header| parse_dynamic(bytes, header, &loads))
-        .transpose()?;
     Ok(ParsedRuntimeElf {
         elf_type,
         architecture,
         loads,
         interpreter,
-        has_dynamic,
         dynamic,
     })
 }
@@ -960,6 +960,27 @@ mod tests {
         assert_eq!(
             parse_linux_runtime_elf_dependency(&elf, PersonalWorkerRuntimeArchitecture::Aarch64)
                 .expect_err("alternate interpreter")
+                .kind,
+            LinuxRuntimeElfErrorKind::UnsafeRuntimeSearch
+        );
+    }
+
+    #[test]
+    fn unsafe_interpreter_precedes_malformed_dynamic_metadata() {
+        let architecture = PersonalWorkerRuntimeArchitecture::X86_64;
+        let mut elf = dynamic_elf(architecture, &["libc.so.6"]);
+        let interpreter = b"/tmp/ld-linux-x86-64.so.2\0";
+        elf[INTERPRETER_OFFSET..INTERPRETER_OFFSET + interpreter.len()]
+            .copy_from_slice(interpreter);
+        write_u64(
+            &mut elf,
+            ELF_HEADER_BYTES + PROGRAM_HEADER_BYTES + 32,
+            interpreter.len() as u64,
+        );
+        write_dynamic(&mut elf, 0, DT_TEXTREL, 0);
+        assert_eq!(
+            parse_linux_runtime_elf_dependency(&elf, architecture)
+                .expect_err("unsafe interpreter precedes invalid dynamic metadata")
                 .kind,
             LinuxRuntimeElfErrorKind::UnsafeRuntimeSearch
         );
