@@ -56,9 +56,15 @@ impl fmt::Debug for LimaHostInstanceIdentity {
 
 pub struct LimaHostIdentityObservation {
     identity: LimaHostInstanceIdentity,
+    lima_home: OwnedFd,
+    lima_home_stat: rustix::fs::Stat,
     instance_directory: OwnedFd,
+    instance_stat: rustix::fs::Stat,
     platform_identifier: File,
+    identifier_stat: rustix::fs::Stat,
     root_disk: File,
+    root_disk_stat: rustix::fs::Stat,
+    root_disk_bytes: u64,
 }
 
 impl LimaHostIdentityObservation {
@@ -66,11 +72,40 @@ impl LimaHostIdentityObservation {
     pub const fn identity(&self) -> &LimaHostInstanceIdentity {
         &self.identity
     }
+
+    pub(crate) const fn root_disk_bytes(&self) -> u64 {
+        self.root_disk_bytes
+    }
+
+    pub(crate) fn confirm(
+        &self,
+        request: &LimaObservationRequest,
+    ) -> Result<(), LimaHostIdentityError> {
+        let held_evidence = HeldIdentityEvidence {
+            lima_home: &self.lima_home,
+            lima_home_stat: &self.lima_home_stat,
+            instance_directory: &self.instance_directory,
+            instance_stat: &self.instance_stat,
+            identifier: &self.platform_identifier,
+            identifier_stat: &self.identifier_stat,
+            root_disk: &self.root_disk,
+            root_disk_stat: &self.root_disk_stat,
+        };
+        held_evidence.verify_bindings(request)?;
+        let identifier = read_identifier(&self.platform_identifier, &self.identifier_stat)?;
+        let disk = read_disk_evidence(&self.root_disk, self.root_disk_bytes)?;
+        held_evidence.verify_bindings(request)?;
+        if derive_identity(&identifier, self.root_disk_bytes, &disk)? != self.identity {
+            return Err(drift("host_identity"));
+        }
+        Ok(())
+    }
 }
 
 impl fmt::Debug for LimaHostIdentityObservation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let _ = (
+            &self.lima_home,
             &self.instance_directory,
             &self.platform_identifier,
             &self.root_disk,
@@ -218,27 +253,17 @@ impl LimaHostIdentityAdapter {
         }
         held_evidence.verify_bindings(request)?;
 
-        let identifier_digest = digest_fields(
-            b"smolrunner-lima-vz-identifier-v1",
-            [identifier_again.as_slice()],
-        );
-        let disk_length = root_disk_bytes.to_be_bytes();
-        let disk_digest = digest_fields(
-            DISK_DOMAIN,
-            [disk_length.as_slice(), disk_evidence_again.as_slice()],
-        );
-        let digest = digest_fields(
-            IDENTITY_DOMAIN,
-            [identifier_digest.as_slice(), disk_digest.as_slice()],
-        );
-
         Ok(LimaHostIdentityObservation {
-            identity: LimaHostInstanceIdentity {
-                digest: parse_digest(digest)?,
-            },
+            identity: derive_identity(&identifier_again, root_disk_bytes, &disk_evidence_again)?,
+            lima_home,
+            lima_home_stat,
             instance_directory,
+            instance_stat,
             platform_identifier: identifier,
+            identifier_stat,
             root_disk,
+            root_disk_stat,
+            root_disk_bytes,
         })
     }
 }
@@ -660,6 +685,23 @@ fn digest_fields<'a>(domain: &[u8], fields: impl IntoIterator<Item = &'a [u8]>) 
         digest.update(field);
     }
     digest.finalize().into()
+}
+
+fn derive_identity(
+    identifier: &[u8],
+    root_disk_bytes: u64,
+    disk_evidence: &[u8],
+) -> Result<LimaHostInstanceIdentity, LimaHostIdentityError> {
+    let identifier_digest = digest_fields(b"smolrunner-lima-vz-identifier-v1", [identifier]);
+    let disk_length = root_disk_bytes.to_be_bytes();
+    let disk_digest = digest_fields(DISK_DOMAIN, [disk_length.as_slice(), disk_evidence]);
+    let digest = digest_fields(
+        IDENTITY_DOMAIN,
+        [identifier_digest.as_slice(), disk_digest.as_slice()],
+    );
+    Ok(LimaHostInstanceIdentity {
+        digest: parse_digest(digest)?,
+    })
 }
 
 fn parse_digest(bytes: [u8; 32]) -> Result<Sha256Digest, LimaHostIdentityError> {

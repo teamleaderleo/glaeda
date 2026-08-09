@@ -10,9 +10,9 @@ use crate::lima_lifecycle::{
     LimaResourceEnvelope, LimaResourceProfile, MAX_LIMA_OBSERVATION_AGE_MILLIS,
 };
 use crate::lima_observation::{
-    LimaGuestObservation, LimaInstanceName, LimaInstanceObservationReport, LimaObservationAdapter,
-    LimaObservationClock, LimaObservationFreshness, LimaObservationRequest, LimaPersistentIdentity,
-    LimaRuntimeState,
+    LIMACTL_SAFE_HOME, LimaGuestObservation, LimaInstanceName, LimaInstanceObservationReport,
+    LimaObservationAdapter, LimaObservationClock, LimaObservationFreshness, LimaObservationRequest,
+    LimaPersistentIdentity, LimaRuntimeState,
 };
 use crate::personal_worker_host_broker::{
     HostBrokerAction, HostBrokerPlan, HostBrokerStateRevision,
@@ -631,6 +631,7 @@ impl LimaLifecycleExecutor {
 
     fn base_command(&self) -> CommandSpec {
         CommandSpec::new(&self.limactl_program)
+            .environment("HOME", LIMACTL_SAFE_HOME)
             .secret_environment("LIMA_HOME", exact_private_path(&self.lima_home))
             .environment("LANG", "C")
             .environment("LC_ALL", "C")

@@ -5,7 +5,7 @@ use serde::Serialize;
 
 use crate::artifact::Sha256Digest;
 use crate::lima_observation::{
-    LimaFilesystemObjectIdentity, LimaGuestObservation, LimaInstanceName,
+    LIMACTL_SAFE_HOME, LimaFilesystemObjectIdentity, LimaGuestObservation, LimaInstanceName,
     LimaInstanceObservationReport, LimaObservationClock, LimaObservationFreshness,
     LimaObservationSourceIdentity, LimaObservationTiming, LimaRuntimeState,
 };

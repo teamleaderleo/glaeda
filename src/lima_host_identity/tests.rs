@@ -113,6 +113,20 @@ fn platform_identifier_and_gpt_changes_change_identity() {
 }
 
 #[test]
+fn held_observation_confirmation_refuses_later_gpt_drift() {
+    let fixture = Fixture::new();
+    let request = fixture.request();
+    let observation = fixture.observe().expect("initial identity");
+
+    write_test_disk(&fixture.instance.join(ROOT_DISK_FILE), [0x22; 16]);
+
+    let error = observation
+        .confirm(&request)
+        .expect_err("held observation must refuse changed GPT evidence");
+    assert_eq!(error.kind, LimaHostIdentityErrorKind::IdentityDrift);
+}
+
+#[test]
 fn missing_symlinked_hardlinked_and_writable_evidence_is_refused() {
     let missing = Fixture::new();
     std_fs::remove_file(missing.instance.join(VZ_IDENTIFIER_FILE)).expect("remove identifier");

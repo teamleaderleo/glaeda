@@ -11,17 +11,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 pub use smolrunner::{
-    actions_runner_readiness, artifact, execution_admission, lima_lifecycle, lima_observation,
-    mac_availability, macos_resource_observation, operator_config, personal_worker_operator_read,
-    personal_worker_queue, personal_worker_read_model, personal_worker_store, process,
-    unix_personal_worker_store, verification_profile,
+    actions_runner_readiness, artifact, execution_admission, lima_host_identity, lima_lifecycle,
+    lima_observation, mac_availability, macos_resource_observation, operator_config,
+    personal_worker_mac_observation, personal_worker_operator_read, personal_worker_queue,
+    personal_worker_read_model, personal_worker_store, process, unix_personal_worker_store,
+    verification_profile,
 };
 
-#[path = "../src/personal_worker_mac_observation.rs"]
-pub mod personal_worker_mac_observation;
+mod lima_host_identity_support;
+
 #[path = "../src/personal_worker_runner_readiness.rs"]
 mod personal_worker_runner_readiness;
 
+use lima_host_identity_support::LimaHostIdentityFixture;
 use personal_worker_mac_observation::{
     PersonalWorkerMacObservation, PersonalWorkerMacObservationAdapter,
     PersonalWorkerMacObservationClock, logical_cpu_command, vm_stat_command,
@@ -74,7 +76,6 @@ use smolrunner::verification_profile::{CacheId, VerificationProfileId};
 
 const GIB: u64 = 1_024 * 1_024 * 1_024;
 const BASE_MILLIS: u64 = 5_000_000;
-const LIMA_HOME: &str = "/Users/operator/.lima";
 const RUNNER_ROOT: &str = "/home/runner/actions-runner";
 const DRAIN_MARKER: &str = "/home/runner/actions-runner/.smolrunner-draining";
 const CACHE_PATH: &str = "/home/runner/.cache/cargo";
@@ -82,6 +83,14 @@ const CONFIG_HEX: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 const LISTENER_PID: u32 = 42;
 const WORKER_PID: u32 = 43;
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
+thread_local! {
+    static LIMA_HOST_FIXTURE: LimaHostIdentityFixture =
+        LimaHostIdentityFixture::new("runner-readiness", "smolrunner");
+}
+
+fn lima_home() -> String {
+    LIMA_HOST_FIXTURE.with(LimaHostIdentityFixture::lima_home_string)
+}
 
 struct TempRoot(PathBuf);
 
@@ -353,7 +362,7 @@ fn config_with_availability(root: &Path, availability: AvailabilityRequest) -> O
 }
 
 fn runner_request() -> ActionsRunnerReadinessRequest {
-    runner_request_for(LIMA_HOME)
+    runner_request_for(&lima_home())
 }
 
 fn runner_request_for(lima_home: &str) -> ActionsRunnerReadinessRequest {
@@ -399,7 +408,7 @@ fn sealed_mac_observation(
         config,
         state,
         LimaResourceProfile::Interactive,
-        LIMA_HOME,
+        &lima_home(),
         35_000,
         35,
     )
@@ -410,7 +419,7 @@ fn sealed_mac_observation_for_profile(
     state: LimaRuntimeState,
     profile: LimaResourceProfile,
 ) -> PersonalWorkerMacObservation {
-    sealed_mac_observation_with(config, state, profile, LIMA_HOME, 35_000, 35)
+    sealed_mac_observation_with(config, state, profile, &lima_home(), 35_000, 35)
 }
 
 fn sealed_mac_observation_with(
@@ -680,11 +689,12 @@ fn idle_ready_binds_exact_sources_timeout_and_private_evidence() {
             .keys()
             .map(String::as_str)
             .collect::<Vec<_>>()
-            == vec!["LANG", "LC_ALL", "LIMA_HOME"]
+            == vec!["HOME", "LANG", "LC_ALL", "LIMA_HOME"]
     }));
     let debug = format!("{observation:?}");
     let json = serde_json::to_string(report).expect("JSON");
-    for private in [RUNNER_ROOT, LIMA_HOME, "/proc/42", "/proc/43"] {
+    let lima_home = lima_home();
+    for private in [RUNNER_ROOT, lima_home.as_str(), "/proc/42", "/proc/43"] {
         assert!(!debug.contains(private));
         assert!(!json.contains(private));
     }
@@ -844,7 +854,7 @@ fn mismatched_private_lima_source_fails_before_runner_commands() {
     );
     assert!(executor.seen().is_empty());
     let source_debug = format!("{:?}", mac.lima_source_identity());
-    assert!(!source_debug.contains(LIMA_HOME));
+    assert!(!source_debug.contains(&lima_home()));
     assert!(source_debug.contains("<private-lima-home>"));
 }
 
@@ -892,7 +902,7 @@ fn stale_source_is_observation_debt_without_runner_commands() {
         &config,
         LimaRuntimeState::Running,
         LimaResourceProfile::Interactive,
-        LIMA_HOME,
+        &lima_home(),
         45_000,
         35,
     );
@@ -928,7 +938,7 @@ fn enclosing_mac_evidence_expiring_during_runner_observation_is_observation_debt
         &config,
         LimaRuntimeState::Running,
         LimaResourceProfile::Interactive,
-        LIMA_HOME,
+        &lima_home(),
         9_000,
         35,
     );

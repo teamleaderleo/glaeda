@@ -23,6 +23,7 @@ const GUEST_SHA256SUM: &str = "/usr/bin/sha256sum";
 const GUEST_STAT: &str = "/usr/bin/stat";
 const GUEST_MACHINE_ID: &str = "/etc/machine-id";
 const REDACTED_PRIVATE_EVIDENCE: &str = "<private-lima-command-evidence>";
+pub(crate) const LIMACTL_SAFE_HOME: &str = "/var/empty";
 const LIMA_OBSERVATION_REQUEST_IDENTITY_DOCUMENT_TYPE: &str =
     "smolrunner-lima-observation-request-identity";
 
@@ -411,8 +412,9 @@ impl LimaObservationAdapter {
     /// Observe one configured Lima instance and, when running, its exact guest resource identity.
     ///
     /// Every subprocess is one fixed direct `limactl` invocation. The process environment contains
-    /// only `LIMA_HOME`, `LANG`, and `LC_ALL`; no shell, generic guest command, profile decision,
-    /// lifecycle mutation, credential, timer, runner control, or cache mutation is available.
+    /// only a fixed non-user `HOME`, exact `LIMA_HOME`, `LANG`, and `LC_ALL`; no shell, generic
+    /// guest command, profile decision, lifecycle mutation, credential, timer, runner control, or
+    /// cache mutation is available.
     ///
     /// # Errors
     ///
@@ -689,6 +691,7 @@ impl LimaObservationAdapter {
 
     fn base_command(&self, request: &LimaObservationRequest) -> CommandSpec {
         CommandSpec::new(&self.limactl_program)
+            .environment("HOME", LIMACTL_SAFE_HOME)
             .environment("LIMA_HOME", exact_private_path(&request.lima_home))
             .environment("LANG", "C")
             .environment("LC_ALL", "C")
