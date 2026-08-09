@@ -47,11 +47,11 @@ The exact fixture proves only these facts on both admitted architectures:
    attempt-private log configuration. It contains no host account name.
 6. A transient systemd service with `Delegate=yes` exposes CPU, memory, and PID controllers on both
    architectures. The fixture creates sibling supervisor and payload groups, moves the launcher to
-   the supervisor, enables only those controllers, and rereads exact outer limits of 75% CPU,
-   96 MiB memory, zero swap, and 64 tasks. It precreates the payload parent with 50% CPU, 64 MiB
-   memory, zero swap, and 32 PIDs before Podman runs. Stopped inspect preserves that exact parent and
-   the requested container limits; the generated OCI spec carries the exact Podman leaf below that
-   parent and one pathless private cgroup namespace. The live leaf exposes the same exact limits.
+   the supervisor, enables and rereads those required controllers, and rereads exact outer limits of
+   75% CPU, 96 MiB memory, zero swap, and 64 tasks. It precreates the payload parent with 50% CPU,
+   64 MiB memory, zero swap, and 32 PIDs before Podman runs. Stopped inspect preserves that exact parent
+   and the requested container limits; the generated OCI spec carries the exact Podman leaf below
+   that parent and one pathless private cgroup namespace. The live leaf exposes the same exact limits.
 7. Detached `podman start <exact-id>` returns the exact ID. Bounded exact-ID inspection polling
    reaches one stopped exit with code zero, and bounded `podman logs` returns only the expected
    SHA-256 results for the image-owned account files. The single-link log remains runner-owned,
