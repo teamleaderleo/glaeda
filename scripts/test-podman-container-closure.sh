@@ -890,7 +890,6 @@ snapshot_read_only_image_store() {
     --numeric-owner \
     --xattrs \
     --xattrs-include='*' \
-    --mtime=@0 \
     -C "$store" -cf - . |
     /usr/bin/sha256sum |
     /usr/bin/awk '{ print $1 }'
