@@ -117,7 +117,7 @@ runtime/conmon/init paths and prove the effective configuration contains no alte
 | OCI hook directories | a `precreate` hook can alter the OCI spec and add mounts | Pass one explicit root-owned empty `--hooks-dir`; prove it remains empty and same-object through spawn. Any hook is conflicting. |
 | CDI spec directories | selected devices can add host devices, mounts, env, and hooks | The 4.9.3 global CLI has no CDI-directory override. Fix the versioned `containers.conf` field to one exact empty root-owned directory, reject any CDI entry or caller device, and verify package behavior. |
 | seccomp profile | controls syscall filtering | Bind an exact root-owned profile digest selected explicitly by the admitted config; reject unconfined or image-selected policy. |
-| AppArmor policy | controls mandatory access confinement on Ubuntu | Bind the exact admitted profile name plus root-owned loaded-policy/config generation. `unconfined` is prohibited. |
+| AppArmor policy | could add mandatory access confinement on Ubuntu | containers/common 0.57.4 rejects every named profile in rootless mode, so the initial backend neither accepts a caller-selected profile nor claims AppArmor confinement. The stopped OCI spec must contain no AppArmor profile. A future outer-service profile is a separate root-installed boundary and cannot be inferred from a loaded host profile. |
 | default container environment | may inject proxies, credentials, or host values | Configuration has `env=[]`, `env_host=false`, and `http_proxy=false`; command repeats the negative flags where Podman supports them. Only immutable image-config env plus the fixed checked-in command env is admitted. |
 | image-declared volumes, health checks, entrypoint, user, and working directory | may create hidden writable volumes or select a different in-image process | Ignore image volumes, disable health checks/restarts, and pass the exact checked-in absolute entrypoint, user, and working directory. The immutable image config is still bound and reviewed. |
 | passwd/group synthesis | numeric `--user`, plain `keep-id`, `--hostuser`, or entry templates can copy host NSS identity into new bind-mounted files | Use `--userns=keep-id:uid=<fixed>,gid=<fixed>` with the same numeric `--user`; the digest-bound image must already contain exactly that numeric user/group. Omit `--hostuser`, `--passwd-entry`, and `--group-entry`. Noble 4.9.3 has no `create --passwd` control, so R02 must inspect the stopped container and generated OCI spec for no runtime passwd/group bind mount, and the immutable gate must compare `/etc/passwd` and `/etc/group` to their exact image-owned digests before repository code. Any synthesis, host-derived name/content, or mismatch blocks. |
@@ -137,6 +137,7 @@ helper/runtime selection, automatic mounts, and powerful precreate hooks:
 - [Podman 4.9.3 pause-process systemd move](https://github.com/containers/podman/blob/v4.9.3/utils/utils.go)
 - [containers/common 0.57.4 containers.conf contract](https://github.com/containers/common/blob/v0.57.4/docs/containers.conf.5.md)
 - [containers/common automatic mounts implementation](https://github.com/containers/common/blob/v0.57.4/pkg/subscriptions/subscriptions.go)
+- [containers/common 0.57.4 rootless AppArmor refusal](https://github.com/containers/common/blob/v0.57.4/pkg/apparmor/apparmor_linux.go)
 
 ### Kernel and host identity inputs
 
@@ -230,7 +231,6 @@ or image string.
   --image-volume=ignore
   --cap-drop=all
   --security-opt=no-new-privileges
-  --security-opt=apparmor=<exact-apparmor-profile>
   --security-opt=seccomp=<exact-seccomp-profile>
   --cgroup-parent=<sealed-payload-child>
   --cgroupns=private
@@ -471,8 +471,9 @@ temporary fixture, and each test proves the marker remains absent.
   free-space preflight is not sufficient.
 - Confirm that `--network=none` plus the fixed hosts/resolver/hostname/timezone policy copies no host
   content; Podman 4.9.3 rejects the otherwise tempting `--dns=none` combination.
-- Select the exact root-owned AppArmor and seccomp profiles and prove they are effective for a
-  rootless cgroup-v2 run.
+- Select the exact root-owned seccomp profile and prove it is effective for a rootless cgroup-v2
+  run. Per-container AppArmor is unavailable through the pinned rootless Podman stack; adding an
+  outer-service AppArmor profile requires a separate root-installed policy and inheritance proof.
 - Prove a root-owned read-only additional image store works with a fresh run-private graph root and
   `--pull=never` without writes to the image store.
 - Decide whether the host catatonit edge is retained or replaced by an init inside the immutable

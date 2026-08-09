@@ -48,7 +48,7 @@ cleanup_user_probe() {
 run_user_probe() {
   local image_id image_hex container_id container_output expected_output
   local init_output init_status start_output start_status inspect_status logs_status completion_seen=0
-  local image_size container_size spec_size spec_path apparmor_profile
+  local image_size container_size spec_size spec_path
   local log_owner log_group log_mode log_links log_size stderr_size exit_code
   local seccomp_sha_now
 
@@ -107,7 +107,6 @@ run_user_probe() {
     --image-volume=ignore \
     --cap-drop=all \
     --security-opt=no-new-privileges \
-    --security-opt="apparmor=$PROBE_APPARMOR_PROFILE" \
     --security-opt="seccomp=$PROBE_SECCOMP_PROFILE" \
     --pids-limit=32 \
     --memory=67108864 \
@@ -219,15 +218,14 @@ run_user_probe() {
   spec_path=${matching_specs[0]}
   spec_size=$(/usr/bin/stat -Lc %s "$spec_path")
   if (( spec_size == 0 || spec_size > 1048576 )) ||
-    ! /usr/bin/jq -e \
-      --arg apparmor_profile "$PROBE_APPARMOR_PROFILE" '
+    ! /usr/bin/jq -e '
       .process.user.uid == 1000 and
       .process.user.gid == 1000 and
       .process.user.umask == 18 and
       .process.user.additionalGids == [1000] and
       .process.noNewPrivileges == true and
       (.process.capabilities | type == "object" and length == 0) and
-      .process.apparmorProfile == $apparmor_profile and
+      (.process.apparmorProfile // "") == "" and
       ([.mounts[] | select(.destination == "/etc/passwd" or .destination == "/etc/group")] | length) == 0 and
       .linux.seccomp != null
     ' "$spec_path" >/dev/null; then
@@ -242,13 +240,6 @@ run_user_probe() {
     printf 'error: generated OCI spec weakened identity, capabilities, seccomp, or account-file ownership\n' >&2
     exit 1
   fi
-  apparmor_profile=$(/usr/bin/jq -r '.process.apparmorProfile // ""' "$spec_path")
-  if [[ $apparmor_profile != "$PROBE_APPARMOR_PROFILE" ]]; then
-    printf 'apparmor_profile=%q\n' "$apparmor_profile" >&2
-    printf 'error: generated OCI spec lacks a bounded AppArmor profile\n' >&2
-    exit 1
-  fi
-
   if /usr/bin/find "$PROBE_GRAPHROOT" "$PROBE_RUNROOT" -type f \
     \( -path "*/$container_id/userdata/passwd" -o -path "*/$container_id/userdata/group" \) \
     -print -quit 2>/dev/null | /usr/bin/grep -q .; then
@@ -396,8 +387,7 @@ $PROBE_GROUP_SHA  /etc/group"
     exit 1
   fi
 
-  printf 'offline_image=exact stopped_create=closed account_files=image-owned apparmor=%s\n' \
-    "$apparmor_profile"
+  printf 'offline_image=exact stopped_create=closed account_files=image-owned apparmor=rootless-unavailable\n'
 }
 
 if [[ ${1:-} == --user-probe ]]; then
@@ -431,14 +421,6 @@ for command in \
     exit 1
   fi
 done
-
-probe_apparmor_profile=docker-default
-probe_apparmor_profiles=/sys/kernel/security/apparmor/profiles
-if [[ ! -r $probe_apparmor_profiles ]] ||
-  ! /usr/bin/grep -Fxq "$probe_apparmor_profile (enforce)" "$probe_apparmor_profiles"; then
-  printf 'error: exact disposable AppArmor profile is not loaded in enforce mode\n' >&2
-  exit 1
-fi
 
 probe_seccomp_source=/usr/share/containers/seccomp.json
 probe_seccomp_expected_sha=cc374cf23846ce1f62f4dc807a8e2b8673c783c6f56cb475467621035d281e6c
@@ -606,7 +588,6 @@ probe_unit_owned=1
   LC_ALL=C \
   LOGNAME="$probe_user" \
   PATH=/usr/bin \
-  PROBE_APPARMOR_PROFILE="$probe_apparmor_profile" \
   PROBE_CIDFILE="$probe_root/runtime/container.cid" \
   PROBE_CAPTURE_STDERR="$probe_root/runtime/logs.stderr" \
   PROBE_CONTAINER_JSON="$probe_root/runtime/container.json" \
