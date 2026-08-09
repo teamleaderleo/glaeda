@@ -98,6 +98,8 @@ pub mod operator_status_service;
 pub mod ownership;
 /// Pure composition of durable queue, Lima lifecycle, and runner-readiness evidence.
 pub mod personal_worker_host_broker;
+/// Pure, path-private durable ownership and crash-phase authority for personal-worker Lima.
+pub mod personal_worker_lima_authority;
 /// Read-only Mac/Lima observation composed for personal-worker planning.
 pub mod personal_worker_mac_observation;
 /// Config-bound ergonomic submission and queued cancellation.
@@ -113,6 +115,8 @@ pub mod personal_worker_read_model;
 pub mod personal_worker_runner_readiness;
 pub mod personal_worker_store;
 pub mod personal_worker_store_transaction;
+/// Pure, one-action personal-worker planning over accepted queue and host evidence.
+pub mod personal_worker_tick;
 /// Pure immutable verification authorization planning from sealed personal-worker evidence.
 #[cfg(target_os = "linux")]
 pub mod personal_worker_verification_plan;

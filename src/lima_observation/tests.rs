@@ -512,6 +512,50 @@ fn request_rejects_aliased_private_paths() {
     );
 }
 
+#[test]
+fn complete_request_identity_binds_private_source_cache_and_policy_without_disclosure() {
+    let baseline = request(30);
+    let different_home = LimaObservationRequest::new(
+        LimaInstanceName::parse("smolrunner").expect("instance"),
+        "/Users/operator/.lima-other",
+        LimaVmType::Vz,
+        LimaArchitecture::Aarch64,
+        CACHE_PATH,
+        30,
+    )
+    .expect("different home");
+    let different_cache = LimaObservationRequest::new(
+        LimaInstanceName::parse("smolrunner").expect("instance"),
+        LIMA_HOME,
+        LimaVmType::Vz,
+        LimaArchitecture::Aarch64,
+        "/home/runner/.cache/other",
+        30,
+    )
+    .expect("different cache");
+    let different_policy = request(31);
+
+    assert_eq!(baseline.request_identity(), request(30).request_identity());
+    assert_ne!(
+        baseline.request_identity(),
+        different_home.request_identity()
+    );
+    assert_ne!(
+        baseline.request_identity(),
+        different_cache.request_identity()
+    );
+    assert_ne!(
+        baseline.request_identity(),
+        different_policy.request_identity()
+    );
+
+    let debug = format!("{:?}", baseline.request_identity());
+    for private in [LIMA_HOME, CACHE_PATH, "/Users/operator/.lima-other"] {
+        assert!(!debug.contains(private));
+    }
+    assert!(debug.contains("sha256:"));
+}
+
 #[cfg(unix)]
 #[test]
 fn request_rejects_non_utf8_private_paths() {

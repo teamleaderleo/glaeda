@@ -9,7 +9,8 @@ use crate::lima_lifecycle::LimaResourceProfile;
 use crate::lima_observation::{
     LimaInstanceObservation, LimaInstanceObservationReport, LimaObservationAdapter,
     LimaObservationClock, LimaObservationFailure, LimaObservationFreshness, LimaObservationPhase,
-    LimaObservationRefusalCode, LimaObservationRequest, LimaObservationSourceIdentity,
+    LimaObservationRefusalCode, LimaObservationRequest, LimaObservationRequestIdentity,
+    LimaObservationSourceIdentity,
 };
 use crate::mac_availability::{AvailabilityRequest, ObservationFreshness};
 use crate::macos_resource_observation::{
@@ -61,6 +62,7 @@ pub struct PersonalWorkerMacObservationReport {
 pub struct PersonalWorkerMacObservation {
     report: PersonalWorkerMacObservationReport,
     lima_source_identity: LimaObservationSourceIdentity,
+    lima_request_identity: LimaObservationRequestIdentity,
     private_evidence: PrivateEvidence,
 }
 
@@ -78,6 +80,11 @@ impl PersonalWorkerMacObservation {
     #[must_use]
     pub const fn lima_source_identity(&self) -> &LimaObservationSourceIdentity {
         &self.lima_source_identity
+    }
+
+    #[must_use]
+    pub const fn lima_request_identity(&self) -> &LimaObservationRequestIdentity {
+        &self.lima_request_identity
     }
 }
 
@@ -370,6 +377,7 @@ impl PersonalWorkerMacObservationAdapter {
         Ok(PersonalWorkerMacObservation {
             report,
             lima_source_identity: lima_request.source_identity(),
+            lima_request_identity: lima_request.request_identity().clone(),
             private_evidence: PrivateEvidence {
                 vm_stat,
                 logical_cpu,
