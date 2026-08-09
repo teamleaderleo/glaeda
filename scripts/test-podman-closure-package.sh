@@ -327,12 +327,10 @@ mkdir -p \
   "$probe_root/tmp"
 chown -R "$probe_uid:$probe_gid" \
   "$probe_root/graphroot" \
-  "$probe_root/network" \
   "$probe_root/runtime" \
   "$probe_root/tmp"
 chmod 0700 \
   "$probe_root/graphroot" \
-  "$probe_root/network" \
   "$probe_root/runtime" \
   "$probe_root/tmp"
 printf '' > "$probe_root/config/containers.conf"
@@ -342,17 +340,56 @@ printf '[storage]\ndriver = "overlay"\nrunroot = "%s"\ngraphroot = "%s"\nrootles
   "$probe_root/runtime/containers" "$probe_root/graphroot" "$probe_root/graphroot" \
   > "$probe_root/config/storage.conf"
 printf '{}\n' > "$probe_root/auth/auth.json"
+printf '' > "$probe_root/network/cni.lock"
+printf '' > "$probe_root/network/netavark.lock"
+chown "$probe_uid:$probe_gid" \
+  "$probe_root/network/cni.lock" \
+  "$probe_root/network/netavark.lock"
+chmod 0600 "$probe_root/network/cni.lock" "$probe_root/network/netavark.lock"
+chmod 0555 "$probe_root/network"
 chmod -R a-w "$probe_root/auth" "$probe_root/config" "$probe_root/hooks"
 
 cat > "$probe_root/user-probe.sh" <<'USER_PROBE'
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ -n $(/usr/bin/find "$PROBE_NETWORK" -mindepth 1 -print -quit) ]]; then
-  printf 'error: run-private network state was not empty before first use\n' >&2
+validate_network_lock() {
+  local path=$1
+  local owner mode links size
+  read -r owner mode links size < <(/usr/bin/stat -Lc '%u %a %h %s' "$path")
+  if [[ -L $path ]] ||
+    [[ ! -f $path ]] ||
+    [[ $owner != "$PROBE_UID" ]] ||
+    [[ $mode != 600 ]] ||
+    [[ $links != 1 ]] ||
+    (( size != 0 )); then
+    return 1
+  fi
+}
+
+mapfile -d '' network_entries_before < <(
+  /usr/bin/find "$PROBE_NETWORK" -mindepth 1 -maxdepth 1 -print0
+)
+if [[ ${#network_entries_before[@]} -ne 2 ]] ||
+  ! validate_network_lock "$PROBE_NETWORK/cni.lock" ||
+  ! validate_network_lock "$PROBE_NETWORK/netavark.lock"; then
+  printf 'error: exact precreated network lock state was absent before first use\n' >&2
+  exit 1
+fi
+read -r network_owner network_group network_mode network_kind < <(
+  /usr/bin/stat -Lc '%u %g %a %F' "$PROBE_NETWORK"
+)
+if [[ -L $PROBE_NETWORK ]] ||
+  [[ $network_owner != 0 ]] ||
+  [[ $network_group != 0 ]] ||
+  [[ $network_mode != 555 ]] ||
+  [[ $network_kind != directory ]]; then
+  printf 'error: network lock directory was not protected before first use\n' >&2
   exit 1
 fi
 network_identity=$(/usr/bin/stat -Lc '%d:%i' "$PROBE_NETWORK")
+cni_lock_identity=$(/usr/bin/stat -Lc '%d:%i' "$PROBE_NETWORK/cni.lock")
+netavark_lock_identity=$(/usr/bin/stat -Lc '%d:%i' "$PROBE_NETWORK/netavark.lock")
 
 /usr/bin/podman \
   --remote=false \
@@ -388,8 +425,11 @@ fi
 mapfile -d '' network_entries < <(
   /usr/bin/find "$PROBE_NETWORK" -mindepth 1 -maxdepth 1 -print0
 )
-if [[ ${#network_entries[@]} -ne 1 ]] ||
-  [[ ${network_entries[0]##*/} != netavark.lock ]]; then
+if [[ ${#network_entries[@]} -ne 2 ]] ||
+  [[ $(/usr/bin/stat -Lc '%d:%i' "$PROBE_NETWORK/cni.lock") != "$cni_lock_identity" ]] ||
+  [[ $(/usr/bin/stat -Lc '%d:%i' "$PROBE_NETWORK/netavark.lock") != "$netavark_lock_identity" ]] ||
+  ! validate_network_lock "$PROBE_NETWORK/cni.lock" ||
+  ! validate_network_lock "$PROBE_NETWORK/netavark.lock"; then
   printf 'network_entry_count=%s\n' "${#network_entries[@]}" >&2
   if (( ${#network_entries[@]} <= 8 )); then
     for network_entry in "${network_entries[@]}"; do
@@ -403,19 +443,7 @@ if [[ ${#network_entries[@]} -ne 1 ]] ||
   printf 'error: Podman created unexpected run-private network state\n' >&2
   exit 1
 fi
-read -r network_owner network_mode network_links network_kind network_size < <(
-  /usr/bin/stat -Lc '%u %a %h %F %s' "${network_entries[0]}"
-)
-if [[ -L ${network_entries[0]} ]] ||
-  [[ $network_owner != "$PROBE_UID" ]] ||
-  [[ $network_links != 1 ]] ||
-  [[ $network_kind != 'regular empty file' ]] ||
-  (( (8#$network_mode & 0022) != 0 )) ||
-  (( network_size > 4096 )); then
-  printf 'error: Podman network lock state was not bounded and private\n' >&2
-  exit 1
-fi
-printf 'network_state=bounded entries=1\n'
+printf 'network_state=precreated-and-stable entries=2\n'
 
 pause_file=$(/usr/bin/find "$XDG_RUNTIME_DIR" -type f -name pause.pid -print -quit)
 if [[ -z $pause_file ]]; then
