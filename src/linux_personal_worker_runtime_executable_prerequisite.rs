@@ -746,7 +746,8 @@ fn map_open(error: Errno) -> PersonalWorkerRuntimeExecutablePrerequisiteError {
 #[cfg(test)]
 mod tests {
     use std::fs as stdfs;
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
+    use std::io::ErrorKind;
+    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _, symlink};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
@@ -861,21 +862,51 @@ mod tests {
     }
 
     struct Fixture {
+        parent: std::path::PathBuf,
+        parent_identity: (u64, u64),
         root: std::path::PathBuf,
+        root_identity: (u64, u64),
     }
 
     impl Fixture {
         fn new() -> Self {
-            let nonce = FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let root = std::env::current_dir()
+            let parent = std::env::current_dir()
                 .expect("current directory")
-                .join("target/r01-executable-prerequisite-fixtures")
-                .join(format!("{}-{nonce}", std::process::id()));
-            stdfs::create_dir_all(root.join("usr/bin")).expect("create bin fixture");
-            stdfs::create_dir_all(root.join("usr/sbin")).expect("create sbin fixture");
-            stdfs::set_permissions(&root, stdfs::Permissions::from_mode(0o0700))
-                .expect("private fixture root");
-            Self { root }
+                .join("target/r01-executable-prerequisite-fixtures");
+            stdfs::create_dir_all(&parent).expect("create executable fixture parent");
+            let parent_metadata = stdfs::symlink_metadata(&parent).expect("inspect fixture parent");
+            assert!(
+                parent_metadata.file_type().is_dir() && !parent_metadata.file_type().is_symlink(),
+                "fixture parent must be a real directory"
+            );
+            let parent_identity = (parent_metadata.dev(), parent_metadata.ino());
+
+            for _ in 0..128 {
+                let nonce = FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed);
+                let root = parent.join(format!("{}-{nonce}", std::process::id()));
+                let mut builder = stdfs::DirBuilder::new();
+                builder.mode(0o0700);
+                match builder.create(&root) {
+                    Ok(()) => {
+                        let root_metadata = stdfs::symlink_metadata(&root)
+                            .expect("inspect created executable fixture root");
+                        let fixture = Self {
+                            parent: parent.clone(),
+                            parent_identity,
+                            root,
+                            root_identity: (root_metadata.dev(), root_metadata.ino()),
+                        };
+                        stdfs::create_dir_all(fixture.root.join("usr/bin"))
+                            .expect("create bin fixture");
+                        stdfs::create_dir_all(fixture.root.join("usr/sbin"))
+                            .expect("create sbin fixture");
+                        return fixture;
+                    }
+                    Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("create private executable fixture root: {error}"),
+                }
+            }
+            panic!("allocate unique executable fixture root")
         }
 
         fn populate(&self) {
@@ -903,12 +934,33 @@ mod tests {
 
     impl Drop for Fixture {
         fn drop(&mut self) {
-            if self.root.starts_with(
-                std::env::current_dir()
-                    .expect("current directory")
-                    .join("target/r01-executable-prerequisite-fixtures"),
-            ) {
-                stdfs::remove_dir_all(&self.root).expect("remove exact executable fixture");
+            assert_eq!(self.root.parent(), Some(self.parent.as_path()));
+            let parent_metadata = stdfs::symlink_metadata(&self.parent)
+                .expect("revalidate executable fixture parent");
+            assert_eq!(
+                (parent_metadata.dev(), parent_metadata.ino()),
+                self.parent_identity,
+                "fixture parent was rebound"
+            );
+            let root_metadata =
+                stdfs::symlink_metadata(&self.root).expect("revalidate executable fixture root");
+            assert!(
+                root_metadata.file_type().is_dir() && !root_metadata.file_type().is_symlink(),
+                "fixture root must remain a real directory"
+            );
+            assert_eq!(
+                (root_metadata.dev(), root_metadata.ino()),
+                self.root_identity,
+                "fixture root was rebound"
+            );
+            stdfs::remove_dir_all(&self.root).expect("remove owned executable fixture");
+            if let Err(error) = stdfs::remove_dir(&self.parent)
+                && !matches!(
+                    error.kind(),
+                    ErrorKind::NotFound | ErrorKind::DirectoryNotEmpty
+                )
+            {
+                panic!("remove empty executable fixture parent: {error}");
             }
         }
     }
