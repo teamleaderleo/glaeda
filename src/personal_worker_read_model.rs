@@ -18,7 +18,7 @@ use crate::personal_worker_store::{
     PersonalWorkerStoreDocument, PersonalWorkerStoreRevision, PersonalWorkerTerminalMutationClass,
 };
 
-pub const PERSONAL_WORKER_READ_MODEL_SCHEMA_VERSION: u8 = 2;
+pub const PERSONAL_WORKER_READ_MODEL_SCHEMA_VERSION: u8 = 3;
 pub const MAX_PERSONAL_WORKER_QUEUE_PAGE_SIZE: u16 = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -269,6 +269,8 @@ impl PersonalWorkerReservationView {
 pub struct PersonalWorkerAdmissionView {
     state: ExecutionAdmissionState,
     observed_at: EpochMillis,
+    requested_limits: ExecutionResourceLimits,
+    applied_limits: ExecutionResourceLimits,
     reservation: PersonalWorkerReservationView,
 }
 
@@ -281,6 +283,16 @@ impl PersonalWorkerAdmissionView {
     #[must_use]
     pub const fn observed_at(&self) -> EpochMillis {
         self.observed_at
+    }
+
+    #[must_use]
+    pub const fn requested_limits(&self) -> ExecutionResourceLimits {
+        self.requested_limits
+    }
+
+    #[must_use]
+    pub const fn applied_limits(&self) -> ExecutionResourceLimits {
+        self.applied_limits
     }
 
     #[must_use]
@@ -472,6 +484,11 @@ impl PersonalWorkerJobView {
     #[must_use]
     pub const fn submitted_at(&self) -> EpochMillis {
         self.submitted_at
+    }
+
+    #[must_use]
+    pub const fn operator_deadline(&self) -> Option<EpochMillis> {
+        self.operator_deadline
     }
 
     #[must_use]
@@ -740,6 +757,10 @@ pub fn personal_worker_job_view(
             .admission
             .reservation()
             .ok_or_else(PersonalWorkerReadError::invalid_document)?;
+        let applied_limits = active
+            .admission
+            .applied_limits()
+            .ok_or_else(PersonalWorkerReadError::invalid_document)?;
         let lease = document
             .cache_leases()
             .iter()
@@ -758,6 +779,8 @@ pub fn personal_worker_job_view(
                 admission: PersonalWorkerAdmissionView {
                     state: active.admission.state(),
                     observed_at: active.admission.observed_at(),
+                    requested_limits: active.admission.requested_limits(),
+                    applied_limits,
                     reservation: PersonalWorkerReservationView {
                         id: reservation.id.clone(),
                         generation: reservation.generation,

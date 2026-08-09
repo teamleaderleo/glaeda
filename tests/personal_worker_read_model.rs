@@ -85,7 +85,7 @@ fn active_reservation() -> (
     PersonalWorkerActiveReservation,
     PersonalWorkerDurableCacheLease,
 ) {
-    let request = request(
+    let mut request = request(
         "active-one",
         "example/active",
         'c',
@@ -93,6 +93,7 @@ fn active_reservation() -> (
         PersonalWorkerPriority::Normal,
         PersonalWorkerCancellationState::Active,
     );
+    request.operator_deadline = Some(time(BASE + 1_800_000));
     let reservation_id = ReservationId::parse("reservation-active-one").expect("reservation ID");
     let generation = ReservationGeneration::new(7).expect("reservation generation");
     let reserved_at = time(BASE - 30_000);
@@ -373,6 +374,10 @@ fn job_view_exposes_exact_queued_and_active_evidence() {
     let admission = active.admission().expect("admission");
     assert_eq!(admission.state(), ExecutionAdmissionState::Running);
     assert_eq!(admission.observed_at(), time(BASE - 10_000));
+    assert_eq!(admission.requested_limits(), limits(2_000, 2));
+    assert_eq!(admission.applied_limits(), limits(2_000, 2));
+    assert_eq!(admission.requested_limits().pids, 2_048);
+    assert_eq!(active.operator_deadline(), Some(time(BASE + 1_800_000)));
     assert_eq!(
         admission.reservation().id().as_str(),
         "reservation-active-one"
@@ -558,6 +563,8 @@ fn public_json_and_errors_exclude_private_runtime_material() {
     )
     .expect_err("missing job");
     let public = format!("{status}\n{page}\n{job}\n{terminal_job}\n{error:?}\n{error}");
+    assert!(job.contains("\"schema_version\":3"));
+    assert!(job.contains("\"applied_limits\""));
 
     for forbidden in [
         "/tmp/private-worker",

@@ -18,6 +18,26 @@ const MAX_GIT_OBSERVATION_OUTPUT_BYTES: usize = 65_536;
 const MAX_REMOTE_URLS: usize = 16;
 const MAX_BRANCH_BYTES: usize = 512;
 
+/// Opaque equality-only identity for one exact private repository workspace location.
+///
+/// The path has no serialization or accessor. Higher-level planners can prove that repository
+/// source and descriptor-derived workspace evidence refer to the same canonical location without
+/// disclosing that location.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RepositoryWorkspaceLocationIdentity(PathBuf);
+
+impl RepositoryWorkspaceLocationIdentity {
+    pub(crate) const fn from_validated(path: PathBuf) -> Self {
+        Self(path)
+    }
+}
+
+impl fmt::Debug for RepositoryWorkspaceLocationIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("<private-workspace-location>")
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RepositoryCleanliness {
@@ -30,6 +50,8 @@ pub struct RepositorySourceObservation {
     source: PersonalWorkerSourceIdentity,
     verification_profile: VerificationProfileId,
     cleanliness: RepositoryCleanliness,
+    #[serde(skip)]
+    workspace_location_identity: RepositoryWorkspaceLocationIdentity,
 }
 
 impl RepositorySourceObservation {
@@ -51,6 +73,11 @@ impl RepositorySourceObservation {
     #[must_use]
     pub const fn cleanliness(&self) -> RepositoryCleanliness {
         self.cleanliness
+    }
+
+    #[must_use]
+    pub const fn workspace_location_identity(&self) -> &RepositoryWorkspaceLocationIdentity {
+        &self.workspace_location_identity
     }
 }
 
@@ -179,6 +206,9 @@ impl RepositorySourceObserver {
             source: PersonalWorkerSourceIdentity::new(first.repository, first.commit, first.tree),
             verification_profile: profile_id.clone(),
             cleanliness: RepositoryCleanliness::Clean,
+            workspace_location_identity: RepositoryWorkspaceLocationIdentity::from_validated(
+                checkout,
+            ),
         })
     }
 

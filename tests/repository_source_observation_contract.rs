@@ -194,6 +194,14 @@ fn clean_exact_source_uses_two_fixed_credentialless_snapshots() {
     assert_eq!(observation.source().commit.as_str(), COMMIT);
     assert_eq!(observation.source().tree.as_str(), TREE);
     assert_eq!(observation.cleanliness(), RepositoryCleanliness::Clean);
+    let location_debug = format!("{:?}", observation.workspace_location_identity());
+    assert_eq!(location_debug, "<private-workspace-location>");
+    assert!(!location_debug.contains(checkout.path().to_string_lossy().as_ref()));
+    assert!(
+        !serde_json::to_string(&observation)
+            .expect("source JSON")
+            .contains(checkout.path().to_string_lossy().as_ref())
+    );
     assert_eq!(executor.command_count(), 14);
 
     let commands = executor.commands.borrow();
@@ -263,6 +271,30 @@ fn clean_exact_source_uses_two_fixed_credentialless_snapshots() {
     let debug = format!("{observation:?} {:?}", observer());
     assert!(!encoded.contains(checkout.path().to_str().expect("UTF-8 path")));
     assert!(!debug.contains(checkout.path().to_str().expect("UTF-8 path")));
+}
+
+#[test]
+fn identical_source_from_different_workspace_roots_retains_distinct_private_identity() {
+    let first = TempCheckout::new("location-first");
+    let second = TempCheckout::new("location-second");
+    let first_executor = ScriptedExecutor::new(clean_script(first.path()));
+    let second_executor = ScriptedExecutor::new(clean_script(second.path()));
+
+    let first_observation = observer()
+        .observe(first.path(), &profile(), &first_executor)
+        .expect("first source");
+    let second_observation = observer()
+        .observe(second.path(), &profile(), &second_executor)
+        .expect("second source");
+
+    assert_eq!(first_observation.source(), second_observation.source());
+    assert_ne!(
+        first_observation.workspace_location_identity(),
+        second_observation.workspace_location_identity()
+    );
+    let public = format!("{first_observation:?}{second_observation:?}");
+    assert!(!public.contains(first.path().to_string_lossy().as_ref()));
+    assert!(!public.contains(second.path().to_string_lossy().as_ref()));
 }
 
 #[test]

@@ -159,6 +159,7 @@ fn descriptor_relative_success_is_private_and_deterministic() {
     let first_evidence = first.trusted_evidence_digest().as_str().to_owned();
     let json = serde_json::to_string(&first).expect("serialize receipt");
     let debug = format!("{first:?}");
+    let location_debug = format!("{:?}", first.workspace_location_identity());
 
     assert_eq!(
         first.installation_id().as_str(),
@@ -169,6 +170,7 @@ fn descriptor_relative_success_is_private_and_deterministic() {
     assert!(first_workspace_id.starts_with("workspace-"));
     assert!(first_namespace.starts_with("sha256:"));
     assert!(first_evidence.starts_with("sha256:"));
+    assert_eq!(location_debug, "<private-workspace-location>");
     for private in [
         fixture.root.path(),
         fixture.workspace.as_path(),
