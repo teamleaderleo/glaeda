@@ -5,10 +5,10 @@ backend and does not authorize a physical Lima or host mutation.
 
 ## Exact evidence
 
-- Fixture commit: `df4fbe89f197d01af62f5699c87c0daa84507b0f`
-- Workflow run: [31310481534](https://github.com/teamleaderleo/smolrunner/actions/runs/31310481534)
-- ARM64 job: [93237438668](https://github.com/teamleaderleo/smolrunner/actions/runs/31310481534/job/93237438668)
-- x86_64 job: [93237438639](https://github.com/teamleaderleo/smolrunner/actions/runs/31310481534/job/93237438639)
+- Fixture commit: `a3381f37bd24c82d8542d88a64e762f7c6b67068`
+- Workflow run: [31310912737](https://github.com/teamleaderleo/smolrunner/actions/runs/31310912737)
+- ARM64 job: [93238494231](https://github.com/teamleaderleo/smolrunner/actions/runs/31310912737/job/93238494231)
+- x86_64 job: [93238494193](https://github.com/teamleaderleo/smolrunner/actions/runs/31310912737/job/93238494193)
 - Date: 2026-08-09
 - Result: both jobs passed on fresh GitHub-hosted Ubuntu 24.04 VMs.
 
@@ -39,7 +39,9 @@ The exact fixture proves only these facts on both admitted architectures:
 4. `podman container init` produces one exact non-running `initialized` object. The generated OCI
    spec is uniquely found below the attempt root before start and preserves UID/GID 1000, umask
    `0022`, supplementary GID 1000, no-new-privileges, an empty capability object, no runtime
-   `/etc/passwd` or `/etc/group` mount, and no AppArmor profile.
+   `/etc/passwd` or `/etc/group` mount, and no AppArmor profile. The spec contains exactly one
+   pathless IPC, PID, and UTS namespace and no runner-control, proxy, or attempt-private-path process
+   environment entry.
 5. The stopped-container inspection preserves the exact image/container IDs, numeric user,
    entrypoint, workdir, no-network/read-only/unprivileged state, PID and memory limits, and bounded
    attempt-private log configuration. It contains no host account name.
