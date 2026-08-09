@@ -28,14 +28,16 @@ use crate::repository_source_observation::{
     REPOSITORY_SOURCE_OBSERVATION_SCHEMA_VERSION, RepositoryCleanliness,
     RepositorySourceObservation,
 };
+use crate::rust_verification_envelope::{
+    RustCacheIdentityClass, RustVerificationEnvelope, RustVerificationSourceIdentity,
+};
+use crate::rust_verification_envelope_digest::digest_rust_verification_envelope;
 use crate::trusted_workspace_receipt::TrustedWorkspaceCacheReceipt;
 use crate::verification_profile::{
-    CacheId, CapabilityId, ConcurrencyPolicy, ExactBuildScope, ExactVerificationScope,
-    RepositoryCommandIdentity, VerificationProfileId,
+    CacheId, ExactBuildScope, ExactVerificationScope, RepositoryCommandIdentity,
+    VerificationProfileId,
 };
-use crate::verification_profile_registry::{
-    RegisteredVerificationProfile, smolrunner_profile_registry,
-};
+use crate::verification_profile_registry::smolrunner_profile_registry;
 
 pub const PERSONAL_WORKER_VERIFICATION_PLAN_SCHEMA_VERSION: u8 = 1;
 pub const MAX_VERIFICATION_STDOUT_BYTES: u64 = 1_048_576;
@@ -53,7 +55,7 @@ pub enum VerificationWorkspaceMountPolicy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VerificationCacheScopePolicy {
-    ExactSourceCommandAndRuntime,
+    ExactSourceCommandEnvelopeAndRuntime,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -125,7 +127,7 @@ impl VerificationRuntimeRequirements {
         container: VerificationContainerPolicy::RootlessDisposableDigestBound,
         root_filesystem: VerificationRootFilesystemPolicy::ReadOnly,
         workspace_mount: VerificationWorkspaceMountPolicy::ReadOnlyExactObject,
-        cache_scope: VerificationCacheScopePolicy::ExactSourceCommandAndRuntime,
+        cache_scope: VerificationCacheScopePolicy::ExactSourceCommandEnvelopeAndRuntime,
         privilege: VerificationPrivilegePolicy::DropAllCapabilitiesAndDenyEscalation,
         network: VerificationNetworkPolicy::Denied,
         credentials: VerificationCredentialPolicy::Absent,
@@ -156,7 +158,7 @@ pub struct VerificationCacheBinding {
     pub workspace_id: crate::verification_profile::RunnerWorkspaceId,
     pub cache_id: CacheId,
     pub protected_namespace_digest: Sha256Digest,
-    pub source_command_namespace_digest: Sha256Digest,
+    pub source_command_envelope_namespace_digest: Sha256Digest,
     pub access: PersonalWorkerCacheAccessMode,
     pub reservation_id: ReservationId,
     pub reservation_generation: ReservationGeneration,
@@ -179,10 +181,10 @@ pub struct PersonalWorkerVerificationPlanReport {
     lima_profile: LimaResourceProfile,
     expected_runner_identity: crate::actions_runner_readiness::ActionsRunnerConfiguredIdentity,
     command: VerificationCommandBinding,
-    required_capabilities: Vec<CapabilityId>,
+    rust_envelope: RustVerificationEnvelope,
+    rust_envelope_digest: Sha256Digest,
     requested_limits: ExecutionResourceLimits,
     applied_limits: ExecutionResourceLimits,
-    concurrency: ConcurrencyPolicy,
     cache: VerificationCacheBinding,
     planned_at: EpochMillis,
     not_after: EpochMillis,
@@ -206,6 +208,16 @@ impl PersonalWorkerVerificationPlanReport {
     #[must_use]
     pub const fn command(&self) -> &VerificationCommandBinding {
         &self.command
+    }
+
+    #[must_use]
+    pub const fn rust_envelope(&self) -> &RustVerificationEnvelope {
+        &self.rust_envelope
+    }
+
+    #[must_use]
+    pub const fn rust_envelope_digest(&self) -> &Sha256Digest {
+        &self.rust_envelope_digest
     }
 
     #[must_use]
@@ -436,13 +448,6 @@ pub fn plan_personal_worker_verification(
     if profile.canonical_command().identity().repository() != &entry.repository {
         return Err(profile_mismatch());
     }
-
-    validate_resources(
-        profile,
-        admission.requested_limits(),
-        admission.applied_limits(),
-        runner,
-    )?;
     if entry.requested_cpu_millis != admission.requested_limits().cpu_millis
         || entry.requested_memory_bytes != admission.requested_limits().memory_bytes
     {
@@ -466,6 +471,58 @@ pub fn plan_personal_worker_verification(
         return Err(cache_mismatch());
     }
 
+    let source_command_namespace_digest = source_command_namespace_digest(
+        protected_namespace_digest,
+        source,
+        profile.canonical_command().identity(),
+    )?;
+    let rust_envelope = registry
+        .resolve_rust_envelope(
+            &entry.verification_profile_id,
+            RustVerificationSourceIdentity::new(
+                source.source().repository.clone(),
+                source.source().commit.clone(),
+                source.source().tree.clone(),
+            ),
+            source_command_namespace_digest.clone(),
+        )
+        .map_err(|_| profile_mismatch())?;
+    if rust_envelope.profile_id() != &entry.verification_profile_id
+        || rust_envelope.command() != profile.canonical_command().identity()
+        || rust_envelope.source().repository != entry.repository
+        || rust_envelope.source().commit != entry.commit
+        || rust_envelope.source().tree != entry.tree
+    {
+        return Err(profile_mismatch());
+    }
+    if rust_envelope.resources().required_worker_profile != LimaResourceProfile::Work
+        || rust_envelope.resources().reserved_resources != admission.applied_limits()
+        || !admission
+            .applied_limits()
+            .fits_within(admission.requested_limits())
+    {
+        return Err(resource_mismatch());
+    }
+    if rust_envelope.cache().identity_class != RustCacheIdentityClass::SourceScoped
+        || rust_envelope.cache().cargo_target_directory.cache_id != *cache_id
+        || rust_envelope
+            .cache()
+            .cargo_target_directory
+            .namespace_digest
+            != source_command_namespace_digest
+    {
+        return Err(cache_mismatch());
+    }
+    let envelope_capabilities = rust_envelope.required_capabilities();
+    if envelope_capabilities.len() != profile.required_capabilities().len()
+        || !envelope_capabilities
+            .iter()
+            .zip(profile.required_capabilities())
+            .all(|(envelope, registered)| envelope == &registered.capability)
+    {
+        return Err(profile_mismatch());
+    }
+
     let not_after = effective_not_after(
         admission.reservation().expires_at(),
         job.view().operator_deadline(),
@@ -473,10 +530,12 @@ pub fn plan_personal_worker_verification(
     if planned_at >= not_after {
         return Err(deadline_expired());
     }
-    let source_command_namespace_digest = source_command_namespace_digest(
+    let rust_envelope_digest =
+        digest_rust_verification_envelope(&rust_envelope).map_err(|_| profile_mismatch())?;
+    let source_command_envelope_namespace_digest = envelope_cache_namespace_digest(
         protected_namespace_digest,
-        source,
-        profile.canonical_command().identity(),
+        &source_command_namespace_digest,
+        &rust_envelope_digest,
     )?;
     let command = profile.canonical_command();
     let report = PersonalWorkerVerificationPlanReport {
@@ -497,25 +556,21 @@ pub fn plan_personal_worker_verification(
             test_scope: command.test_scope().clone(),
             build_scope: command.build_scope().clone(),
         },
-        required_capabilities: profile
-            .required_capabilities()
-            .iter()
-            .map(|required| required.capability.clone())
-            .collect(),
+        rust_envelope,
+        rust_envelope_digest,
         requested_limits: admission.requested_limits(),
         applied_limits: admission.applied_limits(),
-        concurrency: profile.resources().concurrency,
         cache: VerificationCacheBinding {
             installation_id: workspace_receipt.installation_id().clone(),
             workspace_id: workspace_receipt.workspace_id().clone(),
             cache_id: cache_id.clone(),
             protected_namespace_digest: protected_namespace_digest.clone(),
-            source_command_namespace_digest,
+            source_command_envelope_namespace_digest,
             access: entry.cache_access,
             reservation_id: admission.reservation().id().clone(),
             reservation_generation: admission.reservation().generation(),
             acquired_at: durable_cache_lease.acquired_at(),
-            scope_policy: VerificationCacheScopePolicy::ExactSourceCommandAndRuntime,
+            scope_policy: VerificationCacheScopePolicy::ExactSourceCommandEnvelopeAndRuntime,
         },
         planned_at,
         not_after,
@@ -531,36 +586,6 @@ pub fn plan_personal_worker_verification(
         report,
         workspace_receipt,
     })
-}
-
-fn validate_resources(
-    profile: &RegisteredVerificationProfile,
-    requested: ExecutionResourceLimits,
-    applied: ExecutionResourceLimits,
-    runner: &crate::personal_worker_runner_readiness::PersonalWorkerRunnerReadinessReport,
-) -> Result<(), PersonalWorkerVerificationPlanError> {
-    validate_resource_values(profile, requested, applied, runner.lima_profile)
-}
-
-fn validate_resource_values(
-    profile: &RegisteredVerificationProfile,
-    requested: ExecutionResourceLimits,
-    applied: ExecutionResourceLimits,
-    lima_profile: LimaResourceProfile,
-) -> Result<(), PersonalWorkerVerificationPlanError> {
-    let resource_defaults = profile.resources();
-    let lima = lima_profile.envelope();
-    let lima_cpu_millis = u32::from(lima.vcpus)
-        .checked_mul(1_000)
-        .ok_or_else(resource_mismatch)?;
-    if !applied.fits_within(requested)
-        || applied.memory_bytes < resource_defaults.memory.estimated_peak_bytes
-        || applied.cpu_millis > lima_cpu_millis
-        || applied.memory_bytes > lima.memory_bytes
-    {
-        return Err(resource_mismatch());
-    }
-    Ok(())
 }
 
 const fn effective_not_after(
@@ -579,20 +604,39 @@ fn source_command_namespace_digest(
     command: &RepositoryCommandIdentity,
 ) -> Result<Sha256Digest, PersonalWorkerVerificationPlanError> {
     let command_identity = serde_json::to_vec(command).map_err(|_| cache_mismatch())?;
-    digest_namespace_fields(&[
-        protected_namespace.as_str().as_bytes(),
-        source.source().repository.as_str().as_bytes(),
-        source.source().commit.as_str().as_bytes(),
-        source.source().tree.as_str().as_bytes(),
-        command_identity.as_slice(),
-    ])
+    digest_namespace_fields(
+        b"smolrunner-verification-source-command-cache-v1",
+        &[
+            protected_namespace.as_str().as_bytes(),
+            source.source().repository.as_str().as_bytes(),
+            source.source().commit.as_str().as_bytes(),
+            source.source().tree.as_str().as_bytes(),
+            command_identity.as_slice(),
+        ],
+    )
+}
+
+fn envelope_cache_namespace_digest(
+    protected_namespace: &Sha256Digest,
+    source_command_namespace: &Sha256Digest,
+    rust_envelope_digest: &Sha256Digest,
+) -> Result<Sha256Digest, PersonalWorkerVerificationPlanError> {
+    digest_namespace_fields(
+        b"smolrunner-verification-envelope-cache-v1",
+        &[
+            protected_namespace.as_str().as_bytes(),
+            source_command_namespace.as_str().as_bytes(),
+            rust_envelope_digest.as_str().as_bytes(),
+        ],
+    )
 }
 
 fn digest_namespace_fields(
+    domain: &[u8],
     fields: &[&[u8]],
 ) -> Result<Sha256Digest, PersonalWorkerVerificationPlanError> {
     let mut digest = Sha256::new();
-    digest.update(b"smolrunner-verification-source-command-cache-v1");
+    digest.update(domain);
     for field in fields {
         digest.update((field.len() as u64).to_be_bytes());
         digest.update(field);
@@ -723,16 +767,6 @@ mod tests {
         ExecutionResourceLimits::new(cpu_millis, memory_bytes, 2_048).expect("limits")
     }
 
-    fn required_profile() -> RegisteredVerificationProfile {
-        let registry = smolrunner_profile_registry().expect("registry");
-        registry
-            .lookup(
-                &VerificationProfileId::parse(SMOLRUNNER_REQUIRED_PROFILE_ID).expect("profile ID"),
-            )
-            .expect("required profile")
-            .clone()
-    }
-
     fn digest(hex: &str) -> Sha256Digest {
         Sha256Digest::parse(&format!("sha256:{}", hex.repeat(64))).expect("digest")
     }
@@ -776,12 +810,20 @@ mod tests {
     }
 
     fn planning_fixture(receipt_inode: u64) -> PlanningFixture {
-        planning_fixture_with_job_observed(receipt_inode, time(1_000_000))
+        planning_fixture_with(receipt_inode, time(1_000_000), limits(4_000, 4 * GIB))
     }
 
     fn planning_fixture_with_job_observed(
         receipt_inode: u64,
         job_observed_at: EpochMillis,
+    ) -> PlanningFixture {
+        planning_fixture_with(receipt_inode, job_observed_at, limits(4_000, 4 * GIB))
+    }
+
+    fn planning_fixture_with(
+        receipt_inode: u64,
+        job_observed_at: EpochMillis,
+        applied: ExecutionResourceLimits,
     ) -> PlanningFixture {
         let config = config();
         let repository = RepositoryRef::parse("teamleaderleo/smolrunner").expect("repository");
@@ -795,7 +837,6 @@ mod tests {
         let cache_id = CacheId::parse("cargo-target").expect("cache ID");
         let protected_namespace = digest("a");
         let requested = limits(4_000, 4 * GIB);
-        let applied = limits(4_000, 4 * GIB);
         let reservation_id = ReservationId::parse("reservation-one").expect("reservation ID");
         let reservation_generation = ReservationGeneration::new(1).expect("reservation generation");
         let revision = PersonalWorkerStoreRevision::new(7).expect("revision");
@@ -973,8 +1014,17 @@ mod tests {
             "teamleaderleo/smolrunner"
         );
         assert_ne!(
-            report.cache().source_command_namespace_digest,
+            report.cache().source_command_envelope_namespace_digest,
             report.cache().protected_namespace_digest
+        );
+        assert_eq!(
+            report.rust_envelope().resources().reserved_resources,
+            limits(4_000, 4 * GIB)
+        );
+        assert_eq!(
+            digest_rust_verification_envelope(report.rust_envelope())
+                .expect("canonical envelope digest"),
+            *report.rust_envelope_digest()
         );
         assert_eq!(
             report.runtime_requirements().network,
@@ -1013,6 +1063,14 @@ mod tests {
             future_snapshot.kind(),
             PersonalWorkerVerificationPlanErrorKind::SnapshotMismatch
         );
+
+        let underprovisioned = planning_fixture_with(20, time(1_000_000), limits(1_000, 4 * GIB))
+            .plan()
+            .expect_err("one vCPU cannot satisfy the checked-in Rust envelope");
+        assert_eq!(
+            underprovisioned.kind(),
+            PersonalWorkerVerificationPlanErrorKind::ResourceMismatch
+        );
     }
 
     #[test]
@@ -1041,65 +1099,38 @@ mod tests {
     }
 
     #[test]
-    fn resources_bind_exact_applied_limits_without_widening() {
-        let profile = required_profile();
-        let requested = limits(4_000, 4 * GIB);
-        assert!(
-            validate_resource_values(&profile, requested, requested, LimaResourceProfile::Work)
-                .is_ok()
-        );
-
-        let too_little_memory = validate_resource_values(
-            &profile,
-            requested,
-            limits(3_000, 3 * GIB),
-            LimaResourceProfile::Work,
-        )
-        .expect_err("profile peak must fit the applied limit");
-        assert_eq!(
-            too_little_memory.kind(),
-            PersonalWorkerVerificationPlanErrorKind::ResourceMismatch
-        );
-
-        let above_guest = validate_resource_values(
-            &profile,
-            limits(9_000, 5 * GIB),
-            limits(9_000, 5 * GIB),
-            LimaResourceProfile::Work,
-        )
-        .expect_err("applied CPU must fit the exact Lima envelope");
-        assert_eq!(above_guest.code(), "resource_mismatch");
-
-        let widened = validate_resource_values(
-            &profile,
-            requested,
-            limits(5_000, 5 * GIB),
-            LimaResourceProfile::Work,
-        )
-        .expect_err("applied limits cannot widen the durable request");
-        assert_eq!(widened.code(), "resource_mismatch");
-    }
-
-    #[test]
     fn cache_subnamespace_is_deterministic_and_field_framed() {
-        let first = digest_namespace_fields(&[b"parent", b"repo", b"commit", b"tree", b"command"])
-            .expect("first digest");
-        let replay = digest_namespace_fields(&[b"parent", b"repo", b"commit", b"tree", b"command"])
-            .expect("replay digest");
-        let changed_tree = digest_namespace_fields(&[
-            b"parent",
-            b"repo",
-            b"commit",
-            b"different-tree",
-            b"command",
-        ])
+        let domain = b"test-cache-domain-v1";
+        let first = digest_namespace_fields(
+            domain,
+            &[b"parent", b"repo", b"commit", b"tree", b"command"],
+        )
+        .expect("first digest");
+        let replay = digest_namespace_fields(
+            domain,
+            &[b"parent", b"repo", b"commit", b"tree", b"command"],
+        )
+        .expect("replay digest");
+        let changed_tree = digest_namespace_fields(
+            domain,
+            &[b"parent", b"repo", b"commit", b"different-tree", b"command"],
+        )
         .expect("changed digest");
-        let left = digest_namespace_fields(&[b"ab", b"c"]).expect("left digest");
-        let right = digest_namespace_fields(&[b"a", b"bc"]).expect("right digest");
+        let left = digest_namespace_fields(domain, &[b"ab", b"c"]).expect("left digest");
+        let right = digest_namespace_fields(domain, &[b"a", b"bc"]).expect("right digest");
+        let protected = digest("a");
+        let source_command = digest("b");
+        let envelope_one =
+            envelope_cache_namespace_digest(&protected, &source_command, &digest("c"))
+                .expect("first envelope cache digest");
+        let envelope_two =
+            envelope_cache_namespace_digest(&protected, &source_command, &digest("d"))
+                .expect("changed envelope cache digest");
 
         assert_eq!(first, replay);
         assert_ne!(first, changed_tree);
         assert_ne!(left, right);
+        assert_ne!(envelope_one, envelope_two);
         assert!(first.as_str().starts_with("sha256:"));
     }
 

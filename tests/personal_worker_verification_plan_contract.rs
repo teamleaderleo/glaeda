@@ -20,4 +20,6 @@ fn module_remains_a_pure_non_executing_planner() {
     assert!(source.contains("PersonalWorkerRunnerReadinessObservation"));
     assert!(source.contains("RepositorySourceObservation"));
     assert!(source.contains("TrustedWorkspaceCacheReceipt"));
+    assert!(source.contains("RustVerificationEnvelope"));
+    assert!(source.contains("digest_rust_verification_envelope"));
 }
