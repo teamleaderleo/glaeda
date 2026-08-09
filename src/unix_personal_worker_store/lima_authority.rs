@@ -1,7 +1,7 @@
 use std::fmt;
 use std::fs::File;
 use std::io::{Read as _, Write as _};
-use std::os::fd::{AsFd as _, BorrowedFd};
+use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 use std::path::Path;
 
 use rustix::fs::{self, AtFlags, Mode, RenameFlags};
@@ -13,6 +13,7 @@ use super::{
     inspect_directory, inspect_private_file, map_existing_store_directory_open_error,
     map_root_open_error, store_error, synchronize_directory,
 };
+use crate::execution_admission::EpochMillis;
 use crate::personal_worker_lima_authority::{
     ConfirmedPersonalWorkerLimaEnrollment, MAX_PERSONAL_WORKER_LIMA_AUTHORITY_BYTES,
     PersonalWorkerLimaAuthorityDocument, PersonalWorkerLimaAuthorityErrorKind,
@@ -132,7 +133,28 @@ impl UnixPersonalWorkerLimaAuthorityGuard {
         };
         let lock = acquire_mutation_lock_in(&store.directory, owner)?;
         synchronize_directory(&store._root, "personal worker state root")?;
-        store.recover_locked()?;
+        // A previous writer can have returned an ambiguous error after publishing either a worker
+        // or authority entry. Close the child-directory durability window before trusting any
+        // visible entry, then classify both documents before recovering either one.
+        synchronize_directory(&store.directory, "personal worker store directory")?;
+        let current_authority = load_authority(&store, AUTHORITY_DOCUMENT)?;
+        let staged_authority = load_authority(&store, STAGED_AUTHORITY_DOCUMENT)?;
+        let current_worker = store.load_named(CURRENT_DOCUMENT)?;
+        let worker_plan = store.recovery_plan()?;
+        let authority_present = current_authority.is_some() || staged_authority.is_some();
+        let authority_unsettled = staged_authority.is_some()
+            || current_authority
+                .as_ref()
+                .is_some_and(|document| document.attempt().is_some());
+        if authority_present && current_worker.is_none() {
+            return Err(authority_recovery_required());
+        }
+        if authority_unsettled && !matches!(worker_plan, super::StoreRecoveryPlan::Clean { .. }) {
+            return Err(authority_recovery_required());
+        }
+        if !authority_unsettled {
+            store.recover_locked()?;
+        }
         let worker = store.load_named(CURRENT_DOCUMENT)?.ok_or_else(|| {
             store_error(
                 PersonalWorkerStoreErrorKind::Missing,
@@ -185,11 +207,15 @@ impl UnixPersonalWorkerLimaAuthorityGuard {
     pub fn publish_enrollment(
         &mut self,
         enrollment: ConfirmedPersonalWorkerLimaEnrollment,
+        current_time: EpochMillis,
     ) -> AuthorityResult<()> {
-        let document = enrollment.into_document();
         if self.uncertain {
             return Err(authority_recovery_required());
         }
+        if !enrollment.is_fresh_at(current_time) {
+            return Err(authority_stale_enrollment());
+        }
+        let document = enrollment.into_document();
         if self.authority.is_some()
             || document.authority_generation().get() != 1
             || document.attempt().is_some()
@@ -242,23 +268,25 @@ fn recover_authority(
     store: &UnixPersonalWorkerStore,
     worker: &PersonalWorkerStoreDocument,
 ) -> AuthorityResult<()> {
-    let staged = load_authority(store, STAGED_AUTHORITY_DOCUMENT)?;
+    let staged = load_open_authority(store, STAGED_AUTHORITY_DOCUMENT)?;
     let current = load_authority(store, AUTHORITY_DOCUMENT)?;
     match (current, staged) {
         (_, None) => Ok(()),
         (None, Some(staged))
-            if staged.authority_generation().get() == 1 && staged.attempt().is_none() =>
+            if staged.document.authority_generation().get() == 1
+                && staged.document.attempt().is_none() =>
         {
-            publish_existing_stage(store, true)
+            publish_existing_stage(store, &staged, true)
         }
         (Some(current), Some(staged)) => {
-            if !attempt_matches_worker(&current, worker) || !attempt_matches_worker(&staged, worker)
+            if !attempt_matches_worker(&current, worker)
+                || !attempt_matches_worker(&staged.document, worker)
             {
                 Err(authority_recovery_required())
-            } else if staged == current {
+            } else if staged.document == current {
                 remove_authority_stage(store)
-            } else if staged.validate_successor_of(&current).is_ok() {
-                publish_existing_stage(store, false)
+            } else if staged.document.validate_successor_of(&current).is_ok() {
+                publish_existing_stage(store, &staged, false)
             } else {
                 Err(authority_recovery_required())
             }
@@ -281,14 +309,19 @@ fn attempt_matches_worker(
 pub(super) fn refuse_unsettled_lima_authority(
     store: &UnixPersonalWorkerStore,
 ) -> Result<(), PersonalWorkerStoreError> {
+    synchronize_directory(&store.directory, "personal worker store directory")?;
     let staged = load_authority(store, STAGED_AUTHORITY_DOCUMENT)
         .map_err(UnixPersonalWorkerLimaAuthorityError::into_store_error)?;
     let current = load_authority(store, AUTHORITY_DOCUMENT)
         .map_err(UnixPersonalWorkerLimaAuthorityError::into_store_error)?;
+    // Orphan detection needs only safe, bounded file presence. Decoding here would preempt the
+    // explicit schema-v1 migration path, which exclusively owns version conversion.
+    let worker_present = store.read_named_bytes(CURRENT_DOCUMENT)?.is_some();
     if staged.is_some()
         || current
             .as_ref()
             .is_some_and(|document| document.attempt().is_some())
+        || (current.is_some() && !worker_present)
     {
         return Err(store_error(
             PersonalWorkerStoreErrorKind::RevisionConflict,
@@ -302,6 +335,19 @@ fn load_authority(
     store: &UnixPersonalWorkerStore,
     name: &str,
 ) -> AuthorityResult<Option<PersonalWorkerLimaAuthorityDocument>> {
+    Ok(load_open_authority(store, name)?.map(|loaded| loaded.document))
+}
+
+struct OpenAuthorityDocument {
+    document: PersonalWorkerLimaAuthorityDocument,
+    file: OwnedFd,
+    encoded_len: usize,
+}
+
+fn load_open_authority(
+    store: &UnixPersonalWorkerStore,
+    name: &str,
+) -> AuthorityResult<Option<OpenAuthorityDocument>> {
     inspect_directory(
         &store.directory,
         "personal worker store directory",
@@ -313,27 +359,31 @@ fn load_authority(
         Err(_) => return Err(authority_io()),
     };
     inspect_private_file(&file, store.owner, "Lima authority document", None)?;
+    let mut file = File::from(file);
     let mut bytes = Vec::new();
-    File::from(file)
+    std::io::Read::by_ref(&mut file)
         .take((MAX_PERSONAL_WORKER_LIMA_AUTHORITY_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
         .map_err(|_| authority_io())?;
     if bytes.len() > MAX_PERSONAL_WORKER_LIMA_AUTHORITY_BYTES {
         return Err(authority_corrupt());
     }
-    decode_personal_worker_lima_authority(&bytes)
-        .map(Some)
-        .map_err(|error| {
-            if error.kind == PersonalWorkerLimaAuthorityErrorKind::VersionIncompatible {
-                store_error(
-                    PersonalWorkerStoreErrorKind::VersionIncompatible,
-                    "Lima authority requires an explicit supported migration",
-                )
-                .into()
-            } else {
-                authority_corrupt()
-            }
-        })
+    let document = decode_personal_worker_lima_authority(&bytes).map_err(|error| {
+        if error.kind == PersonalWorkerLimaAuthorityErrorKind::VersionIncompatible {
+            store_error(
+                PersonalWorkerStoreErrorKind::VersionIncompatible,
+                "Lima authority requires an explicit supported migration",
+            )
+            .into()
+        } else {
+            authority_corrupt()
+        }
+    })?;
+    Ok(Some(OpenAuthorityDocument {
+        document,
+        file: file.into(),
+        encoded_len: bytes.len(),
+    }))
 }
 
 fn publish_authority(
@@ -402,8 +452,16 @@ fn publish_authority(
 
 fn publish_existing_stage(
     store: &UnixPersonalWorkerStore,
+    staged: &OpenAuthorityDocument,
     no_replace: bool,
 ) -> AuthorityResult<()> {
+    fs::fsync(&staged.file).map_err(|_| authority_io())?;
+    inspect_private_file(
+        &staged.file,
+        store.owner,
+        "staged Lima authority document",
+        Some(staged.encoded_len),
+    )?;
     let flags = if no_replace {
         RenameFlags::NOREPLACE
     } else {
@@ -473,6 +531,13 @@ fn authority_recovery_required() -> UnixPersonalWorkerLimaAuthorityError {
     authority_error(
         SelfKind::RecoveryRequired,
         "Lima authority requires recovery",
+    )
+}
+
+fn authority_stale_enrollment() -> UnixPersonalWorkerLimaAuthorityError {
+    authority_error(
+        SelfKind::InvalidDocument,
+        "confirmed Lima enrollment evidence is not fresh at publication",
     )
 }
 

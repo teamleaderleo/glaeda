@@ -179,9 +179,16 @@ pub struct PersonalWorkerLimaEnrollmentConfirmation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfirmedPersonalWorkerLimaEnrollment {
     document: PersonalWorkerLimaAuthorityDocument,
+    observed_at_millis: u64,
+    expires_at_millis: u64,
 }
 
 impl ConfirmedPersonalWorkerLimaEnrollment {
+    pub(crate) fn is_fresh_at(&self, current_time: EpochMillis) -> bool {
+        current_time.get() >= self.observed_at_millis
+            && current_time.get() <= self.expires_at_millis
+    }
+
     #[must_use]
     pub fn into_document(self) -> PersonalWorkerLimaAuthorityDocument {
         self.document
@@ -309,6 +316,8 @@ impl PersonalWorkerLimaAuthorityDocument {
         }
         Ok(ConfirmedPersonalWorkerLimaEnrollment {
             document: candidate,
+            observed_at_millis: mac.report().timing.observed_at_millis,
+            expires_at_millis: mac.report().timing.expires_at_millis,
         })
     }
 

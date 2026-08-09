@@ -544,8 +544,8 @@ impl PersonalWorkerStore for UnixPersonalWorkerStore {
             ));
         }
         let _lock = self.acquire_mutation_lock()?;
-        self.recover_locked()?;
         lima_authority::refuse_unsettled_lima_authority(self)?;
+        self.recover_locked()?;
         if self.load_named(CURRENT_DOCUMENT)?.is_some() {
             return Err(store_error(
                 PersonalWorkerStoreErrorKind::RevisionConflict,
@@ -568,8 +568,8 @@ impl PersonalWorkerStore for UnixPersonalWorkerStore {
         document: &PersonalWorkerStoreDocument,
     ) -> Result<PersonalWorkerStoreWriteReceipt, PersonalWorkerStoreError> {
         let _lock = self.acquire_mutation_lock()?;
-        self.recover_locked()?;
         lima_authority::refuse_unsettled_lima_authority(self)?;
+        self.recover_locked()?;
         let current = self.load_named(CURRENT_DOCUMENT)?.ok_or_else(|| {
             store_error(
                 PersonalWorkerStoreErrorKind::Missing,

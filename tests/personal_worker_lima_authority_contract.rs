@@ -1010,7 +1010,7 @@ fn unix_sidecar_publishes_only_confirmed_enrollment_under_the_canonical_store_lo
     assert!(!guard.has_active_work());
     assert!(!guard.recovery_required());
     guard
-        .publish_enrollment(enrollment)
+        .publish_enrollment(enrollment, epoch(104_000))
         .expect("publish confirmed enrollment");
     let published = guard.authority().expect("published authority").clone();
     let lifecycle = lifecycle_profile(
@@ -1062,6 +1062,26 @@ fn unix_sidecar_publishes_only_confirmed_enrollment_under_the_canonical_store_lo
         PersonalWorkerStoreErrorKind::RevisionConflict
     );
 
+    let worker_stage_path = root.path().join("personal-worker/.next.json");
+    fs::copy(
+        root.path().join("personal-worker/current.json"),
+        &worker_stage_path,
+    )
+    .expect("write duplicate worker crash stage");
+    fs::set_permissions(&worker_stage_path, fs::Permissions::from_mode(0o600))
+        .expect("private worker crash stage");
+    let joint_recovery = UnixPersonalWorkerStore::open_or_create(root.path())
+        .expect_err("unsettled authority must block worker-stage cleanup");
+    assert_eq!(
+        joint_recovery.kind(),
+        PersonalWorkerStoreErrorKind::RevisionConflict
+    );
+    assert!(
+        worker_stage_path.exists(),
+        "worker recovery evidence must remain untouched"
+    );
+    fs::remove_file(&worker_stage_path).expect("remove test-only worker stage");
+
     let stop_started = prepared
         .checkpoint(
             prepared.attempt().expect("attempt").generation(),
@@ -1105,6 +1125,125 @@ fn unix_sidecar_publishes_only_confirmed_enrollment_under_the_canonical_store_lo
         UnixPersonalWorkerLimaAuthorityErrorKind::RecoveryRequired
     );
     assert!(stage_path.exists(), "recovery evidence must be preserved");
+}
+
+#[test]
+fn unix_sidecar_requires_fresh_enrollment_evidence_at_publication() {
+    let root = TempStateRoot::new();
+    let worker = PersonalWorkerStoreDocument::new(
+        PersonalWorkerQueueInput {
+            generation: PersonalWorkerQueueGeneration::new(1).expect("generation"),
+            observed_at: epoch(90_000),
+            profile_observation: PersonalWorkerProfileObservation::Unobserved,
+            activity_evidence: PersonalWorkerActivityEvidence::Never,
+            queued: Vec::new(),
+            active: Vec::new(),
+            pending_profile_change: None,
+        },
+        Vec::new(),
+    )
+    .expect("initial worker");
+    UnixPersonalWorkerStore::initialize_if_clean(root.path(), &worker)
+        .expect("initialize worker store");
+
+    let config = config();
+    let mac = mac_observation(true, 100_000);
+    let request = request(LIMA_HOME, CACHE_PATH);
+    let confirmation =
+        personal_worker_lima_enrollment_confirmation(&config, &mac, &request, broker_identity())
+            .expect("confirmation");
+    let enrollment = PersonalWorkerLimaAuthorityDocument::enroll(
+        &config,
+        &mac,
+        &request,
+        broker_identity(),
+        Some(confirmation.value()),
+    )
+    .expect("confirmed enrollment");
+    let stale_time = epoch(
+        mac.report()
+            .timing
+            .expires_at_millis
+            .checked_add(1)
+            .expect("bounded stale time"),
+    );
+
+    let mut guard = UnixPersonalWorkerLimaAuthorityGuard::open(root.path()).expect("guard");
+    let stale = guard
+        .publish_enrollment(enrollment, stale_time)
+        .expect_err("stale enrollment cannot become durable authority");
+    assert_eq!(
+        stale.kind(),
+        UnixPersonalWorkerLimaAuthorityErrorKind::InvalidDocument
+    );
+    assert!(guard.authority().is_none());
+    assert!(
+        !root
+            .path()
+            .join("personal-worker/lima-authority.json")
+            .exists()
+    );
+}
+
+#[test]
+fn unix_sidecar_refuses_to_splice_orphan_authority_onto_a_fresh_worker() {
+    let root = TempStateRoot::new();
+    let worker = PersonalWorkerStoreDocument::new(
+        PersonalWorkerQueueInput {
+            generation: PersonalWorkerQueueGeneration::new(1).expect("generation"),
+            observed_at: epoch(90_000),
+            profile_observation: PersonalWorkerProfileObservation::Unobserved,
+            activity_evidence: PersonalWorkerActivityEvidence::Never,
+            queued: Vec::new(),
+            active: Vec::new(),
+            pending_profile_change: None,
+        },
+        Vec::new(),
+    )
+    .expect("initial worker");
+    UnixPersonalWorkerStore::initialize_if_clean(root.path(), &worker)
+        .expect("initialize worker store");
+
+    let config = config();
+    let mac = mac_observation(true, 100_000);
+    let request = request(LIMA_HOME, CACHE_PATH);
+    let confirmation =
+        personal_worker_lima_enrollment_confirmation(&config, &mac, &request, broker_identity())
+            .expect("confirmation");
+    let enrollment = PersonalWorkerLimaAuthorityDocument::enroll(
+        &config,
+        &mac,
+        &request,
+        broker_identity(),
+        Some(confirmation.value()),
+    )
+    .expect("confirmed enrollment");
+    let mut guard = UnixPersonalWorkerLimaAuthorityGuard::open(root.path()).expect("guard");
+    guard
+        .publish_enrollment(enrollment, epoch(104_000))
+        .expect("publish enrollment");
+    drop(guard);
+
+    let worker_path = root.path().join("personal-worker/current.json");
+    fs::remove_file(&worker_path).expect("simulate lost worker document");
+    let reinitialize = UnixPersonalWorkerStore::initialize_if_clean(root.path(), &worker)
+        .expect_err("orphan authority must prevent worker reinitialization");
+    assert_eq!(
+        reinitialize.kind(),
+        PersonalWorkerStoreErrorKind::RevisionConflict
+    );
+    assert!(!worker_path.exists());
+    assert!(
+        root.path()
+            .join("personal-worker/lima-authority.json")
+            .exists()
+    );
+    let reopen = UnixPersonalWorkerLimaAuthorityGuard::open(root.path())
+        .expect_err("the impossible combined state requires recovery");
+    assert_eq!(
+        reopen.kind(),
+        UnixPersonalWorkerLimaAuthorityErrorKind::RecoveryRequired
+    );
 }
 
 #[test]
@@ -1158,7 +1297,7 @@ fn unix_sidecar_poisoned_publication_guard_cannot_retry_after_ambiguous_failure(
     fs::write(&stage, []).expect("race stage after lock acquisition");
     fs::set_permissions(&stage, fs::Permissions::from_mode(0o600)).expect("private race stage");
     let failure = guard
-        .publish_enrollment(enrollment)
+        .publish_enrollment(enrollment, epoch(104_000))
         .expect_err("existing stage makes publication uncertain");
     assert_eq!(
         failure.kind(),
@@ -1179,7 +1318,7 @@ fn unix_sidecar_poisoned_publication_guard_cannot_retry_after_ambiguous_failure(
     .expect("second confirmed enrollment");
     assert_eq!(
         guard
-            .publish_enrollment(retry)
+            .publish_enrollment(retry, epoch(104_000))
             .expect_err("poisoned guard cannot retry")
             .kind(),
         UnixPersonalWorkerLimaAuthorityErrorKind::RecoveryRequired
