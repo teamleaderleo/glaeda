@@ -199,8 +199,8 @@ run_user_probe() {
   fi
 
   mapfile -d '' matching_specs < <(
-    /usr/bin/find "$PROBE_GRAPHROOT" "$PROBE_RUNROOT" -type f \
-      -path "*/$container_id/userdata/config.json" -print0 2>/dev/null
+    /usr/bin/find "$PROBE_ROOT" -xdev -type f -name config.json \
+      -path "*$container_id*" -print0 2>/dev/null
   )
   if [[ ${#matching_specs[@]} -ne 1 ]]; then
     printf 'spec_count=%s\n' "${#matching_specs[@]}" >&2
@@ -561,6 +561,7 @@ probe_unit_owned=1
   PROBE_LOGFILE="$probe_root/runtime/container.log" \
   PROBE_NETWORK="$probe_root/network" \
   PROBE_PASSWD_SHA="$passwd_sha" \
+  PROBE_ROOT="$probe_root" \
   PROBE_ROOTFS_TAR="$probe_root/rootfs.tar" \
   PROBE_RUNROOT="$probe_root/runtime/containers" \
   PROBE_GID="$probe_gid" \
