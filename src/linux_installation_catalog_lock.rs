@@ -37,6 +37,14 @@ impl InstallationCatalogLock {
     }
 }
 
+impl Drop for InstallationCatalogLock {
+    fn drop(&mut self) {
+        // Release the shared open-file description even if a concurrent fork temporarily retains
+        // a duplicate until exec applies `CLOEXEC`.
+        let _ = fs::flock(&self._lock, FlockOperation::Unlock);
+    }
+}
+
 /// Acquire the installation-catalog lock beneath the canonical system state root.
 ///
 /// # Errors
@@ -243,6 +251,8 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use rustix::io::dup;
+
     use crate::state_store::StateStoreErrorKind;
 
     use super::{LOCK_FILE_NAME, lock_installation_catalog};
@@ -300,6 +310,20 @@ mod tests {
         let _lock = lock_installation_catalog(root.path()).expect("acquire first catalog lock");
         let error = lock_installation_catalog(root.path()).expect_err("second lock must be busy");
         assert_eq!(error.kind(), StateStoreErrorKind::Busy);
+    }
+
+    #[test]
+    fn catalog_lock_drop_unlocks_an_inherited_open_file_description() {
+        let root = TempRoot::new("inherited");
+        let guard = lock_installation_catalog(root.path()).expect("acquire catalog lock");
+        let inherited = dup(&guard._lock).expect("duplicate inherited lock descriptor");
+
+        drop(guard);
+        let reacquired = lock_installation_catalog(root.path())
+            .expect("guard drop must explicitly unlock inherited description");
+
+        drop(reacquired);
+        drop(inherited);
     }
 
     #[test]

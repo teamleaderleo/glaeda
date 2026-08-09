@@ -260,7 +260,10 @@ impl LinuxStateRoot {
         Ok((current, file_name))
     }
 
-    fn acquire_installation_lock(&self, path: &StatePath) -> Result<OwnedFd, StateStoreError> {
+    fn acquire_installation_lock(
+        &self,
+        path: &StatePath,
+    ) -> Result<InstallationMutationLock, StateStoreError> {
         let components = path.components();
         if components.len() < 3 || components[0].as_str() != "installations" {
             return Err(StateStoreError::public(
@@ -288,7 +291,7 @@ impl LinuxStateRoot {
 
         let lock = open_installation_lock(&installation, self.owner)?;
         match fs::flock(&lock, FlockOperation::NonBlockingLockExclusive) {
-            Ok(()) => Ok(lock),
+            Ok(()) => Ok(InstallationMutationLock { _lock: lock }),
             Err(Errno::AGAIN) => Err(StateStoreError::public(
                 StateStoreErrorKind::Busy,
                 "another state writer holds the installation lock",
@@ -298,6 +301,20 @@ impl LinuxStateRoot {
                 "could not acquire the installation lock",
             )),
         }
+    }
+}
+
+#[derive(Debug)]
+struct InstallationMutationLock {
+    _lock: OwnedFd,
+}
+
+impl Drop for InstallationMutationLock {
+    fn drop(&mut self) {
+        // A concurrent fork can briefly retain this open-file description until exec closes its
+        // duplicate. Explicit unlock prevents that inherited descriptor from extending the
+        // installation mutation boundary after this guard is dropped.
+        let _ = fs::flock(&self._lock, FlockOperation::Unlock);
     }
 }
 
@@ -679,6 +696,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use rustix::fs::{self as rustix_fs, FlockOperation, Mode};
+    use rustix::io::dup;
 
     use crate::manifest::RunnerScope;
     use crate::ownership::ProjectIdentity;
@@ -1111,6 +1129,26 @@ mod tests {
             .write_atomic(&project_record("example/project"))
             .expect_err("concurrent writer must be busy");
         assert_eq!(error.kind(), StateStoreErrorKind::Busy);
+    }
+
+    #[test]
+    fn installation_lock_drop_unlocks_an_inherited_open_file_description() {
+        let root = TempTree::new("inherited-write-lock");
+        create_project_parent(root.path());
+        let store = LinuxStateRoot::open(root.path()).expect("open state root");
+        let record = project_record("example/project");
+        let guard = store
+            .acquire_installation_lock(record.path())
+            .expect("acquire installation lock");
+        let inherited = dup(&guard._lock).expect("duplicate inherited lock descriptor");
+
+        drop(guard);
+        let reacquired = store
+            .acquire_installation_lock(record.path())
+            .expect("guard drop must explicitly unlock inherited description");
+
+        drop(reacquired);
+        drop(inherited);
     }
 
     #[test]
