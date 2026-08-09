@@ -68,4 +68,5 @@ jobs:
           sudo /usr/bin/env -i
           PATH=/usr/sbin:/usr/bin:/sbin:/bin
           LC_ALL=C
+          SMOLRUNNER_DISPOSABLE_PROBE=github-hosted-ubuntu
           /usr/bin/bash scripts/test-podman-closure-package.sh

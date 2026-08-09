@@ -7,6 +7,10 @@ if [[ $EUID -ne 0 ]]; then
   printf 'error: disposable package probe must run as uid 0\n' >&2
   exit 1
 fi
+if [[ ${SMOLRUNNER_DISPOSABLE_PROBE:-} != github-hosted-ubuntu ]]; then
+  printf 'error: disposable package probe requires the explicit hosted-CI gate\n' >&2
+  exit 1
+fi
 
 for command in \
   /usr/bin/dpkg-query \
@@ -19,6 +23,7 @@ for command in \
   /usr/bin/readlink \
   /usr/sbin/runuser \
   /usr/bin/stat \
+  /usr/bin/systemctl \
   /usr/bin/systemd-run \
   /usr/bin/umount; do
   if [[ ! -x $command ]]; then
@@ -36,19 +41,25 @@ case "$(/usr/bin/uname -m)" in
 esac
 
 probe_root=$(/usr/bin/mktemp -d /tmp/smolrunner-podman-closure.XXXXXX)
-probe_user=smolprobe
-probe_unit=smolrunner-podman-closure-probe.service
+probe_nonce=${probe_root##*.}
+probe_nonce=${probe_nonce,,}
+probe_user="smolprobe_$probe_nonce"
+probe_unit="smolrunner-podman-closure-$probe_nonce.service"
 target_mount="$probe_root/target-tmpfs"
 target_mounted=0
+probe_user_created=0
+probe_unit_owned=0
 
 cleanup() {
   local status=$?
   set +e
-  /usr/bin/systemctl stop "$probe_unit" >/dev/null 2>&1
+  if [[ $probe_unit_owned -eq 1 ]]; then
+    /usr/bin/systemctl stop "$probe_unit" >/dev/null 2>&1
+  fi
   if [[ $target_mounted -eq 1 ]] && /usr/bin/findmnt -rn --target "$target_mount" >/dev/null 2>&1; then
     /usr/bin/umount "$target_mount"
   fi
-  if /usr/bin/id "$probe_user" >/dev/null 2>&1; then
+  if [[ $probe_user_created -eq 1 ]]; then
     /usr/sbin/userdel "$probe_user" >/dev/null 2>&1
   fi
   case "$probe_root" in
@@ -57,6 +68,16 @@ cleanup() {
   exit "$status"
 }
 trap cleanup EXIT
+
+if /usr/bin/id "$probe_user" >/dev/null 2>&1; then
+  printf 'error: unique disposable probe user already exists\n' >&2
+  exit 1
+fi
+if ! unit_load_state=$(/usr/bin/systemctl show --property=LoadState --value "$probe_unit" 2>/dev/null) ||
+  [[ $unit_load_state != not-found ]]; then
+  printf 'error: unique disposable probe unit is not proven absent\n' >&2
+  exit 1
+fi
 
 assert_root_file() {
   local path=$1
@@ -98,7 +119,13 @@ for path in \
   assert_root_file "$path"
 done
 
+read -r fallback_owner fallback_group fallback_kind < <(
+  /usr/bin/stat -c '%u %g %F' /usr/libexec/podman/catatonit
+)
 if [[ ! -L /usr/libexec/podman/catatonit ]] ||
+  [[ $fallback_owner != 0 ]] ||
+  [[ $fallback_group != 0 ]] ||
+  [[ $fallback_kind != 'symbolic link' ]] ||
   [[ $(/usr/bin/readlink -f /usr/libexec/podman/catatonit) != /usr/bin/catatonit ]]; then
   printf 'error: packaged Podman catatonit fallback is not the exact expected symlink\n' >&2
   exit 1
@@ -112,15 +139,25 @@ for helper in /usr/bin/newuidmap /usr/bin/newgidmap; do
   fi
 done
 
-if [[ -e /etc/containers/podman_preexec_hooks.txt ]]; then
+if [[ -e /etc/containers/podman_preexec_hooks.txt ]] ||
+  [[ -L /etc/containers/podman_preexec_hooks.txt ]]; then
   printf 'error: Podman pre-exec hook indicator is present\n' >&2
   exit 1
 fi
 for hook_directory in /usr/libexec/podman/pre-exec-hooks /etc/containers/pre-exec-hooks; do
-  if [[ -d $hook_directory ]] &&
-    [[ -n $(/usr/bin/find "$hook_directory" -mindepth 1 -maxdepth 1 -print -quit) ]]; then
-    printf 'error: Podman pre-exec hook directory is not empty\n' >&2
-    exit 1
+  if [[ -e $hook_directory ]] || [[ -L $hook_directory ]]; then
+    read -r hook_owner hook_group hook_mode hook_kind < <(
+      /usr/bin/stat -c '%u %g %a %F' "$hook_directory"
+    )
+    if [[ -L $hook_directory ]] ||
+      [[ $hook_kind != directory ]] ||
+      [[ $hook_owner != 0 ]] ||
+      [[ $hook_group != 0 ]] ||
+      (( (8#$hook_mode & 0022) != 0 )) ||
+      [[ -n $(/usr/bin/find "$hook_directory" -mindepth 1 -maxdepth 1 -print -quit) ]]; then
+      printf 'error: Podman pre-exec hook path is not an exact protected empty directory\n' >&2
+      exit 1
+    fi
   fi
 done
 
@@ -142,6 +179,7 @@ case "$git_version" in
 esac
 
 /usr/sbin/useradd --create-home --home-dir "$probe_root/hostile-home" --shell /bin/bash "$probe_user"
+probe_user_created=1
 probe_uid=$(/usr/bin/id -u "$probe_user")
 probe_gid=$(/usr/bin/id -g "$probe_user")
 
@@ -271,10 +309,10 @@ if other_explicit.returncode != 0:
 print("git_materializer=closed explicit_owner_gate=smolrunner")
 PY
 
+target_mounted=1
 /usr/bin/mount -t tmpfs \
   -o "size=1048576,nr_inodes=64,uid=$probe_uid,gid=$probe_gid,mode=0700,nosuid,nodev" \
   smolrunner-probe-target "$target_mount"
-target_mounted=1
 target_type=$(/usr/bin/findmnt -rn -o FSTYPE --target "$target_mount")
 target_options=$(/usr/bin/findmnt -rn -o OPTIONS --target "$target_mount")
 target_blocks=$(/usr/bin/stat -f -c %b "$target_mount")
@@ -293,6 +331,12 @@ printf 'target_tmpfs=bounded blocks=%s block_size=%s inodes=%s\n' \
 /usr/bin/umount "$target_mount"
 target_mounted=0
 
+has_option() {
+  local help_text=$1
+  local option=$2
+  /usr/bin/grep -Eq -- "(^|[[:space:],])${option}([=[:space:]]|$)" <<< "$help_text"
+}
+
 global_help=$(/usr/bin/env -i HOME="$probe_root/empty-home" LC_ALL=C PATH=/usr/bin \
   XDG_CONFIG_HOME="$probe_root/empty-xdg" /usr/bin/podman --help)
 create_help=$(/usr/bin/env -i HOME="$probe_root/empty-home" LC_ALL=C PATH=/usr/bin \
@@ -300,19 +344,69 @@ create_help=$(/usr/bin/env -i HOME="$probe_root/empty-home" LC_ALL=C PATH=/usr/b
 start_help=$(/usr/bin/env -i HOME="$probe_root/empty-home" LC_ALL=C PATH=/usr/bin \
   XDG_CONFIG_HOME="$probe_root/empty-xdg" /usr/bin/podman start --help)
 for option in --cgroup-manager --conmon --events-backend --hooks-dir --network-config-dir --remote --runtime --tmpdir --transient-store; do
-  if [[ $global_help != *"$option"* ]]; then
+  if ! has_option "$global_help" "$option"; then
     printf 'error: Podman global option is absent: %s\n' "$option" >&2
     exit 1
   fi
 done
-for option in --cgroup-parent --env-host --http-proxy --mount --network --no-hosts --passwd --read-only-tmpfs --tmpfs; do
-  if [[ $create_help != *"$option"* ]]; then
+for option in \
+  --cap-drop \
+  --cgroup-parent \
+  --cgroupns \
+  --cidfile \
+  --cpus \
+  --entrypoint \
+  --env-host \
+  --hostname \
+  --http-proxy \
+  --image-volume \
+  --init \
+  --init-path \
+  --ipc \
+  --log-driver \
+  --memory \
+  --memory-swap \
+  --mount \
+  --name \
+  --network \
+  --no-healthcheck \
+  --no-hosts \
+  --passwd \
+  --pid \
+  --pids-limit \
+  --privileged \
+  --pull \
+  --read-only \
+  --read-only-tmpfs \
+  --restart \
+  --security-opt \
+  --shm-size \
+  --systemd \
+  --tmpfs \
+  --user \
+  --userns \
+  --uts \
+  --workdir; do
+  if ! has_option "$create_help" "$option"; then
     printf 'error: Podman create option is absent: %s\n' "$option" >&2
     exit 1
   fi
 done
-if [[ $start_help != *'--attach'* ]]; then
+if ! has_option "$start_help" --attach; then
   printf 'error: Podman start boolean attach option is absent\n' >&2
+  exit 1
+fi
+attach_invalid=$(/usr/bin/env -i HOME="$probe_root/empty-home" LC_ALL=C PATH=/usr/bin \
+  XDG_CONFIG_HOME="$probe_root/empty-xdg" \
+  /usr/bin/podman start --attach=stdout --help 2>&1) && {
+  printf 'error: Podman start attach unexpectedly accepts stream names\n' >&2
+  exit 1
+}
+if [[ $attach_invalid != *ParseBool* ]] ||
+  ! /usr/bin/env -i HOME="$probe_root/empty-home" LC_ALL=C PATH=/usr/bin \
+  XDG_CONFIG_HOME="$probe_root/empty-xdg" \
+  /usr/bin/podman start --attach=true --help >/dev/null; then
+  printf 'error: Podman start attach is not the expected Boolean option\n' >&2
   exit 1
 fi
 printf 'podman_cli_surface=expected\n'
@@ -465,6 +559,7 @@ printf 'rootless_info=success pause=contained\n'
 USER_PROBE
 chmod 0555 "$probe_root/user-probe.sh"
 
+probe_unit_owned=1
 /usr/bin/systemd-run \
   --wait \
   --collect \
@@ -496,6 +591,7 @@ chmod 0555 "$probe_root/user-probe.sh"
   XDG_CONFIG_HOME="$probe_root/empty-xdg" \
   XDG_RUNTIME_DIR="$probe_root/runtime" \
   /usr/bin/bash "$probe_root/user-probe.sh"
+probe_unit_owned=0
 
 if /usr/bin/pgrep -u "$probe_uid" >/dev/null 2>&1; then
   printf 'error: rootless first-use probe left an idle process\n' >&2
