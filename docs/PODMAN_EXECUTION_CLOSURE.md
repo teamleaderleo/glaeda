@@ -120,6 +120,7 @@ runtime/conmon/init paths and prove the effective configuration contains no alte
 | AppArmor policy | controls mandatory access confinement on Ubuntu | Bind the exact admitted profile name plus root-owned loaded-policy/config generation. `unconfined` is prohibited. |
 | default container environment | may inject proxies, credentials, or host values | Configuration has `env=[]`, `env_host=false`, and `http_proxy=false`; command repeats the negative flags where Podman supports them. Only immutable image-config env plus the fixed checked-in command env is admitted. |
 | image-declared volumes, health checks, entrypoint, user, and working directory | may create hidden writable volumes or select a different in-image process | Ignore image volumes, disable health checks/restarts, and pass the exact checked-in absolute entrypoint, user, and working directory. The immutable image config is still bound and reviewed. |
+| passwd/group synthesis | numeric `--user`, plain `keep-id`, `--hostuser`, or entry templates can copy host NSS identity into new bind-mounted files | Use `--userns=keep-id:uid=<fixed>,gid=<fixed>` with the same numeric `--user`; the digest-bound image must already contain exactly that numeric user/group. Omit `--hostuser`, `--passwd-entry`, and `--group-entry`. Noble 4.9.3 has no `create --passwd` control, so R01 must inspect the stopped container and generated OCI spec for no runtime passwd/group bind mount, and the immutable gate must compare `/etc/passwd` and `/etc/group` to their exact image-owned digests before repository code. Any synthesis, host-derived name/content, or mismatch blocks. |
 | auth and remote connection files | can expose credentials or redirect Podman to a socket/SSH service | Empty environment excludes all `CONTAINER_*`, `REGISTRY_AUTH_FILE`, and connection variables. Set `REGISTRY_AUTH_FILE` to an exact empty run-private JSON object and prove Docker auth/config absent. Pass `--remote=false`. |
 | network configuration | can select plugins/helpers or host namespace behavior | Pass `--network=none`; supply one fresh exact root-owned non-writable run-private network-state directory containing only precreated single-link `0600` runner-owned empty `cni.lock` and `netavark.lock` files. Noble opens both even for `podman info`; it must reuse their exact inodes without creating, replacing, or resizing anything. Never reuse the directory and remove it after group-empty cleanup. Prohibit host, slirp, pasta, bridge, CNI, plugins, DNS helpers, ports, and network namespace joins; any other pre-existing or post-call entry blocks. |
 | host `/etc/hosts`, resolver, hostname, localtime, and timezone inputs | can disclose host identity or make the generated spec depend on ambient host files | Use a private UTS namespace with a fixed non-secret hostname, `--no-hosts`, no network, an image-owned resolver file, and fixed UTC container configuration. The Ubuntu fixture must prove the generated spec contains no copied host path or content. |
@@ -246,9 +247,8 @@ or image string.
   --no-healthcheck
   --name=<attempt-scoped-nonauthority-name>
   --cidfile=<attempt-private-cidfile>
-  --userns=keep-id
+  --userns=keep-id:uid=<fixed-numeric-uid>,gid=<fixed-numeric-gid>
   --user=<fixed-numeric-uid>:<fixed-numeric-gid>
-  --passwd=false
   --workdir=<fixed-source-path>
   --entrypoint=<checked-in-absolute-image-program>
   --mount=type=bind,src=<protected-materialized-source>,dst=<fixed-source-path>,ro,nosuid,nodev,noexec
@@ -262,9 +262,12 @@ or image string.
 The absolute image entrypoint is a reviewed immutable gate, not Cargo or repository code. It has no
 caller-selected command surface. On start it verifies the actual source/cache mount identities and
 read-only/noexec flags, proves the target is the empty steward-mounted tmpfs with the exact
-byte/inode and executable mount policy, and rereads the cgroup CPU/memory/swap/PID controls. Only
-then may it `exec` the one absolute Cargo command and fixed argument vector selected by the sealed
-Rust envelope. A gate failure executes no repository code and is never a verification success.
+byte/inode and executable mount policy, verifies `/etc/passwd` and `/etc/group` exactly match the
+digest-bound image-owned files with the fixed numeric execution identity, and rereads the cgroup
+CPU/memory/swap/PID controls. The stopped-container inspection must already have refused generated
+passwd/group bind mounts or host-derived identity. Only then may the gate `exec` the one absolute
+Cargo command and fixed argument vector selected by the sealed Rust envelope. A gate failure
+executes no repository code and is never a verification success.
 
 Before `image inspect`, `create`, `inspect`, or `start`, the launcher joins the already-created
 outer attempt cgroup; it supplies null stdin, pipes only bounded stdout/stderr, and allocates no TTY.
@@ -380,6 +383,7 @@ temporary fixture, and each test proves the marker remains absent.
 | image store | manifest/config/layer or store-generation substitution | Image identity/runtime readiness refusal. |
 | network helper | hostile netavark/CNI configuration while command says none | The root-owned non-writable network directory contains only the two exact precreated empty lock inodes and `--network=none` makes persistent config unreachable; no other attempt-local state may appear and the marker remains absent. |
 | host-file injection | hostile host resolver/hosts/hostname/timezone content | Generated spec and container fixture contain only fixed image/runtime values; no host marker appears. |
+| host account injection | change the runner's name/NSS record or request plain `keep-id`, `--hostuser`, or passwd/group entry templates | The closed argv uses explicit numeric keep-id UID/GID options and the same numeric user, the image already owns exact passwd/group entries, stopped inspection finds no generated passwd/group mount, and the gate finds the exact image file digests before repository code. No host name or account content appears. |
 | materializer helper/transport | configure replacements, alternates, promisor fetch, credential helper, filter, SSH command, or transport marker | Unsafe state blocks before Git, or the empty environment/protocol allowlist makes it unreachable; no marker executes and no nonlocal object is read. |
 | materializer control-directory drift | replace the synthetic bare directory, change its owner, or point the fixed argv elsewhere | SmolRunner's exact path/object/owner revalidation fails before Git. The fixture proves explicit Git 2.43 bare-directory selection does not enforce ownership itself, so no success may rely on Git's safe-directory policy. |
 | source rebind | replace or modify checkout after planning, during materialization, or before Podman resolves mounts | The materializer either rejects drift/object mismatch or publishes the exact sealed tree; `create` and the in-image gate bind only that protected object. Replacement after publication cannot affect it. |

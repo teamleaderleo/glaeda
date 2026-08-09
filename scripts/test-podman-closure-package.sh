@@ -371,7 +371,6 @@ for option in \
   --network \
   --no-healthcheck \
   --no-hosts \
-  --passwd \
   --pid \
   --pids-limit \
   --privileged \
