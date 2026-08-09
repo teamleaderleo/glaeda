@@ -276,6 +276,7 @@ probe_unit="smolrunner-podman-container-$probe_nonce.service"
 probe_user_created=0
 probe_unit_owned=0
 probe_script=$(/usr/bin/readlink -f "$0")
+probe_user_script="$probe_root/user-probe.sh"
 
 cleanup() {
   local status=$?
@@ -336,6 +337,7 @@ mkdir -p \
   "$probe_root/runtime" \
   "$probe_root/tmp"
 chmod 0755 "$probe_root"
+install -o 0 -g 0 -m 0555 "$probe_script" "$probe_user_script"
 install -o 0 -g 0 -m 0555 /usr/bin/busybox "$probe_root/rootfs/bin/busybox"
 printf 'root:x:0:0:root:/root:/bin/busybox\nsmolgate:x:1000:1000:SmolRunner gate:/:/bin/busybox\n' \
   > "$probe_root/rootfs/etc/passwd"
@@ -408,7 +410,7 @@ probe_unit_owned=1
   USER="$probe_user" \
   XDG_CONFIG_HOME="$probe_root/empty-xdg" \
   XDG_RUNTIME_DIR="$probe_root/runtime" \
-  /usr/bin/bash "$probe_script" --user-probe
+  /usr/bin/bash "$probe_user_script" --user-probe
 probe_unit_owned=0
 
 if /usr/bin/pgrep -u "$probe_uid" >/dev/null 2>&1; then
