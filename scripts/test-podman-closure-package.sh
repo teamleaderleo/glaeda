@@ -328,11 +328,13 @@ mkdir -p \
   "$probe_root/tmp"
 chown -R "$probe_uid:$probe_gid" \
   "$probe_root/graphroot" \
+  "$probe_root/network" \
   "$probe_root/runroot" \
   "$probe_root/runtime" \
   "$probe_root/tmp"
 chmod 0700 \
   "$probe_root/graphroot" \
+  "$probe_root/network" \
   "$probe_root/runroot" \
   "$probe_root/runtime" \
   "$probe_root/tmp"
@@ -343,11 +345,17 @@ printf '[storage]\ndriver = "overlay"\nrunroot = "%s"\ngraphroot = "%s"\nrootles
   "$probe_root/runroot" "$probe_root/graphroot" "$probe_root/graphroot" \
   > "$probe_root/config/storage.conf"
 printf '{}\n' > "$probe_root/auth/auth.json"
-chmod -R a-w "$probe_root/auth" "$probe_root/config" "$probe_root/hooks" "$probe_root/network"
+chmod -R a-w "$probe_root/auth" "$probe_root/config" "$probe_root/hooks"
 
 cat > "$probe_root/user-probe.sh" <<'USER_PROBE'
 #!/usr/bin/env bash
 set -euo pipefail
+
+if [[ -n $(/usr/bin/find "$PROBE_NETWORK" -mindepth 1 -print -quit) ]]; then
+  printf 'error: run-private network state was not empty before first use\n' >&2
+  exit 1
+fi
+network_identity=$(/usr/bin/stat -Lc '%d:%i' "$PROBE_NETWORK")
 
 /usr/bin/podman \
   --remote=false \
@@ -369,6 +377,33 @@ if ! /usr/bin/jq -e \
   printf 'error: Podman did not report the exact rootless run-private storage roots\n' >&2
   exit 1
 fi
+
+if [[ $(/usr/bin/stat -Lc '%d:%i' "$PROBE_NETWORK") != "$network_identity" ]] ||
+  [[ -L $PROBE_NETWORK ]]; then
+  printf 'error: run-private network directory identity changed during first use\n' >&2
+  exit 1
+fi
+mapfile -d '' network_entries < <(
+  /usr/bin/find "$PROBE_NETWORK" -mindepth 1 -maxdepth 1 -print0
+)
+if [[ ${#network_entries[@]} -ne 1 ]] ||
+  [[ ${network_entries[0]##*/} != netavark.lock ]]; then
+  printf 'error: Podman created unexpected run-private network state\n' >&2
+  exit 1
+fi
+read -r network_owner network_mode network_links network_kind network_size < <(
+  /usr/bin/stat -Lc '%u %a %h %F %s' "${network_entries[0]}"
+)
+if [[ -L ${network_entries[0]} ]] ||
+  [[ $network_owner != "$PROBE_UID" ]] ||
+  [[ $network_links != 1 ]] ||
+  [[ $network_kind != 'regular empty file' ]] ||
+  (( (8#$network_mode & 0022) != 0 )) ||
+  (( network_size > 4096 )); then
+  printf 'error: Podman network lock state was not bounded and private\n' >&2
+  exit 1
+fi
+printf 'network_state=bounded entries=1\n'
 
 pause_file=$(/usr/bin/find "$XDG_RUNTIME_DIR" -type f -name pause.pid -print -quit)
 if [[ -z $pause_file ]]; then
