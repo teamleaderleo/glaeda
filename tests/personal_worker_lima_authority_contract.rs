@@ -949,6 +949,81 @@ fn exhausted_authority_generation_refuses_without_reusing_a_generation() {
 }
 
 #[test]
+fn settlement_reserves_its_clear_generation_before_publishing() {
+    let root = TempStateRoot::new();
+    let worker = PersonalWorkerStoreDocument::new(
+        PersonalWorkerQueueInput {
+            generation: PersonalWorkerQueueGeneration::new(1).expect("generation"),
+            observed_at: epoch(90_000),
+            profile_observation: PersonalWorkerProfileObservation::Unobserved,
+            activity_evidence: PersonalWorkerActivityEvidence::Never,
+            queued: Vec::new(),
+            active: Vec::new(),
+            pending_profile_change: None,
+        },
+        Vec::new(),
+    )
+    .expect("initial worker");
+    UnixPersonalWorkerStore::initialize_if_clean(root.path(), &worker)
+        .expect("initialize worker store");
+
+    let config = config();
+    let mac = mac_observation(true, 100_000);
+    let request = request(LIMA_HOME, CACHE_PATH);
+    let confirmation =
+        personal_worker_lima_enrollment_confirmation(&config, &mac, &request, broker_identity())
+            .expect("confirmation");
+    let enrollment = PersonalWorkerLimaAuthorityDocument::enroll(
+        &config,
+        &mac,
+        &request,
+        broker_identity(),
+        Some(confirmation.value()),
+    )
+    .expect("confirmed enrollment");
+    let mut guard = UnixPersonalWorkerLimaAuthorityGuard::open(root.path()).expect("guard");
+    guard
+        .publish_enrollment(enrollment, epoch(104_000))
+        .expect("publish enrollment");
+    persist_completed_work_attempt(&mut guard);
+    drop(guard);
+
+    let authority_path = root.path().join("personal-worker/lima-authority.json");
+    let completed = fs::read_to_string(&authority_path).expect("completed authority bytes");
+    let penultimate = completed
+        .replacen(
+            "\"authority_generation\":10",
+            "\"authority_generation\":999999999999",
+            1,
+        )
+        .replacen("\"generation\":1", "\"generation\":999999999990", 1);
+    decode_personal_worker_lima_authority(penultimate.as_bytes())
+        .expect("penultimate completed authority is canonical");
+    fs::write(&authority_path, penultimate).expect("write bounded authority fixture");
+    fs::set_permissions(&authority_path, fs::Permissions::from_mode(0o600))
+        .expect("private authority mode");
+
+    let mut guard = UnixPersonalWorkerLimaAuthorityGuard::open(root.path()).expect("reopen guard");
+    let error = guard
+        .settle_completed_attempt()
+        .expect_err("settlement must reserve both remaining generations");
+    assert_eq!(
+        error.kind(),
+        UnixPersonalWorkerLimaAuthorityErrorKind::RevisionConflict
+    );
+    let retained = guard.authority().expect("completed authority retained");
+    assert_eq!(retained.authority_generation().get(), 999_999_999_999);
+    assert!(retained.settlement().is_none());
+    assert!(!root.path().join("personal-worker/.next.json").exists());
+    assert!(
+        !root
+            .path()
+            .join("personal-worker/.lima-authority.next.json")
+            .exists()
+    );
+}
+
+#[test]
 fn strict_decode_binds_each_phase_to_its_exact_durable_generation_delta() {
     let authority = enrolled();
     let before_mac = mac_observation_profile(true, 200_000, LimaResourceProfile::Interactive);

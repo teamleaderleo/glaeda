@@ -622,8 +622,14 @@ impl PersonalWorkerLimaAuthorityDocument {
                 "worker queue generation cannot advance for Lima settlement",
             )
         })?;
+        let prepared_generation = self.authority_generation.next()?;
+        prepared_generation.next().map_err(|_| {
+            PersonalWorkerLimaAuthorityError::invalid(
+                "Lima authority generation cannot reserve settlement completion",
+            )
+        })?;
         let mut next = self.clone();
-        next.authority_generation = self.authority_generation.next()?;
+        next.authority_generation = prepared_generation;
         next.settlement = Some(PersonalWorkerLimaSettlement {
             previous_worker_digest,
             successor_worker_digest,
