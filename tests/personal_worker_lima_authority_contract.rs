@@ -39,11 +39,11 @@ use smolrunner::operator_config::{
 };
 use smolrunner::personal_worker_host_broker::{HostBrokerRunnerObservation, HostBrokerRunnerState};
 use smolrunner::personal_worker_lima_authority::{
-    PERSONAL_WORKER_LIMA_RECOVERY_SCHEMA_VERSION, PersonalWorkerLimaAttemptInput,
-    PersonalWorkerLimaAttemptPhase, PersonalWorkerLimaAuthorityDocument,
-    PersonalWorkerLimaAuthorityErrorKind, PersonalWorkerLimaRecoveryDisposition,
-    decode_personal_worker_lima_authority, encode_personal_worker_lima_authority,
-    personal_worker_lima_enrollment_confirmation,
+    PERSONAL_WORKER_LIMA_AUTHORITY_SCHEMA_VERSION, PERSONAL_WORKER_LIMA_RECOVERY_SCHEMA_VERSION,
+    PersonalWorkerLimaAttemptInput, PersonalWorkerLimaAttemptPhase,
+    PersonalWorkerLimaAuthorityDocument, PersonalWorkerLimaAuthorityErrorKind,
+    PersonalWorkerLimaRecoveryDisposition, decode_personal_worker_lima_authority,
+    encode_personal_worker_lima_authority, personal_worker_lima_enrollment_confirmation,
 };
 use smolrunner::personal_worker_mac_observation::{
     PersonalWorkerMacObservation, PersonalWorkerMacObservationAdapter,
@@ -510,6 +510,15 @@ fn enrolled() -> PersonalWorkerLimaAuthorityDocument {
         broker_identity(),
     )
     .expect("confirmation");
+    assert_eq!(
+        confirmation.schema_version(),
+        PERSONAL_WORKER_LIMA_AUTHORITY_SCHEMA_VERSION
+    );
+    assert!(
+        confirmation
+            .value()
+            .starts_with("personal-worker-lima-enrollment-v3.sha256:")
+    );
     PersonalWorkerLimaAuthorityDocument::enroll(
         &config,
         &running,
@@ -651,6 +660,11 @@ fn enrollment_uses_sealed_running_identity_and_has_canonical_private_encoding() 
     let decoded = decode_personal_worker_lima_authority(&bytes).expect("decode");
     assert_eq!(decoded, document);
     let text = String::from_utf8(bytes).expect("JSON");
+    let value: serde_json::Value = serde_json::from_str(&text).expect("authority JSON");
+    assert_eq!(
+        value["host_identity_digest"],
+        running.lima_host_identity().digest().as_str()
+    );
     let debug = format!("{document:?}");
     let instance_directory = format!("{}/smolrunner", lima_home());
     let lima_home_path = lima_home();
@@ -940,7 +954,7 @@ fn prepared_attempt_blocks_replay_and_follows_exact_durable_phase_graph() {
 }
 
 #[test]
-fn stopped_start_and_profile_change_refuse_without_current_immutable_ownership() {
+fn stopped_start_and_profile_change_require_the_enrolled_host_identity() {
     let authority = enrolled();
     let before = lifecycle_profile(
         LimaLifecycleState::Stopped,
@@ -956,7 +970,7 @@ fn stopped_start_and_profile_change_refuse_without_current_immutable_ownership()
             ..
         }
     ));
-    let error = authority
+    let prepared_edit = authority
         .begin_attempt(PersonalWorkerLimaAttemptInput {
             config: &config(),
             mac: &mac_observation(false, 200_000),
@@ -964,10 +978,62 @@ fn stopped_start_and_profile_change_refuse_without_current_immutable_ownership()
             lifecycle: &before,
             tick: &tick,
         })
-        .expect_err("stopped edit lacks current immutable ownership proof");
+        .expect("stopped edit uses current immutable ownership proof");
     assert_eq!(
-        error.kind,
-        PersonalWorkerLimaAuthorityErrorKind::InvalidInput
+        prepared_edit.attempt().expect("attempt").action(),
+        smolrunner::personal_worker_lima_authority::PersonalWorkerLimaAction::EditToWork
+    );
+    assert_eq!(
+        decode_personal_worker_lima_authority(
+            &encode_personal_worker_lima_authority(&prepared_edit).expect("encode stopped edit")
+        )
+        .expect("decode stopped edit"),
+        prepared_edit
+    );
+    let edit_generation = prepared_edit.attempt().expect("attempt").generation();
+    let editing = prepared_edit
+        .checkpoint(
+            edit_generation,
+            PersonalWorkerLimaAttemptPhase::EditStarted,
+            epoch(206_000),
+        )
+        .expect("edit started");
+    let edited = editing
+        .checkpoint(
+            edit_generation,
+            PersonalWorkerLimaAttemptPhase::EditCompleted,
+            epoch(207_000),
+        )
+        .expect("edit completed");
+    let verifying = edited
+        .checkpoint(
+            edit_generation,
+            PersonalWorkerLimaAttemptPhase::VerifyStarted,
+            epoch(208_000),
+        )
+        .expect("verification started");
+    let completed_edit = verifying
+        .complete_attempt(
+            edit_generation,
+            &config(),
+            &mac_observation_profile(false, 210_000, LimaResourceProfile::Work),
+            &request(&lima_home(), CACHE_PATH),
+            &lifecycle_with_generation(
+                LimaLifecycleState::Stopped,
+                LimaResourceProfile::Work,
+                214_000,
+                2,
+            ),
+            epoch(215_000),
+        )
+        .expect("stopped edit verified");
+    assert_eq!(
+        decode_personal_worker_lima_authority(
+            &encode_personal_worker_lima_authority(&completed_edit)
+                .expect("encode completed stopped edit")
+        )
+        .expect("decode completed stopped edit"),
+        completed_edit
     );
     assert!(authority.attempt().is_none());
 
@@ -981,7 +1047,7 @@ fn stopped_start_and_profile_change_refuse_without_current_immutable_ownership()
         start_tick.action(),
         smolrunner::personal_worker_tick::PersonalWorkerTickAction::StartVm { .. }
     ));
-    let error = authority
+    let prepared_start = authority
         .begin_attempt(PersonalWorkerLimaAttemptInput {
             config: &config(),
             mac: &mac_observation_profile(false, 200_000, LimaResourceProfile::Work),
@@ -989,11 +1055,86 @@ fn stopped_start_and_profile_change_refuse_without_current_immutable_ownership()
             lifecycle: &stopped_work,
             tick: &start_tick,
         })
-        .expect_err("stopped start lacks current immutable ownership proof");
+        .expect("stopped start uses current immutable ownership proof");
     assert_eq!(
-        error.kind,
-        PersonalWorkerLimaAuthorityErrorKind::InvalidInput
+        prepared_start.attempt().expect("attempt").action(),
+        smolrunner::personal_worker_lima_authority::PersonalWorkerLimaAction::Start
     );
+    assert_eq!(
+        decode_personal_worker_lima_authority(
+            &encode_personal_worker_lima_authority(&prepared_start).expect("encode stopped start")
+        )
+        .expect("decode stopped start"),
+        prepared_start
+    );
+    let start_generation = prepared_start.attempt().expect("attempt").generation();
+    let starting = prepared_start
+        .checkpoint(
+            start_generation,
+            PersonalWorkerLimaAttemptPhase::StartStarted,
+            epoch(206_000),
+        )
+        .expect("start started");
+    let started = starting
+        .checkpoint(
+            start_generation,
+            PersonalWorkerLimaAttemptPhase::StartCompleted,
+            epoch(207_000),
+        )
+        .expect("start completed");
+    let verifying = started
+        .checkpoint(
+            start_generation,
+            PersonalWorkerLimaAttemptPhase::VerifyStarted,
+            epoch(208_000),
+        )
+        .expect("verification started");
+    let completed_start = verifying
+        .complete_attempt(
+            start_generation,
+            &config(),
+            &mac_observation_profile(true, 210_000, LimaResourceProfile::Work),
+            &request(&lima_home(), CACHE_PATH),
+            &lifecycle_with_generation(
+                LimaLifecycleState::Running,
+                LimaResourceProfile::Work,
+                214_000,
+                1,
+            ),
+            epoch(215_000),
+        )
+        .expect("stopped start verified");
+    assert_eq!(
+        decode_personal_worker_lima_authority(
+            &encode_personal_worker_lima_authority(&completed_start)
+                .expect("encode completed stopped start")
+        )
+        .expect("decode completed stopped start"),
+        completed_start
+    );
+}
+
+#[test]
+fn stopped_mutation_refuses_same_path_host_identity_replacement() {
+    let authority = enrolled();
+    LIMA_HOST_FIXTURE.with(|fixture| fixture.rewrite_disk_identity("smolrunner", 222));
+    let before = lifecycle_profile(
+        LimaLifecycleState::Stopped,
+        LimaResourceProfile::Interactive,
+        204_000,
+    );
+    let tick = worker_tick(&before);
+    let error = authority
+        .begin_attempt(PersonalWorkerLimaAttemptInput {
+            config: &config(),
+            mac: &mac_observation(false, 200_000),
+            request: &request(&lima_home(), CACHE_PATH),
+            lifecycle: &before,
+            tick: &tick,
+        })
+        .expect_err("replacement host identity cannot authorize stopped mutation");
+    assert_eq!(error.kind, PersonalWorkerLimaAuthorityErrorKind::Conflict);
+    assert!(authority.attempt().is_none());
 }
 
 #[test]
@@ -1199,7 +1340,7 @@ fn strict_decode_binds_each_phase_to_its_exact_durable_generation_delta() {
 fn unknown_version_unknown_fields_and_noncanonical_bytes_fail_closed() {
     let bytes = encode_personal_worker_lima_authority(&enrolled()).expect("encode");
     let mut value: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON");
-    value["schema_version"] = serde_json::json!(3);
+    value["schema_version"] = serde_json::json!(4);
     let version = serde_json::to_vec(&value).expect("version bytes");
     assert_eq!(
         decode_personal_worker_lima_authority(&version)
@@ -1208,16 +1349,23 @@ fn unknown_version_unknown_fields_and_noncanonical_bytes_fail_closed() {
         PersonalWorkerLimaAuthorityErrorKind::VersionIncompatible
     );
 
-    value["schema_version"] = serde_json::json!(1);
-    let previous = serde_json::to_vec(&value).expect("previous version bytes");
-    assert_eq!(
-        decode_personal_worker_lima_authority(&previous)
-            .expect_err("previous version requires explicit migration")
-            .kind,
-        PersonalWorkerLimaAuthorityErrorKind::VersionIncompatible
-    );
+    for previous_version in [1, 2] {
+        value = serde_json::from_slice(&bytes).expect("current JSON");
+        value["schema_version"] = serde_json::json!(previous_version);
+        value
+            .as_object_mut()
+            .expect("authority object")
+            .remove("host_identity_digest");
+        let previous = serde_json::to_vec(&value).expect("real previous version bytes");
+        assert_eq!(
+            decode_personal_worker_lima_authority(&previous)
+                .expect_err("previous version requires explicit migration")
+                .kind,
+            PersonalWorkerLimaAuthorityErrorKind::VersionIncompatible
+        );
+    }
 
-    value["schema_version"] = serde_json::json!(2);
+    value = serde_json::from_slice(&bytes).expect("current JSON");
     value["identity"]["instance_id"] = serde_json::json!("other");
     assert_eq!(
         decode_personal_worker_lima_authority(
