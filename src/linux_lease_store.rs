@@ -347,6 +347,14 @@ struct LeaseMutationLock {
     _lock: OwnedFd,
 }
 
+impl Drop for LeaseMutationLock {
+    fn drop(&mut self) {
+        // Do not let a duplicate inherited across a concurrent fork retain mutation authority
+        // after the owning guard has left its critical section.
+        let _ = fs::flock(&self._lock, FlockOperation::Unlock);
+    }
+}
+
 struct StagedLeaseDocument<'a> {
     parent: std::os::fd::BorrowedFd<'a>,
     file: Option<OwnedFd>,
@@ -665,6 +673,8 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use rustix::io::dup;
+
     use crate::lease::{LeaseAction, LeaseId, LeaseIdentity, LeaseKind, LeaseRecord, LeaseState};
     use crate::lease_catalog::{
         LeaseCatalog, LeaseSelector, LeaseStore, LeaseStoreErrorKind, LeaseWriteDisposition,
@@ -785,6 +795,25 @@ mod tests {
             .acquire_mutation_lock()
             .expect_err("second mutation lock must be busy");
         assert_eq!(error.kind, LeaseStoreErrorKind::Busy);
+    }
+
+    #[test]
+    fn mutation_lock_drop_unlocks_an_inherited_open_file_description() {
+        let root = TempInstallation::new("inherited-lock");
+        let store = LinuxLeaseStore::open_or_create(root.path(), installation_id())
+            .expect("open durable store");
+        let guard = store
+            .acquire_mutation_lock()
+            .expect("acquire mutation lock");
+        let inherited = dup(&guard._lock).expect("duplicate inherited lock descriptor");
+
+        drop(guard);
+        let reacquired = store
+            .acquire_mutation_lock()
+            .expect("guard drop must explicitly unlock inherited description");
+
+        drop(reacquired);
+        drop(inherited);
     }
 
     #[test]
