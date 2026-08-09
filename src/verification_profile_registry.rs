@@ -29,9 +29,7 @@ const DOCTOR_COMMAND_DIGEST: &str =
     "sha256:46d9f7be1e888b842fe77e81e3826d6338e637901022d7acc9d18fb61b8ffe6e";
 const PLAN_COMMAND_DIGEST: &str =
     "sha256:cf9866af6335cd4d3a579dc2f61202cdd3652eb25031330062848251a6e8d0d1";
-const CACHE_ID: &str = "smolrunner-cargo-target";
-const CACHE_NAMESPACE_DIGEST: &str =
-    "sha256:010067f11ccdd816904b7ce368bac777daeb72e699fd4807d4685c83e0434ee6";
+const CACHE_ID: &str = "cargo-target";
 const PROFILE_IDS: [&str; 3] = [
     SMOLRUNNER_REQUIRED_PROFILE_ID,
     SMOLRUNNER_DOCTOR_PROFILE_ID,
@@ -46,12 +44,13 @@ pub enum VerificationCacheClassKind {
     RunnerOwnedCargoTarget,
 }
 
-/// A path-free cache identity class. A future #117 adapter binds it to one exact workspace path.
+/// A path-free cache policy class.
+///
+/// A trusted workspace producer binds the exact installation-specific namespace separately.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct VerificationCacheIdentityClass {
     kind: VerificationCacheClassKind,
     cache_id: CacheId,
-    namespace_digest: Sha256Digest,
 }
 
 impl VerificationCacheIdentityClass {
@@ -63,11 +62,6 @@ impl VerificationCacheIdentityClass {
     #[must_use]
     pub const fn cache_id(&self) -> &CacheId {
         &self.cache_id
-    }
-
-    #[must_use]
-    pub const fn namespace_digest(&self) -> &Sha256Digest {
-        &self.namespace_digest
     }
 }
 
@@ -437,7 +431,6 @@ fn cache_class() -> Result<VerificationCacheIdentityClass, VerificationProfileRe
     Ok(VerificationCacheIdentityClass {
         kind: VerificationCacheClassKind::RunnerOwnedCargoTarget,
         cache_id: CacheId::parse(CACHE_ID)?,
-        namespace_digest: Sha256Digest::parse(CACHE_NAMESPACE_DIGEST)?,
     })
 }
 
@@ -750,6 +743,7 @@ mod tests {
         );
         assert_eq!(required.timeout().total_seconds(), 3_600);
         assert_eq!(required.cache_class(), &cache_class().expect("cache"));
+        assert_eq!(required.cache_class().cache_id().as_str(), "cargo-target");
         assert_eq!(
             required
                 .required_capabilities()
@@ -785,6 +779,8 @@ mod tests {
         let registry = registry();
         let json = serde_json::to_string(&registry).expect("JSON");
         let debug = format!("{registry:?}");
+        assert!(json.contains("\"cache_id\":\"cargo-target\""));
+        assert!(!json.contains("namespace_digest"));
         for private in [
             "/var/lib/smolrunner",
             "/home/runner",

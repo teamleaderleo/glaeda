@@ -159,6 +159,7 @@ fn descriptor_relative_success_is_private_and_deterministic() {
     let first_evidence = first.trusted_evidence_digest().as_str().to_owned();
     let json = serde_json::to_string(&first).expect("serialize receipt");
     let debug = format!("{first:?}");
+    let location_debug = format!("{:?}", first.workspace_location_identity());
 
     assert_eq!(
         first.installation_id().as_str(),
@@ -169,6 +170,7 @@ fn descriptor_relative_success_is_private_and_deterministic() {
     assert!(first_workspace_id.starts_with("workspace-"));
     assert!(first_namespace.starts_with("sha256:"));
     assert!(first_evidence.starts_with("sha256:"));
+    assert_eq!(location_debug, "<private-workspace-location>");
     for private in [
         fixture.root.path(),
         fixture.workspace.as_path(),
@@ -185,6 +187,34 @@ fn descriptor_relative_success_is_private_and_deterministic() {
     assert_eq!(second.workspace_id().as_str(), first_workspace_id);
     assert_eq!(second.cache_namespace_digest().as_str(), first_namespace);
     assert_eq!(second.trusted_evidence_digest().as_str(), first_evidence);
+    assert_eq!(
+        second.workspace_location_identity(),
+        first.workspace_location_identity()
+    );
+}
+
+#[test]
+fn same_path_workspace_replacement_gets_a_distinct_private_identity() {
+    let fixture = Fixture::new("workspace-rebind");
+    if !fixture.root.supported_owner() {
+        return;
+    }
+    let first = fixture.receipt();
+    let displaced = fixture.root.path().join("runner-workspace-displaced");
+    fs::rename(&fixture.workspace, displaced).expect("displace first workspace");
+    create_directory(&fixture.workspace, 0o700);
+    create_directory(&fixture.cache, 0o700);
+
+    let second = fixture.receipt();
+
+    assert_ne!(
+        second.workspace_location_identity(),
+        first.workspace_location_identity()
+    );
+    assert_eq!(
+        format!("{:?}", second.workspace_location_identity()),
+        "<private-workspace-location>"
+    );
 }
 
 #[test]

@@ -405,13 +405,6 @@ fn validate_receipt_for_profile(
             "trusted receipt cache owner must exactly match the runner workspace ID",
         ));
     }
-    if receipt.cache_namespace_digest != *profile.cache_class().namespace_digest() {
-        return Err(VerificationProfilePreflightAdapterError::new(
-            "receipt.cache_namespace_digest",
-            "cache_namespace_mismatch",
-            "trusted receipt namespace digest must exactly match the checked-in cache class",
-        ));
-    }
     if !receipt.cache_present {
         return Err(VerificationProfilePreflightAdapterError::new(
             "receipt.cache_present",
@@ -515,6 +508,8 @@ mod tests {
 
     const WORKSPACE_ROOT: &str = "/srv/smolrunner/workspaces/verification-a";
     const CACHE_PATH: &str = "/srv/smolrunner/workspaces/verification-a/.cache/cargo-target";
+    const CONCRETE_CACHE_NAMESPACE_DIGEST: &str =
+        "sha256:abababababababababababababababababababababababababababababababab";
 
     fn commit(value: &str) -> CommitId {
         CommitId::parse(&value.repeat(40)).expect("commit")
@@ -574,7 +569,8 @@ mod tests {
             tested_tree: tree("2"),
             cache_id: profile.cache_class().cache_id().clone(),
             cache_owner_workspace_id: workspace_id,
-            cache_namespace_digest: profile.cache_class().namespace_digest().clone(),
+            cache_namespace_digest: Sha256Digest::parse(CONCRETE_CACHE_NAMESPACE_DIGEST)
+                .expect("concrete cache namespace"),
             cache_present: true,
             resources: HostResourceObservation {
                 available_memory_bytes: profile.resources().memory.minimum_available_bytes,
@@ -602,6 +598,24 @@ mod tests {
             report.selected_command(),
             profile.canonical_command().identity()
         );
+    }
+
+    #[test]
+    fn concrete_cache_namespace_is_bound_by_the_trusted_receipt_not_the_global_class() {
+        let profile = required_profile();
+        let mut definition = receipt_definition(&profile);
+        definition.cache_namespace_digest = Sha256Digest::parse(
+            "sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+        )
+        .expect("second concrete namespace");
+
+        let report = evaluate_registered_verification_profile(
+            &profile,
+            TrustedRunnerWorkspaceReceipt::new(definition).expect("trusted receipt"),
+        )
+        .expect("concrete namespace is installation-specific");
+
+        assert_eq!(report.readiness(), PreflightReadiness::Ready);
     }
 
     #[test]

@@ -13,6 +13,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::artifact::{CommitId, GitTreeId, RepositoryRef, Sha256Digest};
 use crate::ownership::{OwnershipMarker, ProjectIdentity, ResourceIdentity, ResourceKind};
+use crate::repository_source_observation::RepositoryWorkspaceLocationIdentity;
 use crate::state::{InstallationId, STATE_ROOT};
 use crate::state_document::{ProjectStateDocument, StateDocument, decode_state_document};
 use crate::state_store::MAX_STATE_DOCUMENT_BYTES;
@@ -122,6 +123,8 @@ pub struct TrustedWorkspaceCacheReceipt {
     cache_present: bool,
     trusted_evidence_digest: Sha256Digest,
     #[serde(skip)]
+    workspace_location_identity: RepositoryWorkspaceLocationIdentity,
+    #[serde(skip)]
     workspace_root: PathBuf,
     #[serde(skip)]
     cache_path: PathBuf,
@@ -156,6 +159,11 @@ impl TrustedWorkspaceCacheReceipt {
     #[must_use]
     pub const fn trusted_evidence_digest(&self) -> &Sha256Digest {
         &self.trusted_evidence_digest
+    }
+
+    #[must_use]
+    pub const fn workspace_location_identity(&self) -> &RepositoryWorkspaceLocationIdentity {
+        &self.workspace_location_identity
     }
 
     /// Combine descriptor-derived identity with separately observed non-identity preflight evidence.
@@ -416,6 +424,11 @@ fn produce_with_hook(
         ],
     );
     let trusted_evidence_digest = parse_digest(evidence_bytes, "evidence")?;
+    let workspace_location_identity = RepositoryWorkspaceLocationIdentity::from_validated(
+        workspace_path.clone(),
+        workspace.stat.st_dev,
+        workspace.stat.st_ino,
+    );
 
     Ok(TrustedWorkspaceCacheReceipt {
         schema_version: TRUSTED_WORKSPACE_RECEIPT_SCHEMA_VERSION,
@@ -427,6 +440,7 @@ fn produce_with_hook(
         cache_namespace_digest,
         cache_present: true,
         trusted_evidence_digest,
+        workspace_location_identity,
         workspace_root: workspace_path,
         cache_path,
     })
