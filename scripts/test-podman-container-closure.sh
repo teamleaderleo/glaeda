@@ -152,7 +152,8 @@ cleanup_user_probe() {
 run_hostile_probe() {
   local image_id=$1
   local container_id cgroup_leaf cgroup_leaf_name init_output init_status start_output start_status
-  local container_size exit_code free_blocks free_inodes kill_fd log_size memory_current pids_max_events
+  local container_size exit_code free_blocks free_inodes kill_fd log_group log_links log_mode
+  local log_owner log_size memory_current pids_max_events
   local payload_empty=0 resource_pressure_seen=0 stopped_seen=0
   local -a matching_cgroups matching_specs
 
@@ -351,6 +352,16 @@ run_hostile_probe() {
     [[ -n $(< "$PROBE_PAYLOAD_CGROUP_DIR/cgroup.procs") ]] ||
     ! /usr/bin/grep -Fxq 'populated 0' "$PROBE_PAYLOAD_CGROUP_DIR/cgroup.events"; then
     printf 'error: hostile payload cgroup debt remained after exact removal\n' >&2
+    exit 1
+  fi
+  read -r log_owner log_group log_mode log_links log_size < <(
+    /usr/bin/stat -Lc '%u %g %a %h %s' "$PROBE_HOSTILE_LOGFILE"
+  )
+  if [[ -L $PROBE_HOSTILE_LOGFILE ]] || [[ ! -f $PROBE_HOSTILE_LOGFILE ]] ||
+    [[ $log_owner != "$PROBE_UID" ]] || [[ $log_group != "$PROBE_GID" ]] ||
+    (( (8#$log_mode & 0022) != 0 )) || [[ $log_links != 1 ]] ||
+    (( log_size < 65536 || log_size >= 1048576 )); then
+    printf 'error: hostile payload log did not remain inside its exact bounded identity\n' >&2
     exit 1
   fi
   if ! validate_target_tmpfs; then
