@@ -55,6 +55,9 @@ pub mod lane_executor;
 pub mod lease;
 pub mod lease_catalog;
 pub mod lease_document;
+/// Descriptor-bound host identity for one reviewed Lima VZ instance and raw root disk.
+#[cfg(unix)]
+pub mod lima_host_identity;
 /// Pure Lima policy: work while active, interactive after 10 idle minutes, stopped after 30.
 pub mod lima_lifecycle;
 /// Fixed direct executor for accepted personal-worker Lima lifecycle actions.
