@@ -108,7 +108,6 @@ prepare_cgroup_hierarchy() {
 }
 
 PROBE_OWNED_CONTAINER_ID=
-PROBE_OWNED_IMAGE_ID=
 
 validate_target_tmpfs() {
   local block_size blocks free_blocks free_inodes fs_type inode_limit mode owner group
@@ -143,10 +142,31 @@ cleanup_user_probe() {
   if [[ $PROBE_OWNED_CONTAINER_ID =~ ^[0-9a-f]{64}$ ]]; then
     podman_probe rm --force "$PROBE_OWNED_CONTAINER_ID" >/dev/null 2>&1
   fi
-  if [[ $PROBE_OWNED_IMAGE_ID =~ ^sha256:[0-9a-f]{64}$ ]]; then
-    podman_probe image rm --force "$PROBE_OWNED_IMAGE_ID" >/dev/null 2>&1
-  fi
   exit "$status"
+}
+
+run_image_install_probe() {
+  local image_id image_hex image_size
+
+  image_id=$(podman_probe import "$PROBE_ROOTFS_TAR" localhost/smolrunner-closure-fixture:local)
+  if [[ ! $image_id =~ ^sha256:[0-9a-f]{64}$ ]]; then
+    printf 'error: offline image installation returned a noncanonical identity\n' >&2
+    exit 1
+  fi
+  image_hex=${image_id#sha256:}
+  podman_probe image inspect "$image_id" > "$PROBE_IMAGE_JSON"
+  image_size=$(/usr/bin/stat -Lc %s "$PROBE_IMAGE_JSON")
+  if (( image_size == 0 || image_size > 1048576 )) ||
+    ! /usr/bin/jq -e --arg image_hex "$image_hex" '
+      length == 1 and
+      .[0].Id == $image_hex and
+      (.[0].RepoTags | index("localhost/smolrunner-closure-fixture:local")) != null
+    ' "$PROBE_IMAGE_JSON" >/dev/null; then
+    printf 'error: installed offline image identity was absent, oversized, or mismatched\n' >&2
+    exit 1
+  fi
+  printf '%s\n' "$image_id" > "$PROBE_IMAGE_ID_RECORD"
+  printf 'offline_image_install=exact\n'
 }
 
 run_hostile_probe() {
@@ -399,6 +419,12 @@ run_user_probe() {
 
   prepare_cgroup_hierarchy
 
+  if [[ -L $PROBE_GRAPHROOT ]] || [[ ! -d $PROBE_GRAPHROOT ]] ||
+    [[ -n $(/usr/bin/find "$PROBE_GRAPHROOT" -mindepth 1 -maxdepth 1 -print -quit) ]] ||
+    [[ -e $PROBE_RUNROOT ]] || [[ -L $PROBE_RUNROOT ]]; then
+    printf 'error: execution graph/run roots were not fresh before image inspection\n' >&2
+    exit 1
+  fi
   if ! validate_target_tmpfs ||
     [[ -n $(/usr/bin/find "$PROBE_TARGET" -mindepth 1 -maxdepth 1 -print -quit) ]]; then
     printf 'error: bounded writable target is not one exact empty executable tmpfs\n' >&2
@@ -421,12 +447,11 @@ run_user_probe() {
     exit 1
   fi
 
-  image_id=$(podman_probe import "$PROBE_ROOTFS_TAR" localhost/smolrunner-closure-fixture:local)
+  image_id=$(< "$PROBE_IMAGE_ID_RECORD")
   if [[ ! $image_id =~ ^sha256:[0-9a-f]{64}$ ]]; then
-    printf 'error: offline image import returned a noncanonical identity\n' >&2
+    printf 'error: sealed offline image record is noncanonical\n' >&2
     exit 1
   fi
-  PROBE_OWNED_IMAGE_ID=$image_id
   image_hex=${image_id#sha256:}
 
   podman_probe image inspect "$image_id" > "$PROBE_IMAGE_JSON"
@@ -440,7 +465,11 @@ run_user_probe() {
     printf 'image_inspect_bytes=%s\n' "$image_size" >&2
     /usr/bin/jq -c 'if length == 1 then {id: .[0].Id, tags: .[0].RepoTags} else {count: length} end' \
       "$PROBE_IMAGE_JSON" >&2 || true
-    printf 'error: offline image inspection was absent, oversized, or mismatched\n' >&2
+    printf 'error: read-only additional-store image inspection was absent, oversized, or mismatched\n' >&2
+    exit 1
+  fi
+  if ! /usr/bin/grep -Fq "$PROBE_IMAGE_STORE/" "$PROBE_IMAGE_JSON"; then
+    printf 'error: image inspection did not bind the read-only additional store\n' >&2
     exit 1
   fi
 
@@ -798,8 +827,10 @@ $PROBE_GROUP_SHA  /etc/group"
     exit 1
   fi
   run_hostile_probe "$image_id"
-  podman_probe image rm "$image_id" >/dev/null
-  PROBE_OWNED_IMAGE_ID=
+  if podman_probe image rm "$image_id" >/dev/null 2>&1; then
+    printf 'error: runner removed an image from the read-only additional store\n' >&2
+    exit 1
+  fi
 
   mapfile -d '' network_entries_after < <(
     /usr/bin/find "$PROBE_NETWORK" -mindepth 1 -maxdepth 1 -print0
@@ -813,6 +844,11 @@ $PROBE_GROUP_SHA  /etc/group"
 
   printf 'offline_image=exact stopped_create=closed account_files=image-owned cgroup=bounded apparmor=rootless-unavailable\n'
 }
+
+if [[ ${1:-} == --image-install-probe ]]; then
+  run_image_install_probe
+  exit 0
+fi
 
 if [[ ${1:-} == --user-probe ]]; then
   trap cleanup_user_probe EXIT
@@ -829,6 +865,42 @@ if [[ ${SMOLRUNNER_DISPOSABLE_PROBE:-} != github-hosted-ubuntu ]]; then
   exit 1
 fi
 
+snapshot_read_only_image_store() {
+  local store=$1 expected_identity=$2 identity link mount_target target
+  local -a mount_options
+
+  identity=$(/usr/bin/stat -Lc '%d:%i' "$store")
+  mount_target=$(/usr/bin/findmnt -rn -o TARGET --target "$store")
+  IFS=, read -r -a mount_options <<< "$(/usr/bin/findmnt -rn -o OPTIONS --target "$store")"
+  if [[ -L $store ]] || [[ ! -d $store ]] || [[ $identity != "$expected_identity" ]] ||
+    [[ $mount_target != "$store" ]] ||
+    [[ ! " ${mount_options[*]} " =~ [[:space:]]ro[[:space:]] ]] ||
+    [[ ! " ${mount_options[*]} " =~ [[:space:]]nosuid[[:space:]] ]] ||
+    [[ ! " ${mount_options[*]} " =~ [[:space:]]nodev[[:space:]] ]] ||
+    [[ -n $(/usr/bin/find "$store" -xdev -type f ! -links 1 -print -quit) ]] ||
+    [[ -n $(/usr/bin/find "$store" -xdev ! -type d ! -type f ! -type l -print -quit) ]]; then
+    printf 'error: installed image store is not one exact root-controlled read-only mount\n' >&2
+    exit 1
+  fi
+  while IFS= read -r -d '' link; do
+    target=$(/usr/bin/readlink -f -- "$link")
+    if [[ $target != "$store"/* ]]; then
+      printf 'error: installed image store contains an escaping or dangling symlink\n' >&2
+      exit 1
+    fi
+  done < <(/usr/bin/find "$store" -xdev -type l -print0)
+
+  /usr/bin/tar \
+    --sort=name \
+    --format=gnu \
+    --numeric-owner \
+    --xattrs \
+    --xattrs-include='*' \
+    -C "$store" -cf - . |
+    /usr/bin/sha256sum |
+    /usr/bin/awk '{ print $1 }'
+}
+
 for command in \
   /usr/bin/busybox \
   /usr/bin/mkdir \
@@ -836,6 +908,7 @@ for command in \
   /usr/bin/jq \
   /usr/bin/mount \
   /usr/bin/podman \
+  /usr/bin/readlink \
   /usr/bin/sha256sum \
   /usr/bin/stat \
   /usr/bin/systemctl \
@@ -881,23 +954,34 @@ probe_root=$(/usr/bin/mktemp -d /tmp/smolrunner-podman-container.XXXXXX)
 probe_nonce=${probe_root##*.}
 probe_nonce=${probe_nonce,,}
 probe_user="smolctr_$probe_nonce"
+probe_install_unit="smolrunner-podman-image-$probe_nonce.service"
 probe_unit="smolrunner-podman-container-$probe_nonce.service"
 probe_user_created=0
+probe_install_unit_owned=0
 probe_unit_owned=0
 probe_target_mounted=0
+probe_image_store_mounted=0
 probe_script=$(/usr/bin/readlink -f "$0")
 probe_user_script="$probe_root/user-probe.sh"
 probe_seccomp_profile="$probe_root/seccomp.json"
 probe_target="$probe_root/target"
+probe_image_backing="$probe_root/image-backing/store"
+probe_image_store="$probe_root/image-store"
 
 cleanup() {
   local status=$?
   set +e
+  if [[ $probe_install_unit_owned -eq 1 ]]; then
+    /usr/bin/systemctl stop "$probe_install_unit" >/dev/null 2>&1
+  fi
   if [[ $probe_unit_owned -eq 1 ]]; then
     /usr/bin/systemctl stop "$probe_unit" >/dev/null 2>&1
   fi
   if [[ $probe_target_mounted -eq 1 ]]; then
     /usr/bin/umount -- "$probe_target" >/dev/null 2>&1
+  fi
+  if [[ $probe_image_store_mounted -eq 1 ]]; then
+    /usr/bin/umount -- "$probe_image_store" >/dev/null 2>&1
   fi
   if [[ $probe_user_created -eq 1 ]]; then
     /usr/sbin/userdel "$probe_user" >/dev/null 2>&1
@@ -913,11 +997,13 @@ if /usr/bin/id "$probe_user" >/dev/null 2>&1; then
   printf 'error: unique disposable probe user already exists\n' >&2
   exit 1
 fi
-if ! unit_load_state=$(/usr/bin/systemctl show --property=LoadState --value "$probe_unit" 2>/dev/null) ||
-  [[ $unit_load_state != not-found ]]; then
-  printf 'error: unique disposable probe unit is not proven absent\n' >&2
-  exit 1
-fi
+for candidate_unit in "$probe_install_unit" "$probe_unit"; do
+  if ! unit_load_state=$(/usr/bin/systemctl show --property=LoadState --value "$candidate_unit" 2>/dev/null) ||
+    [[ $unit_load_state != not-found ]]; then
+    printf 'error: unique disposable probe unit is not proven absent\n' >&2
+    exit 1
+  fi
+done
 for mounts_conf in /usr/share/containers/mounts.conf /etc/containers/mounts.conf; do
   if [[ -e $mounts_conf ]] || [[ -L $mounts_conf ]]; then
     if [[ -L $mounts_conf ]] || [[ ! -f $mounts_conf ]] ||
@@ -945,6 +1031,12 @@ mkdir -p \
   "$probe_root/empty-xdg" \
   "$probe_root/graphroot" \
   "$probe_root/hooks" \
+  "$probe_root/image-backing" \
+  "$probe_image_backing" \
+  "$probe_image_store" \
+  "$probe_root/image-network" \
+  "$probe_root/image-runtime" \
+  "$probe_root/image-tmp" \
   "$probe_root/network" \
   "$probe_root/rootfs/bin" \
   "$probe_root/rootfs/etc" \
@@ -1004,24 +1096,109 @@ printf '' > "$probe_root/config/containers.conf"
 printf 'unqualified-search-registries = []\nshort-name-mode = "enforcing"\n' \
   > "$probe_root/config/registries.conf"
 printf '[storage]\ndriver = "overlay"\nrunroot = "%s"\ngraphroot = "%s"\nrootless_storage_path = "%s"\n\n[storage.options]\nadditionalimagestores = []\n' \
+  "$probe_root/image-runtime/containers" "$probe_image_backing" "$probe_image_backing" \
+  > "$probe_root/config/image-storage.conf"
+printf '[storage]\ndriver = "overlay"\nrunroot = "%s"\ngraphroot = "%s"\nrootless_storage_path = "%s"\n\n[storage.options]\nadditionalimagestores = ["%s"]\n' \
   "$probe_root/runtime/containers" "$probe_root/graphroot" "$probe_root/graphroot" \
-  > "$probe_root/config/storage.conf"
+  "$probe_image_store" > "$probe_root/config/storage.conf"
 printf '{}\n' > "$probe_root/auth/auth.json"
+printf '' > "$probe_root/image-network/cni.lock"
+printf '' > "$probe_root/image-network/netavark.lock"
 printf '' > "$probe_root/network/cni.lock"
 printf '' > "$probe_root/network/netavark.lock"
 
 chown -R "$probe_uid:$probe_gid" \
   "$probe_root/graphroot" \
+  "$probe_image_backing" \
+  "$probe_root/image-runtime" \
+  "$probe_root/image-tmp" \
   "$probe_root/runtime" \
   "$probe_root/tmp"
 chown "$probe_uid:$probe_gid" \
+  "$probe_root/image-network/cni.lock" \
+  "$probe_root/image-network/netavark.lock" \
   "$probe_root/network/cni.lock" \
   "$probe_root/network/netavark.lock"
 chmod 0555 "$probe_root/empty-home" "$probe_root/empty-xdg"
-chmod 0700 "$probe_root/graphroot" "$probe_root/runtime" "$probe_root/tmp"
+chmod 0700 \
+  "$probe_root/graphroot" \
+  "$probe_image_backing" \
+  "$probe_root/image-runtime" \
+  "$probe_root/image-tmp" \
+  "$probe_root/runtime" \
+  "$probe_root/tmp"
+chmod 0600 "$probe_root/image-network/cni.lock" "$probe_root/image-network/netavark.lock"
 chmod 0600 "$probe_root/network/cni.lock" "$probe_root/network/netavark.lock"
-chmod 0555 "$probe_root/network"
+chmod 0555 "$probe_root/image-network" "$probe_root/network"
 chmod -R a-w "$probe_root/auth" "$probe_root/config" "$probe_root/hooks" "$probe_root/rootfs"
+
+probe_install_unit_owned=1
+/usr/bin/systemd-run \
+  --wait \
+  --collect \
+  --pipe \
+  --service-type=exec \
+  --unit="${probe_install_unit%.service}" \
+  --uid="$probe_user" \
+  --property=KillMode=control-group \
+  --property=CPUQuota=75% \
+  --property=MemoryMax=100663296 \
+  --property=MemorySwapMax=0 \
+  --property=TasksMax=64 \
+  /usr/bin/env -i \
+  CONTAINERS_CONF="$probe_root/config/containers.conf" \
+  CONTAINERS_REGISTRIES_CONF="$probe_root/config/registries.conf" \
+  CONTAINERS_STORAGE_CONF="$probe_root/config/image-storage.conf" \
+  DBUS_SESSION_BUS_ADDRESS="unix:path=$probe_root/image-runtime/absent-user-bus" \
+  HOME="$probe_root/empty-home" \
+  LC_ALL=C \
+  LOGNAME="$probe_user" \
+  PATH=/usr/bin \
+  PROBE_HOOKS="$probe_root/hooks" \
+  PROBE_IMAGE_ID_RECORD="$probe_root/image-runtime/image.id" \
+  PROBE_IMAGE_JSON="$probe_root/image-runtime/image.json" \
+  PROBE_NETWORK="$probe_root/image-network" \
+  PROBE_ROOTFS_TAR="$probe_root/rootfs.tar" \
+  REGISTRY_AUTH_FILE="$probe_root/auth/auth.json" \
+  TMPDIR="$probe_root/image-tmp" \
+  USER="$probe_user" \
+  XDG_CONFIG_HOME="$probe_root/empty-xdg" \
+  XDG_RUNTIME_DIR="$probe_root/image-runtime" \
+  /usr/bin/bash "$probe_user_script" --image-install-probe
+
+install_cgroup="/system.slice/$probe_install_unit"
+if [[ -e "/sys/fs/cgroup$install_cgroup" ]] || [[ -L "/sys/fs/cgroup$install_cgroup" ]] ||
+  ! unit_load_state=$(/usr/bin/systemctl show --property=LoadState --value "$probe_install_unit" 2>/dev/null) ||
+  [[ $unit_load_state != not-found ]] || /usr/bin/pgrep -u "$probe_uid" >/dev/null 2>&1; then
+  printf 'error: offline image installation did not leave one collected empty service\n' >&2
+  exit 1
+fi
+probe_install_unit_owned=0
+
+image_id=$(< "$probe_root/image-runtime/image.id")
+if [[ ! $image_id =~ ^sha256:[0-9a-f]{64}$ ]]; then
+  printf 'error: offline image installation record is noncanonical\n' >&2
+  exit 1
+fi
+printf '%s\n' "$image_id" > "$probe_root/config/image.id"
+chmod 0444 "$probe_root/config/image.id"
+/usr/bin/chown 0:0 "$probe_root/image-backing" "$probe_image_store"
+/usr/bin/chmod 0700 "$probe_root/image-backing"
+/usr/bin/chmod 0555 "$probe_image_store"
+read -r backing_owner backing_group backing_mode < <(
+  /usr/bin/stat -Lc '%u %g %a' "$probe_root/image-backing"
+)
+if [[ -L $probe_root/image-backing ]] || [[ ! -d $probe_root/image-backing ]] ||
+  [[ $backing_owner != 0 ]] || [[ $backing_group != 0 ]] || [[ $backing_mode != 700 ]]; then
+  printf 'error: writable image backing is not hidden behind one exact root-only parent\n' >&2
+  exit 1
+fi
+image_store_identity=$(/usr/bin/stat -Lc '%d:%i' "$probe_image_backing")
+probe_image_store_mounted=1
+/usr/bin/mount --bind "$probe_image_backing" "$probe_image_store"
+/usr/bin/mount --options remount,bind,ro,nosuid,nodev "$probe_image_store"
+image_store_digest_before=$(snapshot_read_only_image_store "$probe_image_store" "$image_store_identity")
+printf 'readonly_image_store=sealed\n'
 
 /usr/bin/mount --types tmpfs \
   --options "rw,nosuid,nodev,size=8388608,nr_inodes=64,uid=$probe_uid,gid=$probe_gid,mode=0700" \
@@ -1063,7 +1240,9 @@ probe_unit_owned=1
   PROBE_HOSTILE_INIT_STDERR="$probe_root/runtime/hostile-init.stderr" \
   PROBE_HOSTILE_INIT_STDOUT="$probe_root/runtime/hostile-init.stdout" \
   PROBE_HOSTILE_LOGFILE="$probe_root/runtime/hostile.log" \
+  PROBE_IMAGE_ID_RECORD="$probe_root/config/image.id" \
   PROBE_IMAGE_JSON="$probe_root/runtime/image.json" \
+  PROBE_IMAGE_STORE="$probe_image_store" \
   PROBE_INIT_STDERR="$probe_root/runtime/init.stderr" \
   PROBE_INIT_STDOUT="$probe_root/runtime/init.stdout" \
   PROBE_LOGFILE="$probe_root/runtime/container.log" \
@@ -1085,6 +1264,15 @@ probe_unit_owned=1
   XDG_RUNTIME_DIR="$probe_root/runtime" \
   /usr/bin/bash "$probe_user_script" --user-probe
 probe_unit_owned=0
+
+image_store_digest_after=$(snapshot_read_only_image_store "$probe_image_store" "$image_store_identity")
+if [[ $image_store_digest_after != "$image_store_digest_before" ]]; then
+  printf 'error: read-only additional image store changed during container execution\n' >&2
+  exit 1
+fi
+printf 'readonly_image_store=unchanged\n'
+/usr/bin/umount -- "$probe_image_store"
+probe_image_store_mounted=0
 
 /usr/bin/umount -- "$probe_target"
 probe_target_mounted=0

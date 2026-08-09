@@ -23,7 +23,8 @@ The initial personal-worker runtime must instead use:
 - a root-owned empty configuration home and explicit configuration files;
 - a fresh execution-private graph root, `XDG_RUNTIME_DIR`-derived run root, temporary directory,
   and libpod database;
-- a root-owned read-only additional image store;
+- a root-controlled read-only additional-image-store mount whose UID-mapped backing is unreachable
+  to the runner;
 - one steward-created attempt-private, byte-and-inode-bounded Cargo target tmpfs plus separately
   verified read-only cache inputs;
 - a dedicated pre-created cgroup-v2 execution identity; and
@@ -109,7 +110,7 @@ runtime/conmon/init paths and prove the effective configuration contains no alte
 | Edge | Effect | Required disposition |
 | --- | --- | --- |
 | `containers.conf` and modules | selects runtime, conmon, helpers, hooks, CDI, init, env, privileges, mounts, devices, cgroups, logging, and remote mode | Set `CONTAINERS_CONF` to one exact root-owned file; prohibit drop-ins, modules, `CONTAINERS_CONF_OVERRIDE`, and runner config. The file fixes empty CDI/plugin/device/volume lists as well as the admitted runtime settings. Parse and canonicalize the admitted subset, then content-bind it. |
-| `storage.conf` | selects graph/run roots, driver, mount program, additional stores, and mutable options | Set `CONTAINERS_STORAGE_CONF` to one exact root-owned file. It fixes both generic `graphroot` and the rootless-specific `rootless_storage_path` to the same run-private graph root, sets generic `runroot` to the same exact value derived below, and names only one root-owned read-only image store plus native overlay with no helper. Noble rootless Podman ignores generic `graphroot`/`runroot`: the effective graph root comes from `rootless_storage_path`, and the effective run root is exactly `<XDG_RUNTIME_DIR>/containers`. Bind both inputs to those values and require Podman's report to match; a generic field alone is not authority. |
+| `storage.conf` | selects graph/run roots, driver, mount program, additional stores, and mutable options | Set `CONTAINERS_STORAGE_CONF` to one exact root-owned file. It fixes both generic `graphroot` and the rootless-specific `rootless_storage_path` to the same run-private graph root, sets generic `runroot` to the same exact value derived below, and names only one root-controlled `ro,nosuid,nodev` additional-image-store mount plus native overlay with no helper. Rootless layer bytes retain their required subordinate-ID-mapped ownership; their writable backing is below a separate root-owned `0700` parent that the runner cannot traverse. Noble rootless Podman ignores generic `graphroot`/`runroot`: the effective graph root comes from `rootless_storage_path`, and the effective run root is exactly `<XDG_RUNTIME_DIR>/containers`. Bind both inputs to those values and require Podman's report to match; a generic field alone is not authority. |
 | `registries.conf` and drop-ins | changes name resolution, mirrors, and transports | Set `CONTAINERS_REGISTRIES_CONF` to one exact root-owned file and bind its associated drop-in directory as empty. Admit no search registries, mirrors, short-name aliases, or insecure transport. The command still uses a full digest reference and `--pull=never`. |
 | signature policy | can admit alternate transport/signature behavior | The 4.9.3 `run` surface has no global signature-policy selector. Prove the policy path is not opened when the exact local image exists and `--pull=never`; until then bind the applicable root-owned policy as reject-by-default and prohibit runner overrides. |
 | `mounts.conf` | silently copies or mounts host paths into every container | Use a root-owned empty `HOME` and `XDG_CONFIG_HOME`; prove the runner override absent and bind system/vendor files as absent or empty. Any entry is conflicting. |
@@ -159,7 +160,7 @@ kernel, account, or cgroup evidence current.
 
 | State | Lifecycle class | Rule |
 | --- | --- | --- |
-| root-owned verification image store | installation-owned persistent, read-only to runner | Created only by an explicit journaled image-install operation. Bind installation ID, runtime generation, complete image manifest/config/layer identity, owner/mode, and store metadata. Unknown content blocks. |
+| verification image-store generation | installation-owned persistent, root-controlled read-only exposure to runner | Created only by an explicit journaled image-install operation. The stored layer ownership remains the exact subordinate-ID mapping required by rootless overlay; recursive host-root `chown` is invalid. After installation is quiescent, the steward hides the backing store below a root-owned `0700` parent and publishes only an exact `ro,nosuid,nodev` bind mount. Bind installation ID, runtime generation, backing and mount identities, complete image manifest/config/layer identity, mapped ownership/mode/xattr metadata, and the protected parent. Unknown content blocks. |
 | execution graph root | run-private | Fresh empty directory under one durable attempt. It holds writable container layers only. Remove after cgroup emptiness, Podman/conmon exit, unmount proof, and exact ownership revalidation. |
 | execution run root | run-private | Exactly `<XDG_RUNTIME_DIR>/containers`, derived by Noble rootless Podman beneath a fresh empty attempt runtime directory. The generic `storage.conf` value is set identically but does not establish the effective root. It holds locks and transient libpod state. Never reused. |
 | libpod database/static/tmp/volume state | run-private | Use transient store and explicit run-private roots. A crash leaves recovery debt; it never becomes the next attempt's input. |
@@ -473,8 +474,11 @@ temporary fixture, and each test proves the marker remains absent.
 - Select the exact root-owned seccomp profile and prove it is effective for a rootless cgroup-v2
   run. Per-container AppArmor is unavailable through the pinned rootless Podman stack; adding an
   outer-service AppArmor profile requires a separate root-installed policy and inheritance proof.
-- Prove a root-owned read-only additional image store works with a fresh run-private graph root and
-  `--pull=never` without writes to the image store.
+- Extend the disposable proof of a root-controlled read-only additional-image-store mount, hidden
+  mapped backing, fresh execution graph/run roots, exact digest lookup, `--pull=never`, and
+  unchanged post-run fingerprint into the journaled production image-install generation,
+  authoritative mount/backing handles, complete manifest/config/layer verification, and crash-safe
+  publication/recovery.
 - Decide whether the host catatonit edge is retained or replaced by an init inside the immutable
   image; either choice is exact and non-optional.
 - Extend the disposable proof of the packaged pre-exec indicator/compiled hook paths, rootless pause
