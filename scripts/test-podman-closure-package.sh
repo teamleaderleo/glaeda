@@ -16,6 +16,7 @@ for command in \
   /usr/bin/mount \
   /usr/bin/podman \
   /usr/bin/python3 \
+  /usr/bin/readlink \
   /usr/sbin/runuser \
   /usr/bin/stat \
   /usr/bin/systemd-run \
@@ -107,12 +108,18 @@ for path in \
   /usr/bin/crun \
   /usr/bin/newuidmap \
   /usr/bin/newgidmap \
+  /usr/bin/catatonit \
   /usr/bin/fuse-overlayfs \
   /usr/lib/podman/aardvark-dns \
-  /usr/lib/podman/netavark \
-  /usr/libexec/podman/catatonit; do
+  /usr/lib/podman/netavark; do
   assert_root_file "$path"
 done
+
+if [[ ! -L /usr/libexec/podman/catatonit ]] ||
+  [[ $(/usr/bin/readlink -f /usr/libexec/podman/catatonit) != /usr/bin/catatonit ]]; then
+  printf 'error: packaged Podman catatonit fallback is not the exact expected symlink\n' >&2
+  exit 1
+fi
 
 for helper in /usr/bin/newuidmap /usr/bin/newgidmap; do
   helper_mode=$(/usr/bin/stat -Lc %a "$helper")

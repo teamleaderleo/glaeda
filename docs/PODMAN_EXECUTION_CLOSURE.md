@@ -58,7 +58,7 @@ The ARM64 baseline also provides the following relevant versions:
 | containers/common | `0.57.4+ds1` series | configuration data, no executable |
 | conmon | `2.1.10+ds1` series | `/usr/bin/conmon` |
 | crun | `1.14.1` series | `/usr/bin/crun` |
-| catatonit | `0.1.7` series | `/usr/libexec/podman/catatonit` |
+| catatonit | `0.1.7` series | `/usr/bin/catatonit`; packaged Podman fallback symlink at `/usr/libexec/podman/catatonit` |
 | netavark | `1.4.0` series | distribution-owned helper path |
 | fuse-overlayfs | `1.13` series | `/usr/bin/fuse-overlayfs` |
 | newuidmap/newgidmap | installed from `uidmap` | `/usr/bin/newuidmap`, `/usr/bin/newgidmap` |
@@ -92,7 +92,7 @@ select persistent state, or merely provide bounded host facts.
 | `/usr/bin/conmon` | monitor spawned for every container | Select with explicit `--conmon`; exact ELF and loader closure; no `$PATH` fallback. |
 | `/usr/bin/crun` | creates namespaces, mounts, capabilities, seccomp, and cgroups | Select with explicit `--runtime`; exact ELF and loader closure; no named-runtime or `$PATH` fallback. |
 | rootless pause process | first rootless use double-forks a persistent namespace holder, re-executes Podman, and falls back to compile-time and `/usr/bin` catatonit paths | The journaled attempt places the Podman launcher in the authoritative outer cgroup before exec, binds the Podman re-exec and both catatonit candidates, makes the user D-Bus address an exact absent run-private socket, and proves the pause process never leaves the outer group. Retain it only for that attempt, then cgroup-kill, prove empty, remove and sync `pause.pid`, and refuse success or reuse on any ambiguity. |
-| `/usr/libexec/podman/catatonit` and `/usr/bin/catatonit` | `--init` and the rootless pause fallback may execute them | Select the container init with explicit `--init-path`; bind every compiled pause fallback as an exact executable or proven absence and reject aliases/ambiguity. If the image supplies the reviewed init instead, omit `--init` without weakening the separate pause-process closure. |
+| `/usr/bin/catatonit` and packaged `/usr/libexec/podman/catatonit` symlink | `--init` and the rootless pause fallback may execute them | Select the container init with explicit canonical `--init-path=/usr/bin/catatonit`. Bind `/usr/bin/catatonit` as an exact executable and the compiled `/usr/libexec/podman/catatonit` fallback as an exact root-owned symlink whose sole canonical target is that executable; the separate `/usr/bin` pause fallback resolves the same object. Any different/missing target or extra candidate is conflicting. If the image supplies the reviewed init instead, omit `--init` without weakening the separate pause-process closure. |
 | `/usr/bin/newuidmap`, `/usr/bin/newgidmap` | setuid helpers establish the rootless user namespace | Exact root-owned executables, setuid/mode/package evidence, content digest, loader closure, exact runner subordinate ranges, and no `$PATH` ambiguity. |
 | `/usr/bin/git` used by source materialization | object access can consume config, replacements, alternates, promisor state, credentials, and transports before the container exists | Bind its exact ELF/loader closure and invoke only one fixed `cat-file --batch` protocol under the unprivileged runner in the authoritative outer cgroup, with bounded input/time/output and the same empty-protocol environment as O05. Use a protected synthetic bare Git directory plus an inherited descriptor for the already-observed object directory, never repository discovery or its config. The argv adds only one protected command-scope setting, `-c safe.directory=<exact-synthetic-path>`, so Git 2.43 accepts that root-owned directory while any owner/path drift still blocks. Reject replacements, grafts, shallow/promisor/partial-clone state, alternates, unsupported object formats, and unsafe effective config; a missing local object is a bounded failure and can never fetch. |
 | netavark and aardvark-dns | the configured backend may resolve helpers while libpod initializes, even for a no-network run | Fix `network_backend="netavark"` and one root-owned helper directory; bind exact content and loader closure until the package fixture proves an edge unreachable. `--network=none` must keep both unexecuted. |
@@ -214,7 +214,7 @@ or image string.
   create
   --pull=never
   --init
-  --init-path=/usr/libexec/podman/catatonit
+  --init-path=/usr/bin/catatonit
   --network=none
   --no-hosts
   --ipc=private
