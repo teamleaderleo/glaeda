@@ -52,6 +52,25 @@ include or search directory. This proves compatibility with those package bytes 
 expand includes, enumerate configuration files, open or revalidate a path, prove file or directory
 ownership, parse `ld.so.cache`, resolve a library, construct evidence, or seal runtime readiness.
 
+### Dynamic-loader cache parser evidence
+
+- Parser implementation commit: `948debfcfe1d8b1c45c5b372c90cb6e745fa6d93`
+- Workflow run: [31330823779](https://github.com/teamleaderleo/smolrunner/actions/runs/31330823779)
+- ARM64 job: [93288667727](https://github.com/teamleaderleo/smolrunner/actions/runs/31330823779/job/93288667727)
+- x86_64 job: [93288667700](https://github.com/teamleaderleo/smolrunner/actions/runs/31330823779/job/93288667700)
+- Date: 2026-08-09
+- Result: both jobs parsed the complete live `/etc/ld.so.cache` from the exact Noble package
+  baseline below.
+
+The pure parser accepted only the current little-endian glibc 1.1 layout, bounded every table and
+string, validated cache ordering and the closed extension/hwcap representation, and rejected
+unknown cache IDs and unsafe library identities or paths. The Noble x86_64 cache also carries
+generic ELF/libc6 compatibility entries that the admitted 64-bit loader does not select; the parser
+fully validates those known entries but omits them from its compatible-entry view. This proves
+compatibility with those live cache bytes only. It does not open or revalidate the cache, prove its
+owner or package, enumerate or open search directories or libraries, resolve a dependency,
+construct evidence, or seal runtime readiness.
+
 ## Package baseline
 
 Both architectures reported the same Ubuntu Noble package versions:
@@ -140,6 +159,10 @@ Earlier disposable runs were intentionally allowed to fail and corrected these f
   preceded by leading SP, HT, VT, or FF are unsafe search authority even though their whitespace
   is noncanonical; CR remains a whole-file format refusal. Semantic unsafe-search classification
   must therefore precede the generic active-line format check.
+- Noble's x86_64 loader cache includes generic ELF/libc6 compatibility entries in addition to
+  exact x86-64 entries. The admitted 64-bit loader ignores the generic cache ID; the parser must
+  still validate those entries and the complete cache ordering while withholding them from future
+  compatible-library resolution. Unknown cache IDs remain fail-closed.
 
 These are contract changes, not compatibility relaxations: each ambient or mutable edge is now
 either made exact or remains blocking.
