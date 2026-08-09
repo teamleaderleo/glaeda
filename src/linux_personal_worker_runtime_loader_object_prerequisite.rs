@@ -92,6 +92,12 @@ impl PersonalWorkerRuntimeLoaderObjectPrerequisite {
     pub const fn summary(&self) -> PersonalWorkerRuntimeLoaderObjectPrerequisiteSummary {
         self.summary
     }
+
+    pub(crate) fn reconfirm(
+        &mut self,
+    ) -> Result<(), PersonalWorkerRuntimeLoaderObjectPrerequisiteError> {
+        self._source.revalidate()
+    }
 }
 
 impl fmt::Debug for PersonalWorkerRuntimeLoaderObjectPrerequisite {
@@ -867,7 +873,7 @@ mod tests {
             rustix::process::geteuid().as_raw(),
             rustix::process::getegid().as_raw(),
         );
-        let observed = observe_at(&fixture.root, owner, &project, architecture, || {})
+        let mut observed = observe_at(&fixture.root, owner, &project, architecture, || {})
             .expect("observe copied loader fixture");
         assert_eq!(
             observed.summary().disposition(),
@@ -877,6 +883,18 @@ mod tests {
         assert!(debug.contains(REDACTED));
         assert!(!debug.contains("/lib"));
         assert!(!debug.contains("sha256:"));
+        observed
+            .reconfirm()
+            .expect("reconfirm stable loader object");
+        fixture.replace_logical_parent_with_target_parent();
+        let reconfirmed = observed
+            .reconfirm()
+            .expect_err("post-observation loader route drift");
+        assert_eq!(
+            reconfirmed.kind,
+            PersonalWorkerRuntimeLoaderObjectPrerequisiteErrorKind::ChangedDuringRead
+        );
+        fixture.restore_logical_route();
 
         let changed = observe_at(&fixture.root, owner, &project, architecture, || {
             fixture.replace_logical_parent_with_target_parent();

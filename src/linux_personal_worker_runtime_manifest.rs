@@ -155,6 +155,23 @@ pub(crate) fn with_locked_personal_worker_runtime_manifest<T, E>(
     observe_at(Path::new(STATE_ROOT), 0, project, observer)
 }
 
+/// Run one internal two-phase observation while the exact recorded manifest remains locked.
+///
+/// Durable state is revalidated after the initial observation, the retained live evidence is
+/// then reconfirmed, and durable state is revalidated a second time before the shared lock is
+/// released. This brackets the live-evidence confirmation with two identical durable snapshots.
+/// State failure takes precedence over either observer or confirmation failure.
+pub(crate) fn with_reconfirmed_locked_personal_worker_runtime_manifest<T, E>(
+    project: &ProjectIdentity,
+    observer: impl FnOnce(&PersonalWorkerRuntimeManifest) -> Result<T, E>,
+    reconfirm: impl FnOnce(&mut T) -> Result<(), E>,
+) -> Result<
+    LockedPersonalWorkerRuntimeManifestObservation<T>,
+    LockedPersonalWorkerRuntimeManifestObservationError<E>,
+> {
+    observe_reconfirmed_at(Path::new(STATE_ROOT), 0, project, observer, reconfirm)
+}
+
 #[cfg(test)]
 fn discover_at(
     root_path: &Path,
@@ -214,6 +231,38 @@ fn observe_at<T, E>(
     })
 }
 
+fn observe_reconfirmed_at<T, E>(
+    root_path: &Path,
+    expected_root_uid: u32,
+    project: &ProjectIdentity,
+    observer: impl FnOnce(&PersonalWorkerRuntimeManifest) -> Result<T, E>,
+    reconfirm: impl FnOnce(&mut T) -> Result<(), E>,
+) -> Result<
+    LockedPersonalWorkerRuntimeManifestObservation<T>,
+    LockedPersonalWorkerRuntimeManifestObservationError<E>,
+> {
+    let opened = open_locked_manifest(root_path, expected_root_uid, project)
+        .map_err(LockedPersonalWorkerRuntimeManifestObservationError::State)?;
+    let LockedManifestRead::Found(mut opened) = opened else {
+        return Ok(LockedPersonalWorkerRuntimeManifestObservation::Missing);
+    };
+    let observation = observer(&opened.manifest);
+    opened
+        .revalidate(root_path)
+        .map_err(LockedPersonalWorkerRuntimeManifestObservationError::State)?;
+    let mut observation =
+        observation.map_err(LockedPersonalWorkerRuntimeManifestObservationError::Observer)?;
+    let confirmation = reconfirm(&mut observation);
+    let manifest = opened
+        .finish(root_path)
+        .map_err(LockedPersonalWorkerRuntimeManifestObservationError::State)?;
+    confirmation.map_err(LockedPersonalWorkerRuntimeManifestObservationError::Observer)?;
+    Ok(LockedPersonalWorkerRuntimeManifestObservation::Found {
+        manifest,
+        observation,
+    })
+}
+
 enum LockedManifestRead {
     Missing,
     Found(Box<OpenedLockedManifest>),
@@ -228,10 +277,10 @@ struct OpenedLockedManifest {
 }
 
 impl OpenedLockedManifest {
-    fn finish(
-        mut self,
+    fn revalidate(
+        &mut self,
         root_path: &Path,
-    ) -> Result<PersonalWorkerRuntimeManifest, PersonalWorkerRuntimeManifestDiscoveryError> {
+    ) -> Result<(), PersonalWorkerRuntimeManifestDiscoveryError> {
         reread_unchanged_private_file(
             &mut self.manifest_file,
             self.guard.owner(),
@@ -269,6 +318,14 @@ impl OpenedLockedManifest {
             self.guard.owner(),
         )?;
         finish_catalog_read(&self.guard, root_path)?;
+        Ok(())
+    }
+
+    fn finish(
+        mut self,
+        root_path: &Path,
+    ) -> Result<PersonalWorkerRuntimeManifest, PersonalWorkerRuntimeManifestDiscoveryError> {
+        self.revalidate(root_path)?;
         Ok(self.manifest)
     }
 }
@@ -834,6 +891,7 @@ const fn io_error() -> PersonalWorkerRuntimeManifestDiscoveryError {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::fs as std_fs;
     use std::os::unix::fs::{PermissionsExt as _, symlink};
     use std::path::{Path, PathBuf};
@@ -1124,6 +1182,113 @@ mod tests {
                 assert_eq!(observation, 41)
             }
             _ => panic!("locked callback result must escape after final revalidation"),
+        }
+    }
+
+    #[test]
+    fn reconfirmation_is_bracketed_by_state_checks_under_the_shared_lock() {
+        let root = prepare_root("reconfirmed-callback");
+        add_installation(&root, INSTALLATION_ID, project(), true);
+        let stage = Cell::new(0_u8);
+        let result = observe_reconfirmed_at(
+            root.path(),
+            geteuid().as_raw(),
+            &project(),
+            |_| {
+                assert_eq!(stage.replace(1), 0);
+                Ok::<u64, &'static str>(41)
+            },
+            |observation| {
+                assert_eq!(*observation, 41);
+                assert_eq!(stage.replace(2), 1);
+                let competing = fs::open(
+                    root.path().join(CATALOG_LOCK_FILE),
+                    FILE_FLAGS,
+                    Mode::empty(),
+                )
+                .expect("open competing lock descriptor");
+                assert_eq!(
+                    fs::flock(&competing, FlockOperation::NonBlockingLockExclusive),
+                    Err(Errno::AGAIN),
+                    "reconfirmation must run while the separate shared lock is held"
+                );
+                Ok(())
+            },
+        );
+        match result {
+            Ok(LockedPersonalWorkerRuntimeManifestObservation::Found { observation, .. }) => {
+                assert_eq!(observation, 41);
+                assert_eq!(stage.get(), 2);
+            }
+            _ => panic!("bracketed observation must escape after both state checks"),
+        }
+    }
+
+    #[test]
+    fn state_failure_precedes_reconfirmation_and_confirmation_failure() {
+        let root = prepare_root("pre-confirm-state-failure");
+        let installation = add_installation(&root, INSTALLATION_ID, project(), true);
+        let reconfirmed = Cell::new(false);
+        let result = observe_reconfirmed_at(
+            root.path(),
+            geteuid().as_raw(),
+            &project(),
+            |_| {
+                set_mode(&installation.join(RUNTIME_MANIFEST_FILE), 0o644);
+                Ok::<(), &'static str>(())
+            },
+            |_| {
+                reconfirmed.set(true);
+                Ok(())
+            },
+        );
+        match result {
+            Err(LockedPersonalWorkerRuntimeManifestObservationError::State(error)) => {
+                assert_eq!(
+                    error.kind,
+                    PersonalWorkerRuntimeManifestDiscoveryErrorKind::UnsafeFilesystem
+                );
+                assert!(!reconfirmed.get());
+            }
+            _ => panic!("the first state check must precede live reconfirmation"),
+        }
+
+        let root = prepare_root("post-confirm-state-failure");
+        let installation = add_installation(&root, INSTALLATION_ID, project(), true);
+        let result = observe_reconfirmed_at(
+            root.path(),
+            geteuid().as_raw(),
+            &project(),
+            |_| Ok::<(), &'static str>(()),
+            |_| {
+                set_mode(&installation.join(RUNTIME_MANIFEST_FILE), 0o644);
+                Err("confirmation_failed")
+            },
+        );
+        match result {
+            Err(LockedPersonalWorkerRuntimeManifestObservationError::State(error)) => {
+                assert_eq!(
+                    error.kind,
+                    PersonalWorkerRuntimeManifestDiscoveryErrorKind::UnsafeFilesystem
+                );
+            }
+            _ => panic!("the final state check must suppress confirmation failure"),
+        }
+
+        let root = prepare_root("stable-confirmation-failure");
+        add_installation(&root, INSTALLATION_ID, project(), true);
+        let result = observe_reconfirmed_at(
+            root.path(),
+            geteuid().as_raw(),
+            &project(),
+            |_| Ok::<(), &'static str>(()),
+            |_| Err("confirmation_failed"),
+        );
+        match result {
+            Err(LockedPersonalWorkerRuntimeManifestObservationError::Observer(error)) => {
+                assert_eq!(error, "confirmation_failed");
+            }
+            _ => panic!("stable state must preserve confirmation failure"),
         }
     }
 
