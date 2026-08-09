@@ -30,7 +30,7 @@ validate_network_lock() {
 }
 
 run_user_probe() {
-  local image_id image_hex container_id container_output expected_output
+  local image_id image_hex container_id container_output expected_output start_status
   local image_size container_size spec_size spec_path apparmor_profile
 
   mapfile -d '' network_entries_before < <(
@@ -144,6 +144,7 @@ run_user_probe() {
     exit 1
   fi
 
+  set +e
   container_output=$(/usr/bin/timeout --signal=KILL 20s \
     /usr/bin/podman \
     --remote=false \
@@ -156,6 +157,21 @@ run_user_probe() {
     --tmpdir="$TMPDIR" \
     --transient-store \
     start --attach "$container_id")
+  start_status=$?
+  set -e
+  if (( start_status != 0 )); then
+    podman_probe container inspect "$container_id" > "$PROBE_CONTAINER_JSON" || true
+    printf 'start_attach_status=%s\n' "$start_status" >&2
+    /usr/bin/jq -c 'if length == 1 then {
+      state: .[0].State.Status,
+      running: .[0].State.Running,
+      exit_code: .[0].State.ExitCode,
+      error: .[0].State.Error,
+      oom: .[0].State.OOMKilled
+    } else {count: length} end' "$PROBE_CONTAINER_JSON" >&2 || true
+    printf 'error: bounded attached start did not complete\n' >&2
+    exit 1
+  fi
   expected_output="$PROBE_PASSWD_SHA  /etc/passwd
 $PROBE_GROUP_SHA  /etc/group"
   if [[ $container_output != "$expected_output" ]]; then
