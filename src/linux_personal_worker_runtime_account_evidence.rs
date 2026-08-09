@@ -757,7 +757,7 @@ fn hash_stat(hasher: &mut Sha256, stat: &rustix::fs::Stat) {
     for value in [
         stat.st_dev,
         stat.st_ino,
-        u64::from(stat.st_nlink),
+        stat.st_nlink as u64,
         stat.st_size as u64,
     ] {
         hash_field(hasher, &value.to_be_bytes());
