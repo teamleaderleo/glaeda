@@ -892,7 +892,37 @@ mod tests {
         let architecture = host_architecture().expect("supported package-probe architecture");
         let observed =
             observe_personal_worker_runtime_loader_state_prerequisite(&project(), architecture)
-                .expect("observe live Noble loader state");
+                .unwrap_or_else(|error| {
+                    let mut fragments = std::fs::read_dir("/etc/ld.so.conf.d")
+                        .expect("enumerate refused loader fragments")
+                        .filter_map(Result::ok)
+                        .filter_map(|entry| entry.file_name().into_string().ok())
+                        .filter(|name| name.ends_with(".conf"))
+                        .map(|name| {
+                            let bytes =
+                                std::fs::read(Path::new("/etc/ld.so.conf.d").join(&name))
+                                    .expect("read refused loader fragment");
+                            let outcome = parse_linux_dynamic_loader_config(
+                                &bytes,
+                                architecture,
+                                LinuxDynamicLoaderConfigRole::Fragment,
+                            )
+                            .map(|_| "accepted")
+                            .unwrap_or_else(|error| match error.kind {
+                                LinuxDynamicLoaderConfigErrorKind::Size => "size",
+                                LinuxDynamicLoaderConfigErrorKind::Format => "format",
+                                LinuxDynamicLoaderConfigErrorKind::UnsafeSearch => "unsafe_search",
+                            });
+                            (name, outcome)
+                        })
+                        .collect::<Vec<_>>();
+                    fragments.sort_unstable();
+                    panic!(
+                        "observe live Noble loader state: kind={:?}, fragments={fragments:?}, preload_present={}",
+                        error.kind,
+                        Path::new("/etc/ld.so.preload").exists()
+                    )
+                });
         assert_eq!(
             observed.summary().disposition(),
             PersonalWorkerRuntimeLoaderStatePrerequisiteDisposition::ObservedPrerequisite
