@@ -953,8 +953,23 @@ impl RustVerificationEnvelope {
     }
 
     #[must_use]
+    pub const fn compilation(&self) -> &RustCompilationContract {
+        &self.compilation
+    }
+
+    #[must_use]
     pub const fn resources(&self) -> &RustResourceEnvelope {
         &self.resources
+    }
+
+    #[must_use]
+    pub const fn cache(&self) -> &RustCacheContract {
+        &self.cache
+    }
+
+    #[must_use]
+    pub fn required_capabilities(&self) -> &[CapabilityId] {
+        &self.required_capabilities
     }
 
     #[must_use]

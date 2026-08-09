@@ -78,6 +78,14 @@ impl<T> PersonalWorkerOperatorRead<T> {
     pub const fn view(&self) -> &T {
         &self.view
     }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn for_verification_plan_test(
+        config_identity: OperatorConfigIdentity,
+        view: T,
+    ) -> Self {
+        Self::new(config_identity, view)
+    }
 }
 
 impl<T> fmt::Debug for PersonalWorkerOperatorRead<T> {

@@ -92,6 +92,21 @@ impl RepositorySourceObservation {
     pub const fn workspace_location_identity(&self) -> &RepositoryWorkspaceLocationIdentity {
         &self.workspace_location_identity
     }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) const fn for_verification_plan_test(
+        source: PersonalWorkerSourceIdentity,
+        verification_profile: VerificationProfileId,
+        workspace_location_identity: RepositoryWorkspaceLocationIdentity,
+    ) -> Self {
+        Self {
+            schema_version: REPOSITORY_SOURCE_OBSERVATION_SCHEMA_VERSION,
+            source,
+            verification_profile,
+            cleanliness: RepositoryCleanliness::Clean,
+            workspace_location_identity,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

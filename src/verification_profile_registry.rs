@@ -4,6 +4,16 @@ use std::fmt;
 use serde::Serialize;
 
 use crate::artifact::{ArtifactIdentityError, RepositoryRef, Sha256Digest};
+use crate::execution_admission::ExecutionResourceLimits;
+use crate::lima_lifecycle::LimaResourceProfile;
+use crate::rust_verification_envelope::{
+    CargoTargetDirectoryIdentity, RustBuildScriptInclusion, RustCacheContract,
+    RustCacheIdentityClass, RustCargoProfileKind, RustCompilationContract, RustConcurrencyPlan,
+    RustFeatureSelection, RustRetryPolicy, RustRetryPolicyId, RustRuntimeConcurrency,
+    RustTargetDirectoryId, RustTargetPolicy, RustTargetTriple, RustToolchainId,
+    RustToolchainIdentity, RustVerificationEnvelope, RustVerificationEnvelopeDefinition,
+    RustVerificationEnvelopeError, RustVerificationScope, RustVerificationSourceIdentity,
+};
 use crate::verification_profile::{
     ApprovedEquivalentCommand, CacheId, CapabilityId, ConcurrencyPolicy, DeclaredDeviation,
     DeviationCode, DirtyWorkspacePolicy, ExactBuildScope, ExactVerificationScope,
@@ -30,6 +40,13 @@ const DOCTOR_COMMAND_DIGEST: &str =
 const PLAN_COMMAND_DIGEST: &str =
     "sha256:cf9866af6335cd4d3a579dc2f61202cdd3652eb25031330062848251a6e8d0d1";
 const CACHE_ID: &str = "cargo-target";
+const RUST_TOOLCHAIN_ID: &str = "rust-1.97.1-minimal-clippy-rustfmt";
+const RUST_TOOLCHAIN_CONTRACT_DIGEST: &str =
+    "sha256:279d77167cec5426fa80f457cd066dc74a360fbe4e2816f4f3fa01487a918fdc";
+const RUST_HOST_TRIPLE: &str = "aarch64-unknown-linux-gnu";
+const RUST_TARGET_TRIPLE: &str = "aarch64-unknown-linux-gnu";
+const RUST_WORKSPACE_MEMBERS_DIGEST: &str =
+    "sha256:7c4f356a716b2b4cc10680a9a121a56860141340ad966b311b5b419fb01fa272";
 const PROFILE_IDS: [&str; 3] = [
     SMOLRUNNER_REQUIRED_PROFILE_ID,
     SMOLRUNNER_DOCTOR_PROFILE_ID,
@@ -264,6 +281,25 @@ impl VerificationProfileRegistry {
             })
     }
 
+    /// Resolve one checked-in profile into its exact source-bound Rust execution envelope.
+    ///
+    /// The caller supplies only immutable source identity and the already-derived source/command
+    /// target namespace. Toolchain, scope, features, target categories, resources, concurrency,
+    /// capabilities, duration, target-directory class, and retry authority remain registry-owned.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded registry error when the profile is unknown or a checked-in Rust envelope
+    /// declaration no longer satisfies the accepted contract.
+    pub fn resolve_rust_envelope(
+        &self,
+        profile_id: &VerificationProfileId,
+        source: RustVerificationSourceIdentity,
+        source_command_namespace: Sha256Digest,
+    ) -> Result<RustVerificationEnvelope, VerificationProfileRegistryError> {
+        rust_envelope(self.lookup(profile_id)?, source, source_command_namespace)
+    }
+
     #[must_use]
     pub fn human_summary(&self) -> String {
         let ids = self
@@ -445,6 +481,138 @@ fn read_only_authority() -> Result<VerificationAuthorityPolicy, VerificationProf
     })
 }
 
+fn rust_envelope(
+    profile: &RegisteredVerificationProfile,
+    source: RustVerificationSourceIdentity,
+    source_command_namespace: Sha256Digest,
+) -> Result<RustVerificationEnvelope, VerificationProfileRegistryError> {
+    let (cpu_millis, pids, target_directory_id, retry_policy_id, features) =
+        match profile.profile_id().as_str() {
+            SMOLRUNNER_REQUIRED_PROFILE_ID => (
+                4_000,
+                2_048,
+                "smolrunner-required-target-v1",
+                "smolrunner-required-no-retry-v1",
+                RustFeatureSelection::All,
+            ),
+            SMOLRUNNER_DOCTOR_PROFILE_ID => (
+                1_000,
+                512,
+                "smolrunner-doctor-target-v1",
+                "smolrunner-doctor-no-retry-v1",
+                RustFeatureSelection::Default,
+            ),
+            SMOLRUNNER_PLAN_PROFILE_ID => (
+                1_000,
+                512,
+                "smolrunner-plan-target-v1",
+                "smolrunner-plan-no-retry-v1",
+                RustFeatureSelection::Default,
+            ),
+            _ => {
+                return Err(VerificationProfileRegistryError::new(
+                    "registry.rust_envelope.profile_id",
+                    "unknown_rust_envelope",
+                    "profile has no checked-in Rust verification envelope",
+                ));
+            }
+        };
+    let profile_resources = profile.resources();
+    let reserved_resources = ExecutionResourceLimits::new(
+        cpu_millis,
+        profile_resources.memory.estimated_peak_bytes,
+        pids,
+    )
+    .map_err(|_| {
+        VerificationProfileRegistryError::new(
+            "registry.rust_envelope.resources",
+            "invalid_rust_resource_envelope",
+            "checked-in Rust resource limits are invalid",
+        )
+    })?;
+    let concurrency = RustConcurrencyPlan::new(
+        profile_resources.concurrency.build_jobs,
+        RustRuntimeConcurrency::Libtest {
+            test_threads: profile_resources.concurrency.test_threads,
+            filter: None,
+        },
+        Vec::new(),
+    )?;
+    let maximum_execution_millis = profile
+        .timeout()
+        .total_seconds()
+        .checked_mul(1_000)
+        .ok_or_else(|| {
+            VerificationProfileRegistryError::new(
+                "registry.rust_envelope.duration",
+                "invalid_rust_execution_duration",
+                "checked-in Rust execution duration is invalid",
+            )
+        })?;
+    let resources = crate::rust_verification_envelope::RustResourceEnvelope::new(
+        LimaResourceProfile::Work,
+        reserved_resources,
+        concurrency,
+        profile_resources.memory.minimum_available_bytes,
+        profile_resources.memory.minimum_swap_bytes,
+        maximum_execution_millis,
+    )?;
+    let scope = match profile.canonical_command().test_scope() {
+        ExactVerificationScope::WholeWorkspaceTests => RustVerificationScope::WorkspaceTests {
+            members_digest: Sha256Digest::parse(RUST_WORKSPACE_MEMBERS_DIGEST)?,
+            targets: RustTargetPolicy::all_targets(true),
+        },
+        ExactVerificationScope::WholePackageTests { package } => {
+            RustVerificationScope::PackageTests {
+                package: package.clone(),
+                targets: RustTargetPolicy::repository_default(false, false, true),
+            }
+        }
+        ExactVerificationScope::LibraryTests { .. }
+        | ExactVerificationScope::IntegrationTestBinary { .. }
+        | ExactVerificationScope::FilteredTest { .. } => {
+            return Err(VerificationProfileRegistryError::new(
+                "registry.rust_envelope.scope",
+                "unmapped_rust_scope",
+                "checked-in profile scope has no exact Rust envelope mapping",
+            ));
+        }
+    };
+    RustVerificationEnvelope::new(RustVerificationEnvelopeDefinition {
+        profile_id: profile.profile_id().clone(),
+        source,
+        command: profile.canonical_command().identity().clone(),
+        scope,
+        compilation: RustCompilationContract::new(
+            RustToolchainIdentity::new(
+                RustToolchainId::parse(RUST_TOOLCHAIN_ID)?,
+                Sha256Digest::parse(RUST_TOOLCHAIN_CONTRACT_DIGEST)?,
+                RustTargetTriple::parse(RUST_HOST_TRIPLE)?,
+                RustTargetTriple::parse(RUST_TARGET_TRIPLE)?,
+            ),
+            RustCargoProfileKind::Test,
+            features,
+            RustBuildScriptInclusion::Included,
+        ),
+        resources,
+        cache: RustCacheContract::new(
+            RustCacheIdentityClass::SourceScoped,
+            CargoTargetDirectoryIdentity::new(
+                RustTargetDirectoryId::parse(target_directory_id)?,
+                profile.cache_class().cache_id().clone(),
+                source_command_namespace,
+            ),
+        ),
+        required_capabilities: profile
+            .required_capabilities()
+            .iter()
+            .map(|required| required.capability.clone())
+            .collect(),
+        retry: RustRetryPolicy::no_retry(RustRetryPolicyId::parse(retry_policy_id)?),
+    })
+    .map_err(VerificationProfileRegistryError::from)
+}
+
 fn validate_capabilities(
     required: &[RequiredCapability],
     optional: &[OptionalCapability],
@@ -548,6 +716,16 @@ impl From<ArtifactIdentityError> for VerificationProfileRegistryError {
     }
 }
 
+impl From<RustVerificationEnvelopeError> for VerificationProfileRegistryError {
+    fn from(error: RustVerificationEnvelopeError) -> Self {
+        Self {
+            field: error.field,
+            code: error.code,
+            problem: error.problem,
+        }
+    }
+}
+
 impl fmt::Display for VerificationProfileRegistryError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "{} {}: {}", self.field, self.code, self.problem)
@@ -559,6 +737,9 @@ impl std::error::Error for VerificationProfileRegistryError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::artifact::{CommitId, GitTreeId};
+    use crate::rust_verification_envelope_digest::digest_rust_verification_envelope;
+    use sha2::{Digest as _, Sha256};
 
     fn registry() -> VerificationProfileRegistry {
         smolrunner_profile_registry().expect("registry")
@@ -570,6 +751,141 @@ mod tests {
             RepositoryCommandId::parse(command_id).expect("command ID"),
             Sha256Digest::parse(digest).expect("digest"),
         )
+    }
+
+    fn rust_source() -> RustVerificationSourceIdentity {
+        RustVerificationSourceIdentity::new(
+            RepositoryRef::parse(REPOSITORY).expect("repository"),
+            CommitId::parse(&"1".repeat(40)).expect("commit"),
+            GitTreeId::parse(&"2".repeat(40)).expect("tree"),
+        )
+    }
+
+    #[test]
+    fn rust_envelopes_are_checked_in_exact_and_digestible() {
+        let toolchain_document_digest = format!(
+            "sha256:{:x}",
+            Sha256::digest(include_bytes!("../rust-toolchain.toml"))
+        );
+        assert_eq!(toolchain_document_digest, RUST_TOOLCHAIN_CONTRACT_DIGEST);
+        let workspace_members_digest = format!(
+            "sha256:{:x}",
+            Sha256::digest(b"smolrunner-rust-workspace-members-v1\0smolrunner")
+        );
+        assert_eq!(workspace_members_digest, RUST_WORKSPACE_MEMBERS_DIGEST);
+
+        let registry = registry();
+        let namespace =
+            Sha256Digest::parse(&format!("sha256:{}", "a".repeat(64))).expect("namespace");
+        let expected = [
+            (
+                SMOLRUNNER_REQUIRED_PROFILE_ID,
+                4_000,
+                4 * GIB,
+                2_048,
+                2,
+                2,
+                ["cargo", "clippy", "rustc", "rustfmt"].as_slice(),
+                "sha256:a8169b6dd94905418011fc04fbe01a1c94bc730a94498eab64805d0cbe8940c7",
+            ),
+            (
+                SMOLRUNNER_DOCTOR_PROFILE_ID,
+                1_000,
+                512 * MIB,
+                512,
+                1,
+                1,
+                ["cargo", "rustc"].as_slice(),
+                "sha256:06f63fd4887beb67ad749469d0d5cf071604c6aa9112d603b07a84ca605eda9f",
+            ),
+            (
+                SMOLRUNNER_PLAN_PROFILE_ID,
+                1_000,
+                GIB,
+                512,
+                1,
+                1,
+                ["cargo", "rustc"].as_slice(),
+                "sha256:a4a1e50e5df93cf7d66ecabe24be8587fce4d5752b2f1e825c72d09ff604df2e",
+            ),
+        ];
+        for (
+            profile_id,
+            cpu,
+            memory,
+            pids,
+            build_jobs,
+            test_threads,
+            expected_capabilities,
+            expected_digest,
+        ) in expected
+        {
+            let profile_id = VerificationProfileId::parse(profile_id).expect("profile ID");
+            let envelope = registry
+                .resolve_rust_envelope(&profile_id, rust_source(), namespace.clone())
+                .expect("Rust envelope");
+            assert_eq!(envelope.profile_id(), &profile_id);
+            assert_eq!(
+                envelope.command(),
+                registry
+                    .lookup(&profile_id)
+                    .expect("profile")
+                    .canonical_command()
+                    .identity()
+            );
+            assert_eq!(
+                envelope.resources().reserved_resources,
+                ExecutionResourceLimits::new(cpu, memory, pids).expect("limits")
+            );
+            assert_eq!(
+                envelope.resources().concurrency.cargo_build_jobs,
+                build_jobs
+            );
+            assert!(matches!(
+                envelope.resources().concurrency.runtime,
+                RustRuntimeConcurrency::Libtest {
+                    test_threads: actual,
+                    filter: None,
+                } if actual == test_threads
+            ));
+            assert_eq!(
+                envelope.cache().cargo_target_directory.namespace_digest,
+                namespace
+            );
+            assert_eq!(
+                envelope
+                    .required_capabilities()
+                    .iter()
+                    .map(|capability| capability.as_str())
+                    .collect::<Vec<_>>(),
+                expected_capabilities
+            );
+            assert_eq!(
+                envelope.resources().required_worker_profile,
+                LimaResourceProfile::Work
+            );
+            assert_eq!(
+                envelope.resources().minimum_guest_available_memory_bytes,
+                memory
+            );
+            assert_eq!(envelope.resources().minimum_guest_available_swap_bytes, 0);
+            assert_eq!(
+                envelope.resources().maximum_execution_millis,
+                registry
+                    .lookup(&profile_id)
+                    .expect("profile")
+                    .timeout()
+                    .total_seconds()
+                    * 1_000
+            );
+            assert!(matches!(envelope.retry(), RustRetryPolicy::NoRetry { .. }));
+            let json = serde_json::to_string(&envelope).expect("envelope JSON");
+            assert!(json.contains(RUST_TOOLCHAIN_ID));
+            assert!(json.contains(RUST_TOOLCHAIN_CONTRACT_DIGEST));
+            assert!(json.contains(RUST_TARGET_TRIPLE));
+            let digest = digest_rust_verification_envelope(&envelope).expect("envelope digest");
+            assert_eq!(digest.as_str(), expected_digest);
+        }
     }
 
     #[test]

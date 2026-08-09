@@ -166,6 +166,33 @@ impl TrustedWorkspaceCacheReceipt {
         &self.workspace_location_identity
     }
 
+    #[cfg(all(test, target_os = "linux"))]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn for_verification_plan_test(
+        installation_id: RunnerInstallationId,
+        workspace_id: RunnerWorkspaceId,
+        repository: RepositoryRef,
+        cache_id: CacheId,
+        cache_namespace_digest: Sha256Digest,
+        trusted_evidence_digest: Sha256Digest,
+        workspace_location_identity: RepositoryWorkspaceLocationIdentity,
+    ) -> Self {
+        Self {
+            schema_version: TRUSTED_WORKSPACE_RECEIPT_SCHEMA_VERSION,
+            installation_id,
+            workspace_id: workspace_id.clone(),
+            repository,
+            cache_id,
+            cache_owner_workspace_id: workspace_id,
+            cache_namespace_digest,
+            cache_present: true,
+            trusted_evidence_digest,
+            workspace_location_identity,
+            workspace_root: PathBuf::from("/private/test-workspace"),
+            cache_path: PathBuf::from("/private/test-workspace/target"),
+        }
+    }
+
     /// Combine descriptor-derived identity with separately observed non-identity preflight evidence.
     ///
     /// This performs no readiness decision and does not reopen either private path.
