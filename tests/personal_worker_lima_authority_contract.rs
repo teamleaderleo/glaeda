@@ -35,8 +35,9 @@ use smolrunner::operator_config::{
 };
 use smolrunner::personal_worker_host_broker::{HostBrokerRunnerObservation, HostBrokerRunnerState};
 use smolrunner::personal_worker_lima_authority::{
-    PersonalWorkerLimaAttemptInput, PersonalWorkerLimaAttemptPhase,
-    PersonalWorkerLimaAuthorityDocument, PersonalWorkerLimaAuthorityErrorKind,
+    PERSONAL_WORKER_LIMA_RECOVERY_SCHEMA_VERSION, PersonalWorkerLimaAttemptInput,
+    PersonalWorkerLimaAttemptPhase, PersonalWorkerLimaAuthorityDocument,
+    PersonalWorkerLimaAuthorityErrorKind, PersonalWorkerLimaRecoveryDisposition,
     decode_personal_worker_lima_authority, encode_personal_worker_lima_authority,
     personal_worker_lima_enrollment_confirmation,
 };
@@ -508,6 +509,32 @@ fn enrolled() -> PersonalWorkerLimaAuthorityDocument {
     .into_document()
 }
 
+fn assert_recovery(
+    document: &PersonalWorkerLimaAuthorityDocument,
+    disposition: PersonalWorkerLimaRecoveryDisposition,
+    phase: PersonalWorkerLimaAttemptPhase,
+    checkpoint_at: u64,
+) {
+    let report = document.recovery_report();
+    let attempt = document.attempt().expect("durable attempt");
+    let binding = report.attempt().expect("recovery attempt binding");
+    assert_eq!(
+        report.schema_version(),
+        PERSONAL_WORKER_LIMA_RECOVERY_SCHEMA_VERSION
+    );
+    assert_eq!(
+        report.authority_generation(),
+        document.authority_generation()
+    );
+    assert_eq!(report.disposition(), disposition);
+    assert_eq!(binding.generation(), attempt.generation());
+    assert_eq!(binding.store_revision(), attempt.store_revision());
+    assert_eq!(binding.queue_generation(), attempt.queue_generation());
+    assert_eq!(binding.action(), attempt.action());
+    assert_eq!(binding.phase(), phase);
+    assert_eq!(binding.checkpoint_at(), epoch(checkpoint_at));
+}
+
 fn persist_completed_work_attempt(
     guard: &mut UnixPersonalWorkerLimaAuthorityGuard,
 ) -> PersonalWorkerLimaAuthorityDocument {
@@ -686,6 +713,12 @@ fn complete_private_request_drift_is_refused_before_an_attempt() {
 #[test]
 fn prepared_attempt_blocks_replay_and_follows_exact_durable_phase_graph() {
     let authority = enrolled();
+    let clean = authority.recovery_report();
+    assert_eq!(
+        clean.disposition(),
+        PersonalWorkerLimaRecoveryDisposition::Clean
+    );
+    assert!(clean.attempt().is_none());
     let before_mac = mac_observation_profile(true, 200_000, LimaResourceProfile::Interactive);
     let before = lifecycle_profile(
         LimaLifecycleState::Running,
@@ -722,6 +755,12 @@ fn prepared_attempt_blocks_replay_and_follows_exact_durable_phase_graph() {
     assert_eq!(attempt.store_revision().get(), 5);
     assert_eq!(attempt.queue_generation().get(), 7);
     assert_eq!(attempt.phase(), PersonalWorkerLimaAttemptPhase::Prepared);
+    assert_recovery(
+        &prepared,
+        PersonalWorkerLimaRecoveryDisposition::ReobserveBeforeFirstMutation,
+        PersonalWorkerLimaAttemptPhase::Prepared,
+        205_000,
+    );
 
     let replay = prepared
         .begin_attempt(PersonalWorkerLimaAttemptInput {
@@ -745,6 +784,12 @@ fn prepared_attempt_blocks_replay_and_follows_exact_durable_phase_graph() {
             epoch(206_000),
         )
         .expect("stop began");
+    assert_recovery(
+        &stopping,
+        PersonalWorkerLimaRecoveryDisposition::ReobserveUncertainMutation,
+        PersonalWorkerLimaAttemptPhase::StopStarted,
+        206_000,
+    );
     let stopped = stopping
         .checkpoint(
             generation,
@@ -752,6 +797,12 @@ fn prepared_attempt_blocks_replay_and_follows_exact_durable_phase_graph() {
             epoch(207_000),
         )
         .expect("stop completed");
+    assert_recovery(
+        &stopped,
+        PersonalWorkerLimaRecoveryDisposition::ReobserveCheckpointedMutation,
+        PersonalWorkerLimaAttemptPhase::StopCompleted,
+        207_000,
+    );
     let editing = stopped
         .checkpoint(
             generation,
@@ -759,6 +810,12 @@ fn prepared_attempt_blocks_replay_and_follows_exact_durable_phase_graph() {
             epoch(208_000),
         )
         .expect("edit began");
+    assert_recovery(
+        &editing,
+        PersonalWorkerLimaRecoveryDisposition::ReobserveUncertainMutation,
+        PersonalWorkerLimaAttemptPhase::EditStarted,
+        208_000,
+    );
     let edited = editing
         .checkpoint(
             generation,
@@ -766,6 +823,12 @@ fn prepared_attempt_blocks_replay_and_follows_exact_durable_phase_graph() {
             epoch(209_000),
         )
         .expect("edit completed");
+    assert_recovery(
+        &edited,
+        PersonalWorkerLimaRecoveryDisposition::ReobserveCheckpointedMutation,
+        PersonalWorkerLimaAttemptPhase::EditCompleted,
+        209_000,
+    );
     let starting = edited
         .checkpoint(
             generation,
@@ -773,6 +836,12 @@ fn prepared_attempt_blocks_replay_and_follows_exact_durable_phase_graph() {
             epoch(210_000),
         )
         .expect("start began");
+    assert_recovery(
+        &starting,
+        PersonalWorkerLimaRecoveryDisposition::ReobserveUncertainMutation,
+        PersonalWorkerLimaAttemptPhase::StartStarted,
+        210_000,
+    );
     let started = starting
         .checkpoint(
             generation,
@@ -780,6 +849,12 @@ fn prepared_attempt_blocks_replay_and_follows_exact_durable_phase_graph() {
             epoch(211_000),
         )
         .expect("start completed");
+    assert_recovery(
+        &started,
+        PersonalWorkerLimaRecoveryDisposition::ReobserveCheckpointedMutation,
+        PersonalWorkerLimaAttemptPhase::StartCompleted,
+        211_000,
+    );
     let verifying = started
         .checkpoint(
             generation,
@@ -787,6 +862,27 @@ fn prepared_attempt_blocks_replay_and_follows_exact_durable_phase_graph() {
             epoch(212_000),
         )
         .expect("verification began");
+    assert_recovery(
+        &verifying,
+        PersonalWorkerLimaRecoveryDisposition::Reverify,
+        PersonalWorkerLimaAttemptPhase::VerifyStarted,
+        212_000,
+    );
+    let recovery_json = serde_json::to_string(&verifying.recovery_report()).expect("JSON");
+    let recovery_debug = format!("{:?}", verifying.recovery_report());
+    let machine_identity = "a".repeat(64);
+    let cache_identity = "b".repeat(64);
+    for forbidden in [
+        LIMA_HOME,
+        CACHE_PATH,
+        INSTANCE_DIRECTORY,
+        machine_identity.as_str(),
+        cache_identity.as_str(),
+        "/proc/self/fd",
+    ] {
+        assert!(!recovery_json.contains(forbidden));
+        assert!(!recovery_debug.contains(forbidden));
+    }
     let running = mac_observation_profile(true, 214_000, LimaResourceProfile::Work);
     let completed = verifying
         .complete_attempt(
@@ -806,6 +902,12 @@ fn prepared_attempt_blocks_replay_and_follows_exact_durable_phase_graph() {
     assert_eq!(
         completed.attempt().expect("attempt").phase(),
         PersonalWorkerLimaAttemptPhase::Completed
+    );
+    assert_recovery(
+        &completed,
+        PersonalWorkerLimaRecoveryDisposition::SettleCompletedAttempt,
+        PersonalWorkerLimaAttemptPhase::Completed,
+        219_000,
     );
     assert_eq!(
         decode_personal_worker_lima_authority(
@@ -1463,6 +1565,14 @@ fn unix_completed_settlement_recovers_exact_worker_successor_before_clearing_aut
             .settlement()
             .is_some()
     );
+    assert_eq!(
+        guard
+            .authority()
+            .expect("prepared settlement authority")
+            .recovery_report()
+            .disposition(),
+        PersonalWorkerLimaRecoveryDisposition::RecoverPreparedSettlement
+    );
     fs::remove_file(&worker_stage).expect("remove test-only conflicting stage");
     drop(guard);
 
@@ -1473,6 +1583,10 @@ fn unix_completed_settlement_recovers_exact_worker_successor_before_clearing_aut
     let authority = recovered.authority().expect("settled enrollment remains");
     assert!(authority.attempt().is_none());
     assert!(authority.settlement().is_none());
+    assert_eq!(
+        authority.recovery_report().disposition(),
+        PersonalWorkerLimaRecoveryDisposition::Clean
+    );
     let busy = UnixPersonalWorkerStore::open_or_create(root.path())
         .expect_err("settlement guard still owns the canonical writer lock");
     assert_eq!(busy.kind(), PersonalWorkerStoreErrorKind::Busy);
