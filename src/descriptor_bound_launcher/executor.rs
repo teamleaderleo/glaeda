@@ -361,12 +361,12 @@ fn execute_bound_process(
         command.gid(target_gid).uid(target_uid);
     }
 
-    let mut child = command.spawn().map_err(|error| {
+    let mut child = command.spawn().map_err(|_error| {
         #[cfg(test)]
         eprintln!(
             "descriptor-bound private spawn diagnostic: kind={:?} raw_os_error={:?}",
-            error.kind(),
-            error.raw_os_error()
+            _error.kind(),
+            _error.raw_os_error()
         );
         DescriptorBoundLaunchError::spawn("descriptor-bound reviewed process could not be spawned")
     })?;
