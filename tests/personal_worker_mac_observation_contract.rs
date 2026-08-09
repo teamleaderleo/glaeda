@@ -234,14 +234,9 @@ fn clock() -> FakeClock {
 fn exact_stopped_observation_binds_config_host_lima_profile_and_one_timeout() {
     let executor = complete_executor(4, INTERACTIVE_MEMORY);
     let config = config(AvailabilityRequest::Away);
+    let request = request("smolrunner");
     let observation = adapter()
-        .observe(
-            &config,
-            &request("smolrunner"),
-            &lima_adapter(),
-            &executor,
-            &clock(),
-        )
+        .observe(&config, &request, &lima_adapter(), &executor, &clock())
         .expect("complete B02 observation");
     let report = observation.report();
 
@@ -268,6 +263,10 @@ fn exact_stopped_observation_binds_config_host_lima_profile_and_one_timeout() {
         LimaRuntimeState::Stopped
     );
     assert_eq!(report.lima_profile, LimaResourceProfile::Interactive);
+    assert_eq!(
+        observation.lima_source_identity(),
+        &request.source_identity()
+    );
 
     let seen = executor.seen();
     assert_eq!(seen.len(), 8);

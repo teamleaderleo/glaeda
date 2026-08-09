@@ -180,6 +180,36 @@ pub enum LimaArchitecture {
     X86_64,
 }
 
+/// Opaque equality-only identity for one exact private Lima source.
+///
+/// This value intentionally has no serialization or path accessor. It lets higher-level adapters
+/// prove that independently constructed requests target the same validated instance and private
+/// Lima home without disclosing that home.
+#[derive(Clone, PartialEq, Eq)]
+pub struct LimaObservationSourceIdentity {
+    instance: LimaInstanceName,
+    lima_home: PathBuf,
+}
+
+impl LimaObservationSourceIdentity {
+    pub(crate) const fn from_validated(instance: LimaInstanceName, lima_home: PathBuf) -> Self {
+        Self {
+            instance,
+            lima_home,
+        }
+    }
+}
+
+impl fmt::Debug for LimaObservationSourceIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LimaObservationSourceIdentity")
+            .field("instance", &self.instance)
+            .field("lima_home", &"<private-lima-home>")
+            .finish()
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct LimaObservationRequest {
     instance: LimaInstanceName,
@@ -243,6 +273,11 @@ impl LimaObservationRequest {
     #[must_use]
     pub const fn max_age_seconds(&self) -> u64 {
         self.max_age_seconds
+    }
+
+    #[must_use]
+    pub fn source_identity(&self) -> LimaObservationSourceIdentity {
+        LimaObservationSourceIdentity::from_validated(self.instance.clone(), self.lima_home.clone())
     }
 }
 
