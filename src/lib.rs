@@ -79,6 +79,9 @@ pub mod linux_installation_publication;
 /// Durable, revision-checked lease persistence beneath one installation directory.
 #[cfg(target_os = "linux")]
 pub mod linux_lease_store;
+/// Read-only, locked discovery of one protected recorded personal-worker runtime manifest.
+#[cfg(target_os = "linux")]
+pub mod linux_personal_worker_runtime_manifest;
 #[cfg(target_os = "linux")]
 pub mod linux_state;
 #[cfg(target_os = "linux")]
