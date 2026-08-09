@@ -760,7 +760,8 @@ mod tests {
     #[test]
     fn missing_root_project_and_manifest_are_read_only_missing() {
         let missing = std::env::temp_dir().join(format!(
-            "smolrunner-runtime-missing-{}",
+            "smolrunner-runtime-missing-{}-{}",
+            std::process::id(),
             NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
         ));
         assert!(!missing.exists());
