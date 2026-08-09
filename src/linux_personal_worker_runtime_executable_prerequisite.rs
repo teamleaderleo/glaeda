@@ -744,6 +744,18 @@ mod tests {
         }
         let architecture = host_architecture().expect("supported hosted architecture");
         let project = project();
+        for kind in ExecutableKind::ALL {
+            let (parent, name) = kind.path_components();
+            let chain = DirectoryChain::open(Path::new("/"), parent, (0, 0))
+                .unwrap_or_else(|error| panic!("open executable kind {}: {error:?}", kind.tag()));
+            let mut file =
+                BoundExecutableFile::open(chain.leaf(), name, (0, 0), kind.expected_mode())
+                    .unwrap_or_else(|error| {
+                        panic!("open executable file kind {}: {error:?}", kind.tag())
+                    });
+            file.load(architecture, kind.expected_search())
+                .unwrap_or_else(|error| panic!("load executable kind {}: {error:?}", kind.tag()));
+        }
         let live = observe_personal_worker_runtime_executable_prerequisite(&project, architecture)
             .expect("observe live package executables");
         assert_eq!(live.summary().executable_count(), EXECUTABLE_COUNT as u8);
