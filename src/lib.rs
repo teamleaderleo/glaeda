@@ -79,6 +79,9 @@ pub mod linux_installation_publication;
 /// Durable, revision-checked lease persistence beneath one installation directory.
 #[cfg(target_os = "linux")]
 pub mod linux_lease_store;
+/// Direct command-free observation of the five account-related personal-worker runtime classes.
+#[cfg(target_os = "linux")]
+pub mod linux_personal_worker_runtime_account_evidence;
 /// Read-only, locked discovery of one protected recorded personal-worker runtime manifest.
 #[cfg(target_os = "linux")]
 pub mod linux_personal_worker_runtime_manifest;
