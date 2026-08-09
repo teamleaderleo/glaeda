@@ -54,17 +54,19 @@ ownership, parse `ld.so.cache`, resolve a library, construct evidence, or seal r
 
 ### Dynamic-loader cache parser evidence
 
-- Parser implementation commit: `948debfcfe1d8b1c45c5b372c90cb6e745fa6d93`
-- Workflow run: [31330823779](https://github.com/teamleaderleo/smolrunner/actions/runs/31330823779)
-- ARM64 job: [93288667727](https://github.com/teamleaderleo/smolrunner/actions/runs/31330823779/job/93288667727)
-- x86_64 job: [93288667700](https://github.com/teamleaderleo/smolrunner/actions/runs/31330823779/job/93288667700)
+- Parser implementation commit: `75e7a317e66bbeb25a4a8c8626d9ccc0ce27b035`
+- Workflow run: [31332267685](https://github.com/teamleaderleo/smolrunner/actions/runs/31332267685)
+- ARM64 job: [93292289028](https://github.com/teamleaderleo/smolrunner/actions/runs/31332267685/job/93292289028)
+- x86_64 job: [93292288968](https://github.com/teamleaderleo/smolrunner/actions/runs/31332267685/job/93292288968)
 - Date: 2026-08-09
 - Result: both jobs parsed the complete live `/etc/ld.so.cache` from the exact Noble package
   baseline below.
 
 The pure parser accepted only the current little-endian glibc 1.1 layout, bounded every table and
 string, validated cache ordering and the closed extension/hwcap representation, and rejected
-unknown cache IDs and unsafe library identities or paths. The Noble x86_64 cache also carries
+numeric comparison aliases, unknown cache IDs, and unsafe library identities or paths. The x86
+capability vocabulary is exactly `x86-64-v2`, `x86-64-v3`, and `x86-64-v4` with ISA levels 0–3;
+the AArch64 model admits no named hwcap or nonzero ISA level. The Noble x86_64 cache also carries
 generic ELF/libc6 compatibility entries that the admitted 64-bit loader does not select; the parser
 fully validates those known entries but omits them from its compatible-entry view. This proves
 compatibility with those live cache bytes only. It does not open or revalidate the cache, prove its
