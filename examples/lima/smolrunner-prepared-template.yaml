@@ -1,0 +1,228 @@
+minimumLimaVersion: "2.2.0"
+
+# This is the controller-owned source for disposable clones. It is never a job runner itself.
+# One dated image and one pinned runner archive keep template construction fail-closed.
+images:
+  - location: https://cloud-images.ubuntu.com/releases/noble/release-20260705/ubuntu-24.04-server-cloudimg-arm64.img
+    arch: aarch64
+    digest: sha256:7df0201546f75b8bcc1044594c806c35749421ad3c9bc1be2a3ab806cfae39cc
+    variant: server
+
+vmType: vz
+arch: aarch64
+plain: true
+
+# Disposable clones may only increase these values through the durable reservation.
+cpus: 2
+memory: 2GiB
+disk: 20GiB
+
+# Lima owns this SSH/control account. Repository code runs only as the separate locked account.
+user:
+  name: smolrunner-admin
+  comment: SmolRunner controller
+  home: /home/smolrunner-admin
+  shell: /bin/bash
+  uid: 1000
+  passwordlessSudo: true
+
+mounts: []
+networks: []
+portForwards: []
+
+ssh:
+  localPort: 0
+  loadDotSSHPubKeys: false
+  forwardAgent: false
+  forwardX11: false
+  forwardX11Trusted: false
+  overVsock: true
+
+# Do not resolve through the Mac, its VPN, or mDNS. Ordinary build DNS goes only to these
+# reviewed public resolvers; the later runtime network gate will separately deny private/LAN egress.
+hostResolver:
+  enabled: false
+dns:
+  - 1.1.1.1
+  - 1.0.0.1
+
+containerd:
+  system: false
+  user: false
+
+vmOpts:
+  vz:
+    rosetta:
+      enabled: false
+      binfmt: false
+
+video:
+  display: none
+
+propagateProxyEnv: false
+
+# Lima plain mode deliberately retains system provisioning. This fixed script consumes no
+# repository input, downloads only the pinned official runner, verifies size and SHA-256 before
+# extraction, runs the archive's official dependency installer, and creates the non-sudo workload
+# account used by the later JIT boundary.
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -euo pipefail
+      export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+      umask 022
+
+      readonly runner_user="smolrunner-runner"
+      readonly runner_home="/var/lib/smolrunner-runner"
+      readonly runner_work="${runner_home}/work"
+      readonly install_parent="/opt/smolrunner"
+      readonly install_dir="${install_parent}/actions-runner"
+      readonly install_stage="${install_parent}/actions-runner.staging"
+      readonly archive="/var/tmp/actions-runner-linux-arm64-2.336.0.tar.gz"
+      readonly runner_url="https://github.com/actions/runner/releases/download/v2.336.0/actions-runner-linux-arm64-2.336.0.tar.gz"
+      readonly runner_bytes="138824064"
+      readonly runner_sha256="58b758e420b87093fbd4bfddd368074960053e2f1388f01848c82624b90f27d1"
+      readonly marker_dir="/etc/smolrunner"
+      readonly marker="${marker_dir}/prepared-template.json"
+      readonly apt_policy="/etc/apt/apt.conf.d/99-smolrunner-no-automatic-updates"
+
+      if [[ "$(/usr/bin/id -u)" != "0" ]]; then
+        echo "prepared-template provisioning requires root" >&2
+        exit 1
+      fi
+
+      verify_automatic_updates_disabled() {
+        /usr/bin/grep --fixed-strings --line-regexp 'APT::Periodic::Enable "0";' "${apt_policy}" >/dev/null
+        /usr/bin/grep --fixed-strings --line-regexp 'APT::Periodic::Update-Package-Lists "0";' "${apt_policy}" >/dev/null
+        /usr/bin/grep --fixed-strings --line-regexp 'APT::Periodic::Unattended-Upgrade "0";' "${apt_policy}" >/dev/null
+        for unit in apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service; do
+          [[ "$(/usr/bin/systemctl is-enabled "${unit}" 2>/dev/null)" == "masked" ]]
+        done
+      }
+
+      /usr/bin/systemctl mask --now \
+        apt-daily.timer \
+        apt-daily-upgrade.timer \
+        apt-daily.service \
+        apt-daily-upgrade.service
+      /usr/bin/install -o root -g root -m 0644 /dev/null "${apt_policy}"
+      /usr/bin/printf '%s\n' \
+        'APT::Periodic::Enable "0";' \
+        'APT::Periodic::Update-Package-Lists "0";' \
+        'APT::Periodic::Unattended-Upgrade "0";' \
+        >"${apt_policy}"
+      verify_automatic_updates_disabled
+
+      if /usr/bin/getent passwd "${runner_user}" >/dev/null; then
+        IFS=: read -r _ _ _ _ _ existing_home existing_shell < <(/usr/bin/getent passwd "${runner_user}")
+        [[ "${existing_home}" == "${runner_home}" && "${existing_shell}" == "/bin/bash" ]]
+      else
+        /usr/sbin/useradd \
+          --system \
+          --create-home \
+          --home-dir "${runner_home}" \
+          --shell /bin/bash \
+          --user-group \
+          "${runner_user}"
+      fi
+      /usr/bin/passwd --lock "${runner_user}" >/dev/null
+      [[ "$(/usr/bin/id -Gn "${runner_user}")" == "${runner_user}" ]]
+
+      verify_runner_install() {
+        [[ -d "${install_dir}" && ! -L "${install_dir}" ]]
+        [[ "$(/usr/bin/stat --format=%U:%G "${install_dir}")" == "${runner_user}:${runner_user}" ]]
+        [[ -f "${install_dir}/bin/Runner.Listener" && ! -L "${install_dir}/bin/Runner.Listener" ]]
+        local installed_version
+        installed_version="$(
+          cd "${install_dir}"
+          /usr/sbin/runuser --user "${runner_user}" -- \
+            /usr/bin/env -i \
+              HOME="${runner_home}" \
+              PATH=/usr/bin:/bin \
+              "${install_dir}/bin/Runner.Listener" --version
+        )"
+        [[ "${installed_version}" == "2.336.0" ]]
+      }
+
+      /usr/bin/install -d -o root -g root -m 0755 "${install_parent}" "${marker_dir}"
+      /usr/bin/install -d -o "${runner_user}" -g "${runner_user}" -m 0750 "${runner_home}" "${runner_work}"
+
+      if [[ -f "${marker}" && -x "${install_dir}/bin/Runner.Listener" ]]; then
+        /usr/bin/cmp --silent "${marker}" <(/usr/bin/printf '%s\n' \
+          '{' \
+          '  "schema_version": 1,' \
+          '  "actions_runner_version": "2.336.0",' \
+          '  "actions_runner_digest": "sha256:58b758e420b87093fbd4bfddd368074960053e2f1388f01848c82624b90f27d1",' \
+          '  "workload_user": "smolrunner-runner",' \
+          '  "runner_install_directory": "/opt/smolrunner/actions-runner",' \
+          '  "runner_work_directory": "/var/lib/smolrunner-runner/work"' \
+          '}')
+        verify_runner_install
+        verify_automatic_updates_disabled
+        exit 0
+      fi
+
+      if [[ -e "${install_dir}" || -L "${install_dir}" ]]; then
+        echo "runner installation exists without the exact readiness marker" >&2
+        exit 1
+      fi
+
+      /usr/bin/rm -rf -- "${install_stage}"
+      /usr/bin/rm -f -- "${archive}"
+      /usr/bin/curl \
+        --proto '=https' \
+        --tlsv1.2 \
+        --fail \
+        --location \
+        --silent \
+        --show-error \
+        --output "${archive}" \
+        "${runner_url}"
+      [[ "$(/usr/bin/stat --format=%s "${archive}")" == "${runner_bytes}" ]]
+      /usr/bin/printf '%s  %s\n' "${runner_sha256}" "${archive}" \
+        | /usr/bin/sha256sum --check --status
+
+      /usr/bin/install -d -o root -g root -m 0755 "${install_stage}"
+      /usr/bin/tar \
+        --extract \
+        --gzip \
+        --no-same-owner \
+        --file "${archive}" \
+        --directory "${install_stage}"
+      [[ -x "${install_stage}/bin/Runner.Listener" ]]
+      [[ -x "${install_stage}/bin/installdependencies.sh" ]]
+      /usr/bin/env -i \
+        DEBIAN_FRONTEND=noninteractive \
+        PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+        "${install_stage}/bin/installdependencies.sh"
+      /usr/bin/chown -R "${runner_user}:${runner_user}" "${install_stage}"
+      /usr/bin/mv -- "${install_stage}" "${install_dir}"
+      /usr/bin/rm -f -- "${archive}"
+
+      verify_runner_install
+      verify_automatic_updates_disabled
+
+      readonly marker_stage="${marker}.new"
+      /usr/bin/printf '%s\n' \
+        '{' \
+        '  "schema_version": 1,' \
+        '  "actions_runner_version": "2.336.0",' \
+        '  "actions_runner_digest": "sha256:58b758e420b87093fbd4bfddd368074960053e2f1388f01848c82624b90f27d1",' \
+        '  "workload_user": "smolrunner-runner",' \
+        '  "runner_install_directory": "/opt/smolrunner/actions-runner",' \
+        '  "runner_work_directory": "/var/lib/smolrunner-runner/work"' \
+        '}' >"${marker_stage}"
+      /usr/bin/chown root:root "${marker_stage}"
+      /usr/bin/chmod 0444 "${marker_stage}"
+      /usr/bin/mv -- "${marker_stage}" "${marker}"
+
+probes:
+  - mode: readiness
+    description: pinned SmolRunner Actions runner is prepared
+    script: |
+      #!/bin/bash
+      set -euo pipefail
+      /usr/bin/test -r /etc/smolrunner/prepared-template.json
+      /usr/bin/test -x /opt/smolrunner/actions-runner/bin/Runner.Listener
+      /usr/bin/test "$(/usr/bin/id -Gn smolrunner-runner)" = "smolrunner-runner"

@@ -745,7 +745,7 @@ mod tests {
         }
         let bytes = encode_disposable_prepared_template(&current).unwrap();
         let changed = String::from_utf8(bytes).unwrap().replacen(
-            "\"recipe_revision\": 1",
+            "\"recipe_revision\": 2",
             &format!("\"recipe_revision\": {recipe_revision}"),
             1,
         );

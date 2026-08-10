@@ -83,6 +83,9 @@ pub struct DisposableLimaWorkerAdapter {
     lima_home: PathBuf,
     source_template: LimaInstanceName,
     prepared_template_identity: DisposablePreparedTemplateIdentity,
+    source_cpu_count: u32,
+    source_memory_bytes: u64,
+    source_disk_bytes: u64,
 }
 
 impl fmt::Debug for DisposableLimaWorkerAdapter {
@@ -122,6 +125,9 @@ impl DisposableLimaWorkerAdapter {
             lima_home,
             source_template,
             prepared_template_identity,
+            source_cpu_count: prepared_template.source_cpu_count(),
+            source_memory_bytes: prepared_template.source_memory_bytes(),
+            source_disk_bytes: prepared_template.source_disk_bytes(),
         })
     }
 
@@ -176,7 +182,12 @@ impl DisposableLimaWorkerAdapter {
             DisposableWorkerAction::CloneVm
                 if attempt.phase() == DisposableAttemptPhase::CloneAuthorized =>
             {
-                let resources = lima_resources(reservation.resources())?;
+                let resources = lima_resources(
+                    reservation.resources(),
+                    self.source_cpu_count,
+                    self.source_memory_bytes,
+                    self.source_disk_bytes,
+                )?;
                 (
                     DisposableLimaWorkerCommandKind::Clone,
                     self.base_command()
@@ -394,6 +405,9 @@ struct LimaResources {
 
 fn lima_resources(
     resources: DisposableWorkerResources,
+    source_cpu_count: u32,
+    source_memory_bytes: u64,
+    source_disk_bytes: u64,
 ) -> Result<LimaResources, DisposableLimaWorkerError> {
     if !resources.cpu_millis().is_multiple_of(1_000)
         || !resources.memory_bytes().is_multiple_of(GIB)
@@ -403,6 +417,16 @@ fn lima_resources(
             DisposableLimaWorkerErrorKind::UnsupportedResources,
             "unsupported_resource_granularity",
             "Lima worker resources must use whole CPUs and whole GiB values",
+        ));
+    }
+    if resources.cpu_millis() < source_cpu_count.saturating_mul(1_000)
+        || resources.memory_bytes() < source_memory_bytes
+        || resources.disk_bytes() < source_disk_bytes
+    {
+        return Err(error(
+            DisposableLimaWorkerErrorKind::UnsupportedResources,
+            "resources_below_prepared_template",
+            "Lima clone resources cannot be lower than the prepared source template",
         ));
     }
     Ok(LimaResources {
@@ -491,8 +515,8 @@ mod tests {
         let current = template_manifest();
         let bytes = encode_disposable_prepared_template(&current).unwrap();
         let changed = String::from_utf8(bytes).unwrap().replacen(
-            "\"recipe_revision\": 1",
             "\"recipe_revision\": 2",
+            "\"recipe_revision\": 3",
             1,
         );
         decode_disposable_prepared_template(changed.as_bytes())
@@ -560,6 +584,27 @@ mod tests {
             .unwrap();
         assert_eq!(phase, DisposableAttemptPhase::Destroying);
         destroying.find_active(&attempt_id).unwrap().clone()
+    }
+
+    fn clone_authorized_reservation(
+        resources: DisposableWorkerResources,
+    ) -> DisposableAttemptReservation {
+        let initial = initial_reservation(resources);
+        let attempt_id = initial.attempt().attempt_id().clone();
+        let mut catalog =
+            DisposableAttemptCatalog::new(MemoryDisposableAttemptCatalogStore::default());
+        let (empty, _) = catalog.initialize().unwrap();
+        let (reserved, _) = catalog.reserve(empty.revision(), initial).unwrap();
+        let attempt = reserved.find_active(&attempt_id).unwrap().attempt();
+        let (authorized, _) = catalog
+            .transition(
+                reserved.revision(),
+                &attempt_id,
+                attempt.revision(),
+                DisposableAttemptCatalogAction::AuthorizeClone,
+            )
+            .unwrap();
+        authorized.find_active(&attempt_id).unwrap().clone()
     }
 
     fn adapter() -> DisposableLimaWorkerAdapter {
@@ -666,7 +711,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_phase_and_fractional_resources_fail_before_execution() {
+    fn invalid_phase_fractional_and_below_source_resources_fail_before_execution() {
         let invalid_path = DisposableLimaWorkerAdapter::new(
             "/opt/./homebrew/bin/limactl",
             "/Users/runner/.smolrunner/lima",
@@ -711,26 +756,13 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code(), "attempt_expired");
 
-        let fractional =
-            initial_reservation(DisposableWorkerResources::new(3_500, 8 * GIB, 64 * GIB).unwrap());
-        let attempt_id = fractional.attempt().attempt_id().clone();
-        let mut catalog =
-            DisposableAttemptCatalog::new(MemoryDisposableAttemptCatalogStore::default());
-        let (empty, _) = catalog.initialize().unwrap();
-        let (reserved, _) = catalog.reserve(empty.revision(), fractional).unwrap();
-        let attempt = reserved.find_active(&attempt_id).unwrap().attempt();
-        let (provisioning, _) = catalog
-            .transition(
-                reserved.revision(),
-                &attempt_id,
-                attempt.revision(),
-                DisposableAttemptCatalogAction::AuthorizeClone,
-            )
-            .unwrap();
+        let provisioning = clone_authorized_reservation(
+            DisposableWorkerResources::new(3_500, 8 * GIB, 64 * GIB).unwrap(),
+        );
         let error = adapter()
             .plan(
                 EpochMillis::new(1_000).unwrap(),
-                provisioning.find_active(&attempt_id).unwrap(),
+                &provisioning,
                 &DisposableWorkerAction::CloneVm,
             )
             .unwrap_err();
@@ -738,6 +770,32 @@ mod tests {
             error.kind(),
             DisposableLimaWorkerErrorKind::UnsupportedResources
         );
+
+        for resources in [
+            DisposableWorkerResources::new(1_000, 2 * GIB, 20 * GIB).unwrap(),
+            DisposableWorkerResources::new(2_000, GIB, 20 * GIB).unwrap(),
+            DisposableWorkerResources::new(2_000, 2 * GIB, 19 * GIB).unwrap(),
+        ] {
+            let error = adapter()
+                .plan(
+                    EpochMillis::new(1_000).unwrap(),
+                    &clone_authorized_reservation(resources),
+                    &DisposableWorkerAction::CloneVm,
+                )
+                .unwrap_err();
+            assert_eq!(error.code(), "resources_below_prepared_template");
+        }
+
+        let boundary = adapter()
+            .plan(
+                EpochMillis::new(1_000).unwrap(),
+                &clone_authorized_reservation(
+                    DisposableWorkerResources::new(2_000, 2 * GIB, 20 * GIB).unwrap(),
+                ),
+                &DisposableWorkerAction::CloneVm,
+            )
+            .unwrap();
+        assert_eq!(boundary.kind(), DisposableLimaWorkerCommandKind::Clone);
     }
 
     #[test]
@@ -749,6 +807,7 @@ mod tests {
         for input in [
             include_str!("../examples/lima/smolrunner-work.yaml"),
             include_str!("../examples/lima/smolrunner-interactive.yaml"),
+            include_str!("../examples/lima/smolrunner-prepared-template.yaml"),
         ] {
             let document: serde_yaml::Value = serde_yaml::from_str(input).unwrap();
             assert_eq!(
@@ -790,5 +849,65 @@ mod tests {
             assert_eq!(document["video"]["display"].as_str(), Some("none"));
             assert_eq!(document["propagateProxyEnv"].as_bool(), Some(false));
         }
+
+        let production: serde_yaml::Value = serde_yaml::from_str(include_str!(
+            "../examples/lima/smolrunner-prepared-template.yaml"
+        ))
+        .unwrap();
+        assert_eq!(
+            production["user"]["name"].as_str(),
+            Some("smolrunner-admin")
+        );
+        assert_eq!(production["user"]["uid"].as_u64(), Some(1000));
+        assert_eq!(
+            production["user"]["comment"].as_str(),
+            Some("SmolRunner controller")
+        );
+        assert_eq!(production["user"]["passwordlessSudo"].as_bool(), Some(true));
+        assert_eq!(
+            production["cpus"].as_u64(),
+            Some(u64::from(prepared_template.source_cpu_count()))
+        );
+        assert_eq!(production["memory"].as_str(), Some("2GiB"));
+        assert_eq!(production["disk"].as_str(), Some("20GiB"));
+        assert!(production["networks"].as_sequence().unwrap().is_empty());
+        assert_eq!(production["hostResolver"]["enabled"].as_bool(), Some(false));
+        assert_eq!(
+            production["dns"]
+                .as_sequence()
+                .unwrap()
+                .iter()
+                .map(|value| value.as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["1.1.1.1", "1.0.0.1"]
+        );
+        assert_eq!(production["ssh"]["localPort"].as_u64(), Some(0));
+        assert_eq!(production["ssh"]["overVsock"].as_bool(), Some(true));
+        let provisions = production["provision"].as_sequence().unwrap();
+        assert_eq!(provisions.len(), 1);
+        assert_eq!(provisions[0]["mode"].as_str(), Some("system"));
+        let script = provisions[0]["script"].as_str().unwrap();
+        assert!(script.contains(prepared_template.actions_runner_location()));
+        assert!(
+            script.contains(
+                prepared_template
+                    .actions_runner_digest()
+                    .as_str()
+                    .strip_prefix("sha256:")
+                    .unwrap()
+            )
+        );
+        assert!(script.contains("smolrunner-runner"));
+        assert!(script.contains("bin/installdependencies.sh"));
+        assert!(script.contains("99-smolrunner-no-automatic-updates"));
+        assert!(script.contains("systemctl mask --now"));
+        let probes = production["probes"].as_sequence().unwrap();
+        assert_eq!(probes.len(), 1);
+        assert!(
+            probes[0]["script"]
+                .as_str()
+                .unwrap()
+                .contains(prepared_template.ready_marker_path())
+        );
     }
 }
