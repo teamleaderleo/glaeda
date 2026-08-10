@@ -21,6 +21,8 @@ use crate::personal_worker_store::{
 
 /// Same-lock durable persistence for the disposable-attempt catalog.
 mod disposable_attempt_catalog;
+/// Same-lock durable persistence for prepared-template generation state.
+mod disposable_template_generation;
 /// Same-lock durable persistence for the personal-worker Lima lifecycle authority.
 pub mod lima_authority;
 
@@ -203,6 +205,7 @@ impl UnixPersonalWorkerStore {
         // success from the store.
         synchronize_directory(&store._root, "personal worker state root")?;
         disposable_attempt_catalog::refuse_unsettled(&store)?;
+        disposable_template_generation::refuse_unsettled(&store)?;
         lima_authority::refuse_unsettled_lima_authority(&store)?;
         match store.recovery_plan()? {
             StoreRecoveryPlan::Clean {
@@ -254,6 +257,7 @@ impl UnixPersonalWorkerStore {
         let _lock = store.acquire_mutation_lock()?;
         synchronize_directory(&store._root, "personal worker state root")?;
         disposable_attempt_catalog::refuse_unsettled(&store)?;
+        disposable_template_generation::refuse_unsettled(&store)?;
         lima_authority::refuse_unsettled_lima_authority(&store)?;
 
         let current_bytes = store.read_named_bytes(CURRENT_DOCUMENT)?.ok_or_else(|| {
@@ -625,6 +629,7 @@ impl PersonalWorkerStore for UnixPersonalWorkerStore {
         }
         let _lock = self.acquire_mutation_lock()?;
         disposable_attempt_catalog::refuse_unsettled(self)?;
+        disposable_template_generation::refuse_unsettled(self)?;
         lima_authority::refuse_unsettled_lima_authority(self)?;
         self.recover_locked()?;
         if self.load_named(CURRENT_DOCUMENT)?.is_some() {
@@ -650,6 +655,7 @@ impl PersonalWorkerStore for UnixPersonalWorkerStore {
     ) -> Result<PersonalWorkerStoreWriteReceipt, PersonalWorkerStoreError> {
         let _lock = self.acquire_mutation_lock()?;
         disposable_attempt_catalog::refuse_unsettled(self)?;
+        disposable_template_generation::refuse_unsettled(self)?;
         lima_authority::refuse_unsettled_lima_authority(self)?;
         self.recover_locked()?;
         let current = self.load_named(CURRENT_DOCUMENT)?.ok_or_else(|| {
@@ -678,6 +684,7 @@ impl PersonalWorkerStore for UnixPersonalWorkerStore {
     fn recover(&mut self) -> Result<PersonalWorkerStoreRecovery, PersonalWorkerStoreError> {
         let _lock = self.acquire_mutation_lock()?;
         disposable_attempt_catalog::refuse_unsettled(self)?;
+        disposable_template_generation::refuse_unsettled(self)?;
         lima_authority::refuse_unsettled_lima_authority(self)?;
         self.recover_locked()
     }

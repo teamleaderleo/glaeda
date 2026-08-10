@@ -149,6 +149,12 @@ impl UnixPersonalWorkerLimaAuthorityGuard {
             }
             return Err(error.into());
         }
+        if let Err(error) = super::disposable_template_generation::refuse_unsettled(&store) {
+            if error.kind() == PersonalWorkerStoreErrorKind::RevisionConflict {
+                return Err(authority_recovery_required());
+            }
+            return Err(error.into());
+        }
         let current_authority = load_authority(&store, AUTHORITY_DOCUMENT)?;
         let staged_authority = load_authority(&store, STAGED_AUTHORITY_DOCUMENT)?;
         let current_worker = store.load_named(CURRENT_DOCUMENT)?;

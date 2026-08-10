@@ -393,6 +393,26 @@ pub struct DisposableTemplateObservation {
     state: DisposableTemplateObservedState,
 }
 
+#[cfg(test)]
+pub(crate) fn test_disposable_template_observation(
+    document: &DisposableTemplateGenerationDocument,
+    source_identity: DisposableTemplateSourceIdentity,
+    object_identity: Option<DisposableTemplateObjectIdentity>,
+    prepared_template_identity: Option<DisposablePreparedTemplateIdentity>,
+    prior_operation: DisposableTemplatePriorOperationState,
+    state: DisposableTemplateObservedState,
+) -> DisposableTemplateObservation {
+    DisposableTemplateObservation {
+        generation_id: document.generation_id.clone(),
+        document_revision: document.revision,
+        source_identity,
+        object_identity,
+        prepared_template_identity,
+        prior_operation,
+        state,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DisposableTemplateGenerationRefusal {
@@ -430,13 +450,13 @@ pub enum DisposableTemplateGenerationDisposition {
 pub struct DisposableTemplateGenerationPlan {
     generation_id: DisposableTemplateGenerationId,
     expected_revision: u64,
-    _prepared_template_identity: DisposablePreparedTemplateIdentity,
-    _source_identity: DisposableTemplateSourceIdentity,
+    prepared_template_identity: DisposablePreparedTemplateIdentity,
+    source_identity: DisposableTemplateSourceIdentity,
     source_instance: LimaInstanceName,
-    _observed_object_identity: Option<DisposableTemplateObjectIdentity>,
-    _observed_prepared_template_identity: Option<DisposablePreparedTemplateIdentity>,
-    _observed_state: DisposableTemplateObservedState,
-    _prior_operation: DisposableTemplatePriorOperationState,
+    observed_object_identity: Option<DisposableTemplateObjectIdentity>,
+    observed_prepared_template_identity: Option<DisposablePreparedTemplateIdentity>,
+    observed_state: DisposableTemplateObservedState,
+    prior_operation: DisposableTemplatePriorOperationState,
     disposition: DisposableTemplateGenerationDisposition,
 }
 
@@ -444,6 +464,38 @@ impl DisposableTemplateGenerationPlan {
     #[must_use]
     pub const fn disposition(&self) -> DisposableTemplateGenerationDisposition {
         self.disposition
+    }
+
+    pub(crate) fn confirmed_persist_successor(
+        self,
+        document: &DisposableTemplateGenerationDocument,
+        confirmation: DisposableTemplateObservation,
+    ) -> Result<DisposableTemplateGenerationDocument, DisposableTemplateGenerationError> {
+        let DisposableTemplateGenerationDisposition::Persist { action } = self.disposition else {
+            return Err(generation_error(
+                DisposableTemplateGenerationErrorKind::InvalidTransition,
+                "template generation candidate requires the runtime execution service",
+            ));
+        };
+        let binding_matches = self.generation_id == document.generation_id
+            && self.expected_revision == document.revision
+            && self.prepared_template_identity == document.prepared_template_identity
+            && self.source_identity == document.source_identity
+            && self.source_instance == document.source_instance
+            && confirmation.generation_id == self.generation_id
+            && confirmation.document_revision == self.expected_revision
+            && confirmation.source_identity == self.source_identity
+            && confirmation.object_identity == self.observed_object_identity
+            && confirmation.prepared_template_identity == self.observed_prepared_template_identity
+            && confirmation.state == self.observed_state
+            && confirmation.prior_operation == self.prior_operation;
+        if !binding_matches {
+            return Err(generation_error(
+                DisposableTemplateGenerationErrorKind::StaleRevision,
+                "template generation confirmation no longer matches the advisory decision",
+            ));
+        }
+        document.transition(self.expected_revision, action, confirmation.object_identity)
     }
 }
 
@@ -680,13 +732,13 @@ fn plan(
     DisposableTemplateGenerationPlan {
         generation_id: document.generation_id.clone(),
         expected_revision: document.revision,
-        _prepared_template_identity: document.prepared_template_identity.clone(),
-        _source_identity: document.source_identity.clone(),
+        prepared_template_identity: document.prepared_template_identity.clone(),
+        source_identity: document.source_identity.clone(),
         source_instance: document.source_instance.clone(),
-        _observed_object_identity: observation.object_identity.clone(),
-        _observed_prepared_template_identity: observation.prepared_template_identity.clone(),
-        _observed_state: observation.state,
-        _prior_operation: observation.prior_operation,
+        observed_object_identity: observation.object_identity.clone(),
+        observed_prepared_template_identity: observation.prepared_template_identity.clone(),
+        observed_state: observation.state,
+        prior_operation: observation.prior_operation,
         disposition,
     }
 }
