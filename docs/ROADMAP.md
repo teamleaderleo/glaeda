@@ -130,7 +130,7 @@ catalog directly. Restart-at-every-checkpoint coverage exercises the real crash-
 - [x] Persist the attempt through the existing crash-safe state machinery with exact revisions and recovery semantics.
 - [x] Split prechosen runner name from GitHub-assigned runner ID so ambiguous JIT registration can recover by stable identity.
 - [x] Preserve Scale Set job identity and result as bounded protocol values instead of assuming narrower REST/enum forms.
-- [x] Cover crash-after-every-checkpoint, completion-before-assignment, unknown completion strings, stale registration, and scale-to-zero in deterministic persistence tests.
+- [x] Cover crash-after-every-checkpoint, exact late-event binding, refusal of unbound runnerless completion, unknown completion strings, exact stale-registration cleanup, and scale-to-zero in deterministic persistence tests.
 
 **M1 acceptance:** killing the controller at every lifecycle boundary and restarting it never creates a second worker for the same attempt, loses owned cleanup debt, or releases capacity before cleanup is proven.
 
