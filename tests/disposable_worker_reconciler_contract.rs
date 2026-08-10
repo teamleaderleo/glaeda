@@ -653,6 +653,8 @@ fn duplicate_job_event_is_a_no_op_but_identity_drift_is_refused() {
 fn late_duplicate_event_does_not_reverse_cleanup() {
     let exact_runner = runner(41);
     let state = attempt()
+        .authorize_clone()
+        .unwrap()
         .record_terminal(Some(&exact_runner), job("job-late"), result("succeeded"))
         .unwrap()
         .begin_cleanup()

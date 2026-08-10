@@ -158,6 +158,24 @@ fn reserved_attempt_cannot_enter_external_cleanup_through_the_public_catalog() {
         DisposableAttemptCatalogErrorKind::InvalidAction
     );
     assert_eq!(catalog.load().unwrap(), reserved);
+
+    let error = catalog
+        .transition(
+            reserved.revision(),
+            &attempt_id,
+            durable.attempt().revision(),
+            DisposableAttemptCatalogAction::RecordTerminal {
+                runner: Some(runner(1, 11)),
+                job_id: ScaleSetJobId::parse("preauthorization-terminal").unwrap(),
+                result: ScaleSetJobResult::parse("canceled").unwrap(),
+            },
+        )
+        .expect_err("job completion cannot manufacture pre-clone cleanup authority");
+    assert_eq!(
+        error.kind(),
+        DisposableAttemptCatalogErrorKind::InvalidAction
+    );
+    assert_eq!(catalog.load().unwrap(), reserved);
 }
 
 #[test]
@@ -246,12 +264,18 @@ fn global_ownership_identities_are_unique_across_attempts() {
 fn duplicate_terminal_observation_is_satisfied_without_catalog_churn() {
     let (mut catalog, empty) = initialized();
     let (reserved, _) = catalog.reserve(empty.revision(), reservation(1)).unwrap();
+    let authorized = transition(
+        &mut catalog,
+        &reserved,
+        1,
+        DisposableAttemptCatalogAction::AuthorizeClone,
+    );
     let job = ScaleSetJobId::parse("opaque-job-1").unwrap();
     let result = ScaleSetJobResult::parse("future-service-result").unwrap();
 
     let terminal = transition(
         &mut catalog,
-        &reserved,
+        &authorized,
         1,
         DisposableAttemptCatalogAction::RecordTerminal {
             runner: Some(runner(1, 11)),
@@ -332,9 +356,15 @@ fn identity_drift_remains_distinct_from_an_illegal_phase_action() {
 fn completed_attempt_releases_usage_then_moves_to_bounded_replay_history() {
     let (mut catalog, empty) = initialized();
     let (reserved, _) = catalog.reserve(empty.revision(), reservation(1)).unwrap();
-    let terminal = transition(
+    let authorized = transition(
         &mut catalog,
         &reserved,
+        1,
+        DisposableAttemptCatalogAction::AuthorizeClone,
+    );
+    let terminal = transition(
+        &mut catalog,
+        &authorized,
         1,
         DisposableAttemptCatalogAction::RecordTerminal {
             runner: Some(runner(1, 11)),
@@ -487,9 +517,21 @@ fn exact_job_ids_cannot_be_reused_across_concurrent_attempts() {
     let (two, _) = catalog.reserve(one.revision(), reservation(2)).unwrap();
     let shared_job = ScaleSetJobId::parse("shared-job-id").unwrap();
 
-    let one_terminal = transition(
+    let one_authorized = transition(
         &mut catalog,
         &two,
+        1,
+        DisposableAttemptCatalogAction::AuthorizeClone,
+    );
+    let both_authorized = transition(
+        &mut catalog,
+        &one_authorized,
+        2,
+        DisposableAttemptCatalogAction::AuthorizeClone,
+    );
+    let one_terminal = transition(
+        &mut catalog,
+        &both_authorized,
         1,
         DisposableAttemptCatalogAction::RecordTerminal {
             runner: Some(runner(1, 11)),

@@ -130,6 +130,21 @@ fn runnerless_completion_requires_an_exact_prebound_job() {
 }
 
 #[test]
+fn preauthorization_terminal_evidence_cannot_create_cleanup_authority() {
+    assert_eq!(
+        reserved()
+            .record_terminal(
+                Some(&runner(9)),
+                job("preauthorization-terminal"),
+                ScaleSetJobResult::parse("canceled").unwrap(),
+            )
+            .unwrap_err()
+            .code(),
+        "invalid_transition"
+    );
+}
+
+#[test]
 fn unknown_completion_result_still_reaches_cleanup() {
     let terminal = reserved()
         .authorize_clone()

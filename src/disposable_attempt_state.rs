@@ -385,9 +385,10 @@ impl DisposableAttemptState {
 
     /// Record terminal demand for the exact job.
     ///
-    /// `runner` may be absent only after assignment or another exact event has already bound the
-    /// job to this attempt. This prevents one runnerless service event from being attributed to an
-    /// arbitrary outstanding capacity reservation.
+    /// The attempt must already hold clone authority. `runner` may be absent only after assignment
+    /// or another exact event has already bound the job to this attempt. Together these conditions
+    /// prevent a late service event from manufacturing cleanup authority for an untouched capacity
+    /// reservation or from being attributed to an arbitrary outstanding reservation.
     pub fn record_terminal(
         &self,
         runner: Option<&ScaleSetRunnerReference>,
@@ -429,8 +430,7 @@ impl DisposableAttemptState {
         if !cleanup
             && !matches!(
                 self.phase,
-                DisposableAttemptPhase::Reserved
-                    | DisposableAttemptPhase::CloneAuthorized
+                DisposableAttemptPhase::CloneAuthorized
                     | DisposableAttemptPhase::Registering
                     | DisposableAttemptPhase::Waiting
                     | DisposableAttemptPhase::Assigned
@@ -615,7 +615,7 @@ impl DisposableAttemptState {
             DisposableAttemptPhase::Waiting
             | DisposableAttemptPhase::Assigned
             | DisposableAttemptPhase::Running => revision >= 4,
-            DisposableAttemptPhase::Terminal => revision >= 2,
+            DisposableAttemptPhase::Terminal => revision >= 3,
             DisposableAttemptPhase::Destroying => revision >= 3,
             DisposableAttemptPhase::Deregistering => revision >= 4,
             DisposableAttemptPhase::Releasing => revision >= 5,
