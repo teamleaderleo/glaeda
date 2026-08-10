@@ -463,7 +463,8 @@ impl DisposableAttemptCatalogDocument {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "transition", rename_all = "snake_case")]
 pub enum DisposableAttemptCatalogAction {
     BeginProvisioning,
     BeginRegistration,

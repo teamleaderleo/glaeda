@@ -73,8 +73,26 @@ fn job_assignment_does_not_bind_a_runner_before_job_started() {
 }
 
 #[test]
-fn preassignment_completion_can_be_terminal_without_runner_identity() {
+fn runnerless_completion_requires_an_exact_prebound_job() {
+    assert_eq!(
+        reserved()
+            .record_terminal(
+                None,
+                job("cancel-before-runner"),
+                ScaleSetJobResult::parse("canceled").unwrap(),
+            )
+            .unwrap_err()
+            .code(),
+        "identity_drift"
+    );
+
     let terminal = reserved()
+        .begin_provisioning()
+        .unwrap()
+        .begin_registration()
+        .unwrap()
+        .record_assigned(job("cancel-before-runner"))
+        .unwrap()
         .record_terminal(
             None,
             job("cancel-before-runner"),
@@ -94,6 +112,12 @@ fn preassignment_completion_can_be_terminal_without_runner_identity() {
 #[test]
 fn unknown_completion_result_still_reaches_cleanup() {
     let terminal = reserved()
+        .begin_provisioning()
+        .unwrap()
+        .begin_registration()
+        .unwrap()
+        .record_assigned(job("job-future-result"))
+        .unwrap()
         .record_terminal(
             None,
             job("job-future-result"),
@@ -113,6 +137,40 @@ fn unknown_completion_result_still_reaches_cleanup() {
 
     assert_eq!(complete.phase(), DisposableAttemptPhase::Complete);
     assert_eq!(complete.result().unwrap().as_str(), "future-service-result");
+}
+
+#[test]
+fn late_job_evidence_binds_without_reversing_cleanup_and_conflicts_fail_closed() {
+    let exact_runner = runner(41);
+    let destroying = reserved()
+        .begin_cleanup()
+        .unwrap()
+        .record_running(&exact_runner, job("late-job"))
+        .unwrap();
+    assert_eq!(destroying.phase(), DisposableAttemptPhase::Destroying);
+    assert_eq!(destroying.runner_id().unwrap().get(), 41);
+    assert_eq!(destroying.github_job_id().unwrap().as_str(), "late-job");
+
+    let terminal = destroying
+        .record_terminal(
+            Some(&exact_runner),
+            job("late-job"),
+            ScaleSetJobResult::parse("succeeded").unwrap(),
+        )
+        .unwrap();
+    assert_eq!(terminal.phase(), DisposableAttemptPhase::Destroying);
+    assert_eq!(terminal.result().unwrap().as_str(), "succeeded");
+    assert_eq!(
+        terminal
+            .record_terminal(
+                Some(&exact_runner),
+                job("late-job"),
+                ScaleSetJobResult::parse("failed").unwrap(),
+            )
+            .unwrap_err()
+            .code(),
+        "identity_drift"
+    );
 }
 
 #[test]

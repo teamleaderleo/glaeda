@@ -215,15 +215,22 @@ impl DisposableAttemptState {
 
     /// Record the exact GitHub registration returned or rediscovered after JIT creation.
     ///
-    /// This deliberately stays in `registering`: an existing registration does not prove that the
-    /// guest listener is alive or that the one-time JIT configuration remains usable.
+    /// This deliberately stays in the current phase: an existing registration does not prove that
+    /// the guest listener is alive or that the one-time JIT configuration remains usable. During
+    /// cleanup, binding a rediscovered service ID is the durable prerequisite for exact deletion.
     pub fn record_registration(
         &self,
         runner: &ScaleSetRunnerReference,
     ) -> Result<Self, DisposableAttemptStateError> {
-        if self.phase != DisposableAttemptPhase::Registering {
+        if !matches!(
+            self.phase,
+            DisposableAttemptPhase::Registering
+                | DisposableAttemptPhase::Destroying
+                | DisposableAttemptPhase::Deregistering
+                | DisposableAttemptPhase::Releasing
+        ) {
             return Err(invalid_transition(
-                "runner registration can only be recorded while registering",
+                "runner registration can only be recorded while registering or cleaning up",
             ));
         }
         let runner_id = self.validate_runner(runner)?;
@@ -318,6 +325,26 @@ impl DisposableAttemptState {
             {
                 Ok(self.clone())
             }
+            DisposableAttemptPhase::Destroying
+            | DisposableAttemptPhase::Deregistering
+            | DisposableAttemptPhase::Releasing
+            | DisposableAttemptPhase::Complete => {
+                if self.result.is_some() {
+                    if self.runner_id == Some(runner_id)
+                        && self.github_job_id.as_ref() == Some(&job_id)
+                    {
+                        return Ok(self.clone());
+                    }
+                    return Err(identity_drift(
+                        "late job start conflicts with terminal cleanup evidence",
+                    ));
+                }
+                if self.runner_id == Some(runner_id) && self.github_job_id.as_ref() == Some(&job_id)
+                {
+                    return Ok(self.clone());
+                }
+                self.advance_with(self.phase, Some(runner_id), Some(job_id), None)
+            }
             _ => Err(invalid_transition(
                 "job start cannot advance the current attempt phase",
             )),
@@ -326,8 +353,9 @@ impl DisposableAttemptState {
 
     /// Record terminal demand for the exact job.
     ///
-    /// `runner` may be absent for a completion/cancellation that happens before GitHub assigns a
-    /// runner. Cleanup remains driven by the exact job identity and the worker attempt.
+    /// `runner` may be absent only after assignment or another exact event has already bound the
+    /// job to this attempt. This prevents one runnerless service event from being attributed to an
+    /// arbitrary outstanding capacity reservation.
     pub fn record_terminal(
         &self,
         runner: Option<&ScaleSetRunnerReference>,
@@ -338,9 +366,14 @@ impl DisposableAttemptState {
             .map(|value| self.validate_runner(value))
             .transpose()?;
         self.validate_job(&job_id)?;
-        if self.phase == DisposableAttemptPhase::Terminal {
+        if observed_runner_id.is_none() && self.github_job_id.is_none() {
+            return Err(identity_drift(
+                "runnerless terminal evidence requires an already-bound job identity",
+            ));
+        }
+        if let Some(current_result) = self.result.as_ref() {
             if self.github_job_id.as_ref() == Some(&job_id)
-                && self.result.as_ref() == Some(&result)
+                && current_result == &result
                 && observed_runner_id.is_none_or(|id| self.runner_id == Some(id))
             {
                 return Ok(self.clone());
@@ -349,15 +382,29 @@ impl DisposableAttemptState {
                 "terminal evidence conflicts with the bound disposable attempt",
             ));
         }
-        if !matches!(
+        if self.phase == DisposableAttemptPhase::Terminal {
+            return Err(identity_drift(
+                "terminal attempt is missing its validated result",
+            ));
+        }
+        let cleanup = matches!(
             self.phase,
-            DisposableAttemptPhase::Reserved
-                | DisposableAttemptPhase::Provisioning
-                | DisposableAttemptPhase::Registering
-                | DisposableAttemptPhase::Waiting
-                | DisposableAttemptPhase::Assigned
-                | DisposableAttemptPhase::Running
-        ) {
+            DisposableAttemptPhase::Destroying
+                | DisposableAttemptPhase::Deregistering
+                | DisposableAttemptPhase::Releasing
+                | DisposableAttemptPhase::Complete
+        );
+        if !cleanup
+            && !matches!(
+                self.phase,
+                DisposableAttemptPhase::Reserved
+                    | DisposableAttemptPhase::Provisioning
+                    | DisposableAttemptPhase::Registering
+                    | DisposableAttemptPhase::Waiting
+                    | DisposableAttemptPhase::Assigned
+                    | DisposableAttemptPhase::Running
+            )
+        {
             return Err(invalid_transition(
                 "terminal evidence cannot advance the current attempt phase",
             ));
@@ -372,7 +419,11 @@ impl DisposableAttemptState {
             (None, observed) => observed,
         };
         self.advance_with(
-            DisposableAttemptPhase::Terminal,
+            if cleanup {
+                self.phase
+            } else {
+                DisposableAttemptPhase::Terminal
+            },
             runner_id,
             Some(job_id),
             Some(result),

@@ -232,7 +232,7 @@ fn duplicate_terminal_observation_is_satisfied_without_catalog_churn() {
         &reserved,
         1,
         DisposableAttemptCatalogAction::RecordTerminal {
-            runner: None,
+            runner: Some(runner(1, 11)),
             job_id: job.clone(),
             result: result.clone(),
         },
@@ -250,7 +250,7 @@ fn duplicate_terminal_observation_is_satisfied_without_catalog_churn() {
             &attempt_id,
             attempt_revision,
             DisposableAttemptCatalogAction::RecordTerminal {
-                runner: None,
+                runner: Some(runner(1, 11)),
                 job_id: job,
                 result,
             },
@@ -315,7 +315,7 @@ fn completed_attempt_releases_usage_then_moves_to_bounded_replay_history() {
         &reserved,
         1,
         DisposableAttemptCatalogAction::RecordTerminal {
-            runner: None,
+            runner: Some(runner(1, 11)),
             job_id: ScaleSetJobId::parse("job-complete-1").unwrap(),
             result: ScaleSetJobResult::parse("succeeded").unwrap(),
         },
@@ -470,7 +470,7 @@ fn exact_job_ids_cannot_be_reused_across_concurrent_attempts() {
         &two,
         1,
         DisposableAttemptCatalogAction::RecordTerminal {
-            runner: None,
+            runner: Some(runner(1, 11)),
             job_id: shared_job.clone(),
             result: ScaleSetJobResult::parse("canceled").unwrap(),
         },
@@ -486,7 +486,7 @@ fn exact_job_ids_cannot_be_reused_across_concurrent_attempts() {
                 .attempt()
                 .revision(),
             DisposableAttemptCatalogAction::RecordTerminal {
-                runner: None,
+                runner: Some(runner(2, 22)),
                 job_id: shared_job,
                 result: ScaleSetJobResult::parse("canceled").unwrap(),
             },
