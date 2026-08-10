@@ -236,15 +236,16 @@ def _issue_codes(receipt: dict[str, object], key: str) -> list[str]:
     return sorted(set(result))
 
 
-def _source_identity(receipt: dict[str, object]) -> tuple[object, object, object, object]:
+def _source_identity(receipt: dict[str, object]) -> tuple[object, object, object, object, object]:
     source = receipt.get("source")
     if not isinstance(source, dict):
-        return (None, None, None, None)
+        return (None, None, None, None, None)
     return (
         source.get("commit"),
         source.get("tree"),
+        source.get("clean_before"),
         source.get("clean_after"),
-        receipt.get("capability_fingerprint"),
+        source.get("cleanliness_unchanged"),
     )
 
 
@@ -316,10 +317,12 @@ def build_journey_report(
 def render_human(report: dict[str, object]) -> str:
     verdict = str(report["verdict"]).upper()
     doctor = report["doctor"]
+    bootstrap = report["bootstrap"]
     assert isinstance(doctor, dict)
+    assert isinstance(bootstrap, dict)
     lines = [
         f"SmolRunner: {verdict}",
-        f"Bootstrap: {report['bootstrap']['state']}",
+        f"Bootstrap: {bootstrap['state']}",
         f"Doctor: {doctor['overall'] if doctor['evaluated'] else 'not evaluated'}",
     ]
     blockers = report["blocking_codes"]
