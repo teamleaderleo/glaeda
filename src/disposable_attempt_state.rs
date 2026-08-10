@@ -7,8 +7,7 @@ use crate::disposable_worker_reconciler::{
 };
 use crate::execution_admission::EpochMillis;
 use crate::github_scale_set_protocol::{
-    ScaleSetJobId, ScaleSetJobResult, ScaleSetRunnerId, ScaleSetRunnerName,
-    ScaleSetRunnerReference,
+    ScaleSetJobId, ScaleSetJobResult, ScaleSetRunnerId, ScaleSetRunnerName, ScaleSetRunnerReference,
 };
 
 pub const DISPOSABLE_ATTEMPT_STATE_SCHEMA_VERSION: u8 = 1;
@@ -200,12 +199,9 @@ impl DisposableAttemptState {
     ) -> Result<Self, DisposableAttemptStateError> {
         let runner_id = self.validate_runner(runner)?;
         match self.phase {
-            DisposableAttemptPhase::Registering => self.advance_with(
-                DisposableAttemptPhase::Waiting,
-                Some(runner_id),
-                None,
-                None,
-            ),
+            DisposableAttemptPhase::Registering => {
+                self.advance_with(DisposableAttemptPhase::Waiting, Some(runner_id), None, None)
+            }
             DisposableAttemptPhase::Assigned if self.runner_id.is_none() => self.advance_with(
                 DisposableAttemptPhase::Assigned,
                 Some(runner_id),
@@ -292,7 +288,9 @@ impl DisposableAttemptState {
         job_id: ScaleSetJobId,
         result: ScaleSetJobResult,
     ) -> Result<Self, DisposableAttemptStateError> {
-        let observed_runner_id = runner.map(|value| self.validate_runner(value)).transpose()?;
+        let observed_runner_id = runner
+            .map(|value| self.validate_runner(value))
+            .transpose()?;
         self.validate_job(&job_id)?;
         if self.phase == DisposableAttemptPhase::Terminal {
             if self.github_job_id.as_ref() == Some(&job_id)
@@ -476,7 +474,8 @@ impl DisposableAttemptState {
         }
         match self.phase {
             DisposableAttemptPhase::Reserved | DisposableAttemptPhase::Provisioning => {
-                if self.runner_id.is_some() || self.github_job_id.is_some() || self.result.is_some() {
+                if self.runner_id.is_some() || self.github_job_id.is_some() || self.result.is_some()
+                {
                     return Err(invalid_document(
                         "pre-registration attempt cannot carry runner or job evidence",
                     ));
@@ -490,7 +489,8 @@ impl DisposableAttemptState {
                 }
             }
             DisposableAttemptPhase::Waiting => {
-                if self.runner_id.is_none() || self.github_job_id.is_some() || self.result.is_some() {
+                if self.runner_id.is_none() || self.github_job_id.is_some() || self.result.is_some()
+                {
                     return Err(invalid_document(
                         "waiting attempt requires a ready runner and no assigned job",
                     ));
@@ -504,7 +504,8 @@ impl DisposableAttemptState {
                 }
             }
             DisposableAttemptPhase::Running => {
-                if self.runner_id.is_none() || self.github_job_id.is_none() || self.result.is_some() {
+                if self.runner_id.is_none() || self.github_job_id.is_none() || self.result.is_some()
+                {
                     return Err(invalid_document(
                         "running attempt requires exact runner and job identities",
                     ));
@@ -582,7 +583,8 @@ pub fn encode_disposable_attempt_state(
         result: state.result.as_ref().map(ScaleSetJobResult::as_str),
         not_after: state.not_after.get(),
     };
-    let encoded = serde_json::to_vec(&wire).map_err(|_| invalid_document("attempt cannot encode"))?;
+    let encoded =
+        serde_json::to_vec(&wire).map_err(|_| invalid_document("attempt cannot encode"))?;
     if encoded.len() > MAX_DISPOSABLE_ATTEMPT_STATE_BYTES {
         return Err(DisposableAttemptStateError::new(
             "document",
