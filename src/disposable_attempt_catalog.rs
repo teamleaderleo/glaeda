@@ -8,7 +8,7 @@ use crate::disposable_worker_reconciler::{
     DisposableAttemptId, DisposableAttemptPhase, DisposableHostUsage, DisposableWorkerResources,
 };
 use crate::github_scale_set_protocol::{
-    ScaleSetJobId, ScaleSetJobResult, ScaleSetRunnerId, ScaleSetRunnerName, ScaleSetRunnerReference,
+    ScaleSetJobId, ScaleSetJobResult, ScaleSetRunnerReference,
 };
 
 pub const DISPOSABLE_ATTEMPT_CATALOG_SCHEMA_VERSION: u8 = 1;
