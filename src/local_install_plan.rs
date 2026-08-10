@@ -291,8 +291,12 @@ pub struct LauncherSwitchPlan {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "decision", rename_all = "snake_case")]
 pub enum LocalInstallDecision {
-    BuildRequired { plan: LocalInstallBuildPlan },
-    SwitchLauncher { plan: LauncherSwitchPlan },
+    BuildRequired {
+        plan: LocalInstallBuildPlan,
+    },
+    SwitchLauncher {
+        plan: LauncherSwitchPlan,
+    },
     Satisfied {
         generation: LocalInstallGenerationIdentity,
         location: LauncherLocationClass,
@@ -377,17 +381,13 @@ pub fn plan_local_install(
         });
     };
     if accepted.source != *source {
-        let target_generation = accepted
-            .identity
-            .number
-            .checked_add(1)
-            .ok_or_else(|| {
-                error(
-                    LocalInstallPlanErrorKind::GenerationExhausted,
-                    "generation_exhausted",
-                    "local install generation number is exhausted",
-                )
-            })?;
+        let target_generation = accepted.identity.number.checked_add(1).ok_or_else(|| {
+            error(
+                LocalInstallPlanErrorKind::GenerationExhausted,
+                "generation_exhausted",
+                "local install generation number is exhausted",
+            )
+        })?;
         return Ok(LocalInstallDecision::BuildRequired {
             plan: LocalInstallBuildPlan {
                 target_generation,
@@ -591,11 +591,9 @@ pub fn plan_local_install_rollback(
         LocalInstallDecision::Satisfied { location, .. } => {
             RollbackLauncherRequirement::AlreadyPointsToTarget { location }
         }
-        LocalInstallDecision::SwitchLauncher { plan } => {
-            RollbackLauncherRequirement::Switch {
-                location: plan.location,
-            }
-        }
+        LocalInstallDecision::SwitchLauncher { plan } => RollbackLauncherRequirement::Switch {
+            location: plan.location,
+        },
         LocalInstallDecision::ElevationRequired { location, .. } => {
             RollbackLauncherRequirement::Elevation { location }
         }
@@ -764,13 +762,9 @@ mod tests {
         assert_eq!(first_source, second_source);
 
         let state = LocalInstallState::new(None, Vec::new()).expect("state");
-        let LocalInstallDecision::BuildRequired { plan } = plan_local_install(
-            &state,
-            &first_source,
-            LocalInstallPlatform::Macos,
-            &[],
-        )
-        .expect("plan")
+        let LocalInstallDecision::BuildRequired { plan } =
+            plan_local_install(&state, &first_source, LocalInstallPlatform::Macos, &[])
+                .expect("plan")
         else {
             panic!("expected build")
         };
@@ -784,25 +778,17 @@ mod tests {
     fn source_changes_produce_monotonic_build_plan_and_conflicting_evidence_fails() {
         let initial_source = source('a');
         let state = LocalInstallState::new(None, Vec::new()).expect("state");
-        let LocalInstallDecision::BuildRequired { plan } = plan_local_install(
-            &state,
-            &initial_source,
-            LocalInstallPlatform::Macos,
-            &[],
-        )
-        .expect("initial plan")
+        let LocalInstallDecision::BuildRequired { plan } =
+            plan_local_install(&state, &initial_source, LocalInstallPlatform::Macos, &[])
+                .expect("initial plan")
         else {
             panic!("expected build")
         };
         let installed = build_generation(&plan, 'b');
         let state = LocalInstallState::new(Some(installed.clone()), Vec::new()).expect("state");
-        let LocalInstallDecision::BuildRequired { plan } = plan_local_install(
-            &state,
-            &source('c'),
-            LocalInstallPlatform::Macos,
-            &[],
-        )
-        .expect("upgrade plan")
+        let LocalInstallDecision::BuildRequired { plan } =
+            plan_local_install(&state, &source('c'), LocalInstallPlatform::Macos, &[])
+                .expect("upgrade plan")
         else {
             panic!("expected upgrade build")
         };
@@ -828,13 +814,8 @@ mod tests {
     fn accepted_source_skips_build_and_safe_launcher_converges() {
         let wanted = source('a');
         let initial = LocalInstallState::new(None, Vec::new()).expect("state");
-        let LocalInstallDecision::BuildRequired { plan } = plan_local_install(
-            &initial,
-            &wanted,
-            LocalInstallPlatform::Macos,
-            &[],
-        )
-        .expect("build")
+        let LocalInstallDecision::BuildRequired { plan } =
+            plan_local_install(&initial, &wanted, LocalInstallPlatform::Macos, &[]).expect("build")
         else {
             panic!("expected build")
         };
@@ -880,7 +861,10 @@ mod tests {
             LauncherDirectoryDisposition::ReadyUserOwned,
             LauncherEntryDisposition::Absent,
         );
-        for entry in [LauncherEntryDisposition::Foreign, LauncherEntryDisposition::Unknown] {
+        for entry in [
+            LauncherEntryDisposition::Foreign,
+            LauncherEntryDisposition::Unknown,
+        ] {
             let first = launcher(
                 LauncherLocationClass::HomebrewBin,
                 0,
@@ -1047,13 +1031,9 @@ mod tests {
     fn rollback_targets_only_retained_verified_generation_and_uses_same_launcher_rules() {
         let first_source = source('a');
         let empty = LocalInstallState::new(None, Vec::new()).expect("empty");
-        let LocalInstallDecision::BuildRequired { plan } = plan_local_install(
-            &empty,
-            &first_source,
-            LocalInstallPlatform::Macos,
-            &[],
-        )
-        .expect("first plan")
+        let LocalInstallDecision::BuildRequired { plan } =
+            plan_local_install(&empty, &first_source, LocalInstallPlatform::Macos, &[])
+                .expect("first plan")
         else {
             panic!("expected build")
         };
@@ -1070,7 +1050,8 @@ mod tests {
             panic!("expected upgrade")
         };
         let second = build_generation(&plan, 'd');
-        let state = LocalInstallState::new(Some(second.clone()), vec![first.clone()]).expect("state");
+        let state =
+            LocalInstallState::new(Some(second.clone()), vec![first.clone()]).expect("state");
         let stale = launcher(
             LauncherLocationClass::HomeLocalBin,
             0,
@@ -1143,7 +1124,10 @@ mod tests {
             "proxy",
             "credential",
         ] {
-            assert!(!public.contains(private), "leaked private marker: {private}");
+            assert!(
+                !public.contains(private),
+                "leaked private marker: {private}"
+            );
         }
     }
 }
