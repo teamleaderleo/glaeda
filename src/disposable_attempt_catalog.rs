@@ -9,6 +9,13 @@ use crate::disposable_worker_reconciler::{
 };
 use crate::github_scale_set_protocol::{ScaleSetJobId, ScaleSetJobResult, ScaleSetRunnerReference};
 
+mod codec;
+pub use codec::{
+    DisposableAttemptCatalogCodecError, DisposableAttemptCatalogCodecErrorKind,
+    MAX_DISPOSABLE_ATTEMPT_CATALOG_DOCUMENT_BYTES, decode_disposable_attempt_catalog,
+    encode_disposable_attempt_catalog,
+};
+
 pub const DISPOSABLE_ATTEMPT_CATALOG_SCHEMA_VERSION: u8 = 1;
 pub const MAX_ACTIVE_DISPOSABLE_ATTEMPTS: usize = 64;
 pub const MAX_DISPOSABLE_ATTEMPT_TOMBSTONES: usize = 64;
