@@ -143,6 +143,12 @@ impl UnixPersonalWorkerLimaAuthorityGuard {
         // or authority entry. Close the child-directory durability window before trusting any
         // visible entry, then classify both documents before recovering either one.
         synchronize_directory(&store.directory, "personal worker store directory")?;
+        if let Err(error) = super::disposable_attempt_catalog::refuse_unsettled(&store) {
+            if error.kind() == PersonalWorkerStoreErrorKind::RevisionConflict {
+                return Err(authority_recovery_required());
+            }
+            return Err(error.into());
+        }
         let current_authority = load_authority(&store, AUTHORITY_DOCUMENT)?;
         let staged_authority = load_authority(&store, STAGED_AUTHORITY_DOCUMENT)?;
         let current_worker = store.load_named(CURRENT_DOCUMENT)?;
@@ -374,7 +380,7 @@ fn recover_prepared_settlement(
                 return Err(authority_recovery_required());
             }
             store.synchronize_existing_staged(&staged_worker)?;
-            let mut stage = StagedDocument::existing(store.directory.as_fd());
+            let mut stage = StagedDocument::existing(store.directory.as_fd(), STAGED_DOCUMENT);
             store.publish_staged(&mut stage, false)?;
         } else {
             let mut stage = store.stage_document(&successor)?;

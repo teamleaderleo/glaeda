@@ -153,6 +153,52 @@ impl DisposableAttemptState {
         self.not_after
     }
 
+    pub(crate) fn is_exact_successor_of(&self, current: &Self) -> bool {
+        let matches = |candidate: Result<Self, DisposableAttemptStateError>| {
+            candidate.as_ref().is_ok_and(|candidate| candidate == self)
+        };
+        if matches(current.begin_provisioning())
+            || matches(current.begin_registration())
+            || matches(current.begin_cleanup())
+            || matches(current.advance_cleanup(self.phase))
+        {
+            return true;
+        }
+
+        let runner = self
+            .runner_id
+            .map(|id| ScaleSetRunnerReference::new(id, self.runner_name.clone()));
+        if let Some(runner) = runner.as_ref()
+            && (matches(current.record_registration(runner))
+                || matches(current.record_runner_ready(runner)))
+        {
+            return true;
+        }
+        if let Some(job_id) = self.github_job_id.as_ref() {
+            if matches(current.record_assigned(job_id.clone())) {
+                return true;
+            }
+            if let Some(runner) = runner.as_ref()
+                && matches(current.record_running(runner, job_id.clone()))
+            {
+                return true;
+            }
+            if let Some(result) = self.result.as_ref()
+                && (matches(current.record_terminal(None, job_id.clone(), result.clone()))
+                    || runner.as_ref().is_some_and(|runner| {
+                        matches(current.record_terminal(
+                            Some(runner),
+                            job_id.clone(),
+                            result.clone(),
+                        ))
+                    }))
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn begin_provisioning(&self) -> Result<Self, DisposableAttemptStateError> {
         self.advance_phase(
             DisposableAttemptPhase::Reserved,

@@ -415,6 +415,52 @@ impl DisposableAttemptCatalogDocument {
         self.host_usage()?;
         Ok(())
     }
+
+    pub(crate) fn validate_successor_of(
+        &self,
+        current: &Self,
+    ) -> Result<(), DisposableAttemptCatalogError> {
+        current.validate()?;
+        self.validate()?;
+        if self.revision != current.revision.next()? {
+            return Err(invalid_store_successor());
+        }
+
+        let reservation = self
+            .active
+            .last()
+            .filter(|_| self.active.len() == current.active.len() + 1)
+            .and_then(|reservation| current.reserve(reservation.clone()).ok())
+            .is_some_and(|candidate| candidate == *self);
+        let transition =
+            if self.active.len() == current.active.len() && self.tombstones == current.tombstones {
+                let mut changes = self
+                    .active
+                    .iter()
+                    .zip(&current.active)
+                    .filter(|(next, prior)| next != prior);
+                changes.next().is_some_and(|(next, prior)| {
+                    changes.next().is_none()
+                        && next.resources == prior.resources
+                        && next.attempt.is_exact_successor_of(&prior.attempt)
+                })
+            } else {
+                false
+            };
+        let retirement = current.active.iter().any(|reservation| {
+            current
+                .retire_complete(
+                    reservation.attempt.attempt_id(),
+                    reservation.attempt.revision(),
+                )
+                .is_ok_and(|candidate| candidate == *self)
+        });
+        if reservation || transition || retirement {
+            Ok(())
+        } else {
+            Err(invalid_store_successor())
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -469,6 +515,11 @@ impl DisposableAttemptCatalogWriteReceipt {
 }
 
 pub trait DisposableAttemptCatalogStore {
+    /// Recover or refuse any unsettled durable publication before a mutation reads current state.
+    fn recover(&mut self) -> Result<(), DisposableAttemptCatalogError> {
+        Ok(())
+    }
+
     fn load(
         &self,
     ) -> Result<Option<DisposableAttemptCatalogDocument>, DisposableAttemptCatalogError>;
@@ -517,6 +568,7 @@ impl<S: DisposableAttemptCatalogStore> DisposableAttemptCatalog<S> {
         ),
         DisposableAttemptCatalogError,
     > {
+        self.store.recover()?;
         if let Some(current) = self.store.load()? {
             current.validate()?;
             return Ok((
@@ -529,8 +581,22 @@ impl<S: DisposableAttemptCatalogStore> DisposableAttemptCatalog<S> {
             ));
         }
         let document = DisposableAttemptCatalogDocument::empty();
-        let receipt = self.store.create(&document)?;
-        Ok((document, receipt))
+        match self.store.create(&document) {
+            Ok(receipt) => Ok((document, receipt)),
+            Err(error) if error.kind() == DisposableAttemptCatalogErrorKind::AlreadyExists => {
+                let current = self.store.load()?.ok_or(error)?;
+                current.validate()?;
+                Ok((
+                    current.clone(),
+                    DisposableAttemptCatalogWriteReceipt::new(
+                        DisposableAttemptCatalogWriteDisposition::Satisfied,
+                        current.revision(),
+                        None,
+                    ),
+                ))
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Load and validate the current catalog without mutation.
@@ -564,6 +630,7 @@ impl<S: DisposableAttemptCatalogStore> DisposableAttemptCatalog<S> {
         ),
         DisposableAttemptCatalogError,
     > {
+        self.store.recover()?;
         let current = self.load()?;
         require_catalog_revision(&current, expected_catalog_revision)?;
         let next = current.reserve(reservation.clone())?;
@@ -603,6 +670,7 @@ impl<S: DisposableAttemptCatalogStore> DisposableAttemptCatalog<S> {
         ),
         DisposableAttemptCatalogError,
     > {
+        self.store.recover()?;
         let current = self.load()?;
         require_catalog_revision(&current, expected_catalog_revision)?;
         let next = current.replace_attempt(attempt_id, expected_attempt_revision, action)?;
@@ -644,6 +712,7 @@ impl<S: DisposableAttemptCatalogStore> DisposableAttemptCatalog<S> {
         ),
         DisposableAttemptCatalogError,
     > {
+        self.store.recover()?;
         let current = self.load()?;
         require_catalog_revision(&current, expected_catalog_revision)?;
         let next = current.retire_complete(attempt_id, expected_attempt_revision)?;
@@ -683,6 +752,9 @@ impl DisposableAttemptCatalogStore for MemoryDisposableAttemptCatalogStore {
             ));
         }
         document.validate()?;
+        if document != &DisposableAttemptCatalogDocument::empty() {
+            return Err(invalid_store_successor());
+        }
         self.document = Some(document.clone());
         Ok(DisposableAttemptCatalogWriteReceipt::new(
             DisposableAttemptCatalogWriteDisposition::Created,
@@ -708,14 +780,7 @@ impl DisposableAttemptCatalogStore for MemoryDisposableAttemptCatalogStore {
                 current.revision(),
             ));
         }
-        let required_revision = expected_revision.next()?;
-        if document.revision() != required_revision {
-            return Err(catalog_error(
-                DisposableAttemptCatalogErrorKind::Conflict,
-                "replacement catalog revision must advance exactly once",
-            ));
-        }
-        document.validate()?;
+        document.validate_successor_of(current)?;
         self.document = Some(document.clone());
         Ok(DisposableAttemptCatalogWriteReceipt::new(
             DisposableAttemptCatalogWriteDisposition::Replaced,
@@ -735,6 +800,11 @@ pub enum DisposableAttemptCatalogErrorKind {
     InvalidAction,
     LimitExceeded,
     CorruptState,
+    Busy,
+    Io,
+    UnsafeFilesystem,
+    VersionIncompatible,
+    RecoveryRequired,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -752,6 +822,14 @@ impl DisposableAttemptCatalogError {
     #[must_use]
     pub const fn message(&self) -> &'static str {
         self.message
+    }
+
+    #[must_use]
+    pub(crate) const fn from_store(
+        kind: DisposableAttemptCatalogErrorKind,
+        message: &'static str,
+    ) -> Self {
+        Self { kind, message }
     }
 }
 
@@ -848,6 +926,13 @@ fn resource_overflow() -> DisposableAttemptCatalogError {
     catalog_error(
         DisposableAttemptCatalogErrorKind::LimitExceeded,
         "durable disposable resource usage exceeds the bounded host envelope",
+    )
+}
+
+fn invalid_store_successor() -> DisposableAttemptCatalogError {
+    catalog_error(
+        DisposableAttemptCatalogErrorKind::Conflict,
+        "replacement catalog is not one exact authorized successor",
     )
 }
 

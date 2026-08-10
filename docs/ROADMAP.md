@@ -120,15 +120,16 @@ This gate is meant to shrink custom code, not delay the first worker indefinitel
 
 ## Milestone 1 — durable disposable-attempt reconciliation
 
-The pure core has landed; M1 now needs persistence and protocol corrections around it.
+The pure core, bounded Scale Set protocol identities, canonical attempt codec, and crash-safe Unix
+catalog have landed. M1 now needs the final checkpoint fault matrix before the physical adapters.
 
 - [x] Define a small phase graph from reservation through provisioning, registration, assignment, execution, teardown, deregistration, release, and completion.
 - [x] Emit one idempotent next action per reconciliation tick.
 - [x] Enforce concurrency, CPU, memory, and disk budgets before additional workers are admitted.
 - [x] Model cancellation, expiry, reservation loss, runner loss, missing/orphan VM state, duplicate/out-of-order job events, and cleanup ordering.
-- [ ] Persist the attempt through the existing crash-safe state machinery with exact revisions and recovery semantics.
-- [ ] Split prechosen runner name from GitHub-assigned runner ID so ambiguous JIT registration can recover by stable identity.
-- [ ] Preserve Scale Set job identity and result as bounded protocol values instead of assuming narrower REST/enum forms.
+- [x] Persist the attempt through the existing crash-safe state machinery with exact revisions and recovery semantics.
+- [x] Split prechosen runner name from GitHub-assigned runner ID so ambiguous JIT registration can recover by stable identity.
+- [x] Preserve Scale Set job identity and result as bounded protocol values instead of assuming narrower REST/enum forms.
 - [ ] Cover crash-after-every-checkpoint, completion-before-assignment, unknown completion strings, stale registration, and scale-to-zero in deterministic persistence tests.
 
 **M1 acceptance:** killing the controller at every lifecycle boundary and restarting it never creates a second worker for the same attempt, loses owned cleanup debt, or releases capacity before cleanup is proven.

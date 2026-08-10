@@ -14,6 +14,9 @@ mod lima_host_identity_support;
 use lima_host_identity_support::LimaHostIdentityFixture;
 
 use smolrunner::artifact::{CommitId, GitTreeId, RepositoryRef, Sha256Digest};
+use smolrunner::disposable_attempt_catalog::{
+    DisposableAttemptCatalogDocument, encode_disposable_attempt_catalog,
+};
 use smolrunner::execution_admission::{
     EpochMillis, ExecutionRequestId, ExecutionResourceLimits, HostCapacityObservation,
     RunnerProfileId,
@@ -1852,6 +1855,48 @@ fn unix_sidecar_poisoned_publication_guard_cannot_retry_after_ambiguous_failure(
             .expect_err("poisoned guard cannot retry")
             .kind(),
         UnixPersonalWorkerLimaAuthorityErrorKind::RecoveryRequired
+    );
+}
+
+#[test]
+fn unix_sidecar_refuses_unsettled_disposable_catalog_before_recovery() {
+    let root = TempStateRoot::new();
+    let worker = PersonalWorkerStoreDocument::new(
+        PersonalWorkerQueueInput {
+            generation: PersonalWorkerQueueGeneration::new(1).expect("generation"),
+            observed_at: epoch(90_000),
+            profile_observation: PersonalWorkerProfileObservation::Unobserved,
+            activity_evidence: PersonalWorkerActivityEvidence::Never,
+            queued: Vec::new(),
+            active: Vec::new(),
+            pending_profile_change: None,
+        },
+        Vec::new(),
+    )
+    .expect("initial worker");
+    UnixPersonalWorkerStore::initialize_if_clean(root.path(), &worker)
+        .expect("initialize worker store");
+
+    let stage = root
+        .path()
+        .join("personal-worker/.disposable-attempt-catalog.next.json");
+    fs::write(
+        &stage,
+        encode_disposable_attempt_catalog(&DisposableAttemptCatalogDocument::empty())
+            .expect("canonical empty catalog"),
+    )
+    .expect("write staged catalog");
+    fs::set_permissions(&stage, fs::Permissions::from_mode(0o600)).expect("private stage");
+
+    let error = UnixPersonalWorkerLimaAuthorityGuard::open(root.path())
+        .expect_err("unsettled disposable catalog must block Lima authority");
+    assert_eq!(
+        error.kind(),
+        UnixPersonalWorkerLimaAuthorityErrorKind::RecoveryRequired
+    );
+    assert!(
+        stage.exists(),
+        "refusal must preserve catalog recovery evidence"
     );
 }
 

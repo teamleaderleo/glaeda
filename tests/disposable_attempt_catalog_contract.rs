@@ -1,8 +1,8 @@
 use smolrunner::disposable_attempt_catalog::{
     DisposableAttemptCatalog, DisposableAttemptCatalogAction, DisposableAttemptCatalogDocument,
-    DisposableAttemptCatalogErrorKind, DisposableAttemptCatalogWriteDisposition,
-    DisposableAttemptReservation, MAX_ACTIVE_DISPOSABLE_ATTEMPTS,
-    MemoryDisposableAttemptCatalogStore,
+    DisposableAttemptCatalogErrorKind, DisposableAttemptCatalogStore,
+    DisposableAttemptCatalogWriteDisposition, DisposableAttemptReservation,
+    MAX_ACTIVE_DISPOSABLE_ATTEMPTS, MemoryDisposableAttemptCatalogStore,
 };
 use smolrunner::disposable_attempt_state::{DisposableAttemptRevision, DisposableAttemptState};
 use smolrunner::disposable_worker_reconciler::{
@@ -95,6 +95,47 @@ fn initialization_and_exact_duplicate_reservation_are_idempotent() {
         DisposableAttemptCatalogWriteDisposition::Satisfied
     );
     assert_eq!(duplicate_receipt.catalog_revision, reserved.revision());
+}
+
+#[test]
+fn raw_store_refuses_unrelated_revision_successors() {
+    let (mut first_catalog, first_empty) = initialized();
+    let (first_reserved, _) = first_catalog
+        .reserve(first_empty.revision(), reservation(1))
+        .unwrap();
+
+    let (mut second_catalog, second_empty) = initialized();
+    let (second_reserved, _) = second_catalog
+        .reserve(second_empty.revision(), reservation(2))
+        .unwrap();
+    let unrelated = transition(
+        &mut second_catalog,
+        &second_reserved,
+        2,
+        DisposableAttemptCatalogAction::BeginProvisioning,
+    );
+    assert_eq!(
+        unrelated.revision().get(),
+        first_reserved.revision().get() + 1
+    );
+
+    let mut store = MemoryDisposableAttemptCatalogStore::default();
+    assert_eq!(
+        store
+            .create(&first_reserved)
+            .expect_err("raw create must accept only the exact empty catalog")
+            .kind(),
+        DisposableAttemptCatalogErrorKind::Conflict
+    );
+    store.create(&first_empty).unwrap();
+    store
+        .replace_if_revision(first_empty.revision(), &first_reserved)
+        .unwrap();
+    let error = store
+        .replace_if_revision(first_reserved.revision(), &unrelated)
+        .expect_err("revision alone must not authorize an unrelated catalog");
+    assert_eq!(error.kind(), DisposableAttemptCatalogErrorKind::Conflict);
+    assert_eq!(store.load().unwrap(), Some(first_reserved));
 }
 
 #[test]
