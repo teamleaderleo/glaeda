@@ -26,8 +26,7 @@ impl LocalInstallToolchainIdentity {
     ///
     /// # Errors
     ///
-    /// Returns a bounded error unless the value is non-empty ASCII without whitespace/control
-    /// characters and uses the reviewed toolchain token vocabulary.
+    /// Returns an error unless the value is bounded ASCII using the reviewed token vocabulary.
     pub fn parse(value: &str) -> Result<Self, LocalInstallPlanError> {
         if value.is_empty()
             || value.len() > MAX_LOCAL_INSTALL_TOOLCHAIN_BYTES
@@ -36,7 +35,11 @@ impl LocalInstallToolchainIdentity {
                 byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'+' | b'-')
             })
         {
-            return Err(invalid_toolchain());
+            return Err(error(
+                LocalInstallPlanErrorKind::InvalidToolchain,
+                "invalid_toolchain",
+                "local install toolchain identity is invalid",
+            ));
         }
         Ok(Self(value.to_owned()))
     }
@@ -57,24 +60,33 @@ pub struct LocalInstallSourceIdentity {
 }
 
 impl LocalInstallSourceIdentity {
-    /// Bind one exact source checkout and toolchain to a canonical local-install source identity.
+    /// Bind exact checkout, lockfile, and toolchain evidence to one canonical source identity.
     ///
     /// # Errors
     ///
-    /// Returns a bounded error only when canonical identity encoding fails.
+    /// Returns an error only when canonical identity encoding fails.
     pub fn new(
         commit: CommitId,
         tree: GitTreeId,
         cargo_lock_digest: Sha256Digest,
         toolchain: LocalInstallToolchainIdentity,
     ) -> Result<Self, LocalInstallPlanError> {
-        let canonical = LocalInstallSourceDigestDocument {
-            commit: &commit,
-            tree: &tree,
-            cargo_lock_digest: &cargo_lock_digest,
-            toolchain: &toolchain,
-        };
-        let digest = canonical_digest(SOURCE_DIGEST_DOMAIN, &canonical)?;
+        #[derive(Serialize)]
+        struct Document<'a> {
+            commit: &'a CommitId,
+            tree: &'a GitTreeId,
+            cargo_lock_digest: &'a Sha256Digest,
+            toolchain: &'a LocalInstallToolchainIdentity,
+        }
+        let digest = canonical_digest(
+            SOURCE_DIGEST_DOMAIN,
+            &Document {
+                commit: &commit,
+                tree: &tree,
+                cargo_lock_digest: &cargo_lock_digest,
+                toolchain: &toolchain,
+            },
+        )?;
         Ok(Self {
             commit,
             tree,
@@ -109,7 +121,7 @@ pub struct LocalInstallState {
 }
 
 impl LocalInstallState {
-    /// Construct bounded accepted/retained local-install state.
+    /// Construct bounded accepted and retained local-install state.
     ///
     /// # Errors
     ///
@@ -119,7 +131,11 @@ impl LocalInstallState {
         retained: Vec<InstalledLocalBinaryGeneration>,
     ) -> Result<Self, LocalInstallPlanError> {
         if retained.len() > MAX_RETAINED_LOCAL_INSTALL_GENERATIONS {
-            return Err(retained_generation_limit());
+            return Err(error(
+                LocalInstallPlanErrorKind::RetainedGenerationLimit,
+                "retained_generation_limit",
+                "local install retained-generation limit was exceeded",
+            ));
         }
         let mut identities = BTreeSet::new();
         if let Some(current) = accepted.as_ref() {
@@ -127,7 +143,11 @@ impl LocalInstallState {
         }
         for generation in &retained {
             if !identities.insert(generation.identity.clone()) {
-                return Err(duplicate_generation_identity());
+                return Err(error(
+                    LocalInstallPlanErrorKind::DuplicateGenerationIdentity,
+                    "duplicate_generation_identity",
+                    "local install state contains a duplicate generation identity",
+                ));
             }
         }
         Ok(Self { accepted, retained })
@@ -191,8 +211,16 @@ impl LauncherLocationObservation {
         directory: LauncherDirectoryDisposition,
         entry: LauncherEntryDisposition,
     ) -> Result<Self, LocalInstallPlanError> {
-        if in_path != path_rank.is_some() {
-            return Err(invalid_launcher_observation());
+        if in_path != path_rank.is_some()
+            || (!in_path && !matches!(entry, LauncherEntryDisposition::Absent))
+            || (directory == LauncherDirectoryDisposition::Unavailable
+                && !matches!(entry, LauncherEntryDisposition::Absent))
+        {
+            return Err(error(
+                LocalInstallPlanErrorKind::InvalidLauncherObservation,
+                "invalid_launcher_observation",
+                "approved launcher observation is internally inconsistent",
+            ));
         }
         Ok(Self {
             location,
@@ -226,7 +254,7 @@ impl BuiltLocalBinaryEvidence {
     ///
     /// # Errors
     ///
-    /// Returns an error for an empty, oversized, non-ASCII, or control-containing version.
+    /// Returns an error for an invalid binary version string.
     pub fn new(
         source_digest: Sha256Digest,
         predecessor: Option<LocalInstallGenerationIdentity>,
@@ -239,7 +267,11 @@ impl BuiltLocalBinaryEvidence {
             || !binary_version.is_ascii()
             || binary_version.bytes().any(|byte| byte.is_ascii_control())
         {
-            return Err(invalid_binary_version());
+            return Err(error(
+                LocalInstallPlanErrorKind::InvalidBinaryVersion,
+                "invalid_binary_version",
+                "local install binary version is invalid",
+            ));
         }
         Ok(Self {
             source_digest,
@@ -349,7 +381,13 @@ pub fn plan_local_install(
             .identity
             .number
             .checked_add(1)
-            .ok_or_else(generation_exhausted)?;
+            .ok_or_else(|| {
+                error(
+                    LocalInstallPlanErrorKind::GenerationExhausted,
+                    "generation_exhausted",
+                    "local install generation number is exhausted",
+                )
+            })?;
         return Ok(LocalInstallDecision::BuildRequired {
             plan: LocalInstallBuildPlan {
                 target_generation,
@@ -373,17 +411,32 @@ pub fn complete_local_install_build(
     if evidence.source_digest != plan.source.digest
         || evidence.predecessor != plan.expected_predecessor
     {
-        return Err(build_evidence_conflict());
+        return Err(error(
+            LocalInstallPlanErrorKind::BuildEvidenceConflict,
+            "build_evidence_conflict",
+            "local install build evidence does not match the exact build plan",
+        ));
     }
-    let canonical = LocalInstallGenerationDigestDocument {
-        schema_version: LOCAL_INSTALL_PLAN_SCHEMA_VERSION,
-        number: plan.target_generation,
-        predecessor: &plan.expected_predecessor,
-        source: &plan.source,
-        binary_digest: &evidence.binary_digest,
-        binary_version: &evidence.binary_version,
-    };
-    let digest = canonical_digest(GENERATION_DIGEST_DOMAIN, &canonical)?;
+    #[derive(Serialize)]
+    struct Document<'a> {
+        schema_version: u8,
+        number: u64,
+        predecessor: &'a Option<LocalInstallGenerationIdentity>,
+        source: &'a LocalInstallSourceIdentity,
+        binary_digest: &'a Sha256Digest,
+        binary_version: &'a str,
+    }
+    let digest = canonical_digest(
+        GENERATION_DIGEST_DOMAIN,
+        &Document {
+            schema_version: LOCAL_INSTALL_PLAN_SCHEMA_VERSION,
+            number: plan.target_generation,
+            predecessor: &plan.expected_predecessor,
+            source: &plan.source,
+            binary_digest: &evidence.binary_digest,
+            binary_version: &evidence.binary_version,
+        },
+    )?;
     Ok(InstalledLocalBinaryGeneration {
         identity: LocalInstallGenerationIdentity {
             number: plan.target_generation,
@@ -398,6 +451,12 @@ pub fn complete_local_install_build(
 
 /// Plan only the stable `smol` launcher for one already-accepted or candidate generation.
 ///
+/// The first existing launcher entry in PATH controls command resolution. A stale owned launcher at
+/// an earlier elevation-requiring location therefore produces an elevation barrier immediately;
+/// installing another launcher later in PATH would leave the stale command shadowing it. An absent
+/// elevation-requiring location does not shadow later PATH entries and may be skipped in favor of a
+/// later user-owned location.
+///
 /// # Errors
 ///
 /// Returns a bounded conflict for foreign/unknown shadowing, unsafe approved locations, invalid
@@ -408,14 +467,30 @@ pub fn plan_launcher_for_generation(
     launchers: &[LauncherLocationObservation],
 ) -> Result<LocalInstallDecision, LocalInstallPlanError> {
     let sorted = validated_launcher_observations(platform, launchers)?;
-    let mut elevation_candidate = None;
+    let mut absent_elevation_candidate = None;
     for observation in sorted {
         match &observation.entry {
-            LauncherEntryDisposition::Foreign => return Err(foreign_launcher()),
-            LauncherEntryDisposition::Unknown => return Err(unknown_launcher()),
+            LauncherEntryDisposition::Foreign => {
+                return Err(error(
+                    LocalInstallPlanErrorKind::ForeignLauncher,
+                    "foreign_launcher",
+                    "an earlier approved PATH location contains a foreign smol launcher",
+                ));
+            }
+            LauncherEntryDisposition::Unknown => {
+                return Err(error(
+                    LocalInstallPlanErrorKind::UnknownLauncher,
+                    "unknown_launcher",
+                    "an earlier approved PATH location contains an unclassified smol launcher",
+                ));
+            }
             LauncherEntryDisposition::Owned { generation_digest } => {
                 if observation.directory == LauncherDirectoryDisposition::Unsafe {
-                    return Err(unsafe_launcher_location());
+                    return Err(error(
+                        LocalInstallPlanErrorKind::UnsafeLauncherLocation,
+                        "unsafe_launcher_location",
+                        "approved launcher location is unsafe",
+                    ));
                 }
                 if generation_digest == &generation.digest {
                     return Ok(LocalInstallDecision::Satisfied {
@@ -423,21 +498,28 @@ pub fn plan_launcher_for_generation(
                         location: observation.location,
                     });
                 }
-                match observation.directory {
+                return match observation.directory {
                     LauncherDirectoryDisposition::ReadyUserOwned => {
-                        return Ok(LocalInstallDecision::SwitchLauncher {
+                        Ok(LocalInstallDecision::SwitchLauncher {
                             plan: LauncherSwitchPlan {
                                 target_generation: generation.clone(),
                                 location: observation.location,
                             },
-                        });
+                        })
                     }
                     LauncherDirectoryDisposition::NeedsElevation => {
-                        elevation_candidate.get_or_insert(observation.location);
+                        Ok(LocalInstallDecision::ElevationRequired {
+                            generation: generation.clone(),
+                            location: observation.location,
+                        })
                     }
-                    LauncherDirectoryDisposition::Unavailable => {}
+                    LauncherDirectoryDisposition::Unavailable => Err(error(
+                        LocalInstallPlanErrorKind::InvalidLauncherObservation,
+                        "invalid_launcher_observation",
+                        "owned launcher cannot exist in an unavailable location",
+                    )),
                     LauncherDirectoryDisposition::Unsafe => unreachable!(),
-                }
+                };
             }
             LauncherEntryDisposition::Absent => match observation.directory {
                 LauncherDirectoryDisposition::ReadyUserOwned => {
@@ -449,20 +531,30 @@ pub fn plan_launcher_for_generation(
                     });
                 }
                 LauncherDirectoryDisposition::NeedsElevation => {
-                    elevation_candidate.get_or_insert(observation.location);
+                    absent_elevation_candidate.get_or_insert(observation.location);
                 }
                 LauncherDirectoryDisposition::Unavailable => {}
-                LauncherDirectoryDisposition::Unsafe => return Err(unsafe_launcher_location()),
+                LauncherDirectoryDisposition::Unsafe => {
+                    return Err(error(
+                        LocalInstallPlanErrorKind::UnsafeLauncherLocation,
+                        "unsafe_launcher_location",
+                        "approved launcher location is unsafe",
+                    ));
+                }
             },
         }
     }
-    if let Some(location) = elevation_candidate {
+    if let Some(location) = absent_elevation_candidate {
         return Ok(LocalInstallDecision::ElevationRequired {
             generation: generation.clone(),
             location,
         });
     }
-    Err(no_approved_launcher_location())
+    Err(error(
+        LocalInstallPlanErrorKind::NoApprovedLauncherLocation,
+        "no_approved_launcher_location",
+        "no approved launcher location is available in PATH",
+    ))
 }
 
 /// Plan rollback to one retained verified generation through the same launcher safety rules.
@@ -477,15 +569,24 @@ pub fn plan_local_install_rollback(
     platform: LocalInstallPlatform,
     launchers: &[LauncherLocationObservation],
 ) -> Result<LocalInstallRollbackPlan, LocalInstallPlanError> {
-    let current = state
-        .accepted
-        .as_ref()
-        .ok_or_else(missing_accepted_generation)?;
+    let current = state.accepted.as_ref().ok_or_else(|| {
+        error(
+            LocalInstallPlanErrorKind::MissingAcceptedGeneration,
+            "missing_accepted_generation",
+            "local install rollback requires an accepted generation",
+        )
+    })?;
     let retained = state
         .retained
         .iter()
         .find(|generation| generation.identity == *target)
-        .ok_or_else(rollback_target_unavailable)?;
+        .ok_or_else(|| {
+            error(
+                LocalInstallPlanErrorKind::RollbackTargetUnavailable,
+                "rollback_target_unavailable",
+                "requested local install rollback generation is not retained",
+            )
+        })?;
     let launcher = match plan_launcher_for_generation(&retained.identity, platform, launchers)? {
         LocalInstallDecision::Satisfied { location, .. } => {
             RollbackLauncherRequirement::AlreadyPointsToTarget { location }
@@ -512,73 +613,85 @@ fn validated_launcher_observations(
     launchers: &[LauncherLocationObservation],
 ) -> Result<Vec<&LauncherLocationObservation>, LocalInstallPlanError> {
     if launchers.len() > MAX_LAUNCHER_OBSERVATIONS {
-        return Err(too_many_launcher_observations());
+        return Err(error(
+            LocalInstallPlanErrorKind::TooManyLauncherObservations,
+            "too_many_launcher_observations",
+            "local install launcher observation bound was exceeded",
+        ));
     }
     let mut locations = BTreeSet::new();
     let mut ranks = BTreeSet::new();
     let mut result = Vec::new();
     for observation in launchers {
-        if observation.in_path != observation.path_rank.is_some() {
-            return Err(invalid_launcher_observation());
+        if !locations.insert(observation.location) {
+            return Err(error(
+                LocalInstallPlanErrorKind::DuplicateLauncherLocation,
+                "duplicate_launcher_location",
+                "approved launcher location was observed more than once",
+            ));
         }
         if platform == LocalInstallPlatform::Linux
             && observation.location == LauncherLocationClass::HomebrewBin
         {
-            return Err(unsupported_launcher_location());
+            return Err(error(
+                LocalInstallPlanErrorKind::UnsupportedLauncherLocation,
+                "unsupported_launcher_location",
+                "Homebrew launcher location is unsupported on Linux",
+            ));
         }
-        if !locations.insert(observation.location) {
-            return Err(duplicate_launcher_location());
+        if observation.in_path != observation.path_rank.is_some() {
+            return Err(error(
+                LocalInstallPlanErrorKind::InvalidLauncherObservation,
+                "invalid_launcher_observation",
+                "approved launcher observation PATH rank is inconsistent",
+            ));
         }
-        if !observation.in_path {
-            continue;
+        if let Some(rank) = observation.path_rank {
+            if !ranks.insert(rank) {
+                return Err(error(
+                    LocalInstallPlanErrorKind::DuplicatePathRank,
+                    "duplicate_path_rank",
+                    "approved launcher observations contain duplicate PATH ranks",
+                ));
+            }
+            result.push(observation);
         }
-        let rank = observation.path_rank.ok_or_else(invalid_launcher_observation)?;
-        if !ranks.insert(rank) {
-            return Err(duplicate_path_rank());
-        }
-        result.push(observation);
     }
-    result.sort_by_key(|observation| observation.path_rank.unwrap_or(u16::MAX));
+    result.sort_by_key(|observation| observation.path_rank.expect("filtered PATH rank"));
     Ok(result)
-}
-
-#[derive(Serialize)]
-struct LocalInstallSourceDigestDocument<'a> {
-    commit: &'a CommitId,
-    tree: &'a GitTreeId,
-    cargo_lock_digest: &'a Sha256Digest,
-    toolchain: &'a LocalInstallToolchainIdentity,
-}
-
-#[derive(Serialize)]
-struct LocalInstallGenerationDigestDocument<'a> {
-    schema_version: u8,
-    number: u64,
-    predecessor: &'a Option<LocalInstallGenerationIdentity>,
-    source: &'a LocalInstallSourceIdentity,
-    binary_digest: &'a Sha256Digest,
-    binary_version: &'a str,
 }
 
 fn canonical_digest(
     domain: &[u8],
-    value: &impl Serialize,
+    document: &impl Serialize,
 ) -> Result<Sha256Digest, LocalInstallPlanError> {
-    let bytes = serde_json::to_vec(value).map_err(|_| identity_encoding_failed())?;
+    let bytes = serde_json::to_vec(document).map_err(|_| {
+        error(
+            LocalInstallPlanErrorKind::IdentityEncodingFailed,
+            "identity_encoding_failed",
+            "local install canonical identity could not be encoded",
+        )
+    })?;
     let mut hasher = Sha256::new();
     hasher.update(domain);
     hasher.update(bytes);
     let digest = hasher.finalize();
-    let mut encoded = String::with_capacity(SHA256_PREFIX.len() + digest.len() * 2);
-    encoded.push_str(SHA256_PREFIX);
+    let mut value = String::with_capacity(SHA256_PREFIX.len() + digest.len() * 2);
+    value.push_str(SHA256_PREFIX);
     for byte in digest {
-        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
-        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        value.push(char::from(HEX[usize::from(byte >> 4)]));
+        value.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
-    Sha256Digest::parse(&encoded).map_err(|_| identity_encoding_failed())
+    Sha256Digest::parse(&value).map_err(|_| {
+        error(
+            LocalInstallPlanErrorKind::IdentityEncodingFailed,
+            "identity_encoding_failed",
+            "local install canonical identity could not be encoded",
+        )
+    })
 }
 
-fn error(
+const fn error(
     kind: LocalInstallPlanErrorKind,
     code: &'static str,
     problem: &'static str,
@@ -590,346 +703,196 @@ fn error(
     }
 }
 
-fn invalid_toolchain() -> LocalInstallPlanError {
-    error(
-        LocalInstallPlanErrorKind::InvalidToolchain,
-        "invalid_toolchain",
-        "local install toolchain identity is invalid",
-    )
-}
-
-fn invalid_binary_version() -> LocalInstallPlanError {
-    error(
-        LocalInstallPlanErrorKind::InvalidBinaryVersion,
-        "invalid_binary_version",
-        "local install binary version is invalid",
-    )
-}
-
-fn identity_encoding_failed() -> LocalInstallPlanError {
-    error(
-        LocalInstallPlanErrorKind::IdentityEncodingFailed,
-        "identity_encoding_failed",
-        "local install canonical identity could not be encoded",
-    )
-}
-
-fn retained_generation_limit() -> LocalInstallPlanError {
-    error(
-        LocalInstallPlanErrorKind::RetainedGenerationLimit,
-        "retained_generation_limit",
-        "local install retained generation count exceeds the reviewed bound",
-    )
-}
-
-fn duplicate_generation_identity() -> LocalInstallPlanError {
-    error(
-        LocalInstallPlanErrorKind::DuplicateGenerationIdentity,
-        "duplicate_generation_identity",
-        "local install state contains a duplicate generation identity",
-    )
-}
-
-fn generation_exhausted() -> LocalInstallPlanError {
-    error(
-        LocalInstallPlanErrorKind::GenerationExhausted,
-        "generation_exhausted",
-        "local install generation number is exhausted",
-    )
-}
-
-fn build_evidence_conflict() -> LocalInstallPlanError {
-    error(
-        LocalInstallPlanErrorKind::BuildEvidenceConflict,
-        "build_evidence_conflict",
-        "built binary evidence does not match the exact local install build plan",
-    )
-}
-
-fn too_many_launcher_observations() -> LocalInstallPlanError {
-    error(
-        LocalInstallPlanErrorKind::TooManyLauncherObservations,
-        "too_many_launcher_observations",
-        "launcher observation count exceeds the reviewed location set",
-    )
-}
-
-fn invalid_launcher_observation() -> LocalInstallPlanError {
-    error(
-        LocalInstallPlanErrorKind::InvalidLauncherObservation,
-        "invalid_launcher_observation",
-        "launcher PATH presence and precedence evidence is inconsistent",
-    )
-}
-
-fn duplicate_launcher_location() -> LocalInstallPlanError {
-    error(
-        LocalInstallPlanErrorKind::DuplicateLauncherLocation,
-        "duplicate_launcher_location",
-        "launcher evidence repeats one approved location class",
-    )
-}
-
-fn duplicate_path_rank() -> LocalInstallPlanError {
-    error(
-        LocalInstallPlanErrorKind::DuplicatePathRank,
-        "duplicate_path_rank",
-        "launcher evidence repeats one PATH precedence rank",
-    )
-}
-
-fn unsupported_launcher_location() -> LocalInstallPlanError {
-    error(
-        LocalInstallPlanErrorKind::UnsupportedLauncherLocation,
-        "unsupported_launcher_location",
-        "launcher location class is unsupported on this platform",
-    )
-}
-
-fn foreign_launcher() -> LocalInstallPlanError {
-    error(
-        LocalInstallPlanErrorKind::ForeignLauncher,
-        "foreign_launcher",
-        "an earlier approved PATH location already contains a foreign smol launcher",
-    )
-}
-
-fn unknown_launcher() -> LocalInstallPlanError {
-    error(
-        LocalInstallPlanErrorKind::UnknownLauncher,
-        "unknown_launcher",
-        "an earlier approved PATH location has unknown smol launcher identity",
-    )
-}
-
-fn unsafe_launcher_location() -> LocalInstallPlanError {
-    error(
-        LocalInstallPlanErrorKind::UnsafeLauncherLocation,
-        "unsafe_launcher_location",
-        "an approved PATH location is unsafe for deterministic smol launcher resolution",
-    )
-}
-
-fn no_approved_launcher_location() -> LocalInstallPlanError {
-    error(
-        LocalInstallPlanErrorKind::NoApprovedLauncherLocation,
-        "no_approved_launcher_location",
-        "no reviewed launcher location is usable in the current PATH",
-    )
-}
-
-fn rollback_target_unavailable() -> LocalInstallPlanError {
-    error(
-        LocalInstallPlanErrorKind::RollbackTargetUnavailable,
-        "rollback_target_unavailable",
-        "requested local install rollback target is not a retained verified generation",
-    )
-}
-
-fn missing_accepted_generation() -> LocalInstallPlanError {
-    error(
-        LocalInstallPlanErrorKind::MissingAcceptedGeneration,
-        "missing_accepted_generation",
-        "local install rollback requires one accepted generation",
-    )
-}
-
 #[cfg(test)]
 mod tests {
-    use crate::artifact::{CommitId, GitTreeId, Sha256Digest};
+    use super::*;
 
-    use super::{
-        BuiltLocalBinaryEvidence, InstalledLocalBinaryGeneration, LauncherDirectoryDisposition,
-        LauncherEntryDisposition, LauncherLocationClass, LauncherLocationObservation,
-        LocalInstallDecision, LocalInstallGenerationIdentity, LocalInstallPlanErrorKind,
-        LocalInstallPlatform, LocalInstallSourceIdentity, LocalInstallState,
-        LocalInstallToolchainIdentity, RollbackLauncherRequirement, complete_local_install_build,
-        plan_launcher_for_generation, plan_local_install, plan_local_install_rollback,
-    };
-
-    fn digest(byte: char) -> Sha256Digest {
-        Sha256Digest::parse(&format!("sha256:{}", byte.to_string().repeat(64))).expect("digest")
+    fn digest(ch: char) -> Sha256Digest {
+        Sha256Digest::parse(&format!("sha256:{}", ch.to_string().repeat(64))).expect("digest")
     }
 
-    fn source(commit: char) -> LocalInstallSourceIdentity {
+    fn commit(ch: char) -> CommitId {
+        CommitId::parse(&ch.to_string().repeat(40)).expect("commit")
+    }
+
+    fn tree(ch: char) -> GitTreeId {
+        GitTreeId::parse(&ch.to_string().repeat(40)).expect("tree")
+    }
+
+    fn source(ch: char) -> LocalInstallSourceIdentity {
         LocalInstallSourceIdentity::new(
-            CommitId::parse(&commit.to_string().repeat(40)).expect("commit"),
-            GitTreeId::parse(&"2".repeat(40)).expect("tree"),
-            digest('a'),
-            LocalInstallToolchainIdentity::parse("1.97.1-aarch64-apple-darwin")
+            commit(ch),
+            tree(ch),
+            digest(ch),
+            LocalInstallToolchainIdentity::parse("rust-1.97.1-aarch64-apple-darwin")
                 .expect("toolchain"),
         )
         .expect("source")
     }
 
-    fn launch(
+    fn build_generation(
+        plan: &LocalInstallBuildPlan,
+        binary: char,
+    ) -> InstalledLocalBinaryGeneration {
+        complete_local_install_build(
+            plan,
+            BuiltLocalBinaryEvidence::new(
+                plan.source.digest.clone(),
+                plan.expected_predecessor.clone(),
+                digest(binary),
+                "smolrunner 0.1.0",
+            )
+            .expect("build evidence"),
+        )
+        .expect("generation")
+    }
+
+    fn launcher(
         location: LauncherLocationClass,
         rank: u16,
         directory: LauncherDirectoryDisposition,
         entry: LauncherEntryDisposition,
     ) -> LauncherLocationObservation {
         LauncherLocationObservation::new(location, true, Some(rank), directory, entry)
-            .expect("launcher observation")
-    }
-
-    fn generation(number: u64, source: LocalInstallSourceIdentity, binary: char) -> InstalledLocalBinaryGeneration {
-        let predecessor = if number > 1 {
-            Some(LocalInstallGenerationIdentity {
-                number: number - 1,
-                digest: digest('d'),
-            })
-        } else {
-            None
-        };
-        let plan = super::LocalInstallBuildPlan {
-            target_generation: number,
-            expected_predecessor: predecessor.clone(),
-            source: source.clone(),
-        };
-        complete_local_install_build(
-            &plan,
-            BuiltLocalBinaryEvidence::new(
-                source.digest.clone(),
-                predecessor,
-                digest(binary),
-                "smolrunner 0.1.0",
-            )
-            .expect("artifact evidence"),
-        )
-        .expect("generation")
+            .expect("launcher")
     }
 
     #[test]
     fn source_and_generation_identity_are_deterministic() {
-        let first_source = source('1');
-        let second_source = source('1');
+        let first_source = source('a');
+        let second_source = source('a');
         assert_eq!(first_source, second_source);
-        let first = generation(1, first_source, 'b');
-        let second = generation(1, second_source, 'b');
+
+        let state = LocalInstallState::new(None, Vec::new()).expect("state");
+        let LocalInstallDecision::BuildRequired { plan } = plan_local_install(
+            &state,
+            &first_source,
+            LocalInstallPlatform::Macos,
+            &[],
+        )
+        .expect("plan")
+        else {
+            panic!("expected build")
+        };
+        let first = build_generation(&plan, 'b');
+        let second = build_generation(&plan, 'b');
         assert_eq!(first, second);
+        assert_eq!(first.identity.number, 1);
     }
 
     #[test]
-    fn first_install_and_source_upgrade_require_exact_builds() {
-        let source_one = source('1');
-        let empty = LocalInstallState::new(None, Vec::new()).expect("empty state");
-        let LocalInstallDecision::BuildRequired { plan } = plan_local_install(
-            &empty,
-            &source_one,
-            LocalInstallPlatform::Macos,
-            &[],
-        )
-        .expect("first build") else {
-            panic!("expected build")
-        };
-        assert_eq!(plan.target_generation, 1);
-        assert!(plan.expected_predecessor.is_none());
-
-        let accepted = generation(1, source_one.clone(), 'b');
-        let state = LocalInstallState::new(Some(accepted.clone()), Vec::new()).expect("state");
+    fn source_changes_produce_monotonic_build_plan_and_conflicting_evidence_fails() {
+        let initial_source = source('a');
+        let state = LocalInstallState::new(None, Vec::new()).expect("state");
         let LocalInstallDecision::BuildRequired { plan } = plan_local_install(
             &state,
-            &source('3'),
+            &initial_source,
             LocalInstallPlatform::Macos,
             &[],
         )
-        .expect("upgrade build") else {
+        .expect("initial plan")
+        else {
+            panic!("expected build")
+        };
+        let installed = build_generation(&plan, 'b');
+        let state = LocalInstallState::new(Some(installed.clone()), Vec::new()).expect("state");
+        let LocalInstallDecision::BuildRequired { plan } = plan_local_install(
+            &state,
+            &source('c'),
+            LocalInstallPlatform::Macos,
+            &[],
+        )
+        .expect("upgrade plan")
+        else {
             panic!("expected upgrade build")
         };
         assert_eq!(plan.target_generation, 2);
-        assert_eq!(plan.expected_predecessor, Some(accepted.identity));
-    }
+        assert_eq!(plan.expected_predecessor, Some(installed.identity.clone()));
 
-    #[test]
-    fn build_evidence_must_match_source_and_predecessor() {
-        let source = source('1');
-        let plan = super::LocalInstallBuildPlan {
-            target_generation: 2,
-            expected_predecessor: Some(LocalInstallGenerationIdentity {
-                number: 1,
-                digest: digest('d'),
-            }),
-            source: source.clone(),
-        };
-        let evidence = BuiltLocalBinaryEvidence::new(
+        let bad = BuiltLocalBinaryEvidence::new(
             digest('f'),
             plan.expected_predecessor.clone(),
-            digest('b'),
+            digest('d'),
             "smolrunner 0.1.0",
         )
-        .expect("evidence");
-        let error = complete_local_install_build(&plan, evidence).expect_err("source mismatch");
-        assert_eq!(error.kind, LocalInstallPlanErrorKind::BuildEvidenceConflict);
+        .expect("bad evidence");
+        assert_eq!(
+            complete_local_install_build(&plan, bad)
+                .expect_err("source mismatch")
+                .kind,
+            LocalInstallPlanErrorKind::BuildEvidenceConflict
+        );
     }
 
     #[test]
-    fn safe_launcher_absent_or_stale_switches_and_current_is_satisfied() {
-        let generation = generation(1, source('1'), 'b');
-        let absent = [launch(
+    fn accepted_source_skips_build_and_safe_launcher_converges() {
+        let wanted = source('a');
+        let initial = LocalInstallState::new(None, Vec::new()).expect("state");
+        let LocalInstallDecision::BuildRequired { plan } = plan_local_install(
+            &initial,
+            &wanted,
+            LocalInstallPlatform::Macos,
+            &[],
+        )
+        .expect("build")
+        else {
+            panic!("expected build")
+        };
+        let installed = build_generation(&plan, 'b');
+        let state = LocalInstallState::new(Some(installed.clone()), Vec::new()).expect("state");
+
+        let absent = launcher(
             LauncherLocationClass::HomeLocalBin,
             0,
             LauncherDirectoryDisposition::ReadyUserOwned,
             LauncherEntryDisposition::Absent,
-        )];
+        );
         assert!(matches!(
-            plan_launcher_for_generation(&generation.identity, LocalInstallPlatform::Macos, &absent)
-                .expect("switch absent"),
+            plan_local_install(&state, &wanted, LocalInstallPlatform::Macos, &[absent])
+                .expect("launcher plan"),
             LocalInstallDecision::SwitchLauncher { .. }
         ));
 
-        let stale = [launch(
+        let current = launcher(
             LauncherLocationClass::HomeLocalBin,
             0,
             LauncherDirectoryDisposition::ReadyUserOwned,
             LauncherEntryDisposition::Owned {
-                generation_digest: digest('f'),
+                generation_digest: installed.identity.digest.clone(),
             },
-        )];
+        );
         assert!(matches!(
-            plan_launcher_for_generation(&generation.identity, LocalInstallPlatform::Macos, &stale)
-                .expect("switch stale"),
-            LocalInstallDecision::SwitchLauncher { .. }
-        ));
-
-        let current = [launch(
-            LauncherLocationClass::HomeLocalBin,
-            0,
-            LauncherDirectoryDisposition::ReadyUserOwned,
-            LauncherEntryDisposition::Owned {
-                generation_digest: generation.identity.digest.clone(),
-            },
-        )];
-        assert!(matches!(
-            plan_launcher_for_generation(&generation.identity, LocalInstallPlatform::Macos, &current)
+            plan_local_install(&state, &wanted, LocalInstallPlatform::Macos, &[current])
                 .expect("satisfied"),
             LocalInstallDecision::Satisfied { .. }
         ));
     }
 
     #[test]
-    fn earlier_foreign_or_unknown_launcher_blocks_later_safe_location() {
-        let generation = generation(1, source('1'), 'b');
+    fn foreign_or_unknown_earliest_launcher_blocks_later_safe_location() {
+        let generation = LocalInstallGenerationIdentity {
+            number: 1,
+            digest: digest('a'),
+        };
+        let safe_later = launcher(
+            LauncherLocationClass::HomeLocalBin,
+            1,
+            LauncherDirectoryDisposition::ReadyUserOwned,
+            LauncherEntryDisposition::Absent,
+        );
         for entry in [LauncherEntryDisposition::Foreign, LauncherEntryDisposition::Unknown] {
-            let observations = [
-                launch(
-                    LauncherLocationClass::HomeBin,
-                    0,
-                    LauncherDirectoryDisposition::ReadyUserOwned,
-                    entry,
-                ),
-                launch(
-                    LauncherLocationClass::HomeLocalBin,
-                    1,
-                    LauncherDirectoryDisposition::ReadyUserOwned,
-                    LauncherEntryDisposition::Absent,
-                ),
-            ];
+            let first = launcher(
+                LauncherLocationClass::HomebrewBin,
+                0,
+                LauncherDirectoryDisposition::ReadyUserOwned,
+                entry,
+            );
             let error = plan_launcher_for_generation(
-                &generation.identity,
+                &generation,
                 LocalInstallPlatform::Macos,
-                &observations,
+                &[first, safe_later.clone()],
             )
-            .expect_err("shadowing launcher must block");
+            .expect_err("earlier launcher must block");
             assert!(matches!(
                 error.kind,
                 LocalInstallPlanErrorKind::ForeignLauncher
@@ -939,46 +902,68 @@ mod tests {
     }
 
     #[test]
-    fn later_user_owned_location_avoids_elevation_and_elevation_is_explicit_when_needed() {
-        let generation = generation(1, source('1'), 'b');
-        let observations = [
-            launch(
-                LauncherLocationClass::UsrLocalBin,
-                0,
-                LauncherDirectoryDisposition::NeedsElevation,
-                LauncherEntryDisposition::Absent,
-            ),
-            launch(
-                LauncherLocationClass::HomeLocalBin,
-                1,
-                LauncherDirectoryDisposition::ReadyUserOwned,
-                LauncherEntryDisposition::Absent,
-            ),
-        ];
+    fn absent_elevated_slot_can_yield_to_later_user_owned_slot() {
+        let generation = LocalInstallGenerationIdentity {
+            number: 1,
+            digest: digest('a'),
+        };
+        let elevated_absent = launcher(
+            LauncherLocationClass::UsrLocalBin,
+            0,
+            LauncherDirectoryDisposition::NeedsElevation,
+            LauncherEntryDisposition::Absent,
+        );
+        let user_owned = launcher(
+            LauncherLocationClass::HomeLocalBin,
+            1,
+            LauncherDirectoryDisposition::ReadyUserOwned,
+            LauncherEntryDisposition::Absent,
+        );
         let decision = plan_launcher_for_generation(
-            &generation.identity,
+            &generation,
             LocalInstallPlatform::Macos,
-            &observations,
+            &[elevated_absent, user_owned],
         )
-        .expect("later user location");
+        .expect("later user-owned location");
         assert!(matches!(
             decision,
             LocalInstallDecision::SwitchLauncher {
-                plan: super::LauncherSwitchPlan {
+                plan: LauncherSwitchPlan {
                     location: LauncherLocationClass::HomeLocalBin,
                     ..
                 }
             }
         ));
+    }
 
-        let only_elevation = [observations[0].clone()];
+    #[test]
+    fn stale_owned_earlier_launcher_requires_repair_at_that_location() {
+        let generation = LocalInstallGenerationIdentity {
+            number: 2,
+            digest: digest('b'),
+        };
+        let stale_elevated = launcher(
+            LauncherLocationClass::UsrLocalBin,
+            0,
+            LauncherDirectoryDisposition::NeedsElevation,
+            LauncherEntryDisposition::Owned {
+                generation_digest: digest('a'),
+            },
+        );
+        let safe_later = launcher(
+            LauncherLocationClass::HomeLocalBin,
+            1,
+            LauncherDirectoryDisposition::ReadyUserOwned,
+            LauncherEntryDisposition::Absent,
+        );
+        let decision = plan_launcher_for_generation(
+            &generation,
+            LocalInstallPlatform::Macos,
+            &[stale_elevated, safe_later],
+        )
+        .expect("elevation barrier");
         assert!(matches!(
-            plan_launcher_for_generation(
-                &generation.identity,
-                LocalInstallPlatform::Macos,
-                &only_elevation,
-            )
-            .expect("elevation barrier"),
+            decision,
             LocalInstallDecision::ElevationRequired {
                 location: LauncherLocationClass::UsrLocalBin,
                 ..
@@ -987,130 +972,178 @@ mod tests {
     }
 
     #[test]
-    fn launcher_location_platform_and_path_evidence_fail_closed() {
-        let generation = generation(1, source('1'), 'b');
-        let homebrew = [launch(
+    fn no_safe_user_location_falls_back_to_earliest_absent_elevation_candidate() {
+        let generation = LocalInstallGenerationIdentity {
+            number: 1,
+            digest: digest('a'),
+        };
+        let first = launcher(
+            LauncherLocationClass::UsrLocalBin,
+            2,
+            LauncherDirectoryDisposition::NeedsElevation,
+            LauncherEntryDisposition::Absent,
+        );
+        let second = launcher(
+            LauncherLocationClass::HomebrewBin,
+            4,
+            LauncherDirectoryDisposition::NeedsElevation,
+            LauncherEntryDisposition::Absent,
+        );
+        let decision = plan_launcher_for_generation(
+            &generation,
+            LocalInstallPlatform::Macos,
+            &[second, first],
+        )
+        .expect("elevation");
+        assert!(matches!(
+            decision,
+            LocalInstallDecision::ElevationRequired {
+                location: LauncherLocationClass::UsrLocalBin,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn unsupported_homebrew_linux_and_duplicate_ranks_fail_closed() {
+        let generation = LocalInstallGenerationIdentity {
+            number: 1,
+            digest: digest('a'),
+        };
+        let homebrew = launcher(
             LauncherLocationClass::HomebrewBin,
             0,
             LauncherDirectoryDisposition::ReadyUserOwned,
             LauncherEntryDisposition::Absent,
-        )];
-        let error = plan_launcher_for_generation(
-            &generation.identity,
-            LocalInstallPlatform::Linux,
-            &homebrew,
-        )
-        .expect_err("homebrew on linux");
+        );
         assert_eq!(
-            error.kind,
+            plan_launcher_for_generation(&generation, LocalInstallPlatform::Linux, &[homebrew])
+                .expect_err("Homebrew on Linux")
+                .kind,
             LocalInstallPlanErrorKind::UnsupportedLauncherLocation
         );
 
-        let absent_from_path = [LauncherLocationObservation::new(
+        let one = launcher(
             LauncherLocationClass::HomeLocalBin,
-            false,
-            None,
+            0,
             LauncherDirectoryDisposition::ReadyUserOwned,
             LauncherEntryDisposition::Absent,
-        )
-        .expect("out of path")];
-        let error = plan_launcher_for_generation(
-            &generation.identity,
-            LocalInstallPlatform::Linux,
-            &absent_from_path,
-        )
-        .expect_err("no location in path");
+        );
+        let two = launcher(
+            LauncherLocationClass::HomeBin,
+            0,
+            LauncherDirectoryDisposition::ReadyUserOwned,
+            LauncherEntryDisposition::Absent,
+        );
         assert_eq!(
-            error.kind,
-            LocalInstallPlanErrorKind::NoApprovedLauncherLocation
+            plan_launcher_for_generation(&generation, LocalInstallPlatform::Macos, &[one, two])
+                .expect_err("duplicate rank")
+                .kind,
+            LocalInstallPlanErrorKind::DuplicatePathRank
         );
     }
 
     #[test]
-    fn rollback_targets_only_retained_verified_generation() {
-        let source = source('1');
-        let previous = generation(1, source.clone(), 'b');
-        let current = generation(2, source, 'c');
-        let state = LocalInstallState::new(Some(current.clone()), vec![previous.clone()])
-            .expect("rollback state");
-        let launchers = [launch(
+    fn rollback_targets_only_retained_verified_generation_and_uses_same_launcher_rules() {
+        let first_source = source('a');
+        let empty = LocalInstallState::new(None, Vec::new()).expect("empty");
+        let LocalInstallDecision::BuildRequired { plan } = plan_local_install(
+            &empty,
+            &first_source,
+            LocalInstallPlatform::Macos,
+            &[],
+        )
+        .expect("first plan")
+        else {
+            panic!("expected build")
+        };
+        let first = build_generation(&plan, 'b');
+        let current_state = LocalInstallState::new(Some(first.clone()), Vec::new()).expect("state");
+        let LocalInstallDecision::BuildRequired { plan } = plan_local_install(
+            &current_state,
+            &source('c'),
+            LocalInstallPlatform::Macos,
+            &[],
+        )
+        .expect("upgrade")
+        else {
+            panic!("expected upgrade")
+        };
+        let second = build_generation(&plan, 'd');
+        let state = LocalInstallState::new(Some(second.clone()), vec![first.clone()]).expect("state");
+        let stale = launcher(
             LauncherLocationClass::HomeLocalBin,
             0,
             LauncherDirectoryDisposition::ReadyUserOwned,
             LauncherEntryDisposition::Owned {
-                generation_digest: current.identity.digest.clone(),
+                generation_digest: second.identity.digest.clone(),
             },
-        )];
-        let plan = plan_local_install_rollback(
+        );
+        let rollback = plan_local_install_rollback(
             &state,
-            &previous.identity,
+            &first.identity,
             LocalInstallPlatform::Macos,
-            &launchers,
+            &[stale],
         )
-        .expect("rollback plan");
-        assert_eq!(plan.from, current.identity);
-        assert_eq!(plan.to, previous.identity);
+        .expect("rollback");
+        assert_eq!(rollback.from, second.identity);
+        assert_eq!(rollback.to, first.identity);
         assert!(matches!(
-            plan.launcher,
+            rollback.launcher,
             RollbackLauncherRequirement::Switch { .. }
         ));
-
-        let error = plan_local_install_rollback(
-            &state,
-            &LocalInstallGenerationIdentity {
-                number: 99,
-                digest: digest('f'),
-            },
-            LocalInstallPlatform::Macos,
-            &launchers,
-        )
-        .expect_err("unretained rollback");
-        assert_eq!(error.kind, LocalInstallPlanErrorKind::RollbackTargetUnavailable);
     }
 
     #[test]
-    fn generation_overflow_and_state_bounds_fail_closed() {
-        let source = source('1');
-        let accepted = generation(u64::MAX, source.clone(), 'b');
+    fn bounds_overflow_and_privacy_fail_closed() {
+        let wanted = source('a');
+        let identity = LocalInstallGenerationIdentity {
+            number: u64::MAX,
+            digest: digest('b'),
+        };
+        let accepted = InstalledLocalBinaryGeneration {
+            identity: identity.clone(),
+            predecessor: None,
+            source: source('c'),
+            binary_digest: digest('d'),
+            binary_version: "smolrunner 0.1.0".to_owned(),
+        };
         let state = LocalInstallState::new(Some(accepted), Vec::new()).expect("state");
-        let error = plan_local_install(
-            &state,
-            &source('3'),
-            LocalInstallPlatform::Macos,
-            &[],
-        )
-        .expect_err("generation overflow");
-        assert_eq!(error.kind, LocalInstallPlanErrorKind::GenerationExhausted);
+        assert_eq!(
+            plan_local_install(&state, &wanted, LocalInstallPlatform::Macos, &[])
+                .expect_err("generation overflow")
+                .kind,
+            LocalInstallPlanErrorKind::GenerationExhausted
+        );
 
-        let previous = generation(1, source.clone(), 'c');
-        let retained = vec![previous.clone(), previous];
-        let error = LocalInstallState::new(None, retained).expect_err("retained bound");
-        assert_eq!(error.kind, LocalInstallPlanErrorKind::RetainedGenerationLimit);
-    }
+        let retained = InstalledLocalBinaryGeneration {
+            identity: LocalInstallGenerationIdentity {
+                number: 1,
+                digest: digest('e'),
+            },
+            predecessor: None,
+            source: wanted.clone(),
+            binary_digest: digest('f'),
+            binary_version: "smolrunner 0.1.0".to_owned(),
+        };
+        assert_eq!(
+            LocalInstallState::new(None, vec![retained.clone(), retained])
+                .expect_err("retention bound")
+                .kind,
+            LocalInstallPlanErrorKind::RetainedGenerationLimit
+        );
 
-    #[test]
-    fn public_plan_contains_only_symbolic_location_classes() {
-        let source = source('1');
-        let state = LocalInstallState::new(None, Vec::new()).expect("state");
-        let decision = plan_local_install(
-            &state,
-            &source,
-            LocalInstallPlatform::Macos,
-            &[],
-        )
-        .expect("plan");
-        let json = serde_json::to_string(&decision).expect("public plan");
+        let public = serde_json::to_string(&wanted).expect("public source");
         for private in [
             "/Users/",
             "/home/",
-            "/opt/homebrew/bin",
-            "/usr/local/bin",
+            "HOME=",
             "CARGO_HOME",
-            "RUSTUP_HOME",
-            "PATH=",
-            "secret",
+            "RUSTFLAGS",
+            "proxy",
+            "credential",
         ] {
-            assert!(!json.contains(private), "leaked {private}");
+            assert!(!public.contains(private), "leaked private marker: {private}");
         }
     }
 }
