@@ -35,8 +35,8 @@ fn changed_template_identity() -> DisposablePreparedTemplateIdentity {
     let current = current_disposable_prepared_template().unwrap();
     let bytes = encode_disposable_prepared_template(&current).unwrap();
     let changed = String::from_utf8(bytes).unwrap().replacen(
-        "\"recipe_revision\": 1",
         "\"recipe_revision\": 2",
+        "\"recipe_revision\": 3",
         1,
     );
     decode_disposable_prepared_template(changed.as_bytes())

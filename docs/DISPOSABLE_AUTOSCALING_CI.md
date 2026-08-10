@@ -78,6 +78,10 @@ SmolRunner deliberately delegates:
 - VM isolation and lifecycle to Apple Virtualization Framework through Lima;
 - guest bootstrapping to a pinned Ubuntu cloud image and cloud-init/provisioning;
 - guest package/container behavior to Ubuntu and a rootless container engine inside the VM when required;
+- signed Ubuntu Noble repositories to install the official runner's declared dependencies during
+  template construction; this is a versioned update-stream policy, not a claim of byte-reproducible
+  package output, and APT's automatic services/timers are stopped and masked before readiness so a
+  published template or disposable clone cannot drift in the background;
 - network enforcement to a reviewed host-side firewall/egress gateway or protected guest firewall configuration, rather than executable-by-executable network attestation;
 - Mac service supervision to `launchd`;
 - initial cache/artifact transport to GitHub Actions.
@@ -95,6 +99,10 @@ Acceptance: deterministic tests cover duplicate observations, crash-after-each-c
 ### M2 — disposable Lima backend
 
 Create, start, observe, and destroy a uniquely named pinned Lima/VZ VM with fixed resources and no host integrations. Provision the pinned runner and minimal build tools into the image/template, not from repository-controlled input.
+
+Current construction input is checked in at `examples/lima/smolrunner-prepared-template.yaml`. Its exact bytes are part of the canonical prepared-template identity. Lima 2.2.0 owns cloud-init execution in plain mode; the fixed system provision downloads the pinned official runner, verifies its byte count and SHA-256 before extraction, runs that pinned archive's official dependency installer against Ubuntu's signed repositories, creates a locked non-sudo workload account, and emits a root-owned readiness marker. It consumes no repository input. Ubuntu 24.04 LTS remains the first production guest because the dated image is pinned and already exercised; moving to 26.04 is an update decision, not a prerequisite for the first end-to-end path.
+
+The next implementation boundary is durable template generation: create the uniquely named source VM from those exact bytes under a private controller-owned `LIMA_HOME` that refuses global default or override files, start it through provisioning, verify the fixed readiness marker and stopped state, and publish ownership only after the full sequence is durably checkpointed. That boundary must delete and rebuild an incomplete source instead of adopting a name or partial install.
 
 Acceptance: fake/injected executor tests first; then an explicit physical-Mac test proves create, boot, bounded control access, forced failure, destroy, orphan discovery, and zero residual VM/process/disk allocation outside the documented image cache.
 

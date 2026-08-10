@@ -11,11 +11,14 @@ use sha2::{Digest, Sha256};
 
 use crate::artifact::Sha256Digest;
 
-pub const DISPOSABLE_PREPARED_TEMPLATE_SCHEMA_VERSION: u8 = 1;
+pub const DISPOSABLE_PREPARED_TEMPLATE_SCHEMA_VERSION: u8 = 2;
 pub const MAX_DISPOSABLE_PREPARED_TEMPLATE_BYTES: usize = 16_384;
-const IDENTITY_DOMAIN: &[u8] = b"smolrunner.disposable-prepared-template.v1\0";
+pub const MAX_DISPOSABLE_LIMA_TEMPLATE_BYTES: usize = 64 * 1_024;
+const IDENTITY_DOMAIN: &[u8] = b"smolrunner.disposable-prepared-template.v2\0";
 const CURRENT_MANIFEST_BYTES: &[u8] =
     include_bytes!("../examples/lima/smolrunner-prepared-template.json");
+const CURRENT_LIMA_TEMPLATE_BYTES: &[u8] =
+    include_bytes!("../examples/lima/smolrunner-prepared-template.yaml");
 const MAX_DOWNLOAD_LOCATION_BYTES: usize = 512;
 const MAX_RUNNER_ARCHIVE_BYTES: u64 = 1 << 30;
 
@@ -54,6 +57,7 @@ pub struct DisposablePreparedTemplateManifest {
     wire: PreparedTemplateWire,
     guest_image_digest: Sha256Digest,
     actions_runner_digest: Sha256Digest,
+    lima_template_digest: Sha256Digest,
 }
 
 impl fmt::Debug for DisposablePreparedTemplateManifest {
@@ -114,8 +118,53 @@ impl DisposablePreparedTemplateManifest {
     }
 
     #[must_use]
+    pub const fn source_cpu_count(&self) -> u32 {
+        self.wire.source_resources.cpu_count
+    }
+
+    #[must_use]
+    pub const fn source_memory_bytes(&self) -> u64 {
+        self.wire.source_resources.memory_bytes
+    }
+
+    #[must_use]
+    pub const fn source_disk_bytes(&self) -> u64 {
+        self.wire.source_resources.disk_bytes
+    }
+
+    #[must_use]
     pub const fn provisioning_recipe_revision(&self) -> u64 {
         self.wire.provisioning.recipe_revision
+    }
+
+    #[must_use]
+    pub const fn lima_template_digest(&self) -> &Sha256Digest {
+        &self.lima_template_digest
+    }
+
+    #[must_use]
+    pub fn ready_marker_path(&self) -> &str {
+        &self.wire.provisioning.ready_marker_path
+    }
+
+    /// Check that one Lima template is the exact controller-owned construction input.
+    ///
+    /// This deliberately binds bytes rather than attempting to reimplement Lima or cloud-init
+    /// semantics. Lima owns parsing and provisioning after this boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded refusal when the input is oversized or differs from the manifest digest.
+    pub fn validate_lima_template(
+        &self,
+        bytes: &[u8],
+    ) -> Result<(), DisposablePreparedTemplateError> {
+        if bytes.len() > MAX_DISPOSABLE_LIMA_TEMPLATE_BYTES
+            || digest_bytes(bytes)? != self.lima_template_digest
+        {
+            return Err(unsafe_policy());
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -207,6 +256,7 @@ struct PreparedTemplateWire {
     schema_version: u8,
     guest_image: GuestImageWire,
     actions_runner: ActionsRunnerWire,
+    source_resources: SourceResourcesWire,
     provisioning: ProvisioningWire,
     isolation: IsolationWire,
 }
@@ -232,12 +282,28 @@ struct ActionsRunnerWire {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct SourceResourcesWire {
+    cpu_count: u32,
+    memory_bytes: u64,
+    disk_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ProvisioningWire {
     recipe_revision: u64,
+    lima_template_digest: String,
     admin_user: String,
+    admin_uid: u32,
+    admin_comment: String,
+    admin_passwordless_sudo: bool,
     workload_user: String,
     runner_install_directory: String,
     runner_work_directory: String,
+    ready_marker_path: String,
+    runner_dependency_install: String,
+    os_package_source: String,
+    automatic_os_updates_after_readiness: bool,
     runner_auto_update: bool,
     workload_sudo: bool,
     repository_controlled_input: bool,
@@ -249,8 +315,13 @@ struct IsolationWire {
     lima_version: String,
     vm_type: String,
     plain_mode: bool,
+    lima_global_overrides: bool,
     host_mounts: bool,
+    additional_networks: bool,
     port_forwards: bool,
+    host_resolver: bool,
+    dns_servers: Vec<String>,
+    ssh_over_vsock: bool,
     ssh_load_dot_public_keys: bool,
     ssh_agent_forwarding: bool,
     ssh_forward_x11: bool,
@@ -268,7 +339,15 @@ struct IsolationWire {
 /// Returns an error if the checked-in declaration is invalid, unsafe, or noncanonical.
 pub fn current_disposable_prepared_template()
 -> Result<DisposablePreparedTemplateManifest, DisposablePreparedTemplateError> {
-    decode_disposable_prepared_template(CURRENT_MANIFEST_BYTES)
+    let manifest = decode_disposable_prepared_template(CURRENT_MANIFEST_BYTES)?;
+    manifest.validate_lima_template(CURRENT_LIMA_TEMPLATE_BYTES)?;
+    Ok(manifest)
+}
+
+/// Return the exact checked-in Lima input whose digest is bound by the current manifest.
+#[must_use]
+pub const fn current_disposable_lima_template_bytes() -> &'static [u8] {
+    CURRENT_LIMA_TEMPLATE_BYTES
 }
 
 /// Strictly decode one canonical prepared-template declaration.
@@ -294,11 +373,12 @@ pub fn decode_disposable_prepared_template(
     }
     let wire: PreparedTemplateWire =
         serde_json::from_slice(bytes).map_err(|_| invalid_document())?;
-    let (guest_image_digest, actions_runner_digest) = validate_wire(&wire)?;
+    let (guest_image_digest, actions_runner_digest, lima_template_digest) = validate_wire(&wire)?;
     let manifest = DisposablePreparedTemplateManifest {
         wire,
         guest_image_digest,
         actions_runner_digest,
+        lima_template_digest,
     };
     if encode_disposable_prepared_template(&manifest)? != bytes {
         return Err(template_error(
@@ -324,11 +404,13 @@ pub fn encode_disposable_prepared_template(
 
 fn validate_wire(
     wire: &PreparedTemplateWire,
-) -> Result<(Sha256Digest, Sha256Digest), DisposablePreparedTemplateError> {
+) -> Result<(Sha256Digest, Sha256Digest, Sha256Digest), DisposablePreparedTemplateError> {
     let guest_image_digest =
         Sha256Digest::parse(&wire.guest_image.digest).map_err(|_| invalid_document())?;
     let actions_runner_digest =
         Sha256Digest::parse(&wire.actions_runner.digest).map_err(|_| invalid_document())?;
+    let lima_template_digest = Sha256Digest::parse(&wire.provisioning.lima_template_digest)
+        .map_err(|_| invalid_document())?;
     if wire.guest_image.architecture != "aarch64"
         || wire.guest_image.variant != "server"
         || !valid_noble_arm64_image_location(&wire.guest_image.location)
@@ -343,13 +425,26 @@ fn validate_wire(
     {
         return Err(unsafe_policy());
     }
+    if wire.source_resources.cpu_count != 2
+        || wire.source_resources.memory_bytes != 2 * (1 << 30)
+        || wire.source_resources.disk_bytes != 20 * (1 << 30)
+    {
+        return Err(unsafe_policy());
+    }
     let provisioning = &wire.provisioning;
     if provisioning.recipe_revision == 0
         || provisioning.admin_user != "smolrunner-admin"
+        || provisioning.admin_uid != 1000
+        || provisioning.admin_comment != "SmolRunner controller"
+        || !provisioning.admin_passwordless_sudo
         || provisioning.workload_user != "smolrunner-runner"
         || provisioning.admin_user == provisioning.workload_user
         || provisioning.runner_install_directory != "/opt/smolrunner/actions-runner"
         || provisioning.runner_work_directory != "/var/lib/smolrunner-runner/work"
+        || provisioning.ready_marker_path != "/etc/smolrunner/prepared-template.json"
+        || provisioning.runner_dependency_install != "official_archive_script"
+        || provisioning.os_package_source != "ubuntu_noble_signed_repositories_at_build"
+        || provisioning.automatic_os_updates_after_readiness
         || provisioning.runner_auto_update
         || provisioning.workload_sudo
         || provisioning.repository_controlled_input
@@ -360,8 +455,13 @@ fn validate_wire(
     if isolation.lima_version != "2.2.0"
         || isolation.vm_type != "vz"
         || !isolation.plain_mode
+        || isolation.lima_global_overrides
         || isolation.host_mounts
+        || isolation.additional_networks
         || isolation.port_forwards
+        || isolation.host_resolver
+        || isolation.dns_servers != ["1.1.1.1", "1.0.0.1"]
+        || !isolation.ssh_over_vsock
         || isolation.ssh_load_dot_public_keys
         || isolation.ssh_agent_forwarding
         || isolation.ssh_forward_x11
@@ -373,7 +473,16 @@ fn validate_wire(
     {
         return Err(unsafe_policy());
     }
-    Ok((guest_image_digest, actions_runner_digest))
+    Ok((
+        guest_image_digest,
+        actions_runner_digest,
+        lima_template_digest,
+    ))
+}
+
+fn digest_bytes(bytes: &[u8]) -> Result<Sha256Digest, DisposablePreparedTemplateError> {
+    Sha256Digest::parse(&format!("sha256:{:x}", Sha256::digest(bytes)))
+        .map_err(|_| invalid_document())
 }
 
 fn valid_noble_arm64_image_location(value: &str) -> bool {
@@ -454,10 +563,13 @@ mod tests {
     #[test]
     fn checked_in_manifest_is_canonical_pinned_and_domain_bound() {
         let manifest = current_disposable_prepared_template().unwrap();
-        assert_eq!(manifest.schema_version(), 1);
+        assert_eq!(manifest.schema_version(), 2);
         assert_eq!(manifest.actions_runner_version(), "2.336.0");
         assert_eq!(manifest.lima_version(), "2.2.0");
         assert_eq!(manifest.actions_runner_archive_bytes(), 138_824_064);
+        assert_eq!(manifest.source_cpu_count(), 2);
+        assert_eq!(manifest.source_memory_bytes(), 2 * (1 << 30));
+        assert_eq!(manifest.source_disk_bytes(), 20 * (1 << 30));
         assert_eq!(
             manifest.actions_runner_digest().as_str(),
             "sha256:58b758e420b87093fbd4bfddd368074960053e2f1388f01848c82624b90f27d1"
@@ -467,26 +579,40 @@ mod tests {
             "sha256:7df0201546f75b8bcc1044594c806c35749421ad3c9bc1be2a3ab806cfae39cc"
         );
         assert_eq!(
+            manifest.lima_template_digest().as_str(),
+            "sha256:f602539881c741e3db4e69a7658123db6dd5cb01ca4f755c80972e3bf8674974"
+        );
+        assert_eq!(
+            manifest.ready_marker_path(),
+            "/etc/smolrunner/prepared-template.json"
+        );
+        manifest
+            .validate_lima_template(current_disposable_lima_template_bytes())
+            .unwrap();
+        assert_eq!(
             encode_disposable_prepared_template(&manifest).unwrap(),
             CURRENT_MANIFEST_BYTES
         );
         assert_eq!(
             manifest.identity().unwrap().as_str(),
-            "sha256:573888029a9473ccbbc13de203efad50d8d301324326642e0ca8dddf11e80c6c"
+            "sha256:2da01364903b194df9bd9ecd7fdc201195251e7d1d01b620ebe644488b788f4e"
         );
     }
 
     #[test]
     fn version_precedes_new_fields_and_unknown_or_noncanonical_input_fails_closed() {
-        let mut value: serde_json::Value = serde_json::from_slice(CURRENT_MANIFEST_BYTES).unwrap();
-        value["schema_version"] = serde_json::json!(2);
-        value.as_object_mut().unwrap().remove("actions_runner");
-        assert_eq!(
-            decode_disposable_prepared_template(&serde_json::to_vec(&value).unwrap())
-                .unwrap_err()
-                .kind(),
-            DisposablePreparedTemplateErrorKind::VersionIncompatible
-        );
+        for version in [1, 3] {
+            let mut value: serde_json::Value =
+                serde_json::from_slice(CURRENT_MANIFEST_BYTES).unwrap();
+            value["schema_version"] = serde_json::json!(version);
+            value.as_object_mut().unwrap().remove("actions_runner");
+            assert_eq!(
+                decode_disposable_prepared_template(&serde_json::to_vec(&value).unwrap())
+                    .unwrap_err()
+                    .kind(),
+                DisposablePreparedTemplateErrorKind::VersionIncompatible
+            );
+        }
 
         let mut value: serde_json::Value = serde_json::from_slice(CURRENT_MANIFEST_BYTES).unwrap();
         value["unexpected"] = serde_json::json!(true);
@@ -533,9 +659,18 @@ mod tests {
                 ),
             ),
             (&["isolation", "host_mounts"][..], serde_json::json!(true)),
+            (&["isolation", "host_resolver"][..], serde_json::json!(true)),
+            (
+                &["source_resources", "disk_bytes"][..],
+                serde_json::json!(8 * (1_u64 << 30)),
+            ),
             (
                 &["provisioning", "workload_sudo"][..],
                 serde_json::json!(true),
+            ),
+            (
+                &["provisioning", "runner_dependency_install"][..],
+                serde_json::json!("repository_script"),
             ),
         ] {
             let mut value = value_without_extra();
@@ -577,12 +712,35 @@ mod tests {
         changed_manifests.push(redecode(&changed));
 
         let mut changed = baseline.clone();
-        changed.wire.provisioning.recipe_revision = 2;
+        changed.wire.provisioning.recipe_revision = 3;
         changed_manifests.push(redecode(&changed));
 
         for changed_manifest in changed_manifests {
             assert_ne!(changed_manifest.identity().unwrap(), baseline_identity);
         }
+    }
+
+    #[test]
+    fn lima_template_bytes_are_exact_and_tampering_is_refused() {
+        let manifest = current_disposable_prepared_template().unwrap();
+        let mut changed = current_disposable_lima_template_bytes().to_vec();
+        changed.push(b'\n');
+        assert_eq!(
+            manifest
+                .validate_lima_template(&changed)
+                .unwrap_err()
+                .kind(),
+            DisposablePreparedTemplateErrorKind::UnsafePolicy
+        );
+
+        let oversized = vec![b'x'; MAX_DISPOSABLE_LIMA_TEMPLATE_BYTES + 1];
+        assert_eq!(
+            manifest
+                .validate_lima_template(&oversized)
+                .unwrap_err()
+                .kind(),
+            DisposablePreparedTemplateErrorKind::UnsafePolicy
+        );
     }
 
     fn redecode(
