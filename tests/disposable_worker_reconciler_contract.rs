@@ -557,6 +557,22 @@ fn reserved_cancellation_releases_capacity_without_claiming_vm_cleanup() {
 }
 
 #[test]
+fn clone_authorization_cannot_outlive_its_capacity_reservation() {
+    let authorized = attempt().authorize_clone().unwrap();
+    for vm in [
+        DisposableVmObservation::Absent,
+        DisposableVmObservation::Ready,
+    ] {
+        let mut lost = input(&authorized, vm, ScaleSetRunnerObservation::Absent);
+        lost.capacity_reserved = false;
+        assert_eq!(
+            reconcile_attempt(lost).unwrap(),
+            persist(DisposableAttemptCatalogAction::BeginCleanup)
+        );
+    }
+}
+
+#[test]
 fn unknown_conflicting_and_identity_drift_never_authorize_mutation() {
     let state = attempt();
     assert_eq!(

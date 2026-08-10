@@ -414,8 +414,7 @@ pub fn reconcile_attempt(
     if !input.capacity_reserved
         && matches!(
             input.attempt.phase(),
-            Phase::Reserved
-                | Phase::Provisioning
+            Phase::CloneAuthorized
                 | Phase::Registering
                 | Phase::Waiting
                 | Phase::Assigned
