@@ -1,6 +1,6 @@
 use std::fmt;
 use std::fs::File;
-use std::io::{Read as _, Write as _};
+use std::io::{Read as _, Seek as _, Write as _};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -22,7 +22,7 @@ use crate::personal_worker_store::{
 /// Same-lock durable persistence for the disposable-attempt catalog.
 mod disposable_attempt_catalog;
 /// Same-lock durable persistence for prepared-template generation state.
-mod disposable_template_generation;
+pub(crate) mod disposable_template_generation;
 /// Same-lock durable persistence for the personal-worker Lima lifecycle authority.
 pub mod lima_authority;
 
@@ -48,7 +48,7 @@ const MANAGED_DIRECTORY_MODE: Mode = Mode::RUSR
     .union(Mode::RGRP)
     .union(Mode::XGRP);
 const PRIVATE_FILE_MODE: Mode = Mode::RUSR.union(Mode::WUSR);
-const STORE_DIRECTORY: &str = "personal-worker";
+pub(crate) const STORE_DIRECTORY: &str = "personal-worker";
 const STORE_LOCK_FILE: &str = "store.lock";
 const CURRENT_DOCUMENT: &str = "current.json";
 const STAGED_DOCUMENT: &str = ".next.json";

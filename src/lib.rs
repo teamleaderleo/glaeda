@@ -19,6 +19,9 @@ pub mod disposable_lima_worker;
 /// Canonical supply-chain and isolation identity for the prepared disposable VM template.
 pub mod disposable_prepared_template;
 pub mod disposable_template_generation;
+/// Same-lock bounded Lima supervisor for the disposable source-template lifecycle.
+#[cfg(unix)]
+pub mod disposable_template_runtime;
 /// Pure capacity and lifecycle reconciliation for one-job disposable workers.
 pub mod disposable_worker_reconciler;
 pub mod doctor;
