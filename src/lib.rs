@@ -182,6 +182,9 @@ pub mod project_checkout_observation;
 /// Read-only, bounded immediate-child discovery beneath one explicit project root.
 #[cfg(unix)]
 pub mod project_discovery;
+/// Pure generation and idempotent adoption planning for accepted project materializations.
+#[cfg(unix)]
+pub mod project_materialization_generation;
 pub mod renderprove_artifact_binding;
 pub mod renderprove_execution;
 #[cfg(target_os = "linux")]
