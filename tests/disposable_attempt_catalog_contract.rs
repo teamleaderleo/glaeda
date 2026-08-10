@@ -1,7 +1,8 @@
 use smolrunner::disposable_attempt_catalog::{
     DisposableAttemptCatalog, DisposableAttemptCatalogAction, DisposableAttemptCatalogDocument,
     DisposableAttemptCatalogErrorKind, DisposableAttemptCatalogWriteDisposition,
-    DisposableAttemptReservation, MemoryDisposableAttemptCatalogStore, MAX_ACTIVE_DISPOSABLE_ATTEMPTS,
+    DisposableAttemptReservation, MAX_ACTIVE_DISPOSABLE_ATTEMPTS,
+    MemoryDisposableAttemptCatalogStore,
 };
 use smolrunner::disposable_attempt_state::{DisposableAttemptRevision, DisposableAttemptState};
 use smolrunner::disposable_worker_reconciler::{
@@ -42,9 +43,13 @@ fn runner(index: usize, id: u64) -> ScaleSetRunnerReference {
 }
 
 fn initialized() -> (Catalog, DisposableAttemptCatalogDocument) {
-    let mut catalog = DisposableAttemptCatalog::new(MemoryDisposableAttemptCatalogStore::default());
+    let mut catalog =
+        DisposableAttemptCatalog::new(MemoryDisposableAttemptCatalogStore::default());
     let (document, receipt) = catalog.initialize().unwrap();
-    assert_eq!(receipt.disposition, DisposableAttemptCatalogWriteDisposition::Created);
+    assert_eq!(
+        receipt.disposition,
+        DisposableAttemptCatalogWriteDisposition::Created
+    );
     (catalog, document)
 }
 
@@ -131,7 +136,10 @@ fn catalog_and_attempt_revisions_reject_stale_mutations() {
             DisposableAttemptCatalogAction::BeginRegistration,
         )
         .unwrap_err();
-    assert_eq!(stale_catalog.kind(), DisposableAttemptCatalogErrorKind::Conflict);
+    assert_eq!(
+        stale_catalog.kind(),
+        DisposableAttemptCatalogErrorKind::Conflict
+    );
 
     let stale_attempt = catalog
         .transition(
@@ -141,7 +149,10 @@ fn catalog_and_attempt_revisions_reject_stale_mutations() {
             DisposableAttemptCatalogAction::BeginRegistration,
         )
         .unwrap_err();
-    assert_eq!(stale_attempt.kind(), DisposableAttemptCatalogErrorKind::Conflict);
+    assert_eq!(
+        stale_attempt.kind(),
+        DisposableAttemptCatalogErrorKind::Conflict
+    );
 }
 
 #[test]
@@ -163,7 +174,10 @@ fn global_ownership_identities_are_unique_across_attempts() {
     .unwrap();
 
     let error = catalog.reserve(one.revision(), conflicting).unwrap_err();
-    assert_eq!(error.kind(), DisposableAttemptCatalogErrorKind::CorruptState);
+    assert_eq!(
+        error.kind(),
+        DisposableAttemptCatalogErrorKind::CorruptState
+    );
     assert_eq!(catalog.load().unwrap().active().len(), 1);
 }
 
@@ -216,14 +230,15 @@ fn duplicate_terminal_observation_is_satisfied_without_catalog_churn() {
 fn identity_drift_remains_distinct_from_an_illegal_phase_action() {
     let (mut catalog, empty) = initialized();
     let (reserved, _) = catalog.reserve(empty.revision(), reservation(1)).unwrap();
+    let provisioning = transition(
+        &mut catalog,
+        &reserved,
+        1,
+        DisposableAttemptCatalogAction::BeginProvisioning,
+    );
     let registering = transition(
         &mut catalog,
-        &transition(
-            &mut catalog,
-            &reserved,
-            1,
-            DisposableAttemptCatalogAction::BeginProvisioning,
-        ),
+        &provisioning,
         1,
         DisposableAttemptCatalogAction::BeginRegistration,
     );
@@ -246,7 +261,10 @@ fn identity_drift_remains_distinct_from_an_illegal_phase_action() {
             DisposableAttemptCatalogAction::RecordRegistration(wrong_runner),
         )
         .unwrap_err();
-    assert_eq!(drift.kind(), DisposableAttemptCatalogErrorKind::IdentityDrift);
+    assert_eq!(
+        drift.kind(),
+        DisposableAttemptCatalogErrorKind::IdentityDrift
+    );
 }
 
 #[test]
@@ -301,18 +319,28 @@ fn completed_attempt_releases_usage_then_moves_to_bounded_replay_history() {
         .unwrap();
 
     assert!(retired.find_active(&attempt_id).is_none());
-    assert_eq!(retired.find_tombstone(&attempt_id).unwrap().phase(), DisposableAttemptPhase::Complete);
+    assert_eq!(
+        retired.find_tombstone(&attempt_id).unwrap().phase(),
+        DisposableAttemptPhase::Complete
+    );
     assert_eq!(retired.tombstones().len(), 1);
 
-    let reuse = catalog.reserve(retired.revision(), reservation(1)).unwrap_err();
-    assert_eq!(reuse.kind(), DisposableAttemptCatalogErrorKind::AlreadyExists);
+    let reuse = catalog
+        .reserve(retired.revision(), reservation(1))
+        .unwrap_err();
+    assert_eq!(
+        reuse.kind(),
+        DisposableAttemptCatalogErrorKind::AlreadyExists
+    );
 }
 
 #[test]
 fn active_limit_refuses_new_work_but_keeps_exact_duplicate_reservation_idempotent() {
     let (mut catalog, mut document) = initialized();
     for index in 0..MAX_ACTIVE_DISPOSABLE_ATTEMPTS {
-        (document, _) = catalog.reserve(document.revision(), reservation(index)).unwrap();
+        (document, _) = catalog
+            .reserve(document.revision(), reservation(index))
+            .unwrap();
     }
 
     let first = reservation(0);
@@ -324,13 +352,19 @@ fn active_limit_refuses_new_work_but_keeps_exact_duplicate_reservation_idempoten
     );
 
     let overflow = catalog
-        .reserve(document.revision(), reservation(MAX_ACTIVE_DISPOSABLE_ATTEMPTS))
+        .reserve(
+            document.revision(),
+            reservation(MAX_ACTIVE_DISPOSABLE_ATTEMPTS),
+        )
         .unwrap_err();
-    assert_eq!(overflow.kind(), DisposableAttemptCatalogErrorKind::LimitExceeded);
+    assert_eq!(
+        overflow.kind(),
+        DisposableAttemptCatalogErrorKind::LimitExceeded
+    );
 }
 
 #[test]
-fn exact_runner_and_job_ids_cannot_be_reused_across_concurrent_attempts() {
+fn exact_runner_ids_cannot_be_reused_across_concurrent_attempts() {
     let (mut catalog, empty) = initialized();
     let (one, _) = catalog.reserve(empty.revision(), reservation(1)).unwrap();
     let (two, _) = catalog.reserve(one.revision(), reservation(2)).unwrap();
@@ -366,17 +400,61 @@ fn exact_runner_and_job_ids_cannot_be_reused_across_concurrent_attempts() {
         2,
         DisposableAttemptCatalogAction::BeginRegistration,
     );
+    let attempt_id = DisposableAttemptId::parse("attempt-2").unwrap();
     let duplicate_runner_id = catalog
         .transition(
             two_registering.revision(),
-            &DisposableAttemptId::parse("attempt-2").unwrap(),
+            &attempt_id,
             two_registering
-                .find_active(&DisposableAttemptId::parse("attempt-2").unwrap())
+                .find_active(&attempt_id)
                 .unwrap()
                 .attempt()
                 .revision(),
             DisposableAttemptCatalogAction::RecordRegistration(runner(2, 77)),
         )
         .unwrap_err();
-    assert_eq!(duplicate_runner_id.kind(), DisposableAttemptCatalogErrorKind::CorruptState);
+    assert_eq!(
+        duplicate_runner_id.kind(),
+        DisposableAttemptCatalogErrorKind::CorruptState
+    );
+}
+
+#[test]
+fn exact_job_ids_cannot_be_reused_across_concurrent_attempts() {
+    let (mut catalog, empty) = initialized();
+    let (one, _) = catalog.reserve(empty.revision(), reservation(1)).unwrap();
+    let (two, _) = catalog.reserve(one.revision(), reservation(2)).unwrap();
+    let shared_job = ScaleSetJobId::parse("shared-job-id").unwrap();
+
+    let one_terminal = transition(
+        &mut catalog,
+        &two,
+        1,
+        DisposableAttemptCatalogAction::RecordTerminal {
+            runner: None,
+            job_id: shared_job.clone(),
+            result: ScaleSetJobResult::parse("canceled").unwrap(),
+        },
+    );
+    let attempt_id = DisposableAttemptId::parse("attempt-2").unwrap();
+    let duplicate_job_id = catalog
+        .transition(
+            one_terminal.revision(),
+            &attempt_id,
+            one_terminal
+                .find_active(&attempt_id)
+                .unwrap()
+                .attempt()
+                .revision(),
+            DisposableAttemptCatalogAction::RecordTerminal {
+                runner: None,
+                job_id: shared_job,
+                result: ScaleSetJobResult::parse("canceled").unwrap(),
+            },
+        )
+        .unwrap_err();
+    assert_eq!(
+        duplicate_job_id.kind(),
+        DisposableAttemptCatalogErrorKind::CorruptState
+    );
 }
