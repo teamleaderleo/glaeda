@@ -158,6 +158,7 @@ impl DisposableAttemptState {
             candidate.as_ref().is_ok_and(|candidate| candidate == self)
         };
         if matches(current.begin_provisioning())
+            || matches(current.complete_unprovisioned())
             || matches(current.begin_registration())
             || matches(current.begin_cleanup())
             || matches(current.advance_cleanup(self.phase))
@@ -203,6 +204,17 @@ impl DisposableAttemptState {
         self.advance_phase(
             DisposableAttemptPhase::Reserved,
             DisposableAttemptPhase::Provisioning,
+        )
+    }
+
+    /// Complete an attempt that released capacity before any VM creation was authorized.
+    ///
+    /// This path deliberately skips VM and runner cleanup. A reserved attempt has not crossed the
+    /// durable absent-VM checkpoint and therefore owns no external object that may be deleted.
+    pub fn complete_unprovisioned(&self) -> Result<Self, DisposableAttemptStateError> {
+        self.advance_phase(
+            DisposableAttemptPhase::Reserved,
+            DisposableAttemptPhase::Complete,
         )
     }
 

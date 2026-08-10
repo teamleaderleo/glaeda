@@ -74,6 +74,7 @@ fn apply(
     };
     match transition {
         DisposableAttemptCatalogAction::BeginProvisioning => state.begin_provisioning(),
+        DisposableAttemptCatalogAction::CompleteUnprovisioned => state.complete_unprovisioned(),
         DisposableAttemptCatalogAction::BeginRegistration => state.begin_registration(),
         DisposableAttemptCatalogAction::RecordRegistration(runner) => {
             state.record_registration(runner)
@@ -195,7 +196,7 @@ fn happy_path_uses_canonical_durable_transitions() {
             ScaleSetRunnerObservation::Absent,
         ))
         .unwrap(),
-        DisposableWorkerAction::StartVm
+        DisposableWorkerAction::DiscardIncompleteVm
     );
     let action = reconcile_attempt(input(
         &state,
@@ -261,7 +262,7 @@ fn happy_path_uses_canonical_durable_transitions() {
 }
 
 #[test]
-fn stopped_vm_is_started_only_while_provisioning_and_destroyed_during_cleanup() {
+fn stopped_partial_clone_is_discarded_only_while_provisioning_and_destroyed_during_cleanup() {
     let provisioning = attempt().begin_provisioning().unwrap();
     assert_eq!(
         reconcile_attempt(input(
@@ -270,7 +271,7 @@ fn stopped_vm_is_started_only_while_provisioning_and_destroyed_during_cleanup() 
             ScaleSetRunnerObservation::Absent,
         ))
         .unwrap(),
-        DisposableWorkerAction::StartVm
+        DisposableWorkerAction::DiscardIncompleteVm
     );
 
     let registering = provisioning.begin_registration().unwrap();
@@ -449,7 +450,7 @@ fn terminal_cleanup_orders_vm_runner_and_capacity_release() {
 }
 
 #[test]
-fn cancellation_expiry_and_lost_capacity_converge_to_cleanup() {
+fn reserved_cancellation_releases_capacity_without_claiming_vm_cleanup() {
     let state = attempt();
     let mut cancelled = input(
         &state,
@@ -459,7 +460,7 @@ fn cancellation_expiry_and_lost_capacity_converge_to_cleanup() {
     cancelled.cancellation_requested = true;
     assert_eq!(
         reconcile_attempt(cancelled).unwrap(),
-        persist(DisposableAttemptCatalogAction::BeginCleanup)
+        DisposableWorkerAction::ReleaseCapacity
     );
     let mut expired = input(
         &state,
@@ -469,7 +470,7 @@ fn cancellation_expiry_and_lost_capacity_converge_to_cleanup() {
     expired.now = time(10_001);
     assert_eq!(
         reconcile_attempt(expired).unwrap(),
-        persist(DisposableAttemptCatalogAction::BeginCleanup)
+        DisposableWorkerAction::ReleaseCapacity
     );
     let mut lost = input(
         &state,
@@ -479,7 +480,19 @@ fn cancellation_expiry_and_lost_capacity_converge_to_cleanup() {
     lost.capacity_reserved = false;
     assert_eq!(
         reconcile_attempt(lost).unwrap(),
-        persist(DisposableAttemptCatalogAction::BeginCleanup)
+        persist(DisposableAttemptCatalogAction::CompleteUnprovisioned)
+    );
+
+    let preexisting = input(
+        &state,
+        DisposableVmObservation::Ready,
+        ScaleSetRunnerObservation::Absent,
+    );
+    let mut cancelled_preexisting = preexisting;
+    cancelled_preexisting.cancellation_requested = true;
+    assert_eq!(
+        reconcile_attempt(cancelled_preexisting).unwrap(),
+        DisposableWorkerAction::ReleaseCapacity
     );
 }
 
@@ -654,12 +667,22 @@ fn public_action_json_is_bounded_and_contains_no_private_material() {
     let encoded = serde_json::to_string(&action).unwrap();
     assert!(encoded.len() < 512);
     assert!(!encoded.contains("token"));
-    assert_eq!(
-        action,
-        persist(DisposableAttemptCatalogAction::BeginProvisioning)
-    );
     let observing = DisposableWorkerAction::Observe {
         target: DisposableWorkerObservationTarget::Vm,
     };
+    assert_eq!(action, observing);
     assert!(serde_json::to_string(&observing).unwrap().contains("vm"));
+
+    let preexisting = reconcile_attempt(input(
+        &state,
+        DisposableVmObservation::Stopped,
+        ScaleSetRunnerObservation::Absent,
+    ))
+    .unwrap();
+    assert_eq!(
+        preexisting,
+        DisposableWorkerAction::Blocked {
+            code: "vm_exists_before_clone_authorization"
+        }
+    );
 }

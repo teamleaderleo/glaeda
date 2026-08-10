@@ -25,6 +25,7 @@ const DESTROY_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 #[serde(rename_all = "snake_case")]
 pub enum DisposableLimaWorkerCommandKind {
     Clone,
+    DiscardIncomplete,
     Destroy,
 }
 
@@ -141,11 +142,7 @@ impl DisposableLimaWorkerAdapter {
                 "the disposable VM identity conflicts with the prepared source template",
             ));
         }
-        if matches!(
-            action,
-            DisposableWorkerAction::CloneVm | DisposableWorkerAction::StartVm
-        ) && now > attempt.not_after()
-        {
+        if matches!(action, DisposableWorkerAction::CloneVm) && now > attempt.not_after() {
             return Err(error(
                 DisposableLimaWorkerErrorKind::InvalidAction,
                 "attempt_expired",
@@ -170,16 +167,22 @@ impl DisposableLimaWorkerAdapter {
                         .argument(resources.memory_gib)
                         .argument("--disk")
                         .argument(resources.disk_gib)
-                        .argument("--mount-none"),
+                        .argument("--mount-none")
+                        .argument("--start"),
                     CLONE_TIMEOUT,
                 )
             }
-            DisposableWorkerAction::StartVm => {
-                return Err(error(
-                    DisposableLimaWorkerErrorKind::InvalidAction,
-                    "post_clone_observation_required",
-                    "starting a disposable clone requires sealed exact post-clone evidence",
-                ));
+            DisposableWorkerAction::DiscardIncompleteVm
+                if attempt.phase() == DisposableAttemptPhase::Provisioning =>
+            {
+                (
+                    DisposableLimaWorkerCommandKind::DiscardIncomplete,
+                    self.base_command()
+                        .argument("delete")
+                        .argument("--force")
+                        .argument(instance.as_str()),
+                    DESTROY_TIMEOUT,
+                )
             }
             DisposableWorkerAction::DestroyVm
                 if attempt.phase() == DisposableAttemptPhase::Destroying =>
@@ -193,7 +196,9 @@ impl DisposableLimaWorkerAdapter {
                     DESTROY_TIMEOUT,
                 )
             }
-            DisposableWorkerAction::CloneVm | DisposableWorkerAction::DestroyVm => {
+            DisposableWorkerAction::CloneVm
+            | DisposableWorkerAction::DiscardIncompleteVm
+            | DisposableWorkerAction::DestroyVm => {
                 return Err(error(
                     DisposableLimaWorkerErrorKind::InvalidAction,
                     "invalid_durable_phase",
@@ -514,6 +519,7 @@ mod tests {
                 "--disk",
                 "64",
                 "--mount-none",
+                "--start",
             ]
         );
         assert_eq!(
@@ -530,16 +536,29 @@ mod tests {
     }
 
     #[test]
-    fn start_is_refused_until_sealed_post_clone_evidence_and_destroy_is_fixed() {
+    fn incomplete_clone_discard_and_cleanup_destroy_are_distinct_fixed_plans() {
         let provisioning = reservation_in_phase(DisposableAttemptPhase::Provisioning);
-        let start_error = adapter()
+        let discard = adapter()
             .plan(
                 EpochMillis::new(1_000).unwrap(),
                 &provisioning,
-                &DisposableWorkerAction::StartVm,
+                &DisposableWorkerAction::DiscardIncompleteVm,
             )
-            .unwrap_err();
-        assert_eq!(start_error.code(), "post_clone_observation_required");
+            .unwrap();
+        assert_eq!(
+            discard.kind(),
+            DisposableLimaWorkerCommandKind::DiscardIncomplete
+        );
+        assert_eq!(
+            discard.command.displayed_argv(),
+            [
+                "/opt/homebrew/bin/limactl",
+                "--tty=false",
+                "delete",
+                "--force",
+                "smol-worker-1",
+            ]
+        );
 
         let destroying = reservation_in_phase(DisposableAttemptPhase::Destroying);
         let destroy = adapter()
@@ -579,7 +598,7 @@ mod tests {
             .plan(
                 EpochMillis::new(1_000).unwrap(),
                 &reserved,
-                &DisposableWorkerAction::StartVm,
+                &DisposableWorkerAction::CloneVm,
             )
             .unwrap_err();
         assert_eq!(error.kind(), DisposableLimaWorkerErrorKind::InvalidAction);
@@ -589,7 +608,7 @@ mod tests {
             .plan(
                 EpochMillis::new(10_001).unwrap(),
                 &provisioning,
-                &DisposableWorkerAction::StartVm,
+                &DisposableWorkerAction::CloneVm,
             )
             .unwrap_err();
         assert_eq!(error.code(), "attempt_expired");

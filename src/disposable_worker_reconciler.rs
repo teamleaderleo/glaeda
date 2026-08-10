@@ -359,7 +359,8 @@ pub enum DisposableWorkerAction {
         target: DisposableWorkerObservationTarget,
     },
     CloneVm,
-    StartVm,
+    /// Remove a stopped destination left by an interrupted clone after the durable absence marker.
+    DiscardIncompleteVm,
     GenerateJitAndStartRunner,
     Wait,
     DestroyVm,
@@ -397,6 +398,11 @@ pub fn reconcile_attempt(
 
     use DisposableAttemptPhase as Phase;
     use DisposableWorkerAction as Action;
+    if !input.capacity_reserved && input.attempt.phase() == Phase::Reserved {
+        return Ok(persist(
+            DisposableAttemptCatalogAction::CompleteUnprovisioned,
+        ));
+    }
     if !input.capacity_reserved
         && matches!(
             input.attempt.phase(),
@@ -412,15 +418,26 @@ pub fn reconcile_attempt(
         return Ok(persist(DisposableAttemptCatalogAction::BeginCleanup));
     }
     Ok(match input.attempt.phase() {
-        Phase::Reserved if cleanup => persist(DisposableAttemptCatalogAction::BeginCleanup),
-        Phase::Reserved => persist(DisposableAttemptCatalogAction::BeginProvisioning),
+        Phase::Reserved if cleanup => Action::ReleaseCapacity,
+        Phase::Reserved => match input.vm {
+            DisposableVmObservation::Unknown => Action::Observe {
+                target: DisposableWorkerObservationTarget::Vm,
+            },
+            DisposableVmObservation::Absent => {
+                persist(DisposableAttemptCatalogAction::BeginProvisioning)
+            }
+            DisposableVmObservation::Stopped | DisposableVmObservation::Ready => Action::Blocked {
+                code: "vm_exists_before_clone_authorization",
+            },
+            DisposableVmObservation::Conflicting => unreachable!(),
+        },
         Phase::Provisioning if cleanup => persist(DisposableAttemptCatalogAction::BeginCleanup),
         Phase::Provisioning => match input.vm {
             DisposableVmObservation::Unknown => Action::Observe {
                 target: DisposableWorkerObservationTarget::Vm,
             },
             DisposableVmObservation::Absent => Action::CloneVm,
-            DisposableVmObservation::Stopped => Action::StartVm,
+            DisposableVmObservation::Stopped => Action::DiscardIncompleteVm,
             DisposableVmObservation::Ready => {
                 persist(DisposableAttemptCatalogAction::BeginRegistration)
             }
@@ -623,6 +640,7 @@ fn validate_transition(
 ) -> Result<DisposableAttemptCatalogAction, DisposableWorkerReconcilerError> {
     let result = match &transition {
         DisposableAttemptCatalogAction::BeginProvisioning => attempt.begin_provisioning(),
+        DisposableAttemptCatalogAction::CompleteUnprovisioned => attempt.complete_unprovisioned(),
         DisposableAttemptCatalogAction::BeginRegistration => attempt.begin_registration(),
         DisposableAttemptCatalogAction::RecordRegistration(runner) => {
             attempt.record_registration(runner)

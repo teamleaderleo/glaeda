@@ -20,6 +20,26 @@ fn reserved() -> DisposableAttemptState {
     )
 }
 
+#[test]
+fn unprovisioned_completion_skips_external_cleanup_and_is_reserved_only() {
+    let complete = reserved().complete_unprovisioned().unwrap();
+
+    assert_eq!(complete.phase(), DisposableAttemptPhase::Complete);
+    assert_eq!(complete.revision().get(), 2);
+    assert!(complete.runner_id().is_none());
+    assert!(complete.github_job_id().is_none());
+    assert!(complete.result().is_none());
+    assert_eq!(
+        reserved()
+            .begin_provisioning()
+            .unwrap()
+            .complete_unprovisioned()
+            .unwrap_err()
+            .code(),
+        "invalid_transition"
+    );
+}
+
 fn runner(id: u64) -> ScaleSetRunnerReference {
     ScaleSetRunnerReference::new(
         ScaleSetRunnerId::new(id).unwrap(),

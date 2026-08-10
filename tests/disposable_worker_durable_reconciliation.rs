@@ -171,7 +171,7 @@ fn every_durable_checkpoint_reopens_without_duplicate_capacity_or_cleanup_loss()
             None,
             true,
         );
-        assert_eq!(action, DisposableWorkerAction::StartVm);
+        assert_eq!(action, DisposableWorkerAction::DiscardIncompleteVm);
     }
 
     let (state, _) = tick(
@@ -331,6 +331,55 @@ fn every_durable_checkpoint_reopens_without_duplicate_capacity_or_cleanup_loss()
     let store = UnixPersonalWorkerStore::open_or_create_disposable_catalog(root.path()).unwrap();
     let catalog = DisposableAttemptCatalog::new(store).load().unwrap();
     assert_eq!(catalog.host_usage().unwrap().workers(), 0);
+}
+
+#[test]
+fn lost_reserved_capacity_completes_without_acquiring_vm_cleanup_authority() {
+    let root = TempRoot::new();
+    initialize(root.path());
+
+    let (catalog, action) = tick(
+        root.path(),
+        DisposableVmObservation::Ready,
+        ScaleSetRunnerObservation::Absent,
+        None,
+        false,
+    );
+    assert!(matches!(
+        action,
+        DisposableWorkerAction::Persist {
+            transition: smolrunner::disposable_attempt_catalog::DisposableAttemptCatalogAction::CompleteUnprovisioned
+        }
+    ));
+    let attempt = catalog.find_active(&attempt_id()).unwrap().attempt();
+    assert_eq!(attempt.phase(), DisposableAttemptPhase::Complete);
+    assert_eq!(attempt.revision().get(), 2);
+    assert!(attempt.runner_id().is_none());
+    assert!(attempt.github_job_id().is_none());
+    assert_eq!(catalog.host_usage().unwrap().workers(), 0);
+
+    let (_, replay) = tick(
+        root.path(),
+        DisposableVmObservation::Ready,
+        ScaleSetRunnerObservation::Absent,
+        None,
+        false,
+    );
+    assert_eq!(
+        replay,
+        DisposableWorkerAction::Blocked {
+            code: "completed_attempt_retains_external_state"
+        }
+    );
+
+    let (_, absent_replay) = tick(
+        root.path(),
+        DisposableVmObservation::Absent,
+        ScaleSetRunnerObservation::Absent,
+        None,
+        false,
+    );
+    assert_eq!(absent_replay, DisposableWorkerAction::NoOp);
 }
 
 #[test]

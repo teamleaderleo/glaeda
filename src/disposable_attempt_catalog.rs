@@ -467,6 +467,7 @@ impl DisposableAttemptCatalogDocument {
 #[serde(tag = "transition", rename_all = "snake_case")]
 pub enum DisposableAttemptCatalogAction {
     BeginProvisioning,
+    CompleteUnprovisioned,
     BeginRegistration,
     RecordRegistration(ScaleSetRunnerReference),
     RecordRunnerReady(ScaleSetRunnerReference),
@@ -848,6 +849,7 @@ fn apply_action(
 ) -> Result<DisposableAttemptState, DisposableAttemptCatalogError> {
     let result = match action {
         DisposableAttemptCatalogAction::BeginProvisioning => current.begin_provisioning(),
+        DisposableAttemptCatalogAction::CompleteUnprovisioned => current.complete_unprovisioned(),
         DisposableAttemptCatalogAction::BeginRegistration => current.begin_registration(),
         DisposableAttemptCatalogAction::RecordRegistration(runner) => {
             current.record_registration(&runner)
