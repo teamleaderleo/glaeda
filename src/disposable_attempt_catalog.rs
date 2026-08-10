@@ -135,14 +135,20 @@ impl DisposableAttemptCatalogDocument {
     }
 
     #[must_use]
-    pub fn find_active(&self, attempt_id: &DisposableAttemptId) -> Option<&DisposableAttemptReservation> {
+    pub fn find_active(
+        &self,
+        attempt_id: &DisposableAttemptId,
+    ) -> Option<&DisposableAttemptReservation> {
         self.active
             .iter()
             .find(|reservation| reservation.attempt.attempt_id() == attempt_id)
     }
 
     #[must_use]
-    pub fn find_tombstone(&self, attempt_id: &DisposableAttemptId) -> Option<&DisposableAttemptState> {
+    pub fn find_tombstone(
+        &self,
+        attempt_id: &DisposableAttemptId,
+    ) -> Option<&DisposableAttemptState> {
         self.tombstones
             .iter()
             .find(|attempt| attempt.attempt_id() == attempt_id)
@@ -190,12 +196,6 @@ impl DisposableAttemptCatalogDocument {
         &self,
         reservation: DisposableAttemptReservation,
     ) -> Result<Self, DisposableAttemptCatalogError> {
-        if self.active.len() >= MAX_ACTIVE_DISPOSABLE_ATTEMPTS {
-            return Err(catalog_error(
-                DisposableAttemptCatalogErrorKind::LimitExceeded,
-                "active disposable attempt limit is reached",
-            ));
-        }
         if let Some(existing) = self.find_active(reservation.attempt.attempt_id()) {
             if existing == &reservation {
                 return Ok(self.clone());
@@ -209,6 +209,12 @@ impl DisposableAttemptCatalogDocument {
             return Err(catalog_error(
                 DisposableAttemptCatalogErrorKind::AlreadyExists,
                 "completed disposable attempt identity remains in replay history",
+            ));
+        }
+        if self.active.len() >= MAX_ACTIVE_DISPOSABLE_ATTEMPTS {
+            return Err(catalog_error(
+                DisposableAttemptCatalogErrorKind::LimitExceeded,
+                "active disposable attempt limit is reached",
             ));
         }
 
@@ -410,7 +416,9 @@ impl DisposableAttemptCatalogWriteReceipt {
 }
 
 pub trait DisposableAttemptCatalogStore {
-    fn load(&self) -> Result<Option<DisposableAttemptCatalogDocument>, DisposableAttemptCatalogError>;
+    fn load(
+        &self,
+    ) -> Result<Option<DisposableAttemptCatalogDocument>, DisposableAttemptCatalogError>;
 
     fn create(
         &mut self,
@@ -449,8 +457,13 @@ impl<S: DisposableAttemptCatalogStore> DisposableAttemptCatalog<S> {
     /// Returns a store error if durable state cannot be loaded or initialized.
     pub fn initialize(
         &mut self,
-    ) -> Result<(DisposableAttemptCatalogDocument, DisposableAttemptCatalogWriteReceipt), DisposableAttemptCatalogError>
-    {
+    ) -> Result<
+        (
+            DisposableAttemptCatalogDocument,
+            DisposableAttemptCatalogWriteReceipt,
+        ),
+        DisposableAttemptCatalogError,
+    > {
         if let Some(current) = self.store.load()? {
             current.validate()?;
             return Ok((
@@ -491,8 +504,13 @@ impl<S: DisposableAttemptCatalogStore> DisposableAttemptCatalog<S> {
         &mut self,
         expected_catalog_revision: DisposableAttemptCatalogRevision,
         reservation: DisposableAttemptReservation,
-    ) -> Result<(DisposableAttemptCatalogDocument, DisposableAttemptCatalogWriteReceipt), DisposableAttemptCatalogError>
-    {
+    ) -> Result<
+        (
+            DisposableAttemptCatalogDocument,
+            DisposableAttemptCatalogWriteReceipt,
+        ),
+        DisposableAttemptCatalogError,
+    > {
         let current = self.load()?;
         require_catalog_revision(&current, expected_catalog_revision)?;
         let next = current.reserve(reservation.clone())?;
@@ -509,7 +527,13 @@ impl<S: DisposableAttemptCatalogStore> DisposableAttemptCatalog<S> {
         let receipt = self
             .store
             .replace_if_revision(expected_catalog_revision, &next)?;
-        Ok((next, receipt))
+        Ok((
+            next,
+            DisposableAttemptCatalogWriteReceipt {
+                attempt_revision: Some(reservation.attempt.revision()),
+                ..receipt
+            },
+        ))
     }
 
     /// Atomically apply one typed lifecycle observation/action to one exact attempt revision.
@@ -519,8 +543,13 @@ impl<S: DisposableAttemptCatalogStore> DisposableAttemptCatalog<S> {
         attempt_id: &DisposableAttemptId,
         expected_attempt_revision: DisposableAttemptRevision,
         action: DisposableAttemptCatalogAction,
-    ) -> Result<(DisposableAttemptCatalogDocument, DisposableAttemptCatalogWriteReceipt), DisposableAttemptCatalogError>
-    {
+    ) -> Result<
+        (
+            DisposableAttemptCatalogDocument,
+            DisposableAttemptCatalogWriteReceipt,
+        ),
+        DisposableAttemptCatalogError,
+    > {
         let current = self.load()?;
         require_catalog_revision(&current, expected_catalog_revision)?;
         let next = current.replace_attempt(attempt_id, expected_attempt_revision, action)?;
@@ -555,8 +584,13 @@ impl<S: DisposableAttemptCatalogStore> DisposableAttemptCatalog<S> {
         expected_catalog_revision: DisposableAttemptCatalogRevision,
         attempt_id: &DisposableAttemptId,
         expected_attempt_revision: DisposableAttemptRevision,
-    ) -> Result<(DisposableAttemptCatalogDocument, DisposableAttemptCatalogWriteReceipt), DisposableAttemptCatalogError>
-    {
+    ) -> Result<
+        (
+            DisposableAttemptCatalogDocument,
+            DisposableAttemptCatalogWriteReceipt,
+        ),
+        DisposableAttemptCatalogError,
+    > {
         let current = self.load()?;
         require_catalog_revision(&current, expected_catalog_revision)?;
         let next = current.retire_complete(attempt_id, expected_attempt_revision)?;
@@ -579,7 +613,9 @@ pub struct MemoryDisposableAttemptCatalogStore {
 }
 
 impl DisposableAttemptCatalogStore for MemoryDisposableAttemptCatalogStore {
-    fn load(&self) -> Result<Option<DisposableAttemptCatalogDocument>, DisposableAttemptCatalogError> {
+    fn load(
+        &self,
+    ) -> Result<Option<DisposableAttemptCatalogDocument>, DisposableAttemptCatalogError> {
         Ok(self.document.clone())
     }
 
@@ -639,6 +675,7 @@ pub enum DisposableAttemptCatalogErrorKind {
     AlreadyExists,
     Missing,
     Conflict,
+    IdentityDrift,
     InvalidAction,
     LimitExceeded,
     CorruptState,
@@ -696,8 +733,13 @@ fn apply_action(
         DisposableAttemptCatalogAction::AdvanceCleanup(phase) => current.advance_cleanup(phase),
     };
     result.map_err(|error| {
+        let kind = if error.code() == "identity_drift" {
+            DisposableAttemptCatalogErrorKind::IdentityDrift
+        } else {
+            DisposableAttemptCatalogErrorKind::InvalidAction
+        };
         catalog_error(
-            DisposableAttemptCatalogErrorKind::InvalidAction,
+            kind,
             match error.code() {
                 "identity_drift" => "disposable attempt action conflicts with durable identity",
                 "invalid_transition" => "disposable attempt action is invalid for the current phase",
