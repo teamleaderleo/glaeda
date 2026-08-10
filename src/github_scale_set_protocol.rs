@@ -143,7 +143,7 @@ pub struct ScaleSetRunnerReference {
 
 impl ScaleSetRunnerReference {
     #[must_use]
-    pub const fn new(id: ScaleSetRunnerId, name: ScaleSetRunnerName) -> Self {
+    pub fn new(id: ScaleSetRunnerId, name: ScaleSetRunnerName) -> Self {
         Self { id, name }
     }
 }
@@ -170,7 +170,7 @@ impl ScaleSetJobEvent {
     }
 
     #[must_use]
-    pub const fn runner(&self) -> Option<&ScaleSetRunnerReference> {
+    pub fn runner(&self) -> Option<&ScaleSetRunnerReference> {
         match self {
             Self::Started { runner, .. } => Some(runner),
             Self::Completed { runner, .. } => runner.as_ref(),
@@ -178,7 +178,7 @@ impl ScaleSetJobEvent {
     }
 
     #[must_use]
-    pub const fn job_id(&self) -> &ScaleSetJobId {
+    pub fn job_id(&self) -> &ScaleSetJobId {
         match self {
             Self::Started { job_id, .. } | Self::Completed { job_id, .. } => job_id,
         }
