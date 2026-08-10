@@ -266,7 +266,7 @@ impl Check {
         Self {
             id: id.into(),
             status,
-            summary,
+            summary: summary.into(),
             detail,
         }
     }
