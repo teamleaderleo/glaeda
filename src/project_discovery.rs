@@ -778,10 +778,10 @@ mod tests {
         ) -> io::Result<ExecutionRecord> {
             assert_eq!(timeout, PROJECT_CHECKOUT_COMMAND_TIMEOUT);
             self.commands.borrow_mut().push(spec.clone());
-            if let Some(root) = self.mutation_root.as_ref() {
-                if !self.mutated.replace(true) {
-                    fs::create_dir(root.join("late-entry")).expect("mutate discovery root");
-                }
+            if let Some(root) = self.mutation_root.as_ref()
+                && !self.mutated.replace(true)
+            {
+                fs::create_dir(root.join("late-entry")).expect("mutate discovery root");
             }
             let response = self
                 .responses
@@ -921,7 +921,7 @@ projects:
         let non_git = root.directory("a-non-git");
         let nested = non_git.join("nested-repository-looking-directory");
         fs::create_dir(&nested).expect("nested directory");
-        let bare = root.directory("b-bare");
+        let _bare = root.directory("b-bare");
         let target = root.directory("c-target");
         let link = root.path().join("d-link");
         symlink(&target, &link).expect("symlink");
