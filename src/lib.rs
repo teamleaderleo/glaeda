@@ -123,6 +123,8 @@ pub mod linux_state;
 pub mod linux_state_prepare;
 #[cfg(target_os = "linux")]
 pub mod linux_state_recovery;
+/// Pure fixed offline Cargo command policy for exact local self-builds.
+pub mod local_install_build_command;
 /// Pure exact-source local binary generation and stable launcher planning.
 pub mod local_install_plan;
 pub mod mac_availability;
