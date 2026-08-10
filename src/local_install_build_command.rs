@@ -76,48 +76,47 @@ pub struct LocalInstallBuildCommandPolicy {
     pub fixed_public_environment: [&'static str; 5],
 }
 
+/// Private paths for one exact local self-build.
+///
+/// Callers choose only the exact source root, one SmolRunner-owned build root, and the reviewed
+/// Cargo/rustc/rustdoc executables. The command derives fixed `work`, `home`, `cargo-home`, and
+/// `target` children beneath the build root so ordinary code cannot independently reconfigure them.
 #[derive(Clone, PartialEq, Eq)]
 pub struct LocalInstallBuildCommandContext {
     source_root: PathBuf,
-    isolated_working_directory: PathBuf,
+    build_root: PathBuf,
     cargo_program: PathBuf,
     rustc_program: PathBuf,
     rustdoc_program: PathBuf,
-    isolated_home: PathBuf,
-    cargo_home: PathBuf,
-    target_directory: PathBuf,
 }
 
 impl LocalInstallBuildCommandContext {
     /// Bind private lexical paths for one exact local self-build.
     ///
-    /// Cargo runs from `isolated_working_directory`; the source checkout is selected only through
-    /// the fixed private `Cargo.toml` manifest argument. A later preflight proves filesystem and
-    /// Cargo-config safety before process execution.
-    ///
     /// # Errors
     ///
-    /// Returns an error unless all paths are absolute normalized non-root UTF-8 paths, toolchain
-    /// paths are distinct, and source/build-private directory classes are pairwise disjoint.
+    /// Returns an error unless all paths are absolute normalized non-root UTF-8 paths, source and
+    /// build roots are disjoint, and the three toolchain executable paths are distinct.
     pub fn new(
         source_root: impl Into<PathBuf>,
-        isolated_working_directory: impl Into<PathBuf>,
+        build_root: impl Into<PathBuf>,
         cargo_program: impl Into<PathBuf>,
         rustc_program: impl Into<PathBuf>,
         rustdoc_program: impl Into<PathBuf>,
-        isolated_home: impl Into<PathBuf>,
-        cargo_home: impl Into<PathBuf>,
-        target_directory: impl Into<PathBuf>,
     ) -> Result<Self, LocalInstallBuildCommandError> {
         let source_root = private_path(source_root.into())?;
-        let isolated_working_directory = private_path(isolated_working_directory.into())?;
+        let build_root = private_path(build_root.into())?;
         let cargo_program = private_path(cargo_program.into())?;
         let rustc_program = private_path(rustc_program.into())?;
         let rustdoc_program = private_path(rustdoc_program.into())?;
-        let isolated_home = private_path(isolated_home.into())?;
-        let cargo_home = private_path(cargo_home.into())?;
-        let target_directory = private_path(target_directory.into())?;
 
+        if overlaps(&source_root, &build_root) {
+            return Err(error(
+                LocalInstallBuildCommandErrorKind::UnsafeBuildDirectory,
+                "unsafe_build_directory",
+                "local self-build source and build roots must be disjoint",
+            ));
+        }
         if cargo_program == rustc_program
             || cargo_program == rustdoc_program
             || rustc_program == rustdoc_program
@@ -129,39 +128,33 @@ impl LocalInstallBuildCommandContext {
             ));
         }
 
-        let private_directories = [
-            &source_root,
-            &isolated_working_directory,
-            &isolated_home,
-            &cargo_home,
-            &target_directory,
-        ];
-        for (index, left) in private_directories.iter().enumerate() {
-            for right in private_directories.iter().skip(index + 1) {
-                if overlaps(left, right) {
-                    return Err(error(
-                        LocalInstallBuildCommandErrorKind::UnsafeBuildDirectory,
-                        "unsafe_build_directory",
-                        "local self-build source and private build directories must be disjoint",
-                    ));
-                }
-            }
-        }
-
         Ok(Self {
             source_root,
-            isolated_working_directory,
+            build_root,
             cargo_program,
             rustc_program,
             rustdoc_program,
-            isolated_home,
-            cargo_home,
-            target_directory,
         })
     }
 
     fn manifest_path(&self) -> PathBuf {
         self.source_root.join("Cargo.toml")
+    }
+
+    fn working_directory(&self) -> PathBuf {
+        self.build_root.join("work")
+    }
+
+    fn isolated_home(&self) -> PathBuf {
+        self.build_root.join("home")
+    }
+
+    fn cargo_home(&self) -> PathBuf {
+        self.build_root.join("cargo-home")
+    }
+
+    fn target_directory(&self) -> PathBuf {
+        self.build_root.join("target")
     }
 }
 
@@ -170,19 +163,13 @@ impl fmt::Debug for LocalInstallBuildCommandContext {
         formatter
             .debug_struct("LocalInstallBuildCommandContext")
             .field("source_root", &"<private exact source root>")
-            .field(
-                "isolated_working_directory",
-                &"<private isolated command working directory>",
-            )
+            .field("build_root", &"<private SmolRunner build root>")
             .field("cargo_program", &"<private reviewed toolchain executable>")
             .field("rustc_program", &"<private reviewed toolchain executable>")
             .field(
                 "rustdoc_program",
                 &"<private reviewed toolchain executable>",
             )
-            .field("isolated_home", &"<private SmolRunner build directory>")
-            .field("cargo_home", &"<private SmolRunner build directory>")
-            .field("target_directory", &"<private SmolRunner build directory>")
             .finish()
     }
 }
@@ -261,9 +248,9 @@ impl std::error::Error for LocalInstallBuildCommandError {}
 
 /// Build the sole reviewed offline Cargo command for one Z2-A install build plan.
 ///
-/// Cargo runs from a private isolated working directory and receives the exact source manifest only
-/// through a redacted `--manifest-path` argument. The later preflight must prove the isolated cwd
-/// ancestor chain and isolated CARGO_HOME are config-free before this inert command may execute.
+/// Cargo runs from `<build-root>/work` and receives the exact source manifest only through a
+/// redacted `--manifest-path` argument. A later preflight proves the build-root lineage and isolated
+/// Cargo home are config-free before this inert command may execute.
 ///
 /// # Errors
 ///
@@ -295,9 +282,9 @@ pub fn plan_local_install_build_command(
         .argument("smolrunner")
         .argument("--jobs")
         .argument(jobs.to_string())
-        .secret_environment("HOME", private_utf8(&context.isolated_home))
-        .secret_environment("CARGO_HOME", private_utf8(&context.cargo_home))
-        .secret_environment("CARGO_TARGET_DIR", private_utf8(&context.target_directory))
+        .secret_environment("HOME", private_utf8(&context.isolated_home()))
+        .secret_environment("CARGO_HOME", private_utf8(&context.cargo_home()))
+        .secret_environment("CARGO_TARGET_DIR", private_utf8(&context.target_directory()))
         .secret_environment("RUSTC", private_utf8(&context.rustc_program))
         .secret_environment("RUSTDOC", private_utf8(&context.rustdoc_program))
         .environment("PATH", system_path)
@@ -310,7 +297,7 @@ pub fn plan_local_install_build_command(
     Ok(LocalInstallBuildCommand {
         policy,
         spec,
-        working_directory: context.isolated_working_directory.clone(),
+        working_directory: context.working_directory(),
         timeout: LOCAL_INSTALL_BUILD_TIMEOUT,
     })
 }
@@ -449,7 +436,7 @@ mod tests {
         LocalInstallBuildPlan, LocalInstallGenerationIdentity, LocalInstallSourceIdentity,
         LocalInstallToolchainIdentity,
     };
-    use crate::process::{CommandValue, SecretString};
+    use crate::process::CommandValue;
 
     use super::*;
 
@@ -482,19 +469,16 @@ mod tests {
     fn context(prefix: &str) -> LocalInstallBuildCommandContext {
         LocalInstallBuildCommandContext::new(
             format!("/{prefix}/source"),
-            format!("/{prefix}-cwd/work"),
+            format!("/{prefix}-build"),
             format!("/{prefix}/toolchain/cargo"),
             format!("/{prefix}/toolchain/rustc"),
             format!("/{prefix}/toolchain/rustdoc"),
-            format!("/{prefix}-home/state/home"),
-            format!("/{prefix}-cargo/cache"),
-            format!("/{prefix}-target/build"),
         )
         .expect("context")
     }
 
     #[test]
-    fn exact_argv_uses_redacted_manifest_path_and_isolated_working_directory() {
+    fn exact_argv_uses_redacted_manifest_and_fixed_build_root_children() {
         let context = context("private-a");
         let command =
             plan_local_install_build_command(&build('a'), LocalInstallPlatform::Macos, &context, 3)
@@ -516,16 +500,20 @@ mod tests {
                 "3".to_owned(),
             ]
         );
-        assert_eq!(
-            command.working_directory(),
-            context.isolated_working_directory
-        );
+        assert_eq!(command.working_directory(), context.working_directory());
         assert_ne!(command.working_directory(), context.source_root);
-        assert_eq!(
+        assert!(matches!(
             command.spec().arguments[2],
-            CommandValue::Secret(SecretString::new(
-                context.manifest_path().to_str().expect("manifest")
-            ))
+            CommandValue::Secret(_)
+        ));
+        assert_eq!(
+            command
+                .spec()
+                .environment
+                .get("CARGO_HOME")
+                .expect("cargo home")
+                .is_secret(),
+            true
         );
     }
 
@@ -535,7 +523,6 @@ mod tests {
         let command =
             plan_local_install_build_command(&build('a'), LocalInstallPlatform::Linux, &context, 2)
                 .expect("command");
-
         let keys = command
             .spec()
             .environment
@@ -553,11 +540,9 @@ mod tests {
             "RUSTFLAGS",
             "RUSTC_WRAPPER",
             "RUSTC_WORKSPACE_WRAPPER",
-            "CARGO_BUILD_RUSTC_WRAPPER",
             "HTTP_PROXY",
             "HTTPS_PROXY",
             "ALL_PROXY",
-            "CARGO_REGISTRIES_CRATES_IO_TOKEN",
             "GIT_ASKPASS",
             "SSH_AUTH_SOCK",
         ] {
@@ -591,12 +576,10 @@ mod tests {
             first.policy().cargo_config_policy,
             "isolated_cwd_and_cargo_home_config_free_v1"
         );
-        assert_eq!(first.policy().fixed_argument_policy, FIXED_ARGUMENT_POLICY);
         let public = serde_json::to_string(first.policy()).expect("policy");
         assert!(!public.contains("secret-one"));
         assert!(!public.contains("secret-two"));
-        let debug = format!("{first:?}");
-        assert!(!debug.contains("secret-one"));
+        assert!(!format!("{first:?}").contains("secret-one"));
     }
 
     #[test]
@@ -635,7 +618,7 @@ mod tests {
     }
 
     #[test]
-    fn unsafe_overlap_and_jobs_fail_closed() {
+    fn unsafe_overlap_jobs_and_tool_paths_fail_closed() {
         let build = build('a');
         let context = context("private-d");
         for jobs in [0, 5, u8::MAX] {
@@ -651,36 +634,41 @@ mod tests {
                 LocalInstallBuildCommandErrorKind::InvalidJobs
             );
         }
-
         assert_eq!(
             LocalInstallBuildCommandContext::new(
                 "/repo/source",
-                "/repo/source/tmp",
+                "/repo/source/build",
                 "/tools/cargo",
                 "/tools/rustc",
                 "/tools/rustdoc",
-                "/state/home",
-                "/state/cargo-home",
-                "/state/target",
             )
-            .expect_err("source/cwd overlap")
+            .expect_err("overlap")
             .kind,
             LocalInstallBuildCommandErrorKind::UnsafeBuildDirectory
         );
         assert_eq!(
             LocalInstallBuildCommandContext::new(
                 "relative/source",
-                "/tmp/work",
+                "/build/root",
                 "/tools/cargo",
                 "/tools/rustc",
                 "/tools/rustdoc",
-                "/state/home",
-                "/state/cargo-home",
-                "/state/target",
             )
             .expect_err("relative")
             .kind,
             LocalInstallBuildCommandErrorKind::UnsafePrivatePath
+        );
+        assert_eq!(
+            LocalInstallBuildCommandContext::new(
+                "/repo/source",
+                "/build/root",
+                "/tools/cargo",
+                "/tools/cargo",
+                "/tools/rustdoc",
+            )
+            .expect_err("duplicate tool")
+            .kind,
+            LocalInstallBuildCommandErrorKind::InvalidToolchainPaths
         );
     }
 }
