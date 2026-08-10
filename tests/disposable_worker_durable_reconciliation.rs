@@ -277,7 +277,10 @@ fn every_durable_checkpoint_reopens_without_duplicate_capacity_or_cleanup_loss()
             None,
             true,
         );
-        assert_eq!(action, DisposableWorkerAction::DeleteRunner);
+        assert_eq!(
+            action,
+            DisposableWorkerAction::DeleteRunner { runner: runner() }
+        );
     }
 
     let (state, _) = tick(
@@ -317,4 +320,110 @@ fn every_durable_checkpoint_reopens_without_duplicate_capacity_or_cleanup_loss()
     let store = UnixPersonalWorkerStore::open_or_create_disposable_catalog(root.path()).unwrap();
     let catalog = DisposableAttemptCatalog::new(store).load().unwrap();
     assert_eq!(catalog.host_usage().unwrap().workers(), 0);
+}
+
+#[test]
+fn stale_registration_is_bound_before_delete_and_recovery_never_uses_name_alone() {
+    let root = TempRoot::new();
+    initialize(root.path());
+
+    tick(
+        root.path(),
+        ExactObjectObservation::Absent,
+        ScaleSetRunnerObservation::Absent,
+        None,
+        true,
+    );
+    tick(
+        root.path(),
+        ExactObjectObservation::Matching,
+        ScaleSetRunnerObservation::Absent,
+        None,
+        true,
+    );
+
+    let (catalog, action) = tick(
+        root.path(),
+        ExactObjectObservation::Matching,
+        ScaleSetRunnerObservation::RegistrationOnly { runner: runner() },
+        None,
+        true,
+    );
+    assert!(matches!(
+        action,
+        DisposableWorkerAction::Persist {
+            transition:
+                smolrunner::disposable_attempt_catalog::DisposableAttemptCatalogAction::RecordRegistration(_)
+        }
+    ));
+    assert_eq!(
+        catalog
+            .find_active(&attempt_id())
+            .unwrap()
+            .attempt()
+            .runner_id()
+            .unwrap()
+            .get(),
+        71
+    );
+
+    tick(
+        root.path(),
+        ExactObjectObservation::Matching,
+        ScaleSetRunnerObservation::RegistrationOnly { runner: runner() },
+        None,
+        true,
+    );
+    tick(
+        root.path(),
+        ExactObjectObservation::Absent,
+        ScaleSetRunnerObservation::RegistrationOnly { runner: runner() },
+        None,
+        true,
+    );
+
+    for _ in 0..2 {
+        let (_, action) = tick(
+            root.path(),
+            ExactObjectObservation::Absent,
+            ScaleSetRunnerObservation::RegistrationOnly { runner: runner() },
+            None,
+            true,
+        );
+        assert_eq!(
+            action,
+            DisposableWorkerAction::DeleteRunner { runner: runner() }
+        );
+    }
+
+    let (catalog, _) = tick(
+        root.path(),
+        ExactObjectObservation::Absent,
+        ScaleSetRunnerObservation::Absent,
+        None,
+        true,
+    );
+    let state = catalog.find_active(&attempt_id()).unwrap().attempt();
+    assert_eq!(state.phase(), DisposableAttemptPhase::Releasing);
+
+    let replacement = ScaleSetRunnerReference::new(
+        ScaleSetRunnerId::new(72).unwrap(),
+        ScaleSetRunnerName::parse("smol-attempt-restart-1").unwrap(),
+    );
+    assert_eq!(
+        reconcile_attempt(DisposableWorkerReconcileInput {
+            now: epoch(1_000),
+            attempt: state,
+            vm: ExactObjectObservation::Absent,
+            runner: ScaleSetRunnerObservation::RegistrationOnly {
+                runner: replacement,
+            },
+            job_event: None,
+            capacity_reserved: true,
+            cancellation_requested: false,
+        })
+        .unwrap_err()
+        .code(),
+        "runner_identity_drift"
+    );
 }

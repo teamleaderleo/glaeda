@@ -88,7 +88,7 @@ fn populated_catalog() -> DisposableAttemptCatalogDocument {
         &registered,
         1,
         DisposableAttemptCatalogAction::RecordTerminal {
-            runner: None,
+            runner: Some(runner(1, 11)),
             job_id: ScaleSetJobId::parse("completed-job-1").unwrap(),
             result: ScaleSetJobResult::parse("succeeded").unwrap(),
         },
@@ -213,7 +213,7 @@ fn saturated_tombstone_history_retains_a_safe_revision_lower_bound() {
             &document,
             index,
             DisposableAttemptCatalogAction::RecordTerminal {
-                runner: None,
+                runner: Some(runner(index, 1_000 + u64::try_from(index).unwrap())),
                 job_id: ScaleSetJobId::parse(&format!("completed-job-{index}")).unwrap(),
                 result: ScaleSetJobResult::parse("succeeded").unwrap(),
             },

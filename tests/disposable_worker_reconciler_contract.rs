@@ -252,13 +252,34 @@ fn happy_path_uses_canonical_durable_transitions() {
 }
 
 #[test]
-fn crash_discovered_registration_is_deleted_before_regeneration() {
+fn crash_discovered_registration_is_durably_bound_before_cleanup() {
     let mut state = attempt().begin_provisioning().unwrap();
     state = state.begin_registration().unwrap();
-    let registered = ScaleSetRunnerObservation::RegistrationOnly { runner: runner(41) };
+    let exact_runner = runner(41);
+    let action = reconcile_attempt(input(
+        &state,
+        ExactObjectObservation::Matching,
+        ScaleSetRunnerObservation::RegistrationOnly {
+            runner: exact_runner.clone(),
+        },
+    ))
+    .unwrap();
     assert_eq!(
-        reconcile_attempt(input(&state, ExactObjectObservation::Matching, registered,)).unwrap(),
-        DisposableWorkerAction::DeleteRunner
+        action,
+        persist(DisposableAttemptCatalogAction::RecordRegistration(
+            exact_runner
+        ))
+    );
+    state = apply(&state, &action);
+    assert_eq!(state.runner_id().unwrap().get(), 41);
+    assert_eq!(
+        reconcile_attempt(input(
+            &state,
+            ExactObjectObservation::Matching,
+            ScaleSetRunnerObservation::RegistrationOnly { runner: runner(41) },
+        ))
+        .unwrap(),
+        persist(DisposableAttemptCatalogAction::BeginCleanup)
     );
     assert_eq!(
         reconcile_attempt(input(
@@ -267,12 +288,12 @@ fn crash_discovered_registration_is_deleted_before_regeneration() {
             ScaleSetRunnerObservation::Absent,
         ))
         .unwrap(),
-        DisposableWorkerAction::GenerateJitAndStartRunner
+        persist(DisposableAttemptCatalogAction::BeginCleanup)
     );
 }
 
 #[test]
-fn completion_before_assignment_is_durable_and_still_cleans_up() {
+fn runnerless_completion_without_attempt_binding_fails_closed() {
     let state = attempt();
     let mut completed = input(
         &state,
@@ -284,17 +305,9 @@ fn completion_before_assignment_is_durable_and_still_cleans_up() {
         job_id: job("cancelled-before-assignment"),
         result: result("canceled"),
     });
-    let action = reconcile_attempt(completed).unwrap();
-    let state = apply(&state, &action);
-    assert_eq!(state.phase(), DisposableAttemptPhase::Terminal);
     assert_eq!(
-        reconcile_attempt(input(
-            &state,
-            ExactObjectObservation::Absent,
-            ScaleSetRunnerObservation::Absent,
-        ))
-        .unwrap(),
-        persist(DisposableAttemptCatalogAction::BeginCleanup)
+        reconcile_attempt(completed).unwrap_err().code(),
+        "github_job_identity_drift"
     );
 }
 
@@ -302,6 +315,12 @@ fn completion_before_assignment_is_durable_and_still_cleans_up() {
 fn terminal_cleanup_orders_vm_runner_and_capacity_release() {
     let exact_runner = runner(41);
     let mut state = attempt()
+        .begin_provisioning()
+        .unwrap()
+        .begin_registration()
+        .unwrap()
+        .record_assigned(job("job-cleanup"))
+        .unwrap()
         .record_terminal(None, job("job-cleanup"), result("failed"))
         .unwrap()
         .begin_cleanup()
@@ -327,16 +346,34 @@ fn terminal_cleanup_orders_vm_runner_and_capacity_release() {
     .unwrap();
     state = apply(&state, &action);
     assert_eq!(state.phase(), DisposableAttemptPhase::Deregistering);
+    let action = reconcile_attempt(input(
+        &state,
+        ExactObjectObservation::Absent,
+        ScaleSetRunnerObservation::RegistrationOnly {
+            runner: exact_runner.clone(),
+        },
+    ))
+    .unwrap();
+    assert_eq!(
+        action,
+        persist(DisposableAttemptCatalogAction::RecordRegistration(
+            exact_runner.clone()
+        ))
+    );
+    state = apply(&state, &action);
+    assert_eq!(state.phase(), DisposableAttemptPhase::Deregistering);
     assert_eq!(
         reconcile_attempt(input(
             &state,
             ExactObjectObservation::Absent,
             ScaleSetRunnerObservation::RegistrationOnly {
-                runner: exact_runner,
+                runner: exact_runner.clone(),
             },
         ))
         .unwrap(),
-        DisposableWorkerAction::DeleteRunner
+        DisposableWorkerAction::DeleteRunner {
+            runner: exact_runner
+        }
     );
     let action = reconcile_attempt(input(
         &state,
@@ -501,6 +538,62 @@ fn late_duplicate_event_does_not_reverse_cleanup() {
     assert_eq!(
         reconcile_attempt(duplicate).unwrap(),
         DisposableWorkerAction::DestroyVm
+    );
+}
+
+#[test]
+fn first_late_job_events_are_checkpointed_without_reversing_cleanup() {
+    let exact_runner = runner(41);
+    let mut state = attempt().begin_cleanup().unwrap();
+    let mut started = input(
+        &state,
+        ExactObjectObservation::Matching,
+        ScaleSetRunnerObservation::RegistrationOnly {
+            runner: exact_runner.clone(),
+        },
+    );
+    started.job_event = Some(ScaleSetJobEvent::Started {
+        runner: exact_runner.clone(),
+        job_id: job("job-late-first"),
+    });
+    let action = reconcile_attempt(started).unwrap();
+    state = apply(&state, &action);
+    assert_eq!(state.phase(), DisposableAttemptPhase::Destroying);
+    assert_eq!(state.runner_id().unwrap().get(), 41);
+    assert_eq!(state.github_job_id().unwrap().as_str(), "job-late-first");
+
+    let mut completed = input(
+        &state,
+        ExactObjectObservation::Matching,
+        ScaleSetRunnerObservation::RegistrationOnly {
+            runner: exact_runner.clone(),
+        },
+    );
+    completed.job_event = Some(ScaleSetJobEvent::Completed {
+        runner: Some(exact_runner.clone()),
+        job_id: job("job-late-first"),
+        result: result("succeeded"),
+    });
+    let action = reconcile_attempt(completed).unwrap();
+    state = apply(&state, &action);
+    assert_eq!(state.phase(), DisposableAttemptPhase::Destroying);
+    assert_eq!(state.result().unwrap().as_str(), "succeeded");
+
+    let mut conflicting = input(
+        &state,
+        ExactObjectObservation::Matching,
+        ScaleSetRunnerObservation::RegistrationOnly {
+            runner: exact_runner.clone(),
+        },
+    );
+    conflicting.job_event = Some(ScaleSetJobEvent::Completed {
+        runner: Some(exact_runner),
+        job_id: job("job-late-first"),
+        result: result("failed"),
+    });
+    assert_eq!(
+        reconcile_attempt(conflicting).unwrap_err().code(),
+        "github_job_identity_drift"
     );
 }
 

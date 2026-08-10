@@ -359,7 +359,9 @@ pub enum DisposableWorkerAction {
     GenerateJitAndStartRunner,
     Wait,
     DestroyVm,
-    DeleteRunner,
+    DeleteRunner {
+        runner: ScaleSetRunnerReference,
+    },
     ReleaseCapacity,
     NoOp,
     Blocked {
@@ -432,11 +434,19 @@ pub fn reconcile_attempt(
             ScaleSetRunnerObservation::Unknown => Action::Observe {
                 target: DisposableWorkerObservationTarget::Runner,
             },
-            ScaleSetRunnerObservation::Absent => Action::GenerateJitAndStartRunner,
-            ScaleSetRunnerObservation::RegistrationOnly { .. }
+            ScaleSetRunnerObservation::Absent if input.attempt.runner_id().is_none() => {
+                Action::GenerateJitAndStartRunner
+            }
+            ScaleSetRunnerObservation::Absent => {
+                persist(DisposableAttemptCatalogAction::BeginCleanup)
+            }
+            ScaleSetRunnerObservation::RegistrationOnly { runner }
                 if input.attempt.runner_id().is_none() =>
             {
-                Action::DeleteRunner
+                persist(validate_transition(
+                    input.attempt,
+                    DisposableAttemptCatalogAction::RecordRegistration(runner.clone()),
+                )?)
             }
             ScaleSetRunnerObservation::RegistrationOnly { .. } => {
                 persist(DisposableAttemptCatalogAction::BeginCleanup)
@@ -507,8 +517,19 @@ pub fn reconcile_attempt(
             ScaleSetRunnerObservation::Absent => persist(
                 DisposableAttemptCatalogAction::AdvanceCleanup(Phase::Releasing),
             ),
-            ScaleSetRunnerObservation::RegistrationOnly { .. }
-            | ScaleSetRunnerObservation::IdleReady { .. } => Action::DeleteRunner,
+            ScaleSetRunnerObservation::RegistrationOnly { runner }
+            | ScaleSetRunnerObservation::IdleReady { runner }
+                if input.attempt.runner_id().is_none() =>
+            {
+                persist(validate_transition(
+                    input.attempt,
+                    DisposableAttemptCatalogAction::RecordRegistration(runner.clone()),
+                )?)
+            }
+            ScaleSetRunnerObservation::RegistrationOnly { runner }
+            | ScaleSetRunnerObservation::IdleReady { runner } => Action::DeleteRunner {
+                runner: runner.clone(),
+            },
             ScaleSetRunnerObservation::Conflicting => unreachable!(),
         },
         Phase::Releasing if matches!(input.vm, ExactObjectObservation::Unknown) => {
@@ -524,13 +545,28 @@ pub fn reconcile_attempt(
                 target: DisposableWorkerObservationTarget::Runner,
             }
         }
-        Phase::Releasing if !matches!(input.runner, ScaleSetRunnerObservation::Absent) => {
-            Action::DeleteRunner
-        }
-        Phase::Releasing if input.capacity_reserved => Action::ReleaseCapacity,
-        Phase::Releasing => persist(DisposableAttemptCatalogAction::AdvanceCleanup(
-            Phase::Complete,
-        )),
+        Phase::Releasing => match &input.runner {
+            ScaleSetRunnerObservation::RegistrationOnly { runner }
+            | ScaleSetRunnerObservation::IdleReady { runner }
+                if input.attempt.runner_id().is_none() =>
+            {
+                persist(validate_transition(
+                    input.attempt,
+                    DisposableAttemptCatalogAction::RecordRegistration(runner.clone()),
+                )?)
+            }
+            ScaleSetRunnerObservation::RegistrationOnly { runner }
+            | ScaleSetRunnerObservation::IdleReady { runner } => Action::DeleteRunner {
+                runner: runner.clone(),
+            },
+            ScaleSetRunnerObservation::Absent if input.capacity_reserved => Action::ReleaseCapacity,
+            ScaleSetRunnerObservation::Absent => persist(
+                DisposableAttemptCatalogAction::AdvanceCleanup(Phase::Complete),
+            ),
+            ScaleSetRunnerObservation::Unknown | ScaleSetRunnerObservation::Conflicting => {
+                unreachable!()
+            }
+        },
         Phase::Complete if input.capacity_reserved => Action::Blocked {
             code: "completed_attempt_retains_capacity",
         },
@@ -627,16 +663,6 @@ fn plan_job_event(
     attempt: &DisposableAttemptState,
     event: &ScaleSetJobEvent,
 ) -> Result<Option<DisposableWorkerAction>, DisposableWorkerReconcilerError> {
-    if matches!(
-        attempt.phase(),
-        DisposableAttemptPhase::Destroying
-            | DisposableAttemptPhase::Deregistering
-            | DisposableAttemptPhase::Releasing
-            | DisposableAttemptPhase::Complete
-    ) {
-        validate_late_job_event_identity(attempt, event)?;
-        return Ok(None);
-    }
     let transition = match event {
         ScaleSetJobEvent::Started { runner, job_id } => {
             DisposableAttemptCatalogAction::RecordRunning {
@@ -675,30 +701,6 @@ fn plan_job_event(
         )
     })?;
     Ok((after.revision() != before).then(|| persist(transition)))
-}
-
-fn validate_late_job_event_identity(
-    attempt: &DisposableAttemptState,
-    event: &ScaleSetJobEvent,
-) -> Result<(), DisposableWorkerReconcilerError> {
-    let runner = event.runner();
-    let job_id = event.job_id();
-    let runner_matches = runner.is_none_or(|runner| {
-        runner.name == *attempt.runner_name()
-            && attempt.runner_id().is_none_or(|id| id == runner.id)
-    });
-    let job_matches = attempt
-        .github_job_id()
-        .is_none_or(|current| current == job_id);
-    if runner_matches && job_matches {
-        Ok(())
-    } else {
-        Err(DisposableWorkerReconcilerError::new(
-            "job_event",
-            "github_job_identity_drift",
-            "late job event conflicts with cleanup-bound durable identity",
-        ))
-    }
 }
 
 fn validate_identifier(
