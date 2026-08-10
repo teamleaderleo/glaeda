@@ -278,7 +278,7 @@ impl ProjectCheckoutObserver {
             return Err(not_worktree());
         }
         require_success(&top_level)?;
-        if PathBuf::from(parse_single_line(&top_level.stdout)?) != checkout {
+        if Path::new(parse_single_line(&top_level.stdout)?) != checkout.as_path() {
             return Err(not_worktree());
         }
 
