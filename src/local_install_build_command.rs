@@ -94,13 +94,13 @@ impl LocalInstallBuildCommandContext {
         cargo_home: impl Into<PathBuf>,
         target_directory: impl Into<PathBuf>,
     ) -> Result<Self, LocalInstallBuildCommandError> {
-        let repository_root = private_path("repository_root", repository_root.into())?;
-        let cargo_program = private_path("cargo_program", cargo_program.into())?;
-        let rustc_program = private_path("rustc_program", rustc_program.into())?;
-        let rustdoc_program = private_path("rustdoc_program", rustdoc_program.into())?;
-        let isolated_home = private_path("isolated_home", isolated_home.into())?;
-        let cargo_home = private_path("cargo_home", cargo_home.into())?;
-        let target_directory = private_path("target_directory", target_directory.into())?;
+        let repository_root = private_path(repository_root.into())?;
+        let cargo_program = private_path(cargo_program.into())?;
+        let rustc_program = private_path(rustc_program.into())?;
+        let rustdoc_program = private_path(rustdoc_program.into())?;
+        let isolated_home = private_path(isolated_home.into())?;
+        let cargo_home = private_path(cargo_home.into())?;
+        let target_directory = private_path(target_directory.into())?;
 
         if cargo_program == rustc_program
             || cargo_program == rustdoc_program
@@ -256,11 +256,11 @@ pub fn plan_local_install_build_command(
         .argument("smolrunner")
         .argument("--jobs")
         .argument(jobs.to_string())
-        .environment("HOME", private_utf8(&context.isolated_home))
-        .environment("CARGO_HOME", private_utf8(&context.cargo_home))
-        .environment("CARGO_TARGET_DIR", private_utf8(&context.target_directory))
-        .environment("RUSTC", private_utf8(&context.rustc_program))
-        .environment("RUSTDOC", private_utf8(&context.rustdoc_program))
+        .secret_environment("HOME", private_utf8(&context.isolated_home))
+        .secret_environment("CARGO_HOME", private_utf8(&context.cargo_home))
+        .secret_environment("CARGO_TARGET_DIR", private_utf8(&context.target_directory))
+        .secret_environment("RUSTC", private_utf8(&context.rustc_program))
+        .secret_environment("RUSTDOC", private_utf8(&context.rustdoc_program))
         .environment("PATH", system_path)
         .environment("LANG", "C")
         .environment("LC_ALL", "C")
@@ -323,10 +323,7 @@ fn policy(
     })
 }
 
-fn private_path(
-    _field: &'static str,
-    path: PathBuf,
-) -> Result<PathBuf, LocalInstallBuildCommandError> {
+fn private_path(path: PathBuf) -> Result<PathBuf, LocalInstallBuildCommandError> {
     if !path.is_absolute()
         || path == Path::new("/")
         || path.to_str().is_none()
@@ -438,8 +435,12 @@ mod tests {
     fn plain(value: &CommandValue) -> &str {
         match value {
             CommandValue::Plain(value) => value,
-            CommandValue::Secret(_) => panic!("self-build command uses no secret values"),
+            CommandValue::Secret(_) => panic!("expected fixed public command value"),
         }
+    }
+
+    fn is_secret(value: &CommandValue) -> bool {
+        matches!(value, CommandValue::Secret(_))
     }
 
     #[test]
@@ -490,7 +491,7 @@ mod tests {
     }
 
     #[test]
-    fn private_context_populates_only_reviewed_private_values() {
+    fn private_context_values_are_redacted_inside_command_spec() {
         let context = context("private-b");
         let command = plan_local_install_build_command(
             &build('a'),
@@ -501,15 +502,12 @@ mod tests {
         .expect("command");
 
         assert_eq!(command.spec().program, context.cargo_program);
-        assert_eq!(command.working_directory(), context.repository_root);
-        assert_eq!(
-            plain(command.spec().environment.get("RUSTC").expect("rustc")),
-            context.rustc_program.to_str().expect("rustc path")
-        );
-        assert_eq!(
-            plain(command.spec().environment.get("RUSTDOC").expect("rustdoc")),
-            context.rustdoc_program.to_str().expect("rustdoc path")
-        );
+        assert_eq!(command.working_directory(), context.repository_root.as_path());
+        for key in ["HOME", "CARGO_HOME", "CARGO_TARGET_DIR", "RUSTC", "RUSTDOC"] {
+            assert!(is_secret(
+                command.spec().environment.get(key).expect("private value")
+            ));
+        }
         assert_eq!(
             plain(command.spec().environment.get("PATH").expect("path")),
             LINUX_SYSTEM_PATH
@@ -524,6 +522,9 @@ mod tests {
             ),
             "true"
         );
+        let serialized = serde_json::to_string(command.spec()).expect("serialized command spec");
+        assert!(!serialized.contains("private-b/state"));
+        assert!(serialized.contains("[REDACTED]"));
         assert_eq!(command.timeout(), LOCAL_INSTALL_BUILD_TIMEOUT);
     }
 
