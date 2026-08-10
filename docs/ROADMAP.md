@@ -72,6 +72,40 @@ Prefer mature components for GitHub protocol semantics, VM isolation, guest OS, 
 
 The R01 implementation remains useful defense-in-depth and future Linux/container work. No additional narrow R01 proof slice blocks the disposable VM product path.
 
+## Adjacent operator lane — developer namespace and blank-Mac recovery
+
+The disposable worker path is the production critical path. A separate operator-experience lane may make the **development machine itself reproducible** without turning persistent developer state into CI execution state. The governing design is [Developer project namespace and workstation recovery](PROJECT_WORKSPACES.md), tracked in [#372](https://github.com/teamleaderleo/smolrunner/issues/372).
+
+The target experience is:
+
+```text
+replacement Mac
+-> restore reviewed operator catalog
+-> converge developer environment
+-> smolrunner project enter PROJECT
+-> work
+```
+
+This lane owns logical project names, a portable secret-free catalog, adoption of existing Mac checkouts, lazy repository materialization, one trusted persistent developer Lima environment, generation-based publication/recovery, and eventual blank-Mac convergence. It borrows Nix/OSTree-style prepare/prove/switch semantics plus SmolRunner's existing compare-and-swap and reconciliation discipline.
+
+It must preserve the production boundary:
+
+- persistent developer checkouts never mount into hostile CI workers;
+- developer credentials never flow into disposable workers;
+- persistent writable developer caches carry no verification authority merely by existing;
+- exact source identity remains separate from materialization and execution identity;
+- destructive project cleanup still requires exact ownership evidence and separate authority.
+
+Initial sequence:
+
+- [x] P1 design and canonical identity contract in `docs/PROJECT_WORKSPACES.md` and #372.
+- [ ] P2 read-only catalog parsing, alias resolution, and explicit-root checkout discovery.
+- [ ] P3 in-place adoption of existing `~/Projects` checkouts plus durable catalog generations and local-only-risk reporting.
+- [ ] P4 one persistent developer Lima environment plus `project ensure` / `project enter` for a public repository.
+- [ ] P5 reviewed blank-Mac convergence with eager essential projects, lazy remainder, and explicit credential blockers.
+
+P2/P3 can progress as bounded read-only/durable-state work when they do not collide with disposable-worker milestones. P4/P5 must reuse mature host/VM/dependency tooling and may not divert the hostile-CI backend into a persistent worker model.
+
 ## Gate A — dependency and adapter boundary
 
 Before broad M2-M4 implementation, finish the research in [#368](https://github.com/teamleaderleo/smolrunner/issues/368) far enough to keep the core from duplicating mature projects.
