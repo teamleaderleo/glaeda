@@ -23,7 +23,26 @@ const SHA256_PREFIX: &str = "sha256:";
 const HEX: &[u8; 16] = b"0123456789abcdef";
 
 #[derive(Clone, PartialEq, Eq)]
-struct PrivateDiscoveryLocation(PathBuf);
+struct PrivateDiscoveryLocation {
+    path: PathBuf,
+    identity: Option<FilesystemIdentity>,
+}
+
+impl PrivateDiscoveryLocation {
+    fn observed(path: PathBuf, identity: FilesystemIdentity) -> Self {
+        Self {
+            path,
+            identity: Some(identity),
+        }
+    }
+
+    fn unavailable(path: PathBuf) -> Self {
+        Self {
+            path,
+            identity: None,
+        }
+    }
+}
 
 impl fmt::Debug for PrivateDiscoveryLocation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -113,7 +132,7 @@ pub struct ProjectDiscoveryEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checkout: Option<ProjectCheckoutObservation>,
     #[serde(skip)]
-    location: Option<PrivateDiscoveryLocation>,
+    location: PrivateDiscoveryLocation,
 }
 
 impl ProjectDiscoveryEntry {
@@ -121,7 +140,7 @@ impl ProjectDiscoveryEntry {
         slot: u16,
         observation: ProjectCheckoutObservation,
         project_match: ProjectDiscoveryMatch,
-        location: PathBuf,
+        location: PrivateDiscoveryLocation,
     ) -> Self {
         let entry_id = Some(observation.materialization_id().clone());
         let recovery = Some(ProjectRecoveryRisk::from_observation(&observation));
@@ -132,7 +151,7 @@ impl ProjectDiscoveryEntry {
             project_match: Some(project_match),
             recovery,
             checkout: Some(observation),
-            location: Some(PrivateDiscoveryLocation(location)),
+            location,
         }
     }
 
@@ -140,7 +159,7 @@ impl ProjectDiscoveryEntry {
         slot: u16,
         entry_id: Option<Sha256Digest>,
         kind: ProjectDiscoveryEntryKind,
-        location: PathBuf,
+        location: PrivateDiscoveryLocation,
     ) -> Self {
         Self {
             slot,
@@ -149,7 +168,7 @@ impl ProjectDiscoveryEntry {
             project_match: None,
             recovery: None,
             checkout: None,
-            location: Some(PrivateDiscoveryLocation(location)),
+            location,
         }
     }
 
@@ -236,7 +255,8 @@ impl std::error::Error for ProjectDiscoveryError {}
 ///
 /// Discovery is offline and read-only. It never recurses beneath an immediate child. Private child
 /// names are used only to produce deterministic per-scan slot ordering and never enter the public
-/// report.
+/// report. The immediate child set and every observed child filesystem identity are rechecked after
+/// checkout observation so add/remove/rename/replacement races fail as `root_changed`.
 ///
 /// # Errors
 ///
@@ -263,21 +283,11 @@ pub fn discover_project_root(
     let root_identity = FilesystemIdentity::from_metadata(&root_metadata);
     let root_id = opaque_filesystem_id(ROOT_ID_DOMAIN, root_identity)?;
 
-    let mut candidates = Vec::new();
-    let directory = std::fs::read_dir(root).map_err(|_| root_unavailable())?;
-    for entry in directory {
-        let entry = entry.map_err(|_| root_changed())?;
-        if candidates.len() >= MAX_PROJECT_DISCOVERY_ENTRIES {
-            return Err(too_many_entries());
-        }
-        let name = entry.file_name();
-        candidates.push(Candidate {
-            sort_key: name.as_bytes().to_vec(),
-            path: entry.path(),
-        });
-    }
-    candidates.sort_by(|left, right| left.sort_key.cmp(&right.sort_key));
-
+    let candidates = read_candidates(root)?;
+    let initial_keys = candidates
+        .iter()
+        .map(|candidate| candidate.sort_key.clone())
+        .collect::<Vec<_>>();
     let mut entries = Vec::with_capacity(candidates.len());
     for (index, candidate) in candidates.into_iter().enumerate() {
         let slot = u16::try_from(index).map_err(|_| too_many_entries())?;
@@ -291,10 +301,7 @@ pub fn discover_project_root(
     }
 
     mark_duplicate_materializations(&mut entries);
-    let final_metadata = std::fs::metadata(root).map_err(|_| root_changed())?;
-    if !root_identity.matches(&final_metadata) {
-        return Err(root_changed());
-    }
+    validate_discovery_stable(root, root_identity, &initial_keys, &entries)?;
     let summary = summarize(&entries)?;
     Ok(ProjectDiscoveryReport {
         schema_version: PROJECT_DISCOVERY_SCHEMA_VERSION,
@@ -302,7 +309,7 @@ pub fn discover_project_root(
         catalog_identity: catalog.identity().clone(),
         entries,
         summary,
-        root_location: PrivateDiscoveryLocation(root.to_path_buf()),
+        root_location: PrivateDiscoveryLocation::observed(root.to_path_buf(), root_identity),
     })
 }
 
@@ -312,7 +319,7 @@ struct Candidate {
     path: PathBuf,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FilesystemIdentity {
     device: u64,
     inode: u64,
@@ -329,11 +336,28 @@ impl FilesystemIdentity {
     }
 
     fn matches(self, metadata: &std::fs::Metadata) -> bool {
-        metadata.is_dir()
-            && metadata.dev() == self.device
+        metadata.dev() == self.device
             && metadata.ino() == self.inode
             && metadata.uid() == self.owner
     }
+}
+
+fn read_candidates(root: &Path) -> Result<Vec<Candidate>, ProjectDiscoveryError> {
+    let mut candidates = Vec::new();
+    let directory = std::fs::read_dir(root).map_err(|_| root_unavailable())?;
+    for entry in directory {
+        let entry = entry.map_err(|_| root_changed())?;
+        if candidates.len() >= MAX_PROJECT_DISCOVERY_ENTRIES {
+            return Err(too_many_entries());
+        }
+        let name = entry.file_name();
+        candidates.push(Candidate {
+            sort_key: name.as_bytes().to_vec(),
+            path: entry.path(),
+        });
+    }
+    candidates.sort_by(|left, right| left.sort_key.cmp(&right.sort_key));
+    Ok(candidates)
 }
 
 fn discover_candidate(
@@ -350,18 +374,19 @@ fn discover_candidate(
                 slot,
                 None,
                 ProjectDiscoveryEntryKind::Unknown,
-                path,
+                PrivateDiscoveryLocation::unavailable(path),
             );
         }
     };
-    let entry_id = opaque_filesystem_id(ENTRY_ID_DOMAIN, FilesystemIdentity::from_metadata(&metadata))
-        .ok();
+    let identity = FilesystemIdentity::from_metadata(&metadata);
+    let entry_id = opaque_filesystem_id(ENTRY_ID_DOMAIN, identity).ok();
+    let location = PrivateDiscoveryLocation::observed(path.clone(), identity);
     if metadata.file_type().is_symlink() {
         return ProjectDiscoveryEntry::classified(
             slot,
             entry_id,
             ProjectDiscoveryEntryKind::Symlink,
-            path,
+            location,
         );
     }
     if !metadata.is_dir() {
@@ -369,7 +394,7 @@ fn discover_candidate(
             slot,
             entry_id,
             ProjectDiscoveryEntryKind::NonDirectory,
-            path,
+            location,
         );
     }
     if path.to_str().is_none() {
@@ -377,14 +402,14 @@ fn discover_candidate(
             slot,
             entry_id,
             ProjectDiscoveryEntryKind::Unknown,
-            path,
+            location,
         );
     }
 
     match observer.observe(&path, executor) {
         Ok(observation) => {
             let project_match = match_project(catalog, &observation);
-            ProjectDiscoveryEntry::checkout(slot, observation, project_match, path)
+            ProjectDiscoveryEntry::checkout(slot, observation, project_match, location)
         }
         Err(error) => {
             let kind = match error.kind {
@@ -394,18 +419,16 @@ fn discover_candidate(
                 ProjectCheckoutObservationErrorKind::BareRepository => {
                     ProjectDiscoveryEntryKind::BareRepository
                 }
-                ProjectCheckoutObservationErrorKind::UnsafePath => {
-                    ProjectDiscoveryEntryKind::Symlink
-                }
                 ProjectCheckoutObservationErrorKind::SourceChanged => {
                     ProjectDiscoveryEntryKind::Changed
                 }
-                ProjectCheckoutObservationErrorKind::Unavailable
+                ProjectCheckoutObservationErrorKind::UnsafePath
+                | ProjectCheckoutObservationErrorKind::Unavailable
                 | ProjectCheckoutObservationErrorKind::InvalidOutput => {
                     ProjectDiscoveryEntryKind::Unknown
                 }
             };
-            ProjectDiscoveryEntry::classified(slot, entry_id, kind, path)
+            ProjectDiscoveryEntry::classified(slot, entry_id, kind, location)
         }
     }
 }
@@ -417,7 +440,7 @@ fn match_project(
     let observed_projects = observation
         .remotes()
         .iter()
-        .filter_map(|remote| remote.project.as_ref())
+        .filter_map(|remote| remote.project.clone())
         .collect::<BTreeSet<_>>();
     let catalog_matches = catalog
         .projects()
@@ -460,7 +483,38 @@ fn mark_duplicate_materializations(entries: &mut [ProjectDiscoveryEntry]) {
     }
 }
 
-fn summarize(entries: &[ProjectDiscoveryEntry]) -> Result<ProjectDiscoverySummary, ProjectDiscoveryError> {
+fn validate_discovery_stable(
+    root: &Path,
+    root_identity: FilesystemIdentity,
+    initial_keys: &[Vec<u8>],
+    entries: &[ProjectDiscoveryEntry],
+) -> Result<(), ProjectDiscoveryError> {
+    let final_metadata = std::fs::metadata(root).map_err(|_| root_changed())?;
+    if !final_metadata.is_dir() || !root_identity.matches(&final_metadata) {
+        return Err(root_changed());
+    }
+    let final_candidates = read_candidates(root).map_err(|_| root_changed())?;
+    let final_keys = final_candidates
+        .into_iter()
+        .map(|candidate| candidate.sort_key)
+        .collect::<Vec<_>>();
+    if final_keys != initial_keys {
+        return Err(root_changed());
+    }
+    for entry in entries {
+        let current = std::fs::symlink_metadata(&entry.location.path);
+        match (entry.location.identity, current) {
+            (Some(expected), Ok(metadata)) if expected.matches(&metadata) => {}
+            (None, Err(_)) => {}
+            _ => return Err(root_changed()),
+        }
+    }
+    Ok(())
+}
+
+fn summarize(
+    entries: &[ProjectDiscoveryEntry],
+) -> Result<ProjectDiscoverySummary, ProjectDiscoveryError> {
     let mut summary = ProjectDiscoverySummary {
         entry_count: bounded_count(entries.len())?,
         checkout_count: 0,
@@ -606,7 +660,7 @@ fn invalid_identity() -> ProjectDiscoveryError {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
     use std::fs;
     use std::io;
@@ -686,6 +740,8 @@ mod tests {
     struct ScriptedExecutor {
         responses: RefCell<VecDeque<Response>>,
         commands: RefCell<Vec<CommandSpec>>,
+        mutation_root: Option<PathBuf>,
+        mutated: Cell<bool>,
     }
 
     impl ScriptedExecutor {
@@ -693,6 +749,17 @@ mod tests {
             Self {
                 responses: RefCell::new(responses.into()),
                 commands: RefCell::new(Vec::new()),
+                mutation_root: None,
+                mutated: Cell::new(false),
+            }
+        }
+
+        fn with_root_mutation(responses: Vec<Response>, root: &Path) -> Self {
+            Self {
+                responses: RefCell::new(responses.into()),
+                commands: RefCell::new(Vec::new()),
+                mutation_root: Some(root.to_path_buf()),
+                mutated: Cell::new(false),
             }
         }
     }
@@ -711,6 +778,11 @@ mod tests {
         ) -> io::Result<ExecutionRecord> {
             assert_eq!(timeout, PROJECT_CHECKOUT_COMMAND_TIMEOUT);
             self.commands.borrow_mut().push(spec.clone());
+            if let Some(root) = self.mutation_root.as_ref() {
+                if !self.mutated.replace(true) {
+                    fs::create_dir(root.join("late-entry")).expect("mutate discovery root");
+                }
+            }
             let response = self
                 .responses
                 .borrow_mut()
@@ -792,13 +864,8 @@ projects:
         );
         let executor = ScriptedExecutor::new(checkout_responses(&checkout, remotes, &status));
 
-        let report = discover_project_root(
-            root.path(),
-            &catalog(),
-            &observer(),
-            &executor,
-        )
-        .expect("discovery report");
+        let report = discover_project_root(root.path(), &catalog(), &observer(), &executor)
+            .expect("discovery report");
 
         assert_eq!(report.entries().len(), 1);
         let entry = &report.entries()[0];
@@ -834,13 +901,8 @@ projects:
         responses.extend(checkout_responses(&second, remote, &status));
         let executor = ScriptedExecutor::new(responses);
 
-        let report = discover_project_root(
-            root.path(),
-            &catalog(),
-            &observer(),
-            &executor,
-        )
-        .expect("duplicate discovery");
+        let report = discover_project_root(root.path(), &catalog(), &observer(), &executor)
+            .expect("duplicate discovery");
         assert_eq!(report.entries().len(), 2);
         assert!(report.entries().iter().all(|entry| {
             entry
@@ -870,13 +932,8 @@ projects:
             Response::success("true\n"),
             Response::failed(128, "fatal: target is non-git"),
         ]);
-        let report = discover_project_root(
-            root.path(),
-            &catalog(),
-            &observer(),
-            &executor,
-        )
-        .expect("classification report");
+        let report = discover_project_root(root.path(), &catalog(), &observer(), &executor)
+            .expect("classification report");
 
         let kinds = report
             .entries()
@@ -921,5 +978,19 @@ projects:
             .expect_err("aliased root");
         assert_eq!(error.kind, ProjectDiscoveryErrorKind::UnsafeRoot);
         assert!(executor.commands.borrow().is_empty());
+    }
+
+    #[test]
+    fn root_child_set_change_fails_closed() {
+        let root = TempRoot::new("root-change");
+        let checkout = root.directory("checkout");
+        let remote = "remote.origin.url\nhttps://github.com/teamleaderleo/smolrunner.git\0";
+        let status = format!("# branch.oid {COMMIT}\0# branch.head main\0");
+        let responses = checkout_responses(&checkout, remote, &status);
+        let executor = ScriptedExecutor::with_root_mutation(responses, root.path());
+
+        let error = discover_project_root(root.path(), &catalog(), &observer(), &executor)
+            .expect_err("root changed during discovery");
+        assert_eq!(error.kind, ProjectDiscoveryErrorKind::RootChanged);
     }
 }
