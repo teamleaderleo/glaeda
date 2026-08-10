@@ -1055,12 +1055,7 @@ mod tests {
             Response::success("false\n"),
             Response::success(format!("{}\n", checkout.path().display())),
         ];
-        responses.extend(snapshot_responses(
-            remotes,
-            &status,
-            "100644\n",
-            worktrees,
-        ));
+        responses.extend(snapshot_responses(remotes, &status, "100644\n", worktrees));
         responses.extend(snapshot_responses(
             "remote.origin.url\nhttps://github.com/example/changed.git\0",
             &status,
@@ -1071,6 +1066,9 @@ mod tests {
         let error = observer()
             .observe(checkout.path(), &executor)
             .expect_err("changed snapshot");
-        assert_eq!(error.kind, ProjectCheckoutObservationErrorKind::SourceChanged);
+        assert_eq!(
+            error.kind,
+            ProjectCheckoutObservationErrorKind::SourceChanged
+        );
     }
 }
