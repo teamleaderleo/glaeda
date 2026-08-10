@@ -11,8 +11,7 @@ use smolrunner::disposable_worker_reconciler::{
 };
 use smolrunner::execution_admission::EpochMillis;
 use smolrunner::github_scale_set_protocol::{
-    ScaleSetJobId, ScaleSetJobResult, ScaleSetRunnerId, ScaleSetRunnerName,
-    ScaleSetRunnerReference,
+    ScaleSetJobId, ScaleSetJobResult, ScaleSetRunnerId, ScaleSetRunnerName, ScaleSetRunnerReference,
 };
 
 type Catalog = DisposableAttemptCatalog<MemoryDisposableAttemptCatalogStore>;
@@ -43,8 +42,7 @@ fn runner(index: usize, id: u64) -> ScaleSetRunnerReference {
 }
 
 fn initialized() -> (Catalog, DisposableAttemptCatalogDocument) {
-    let mut catalog =
-        DisposableAttemptCatalog::new(MemoryDisposableAttemptCatalogStore::default());
+    let mut catalog = DisposableAttemptCatalog::new(MemoryDisposableAttemptCatalogStore::default());
     let (document, receipt) = catalog.initialize().unwrap();
     assert_eq!(
         receipt.disposition,
