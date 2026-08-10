@@ -21,6 +21,7 @@ fn attempt() -> smolrunner::disposable_worker_reconciler::DisposableAttempt {
         CapacityClaimId::parse("claim-1").unwrap(),
         DisposableVmId::parse("vm-1").unwrap(),
         ScaleSetRunnerId::parse("runner-1").unwrap(),
+        resources(4_000, 8_000, 100_000),
         time(10_000),
     )
 }

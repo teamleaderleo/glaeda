@@ -6,7 +6,7 @@ use crate::execution_admission::EpochMillis;
 
 pub const DISPOSABLE_WORKER_RECONCILER_SCHEMA_VERSION: u8 = 1;
 const MAX_IDENTIFIER_LEN: usize = 96;
-const MAX_WORKERS: u16 = 64;
+pub const MAX_DISPOSABLE_WORKERS: u16 = 64;
 const MAX_CPU_MILLIS: u32 = 1_000_000;
 const MAX_BYTES: u64 = 1_u64 << 50;
 
@@ -137,7 +137,7 @@ impl DisposableHostBudget {
         max_workers: u16,
         total: DisposableWorkerResources,
     ) -> Result<Self, DisposableWorkerReconcilerError> {
-        if !(1..=MAX_WORKERS).contains(&max_workers) {
+        if !(1..=MAX_DISPOSABLE_WORKERS).contains(&max_workers) {
             return Err(DisposableWorkerReconcilerError::new(
                 "budget.max_workers",
                 "invalid_worker_limit",
@@ -171,7 +171,7 @@ impl DisposableHostUsage {
         workers: u16,
         resources: DisposableWorkerResources,
     ) -> Result<Self, DisposableWorkerReconcilerError> {
-        if workers > MAX_WORKERS {
+        if workers > MAX_DISPOSABLE_WORKERS {
             return Err(DisposableWorkerReconcilerError::new(
                 "usage.workers",
                 "invalid_worker_usage",
@@ -197,7 +197,7 @@ impl ScaleSetDemand {
         observed_at: EpochMillis,
         expires_at: EpochMillis,
     ) -> Result<Self, DisposableWorkerReconcilerError> {
-        if assigned_jobs > MAX_WORKERS || running_jobs > assigned_jobs {
+        if assigned_jobs > MAX_DISPOSABLE_WORKERS || running_jobs > assigned_jobs {
             return Err(DisposableWorkerReconcilerError::new(
                 "demand",
                 "invalid_scale_set_demand",
@@ -329,10 +329,23 @@ pub struct DisposableAttempt {
     capacity_claim_id: CapacityClaimId,
     vm_id: DisposableVmId,
     runner_id: ScaleSetRunnerId,
+    resources: DisposableWorkerResources,
     phase: DisposableAttemptPhase,
     github_job_id: Option<GitHubJobId>,
     conclusion: Option<GitHubJobConclusion>,
     not_after: EpochMillis,
+}
+
+pub(crate) struct PersistedDisposableAttempt {
+    pub attempt_id: DisposableAttemptId,
+    pub capacity_claim_id: CapacityClaimId,
+    pub vm_id: DisposableVmId,
+    pub runner_id: ScaleSetRunnerId,
+    pub resources: DisposableWorkerResources,
+    pub phase: DisposableAttemptPhase,
+    pub github_job_id: Option<GitHubJobId>,
+    pub conclusion: Option<GitHubJobConclusion>,
+    pub not_after: EpochMillis,
 }
 
 impl DisposableAttempt {
@@ -342,6 +355,7 @@ impl DisposableAttempt {
         capacity_claim_id: CapacityClaimId,
         vm_id: DisposableVmId,
         runner_id: ScaleSetRunnerId,
+        resources: DisposableWorkerResources,
         not_after: EpochMillis,
     ) -> Self {
         Self {
@@ -350,6 +364,7 @@ impl DisposableAttempt {
             capacity_claim_id,
             vm_id,
             runner_id,
+            resources,
             phase: DisposableAttemptPhase::Reserved,
             github_job_id: None,
             conclusion: None,
@@ -383,6 +398,11 @@ impl DisposableAttempt {
     }
 
     #[must_use]
+    pub const fn resources(&self) -> DisposableWorkerResources {
+        self.resources
+    }
+
+    #[must_use]
     pub const fn github_job_id(&self) -> Option<GitHubJobId> {
         self.github_job_id
     }
@@ -393,8 +413,109 @@ impl DisposableAttempt {
     }
 
     #[must_use]
+    pub const fn capacity_reserved(&self) -> bool {
+        !matches!(self.phase, DisposableAttemptPhase::Complete)
+    }
+
+    #[must_use]
     pub const fn not_after(&self) -> EpochMillis {
         self.not_after
+    }
+
+    pub(crate) fn from_persisted(
+        persisted: PersistedDisposableAttempt,
+    ) -> Result<Self, DisposableWorkerReconcilerError> {
+        let attempt = Self {
+            schema_version: DISPOSABLE_WORKER_RECONCILER_SCHEMA_VERSION,
+            attempt_id: persisted.attempt_id,
+            capacity_claim_id: persisted.capacity_claim_id,
+            vm_id: persisted.vm_id,
+            runner_id: persisted.runner_id,
+            resources: persisted.resources,
+            phase: persisted.phase,
+            github_job_id: persisted.github_job_id,
+            conclusion: persisted.conclusion,
+            not_after: persisted.not_after,
+        };
+        validate_attempt(&attempt)?;
+        Ok(attempt)
+    }
+
+    pub(crate) fn validate_for_persistence(&self) -> Result<(), DisposableWorkerReconcilerError> {
+        validate_attempt(self)
+    }
+
+    pub(crate) fn validate_successor_of(
+        &self,
+        previous: &Self,
+    ) -> Result<(), DisposableWorkerReconcilerError> {
+        if self.attempt_id != previous.attempt_id
+            || self.capacity_claim_id != previous.capacity_claim_id
+            || self.vm_id != previous.vm_id
+            || self.runner_id != previous.runner_id
+            || self.resources != previous.resources
+            || self.not_after != previous.not_after
+        {
+            return Err(DisposableWorkerReconcilerError::new(
+                "attempt",
+                "attempt_identity_drift",
+                "a durable attempt successor must preserve its exact identity and limits",
+            ));
+        }
+        let action = if self.phase == previous.phase {
+            return Err(DisposableWorkerReconcilerError::new(
+                "attempt",
+                "invalid_attempt_successor",
+                "a durable attempt successor must advance one exact checkpoint",
+            ));
+        } else {
+            match self.phase {
+                DisposableAttemptPhase::Assigned => DisposableWorkerAction::RecordAssigned {
+                    github_job_id: self.github_job_id.ok_or_else(|| {
+                        DisposableWorkerReconcilerError::new(
+                            "attempt.github_job_id",
+                            "invalid_attempt_successor",
+                            "assigned attempt successor is missing its GitHub job identity",
+                        )
+                    })?,
+                },
+                DisposableAttemptPhase::Running => DisposableWorkerAction::RecordRunning {
+                    github_job_id: self.github_job_id.ok_or_else(|| {
+                        DisposableWorkerReconcilerError::new(
+                            "attempt.github_job_id",
+                            "invalid_attempt_successor",
+                            "running attempt successor is missing its GitHub job identity",
+                        )
+                    })?,
+                },
+                DisposableAttemptPhase::Terminal => DisposableWorkerAction::RecordTerminal {
+                    github_job_id: self.github_job_id.ok_or_else(|| {
+                        DisposableWorkerReconcilerError::new(
+                            "attempt.github_job_id",
+                            "invalid_attempt_successor",
+                            "terminal attempt successor is missing its GitHub job identity",
+                        )
+                    })?,
+                    conclusion: self.conclusion.ok_or_else(|| {
+                        DisposableWorkerReconcilerError::new(
+                            "attempt.conclusion",
+                            "invalid_attempt_successor",
+                            "terminal attempt successor is missing its conclusion",
+                        )
+                    })?,
+                },
+                phase => DisposableWorkerAction::Checkpoint { phase },
+            }
+        };
+        let expected = previous.checkpoint(&action)?;
+        if &expected != self {
+            return Err(DisposableWorkerReconcilerError::new(
+                "attempt",
+                "invalid_attempt_successor",
+                "a durable attempt successor changed evidence outside one exact checkpoint",
+            ));
+        }
+        Ok(())
     }
 
     pub fn checkpoint(

@@ -19,10 +19,10 @@ The R01 implementation is preserved, but no additional narrow OS/runtime proof s
 
 ## Milestone 1 — disposable-attempt reconciliation
 
-- [ ] Define one durable identity joining a scale-set capacity claim, reservation, VM, runner, actual assigned GitHub job, and attempt.
-- [ ] Define a small crash-recoverable phase graph from admission through cleanup and release.
-- [ ] Emit exactly one idempotent next action per reconciliation tick.
-- [ ] Enforce global concurrency, memory, CPU, and disk budgets before provisioning.
+- [x] Define one durable identity joining a scale-set capacity claim, reservation, VM, runner, actual assigned GitHub job, and attempt.
+- [x] Define a small crash-recoverable phase graph from admission through cleanup and release.
+- [x] Emit exactly one idempotent next action per reconciliation tick.
+- [x] Enforce global concurrency, memory, CPU, and disk budgets before provisioning.
 - [ ] Cover cancellation, expiry, runner loss, orphan VM, stale registration, every checkpoint interruption, bounded retry, and scale-to-zero in deterministic tests.
 
 ## Milestone 2 — disposable Lima/VZ worker

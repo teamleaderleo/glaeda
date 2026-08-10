@@ -12,6 +12,8 @@ pub mod debian_package_recovery;
 pub mod descriptor_bound_launcher;
 /// Pure capacity and lifecycle reconciliation for one-job disposable workers.
 pub mod disposable_worker_reconciler;
+/// Strict canonical durable state for disposable worker attempts and capacity claims.
+pub mod disposable_worker_store;
 pub mod doctor;
 pub mod durable_journal;
 #[cfg(target_os = "linux")]

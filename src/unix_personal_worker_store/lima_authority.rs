@@ -374,7 +374,7 @@ fn recover_prepared_settlement(
                 return Err(authority_recovery_required());
             }
             store.synchronize_existing_staged(&staged_worker)?;
-            let mut stage = StagedDocument::existing(store.directory.as_fd());
+            let mut stage = StagedDocument::existing(store.directory.as_fd(), STAGED_DOCUMENT);
             store.publish_staged(&mut stage, false)?;
         } else {
             let mut stage = store.stage_document(&successor)?;
