@@ -86,15 +86,12 @@ impl ProjectAlias {
         let Some(first) = bytes.next() else {
             return Err(invalid_alias_error());
         };
-        if value.len() > MAX_ALIAS_BYTES
-            || (!first.is_ascii_lowercase() && !first.is_ascii_digit())
+        if value.len() > MAX_ALIAS_BYTES || (!first.is_ascii_lowercase() && !first.is_ascii_digit())
         {
             return Err(invalid_alias_error());
         }
         if !bytes.all(|byte| {
-            byte.is_ascii_lowercase()
-                || byte.is_ascii_digit()
-                || matches!(byte, b'.' | b'_' | b'-')
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
         }) {
             return Err(invalid_alias_error());
         }
@@ -135,10 +132,8 @@ impl GitHubProjectSource {
             .strip_prefix("https://github.com/")
             .or_else(|| value.strip_prefix("git@github.com:"))
             .or_else(|| value.strip_prefix("ssh://git@github.com/"))
-            .ok_or_else(invalid_source_error)?;
-        if path
-            .bytes()
-            .any(|byte| matches!(byte, b'?' | b'#' | b':'))
+            .ok_or(invalid_source_error())?;
+        if path.bytes().any(|byte| matches!(byte, b'?' | b'#' | b':'))
             || path.starts_with('/')
             || path.ends_with('/')
         {
@@ -148,10 +143,15 @@ impl GitHubProjectSource {
         let mut parts = path.split('/');
         let owner = parts.next().unwrap_or_default().to_ascii_lowercase();
         let repository = parts.next().unwrap_or_default().to_ascii_lowercase();
-        if parts.next().is_some() || !valid_owner(&owner) || !valid_repository(&repository) {
+        if parts.next().is_some()
+            || !valid_owner(&owner)
+            || !valid_repository(&repository)
+            || repository.ends_with(".git")
+        {
             return Err(invalid_source_error());
         }
-        let project = ProjectIdentity::parse(&format!("github.com/{owner}/{repository}"))?;
+        let project = ProjectIdentity::parse(&format!("github.com/{owner}/{repository}"))
+            .map_err(|_| invalid_source_error())?;
         Ok(Self {
             remote: format!("https://github.com/{owner}/{repository}.git"),
             project,
@@ -265,13 +265,9 @@ impl ProjectCatalog {
                 "project catalog exceeds the bounded document size",
             ));
         }
-        let document: ProjectCatalogDocument = serde_yaml::from_slice(bytes).map_err(|_| {
-            ProjectCatalogError::new(
-                "document",
-                "invalid_document",
-                "project catalog must be strict valid YAML",
-            )
-        })?;
+        let contents = std::str::from_utf8(bytes).map_err(|_| invalid_document_error())?;
+        let document: ProjectCatalogDocument =
+            serde_yaml::from_str(contents).map_err(|_| invalid_document_error())?;
         if document.version != PROJECT_CATALOG_SCHEMA_VERSION {
             return Err(ProjectCatalogError::new(
                 "version",
@@ -384,13 +380,13 @@ impl ProjectCatalog {
                 .projects
                 .iter()
                 .find(|project| project.id() == &id)
-                .ok_or_else(unknown_project_error);
+                .ok_or(unknown_project_error());
         }
         let alias = ProjectAlias::parse(value)?;
         self.projects
             .iter()
             .find(|project| project.aliases.binary_search(&alias).is_ok())
-            .ok_or_else(unknown_project_error)
+            .ok_or(unknown_project_error())
     }
 }
 
@@ -497,9 +493,7 @@ fn valid_repository(value: &str) -> bool {
         && value != "."
         && value != ".."
         && value.bytes().all(|byte| {
-            byte.is_ascii_lowercase()
-                || byte.is_ascii_digit()
-                || matches!(byte, b'.' | b'_' | b'-')
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
         })
 }
 
@@ -516,6 +510,14 @@ fn invalid_source_error() -> ProjectCatalogError {
         "project.source",
         "invalid_source",
         "project source must be one reviewed GitHub HTTPS or SSH remote",
+    )
+}
+
+fn invalid_document_error() -> ProjectCatalogError {
+    ProjectCatalogError::new(
+        "document",
+        "invalid_document",
+        "project catalog must be strict valid UTF-8 YAML",
     )
 }
 
@@ -709,7 +711,10 @@ projects:
 
     #[test]
     fn invalid_alias_identity_source_and_unknown_project_are_bounded() {
-        assert_eq!(ProjectAlias::parse("Bad").unwrap_err().code, "invalid_alias");
+        assert_eq!(
+            ProjectAlias::parse("Bad").unwrap_err().code,
+            "invalid_alias"
+        );
         assert_eq!(
             ProjectAlias::parse(&"a".repeat(MAX_ALIAS_BYTES + 1))
                 .unwrap_err()
@@ -754,7 +759,9 @@ projects:
             "version: 1\nprojects:\n  - id: github.com/openai/codex\n    aliases: [{aliases}]\n    source: https://github.com/openai/codex.git\n    materialization: developer\n    restore: lazy\n"
         );
         assert_eq!(
-            ProjectCatalog::decode_yaml(yaml.as_bytes()).unwrap_err().code,
+            ProjectCatalog::decode_yaml(yaml.as_bytes())
+                .unwrap_err()
+                .code,
             "too_many_aliases"
         );
 
@@ -767,7 +774,9 @@ projects:
             .collect::<String>();
         let yaml = format!("version: 1\nprojects:\n{projects}");
         assert_eq!(
-            ProjectCatalog::decode_yaml(yaml.as_bytes()).unwrap_err().code,
+            ProjectCatalog::decode_yaml(yaml.as_bytes())
+                .unwrap_err()
+                .code,
             "too_many_projects"
         );
     }
