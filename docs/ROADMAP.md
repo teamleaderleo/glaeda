@@ -138,8 +138,9 @@ catalog directly. Restart-at-every-checkpoint coverage exercises the real crash-
 
 Build a worker factory that makes **fresh writable state cheap**.
 
-- [x] Distinguish absent, exact stopped, and exact ready workers so clone and start are independently retryable across controller crashes.
-- [x] Define sealed fixed shell-free clone and force-delete Lima command plans with an empty explicit environment, fixed deadlines, and exact durable attempt/resource inputs; refuse start until sealed post-clone evidence exists, and keep all execution private until the same-lock durable authority exists.
+- [x] Distinguish absent, exact stopped, and exact ready workers so clone-with-start success and interrupted-clone cleanup are independently recoverable across controller crashes.
+- [x] Define sealed fixed shell-free clone and force-delete Lima command plans with an empty explicit environment, fixed deadlines, and exact durable attempt/resource inputs; omit standalone start, and keep all execution private until the same-lock durable authority exists.
+- [x] Persist the controller's observed-absent decision as versioned `CloneAuthorized` state before cloning; use clone-with-start and discard only a stopped partial clone inside that authorized creation window, avoiding Lima's create-or-start `start NAME` behavior. Schema-v1 attempts and the legacy `Provisioning` phase fail closed. The future mutation boundary must still revalidate sealed absence under the catalog lock.
 - [ ] Pin a reviewed Apple-silicon Ubuntu cloud image by exact digest and pin the official runner archive/version by exact digest.
 - [ ] Produce a controller-owned prepared template containing the runner, required guest account separation, selected toolchains, and static provisioning inputs.
 - [ ] Evaluate Ubuntu 26.04 ARM64 first where it simplifies VZ/vsock control; retain the final distro/version as an explicit reviewed input.

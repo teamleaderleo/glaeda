@@ -94,6 +94,24 @@ fn tick(
     job_event: Option<ScaleSetJobEvent>,
     capacity_reserved: bool,
 ) -> (DisposableAttemptCatalogDocument, DisposableWorkerAction) {
+    tick_with_cancellation(
+        root,
+        vm,
+        runner_observation,
+        job_event,
+        capacity_reserved,
+        false,
+    )
+}
+
+fn tick_with_cancellation(
+    root: &Path,
+    vm: DisposableVmObservation,
+    runner_observation: ScaleSetRunnerObservation,
+    job_event: Option<ScaleSetJobEvent>,
+    capacity_reserved: bool,
+    cancellation_requested: bool,
+) -> (DisposableAttemptCatalogDocument, DisposableWorkerAction) {
     let store = UnixPersonalWorkerStore::open_or_create_disposable_catalog(root).unwrap();
     let mut catalog = DisposableAttemptCatalog::new(store);
     let current = catalog.load().unwrap();
@@ -106,7 +124,7 @@ fn tick(
         runner: runner_observation,
         job_event,
         capacity_reserved,
-        cancellation_requested: false,
+        cancellation_requested,
     })
     .unwrap();
     let next = if let DisposableWorkerAction::Persist { transition } = &action {
@@ -149,7 +167,7 @@ fn every_durable_checkpoint_reopens_without_duplicate_capacity_or_cleanup_loss()
     assert!(matches!(action, DisposableWorkerAction::Persist { .. }));
     assert_eq!(
         state.find_active(&attempt_id()).unwrap().attempt().phase(),
-        DisposableAttemptPhase::Provisioning
+        DisposableAttemptPhase::CloneAuthorized
     );
 
     for _ in 0..2 {
@@ -171,7 +189,7 @@ fn every_durable_checkpoint_reopens_without_duplicate_capacity_or_cleanup_loss()
             None,
             true,
         );
-        assert_eq!(action, DisposableWorkerAction::StartVm);
+        assert_eq!(action, DisposableWorkerAction::DiscardIncompleteVm);
     }
 
     let (state, _) = tick(
@@ -331,6 +349,111 @@ fn every_durable_checkpoint_reopens_without_duplicate_capacity_or_cleanup_loss()
     let store = UnixPersonalWorkerStore::open_or_create_disposable_catalog(root.path()).unwrap();
     let catalog = DisposableAttemptCatalog::new(store).load().unwrap();
     assert_eq!(catalog.host_usage().unwrap().workers(), 0);
+}
+
+#[test]
+fn lost_reserved_capacity_completes_without_acquiring_vm_cleanup_authority() {
+    let root = TempRoot::new();
+    initialize(root.path());
+
+    let (catalog, action) = tick(
+        root.path(),
+        DisposableVmObservation::Ready,
+        ScaleSetRunnerObservation::Absent,
+        None,
+        false,
+    );
+    assert!(matches!(
+        action,
+        DisposableWorkerAction::Persist {
+            transition: smolrunner::disposable_attempt_catalog::DisposableAttemptCatalogAction::CompleteUnprovisioned
+        }
+    ));
+    let attempt = catalog.find_active(&attempt_id()).unwrap().attempt();
+    assert_eq!(attempt.phase(), DisposableAttemptPhase::Complete);
+    assert_eq!(attempt.revision().get(), 2);
+    assert!(attempt.runner_id().is_none());
+    assert!(attempt.github_job_id().is_none());
+    assert_eq!(catalog.host_usage().unwrap().workers(), 0);
+
+    let (_, replay) = tick(
+        root.path(),
+        DisposableVmObservation::Ready,
+        ScaleSetRunnerObservation::Absent,
+        None,
+        false,
+    );
+    assert_eq!(
+        replay,
+        DisposableWorkerAction::Blocked {
+            code: "completed_attempt_retains_external_state"
+        }
+    );
+
+    let (_, absent_replay) = tick(
+        root.path(),
+        DisposableVmObservation::Absent,
+        ScaleSetRunnerObservation::Absent,
+        None,
+        false,
+    );
+    assert_eq!(absent_replay, DisposableWorkerAction::NoOp);
+}
+
+#[test]
+fn reserved_cancellation_survives_restart_before_capacity_release() {
+    let root = TempRoot::new();
+    initialize(root.path());
+
+    let (catalog, checkpoint) = tick_with_cancellation(
+        root.path(),
+        DisposableVmObservation::Absent,
+        ScaleSetRunnerObservation::Absent,
+        None,
+        true,
+        true,
+    );
+    assert!(matches!(
+        checkpoint,
+        DisposableWorkerAction::Persist {
+            transition: smolrunner::disposable_attempt_catalog::DisposableAttemptCatalogAction::BeginUnprovisionedRelease
+        }
+    ));
+    assert_eq!(
+        catalog
+            .find_active(&attempt_id())
+            .unwrap()
+            .attempt()
+            .phase(),
+        DisposableAttemptPhase::UnprovisionedReleasing
+    );
+
+    // The transient cancellation input is deliberately absent after reopening.
+    let (_, release) = tick(
+        root.path(),
+        DisposableVmObservation::Absent,
+        ScaleSetRunnerObservation::Absent,
+        None,
+        true,
+    );
+    assert_eq!(release, DisposableWorkerAction::ReleaseCapacity);
+
+    let (complete, _) = tick(
+        root.path(),
+        DisposableVmObservation::Absent,
+        ScaleSetRunnerObservation::Absent,
+        None,
+        false,
+    );
+    assert_eq!(
+        complete
+            .find_active(&attempt_id())
+            .unwrap()
+            .attempt()
+            .phase(),
+        DisposableAttemptPhase::Complete
+    );
+    assert_eq!(complete.host_usage().unwrap().workers(), 0);
 }
 
 #[test]

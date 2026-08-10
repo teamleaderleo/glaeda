@@ -10,7 +10,7 @@ use crate::github_scale_set_protocol::{
     ScaleSetJobId, ScaleSetJobResult, ScaleSetRunnerId, ScaleSetRunnerName, ScaleSetRunnerReference,
 };
 
-pub const DISPOSABLE_ATTEMPT_STATE_SCHEMA_VERSION: u8 = 1;
+pub const DISPOSABLE_ATTEMPT_STATE_SCHEMA_VERSION: u8 = 2;
 pub const MAX_DISPOSABLE_ATTEMPT_STATE_BYTES: usize = 16_384;
 const MAX_DISPOSABLE_ATTEMPT_REVISION: u64 = 1_000_000_000_000;
 
@@ -157,7 +157,9 @@ impl DisposableAttemptState {
         let matches = |candidate: Result<Self, DisposableAttemptStateError>| {
             candidate.as_ref().is_ok_and(|candidate| candidate == self)
         };
-        if matches(current.begin_provisioning())
+        if matches(current.authorize_clone())
+            || matches(current.begin_unprovisioned_release())
+            || matches(current.complete_unprovisioned())
             || matches(current.begin_registration())
             || matches(current.begin_cleanup())
             || matches(current.advance_cleanup(self.phase))
@@ -200,15 +202,45 @@ impl DisposableAttemptState {
     }
 
     pub fn begin_provisioning(&self) -> Result<Self, DisposableAttemptStateError> {
+        Err(invalid_transition(
+            "legacy provisioning cannot advance a current-schema attempt",
+        ))
+    }
+
+    /// Persist the observed-absent decision that permits one attempt-bound clone operation.
+    pub fn authorize_clone(&self) -> Result<Self, DisposableAttemptStateError> {
         self.advance_phase(
             DisposableAttemptPhase::Reserved,
-            DisposableAttemptPhase::Provisioning,
+            DisposableAttemptPhase::CloneAuthorized,
         )
+    }
+
+    /// Persist cancellation/expiry before releasing capacity for an unprovisioned attempt.
+    pub fn begin_unprovisioned_release(&self) -> Result<Self, DisposableAttemptStateError> {
+        self.advance_phase(
+            DisposableAttemptPhase::Reserved,
+            DisposableAttemptPhase::UnprovisionedReleasing,
+        )
+    }
+
+    /// Complete an attempt that released capacity before any VM creation was authorized.
+    ///
+    /// This path deliberately skips VM and runner cleanup. A reserved attempt has not crossed the
+    /// durable absent-VM checkpoint and therefore owns no external object that may be deleted.
+    pub fn complete_unprovisioned(&self) -> Result<Self, DisposableAttemptStateError> {
+        match self.phase {
+            DisposableAttemptPhase::Reserved | DisposableAttemptPhase::UnprovisionedReleasing => {
+                self.advance_with(DisposableAttemptPhase::Complete, None, None, None)
+            }
+            _ => Err(invalid_transition(
+                "only an unprovisioned attempt may complete without cleanup",
+            )),
+        }
     }
 
     pub fn begin_registration(&self) -> Result<Self, DisposableAttemptStateError> {
         self.advance_phase(
-            DisposableAttemptPhase::Provisioning,
+            DisposableAttemptPhase::CloneAuthorized,
             DisposableAttemptPhase::Registering,
         )
     }
@@ -353,9 +385,10 @@ impl DisposableAttemptState {
 
     /// Record terminal demand for the exact job.
     ///
-    /// `runner` may be absent only after assignment or another exact event has already bound the
-    /// job to this attempt. This prevents one runnerless service event from being attributed to an
-    /// arbitrary outstanding capacity reservation.
+    /// The attempt must already hold clone authority. `runner` may be absent only after assignment
+    /// or another exact event has already bound the job to this attempt. Together these conditions
+    /// prevent a late service event from manufacturing cleanup authority for an untouched capacity
+    /// reservation or from being attributed to an arbitrary outstanding reservation.
     pub fn record_terminal(
         &self,
         runner: Option<&ScaleSetRunnerReference>,
@@ -397,8 +430,7 @@ impl DisposableAttemptState {
         if !cleanup
             && !matches!(
                 self.phase,
-                DisposableAttemptPhase::Reserved
-                    | DisposableAttemptPhase::Provisioning
+                DisposableAttemptPhase::CloneAuthorized
                     | DisposableAttemptPhase::Registering
                     | DisposableAttemptPhase::Waiting
                     | DisposableAttemptPhase::Assigned
@@ -433,7 +465,11 @@ impl DisposableAttemptState {
     pub fn begin_cleanup(&self) -> Result<Self, DisposableAttemptStateError> {
         match self.phase {
             DisposableAttemptPhase::Reserved
-            | DisposableAttemptPhase::Provisioning
+            | DisposableAttemptPhase::UnprovisionedReleasing
+            | DisposableAttemptPhase::Provisioning => Err(invalid_transition(
+                "cleanup requires durable clone or later external-object authority",
+            )),
+            DisposableAttemptPhase::CloneAuthorized
             | DisposableAttemptPhase::Registering
             | DisposableAttemptPhase::Waiting
             | DisposableAttemptPhase::Assigned
@@ -569,14 +605,42 @@ impl DisposableAttemptState {
                 "terminal result requires an exact Scale Set job identity",
             ));
         }
+        let revision = self.revision.get();
+        let revision_shape_valid = match self.phase {
+            DisposableAttemptPhase::Reserved => revision == 1,
+            DisposableAttemptPhase::UnprovisionedReleasing
+            | DisposableAttemptPhase::CloneAuthorized => revision == 2,
+            DisposableAttemptPhase::Provisioning => false,
+            DisposableAttemptPhase::Registering => revision >= 3,
+            DisposableAttemptPhase::Waiting
+            | DisposableAttemptPhase::Assigned
+            | DisposableAttemptPhase::Running => revision >= 4,
+            DisposableAttemptPhase::Terminal => revision >= 3,
+            DisposableAttemptPhase::Destroying => revision >= 3,
+            DisposableAttemptPhase::Deregistering => revision >= 4,
+            DisposableAttemptPhase::Releasing => revision >= 5,
+            DisposableAttemptPhase::Complete => matches!(revision, 2 | 3) || revision >= 6,
+        };
+        if !revision_shape_valid {
+            return Err(invalid_document(
+                "attempt phase conflicts with its durable revision history",
+            ));
+        }
         match self.phase {
-            DisposableAttemptPhase::Reserved | DisposableAttemptPhase::Provisioning => {
+            DisposableAttemptPhase::Reserved
+            | DisposableAttemptPhase::UnprovisionedReleasing
+            | DisposableAttemptPhase::CloneAuthorized => {
                 if self.runner_id.is_some() || self.github_job_id.is_some() || self.result.is_some()
                 {
                     return Err(invalid_document(
                         "pre-registration attempt cannot carry runner or job evidence",
                     ));
                 }
+            }
+            DisposableAttemptPhase::Provisioning => {
+                return Err(invalid_document(
+                    "legacy provisioning phase is unsupported by the current schema",
+                ));
             }
             DisposableAttemptPhase::Registering => {
                 if self.github_job_id.is_some() || self.result.is_some() {
@@ -619,6 +683,14 @@ impl DisposableAttemptState {
             | DisposableAttemptPhase::Deregistering
             | DisposableAttemptPhase::Releasing
             | DisposableAttemptPhase::Complete => {}
+        }
+        if self.phase == DisposableAttemptPhase::Complete
+            && revision <= 3
+            && (self.runner_id.is_some() || self.github_job_id.is_some() || self.result.is_some())
+        {
+            return Err(invalid_document(
+                "unprovisioned completion cannot carry external job or runner evidence",
+            ));
         }
         Ok(())
     }
@@ -753,7 +825,9 @@ pub fn decode_disposable_attempt_state(
 const fn phase_name(phase: DisposableAttemptPhase) -> &'static str {
     match phase {
         DisposableAttemptPhase::Reserved => "reserved",
+        DisposableAttemptPhase::UnprovisionedReleasing => "unprovisioned_releasing",
         DisposableAttemptPhase::Provisioning => "provisioning",
+        DisposableAttemptPhase::CloneAuthorized => "clone_authorized",
         DisposableAttemptPhase::Registering => "registering",
         DisposableAttemptPhase::Waiting => "waiting",
         DisposableAttemptPhase::Assigned => "assigned",
@@ -769,7 +843,9 @@ const fn phase_name(phase: DisposableAttemptPhase) -> &'static str {
 fn parse_phase(value: &str) -> Result<DisposableAttemptPhase, DisposableAttemptStateError> {
     match value {
         "reserved" => Ok(DisposableAttemptPhase::Reserved),
+        "unprovisioned_releasing" => Ok(DisposableAttemptPhase::UnprovisionedReleasing),
         "provisioning" => Ok(DisposableAttemptPhase::Provisioning),
+        "clone_authorized" => Ok(DisposableAttemptPhase::CloneAuthorized),
         "registering" => Ok(DisposableAttemptPhase::Registering),
         "waiting" => Ok(DisposableAttemptPhase::Waiting),
         "assigned" => Ok(DisposableAttemptPhase::Assigned),

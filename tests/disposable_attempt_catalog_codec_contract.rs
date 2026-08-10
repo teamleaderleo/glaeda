@@ -68,7 +68,7 @@ fn populated_catalog() -> DisposableAttemptCatalogDocument {
         &mut catalog,
         &two,
         2,
-        DisposableAttemptCatalogAction::BeginProvisioning,
+        DisposableAttemptCatalogAction::AuthorizeClone,
     );
     let registering = transition(
         &mut catalog,
@@ -83,9 +83,16 @@ fn populated_catalog() -> DisposableAttemptCatalogDocument {
         DisposableAttemptCatalogAction::RecordRegistration(runner(2, 22)),
     );
 
-    let terminal = transition(
+    let both_authorized = transition(
         &mut catalog,
         &registered,
+        1,
+        DisposableAttemptCatalogAction::AuthorizeClone,
+    );
+
+    let terminal = transition(
+        &mut catalog,
+        &both_authorized,
         1,
         DisposableAttemptCatalogAction::RecordTerminal {
             runner: Some(runner(1, 11)),
@@ -197,6 +204,22 @@ fn catalog_revision_must_match_the_represented_history() {
             .kind(),
         DisposableAttemptCatalogCodecErrorKind::CorruptState
     );
+
+    let mut preauthorization_terminal: serde_json::Value =
+        serde_json::from_slice(&encoded).unwrap();
+    preauthorization_terminal["revision"] = serde_json::json!(3);
+    preauthorization_terminal["active"][0]["attempt"]["revision"] = serde_json::json!(2);
+    preauthorization_terminal["active"][0]["attempt"]["runner_id"] = serde_json::json!(11);
+    preauthorization_terminal["active"][0]["attempt"]["phase"] = serde_json::json!("terminal");
+    preauthorization_terminal["active"][0]["attempt"]["github_job_id"] =
+        serde_json::json!("preauthorization-terminal");
+    preauthorization_terminal["active"][0]["attempt"]["result"] = serde_json::json!("canceled");
+    assert_eq!(
+        decode_disposable_attempt_catalog(&serde_json::to_vec(&preauthorization_terminal).unwrap())
+            .unwrap_err()
+            .kind(),
+        DisposableAttemptCatalogCodecErrorKind::CorruptState
+    );
 }
 
 #[test]
@@ -208,6 +231,12 @@ fn saturated_tombstone_history_retains_a_safe_revision_lower_bound() {
             .reserve(document.revision(), reservation(index))
             .unwrap()
             .0;
+        document = transition(
+            &mut catalog,
+            &document,
+            index,
+            DisposableAttemptCatalogAction::AuthorizeClone,
+        );
         document = transition(
             &mut catalog,
             &document,
@@ -261,6 +290,15 @@ fn saturated_tombstone_history_retains_a_safe_revision_lower_bound() {
 fn top_level_future_schema_and_unknown_fields_fail_closed() {
     let encoded = encode_disposable_attempt_catalog(&populated_catalog()).unwrap();
     let mut value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+
+    let mut legacy_attempt = value.clone();
+    legacy_attempt["active"][0]["attempt"]["schema_version"] = serde_json::json!(1);
+    assert_eq!(
+        decode_disposable_attempt_catalog(&serde_json::to_vec(&legacy_attempt).unwrap())
+            .unwrap_err()
+            .kind(),
+        DisposableAttemptCatalogCodecErrorKind::VersionIncompatible
+    );
 
     value["schema_version"] = serde_json::json!(2);
     let future = serde_json::to_vec(&value).unwrap();

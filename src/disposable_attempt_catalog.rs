@@ -466,7 +466,11 @@ impl DisposableAttemptCatalogDocument {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "transition", rename_all = "snake_case")]
 pub enum DisposableAttemptCatalogAction {
+    /// Legacy API action retained for explicit fail-closed classification; it never advances v2.
     BeginProvisioning,
+    AuthorizeClone,
+    BeginUnprovisionedRelease,
+    CompleteUnprovisioned,
     BeginRegistration,
     RecordRegistration(ScaleSetRunnerReference),
     RecordRunnerReady(ScaleSetRunnerReference),
@@ -848,6 +852,11 @@ fn apply_action(
 ) -> Result<DisposableAttemptState, DisposableAttemptCatalogError> {
     let result = match action {
         DisposableAttemptCatalogAction::BeginProvisioning => current.begin_provisioning(),
+        DisposableAttemptCatalogAction::AuthorizeClone => current.authorize_clone(),
+        DisposableAttemptCatalogAction::BeginUnprovisionedRelease => {
+            current.begin_unprovisioned_release()
+        }
+        DisposableAttemptCatalogAction::CompleteUnprovisioned => current.complete_unprovisioned(),
         DisposableAttemptCatalogAction::BeginRegistration => current.begin_registration(),
         DisposableAttemptCatalogAction::RecordRegistration(runner) => {
             current.record_registration(&runner)
