@@ -374,6 +374,7 @@ mod tests {
     use rustix::fs::{FlockOperation, flock};
 
     use super::*;
+    use crate::artifact::Sha256Digest;
     use crate::disposable_attempt_catalog::{
         DisposableAttemptCatalog, DisposableAttemptCatalogAction,
         DisposableAttemptCatalogWriteDisposition, DisposableAttemptReservation,
@@ -419,6 +420,16 @@ mod tests {
     }
 
     fn reservation(index: usize) -> DisposableAttemptReservation {
+        reservation_with_digest(
+            index,
+            Sha256Digest::parse(&format!("sha256:{}", "ab".repeat(32))).unwrap(),
+        )
+    }
+
+    fn reservation_with_digest(
+        index: usize,
+        prepared_template_digest: Sha256Digest,
+    ) -> DisposableAttemptReservation {
         DisposableAttemptReservation::new(
             DisposableAttemptState::reserved(
                 DisposableAttemptId::parse(&format!("attempt-{index}")).unwrap(),
@@ -428,6 +439,7 @@ mod tests {
                 EpochMillis::new(100_000 + u64::try_from(index).unwrap()).unwrap(),
             ),
             DisposableWorkerResources::new(1_000, 2_000, 3_000).unwrap(),
+            prepared_template_digest,
         )
         .unwrap()
     }
@@ -443,11 +455,24 @@ mod tests {
     }
 
     fn progressed_successor(index: usize) -> DisposableAttemptCatalogDocument {
+        progressed_successor_with_digest(
+            index,
+            Sha256Digest::parse(&format!("sha256:{}", "ab".repeat(32))).unwrap(),
+        )
+    }
+
+    fn progressed_successor_with_digest(
+        index: usize,
+        prepared_template_digest: Sha256Digest,
+    ) -> DisposableAttemptCatalogDocument {
         let mut catalog =
             DisposableAttemptCatalog::new(MemoryDisposableAttemptCatalogStore::default());
         let (empty, _) = catalog.initialize().unwrap();
         let (reserved, _) = catalog
-            .reserve(empty.revision(), reservation(index))
+            .reserve(
+                empty.revision(),
+                reservation_with_digest(index, prepared_template_digest),
+            )
             .unwrap();
         let attempt_id = DisposableAttemptId::parse(&format!("attempt-{index}")).unwrap();
         catalog
@@ -555,6 +580,28 @@ mod tests {
                 .join(STAGED_CATALOG_DOCUMENT)
                 .exists()
         );
+
+        let rebound = progressed_successor_with_digest(
+            1,
+            Sha256Digest::parse(&format!("sha256:{}", "cd".repeat(32))).unwrap(),
+        );
+        assert_eq!(rebound.revision().get(), next.revision().get() + 1);
+        write_private(
+            &root.store_directory().join(STAGED_CATALOG_DOCUMENT),
+            &encode_disposable_attempt_catalog(&rebound).unwrap(),
+        );
+        assert_eq!(
+            UnixPersonalWorkerStore::open_or_create_disposable_catalog(root.path())
+                .unwrap_err()
+                .kind(),
+            DisposableAttemptCatalogErrorKind::CorruptState
+        );
+        assert!(
+            root.store_directory()
+                .join(STAGED_CATALOG_DOCUMENT)
+                .exists()
+        );
+        fs::remove_file(root.store_directory().join(STAGED_CATALOG_DOCUMENT)).unwrap();
 
         let forged_successor = progressed_successor(2);
         assert_eq!(forged_successor.revision().get(), next.revision().get() + 1);

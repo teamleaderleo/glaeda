@@ -3,6 +3,7 @@ use std::fmt;
 
 use serde::Serialize;
 
+use crate::artifact::Sha256Digest;
 use crate::disposable_attempt_state::{DisposableAttemptRevision, DisposableAttemptState};
 use crate::disposable_worker_reconciler::{
     DisposableAttemptId, DisposableAttemptPhase, DisposableHostUsage, DisposableWorkerResources,
@@ -16,7 +17,7 @@ pub use codec::{
     encode_disposable_attempt_catalog,
 };
 
-pub const DISPOSABLE_ATTEMPT_CATALOG_SCHEMA_VERSION: u8 = 1;
+pub const DISPOSABLE_ATTEMPT_CATALOG_SCHEMA_VERSION: u8 = 2;
 pub const MAX_ACTIVE_DISPOSABLE_ATTEMPTS: usize = 64;
 pub const MAX_DISPOSABLE_ATTEMPT_TOMBSTONES: usize = 64;
 const MAX_DISPOSABLE_ATTEMPT_CATALOG_REVISION: u64 = 1_000_000_000_000;
@@ -66,10 +67,12 @@ impl DisposableAttemptCatalogRevision {
 pub struct DisposableAttemptReservation {
     attempt: DisposableAttemptState,
     resources: DisposableWorkerResources,
+    prepared_template_digest: Sha256Digest,
 }
 
 impl DisposableAttemptReservation {
-    /// Bind one reserved attempt to the exact host resources it owns until release completes.
+    /// Bind one reserved attempt to the exact host resources and prepared-template generation it
+    /// owns until release completes.
     ///
     /// # Errors
     ///
@@ -77,6 +80,7 @@ impl DisposableAttemptReservation {
     pub fn new(
         attempt: DisposableAttemptState,
         resources: DisposableWorkerResources,
+        prepared_template_digest: Sha256Digest,
     ) -> Result<Self, DisposableAttemptCatalogError> {
         if attempt.phase() != DisposableAttemptPhase::Reserved || attempt.revision().get() != 1 {
             return Err(catalog_error(
@@ -84,7 +88,11 @@ impl DisposableAttemptReservation {
                 "new disposable reservation must begin at reserved attempt revision one",
             ));
         }
-        Ok(Self { attempt, resources })
+        Ok(Self {
+            attempt,
+            resources,
+            prepared_template_digest,
+        })
     }
 
     #[must_use]
@@ -95,6 +103,12 @@ impl DisposableAttemptReservation {
     #[must_use]
     pub const fn resources(&self) -> DisposableWorkerResources {
         self.resources
+    }
+
+    /// Return the exact prepared-template generation reserved for this attempt.
+    #[must_use]
+    pub const fn prepared_template_digest(&self) -> &Sha256Digest {
+        &self.prepared_template_digest
     }
 }
 
@@ -442,6 +456,7 @@ impl DisposableAttemptCatalogDocument {
                 changes.next().is_some_and(|(next, prior)| {
                     changes.next().is_none()
                         && next.resources == prior.resources
+                        && next.prepared_template_digest == prior.prepared_template_digest
                         && next.attempt.is_exact_successor_of(&prior.attempt)
                 })
             } else {
