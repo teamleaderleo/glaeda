@@ -1,5 +1,7 @@
 use smolrunner::disposable_attempt_catalog::DisposableAttemptCatalogAction;
-use smolrunner::disposable_attempt_state::DisposableAttemptState;
+use smolrunner::disposable_attempt_state::{
+    DisposableAttemptState, decode_disposable_attempt_state, encode_disposable_attempt_state,
+};
 use smolrunner::disposable_worker_reconciler::{
     CapacityClaimId, DisposableAttemptId, DisposableAttemptPhase, DisposableHostBudget,
     DisposableHostUsage, DisposableVmId, DisposableVmObservation, DisposableWorkerAction,
@@ -74,6 +76,10 @@ fn apply(
     };
     match transition {
         DisposableAttemptCatalogAction::BeginProvisioning => state.begin_provisioning(),
+        DisposableAttemptCatalogAction::AuthorizeClone => state.authorize_clone(),
+        DisposableAttemptCatalogAction::BeginUnprovisionedRelease => {
+            state.begin_unprovisioned_release()
+        }
         DisposableAttemptCatalogAction::CompleteUnprovisioned => state.complete_unprovisioned(),
         DisposableAttemptCatalogAction::BeginRegistration => state.begin_registration(),
         DisposableAttemptCatalogAction::RecordRegistration(runner) => {
@@ -176,7 +182,7 @@ fn happy_path_uses_canonical_durable_transitions() {
     .unwrap();
     assert_eq!(
         action,
-        persist(DisposableAttemptCatalogAction::BeginProvisioning)
+        persist(DisposableAttemptCatalogAction::AuthorizeClone)
     );
     state = apply(&state, &action);
 
@@ -262,8 +268,8 @@ fn happy_path_uses_canonical_durable_transitions() {
 }
 
 #[test]
-fn stopped_partial_clone_is_discarded_only_while_provisioning_and_destroyed_during_cleanup() {
-    let provisioning = attempt().begin_provisioning().unwrap();
+fn stopped_partial_clone_is_discarded_only_after_clone_authorization() {
+    let provisioning = attempt().authorize_clone().unwrap();
     assert_eq!(
         reconcile_attempt(input(
             &provisioning,
@@ -298,8 +304,35 @@ fn stopped_partial_clone_is_discarded_only_while_provisioning_and_destroyed_duri
 }
 
 #[test]
+fn legacy_provisioning_schema_and_current_schema_alias_are_both_refused() {
+    let bytes = encode_disposable_attempt_state(&attempt()).unwrap();
+    let mut legacy: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    legacy["schema_version"] = serde_json::json!(1);
+    legacy["revision"] = serde_json::json!(2);
+    legacy["phase"] = serde_json::json!("provisioning");
+    assert_eq!(
+        decode_disposable_attempt_state(&serde_json::to_vec(&legacy).unwrap())
+            .unwrap_err()
+            .code(),
+        "version_incompatible"
+    );
+
+    legacy["schema_version"] = serde_json::json!(2);
+    assert_eq!(
+        decode_disposable_attempt_state(&serde_json::to_vec(&legacy).unwrap())
+            .unwrap_err()
+            .code(),
+        "invalid_document"
+    );
+    assert_eq!(
+        attempt().begin_provisioning().unwrap_err().code(),
+        "invalid_transition"
+    );
+}
+
+#[test]
 fn crash_discovered_registration_is_durably_bound_before_cleanup() {
-    let mut state = attempt().begin_provisioning().unwrap();
+    let mut state = attempt().authorize_clone().unwrap();
     state = state.begin_registration().unwrap();
     let exact_runner = runner(41);
     let action = reconcile_attempt(input(
@@ -361,7 +394,7 @@ fn runnerless_completion_without_attempt_binding_fails_closed() {
 fn terminal_cleanup_orders_vm_runner_and_capacity_release() {
     let exact_runner = runner(41);
     let mut state = attempt()
-        .begin_provisioning()
+        .authorize_clone()
         .unwrap()
         .begin_registration()
         .unwrap()
@@ -458,9 +491,36 @@ fn reserved_cancellation_releases_capacity_without_claiming_vm_cleanup() {
         ScaleSetRunnerObservation::Absent,
     );
     cancelled.cancellation_requested = true;
+    let cancellation_checkpoint = reconcile_attempt(cancelled).unwrap();
     assert_eq!(
-        reconcile_attempt(cancelled).unwrap(),
+        cancellation_checkpoint,
+        persist(DisposableAttemptCatalogAction::BeginUnprovisionedRelease)
+    );
+    let releasing = apply(&state, &cancellation_checkpoint);
+    assert_eq!(
+        releasing.phase(),
+        DisposableAttemptPhase::UnprovisionedReleasing
+    );
+
+    // The checkpoint retains cancellation across a restart even if the transient request is lost.
+    assert_eq!(
+        reconcile_attempt(input(
+            &releasing,
+            DisposableVmObservation::Absent,
+            ScaleSetRunnerObservation::Absent,
+        ))
+        .unwrap(),
         DisposableWorkerAction::ReleaseCapacity
+    );
+    let mut released = input(
+        &releasing,
+        DisposableVmObservation::Absent,
+        ScaleSetRunnerObservation::Absent,
+    );
+    released.capacity_reserved = false;
+    assert_eq!(
+        reconcile_attempt(released).unwrap(),
+        persist(DisposableAttemptCatalogAction::CompleteUnprovisioned)
     );
     let mut expired = input(
         &state,
@@ -470,7 +530,7 @@ fn reserved_cancellation_releases_capacity_without_claiming_vm_cleanup() {
     expired.now = time(10_001);
     assert_eq!(
         reconcile_attempt(expired).unwrap(),
-        DisposableWorkerAction::ReleaseCapacity
+        persist(DisposableAttemptCatalogAction::BeginUnprovisionedRelease)
     );
     let mut lost = input(
         &state,
@@ -492,7 +552,7 @@ fn reserved_cancellation_releases_capacity_without_claiming_vm_cleanup() {
     cancelled_preexisting.cancellation_requested = true;
     assert_eq!(
         reconcile_attempt(cancelled_preexisting).unwrap(),
-        DisposableWorkerAction::ReleaseCapacity
+        persist(DisposableAttemptCatalogAction::BeginUnprovisionedRelease)
     );
 }
 
@@ -510,7 +570,7 @@ fn unknown_conflicting_and_identity_drift_never_authorize_mutation() {
             code: "conflicting_vm_identity"
         }
     );
-    let mut state = state.begin_provisioning().unwrap();
+    let mut state = state.authorize_clone().unwrap();
     state = state.begin_registration().unwrap();
     let wrong = ScaleSetRunnerReference::new(
         ScaleSetRunnerId::new(9).unwrap(),
@@ -532,7 +592,7 @@ fn unknown_conflicting_and_identity_drift_never_authorize_mutation() {
 fn duplicate_job_event_is_a_no_op_but_identity_drift_is_refused() {
     let exact_runner = runner(41);
     let state = attempt()
-        .begin_provisioning()
+        .authorize_clone()
         .unwrap()
         .begin_registration()
         .unwrap()
@@ -602,7 +662,11 @@ fn late_duplicate_event_does_not_reverse_cleanup() {
 #[test]
 fn first_late_job_events_are_checkpointed_without_reversing_cleanup() {
     let exact_runner = runner(41);
-    let mut state = attempt().begin_cleanup().unwrap();
+    let mut state = attempt()
+        .authorize_clone()
+        .unwrap()
+        .begin_cleanup()
+        .unwrap();
     let mut started = input(
         &state,
         DisposableVmObservation::Ready,

@@ -459,7 +459,7 @@ mod tests {
                     .unwrap()
                     .attempt()
                     .revision(),
-                DisposableAttemptCatalogAction::BeginProvisioning,
+                DisposableAttemptCatalogAction::AuthorizeClone,
             )
             .unwrap()
             .0
@@ -502,7 +502,7 @@ mod tests {
                 same.revision(),
                 &attempt_id,
                 attempt_revision,
-                DisposableAttemptCatalogAction::BeginProvisioning,
+                DisposableAttemptCatalogAction::AuthorizeClone,
             )
             .unwrap();
         drop(catalog);

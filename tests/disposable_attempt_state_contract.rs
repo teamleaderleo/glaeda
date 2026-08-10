@@ -31,7 +31,7 @@ fn unprovisioned_completion_skips_external_cleanup_and_is_reserved_only() {
     assert!(complete.result().is_none());
     assert_eq!(
         reserved()
-            .begin_provisioning()
+            .authorize_clone()
             .unwrap()
             .complete_unprovisioned()
             .unwrap_err()
@@ -54,7 +54,7 @@ fn job(value: &str) -> ScaleSetJobId {
 #[test]
 fn registration_and_listener_readiness_are_distinct_durable_checkpoints() {
     let registering = reserved()
-        .begin_provisioning()
+        .authorize_clone()
         .unwrap()
         .begin_registration()
         .unwrap();
@@ -73,7 +73,7 @@ fn registration_and_listener_readiness_are_distinct_durable_checkpoints() {
 #[test]
 fn job_assignment_does_not_bind_a_runner_before_job_started() {
     let assigned = reserved()
-        .begin_provisioning()
+        .authorize_clone()
         .unwrap()
         .begin_registration()
         .unwrap()
@@ -107,7 +107,7 @@ fn runnerless_completion_requires_an_exact_prebound_job() {
     );
 
     let terminal = reserved()
-        .begin_provisioning()
+        .authorize_clone()
         .unwrap()
         .begin_registration()
         .unwrap()
@@ -132,7 +132,7 @@ fn runnerless_completion_requires_an_exact_prebound_job() {
 #[test]
 fn unknown_completion_result_still_reaches_cleanup() {
     let terminal = reserved()
-        .begin_provisioning()
+        .authorize_clone()
         .unwrap()
         .begin_registration()
         .unwrap()
@@ -163,6 +163,8 @@ fn unknown_completion_result_still_reaches_cleanup() {
 fn late_job_evidence_binds_without_reversing_cleanup_and_conflicts_fail_closed() {
     let exact_runner = runner(41);
     let destroying = reserved()
+        .authorize_clone()
+        .unwrap()
         .begin_cleanup()
         .unwrap()
         .record_running(&exact_runner, job("late-job"))
@@ -196,7 +198,7 @@ fn late_job_evidence_binds_without_reversing_cleanup_and_conflicts_fail_closed()
 #[test]
 fn exact_runner_and_job_identity_drift_fails_closed() {
     let registered = reserved()
-        .begin_provisioning()
+        .authorize_clone()
         .unwrap()
         .begin_registration()
         .unwrap()
@@ -234,7 +236,7 @@ fn exact_runner_and_job_identity_drift_fails_closed() {
 #[test]
 fn canonical_codec_round_trips_exact_state_and_revision() {
     let state = reserved()
-        .begin_provisioning()
+        .authorize_clone()
         .unwrap()
         .begin_registration()
         .unwrap()
@@ -258,7 +260,7 @@ fn codec_rejects_future_versions_unknown_fields_and_inconsistent_phase_evidence(
     let base = encode_disposable_attempt_state(&reserved()).unwrap();
     let mut value: serde_json::Value = serde_json::from_slice(&base).unwrap();
 
-    value["schema_version"] = serde_json::json!(2);
+    value["schema_version"] = serde_json::json!(3);
     let future = serde_json::to_vec(&value).unwrap();
     assert_eq!(
         decode_disposable_attempt_state(&future).unwrap_err().code(),

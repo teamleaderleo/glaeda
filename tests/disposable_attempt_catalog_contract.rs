@@ -112,7 +112,7 @@ fn raw_store_refuses_unrelated_revision_successors() {
         &mut second_catalog,
         &second_reserved,
         2,
-        DisposableAttemptCatalogAction::BeginProvisioning,
+        DisposableAttemptCatalogAction::AuthorizeClone,
     );
     assert_eq!(
         unrelated.revision().get(),
@@ -136,6 +136,28 @@ fn raw_store_refuses_unrelated_revision_successors() {
         .expect_err("revision alone must not authorize an unrelated catalog");
     assert_eq!(error.kind(), DisposableAttemptCatalogErrorKind::Conflict);
     assert_eq!(store.load().unwrap(), Some(first_reserved));
+}
+
+#[test]
+fn reserved_attempt_cannot_enter_external_cleanup_through_the_public_catalog() {
+    let (mut catalog, empty) = initialized();
+    let (reserved, _) = catalog.reserve(empty.revision(), reservation(1)).unwrap();
+    let attempt_id = DisposableAttemptId::parse("attempt-1").unwrap();
+    let durable = reserved.find_active(&attempt_id).unwrap();
+
+    let error = catalog
+        .transition(
+            reserved.revision(),
+            durable.attempt().attempt_id(),
+            durable.attempt().revision(),
+            DisposableAttemptCatalogAction::BeginCleanup,
+        )
+        .expect_err("reserved state has no VM cleanup authority");
+    assert_eq!(
+        error.kind(),
+        DisposableAttemptCatalogErrorKind::InvalidAction
+    );
+    assert_eq!(catalog.load().unwrap(), reserved);
 }
 
 #[test]
@@ -163,7 +185,7 @@ fn catalog_and_attempt_revisions_reject_stale_mutations() {
             reserved.revision(),
             &attempt_id,
             attempt_revision,
-            DisposableAttemptCatalogAction::BeginProvisioning,
+            DisposableAttemptCatalogAction::AuthorizeClone,
         )
         .unwrap();
 
@@ -273,7 +295,7 @@ fn identity_drift_remains_distinct_from_an_illegal_phase_action() {
         &mut catalog,
         &reserved,
         1,
-        DisposableAttemptCatalogAction::BeginProvisioning,
+        DisposableAttemptCatalogAction::AuthorizeClone,
     );
     let registering = transition(
         &mut catalog,
@@ -412,7 +434,7 @@ fn exact_runner_ids_cannot_be_reused_across_concurrent_attempts() {
         &mut catalog,
         &two,
         1,
-        DisposableAttemptCatalogAction::BeginProvisioning,
+        DisposableAttemptCatalogAction::AuthorizeClone,
     );
     let one_registering = transition(
         &mut catalog,
@@ -431,7 +453,7 @@ fn exact_runner_ids_cannot_be_reused_across_concurrent_attempts() {
         &mut catalog,
         &one_registered,
         2,
-        DisposableAttemptCatalogAction::BeginProvisioning,
+        DisposableAttemptCatalogAction::AuthorizeClone,
     );
     let two_registering = transition(
         &mut catalog,

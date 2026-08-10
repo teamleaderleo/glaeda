@@ -153,7 +153,7 @@ impl DisposableLimaWorkerAdapter {
 
         let (kind, command, timeout) = match action {
             DisposableWorkerAction::CloneVm
-                if attempt.phase() == DisposableAttemptPhase::Provisioning =>
+                if attempt.phase() == DisposableAttemptPhase::CloneAuthorized =>
             {
                 let resources = lima_resources(reservation.resources())?;
                 (
@@ -174,7 +174,7 @@ impl DisposableLimaWorkerAdapter {
                 )
             }
             DisposableWorkerAction::DiscardIncompleteVm
-                if attempt.phase() == DisposableAttemptPhase::Provisioning =>
+                if attempt.phase() == DisposableAttemptPhase::CloneAuthorized =>
             {
                 (
                     DisposableLimaWorkerCommandKind::DiscardIncomplete,
@@ -462,10 +462,10 @@ mod tests {
                 reserved.revision(),
                 &attempt_id,
                 reserved_attempt.revision(),
-                DisposableAttemptCatalogAction::BeginProvisioning,
+                DisposableAttemptCatalogAction::AuthorizeClone,
             )
             .unwrap();
-        if phase == DisposableAttemptPhase::Provisioning {
+        if phase == DisposableAttemptPhase::CloneAuthorized {
             return provisioning.find_active(&attempt_id).unwrap().clone();
         }
         let provisioning_attempt = provisioning.find_active(&attempt_id).unwrap().attempt();
@@ -492,7 +492,7 @@ mod tests {
 
     #[test]
     fn clone_plan_is_fixed_private_and_requires_observation() {
-        let reservation = reservation_in_phase(DisposableAttemptPhase::Provisioning);
+        let reservation = reservation_in_phase(DisposableAttemptPhase::CloneAuthorized);
         let plan = adapter()
             .plan(
                 EpochMillis::new(1_000).unwrap(),
@@ -538,7 +538,7 @@ mod tests {
 
     #[test]
     fn incomplete_clone_discard_and_cleanup_destroy_are_distinct_fixed_plans() {
-        let provisioning = reservation_in_phase(DisposableAttemptPhase::Provisioning);
+        let provisioning = reservation_in_phase(DisposableAttemptPhase::CloneAuthorized);
         let discard = adapter()
             .plan(
                 EpochMillis::new(1_000).unwrap(),
@@ -604,7 +604,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.kind(), DisposableLimaWorkerErrorKind::InvalidAction);
 
-        let provisioning = reservation_in_phase(DisposableAttemptPhase::Provisioning);
+        let provisioning = reservation_in_phase(DisposableAttemptPhase::CloneAuthorized);
         let error = adapter()
             .plan(
                 EpochMillis::new(10_001).unwrap(),
@@ -627,7 +627,7 @@ mod tests {
                 reserved.revision(),
                 &attempt_id,
                 attempt.revision(),
-                DisposableAttemptCatalogAction::BeginProvisioning,
+                DisposableAttemptCatalogAction::AuthorizeClone,
             )
             .unwrap();
         let error = adapter()

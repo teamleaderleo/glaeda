@@ -68,7 +68,7 @@ fn populated_catalog() -> DisposableAttemptCatalogDocument {
         &mut catalog,
         &two,
         2,
-        DisposableAttemptCatalogAction::BeginProvisioning,
+        DisposableAttemptCatalogAction::AuthorizeClone,
     );
     let registering = transition(
         &mut catalog,
@@ -261,6 +261,15 @@ fn saturated_tombstone_history_retains_a_safe_revision_lower_bound() {
 fn top_level_future_schema_and_unknown_fields_fail_closed() {
     let encoded = encode_disposable_attempt_catalog(&populated_catalog()).unwrap();
     let mut value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+
+    let mut legacy_attempt = value.clone();
+    legacy_attempt["active"][0]["attempt"]["schema_version"] = serde_json::json!(1);
+    assert_eq!(
+        decode_disposable_attempt_catalog(&serde_json::to_vec(&legacy_attempt).unwrap())
+            .unwrap_err()
+            .kind(),
+        DisposableAttemptCatalogCodecErrorKind::VersionIncompatible
+    );
 
     value["schema_version"] = serde_json::json!(2);
     let future = serde_json::to_vec(&value).unwrap();

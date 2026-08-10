@@ -291,7 +291,10 @@ pub fn plan_capacity(
 #[serde(rename_all = "snake_case")]
 pub enum DisposableAttemptPhase {
     Reserved,
+    UnprovisionedReleasing,
+    /// Legacy schema-v1 state that did not prove VM absence and cannot authorize mutation.
     Provisioning,
+    CloneAuthorized,
     Registering,
     Waiting,
     Assigned,
@@ -398,7 +401,12 @@ pub fn reconcile_attempt(
 
     use DisposableAttemptPhase as Phase;
     use DisposableWorkerAction as Action;
-    if !input.capacity_reserved && input.attempt.phase() == Phase::Reserved {
+    if !input.capacity_reserved
+        && matches!(
+            input.attempt.phase(),
+            Phase::Reserved | Phase::UnprovisionedReleasing
+        )
+    {
         return Ok(persist(
             DisposableAttemptCatalogAction::CompleteUnprovisioned,
         ));
@@ -418,21 +426,28 @@ pub fn reconcile_attempt(
         return Ok(persist(DisposableAttemptCatalogAction::BeginCleanup));
     }
     Ok(match input.attempt.phase() {
-        Phase::Reserved if cleanup => Action::ReleaseCapacity,
+        Phase::Reserved if cleanup => {
+            persist(DisposableAttemptCatalogAction::BeginUnprovisionedRelease)
+        }
         Phase::Reserved => match input.vm {
             DisposableVmObservation::Unknown => Action::Observe {
                 target: DisposableWorkerObservationTarget::Vm,
             },
             DisposableVmObservation::Absent => {
-                persist(DisposableAttemptCatalogAction::BeginProvisioning)
+                persist(DisposableAttemptCatalogAction::AuthorizeClone)
             }
             DisposableVmObservation::Stopped | DisposableVmObservation::Ready => Action::Blocked {
                 code: "vm_exists_before_clone_authorization",
             },
             DisposableVmObservation::Conflicting => unreachable!(),
         },
-        Phase::Provisioning if cleanup => persist(DisposableAttemptCatalogAction::BeginCleanup),
-        Phase::Provisioning => match input.vm {
+        Phase::UnprovisionedReleasing if input.capacity_reserved => Action::ReleaseCapacity,
+        Phase::UnprovisionedReleasing => unreachable!(),
+        Phase::Provisioning => Action::Blocked {
+            code: "legacy_provisioning_recovery_required",
+        },
+        Phase::CloneAuthorized if cleanup => persist(DisposableAttemptCatalogAction::BeginCleanup),
+        Phase::CloneAuthorized => match input.vm {
             DisposableVmObservation::Unknown => Action::Observe {
                 target: DisposableWorkerObservationTarget::Vm,
             },
@@ -640,6 +655,10 @@ fn validate_transition(
 ) -> Result<DisposableAttemptCatalogAction, DisposableWorkerReconcilerError> {
     let result = match &transition {
         DisposableAttemptCatalogAction::BeginProvisioning => attempt.begin_provisioning(),
+        DisposableAttemptCatalogAction::AuthorizeClone => attempt.authorize_clone(),
+        DisposableAttemptCatalogAction::BeginUnprovisionedRelease => {
+            attempt.begin_unprovisioned_release()
+        }
         DisposableAttemptCatalogAction::CompleteUnprovisioned => attempt.complete_unprovisioned(),
         DisposableAttemptCatalogAction::BeginRegistration => attempt.begin_registration(),
         DisposableAttemptCatalogAction::RecordRegistration(runner) => {
