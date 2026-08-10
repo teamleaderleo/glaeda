@@ -2,8 +2,8 @@ use smolrunner::disposable_attempt_catalog::DisposableAttemptCatalogAction;
 use smolrunner::disposable_attempt_state::DisposableAttemptState;
 use smolrunner::disposable_worker_reconciler::{
     CapacityClaimId, DisposableAttemptId, DisposableAttemptPhase, DisposableHostBudget,
-    DisposableHostUsage, DisposableVmId, DisposableWorkerAction, DisposableWorkerObservationTarget,
-    DisposableWorkerReconcileInput, DisposableWorkerResources, ExactObjectObservation,
+    DisposableHostUsage, DisposableVmId, DisposableVmObservation, DisposableWorkerAction,
+    DisposableWorkerObservationTarget, DisposableWorkerReconcileInput, DisposableWorkerResources,
     ScaleSetDemand, ScaleSetRunnerObservation, plan_capacity, reconcile_attempt,
 };
 use smolrunner::execution_admission::EpochMillis;
@@ -47,7 +47,7 @@ fn result(value: &str) -> ScaleSetJobResult {
 
 fn input<'a>(
     attempt: &'a DisposableAttemptState,
-    vm: ExactObjectObservation,
+    vm: DisposableVmObservation,
     runner: ScaleSetRunnerObservation,
 ) -> DisposableWorkerReconcileInput<'a> {
     DisposableWorkerReconcileInput {
@@ -169,7 +169,7 @@ fn happy_path_uses_canonical_durable_transitions() {
     let mut state = attempt();
     let action = reconcile_attempt(input(
         &state,
-        ExactObjectObservation::Absent,
+        DisposableVmObservation::Absent,
         ScaleSetRunnerObservation::Absent,
     ))
     .unwrap();
@@ -182,15 +182,24 @@ fn happy_path_uses_canonical_durable_transitions() {
     assert_eq!(
         reconcile_attempt(input(
             &state,
-            ExactObjectObservation::Absent,
+            DisposableVmObservation::Absent,
             ScaleSetRunnerObservation::Absent,
         ))
         .unwrap(),
-        DisposableWorkerAction::ProvisionVm
+        DisposableWorkerAction::CloneVm
+    );
+    assert_eq!(
+        reconcile_attempt(input(
+            &state,
+            DisposableVmObservation::Stopped,
+            ScaleSetRunnerObservation::Absent,
+        ))
+        .unwrap(),
+        DisposableWorkerAction::StartVm
     );
     let action = reconcile_attempt(input(
         &state,
-        ExactObjectObservation::Matching,
+        DisposableVmObservation::Ready,
         ScaleSetRunnerObservation::Absent,
     ))
     .unwrap();
@@ -199,7 +208,7 @@ fn happy_path_uses_canonical_durable_transitions() {
     assert_eq!(
         reconcile_attempt(input(
             &state,
-            ExactObjectObservation::Matching,
+            DisposableVmObservation::Ready,
             ScaleSetRunnerObservation::Absent,
         ))
         .unwrap(),
@@ -209,7 +218,7 @@ fn happy_path_uses_canonical_durable_transitions() {
     let exact_runner = runner(41);
     let action = reconcile_attempt(input(
         &state,
-        ExactObjectObservation::Matching,
+        DisposableVmObservation::Ready,
         ScaleSetRunnerObservation::IdleReady {
             runner: exact_runner.clone(),
         },
@@ -220,7 +229,7 @@ fn happy_path_uses_canonical_durable_transitions() {
 
     let mut started = input(
         &state,
-        ExactObjectObservation::Matching,
+        DisposableVmObservation::Ready,
         ScaleSetRunnerObservation::IdleReady {
             runner: exact_runner.clone(),
         },
@@ -235,7 +244,7 @@ fn happy_path_uses_canonical_durable_transitions() {
 
     let mut completed = input(
         &state,
-        ExactObjectObservation::Matching,
+        DisposableVmObservation::Ready,
         ScaleSetRunnerObservation::IdleReady {
             runner: exact_runner.clone(),
         },
@@ -252,13 +261,49 @@ fn happy_path_uses_canonical_durable_transitions() {
 }
 
 #[test]
+fn stopped_vm_is_started_only_while_provisioning_and_destroyed_during_cleanup() {
+    let provisioning = attempt().begin_provisioning().unwrap();
+    assert_eq!(
+        reconcile_attempt(input(
+            &provisioning,
+            DisposableVmObservation::Stopped,
+            ScaleSetRunnerObservation::Absent,
+        ))
+        .unwrap(),
+        DisposableWorkerAction::StartVm
+    );
+
+    let registering = provisioning.begin_registration().unwrap();
+    assert_eq!(
+        reconcile_attempt(input(
+            &registering,
+            DisposableVmObservation::Stopped,
+            ScaleSetRunnerObservation::Absent,
+        ))
+        .unwrap(),
+        persist(DisposableAttemptCatalogAction::BeginCleanup)
+    );
+
+    let destroying = registering.begin_cleanup().unwrap();
+    assert_eq!(
+        reconcile_attempt(input(
+            &destroying,
+            DisposableVmObservation::Stopped,
+            ScaleSetRunnerObservation::Absent,
+        ))
+        .unwrap(),
+        DisposableWorkerAction::DestroyVm
+    );
+}
+
+#[test]
 fn crash_discovered_registration_is_durably_bound_before_cleanup() {
     let mut state = attempt().begin_provisioning().unwrap();
     state = state.begin_registration().unwrap();
     let exact_runner = runner(41);
     let action = reconcile_attempt(input(
         &state,
-        ExactObjectObservation::Matching,
+        DisposableVmObservation::Ready,
         ScaleSetRunnerObservation::RegistrationOnly {
             runner: exact_runner.clone(),
         },
@@ -275,7 +320,7 @@ fn crash_discovered_registration_is_durably_bound_before_cleanup() {
     assert_eq!(
         reconcile_attempt(input(
             &state,
-            ExactObjectObservation::Matching,
+            DisposableVmObservation::Ready,
             ScaleSetRunnerObservation::RegistrationOnly { runner: runner(41) },
         ))
         .unwrap(),
@@ -284,7 +329,7 @@ fn crash_discovered_registration_is_durably_bound_before_cleanup() {
     assert_eq!(
         reconcile_attempt(input(
             &state,
-            ExactObjectObservation::Matching,
+            DisposableVmObservation::Ready,
             ScaleSetRunnerObservation::Absent,
         ))
         .unwrap(),
@@ -297,7 +342,7 @@ fn runnerless_completion_without_attempt_binding_fails_closed() {
     let state = attempt();
     let mut completed = input(
         &state,
-        ExactObjectObservation::Absent,
+        DisposableVmObservation::Absent,
         ScaleSetRunnerObservation::Absent,
     );
     completed.job_event = Some(ScaleSetJobEvent::Completed {
@@ -328,7 +373,7 @@ fn terminal_cleanup_orders_vm_runner_and_capacity_release() {
     assert_eq!(
         reconcile_attempt(input(
             &state,
-            ExactObjectObservation::Matching,
+            DisposableVmObservation::Ready,
             ScaleSetRunnerObservation::RegistrationOnly {
                 runner: exact_runner.clone(),
             },
@@ -338,7 +383,7 @@ fn terminal_cleanup_orders_vm_runner_and_capacity_release() {
     );
     let action = reconcile_attempt(input(
         &state,
-        ExactObjectObservation::Absent,
+        DisposableVmObservation::Absent,
         ScaleSetRunnerObservation::RegistrationOnly {
             runner: exact_runner.clone(),
         },
@@ -348,7 +393,7 @@ fn terminal_cleanup_orders_vm_runner_and_capacity_release() {
     assert_eq!(state.phase(), DisposableAttemptPhase::Deregistering);
     let action = reconcile_attempt(input(
         &state,
-        ExactObjectObservation::Absent,
+        DisposableVmObservation::Absent,
         ScaleSetRunnerObservation::RegistrationOnly {
             runner: exact_runner.clone(),
         },
@@ -365,7 +410,7 @@ fn terminal_cleanup_orders_vm_runner_and_capacity_release() {
     assert_eq!(
         reconcile_attempt(input(
             &state,
-            ExactObjectObservation::Absent,
+            DisposableVmObservation::Absent,
             ScaleSetRunnerObservation::RegistrationOnly {
                 runner: exact_runner.clone(),
             },
@@ -377,7 +422,7 @@ fn terminal_cleanup_orders_vm_runner_and_capacity_release() {
     );
     let action = reconcile_attempt(input(
         &state,
-        ExactObjectObservation::Absent,
+        DisposableVmObservation::Absent,
         ScaleSetRunnerObservation::Absent,
     ))
     .unwrap();
@@ -386,7 +431,7 @@ fn terminal_cleanup_orders_vm_runner_and_capacity_release() {
     assert_eq!(
         reconcile_attempt(input(
             &state,
-            ExactObjectObservation::Absent,
+            DisposableVmObservation::Absent,
             ScaleSetRunnerObservation::Absent,
         ))
         .unwrap(),
@@ -394,7 +439,7 @@ fn terminal_cleanup_orders_vm_runner_and_capacity_release() {
     );
     let mut released = input(
         &state,
-        ExactObjectObservation::Absent,
+        DisposableVmObservation::Absent,
         ScaleSetRunnerObservation::Absent,
     );
     released.capacity_reserved = false;
@@ -408,7 +453,7 @@ fn cancellation_expiry_and_lost_capacity_converge_to_cleanup() {
     let state = attempt();
     let mut cancelled = input(
         &state,
-        ExactObjectObservation::Absent,
+        DisposableVmObservation::Absent,
         ScaleSetRunnerObservation::Absent,
     );
     cancelled.cancellation_requested = true;
@@ -418,7 +463,7 @@ fn cancellation_expiry_and_lost_capacity_converge_to_cleanup() {
     );
     let mut expired = input(
         &state,
-        ExactObjectObservation::Absent,
+        DisposableVmObservation::Absent,
         ScaleSetRunnerObservation::Absent,
     );
     expired.now = time(10_001);
@@ -428,7 +473,7 @@ fn cancellation_expiry_and_lost_capacity_converge_to_cleanup() {
     );
     let mut lost = input(
         &state,
-        ExactObjectObservation::Absent,
+        DisposableVmObservation::Absent,
         ScaleSetRunnerObservation::Absent,
     );
     lost.capacity_reserved = false;
@@ -444,7 +489,7 @@ fn unknown_conflicting_and_identity_drift_never_authorize_mutation() {
     assert_eq!(
         reconcile_attempt(input(
             &state,
-            ExactObjectObservation::Conflicting,
+            DisposableVmObservation::Conflicting,
             ScaleSetRunnerObservation::Absent,
         ))
         .unwrap(),
@@ -461,7 +506,7 @@ fn unknown_conflicting_and_identity_drift_never_authorize_mutation() {
     assert_eq!(
         reconcile_attempt(input(
             &state,
-            ExactObjectObservation::Matching,
+            DisposableVmObservation::Ready,
             ScaleSetRunnerObservation::IdleReady { runner: wrong },
         ))
         .unwrap_err()
@@ -484,7 +529,7 @@ fn duplicate_job_event_is_a_no_op_but_identity_drift_is_refused() {
         .unwrap();
     let mut duplicate = input(
         &state,
-        ExactObjectObservation::Matching,
+        DisposableVmObservation::Ready,
         ScaleSetRunnerObservation::IdleReady {
             runner: exact_runner.clone(),
         },
@@ -500,7 +545,7 @@ fn duplicate_job_event_is_a_no_op_but_identity_drift_is_refused() {
 
     let mut drift = input(
         &state,
-        ExactObjectObservation::Matching,
+        DisposableVmObservation::Ready,
         ScaleSetRunnerObservation::IdleReady {
             runner: exact_runner.clone(),
         },
@@ -525,7 +570,7 @@ fn late_duplicate_event_does_not_reverse_cleanup() {
         .unwrap();
     let mut duplicate = input(
         &state,
-        ExactObjectObservation::Matching,
+        DisposableVmObservation::Ready,
         ScaleSetRunnerObservation::RegistrationOnly {
             runner: exact_runner.clone(),
         },
@@ -547,7 +592,7 @@ fn first_late_job_events_are_checkpointed_without_reversing_cleanup() {
     let mut state = attempt().begin_cleanup().unwrap();
     let mut started = input(
         &state,
-        ExactObjectObservation::Matching,
+        DisposableVmObservation::Ready,
         ScaleSetRunnerObservation::RegistrationOnly {
             runner: exact_runner.clone(),
         },
@@ -564,7 +609,7 @@ fn first_late_job_events_are_checkpointed_without_reversing_cleanup() {
 
     let mut completed = input(
         &state,
-        ExactObjectObservation::Matching,
+        DisposableVmObservation::Ready,
         ScaleSetRunnerObservation::RegistrationOnly {
             runner: exact_runner.clone(),
         },
@@ -581,7 +626,7 @@ fn first_late_job_events_are_checkpointed_without_reversing_cleanup() {
 
     let mut conflicting = input(
         &state,
-        ExactObjectObservation::Matching,
+        DisposableVmObservation::Ready,
         ScaleSetRunnerObservation::RegistrationOnly {
             runner: exact_runner.clone(),
         },
@@ -602,7 +647,7 @@ fn public_action_json_is_bounded_and_contains_no_private_material() {
     let state = attempt();
     let action = reconcile_attempt(input(
         &state,
-        ExactObjectObservation::Unknown,
+        DisposableVmObservation::Unknown,
         ScaleSetRunnerObservation::Unknown,
     ))
     .unwrap();

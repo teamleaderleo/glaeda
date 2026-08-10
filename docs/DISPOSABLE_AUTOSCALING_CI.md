@@ -88,7 +88,7 @@ SmolRunner still owns the exact configuration of those components, admission, sc
 
 ### M1 — disposable-attempt control contract
 
-Add the small durable lifecycle that joins one scale-set capacity claim, one capacity reservation, one VM identity, one runner registration, and the actual GitHub job when GitHub assigns it. Its pure reconciler must cover every crash point and emit one next action: provision, register, wait, destroy, deregister, release, retry with bounded backoff, or stop for operator policy. Enforce host-wide concurrency and memory/disk ceilings before provisioning.
+Add the small durable lifecycle that joins one scale-set capacity claim, one capacity reservation, one VM identity, one runner registration, and the actual GitHub job when GitHub assigns it. Its pure reconciler must cover every crash point and emit one next action: clone, start, register, wait, destroy, deregister, release, retry with bounded backoff, or stop for operator policy. Enforce host-wide concurrency and memory/disk ceilings before provisioning.
 
 Acceptance: deterministic tests cover duplicate observations, crash-after-each-checkpoint, cancellation, expiry, runner loss, orphan VM, stale GitHub runner, and scale-to-zero. No host or GitHub mutation is in this slice.
 
