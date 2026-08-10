@@ -456,6 +456,7 @@ impl DisposableAttemptCatalogDocument {
                 changes.next().is_some_and(|(next, prior)| {
                     changes.next().is_none()
                         && next.resources == prior.resources
+                        && next.prepared_template_digest == prior.prepared_template_digest
                         && next.attempt.is_exact_successor_of(&prior.attempt)
                 })
             } else {

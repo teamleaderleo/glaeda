@@ -36,10 +36,17 @@ fn attempt(index: usize) -> DisposableAttemptState {
 }
 
 fn reservation(index: usize) -> DisposableAttemptReservation {
+    reservation_with_digest(index, template_digest())
+}
+
+fn reservation_with_digest(
+    index: usize,
+    prepared_template_digest: Sha256Digest,
+) -> DisposableAttemptReservation {
     DisposableAttemptReservation::new(
         attempt(index),
         DisposableWorkerResources::new(1_000, 2 * 1024 * 1024, 8 * 1024 * 1024).unwrap(),
-        template_digest(),
+        prepared_template_digest,
     )
     .unwrap()
 }
@@ -159,6 +166,28 @@ fn raw_store_refuses_unrelated_revision_successors() {
         .replace_if_revision(first_reserved.revision(), &unrelated)
         .expect_err("revision alone must not authorize an unrelated catalog");
     assert_eq!(error.kind(), DisposableAttemptCatalogErrorKind::Conflict);
+    assert_eq!(store.load().unwrap(), Some(first_reserved.clone()));
+
+    let (mut rebound_catalog, rebound_empty) = initialized();
+    let (rebound_reserved, _) = rebound_catalog
+        .reserve(
+            rebound_empty.revision(),
+            reservation_with_digest(1, other_template_digest()),
+        )
+        .unwrap();
+    let rebound = transition(
+        &mut rebound_catalog,
+        &rebound_reserved,
+        1,
+        DisposableAttemptCatalogAction::AuthorizeClone,
+    );
+    assert_eq!(
+        store
+            .replace_if_revision(first_reserved.revision(), &rebound)
+            .expect_err("phase advance cannot rebind the prepared-template generation")
+            .kind(),
+        DisposableAttemptCatalogErrorKind::Conflict
+    );
     assert_eq!(store.load().unwrap(), Some(first_reserved));
 }
 
