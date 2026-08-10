@@ -8,8 +8,7 @@ use crate::disposable_worker_reconciler::{
     DisposableAttemptId, DisposableAttemptPhase, DisposableHostUsage, DisposableWorkerResources,
 };
 use crate::github_scale_set_protocol::{
-    ScaleSetJobId, ScaleSetJobResult, ScaleSetRunnerId, ScaleSetRunnerName,
-    ScaleSetRunnerReference,
+    ScaleSetJobId, ScaleSetJobResult, ScaleSetRunnerId, ScaleSetRunnerName, ScaleSetRunnerReference,
 };
 
 pub const DISPOSABLE_ATTEMPT_CATALOG_SCHEMA_VERSION: u8 = 1;
@@ -205,7 +204,10 @@ impl DisposableAttemptCatalogDocument {
                 "disposable attempt already exists with different durable evidence",
             ));
         }
-        if self.find_tombstone(reservation.attempt.attempt_id()).is_some() {
+        if self
+            .find_tombstone(reservation.attempt.attempt_id())
+            .is_some()
+        {
             return Err(catalog_error(
                 DisposableAttemptCatalogErrorKind::AlreadyExists,
                 "completed disposable attempt identity remains in replay history",
@@ -650,7 +652,10 @@ impl DisposableAttemptCatalogStore for MemoryDisposableAttemptCatalogStore {
             )
         })?;
         if current.revision() != expected_revision {
-            return Err(stale_catalog_revision(expected_revision, current.revision()));
+            return Err(stale_catalog_revision(
+                expected_revision,
+                current.revision(),
+            ));
         }
         let required_revision = expected_revision.next()?;
         if document.revision() != required_revision {
@@ -742,7 +747,9 @@ fn apply_action(
             kind,
             match error.code() {
                 "identity_drift" => "disposable attempt action conflicts with durable identity",
-                "invalid_transition" => "disposable attempt action is invalid for the current phase",
+                "invalid_transition" => {
+                    "disposable attempt action is invalid for the current phase"
+                }
                 _ => "disposable attempt action produced invalid durable state",
             },
         )
