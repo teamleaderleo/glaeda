@@ -7,8 +7,7 @@ use smolrunner::disposable_worker_reconciler::{
 };
 use smolrunner::execution_admission::EpochMillis;
 use smolrunner::github_scale_set_protocol::{
-    ScaleSetJobId, ScaleSetJobResult, ScaleSetRunnerId, ScaleSetRunnerName,
-    ScaleSetRunnerReference,
+    ScaleSetJobId, ScaleSetJobResult, ScaleSetRunnerId, ScaleSetRunnerName, ScaleSetRunnerReference,
 };
 
 fn reserved() -> DisposableAttemptState {
@@ -65,7 +64,9 @@ fn job_assignment_does_not_bind_a_runner_before_job_started() {
     assert!(assigned.runner_id().is_none());
     assert_eq!(assigned.github_job_id().unwrap().as_str(), "job_opaque-7");
 
-    let running = assigned.record_running(&runner(9), job("job_opaque-7")).unwrap();
+    let running = assigned
+        .record_running(&runner(9), job("job_opaque-7"))
+        .unwrap();
     assert_eq!(running.phase(), DisposableAttemptPhase::Running);
     assert_eq!(running.runner_id().unwrap().get(), 9);
     assert_eq!(running.github_job_id().unwrap().as_str(), "job_opaque-7");
@@ -83,7 +84,10 @@ fn preassignment_completion_can_be_terminal_without_runner_identity() {
 
     assert_eq!(terminal.phase(), DisposableAttemptPhase::Terminal);
     assert!(terminal.runner_id().is_none());
-    assert_eq!(terminal.github_job_id().unwrap().as_str(), "cancel-before-runner");
+    assert_eq!(
+        terminal.github_job_id().unwrap().as_str(),
+        "cancel-before-runner"
+    );
     assert_eq!(terminal.result().unwrap().as_str(), "canceled");
 }
 
@@ -122,7 +126,10 @@ fn exact_runner_and_job_identity_drift_fails_closed() {
         .unwrap();
 
     assert_eq!(
-        registered.record_runner_ready(&runner(8)).unwrap_err().code(),
+        registered
+            .record_runner_ready(&runner(8))
+            .unwrap_err()
+            .code(),
         "identity_drift"
     );
 
@@ -159,7 +166,10 @@ fn canonical_codec_round_trips_exact_state_and_revision() {
     let decoded = decode_disposable_attempt_state(&encoded).unwrap();
 
     assert_eq!(decoded, state);
-    assert_eq!(decoded.schema_version(), DISPOSABLE_ATTEMPT_STATE_SCHEMA_VERSION);
+    assert_eq!(
+        decoded.schema_version(),
+        DISPOSABLE_ATTEMPT_STATE_SCHEMA_VERSION
+    );
     assert_eq!(decoded.revision(), state.revision());
     assert_eq!(decoded.runner_name().as_str(), "smol-attempt-1");
     assert_eq!(decoded.runner_id().unwrap().get(), 77);
@@ -181,7 +191,9 @@ fn codec_rejects_future_versions_unknown_fields_and_inconsistent_phase_evidence(
     value["unexpected"] = serde_json::json!(true);
     let unknown = serde_json::to_vec(&value).unwrap();
     assert_eq!(
-        decode_disposable_attempt_state(&unknown).unwrap_err().code(),
+        decode_disposable_attempt_state(&unknown)
+            .unwrap_err()
+            .code(),
         "invalid_document"
     );
 
