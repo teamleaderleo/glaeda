@@ -179,6 +179,9 @@ pub mod project_catalog;
 /// Read-only, credentialless observation of one developer Git checkout on Unix hosts.
 #[cfg(unix)]
 pub mod project_checkout_observation;
+/// Read-only, bounded immediate-child discovery beneath one explicit project root.
+#[cfg(unix)]
+pub mod project_discovery;
 pub mod renderprove_artifact_binding;
 pub mod renderprove_execution;
 #[cfg(target_os = "linux")]
