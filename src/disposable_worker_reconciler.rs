@@ -305,10 +305,13 @@ pub enum DisposableAttemptPhase {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
-pub enum ExactObjectObservation {
+pub enum DisposableVmObservation {
     Unknown,
     Absent,
-    Matching,
+    /// The exact owned clone exists but is not running or controller-ready.
+    Stopped,
+    /// The exact owned clone is running and has passed the backend readiness check.
+    Ready,
     Conflicting,
 }
 
@@ -332,7 +335,7 @@ pub enum ScaleSetRunnerObservation {
 pub struct DisposableWorkerReconcileInput<'a> {
     pub now: EpochMillis,
     pub attempt: &'a DisposableAttemptState,
-    pub vm: ExactObjectObservation,
+    pub vm: DisposableVmObservation,
     pub runner: ScaleSetRunnerObservation,
     pub job_event: Option<ScaleSetJobEvent>,
     pub capacity_reserved: bool,
@@ -355,7 +358,8 @@ pub enum DisposableWorkerAction {
     Observe {
         target: DisposableWorkerObservationTarget,
     },
-    ProvisionVm,
+    CloneVm,
+    StartVm,
     GenerateJitAndStartRunner,
     Wait,
     DestroyVm,
@@ -374,7 +378,7 @@ pub fn reconcile_attempt(
 ) -> Result<DisposableWorkerAction, DisposableWorkerReconcilerError> {
     let cleanup = input.cancellation_requested || input.now > input.attempt.not_after();
 
-    if matches!(input.vm, ExactObjectObservation::Conflicting) {
+    if matches!(input.vm, DisposableVmObservation::Conflicting) {
         return Ok(DisposableWorkerAction::Blocked {
             code: "conflicting_vm_identity",
         });
@@ -412,22 +416,28 @@ pub fn reconcile_attempt(
         Phase::Reserved => persist(DisposableAttemptCatalogAction::BeginProvisioning),
         Phase::Provisioning if cleanup => persist(DisposableAttemptCatalogAction::BeginCleanup),
         Phase::Provisioning => match input.vm {
-            ExactObjectObservation::Unknown => Action::Observe {
+            DisposableVmObservation::Unknown => Action::Observe {
                 target: DisposableWorkerObservationTarget::Vm,
             },
-            ExactObjectObservation::Absent => Action::ProvisionVm,
-            ExactObjectObservation::Matching => {
+            DisposableVmObservation::Absent => Action::CloneVm,
+            DisposableVmObservation::Stopped => Action::StartVm,
+            DisposableVmObservation::Ready => {
                 persist(DisposableAttemptCatalogAction::BeginRegistration)
             }
-            ExactObjectObservation::Conflicting => unreachable!(),
+            DisposableVmObservation::Conflicting => unreachable!(),
         },
         Phase::Registering if cleanup => persist(DisposableAttemptCatalogAction::BeginCleanup),
-        Phase::Registering if matches!(input.vm, ExactObjectObservation::Unknown) => {
+        Phase::Registering if matches!(input.vm, DisposableVmObservation::Unknown) => {
             Action::Observe {
                 target: DisposableWorkerObservationTarget::Vm,
             }
         }
-        Phase::Registering if matches!(input.vm, ExactObjectObservation::Absent) => {
+        Phase::Registering
+            if matches!(
+                input.vm,
+                DisposableVmObservation::Absent | DisposableVmObservation::Stopped
+            ) =>
+        {
             persist(DisposableAttemptCatalogAction::BeginCleanup)
         }
         Phase::Registering => match &input.runner {
@@ -461,14 +471,17 @@ pub fn reconcile_attempt(
             persist(DisposableAttemptCatalogAction::BeginCleanup)
         }
         Phase::Waiting | Phase::Assigned | Phase::Running
-            if matches!(input.vm, ExactObjectObservation::Unknown) =>
+            if matches!(input.vm, DisposableVmObservation::Unknown) =>
         {
             Action::Observe {
                 target: DisposableWorkerObservationTarget::Vm,
             }
         }
         Phase::Waiting | Phase::Assigned | Phase::Running
-            if matches!(input.vm, ExactObjectObservation::Absent) =>
+            if matches!(
+                input.vm,
+                DisposableVmObservation::Absent | DisposableVmObservation::Stopped
+            ) =>
         {
             persist(DisposableAttemptCatalogAction::BeginCleanup)
         }
@@ -493,21 +506,26 @@ pub fn reconcile_attempt(
         },
         Phase::Terminal => persist(DisposableAttemptCatalogAction::BeginCleanup),
         Phase::Destroying => match input.vm {
-            ExactObjectObservation::Unknown => Action::Observe {
+            DisposableVmObservation::Unknown => Action::Observe {
                 target: DisposableWorkerObservationTarget::Vm,
             },
-            ExactObjectObservation::Matching => Action::DestroyVm,
-            ExactObjectObservation::Absent => persist(
+            DisposableVmObservation::Stopped | DisposableVmObservation::Ready => Action::DestroyVm,
+            DisposableVmObservation::Absent => persist(
                 DisposableAttemptCatalogAction::AdvanceCleanup(Phase::Deregistering),
             ),
-            ExactObjectObservation::Conflicting => unreachable!(),
+            DisposableVmObservation::Conflicting => unreachable!(),
         },
-        Phase::Deregistering if matches!(input.vm, ExactObjectObservation::Unknown) => {
+        Phase::Deregistering if matches!(input.vm, DisposableVmObservation::Unknown) => {
             Action::Observe {
                 target: DisposableWorkerObservationTarget::Vm,
             }
         }
-        Phase::Deregistering if matches!(input.vm, ExactObjectObservation::Matching) => {
+        Phase::Deregistering
+            if matches!(
+                input.vm,
+                DisposableVmObservation::Stopped | DisposableVmObservation::Ready
+            ) =>
+        {
             Action::DestroyVm
         }
         Phase::Deregistering => match &input.runner {
@@ -532,12 +550,17 @@ pub fn reconcile_attempt(
             },
             ScaleSetRunnerObservation::Conflicting => unreachable!(),
         },
-        Phase::Releasing if matches!(input.vm, ExactObjectObservation::Unknown) => {
+        Phase::Releasing if matches!(input.vm, DisposableVmObservation::Unknown) => {
             Action::Observe {
                 target: DisposableWorkerObservationTarget::Vm,
             }
         }
-        Phase::Releasing if matches!(input.vm, ExactObjectObservation::Matching) => {
+        Phase::Releasing
+            if matches!(
+                input.vm,
+                DisposableVmObservation::Stopped | DisposableVmObservation::Ready
+            ) =>
+        {
             Action::DestroyVm
         }
         Phase::Releasing if matches!(input.runner, ScaleSetRunnerObservation::Unknown) => {
@@ -571,7 +594,7 @@ pub fn reconcile_attempt(
             code: "completed_attempt_retains_capacity",
         },
         Phase::Complete
-            if matches!(input.vm, ExactObjectObservation::Unknown)
+            if matches!(input.vm, DisposableVmObservation::Unknown)
                 || matches!(input.runner, ScaleSetRunnerObservation::Unknown) =>
         {
             Action::Blocked {
@@ -579,7 +602,7 @@ pub fn reconcile_attempt(
             }
         }
         Phase::Complete
-            if !matches!(input.vm, ExactObjectObservation::Absent)
+            if !matches!(input.vm, DisposableVmObservation::Absent)
                 || !matches!(input.runner, ScaleSetRunnerObservation::Absent) =>
         {
             Action::Blocked {

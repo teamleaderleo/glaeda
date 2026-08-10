@@ -11,8 +11,8 @@ use smolrunner::disposable_attempt_catalog::{
 use smolrunner::disposable_attempt_state::DisposableAttemptState;
 use smolrunner::disposable_worker_reconciler::{
     CapacityClaimId, DisposableAttemptId, DisposableAttemptPhase, DisposableVmId,
-    DisposableWorkerAction, DisposableWorkerReconcileInput, DisposableWorkerResources,
-    ExactObjectObservation, ScaleSetRunnerObservation, reconcile_attempt,
+    DisposableVmObservation, DisposableWorkerAction, DisposableWorkerReconcileInput,
+    DisposableWorkerResources, ScaleSetRunnerObservation, reconcile_attempt,
 };
 use smolrunner::execution_admission::EpochMillis;
 use smolrunner::github_scale_set_protocol::{
@@ -89,7 +89,7 @@ fn initialize(root: &Path) -> DisposableAttemptCatalogDocument {
 
 fn tick(
     root: &Path,
-    vm: ExactObjectObservation,
+    vm: DisposableVmObservation,
     runner_observation: ScaleSetRunnerObservation,
     job_event: Option<ScaleSetJobEvent>,
     capacity_reserved: bool,
@@ -141,7 +141,7 @@ fn every_durable_checkpoint_reopens_without_duplicate_capacity_or_cleanup_loss()
 
     let (state, action) = tick(
         root.path(),
-        ExactObjectObservation::Absent,
+        DisposableVmObservation::Absent,
         ScaleSetRunnerObservation::Absent,
         None,
         true,
@@ -155,17 +155,28 @@ fn every_durable_checkpoint_reopens_without_duplicate_capacity_or_cleanup_loss()
     for _ in 0..2 {
         let (_, action) = tick(
             root.path(),
-            ExactObjectObservation::Absent,
+            DisposableVmObservation::Absent,
             ScaleSetRunnerObservation::Absent,
             None,
             true,
         );
-        assert_eq!(action, DisposableWorkerAction::ProvisionVm);
+        assert_eq!(action, DisposableWorkerAction::CloneVm);
+    }
+
+    for _ in 0..2 {
+        let (_, action) = tick(
+            root.path(),
+            DisposableVmObservation::Stopped,
+            ScaleSetRunnerObservation::Absent,
+            None,
+            true,
+        );
+        assert_eq!(action, DisposableWorkerAction::StartVm);
     }
 
     let (state, _) = tick(
         root.path(),
-        ExactObjectObservation::Matching,
+        DisposableVmObservation::Ready,
         ScaleSetRunnerObservation::Absent,
         None,
         true,
@@ -177,7 +188,7 @@ fn every_durable_checkpoint_reopens_without_duplicate_capacity_or_cleanup_loss()
     for _ in 0..2 {
         let (_, action) = tick(
             root.path(),
-            ExactObjectObservation::Matching,
+            DisposableVmObservation::Ready,
             ScaleSetRunnerObservation::Absent,
             None,
             true,
@@ -188,7 +199,7 @@ fn every_durable_checkpoint_reopens_without_duplicate_capacity_or_cleanup_loss()
     let exact_runner = runner();
     let (state, _) = tick(
         root.path(),
-        ExactObjectObservation::Matching,
+        DisposableVmObservation::Ready,
         ScaleSetRunnerObservation::IdleReady {
             runner: exact_runner.clone(),
         },
@@ -203,7 +214,7 @@ fn every_durable_checkpoint_reopens_without_duplicate_capacity_or_cleanup_loss()
     let exact_job = ScaleSetJobId::parse("opaque-job/restart-1").unwrap();
     let (state, _) = tick(
         root.path(),
-        ExactObjectObservation::Matching,
+        DisposableVmObservation::Ready,
         ScaleSetRunnerObservation::IdleReady {
             runner: exact_runner.clone(),
         },
@@ -220,7 +231,7 @@ fn every_durable_checkpoint_reopens_without_duplicate_capacity_or_cleanup_loss()
 
     let (state, _) = tick(
         root.path(),
-        ExactObjectObservation::Matching,
+        DisposableVmObservation::Ready,
         ScaleSetRunnerObservation::IdleReady {
             runner: exact_runner,
         },
@@ -238,7 +249,7 @@ fn every_durable_checkpoint_reopens_without_duplicate_capacity_or_cleanup_loss()
 
     let (state, _) = tick(
         root.path(),
-        ExactObjectObservation::Matching,
+        DisposableVmObservation::Ready,
         ScaleSetRunnerObservation::RegistrationOnly { runner: runner() },
         None,
         true,
@@ -250,7 +261,7 @@ fn every_durable_checkpoint_reopens_without_duplicate_capacity_or_cleanup_loss()
     for _ in 0..2 {
         let (_, action) = tick(
             root.path(),
-            ExactObjectObservation::Matching,
+            DisposableVmObservation::Ready,
             ScaleSetRunnerObservation::RegistrationOnly { runner: runner() },
             None,
             true,
@@ -260,7 +271,7 @@ fn every_durable_checkpoint_reopens_without_duplicate_capacity_or_cleanup_loss()
 
     let (state, _) = tick(
         root.path(),
-        ExactObjectObservation::Absent,
+        DisposableVmObservation::Absent,
         ScaleSetRunnerObservation::RegistrationOnly { runner: runner() },
         None,
         true,
@@ -272,7 +283,7 @@ fn every_durable_checkpoint_reopens_without_duplicate_capacity_or_cleanup_loss()
     for _ in 0..2 {
         let (_, action) = tick(
             root.path(),
-            ExactObjectObservation::Absent,
+            DisposableVmObservation::Absent,
             ScaleSetRunnerObservation::RegistrationOnly { runner: runner() },
             None,
             true,
@@ -285,7 +296,7 @@ fn every_durable_checkpoint_reopens_without_duplicate_capacity_or_cleanup_loss()
 
     let (state, _) = tick(
         root.path(),
-        ExactObjectObservation::Absent,
+        DisposableVmObservation::Absent,
         ScaleSetRunnerObservation::Absent,
         None,
         true,
@@ -297,7 +308,7 @@ fn every_durable_checkpoint_reopens_without_duplicate_capacity_or_cleanup_loss()
     for _ in 0..2 {
         let (_, action) = tick(
             root.path(),
-            ExactObjectObservation::Absent,
+            DisposableVmObservation::Absent,
             ScaleSetRunnerObservation::Absent,
             None,
             true,
@@ -307,7 +318,7 @@ fn every_durable_checkpoint_reopens_without_duplicate_capacity_or_cleanup_loss()
 
     let (state, _) = tick(
         root.path(),
-        ExactObjectObservation::Absent,
+        DisposableVmObservation::Absent,
         ScaleSetRunnerObservation::Absent,
         None,
         false,
@@ -329,14 +340,21 @@ fn stale_registration_is_bound_before_delete_and_recovery_never_uses_name_alone(
 
     tick(
         root.path(),
-        ExactObjectObservation::Absent,
+        DisposableVmObservation::Absent,
         ScaleSetRunnerObservation::Absent,
         None,
         true,
     );
     tick(
         root.path(),
-        ExactObjectObservation::Matching,
+        DisposableVmObservation::Stopped,
+        ScaleSetRunnerObservation::Absent,
+        None,
+        true,
+    );
+    tick(
+        root.path(),
+        DisposableVmObservation::Ready,
         ScaleSetRunnerObservation::Absent,
         None,
         true,
@@ -344,7 +362,7 @@ fn stale_registration_is_bound_before_delete_and_recovery_never_uses_name_alone(
 
     let (catalog, action) = tick(
         root.path(),
-        ExactObjectObservation::Matching,
+        DisposableVmObservation::Ready,
         ScaleSetRunnerObservation::RegistrationOnly { runner: runner() },
         None,
         true,
@@ -369,14 +387,14 @@ fn stale_registration_is_bound_before_delete_and_recovery_never_uses_name_alone(
 
     tick(
         root.path(),
-        ExactObjectObservation::Matching,
+        DisposableVmObservation::Ready,
         ScaleSetRunnerObservation::RegistrationOnly { runner: runner() },
         None,
         true,
     );
     tick(
         root.path(),
-        ExactObjectObservation::Absent,
+        DisposableVmObservation::Absent,
         ScaleSetRunnerObservation::RegistrationOnly { runner: runner() },
         None,
         true,
@@ -385,7 +403,7 @@ fn stale_registration_is_bound_before_delete_and_recovery_never_uses_name_alone(
     for _ in 0..2 {
         let (_, action) = tick(
             root.path(),
-            ExactObjectObservation::Absent,
+            DisposableVmObservation::Absent,
             ScaleSetRunnerObservation::RegistrationOnly { runner: runner() },
             None,
             true,
@@ -398,7 +416,7 @@ fn stale_registration_is_bound_before_delete_and_recovery_never_uses_name_alone(
 
     let (catalog, _) = tick(
         root.path(),
-        ExactObjectObservation::Absent,
+        DisposableVmObservation::Absent,
         ScaleSetRunnerObservation::Absent,
         None,
         true,
@@ -414,7 +432,7 @@ fn stale_registration_is_bound_before_delete_and_recovery_never_uses_name_alone(
         reconcile_attempt(DisposableWorkerReconcileInput {
             now: epoch(1_000),
             attempt: state,
-            vm: ExactObjectObservation::Absent,
+            vm: DisposableVmObservation::Absent,
             runner: ScaleSetRunnerObservation::RegistrationOnly {
                 runner: replacement,
             },
