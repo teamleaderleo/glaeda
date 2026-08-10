@@ -9,7 +9,7 @@ use crate::artifact::Sha256Digest;
 use crate::local_install_plan::{
     LocalInstallBuildPlan, LocalInstallGenerationIdentity, LocalInstallPlatform,
 };
-use crate::process::{CommandSpec, CommandValue};
+use crate::process::CommandSpec;
 
 pub const LOCAL_INSTALL_BUILD_COMMAND_SCHEMA_VERSION: u8 = 2;
 pub const LOCAL_INSTALL_BUILD_TIMEOUT: Duration = Duration::from_secs(20 * 60);
@@ -449,6 +449,7 @@ mod tests {
         LocalInstallBuildPlan, LocalInstallGenerationIdentity, LocalInstallSourceIdentity,
         LocalInstallToolchainIdentity,
     };
+    use crate::process::{CommandValue, SecretString};
 
     use super::*;
 
@@ -492,12 +493,6 @@ mod tests {
         .expect("context")
     }
 
-    fn command_value(value: &CommandValue) -> &str {
-        match value {
-            CommandValue::Plain(value) | CommandValue::Secret(value) => value,
-        }
-    }
-
     #[test]
     fn exact_argv_uses_redacted_manifest_path_and_isolated_working_directory() {
         let context = context("private-a");
@@ -527,13 +522,11 @@ mod tests {
         );
         assert_ne!(command.working_directory(), context.source_root);
         assert_eq!(
-            command_value(&command.spec().arguments[2]),
-            context.manifest_path().to_str().expect("manifest")
-        );
-        assert!(matches!(
             command.spec().arguments[2],
-            CommandValue::Secret(_)
-        ));
+            CommandValue::Secret(SecretString::new(
+                context.manifest_path().to_str().expect("manifest")
+            ))
+        );
     }
 
     #[test]
