@@ -176,6 +176,9 @@ pub mod preview;
 pub mod process;
 /// Pure, strict logical project catalog identities and alias resolution.
 pub mod project_catalog;
+/// Read-only, credentialless observation of one developer Git checkout on Unix hosts.
+#[cfg(unix)]
+pub mod project_checkout_observation;
 pub mod renderprove_artifact_binding;
 pub mod renderprove_execution;
 #[cfg(target_os = "linux")]
