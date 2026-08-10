@@ -3,8 +3,8 @@ use std::fmt;
 
 use serde::Serialize;
 
-use crate::artifact::Sha256Digest;
 use crate::disposable_attempt_state::{DisposableAttemptRevision, DisposableAttemptState};
+use crate::disposable_prepared_template::DisposablePreparedTemplateIdentity;
 use crate::disposable_worker_reconciler::{
     DisposableAttemptId, DisposableAttemptPhase, DisposableHostUsage, DisposableWorkerResources,
 };
@@ -17,7 +17,7 @@ pub use codec::{
     encode_disposable_attempt_catalog,
 };
 
-pub const DISPOSABLE_ATTEMPT_CATALOG_SCHEMA_VERSION: u8 = 2;
+pub const DISPOSABLE_ATTEMPT_CATALOG_SCHEMA_VERSION: u8 = 3;
 pub const MAX_ACTIVE_DISPOSABLE_ATTEMPTS: usize = 64;
 pub const MAX_DISPOSABLE_ATTEMPT_TOMBSTONES: usize = 64;
 const MAX_DISPOSABLE_ATTEMPT_CATALOG_REVISION: u64 = 1_000_000_000_000;
@@ -67,7 +67,7 @@ impl DisposableAttemptCatalogRevision {
 pub struct DisposableAttemptReservation {
     attempt: DisposableAttemptState,
     resources: DisposableWorkerResources,
-    prepared_template_digest: Sha256Digest,
+    prepared_template_identity: DisposablePreparedTemplateIdentity,
 }
 
 impl DisposableAttemptReservation {
@@ -80,7 +80,7 @@ impl DisposableAttemptReservation {
     pub fn new(
         attempt: DisposableAttemptState,
         resources: DisposableWorkerResources,
-        prepared_template_digest: Sha256Digest,
+        prepared_template_identity: DisposablePreparedTemplateIdentity,
     ) -> Result<Self, DisposableAttemptCatalogError> {
         if attempt.phase() != DisposableAttemptPhase::Reserved || attempt.revision().get() != 1 {
             return Err(catalog_error(
@@ -91,7 +91,7 @@ impl DisposableAttemptReservation {
         Ok(Self {
             attempt,
             resources,
-            prepared_template_digest,
+            prepared_template_identity,
         })
     }
 
@@ -107,8 +107,8 @@ impl DisposableAttemptReservation {
 
     /// Return the exact prepared-template generation reserved for this attempt.
     #[must_use]
-    pub const fn prepared_template_digest(&self) -> &Sha256Digest {
-        &self.prepared_template_digest
+    pub const fn prepared_template_identity(&self) -> &DisposablePreparedTemplateIdentity {
+        &self.prepared_template_identity
     }
 }
 
@@ -456,7 +456,7 @@ impl DisposableAttemptCatalogDocument {
                 changes.next().is_some_and(|(next, prior)| {
                     changes.next().is_none()
                         && next.resources == prior.resources
-                        && next.prepared_template_digest == prior.prepared_template_digest
+                        && next.prepared_template_identity == prior.prepared_template_identity
                         && next.attempt.is_exact_successor_of(&prior.attempt)
                 })
             } else {

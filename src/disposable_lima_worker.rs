@@ -7,6 +7,9 @@ use sha2::{Digest, Sha256};
 
 use crate::artifact::Sha256Digest;
 use crate::disposable_attempt_catalog::DisposableAttemptReservation;
+use crate::disposable_prepared_template::{
+    DisposablePreparedTemplateIdentity, DisposablePreparedTemplateManifest,
+};
 use crate::disposable_worker_reconciler::{
     DisposableAttemptPhase, DisposableWorkerAction, DisposableWorkerResources,
 };
@@ -14,7 +17,7 @@ use crate::execution_admission::EpochMillis;
 use crate::lima_observation::{LIMACTL_SAFE_HOME, LimaInstanceName};
 use crate::process::CommandSpec;
 
-pub const DISPOSABLE_LIMA_WORKER_SCHEMA_VERSION: u8 = 2;
+pub const DISPOSABLE_LIMA_WORKER_SCHEMA_VERSION: u8 = 3;
 
 const GIB: u64 = 1 << 30;
 const MAX_PRIVATE_PATH_BYTES: usize = 1_024;
@@ -79,7 +82,7 @@ pub struct DisposableLimaWorkerAdapter {
     limactl_program: PathBuf,
     lima_home: PathBuf,
     source_template: LimaInstanceName,
-    prepared_template_digest: Sha256Digest,
+    prepared_template_identity: DisposablePreparedTemplateIdentity,
 }
 
 impl fmt::Debug for DisposableLimaWorkerAdapter {
@@ -89,7 +92,10 @@ impl fmt::Debug for DisposableLimaWorkerAdapter {
             .field("limactl_program", &"<private-program-path>")
             .field("lima_home", &"<private-lima-home>")
             .field("source_template", &self.source_template)
-            .field("prepared_template_digest", &self.prepared_template_digest)
+            .field(
+                "prepared_template_identity",
+                &self.prepared_template_identity,
+            )
             .finish()
     }
 }
@@ -104,15 +110,18 @@ impl DisposableLimaWorkerAdapter {
         limactl_program: impl Into<PathBuf>,
         lima_home: impl Into<PathBuf>,
         source_template: LimaInstanceName,
-        prepared_template_digest: Sha256Digest,
+        prepared_template: &DisposablePreparedTemplateManifest,
     ) -> Result<Self, DisposableLimaWorkerError> {
         let limactl_program = validate_private_path(limactl_program.into())?;
         let lima_home = validate_private_path(lima_home.into())?;
+        let prepared_template_identity = prepared_template
+            .identity()
+            .map_err(|_| invalid_configuration())?;
         Ok(Self {
             limactl_program,
             lima_home,
             source_template,
-            prepared_template_digest,
+            prepared_template_identity,
         })
     }
 
@@ -134,7 +143,7 @@ impl DisposableLimaWorkerAdapter {
         action: &DisposableWorkerAction,
     ) -> Result<DisposableLimaWorkerCommandPlan, DisposableLimaWorkerError> {
         let attempt = reservation.attempt();
-        if reservation.prepared_template_digest() != &self.prepared_template_digest {
+        if reservation.prepared_template_identity() != &self.prepared_template_identity {
             return Err(error(
                 DisposableLimaWorkerErrorKind::InvalidAction,
                 "prepared_template_identity_drift",
@@ -230,7 +239,7 @@ impl DisposableLimaWorkerAdapter {
             &command,
             timeout,
             &self.lima_home,
-            &self.prepared_template_digest,
+            &self.prepared_template_identity,
         )?;
         Ok(DisposableLimaWorkerCommandPlan {
             schema_version: DISPOSABLE_LIMA_WORKER_SCHEMA_VERSION,
@@ -238,7 +247,7 @@ impl DisposableLimaWorkerAdapter {
             attempt_id: attempt.attempt_id().as_str().to_owned(),
             attempt_revision: attempt.revision().get(),
             vm_id: attempt.vm_id().as_str().to_owned(),
-            prepared_template_digest: self.prepared_template_digest.clone(),
+            prepared_template_identity: self.prepared_template_identity.clone(),
             command_identity,
             timeout_seconds: timeout.as_secs(),
             observation_required: true,
@@ -265,7 +274,7 @@ pub struct DisposableLimaWorkerCommandPlan {
     attempt_id: String,
     attempt_revision: u64,
     vm_id: String,
-    prepared_template_digest: Sha256Digest,
+    prepared_template_identity: DisposablePreparedTemplateIdentity,
     command_identity: Sha256Digest,
     timeout_seconds: u64,
     observation_required: bool,
@@ -302,8 +311,8 @@ impl DisposableLimaWorkerCommandPlan {
     }
 
     #[must_use]
-    pub const fn prepared_template_digest(&self) -> &Sha256Digest {
-        &self.prepared_template_digest
+    pub const fn prepared_template_identity(&self) -> &DisposablePreparedTemplateIdentity {
+        &self.prepared_template_identity
     }
 
     #[must_use]
@@ -331,7 +340,10 @@ impl fmt::Debug for DisposableLimaWorkerCommandPlan {
             .field("attempt_id", &self.attempt_id)
             .field("attempt_revision", &self.attempt_revision)
             .field("vm_id", &self.vm_id)
-            .field("prepared_template_digest", &self.prepared_template_digest)
+            .field(
+                "prepared_template_identity",
+                &self.prepared_template_identity,
+            )
             .field("command_identity", &self.command_identity)
             .field("timeout_seconds", &self.timeout_seconds)
             .field("observation_required", &self.observation_required)
@@ -348,14 +360,14 @@ struct CommandIdentityDocument<'a> {
     lang: &'static str,
     lc_all: &'static str,
     timeout_seconds: u64,
-    prepared_template_digest: &'a str,
+    prepared_template_identity: &'a str,
 }
 
 fn command_identity(
     command: &CommandSpec,
     timeout: Duration,
     lima_home: &Path,
-    prepared_template_digest: &Sha256Digest,
+    prepared_template_identity: &DisposablePreparedTemplateIdentity,
 ) -> Result<Sha256Digest, DisposableLimaWorkerError> {
     let document = CommandIdentityDocument {
         schema_version: DISPOSABLE_LIMA_WORKER_SCHEMA_VERSION,
@@ -367,7 +379,7 @@ fn command_identity(
         lang: "C",
         lc_all: "C",
         timeout_seconds: timeout.as_secs(),
-        prepared_template_digest: prepared_template_digest.as_str(),
+        prepared_template_identity: prepared_template_identity.as_str(),
     };
     let bytes = serde_json::to_vec(&document).map_err(|_| invalid_configuration())?;
     let digest = Sha256::digest(bytes);
@@ -453,6 +465,10 @@ mod tests {
         MemoryDisposableAttemptCatalogStore,
     };
     use crate::disposable_attempt_state::DisposableAttemptState;
+    use crate::disposable_prepared_template::{
+        current_disposable_prepared_template, decode_disposable_prepared_template,
+        encode_disposable_prepared_template,
+    };
     use crate::disposable_worker_reconciler::{
         CapacityClaimId, DisposableAttemptId, DisposableVmId,
     };
@@ -463,15 +479,36 @@ mod tests {
         DisposableWorkerResources::new(4_000, 8 * GIB, 64 * GIB).unwrap()
     }
 
-    fn template_digest() -> Sha256Digest {
-        Sha256Digest::parse(&format!("sha256:{}", "ab".repeat(32))).unwrap()
+    fn template_manifest() -> DisposablePreparedTemplateManifest {
+        current_disposable_prepared_template().unwrap()
     }
 
-    fn other_template_digest() -> Sha256Digest {
-        Sha256Digest::parse(&format!("sha256:{}", "cd".repeat(32))).unwrap()
+    fn template_identity() -> DisposablePreparedTemplateIdentity {
+        template_manifest().identity().unwrap()
+    }
+
+    fn other_template_identity() -> DisposablePreparedTemplateIdentity {
+        let current = template_manifest();
+        let bytes = encode_disposable_prepared_template(&current).unwrap();
+        let changed = String::from_utf8(bytes).unwrap().replacen(
+            "\"recipe_revision\": 1",
+            "\"recipe_revision\": 2",
+            1,
+        );
+        decode_disposable_prepared_template(changed.as_bytes())
+            .unwrap()
+            .identity()
+            .unwrap()
     }
 
     fn initial_reservation(resources: DisposableWorkerResources) -> DisposableAttemptReservation {
+        initial_reservation_with_identity(resources, template_identity())
+    }
+
+    fn initial_reservation_with_identity(
+        resources: DisposableWorkerResources,
+        prepared_template_identity: DisposablePreparedTemplateIdentity,
+    ) -> DisposableAttemptReservation {
         DisposableAttemptReservation::new(
             DisposableAttemptState::reserved(
                 DisposableAttemptId::parse("attempt-1").unwrap(),
@@ -481,13 +518,20 @@ mod tests {
                 EpochMillis::new(10_000).unwrap(),
             ),
             resources,
-            template_digest(),
+            prepared_template_identity,
         )
         .unwrap()
     }
 
     fn reservation_in_phase(phase: DisposableAttemptPhase) -> DisposableAttemptReservation {
-        let initial = initial_reservation(resources());
+        reservation_in_phase_with_identity(phase, template_identity())
+    }
+
+    fn reservation_in_phase_with_identity(
+        phase: DisposableAttemptPhase,
+        prepared_template_identity: DisposablePreparedTemplateIdentity,
+    ) -> DisposableAttemptReservation {
+        let initial = initial_reservation_with_identity(resources(), prepared_template_identity);
         let attempt_id = initial.attempt().attempt_id().clone();
         let mut catalog =
             DisposableAttemptCatalog::new(MemoryDisposableAttemptCatalogStore::default());
@@ -523,7 +567,7 @@ mod tests {
             "/opt/homebrew/bin/limactl",
             "/Users/runner/.smolrunner/lima",
             LimaInstanceName::parse("smol-template").unwrap(),
-            template_digest(),
+            &template_manifest(),
         )
         .unwrap()
     }
@@ -540,8 +584,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(plan.kind(), DisposableLimaWorkerCommandKind::Clone);
-        assert_eq!(plan.schema_version(), 2);
-        assert_eq!(plan.prepared_template_digest(), &template_digest());
+        assert_eq!(plan.schema_version(), 3);
+        assert_eq!(plan.prepared_template_identity(), &template_identity());
         assert!(plan.observation_required());
         assert_eq!(plan.attempt_revision(), 2);
         assert_eq!(plan.timeout, CLONE_TIMEOUT);
@@ -627,7 +671,7 @@ mod tests {
             "/opt/./homebrew/bin/limactl",
             "/Users/runner/.smolrunner/lima",
             LimaInstanceName::parse("smol-template").unwrap(),
-            template_digest(),
+            &template_manifest(),
         )
         .unwrap_err();
         assert_eq!(
@@ -635,17 +679,13 @@ mod tests {
             DisposableLimaWorkerErrorKind::InvalidConfiguration
         );
 
-        let drifted_adapter = DisposableLimaWorkerAdapter::new(
-            "/opt/homebrew/bin/limactl",
-            "/Users/runner/.smolrunner/lima",
-            LimaInstanceName::parse("smol-template").unwrap(),
-            other_template_digest(),
-        )
-        .unwrap();
-        let error = drifted_adapter
+        let error = adapter()
             .plan(
                 EpochMillis::new(1_000).unwrap(),
-                &reservation_in_phase(DisposableAttemptPhase::CloneAuthorized),
+                &reservation_in_phase_with_identity(
+                    DisposableAttemptPhase::CloneAuthorized,
+                    other_template_identity(),
+                ),
                 &DisposableWorkerAction::CloneVm,
             )
             .unwrap_err();
@@ -702,22 +742,53 @@ mod tests {
 
     #[test]
     fn checked_in_lima_inputs_have_one_exact_arm64_image_without_a_moving_fallback() {
-        const LOCATION: &str = "https://cloud-images.ubuntu.com/releases/noble/release-20260705/ubuntu-24.04-server-cloudimg-arm64.img";
-        const DIGEST: &str =
-            "sha256:7df0201546f75b8bcc1044594c806c35749421ad3c9bc1be2a3ab806cfae39cc";
+        let prepared_template = template_manifest();
+        let location = prepared_template.guest_image_location();
+        let digest = prepared_template.guest_image_digest().as_str();
 
         for input in [
             include_str!("../examples/lima/smolrunner-work.yaml"),
             include_str!("../examples/lima/smolrunner-interactive.yaml"),
         ] {
             let document: serde_yaml::Value = serde_yaml::from_str(input).unwrap();
+            assert_eq!(
+                document["minimumLimaVersion"].as_str(),
+                Some(prepared_template.lima_version())
+            );
+            assert_eq!(
+                document["vmType"].as_str(),
+                Some(prepared_template.vm_type())
+            );
+            assert_eq!(
+                document["arch"].as_str(),
+                Some(prepared_template.guest_architecture())
+            );
             assert!(document.get("base").is_none());
             let images = document["images"].as_sequence().unwrap();
             assert_eq!(images.len(), 1);
-            assert_eq!(images[0]["location"].as_str(), Some(LOCATION));
+            assert_eq!(images[0]["location"].as_str(), Some(location));
             assert_eq!(images[0]["arch"].as_str(), Some("aarch64"));
-            assert_eq!(images[0]["digest"].as_str(), Some(DIGEST));
-            assert!(!LOCATION.contains("/release/"));
+            assert_eq!(images[0]["digest"].as_str(), Some(digest));
+            assert!(!location.contains("/release/"));
+            assert_eq!(document["plain"].as_bool(), Some(true));
+            assert!(document["mounts"].as_sequence().unwrap().is_empty());
+            assert!(document["portForwards"].as_sequence().unwrap().is_empty());
+            assert_eq!(document["ssh"]["loadDotSSHPubKeys"].as_bool(), Some(false));
+            assert_eq!(document["ssh"]["forwardAgent"].as_bool(), Some(false));
+            assert_eq!(document["ssh"]["forwardX11"].as_bool(), Some(false));
+            assert_eq!(document["ssh"]["forwardX11Trusted"].as_bool(), Some(false));
+            assert_eq!(document["containerd"]["system"].as_bool(), Some(false));
+            assert_eq!(document["containerd"]["user"].as_bool(), Some(false));
+            assert_eq!(
+                document["vmOpts"]["vz"]["rosetta"]["enabled"].as_bool(),
+                Some(false)
+            );
+            assert_eq!(
+                document["vmOpts"]["vz"]["rosetta"]["binfmt"].as_bool(),
+                Some(false)
+            );
+            assert_eq!(document["video"]["display"].as_str(), Some("none"));
+            assert_eq!(document["propagateProxyEnv"].as_bool(), Some(false));
         }
     }
 }

@@ -8,10 +8,10 @@ use super::{
     DisposableAttemptCatalogRevision, DisposableAttemptReservation, MAX_ACTIVE_DISPOSABLE_ATTEMPTS,
     MAX_DISPOSABLE_ATTEMPT_TOMBSTONES,
 };
-use crate::artifact::Sha256Digest;
 use crate::disposable_attempt_state::{
     DisposableAttemptState, decode_disposable_attempt_state, encode_disposable_attempt_state,
 };
+use crate::disposable_prepared_template::DisposablePreparedTemplateIdentity;
 use crate::disposable_worker_reconciler::DisposableWorkerResources;
 
 pub const MAX_DISPOSABLE_ATTEMPT_CATALOG_DOCUMENT_BYTES: usize = 1_048_576;
@@ -73,7 +73,10 @@ pub fn encode_disposable_attempt_catalog(
                     memory_bytes: reservation.resources.memory_bytes(),
                     disk_bytes: reservation.resources.disk_bytes(),
                 },
-                prepared_template_digest: reservation.prepared_template_digest.as_str().to_owned(),
+                prepared_template_digest: reservation
+                    .prepared_template_identity
+                    .as_str()
+                    .to_owned(),
             })
         })
         .collect::<Result<Vec<_>, DisposableAttemptCatalogCodecError>>()?;
@@ -168,17 +171,18 @@ pub fn decode_disposable_attempt_catalog(
                     "disposable attempt reservation resources are invalid",
                 )
             })?;
-            let prepared_template_digest =
-                Sha256Digest::parse(&reservation.prepared_template_digest).map_err(|_| {
-                    codec_error(
-                        DisposableAttemptCatalogCodecErrorKind::CorruptState,
-                        "disposable prepared-template digest is invalid",
-                    )
-                })?;
+            let prepared_template_identity =
+                DisposablePreparedTemplateIdentity::parse(&reservation.prepared_template_digest)
+                    .map_err(|_| {
+                        codec_error(
+                            DisposableAttemptCatalogCodecErrorKind::CorruptState,
+                            "disposable prepared-template digest is invalid",
+                        )
+                    })?;
             Ok(DisposableAttemptReservation {
                 attempt,
                 resources,
-                prepared_template_digest,
+                prepared_template_identity,
             })
         })
         .collect::<Result<Vec<_>, DisposableAttemptCatalogCodecError>>()?;
