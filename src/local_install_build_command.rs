@@ -145,7 +145,10 @@ impl fmt::Debug for LocalInstallBuildCommandContext {
             .field("repository_root", &"<private absolute path>")
             .field("cargo_program", &"<private reviewed toolchain executable>")
             .field("rustc_program", &"<private reviewed toolchain executable>")
-            .field("rustdoc_program", &"<private reviewed toolchain executable>")
+            .field(
+                "rustdoc_program",
+                &"<private reviewed toolchain executable>",
+            )
             .field("isolated_home", &"<private SmolRunner build directory>")
             .field("cargo_home", &"<private SmolRunner build directory>")
             .field("target_directory", &"<private SmolRunner build directory>")
@@ -506,16 +509,15 @@ mod tests {
     #[test]
     fn private_context_values_are_redacted_inside_command_spec() {
         let context = context("private-b");
-        let command = plan_local_install_build_command(
-            &build('a'),
-            LocalInstallPlatform::Linux,
-            &context,
-            2,
-        )
-        .expect("command");
+        let command =
+            plan_local_install_build_command(&build('a'), LocalInstallPlatform::Linux, &context, 2)
+                .expect("command");
 
         assert_eq!(command.spec().program, context.cargo_program);
-        assert_eq!(command.working_directory(), context.repository_root.as_path());
+        assert_eq!(
+            command.working_directory(),
+            context.repository_root.as_path()
+        );
         for key in ["HOME", "CARGO_HOME", "CARGO_TARGET_DIR", "RUSTC", "RUSTDOC"] {
             assert!(is_secret(
                 command.spec().environment.get(key).expect("private value")
@@ -546,20 +548,12 @@ mod tests {
     fn platform_changes_fixed_system_path() {
         let build = build('a');
         let context = context("private-c");
-        let mac = plan_local_install_build_command(
-            &build,
-            LocalInstallPlatform::Macos,
-            &context,
-            1,
-        )
-        .expect("mac");
-        let linux = plan_local_install_build_command(
-            &build,
-            LocalInstallPlatform::Linux,
-            &context,
-            1,
-        )
-        .expect("linux");
+        let mac =
+            plan_local_install_build_command(&build, LocalInstallPlatform::Macos, &context, 1)
+                .expect("mac");
+        let linux =
+            plan_local_install_build_command(&build, LocalInstallPlatform::Linux, &context, 1)
+                .expect("linux");
         assert_eq!(
             plain(mac.spec().environment.get("PATH").expect("path")),
             MACOS_SYSTEM_PATH
@@ -601,7 +595,10 @@ mod tests {
             "credential",
             "proxy",
         ] {
-            assert!(!public.contains(private), "leaked private marker: {private}");
+            assert!(
+                !public.contains(private),
+                "leaked private marker: {private}"
+            );
         }
         let debug = format!("{first:?}");
         assert!(!debug.contains("secret-one"));
@@ -610,20 +607,12 @@ mod tests {
     #[test]
     fn source_predecessor_jobs_and_platform_change_policy_identity() {
         let context = context("private-d");
-        let base = plan_local_install_build_command(
-            &build('a'),
-            LocalInstallPlatform::Macos,
-            &context,
-            2,
-        )
-        .expect("base");
-        let different_source = plan_local_install_build_command(
-            &build('b'),
-            LocalInstallPlatform::Macos,
-            &context,
-            2,
-        )
-        .expect("source");
+        let base =
+            plan_local_install_build_command(&build('a'), LocalInstallPlatform::Macos, &context, 2)
+                .expect("base");
+        let different_source =
+            plan_local_install_build_command(&build('b'), LocalInstallPlatform::Macos, &context, 2)
+                .expect("source");
         let mut predecessor_build = build('a');
         predecessor_build.expected_predecessor = Some(LocalInstallGenerationIdentity {
             number: 1,
@@ -636,13 +625,9 @@ mod tests {
             2,
         )
         .expect("predecessor");
-        let different_jobs = plan_local_install_build_command(
-            &build('a'),
-            LocalInstallPlatform::Macos,
-            &context,
-            3,
-        )
-        .expect("jobs");
+        let different_jobs =
+            plan_local_install_build_command(&build('a'), LocalInstallPlatform::Macos, &context, 3)
+                .expect("jobs");
 
         let identities = [
             base.policy().identity.digest.as_str(),
