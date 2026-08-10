@@ -59,8 +59,7 @@ fn transition(
 }
 
 fn populated_catalog() -> DisposableAttemptCatalogDocument {
-    let mut catalog =
-        DisposableAttemptCatalog::new(MemoryDisposableAttemptCatalogStore::default());
+    let mut catalog = DisposableAttemptCatalog::new(MemoryDisposableAttemptCatalogStore::default());
     let (empty, _) = catalog.initialize().unwrap();
     let (one, _) = catalog.reserve(empty.revision(), reservation(1)).unwrap();
     let (two, _) = catalog.reserve(one.revision(), reservation(2)).unwrap();
@@ -171,7 +170,9 @@ fn top_level_future_schema_and_unknown_fields_fail_closed() {
     value["schema_version"] = serde_json::json!(2);
     let future = serde_json::to_vec(&value).unwrap();
     assert_eq!(
-        decode_disposable_attempt_catalog(&future).unwrap_err().kind(),
+        decode_disposable_attempt_catalog(&future)
+            .unwrap_err()
+            .kind(),
         DisposableAttemptCatalogCodecErrorKind::VersionIncompatible
     );
 
@@ -179,7 +180,9 @@ fn top_level_future_schema_and_unknown_fields_fail_closed() {
     value["unexpected"] = serde_json::json!(true);
     let unknown = serde_json::to_vec(&value).unwrap();
     assert_eq!(
-        decode_disposable_attempt_catalog(&unknown).unwrap_err().kind(),
+        decode_disposable_attempt_catalog(&unknown)
+            .unwrap_err()
+            .kind(),
         DisposableAttemptCatalogCodecErrorKind::InvalidDocument
     );
 }
@@ -211,8 +214,7 @@ fn embedded_attempt_unknown_fields_and_invalid_resources_fail_closed() {
 
 #[test]
 fn global_identity_collisions_are_revalidated_after_decode() {
-    let mut catalog =
-        DisposableAttemptCatalog::new(MemoryDisposableAttemptCatalogStore::default());
+    let mut catalog = DisposableAttemptCatalog::new(MemoryDisposableAttemptCatalogStore::default());
     let (empty, _) = catalog.initialize().unwrap();
     let (one, _) = catalog.reserve(empty.revision(), reservation(1)).unwrap();
     let (two, _) = catalog.reserve(one.revision(), reservation(2)).unwrap();
