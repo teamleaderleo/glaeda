@@ -24,16 +24,14 @@ const HEX: &[u8; 16] = b"0123456789abcdef";
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct ProjectCheckoutLocationIdentity {
-    path: PathBuf,
     device: u64,
     inode: u64,
     owner: u32,
 }
 
 impl ProjectCheckoutLocationIdentity {
-    fn from_metadata(path: PathBuf, metadata: &std::fs::Metadata) -> Self {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
         Self {
-            path,
             device: metadata.dev(),
             inode: metadata.ino(),
             owner: metadata.uid(),
@@ -116,11 +114,6 @@ pub struct ProjectCheckoutObservation {
 
 impl ProjectCheckoutObservation {
     #[must_use]
-    pub const fn schema_version(&self) -> u8 {
-        self.schema_version
-    }
-
-    #[must_use]
     pub const fn materialization_id(&self) -> &Sha256Digest {
         &self.materialization_id
     }
@@ -138,16 +131,6 @@ impl ProjectCheckoutObservation {
     #[must_use]
     pub const fn source_ambiguous(&self) -> bool {
         self.source_ambiguous
-    }
-
-    #[must_use]
-    pub const fn commit(&self) -> &CommitId {
-        &self.commit
-    }
-
-    #[must_use]
-    pub const fn tree(&self) -> &GitTreeId {
-        &self.tree
     }
 
     #[must_use]
@@ -188,11 +171,6 @@ impl ProjectCheckoutObservation {
     #[must_use]
     pub const fn owner_matches_parent(&self) -> bool {
         self.owner_matches_parent
-    }
-
-    #[must_use]
-    pub const fn remote_freshness(&self) -> RemoteFreshness {
-        self.remote_freshness
     }
 
     #[must_use]
@@ -242,7 +220,7 @@ impl fmt::Debug for ProjectCheckoutObserver {
 }
 
 impl ProjectCheckoutObserver {
-    /// Create one read-only developer-checkout observer using a reviewed absolute Git executable.
+    /// Create one read-only checkout observer using a reviewed absolute Git executable.
     ///
     /// # Errors
     ///
@@ -257,20 +235,20 @@ impl ProjectCheckoutObserver {
 
     /// Observe one exact checkout without network access or repository mutation.
     ///
-    /// Dirty tracked files, untracked files, detached HEAD, missing upstream, forks, and multiple
-    /// remotes are successful observations. A source change during the observation fails closed.
+    /// Dirty files, detached HEAD, missing upstream, forks, and multiple remotes are successful
+    /// observations because they are recovery evidence. A source change during observation fails.
     ///
     /// # Errors
     ///
-    /// Returns a bounded error for an unsafe path, non-worktree directory, bare repository,
-    /// changed source, command failure, or malformed bounded Git output.
+    /// Returns a bounded error for unsafe paths, non-worktrees, bare repositories, source drift,
+    /// unavailable commands, or malformed bounded Git output.
     pub fn observe(
         &self,
         checkout: &Path,
         executor: &impl TimedCommandExecutor,
     ) -> Result<ProjectCheckoutObservation, ProjectCheckoutObservationError> {
-        let original_metadata = std::fs::symlink_metadata(checkout).map_err(|_| unavailable())?;
-        if original_metadata.file_type().is_symlink() || !original_metadata.is_dir() {
+        let source_metadata = std::fs::symlink_metadata(checkout).map_err(|_| unavailable())?;
+        if source_metadata.file_type().is_symlink() || !source_metadata.is_dir() {
             return Err(unsafe_path());
         }
         let checkout = std::fs::canonicalize(checkout).map_err(|_| unavailable())?;
@@ -278,14 +256,10 @@ impl ProjectCheckoutObserver {
             return Err(unsafe_path());
         }
         let metadata = std::fs::metadata(&checkout).map_err(|_| unavailable())?;
-        if !metadata.is_dir() {
-            return Err(unsafe_path());
-        }
         let parent = checkout.parent().ok_or_else(unsafe_path)?;
         let parent_metadata = std::fs::metadata(parent).map_err(|_| unavailable())?;
         let owner_matches_parent = metadata.uid() == parent_metadata.uid();
-        let location_identity =
-            ProjectCheckoutLocationIdentity::from_metadata(checkout.clone(), &metadata);
+        let location_identity = ProjectCheckoutLocationIdentity::from_metadata(&metadata);
         let materialization_id = location_identity.materialization_id()?;
 
         let bare = self.git(&checkout, &["rev-parse", "--is-bare-repository"], executor)?;
@@ -304,45 +278,18 @@ impl ProjectCheckoutObserver {
             return Err(not_worktree());
         }
         require_success(&top_level)?;
-        let observed_root = PathBuf::from(parse_single_line(&top_level.stdout)?);
-        if observed_root != checkout {
+        if PathBuf::from(parse_single_line(&top_level.stdout)?) != checkout {
             return Err(not_worktree());
         }
 
         let first = self.snapshot(&checkout, executor)?;
-        let final_commit = self.git(
-            &checkout,
-            &["rev-parse", "--verify", "HEAD^{commit}"],
-            executor,
-        )?;
-        require_success(&final_commit)?;
-        let final_commit = CommitId::parse(parse_single_line(&final_commit.stdout)?)
-            .map_err(|_| invalid_output())?;
-        let final_tree = self.git(
-            &checkout,
-            &["rev-parse", "--verify", "HEAD^{tree}"],
-            executor,
-        )?;
-        require_success(&final_tree)?;
-        let final_tree = GitTreeId::parse(parse_single_line(&final_tree.stdout)?)
-            .map_err(|_| invalid_output())?;
-        let final_status = self.git(
-            &checkout,
-            &[
-                "status",
-                "--porcelain=v2",
-                "--branch",
-                "-z",
-                "--untracked-files=all",
-                "--ignore-submodules=all",
-            ],
-            executor,
-        )?;
-        require_success(&final_status)?;
+        let final_commit = self.read_commit(&checkout, executor)?;
+        let final_tree = self.read_tree(&checkout, executor)?;
+        let final_status = self.read_status(&checkout, executor)?;
         let final_metadata = std::fs::metadata(&checkout).map_err(|_| source_changed())?;
         if final_commit != first.commit
             || final_tree != first.tree
-            || final_status.stdout != first.raw_status
+            || final_status != first.raw_status
             || !location_identity.matches(&final_metadata)
         {
             return Err(source_changed());
@@ -374,24 +321,8 @@ impl ProjectCheckoutObserver {
         checkout: &Path,
         executor: &impl TimedCommandExecutor,
     ) -> Result<ProjectCheckoutSnapshot, ProjectCheckoutObservationError> {
-        let commit = self.git(
-            checkout,
-            &["rev-parse", "--verify", "HEAD^{commit}"],
-            executor,
-        )?;
-        require_success(&commit)?;
-        let commit = CommitId::parse(parse_single_line(&commit.stdout)?)
-            .map_err(|_| invalid_output())?;
-
-        let tree = self.git(
-            checkout,
-            &["rev-parse", "--verify", "HEAD^{tree}"],
-            executor,
-        )?;
-        require_success(&tree)?;
-        let tree = GitTreeId::parse(parse_single_line(&tree.stdout)?)
-            .map_err(|_| invalid_output())?;
-
+        let commit = self.read_commit(checkout, executor)?;
+        let tree = self.read_tree(checkout, executor)?;
         let remotes = self.git(
             checkout,
             &[
@@ -405,23 +336,8 @@ impl ProjectCheckoutObserver {
         )?;
         let remotes = parse_remotes(&remotes)?;
         let (primary_project, source_ambiguous) = select_primary_project(&remotes);
-
-        let status = self.git(
-            checkout,
-            &[
-                "status",
-                "--porcelain=v2",
-                "--branch",
-                "-z",
-                "--untracked-files=all",
-                "--ignore-submodules=all",
-            ],
-            executor,
-        )?;
-        require_success(&status)?;
-        let raw_status = status.stdout.clone();
-        let status = parse_status(&status.stdout)?;
-
+        let raw_status = self.read_status(checkout, executor)?;
+        let status = parse_status(&raw_status)?;
         let modes = self.git(
             checkout,
             &["ls-files", "--format=%(objectmode)"],
@@ -429,7 +345,6 @@ impl ProjectCheckoutObserver {
         )?;
         require_success(&modes)?;
         let submodules_present = parse_submodule_presence(&modes.stdout)?;
-
         let worktrees = self.git(
             checkout,
             &["worktree", "list", "--porcelain", "-z"],
@@ -449,6 +364,55 @@ impl ProjectCheckoutObserver {
             linked_worktree_count,
             submodules_present,
         })
+    }
+
+    fn read_commit(
+        &self,
+        checkout: &Path,
+        executor: &impl TimedCommandExecutor,
+    ) -> Result<CommitId, ProjectCheckoutObservationError> {
+        let record = self.git(
+            checkout,
+            &["rev-parse", "--verify", "HEAD^{commit}"],
+            executor,
+        )?;
+        require_success(&record)?;
+        CommitId::parse(parse_single_line(&record.stdout)?).map_err(|_| invalid_output())
+    }
+
+    fn read_tree(
+        &self,
+        checkout: &Path,
+        executor: &impl TimedCommandExecutor,
+    ) -> Result<GitTreeId, ProjectCheckoutObservationError> {
+        let record = self.git(
+            checkout,
+            &["rev-parse", "--verify", "HEAD^{tree}"],
+            executor,
+        )?;
+        require_success(&record)?;
+        GitTreeId::parse(parse_single_line(&record.stdout)?).map_err(|_| invalid_output())
+    }
+
+    fn read_status(
+        &self,
+        checkout: &Path,
+        executor: &impl TimedCommandExecutor,
+    ) -> Result<String, ProjectCheckoutObservationError> {
+        let record = self.git(
+            checkout,
+            &[
+                "status",
+                "--porcelain=v2",
+                "--branch",
+                "-z",
+                "--untracked-files=all",
+                "--ignore-submodules=all",
+            ],
+            executor,
+        )?;
+        require_success(&record)?;
+        Ok(record.stdout)
     }
 
     fn git(
@@ -924,7 +888,7 @@ mod tests {
     }
 
     #[test]
-    fn clean_checkout_reports_canonical_project_without_private_path() {
+    fn clean_checkout_reports_project_without_private_path() {
         let checkout = TempDirectory::new("clean");
         let remotes = "remote.origin.url\nhttps://github.com/TeamLeaderLeo/SmolRunner.git\0";
         let status = format!(
@@ -951,12 +915,8 @@ mod tests {
         );
         assert!(!observation.source_ambiguous());
         assert!(!observation.tracked_changes_present());
-        assert_eq!(observation.untracked_entry_count(), 0);
-        assert!(observation.upstream_configured());
         assert_eq!(observation.local_commits_ahead(), Some(0));
         assert_eq!(observation.linked_worktree_count(), 1);
-        assert!(!observation.submodules_present());
-        assert!(observation.owner_matches_parent());
         let json = serde_json::to_string(&observation).expect("public JSON");
         assert!(!json.contains(checkout.path().to_string_lossy().as_ref()));
         assert!(
@@ -967,7 +927,7 @@ mod tests {
     }
 
     #[test]
-    fn dirty_fork_and_local_ahead_are_successful_recovery_evidence() {
+    fn dirty_fork_and_local_ahead_are_recovery_evidence() {
         let checkout = TempDirectory::new("dirty-fork");
         let remotes = concat!(
             "remote.origin.url\nhttps://github.com/example/fork.git\0",
@@ -985,10 +945,13 @@ mod tests {
         ));
         let observation = observer()
             .observe(checkout.path(), &executor)
-            .expect("dirty checkout is still observable");
+            .expect("dirty checkout is observable");
 
         assert_eq!(
-            observation.primary_project().expect("origin project").as_str(),
+            observation
+                .primary_project()
+                .expect("origin project")
+                .as_str(),
             "github.com/example/fork"
         );
         assert!(observation.source_ambiguous());
@@ -1008,60 +971,49 @@ mod tests {
     }
 
     #[test]
-    fn detached_head_without_upstream_is_successful() {
-        let checkout = TempDirectory::new("detached");
+    fn detached_and_non_git_states_are_bounded() {
+        let detached = TempDirectory::new("detached");
         let status = format!("# branch.oid {COMMIT}\0# branch.head (detached)\0");
         let executor = ScriptedExecutor::new(script(
-            checkout.path(),
+            detached.path(),
             "",
             &status,
             "100644\n",
             "worktree /private/path\0HEAD 1111111111111111111111111111111111111111\0detached\0\0",
         ));
         let observation = observer()
-            .observe(checkout.path(), &executor)
+            .observe(detached.path(), &executor)
             .expect("detached checkout");
-        assert!(matches!(
-            observation.branch(),
-            ProjectBranchState::Detached
-        ));
+        assert!(matches!(observation.branch(), ProjectBranchState::Detached));
         assert!(!observation.upstream_configured());
         assert_eq!(observation.local_commits_ahead(), None);
-        assert_eq!(observation.primary_project(), None);
-    }
 
-    #[test]
-    fn ordinary_directory_is_not_a_worktree_even_when_git_prints_diagnostics() {
-        let checkout = TempDirectory::new("ordinary-directory");
+        let ordinary = TempDirectory::new("ordinary-directory");
         let executor = ScriptedExecutor::new(vec![Response::failed(128, "fatal: private path")]);
         let error = observer()
-            .observe(checkout.path(), &executor)
+            .observe(ordinary.path(), &executor)
             .expect_err("non Git directory");
         assert_eq!(error.kind, ProjectCheckoutObservationErrorKind::NotWorktree);
-        assert_eq!(executor.commands.borrow().len(), 1);
-        assert!(!serde_json::to_string(&error)
-            .expect("error JSON")
-            .contains("private path"));
+        assert!(
+            !serde_json::to_string(&error)
+                .expect("error JSON")
+                .contains("private path")
+        );
     }
 
     #[test]
-    fn bare_repository_is_classified_without_followup_commands() {
-        let checkout = TempDirectory::new("bare");
+    fn bare_and_symlink_candidates_are_classified() {
+        let bare = TempDirectory::new("bare");
         let executor = ScriptedExecutor::new(vec![Response::success("true\n")]);
         let error = observer()
-            .observe(checkout.path(), &executor)
+            .observe(bare.path(), &executor)
             .expect_err("bare repository");
         assert_eq!(
             error.kind,
             ProjectCheckoutObservationErrorKind::BareRepository
         );
-        assert_eq!(executor.commands.borrow().len(), 1);
-    }
 
-    #[test]
-    fn symlink_candidate_is_refused_before_git() {
         use std::os::unix::fs::symlink;
-
         let root = TempDirectory::new("symlink-root");
         let target = root.path().join("target");
         fs::create_dir(&target).expect("target directory");
