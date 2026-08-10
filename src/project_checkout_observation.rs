@@ -236,25 +236,29 @@ impl ProjectCheckoutObserver {
     /// Observe one exact checkout without network access or repository mutation.
     ///
     /// Dirty files, detached HEAD, missing upstream, forks, and multiple remotes are successful
-    /// observations because they are recovery evidence. A source change during observation fails.
+    /// observations because they are recovery evidence. Two complete snapshots must agree.
     ///
     /// # Errors
     ///
-    /// Returns a bounded error for unsafe paths, non-worktrees, bare repositories, source drift,
-    /// unavailable commands, or malformed bounded Git output.
+    /// Returns a bounded error for unsafe or aliased paths, non-worktrees, bare repositories,
+    /// source drift, unavailable commands, or malformed bounded Git output.
     pub fn observe(
         &self,
         checkout: &Path,
         executor: &impl TimedCommandExecutor,
     ) -> Result<ProjectCheckoutObservation, ProjectCheckoutObservationError> {
+        if !is_normalized_absolute_path(checkout) || checkout.to_str().is_none() {
+            return Err(unsafe_path());
+        }
         let source_metadata = std::fs::symlink_metadata(checkout).map_err(|_| unavailable())?;
         if source_metadata.file_type().is_symlink() || !source_metadata.is_dir() {
             return Err(unsafe_path());
         }
-        let checkout = std::fs::canonicalize(checkout).map_err(|_| unavailable())?;
-        if !is_normalized_absolute_path(&checkout) || checkout.to_str().is_none() {
+        let canonical = std::fs::canonicalize(checkout).map_err(|_| unavailable())?;
+        if canonical.as_path() != checkout {
             return Err(unsafe_path());
         }
+        let checkout = canonical;
         let metadata = std::fs::metadata(&checkout).map_err(|_| unavailable())?;
         let parent = checkout.parent().ok_or_else(unsafe_path)?;
         let parent_metadata = std::fs::metadata(parent).map_err(|_| unavailable())?;
@@ -283,33 +287,27 @@ impl ProjectCheckoutObserver {
         }
 
         let first = self.snapshot(&checkout, executor)?;
-        let final_commit = self.read_commit(&checkout, executor)?;
-        let final_tree = self.read_tree(&checkout, executor)?;
-        let final_status = self.read_status(&checkout, executor)?;
+        let second = self.snapshot(&checkout, executor)?;
         let final_metadata = std::fs::metadata(&checkout).map_err(|_| source_changed())?;
-        if final_commit != first.commit
-            || final_tree != first.tree
-            || final_status != first.raw_status
-            || !location_identity.matches(&final_metadata)
-        {
+        if first != second || !location_identity.matches(&final_metadata) {
             return Err(source_changed());
         }
 
         Ok(ProjectCheckoutObservation {
             schema_version: PROJECT_CHECKOUT_OBSERVATION_SCHEMA_VERSION,
             materialization_id,
-            primary_project: first.primary_project,
-            remotes: first.remotes,
-            source_ambiguous: first.source_ambiguous,
-            commit: first.commit,
-            tree: first.tree,
-            branch: first.status.branch,
-            tracked_changes_present: first.status.tracked_changes_present,
-            untracked_entry_count: first.status.untracked_entry_count,
-            upstream_configured: first.status.upstream_configured,
-            local_commits_ahead: first.status.local_commits_ahead,
-            linked_worktree_count: first.linked_worktree_count,
-            submodules_present: first.submodules_present,
+            primary_project: second.primary_project,
+            remotes: second.remotes,
+            source_ambiguous: second.source_ambiguous,
+            commit: second.commit,
+            tree: second.tree,
+            branch: second.status.branch,
+            tracked_changes_present: second.status.tracked_changes_present,
+            untracked_entry_count: second.status.untracked_entry_count,
+            upstream_configured: second.status.upstream_configured,
+            local_commits_ahead: second.status.local_commits_ahead,
+            linked_worktree_count: second.linked_worktree_count,
+            submodules_present: second.submodules_present,
             owner_matches_parent,
             remote_freshness: RemoteFreshness::Unknown,
             location_identity,
@@ -861,6 +859,22 @@ mod tests {
         ProjectCheckoutObserver::new("/usr/bin/git").expect("observer")
     }
 
+    fn snapshot_responses(
+        remotes: &str,
+        status: &str,
+        modes: &str,
+        worktrees: &str,
+    ) -> Vec<Response> {
+        vec![
+            Response::success(format!("{COMMIT}\n")),
+            Response::success(format!("{TREE}\n")),
+            Response::success(remotes),
+            Response::success(status),
+            Response::success(modes),
+            Response::success(worktrees),
+        ]
+    }
+
     fn script(
         root: &Path,
         remotes: &str,
@@ -868,19 +882,14 @@ mod tests {
         modes: &str,
         worktrees: &str,
     ) -> Vec<Response> {
-        vec![
+        let snapshot = snapshot_responses(remotes, status, modes, worktrees);
+        let mut responses = vec![
             Response::success("false\n"),
             Response::success(format!("{}\n", root.display())),
-            Response::success(format!("{COMMIT}\n")),
-            Response::success(format!("{TREE}\n")),
-            Response::success(remotes),
-            Response::success(status),
-            Response::success(modes),
-            Response::success(worktrees),
-            Response::success(format!("{COMMIT}\n")),
-            Response::success(format!("{TREE}\n")),
-            Response::success(status),
-        ]
+        ];
+        responses.extend(snapshot.clone());
+        responses.extend(snapshot);
+        responses
     }
 
     #[test]
@@ -919,7 +928,7 @@ mod tests {
             !format!("{:?}", observation.location_identity())
                 .contains(checkout.path().to_string_lossy().as_ref())
         );
-        assert_eq!(executor.commands.borrow().len(), 11);
+        assert_eq!(executor.commands.borrow().len(), 14);
     }
 
     #[test]
@@ -998,7 +1007,7 @@ mod tests {
     }
 
     #[test]
-    fn bare_and_symlink_candidates_are_classified() {
+    fn bare_symlink_and_alias_candidates_are_classified() {
         let bare = TempDirectory::new("bare");
         let executor = ScriptedExecutor::new(vec![Response::success("true\n")]);
         let error = observer()
@@ -1021,5 +1030,47 @@ mod tests {
             .expect_err("symlink refused");
         assert_eq!(error.kind, ProjectCheckoutObservationErrorKind::UnsafePath);
         assert!(executor.commands.borrow().is_empty());
+
+        let actual_parent = root.path().join("actual-parent");
+        let actual_checkout = actual_parent.join("checkout");
+        fs::create_dir_all(&actual_checkout).expect("actual checkout");
+        let alias_parent = root.path().join("alias-parent");
+        symlink(&actual_parent, &alias_parent).expect("ancestor alias");
+        let aliased_checkout = alias_parent.join("checkout");
+        let executor = ScriptedExecutor::new(Vec::new());
+        let error = observer()
+            .observe(&aliased_checkout, &executor)
+            .expect_err("ancestor symlink refused");
+        assert_eq!(error.kind, ProjectCheckoutObservationErrorKind::UnsafePath);
+        assert!(executor.commands.borrow().is_empty());
+    }
+
+    #[test]
+    fn changed_second_snapshot_fails_closed() {
+        let checkout = TempDirectory::new("source-change");
+        let remotes = "remote.origin.url\nhttps://github.com/example/project.git\0";
+        let status = format!("# branch.oid {COMMIT}\0# branch.head main\0");
+        let worktrees = "worktree /private/path\0HEAD 1111111111111111111111111111111111111111\0branch refs/heads/main\0\0";
+        let mut responses = vec![
+            Response::success("false\n"),
+            Response::success(format!("{}\n", checkout.path().display())),
+        ];
+        responses.extend(snapshot_responses(
+            remotes,
+            &status,
+            "100644\n",
+            worktrees,
+        ));
+        responses.extend(snapshot_responses(
+            "remote.origin.url\nhttps://github.com/example/changed.git\0",
+            &status,
+            "100644\n",
+            worktrees,
+        ));
+        let executor = ScriptedExecutor::new(responses);
+        let error = observer()
+            .observe(checkout.path(), &executor)
+            .expect_err("changed snapshot");
+        assert_eq!(error.kind, ProjectCheckoutObservationErrorKind::SourceChanged);
     }
 }
