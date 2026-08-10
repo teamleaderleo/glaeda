@@ -155,7 +155,9 @@ impl ProjectAdoptionCandidate {
     ///
     /// Returns a bounded error unless the entry is a successful checkout resolving to exactly one
     /// catalogued project with a complete recovery/observation receipt.
-    pub fn from_discovery_entry(entry: &ProjectDiscoveryEntry) -> Result<Self, ProjectAdoptionError> {
+    pub fn from_discovery_entry(
+        entry: &ProjectDiscoveryEntry,
+    ) -> Result<Self, ProjectAdoptionError> {
         if entry.kind != ProjectDiscoveryEntryKind::Checkout {
             return Err(discovery_not_checkout());
         }
@@ -190,9 +192,15 @@ pub struct ProjectAdoptionPlan {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "decision", rename_all = "snake_case")]
 pub enum ProjectAdoptionDecision {
-    Apply { plan: Box<ProjectAdoptionPlan> },
-    Replay { record: ProjectAdoptionOperationRecord },
-    Satisfied { materialization: AcceptedProjectMaterialization },
+    Apply {
+        plan: Box<ProjectAdoptionPlan>,
+    },
+    Replay {
+        record: ProjectAdoptionOperationRecord,
+    },
+    Satisfied {
+        materialization: AcceptedProjectMaterialization,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -647,7 +655,7 @@ mod tests {
     };
 
     use super::{
-        MAX_PROJECT_ADOPTION_RECORDS, MAX_PROJECT_MATERIALIZATIONS, AcceptedProjectMaterialization,
+        AcceptedProjectMaterialization, MAX_PROJECT_ADOPTION_RECORDS, MAX_PROJECT_MATERIALIZATIONS,
         ProjectAdoptionCandidate, ProjectAdoptionDecision, ProjectAdoptionErrorKind,
         ProjectAdoptionOperationRecord, ProjectAdoptionRequestId, ProjectMaterializationClass,
         ProjectMaterializationGeneration, build_generation, plan_project_adoption_candidate,
@@ -684,7 +692,11 @@ projects:
         .expect("catalog")
     }
 
-    fn candidate(project: &str, materialization: char, observation: char) -> ProjectAdoptionCandidate {
+    fn candidate(
+        project: &str,
+        materialization: char,
+        observation: char,
+    ) -> ProjectAdoptionCandidate {
         ProjectAdoptionCandidate {
             project: ProjectIdentity::parse(project).expect("project"),
             materialization_id: digest(materialization),
@@ -832,7 +844,10 @@ projects:
             generation_one.identity(),
         )
         .expect_err("catalog mismatch");
-        assert_eq!(error.kind, ProjectAdoptionErrorKind::CatalogIdentityMismatch);
+        assert_eq!(
+            error.kind,
+            ProjectAdoptionErrorKind::CatalogIdentityMismatch
+        );
 
         let error = plan_project_adoption_candidate(
             &generation_one,
@@ -973,14 +988,9 @@ projects:
         );
 
         let records = vec![seed_record; MAX_PROJECT_ADOPTION_RECORDS];
-        let record_full = build_generation(
-            10,
-            None,
-            catalog.identity().clone(),
-            Vec::new(),
-            records,
-        )
-        .expect("record-full generation");
+        let record_full =
+            build_generation(10, None, catalog.identity().clone(), Vec::new(), records)
+                .expect("record-full generation");
         let error = plan_project_adoption_candidate(
             &record_full,
             &catalog,
