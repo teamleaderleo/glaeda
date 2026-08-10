@@ -415,6 +415,52 @@ impl DisposableAttemptCatalogDocument {
         self.host_usage()?;
         Ok(())
     }
+
+    pub(crate) fn validate_successor_of(
+        &self,
+        current: &Self,
+    ) -> Result<(), DisposableAttemptCatalogError> {
+        current.validate()?;
+        self.validate()?;
+        if self.revision != current.revision.next()? {
+            return Err(invalid_store_successor());
+        }
+
+        let reservation = self
+            .active
+            .last()
+            .filter(|_| self.active.len() == current.active.len() + 1)
+            .and_then(|reservation| current.reserve(reservation.clone()).ok())
+            .is_some_and(|candidate| candidate == *self);
+        let transition =
+            if self.active.len() == current.active.len() && self.tombstones == current.tombstones {
+                let mut changes = self
+                    .active
+                    .iter()
+                    .zip(&current.active)
+                    .filter(|(next, prior)| next != prior);
+                changes.next().is_some_and(|(next, prior)| {
+                    changes.next().is_none()
+                        && next.resources == prior.resources
+                        && next.attempt.is_exact_successor_of(&prior.attempt)
+                })
+            } else {
+                false
+            };
+        let retirement = current.active.iter().any(|reservation| {
+            current
+                .retire_complete(
+                    reservation.attempt.attempt_id(),
+                    reservation.attempt.revision(),
+                )
+                .is_ok_and(|candidate| candidate == *self)
+        });
+        if reservation || transition || retirement {
+            Ok(())
+        } else {
+            Err(invalid_store_successor())
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -706,6 +752,9 @@ impl DisposableAttemptCatalogStore for MemoryDisposableAttemptCatalogStore {
             ));
         }
         document.validate()?;
+        if document != &DisposableAttemptCatalogDocument::empty() {
+            return Err(invalid_store_successor());
+        }
         self.document = Some(document.clone());
         Ok(DisposableAttemptCatalogWriteReceipt::new(
             DisposableAttemptCatalogWriteDisposition::Created,
@@ -731,14 +780,7 @@ impl DisposableAttemptCatalogStore for MemoryDisposableAttemptCatalogStore {
                 current.revision(),
             ));
         }
-        let required_revision = expected_revision.next()?;
-        if document.revision() != required_revision {
-            return Err(catalog_error(
-                DisposableAttemptCatalogErrorKind::Conflict,
-                "replacement catalog revision must advance exactly once",
-            ));
-        }
-        document.validate()?;
+        document.validate_successor_of(current)?;
         self.document = Some(document.clone());
         Ok(DisposableAttemptCatalogWriteReceipt::new(
             DisposableAttemptCatalogWriteDisposition::Replaced,
@@ -884,6 +926,13 @@ fn resource_overflow() -> DisposableAttemptCatalogError {
     catalog_error(
         DisposableAttemptCatalogErrorKind::LimitExceeded,
         "durable disposable resource usage exceeds the bounded host envelope",
+    )
+}
+
+fn invalid_store_successor() -> DisposableAttemptCatalogError {
+    catalog_error(
+        DisposableAttemptCatalogErrorKind::Conflict,
+        "replacement catalog is not one exact authorized successor",
     )
 }
 

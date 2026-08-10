@@ -45,6 +45,7 @@ impl UnixPersonalWorkerStore {
         };
         synchronize_directory(&store._root, "disposable-attempt state root")
             .map_err(map_personal_error)?;
+        synchronize_catalog_directory(&store)?;
         refuse_unsettled_lima_authority(&store)?;
         store.recover_catalog_locked()?;
         Ok(store)
@@ -80,6 +81,9 @@ impl UnixPersonalWorkerStore {
                     .checked_add(1)
                     .is_some_and(|next| staged.revision().get() == next) =>
             {
+                staged
+                    .validate_successor_of(&current)
+                    .map_err(|_| corrupt())?;
                 Ok(RecoveryPlan::PublishStaged { no_replace: false })
             }
             Some(_) => Err(corrupt()),
@@ -175,6 +179,7 @@ impl UnixPersonalWorkerStore {
 impl DisposableAttemptCatalogStore for UnixPersonalWorkerStore {
     fn recover(&mut self) -> Result<(), DisposableAttemptCatalogError> {
         let _lock = self.acquire_mutation_lock().map_err(map_personal_error)?;
+        synchronize_catalog_directory(self)?;
         refuse_unsettled_lima_authority(self)?;
         self.recover_catalog_locked()
     }
@@ -210,6 +215,7 @@ impl DisposableAttemptCatalogStore for UnixPersonalWorkerStore {
             ));
         }
         let _lock = self.acquire_mutation_lock().map_err(map_personal_error)?;
+        synchronize_catalog_directory(self)?;
         refuse_unsettled_lima_authority(self)?;
         self.recover_catalog_locked()?;
         if self.load_catalog_named(CATALOG_DOCUMENT)?.is_some() {
@@ -234,6 +240,7 @@ impl DisposableAttemptCatalogStore for UnixPersonalWorkerStore {
         document: &DisposableAttemptCatalogDocument,
     ) -> Result<DisposableAttemptCatalogWriteReceipt, DisposableAttemptCatalogError> {
         let _lock = self.acquire_mutation_lock().map_err(map_personal_error)?;
+        synchronize_catalog_directory(self)?;
         refuse_unsettled_lima_authority(self)?;
         self.recover_catalog_locked()?;
         let current = self.load_catalog_named(CATALOG_DOCUMENT)?.ok_or_else(|| {
@@ -242,17 +249,13 @@ impl DisposableAttemptCatalogStore for UnixPersonalWorkerStore {
                 "disposable-attempt catalog does not exist",
             )
         })?;
-        if current.revision() != expected_revision
-            || expected_revision
-                .get()
-                .checked_add(1)
-                .is_none_or(|next| document.revision().get() != next)
-        {
+        if current.revision() != expected_revision {
             return Err(public(
                 DisposableAttemptCatalogErrorKind::Conflict,
                 "disposable-attempt catalog revision changed before publication",
             ));
         }
+        document.validate_successor_of(&current)?;
         let mut staged = self.stage_catalog(document)?;
         self.publish_named_staged(&mut staged, CATALOG_DOCUMENT, false)
             .map_err(map_personal_error)?;
@@ -302,6 +305,16 @@ fn map_personal_error(error: PersonalWorkerStoreError) -> DisposableAttemptCatal
         }
     };
     public(kind, error.message())
+}
+
+fn synchronize_catalog_directory(
+    store: &UnixPersonalWorkerStore,
+) -> Result<(), DisposableAttemptCatalogError> {
+    // A prior writer may have renamed the stage successfully and then received an ambiguous
+    // directory-fsync error. Every later recovery or mutation closes that durability window under
+    // the same canonical lock before it classifies current/staged state or returns a receipt.
+    synchronize_directory(&store.directory, "personal worker store directory")
+        .map_err(map_personal_error)
 }
 
 fn refuse_unsettled_lima_authority(
@@ -429,6 +442,29 @@ mod tests {
             .0
     }
 
+    fn progressed_successor(index: usize) -> DisposableAttemptCatalogDocument {
+        let mut catalog =
+            DisposableAttemptCatalog::new(MemoryDisposableAttemptCatalogStore::default());
+        let (empty, _) = catalog.initialize().unwrap();
+        let (reserved, _) = catalog
+            .reserve(empty.revision(), reservation(index))
+            .unwrap();
+        let attempt_id = DisposableAttemptId::parse(&format!("attempt-{index}")).unwrap();
+        catalog
+            .transition(
+                reserved.revision(),
+                &attempt_id,
+                reserved
+                    .find_active(&attempt_id)
+                    .unwrap()
+                    .attempt()
+                    .revision(),
+                DisposableAttemptCatalogAction::BeginProvisioning,
+            )
+            .unwrap()
+            .0
+    }
+
     fn write_private(path: &Path, bytes: &[u8]) {
         fs::write(path, bytes).expect("write private fixture");
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))
@@ -519,6 +555,37 @@ mod tests {
                 .join(STAGED_CATALOG_DOCUMENT)
                 .exists()
         );
+
+        let forged_successor = progressed_successor(2);
+        assert_eq!(forged_successor.revision().get(), next.revision().get() + 1);
+        let mut direct_store =
+            UnixPersonalWorkerStore::open_or_create_disposable_catalog(root.path()).unwrap();
+        assert_eq!(
+            DisposableAttemptCatalogStore::replace_if_revision(
+                &mut direct_store,
+                next.revision(),
+                &forged_successor,
+            )
+            .unwrap_err()
+            .kind(),
+            DisposableAttemptCatalogErrorKind::Conflict
+        );
+        write_private(
+            &root.store_directory().join(STAGED_CATALOG_DOCUMENT),
+            &encode_disposable_attempt_catalog(&forged_successor).unwrap(),
+        );
+        assert_eq!(
+            UnixPersonalWorkerStore::open_or_create_disposable_catalog(root.path())
+                .unwrap_err()
+                .kind(),
+            DisposableAttemptCatalogErrorKind::CorruptState
+        );
+        assert!(
+            root.store_directory()
+                .join(STAGED_CATALOG_DOCUMENT)
+                .exists()
+        );
+        fs::remove_file(root.store_directory().join(STAGED_CATALOG_DOCUMENT)).unwrap();
 
         let conflicting = successor(2);
         assert_eq!(conflicting.revision(), next.revision());
