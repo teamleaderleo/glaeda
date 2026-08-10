@@ -19,7 +19,8 @@ const COMMAND_IDENTITY_DOMAIN: &[u8] = b"smolrunner-local-install-build-command-
 const SHA256_PREFIX: &str = "sha256:";
 const HEX: &[u8; 16] = b"0123456789abcdef";
 const MACOS_SYSTEM_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
-const LINUX_SYSTEM_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
+const LINUX_SYSTEM_PATH: &str = "/usr/bin:/bin";
+const CARGO_CONFIG_POLICY: &str = "source_tree_only_no_ancestor_config_v1";
 const FIXED_ARGUMENT_POLICY: [&str; 7] = [
     "build",
     "--locked",
@@ -59,6 +60,7 @@ pub struct LocalInstallBuildCommandPolicy {
     pub platform: LocalInstallPlatform,
     pub jobs: u8,
     pub timeout_seconds: u64,
+    pub cargo_config_policy: &'static str,
     pub fixed_argument_policy: [&'static str; 7],
     pub environment_keys: [&'static str; 11],
 }
@@ -78,7 +80,8 @@ impl LocalInstallBuildCommandContext {
     /// Bind private, lexically safe paths for one exact local self-build.
     ///
     /// This constructor performs no filesystem observation. A later execution adapter must prove
-    /// type, owner, mode, alias, and executable identity before using these paths as authority.
+    /// type, owner, mode, alias, executable identity, and the command policy's Cargo-config
+    /// precondition before using these paths as authority.
     ///
     /// # Errors
     ///
@@ -222,7 +225,10 @@ impl std::error::Error for LocalInstallBuildCommandError {}
 ///
 /// The returned `CommandSpec` is inert. The process layer clears ambient environment state when an
 /// accepted execution adapter eventually runs it. No caller-controlled flags or environment values
-/// are accepted by this API.
+/// are accepted by this API. Before launch, that adapter must additionally prove Cargo will load no
+/// configuration from ancestors outside the exact source tree and no unreviewed config from the
+/// isolated Cargo home; Cargo's hierarchical config discovery cannot be disabled by this pure
+/// command object.
 ///
 /// # Errors
 ///
@@ -290,6 +296,7 @@ fn policy(
         platform: LocalInstallPlatform,
         jobs: u8,
         timeout_seconds: u64,
+        cargo_config_policy: &'static str,
         fixed_argument_policy: [&'static str; 7],
         environment_keys: [&'static str; 11],
     }
@@ -303,6 +310,7 @@ fn policy(
         platform,
         jobs,
         timeout_seconds,
+        cargo_config_policy: CARGO_CONFIG_POLICY,
         fixed_argument_policy: FIXED_ARGUMENT_POLICY,
         environment_keys: ENVIRONMENT_KEYS,
     };
@@ -318,6 +326,7 @@ fn policy(
         platform,
         jobs,
         timeout_seconds,
+        cargo_config_policy: CARGO_CONFIG_POLICY,
         fixed_argument_policy: FIXED_ARGUMENT_POLICY,
         environment_keys: ENVIRONMENT_KEYS,
     })
@@ -474,6 +483,10 @@ mod tests {
             .map(String::as_str)
             .collect::<Vec<_>>();
         assert_eq!(keys, ENVIRONMENT_KEYS);
+        assert_eq!(
+            command.policy().cargo_config_policy,
+            "source_tree_only_no_ancestor_config_v1"
+        );
         for forbidden in [
             "RUSTFLAGS",
             "RUSTC_WRAPPER",
@@ -512,6 +525,7 @@ mod tests {
             plain(command.spec().environment.get("PATH").expect("path")),
             LINUX_SYSTEM_PATH
         );
+        assert_eq!(LINUX_SYSTEM_PATH, "/usr/bin:/bin");
         assert_eq!(
             plain(
                 command
