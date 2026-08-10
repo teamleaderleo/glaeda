@@ -338,11 +338,7 @@ impl ProjectCheckoutObserver {
         let (primary_project, source_ambiguous) = select_primary_project(&remotes);
         let raw_status = self.read_status(checkout, executor)?;
         let status = parse_status(&raw_status)?;
-        let modes = self.git(
-            checkout,
-            &["ls-files", "--format=%(objectmode)"],
-            executor,
-        )?;
+        let modes = self.git(checkout, &["ls-files", "--format=%(objectmode)"], executor)?;
         require_success(&modes)?;
         let submodules_present = parse_submodule_presence(&modes.stdout)?;
         let worktrees = self.git(
