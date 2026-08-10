@@ -5,8 +5,8 @@ use serde_json::Value;
 
 use super::{
     DISPOSABLE_ATTEMPT_CATALOG_SCHEMA_VERSION, DisposableAttemptCatalogDocument,
-    DisposableAttemptCatalogRevision, DisposableAttemptReservation, MAX_ACTIVE_DISPOSABLE_ATTEMPTS,
-    MAX_DISPOSABLE_ATTEMPT_TOMBSTONES,
+    DisposableAttemptCatalogRevision, DisposableAttemptReservation,
+    MAX_ACTIVE_DISPOSABLE_ATTEMPTS, MAX_DISPOSABLE_ATTEMPT_TOMBSTONES,
 };
 use crate::disposable_attempt_state::{
     DisposableAttemptState, decode_disposable_attempt_state, encode_disposable_attempt_state,
@@ -48,9 +48,12 @@ struct ResourceWire {
 pub fn encode_disposable_attempt_catalog(
     document: &DisposableAttemptCatalogDocument,
 ) -> Result<Vec<u8>, DisposableAttemptCatalogCodecError> {
-    document
-        .validate()
-        .map_err(|_| codec_error(DisposableAttemptCatalogCodecErrorKind::CorruptState, "catalog invariants are invalid"))?;
+    document.validate().map_err(|_| {
+        codec_error(
+            DisposableAttemptCatalogCodecErrorKind::CorruptState,
+            "catalog invariants are invalid",
+        )
+    })?;
 
     let active = document
         .active
