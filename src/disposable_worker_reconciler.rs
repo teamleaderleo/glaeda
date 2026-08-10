@@ -2,7 +2,10 @@ use std::fmt;
 
 use serde::Serialize;
 
+use crate::disposable_attempt_catalog::DisposableAttemptCatalogAction;
+use crate::disposable_attempt_state::DisposableAttemptState;
 use crate::execution_admission::EpochMillis;
+use crate::github_scale_set_protocol::{ScaleSetJobEvent, ScaleSetRunnerReference};
 
 pub const DISPOSABLE_WORKER_RECONCILER_SCHEMA_VERSION: u8 = 1;
 const MAX_IDENTIFIER_LEN: usize = 96;
@@ -33,29 +36,6 @@ macro_rules! identifier {
 identifier!(DisposableAttemptId, "attempt_id");
 identifier!(CapacityClaimId, "capacity_claim_id");
 identifier!(DisposableVmId, "vm_id");
-identifier!(ScaleSetRunnerId, "runner_id");
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-#[serde(transparent)]
-pub struct GitHubJobId(u64);
-
-impl GitHubJobId {
-    pub fn new(value: u64) -> Result<Self, DisposableWorkerReconcilerError> {
-        if value == 0 {
-            return Err(DisposableWorkerReconcilerError::new(
-                "github_job_id",
-                "invalid_github_job_id",
-                "GitHub job identity must be greater than zero",
-            ));
-        }
-        Ok(Self(value))
-    }
-
-    #[must_use]
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct DisposableWorkerResources {
@@ -179,6 +159,16 @@ impl DisposableHostUsage {
             ));
         }
         Ok(Self { workers, resources })
+    }
+
+    #[must_use]
+    pub const fn workers(self) -> u16 {
+        self.workers
+    }
+
+    #[must_use]
+    pub const fn resources(self) -> DisposableWorkerResources {
+        self.resources
     }
 }
 
@@ -314,138 +304,6 @@ pub enum DisposableAttemptPhase {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GitHubJobConclusion {
-    Success,
-    Failure,
-    Cancelled,
-    TimedOut,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct DisposableAttempt {
-    schema_version: u8,
-    attempt_id: DisposableAttemptId,
-    capacity_claim_id: CapacityClaimId,
-    vm_id: DisposableVmId,
-    runner_id: ScaleSetRunnerId,
-    phase: DisposableAttemptPhase,
-    github_job_id: Option<GitHubJobId>,
-    conclusion: Option<GitHubJobConclusion>,
-    not_after: EpochMillis,
-}
-
-impl DisposableAttempt {
-    #[must_use]
-    pub fn reserved(
-        attempt_id: DisposableAttemptId,
-        capacity_claim_id: CapacityClaimId,
-        vm_id: DisposableVmId,
-        runner_id: ScaleSetRunnerId,
-        not_after: EpochMillis,
-    ) -> Self {
-        Self {
-            schema_version: DISPOSABLE_WORKER_RECONCILER_SCHEMA_VERSION,
-            attempt_id,
-            capacity_claim_id,
-            vm_id,
-            runner_id,
-            phase: DisposableAttemptPhase::Reserved,
-            github_job_id: None,
-            conclusion: None,
-            not_after,
-        }
-    }
-
-    #[must_use]
-    pub const fn phase(&self) -> DisposableAttemptPhase {
-        self.phase
-    }
-
-    #[must_use]
-    pub const fn attempt_id(&self) -> &DisposableAttemptId {
-        &self.attempt_id
-    }
-
-    #[must_use]
-    pub const fn capacity_claim_id(&self) -> &CapacityClaimId {
-        &self.capacity_claim_id
-    }
-
-    #[must_use]
-    pub const fn vm_id(&self) -> &DisposableVmId {
-        &self.vm_id
-    }
-
-    #[must_use]
-    pub const fn runner_id(&self) -> &ScaleSetRunnerId {
-        &self.runner_id
-    }
-
-    #[must_use]
-    pub const fn github_job_id(&self) -> Option<GitHubJobId> {
-        self.github_job_id
-    }
-
-    #[must_use]
-    pub const fn conclusion(&self) -> Option<GitHubJobConclusion> {
-        self.conclusion
-    }
-
-    #[must_use]
-    pub const fn not_after(&self) -> EpochMillis {
-        self.not_after
-    }
-
-    pub fn checkpoint(
-        &self,
-        action: &DisposableWorkerAction,
-    ) -> Result<Self, DisposableWorkerReconcilerError> {
-        let (phase, job, conclusion) = match action {
-            DisposableWorkerAction::Checkpoint { phase } => {
-                (*phase, self.github_job_id, self.conclusion)
-            }
-            DisposableWorkerAction::RecordAssigned { github_job_id } => {
-                (DisposableAttemptPhase::Assigned, Some(*github_job_id), None)
-            }
-            DisposableWorkerAction::RecordRunning { github_job_id } => {
-                (DisposableAttemptPhase::Running, Some(*github_job_id), None)
-            }
-            DisposableWorkerAction::RecordTerminal {
-                github_job_id,
-                conclusion,
-            } => (
-                DisposableAttemptPhase::Terminal,
-                Some(*github_job_id),
-                Some(*conclusion),
-            ),
-            _ => {
-                return Err(DisposableWorkerReconcilerError::new(
-                    "action",
-                    "action_not_checkpointable",
-                    "only durable checkpoint actions can advance an attempt",
-                ));
-            }
-        };
-        validate_transition(self.phase, phase)?;
-        if let (Some(current), Some(next)) = (self.github_job_id, job)
-            && current != next
-        {
-            return Err(DisposableWorkerReconcilerError::new(
-                "github_job_id",
-                "github_job_identity_drift",
-                "an attempt cannot change its assigned GitHub job",
-            ));
-        }
-        let mut next = self.clone();
-        next.phase = phase;
-        next.github_job_id = job;
-        next.conclusion = conclusion;
-        Ok(next)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum ExactObjectObservation {
     Unknown,
@@ -454,31 +312,29 @@ pub enum ExactObjectObservation {
     Conflicting,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum ScaleSetRunnerObservation {
     Unknown,
     Absent,
-    Idle,
-    Assigned {
-        github_job_id: GitHubJobId,
+    /// The exact service registration exists, but a bounded launch/recovery check proved that no
+    /// usable listener is becoming ready from the one-time JIT configuration.
+    RegistrationOnly {
+        runner: ScaleSetRunnerReference,
     },
-    Running {
-        github_job_id: GitHubJobId,
-    },
-    Terminal {
-        github_job_id: GitHubJobId,
-        conclusion: GitHubJobConclusion,
+    IdleReady {
+        runner: ScaleSetRunnerReference,
     },
     Conflicting,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DisposableWorkerReconcileInput<'a> {
     pub now: EpochMillis,
-    pub attempt: &'a DisposableAttempt,
+    pub attempt: &'a DisposableAttemptState,
     pub vm: ExactObjectObservation,
     pub runner: ScaleSetRunnerObservation,
+    pub job_event: Option<ScaleSetJobEvent>,
     pub capacity_reserved: bool,
     pub cancellation_requested: bool,
 }
@@ -493,24 +349,14 @@ pub enum DisposableWorkerObservationTarget {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum DisposableWorkerAction {
-    Checkpoint {
-        phase: DisposableAttemptPhase,
+    Persist {
+        transition: DisposableAttemptCatalogAction,
     },
     Observe {
         target: DisposableWorkerObservationTarget,
     },
     ProvisionVm,
     GenerateJitAndStartRunner,
-    RecordAssigned {
-        github_job_id: GitHubJobId,
-    },
-    RecordRunning {
-        github_job_id: GitHubJobId,
-    },
-    RecordTerminal {
-        github_job_id: GitHubJobId,
-        conclusion: GitHubJobConclusion,
-    },
     Wait,
     DestroyVm,
     DeleteRunner,
@@ -524,8 +370,7 @@ pub enum DisposableWorkerAction {
 pub fn reconcile_attempt(
     input: DisposableWorkerReconcileInput<'_>,
 ) -> Result<DisposableWorkerAction, DisposableWorkerReconcilerError> {
-    validate_attempt(input.attempt)?;
-    let cleanup = input.cancellation_requested || input.now > input.attempt.not_after;
+    let cleanup = input.cancellation_requested || input.now > input.attempt.not_after();
 
     if matches!(input.vm, ExactObjectObservation::Conflicting) {
         return Ok(DisposableWorkerAction::Blocked {
@@ -537,12 +382,18 @@ pub fn reconcile_attempt(
             code: "conflicting_runner_identity",
         });
     }
+    validate_runner_observation(input.attempt, &input.runner)?;
+    if let Some(event) = input.job_event.as_ref()
+        && let Some(action) = plan_job_event(input.attempt, event)?
+    {
+        return Ok(action);
+    }
 
     use DisposableAttemptPhase as Phase;
     use DisposableWorkerAction as Action;
     if !input.capacity_reserved
         && matches!(
-            input.attempt.phase,
+            input.attempt.phase(),
             Phase::Reserved
                 | Phase::Provisioning
                 | Phase::Registering
@@ -552,56 +403,53 @@ pub fn reconcile_attempt(
                 | Phase::Terminal
         )
     {
-        return Ok(Action::Checkpoint {
-            phase: Phase::Destroying,
-        });
+        return Ok(persist(DisposableAttemptCatalogAction::BeginCleanup));
     }
-    Ok(match input.attempt.phase {
-        Phase::Reserved if cleanup => Action::Checkpoint {
-            phase: Phase::Destroying,
-        },
-        Phase::Reserved => Action::Checkpoint {
-            phase: Phase::Provisioning,
-        },
-        Phase::Provisioning if cleanup => Action::Checkpoint {
-            phase: Phase::Destroying,
-        },
+    Ok(match input.attempt.phase() {
+        Phase::Reserved if cleanup => persist(DisposableAttemptCatalogAction::BeginCleanup),
+        Phase::Reserved => persist(DisposableAttemptCatalogAction::BeginProvisioning),
+        Phase::Provisioning if cleanup => persist(DisposableAttemptCatalogAction::BeginCleanup),
         Phase::Provisioning => match input.vm {
             ExactObjectObservation::Unknown => Action::Observe {
                 target: DisposableWorkerObservationTarget::Vm,
             },
             ExactObjectObservation::Absent => Action::ProvisionVm,
-            ExactObjectObservation::Matching => Action::Checkpoint {
-                phase: Phase::Registering,
-            },
+            ExactObjectObservation::Matching => {
+                persist(DisposableAttemptCatalogAction::BeginRegistration)
+            }
             ExactObjectObservation::Conflicting => unreachable!(),
         },
-        Phase::Registering if cleanup => Action::Checkpoint {
-            phase: Phase::Destroying,
-        },
+        Phase::Registering if cleanup => persist(DisposableAttemptCatalogAction::BeginCleanup),
         Phase::Registering if matches!(input.vm, ExactObjectObservation::Unknown) => {
             Action::Observe {
                 target: DisposableWorkerObservationTarget::Vm,
             }
         }
         Phase::Registering if matches!(input.vm, ExactObjectObservation::Absent) => {
-            Action::Checkpoint {
-                phase: Phase::Deregistering,
-            }
+            persist(DisposableAttemptCatalogAction::BeginCleanup)
         }
-        Phase::Registering => match input.runner {
+        Phase::Registering => match &input.runner {
             ScaleSetRunnerObservation::Unknown => Action::Observe {
                 target: DisposableWorkerObservationTarget::Runner,
             },
             ScaleSetRunnerObservation::Absent => Action::GenerateJitAndStartRunner,
-            ScaleSetRunnerObservation::Idle => Action::Checkpoint {
-                phase: Phase::Waiting,
-            },
-            state => record_job_state(input.attempt.phase, input.attempt.github_job_id, state)?,
+            ScaleSetRunnerObservation::RegistrationOnly { .. }
+                if input.attempt.runner_id().is_none() =>
+            {
+                Action::DeleteRunner
+            }
+            ScaleSetRunnerObservation::RegistrationOnly { .. } => {
+                persist(DisposableAttemptCatalogAction::BeginCleanup)
+            }
+            ScaleSetRunnerObservation::IdleReady { runner } => persist(validate_transition(
+                input.attempt,
+                DisposableAttemptCatalogAction::RecordRunnerReady(runner.clone()),
+            )?),
+            ScaleSetRunnerObservation::Conflicting => unreachable!(),
         },
-        Phase::Waiting | Phase::Assigned | Phase::Running if cleanup => Action::Checkpoint {
-            phase: Phase::Destroying,
-        },
+        Phase::Waiting | Phase::Assigned | Phase::Running if cleanup => {
+            persist(DisposableAttemptCatalogAction::BeginCleanup)
+        }
         Phase::Waiting | Phase::Assigned | Phase::Running
             if matches!(input.vm, ExactObjectObservation::Unknown) =>
         {
@@ -612,31 +460,36 @@ pub fn reconcile_attempt(
         Phase::Waiting | Phase::Assigned | Phase::Running
             if matches!(input.vm, ExactObjectObservation::Absent) =>
         {
-            Action::Checkpoint {
-                phase: Phase::Deregistering,
-            }
+            persist(DisposableAttemptCatalogAction::BeginCleanup)
         }
-        Phase::Waiting | Phase::Assigned | Phase::Running => match input.runner {
+        Phase::Waiting | Phase::Assigned | Phase::Running => match &input.runner {
             ScaleSetRunnerObservation::Unknown => Action::Observe {
                 target: DisposableWorkerObservationTarget::Runner,
             },
-            ScaleSetRunnerObservation::Absent => Action::Checkpoint {
-                phase: Phase::Destroying,
-            },
-            ScaleSetRunnerObservation::Idle => Action::Wait,
-            state => record_job_state(input.attempt.phase, input.attempt.github_job_id, state)?,
+            ScaleSetRunnerObservation::Absent
+            | ScaleSetRunnerObservation::RegistrationOnly { .. } => {
+                persist(DisposableAttemptCatalogAction::BeginCleanup)
+            }
+            ScaleSetRunnerObservation::IdleReady { runner }
+                if input.attempt.runner_id().is_none() =>
+            {
+                persist(validate_transition(
+                    input.attempt,
+                    DisposableAttemptCatalogAction::RecordRunnerReady(runner.clone()),
+                )?)
+            }
+            ScaleSetRunnerObservation::IdleReady { .. } => Action::Wait,
+            ScaleSetRunnerObservation::Conflicting => unreachable!(),
         },
-        Phase::Terminal => Action::Checkpoint {
-            phase: Phase::Destroying,
-        },
+        Phase::Terminal => persist(DisposableAttemptCatalogAction::BeginCleanup),
         Phase::Destroying => match input.vm {
             ExactObjectObservation::Unknown => Action::Observe {
                 target: DisposableWorkerObservationTarget::Vm,
             },
             ExactObjectObservation::Matching => Action::DestroyVm,
-            ExactObjectObservation::Absent => Action::Checkpoint {
-                phase: Phase::Deregistering,
-            },
+            ExactObjectObservation::Absent => persist(
+                DisposableAttemptCatalogAction::AdvanceCleanup(Phase::Deregistering),
+            ),
             ExactObjectObservation::Conflicting => unreachable!(),
         },
         Phase::Deregistering if matches!(input.vm, ExactObjectObservation::Unknown) => {
@@ -647,17 +500,15 @@ pub fn reconcile_attempt(
         Phase::Deregistering if matches!(input.vm, ExactObjectObservation::Matching) => {
             Action::DestroyVm
         }
-        Phase::Deregistering => match input.runner {
+        Phase::Deregistering => match &input.runner {
             ScaleSetRunnerObservation::Unknown => Action::Observe {
                 target: DisposableWorkerObservationTarget::Runner,
             },
-            ScaleSetRunnerObservation::Absent => Action::Checkpoint {
-                phase: Phase::Releasing,
-            },
-            ScaleSetRunnerObservation::Idle
-            | ScaleSetRunnerObservation::Assigned { .. }
-            | ScaleSetRunnerObservation::Running { .. }
-            | ScaleSetRunnerObservation::Terminal { .. } => Action::DeleteRunner,
+            ScaleSetRunnerObservation::Absent => persist(
+                DisposableAttemptCatalogAction::AdvanceCleanup(Phase::Releasing),
+            ),
+            ScaleSetRunnerObservation::RegistrationOnly { .. }
+            | ScaleSetRunnerObservation::IdleReady { .. } => Action::DeleteRunner,
             ScaleSetRunnerObservation::Conflicting => unreachable!(),
         },
         Phase::Releasing if matches!(input.vm, ExactObjectObservation::Unknown) => {
@@ -677,9 +528,9 @@ pub fn reconcile_attempt(
             Action::DeleteRunner
         }
         Phase::Releasing if input.capacity_reserved => Action::ReleaseCapacity,
-        Phase::Releasing => Action::Checkpoint {
-            phase: Phase::Complete,
-        },
+        Phase::Releasing => persist(DisposableAttemptCatalogAction::AdvanceCleanup(
+            Phase::Complete,
+        )),
         Phase::Complete if input.capacity_reserved => Action::Blocked {
             code: "completed_attempt_retains_capacity",
         },
@@ -703,146 +554,151 @@ pub fn reconcile_attempt(
     })
 }
 
-fn record_job_state(
-    phase: DisposableAttemptPhase,
-    expected: Option<GitHubJobId>,
-    state: ScaleSetRunnerObservation,
-) -> Result<DisposableWorkerAction, DisposableWorkerReconcilerError> {
-    let action = match state {
-        ScaleSetRunnerObservation::Assigned { github_job_id } => {
-            DisposableWorkerAction::RecordAssigned { github_job_id }
-        }
-        ScaleSetRunnerObservation::Running { github_job_id } => {
-            DisposableWorkerAction::RecordRunning { github_job_id }
-        }
-        ScaleSetRunnerObservation::Terminal {
-            github_job_id,
-            conclusion,
-        } => DisposableWorkerAction::RecordTerminal {
-            github_job_id,
-            conclusion,
-        },
-        ScaleSetRunnerObservation::Conflicting => DisposableWorkerAction::Blocked {
-            code: "conflicting_runner_identity",
-        },
-        ScaleSetRunnerObservation::Unknown
-        | ScaleSetRunnerObservation::Absent
-        | ScaleSetRunnerObservation::Idle => {
-            return Err(DisposableWorkerReconcilerError::new(
-                "runner",
-                "runner_state_not_recordable",
-                "runner state does not contain an assignable GitHub job",
-            ));
-        }
-    };
-    let observed = match action {
-        DisposableWorkerAction::RecordAssigned { github_job_id }
-        | DisposableWorkerAction::RecordRunning { github_job_id }
-        | DisposableWorkerAction::RecordTerminal { github_job_id, .. } => Some(github_job_id),
-        _ => None,
-    };
-    if let (Some(expected), Some(observed)) = (expected, observed)
-        && expected != observed
-    {
-        return Err(DisposableWorkerReconcilerError::new(
-            "github_job_id",
-            "github_job_identity_drift",
-            "runner observation changed the attempt's assigned GitHub job",
-        ));
-    }
-    if matches!(
-        (&action, phase),
-        (
-            DisposableWorkerAction::RecordAssigned { .. },
-            DisposableAttemptPhase::Assigned | DisposableAttemptPhase::Running
-        ) | (
-            DisposableWorkerAction::RecordRunning { .. },
-            DisposableAttemptPhase::Running
-        )
-    ) {
-        return Ok(DisposableWorkerAction::Wait);
-    }
-    Ok(action)
-}
-
-fn validate_attempt(attempt: &DisposableAttempt) -> Result<(), DisposableWorkerReconcilerError> {
-    if attempt.schema_version != DISPOSABLE_WORKER_RECONCILER_SCHEMA_VERSION {
-        return Err(DisposableWorkerReconcilerError::new(
-            "schema_version",
-            "unsupported_schema_version",
-            "disposable worker attempt schema is unsupported",
-        ));
-    }
-    use DisposableAttemptPhase as Phase;
-    let valid_shape = match attempt.phase {
-        Phase::Reserved | Phase::Provisioning | Phase::Registering | Phase::Waiting => {
-            attempt.github_job_id.is_none() && attempt.conclusion.is_none()
-        }
-        Phase::Assigned | Phase::Running => {
-            attempt.github_job_id.is_some() && attempt.conclusion.is_none()
-        }
-        Phase::Terminal => attempt.github_job_id.is_some() && attempt.conclusion.is_some(),
-        Phase::Destroying | Phase::Deregistering | Phase::Releasing | Phase::Complete => {
-            attempt.conclusion.is_none() || attempt.github_job_id.is_some()
-        }
-    };
-    if !valid_shape {
-        return Err(DisposableWorkerReconcilerError::new(
-            "attempt.phase",
-            "invalid_attempt_shape",
-            "attempt phase does not match its GitHub job evidence",
-        ));
-    }
-    Ok(())
+fn persist(transition: DisposableAttemptCatalogAction) -> DisposableWorkerAction {
+    DisposableWorkerAction::Persist { transition }
 }
 
 fn validate_transition(
-    from: DisposableAttemptPhase,
-    to: DisposableAttemptPhase,
+    attempt: &DisposableAttemptState,
+    transition: DisposableAttemptCatalogAction,
+) -> Result<DisposableAttemptCatalogAction, DisposableWorkerReconcilerError> {
+    let result = match &transition {
+        DisposableAttemptCatalogAction::BeginProvisioning => attempt.begin_provisioning(),
+        DisposableAttemptCatalogAction::BeginRegistration => attempt.begin_registration(),
+        DisposableAttemptCatalogAction::RecordRegistration(runner) => {
+            attempt.record_registration(runner)
+        }
+        DisposableAttemptCatalogAction::RecordRunnerReady(runner) => {
+            attempt.record_runner_ready(runner)
+        }
+        DisposableAttemptCatalogAction::RecordAssigned(job_id) => {
+            attempt.record_assigned(job_id.clone())
+        }
+        DisposableAttemptCatalogAction::RecordRunning { runner, job_id } => {
+            attempt.record_running(runner, job_id.clone())
+        }
+        DisposableAttemptCatalogAction::RecordTerminal {
+            runner,
+            job_id,
+            result,
+        } => attempt.record_terminal(runner.as_ref(), job_id.clone(), result.clone()),
+        DisposableAttemptCatalogAction::BeginCleanup => attempt.begin_cleanup(),
+        DisposableAttemptCatalogAction::AdvanceCleanup(phase) => attempt.advance_cleanup(*phase),
+    };
+    result.map_err(|error| {
+        let code = if error.code() == "identity_drift" {
+            "github_job_identity_drift"
+        } else {
+            "invalid_attempt_transition"
+        };
+        DisposableWorkerReconcilerError::new(
+            "attempt",
+            code,
+            "observation cannot advance the durable disposable attempt",
+        )
+    })?;
+    Ok(transition)
+}
+
+fn validate_runner_observation(
+    attempt: &DisposableAttemptState,
+    observation: &ScaleSetRunnerObservation,
 ) -> Result<(), DisposableWorkerReconcilerError> {
-    use DisposableAttemptPhase as Phase;
-    let valid = matches!(
-        (from, to),
-        (Phase::Reserved, Phase::Provisioning | Phase::Destroying)
-            | (Phase::Provisioning, Phase::Registering | Phase::Destroying)
-            | (
-                Phase::Registering,
-                Phase::Waiting
-                    | Phase::Assigned
-                    | Phase::Running
-                    | Phase::Terminal
-                    | Phase::Destroying
-                    | Phase::Deregistering
-            )
-            | (
-                Phase::Waiting,
-                Phase::Assigned
-                    | Phase::Running
-                    | Phase::Terminal
-                    | Phase::Destroying
-                    | Phase::Deregistering
-            )
-            | (
-                Phase::Assigned,
-                Phase::Running | Phase::Terminal | Phase::Destroying | Phase::Deregistering
-            )
-            | (
-                Phase::Running,
-                Phase::Terminal | Phase::Destroying | Phase::Deregistering
-            )
-            | (Phase::Terminal, Phase::Destroying)
-            | (Phase::Destroying, Phase::Deregistering)
-            | (Phase::Deregistering, Phase::Releasing)
-            | (Phase::Releasing, Phase::Complete)
-    );
-    if !valid {
+    let runner = match observation {
+        ScaleSetRunnerObservation::RegistrationOnly { runner }
+        | ScaleSetRunnerObservation::IdleReady { runner } => runner,
+        ScaleSetRunnerObservation::Unknown
+        | ScaleSetRunnerObservation::Absent
+        | ScaleSetRunnerObservation::Conflicting => return Ok(()),
+    };
+    if runner.name != *attempt.runner_name()
+        || attempt.runner_id().is_some_and(|id| id != runner.id)
+    {
         return Err(DisposableWorkerReconcilerError::new(
-            "attempt.phase",
-            "invalid_phase_transition",
-            "disposable worker phase transition is not monotonic",
+            "runner",
+            "runner_identity_drift",
+            "runner observation differs from the durable runner identity",
         ));
     }
     Ok(())
+}
+
+fn plan_job_event(
+    attempt: &DisposableAttemptState,
+    event: &ScaleSetJobEvent,
+) -> Result<Option<DisposableWorkerAction>, DisposableWorkerReconcilerError> {
+    if matches!(
+        attempt.phase(),
+        DisposableAttemptPhase::Destroying
+            | DisposableAttemptPhase::Deregistering
+            | DisposableAttemptPhase::Releasing
+            | DisposableAttemptPhase::Complete
+    ) {
+        validate_late_job_event_identity(attempt, event)?;
+        return Ok(None);
+    }
+    let transition = match event {
+        ScaleSetJobEvent::Started { runner, job_id } => {
+            DisposableAttemptCatalogAction::RecordRunning {
+                runner: runner.clone(),
+                job_id: job_id.clone(),
+            }
+        }
+        ScaleSetJobEvent::Completed {
+            runner,
+            job_id,
+            result,
+        } => DisposableAttemptCatalogAction::RecordTerminal {
+            runner: runner.clone(),
+            job_id: job_id.clone(),
+            result: result.clone(),
+        },
+    };
+    let before = attempt.revision();
+    let transition = validate_transition(attempt, transition)?;
+    let after = match &transition {
+        DisposableAttemptCatalogAction::RecordRunning { runner, job_id } => {
+            attempt.record_running(runner, job_id.clone())
+        }
+        DisposableAttemptCatalogAction::RecordTerminal {
+            runner,
+            job_id,
+            result,
+        } => attempt.record_terminal(runner.as_ref(), job_id.clone(), result.clone()),
+        _ => unreachable!(),
+    }
+    .map_err(|_| {
+        DisposableWorkerReconcilerError::new(
+            "job_event",
+            "invalid_job_event",
+            "job event cannot advance the durable attempt",
+        )
+    })?;
+    Ok((after.revision() != before).then(|| persist(transition)))
+}
+
+fn validate_late_job_event_identity(
+    attempt: &DisposableAttemptState,
+    event: &ScaleSetJobEvent,
+) -> Result<(), DisposableWorkerReconcilerError> {
+    let runner = event.runner();
+    let job_id = event.job_id();
+    let runner_matches = runner.is_none_or(|runner| {
+        runner.name == *attempt.runner_name()
+            && attempt.runner_id().is_none_or(|id| id == runner.id)
+    });
+    let job_matches = attempt
+        .github_job_id()
+        .is_none_or(|current| current == job_id);
+    if runner_matches && job_matches {
+        Ok(())
+    } else {
+        Err(DisposableWorkerReconcilerError::new(
+            "job_event",
+            "github_job_identity_drift",
+            "late job event conflicts with cleanup-bound durable identity",
+        ))
+    }
 }
 
 fn validate_identifier(

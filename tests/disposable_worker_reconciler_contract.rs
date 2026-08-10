@@ -1,11 +1,16 @@
+use smolrunner::disposable_attempt_catalog::DisposableAttemptCatalogAction;
+use smolrunner::disposable_attempt_state::DisposableAttemptState;
 use smolrunner::disposable_worker_reconciler::{
     CapacityClaimId, DisposableAttemptId, DisposableAttemptPhase, DisposableHostBudget,
     DisposableHostUsage, DisposableVmId, DisposableWorkerAction, DisposableWorkerObservationTarget,
     DisposableWorkerReconcileInput, DisposableWorkerResources, ExactObjectObservation,
-    GitHubJobConclusion, GitHubJobId, ScaleSetDemand, ScaleSetRunnerId, ScaleSetRunnerObservation,
-    plan_capacity, reconcile_attempt,
+    ScaleSetDemand, ScaleSetRunnerObservation, plan_capacity, reconcile_attempt,
 };
 use smolrunner::execution_admission::EpochMillis;
+use smolrunner::github_scale_set_protocol::{
+    ScaleSetJobEvent, ScaleSetJobId, ScaleSetJobResult, ScaleSetRunnerId, ScaleSetRunnerName,
+    ScaleSetRunnerReference,
+};
 
 fn time(value: u64) -> EpochMillis {
     EpochMillis::new(value).unwrap()
@@ -15,18 +20,33 @@ fn resources(cpu: u32, memory: u64, disk: u64) -> DisposableWorkerResources {
     DisposableWorkerResources::new(cpu, memory, disk).unwrap()
 }
 
-fn attempt() -> smolrunner::disposable_worker_reconciler::DisposableAttempt {
-    smolrunner::disposable_worker_reconciler::DisposableAttempt::reserved(
+fn attempt() -> DisposableAttemptState {
+    DisposableAttemptState::reserved(
         DisposableAttemptId::parse("attempt-1").unwrap(),
         CapacityClaimId::parse("claim-1").unwrap(),
         DisposableVmId::parse("vm-1").unwrap(),
-        ScaleSetRunnerId::parse("runner-1").unwrap(),
+        ScaleSetRunnerName::parse("smol-attempt-1").unwrap(),
         time(10_000),
     )
 }
 
+fn runner(id: u64) -> ScaleSetRunnerReference {
+    ScaleSetRunnerReference::new(
+        ScaleSetRunnerId::new(id).unwrap(),
+        ScaleSetRunnerName::parse("smol-attempt-1").unwrap(),
+    )
+}
+
+fn job(value: &str) -> ScaleSetJobId {
+    ScaleSetJobId::parse(value).unwrap()
+}
+
+fn result(value: &str) -> ScaleSetJobResult {
+    ScaleSetJobResult::parse(value).unwrap()
+}
+
 fn input<'a>(
-    attempt: &'a smolrunner::disposable_worker_reconciler::DisposableAttempt,
+    attempt: &'a DisposableAttemptState,
     vm: ExactObjectObservation,
     runner: ScaleSetRunnerObservation,
 ) -> DisposableWorkerReconcileInput<'a> {
@@ -35,9 +55,47 @@ fn input<'a>(
         attempt,
         vm,
         runner,
+        job_event: None,
         capacity_reserved: true,
         cancellation_requested: false,
     }
+}
+
+fn persist(action: DisposableAttemptCatalogAction) -> DisposableWorkerAction {
+    DisposableWorkerAction::Persist { transition: action }
+}
+
+fn apply(
+    state: &DisposableAttemptState,
+    action: &DisposableWorkerAction,
+) -> DisposableAttemptState {
+    let DisposableWorkerAction::Persist { transition } = action else {
+        panic!("action is not durable");
+    };
+    match transition {
+        DisposableAttemptCatalogAction::BeginProvisioning => state.begin_provisioning(),
+        DisposableAttemptCatalogAction::BeginRegistration => state.begin_registration(),
+        DisposableAttemptCatalogAction::RecordRegistration(runner) => {
+            state.record_registration(runner)
+        }
+        DisposableAttemptCatalogAction::RecordRunnerReady(runner) => {
+            state.record_runner_ready(runner)
+        }
+        DisposableAttemptCatalogAction::RecordAssigned(job_id) => {
+            state.record_assigned(job_id.clone())
+        }
+        DisposableAttemptCatalogAction::RecordRunning { runner, job_id } => {
+            state.record_running(runner, job_id.clone())
+        }
+        DisposableAttemptCatalogAction::RecordTerminal {
+            runner,
+            job_id,
+            result,
+        } => state.record_terminal(runner.as_ref(), job_id.clone(), result.clone()),
+        DisposableAttemptCatalogAction::BeginCleanup => state.begin_cleanup(),
+        DisposableAttemptCatalogAction::AdvanceCleanup(phase) => state.advance_cleanup(*phase),
+    }
+    .unwrap()
 }
 
 #[test]
@@ -58,34 +116,47 @@ fn capacity_is_bounded_by_demand_global_workers_and_every_resource() {
     assert_eq!(plan.additional_workers(), 2);
 
     let disk_limited = DisposableHostBudget::new(10, resources(40_000, 80_000, 150_000)).unwrap();
-    let unused = DisposableHostUsage::zero();
     let plan = plan_capacity(
         time(1_000),
         demand,
         disk_limited,
-        unused,
+        DisposableHostUsage::zero(),
         resources(4_000, 8_000, 100_000),
     )
     .unwrap();
     assert_eq!(plan.advertised_max_capacity(), 1);
     assert_eq!(plan.additional_workers(), 1);
+
+    let idle = ScaleSetDemand::new(0, 0, time(900), time(1_100)).unwrap();
+    let plan = plan_capacity(
+        time(1_000),
+        idle,
+        budget,
+        DisposableHostUsage::zero(),
+        resources(4_000, 8_000, 100_000),
+    )
+    .unwrap();
+    assert_eq!(plan.desired_workers(), 0);
+    assert_eq!(plan.additional_workers(), 0);
 }
 
 #[test]
-fn stale_or_inconsistent_demand_and_overcommitted_usage_fail_closed() {
-    let demand = ScaleSetDemand::new(2, 3, time(900), time(1_100)).unwrap_err();
-    assert_eq!(demand.code(), "invalid_scale_set_demand");
-
+fn stale_demand_and_overcommitted_usage_fail_closed() {
+    assert_eq!(
+        ScaleSetDemand::new(2, 3, time(900), time(1_100))
+            .unwrap_err()
+            .code(),
+        "invalid_scale_set_demand"
+    );
     let demand = ScaleSetDemand::new(2, 1, time(900), time(950)).unwrap();
     let budget = DisposableHostBudget::new(1, resources(4_000, 8_000, 100_000)).unwrap();
-    let usage = DisposableHostUsage::zero();
     assert_eq!(
         plan_capacity(
             time(1_000),
             demand,
             budget,
-            usage,
-            resources(4_000, 8_000, 100_000)
+            DisposableHostUsage::zero(),
+            resources(4_000, 8_000, 100_000),
         )
         .unwrap_err()
         .code(),
@@ -94,7 +165,7 @@ fn stale_or_inconsistent_demand_and_overcommitted_usage_fail_closed() {
 }
 
 #[test]
-fn happy_path_is_checkpointed_before_each_external_mutation() {
+fn happy_path_uses_canonical_durable_transitions() {
     let mut state = attempt();
     let action = reconcile_attempt(input(
         &state,
@@ -104,17 +175,15 @@ fn happy_path_is_checkpointed_before_each_external_mutation() {
     .unwrap();
     assert_eq!(
         action,
-        DisposableWorkerAction::Checkpoint {
-            phase: DisposableAttemptPhase::Provisioning
-        }
+        persist(DisposableAttemptCatalogAction::BeginProvisioning)
     );
-    state = state.checkpoint(&action).unwrap();
+    state = apply(&state, &action);
 
     assert_eq!(
         reconcile_attempt(input(
             &state,
             ExactObjectObservation::Absent,
-            ScaleSetRunnerObservation::Absent
+            ScaleSetRunnerObservation::Absent,
         ))
         .unwrap(),
         DisposableWorkerAction::ProvisionVm
@@ -125,87 +194,125 @@ fn happy_path_is_checkpointed_before_each_external_mutation() {
         ScaleSetRunnerObservation::Absent,
     ))
     .unwrap();
-    state = state.checkpoint(&action).unwrap();
+    state = apply(&state, &action);
     assert_eq!(state.phase(), DisposableAttemptPhase::Registering);
     assert_eq!(
         reconcile_attempt(input(
             &state,
             ExactObjectObservation::Matching,
-            ScaleSetRunnerObservation::Absent
+            ScaleSetRunnerObservation::Absent,
         ))
         .unwrap(),
         DisposableWorkerAction::GenerateJitAndStartRunner
     );
 
+    let exact_runner = runner(41);
     let action = reconcile_attempt(input(
         &state,
         ExactObjectObservation::Matching,
-        ScaleSetRunnerObservation::Idle,
-    ))
-    .unwrap();
-    state = state.checkpoint(&action).unwrap();
-    let job = GitHubJobId::new(42).unwrap();
-    let action = reconcile_attempt(input(
-        &state,
-        ExactObjectObservation::Matching,
-        ScaleSetRunnerObservation::Assigned { github_job_id: job },
-    ))
-    .unwrap();
-    state = state.checkpoint(&action).unwrap();
-    assert_eq!(state.github_job_id(), Some(job));
-
-    let action = reconcile_attempt(input(
-        &state,
-        ExactObjectObservation::Matching,
-        ScaleSetRunnerObservation::Running { github_job_id: job },
-    ))
-    .unwrap();
-    state = state.checkpoint(&action).unwrap();
-    let action = reconcile_attempt(input(
-        &state,
-        ExactObjectObservation::Matching,
-        ScaleSetRunnerObservation::Terminal {
-            github_job_id: job,
-            conclusion: GitHubJobConclusion::Success,
+        ScaleSetRunnerObservation::IdleReady {
+            runner: exact_runner.clone(),
         },
     ))
     .unwrap();
-    state = state.checkpoint(&action).unwrap();
+    state = apply(&state, &action);
+    assert_eq!(state.phase(), DisposableAttemptPhase::Waiting);
+
+    let mut started = input(
+        &state,
+        ExactObjectObservation::Matching,
+        ScaleSetRunnerObservation::IdleReady {
+            runner: exact_runner.clone(),
+        },
+    );
+    started.job_event = Some(ScaleSetJobEvent::Started {
+        runner: exact_runner.clone(),
+        job_id: job("job-A/opaque"),
+    });
+    let action = reconcile_attempt(started).unwrap();
+    state = apply(&state, &action);
+    assert_eq!(state.phase(), DisposableAttemptPhase::Running);
+
+    let mut completed = input(
+        &state,
+        ExactObjectObservation::Matching,
+        ScaleSetRunnerObservation::IdleReady {
+            runner: exact_runner.clone(),
+        },
+    );
+    completed.job_event = Some(ScaleSetJobEvent::Completed {
+        runner: Some(exact_runner),
+        job_id: job("job-A/opaque"),
+        result: result("future service result"),
+    });
+    let action = reconcile_attempt(completed).unwrap();
+    state = apply(&state, &action);
     assert_eq!(state.phase(), DisposableAttemptPhase::Terminal);
+    assert_eq!(state.result().unwrap().as_str(), "future service result");
 }
 
 #[test]
-fn terminal_cleanup_destroys_vm_before_deleting_runner_and_releasing_capacity() {
-    let job = GitHubJobId::new(42).unwrap();
-    let mut state = attempt();
-    for action in [
-        DisposableWorkerAction::Checkpoint {
-            phase: DisposableAttemptPhase::Provisioning,
-        },
-        DisposableWorkerAction::Checkpoint {
-            phase: DisposableAttemptPhase::Registering,
-        },
-        DisposableWorkerAction::Checkpoint {
-            phase: DisposableAttemptPhase::Waiting,
-        },
-        DisposableWorkerAction::RecordTerminal {
-            github_job_id: job,
-            conclusion: GitHubJobConclusion::Failure,
-        },
-        DisposableWorkerAction::Checkpoint {
-            phase: DisposableAttemptPhase::Destroying,
-        },
-    ] {
-        state = state.checkpoint(&action).unwrap();
-    }
+fn crash_discovered_registration_is_deleted_before_regeneration() {
+    let mut state = attempt().begin_provisioning().unwrap();
+    state = state.begin_registration().unwrap();
+    let registered = ScaleSetRunnerObservation::RegistrationOnly { runner: runner(41) };
+    assert_eq!(
+        reconcile_attempt(input(&state, ExactObjectObservation::Matching, registered,)).unwrap(),
+        DisposableWorkerAction::DeleteRunner
+    );
     assert_eq!(
         reconcile_attempt(input(
             &state,
             ExactObjectObservation::Matching,
-            ScaleSetRunnerObservation::Terminal {
-                github_job_id: job,
-                conclusion: GitHubJobConclusion::Failure
-            }
+            ScaleSetRunnerObservation::Absent,
+        ))
+        .unwrap(),
+        DisposableWorkerAction::GenerateJitAndStartRunner
+    );
+}
+
+#[test]
+fn completion_before_assignment_is_durable_and_still_cleans_up() {
+    let state = attempt();
+    let mut completed = input(
+        &state,
+        ExactObjectObservation::Absent,
+        ScaleSetRunnerObservation::Absent,
+    );
+    completed.job_event = Some(ScaleSetJobEvent::Completed {
+        runner: None,
+        job_id: job("cancelled-before-assignment"),
+        result: result("canceled"),
+    });
+    let action = reconcile_attempt(completed).unwrap();
+    let state = apply(&state, &action);
+    assert_eq!(state.phase(), DisposableAttemptPhase::Terminal);
+    assert_eq!(
+        reconcile_attempt(input(
+            &state,
+            ExactObjectObservation::Absent,
+            ScaleSetRunnerObservation::Absent,
+        ))
+        .unwrap(),
+        persist(DisposableAttemptCatalogAction::BeginCleanup)
+    );
+}
+
+#[test]
+fn terminal_cleanup_orders_vm_runner_and_capacity_release() {
+    let exact_runner = runner(41);
+    let mut state = attempt()
+        .record_terminal(None, job("job-cleanup"), result("failed"))
+        .unwrap()
+        .begin_cleanup()
+        .unwrap();
+    assert_eq!(
+        reconcile_attempt(input(
+            &state,
+            ExactObjectObservation::Matching,
+            ScaleSetRunnerObservation::RegistrationOnly {
+                runner: exact_runner.clone(),
+            },
         ))
         .unwrap(),
         DisposableWorkerAction::DestroyVm
@@ -213,18 +320,20 @@ fn terminal_cleanup_destroys_vm_before_deleting_runner_and_releasing_capacity() 
     let action = reconcile_attempt(input(
         &state,
         ExactObjectObservation::Absent,
-        ScaleSetRunnerObservation::Terminal {
-            github_job_id: job,
-            conclusion: GitHubJobConclusion::Failure,
+        ScaleSetRunnerObservation::RegistrationOnly {
+            runner: exact_runner.clone(),
         },
     ))
     .unwrap();
-    state = state.checkpoint(&action).unwrap();
+    state = apply(&state, &action);
+    assert_eq!(state.phase(), DisposableAttemptPhase::Deregistering);
     assert_eq!(
         reconcile_attempt(input(
             &state,
             ExactObjectObservation::Absent,
-            ScaleSetRunnerObservation::Idle
+            ScaleSetRunnerObservation::RegistrationOnly {
+                runner: exact_runner,
+            },
         ))
         .unwrap(),
         DisposableWorkerAction::DeleteRunner
@@ -235,12 +344,13 @@ fn terminal_cleanup_destroys_vm_before_deleting_runner_and_releasing_capacity() 
         ScaleSetRunnerObservation::Absent,
     ))
     .unwrap();
-    state = state.checkpoint(&action).unwrap();
+    state = apply(&state, &action);
+    assert_eq!(state.phase(), DisposableAttemptPhase::Releasing);
     assert_eq!(
         reconcile_attempt(input(
             &state,
             ExactObjectObservation::Absent,
-            ScaleSetRunnerObservation::Absent
+            ScaleSetRunnerObservation::Absent,
         ))
         .unwrap(),
         DisposableWorkerAction::ReleaseCapacity
@@ -252,208 +362,166 @@ fn terminal_cleanup_destroys_vm_before_deleting_runner_and_releasing_capacity() 
     );
     released.capacity_reserved = false;
     let action = reconcile_attempt(released).unwrap();
-    state = state.checkpoint(&action).unwrap();
-    let mut complete = input(
+    state = apply(&state, &action);
+    assert_eq!(state.phase(), DisposableAttemptPhase::Complete);
+}
+
+#[test]
+fn cancellation_expiry_and_lost_capacity_converge_to_cleanup() {
+    let state = attempt();
+    let mut cancelled = input(
         &state,
         ExactObjectObservation::Absent,
         ScaleSetRunnerObservation::Absent,
     );
-    complete.capacity_reserved = false;
+    cancelled.cancellation_requested = true;
     assert_eq!(
-        reconcile_attempt(complete).unwrap(),
-        DisposableWorkerAction::NoOp
+        reconcile_attempt(cancelled).unwrap(),
+        persist(DisposableAttemptCatalogAction::BeginCleanup)
     );
-}
-
-#[test]
-fn cancellation_expiry_runner_loss_and_orphan_vm_all_converge_to_cleanup() {
-    let reserved_attempt = attempt();
-    let mut reserved = input(
-        &reserved_attempt,
-        ExactObjectObservation::Absent,
-        ScaleSetRunnerObservation::Absent,
-    );
-    reserved.cancellation_requested = true;
-    assert_eq!(
-        reconcile_attempt(reserved).unwrap(),
-        DisposableWorkerAction::Checkpoint {
-            phase: DisposableAttemptPhase::Destroying
-        }
-    );
-
-    let mut provisioning = attempt();
-    provisioning = provisioning
-        .checkpoint(&DisposableWorkerAction::Checkpoint {
-            phase: DisposableAttemptPhase::Provisioning,
-        })
-        .unwrap();
     let mut expired = input(
-        &provisioning,
-        ExactObjectObservation::Matching,
+        &state,
+        ExactObjectObservation::Absent,
         ScaleSetRunnerObservation::Absent,
     );
     expired.now = time(10_001);
     assert_eq!(
         reconcile_attempt(expired).unwrap(),
-        DisposableWorkerAction::Checkpoint {
-            phase: DisposableAttemptPhase::Destroying
-        }
+        persist(DisposableAttemptCatalogAction::BeginCleanup)
     );
-
-    let mut waiting = provisioning
-        .checkpoint(&DisposableWorkerAction::Checkpoint {
-            phase: DisposableAttemptPhase::Registering,
-        })
-        .unwrap();
-    waiting = waiting
-        .checkpoint(&DisposableWorkerAction::Checkpoint {
-            phase: DisposableAttemptPhase::Waiting,
-        })
-        .unwrap();
-    assert_eq!(
-        reconcile_attempt(input(
-            &waiting,
-            ExactObjectObservation::Matching,
-            ScaleSetRunnerObservation::Absent
-        ))
-        .unwrap(),
-        DisposableWorkerAction::Checkpoint {
-            phase: DisposableAttemptPhase::Destroying
-        }
+    let mut lost = input(
+        &state,
+        ExactObjectObservation::Absent,
+        ScaleSetRunnerObservation::Absent,
     );
+    lost.capacity_reserved = false;
     assert_eq!(
-        reconcile_attempt(input(
-            &waiting,
-            ExactObjectObservation::Absent,
-            ScaleSetRunnerObservation::Idle
-        ))
-        .unwrap(),
-        DisposableWorkerAction::Checkpoint {
-            phase: DisposableAttemptPhase::Deregistering
-        }
+        reconcile_attempt(lost).unwrap(),
+        persist(DisposableAttemptCatalogAction::BeginCleanup)
     );
 }
 
 #[test]
-fn unknown_and_conflicting_external_state_never_authorize_mutation() {
-    let mut state = attempt();
-    state = state
-        .checkpoint(&DisposableWorkerAction::Checkpoint {
-            phase: DisposableAttemptPhase::Provisioning,
-        })
-        .unwrap();
-    assert_eq!(
-        reconcile_attempt(input(
-            &state,
-            ExactObjectObservation::Unknown,
-            ScaleSetRunnerObservation::Unknown
-        ))
-        .unwrap(),
-        DisposableWorkerAction::Observe {
-            target: DisposableWorkerObservationTarget::Vm
-        }
-    );
+fn unknown_conflicting_and_identity_drift_never_authorize_mutation() {
+    let state = attempt();
     assert_eq!(
         reconcile_attempt(input(
             &state,
             ExactObjectObservation::Conflicting,
-            ScaleSetRunnerObservation::Absent
+            ScaleSetRunnerObservation::Absent,
         ))
         .unwrap(),
         DisposableWorkerAction::Blocked {
             code: "conflicting_vm_identity"
         }
     );
-}
-
-#[test]
-fn an_attempt_can_never_change_the_actual_assigned_job() {
-    let mut state = attempt();
-    state = state
-        .checkpoint(&DisposableWorkerAction::Checkpoint {
-            phase: DisposableAttemptPhase::Provisioning,
-        })
-        .unwrap();
-    state = state
-        .checkpoint(&DisposableWorkerAction::Checkpoint {
-            phase: DisposableAttemptPhase::Registering,
-        })
-        .unwrap();
-    state = state
-        .checkpoint(&DisposableWorkerAction::RecordAssigned {
-            github_job_id: GitHubJobId::new(7).unwrap(),
-        })
-        .unwrap();
-    let error = state
-        .checkpoint(&DisposableWorkerAction::RecordRunning {
-            github_job_id: GitHubJobId::new(8).unwrap(),
-        })
-        .unwrap_err();
-    assert_eq!(error.code(), "github_job_identity_drift");
-}
-
-#[test]
-fn duplicate_and_out_of_order_job_messages_do_not_regress_phase() {
-    let job = GitHubJobId::new(7).unwrap();
-    let mut state = attempt();
-    state = state
-        .checkpoint(&DisposableWorkerAction::Checkpoint {
-            phase: DisposableAttemptPhase::Provisioning,
-        })
-        .unwrap();
-    state = state
-        .checkpoint(&DisposableWorkerAction::Checkpoint {
-            phase: DisposableAttemptPhase::Registering,
-        })
-        .unwrap();
-    state = state
-        .checkpoint(&DisposableWorkerAction::RecordAssigned { github_job_id: job })
-        .unwrap();
+    let mut state = state.begin_provisioning().unwrap();
+    state = state.begin_registration().unwrap();
+    let wrong = ScaleSetRunnerReference::new(
+        ScaleSetRunnerId::new(9).unwrap(),
+        ScaleSetRunnerName::parse("another-runner").unwrap(),
+    );
     assert_eq!(
         reconcile_attempt(input(
             &state,
             ExactObjectObservation::Matching,
-            ScaleSetRunnerObservation::Assigned { github_job_id: job }
+            ScaleSetRunnerObservation::IdleReady { runner: wrong },
         ))
-        .unwrap(),
-        DisposableWorkerAction::Wait
-    );
-    state = state
-        .checkpoint(&DisposableWorkerAction::RecordRunning { github_job_id: job })
-        .unwrap();
-    assert_eq!(
-        reconcile_attempt(input(
-            &state,
-            ExactObjectObservation::Matching,
-            ScaleSetRunnerObservation::Assigned { github_job_id: job }
-        ))
-        .unwrap(),
-        DisposableWorkerAction::Wait
+        .unwrap_err()
+        .code(),
+        "runner_identity_drift"
     );
 }
 
 #[test]
-fn lost_capacity_reservation_never_starts_or_retains_a_worker() {
-    let state = attempt();
-    let mut without_reservation = input(
+fn duplicate_job_event_is_a_no_op_but_identity_drift_is_refused() {
+    let exact_runner = runner(41);
+    let state = attempt()
+        .begin_provisioning()
+        .unwrap()
+        .begin_registration()
+        .unwrap()
+        .record_runner_ready(&exact_runner)
+        .unwrap()
+        .record_running(&exact_runner, job("job-one"))
+        .unwrap();
+    let mut duplicate = input(
         &state,
-        ExactObjectObservation::Absent,
-        ScaleSetRunnerObservation::Absent,
+        ExactObjectObservation::Matching,
+        ScaleSetRunnerObservation::IdleReady {
+            runner: exact_runner.clone(),
+        },
     );
-    without_reservation.capacity_reserved = false;
+    duplicate.job_event = Some(ScaleSetJobEvent::Started {
+        runner: exact_runner.clone(),
+        job_id: job("job-one"),
+    });
     assert_eq!(
-        reconcile_attempt(without_reservation).unwrap(),
-        DisposableWorkerAction::Checkpoint {
-            phase: DisposableAttemptPhase::Destroying
-        }
+        reconcile_attempt(duplicate).unwrap(),
+        DisposableWorkerAction::Wait
+    );
+
+    let mut drift = input(
+        &state,
+        ExactObjectObservation::Matching,
+        ScaleSetRunnerObservation::IdleReady {
+            runner: exact_runner.clone(),
+        },
+    );
+    drift.job_event = Some(ScaleSetJobEvent::Started {
+        runner: exact_runner,
+        job_id: job("job-two"),
+    });
+    assert_eq!(
+        reconcile_attempt(drift).unwrap_err().code(),
+        "github_job_identity_drift"
     );
 }
 
 #[test]
-fn public_json_contains_only_bounded_identifiers_and_actions() {
+fn late_duplicate_event_does_not_reverse_cleanup() {
+    let exact_runner = runner(41);
+    let state = attempt()
+        .record_terminal(Some(&exact_runner), job("job-late"), result("succeeded"))
+        .unwrap()
+        .begin_cleanup()
+        .unwrap();
+    let mut duplicate = input(
+        &state,
+        ExactObjectObservation::Matching,
+        ScaleSetRunnerObservation::RegistrationOnly {
+            runner: exact_runner.clone(),
+        },
+    );
+    duplicate.job_event = Some(ScaleSetJobEvent::Completed {
+        runner: Some(exact_runner),
+        job_id: job("job-late"),
+        result: result("succeeded"),
+    });
+    assert_eq!(
+        reconcile_attempt(duplicate).unwrap(),
+        DisposableWorkerAction::DestroyVm
+    );
+}
+
+#[test]
+fn public_action_json_is_bounded_and_contains_no_private_material() {
     let state = attempt();
-    let json = serde_json::to_string(&state).unwrap();
-    assert!(json.contains("attempt-1"));
-    assert!(!json.contains("token"));
-    assert!(!json.contains("/Users/"));
+    let action = reconcile_attempt(input(
+        &state,
+        ExactObjectObservation::Unknown,
+        ScaleSetRunnerObservation::Unknown,
+    ))
+    .unwrap();
+    let encoded = serde_json::to_string(&action).unwrap();
+    assert!(encoded.len() < 512);
+    assert!(!encoded.contains("token"));
+    assert_eq!(
+        action,
+        persist(DisposableAttemptCatalogAction::BeginProvisioning)
+    );
+    let observing = DisposableWorkerAction::Observe {
+        target: DisposableWorkerObservationTarget::Vm,
+    };
+    assert!(serde_json::to_string(&observing).unwrap().contains("vm"));
 }

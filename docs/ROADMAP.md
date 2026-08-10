@@ -120,8 +120,8 @@ This gate is meant to shrink custom code, not delay the first worker indefinitel
 
 ## Milestone 1 — durable disposable-attempt reconciliation
 
-The pure core, bounded Scale Set protocol identities, canonical attempt codec, and crash-safe Unix
-catalog have landed. M1 now needs the final checkpoint fault matrix before the physical adapters.
+The pure reconciler now consumes the bounded Scale Set protocol and canonical durable attempt
+catalog directly. Restart-at-every-checkpoint coverage exercises the real crash-safe Unix store.
 
 - [x] Define a small phase graph from reservation through provisioning, registration, assignment, execution, teardown, deregistration, release, and completion.
 - [x] Emit one idempotent next action per reconciliation tick.
@@ -130,7 +130,7 @@ catalog have landed. M1 now needs the final checkpoint fault matrix before the p
 - [x] Persist the attempt through the existing crash-safe state machinery with exact revisions and recovery semantics.
 - [x] Split prechosen runner name from GitHub-assigned runner ID so ambiguous JIT registration can recover by stable identity.
 - [x] Preserve Scale Set job identity and result as bounded protocol values instead of assuming narrower REST/enum forms.
-- [ ] Cover crash-after-every-checkpoint, completion-before-assignment, unknown completion strings, stale registration, and scale-to-zero in deterministic persistence tests.
+- [x] Cover crash-after-every-checkpoint, completion-before-assignment, unknown completion strings, stale registration, and scale-to-zero in deterministic persistence tests.
 
 **M1 acceptance:** killing the controller at every lifecycle boundary and restarting it never creates a second worker for the same attempt, loses owned cleanup debt, or releases capacity before cleanup is proven.
 
