@@ -138,7 +138,7 @@ catalog directly. Restart-at-every-checkpoint coverage exercises the real crash-
 
 Build a worker factory that makes **fresh writable state cheap**.
 
-- [x] Distinguish absent, exact stopped, and exact ready workers so clone and start are independently retryable across controller crashes.
+- [x] Distinguish absent, exact stopped, and exact ready workers so clone-with-start success and interrupted-clone cleanup are independently recoverable across controller crashes.
 - [x] Define sealed fixed shell-free clone and force-delete Lima command plans with an empty explicit environment, fixed deadlines, and exact durable attempt/resource inputs; omit standalone start, and keep all execution private until the same-lock durable authority exists.
 - [x] Persist the controller's observed-absent decision before cloning; use clone-with-start and discard only a stopped partial clone inside that authorized creation window, avoiding Lima's create-or-start `start NAME` behavior. The future mutation boundary must still revalidate sealed absence under the catalog lock.
 - [ ] Pin a reviewed Apple-silicon Ubuntu cloud image by exact digest and pin the official runner archive/version by exact digest.

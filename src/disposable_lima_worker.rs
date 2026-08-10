@@ -70,8 +70,9 @@ impl std::error::Error for DisposableLimaWorkerError {}
 /// shell, arbitrary guest command, network policy, runner credential, caller-selected environment,
 /// or caller-selected deadline. The source template must be prepared and validated by the trusted
 /// controller before this boundary; a Lima instance name alone is not ownership or isolation
-/// evidence. The clone plan removes inherited mounts. Start is refused until a separate boundary
-/// supplies sealed post-clone configuration and ownership evidence.
+/// evidence. The clone plan removes inherited mounts and requests startup only as the final clone
+/// operation; this adapter never emits Lima's create-or-start `start NAME` command. No plan is
+/// executable until a separate boundary supplies sealed current evidence and durable authority.
 #[derive(Clone, PartialEq, Eq)]
 pub struct DisposableLimaWorkerAdapter {
     limactl_program: PathBuf,
