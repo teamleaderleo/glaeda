@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
@@ -92,11 +91,9 @@ pub struct LocalInstallBuildCommandContext {
 impl LocalInstallBuildCommandContext {
     /// Bind private lexical paths for one exact local self-build.
     ///
-    /// The source root supplies the fixed private `Cargo.toml` manifest path. Cargo itself runs from
-    /// `isolated_working_directory`, so its hierarchical `.cargo/config*` lookup follows that
-    /// isolated directory's ancestors instead of the source checkout's ancestors. A later read-only
-    /// preflight must prove those private locations, toolchain files, and Cargo-config absence before
-    /// process execution.
+    /// Cargo runs from `isolated_working_directory`; the source checkout is selected only through
+    /// the fixed private `Cargo.toml` manifest argument. A later preflight proves filesystem and
+    /// Cargo-config safety before process execution.
     ///
     /// # Errors
     ///
@@ -121,10 +118,9 @@ impl LocalInstallBuildCommandContext {
         let cargo_home = private_path(cargo_home.into())?;
         let target_directory = private_path(target_directory.into())?;
 
-        let toolchain_paths = [&cargo_program, &rustc_program, &rustdoc_program];
-        if toolchain_paths[0] == toolchain_paths[1]
-            || toolchain_paths[0] == toolchain_paths[2]
-            || toolchain_paths[1] == toolchain_paths[2]
+        if cargo_program == rustc_program
+            || cargo_program == rustdoc_program
+            || rustc_program == rustdoc_program
         {
             return Err(error(
                 LocalInstallBuildCommandErrorKind::InvalidToolchainPaths,
@@ -266,9 +262,8 @@ impl std::error::Error for LocalInstallBuildCommandError {}
 /// Build the sole reviewed offline Cargo command for one Z2-A install build plan.
 ///
 /// Cargo runs from a private isolated working directory and receives the exact source manifest only
-/// through a redacted `--manifest-path` argument. This removes ordinary source-parent and home Cargo
-/// configuration from the hierarchical lookup chain. The later preflight must prove the isolated
-/// cwd ancestor chain and isolated CARGO_HOME are config-free before this inert command may execute.
+/// through a redacted `--manifest-path` argument. The later preflight must prove the isolated cwd
+/// ancestor chain and isolated CARGO_HOME are config-free before this inert command may execute.
 ///
 /// # Errors
 ///
@@ -447,6 +442,8 @@ const fn error(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use crate::artifact::{CommitId, GitTreeId, Sha256Digest};
     use crate::local_install_plan::{
         LocalInstallBuildPlan, LocalInstallGenerationIdentity, LocalInstallSourceIdentity,
@@ -504,13 +501,9 @@ mod tests {
     #[test]
     fn exact_argv_uses_redacted_manifest_path_and_isolated_working_directory() {
         let context = context("private-a");
-        let command = plan_local_install_build_command(
-            &build('a'),
-            LocalInstallPlatform::Macos,
-            &context,
-            3,
-        )
-        .expect("command");
+        let command =
+            plan_local_install_build_command(&build('a'), LocalInstallPlatform::Macos, &context, 3)
+                .expect("command");
 
         assert_eq!(
             command.spec().displayed_argv(),
@@ -528,25 +521,27 @@ mod tests {
                 "3".to_owned(),
             ]
         );
-        assert_eq!(command.working_directory(), context.isolated_working_directory);
+        assert_eq!(
+            command.working_directory(),
+            context.isolated_working_directory
+        );
         assert_ne!(command.working_directory(), context.source_root);
         assert_eq!(
             command_value(&command.spec().arguments[2]),
             context.manifest_path().to_str().expect("manifest")
         );
-        assert!(matches!(command.spec().arguments[2], CommandValue::Secret(_)));
+        assert!(matches!(
+            command.spec().arguments[2],
+            CommandValue::Secret(_)
+        ));
     }
 
     #[test]
     fn environment_is_closed_and_private_values_are_redacted() {
         let context = context("private-b");
-        let command = plan_local_install_build_command(
-            &build('a'),
-            LocalInstallPlatform::Linux,
-            &context,
-            2,
-        )
-        .expect("command");
+        let command =
+            plan_local_install_build_command(&build('a'), LocalInstallPlatform::Linux, &context, 2)
+                .expect("command");
 
         let keys = command
             .spec()
@@ -603,10 +598,7 @@ mod tests {
             first.policy().cargo_config_policy,
             "isolated_cwd_and_cargo_home_config_free_v1"
         );
-        assert_eq!(
-            first.policy().fixed_argument_policy,
-            FIXED_ARGUMENT_POLICY
-        );
+        assert_eq!(first.policy().fixed_argument_policy, FIXED_ARGUMENT_POLICY);
         let public = serde_json::to_string(first.policy()).expect("policy");
         assert!(!public.contains("secret-one"));
         assert!(!public.contains("secret-two"));
@@ -617,20 +609,12 @@ mod tests {
     #[test]
     fn platform_source_predecessor_and_jobs_change_policy_identity() {
         let context = context("private-c");
-        let base = plan_local_install_build_command(
-            &build('a'),
-            LocalInstallPlatform::Macos,
-            &context,
-            2,
-        )
-        .expect("base");
-        let source = plan_local_install_build_command(
-            &build('b'),
-            LocalInstallPlatform::Macos,
-            &context,
-            2,
-        )
-        .expect("source");
+        let base =
+            plan_local_install_build_command(&build('a'), LocalInstallPlatform::Macos, &context, 2)
+                .expect("base");
+        let source =
+            plan_local_install_build_command(&build('b'), LocalInstallPlatform::Macos, &context, 2)
+                .expect("source");
         let mut predecessor_build = build('a');
         predecessor_build.expected_predecessor = Some(LocalInstallGenerationIdentity {
             number: 1,
@@ -643,20 +627,12 @@ mod tests {
             2,
         )
         .expect("predecessor");
-        let jobs = plan_local_install_build_command(
-            &build('a'),
-            LocalInstallPlatform::Macos,
-            &context,
-            3,
-        )
-        .expect("jobs");
-        let linux = plan_local_install_build_command(
-            &build('a'),
-            LocalInstallPlatform::Linux,
-            &context,
-            2,
-        )
-        .expect("linux");
+        let jobs =
+            plan_local_install_build_command(&build('a'), LocalInstallPlatform::Macos, &context, 3)
+                .expect("jobs");
+        let linux =
+            plan_local_install_build_command(&build('a'), LocalInstallPlatform::Linux, &context, 2)
+                .expect("linux");
 
         let identities = [base, source, predecessor, jobs, linux]
             .into_iter()
