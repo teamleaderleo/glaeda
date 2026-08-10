@@ -22,6 +22,8 @@ pub mod exact_commit_handoff;
 pub mod execution_admission;
 pub mod execution_receipt;
 pub mod execution_receipt_store;
+/// Pure bounded vocabulary for GitHub Runner Scale Set job and runner identities.
+pub mod github_scale_set_protocol;
 /// Pure, fail-closed mapping of reviewed GitHub workflow-job evidence into typed broker intents.
 pub mod github_workflow_job_mapper;
 /// Pure, bounded normalization of complete GitHub workflow-job reconciliation snapshots.
@@ -264,7 +266,7 @@ impl Check {
         Self {
             id: id.into(),
             status,
-            summary: summary.into(),
+            summary,
             detail,
         }
     }
