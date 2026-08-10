@@ -1,4 +1,3 @@
-use smolrunner::artifact::Sha256Digest;
 use smolrunner::disposable_attempt_catalog::{
     DisposableAttemptCatalog, DisposableAttemptCatalogAction,
     DisposableAttemptCatalogCodecErrorKind, DisposableAttemptCatalogDocument,
@@ -7,6 +6,10 @@ use smolrunner::disposable_attempt_catalog::{
     decode_disposable_attempt_catalog, encode_disposable_attempt_catalog,
 };
 use smolrunner::disposable_attempt_state::DisposableAttemptState;
+use smolrunner::disposable_prepared_template::{
+    DisposablePreparedTemplateIdentity, current_disposable_prepared_template,
+    decode_disposable_prepared_template, encode_disposable_prepared_template,
+};
 use smolrunner::disposable_worker_reconciler::{
     CapacityClaimId, DisposableAttemptId, DisposableAttemptPhase, DisposableVmId,
     DisposableWorkerResources,
@@ -26,12 +29,25 @@ fn attempt(index: usize) -> DisposableAttemptState {
     )
 }
 
-fn template_digest() -> Sha256Digest {
-    Sha256Digest::parse(&format!("sha256:{}", "ab".repeat(32))).unwrap()
+fn template_digest() -> DisposablePreparedTemplateIdentity {
+    current_disposable_prepared_template()
+        .unwrap()
+        .identity()
+        .unwrap()
 }
 
-fn other_template_digest() -> Sha256Digest {
-    Sha256Digest::parse(&format!("sha256:{}", "cd".repeat(32))).unwrap()
+fn other_template_digest() -> DisposablePreparedTemplateIdentity {
+    let current = current_disposable_prepared_template().unwrap();
+    let bytes = encode_disposable_prepared_template(&current).unwrap();
+    let changed = String::from_utf8(bytes).unwrap().replacen(
+        "\"recipe_revision\": 1",
+        "\"recipe_revision\": 2",
+        1,
+    );
+    decode_disposable_prepared_template(changed.as_bytes())
+        .unwrap()
+        .identity()
+        .unwrap()
 }
 
 fn reservation(index: usize) -> DisposableAttemptReservation {
@@ -40,7 +56,7 @@ fn reservation(index: usize) -> DisposableAttemptReservation {
 
 fn reservation_with_digest(
     index: usize,
-    prepared_template_digest: Sha256Digest,
+    prepared_template_digest: DisposablePreparedTemplateIdentity,
 ) -> DisposableAttemptReservation {
     DisposableAttemptReservation::new(
         attempt(index),
@@ -163,7 +179,7 @@ fn canonical_codec_round_trips_progressed_active_and_tombstone_state() {
     assert_eq!(decoded.active().len(), 1);
     assert_eq!(decoded.tombstones().len(), 1);
     assert_eq!(
-        decoded.active()[0].prepared_template_digest(),
+        decoded.active()[0].prepared_template_identity(),
         &template_digest()
     );
     assert_eq!(
@@ -197,7 +213,7 @@ fn prepared_template_digest_is_part_of_the_durable_reservation_identity() {
 
     assert_ne!(changed, encoded);
     assert_eq!(
-        decoded.active()[0].prepared_template_digest(),
+        decoded.active()[0].prepared_template_identity(),
         &other_template_digest()
     );
 }
@@ -359,7 +375,16 @@ fn top_level_future_schema_and_unknown_fields_fail_closed() {
         DisposableAttemptCatalogCodecErrorKind::VersionIncompatible
     );
 
-    value["schema_version"] = serde_json::json!(3);
+    let mut previous_catalog = value.clone();
+    previous_catalog["schema_version"] = serde_json::json!(2);
+    assert_eq!(
+        decode_disposable_attempt_catalog(&serde_json::to_vec(&previous_catalog).unwrap())
+            .unwrap_err()
+            .kind(),
+        DisposableAttemptCatalogCodecErrorKind::VersionIncompatible
+    );
+
+    value["schema_version"] = serde_json::json!(4);
     let future = serde_json::to_vec(&value).unwrap();
     assert_eq!(
         decode_disposable_attempt_catalog(&future)
@@ -368,7 +393,7 @@ fn top_level_future_schema_and_unknown_fields_fail_closed() {
         DisposableAttemptCatalogCodecErrorKind::VersionIncompatible
     );
 
-    value["schema_version"] = serde_json::json!(2);
+    value["schema_version"] = serde_json::json!(3);
     value["unexpected"] = serde_json::json!(true);
     let unknown = serde_json::to_vec(&value).unwrap();
     assert_eq!(

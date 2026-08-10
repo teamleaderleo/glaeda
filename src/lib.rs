@@ -16,6 +16,8 @@ pub mod disposable_attempt_catalog;
 pub mod disposable_attempt_state;
 /// Sealed fixed Lima command plans for one durably planned disposable worker.
 pub mod disposable_lima_worker;
+/// Canonical supply-chain and isolation identity for the prepared disposable VM template.
+pub mod disposable_prepared_template;
 /// Pure capacity and lifecycle reconciliation for one-job disposable workers.
 pub mod disposable_worker_reconciler;
 pub mod doctor;

@@ -1,4 +1,3 @@
-use smolrunner::artifact::Sha256Digest;
 use smolrunner::disposable_attempt_catalog::{
     DisposableAttemptCatalog, DisposableAttemptCatalogAction, DisposableAttemptCatalogDocument,
     DisposableAttemptCatalogErrorKind, DisposableAttemptCatalogStore,
@@ -6,6 +5,10 @@ use smolrunner::disposable_attempt_catalog::{
     MAX_ACTIVE_DISPOSABLE_ATTEMPTS, MemoryDisposableAttemptCatalogStore,
 };
 use smolrunner::disposable_attempt_state::{DisposableAttemptRevision, DisposableAttemptState};
+use smolrunner::disposable_prepared_template::{
+    DisposablePreparedTemplateIdentity, current_disposable_prepared_template,
+    decode_disposable_prepared_template, encode_disposable_prepared_template,
+};
 use smolrunner::disposable_worker_reconciler::{
     CapacityClaimId, DisposableAttemptId, DisposableAttemptPhase, DisposableVmId,
     DisposableWorkerResources,
@@ -17,12 +20,29 @@ use smolrunner::github_scale_set_protocol::{
 
 type Catalog = DisposableAttemptCatalog<MemoryDisposableAttemptCatalogStore>;
 
-fn template_digest() -> Sha256Digest {
-    Sha256Digest::parse(&format!("sha256:{}", "ab".repeat(32))).unwrap()
+fn template_digest() -> DisposablePreparedTemplateIdentity {
+    current_disposable_prepared_template()
+        .unwrap()
+        .identity()
+        .unwrap()
 }
 
-fn other_template_digest() -> Sha256Digest {
-    Sha256Digest::parse(&format!("sha256:{}", "cd".repeat(32))).unwrap()
+fn other_template_digest() -> DisposablePreparedTemplateIdentity {
+    changed_template_identity()
+}
+
+fn changed_template_identity() -> DisposablePreparedTemplateIdentity {
+    let current = current_disposable_prepared_template().unwrap();
+    let bytes = encode_disposable_prepared_template(&current).unwrap();
+    let changed = String::from_utf8(bytes).unwrap().replacen(
+        "\"recipe_revision\": 1",
+        "\"recipe_revision\": 2",
+        1,
+    );
+    decode_disposable_prepared_template(changed.as_bytes())
+        .unwrap()
+        .identity()
+        .unwrap()
 }
 
 fn attempt(index: usize) -> DisposableAttemptState {
@@ -41,7 +61,7 @@ fn reservation(index: usize) -> DisposableAttemptReservation {
 
 fn reservation_with_digest(
     index: usize,
-    prepared_template_digest: Sha256Digest,
+    prepared_template_digest: DisposablePreparedTemplateIdentity,
 ) -> DisposableAttemptReservation {
     DisposableAttemptReservation::new(
         attempt(index),

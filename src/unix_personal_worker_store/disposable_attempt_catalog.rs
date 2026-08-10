@@ -374,13 +374,16 @@ mod tests {
     use rustix::fs::{FlockOperation, flock};
 
     use super::*;
-    use crate::artifact::Sha256Digest;
     use crate::disposable_attempt_catalog::{
         DisposableAttemptCatalog, DisposableAttemptCatalogAction,
         DisposableAttemptCatalogWriteDisposition, DisposableAttemptReservation,
         MemoryDisposableAttemptCatalogStore,
     };
     use crate::disposable_attempt_state::DisposableAttemptState;
+    use crate::disposable_prepared_template::{
+        DisposablePreparedTemplateIdentity, current_disposable_prepared_template,
+        decode_disposable_prepared_template, encode_disposable_prepared_template,
+    };
     use crate::disposable_worker_reconciler::{
         CapacityClaimId, DisposableAttemptId, DisposableVmId, DisposableWorkerResources,
     };
@@ -420,15 +423,12 @@ mod tests {
     }
 
     fn reservation(index: usize) -> DisposableAttemptReservation {
-        reservation_with_digest(
-            index,
-            Sha256Digest::parse(&format!("sha256:{}", "ab".repeat(32))).unwrap(),
-        )
+        reservation_with_digest(index, prepared_template_identity(1))
     }
 
     fn reservation_with_digest(
         index: usize,
-        prepared_template_digest: Sha256Digest,
+        prepared_template_digest: DisposablePreparedTemplateIdentity,
     ) -> DisposableAttemptReservation {
         DisposableAttemptReservation::new(
             DisposableAttemptState::reserved(
@@ -455,15 +455,12 @@ mod tests {
     }
 
     fn progressed_successor(index: usize) -> DisposableAttemptCatalogDocument {
-        progressed_successor_with_digest(
-            index,
-            Sha256Digest::parse(&format!("sha256:{}", "ab".repeat(32))).unwrap(),
-        )
+        progressed_successor_with_digest(index, prepared_template_identity(1))
     }
 
     fn progressed_successor_with_digest(
         index: usize,
-        prepared_template_digest: Sha256Digest,
+        prepared_template_digest: DisposablePreparedTemplateIdentity,
     ) -> DisposableAttemptCatalogDocument {
         let mut catalog =
             DisposableAttemptCatalog::new(MemoryDisposableAttemptCatalogStore::default());
@@ -581,10 +578,7 @@ mod tests {
                 .exists()
         );
 
-        let rebound = progressed_successor_with_digest(
-            1,
-            Sha256Digest::parse(&format!("sha256:{}", "cd".repeat(32))).unwrap(),
-        );
+        let rebound = progressed_successor_with_digest(1, prepared_template_identity(2));
         assert_eq!(rebound.revision().get(), next.revision().get() + 1);
         write_private(
             &root.store_directory().join(STAGED_CATALOG_DOCUMENT),
@@ -742,5 +736,22 @@ mod tests {
                 .kind(),
             DisposableAttemptCatalogErrorKind::Busy
         );
+    }
+
+    fn prepared_template_identity(recipe_revision: u64) -> DisposablePreparedTemplateIdentity {
+        let current = current_disposable_prepared_template().unwrap();
+        if recipe_revision == current.provisioning_recipe_revision() {
+            return current.identity().unwrap();
+        }
+        let bytes = encode_disposable_prepared_template(&current).unwrap();
+        let changed = String::from_utf8(bytes).unwrap().replacen(
+            "\"recipe_revision\": 1",
+            &format!("\"recipe_revision\": {recipe_revision}"),
+            1,
+        );
+        decode_disposable_prepared_template(changed.as_bytes())
+            .unwrap()
+            .identity()
+            .unwrap()
     }
 }

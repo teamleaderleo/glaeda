@@ -5,11 +5,13 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use smolrunner::artifact::Sha256Digest;
 use smolrunner::disposable_attempt_catalog::{
     DisposableAttemptCatalog, DisposableAttemptCatalogDocument, DisposableAttemptReservation,
 };
 use smolrunner::disposable_attempt_state::DisposableAttemptState;
+use smolrunner::disposable_prepared_template::{
+    DisposablePreparedTemplateIdentity, current_disposable_prepared_template,
+};
 use smolrunner::disposable_worker_reconciler::{
     CapacityClaimId, DisposableAttemptId, DisposableAttemptPhase, DisposableVmId,
     DisposableVmObservation, DisposableWorkerAction, DisposableWorkerReconcileInput,
@@ -53,8 +55,11 @@ fn epoch(value: u64) -> EpochMillis {
     EpochMillis::new(value).unwrap()
 }
 
-fn template_digest() -> Sha256Digest {
-    Sha256Digest::parse(&format!("sha256:{}", "ab".repeat(32))).unwrap()
+fn template_digest() -> DisposablePreparedTemplateIdentity {
+    current_disposable_prepared_template()
+        .unwrap()
+        .identity()
+        .unwrap()
 }
 
 fn attempt_id() -> DisposableAttemptId {
