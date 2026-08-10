@@ -1,3 +1,4 @@
+use smolrunner::artifact::Sha256Digest;
 use smolrunner::disposable_attempt_catalog::{
     DisposableAttemptCatalog, DisposableAttemptCatalogAction,
     DisposableAttemptCatalogCodecErrorKind, DisposableAttemptCatalogDocument,
@@ -25,10 +26,26 @@ fn attempt(index: usize) -> DisposableAttemptState {
     )
 }
 
+fn template_digest() -> Sha256Digest {
+    Sha256Digest::parse(&format!("sha256:{}", "ab".repeat(32))).unwrap()
+}
+
+fn other_template_digest() -> Sha256Digest {
+    Sha256Digest::parse(&format!("sha256:{}", "cd".repeat(32))).unwrap()
+}
+
 fn reservation(index: usize) -> DisposableAttemptReservation {
+    reservation_with_digest(index, template_digest())
+}
+
+fn reservation_with_digest(
+    index: usize,
+    prepared_template_digest: Sha256Digest,
+) -> DisposableAttemptReservation {
     DisposableAttemptReservation::new(
         attempt(index),
         DisposableWorkerResources::new(1_500, 4 * 1024 * 1024, 16 * 1024 * 1024).unwrap(),
+        prepared_template_digest,
     )
     .unwrap()
 }
@@ -146,6 +163,10 @@ fn canonical_codec_round_trips_progressed_active_and_tombstone_state() {
     assert_eq!(decoded.active().len(), 1);
     assert_eq!(decoded.tombstones().len(), 1);
     assert_eq!(
+        decoded.active()[0].prepared_template_digest(),
+        &template_digest()
+    );
+    assert_eq!(
         decoded.active()[0].attempt().phase(),
         DisposableAttemptPhase::Registering
     );
@@ -153,6 +174,31 @@ fn canonical_codec_round_trips_progressed_active_and_tombstone_state() {
     assert_eq!(
         decoded.tombstones()[0].phase(),
         DisposableAttemptPhase::Complete
+    );
+}
+
+#[test]
+fn prepared_template_digest_is_part_of_the_durable_reservation_identity() {
+    let mut catalog = DisposableAttemptCatalog::new(MemoryDisposableAttemptCatalogStore::default());
+    let (empty, _) = catalog.initialize().unwrap();
+    let (reserved, _) = catalog.reserve(empty.revision(), reservation(1)).unwrap();
+    let encoded = encode_disposable_attempt_catalog(&reserved).unwrap();
+    let mut other_catalog =
+        DisposableAttemptCatalog::new(MemoryDisposableAttemptCatalogStore::default());
+    let (other_empty, _) = other_catalog.initialize().unwrap();
+    let (other_reserved, _) = other_catalog
+        .reserve(
+            other_empty.revision(),
+            reservation_with_digest(1, other_template_digest()),
+        )
+        .unwrap();
+    let changed = encode_disposable_attempt_catalog(&other_reserved).unwrap();
+    let decoded = decode_disposable_attempt_catalog(&changed).unwrap();
+
+    assert_ne!(changed, encoded);
+    assert_eq!(
+        decoded.active()[0].prepared_template_digest(),
+        &other_template_digest()
     );
 }
 
@@ -300,7 +346,20 @@ fn top_level_future_schema_and_unknown_fields_fail_closed() {
         DisposableAttemptCatalogCodecErrorKind::VersionIncompatible
     );
 
-    value["schema_version"] = serde_json::json!(2);
+    let mut legacy_catalog = value.clone();
+    legacy_catalog["schema_version"] = serde_json::json!(1);
+    legacy_catalog["active"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("prepared_template_digest");
+    assert_eq!(
+        decode_disposable_attempt_catalog(&serde_json::to_vec(&legacy_catalog).unwrap())
+            .unwrap_err()
+            .kind(),
+        DisposableAttemptCatalogCodecErrorKind::VersionIncompatible
+    );
+
+    value["schema_version"] = serde_json::json!(3);
     let future = serde_json::to_vec(&value).unwrap();
     assert_eq!(
         decode_disposable_attempt_catalog(&future)
@@ -309,7 +368,7 @@ fn top_level_future_schema_and_unknown_fields_fail_closed() {
         DisposableAttemptCatalogCodecErrorKind::VersionIncompatible
     );
 
-    value["schema_version"] = serde_json::json!(1);
+    value["schema_version"] = serde_json::json!(2);
     value["unexpected"] = serde_json::json!(true);
     let unknown = serde_json::to_vec(&value).unwrap();
     assert_eq!(
@@ -339,6 +398,15 @@ fn embedded_attempt_unknown_fields_and_invalid_resources_fail_closed() {
     let invalid_resources = serde_json::to_vec(&value).unwrap();
     assert_eq!(
         decode_disposable_attempt_catalog(&invalid_resources)
+            .unwrap_err()
+            .kind(),
+        DisposableAttemptCatalogCodecErrorKind::CorruptState
+    );
+
+    let mut value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+    value["active"][0]["prepared_template_digest"] = serde_json::json!("sha256:moving");
+    assert_eq!(
+        decode_disposable_attempt_catalog(&serde_json::to_vec(&value).unwrap())
             .unwrap_err()
             .kind(),
         DisposableAttemptCatalogCodecErrorKind::CorruptState

@@ -1,3 +1,4 @@
+use smolrunner::artifact::Sha256Digest;
 use smolrunner::disposable_attempt_catalog::{
     DisposableAttemptCatalog, DisposableAttemptCatalogAction, DisposableAttemptCatalogDocument,
     DisposableAttemptCatalogErrorKind, DisposableAttemptCatalogStore,
@@ -16,6 +17,14 @@ use smolrunner::github_scale_set_protocol::{
 
 type Catalog = DisposableAttemptCatalog<MemoryDisposableAttemptCatalogStore>;
 
+fn template_digest() -> Sha256Digest {
+    Sha256Digest::parse(&format!("sha256:{}", "ab".repeat(32))).unwrap()
+}
+
+fn other_template_digest() -> Sha256Digest {
+    Sha256Digest::parse(&format!("sha256:{}", "cd".repeat(32))).unwrap()
+}
+
 fn attempt(index: usize) -> DisposableAttemptState {
     DisposableAttemptState::reserved(
         DisposableAttemptId::parse(&format!("attempt-{index}")).unwrap(),
@@ -30,6 +39,7 @@ fn reservation(index: usize) -> DisposableAttemptReservation {
     DisposableAttemptReservation::new(
         attempt(index),
         DisposableWorkerResources::new(1_000, 2 * 1024 * 1024, 8 * 1024 * 1024).unwrap(),
+        template_digest(),
     )
     .unwrap()
 }
@@ -95,6 +105,20 @@ fn initialization_and_exact_duplicate_reservation_are_idempotent() {
         DisposableAttemptCatalogWriteDisposition::Satisfied
     );
     assert_eq!(duplicate_receipt.catalog_revision, reserved.revision());
+
+    let changed_template = DisposableAttemptReservation::new(
+        attempt(1),
+        DisposableWorkerResources::new(1_000, 2 * 1024 * 1024, 8 * 1024 * 1024).unwrap(),
+        other_template_digest(),
+    )
+    .unwrap();
+    assert_eq!(
+        catalog
+            .reserve(reserved.revision(), changed_template)
+            .unwrap_err()
+            .kind(),
+        DisposableAttemptCatalogErrorKind::AlreadyExists
+    );
 }
 
 #[test]
@@ -249,6 +273,7 @@ fn global_ownership_identities_are_unique_across_attempts() {
     let conflicting = DisposableAttemptReservation::new(
         duplicate_name,
         DisposableWorkerResources::new(1_000, 2 * 1024 * 1024, 8 * 1024 * 1024).unwrap(),
+        template_digest(),
     )
     .unwrap();
 

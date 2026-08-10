@@ -5,6 +5,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use smolrunner::artifact::Sha256Digest;
 use smolrunner::disposable_attempt_catalog::{
     DisposableAttemptCatalog, DisposableAttemptCatalogDocument, DisposableAttemptReservation,
 };
@@ -52,6 +53,10 @@ fn epoch(value: u64) -> EpochMillis {
     EpochMillis::new(value).unwrap()
 }
 
+fn template_digest() -> Sha256Digest {
+    Sha256Digest::parse(&format!("sha256:{}", "ab".repeat(32))).unwrap()
+}
+
 fn attempt_id() -> DisposableAttemptId {
     DisposableAttemptId::parse("attempt-restart-1").unwrap()
 }
@@ -80,6 +85,7 @@ fn initialize(root: &Path) -> DisposableAttemptCatalogDocument {
             DisposableAttemptReservation::new(
                 state,
                 DisposableWorkerResources::new(2_000, 4_000, 8_000).unwrap(),
+                template_digest(),
             )
             .unwrap(),
         )

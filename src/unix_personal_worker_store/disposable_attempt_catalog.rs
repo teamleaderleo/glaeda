@@ -374,6 +374,7 @@ mod tests {
     use rustix::fs::{FlockOperation, flock};
 
     use super::*;
+    use crate::artifact::Sha256Digest;
     use crate::disposable_attempt_catalog::{
         DisposableAttemptCatalog, DisposableAttemptCatalogAction,
         DisposableAttemptCatalogWriteDisposition, DisposableAttemptReservation,
@@ -428,6 +429,7 @@ mod tests {
                 EpochMillis::new(100_000 + u64::try_from(index).unwrap()).unwrap(),
             ),
             DisposableWorkerResources::new(1_000, 2_000, 3_000).unwrap(),
+            Sha256Digest::parse(&format!("sha256:{}", "ab".repeat(32))).unwrap(),
         )
         .unwrap()
     }

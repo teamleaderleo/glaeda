@@ -8,12 +8,18 @@ use super::{
     DisposableAttemptCatalogRevision, DisposableAttemptReservation, MAX_ACTIVE_DISPOSABLE_ATTEMPTS,
     MAX_DISPOSABLE_ATTEMPT_TOMBSTONES,
 };
+use crate::artifact::Sha256Digest;
 use crate::disposable_attempt_state::{
     DisposableAttemptState, decode_disposable_attempt_state, encode_disposable_attempt_state,
 };
 use crate::disposable_worker_reconciler::DisposableWorkerResources;
 
 pub const MAX_DISPOSABLE_ATTEMPT_CATALOG_DOCUMENT_BYTES: usize = 1_048_576;
+
+#[derive(Deserialize)]
+struct CatalogVersionWire {
+    schema_version: u8,
+}
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -29,6 +35,7 @@ struct CatalogWire {
 struct ReservationWire {
     attempt: Value,
     resources: ResourceWire,
+    prepared_template_digest: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -66,6 +73,7 @@ pub fn encode_disposable_attempt_catalog(
                     memory_bytes: reservation.resources.memory_bytes(),
                     disk_bytes: reservation.resources.disk_bytes(),
                 },
+                prepared_template_digest: reservation.prepared_template_digest.as_str().to_owned(),
             })
         })
         .collect::<Result<Vec<_>, DisposableAttemptCatalogCodecError>>()?;
@@ -111,18 +119,24 @@ pub fn decode_disposable_attempt_catalog(
             "disposable attempt catalog exceeds the reviewed byte limit",
         ));
     }
+    let version: CatalogVersionWire = serde_json::from_slice(bytes).map_err(|_| {
+        codec_error(
+            DisposableAttemptCatalogCodecErrorKind::InvalidDocument,
+            "disposable attempt catalog JSON is invalid",
+        )
+    })?;
+    if version.schema_version != DISPOSABLE_ATTEMPT_CATALOG_SCHEMA_VERSION {
+        return Err(codec_error(
+            DisposableAttemptCatalogCodecErrorKind::VersionIncompatible,
+            "disposable attempt catalog schema version is unsupported",
+        ));
+    }
     let wire: CatalogWire = serde_json::from_slice(bytes).map_err(|_| {
         codec_error(
             DisposableAttemptCatalogCodecErrorKind::InvalidDocument,
             "disposable attempt catalog JSON is invalid",
         )
     })?;
-    if wire.schema_version != DISPOSABLE_ATTEMPT_CATALOG_SCHEMA_VERSION {
-        return Err(codec_error(
-            DisposableAttemptCatalogCodecErrorKind::VersionIncompatible,
-            "disposable attempt catalog schema version is unsupported",
-        ));
-    }
     if wire.active.len() > MAX_ACTIVE_DISPOSABLE_ATTEMPTS
         || wire.tombstones.len() > MAX_DISPOSABLE_ATTEMPT_TOMBSTONES
     {
@@ -154,7 +168,18 @@ pub fn decode_disposable_attempt_catalog(
                     "disposable attempt reservation resources are invalid",
                 )
             })?;
-            Ok(DisposableAttemptReservation { attempt, resources })
+            let prepared_template_digest =
+                Sha256Digest::parse(&reservation.prepared_template_digest).map_err(|_| {
+                    codec_error(
+                        DisposableAttemptCatalogCodecErrorKind::CorruptState,
+                        "disposable prepared-template digest is invalid",
+                    )
+                })?;
+            Ok(DisposableAttemptReservation {
+                attempt,
+                resources,
+                prepared_template_digest,
+            })
         })
         .collect::<Result<Vec<_>, DisposableAttemptCatalogCodecError>>()?;
     let tombstones = wire
