@@ -7,9 +7,7 @@ use crate::disposable_attempt_state::{DisposableAttemptRevision, DisposableAttem
 use crate::disposable_worker_reconciler::{
     DisposableAttemptId, DisposableAttemptPhase, DisposableHostUsage, DisposableWorkerResources,
 };
-use crate::github_scale_set_protocol::{
-    ScaleSetJobId, ScaleSetJobResult, ScaleSetRunnerReference,
-};
+use crate::github_scale_set_protocol::{ScaleSetJobId, ScaleSetJobResult, ScaleSetRunnerReference};
 
 pub const DISPOSABLE_ATTEMPT_CATALOG_SCHEMA_VERSION: u8 = 1;
 pub const MAX_ACTIVE_DISPOSABLE_ATTEMPTS: usize = 64;
