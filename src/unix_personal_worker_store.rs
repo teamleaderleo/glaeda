@@ -19,6 +19,8 @@ use crate::personal_worker_store::{
     encode_personal_worker_store_document, migrate_personal_worker_store_v1_document,
 };
 
+/// Same-lock durable persistence for the disposable-attempt catalog.
+mod disposable_attempt_catalog;
 /// Same-lock durable persistence for the personal-worker Lima lifecycle authority.
 pub mod lima_authority;
 
@@ -200,6 +202,7 @@ impl UnixPersonalWorkerStore {
         // that recovery window under the canonical lock before it can inspect, publish, or report
         // success from the store.
         synchronize_directory(&store._root, "personal worker state root")?;
+        disposable_attempt_catalog::refuse_unsettled(&store)?;
         lima_authority::refuse_unsettled_lima_authority(&store)?;
         match store.recovery_plan()? {
             StoreRecoveryPlan::Clean {
@@ -250,6 +253,7 @@ impl UnixPersonalWorkerStore {
         };
         let _lock = store.acquire_mutation_lock()?;
         synchronize_directory(&store._root, "personal worker state root")?;
+        disposable_attempt_catalog::refuse_unsettled(&store)?;
         lima_authority::refuse_unsettled_lima_authority(&store)?;
 
         let current_bytes = store.read_named_bytes(CURRENT_DOCUMENT)?.ok_or_else(|| {
@@ -291,7 +295,8 @@ impl UnixPersonalWorkerStore {
                         ));
                     }
                     store.synchronize_existing_staged(&migrated)?;
-                    let mut staged = StagedDocument::existing(store.directory.as_fd());
+                    let mut staged =
+                        StagedDocument::existing(store.directory.as_fd(), STAGED_DOCUMENT);
                     store.publish_staged(&mut staged, false)?;
                     return Ok(PersonalWorkerStoreMigrationReceipt::new(
                         PersonalWorkerStoreMigrationDisposition::Migrated,
@@ -352,6 +357,14 @@ impl UnixPersonalWorkerStore {
     }
 
     fn read_named_bytes(&self, name: &str) -> Result<Option<Vec<u8>>, PersonalWorkerStoreError> {
+        self.read_named_bytes_bounded(name, MAX_PERSONAL_WORKER_STORE_BYTES)
+    }
+
+    fn read_named_bytes_bounded(
+        &self,
+        name: &str,
+        max_bytes: usize,
+    ) -> Result<Option<Vec<u8>>, PersonalWorkerStoreError> {
         inspect_directory(
             &self.directory,
             "personal worker store directory",
@@ -365,7 +378,7 @@ impl UnixPersonalWorkerStore {
         inspect_private_file(&file, self.owner, "personal worker state document", None)?;
         let mut bytes = Vec::new();
         File::from(file)
-            .take((MAX_PERSONAL_WORKER_STORE_BYTES + 1) as u64)
+            .take((max_bytes + 1) as u64)
             .read_to_end(&mut bytes)
             .map_err(|_| {
                 store_error(
@@ -373,7 +386,7 @@ impl UnixPersonalWorkerStore {
                     "could not read the personal worker state document",
                 )
             })?;
-        if bytes.len() > MAX_PERSONAL_WORKER_STORE_BYTES {
+        if bytes.len() > max_bytes {
             return Err(PersonalWorkerStoreError::corrupt_state());
         }
         Ok(Some(bytes))
@@ -384,15 +397,24 @@ impl UnixPersonalWorkerStore {
         document: &PersonalWorkerStoreDocument,
     ) -> Result<StagedDocument<'_>, PersonalWorkerStoreError> {
         let encoded = encode_personal_worker_store_document(document)?;
+        self.stage_named_bytes(STAGED_DOCUMENT, &encoded)
+    }
+
+    fn stage_named_bytes(
+        &self,
+        staged_name: &'static str,
+        encoded: &[u8],
+    ) -> Result<StagedDocument<'_>, PersonalWorkerStoreError> {
         let file = fs::openat(
             &self.directory,
-            STAGED_DOCUMENT,
+            staged_name,
             NEW_FILE_FLAGS,
             PRIVATE_FILE_MODE,
         )
         .map_err(map_stage_create_error)?;
         let mut staged = StagedDocument {
             directory: self.directory.as_fd(),
+            name: staged_name,
             file: Some(file),
             armed: true,
         };
@@ -410,7 +432,7 @@ impl UnixPersonalWorkerStore {
             Some(0),
         )?;
         let mut file = File::from(staged.file.take().expect("staged file is present"));
-        file.write_all(&encoded).map_err(|_| {
+        file.write_all(encoded).map_err(|_| {
             store_error(
                 PersonalWorkerStoreErrorKind::Io,
                 "could not write the staged personal worker document",
@@ -437,6 +459,15 @@ impl UnixPersonalWorkerStore {
         staged: &mut StagedDocument<'_>,
         no_replace: bool,
     ) -> Result<(), PersonalWorkerStoreError> {
+        self.publish_named_staged(staged, CURRENT_DOCUMENT, no_replace)
+    }
+
+    fn publish_named_staged(
+        &self,
+        staged: &mut StagedDocument<'_>,
+        current_name: &'static str,
+        no_replace: bool,
+    ) -> Result<(), PersonalWorkerStoreError> {
         let flags = if no_replace {
             RenameFlags::NOREPLACE
         } else {
@@ -444,9 +475,9 @@ impl UnixPersonalWorkerStore {
         };
         fs::renameat_with(
             &self.directory,
-            STAGED_DOCUMENT,
+            staged.name,
             &self.directory,
-            CURRENT_DOCUMENT,
+            current_name,
             flags,
         )
         .map_err(|error| map_publish_error(error, no_replace))?;
@@ -558,7 +589,8 @@ impl UnixPersonalWorkerStore {
                     .load_named(STAGED_DOCUMENT)?
                     .ok_or_else(PersonalWorkerStoreError::corrupt_state)?;
                 self.synchronize_existing_staged(&staged)?;
-                let mut staged_guard = StagedDocument::existing(self.directory.as_fd());
+                let mut staged_guard =
+                    StagedDocument::existing(self.directory.as_fd(), STAGED_DOCUMENT);
                 self.publish_staged(&mut staged_guard, no_replace)?;
                 Ok(PersonalWorkerStoreRecovery::new(
                     PersonalWorkerStoreRecoveryDisposition::PublishedStaged,
@@ -592,6 +624,7 @@ impl PersonalWorkerStore for UnixPersonalWorkerStore {
             ));
         }
         let _lock = self.acquire_mutation_lock()?;
+        disposable_attempt_catalog::refuse_unsettled(self)?;
         lima_authority::refuse_unsettled_lima_authority(self)?;
         self.recover_locked()?;
         if self.load_named(CURRENT_DOCUMENT)?.is_some() {
@@ -616,6 +649,7 @@ impl PersonalWorkerStore for UnixPersonalWorkerStore {
         document: &PersonalWorkerStoreDocument,
     ) -> Result<PersonalWorkerStoreWriteReceipt, PersonalWorkerStoreError> {
         let _lock = self.acquire_mutation_lock()?;
+        disposable_attempt_catalog::refuse_unsettled(self)?;
         lima_authority::refuse_unsettled_lima_authority(self)?;
         self.recover_locked()?;
         let current = self.load_named(CURRENT_DOCUMENT)?.ok_or_else(|| {
@@ -643,6 +677,7 @@ impl PersonalWorkerStore for UnixPersonalWorkerStore {
 
     fn recover(&mut self) -> Result<PersonalWorkerStoreRecovery, PersonalWorkerStoreError> {
         let _lock = self.acquire_mutation_lock()?;
+        disposable_attempt_catalog::refuse_unsettled(self)?;
         lima_authority::refuse_unsettled_lima_authority(self)?;
         self.recover_locked()
     }
@@ -715,14 +750,16 @@ fn acquire_mutation_lock_in(
 
 struct StagedDocument<'a> {
     directory: BorrowedFd<'a>,
+    name: &'static str,
     file: Option<OwnedFd>,
     armed: bool,
 }
 
 impl<'a> StagedDocument<'a> {
-    fn existing(directory: BorrowedFd<'a>) -> Self {
+    fn existing(directory: BorrowedFd<'a>, name: &'static str) -> Self {
         Self {
             directory,
+            name,
             file: None,
             armed: false,
         }
@@ -736,7 +773,7 @@ impl<'a> StagedDocument<'a> {
 impl Drop for StagedDocument<'_> {
     fn drop(&mut self) {
         if self.armed {
-            let _ = fs::unlinkat(self.directory, STAGED_DOCUMENT, AtFlags::empty());
+            let _ = fs::unlinkat(self.directory, self.name, AtFlags::empty());
         }
     }
 }
