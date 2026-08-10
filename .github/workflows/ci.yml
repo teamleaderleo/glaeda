@@ -35,12 +35,19 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
 
-          paths = [Path("scripts/bootstrap"), *Path("scripts/workspace_bootstrap").glob("*.py")]
+          paths = [
+              Path("smolrunner"),
+              Path("scripts/bootstrap"),
+              Path("scripts/test-front-door.py"),
+              *Path("scripts/workspace_bootstrap").glob("*.py"),
+          ]
           for path in paths:
               compile(path.read_text(encoding="utf-8"), str(path), "exec")
           PY
+          test -x ./smolrunner
           bash -n scripts/test-bootstrap.sh
           bash scripts/test-bootstrap.sh
+          python3 scripts/test-front-door.py
 
           first_receipt=$(mktemp)
           second_receipt=$(mktemp)
@@ -151,6 +158,18 @@ jobs:
 
       - name: Run tests
         run: cargo test --locked --all-targets --all-features
+
+      - name: Exercise root SmolRunner front door
+        run: |
+          ./smolrunner --output json | jq -e '
+            .schema_version == 1 and
+            .receipt_type == "smolrunner-front-door-readiness-receipt" and
+            .verdict == "ready" and
+            .doctor.evaluated == true and
+            (.doctor.overall == "pass" or .doctor.overall == "warn") and
+            .next_action == "none"
+          '
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
 
       - name: Exercise machine-readable doctor output
         run: cargo run --locked --quiet -- --output json doctor
