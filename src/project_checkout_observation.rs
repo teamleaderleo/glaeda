@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fmt;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Component, Path, PathBuf};
@@ -28,8 +28,6 @@ pub struct ProjectCheckoutLocationIdentity {
     device: u64,
     inode: u64,
     owner: u32,
-    ctime_seconds: i64,
-    ctime_nanoseconds: i64,
 }
 
 impl ProjectCheckoutLocationIdentity {
@@ -39,8 +37,6 @@ impl ProjectCheckoutLocationIdentity {
             device: metadata.dev(),
             inode: metadata.ino(),
             owner: metadata.uid(),
-            ctime_seconds: metadata.ctime(),
-            ctime_nanoseconds: metadata.ctime_nsec(),
         }
     }
 
@@ -49,8 +45,6 @@ impl ProjectCheckoutLocationIdentity {
             && metadata.dev() == self.device
             && metadata.ino() == self.inode
             && metadata.uid() == self.owner
-            && metadata.ctime() == self.ctime_seconds
-            && metadata.ctime_nsec() == self.ctime_nanoseconds
     }
 
     fn materialization_id(&self) -> Result<Sha256Digest, ProjectCheckoutObservationError> {
@@ -59,8 +53,6 @@ impl ProjectCheckoutLocationIdentity {
         hasher.update(self.device.to_be_bytes());
         hasher.update(self.inode.to_be_bytes());
         hasher.update(self.owner.to_be_bytes());
-        hasher.update(self.ctime_seconds.to_be_bytes());
-        hasher.update(self.ctime_nanoseconds.to_be_bytes());
         let digest = hasher.finalize();
         let mut value = String::with_capacity(SHA256_PREFIX.len() + digest.len() * 2);
         value.push_str(SHA256_PREFIX);
@@ -292,10 +284,14 @@ impl ProjectCheckoutObserver {
         let parent = checkout.parent().ok_or_else(unsafe_path)?;
         let parent_metadata = std::fs::metadata(parent).map_err(|_| unavailable())?;
         let owner_matches_parent = metadata.uid() == parent_metadata.uid();
-        let location_identity = ProjectCheckoutLocationIdentity::from_metadata(checkout.clone(), &metadata);
+        let location_identity =
+            ProjectCheckoutLocationIdentity::from_metadata(checkout.clone(), &metadata);
         let materialization_id = location_identity.materialization_id()?;
 
         let bare = self.git(&checkout, &["rev-parse", "--is-bare-repository"], executor)?;
+        if !bare.success {
+            return Err(not_worktree());
+        }
         require_success(&bare)?;
         match parse_single_line(&bare.stdout)? {
             "true" => return Err(bare_repository()),
@@ -307,6 +303,7 @@ impl ProjectCheckoutObserver {
         if !top_level.success {
             return Err(not_worktree());
         }
+        require_success(&top_level)?;
         let observed_root = PathBuf::from(parse_single_line(&top_level.stdout)?);
         if observed_root != checkout {
             return Err(not_worktree());
@@ -397,7 +394,13 @@ impl ProjectCheckoutObserver {
 
         let remotes = self.git(
             checkout,
-            &["config", "--no-includes", "--null", "--get-regexp", "^remote\\..*\\.url$"],
+            &[
+                "config",
+                "--no-includes",
+                "--null",
+                "--get-regexp",
+                "^remote\\..*\\.url$",
+            ],
             executor,
         )?;
         let remotes = parse_remotes(&remotes)?;
@@ -419,11 +422,19 @@ impl ProjectCheckoutObserver {
         let raw_status = status.stdout.clone();
         let status = parse_status(&status.stdout)?;
 
-        let modes = self.git(checkout, &["ls-files", "--format=%(objectmode)"], executor)?;
+        let modes = self.git(
+            checkout,
+            &["ls-files", "--format=%(objectmode)"],
+            executor,
+        )?;
         require_success(&modes)?;
         let submodules_present = parse_submodule_presence(&modes.stdout)?;
 
-        let worktrees = self.git(checkout, &["worktree", "list", "--porcelain", "-z"], executor)?;
+        let worktrees = self.git(
+            checkout,
+            &["worktree", "list", "--porcelain", "-z"],
+            executor,
+        )?;
         require_success(&worktrees)?;
         let linked_worktree_count = parse_worktree_count(&worktrees.stdout)?;
 
@@ -479,9 +490,10 @@ impl ProjectCheckoutObserver {
             .map_err(|_| unavailable())?;
         if record.argv != expected_argv
             || record.environment_keys != expected_environment_keys
-            || !record.stderr.is_empty()
             || record.stdout.len() > MAX_PROJECT_CHECKOUT_OUTPUT_BYTES
+            || record.stderr.len() > MAX_PROJECT_CHECKOUT_OUTPUT_BYTES
             || record.stdout.contains('\u{fffd}')
+            || record.stderr.contains('\u{fffd}')
             || record.stdout.contains('\r')
         {
             return Err(invalid_output());
@@ -521,7 +533,7 @@ fn parse_remotes(
         }
         return Err(invalid_output());
     }
-    if record.status != Some(0) {
+    if record.status != Some(0) || !record.stderr.is_empty() {
         return Err(invalid_output());
     }
     let mut remotes = Vec::new();
@@ -529,7 +541,10 @@ fn parse_remotes(
         let Some((key, url)) = entry.split_once('\n') else {
             return Err(invalid_output());
         };
-        let Some(name) = key.strip_prefix("remote.").and_then(|key| key.strip_suffix(".url")) else {
+        let Some(name) = key
+            .strip_prefix("remote.")
+            .and_then(|key| key.strip_suffix(".url"))
+        else {
             return Err(invalid_output());
         };
         if !valid_remote_name(name) || remotes.len() >= MAX_PROJECT_REMOTES {
@@ -546,7 +561,11 @@ fn parse_remotes(
     if !record.stdout.is_empty() && !record.stdout.ends_with('\0') {
         return Err(invalid_output());
     }
-    remotes.sort_by(|left, right| left.name.cmp(&right.name).then(left.project.cmp(&right.project)));
+    remotes.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then(left.project.cmp(&right.project))
+    });
     Ok(remotes)
 }
 
@@ -676,9 +695,9 @@ fn validate_branch_name(value: &str) -> Result<(), ProjectCheckoutObservationErr
 fn valid_remote_name(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= MAX_REMOTE_NAME_BYTES
-        && value.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
-        })
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 fn parse_single_line(value: &str) -> Result<&str, ProjectCheckoutObservationError> {
@@ -691,7 +710,7 @@ fn parse_single_line(value: &str) -> Result<&str, ProjectCheckoutObservationErro
 }
 
 fn require_success(record: &ExecutionRecord) -> Result<(), ProjectCheckoutObservationError> {
-    if record.success && record.status == Some(0) {
+    if record.success && record.status == Some(0) && record.stderr.is_empty() {
         Ok(())
     } else {
         Err(unavailable())
@@ -710,7 +729,11 @@ fn error(
     code: &'static str,
     problem: &'static str,
 ) -> ProjectCheckoutObservationError {
-    ProjectCheckoutObservationError { kind, code, problem }
+    ProjectCheckoutObservationError {
+        kind,
+        code,
+        problem,
+    }
 }
 
 fn not_worktree() -> ProjectCheckoutObservationError {
@@ -808,6 +831,7 @@ mod tests {
     #[derive(Clone)]
     struct Response {
         stdout: String,
+        stderr: String,
         status: i32,
     }
 
@@ -815,7 +839,16 @@ mod tests {
         fn success(stdout: impl Into<String>) -> Self {
             Self {
                 stdout: stdout.into(),
+                stderr: String::new(),
                 status: 0,
+            }
+        }
+
+        fn failed(status: i32, stderr: impl Into<String>) -> Self {
+            Self {
+                stdout: String::new(),
+                stderr: stderr.into(),
+                status,
             }
         }
     }
@@ -859,7 +892,7 @@ mod tests {
                 status: Some(response.status),
                 success: response.status == 0,
                 stdout: response.stdout,
-                stderr: String::new(),
+                stderr: response.stderr,
             })
         }
     }
@@ -868,7 +901,13 @@ mod tests {
         ProjectCheckoutObserver::new("/usr/bin/git").expect("observer")
     }
 
-    fn script(root: &Path, remotes: &str, status: &str, modes: &str, worktrees: &str) -> Vec<Response> {
+    fn script(
+        root: &Path,
+        remotes: &str,
+        status: &str,
+        modes: &str,
+        worktrees: &str,
+    ) -> Vec<Response> {
         vec![
             Response::success("false\n"),
             Response::success(format!("{}\n", root.display())),
@@ -891,7 +930,10 @@ mod tests {
         let status = format!(
             "# branch.oid {COMMIT}\0# branch.head main\0# branch.upstream origin/main\0# branch.ab +0 -0\0"
         );
-        let worktrees = format!("worktree {}\0HEAD {COMMIT}\0branch refs/heads/main\0\0", checkout.path().display());
+        let worktrees = format!(
+            "worktree {}\0HEAD {COMMIT}\0branch refs/heads/main\0\0",
+            checkout.path().display()
+        );
         let executor = ScriptedExecutor::new(script(
             checkout.path(),
             remotes,
@@ -917,8 +959,10 @@ mod tests {
         assert!(observation.owner_matches_parent());
         let json = serde_json::to_string(&observation).expect("public JSON");
         assert!(!json.contains(checkout.path().to_string_lossy().as_ref()));
-        assert!(!format!("{:?}", observation.location_identity())
-            .contains(checkout.path().to_string_lossy().as_ref()));
+        assert!(
+            !format!("{:?}", observation.location_identity())
+                .contains(checkout.path().to_string_lossy().as_ref())
+        );
         assert_eq!(executor.commands.borrow().len(), 11);
     }
 
@@ -977,10 +1021,27 @@ mod tests {
         let observation = observer()
             .observe(checkout.path(), &executor)
             .expect("detached checkout");
-        assert!(matches!(observation.branch(), ProjectBranchState::Detached));
+        assert!(matches!(
+            observation.branch(),
+            ProjectBranchState::Detached
+        ));
         assert!(!observation.upstream_configured());
         assert_eq!(observation.local_commits_ahead(), None);
         assert_eq!(observation.primary_project(), None);
+    }
+
+    #[test]
+    fn ordinary_directory_is_not_a_worktree_even_when_git_prints_diagnostics() {
+        let checkout = TempDirectory::new("ordinary-directory");
+        let executor = ScriptedExecutor::new(vec![Response::failed(128, "fatal: private path")]);
+        let error = observer()
+            .observe(checkout.path(), &executor)
+            .expect_err("non Git directory");
+        assert_eq!(error.kind, ProjectCheckoutObservationErrorKind::NotWorktree);
+        assert_eq!(executor.commands.borrow().len(), 1);
+        assert!(!serde_json::to_string(&error)
+            .expect("error JSON")
+            .contains("private path"));
     }
 
     #[test]
@@ -990,11 +1051,13 @@ mod tests {
         let error = observer()
             .observe(checkout.path(), &executor)
             .expect_err("bare repository");
-        assert_eq!(error.kind, ProjectCheckoutObservationErrorKind::BareRepository);
+        assert_eq!(
+            error.kind,
+            ProjectCheckoutObservationErrorKind::BareRepository
+        );
         assert_eq!(executor.commands.borrow().len(), 1);
     }
 
-    #[cfg(unix)]
     #[test]
     fn symlink_candidate_is_refused_before_git() {
         use std::os::unix::fs::symlink;
