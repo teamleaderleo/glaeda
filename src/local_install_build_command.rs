@@ -78,9 +78,8 @@ pub struct LocalInstallBuildCommandPolicy {
 
 /// Private paths for one exact local self-build.
 ///
-/// Callers choose only the exact source root, one SmolRunner-owned build root, and the reviewed
-/// Cargo/rustc/rustdoc executables. The command derives fixed `work`, `home`, `cargo-home`, and
-/// `target` children beneath the build root so ordinary code cannot independently reconfigure them.
+/// Callers choose one exact source root, one SmolRunner-owned build root, and three exact toolchain
+/// executables. The command derives `work`, `home`, `cargo-home`, and `target` below the build root.
 #[derive(Clone, PartialEq, Eq)]
 pub struct LocalInstallBuildCommandContext {
     source_root: PathBuf,
@@ -96,7 +95,7 @@ impl LocalInstallBuildCommandContext {
     /// # Errors
     ///
     /// Returns an error unless all paths are absolute normalized non-root UTF-8 paths, source and
-    /// build roots are disjoint, and the three toolchain executable paths are distinct.
+    /// build roots are disjoint, and the toolchain executable paths are distinct.
     pub fn new(
         source_root: impl Into<PathBuf>,
         build_root: impl Into<PathBuf>,
@@ -248,9 +247,9 @@ impl std::error::Error for LocalInstallBuildCommandError {}
 
 /// Build the sole reviewed offline Cargo command for one Z2-A install build plan.
 ///
-/// Cargo runs from `<build-root>/work` and receives the exact source manifest only through a
-/// redacted `--manifest-path` argument. A later preflight proves the build-root lineage and isolated
-/// Cargo home are config-free before this inert command may execute.
+/// Cargo runs from `<build-root>/work` and receives the exact source manifest through a redacted
+/// `--manifest-path` argument. A later preflight proves the build-root lineage and isolated Cargo
+/// home are config-free before this inert command may execute.
 ///
 /// # Errors
 ///
@@ -506,15 +505,10 @@ mod tests {
             command.spec().arguments[2],
             CommandValue::Secret(_)
         ));
-        assert_eq!(
-            command
-                .spec()
-                .environment
-                .get("CARGO_HOME")
-                .expect("cargo home")
-                .is_secret(),
-            true
-        );
+        assert!(matches!(
+            command.spec().environment.get("CARGO_HOME"),
+            Some(CommandValue::Secret(_))
+        ));
     }
 
     #[test]
