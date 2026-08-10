@@ -14,7 +14,10 @@ fn runner() -> ScaleSetRunnerReference {
 fn job_identity_preserves_opaque_nonnumeric_wire_values() {
     let job = ScaleSetJobId::parse("job_01JZ9Y6V6F8Q9W7M3N2K1P0ABC").unwrap();
     assert_eq!(job.as_str(), "job_01JZ9Y6V6F8Q9W7M3N2K1P0ABC");
-    assert_eq!(serde_json::to_string(&job).unwrap(), "\"job_01JZ9Y6V6F8Q9W7M3N2K1P0ABC\"");
+    assert_eq!(
+        serde_json::to_string(&job).unwrap(),
+        "\"job_01JZ9Y6V6F8Q9W7M3N2K1P0ABC\""
+    );
 }
 
 #[test]
@@ -51,7 +54,10 @@ fn started_event_binds_exact_runner_and_job() {
         job_id: ScaleSetJobId::parse("job-7").unwrap(),
     };
 
-    assert_eq!(event.schema_version(), GITHUB_SCALE_SET_PROTOCOL_SCHEMA_VERSION);
+    assert_eq!(
+        event.schema_version(),
+        GITHUB_SCALE_SET_PROTOCOL_SCHEMA_VERSION
+    );
     assert_eq!(event.runner().unwrap().id.get(), 42);
     assert_eq!(event.runner().unwrap().name.as_str(), "smol-attempt-42");
     assert_eq!(event.job_id().as_str(), "job-7");
