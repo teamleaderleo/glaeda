@@ -12,8 +12,7 @@ use smolrunner::disposable_worker_reconciler::{
 };
 use smolrunner::execution_admission::EpochMillis;
 use smolrunner::github_scale_set_protocol::{
-    ScaleSetJobId, ScaleSetJobResult, ScaleSetRunnerId, ScaleSetRunnerName,
-    ScaleSetRunnerReference,
+    ScaleSetJobId, ScaleSetJobResult, ScaleSetRunnerId, ScaleSetRunnerName, ScaleSetRunnerReference,
 };
 
 fn attempt(index: usize) -> DisposableAttemptState {
@@ -140,9 +139,15 @@ fn canonical_codec_round_trips_progressed_active_and_tombstone_state() {
     assert_eq!(decoded, document);
     assert_eq!(decoded.active().len(), 1);
     assert_eq!(decoded.tombstones().len(), 1);
-    assert_eq!(decoded.active()[0].attempt().phase(), DisposableAttemptPhase::Registering);
+    assert_eq!(
+        decoded.active()[0].attempt().phase(),
+        DisposableAttemptPhase::Registering
+    );
     assert_eq!(decoded.active()[0].attempt().runner_id().unwrap().get(), 22);
-    assert_eq!(decoded.tombstones()[0].phase(), DisposableAttemptPhase::Complete);
+    assert_eq!(
+        decoded.tombstones()[0].phase(),
+        DisposableAttemptPhase::Complete
+    );
 }
 
 #[test]
@@ -152,7 +157,10 @@ fn noncanonical_json_is_rejected_after_full_validation() {
     let pretty = serde_json::to_vec_pretty(&value).unwrap();
 
     let error = decode_disposable_attempt_catalog(&pretty).unwrap_err();
-    assert_eq!(error.kind(), DisposableAttemptCatalogCodecErrorKind::NonCanonical);
+    assert_eq!(
+        error.kind(),
+        DisposableAttemptCatalogCodecErrorKind::NonCanonical
+    );
 }
 
 #[test]
