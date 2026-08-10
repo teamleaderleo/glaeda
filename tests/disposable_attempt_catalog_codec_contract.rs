@@ -2,8 +2,8 @@ use smolrunner::disposable_attempt_catalog::{
     DisposableAttemptCatalog, DisposableAttemptCatalogAction,
     DisposableAttemptCatalogCodecErrorKind, DisposableAttemptCatalogDocument,
     DisposableAttemptReservation, MAX_DISPOSABLE_ATTEMPT_CATALOG_DOCUMENT_BYTES,
-    MemoryDisposableAttemptCatalogStore, decode_disposable_attempt_catalog,
-    encode_disposable_attempt_catalog,
+    MAX_DISPOSABLE_ATTEMPT_TOMBSTONES, MemoryDisposableAttemptCatalogStore,
+    decode_disposable_attempt_catalog, encode_disposable_attempt_catalog,
 };
 use smolrunner::disposable_attempt_state::DisposableAttemptState;
 use smolrunner::disposable_worker_reconciler::{
@@ -159,6 +159,101 @@ fn noncanonical_json_is_rejected_after_full_validation() {
     assert_eq!(
         error.kind(),
         DisposableAttemptCatalogCodecErrorKind::NonCanonical
+    );
+}
+
+#[test]
+fn catalog_revision_must_match_the_represented_history() {
+    let empty =
+        encode_disposable_attempt_catalog(&DisposableAttemptCatalogDocument::empty()).unwrap();
+    let mut empty_value: serde_json::Value = serde_json::from_slice(&empty).unwrap();
+    empty_value["revision"] = serde_json::json!(2);
+    assert_eq!(
+        decode_disposable_attempt_catalog(&serde_json::to_vec(&empty_value).unwrap())
+            .unwrap_err()
+            .kind(),
+        DisposableAttemptCatalogCodecErrorKind::CorruptState
+    );
+
+    let mut catalog = DisposableAttemptCatalog::new(MemoryDisposableAttemptCatalogStore::default());
+    let (empty, _) = catalog.initialize().unwrap();
+    let (reserved, _) = catalog.reserve(empty.revision(), reservation(1)).unwrap();
+    let encoded = encode_disposable_attempt_catalog(&reserved).unwrap();
+    let mut reserved_value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+    reserved_value["revision"] = serde_json::json!(1);
+    assert_eq!(
+        decode_disposable_attempt_catalog(&serde_json::to_vec(&reserved_value).unwrap())
+            .unwrap_err()
+            .kind(),
+        DisposableAttemptCatalogCodecErrorKind::CorruptState
+    );
+
+    let mut impossible_reservation: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+    impossible_reservation["revision"] = serde_json::json!(3);
+    impossible_reservation["active"][0]["attempt"]["revision"] = serde_json::json!(2);
+    assert_eq!(
+        decode_disposable_attempt_catalog(&serde_json::to_vec(&impossible_reservation).unwrap())
+            .unwrap_err()
+            .kind(),
+        DisposableAttemptCatalogCodecErrorKind::CorruptState
+    );
+}
+
+#[test]
+fn saturated_tombstone_history_retains_a_safe_revision_lower_bound() {
+    let mut catalog = DisposableAttemptCatalog::new(MemoryDisposableAttemptCatalogStore::default());
+    let (mut document, _) = catalog.initialize().unwrap();
+    for index in 1..=MAX_DISPOSABLE_ATTEMPT_TOMBSTONES + 1 {
+        document = catalog
+            .reserve(document.revision(), reservation(index))
+            .unwrap()
+            .0;
+        document = transition(
+            &mut catalog,
+            &document,
+            index,
+            DisposableAttemptCatalogAction::RecordTerminal {
+                runner: None,
+                job_id: ScaleSetJobId::parse(&format!("completed-job-{index}")).unwrap(),
+                result: ScaleSetJobResult::parse("succeeded").unwrap(),
+            },
+        );
+        for phase in [
+            None,
+            Some(DisposableAttemptPhase::Deregistering),
+            Some(DisposableAttemptPhase::Releasing),
+            Some(DisposableAttemptPhase::Complete),
+        ] {
+            document = transition(
+                &mut catalog,
+                &document,
+                index,
+                phase.map_or(
+                    DisposableAttemptCatalogAction::BeginCleanup,
+                    DisposableAttemptCatalogAction::AdvanceCleanup,
+                ),
+            );
+        }
+        let attempt_id = DisposableAttemptId::parse(&format!("attempt-{index}")).unwrap();
+        let attempt_revision = document
+            .find_active(&attempt_id)
+            .unwrap()
+            .attempt()
+            .revision();
+        document = catalog
+            .retire_complete(document.revision(), &attempt_id, attempt_revision)
+            .unwrap()
+            .0;
+    }
+
+    assert_eq!(
+        document.tombstones().len(),
+        MAX_DISPOSABLE_ATTEMPT_TOMBSTONES
+    );
+    let encoded = encode_disposable_attempt_catalog(&document).unwrap();
+    assert_eq!(
+        decode_disposable_attempt_catalog(&encoded).unwrap(),
+        document
     );
 }
 

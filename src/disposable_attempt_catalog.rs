@@ -323,6 +323,52 @@ impl DisposableAttemptCatalogDocument {
             ));
         }
 
+        // Catalog revision one is the empty document. Reserving an attempt and every later
+        // attempt-revision advance each consume one catalog revision; retirement consumes one
+        // more. Before replay history fills this sum is exact. Once the FIFO is full, evicted
+        // tombstones make the retained sum only a lower bound on the monotonic catalog revision.
+        let represented_revision = self
+            .active
+            .iter()
+            .try_fold(1_u64, |revision, reservation| {
+                revision.checked_add(reservation.attempt.revision().get())
+            })
+            .and_then(|revision| {
+                self.tombstones
+                    .iter()
+                    .try_fold(revision, |revision, attempt| {
+                        revision
+                            .checked_add(attempt.revision().get())?
+                            .checked_add(1)
+                    })
+            })
+            .ok_or_else(|| {
+                catalog_error(
+                    DisposableAttemptCatalogErrorKind::CorruptState,
+                    "disposable attempt catalog represented revision overflows",
+                )
+            })?;
+        let revision_is_consistent = if self.tombstones.len() < MAX_DISPOSABLE_ATTEMPT_TOMBSTONES {
+            self.revision.get() == represented_revision
+        } else {
+            self.revision.get() >= represented_revision
+        };
+        if !revision_is_consistent {
+            return Err(catalog_error(
+                DisposableAttemptCatalogErrorKind::CorruptState,
+                "disposable attempt catalog revision conflicts with represented history",
+            ));
+        }
+        if self.active.iter().any(|reservation| {
+            reservation.attempt.phase() == DisposableAttemptPhase::Reserved
+                && reservation.attempt.revision().get() != 1
+        }) {
+            return Err(catalog_error(
+                DisposableAttemptCatalogErrorKind::CorruptState,
+                "reserved disposable attempt must remain at attempt revision one",
+            ));
+        }
+
         let mut attempt_ids = BTreeSet::new();
         let mut claim_ids = BTreeSet::new();
         let mut vm_ids = BTreeSet::new();
