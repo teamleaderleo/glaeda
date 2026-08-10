@@ -172,6 +172,8 @@ pub mod podman_preview_inspect;
 pub mod podman_preview_state;
 pub mod preview;
 pub mod process;
+/// Pure, strict logical project catalog identities and alias resolution.
+pub mod project_catalog;
 pub mod renderprove_artifact_binding;
 pub mod renderprove_execution;
 #[cfg(target_os = "linux")]
