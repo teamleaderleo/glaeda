@@ -10,6 +10,8 @@ pub mod debian_package_recovery;
 /// Descriptor-bound execution of already reviewed Linux launch plans.
 #[cfg(target_os = "linux")]
 pub mod descriptor_bound_launcher;
+/// Pure durable state, revisions, and codec for one disposable worker attempt.
+pub mod disposable_attempt_state;
 /// Pure capacity and lifecycle reconciliation for one-job disposable workers.
 pub mod disposable_worker_reconciler;
 pub mod doctor;
