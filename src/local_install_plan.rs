@@ -1045,8 +1045,7 @@ mod tests {
             LocalInstallPlatform::Macos,
             &[],
         )
-        .expect("upgrade")
-        else {
+        .expect("upgrade") else {
             panic!("expected upgrade")
         };
         let second = build_generation(&plan, 'd');
