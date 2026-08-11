@@ -183,6 +183,8 @@ zero-capacity poll is retained as short-lived advisory evidence only. It does no
 cancellation and capacity vetoes remain clear at a later mutation barrier. The clone transaction
 therefore performs its own fresh zero-capacity poll: a newly arrived message is durably retained
 before return, while only idle can authorize the next checkpoint.
+The 30-second message-admission window is separate from the deterministic six-hour hard ceiling on
+the resulting one-job attempt, so replay is exact without expiring ordinary builds after one poll.
 Unacquired or pre-clone-canceled work completes its durable release and moves immediately into
 bounded replay history, so repeated cancellations restore advertised capacity instead of filling
 the active catalog.

@@ -25,6 +25,7 @@ use crate::github_scale_set_protocol::ScaleSetRunnerName;
 const CLAIM_DOMAIN: &[u8] = b"smolrunner.scale-set-capacity-claim.v1\0";
 const MAX_REPOSITORY_COMPONENT: usize = 100;
 const MAX_LABELS: usize = 32;
+const DISPOSABLE_JOB_MAX_MILLIS: u64 = 6 * 60 * 60 * 1_000;
 
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct ScaleSetConsumerPolicy {
@@ -113,6 +114,15 @@ pub(crate) fn apply_scale_set_event(
         if now < pending.observed_at() || now > pending.not_after() {
             return Err(ScaleSetConsumerError::new("consumer_admission_stale"));
         }
+        // The inbox deadline bounds whether this service message is fresh enough to create a
+        // reservation. It is not the workload lifetime. Derive the one-job hard ceiling from the
+        // exact persisted message deadline so crash replay produces byte-identical state.
+        let attempt_not_after = pending
+            .not_after()
+            .get()
+            .checked_add(DISPOSABLE_JOB_MAX_MILLIS)
+            .and_then(|value| EpochMillis::new(value).ok())
+            .ok_or_else(|| ScaleSetConsumerError::new("consumer_attempt_deadline_invalid"))?;
         let reservation = DisposableAttemptReservation::new(
             DisposableAttemptState::reserved_for_job(
                 identities.attempt_id.clone(),
@@ -120,7 +130,7 @@ pub(crate) fn apply_scale_set_event(
                 identities.vm_id,
                 identities.runner_name,
                 job.job_id.clone(),
-                pending.not_after(),
+                attempt_not_after,
             ),
             policy.resources,
             policy.prepared_template_identity.clone(),
@@ -494,7 +504,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(reserved.active().len(), 1);
-        assert_eq!(reserved.active()[0].attempt().not_after().get(), 120_000);
+        assert_eq!(reserved.active()[0].attempt().not_after().get(), 21_720_000);
         assert_eq!(
             apply_scale_set_event(
                 &policy,
