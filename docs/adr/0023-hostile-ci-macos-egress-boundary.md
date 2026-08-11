@@ -25,7 +25,7 @@ only as a development and lifecycle-integration path; it is not accepted for hos
 macOS PF is the mature enforcement component. A root-owned installation manages one fixed anchor
 that applies to TCP and UDP sockets owned by the dedicated service UID. The anchor:
 
-- permits the one fixed loopback TCP port used only by Lima's SSH-over-vsock forwarder;
+- permits loopback TCP port 61922, used only by Lima's SSH-over-vsock forwarder;
 - rejects every other loopback destination;
 - rejects IPv4 private, link-local, carrier-grade NAT, benchmarking, multicast, limited-broadcast,
   and documentation/reserved ranges that cannot be ordinary public build destinations;
@@ -62,4 +62,3 @@ admission as unavailable.
 
 Connection, rate, and byte ceilings remain later hardening. Project-specific private-network
 exceptions are also deferred; they must never be supplied by workflow input.
-

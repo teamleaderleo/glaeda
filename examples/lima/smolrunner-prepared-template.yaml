@@ -31,7 +31,8 @@ networks: []
 portForwards: []
 
 ssh:
-  localPort: 0
+  # The single-worker production PF policy permits only this loopback control endpoint.
+  localPort: 61922
   loadDotSSHPubKeys: false
   forwardAgent: false
   forwardX11: false

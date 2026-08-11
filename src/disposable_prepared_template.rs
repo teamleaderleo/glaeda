@@ -11,10 +11,10 @@ use sha2::{Digest, Sha256};
 
 use crate::artifact::Sha256Digest;
 
-pub const DISPOSABLE_PREPARED_TEMPLATE_SCHEMA_VERSION: u8 = 3;
+pub const DISPOSABLE_PREPARED_TEMPLATE_SCHEMA_VERSION: u8 = 4;
 pub const MAX_DISPOSABLE_PREPARED_TEMPLATE_BYTES: usize = 16_384;
 pub const MAX_DISPOSABLE_LIMA_TEMPLATE_BYTES: usize = 64 * 1_024;
-const IDENTITY_DOMAIN: &[u8] = b"smolrunner.disposable-prepared-template.v3\0";
+const IDENTITY_DOMAIN: &[u8] = b"smolrunner.disposable-prepared-template.v4\0";
 const CURRENT_MANIFEST_BYTES: &[u8] =
     include_bytes!("../examples/lima/smolrunner-prepared-template.json");
 const CURRENT_LIMA_TEMPLATE_BYTES: &[u8] =
@@ -177,6 +177,12 @@ impl DisposablePreparedTemplateManifest {
         &self.wire.isolation.vm_type
     }
 
+    /// Return the one loopback TCP port reserved for Lima's SSH-over-vsock control forwarder.
+    #[must_use]
+    pub const fn ssh_local_port(&self) -> u16 {
+        self.wire.isolation.ssh_local_port
+    }
+
     /// Derive the domain-separated identity of every canonical manifest field.
     ///
     /// # Errors
@@ -323,6 +329,7 @@ struct IsolationWire {
     port_forwards: bool,
     host_resolver: bool,
     dns_servers: Vec<String>,
+    ssh_local_port: u16,
     ssh_over_vsock: bool,
     ssh_load_dot_public_keys: bool,
     ssh_agent_forwarding: bool,
@@ -467,6 +474,7 @@ fn validate_wire(
         || isolation.port_forwards
         || isolation.host_resolver
         || isolation.dns_servers != ["1.1.1.1", "1.0.0.1"]
+        || isolation.ssh_local_port != 61_922
         || !isolation.ssh_over_vsock
         || isolation.ssh_load_dot_public_keys
         || isolation.ssh_agent_forwarding
@@ -569,13 +577,14 @@ mod tests {
     #[test]
     fn checked_in_manifest_is_canonical_pinned_and_domain_bound() {
         let manifest = current_disposable_prepared_template().unwrap();
-        assert_eq!(manifest.schema_version(), 3);
+        assert_eq!(manifest.schema_version(), 4);
         assert_eq!(manifest.actions_runner_version(), "2.336.0");
         assert_eq!(manifest.lima_version(), "2.2.0");
         assert_eq!(manifest.actions_runner_archive_bytes(), 138_824_064);
         assert_eq!(manifest.source_cpu_count(), 2);
         assert_eq!(manifest.source_memory_bytes(), 2 * (1 << 30));
         assert_eq!(manifest.source_disk_bytes(), 20 * (1 << 30));
+        assert_eq!(manifest.ssh_local_port(), 61_922);
         assert_eq!(
             manifest.actions_runner_digest().as_str(),
             "sha256:58b758e420b87093fbd4bfddd368074960053e2f1388f01848c82624b90f27d1"
@@ -586,7 +595,7 @@ mod tests {
         );
         assert_eq!(
             manifest.lima_template_digest().as_str(),
-            "sha256:39b371c566c150d8d2806f351dab08924f654609fcdb785f67762ab8852fb638"
+            "sha256:380eeb0298eb625fb05b1258ef77763334c44309231c983f470ea56cc937d09a"
         );
         assert_eq!(
             manifest.ready_marker_path(),
@@ -601,13 +610,13 @@ mod tests {
         );
         assert_eq!(
             manifest.identity().unwrap().as_str(),
-            "sha256:bb99009dfaf80d20da24c3af05f85320737c6f1cad09fdd651e37f4900f9711a"
+            "sha256:58fe22e97fdaebb2fc9bae1ef535ff73266190bdf713e166fe0834a3b17cda7b"
         );
     }
 
     #[test]
     fn version_precedes_new_fields_and_unknown_or_noncanonical_input_fails_closed() {
-        for version in [1, 2, 4] {
+        for version in [1, 2, 3, 5] {
             let mut value: serde_json::Value =
                 serde_json::from_slice(CURRENT_MANIFEST_BYTES).unwrap();
             value["schema_version"] = serde_json::json!(version);
@@ -666,6 +675,7 @@ mod tests {
             ),
             (&["isolation", "host_mounts"][..], serde_json::json!(true)),
             (&["isolation", "host_resolver"][..], serde_json::json!(true)),
+            (&["isolation", "ssh_local_port"][..], serde_json::json!(22)),
             (
                 &["source_resources", "disk_bytes"][..],
                 serde_json::json!(8 * (1_u64 << 30)),

@@ -1049,7 +1049,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["1.1.1.1", "1.0.0.1"]
         );
-        assert_eq!(production["ssh"]["localPort"].as_u64(), Some(0));
+        assert_eq!(production["ssh"]["localPort"].as_u64(), Some(61_922));
         assert_eq!(production["ssh"]["overVsock"].as_bool(), Some(true));
         let provisions = production["provision"].as_sequence().unwrap();
         assert_eq!(provisions.len(), 1);
