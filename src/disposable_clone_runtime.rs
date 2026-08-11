@@ -568,6 +568,7 @@ impl DisposableCloneRuntime {
         started: &DisposableAttemptCatalogDocument,
         attempt_id: &DisposableAttemptId,
         prepared: &PreparedClone,
+        admission: &impl DisposableCloneAdmissionSource,
         executor: &impl TimedCommandExecutor,
         clock: &impl CloneRuntimeClock,
     ) -> Result<DisposableVmIdentity, DisposableCloneRuntimeError> {
@@ -593,6 +594,11 @@ impl DisposableCloneRuntime {
         if now > attempt.not_after() || now > prepared.admission_expires_at {
             return Err(DisposableCloneRuntimeError::recovery(
                 "clone_expired_before_command",
+            ));
+        }
+        if !admission.host_admission_permitted()? {
+            return Err(DisposableCloneRuntimeError::recovery(
+                "clone_host_admission_lost_after_checkpoint",
             ));
         }
 
@@ -2958,31 +2964,32 @@ mod tests {
         let clone_admission = HostGateAdmission {
             observation_calls: Cell::new(0),
             gate_calls: Cell::new(0),
-            deny_on: 2,
+            deny_on: 3,
         };
         let mut clone_store =
             UnixPersonalWorkerStore::open_or_create_disposable_catalog(clone_root.path()).unwrap();
 
-        let outcome = clone_store
-            .execute_disposable_clone_transaction(
-                &clone_runtime,
-                &clone_attempt_id,
-                &clone_admission,
-                &clone_executor,
-                &FixedClock,
-            )
-            .unwrap();
-        assert!(matches!(
-            outcome,
-            DisposableCloneTransactionOutcome::AdmissionHeld { attempt_id: ref held }
-                if held == clone_attempt_id.as_str()
-        ));
+        let error = match clone_store.execute_disposable_clone_transaction(
+            &clone_runtime,
+            &clone_attempt_id,
+            &clone_admission,
+            &clone_executor,
+            &FixedClock,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("lost post-checkpoint host admission must require recovery"),
+        };
+        assert_eq!(
+            error.kind(),
+            DisposableCloneRuntimeErrorKind::RecoveryRequired
+        );
+        assert_eq!(error.code(), "clone_host_admission_lost_after_checkpoint");
         assert_eq!(clone_admission.observation_calls.get(), 1);
-        assert_eq!(clone_admission.gate_calls.get(), 2);
+        assert_eq!(clone_admission.gate_calls.get(), 3);
         assert_eq!(clone_executor.clone_count(), 0);
         assert_eq!(
             durable_attempt(&clone_root, &clone_attempt_id).phase(),
-            DisposableAttemptPhase::CloneAuthorized
+            DisposableAttemptPhase::CloneStarted
         );
     }
 

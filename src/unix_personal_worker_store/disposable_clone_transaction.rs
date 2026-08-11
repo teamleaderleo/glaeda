@@ -206,7 +206,8 @@ impl UnixPersonalWorkerStore {
         .map_err(|_| DisposableCloneRuntimeError::recovery("clone_checkpoint_publish_ambiguous"))?;
         drop(staged);
 
-        let identity = runtime.execute_locked(&started, attempt_id, &prepared, executor, clock)?;
+        let identity =
+            runtime.execute_locked(&started, attempt_id, &prepared, admission, executor, clock)?;
         let started_attempt_revision = started
             .find_active(attempt_id)
             .ok_or_else(|| DisposableCloneRuntimeError::durable("clone_attempt_missing"))?
