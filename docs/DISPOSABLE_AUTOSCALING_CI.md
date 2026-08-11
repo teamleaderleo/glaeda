@@ -201,6 +201,13 @@ Acceptance: ordinary clone/download/build/test fixtures pass; hostile fixtures c
 
 Add `smolrunner worker serve` under `launchd`: observe demand, reserve bounded capacity, advance attempts, back off transient failures, enforce circuit breakers and operator holds, clean orphans, reconcile after reboot, remove stale runners, and scale to zero. Status must explain current capacity, attempts, blockers, retries, and cleanup debt without exposing secrets.
 
+The enrollment boundary is one canonical, bounded, secret-free document. It binds the private
+state root, Lima program/home/source instance, exact installed bridge digest, GitHub App identity
+and Keychain reference, exact Scale Set/repository/labels, and the single worker's CPU, memory, and
+disk reservation. The App private key remains in Keychain. Decoding delegates to the existing
+bridge, current prepared-template, resource, consumer, clone, and runner constructors so the
+service entry point cannot invent a weaker parallel configuration path.
+
 Acceptance: sleep/wake, controller kill, Mac reboot, network loss, GitHub outage, failed provisioning, stuck job, and failed teardown tests all converge automatically or stop behind a precise durable blocker.
 
 ### M6 — production acceptance and safe optimization
