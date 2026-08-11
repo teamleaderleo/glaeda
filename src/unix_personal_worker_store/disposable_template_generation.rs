@@ -9,7 +9,7 @@ use crate::disposable_template_generation::{
 };
 
 pub(super) const GENERATION_DOCUMENT: &str = "disposable-template-generation.json";
-const STAGED_GENERATION_DOCUMENT: &str = ".disposable-template-generation.next.json";
+pub(super) const STAGED_GENERATION_DOCUMENT: &str = ".disposable-template-generation.next.json";
 pub(crate) const TEMPLATE_INPUT_DOCUMENT: &str = "disposable-template-input-v2.yaml";
 const STAGED_TEMPLATE_INPUT_DOCUMENT: &str = ".disposable-template-input-v2.next.yaml";
 

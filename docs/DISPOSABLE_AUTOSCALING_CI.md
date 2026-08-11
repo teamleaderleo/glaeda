@@ -291,6 +291,13 @@ step paced by the normal idle delay, not a failure that can open the supervisor 
 Process-lifetime control remains delegated to `launchd`; this marker is not a second service
 supervisor.
 
+`worker service-status --store-root <absolute-root>` is the bounded read-only operational view. It
+uses one shared canonical-store lock and reports controller ownership, admission state, current
+catalog/inbox revisions, active attempt phases and binding presence, retained replay history,
+pending Scale Set reconciliation, and fixed recovery/blocker codes. It does not recover a staged
+publication, contact GitHub, inspect Lima, acquire credentials, or reveal private filesystem and
+Scale Set evidence.
+
 Acceptance: sleep/wake, controller kill, Mac reboot, network loss, GitHub outage, failed provisioning, stuck job, and failed teardown tests all converge automatically or stop behind a precise durable blocker.
 
 ### M6 — production acceptance and safe optimization

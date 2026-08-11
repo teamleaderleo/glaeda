@@ -26,6 +26,11 @@ mod disposable_attempt_catalog;
 mod disposable_cleanup_transaction;
 /// Same-lock clone checkpoint, execution, and identity publication.
 mod disposable_clone_transaction;
+/// Read-only bounded operator status for the disposable-worker service.
+mod disposable_worker_status;
+pub use disposable_worker_status::{
+    DisposableWorkerAttemptStatus, DisposableWorkerOperationalState, DisposableWorkerServiceStatus,
+};
 /// Same-lock JIT registration, no-replay checkpoint, and one-job runner execution.
 mod disposable_runner_transaction;
 pub(crate) use disposable_runner_transaction::DisposableRunnerTransactionOutcome;

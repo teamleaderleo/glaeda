@@ -167,6 +167,12 @@ enum WorkerCommand {
         #[arg(long)]
         store_root: PathBuf,
     },
+    /// Read one bounded durable status report for the disposable-worker service.
+    ServiceStatus {
+        /// Explicit absolute normalized disposable-worker state root.
+        #[arg(long)]
+        store_root: PathBuf,
+    },
     /// Inspect or change the admission hold for disposable workers.
     Admission {
         #[command(subcommand)]
@@ -358,6 +364,9 @@ fn main() -> ExitCode {
         },
         Command::Worker { command } => match command {
             WorkerCommand::Status { store_root } => run_worker_status(cli.output, &store_root),
+            WorkerCommand::ServiceStatus { store_root } => {
+                run_disposable_worker_service_status(cli.output, &store_root)
+            }
             WorkerCommand::Admission { command } => match command {
                 WorkerAdmissionCommand::Status { store_root } => {
                     run_worker_admission(cli.output, &store_root, None)
@@ -481,6 +490,91 @@ fn run_worker_status(output: OutputFormat, store_root: &Path) -> ExitCode {
         }
     }
     ExitCode::SUCCESS
+}
+
+#[cfg(unix)]
+fn run_disposable_worker_service_status(output: OutputFormat, store_root: &Path) -> ExitCode {
+    if !explicit_normalized_absolute_path(store_root) {
+        return emit_runtime_error(
+            output,
+            "disposable_worker_status",
+            "disposable worker state root must be an explicit absolute normalized path".to_owned(),
+        );
+    }
+    let store = match UnixPersonalWorkerStore::open_existing_read_only(store_root) {
+        Ok(store) => store,
+        Err(_) => {
+            return emit_runtime_error(
+                output,
+                "disposable_worker_status",
+                "disposable worker service status is unavailable".to_owned(),
+            );
+        }
+    };
+    let status = match store.inspect_disposable_worker_service_status() {
+        Ok(status) => status,
+        Err(_) => {
+            return emit_runtime_error(
+                output,
+                "disposable_worker_status",
+                "disposable worker service status is unavailable".to_owned(),
+            );
+        }
+    };
+    match output {
+        OutputFormat::Json => {
+            if print_json(&status).is_err() {
+                return ExitCode::from(2);
+            }
+        }
+        OutputFormat::Human => {
+            println!("disposable worker service: {:?}", status.state());
+            println!(
+                "controller={}, admission={}, catalog_revision={}, inbox_revision={}, active_attempts={}, retained_tombstones={}",
+                if status.controller_running() {
+                    "running"
+                } else {
+                    "stopped"
+                },
+                if status.admission_held() {
+                    "held"
+                } else {
+                    "open"
+                },
+                status
+                    .catalog_revision()
+                    .map_or_else(|| "missing".to_owned(), |value| value.to_string()),
+                status
+                    .inbox_revision()
+                    .map_or_else(|| "missing".to_owned(), |value| value.to_string()),
+                status.active_attempts().len(),
+                status.retained_tombstones(),
+            );
+            for attempt in status.active_attempts() {
+                println!(
+                    "attempt {}: phase={:?}, vm_bound={}, runner_bound={}, job_bound={}",
+                    attempt.attempt_id(),
+                    attempt.phase(),
+                    attempt.vm_bound(),
+                    attempt.runner_bound(),
+                    attempt.job_bound(),
+                );
+            }
+            for blocker in status.blockers() {
+                println!("blocker: {blocker}");
+            }
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+#[cfg(not(unix))]
+fn run_disposable_worker_service_status(output: OutputFormat, _store_root: &Path) -> ExitCode {
+    emit_runtime_error(
+        output,
+        "disposable_worker_status_unsupported",
+        "disposable worker status requires a Unix host".to_owned(),
+    )
 }
 
 #[cfg(unix)]
@@ -1317,7 +1411,7 @@ mod tests {
 
     use super::{
         Cli, Command, HostCommand, JobCommand, OutputFormat, QueueCommand, WorkerAdmissionCommand,
-        WorkerCommand, run_worker_admission,
+        WorkerCommand, run_disposable_worker_service_status, run_worker_admission,
     };
     #[cfg(target_os = "linux")]
     use super::{HostPreparePhaseKind, classify_host_prepare_actions};
@@ -1397,6 +1491,22 @@ mod tests {
             panic!("expected worker status command");
         };
         assert_eq!(store_root, PathBuf::from("/tmp/worker-state"));
+
+        let service_status = Cli::try_parse_from([
+            "smolrunner",
+            "worker",
+            "service-status",
+            "--store-root",
+            "/tmp/disposable-state",
+        ])
+        .expect("parse disposable service status");
+        let Command::Worker {
+            command: WorkerCommand::ServiceStatus { store_root },
+        } = service_status.command
+        else {
+            panic!("expected disposable service status command");
+        };
+        assert_eq!(store_root, PathBuf::from("/tmp/disposable-state"));
 
         let admission = Cli::try_parse_from([
             "smolrunner",
@@ -1560,6 +1670,10 @@ mod tests {
                 .inspect_disposable_worker_admission()
                 .unwrap()
                 .admission_held()
+        );
+        assert_eq!(
+            run_disposable_worker_service_status(OutputFormat::Json, &root.0),
+            std::process::ExitCode::SUCCESS
         );
     }
 

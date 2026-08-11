@@ -13,8 +13,8 @@ use crate::github_scale_set_inbox::{
     encode_scale_set_inbox,
 };
 
-const INBOX_DOCUMENT: &str = "github-scale-set-inbox.json";
-const STAGED_INBOX_DOCUMENT: &str = ".github-scale-set-inbox.next.json";
+pub(super) const INBOX_DOCUMENT: &str = "github-scale-set-inbox.json";
+pub(super) const STAGED_INBOX_DOCUMENT: &str = ".github-scale-set-inbox.next.json";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecoveryPlan {
@@ -652,7 +652,7 @@ impl UnixPersonalWorkerStore {
         Ok(Ok((next_inbox, next_catalog, output)))
     }
 
-    fn load_scale_set_inbox_named(
+    pub(super) fn load_scale_set_inbox_named(
         &self,
         name: &str,
     ) -> Result<Option<ScaleSetInboxDocument>, ScaleSetInboxError> {
