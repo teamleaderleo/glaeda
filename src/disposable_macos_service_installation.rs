@@ -19,8 +19,12 @@ use crate::disposable_network_gate_activation::{
     DISPOSABLE_NETWORK_PF_CONFIGURATION_PATH, plan_disposable_network_gate_activation,
 };
 use crate::disposable_worker_enrollment::decode_disposable_worker_enrollment;
-use crate::journal::RollbackClass;
-use crate::state::InstallationId;
+use crate::journal::{
+    ActionOutcome, ExecutionJournal, ExecutionLane, JOURNAL_SCHEMA_VERSION, JournalRecord,
+    PlannedMutation, Preconditions, RollbackClass,
+};
+use crate::journal_document::JournalStateDocument;
+use crate::state::{InstallationId, JournalId};
 
 pub const DISPOSABLE_MACOS_SERVICE_INSTALLATION_SCHEMA_VERSION: u8 = 1;
 pub const DISPOSABLE_MACOS_SERVICE_ACCOUNT: &str = "_smolrunner";
@@ -201,6 +205,85 @@ impl DisposableMacosServicePlan {
     #[must_use]
     pub const fn report(&self) -> &DisposableMacosServicePlanReport {
         &self.report
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    #[allow(
+        dead_code,
+        reason = "consumed by the in-progress production apply boundary"
+    )]
+    pub(crate) fn initial_journal_document(&self) -> JournalStateDocument {
+        let plan_identity = self.report.plan_identity().as_str();
+        let journal_id = JournalId::parse(&format!(
+            "macos-service-{}",
+            plan_identity
+                .strip_prefix("sha256:")
+                .expect("plan identity is a canonical SHA-256 digest")
+        ))
+        .expect("derived lifecycle journal ID is canonical");
+        let records = self
+            .report
+            .actions()
+            .iter()
+            .enumerate()
+            .map(|(index, action)| JournalRecord {
+                action: PlannedMutation::new(
+                    action_id(action.kind()),
+                    ExecutionLane::Root,
+                    action.summary(),
+                    action.rollback(),
+                    Preconditions::new([
+                        format!("installation={}", self.report.installation_id().as_str()),
+                        format!("plan={plan_identity}"),
+                    ]),
+                ),
+                outcome: if index == 0 {
+                    ActionOutcome::Completed
+                } else {
+                    ActionOutcome::Pending
+                },
+                message: if index == 0 {
+                    Some("exact lifecycle journal published".to_owned())
+                } else {
+                    None
+                },
+            })
+            .collect();
+        JournalStateDocument::new(
+            self.report.installation_id().clone(),
+            journal_id,
+            ExecutionJournal {
+                schema_version: JOURNAL_SCHEMA_VERSION,
+                records,
+                stopped_after: None,
+            },
+        )
+        .expect("fixed production lifecycle journal is valid")
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "consumed by the in-progress production apply boundary"
+)]
+const fn action_id(kind: DisposableMacosServiceActionKind) -> &'static str {
+    match kind {
+        DisposableMacosServiceActionKind::BeginLifecycle => "begin-lifecycle",
+        DisposableMacosServiceActionKind::EnsureServiceAccount => "ensure-service-account",
+        DisposableMacosServiceActionKind::PublishExecutables => "publish-executables",
+        DisposableMacosServiceActionKind::PublishEnrollment => "publish-enrollment",
+        DisposableMacosServiceActionKind::PublishNetworkPolicy => "publish-network-policy",
+        DisposableMacosServiceActionKind::PublishLaunchDaemons => "publish-launch-daemons",
+        DisposableMacosServiceActionKind::StartNetworkGate => "start-network-gate",
+        DisposableMacosServiceActionKind::StartWorkerService => "start-worker-service",
+        DisposableMacosServiceActionKind::StopWorkerService => "stop-worker-service",
+        DisposableMacosServiceActionKind::RemoveWorkerService => "remove-worker-service",
+        DisposableMacosServiceActionKind::StopNetworkGate => "stop-network-gate",
+        DisposableMacosServiceActionKind::RemoveNetworkPolicy => "remove-network-policy",
+        DisposableMacosServiceActionKind::RemoveEnrollment => "remove-enrollment",
+        DisposableMacosServiceActionKind::RemoveExecutables => "remove-executables",
+        DisposableMacosServiceActionKind::RemoveServiceAccount => "remove-service-account",
+        DisposableMacosServiceActionKind::CompleteLifecycle => "complete-lifecycle",
     }
 }
 
@@ -891,6 +974,24 @@ mod tests {
         assert!(ownership.contains(DIGEST_B));
         assert!(!ownership.contains("acme-ci"));
         assert!(!ownership.contains("Iv1."));
+
+        let journal = plan.initial_journal_document();
+        assert_eq!(journal.installation_id(), &installation_id());
+        assert_eq!(journal.journal().records.len(), 9);
+        assert_eq!(
+            journal.journal().records[0].outcome,
+            ActionOutcome::Completed
+        );
+        assert!(
+            journal.journal().records[1..]
+                .iter()
+                .all(|record| record.outcome == ActionOutcome::Pending)
+        );
+        let encoded = crate::journal_document::encode_journal_document(&journal).unwrap();
+        assert_eq!(
+            crate::journal_document::decode_journal_document(&encoded).unwrap(),
+            journal
+        );
     }
 
     #[test]
