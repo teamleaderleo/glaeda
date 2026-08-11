@@ -359,7 +359,7 @@ mod tests {
 
     const DIGEST: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const NETWORK_DIGEST: &str =
-        "sha256:a6eb142b9051c724543c342f9631c79b2f829bb34709dcee84191be237b7fa9b";
+        "sha256:65ceec8974086e378f216acc555724cb40b08ccc047391dedd0b6f17df72587e";
 
     fn canonical_document() -> Vec<u8> {
         canonical_bytes(&EnrollmentWire {
