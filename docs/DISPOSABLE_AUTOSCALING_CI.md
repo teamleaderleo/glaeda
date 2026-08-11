@@ -274,8 +274,22 @@ event handling, teardown, capacity release, and retirement continue even when th
 refused or needs rebuilding, so a broken source cannot strand an existing hostile worker. The
 single supervisor retry/circuit policy drives template maintenance and the production clock,
 bounded executor, clone/runner runtimes, and durable coordinator without exposing a second command
-path. The service remains deliberately unreachable from the CLI until operator holds, bounded
-status output, and the launchd installation/removal contract are present.
+path. `worker serve --enrollment <absolute-canonical-document>` is now the sole production entry
+point; it boundedly loads the existing secret-free enrollment and then enters that supervisor.
+The enrollment must be an owner-matched mode-0600 single-link regular file beneath an
+owner-matched non-writable directory path; startup opens the path without following links and
+requires stable descriptor, pathname, metadata, and bytes before accepting its authority.
+The launchd installation/removal contract and comprehensive bounded status remain incomplete.
+
+The first operator-control surface is deliberately small: a private empty marker under the
+canonical store lock represents an admission hold. `worker admission hold` makes every demand poll
+advertise zero capacity and vetoes both clone authorization and the final clone command before any
+executor call. It does not pause lifecycle polling, job-result observation, VM destruction, stale
+runner removal, capacity release, or recovery. `worker admission status` and `resume` use the same
+versioned typed report for human and JSON output. A held idle poll is a successful advisory service
+step paced by the normal idle delay, not a failure that can open the supervisor circuit.
+Process-lifetime control remains delegated to `launchd`; this marker is not a second service
+supervisor.
 
 Acceptance: sleep/wake, controller kill, Mac reboot, network loss, GitHub outage, failed provisioning, stuck job, and failed teardown tests all converge automatically or stop behind a precise durable blocker.
 

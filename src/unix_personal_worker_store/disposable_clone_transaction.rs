@@ -42,11 +42,27 @@ impl UnixPersonalWorkerStore {
             .map_err(|_| DisposableCloneRuntimeError::recovery("clone_worker_recovery_required"))?;
         self.recover_catalog_locked()
             .map_err(|_| DisposableCloneRuntimeError::recovery("clone_catalog_recovery_failed"))?;
+        let admission_held = self
+            .disposable_worker_admission_held_locked()
+            .map_err(|_| DisposableCloneRuntimeError::durable("clone_operator_hold_unavailable"))?;
 
         let current = self
             .load_catalog_named(super::disposable_attempt_catalog::CATALOG_DOCUMENT)
             .map_err(|_| DisposableCloneRuntimeError::durable("clone_catalog_unavailable"))?
             .ok_or_else(|| DisposableCloneRuntimeError::durable("clone_catalog_missing"))?;
+        if admission_held {
+            let reservation = current
+                .find_active(attempt_id)
+                .ok_or_else(|| DisposableCloneRuntimeError::durable("clone_attempt_missing"))?;
+            let observation = admission.observe(&current, reservation);
+            if let Some(outcome) = self.persist_pending_clone_scale_set_message(admission)? {
+                return Ok(outcome);
+            }
+            observation?;
+            return Ok(DisposableCloneTransactionOutcome::AdmissionHeld {
+                attempt_id: attempt_id.as_str().to_owned(),
+            });
+        }
         let authorization =
             runtime.authorize_locked(&current, attempt_id, admission, executor, clock);
         if let Some(outcome) = self.persist_pending_clone_scale_set_message(admission)? {
@@ -117,11 +133,27 @@ impl UnixPersonalWorkerStore {
             .map_err(|_| DisposableCloneRuntimeError::recovery("clone_worker_recovery_required"))?;
         self.recover_catalog_locked()
             .map_err(|_| DisposableCloneRuntimeError::recovery("clone_catalog_recovery_failed"))?;
+        let admission_held = self
+            .disposable_worker_admission_held_locked()
+            .map_err(|_| DisposableCloneRuntimeError::durable("clone_operator_hold_unavailable"))?;
 
         let current = self
             .load_catalog_named(super::disposable_attempt_catalog::CATALOG_DOCUMENT)
             .map_err(|_| DisposableCloneRuntimeError::durable("clone_catalog_unavailable"))?
             .ok_or_else(|| DisposableCloneRuntimeError::durable("clone_catalog_missing"))?;
+        if admission_held {
+            let reservation = current
+                .find_active(attempt_id)
+                .ok_or_else(|| DisposableCloneRuntimeError::durable("clone_attempt_missing"))?;
+            let observation = admission.observe(&current, reservation);
+            if let Some(outcome) = self.persist_pending_clone_scale_set_message(admission)? {
+                return Ok(outcome);
+            }
+            observation?;
+            return Ok(DisposableCloneTransactionOutcome::AdmissionHeld {
+                attempt_id: attempt_id.as_str().to_owned(),
+            });
+        }
         let generation = self
             .load_template_generation_named(
                 super::disposable_template_generation::GENERATION_DOCUMENT,

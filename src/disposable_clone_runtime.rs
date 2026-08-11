@@ -238,6 +238,9 @@ pub struct DisposableCloneRuntimeReceipt {
 }
 
 pub(crate) enum DisposableCloneTransactionOutcome {
+    AdmissionHeld {
+        attempt_id: String,
+    },
     CloneAuthorized {
         attempt_id: String,
     },
@@ -381,6 +384,9 @@ impl DisposableCloneRuntime {
             .execute_disposable_clone_transaction(self, attempt_id, admission, executor, clock)?
         {
             DisposableCloneTransactionOutcome::Completed(receipt) => Ok(receipt),
+            DisposableCloneTransactionOutcome::AdmissionHeld { .. } => Err(
+                DisposableCloneRuntimeError::recovery("clone_admission_held"),
+            ),
             DisposableCloneTransactionOutcome::CloneAuthorized { .. } => Err(
                 DisposableCloneRuntimeError::recovery("clone_authorization_only"),
             ),
@@ -2505,7 +2511,83 @@ mod tests {
     }
 
     #[test]
-    fn live_message_preempts_reserved_attempt_authorization() {
+    fn operator_hold_blocks_authorization_and_clone_before_any_executor_call() {
+        let root = TempRoot::new("operator-hold-authorize");
+        let host = LimaHostIdentityFixture::new_with_disk_bytes(
+            "clone-runtime-operator-hold-authorize",
+            SOURCE,
+            SOURCE_DISK,
+        );
+        let authorization_runtime = runtime(&root, &host);
+        let attempt_id = install_reserved_attempt(&root);
+        let authorization_executor = executor(&host, false);
+        let admission = FakeAdmission::available();
+        let mut store =
+            UnixPersonalWorkerStore::open_or_create_disposable_catalog(root.path()).unwrap();
+        store.set_disposable_worker_admission_hold(true).unwrap();
+
+        let outcome = store
+            .authorize_disposable_clone_transaction(
+                &authorization_runtime,
+                &attempt_id,
+                &admission,
+                &authorization_executor,
+                &FixedClock,
+            )
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            DisposableCloneTransactionOutcome::AdmissionHeld { attempt_id: ref held }
+                if held == attempt_id.as_str()
+        ));
+        assert_eq!(admission.calls.get(), 1);
+        assert_eq!(authorization_executor.clone_count(), 0);
+        assert_eq!(
+            durable_attempt(&root, &attempt_id).phase(),
+            DisposableAttemptPhase::Reserved
+        );
+
+        let clone_root = TempRoot::new("operator-hold-clone");
+        let clone_host = LimaHostIdentityFixture::new_with_disk_bytes(
+            "clone-runtime-operator-hold-clone",
+            SOURCE,
+            SOURCE_DISK,
+        );
+        let clone_runtime = runtime(&clone_root, &clone_host);
+        install_ready_generation(&clone_root, &clone_host, &clone_runtime);
+        let clone_attempt_id = install_authorized_attempt(&clone_root);
+        let clone_executor = executor(&clone_host, false);
+        let clone_admission = FakeAdmission::available();
+        let mut clone_store =
+            UnixPersonalWorkerStore::open_or_create_disposable_catalog(clone_root.path()).unwrap();
+        clone_store
+            .set_disposable_worker_admission_hold(true)
+            .unwrap();
+
+        let outcome = clone_store
+            .execute_disposable_clone_transaction(
+                &clone_runtime,
+                &clone_attempt_id,
+                &clone_admission,
+                &clone_executor,
+                &FixedClock,
+            )
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            DisposableCloneTransactionOutcome::AdmissionHeld { attempt_id: ref held }
+                if held == clone_attempt_id.as_str()
+        ));
+        assert_eq!(clone_admission.calls.get(), 1);
+        assert_eq!(clone_executor.clone_count(), 0);
+        assert_eq!(
+            durable_attempt(&clone_root, &clone_attempt_id).phase(),
+            DisposableAttemptPhase::CloneAuthorized
+        );
+    }
+
+    #[test]
+    fn operator_hold_still_persists_live_message_before_refusing_authorization() {
         let root = TempRoot::new("authorize-message");
         let host = LimaHostIdentityFixture::new_with_disk_bytes(
             "clone-runtime-authorize-message",
@@ -2517,6 +2599,7 @@ mod tests {
             ScaleSetBridgeIdentity::parse(&format!("sha256:{}", "45".repeat(32))).unwrap();
         let mut store = initialize_scale_set_control(&root, &identity);
         let attempt_id = install_reserved_attempt(&root);
+        store.set_disposable_worker_admission_hold(true).unwrap();
         let executor = executor(&host, false);
         let mut bridge = MessageBridge {
             response: RefCell::new(Some(ScaleSetBridgePoll::Message {

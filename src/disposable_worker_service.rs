@@ -25,7 +25,7 @@ use crate::github_scale_set_service::{
 };
 use crate::github_scale_set_supervisor::{
     ScaleSetSupervisor, ScaleSetSupervisorEvent, ScaleSetSupervisorEventSink,
-    ScaleSetSupervisorExit, ScaleSetSupervisorPolicy, ThreadScaleSetSupervisorWait,
+    ScaleSetSupervisorPolicy, ThreadScaleSetSupervisorWait,
 };
 use crate::lima_observation::LimaObservationClock;
 use crate::personal_worker_store::PersonalWorkerStoreErrorKind;
@@ -35,14 +35,14 @@ use crate::unix_personal_worker_store::UnixPersonalWorkerStore;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum DisposableWorkerServiceErrorKind {
+pub enum DisposableWorkerServiceErrorKind {
     DurableState,
     Bridge,
     Supervisor,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize)]
-pub(crate) struct DisposableWorkerServiceError {
+pub struct DisposableWorkerServiceError {
     kind: DisposableWorkerServiceErrorKind,
     code: &'static str,
 }
@@ -52,7 +52,7 @@ impl DisposableWorkerServiceError {
         Self { kind, code }
     }
 
-    pub(crate) const fn code(self) -> &'static str {
+    pub const fn code(self) -> &'static str {
         self.code
     }
 }
@@ -105,6 +105,12 @@ fn prepare_durable_service(
                 },
             )
         })?;
+    store.inspect_disposable_worker_admission().map_err(|_| {
+        DisposableWorkerServiceError::new(
+            DisposableWorkerServiceErrorKind::DurableState,
+            "disposable_worker_admission_state_unavailable",
+        )
+    })?;
     let mut catalog = DisposableAttemptCatalog::new(store);
     catalog.initialize().map_err(|_| {
         DisposableWorkerServiceError::new(
@@ -174,9 +180,9 @@ fn recover_disposable_documents(
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) fn serve_disposable_worker(
+pub fn serve_disposable_worker(
     enrollment: DisposableWorkerEnrollment,
-) -> Result<ScaleSetSupervisorExit, DisposableWorkerServiceError> {
+) -> Result<(), DisposableWorkerServiceError> {
     // Complete all local durable recovery before acquiring or handing the App key to a child.
     let prepared = prepare_durable_service(enrollment)?;
     let executor = ProcessExecutor;
@@ -215,6 +221,7 @@ pub(crate) fn serve_disposable_worker(
             &executor,
             &clock,
         )
+        .map(|_exit| ())
         .map_err(|error| {
             DisposableWorkerServiceError::new(
                 DisposableWorkerServiceErrorKind::Supervisor,
@@ -428,6 +435,29 @@ mod tests {
         assert_eq!(error.code(), "disposable_worker_catalog_unavailable");
         assert!(!directory.join("disposable-attempt-catalog.json").exists());
         assert!(directory.join("github-scale-set-inbox.json").exists());
+    }
+
+    #[test]
+    fn unsafe_admission_marker_blocks_startup_before_bridge_authority() {
+        let root = TempRoot::new();
+        drop(prepare_durable_service(enrollment(&root.0)).unwrap());
+        let mut store =
+            UnixPersonalWorkerStore::open_or_create_disposable_catalog(&root.0).unwrap();
+        store.set_disposable_worker_admission_hold(true).unwrap();
+        drop(store);
+        let marker = root
+            .0
+            .join("personal-worker/disposable-worker-admission.hold");
+        fs::set_permissions(&marker, fs::Permissions::from_mode(0o640)).unwrap();
+
+        let error = match prepare_durable_service(enrollment(&root.0)) {
+            Ok(_) => panic!("unsafe admission marker unexpectedly reached service startup"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.code(),
+            "disposable_worker_admission_state_unavailable"
+        );
     }
 
     #[test]

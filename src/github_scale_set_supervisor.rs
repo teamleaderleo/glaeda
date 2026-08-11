@@ -259,6 +259,7 @@ where
                     disposition,
                     ScaleSetServiceDisposition::Idle(_)
                         | ScaleSetServiceDisposition::IdleObservationRecorded { .. }
+                        | ScaleSetServiceDisposition::AdmissionHeld { .. }
                 ) {
                     immediate_steps = 0;
                     policy.idle_delay
@@ -439,6 +440,42 @@ mod tests {
                 ScaleSetSupervisorEvent::Stopped,
             ] if *next_delay == Duration::from_millis(10)
         ));
+    }
+
+    #[test]
+    fn admission_hold_uses_idle_pacing_without_opening_the_failure_circuit() {
+        let mut results = VecDeque::from_iter((0..6).map(|_| {
+            Ok(ScaleSetServiceDisposition::AdmissionHeld {
+                attempt_id: "attempt-held".to_owned(),
+            })
+        }));
+        let mut wait = FakeWait {
+            signals: VecDeque::from([
+                Ok(ScaleSetSupervisorSignal::Continue),
+                Ok(ScaleSetSupervisorSignal::Continue),
+                Ok(ScaleSetSupervisorSignal::Continue),
+                Ok(ScaleSetSupervisorSignal::Continue),
+                Ok(ScaleSetSupervisorSignal::Continue),
+                Ok(ScaleSetSupervisorSignal::Stop),
+            ]),
+            delays: Vec::new(),
+        };
+        let mut events = Events::default();
+
+        run_supervisor_loop(
+            || results.pop_front().expect("bounded held-step fixture"),
+            policy(),
+            &mut wait,
+            &mut events,
+        )
+        .unwrap();
+
+        assert_eq!(wait.delays, [Duration::from_millis(10); 6]);
+        assert!(!events.0.iter().any(|event| matches!(
+            event,
+            ScaleSetSupervisorEvent::RetryScheduled { .. }
+                | ScaleSetSupervisorEvent::CircuitOpen { .. }
+        )));
     }
 
     #[test]

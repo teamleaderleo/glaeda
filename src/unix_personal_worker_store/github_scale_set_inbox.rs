@@ -181,7 +181,10 @@ impl UnixPersonalWorkerStore {
             .map_err(map_catalog_error)?
             .ok_or_else(|| ScaleSetInboxError::new("inbox_catalog_missing"))?;
         let usage = catalog.host_usage().map_err(map_catalog_error)?;
-        let available_capacity = u16::from(usage.workers() == 0);
+        let admission_held = self
+            .disposable_worker_admission_held_locked()
+            .map_err(map_store_error)?;
+        let available_capacity = u16::from(usage.workers() == 0 && !admission_held);
         let (response, observed_at, not_after) = match poll(available_capacity) {
             Ok(response) => response,
             Err(error) => return Ok(Err(error)),
@@ -530,6 +533,7 @@ impl UnixPersonalWorkerStore {
             u32,
             &PendingScaleSetMessage,
             &DisposableAttemptCatalogDocument,
+            bool,
         ) -> Result<Vec<u64>, E>,
     ) -> Result<Result<ScaleSetInboxDocument, E>, ScaleSetInboxError> {
         let _lock = self.acquire_mutation_lock().map_err(map_store_error)?;
@@ -560,12 +564,16 @@ impl UnixPersonalWorkerStore {
             })
             .ok_or_else(|| ScaleSetInboxError::new("inbox_ack_refused"))?;
         let message_id = pending.message_id();
+        let admission_held = self
+            .disposable_worker_admission_held_locked()
+            .map_err(map_store_error)?;
         let started = inbox.begin_ack(message_id)?;
         let mut staged = self.stage_scale_set_inbox(&started)?;
         self.publish_named_staged(&mut staged, INBOX_DOCUMENT, false)
             .map_err(map_store_error)?;
 
-        let acquired_request_ids = match acknowledge(message_id, pending, &catalog) {
+        let acquired_request_ids = match acknowledge(message_id, pending, &catalog, admission_held)
+        {
             Ok(acquired) => acquired,
             Err(error) => return Ok(Err(error)),
         };
@@ -1034,6 +1042,38 @@ mod tests {
     }
 
     #[test]
+    fn admission_hold_advertises_zero_capacity_without_blocking_polling() {
+        let root = TempRoot::new("admission-hold-capacity");
+        let mut store = initialized_store(&root);
+        let identity = source_identity();
+        store.initialize_scale_set_inbox(&identity).unwrap();
+        store.set_disposable_worker_admission_hold(true).unwrap();
+
+        let (response, attempt_id) = store
+            .poll_and_record_scale_set(&identity, |available_capacity| {
+                assert_eq!(available_capacity, 0);
+                Ok::<_, ()>((
+                    ScaleSetBridgePoll::Idle {
+                        statistics: statistics(),
+                    },
+                    EpochMillis::new(100_000).unwrap(),
+                    EpochMillis::new(120_000).unwrap(),
+                ))
+            })
+            .unwrap()
+            .unwrap();
+
+        assert!(matches!(response, ScaleSetBridgePoll::Idle { .. }));
+        assert!(attempt_id.is_none());
+        assert!(
+            store
+                .inspect_disposable_worker_admission()
+                .unwrap()
+                .admission_held()
+        );
+    }
+
+    #[test]
     fn inbox_initialization_and_successors_are_durable() {
         let root = TempRoot::new("successors");
         let mut store = initialized_store(&root);
@@ -1321,7 +1361,7 @@ mod tests {
                 &identity,
                 applied.revision(),
                 applied_catalog.revision(),
-                |message_id, _, _| {
+                |message_id, _, _, _| {
                     assert_eq!(message_id, 7);
                     let checkpoint =
                         decode_scale_set_inbox(&std::fs::read(&path).unwrap()).unwrap();
@@ -1367,7 +1407,7 @@ mod tests {
                 &identity,
                 second.revision(),
                 acquired_catalog.revision(),
-                |_, _, _| Err::<Vec<u64>, _>("bridge-failed"),
+                |_, _, _, _| Err::<Vec<u64>, _>("bridge-failed"),
             )
             .unwrap();
         assert_eq!(failed.unwrap_err(), "bridge-failed");
@@ -1422,7 +1462,7 @@ mod tests {
                 &identity,
                 applied.revision(),
                 applied_catalog.revision(),
-                |_, _, _| Ok::<_, ()>(Vec::new()),
+                |_, _, _, _| Ok::<_, ()>(Vec::new()),
             )
             .unwrap()
             .unwrap();
@@ -1501,7 +1541,7 @@ mod tests {
                 &identity,
                 applied.revision(),
                 reserved.revision(),
-                |_, _, _| Ok::<_, ()>(vec![41]),
+                |_, _, _, _| Ok::<_, ()>(vec![41]),
             )
             .unwrap()
             .unwrap();
@@ -1585,7 +1625,7 @@ mod tests {
                 &identity,
                 applied.revision(),
                 reserved.revision(),
-                |_, _, _| Ok::<_, ()>(vec![41]),
+                |_, _, _, _| Ok::<_, ()>(vec![41]),
             )
             .unwrap()
             .unwrap();

@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use rustix::fs::{self, AtFlags, FileType, FlockOperation, Mode, OFlags, RenameFlags};
 use rustix::io::Errno;
+use serde::Serialize;
 
 use crate::personal_worker_store::{
     MAX_PERSONAL_WORKER_STORE_BYTES, PersonalWorkerStore, PersonalWorkerStoreDocument,
@@ -60,6 +61,7 @@ const PRIVATE_FILE_MODE: Mode = Mode::RUSR.union(Mode::WUSR);
 pub(crate) const STORE_DIRECTORY: &str = "personal-worker";
 const STORE_LOCK_FILE: &str = "store.lock";
 const DISPOSABLE_WORKER_SERVICE_LOCK_FILE: &str = "disposable-worker-service.lock";
+const DISPOSABLE_WORKER_ADMISSION_HOLD_FILE: &str = "disposable-worker-admission.hold";
 const CURRENT_DOCUMENT: &str = "current.json";
 const STAGED_DOCUMENT: &str = ".next.json";
 static NEXT_INITIALIZATION_STAGE: AtomicU64 = AtomicU64::new(1);
@@ -69,6 +71,23 @@ pub struct UnixPersonalWorkerStore {
     _root: OwnedFd,
     directory: OwnedFd,
     owner: (u32, u32),
+}
+
+/// Bounded operator control state for disposable-worker admission.
+///
+/// The marker only vetoes new worker creation. Existing job observation, runner cleanup, VM
+/// destruction, capacity release, and recovery continue while the hold is active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct DisposableWorkerAdmissionStatus {
+    schema_version: u8,
+    admission_held: bool,
+}
+
+impl DisposableWorkerAdmissionStatus {
+    #[must_use]
+    pub const fn admission_held(self) -> bool {
+        self.admission_held
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -375,6 +394,192 @@ impl UnixPersonalWorkerStore {
                 "could not acquire the disposable worker service lock",
             )),
         }
+    }
+
+    /// Read the exact current admission hold without creating or recovering durable job state.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded store error when the canonical lock is busy or the fixed marker path is
+    /// missing from its required private-file policy.
+    pub fn inspect_disposable_worker_admission(
+        &self,
+    ) -> Result<DisposableWorkerAdmissionStatus, PersonalWorkerStoreError> {
+        let _lock = self.acquire_read_lock()?;
+        Ok(DisposableWorkerAdmissionStatus {
+            schema_version: 1,
+            admission_held: self.disposable_worker_admission_held_locked()?,
+        })
+    }
+
+    /// Enable or clear the durable admission hold under the canonical store lock.
+    ///
+    /// This operation never changes an attempt, runner, VM, template, or GitHub object. Enabling
+    /// the hold is idempotent and immediately closes advertised capacity; clearing it only removes
+    /// that veto and leaves every other recovery and admission check in force.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded store error when the lock is busy or the fixed marker cannot be safely
+    /// created, inspected, removed, or synchronized.
+    pub fn set_disposable_worker_admission_hold(
+        &mut self,
+        held: bool,
+    ) -> Result<DisposableWorkerAdmissionStatus, PersonalWorkerStoreError> {
+        let _lock = self.acquire_mutation_lock()?;
+        synchronize_directory(&self.directory, "personal worker store directory")?;
+        let current = self.open_disposable_worker_admission_hold_locked()?;
+        if current.is_some() == held {
+            if let Some(file) = current.as_ref() {
+                self.confirm_disposable_worker_admission_hold_locked(file)?;
+            }
+            return Ok(DisposableWorkerAdmissionStatus {
+                schema_version: 1,
+                admission_held: held,
+            });
+        }
+        if held {
+            let file = fs::openat(
+                &self.directory,
+                DISPOSABLE_WORKER_ADMISSION_HOLD_FILE,
+                NEW_FILE_FLAGS,
+                PRIVATE_FILE_MODE,
+            )
+            .map_err(map_document_open_error)?;
+            fs::fchmod(&file, PRIVATE_FILE_MODE).map_err(|_| {
+                store_error(
+                    PersonalWorkerStoreErrorKind::Io,
+                    "could not set private disposable-worker hold permissions",
+                )
+            })?;
+            inspect_private_file(
+                &file,
+                self.owner,
+                "disposable worker admission hold",
+                Some(0),
+            )?;
+            fs::fsync(&file).map_err(|_| {
+                store_error(
+                    PersonalWorkerStoreErrorKind::Io,
+                    "could not synchronize the disposable-worker admission hold",
+                )
+            })?;
+            self.confirm_disposable_worker_admission_hold_locked(&file)?;
+            synchronize_directory(&self.directory, "personal worker store directory")?;
+            self.confirm_disposable_worker_admission_hold_locked(&file)?;
+        } else {
+            let file = current
+                .as_ref()
+                .ok_or_else(PersonalWorkerStoreError::corrupt_state)?;
+            self.confirm_disposable_worker_admission_hold_locked(file)?;
+            fs::unlinkat(
+                &self.directory,
+                DISPOSABLE_WORKER_ADMISSION_HOLD_FILE,
+                AtFlags::empty(),
+            )
+            .map_err(|_| {
+                store_error(
+                    PersonalWorkerStoreErrorKind::Io,
+                    "could not remove the disposable-worker admission hold",
+                )
+            })?;
+            synchronize_directory(&self.directory, "personal worker store directory")?;
+            if self
+                .open_disposable_worker_admission_hold_locked()?
+                .is_some()
+            {
+                return Err(store_error(
+                    PersonalWorkerStoreErrorKind::UnsafeFilesystem,
+                    "disposable-worker admission hold changed during removal",
+                ));
+            }
+        }
+        Ok(DisposableWorkerAdmissionStatus {
+            schema_version: 1,
+            admission_held: held,
+        })
+    }
+
+    fn disposable_worker_admission_held_locked(&self) -> Result<bool, PersonalWorkerStoreError> {
+        let file = self.open_disposable_worker_admission_hold_locked()?;
+        if let Some(file) = file.as_ref() {
+            self.confirm_disposable_worker_admission_hold_locked(file)?;
+        }
+        Ok(file.is_some())
+    }
+
+    fn open_disposable_worker_admission_hold_locked(
+        &self,
+    ) -> Result<Option<OwnedFd>, PersonalWorkerStoreError> {
+        inspect_directory(
+            &self.directory,
+            "personal worker store directory",
+            Some(self.owner),
+        )?;
+        let file = match fs::openat(
+            &self.directory,
+            DISPOSABLE_WORKER_ADMISSION_HOLD_FILE,
+            EXISTING_FILE_FLAGS,
+            Mode::empty(),
+        ) {
+            Ok(file) => file,
+            Err(Errno::NOENT) => return Ok(None),
+            Err(error) => return Err(map_document_open_error(error)),
+        };
+        inspect_private_file(
+            &file,
+            self.owner,
+            "disposable worker admission hold",
+            Some(0),
+        )?;
+        Ok(Some(file))
+    }
+
+    fn confirm_disposable_worker_admission_hold_locked(
+        &self,
+        file: &OwnedFd,
+    ) -> Result<(), PersonalWorkerStoreError> {
+        inspect_private_file(
+            file,
+            self.owner,
+            "disposable worker admission hold",
+            Some(0),
+        )?;
+        let held = fs::fstat(file).map_err(|_| {
+            store_error(
+                PersonalWorkerStoreErrorKind::Io,
+                "could not inspect the disposable-worker admission hold",
+            )
+        })?;
+        let named = fs::statat(
+            &self.directory,
+            DISPOSABLE_WORKER_ADMISSION_HOLD_FILE,
+            AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(|_| {
+            store_error(
+                PersonalWorkerStoreErrorKind::UnsafeFilesystem,
+                "disposable-worker admission hold changed during inspection",
+            )
+        })?;
+        if held.st_dev != named.st_dev
+            || held.st_ino != named.st_ino
+            || held.st_mode != named.st_mode
+            || held.st_nlink != named.st_nlink
+            || held.st_uid != named.st_uid
+            || held.st_gid != named.st_gid
+            || held.st_size != named.st_size
+            || held.st_mtime != named.st_mtime
+            || held.st_mtime_nsec != named.st_mtime_nsec
+            || held.st_ctime != named.st_ctime
+            || held.st_ctime_nsec != named.st_ctime_nsec
+        {
+            return Err(store_error(
+                PersonalWorkerStoreErrorKind::UnsafeFilesystem,
+                "disposable-worker admission hold changed during inspection",
+            ));
+        }
+        Ok(())
     }
 
     fn acquire_read_lock(&self) -> Result<StoreReadLock, PersonalWorkerStoreError> {
@@ -1284,6 +1489,7 @@ mod tests {
     use rustix::io::dup;
 
     use super::UnixPersonalWorkerStore;
+    use crate::personal_worker_store::PersonalWorkerStoreErrorKind;
 
     static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
 
@@ -1345,5 +1551,112 @@ mod tests {
 
         drop(mutation);
         drop(inherited);
+    }
+
+    #[test]
+    fn admission_hold_is_durable_idempotent_and_private() {
+        let root = TempRoot::new("admission-hold");
+        let (mut store, _) =
+            UnixPersonalWorkerStore::open_or_create(root.path()).expect("open store");
+        assert!(
+            !store
+                .inspect_disposable_worker_admission()
+                .unwrap()
+                .admission_held()
+        );
+
+        assert!(
+            store
+                .set_disposable_worker_admission_hold(true)
+                .unwrap()
+                .admission_held()
+        );
+        assert!(
+            store
+                .set_disposable_worker_admission_hold(true)
+                .unwrap()
+                .admission_held()
+        );
+        drop(store);
+
+        let (mut reopened, _) =
+            UnixPersonalWorkerStore::open_or_create(root.path()).expect("reopen store");
+        assert!(
+            reopened
+                .inspect_disposable_worker_admission()
+                .unwrap()
+                .admission_held()
+        );
+        assert!(
+            !reopened
+                .set_disposable_worker_admission_hold(false)
+                .unwrap()
+                .admission_held()
+        );
+        assert!(
+            !reopened
+                .set_disposable_worker_admission_hold(false)
+                .unwrap()
+                .admission_held()
+        );
+    }
+
+    #[test]
+    fn unsafe_admission_hold_marker_fails_closed() {
+        let root = TempRoot::new("unsafe-admission-hold");
+        let (mut store, _) =
+            UnixPersonalWorkerStore::open_or_create(root.path()).expect("open store");
+        store
+            .set_disposable_worker_admission_hold(true)
+            .expect("enable hold");
+        let marker = root
+            .path()
+            .join("personal-worker")
+            .join("disposable-worker-admission.hold");
+        fs::set_permissions(&marker, fs::Permissions::from_mode(0o644))
+            .expect("weaken marker mode");
+
+        assert_eq!(
+            store
+                .inspect_disposable_worker_admission()
+                .unwrap_err()
+                .kind(),
+            PersonalWorkerStoreErrorKind::UnsafeFilesystem
+        );
+    }
+
+    #[test]
+    fn admission_hold_confirmation_refuses_same_name_replacement() {
+        let root = TempRoot::new("admission-hold-rebind");
+        let (mut store, _) =
+            UnixPersonalWorkerStore::open_or_create(root.path()).expect("open store");
+        store
+            .set_disposable_worker_admission_hold(true)
+            .expect("enable hold");
+        let held = store
+            .open_disposable_worker_admission_hold_locked()
+            .unwrap()
+            .unwrap();
+        let marker = root
+            .path()
+            .join("personal-worker")
+            .join("disposable-worker-admission.hold");
+        let displaced = root
+            .path()
+            .join("personal-worker")
+            .join("disposable-worker-admission.displaced");
+        fs::rename(&marker, &displaced).expect("displace held marker");
+        let replacement = fs::File::create(&marker).expect("create replacement marker");
+        replacement
+            .set_permissions(fs::Permissions::from_mode(0o600))
+            .expect("set replacement mode");
+
+        assert_eq!(
+            store
+                .confirm_disposable_worker_admission_hold_locked(&held)
+                .unwrap_err()
+                .kind(),
+            PersonalWorkerStoreErrorKind::UnsafeFilesystem
+        );
     }
 }

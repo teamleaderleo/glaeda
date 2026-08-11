@@ -125,6 +125,9 @@ pub(crate) enum ScaleSetServiceDisposition {
     IdleObservationRecorded {
         attempt_id: String,
     },
+    AdmissionHeld {
+        attempt_id: String,
+    },
     MessagePersisted {
         message_id: u32,
     },
@@ -390,13 +393,13 @@ impl<B: ScaleSetBridgeSession, C: ScaleSetServiceClock> ScaleSetService<B, C> {
                     &self.source_identity,
                     inbox.revision(),
                     catalog.revision(),
-                    |message_id, pending, catalog| {
+                    |message_id, pending, catalog, admission_held| {
                         // Sample the acquisition deadline only after the durable ack-started
                         // checkpoint while the canonical store lock still binds this exact
                         // pending message and catalog revision.
                         let now = clock.now()?;
-                        let acquire_available =
-                            should_acquire_scale_set_available(policy, pending, catalog, now)
+                        let acquire_available = !admission_held
+                            && should_acquire_scale_set_available(policy, pending, catalog, now)
                                 .map_err(ScaleSetServiceError::from_consumer)?;
                         bridge
                             .ack(message_id, acquire_available)
@@ -621,6 +624,9 @@ impl<B: ScaleSetBridgeSession, C: ScaleSetServiceClock> ScaleSetService<B, C> {
             .execute_disposable_clone_transaction(runtime, attempt_id, &admission, executor, clock)
             .map_err(ScaleSetServiceError::from_clone)?
         {
+            DisposableCloneTransactionOutcome::AdmissionHeld { attempt_id } => {
+                Ok(ScaleSetServiceDisposition::AdmissionHeld { attempt_id })
+            }
             DisposableCloneTransactionOutcome::CloneAuthorized { .. } => {
                 Err(ScaleSetServiceError::new("clone_phase_changed"))
             }
@@ -654,6 +660,9 @@ impl<B: ScaleSetBridgeSession, C: ScaleSetServiceClock> ScaleSetService<B, C> {
             )
             .map_err(ScaleSetServiceError::from_clone)?
         {
+            DisposableCloneTransactionOutcome::AdmissionHeld { attempt_id } => {
+                Ok(ScaleSetServiceDisposition::AdmissionHeld { attempt_id })
+            }
             DisposableCloneTransactionOutcome::CloneAuthorized { attempt_id } => {
                 Ok(ScaleSetServiceDisposition::CloneAuthorized { attempt_id })
             }
@@ -702,7 +711,8 @@ impl<B: ScaleSetBridgeSession, C: ScaleSetServiceClock> ScaleSetService<B, C> {
             DisposableCloneTransactionOutcome::ScaleSetMessagePersisted { message_id } => {
                 Ok(ScaleSetServiceDisposition::MessagePersisted { message_id })
             }
-            DisposableCloneTransactionOutcome::CloneAuthorized { .. }
+            DisposableCloneTransactionOutcome::AdmissionHeld { .. }
+            | DisposableCloneTransactionOutcome::CloneAuthorized { .. }
             | DisposableCloneTransactionOutcome::Completed(_) => {
                 Err(ScaleSetServiceError::new("clone_phase_changed"))
             }
@@ -1427,6 +1437,81 @@ mod tests {
     }
 
     #[test]
+    fn hold_set_after_message_persistence_refuses_acquisition_and_releases_capacity() {
+        let root = TempRoot::new();
+        let store = UnixPersonalWorkerStore::open_or_create_disposable_catalog(&root.0).unwrap();
+        let mut catalog = DisposableAttemptCatalog::new(store);
+        catalog.initialize().unwrap();
+        let store = catalog.into_store();
+        let policy = consumer_policy();
+        let bridge = FakeBridge {
+            polls: VecDeque::from([ScaleSetBridgePoll::Message {
+                message_id: 7,
+                statistics: statistics(),
+                events: vec![event()],
+            }]),
+            acquired: VecDeque::from([Vec::new()]),
+            capacities: Vec::new(),
+            acknowledgements: Vec::new(),
+        };
+        let mut service = ScaleSetService::with_parts(
+            store,
+            bridge,
+            policy.clone(),
+            FixedClock(EpochMillis::new(100_000).unwrap()),
+        )
+        .unwrap();
+        assert!(matches!(
+            service.reconcile_once().unwrap(),
+            ScaleSetServiceDisposition::MessagePersisted { .. }
+        ));
+        assert!(matches!(
+            service.reconcile_once().unwrap(),
+            ScaleSetServiceDisposition::EventApplied { .. }
+        ));
+
+        let (mut store, bridge) = service.into_parts();
+        store.set_disposable_worker_admission_hold(true).unwrap();
+        let mut service = ScaleSetService::with_parts(
+            store,
+            bridge,
+            policy,
+            FixedClock(EpochMillis::new(100_001).unwrap()),
+        )
+        .unwrap();
+        assert!(matches!(
+            service.reconcile_once().unwrap(),
+            ScaleSetServiceDisposition::MessageAcknowledged { .. }
+        ));
+        assert!(matches!(
+            service.reconcile_once().unwrap(),
+            ScaleSetServiceDisposition::AckOutcomeApplied { .. }
+        ));
+        assert!(matches!(
+            service.reconcile_once().unwrap(),
+            ScaleSetServiceDisposition::UnprovisionedReleased { .. }
+        ));
+        assert!(matches!(
+            service.reconcile_once().unwrap(),
+            ScaleSetServiceDisposition::AttemptRetired { .. }
+        ));
+
+        let (store, bridge) = service.into_parts();
+        assert_eq!(bridge.acknowledgements, [(7, false)]);
+        assert!(
+            store
+                .inspect_disposable_worker_admission()
+                .unwrap()
+                .admission_held()
+        );
+        let catalog = DisposableAttemptCatalogStore::load(&store)
+            .unwrap()
+            .unwrap();
+        assert!(catalog.active().is_empty());
+        assert_eq!(catalog.tombstones().len(), 1);
+    }
+
+    #[test]
     fn acquisition_deadline_is_sampled_after_the_durable_ack_checkpoint() {
         let root = TempRoot::new();
         let store = UnixPersonalWorkerStore::open_or_create_disposable_catalog(&root.0).unwrap();
@@ -1586,7 +1671,7 @@ mod tests {
     }
 
     #[test]
-    fn acquired_job_cancellation_before_clone_is_durably_releasable() {
+    fn acquired_job_cancellation_remains_durably_releasable_during_operator_hold() {
         let root = TempRoot::new();
         let store = UnixPersonalWorkerStore::open_or_create_disposable_catalog(&root.0).unwrap();
         let mut catalog = DisposableAttemptCatalog::new(store);
@@ -1653,6 +1738,12 @@ mod tests {
                 ScaleSetServiceDisposition::AckOutcomeApplied { message_id: actual }
                     if actual == message_id
             ));
+            if message_id == 7 {
+                service
+                    .store
+                    .set_disposable_worker_admission_hold(true)
+                    .unwrap();
+            }
         }
 
         assert!(matches!(

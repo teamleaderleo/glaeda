@@ -33,9 +33,9 @@ pub mod disposable_template_runtime;
 pub mod disposable_worker_enrollment;
 /// Pure capacity and lifecycle reconciliation for one-job disposable workers.
 pub mod disposable_worker_reconciler;
-/// Private production composition for one enrolled disposable Scale Set worker.
+/// Production composition for one enrolled disposable Scale Set worker.
 #[cfg(unix)]
-pub(crate) mod disposable_worker_service;
+pub mod disposable_worker_service;
 pub mod doctor;
 pub mod durable_journal;
 #[cfg(target_os = "linux")]
