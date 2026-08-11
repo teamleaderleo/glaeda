@@ -17,7 +17,7 @@ pub use codec::{
     encode_disposable_attempt_catalog,
 };
 
-pub const DISPOSABLE_ATTEMPT_CATALOG_SCHEMA_VERSION: u8 = 4;
+pub const DISPOSABLE_ATTEMPT_CATALOG_SCHEMA_VERSION: u8 = 5;
 pub const MAX_ACTIVE_DISPOSABLE_ATTEMPTS: usize = 64;
 pub const MAX_DISPOSABLE_ATTEMPT_TOMBSTONES: usize = 64;
 const MAX_DISPOSABLE_ATTEMPT_CATALOG_REVISION: u64 = 1_000_000_000_000;
@@ -386,6 +386,7 @@ impl DisposableAttemptCatalogDocument {
         let mut attempt_ids = BTreeSet::new();
         let mut claim_ids = BTreeSet::new();
         let mut vm_ids = BTreeSet::new();
+        let mut vm_identities = BTreeSet::new();
         let mut runner_names = BTreeSet::new();
         let mut runner_ids = BTreeSet::new();
         let mut job_ids = BTreeSet::new();
@@ -400,6 +401,12 @@ impl DisposableAttemptCatalogDocument {
                 || !claim_ids.insert(attempt.capacity_claim_id().clone())
                 || !vm_ids.insert(attempt.vm_id().clone())
                 || !runner_names.insert(attempt.runner_name().clone())
+            {
+                return Err(duplicate_identity());
+            }
+            if attempt
+                .vm_identity()
+                .is_some_and(|identity| !vm_identities.insert(identity.clone()))
             {
                 return Err(duplicate_identity());
             }
@@ -485,6 +492,7 @@ pub enum DisposableAttemptCatalogAction {
     BeginProvisioning,
     AuthorizeClone,
     RecordCloneStarted,
+    RecordVmIdentity(crate::disposable_worker_reconciler::DisposableVmIdentity),
     BeginUnprovisionedRelease,
     CompleteUnprovisioned,
     BeginRegistration,
@@ -870,6 +878,9 @@ fn apply_action(
         DisposableAttemptCatalogAction::BeginProvisioning => current.begin_provisioning(),
         DisposableAttemptCatalogAction::AuthorizeClone => current.authorize_clone(),
         DisposableAttemptCatalogAction::RecordCloneStarted => current.record_clone_started(),
+        DisposableAttemptCatalogAction::RecordVmIdentity(identity) => {
+            current.record_vm_identity(identity)
+        }
         DisposableAttemptCatalogAction::BeginUnprovisionedRelease => {
             current.begin_unprovisioned_release()
         }

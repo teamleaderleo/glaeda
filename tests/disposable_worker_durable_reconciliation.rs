@@ -3,6 +3,7 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use smolrunner::disposable_attempt_catalog::{
@@ -15,8 +16,9 @@ use smolrunner::disposable_prepared_template::{
 };
 use smolrunner::disposable_worker_reconciler::{
     CapacityClaimId, DisposableAttemptId, DisposableAttemptPhase, DisposableVmId,
-    DisposableVmObservation, DisposableWorkerAction, DisposableWorkerReconcileInput,
-    DisposableWorkerResources, ScaleSetRunnerObservation, reconcile_attempt,
+    DisposableVmIdentity, DisposableVmObservation, DisposableWorkerAction,
+    DisposableWorkerReconcileInput, DisposableWorkerResources, ScaleSetRunnerObservation,
+    reconcile_attempt,
 };
 use smolrunner::execution_admission::EpochMillis;
 use smolrunner::github_scale_set_protocol::{
@@ -65,6 +67,13 @@ fn template_digest() -> DisposablePreparedTemplateIdentity {
 
 fn attempt_id() -> DisposableAttemptId {
     DisposableAttemptId::parse("attempt-restart-1").unwrap()
+}
+
+fn vm_identity() -> &'static DisposableVmIdentity {
+    static IDENTITY: LazyLock<DisposableVmIdentity> = LazyLock::new(|| {
+        DisposableVmIdentity::parse(&format!("sha256:{}", "22".repeat(32))).unwrap()
+    });
+    &IDENTITY
 }
 
 fn runner() -> ScaleSetRunnerReference {
@@ -133,6 +142,11 @@ fn tick_with_cancellation(
         now: epoch(1_000),
         attempt: &state,
         vm,
+        vm_identity: matches!(
+            vm,
+            DisposableVmObservation::Stopped | DisposableVmObservation::Ready
+        )
+        .then(vm_identity),
         runner: runner_observation,
         job_event,
         capacity_reserved,
@@ -205,6 +219,28 @@ fn every_durable_checkpoint_reopens_without_duplicate_capacity_or_cleanup_loss()
     assert_eq!(
         state.find_active(&attempt_id()).unwrap().attempt().phase(),
         DisposableAttemptPhase::CloneStarted
+    );
+
+    let (state, action) = tick(
+        root.path(),
+        DisposableVmObservation::Stopped,
+        ScaleSetRunnerObservation::Absent,
+        None,
+        true,
+    );
+    assert!(matches!(
+        action,
+        DisposableWorkerAction::Persist {
+            transition: DisposableAttemptCatalogAction::RecordVmIdentity(_)
+        }
+    ));
+    assert!(
+        state
+            .find_active(&attempt_id())
+            .unwrap()
+            .attempt()
+            .vm_identity()
+            .is_some()
     );
 
     for _ in 0..2 {
@@ -508,6 +544,13 @@ fn stale_registration_is_bound_before_delete_and_recovery_never_uses_name_alone(
         None,
         true,
     );
+    tick(
+        root.path(),
+        DisposableVmObservation::Ready,
+        ScaleSetRunnerObservation::Absent,
+        None,
+        true,
+    );
 
     let (catalog, action) = tick(
         root.path(),
@@ -582,6 +625,7 @@ fn stale_registration_is_bound_before_delete_and_recovery_never_uses_name_alone(
             now: epoch(1_000),
             attempt: state,
             vm: DisposableVmObservation::Absent,
+            vm_identity: None,
             runner: ScaleSetRunnerObservation::RegistrationOnly {
                 runner: replacement,
             },

@@ -12,7 +12,7 @@ use smolrunner::disposable_prepared_template::{
 };
 use smolrunner::disposable_worker_reconciler::{
     CapacityClaimId, DisposableAttemptId, DisposableAttemptPhase, DisposableVmId,
-    DisposableWorkerResources,
+    DisposableVmIdentity, DisposableWorkerResources,
 };
 use smolrunner::execution_admission::EpochMillis;
 use smolrunner::github_scale_set_protocol::{
@@ -34,6 +34,10 @@ fn template_digest() -> DisposablePreparedTemplateIdentity {
         .unwrap()
         .identity()
         .unwrap()
+}
+
+fn vm_identity(index: usize) -> DisposableVmIdentity {
+    DisposableVmIdentity::parse(&format!("sha256:{index:064x}")).unwrap()
 }
 
 fn other_template_digest() -> DisposablePreparedTemplateIdentity {
@@ -113,6 +117,12 @@ fn populated_catalog() -> DisposableAttemptCatalogDocument {
         &mut catalog,
         &started,
         2,
+        DisposableAttemptCatalogAction::RecordVmIdentity(vm_identity(2)),
+    );
+    let registering = transition(
+        &mut catalog,
+        &registering,
+        2,
         DisposableAttemptCatalogAction::BeginRegistration,
     );
     let registered = transition(
@@ -133,6 +143,12 @@ fn populated_catalog() -> DisposableAttemptCatalogDocument {
         &both_authorized,
         1,
         DisposableAttemptCatalogAction::RecordCloneStarted,
+    );
+    let both_started = transition(
+        &mut catalog,
+        &both_started,
+        1,
+        DisposableAttemptCatalogAction::RecordVmIdentity(vm_identity(1)),
     );
 
     let terminal = transition(
@@ -321,6 +337,12 @@ fn saturated_tombstone_history_retains_a_safe_revision_lower_bound() {
             &mut catalog,
             &document,
             index,
+            DisposableAttemptCatalogAction::RecordVmIdentity(vm_identity(index)),
+        );
+        document = transition(
+            &mut catalog,
+            &document,
+            index,
             DisposableAttemptCatalogAction::RecordTerminal {
                 runner: Some(runner(index, 1_000 + u64::try_from(index).unwrap())),
                 job_id: ScaleSetJobId::parse(&format!("completed-job-{index}")).unwrap(),
@@ -410,7 +432,7 @@ fn top_level_future_schema_and_unknown_fields_fail_closed() {
         DisposableAttemptCatalogCodecErrorKind::VersionIncompatible
     );
 
-    value["schema_version"] = serde_json::json!(5);
+    value["schema_version"] = serde_json::json!(6);
     let future = serde_json::to_vec(&value).unwrap();
     assert_eq!(
         decode_disposable_attempt_catalog(&future)
@@ -419,7 +441,7 @@ fn top_level_future_schema_and_unknown_fields_fail_closed() {
         DisposableAttemptCatalogCodecErrorKind::VersionIncompatible
     );
 
-    value["schema_version"] = serde_json::json!(4);
+    value["schema_version"] = serde_json::json!(5);
     value["unexpected"] = serde_json::json!(true);
     let unknown = serde_json::to_vec(&value).unwrap();
     assert_eq!(

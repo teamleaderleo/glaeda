@@ -4,6 +4,7 @@ use smolrunner::disposable_attempt_state::{
 };
 use smolrunner::disposable_worker_reconciler::{
     CapacityClaimId, DisposableAttemptId, DisposableAttemptPhase, DisposableVmId,
+    DisposableVmIdentity,
 };
 use smolrunner::execution_admission::EpochMillis;
 use smolrunner::github_scale_set_protocol::{
@@ -18,6 +19,10 @@ fn reserved() -> DisposableAttemptState {
         ScaleSetRunnerName::parse("smol-attempt-1").unwrap(),
         EpochMillis::new(50_000).unwrap(),
     )
+}
+
+fn vm_identity() -> DisposableVmIdentity {
+    DisposableVmIdentity::parse(&format!("sha256:{}", "33".repeat(32))).unwrap()
 }
 
 #[test]
@@ -42,6 +47,38 @@ fn unprovisioned_completion_skips_cleanup_only_before_clone_start() {
     );
 }
 
+#[test]
+fn vm_identity_binds_once_only_after_clone_start_and_survives_codec() {
+    assert_eq!(
+        reserved()
+            .record_vm_identity(vm_identity())
+            .unwrap_err()
+            .code(),
+        "invalid_transition"
+    );
+
+    let started = reserved()
+        .authorize_clone()
+        .unwrap()
+        .record_clone_started()
+        .unwrap();
+    let identity = vm_identity();
+    let bound = started.record_vm_identity(identity.clone()).unwrap();
+    assert_eq!(bound.phase(), DisposableAttemptPhase::CloneStarted);
+    assert_eq!(bound.revision().get(), 4);
+    assert_eq!(bound.vm_identity(), Some(&identity));
+    assert_eq!(bound.record_vm_identity(identity).unwrap(), bound);
+
+    let different = DisposableVmIdentity::parse(&format!("sha256:{}", "44".repeat(32))).unwrap();
+    assert_eq!(
+        bound.record_vm_identity(different).unwrap_err().code(),
+        "identity_drift"
+    );
+
+    let encoded = encode_disposable_attempt_state(&bound).unwrap();
+    assert_eq!(decode_disposable_attempt_state(&encoded).unwrap(), bound);
+}
+
 fn runner(id: u64) -> ScaleSetRunnerReference {
     ScaleSetRunnerReference::new(
         ScaleSetRunnerId::new(id).unwrap(),
@@ -59,6 +96,8 @@ fn registration_and_listener_readiness_are_distinct_durable_checkpoints() {
         .authorize_clone()
         .unwrap()
         .record_clone_started()
+        .unwrap()
+        .record_vm_identity(vm_identity())
         .unwrap()
         .begin_registration()
         .unwrap();
@@ -80,6 +119,8 @@ fn job_assignment_does_not_bind_a_runner_before_job_started() {
         .authorize_clone()
         .unwrap()
         .record_clone_started()
+        .unwrap()
+        .record_vm_identity(vm_identity())
         .unwrap()
         .begin_registration()
         .unwrap()
@@ -116,6 +157,8 @@ fn runnerless_completion_requires_an_exact_prebound_job() {
         .authorize_clone()
         .unwrap()
         .record_clone_started()
+        .unwrap()
+        .record_vm_identity(vm_identity())
         .unwrap()
         .begin_registration()
         .unwrap()
@@ -159,6 +202,8 @@ fn unknown_completion_result_still_reaches_cleanup() {
         .unwrap()
         .record_clone_started()
         .unwrap()
+        .record_vm_identity(vm_identity())
+        .unwrap()
         .begin_registration()
         .unwrap()
         .record_assigned(job("job-future-result"))
@@ -191,6 +236,8 @@ fn late_job_evidence_binds_without_reversing_cleanup_and_conflicts_fail_closed()
         .authorize_clone()
         .unwrap()
         .record_clone_started()
+        .unwrap()
+        .record_vm_identity(vm_identity())
         .unwrap()
         .begin_cleanup()
         .unwrap()
@@ -228,6 +275,8 @@ fn exact_runner_and_job_identity_drift_fails_closed() {
         .authorize_clone()
         .unwrap()
         .record_clone_started()
+        .unwrap()
+        .record_vm_identity(vm_identity())
         .unwrap()
         .begin_registration()
         .unwrap()
@@ -269,6 +318,8 @@ fn canonical_codec_round_trips_exact_state_and_revision() {
         .unwrap()
         .record_clone_started()
         .unwrap()
+        .record_vm_identity(vm_identity())
+        .unwrap()
         .begin_registration()
         .unwrap()
         .record_registration(&runner(77))
@@ -291,7 +342,7 @@ fn codec_rejects_future_versions_unknown_fields_and_inconsistent_phase_evidence(
     let base = encode_disposable_attempt_state(&reserved()).unwrap();
     let mut value: serde_json::Value = serde_json::from_slice(&base).unwrap();
 
-    value["schema_version"] = serde_json::json!(4);
+    value["schema_version"] = serde_json::json!(DISPOSABLE_ATTEMPT_STATE_SCHEMA_VERSION + 1);
     let future = serde_json::to_vec(&value).unwrap();
     assert_eq!(
         decode_disposable_attempt_state(&future).unwrap_err().code(),
@@ -323,6 +374,33 @@ fn codec_rejects_future_versions_unknown_fields_and_inconsistent_phase_evidence(
     let inconsistent = serde_json::to_vec(&inconsistent).unwrap();
     assert_eq!(
         decode_disposable_attempt_state(&inconsistent)
+            .unwrap_err()
+            .code(),
+        "invalid_document"
+    );
+
+    let mut impossible_started: serde_json::Value = serde_json::from_slice(&base).unwrap();
+    impossible_started["revision"] = serde_json::json!(4);
+    impossible_started["phase"] = serde_json::json!("clone_started");
+    assert_eq!(
+        decode_disposable_attempt_state(&serde_json::to_vec(&impossible_started).unwrap())
+            .unwrap_err()
+            .code(),
+        "invalid_document"
+    );
+
+    let bound = reserved()
+        .authorize_clone()
+        .unwrap()
+        .record_clone_started()
+        .unwrap()
+        .record_vm_identity(vm_identity())
+        .unwrap();
+    let mut impossible_registration: serde_json::Value =
+        serde_json::from_slice(&encode_disposable_attempt_state(&bound).unwrap()).unwrap();
+    impossible_registration["phase"] = serde_json::json!("registering");
+    assert_eq!(
+        decode_disposable_attempt_state(&serde_json::to_vec(&impossible_registration).unwrap())
             .unwrap_err()
             .code(),
         "invalid_document"

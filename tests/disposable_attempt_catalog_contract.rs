@@ -11,7 +11,7 @@ use smolrunner::disposable_prepared_template::{
 };
 use smolrunner::disposable_worker_reconciler::{
     CapacityClaimId, DisposableAttemptId, DisposableAttemptPhase, DisposableVmId,
-    DisposableWorkerResources,
+    DisposableVmIdentity, DisposableWorkerResources,
 };
 use smolrunner::execution_admission::EpochMillis;
 use smolrunner::github_scale_set_protocol::{
@@ -29,6 +29,10 @@ fn template_digest() -> DisposablePreparedTemplateIdentity {
 
 fn other_template_digest() -> DisposablePreparedTemplateIdentity {
     changed_template_identity()
+}
+
+fn vm_identity(index: usize) -> DisposableVmIdentity {
+    DisposableVmIdentity::parse(&format!("sha256:{index:064x}")).unwrap()
 }
 
 fn changed_template_identity() -> DisposablePreparedTemplateIdentity {
@@ -212,6 +216,132 @@ fn raw_store_refuses_unrelated_revision_successors() {
 }
 
 #[test]
+fn raw_store_refuses_vm_identity_rebinding_during_a_legal_phase_advance() {
+    let (mut current_catalog, empty) = initialized();
+    let (reserved, _) = current_catalog
+        .reserve(empty.revision(), reservation(1))
+        .unwrap();
+    let authorized = transition(
+        &mut current_catalog,
+        &reserved,
+        1,
+        DisposableAttemptCatalogAction::AuthorizeClone,
+    );
+    let started = transition(
+        &mut current_catalog,
+        &authorized,
+        1,
+        DisposableAttemptCatalogAction::RecordCloneStarted,
+    );
+    let bound = transition(
+        &mut current_catalog,
+        &started,
+        1,
+        DisposableAttemptCatalogAction::RecordVmIdentity(vm_identity(1)),
+    );
+
+    let (mut alternate_catalog, alternate_empty) = initialized();
+    let (alternate_reserved, _) = alternate_catalog
+        .reserve(alternate_empty.revision(), reservation(1))
+        .unwrap();
+    let alternate_authorized = transition(
+        &mut alternate_catalog,
+        &alternate_reserved,
+        1,
+        DisposableAttemptCatalogAction::AuthorizeClone,
+    );
+    let alternate_started = transition(
+        &mut alternate_catalog,
+        &alternate_authorized,
+        1,
+        DisposableAttemptCatalogAction::RecordCloneStarted,
+    );
+    let alternate_bound = transition(
+        &mut alternate_catalog,
+        &alternate_started,
+        1,
+        DisposableAttemptCatalogAction::RecordVmIdentity(vm_identity(2)),
+    );
+    let forged_cleanup = transition(
+        &mut alternate_catalog,
+        &alternate_bound,
+        1,
+        DisposableAttemptCatalogAction::BeginCleanup,
+    );
+
+    let mut store = MemoryDisposableAttemptCatalogStore::default();
+    store.create(&empty).unwrap();
+    for document in [&reserved, &authorized, &started, &bound] {
+        let current = store.load().unwrap().unwrap();
+        store
+            .replace_if_revision(current.revision(), document)
+            .unwrap();
+    }
+    assert_eq!(
+        store
+            .replace_if_revision(bound.revision(), &forged_cleanup)
+            .expect_err("phase advance cannot rebind the observed VM identity")
+            .kind(),
+        DisposableAttemptCatalogErrorKind::Conflict
+    );
+    assert_eq!(store.load().unwrap(), Some(bound));
+}
+
+#[test]
+fn one_observed_vm_identity_cannot_be_owned_by_two_attempts() {
+    let (mut catalog, empty) = initialized();
+    let (one, _) = catalog.reserve(empty.revision(), reservation(1)).unwrap();
+    let (two, _) = catalog.reserve(one.revision(), reservation(2)).unwrap();
+    let one_authorized = transition(
+        &mut catalog,
+        &two,
+        1,
+        DisposableAttemptCatalogAction::AuthorizeClone,
+    );
+    let one_started = transition(
+        &mut catalog,
+        &one_authorized,
+        1,
+        DisposableAttemptCatalogAction::RecordCloneStarted,
+    );
+    let one_bound = transition(
+        &mut catalog,
+        &one_started,
+        1,
+        DisposableAttemptCatalogAction::RecordVmIdentity(vm_identity(7)),
+    );
+    let two_authorized = transition(
+        &mut catalog,
+        &one_bound,
+        2,
+        DisposableAttemptCatalogAction::AuthorizeClone,
+    );
+    let two_started = transition(
+        &mut catalog,
+        &two_authorized,
+        2,
+        DisposableAttemptCatalogAction::RecordCloneStarted,
+    );
+    let attempt_id = DisposableAttemptId::parse("attempt-2").unwrap();
+    assert_eq!(
+        catalog
+            .transition(
+                two_started.revision(),
+                &attempt_id,
+                two_started
+                    .find_active(&attempt_id)
+                    .unwrap()
+                    .attempt()
+                    .revision(),
+                DisposableAttemptCatalogAction::RecordVmIdentity(vm_identity(7)),
+            )
+            .expect_err("one exact VM object cannot satisfy two durable attempts")
+            .kind(),
+        DisposableAttemptCatalogErrorKind::CorruptState
+    );
+}
+
+#[test]
 fn reserved_attempt_cannot_enter_external_cleanup_through_the_public_catalog() {
     let (mut catalog, empty) = initialized();
     let (reserved, _) = catalog.reserve(empty.revision(), reservation(1)).unwrap();
@@ -350,6 +480,12 @@ fn duplicate_terminal_observation_is_satisfied_without_catalog_churn() {
         1,
         DisposableAttemptCatalogAction::RecordCloneStarted,
     );
+    let started = transition(
+        &mut catalog,
+        &started,
+        1,
+        DisposableAttemptCatalogAction::RecordVmIdentity(vm_identity(1)),
+    );
     let job = ScaleSetJobId::parse("opaque-job-1").unwrap();
     let result = ScaleSetJobResult::parse("future-service-result").unwrap();
 
@@ -407,6 +543,12 @@ fn identity_drift_remains_distinct_from_an_illegal_phase_action() {
         1,
         DisposableAttemptCatalogAction::RecordCloneStarted,
     );
+    let started = transition(
+        &mut catalog,
+        &started,
+        1,
+        DisposableAttemptCatalogAction::RecordVmIdentity(vm_identity(1)),
+    );
     let registering = transition(
         &mut catalog,
         &started,
@@ -453,6 +595,12 @@ fn completed_attempt_releases_usage_then_moves_to_bounded_replay_history() {
         &authorized,
         1,
         DisposableAttemptCatalogAction::RecordCloneStarted,
+    );
+    let started = transition(
+        &mut catalog,
+        &started,
+        1,
+        DisposableAttemptCatalogAction::RecordVmIdentity(vm_identity(1)),
     );
     let terminal = transition(
         &mut catalog,
@@ -564,6 +712,12 @@ fn exact_runner_ids_cannot_be_reused_across_concurrent_attempts() {
         1,
         DisposableAttemptCatalogAction::RecordCloneStarted,
     );
+    let one_started = transition(
+        &mut catalog,
+        &one_started,
+        1,
+        DisposableAttemptCatalogAction::RecordVmIdentity(vm_identity(1)),
+    );
     let one_registering = transition(
         &mut catalog,
         &one_started,
@@ -588,6 +742,12 @@ fn exact_runner_ids_cannot_be_reused_across_concurrent_attempts() {
         &two_provisioning,
         2,
         DisposableAttemptCatalogAction::RecordCloneStarted,
+    );
+    let two_started = transition(
+        &mut catalog,
+        &two_started,
+        2,
+        DisposableAttemptCatalogAction::RecordVmIdentity(vm_identity(2)),
     );
     let two_registering = transition(
         &mut catalog,
@@ -639,6 +799,12 @@ fn exact_job_ids_cannot_be_reused_across_concurrent_attempts() {
         1,
         DisposableAttemptCatalogAction::RecordCloneStarted,
     );
+    let one_started = transition(
+        &mut catalog,
+        &one_started,
+        1,
+        DisposableAttemptCatalogAction::RecordVmIdentity(vm_identity(1)),
+    );
     let one_terminal = transition(
         &mut catalog,
         &one_started,
@@ -654,6 +820,12 @@ fn exact_job_ids_cannot_be_reused_across_concurrent_attempts() {
         &one_terminal,
         2,
         DisposableAttemptCatalogAction::RecordCloneStarted,
+    );
+    let two_started = transition(
+        &mut catalog,
+        &two_started,
+        2,
+        DisposableAttemptCatalogAction::RecordVmIdentity(vm_identity(2)),
     );
     let attempt_id = DisposableAttemptId::parse("attempt-2").unwrap();
     let duplicate_job_id = catalog
