@@ -12,13 +12,20 @@ publish = false
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 serde_yaml = { package = "serde_norway", version = "0.9.42" }
 sha2 = "0.10"
 
 [target.'cfg(unix)'.dependencies]
 # `mount` exposes Linux open_tree/move_mount through rustix without unsafe project code.
-rustix = { version = "1.1.4", features = ["fs", "mount", "process", "rand", "thread"] }
+rustix = { version = "1.1.4", features = ["event", "fs", "mount", "process", "rand", "thread"] }
+# Guarantee compiler-resistant wiping for controller credentials and one-time JIT material.
+zeroize = "1.8.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Read the controller GitHub App key directly from the macOS Keychain without a secret-bearing
+# subprocess, argv, environment, or public execution record.
+security-framework = { version = "3.7.0", default-features = false }
 
 [lints.rust]
 unsafe_code = "forbid"

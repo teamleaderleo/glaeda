@@ -114,8 +114,15 @@ The checked-in `tools/scaleset-bridge` foundation pins the official Go client an
 empty-environment, stdin/stdout-only protocol for exact scale-set validation, long polling,
 explicit post-persistence acknowledgement, JIT generation, and exact runner observation/removal.
 It deliberately does not use the official convenience listener's acknowledge-before-handler
-ordering. No Rust caller, Keychain credential source, durable message consumer, enrollment path, or
-guest JIT handoff exists yet, so this foundation is not production capacity.
+ordering. A private Rust adapter now starts that no-argument process with an empty environment,
+reads the GitHub App key directly through macOS Security.framework, strictly decodes bounded
+responses, maps validated statistics into the existing typed demand contract, and retains JIT
+configuration only in a redacted guaranteed-zeroization value. Before reading the key it requires
+the bridge at the one fixed root-owned, non-writable installation path with exact SHA-256 content,
+and it reconfirms that held file around spawn. Every exchange has a finite deadline; malformed
+decoded or semantic responses poison and terminate the session. The personal-Mac adapter fixes
+advertised Scale Set capacity at one. No durable message consumer, enrollment path,
+service loop, or guest JIT handoff exists yet, so this adapter is not production capacity.
 
 Acceptance: an enrolled test repository targets the SmolRunner scale-set label, queues a job, and receives its result without operator commands; the JIT runner cannot accept a second job and its credential is absent after VM destruction.
 
