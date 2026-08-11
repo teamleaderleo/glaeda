@@ -210,6 +210,27 @@ func TestPollUsesCurrentAvailableCapacity(t *testing.T) {
 	}
 }
 
+func TestPollRejectsAvailableJobsBeyondCurrentCapacity(t *testing.T) {
+	backend := &fakeBackend{message: &scaleset.RunnerScaleSetMessage{
+		MessageID:  7,
+		Statistics: &scaleset.RunnerScaleSetStatistic{TotalAvailableJobs: 1},
+		JobAvailableMessages: []*scaleset.JobAvailable{{JobMessageBase: scaleset.JobMessageBase{
+			RunnerRequestID: 41,
+			RepositoryName:  "project",
+			OwnerName:       "example",
+			JobID:           "job-1",
+			WorkflowRunID:   99,
+			RequestLabels:   []string{"smolrunner"},
+		}}},
+	}}
+	server := startedServer(t, backend)
+
+	response := server.handle(context.Background(), protocolRequest{Version: 1, Operation: "poll", MaxCapacity: 0})
+	if response.Code != "invalid_message" || server.pending != nil || !reflect.DeepEqual(backend.calls, []string{"poll"}) {
+		t.Fatalf("over-capacity message response=%#v pending=%#v calls=%v", response, server.pending, backend.calls)
+	}
+}
+
 func TestAckRejectsForeignOrDuplicateAcquisitionWithoutRepeatingDelete(t *testing.T) {
 	backend := &fakeBackend{
 		acquired: []int64{42},
@@ -227,7 +248,7 @@ func TestAckRejectsForeignOrDuplicateAcquisitionWithoutRepeatingDelete(t *testin
 		},
 	}
 	server := startedServer(t, backend)
-	if response := server.handle(context.Background(), protocolRequest{Version: 1, Operation: "poll"}); response.Type != "message" {
+	if response := server.handle(context.Background(), protocolRequest{Version: 1, Operation: "poll", MaxCapacity: 1}); response.Type != "message" {
 		t.Fatalf("poll response=%#v", response)
 	}
 	invalid := server.handle(context.Background(), protocolRequest{Version: 1, Operation: "ack", MessageID: 7})

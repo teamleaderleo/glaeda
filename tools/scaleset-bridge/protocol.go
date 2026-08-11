@@ -475,6 +475,9 @@ func (server *server) poll(ctx context.Context, maxCapacity int) protocolRespons
 	if normalizeErr != nil {
 		return errorResponse("invalid_message")
 	}
+	if len(available) > maxCapacity {
+		return errorResponse("invalid_message")
+	}
 	if !responseFitsProtocolLine(response) {
 		return errorResponse("invalid_message")
 	}

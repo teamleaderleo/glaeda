@@ -48,6 +48,7 @@ impl UnixPersonalWorkerStore {
         synchronize_catalog_directory(&store)?;
         super::disposable_template_generation::refuse_unsettled(&store)
             .map_err(map_personal_error)?;
+        super::github_scale_set_inbox::refuse_unsettled(&store).map_err(map_personal_error)?;
         refuse_unsettled_lima_authority(&store)?;
         store.recover_catalog_locked()?;
         Ok(store)
@@ -186,6 +187,7 @@ impl DisposableAttemptCatalogStore for UnixPersonalWorkerStore {
         synchronize_catalog_directory(self)?;
         super::disposable_template_generation::refuse_unsettled(self)
             .map_err(map_personal_error)?;
+        super::github_scale_set_inbox::refuse_unsettled(self).map_err(map_personal_error)?;
         refuse_unsettled_lima_authority(self)?;
         self.recover_catalog_locked()
     }
@@ -224,6 +226,7 @@ impl DisposableAttemptCatalogStore for UnixPersonalWorkerStore {
         synchronize_catalog_directory(self)?;
         super::disposable_template_generation::refuse_unsettled(self)
             .map_err(map_personal_error)?;
+        super::github_scale_set_inbox::refuse_unsettled(self).map_err(map_personal_error)?;
         refuse_unsettled_lima_authority(self)?;
         self.recover_catalog_locked()?;
         if self.load_catalog_named(CATALOG_DOCUMENT)?.is_some() {
@@ -251,6 +254,7 @@ impl DisposableAttemptCatalogStore for UnixPersonalWorkerStore {
         synchronize_catalog_directory(self)?;
         super::disposable_template_generation::refuse_unsettled(self)
             .map_err(map_personal_error)?;
+        super::github_scale_set_inbox::refuse_unsettled(self).map_err(map_personal_error)?;
         refuse_unsettled_lima_authority(self)?;
         self.recover_catalog_locked()?;
         let current = self.load_catalog_named(CATALOG_DOCUMENT)?.ok_or_else(|| {

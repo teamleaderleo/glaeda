@@ -849,6 +849,15 @@ fn plan_job_event(
     attempt: &DisposableAttemptState,
     event: &ScaleSetJobEvent,
 ) -> Result<Option<DisposableWorkerAction>, DisposableWorkerReconcilerError> {
+    if matches!(event, ScaleSetJobEvent::Completed { runner: None, .. })
+        && attempt.github_job_id().is_none()
+    {
+        return Err(DisposableWorkerReconcilerError::new(
+            "job_event",
+            "github_job_identity_drift",
+            "runnerless completion requires the exact durable job binding",
+        ));
+    }
     let transition = match event {
         ScaleSetJobEvent::Started { runner, job_id } => {
             DisposableAttemptCatalogAction::RecordRunning {

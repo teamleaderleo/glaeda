@@ -18,7 +18,7 @@ pub use codec::{
     encode_disposable_attempt_catalog,
 };
 
-pub const DISPOSABLE_ATTEMPT_CATALOG_SCHEMA_VERSION: u8 = 5;
+pub const DISPOSABLE_ATTEMPT_CATALOG_SCHEMA_VERSION: u8 = 6;
 pub const MAX_ACTIVE_DISPOSABLE_ATTEMPTS: usize = 64;
 pub const MAX_DISPOSABLE_ATTEMPT_TOMBSTONES: usize = 64;
 const MAX_DISPOSABLE_ATTEMPT_CATALOG_REVISION: u64 = 1_000_000_000_000;
@@ -211,7 +211,7 @@ impl DisposableAttemptCatalogDocument {
         DisposableHostUsage::new(workers, resources).map_err(|_| resource_overflow())
     }
 
-    fn reserve(
+    pub(crate) fn reserve(
         &self,
         reservation: DisposableAttemptReservation,
     ) -> Result<Self, DisposableAttemptCatalogError> {
@@ -247,7 +247,7 @@ impl DisposableAttemptCatalogDocument {
         Ok(next)
     }
 
-    fn replace_attempt(
+    pub(crate) fn replace_attempt(
         &self,
         attempt_id: &DisposableAttemptId,
         expected_attempt_revision: DisposableAttemptRevision,
@@ -282,7 +282,7 @@ impl DisposableAttemptCatalogDocument {
         Ok(next)
     }
 
-    fn retire_complete(
+    pub(crate) fn retire_complete(
         &self,
         attempt_id: &DisposableAttemptId,
         expected_attempt_revision: DisposableAttemptRevision,

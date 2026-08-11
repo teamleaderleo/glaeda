@@ -159,7 +159,7 @@ fn runnerless_completion_requires_an_exact_prebound_job() {
             )
             .unwrap_err()
             .code(),
-        "identity_drift"
+        "invalid_transition"
     );
 
     let terminal = reserved()

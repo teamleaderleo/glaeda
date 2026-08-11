@@ -22,7 +22,6 @@ use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
-#[cfg(target_os = "macos")]
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -42,6 +41,28 @@ const MAX_BRIDGE_PROGRAM_BYTES: u64 = 64 * 1024 * 1024;
 const BRIDGE_PROGRAM: &str = "/opt/smolrunner/bin/scaleset-bridge";
 const DEFAULT_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(75);
+const BRIDGE_IDENTITY_DOMAIN: &[u8] = b"smolrunner.github-scale-set-bridge.v1\0";
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ScaleSetBridgeIdentity(Sha256Digest);
+
+impl ScaleSetBridgeIdentity {
+    pub(crate) fn parse(value: &str) -> Result<Self, ScaleSetBridgeError> {
+        Sha256Digest::parse(value)
+            .map(Self)
+            .map_err(|_| ScaleSetBridgeError::new("invalid_bridge_identity"))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl fmt::Debug for ScaleSetBridgeIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ScaleSetBridgeIdentity(<private>)")
+    }
+}
 
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct GitHubAppKeychainConfig {
@@ -113,11 +134,13 @@ impl ScaleSetBridgeTarget {
                 return Err(ScaleSetBridgeError::new("invalid_scale_set_target"));
             }
         }
+        let mut labels = labels.to_vec();
+        labels.sort();
         Ok(Self {
             id,
             name: name.to_owned(),
             runner_group_id,
-            labels: labels.to_vec(),
+            labels,
             owner: owner.to_owned(),
             max_capacity,
         })
@@ -149,6 +172,34 @@ impl ScaleSetBridgeConfig {
             target,
         })
     }
+
+    pub(crate) fn identity(&self) -> ScaleSetBridgeIdentity {
+        let mut hasher = Sha256::new();
+        hasher.update(BRIDGE_IDENTITY_DOMAIN);
+        hash_identity_field(&mut hasher, &[PROTOCOL_VERSION]);
+        hash_identity_field(&mut hasher, self.program.as_os_str().as_encoded_bytes());
+        hash_identity_field(&mut hasher, self.program_digest.as_str().as_bytes());
+        hash_identity_field(&mut hasher, self.github_app.github_config_url.as_bytes());
+        hash_identity_field(&mut hasher, self.github_app.client_id.as_bytes());
+        hash_identity_field(&mut hasher, &self.github_app.installation_id.to_be_bytes());
+        hash_identity_field(&mut hasher, self.github_app.service.as_bytes());
+        hash_identity_field(&mut hasher, self.github_app.account.as_bytes());
+        hash_identity_field(&mut hasher, &self.target.id.to_be_bytes());
+        hash_identity_field(&mut hasher, self.target.name.as_bytes());
+        hash_identity_field(&mut hasher, &self.target.runner_group_id.to_be_bytes());
+        hash_identity_field(&mut hasher, self.target.owner.as_bytes());
+        hash_identity_field(&mut hasher, &self.target.max_capacity.to_be_bytes());
+        for label in &self.target.labels {
+            hash_identity_field(&mut hasher, label.as_bytes());
+        }
+        ScaleSetBridgeIdentity::parse(&format!("sha256:{:x}", hasher.finalize()))
+            .expect("SHA-256 output is canonical")
+    }
+}
+
+fn hash_identity_field(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
+    hasher.update(value);
 }
 
 struct GitHubAppPrivateKey(Vec<u8>);
@@ -817,6 +868,14 @@ impl ScaleSetBridgeClient {
                     .into_iter()
                     .map(|event| normalize_event(event, self.target.id))
                     .collect::<Result<Vec<_>, _>>()?;
+                if events
+                    .iter()
+                    .filter(|event| matches!(event, ScaleSetBridgeEvent::Available(_)))
+                    .count()
+                    > usize::from(available_capacity)
+                {
+                    return Err(ScaleSetBridgeError::new("invalid_bridge_message"));
+                }
                 Ok(ScaleSetBridgePoll::Message {
                     message_id,
                     statistics,
@@ -1626,6 +1685,58 @@ mod tests {
     }
 
     #[test]
+    fn bridge_identity_is_order_canonical_and_changes_with_enrollment() {
+        let base = config();
+        let first = ScaleSetBridgeConfig::new(
+            Path::new(BRIDGE_PROGRAM),
+            base.program_digest.clone(),
+            base.github_app.clone(),
+            ScaleSetBridgeTarget::new(
+                23,
+                "smolrunner",
+                1,
+                &["arm64".to_owned(), "smolrunner".to_owned()],
+                "smolrunner-host",
+                1,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let reordered = ScaleSetBridgeConfig::new(
+            Path::new(BRIDGE_PROGRAM),
+            base.program_digest.clone(),
+            base.github_app.clone(),
+            ScaleSetBridgeTarget::new(
+                23,
+                "smolrunner",
+                1,
+                &["smolrunner".to_owned(), "arm64".to_owned()],
+                "smolrunner-host",
+                1,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let changed = ScaleSetBridgeConfig::new(
+            Path::new(BRIDGE_PROGRAM),
+            base.program_digest,
+            base.github_app,
+            ScaleSetBridgeTarget::new(
+                23,
+                "smolrunner",
+                1,
+                &["arm64".to_owned(), "smolrunner".to_owned()],
+                "another-host",
+                1,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(first.identity(), reordered.identity());
+        assert_ne!(first.identity(), changed.identity());
+    }
+
+    #[test]
     fn session_maps_demand_events_and_exact_ack() {
         let transport = ScriptedTransport::new(&[
             r#"{"version":1,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
@@ -1663,6 +1774,21 @@ mod tests {
             client.poll(2).unwrap_err().code(),
             "invalid_bridge_capacity"
         );
+    }
+
+    #[test]
+    fn poll_rejects_available_events_beyond_current_capacity() {
+        let transport = ScriptedTransport::new(&[
+            r#"{"version":1,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
+            r#"{"version":1,"type":"message","message_id":7,"statistics":{"available_jobs":1,"acquired_jobs":0,"assigned_jobs":1,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0},"events":[{"kind":"available","runner_request_id":41,"repository":"project","owner":"example","job_id":"job-1","workflow_run_id":99,"request_labels":["smolrunner"]}]}"#,
+        ]);
+        let mut client = ScaleSetBridgeClient::connect_with_transport(
+            config(),
+            GitHubAppPrivateKey::parse(b"private-key".to_vec()).unwrap(),
+            Box::new(transport),
+        )
+        .unwrap();
+        assert_eq!(client.poll(0).unwrap_err().code(), "invalid_bridge_message");
     }
 
     #[test]

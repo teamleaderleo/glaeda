@@ -25,6 +25,8 @@ mod disposable_attempt_catalog;
 mod disposable_clone_transaction;
 /// Same-lock durable persistence for prepared-template generation state.
 pub(crate) mod disposable_template_generation;
+/// Same-lock persistence for Scale Set messages before acknowledgement.
+mod github_scale_set_inbox;
 /// Same-lock durable persistence for the personal-worker Lima lifecycle authority.
 pub mod lima_authority;
 
@@ -208,6 +210,7 @@ impl UnixPersonalWorkerStore {
         synchronize_directory(&store._root, "personal worker state root")?;
         disposable_attempt_catalog::refuse_unsettled(&store)?;
         disposable_template_generation::refuse_unsettled(&store)?;
+        github_scale_set_inbox::refuse_unsettled(&store)?;
         lima_authority::refuse_unsettled_lima_authority(&store)?;
         match store.recovery_plan()? {
             StoreRecoveryPlan::Clean {
@@ -260,6 +263,7 @@ impl UnixPersonalWorkerStore {
         synchronize_directory(&store._root, "personal worker state root")?;
         disposable_attempt_catalog::refuse_unsettled(&store)?;
         disposable_template_generation::refuse_unsettled(&store)?;
+        github_scale_set_inbox::refuse_unsettled(&store)?;
         lima_authority::refuse_unsettled_lima_authority(&store)?;
 
         let current_bytes = store.read_named_bytes(CURRENT_DOCUMENT)?.ok_or_else(|| {
@@ -632,6 +636,7 @@ impl PersonalWorkerStore for UnixPersonalWorkerStore {
         let _lock = self.acquire_mutation_lock()?;
         disposable_attempt_catalog::refuse_unsettled(self)?;
         disposable_template_generation::refuse_unsettled(self)?;
+        github_scale_set_inbox::refuse_unsettled(self)?;
         lima_authority::refuse_unsettled_lima_authority(self)?;
         self.recover_locked()?;
         if self.load_named(CURRENT_DOCUMENT)?.is_some() {
@@ -658,6 +663,7 @@ impl PersonalWorkerStore for UnixPersonalWorkerStore {
         let _lock = self.acquire_mutation_lock()?;
         disposable_attempt_catalog::refuse_unsettled(self)?;
         disposable_template_generation::refuse_unsettled(self)?;
+        github_scale_set_inbox::refuse_unsettled(self)?;
         lima_authority::refuse_unsettled_lima_authority(self)?;
         self.recover_locked()?;
         let current = self.load_named(CURRENT_DOCUMENT)?.ok_or_else(|| {
@@ -687,6 +693,7 @@ impl PersonalWorkerStore for UnixPersonalWorkerStore {
         let _lock = self.acquire_mutation_lock()?;
         disposable_attempt_catalog::refuse_unsettled(self)?;
         disposable_template_generation::refuse_unsettled(self)?;
+        github_scale_set_inbox::refuse_unsettled(self)?;
         lima_authority::refuse_unsettled_lima_authority(self)?;
         self.recover_locked()
     }

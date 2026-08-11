@@ -1,6 +1,7 @@
 use smolrunner::disposable_attempt_catalog::DisposableAttemptCatalogAction;
 use smolrunner::disposable_attempt_state::{
-    DisposableAttemptState, decode_disposable_attempt_state, encode_disposable_attempt_state,
+    DISPOSABLE_ATTEMPT_STATE_SCHEMA_VERSION, DisposableAttemptState,
+    decode_disposable_attempt_state, encode_disposable_attempt_state,
 };
 use std::sync::LazyLock;
 
@@ -519,6 +520,14 @@ fn legacy_provisioning_schema_and_current_schema_alias_are_both_refused() {
     );
 
     legacy["schema_version"] = serde_json::json!(4);
+    assert_eq!(
+        decode_disposable_attempt_state(&serde_json::to_vec(&legacy).unwrap())
+            .unwrap_err()
+            .code(),
+        "version_incompatible"
+    );
+
+    legacy["schema_version"] = serde_json::json!(DISPOSABLE_ATTEMPT_STATE_SCHEMA_VERSION);
     assert_eq!(
         decode_disposable_attempt_state(&serde_json::to_vec(&legacy).unwrap())
             .unwrap_err()

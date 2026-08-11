@@ -40,8 +40,17 @@ pub mod execution_receipt_store;
 /// Private-process adapter for the pinned official Runner Scale Set bridge.
 #[cfg(unix)]
 pub(crate) mod github_scale_set_bridge;
+/// Private exact mapping from persisted Scale Set events into disposable-attempt successors.
+#[cfg(unix)]
+pub(crate) mod github_scale_set_consumer;
+/// Private durable persistence-before-ack state for Scale Set lifecycle messages.
+#[cfg(unix)]
+pub(crate) mod github_scale_set_inbox;
 /// Pure bounded vocabulary for GitHub Runner Scale Set job and runner identities.
 pub mod github_scale_set_protocol;
+/// Private one-transition-at-a-time coordinator for the durable Scale Set message path.
+#[cfg(unix)]
+pub(crate) mod github_scale_set_service;
 /// Pure, fail-closed mapping of reviewed GitHub workflow-job evidence into typed broker intents.
 pub mod github_workflow_job_mapper;
 /// Pure, bounded normalization of complete GitHub workflow-job reconciliation snapshots.

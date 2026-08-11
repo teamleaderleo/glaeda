@@ -15,8 +15,8 @@ use serde::Serialize;
 
 use crate::artifact::Sha256Digest;
 use crate::disposable_attempt_catalog::{
-    DisposableAttemptCatalogDocument, DisposableAttemptCatalogRevision,
-    DisposableAttemptReservation,
+    DisposableAttemptCatalogAction, DisposableAttemptCatalogDocument,
+    DisposableAttemptCatalogRevision, DisposableAttemptReservation,
 };
 use crate::disposable_attempt_state::DisposableAttemptRevision;
 use crate::disposable_lima_worker::{
@@ -65,8 +65,69 @@ pub struct DisposableCloneAdmissionObservation {
     cancellation_requested: bool,
 }
 
+/// Opaque exact binding between one settled Scale Set idle poll and one clone candidate.
+///
+/// The type has no public constructor, accessors, serialization, or debug projection. It exists
+/// only so the sealed admission source and durable store transaction can compare the same evidence
+/// without exposing GitHub or durable-state identities.
+pub struct DisposableCloneAdmissionBinding {
+    source_identity: crate::github_scale_set_bridge::ScaleSetBridgeIdentity,
+    catalog_revision: DisposableAttemptCatalogRevision,
+    attempt_id: DisposableAttemptId,
+    attempt_revision: DisposableAttemptRevision,
+    capacity_claim_id: CapacityClaimId,
+    observed_at: EpochMillis,
+    expires_at: EpochMillis,
+}
+
+impl DisposableCloneAdmissionBinding {
+    pub(crate) fn new(
+        source_identity: &crate::github_scale_set_bridge::ScaleSetBridgeIdentity,
+        idle: &crate::github_scale_set_inbox::ScaleSetIdleObservation,
+    ) -> Self {
+        Self {
+            source_identity: source_identity.clone(),
+            catalog_revision: idle.catalog_revision(),
+            attempt_id: idle.attempt_id().clone(),
+            attempt_revision: idle.attempt_revision(),
+            capacity_claim_id: idle.capacity_claim_id().clone(),
+            observed_at: idle.observed_at(),
+            expires_at: idle.not_after(),
+        }
+    }
+
+    pub(crate) const fn source_identity(
+        &self,
+    ) -> &crate::github_scale_set_bridge::ScaleSetBridgeIdentity {
+        &self.source_identity
+    }
+
+    pub(crate) const fn catalog_revision(&self) -> DisposableAttemptCatalogRevision {
+        self.catalog_revision
+    }
+
+    pub(crate) const fn attempt_id(&self) -> &DisposableAttemptId {
+        &self.attempt_id
+    }
+
+    pub(crate) const fn attempt_revision(&self) -> DisposableAttemptRevision {
+        self.attempt_revision
+    }
+
+    pub(crate) const fn capacity_claim_id(&self) -> &CapacityClaimId {
+        &self.capacity_claim_id
+    }
+
+    pub(crate) const fn observed_at(&self) -> EpochMillis {
+        self.observed_at
+    }
+
+    pub(crate) const fn expires_at(&self) -> EpochMillis {
+        self.expires_at
+    }
+}
+
 impl DisposableCloneAdmissionObservation {
-    #[cfg(test)]
     pub(crate) fn new(
         catalog: &DisposableAttemptCatalogDocument,
         reservation: &DisposableAttemptReservation,
@@ -134,7 +195,11 @@ impl DisposableCloneAdmissionObservation {
 /// evidence. The clone transaction invokes it while holding the canonical store lock immediately
 /// before both the durable start checkpoint and the external command.
 pub(crate) mod admission_seal {
-    pub trait Sealed {}
+    pub trait Sealed {
+        fn scale_set_admission_binding(&self) -> Option<&super::DisposableCloneAdmissionBinding> {
+            None
+        }
+    }
 }
 
 pub trait DisposableCloneAdmissionSource: admission_seal::Sealed {
@@ -306,6 +371,33 @@ impl DisposableCloneRuntime {
         )
     }
 
+    /// Persist the exact target-absence checkpoint for one reserved Scale Set attempt.
+    pub(crate) fn authorize_once(
+        &self,
+        attempt_id: &DisposableAttemptId,
+        admission: &impl DisposableCloneAdmissionSource,
+    ) -> Result<(), DisposableCloneRuntimeError> {
+        self.authorize_once_with(
+            attempt_id,
+            admission,
+            &ProcessExecutor,
+            &SystemCloneRuntimeClock,
+        )
+    }
+
+    pub(crate) fn authorize_once_with(
+        &self,
+        attempt_id: &DisposableAttemptId,
+        admission: &impl DisposableCloneAdmissionSource,
+        executor: &impl TimedCommandExecutor,
+        clock: &impl CloneRuntimeClock,
+    ) -> Result<(), DisposableCloneRuntimeError> {
+        let mut store =
+            UnixPersonalWorkerStore::open_or_create_disposable_catalog(&self.state_root)
+                .map_err(|_| DisposableCloneRuntimeError::durable("clone_catalog_unavailable"))?;
+        store.authorize_disposable_clone_transaction(self, attempt_id, admission, executor, clock)
+    }
+
     /// Exercise the future transaction with injected admission, process, and clock sources.
     pub(crate) fn clone_once_with(
         &self,
@@ -381,6 +473,64 @@ impl DisposableCloneRuntime {
             source,
             generation: generation.clone(),
         })
+    }
+
+    pub(crate) fn authorize_locked(
+        &self,
+        catalog: &DisposableAttemptCatalogDocument,
+        generation: &DisposableTemplateGenerationDocument,
+        attempt_id: &DisposableAttemptId,
+        admission: &impl DisposableCloneAdmissionSource,
+        executor: &impl TimedCommandExecutor,
+        clock: &impl CloneRuntimeClock,
+    ) -> Result<(), DisposableCloneRuntimeError> {
+        let reservation = catalog
+            .find_active(attempt_id)
+            .ok_or_else(|| DisposableCloneRuntimeError::durable("clone_attempt_missing"))?;
+        if reservation.attempt().phase() != DisposableAttemptPhase::Reserved {
+            return Err(DisposableCloneRuntimeError::recovery(
+                "clone_authorization_phase_invalid",
+            ));
+        }
+        let source = self
+            .template_runtime
+            .confirm_stopped_clone_source(generation, executor, clock)
+            .map_err(|_| observation("clone_source_not_ready"))?;
+        let target_request = self
+            .worker
+            .target_observation_request(reservation)
+            .map_err(|_| invalid_configuration("clone_target_request_invalid"))?;
+        self.verify_limactl(executor)?;
+        self.confirm_target_absent(&target_request, executor, clock)?;
+        source
+            .confirm_current()
+            .map_err(|_| observation("clone_source_drift"))?;
+        let admission_observation = admission.observe(catalog, reservation)?;
+        let now = clock
+            .epoch_millis()
+            .map_err(|_| observation("clone_clock_unavailable"))?;
+        admission_observation.validate_for(catalog, reservation, now)?;
+        let action = reconcile_attempt(DisposableWorkerReconcileInput {
+            now,
+            attempt: reservation.attempt(),
+            vm: DisposableVmObservation::Absent,
+            vm_identity: None,
+            runner: ScaleSetRunnerObservation::Absent,
+            job_event: None,
+            capacity_reserved: admission_observation.capacity_reserved,
+            cancellation_requested: admission_observation.cancellation_requested,
+        })
+        .map_err(|_| DisposableCloneRuntimeError::recovery("clone_reconcile_failed"))?;
+        if action
+            != (DisposableWorkerAction::Persist {
+                transition: DisposableAttemptCatalogAction::AuthorizeClone,
+            })
+        {
+            return Err(DisposableCloneRuntimeError::recovery(
+                "clone_no_longer_authorizable",
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn execute_locked(
@@ -1018,7 +1168,7 @@ mod tests {
         .unwrap();
     }
 
-    fn install_authorized_attempt(root: &TempRoot) -> DisposableAttemptId {
+    fn install_reserved_attempt(root: &TempRoot) -> DisposableAttemptId {
         let store =
             UnixPersonalWorkerStore::open_or_create_disposable_catalog(root.path()).unwrap();
         let mut catalog = DisposableAttemptCatalog::new(store);
@@ -1040,7 +1190,16 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        let (reserved, _) = catalog.reserve(empty.revision(), reservation).unwrap();
+        catalog.reserve(empty.revision(), reservation).unwrap();
+        attempt_id
+    }
+
+    fn install_authorized_attempt(root: &TempRoot) -> DisposableAttemptId {
+        let attempt_id = install_reserved_attempt(root);
+        let store =
+            UnixPersonalWorkerStore::open_or_create_disposable_catalog(root.path()).unwrap();
+        let mut catalog = DisposableAttemptCatalog::new(store);
+        let reserved = catalog.load().unwrap();
         catalog
             .transition(
                 reserved.revision(),
@@ -1094,6 +1253,35 @@ mod tests {
         let attempt = durable_attempt(&root, &attempt_id);
         assert_eq!(attempt.phase(), DisposableAttemptPhase::CloneStarted);
         assert!(attempt.vm_identity().is_some());
+    }
+
+    #[test]
+    fn reserved_attempt_is_authorized_only_after_exact_absence_preflight() {
+        let root = TempRoot::new("authorize");
+        let host = LimaHostIdentityFixture::new_with_disk_bytes(
+            "clone-runtime-authorize",
+            SOURCE,
+            SOURCE_DISK,
+        );
+        let runtime = runtime(&root, &host);
+        install_ready_generation(&root, &host, &runtime);
+        let attempt_id = install_reserved_attempt(&root);
+        let executor = executor(&host, false);
+        let admission = FakeAdmission::available();
+
+        runtime
+            .authorize_once_with(&attempt_id, &admission, &executor, &FixedClock)
+            .unwrap();
+
+        let attempt = durable_attempt(&root, &attempt_id);
+        assert_eq!(attempt.phase(), DisposableAttemptPhase::CloneAuthorized);
+        assert_eq!(attempt.revision().get(), 2);
+        assert_eq!(executor.clone_count(), 0);
+        let replay = runtime
+            .authorize_once_with(&attempt_id, &admission, &executor, &FixedClock)
+            .unwrap_err();
+        assert_eq!(replay.code(), "clone_authorization_phase_invalid");
+        assert_eq!(executor.clone_count(), 0);
     }
 
     #[test]

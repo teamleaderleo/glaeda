@@ -522,7 +522,15 @@ fn top_level_future_schema_and_unknown_fields_fail_closed() {
         DisposableAttemptCatalogCodecErrorKind::VersionIncompatible
     );
 
-    value["schema_version"] = serde_json::json!(6);
+    previous_catalog["schema_version"] = serde_json::json!(5);
+    assert_eq!(
+        decode_disposable_attempt_catalog(&serde_json::to_vec(&previous_catalog).unwrap())
+            .unwrap_err()
+            .kind(),
+        DisposableAttemptCatalogCodecErrorKind::VersionIncompatible
+    );
+
+    value["schema_version"] = serde_json::json!(7);
     let future = serde_json::to_vec(&value).unwrap();
     assert_eq!(
         decode_disposable_attempt_catalog(&future)
@@ -531,7 +539,7 @@ fn top_level_future_schema_and_unknown_fields_fail_closed() {
         DisposableAttemptCatalogCodecErrorKind::VersionIncompatible
     );
 
-    value["schema_version"] = serde_json::json!(5);
+    value["schema_version"] = serde_json::json!(6);
     value["unexpected"] = serde_json::json!(true);
     let unknown = serde_json::to_vec(&value).unwrap();
     assert_eq!(

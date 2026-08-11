@@ -128,6 +128,9 @@ catalog directly. Restart-at-every-checkpoint coverage exercises the real crash-
 - [x] Enforce concurrency, CPU, memory, and disk budgets before additional workers are admitted.
 - [x] Model cancellation, expiry, reservation loss, runner loss, missing/orphan VM state, duplicate/out-of-order job events, and cleanup ordering.
 - [x] Persist the attempt through the existing crash-safe state machinery with exact revisions and recovery semantics.
+- [x] Bind an acquired Scale Set offer to its exact GitHub job before clone authority; runnerless pre-clone cancellation releases capacity without manufacturing VM cleanup authority.
+- [x] Derive clone admission from a durable zero-capacity Scale Set idle poll bound to the exact catalog, attempt revision, claim, and source; require a new poll after clone authorization advances state.
+- [x] Complete and retire unacquired or pre-clone-canceled attempts one durable transition at a time so capacity returns and bounded replay history replaces active-state accumulation.
 - [x] Split prechosen runner name from GitHub-assigned runner ID so ambiguous JIT registration can recover by stable identity.
 - [x] Preserve Scale Set job identity and result as bounded protocol values instead of assuming narrower REST/enum forms.
 - [x] Cover crash-after-every-checkpoint, exact late-event binding, refusal of unbound runnerless completion, unknown completion strings, exact stale-registration cleanup, and scale-to-zero in deterministic persistence tests.
@@ -167,10 +170,12 @@ Make GitHub the normal control path for agents and humans.
   a secret-bearing subprocess, argv, environment, or public execution record.
 - [x] Refuse secret-bearing bridge startup unless the fixed protected installation path matches the
   reviewed SHA-256 identity, and bound every bridge operation with a finite deadline.
-- [ ] Integrate a pinned Runner Scale Set Client behind a narrow adapter for demand, sessions, acknowledgement, JIT generation, job-start, and job-completion observations.
+- [x] Integrate a pinned Runner Scale Set Client behind a narrow adapter for demand, sessions, acknowledgement, JIT generation, job-start, and job-completion observations.
   - [x] Pin the official Go client behind a bounded empty-environment bridge whose messages require
-    an explicit post-persistence acknowledgement; the durable service consumer remains open.
-- [ ] Validate every upstream response before it can advance durable state; malformed or internally inconsistent responses retain the prior attempt and fail closed.
+    an explicit post-persistence acknowledgement.
+  - [x] Persist each normalized message before acknowledgement, apply its events under the canonical
+    store lock, and reconcile the exact acquired subset before admitting another message.
+- [x] Validate every upstream response before it can advance durable state; malformed or internally inconsistent responses retain the prior attempt and fail closed.
 - [ ] Persist a unique runner name before JIT creation; bind the service-assigned runner ID only after exact scale-set identity is observed.
 - [ ] Transfer JIT configuration without argv, public logs, public journals, reusable guest storage, or a long-lived parent environment carrying the secret.
 - [ ] Prefer direct execution of the official `Runner.Listener`; add only a tiny bounded exec-only guest launcher if the existing control path cannot deliver the secret cleanly.
