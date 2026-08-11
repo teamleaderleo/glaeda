@@ -110,6 +110,13 @@ Acceptance: fake/injected executor tests first; then an explicit physical-Mac te
 
 Integrate a pinned build of GitHub's Runner Scale Set Client behind a narrow local adapter. Add Keychain-backed GitHub App authentication, scale-set session recovery, current-capacity reporting, JIT configuration generation, exact runner/VM binding, actual-job lifecycle binding, one-job execution, stale-runner deletion, and bounded log collection. Its long-polling session avoids an inbound webhook and avoids recreating GitHub's assignment semantics in Rust.
 
+The checked-in `tools/scaleset-bridge` foundation pins the official Go client and exposes an
+empty-environment, stdin/stdout-only protocol for exact scale-set validation, long polling,
+explicit post-persistence acknowledgement, JIT generation, and exact runner observation/removal.
+It deliberately does not use the official convenience listener's acknowledge-before-handler
+ordering. No Rust caller, Keychain credential source, durable message consumer, enrollment path, or
+guest JIT handoff exists yet, so this foundation is not production capacity.
+
 Acceptance: an enrolled test repository targets the SmolRunner scale-set label, queues a job, and receives its result without operator commands; the JIT runner cannot accept a second job and its credential is absent after VM destruction.
 
 ### M4 — hostile-CI network and nested-container policy
