@@ -2,7 +2,7 @@
 //!
 //! This module deliberately stops before process execution. It converts one bridge-issued JIT
 //! configuration into a non-cloneable, non-serializable command plan whose secret exists only in
-//! a guaranteed-zeroizing environment value. A later same-lock service must freshly prove the
+//! a guaranteed-zeroizing standard-input value. A later same-lock service must freshly prove the
 //! exact disposable target ready, durably record the returned runner ID, publish a no-replay
 //! runner-start checkpoint, and only then consume the command.
 
@@ -26,13 +26,11 @@ use crate::process::CommandSpec;
 
 const MAX_PRIVATE_PATH_BYTES: usize = 1_024;
 const RUNNER_WORK_DIRECTORY: &str = "/opt/smolrunner/actions-runner";
-const RUNNER_LISTENER: &str = "/opt/smolrunner/actions-runner/bin/Runner.Listener";
+const JIT_LAUNCHER: &str = "/opt/smolrunner/bin/smolrunner-jit-launcher";
 const SUDO: &str = "/usr/bin/sudo";
+const ENV: &str = "/usr/bin/env";
 const RUNNER_USER: &str = "smolrunner-runner";
-const JIT_ENVIRONMENT: &str = "ACTIONS_RUNNER_INPUT_JITCONFIG";
-const RESULT_ENVIRONMENT: &str = "ACTIONS_RUNNER_RETURN_JOB_RESULT_FOR_HOSTED";
-const SHELLENV_ALLOW: &str =
-    "ACTIONS_RUNNER_INPUT_JITCONFIG,ACTIONS_RUNNER_RETURN_JOB_RESULT_FOR_HOSTED";
+const RUNNER_HOME: &str = "/var/lib/smolrunner-runner";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DisposableRunnerRuntimeErrorKind {
@@ -132,24 +130,20 @@ impl DisposableRunnerRuntime {
         let command = self
             .base_command()
             .argument("shell")
-            .argument("--preserve-env")
             .argument("--workdir")
             .argument(RUNNER_WORK_DIRECTORY)
             .argument(attempt.vm_id().as_str())
             .argument(SUDO)
             .argument("--non-interactive")
             .argument("--set-home")
-            .argument(format!("--preserve-env={SHELLENV_ALLOW}"))
             .argument("--user")
             .argument(RUNNER_USER)
-            .argument(RUNNER_LISTENER)
-            .argument("run")
-            .argument("--startuptype")
-            .argument("service")
-            .environment("LIMA_SHELLENV_BLOCK", "*")
-            .environment("LIMA_SHELLENV_ALLOW", SHELLENV_ALLOW)
-            .zeroizing_secret_environment(JIT_ENVIRONMENT, encoded)
-            .environment(RESULT_ENVIRONMENT, "true");
+            .argument(ENV)
+            .argument("-i")
+            .argument(format!("HOME={RUNNER_HOME}"))
+            .argument("PATH=/usr/bin:/bin")
+            .argument(JIT_LAUNCHER)
+            .zeroizing_secret_stdin_line(encoded);
 
         Ok(DisposableRunnerLaunchPlan {
             attempt_id: attempt.attempt_id().clone(),
@@ -234,7 +228,7 @@ impl fmt::Debug for DisposableRunnerLaunchPlan {
             .field("vm_identity", &self.vm_identity)
             .field("runner", &self.runner)
             .field("not_after", &self.not_after)
-            .field("command", &self.command)
+            .field("command", &"<fixed-secret-stdin-command>")
             .finish()
     }
 }
@@ -256,8 +250,11 @@ fn validate_jit(value: &Zeroizing<String>) -> Result<(), DisposableRunnerRuntime
 fn validate_private_path(path: PathBuf) -> Result<PathBuf, DisposableRunnerRuntimeError> {
     let raw = path.to_str().ok_or_else(invalid_configuration)?;
     if !path.is_absolute()
+        || raw == "/"
         || raw.len() > MAX_PRIVATE_PATH_BYTES
+        || raw.bytes().any(|byte| byte.is_ascii_control())
         || raw.contains("//")
+        || raw.ends_with('/')
         || raw
             .split('/')
             .any(|component| matches!(component, "." | ".."))
@@ -381,7 +378,8 @@ mod tests {
         assert!(!argv.iter().any(|value| value.contains(secret)));
         assert_eq!(argv[0], "/opt/homebrew/bin/limactl");
         assert!(argv.windows(2).any(|pair| pair == ["--user", RUNNER_USER]));
-        assert!(argv.iter().any(|value| value == RUNNER_LISTENER));
+        assert!(argv.iter().any(|value| value == JIT_LAUNCHER));
+        assert!(!argv.iter().any(|value| value == "--preserve-env"));
         assert_eq!(
             plan.command()
                 .environment
@@ -389,14 +387,10 @@ mod tests {
                 .cloned()
                 .collect::<Vec<_>>(),
             vec![
-                JIT_ENVIRONMENT.to_owned(),
-                RESULT_ENVIRONMENT.to_owned(),
                 "HOME".to_owned(),
                 "LANG".to_owned(),
                 "LC_ALL".to_owned(),
                 "LIMA_HOME".to_owned(),
-                "LIMA_SHELLENV_ALLOW".to_owned(),
-                "LIMA_SHELLENV_BLOCK".to_owned(),
             ]
         );
         let debug = format!("{plan:?}");
@@ -405,7 +399,7 @@ mod tests {
         assert!(!json.contains(secret));
         assert!(!debug.contains("/Users/operator"));
         assert!(!json.contains("/Users/operator"));
-        assert!(debug.contains("[REDACTED]"));
+        assert!(debug.contains("<fixed-secret-stdin-command>"));
         assert!(json.contains("[REDACTED]"));
     }
 
@@ -455,14 +449,26 @@ mod tests {
 
     #[test]
     fn runtime_refuses_path_aliases() {
-        assert_eq!(
-            DisposableRunnerRuntime::new(
-                "/opt/./homebrew/bin/limactl",
-                "/Users/operator/.lima-smolrunner",
-            )
-            .unwrap_err()
-            .code(),
-            "runner_runtime_configuration_invalid"
-        );
+        for path in [
+            "/",
+            "/opt/./homebrew/bin/limactl",
+            "/opt/homebrew/bin/limactl/",
+            "/opt/homebrew/bin/limactl\nchanged",
+        ] {
+            assert_eq!(
+                DisposableRunnerRuntime::new(path, "/Users/operator/.lima-smolrunner")
+                    .unwrap_err()
+                    .code(),
+                "runner_runtime_configuration_invalid"
+            );
+        }
+
+        let runtime = DisposableRunnerRuntime::new(
+            "/Users/operator/private/bin/limactl",
+            "/Users/operator/.lima-smolrunner",
+        )
+        .unwrap();
+        let debug = format!("{runtime:?}");
+        assert!(!debug.contains("/Users/operator"));
     }
 }

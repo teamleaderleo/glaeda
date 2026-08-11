@@ -11,10 +11,10 @@ use sha2::{Digest, Sha256};
 
 use crate::artifact::Sha256Digest;
 
-pub const DISPOSABLE_PREPARED_TEMPLATE_SCHEMA_VERSION: u8 = 2;
+pub const DISPOSABLE_PREPARED_TEMPLATE_SCHEMA_VERSION: u8 = 3;
 pub const MAX_DISPOSABLE_PREPARED_TEMPLATE_BYTES: usize = 16_384;
 pub const MAX_DISPOSABLE_LIMA_TEMPLATE_BYTES: usize = 64 * 1_024;
-const IDENTITY_DOMAIN: &[u8] = b"smolrunner.disposable-prepared-template.v2\0";
+const IDENTITY_DOMAIN: &[u8] = b"smolrunner.disposable-prepared-template.v3\0";
 const CURRENT_MANIFEST_BYTES: &[u8] =
     include_bytes!("../examples/lima/smolrunner-prepared-template.json");
 const CURRENT_LIMA_TEMPLATE_BYTES: &[u8] =
@@ -300,6 +300,8 @@ struct ProvisioningWire {
     workload_user: String,
     runner_install_directory: String,
     runner_work_directory: String,
+    jit_launcher_path: String,
+    jit_launcher_digest: String,
     ready_marker_path: String,
     runner_dependency_install: String,
     os_package_source: String,
@@ -411,6 +413,7 @@ fn validate_wire(
         Sha256Digest::parse(&wire.actions_runner.digest).map_err(|_| invalid_document())?;
     let lima_template_digest = Sha256Digest::parse(&wire.provisioning.lima_template_digest)
         .map_err(|_| invalid_document())?;
+    Sha256Digest::parse(&wire.provisioning.jit_launcher_digest).map_err(|_| invalid_document())?;
     if wire.guest_image.architecture != "aarch64"
         || wire.guest_image.variant != "server"
         || !valid_noble_arm64_image_location(&wire.guest_image.location)
@@ -441,6 +444,9 @@ fn validate_wire(
         || provisioning.admin_user == provisioning.workload_user
         || provisioning.runner_install_directory != "/opt/smolrunner/actions-runner"
         || provisioning.runner_work_directory != "/var/lib/smolrunner-runner/work"
+        || provisioning.jit_launcher_path != "/opt/smolrunner/bin/smolrunner-jit-launcher"
+        || provisioning.jit_launcher_digest
+            != "sha256:9b7cc857f2de1181f64bb067e4d4870e0bcb679d597ec047d885395ac6160996"
         || provisioning.ready_marker_path != "/etc/smolrunner/prepared-template.json"
         || provisioning.runner_dependency_install != "official_archive_script"
         || provisioning.os_package_source != "ubuntu_noble_signed_repositories_at_build"
@@ -563,7 +569,7 @@ mod tests {
     #[test]
     fn checked_in_manifest_is_canonical_pinned_and_domain_bound() {
         let manifest = current_disposable_prepared_template().unwrap();
-        assert_eq!(manifest.schema_version(), 2);
+        assert_eq!(manifest.schema_version(), 3);
         assert_eq!(manifest.actions_runner_version(), "2.336.0");
         assert_eq!(manifest.lima_version(), "2.2.0");
         assert_eq!(manifest.actions_runner_archive_bytes(), 138_824_064);
@@ -580,7 +586,7 @@ mod tests {
         );
         assert_eq!(
             manifest.lima_template_digest().as_str(),
-            "sha256:f602539881c741e3db4e69a7658123db6dd5cb01ca4f755c80972e3bf8674974"
+            "sha256:7adc6bf690b4604c555b32c333d97fe8df0641b69976604f4826076244bc0e2c"
         );
         assert_eq!(
             manifest.ready_marker_path(),
@@ -595,13 +601,13 @@ mod tests {
         );
         assert_eq!(
             manifest.identity().unwrap().as_str(),
-            "sha256:2da01364903b194df9bd9ecd7fdc201195251e7d1d01b620ebe644488b788f4e"
+            "sha256:df14b5d9fea12a48bc827ed0d6229e46d204df0296063e090a6beff2d7d71ac6"
         );
     }
 
     #[test]
     fn version_precedes_new_fields_and_unknown_or_noncanonical_input_fails_closed() {
-        for version in [1, 3] {
+        for version in [1, 2, 4] {
             let mut value: serde_json::Value =
                 serde_json::from_slice(CURRENT_MANIFEST_BYTES).unwrap();
             value["schema_version"] = serde_json::json!(version);
@@ -712,7 +718,7 @@ mod tests {
         changed_manifests.push(redecode(&changed));
 
         let mut changed = baseline.clone();
-        changed.wire.provisioning.recipe_revision = 3;
+        changed.wire.provisioning.recipe_revision = 4;
         changed_manifests.push(redecode(&changed));
 
         for changed_manifest in changed_manifests {
