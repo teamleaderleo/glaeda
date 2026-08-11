@@ -23,13 +23,14 @@ const bridgeVersion = "0.1.0"
 const maxServiceResponseBytes = 2 * 1024 * 1024
 
 type protocolRequest struct {
-	Version    int         `json:"version"`
-	Operation  string      `json:"operation"`
-	Start      startConfig `json:"start,omitempty"`
-	MessageID  int         `json:"message_id,omitempty"`
-	RunnerName string      `json:"runner_name,omitempty"`
-	RunnerID   int64       `json:"runner_id,omitempty"`
-	WorkFolder string      `json:"work_folder,omitempty"`
+	Version          int         `json:"version"`
+	Operation        string      `json:"operation"`
+	Start            startConfig `json:"start,omitempty"`
+	MessageID        int         `json:"message_id,omitempty"`
+	RunnerRequestIDs []int64     `json:"runner_request_ids,omitempty"`
+	RunnerName       string      `json:"runner_name,omitempty"`
+	RunnerID         int64       `json:"runner_id,omitempty"`
+	WorkFolder       string      `json:"work_folder,omitempty"`
 }
 
 type startConfig struct {
@@ -415,6 +416,8 @@ func (server *server) handle(ctx context.Context, request protocolRequest) proto
 		return server.poll(ctx)
 	case "ack":
 		return server.ack(ctx, request.MessageID)
+	case "acquire":
+		return server.acquire(ctx, request.RunnerRequestIDs)
 	case "generate_jit":
 		return server.generateJIT(ctx, request.RunnerName, request.WorkFolder)
 	case "observe_runner":
@@ -509,11 +512,38 @@ func (server *server) ack(ctx context.Context, messageID int) protocolResponse {
 	return protocolResponse{Version: protocolVersion, Type: "acked", MessageID: messageID, AcquiredRequests: acquired}
 }
 
+func (server *server) acquire(ctx context.Context, requestIDs []int64) protocolResponse {
+	if server.backend == nil {
+		return errorResponse("not_started")
+	}
+	if server.pending != nil {
+		return errorResponse("ack_required")
+	}
+	if len(requestIDs) == 0 || len(requestIDs) > 50 {
+		return errorResponse("invalid_acquisition_request")
+	}
+	if err := validateAcquiredJobs(requestIDs, nil); err != nil {
+		return errorResponse("invalid_acquisition_request")
+	}
+	acquired, err := server.backend.AcquireJobs(ctx, requestIDs)
+	if err != nil {
+		return errorResponse("acquire_failed")
+	}
+	if err := validateAcquiredJobs(requestIDs, acquired); err != nil {
+		return errorResponse("invalid_acquisition")
+	}
+	slices.Sort(acquired)
+	return protocolResponse{Version: protocolVersion, Type: "acquired", AcquiredRequests: acquired}
+}
+
 func validateAcquiredJobs(available, acquired []int64) error {
 	expected := make(map[int64]struct{}, len(available))
 	for _, id := range available {
 		if id <= 0 {
 			return errors.New("invalid available job request")
+		}
+		if _, exists := expected[id]; exists {
+			return errors.New("duplicate available job request")
 		}
 		expected[id] = struct{}{}
 	}
