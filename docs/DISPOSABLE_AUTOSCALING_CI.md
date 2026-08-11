@@ -279,7 +279,13 @@ point; it boundedly loads the existing secret-free enrollment and then enters th
 The enrollment must be an owner-matched mode-0600 single-link regular file beneath an
 owner-matched non-writable directory path; startup opens the path without following links and
 requires stable descriptor, pathname, metadata, and bytes before accepting its authority.
-The launchd installation/removal contract and comprehensive bounded status remain incomplete.
+The pure `service plan` surface now binds the exact executable and enrollment to one private
+mode-0600 user LaunchAgent, a fixed label, `KeepAlive`/`RunAtLoad`, bounded restart throttling,
+null output, and an ordered install/removal compensation contract. It never writes the property
+list or invokes `launchctl`; operator-machine installation or removal still requires explicit
+approval and a future same-evidence executor. Running as a user LaunchAgent deliberately delegates
+login-session restart to `launchd` and preserves access to the operator's Keychain and Lima/VZ
+state without granting a root daemon those credentials.
 
 The first operator-control surface is deliberately small: a private empty marker under the
 canonical store lock represents an admission hold. `worker admission hold` makes every demand poll
