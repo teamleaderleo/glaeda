@@ -23,6 +23,9 @@ use crate::personal_worker_store::{
 mod disposable_attempt_catalog;
 /// Same-lock clone checkpoint, execution, and identity publication.
 mod disposable_clone_transaction;
+/// Same-lock JIT registration, no-replay checkpoint, and one-job runner execution.
+mod disposable_runner_transaction;
+pub(crate) use disposable_runner_transaction::DisposableRunnerTransactionOutcome;
 /// Same-lock durable persistence for prepared-template generation state.
 pub(crate) mod disposable_template_generation;
 /// Same-lock persistence for Scale Set messages before acknowledgement.

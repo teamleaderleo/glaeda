@@ -461,6 +461,22 @@ func TestRunnerRemovalReobservesExactScaleSetIdentity(t *testing.T) {
 	}
 }
 
+func TestRunnerObservationDistinguishesProvenAbsenceFromFailure(t *testing.T) {
+	backend := &fakeBackend{}
+	server := startedServer(t, backend)
+	response := server.handle(context.Background(), protocolRequest{Version: 1, Operation: "observe_runner", RunnerName: "smolrunner-job-1"})
+	if response.Type != "runner_absent" || response.Code != "" || response.Runner != nil || !reflect.DeepEqual(backend.calls, []string{"runner:smolrunner-job-1"}) {
+		t.Fatalf("absent response=%#v calls=%v", response, backend.calls)
+	}
+
+	backend.calls = nil
+	backend.runner = &scaleset.RunnerReference{ID: 81, Name: "smolrunner-job-1", RunnerScaleSetID: 23}
+	response = server.handle(context.Background(), protocolRequest{Version: 1, Operation: "observe_runner", RunnerName: "smolrunner-job-1"})
+	if response.Type != "runner" || response.Runner == nil || response.Runner.ID != 81 || !reflect.DeepEqual(backend.calls, []string{"runner:smolrunner-job-1"}) {
+		t.Fatalf("present response=%#v calls=%v", response, backend.calls)
+	}
+}
+
 func TestMessageBoundsFailBeforeAckAuthority(t *testing.T) {
 	backend := &fakeBackend{message: &scaleset.RunnerScaleSetMessage{
 		MessageID:  7,

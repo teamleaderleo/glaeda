@@ -10,19 +10,24 @@ use crate::disposable_clone_runtime::{
     DisposableCloneRuntime, DisposableCloneRuntimeError, DisposableCloneTransactionOutcome,
     PendingCloneScaleSetMessage, admission_seal,
 };
+use crate::disposable_runner_runtime::{
+    DisposableRunnerRegistrationSource, DisposableRunnerRuntime, DisposableRunnerRuntimeError,
+};
 use crate::disposable_worker_reconciler::DisposableAttemptId;
 use crate::disposable_worker_reconciler::DisposableAttemptPhase;
 use crate::execution_admission::EpochMillis;
 use crate::github_scale_set_bridge::{
     ScaleSetBridgeClient, ScaleSetBridgeError, ScaleSetBridgeIdentity, ScaleSetBridgePoll,
-    ScaleSetStatistics,
+    ScaleSetJitReceipt, ScaleSetRunnerLookup, ScaleSetStatistics,
 };
 use crate::github_scale_set_consumer::{
     ScaleSetConsumerError, ScaleSetConsumerPolicy, apply_scale_set_ack_outcome,
     apply_scale_set_event,
 };
 use crate::github_scale_set_inbox::ScaleSetInboxError;
+use crate::github_scale_set_protocol::{ScaleSetRunnerName, ScaleSetRunnerReference};
 use crate::process::TimedCommandExecutor;
+use crate::unix_personal_worker_store::DisposableRunnerTransactionOutcome;
 use crate::unix_personal_worker_store::UnixPersonalWorkerStore;
 
 const MESSAGE_FRESHNESS_MILLIS: u64 = 30_000;
@@ -32,6 +37,23 @@ pub(crate) trait ScaleSetBridgeSession {
     fn ack(&mut self, message_id: u32) -> Result<Vec<u64>, ScaleSetBridgeError>;
 }
 
+pub(crate) trait ScaleSetRunnerBridgeSession {
+    fn generate_jit(
+        &mut self,
+        runner_name: &ScaleSetRunnerName,
+    ) -> Result<ScaleSetJitReceipt, ScaleSetBridgeError>;
+
+    fn observe_runner(
+        &mut self,
+        runner_name: &ScaleSetRunnerName,
+    ) -> Result<ScaleSetRunnerLookup, ScaleSetBridgeError>;
+
+    fn remove_runner(
+        &mut self,
+        runner: &ScaleSetRunnerReference,
+    ) -> Result<(), ScaleSetBridgeError>;
+}
+
 impl ScaleSetBridgeSession for ScaleSetBridgeClient {
     fn poll(&mut self, available_capacity: u16) -> Result<ScaleSetBridgePoll, ScaleSetBridgeError> {
         ScaleSetBridgeClient::poll(self, available_capacity)
@@ -39,6 +61,29 @@ impl ScaleSetBridgeSession for ScaleSetBridgeClient {
 
     fn ack(&mut self, message_id: u32) -> Result<Vec<u64>, ScaleSetBridgeError> {
         ScaleSetBridgeClient::ack(self, message_id)
+    }
+}
+
+impl ScaleSetRunnerBridgeSession for ScaleSetBridgeClient {
+    fn generate_jit(
+        &mut self,
+        runner_name: &ScaleSetRunnerName,
+    ) -> Result<ScaleSetJitReceipt, ScaleSetBridgeError> {
+        ScaleSetBridgeClient::generate_jit(self, runner_name)
+    }
+
+    fn observe_runner(
+        &mut self,
+        runner_name: &ScaleSetRunnerName,
+    ) -> Result<ScaleSetRunnerLookup, ScaleSetBridgeError> {
+        ScaleSetBridgeClient::observe_runner(self, runner_name)
+    }
+
+    fn remove_runner(
+        &mut self,
+        runner: &ScaleSetRunnerReference,
+    ) -> Result<(), ScaleSetBridgeError> {
+        ScaleSetBridgeClient::remove_runner(self, runner)
     }
 }
 
@@ -68,6 +113,8 @@ pub(crate) enum ScaleSetServiceDisposition {
     MessagePersisted { message_id: u32 },
     CloneAuthorized { attempt_id: String },
     CloneCompleted { attempt_id: String },
+    RunnerRegistrationRecovered { attempt_id: String },
+    RunnerCommandCompleted { attempt_id: String },
     EventApplied { message_id: u32, event_index: usize },
     MessageAcknowledged { message_id: u32 },
     AckOutcomeApplied { message_id: u32 },
@@ -302,9 +349,78 @@ impl<B: ScaleSetBridgeSession, C: ScaleSetServiceClock> ScaleSetService<B, C> {
         }
     }
 
+    pub(crate) fn run_registered_once(
+        &mut self,
+        runner_runtime: &DisposableRunnerRuntime,
+        clone_runtime: &DisposableCloneRuntime,
+        attempt_id: &DisposableAttemptId,
+        executor: &impl TimedCommandExecutor,
+        clock: &impl CloneRuntimeClock,
+    ) -> Result<ScaleSetServiceDisposition, ScaleSetServiceError>
+    where
+        B: ScaleSetRunnerBridgeSession,
+    {
+        let mut registration = LiveScaleSetRunnerRegistration {
+            bridge: &mut self.bridge,
+            source_identity: &self.source_identity,
+        };
+        match self
+            .store
+            .execute_disposable_runner_transaction(
+                runner_runtime,
+                clone_runtime,
+                attempt_id,
+                &mut registration,
+                executor,
+                clock,
+            )
+            .map_err(ScaleSetServiceError::from_runner)?
+        {
+            DisposableRunnerTransactionOutcome::RegistrationRecovered { attempt_id } => {
+                Ok(ScaleSetServiceDisposition::RunnerRegistrationRecovered { attempt_id })
+            }
+            DisposableRunnerTransactionOutcome::CommandCompleted(receipt) => {
+                Ok(ScaleSetServiceDisposition::RunnerCommandCompleted {
+                    attempt_id: receipt.attempt_id().as_str().to_owned(),
+                })
+            }
+        }
+    }
+
     #[cfg(test)]
     fn into_parts(self) -> (UnixPersonalWorkerStore, B) {
         (self.store, self.bridge)
+    }
+}
+
+struct LiveScaleSetRunnerRegistration<'a, B> {
+    bridge: &'a mut B,
+    source_identity: &'a ScaleSetBridgeIdentity,
+}
+
+impl<B: ScaleSetRunnerBridgeSession> DisposableRunnerRegistrationSource
+    for LiveScaleSetRunnerRegistration<'_, B>
+{
+    fn scale_set_source_identity(&self) -> &ScaleSetBridgeIdentity {
+        self.source_identity
+    }
+
+    fn observe_runner(
+        &mut self,
+        runner_name: &ScaleSetRunnerName,
+    ) -> Result<ScaleSetRunnerLookup, DisposableRunnerRuntimeError> {
+        self.bridge
+            .observe_runner(runner_name)
+            .map_err(|error| DisposableRunnerRuntimeError::bridge(error.code()))
+    }
+
+    fn generate_jit(
+        &mut self,
+        runner_name: &ScaleSetRunnerName,
+    ) -> Result<ScaleSetJitReceipt, DisposableRunnerRuntimeError> {
+        self.bridge
+            .generate_jit(runner_name)
+            .map_err(|error| DisposableRunnerRuntimeError::bridge(error.code()))
     }
 }
 
@@ -438,6 +554,10 @@ impl ScaleSetServiceError {
     }
 
     fn from_clone(error: DisposableCloneRuntimeError) -> Self {
+        Self::new(error.code())
+    }
+
+    fn from_runner(error: DisposableRunnerRuntimeError) -> Self {
         Self::new(error.code())
     }
 

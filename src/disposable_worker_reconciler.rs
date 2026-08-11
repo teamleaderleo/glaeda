@@ -593,6 +593,13 @@ pub fn reconcile_attempt(
         {
             persist(DisposableAttemptCatalogAction::BeginCleanup)
         }
+        Phase::Assigned
+            if input.attempt.runner_id().is_none()
+                && !input.attempt.runner_start_started()
+                && matches!(input.runner, ScaleSetRunnerObservation::Absent) =>
+        {
+            Action::GenerateJitAndStartRunner
+        }
         Phase::Waiting | Phase::Assigned | Phase::Running => match &input.runner {
             ScaleSetRunnerObservation::Unknown => Action::Observe {
                 target: DisposableWorkerObservationTarget::Runner,

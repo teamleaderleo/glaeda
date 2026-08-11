@@ -568,7 +568,13 @@ func (server *server) observeRunner(ctx context.Context, name string) protocolRe
 		return errorResponse("invalid_runner")
 	}
 	result, err := server.backend.GetRunnerByName(ctx, name)
-	if err != nil || result == nil || result.ID <= 0 || result.Name != name || result.RunnerScaleSetID != server.config.ScaleSetID {
+	if err != nil {
+		return errorResponse("runner_unavailable")
+	}
+	if result == nil {
+		return protocolResponse{Version: protocolVersion, Type: "runner_absent"}
+	}
+	if result.ID <= 0 || result.Name != name || result.RunnerScaleSetID != server.config.ScaleSetID {
 		return errorResponse("runner_unavailable")
 	}
 	return protocolResponse{Version: protocolVersion, Type: "runner", Runner: normalizeRunner(result)}

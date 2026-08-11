@@ -287,6 +287,21 @@ fn happy_path_uses_canonical_durable_transitions() {
         DisposableWorkerAction::GenerateJitAndStartRunner
     );
 
+    let assigned_before_jit = state.record_assigned(job("job-before-jit")).unwrap();
+    assert_eq!(
+        assigned_before_jit.phase(),
+        DisposableAttemptPhase::Assigned
+    );
+    assert_eq!(
+        reconcile_attempt(input(
+            &assigned_before_jit,
+            DisposableVmObservation::Ready,
+            ScaleSetRunnerObservation::Absent,
+        ))
+        .unwrap(),
+        DisposableWorkerAction::GenerateJitAndStartRunner
+    );
+
     let exact_runner = runner(41);
     state = state.record_registration(&exact_runner).unwrap();
     state = state.record_runner_start_started().unwrap();

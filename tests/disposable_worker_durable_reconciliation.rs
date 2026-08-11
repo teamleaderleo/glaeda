@@ -168,6 +168,21 @@ fn initialize(root: &Path) -> DisposableAttemptCatalogDocument {
         .0
 }
 
+fn persist_attempt_action(root: &Path, action: DisposableAttemptCatalogAction) {
+    let store = UnixPersonalWorkerStore::open_or_create_disposable_catalog(root).unwrap();
+    let mut catalog = DisposableAttemptCatalog::new(store);
+    let current = catalog.load().unwrap();
+    let attempt = current.find_active(&attempt_id()).unwrap().attempt();
+    catalog
+        .transition(
+            current.revision(),
+            &attempt_id(),
+            attempt.revision(),
+            action,
+        )
+        .unwrap();
+}
+
 fn tick(
     root: &Path,
     vm: DisposableVmObservation,
@@ -329,6 +344,14 @@ fn every_durable_checkpoint_reopens_without_duplicate_capacity_or_cleanup_loss()
     }
 
     let exact_runner = runner();
+    persist_attempt_action(
+        root.path(),
+        DisposableAttemptCatalogAction::RecordRegistration(exact_runner.clone()),
+    );
+    persist_attempt_action(
+        root.path(),
+        DisposableAttemptCatalogAction::RecordRunnerStartStarted,
+    );
     let (state, _) = tick(
         root.path(),
         DisposableVmObservation::Ready,

@@ -239,6 +239,12 @@ impl ScaleSetStatistics {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ScaleSetRunnerLookup {
+    Absent,
+    Present(ScaleSetRunnerReference),
+}
+
 impl Drop for GitHubAppPrivateKey {
     fn drop(&mut self) {
         self.0.zeroize();
@@ -985,7 +991,7 @@ impl ScaleSetBridgeClient {
     pub(crate) fn observe_runner(
         &mut self,
         runner_name: &ScaleSetRunnerName,
-    ) -> Result<ScaleSetRunnerReference, ScaleSetBridgeError> {
+    ) -> Result<ScaleSetRunnerLookup, ScaleSetBridgeError> {
         let mut response = exchange_and_decode(
             self.transport.as_mut(),
             &BridgeRequest::runner("observe_runner", runner_name.as_str(), None, None),
@@ -993,6 +999,20 @@ impl ScaleSetBridgeClient {
         let result = (|| {
             if response.response_type == "error" {
                 return Err(response.bridge_error()?);
+            }
+            if response.response_type == "runner_absent" {
+                if response.code.is_some()
+                    || response.scale_set_id.is_some()
+                    || response.message_id.is_some()
+                    || response.statistics.is_some()
+                    || !response.events.is_empty()
+                    || !response.acquired_requests.is_empty()
+                    || response.runner.is_some()
+                    || response.encoded_jit_config.is_some()
+                {
+                    return Err(ScaleSetBridgeError::new("invalid_bridge_response"));
+                }
+                return Ok(ScaleSetRunnerLookup::Absent);
             }
             if response.response_type != "runner"
                 || response.code.is_some()
@@ -1013,6 +1033,7 @@ impl ScaleSetBridgeClient {
                 self.target.id,
                 Some(runner_name.as_str()),
             )
+            .map(ScaleSetRunnerLookup::Present)
         })();
         self.finish_response(result)
     }
@@ -1845,6 +1866,33 @@ mod tests {
             };
         assert_eq!(error.code(), "invalid_bridge_response");
         assert!(poisoned.get());
+    }
+
+    #[test]
+    fn runner_lookup_distinguishes_exact_presence_from_proven_absence() {
+        let transport = ScriptedTransport::new(&[
+            r#"{"version":1,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
+            r#"{"version":1,"type":"runner_absent"}"#,
+            r#"{"version":1,"type":"runner","runner":{"id":81,"name":"smolrunner-job-1","scale_set_id":23}}"#,
+        ]);
+        let mut client = ScaleSetBridgeClient::connect_with_transport(
+            config(),
+            GitHubAppPrivateKey::parse(b"private-key".to_vec()).unwrap(),
+            Box::new(transport),
+        )
+        .unwrap();
+        let name = ScaleSetRunnerName::parse("smolrunner-job-1").unwrap();
+        assert_eq!(
+            client.observe_runner(&name).unwrap(),
+            ScaleSetRunnerLookup::Absent
+        );
+        assert_eq!(
+            client.observe_runner(&name).unwrap(),
+            ScaleSetRunnerLookup::Present(ScaleSetRunnerReference::new(
+                ScaleSetRunnerId::new(81).unwrap(),
+                name,
+            ))
+        );
     }
 
     #[test]

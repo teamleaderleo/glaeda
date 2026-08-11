@@ -195,11 +195,15 @@ launcher sets only the official runner's JIT input and hosted-result switch imme
 `exec`. The plan fixes the Lima shell, guest `sudo`, launcher, work directory, and empty inherited
 environment, and binds the candidate to the exact
 durable attempt, cloned VM identity, runner name, runner ID, and deadline. It intentionally exposes
-no execution path yet: the production service must still freshly prove the complete target ready,
-durably record the GitHub registration, publish a no-replay runner-start checkpoint, and only then
-consume the command. No operator enrollment path, executable guest handoff, terminal cleanup, or
-supervised service loop exists yet, so this remains control-plane foundation rather than production
-capacity.
+no free-standing execution path. A private canonical-lock transaction now distinguishes proven
+registration absence from observation failure, repeatedly rechecks the running clone's exact host
+identity, resources, realized Lima isolation policy, guest identity, pinned runner and launcher,
+and disabled automatic updates, then durably records the GitHub registration and a no-replay
+runner-start checkpoint before consuming the one command. A discovered registration is persisted
+for exact cleanup without issuing another JIT value; command failure leaves Started recovery debt
+and cannot replay. The initial transaction deliberately retains the single controller lock while
+the one-job runner command is active. Operator enrollment, terminal runner/VM cleanup, a supervised
+service loop, and the physical acceptance run remain, so this is not production capacity yet.
 
 Acceptance: an enrolled test repository targets the SmolRunner scale-set label, queues a job, and receives its result without operator commands; the JIT runner cannot accept a second job and its credential is absent after VM destruction.
 
