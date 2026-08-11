@@ -231,8 +231,17 @@ ready clone is freshly re-observed and checkpointed into `Registering` without r
 fresh cancellation, lost-capacity observation, or attempt expiry checkpoints it into `Destroying`;
 a final descriptor-held VM identity check precedes registration publication. A runner whose Started
 marker is already durable is routed back to message observation rather than receiving another JIT
-value. The long-running process wrapper, retry/circuit-breaker policy, orphan enumeration, operator
-enrollment, and physical acceptance run remain, so this is not production capacity yet.
+value. The long-running process wrapper, retry/circuit-breaker policy, and operator enrollment are
+now composed. On each process start, the service snapshots the bounded completed-attempt tombstones
+and, after pending messages and active cleanup are drained, audits one retained exact VM/runner
+identity per tick. A reappeared exact VM or exact service-assigned runner is removed under the
+canonical lock; the transaction rechecks that no active attempt has overtaken the audit before
+observing or deleting anything, and it likewise refuses when a Scale Set message or acknowledgement
+still requires reconciliation. A same-name replacement or registration without retained service
+identity is protected and becomes recovery debt. Ambiguous deletion is observed again before retry. This does
+not delete arbitrary Lima instances or Scale Set registrations after their ownership evidence has
+been evicted. Broader enumeration requires a durable ownership index; the physical acceptance run
+also remains, so this is not production capacity yet.
 
 Acceptance: an enrolled test repository targets the SmolRunner scale-set label, queues a job, and receives its result without operator commands; the JIT runner cannot accept a second job and its credential is absent after VM destruction.
 

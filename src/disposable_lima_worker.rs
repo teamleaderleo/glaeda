@@ -7,6 +7,7 @@ use sha2::{Digest, Sha256};
 
 use crate::artifact::Sha256Digest;
 use crate::disposable_attempt_catalog::DisposableAttemptReservation;
+use crate::disposable_attempt_state::DisposableAttemptState;
 use crate::disposable_prepared_template::{
     DisposablePreparedTemplateIdentity, DisposablePreparedTemplateManifest,
 };
@@ -284,14 +285,27 @@ impl DisposableLimaWorkerAdapter {
         &self,
         reservation: &DisposableAttemptReservation,
     ) -> Result<LimaObservationRequest, DisposableLimaWorkerError> {
-        let instance =
-            LimaInstanceName::parse(reservation.attempt().vm_id().as_str()).map_err(|_| {
-                error(
-                    DisposableLimaWorkerErrorKind::InvalidAction,
-                    "invalid_vm_identity",
-                    "the durable VM identity is not a supported Lima instance name",
-                )
-            })?;
+        self.target_observation_request_for_attempt(reservation.attempt())
+    }
+
+    pub(crate) fn target_observation_request_for_attempt(
+        &self,
+        attempt: &DisposableAttemptState,
+    ) -> Result<LimaObservationRequest, DisposableLimaWorkerError> {
+        let instance = LimaInstanceName::parse(attempt.vm_id().as_str()).map_err(|_| {
+            error(
+                DisposableLimaWorkerErrorKind::InvalidAction,
+                "invalid_vm_identity",
+                "the durable VM identity is not a supported Lima instance name",
+            )
+        })?;
+        if instance == self.source_template {
+            return Err(error(
+                DisposableLimaWorkerErrorKind::InvalidAction,
+                "source_template_conflict",
+                "the disposable VM identity conflicts with the prepared source template",
+            ));
+        }
         LimaObservationRequest::new(
             instance,
             self.lima_home.clone(),
@@ -301,6 +315,40 @@ impl DisposableLimaWorkerAdapter {
             OBSERVATION_MAX_AGE_SECONDS,
         )
         .map_err(|_| invalid_configuration())
+    }
+
+    pub(crate) fn completed_orphan_destroy_command(
+        &self,
+        attempt: &DisposableAttemptState,
+    ) -> Result<(CommandSpec, Duration), DisposableLimaWorkerError> {
+        if attempt.phase() != DisposableAttemptPhase::Complete || attempt.vm_identity().is_none() {
+            return Err(error(
+                DisposableLimaWorkerErrorKind::InvalidAction,
+                "invalid_orphan_cleanup_authority",
+                "only a completed exact-identity attempt authorizes orphan cleanup",
+            ));
+        }
+        let instance = LimaInstanceName::parse(attempt.vm_id().as_str()).map_err(|_| {
+            error(
+                DisposableLimaWorkerErrorKind::InvalidAction,
+                "invalid_vm_identity",
+                "the durable VM identity is not a supported Lima instance name",
+            )
+        })?;
+        if instance == self.source_template {
+            return Err(error(
+                DisposableLimaWorkerErrorKind::InvalidAction,
+                "source_template_conflict",
+                "the disposable VM identity conflicts with the prepared source template",
+            ));
+        }
+        Ok((
+            self.base_command()
+                .argument("delete")
+                .argument("--force")
+                .argument(instance.as_str()),
+            DESTROY_TIMEOUT,
+        ))
     }
 
     pub(crate) fn version_command(&self) -> (CommandSpec, String) {

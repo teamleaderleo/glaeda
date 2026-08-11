@@ -19,7 +19,7 @@ use crate::disposable_attempt_catalog::{
     DisposableAttemptCatalogAction, DisposableAttemptCatalogDocument,
     DisposableAttemptCatalogRevision, DisposableAttemptReservation,
 };
-use crate::disposable_attempt_state::DisposableAttemptRevision;
+use crate::disposable_attempt_state::{DisposableAttemptRevision, DisposableAttemptState};
 use crate::disposable_lima_worker::{
     DisposableLimaWorkerAdapter, DisposableLimaWorkerCommandKind, DisposableLimaWorkerCommandPlan,
 };
@@ -865,6 +865,90 @@ impl DisposableCloneRuntime {
             _ => Err(DisposableCloneRuntimeError::recovery(
                 "cleanup_vm_control_host_conflict",
             )),
+        }
+    }
+
+    /// Recheck one completed tombstone for a VM that reappeared after prior exact cleanup.
+    ///
+    /// The tombstone's descriptor-derived VM identity is the cleanup authority. A matching name
+    /// without that exact identity remains protected from mutation.
+    pub(crate) fn observe_completed_orphan_worker(
+        &self,
+        attempt: &DisposableAttemptState,
+        executor: &impl TimedCommandExecutor,
+        clock: &impl CloneRuntimeClock,
+    ) -> Result<DisposableCleanupVmObservation, DisposableCloneRuntimeError> {
+        if attempt.phase() != DisposableAttemptPhase::Complete {
+            return Err(DisposableCloneRuntimeError::recovery(
+                "orphan_vm_phase_mismatch",
+            ));
+        }
+        let expected_identity = attempt
+            .vm_identity()
+            .ok_or_else(|| DisposableCloneRuntimeError::recovery("orphan_vm_identity_missing"))?;
+        let request = self
+            .worker
+            .target_observation_request_for_attempt(attempt)
+            .map_err(|_| invalid_configuration("orphan_target_request_invalid"))?;
+        self.verify_limactl(executor)?;
+        let adapter = LimaObservationAdapter::new(self.limactl_program.clone())
+            .map_err(|_| invalid_configuration("orphan_observer_invalid"))?;
+        let bounded = BoundedExecutor { executor };
+        let lima = adapter.observe(&request, &bounded, clock);
+        let host = LimaHostIdentityAdapter.observe(&request);
+        match (lima, host) {
+            (Err(lima_error), Err(host_error))
+                if lima_error.code == LimaObservationRefusalCode::MissingInstanceEvidence
+                    && host_error.kind == LimaHostIdentityErrorKind::MissingEvidence =>
+            {
+                Ok(DisposableCleanupVmObservation::Absent)
+            }
+            (Ok(_), Ok(host)) => {
+                if &DisposableVmIdentity::from_host_identity(host.identity()) != expected_identity {
+                    return Err(DisposableCloneRuntimeError::recovery(
+                        "orphan_vm_identity_drift",
+                    ));
+                }
+                host.confirm(&request)
+                    .map_err(|_| observation("orphan_vm_identity_drift"))?;
+                Ok(DisposableCleanupVmObservation::Present(Box::new(
+                    ConfirmedDisposableCleanupVm { host, request },
+                )))
+            }
+            (Err(error), _)
+                if error.code != LimaObservationRefusalCode::MissingInstanceEvidence =>
+            {
+                Err(observation("orphan_vm_observation_unavailable"))
+            }
+            _ => Err(DisposableCloneRuntimeError::recovery(
+                "orphan_vm_control_host_conflict",
+            )),
+        }
+    }
+
+    pub(crate) fn destroy_completed_orphan_worker(
+        &self,
+        attempt: &DisposableAttemptState,
+        confirmed: &ConfirmedDisposableCleanupVm,
+        executor: &impl TimedCommandExecutor,
+        clock: &impl CloneRuntimeClock,
+    ) -> Result<(), DisposableCloneRuntimeError> {
+        confirmed.confirm_current()?;
+        self.verify_limactl(executor)?;
+        let (command_spec, timeout) = self
+            .worker
+            .completed_orphan_destroy_command(attempt)
+            .map_err(|_| DisposableCloneRuntimeError::recovery("orphan_destroy_plan_refused"))?;
+        confirmed.confirm_current()?;
+        let record = executor
+            .execute_with_timeout(&command_spec, timeout)
+            .map_err(|_| command("orphan_destroy_command_failed"))?;
+        validate_record(&command_spec, &record)?;
+        match self.observe_completed_orphan_worker(attempt, executor, clock)? {
+            DisposableCleanupVmObservation::Absent => Ok(()),
+            DisposableCleanupVmObservation::Present(_) => Err(
+                DisposableCloneRuntimeError::recovery("orphan_destroy_not_observed"),
+            ),
         }
     }
 
@@ -1786,6 +1870,10 @@ mod tests {
         let mut executor = executor(&host, false);
         let (mut store, attempt_id, source_identity, runner) =
             install_terminal_attempt(&root, &host, &clone_runtime, &mut executor);
+        let expected_runner = runner.clone();
+        let target_identifier = fs::read(host.lima_home().join(TARGET).join("vz-identifier"))
+            .expect("read target identity before cleanup");
+        let target_identity_byte = target_identifier[19];
         let mut cleanup = FakeCleanup {
             source_identity: source_identity.clone(),
             runner: Some(runner),
@@ -1907,6 +1995,184 @@ mod tests {
                 .count(),
             1
         );
+
+        host.add_instance(TARGET, TARGET_DISK);
+        fs::write(
+            host.lima_home().join(TARGET).join("vz-identifier"),
+            &target_identifier,
+        )
+        .expect("restore the exact completed target identifier");
+        lima_host_identity_support::rewrite_disk_identity(
+            &host.lima_home().join(TARGET).join("disk"),
+            target_identity_byte,
+        );
+        assert_eq!(
+            store
+                .execute_disposable_orphan_cleanup_transaction(
+                    &clone_runtime,
+                    &attempt_id,
+                    &mut cleanup,
+                    &executor,
+                    &FixedClock,
+                )
+                .unwrap(),
+            crate::unix_personal_worker_store::DisposableOrphanCleanupOutcome::VmDestroyed
+        );
+        assert!(!host.lima_home().join(TARGET).exists());
+
+        cleanup.runner = Some(ScaleSetRunnerReference::new(
+            ScaleSetRunnerId::new(78).unwrap(),
+            expected_runner.name.clone(),
+        ));
+        let mismatch = store
+            .execute_disposable_orphan_cleanup_transaction(
+                &clone_runtime,
+                &attempt_id,
+                &mut cleanup,
+                &executor,
+                &FixedClock,
+            )
+            .unwrap_err();
+        assert_eq!(mismatch.code(), "orphan_runner_identity_drift");
+        assert_eq!(cleanup.remove_calls, 1);
+
+        cleanup.runner = Some(expected_runner);
+        assert_eq!(
+            store
+                .execute_disposable_orphan_cleanup_transaction(
+                    &clone_runtime,
+                    &attempt_id,
+                    &mut cleanup,
+                    &executor,
+                    &FixedClock,
+                )
+                .unwrap(),
+            crate::unix_personal_worker_store::DisposableOrphanCleanupOutcome::RunnerDeleted
+        );
+        assert_eq!(cleanup.remove_calls, 2);
+
+        host.add_instance(TARGET, TARGET_DISK);
+        fs::write(
+            host.lima_home().join(TARGET).join("vz-identifier"),
+            &target_identifier,
+        )
+        .expect("restore the exact completed target identifier");
+        lima_host_identity_support::rewrite_disk_identity(
+            &host.lima_home().join(TARGET).join("disk"),
+            target_identity_byte,
+        );
+        let active_attempt_id =
+            DisposableAttemptId::parse("attempt-active-during-orphan-audit").unwrap();
+        let active_attempt = DisposableAttemptState::reserved(
+            active_attempt_id.clone(),
+            CapacityClaimId::parse("claim-active-during-orphan-audit").unwrap(),
+            DisposableVmId::parse("smol-clone-active").unwrap(),
+            ScaleSetRunnerName::parse("smol-clone-active").unwrap(),
+            EpochMillis::new(1_900_000_600_000).unwrap(),
+        );
+        let active_reservation = DisposableAttemptReservation::new(
+            active_attempt,
+            DisposableWorkerResources::new(4_000, 8 * GIB, TARGET_DISK).unwrap(),
+            current_disposable_prepared_template()
+                .unwrap()
+                .identity()
+                .unwrap(),
+        )
+        .unwrap();
+        let mut catalog = DisposableAttemptCatalog::new(store);
+        let before_reserve = catalog.load().unwrap();
+        catalog
+            .reserve(before_reserve.revision(), active_reservation)
+            .unwrap();
+        store = catalog.into_store();
+        let calls_before_refusal = executor.calls.borrow().len();
+        let removals_before_refusal = cleanup.remove_calls;
+        let active_refusal = store
+            .execute_disposable_orphan_cleanup_transaction(
+                &clone_runtime,
+                &attempt_id,
+                &mut cleanup,
+                &executor,
+                &FixedClock,
+            )
+            .unwrap_err();
+        assert_eq!(active_refusal.code(), "orphan_active_attempt_present");
+        assert_eq!(executor.calls.borrow().len(), calls_before_refusal);
+        assert_eq!(cleanup.remove_calls, removals_before_refusal);
+        assert!(host.lima_home().join(TARGET).exists());
+
+        let mut catalog = DisposableAttemptCatalog::new(store);
+        let active = catalog.load().unwrap();
+        let completed = catalog
+            .transition(
+                active.revision(),
+                &active_attempt_id,
+                active
+                    .find_active(&active_attempt_id)
+                    .unwrap()
+                    .attempt()
+                    .revision(),
+                DisposableAttemptCatalogAction::CompleteUnprovisioned,
+            )
+            .unwrap()
+            .0;
+        catalog
+            .retire_complete(
+                completed.revision(),
+                &active_attempt_id,
+                completed
+                    .find_active(&active_attempt_id)
+                    .unwrap()
+                    .attempt()
+                    .revision(),
+            )
+            .unwrap();
+        store = catalog.into_store();
+        store
+            .poll_and_record_scale_set(&source_identity, |available_capacity| {
+                assert_eq!(available_capacity, 1);
+                Ok::<_, ()>((
+                    ScaleSetBridgePoll::Message {
+                        message_id: 91,
+                        statistics: ScaleSetStatistics {
+                            available_jobs: 1,
+                            acquired_jobs: 0,
+                            assigned_jobs: 0,
+                            running_jobs: 0,
+                            registered_runners: 0,
+                            busy_runners: 0,
+                            idle_runners: 0,
+                        },
+                        events: vec![ScaleSetBridgeEvent::Available(ScaleSetBridgeJobEvidence {
+                            runner_request_id: 91,
+                            repository: "project".to_owned(),
+                            owner: "example".to_owned(),
+                            job_id: ScaleSetJobId::parse("job-pending-during-orphan-audit")
+                                .unwrap(),
+                            workflow_run_id: 91,
+                            request_labels: vec!["smolrunner".to_owned()],
+                        })],
+                    },
+                    EpochMillis::new(1_900_000_000_000).unwrap(),
+                    EpochMillis::new(1_900_000_030_000).unwrap(),
+                ))
+            })
+            .unwrap()
+            .unwrap();
+        let calls_before_pending_refusal = executor.calls.borrow().len();
+        let pending_refusal = store
+            .execute_disposable_orphan_cleanup_transaction(
+                &clone_runtime,
+                &attempt_id,
+                &mut cleanup,
+                &executor,
+                &FixedClock,
+            )
+            .unwrap_err();
+        assert_eq!(pending_refusal.code(), "orphan_inbox_recovery_required");
+        assert_eq!(executor.calls.borrow().len(), calls_before_pending_refusal);
+        assert_eq!(cleanup.remove_calls, removals_before_refusal);
+        assert!(host.lima_home().join(TARGET).exists());
     }
 
     #[test]

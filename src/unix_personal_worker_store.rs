@@ -24,6 +24,7 @@ use crate::personal_worker_store::{
 mod disposable_attempt_catalog;
 /// Same-lock observation-first VM/runner cleanup and capacity release.
 mod disposable_cleanup_transaction;
+pub(crate) use disposable_cleanup_transaction::DisposableOrphanCleanupOutcome;
 /// Same-lock clone checkpoint, execution, and identity publication.
 mod disposable_clone_transaction;
 /// Read-only bounded operator status for the disposable-worker service.

@@ -18,9 +18,107 @@ use crate::disposable_worker_reconciler::{
     DisposableWorkerReconcileInput, ScaleSetRunnerObservation, reconcile_attempt,
 };
 use crate::github_scale_set_bridge::ScaleSetRunnerLookup;
+use crate::github_scale_set_protocol::ScaleSetRunnerReference;
 use crate::process::TimedCommandExecutor;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DisposableOrphanCleanupOutcome {
+    Satisfied,
+    VmDestroyed,
+    RunnerDeleted,
+}
+
 impl UnixPersonalWorkerStore {
+    pub(crate) fn execute_disposable_orphan_cleanup_transaction(
+        &mut self,
+        runtime: &DisposableCloneRuntime,
+        attempt_id: &DisposableAttemptId,
+        runner_source: &mut impl DisposableCleanupRunnerSource,
+        executor: &impl TimedCommandExecutor,
+        clock: &impl CloneRuntimeClock,
+    ) -> Result<DisposableOrphanCleanupOutcome, DisposableCloneRuntimeError> {
+        let _lock = self
+            .acquire_mutation_lock()
+            .map_err(|_| DisposableCloneRuntimeError::durable("orphan_store_lock_unavailable"))?;
+        synchronize_directory(&self.directory, "personal worker store directory")
+            .map_err(|_| DisposableCloneRuntimeError::durable("orphan_store_sync_failed"))?;
+        super::disposable_template_generation::refuse_unsettled(self).map_err(|_| {
+            DisposableCloneRuntimeError::recovery("orphan_template_recovery_required")
+        })?;
+        super::github_scale_set_inbox::refuse_unsettled(self)
+            .map_err(|_| DisposableCloneRuntimeError::recovery("orphan_inbox_recovery_required"))?;
+        super::github_scale_set_inbox::require_settled_source(
+            self,
+            runner_source.scale_set_source_identity().as_str(),
+        )
+        .map_err(|_| DisposableCloneRuntimeError::recovery("orphan_inbox_source_unavailable"))?;
+        super::lima_authority::refuse_unsettled_lima_authority(self)
+            .map_err(|_| DisposableCloneRuntimeError::recovery("orphan_lima_recovery_required"))?;
+        self.refuse_unsettled_personal_worker_state().map_err(|_| {
+            DisposableCloneRuntimeError::recovery("orphan_worker_recovery_required")
+        })?;
+        self.recover_catalog_locked()
+            .map_err(|_| DisposableCloneRuntimeError::recovery("orphan_catalog_recovery_failed"))?;
+
+        let current = self
+            .load_catalog_named(super::disposable_attempt_catalog::CATALOG_DOCUMENT)
+            .map_err(|_| DisposableCloneRuntimeError::durable("orphan_catalog_unavailable"))?
+            .ok_or_else(|| DisposableCloneRuntimeError::durable("orphan_catalog_missing"))?;
+        if !current.active().is_empty() {
+            return Err(DisposableCloneRuntimeError::recovery(
+                "orphan_active_attempt_present",
+            ));
+        }
+        let Some(attempt) = current.find_tombstone(attempt_id) else {
+            // Bounded FIFO retirement may evict an older startup audit candidate before it is
+            // reached. With no retained authority, no external object may be mutated.
+            return Ok(DisposableOrphanCleanupOutcome::Satisfied);
+        };
+        if attempt.phase() != DisposableAttemptPhase::Complete {
+            return Err(DisposableCloneRuntimeError::recovery(
+                "orphan_tombstone_phase_mismatch",
+            ));
+        }
+
+        if attempt.vm_identity().is_some() {
+            match runtime.observe_completed_orphan_worker(attempt, executor, clock)? {
+                DisposableCleanupVmObservation::Absent => {}
+                DisposableCleanupVmObservation::Present(confirmed) => {
+                    runtime
+                        .destroy_completed_orphan_worker(attempt, &confirmed, executor, clock)?;
+                    return Ok(DisposableOrphanCleanupOutcome::VmDestroyed);
+                }
+            }
+        }
+
+        let observed_runner = runner_source.observe_runner(attempt.runner_name())?;
+        match observed_runner {
+            ScaleSetRunnerLookup::Absent => Ok(DisposableOrphanCleanupOutcome::Satisfied),
+            ScaleSetRunnerLookup::Present(observed) => {
+                let expected = attempt
+                    .runner_id()
+                    .map(|id| ScaleSetRunnerReference::new(id, attempt.runner_name().clone()))
+                    .ok_or_else(|| {
+                        DisposableCloneRuntimeError::recovery("orphan_runner_identity_unavailable")
+                    })?;
+                if observed != expected {
+                    return Err(DisposableCloneRuntimeError::recovery(
+                        "orphan_runner_identity_drift",
+                    ));
+                }
+                runner_source.remove_runner(&expected)?;
+                match runner_source.observe_runner(attempt.runner_name())? {
+                    ScaleSetRunnerLookup::Absent => {
+                        Ok(DisposableOrphanCleanupOutcome::RunnerDeleted)
+                    }
+                    ScaleSetRunnerLookup::Present(_) => Err(DisposableCloneRuntimeError::recovery(
+                        "orphan_runner_delete_not_observed",
+                    )),
+                }
+            }
+        }
+    }
+
     pub(crate) fn execute_disposable_cleanup_transaction(
         &mut self,
         runtime: &DisposableCloneRuntime,

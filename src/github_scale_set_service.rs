@@ -3,6 +3,7 @@
 #![allow(dead_code)]
 
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -32,8 +33,10 @@ use crate::github_scale_set_consumer::{
 use crate::github_scale_set_inbox::{PendingScaleSetMessage, ScaleSetInboxError};
 use crate::github_scale_set_protocol::{ScaleSetRunnerName, ScaleSetRunnerReference};
 use crate::process::TimedCommandExecutor;
-use crate::unix_personal_worker_store::DisposableRunnerTransactionOutcome;
 use crate::unix_personal_worker_store::UnixPersonalWorkerStore;
+use crate::unix_personal_worker_store::{
+    DisposableOrphanCleanupOutcome, DisposableRunnerTransactionOutcome,
+};
 
 const MESSAGE_FRESHNESS_MILLIS: u64 = 30_000;
 
@@ -175,6 +178,15 @@ pub(crate) enum ScaleSetServiceDisposition {
     AttemptRetired {
         attempt_id: String,
     },
+    OrphanAuditSatisfied {
+        attempt_id: String,
+    },
+    OrphanVmDestroyed {
+        attempt_id: String,
+    },
+    OrphanRunnerDeleted {
+        attempt_id: String,
+    },
     TemplateAdvanced {
         disposition: DisposableTemplateRuntimeDisposition,
     },
@@ -247,12 +259,44 @@ fn advance_template_if_required(
     }
 }
 
+fn apply_startup_orphan_outcome(
+    audit: &mut VecDeque<DisposableAttemptId>,
+    attempt_id: &DisposableAttemptId,
+    outcome: DisposableOrphanCleanupOutcome,
+) -> Result<ScaleSetServiceDisposition, ScaleSetServiceError> {
+    if audit.front() != Some(attempt_id) {
+        return Err(ScaleSetServiceError::new(
+            "scale_set_orphan_audit_cursor_invalid",
+        ));
+    }
+    let public_attempt_id = attempt_id.as_str().to_owned();
+    Ok(match outcome {
+        DisposableOrphanCleanupOutcome::Satisfied => {
+            audit.pop_front();
+            ScaleSetServiceDisposition::OrphanAuditSatisfied {
+                attempt_id: public_attempt_id,
+            }
+        }
+        DisposableOrphanCleanupOutcome::VmDestroyed => {
+            ScaleSetServiceDisposition::OrphanVmDestroyed {
+                attempt_id: public_attempt_id,
+            }
+        }
+        DisposableOrphanCleanupOutcome::RunnerDeleted => {
+            ScaleSetServiceDisposition::OrphanRunnerDeleted {
+                attempt_id: public_attempt_id,
+            }
+        }
+    })
+}
+
 pub(crate) struct ScaleSetService<B, C> {
     store: UnixPersonalWorkerStore,
     bridge: B,
     policy: ScaleSetConsumerPolicy,
     source_identity: ScaleSetBridgeIdentity,
     clock: C,
+    startup_orphan_audit: VecDeque<DisposableAttemptId>,
 }
 
 pub(crate) struct PreparedScaleSetService {
@@ -261,6 +305,7 @@ pub(crate) struct PreparedScaleSetService {
     source_identity: ScaleSetBridgeIdentity,
     last_acked_message_id: u32,
     pending: Option<PendingScaleSetMessage>,
+    startup_orphan_audit: VecDeque<DisposableAttemptId>,
 }
 
 impl ScaleSetService<ScaleSetBridgeClient, SystemScaleSetServiceClock> {
@@ -274,7 +319,7 @@ impl ScaleSetService<ScaleSetBridgeClient, SystemScaleSetServiceClock> {
         store
             .initialize_scale_set_inbox(&source_identity)
             .map_err(ScaleSetServiceError::from_inbox)?;
-        let (inbox, _) = store
+        let (inbox, catalog) = store
             .load_scale_set_control_state(&source_identity)
             .map_err(ScaleSetServiceError::from_inbox)?;
         if inbox
@@ -288,12 +333,18 @@ impl ScaleSetService<ScaleSetBridgeClient, SystemScaleSetServiceClock> {
             .map(|receipt| receipt.message_id())
             .unwrap_or(0);
         let pending = inbox.pending().cloned();
+        let startup_orphan_audit = catalog
+            .tombstones()
+            .iter()
+            .map(|attempt| attempt.attempt_id().clone())
+            .collect();
         Ok(PreparedScaleSetService {
             store,
             policy,
             source_identity,
             last_acked_message_id,
             pending,
+            startup_orphan_audit,
         })
     }
 
@@ -316,6 +367,7 @@ impl ScaleSetService<ScaleSetBridgeClient, SystemScaleSetServiceClock> {
             policy: prepared.policy,
             source_identity: prepared.source_identity,
             clock: SystemScaleSetServiceClock,
+            startup_orphan_audit: prepared.startup_orphan_audit,
         })
     }
 
@@ -340,12 +392,21 @@ impl<B: ScaleSetBridgeSession, C: ScaleSetServiceClock> ScaleSetService<B, C> {
         store
             .initialize_scale_set_inbox(&source_identity)
             .map_err(ScaleSetServiceError::from_inbox)?;
+        let (_, catalog) = store
+            .load_scale_set_control_state(&source_identity)
+            .map_err(ScaleSetServiceError::from_inbox)?;
+        let startup_orphan_audit = catalog
+            .tombstones()
+            .iter()
+            .map(|attempt| attempt.attempt_id().clone())
+            .collect();
         Ok(Self {
             store,
             bridge,
             policy,
             source_identity,
             clock,
+            startup_orphan_audit,
         })
     }
 
@@ -524,6 +585,31 @@ impl<B: ScaleSetBridgeSession, C: ScaleSetServiceClock> ScaleSetService<B, C> {
             return Err(ScaleSetServiceError::new(
                 "scale_set_capacity_invariant_violated",
             ));
+        }
+        if catalog.active().is_empty()
+            && let Some(attempt_id) = self.startup_orphan_audit.front().cloned()
+        {
+            drop(catalog);
+            drop(inbox);
+            let mut cleanup = LiveScaleSetCleanup {
+                bridge: &mut self.bridge,
+                source_identity: &self.source_identity,
+            };
+            let outcome = self
+                .store
+                .execute_disposable_orphan_cleanup_transaction(
+                    clone_runtime,
+                    &attempt_id,
+                    &mut cleanup,
+                    executor,
+                    clock,
+                )
+                .map_err(ScaleSetServiceError::from_clone)?;
+            return apply_startup_orphan_outcome(
+                &mut self.startup_orphan_audit,
+                &attempt_id,
+                outcome,
+            );
         }
         let selected = catalog.active().first().map(|reservation| {
             let attempt_id = reservation.attempt().attempt_id().clone();
@@ -1287,6 +1373,42 @@ mod tests {
     }
 
     #[test]
+    fn startup_orphan_audit_rechecks_after_each_mutation_before_advancing() {
+        let attempt_id = DisposableAttemptId::parse("attempt-orphan-audit").unwrap();
+        let mut audit = VecDeque::from([attempt_id.clone()]);
+        assert!(matches!(
+            apply_startup_orphan_outcome(
+                &mut audit,
+                &attempt_id,
+                DisposableOrphanCleanupOutcome::VmDestroyed,
+            )
+            .unwrap(),
+            ScaleSetServiceDisposition::OrphanVmDestroyed { .. }
+        ));
+        assert_eq!(audit.front(), Some(&attempt_id));
+        assert!(matches!(
+            apply_startup_orphan_outcome(
+                &mut audit,
+                &attempt_id,
+                DisposableOrphanCleanupOutcome::RunnerDeleted,
+            )
+            .unwrap(),
+            ScaleSetServiceDisposition::OrphanRunnerDeleted { .. }
+        ));
+        assert_eq!(audit.front(), Some(&attempt_id));
+        assert!(matches!(
+            apply_startup_orphan_outcome(
+                &mut audit,
+                &attempt_id,
+                DisposableOrphanCleanupOutcome::Satisfied,
+            )
+            .unwrap(),
+            ScaleSetServiceDisposition::OrphanAuditSatisfied { .. }
+        ));
+        assert!(audit.is_empty());
+    }
+
+    #[test]
     fn one_tick_at_a_time_persists_applies_acks_and_reconciles_capacity() {
         let root = TempRoot::new();
         let store = UnixPersonalWorkerStore::open_or_create_disposable_catalog(&root.0).unwrap();
@@ -1321,7 +1443,7 @@ mod tests {
         let mut service = ScaleSetService::with_parts(
             store,
             bridge,
-            policy,
+            policy.clone(),
             FixedClock(EpochMillis::new(100_000).unwrap()),
         )
         .unwrap();
@@ -1367,6 +1489,21 @@ mod tests {
         assert_eq!(bridge.capacities, [1, 1]);
         assert_eq!(bridge.acknowledgements, [(7, true)]);
         assert!(DisposableAttemptCatalogStore::recover(&mut store).is_ok());
+        let restarted = ScaleSetService::with_parts(
+            store,
+            bridge,
+            policy,
+            FixedClock(EpochMillis::new(100_001).unwrap()),
+        )
+        .unwrap();
+        assert_eq!(restarted.startup_orphan_audit.len(), 1);
+        assert_eq!(
+            restarted.startup_orphan_audit.front(),
+            catalog
+                .tombstones()
+                .first()
+                .map(|attempt| attempt.attempt_id())
+        );
     }
 
     #[test]
