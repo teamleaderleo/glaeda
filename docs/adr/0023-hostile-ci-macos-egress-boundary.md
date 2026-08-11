@@ -39,7 +39,8 @@ that applies to TCP and UDP sockets owned by the dedicated service UID. The anch
 The pinned gVisor user network does not forward ICMP outside its virtual network. The service
 account is unprivileged and the first policy intentionally admits no other outbound protocol.
 
-The service account is unprivileged and receives no PF mutation authority. A separately approved
+The service account is unprivileged, has one dedicated primary group and no supplementary groups,
+and receives no PF mutation authority. A separately approved
 root installation owns the account, PF anchor, main-ruleset attachment, LaunchDaemon, executable,
 and enrollment placement. Service startup observes the active PF state and refuses new provisioning
 unless the exact installed policy, service UID, executable, enrollment, fixed Lima control port,
