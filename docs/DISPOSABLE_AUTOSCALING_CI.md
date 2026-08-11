@@ -283,16 +283,23 @@ event handling, teardown, capacity release, and retirement continue even when th
 refused or needs rebuilding, so a broken source cannot strand an existing hostile worker. The
 single supervisor retry/circuit policy drives template maintenance and the production clock,
 bounded executor, clone/runner runtimes, and durable coordinator without exposing a second command
-path. `worker serve --enrollment <absolute-canonical-document>` is now the sole production entry
+path. `worker serve --enrollment <absolute-canonical-document> --enrollment-digest <approved-sha256>`
+is now the sole production entry
 point; it boundedly loads the existing secret-free enrollment and then enters that supervisor.
 The enrollment must be an owner-matched mode-0600 single-link regular file beneath an
 owner-matched non-writable directory path; startup opens the path without following links and
 requires stable descriptor, pathname, metadata, and bytes before accepting its authority.
 The pure `service plan` surface now binds the exact executable and enrollment to one private
 mode-0600 user LaunchAgent, a fixed label, `KeepAlive`/`RunAtLoad`, bounded restart throttling,
-null output, and an ordered install/removal compensation contract. It never writes the property
-list or invokes `launchctl`; operator-machine installation or removal still requires explicit
-approval and a future same-evidence executor. Running as a user LaunchAgent deliberately delegates
+null output, and an ordered install/removal compensation contract. `service apply` requires the
+exact emitted plan identity as explicit approval, revalidates protected executable/enrollment
+bytes, requires the executable and its directory chain to be root-owned and non-writable,
+serializes concurrent applies, and atomically renames one unpredictable private stage without
+clobbering an existing entry. Incomplete abandoned stages authorize no cleanup or execution. The
+approved enrollment digest is part of the persisted argv and is rechecked on every service start.
+Apply uses bounded fixed-shape `launchctl` observations and mutations. Removal confirms the exact
+loaded path/program/argv, boots it out, confirms absence, and only then removes an
+exact-byte-matching property list. Running as a user LaunchAgent deliberately delegates
 login-session restart to `launchd` and preserves access to the operator's Keychain and Lima/VZ
 state without granting a root daemon those credentials.
 

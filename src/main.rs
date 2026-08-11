@@ -30,7 +30,11 @@ use rustix::{
     process::{getegid, geteuid},
 };
 use serde::Serialize;
+#[cfg(target_os = "macos")]
+use sha2::{Digest as _, Sha256};
 use smolrunner::artifact::Sha256Digest;
+#[cfg(target_os = "macos")]
+use smolrunner::disposable_launchd_service::apply_disposable_launchd_service;
 use smolrunner::disposable_launchd_service::{
     DisposableLaunchdServiceDesiredState, plan_disposable_launchd_service,
 };
@@ -73,7 +77,7 @@ use smolrunner::manifest::{ManifestError, load};
 #[cfg(target_os = "linux")]
 use smolrunner::ownership::ProjectIdentity;
 use smolrunner::plan::{build, render_human as render_plan};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use smolrunner::process::ProcessExecutor;
 #[cfg(target_os = "linux")]
 use smolrunner::runner_user_observation::observe_verified_runner_user;
@@ -166,6 +170,30 @@ enum ServiceCommand {
         #[arg(long)]
         enrollment_digest: String,
     },
+    /// Apply one exact LaunchAgent plan after explicit plan-identity approval.
+    Apply {
+        /// Desired LaunchAgent state.
+        #[arg(long, value_enum)]
+        desired: ServiceDesiredState,
+        /// Explicit absolute normalized operator home directory.
+        #[arg(long)]
+        operator_home: PathBuf,
+        /// Exact absolute normalized SmolRunner executable path.
+        #[arg(long)]
+        program: PathBuf,
+        /// Exact reviewed SmolRunner executable content digest.
+        #[arg(long)]
+        program_digest: String,
+        /// Exact absolute normalized canonical enrollment document.
+        #[arg(long)]
+        enrollment: PathBuf,
+        /// Exact canonical enrollment-document content digest.
+        #[arg(long)]
+        enrollment_digest: String,
+        /// Explicit approval of the exact plan identity emitted by `service plan`.
+        #[arg(long)]
+        approve_plan: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -232,6 +260,9 @@ enum WorkerCommand {
         /// Explicit absolute normalized canonical enrollment document.
         #[arg(long)]
         enrollment: PathBuf,
+        /// Exact approved canonical enrollment-document content digest.
+        #[arg(long)]
+        enrollment_digest: String,
     },
 }
 
@@ -427,7 +458,10 @@ fn main() -> ExitCode {
                     run_worker_admission(cli.output, &store_root, Some(false))
                 }
             },
-            WorkerCommand::Serve { enrollment } => run_worker_serve(cli.output, &enrollment),
+            WorkerCommand::Serve {
+                enrollment,
+                enrollment_digest,
+            } => run_worker_serve(cli.output, &enrollment, &enrollment_digest),
         },
         Command::Service { command } => match command {
             ServiceCommand::Plan {
@@ -445,6 +479,24 @@ fn main() -> ExitCode {
                 &program_digest,
                 &enrollment,
                 &enrollment_digest,
+            ),
+            ServiceCommand::Apply {
+                desired,
+                operator_home,
+                program,
+                program_digest,
+                enrollment,
+                enrollment_digest,
+                approve_plan,
+            } => run_disposable_launchd_service_apply(
+                cli.output,
+                desired.into(),
+                &operator_home,
+                &program,
+                &program_digest,
+                &enrollment,
+                &enrollment_digest,
+                &approve_plan,
             ),
         },
         Command::Queue { command } => match command {
@@ -598,6 +650,110 @@ fn run_disposable_launchd_service_plan(
         output,
         "disposable_launchd_service_plan_unsupported",
         "disposable-worker LaunchAgent planning requires macOS".to_owned(),
+    )
+}
+
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn run_disposable_launchd_service_apply(
+    output: OutputFormat,
+    desired: DisposableLaunchdServiceDesiredState,
+    operator_home: &Path,
+    program: &Path,
+    program_digest: &str,
+    enrollment: &Path,
+    enrollment_digest: &str,
+    approved_plan: &str,
+) -> ExitCode {
+    let program_digest = match Sha256Digest::parse(program_digest) {
+        Ok(digest) => digest,
+        Err(_) => {
+            return emit_runtime_error(
+                output,
+                "disposable_launchd_service_apply",
+                "disposable-worker LaunchAgent apply inputs are invalid".to_owned(),
+            );
+        }
+    };
+    let enrollment_digest = match Sha256Digest::parse(enrollment_digest) {
+        Ok(digest) => digest,
+        Err(_) => {
+            return emit_runtime_error(
+                output,
+                "disposable_launchd_service_apply",
+                "disposable-worker LaunchAgent apply inputs are invalid".to_owned(),
+            );
+        }
+    };
+    let approved_plan = match Sha256Digest::parse(approved_plan) {
+        Ok(digest) => digest,
+        Err(_) => {
+            return emit_runtime_error(
+                output,
+                "disposable_launchd_service_approval_invalid",
+                "an exact LaunchAgent plan identity must be approved".to_owned(),
+            );
+        }
+    };
+    let plan = match plan_disposable_launchd_service(
+        desired,
+        geteuid().as_raw(),
+        operator_home,
+        program,
+        &program_digest,
+        enrollment,
+        &enrollment_digest,
+    ) {
+        Ok(plan) => plan,
+        Err(_) => {
+            return emit_runtime_error(
+                output,
+                "disposable_launchd_service_apply",
+                "disposable-worker LaunchAgent apply inputs are invalid".to_owned(),
+            );
+        }
+    };
+    let report = match apply_disposable_launchd_service(&plan, &approved_plan, &ProcessExecutor) {
+        Ok(report) => report,
+        Err(error) => {
+            return emit_runtime_error(
+                output,
+                error.code(),
+                "disposable-worker LaunchAgent apply was refused".to_owned(),
+            );
+        }
+    };
+    match output {
+        OutputFormat::Json => {
+            if print_json(&report).is_err() {
+                return ExitCode::from(2);
+            }
+        }
+        OutputFormat::Human => println!(
+            "disposable worker service: {:?}, plan={}",
+            report.disposition(),
+            report.plan_identity().as_str(),
+        ),
+    }
+    ExitCode::SUCCESS
+}
+
+#[cfg(not(target_os = "macos"))]
+#[allow(clippy::too_many_arguments)]
+fn run_disposable_launchd_service_apply(
+    output: OutputFormat,
+    _desired: DisposableLaunchdServiceDesiredState,
+    _operator_home: &Path,
+    _program: &Path,
+    _program_digest: &str,
+    _enrollment: &Path,
+    _enrollment_digest: &str,
+    _approved_plan: &str,
+) -> ExitCode {
+    emit_runtime_error(
+        output,
+        "disposable_launchd_service_apply_unsupported",
+        "disposable-worker LaunchAgent apply requires macOS".to_owned(),
     )
 }
 
@@ -825,7 +981,11 @@ fn explicit_normalized_absolute_path(path: &Path) -> bool {
 }
 
 #[cfg(target_os = "macos")]
-fn run_worker_serve(output: OutputFormat, enrollment_path: &Path) -> ExitCode {
+fn run_worker_serve(
+    output: OutputFormat,
+    enrollment_path: &Path,
+    enrollment_digest: &str,
+) -> ExitCode {
     if !explicit_normalized_absolute_path(enrollment_path) {
         return emit_runtime_error(
             output,
@@ -844,6 +1004,13 @@ fn run_worker_serve(output: OutputFormat, enrollment_path: &Path) -> ExitCode {
             );
         }
     };
+    if !approved_enrollment_bytes(&bytes, enrollment_digest) {
+        return emit_runtime_error(
+            output,
+            "disposable_worker_service_enrollment_digest_mismatch",
+            "disposable worker enrollment does not match the approved service plan".to_owned(),
+        );
+    }
     let enrollment = match decode_disposable_worker_enrollment(&bytes) {
         Ok(enrollment) => enrollment,
         Err(error) => {
@@ -862,6 +1029,16 @@ fn run_worker_serve(output: OutputFormat, enrollment_path: &Path) -> ExitCode {
             "disposable worker service stopped with a durable blocker".to_owned(),
         ),
     }
+}
+
+#[cfg(target_os = "macos")]
+fn approved_enrollment_bytes(bytes: &[u8], expected: &str) -> bool {
+    let Ok(expected) = Sha256Digest::parse(expected) else {
+        return false;
+    };
+    let observed = Sha256Digest::parse(&format!("sha256:{:x}", Sha256::digest(bytes)))
+        .expect("SHA-256 output is a canonical digest");
+    observed == expected
 }
 
 #[cfg(target_os = "macos")]
@@ -1007,7 +1184,11 @@ fn same_enrollment_directory(left: &rustix_fs::Stat, right: &rustix_fs::Stat) ->
 }
 
 #[cfg(not(target_os = "macos"))]
-fn run_worker_serve(output: OutputFormat, _enrollment_path: &Path) -> ExitCode {
+fn run_worker_serve(
+    output: OutputFormat,
+    _enrollment_path: &Path,
+    _enrollment_digest: &str,
+) -> ExitCode {
     emit_runtime_error(
         output,
         "disposable_worker_service_unsupported",
@@ -1698,10 +1879,16 @@ mod tests {
             "serve",
             "--enrollment",
             "/etc/smolrunner/disposable-worker.json",
+            "--enrollment-digest",
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         ])
         .expect("parse disposable worker service");
         let Command::Worker {
-            command: WorkerCommand::Serve { enrollment },
+            command:
+                WorkerCommand::Serve {
+                    enrollment,
+                    enrollment_digest,
+                },
         } = serve.command
         else {
             panic!("expected disposable worker serve command");
@@ -1709,6 +1896,10 @@ mod tests {
         assert_eq!(
             enrollment,
             PathBuf::from("/etc/smolrunner/disposable-worker.json")
+        );
+        assert_eq!(
+            enrollment_digest,
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
         );
 
         let queue = Cli::try_parse_from([
@@ -1860,6 +2051,43 @@ mod tests {
             enrollment_digest,
             "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
         );
+
+        let apply = Cli::try_parse_from([
+            "smolrunner",
+            "service",
+            "apply",
+            "--desired",
+            "removed",
+            "--operator-home",
+            "/Users/operator",
+            "--program",
+            "/opt/smolrunner/bin/smolrunner",
+            "--program-digest",
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--enrollment",
+            "/Users/operator/.config/smolrunner/enrollment.json",
+            "--enrollment-digest",
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "--approve-plan",
+            "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        ])
+        .expect("parse disposable LaunchAgent apply");
+        let Command::Service {
+            command:
+                ServiceCommand::Apply {
+                    desired,
+                    approve_plan,
+                    ..
+                },
+        } = apply.command
+        else {
+            panic!("expected disposable LaunchAgent apply");
+        };
+        assert!(matches!(desired, ServiceDesiredState::Removed));
+        assert_eq!(
+            approve_plan,
+            "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        );
     }
 
     #[cfg(unix)]
@@ -1897,7 +2125,9 @@ mod tests {
     fn disposable_worker_enrollment_loader_requires_one_private_regular_file() {
         use std::os::unix::fs::symlink;
 
-        use super::read_private_disposable_worker_enrollment;
+        use sha2::{Digest as _, Sha256};
+
+        use super::{approved_enrollment_bytes, read_private_disposable_worker_enrollment};
 
         let root = DisposableTempRoot::new();
         let enrollment = root.0.join("enrollment.json");
@@ -1908,6 +2138,15 @@ mod tests {
             read_private_disposable_worker_enrollment(&enrollment).unwrap(),
             b"exact-enrollment"
         );
+        let approved_digest = format!("sha256:{:x}", Sha256::digest(b"exact-enrollment"));
+        assert!(approved_enrollment_bytes(
+            b"exact-enrollment",
+            &approved_digest
+        ));
+        assert!(!approved_enrollment_bytes(
+            b"changed-enrollment",
+            &approved_digest
+        ));
 
         let alias = root.0.join("enrollment-alias.json");
         symlink(&enrollment, &alias).expect("create enrollment symlink");
