@@ -788,8 +788,17 @@ impl ScaleSetBridgeClient {
         })
     }
 
-    pub(crate) fn poll(&mut self) -> Result<ScaleSetBridgePoll, ScaleSetBridgeError> {
-        let mut response = exchange_and_decode(self.transport.as_mut(), &BridgeRequest::poll())?;
+    pub(crate) fn poll(
+        &mut self,
+        available_capacity: u16,
+    ) -> Result<ScaleSetBridgePoll, ScaleSetBridgeError> {
+        if available_capacity > self.target.max_capacity {
+            return Err(ScaleSetBridgeError::new("invalid_bridge_capacity"));
+        }
+        let mut response = exchange_and_decode(
+            self.transport.as_mut(),
+            &BridgeRequest::poll(available_capacity),
+        )?;
         let result = (|| match response.response_type.as_str() {
             "idle" => {
                 response.require_idle_shape()?;
@@ -1038,6 +1047,8 @@ struct BridgeRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     message_id: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    max_capacity: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     runner_name: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     runner_id: Option<u64>,
@@ -1085,18 +1096,20 @@ impl<'a> BridgeRequest<'a> {
                 max_capacity: config.target.max_capacity,
             }),
             message_id: None,
+            max_capacity: None,
             runner_name: None,
             runner_id: None,
             work_folder: None,
         }
     }
 
-    const fn poll() -> Self {
+    const fn poll(max_capacity: u16) -> Self {
         Self {
             version: PROTOCOL_VERSION,
             operation: "poll",
             start: None,
             message_id: None,
+            max_capacity: Some(max_capacity),
             runner_name: None,
             runner_id: None,
             work_folder: None,
@@ -1109,6 +1122,7 @@ impl<'a> BridgeRequest<'a> {
             operation: "ack",
             start: None,
             message_id: Some(message_id),
+            max_capacity: None,
             runner_name: None,
             runner_id: None,
             work_folder: None,
@@ -1126,6 +1140,7 @@ impl<'a> BridgeRequest<'a> {
             operation,
             start: None,
             message_id: None,
+            max_capacity: None,
             runner_name: Some(runner_name),
             runner_id,
             work_folder,
@@ -1437,6 +1452,7 @@ fn known_bridge_error(code: &str) -> Option<&'static str> {
         "invalid_start" => "invalid_start",
         "start_failed" => "start_failed",
         "not_started" => "not_started",
+        "invalid_capacity" => "invalid_capacity",
         "ack_required" => "ack_required",
         "poll_failed" => "poll_failed",
         "invalid_message" => "invalid_message",
@@ -1626,7 +1642,7 @@ mod tests {
             message_id,
             statistics,
             events,
-        } = client.poll().unwrap()
+        } = client.poll(1).unwrap()
         else {
             panic!("expected message")
         };
@@ -1643,6 +1659,10 @@ mod tests {
             [ScaleSetBridgeEvent::Available(_)]
         ));
         assert_eq!(client.ack(7).unwrap(), vec![41]);
+        assert_eq!(
+            client.poll(2).unwrap_err().code(),
+            "invalid_bridge_capacity"
+        );
     }
 
     #[test]
@@ -1702,7 +1722,10 @@ mod tests {
             Box::new(transport),
         )
         .unwrap();
-        assert_eq!(client.poll().unwrap_err().code(), "invalid_bridge_response");
+        assert_eq!(
+            client.poll(1).unwrap_err().code(),
+            "invalid_bridge_response"
+        );
         assert!(poisoned.get());
 
         let mut response = decode_response(
@@ -1732,9 +1755,12 @@ mod tests {
             Box::new(transport),
         )
         .unwrap();
-        assert_eq!(client.poll().unwrap_err().code(), "invalid_bridge_event");
+        assert_eq!(client.poll(1).unwrap_err().code(), "invalid_bridge_event");
         assert!(poisoned.get());
-        assert_eq!(client.poll().unwrap_err().code(), "bridge_session_poisoned");
+        assert_eq!(
+            client.poll(1).unwrap_err().code(),
+            "bridge_session_poisoned"
+        );
     }
 
     #[test]
@@ -1745,7 +1771,7 @@ mod tests {
         }
         let mut transport = ChildBridgeTransport::spawn(program).unwrap();
         let error = transport
-            .exchange_with_timeout(&BridgeRequest::poll(), Duration::from_millis(20))
+            .exchange_with_timeout(&BridgeRequest::poll(0), Duration::from_millis(20))
             .unwrap_err();
         assert_eq!(error.code(), "bridge_response_timeout");
         assert!(transport.poisoned);

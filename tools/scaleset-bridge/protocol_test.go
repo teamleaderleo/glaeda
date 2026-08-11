@@ -151,11 +151,11 @@ func TestPollRequiresDurableAckBeforeAdvancing(t *testing.T) {
 	}
 	server := startedServer(t, backend)
 
-	message := server.handle(context.Background(), protocolRequest{Version: 1, Operation: "poll"})
+	message := server.handle(context.Background(), protocolRequest{Version: 1, Operation: "poll", MaxCapacity: 1})
 	if message.Type != "message" || message.MessageID != 7 || len(message.Events) != 1 {
 		t.Fatalf("message response = %#v", message)
 	}
-	if response := server.handle(context.Background(), protocolRequest{Version: 1, Operation: "poll"}); response.Code != "ack_required" {
+	if response := server.handle(context.Background(), protocolRequest{Version: 1, Operation: "poll", MaxCapacity: 1}); response.Code != "ack_required" {
 		t.Fatalf("second poll response = %#v", response)
 	}
 	if !reflect.DeepEqual(backend.calls, []string{"poll"}) {
@@ -193,6 +193,20 @@ func TestIdleRetainsLatestValidatedStatistics(t *testing.T) {
 	idle := server.handle(context.Background(), protocolRequest{Version: 1, Operation: "poll"})
 	if idle.Type != "idle" || idle.Statistics == nil || idle.Statistics.AssignedJobs != 3 {
 		t.Fatalf("idle reverted to startup statistics: %#v", idle)
+	}
+}
+
+func TestPollUsesCurrentAvailableCapacity(t *testing.T) {
+	backend := &fakeBackend{}
+	server := startedServer(t, backend)
+
+	response := server.handle(context.Background(), protocolRequest{Version: 1, Operation: "poll", MaxCapacity: 0})
+	if response.Type != "idle" || backend.maxCapacity != 0 {
+		t.Fatalf("zero-capacity poll response=%#v capacity=%d", response, backend.maxCapacity)
+	}
+	response = server.handle(context.Background(), protocolRequest{Version: 1, Operation: "poll", MaxCapacity: 2})
+	if response.Code != "invalid_capacity" || !reflect.DeepEqual(backend.calls, []string{"poll"}) {
+		t.Fatalf("widened capacity response=%#v calls=%v", response, backend.calls)
 	}
 }
 

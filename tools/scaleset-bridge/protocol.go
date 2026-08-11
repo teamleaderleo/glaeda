@@ -23,13 +23,14 @@ const bridgeVersion = "0.1.0"
 const maxServiceResponseBytes = 2 * 1024 * 1024
 
 type protocolRequest struct {
-	Version    int         `json:"version"`
-	Operation  string      `json:"operation"`
-	Start      startConfig `json:"start,omitempty"`
-	MessageID  int         `json:"message_id,omitempty"`
-	RunnerName string      `json:"runner_name,omitempty"`
-	RunnerID   int64       `json:"runner_id,omitempty"`
-	WorkFolder string      `json:"work_folder,omitempty"`
+	Version     int         `json:"version"`
+	Operation   string      `json:"operation"`
+	Start       startConfig `json:"start,omitempty"`
+	MessageID   int         `json:"message_id,omitempty"`
+	MaxCapacity int         `json:"max_capacity,omitempty"`
+	RunnerName  string      `json:"runner_name,omitempty"`
+	RunnerID    int64       `json:"runner_id,omitempty"`
+	WorkFolder  string      `json:"work_folder,omitempty"`
 }
 
 type startConfig struct {
@@ -412,7 +413,7 @@ func (server *server) handle(ctx context.Context, request protocolRequest) proto
 	case "start":
 		return server.start(ctx, request.Start)
 	case "poll":
-		return server.poll(ctx)
+		return server.poll(ctx, request.MaxCapacity)
 	case "ack":
 		return server.ack(ctx, request.MessageID)
 	case "generate_jit":
@@ -449,14 +450,17 @@ func (server *server) start(ctx context.Context, config startConfig) protocolRes
 	return protocolResponse{Version: protocolVersion, Type: "ready", ScaleSetID: config.ScaleSetID, Statistics: initial}
 }
 
-func (server *server) poll(ctx context.Context) protocolResponse {
+func (server *server) poll(ctx context.Context, maxCapacity int) protocolResponse {
 	if server.backend == nil {
 		return errorResponse("not_started")
+	}
+	if maxCapacity < 0 || maxCapacity > server.config.MaxCapacity {
+		return errorResponse("invalid_capacity")
 	}
 	if server.pending != nil {
 		return errorResponse("ack_required")
 	}
-	message, err := server.backend.Poll(ctx, server.lastAckedID, server.config.MaxCapacity)
+	message, err := server.backend.Poll(ctx, server.lastAckedID, maxCapacity)
 	if err != nil {
 		return errorResponse("poll_failed")
 	}
