@@ -18,7 +18,7 @@ pub use codec::{
     encode_disposable_attempt_catalog,
 };
 
-pub const DISPOSABLE_ATTEMPT_CATALOG_SCHEMA_VERSION: u8 = 6;
+pub const DISPOSABLE_ATTEMPT_CATALOG_SCHEMA_VERSION: u8 = 7;
 pub const MAX_ACTIVE_DISPOSABLE_ATTEMPTS: usize = 64;
 pub const MAX_DISPOSABLE_ATTEMPT_TOMBSTONES: usize = 64;
 const MAX_DISPOSABLE_ATTEMPT_CATALOG_REVISION: u64 = 1_000_000_000_000;
@@ -596,6 +596,7 @@ pub enum DisposableAttemptCatalogAction {
     CompleteUnprovisioned,
     BeginRegistration,
     RecordRegistration(ScaleSetRunnerReference),
+    RecordRunnerStartStarted,
     RecordRunnerReady(ScaleSetRunnerReference),
     RecordAssigned(ScaleSetJobId),
     RecordRunning {
@@ -984,6 +985,9 @@ fn apply_action(
         DisposableAttemptCatalogAction::BeginRegistration => current.begin_registration(),
         DisposableAttemptCatalogAction::RecordRegistration(runner) => {
             current.record_registration(&runner)
+        }
+        DisposableAttemptCatalogAction::RecordRunnerStartStarted => {
+            current.record_runner_start_started()
         }
         DisposableAttemptCatalogAction::RecordRunnerReady(runner) => {
             current.record_runner_ready(&runner)

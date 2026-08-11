@@ -245,9 +245,28 @@ fn populated_catalog() -> DisposableAttemptCatalogDocument {
     let both_started = bind_vm_fixture(&both_started, 1);
     catalog = DisposableAttemptCatalog::new(FixtureStore::with_document(both_started.clone()));
 
-    let terminal = transition(
+    let first_registering = transition(
         &mut catalog,
         &both_started,
+        1,
+        DisposableAttemptCatalogAction::BeginRegistration,
+    );
+    let first_registered = transition(
+        &mut catalog,
+        &first_registering,
+        1,
+        DisposableAttemptCatalogAction::RecordRegistration(runner(1, 11)),
+    );
+    let first_start_started = transition(
+        &mut catalog,
+        &first_registered,
+        1,
+        DisposableAttemptCatalogAction::RecordRunnerStartStarted,
+    );
+
+    let terminal = transition(
+        &mut catalog,
+        &first_start_started,
         1,
         DisposableAttemptCatalogAction::RecordTerminal {
             runner: Some(runner(1, 11)),
@@ -433,6 +452,27 @@ fn saturated_tombstone_history_retains_a_safe_revision_lower_bound() {
             &mut catalog,
             &document,
             index,
+            DisposableAttemptCatalogAction::BeginRegistration,
+        );
+        document = transition(
+            &mut catalog,
+            &document,
+            index,
+            DisposableAttemptCatalogAction::RecordRegistration(runner(
+                index,
+                1_000 + u64::try_from(index).unwrap(),
+            )),
+        );
+        document = transition(
+            &mut catalog,
+            &document,
+            index,
+            DisposableAttemptCatalogAction::RecordRunnerStartStarted,
+        );
+        document = transition(
+            &mut catalog,
+            &document,
+            index,
             DisposableAttemptCatalogAction::RecordTerminal {
                 runner: Some(runner(index, 1_000 + u64::try_from(index).unwrap())),
                 job_id: ScaleSetJobId::parse(&format!("completed-job-{index}")).unwrap(),
@@ -530,7 +570,15 @@ fn top_level_future_schema_and_unknown_fields_fail_closed() {
         DisposableAttemptCatalogCodecErrorKind::VersionIncompatible
     );
 
-    value["schema_version"] = serde_json::json!(7);
+    previous_catalog["schema_version"] = serde_json::json!(6);
+    assert_eq!(
+        decode_disposable_attempt_catalog(&serde_json::to_vec(&previous_catalog).unwrap())
+            .unwrap_err()
+            .kind(),
+        DisposableAttemptCatalogCodecErrorKind::VersionIncompatible
+    );
+
+    value["schema_version"] = serde_json::json!(8);
     let future = serde_json::to_vec(&value).unwrap();
     assert_eq!(
         decode_disposable_attempt_catalog(&future)
@@ -539,7 +587,7 @@ fn top_level_future_schema_and_unknown_fields_fail_closed() {
         DisposableAttemptCatalogCodecErrorKind::VersionIncompatible
     );
 
-    value["schema_version"] = serde_json::json!(6);
+    value["schema_version"] = serde_json::json!(7);
     value["unexpected"] = serde_json::json!(true);
     let unknown = serde_json::to_vec(&value).unwrap();
     assert_eq!(

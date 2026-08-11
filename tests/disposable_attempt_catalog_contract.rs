@@ -567,9 +567,27 @@ fn duplicate_terminal_observation_is_satisfied_without_catalog_churn() {
     let job = ScaleSetJobId::parse("opaque-job-1").unwrap();
     let result = ScaleSetJobResult::parse("future-service-result").unwrap();
 
-    let terminal = transition(
+    let registering = transition(
         &mut catalog,
         &started,
+        1,
+        DisposableAttemptCatalogAction::BeginRegistration,
+    );
+    let registered = transition(
+        &mut catalog,
+        &registering,
+        1,
+        DisposableAttemptCatalogAction::RecordRegistration(runner(1, 11)),
+    );
+    let start_started = transition(
+        &mut catalog,
+        &registered,
+        1,
+        DisposableAttemptCatalogAction::RecordRunnerStartStarted,
+    );
+    let terminal = transition(
+        &mut catalog,
+        &start_started,
         1,
         DisposableAttemptCatalogAction::RecordTerminal {
             runner: Some(runner(1, 11)),
@@ -670,9 +688,27 @@ fn completed_attempt_releases_usage_then_moves_to_bounded_replay_history() {
         DisposableAttemptCatalogAction::RecordCloneStarted,
     );
     let started = bind_vm_fixture(&mut catalog, &started, 1, 1);
-    let terminal = transition(
+    let registering = transition(
         &mut catalog,
         &started,
+        1,
+        DisposableAttemptCatalogAction::BeginRegistration,
+    );
+    let registered = transition(
+        &mut catalog,
+        &registering,
+        1,
+        DisposableAttemptCatalogAction::RecordRegistration(runner(1, 11)),
+    );
+    let start_started = transition(
+        &mut catalog,
+        &registered,
+        1,
+        DisposableAttemptCatalogAction::RecordRunnerStartStarted,
+    );
+    let terminal = transition(
+        &mut catalog,
+        &start_started,
         1,
         DisposableAttemptCatalogAction::RecordTerminal {
             runner: Some(runner(1, 11)),
@@ -858,9 +894,27 @@ fn exact_job_ids_cannot_be_reused_across_concurrent_attempts() {
         DisposableAttemptCatalogAction::RecordCloneStarted,
     );
     let one_started = bind_vm_fixture(&mut catalog, &one_started, 1, 1);
-    let one_terminal = transition(
+    let one_registering = transition(
         &mut catalog,
         &one_started,
+        1,
+        DisposableAttemptCatalogAction::BeginRegistration,
+    );
+    let one_registered = transition(
+        &mut catalog,
+        &one_registering,
+        1,
+        DisposableAttemptCatalogAction::RecordRegistration(runner(1, 11)),
+    );
+    let one_start_started = transition(
+        &mut catalog,
+        &one_registered,
+        1,
+        DisposableAttemptCatalogAction::RecordRunnerStartStarted,
+    );
+    let one_terminal = transition(
+        &mut catalog,
+        &one_start_started,
         1,
         DisposableAttemptCatalogAction::RecordTerminal {
             runner: Some(runner(1, 11)),
@@ -875,12 +929,30 @@ fn exact_job_ids_cannot_be_reused_across_concurrent_attempts() {
         DisposableAttemptCatalogAction::RecordCloneStarted,
     );
     let two_started = bind_vm_fixture(&mut catalog, &two_started, 2, 2);
+    let two_registering = transition(
+        &mut catalog,
+        &two_started,
+        2,
+        DisposableAttemptCatalogAction::BeginRegistration,
+    );
+    let two_registered = transition(
+        &mut catalog,
+        &two_registering,
+        2,
+        DisposableAttemptCatalogAction::RecordRegistration(runner(2, 22)),
+    );
+    let two_start_started = transition(
+        &mut catalog,
+        &two_registered,
+        2,
+        DisposableAttemptCatalogAction::RecordRunnerStartStarted,
+    );
     let attempt_id = DisposableAttemptId::parse("attempt-2").unwrap();
     let duplicate_job_id = catalog
         .transition(
-            two_started.revision(),
+            two_start_started.revision(),
             &attempt_id,
-            two_started
+            two_start_started
                 .find_active(&attempt_id)
                 .unwrap()
                 .attempt()

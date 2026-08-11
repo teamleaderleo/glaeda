@@ -762,6 +762,9 @@ fn validate_transition(
         DisposableAttemptCatalogAction::RecordRegistration(runner) => {
             attempt.record_registration(runner)
         }
+        DisposableAttemptCatalogAction::RecordRunnerStartStarted => {
+            attempt.record_runner_start_started()
+        }
         DisposableAttemptCatalogAction::RecordRunnerReady(runner) => {
             attempt.record_runner_ready(runner)
         }

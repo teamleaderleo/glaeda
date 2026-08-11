@@ -116,11 +116,35 @@ fn registration_and_listener_readiness_are_distinct_durable_checkpoints() {
     assert_eq!(registered.phase(), DisposableAttemptPhase::Registering);
     assert_eq!(registered.runner_id().unwrap().get(), 41);
     assert!(registered.github_job_id().is_none());
+    assert_eq!(
+        registered
+            .record_runner_ready(&runner(41))
+            .unwrap_err()
+            .code(),
+        "invalid_transition"
+    );
+    assert_eq!(
+        registered
+            .record_running(&runner(41), job("job-before-start"))
+            .unwrap_err()
+            .code(),
+        "invalid_transition"
+    );
 
-    let ready = registered.record_runner_ready(&runner(41)).unwrap();
+    let start_started = registered.record_runner_start_started().unwrap();
+    assert_eq!(start_started.phase(), DisposableAttemptPhase::Registering);
+    assert!(start_started.runner_start_started());
+    assert_eq!(start_started.runner_id().unwrap().get(), 41);
+    assert!(start_started.revision().get() > registered.revision().get());
+    assert_eq!(
+        start_started.record_runner_start_started().unwrap(),
+        start_started
+    );
+
+    let ready = start_started.record_runner_ready(&runner(41)).unwrap();
     assert_eq!(ready.phase(), DisposableAttemptPhase::Waiting);
     assert_eq!(ready.runner_id().unwrap().get(), 41);
-    assert!(ready.revision().get() > registered.revision().get());
+    assert!(ready.revision().get() > start_started.revision().get());
 }
 
 #[test]
@@ -141,6 +165,10 @@ fn job_assignment_does_not_bind_a_runner_before_job_started() {
     assert_eq!(assigned.github_job_id().unwrap().as_str(), "job_opaque-7");
 
     let running = assigned
+        .record_registration(&runner(9))
+        .unwrap()
+        .record_runner_start_started()
+        .unwrap()
         .record_running(&runner(9), job("job_opaque-7"))
         .unwrap();
     assert_eq!(running.phase(), DisposableAttemptPhase::Running);
@@ -215,6 +243,10 @@ fn unknown_completion_result_still_reaches_cleanup() {
         .unwrap()
         .record_assigned(job("job-future-result"))
         .unwrap()
+        .record_registration(&runner(12))
+        .unwrap()
+        .record_runner_start_started()
+        .unwrap()
         .record_terminal(
             None,
             job("job-future-result"),
@@ -245,6 +277,12 @@ fn late_job_evidence_binds_without_reversing_cleanup_and_conflicts_fail_closed()
         .record_clone_started()
         .unwrap()
         .bind_vm_fixture()
+        .begin_registration()
+        .unwrap()
+        .record_registration(&exact_runner)
+        .unwrap()
+        .record_runner_start_started()
+        .unwrap()
         .begin_cleanup()
         .unwrap()
         .record_running(&exact_runner, job("late-job"))
@@ -297,6 +335,8 @@ fn exact_runner_and_job_identity_drift_fails_closed() {
     );
 
     let running = registered
+        .record_runner_start_started()
+        .unwrap()
         .record_runner_ready(&runner(7))
         .unwrap()
         .record_assigned(job("job-a"))
@@ -364,7 +404,7 @@ fn codec_rejects_future_versions_unknown_fields_and_inconsistent_phase_evidence(
     );
 
     value.as_object_mut().unwrap().remove("unexpected");
-    value["schema_version"] = serde_json::json!(2);
+    value["schema_version"] = serde_json::json!(DISPOSABLE_ATTEMPT_STATE_SCHEMA_VERSION - 1);
     assert_eq!(
         decode_disposable_attempt_state(&serde_json::to_vec(&value).unwrap())
             .unwrap_err()
@@ -429,6 +469,34 @@ fn codec_rejects_future_versions_unknown_fields_and_inconsistent_phase_evidence(
     impossible_registration["phase"] = serde_json::json!("registering");
     assert_eq!(
         decode_disposable_attempt_state(&serde_json::to_vec(&impossible_registration).unwrap())
+            .unwrap_err()
+            .code(),
+        "invalid_document"
+    );
+
+    let registered = bound
+        .begin_registration()
+        .unwrap()
+        .record_registration(&runner(12))
+        .unwrap();
+    let mut forged_checkpoint: serde_json::Value =
+        serde_json::from_slice(&encode_disposable_attempt_state(&registered).unwrap()).unwrap();
+    forged_checkpoint["runner_start_started"] = serde_json::json!(true);
+    forged_checkpoint["runner_id"] = serde_json::Value::Null;
+    assert_eq!(
+        decode_disposable_attempt_state(&serde_json::to_vec(&forged_checkpoint).unwrap())
+            .unwrap_err()
+            .code(),
+        "invalid_document"
+    );
+
+    let mut forged_running: serde_json::Value =
+        serde_json::from_slice(&encode_disposable_attempt_state(&registered).unwrap()).unwrap();
+    forged_running["phase"] = serde_json::json!("running");
+    forged_running["revision"] = serde_json::json!(registered.revision().get() + 1);
+    forged_running["github_job_id"] = serde_json::json!("job-without-start");
+    assert_eq!(
+        decode_disposable_attempt_state(&serde_json::to_vec(&forged_running).unwrap())
             .unwrap_err()
             .code(),
         "invalid_document"
