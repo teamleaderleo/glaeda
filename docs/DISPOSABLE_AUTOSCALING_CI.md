@@ -252,6 +252,18 @@ disk reservation. The App private key remains in Keychain. Decoding delegates to
 bridge, current prepared-template, resource, consumer, clone, and runner constructors so the
 service entry point cannot invent a weaker parallel configuration path.
 
+The private service composition now consumes that enrollment and performs bounded joint recovery
+of the template, attempt catalog, and Scale Set inbox before initialization. A fresh bridge session
+restores the durable acknowledged-message cursor and re-fetches any pending message from GitHub;
+its exact normalized event bundle must match the durable inbox before acknowledgement authority is
+restored. Source-template readiness gates only new polling and clone execution. Registration, job
+event handling, teardown, capacity release, and retirement continue even when that source is
+refused or needs rebuilding, so a broken source cannot strand an existing hostile worker. The
+single supervisor retry/circuit policy drives template maintenance and the production clock,
+bounded executor, clone/runner runtimes, and durable coordinator without exposing a second command
+path. The service remains deliberately unreachable from the CLI until operator holds, bounded
+status output, and the launchd installation/removal contract are present.
+
 Acceptance: sleep/wake, controller kill, Mac reboot, network loss, GitHub outage, failed provisioning, stuck job, and failed teardown tests all converge automatically or stop behind a precise durable blocker.
 
 ### M6 — production acceptance and safe optimization

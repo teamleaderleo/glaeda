@@ -874,41 +874,68 @@ impl ScaleSetBridgeClient {
             self.transport.as_mut(),
             &BridgeRequest::poll(available_capacity),
         )?;
-        let result = (|| match response.response_type.as_str() {
-            "idle" => {
-                response.require_idle_shape()?;
-                Ok(ScaleSetBridgePoll::Idle {
-                    statistics: response.require_statistics()?,
-                })
-            }
-            "message" => {
-                response.require_message_shape()?;
-                let message_id = positive_u32(response.message_id, "invalid_bridge_message")?;
-                if response.events.len() > MAX_EVENTS {
-                    return Err(ScaleSetBridgeError::new("invalid_bridge_message"));
-                }
-                let statistics = response.require_statistics()?;
-                let events = std::mem::take(&mut response.events)
-                    .into_iter()
-                    .map(|event| normalize_event(event, self.target.id))
-                    .collect::<Result<Vec<_>, _>>()?;
-                if events
-                    .iter()
-                    .filter(|event| matches!(event, ScaleSetBridgeEvent::Available(_)))
-                    .count()
-                    > usize::from(available_capacity)
-                {
-                    return Err(ScaleSetBridgeError::new("invalid_bridge_message"));
-                }
-                Ok(ScaleSetBridgePoll::Message {
-                    message_id,
-                    statistics,
+        let result = normalize_poll_response(&mut response, available_capacity, self.target.id);
+        self.finish_response(result)
+    }
+
+    /// Restore a fresh bridge process from the exact durable inbox cursor. A pending message is
+    /// re-fetched from GitHub and must normalize to the exact durable event bundle before this
+    /// session can acknowledge it.
+    pub(crate) fn resume(
+        &mut self,
+        last_acked_message_id: u32,
+        pending: Option<(u32, &[ScaleSetBridgeEvent])>,
+    ) -> Result<(), ScaleSetBridgeError> {
+        let available_capacity = pending
+            .map(|(_, events)| {
+                u16::try_from(
+                    events
+                        .iter()
+                        .filter(|event| matches!(event, ScaleSetBridgeEvent::Available(_)))
+                        .count(),
+                )
+                .map_err(|_| ScaleSetBridgeError::new("invalid_bridge_message"))
+            })
+            .transpose()?
+            .unwrap_or(0);
+        if available_capacity > self.target.max_capacity {
+            return Err(ScaleSetBridgeError::new("invalid_bridge_message"));
+        }
+        let expected_message_id = pending.map(|(message_id, _)| message_id).unwrap_or(0);
+        let mut response = exchange_and_decode(
+            self.transport.as_mut(),
+            &BridgeRequest::resume(
+                last_acked_message_id,
+                expected_message_id,
+                available_capacity,
+            ),
+        )?;
+        let result = if let Some((message_id, expected_events)) = pending {
+            match normalize_poll_response(&mut response, available_capacity, self.target.id)? {
+                ScaleSetBridgePoll::Message {
+                    message_id: observed_message_id,
                     events,
-                })
+                    ..
+                } if observed_message_id == message_id && events == expected_events => Ok(()),
+                _ => Err(ScaleSetBridgeError::new("invalid_bridge_message")),
             }
-            "error" => Err(response.bridge_error()?),
-            _ => Err(ScaleSetBridgeError::new("invalid_bridge_response")),
-        })();
+        } else if response.response_type == "error" {
+            Err(response.bridge_error()?)
+        } else if response.response_type == "restored"
+            && response.message_id
+                == (last_acked_message_id != 0).then_some(u64::from(last_acked_message_id))
+            && response.code.is_none()
+            && response.scale_set_id.is_none()
+            && response.statistics.is_none()
+            && response.events.is_empty()
+            && response.acquired_requests.is_empty()
+            && response.runner.is_none()
+            && response.encoded_jit_config.is_none()
+        {
+            Ok(())
+        } else {
+            Err(ScaleSetBridgeError::new("invalid_bridge_response"))
+        };
         self.finish_response(result)
     }
 
@@ -1098,6 +1125,48 @@ impl ScaleSetBridgeClient {
     }
 }
 
+fn normalize_poll_response(
+    response: &mut BridgeResponse,
+    available_capacity: u16,
+    expected_scale_set_id: u32,
+) -> Result<ScaleSetBridgePoll, ScaleSetBridgeError> {
+    match response.response_type.as_str() {
+        "idle" => {
+            response.require_idle_shape()?;
+            Ok(ScaleSetBridgePoll::Idle {
+                statistics: response.require_statistics()?,
+            })
+        }
+        "message" => {
+            response.require_message_shape()?;
+            let message_id = positive_u32(response.message_id, "invalid_bridge_message")?;
+            if response.events.len() > MAX_EVENTS {
+                return Err(ScaleSetBridgeError::new("invalid_bridge_message"));
+            }
+            let statistics = response.require_statistics()?;
+            let events = std::mem::take(&mut response.events)
+                .into_iter()
+                .map(|event| normalize_event(event, expected_scale_set_id))
+                .collect::<Result<Vec<_>, _>>()?;
+            if events
+                .iter()
+                .filter(|event| matches!(event, ScaleSetBridgeEvent::Available(_)))
+                .count()
+                > usize::from(available_capacity)
+            {
+                return Err(ScaleSetBridgeError::new("invalid_bridge_message"));
+            }
+            Ok(ScaleSetBridgePoll::Message {
+                message_id,
+                statistics,
+                events,
+            })
+        }
+        "error" => Err(response.bridge_error()?),
+        _ => Err(ScaleSetBridgeError::new("invalid_bridge_response")),
+    }
+}
+
 fn exchange_and_decode(
     transport: &mut dyn BridgeTransport,
     request: &BridgeRequest<'_>,
@@ -1144,6 +1213,8 @@ struct BridgeRequest<'a> {
     start: Option<StartRequest<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     message_id: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_acked_message_id: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_capacity: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1194,6 +1265,7 @@ impl<'a> BridgeRequest<'a> {
                 max_capacity: config.target.max_capacity,
             }),
             message_id: None,
+            last_acked_message_id: None,
             max_capacity: None,
             runner_name: None,
             runner_id: None,
@@ -1207,6 +1279,7 @@ impl<'a> BridgeRequest<'a> {
             operation: "poll",
             start: None,
             message_id: None,
+            last_acked_message_id: None,
             max_capacity: Some(max_capacity),
             runner_name: None,
             runner_id: None,
@@ -1220,7 +1293,22 @@ impl<'a> BridgeRequest<'a> {
             operation: "ack",
             start: None,
             message_id: Some(message_id),
+            last_acked_message_id: None,
             max_capacity: None,
+            runner_name: None,
+            runner_id: None,
+            work_folder: None,
+        }
+    }
+
+    fn resume(last_acked_message_id: u32, message_id: u32, max_capacity: u16) -> Self {
+        Self {
+            version: PROTOCOL_VERSION,
+            operation: "resume",
+            start: None,
+            message_id: (message_id != 0).then_some(message_id),
+            last_acked_message_id: (last_acked_message_id != 0).then_some(last_acked_message_id),
+            max_capacity: Some(max_capacity),
             runner_name: None,
             runner_id: None,
             work_folder: None,
@@ -1238,6 +1326,7 @@ impl<'a> BridgeRequest<'a> {
             operation,
             start: None,
             message_id: None,
+            last_acked_message_id: None,
             max_capacity: None,
             runner_name: Some(runner_name),
             runner_id,
@@ -1554,6 +1643,8 @@ fn known_bridge_error(code: &str) -> Option<&'static str> {
         "ack_required" => "ack_required",
         "poll_failed" => "poll_failed",
         "invalid_message" => "invalid_message",
+        "invalid_recovery" => "invalid_recovery",
+        "recovery_failed" => "recovery_failed",
         "message_mismatch" => "message_mismatch",
         "ack_failed" => "ack_failed",
         "acquire_failed" => "acquire_failed",
@@ -1813,6 +1904,68 @@ mod tests {
             client.poll(2).unwrap_err().code(),
             "invalid_bridge_capacity"
         );
+    }
+
+    #[test]
+    fn fresh_session_refetches_and_matches_durable_pending_before_ack() {
+        let transport = ScriptedTransport::new(&[
+            r#"{"version":1,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
+            r#"{"version":1,"type":"message","message_id":8,"statistics":{"available_jobs":1,"acquired_jobs":0,"assigned_jobs":1,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0},"events":[{"kind":"available","runner_request_id":41,"repository":"project","owner":"example","job_id":"job-1","workflow_run_id":99,"request_labels":["smolrunner"]}]}"#,
+            r#"{"version":1,"type":"acked","message_id":8,"acquired_requests":[41]}"#,
+        ]);
+        let mut client = ScaleSetBridgeClient::connect_with_transport(
+            config(),
+            GitHubAppPrivateKey::parse(b"private-key".to_vec()).unwrap(),
+            Box::new(transport),
+        )
+        .unwrap();
+        let expected = ScaleSetBridgeEvent::Available(ScaleSetBridgeJobEvidence {
+            runner_request_id: 41,
+            repository: "project".to_owned(),
+            owner: "example".to_owned(),
+            job_id: ScaleSetJobId::parse("job-1").unwrap(),
+            workflow_run_id: 99,
+            request_labels: vec!["smolrunner".to_owned()],
+        });
+
+        client.resume(7, Some((8, &[expected]))).unwrap();
+        assert_eq!(client.ack(8).unwrap(), vec![41]);
+    }
+
+    #[test]
+    fn fresh_session_restores_durable_ack_cursor_without_polling() {
+        let transport = ScriptedTransport::new(&[
+            r#"{"version":1,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
+            r#"{"version":1,"type":"restored","message_id":7}"#,
+        ]);
+        let mut client = ScaleSetBridgeClient::connect_with_transport(
+            config(),
+            GitHubAppPrivateKey::parse(b"private-key".to_vec()).unwrap(),
+            Box::new(transport),
+        )
+        .unwrap();
+
+        client.resume(7, None).unwrap();
+    }
+
+    #[test]
+    fn durable_pending_mismatch_poisons_the_fresh_session() {
+        let (transport, poisoned) = ScriptedTransport::with_poison_probe(&[
+            r#"{"version":1,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
+            r#"{"version":1,"type":"message","message_id":9,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0},"events":[]}"#,
+        ]);
+        let mut client = ScaleSetBridgeClient::connect_with_transport(
+            config(),
+            GitHubAppPrivateKey::parse(b"private-key".to_vec()).unwrap(),
+            Box::new(transport),
+        )
+        .unwrap();
+
+        assert_eq!(
+            client.resume(7, Some((8, &[]))).unwrap_err().code(),
+            "invalid_bridge_message"
+        );
+        assert!(poisoned.get());
     }
 
     #[test]

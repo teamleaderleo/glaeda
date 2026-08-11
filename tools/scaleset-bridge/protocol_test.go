@@ -174,6 +174,75 @@ func TestPollRequiresDurableAckBeforeAdvancing(t *testing.T) {
 	}
 }
 
+func TestResumeRefetchesExactDurablePendingBeforeAck(t *testing.T) {
+	backend := &fakeBackend{
+		acquired: []int64{41},
+		message: &scaleset.RunnerScaleSetMessage{
+			MessageID:  8,
+			Statistics: &scaleset.RunnerScaleSetStatistic{TotalAvailableJobs: 1},
+			JobAvailableMessages: []*scaleset.JobAvailable{{JobMessageBase: scaleset.JobMessageBase{
+				RunnerRequestID: 41,
+				RepositoryName:  "project",
+				OwnerName:       "example",
+				JobID:           "job-1",
+				WorkflowRunID:   99,
+				RequestLabels:   []string{"smolrunner"},
+			}}},
+		},
+	}
+	server := startedServer(t, backend)
+	resumed := server.handle(context.Background(), protocolRequest{
+		Version:     1,
+		Operation:   "resume",
+		LastAckedID: 7,
+		MessageID:   8,
+		MaxCapacity: 1,
+	})
+	if resumed.Type != "message" || resumed.MessageID != 8 || server.pending == nil || server.lastAckedID != 7 {
+		t.Fatalf("resume response=%#v pending=%#v last=%d", resumed, server.pending, server.lastAckedID)
+	}
+	acked := server.handle(context.Background(), protocolRequest{Version: 1, Operation: "ack", MessageID: 8})
+	if acked.Type != "acked" || !reflect.DeepEqual(acked.AcquiredRequests, []int64{41}) {
+		t.Fatalf("ack response=%#v", acked)
+	}
+	if !reflect.DeepEqual(backend.calls, []string{"poll", "delete:8", "acquire:[41]"}) || backend.lastMessageID != 7 {
+		t.Fatalf("resume/ack calls=%v last=%d", backend.calls, backend.lastMessageID)
+	}
+}
+
+func TestResumeRefusesMismatchedRedeliveryWithoutBinding(t *testing.T) {
+	backend := &fakeBackend{message: &scaleset.RunnerScaleSetMessage{
+		MessageID:  9,
+		Statistics: &scaleset.RunnerScaleSetStatistic{},
+	}}
+	server := startedServer(t, backend)
+	response := server.handle(context.Background(), protocolRequest{
+		Version:     1,
+		Operation:   "resume",
+		LastAckedID: 7,
+		MessageID:   8,
+	})
+	if response.Code != "recovery_failed" || server.pending != nil || server.lastAckedID != 0 || server.recoveryApplied {
+		t.Fatalf("mismatched resume response=%#v pending=%#v last=%d", response, server.pending, server.lastAckedID)
+	}
+}
+
+func TestResumeRestoresAcknowledgedCursorWithoutPolling(t *testing.T) {
+	backend := &fakeBackend{}
+	server := startedServer(t, backend)
+	response := server.handle(context.Background(), protocolRequest{
+		Version:     1,
+		Operation:   "resume",
+		LastAckedID: 7,
+	})
+	if response.Type != "restored" || response.MessageID != 7 || server.lastAckedID != 7 || !server.recoveryApplied {
+		t.Fatalf("cursor restore response=%#v last=%d", response, server.lastAckedID)
+	}
+	if len(backend.calls) != 0 {
+		t.Fatalf("cursor-only restore unexpectedly called backend: %v", backend.calls)
+	}
+}
+
 func TestIdleRetainsLatestValidatedStatistics(t *testing.T) {
 	backend := &fakeBackend{
 		initial: &scaleset.RunnerScaleSetStatistic{TotalAssignedJobs: 8},

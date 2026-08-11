@@ -15,6 +15,9 @@ use crate::disposable_clone_runtime::{
 use crate::disposable_runner_runtime::{
     DisposableRunnerRegistrationSource, DisposableRunnerRuntime, DisposableRunnerRuntimeError,
 };
+use crate::disposable_template_runtime::{
+    DisposableTemplateRuntime, DisposableTemplateRuntimeDisposition,
+};
 use crate::disposable_worker_reconciler::DisposableAttemptId;
 use crate::disposable_worker_reconciler::DisposableAttemptPhase;
 use crate::execution_admission::EpochMillis;
@@ -26,7 +29,7 @@ use crate::github_scale_set_consumer::{
     ScaleSetConsumerError, ScaleSetConsumerPolicy, apply_scale_set_ack_outcome,
     apply_scale_set_event,
 };
-use crate::github_scale_set_inbox::ScaleSetInboxError;
+use crate::github_scale_set_inbox::{PendingScaleSetMessage, ScaleSetInboxError};
 use crate::github_scale_set_protocol::{ScaleSetRunnerName, ScaleSetRunnerReference};
 use crate::process::TimedCommandExecutor;
 use crate::unix_personal_worker_store::DisposableRunnerTransactionOutcome;
@@ -93,7 +96,7 @@ pub(crate) trait ScaleSetServiceClock {
     fn now(&self) -> Result<EpochMillis, ScaleSetServiceError>;
 }
 
-struct SystemScaleSetServiceClock;
+pub(crate) struct SystemScaleSetServiceClock;
 
 impl ScaleSetServiceClock for SystemScaleSetServiceClock {
     fn now(&self) -> Result<EpochMillis, ScaleSetServiceError> {
@@ -161,6 +164,9 @@ pub(crate) enum ScaleSetServiceDisposition {
     AttemptRetired {
         attempt_id: String,
     },
+    TemplateAdvanced {
+        disposition: DisposableTemplateRuntimeDisposition,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,6 +208,34 @@ fn supervised_operation(
     }
 }
 
+fn template_required_for(operation: Option<SupervisedOperation>) -> bool {
+    operation.is_none_or(|operation| matches!(operation, SupervisedOperation::ExecuteClone))
+}
+
+fn advance_template_if_required(
+    operation: Option<SupervisedOperation>,
+    reconcile: impl FnOnce() -> Result<DisposableTemplateRuntimeDisposition, ScaleSetServiceError>,
+) -> Result<Option<ScaleSetServiceDisposition>, ScaleSetServiceError> {
+    if !template_required_for(operation) {
+        return Ok(None);
+    }
+    match reconcile()? {
+        DisposableTemplateRuntimeDisposition::Satisfied => Ok(None),
+        disposition @ (DisposableTemplateRuntimeDisposition::Persisted
+        | DisposableTemplateRuntimeDisposition::CommandCompleted { .. }) => {
+            Ok(Some(ScaleSetServiceDisposition::TemplateAdvanced {
+                disposition,
+            }))
+        }
+        DisposableTemplateRuntimeDisposition::RebuildRequired => {
+            Err(ScaleSetServiceError::new("template_rebuild_required"))
+        }
+        DisposableTemplateRuntimeDisposition::Refused => {
+            Err(ScaleSetServiceError::new("template_refused"))
+        }
+    }
+}
+
 pub(crate) struct ScaleSetService<B, C> {
     store: UnixPersonalWorkerStore,
     bridge: B,
@@ -210,13 +244,77 @@ pub(crate) struct ScaleSetService<B, C> {
     clock: C,
 }
 
+pub(crate) struct PreparedScaleSetService {
+    store: UnixPersonalWorkerStore,
+    policy: ScaleSetConsumerPolicy,
+    source_identity: ScaleSetBridgeIdentity,
+    last_acked_message_id: u32,
+    pending: Option<PendingScaleSetMessage>,
+}
+
 impl ScaleSetService<ScaleSetBridgeClient, SystemScaleSetServiceClock> {
+    /// Prepare and recover every durable Scale Set document before a credential-bearing bridge
+    /// process is started.
+    pub(crate) fn prepare(
+        mut store: UnixPersonalWorkerStore,
+        policy: ScaleSetConsumerPolicy,
+    ) -> Result<PreparedScaleSetService, ScaleSetServiceError> {
+        let source_identity = policy.source_identity().clone();
+        store
+            .initialize_scale_set_inbox(&source_identity)
+            .map_err(ScaleSetServiceError::from_inbox)?;
+        let (inbox, _) = store
+            .load_scale_set_control_state(&source_identity)
+            .map_err(ScaleSetServiceError::from_inbox)?;
+        if inbox
+            .pending()
+            .is_some_and(PendingScaleSetMessage::ack_started)
+        {
+            return Err(ScaleSetServiceError::new("scale_set_ack_outcome_unknown"));
+        }
+        let last_acked_message_id = inbox
+            .last_ack()
+            .map(|receipt| receipt.message_id())
+            .unwrap_or(0);
+        let pending = inbox.pending().cloned();
+        Ok(PreparedScaleSetService {
+            store,
+            policy,
+            source_identity,
+            last_acked_message_id,
+            pending,
+        })
+    }
+
+    pub(crate) fn start(
+        prepared: PreparedScaleSetService,
+        mut bridge: ScaleSetBridgeClient,
+    ) -> Result<Self, ScaleSetServiceError> {
+        bridge
+            .resume(
+                prepared.last_acked_message_id,
+                prepared
+                    .pending
+                    .as_ref()
+                    .map(|pending| (pending.message_id(), pending.events())),
+            )
+            .map_err(ScaleSetServiceError::from_bridge)?;
+        Ok(Self {
+            store: prepared.store,
+            bridge,
+            policy: prepared.policy,
+            source_identity: prepared.source_identity,
+            clock: SystemScaleSetServiceClock,
+        })
+    }
+
     pub(crate) fn new(
         store: UnixPersonalWorkerStore,
         bridge: ScaleSetBridgeClient,
         policy: ScaleSetConsumerPolicy,
     ) -> Result<Self, ScaleSetServiceError> {
-        Self::with_parts(store, bridge, policy, SystemScaleSetServiceClock)
+        let prepared = Self::prepare(store, policy)?;
+        Self::start(prepared, bridge)
     }
 }
 
@@ -381,6 +479,7 @@ impl<B: ScaleSetBridgeSession, C: ScaleSetServiceClock> ScaleSetService<B, C> {
     /// the canonical lock before it can mutate anything.
     pub(crate) fn supervise_once(
         &mut self,
+        template_runtime: &DisposableTemplateRuntime,
         clone_runtime: &DisposableCloneRuntime,
         runner_runtime: &DisposableRunnerRuntime,
         executor: &impl TimedCommandExecutor,
@@ -405,16 +504,32 @@ impl<B: ScaleSetBridgeSession, C: ScaleSetServiceClock> ScaleSetService<B, C> {
                 "scale_set_capacity_invariant_violated",
             ));
         }
-        let Some(reservation) = catalog.active().first() else {
-            return self.reconcile_once();
-        };
-        let attempt_id = reservation.attempt().attempt_id().clone();
-        let phase = reservation.attempt().phase();
-        let runner_started = reservation.attempt().runner_start_started();
+        let selected = catalog.active().first().map(|reservation| {
+            let attempt_id = reservation.attempt().attempt_id().clone();
+            let operation = supervised_operation(
+                reservation.attempt().phase(),
+                reservation.attempt().runner_start_started(),
+            )?;
+            Ok::<_, ScaleSetServiceError>((attempt_id, operation))
+        });
+        let selected = selected.transpose()?;
+        let operation = selected.as_ref().map(|(_, operation)| *operation);
         drop(catalog);
         drop(inbox);
 
-        match supervised_operation(phase, runner_started)? {
+        if let Some(disposition) = advance_template_if_required(operation, || {
+            template_runtime
+                .reconcile_once(executor, clock)
+                .map(|receipt| receipt.disposition)
+                .map_err(|error| ScaleSetServiceError::new(error.code()))
+        })? {
+            return Ok(disposition);
+        }
+
+        let Some((attempt_id, operation)) = selected else {
+            return self.reconcile_once();
+        };
+        match operation {
             SupervisedOperation::AuthorizeClone => {
                 self.authorize_reserved_once(clone_runtime, &attempt_id, executor, clock)
             }
@@ -1037,6 +1152,34 @@ mod tests {
                 .unwrap_err()
                 .code(),
             "scale_set_legacy_provisioning_recovery_required"
+        );
+        assert!(template_required_for(None));
+        assert!(!template_required_for(Some(Operation::AuthorizeClone)));
+        assert!(template_required_for(Some(Operation::ExecuteClone)));
+        for operation in [
+            Operation::CheckpointRegistration,
+            Operation::RunRegistered,
+            Operation::Cleanup,
+            Operation::Control,
+        ] {
+            assert!(
+                !template_required_for(Some(operation)),
+                "post-clone recovery must not depend on source-template health: {operation:?}"
+            );
+        }
+
+        let cleanup = advance_template_if_required(Some(Operation::Cleanup), || {
+            panic!("broken source template must not be observed while cleanup debt exists")
+        })
+        .unwrap();
+        assert!(cleanup.is_none());
+        assert_eq!(
+            advance_template_if_required(None, || {
+                Ok(DisposableTemplateRuntimeDisposition::Refused)
+            })
+            .unwrap_err()
+            .code(),
+            "template_refused"
         );
     }
 

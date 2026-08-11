@@ -235,6 +235,8 @@ impl DisposableAttemptCatalogStore for UnixPersonalWorkerStore {
                 "disposable-attempt catalog already exists",
             ));
         }
+        super::github_scale_set_inbox::refuse_orphan_current_without_catalog(self)
+            .map_err(map_personal_error)?;
         let mut staged = self.stage_catalog(document)?;
         self.publish_named_staged(&mut staged, CATALOG_DOCUMENT, true)
             .map_err(map_personal_error)?;

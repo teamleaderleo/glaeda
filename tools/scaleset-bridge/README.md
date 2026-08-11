@@ -28,6 +28,9 @@ types before the pinned official client can normalize them. Protocol version 1 s
 - `poll` and `ack`: expose the latest validated statistics and bounded job lifecycle messages
   without automatic acknowledgement, and accept only positive unique acquired IDs from the exact
   persisted available-job set;
+- `resume`: restore a fresh session's durable acknowledged-message cursor and, when Rust has a
+  pending durable message, re-fetch that exact message ID before acknowledgement can resume; Rust
+  separately requires the complete normalized event bundle to equal its durable inbox;
 - `generate_jit`: return one exact runner ID/name plus its one-time encoded JIT configuration;
 - `observe_runner` and `remove_runner`: observe by exact name and remove only after re-observing the
   exact numeric ID, name, and configured scale-set identity.
@@ -38,9 +41,11 @@ and remains secret-bearing data for the future Rust/guest handoff.
 
 ## Current nonclaims
 
-This package is not yet called by the Rust controller. It does not read the Mac Keychain, create or
-adopt a scale set, persist message receipts, reserve host capacity, launch a VM, transfer JIT data
-to a guest, supervise a runner, or recover a bridge/process crash or ambiguous network outcome
-between message deletion and job acquisition. Those remain M3 integration work. Until the Rust
-adapter persists a polled message and its available request IDs before `ack`, this bridge is a
-tested protocol foundation, not a usable autoscaler.
+The private Rust worker service now verifies and starts this bridge after local durable recovery;
+Rust, not this process, reads the Mac Keychain reference, persists message receipts, reserves host
+capacity, drives Lima, and supervises the runner. The bridge still does not create or adopt a scale
+set. A crash before acknowledgement starts is recovered by exact redelivery matching. A crash or
+ambiguous network result after durable acknowledgement starts remains explicit recovery debt,
+because message deletion and job acquisition cannot be truthfully replayed from local evidence
+alone. The composed service remains private until operator holds, bounded status, and the
+`worker serve`/launchd boundary are added.

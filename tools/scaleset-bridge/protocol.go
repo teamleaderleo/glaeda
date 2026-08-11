@@ -27,6 +27,7 @@ type protocolRequest struct {
 	Operation   string      `json:"operation"`
 	Start       startConfig `json:"start,omitempty"`
 	MessageID   int         `json:"message_id,omitempty"`
+	LastAckedID int         `json:"last_acked_message_id,omitempty"`
 	MaxCapacity int         `json:"max_capacity,omitempty"`
 	RunnerName  string      `json:"runner_name,omitempty"`
 	RunnerID    int64       `json:"runner_id,omitempty"`
@@ -392,12 +393,13 @@ type pendingMessage struct {
 }
 
 type server struct {
-	factory        backendFactory
-	backend        backend
-	config         startConfig
-	lastStatistics statistics
-	lastAckedID    int
-	pending        *pendingMessage
+	factory         backendFactory
+	backend         backend
+	config          startConfig
+	lastStatistics  statistics
+	lastAckedID     int
+	pending         *pendingMessage
+	recoveryApplied bool
 }
 
 func newServer(factory backendFactory) *server { return &server{factory: factory} }
@@ -414,6 +416,8 @@ func (server *server) handle(ctx context.Context, request protocolRequest) proto
 		return server.start(ctx, request.Start)
 	case "poll":
 		return server.poll(ctx, request.MaxCapacity)
+	case "resume":
+		return server.resume(ctx, request.LastAckedID, request.MessageID, request.MaxCapacity)
 	case "ack":
 		return server.ack(ctx, request.MessageID)
 	case "generate_jit":
@@ -425,6 +429,42 @@ func (server *server) handle(ctx context.Context, request protocolRequest) proto
 	default:
 		return errorResponse("unsupported_operation")
 	}
+}
+
+// resume restores the durable controller cursor in a fresh bridge process. When a durable
+// message is pending, the bridge re-fetches it from GitHub and binds only the exact expected ID;
+// Rust independently compares the complete normalized event set before using the session.
+func (server *server) resume(ctx context.Context, lastAckedID, pendingMessageID, maxCapacity int) protocolResponse {
+	if server.backend == nil {
+		return errorResponse("not_started")
+	}
+	if server.recoveryApplied || server.pending != nil || server.lastAckedID != 0 || lastAckedID < 0 || maxCapacity < 0 || maxCapacity > server.config.MaxCapacity {
+		return errorResponse("invalid_recovery")
+	}
+	if pendingMessageID == 0 {
+		if maxCapacity != 0 {
+			return errorResponse("invalid_recovery")
+		}
+		server.lastAckedID = lastAckedID
+		server.recoveryApplied = true
+		return protocolResponse{Version: protocolVersion, Type: "restored", MessageID: lastAckedID}
+	}
+	if pendingMessageID <= lastAckedID {
+		return errorResponse("invalid_recovery")
+	}
+	message, err := server.backend.Poll(ctx, lastAckedID, maxCapacity)
+	if err != nil || message == nil || message.MessageID != pendingMessageID || message.Statistics == nil {
+		return errorResponse("recovery_failed")
+	}
+	response, available, normalizeErr := normalizeMessage(message)
+	if normalizeErr != nil || len(available) > maxCapacity || !responseFitsProtocolLine(response) {
+		return errorResponse("recovery_failed")
+	}
+	server.lastAckedID = lastAckedID
+	server.lastStatistics = *response.Statistics
+	server.pending = &pendingMessage{messageID: message.MessageID, available: available}
+	server.recoveryApplied = true
+	return response
 }
 
 func (server *server) start(ctx context.Context, config startConfig) protocolResponse {

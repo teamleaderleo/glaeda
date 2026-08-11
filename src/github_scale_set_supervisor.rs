@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use crate::disposable_clone_runtime::{CloneRuntimeClock, DisposableCloneRuntime};
 use crate::disposable_runner_runtime::DisposableRunnerRuntime;
+use crate::disposable_template_runtime::DisposableTemplateRuntime;
 use crate::github_scale_set_service::{
     ScaleSetBridgeSession, ScaleSetRunnerBridgeSession, ScaleSetService, ScaleSetServiceClock,
     ScaleSetServiceDisposition, ScaleSetServiceError,
@@ -207,6 +208,7 @@ impl<'a, W: ScaleSetSupervisorWait, S: ScaleSetSupervisorEventSink> ScaleSetSupe
     pub(crate) fn serve<B, C, E, L>(
         &mut self,
         service: &mut ScaleSetService<B, C>,
+        template_runtime: &DisposableTemplateRuntime,
         clone_runtime: &DisposableCloneRuntime,
         runner_runtime: &DisposableRunnerRuntime,
         executor: &E,
@@ -219,7 +221,15 @@ impl<'a, W: ScaleSetSupervisorWait, S: ScaleSetSupervisorEventSink> ScaleSetSupe
         L: CloneRuntimeClock,
     {
         run_supervisor_loop(
-            || service.supervise_once(clone_runtime, runner_runtime, executor, clock),
+            || {
+                service.supervise_once(
+                    template_runtime,
+                    clone_runtime,
+                    runner_runtime,
+                    executor,
+                    clock,
+                )
+            },
             self.policy,
             self.wait,
             self.events,

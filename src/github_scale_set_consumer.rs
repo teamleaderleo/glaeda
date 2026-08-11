@@ -111,7 +111,12 @@ pub(crate) fn apply_scale_set_event(
     let identities = derive_identities(policy, job)?;
 
     if matches!(event, ScaleSetBridgeEvent::Available(_)) {
-        if now < pending.observed_at() || now > pending.not_after() {
+        // Recording the normalized message is the durable admission point. Production restart
+        // re-fetches and exactly matches a still-pending GitHub message before replaying it, so a
+        // controller outage must not make that durable work permanently unacknowledgeable. Keep
+        // rejecting clock rollback; the attempt's original six-hour deadline still prevents a
+        // delayed replay from authorizing useful worker execution indefinitely.
+        if now < pending.observed_at() {
             return Err(ScaleSetConsumerError::new("consumer_admission_stale"));
         }
         // The inbox deadline bounds whether this service message is fresh enough to create a
@@ -520,7 +525,7 @@ mod tests {
     }
 
     #[test]
-    fn changed_job_or_expired_admission_cannot_reuse_request_id() {
+    fn changed_job_or_clock_rollback_cannot_reuse_request_id() {
         let policy = policy();
         let event = ScaleSetBridgeEvent::Available(job("job-1"));
         let pending = pending(event.clone());
@@ -551,12 +556,29 @@ mod tests {
                 &pending,
                 &event,
                 &DisposableAttemptCatalogDocument::empty(),
-                EpochMillis::new(120_001).unwrap(),
+                EpochMillis::new(99_999).unwrap(),
             )
             .unwrap_err()
             .code(),
             "consumer_admission_stale"
         );
+    }
+
+    #[test]
+    fn exact_durable_available_event_remains_replayable_after_controller_outage() {
+        let policy = policy();
+        let event = ScaleSetBridgeEvent::Available(job("job-1"));
+        let pending = pending(event.clone());
+        let reserved = apply_scale_set_event(
+            &policy,
+            &pending,
+            &event,
+            &DisposableAttemptCatalogDocument::empty(),
+            EpochMillis::new(120_001).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(reserved.active()[0].attempt().not_after().get(), 21_700_000);
     }
 
     #[test]

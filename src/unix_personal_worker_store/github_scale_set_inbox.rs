@@ -711,6 +711,21 @@ pub(super) fn refuse_unsettled(
     Ok(())
 }
 
+pub(super) fn refuse_orphan_current_without_catalog(
+    store: &UnixPersonalWorkerStore,
+) -> Result<(), PersonalWorkerStoreError> {
+    if store
+        .read_named_bytes_bounded(INBOX_DOCUMENT, MAX_GITHUB_SCALE_SET_INBOX_BYTES)?
+        .is_some()
+    {
+        return Err(store_error(
+            PersonalWorkerStoreErrorKind::CorruptState,
+            "Scale Set inbox exists without its disposable-attempt catalog",
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn require_settled_source(
     store: &UnixPersonalWorkerStore,
     expected_source_identity: &str,

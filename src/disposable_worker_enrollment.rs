@@ -5,11 +5,6 @@
 //! bridge, prepared-template, resource, Lima, and consumer boundaries instead of duplicating
 //! those semantics here.
 
-// The validated parts become live when the following slice wires `worker serve`; keeping the
-// decoder independently testable prevents that process entry point from becoming the policy
-// parser. Remove this allowance when the service facade consumes `into_parts`.
-#![allow(dead_code)]
-
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -19,6 +14,7 @@ use crate::artifact::Sha256Digest;
 use crate::disposable_clone_runtime::DisposableCloneRuntime;
 use crate::disposable_prepared_template::current_disposable_prepared_template;
 use crate::disposable_runner_runtime::DisposableRunnerRuntime;
+use crate::disposable_template_runtime::DisposableTemplateRuntime;
 use crate::disposable_worker_reconciler::DisposableWorkerResources;
 use crate::github_scale_set_bridge::{
     GitHubAppKeychainConfig, ScaleSetBridgeConfig, ScaleSetBridgeTarget,
@@ -83,6 +79,7 @@ pub struct DisposableWorkerEnrollment {
     state_root: PathBuf,
     bridge_config: ScaleSetBridgeConfig,
     consumer_policy: ScaleSetConsumerPolicy,
+    template_runtime: DisposableTemplateRuntime,
     clone_runtime: DisposableCloneRuntime,
     runner_runtime: DisposableRunnerRuntime,
 }
@@ -102,6 +99,7 @@ pub(crate) struct DisposableWorkerEnrollmentParts {
     pub(crate) state_root: PathBuf,
     pub(crate) bridge_config: ScaleSetBridgeConfig,
     pub(crate) consumer_policy: ScaleSetConsumerPolicy,
+    pub(crate) template_runtime: DisposableTemplateRuntime,
     pub(crate) clone_runtime: DisposableCloneRuntime,
     pub(crate) runner_runtime: DisposableRunnerRuntime,
 }
@@ -112,6 +110,7 @@ impl DisposableWorkerEnrollment {
             state_root: self.state_root,
             bridge_config: self.bridge_config,
             consumer_policy: self.consumer_policy,
+            template_runtime: self.template_runtime,
             clone_runtime: self.clone_runtime,
             runner_runtime: self.runner_runtime,
         }
@@ -208,6 +207,13 @@ fn build_enrollment(
         &prepared,
     )
     .map_err(|_| invalid_configuration())?;
+    let template_runtime = DisposableTemplateRuntime::new(
+        state_root.clone(),
+        limactl_program.clone(),
+        lima_home.clone(),
+        source_instance.clone(),
+    )
+    .map_err(|_| invalid_configuration())?;
     let clone_runtime = DisposableCloneRuntime::new(
         state_root.clone(),
         limactl_program.clone(),
@@ -221,6 +227,7 @@ fn build_enrollment(
         state_root,
         bridge_config,
         consumer_policy,
+        template_runtime,
         clone_runtime,
         runner_runtime,
     })
@@ -375,6 +382,7 @@ mod tests {
         assert_eq!(parts.state_root, Path::new("/private/var/lib/smolrunner"));
         let _ = parts.bridge_config;
         let _ = parts.consumer_policy;
+        let _ = parts.template_runtime;
         let _ = parts.clone_runtime;
         let _ = parts.runner_runtime;
     }
