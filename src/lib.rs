@@ -21,6 +21,9 @@ pub mod disposable_clone_runtime;
 pub mod disposable_lima_worker;
 /// Canonical supply-chain and isolation identity for the prepared disposable VM template.
 pub mod disposable_prepared_template;
+/// Private, secret-safe command binding for one durably registered disposable guest runner.
+#[cfg(unix)]
+pub(crate) mod disposable_runner_runtime;
 pub mod disposable_template_generation;
 /// Same-lock bounded Lima supervisor for the disposable source-template lifecycle.
 #[cfg(unix)]

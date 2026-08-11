@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use rustix::io::Errno;
 use rustix::process::{self, Pid, Signal};
 use serde::Serialize;
+use zeroize::Zeroizing;
 
 const REDACTED: &str = "[REDACTED]";
 const CAPTURE_BUFFER_BYTES: usize = 8_192;
@@ -19,12 +20,16 @@ pub const MAX_CAPTURED_STREAM_BYTES: usize = 1_048_576;
 pub const MAX_COMMAND_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Clone, PartialEq, Eq)]
-pub struct SecretString(String);
+pub struct SecretString(Zeroizing<String>);
 
 impl SecretString {
     #[must_use]
     pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
+        Self(Zeroizing::new(value.into()))
+    }
+
+    pub(crate) fn from_zeroizing(value: Zeroizing<String>) -> Self {
+        Self(value)
     }
 
     fn expose(&self) -> &str {
@@ -119,6 +124,20 @@ impl CommandSpec {
     pub fn secret_environment(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.environment
             .insert(key.into(), CommandValue::Secret(SecretString::new(value)));
+        self
+    }
+
+    /// Add an already-zeroizing secret without creating a second ordinary `String` copy.
+    #[must_use]
+    pub(crate) fn zeroizing_secret_environment(
+        mut self,
+        key: impl Into<String>,
+        value: Zeroizing<String>,
+    ) -> Self {
+        self.environment.insert(
+            key.into(),
+            CommandValue::Secret(SecretString::from_zeroizing(value)),
+        );
         self
     }
 

@@ -188,7 +188,14 @@ the resulting one-job attempt, so replay is exact without expiring ordinary buil
 Unacquired or pre-clone-canceled work completes its durable release and moves immediately into
 bounded replay history, so repeated cancellations restore advertised capacity instead of filling
 the active catalog.
-No operator enrollment path, JIT generation-to-guest handoff, runner launch, terminal cleanup, or
+A private guest-handoff foundation consumes the bridge's guaranteed-zeroization JIT value into an
+official-runner environment input without placing the value in argv, logs, Debug, serialization, or
+an ordinary copied `String`. It fixes the Lima shell, guest `sudo`, runner listener, work directory,
+environment allowlist, and one-job hosted result switch, and binds the candidate to the exact
+durable attempt, cloned VM identity, runner name, runner ID, and deadline. It intentionally exposes
+no execution path yet: the production service must still freshly prove the complete target ready,
+durably record the GitHub registration, publish a no-replay runner-start checkpoint, and only then
+consume the command. No operator enrollment path, executable guest handoff, terminal cleanup, or
 supervised service loop exists yet, so this remains control-plane foundation rather than production
 capacity.
 
