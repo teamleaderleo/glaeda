@@ -48,12 +48,14 @@ const CREATE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const STOP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const DISCARD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const GUEST_CACHE_PATH: &str = "/var/lib/smolrunner-runner/work";
-const RUNNER_LISTENER: &str = "/opt/smolrunner/actions-runner/bin/Runner.Listener";
 const JIT_LAUNCHER: &str = "/opt/smolrunner/bin/smolrunner-jit-launcher";
 const JIT_LAUNCHER_BYTES: &[u8] = include_bytes!("../examples/lima/smolrunner-jit-launcher");
+const RUNNER_INTEGRITY: &str = "/opt/smolrunner/bin/smolrunner-runner-integrity";
+const RUNNER_INTEGRITY_BYTES: &[u8] =
+    include_bytes!("../examples/lima/smolrunner-runner-integrity");
 const RUNNER_USER: &str = "smolrunner-runner";
-const EXPECTED_RUNNER_VERSION: &str = "2.336.0\n";
 const EXPECTED_RUNNER_GROUPS: &str = "smolrunner-runner\n";
+const EXPECTED_RUNNER_INTEGRITY: &str = "smolrunner-runner-integrity-ok\n";
 const APT_POLICY_PATH: &str = "/etc/apt/apt.conf.d/99-smolrunner-no-automatic-updates";
 const APT_POLICY_BYTES: &[u8] = b"APT::Periodic::Enable \"0\";\nAPT::Periodic::Update-Package-Lists \"0\";\nAPT::Periodic::Unattended-Upgrade \"0\";\n";
 const MASKED_APT_UNITS: [&str; 4] = [
@@ -544,6 +546,12 @@ mod tests {
         assert!(template.contains(&format!(
             "readonly jit_launcher_sha256=\"{launcher_digest}\""
         )));
+        let integrity_digest = format!("{:x}", Sha256::digest(RUNNER_INTEGRITY_BYTES));
+        assert!(template.contains(&format!(
+            "readonly integrity_verifier_sha256=\"{integrity_digest}\""
+        )));
+        assert!(template.contains("/usr/bin/chown -R root:root \"${install_stage}\""));
+        assert!(template.contains("/usr/bin/chmod 1775 \"${install_stage}\""));
     }
 
     #[test]
@@ -1154,14 +1162,28 @@ impl DisposableTemplateRuntime {
         if !command_matches(executor, &marker, OBSERVATION_TIMEOUT, &expected_marker)? {
             return Ok(false);
         }
-        let version = self
-            .guest_command_for(instance, RUNNER_LISTENER)
-            .argument("--version");
+        let integrity_digest = format!("{:x}", Sha256::digest(RUNNER_INTEGRITY_BYTES));
+        let expected_integrity = format!("{integrity_digest}  {RUNNER_INTEGRITY}\n");
+        let integrity_file = self
+            .guest_command_for(instance, "/usr/bin/sha256sum")
+            .argument(RUNNER_INTEGRITY);
         if !command_matches(
             executor,
-            &version,
+            &integrity_file,
             OBSERVATION_TIMEOUT,
-            EXPECTED_RUNNER_VERSION,
+            &expected_integrity,
+        )? {
+            return Ok(false);
+        }
+        let integrity = self
+            .guest_command_for(instance, "/usr/bin/sudo")
+            .argument("--non-interactive")
+            .argument(RUNNER_INTEGRITY);
+        if !command_matches(
+            executor,
+            &integrity,
+            OBSERVATION_TIMEOUT,
+            EXPECTED_RUNNER_INTEGRITY,
         )? {
             return Ok(false);
         }

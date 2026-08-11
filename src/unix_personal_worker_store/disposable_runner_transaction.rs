@@ -188,8 +188,13 @@ impl UnixPersonalWorkerStore {
         let command_started_at = clock
             .epoch_millis()
             .map_err(|_| DisposableRunnerRuntimeError::observation("runner_clock_unavailable"))?;
-        plan.execute_started(started_reservation, command_started_at, executor)
-            .map(DisposableRunnerTransactionOutcome::CommandCompleted)
+        let receipt = plan.execute_started(started_reservation, command_started_at, executor)?;
+        ready_after_checkpoint.confirm_current().map_err(|_| {
+            DisposableRunnerRuntimeError::recovery("runner_target_post_command_drift")
+        })?;
+        Ok(DisposableRunnerTransactionOutcome::CommandCompleted(
+            receipt,
+        ))
     }
 
     fn publish_runner_catalog(

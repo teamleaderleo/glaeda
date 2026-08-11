@@ -912,6 +912,7 @@ mod tests {
         calls: RefCell<Vec<Vec<String>>>,
         fail_clone: bool,
         fail_runner: bool,
+        rewrite_target_after_runner: bool,
         target_ready: bool,
         rewrite_target_during_final_source: bool,
         target_rewritten: Cell<bool>,
@@ -1073,6 +1074,9 @@ mod tests {
                 if runner_launch && self.fail_runner {
                     return Err(io::Error::other("injected runner failure"));
                 }
+                if runner_launch && self.rewrite_target_after_runner {
+                    self.host.rewrite_disk_identity(TARGET, 0x99);
+                }
                 let stdout = if argv.iter().any(|value| value == "/usr/bin/uname") {
                     "aarch64\n".to_owned()
                 } else if argv.iter().any(|value| value == "_NPROCESSORS_ONLN") {
@@ -1097,15 +1101,21 @@ mod tests {
                     .is_some_and(|value| value == "/opt/smolrunner/bin/smolrunner-jit-launcher")
                 {
                     "9b7cc857f2de1181f64bb067e4d4870e0bcb679d597ec047d885395ac6160996  /opt/smolrunner/bin/smolrunner-jit-launcher\n".to_owned()
+                } else if argv
+                    .last()
+                    .is_some_and(|value| value == "/opt/smolrunner/bin/smolrunner-runner-integrity")
+                    && argv.iter().any(|value| value == "/usr/bin/sha256sum")
+                {
+                    "38ab837c98c697f91be7e0fda94492d342dea1c2515c20d3a643078da5dea8da  /opt/smolrunner/bin/smolrunner-runner-integrity\n".to_owned()
+                } else if argv
+                    .last()
+                    .is_some_and(|value| value == "/opt/smolrunner/bin/smolrunner-runner-integrity")
+                {
+                    "smolrunner-runner-integrity-ok\n".to_owned()
                 } else if argv.last().is_some_and(|value| {
                     value == "/etc/apt/apt.conf.d/99-smolrunner-no-automatic-updates"
                 }) {
                     "b10384a904cdd14d18af31a7754a19ca0c67c237f3ca7bd239f4cf64102ffedb  /etc/apt/apt.conf.d/99-smolrunner-no-automatic-updates\n".to_owned()
-                } else if argv
-                    .iter()
-                    .any(|value| value == "/opt/smolrunner/actions-runner/bin/Runner.Listener")
-                {
-                    "2.336.0\n".to_owned()
                 } else if argv.iter().any(|value| value == "/usr/bin/id") {
                     "smolrunner-runner\n".to_owned()
                 } else if argv.iter().any(|value| value == "/usr/bin/systemctl") {
@@ -1142,6 +1152,7 @@ mod tests {
             calls: RefCell::new(Vec::new()),
             fail_clone,
             fail_runner: false,
+            rewrite_target_after_runner: false,
             target_ready: false,
             rewrite_target_during_final_source: false,
             target_rewritten: Cell::new(false),
@@ -1242,6 +1253,15 @@ mod tests {
         assert!(executor.calls.borrow().iter().any(|argv| {
             argv.iter().any(|value| value == TARGET)
                 && argv.iter().any(|value| value == "/usr/bin/sha256sum")
+        }));
+        assert!(executor.calls.borrow().iter().any(|argv| {
+            argv.iter()
+                .any(|value| value == "/opt/smolrunner/bin/smolrunner-runner-integrity")
+                && argv.iter().any(|value| value == "/usr/bin/sudo")
+        }));
+        assert!(!executor.calls.borrow().iter().any(|argv| {
+            argv.iter()
+                .any(|value| value == "/opt/smolrunner/actions-runner/bin/Runner.Listener")
         }));
     }
 
@@ -1346,6 +1366,63 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(error.code(), "runner_command_failed");
+        assert!(durable_attempt(&root, &attempt_id).runner_start_started());
+        assert_eq!(registration.jit_calls, 1);
+        assert_eq!(executor.runner_launch_count(), 1);
+
+        let recovery = store
+            .execute_disposable_runner_transaction(
+                &runner_runtime,
+                &clone_runtime,
+                &attempt_id,
+                &mut registration,
+                &executor,
+                &FixedClock,
+            )
+            .unwrap_err();
+        assert_eq!(recovery.code(), "runner_launch_state_invalid");
+        assert_eq!(registration.jit_calls, 1);
+        assert_eq!(executor.runner_launch_count(), 1);
+    }
+
+    #[test]
+    fn post_command_target_rebind_withholds_success_without_replaying_jit() {
+        let root = TempRoot::new("runner-post-command-rebind");
+        let host = LimaHostIdentityFixture::new_with_disk_bytes(
+            "clone-runtime-runner-post-command-rebind",
+            SOURCE,
+            SOURCE_DISK,
+        );
+        let clone_runtime = runtime(&root, &host);
+        let mut executor = executor(&host, false);
+        let attempt_id =
+            install_running_registering_attempt(&root, &host, &clone_runtime, &mut executor);
+        executor.rewrite_target_after_runner = true;
+        let source_identity =
+            ScaleSetBridgeIdentity::parse(&format!("sha256:{}", "69".repeat(32))).unwrap();
+        let mut store =
+            UnixPersonalWorkerStore::open_or_create_disposable_catalog(root.path()).unwrap();
+        store.initialize_scale_set_inbox(&source_identity).unwrap();
+        let runner_runtime =
+            DisposableRunnerRuntime::new("/opt/homebrew/bin/limactl", host.lima_home()).unwrap();
+        let mut registration = FakeRegistration {
+            source_identity,
+            observed: ScaleSetRunnerLookup::Absent,
+            observe_calls: 0,
+            jit_calls: 0,
+        };
+
+        let error = store
+            .execute_disposable_runner_transaction(
+                &runner_runtime,
+                &clone_runtime,
+                &attempt_id,
+                &mut registration,
+                &executor,
+                &FixedClock,
+            )
+            .unwrap_err();
+        assert_eq!(error.code(), "runner_target_post_command_drift");
         assert!(durable_attempt(&root, &attempt_id).runner_start_started());
         assert_eq!(registration.jit_calls, 1);
         assert_eq!(executor.runner_launch_count(), 1);

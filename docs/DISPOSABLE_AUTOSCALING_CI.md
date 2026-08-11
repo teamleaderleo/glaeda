@@ -139,7 +139,8 @@ Lima version before observation and again immediately before each mutation. Read
 Lima semantics back to that pinned binary: the supervisor compares `limactl validate --fill` for
 the exact input with the complete realized `limactl list --all-fields` config across the guest
 probes, re-observes the full final Lima state and guest identity, then verifies the pinned runner
-marker/version/account and the still-disabled automatic-update policy. The complete composite
+marker, root-owned non-writable installation closure, exact file/entry manifest, account, and the
+still-disabled automatic-update policy. The complete composite
 observation has one 30-second freshness budget. The clone-attempt transaction composes that exact
 stopped source with a durable acquired attempt, a fresh absent target, a live Scale Set veto, one
 fixed clone-with-start command, and the finally reconfirmed descriptor-bound post-clone disk
@@ -190,18 +191,23 @@ bounded replay history, so repeated cancellations restore advertised capacity in
 the active catalog.
 A private guest-handoff foundation consumes the bridge's guaranteed-zeroization JIT value as one
 secret standard-input line to a fixed template-bound guest launcher, without placing the value in
-argv, the inherited environment, logs, Debug, serialization, or an ordinary copied `String`. The
+argv, the inherited environment, logs, Debug, serialization, or an ordinary copied `String`.
+Secret-bearing command output is discarded at the host operating-system boundary rather than
+captured and redacted. The
 launcher sets only the official runner's JIT input and hosted-result switch immediately before
 `exec`. The plan fixes the Lima shell, guest `sudo`, launcher, work directory, and empty inherited
 environment, and binds the candidate to the exact
 durable attempt, cloned VM identity, runner name, runner ID, and deadline. It intentionally exposes
 no free-standing execution path. A private canonical-lock transaction now distinguishes proven
 registration absence from observation failure, repeatedly rechecks the running clone's exact host
-identity, resources, realized Lima isolation policy, guest identity, pinned runner and launcher,
-and disabled automatic updates, then durably records the GitHub registration and a no-replay
+identity, resources, realized Lima isolation policy, guest identity, root-owned checksum-verified
+runner closure and launcher, and disabled automatic updates, then durably records the GitHub
+registration and a no-replay
 runner-start checkpoint before consuming the one command. A discovered registration is persisted
 for exact cleanup without issuing another JIT value; command failure leaves Started recovery debt
-and cannot replay. The initial transaction deliberately retains the single controller lock while
+and cannot replay. A final retained host-object check withholds a successful receipt if the Lima
+instance or disk path was rebound while the runner command was active. The initial transaction
+deliberately retains the single controller lock while
 the one-job runner command is active. Operator enrollment, terminal runner/VM cleanup, a supervised
 service loop, and the physical acceptance run remain, so this is not production capacity yet.
 
