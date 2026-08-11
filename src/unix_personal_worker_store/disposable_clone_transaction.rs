@@ -50,7 +50,8 @@ impl UnixPersonalWorkerStore {
             .load_catalog_named(super::disposable_attempt_catalog::CATALOG_DOCUMENT)
             .map_err(|_| DisposableCloneRuntimeError::durable("clone_catalog_unavailable"))?
             .ok_or_else(|| DisposableCloneRuntimeError::durable("clone_catalog_missing"))?;
-        if admission_held {
+        let host_admission_held = !admission.host_admission_permitted()?;
+        if admission_held || host_admission_held {
             let reservation = current
                 .find_active(attempt_id)
                 .ok_or_else(|| DisposableCloneRuntimeError::durable("clone_attempt_missing"))?;
@@ -67,6 +68,11 @@ impl UnixPersonalWorkerStore {
             runtime.authorize_locked(&current, attempt_id, admission, executor, clock);
         if let Some(outcome) = self.persist_pending_clone_scale_set_message(admission)? {
             return Ok(outcome);
+        }
+        if !admission.host_admission_permitted()? {
+            return Ok(DisposableCloneTransactionOutcome::AdmissionHeld {
+                attempt_id: attempt_id.as_str().to_owned(),
+            });
         }
         authorization?;
         let expected_attempt_revision = current
@@ -141,7 +147,8 @@ impl UnixPersonalWorkerStore {
             .load_catalog_named(super::disposable_attempt_catalog::CATALOG_DOCUMENT)
             .map_err(|_| DisposableCloneRuntimeError::durable("clone_catalog_unavailable"))?
             .ok_or_else(|| DisposableCloneRuntimeError::durable("clone_catalog_missing"))?;
-        if admission_held {
+        let host_admission_held = !admission.host_admission_permitted()?;
+        if admission_held || host_admission_held {
             let reservation = current
                 .find_active(attempt_id)
                 .ok_or_else(|| DisposableCloneRuntimeError::durable("clone_attempt_missing"))?;
@@ -172,6 +179,11 @@ impl UnixPersonalWorkerStore {
             return Ok(outcome);
         }
         let prepared = prepared?;
+        if !admission.host_admission_permitted()? {
+            return Ok(DisposableCloneTransactionOutcome::AdmissionHeld {
+                attempt_id: attempt_id.as_str().to_owned(),
+            });
+        }
         let expected_attempt_revision = current
             .find_active(attempt_id)
             .ok_or_else(|| DisposableCloneRuntimeError::durable("clone_attempt_missing"))?

@@ -166,6 +166,12 @@ pub(crate) trait DisposableCloneAdmissionSource: admission_seal::Sealed {
         reservation: &DisposableAttemptReservation,
     ) -> Result<DisposableCloneAdmissionObservation, DisposableCloneRuntimeError>;
 
+    /// Recheck host-local admission immediately before a durable provisioning transition.
+    ///
+    /// This is distinct from capacity/cancellation: a false host gate holds provisioning without
+    /// releasing an already acquired GitHub job.
+    fn host_admission_permitted(&self) -> Result<bool, DisposableCloneRuntimeError>;
+
     fn take_pending_scale_set_message(&self) -> Option<PendingCloneScaleSetMessage> {
         None
     }
@@ -2407,6 +2413,12 @@ mod tests {
         cancellation_requested: bool,
     }
 
+    struct HostGateAdmission {
+        observation_calls: Cell<u8>,
+        gate_calls: Cell<u8>,
+        deny_on: u8,
+    }
+
     impl FakeAdmission {
         fn available() -> Self {
             Self {
@@ -2421,7 +2433,13 @@ mod tests {
 
     impl admission_seal::Sealed for FakeAdmissionAt {}
 
+    impl admission_seal::Sealed for HostGateAdmission {}
+
     impl DisposableCloneAdmissionSource for FakeAdmission {
+        fn host_admission_permitted(&self) -> Result<bool, DisposableCloneRuntimeError> {
+            Ok(true)
+        }
+
         fn observe(
             &self,
             catalog: &DisposableAttemptCatalogDocument,
@@ -2441,6 +2459,10 @@ mod tests {
     }
 
     impl DisposableCloneAdmissionSource for FakeAdmissionAt {
+        fn host_admission_permitted(&self) -> Result<bool, DisposableCloneRuntimeError> {
+            Ok(true)
+        }
+
         fn observe(
             &self,
             catalog: &DisposableAttemptCatalogDocument,
@@ -2454,6 +2476,31 @@ mod tests {
                 self.capacity_reserved,
                 self.cancellation_requested,
             ))
+        }
+    }
+
+    impl DisposableCloneAdmissionSource for HostGateAdmission {
+        fn observe(
+            &self,
+            catalog: &DisposableAttemptCatalogDocument,
+            reservation: &DisposableAttemptReservation,
+        ) -> Result<DisposableCloneAdmissionObservation, DisposableCloneRuntimeError> {
+            self.observation_calls
+                .set(self.observation_calls.get().saturating_add(1));
+            Ok(DisposableCloneAdmissionObservation::new(
+                catalog,
+                reservation,
+                EpochMillis::new(1_900_000_000_000).unwrap(),
+                EpochMillis::new(1_900_000_030_000).unwrap(),
+                true,
+                false,
+            ))
+        }
+
+        fn host_admission_permitted(&self) -> Result<bool, DisposableCloneRuntimeError> {
+            let call = self.gate_calls.get().saturating_add(1);
+            self.gate_calls.set(call);
+            Ok(call != self.deny_on)
         }
     }
 
@@ -2541,6 +2588,10 @@ mod tests {
     impl admission_seal::Sealed for OrderedAdmission {}
 
     impl DisposableCloneAdmissionSource for OrderedAdmission {
+        fn host_admission_permitted(&self) -> Result<bool, DisposableCloneRuntimeError> {
+            Ok(true)
+        }
+
         fn observe(
             &self,
             catalog: &DisposableAttemptCatalogDocument,
@@ -2845,6 +2896,89 @@ mod tests {
                 if held == clone_attempt_id.as_str()
         ));
         assert_eq!(clone_admission.calls.get(), 1);
+        assert_eq!(clone_executor.clone_count(), 0);
+        assert_eq!(
+            durable_attempt(&clone_root, &clone_attempt_id).phase(),
+            DisposableAttemptPhase::CloneAuthorized
+        );
+    }
+
+    #[test]
+    fn host_admission_gate_blocks_authorization_and_clone_before_any_executor_call() {
+        let authorization_root = TempRoot::new("host-gate-authorize");
+        let authorization_host = LimaHostIdentityFixture::new_with_disk_bytes(
+            "clone-runtime-host-gate-authorize",
+            SOURCE,
+            SOURCE_DISK,
+        );
+        let authorization_runtime = runtime(&authorization_root, &authorization_host);
+        let attempt_id = install_reserved_attempt(&authorization_root);
+        let authorization_executor = executor(&authorization_host, false);
+        let authorization_admission = HostGateAdmission {
+            observation_calls: Cell::new(0),
+            gate_calls: Cell::new(0),
+            deny_on: 2,
+        };
+        let mut authorization_store =
+            UnixPersonalWorkerStore::open_or_create_disposable_catalog(authorization_root.path())
+                .unwrap();
+
+        let outcome = authorization_store
+            .authorize_disposable_clone_transaction(
+                &authorization_runtime,
+                &attempt_id,
+                &authorization_admission,
+                &authorization_executor,
+                &FixedClock,
+            )
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            DisposableCloneTransactionOutcome::AdmissionHeld { attempt_id: ref held }
+                if held == attempt_id.as_str()
+        ));
+        assert_eq!(authorization_admission.observation_calls.get(), 1);
+        assert_eq!(authorization_admission.gate_calls.get(), 2);
+        assert_eq!(authorization_executor.clone_count(), 0);
+        assert_eq!(
+            durable_attempt(&authorization_root, &attempt_id).phase(),
+            DisposableAttemptPhase::Reserved
+        );
+
+        let clone_root = TempRoot::new("host-gate-clone");
+        let clone_host = LimaHostIdentityFixture::new_with_disk_bytes(
+            "clone-runtime-host-gate-clone",
+            SOURCE,
+            SOURCE_DISK,
+        );
+        let clone_runtime = runtime(&clone_root, &clone_host);
+        install_ready_generation(&clone_root, &clone_host, &clone_runtime);
+        let clone_attempt_id = install_authorized_attempt(&clone_root);
+        let clone_executor = executor(&clone_host, false);
+        let clone_admission = HostGateAdmission {
+            observation_calls: Cell::new(0),
+            gate_calls: Cell::new(0),
+            deny_on: 2,
+        };
+        let mut clone_store =
+            UnixPersonalWorkerStore::open_or_create_disposable_catalog(clone_root.path()).unwrap();
+
+        let outcome = clone_store
+            .execute_disposable_clone_transaction(
+                &clone_runtime,
+                &clone_attempt_id,
+                &clone_admission,
+                &clone_executor,
+                &FixedClock,
+            )
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            DisposableCloneTransactionOutcome::AdmissionHeld { attempt_id: ref held }
+                if held == clone_attempt_id.as_str()
+        ));
+        assert_eq!(clone_admission.observation_calls.get(), 1);
+        assert_eq!(clone_admission.gate_calls.get(), 2);
         assert_eq!(clone_executor.clone_count(), 0);
         assert_eq!(
             durable_attempt(&clone_root, &clone_attempt_id).phase(),

@@ -129,6 +129,7 @@ fn prepare_durable_service(
     let scale_set = ScaleSetService::<ScaleSetBridgeClient, SystemScaleSetServiceClock>::prepare(
         store,
         parts.consumer_policy.clone(),
+        parts.network_policy.clone(),
     )
     .map_err(|error| {
         DisposableWorkerServiceError::new(

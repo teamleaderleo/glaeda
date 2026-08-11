@@ -13,6 +13,9 @@ use crate::disposable_clone_runtime::{
     DisposableCloneRuntimeError, DisposableCloneTransactionOutcome, PendingCloneScaleSetMessage,
     admission_seal,
 };
+#[cfg(target_os = "macos")]
+use crate::disposable_network_gate::observe_disposable_network_gate;
+use crate::disposable_network_policy::DisposableNetworkPolicyPlan;
 use crate::disposable_runner_runtime::{
     DisposableRunnerRegistrationSource, DisposableRunnerRuntime, DisposableRunnerRuntimeError,
 };
@@ -294,6 +297,7 @@ pub(crate) struct ScaleSetService<B, C> {
     store: UnixPersonalWorkerStore,
     bridge: B,
     policy: ScaleSetConsumerPolicy,
+    network_policy: Option<DisposableNetworkPolicyPlan>,
     source_identity: ScaleSetBridgeIdentity,
     clock: C,
     startup_orphan_audit: VecDeque<DisposableAttemptId>,
@@ -302,10 +306,27 @@ pub(crate) struct ScaleSetService<B, C> {
 pub(crate) struct PreparedScaleSetService {
     store: UnixPersonalWorkerStore,
     policy: ScaleSetConsumerPolicy,
+    network_policy: DisposableNetworkPolicyPlan,
     source_identity: ScaleSetBridgeIdentity,
     last_acked_message_id: u32,
     pending: Option<PendingScaleSetMessage>,
     startup_orphan_audit: VecDeque<DisposableAttemptId>,
+}
+
+fn network_admission_permitted(policy: Option<&DisposableNetworkPolicyPlan>) -> bool {
+    let Some(policy) = policy else {
+        // Only the cfg(test) constructor omits the production network policy.
+        return true;
+    };
+    #[cfg(target_os = "macos")]
+    {
+        observe_disposable_network_gate(policy).is_ok()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = policy;
+        false
+    }
 }
 
 impl ScaleSetService<ScaleSetBridgeClient, SystemScaleSetServiceClock> {
@@ -314,6 +335,7 @@ impl ScaleSetService<ScaleSetBridgeClient, SystemScaleSetServiceClock> {
     pub(crate) fn prepare(
         mut store: UnixPersonalWorkerStore,
         policy: ScaleSetConsumerPolicy,
+        network_policy: DisposableNetworkPolicyPlan,
     ) -> Result<PreparedScaleSetService, ScaleSetServiceError> {
         let source_identity = policy.source_identity().clone();
         store
@@ -341,6 +363,7 @@ impl ScaleSetService<ScaleSetBridgeClient, SystemScaleSetServiceClock> {
         Ok(PreparedScaleSetService {
             store,
             policy,
+            network_policy,
             source_identity,
             last_acked_message_id,
             pending,
@@ -365,6 +388,7 @@ impl ScaleSetService<ScaleSetBridgeClient, SystemScaleSetServiceClock> {
             store: prepared.store,
             bridge,
             policy: prepared.policy,
+            network_policy: Some(prepared.network_policy),
             source_identity: prepared.source_identity,
             clock: SystemScaleSetServiceClock,
             startup_orphan_audit: prepared.startup_orphan_audit,
@@ -375,13 +399,15 @@ impl ScaleSetService<ScaleSetBridgeClient, SystemScaleSetServiceClock> {
         store: UnixPersonalWorkerStore,
         bridge: ScaleSetBridgeClient,
         policy: ScaleSetConsumerPolicy,
+        network_policy: DisposableNetworkPolicyPlan,
     ) -> Result<Self, ScaleSetServiceError> {
-        let prepared = Self::prepare(store, policy)?;
+        let prepared = Self::prepare(store, policy, network_policy)?;
         Self::start(prepared, bridge)
     }
 }
 
 impl<B: ScaleSetBridgeSession, C: ScaleSetServiceClock> ScaleSetService<B, C> {
+    #[cfg(test)]
     fn with_parts(
         mut store: UnixPersonalWorkerStore,
         bridge: B,
@@ -404,6 +430,7 @@ impl<B: ScaleSetBridgeSession, C: ScaleSetServiceClock> ScaleSetService<B, C> {
             store,
             bridge,
             policy,
+            network_policy: None,
             source_identity,
             clock,
             startup_orphan_audit,
@@ -449,6 +476,7 @@ impl<B: ScaleSetBridgeSession, C: ScaleSetServiceClock> ScaleSetService<B, C> {
             let bridge = &mut self.bridge;
             let clock = &self.clock;
             let policy = &self.policy;
+            let network_policy = self.network_policy.as_ref();
             self.store
                 .acknowledge_scale_set_message(
                     &self.source_identity,
@@ -460,6 +488,7 @@ impl<B: ScaleSetBridgeSession, C: ScaleSetServiceClock> ScaleSetService<B, C> {
                         // pending message and catalog revision.
                         let now = clock.now()?;
                         let acquire_available = !admission_held
+                            && network_admission_permitted(network_policy)
                             && should_acquire_scale_set_available(policy, pending, catalog, now)
                                 .map_err(ScaleSetServiceError::from_consumer)?;
                         bridge
@@ -525,9 +554,15 @@ impl<B: ScaleSetBridgeSession, C: ScaleSetServiceClock> ScaleSetService<B, C> {
 
         let bridge = &mut self.bridge;
         let clock = &self.clock;
+        let network_policy = self.network_policy.as_ref();
         let (response, attempt_id) = self
             .store
             .poll_and_record_scale_set(&self.source_identity, |available_capacity| {
+                let available_capacity = if network_admission_permitted(network_policy) {
+                    available_capacity
+                } else {
+                    0
+                };
                 let response = bridge
                     .poll(available_capacity)
                     .map_err(ScaleSetServiceError::from_bridge)?;
@@ -703,8 +738,12 @@ impl<B: ScaleSetBridgeSession, C: ScaleSetServiceClock> ScaleSetService<B, C> {
         executor: &impl TimedCommandExecutor,
         clock: &impl CloneRuntimeClock,
     ) -> Result<ScaleSetServiceDisposition, ScaleSetServiceError> {
-        let admission =
-            LiveScaleSetCloneAdmission::new(&mut self.bridge, &self.source_identity, clock);
+        let admission = LiveScaleSetCloneAdmission::with_network_policy(
+            &mut self.bridge,
+            &self.source_identity,
+            clock,
+            self.network_policy.as_ref(),
+        );
         match self
             .store
             .execute_disposable_clone_transaction(runtime, attempt_id, &admission, executor, clock)
@@ -737,8 +776,12 @@ impl<B: ScaleSetBridgeSession, C: ScaleSetServiceClock> ScaleSetService<B, C> {
         executor: &impl TimedCommandExecutor,
         clock: &impl CloneRuntimeClock,
     ) -> Result<ScaleSetServiceDisposition, ScaleSetServiceError> {
-        let admission =
-            LiveScaleSetCloneAdmission::new(&mut self.bridge, &self.source_identity, clock);
+        let admission = LiveScaleSetCloneAdmission::with_network_policy(
+            &mut self.bridge,
+            &self.source_identity,
+            clock,
+            self.network_policy.as_ref(),
+        );
         match self
             .store
             .authorize_disposable_clone_transaction(
@@ -771,8 +814,12 @@ impl<B: ScaleSetBridgeSession, C: ScaleSetServiceClock> ScaleSetService<B, C> {
         executor: &impl TimedCommandExecutor,
         clock: &impl CloneRuntimeClock,
     ) -> Result<ScaleSetServiceDisposition, ScaleSetServiceError> {
-        let admission =
-            LiveScaleSetCloneAdmission::new(&mut self.bridge, &self.source_identity, clock);
+        let admission = LiveScaleSetCloneAdmission::with_network_policy(
+            &mut self.bridge,
+            &self.source_identity,
+            clock,
+            self.network_policy.as_ref(),
+        );
         match self
             .store
             .checkpoint_disposable_registration_transaction(
@@ -953,10 +1000,12 @@ pub(crate) struct LiveScaleSetCloneAdmission<'a, B, C> {
     bridge: RefCell<&'a mut B>,
     source_identity: &'a ScaleSetBridgeIdentity,
     clock: &'a C,
+    network_policy: Option<&'a DisposableNetworkPolicyPlan>,
     pending: RefCell<Option<PendingCloneScaleSetMessage>>,
 }
 
 impl<'a, B, C> LiveScaleSetCloneAdmission<'a, B, C> {
+    #[cfg(test)]
     pub(crate) fn new(
         bridge: &'a mut B,
         source_identity: &'a ScaleSetBridgeIdentity,
@@ -966,6 +1015,22 @@ impl<'a, B, C> LiveScaleSetCloneAdmission<'a, B, C> {
             bridge: RefCell::new(bridge),
             source_identity,
             clock,
+            network_policy: None,
+            pending: RefCell::new(None),
+        }
+    }
+
+    pub(crate) fn with_network_policy(
+        bridge: &'a mut B,
+        source_identity: &'a ScaleSetBridgeIdentity,
+        clock: &'a C,
+        network_policy: Option<&'a DisposableNetworkPolicyPlan>,
+    ) -> Self {
+        Self {
+            bridge: RefCell::new(bridge),
+            source_identity,
+            clock,
+            network_policy,
             pending: RefCell::new(None),
         }
     }
@@ -978,6 +1043,10 @@ impl<B: ScaleSetBridgeSession, C: CloneRuntimeClock> DisposableCloneAdmissionSou
 {
     fn scale_set_source_identity(&self) -> Option<&ScaleSetBridgeIdentity> {
         Some(self.source_identity)
+    }
+
+    fn host_admission_permitted(&self) -> Result<bool, DisposableCloneRuntimeError> {
+        Ok(network_admission_permitted(self.network_policy))
     }
 
     fn observe(
@@ -1504,6 +1573,58 @@ mod tests {
                 .first()
                 .map(|attempt| attempt.attempt_id())
         );
+    }
+
+    #[test]
+    fn unavailable_host_network_gate_advertises_zero_and_refuses_acquisition() {
+        let root = TempRoot::new();
+        let store = UnixPersonalWorkerStore::open_or_create_disposable_catalog(&root.0).unwrap();
+        let mut catalog = DisposableAttemptCatalog::new(store);
+        catalog.initialize().unwrap();
+        let store = catalog.into_store();
+        let bridge = FakeBridge {
+            // A nonconforming upstream response is still persisted, but the under-lock ack gate
+            // must refuse acquisition after capacity zero was advertised.
+            polls: VecDeque::from([ScaleSetBridgePoll::Message {
+                message_id: 7,
+                statistics: statistics(),
+                events: vec![event()],
+            }]),
+            acquired: VecDeque::from([Vec::new()]),
+            capacities: Vec::new(),
+            acknowledgements: Vec::new(),
+        };
+        let mut service = ScaleSetService::with_parts(
+            store,
+            bridge,
+            consumer_policy(),
+            FixedClock(EpochMillis::new(100_000).unwrap()),
+        )
+        .unwrap();
+        let other_uid = rustix::process::geteuid().as_raw().checked_add(1).unwrap();
+        service.network_policy = Some(
+            crate::disposable_network_policy::plan_disposable_network_policy(
+                other_uid,
+                &current_disposable_prepared_template().unwrap(),
+            )
+            .unwrap(),
+        );
+
+        assert!(matches!(
+            service.reconcile_once().unwrap(),
+            ScaleSetServiceDisposition::MessagePersisted { .. }
+        ));
+        assert!(matches!(
+            service.reconcile_once().unwrap(),
+            ScaleSetServiceDisposition::EventApplied { .. }
+        ));
+        assert!(matches!(
+            service.reconcile_once().unwrap(),
+            ScaleSetServiceDisposition::MessageAcknowledged { .. }
+        ));
+        let (_, bridge) = service.into_parts();
+        assert_eq!(bridge.capacities, [0]);
+        assert_eq!(bridge.acknowledgements, [(7, false)]);
     }
 
     #[test]
