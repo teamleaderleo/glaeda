@@ -527,18 +527,18 @@ impl ChildBridgeTransport {
         if self.poisoned {
             return Err(ScaleSetBridgeError::new("bridge_session_poisoned"));
         }
-        let mut encoded = serde_json::to_vec(request)
-            .map_err(|_| ScaleSetBridgeError::new("bridge_request_failed"))?;
+        let mut encoded = Zeroizing::new(
+            serde_json::to_vec(request)
+                .map_err(|_| ScaleSetBridgeError::new("bridge_request_failed"))?,
+        );
         encoded.push(b'\n');
         if encoded.len() > MAX_PROTOCOL_LINE_BYTES {
-            encoded.zeroize();
             return Err(ScaleSetBridgeError::new("bridge_request_failed"));
         }
         let deadline = Instant::now()
             .checked_add(timeout)
             .ok_or_else(|| ScaleSetBridgeError::new("bridge_request_failed"))?;
         let write_result = write_all_until(&mut self.input, &encoded, deadline);
-        encoded.zeroize();
         write_result?;
 
         let mut response = Vec::with_capacity(4_096);
