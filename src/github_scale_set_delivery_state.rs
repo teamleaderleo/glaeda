@@ -68,7 +68,7 @@ impl ScaleSetDeliveryRecoveryState {
     }
 
     pub(crate) fn begin_ack(&self) -> Result<Self, ScaleSetDeliveryRecoveryError> {
-        match self.phase {
+        match &self.phase {
             ScaleSetDeliveryRecoveryPhase::Reconciled => {
                 self.successor(ScaleSetDeliveryRecoveryPhase::AcknowledgementStarted)
             }
