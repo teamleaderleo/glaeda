@@ -208,8 +208,17 @@ for exact cleanup without issuing another JIT value; command failure leaves Star
 and cannot replay. A final retained host-object check withholds a successful receipt if the Lima
 instance or disk path was rebound while the runner command was active. The initial transaction
 deliberately retains the single controller lock while
-the one-job runner command is active. Operator enrollment, terminal runner/VM cleanup, a supervised
-service loop, and the physical acceptance run remain, so this is not production capacity yet.
+the one-job runner command is active.
+
+Terminal cleanup now has an observation-first canonical-lock transaction over the existing durable
+`Destroying -> Deregistering -> Releasing -> Complete` graph. It compares the current descriptor-
+bound VZ/disk identity before Lima deletion, requires both Lima and the host identity path to prove
+absence, deletes only the exact service-assigned runner ID and prechosen name, and releases host
+capacity only after both VM and runner are absent. Each tick performs at most one external deletion;
+an ambiguous result leaves the cleanup phase unchanged so restart observes before retrying. A
+complete attempt contributes zero host usage and is then retired into bounded replay history.
+Operator enrollment, the supervised service loop that repeatedly invokes these transactions, and
+the physical acceptance run remain, so this is not production capacity yet.
 
 Acceptance: an enrolled test repository targets the SmolRunner scale-set label, queues a job, and receives its result without operator commands; the JIT runner cannot accept a second job and its credential is absent after VM destruction.
 

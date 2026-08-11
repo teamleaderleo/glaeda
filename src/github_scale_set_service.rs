@@ -6,9 +6,10 @@ use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::disposable_clone_runtime::{
-    CloneRuntimeClock, DisposableCloneAdmissionObservation, DisposableCloneAdmissionSource,
-    DisposableCloneRuntime, DisposableCloneRuntimeError, DisposableCloneTransactionOutcome,
-    PendingCloneScaleSetMessage, admission_seal,
+    CloneRuntimeClock, DisposableCleanupRunnerSource, DisposableCleanupTransactionOutcome,
+    DisposableCloneAdmissionObservation, DisposableCloneAdmissionSource, DisposableCloneRuntime,
+    DisposableCloneRuntimeError, DisposableCloneTransactionOutcome, PendingCloneScaleSetMessage,
+    admission_seal,
 };
 use crate::disposable_runner_runtime::{
     DisposableRunnerRegistrationSource, DisposableRunnerRuntime, DisposableRunnerRuntimeError,
@@ -109,17 +110,53 @@ impl ScaleSetServiceClock for SystemScaleSetServiceClock {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ScaleSetServiceDisposition {
     Idle(ScaleSetStatistics),
-    IdleObservationRecorded { attempt_id: String },
-    MessagePersisted { message_id: u32 },
-    CloneAuthorized { attempt_id: String },
-    CloneCompleted { attempt_id: String },
-    RunnerRegistrationRecovered { attempt_id: String },
-    RunnerCommandCompleted { attempt_id: String },
-    EventApplied { message_id: u32, event_index: usize },
-    MessageAcknowledged { message_id: u32 },
-    AckOutcomeApplied { message_id: u32 },
-    UnprovisionedReleased { attempt_id: String },
-    AttemptRetired { attempt_id: String },
+    IdleObservationRecorded {
+        attempt_id: String,
+    },
+    MessagePersisted {
+        message_id: u32,
+    },
+    CloneAuthorized {
+        attempt_id: String,
+    },
+    CloneCompleted {
+        attempt_id: String,
+    },
+    RunnerRegistrationRecovered {
+        attempt_id: String,
+    },
+    RunnerCommandCompleted {
+        attempt_id: String,
+    },
+    CleanupCheckpointed {
+        attempt_id: String,
+        phase: DisposableAttemptPhase,
+    },
+    VmDestroyed {
+        attempt_id: String,
+    },
+    RunnerDeleted {
+        attempt_id: String,
+    },
+    CapacityReleased {
+        attempt_id: String,
+    },
+    EventApplied {
+        message_id: u32,
+        event_index: usize,
+    },
+    MessageAcknowledged {
+        message_id: u32,
+    },
+    AckOutcomeApplied {
+        message_id: u32,
+    },
+    UnprovisionedReleased {
+        attempt_id: String,
+    },
+    AttemptRetired {
+        attempt_id: String,
+    },
 }
 
 pub(crate) struct ScaleSetService<B, C> {
@@ -387,9 +424,78 @@ impl<B: ScaleSetBridgeSession, C: ScaleSetServiceClock> ScaleSetService<B, C> {
         }
     }
 
+    pub(crate) fn cleanup_once(
+        &mut self,
+        runtime: &DisposableCloneRuntime,
+        attempt_id: &DisposableAttemptId,
+        executor: &impl TimedCommandExecutor,
+        clock: &impl CloneRuntimeClock,
+    ) -> Result<ScaleSetServiceDisposition, ScaleSetServiceError>
+    where
+        B: ScaleSetRunnerBridgeSession,
+    {
+        let mut cleanup = LiveScaleSetCleanup {
+            bridge: &mut self.bridge,
+            source_identity: &self.source_identity,
+        };
+        match self
+            .store
+            .execute_disposable_cleanup_transaction(
+                runtime,
+                attempt_id,
+                &mut cleanup,
+                executor,
+                clock,
+            )
+            .map_err(ScaleSetServiceError::from_clone)?
+        {
+            DisposableCleanupTransactionOutcome::CleanupCheckpointed { attempt_id, phase } => {
+                Ok(ScaleSetServiceDisposition::CleanupCheckpointed { attempt_id, phase })
+            }
+            DisposableCleanupTransactionOutcome::VmDestroyed { attempt_id } => {
+                Ok(ScaleSetServiceDisposition::VmDestroyed { attempt_id })
+            }
+            DisposableCleanupTransactionOutcome::RunnerDeleted { attempt_id } => {
+                Ok(ScaleSetServiceDisposition::RunnerDeleted { attempt_id })
+            }
+            DisposableCleanupTransactionOutcome::CapacityReleased { attempt_id } => {
+                Ok(ScaleSetServiceDisposition::CapacityReleased { attempt_id })
+            }
+        }
+    }
+
     #[cfg(test)]
     fn into_parts(self) -> (UnixPersonalWorkerStore, B) {
         (self.store, self.bridge)
+    }
+}
+
+struct LiveScaleSetCleanup<'a, B> {
+    bridge: &'a mut B,
+    source_identity: &'a ScaleSetBridgeIdentity,
+}
+
+impl<B: ScaleSetRunnerBridgeSession> DisposableCleanupRunnerSource for LiveScaleSetCleanup<'_, B> {
+    fn scale_set_source_identity(&self) -> &ScaleSetBridgeIdentity {
+        self.source_identity
+    }
+
+    fn observe_runner(
+        &mut self,
+        runner_name: &ScaleSetRunnerName,
+    ) -> Result<ScaleSetRunnerLookup, DisposableCloneRuntimeError> {
+        self.bridge
+            .observe_runner(runner_name)
+            .map_err(|error| DisposableCloneRuntimeError::observation(error.code()))
+    }
+
+    fn remove_runner(
+        &mut self,
+        runner: &ScaleSetRunnerReference,
+    ) -> Result<(), DisposableCloneRuntimeError> {
+        self.bridge
+            .remove_runner(runner)
+            .map_err(|error| DisposableCloneRuntimeError::observation(error.code()))
     }
 }
 

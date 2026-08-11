@@ -35,8 +35,11 @@ use crate::disposable_worker_reconciler::{
     reconcile_attempt,
 };
 use crate::execution_admission::EpochMillis;
-use crate::github_scale_set_bridge::{ScaleSetBridgeIdentity, ScaleSetBridgePoll};
-use crate::lima_host_identity::LimaHostIdentityAdapter;
+use crate::github_scale_set_bridge::{
+    ScaleSetBridgeIdentity, ScaleSetBridgePoll, ScaleSetRunnerLookup,
+};
+use crate::github_scale_set_protocol::{ScaleSetRunnerName, ScaleSetRunnerReference};
+use crate::lima_host_identity::{LimaHostIdentityAdapter, LimaHostIdentityErrorKind};
 use crate::lima_observation::{
     LimaInstanceName, LimaObservationAdapter, LimaObservationClock, LimaObservationRefusalCode,
     LimaObservationRequest,
@@ -228,6 +231,37 @@ pub(crate) enum DisposableCloneTransactionOutcome {
     CloneAuthorized { attempt_id: String },
     Completed(DisposableCloneRuntimeReceipt),
     ScaleSetMessagePersisted { message_id: u32 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DisposableCleanupTransactionOutcome {
+    CleanupCheckpointed {
+        attempt_id: String,
+        phase: DisposableAttemptPhase,
+    },
+    VmDestroyed {
+        attempt_id: String,
+    },
+    RunnerDeleted {
+        attempt_id: String,
+    },
+    CapacityReleased {
+        attempt_id: String,
+    },
+}
+
+pub(crate) trait DisposableCleanupRunnerSource {
+    fn scale_set_source_identity(&self) -> &ScaleSetBridgeIdentity;
+
+    fn observe_runner(
+        &mut self,
+        runner_name: &ScaleSetRunnerName,
+    ) -> Result<ScaleSetRunnerLookup, DisposableCloneRuntimeError>;
+
+    fn remove_runner(
+        &mut self,
+        runner: &ScaleSetRunnerReference,
+    ) -> Result<(), DisposableCloneRuntimeError>;
 }
 
 impl DisposableCloneRuntimeReceipt {
@@ -620,6 +654,115 @@ impl DisposableCloneRuntime {
         Ok(ConfirmedDisposableWorker { host, request })
     }
 
+    /// Observe a cleanup target without requiring the guest or runner to remain healthy.
+    ///
+    /// Proven absence requires both Lima's control-plane view and the descriptor-relative host
+    /// identity path to be absent. A present target is returned only when its retained host
+    /// identity still matches the exact durable clone identity.
+    pub(crate) fn observe_cleanup_worker(
+        &self,
+        reservation: &DisposableAttemptReservation,
+        executor: &impl TimedCommandExecutor,
+        clock: &impl CloneRuntimeClock,
+    ) -> Result<DisposableCleanupVmObservation, DisposableCloneRuntimeError> {
+        if !matches!(
+            reservation.attempt().phase(),
+            DisposableAttemptPhase::Destroying
+                | DisposableAttemptPhase::Deregistering
+                | DisposableAttemptPhase::Releasing
+        ) {
+            return Err(DisposableCloneRuntimeError::recovery(
+                "cleanup_vm_phase_mismatch",
+            ));
+        }
+        let expected_identity = reservation
+            .attempt()
+            .vm_identity()
+            .ok_or_else(|| DisposableCloneRuntimeError::recovery("cleanup_vm_identity_missing"))?;
+        let request = self
+            .worker
+            .target_observation_request(reservation)
+            .map_err(|_| invalid_configuration("cleanup_target_request_invalid"))?;
+        self.verify_limactl(executor)?;
+        let adapter = LimaObservationAdapter::new(self.limactl_program.clone())
+            .map_err(|_| invalid_configuration("cleanup_observer_invalid"))?;
+        let bounded = BoundedExecutor { executor };
+        let lima = adapter.observe(&request, &bounded, clock);
+        let host = LimaHostIdentityAdapter.observe(&request);
+        match (lima, host) {
+            (Err(lima_error), Err(host_error))
+                if lima_error.code == LimaObservationRefusalCode::MissingInstanceEvidence
+                    && host_error.kind == LimaHostIdentityErrorKind::MissingEvidence =>
+            {
+                Ok(DisposableCleanupVmObservation::Absent)
+            }
+            (Ok(_), Ok(host)) => {
+                if host.root_disk_bytes() != reservation.resources().disk_bytes()
+                    || &DisposableVmIdentity::from_host_identity(host.identity())
+                        != expected_identity
+                {
+                    return Err(DisposableCloneRuntimeError::recovery(
+                        "cleanup_vm_identity_drift",
+                    ));
+                }
+                host.confirm(&request)
+                    .map_err(|_| observation("cleanup_vm_identity_drift"))?;
+                Ok(DisposableCleanupVmObservation::Present(Box::new(
+                    ConfirmedDisposableCleanupVm { host, request },
+                )))
+            }
+            (Err(error), _)
+                if error.code != LimaObservationRefusalCode::MissingInstanceEvidence =>
+            {
+                Err(observation("cleanup_vm_observation_unavailable"))
+            }
+            _ => Err(DisposableCloneRuntimeError::recovery(
+                "cleanup_vm_control_host_conflict",
+            )),
+        }
+    }
+
+    /// Delete one freshly confirmed owned cleanup target with Lima's fixed bounded command.
+    ///
+    /// Success is returned only after both Lima and the host identity path prove absence. An
+    /// ambiguous command result leaves the durable cleanup phase unchanged for observation-first
+    /// retry on the next reconciliation tick.
+    pub(crate) fn destroy_cleanup_worker(
+        &self,
+        reservation: &DisposableAttemptReservation,
+        confirmed: &ConfirmedDisposableCleanupVm,
+        executor: &impl TimedCommandExecutor,
+        clock: &impl CloneRuntimeClock,
+    ) -> Result<(), DisposableCloneRuntimeError> {
+        confirmed.confirm_current()?;
+        self.verify_limactl(executor)?;
+        confirmed.confirm_current()?;
+        let now = clock
+            .epoch_millis()
+            .map_err(|_| observation("cleanup_clock_unavailable"))?;
+        let plan = self
+            .worker
+            .plan(now, reservation, &DisposableWorkerAction::DestroyVm)
+            .map_err(|_| DisposableCloneRuntimeError::recovery("cleanup_destroy_plan_refused"))?;
+        if plan.kind() != DisposableLimaWorkerCommandKind::Destroy {
+            return Err(DisposableCloneRuntimeError::recovery(
+                "cleanup_destroy_plan_mismatch",
+            ));
+        }
+        confirmed.confirm_current()?;
+        let record = executor
+            .execute_with_timeout(plan.command(), plan.timeout())
+            .map_err(|_| command("cleanup_destroy_command_failed"))?;
+        validate_record(plan.command(), &record)
+            .map_err(|_| command("cleanup_destroy_record_mismatch"))?;
+        match self.observe_cleanup_worker(reservation, executor, clock)? {
+            DisposableCleanupVmObservation::Absent => Ok(()),
+            DisposableCleanupVmObservation::Present(_) => Err(
+                DisposableCloneRuntimeError::recovery("cleanup_destroy_not_observed"),
+            ),
+        }
+    }
+
     fn verify_limactl(
         &self,
         executor: &impl TimedCommandExecutor,
@@ -672,6 +815,24 @@ pub(crate) struct PreparedClone {
 pub(crate) struct ConfirmedDisposableWorker {
     host: crate::lima_host_identity::LimaHostIdentityObservation,
     request: LimaObservationRequest,
+}
+
+pub(crate) enum DisposableCleanupVmObservation {
+    Absent,
+    Present(Box<ConfirmedDisposableCleanupVm>),
+}
+
+pub(crate) struct ConfirmedDisposableCleanupVm {
+    host: crate::lima_host_identity::LimaHostIdentityObservation,
+    request: LimaObservationRequest,
+}
+
+impl ConfirmedDisposableCleanupVm {
+    fn confirm_current(&self) -> Result<(), DisposableCloneRuntimeError> {
+        self.host
+            .confirm(&self.request)
+            .map_err(|_| observation("cleanup_vm_identity_drift"))
+    }
 }
 
 impl ConfirmedDisposableWorker {
@@ -758,8 +919,8 @@ mod tests {
 
     use super::*;
     use crate::disposable_attempt_catalog::{
-        DisposableAttemptCatalog, DisposableAttemptCatalogAction, DisposableAttemptReservation,
-        MemoryDisposableAttemptCatalogStore,
+        DisposableAttemptCatalog, DisposableAttemptCatalogAction, DisposableAttemptCatalogStore,
+        DisposableAttemptReservation, MemoryDisposableAttemptCatalogStore,
     };
     use crate::disposable_attempt_state::DisposableAttemptState;
     use crate::disposable_prepared_template::current_disposable_prepared_template;
@@ -779,7 +940,8 @@ mod tests {
         ScaleSetStatistics,
     };
     use crate::github_scale_set_protocol::{
-        ScaleSetJobId, ScaleSetRunnerId, ScaleSetRunnerName, ScaleSetRunnerReference,
+        ScaleSetJobId, ScaleSetJobResult, ScaleSetRunnerId, ScaleSetRunnerName,
+        ScaleSetRunnerReference,
     };
     use crate::github_scale_set_service::{LiveScaleSetCloneAdmission, ScaleSetBridgeSession};
     use crate::lima_observation::{LimaArchitecture, LimaVmType};
@@ -888,6 +1050,29 @@ mod tests {
         final_millis: u64,
     }
 
+    struct CleanupRebindClock<'a> {
+        host: &'a LimaHostIdentityFixture,
+        calls: Cell<u8>,
+    }
+
+    impl LimaObservationClock for CleanupRebindClock<'_> {
+        fn unix_seconds(&self) -> io::Result<u64> {
+            Ok(1_900_000_000)
+        }
+    }
+
+    impl CloneRuntimeClock for CleanupRebindClock<'_> {
+        fn epoch_millis(&self) -> io::Result<EpochMillis> {
+            let call = self.calls.get();
+            self.calls.set(call.saturating_add(1));
+            if call == 1 {
+                fs::remove_dir_all(self.host.lima_home().join(TARGET))?;
+                self.host.add_instance(TARGET, TARGET_DISK);
+            }
+            EpochMillis::new(1_900_000_000_000).map_err(io::Error::other)
+        }
+    }
+
     impl LimaObservationClock for SequencedClock {
         fn unix_seconds(&self) -> io::Result<u64> {
             Ok(1_900_000_000)
@@ -913,6 +1098,7 @@ mod tests {
         fail_clone: bool,
         fail_runner: bool,
         rewrite_target_after_runner: bool,
+        fail_delete_after_remove: bool,
         target_ready: bool,
         rewrite_target_during_final_source: bool,
         target_rewritten: Cell<bool>,
@@ -1030,6 +1216,15 @@ mod tests {
                 }
                 self.host.add_instance(TARGET, TARGET_DISK);
                 return Ok(Self::record(spec, "clone complete\n".to_owned()));
+            }
+            if argv.iter().any(|value| value == "delete")
+                && argv.iter().any(|value| value == TARGET)
+            {
+                fs::remove_dir_all(self.host.lima_home().join(TARGET))?;
+                if self.fail_delete_after_remove {
+                    return Err(io::Error::other("injected ambiguous delete failure"));
+                }
+                return Ok(Self::record(spec, "deleted\n".to_owned()));
             }
             if argv.len() == 3 && argv.last().is_some_and(|value| value == "--version") {
                 let call = self.version_calls.get().saturating_add(1);
@@ -1153,6 +1348,7 @@ mod tests {
             fail_clone,
             fail_runner: false,
             rewrite_target_after_runner: false,
+            fail_delete_after_remove: false,
             target_ready: false,
             rewrite_target_during_final_source: false,
             target_rewritten: Cell::new(false),
@@ -1326,6 +1522,281 @@ mod tests {
         assert_eq!(registration.observe_calls, 1);
         assert_eq!(registration.jit_calls, 1);
         assert_eq!(executor.runner_launch_count(), 1);
+    }
+
+    fn install_terminal_attempt(
+        root: &TempRoot,
+        host: &LimaHostIdentityFixture,
+        clone_runtime: &DisposableCloneRuntime,
+        executor: &mut FakeExecutor<'_>,
+    ) -> (
+        UnixPersonalWorkerStore,
+        DisposableAttemptId,
+        ScaleSetBridgeIdentity,
+        ScaleSetRunnerReference,
+    ) {
+        let attempt_id = install_running_registering_attempt(root, host, clone_runtime, executor);
+        let source_identity =
+            ScaleSetBridgeIdentity::parse(&format!("sha256:{}", "70".repeat(32))).unwrap();
+        let mut store =
+            UnixPersonalWorkerStore::open_or_create_disposable_catalog(root.path()).unwrap();
+        store.initialize_scale_set_inbox(&source_identity).unwrap();
+        let runner_runtime =
+            DisposableRunnerRuntime::new("/opt/homebrew/bin/limactl", host.lima_home()).unwrap();
+        let runner = ScaleSetRunnerReference::new(
+            ScaleSetRunnerId::new(77).unwrap(),
+            ScaleSetRunnerName::parse(TARGET).unwrap(),
+        );
+        let mut registration = FakeRegistration {
+            source_identity: source_identity.clone(),
+            observed: ScaleSetRunnerLookup::Absent,
+            observe_calls: 0,
+            jit_calls: 0,
+        };
+        store
+            .execute_disposable_runner_transaction(
+                &runner_runtime,
+                clone_runtime,
+                &attempt_id,
+                &mut registration,
+                executor,
+                &FixedClock,
+            )
+            .unwrap();
+
+        let mut catalog = DisposableAttemptCatalog::new(store);
+        let registering = catalog.load().unwrap();
+        let assigned = catalog
+            .transition(
+                registering.revision(),
+                &attempt_id,
+                registering
+                    .find_active(&attempt_id)
+                    .unwrap()
+                    .attempt()
+                    .revision(),
+                DisposableAttemptCatalogAction::RecordAssigned(
+                    ScaleSetJobId::parse("job-terminal-cleanup").unwrap(),
+                ),
+            )
+            .unwrap()
+            .0;
+        let terminal = catalog
+            .transition(
+                assigned.revision(),
+                &attempt_id,
+                assigned
+                    .find_active(&attempt_id)
+                    .unwrap()
+                    .attempt()
+                    .revision(),
+                DisposableAttemptCatalogAction::RecordTerminal {
+                    runner: Some(runner.clone()),
+                    job_id: ScaleSetJobId::parse("job-terminal-cleanup").unwrap(),
+                    result: ScaleSetJobResult::parse("succeeded").unwrap(),
+                },
+            )
+            .unwrap()
+            .0;
+        assert_eq!(
+            terminal.find_active(&attempt_id).unwrap().attempt().phase(),
+            DisposableAttemptPhase::Terminal
+        );
+        (catalog.into_store(), attempt_id, source_identity, runner)
+    }
+
+    #[test]
+    fn terminal_cleanup_destroys_vm_deletes_runner_releases_and_retires() {
+        let root = TempRoot::new("terminal-cleanup");
+        let host = LimaHostIdentityFixture::new_with_disk_bytes(
+            "clone-runtime-terminal-cleanup",
+            SOURCE,
+            SOURCE_DISK,
+        );
+        let clone_runtime = runtime(&root, &host);
+        let mut executor = executor(&host, false);
+        let (mut store, attempt_id, source_identity, runner) =
+            install_terminal_attempt(&root, &host, &clone_runtime, &mut executor);
+        let mut cleanup = FakeCleanup {
+            source_identity: source_identity.clone(),
+            runner: Some(runner),
+            remove_calls: 0,
+            fail_remove_after_remove: false,
+        };
+
+        assert!(matches!(
+            store
+                .execute_disposable_cleanup_transaction(
+                    &clone_runtime,
+                    &attempt_id,
+                    &mut cleanup,
+                    &executor,
+                    &FixedClock,
+                )
+                .unwrap(),
+            DisposableCleanupTransactionOutcome::CleanupCheckpointed {
+                phase: DisposableAttemptPhase::Destroying,
+                ..
+            }
+        ));
+        executor.fail_delete_after_remove = true;
+        let ambiguous = store
+            .execute_disposable_cleanup_transaction(
+                &clone_runtime,
+                &attempt_id,
+                &mut cleanup,
+                &executor,
+                &FixedClock,
+            )
+            .unwrap_err();
+        assert_eq!(ambiguous.code(), "cleanup_destroy_command_failed");
+        assert!(!host.lima_home().join(TARGET).exists());
+        assert_eq!(
+            durable_attempt(&root, &attempt_id).phase(),
+            DisposableAttemptPhase::Destroying
+        );
+        executor.fail_delete_after_remove = false;
+        assert!(matches!(
+            store
+                .execute_disposable_cleanup_transaction(
+                    &clone_runtime,
+                    &attempt_id,
+                    &mut cleanup,
+                    &executor,
+                    &FixedClock,
+                )
+                .unwrap(),
+            DisposableCleanupTransactionOutcome::CleanupCheckpointed {
+                phase: DisposableAttemptPhase::Deregistering,
+                ..
+            }
+        ));
+        cleanup.fail_remove_after_remove = true;
+        let ambiguous = store
+            .execute_disposable_cleanup_transaction(
+                &clone_runtime,
+                &attempt_id,
+                &mut cleanup,
+                &executor,
+                &FixedClock,
+            )
+            .unwrap_err();
+        assert_eq!(ambiguous.code(), "injected_runner_delete_failed");
+        assert_eq!(cleanup.remove_calls, 1);
+        assert_eq!(
+            durable_attempt(&root, &attempt_id).phase(),
+            DisposableAttemptPhase::Deregistering
+        );
+        cleanup.fail_remove_after_remove = false;
+        assert!(matches!(
+            store
+                .execute_disposable_cleanup_transaction(
+                    &clone_runtime,
+                    &attempt_id,
+                    &mut cleanup,
+                    &executor,
+                    &FixedClock,
+                )
+                .unwrap(),
+            DisposableCleanupTransactionOutcome::CleanupCheckpointed {
+                phase: DisposableAttemptPhase::Releasing,
+                ..
+            }
+        ));
+        assert!(matches!(
+            store
+                .execute_disposable_cleanup_transaction(
+                    &clone_runtime,
+                    &attempt_id,
+                    &mut cleanup,
+                    &executor,
+                    &FixedClock,
+                )
+                .unwrap(),
+            DisposableCleanupTransactionOutcome::CapacityReleased { .. }
+        ));
+
+        let complete = DisposableAttemptCatalogStore::load(&store)
+            .unwrap()
+            .unwrap();
+        assert_eq!(complete.host_usage().unwrap().workers(), 0);
+        assert_eq!(
+            complete.find_active(&attempt_id).unwrap().attempt().phase(),
+            DisposableAttemptPhase::Complete
+        );
+        let retired = store
+            .retire_scale_set_complete_attempt(&source_identity, &attempt_id)
+            .unwrap();
+        assert!(retired.active().is_empty());
+        assert_eq!(retired.tombstones().len(), 1);
+        assert_eq!(
+            executor
+                .calls
+                .borrow()
+                .iter()
+                .filter(|argv| argv.iter().any(|value| value == "delete"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn cleanup_reconfirms_owned_vm_after_clock_and_plan_before_delete() {
+        let root = TempRoot::new("cleanup-final-rebind");
+        let host = LimaHostIdentityFixture::new_with_disk_bytes(
+            "clone-runtime-cleanup-final-rebind",
+            SOURCE,
+            SOURCE_DISK,
+        );
+        let clone_runtime = runtime(&root, &host);
+        let mut executor = executor(&host, false);
+        let (mut store, attempt_id, source_identity, runner) =
+            install_terminal_attempt(&root, &host, &clone_runtime, &mut executor);
+        let mut cleanup = FakeCleanup {
+            source_identity,
+            runner: Some(runner),
+            remove_calls: 0,
+            fail_remove_after_remove: false,
+        };
+        store
+            .execute_disposable_cleanup_transaction(
+                &clone_runtime,
+                &attempt_id,
+                &mut cleanup,
+                &executor,
+                &FixedClock,
+            )
+            .unwrap();
+
+        let clock = CleanupRebindClock {
+            host: &host,
+            calls: Cell::new(0),
+        };
+        let error = store
+            .execute_disposable_cleanup_transaction(
+                &clone_runtime,
+                &attempt_id,
+                &mut cleanup,
+                &executor,
+                &clock,
+            )
+            .unwrap_err();
+
+        assert_eq!(error.code(), "cleanup_vm_identity_drift");
+        assert!(host.lima_home().join(TARGET).exists());
+        assert_eq!(
+            durable_attempt(&root, &attempt_id).phase(),
+            DisposableAttemptPhase::Destroying
+        );
+        assert_eq!(
+            executor
+                .calls
+                .borrow()
+                .iter()
+                .filter(|argv| argv.iter().any(|value| value == "delete"))
+                .count(),
+            0
+        );
     }
 
     #[test]
@@ -1537,6 +2008,48 @@ mod tests {
         observed: ScaleSetRunnerLookup,
         observe_calls: u8,
         jit_calls: u8,
+    }
+
+    struct FakeCleanup {
+        source_identity: ScaleSetBridgeIdentity,
+        runner: Option<ScaleSetRunnerReference>,
+        remove_calls: u8,
+        fail_remove_after_remove: bool,
+    }
+
+    impl DisposableCleanupRunnerSource for FakeCleanup {
+        fn scale_set_source_identity(&self) -> &ScaleSetBridgeIdentity {
+            &self.source_identity
+        }
+
+        fn observe_runner(
+            &mut self,
+            _runner_name: &ScaleSetRunnerName,
+        ) -> Result<ScaleSetRunnerLookup, DisposableCloneRuntimeError> {
+            Ok(self
+                .runner
+                .clone()
+                .map_or(ScaleSetRunnerLookup::Absent, ScaleSetRunnerLookup::Present))
+        }
+
+        fn remove_runner(
+            &mut self,
+            runner: &ScaleSetRunnerReference,
+        ) -> Result<(), DisposableCloneRuntimeError> {
+            if self.runner.as_ref() != Some(runner) {
+                return Err(DisposableCloneRuntimeError::recovery(
+                    "fake_cleanup_runner_mismatch",
+                ));
+            }
+            self.remove_calls = self.remove_calls.saturating_add(1);
+            self.runner = None;
+            if self.fail_remove_after_remove {
+                return Err(DisposableCloneRuntimeError::observation(
+                    "injected_runner_delete_failed",
+                ));
+            }
+            Ok(())
+        }
     }
 
     impl DisposableRunnerRegistrationSource for FakeRegistration {

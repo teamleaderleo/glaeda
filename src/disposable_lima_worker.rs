@@ -226,7 +226,12 @@ impl DisposableLimaWorkerAdapter {
                 )
             }
             DisposableWorkerAction::DestroyVm
-                if attempt.phase() == DisposableAttemptPhase::Destroying =>
+                if matches!(
+                    attempt.phase(),
+                    DisposableAttemptPhase::Destroying
+                        | DisposableAttemptPhase::Deregistering
+                        | DisposableAttemptPhase::Releasing
+                ) =>
             {
                 (
                     DisposableLimaWorkerCommandKind::Destroy,
@@ -630,7 +635,6 @@ mod tests {
         if phase == DisposableAttemptPhase::CloneStarted {
             return started.find_active(&attempt_id).unwrap().clone();
         }
-        assert_eq!(phase, DisposableAttemptPhase::Destroying);
         let started_attempt = started.find_active(&attempt_id).unwrap().attempt();
         let mut encoded =
             String::from_utf8(encode_disposable_attempt_state(started_attempt).unwrap()).unwrap();
@@ -646,7 +650,28 @@ mod tests {
         let bound = decode_disposable_attempt_state(encoded.as_bytes()).unwrap();
         let destroying_attempt = bound.begin_cleanup().unwrap();
         let destroying = replace_attempt_fixture(&started, started_attempt, &destroying_attempt, 2);
-        destroying.find_active(&attempt_id).unwrap().clone()
+        if phase == DisposableAttemptPhase::Destroying {
+            return destroying.find_active(&attempt_id).unwrap().clone();
+        }
+        let deregistering_attempt = destroying_attempt
+            .advance_cleanup(DisposableAttemptPhase::Deregistering)
+            .unwrap();
+        let deregistering =
+            replace_attempt_fixture(&destroying, &destroying_attempt, &deregistering_attempt, 1);
+        if phase == DisposableAttemptPhase::Deregistering {
+            return deregistering.find_active(&attempt_id).unwrap().clone();
+        }
+        assert_eq!(phase, DisposableAttemptPhase::Releasing);
+        let releasing_attempt = deregistering_attempt
+            .advance_cleanup(DisposableAttemptPhase::Releasing)
+            .unwrap();
+        let releasing = replace_attempt_fixture(
+            &deregistering,
+            &deregistering_attempt,
+            &releasing_attempt,
+            1,
+        );
+        releasing.find_active(&attempt_id).unwrap().clone()
     }
 
     fn replace_attempt_fixture(
@@ -779,24 +804,30 @@ mod tests {
             ]
         );
 
-        let destroying = reservation_in_phase(DisposableAttemptPhase::Destroying);
-        let destroy = adapter()
-            .plan(
-                EpochMillis::new(20_000).unwrap(),
-                &destroying,
-                &DisposableWorkerAction::DestroyVm,
-            )
-            .unwrap();
-        assert_eq!(
-            destroy.command.displayed_argv(),
-            [
-                "/opt/homebrew/bin/limactl",
-                "--tty=false",
-                "delete",
-                "--force",
-                "smol-worker-1",
-            ]
-        );
+        for phase in [
+            DisposableAttemptPhase::Destroying,
+            DisposableAttemptPhase::Deregistering,
+            DisposableAttemptPhase::Releasing,
+        ] {
+            let cleanup = reservation_in_phase(phase);
+            let destroy = adapter()
+                .plan(
+                    EpochMillis::new(20_000).unwrap(),
+                    &cleanup,
+                    &DisposableWorkerAction::DestroyVm,
+                )
+                .unwrap();
+            assert_eq!(
+                destroy.command.displayed_argv(),
+                [
+                    "/opt/homebrew/bin/limactl",
+                    "--tty=false",
+                    "delete",
+                    "--force",
+                    "smol-worker-1",
+                ]
+            );
+        }
     }
 
     #[test]
