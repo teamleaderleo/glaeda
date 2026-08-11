@@ -478,27 +478,49 @@ fn execute_secret_process_with_discarded_output<S: CaptureThreadSpawner>(
             return Err(error);
         }
     };
+    while !writer.is_finished() {
+        let now = Instant::now();
+        if now >= deadline {
+            let termination_result = terminate_process_group(&mut child);
+            let wait_result = child.wait();
+            let _writer_result = join_secret_writer(writer);
+            termination_result?;
+            wait_result?;
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "child exceeded the reviewed wall-clock timeout",
+            ));
+        }
+        thread::sleep(
+            deadline
+                .saturating_duration_since(now)
+                .min(CAPTURE_POLL_INTERVAL),
+        );
+    }
+    if let Err(error) = join_secret_writer(writer) {
+        let termination_result = terminate_process_group(&mut child);
+        let wait_result = child.wait();
+        termination_result?;
+        wait_result?;
+        return Err(error);
+    }
     let mut timed_out = false;
     let status = match wait_for_child(&mut child, Some(deadline), &mut timed_out) {
         Ok(status) => status,
         Err(error) => {
             let termination_result = terminate_process_group(&mut child);
             let wait_result = child.wait();
-            let writer_result = join_secret_writer(writer);
             termination_result?;
             wait_result?;
-            writer_result?;
             return Err(error);
         }
     };
-    let writer_result = join_secret_writer(writer);
     if timed_out {
         return Err(io::Error::new(
             io::ErrorKind::TimedOut,
             "child exceeded the reviewed wall-clock timeout",
         ));
     }
-    writer_result?;
 
     Ok(ExecutionRecord {
         argv: spec.displayed_argv(),
@@ -950,6 +972,37 @@ mod tests {
             .expect_err("closed output pipes must not bypass the command deadline");
 
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        Ok(())
+    }
+
+    #[test]
+    fn secret_writer_deadline_survives_direct_child_exit_with_inherited_stdin() -> io::Result<()> {
+        let python = Path::new("/usr/bin/python3");
+        if !python.is_file() {
+            return Ok(());
+        }
+
+        let fixture = timeout_fixture_directory()?;
+        let marker = fixture.join("secret-stdin-descendant-survived");
+        let script = "import os,pathlib,sys,time; pid=os.fork(); pid and os._exit(0); time.sleep(0.6); pathlib.Path(sys.argv[1]).write_text('survived'); time.sleep(10)";
+        let error = ProcessExecutor
+            .execute_with_timeout(
+                &CommandSpec::new(python)
+                    .argument("-c")
+                    .argument(script)
+                    .argument(marker.to_string_lossy())
+                    .zeroizing_secret_stdin_line(Zeroizing::new("s".repeat(65_536))),
+                Duration::from_millis(100),
+            )
+            .expect_err("an inherited unread secret pipe must not outlive the deadline");
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        thread::sleep(Duration::from_millis(800));
+        assert!(
+            !marker.exists(),
+            "secret-input descendant survived group timeout"
+        );
+        fs::remove_dir(&fixture)?;
         Ok(())
     }
 
