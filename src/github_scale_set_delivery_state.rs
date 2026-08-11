@@ -125,9 +125,8 @@ impl ScaleSetDeliveryRecoveryState {
             }
         }
         observed.sort_unstable();
-        let phase = ScaleSetDeliveryRecoveryPhase::AcquisitionRecoveryObserved {
-            acquired: observed,
-        };
+        let phase =
+            ScaleSetDeliveryRecoveryPhase::AcquisitionRecoveryObserved { acquired: observed };
         if self.phase == phase {
             return Ok(self.clone());
         }
@@ -293,8 +292,8 @@ impl RecoveryWire {
     }
 
     fn into_state(self) -> Result<ScaleSetDeliveryRecoveryState, ScaleSetDeliveryRecoveryError> {
-        let delivery =
-            decode_scale_set_delivery(self.delivery_json.as_bytes()).map_err(|_| corrupt_state())?;
+        let delivery = decode_scale_set_delivery(self.delivery_json.as_bytes())
+            .map_err(|_| corrupt_state())?;
         let catalog_revision = DisposableAttemptCatalogRevision::new(self.catalog_revision)
             .map_err(|_| corrupt_state())?;
         let state = ScaleSetDeliveryRecoveryState {
