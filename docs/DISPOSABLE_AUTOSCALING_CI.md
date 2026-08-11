@@ -260,13 +260,17 @@ one until peer isolation is separately proven.
 
 The root activation transaction is now implemented as the small bridge to that mature boundary.
 It requires the fixed root-owned main-ruleset attachment and exact generated anchor, asks `pfctl`
-to prove the anchor is live and first in the parsed filter rules, acquires Apple's boot-scoped PF
-enable reference, reloads only the SmolRunner anchor, and durably records the returned token before
-publishing the existing read-only admission receipt. A failed anchor load releases the newly
-acquired reference; a crash after token publication but before receipt publication is retried
-without taking another reference. This is not yet the production boundary by itself: the next
-slice must install the dedicated non-login account, exact PF inputs, root LaunchDaemon, and
-unprivileged worker service as one separately approved lifecycle.
+to prove the anchor is live and first in the parsed filter rules, loads only the exact canonical
+SmolRunner anchor before enabling when necessary, observes PF's global state, establishes PF's
+idempotent simple non-token enable reference, and publishes the existing read-only admission
+receipt last. Activation never takes a private PF token and never disables the host-wide filter,
+so a crash cannot leak an unrecoverable token: retry reloads the exact anchor, re-establishes the
+simple reference, re-observes PF, and republishes only after live state is satisfied. The pending
+installation lifecycle must remove SmolRunner's rules and receipt while deliberately leaving
+global PF lifecycle to macOS and the operator. This is not yet
+the production boundary by itself: the next slice must install the dedicated non-login account,
+exact PF inputs, root LaunchDaemon, and unprivileged worker service as one separately approved
+lifecycle.
 
 Acceptance: ordinary clone/download/build/test fixtures pass; hostile fixtures cannot reach denied destinations, listen inbound, exceed resource ceilings, or leave a reachable process after teardown.
 

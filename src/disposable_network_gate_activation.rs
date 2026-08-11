@@ -32,28 +32,23 @@ use crate::process::{CommandSpec, ExecutionRecord, TimedCommandExecutor};
 #[cfg(target_os = "macos")]
 use rustix::fs::{self as rustix_fs, AtFlags, FileType, FlockOperation, Mode, OFlags};
 
-pub const DISPOSABLE_NETWORK_GATE_ACTIVATION_SCHEMA_VERSION: u8 = 1;
+pub const DISPOSABLE_NETWORK_GATE_ACTIVATION_SCHEMA_VERSION: u8 = 2;
 pub const DISPOSABLE_NETWORK_PF_ANCHOR_PATH: &str =
-    "/etc/pf.anchors/io.smolrunner.disposable-worker";
+    "/private/etc/pf.anchors/io.smolrunner.disposable-worker";
 pub const DISPOSABLE_NETWORK_PF_CONFIGURATION_PATH: &str = "/etc/pf.conf";
-pub const DISPOSABLE_NETWORK_PF_ENABLE_TOKEN_PATH: &str =
-    "/private/var/run/smolrunner/network-gate-pf-token-v1.json";
 pub const DISPOSABLE_NETWORK_GATE_ACTIVATION_LOCK_PATH: &str =
     "/private/var/run/smolrunner/.network-gate-activation-v1.lock";
-const DISPOSABLE_NETWORK_PF_CANONICAL_ANCHOR_PATH: &str =
-    "/private/etc/pf.anchors/io.smolrunner.disposable-worker";
+const DISPOSABLE_NETWORK_PF_CANONICAL_ANCHOR_PATH: &str = DISPOSABLE_NETWORK_PF_ANCHOR_PATH;
 const DISPOSABLE_NETWORK_PF_CANONICAL_CONFIGURATION_PATH: &str = "/private/etc/pf.conf";
 
 pub(crate) const PFCTL_PROGRAM: &str = "/sbin/pfctl";
-const ACTIVATION_DOMAIN: &[u8] = b"smolrunner.disposable-network-gate-activation.v1\0";
-const ACTIVATION_COMMAND_CONTRACT: &[u8] = b"inspect-main-anchors-before-and-after\0inspect-main-rules-before-and-after\0inspect-enable-references\0enable-reference\0load-exact-anchor\0release-reference\0";
+const ACTIVATION_DOMAIN: &[u8] = b"smolrunner.disposable-network-gate-activation.v2\0";
+const ACTIVATION_COMMAND_CONTRACT: &[u8] = b"inspect-main-anchors-before-and-after\0inspect-main-rules-before-and-after\0inspect-pf-status-before-and-after\0load-exact-canonical-anchor-before-enable\0establish-simple-nontoken-reference\0never-disable-host-pf\0";
 const PFCTL_TIMEOUT_SECONDS: u64 = 15;
 #[cfg(target_os = "macos")]
 const GATE_DIRECTORY_PATH: &str = "/private/var/run/smolrunner";
 #[cfg(target_os = "macos")]
 const GATE_RECEIPT_NAME: &str = "network-gate-v1.json";
-#[cfg(target_os = "macos")]
-const GATE_TOKEN_NAME: &str = "network-gate-pf-token-v1.json";
 #[cfg(target_os = "macos")]
 const GATE_LOCK_NAME: &str = ".network-gate-activation-v1.lock";
 #[cfg(target_os = "macos")]
@@ -64,8 +59,6 @@ const SYSTEM_RANDOM_SOURCE: &str = "/dev/urandom";
 const MAX_PF_CONFIGURATION_BYTES: usize = 256 * 1024;
 #[cfg(target_os = "macos")]
 const MAX_PF_ANCHOR_BYTES: usize = 64 * 1024;
-#[cfg(target_os = "macos")]
-const MAX_GATE_TOKEN_BYTES: usize = 4 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DisposableNetworkGateActivationReport {
@@ -290,7 +283,7 @@ pub fn plan_disposable_network_gate_activation(
             service_uid: network_policy.report().service_uid(),
             privilege: "root_only",
             enforcement: "delegated_to_macos_pf",
-            recovery: "boot_volatile_token_then_receipt",
+            recovery: "idempotent_simple_reference_then_receipt",
         },
         network_policy: network_policy.clone(),
         main_attachment,
@@ -316,19 +309,11 @@ fn activation_identity(
     hash_field(&mut hasher, DISPOSABLE_NETWORK_PF_ANCHOR_PATH.as_bytes());
     hash_field(
         &mut hasher,
-        DISPOSABLE_NETWORK_PF_CANONICAL_ANCHOR_PATH.as_bytes(),
-    );
-    hash_field(
-        &mut hasher,
         DISPOSABLE_NETWORK_PF_CONFIGURATION_PATH.as_bytes(),
     );
     hash_field(
         &mut hasher,
         DISPOSABLE_NETWORK_PF_CANONICAL_CONFIGURATION_PATH.as_bytes(),
-    );
-    hash_field(
-        &mut hasher,
-        DISPOSABLE_NETWORK_PF_ENABLE_TOKEN_PATH.as_bytes(),
     );
     hash_field(
         &mut hasher,
@@ -353,8 +338,8 @@ fn hash_field(hasher: &mut Sha256, bytes: &[u8]) {
 ///
 /// The fixed root paths must already have been installed by the separately approved installer.
 /// This call serializes activation, verifies the main-ruleset attachment and exact anchor bytes,
-/// delegates enforcement to `/sbin/pfctl`, persists the returned PF reference token, and publishes
-/// the public receipt last. It never invokes an implicit shell.
+/// loads the exact canonical anchor before enabling PF, and publishes the public receipt last. It
+/// never invokes an implicit shell and never disables the host-wide packet filter.
 ///
 /// # Errors
 ///
@@ -433,14 +418,6 @@ fn activate_at(
     synchronize_directory(&gate_directory)?;
     verify_directory(paths.gate_directory, expected_uid, expected_gid, 0o755)?;
 
-    let token_bytes = read_optional_exact_file_at(
-        &gate_directory,
-        GATE_TOKEN_NAME,
-        expected_uid,
-        expected_gid,
-        0o600,
-        MAX_GATE_TOKEN_BYTES,
-    )?;
     let receipt_present = read_optional_exact_file_at(
         &gate_directory,
         GATE_RECEIPT_NAME,
@@ -470,87 +447,42 @@ fn activate_at(
         )?;
     }
 
-    let token = match token_bytes {
-        Some(bytes) => Some(decode_token(&bytes, plan)?),
-        None => None,
-    };
-
-    if receipt_present && token.is_none() {
-        return Err(activation_error(
-            DisposableNetworkGateActivationErrorKind::RecoveryRequired,
-            "disposable_network_gate_token_missing",
-        ));
-    }
-
     revalidate_installed_inputs(plan, paths, expected_uid, expected_gid)?;
     let anchors = execute_pf(executor, inspect_main_anchor_spec())?;
     require_main_anchor(&anchors)?;
     let rules = execute_pf(executor, inspect_main_rules_spec())?;
     require_first_filter_rule(&rules)?;
 
-    let had_token = token.is_some();
-    let token = match token {
-        Some(token) => {
-            let references = execute_pf(executor, inspect_enable_references_spec())?;
-            require_reference(&references, token)?;
-            token
-        }
-        None => {
-            let enabled = execute_pf(executor, enable_pf_spec())?;
-            enabled_reference_token(&enabled).map_err(|_| {
-                activation_error(
-                    DisposableNetworkGateActivationErrorKind::RecoveryRequired,
-                    "disposable_network_gate_enable_outcome_unknown",
-                )
-            })?
-        }
-    };
-
-    if let Err(error) = execute_pf(executor, load_anchor_spec()) {
-        if !had_token && release_reference(executor, token).is_err() {
-            return Err(activation_error(
-                DisposableNetworkGateActivationErrorKind::RecoveryRequired,
-                "disposable_network_gate_compensation_failed",
-            ));
-        }
-        return Err(error);
-    }
-    if let Err(error) = revalidate_installed_inputs(plan, paths, expected_uid, expected_gid) {
-        if !had_token && release_reference(executor, token).is_err() {
-            return Err(activation_error(
-                DisposableNetworkGateActivationErrorKind::RecoveryRequired,
-                "disposable_network_gate_compensation_failed",
-            ));
-        }
-        return Err(error);
-    }
+    // Load the exact canonical root-owned anchor before enabling PF. If PF is already enabled this
+    // replaces only SmolRunner's live anchor; if PF is disabled no packet is filtered until the
+    // exact anchor has been loaded and revalidated.
+    execute_pf(executor, load_anchor_spec())?;
+    revalidate_installed_inputs(plan, paths, expected_uid, expected_gid)?;
     let anchors = execute_pf(executor, inspect_main_anchor_spec())?;
     require_main_anchor(&anchors)?;
     let rules = execute_pf(executor, inspect_main_rules_spec())?;
     require_first_filter_rule(&rules)?;
 
-    if !had_token {
-        let token_bytes = encode_token(plan, token)?;
-        if publish_exact_file(
-            &gate_directory,
-            GATE_TOKEN_NAME,
-            &token_bytes,
-            0o600,
-            expected_uid,
-            expected_gid,
-        )
-        .is_err()
-        {
-            // Publication can fail after the rename became visible but before directory fsync
-            // reported success. Keep the known boot-local reference live so a retry can either
-            // trust the exact token file after synchronizing the directory or safely take a new
-            // reference when no token file exists. Releasing here could strand an exact visible
-            // token document that names a no-longer-live reference.
-            return Err(activation_error(
-                DisposableNetworkGateActivationErrorKind::RecoveryRequired,
-                "disposable_network_gate_token_publication_failed",
-            ));
-        }
+    let status = execute_pf(executor, inspect_pf_status_spec())?;
+    let was_enabled = require_pf_status(&status)? == PfStatus::Enabled;
+    // DIOCSTART (pfctl -e) establishes the kernel's simple non-token enable reference. Apple PF
+    // makes this idempotent: when PF is already enabled solely by token holders it first adds the
+    // simple reference and then reports EEXIST; when that reference already exists it only reports
+    // EEXIST. This keeps PF available if other components release their tokens without creating an
+    // external token-persistence transaction of our own.
+    enable_pf(executor)?;
+
+    revalidate_installed_inputs(plan, paths, expected_uid, expected_gid)?;
+    let anchors = execute_pf(executor, inspect_main_anchor_spec())?;
+    require_main_anchor(&anchors)?;
+    let rules = execute_pf(executor, inspect_main_rules_spec())?;
+    require_first_filter_rule(&rules)?;
+    let status = execute_pf(executor, inspect_pf_status_spec())?;
+    if require_pf_status(&status)? != PfStatus::Enabled {
+        return Err(activation_error(
+            DisposableNetworkGateActivationErrorKind::RecoveryRequired,
+            "disposable_network_gate_pf_not_enabled",
+        ));
     }
 
     publish_exact_file(
@@ -564,7 +496,7 @@ fn activate_at(
     synchronize_directory(&gate_directory)?;
     let disposition = if receipt_present {
         DisposableNetworkGateActivationDisposition::Satisfied
-    } else if had_token {
+    } else if was_enabled {
         DisposableNetworkGateActivationDisposition::Recovered
     } else {
         DisposableNetworkGateActivationDisposition::Activated
@@ -663,6 +595,31 @@ fn execute_pf(
 }
 
 #[cfg(target_os = "macos")]
+fn enable_pf(
+    executor: &impl TimedCommandExecutor,
+) -> Result<(), DisposableNetworkGateActivationError> {
+    let record = executor
+        .execute_with_timeout(&enable_pf_spec(), PFCTL_TIMEOUT)
+        .map_err(|_| {
+            activation_error(
+                DisposableNetworkGateActivationErrorKind::RecoveryRequired,
+                "disposable_network_gate_pf_enable_outcome_unknown",
+            )
+        })?;
+    if record.success
+        || (record.status == Some(1)
+            && record.stdout.is_empty()
+            && record.stderr == "pfctl: pf already enabled\n")
+    {
+        return Ok(());
+    }
+    Err(activation_error(
+        DisposableNetworkGateActivationErrorKind::CommandFailed,
+        "disposable_network_gate_pf_command_failed",
+    ))
+}
+
+#[cfg(target_os = "macos")]
 fn require_main_anchor(
     record: &ExecutionRecord,
 ) -> Result<(), DisposableNetworkGateActivationError> {
@@ -696,78 +653,34 @@ fn require_first_filter_rule(
 }
 
 #[cfg(target_os = "macos")]
-fn require_reference(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PfStatus {
+    Enabled,
+    Disabled,
+}
+
+#[cfg(target_os = "macos")]
+fn require_pf_status(
     record: &ExecutionRecord,
-    token: u64,
-) -> Result<(), DisposableNetworkGateActivationError> {
-    let present = record.stdout.lines().any(|line| {
-        let fields = line.split_ascii_whitespace().collect::<Vec<_>>();
-        fields
-            .get(2)
-            .is_some_and(|field| *field == token.to_string())
-    });
-    if !present {
-        return Err(activation_error(
-            DisposableNetworkGateActivationErrorKind::RecoveryRequired,
-            "disposable_network_gate_pf_reference_missing",
-        ));
+) -> Result<PfStatus, DisposableNetworkGateActivationError> {
+    let mut statuses = record
+        .stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("Status: "));
+    let status = statuses
+        .next()
+        .ok_or_else(|| unsafe_state("disposable_network_gate_pf_status_invalid"))?;
+    if statuses.next().is_some() {
+        return Err(unsafe_state("disposable_network_gate_pf_status_invalid"));
     }
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn release_reference(
-    executor: &impl TimedCommandExecutor,
-    token: u64,
-) -> Result<(), DisposableNetworkGateActivationError> {
-    execute_pf(executor, release_pf_spec(token)).map(|_| ())
-}
-
-#[cfg(target_os = "macos")]
-#[derive(Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PfTokenWire {
-    schema_version: u8,
-    activation_identity: String,
-    policy_identity: String,
-    token: u64,
-}
-
-#[cfg(target_os = "macos")]
-fn encode_token(
-    plan: &DisposableNetworkGateActivationPlan,
-    token: u64,
-) -> Result<Vec<u8>, DisposableNetworkGateActivationError> {
-    if token == 0 {
-        return Err(unsafe_state("disposable_network_gate_token_invalid"));
+    if status == "Status: Disabled" {
+        return Ok(PfStatus::Disabled);
     }
-    let mut bytes = serde_json::to_vec_pretty(&PfTokenWire {
-        schema_version: DISPOSABLE_NETWORK_GATE_ACTIVATION_SCHEMA_VERSION,
-        activation_identity: plan.report().activation_identity().as_str().to_owned(),
-        policy_identity: plan.report().policy_identity().as_str().to_owned(),
-        token,
-    })
-    .map_err(|_| unsafe_state("disposable_network_gate_token_invalid"))?;
-    bytes.push(b'\n');
-    Ok(bytes)
-}
-
-#[cfg(target_os = "macos")]
-fn decode_token(
-    bytes: &[u8],
-    plan: &DisposableNetworkGateActivationPlan,
-) -> Result<u64, DisposableNetworkGateActivationError> {
-    let wire: PfTokenWire = serde_json::from_slice(bytes)
-        .map_err(|_| unsafe_state("disposable_network_gate_token_invalid"))?;
-    if encode_token(plan, wire.token)? != bytes
-        || wire.schema_version != DISPOSABLE_NETWORK_GATE_ACTIVATION_SCHEMA_VERSION
-        || wire.activation_identity != plan.report().activation_identity().as_str()
-        || wire.policy_identity != plan.report().policy_identity().as_str()
-        || wire.token == 0
-    {
-        return Err(unsafe_state("disposable_network_gate_token_invalid"));
+    if status == "Status: Enabled" || status.starts_with("Status: Enabled for ") {
+        return Ok(PfStatus::Enabled);
     }
-    Ok(wire.token)
+    Err(unsafe_state("disposable_network_gate_pf_status_invalid"))
 }
 
 #[cfg(target_os = "macos")]
@@ -1148,15 +1061,15 @@ pub(crate) fn inspect_main_rules_spec() -> CommandSpec {
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) fn inspect_enable_references_spec() -> CommandSpec {
+pub(crate) fn inspect_pf_status_spec() -> CommandSpec {
     CommandSpec::new(PFCTL_PROGRAM)
         .argument("-s")
-        .argument("References")
+        .argument("info")
 }
 
 #[cfg(target_os = "macos")]
 pub(crate) fn enable_pf_spec() -> CommandSpec {
-    CommandSpec::new(PFCTL_PROGRAM).argument("-E")
+    CommandSpec::new(PFCTL_PROGRAM).argument("-e")
 }
 
 #[cfg(target_os = "macos")]
@@ -1166,45 +1079,6 @@ pub(crate) fn load_anchor_spec() -> CommandSpec {
         .argument(DISPOSABLE_NETWORK_PF_ANCHOR)
         .argument("-f")
         .argument(DISPOSABLE_NETWORK_PF_ANCHOR_PATH)
-}
-
-#[cfg(target_os = "macos")]
-pub(crate) fn release_pf_spec(token: u64) -> CommandSpec {
-    CommandSpec::new(PFCTL_PROGRAM)
-        .argument("-X")
-        .argument(token.to_string())
-}
-
-#[cfg(target_os = "macos")]
-pub(crate) fn enabled_reference_token(
-    record: &ExecutionRecord,
-) -> Result<u64, DisposableNetworkGateActivationPlanError> {
-    if !record.success {
-        return Err(invalid_pf_response());
-    }
-    let mut tokens = record
-        .stdout
-        .lines()
-        .chain(record.stderr.lines())
-        .filter_map(|line| line.trim().strip_prefix("Token : "))
-        .map(str::trim);
-    let token = tokens
-        .next()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|token| *token > 0)
-        .ok_or_else(invalid_pf_response)?;
-    if tokens.next().is_some() {
-        return Err(invalid_pf_response());
-    }
-    Ok(token)
-}
-
-#[cfg(target_os = "macos")]
-fn invalid_pf_response() -> DisposableNetworkGateActivationPlanError {
-    DisposableNetworkGateActivationPlanError {
-        kind: DisposableNetworkGateActivationPlanErrorKind::InvalidPolicy,
-        code: "disposable_network_gate_pf_response_invalid",
-    }
 }
 
 #[cfg(test)]
@@ -1231,13 +1105,13 @@ mod tests {
             plan.main_attachment(),
             concat!(
                 "anchor \"io.smolrunner.disposable-worker\"\n",
-                "load anchor \"io.smolrunner.disposable-worker\" from \"/etc/pf.anchors/io.smolrunner.disposable-worker\"\n"
+                "load anchor \"io.smolrunner.disposable-worker\" from \"/private/etc/pf.anchors/io.smolrunner.disposable-worker\"\n"
             )
             .as_bytes()
         );
         assert_eq!(
             plan.report().activation_identity().as_str(),
-            "sha256:780e0ddf3afaf075554d1011810f89bc0be22db9dd35627264f2e90d4bb94276"
+            "sha256:930a5d9c20260f282eb33ca28ed68443b258c17e7f13113c1b60153fab2f44bd"
         );
         assert!(format!("{plan:?}").contains("root_only"));
         assert!(!format!("{plan:?}").contains("/etc/pf.conf"));
@@ -1245,7 +1119,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn pfctl_commands_and_token_response_are_fixed() {
+    fn pfctl_commands_and_status_response_are_fixed() {
         assert_eq!(
             inspect_main_anchor_spec().displayed_argv(),
             ["/sbin/pfctl", "-s", "Anchors"]
@@ -1255,10 +1129,10 @@ mod tests {
             ["/sbin/pfctl", "-s", "rules"]
         );
         assert_eq!(
-            inspect_enable_references_spec().displayed_argv(),
-            ["/sbin/pfctl", "-s", "References"]
+            inspect_pf_status_spec().displayed_argv(),
+            ["/sbin/pfctl", "-s", "info"]
         );
-        assert_eq!(enable_pf_spec().displayed_argv(), ["/sbin/pfctl", "-E"]);
+        assert_eq!(enable_pf_spec().displayed_argv(), ["/sbin/pfctl", "-e"]);
         assert_eq!(
             load_anchor_spec().displayed_argv(),
             [
@@ -1266,34 +1140,32 @@ mod tests {
                 "-a",
                 "io.smolrunner.disposable-worker",
                 "-f",
-                "/etc/pf.anchors/io.smolrunner.disposable-worker"
+                "/private/etc/pf.anchors/io.smolrunner.disposable-worker"
             ]
         );
-        assert_eq!(
-            release_pf_spec(42).displayed_argv(),
-            ["/sbin/pfctl", "-X", "42"]
-        );
 
-        let record = ExecutionRecord {
+        let enabled = ExecutionRecord {
             argv: Vec::new(),
             environment_keys: Vec::new(),
             status: Some(0),
             success: true,
-            stdout: "pf enabled\nToken : 42\n".to_owned(),
+            stdout: "Status: Enabled for 0 days 00:00:01\n".to_owned(),
             stderr: String::new(),
         };
-        assert_eq!(enabled_reference_token(&record).unwrap(), 42);
+        assert_eq!(require_pf_status(&enabled).unwrap(), PfStatus::Enabled);
+        let mut disabled = enabled.clone();
+        disabled.stdout = "Status: Disabled\n".to_owned();
+        assert_eq!(require_pf_status(&disabled).unwrap(), PfStatus::Disabled);
         for stdout in [
             "",
-            "Token : 0\n",
-            "Token : nope\n",
-            "Token : 1\nToken : 2\n",
+            "Status: Unknown\n",
+            "Status: Enabled\nStatus: Disabled\n",
         ] {
-            let mut invalid = record.clone();
+            let mut invalid = enabled.clone();
             invalid.stdout = stdout.to_owned();
             assert_eq!(
-                enabled_reference_token(&invalid).unwrap_err().code(),
-                "disposable_network_gate_pf_response_invalid"
+                require_pf_status(&invalid).unwrap_err().code(),
+                "disposable_network_gate_pf_status_invalid"
             );
         }
     }
@@ -1459,21 +1331,63 @@ mod tests {
             )
         }
 
+        fn anchor_listing() -> ExecutionRecord {
+            success("io.smolrunner.disposable-worker\n")
+        }
+
+        fn main_rules() -> ExecutionRecord {
+            success("anchor \"io.smolrunner.disposable-worker\" all\nanchor \"com.apple/*\" all\n")
+        }
+
+        fn enabled_status() -> ExecutionRecord {
+            success("Status: Enabled for 0 days 00:00:01\n")
+        }
+
+        fn disabled_status() -> ExecutionRecord {
+            success("Status: Disabled\n")
+        }
+
+        fn already_enabled() -> ExecutionRecord {
+            ExecutionRecord {
+                argv: Vec::new(),
+                environment_keys: Vec::new(),
+                status: Some(1),
+                success: false,
+                stdout: String::new(),
+                stderr: "pfctl: pf already enabled\n".to_owned(),
+            }
+        }
+
+        fn enabled_activation_responses() -> Vec<ExecutionRecord> {
+            vec![
+                anchor_listing(),
+                main_rules(),
+                success(""),
+                anchor_listing(),
+                main_rules(),
+                enabled_status(),
+                already_enabled(),
+                anchor_listing(),
+                main_rules(),
+                enabled_status(),
+            ]
+        }
+
         #[test]
-        fn activation_publishes_token_then_receipt_and_recovers_idempotently() {
+        fn activation_loads_canonical_anchor_before_enable_and_recovers_idempotently() {
             let plan = plan();
             let fixture = Fixture::new(&plan);
             let first = FakeExecutor::new([
-                success("io.smolrunner.disposable-worker\n"),
-                success(
-                    "anchor \"io.smolrunner.disposable-worker\" all\nanchor \"com.apple/*\" all\n",
-                ),
-                success("Token : 42\n"),
+                anchor_listing(),
+                main_rules(),
                 success(""),
-                success("io.smolrunner.disposable-worker\n"),
-                success(
-                    "anchor \"io.smolrunner.disposable-worker\" all\nanchor \"com.apple/*\" all\n",
-                ),
+                anchor_listing(),
+                main_rules(),
+                disabled_status(),
+                success(""),
+                anchor_listing(),
+                main_rules(),
+                enabled_status(),
             ]);
             let receipt = activate_fixture(&plan, &fixture, &first).unwrap();
             assert_eq!(
@@ -1485,24 +1399,23 @@ mod tests {
                 [
                     vec!["/sbin/pfctl", "-s", "Anchors"],
                     vec!["/sbin/pfctl", "-s", "rules"],
-                    vec!["/sbin/pfctl", "-E"],
                     vec![
                         "/sbin/pfctl",
                         "-a",
                         "io.smolrunner.disposable-worker",
                         "-f",
-                        "/etc/pf.anchors/io.smolrunner.disposable-worker"
+                        "/private/etc/pf.anchors/io.smolrunner.disposable-worker"
                     ],
                     vec!["/sbin/pfctl", "-s", "Anchors"],
-                    vec!["/sbin/pfctl", "-s", "rules"]
+                    vec!["/sbin/pfctl", "-s", "rules"],
+                    vec!["/sbin/pfctl", "-s", "info"],
+                    vec!["/sbin/pfctl", "-e"],
+                    vec!["/sbin/pfctl", "-s", "Anchors"],
+                    vec!["/sbin/pfctl", "-s", "rules"],
+                    vec!["/sbin/pfctl", "-s", "info"]
                 ]
             );
-            let token = fixture.gate_directory.join(GATE_TOKEN_NAME);
             let public = fixture.gate_directory.join(GATE_RECEIPT_NAME);
-            assert_eq!(
-                std::fs::metadata(&token).unwrap().permissions().mode() & 0o7777,
-                0o600
-            );
             assert_eq!(
                 std::fs::metadata(&public).unwrap().permissions().mode() & 0o7777,
                 0o444
@@ -1510,18 +1423,7 @@ mod tests {
             assert_eq!(std::fs::read(&public).unwrap(), plan.receipt());
 
             std::fs::remove_file(&public).unwrap();
-            let recovery = FakeExecutor::new([
-                success("io.smolrunner.disposable-worker\n"),
-                success(
-                    "anchor \"io.smolrunner.disposable-worker\" all\nanchor \"com.apple/*\" all\n",
-                ),
-                success("TOKENS:\nPID Process TOKEN TIMESTAMP\n123 smolrunner 42 0-days\n"),
-                success(""),
-                success("io.smolrunner.disposable-worker\n"),
-                success(
-                    "anchor \"io.smolrunner.disposable-worker\" all\nanchor \"com.apple/*\" all\n",
-                ),
-            ]);
+            let recovery = FakeExecutor::new(enabled_activation_responses());
             assert_eq!(
                 activate_fixture(&plan, &fixture, &recovery)
                     .unwrap()
@@ -1529,68 +1431,56 @@ mod tests {
                 DisposableNetworkGateActivationDisposition::Recovered
             );
 
-            let satisfied = FakeExecutor::new([
-                success("io.smolrunner.disposable-worker\n"),
-                success(
-                    "anchor \"io.smolrunner.disposable-worker\" all\nanchor \"com.apple/*\" all\n",
-                ),
-                success("TOKENS:\nPID Process TOKEN TIMESTAMP\n123 smolrunner 42 0-days\n"),
-                success(""),
-                success("io.smolrunner.disposable-worker\n"),
-                success(
-                    "anchor \"io.smolrunner.disposable-worker\" all\nanchor \"com.apple/*\" all\n",
-                ),
-            ]);
+            let satisfied = FakeExecutor::new(enabled_activation_responses());
             assert_eq!(
                 activate_fixture(&plan, &fixture, &satisfied)
                     .unwrap()
                     .disposition(),
                 DisposableNetworkGateActivationDisposition::Satisfied
             );
-
-            std::fs::remove_file(&token).unwrap();
-            let orphan = FakeExecutor::new([
-                success("io.smolrunner.disposable-worker\n"),
-                success(
-                    "anchor \"io.smolrunner.disposable-worker\" all\nanchor \"com.apple/*\" all\n",
-                ),
-            ]);
-            assert_eq!(
-                activate_fixture(&plan, &fixture, &orphan)
-                    .unwrap_err()
-                    .code(),
-                "disposable_network_gate_token_missing"
-            );
-            assert!(!public.exists());
         }
 
         #[test]
-        fn failed_anchor_load_releases_new_reference_and_publishes_nothing() {
+        fn failed_anchor_load_or_ambiguous_enable_publishes_no_receipt() {
             let plan = plan();
             let fixture = Fixture::new(&plan);
             let mut failed = success("");
             failed.success = false;
             failed.status = Some(1);
-            let executor = FakeExecutor::new([
-                success("io.smolrunner.disposable-worker\n"),
-                success(
-                    "anchor \"io.smolrunner.disposable-worker\" all\nanchor \"com.apple/*\" all\n",
-                ),
-                success("Token : 77\n"),
-                failed,
-                success(""),
-            ]);
+            let load_failure = FakeExecutor::new([anchor_listing(), main_rules(), failed.clone()]);
             assert_eq!(
-                activate_fixture(&plan, &fixture, &executor)
+                activate_fixture(&plan, &fixture, &load_failure)
                     .unwrap_err()
                     .kind(),
                 DisposableNetworkGateActivationErrorKind::CommandFailed
             );
-            assert!(!fixture.gate_directory.join(GATE_TOKEN_NAME).exists());
             assert!(!fixture.gate_directory.join(GATE_RECEIPT_NAME).exists());
+
+            let enable_failure = FakeExecutor::new([
+                anchor_listing(),
+                main_rules(),
+                success(""),
+                anchor_listing(),
+                main_rules(),
+                disabled_status(),
+                failed,
+            ]);
             assert_eq!(
-                executor.calls().last().unwrap(),
-                &vec!["/sbin/pfctl", "-X", "77"]
+                activate_fixture(&plan, &fixture, &enable_failure)
+                    .unwrap_err()
+                    .kind(),
+                DisposableNetworkGateActivationErrorKind::CommandFailed
+            );
+            assert!(!fixture.gate_directory.join(GATE_RECEIPT_NAME).exists());
+
+            // If the failed response hid a successful enable, retry observes the global state and
+            // recovers without acquiring or leaking a private PF reference.
+            let recovered = FakeExecutor::new(enabled_activation_responses());
+            assert_eq!(
+                activate_fixture(&plan, &fixture, &recovered)
+                    .unwrap()
+                    .disposition(),
+                DisposableNetworkGateActivationDisposition::Recovered
             );
         }
 
@@ -1598,18 +1488,7 @@ mod tests {
         fn installed_input_drift_revokes_the_prior_receipt_before_refusal() {
             let plan = plan();
             let fixture = Fixture::new(&plan);
-            let first = FakeExecutor::new([
-                success("io.smolrunner.disposable-worker\n"),
-                success(
-                    "anchor \"io.smolrunner.disposable-worker\" all\nanchor \"com.apple/*\" all\n",
-                ),
-                success("Token : 91\n"),
-                success(""),
-                success("io.smolrunner.disposable-worker\n"),
-                success(
-                    "anchor \"io.smolrunner.disposable-worker\" all\nanchor \"com.apple/*\" all\n",
-                ),
-            ]);
+            let first = FakeExecutor::new(enabled_activation_responses());
             activate_fixture(&plan, &fixture, &first).unwrap();
             let public = fixture.gate_directory.join(GATE_RECEIPT_NAME);
             assert!(public.exists());
