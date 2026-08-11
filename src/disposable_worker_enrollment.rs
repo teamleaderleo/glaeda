@@ -12,6 +12,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::artifact::Sha256Digest;
 use crate::disposable_clone_runtime::DisposableCloneRuntime;
+use crate::disposable_network_policy::{
+    DisposableNetworkPolicyBackend, DisposableNetworkPolicyPlan, plan_disposable_network_policy,
+};
 use crate::disposable_prepared_template::current_disposable_prepared_template;
 use crate::disposable_runner_runtime::DisposableRunnerRuntime;
 use crate::disposable_template_runtime::DisposableTemplateRuntime;
@@ -22,7 +25,7 @@ use crate::github_scale_set_bridge::{
 use crate::github_scale_set_consumer::ScaleSetConsumerPolicy;
 use crate::lima_observation::LimaInstanceName;
 
-pub const DISPOSABLE_WORKER_ENROLLMENT_SCHEMA_VERSION: u8 = 1;
+pub const DISPOSABLE_WORKER_ENROLLMENT_SCHEMA_VERSION: u8 = 2;
 pub const MAX_DISPOSABLE_WORKER_ENROLLMENT_BYTES: usize = 16 * 1024;
 const BRIDGE_PROGRAM: &str = "/opt/smolrunner/bin/scaleset-bridge";
 
@@ -77,6 +80,7 @@ impl std::error::Error for DisposableWorkerEnrollmentError {}
 /// The type deliberately has no serialization, path accessor, `Clone`, or derived `Debug`.
 pub struct DisposableWorkerEnrollment {
     state_root: PathBuf,
+    network_policy: DisposableNetworkPolicyPlan,
     bridge_config: ScaleSetBridgeConfig,
     consumer_policy: ScaleSetConsumerPolicy,
     template_runtime: DisposableTemplateRuntime,
@@ -90,6 +94,7 @@ impl fmt::Debug for DisposableWorkerEnrollment {
             .debug_struct("DisposableWorkerEnrollment")
             .field("state_root", &"<private-state-root>")
             .field("bridge", &"<enrolled-scale-set>")
+            .field("network", &"<planned-not-observed>")
             .field("policy", &self.consumer_policy)
             .finish()
     }
@@ -97,6 +102,7 @@ impl fmt::Debug for DisposableWorkerEnrollment {
 
 pub(crate) struct DisposableWorkerEnrollmentParts {
     pub(crate) state_root: PathBuf,
+    pub(crate) network_policy: DisposableNetworkPolicyPlan,
     pub(crate) bridge_config: ScaleSetBridgeConfig,
     pub(crate) consumer_policy: ScaleSetConsumerPolicy,
     pub(crate) template_runtime: DisposableTemplateRuntime,
@@ -108,6 +114,7 @@ impl DisposableWorkerEnrollment {
     pub(crate) fn into_parts(self) -> DisposableWorkerEnrollmentParts {
         DisposableWorkerEnrollmentParts {
             state_root: self.state_root,
+            network_policy: self.network_policy,
             bridge_config: self.bridge_config,
             consumer_policy: self.consumer_policy,
             template_runtime: self.template_runtime,
@@ -170,6 +177,8 @@ fn build_enrollment(
         LimaInstanceName::parse(&wire.lima.source_instance).map_err(|_| invalid_configuration())?;
     let bridge_digest =
         Sha256Digest::parse(&wire.bridge.program_digest).map_err(|_| invalid_configuration())?;
+    let expected_network_identity =
+        Sha256Digest::parse(&wire.network.policy_identity).map_err(|_| invalid_configuration())?;
     let github_app = GitHubAppKeychainConfig::new(
         &wire.github.config_url,
         &wire.github.client_id,
@@ -191,6 +200,13 @@ fn build_enrollment(
         ScaleSetBridgeConfig::new(Path::new(BRIDGE_PROGRAM), bridge_digest, github_app, target)
             .map_err(|_| invalid_configuration())?;
     let prepared = current_disposable_prepared_template().map_err(|_| invalid_configuration())?;
+    let network_policy = plan_disposable_network_policy(wire.network.service_uid, &prepared)
+        .map_err(|_| invalid_configuration())?;
+    if wire.network.backend != DisposableNetworkPolicyBackend::MacosPfDedicatedUid
+        || network_policy.report().policy_identity() != &expected_network_identity
+    {
+        return Err(invalid_configuration());
+    }
     let resources = DisposableWorkerResources::new(
         wire.resources.cpu_millis,
         wire.resources.memory_bytes,
@@ -225,6 +241,7 @@ fn build_enrollment(
         .map_err(|_| invalid_configuration())?;
     Ok(DisposableWorkerEnrollment {
         state_root,
+        network_policy,
         bridge_config,
         consumer_policy,
         template_runtime,
@@ -277,11 +294,20 @@ struct VersionWire {
 struct EnrollmentWire {
     schema_version: u8,
     state_root: String,
+    network: NetworkWire,
     lima: LimaWire,
     bridge: BridgeWire,
     github: GitHubWire,
     scale_set: ScaleSetWire,
     resources: ResourcesWire,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct NetworkWire {
+    backend: DisposableNetworkPolicyBackend,
+    service_uid: u32,
+    policy_identity: String,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -332,11 +358,18 @@ mod tests {
     use super::*;
 
     const DIGEST: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const NETWORK_DIGEST: &str =
+        "sha256:a6eb142b9051c724543c342f9631c79b2f829bb34709dcee84191be237b7fa9b";
 
     fn canonical_document() -> Vec<u8> {
         canonical_bytes(&EnrollmentWire {
             schema_version: DISPOSABLE_WORKER_ENROLLMENT_SCHEMA_VERSION,
             state_root: "/private/var/lib/smolrunner".to_owned(),
+            network: NetworkWire {
+                backend: DisposableNetworkPolicyBackend::MacosPfDedicatedUid,
+                service_uid: 502,
+                policy_identity: NETWORK_DIGEST.to_owned(),
+            },
             lima: LimaWire {
                 program: "/opt/homebrew/bin/limactl".to_owned(),
                 home: "/private/var/lib/smolrunner/lima".to_owned(),
@@ -377,9 +410,15 @@ mod tests {
         assert!(!debug.contains("acme-ci"));
         assert!(!debug.contains("Iv1."));
         assert!(!debug.contains(DIGEST));
+        assert!(!debug.contains(NETWORK_DIGEST));
 
         let parts = enrollment.into_parts();
         assert_eq!(parts.state_root, Path::new("/private/var/lib/smolrunner"));
+        assert_eq!(parts.network_policy.report().service_uid(), 502);
+        assert_eq!(
+            parts.network_policy.report().policy_identity().as_str(),
+            NETWORK_DIGEST
+        );
         let _ = parts.bridge_config;
         let _ = parts.consumer_policy;
         let _ = parts.template_runtime;
@@ -390,9 +429,9 @@ mod tests {
     #[test]
     fn prior_future_unknown_and_noncanonical_documents_fail_closed() {
         let current = String::from_utf8(canonical_document()).unwrap();
-        for version in [0, 2] {
+        for version in [0, 1, 3] {
             let changed = current.replacen(
-                "\"schema_version\": 1",
+                "\"schema_version\": 2",
                 &format!("\"schema_version\": {version}"),
                 1,
             );
@@ -431,6 +470,8 @@ mod tests {
         let cases = [
             current.replace("/opt/homebrew/bin/limactl", "relative/limactl"),
             current.replace(DIGEST, "sha256:not-a-digest"),
+            current.replace(NETWORK_DIGEST, "sha256:not-a-digest"),
+            current.replace("\"service_uid\": 502", "\"service_uid\": 0"),
             current.replace("\"cpu_millis\": 2000", "\"cpu_millis\": 1"),
             current.replace(
                 "\"self-hosted\",\n      \"smolrunner\"",

@@ -37,6 +37,7 @@ use crate::unix_personal_worker_store::UnixPersonalWorkerStore;
 #[serde(rename_all = "snake_case")]
 pub enum DisposableWorkerServiceErrorKind {
     DurableState,
+    NetworkGate,
     Bridge,
     Supervisor,
 }
@@ -85,6 +86,12 @@ fn prepare_durable_service(
     enrollment: DisposableWorkerEnrollment,
 ) -> Result<PreparedDisposableWorkerService, DisposableWorkerServiceError> {
     let parts = enrollment.into_parts();
+    if rustix::process::geteuid().as_raw() != parts.network_policy.report().service_uid() {
+        return Err(DisposableWorkerServiceError::new(
+            DisposableWorkerServiceErrorKind::NetworkGate,
+            "disposable_worker_network_service_identity_mismatch",
+        ));
+    }
     recover_disposable_documents(&parts.state_root)?;
     let store = UnixPersonalWorkerStore::open_or_create_disposable_catalog(&parts.state_root)
         .map_err(|_| {
@@ -294,12 +301,29 @@ mod tests {
     }
 
     fn enrollment(root: &std::path::Path) -> DisposableWorkerEnrollment {
+        enrollment_with_uid(root, rustix::process::geteuid().as_raw())
+    }
+
+    fn enrollment_with_uid(root: &std::path::Path, service_uid: u32) -> DisposableWorkerEnrollment {
         let path = serde_json::to_string(root.to_str().unwrap()).unwrap();
+        let prepared =
+            crate::disposable_prepared_template::current_disposable_prepared_template().unwrap();
+        let network = crate::disposable_network_policy::plan_disposable_network_policy(
+            service_uid,
+            &prepared,
+        )
+        .unwrap();
+        let network_identity = network.report().policy_identity().as_str();
         let document = format!(
             concat!(
                 "{{\n",
-                "  \"schema_version\": 1,\n",
+                "  \"schema_version\": 2,\n",
                 "  \"state_root\": {path},\n",
+                "  \"network\": {{\n",
+                "    \"backend\": \"macos_pf_dedicated_uid\",\n",
+                "    \"service_uid\": {service_uid},\n",
+                "    \"policy_identity\": \"{network_identity}\"\n",
+                "  }},\n",
                 "  \"lima\": {{\n",
                 "    \"program\": \"/opt/homebrew/bin/limactl\",\n",
                 "    \"home\": \"/private/var/lib/smolrunner/lima\",\n",
@@ -333,9 +357,27 @@ mod tests {
                 "  }}\n",
                 "}}\n"
             ),
-            path = path
+            path = path,
+            service_uid = service_uid,
+            network_identity = network_identity,
         );
         decode_disposable_worker_enrollment(document.as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn enrolled_network_service_identity_precedes_durable_or_bridge_authority() {
+        let root = TempRoot::new();
+        let current = rustix::process::geteuid().as_raw();
+        let other = current.checked_add(1).unwrap();
+        let error = match prepare_durable_service(enrollment_with_uid(&root.0, other)) {
+            Ok(_) => panic!("mismatched service identity unexpectedly prepared the service"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.code(),
+            "disposable_worker_network_service_identity_mismatch"
+        );
+        assert!(!root.0.join("personal-worker").exists());
     }
 
     #[test]
