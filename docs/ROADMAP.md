@@ -165,6 +165,8 @@ Make GitHub the normal control path for agents and humans.
 - [ ] Store the least-privilege controller GitHub App credential in the Mac Keychain.
 - [x] Read the pre-enrolled GitHub App credential directly through macOS Security.framework without
   a secret-bearing subprocess, argv, environment, or public execution record.
+- [x] Refuse secret-bearing bridge startup unless the fixed protected installation path matches the
+  reviewed SHA-256 identity, and bound every bridge operation with a finite deadline.
 - [ ] Integrate a pinned Runner Scale Set Client behind a narrow adapter for demand, sessions, acknowledgement, JIT generation, job-start, and job-completion observations.
   - [x] Pin the official Go client behind a bounded empty-environment bridge whose messages require
     an explicit post-persistence acknowledgement; the durable service consumer remains open.

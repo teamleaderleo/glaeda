@@ -5,13 +5,27 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
-use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(target_os = "macos")]
+use std::fs::{File, OpenOptions};
+#[cfg(target_os = "macos")]
+use std::io::Seek;
+use std::io::{ErrorKind, Read, Write};
+use std::os::fd::AsFd;
+#[cfg(target_os = "macos")]
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::time::{Duration, Instant};
 
+use rustix::event::{PollFd, PollFlags, Timespec, poll};
+use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "macos")]
+use sha2::{Digest, Sha256};
+use zeroize::{Zeroize, Zeroizing};
 
+use crate::artifact::Sha256Digest;
 use crate::github_scale_set_protocol::{
     ScaleSetJobId, ScaleSetJobResult, ScaleSetRunnerId, ScaleSetRunnerName, ScaleSetRunnerReference,
 };
@@ -23,6 +37,10 @@ const MAX_PRIVATE_KEY_BYTES: usize = 64 * 1024;
 const MAX_JIT_CONFIG_BYTES: usize = 64 * 1024;
 const MAX_EVENTS: usize = 50;
 const MAX_LABELS: usize = 32;
+const MAX_BRIDGE_PROGRAM_BYTES: u64 = 64 * 1024 * 1024;
+const BRIDGE_PROGRAM: &str = "/opt/smolrunner/bin/scaleset-bridge";
+const DEFAULT_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
+const POLL_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(75);
 
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct GitHubAppKeychainConfig {
@@ -108,6 +126,7 @@ impl ScaleSetBridgeTarget {
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct ScaleSetBridgeConfig {
     program: PathBuf,
+    program_digest: Sha256Digest,
     github_app: GitHubAppKeychainConfig,
     target: ScaleSetBridgeTarget,
 }
@@ -115,14 +134,16 @@ pub(crate) struct ScaleSetBridgeConfig {
 impl ScaleSetBridgeConfig {
     pub(crate) fn new(
         program: &Path,
+        program_digest: Sha256Digest,
         github_app: GitHubAppKeychainConfig,
         target: ScaleSetBridgeTarget,
     ) -> Result<Self, ScaleSetBridgeError> {
-        if !canonical_absolute_path(program) {
+        if program != Path::new(BRIDGE_PROGRAM) || !canonical_absolute_path(program) {
             return Err(ScaleSetBridgeError::new("invalid_bridge_program"));
         }
         Ok(Self {
             program: program.to_path_buf(),
+            program_digest,
             github_app,
             target,
         })
@@ -132,11 +153,12 @@ impl ScaleSetBridgeConfig {
 struct GitHubAppPrivateKey(Vec<u8>);
 
 impl GitHubAppPrivateKey {
-    fn parse(bytes: Vec<u8>) -> Result<Self, ScaleSetBridgeError> {
+    fn parse(mut bytes: Vec<u8>) -> Result<Self, ScaleSetBridgeError> {
         if bytes.is_empty()
             || bytes.len() > MAX_PRIVATE_KEY_BYTES
             || std::str::from_utf8(&bytes).is_err()
         {
+            bytes.zeroize();
             return Err(ScaleSetBridgeError::new("invalid_github_app_private_key"));
         }
         Ok(Self(bytes))
@@ -167,7 +189,7 @@ impl ScaleSetStatistics {
 
 impl Drop for GitHubAppPrivateKey {
     fn drop(&mut self) {
-        self.0.fill(0);
+        self.0.zeroize();
     }
 }
 
@@ -185,6 +207,160 @@ fn load_keychain_private_key(
         security_framework::passwords::get_generic_password(&config.service, &config.account)
             .map_err(|_| ScaleSetBridgeError::new("keychain_credential_unavailable"))?;
     GitHubAppPrivateKey::parse(bytes)
+}
+
+#[cfg(target_os = "macos")]
+struct VerifiedBridgeProgram {
+    file: File,
+    snapshot: BridgeProgramSnapshot,
+    digest: Sha256Digest,
+}
+
+#[cfg(target_os = "macos")]
+impl VerifiedBridgeProgram {
+    fn open(config: &ScaleSetBridgeConfig) -> Result<Self, ScaleSetBridgeError> {
+        verify_protected_bridge_path(&config.program)?;
+        let path_metadata = std::fs::symlink_metadata(&config.program)
+            .map_err(|_| ScaleSetBridgeError::new("bridge_program_unavailable"))?;
+        let snapshot = BridgeProgramSnapshot::from_metadata(&path_metadata)?;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .open(&config.program)
+            .map_err(|_| ScaleSetBridgeError::new("bridge_program_unavailable"))?;
+        snapshot.matches_metadata(
+            &file
+                .metadata()
+                .map_err(|_| ScaleSetBridgeError::new("bridge_program_unavailable"))?,
+        )?;
+        require_bridge_digest(&mut file, &config.program_digest)?;
+        snapshot.matches_metadata(
+            &file
+                .metadata()
+                .map_err(|_| ScaleSetBridgeError::new("bridge_program_unavailable"))?,
+        )?;
+        let verified = Self {
+            file,
+            snapshot,
+            digest: config.program_digest.clone(),
+        };
+        verified.confirm(&config.program)?;
+        Ok(verified)
+    }
+
+    fn confirm(&self, path: &Path) -> Result<(), ScaleSetBridgeError> {
+        verify_protected_bridge_path(path)?;
+        self.snapshot.matches_metadata(
+            &self
+                .file
+                .metadata()
+                .map_err(|_| ScaleSetBridgeError::new("bridge_program_unavailable"))?,
+        )?;
+        self.snapshot.matches_metadata(
+            &std::fs::symlink_metadata(path)
+                .map_err(|_| ScaleSetBridgeError::new("bridge_program_unavailable"))?,
+        )?;
+        let mut file = self
+            .file
+            .try_clone()
+            .map_err(|_| ScaleSetBridgeError::new("bridge_program_unavailable"))?;
+        require_bridge_digest(&mut file, &self.digest)
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct BridgeProgramSnapshot {
+    dev: u64,
+    ino: u64,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+    nlink: u64,
+    size: u64,
+}
+
+#[cfg(target_os = "macos")]
+impl BridgeProgramSnapshot {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Result<Self, ScaleSetBridgeError> {
+        let mode = metadata.mode();
+        if !metadata.file_type().is_file()
+            || metadata.uid() != 0
+            || metadata.gid() != 0
+            || mode & 0o7777 != 0o555
+            || metadata.nlink() != 1
+            || metadata.len() == 0
+            || metadata.len() > MAX_BRIDGE_PROGRAM_BYTES
+        {
+            return Err(ScaleSetBridgeError::new("unsafe_bridge_program"));
+        }
+        Ok(Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+            mode,
+            nlink: metadata.nlink(),
+            size: metadata.len(),
+        })
+    }
+
+    fn matches_metadata(self, metadata: &std::fs::Metadata) -> Result<(), ScaleSetBridgeError> {
+        let current = Self::from_metadata(metadata)?;
+        if current != self {
+            return Err(ScaleSetBridgeError::new("bridge_program_changed"));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn verify_protected_bridge_path(path: &Path) -> Result<(), ScaleSetBridgeError> {
+    if path != Path::new(BRIDGE_PROGRAM) {
+        return Err(ScaleSetBridgeError::new("invalid_bridge_program"));
+    }
+    for component in ["/", "/opt", "/opt/smolrunner", "/opt/smolrunner/bin"] {
+        let metadata = std::fs::symlink_metadata(component)
+            .map_err(|_| ScaleSetBridgeError::new("bridge_program_unavailable"))?;
+        if !metadata.file_type().is_dir()
+            || metadata.uid() != 0
+            || metadata.gid() != 0
+            || metadata.mode() & 0o022 != 0
+        {
+            return Err(ScaleSetBridgeError::new("unsafe_bridge_program"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn require_bridge_digest(
+    file: &mut File,
+    expected: &Sha256Digest,
+) -> Result<(), ScaleSetBridgeError> {
+    file.rewind()
+        .map_err(|_| ScaleSetBridgeError::new("bridge_program_unavailable"))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    let mut total = 0_u64;
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|_| ScaleSetBridgeError::new("bridge_program_unavailable"))?;
+        if read == 0 {
+            break;
+        }
+        total = total
+            .checked_add(read as u64)
+            .filter(|total| *total <= MAX_BRIDGE_PROGRAM_BYTES)
+            .ok_or_else(|| ScaleSetBridgeError::new("unsafe_bridge_program"))?;
+        hasher.update(&buffer[..read]);
+    }
+    buffer.zeroize();
+    let actual = format!("sha256:{:x}", hasher.finalize());
+    if actual != expected.as_str() {
+        return Err(ScaleSetBridgeError::new("bridge_program_digest_mismatch"));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize)]
@@ -277,7 +453,7 @@ impl EncodedJitConfig {
 
 impl Drop for EncodedJitConfig {
     fn drop(&mut self) {
-        self.0.fill(0);
+        self.0.zeroize();
     }
 }
 
@@ -294,12 +470,13 @@ pub(crate) struct ScaleSetJitReceipt {
 
 trait BridgeTransport {
     fn exchange(&mut self, request: &BridgeRequest<'_>) -> Result<Vec<u8>, ScaleSetBridgeError>;
+    fn poison(&mut self);
 }
 
 struct ChildBridgeTransport {
     child: Child,
     input: ChildStdin,
-    output: BufReader<ChildStdout>,
+    output: ChildStdout,
     poisoned: bool,
 }
 
@@ -330,10 +507,14 @@ impl ChildBridgeTransport {
                 return Err(ScaleSetBridgeError::new("bridge_pipe_unavailable"));
             }
         };
+        if make_nonblocking(&input).is_err() || make_nonblocking(&output).is_err() {
+            terminate_child(&mut child);
+            return Err(ScaleSetBridgeError::new("bridge_pipe_unavailable"));
+        }
         Ok(Self {
             child,
             input,
-            output: BufReader::new(output),
+            output,
             poisoned: false,
         })
     }
@@ -341,36 +522,49 @@ impl ChildBridgeTransport {
     fn exchange_inner(
         &mut self,
         request: &BridgeRequest<'_>,
+        timeout: Duration,
     ) -> Result<Vec<u8>, ScaleSetBridgeError> {
         if self.poisoned {
             return Err(ScaleSetBridgeError::new("bridge_session_poisoned"));
         }
-        serde_json::to_writer(&mut self.input, request)
+        let mut encoded = serde_json::to_vec(request)
             .map_err(|_| ScaleSetBridgeError::new("bridge_request_failed"))?;
-        self.input
-            .write_all(b"\n")
-            .and_then(|_| self.input.flush())
-            .map_err(|_| ScaleSetBridgeError::new("bridge_request_failed"))?;
+        encoded.push(b'\n');
+        if encoded.len() > MAX_PROTOCOL_LINE_BYTES {
+            encoded.zeroize();
+            return Err(ScaleSetBridgeError::new("bridge_request_failed"));
+        }
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| ScaleSetBridgeError::new("bridge_request_failed"))?;
+        let write_result = write_all_until(&mut self.input, &encoded, deadline);
+        encoded.zeroize();
+        write_result?;
 
         let mut response = Vec::with_capacity(4_096);
-        let mut bounded = self
-            .output
-            .by_ref()
-            .take((MAX_PROTOCOL_LINE_BYTES + 1) as u64);
-        let read = bounded
-            .read_until(b'\n', &mut response)
-            .map_err(|_| ScaleSetBridgeError::new("bridge_response_failed"))?;
-        if read == 0 || response.len() > MAX_PROTOCOL_LINE_BYTES || response.last() != Some(&b'\n')
-        {
-            response.fill(0);
-            return Err(ScaleSetBridgeError::new("bridge_response_invalid"));
+        let read_result = read_line_until(&mut self.output, &mut response, deadline);
+        if let Err(error) = read_result {
+            response.zeroize();
+            return Err(error);
         }
         response.pop();
         if response.last() == Some(&b'\r') {
-            response.fill(0);
+            response.zeroize();
             return Err(ScaleSetBridgeError::new("bridge_response_invalid"));
         }
         Ok(response)
+    }
+
+    fn exchange_with_timeout(
+        &mut self,
+        request: &BridgeRequest<'_>,
+        timeout: Duration,
+    ) -> Result<Vec<u8>, ScaleSetBridgeError> {
+        let result = self.exchange_inner(request, timeout);
+        if result.is_err() {
+            self.poison();
+        }
+        result
     }
 
     fn terminate(&mut self) {
@@ -380,12 +574,12 @@ impl ChildBridgeTransport {
 
 impl BridgeTransport for ChildBridgeTransport {
     fn exchange(&mut self, request: &BridgeRequest<'_>) -> Result<Vec<u8>, ScaleSetBridgeError> {
-        let result = self.exchange_inner(request);
-        if result.is_err() {
-            self.poisoned = true;
-            self.terminate();
-        }
-        result
+        self.exchange_with_timeout(request, request.exchange_timeout())
+    }
+
+    fn poison(&mut self) {
+        self.poisoned = true;
+        self.terminate();
     }
 }
 
@@ -405,6 +599,95 @@ fn terminate_child(child: &mut Child) {
     }
 }
 
+fn make_nonblocking<Fd: AsFd>(fd: &Fd) -> Result<(), ScaleSetBridgeError> {
+    let flags = fcntl_getfl(fd).map_err(|_| ScaleSetBridgeError::new("bridge_pipe_unavailable"))?;
+    fcntl_setfl(fd, flags | OFlags::NONBLOCK)
+        .map_err(|_| ScaleSetBridgeError::new("bridge_pipe_unavailable"))
+}
+
+fn write_all_until(
+    output: &mut ChildStdin,
+    bytes: &[u8],
+    deadline: Instant,
+) -> Result<(), ScaleSetBridgeError> {
+    let mut written = 0;
+    while written < bytes.len() {
+        wait_for_fd(output, PollFlags::OUT, deadline, "bridge_request_timeout")?;
+        match output.write(&bytes[written..]) {
+            Ok(0) => return Err(ScaleSetBridgeError::new("bridge_request_failed")),
+            Ok(count) => written += count,
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(_) => return Err(ScaleSetBridgeError::new("bridge_request_failed")),
+        }
+    }
+    Ok(())
+}
+
+fn read_line_until(
+    input: &mut ChildStdout,
+    response: &mut Vec<u8>,
+    deadline: Instant,
+) -> Result<(), ScaleSetBridgeError> {
+    let mut buffer = Zeroizing::new([0_u8; 4_096]);
+    loop {
+        wait_for_fd(input, PollFlags::IN, deadline, "bridge_response_timeout")?;
+        let remaining = MAX_PROTOCOL_LINE_BYTES
+            .saturating_add(1)
+            .saturating_sub(response.len());
+        if remaining == 0 {
+            return Err(ScaleSetBridgeError::new("bridge_response_invalid"));
+        }
+        let capacity = remaining.min(buffer.len());
+        match input.read(&mut buffer[..capacity]) {
+            Ok(0) => return Err(ScaleSetBridgeError::new("bridge_response_invalid")),
+            Ok(count) => {
+                response.extend_from_slice(&buffer[..count]);
+                if let Some(newline) = response.iter().position(|byte| *byte == b'\n') {
+                    if newline + 1 != response.len() {
+                        return Err(ScaleSetBridgeError::new("bridge_response_invalid"));
+                    }
+                    return Ok(());
+                }
+            }
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(_) => return Err(ScaleSetBridgeError::new("bridge_response_failed")),
+        }
+    }
+}
+
+fn wait_for_fd<Fd: AsFd>(
+    fd: &Fd,
+    readiness: PollFlags,
+    deadline: Instant,
+    timeout_code: &'static str,
+) -> Result<(), ScaleSetBridgeError> {
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| ScaleSetBridgeError::new(timeout_code))?;
+        let timeout =
+            Timespec::try_from(remaining).map_err(|_| ScaleSetBridgeError::new(timeout_code))?;
+        let mut descriptor = [PollFd::new(fd, readiness | PollFlags::ERR | PollFlags::HUP)];
+        match poll(&mut descriptor, Some(&timeout)) {
+            Ok(0) => return Err(ScaleSetBridgeError::new(timeout_code)),
+            Ok(_) => {
+                let observed = descriptor[0].revents();
+                if observed.intersects(PollFlags::ERR | PollFlags::HUP) {
+                    return Err(ScaleSetBridgeError::new("bridge_pipe_unavailable"));
+                }
+                if observed.contains(readiness) {
+                    return Ok(());
+                }
+            }
+            Err(rustix::io::Errno::INTR) => {}
+            Err(_) => return Err(ScaleSetBridgeError::new("bridge_pipe_unavailable")),
+        }
+    }
+}
+
 pub(crate) struct ScaleSetBridgeClient {
     transport: Box<dyn BridgeTransport>,
     target: ScaleSetBridgeTarget,
@@ -415,8 +698,14 @@ impl ScaleSetBridgeClient {
     pub(crate) fn connect_from_keychain(
         config: ScaleSetBridgeConfig,
     ) -> Result<Self, ScaleSetBridgeError> {
+        let verified_program = VerifiedBridgeProgram::open(&config)?;
         let private_key = load_keychain_private_key(&config.github_app)?;
-        let transport = ChildBridgeTransport::spawn(&config.program)?;
+        verified_program.confirm(&config.program)?;
+        let mut transport = ChildBridgeTransport::spawn(&config.program)?;
+        if let Err(error) = verified_program.confirm(&config.program) {
+            transport.poison();
+            return Err(error);
+        }
         Self::connect_with_transport(config, private_key, Box::new(transport))
     }
 
@@ -436,7 +725,7 @@ impl ScaleSetBridgeClient {
 
     pub(crate) fn poll(&mut self) -> Result<ScaleSetBridgePoll, ScaleSetBridgeError> {
         let mut response = exchange_and_decode(self.transport.as_mut(), &BridgeRequest::poll())?;
-        match response.response_type.as_str() {
+        let result = (|| match response.response_type.as_str() {
             "idle" => {
                 response.require_idle_shape()?;
                 Ok(ScaleSetBridgePoll::Idle {
@@ -462,33 +751,37 @@ impl ScaleSetBridgeClient {
             }
             "error" => Err(response.bridge_error()?),
             _ => Err(ScaleSetBridgeError::new("invalid_bridge_response")),
-        }
+        })();
+        self.finish_response(result)
     }
 
     pub(crate) fn ack(&mut self, message_id: u32) -> Result<Vec<u64>, ScaleSetBridgeError> {
         let mut response =
             exchange_and_decode(self.transport.as_mut(), &BridgeRequest::ack(message_id))?;
-        if response.response_type == "error" {
-            return Err(response.bridge_error()?);
-        }
-        if response.response_type != "acked"
-            || response.message_id != Some(u64::from(message_id))
-            || response.code.is_some()
-            || response.scale_set_id.is_some()
-            || response.statistics.is_some()
-            || !response.events.is_empty()
-            || response.runner.is_some()
-            || response.encoded_jit_config.is_some()
-        {
-            return Err(ScaleSetBridgeError::new("invalid_bridge_response"));
-        }
-        let mut seen = BTreeSet::new();
-        for id in &response.acquired_requests {
-            if *id == 0 || !seen.insert(*id) {
+        let result = (|| {
+            if response.response_type == "error" {
+                return Err(response.bridge_error()?);
+            }
+            if response.response_type != "acked"
+                || response.message_id != Some(u64::from(message_id))
+                || response.code.is_some()
+                || response.scale_set_id.is_some()
+                || response.statistics.is_some()
+                || !response.events.is_empty()
+                || response.runner.is_some()
+                || response.encoded_jit_config.is_some()
+            {
                 return Err(ScaleSetBridgeError::new("invalid_bridge_response"));
             }
-        }
-        Ok(std::mem::take(&mut response.acquired_requests))
+            let mut seen = BTreeSet::new();
+            for id in &response.acquired_requests {
+                if *id == 0 || !seen.insert(*id) {
+                    return Err(ScaleSetBridgeError::new("invalid_bridge_response"));
+                }
+            }
+            Ok(std::mem::take(&mut response.acquired_requests))
+        })();
+        self.finish_response(result)
     }
 
     pub(crate) fn generate_jit(
@@ -499,40 +792,43 @@ impl ScaleSetBridgeClient {
             self.transport.as_mut(),
             &BridgeRequest::runner("generate_jit", runner_name.as_str(), None, Some("_work")),
         )?;
-        if response.response_type == "error" {
-            return Err(response.bridge_error()?);
-        }
-        if response.response_type != "jit"
-            || response.code.is_some()
-            || response.scale_set_id.is_some()
-            || response.message_id.is_some()
-            || response.statistics.is_some()
-            || !response.events.is_empty()
-            || !response.acquired_requests.is_empty()
-        {
-            return Err(ScaleSetBridgeError::new("invalid_bridge_response"));
-        }
-        let runner = normalize_runner(
-            response
-                .runner
+        let result = (|| {
+            if response.response_type == "error" {
+                return Err(response.bridge_error()?);
+            }
+            if response.response_type != "jit"
+                || response.code.is_some()
+                || response.scale_set_id.is_some()
+                || response.message_id.is_some()
+                || response.statistics.is_some()
+                || !response.events.is_empty()
+                || !response.acquired_requests.is_empty()
+            {
+                return Err(ScaleSetBridgeError::new("invalid_bridge_response"));
+            }
+            let runner = normalize_runner(
+                response
+                    .runner
+                    .take()
+                    .ok_or_else(|| ScaleSetBridgeError::new("invalid_bridge_response"))?,
+                self.target.id,
+                Some(runner_name.as_str()),
+            )?;
+            let mut config = response
+                .encoded_jit_config
                 .take()
-                .ok_or_else(|| ScaleSetBridgeError::new("invalid_bridge_response"))?,
-            self.target.id,
-            Some(runner_name.as_str()),
-        )?;
-        let mut config = response
-            .encoded_jit_config
-            .take()
-            .ok_or_else(|| ScaleSetBridgeError::new("invalid_bridge_response"))?
-            .into_bytes();
-        if config.is_empty() || config.len() > MAX_JIT_CONFIG_BYTES {
-            config.fill(0);
-            return Err(ScaleSetBridgeError::new("invalid_bridge_response"));
-        }
-        Ok(ScaleSetJitReceipt {
-            runner,
-            config: EncodedJitConfig(config),
-        })
+                .ok_or_else(|| ScaleSetBridgeError::new("invalid_bridge_response"))?
+                .into_bytes();
+            if config.is_empty() || config.len() > MAX_JIT_CONFIG_BYTES {
+                config.zeroize();
+                return Err(ScaleSetBridgeError::new("invalid_bridge_response"));
+            }
+            Ok(ScaleSetJitReceipt {
+                runner,
+                config: EncodedJitConfig(config),
+            })
+        })();
+        self.finish_response(result)
     }
 
     pub(crate) fn observe_runner(
@@ -543,28 +839,31 @@ impl ScaleSetBridgeClient {
             self.transport.as_mut(),
             &BridgeRequest::runner("observe_runner", runner_name.as_str(), None, None),
         )?;
-        if response.response_type == "error" {
-            return Err(response.bridge_error()?);
-        }
-        if response.response_type != "runner"
-            || response.code.is_some()
-            || response.scale_set_id.is_some()
-            || response.message_id.is_some()
-            || response.statistics.is_some()
-            || !response.events.is_empty()
-            || !response.acquired_requests.is_empty()
-            || response.encoded_jit_config.is_some()
-        {
-            return Err(ScaleSetBridgeError::new("invalid_bridge_response"));
-        }
-        normalize_runner(
-            response
-                .runner
-                .take()
-                .ok_or_else(|| ScaleSetBridgeError::new("invalid_bridge_response"))?,
-            self.target.id,
-            Some(runner_name.as_str()),
-        )
+        let result = (|| {
+            if response.response_type == "error" {
+                return Err(response.bridge_error()?);
+            }
+            if response.response_type != "runner"
+                || response.code.is_some()
+                || response.scale_set_id.is_some()
+                || response.message_id.is_some()
+                || response.statistics.is_some()
+                || !response.events.is_empty()
+                || !response.acquired_requests.is_empty()
+                || response.encoded_jit_config.is_some()
+            {
+                return Err(ScaleSetBridgeError::new("invalid_bridge_response"));
+            }
+            normalize_runner(
+                response
+                    .runner
+                    .take()
+                    .ok_or_else(|| ScaleSetBridgeError::new("invalid_bridge_response"))?,
+                self.target.id,
+                Some(runner_name.as_str()),
+            )
+        })();
+        self.finish_response(result)
     }
 
     pub(crate) fn remove_runner(
@@ -580,29 +879,50 @@ impl ScaleSetBridgeClient {
                 None,
             ),
         )?;
-        if response.response_type == "error" {
-            return Err(response.bridge_error()?);
+        let result = (|| {
+            if response.response_type == "error" {
+                return Err(response.bridge_error()?);
+            }
+            if response.response_type != "removed"
+                || response.code.is_some()
+                || response.scale_set_id.is_some()
+                || response.message_id.is_some()
+                || response.statistics.is_some()
+                || !response.events.is_empty()
+                || !response.acquired_requests.is_empty()
+                || response.encoded_jit_config.is_some()
+                || normalize_runner(
+                    response
+                        .runner
+                        .take()
+                        .ok_or_else(|| ScaleSetBridgeError::new("invalid_bridge_response"))?,
+                    self.target.id,
+                    Some(runner.name.as_str()),
+                )? != *runner
+            {
+                return Err(ScaleSetBridgeError::new("invalid_bridge_response"));
+            }
+            Ok(())
+        })();
+        self.finish_response(result)
+    }
+
+    fn finish_response<T>(
+        &mut self,
+        result: Result<T, ScaleSetBridgeError>,
+    ) -> Result<T, ScaleSetBridgeError> {
+        if result.as_ref().is_err_and(|error| {
+            matches!(
+                error.code(),
+                "invalid_bridge_response"
+                    | "invalid_bridge_message"
+                    | "invalid_bridge_event"
+                    | "invalid_bridge_runner"
+            )
+        }) {
+            self.transport.poison();
         }
-        if response.response_type != "removed"
-            || response.code.is_some()
-            || response.scale_set_id.is_some()
-            || response.message_id.is_some()
-            || response.statistics.is_some()
-            || !response.events.is_empty()
-            || !response.acquired_requests.is_empty()
-            || response.encoded_jit_config.is_some()
-            || normalize_runner(
-                response
-                    .runner
-                    .take()
-                    .ok_or_else(|| ScaleSetBridgeError::new("invalid_bridge_response"))?,
-                self.target.id,
-                Some(runner.name.as_str()),
-            )? != *runner
-        {
-            return Err(ScaleSetBridgeError::new("invalid_bridge_response"));
-        }
-        Ok(())
+        result
     }
 }
 
@@ -612,7 +932,10 @@ fn exchange_and_decode(
 ) -> Result<BridgeResponse, ScaleSetBridgeError> {
     let mut bytes = transport.exchange(request)?;
     let result = decode_response(&bytes);
-    bytes.fill(0);
+    bytes.zeroize();
+    if result.is_err() {
+        transport.poison();
+    }
     result
 }
 
@@ -659,6 +982,14 @@ struct StartRequest<'a> {
 }
 
 impl<'a> BridgeRequest<'a> {
+    fn exchange_timeout(&self) -> Duration {
+        if self.operation == "poll" {
+            POLL_EXCHANGE_TIMEOUT
+        } else {
+            DEFAULT_EXCHANGE_TIMEOUT
+        }
+    }
+
     fn start(config: &'a ScaleSetBridgeConfig, key: &'a GitHubAppPrivateKey) -> Self {
         Self {
             version: PROTOCOL_VERSION,
@@ -739,15 +1070,29 @@ struct BridgeResponse {
     #[serde(default)]
     acquired_requests: Vec<u64>,
     runner: Option<RunnerWire>,
-    encoded_jit_config: Option<String>,
+    encoded_jit_config: Option<SecretString>,
 }
 
-impl Drop for BridgeResponse {
+struct SecretString(String);
+
+impl<'de> Deserialize<'de> for SecretString {
+    fn deserialize<Deserializer>(deserializer: Deserializer) -> Result<Self, Deserializer::Error>
+    where
+        Deserializer: serde::Deserializer<'de>,
+    {
+        String::deserialize(deserializer).map(Self)
+    }
+}
+
+impl SecretString {
+    fn into_bytes(mut self) -> Vec<u8> {
+        std::mem::take(&mut self.0).into_bytes()
+    }
+}
+
+impl Drop for SecretString {
     fn drop(&mut self) {
-        if let Some(secret) = self.encoded_jit_config.take() {
-            let mut bytes = secret.into_bytes();
-            bytes.fill(0);
-        }
+        self.0.zeroize();
     }
 }
 
@@ -1043,24 +1388,34 @@ fn canonical_absolute_path(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::collections::VecDeque;
+    use std::rc::Rc;
 
     use super::*;
 
     struct ScriptedTransport {
         responses: VecDeque<Vec<u8>>,
         requests: Vec<Vec<u8>>,
+        poisoned: Rc<Cell<bool>>,
     }
 
     impl ScriptedTransport {
         fn new(responses: &[&str]) -> Self {
-            Self {
+            Self::with_poison_probe(responses).0
+        }
+
+        fn with_poison_probe(responses: &[&str]) -> (Self, Rc<Cell<bool>>) {
+            let poisoned = Rc::new(Cell::new(false));
+            let transport = Self {
                 responses: responses
                     .iter()
                     .map(|response| response.as_bytes().to_vec())
                     .collect(),
                 requests: Vec::new(),
-            }
+                poisoned: Rc::clone(&poisoned),
+            };
+            (transport, poisoned)
         }
     }
 
@@ -1069,6 +1424,9 @@ mod tests {
             &mut self,
             request: &BridgeRequest<'_>,
         ) -> Result<Vec<u8>, ScaleSetBridgeError> {
+            if self.poisoned.get() {
+                return Err(ScaleSetBridgeError::new("bridge_session_poisoned"));
+            }
             self.requests.push(
                 serde_json::to_vec(request)
                     .map_err(|_| ScaleSetBridgeError::new("script_encode_failed"))?,
@@ -1077,11 +1435,16 @@ mod tests {
                 .pop_front()
                 .ok_or_else(|| ScaleSetBridgeError::new("script_exhausted"))
         }
+
+        fn poison(&mut self) {
+            self.poisoned.set(true);
+        }
     }
 
     fn config() -> ScaleSetBridgeConfig {
         ScaleSetBridgeConfig::new(
             Path::new("/opt/smolrunner/bin/scaleset-bridge"),
+            Sha256Digest::parse(&format!("sha256:{}", "ab".repeat(32))).unwrap(),
             GitHubAppKeychainConfig::new(
                 "https://github.com/example/project",
                 "Iv1.example",
@@ -1118,6 +1481,7 @@ mod tests {
         assert!(
             ScaleSetBridgeConfig::new(
                 Path::new("/opt/./bridge"),
+                Sha256Digest::parse(&format!("sha256:{}", "ab".repeat(32))).unwrap(),
                 config().github_app,
                 config().target
             )
@@ -1213,6 +1577,20 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(unknown_error.code(), "invalid_bridge_response");
+
+        let (transport, poisoned) = ScriptedTransport::with_poison_probe(&[
+            r#"{"version":1,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
+            r#"{"version":1,"type":"idle","unknown":true}"#,
+        ]);
+        let mut client = ScaleSetBridgeClient::connect_with_transport(
+            config(),
+            GitHubAppPrivateKey::parse(b"private-key".to_vec()).unwrap(),
+            Box::new(transport),
+        )
+        .unwrap();
+        assert_eq!(client.poll().unwrap_err().code(), "invalid_bridge_response");
+        assert!(poisoned.get());
+
         let mut response = decode_response(
             br#"{"version":1,"type":"message","message_id":7,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0},"events":[{"kind":"completed","runner_request_id":41,"repository":"project","owner":"example","job_id":"job-1","workflow_run_id":99,"request_labels":["smolrunner"],"result":"failed"}]}"#,
         )
@@ -1229,5 +1607,34 @@ mod tests {
             .code(),
             "invalid_bridge_event"
         );
+
+        let (transport, poisoned) = ScriptedTransport::with_poison_probe(&[
+            r#"{"version":1,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
+            r#"{"version":1,"type":"message","message_id":8,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0},"events":[{"kind":"completed","runner_request_id":41,"repository":"project","owner":"example","job_id":"job-1","workflow_run_id":99,"request_labels":["smolrunner"],"result":"failed"}]}"#,
+        ]);
+        let mut client = ScaleSetBridgeClient::connect_with_transport(
+            config(),
+            GitHubAppPrivateKey::parse(b"private-key".to_vec()).unwrap(),
+            Box::new(transport),
+        )
+        .unwrap();
+        assert_eq!(client.poll().unwrap_err().code(), "invalid_bridge_event");
+        assert!(poisoned.get());
+        assert_eq!(client.poll().unwrap_err().code(), "bridge_session_poisoned");
+    }
+
+    #[test]
+    fn wedged_child_times_out_and_is_reaped() {
+        let program = Path::new("/usr/bin/tail");
+        if !program.exists() {
+            return;
+        }
+        let mut transport = ChildBridgeTransport::spawn(program).unwrap();
+        let error = transport
+            .exchange_with_timeout(&BridgeRequest::poll(), Duration::from_millis(20))
+            .unwrap_err();
+        assert_eq!(error.code(), "bridge_response_timeout");
+        assert!(transport.poisoned);
+        assert!(transport.child.try_wait().unwrap().is_some());
     }
 }

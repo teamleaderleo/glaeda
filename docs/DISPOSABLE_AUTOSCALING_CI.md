@@ -117,8 +117,11 @@ It deliberately does not use the official convenience listener's acknowledge-bef
 ordering. A private Rust adapter now starts that no-argument process with an empty environment,
 reads the GitHub App key directly through macOS Security.framework, strictly decodes bounded
 responses, maps validated statistics into the existing typed demand contract, and retains JIT
-configuration only in a redacted zero-on-drop value. The personal-Mac adapter fixes advertised
-Scale Set capacity at one. No durable message consumer, enrollment path,
+configuration only in a redacted guaranteed-zeroization value. Before reading the key it requires
+the bridge at the one fixed root-owned, non-writable installation path with exact SHA-256 content,
+and it reconfirms that held file around spawn. Every exchange has a finite deadline; malformed
+decoded or semantic responses poison and terminate the session. The personal-Mac adapter fixes
+advertised Scale Set capacity at one. No durable message consumer, enrollment path,
 service loop, or guest JIT handoff exists yet, so this adapter is not production capacity.
 
 Acceptance: an enrolled test repository targets the SmolRunner scale-set label, queues a job, and receives its result without operator commands; the JIT runner cannot accept a second job and its credential is absent after VM destruction.
