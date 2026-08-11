@@ -164,6 +164,8 @@ Make GitHub the normal control path for agents and humans.
 
 - [ ] Store the least-privilege controller GitHub App credential in the Mac Keychain.
 - [ ] Integrate a pinned Runner Scale Set Client behind a narrow adapter for demand, sessions, acknowledgement, JIT generation, job-start, and job-completion observations.
+  - [x] Pin the official Go client behind a bounded empty-environment bridge whose messages require
+    an explicit post-persistence acknowledgement; the Rust/Keychain/durable consumer remains open.
 - [ ] Validate every upstream response before it can advance durable state; malformed or internally inconsistent responses retain the prior attempt and fail closed.
 - [ ] Persist a unique runner name before JIT creation; bind the service-assigned runner ID only after exact scale-set identity is observed.
 - [ ] Transfer JIT configuration without argv, public logs, public journals, reusable guest storage, or a long-lived parent environment carrying the secret.

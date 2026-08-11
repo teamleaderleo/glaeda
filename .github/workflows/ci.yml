@@ -23,6 +23,22 @@ jobs:
         with:
           show-progress: false
 
+      - name: Install pinned Go toolchain
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+        with:
+          go-version-file: tools/scaleset-bridge/go.mod
+          cache-dependency-path: tools/scaleset-bridge/go.sum
+
+      - name: Verify Runner Scale Set bridge
+        working-directory: tools/scaleset-bridge
+        run: |
+          go mod verify
+          gofmt -d -e . | tee /tmp/smolrunner-scaleset-gofmt.diff
+          test ! -s /tmp/smolrunner-scaleset-gofmt.diff
+          go vet ./...
+          go test ./...
+          go build -trimpath -o /tmp/smolrunner-scaleset-bridge .
+
       - name: Install pinned Rust toolchain
         run: >-
           rustup toolchain install 1.97.1
