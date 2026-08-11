@@ -2,11 +2,14 @@ use smolrunner::disposable_attempt_catalog::DisposableAttemptCatalogAction;
 use smolrunner::disposable_attempt_state::{
     DisposableAttemptState, decode_disposable_attempt_state, encode_disposable_attempt_state,
 };
+use std::sync::LazyLock;
+
 use smolrunner::disposable_worker_reconciler::{
     CapacityClaimId, DisposableAttemptId, DisposableAttemptPhase, DisposableHostBudget,
-    DisposableHostUsage, DisposableVmId, DisposableVmObservation, DisposableWorkerAction,
-    DisposableWorkerObservationTarget, DisposableWorkerReconcileInput, DisposableWorkerResources,
-    ScaleSetDemand, ScaleSetRunnerObservation, plan_capacity, reconcile_attempt,
+    DisposableHostUsage, DisposableVmId, DisposableVmIdentity, DisposableVmObservation,
+    DisposableWorkerAction, DisposableWorkerObservationTarget, DisposableWorkerReconcileInput,
+    DisposableWorkerResources, ScaleSetDemand, ScaleSetRunnerObservation, plan_capacity,
+    reconcile_attempt,
 };
 use smolrunner::execution_admission::EpochMillis;
 use smolrunner::github_scale_set_protocol::{
@@ -47,6 +50,54 @@ fn result(value: &str) -> ScaleSetJobResult {
     ScaleSetJobResult::parse(value).unwrap()
 }
 
+fn vm_identity() -> &'static DisposableVmIdentity {
+    static BOUND: LazyLock<DisposableAttemptState> = LazyLock::new(|| {
+        bind_vm(
+            attempt()
+                .authorize_clone()
+                .unwrap()
+                .record_clone_started()
+                .unwrap(),
+        )
+    });
+    BOUND.vm_identity().unwrap()
+}
+
+fn bind_vm(state: DisposableAttemptState) -> DisposableAttemptState {
+    bind_vm_with_byte(state, "11")
+}
+
+fn bind_vm_with_byte(state: DisposableAttemptState, digest_byte: &str) -> DisposableAttemptState {
+    assert_eq!(state.phase(), DisposableAttemptPhase::CloneStarted);
+    let revision = state.revision().get();
+    let mut encoded = String::from_utf8(encode_disposable_attempt_state(&state).unwrap()).unwrap();
+    encoded = encoded.replacen(
+        &format!("\"revision\":{revision}"),
+        &format!("\"revision\":{}", revision + 1),
+        1,
+    );
+    encoded = encoded.replacen(
+        &format!("\"vm_id\":\"{}\"", state.vm_id().as_str()),
+        &format!(
+            "\"vm_id\":\"{}\",\"vm_identity_digest\":\"sha256:{}\"",
+            state.vm_id().as_str(),
+            digest_byte.repeat(32)
+        ),
+        1,
+    );
+    decode_disposable_attempt_state(encoded.as_bytes()).unwrap()
+}
+
+trait BindVmFixture {
+    fn bind_vm_fixture(self) -> Self;
+}
+
+impl BindVmFixture for DisposableAttemptState {
+    fn bind_vm_fixture(self) -> Self {
+        bind_vm(self)
+    }
+}
+
 fn input<'a>(
     attempt: &'a DisposableAttemptState,
     vm: DisposableVmObservation,
@@ -56,6 +107,11 @@ fn input<'a>(
         now: time(1_000),
         attempt,
         vm,
+        vm_identity: matches!(
+            vm,
+            DisposableVmObservation::Stopped | DisposableVmObservation::Ready
+        )
+        .then(vm_identity),
         runner,
         job_event: None,
         capacity_reserved: true,
@@ -200,12 +256,15 @@ fn happy_path_uses_canonical_durable_transitions() {
     assert_eq!(
         reconcile_attempt(input(
             &state,
-            DisposableVmObservation::Stopped,
+            DisposableVmObservation::Ready,
             ScaleSetRunnerObservation::Absent,
         ))
         .unwrap(),
-        DisposableWorkerAction::DiscardIncompleteVm
+        DisposableWorkerAction::Blocked {
+            code: "unbound_vm_recovery_required"
+        }
     );
+    state = bind_vm(state);
     let action = reconcile_attempt(input(
         &state,
         DisposableVmObservation::Ready,
@@ -291,8 +350,22 @@ fn stopped_partial_clone_is_discarded_only_after_clone_start() {
             ScaleSetRunnerObservation::Absent,
         ))
         .unwrap(),
-        persist(DisposableAttemptCatalogAction::BeginCleanup)
+        DisposableWorkerAction::Blocked {
+            code: "unbound_vm_recovery_required"
+        }
     );
+    assert_eq!(
+        reconcile_attempt(input(
+            &provisioning,
+            DisposableVmObservation::Stopped,
+            ScaleSetRunnerObservation::Absent,
+        ))
+        .unwrap(),
+        DisposableWorkerAction::Blocked {
+            code: "unbound_vm_recovery_required"
+        }
+    );
+    let provisioning = bind_vm(provisioning);
     assert_eq!(
         reconcile_attempt(input(
             &provisioning,
@@ -327,6 +400,95 @@ fn stopped_partial_clone_is_discarded_only_after_clone_start() {
 }
 
 #[test]
+fn unbound_started_is_always_recovery_debt_and_bound_replacement_drift_blocks() {
+    let started = attempt()
+        .authorize_clone()
+        .unwrap()
+        .record_clone_started()
+        .unwrap();
+    assert_eq!(
+        reconcile_attempt(input(
+            &started,
+            DisposableVmObservation::Ready,
+            ScaleSetRunnerObservation::Absent,
+        ))
+        .unwrap(),
+        DisposableWorkerAction::Blocked {
+            code: "unbound_vm_recovery_required"
+        }
+    );
+    for vm in [
+        DisposableVmObservation::Unknown,
+        DisposableVmObservation::Absent,
+    ] {
+        assert_eq!(
+            reconcile_attempt(input(&started, vm, ScaleSetRunnerObservation::Absent,)).unwrap(),
+            DisposableWorkerAction::Blocked {
+                code: "unbound_vm_recovery_required"
+            }
+        );
+    }
+    let mut cancelled = input(
+        &started,
+        DisposableVmObservation::Absent,
+        ScaleSetRunnerObservation::Absent,
+    );
+    cancelled.cancellation_requested = true;
+    assert_eq!(
+        reconcile_attempt(cancelled).unwrap(),
+        DisposableWorkerAction::Blocked {
+            code: "unbound_vm_recovery_required"
+        }
+    );
+    let mut capacity_lost = input(
+        &started,
+        DisposableVmObservation::Absent,
+        ScaleSetRunnerObservation::Absent,
+    );
+    capacity_lost.capacity_reserved = false;
+    assert_eq!(
+        reconcile_attempt(capacity_lost).unwrap(),
+        DisposableWorkerAction::Blocked {
+            code: "unbound_vm_recovery_required"
+        }
+    );
+    let mut late_event = input(
+        &started,
+        DisposableVmObservation::Absent,
+        ScaleSetRunnerObservation::Absent,
+    );
+    late_event.job_event = Some(ScaleSetJobEvent::Completed {
+        runner: None,
+        job_id: job("unbound-late"),
+        result: result("failed"),
+    });
+    assert_eq!(
+        reconcile_attempt(late_event).unwrap(),
+        DisposableWorkerAction::Blocked {
+            code: "unbound_vm_recovery_required"
+        }
+    );
+    assert_eq!(
+        started.begin_cleanup().unwrap_err().code(),
+        "invalid_document"
+    );
+    let bound = bind_vm(started.clone());
+
+    let replacement_state = bind_vm_with_byte(started, "55");
+    let replacement = replacement_state.vm_identity().unwrap();
+    let mut replaced = input(
+        &bound,
+        DisposableVmObservation::Ready,
+        ScaleSetRunnerObservation::Absent,
+    );
+    replaced.vm_identity = Some(replacement);
+    assert_eq!(
+        reconcile_attempt(replaced).unwrap_err().code(),
+        "vm_identity_drift"
+    );
+}
+
+#[test]
 fn legacy_provisioning_schema_and_current_schema_alias_are_both_refused() {
     let bytes = encode_disposable_attempt_state(&attempt()).unwrap();
     let mut legacy: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -353,6 +515,14 @@ fn legacy_provisioning_schema_and_current_schema_alias_are_both_refused() {
         decode_disposable_attempt_state(&serde_json::to_vec(&legacy).unwrap())
             .unwrap_err()
             .code(),
+        "version_incompatible"
+    );
+
+    legacy["schema_version"] = serde_json::json!(4);
+    assert_eq!(
+        decode_disposable_attempt_state(&serde_json::to_vec(&legacy).unwrap())
+            .unwrap_err()
+            .code(),
         "invalid_document"
     );
     assert_eq!(
@@ -365,6 +535,7 @@ fn legacy_provisioning_schema_and_current_schema_alias_are_both_refused() {
 fn crash_discovered_registration_is_durably_bound_before_cleanup() {
     let mut state = attempt().authorize_clone().unwrap();
     state = state.record_clone_started().unwrap();
+    state = bind_vm(state);
     state = state.begin_registration().unwrap();
     let exact_runner = runner(41);
     let action = reconcile_attempt(input(
@@ -430,6 +601,7 @@ fn terminal_cleanup_orders_vm_runner_and_capacity_release() {
         .unwrap()
         .record_clone_started()
         .unwrap()
+        .bind_vm_fixture()
         .begin_registration()
         .unwrap()
         .record_assigned(job("job-cleanup"))
@@ -622,6 +794,7 @@ fn unknown_conflicting_and_identity_drift_never_authorize_mutation() {
     );
     let mut state = state.authorize_clone().unwrap();
     state = state.record_clone_started().unwrap();
+    state = bind_vm(state);
     state = state.begin_registration().unwrap();
     let wrong = ScaleSetRunnerReference::new(
         ScaleSetRunnerId::new(9).unwrap(),
@@ -647,6 +820,7 @@ fn duplicate_job_event_is_a_no_op_but_identity_drift_is_refused() {
         .unwrap()
         .record_clone_started()
         .unwrap()
+        .bind_vm_fixture()
         .begin_registration()
         .unwrap()
         .record_runner_ready(&exact_runner)
@@ -694,6 +868,7 @@ fn late_duplicate_event_does_not_reverse_cleanup() {
         .unwrap()
         .record_clone_started()
         .unwrap()
+        .bind_vm_fixture()
         .record_terminal(Some(&exact_runner), job("job-late"), result("succeeded"))
         .unwrap()
         .begin_cleanup()
@@ -724,6 +899,7 @@ fn first_late_job_events_are_checkpointed_without_reversing_cleanup() {
         .unwrap()
         .record_clone_started()
         .unwrap()
+        .bind_vm_fixture()
         .begin_cleanup()
         .unwrap();
     let mut started = input(

@@ -20,6 +20,38 @@ fn reserved() -> DisposableAttemptState {
     )
 }
 
+fn bind_vm_fixture(state: DisposableAttemptState) -> DisposableAttemptState {
+    assert_eq!(state.phase(), DisposableAttemptPhase::CloneStarted);
+    assert!(state.vm_identity().is_none());
+    let revision = state.revision().get();
+    let mut encoded = String::from_utf8(encode_disposable_attempt_state(&state).unwrap()).unwrap();
+    encoded = encoded.replacen(
+        &format!("\"revision\":{revision}"),
+        &format!("\"revision\":{}", revision + 1),
+        1,
+    );
+    encoded = encoded.replacen(
+        &format!("\"vm_id\":\"{}\"", state.vm_id().as_str()),
+        &format!(
+            "\"vm_id\":\"{}\",\"vm_identity_digest\":\"sha256:{}\"",
+            state.vm_id().as_str(),
+            "33".repeat(32)
+        ),
+        1,
+    );
+    decode_disposable_attempt_state(encoded.as_bytes()).unwrap()
+}
+
+trait BindVmFixture {
+    fn bind_vm_fixture(self) -> Self;
+}
+
+impl BindVmFixture for DisposableAttemptState {
+    fn bind_vm_fixture(self) -> Self {
+        bind_vm_fixture(self)
+    }
+}
+
 #[test]
 fn unprovisioned_completion_skips_cleanup_only_before_clone_start() {
     let complete = reserved().complete_unprovisioned().unwrap();
@@ -42,6 +74,22 @@ fn unprovisioned_completion_skips_cleanup_only_before_clone_start() {
     );
 }
 
+#[test]
+fn bound_vm_identity_survives_codec_and_has_no_public_first_binding_transition() {
+    let started = reserved()
+        .authorize_clone()
+        .unwrap()
+        .record_clone_started()
+        .unwrap();
+    let bound = bind_vm_fixture(started);
+    assert_eq!(bound.phase(), DisposableAttemptPhase::CloneStarted);
+    assert_eq!(bound.revision().get(), 4);
+    assert!(bound.vm_identity().is_some());
+
+    let encoded = encode_disposable_attempt_state(&bound).unwrap();
+    assert_eq!(decode_disposable_attempt_state(&encoded).unwrap(), bound);
+}
+
 fn runner(id: u64) -> ScaleSetRunnerReference {
     ScaleSetRunnerReference::new(
         ScaleSetRunnerId::new(id).unwrap(),
@@ -60,6 +108,7 @@ fn registration_and_listener_readiness_are_distinct_durable_checkpoints() {
         .unwrap()
         .record_clone_started()
         .unwrap()
+        .bind_vm_fixture()
         .begin_registration()
         .unwrap();
     let registered = registering.record_registration(&runner(41)).unwrap();
@@ -81,6 +130,7 @@ fn job_assignment_does_not_bind_a_runner_before_job_started() {
         .unwrap()
         .record_clone_started()
         .unwrap()
+        .bind_vm_fixture()
         .begin_registration()
         .unwrap()
         .record_assigned(job("job_opaque-7"))
@@ -117,6 +167,7 @@ fn runnerless_completion_requires_an_exact_prebound_job() {
         .unwrap()
         .record_clone_started()
         .unwrap()
+        .bind_vm_fixture()
         .begin_registration()
         .unwrap()
         .record_assigned(job("cancel-before-runner"))
@@ -159,6 +210,7 @@ fn unknown_completion_result_still_reaches_cleanup() {
         .unwrap()
         .record_clone_started()
         .unwrap()
+        .bind_vm_fixture()
         .begin_registration()
         .unwrap()
         .record_assigned(job("job-future-result"))
@@ -192,6 +244,7 @@ fn late_job_evidence_binds_without_reversing_cleanup_and_conflicts_fail_closed()
         .unwrap()
         .record_clone_started()
         .unwrap()
+        .bind_vm_fixture()
         .begin_cleanup()
         .unwrap()
         .record_running(&exact_runner, job("late-job"))
@@ -229,6 +282,7 @@ fn exact_runner_and_job_identity_drift_fails_closed() {
         .unwrap()
         .record_clone_started()
         .unwrap()
+        .bind_vm_fixture()
         .begin_registration()
         .unwrap()
         .record_registration(&runner(7))
@@ -269,6 +323,7 @@ fn canonical_codec_round_trips_exact_state_and_revision() {
         .unwrap()
         .record_clone_started()
         .unwrap()
+        .bind_vm_fixture()
         .begin_registration()
         .unwrap()
         .record_registration(&runner(77))
@@ -291,7 +346,7 @@ fn codec_rejects_future_versions_unknown_fields_and_inconsistent_phase_evidence(
     let base = encode_disposable_attempt_state(&reserved()).unwrap();
     let mut value: serde_json::Value = serde_json::from_slice(&base).unwrap();
 
-    value["schema_version"] = serde_json::json!(4);
+    value["schema_version"] = serde_json::json!(DISPOSABLE_ATTEMPT_STATE_SCHEMA_VERSION + 1);
     let future = serde_json::to_vec(&value).unwrap();
     assert_eq!(
         decode_disposable_attempt_state(&future).unwrap_err().code(),
@@ -323,6 +378,57 @@ fn codec_rejects_future_versions_unknown_fields_and_inconsistent_phase_evidence(
     let inconsistent = serde_json::to_vec(&inconsistent).unwrap();
     assert_eq!(
         decode_disposable_attempt_state(&inconsistent)
+            .unwrap_err()
+            .code(),
+        "invalid_document"
+    );
+
+    let mut impossible_started: serde_json::Value = serde_json::from_slice(&base).unwrap();
+    impossible_started["revision"] = serde_json::json!(4);
+    impossible_started["phase"] = serde_json::json!("clone_started");
+    assert_eq!(
+        decode_disposable_attempt_state(&serde_json::to_vec(&impossible_started).unwrap())
+            .unwrap_err()
+            .code(),
+        "invalid_document"
+    );
+
+    let unbound_started = reserved()
+        .authorize_clone()
+        .unwrap()
+        .record_clone_started()
+        .unwrap();
+    let mut unbound_cleanup: serde_json::Value =
+        serde_json::from_slice(&encode_disposable_attempt_state(&unbound_started).unwrap())
+            .unwrap();
+    unbound_cleanup["revision"] = serde_json::json!(4);
+    unbound_cleanup["phase"] = serde_json::json!("destroying");
+    assert_eq!(
+        decode_disposable_attempt_state(&serde_json::to_vec(&unbound_cleanup).unwrap())
+            .unwrap_err()
+            .code(),
+        "invalid_document"
+    );
+    unbound_cleanup["revision"] = serde_json::json!(5);
+    unbound_cleanup["phase"] = serde_json::json!("complete");
+    assert_eq!(
+        decode_disposable_attempt_state(&serde_json::to_vec(&unbound_cleanup).unwrap())
+            .unwrap_err()
+            .code(),
+        "invalid_document"
+    );
+
+    let bound = reserved()
+        .authorize_clone()
+        .unwrap()
+        .record_clone_started()
+        .unwrap()
+        .bind_vm_fixture();
+    let mut impossible_registration: serde_json::Value =
+        serde_json::from_slice(&encode_disposable_attempt_state(&bound).unwrap()).unwrap();
+    impossible_registration["phase"] = serde_json::json!("registering");
+    assert_eq!(
+        decode_disposable_attempt_state(&serde_json::to_vec(&impossible_registration).unwrap())
             .unwrap_err()
             .code(),
         "invalid_document"

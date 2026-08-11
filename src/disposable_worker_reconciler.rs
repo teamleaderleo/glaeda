@@ -2,6 +2,7 @@ use std::fmt;
 
 use serde::Serialize;
 
+use crate::artifact::Sha256Digest;
 use crate::disposable_attempt_catalog::DisposableAttemptCatalogAction;
 use crate::disposable_attempt_state::DisposableAttemptState;
 use crate::execution_admission::EpochMillis;
@@ -36,6 +37,43 @@ macro_rules! identifier {
 identifier!(DisposableAttemptId, "attempt_id");
 identifier!(CapacityClaimId, "capacity_claim_id");
 identifier!(DisposableVmId, "vm_id");
+
+/// Equality-only identity of one observed disposable Lima instance.
+///
+/// This digest is durable drift evidence, not standalone deletion authority. The host-mutation
+/// boundary must still retain and freshly confirm the matching Lima host-identity observation
+/// immediately before a name-targeted command.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct DisposableVmIdentity(Sha256Digest);
+
+impl DisposableVmIdentity {
+    /// Parse one canonical identity digest.
+    ///
+    /// Parsing does not prove that a VM exists or that SmolRunner owns it. It exists only for the
+    /// private durable codec and crate-internal tests; only the future sealed clone-completion
+    /// transaction may create the first durable binding.
+    pub(crate) fn parse(value: &str) -> Result<Self, DisposableWorkerReconcilerError> {
+        Sha256Digest::parse(value).map(Self).map_err(|_| {
+            DisposableWorkerReconcilerError::new(
+                "vm_identity",
+                "invalid_vm_identity",
+                "disposable VM identity digest is invalid",
+            )
+        })
+    }
+
+    #[must_use]
+    pub(crate) fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl fmt::Debug for DisposableVmIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("DisposableVmIdentity(<private>)")
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct DisposableWorkerResources {
@@ -341,6 +379,10 @@ pub struct DisposableWorkerReconcileInput<'a> {
     pub now: EpochMillis,
     pub attempt: &'a DisposableAttemptState,
     pub vm: DisposableVmObservation,
+    /// Exact identity accompanying a stopped or ready observation. This is absent for all other
+    /// observation states and is only persisted as a drift check for the later held-evidence
+    /// execution boundary.
+    pub vm_identity: Option<&'a DisposableVmIdentity>,
     pub runner: ScaleSetRunnerObservation,
     pub job_event: Option<ScaleSetJobEvent>,
     pub capacity_reserved: bool,
@@ -390,12 +432,20 @@ pub fn reconcile_attempt(
             code: "conflicting_vm_identity",
         });
     }
+    validate_vm_observation(input.attempt, input.vm, input.vm_identity)?;
     if matches!(input.runner, ScaleSetRunnerObservation::Conflicting) {
         return Ok(DisposableWorkerAction::Blocked {
             code: "conflicting_runner_identity",
         });
     }
     validate_runner_observation(input.attempt, &input.runner)?;
+    if input.attempt.phase() == DisposableAttemptPhase::CloneStarted
+        && input.attempt.vm_identity().is_none()
+    {
+        return Ok(DisposableWorkerAction::Blocked {
+            code: "unbound_vm_recovery_required",
+        });
+    }
     if let Some(event) = input.job_event.as_ref()
         && let Some(action) = plan_job_event(input.attempt, event)?
     {
@@ -554,6 +604,13 @@ pub fn reconcile_attempt(
             ScaleSetRunnerObservation::Conflicting => unreachable!(),
         },
         Phase::Terminal => persist(DisposableAttemptCatalogAction::BeginCleanup),
+        Phase::Destroying
+            if input.vm_identity.is_some() && input.attempt.vm_identity().is_none() =>
+        {
+            Action::Blocked {
+                code: "unbound_vm_recovery_required",
+            }
+        }
         Phase::Destroying => match input.vm {
             DisposableVmObservation::Unknown => Action::Observe {
                 target: DisposableWorkerObservationTarget::Vm,
@@ -564,6 +621,13 @@ pub fn reconcile_attempt(
             ),
             DisposableVmObservation::Conflicting => unreachable!(),
         },
+        Phase::Deregistering
+            if input.vm_identity.is_some() && input.attempt.vm_identity().is_none() =>
+        {
+            Action::Blocked {
+                code: "unbound_vm_recovery_required",
+            }
+        }
         Phase::Deregistering if matches!(input.vm, DisposableVmObservation::Unknown) => {
             Action::Observe {
                 target: DisposableWorkerObservationTarget::Vm,
@@ -599,6 +663,13 @@ pub fn reconcile_attempt(
             },
             ScaleSetRunnerObservation::Conflicting => unreachable!(),
         },
+        Phase::Releasing
+            if input.vm_identity.is_some() && input.attempt.vm_identity().is_none() =>
+        {
+            Action::Blocked {
+                code: "unbound_vm_recovery_required",
+            }
+        }
         Phase::Releasing if matches!(input.vm, DisposableVmObservation::Unknown) => {
             Action::Observe {
                 target: DisposableWorkerObservationTarget::Vm,
@@ -700,10 +771,10 @@ fn validate_transition(
         DisposableAttemptCatalogAction::AdvanceCleanup(phase) => attempt.advance_cleanup(*phase),
     };
     result.map_err(|error| {
-        let code = if error.code() == "identity_drift" {
-            "github_job_identity_drift"
-        } else {
+        let code = if error.code() != "identity_drift" {
             "invalid_attempt_transition"
+        } else {
+            "github_job_identity_drift"
         };
         DisposableWorkerReconcilerError::new(
             "attempt",
@@ -712,6 +783,34 @@ fn validate_transition(
         )
     })?;
     Ok(transition)
+}
+
+fn validate_vm_observation(
+    attempt: &DisposableAttemptState,
+    observation: DisposableVmObservation,
+    observed_identity: Option<&DisposableVmIdentity>,
+) -> Result<(), DisposableWorkerReconcilerError> {
+    let identity_required = matches!(
+        observation,
+        DisposableVmObservation::Stopped | DisposableVmObservation::Ready
+    );
+    if identity_required != observed_identity.is_some() {
+        return Err(DisposableWorkerReconcilerError::new(
+            "vm_identity",
+            "invalid_vm_observation",
+            "VM identity evidence does not match the observation state",
+        ));
+    }
+    if let (Some(current), Some(observed)) = (attempt.vm_identity(), observed_identity)
+        && current != observed
+    {
+        return Err(DisposableWorkerReconcilerError::new(
+            "vm_identity",
+            "vm_identity_drift",
+            "observed VM identity differs from the durable disposable VM identity",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_runner_observation(

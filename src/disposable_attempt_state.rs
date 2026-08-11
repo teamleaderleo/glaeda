@@ -4,13 +4,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::disposable_worker_reconciler::{
     CapacityClaimId, DisposableAttemptId, DisposableAttemptPhase, DisposableVmId,
+    DisposableVmIdentity,
 };
 use crate::execution_admission::EpochMillis;
 use crate::github_scale_set_protocol::{
     ScaleSetJobId, ScaleSetJobResult, ScaleSetRunnerId, ScaleSetRunnerName, ScaleSetRunnerReference,
 };
 
-pub const DISPOSABLE_ATTEMPT_STATE_SCHEMA_VERSION: u8 = 3;
+pub const DISPOSABLE_ATTEMPT_STATE_SCHEMA_VERSION: u8 = 4;
 pub const MAX_DISPOSABLE_ATTEMPT_STATE_BYTES: usize = 16_384;
 const MAX_DISPOSABLE_ATTEMPT_REVISION: u64 = 1_000_000_000_000;
 
@@ -65,6 +66,7 @@ pub struct DisposableAttemptState {
     attempt_id: DisposableAttemptId,
     capacity_claim_id: CapacityClaimId,
     vm_id: DisposableVmId,
+    vm_identity: Option<DisposableVmIdentity>,
     runner_name: ScaleSetRunnerName,
     runner_id: Option<ScaleSetRunnerId>,
     phase: DisposableAttemptPhase,
@@ -89,6 +91,7 @@ impl DisposableAttemptState {
             attempt_id,
             capacity_claim_id,
             vm_id,
+            vm_identity: None,
             runner_name,
             runner_id: None,
             phase: DisposableAttemptPhase::Reserved,
@@ -121,6 +124,12 @@ impl DisposableAttemptState {
     #[must_use]
     pub const fn vm_id(&self) -> &DisposableVmId {
         &self.vm_id
+    }
+
+    /// Return the exact observed host identity bound to this clone, when one has been persisted.
+    #[must_use]
+    pub const fn vm_identity(&self) -> Option<&DisposableVmIdentity> {
+        self.vm_identity.as_ref()
     }
 
     #[must_use]
@@ -602,6 +611,7 @@ impl DisposableAttemptState {
             attempt_id: self.attempt_id.clone(),
             capacity_claim_id: self.capacity_claim_id.clone(),
             vm_id: self.vm_id.clone(),
+            vm_identity: self.vm_identity.clone(),
             runner_name: self.runner_name.clone(),
             runner_id,
             phase,
@@ -661,13 +671,13 @@ impl DisposableAttemptState {
             DisposableAttemptPhase::Reserved => revision == 1,
             DisposableAttemptPhase::UnprovisionedReleasing => matches!(revision, 2 | 3),
             DisposableAttemptPhase::CloneAuthorized => revision == 2,
-            DisposableAttemptPhase::CloneStarted => revision == 3,
+            DisposableAttemptPhase::CloneStarted => matches!(revision, 3 | 4),
             DisposableAttemptPhase::Provisioning => false,
-            DisposableAttemptPhase::Registering => revision >= 4,
+            DisposableAttemptPhase::Registering => revision >= 5,
             DisposableAttemptPhase::Waiting
             | DisposableAttemptPhase::Assigned
-            | DisposableAttemptPhase::Running => revision >= 5,
-            DisposableAttemptPhase::Terminal => revision >= 4,
+            | DisposableAttemptPhase::Running => revision >= 6,
+            DisposableAttemptPhase::Terminal => revision >= 5,
             DisposableAttemptPhase::Destroying => revision >= 4,
             DisposableAttemptPhase::Deregistering => revision >= 5,
             DisposableAttemptPhase::Releasing => revision >= 6,
@@ -682,18 +692,24 @@ impl DisposableAttemptState {
             DisposableAttemptPhase::Reserved
             | DisposableAttemptPhase::UnprovisionedReleasing
             | DisposableAttemptPhase::CloneAuthorized => {
-                if self.runner_id.is_some() || self.github_job_id.is_some() || self.result.is_some()
+                if self.vm_identity.is_some()
+                    || self.runner_id.is_some()
+                    || self.github_job_id.is_some()
+                    || self.result.is_some()
                 {
                     return Err(invalid_document(
-                        "pre-registration attempt cannot carry runner or job evidence",
+                        "pre-clone attempt cannot carry VM, runner, or job evidence",
                     ));
                 }
             }
             DisposableAttemptPhase::CloneStarted => {
-                if self.runner_id.is_some() || self.github_job_id.is_some() || self.result.is_some()
+                if (revision == 3) != self.vm_identity.is_none()
+                    || self.runner_id.is_some()
+                    || self.github_job_id.is_some()
+                    || self.result.is_some()
                 {
                     return Err(invalid_document(
-                        "clone-started attempt cannot carry runner or job evidence",
+                        "clone-started attempt has inconsistent VM, runner, or job evidence",
                     ));
                 }
             }
@@ -703,53 +719,85 @@ impl DisposableAttemptState {
                 ));
             }
             DisposableAttemptPhase::Registering => {
-                if self.github_job_id.is_some() || self.result.is_some() {
+                if self.vm_identity.is_none()
+                    || self.github_job_id.is_some()
+                    || self.result.is_some()
+                {
                     return Err(invalid_document(
-                        "registering attempt cannot carry job terminal evidence",
+                        "registering attempt requires VM identity and no job terminal evidence",
                     ));
                 }
             }
             DisposableAttemptPhase::Waiting => {
-                if self.runner_id.is_none() || self.github_job_id.is_some() || self.result.is_some()
+                if self.vm_identity.is_none()
+                    || self.runner_id.is_none()
+                    || self.github_job_id.is_some()
+                    || self.result.is_some()
                 {
                     return Err(invalid_document(
-                        "waiting attempt requires a ready runner and no assigned job",
+                        "waiting attempt requires exact VM and runner identities and no assigned job",
                     ));
                 }
             }
             DisposableAttemptPhase::Assigned => {
-                if self.github_job_id.is_none() || self.result.is_some() {
+                if self.vm_identity.is_none()
+                    || self.github_job_id.is_none()
+                    || self.result.is_some()
+                {
                     return Err(invalid_document(
-                        "assigned attempt requires one job identity without terminal result",
+                        "assigned attempt requires exact VM and job identities without terminal result",
                     ));
                 }
             }
             DisposableAttemptPhase::Running => {
-                if self.runner_id.is_none() || self.github_job_id.is_none() || self.result.is_some()
+                if self.vm_identity.is_none()
+                    || self.runner_id.is_none()
+                    || self.github_job_id.is_none()
+                    || self.result.is_some()
                 {
                     return Err(invalid_document(
-                        "running attempt requires exact runner and job identities",
+                        "running attempt requires exact VM, runner, and job identities",
                     ));
                 }
             }
             DisposableAttemptPhase::Terminal => {
-                if self.github_job_id.is_none() || self.result.is_none() {
+                if self.vm_identity.is_none()
+                    || self.github_job_id.is_none()
+                    || self.result.is_none()
+                {
                     return Err(invalid_document(
-                        "terminal attempt requires exact job identity and result",
+                        "terminal attempt requires exact VM and job identities and result",
                     ));
                 }
             }
             DisposableAttemptPhase::Destroying
             | DisposableAttemptPhase::Deregistering
-            | DisposableAttemptPhase::Releasing
-            | DisposableAttemptPhase::Complete => {}
+            | DisposableAttemptPhase::Releasing => {
+                if self.vm_identity.is_none() {
+                    return Err(invalid_document(
+                        "provisioned cleanup requires exact durable VM identity",
+                    ));
+                }
+            }
+            DisposableAttemptPhase::Complete => {}
         }
         if self.phase == DisposableAttemptPhase::Complete
             && revision <= 4
-            && (self.runner_id.is_some() || self.github_job_id.is_some() || self.result.is_some())
+            && (self.vm_identity.is_some()
+                || self.runner_id.is_some()
+                || self.github_job_id.is_some()
+                || self.result.is_some())
         {
             return Err(invalid_document(
                 "unprovisioned completion cannot carry external job or runner evidence",
+            ));
+        }
+        if self.phase == DisposableAttemptPhase::Complete
+            && revision > 4
+            && self.vm_identity.is_none()
+        {
+            return Err(invalid_document(
+                "provisioned completion requires exact durable VM identity",
             ));
         }
         Ok(())
@@ -763,6 +811,8 @@ struct AttemptWire<'a> {
     attempt_id: &'a str,
     capacity_claim_id: &'a str,
     vm_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vm_identity_digest: Option<&'a str>,
     runner_name: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     runner_id: Option<u64>,
@@ -782,6 +832,7 @@ struct OwnedAttemptWire {
     attempt_id: String,
     capacity_claim_id: String,
     vm_id: String,
+    vm_identity_digest: Option<String>,
     runner_name: String,
     runner_id: Option<u64>,
     phase: String,
@@ -805,6 +856,7 @@ pub fn encode_disposable_attempt_state(
         attempt_id: state.attempt_id.as_str(),
         capacity_claim_id: state.capacity_claim_id.as_str(),
         vm_id: state.vm_id.as_str(),
+        vm_identity_digest: state.vm_identity.as_ref().map(DisposableVmIdentity::as_str),
         runner_name: state.runner_name.as_str(),
         runner_id: state.runner_id.map(ScaleSetRunnerId::get),
         phase: phase_name(state.phase),
@@ -857,6 +909,11 @@ pub fn decode_disposable_attempt_state(
             .map_err(|_| invalid_document("capacity claim ID is invalid"))?,
         vm_id: DisposableVmId::parse(&wire.vm_id)
             .map_err(|_| invalid_document("VM ID is invalid"))?,
+        vm_identity: wire
+            .vm_identity_digest
+            .map(|value| DisposableVmIdentity::parse(&value))
+            .transpose()
+            .map_err(|_| invalid_document("VM identity digest is invalid"))?,
         runner_name: ScaleSetRunnerName::parse(&wire.runner_name)
             .map_err(|_| invalid_document("runner name is invalid"))?,
         runner_id: wire
