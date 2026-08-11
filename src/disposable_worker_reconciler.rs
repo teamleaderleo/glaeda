@@ -51,16 +51,16 @@ pub struct DisposableVmIdentity(Sha256Digest);
 impl DisposableVmIdentity {
     /// Derive the durable equality token from the existing descriptor-bound Lima host observer.
     #[must_use]
-    pub fn from_host_identity(identity: &LimaHostInstanceIdentity) -> Self {
+    pub(crate) fn from_host_identity(identity: &LimaHostInstanceIdentity) -> Self {
         Self(identity.digest().clone())
     }
 
     /// Parse one canonical identity digest.
     ///
-    /// Parsing does not prove that a VM exists or that SmolRunner owns it. It is exposed for
-    /// durable state transport and tests; only a freshly confirmed host observation can authorize
-    /// a mutation.
-    pub fn parse(value: &str) -> Result<Self, DisposableWorkerReconcilerError> {
+    /// Parsing does not prove that a VM exists or that SmolRunner owns it. It exists only for the
+    /// private durable codec and crate-internal tests; only the clone-completion transaction may
+    /// create the first durable binding.
+    pub(crate) fn parse(value: &str) -> Result<Self, DisposableWorkerReconcilerError> {
         Sha256Digest::parse(value).map(Self).map_err(|_| {
             DisposableWorkerReconcilerError::new(
                 "vm_identity",
@@ -515,9 +515,9 @@ pub fn reconcile_attempt(
         Phase::CloneStarted
             if input.vm_identity.is_some() && input.attempt.vm_identity().is_none() =>
         {
-            persist(DisposableAttemptCatalogAction::RecordVmIdentity(
-                input.vm_identity.expect("checked as present").clone(),
-            ))
+            Action::Blocked {
+                code: "unbound_vm_recovery_required",
+            }
         }
         Phase::CloneStarted => match input.vm {
             DisposableVmObservation::Unknown => Action::Observe {
@@ -614,9 +614,9 @@ pub fn reconcile_attempt(
         Phase::Destroying
             if input.vm_identity.is_some() && input.attempt.vm_identity().is_none() =>
         {
-            persist(DisposableAttemptCatalogAction::RecordVmIdentity(
-                input.vm_identity.expect("checked as present").clone(),
-            ))
+            Action::Blocked {
+                code: "unbound_vm_recovery_required",
+            }
         }
         Phase::Destroying => match input.vm {
             DisposableVmObservation::Unknown => Action::Observe {
@@ -631,9 +631,9 @@ pub fn reconcile_attempt(
         Phase::Deregistering
             if input.vm_identity.is_some() && input.attempt.vm_identity().is_none() =>
         {
-            persist(DisposableAttemptCatalogAction::RecordVmIdentity(
-                input.vm_identity.expect("checked as present").clone(),
-            ))
+            Action::Blocked {
+                code: "unbound_vm_recovery_required",
+            }
         }
         Phase::Deregistering if matches!(input.vm, DisposableVmObservation::Unknown) => {
             Action::Observe {
@@ -673,9 +673,9 @@ pub fn reconcile_attempt(
         Phase::Releasing
             if input.vm_identity.is_some() && input.attempt.vm_identity().is_none() =>
         {
-            persist(DisposableAttemptCatalogAction::RecordVmIdentity(
-                input.vm_identity.expect("checked as present").clone(),
-            ))
+            Action::Blocked {
+                code: "unbound_vm_recovery_required",
+            }
         }
         Phase::Releasing if matches!(input.vm, DisposableVmObservation::Unknown) => {
             Action::Observe {
@@ -752,9 +752,6 @@ fn validate_transition(
         DisposableAttemptCatalogAction::BeginProvisioning => attempt.begin_provisioning(),
         DisposableAttemptCatalogAction::AuthorizeClone => attempt.authorize_clone(),
         DisposableAttemptCatalogAction::RecordCloneStarted => attempt.record_clone_started(),
-        DisposableAttemptCatalogAction::RecordVmIdentity(identity) => {
-            attempt.record_vm_identity(identity.clone())
-        }
         DisposableAttemptCatalogAction::BeginUnprovisionedRelease => {
             attempt.begin_unprovisioned_release()
         }
@@ -783,11 +780,6 @@ fn validate_transition(
     result.map_err(|error| {
         let code = if error.code() != "identity_drift" {
             "invalid_attempt_transition"
-        } else if matches!(
-            &transition,
-            DisposableAttemptCatalogAction::RecordVmIdentity(_)
-        ) {
-            "vm_identity_drift"
         } else {
             "github_job_identity_drift"
         };

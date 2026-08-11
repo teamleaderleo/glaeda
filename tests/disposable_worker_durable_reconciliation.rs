@@ -8,9 +8,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use smolrunner::disposable_attempt_catalog::{
     DisposableAttemptCatalog, DisposableAttemptCatalogAction, DisposableAttemptCatalogDocument,
-    DisposableAttemptReservation,
+    DisposableAttemptReservation, decode_disposable_attempt_catalog,
+    encode_disposable_attempt_catalog,
 };
-use smolrunner::disposable_attempt_state::DisposableAttemptState;
+use smolrunner::disposable_attempt_state::{
+    DisposableAttemptState, decode_disposable_attempt_state, encode_disposable_attempt_state,
+};
 use smolrunner::disposable_prepared_template::{
     DisposablePreparedTemplateIdentity, current_disposable_prepared_template,
 };
@@ -70,10 +73,67 @@ fn attempt_id() -> DisposableAttemptId {
 }
 
 fn vm_identity() -> &'static DisposableVmIdentity {
-    static IDENTITY: LazyLock<DisposableVmIdentity> = LazyLock::new(|| {
-        DisposableVmIdentity::parse(&format!("sha256:{}", "22".repeat(32))).unwrap()
+    static BOUND: LazyLock<DisposableAttemptState> = LazyLock::new(|| {
+        bind_attempt_fixture(
+            DisposableAttemptState::reserved(
+                attempt_id(),
+                CapacityClaimId::parse("claim-restart-1").unwrap(),
+                DisposableVmId::parse("vm-restart-1").unwrap(),
+                ScaleSetRunnerName::parse("smol-attempt-restart-1").unwrap(),
+                epoch(100_000),
+            )
+            .authorize_clone()
+            .unwrap()
+            .record_clone_started()
+            .unwrap(),
+        )
     });
-    &IDENTITY
+    BOUND.vm_identity().unwrap()
+}
+
+fn bind_attempt_fixture(state: DisposableAttemptState) -> DisposableAttemptState {
+    let revision = state.revision().get();
+    let mut encoded = String::from_utf8(encode_disposable_attempt_state(&state).unwrap()).unwrap();
+    encoded = encoded.replacen(
+        &format!("\"revision\":{revision}"),
+        &format!("\"revision\":{}", revision + 1),
+        1,
+    );
+    encoded = encoded.replacen(
+        &format!("\"vm_id\":\"{}\"", state.vm_id().as_str()),
+        &format!(
+            "\"vm_id\":\"{}\",\"vm_identity_digest\":\"sha256:{}\"",
+            state.vm_id().as_str(),
+            "22".repeat(32)
+        ),
+        1,
+    );
+    decode_disposable_attempt_state(encoded.as_bytes()).unwrap()
+}
+
+fn bind_current_catalog_fixture(root: &Path) {
+    let path = root
+        .join("personal-worker")
+        .join("disposable-attempt-catalog.json");
+    let current_bytes = fs::read(&path).unwrap();
+    let current = decode_disposable_attempt_catalog(&current_bytes).unwrap();
+    let attempt = current.find_active(&attempt_id()).unwrap().attempt();
+    let bound_attempt = bind_attempt_fixture(attempt.clone());
+    let current_attempt_value: serde_json::Value =
+        serde_json::from_slice(&encode_disposable_attempt_state(attempt).unwrap()).unwrap();
+    let current_attempt_json = serde_json::to_string(&current_attempt_value).unwrap();
+    let bound_attempt_value: serde_json::Value =
+        serde_json::from_slice(&encode_disposable_attempt_state(&bound_attempt).unwrap()).unwrap();
+    let bound_attempt_json = serde_json::to_string(&bound_attempt_value).unwrap();
+    let mut encoded = String::from_utf8(current_bytes).unwrap();
+    encoded = encoded.replacen(
+        &format!("\"revision\":{}", current.revision().get()),
+        &format!("\"revision\":{}", current.revision().get() + 1),
+        1,
+    );
+    encoded = encoded.replacen(&current_attempt_json, &bound_attempt_json, 1);
+    let bound = decode_disposable_attempt_catalog(encoded.as_bytes()).unwrap();
+    fs::write(path, encode_disposable_attempt_catalog(&bound).unwrap()).unwrap();
 }
 
 fn runner() -> ScaleSetRunnerReference {
@@ -220,20 +280,12 @@ fn every_durable_checkpoint_reopens_without_duplicate_capacity_or_cleanup_loss()
         state.find_active(&attempt_id()).unwrap().attempt().phase(),
         DisposableAttemptPhase::CloneStarted
     );
-
-    let (state, action) = tick(
-        root.path(),
-        DisposableVmObservation::Stopped,
-        ScaleSetRunnerObservation::Absent,
-        None,
-        true,
-    );
-    assert!(matches!(
-        action,
-        DisposableWorkerAction::Persist {
-            transition: DisposableAttemptCatalogAction::RecordVmIdentity(_)
-        }
-    ));
+    bind_current_catalog_fixture(root.path());
+    let state = DisposableAttemptCatalog::new(
+        UnixPersonalWorkerStore::open_or_create_disposable_catalog(root.path()).unwrap(),
+    )
+    .load()
+    .unwrap();
     assert!(
         state
             .find_active(&attempt_id())
@@ -537,6 +589,7 @@ fn stale_registration_is_bound_before_delete_and_recovery_never_uses_name_alone(
         None,
         true,
     );
+    bind_current_catalog_fixture(root.path());
     tick(
         root.path(),
         DisposableVmObservation::Ready,

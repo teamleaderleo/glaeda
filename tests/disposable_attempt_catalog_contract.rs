@@ -1,24 +1,82 @@
 use smolrunner::disposable_attempt_catalog::{
-    DisposableAttemptCatalog, DisposableAttemptCatalogAction, DisposableAttemptCatalogDocument,
-    DisposableAttemptCatalogErrorKind, DisposableAttemptCatalogStore,
-    DisposableAttemptCatalogWriteDisposition, DisposableAttemptReservation,
-    MAX_ACTIVE_DISPOSABLE_ATTEMPTS, MemoryDisposableAttemptCatalogStore,
+    DisposableAttemptCatalog, DisposableAttemptCatalogAction, DisposableAttemptCatalogCodecError,
+    DisposableAttemptCatalogCodecErrorKind, DisposableAttemptCatalogDocument,
+    DisposableAttemptCatalogError, DisposableAttemptCatalogErrorKind,
+    DisposableAttemptCatalogRevision, DisposableAttemptCatalogStore,
+    DisposableAttemptCatalogWriteDisposition, DisposableAttemptCatalogWriteReceipt,
+    DisposableAttemptReservation, MAX_ACTIVE_DISPOSABLE_ATTEMPTS,
+    MemoryDisposableAttemptCatalogStore, decode_disposable_attempt_catalog,
+    encode_disposable_attempt_catalog,
 };
-use smolrunner::disposable_attempt_state::{DisposableAttemptRevision, DisposableAttemptState};
+use smolrunner::disposable_attempt_state::{
+    DisposableAttemptRevision, DisposableAttemptState, decode_disposable_attempt_state,
+    encode_disposable_attempt_state,
+};
 use smolrunner::disposable_prepared_template::{
     DisposablePreparedTemplateIdentity, current_disposable_prepared_template,
     decode_disposable_prepared_template, encode_disposable_prepared_template,
 };
 use smolrunner::disposable_worker_reconciler::{
     CapacityClaimId, DisposableAttemptId, DisposableAttemptPhase, DisposableVmId,
-    DisposableVmIdentity, DisposableWorkerResources,
+    DisposableWorkerResources,
 };
 use smolrunner::execution_admission::EpochMillis;
 use smolrunner::github_scale_set_protocol::{
     ScaleSetJobId, ScaleSetJobResult, ScaleSetRunnerId, ScaleSetRunnerName, ScaleSetRunnerReference,
 };
 
-type Catalog = DisposableAttemptCatalog<MemoryDisposableAttemptCatalogStore>;
+type Catalog = DisposableAttemptCatalog<FixtureStore>;
+
+#[derive(Debug, Default)]
+struct FixtureStore {
+    document: Option<DisposableAttemptCatalogDocument>,
+}
+
+impl FixtureStore {
+    fn with_document(document: DisposableAttemptCatalogDocument) -> Self {
+        Self {
+            document: Some(document),
+        }
+    }
+}
+
+impl DisposableAttemptCatalogStore for FixtureStore {
+    fn load(
+        &self,
+    ) -> Result<Option<DisposableAttemptCatalogDocument>, DisposableAttemptCatalogError> {
+        Ok(self.document.clone())
+    }
+
+    fn create(
+        &mut self,
+        document: &DisposableAttemptCatalogDocument,
+    ) -> Result<DisposableAttemptCatalogWriteReceipt, DisposableAttemptCatalogError> {
+        assert!(self.document.is_none());
+        self.document = Some(document.clone());
+        Ok(DisposableAttemptCatalogWriteReceipt::new(
+            DisposableAttemptCatalogWriteDisposition::Created,
+            document.revision(),
+            None,
+        ))
+    }
+
+    fn replace_if_revision(
+        &mut self,
+        expected_revision: DisposableAttemptCatalogRevision,
+        document: &DisposableAttemptCatalogDocument,
+    ) -> Result<DisposableAttemptCatalogWriteReceipt, DisposableAttemptCatalogError> {
+        assert_eq!(
+            self.document.as_ref().map(|current| current.revision()),
+            Some(expected_revision)
+        );
+        self.document = Some(document.clone());
+        Ok(DisposableAttemptCatalogWriteReceipt::new(
+            DisposableAttemptCatalogWriteDisposition::Replaced,
+            document.revision(),
+            None,
+        ))
+    }
+}
 
 fn template_digest() -> DisposablePreparedTemplateIdentity {
     current_disposable_prepared_template()
@@ -31,8 +89,66 @@ fn other_template_digest() -> DisposablePreparedTemplateIdentity {
     changed_template_identity()
 }
 
-fn vm_identity(index: usize) -> DisposableVmIdentity {
-    DisposableVmIdentity::parse(&format!("sha256:{index:064x}")).unwrap()
+fn try_bind_vm_fixture(
+    document: &DisposableAttemptCatalogDocument,
+    index: usize,
+    identity_index: usize,
+) -> Result<DisposableAttemptCatalogDocument, DisposableAttemptCatalogCodecError> {
+    let attempt_id = DisposableAttemptId::parse(&format!("attempt-{index}")).unwrap();
+    let current_attempt = document.find_active(&attempt_id).unwrap().attempt();
+    assert_eq!(
+        current_attempt.phase(),
+        DisposableAttemptPhase::CloneStarted
+    );
+    assert!(current_attempt.vm_identity().is_none());
+
+    let current_attempt_json =
+        String::from_utf8(encode_disposable_attempt_state(current_attempt).unwrap()).unwrap();
+    let mut next_attempt_json = current_attempt_json.clone();
+    next_attempt_json = next_attempt_json.replacen(
+        &format!("\"revision\":{}", current_attempt.revision().get()),
+        &format!("\"revision\":{}", current_attempt.revision().get() + 1),
+        1,
+    );
+    next_attempt_json = next_attempt_json.replacen(
+        &format!("\"vm_id\":\"vm-{index}\",\"runner_name\""),
+        &format!(
+            "\"vm_id\":\"vm-{index}\",\"vm_identity_digest\":\"sha256:{identity_index:064x}\",\"runner_name\""
+        ),
+        1,
+    );
+    let bound_attempt = decode_disposable_attempt_state(next_attempt_json.as_bytes()).unwrap();
+    let current_attempt_value: serde_json::Value =
+        serde_json::from_str(&current_attempt_json).unwrap();
+    let current_catalog_attempt_json = serde_json::to_string(&current_attempt_value).unwrap();
+    let bound_attempt_value: serde_json::Value =
+        serde_json::from_slice(&encode_disposable_attempt_state(&bound_attempt).unwrap()).unwrap();
+    let bound_catalog_attempt_json = serde_json::to_string(&bound_attempt_value).unwrap();
+
+    let mut catalog_json =
+        String::from_utf8(encode_disposable_attempt_catalog(document).unwrap()).unwrap();
+    catalog_json = catalog_json.replacen(
+        &format!("\"revision\":{}", document.revision().get()),
+        &format!("\"revision\":{}", document.revision().get() + 1),
+        1,
+    );
+    catalog_json = catalog_json.replacen(
+        &current_catalog_attempt_json,
+        &bound_catalog_attempt_json,
+        1,
+    );
+    decode_disposable_attempt_catalog(catalog_json.as_bytes())
+}
+
+fn bind_vm_fixture(
+    catalog: &mut Catalog,
+    document: &DisposableAttemptCatalogDocument,
+    index: usize,
+    identity_index: usize,
+) -> DisposableAttemptCatalogDocument {
+    let bound = try_bind_vm_fixture(document, index, identity_index).unwrap();
+    *catalog = Catalog::new(FixtureStore::with_document(bound.clone()));
+    bound
 }
 
 fn changed_template_identity() -> DisposablePreparedTemplateIdentity {
@@ -83,7 +199,7 @@ fn runner(index: usize, id: u64) -> ScaleSetRunnerReference {
 }
 
 fn initialized() -> (Catalog, DisposableAttemptCatalogDocument) {
-    let mut catalog = DisposableAttemptCatalog::new(MemoryDisposableAttemptCatalogStore::default());
+    let mut catalog = DisposableAttemptCatalog::new(FixtureStore::default());
     let (document, receipt) = catalog.initialize().unwrap();
     assert_eq!(
         receipt.disposition,
@@ -216,7 +332,7 @@ fn raw_store_refuses_unrelated_revision_successors() {
 }
 
 #[test]
-fn raw_store_refuses_vm_identity_rebinding_during_a_legal_phase_advance() {
+fn raw_store_refuses_first_vm_identity_binding() {
     let (mut current_catalog, empty) = initialized();
     let (reserved, _) = current_catalog
         .reserve(empty.revision(), reservation(1))
@@ -233,45 +349,11 @@ fn raw_store_refuses_vm_identity_rebinding_during_a_legal_phase_advance() {
         1,
         DisposableAttemptCatalogAction::RecordCloneStarted,
     );
-    let bound = transition(
-        &mut current_catalog,
-        &started,
-        1,
-        DisposableAttemptCatalogAction::RecordVmIdentity(vm_identity(1)),
-    );
-
-    let (mut alternate_catalog, alternate_empty) = initialized();
-    let (alternate_reserved, _) = alternate_catalog
-        .reserve(alternate_empty.revision(), reservation(1))
-        .unwrap();
-    let alternate_authorized = transition(
-        &mut alternate_catalog,
-        &alternate_reserved,
-        1,
-        DisposableAttemptCatalogAction::AuthorizeClone,
-    );
-    let alternate_started = transition(
-        &mut alternate_catalog,
-        &alternate_authorized,
-        1,
-        DisposableAttemptCatalogAction::RecordCloneStarted,
-    );
-    let alternate_bound = transition(
-        &mut alternate_catalog,
-        &alternate_started,
-        1,
-        DisposableAttemptCatalogAction::RecordVmIdentity(vm_identity(2)),
-    );
-    let forged_cleanup = transition(
-        &mut alternate_catalog,
-        &alternate_bound,
-        1,
-        DisposableAttemptCatalogAction::BeginCleanup,
-    );
+    let bound = bind_vm_fixture(&mut current_catalog, &started, 1, 1);
 
     let mut store = MemoryDisposableAttemptCatalogStore::default();
     store.create(&empty).unwrap();
-    for document in [&reserved, &authorized, &started, &bound] {
+    for document in [&reserved, &authorized, &started] {
         let current = store.load().unwrap().unwrap();
         store
             .replace_if_revision(current.revision(), document)
@@ -279,12 +361,12 @@ fn raw_store_refuses_vm_identity_rebinding_during_a_legal_phase_advance() {
     }
     assert_eq!(
         store
-            .replace_if_revision(bound.revision(), &forged_cleanup)
-            .expect_err("phase advance cannot rebind the observed VM identity")
+            .replace_if_revision(started.revision(), &bound)
+            .expect_err("raw store replacement cannot manufacture clone provenance")
             .kind(),
         DisposableAttemptCatalogErrorKind::Conflict
     );
-    assert_eq!(store.load().unwrap(), Some(bound));
+    assert_eq!(store.load().unwrap(), Some(started));
 }
 
 #[test]
@@ -304,12 +386,7 @@ fn one_observed_vm_identity_cannot_be_owned_by_two_attempts() {
         1,
         DisposableAttemptCatalogAction::RecordCloneStarted,
     );
-    let one_bound = transition(
-        &mut catalog,
-        &one_started,
-        1,
-        DisposableAttemptCatalogAction::RecordVmIdentity(vm_identity(7)),
-    );
+    let one_bound = bind_vm_fixture(&mut catalog, &one_started, 1, 7);
     let two_authorized = transition(
         &mut catalog,
         &one_bound,
@@ -322,22 +399,11 @@ fn one_observed_vm_identity_cannot_be_owned_by_two_attempts() {
         2,
         DisposableAttemptCatalogAction::RecordCloneStarted,
     );
-    let attempt_id = DisposableAttemptId::parse("attempt-2").unwrap();
     assert_eq!(
-        catalog
-            .transition(
-                two_started.revision(),
-                &attempt_id,
-                two_started
-                    .find_active(&attempt_id)
-                    .unwrap()
-                    .attempt()
-                    .revision(),
-                DisposableAttemptCatalogAction::RecordVmIdentity(vm_identity(7)),
-            )
+        try_bind_vm_fixture(&two_started, 2, 7)
             .expect_err("one exact VM object cannot satisfy two durable attempts")
             .kind(),
-        DisposableAttemptCatalogErrorKind::CorruptState
+        DisposableAttemptCatalogCodecErrorKind::CorruptState
     );
 }
 
@@ -480,12 +546,7 @@ fn duplicate_terminal_observation_is_satisfied_without_catalog_churn() {
         1,
         DisposableAttemptCatalogAction::RecordCloneStarted,
     );
-    let started = transition(
-        &mut catalog,
-        &started,
-        1,
-        DisposableAttemptCatalogAction::RecordVmIdentity(vm_identity(1)),
-    );
+    let started = bind_vm_fixture(&mut catalog, &started, 1, 1);
     let job = ScaleSetJobId::parse("opaque-job-1").unwrap();
     let result = ScaleSetJobResult::parse("future-service-result").unwrap();
 
@@ -543,12 +604,7 @@ fn identity_drift_remains_distinct_from_an_illegal_phase_action() {
         1,
         DisposableAttemptCatalogAction::RecordCloneStarted,
     );
-    let started = transition(
-        &mut catalog,
-        &started,
-        1,
-        DisposableAttemptCatalogAction::RecordVmIdentity(vm_identity(1)),
-    );
+    let started = bind_vm_fixture(&mut catalog, &started, 1, 1);
     let registering = transition(
         &mut catalog,
         &started,
@@ -596,12 +652,7 @@ fn completed_attempt_releases_usage_then_moves_to_bounded_replay_history() {
         1,
         DisposableAttemptCatalogAction::RecordCloneStarted,
     );
-    let started = transition(
-        &mut catalog,
-        &started,
-        1,
-        DisposableAttemptCatalogAction::RecordVmIdentity(vm_identity(1)),
-    );
+    let started = bind_vm_fixture(&mut catalog, &started, 1, 1);
     let terminal = transition(
         &mut catalog,
         &started,
@@ -712,12 +763,7 @@ fn exact_runner_ids_cannot_be_reused_across_concurrent_attempts() {
         1,
         DisposableAttemptCatalogAction::RecordCloneStarted,
     );
-    let one_started = transition(
-        &mut catalog,
-        &one_started,
-        1,
-        DisposableAttemptCatalogAction::RecordVmIdentity(vm_identity(1)),
-    );
+    let one_started = bind_vm_fixture(&mut catalog, &one_started, 1, 1);
     let one_registering = transition(
         &mut catalog,
         &one_started,
@@ -743,12 +789,7 @@ fn exact_runner_ids_cannot_be_reused_across_concurrent_attempts() {
         2,
         DisposableAttemptCatalogAction::RecordCloneStarted,
     );
-    let two_started = transition(
-        &mut catalog,
-        &two_started,
-        2,
-        DisposableAttemptCatalogAction::RecordVmIdentity(vm_identity(2)),
-    );
+    let two_started = bind_vm_fixture(&mut catalog, &two_started, 2, 2);
     let two_registering = transition(
         &mut catalog,
         &two_started,
@@ -799,12 +840,7 @@ fn exact_job_ids_cannot_be_reused_across_concurrent_attempts() {
         1,
         DisposableAttemptCatalogAction::RecordCloneStarted,
     );
-    let one_started = transition(
-        &mut catalog,
-        &one_started,
-        1,
-        DisposableAttemptCatalogAction::RecordVmIdentity(vm_identity(1)),
-    );
+    let one_started = bind_vm_fixture(&mut catalog, &one_started, 1, 1);
     let one_terminal = transition(
         &mut catalog,
         &one_started,
@@ -821,12 +857,7 @@ fn exact_job_ids_cannot_be_reused_across_concurrent_attempts() {
         2,
         DisposableAttemptCatalogAction::RecordCloneStarted,
     );
-    let two_started = transition(
-        &mut catalog,
-        &two_started,
-        2,
-        DisposableAttemptCatalogAction::RecordVmIdentity(vm_identity(2)),
-    );
+    let two_started = bind_vm_fixture(&mut catalog, &two_started, 2, 2);
     let attempt_id = DisposableAttemptId::parse("attempt-2").unwrap();
     let duplicate_job_id = catalog
         .transition(

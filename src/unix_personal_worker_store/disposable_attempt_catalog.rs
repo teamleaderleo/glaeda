@@ -8,6 +8,9 @@ use crate::disposable_attempt_catalog::{
     DisposableAttemptCatalogWriteReceipt, MAX_DISPOSABLE_ATTEMPT_CATALOG_DOCUMENT_BYTES,
     decode_disposable_attempt_catalog, encode_disposable_attempt_catalog,
 };
+use crate::disposable_attempt_state::DisposableAttemptRevision;
+use crate::disposable_worker_reconciler::{DisposableAttemptId, DisposableVmIdentity};
+use crate::lima_host_identity::LimaHostIdentityObservation;
 
 const CATALOG_DOCUMENT: &str = "disposable-attempt-catalog.json";
 const STAGED_CATALOG_DOCUMENT: &str = ".disposable-attempt-catalog.next.json";
@@ -84,7 +87,7 @@ impl UnixPersonalWorkerStore {
                     .is_some_and(|next| staged.revision().get() == next) =>
             {
                 staged
-                    .validate_successor_of(&current)
+                    .validate_recovery_successor_of(&current)
                     .map_err(|_| corrupt())?;
                 Ok(RecoveryPlan::PublishStaged { no_replace: false })
             }
@@ -101,6 +104,95 @@ impl UnixPersonalWorkerStore {
                 "personal-worker recovery must complete before disposable-attempt mutation",
             )),
         }
+    }
+
+    /// Confirm absence, checkpoint clone start, execute once, and bind the observed result.
+    ///
+    /// Both closures run while the canonical mutation lock is held. The first closure must retain
+    /// the exact absent-target and prepared-source evidence needed by the command. The second runs
+    /// only after `CloneStarted` is durable and must return the sealed descriptor-held Lima host
+    /// observation produced after the fixed clone command succeeds. Command failure leaves the
+    /// unbound `CloneStarted` checkpoint; ordinary reconciliation then protects any present
+    /// same-name VM.
+    #[allow(dead_code)]
+    pub(crate) fn execute_confirmed_disposable_clone<T, E, C>(
+        &mut self,
+        expected_catalog_revision: DisposableAttemptCatalogRevision,
+        attempt_id: &DisposableAttemptId,
+        expected_attempt_revision: DisposableAttemptRevision,
+        confirm: impl FnOnce(&DisposableAttemptCatalogDocument) -> Result<C, E>,
+        execute: impl FnOnce(
+            &DisposableAttemptCatalogDocument,
+            C,
+        ) -> Result<(T, LimaHostIdentityObservation), E>,
+    ) -> Result<Result<(DisposableAttemptCatalogDocument, T), E>, DisposableAttemptCatalogError>
+    {
+        self.execute_confirmed_disposable_clone_with_identity(
+            expected_catalog_revision,
+            attempt_id,
+            expected_attempt_revision,
+            confirm,
+            execute,
+            |observation| DisposableVmIdentity::from_host_identity(observation.identity()),
+        )
+    }
+
+    fn execute_confirmed_disposable_clone_with_identity<T, E, C, I>(
+        &mut self,
+        expected_catalog_revision: DisposableAttemptCatalogRevision,
+        attempt_id: &DisposableAttemptId,
+        expected_attempt_revision: DisposableAttemptRevision,
+        confirm: impl FnOnce(&DisposableAttemptCatalogDocument) -> Result<C, E>,
+        execute: impl FnOnce(&DisposableAttemptCatalogDocument, C) -> Result<(T, I), E>,
+        identity_from_evidence: impl FnOnce(&I) -> DisposableVmIdentity,
+    ) -> Result<Result<(DisposableAttemptCatalogDocument, T), E>, DisposableAttemptCatalogError>
+    {
+        let _lock = self.acquire_mutation_lock().map_err(map_personal_error)?;
+        synchronize_catalog_directory(self)?;
+        super::disposable_template_generation::refuse_unsettled(self)
+            .map_err(map_personal_error)?;
+        refuse_unsettled_lima_authority(self)?;
+        self.refuse_unsettled_personal_worker_state()?;
+        self.recover_catalog_locked()?;
+        let current = self.load_catalog_named(CATALOG_DOCUMENT)?.ok_or_else(|| {
+            public(
+                DisposableAttemptCatalogErrorKind::Missing,
+                "disposable-attempt catalog does not exist",
+            )
+        })?;
+        if current.revision() != expected_catalog_revision {
+            return Err(public(
+                DisposableAttemptCatalogErrorKind::Conflict,
+                "disposable-attempt catalog revision changed before clone execution",
+            ));
+        }
+        let retained = match confirm(&current) {
+            Ok(retained) => retained,
+            Err(error) => return Ok(Err(error)),
+        };
+        let started = current.checkpoint_clone_started(attempt_id, expected_attempt_revision)?;
+        started.validate_successor_of(&current)?;
+        let mut staged = self.stage_catalog(&started)?;
+        self.publish_named_staged(&mut staged, CATALOG_DOCUMENT, false)
+            .map_err(map_personal_error)?;
+
+        let (value, identity_evidence) = match execute(&started, retained) {
+            Ok(result) => result,
+            Err(error) => return Ok(Err(error)),
+        };
+        let identity = identity_from_evidence(&identity_evidence);
+        let started_attempt_revision = started
+            .find_active(attempt_id)
+            .ok_or_else(corrupt)?
+            .attempt()
+            .revision();
+        let bound =
+            started.bind_vm_identity_after_clone(attempt_id, started_attempt_revision, identity)?;
+        bound.validate_recovery_successor_of(&started)?;
+        let mut staged = self.stage_catalog(&bound)?;
+        self.publish_named_staged(&mut staged, CATALOG_DOCUMENT, false)
+            .map_err(map_personal_error)?;
+        Ok(Ok((bound, value)))
     }
 
     fn stage_catalog(
@@ -393,7 +485,8 @@ mod tests {
         decode_disposable_prepared_template, encode_disposable_prepared_template,
     };
     use crate::disposable_worker_reconciler::{
-        CapacityClaimId, DisposableAttemptId, DisposableVmId, DisposableWorkerResources,
+        CapacityClaimId, DisposableAttemptId, DisposableAttemptPhase, DisposableVmId,
+        DisposableWorkerResources,
     };
     use crate::execution_admission::EpochMillis;
     use crate::github_scale_set_protocol::ScaleSetRunnerName;
@@ -541,6 +634,130 @@ mod tests {
             UnixPersonalWorkerStore::open_or_create_disposable_catalog(root.path()).unwrap();
         let catalog = DisposableAttemptCatalog::new(store);
         assert_eq!(catalog.load().unwrap(), provisioning);
+    }
+
+    #[test]
+    fn private_clone_transaction_binds_only_the_successfully_observed_result() {
+        let root = TempRoot::new("clone-bind");
+        let store =
+            UnixPersonalWorkerStore::open_or_create_disposable_catalog(root.path()).unwrap();
+        let mut catalog = DisposableAttemptCatalog::new(store);
+        let (empty, _) = catalog.initialize().unwrap();
+        let (reserved, _) = catalog.reserve(empty.revision(), reservation(1)).unwrap();
+        let attempt_id = DisposableAttemptId::parse("attempt-1").unwrap();
+        let (authorized, _) = catalog
+            .transition(
+                reserved.revision(),
+                &attempt_id,
+                reserved
+                    .find_active(&attempt_id)
+                    .unwrap()
+                    .attempt()
+                    .revision(),
+                DisposableAttemptCatalogAction::AuthorizeClone,
+            )
+            .unwrap();
+        let expected_attempt_revision = authorized
+            .find_active(&attempt_id)
+            .unwrap()
+            .attempt()
+            .revision();
+        let mut store = catalog.into_store();
+
+        let (bound, value) = store
+            .execute_confirmed_disposable_clone_with_identity(
+                authorized.revision(),
+                &attempt_id,
+                expected_attempt_revision,
+                |current| {
+                    assert_eq!(
+                        current.find_active(&attempt_id).unwrap().attempt().phase(),
+                        DisposableAttemptPhase::CloneAuthorized
+                    );
+                    Ok::<_, &'static str>("retained-absence")
+                },
+                |started, retained| {
+                    assert_eq!(retained, "retained-absence");
+                    assert_eq!(
+                        started.find_active(&attempt_id).unwrap().attempt().phase(),
+                        DisposableAttemptPhase::CloneStarted
+                    );
+                    Ok::<_, &'static str>((
+                        41_u8,
+                        DisposableVmIdentity::parse(&format!("sha256:{}", "33".repeat(32)))
+                            .unwrap(),
+                    ))
+                },
+                Clone::clone,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(value, 41);
+        assert!(
+            bound
+                .find_active(&attempt_id)
+                .unwrap()
+                .attempt()
+                .vm_identity()
+                .is_some()
+        );
+        drop(store);
+
+        let reopened =
+            UnixPersonalWorkerStore::open_or_create_disposable_catalog(root.path()).unwrap();
+        assert_eq!(
+            DisposableAttemptCatalog::new(reopened).load().unwrap(),
+            bound
+        );
+    }
+
+    #[test]
+    fn failed_clone_leaves_unbound_started_recovery_debt() {
+        let root = TempRoot::new("clone-failure");
+        let store =
+            UnixPersonalWorkerStore::open_or_create_disposable_catalog(root.path()).unwrap();
+        let mut catalog = DisposableAttemptCatalog::new(store);
+        let (empty, _) = catalog.initialize().unwrap();
+        let (reserved, _) = catalog.reserve(empty.revision(), reservation(1)).unwrap();
+        let attempt_id = DisposableAttemptId::parse("attempt-1").unwrap();
+        let (authorized, _) = catalog
+            .transition(
+                reserved.revision(),
+                &attempt_id,
+                reserved
+                    .find_active(&attempt_id)
+                    .unwrap()
+                    .attempt()
+                    .revision(),
+                DisposableAttemptCatalogAction::AuthorizeClone,
+            )
+            .unwrap();
+        let expected_attempt_revision = authorized
+            .find_active(&attempt_id)
+            .unwrap()
+            .attempt()
+            .revision();
+        let mut store = catalog.into_store();
+
+        let outcome = store
+            .execute_confirmed_disposable_clone_with_identity::<(), _, _, DisposableVmIdentity>(
+                authorized.revision(),
+                &attempt_id,
+                expected_attempt_revision,
+                |_| Ok::<_, &'static str>(()),
+                |_, ()| Err("clone failed"),
+                Clone::clone,
+            )
+            .unwrap();
+        assert_eq!(outcome.unwrap_err(), "clone failed");
+        drop(store);
+
+        let reopened =
+            UnixPersonalWorkerStore::open_or_create_disposable_catalog(root.path()).unwrap();
+        let current = DisposableAttemptCatalog::new(reopened).load().unwrap();
+        let attempt = current.find_active(&attempt_id).unwrap().attempt();
+        assert_eq!(attempt.phase(), DisposableAttemptPhase::CloneStarted);
+        assert!(attempt.vm_identity().is_none());
     }
 
     #[test]

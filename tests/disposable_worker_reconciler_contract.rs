@@ -51,14 +51,51 @@ fn result(value: &str) -> ScaleSetJobResult {
 }
 
 fn vm_identity() -> &'static DisposableVmIdentity {
-    static IDENTITY: LazyLock<DisposableVmIdentity> = LazyLock::new(|| {
-        DisposableVmIdentity::parse(&format!("sha256:{}", "11".repeat(32))).unwrap()
+    static BOUND: LazyLock<DisposableAttemptState> = LazyLock::new(|| {
+        bind_vm(
+            attempt()
+                .authorize_clone()
+                .unwrap()
+                .record_clone_started()
+                .unwrap(),
+        )
     });
-    &IDENTITY
+    BOUND.vm_identity().unwrap()
 }
 
 fn bind_vm(state: DisposableAttemptState) -> DisposableAttemptState {
-    state.record_vm_identity(vm_identity().clone()).unwrap()
+    bind_vm_with_byte(state, "11")
+}
+
+fn bind_vm_with_byte(state: DisposableAttemptState, digest_byte: &str) -> DisposableAttemptState {
+    assert_eq!(state.phase(), DisposableAttemptPhase::CloneStarted);
+    let revision = state.revision().get();
+    let mut encoded = String::from_utf8(encode_disposable_attempt_state(&state).unwrap()).unwrap();
+    encoded = encoded.replacen(
+        &format!("\"revision\":{revision}"),
+        &format!("\"revision\":{}", revision + 1),
+        1,
+    );
+    encoded = encoded.replacen(
+        &format!("\"vm_id\":\"{}\"", state.vm_id().as_str()),
+        &format!(
+            "\"vm_id\":\"{}\",\"vm_identity_digest\":\"sha256:{}\"",
+            state.vm_id().as_str(),
+            digest_byte.repeat(32)
+        ),
+        1,
+    );
+    decode_disposable_attempt_state(encoded.as_bytes()).unwrap()
+}
+
+trait BindVmFixture {
+    fn bind_vm_fixture(self) -> Self;
+}
+
+impl BindVmFixture for DisposableAttemptState {
+    fn bind_vm_fixture(self) -> Self {
+        bind_vm(self)
+    }
 }
 
 fn input<'a>(
@@ -97,9 +134,6 @@ fn apply(
         DisposableAttemptCatalogAction::BeginProvisioning => state.begin_provisioning(),
         DisposableAttemptCatalogAction::AuthorizeClone => state.authorize_clone(),
         DisposableAttemptCatalogAction::RecordCloneStarted => state.record_clone_started(),
-        DisposableAttemptCatalogAction::RecordVmIdentity(identity) => {
-            state.record_vm_identity(identity.clone())
-        }
         DisposableAttemptCatalogAction::BeginUnprovisionedRelease => {
             state.begin_unprovisioned_release()
         }
@@ -219,19 +253,18 @@ fn happy_path_uses_canonical_durable_transitions() {
         DisposableWorkerAction::CheckpointAndCloneVm
     );
     state = state.record_clone_started().unwrap();
-    let action = reconcile_attempt(input(
-        &state,
-        DisposableVmObservation::Ready,
-        ScaleSetRunnerObservation::Absent,
-    ))
-    .unwrap();
     assert_eq!(
-        action,
-        persist(DisposableAttemptCatalogAction::RecordVmIdentity(
-            vm_identity().clone()
+        reconcile_attempt(input(
+            &state,
+            DisposableVmObservation::Ready,
+            ScaleSetRunnerObservation::Absent,
         ))
+        .unwrap(),
+        DisposableWorkerAction::Blocked {
+            code: "unbound_vm_recovery_required"
+        }
     );
-    state = apply(&state, &action);
+    state = bind_vm(state);
     let action = reconcile_attempt(input(
         &state,
         DisposableVmObservation::Ready,
@@ -319,19 +352,18 @@ fn stopped_partial_clone_is_discarded_only_after_clone_start() {
         .unwrap(),
         persist(DisposableAttemptCatalogAction::BeginCleanup)
     );
-    let bind = reconcile_attempt(input(
-        &provisioning,
-        DisposableVmObservation::Stopped,
-        ScaleSetRunnerObservation::Absent,
-    ))
-    .unwrap();
     assert_eq!(
-        bind,
-        persist(DisposableAttemptCatalogAction::RecordVmIdentity(
-            vm_identity().clone()
+        reconcile_attempt(input(
+            &provisioning,
+            DisposableVmObservation::Stopped,
+            ScaleSetRunnerObservation::Absent,
         ))
+        .unwrap(),
+        DisposableWorkerAction::Blocked {
+            code: "unbound_vm_recovery_required"
+        }
     );
-    let provisioning = apply(&provisioning, &bind);
+    let provisioning = bind_vm(provisioning);
     assert_eq!(
         reconcile_attempt(input(
             &provisioning,
@@ -366,52 +398,45 @@ fn stopped_partial_clone_is_discarded_only_after_clone_start() {
 }
 
 #[test]
-fn present_vm_is_bound_before_adoption_or_cleanup_and_replacement_drift_blocks() {
+fn unbound_present_vm_is_protected_and_bound_replacement_drift_blocks() {
     let started = attempt()
         .authorize_clone()
         .unwrap()
         .record_clone_started()
         .unwrap();
-    let bind = reconcile_attempt(input(
-        &started,
-        DisposableVmObservation::Ready,
-        ScaleSetRunnerObservation::Absent,
-    ))
-    .unwrap();
     assert_eq!(
-        bind,
-        persist(DisposableAttemptCatalogAction::RecordVmIdentity(
-            vm_identity().clone()
+        reconcile_attempt(input(
+            &started,
+            DisposableVmObservation::Ready,
+            ScaleSetRunnerObservation::Absent,
         ))
+        .unwrap(),
+        DisposableWorkerAction::Blocked {
+            code: "unbound_vm_recovery_required"
+        }
     );
-    let bound = apply(&started, &bind);
+    let bound = bind_vm(started.clone());
 
-    let replacement = DisposableVmIdentity::parse(&format!("sha256:{}", "55".repeat(32))).unwrap();
+    let replacement_state = bind_vm_with_byte(started, "55");
+    let replacement = replacement_state.vm_identity().unwrap();
     let mut replaced = input(
         &bound,
         DisposableVmObservation::Ready,
         ScaleSetRunnerObservation::Absent,
     );
-    replaced.vm_identity = Some(&replacement);
+    replaced.vm_identity = Some(replacement);
     assert_eq!(
         reconcile_attempt(replaced).unwrap_err().code(),
         "vm_identity_drift"
     );
 
-    let destroying = started.begin_cleanup().unwrap();
-    let bind_for_cleanup = reconcile_attempt(input(
-        &destroying,
-        DisposableVmObservation::Stopped,
-        ScaleSetRunnerObservation::Absent,
-    ))
-    .unwrap();
-    assert!(matches!(
-        bind_for_cleanup,
-        DisposableWorkerAction::Persist {
-            transition: DisposableAttemptCatalogAction::RecordVmIdentity(_)
-        }
-    ));
-    let destroying = apply(&destroying, &bind_for_cleanup);
+    let destroying = attempt()
+        .authorize_clone()
+        .unwrap()
+        .record_clone_started()
+        .unwrap()
+        .begin_cleanup()
+        .unwrap();
     assert_eq!(
         reconcile_attempt(input(
             &destroying,
@@ -419,7 +444,9 @@ fn present_vm_is_bound_before_adoption_or_cleanup_and_replacement_drift_blocks()
             ScaleSetRunnerObservation::Absent,
         ))
         .unwrap(),
-        DisposableWorkerAction::DestroyVm
+        DisposableWorkerAction::Blocked {
+            code: "unbound_vm_recovery_required"
+        }
     );
 }
 
@@ -536,8 +563,7 @@ fn terminal_cleanup_orders_vm_runner_and_capacity_release() {
         .unwrap()
         .record_clone_started()
         .unwrap()
-        .record_vm_identity(vm_identity().clone())
-        .unwrap()
+        .bind_vm_fixture()
         .begin_registration()
         .unwrap()
         .record_assigned(job("job-cleanup"))
@@ -756,8 +782,7 @@ fn duplicate_job_event_is_a_no_op_but_identity_drift_is_refused() {
         .unwrap()
         .record_clone_started()
         .unwrap()
-        .record_vm_identity(vm_identity().clone())
-        .unwrap()
+        .bind_vm_fixture()
         .begin_registration()
         .unwrap()
         .record_runner_ready(&exact_runner)
@@ -805,8 +830,7 @@ fn late_duplicate_event_does_not_reverse_cleanup() {
         .unwrap()
         .record_clone_started()
         .unwrap()
-        .record_vm_identity(vm_identity().clone())
-        .unwrap()
+        .bind_vm_fixture()
         .record_terminal(Some(&exact_runner), job("job-late"), result("succeeded"))
         .unwrap()
         .begin_cleanup()
@@ -837,8 +861,7 @@ fn first_late_job_events_are_checkpointed_without_reversing_cleanup() {
         .unwrap()
         .record_clone_started()
         .unwrap()
-        .record_vm_identity(vm_identity().clone())
-        .unwrap()
+        .bind_vm_fixture()
         .begin_cleanup()
         .unwrap();
     let mut started = input(

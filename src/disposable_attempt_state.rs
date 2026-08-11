@@ -168,10 +168,6 @@ impl DisposableAttemptState {
         };
         if matches(current.authorize_clone())
             || matches(current.record_clone_started())
-            || self
-                .vm_identity
-                .as_ref()
-                .is_some_and(|identity| matches(current.record_vm_identity(identity.clone())))
             || matches(current.begin_unprovisioned_release())
             || matches(current.complete_unprovisioned())
             || matches(current.begin_registration())
@@ -237,8 +233,8 @@ impl DisposableAttemptState {
         )
     }
 
-    /// Bind the exact observed clone identity before adoption or deletion.
-    pub fn record_vm_identity(
+    /// Bind the exact observed clone identity from the private clone-completion transaction.
+    pub(crate) fn record_vm_identity(
         &self,
         identity: DisposableVmIdentity,
     ) -> Result<Self, DisposableAttemptStateError> {
@@ -251,15 +247,9 @@ impl DisposableAttemptState {
                 ))
             };
         }
-        if !matches!(
-            self.phase,
-            DisposableAttemptPhase::CloneStarted
-                | DisposableAttemptPhase::Destroying
-                | DisposableAttemptPhase::Deregistering
-                | DisposableAttemptPhase::Releasing
-        ) {
+        if self.phase != DisposableAttemptPhase::CloneStarted {
             return Err(invalid_transition(
-                "VM identity can only bind after the durable clone-start checkpoint",
+                "VM identity can only bind during private clone completion",
             ));
         }
         let mut next = self.clone();
