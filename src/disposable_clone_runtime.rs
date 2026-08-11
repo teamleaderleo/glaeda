@@ -16,8 +16,8 @@ use serde::Serialize;
 
 use crate::artifact::Sha256Digest;
 use crate::disposable_attempt_catalog::{
-    DisposableAttemptCatalogDocument, DisposableAttemptCatalogRevision,
-    DisposableAttemptReservation,
+    DisposableAttemptCatalogAction, DisposableAttemptCatalogDocument,
+    DisposableAttemptCatalogRevision, DisposableAttemptReservation,
 };
 use crate::disposable_attempt_state::DisposableAttemptRevision;
 use crate::disposable_lima_worker::{
@@ -97,6 +97,22 @@ impl DisposableCloneAdmissionObservation {
         reservation: &DisposableAttemptReservation,
         now: EpochMillis,
     ) -> Result<(), DisposableCloneRuntimeError> {
+        self.validate_identity_and_freshness_for(catalog, reservation, now)?;
+        if !self.capacity_reserved {
+            return Err(DisposableCloneRuntimeError::recovery("clone_capacity_lost"));
+        }
+        if self.cancellation_requested {
+            return Err(DisposableCloneRuntimeError::recovery("clone_cancelled"));
+        }
+        Ok(())
+    }
+
+    fn validate_identity_and_freshness_for(
+        &self,
+        catalog: &DisposableAttemptCatalogDocument,
+        reservation: &DisposableAttemptReservation,
+        now: EpochMillis,
+    ) -> Result<(), DisposableCloneRuntimeError> {
         if self.catalog_revision != catalog.revision()
             || &self.attempt_id != reservation.attempt().attempt_id()
             || self.attempt_revision != reservation.attempt().revision()
@@ -118,12 +134,6 @@ impl DisposableCloneAdmissionObservation {
                 .is_none_or(|window| window > CLONE_ADMISSION_MAX_MILLIS)
         {
             return Err(observation("clone_admission_stale"));
-        }
-        if !self.capacity_reserved {
-            return Err(DisposableCloneRuntimeError::recovery("clone_capacity_lost"));
-        }
-        if self.cancellation_requested {
-            return Err(DisposableCloneRuntimeError::recovery("clone_cancelled"));
         }
         Ok(())
     }
@@ -228,9 +238,17 @@ pub struct DisposableCloneRuntimeReceipt {
 }
 
 pub(crate) enum DisposableCloneTransactionOutcome {
-    CloneAuthorized { attempt_id: String },
+    CloneAuthorized {
+        attempt_id: String,
+    },
+    RegistrationCheckpointed {
+        attempt_id: String,
+        phase: DisposableAttemptPhase,
+    },
     Completed(DisposableCloneRuntimeReceipt),
-    ScaleSetMessagePersisted { message_id: u32 },
+    ScaleSetMessagePersisted {
+        message_id: u32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -365,6 +383,9 @@ impl DisposableCloneRuntime {
             DisposableCloneTransactionOutcome::Completed(receipt) => Ok(receipt),
             DisposableCloneTransactionOutcome::CloneAuthorized { .. } => Err(
                 DisposableCloneRuntimeError::recovery("clone_authorization_only"),
+            ),
+            DisposableCloneTransactionOutcome::RegistrationCheckpointed { .. } => Err(
+                DisposableCloneRuntimeError::recovery("clone_registration_checkpoint_only"),
             ),
             DisposableCloneTransactionOutcome::ScaleSetMessagePersisted { .. } => Err(
                 DisposableCloneRuntimeError::recovery("clone_scale_set_message_persisted"),
@@ -609,6 +630,115 @@ impl DisposableCloneRuntime {
         })
     }
 
+    pub(crate) fn authorize_registration_locked(
+        &self,
+        catalog: &DisposableAttemptCatalogDocument,
+        attempt_id: &DisposableAttemptId,
+        admission: &impl DisposableCloneAdmissionSource,
+        executor: &impl TimedCommandExecutor,
+        clock: &impl CloneRuntimeClock,
+    ) -> Result<DisposableAttemptCatalogAction, DisposableCloneRuntimeError> {
+        let reservation = catalog
+            .find_active(attempt_id)
+            .ok_or_else(|| DisposableCloneRuntimeError::durable("clone_attempt_missing"))?;
+        if reservation.attempt().phase() != DisposableAttemptPhase::CloneStarted
+            || reservation.attempt().vm_identity().is_none()
+        {
+            return Err(DisposableCloneRuntimeError::recovery(
+                "clone_registration_phase_mismatch",
+            ));
+        }
+        let admission_observation = admission.observe(catalog, reservation)?;
+        let observed_at = clock
+            .epoch_millis()
+            .map_err(|_| observation("clone_clock_unavailable"))?;
+        admission_observation.validate_identity_and_freshness_for(
+            catalog,
+            reservation,
+            observed_at,
+        )?;
+        let cleanup = !admission_observation.capacity_reserved
+            || admission_observation.cancellation_requested
+            || observed_at > reservation.attempt().not_after();
+        if cleanup {
+            let action = reconcile_attempt(DisposableWorkerReconcileInput {
+                now: observed_at,
+                attempt: reservation.attempt(),
+                vm: DisposableVmObservation::Unknown,
+                vm_identity: None,
+                runner: ScaleSetRunnerObservation::Unknown,
+                job_event: None,
+                capacity_reserved: admission_observation.capacity_reserved,
+                cancellation_requested: admission_observation.cancellation_requested,
+            })
+            .map_err(|_| DisposableCloneRuntimeError::recovery("clone_reconcile_failed"))?;
+            if action
+                != (DisposableWorkerAction::Persist {
+                    transition: DisposableAttemptCatalogAction::BeginCleanup,
+                })
+            {
+                return Err(DisposableCloneRuntimeError::recovery(
+                    "clone_cleanup_checkpoint_refused",
+                ));
+            }
+            return Ok(DisposableAttemptCatalogAction::BeginCleanup);
+        }
+
+        let ready = self.confirm_ready_worker_bound(reservation, executor, clock)?;
+        let ready_after_admission =
+            self.confirm_ready_worker_bound(reservation, executor, clock)?;
+        ready
+            .confirm_current()
+            .map_err(|_| observation("clone_worker_identity_drift"))?;
+        ready_after_admission
+            .confirm_current()
+            .map_err(|_| observation("clone_worker_identity_drift"))?;
+        let checkpoint_at = clock
+            .epoch_millis()
+            .map_err(|_| observation("clone_clock_unavailable"))?;
+        if checkpoint_at <= reservation.attempt().not_after() {
+            admission_observation.validate_identity_and_freshness_for(
+                catalog,
+                reservation,
+                checkpoint_at,
+            )?;
+        }
+        let action = reconcile_attempt(DisposableWorkerReconcileInput {
+            now: checkpoint_at,
+            attempt: reservation.attempt(),
+            vm: DisposableVmObservation::Ready,
+            vm_identity: reservation.attempt().vm_identity(),
+            runner: ScaleSetRunnerObservation::Unknown,
+            job_event: None,
+            capacity_reserved: admission_observation.capacity_reserved,
+            cancellation_requested: admission_observation.cancellation_requested,
+        })
+        .map_err(|_| DisposableCloneRuntimeError::recovery("clone_reconcile_failed"))?;
+        let transition = if checkpoint_at > reservation.attempt().not_after() {
+            DisposableAttemptCatalogAction::BeginCleanup
+        } else {
+            DisposableAttemptCatalogAction::BeginRegistration
+        };
+        if action
+            != (DisposableWorkerAction::Persist {
+                transition: transition.clone(),
+            })
+        {
+            return Err(DisposableCloneRuntimeError::recovery(
+                "clone_registration_refused",
+            ));
+        }
+        if transition == DisposableAttemptCatalogAction::BeginRegistration {
+            ready
+                .confirm_current()
+                .map_err(|_| observation("clone_worker_identity_drift"))?;
+            ready_after_admission
+                .confirm_current()
+                .map_err(|_| observation("clone_worker_identity_drift"))?;
+        }
+        Ok(transition)
+    }
+
     /// Reconfirm the exact running clone and its realized isolation policy before JIT handoff.
     pub(crate) fn confirm_ready_worker(
         &self,
@@ -625,6 +755,16 @@ impl DisposableCloneRuntime {
                 "clone_worker_phase_mismatch",
             ));
         }
+        self.confirm_ready_worker_bound(reservation, executor, clock)
+    }
+
+    fn confirm_ready_worker_bound(
+        &self,
+        reservation: &DisposableAttemptReservation,
+        executor: &impl TimedCommandExecutor,
+        clock: &impl CloneRuntimeClock,
+    ) -> Result<ConfirmedDisposableWorker, DisposableCloneRuntimeError> {
+        let attempt = reservation.attempt();
         let expected_identity = attempt.vm_identity().ok_or_else(|| {
             DisposableCloneRuntimeError::recovery("clone_worker_identity_missing")
         })?;
@@ -990,6 +1130,8 @@ mod tests {
 
     struct FixedClock;
 
+    struct FixedMillisClock(u64);
+
     impl LimaObservationClock for FixedClock {
         fn unix_seconds(&self) -> io::Result<u64> {
             Ok(1_900_000_000)
@@ -999,6 +1141,18 @@ mod tests {
     impl CloneRuntimeClock for FixedClock {
         fn epoch_millis(&self) -> io::Result<EpochMillis> {
             EpochMillis::new(1_900_000_000_000).map_err(io::Error::other)
+        }
+    }
+
+    impl LimaObservationClock for FixedMillisClock {
+        fn unix_seconds(&self) -> io::Result<u64> {
+            Ok(self.0 / 1_000)
+        }
+    }
+
+    impl CloneRuntimeClock for FixedMillisClock {
+        fn epoch_millis(&self) -> io::Result<EpochMillis> {
+            EpochMillis::new(self.0).map_err(io::Error::other)
         }
     }
 
@@ -1972,6 +2126,12 @@ mod tests {
         cancel_on: Option<u8>,
     }
 
+    struct FakeAdmissionAt {
+        observed_at: u64,
+        capacity_reserved: bool,
+        cancellation_requested: bool,
+    }
+
     impl FakeAdmission {
         fn available() -> Self {
             Self {
@@ -1983,6 +2143,8 @@ mod tests {
     }
 
     impl admission_seal::Sealed for FakeAdmission {}
+
+    impl admission_seal::Sealed for FakeAdmissionAt {}
 
     impl DisposableCloneAdmissionSource for FakeAdmission {
         fn observe(
@@ -1999,6 +2161,23 @@ mod tests {
                 EpochMillis::new(1_900_000_030_000).unwrap(),
                 self.lose_capacity_on != Some(call),
                 self.cancel_on == Some(call),
+            ))
+        }
+    }
+
+    impl DisposableCloneAdmissionSource for FakeAdmissionAt {
+        fn observe(
+            &self,
+            catalog: &DisposableAttemptCatalogDocument,
+            reservation: &DisposableAttemptReservation,
+        ) -> Result<DisposableCloneAdmissionObservation, DisposableCloneRuntimeError> {
+            Ok(DisposableCloneAdmissionObservation::new(
+                catalog,
+                reservation,
+                EpochMillis::new(self.observed_at).unwrap(),
+                EpochMillis::new(self.observed_at + CLONE_ADMISSION_MAX_MILLIS).unwrap(),
+                self.capacity_reserved,
+                self.cancellation_requested,
             ))
         }
     }
@@ -2645,6 +2824,336 @@ mod tests {
         let attempt = durable_attempt(&root, &attempt_id);
         assert_eq!(attempt.phase(), DisposableAttemptPhase::CloneStarted);
         assert!(attempt.vm_identity().is_none());
+    }
+
+    #[test]
+    fn bound_ready_clone_checkpoints_registration_without_replaying_clone() {
+        let root = TempRoot::new("registration-checkpoint");
+        let host = LimaHostIdentityFixture::new_with_disk_bytes(
+            "clone-runtime-registration-checkpoint",
+            SOURCE,
+            SOURCE_DISK,
+        );
+        let runtime = runtime(&root, &host);
+        install_ready_generation(&root, &host, &runtime);
+        let attempt_id = install_authorized_attempt(&root);
+        let mut executor = executor(&host, false);
+        runtime
+            .clone_once_with(
+                &attempt_id,
+                &FakeAdmission::available(),
+                &executor,
+                &FixedClock,
+            )
+            .unwrap();
+        executor.target_ready = true;
+        let clone_calls = executor.clone_count();
+        let admission = FakeAdmission::available();
+        let mut store =
+            UnixPersonalWorkerStore::open_or_create_disposable_catalog(root.path()).unwrap();
+
+        let outcome = store
+            .checkpoint_disposable_registration_transaction(
+                &runtime,
+                &attempt_id,
+                &admission,
+                &executor,
+                &FixedClock,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            outcome,
+            DisposableCloneTransactionOutcome::RegistrationCheckpointed {
+                ref attempt_id,
+                phase: DisposableAttemptPhase::Registering,
+            } if attempt_id == "attempt-clone-1"
+        ));
+        assert_eq!(executor.clone_count(), clone_calls);
+        assert_eq!(admission.calls.get(), 1);
+        let attempt = durable_attempt(&root, &attempt_id);
+        assert_eq!(attempt.phase(), DisposableAttemptPhase::Registering);
+        assert!(attempt.vm_identity().is_some());
+    }
+
+    #[test]
+    fn registration_vetoes_checkpoint_cleanup_that_survives_reopen() {
+        for (label, lose_capacity_on, cancel_on) in [
+            ("registration-capacity-lost", Some(1), None),
+            ("registration-cancelled", None, Some(1)),
+        ] {
+            let root = TempRoot::new(label);
+            let host = LimaHostIdentityFixture::new_with_disk_bytes(label, SOURCE, SOURCE_DISK);
+            let runtime = runtime(&root, &host);
+            install_ready_generation(&root, &host, &runtime);
+            let attempt_id = install_authorized_attempt(&root);
+            let mut executor = executor(&host, false);
+            runtime
+                .clone_once_with(
+                    &attempt_id,
+                    &FakeAdmission::available(),
+                    &executor,
+                    &FixedClock,
+                )
+                .unwrap();
+            executor.target_ready = true;
+            let clone_calls = executor.clone_count();
+            let admission = FakeAdmission {
+                calls: Cell::new(0),
+                lose_capacity_on,
+                cancel_on,
+            };
+            let mut store =
+                UnixPersonalWorkerStore::open_or_create_disposable_catalog(root.path()).unwrap();
+
+            let outcome = store
+                .checkpoint_disposable_registration_transaction(
+                    &runtime,
+                    &attempt_id,
+                    &admission,
+                    &executor,
+                    &FixedClock,
+                )
+                .unwrap();
+
+            assert!(matches!(
+                outcome,
+                DisposableCloneTransactionOutcome::RegistrationCheckpointed {
+                    phase: DisposableAttemptPhase::Destroying,
+                    ..
+                }
+            ));
+            assert_eq!(executor.clone_count(), clone_calls);
+            drop(store);
+            assert_eq!(
+                durable_attempt(&root, &attempt_id).phase(),
+                DisposableAttemptPhase::Destroying
+            );
+        }
+    }
+
+    #[test]
+    fn expired_unready_clone_checkpoints_cleanup_and_survives_reopen() {
+        let root = TempRoot::new("registration-expired-unready");
+        let host = LimaHostIdentityFixture::new_with_disk_bytes(
+            "registration-expired-unready",
+            SOURCE,
+            SOURCE_DISK,
+        );
+        let runtime = runtime(&root, &host);
+        install_ready_generation(&root, &host, &runtime);
+        let attempt_id = install_authorized_attempt(&root);
+        let executor = executor(&host, false);
+        runtime
+            .clone_once_with(
+                &attempt_id,
+                &FakeAdmission::available(),
+                &executor,
+                &FixedClock,
+            )
+            .unwrap();
+        let admission = FakeAdmissionAt {
+            observed_at: 1_900_000_700_000,
+            capacity_reserved: true,
+            cancellation_requested: false,
+        };
+        let clock = FixedMillisClock(1_900_000_700_000);
+        let mut store =
+            UnixPersonalWorkerStore::open_or_create_disposable_catalog(root.path()).unwrap();
+
+        let outcome = store
+            .checkpoint_disposable_registration_transaction(
+                &runtime,
+                &attempt_id,
+                &admission,
+                &executor,
+                &clock,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            outcome,
+            DisposableCloneTransactionOutcome::RegistrationCheckpointed {
+                phase: DisposableAttemptPhase::Destroying,
+                ..
+            }
+        ));
+        drop(store);
+        assert_eq!(
+            durable_attempt(&root, &attempt_id).phase(),
+            DisposableAttemptPhase::Destroying
+        );
+    }
+
+    #[test]
+    fn clone_expiring_during_ready_probe_checkpoints_cleanup_and_survives_reopen() {
+        let root = TempRoot::new("registration-expired-ready");
+        let host = LimaHostIdentityFixture::new_with_disk_bytes(
+            "registration-expired-ready",
+            SOURCE,
+            SOURCE_DISK,
+        );
+        let runtime = runtime(&root, &host);
+        install_ready_generation(&root, &host, &runtime);
+        let attempt_id = install_authorized_attempt(&root);
+        let mut executor = executor(&host, false);
+        runtime
+            .clone_once_with(
+                &attempt_id,
+                &FakeAdmission::available(),
+                &executor,
+                &FixedClock,
+            )
+            .unwrap();
+        executor.target_ready = true;
+        let clock = SequencedClock {
+            calls: Cell::new(0),
+            final_millis: 1_900_000_700_000,
+        };
+        let mut store =
+            UnixPersonalWorkerStore::open_or_create_disposable_catalog(root.path()).unwrap();
+
+        let outcome = store
+            .checkpoint_disposable_registration_transaction(
+                &runtime,
+                &attempt_id,
+                &FakeAdmission::available(),
+                &executor,
+                &clock,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            outcome,
+            DisposableCloneTransactionOutcome::RegistrationCheckpointed {
+                phase: DisposableAttemptPhase::Destroying,
+                ..
+            }
+        ));
+        drop(store);
+        assert_eq!(
+            durable_attempt(&root, &attempt_id).phase(),
+            DisposableAttemptPhase::Destroying
+        );
+    }
+
+    #[test]
+    fn registration_checkpoint_refuses_final_same_name_rebind() {
+        let root = TempRoot::new("registration-final-rebind");
+        let host = LimaHostIdentityFixture::new_with_disk_bytes(
+            "registration-final-rebind",
+            SOURCE,
+            SOURCE_DISK,
+        );
+        let runtime = runtime(&root, &host);
+        install_ready_generation(&root, &host, &runtime);
+        let attempt_id = install_authorized_attempt(&root);
+        let mut executor = executor(&host, false);
+        runtime
+            .clone_once_with(
+                &attempt_id,
+                &FakeAdmission::available(),
+                &executor,
+                &FixedClock,
+            )
+            .unwrap();
+        executor.target_ready = true;
+        let clock = CleanupRebindClock {
+            host: &host,
+            calls: Cell::new(0),
+        };
+        let mut store =
+            UnixPersonalWorkerStore::open_or_create_disposable_catalog(root.path()).unwrap();
+
+        let error = match store.checkpoint_disposable_registration_transaction(
+            &runtime,
+            &attempt_id,
+            &FakeAdmission::available(),
+            &executor,
+            &clock,
+        ) {
+            Ok(_) => panic!("same-name replacement must refuse registration"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code(), "clone_worker_identity_drift");
+        drop(store);
+        assert_eq!(
+            durable_attempt(&root, &attempt_id).phase(),
+            DisposableAttemptPhase::CloneStarted
+        );
+    }
+
+    #[test]
+    fn live_scale_set_message_preempts_registration_checkpoint() {
+        let root = TempRoot::new("registration-message");
+        let host = LimaHostIdentityFixture::new_with_disk_bytes(
+            "clone-runtime-registration-message",
+            SOURCE,
+            SOURCE_DISK,
+        );
+        let runtime = runtime(&root, &host);
+        install_ready_generation(&root, &host, &runtime);
+        let attempt_id = install_authorized_attempt(&root);
+        let mut executor = executor(&host, false);
+        runtime
+            .clone_once_with(
+                &attempt_id,
+                &FakeAdmission::available(),
+                &executor,
+                &FixedClock,
+            )
+            .unwrap();
+        executor.target_ready = true;
+        let identity =
+            ScaleSetBridgeIdentity::parse(&format!("sha256:{}", "46".repeat(32))).unwrap();
+        let mut store =
+            UnixPersonalWorkerStore::open_or_recover_scale_set_inbox(root.path()).unwrap();
+        store.initialize_scale_set_inbox(&identity).unwrap();
+        let mut bridge = MessageBridge {
+            response: RefCell::new(Some(ScaleSetBridgePoll::Message {
+                message_id: 9,
+                statistics: ScaleSetStatistics {
+                    available_jobs: 0,
+                    acquired_jobs: 1,
+                    assigned_jobs: 1,
+                    running_jobs: 0,
+                    registered_runners: 0,
+                    busy_runners: 0,
+                    idle_runners: 0,
+                },
+                events: vec![ScaleSetBridgeEvent::Assigned(ScaleSetBridgeJobEvidence {
+                    runner_request_id: 41,
+                    repository: "project".to_owned(),
+                    owner: "example".to_owned(),
+                    job_id: ScaleSetJobId::parse("job-1").unwrap(),
+                    workflow_run_id: 99,
+                    request_labels: vec!["smolrunner".to_owned()],
+                })],
+            })),
+            capacities: RefCell::new(Vec::new()),
+        };
+        let admission = LiveScaleSetCloneAdmission::new(&mut bridge, &identity, &FixedClock);
+
+        let outcome = store
+            .checkpoint_disposable_registration_transaction(
+                &runtime,
+                &attempt_id,
+                &admission,
+                &executor,
+                &FixedClock,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            outcome,
+            DisposableCloneTransactionOutcome::ScaleSetMessagePersisted { message_id: 9 }
+        ));
+        assert_eq!(bridge.capacities.borrow().as_slice(), [0]);
+        let (_, catalog) = store.load_scale_set_control_state(&identity).unwrap();
+        let attempt = catalog.find_active(&attempt_id).unwrap().attempt();
+        assert_eq!(attempt.phase(), DisposableAttemptPhase::CloneStarted);
+        assert!(attempt.vm_identity().is_some());
     }
 
     #[test]

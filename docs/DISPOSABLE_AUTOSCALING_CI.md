@@ -217,8 +217,14 @@ absence, deletes only the exact service-assigned runner ID and prechosen name, a
 capacity only after both VM and runner are absent. Each tick performs at most one external deletion;
 an ambiguous result leaves the cleanup phase unchanged so restart observes before retrying. A
 complete attempt contributes zero host usage and is then retired into bounded replay history.
-Operator enrollment, the supervised service loop that repeatedly invokes these transactions, and
-the physical acceptance run remain, so this is not production capacity yet.
+The private coordinator now has one phase dispatcher that drains persisted Scale Set messages first
+and then selects exactly one existing same-lock transaction from the current durable phase. A bound
+ready clone is freshly re-observed and checkpointed into `Registering` without replaying clone; a
+fresh cancellation, lost-capacity observation, or attempt expiry checkpoints it into `Destroying`;
+a final descriptor-held VM identity check precedes registration publication. A runner whose Started
+marker is already durable is routed back to message observation rather than receiving another JIT
+value. The long-running process wrapper, retry/circuit-breaker policy, orphan enumeration, operator
+enrollment, and physical acceptance run remain, so this is not production capacity yet.
 
 Acceptance: an enrolled test repository targets the SmolRunner scale-set label, queues a job, and receives its result without operator commands; the JIT runner cannot accept a second job and its credential is absent after VM destruction.
 

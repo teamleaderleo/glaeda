@@ -1,4 +1,5 @@
-// The coordinator is private until guest JIT handoff and the supervised worker command are wired.
+// The coordinator stays private until operator enrollment and the launchd service entry point are
+// wired around this bounded phase dispatcher.
 #![allow(dead_code)]
 
 use std::cell::RefCell;
@@ -122,6 +123,9 @@ pub(crate) enum ScaleSetServiceDisposition {
     CloneCompleted {
         attempt_id: String,
     },
+    RegistrationCheckpointed {
+        attempt_id: String,
+    },
     RunnerRegistrationRecovered {
         attempt_id: String,
     },
@@ -157,6 +161,45 @@ pub(crate) enum ScaleSetServiceDisposition {
     AttemptRetired {
         attempt_id: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SupervisedOperation {
+    Control,
+    AuthorizeClone,
+    ExecuteClone,
+    CheckpointRegistration,
+    RunRegistered,
+    Cleanup,
+}
+
+fn supervised_operation(
+    phase: DisposableAttemptPhase,
+    runner_started: bool,
+) -> Result<SupervisedOperation, ScaleSetServiceError> {
+    match phase {
+        DisposableAttemptPhase::Reserved => Ok(SupervisedOperation::AuthorizeClone),
+        DisposableAttemptPhase::CloneAuthorized => Ok(SupervisedOperation::ExecuteClone),
+        DisposableAttemptPhase::CloneStarted => Ok(SupervisedOperation::CheckpointRegistration),
+        DisposableAttemptPhase::Registering | DisposableAttemptPhase::Assigned
+            if !runner_started =>
+        {
+            Ok(SupervisedOperation::RunRegistered)
+        }
+        DisposableAttemptPhase::Terminal
+        | DisposableAttemptPhase::Destroying
+        | DisposableAttemptPhase::Deregistering
+        | DisposableAttemptPhase::Releasing => Ok(SupervisedOperation::Cleanup),
+        DisposableAttemptPhase::UnprovisionedReleasing
+        | DisposableAttemptPhase::Complete
+        | DisposableAttemptPhase::Registering
+        | DisposableAttemptPhase::Waiting
+        | DisposableAttemptPhase::Assigned
+        | DisposableAttemptPhase::Running => Ok(SupervisedOperation::Control),
+        DisposableAttemptPhase::Provisioning => Err(ScaleSetServiceError::new(
+            "scale_set_legacy_provisioning_recovery_required",
+        )),
+    }
 }
 
 pub(crate) struct ScaleSetService<B, C> {
@@ -330,6 +373,71 @@ impl<B: ScaleSetBridgeSession, C: ScaleSetServiceClock> ScaleSetService<B, C> {
         }
     }
 
+    /// Advance exactly one durable lifecycle edge or one bounded external operation.
+    ///
+    /// This is the product-facing dispatcher used by the future supervised loop. It always drains
+    /// persisted Scale Set work first, then selects the one active disposable attempt by its
+    /// current durable phase. Every selected transaction reopens and revalidates the state under
+    /// the canonical lock before it can mutate anything.
+    pub(crate) fn supervise_once(
+        &mut self,
+        clone_runtime: &DisposableCloneRuntime,
+        runner_runtime: &DisposableRunnerRuntime,
+        executor: &impl TimedCommandExecutor,
+        clock: &impl CloneRuntimeClock,
+    ) -> Result<ScaleSetServiceDisposition, ScaleSetServiceError>
+    where
+        B: ScaleSetRunnerBridgeSession,
+    {
+        let (inbox, catalog) = self
+            .store
+            .load_scale_set_control_state(&self.source_identity)
+            .map_err(ScaleSetServiceError::from_inbox)?;
+        if inbox.pending().is_some()
+            || inbox
+                .last_ack()
+                .is_some_and(|receipt| !receipt.outcome_applied())
+        {
+            return self.reconcile_once();
+        }
+        if catalog.active().len() > 1 {
+            return Err(ScaleSetServiceError::new(
+                "scale_set_capacity_invariant_violated",
+            ));
+        }
+        let Some(reservation) = catalog.active().first() else {
+            return self.reconcile_once();
+        };
+        let attempt_id = reservation.attempt().attempt_id().clone();
+        let phase = reservation.attempt().phase();
+        let runner_started = reservation.attempt().runner_start_started();
+        drop(catalog);
+        drop(inbox);
+
+        match supervised_operation(phase, runner_started)? {
+            SupervisedOperation::AuthorizeClone => {
+                self.authorize_reserved_once(clone_runtime, &attempt_id, executor, clock)
+            }
+            SupervisedOperation::ExecuteClone => {
+                self.clone_authorized_once(clone_runtime, &attempt_id, executor, clock)
+            }
+            SupervisedOperation::CheckpointRegistration => {
+                self.checkpoint_registration_once(clone_runtime, &attempt_id, executor, clock)
+            }
+            SupervisedOperation::RunRegistered => self.run_registered_once(
+                runner_runtime,
+                clone_runtime,
+                &attempt_id,
+                executor,
+                clock,
+            ),
+            SupervisedOperation::Cleanup => {
+                self.cleanup_once(clone_runtime, &attempt_id, executor, clock)
+            }
+            SupervisedOperation::Control => self.reconcile_once(),
+        }
+    }
+
     pub(crate) fn clone_authorized_once(
         &mut self,
         runtime: &DisposableCloneRuntime,
@@ -345,6 +453,9 @@ impl<B: ScaleSetBridgeSession, C: ScaleSetServiceClock> ScaleSetService<B, C> {
             .map_err(ScaleSetServiceError::from_clone)?
         {
             DisposableCloneTransactionOutcome::CloneAuthorized { .. } => {
+                Err(ScaleSetServiceError::new("clone_phase_changed"))
+            }
+            DisposableCloneTransactionOutcome::RegistrationCheckpointed { .. } => {
                 Err(ScaleSetServiceError::new("clone_phase_changed"))
             }
             DisposableCloneTransactionOutcome::Completed(receipt) => {
@@ -381,6 +492,49 @@ impl<B: ScaleSetBridgeSession, C: ScaleSetServiceClock> ScaleSetService<B, C> {
                 Ok(ScaleSetServiceDisposition::MessagePersisted { message_id })
             }
             DisposableCloneTransactionOutcome::Completed(_) => {
+                Err(ScaleSetServiceError::new("clone_phase_changed"))
+            }
+            DisposableCloneTransactionOutcome::RegistrationCheckpointed { .. } => {
+                Err(ScaleSetServiceError::new("clone_phase_changed"))
+            }
+        }
+    }
+
+    pub(crate) fn checkpoint_registration_once(
+        &mut self,
+        runtime: &DisposableCloneRuntime,
+        attempt_id: &DisposableAttemptId,
+        executor: &impl TimedCommandExecutor,
+        clock: &impl CloneRuntimeClock,
+    ) -> Result<ScaleSetServiceDisposition, ScaleSetServiceError> {
+        let admission =
+            LiveScaleSetCloneAdmission::new(&mut self.bridge, &self.source_identity, clock);
+        match self
+            .store
+            .checkpoint_disposable_registration_transaction(
+                runtime, attempt_id, &admission, executor, clock,
+            )
+            .map_err(ScaleSetServiceError::from_clone)?
+        {
+            DisposableCloneTransactionOutcome::RegistrationCheckpointed {
+                attempt_id,
+                phase: DisposableAttemptPhase::Registering,
+            } => Ok(ScaleSetServiceDisposition::RegistrationCheckpointed { attempt_id }),
+            DisposableCloneTransactionOutcome::RegistrationCheckpointed {
+                attempt_id,
+                phase: DisposableAttemptPhase::Destroying,
+            } => Ok(ScaleSetServiceDisposition::CleanupCheckpointed {
+                attempt_id,
+                phase: DisposableAttemptPhase::Destroying,
+            }),
+            DisposableCloneTransactionOutcome::RegistrationCheckpointed { .. } => {
+                Err(ScaleSetServiceError::new("clone_phase_changed"))
+            }
+            DisposableCloneTransactionOutcome::ScaleSetMessagePersisted { message_id } => {
+                Ok(ScaleSetServiceDisposition::MessagePersisted { message_id })
+            }
+            DisposableCloneTransactionOutcome::CloneAuthorized { .. }
+            | DisposableCloneTransactionOutcome::Completed(_) => {
                 Err(ScaleSetServiceError::new("clone_phase_changed"))
             }
         }
@@ -816,6 +970,69 @@ mod tests {
             runner: None,
             result: crate::github_scale_set_protocol::ScaleSetJobResult::parse("canceled").unwrap(),
         }
+    }
+
+    #[test]
+    fn supervisor_routes_every_durable_phase_without_replaying_started_runner() {
+        use SupervisedOperation as Operation;
+
+        for (phase, started, operation) in [
+            (
+                DisposableAttemptPhase::Reserved,
+                false,
+                Operation::AuthorizeClone,
+            ),
+            (
+                DisposableAttemptPhase::CloneAuthorized,
+                false,
+                Operation::ExecuteClone,
+            ),
+            (
+                DisposableAttemptPhase::CloneStarted,
+                false,
+                Operation::CheckpointRegistration,
+            ),
+            (
+                DisposableAttemptPhase::Registering,
+                false,
+                Operation::RunRegistered,
+            ),
+            (
+                DisposableAttemptPhase::Assigned,
+                false,
+                Operation::RunRegistered,
+            ),
+            (
+                DisposableAttemptPhase::Registering,
+                true,
+                Operation::Control,
+            ),
+            (DisposableAttemptPhase::Waiting, true, Operation::Control),
+            (DisposableAttemptPhase::Assigned, true, Operation::Control),
+            (DisposableAttemptPhase::Running, true, Operation::Control),
+            (DisposableAttemptPhase::Terminal, true, Operation::Cleanup),
+            (DisposableAttemptPhase::Destroying, true, Operation::Cleanup),
+            (
+                DisposableAttemptPhase::Deregistering,
+                true,
+                Operation::Cleanup,
+            ),
+            (DisposableAttemptPhase::Releasing, true, Operation::Cleanup),
+            (
+                DisposableAttemptPhase::UnprovisionedReleasing,
+                false,
+                Operation::Control,
+            ),
+            (DisposableAttemptPhase::Complete, true, Operation::Control),
+        ] {
+            assert_eq!(supervised_operation(phase, started).unwrap(), operation);
+        }
+        assert_eq!(
+            supervised_operation(DisposableAttemptPhase::Provisioning, false)
+                .unwrap_err()
+                .code(),
+            "scale_set_legacy_provisioning_recovery_required"
+        );
     }
 
     #[test]
