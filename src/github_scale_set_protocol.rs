@@ -68,6 +68,38 @@ impl ScaleSetRunnerId {
     }
 }
 
+/// Positive service runner-request identity used before a JIT runner is created.
+///
+/// GitHub uses this identity when an available job is explicitly acquired after the containing
+/// Scale Set message has been durably handled. It is distinct from the opaque workflow job ID and
+/// from the later service-assigned runner ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct ScaleSetRunnerRequestId(u64);
+
+impl ScaleSetRunnerRequestId {
+    /// Construct one positive Runner Scale Set request identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for zero.
+    pub fn new(value: u64) -> Result<Self, GitHubScaleSetProtocolError> {
+        if value == 0 {
+            return Err(GitHubScaleSetProtocolError::new(
+                "runner_request_id",
+                "invalid_runner_request_id",
+                "runner request ID must be greater than zero",
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct ScaleSetJobId(String);
