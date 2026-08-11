@@ -103,9 +103,15 @@ fn populated_catalog() -> DisposableAttemptCatalogDocument {
         2,
         DisposableAttemptCatalogAction::AuthorizeClone,
     );
-    let registering = transition(
+    let started = transition(
         &mut catalog,
         &provisioning,
+        2,
+        DisposableAttemptCatalogAction::RecordCloneStarted,
+    );
+    let registering = transition(
+        &mut catalog,
+        &started,
         2,
         DisposableAttemptCatalogAction::BeginRegistration,
     );
@@ -122,10 +128,16 @@ fn populated_catalog() -> DisposableAttemptCatalogDocument {
         1,
         DisposableAttemptCatalogAction::AuthorizeClone,
     );
+    let both_started = transition(
+        &mut catalog,
+        &both_authorized,
+        1,
+        DisposableAttemptCatalogAction::RecordCloneStarted,
+    );
 
     let terminal = transition(
         &mut catalog,
-        &both_authorized,
+        &both_started,
         1,
         DisposableAttemptCatalogAction::RecordTerminal {
             runner: Some(runner(1, 11)),
@@ -303,6 +315,12 @@ fn saturated_tombstone_history_retains_a_safe_revision_lower_bound() {
             &mut catalog,
             &document,
             index,
+            DisposableAttemptCatalogAction::RecordCloneStarted,
+        );
+        document = transition(
+            &mut catalog,
+            &document,
+            index,
             DisposableAttemptCatalogAction::RecordTerminal {
                 runner: Some(runner(index, 1_000 + u64::try_from(index).unwrap())),
                 job_id: ScaleSetJobId::parse(&format!("completed-job-{index}")).unwrap(),
@@ -384,7 +402,15 @@ fn top_level_future_schema_and_unknown_fields_fail_closed() {
         DisposableAttemptCatalogCodecErrorKind::VersionIncompatible
     );
 
-    value["schema_version"] = serde_json::json!(4);
+    previous_catalog["schema_version"] = serde_json::json!(3);
+    assert_eq!(
+        decode_disposable_attempt_catalog(&serde_json::to_vec(&previous_catalog).unwrap())
+            .unwrap_err()
+            .kind(),
+        DisposableAttemptCatalogCodecErrorKind::VersionIncompatible
+    );
+
+    value["schema_version"] = serde_json::json!(5);
     let future = serde_json::to_vec(&value).unwrap();
     assert_eq!(
         decode_disposable_attempt_catalog(&future)
@@ -393,7 +419,7 @@ fn top_level_future_schema_and_unknown_fields_fail_closed() {
         DisposableAttemptCatalogCodecErrorKind::VersionIncompatible
     );
 
-    value["schema_version"] = serde_json::json!(3);
+    value["schema_version"] = serde_json::json!(4);
     value["unexpected"] = serde_json::json!(true);
     let unknown = serde_json::to_vec(&value).unwrap();
     assert_eq!(

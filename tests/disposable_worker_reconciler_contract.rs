@@ -77,6 +77,7 @@ fn apply(
     match transition {
         DisposableAttemptCatalogAction::BeginProvisioning => state.begin_provisioning(),
         DisposableAttemptCatalogAction::AuthorizeClone => state.authorize_clone(),
+        DisposableAttemptCatalogAction::RecordCloneStarted => state.record_clone_started(),
         DisposableAttemptCatalogAction::BeginUnprovisionedRelease => {
             state.begin_unprovisioned_release()
         }
@@ -193,8 +194,9 @@ fn happy_path_uses_canonical_durable_transitions() {
             ScaleSetRunnerObservation::Absent,
         ))
         .unwrap(),
-        DisposableWorkerAction::CloneVm
+        DisposableWorkerAction::CheckpointAndCloneVm
     );
+    state = state.record_clone_started().unwrap();
     assert_eq!(
         reconcile_attempt(input(
             &state,
@@ -268,8 +270,29 @@ fn happy_path_uses_canonical_durable_transitions() {
 }
 
 #[test]
-fn stopped_partial_clone_is_discarded_only_after_clone_authorization() {
-    let provisioning = attempt().authorize_clone().unwrap();
+fn stopped_partial_clone_is_discarded_only_after_clone_start() {
+    let authorized = attempt().authorize_clone().unwrap();
+    assert_eq!(
+        reconcile_attempt(input(
+            &authorized,
+            DisposableVmObservation::Stopped,
+            ScaleSetRunnerObservation::Absent,
+        ))
+        .unwrap(),
+        DisposableWorkerAction::Blocked {
+            code: "vm_changed_before_clone_start"
+        }
+    );
+    let provisioning = authorized.record_clone_started().unwrap();
+    assert_eq!(
+        reconcile_attempt(input(
+            &provisioning,
+            DisposableVmObservation::Absent,
+            ScaleSetRunnerObservation::Absent,
+        ))
+        .unwrap(),
+        persist(DisposableAttemptCatalogAction::BeginCleanup)
+    );
     assert_eq!(
         reconcile_attempt(input(
             &provisioning,
@@ -322,6 +345,14 @@ fn legacy_provisioning_schema_and_current_schema_alias_are_both_refused() {
         decode_disposable_attempt_state(&serde_json::to_vec(&legacy).unwrap())
             .unwrap_err()
             .code(),
+        "version_incompatible"
+    );
+
+    legacy["schema_version"] = serde_json::json!(3);
+    assert_eq!(
+        decode_disposable_attempt_state(&serde_json::to_vec(&legacy).unwrap())
+            .unwrap_err()
+            .code(),
         "invalid_document"
     );
     assert_eq!(
@@ -333,6 +364,7 @@ fn legacy_provisioning_schema_and_current_schema_alias_are_both_refused() {
 #[test]
 fn crash_discovered_registration_is_durably_bound_before_cleanup() {
     let mut state = attempt().authorize_clone().unwrap();
+    state = state.record_clone_started().unwrap();
     state = state.begin_registration().unwrap();
     let exact_runner = runner(41);
     let action = reconcile_attempt(input(
@@ -395,6 +427,8 @@ fn terminal_cleanup_orders_vm_runner_and_capacity_release() {
     let exact_runner = runner(41);
     let mut state = attempt()
         .authorize_clone()
+        .unwrap()
+        .record_clone_started()
         .unwrap()
         .begin_registration()
         .unwrap()
@@ -557,7 +591,7 @@ fn reserved_cancellation_releases_capacity_without_claiming_vm_cleanup() {
 }
 
 #[test]
-fn clone_authorization_cannot_outlive_its_capacity_reservation() {
+fn clone_authorization_without_start_can_release_lost_capacity_without_vm_cleanup() {
     let authorized = attempt().authorize_clone().unwrap();
     for vm in [
         DisposableVmObservation::Absent,
@@ -567,7 +601,7 @@ fn clone_authorization_cannot_outlive_its_capacity_reservation() {
         lost.capacity_reserved = false;
         assert_eq!(
             reconcile_attempt(lost).unwrap(),
-            persist(DisposableAttemptCatalogAction::BeginCleanup)
+            persist(DisposableAttemptCatalogAction::CompleteUnprovisioned)
         );
     }
 }
@@ -587,6 +621,7 @@ fn unknown_conflicting_and_identity_drift_never_authorize_mutation() {
         }
     );
     let mut state = state.authorize_clone().unwrap();
+    state = state.record_clone_started().unwrap();
     state = state.begin_registration().unwrap();
     let wrong = ScaleSetRunnerReference::new(
         ScaleSetRunnerId::new(9).unwrap(),
@@ -609,6 +644,8 @@ fn duplicate_job_event_is_a_no_op_but_identity_drift_is_refused() {
     let exact_runner = runner(41);
     let state = attempt()
         .authorize_clone()
+        .unwrap()
+        .record_clone_started()
         .unwrap()
         .begin_registration()
         .unwrap()
@@ -655,6 +692,8 @@ fn late_duplicate_event_does_not_reverse_cleanup() {
     let state = attempt()
         .authorize_clone()
         .unwrap()
+        .record_clone_started()
+        .unwrap()
         .record_terminal(Some(&exact_runner), job("job-late"), result("succeeded"))
         .unwrap()
         .begin_cleanup()
@@ -682,6 +721,8 @@ fn first_late_job_events_are_checkpointed_without_reversing_cleanup() {
     let exact_runner = runner(41);
     let mut state = attempt()
         .authorize_clone()
+        .unwrap()
+        .record_clone_started()
         .unwrap()
         .begin_cleanup()
         .unwrap();
