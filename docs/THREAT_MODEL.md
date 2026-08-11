@@ -45,7 +45,15 @@ Unless an operator explicitly selects a separately documented weaker backend:
 
 Ordinary CI needs DNS, HTTPS, HTTP, package registries, source hosts, and sometimes explicitly approved Git SSH or service endpoints. The default policy therefore is controlled outbound internet, not a blanket offline sandbox.
 
-The enforcement point is outside repository authority. It denies host gateway addresses, RFC1918/private ranges, IPv6 private/link-local ranges, cloud metadata and link-local services, peer-worker networks, and controller endpoints. Inbound and worker-to-worker access are denied. Project exceptions are explicit, scoped, observable, and do not grant generic LAN access. Connection, rate, and byte ceilings are hardening requirements before broad unattended use.
+The enforcement point is outside repository authority. For the first macOS production path,
+[ADR 0023](adr/0023-hostile-ci-macos-egress-boundary.md) assigns all controller/Lima sockets to a
+dedicated non-login service UID and applies a root-owned macOS PF anchor to that UID. It denies host
+gateway addresses, private/LAN, IPv6 private/link-local, metadata, controller, and peer-worker
+destinations while permitting ordinary public TCP/UDP egress and only Lima's fixed SSH-over-vsock
+loopback port. The operator-account LaunchAgent is not a hostile-CI production boundary. Inbound and
+worker-to-worker access are denied. Project exceptions are explicit, scoped, observable, and do not
+grant generic LAN access. Connection, rate, and byte ceilings are hardening requirements before
+broad unattended use.
 
 ## Secrets and GitHub trust
 

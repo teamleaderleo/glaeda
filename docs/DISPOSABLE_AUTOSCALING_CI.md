@@ -249,6 +249,15 @@ Acceptance: an enrolled test repository targets the SmolRunner scale-set label, 
 
 Enforce denial of host, LAN, link-local, metadata, control-plane, and peer-worker destinations while preserving DNS and ordinary outbound build access. Enable rootless nested containers inside the guest only after this policy and guest resource limits are verified.
 
+The selected first-macOS boundary is [ADR 0023](adr/0023-hostile-ci-macos-egress-boundary.md): a
+dedicated non-login service identity runs SmolRunner, Lima, and Lima's gVisor user network, while a
+root-owned macOS PF anchor denies non-public destinations for that identity. This is deliberately a
+host policy around mature components, not a guest firewall or a custom network-stack verifier. The
+existing operator LaunchAgent remains a development/lifecycle integration path and must not admit
+hostile CI. Production acceptance requires a separately approved LaunchDaemon/PF installation,
+exact startup observation, and physical allow/deny fixtures. Initial concurrency remains exactly
+one until peer isolation is separately proven.
+
 Acceptance: ordinary clone/download/build/test fixtures pass; hostile fixtures cannot reach denied destinations, listen inbound, exceed resource ceilings, or leave a reachable process after teardown.
 
 ### M5 — supervised reconciliation and autoscaling
@@ -301,7 +310,10 @@ Apply uses bounded fixed-shape `launchctl` observations and mutations. Removal c
 loaded path/program/argv, boots it out, confirms absence, and only then removes an
 exact-byte-matching property list. Running as a user LaunchAgent deliberately delegates
 login-session restart to `launchd` and preserves access to the operator's Keychain and Lima/VZ
-state without granting a root daemon those credentials.
+state without granting a root daemon those credentials. It is the development and lifecycle
+integration service path, not the M4 hostile-CI network boundary. The production path moves the
+same unprivileged controller into the dedicated service identity selected by ADR 0023; root owns
+installation and PF configuration but never receives the GitHub App key or job authority.
 
 The first operator-control surface is deliberately small: a private empty marker under the
 canonical store lock represents an admission hold. `worker admission hold` makes every demand poll

@@ -113,7 +113,9 @@ Before broad M2-M4 implementation, finish the research in [#368](https://github.
 - [ ] Compare direct pinned `actions/scaleset` integration with GARM, GHA Outrunner, Graftery, and related autoscaler/provider contracts.
 - [ ] Keep Lima/VZ as the first backend while defining a small backend-independent disposable-worker contract.
 - [ ] Decide whether the one-time JIT secret can be delivered through direct runner execution over the existing Lima control path or needs a tiny exec-only guest launcher.
-- [ ] Select or bound the M4 network-enforcement backend; keep network policy intent independent of that implementation.
+- [x] Select and bound the first M4 backend in ADR 0023: dedicated macOS service identity plus a
+  root-owned PF anchor around Lima's gVisor user network. Keep policy intent independent of that
+  backend and keep the operator LaunchAgent development-only for hostile workloads.
 - [ ] Record source/version/license implications for candidate dependencies before they become required distribution components.
 
 This gate is meant to shrink custom code, not delay the first worker indefinitely. The default remains direct `actions/scaleset` + Lima/VZ unless research finds a clearly better boundary.
@@ -195,6 +197,8 @@ M3 proves functionality. M4 makes arbitrary repository code an intended workload
 - [ ] Give each worker only the short-lived JIT/Actions authority required for its exact job; assume every credential visible in the guest may be stolen.
 - [ ] Deny inbound access and outbound Mac host, private/LAN, link-local, metadata, controller, and peer-worker destinations outside explicit workload authority.
 - [ ] Preserve explicit DNS and ordinary outbound source/package/build access without depending on or exposing the Mac's local resolver state.
+- [ ] Add the separately approved dedicated-service-account LaunchDaemon and PF installation,
+  observation, removal, and startup admission gate from ADR 0023.
 - [ ] Add bounded connection/rate/byte policy where the selected mature enforcement backend supports it.
 - [ ] Allow explicit project network exceptions as reviewed policy rather than arbitrary workflow expansion.
 - [ ] Enable rootless nested containers inside the disposable VM for container actions, service containers, and ordinary container builds.
