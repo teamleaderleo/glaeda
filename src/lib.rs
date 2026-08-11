@@ -21,6 +21,9 @@ pub mod disposable_clone_runtime;
 pub mod disposable_launchd_service;
 /// Sealed fixed Lima command plans for one durably planned disposable worker.
 pub mod disposable_lima_worker;
+/// Pure exact installation plan for the production macOS disposable-worker services.
+#[cfg(unix)]
+pub mod disposable_macos_service_installation;
 /// Canonical boot-volatile receipt for the root-owned hostile-CI network gate.
 pub mod disposable_network_gate;
 /// Exact root activation plan for the macOS hostile-CI PF gate.

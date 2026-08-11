@@ -195,6 +195,10 @@ impl ScaleSetBridgeConfig {
         ScaleSetBridgeIdentity::parse(&format!("sha256:{:x}", hasher.finalize()))
             .expect("SHA-256 output is canonical")
     }
+
+    pub(crate) const fn program_digest(&self) -> &Sha256Digest {
+        &self.program_digest
+    }
 }
 
 fn hash_identity_field(hasher: &mut Sha256, value: &[u8]) {

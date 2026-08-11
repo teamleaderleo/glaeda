@@ -276,6 +276,14 @@ the production boundary by itself: the next slice must install the dedicated non
 exact PF inputs, root LaunchDaemon, and unprivileged worker service as one separately approved
 lifecycle.
 
+That production lifecycle now has one pure complete plan contract. It decodes the real canonical
+enrollment, binds the dedicated UID and primary group, exact controller and bridge digests,
+service-private enrollment, generated PF inputs, root gate LaunchDaemon, unprivileged worker
+LaunchDaemon, opaque installation ownership identity, versioned lifecycle checkpoints, start
+ordering, drain-first removal, and reverse compensation classes. The planner performs no account,
+filesystem, Keychain, launchd, process, or PF operation. The privileged apply, observation, and
+removal transaction remains the next required boundary and is not implied by a successful plan.
+
 Acceptance: ordinary clone/download/build/test fixtures pass; hostile fixtures cannot reach denied destinations, listen inbound, exceed resource ceilings, or leave a reachable process after teardown.
 
 ### M5 — supervised reconciliation and autoscaling

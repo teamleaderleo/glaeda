@@ -202,6 +202,10 @@ M3 proves functionality. M4 makes arbitrary repository code an intended workload
   enforcement to Apple `pfctl`, and publish the worker admission receipt only after PF is enabled.
 - [ ] Add the separately approved dedicated-service-account LaunchDaemon and PF installation,
   observation, removal, and startup admission gate from ADR 0023.
+  - [x] Define one exact non-mutating production plan binding the account, protected inputs, PF
+    policy, both LaunchDaemons, installation ownership identity, lifecycle checkpoints, startup
+    order, drain-first removal, and compensation classes.
+  - [ ] Implement the explicitly approved root apply/observe/remove transaction for that plan.
 - [ ] Add bounded connection/rate/byte policy where the selected mature enforcement backend supports it.
 - [ ] Allow explicit project network exceptions as reviewed policy rather than arbitrary workflow expansion.
 - [ ] Enable rootless nested containers inside the disposable VM for container actions, service containers, and ordinary container builds.
