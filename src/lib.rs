@@ -40,6 +40,9 @@ pub mod execution_receipt_store;
 /// Private-process adapter for the pinned official Runner Scale Set bridge.
 #[cfg(unix)]
 pub(crate) mod github_scale_set_bridge;
+/// Canonical bounded durable record of one polled Runner Scale Set delivery.
+#[cfg(unix)]
+pub(crate) mod github_scale_set_delivery;
 /// Pure bounded vocabulary for GitHub Runner Scale Set job and runner identities.
 pub mod github_scale_set_protocol;
 /// Pure, fail-closed mapping of reviewed GitHub workflow-job evidence into typed broker intents.
