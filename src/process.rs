@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -34,6 +34,12 @@ impl SecretString {
 
     fn expose(&self) -> &str {
         &self.0
+    }
+
+    fn zeroizing_bytes(&self) -> Zeroizing<Vec<u8>> {
+        let mut bytes = Vec::with_capacity(self.0.len());
+        bytes.extend_from_slice(self.0.as_bytes());
+        Zeroizing::new(bytes)
     }
 }
 
@@ -88,6 +94,8 @@ pub struct CommandSpec {
     pub program: PathBuf,
     pub arguments: Vec<CommandValue>,
     pub environment: BTreeMap<String, CommandValue>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    secret_stdin: Option<SecretString>,
 }
 
 impl CommandSpec {
@@ -97,6 +105,7 @@ impl CommandSpec {
             program: program.into(),
             arguments: Vec::new(),
             environment: BTreeMap::new(),
+            secret_stdin: None,
         }
     }
 
@@ -127,17 +136,13 @@ impl CommandSpec {
         self
     }
 
-    /// Add an already-zeroizing secret without creating a second ordinary `String` copy.
+    /// Supply one secret line on standard input without placing it in argv or the environment.
+    ///
+    /// The production executor writes the value followed by one newline from a separately
+    /// zeroizing buffer, closes the pipe, and treats a write failure as command failure.
     #[must_use]
-    pub(crate) fn zeroizing_secret_environment(
-        mut self,
-        key: impl Into<String>,
-        value: Zeroizing<String>,
-    ) -> Self {
-        self.environment.insert(
-            key.into(),
-            CommandValue::Secret(SecretString::from_zeroizing(value)),
-        );
+    pub(crate) fn zeroizing_secret_stdin_line(mut self, value: Zeroizing<String>) -> Self {
+        self.secret_stdin = Some(SecretString::from_zeroizing(value));
         self
     }
 
@@ -237,7 +242,11 @@ fn execute_process_with_spawner<S: CaptureThreadSpawner>(
     let mut command = Command::new(&spec.program);
     command
         .env_clear()
-        .stdin(Stdio::null())
+        .stdin(if spec.secret_stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
@@ -270,16 +279,36 @@ fn execute_process_with_spawner<S: CaptureThreadSpawner>(
     let stdout_reader = match spawner.spawn(stdout, CapturedStream::Stdout, sender.clone()) {
         Ok(reader) => reader,
         Err(error) => {
-            cleanup_capture_setup_failure(&mut child, None)?;
+            cleanup_capture_setup_failure(&mut child, Vec::new())?;
             return Err(error);
         }
     };
     let stderr_reader = match spawner.spawn(stderr, CapturedStream::Stderr, sender) {
         Ok(reader) => reader,
         Err(error) => {
-            cleanup_capture_setup_failure(&mut child, Some(stdout_reader))?;
+            cleanup_capture_setup_failure(&mut child, vec![stdout_reader])?;
             return Err(error);
         }
+    };
+    let stdin_writer = if let Some(secret) = spec.secret_stdin.as_ref() {
+        let stdin = match child.stdin.take() {
+            Some(stdin) => stdin,
+            None => {
+                cleanup_capture_setup_failure(&mut child, vec![stdout_reader, stderr_reader])?;
+                return Err(io::Error::other(
+                    "child stdin was not available after requesting a pipe",
+                ));
+            }
+        };
+        match spawner.spawn_secret_writer(stdin, secret.zeroizing_bytes()) {
+            Ok(writer) => Some(writer),
+            Err(error) => {
+                cleanup_capture_setup_failure(&mut child, vec![stdout_reader, stderr_reader])?;
+                return Err(error);
+            }
+        }
+    } else {
+        None
     };
 
     let mut stdout_bytes = None;
@@ -297,9 +326,11 @@ fn execute_process_with_spawner<S: CaptureThreadSpawner>(
                     let wait_result = child.wait();
                     let stdout_join_result = join_capture_reader(stdout_reader);
                     let stderr_join_result = join_capture_reader(stderr_reader);
+                    let stdin_join_result = stdin_writer.map(join_secret_writer).transpose();
                     wait_result?;
                     stdout_join_result?;
                     stderr_join_result?;
+                    stdin_join_result?;
                     return Err(io::Error::other(
                         "output capture workers stopped before reporting completion",
                     ));
@@ -323,10 +354,12 @@ fn execute_process_with_spawner<S: CaptureThreadSpawner>(
                     let wait_result = child.wait();
                     let stdout_join_result = join_capture_reader(stdout_reader);
                     let stderr_join_result = join_capture_reader(stderr_reader);
+                    let stdin_join_result = stdin_writer.map(join_secret_writer).transpose();
                     termination_result?;
                     wait_result?;
                     stdout_join_result?;
                     stderr_join_result?;
+                    stdin_join_result?;
                     return Err(io::Error::other(
                         "output capture workers stopped before reporting completion",
                     ));
@@ -340,10 +373,12 @@ fn execute_process_with_spawner<S: CaptureThreadSpawner>(
                     let wait_result = child.wait();
                     let stdout_join_result = join_capture_reader(stdout_reader);
                     let stderr_join_result = join_capture_reader(stderr_reader);
+                    let stdin_join_result = stdin_writer.map(join_secret_writer).transpose();
                     termination_result?;
                     wait_result?;
                     stdout_join_result?;
                     stderr_join_result?;
+                    stdin_join_result?;
                     return Err(io::Error::other(
                         "output capture workers stopped before reporting completion",
                     ));
@@ -381,6 +416,7 @@ fn execute_process_with_spawner<S: CaptureThreadSpawner>(
     };
     join_capture_reader(stdout_reader)?;
     join_capture_reader(stderr_reader)?;
+    let stdin_result = stdin_writer.map(join_secret_writer).transpose();
 
     if timed_out {
         return Err(io::Error::new(
@@ -402,6 +438,7 @@ fn execute_process_with_spawner<S: CaptureThreadSpawner>(
             format!("child {streams} exceeded the {MAX_CAPTURED_STREAM_BYTES}-byte capture limit"),
         ));
     }
+    stdin_result?;
 
     let stdout_bytes = stdout_bytes.expect("stdout completion recorded");
     let stderr_bytes = stderr_bytes.expect("stderr completion recorded");
@@ -410,6 +447,11 @@ fn execute_process_with_spawner<S: CaptureThreadSpawner>(
         .iter()
         .chain(spec.environment.values())
         .filter_map(CommandValue::secret)
+        .chain(
+            spec.secret_stdin
+                .iter()
+                .filter_map(|value| (!value.expose().is_empty()).then_some(value.expose())),
+        )
         .collect::<Vec<_>>();
 
     Ok(ExecutionRecord {
@@ -449,6 +491,12 @@ trait CaptureThreadSpawner {
         stream: CapturedStream,
         sender: Sender<CaptureEvent>,
     ) -> io::Result<JoinHandle<()>>;
+
+    fn spawn_secret_writer<W: Write + Send + 'static>(
+        &self,
+        writer: W,
+        secret: Zeroizing<Vec<u8>>,
+    ) -> io::Result<JoinHandle<io::Result<()>>>;
 }
 
 struct ThreadCaptureSpawner;
@@ -463,6 +511,18 @@ impl CaptureThreadSpawner for ThreadCaptureSpawner {
         thread::Builder::new().spawn(move || {
             let result = capture_stream(reader, stream, &sender);
             let _ = sender.send(CaptureEvent::Completed(stream, result));
+        })
+    }
+
+    fn spawn_secret_writer<W: Write + Send + 'static>(
+        &self,
+        mut writer: W,
+        secret: Zeroizing<Vec<u8>>,
+    ) -> io::Result<JoinHandle<io::Result<()>>> {
+        thread::Builder::new().spawn(move || {
+            writer.write_all(&secret)?;
+            writer.write_all(b"\n")?;
+            writer.flush()
         })
     }
 }
@@ -519,11 +579,14 @@ fn abort_spawned_child(child: &mut Child) -> io::Result<()> {
 
 fn cleanup_capture_setup_failure(
     child: &mut Child,
-    started_reader: Option<JoinHandle<()>>,
+    started_readers: Vec<JoinHandle<()>>,
 ) -> io::Result<()> {
     let termination_result = terminate_process_group(child);
     let wait_result = child.wait();
-    let join_result = started_reader.map(join_capture_reader).transpose();
+    let join_result = started_readers
+        .into_iter()
+        .map(join_capture_reader)
+        .collect::<io::Result<Vec<_>>>();
     termination_result?;
     wait_result?;
     join_result?;
@@ -566,6 +629,12 @@ fn join_capture_reader(handle: JoinHandle<()>) -> io::Result<()> {
         .map_err(|_| io::Error::other("output capture worker panicked"))
 }
 
+fn join_secret_writer(handle: JoinHandle<io::Result<()>>) -> io::Result<()> {
+    handle
+        .join()
+        .map_err(|_| io::Error::other("secret-input worker panicked"))?
+}
+
 fn ensure_absolute_program(program: &Path) -> io::Result<()> {
     if program.is_absolute() {
         Ok(())
@@ -589,7 +658,7 @@ fn redact(value: &str, secrets: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::io::{self, Read};
+    use std::io::{self, Read, Write};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc::Sender;
@@ -600,7 +669,7 @@ mod tests {
     use super::{
         CaptureEvent, CaptureThreadSpawner, CapturedStream, CommandExecutor, CommandSpec,
         MAX_CAPTURED_STREAM_BYTES, MAX_COMMAND_TIMEOUT, ProcessExecutor, REDACTED,
-        ThreadCaptureSpawner, TimedCommandExecutor, execute_process_with_spawner,
+        ThreadCaptureSpawner, TimedCommandExecutor, Zeroizing, execute_process_with_spawner,
     };
 
     struct FailingCaptureSpawner {
@@ -630,6 +699,18 @@ mod tests {
             }
             ThreadCaptureSpawner.spawn(reader, stream, sender)
         }
+
+        fn spawn_secret_writer<W: Write + Send + 'static>(
+            &self,
+            writer: W,
+            secret: Zeroizing<Vec<u8>>,
+        ) -> io::Result<JoinHandle<io::Result<()>>> {
+            let call = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
+            if call == self.fail_on_call {
+                return Err(io::Error::other("injected secret-input thread failure"));
+            }
+            ThreadCaptureSpawner.spawn_secret_writer(writer, secret)
+        }
     }
 
     #[test]
@@ -637,15 +718,36 @@ mod tests {
         let spec = CommandSpec::new("/usr/bin/example")
             .argument("visible")
             .secret_argument("very-secret")
-            .secret_environment("TOKEN", "environment-secret");
+            .secret_environment("TOKEN", "environment-secret")
+            .zeroizing_secret_stdin_line(Zeroizing::new("stdin-secret".to_owned()));
 
         let debug = format!("{spec:?}");
         let json = serde_json::to_string(&spec).expect("serialize command spec");
         assert!(!debug.contains("very-secret"));
         assert!(!debug.contains("environment-secret"));
+        assert!(!debug.contains("stdin-secret"));
         assert!(!json.contains("very-secret"));
         assert!(!json.contains("environment-secret"));
+        assert!(!json.contains("stdin-secret"));
         assert!(json.contains(REDACTED));
+    }
+
+    #[test]
+    fn secret_standard_input_is_written_once_and_redacted() -> io::Result<()> {
+        let cat = Path::new("/bin/cat");
+        if !cat.is_file() {
+            return Ok(());
+        }
+        let secret = "guest-jit-secret";
+        let spec =
+            CommandSpec::new(cat).zeroizing_secret_stdin_line(Zeroizing::new(secret.to_owned()));
+        let record = ProcessExecutor.execute_with_timeout(&spec, Duration::from_secs(1))?;
+
+        assert!(record.success);
+        assert_eq!(record.stdout, format!("{REDACTED}\n"));
+        assert!(!record.argv.join(" ").contains(secret));
+        assert!(record.environment_keys.is_empty());
+        Ok(())
     }
 
     #[test]
@@ -808,22 +910,33 @@ mod tests {
             return Ok(());
         }
 
-        for fail_on_call in [1, 2] {
+        for fail_on_call in [1, 2, 3] {
             let fixture = timeout_fixture_directory()?;
             let marker = fixture.join("process-survived-capture-setup-failure");
             let script = "import pathlib,sys,time; time.sleep(0.6); pathlib.Path(sys.argv[1]).write_text('survived'); time.sleep(10)";
+            let mut spec = CommandSpec::new(python)
+                .argument("-c")
+                .argument(script)
+                .argument(marker.to_string_lossy());
+            if fail_on_call == 3 {
+                spec = spec.zeroizing_secret_stdin_line(Zeroizing::new("secret".to_owned()));
+            }
             let error = execute_process_with_spawner(
-                &CommandSpec::new(python)
-                    .argument("-c")
-                    .argument(script)
-                    .argument(marker.to_string_lossy()),
+                &spec,
                 None,
                 &FailingCaptureSpawner::new(fail_on_call),
             )
             .expect_err("capture thread setup failure must abort the spawned process group");
 
             assert_eq!(error.kind(), io::ErrorKind::Other);
-            assert_eq!(error.to_string(), "injected capture thread failure");
+            assert_eq!(
+                error.to_string(),
+                if fail_on_call == 3 {
+                    "injected secret-input thread failure"
+                } else {
+                    "injected capture thread failure"
+                }
+            );
             thread::sleep(Duration::from_millis(800));
             assert!(
                 !marker.exists(),

@@ -116,9 +116,10 @@ pub(crate) fn apply_scale_set_event(
         }
         // The inbox deadline bounds whether this service message is fresh enough to create a
         // reservation. It is not the workload lifetime. Derive the one-job hard ceiling from the
-        // exact persisted message deadline so crash replay produces byte-identical state.
+        // exact persisted observation time so crash replay produces byte-identical state and the
+        // hard ceiling is exactly six hours rather than freshness plus six hours.
         let attempt_not_after = pending
-            .not_after()
+            .observed_at()
             .get()
             .checked_add(DISPOSABLE_JOB_MAX_MILLIS)
             .and_then(|value| EpochMillis::new(value).ok())
@@ -504,7 +505,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(reserved.active().len(), 1);
-        assert_eq!(reserved.active()[0].attempt().not_after().get(), 21_720_000);
+        assert_eq!(reserved.active()[0].attempt().not_after().get(), 21_700_000);
         assert_eq!(
             apply_scale_set_event(
                 &policy,

@@ -819,8 +819,12 @@ mod tests {
             return current.identity().unwrap();
         }
         let bytes = encode_disposable_prepared_template(&current).unwrap();
+        let current_recipe = format!(
+            "\"recipe_revision\": {}",
+            current.provisioning_recipe_revision()
+        );
         let changed = String::from_utf8(bytes).unwrap().replacen(
-            "\"recipe_revision\": 2",
+            &current_recipe,
             &format!("\"recipe_revision\": {recipe_revision}"),
             1,
         );

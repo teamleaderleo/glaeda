@@ -188,10 +188,12 @@ the resulting one-job attempt, so replay is exact without expiring ordinary buil
 Unacquired or pre-clone-canceled work completes its durable release and moves immediately into
 bounded replay history, so repeated cancellations restore advertised capacity instead of filling
 the active catalog.
-A private guest-handoff foundation consumes the bridge's guaranteed-zeroization JIT value into an
-official-runner environment input without placing the value in argv, logs, Debug, serialization, or
-an ordinary copied `String`. It fixes the Lima shell, guest `sudo`, runner listener, work directory,
-environment allowlist, and one-job hosted result switch, and binds the candidate to the exact
+A private guest-handoff foundation consumes the bridge's guaranteed-zeroization JIT value as one
+secret standard-input line to a fixed template-bound guest launcher, without placing the value in
+argv, the inherited environment, logs, Debug, serialization, or an ordinary copied `String`. The
+launcher sets only the official runner's JIT input and hosted-result switch immediately before
+`exec`. The plan fixes the Lima shell, guest `sudo`, launcher, work directory, and empty inherited
+environment, and binds the candidate to the exact
 durable attempt, cloned VM identity, runner name, runner ID, and deadline. It intentionally exposes
 no execution path yet: the production service must still freshly prove the complete target ready,
 durably record the GitHub registration, publish a no-replay runner-start checkpoint, and only then
