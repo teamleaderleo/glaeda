@@ -663,6 +663,20 @@ struct RuntimeObservation {
     retained_host: Option<LimaHostIdentityObservation>,
 }
 
+/// Descriptor-retaining proof that the exact prepared source is currently ready and stopped.
+pub(crate) struct ConfirmedDisposableCloneSource {
+    host: LimaHostIdentityObservation,
+    request: LimaObservationRequest,
+}
+
+impl ConfirmedDisposableCloneSource {
+    pub(crate) fn confirm_current(&self) -> Result<(), DisposableTemplateRuntimeError> {
+        self.host
+            .confirm(&self.request)
+            .map_err(|_| observation_failure("template_host_identity_drift"))
+    }
+}
+
 #[derive(PartialEq, Eq)]
 struct RealizedInstanceConfig {
     runtime_state: LimaRuntimeState,
@@ -683,6 +697,15 @@ impl fmt::Debug for DisposableTemplateRuntime {
 }
 
 impl DisposableTemplateRuntime {
+    pub(crate) fn initial_document(&self) -> DisposableTemplateGenerationDocument {
+        DisposableTemplateGenerationDocument::runtime_initial(
+            self.generation_id.clone(),
+            self.prepared_template_identity.clone(),
+            self.source_identity.clone(),
+            self.source_instance.clone(),
+        )
+    }
+
     /// Construct the fixed production source-template supervisor.
     ///
     /// # Errors
@@ -767,12 +790,7 @@ impl DisposableTemplateRuntime {
         {
             Some(current) => current,
             None => {
-                let initial = DisposableTemplateGenerationDocument::runtime_initial(
-                    self.generation_id.clone(),
-                    self.prepared_template_identity.clone(),
-                    self.source_identity.clone(),
-                    self.source_instance.clone(),
-                );
+                let initial = self.initial_document();
                 store
                     .create_disposable_template_generation(&initial)
                     .map_err(DisposableTemplateRuntimeError::from_store)?;
@@ -844,6 +862,30 @@ impl DisposableTemplateRuntime {
                 ))
             }
         }
+    }
+
+    /// Reconfirm that the exact durable source generation is ready and stopped for cloning.
+    pub(crate) fn confirm_stopped_clone_source(
+        &self,
+        document: &DisposableTemplateGenerationDocument,
+        executor: &impl TimedCommandExecutor,
+        clock: &impl LimaObservationClock,
+    ) -> Result<ConfirmedDisposableCloneSource, DisposableTemplateRuntimeError> {
+        self.validate_document_identity(document)?;
+        let observed = self.observe(document, executor, clock)?;
+        let plan = reconcile_disposable_template_generation(document, &observed.sealed);
+        if plan.disposition() != DisposableTemplateGenerationDisposition::Satisfied {
+            return Err(observation_failure("template_source_not_ready_stopped"));
+        }
+        let host = observed
+            .retained_host
+            .ok_or_else(|| observation_failure("template_host_identity_missing"))?;
+        host.confirm(&self.observation_request)
+            .map_err(|_| observation_failure("template_host_identity_drift"))?;
+        Ok(ConfirmedDisposableCloneSource {
+            host,
+            request: self.observation_request.clone(),
+        })
     }
 
     fn validate_document_identity(

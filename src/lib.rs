@@ -14,6 +14,9 @@ pub mod descriptor_bound_launcher;
 pub mod disposable_attempt_catalog;
 /// Pure durable state, revisions, and codec for one disposable worker attempt.
 pub mod disposable_attempt_state;
+/// Same-lock execution of one authorized disposable Lima clone.
+#[cfg(unix)]
+pub mod disposable_clone_runtime;
 /// Sealed fixed Lima command plans for one durably planned disposable worker.
 pub mod disposable_lima_worker;
 /// Canonical supply-chain and isolation identity for the prepared disposable VM template.
