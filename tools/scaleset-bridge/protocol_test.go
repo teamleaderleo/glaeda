@@ -110,6 +110,8 @@ func startedServer(t *testing.T, fake *fakeBackend) *server {
 	return server
 }
 
+func boolPointer(value bool) *bool { return &value }
+
 func TestDecodeRequestIsStrictAndVersioned(t *testing.T) {
 	valid := []byte(`{"version":1,"operation":"poll"}`)
 	request, err := decodeRequest(valid)
@@ -162,7 +164,7 @@ func TestPollRequiresDurableAckBeforeAdvancing(t *testing.T) {
 		t.Fatalf("calls before ack = %v", backend.calls)
 	}
 
-	acked := server.handle(context.Background(), protocolRequest{Version: 1, Operation: "ack", MessageID: 7})
+	acked := server.handle(context.Background(), protocolRequest{Version: 1, Operation: "ack", MessageID: 7, AcquireAvailable: boolPointer(true)})
 	if acked.Type != "acked" || !reflect.DeepEqual(acked.AcquiredRequests, []int64{41}) {
 		t.Fatalf("ack response = %#v", acked)
 	}
@@ -171,6 +173,38 @@ func TestPollRequiresDurableAckBeforeAdvancing(t *testing.T) {
 	}
 	if server.lastAckedID != 7 || server.pending != nil || backend.maxCapacity != 1 {
 		t.Fatalf("server did not advance exact ack state")
+	}
+}
+
+func TestAckCanDeleteAnExpiredOfferWithoutAcquiringIt(t *testing.T) {
+	backend := &fakeBackend{
+		acquired: []int64{41},
+		message: &scaleset.RunnerScaleSetMessage{
+			MessageID:  7,
+			Statistics: &scaleset.RunnerScaleSetStatistic{TotalAvailableJobs: 1},
+			JobAvailableMessages: []*scaleset.JobAvailable{{JobMessageBase: scaleset.JobMessageBase{
+				RunnerRequestID: 41,
+				RepositoryName:  "project",
+				OwnerName:       "example",
+				JobID:           "job-1",
+				WorkflowRunID:   99,
+				RequestLabels:   []string{"smolrunner"},
+			}}},
+		},
+	}
+	server := startedServer(t, backend)
+	if response := server.handle(context.Background(), protocolRequest{Version: 1, Operation: "poll", MaxCapacity: 1}); response.Type != "message" {
+		t.Fatalf("poll response=%#v", response)
+	}
+	if response := server.handle(context.Background(), protocolRequest{Version: 1, Operation: "ack", MessageID: 7}); response.Code != "invalid_ack" || server.pending == nil {
+		t.Fatalf("ack without explicit acquisition policy response=%#v pending=%#v", response, server.pending)
+	}
+	acked := server.handle(context.Background(), protocolRequest{Version: 1, Operation: "ack", MessageID: 7, AcquireAvailable: boolPointer(false)})
+	if acked.Type != "acked" || len(acked.AcquiredRequests) != 0 {
+		t.Fatalf("ack response=%#v", acked)
+	}
+	if !reflect.DeepEqual(backend.calls, []string{"poll", "delete:7"}) || server.pending != nil || server.lastAckedID != 7 {
+		t.Fatalf("expired-offer ack calls=%v pending=%#v last=%d", backend.calls, server.pending, server.lastAckedID)
 	}
 }
 
@@ -201,7 +235,7 @@ func TestResumeRefetchesExactDurablePendingBeforeAck(t *testing.T) {
 	if resumed.Type != "message" || resumed.MessageID != 8 || server.pending == nil || server.lastAckedID != 7 {
 		t.Fatalf("resume response=%#v pending=%#v last=%d", resumed, server.pending, server.lastAckedID)
 	}
-	acked := server.handle(context.Background(), protocolRequest{Version: 1, Operation: "ack", MessageID: 8})
+	acked := server.handle(context.Background(), protocolRequest{Version: 1, Operation: "ack", MessageID: 8, AcquireAvailable: boolPointer(true)})
 	if acked.Type != "acked" || !reflect.DeepEqual(acked.AcquiredRequests, []int64{41}) {
 		t.Fatalf("ack response=%#v", acked)
 	}
@@ -256,7 +290,7 @@ func TestIdleRetainsLatestValidatedStatistics(t *testing.T) {
 	if message.Type != "message" || message.Statistics == nil || message.Statistics.AssignedJobs != 3 {
 		t.Fatalf("message response=%#v", message)
 	}
-	if response := server.handle(context.Background(), protocolRequest{Version: 1, Operation: "ack", MessageID: 7}); response.Type != "acked" {
+	if response := server.handle(context.Background(), protocolRequest{Version: 1, Operation: "ack", MessageID: 7, AcquireAvailable: boolPointer(false)}); response.Type != "acked" {
 		t.Fatalf("ack response=%#v", response)
 	}
 	idle := server.handle(context.Background(), protocolRequest{Version: 1, Operation: "poll"})
@@ -320,12 +354,12 @@ func TestAckRejectsForeignOrDuplicateAcquisitionWithoutRepeatingDelete(t *testin
 	if response := server.handle(context.Background(), protocolRequest{Version: 1, Operation: "poll", MaxCapacity: 1}); response.Type != "message" {
 		t.Fatalf("poll response=%#v", response)
 	}
-	invalid := server.handle(context.Background(), protocolRequest{Version: 1, Operation: "ack", MessageID: 7})
+	invalid := server.handle(context.Background(), protocolRequest{Version: 1, Operation: "ack", MessageID: 7, AcquireAvailable: boolPointer(true)})
 	if invalid.Code != "invalid_acquisition" || server.pending == nil || !server.pending.deleted || server.lastAckedID != 0 {
 		t.Fatalf("invalid acquisition advanced state: response=%#v pending=%#v", invalid, server.pending)
 	}
 	backend.acquired = []int64{41}
-	valid := server.handle(context.Background(), protocolRequest{Version: 1, Operation: "ack", MessageID: 7})
+	valid := server.handle(context.Background(), protocolRequest{Version: 1, Operation: "ack", MessageID: 7, AcquireAvailable: boolPointer(true)})
 	if valid.Type != "acked" || !reflect.DeepEqual(valid.AcquiredRequests, []int64{41}) || !reflect.DeepEqual(backend.calls, []string{"poll", "delete:7", "acquire:[41]", "acquire:[41]"}) {
 		t.Fatalf("acquisition retry response=%#v calls=%v", valid, backend.calls)
 	}
@@ -348,7 +382,7 @@ func TestPollRejectsNonAdvancingMessageID(t *testing.T) {
 	if response := server.handle(context.Background(), protocolRequest{Version: 1, Operation: "poll"}); response.Type != "message" {
 		t.Fatalf("first poll response=%#v", response)
 	}
-	if response := server.handle(context.Background(), protocolRequest{Version: 1, Operation: "ack", MessageID: 7}); response.Type != "acked" {
+	if response := server.handle(context.Background(), protocolRequest{Version: 1, Operation: "ack", MessageID: 7, AcquireAvailable: boolPointer(false)}); response.Type != "acked" {
 		t.Fatalf("ack response=%#v", response)
 	}
 	backend.message = &scaleset.RunnerScaleSetMessage{MessageID: 7, Statistics: &scaleset.RunnerScaleSetStatistic{}}

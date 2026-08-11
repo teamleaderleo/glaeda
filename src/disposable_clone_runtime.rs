@@ -1144,6 +1144,19 @@ mod tests {
         }
     }
 
+    fn initialize_scale_set_control(
+        root: &TempRoot,
+        source_identity: &ScaleSetBridgeIdentity,
+    ) -> UnixPersonalWorkerStore {
+        let store =
+            UnixPersonalWorkerStore::open_or_create_disposable_catalog(root.path()).unwrap();
+        let mut catalog = DisposableAttemptCatalog::new(store);
+        catalog.initialize().unwrap();
+        let mut store = catalog.into_store();
+        store.initialize_scale_set_inbox(source_identity).unwrap();
+        store
+    }
+
     impl LimaObservationClock for FixedMillisClock {
         fn unix_seconds(&self) -> io::Result<u64> {
             Ok(self.0 / 1_000)
@@ -1625,13 +1638,11 @@ mod tests {
         );
         let clone_runtime = runtime(&root, &host);
         let mut executor = executor(&host, false);
-        let attempt_id =
-            install_running_registering_attempt(&root, &host, &clone_runtime, &mut executor);
-        let mut store =
-            UnixPersonalWorkerStore::open_or_create_disposable_catalog(root.path()).unwrap();
         let source_identity =
             ScaleSetBridgeIdentity::parse(&format!("sha256:{}", "66".repeat(32))).unwrap();
-        store.initialize_scale_set_inbox(&source_identity).unwrap();
+        let mut store = initialize_scale_set_control(&root, &source_identity);
+        let attempt_id =
+            install_running_registering_attempt(&root, &host, &clone_runtime, &mut executor);
         let runner_runtime =
             DisposableRunnerRuntime::new("/opt/homebrew/bin/limactl", host.lima_home()).unwrap();
         let mut registration = FakeRegistration {
@@ -1689,12 +1700,10 @@ mod tests {
         ScaleSetBridgeIdentity,
         ScaleSetRunnerReference,
     ) {
-        let attempt_id = install_running_registering_attempt(root, host, clone_runtime, executor);
         let source_identity =
             ScaleSetBridgeIdentity::parse(&format!("sha256:{}", "70".repeat(32))).unwrap();
-        let mut store =
-            UnixPersonalWorkerStore::open_or_create_disposable_catalog(root.path()).unwrap();
-        store.initialize_scale_set_inbox(&source_identity).unwrap();
+        let mut store = initialize_scale_set_control(root, &source_identity);
+        let attempt_id = install_running_registering_attempt(root, host, clone_runtime, executor);
         let runner_runtime =
             DisposableRunnerRuntime::new("/opt/homebrew/bin/limactl", host.lima_home()).unwrap();
         let runner = ScaleSetRunnerReference::new(
@@ -1963,14 +1972,12 @@ mod tests {
         );
         let clone_runtime = runtime(&root, &host);
         let mut executor = executor(&host, false);
+        let source_identity =
+            ScaleSetBridgeIdentity::parse(&format!("sha256:{}", "67".repeat(32))).unwrap();
+        let mut store = initialize_scale_set_control(&root, &source_identity);
         let attempt_id =
             install_running_registering_attempt(&root, &host, &clone_runtime, &mut executor);
         executor.fail_runner = true;
-        let source_identity =
-            ScaleSetBridgeIdentity::parse(&format!("sha256:{}", "67".repeat(32))).unwrap();
-        let mut store =
-            UnixPersonalWorkerStore::open_or_create_disposable_catalog(root.path()).unwrap();
-        store.initialize_scale_set_inbox(&source_identity).unwrap();
         let runner_runtime =
             DisposableRunnerRuntime::new("/opt/homebrew/bin/limactl", host.lima_home()).unwrap();
         let mut registration = FakeRegistration {
@@ -2020,14 +2027,12 @@ mod tests {
         );
         let clone_runtime = runtime(&root, &host);
         let mut executor = executor(&host, false);
+        let source_identity =
+            ScaleSetBridgeIdentity::parse(&format!("sha256:{}", "69".repeat(32))).unwrap();
+        let mut store = initialize_scale_set_control(&root, &source_identity);
         let attempt_id =
             install_running_registering_attempt(&root, &host, &clone_runtime, &mut executor);
         executor.rewrite_target_after_runner = true;
-        let source_identity =
-            ScaleSetBridgeIdentity::parse(&format!("sha256:{}", "69".repeat(32))).unwrap();
-        let mut store =
-            UnixPersonalWorkerStore::open_or_create_disposable_catalog(root.path()).unwrap();
-        store.initialize_scale_set_inbox(&source_identity).unwrap();
         let runner_runtime =
             DisposableRunnerRuntime::new("/opt/homebrew/bin/limactl", host.lima_home()).unwrap();
         let mut registration = FakeRegistration {
@@ -2077,13 +2082,11 @@ mod tests {
         );
         let clone_runtime = runtime(&root, &host);
         let mut executor = executor(&host, false);
-        let attempt_id =
-            install_running_registering_attempt(&root, &host, &clone_runtime, &mut executor);
         let source_identity =
             ScaleSetBridgeIdentity::parse(&format!("sha256:{}", "68".repeat(32))).unwrap();
-        let mut store =
-            UnixPersonalWorkerStore::open_or_create_disposable_catalog(root.path()).unwrap();
-        store.initialize_scale_set_inbox(&source_identity).unwrap();
+        let mut store = initialize_scale_set_control(&root, &source_identity);
+        let attempt_id =
+            install_running_registering_attempt(&root, &host, &clone_runtime, &mut executor);
         let runner_runtime =
             DisposableRunnerRuntime::new("/opt/homebrew/bin/limactl", host.lima_home()).unwrap();
         let existing = ScaleSetRunnerReference::new(
@@ -2297,7 +2300,11 @@ mod tests {
             Ok(self.response.borrow_mut().take().unwrap())
         }
 
-        fn ack(&mut self, _message_id: u32) -> Result<Vec<u64>, ScaleSetBridgeError> {
+        fn ack(
+            &mut self,
+            _message_id: u32,
+            _acquire_available: bool,
+        ) -> Result<Vec<u64>, ScaleSetBridgeError> {
             unreachable!("clone admission never acknowledges a message")
         }
     }
@@ -2506,12 +2513,10 @@ mod tests {
             SOURCE_DISK,
         );
         let runtime = runtime(&root, &host);
-        let attempt_id = install_reserved_attempt(&root);
         let identity =
             ScaleSetBridgeIdentity::parse(&format!("sha256:{}", "45".repeat(32))).unwrap();
-        let mut store =
-            UnixPersonalWorkerStore::open_or_recover_scale_set_inbox(root.path()).unwrap();
-        store.initialize_scale_set_inbox(&identity).unwrap();
+        let mut store = initialize_scale_set_control(&root, &identity);
+        let attempt_id = install_reserved_attempt(&root);
         let executor = executor(&host, false);
         let mut bridge = MessageBridge {
             response: RefCell::new(Some(ScaleSetBridgePoll::Message {
@@ -2576,13 +2581,11 @@ mod tests {
         );
         let runtime = runtime(&root, &host);
         install_ready_generation(&root, &host, &runtime);
-        let attempt_id = install_authorized_attempt(&root);
         let identity =
             ScaleSetBridgeIdentity::parse(&format!("sha256:{}", "44".repeat(32))).unwrap();
-        let mut store =
-            UnixPersonalWorkerStore::open_or_recover_scale_set_inbox(root.path()).unwrap();
-        store.initialize_scale_set_inbox(&identity).unwrap();
+        let store = initialize_scale_set_control(&root, &identity);
         drop(store);
+        let attempt_id = install_authorized_attempt(&root);
         let executor = executor(&host, false);
         let mut bridge = MessageBridge {
             response: RefCell::new(Some(ScaleSetBridgePoll::Message {
@@ -3094,6 +3097,9 @@ mod tests {
         );
         let runtime = runtime(&root, &host);
         install_ready_generation(&root, &host, &runtime);
+        let identity =
+            ScaleSetBridgeIdentity::parse(&format!("sha256:{}", "46".repeat(32))).unwrap();
+        let mut store = initialize_scale_set_control(&root, &identity);
         let attempt_id = install_authorized_attempt(&root);
         let mut executor = executor(&host, false);
         runtime
@@ -3105,11 +3111,6 @@ mod tests {
             )
             .unwrap();
         executor.target_ready = true;
-        let identity =
-            ScaleSetBridgeIdentity::parse(&format!("sha256:{}", "46".repeat(32))).unwrap();
-        let mut store =
-            UnixPersonalWorkerStore::open_or_recover_scale_set_inbox(root.path()).unwrap();
-        store.initialize_scale_set_inbox(&identity).unwrap();
         let mut bridge = MessageBridge {
             response: RefCell::new(Some(ScaleSetBridgePoll::Message {
                 message_id: 9,

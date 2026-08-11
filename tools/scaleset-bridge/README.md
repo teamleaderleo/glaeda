@@ -14,7 +14,8 @@ poll through official client
 -> return one bounded normalized message to Rust
 -> persist/reconcile it under the durable SmolRunner lock
 -> explicit ack from Rust
--> delete the message and acquire its available job request IDs
+-> delete the message and acquire its available job request IDs only when Rust's exact durable
+   reservation remains inside its hard execution deadline
 ```
 
 ## Process contract
@@ -26,8 +27,9 @@ types before the pinned official client can normalize them. Protocol version 1 s
 - `start`: accept the GitHub App private key through stdin, verify one already-enrolled exact scale
   set by ID/name/group/labels/disabled-update policy, and create a message session;
 - `poll` and `ack`: expose the latest validated statistics and bounded job lifecycle messages
-  without automatic acknowledgement, and accept only positive unique acquired IDs from the exact
-  persisted available-job set;
+  without automatic acknowledgement; Rust explicitly selects whether an acknowledgement may
+  acquire the one persisted available job, and returned acquired IDs must remain a positive unique
+  subset of that exact offered set;
 - `resume`: restore a fresh session's durable acknowledged-message cursor and, when Rust has a
   pending durable message, re-fetch that exact message ID before acknowledgement can resume; Rust
   separately requires the complete normalized event bundle to equal its durable inbox;

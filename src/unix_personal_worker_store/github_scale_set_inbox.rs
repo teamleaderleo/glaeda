@@ -63,7 +63,8 @@ impl UnixPersonalWorkerStore {
             .map_err(map_store_error)?;
         require_other_stages_clean(self)?;
         self.recover_scale_set_inbox_locked()?;
-        self.load_catalog_named(super::disposable_attempt_catalog::CATALOG_DOCUMENT)
+        let catalog = self
+            .load_catalog_named(super::disposable_attempt_catalog::CATALOG_DOCUMENT)
             .map_err(map_catalog_error)?
             .ok_or_else(|| ScaleSetInboxError::new("inbox_catalog_missing"))?;
         if let Some(current) = self.load_scale_set_inbox_named(INBOX_DOCUMENT)? {
@@ -71,6 +72,11 @@ impl UnixPersonalWorkerStore {
                 return Err(ScaleSetInboxError::new("inbox_source_mismatch"));
             }
             return Ok(current);
+        }
+        if catalog != DisposableAttemptCatalogDocument::empty() {
+            return Err(ScaleSetInboxError::new(
+                "inbox_catalog_history_without_inbox",
+            ));
         }
 
         let document = ScaleSetInboxDocument::empty(source_identity.clone());
@@ -304,6 +310,76 @@ impl UnixPersonalWorkerStore {
         Ok(next)
     }
 
+    /// Durably consume an expired, unacquired pre-clone reservation without consulting the source
+    /// template.
+    ///
+    /// Template health may gate creation, but it must never gate return of capacity that has not
+    /// crossed the clone-start checkpoint or acquired an external GitHub job. An acquired job is
+    /// instead retained until an exact upstream cancellation event releases it.
+    pub(crate) fn checkpoint_expired_scale_set_preclone_attempt(
+        &mut self,
+        expected_source_identity: &ScaleSetBridgeIdentity,
+        attempt_id: &crate::disposable_worker_reconciler::DisposableAttemptId,
+        now: crate::execution_admission::EpochMillis,
+    ) -> Result<bool, ScaleSetInboxError> {
+        let _lock = self.acquire_mutation_lock().map_err(map_store_error)?;
+        synchronize_directory(&self.directory, "personal worker store directory")
+            .map_err(map_store_error)?;
+        require_non_message_stages_clean(self)?;
+        self.recover_scale_set_transaction_stages()?;
+        let inbox = self
+            .load_scale_set_inbox_named(INBOX_DOCUMENT)?
+            .ok_or_else(|| ScaleSetInboxError::new("inbox_missing"))?;
+        if inbox.source_identity() != expected_source_identity {
+            return Err(ScaleSetInboxError::new("inbox_source_mismatch"));
+        }
+        if inbox.requires_reconciliation() {
+            return Err(ScaleSetInboxError::new("inbox_recovery_required"));
+        }
+        let catalog = self
+            .load_catalog_named(super::disposable_attempt_catalog::CATALOG_DOCUMENT)
+            .map_err(map_catalog_error)?
+            .ok_or_else(|| ScaleSetInboxError::new("inbox_catalog_missing"))?;
+        let reservation = catalog
+            .find_active(attempt_id)
+            .ok_or_else(|| ScaleSetInboxError::new("inbox_release_refused"))?;
+        if !matches!(
+            reservation.attempt().phase(),
+            crate::disposable_worker_reconciler::DisposableAttemptPhase::Reserved
+                | crate::disposable_worker_reconciler::DisposableAttemptPhase::CloneAuthorized
+        ) {
+            return Err(ScaleSetInboxError::new("inbox_release_refused"));
+        }
+        if now <= reservation.attempt().not_after() {
+            return Ok(false);
+        }
+        // A clean inbox plus the exact prebound job identity means the Available offer was
+        // durably acknowledged as acquired. The unacquired acknowledgement path removes that
+        // authority by moving the attempt to UnprovisionedReleasing before the inbox is clean.
+        // Never forget an acquired GitHub job merely because its local start deadline elapsed;
+        // the service must keep polling until exact upstream cancellation settles it.
+        if reservation.attempt().github_job_id().is_some() {
+            return Ok(false);
+        }
+        let next = catalog
+            .replace_attempt(
+                attempt_id,
+                reservation.attempt().revision(),
+                crate::disposable_attempt_catalog::DisposableAttemptCatalogAction::BeginUnprovisionedRelease,
+            )
+            .map_err(map_catalog_error)?;
+        next.validate_successor_of(&catalog)
+            .map_err(map_catalog_error)?;
+        let mut staged = self.stage_catalog(&next).map_err(map_catalog_error)?;
+        self.publish_named_staged(
+            &mut staged,
+            super::disposable_attempt_catalog::CATALOG_DOCUMENT,
+            false,
+        )
+        .map_err(map_store_error)?;
+        Ok(true)
+    }
+
     /// Move one exact complete Scale Set attempt into bounded replay history.
     pub(crate) fn retire_scale_set_complete_attempt(
         &mut self,
@@ -449,7 +525,12 @@ impl UnixPersonalWorkerStore {
         &mut self,
         expected_source_identity: &ScaleSetBridgeIdentity,
         expected_inbox_revision: ScaleSetInboxRevision,
-        acknowledge: impl FnOnce(u32) -> Result<Vec<u64>, E>,
+        expected_catalog_revision: crate::disposable_attempt_catalog::DisposableAttemptCatalogRevision,
+        acknowledge: impl FnOnce(
+            u32,
+            &PendingScaleSetMessage,
+            &DisposableAttemptCatalogDocument,
+        ) -> Result<Vec<u64>, E>,
     ) -> Result<Result<ScaleSetInboxDocument, E>, ScaleSetInboxError> {
         let _lock = self.acquire_mutation_lock().map_err(map_store_error)?;
         synchronize_directory(&self.directory, "personal worker store directory")
@@ -465,19 +546,26 @@ impl UnixPersonalWorkerStore {
         if inbox.source_identity() != expected_source_identity {
             return Err(ScaleSetInboxError::new("inbox_source_mismatch"));
         }
-        let message_id = inbox
+        let catalog = self
+            .load_catalog_named(super::disposable_attempt_catalog::CATALOG_DOCUMENT)
+            .map_err(map_catalog_error)?
+            .ok_or_else(|| ScaleSetInboxError::new("inbox_catalog_missing"))?;
+        if catalog.revision() != expected_catalog_revision {
+            return Err(ScaleSetInboxError::new("inbox_catalog_conflict"));
+        }
+        let pending = inbox
             .pending()
             .filter(|pending| {
                 !pending.ack_started() && pending.next_event_index() == pending.events().len()
             })
-            .map(PendingScaleSetMessage::message_id)
             .ok_or_else(|| ScaleSetInboxError::new("inbox_ack_refused"))?;
+        let message_id = pending.message_id();
         let started = inbox.begin_ack(message_id)?;
         let mut staged = self.stage_scale_set_inbox(&started)?;
         self.publish_named_staged(&mut staged, INBOX_DOCUMENT, false)
             .map_err(map_store_error)?;
 
-        let acquired_request_ids = match acknowledge(message_id) {
+        let acquired_request_ids = match acknowledge(message_id, pending, &catalog) {
             Ok(acquired) => acquired,
             Err(error) => return Ok(Err(error)),
         };
@@ -1062,6 +1150,58 @@ mod tests {
     }
 
     #[test]
+    fn missing_inbox_cannot_reset_nonempty_catalog_history() {
+        let root = TempRoot::new("missing-inbox-with-history");
+        let mut store = initialized_store(&root);
+        let identity = source_identity();
+        let empty = store.initialize_scale_set_inbox(&identity).unwrap();
+        let recorded = empty
+            .record(
+                7,
+                EpochMillis::new(100_000).unwrap(),
+                EpochMillis::new(120_000).unwrap(),
+                vec![event()],
+            )
+            .unwrap();
+        store
+            .replace_scale_set_inbox_if_revision(empty.revision(), &recorded)
+            .unwrap();
+        let policy = consumer_policy();
+        store
+            .apply_next_scale_set_event(
+                &identity,
+                recorded.revision(),
+                |pending, event, catalog| {
+                    crate::github_scale_set_consumer::apply_scale_set_event(
+                        &policy,
+                        pending,
+                        event,
+                        catalog,
+                        EpochMillis::new(100_001).unwrap(),
+                    )
+                    .map(|next| (next, ()))
+                },
+            )
+            .unwrap()
+            .unwrap();
+        std::fs::remove_file(
+            root.0
+                .join(super::super::STORE_DIRECTORY)
+                .join(INBOX_DOCUMENT),
+        )
+        .unwrap();
+
+        assert_eq!(
+            store
+                .initialize_scale_set_inbox(&identity)
+                .unwrap_err()
+                .code(),
+            "inbox_catalog_history_without_inbox"
+        );
+        assert!(store.load_scale_set_inbox().unwrap().is_none());
+    }
+
+    #[test]
     fn catalog_effect_precedes_cursor_and_replay_is_idempotent() {
         let root = TempRoot::new("event-transaction");
         let mut store = initialized_store(&root);
@@ -1157,7 +1297,7 @@ mod tests {
             .replace_scale_set_inbox_if_revision(empty.revision(), &recorded)
             .unwrap();
         let policy = consumer_policy();
-        let (applied, _, ()) = store
+        let (applied, applied_catalog, ()) = store
             .apply_next_scale_set_event(
                 &identity,
                 recorded.revision(),
@@ -1177,12 +1317,18 @@ mod tests {
 
         let path = root.0.join(STORE_DIRECTORY).join(INBOX_DOCUMENT);
         let completed = store
-            .acknowledge_scale_set_message(&identity, applied.revision(), |message_id| {
-                assert_eq!(message_id, 7);
-                let checkpoint = decode_scale_set_inbox(&std::fs::read(&path).unwrap()).unwrap();
-                assert!(checkpoint.pending().unwrap().ack_started());
-                Ok::<_, ()>(vec![41])
-            })
+            .acknowledge_scale_set_message(
+                &identity,
+                applied.revision(),
+                applied_catalog.revision(),
+                |message_id, _, _| {
+                    assert_eq!(message_id, 7);
+                    let checkpoint =
+                        decode_scale_set_inbox(&std::fs::read(&path).unwrap()).unwrap();
+                    assert!(checkpoint.pending().unwrap().ack_started());
+                    Ok::<_, ()>(vec![41])
+                },
+            )
             .unwrap()
             .unwrap();
         assert!(completed.pending().is_none());
@@ -1217,9 +1363,12 @@ mod tests {
             .replace_scale_set_inbox_if_revision(reconciled.revision(), &second)
             .unwrap();
         let failed = store
-            .acknowledge_scale_set_message(&identity, second.revision(), |_| {
-                Err::<Vec<u64>, _>("bridge-failed")
-            })
+            .acknowledge_scale_set_message(
+                &identity,
+                second.revision(),
+                acquired_catalog.revision(),
+                |_, _, _| Err::<Vec<u64>, _>("bridge-failed"),
+            )
             .unwrap();
         assert_eq!(failed.unwrap_err(), "bridge-failed");
         assert!(
@@ -1251,7 +1400,7 @@ mod tests {
             .replace_scale_set_inbox_if_revision(empty.revision(), &recorded)
             .unwrap();
         let policy = consumer_policy();
-        let (applied, _, ()) = store
+        let (applied, applied_catalog, ()) = store
             .apply_next_scale_set_event(
                 &identity,
                 recorded.revision(),
@@ -1269,9 +1418,12 @@ mod tests {
             .unwrap()
             .unwrap();
         let completed = store
-            .acknowledge_scale_set_message(&identity, applied.revision(), |_| {
-                Ok::<_, ()>(Vec::new())
-            })
+            .acknowledge_scale_set_message(
+                &identity,
+                applied.revision(),
+                applied_catalog.revision(),
+                |_, _, _| Ok::<_, ()>(Vec::new()),
+            )
             .unwrap()
             .unwrap();
 
@@ -1307,5 +1459,168 @@ mod tests {
             crate::disposable_worker_reconciler::DisposableAttemptPhase::UnprovisionedReleasing
         );
         assert!(DisposableAttemptCatalogStore::recover(&mut store).is_ok());
+    }
+
+    #[test]
+    fn expired_acquired_clone_authorization_waits_for_upstream_cancellation() {
+        let root = TempRoot::new("expired-clone-authorization");
+        let mut store = initialized_store(&root);
+        let identity = source_identity();
+        let empty = store.initialize_scale_set_inbox(&identity).unwrap();
+        let recorded = empty
+            .record(
+                7,
+                EpochMillis::new(100_000).unwrap(),
+                EpochMillis::new(120_000).unwrap(),
+                vec![event()],
+            )
+            .unwrap();
+        store
+            .replace_scale_set_inbox_if_revision(empty.revision(), &recorded)
+            .unwrap();
+        let policy = consumer_policy();
+        let (applied, reserved, ()) = store
+            .apply_next_scale_set_event(
+                &identity,
+                recorded.revision(),
+                |pending, event, catalog| {
+                    apply_scale_set_event(
+                        &policy,
+                        pending,
+                        event,
+                        catalog,
+                        EpochMillis::new(100_001).unwrap(),
+                    )
+                    .map(|next| (next, ()))
+                },
+            )
+            .unwrap()
+            .unwrap();
+        let acknowledged = store
+            .acknowledge_scale_set_message(
+                &identity,
+                applied.revision(),
+                reserved.revision(),
+                |_, _, _| Ok::<_, ()>(vec![41]),
+            )
+            .unwrap()
+            .unwrap();
+        let (settled, reserved, ()) = store
+            .apply_scale_set_ack_outcome(&identity, acknowledged.revision(), |receipt, catalog| {
+                apply_scale_set_ack_outcome(&policy, receipt, catalog).map(|next| (next, ()))
+            })
+            .unwrap()
+            .unwrap();
+        assert!(settled.last_ack().unwrap().outcome_applied());
+        let attempt_id = reserved.active()[0].attempt().attempt_id().clone();
+        let authorized = reserved
+            .replace_attempt(
+                &attempt_id,
+                reserved.active()[0].attempt().revision(),
+                crate::disposable_attempt_catalog::DisposableAttemptCatalogAction::AuthorizeClone,
+            )
+            .unwrap();
+        DisposableAttemptCatalogStore::replace_if_revision(
+            &mut store,
+            reserved.revision(),
+            &authorized,
+        )
+        .unwrap();
+
+        assert!(
+            !store
+                .checkpoint_expired_scale_set_preclone_attempt(
+                    &identity,
+                    &attempt_id,
+                    EpochMillis::new(21_700_001).unwrap(),
+                )
+                .unwrap()
+        );
+        let catalog = DisposableAttemptCatalogStore::load(&store)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            catalog.active()[0].attempt().phase(),
+            crate::disposable_worker_reconciler::DisposableAttemptPhase::CloneAuthorized
+        );
+    }
+
+    #[test]
+    fn expired_acquired_job_cannot_take_the_unprovisioned_release_path() {
+        let root = TempRoot::new("expired-acquired-job");
+        let mut store = initialized_store(&root);
+        let identity = source_identity();
+        let empty = store.initialize_scale_set_inbox(&identity).unwrap();
+        let recorded = empty
+            .record(
+                7,
+                EpochMillis::new(100_000).unwrap(),
+                EpochMillis::new(120_000).unwrap(),
+                vec![event()],
+            )
+            .unwrap();
+        store
+            .replace_scale_set_inbox_if_revision(empty.revision(), &recorded)
+            .unwrap();
+        let policy = consumer_policy();
+        let (applied, reserved, ()) = store
+            .apply_next_scale_set_event(
+                &identity,
+                recorded.revision(),
+                |pending, event, catalog| {
+                    apply_scale_set_event(
+                        &policy,
+                        pending,
+                        event,
+                        catalog,
+                        EpochMillis::new(100_001).unwrap(),
+                    )
+                    .map(|next| (next, ()))
+                },
+            )
+            .unwrap()
+            .unwrap();
+        let acknowledged = store
+            .acknowledge_scale_set_message(
+                &identity,
+                applied.revision(),
+                reserved.revision(),
+                |_, _, _| Ok::<_, ()>(vec![41]),
+            )
+            .unwrap()
+            .unwrap();
+        let (settled, acquired, ()) = store
+            .apply_scale_set_ack_outcome(&identity, acknowledged.revision(), |receipt, catalog| {
+                apply_scale_set_ack_outcome(&policy, receipt, catalog).map(|next| (next, ()))
+            })
+            .unwrap()
+            .unwrap();
+        assert!(settled.last_ack().unwrap().outcome_applied());
+        let attempt_id = acquired.active()[0].attempt().attempt_id().clone();
+
+        assert!(
+            !store
+                .checkpoint_expired_scale_set_preclone_attempt(
+                    &identity,
+                    &attempt_id,
+                    EpochMillis::new(21_700_001).unwrap(),
+                )
+                .unwrap()
+        );
+        let catalog = DisposableAttemptCatalogStore::load(&store)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            catalog.active()[0].attempt().phase(),
+            crate::disposable_worker_reconciler::DisposableAttemptPhase::Reserved
+        );
+        assert_eq!(
+            catalog.active()[0]
+                .attempt()
+                .github_job_id()
+                .unwrap()
+                .as_str(),
+            "job-1"
+        );
     }
 }

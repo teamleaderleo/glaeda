@@ -28,7 +28,9 @@ use crate::github_scale_set_supervisor::{
     ScaleSetSupervisorExit, ScaleSetSupervisorPolicy, ThreadScaleSetSupervisorWait,
 };
 use crate::lima_observation::LimaObservationClock;
+use crate::personal_worker_store::PersonalWorkerStoreErrorKind;
 use crate::process::ProcessExecutor;
+use crate::unix_personal_worker_store::DisposableWorkerServiceLock;
 use crate::unix_personal_worker_store::UnixPersonalWorkerStore;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -74,6 +76,7 @@ impl fmt::Display for DisposableWorkerServiceError {
 impl std::error::Error for DisposableWorkerServiceError {}
 
 struct PreparedDisposableWorkerService {
+    _service_lock: DisposableWorkerServiceLock,
     scale_set: PreparedScaleSetService,
     parts: DisposableWorkerEnrollmentParts,
 }
@@ -88,6 +91,18 @@ fn prepare_durable_service(
             DisposableWorkerServiceError::new(
                 DisposableWorkerServiceErrorKind::DurableState,
                 "disposable_worker_store_unavailable",
+            )
+        })?;
+    let service_lock = store
+        .acquire_disposable_worker_service_lock()
+        .map_err(|error| {
+            DisposableWorkerServiceError::new(
+                DisposableWorkerServiceErrorKind::DurableState,
+                if error.kind() == PersonalWorkerStoreErrorKind::Busy {
+                    "disposable_worker_service_busy"
+                } else {
+                    "disposable_worker_service_lock_unavailable"
+                },
             )
         })?;
     let mut catalog = DisposableAttemptCatalog::new(store);
@@ -108,7 +123,11 @@ fn prepare_durable_service(
             error.code(),
         )
     })?;
-    Ok(PreparedDisposableWorkerService { scale_set, parts })
+    Ok(PreparedDisposableWorkerService {
+        _service_lock: service_lock,
+        scale_set,
+        parts,
+    })
 }
 
 fn recover_disposable_documents(
@@ -328,6 +347,21 @@ mod tests {
                 .is_file()
         );
         drop(prepared);
+    }
+
+    #[test]
+    fn a_second_service_cannot_open_a_competing_bridge_session() {
+        let root = TempRoot::new();
+        let prepared = prepare_durable_service(enrollment(&root.0)).unwrap();
+
+        let error = match prepare_durable_service(enrollment(&root.0)) {
+            Ok(_) => panic!("competing service unexpectedly acquired controller ownership"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), "disposable_worker_service_busy");
+
+        drop(prepared);
+        drop(prepare_durable_service(enrollment(&root.0)).unwrap());
     }
 
     #[test]

@@ -939,9 +939,15 @@ impl ScaleSetBridgeClient {
         self.finish_response(result)
     }
 
-    pub(crate) fn ack(&mut self, message_id: u32) -> Result<Vec<u64>, ScaleSetBridgeError> {
-        let mut response =
-            exchange_and_decode(self.transport.as_mut(), &BridgeRequest::ack(message_id))?;
+    pub(crate) fn ack(
+        &mut self,
+        message_id: u32,
+        acquire_available: bool,
+    ) -> Result<Vec<u64>, ScaleSetBridgeError> {
+        let mut response = exchange_and_decode(
+            self.transport.as_mut(),
+            &BridgeRequest::ack(message_id, acquire_available),
+        )?;
         let result = (|| {
             if response.response_type == "error" {
                 return Err(response.bridge_error()?);
@@ -962,6 +968,9 @@ impl ScaleSetBridgeClient {
                 if *id == 0 || !seen.insert(*id) {
                     return Err(ScaleSetBridgeError::new("invalid_bridge_response"));
                 }
+            }
+            if !acquire_available && !response.acquired_requests.is_empty() {
+                return Err(ScaleSetBridgeError::new("invalid_bridge_response"));
             }
             Ok(std::mem::take(&mut response.acquired_requests))
         })();
@@ -1218,6 +1227,8 @@ struct BridgeRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     max_capacity: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    acquire_available: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     runner_name: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     runner_id: Option<u64>,
@@ -1267,6 +1278,7 @@ impl<'a> BridgeRequest<'a> {
             message_id: None,
             last_acked_message_id: None,
             max_capacity: None,
+            acquire_available: None,
             runner_name: None,
             runner_id: None,
             work_folder: None,
@@ -1281,13 +1293,14 @@ impl<'a> BridgeRequest<'a> {
             message_id: None,
             last_acked_message_id: None,
             max_capacity: Some(max_capacity),
+            acquire_available: None,
             runner_name: None,
             runner_id: None,
             work_folder: None,
         }
     }
 
-    const fn ack(message_id: u32) -> Self {
+    const fn ack(message_id: u32, acquire_available: bool) -> Self {
         Self {
             version: PROTOCOL_VERSION,
             operation: "ack",
@@ -1295,6 +1308,7 @@ impl<'a> BridgeRequest<'a> {
             message_id: Some(message_id),
             last_acked_message_id: None,
             max_capacity: None,
+            acquire_available: Some(acquire_available),
             runner_name: None,
             runner_id: None,
             work_folder: None,
@@ -1309,6 +1323,7 @@ impl<'a> BridgeRequest<'a> {
             message_id: (message_id != 0).then_some(message_id),
             last_acked_message_id: (last_acked_message_id != 0).then_some(last_acked_message_id),
             max_capacity: Some(max_capacity),
+            acquire_available: None,
             runner_name: None,
             runner_id: None,
             work_folder: None,
@@ -1328,6 +1343,7 @@ impl<'a> BridgeRequest<'a> {
             message_id: None,
             last_acked_message_id: None,
             max_capacity: None,
+            acquire_available: None,
             runner_name: Some(runner_name),
             runner_id,
             work_folder,
@@ -1899,7 +1915,7 @@ mod tests {
             events.as_slice(),
             [ScaleSetBridgeEvent::Available(_)]
         ));
-        assert_eq!(client.ack(7).unwrap(), vec![41]);
+        assert_eq!(client.ack(7, true).unwrap(), vec![41]);
         assert_eq!(
             client.poll(2).unwrap_err().code(),
             "invalid_bridge_capacity"
@@ -1929,7 +1945,7 @@ mod tests {
         });
 
         client.resume(7, Some((8, &[expected]))).unwrap();
-        assert_eq!(client.ack(8).unwrap(), vec![41]);
+        assert_eq!(client.ack(8, true).unwrap(), vec![41]);
     }
 
     #[test]

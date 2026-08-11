@@ -186,6 +186,14 @@ therefore performs its own fresh zero-capacity poll: a newly arrived message is 
 before return, while only idle can authorize the next checkpoint.
 The 30-second message-admission window is separate from the deterministic six-hour hard ceiling on
 the resulting one-job attempt, so replay is exact without expiring ordinary builds after one poll.
+If a controller outage outlives that hard ceiling, the exact redelivered message is deleted and
+acknowledged without acquiring its available job; the expired local reservation then follows the
+ordinary unprovisioned-release path instead of accepting work that can no longer start safely.
+The acquisition deadline is sampled only after the durable acknowledgement checkpoint while the
+canonical store lock still binds the exact message and catalog. If GitHub nevertheless confirms an
+acquisition before that boundary, the durable job binding cannot enter unprovisioned release after
+the deadline; capacity stays closed while the service polls until the exact upstream cancellation
+settles the obligation.
 Unacquired or pre-clone-canceled work completes its durable release and moves immediately into
 bounded replay history, so repeated cancellations restore advertised capacity instead of filling
 the active catalog.
@@ -256,7 +264,12 @@ The private service composition now consumes that enrollment and performs bounde
 of the template, attempt catalog, and Scale Set inbox before initialization. A fresh bridge session
 restores the durable acknowledged-message cursor and re-fetches any pending message from GitHub;
 its exact normalized event bundle must match the durable inbox before acknowledgement authority is
-restored. Source-template readiness gates only new polling and clone execution. Registration, job
+restored. One dedicated no-follow private lock permits only one process-lifetime bridge/controller
+session; short durable mutations continue to use the canonical store lock. A missing inbox may be
+created only beside the exact pristine catalog, so cursor loss cannot be spliced onto active or
+historical attempt authority. Source-template readiness gates only new polling and clone execution.
+An expired Reserved or CloneAuthorized attempt is checkpointed into unprovisioned release before
+that template gate, so a permanently broken source cannot retain unused capacity. Registration, job
 event handling, teardown, capacity release, and retirement continue even when that source is
 refused or needs rebuilding, so a broken source cannot strand an existing hostile worker. The
 single supervisor retry/circuit policy drives template maintenance and the production clock,

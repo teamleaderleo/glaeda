@@ -27,7 +27,7 @@ use crate::github_scale_set_bridge::{
 };
 use crate::github_scale_set_consumer::{
     ScaleSetConsumerError, ScaleSetConsumerPolicy, apply_scale_set_ack_outcome,
-    apply_scale_set_event,
+    apply_scale_set_event, should_acquire_scale_set_available,
 };
 use crate::github_scale_set_inbox::{PendingScaleSetMessage, ScaleSetInboxError};
 use crate::github_scale_set_protocol::{ScaleSetRunnerName, ScaleSetRunnerReference};
@@ -39,7 +39,11 @@ const MESSAGE_FRESHNESS_MILLIS: u64 = 30_000;
 
 pub(crate) trait ScaleSetBridgeSession {
     fn poll(&mut self, available_capacity: u16) -> Result<ScaleSetBridgePoll, ScaleSetBridgeError>;
-    fn ack(&mut self, message_id: u32) -> Result<Vec<u64>, ScaleSetBridgeError>;
+    fn ack(
+        &mut self,
+        message_id: u32,
+        acquire_available: bool,
+    ) -> Result<Vec<u64>, ScaleSetBridgeError>;
 }
 
 pub(crate) trait ScaleSetRunnerBridgeSession {
@@ -64,8 +68,12 @@ impl ScaleSetBridgeSession for ScaleSetBridgeClient {
         ScaleSetBridgeClient::poll(self, available_capacity)
     }
 
-    fn ack(&mut self, message_id: u32) -> Result<Vec<u64>, ScaleSetBridgeError> {
-        ScaleSetBridgeClient::ack(self, message_id)
+    fn ack(
+        &mut self,
+        message_id: u32,
+        acquire_available: bool,
+    ) -> Result<Vec<u64>, ScaleSetBridgeError> {
+        ScaleSetBridgeClient::ack(self, message_id, acquire_available)
     }
 }
 
@@ -375,13 +383,23 @@ impl<B: ScaleSetBridgeSession, C: ScaleSetServiceClock> ScaleSetService<B, C> {
 
             let message_id = pending.message_id();
             let bridge = &mut self.bridge;
+            let clock = &self.clock;
+            let policy = &self.policy;
             self.store
                 .acknowledge_scale_set_message(
                     &self.source_identity,
                     inbox.revision(),
-                    |message_id| {
+                    catalog.revision(),
+                    |message_id, pending, catalog| {
+                        // Sample the acquisition deadline only after the durable ack-started
+                        // checkpoint while the canonical store lock still binds this exact
+                        // pending message and catalog revision.
+                        let now = clock.now()?;
+                        let acquire_available =
+                            should_acquire_scale_set_available(policy, pending, catalog, now)
+                                .map_err(ScaleSetServiceError::from_consumer)?;
                         bridge
-                            .ack(message_id)
+                            .ack(message_id, acquire_available)
                             .map_err(ScaleSetServiceError::from_bridge)
                     },
                 )
@@ -510,12 +528,48 @@ impl<B: ScaleSetBridgeSession, C: ScaleSetServiceClock> ScaleSetService<B, C> {
                 reservation.attempt().phase(),
                 reservation.attempt().runner_start_started(),
             )?;
-            Ok::<_, ScaleSetServiceError>((attempt_id, operation))
+            Ok::<_, ScaleSetServiceError>((
+                attempt_id,
+                operation,
+                reservation.attempt().github_job_id().is_some(),
+                reservation.attempt().not_after(),
+            ))
         });
         let selected = selected.transpose()?;
-        let operation = selected.as_ref().map(|(_, operation)| *operation);
+        let operation = selected.as_ref().map(|(_, operation, _, _)| *operation);
         drop(catalog);
         drop(inbox);
+
+        if let Some((attempt_id, operation, acquired, not_after)) = selected.as_ref()
+            && matches!(
+                operation,
+                SupervisedOperation::AuthorizeClone | SupervisedOperation::ExecuteClone
+            )
+        {
+            let now = clock
+                .epoch_millis()
+                .map_err(|_| ScaleSetServiceError::new("scale_set_clock_unavailable"))?;
+            let released = self
+                .store
+                .checkpoint_expired_scale_set_preclone_attempt(
+                    &self.source_identity,
+                    attempt_id,
+                    now,
+                )
+                .map_err(ScaleSetServiceError::from_inbox)?;
+            if released {
+                return Ok(ScaleSetServiceDisposition::CleanupCheckpointed {
+                    attempt_id: attempt_id.as_str().to_owned(),
+                    phase: DisposableAttemptPhase::UnprovisionedReleasing,
+                });
+            }
+            if *acquired && now > *not_after {
+                // Acquisition is an external obligation. Once the exact offer was acquired, an
+                // elapsed local start deadline cannot manufacture an unprovisioned release. Keep
+                // capacity closed and poll until GitHub supplies the exact cancellation event.
+                return self.reconcile_once();
+            }
+        }
 
         if let Some(disposition) = advance_template_if_required(operation, || {
             template_runtime
@@ -526,7 +580,7 @@ impl<B: ScaleSetBridgeSession, C: ScaleSetServiceClock> ScaleSetService<B, C> {
             return Ok(disposition);
         }
 
-        let Some((attempt_id, operation)) = selected else {
+        let Some((attempt_id, operation, _, _)) = selected else {
             return self.reconcile_once();
         };
         match operation {
@@ -965,6 +1019,7 @@ impl std::error::Error for ScaleSetServiceError {}
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::collections::VecDeque;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
@@ -1025,11 +1080,32 @@ mod tests {
         }
     }
 
+    struct AckCheckpointClock {
+        now: EpochMillis,
+        calls: Cell<u8>,
+        inbox_path: PathBuf,
+    }
+
+    impl ScaleSetServiceClock for AckCheckpointClock {
+        fn now(&self) -> Result<EpochMillis, ScaleSetServiceError> {
+            let call = self.calls.get().saturating_add(1);
+            self.calls.set(call);
+            if call == 3 {
+                let inbox = crate::github_scale_set_inbox::decode_scale_set_inbox(
+                    &std::fs::read(&self.inbox_path).unwrap(),
+                )
+                .unwrap();
+                assert!(inbox.pending().unwrap().ack_started());
+            }
+            Ok(self.now)
+        }
+    }
+
     struct FakeBridge {
         polls: VecDeque<ScaleSetBridgePoll>,
         acquired: VecDeque<Vec<u64>>,
         capacities: Vec<u16>,
-        acknowledgements: Vec<u32>,
+        acknowledgements: Vec<(u32, bool)>,
     }
 
     impl ScaleSetBridgeSession for FakeBridge {
@@ -1041,8 +1117,12 @@ mod tests {
             Ok(self.polls.pop_front().expect("expected fake poll"))
         }
 
-        fn ack(&mut self, message_id: u32) -> Result<Vec<u64>, ScaleSetBridgeError> {
-            self.acknowledgements.push(message_id);
+        fn ack(
+            &mut self,
+            message_id: u32,
+            acquire_available: bool,
+        ) -> Result<Vec<u64>, ScaleSetBridgeError> {
+            self.acknowledgements.push((message_id, acquire_available));
             Ok(self.acquired.pop_front().unwrap_or_default())
         }
     }
@@ -1061,6 +1141,19 @@ mod tests {
 
     fn source_identity() -> ScaleSetBridgeIdentity {
         ScaleSetBridgeIdentity::parse(&format!("sha256:{}", "55".repeat(32))).unwrap()
+    }
+
+    fn consumer_policy() -> ScaleSetConsumerPolicy {
+        ScaleSetConsumerPolicy::new(
+            source_identity(),
+            23,
+            "project",
+            "example",
+            &["smolrunner".to_owned()],
+            DisposableWorkerResources::new(2_000, 2 << 30, 20 << 30).unwrap(),
+            &current_disposable_prepared_template().unwrap(),
+        )
+        .unwrap()
     }
 
     fn event() -> ScaleSetBridgeEvent {
@@ -1262,8 +1355,119 @@ mod tests {
         assert!(catalog.active().is_empty());
         assert_eq!(catalog.tombstones().len(), 1);
         assert_eq!(bridge.capacities, [1, 1]);
-        assert_eq!(bridge.acknowledgements, [7]);
+        assert_eq!(bridge.acknowledgements, [(7, true)]);
         assert!(DisposableAttemptCatalogStore::recover(&mut store).is_ok());
+    }
+
+    #[test]
+    fn six_hour_outage_acknowledges_without_acquiring_and_releases_capacity() {
+        let root = TempRoot::new();
+        let store = UnixPersonalWorkerStore::open_or_create_disposable_catalog(&root.0).unwrap();
+        let mut catalog = DisposableAttemptCatalog::new(store);
+        catalog.initialize().unwrap();
+        let store = catalog.into_store();
+        let policy = consumer_policy();
+        let bridge = FakeBridge {
+            polls: VecDeque::from([ScaleSetBridgePoll::Message {
+                message_id: 7,
+                statistics: statistics(),
+                events: vec![event()],
+            }]),
+            acquired: VecDeque::from([Vec::new()]),
+            capacities: Vec::new(),
+            acknowledgements: Vec::new(),
+        };
+        let mut service = ScaleSetService::with_parts(
+            store,
+            bridge,
+            policy.clone(),
+            FixedClock(EpochMillis::new(100_000).unwrap()),
+        )
+        .unwrap();
+        assert!(matches!(
+            service.reconcile_once().unwrap(),
+            ScaleSetServiceDisposition::MessagePersisted { .. }
+        ));
+        assert!(matches!(
+            service.reconcile_once().unwrap(),
+            ScaleSetServiceDisposition::EventApplied { .. }
+        ));
+
+        let (store, bridge) = service.into_parts();
+        let mut service = ScaleSetService::with_parts(
+            store,
+            bridge,
+            policy,
+            FixedClock(EpochMillis::new(21_700_001).unwrap()),
+        )
+        .unwrap();
+        assert!(matches!(
+            service.reconcile_once().unwrap(),
+            ScaleSetServiceDisposition::MessageAcknowledged { .. }
+        ));
+        assert!(matches!(
+            service.reconcile_once().unwrap(),
+            ScaleSetServiceDisposition::AckOutcomeApplied { .. }
+        ));
+        assert!(matches!(
+            service.reconcile_once().unwrap(),
+            ScaleSetServiceDisposition::UnprovisionedReleased { .. }
+        ));
+        assert!(matches!(
+            service.reconcile_once().unwrap(),
+            ScaleSetServiceDisposition::AttemptRetired { .. }
+        ));
+        let (store, bridge) = service.into_parts();
+        assert_eq!(bridge.acknowledgements, [(7, false)]);
+        let catalog = DisposableAttemptCatalogStore::load(&store)
+            .unwrap()
+            .unwrap();
+        assert!(catalog.active().is_empty());
+        assert_eq!(catalog.tombstones().len(), 1);
+    }
+
+    #[test]
+    fn acquisition_deadline_is_sampled_after_the_durable_ack_checkpoint() {
+        let root = TempRoot::new();
+        let store = UnixPersonalWorkerStore::open_or_create_disposable_catalog(&root.0).unwrap();
+        let mut catalog = DisposableAttemptCatalog::new(store);
+        catalog.initialize().unwrap();
+        let store = catalog.into_store();
+        let bridge = FakeBridge {
+            polls: VecDeque::from([ScaleSetBridgePoll::Message {
+                message_id: 7,
+                statistics: statistics(),
+                events: vec![event()],
+            }]),
+            acquired: VecDeque::from([vec![41]]),
+            capacities: Vec::new(),
+            acknowledgements: Vec::new(),
+        };
+        let clock = AckCheckpointClock {
+            now: EpochMillis::new(100_000).unwrap(),
+            calls: Cell::new(0),
+            inbox_path: root
+                .0
+                .join("personal-worker")
+                .join("github-scale-set-inbox.json"),
+        };
+        let mut service =
+            ScaleSetService::with_parts(store, bridge, consumer_policy(), clock).unwrap();
+
+        assert!(matches!(
+            service.reconcile_once().unwrap(),
+            ScaleSetServiceDisposition::MessagePersisted { .. }
+        ));
+        assert!(matches!(
+            service.reconcile_once().unwrap(),
+            ScaleSetServiceDisposition::EventApplied { .. }
+        ));
+        assert!(matches!(
+            service.reconcile_once().unwrap(),
+            ScaleSetServiceDisposition::MessageAcknowledged { .. }
+        ));
+        let (_, bridge) = service.into_parts();
+        assert_eq!(bridge.acknowledgements, [(7, true)]);
     }
 
     #[test]
@@ -1470,6 +1674,6 @@ mod tests {
         assert_eq!(attempt.result().unwrap().as_str(), "canceled");
         assert!(attempt.vm_identity().is_none());
         assert_eq!(bridge.capacities, [1, 0, 0]);
-        assert_eq!(bridge.acknowledgements, [7, 8, 9]);
+        assert_eq!(bridge.acknowledgements, [(7, true), (8, false), (9, false)]);
     }
 }

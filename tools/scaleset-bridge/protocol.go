@@ -23,15 +23,16 @@ const bridgeVersion = "0.1.0"
 const maxServiceResponseBytes = 2 * 1024 * 1024
 
 type protocolRequest struct {
-	Version     int         `json:"version"`
-	Operation   string      `json:"operation"`
-	Start       startConfig `json:"start,omitempty"`
-	MessageID   int         `json:"message_id,omitempty"`
-	LastAckedID int         `json:"last_acked_message_id,omitempty"`
-	MaxCapacity int         `json:"max_capacity,omitempty"`
-	RunnerName  string      `json:"runner_name,omitempty"`
-	RunnerID    int64       `json:"runner_id,omitempty"`
-	WorkFolder  string      `json:"work_folder,omitempty"`
+	Version          int         `json:"version"`
+	Operation        string      `json:"operation"`
+	Start            startConfig `json:"start,omitempty"`
+	MessageID        int         `json:"message_id,omitempty"`
+	LastAckedID      int         `json:"last_acked_message_id,omitempty"`
+	MaxCapacity      int         `json:"max_capacity,omitempty"`
+	AcquireAvailable *bool       `json:"acquire_available,omitempty"`
+	RunnerName       string      `json:"runner_name,omitempty"`
+	RunnerID         int64       `json:"runner_id,omitempty"`
+	WorkFolder       string      `json:"work_folder,omitempty"`
 }
 
 type startConfig struct {
@@ -419,7 +420,10 @@ func (server *server) handle(ctx context.Context, request protocolRequest) proto
 	case "resume":
 		return server.resume(ctx, request.LastAckedID, request.MessageID, request.MaxCapacity)
 	case "ack":
-		return server.ack(ctx, request.MessageID)
+		if request.AcquireAvailable == nil {
+			return errorResponse("invalid_ack")
+		}
+		return server.ack(ctx, request.MessageID, *request.AcquireAvailable)
 	case "generate_jit":
 		return server.generateJIT(ctx, request.RunnerName, request.WorkFolder)
 	case "observe_runner":
@@ -526,7 +530,7 @@ func (server *server) poll(ctx context.Context, maxCapacity int) protocolRespons
 	return response
 }
 
-func (server *server) ack(ctx context.Context, messageID int) protocolResponse {
+func (server *server) ack(ctx context.Context, messageID int, acquireAvailable bool) protocolResponse {
 	if server.backend == nil {
 		return errorResponse("not_started")
 	}
@@ -540,7 +544,7 @@ func (server *server) ack(ctx context.Context, messageID int) protocolResponse {
 		server.pending.deleted = true
 	}
 	var acquired []int64
-	if len(server.pending.available) > 0 {
+	if acquireAvailable && len(server.pending.available) > 0 {
 		var err error
 		acquired, err = server.backend.AcquireJobs(ctx, server.pending.available)
 		if err != nil {

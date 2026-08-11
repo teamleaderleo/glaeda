@@ -180,6 +180,44 @@ pub(crate) fn apply_scale_set_event(
     Err(ScaleSetConsumerError::new("consumer_claim_missing"))
 }
 
+/// Decide whether acknowledgement may acquire the single offered job from the exact durable
+/// reservation. The deadline is exclusive: at or after it, the offer is acknowledged without
+/// acquisition so a long controller outage cannot strand an unserviceable GitHub job.
+pub(crate) fn should_acquire_scale_set_available(
+    policy: &ScaleSetConsumerPolicy,
+    pending: &PendingScaleSetMessage,
+    catalog: &DisposableAttemptCatalogDocument,
+    now: EpochMillis,
+) -> Result<bool, ScaleSetConsumerError> {
+    if now < pending.observed_at() {
+        return Err(ScaleSetConsumerError::new("consumer_admission_stale"));
+    }
+    let mut available = pending.events().iter().filter_map(|event| match event {
+        ScaleSetBridgeEvent::Available(job) => Some(job),
+        _ => None,
+    });
+    let Some(job) = available.next() else {
+        return Ok(false);
+    };
+    if available.next().is_some() {
+        return Err(ScaleSetConsumerError::new("consumer_capacity_invalid"));
+    }
+    validate_job(policy, job)?;
+    let identities = derive_identities(policy, job)?;
+    let reservation = find_active_by_claim(catalog, &identities.claim_id)
+        .ok_or_else(|| ScaleSetConsumerError::new("consumer_ack_claim_missing"))?;
+    validate_reservation(policy, reservation, &identities)?;
+    match reservation.attempt().phase() {
+        crate::disposable_worker_reconciler::DisposableAttemptPhase::Reserved => {
+            Ok(now < reservation.attempt().not_after())
+        }
+        crate::disposable_worker_reconciler::DisposableAttemptPhase::UnprovisionedReleasing => {
+            Ok(false)
+        }
+        _ => Err(ScaleSetConsumerError::new("consumer_ack_claim_drift")),
+    }
+}
+
 pub(crate) fn apply_scale_set_ack_outcome(
     policy: &ScaleSetConsumerPolicy,
     receipt: &ScaleSetAckReceipt,
@@ -579,6 +617,44 @@ mod tests {
         .unwrap();
 
         assert_eq!(reserved.active()[0].attempt().not_after().get(), 21_700_000);
+        assert!(
+            !should_acquire_scale_set_available(
+                &policy,
+                &pending,
+                &reserved,
+                EpochMillis::new(21_700_000).unwrap(),
+            )
+            .unwrap()
+        );
+        assert!(
+            should_acquire_scale_set_available(
+                &policy,
+                &pending,
+                &reserved,
+                EpochMillis::new(21_699_999).unwrap(),
+            )
+            .unwrap()
+        );
+        assert!(
+            !should_acquire_scale_set_available(
+                &policy,
+                &pending,
+                &reserved,
+                EpochMillis::new(21_700_001).unwrap(),
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            should_acquire_scale_set_available(
+                &policy,
+                &pending,
+                &reserved,
+                EpochMillis::new(99_999).unwrap(),
+            )
+            .unwrap_err()
+            .code(),
+            "consumer_admission_stale"
+        );
     }
 
     #[test]
