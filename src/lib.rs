@@ -21,6 +21,8 @@ pub mod disposable_clone_runtime;
 pub mod disposable_launchd_service;
 /// Sealed fixed Lima command plans for one durably planned disposable worker.
 pub mod disposable_lima_worker;
+/// Pure fixed macOS PF policy for one dedicated hostile-CI service identity.
+pub mod disposable_network_policy;
 /// Canonical supply-chain and isolation identity for the prepared disposable VM template.
 pub mod disposable_prepared_template;
 /// Private, secret-safe command binding for one durably registered disposable guest runner.

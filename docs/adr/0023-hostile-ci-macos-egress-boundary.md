@@ -36,6 +36,9 @@ that applies to TCP and UDP sockets owned by the dedicated service UID. The anch
   resolvers; and
 - adds no inbound forwarding rule.
 
+The pinned gVisor user network does not forward ICMP outside its virtual network. The service
+account is unprivileged and the first policy intentionally admits no other outbound protocol.
+
 The service account is unprivileged and receives no PF mutation authority. A separately approved
 root installation owns the account, PF anchor, main-ruleset attachment, LaunchDaemon, executable,
 and enrollment placement. Service startup observes the active PF state and refuses new provisioning
