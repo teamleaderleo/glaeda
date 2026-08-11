@@ -43,6 +43,9 @@ pub(crate) mod github_scale_set_bridge;
 /// Canonical bounded durable record of one polled Runner Scale Set delivery.
 #[cfg(unix)]
 pub(crate) mod github_scale_set_delivery;
+/// Pure crash/replay phases for one durably reconciled Scale Set delivery.
+#[cfg(unix)]
+pub(crate) mod github_scale_set_delivery_state;
 /// Pure bounded vocabulary for GitHub Runner Scale Set job and runner identities.
 pub mod github_scale_set_protocol;
 /// Pure, fail-closed mapping of reviewed GitHub workflow-job evidence into typed broker intents.
