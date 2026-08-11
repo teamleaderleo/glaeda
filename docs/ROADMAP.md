@@ -197,6 +197,9 @@ M3 proves functionality. M4 makes arbitrary repository code an intended workload
 - [ ] Give each worker only the short-lived JIT/Actions authority required for its exact job; assume every credential visible in the guest may be stolen.
 - [ ] Deny inbound access and outbound Mac host, private/LAN, link-local, metadata, controller, and peer-worker destinations outside explicit workload authority.
 - [ ] Preserve explicit DNS and ordinary outbound source/package/build access without depending on or exposing the Mac's local resolver state.
+- [x] Implement the root-only boot activation transaction: verify the installed PF attachment and
+  exact anchor, delegate live rule ordering and enforcement to Apple `pfctl`, retain its boot
+  enable-reference token, and publish the worker admission receipt only after the anchor loads.
 - [ ] Add the separately approved dedicated-service-account LaunchDaemon and PF installation,
   observation, removal, and startup admission gate from ADR 0023.
 - [ ] Add bounded connection/rate/byte policy where the selected mature enforcement backend supports it.

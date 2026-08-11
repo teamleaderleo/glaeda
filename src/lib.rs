@@ -23,6 +23,8 @@ pub mod disposable_launchd_service;
 pub mod disposable_lima_worker;
 /// Canonical boot-volatile receipt for the root-owned hostile-CI network gate.
 pub mod disposable_network_gate;
+/// Exact root activation plan for the macOS hostile-CI PF gate.
+pub mod disposable_network_gate_activation;
 /// Pure fixed macOS PF policy for one dedicated hostile-CI service identity.
 pub mod disposable_network_policy;
 /// Canonical supply-chain and isolation identity for the prepared disposable VM template.

@@ -258,6 +258,16 @@ hostile CI. Production acceptance requires a separately approved LaunchDaemon/PF
 exact startup observation, and physical allow/deny fixtures. Initial concurrency remains exactly
 one until peer isolation is separately proven.
 
+The root activation transaction is now implemented as the small bridge to that mature boundary.
+It requires the fixed root-owned main-ruleset attachment and exact generated anchor, asks `pfctl`
+to prove the anchor is live and first in the parsed filter rules, acquires Apple's boot-scoped PF
+enable reference, reloads only the SmolRunner anchor, and durably records the returned token before
+publishing the existing read-only admission receipt. A failed anchor load releases the newly
+acquired reference; a crash after token publication but before receipt publication is retried
+without taking another reference. This is not yet the production boundary by itself: the next
+slice must install the dedicated non-login account, exact PF inputs, root LaunchDaemon, and
+unprivileged worker service as one separately approved lifecycle.
+
 Acceptance: ordinary clone/download/build/test fixtures pass; hostile fixtures cannot reach denied destinations, listen inbound, exceed resource ceilings, or leave a reachable process after teardown.
 
 ### M5 — supervised reconciliation and autoscaling
