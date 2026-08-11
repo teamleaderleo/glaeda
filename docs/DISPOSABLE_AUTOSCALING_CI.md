@@ -266,7 +266,11 @@ idempotent simple non-token enable reference, and publishes the existing read-on
 receipt last. Activation never takes a private PF token and never disables the host-wide filter,
 so a crash cannot leak an unrecoverable token: retry reloads the exact anchor, re-establishes the
 simple reference, re-observes PF, and republishes only after live state is satisfied. The pending
-installation lifecycle must remove SmolRunner's rules and receipt while deliberately leaving
+root service will invoke this transaction through `worker network-activate` with only the dedicated
+service UID and exact approved policy identity; this command carries no enrollment or credential.
+It is not a standalone installer and refuses a policy identity that does not match the checked-in
+prepared-template policy. The installation lifecycle must remove SmolRunner's rules and receipt
+while deliberately leaving
 global PF lifecycle to macOS and the operator. This is not yet
 the production boundary by itself: the next slice must install the dedicated non-login account,
 exact PF inputs, root LaunchDaemon, and unprivileged worker service as one separately approved

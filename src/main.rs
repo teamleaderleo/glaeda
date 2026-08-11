@@ -39,6 +39,14 @@ use smolrunner::disposable_launchd_service::{
     DisposableLaunchdServiceDesiredState, plan_disposable_launchd_service,
 };
 #[cfg(target_os = "macos")]
+use smolrunner::disposable_network_gate_activation::{
+    activate_disposable_network_gate, plan_disposable_network_gate_activation,
+};
+#[cfg(target_os = "macos")]
+use smolrunner::disposable_network_policy::plan_disposable_network_policy;
+#[cfg(target_os = "macos")]
+use smolrunner::disposable_prepared_template::current_disposable_prepared_template;
+#[cfg(target_os = "macos")]
 use smolrunner::disposable_worker_enrollment::{
     MAX_DISPOSABLE_WORKER_ENROLLMENT_BYTES, decode_disposable_worker_enrollment,
 };
@@ -264,6 +272,15 @@ enum WorkerCommand {
         #[arg(long)]
         enrollment_digest: String,
     },
+    /// Root-only boot activation for the enrolled hostile-CI network gate.
+    NetworkActivate {
+        /// Exact dedicated service account UID bound into the PF policy.
+        #[arg(long)]
+        service_uid: u32,
+        /// Exact reviewed network-policy identity bound into the root service plan.
+        #[arg(long)]
+        policy_identity: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -462,6 +479,10 @@ fn main() -> ExitCode {
                 enrollment,
                 enrollment_digest,
             } => run_worker_serve(cli.output, &enrollment, &enrollment_digest),
+            WorkerCommand::NetworkActivate {
+                service_uid,
+                policy_identity,
+            } => run_worker_network_activate(cli.output, service_uid, &policy_identity),
         },
         Command::Service { command } => match command {
             ServiceCommand::Plan {
@@ -1029,6 +1050,93 @@ fn run_worker_serve(
             "disposable worker service stopped with a durable blocker".to_owned(),
         ),
     }
+}
+
+#[cfg(target_os = "macos")]
+fn run_worker_network_activate(
+    output: OutputFormat,
+    service_uid: u32,
+    policy_identity: &str,
+) -> ExitCode {
+    let expected_policy_identity = match Sha256Digest::parse(policy_identity) {
+        Ok(identity) => identity,
+        Err(_) => {
+            return emit_runtime_error(
+                output,
+                "disposable_network_gate_activation_input_invalid",
+                "disposable-network gate activation inputs are invalid".to_owned(),
+            );
+        }
+    };
+    let prepared_template = match current_disposable_prepared_template() {
+        Ok(template) => template,
+        Err(error) => {
+            return emit_runtime_error(
+                output,
+                error.code(),
+                "the checked-in disposable-worker template was refused".to_owned(),
+            );
+        }
+    };
+    let network_policy = match plan_disposable_network_policy(service_uid, &prepared_template) {
+        Ok(policy) => policy,
+        Err(error) => {
+            return emit_runtime_error(
+                output,
+                error.code(),
+                "disposable-network policy activation was refused".to_owned(),
+            );
+        }
+    };
+    if network_policy.report().policy_identity() != &expected_policy_identity {
+        return emit_runtime_error(
+            output,
+            "disposable_network_policy_identity_mismatch",
+            "disposable-network policy does not match the approved service plan".to_owned(),
+        );
+    }
+    let activation = match plan_disposable_network_gate_activation(&network_policy) {
+        Ok(activation) => activation,
+        Err(error) => {
+            return emit_runtime_error(
+                output,
+                error.code(),
+                "disposable-network gate activation plan was refused".to_owned(),
+            );
+        }
+    };
+    let receipt = match activate_disposable_network_gate(&activation, &ProcessExecutor) {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            return emit_runtime_error(
+                output,
+                error.code(),
+                "disposable-network gate activation was refused".to_owned(),
+            );
+        }
+    };
+    match output {
+        OutputFormat::Json => {
+            if print_json(&receipt).is_err() {
+                return ExitCode::from(2);
+            }
+        }
+        OutputFormat::Human => println!("disposable network gate: {:?}", receipt.disposition()),
+    }
+    ExitCode::SUCCESS
+}
+
+#[cfg(not(target_os = "macos"))]
+fn run_worker_network_activate(
+    output: OutputFormat,
+    _service_uid: u32,
+    _policy_identity: &str,
+) -> ExitCode {
+    emit_runtime_error(
+        output,
+        "disposable_network_gate_activation_unsupported",
+        "disposable-network gate activation requires macOS".to_owned(),
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -1900,6 +2008,32 @@ mod tests {
         assert_eq!(
             enrollment_digest,
             "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+
+        let network_activate = Cli::try_parse_from([
+            "smolrunner",
+            "worker",
+            "network-activate",
+            "--service-uid",
+            "502",
+            "--policy-identity",
+            "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        ])
+        .expect("parse disposable network activation");
+        let Command::Worker {
+            command:
+                WorkerCommand::NetworkActivate {
+                    service_uid,
+                    policy_identity,
+                },
+        } = network_activate.command
+        else {
+            panic!("expected disposable network activation command");
+        };
+        assert_eq!(service_uid, 502);
+        assert_eq!(
+            policy_identity,
+            "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
         );
 
         let queue = Cli::try_parse_from([
