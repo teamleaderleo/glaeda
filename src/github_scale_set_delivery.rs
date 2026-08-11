@@ -9,8 +9,8 @@ use crate::github_scale_set_bridge::{
     ScaleSetBridgeEvent, ScaleSetBridgeJobEvidence, ScaleSetBridgePoll, ScaleSetStatistics,
 };
 use crate::github_scale_set_protocol::{
-    ScaleSetJobId, ScaleSetJobResult, ScaleSetRunnerId, ScaleSetRunnerName, ScaleSetRunnerReference,
-    ScaleSetRunnerRequestId,
+    ScaleSetJobId, ScaleSetJobResult, ScaleSetRunnerId, ScaleSetRunnerName,
+    ScaleSetRunnerReference, ScaleSetRunnerRequestId,
 };
 
 pub(crate) const SCALE_SET_DELIVERY_SCHEMA_VERSION: u8 = 1;
