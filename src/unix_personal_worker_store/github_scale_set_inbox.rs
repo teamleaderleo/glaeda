@@ -685,55 +685,6 @@ pub(super) fn require_settled_source(
     Ok(())
 }
 
-pub(super) fn require_settled_clone_admission(
-    store: &UnixPersonalWorkerStore,
-    binding: &crate::disposable_clone_runtime::DisposableCloneAdmissionBinding,
-    catalog: &DisposableAttemptCatalogDocument,
-    reservation: &crate::disposable_attempt_catalog::DisposableAttemptReservation,
-) -> Result<(), PersonalWorkerStoreError> {
-    refuse_unsettled(store)?;
-    let bytes = store
-        .read_named_bytes_bounded(INBOX_DOCUMENT, MAX_GITHUB_SCALE_SET_INBOX_BYTES)?
-        .ok_or_else(|| {
-            store_error(
-                PersonalWorkerStoreErrorKind::Missing,
-                "Scale Set inbox is required before disposable clone admission",
-            )
-        })?;
-    let inbox = decode_scale_set_inbox(&bytes).map_err(|error| {
-        let kind = if error.code() == "inbox_version_incompatible" {
-            PersonalWorkerStoreErrorKind::VersionIncompatible
-        } else {
-            PersonalWorkerStoreErrorKind::CorruptState
-        };
-        store_error(kind, "Scale Set inbox state is invalid")
-    })?;
-    let idle = inbox.last_idle().ok_or_else(|| {
-        store_error(
-            PersonalWorkerStoreErrorKind::RevisionConflict,
-            "fresh Scale Set idle evidence is required before clone admission",
-        )
-    })?;
-    if inbox.source_identity() != binding.source_identity()
-        || catalog.revision() != binding.catalog_revision()
-        || reservation.attempt().attempt_id() != binding.attempt_id()
-        || reservation.attempt().revision() != binding.attempt_revision()
-        || reservation.attempt().capacity_claim_id() != binding.capacity_claim_id()
-        || idle.catalog_revision() != binding.catalog_revision()
-        || idle.attempt_id() != binding.attempt_id()
-        || idle.attempt_revision() != binding.attempt_revision()
-        || idle.capacity_claim_id() != binding.capacity_claim_id()
-        || idle.observed_at() != binding.observed_at()
-        || idle.not_after() != binding.expires_at()
-    {
-        return Err(store_error(
-            PersonalWorkerStoreErrorKind::RevisionConflict,
-            "Scale Set clone admission evidence is stale or mismatched",
-        ));
-    }
-    Ok(())
-}
-
 fn require_other_stages_clean(store: &UnixPersonalWorkerStore) -> Result<(), ScaleSetInboxError> {
     store
         .refuse_unsettled_personal_worker_state()

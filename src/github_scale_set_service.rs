@@ -5,12 +5,7 @@ use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::disposable_attempt_catalog::DisposableAttemptCatalogDocument;
-use crate::disposable_clone_runtime::{
-    DisposableCloneAdmissionBinding, DisposableCloneAdmissionObservation,
-    DisposableCloneAdmissionSource, DisposableCloneRuntime, DisposableCloneRuntimeError,
-    DisposableCloneRuntimeReceipt, admission_seal,
-};
-use crate::disposable_worker_reconciler::{DisposableAttemptId, DisposableAttemptPhase};
+use crate::disposable_worker_reconciler::DisposableAttemptPhase;
 use crate::execution_admission::EpochMillis;
 use crate::github_scale_set_bridge::{
     ScaleSetBridgeClient, ScaleSetBridgeError, ScaleSetBridgeIdentity, ScaleSetBridgePoll,
@@ -59,43 +54,6 @@ impl ScaleSetServiceClock for SystemScaleSetServiceClock {
     }
 }
 
-struct DurableScaleSetCloneAdmission {
-    binding: DisposableCloneAdmissionBinding,
-}
-
-impl admission_seal::Sealed for DurableScaleSetCloneAdmission {
-    fn scale_set_admission_binding(&self) -> Option<&DisposableCloneAdmissionBinding> {
-        Some(&self.binding)
-    }
-}
-
-impl DisposableCloneAdmissionSource for DurableScaleSetCloneAdmission {
-    fn observe(
-        &self,
-        catalog: &DisposableAttemptCatalogDocument,
-        reservation: &crate::disposable_attempt_catalog::DisposableAttemptReservation,
-    ) -> Result<DisposableCloneAdmissionObservation, DisposableCloneRuntimeError> {
-        if !matches!(
-            reservation.attempt().phase(),
-            DisposableAttemptPhase::Reserved | DisposableAttemptPhase::CloneAuthorized
-        ) || reservation.attempt().github_job_id().is_none()
-            || reservation.attempt().result().is_some()
-        {
-            return Err(DisposableCloneRuntimeError::recovery(
-                "clone_scale_set_admission_invalid",
-            ));
-        }
-        Ok(DisposableCloneAdmissionObservation::new(
-            catalog,
-            reservation,
-            self.binding.observed_at(),
-            self.binding.expires_at(),
-            true,
-            false,
-        ))
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ScaleSetServiceDisposition {
     Idle(ScaleSetStatistics),
@@ -106,13 +64,6 @@ pub(crate) enum ScaleSetServiceDisposition {
     AckOutcomeApplied { message_id: u32 },
     UnprovisionedReleased { attempt_id: String },
     AttemptRetired { attempt_id: String },
-}
-
-#[derive(Debug)]
-pub(crate) enum ScaleSetWorkerDisposition {
-    NoCandidate,
-    CloneAuthorized { attempt_id: String },
-    CloneCompleted(DisposableCloneRuntimeReceipt),
 }
 
 pub(crate) struct ScaleSetService<B, C> {
@@ -319,109 +270,6 @@ impl<B: ScaleSetBridgeSession, C: ScaleSetServiceClock> ScaleSetService<B, C> {
         }
     }
 
-    /// Advance at most one acquired worker mutation after a fresh zero-capacity idle poll.
-    pub(crate) fn progress_worker_once(
-        &mut self,
-        runtime: &DisposableCloneRuntime,
-    ) -> Result<ScaleSetWorkerDisposition, ScaleSetServiceError> {
-        let (inbox, catalog) = self
-            .store
-            .load_scale_set_control_state(&self.source_identity)
-            .map_err(ScaleSetServiceError::from_inbox)?;
-        if inbox.requires_reconciliation() {
-            return Err(ScaleSetServiceError::new(
-                "scale_set_reconciliation_required",
-            ));
-        }
-        let mut candidates = catalog.active().iter().filter(|reservation| {
-            matches!(
-                reservation.attempt().phase(),
-                DisposableAttemptPhase::Reserved | DisposableAttemptPhase::CloneAuthorized
-            )
-        });
-        let Some(candidate) = candidates.next() else {
-            return Ok(ScaleSetWorkerDisposition::NoCandidate);
-        };
-        if candidates.next().is_some() {
-            return Err(ScaleSetServiceError::new(
-                "scale_set_capacity_invariant_violated",
-            ));
-        }
-        let attempt_id = candidate.attempt().attempt_id().clone();
-        match candidate.attempt().phase() {
-            DisposableAttemptPhase::Reserved => {
-                self.authorize_reserved_attempt(runtime, &attempt_id)?;
-                Ok(ScaleSetWorkerDisposition::CloneAuthorized {
-                    attempt_id: attempt_id.as_str().to_owned(),
-                })
-            }
-            DisposableAttemptPhase::CloneAuthorized => {
-                let receipt = self.clone_authorized_attempt(runtime, &attempt_id)?;
-                Ok(ScaleSetWorkerDisposition::CloneCompleted(receipt))
-            }
-            _ => unreachable!("candidate phase was filtered"),
-        }
-    }
-
-    /// Persist one reserved attempt's exact target-absence checkpoint.
-    pub(crate) fn authorize_reserved_attempt(
-        &mut self,
-        runtime: &DisposableCloneRuntime,
-        attempt_id: &DisposableAttemptId,
-    ) -> Result<(), ScaleSetServiceError> {
-        let admission = self.clone_admission(attempt_id)?;
-        runtime
-            .authorize_once(attempt_id, &admission)
-            .map_err(ScaleSetServiceError::from_clone)
-    }
-
-    /// Execute one already-authorized clone against the exact settled durable Scale Set source.
-    ///
-    /// The clone transaction reopens the inbox and catalog under their canonical lock. A pending
-    /// event, unresolved acknowledgement, source-identity mismatch, job-less reservation, or
-    /// cancellation/release phase refuses before the clone-start checkpoint.
-    pub(crate) fn clone_authorized_attempt(
-        &mut self,
-        runtime: &DisposableCloneRuntime,
-        attempt_id: &DisposableAttemptId,
-    ) -> Result<DisposableCloneRuntimeReceipt, ScaleSetServiceError> {
-        let admission = self.clone_admission(attempt_id)?;
-        runtime
-            .clone_once(attempt_id, &admission)
-            .map_err(ScaleSetServiceError::from_clone)
-    }
-
-    fn clone_admission(
-        &mut self,
-        attempt_id: &DisposableAttemptId,
-    ) -> Result<DurableScaleSetCloneAdmission, ScaleSetServiceError> {
-        let (inbox, catalog) = self
-            .store
-            .load_scale_set_control_state(&self.source_identity)
-            .map_err(ScaleSetServiceError::from_inbox)?;
-        if inbox.requires_reconciliation() {
-            return Err(ScaleSetServiceError::new(
-                "scale_set_reconciliation_required",
-            ));
-        }
-        let idle = inbox
-            .last_idle()
-            .ok_or_else(|| ScaleSetServiceError::new("scale_set_clone_admission_missing"))?;
-        let reservation = catalog
-            .find_active(attempt_id)
-            .ok_or_else(|| ScaleSetServiceError::new("scale_set_clone_attempt_missing"))?;
-        if idle.catalog_revision() != catalog.revision()
-            || idle.attempt_id() != reservation.attempt().attempt_id()
-            || idle.attempt_revision() != reservation.attempt().revision()
-            || idle.capacity_claim_id() != reservation.attempt().capacity_claim_id()
-        {
-            return Err(ScaleSetServiceError::new("scale_set_clone_admission_stale"));
-        }
-        Ok(DurableScaleSetCloneAdmission {
-            binding: DisposableCloneAdmissionBinding::new(&self.source_identity, idle),
-        })
-    }
-
     #[cfg(test)]
     fn into_parts(self) -> (UnixPersonalWorkerStore, B) {
         (self.store, self.bridge)
@@ -459,10 +307,6 @@ impl ScaleSetServiceError {
         Self::new(error.code())
     }
 
-    fn from_clone(error: DisposableCloneRuntimeError) -> Self {
-        Self::new(error.code())
-    }
-
     pub(crate) const fn code(self) -> &'static str {
         self.code
     }
@@ -497,7 +341,9 @@ mod tests {
         DisposableAttemptCatalog, DisposableAttemptCatalogStore,
     };
     use crate::disposable_prepared_template::current_disposable_prepared_template;
-    use crate::disposable_worker_reconciler::{DisposableAttemptPhase, DisposableWorkerResources};
+    use crate::disposable_worker_reconciler::{
+        DisposableAttemptId, DisposableAttemptPhase, DisposableWorkerResources,
+    };
     use crate::github_scale_set_bridge::{ScaleSetBridgeEvent, ScaleSetBridgeJobEvidence};
     use crate::github_scale_set_protocol::ScaleSetJobId;
 
@@ -683,7 +529,7 @@ mod tests {
     }
 
     #[test]
-    fn acquired_reservation_requires_a_durable_zero_capacity_idle_poll_before_clone() {
+    fn zero_capacity_idle_poll_is_persisted_as_advisory_state_only() {
         let root = TempRoot::new();
         let store = UnixPersonalWorkerStore::open_or_create_disposable_catalog(&root.0).unwrap();
         let mut catalog = DisposableAttemptCatalog::new(store);
@@ -731,8 +577,6 @@ mod tests {
             }
             other => panic!("unexpected disposition: {other:?}"),
         };
-        let admission = service.clone_admission(&attempt_id).unwrap();
-        assert!(admission_seal::Sealed::scale_set_admission_binding(&admission).is_some());
 
         let (mut store, bridge) = service.into_parts();
         let (inbox, catalog) = store
@@ -740,99 +584,11 @@ mod tests {
             .unwrap();
         let reservation = &catalog.active()[0];
         let idle = inbox.last_idle().unwrap();
+        assert_eq!(&attempt_id, reservation.attempt().attempt_id());
         assert_eq!(idle.catalog_revision(), catalog.revision());
         assert_eq!(idle.attempt_id(), reservation.attempt().attempt_id());
         assert_eq!(idle.attempt_revision(), reservation.attempt().revision());
         assert_eq!(bridge.capacities, [1, 0]);
-    }
-
-    #[test]
-    fn clone_authorization_consumes_idle_evidence_before_the_clone_command() {
-        let root = TempRoot::new();
-        let store = UnixPersonalWorkerStore::open_or_create_disposable_catalog(&root.0).unwrap();
-        let mut catalog = DisposableAttemptCatalog::new(store);
-        catalog.initialize().unwrap();
-        let store = catalog.into_store();
-        let policy = ScaleSetConsumerPolicy::new(
-            source_identity(),
-            23,
-            "project",
-            "example",
-            &["smolrunner".to_owned()],
-            DisposableWorkerResources::new(2_000, 2 << 30, 20 << 30).unwrap(),
-            &current_disposable_prepared_template().unwrap(),
-        )
-        .unwrap();
-        let bridge = FakeBridge {
-            polls: VecDeque::from([
-                ScaleSetBridgePoll::Message {
-                    message_id: 7,
-                    statistics: statistics(),
-                    events: vec![event()],
-                },
-                ScaleSetBridgePoll::Idle {
-                    statistics: statistics(),
-                },
-                ScaleSetBridgePoll::Idle {
-                    statistics: statistics(),
-                },
-            ]),
-            acquired: VecDeque::from([vec![41]]),
-            capacities: Vec::new(),
-            acknowledgements: Vec::new(),
-        };
-        let mut service = ScaleSetService::with_parts(
-            store,
-            bridge,
-            policy.clone(),
-            FixedClock(EpochMillis::new(100_000).unwrap()),
-        )
-        .unwrap();
-
-        for _ in 0..4 {
-            service.reconcile_once().unwrap();
-        }
-        let attempt_id = match service.reconcile_once().unwrap() {
-            ScaleSetServiceDisposition::CloneAdmissionRefreshed { attempt_id } => {
-                DisposableAttemptId::parse(&attempt_id).unwrap()
-            }
-            other => panic!("unexpected disposition: {other:?}"),
-        };
-
-        let (store, bridge) = service.into_parts();
-        let mut catalog = DisposableAttemptCatalog::new(store);
-        let current = catalog.load().unwrap();
-        let reservation = current.find_active(&attempt_id).unwrap();
-        catalog
-            .transition(
-                current.revision(),
-                &attempt_id,
-                reservation.attempt().revision(),
-                crate::disposable_attempt_catalog::DisposableAttemptCatalogAction::AuthorizeClone,
-            )
-            .unwrap();
-        let mut service = ScaleSetService::with_parts(
-            catalog.into_store(),
-            bridge,
-            policy,
-            FixedClock(EpochMillis::new(100_000).unwrap()),
-        )
-        .unwrap();
-
-        let error = match service.clone_admission(&attempt_id) {
-            Ok(_) => panic!("stale idle evidence unexpectedly remained usable"),
-            Err(error) => error,
-        };
-        assert_eq!(error.code(), "scale_set_clone_admission_stale");
-        assert!(matches!(
-            service.reconcile_once().unwrap(),
-            ScaleSetServiceDisposition::CloneAdmissionRefreshed { attempt_id: refreshed }
-                if refreshed == attempt_id.as_str()
-        ));
-        assert!(service.clone_admission(&attempt_id).is_ok());
-
-        let (_, bridge) = service.into_parts();
-        assert_eq!(bridge.capacities, [1, 0, 0]);
     }
 
     #[test]
