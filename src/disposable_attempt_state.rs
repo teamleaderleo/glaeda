@@ -233,32 +233,6 @@ impl DisposableAttemptState {
         )
     }
 
-    /// Bind the exact observed clone identity from the private clone-completion transaction.
-    pub(crate) fn record_vm_identity(
-        &self,
-        identity: DisposableVmIdentity,
-    ) -> Result<Self, DisposableAttemptStateError> {
-        if let Some(current) = self.vm_identity.as_ref() {
-            return if current == &identity {
-                Ok(self.clone())
-            } else {
-                Err(identity_drift(
-                    "observed VM identity differs from the durable disposable VM identity",
-                ))
-            };
-        }
-        if self.phase != DisposableAttemptPhase::CloneStarted {
-            return Err(invalid_transition(
-                "VM identity can only bind during private clone completion",
-            ));
-        }
-        let mut next = self.clone();
-        next.revision = self.revision.next()?;
-        next.vm_identity = Some(identity);
-        next.validate()?;
-        Ok(next)
-    }
-
     /// Persist cancellation/expiry before releasing capacity for an unprovisioned attempt.
     pub fn begin_unprovisioned_release(&self) -> Result<Self, DisposableAttemptStateError> {
         match self.phase {
@@ -798,8 +772,14 @@ impl DisposableAttemptState {
             }
             DisposableAttemptPhase::Destroying
             | DisposableAttemptPhase::Deregistering
-            | DisposableAttemptPhase::Releasing
-            | DisposableAttemptPhase::Complete => {}
+            | DisposableAttemptPhase::Releasing => {
+                if self.vm_identity.is_none() {
+                    return Err(invalid_document(
+                        "provisioned cleanup requires exact durable VM identity",
+                    ));
+                }
+            }
+            DisposableAttemptPhase::Complete => {}
         }
         if self.phase == DisposableAttemptPhase::Complete
             && revision <= 4
@@ -810,6 +790,14 @@ impl DisposableAttemptState {
         {
             return Err(invalid_document(
                 "unprovisioned completion cannot carry external job or runner evidence",
+            ));
+        }
+        if self.phase == DisposableAttemptPhase::Complete
+            && revision > 4
+            && self.vm_identity.is_none()
+        {
+            return Err(invalid_document(
+                "provisioned completion requires exact durable VM identity",
             ));
         }
         Ok(())

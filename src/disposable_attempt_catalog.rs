@@ -6,8 +6,7 @@ use serde::Serialize;
 use crate::disposable_attempt_state::{DisposableAttemptRevision, DisposableAttemptState};
 use crate::disposable_prepared_template::DisposablePreparedTemplateIdentity;
 use crate::disposable_worker_reconciler::{
-    DisposableAttemptId, DisposableAttemptPhase, DisposableHostUsage, DisposableVmIdentity,
-    DisposableWorkerResources,
+    DisposableAttemptId, DisposableAttemptPhase, DisposableHostUsage, DisposableWorkerResources,
 };
 use crate::github_scale_set_protocol::{ScaleSetJobId, ScaleSetJobResult, ScaleSetRunnerReference};
 
@@ -282,56 +281,6 @@ impl DisposableAttemptCatalogDocument {
         Ok(next)
     }
 
-    /// Bind one post-clone identity through the private same-lock runtime path.
-    ///
-    /// This deliberately is not part of `DisposableAttemptCatalogAction` or the generic store
-    /// successor relation. A recovered/staged document and a public reconciler action therefore
-    /// cannot manufacture initial VM ownership from an object that merely appeared by name.
-    pub(crate) fn bind_vm_identity_after_clone(
-        &self,
-        attempt_id: &DisposableAttemptId,
-        expected_attempt_revision: DisposableAttemptRevision,
-        identity: DisposableVmIdentity,
-    ) -> Result<Self, DisposableAttemptCatalogError> {
-        let index = self
-            .active
-            .iter()
-            .position(|reservation| reservation.attempt.attempt_id() == attempt_id)
-            .ok_or_else(|| {
-                catalog_error(
-                    DisposableAttemptCatalogErrorKind::Missing,
-                    "disposable attempt does not exist",
-                )
-            })?;
-        let current = &self.active[index];
-        if current.attempt.revision() != expected_attempt_revision {
-            return Err(stale_attempt_revision(
-                expected_attempt_revision,
-                current.attempt.revision(),
-            ));
-        }
-        let successor = current
-            .attempt
-            .record_vm_identity(identity)
-            .map_err(|error| {
-                let kind = if error.code() == "identity_drift" {
-                    DisposableAttemptCatalogErrorKind::IdentityDrift
-                } else {
-                    DisposableAttemptCatalogErrorKind::InvalidAction
-                };
-                catalog_error(kind, "private clone completion cannot bind VM identity")
-            })?;
-        if successor == current.attempt {
-            return Ok(self.clone());
-        }
-
-        let mut next = self.clone();
-        next.revision = self.revision.next()?;
-        next.active[index].attempt = successor;
-        next.validate()?;
-        Ok(next)
-    }
-
     fn retire_complete(
         &self,
         attempt_id: &DisposableAttemptId,
@@ -533,73 +482,6 @@ impl DisposableAttemptCatalogDocument {
         } else {
             Err(invalid_store_successor())
         }
-    }
-
-    /// Validate a staged successor that only the private same-lock clone runtime can create.
-    ///
-    /// Ordinary store replacement intentionally excludes the initial VM-identity bind. Recovery
-    /// may complete that exact staged publication because the stage is written only after the
-    /// fixed clone command and post-clone observation succeed while the canonical lock is held.
-    pub(crate) fn validate_recovery_successor_of(
-        &self,
-        current: &Self,
-    ) -> Result<(), DisposableAttemptCatalogError> {
-        if self.validate_successor_of(current).is_ok() {
-            return Ok(());
-        }
-        current.validate()?;
-        self.validate()?;
-        if self.revision != current.revision.next()?
-            || self.active.len() != current.active.len()
-            || self.tombstones != current.tombstones
-        {
-            return Err(invalid_store_successor());
-        }
-        let mut changes = self
-            .active
-            .iter()
-            .zip(&current.active)
-            .filter(|(next, prior)| next != prior);
-        let valid = changes.next().is_some_and(|(next, prior)| {
-            changes.next().is_none()
-                && next.resources == prior.resources
-                && next.prepared_template_identity == prior.prepared_template_identity
-                && prior.attempt.phase() == DisposableAttemptPhase::CloneStarted
-                && prior.attempt.vm_identity().is_none()
-                && next.attempt.vm_identity().is_some()
-                && prior
-                    .attempt
-                    .revision()
-                    .get()
-                    .checked_add(1)
-                    .is_some_and(|revision| next.attempt.revision().get() == revision)
-                && next.attempt.phase() == prior.attempt.phase()
-                && next.attempt.attempt_id() == prior.attempt.attempt_id()
-                && next.attempt.capacity_claim_id() == prior.attempt.capacity_claim_id()
-                && next.attempt.vm_id() == prior.attempt.vm_id()
-                && next.attempt.runner_name() == prior.attempt.runner_name()
-                && next.attempt.runner_id() == prior.attempt.runner_id()
-                && next.attempt.github_job_id() == prior.attempt.github_job_id()
-                && next.attempt.result() == prior.attempt.result()
-                && next.attempt.not_after() == prior.attempt.not_after()
-        });
-        if valid {
-            Ok(())
-        } else {
-            Err(invalid_store_successor())
-        }
-    }
-
-    pub(crate) fn checkpoint_clone_started(
-        &self,
-        attempt_id: &DisposableAttemptId,
-        expected_attempt_revision: DisposableAttemptRevision,
-    ) -> Result<Self, DisposableAttemptCatalogError> {
-        self.replace_attempt(
-            attempt_id,
-            expected_attempt_revision,
-            DisposableAttemptCatalogAction::RecordCloneStarted,
-        )
     }
 }
 

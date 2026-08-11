@@ -393,6 +393,31 @@ fn codec_rejects_future_versions_unknown_fields_and_inconsistent_phase_evidence(
         "invalid_document"
     );
 
+    let unbound_started = reserved()
+        .authorize_clone()
+        .unwrap()
+        .record_clone_started()
+        .unwrap();
+    let mut unbound_cleanup: serde_json::Value =
+        serde_json::from_slice(&encode_disposable_attempt_state(&unbound_started).unwrap())
+            .unwrap();
+    unbound_cleanup["revision"] = serde_json::json!(4);
+    unbound_cleanup["phase"] = serde_json::json!("destroying");
+    assert_eq!(
+        decode_disposable_attempt_state(&serde_json::to_vec(&unbound_cleanup).unwrap())
+            .unwrap_err()
+            .code(),
+        "invalid_document"
+    );
+    unbound_cleanup["revision"] = serde_json::json!(5);
+    unbound_cleanup["phase"] = serde_json::json!("complete");
+    assert_eq!(
+        decode_disposable_attempt_state(&serde_json::to_vec(&unbound_cleanup).unwrap())
+            .unwrap_err()
+            .code(),
+        "invalid_document"
+    );
+
     let bound = reserved()
         .authorize_clone()
         .unwrap()

@@ -487,10 +487,13 @@ const fn error(
 mod tests {
     use super::*;
     use crate::disposable_attempt_catalog::{
-        DisposableAttemptCatalog, DisposableAttemptCatalogAction,
-        MemoryDisposableAttemptCatalogStore,
+        DisposableAttemptCatalog, DisposableAttemptCatalogAction, DisposableAttemptCatalogDocument,
+        MemoryDisposableAttemptCatalogStore, decode_disposable_attempt_catalog,
+        encode_disposable_attempt_catalog,
     };
-    use crate::disposable_attempt_state::DisposableAttemptState;
+    use crate::disposable_attempt_state::{
+        DisposableAttemptState, decode_disposable_attempt_state, encode_disposable_attempt_state,
+    };
     use crate::disposable_prepared_template::{
         current_disposable_prepared_template, decode_disposable_prepared_template,
         encode_disposable_prepared_template,
@@ -587,17 +590,49 @@ mod tests {
         if phase == DisposableAttemptPhase::CloneStarted {
             return started.find_active(&attempt_id).unwrap().clone();
         }
-        let started_attempt = started.find_active(&attempt_id).unwrap().attempt();
-        let (destroying, _) = catalog
-            .transition(
-                started.revision(),
-                &attempt_id,
-                started_attempt.revision(),
-                DisposableAttemptCatalogAction::BeginCleanup,
-            )
-            .unwrap();
         assert_eq!(phase, DisposableAttemptPhase::Destroying);
+        let started_attempt = started.find_active(&attempt_id).unwrap().attempt();
+        let mut encoded =
+            String::from_utf8(encode_disposable_attempt_state(started_attempt).unwrap()).unwrap();
+        encoded = encoded.replacen("\"revision\":3", "\"revision\":4", 1);
+        encoded = encoded.replacen(
+            "\"vm_id\":\"smol-worker-1\",\"runner_name\"",
+            &format!(
+                "\"vm_id\":\"smol-worker-1\",\"vm_identity_digest\":\"sha256:{}\",\"runner_name\"",
+                "44".repeat(32)
+            ),
+            1,
+        );
+        let bound = decode_disposable_attempt_state(encoded.as_bytes()).unwrap();
+        let destroying_attempt = bound.begin_cleanup().unwrap();
+        let destroying = replace_attempt_fixture(&started, started_attempt, &destroying_attempt, 2);
         destroying.find_active(&attempt_id).unwrap().clone()
+    }
+
+    fn replace_attempt_fixture(
+        document: &DisposableAttemptCatalogDocument,
+        current: &DisposableAttemptState,
+        next: &DisposableAttemptState,
+        catalog_revision_advance: u64,
+    ) -> DisposableAttemptCatalogDocument {
+        let current_value: serde_json::Value =
+            serde_json::from_slice(&encode_disposable_attempt_state(current).unwrap()).unwrap();
+        let current_json = serde_json::to_string(&current_value).unwrap();
+        let next_value: serde_json::Value =
+            serde_json::from_slice(&encode_disposable_attempt_state(next).unwrap()).unwrap();
+        let next_json = serde_json::to_string(&next_value).unwrap();
+        let mut catalog_json =
+            String::from_utf8(encode_disposable_attempt_catalog(document).unwrap()).unwrap();
+        catalog_json = catalog_json.replacen(
+            &format!("\"revision\":{}", document.revision().get()),
+            &format!(
+                "\"revision\":{}",
+                document.revision().get() + catalog_revision_advance
+            ),
+            1,
+        );
+        catalog_json = catalog_json.replacen(&current_json, &next_json, 1);
+        decode_disposable_attempt_catalog(catalog_json.as_bytes()).unwrap()
     }
 
     fn clone_authorized_reservation(

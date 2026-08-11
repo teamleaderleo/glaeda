@@ -7,7 +7,6 @@ use crate::disposable_attempt_catalog::DisposableAttemptCatalogAction;
 use crate::disposable_attempt_state::DisposableAttemptState;
 use crate::execution_admission::EpochMillis;
 use crate::github_scale_set_protocol::{ScaleSetJobEvent, ScaleSetRunnerReference};
-use crate::lima_host_identity::LimaHostInstanceIdentity;
 
 pub const DISPOSABLE_WORKER_RECONCILER_SCHEMA_VERSION: u8 = 2;
 const MAX_IDENTIFIER_LEN: usize = 96;
@@ -49,17 +48,11 @@ identifier!(DisposableVmId, "vm_id");
 pub struct DisposableVmIdentity(Sha256Digest);
 
 impl DisposableVmIdentity {
-    /// Derive the durable equality token from the existing descriptor-bound Lima host observer.
-    #[must_use]
-    pub(crate) fn from_host_identity(identity: &LimaHostInstanceIdentity) -> Self {
-        Self(identity.digest().clone())
-    }
-
     /// Parse one canonical identity digest.
     ///
     /// Parsing does not prove that a VM exists or that SmolRunner owns it. It exists only for the
-    /// private durable codec and crate-internal tests; only the clone-completion transaction may
-    /// create the first durable binding.
+    /// private durable codec and crate-internal tests; only the future sealed clone-completion
+    /// transaction may create the first durable binding.
     pub(crate) fn parse(value: &str) -> Result<Self, DisposableWorkerReconcilerError> {
         Sha256Digest::parse(value).map(Self).map_err(|_| {
             DisposableWorkerReconcilerError::new(
@@ -446,6 +439,13 @@ pub fn reconcile_attempt(
         });
     }
     validate_runner_observation(input.attempt, &input.runner)?;
+    if input.attempt.phase() == DisposableAttemptPhase::CloneStarted
+        && input.attempt.vm_identity().is_none()
+    {
+        return Ok(DisposableWorkerAction::Blocked {
+            code: "unbound_vm_recovery_required",
+        });
+    }
     if let Some(event) = input.job_event.as_ref()
         && let Some(action) = plan_job_event(input.attempt, event)?
     {
@@ -512,13 +512,6 @@ pub fn reconcile_attempt(
             DisposableVmObservation::Conflicting => unreachable!(),
         },
         Phase::CloneStarted if cleanup => persist(DisposableAttemptCatalogAction::BeginCleanup),
-        Phase::CloneStarted
-            if input.vm_identity.is_some() && input.attempt.vm_identity().is_none() =>
-        {
-            Action::Blocked {
-                code: "unbound_vm_recovery_required",
-            }
-        }
         Phase::CloneStarted => match input.vm {
             DisposableVmObservation::Unknown => Action::Observe {
                 target: DisposableWorkerObservationTarget::Vm,

@@ -350,7 +350,9 @@ fn stopped_partial_clone_is_discarded_only_after_clone_start() {
             ScaleSetRunnerObservation::Absent,
         ))
         .unwrap(),
-        persist(DisposableAttemptCatalogAction::BeginCleanup)
+        DisposableWorkerAction::Blocked {
+            code: "unbound_vm_recovery_required"
+        }
     );
     assert_eq!(
         reconcile_attempt(input(
@@ -398,7 +400,7 @@ fn stopped_partial_clone_is_discarded_only_after_clone_start() {
 }
 
 #[test]
-fn unbound_present_vm_is_protected_and_bound_replacement_drift_blocks() {
+fn unbound_started_is_always_recovery_debt_and_bound_replacement_drift_blocks() {
     let started = attempt()
         .authorize_clone()
         .unwrap()
@@ -415,6 +417,61 @@ fn unbound_present_vm_is_protected_and_bound_replacement_drift_blocks() {
             code: "unbound_vm_recovery_required"
         }
     );
+    for vm in [
+        DisposableVmObservation::Unknown,
+        DisposableVmObservation::Absent,
+    ] {
+        assert_eq!(
+            reconcile_attempt(input(&started, vm, ScaleSetRunnerObservation::Absent,)).unwrap(),
+            DisposableWorkerAction::Blocked {
+                code: "unbound_vm_recovery_required"
+            }
+        );
+    }
+    let mut cancelled = input(
+        &started,
+        DisposableVmObservation::Absent,
+        ScaleSetRunnerObservation::Absent,
+    );
+    cancelled.cancellation_requested = true;
+    assert_eq!(
+        reconcile_attempt(cancelled).unwrap(),
+        DisposableWorkerAction::Blocked {
+            code: "unbound_vm_recovery_required"
+        }
+    );
+    let mut capacity_lost = input(
+        &started,
+        DisposableVmObservation::Absent,
+        ScaleSetRunnerObservation::Absent,
+    );
+    capacity_lost.capacity_reserved = false;
+    assert_eq!(
+        reconcile_attempt(capacity_lost).unwrap(),
+        DisposableWorkerAction::Blocked {
+            code: "unbound_vm_recovery_required"
+        }
+    );
+    let mut late_event = input(
+        &started,
+        DisposableVmObservation::Absent,
+        ScaleSetRunnerObservation::Absent,
+    );
+    late_event.job_event = Some(ScaleSetJobEvent::Completed {
+        runner: None,
+        job_id: job("unbound-late"),
+        result: result("failed"),
+    });
+    assert_eq!(
+        reconcile_attempt(late_event).unwrap(),
+        DisposableWorkerAction::Blocked {
+            code: "unbound_vm_recovery_required"
+        }
+    );
+    assert_eq!(
+        started.begin_cleanup().unwrap_err().code(),
+        "invalid_document"
+    );
     let bound = bind_vm(started.clone());
 
     let replacement_state = bind_vm_with_byte(started, "55");
@@ -428,25 +485,6 @@ fn unbound_present_vm_is_protected_and_bound_replacement_drift_blocks() {
     assert_eq!(
         reconcile_attempt(replaced).unwrap_err().code(),
         "vm_identity_drift"
-    );
-
-    let destroying = attempt()
-        .authorize_clone()
-        .unwrap()
-        .record_clone_started()
-        .unwrap()
-        .begin_cleanup()
-        .unwrap();
-    assert_eq!(
-        reconcile_attempt(input(
-            &destroying,
-            DisposableVmObservation::Stopped,
-            ScaleSetRunnerObservation::Absent,
-        ))
-        .unwrap(),
-        DisposableWorkerAction::Blocked {
-            code: "unbound_vm_recovery_required"
-        }
     );
 }
 

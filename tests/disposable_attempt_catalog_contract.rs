@@ -349,6 +349,23 @@ fn raw_store_refuses_first_vm_identity_binding() {
         1,
         DisposableAttemptCatalogAction::RecordCloneStarted,
     );
+    let attempt_id = DisposableAttemptId::parse("attempt-1").unwrap();
+    assert_eq!(
+        current_catalog
+            .transition(
+                started.revision(),
+                &attempt_id,
+                started
+                    .find_active(&attempt_id)
+                    .unwrap()
+                    .attempt()
+                    .revision(),
+                DisposableAttemptCatalogAction::BeginCleanup,
+            )
+            .expect_err("unbound clone outcome cannot acquire cleanup authority")
+            .kind(),
+        DisposableAttemptCatalogErrorKind::InvalidAction
+    );
     let bound = bind_vm_fixture(&mut current_catalog, &started, 1, 1);
 
     let mut store = MemoryDisposableAttemptCatalogStore::default();
