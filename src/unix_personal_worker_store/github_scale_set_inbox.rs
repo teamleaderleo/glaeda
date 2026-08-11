@@ -220,6 +220,39 @@ impl UnixPersonalWorkerStore {
         Ok(Ok((response, attempt_id)))
     }
 
+    /// Persist a message discovered by the live clone-admission poll while the caller retains the
+    /// canonical mutation lock. An idle response never enters this path and cannot be replayed as
+    /// mutation authority.
+    pub(super) fn persist_clone_scale_set_message_locked(
+        &mut self,
+        pending: crate::disposable_clone_runtime::PendingCloneScaleSetMessage,
+    ) -> Result<u32, ScaleSetInboxError> {
+        synchronize_directory(&self.directory, "personal worker store directory")
+            .map_err(map_store_error)?;
+        let inbox = self
+            .load_scale_set_inbox_named(INBOX_DOCUMENT)?
+            .ok_or_else(|| ScaleSetInboxError::new("inbox_missing"))?;
+        if inbox.source_identity() != &pending.source_identity {
+            return Err(ScaleSetInboxError::new("inbox_source_mismatch"));
+        }
+        if inbox.requires_reconciliation() {
+            return Err(ScaleSetInboxError::new("inbox_recovery_required"));
+        }
+        let ScaleSetBridgePoll::Message {
+            message_id,
+            statistics: _,
+            events,
+        } = pending.response
+        else {
+            return Err(ScaleSetInboxError::new("inbox_message_refused"));
+        };
+        let next = inbox.record(message_id, pending.observed_at, pending.not_after, events)?;
+        let mut staged = self.stage_scale_set_inbox(&next)?;
+        self.publish_named_staged(&mut staged, INBOX_DOCUMENT, false)
+            .map_err(map_store_error)?;
+        Ok(message_id)
+    }
+
     /// Finish one exact pre-clone capacity release after its durable cancellation checkpoint.
     pub(crate) fn complete_scale_set_unprovisioned_attempt(
         &mut self,

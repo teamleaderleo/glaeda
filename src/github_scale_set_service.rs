@@ -1,9 +1,16 @@
 // The coordinator is private until guest JIT handoff and the supervised worker command are wired.
 #![allow(dead_code)]
 
+use std::cell::RefCell;
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::disposable_clone_runtime::{
+    CloneRuntimeClock, DisposableCloneAdmissionObservation, DisposableCloneAdmissionSource,
+    DisposableCloneRuntime, DisposableCloneRuntimeError, DisposableCloneTransactionOutcome,
+    PendingCloneScaleSetMessage, admission_seal,
+};
+use crate::disposable_worker_reconciler::DisposableAttemptId;
 use crate::disposable_worker_reconciler::DisposableAttemptPhase;
 use crate::execution_admission::EpochMillis;
 use crate::github_scale_set_bridge::{
@@ -15,6 +22,7 @@ use crate::github_scale_set_consumer::{
     apply_scale_set_event,
 };
 use crate::github_scale_set_inbox::ScaleSetInboxError;
+use crate::process::TimedCommandExecutor;
 use crate::unix_personal_worker_store::UnixPersonalWorkerStore;
 
 const MESSAGE_FRESHNESS_MILLIS: u64 = 30_000;
@@ -58,6 +66,8 @@ pub(crate) enum ScaleSetServiceDisposition {
     Idle(ScaleSetStatistics),
     IdleObservationRecorded { attempt_id: String },
     MessagePersisted { message_id: u32 },
+    CloneAuthorized { attempt_id: String },
+    CloneCompleted { attempt_id: String },
     EventApplied { message_id: u32, event_index: usize },
     MessageAcknowledged { message_id: u32 },
     AckOutcomeApplied { message_id: u32 },
@@ -236,9 +246,172 @@ impl<B: ScaleSetBridgeSession, C: ScaleSetServiceClock> ScaleSetService<B, C> {
         }
     }
 
+    pub(crate) fn clone_authorized_once(
+        &mut self,
+        runtime: &DisposableCloneRuntime,
+        attempt_id: &DisposableAttemptId,
+        executor: &impl TimedCommandExecutor,
+        clock: &impl CloneRuntimeClock,
+    ) -> Result<ScaleSetServiceDisposition, ScaleSetServiceError> {
+        let admission =
+            LiveScaleSetCloneAdmission::new(&mut self.bridge, &self.source_identity, clock);
+        match self
+            .store
+            .execute_disposable_clone_transaction(runtime, attempt_id, &admission, executor, clock)
+            .map_err(ScaleSetServiceError::from_clone)?
+        {
+            DisposableCloneTransactionOutcome::CloneAuthorized { .. } => {
+                Err(ScaleSetServiceError::new("clone_phase_changed"))
+            }
+            DisposableCloneTransactionOutcome::Completed(receipt) => {
+                Ok(ScaleSetServiceDisposition::CloneCompleted {
+                    attempt_id: receipt.attempt_id().to_owned(),
+                })
+            }
+            DisposableCloneTransactionOutcome::ScaleSetMessagePersisted { message_id } => {
+                Ok(ScaleSetServiceDisposition::MessagePersisted { message_id })
+            }
+        }
+    }
+
+    pub(crate) fn authorize_reserved_once(
+        &mut self,
+        runtime: &DisposableCloneRuntime,
+        attempt_id: &DisposableAttemptId,
+        executor: &impl TimedCommandExecutor,
+        clock: &impl CloneRuntimeClock,
+    ) -> Result<ScaleSetServiceDisposition, ScaleSetServiceError> {
+        let admission =
+            LiveScaleSetCloneAdmission::new(&mut self.bridge, &self.source_identity, clock);
+        match self
+            .store
+            .authorize_disposable_clone_transaction(
+                runtime, attempt_id, &admission, executor, clock,
+            )
+            .map_err(ScaleSetServiceError::from_clone)?
+        {
+            DisposableCloneTransactionOutcome::CloneAuthorized { attempt_id } => {
+                Ok(ScaleSetServiceDisposition::CloneAuthorized { attempt_id })
+            }
+            DisposableCloneTransactionOutcome::ScaleSetMessagePersisted { message_id } => {
+                Ok(ScaleSetServiceDisposition::MessagePersisted { message_id })
+            }
+            DisposableCloneTransactionOutcome::Completed(_) => {
+                Err(ScaleSetServiceError::new("clone_phase_changed"))
+            }
+        }
+    }
+
     #[cfg(test)]
     fn into_parts(self) -> (UnixPersonalWorkerStore, B) {
         (self.store, self.bridge)
+    }
+}
+
+pub(crate) struct LiveScaleSetCloneAdmission<'a, B, C> {
+    bridge: RefCell<&'a mut B>,
+    source_identity: &'a ScaleSetBridgeIdentity,
+    clock: &'a C,
+    pending: RefCell<Option<PendingCloneScaleSetMessage>>,
+}
+
+impl<'a, B, C> LiveScaleSetCloneAdmission<'a, B, C> {
+    pub(crate) fn new(
+        bridge: &'a mut B,
+        source_identity: &'a ScaleSetBridgeIdentity,
+        clock: &'a C,
+    ) -> Self {
+        Self {
+            bridge: RefCell::new(bridge),
+            source_identity,
+            clock,
+            pending: RefCell::new(None),
+        }
+    }
+}
+
+impl<B, C> admission_seal::Sealed for LiveScaleSetCloneAdmission<'_, B, C> {}
+
+impl<B: ScaleSetBridgeSession, C: CloneRuntimeClock> DisposableCloneAdmissionSource
+    for LiveScaleSetCloneAdmission<'_, B, C>
+{
+    fn scale_set_source_identity(&self) -> Option<&ScaleSetBridgeIdentity> {
+        Some(self.source_identity)
+    }
+
+    fn observe(
+        &self,
+        catalog: &crate::disposable_attempt_catalog::DisposableAttemptCatalogDocument,
+        reservation: &crate::disposable_attempt_catalog::DisposableAttemptReservation,
+    ) -> Result<DisposableCloneAdmissionObservation, DisposableCloneRuntimeError> {
+        if self.pending.borrow().is_some() {
+            return Err(DisposableCloneRuntimeError::recovery(
+                "clone_scale_set_message_pending",
+            ));
+        }
+        let capacity_reserved = catalog
+            .find_active(reservation.attempt().attempt_id())
+            .is_some_and(|current| current == reservation)
+            && catalog
+                .host_usage()
+                .map(|usage| usage.workers() == 1)
+                .unwrap_or(false);
+        let poll_started_at = self
+            .clock
+            .epoch_millis()
+            .map_err(|_| DisposableCloneRuntimeError::observation("clone_clock_unavailable"))?;
+        let poll_started_not_after = poll_started_at
+            .get()
+            .checked_add(MESSAGE_FRESHNESS_MILLIS)
+            .and_then(|value| EpochMillis::new(value).ok())
+            .ok_or_else(|| DisposableCloneRuntimeError::observation("clone_clock_unavailable"))?;
+        let response =
+            self.bridge.borrow_mut().poll(0).map_err(|_| {
+                DisposableCloneRuntimeError::observation("clone_scale_set_poll_failed")
+            })?;
+        match response {
+            ScaleSetBridgePoll::Idle { .. } => {
+                let observed_at = self.clock.epoch_millis().map_err(|_| {
+                    DisposableCloneRuntimeError::observation("clone_clock_unavailable")
+                })?;
+                let not_after = observed_at
+                    .get()
+                    .checked_add(MESSAGE_FRESHNESS_MILLIS)
+                    .and_then(|value| EpochMillis::new(value).ok())
+                    .ok_or_else(|| {
+                        DisposableCloneRuntimeError::observation("clone_clock_unavailable")
+                    })?;
+                Ok(DisposableCloneAdmissionObservation::new(
+                    catalog,
+                    reservation,
+                    observed_at,
+                    not_after,
+                    capacity_reserved,
+                    false,
+                ))
+            }
+            response @ ScaleSetBridgePoll::Message { .. } => {
+                let observed_at = self.clock.epoch_millis().unwrap_or(poll_started_at);
+                let not_after = observed_at
+                    .get()
+                    .checked_add(MESSAGE_FRESHNESS_MILLIS)
+                    .and_then(|value| EpochMillis::new(value).ok())
+                    .unwrap_or(poll_started_not_after);
+                self.pending.replace(Some(PendingCloneScaleSetMessage {
+                    source_identity: self.source_identity.clone(),
+                    response,
+                    observed_at,
+                    not_after,
+                }));
+                Err(DisposableCloneRuntimeError::recovery(
+                    "clone_scale_set_message_pending",
+                ))
+            }
+        }
+    }
+
+    fn take_pending_scale_set_message(&self) -> Option<PendingCloneScaleSetMessage> {
+        self.pending.borrow_mut().take()
     }
 }
 
@@ -261,6 +434,10 @@ impl ScaleSetServiceError {
     }
 
     fn from_consumer(error: ScaleSetConsumerError) -> Self {
+        Self::new(error.code())
+    }
+
+    fn from_clone(error: DisposableCloneRuntimeError) -> Self {
         Self::new(error.code())
     }
 
@@ -327,10 +504,23 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
     struct FixedClock(EpochMillis);
 
     impl ScaleSetServiceClock for FixedClock {
         fn now(&self) -> Result<EpochMillis, ScaleSetServiceError> {
+            Ok(self.0)
+        }
+    }
+
+    impl crate::lima_observation::LimaObservationClock for FixedClock {
+        fn unix_seconds(&self) -> std::io::Result<u64> {
+            Ok(self.0.get() / 1_000)
+        }
+    }
+
+    impl CloneRuntimeClock for FixedClock {
+        fn epoch_millis(&self) -> std::io::Result<EpochMillis> {
             Ok(self.0)
         }
     }
@@ -545,6 +735,58 @@ mod tests {
         assert_eq!(idle.catalog_revision(), catalog.revision());
         assert_eq!(idle.attempt_id(), reservation.attempt().attempt_id());
         assert_eq!(idle.attempt_revision(), reservation.attempt().revision());
+        assert_eq!(bridge.capacities, [1, 0]);
+    }
+
+    #[test]
+    fn live_clone_admission_polls_zero_capacity_instead_of_reusing_idle_evidence() {
+        let root = TempRoot::new();
+        let store = UnixPersonalWorkerStore::open_or_create_disposable_catalog(&root.0).unwrap();
+        let mut catalog = DisposableAttemptCatalog::new(store);
+        catalog.initialize().unwrap();
+        let store = catalog.into_store();
+        let policy = ScaleSetConsumerPolicy::new(
+            source_identity(),
+            23,
+            "project",
+            "example",
+            &["smolrunner".to_owned()],
+            DisposableWorkerResources::new(2_000, 2 << 30, 20 << 30).unwrap(),
+            &current_disposable_prepared_template().unwrap(),
+        )
+        .unwrap();
+        let bridge = FakeBridge {
+            polls: VecDeque::from([
+                ScaleSetBridgePoll::Message {
+                    message_id: 7,
+                    statistics: statistics(),
+                    events: vec![event()],
+                },
+                ScaleSetBridgePoll::Idle {
+                    statistics: statistics(),
+                },
+            ]),
+            acquired: VecDeque::from([vec![41]]),
+            capacities: Vec::new(),
+            acknowledgements: Vec::new(),
+        };
+        let clock = FixedClock(EpochMillis::new(100_000).unwrap());
+        let mut service = ScaleSetService::with_parts(store, bridge, policy, clock).unwrap();
+        for _ in 0..4 {
+            service.reconcile_once().unwrap();
+        }
+
+        let (mut store, mut bridge) = service.into_parts();
+        let (_, catalog) = store
+            .load_scale_set_control_state(&source_identity())
+            .unwrap();
+        let reservation = &catalog.active()[0];
+        let source = source_identity();
+        let admission = LiveScaleSetCloneAdmission::new(&mut bridge, &source, &clock);
+        admission.observe(&catalog, reservation).unwrap();
+        assert!(admission.take_pending_scale_set_message().is_none());
+        drop(admission);
+
         assert_eq!(bridge.capacities, [1, 0]);
     }
 
