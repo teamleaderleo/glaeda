@@ -14,7 +14,7 @@ use crate::github_scale_set_protocol::ScaleSetRunnerRequestId;
 
 pub(crate) const SCALE_SET_DELIVERY_RECOVERY_SCHEMA_VERSION: u8 = 1;
 pub(crate) const MAX_SCALE_SET_DELIVERY_RECOVERY_BYTES: usize =
-    MAX_SCALE_SET_DELIVERY_BYTES + 16 * 1024;
+    MAX_SCALE_SET_DELIVERY_BYTES * 4 + 16 * 1024;
 const MAX_DELIVERY_RECOVERY_REVISION: u64 = 1_000_000_000_000;
 
 /// Pure recovery state for one durably reconciled Runner Scale Set delivery.
@@ -68,27 +68,37 @@ impl ScaleSetDeliveryRecoveryState {
     }
 
     pub(crate) fn begin_ack(&self) -> Result<Self, ScaleSetDeliveryRecoveryError> {
-        if self.phase != ScaleSetDeliveryRecoveryPhase::Reconciled {
-            return Err(recovery_error(
+        match self.phase {
+            ScaleSetDeliveryRecoveryPhase::Reconciled => {
+                self.successor(ScaleSetDeliveryRecoveryPhase::AcknowledgementStarted)
+            }
+            ScaleSetDeliveryRecoveryPhase::AcknowledgementStarted => Ok(self.clone()),
+            _ => Err(recovery_error(
                 ScaleSetDeliveryRecoveryErrorKind::Conflict,
                 "only a reconciled delivery may begin acknowledgement",
-            ));
+            )),
         }
-        self.successor(ScaleSetDeliveryRecoveryPhase::AcknowledgementStarted)
     }
 
     pub(crate) fn record_ack_response(
         &self,
         acquired: &[ScaleSetRunnerRequestId],
     ) -> Result<Self, ScaleSetDeliveryRecoveryError> {
-        if self.phase != ScaleSetDeliveryRecoveryPhase::AcknowledgementStarted {
-            return Err(recovery_error(
-                ScaleSetDeliveryRecoveryErrorKind::Conflict,
-                "acknowledgement response requires a started acknowledgement",
-            ));
-        }
         let acquired = self.validated_acquired(acquired)?;
-        self.successor(ScaleSetDeliveryRecoveryPhase::Acknowledged { acquired })
+        match &self.phase {
+            ScaleSetDeliveryRecoveryPhase::AcknowledgementStarted => {
+                self.successor(ScaleSetDeliveryRecoveryPhase::Acknowledged { acquired })
+            }
+            ScaleSetDeliveryRecoveryPhase::Acknowledged { acquired: current }
+                if current == &acquired =>
+            {
+                Ok(self.clone())
+            }
+            _ => Err(recovery_error(
+                ScaleSetDeliveryRecoveryErrorKind::Conflict,
+                "acknowledgement response conflicts with the durable recovery phase",
+            )),
+        }
     }
 
     pub(crate) fn record_recovery_acquire(
@@ -115,9 +125,13 @@ impl ScaleSetDeliveryRecoveryState {
             }
         }
         observed.sort_unstable();
-        self.successor(ScaleSetDeliveryRecoveryPhase::AcquisitionRecoveryObserved {
+        let phase = ScaleSetDeliveryRecoveryPhase::AcquisitionRecoveryObserved {
             acquired: observed,
-        })
+        };
+        if self.phase == phase {
+            return Ok(self.clone());
+        }
+        self.successor(phase)
     }
 
     fn successor(
@@ -266,7 +280,8 @@ impl RecoveryWire {
     fn from_state(
         state: &ScaleSetDeliveryRecoveryState,
     ) -> Result<Self, ScaleSetDeliveryRecoveryError> {
-        let delivery_bytes = encode_scale_set_delivery(&state.delivery).map_err(|_| corrupt_state())?;
+        let delivery_bytes =
+            encode_scale_set_delivery(&state.delivery).map_err(|_| corrupt_state())?;
         let delivery_json = String::from_utf8(delivery_bytes).map_err(|_| corrupt_state())?;
         Ok(Self {
             schema_version: state.schema_version,
@@ -450,6 +465,8 @@ mod tests {
         )
         .unwrap();
         let started = initial.begin_ack().unwrap();
+        assert_eq!(started.begin_ack().unwrap().revision(), started.revision());
+
         let expected = vec![ScaleSetRunnerRequestId::new(41).unwrap()];
         let acknowledged = started.record_ack_response(&expected).unwrap();
         match acknowledged.phase() {
@@ -458,12 +475,23 @@ mod tests {
             }
             phase => panic!("unexpected acknowledged phase: {phase:?}"),
         }
+        assert_eq!(
+            acknowledged
+                .record_ack_response(&expected)
+                .unwrap()
+                .revision(),
+            acknowledged.revision()
+        );
 
         let recovery = started.record_recovery_acquire(&[]).unwrap();
         assert!(matches!(
             recovery.phase(),
             ScaleSetDeliveryRecoveryPhase::AcquisitionRecoveryObserved { acquired } if acquired.is_empty()
         ));
+        assert_eq!(
+            recovery.record_recovery_acquire(&[]).unwrap().revision(),
+            recovery.revision()
+        );
     }
 
     #[test]
