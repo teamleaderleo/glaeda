@@ -17,7 +17,7 @@ pub use codec::{
     encode_disposable_attempt_catalog,
 };
 
-pub const DISPOSABLE_ATTEMPT_CATALOG_SCHEMA_VERSION: u8 = 3;
+pub const DISPOSABLE_ATTEMPT_CATALOG_SCHEMA_VERSION: u8 = 4;
 pub const MAX_ACTIVE_DISPOSABLE_ATTEMPTS: usize = 64;
 pub const MAX_DISPOSABLE_ATTEMPT_TOMBSTONES: usize = 64;
 const MAX_DISPOSABLE_ATTEMPT_CATALOG_REVISION: u64 = 1_000_000_000_000;
@@ -481,9 +481,10 @@ impl DisposableAttemptCatalogDocument {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "transition", rename_all = "snake_case")]
 pub enum DisposableAttemptCatalogAction {
-    /// Legacy API action retained for explicit fail-closed classification; it never advances v2.
+    /// Legacy API action retained for explicit fail-closed classification; it never advances v3.
     BeginProvisioning,
     AuthorizeClone,
+    RecordCloneStarted,
     BeginUnprovisionedRelease,
     CompleteUnprovisioned,
     BeginRegistration,
@@ -868,6 +869,7 @@ fn apply_action(
     let result = match action {
         DisposableAttemptCatalogAction::BeginProvisioning => current.begin_provisioning(),
         DisposableAttemptCatalogAction::AuthorizeClone => current.authorize_clone(),
+        DisposableAttemptCatalogAction::RecordCloneStarted => current.record_clone_started(),
         DisposableAttemptCatalogAction::BeginUnprovisionedRelease => {
             current.begin_unprovisioned_release()
         }

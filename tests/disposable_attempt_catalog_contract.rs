@@ -344,12 +344,18 @@ fn duplicate_terminal_observation_is_satisfied_without_catalog_churn() {
         1,
         DisposableAttemptCatalogAction::AuthorizeClone,
     );
+    let started = transition(
+        &mut catalog,
+        &authorized,
+        1,
+        DisposableAttemptCatalogAction::RecordCloneStarted,
+    );
     let job = ScaleSetJobId::parse("opaque-job-1").unwrap();
     let result = ScaleSetJobResult::parse("future-service-result").unwrap();
 
     let terminal = transition(
         &mut catalog,
-        &authorized,
+        &started,
         1,
         DisposableAttemptCatalogAction::RecordTerminal {
             runner: Some(runner(1, 11)),
@@ -395,9 +401,15 @@ fn identity_drift_remains_distinct_from_an_illegal_phase_action() {
         1,
         DisposableAttemptCatalogAction::AuthorizeClone,
     );
-    let registering = transition(
+    let started = transition(
         &mut catalog,
         &provisioning,
+        1,
+        DisposableAttemptCatalogAction::RecordCloneStarted,
+    );
+    let registering = transition(
+        &mut catalog,
+        &started,
         1,
         DisposableAttemptCatalogAction::BeginRegistration,
     );
@@ -436,9 +448,15 @@ fn completed_attempt_releases_usage_then_moves_to_bounded_replay_history() {
         1,
         DisposableAttemptCatalogAction::AuthorizeClone,
     );
-    let terminal = transition(
+    let started = transition(
         &mut catalog,
         &authorized,
+        1,
+        DisposableAttemptCatalogAction::RecordCloneStarted,
+    );
+    let terminal = transition(
+        &mut catalog,
+        &started,
         1,
         DisposableAttemptCatalogAction::RecordTerminal {
             runner: Some(runner(1, 11)),
@@ -540,9 +558,15 @@ fn exact_runner_ids_cannot_be_reused_across_concurrent_attempts() {
         1,
         DisposableAttemptCatalogAction::AuthorizeClone,
     );
-    let one_registering = transition(
+    let one_started = transition(
         &mut catalog,
         &one_provisioning,
+        1,
+        DisposableAttemptCatalogAction::RecordCloneStarted,
+    );
+    let one_registering = transition(
+        &mut catalog,
+        &one_started,
         1,
         DisposableAttemptCatalogAction::BeginRegistration,
     );
@@ -559,9 +583,15 @@ fn exact_runner_ids_cannot_be_reused_across_concurrent_attempts() {
         2,
         DisposableAttemptCatalogAction::AuthorizeClone,
     );
-    let two_registering = transition(
+    let two_started = transition(
         &mut catalog,
         &two_provisioning,
+        2,
+        DisposableAttemptCatalogAction::RecordCloneStarted,
+    );
+    let two_registering = transition(
+        &mut catalog,
+        &two_started,
         2,
         DisposableAttemptCatalogAction::BeginRegistration,
     );
@@ -603,9 +633,15 @@ fn exact_job_ids_cannot_be_reused_across_concurrent_attempts() {
         2,
         DisposableAttemptCatalogAction::AuthorizeClone,
     );
-    let one_terminal = transition(
+    let one_started = transition(
         &mut catalog,
         &both_authorized,
+        1,
+        DisposableAttemptCatalogAction::RecordCloneStarted,
+    );
+    let one_terminal = transition(
+        &mut catalog,
+        &one_started,
         1,
         DisposableAttemptCatalogAction::RecordTerminal {
             runner: Some(runner(1, 11)),
@@ -613,12 +649,18 @@ fn exact_job_ids_cannot_be_reused_across_concurrent_attempts() {
             result: ScaleSetJobResult::parse("canceled").unwrap(),
         },
     );
+    let two_started = transition(
+        &mut catalog,
+        &one_terminal,
+        2,
+        DisposableAttemptCatalogAction::RecordCloneStarted,
+    );
     let attempt_id = DisposableAttemptId::parse("attempt-2").unwrap();
     let duplicate_job_id = catalog
         .transition(
-            one_terminal.revision(),
+            two_started.revision(),
             &attempt_id,
-            one_terminal
+            two_started
                 .find_active(&attempt_id)
                 .unwrap()
                 .attempt()

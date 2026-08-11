@@ -7,7 +7,7 @@ use crate::disposable_attempt_state::DisposableAttemptState;
 use crate::execution_admission::EpochMillis;
 use crate::github_scale_set_protocol::{ScaleSetJobEvent, ScaleSetRunnerReference};
 
-pub const DISPOSABLE_WORKER_RECONCILER_SCHEMA_VERSION: u8 = 1;
+pub const DISPOSABLE_WORKER_RECONCILER_SCHEMA_VERSION: u8 = 2;
 const MAX_IDENTIFIER_LEN: usize = 96;
 const MAX_WORKERS: u16 = 64;
 const MAX_CPU_MILLIS: u32 = 1_000_000;
@@ -295,6 +295,8 @@ pub enum DisposableAttemptPhase {
     /// Legacy schema-v1 state that did not prove VM absence and cannot authorize mutation.
     Provisioning,
     CloneAuthorized,
+    /// The clone command crossed its durable no-replay checkpoint; only observation may advance it.
+    CloneStarted,
     Registering,
     Waiting,
     Assigned,
@@ -361,7 +363,8 @@ pub enum DisposableWorkerAction {
     Observe {
         target: DisposableWorkerObservationTarget,
     },
-    CloneVm,
+    /// Under one durable lock, persist `RecordCloneStarted` and then issue one clone command.
+    CheckpointAndCloneVm,
     /// Remove a stopped destination left by an interrupted clone after the durable absence marker.
     DiscardIncompleteVm,
     GenerateJitAndStartRunner,
@@ -404,7 +407,7 @@ pub fn reconcile_attempt(
     if !input.capacity_reserved
         && matches!(
             input.attempt.phase(),
-            Phase::Reserved | Phase::UnprovisionedReleasing
+            Phase::Reserved | Phase::CloneAuthorized | Phase::UnprovisionedReleasing
         )
     {
         return Ok(persist(
@@ -414,7 +417,7 @@ pub fn reconcile_attempt(
     if !input.capacity_reserved
         && matches!(
             input.attempt.phase(),
-            Phase::CloneAuthorized
+            Phase::CloneStarted
                 | Phase::Registering
                 | Phase::Waiting
                 | Phase::Assigned
@@ -445,12 +448,27 @@ pub fn reconcile_attempt(
         Phase::Provisioning => Action::Blocked {
             code: "legacy_provisioning_recovery_required",
         },
-        Phase::CloneAuthorized if cleanup => persist(DisposableAttemptCatalogAction::BeginCleanup),
+        Phase::CloneAuthorized if cleanup => {
+            persist(DisposableAttemptCatalogAction::BeginUnprovisionedRelease)
+        }
         Phase::CloneAuthorized => match input.vm {
             DisposableVmObservation::Unknown => Action::Observe {
                 target: DisposableWorkerObservationTarget::Vm,
             },
-            DisposableVmObservation::Absent => Action::CloneVm,
+            DisposableVmObservation::Absent => Action::CheckpointAndCloneVm,
+            DisposableVmObservation::Stopped | DisposableVmObservation::Ready => Action::Blocked {
+                code: "vm_changed_before_clone_start",
+            },
+            DisposableVmObservation::Conflicting => unreachable!(),
+        },
+        Phase::CloneStarted if cleanup => persist(DisposableAttemptCatalogAction::BeginCleanup),
+        Phase::CloneStarted => match input.vm {
+            DisposableVmObservation::Unknown => Action::Observe {
+                target: DisposableWorkerObservationTarget::Vm,
+            },
+            DisposableVmObservation::Absent => {
+                persist(DisposableAttemptCatalogAction::BeginCleanup)
+            }
             DisposableVmObservation::Stopped => Action::DiscardIncompleteVm,
             DisposableVmObservation::Ready => {
                 persist(DisposableAttemptCatalogAction::BeginRegistration)
@@ -655,6 +673,7 @@ fn validate_transition(
     let result = match &transition {
         DisposableAttemptCatalogAction::BeginProvisioning => attempt.begin_provisioning(),
         DisposableAttemptCatalogAction::AuthorizeClone => attempt.authorize_clone(),
+        DisposableAttemptCatalogAction::RecordCloneStarted => attempt.record_clone_started(),
         DisposableAttemptCatalogAction::BeginUnprovisionedRelease => {
             attempt.begin_unprovisioned_release()
         }

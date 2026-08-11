@@ -170,7 +170,9 @@ impl DisposableLimaWorkerAdapter {
                 "the disposable VM identity conflicts with the prepared source template",
             ));
         }
-        if matches!(action, DisposableWorkerAction::CloneVm) && now > attempt.not_after() {
+        if matches!(action, DisposableWorkerAction::CheckpointAndCloneVm)
+            && now > attempt.not_after()
+        {
             return Err(error(
                 DisposableLimaWorkerErrorKind::InvalidAction,
                 "attempt_expired",
@@ -179,7 +181,7 @@ impl DisposableLimaWorkerAdapter {
         }
 
         let (kind, command, timeout) = match action {
-            DisposableWorkerAction::CloneVm
+            DisposableWorkerAction::CheckpointAndCloneVm
                 if attempt.phase() == DisposableAttemptPhase::CloneAuthorized =>
             {
                 let resources = lima_resources(
@@ -206,7 +208,7 @@ impl DisposableLimaWorkerAdapter {
                 )
             }
             DisposableWorkerAction::DiscardIncompleteVm
-                if attempt.phase() == DisposableAttemptPhase::CloneAuthorized =>
+                if attempt.phase() == DisposableAttemptPhase::CloneStarted =>
             {
                 (
                     DisposableLimaWorkerCommandKind::DiscardIncomplete,
@@ -229,7 +231,7 @@ impl DisposableLimaWorkerAdapter {
                     DESTROY_TIMEOUT,
                 )
             }
-            DisposableWorkerAction::CloneVm
+            DisposableWorkerAction::CheckpointAndCloneVm
             | DisposableWorkerAction::DiscardIncompleteVm
             | DisposableWorkerAction::DestroyVm => {
                 return Err(error(
@@ -574,11 +576,23 @@ mod tests {
             return provisioning.find_active(&attempt_id).unwrap().clone();
         }
         let provisioning_attempt = provisioning.find_active(&attempt_id).unwrap().attempt();
-        let (destroying, _) = catalog
+        let (started, _) = catalog
             .transition(
                 provisioning.revision(),
                 &attempt_id,
                 provisioning_attempt.revision(),
+                DisposableAttemptCatalogAction::RecordCloneStarted,
+            )
+            .unwrap();
+        if phase == DisposableAttemptPhase::CloneStarted {
+            return started.find_active(&attempt_id).unwrap().clone();
+        }
+        let started_attempt = started.find_active(&attempt_id).unwrap().attempt();
+        let (destroying, _) = catalog
+            .transition(
+                started.revision(),
+                &attempt_id,
+                started_attempt.revision(),
                 DisposableAttemptCatalogAction::BeginCleanup,
             )
             .unwrap();
@@ -624,7 +638,7 @@ mod tests {
             .plan(
                 EpochMillis::new(1_000).unwrap(),
                 &reservation,
-                &DisposableWorkerAction::CloneVm,
+                &DisposableWorkerAction::CheckpointAndCloneVm,
             )
             .unwrap();
 
@@ -667,7 +681,7 @@ mod tests {
 
     #[test]
     fn incomplete_clone_discard_and_cleanup_destroy_are_distinct_fixed_plans() {
-        let provisioning = reservation_in_phase(DisposableAttemptPhase::CloneAuthorized);
+        let provisioning = reservation_in_phase(DisposableAttemptPhase::CloneStarted);
         let discard = adapter()
             .plan(
                 EpochMillis::new(1_000).unwrap(),
@@ -731,7 +745,7 @@ mod tests {
                     DisposableAttemptPhase::CloneAuthorized,
                     other_template_identity(),
                 ),
-                &DisposableWorkerAction::CloneVm,
+                &DisposableWorkerAction::CheckpointAndCloneVm,
             )
             .unwrap_err();
         assert_eq!(error.code(), "prepared_template_identity_drift");
@@ -741,7 +755,7 @@ mod tests {
             .plan(
                 EpochMillis::new(1_000).unwrap(),
                 &reserved,
-                &DisposableWorkerAction::CloneVm,
+                &DisposableWorkerAction::CheckpointAndCloneVm,
             )
             .unwrap_err();
         assert_eq!(error.kind(), DisposableLimaWorkerErrorKind::InvalidAction);
@@ -751,7 +765,7 @@ mod tests {
             .plan(
                 EpochMillis::new(10_001).unwrap(),
                 &provisioning,
-                &DisposableWorkerAction::CloneVm,
+                &DisposableWorkerAction::CheckpointAndCloneVm,
             )
             .unwrap_err();
         assert_eq!(error.code(), "attempt_expired");
@@ -763,7 +777,7 @@ mod tests {
             .plan(
                 EpochMillis::new(1_000).unwrap(),
                 &provisioning,
-                &DisposableWorkerAction::CloneVm,
+                &DisposableWorkerAction::CheckpointAndCloneVm,
             )
             .unwrap_err();
         assert_eq!(
@@ -780,7 +794,7 @@ mod tests {
                 .plan(
                     EpochMillis::new(1_000).unwrap(),
                     &clone_authorized_reservation(resources),
-                    &DisposableWorkerAction::CloneVm,
+                    &DisposableWorkerAction::CheckpointAndCloneVm,
                 )
                 .unwrap_err();
             assert_eq!(error.code(), "resources_below_prepared_template");
@@ -792,7 +806,7 @@ mod tests {
                 &clone_authorized_reservation(
                     DisposableWorkerResources::new(2_000, 2 * GIB, 20 * GIB).unwrap(),
                 ),
-                &DisposableWorkerAction::CloneVm,
+                &DisposableWorkerAction::CheckpointAndCloneVm,
             )
             .unwrap();
         assert_eq!(boundary.kind(), DisposableLimaWorkerCommandKind::Clone);

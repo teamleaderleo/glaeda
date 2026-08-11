@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use smolrunner::disposable_attempt_catalog::{
-    DisposableAttemptCatalog, DisposableAttemptCatalogDocument, DisposableAttemptReservation,
+    DisposableAttemptCatalog, DisposableAttemptCatalogAction, DisposableAttemptCatalogDocument,
+    DisposableAttemptReservation,
 };
 use smolrunner::disposable_attempt_state::DisposableAttemptState;
 use smolrunner::disposable_prepared_template::{
@@ -138,18 +139,30 @@ fn tick_with_cancellation(
         cancellation_requested,
     })
     .unwrap();
-    let next = if let DisposableWorkerAction::Persist { transition } = &action {
-        catalog
-            .transition(
-                current.revision(),
-                state.attempt_id(),
-                state.revision(),
-                transition.clone(),
-            )
-            .unwrap()
-            .0
-    } else {
-        current
+    let next = match &action {
+        DisposableWorkerAction::Persist { transition } => {
+            catalog
+                .transition(
+                    current.revision(),
+                    state.attempt_id(),
+                    state.revision(),
+                    transition.clone(),
+                )
+                .unwrap()
+                .0
+        }
+        DisposableWorkerAction::CheckpointAndCloneVm => {
+            catalog
+                .transition(
+                    current.revision(),
+                    state.attempt_id(),
+                    state.revision(),
+                    DisposableAttemptCatalogAction::RecordCloneStarted,
+                )
+                .unwrap()
+                .0
+        }
+        _ => current,
     };
     drop(catalog);
 
@@ -181,16 +194,18 @@ fn every_durable_checkpoint_reopens_without_duplicate_capacity_or_cleanup_loss()
         DisposableAttemptPhase::CloneAuthorized
     );
 
-    for _ in 0..2 {
-        let (_, action) = tick(
-            root.path(),
-            DisposableVmObservation::Absent,
-            ScaleSetRunnerObservation::Absent,
-            None,
-            true,
-        );
-        assert_eq!(action, DisposableWorkerAction::CloneVm);
-    }
+    let (state, action) = tick(
+        root.path(),
+        DisposableVmObservation::Absent,
+        ScaleSetRunnerObservation::Absent,
+        None,
+        true,
+    );
+    assert_eq!(action, DisposableWorkerAction::CheckpointAndCloneVm);
+    assert_eq!(
+        state.find_active(&attempt_id()).unwrap().attempt().phase(),
+        DisposableAttemptPhase::CloneStarted
+    );
 
     for _ in 0..2 {
         let (_, action) = tick(
@@ -481,7 +496,7 @@ fn stale_registration_is_bound_before_delete_and_recovery_never_uses_name_alone(
     );
     tick(
         root.path(),
-        DisposableVmObservation::Stopped,
+        DisposableVmObservation::Absent,
         ScaleSetRunnerObservation::Absent,
         None,
         true,
