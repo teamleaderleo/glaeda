@@ -4,7 +4,6 @@
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::disposable_attempt_catalog::DisposableAttemptCatalogDocument;
 use crate::disposable_worker_reconciler::DisposableAttemptPhase;
 use crate::execution_admission::EpochMillis;
 use crate::github_scale_set_bridge::{
@@ -57,7 +56,7 @@ impl ScaleSetServiceClock for SystemScaleSetServiceClock {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ScaleSetServiceDisposition {
     Idle(ScaleSetStatistics),
-    CloneAdmissionRefreshed { attempt_id: String },
+    IdleObservationRecorded { attempt_id: String },
     MessagePersisted { message_id: u32 },
     EventApplied { message_id: u32, event_index: usize },
     MessageAcknowledged { message_id: u32 },
@@ -207,64 +206,31 @@ impl<B: ScaleSetBridgeSession, C: ScaleSetServiceClock> ScaleSetService<B, C> {
             });
         }
 
-        let available_capacity = available_capacity(&catalog)?;
-        match self
-            .bridge
-            .poll(available_capacity)
-            .map_err(ScaleSetServiceError::from_bridge)?
-        {
-            ScaleSetBridgePoll::Idle { statistics } => {
-                let Some(reservation) = catalog.active().iter().find(|reservation| {
-                    reservation.attempt().github_job_id().is_some()
-                        && matches!(
-                            reservation.attempt().phase(),
-                            DisposableAttemptPhase::Reserved
-                                | DisposableAttemptPhase::CloneAuthorized
-                        )
-                }) else {
-                    return Ok(ScaleSetServiceDisposition::Idle(statistics));
-                };
-                let observed_at = self.clock.now()?;
+        let bridge = &mut self.bridge;
+        let clock = &self.clock;
+        let (response, attempt_id) = self
+            .store
+            .poll_and_record_scale_set(&self.source_identity, |available_capacity| {
+                let response = bridge
+                    .poll(available_capacity)
+                    .map_err(ScaleSetServiceError::from_bridge)?;
+                let observed_at = clock.now()?;
                 let not_after = observed_at
                     .get()
                     .checked_add(MESSAGE_FRESHNESS_MILLIS)
                     .and_then(|value| EpochMillis::new(value).ok())
                     .ok_or_else(|| ScaleSetServiceError::new("scale_set_clock_unavailable"))?;
-                let attempt_id = reservation.attempt().attempt_id().clone();
-                self.store
-                    .record_scale_set_idle(
-                        &self.source_identity,
-                        inbox.revision(),
-                        &attempt_id,
-                        observed_at,
-                        not_after,
-                    )
-                    .map_err(ScaleSetServiceError::from_inbox)?;
-                Ok(ScaleSetServiceDisposition::CloneAdmissionRefreshed {
+                Ok((response, observed_at, not_after))
+            })
+            .map_err(ScaleSetServiceError::from_inbox)??;
+        match response {
+            ScaleSetBridgePoll::Idle { statistics } => match attempt_id {
+                Some(attempt_id) => Ok(ScaleSetServiceDisposition::IdleObservationRecorded {
                     attempt_id: attempt_id.as_str().to_owned(),
-                })
-            }
-            ScaleSetBridgePoll::Message {
-                message_id,
-                statistics: _,
-                events,
-            } => {
-                let observed_at = self.clock.now()?;
-                let not_after = observed_at
-                    .get()
-                    .checked_add(MESSAGE_FRESHNESS_MILLIS)
-                    .and_then(|value| EpochMillis::new(value).ok())
-                    .ok_or_else(|| ScaleSetServiceError::new("scale_set_clock_unavailable"))?;
-                self.store
-                    .record_scale_set_message(
-                        &self.source_identity,
-                        inbox.revision(),
-                        message_id,
-                        observed_at,
-                        not_after,
-                        events,
-                    )
-                    .map_err(ScaleSetServiceError::from_inbox)?;
+                }),
+                None => Ok(ScaleSetServiceDisposition::Idle(statistics)),
+            },
+            ScaleSetBridgePoll::Message { message_id, .. } => {
                 Ok(ScaleSetServiceDisposition::MessagePersisted { message_id })
             }
         }
@@ -274,15 +240,6 @@ impl<B: ScaleSetBridgeSession, C: ScaleSetServiceClock> ScaleSetService<B, C> {
     fn into_parts(self) -> (UnixPersonalWorkerStore, B) {
         (self.store, self.bridge)
     }
-}
-
-fn available_capacity(
-    catalog: &DisposableAttemptCatalogDocument,
-) -> Result<u16, ScaleSetServiceError> {
-    let usage = catalog
-        .host_usage()
-        .map_err(|_| ScaleSetServiceError::new("scale_set_capacity_invalid"))?;
-    Ok(u16::from(usage.workers() == 0))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -572,7 +529,7 @@ mod tests {
             service.reconcile_once().unwrap();
         }
         let attempt_id = match service.reconcile_once().unwrap() {
-            ScaleSetServiceDisposition::CloneAdmissionRefreshed { attempt_id } => {
+            ScaleSetServiceDisposition::IdleObservationRecorded { attempt_id } => {
                 DisposableAttemptId::parse(&attempt_id).unwrap()
             }
             other => panic!("unexpected disposition: {other:?}"),

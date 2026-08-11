@@ -129,6 +129,7 @@ catalog directly. Restart-at-every-checkpoint coverage exercises the real crash-
 - [x] Model cancellation, expiry, reservation loss, runner loss, missing/orphan VM state, duplicate/out-of-order job events, and cleanup ordering.
 - [x] Persist the attempt through the existing crash-safe state machinery with exact revisions and recovery semantics.
 - [x] Bind an acquired Scale Set offer to its exact GitHub job before clone authority; runnerless pre-clone cancellation releases capacity without manufacturing VM cleanup authority.
+- [x] Retain the canonical store lock from current-capacity derivation through the bounded Scale Set poll and exact response publication.
 - [ ] Add a live persistence-aware Scale Set clone-admission source; an earlier zero-capacity idle poll is advisory and cannot authorize a later mutation.
 - [x] Complete and retire unacquired or pre-clone-canceled attempts one durable transition at a time so capacity returns and bounded replay history replaces active-state accumulation.
 - [x] Split prechosen runner name from GitHub-assigned runner ID so ambiguous JIT registration can recover by stable identity.

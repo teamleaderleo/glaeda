@@ -122,10 +122,12 @@ the bridge at the one fixed root-owned, non-writable installation path with exac
 and it reconfirms that held file around spawn. Every exchange has a finite deadline; malformed
 decoded or semantic responses poison and terminate the session. The personal-Mac adapter fixes
 advertised Scale Set capacity at one and derives its current zero-or-one availability from the
-durable attempt catalog. A private persistence-before-ack inbox now binds the exact bridge
-configuration identity, applies normalized events to exact capacity claims under the canonical
-store lock, and reconciles GitHub's acquired subset before another message or lifecycle mutation
-may proceed. Its one-transition coordinator covers poll, durable record, event application,
+durable attempt catalog. Capacity derivation, the bounded long poll, and exact response
+publication retain one canonical store lock, so a cooperating writer cannot consume the
+advertised slot between those operations. A private persistence-before-ack inbox now binds the
+exact bridge configuration identity, applies normalized events to exact capacity claims under the
+canonical store lock, and reconciles GitHub's acquired subset before another message or lifecycle
+mutation may proceed. Its one-transition coordinator covers poll, durable record, event application,
 acknowledgement checkpoint, and acquired/unacquired capacity reconciliation with crash replay.
 An acquired offer is now prebound to its exact GitHub job before clone authority exists; exact
 runnerless cancellation can release it without manufacturing VM cleanup authority. A settled

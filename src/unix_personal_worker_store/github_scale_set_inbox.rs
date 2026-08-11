@@ -6,6 +6,7 @@ use super::*;
 
 use crate::disposable_attempt_catalog::DisposableAttemptCatalogDocument;
 use crate::github_scale_set_bridge::ScaleSetBridgeIdentity;
+use crate::github_scale_set_bridge::ScaleSetBridgePoll;
 use crate::github_scale_set_inbox::{
     MAX_GITHUB_SCALE_SET_INBOX_BYTES, PendingScaleSetMessage, ScaleSetAckReceipt,
     ScaleSetInboxDocument, ScaleSetInboxError, ScaleSetInboxRevision, decode_scale_set_inbox,
@@ -126,75 +127,97 @@ impl UnixPersonalWorkerStore {
         Ok((inbox, catalog))
     }
 
-    /// Persist one exact bridge message before any event effect or acknowledgement.
-    pub(crate) fn record_scale_set_message(
+    /// Derive current capacity, perform one bounded bridge poll, and persist its exact response
+    /// while retaining the canonical mutation lock.
+    ///
+    /// Keeping these three operations in one transaction prevents a cooperating catalog writer
+    /// from consuming capacity after it was advertised but before an offered job is recorded.
+    pub(crate) fn poll_and_record_scale_set<E>(
         &mut self,
         expected_source_identity: &ScaleSetBridgeIdentity,
-        expected_inbox_revision: ScaleSetInboxRevision,
-        message_id: u32,
-        observed_at: crate::execution_admission::EpochMillis,
-        not_after: crate::execution_admission::EpochMillis,
-        events: Vec<crate::github_scale_set_bridge::ScaleSetBridgeEvent>,
-    ) -> Result<ScaleSetInboxDocument, ScaleSetInboxError> {
+        poll: impl FnOnce(
+            u16,
+        ) -> Result<
+            (
+                ScaleSetBridgePoll,
+                crate::execution_admission::EpochMillis,
+                crate::execution_admission::EpochMillis,
+            ),
+            E,
+        >,
+    ) -> Result<
+        Result<
+            (
+                ScaleSetBridgePoll,
+                Option<crate::disposable_worker_reconciler::DisposableAttemptId>,
+            ),
+            E,
+        >,
+        ScaleSetInboxError,
+    > {
         let _lock = self.acquire_mutation_lock().map_err(map_store_error)?;
         synchronize_directory(&self.directory, "personal worker store directory")
             .map_err(map_store_error)?;
         require_non_message_stages_clean(self)?;
         self.recover_scale_set_transaction_stages()?;
-        let inbox = self
-            .load_scale_set_inbox_named(INBOX_DOCUMENT)?
-            .ok_or_else(|| ScaleSetInboxError::new("inbox_missing"))?;
-        if inbox.revision() != expected_inbox_revision {
-            return Err(ScaleSetInboxError::new("inbox_revision_conflict"));
-        }
-        if inbox.source_identity() != expected_source_identity {
-            return Err(ScaleSetInboxError::new("inbox_source_mismatch"));
-        }
-        self.load_catalog_named(super::disposable_attempt_catalog::CATALOG_DOCUMENT)
-            .map_err(map_catalog_error)?
-            .ok_or_else(|| ScaleSetInboxError::new("inbox_catalog_missing"))?;
-        let next = inbox.record(message_id, observed_at, not_after, events)?;
-        let mut staged = self.stage_scale_set_inbox(&next)?;
-        self.publish_named_staged(&mut staged, INBOX_DOCUMENT, false)
-            .map_err(map_store_error)?;
-        Ok(next)
-    }
 
-    /// Persist one no-message poll bound to the exact current clone candidate.
-    pub(crate) fn record_scale_set_idle(
-        &mut self,
-        expected_source_identity: &ScaleSetBridgeIdentity,
-        expected_inbox_revision: ScaleSetInboxRevision,
-        attempt_id: &crate::disposable_worker_reconciler::DisposableAttemptId,
-        observed_at: crate::execution_admission::EpochMillis,
-        not_after: crate::execution_admission::EpochMillis,
-    ) -> Result<ScaleSetInboxDocument, ScaleSetInboxError> {
-        let _lock = self.acquire_mutation_lock().map_err(map_store_error)?;
-        synchronize_directory(&self.directory, "personal worker store directory")
-            .map_err(map_store_error)?;
-        require_non_message_stages_clean(self)?;
-        self.recover_scale_set_transaction_stages()?;
         let inbox = self
             .load_scale_set_inbox_named(INBOX_DOCUMENT)?
             .ok_or_else(|| ScaleSetInboxError::new("inbox_missing"))?;
-        if inbox.revision() != expected_inbox_revision {
-            return Err(ScaleSetInboxError::new("inbox_revision_conflict"));
-        }
         if inbox.source_identity() != expected_source_identity {
             return Err(ScaleSetInboxError::new("inbox_source_mismatch"));
+        }
+        if inbox.requires_reconciliation() {
+            return Err(ScaleSetInboxError::new("inbox_recovery_required"));
         }
         let catalog = self
             .load_catalog_named(super::disposable_attempt_catalog::CATALOG_DOCUMENT)
             .map_err(map_catalog_error)?
             .ok_or_else(|| ScaleSetInboxError::new("inbox_catalog_missing"))?;
-        let reservation = catalog
-            .find_active(attempt_id)
-            .ok_or_else(|| ScaleSetInboxError::new("inbox_idle_refused"))?;
-        let next = inbox.record_idle(observed_at, not_after, catalog.revision(), reservation)?;
-        let mut staged = self.stage_scale_set_inbox(&next)?;
-        self.publish_named_staged(&mut staged, INBOX_DOCUMENT, false)
-            .map_err(map_store_error)?;
-        Ok(next)
+        let usage = catalog.host_usage().map_err(map_catalog_error)?;
+        let available_capacity = u16::from(usage.workers() == 0);
+        let (response, observed_at, not_after) = match poll(available_capacity) {
+            Ok(response) => response,
+            Err(error) => return Ok(Err(error)),
+        };
+
+        let attempt_id = match &response {
+            ScaleSetBridgePoll::Message {
+                message_id,
+                statistics: _,
+                events,
+            } => {
+                let next = inbox.record(*message_id, observed_at, not_after, events.clone())?;
+                let mut staged = self.stage_scale_set_inbox(&next)?;
+                self.publish_named_staged(&mut staged, INBOX_DOCUMENT, false)
+                    .map_err(map_store_error)?;
+                None
+            }
+            ScaleSetBridgePoll::Idle { statistics: _ } => {
+                let mut candidates = catalog.active().iter().filter(|reservation| {
+                    reservation.attempt().github_job_id().is_some()
+                        && matches!(
+                            reservation.attempt().phase(),
+                            crate::disposable_worker_reconciler::DisposableAttemptPhase::Reserved
+                                | crate::disposable_worker_reconciler::DisposableAttemptPhase::CloneAuthorized
+                        )
+                });
+                let Some(candidate) = candidates.next() else {
+                    return Ok(Ok((response, None)));
+                };
+                if candidates.next().is_some() {
+                    return Err(ScaleSetInboxError::new("inbox_capacity_invalid"));
+                }
+                let attempt_id = candidate.attempt().attempt_id().clone();
+                let next =
+                    inbox.record_idle(observed_at, not_after, catalog.revision(), candidate)?;
+                let mut staged = self.stage_scale_set_inbox(&next)?;
+                self.publish_named_staged(&mut staged, INBOX_DOCUMENT, false)
+                    .map_err(map_store_error)?;
+                Some(attempt_id)
+            }
+        };
+        Ok(Ok((response, attempt_id)))
     }
 
     /// Finish one exact pre-clone capacity release after its durable cancellation checkpoint.
@@ -753,7 +776,9 @@ mod tests {
     use crate::disposable_prepared_template::current_disposable_prepared_template;
     use crate::disposable_worker_reconciler::DisposableWorkerResources;
     use crate::execution_admission::EpochMillis;
-    use crate::github_scale_set_bridge::{ScaleSetBridgeEvent, ScaleSetBridgeJobEvidence};
+    use crate::github_scale_set_bridge::{
+        ScaleSetBridgeEvent, ScaleSetBridgeJobEvidence, ScaleSetStatistics,
+    };
     use crate::github_scale_set_consumer::{
         ScaleSetConsumerPolicy, apply_scale_set_ack_outcome, apply_scale_set_event,
     };
@@ -817,6 +842,59 @@ mod tests {
             &current_disposable_prepared_template().unwrap(),
         )
         .unwrap()
+    }
+
+    fn statistics() -> ScaleSetStatistics {
+        ScaleSetStatistics {
+            available_jobs: 1,
+            acquired_jobs: 0,
+            assigned_jobs: 0,
+            running_jobs: 0,
+            registered_runners: 0,
+            busy_runners: 0,
+            idle_runners: 0,
+        }
+    }
+
+    #[test]
+    fn capacity_poll_and_message_publication_retain_one_canonical_lock() {
+        let root = TempRoot::new("capacity-poll-lock");
+        let mut store = initialized_store(&root);
+        let identity = source_identity();
+        store.initialize_scale_set_inbox(&identity).unwrap();
+
+        let (response, attempt_id) = store
+            .poll_and_record_scale_set(&identity, |available_capacity| {
+                assert_eq!(available_capacity, 1);
+                let concurrent =
+                    UnixPersonalWorkerStore::open_or_create_disposable_catalog(&root.0);
+                let error = match concurrent {
+                    Ok(_) => {
+                        panic!("cooperating catalog writer acquired the poll transaction lock")
+                    }
+                    Err(error) => error,
+                };
+                assert_eq!(error.kind(), DisposableAttemptCatalogErrorKind::Busy);
+                Ok::<_, ()>((
+                    ScaleSetBridgePoll::Message {
+                        message_id: 7,
+                        statistics: statistics(),
+                        events: vec![event()],
+                    },
+                    EpochMillis::new(100_000).unwrap(),
+                    EpochMillis::new(120_000).unwrap(),
+                ))
+            })
+            .unwrap()
+            .unwrap();
+
+        assert!(attempt_id.is_none());
+        assert!(matches!(
+            response,
+            ScaleSetBridgePoll::Message { message_id: 7, .. }
+        ));
+        let inbox = store.load_scale_set_inbox().unwrap().unwrap();
+        assert_eq!(inbox.pending().unwrap().message_id(), 7);
     }
 
     #[test]
