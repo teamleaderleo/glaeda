@@ -452,6 +452,24 @@ impl EncodedJitConfig {
     pub(crate) fn expose_to_guest_handoff(&self) -> &[u8] {
         &self.0
     }
+
+    pub(crate) fn into_zeroizing_string(
+        mut self,
+    ) -> Result<Zeroizing<String>, ScaleSetBridgeError> {
+        let bytes = std::mem::take(&mut *self.0);
+        match String::from_utf8(bytes) {
+            Ok(value) => Ok(Zeroizing::new(value)),
+            Err(error) => {
+                let _bytes = Zeroizing::new(error.into_bytes());
+                Err(ScaleSetBridgeError::new("invalid_jit_encoding"))
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(value: &str) -> Self {
+        Self(Zeroizing::new(value.as_bytes().to_vec()))
+    }
 }
 
 impl fmt::Debug for EncodedJitConfig {
