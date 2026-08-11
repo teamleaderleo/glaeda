@@ -6,7 +6,8 @@ use serde::Serialize;
 use crate::disposable_attempt_state::{DisposableAttemptRevision, DisposableAttemptState};
 use crate::disposable_prepared_template::DisposablePreparedTemplateIdentity;
 use crate::disposable_worker_reconciler::{
-    DisposableAttemptId, DisposableAttemptPhase, DisposableHostUsage, DisposableWorkerResources,
+    DisposableAttemptId, DisposableAttemptPhase, DisposableHostUsage, DisposableVmIdentity,
+    DisposableWorkerResources,
 };
 use crate::github_scale_set_protocol::{ScaleSetJobId, ScaleSetJobResult, ScaleSetRunnerReference};
 
@@ -321,6 +322,46 @@ impl DisposableAttemptCatalogDocument {
         Ok(next)
     }
 
+    /// Bind the exact post-clone VM identity through the private runtime transaction.
+    pub(crate) fn bind_vm_identity_after_clone(
+        &self,
+        attempt_id: &DisposableAttemptId,
+        expected_attempt_revision: DisposableAttemptRevision,
+        identity: DisposableVmIdentity,
+    ) -> Result<Self, DisposableAttemptCatalogError> {
+        let index = self
+            .active
+            .iter()
+            .position(|reservation| reservation.attempt.attempt_id() == attempt_id)
+            .ok_or_else(|| {
+                catalog_error(
+                    DisposableAttemptCatalogErrorKind::Missing,
+                    "disposable attempt does not exist",
+                )
+            })?;
+        let current = &self.active[index];
+        if current.attempt.revision() != expected_attempt_revision {
+            return Err(stale_attempt_revision(
+                expected_attempt_revision,
+                current.attempt.revision(),
+            ));
+        }
+        let successor = current
+            .attempt
+            .bind_vm_identity_after_clone(identity)
+            .map_err(|_| {
+                catalog_error(
+                    DisposableAttemptCatalogErrorKind::InvalidAction,
+                    "clone completion cannot bind VM identity",
+                )
+            })?;
+        let mut next = self.clone();
+        next.revision = self.revision.next()?;
+        next.active[index].attempt = successor;
+        next.validate()?;
+        Ok(next)
+    }
+
     fn validate(&self) -> Result<(), DisposableAttemptCatalogError> {
         if self.schema_version != DISPOSABLE_ATTEMPT_CATALOG_SCHEMA_VERSION {
             return Err(catalog_error(
@@ -482,6 +523,65 @@ impl DisposableAttemptCatalogDocument {
         } else {
             Err(invalid_store_successor())
         }
+    }
+
+    /// Validate either an ordinary successor or the one private post-clone identity bind.
+    pub(crate) fn validate_recovery_successor_of(
+        &self,
+        current: &Self,
+    ) -> Result<(), DisposableAttemptCatalogError> {
+        if self.validate_successor_of(current).is_ok() {
+            return Ok(());
+        }
+        current.validate()?;
+        self.validate()?;
+        if self.revision != current.revision.next()?
+            || self.active.len() != current.active.len()
+            || self.tombstones != current.tombstones
+        {
+            return Err(invalid_store_successor());
+        }
+        let mut changes = self
+            .active
+            .iter()
+            .zip(&current.active)
+            .filter(|(next, prior)| next != prior);
+        let valid = changes.next().is_some_and(|(next, prior)| {
+            changes.next().is_none()
+                && next.resources == prior.resources
+                && next.prepared_template_identity == prior.prepared_template_identity
+                && prior.attempt.phase() == DisposableAttemptPhase::CloneStarted
+                && prior.attempt.revision().get() == 3
+                && prior.attempt.vm_identity().is_none()
+                && next.attempt.phase() == DisposableAttemptPhase::CloneStarted
+                && next.attempt.revision().get() == 4
+                && next.attempt.vm_identity().is_some()
+                && next.attempt.attempt_id() == prior.attempt.attempt_id()
+                && next.attempt.capacity_claim_id() == prior.attempt.capacity_claim_id()
+                && next.attempt.vm_id() == prior.attempt.vm_id()
+                && next.attempt.runner_name() == prior.attempt.runner_name()
+                && next.attempt.runner_id() == prior.attempt.runner_id()
+                && next.attempt.github_job_id() == prior.attempt.github_job_id()
+                && next.attempt.result() == prior.attempt.result()
+                && next.attempt.not_after() == prior.attempt.not_after()
+        });
+        if valid {
+            Ok(())
+        } else {
+            Err(invalid_store_successor())
+        }
+    }
+
+    pub(crate) fn checkpoint_clone_started(
+        &self,
+        attempt_id: &DisposableAttemptId,
+        expected_attempt_revision: DisposableAttemptRevision,
+    ) -> Result<Self, DisposableAttemptCatalogError> {
+        self.replace_attempt(
+            attempt_id,
+            expected_attempt_revision,
+            DisposableAttemptCatalogAction::RecordCloneStarted,
+        )
     }
 }
 
@@ -975,4 +1075,99 @@ const fn catalog_error(
     message: &'static str,
 ) -> DisposableAttemptCatalogError {
     DisposableAttemptCatalogError { kind, message }
+}
+
+#[cfg(test)]
+mod clone_identity_tests {
+    use super::*;
+    use crate::disposable_attempt_state::DisposableAttemptState;
+    use crate::disposable_prepared_template::current_disposable_prepared_template;
+    use crate::disposable_worker_reconciler::{
+        CapacityClaimId, DisposableVmId, DisposableWorkerResources,
+    };
+    use crate::execution_admission::EpochMillis;
+    use crate::github_scale_set_protocol::ScaleSetRunnerName;
+
+    fn started_catalog() -> (DisposableAttemptCatalogDocument, DisposableAttemptId) {
+        let mut catalog =
+            DisposableAttemptCatalog::new(MemoryDisposableAttemptCatalogStore::default());
+        let (empty, _) = catalog.initialize().unwrap();
+        let attempt_id = DisposableAttemptId::parse("attempt-clone-bind").unwrap();
+        let attempt = DisposableAttemptState::reserved(
+            attempt_id.clone(),
+            CapacityClaimId::parse("claim-clone-bind").unwrap(),
+            DisposableVmId::parse("vm-clone-bind").unwrap(),
+            ScaleSetRunnerName::parse("smol-clone-bind").unwrap(),
+            EpochMillis::new(50_000).unwrap(),
+        );
+        let reservation = DisposableAttemptReservation::new(
+            attempt,
+            DisposableWorkerResources::new(2_000, 2 << 30, 20 << 30).unwrap(),
+            current_disposable_prepared_template()
+                .unwrap()
+                .identity()
+                .unwrap(),
+        )
+        .unwrap();
+        let (reserved, _) = catalog.reserve(empty.revision(), reservation).unwrap();
+        let (authorized, _) = catalog
+            .transition(
+                reserved.revision(),
+                &attempt_id,
+                reserved
+                    .find_active(&attempt_id)
+                    .unwrap()
+                    .attempt()
+                    .revision(),
+                DisposableAttemptCatalogAction::AuthorizeClone,
+            )
+            .unwrap();
+        let (started, _) = catalog
+            .transition(
+                authorized.revision(),
+                &attempt_id,
+                authorized
+                    .find_active(&attempt_id)
+                    .unwrap()
+                    .attempt()
+                    .revision(),
+                DisposableAttemptCatalogAction::RecordCloneStarted,
+            )
+            .unwrap();
+        (started, attempt_id)
+    }
+
+    #[test]
+    fn only_recovery_accepts_the_private_post_clone_identity_successor() {
+        let (started, attempt_id) = started_catalog();
+        let attempt_revision = started
+            .find_active(&attempt_id)
+            .unwrap()
+            .attempt()
+            .revision();
+        let identity = DisposableVmIdentity::parse(&format!("sha256:{}", "44".repeat(32))).unwrap();
+        let bound = started
+            .bind_vm_identity_after_clone(&attempt_id, attempt_revision, identity)
+            .unwrap();
+
+        assert!(bound.validate_successor_of(&started).is_err());
+        bound.validate_recovery_successor_of(&started).unwrap();
+        assert_eq!(
+            bound
+                .find_active(&attempt_id)
+                .unwrap()
+                .attempt()
+                .revision()
+                .get(),
+            4
+        );
+        assert!(
+            bound
+                .find_active(&attempt_id)
+                .unwrap()
+                .attempt()
+                .vm_identity()
+                .is_some()
+        );
+    }
 }

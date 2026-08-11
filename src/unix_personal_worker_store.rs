@@ -21,6 +21,8 @@ use crate::personal_worker_store::{
 
 /// Same-lock durable persistence for the disposable-attempt catalog.
 mod disposable_attempt_catalog;
+/// Same-lock clone checkpoint, execution, and identity publication.
+mod disposable_clone_transaction;
 /// Same-lock durable persistence for prepared-template generation state.
 pub(crate) mod disposable_template_generation;
 /// Same-lock durable persistence for the personal-worker Lima lifecycle authority.

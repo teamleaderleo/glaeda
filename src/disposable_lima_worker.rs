@@ -14,7 +14,9 @@ use crate::disposable_worker_reconciler::{
     DisposableAttemptPhase, DisposableWorkerAction, DisposableWorkerResources,
 };
 use crate::execution_admission::EpochMillis;
-use crate::lima_observation::{LIMACTL_SAFE_HOME, LimaInstanceName};
+use crate::lima_observation::{
+    LIMACTL_SAFE_HOME, LimaArchitecture, LimaInstanceName, LimaObservationRequest, LimaVmType,
+};
 use crate::process::CommandSpec;
 
 pub const DISPOSABLE_LIMA_WORKER_SCHEMA_VERSION: u8 = 3;
@@ -23,6 +25,8 @@ const GIB: u64 = 1 << 30;
 const MAX_PRIVATE_PATH_BYTES: usize = 1_024;
 const CLONE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const DESTROY_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const OBSERVATION_MAX_AGE_SECONDS: u64 = 30;
+const GUEST_CACHE_PATH: &str = "/var/lib/smolrunner-runner/work";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -86,6 +90,7 @@ pub struct DisposableLimaWorkerAdapter {
     source_cpu_count: u32,
     source_memory_bytes: u64,
     source_disk_bytes: u64,
+    lima_version: String,
 }
 
 impl fmt::Debug for DisposableLimaWorkerAdapter {
@@ -128,6 +133,7 @@ impl DisposableLimaWorkerAdapter {
             source_cpu_count: prepared_template.source_cpu_count(),
             source_memory_bytes: prepared_template.source_memory_bytes(),
             source_disk_bytes: prepared_template.source_disk_bytes(),
+            lima_version: prepared_template.lima_version().to_owned(),
         })
     }
 
@@ -264,11 +270,39 @@ impl DisposableLimaWorkerAdapter {
             command_identity,
             timeout_seconds: timeout.as_secs(),
             observation_required: true,
-            #[cfg(test)]
             command,
-            #[cfg(test)]
             timeout,
         })
+    }
+
+    pub(crate) fn target_observation_request(
+        &self,
+        reservation: &DisposableAttemptReservation,
+    ) -> Result<LimaObservationRequest, DisposableLimaWorkerError> {
+        let instance =
+            LimaInstanceName::parse(reservation.attempt().vm_id().as_str()).map_err(|_| {
+                error(
+                    DisposableLimaWorkerErrorKind::InvalidAction,
+                    "invalid_vm_identity",
+                    "the durable VM identity is not a supported Lima instance name",
+                )
+            })?;
+        LimaObservationRequest::new(
+            instance,
+            self.lima_home.clone(),
+            LimaVmType::Vz,
+            LimaArchitecture::Aarch64,
+            GUEST_CACHE_PATH,
+            OBSERVATION_MAX_AGE_SECONDS,
+        )
+        .map_err(|_| invalid_configuration())
+    }
+
+    pub(crate) fn version_command(&self) -> (CommandSpec, String) {
+        (
+            self.base_command().argument("--version"),
+            format!("limactl version {}\n", self.lima_version),
+        )
     }
 
     fn base_command(&self) -> CommandSpec {
@@ -291,9 +325,7 @@ pub struct DisposableLimaWorkerCommandPlan {
     command_identity: Sha256Digest,
     timeout_seconds: u64,
     observation_required: bool,
-    #[cfg(test)]
     command: CommandSpec,
-    #[cfg(test)]
     timeout: Duration,
 }
 
@@ -341,6 +373,14 @@ impl DisposableLimaWorkerCommandPlan {
     #[must_use]
     pub const fn observation_required(&self) -> bool {
         self.observation_required
+    }
+
+    pub(crate) const fn command(&self) -> &CommandSpec {
+        &self.command
+    }
+
+    pub(crate) const fn timeout(&self) -> Duration {
+        self.timeout
     }
 }
 

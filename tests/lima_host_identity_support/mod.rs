@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::fs::{self, File, OpenOptions, Permissions};
 use std::io::{Seek, SeekFrom, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -21,8 +19,13 @@ pub struct LimaHostIdentityFixture {
     lima_home: PathBuf,
 }
 
+#[allow(dead_code)]
 impl LimaHostIdentityFixture {
     pub fn new(label: &str, instance: &str) -> Self {
+        Self::new_with_disk_bytes(label, instance, DISK_BYTES)
+    }
+
+    pub fn new_with_disk_bytes(label: &str, instance: &str, disk_bytes: u64) -> Self {
         let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
         let root = std::env::current_dir()
             .expect("current directory")
@@ -36,7 +39,12 @@ impl LimaHostIdentityFixture {
             .expect("private instance directory");
         let identity_byte = u8::try_from(sequence % 254 + 1).expect("bounded identity byte");
         write_identifier(&instance_directory.join("vz-identifier"), identity_byte);
-        write_disk(&instance_directory.join("disk"), identity_byte, true);
+        write_disk(
+            &instance_directory.join("disk"),
+            identity_byte,
+            disk_bytes,
+            true,
+        );
         Self { root, lima_home }
     }
 
@@ -51,13 +59,30 @@ impl LimaHostIdentityFixture {
             .to_owned()
     }
 
+    pub fn add_instance(&self, instance: &str, disk_bytes: u64) {
+        let instance_directory = self.lima_home.join(instance);
+        fs::create_dir(&instance_directory).expect("create additional Lima identity fixture");
+        fs::set_permissions(&instance_directory, Permissions::from_mode(0o700))
+            .expect("private additional instance directory");
+        let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+        let identity_byte = u8::try_from(sequence % 254 + 1).expect("bounded identity byte");
+        write_identifier(&instance_directory.join("vz-identifier"), identity_byte);
+        write_disk(
+            &instance_directory.join("disk"),
+            identity_byte,
+            disk_bytes,
+            true,
+        );
+    }
+
     pub fn rewrite_disk_identity(&self, instance: &str, identity_byte: u8) {
         rewrite_disk_identity(&self.lima_home.join(instance).join("disk"), identity_byte);
     }
 }
 
 pub fn rewrite_disk_identity(path: &Path, identity_byte: u8) {
-    write_disk(path, identity_byte, false);
+    let disk_bytes = fs::metadata(path).expect("root disk metadata").len();
+    write_disk(path, identity_byte, disk_bytes, false);
 }
 
 impl Drop for LimaHostIdentityFixture {
@@ -87,7 +112,7 @@ fn write_identifier(path: &Path, identity_byte: u8) {
         .expect("write VZ identifier");
 }
 
-fn write_disk(path: &Path, identity_byte: u8, create_new: bool) {
+fn write_disk(path: &Path, identity_byte: u8, disk_bytes: u64, create_new: bool) {
     let mut options = OpenOptions::new();
     options
         .create(create_new)
@@ -97,7 +122,7 @@ fn write_disk(path: &Path, identity_byte: u8, create_new: bool) {
         .write(true)
         .mode(0o600);
     let mut disk = options.open(path).expect("create sparse root disk");
-    disk.set_len(DISK_BYTES).expect("size sparse root disk");
+    disk.set_len(disk_bytes).expect("size sparse root disk");
 
     let mut table = vec![0_u8; GPT_TABLE_BYTES];
     table[..16].copy_from_slice(&[
@@ -105,7 +130,7 @@ fn write_disk(path: &Path, identity_byte: u8, create_new: bool) {
         0xe4,
     ]);
     table[16..32].copy_from_slice(&[0x33; 16]);
-    let last_lba = DISK_BYTES / LOGICAL_BLOCK_BYTES - 1;
+    let last_lba = disk_bytes / LOGICAL_BLOCK_BYTES - 1;
     table[32..40].copy_from_slice(&34_u64.to_le_bytes());
     table[40..48].copy_from_slice(&(last_lba - GPT_TABLE_BLOCKS - 1).to_le_bytes());
 

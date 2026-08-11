@@ -8,7 +8,7 @@ use crate::disposable_template_generation::{
     decode_disposable_template_generation, encode_disposable_template_generation,
 };
 
-const GENERATION_DOCUMENT: &str = "disposable-template-generation.json";
+pub(super) const GENERATION_DOCUMENT: &str = "disposable-template-generation.json";
 const STAGED_GENERATION_DOCUMENT: &str = ".disposable-template-generation.next.json";
 pub(crate) const TEMPLATE_INPUT_DOCUMENT: &str = "disposable-template-input-v2.yaml";
 const STAGED_TEMPLATE_INPUT_DOCUMENT: &str = ".disposable-template-input-v2.next.yaml";
@@ -461,7 +461,7 @@ impl UnixPersonalWorkerStore {
         self.recover_template_generation_locked()
     }
 
-    fn refuse_other_unsettled_state(&self) -> Result<(), PersonalWorkerStoreError> {
+    pub(super) fn refuse_other_unsettled_state(&self) -> Result<(), PersonalWorkerStoreError> {
         disposable_attempt_catalog::refuse_unsettled(self)?;
         lima_authority::refuse_unsettled_lima_authority(self)?;
         match self.recovery_plan()? {
@@ -474,7 +474,7 @@ impl UnixPersonalWorkerStore {
         }
     }
 
-    fn load_template_generation_named(
+    pub(super) fn load_template_generation_named(
         &self,
         name: &str,
     ) -> Result<Option<DisposableTemplateGenerationDocument>, PersonalWorkerStoreError> {

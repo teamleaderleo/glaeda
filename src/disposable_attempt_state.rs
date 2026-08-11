@@ -233,6 +233,29 @@ impl DisposableAttemptState {
         )
     }
 
+    /// Bind the first VM identity after the fixed clone command succeeds.
+    ///
+    /// This transition is intentionally crate-private and is excluded from the generic catalog
+    /// action vocabulary. Only the same-lock clone runtime may use it.
+    pub(crate) fn bind_vm_identity_after_clone(
+        &self,
+        identity: DisposableVmIdentity,
+    ) -> Result<Self, DisposableAttemptStateError> {
+        if self.phase != DisposableAttemptPhase::CloneStarted
+            || self.revision.get() != 3
+            || self.vm_identity.is_some()
+        {
+            return Err(invalid_transition(
+                "VM identity can bind only to the first clone-started checkpoint",
+            ));
+        }
+        let mut next = self.clone();
+        next.revision = self.revision.next()?;
+        next.vm_identity = Some(identity);
+        next.validate()?;
+        Ok(next)
+    }
+
     /// Persist cancellation/expiry before releasing capacity for an unprovisioned attempt.
     pub fn begin_unprovisioned_release(&self) -> Result<Self, DisposableAttemptStateError> {
         match self.phase {

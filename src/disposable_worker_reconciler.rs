@@ -7,6 +7,8 @@ use crate::disposable_attempt_catalog::DisposableAttemptCatalogAction;
 use crate::disposable_attempt_state::DisposableAttemptState;
 use crate::execution_admission::EpochMillis;
 use crate::github_scale_set_protocol::{ScaleSetJobEvent, ScaleSetRunnerReference};
+#[cfg(unix)]
+use crate::lima_host_identity::LimaHostInstanceIdentity;
 
 pub const DISPOSABLE_WORKER_RECONCILER_SCHEMA_VERSION: u8 = 2;
 const MAX_IDENTIFIER_LEN: usize = 96;
@@ -48,6 +50,13 @@ identifier!(DisposableVmId, "vm_id");
 pub struct DisposableVmIdentity(Sha256Digest);
 
 impl DisposableVmIdentity {
+    /// Derive the durable equality token from one descriptor-bound post-clone observation.
+    #[cfg(unix)]
+    #[must_use]
+    pub(crate) fn from_host_identity(identity: &LimaHostInstanceIdentity) -> Self {
+        Self(identity.digest().clone())
+    }
+
     /// Parse one canonical identity digest.
     ///
     /// Parsing does not prove that a VM exists or that SmolRunner owns it. It exists only for the
