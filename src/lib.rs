@@ -28,6 +28,9 @@ pub mod disposable_template_generation;
 /// Same-lock bounded Lima supervisor for the disposable source-template lifecycle.
 #[cfg(unix)]
 pub mod disposable_template_runtime;
+/// Canonical, secret-free operator enrollment for one disposable Scale Set worker.
+#[cfg(unix)]
+pub mod disposable_worker_enrollment;
 /// Pure capacity and lifecycle reconciliation for one-job disposable workers.
 pub mod disposable_worker_reconciler;
 pub mod doctor;
