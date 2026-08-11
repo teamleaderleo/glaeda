@@ -238,6 +238,13 @@ Acceptance: ordinary clone/download/build/test fixtures pass; hostile fixtures c
 
 Add `smolrunner worker serve` under `launchd`: observe demand, reserve bounded capacity, advance attempts, back off transient failures, enforce circuit breakers and operator holds, clean orphans, reconcile after reboot, remove stale runners, and scale to zero. Status must explain current capacity, attempts, blockers, retries, and cleanup debt without exposing secrets.
 
+The private supervisor loop now drives the existing one-transition dispatcher: durable progress
+continues immediately, an idle poll receives a fixed delay, failures use bounded exponential
+backoff, and repeated failures open a five-minute cool-down circuit that closes only after a
+successful step. `launchd` remains responsible for process lifetime and crash restart. This loop is
+not production-facing until enrolled configuration, operator holds, bounded status, and the
+`worker serve`/launchd installation path consume it.
+
 Acceptance: sleep/wake, controller kill, Mac reboot, network loss, GitHub outage, failed provisioning, stuck job, and failed teardown tests all converge automatically or stop behind a precise durable blocker.
 
 ### M6 — production acceptance and safe optimization

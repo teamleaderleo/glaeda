@@ -54,6 +54,9 @@ pub mod github_scale_set_protocol;
 /// Private one-transition-at-a-time coordinator for the durable Scale Set message path.
 #[cfg(unix)]
 pub(crate) mod github_scale_set_service;
+/// Private bounded retry/backoff loop around the disposable Scale Set phase dispatcher.
+#[cfg(unix)]
+pub(crate) mod github_scale_set_supervisor;
 /// Pure, fail-closed mapping of reviewed GitHub workflow-job evidence into typed broker intents.
 pub mod github_workflow_job_mapper;
 /// Pure, bounded normalization of complete GitHub workflow-job reconciliation snapshots.

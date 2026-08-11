@@ -801,6 +801,11 @@ impl ScaleSetServiceError {
         Self { code }
     }
 
+    #[cfg(test)]
+    pub(crate) const fn for_test(code: &'static str) -> Self {
+        Self::new(code)
+    }
+
     const fn from_bridge(error: ScaleSetBridgeError) -> Self {
         Self::new(error.code())
     }
