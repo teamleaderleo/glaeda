@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 #[cfg(target_os = "macos")]
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
@@ -443,17 +444,11 @@ pub(crate) enum ScaleSetBridgePoll {
     },
 }
 
-pub(crate) struct EncodedJitConfig(Vec<u8>);
+pub(crate) struct EncodedJitConfig(Zeroizing<Vec<u8>>);
 
 impl EncodedJitConfig {
     pub(crate) fn expose_to_guest_handoff(&self) -> &[u8] {
         &self.0
-    }
-}
-
-impl Drop for EncodedJitConfig {
-    fn drop(&mut self) {
-        self.0.zeroize();
     }
 }
 
@@ -469,8 +464,90 @@ pub(crate) struct ScaleSetJitReceipt {
 }
 
 trait BridgeTransport {
-    fn exchange(&mut self, request: &BridgeRequest<'_>) -> Result<Vec<u8>, ScaleSetBridgeError>;
+    fn exchange(
+        &mut self,
+        request: &BridgeRequest<'_>,
+    ) -> Result<Zeroizing<Vec<u8>>, ScaleSetBridgeError>;
     fn poison(&mut self);
+}
+
+struct BoundedSecretBuffer {
+    bytes: Zeroizing<Box<[u8]>>,
+    len: usize,
+}
+
+impl BoundedSecretBuffer {
+    fn new(capacity: usize) -> Self {
+        // Allocate the entire protocol bound before any credential or JIT byte enters the buffer.
+        // Growing a Vec after that point could leave an unwiped allocator copy behind.
+        Self {
+            bytes: Zeroizing::new(vec![0_u8; capacity].into_boxed_slice()),
+            len: 0,
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+
+    fn remaining_mut(&mut self) -> &mut [u8] {
+        &mut self.bytes[self.len..]
+    }
+
+    fn advance(&mut self, count: usize) -> Result<(), ScaleSetBridgeError> {
+        self.len = self
+            .len
+            .checked_add(count)
+            .filter(|len| *len <= self.bytes.len())
+            .ok_or_else(|| ScaleSetBridgeError::new("bridge_response_invalid"))?;
+        Ok(())
+    }
+
+    fn push(&mut self, byte: u8) -> Result<(), ScaleSetBridgeError> {
+        if self.len == self.bytes.len() {
+            return Err(ScaleSetBridgeError::new("bridge_request_failed"));
+        }
+        self.bytes[self.len] = byte;
+        self.len += 1;
+        Ok(())
+    }
+
+    fn strip_final_newline(&mut self) -> Result<(), ScaleSetBridgeError> {
+        if self.len == 0 || self.bytes[self.len - 1] != b'\n' {
+            return Err(ScaleSetBridgeError::new("bridge_response_invalid"));
+        }
+        self.len -= 1;
+        self.bytes[self.len] = 0;
+        if self.len > 0 && self.bytes[self.len - 1] == b'\r' {
+            return Err(ScaleSetBridgeError::new("bridge_response_invalid"));
+        }
+        Ok(())
+    }
+
+    fn into_exact_vec(self) -> Zeroizing<Vec<u8>> {
+        let mut result = Zeroizing::new(Vec::with_capacity(self.len));
+        result.extend_from_slice(self.as_slice());
+        result
+    }
+}
+
+impl Write for BoundedSecretBuffer {
+    fn write(&mut self, input: &[u8]) -> std::io::Result<usize> {
+        if input.len() > self.bytes.len().saturating_sub(self.len) {
+            return Err(std::io::Error::new(
+                ErrorKind::WriteZero,
+                "bounded bridge request exceeded its fixed buffer",
+            ));
+        }
+        let end = self.len + input.len();
+        self.bytes[self.len..end].copy_from_slice(input);
+        self.len = end;
+        Ok(input.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 struct ChildBridgeTransport {
@@ -523,43 +600,33 @@ impl ChildBridgeTransport {
         &mut self,
         request: &BridgeRequest<'_>,
         timeout: Duration,
-    ) -> Result<Vec<u8>, ScaleSetBridgeError> {
+    ) -> Result<Zeroizing<Vec<u8>>, ScaleSetBridgeError> {
         if self.poisoned {
             return Err(ScaleSetBridgeError::new("bridge_session_poisoned"));
         }
-        let mut encoded = Zeroizing::new(
-            serde_json::to_vec(request)
-                .map_err(|_| ScaleSetBridgeError::new("bridge_request_failed"))?,
-        );
-        encoded.push(b'\n');
-        if encoded.len() > MAX_PROTOCOL_LINE_BYTES {
-            return Err(ScaleSetBridgeError::new("bridge_request_failed"));
-        }
+        let mut encoded = BoundedSecretBuffer::new(MAX_PROTOCOL_LINE_BYTES);
+        serde_json::to_writer(&mut encoded, request)
+            .map_err(|_| ScaleSetBridgeError::new("bridge_request_failed"))?;
+        encoded.push(b'\n')?;
         let deadline = Instant::now()
             .checked_add(timeout)
             .ok_or_else(|| ScaleSetBridgeError::new("bridge_request_failed"))?;
-        let write_result = write_all_until(&mut self.input, &encoded, deadline);
-        write_result?;
+        write_all_until(&mut self.input, encoded.as_slice(), deadline)?;
 
-        let mut response = Vec::with_capacity(4_096);
-        let read_result = read_line_until(&mut self.output, &mut response, deadline);
-        if let Err(error) = read_result {
-            response.zeroize();
-            return Err(error);
-        }
-        response.pop();
-        if response.last() == Some(&b'\r') {
-            response.zeroize();
+        let mut response = BoundedSecretBuffer::new(MAX_PROTOCOL_LINE_BYTES + 1);
+        read_line_until(&mut self.output, &mut response, deadline)?;
+        if response.len > MAX_PROTOCOL_LINE_BYTES {
             return Err(ScaleSetBridgeError::new("bridge_response_invalid"));
         }
-        Ok(response)
+        response.strip_final_newline()?;
+        Ok(response.into_exact_vec())
     }
 
     fn exchange_with_timeout(
         &mut self,
         request: &BridgeRequest<'_>,
         timeout: Duration,
-    ) -> Result<Vec<u8>, ScaleSetBridgeError> {
+    ) -> Result<Zeroizing<Vec<u8>>, ScaleSetBridgeError> {
         let result = self.exchange_inner(request, timeout);
         if result.is_err() {
             self.poison();
@@ -573,7 +640,10 @@ impl ChildBridgeTransport {
 }
 
 impl BridgeTransport for ChildBridgeTransport {
-    fn exchange(&mut self, request: &BridgeRequest<'_>) -> Result<Vec<u8>, ScaleSetBridgeError> {
+    fn exchange(
+        &mut self,
+        request: &BridgeRequest<'_>,
+    ) -> Result<Zeroizing<Vec<u8>>, ScaleSetBridgeError> {
         self.exchange_with_timeout(request, request.exchange_timeout())
     }
 
@@ -626,25 +696,20 @@ fn write_all_until(
 
 fn read_line_until(
     input: &mut ChildStdout,
-    response: &mut Vec<u8>,
+    response: &mut BoundedSecretBuffer,
     deadline: Instant,
 ) -> Result<(), ScaleSetBridgeError> {
-    let mut buffer = Zeroizing::new([0_u8; 4_096]);
     loop {
         wait_for_fd(input, PollFlags::IN, deadline, "bridge_response_timeout")?;
-        let remaining = MAX_PROTOCOL_LINE_BYTES
-            .saturating_add(1)
-            .saturating_sub(response.len());
-        if remaining == 0 {
+        if response.remaining_mut().is_empty() {
             return Err(ScaleSetBridgeError::new("bridge_response_invalid"));
         }
-        let capacity = remaining.min(buffer.len());
-        match input.read(&mut buffer[..capacity]) {
+        match input.read(response.remaining_mut()) {
             Ok(0) => return Err(ScaleSetBridgeError::new("bridge_response_invalid")),
             Ok(count) => {
-                response.extend_from_slice(&buffer[..count]);
-                if let Some(newline) = response.iter().position(|byte| *byte == b'\n') {
-                    if newline + 1 != response.len() {
+                response.advance(count)?;
+                if let Some(newline) = response.as_slice().iter().position(|byte| *byte == b'\n') {
+                    if newline + 1 != response.len {
                         return Err(ScaleSetBridgeError::new("bridge_response_invalid"));
                     }
                     return Ok(());
@@ -930,9 +995,8 @@ fn exchange_and_decode(
     transport: &mut dyn BridgeTransport,
     request: &BridgeRequest<'_>,
 ) -> Result<BridgeResponse, ScaleSetBridgeError> {
-    let mut bytes = transport.exchange(request)?;
+    let bytes = transport.exchange(request)?;
     let result = decode_response(&bytes);
-    bytes.zeroize();
     if result.is_err() {
         transport.poison();
     }
@@ -943,12 +1007,26 @@ fn decode_response(bytes: &[u8]) -> Result<BridgeResponse, ScaleSetBridgeError> 
     if bytes.is_empty() || bytes.len() > MAX_PROTOCOL_LINE_BYTES {
         return Err(ScaleSetBridgeError::new("invalid_bridge_response"));
     }
-    let response: BridgeResponse = serde_json::from_slice(bytes)
+    let response: BridgeResponseWire<'_> = serde_json::from_slice(bytes)
         .map_err(|_| ScaleSetBridgeError::new("invalid_bridge_response"))?;
     if response.version != PROTOCOL_VERSION {
         return Err(ScaleSetBridgeError::new("invalid_bridge_response"));
     }
-    Ok(response)
+    let encoded_jit_config = response
+        .encoded_jit_config
+        .map(SecretString::from_raw_json)
+        .transpose()?;
+    Ok(BridgeResponse {
+        response_type: response.response_type,
+        code: response.code,
+        scale_set_id: response.scale_set_id,
+        message_id: response.message_id,
+        statistics: response.statistics,
+        events: response.events,
+        acquired_requests: response.acquired_requests,
+        runner: response.runner,
+        encoded_jit_config,
+    })
 }
 
 #[derive(Serialize)]
@@ -1057,7 +1135,7 @@ impl<'a> BridgeRequest<'a> {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct BridgeResponse {
+struct BridgeResponseWire<'a> {
     version: u8,
     #[serde(rename = "type")]
     response_type: String,
@@ -1070,29 +1148,46 @@ struct BridgeResponse {
     #[serde(default)]
     acquired_requests: Vec<u64>,
     runner: Option<RunnerWire>,
+    #[serde(borrow)]
+    encoded_jit_config: Option<&'a RawValue>,
+}
+
+struct BridgeResponse {
+    response_type: String,
+    code: Option<String>,
+    scale_set_id: Option<u64>,
+    message_id: Option<u64>,
+    statistics: Option<StatisticsWire>,
+    events: Vec<EventWire>,
+    acquired_requests: Vec<u64>,
+    runner: Option<RunnerWire>,
     encoded_jit_config: Option<SecretString>,
 }
 
-struct SecretString(String);
-
-impl<'de> Deserialize<'de> for SecretString {
-    fn deserialize<Deserializer>(deserializer: Deserializer) -> Result<Self, Deserializer::Error>
-    where
-        Deserializer: serde::Deserializer<'de>,
-    {
-        String::deserialize(deserializer).map(Self)
-    }
-}
+struct SecretString(Zeroizing<Vec<u8>>);
 
 impl SecretString {
-    fn into_bytes(mut self) -> Vec<u8> {
-        std::mem::take(&mut self.0).into_bytes()
+    fn from_raw_json(raw: &RawValue) -> Result<Self, ScaleSetBridgeError> {
+        // Borrow the exact JSON token from the zeroizing transport buffer. Escapes are rejected so
+        // serde_json never needs a separately allocated unescape buffer for the one-time secret.
+        let raw = raw.get().as_bytes();
+        if raw.len() < 2 || raw.first() != Some(&b'"') || raw.last() != Some(&b'"') {
+            return Err(ScaleSetBridgeError::new("invalid_bridge_response"));
+        }
+        let value = &raw[1..raw.len() - 1];
+        if value
+            .iter()
+            .any(|byte| *byte == b'\\' || *byte == b'"' || *byte < b' ')
+        {
+            return Err(ScaleSetBridgeError::new("invalid_bridge_response"));
+        }
+        let mut bytes = Vec::with_capacity(value.len());
+        bytes.extend_from_slice(value);
+        Ok(Self(Zeroizing::new(bytes)))
     }
-}
 
-impl Drop for SecretString {
-    fn drop(&mut self) {
-        self.0.zeroize();
+    fn into_bytes(mut self) -> Zeroizing<Vec<u8>> {
+        Zeroizing::new(std::mem::take(&mut *self.0))
     }
 }
 
@@ -1423,7 +1518,7 @@ mod tests {
         fn exchange(
             &mut self,
             request: &BridgeRequest<'_>,
-        ) -> Result<Vec<u8>, ScaleSetBridgeError> {
+        ) -> Result<Zeroizing<Vec<u8>>, ScaleSetBridgeError> {
             if self.poisoned.get() {
                 return Err(ScaleSetBridgeError::new("bridge_session_poisoned"));
             }
@@ -1433,6 +1528,7 @@ mod tests {
             );
             self.responses
                 .pop_front()
+                .map(Zeroizing::new)
                 .ok_or_else(|| ScaleSetBridgeError::new("script_exhausted"))
         }
 
@@ -1567,6 +1663,24 @@ mod tests {
         assert_eq!(receipt.runner.id.get(), 81);
         assert_eq!(format!("{:?}", receipt.config), "[REDACTED]");
         assert_eq!(receipt.config.expose_to_guest_handoff(), b"one-time-secret");
+
+        let (transport, poisoned) = ScriptedTransport::with_poison_probe(&[
+            r#"{"version":1,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
+            r#"{"version":1,"type":"jit","runner":{"id":81,"name":"smolrunner-job-1","scale_set_id":23},"encoded_jit_config":"escaped\u002dsecret"}"#,
+        ]);
+        let mut client = ScaleSetBridgeClient::connect_with_transport(
+            config(),
+            GitHubAppPrivateKey::parse(b"private-key".to_vec()).unwrap(),
+            Box::new(transport),
+        )
+        .unwrap();
+        let error =
+            match client.generate_jit(&ScaleSetRunnerName::parse("smolrunner-job-1").unwrap()) {
+                Ok(_) => panic!("escaped JIT secret was accepted"),
+                Err(error) => error,
+            };
+        assert_eq!(error.code(), "invalid_bridge_response");
+        assert!(poisoned.get());
     }
 
     #[test]
