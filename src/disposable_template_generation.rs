@@ -66,6 +66,10 @@ impl fmt::Debug for DisposableTemplateGenerationId {
 pub struct DisposableTemplateSourceIdentity(Sha256Digest);
 
 impl DisposableTemplateSourceIdentity {
+    pub(crate) fn from_runtime_digest(digest: Sha256Digest) -> Self {
+        Self(digest)
+    }
+
     pub(crate) fn parse(value: &str) -> Result<Self, DisposableTemplateGenerationError> {
         Sha256Digest::parse(value).map(Self).map_err(|_| {
             generation_error(
@@ -95,6 +99,10 @@ impl fmt::Debug for DisposableTemplateSourceIdentity {
 pub struct DisposableTemplateObjectIdentity(Sha256Digest);
 
 impl DisposableTemplateObjectIdentity {
+    pub(crate) fn from_host_digest(digest: Sha256Digest) -> Self {
+        Self(digest)
+    }
+
     pub(crate) fn parse(value: &str) -> Result<Self, DisposableTemplateGenerationError> {
         Sha256Digest::parse(value)
             .map(Self)
@@ -184,6 +192,20 @@ impl DisposableTemplateGenerationDocument {
             phase: DisposableTemplateGenerationPhase::Pending,
             history: Vec::new(),
         }
+    }
+
+    pub(crate) fn runtime_initial(
+        generation_id: DisposableTemplateGenerationId,
+        prepared_template_identity: DisposablePreparedTemplateIdentity,
+        source_identity: DisposableTemplateSourceIdentity,
+        source_instance: LimaInstanceName,
+    ) -> Self {
+        Self::initial(
+            generation_id,
+            prepared_template_identity,
+            source_identity,
+            source_instance,
+        )
     }
 
     #[must_use]
@@ -413,6 +435,25 @@ pub(crate) fn test_disposable_template_observation(
     }
 }
 
+pub(crate) fn runtime_disposable_template_observation(
+    document: &DisposableTemplateGenerationDocument,
+    source_identity: DisposableTemplateSourceIdentity,
+    object_identity: Option<DisposableTemplateObjectIdentity>,
+    prepared_template_identity: Option<DisposablePreparedTemplateIdentity>,
+    prior_operation: DisposableTemplatePriorOperationState,
+    state: DisposableTemplateObservedState,
+) -> DisposableTemplateObservation {
+    DisposableTemplateObservation {
+        generation_id: document.generation_id.clone(),
+        document_revision: document.revision,
+        source_identity,
+        object_identity,
+        prepared_template_identity,
+        prior_operation,
+        state,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DisposableTemplateGenerationRefusal {
@@ -466,6 +507,17 @@ impl DisposableTemplateGenerationPlan {
         self.disposition
     }
 
+    pub(crate) fn is_bound_to_document(
+        &self,
+        document: &DisposableTemplateGenerationDocument,
+    ) -> bool {
+        self.generation_id == document.generation_id
+            && self.expected_revision == document.revision
+            && self.prepared_template_identity == document.prepared_template_identity
+            && self.source_identity == document.source_identity
+            && self.source_instance == document.source_instance
+    }
+
     pub(crate) fn confirmed_persist_successor(
         self,
         document: &DisposableTemplateGenerationDocument,
@@ -477,25 +529,59 @@ impl DisposableTemplateGenerationPlan {
                 "template generation candidate requires the runtime execution service",
             ));
         };
-        let binding_matches = self.generation_id == document.generation_id
-            && self.expected_revision == document.revision
-            && self.prepared_template_identity == document.prepared_template_identity
-            && self.source_identity == document.source_identity
-            && self.source_instance == document.source_instance
-            && confirmation.generation_id == self.generation_id
-            && confirmation.document_revision == self.expected_revision
-            && confirmation.source_identity == self.source_identity
-            && confirmation.object_identity == self.observed_object_identity
-            && confirmation.prepared_template_identity == self.observed_prepared_template_identity
-            && confirmation.state == self.observed_state
-            && confirmation.prior_operation == self.prior_operation;
-        if !binding_matches {
+        if !self.confirmation_matches(document, &confirmation) {
             return Err(generation_error(
                 DisposableTemplateGenerationErrorKind::StaleRevision,
                 "template generation confirmation no longer matches the advisory decision",
             ));
         }
         document.transition(self.expected_revision, action, confirmation.object_identity)
+    }
+
+    pub(crate) fn confirmed_runtime_successor(
+        self,
+        document: &DisposableTemplateGenerationDocument,
+        confirmation: DisposableTemplateObservation,
+    ) -> Result<DisposableTemplateGenerationDocument, DisposableTemplateGenerationError> {
+        let action = match self.disposition {
+            DisposableTemplateGenerationDisposition::CreateCandidate => {
+                DisposableTemplateGenerationAction::RecordCreateStarted
+            }
+            DisposableTemplateGenerationDisposition::StopCandidate => {
+                DisposableTemplateGenerationAction::RecordStopStarted
+            }
+            DisposableTemplateGenerationDisposition::DiscardCandidate => {
+                DisposableTemplateGenerationAction::RecordDiscardStarted
+            }
+            _ => {
+                return Err(generation_error(
+                    DisposableTemplateGenerationErrorKind::InvalidTransition,
+                    "template generation plan is not runtime command authority",
+                ));
+            }
+        };
+        if !self.confirmation_matches(document, &confirmation) {
+            return Err(generation_error(
+                DisposableTemplateGenerationErrorKind::StaleRevision,
+                "template generation confirmation no longer matches the runtime decision",
+            ));
+        }
+        document.transition(self.expected_revision, action, confirmation.object_identity)
+    }
+
+    fn confirmation_matches(
+        &self,
+        document: &DisposableTemplateGenerationDocument,
+        confirmation: &DisposableTemplateObservation,
+    ) -> bool {
+        self.is_bound_to_document(document)
+            && confirmation.generation_id == self.generation_id
+            && confirmation.document_revision == self.expected_revision
+            && confirmation.source_identity == self.source_identity
+            && confirmation.object_identity == self.observed_object_identity
+            && confirmation.prepared_template_identity == self.observed_prepared_template_identity
+            && confirmation.state == self.observed_state
+            && confirmation.prior_operation == self.prior_operation
     }
 }
 
