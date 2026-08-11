@@ -124,12 +124,16 @@ impl ScaleSetDeliveryRecoveryState {
         &self,
         phase: ScaleSetDeliveryRecoveryPhase,
     ) -> Result<Self, ScaleSetDeliveryRecoveryError> {
-        let revision = self.revision.checked_add(1).ok_or_else(|| {
-            recovery_error(
-                ScaleSetDeliveryRecoveryErrorKind::Conflict,
-                "delivery recovery revision cannot advance",
-            )
-        })?;
+        let revision = self
+            .revision
+            .checked_add(1)
+            .filter(|revision| *revision <= MAX_DELIVERY_RECOVERY_REVISION)
+            .ok_or_else(|| {
+                recovery_error(
+                    ScaleSetDeliveryRecoveryErrorKind::Conflict,
+                    "delivery recovery revision cannot advance",
+                )
+            })?;
         let state = Self {
             schema_version: self.schema_version,
             revision,
@@ -160,9 +164,7 @@ impl ScaleSetDeliveryRecoveryState {
                 ));
             }
         }
-        let mut result = seen.into_iter().collect::<Vec<_>>();
-        result.sort_unstable();
-        Ok(result)
+        Ok(seen.into_iter().collect())
     }
 
     fn validate(&self) -> Result<(), ScaleSetDeliveryRecoveryError> {
@@ -200,7 +202,7 @@ pub(crate) fn encode_scale_set_delivery_recovery(
     state: &ScaleSetDeliveryRecoveryState,
 ) -> Result<Vec<u8>, ScaleSetDeliveryRecoveryError> {
     state.validate()?;
-    let wire = RecoveryWire::from_state(state);
+    let wire = RecoveryWire::from_state(state)?;
     let bytes = serde_json::to_vec(&wire).map_err(|_| {
         recovery_error(
             ScaleSetDeliveryRecoveryErrorKind::InvalidDocument,
@@ -256,28 +258,28 @@ struct RecoveryWire {
     schema_version: u8,
     revision: u64,
     catalog_revision: u64,
-    delivery: serde_json::Value,
+    delivery_json: String,
     phase: RecoveryPhaseWire,
 }
 
 impl RecoveryWire {
-    fn from_state(state: &ScaleSetDeliveryRecoveryState) -> Self {
-        let delivery_bytes =
-            encode_scale_set_delivery(&state.delivery).expect("validated delivery must encode");
-        let delivery = serde_json::from_slice(&delivery_bytes)
-            .expect("canonical delivery bytes must be valid JSON");
-        Self {
+    fn from_state(
+        state: &ScaleSetDeliveryRecoveryState,
+    ) -> Result<Self, ScaleSetDeliveryRecoveryError> {
+        let delivery_bytes = encode_scale_set_delivery(&state.delivery).map_err(|_| corrupt_state())?;
+        let delivery_json = String::from_utf8(delivery_bytes).map_err(|_| corrupt_state())?;
+        Ok(Self {
             schema_version: state.schema_version,
             revision: state.revision,
             catalog_revision: state.catalog_revision.get(),
-            delivery,
+            delivery_json,
             phase: RecoveryPhaseWire::from_phase(&state.phase),
-        }
+        })
     }
 
     fn into_state(self) -> Result<ScaleSetDeliveryRecoveryState, ScaleSetDeliveryRecoveryError> {
-        let delivery_bytes = serde_json::to_vec(&self.delivery).map_err(|_| invalid_document())?;
-        let delivery = decode_scale_set_delivery(&delivery_bytes).map_err(|_| corrupt_state())?;
+        let delivery =
+            decode_scale_set_delivery(self.delivery_json.as_bytes()).map_err(|_| corrupt_state())?;
         let catalog_revision = DisposableAttemptCatalogRevision::new(self.catalog_revision)
             .map_err(|_| corrupt_state())?;
         let state = ScaleSetDeliveryRecoveryState {
@@ -448,12 +450,14 @@ mod tests {
         )
         .unwrap();
         let started = initial.begin_ack().unwrap();
-        let acquired = [ScaleSetRunnerRequestId::new(41).unwrap()];
-        let acknowledged = started.record_ack_response(&acquired).unwrap();
-        assert!(matches!(
-            acknowledged.phase(),
-            ScaleSetDeliveryRecoveryPhase::Acknowledged { acquired } if acquired == &acquired.to_vec()
-        ));
+        let expected = vec![ScaleSetRunnerRequestId::new(41).unwrap()];
+        let acknowledged = started.record_ack_response(&expected).unwrap();
+        match acknowledged.phase() {
+            ScaleSetDeliveryRecoveryPhase::Acknowledged { acquired } => {
+                assert_eq!(acquired, &expected);
+            }
+            phase => panic!("unexpected acknowledged phase: {phase:?}"),
+        }
 
         let recovery = started.record_recovery_acquire(&[]).unwrap();
         assert!(matches!(
