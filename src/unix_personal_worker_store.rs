@@ -203,6 +203,10 @@ impl UnixPersonalWorkerStore {
             Some(lock) => lock,
             None => store.acquire_mutation_lock()?,
         };
+        // A previous initializer may have crashed or received an fsync error after publishing the
+        // managed directory but before its parent entry became durable. Every initializer closes
+        // that recovery window under the canonical lock before it can inspect, publish, or report
+        // success from the store.
         synchronize_directory(&store._root, "personal worker state root")?;
         disposable_attempt_catalog::refuse_unsettled(&store)?;
         disposable_template_generation::refuse_unsettled(&store)?;
@@ -236,6 +240,11 @@ impl UnixPersonalWorkerStore {
         }
     }
 
+    /// Explicitly migrate one canonical schema-v1 store to schema v2 under its durable writer lock.
+    ///
+    /// This operation never creates missing store authority. A pre-existing staged file is
+    /// published only when it is the exact canonical v2 image of the current canonical v1 state;
+    /// every other staged shape is preserved and reported as recovery-required.
     pub fn migrate_v1(
         root_path: impl AsRef<Path>,
     ) -> Result<PersonalWorkerStoreMigrationReceipt, PersonalWorkerStoreError> {
@@ -711,12 +720,16 @@ struct StoreReadLock {
 
 impl Drop for StoreMutationLock {
     fn drop(&mut self) {
+        // `CLOEXEC` closes this descriptor at exec, but a concurrent fork can briefly inherit the
+        // same open-file description after this guard is dropped. Explicitly unlocking prevents
+        // that inherited duplicate from extending the mutation boundary.
         let _ = fs::flock(&self._lock, FlockOperation::Unlock);
     }
 }
 
 impl Drop for StoreReadLock {
     fn drop(&mut self) {
+        // Keep read-only inspection from leaving the same transient inherited-lock window.
         let _ = fs::flock(&self._lock, FlockOperation::Unlock);
     }
 }
@@ -827,6 +840,9 @@ fn ensure_lock_file(
         PRIVATE_FILE_MODE,
     ) {
         Ok(lock) => {
+            // The canonical lock inode becomes synchronization authority as soon as the directory
+            // entry is visible. Never unlink it after that point: another process may already hold
+            // this inode, and replacing its name would split exclusive-writer authority.
             fs::fchmod(&lock, PRIVATE_FILE_MODE).map_err(|_| {
                 store_error(
                     PersonalWorkerStoreErrorKind::Io,
