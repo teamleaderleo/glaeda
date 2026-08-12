@@ -135,13 +135,16 @@ jobs:
             scripts/macbook-runner-bootstrap.sh \
             scripts/macbook-runner-observe.sh \
             scripts/macbook-runner-vm.sh \
+            scripts/macbook-ui-state.sh \
             scripts/macbook-workspace.sh \
             scripts/test-macbook-runner-bootstrap.sh \
             scripts/test-macbook-runner-vm.sh \
-            scripts/test-macbook-runner-vm-paths.sh
+            scripts/test-macbook-runner-vm-paths.sh \
+            scripts/test-macbook-workspace.sh
           bash scripts/test-macbook-runner-bootstrap.sh
           bash scripts/test-macbook-runner-vm.sh
           bash scripts/test-macbook-runner-vm-paths.sh
+          bash scripts/test-macbook-workspace.sh
           bash scripts/macbook-workspace.sh help >/dev/null
           bash scripts/macbook-workspace.sh notify-doctor 0
           if grep -Eq 'allowAll|openAccess|CMUX_SOCKET_(PATH|PASSWORD)' scripts/macbook-workspace.sh; then
