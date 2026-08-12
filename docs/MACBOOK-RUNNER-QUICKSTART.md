@@ -23,21 +23,57 @@ bash scripts/macbook-runner-vm.sh run work -- /usr/bin/nproc
 
 The fresh-instance references are `examples/lima/smolrunner-interactive.yaml` and `examples/lima/smolrunner-work.yaml`.
 
-## Default tmux workspace
+## Default Mac workspace
 
 ```bash
 make work
 ```
 
-This command:
+`make work` now chooses the richer cmux workspace when a working cmux CLI is available and falls back to the compatibility tmux workspace otherwise. The choice is capability-based; SmolRunner correctness does not depend on either UI.
 
-- installs Mac-side `tmux` and Lima through Homebrew when either command is missing;
+With cmux available, the command:
+
 - starts the existing `smolrunner` Lima instance when needed;
-- creates or reattaches to a Mac-side tmux session named `smolrunner`;
-- opens a `host` window rooted in the Mac checkout;
-- opens a `vm` window containing an interactive Lima guest shell.
+- opens or selects a cmux workspace named `smolrunner`;
+- keeps a `Mac host` terminal rooted in this checkout;
+- keeps a `Lima VM` terminal entering the persistent guest;
+- creates and repairs those standard surfaces through the cmux CLI rather than macOS Automation scripting;
+- refreshes the sidebar from fresh Lima observations instead of leaving a one-time `running` marker behind;
+- shows the reviewed `interactive` or `work` profile when the VM is running and `stopped` after shutdown;
+- shows an active Actions worker when the guest process observation proves one exists;
+- optionally shows active and queued personal-worker counts when `SMOLRUNNER_PERSONAL_WORKER_STORE_ROOT` and a built SmolRunner CLI are explicitly supplied.
 
-Re-running `make work` reattaches to the same session and recreates either standard window if it was closed. The helper does not create a missing VM, provision the guest, register an Actions listener, or copy Mac credentials into Linux.
+The workspace uses only documented cmux commands such as `list-workspaces`, `new-workspace`, `tree`, `new-split`, `rename-tab`, `send`, `set-status`, `clear-status`, and `select-workspace`. It does not widen cmux control-socket access, pass the socket into Lima, or scrape terminal text as runner state.
+
+SmolRunner also leaves global cmux preferences alone. A personal terminal configuration such as terminal-kit can own fonts, themes, sidebar preferences, copy controls, keybindings, and other app settings while SmolRunner supplies only project-specific workspace content and live status metadata.
+
+Override the workspace/session name when needed:
+
+```bash
+SMOLRUNNER_WORK_SESSION=another-session make work
+```
+
+## Explicit cmux and tmux paths
+
+Install cmux explicitly through the reviewed cask and open the workspace:
+
+```bash
+make work-cmux-setup
+```
+
+After cmux is installed, force the cmux path with:
+
+```bash
+make work-cmux
+```
+
+Force the compatibility tmux path with:
+
+```bash
+make work-tmux
+```
+
+The tmux workspace creates or reattaches a Mac-side session named `smolrunner`, with a `host` window rooted in the checkout and a `vm` window containing an interactive Lima guest shell.
 
 Useful default tmux keys use the `Ctrl-b` prefix:
 
@@ -49,46 +85,33 @@ Useful default tmux keys use the `Ctrl-b` prefix:
 - `Ctrl-b d`: detach while leaving the session running;
 - `Ctrl-b [`: enter scroll/copy mode; press `q` to leave it.
 
-Override the tmux session name when needed:
+## Live cmux status projection
+
+The small read-only helper:
 
 ```bash
-SMOLRUNNER_WORK_SESSION=another-session make work
+bash scripts/macbook-ui-state.sh
 ```
 
-`make work-tmux` remains an explicit alias for this compatibility path.
+returns bounded JSON derived from the current Lima configuration and process observation. It reports only the VM state, reviewed profile match, whether an Actions worker is observed, and whether the explicit operator-run marker exists. It does not mutate the VM or inspect arbitrary guest data.
 
-## Opt-in cmux workspace
-
-cmux remains opt-in until the launcher completes hands-on acceptance on the target Apple Silicon Mac.
-
-Install cmux explicitly, start the existing VM, and open the workspace:
+Refresh the named cmux workspace manually with:
 
 ```bash
-make work-cmux-setup
+bash scripts/macbook-workspace.sh sync-cmux
 ```
 
-The setup command:
+The regular `make vm-up`, `make vm-status`, `make vm-sync`, `make vm-doctor`, and `make vm-stop` paths also refresh cmux metadata when the workspace exists. Each refresh first clears SmolRunner-owned status keys and then writes the fresh observation, which prevents stale `running`, worker, or queue badges from surviving later state changes.
 
-- installs cmux through the reviewed `manaflow-ai/cmux` Homebrew cask when missing;
-- installs Lima through Homebrew when `limactl` is missing;
-- starts the existing `smolrunner` Lima instance;
-- opens a cmux workspace named `smolrunner` with a `Mac host` terminal and a `Lima VM` terminal.
-
-After cmux is installed, open or select that workspace with:
+For the durable personal-worker read model, an explicit store can be projected too:
 
 ```bash
-make work-cmux
+SMOLRUNNER_PERSONAL_WORKER_STORE_ROOT=/absolute/state/root \
+SMOLRUNNER_BIN=./target/debug/smolrunner \
+  bash scripts/macbook-workspace.sh sync-cmux
 ```
 
-Override the workspace name when needed:
-
-```bash
-SMOLRUNNER_WORK_SESSION=another-session make work-cmux
-```
-
-cmux may trigger the standard macOS Automation permission prompt when the invoking terminal first asks cmux to create or select the workspace. The launcher uses cmux's macOS scripting interface to find or create the human-facing workspace. Commands that rename the workspace and terminal tabs run inside cmux, so the helper leaves socket access unchanged and never enables broad external control.
-
-The Lima guest receives no cmux socket, Mac filesystem mount, SSH agent, or copied credential. cmux provides the vertical workspace sidebar, split panes, session restoration, and attention indicators while remaining a human-facing view over SmolRunner commands.
+That read reuses the schema-versioned `worker status` command. A missing store, missing binary, or failed read simply omits queue/activity badges; it never invents state.
 
 ## Open only the VM
 
@@ -107,14 +130,14 @@ limactl shell smolrunner
 ## Everyday commands
 
 ```bash
-make vm-status   # Lima state plus host and guest Git branches
-make vm-sync     # clean guest checkout: fetch main, then fast-forward only
-make vm-doctor   # run machine-readable SmolRunner doctor in the guest
+make vm-status   # Lima state plus host and guest Git branches; refresh cmux status
+make vm-sync     # clean guest checkout: fetch main, then fast-forward only; refresh cmux status
+make vm-doctor   # run machine-readable SmolRunner doctor; notify and refresh cmux
 make vm-observe  # read-only Mac and guest resource report
-make vm-stop     # graceful VM stop
+make vm-stop     # graceful VM stop; refresh cmux status to stopped
 ```
 
-When `make vm-doctor` runs from a cmux terminal, completion or failure also produces a fixed cmux notification. The notification contains only the bounded result and exit status; doctor output remains in the terminal. Outside cmux, notification delivery is a silent no-op.
+When `make vm-doctor` runs from a cmux terminal, completion or failure produces a fixed cmux notification. Outside a cmux terminal, SmolRunner can still flash the named workspace when it is available. Doctor output itself remains in the terminal.
 
 The full wrappers are also available directly:
 
@@ -170,9 +193,10 @@ The VM is currently a development and field-validation environment:
 
 - ARM64 Ubuntu, systemd, cgroup v2, Rust, and rootless Podman are working;
 - GitHub-hosted runners still execute the repository's ordinary Actions workflows;
-- no official Actions listener is registered in this Lima VM;
-- no daemon, timer, queue polling, webhook, automatic wake-up/shutdown, cache deletion, host-home mount, or credential propagation is added by the profile helper;
-- cmux remains a human-facing view and never becomes privileged execution transport;
+- no official Actions listener is registered in this Lima VM by the workspace helper;
+- no daemon, timer, queue polling, webhook, automatic wake-up/shutdown, cache deletion, host-home mount, or credential propagation is added by these workspace shortcuts;
+- cmux remains a human-facing projection and never becomes privileged execution transport or authoritative runner state;
+- terminal/editor integration is intentionally an adapter over SmolRunner state, so the future `project enter` journey can hand an accepted project materialization to the same workspace surface without giving cmux project-ownership authority;
 - no project bootstrap, runner registration, automatic update, or production deployment authority is implied by these shortcuts.
 
-Repository-specific dependency installation and verification remain repository-owned. SmolRunner will eventually provide the surrounding one-command host, runner, release-channel, rollback, and disposable-execution lifecycle after the reviewed preparation and registration paths exist.
+Repository-specific dependency installation and verification remain repository-owned. SmolRunner will eventually provide the surrounding one-command host, runner, release-channel, rollback, project-entry, and disposable-execution lifecycle after the reviewed preparation and project namespace paths exist.
