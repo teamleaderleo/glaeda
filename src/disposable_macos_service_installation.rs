@@ -192,9 +192,35 @@ pub struct DisposableMacosServicePlan {
     enrollment_bytes: Vec<u8>,
     network_anchor: Vec<u8>,
     main_pf_attachment: Vec<u8>,
+    network_receipt: Vec<u8>,
     network_plist: Vec<u8>,
     worker_plist: Vec<u8>,
     installation_record: Vec<u8>,
+}
+
+/// Private exact material consumed only by the root apply transaction.
+#[allow(
+    dead_code,
+    reason = "consumed by the in-progress production apply boundary"
+)]
+pub(crate) struct DisposableMacosServiceApplyParts<'a> {
+    pub(crate) desired_state: DisposableMacosServiceDesiredState,
+    pub(crate) installation_id: &'a InstallationId,
+    pub(crate) service_uid: u32,
+    pub(crate) primary_group_id: u32,
+    pub(crate) program_source: &'a Path,
+    pub(crate) program_digest: &'a Sha256Digest,
+    pub(crate) bridge_source: &'a Path,
+    pub(crate) bridge_digest: &'a Sha256Digest,
+    pub(crate) enrollment_source: &'a Path,
+    pub(crate) enrollment_digest: &'a Sha256Digest,
+    pub(crate) enrollment_bytes: &'a [u8],
+    pub(crate) network_anchor: &'a [u8],
+    pub(crate) main_pf_attachment: &'a [u8],
+    pub(crate) network_receipt: &'a [u8],
+    pub(crate) network_plist: &'a [u8],
+    pub(crate) worker_plist: &'a [u8],
+    pub(crate) installation_record: &'a [u8],
 }
 
 impl fmt::Debug for DisposableMacosServicePlan {
@@ -210,6 +236,33 @@ impl DisposableMacosServicePlan {
     #[must_use]
     pub const fn report(&self) -> &DisposableMacosServicePlanReport {
         &self.report
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    #[allow(
+        dead_code,
+        reason = "consumed by the in-progress production apply boundary"
+    )]
+    pub(crate) fn apply_parts(&self) -> DisposableMacosServiceApplyParts<'_> {
+        DisposableMacosServiceApplyParts {
+            desired_state: self.report.desired_state,
+            installation_id: &self.report.installation_id,
+            service_uid: self.report.service_uid,
+            primary_group_id: self.report.primary_group_id,
+            program_source: &self.program_source,
+            program_digest: &self.program_digest,
+            bridge_source: &self.bridge_source,
+            bridge_digest: &self.bridge_digest,
+            enrollment_source: &self.enrollment_source,
+            enrollment_digest: &self.enrollment_digest,
+            enrollment_bytes: &self.enrollment_bytes,
+            network_anchor: &self.network_anchor,
+            main_pf_attachment: &self.main_pf_attachment,
+            network_receipt: &self.network_receipt,
+            network_plist: &self.network_plist,
+            worker_plist: &self.worker_plist,
+            installation_record: &self.installation_record,
+        }
     }
 
     #[cfg(any(target_os = "macos", test))]
@@ -515,6 +568,7 @@ pub fn plan_disposable_macos_service(
     let worker_plist = render_worker_plist(&enrollment_digest);
     let network_anchor = parts.network_policy.anchor_bytes().to_vec();
     let main_pf_attachment = activation.main_attachment().to_vec();
+    let network_receipt = activation.receipt().to_vec();
     let installation_record = render_installation_record(
         installation_id,
         service_uid,
@@ -543,6 +597,7 @@ pub fn plan_disposable_macos_service(
         &network_policy_identity,
         &network_anchor,
         &main_pf_attachment,
+        &network_receipt,
         &network_plist,
         &worker_plist,
         &installation_record,
@@ -576,6 +631,7 @@ pub fn plan_disposable_macos_service(
         enrollment_bytes: enrollment_bytes.to_vec(),
         network_anchor,
         main_pf_attachment,
+        network_receipt,
         network_plist,
         worker_plist,
         installation_record,
@@ -745,6 +801,7 @@ fn plan_identity(
     network_policy_identity: &Sha256Digest,
     network_anchor: &[u8],
     main_pf_attachment: &[u8],
+    network_receipt: &[u8],
     network_plist: &[u8],
     worker_plist: &[u8],
     installation_record: &[u8],
@@ -779,6 +836,7 @@ fn plan_identity(
         DISPOSABLE_MACOS_INSTALLATION_RECORD_PATH.as_bytes(),
         network_anchor,
         main_pf_attachment,
+        network_receipt,
         network_plist,
         worker_plist,
         installation_record,

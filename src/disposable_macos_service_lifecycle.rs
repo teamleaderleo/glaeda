@@ -20,7 +20,9 @@ use std::path::{Path, PathBuf};
 use rustix::fs::{self, AtFlags, FileType, FlockOperation, Mode, OFlags, RenameFlags, Stat};
 use serde::Serialize;
 
-use crate::disposable_macos_service_installation::DisposableMacosServicePlan;
+use crate::disposable_macos_service_installation::{
+    DisposableMacosServiceActionKind, DisposableMacosServicePlan,
+};
 use crate::journal_document::{
     JournalStateDocument, decode_journal_document, encode_journal_document,
 };
@@ -55,6 +57,69 @@ pub(crate) enum DisposableMacosServiceLifecycleErrorKind {
 pub(crate) struct DisposableMacosServiceLifecycleError {
     kind: DisposableMacosServiceLifecycleErrorKind,
     code: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DisposableMacosServiceActionRecovery {
+    Completed,
+    RetryAuthorized,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DisposableMacosServiceActionConfirmation {
+    Completed,
+    Unknown,
+}
+
+/// Action-specific authority below the lifecycle journal.
+///
+/// Implementations must retain exact evidence in `Prepared`, reconfirm it immediately before a
+/// mutation in `execute`, and classify recovery as `RetryAuthorized` only after proving that no
+/// earlier external operation can still take effect. The journal never manufactures that proof.
+pub(crate) trait DisposableMacosServiceActionDriver {
+    type Prepared;
+    type Error;
+
+    fn recover(
+        &mut self,
+        plan: &DisposableMacosServicePlan,
+        action: DisposableMacosServiceActionKind,
+    ) -> Result<DisposableMacosServiceActionRecovery, Self::Error>;
+
+    fn prepare(
+        &mut self,
+        plan: &DisposableMacosServicePlan,
+        action: DisposableMacosServiceActionKind,
+    ) -> Result<Self::Prepared, Self::Error>;
+
+    fn execute(
+        &mut self,
+        plan: &DisposableMacosServicePlan,
+        action: DisposableMacosServiceActionKind,
+        prepared: Self::Prepared,
+    ) -> Result<(), Self::Error>;
+
+    fn confirm_completed(
+        &mut self,
+        plan: &DisposableMacosServicePlan,
+        action: DisposableMacosServiceActionKind,
+    ) -> Result<DisposableMacosServiceActionConfirmation, Self::Error>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DisposableMacosServiceLifecycleDisposition {
+    ActionCompleted {
+        action: DisposableMacosServiceActionKind,
+        document: JournalStateDocument,
+    },
+    RecoveryRequired {
+        action: DisposableMacosServiceActionKind,
+        document: JournalStateDocument,
+    },
+    Settled {
+        document: JournalStateDocument,
+    },
 }
 
 impl DisposableMacosServiceLifecycleError {
@@ -225,6 +290,124 @@ impl DisposableMacosServiceLifecycleStore {
         self.read_current(plan)?
             .map(|current| current.document)
             .ok_or_else(recovery_required)
+    }
+
+    /// Reconcile at most one exact external action while retaining the lifecycle lock.
+    ///
+    /// A new action is prepared before its `executing` checkpoint and executed only after that
+    /// checkpoint is durable. A restarted `executing` action is never replayed unless the
+    /// action-specific driver proves retry safety. Errors and unknown postconditions leave the
+    /// exact action executing for later recovery; this method performs no automatic rollback.
+    pub(crate) fn reconcile_one<D: DisposableMacosServiceActionDriver>(
+        &self,
+        plan: &DisposableMacosServicePlan,
+        driver: &mut D,
+    ) -> Result<
+        Result<DisposableMacosServiceLifecycleDisposition, D::Error>,
+        DisposableMacosServiceLifecycleError,
+    > {
+        let _lock = self.acquire_lock()?;
+        self.synchronize_directory()?;
+        let mut current = match self.recover_locked(plan)? {
+            Some(current) => current,
+            None => {
+                let initial = plan.initial_journal_document();
+                self.publish_locked(plan, None, &initial)?;
+                self.read_current(plan)?.ok_or_else(recovery_required)?
+            }
+        };
+        if current.document.journal().completed() {
+            return Ok(Ok(DisposableMacosServiceLifecycleDisposition::Settled {
+                document: current.document,
+            }));
+        }
+
+        let executing_index = current
+            .document
+            .journal()
+            .records
+            .iter()
+            .position(|record| record.outcome == crate::journal::ActionOutcome::Executing);
+        let (action_index, prepared) = if let Some(index) = executing_index {
+            let action = action_kind(plan, index)?;
+            match driver.recover(plan, action) {
+                Ok(DisposableMacosServiceActionRecovery::Completed) => {
+                    let successor = plan
+                        .complete_executing_lifecycle_action(&current.document)
+                        .map_err(|_| recovery_required())?;
+                    self.publish_locked(plan, Some(&current), &successor)?;
+                    return Ok(Ok(
+                        DisposableMacosServiceLifecycleDisposition::ActionCompleted {
+                            action,
+                            document: successor,
+                        },
+                    ));
+                }
+                Ok(DisposableMacosServiceActionRecovery::Unknown) => {
+                    return Ok(Ok(
+                        DisposableMacosServiceLifecycleDisposition::RecoveryRequired {
+                            action,
+                            document: current.document,
+                        },
+                    ));
+                }
+                Ok(DisposableMacosServiceActionRecovery::RetryAuthorized) => {}
+                Err(error) => return Ok(Err(error)),
+            }
+            let prepared = match driver.prepare(plan, action) {
+                Ok(prepared) => prepared,
+                Err(error) => return Ok(Err(error)),
+            };
+            (index, prepared)
+        } else {
+            let index = current
+                .document
+                .journal()
+                .records
+                .iter()
+                .position(|record| record.outcome == crate::journal::ActionOutcome::Pending)
+                .ok_or_else(recovery_required)?;
+            let action = action_kind(plan, index)?;
+            let prepared = match driver.prepare(plan, action) {
+                Ok(prepared) => prepared,
+                Err(error) => return Ok(Err(error)),
+            };
+            let successor = plan
+                .begin_next_lifecycle_action(&current.document)
+                .map_err(|_| recovery_required())?;
+            self.publish_locked(plan, Some(&current), &successor)?;
+            current = self.read_current(plan)?.ok_or_else(recovery_required)?;
+            if current.document != successor {
+                return Err(recovery_required());
+            }
+            (index, prepared)
+        };
+
+        let action = action_kind(plan, action_index)?;
+        if let Err(error) = driver.execute(plan, action, prepared) {
+            return Ok(Err(error));
+        }
+        match driver.confirm_completed(plan, action) {
+            Err(error) => Ok(Err(error)),
+            Ok(DisposableMacosServiceActionConfirmation::Unknown) => Ok(Ok(
+                DisposableMacosServiceLifecycleDisposition::RecoveryRequired {
+                    action,
+                    document: current.document,
+                },
+            )),
+            Ok(DisposableMacosServiceActionConfirmation::Completed) => {
+                let successor = plan
+                    .complete_executing_lifecycle_action(&current.document)
+                    .map_err(|_| recovery_required())?;
+                self.publish_locked(plan, Some(&current), &successor)?;
+                Ok(Ok(
+                    DisposableMacosServiceLifecycleDisposition::ActionCompleted {
+                        action,
+                        document: successor,
+                    },
+                ))
+            }
+        }
     }
 
     /// Publish the exact `pending -> executing` successor for the next lifecycle action.
@@ -573,6 +756,17 @@ impl DisposableMacosServiceLifecycleStore {
     }
 }
 
+fn action_kind(
+    plan: &DisposableMacosServicePlan,
+    index: usize,
+) -> Result<DisposableMacosServiceActionKind, DisposableMacosServiceLifecycleError> {
+    plan.report()
+        .actions()
+        .get(index)
+        .map(|action| action.kind())
+        .ok_or_else(recovery_required)
+}
+
 fn read_bounded(file: &mut File) -> Result<Vec<u8>, DisposableMacosServiceLifecycleError> {
     let mut bytes = Vec::new();
     file.take(MAX_LIFECYCLE_BYTES + 1)
@@ -674,6 +868,7 @@ const fn io_error() -> DisposableMacosServiceLifecycleError {
 #[cfg(test)]
 mod tests {
     use std::fs::{self as std_fs, OpenOptions};
+    use std::os::fd::AsFd as _;
     use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -797,6 +992,89 @@ mod tests {
         .unwrap()
     }
 
+    struct FakeDriver {
+        lock: PathBuf,
+        recovery: DisposableMacosServiceActionRecovery,
+        confirmation: DisposableMacosServiceActionConfirmation,
+        fail_execute: bool,
+        prepared: usize,
+        executed: usize,
+    }
+
+    impl FakeDriver {
+        fn new(root: &Path) -> Self {
+            Self {
+                lock: root.join(LOCK_DOCUMENT),
+                recovery: DisposableMacosServiceActionRecovery::Unknown,
+                confirmation: DisposableMacosServiceActionConfirmation::Completed,
+                fail_execute: false,
+                prepared: 0,
+                executed: 0,
+            }
+        }
+
+        fn require_transaction_lock(&self) {
+            let lock = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&self.lock)
+                .unwrap();
+            assert_eq!(
+                fs::flock(lock.as_fd(), FlockOperation::NonBlockingLockExclusive).unwrap_err(),
+                rustix::io::Errno::AGAIN
+            );
+        }
+    }
+
+    impl DisposableMacosServiceActionDriver for FakeDriver {
+        type Prepared = DisposableMacosServiceActionKind;
+        type Error = &'static str;
+
+        fn recover(
+            &mut self,
+            _plan: &DisposableMacosServicePlan,
+            _action: DisposableMacosServiceActionKind,
+        ) -> Result<DisposableMacosServiceActionRecovery, Self::Error> {
+            self.require_transaction_lock();
+            Ok(self.recovery)
+        }
+
+        fn prepare(
+            &mut self,
+            _plan: &DisposableMacosServicePlan,
+            action: DisposableMacosServiceActionKind,
+        ) -> Result<Self::Prepared, Self::Error> {
+            self.require_transaction_lock();
+            self.prepared += 1;
+            Ok(action)
+        }
+
+        fn execute(
+            &mut self,
+            _plan: &DisposableMacosServicePlan,
+            action: DisposableMacosServiceActionKind,
+            prepared: Self::Prepared,
+        ) -> Result<(), Self::Error> {
+            self.require_transaction_lock();
+            assert_eq!(prepared, action);
+            self.executed += 1;
+            if self.fail_execute {
+                Err("ambiguous execute failure")
+            } else {
+                Ok(())
+            }
+        }
+
+        fn confirm_completed(
+            &mut self,
+            _plan: &DisposableMacosServicePlan,
+            _action: DisposableMacosServiceActionKind,
+        ) -> Result<DisposableMacosServiceActionConfirmation, Self::Error> {
+            self.require_transaction_lock();
+            Ok(self.confirmation)
+        }
+    }
+
     #[test]
     fn initializes_and_advances_only_exact_contiguous_states() {
         let fixture = Fixture::new();
@@ -917,5 +1195,102 @@ mod tests {
 
         std_fs::remove_dir(&fixture.root).unwrap();
         std_fs::rename(detached, &fixture.root).unwrap();
+    }
+
+    #[test]
+    fn one_action_transaction_holds_lock_across_checkpoint_execute_and_confirmation() {
+        let fixture = Fixture::new();
+        let store =
+            DisposableMacosServiceLifecycleStore::open_existing(&fixture.root, fixture.owner())
+                .unwrap();
+        let plan = plan();
+        let mut driver = FakeDriver::new(&fixture.root);
+
+        let disposition = store.reconcile_one(&plan, &mut driver).unwrap().unwrap();
+        let DisposableMacosServiceLifecycleDisposition::ActionCompleted { action, document } =
+            disposition
+        else {
+            panic!("expected one completed action")
+        };
+        assert_eq!(
+            action,
+            DisposableMacosServiceActionKind::EnsureServiceAccount
+        );
+        assert_eq!(driver.prepared, 1);
+        assert_eq!(driver.executed, 1);
+        assert_eq!(
+            document.journal().records[1].outcome,
+            ActionOutcome::Completed
+        );
+        assert_eq!(
+            document.journal().records[2].outcome,
+            ActionOutcome::Pending
+        );
+    }
+
+    #[test]
+    fn ambiguous_failure_remains_executing_until_exact_recovery_authorizes_retry() {
+        let fixture = Fixture::new();
+        let store =
+            DisposableMacosServiceLifecycleStore::open_existing(&fixture.root, fixture.owner())
+                .unwrap();
+        let plan = plan();
+        let mut failing = FakeDriver::new(&fixture.root);
+        failing.fail_execute = true;
+        assert_eq!(
+            store.reconcile_one(&plan, &mut failing).unwrap(),
+            Err("ambiguous execute failure")
+        );
+        let executing = store.load(&plan).unwrap().unwrap();
+        assert_eq!(
+            executing.journal().records[1].outcome,
+            ActionOutcome::Executing
+        );
+
+        let mut unknown = FakeDriver::new(&fixture.root);
+        let disposition = store.reconcile_one(&plan, &mut unknown).unwrap().unwrap();
+        assert!(matches!(
+            disposition,
+            DisposableMacosServiceLifecycleDisposition::RecoveryRequired {
+                action: DisposableMacosServiceActionKind::EnsureServiceAccount,
+                ..
+            }
+        ));
+        assert_eq!(unknown.prepared, 0);
+        assert_eq!(unknown.executed, 0);
+
+        let mut retry = FakeDriver::new(&fixture.root);
+        retry.recovery = DisposableMacosServiceActionRecovery::RetryAuthorized;
+        let disposition = store.reconcile_one(&plan, &mut retry).unwrap().unwrap();
+        assert!(matches!(
+            disposition,
+            DisposableMacosServiceLifecycleDisposition::ActionCompleted {
+                action: DisposableMacosServiceActionKind::EnsureServiceAccount,
+                ..
+            }
+        ));
+        assert_eq!(retry.executed, 1);
+    }
+
+    #[test]
+    fn observed_completed_recovery_advances_without_reexecution() {
+        let fixture = Fixture::new();
+        let store =
+            DisposableMacosServiceLifecycleStore::open_existing(&fixture.root, fixture.owner())
+                .unwrap();
+        let plan = plan();
+        let mut failing = FakeDriver::new(&fixture.root);
+        failing.fail_execute = true;
+        let _ = store.reconcile_one(&plan, &mut failing).unwrap();
+
+        let mut recovered = FakeDriver::new(&fixture.root);
+        recovered.recovery = DisposableMacosServiceActionRecovery::Completed;
+        let disposition = store.reconcile_one(&plan, &mut recovered).unwrap().unwrap();
+        assert!(matches!(
+            disposition,
+            DisposableMacosServiceLifecycleDisposition::ActionCompleted { .. }
+        ));
+        assert_eq!(recovered.prepared, 0);
+        assert_eq!(recovered.executed, 0);
     }
 }
