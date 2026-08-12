@@ -5,6 +5,7 @@ script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 repo_root="$(CDPATH= cd -- "${script_dir}/.." && pwd)"
 session="${SMOLRUNNER_WORK_SESSION:-smolrunner}"
 vm_helper="${repo_root}/scripts/macbook-runner-vm.sh"
+state_helper="${repo_root}/scripts/macbook-ui-state.sh"
 command_name="${1:-auto}"
 
 usage() {
@@ -204,8 +205,7 @@ for row in rows:
     ident = row.get("id") or row.get("ref")
     if ident:
         print(ident)
-'
- "${wanted}"
+' "${wanted}"
 }
 
 find_workspace_id() {
@@ -318,16 +318,20 @@ worker_counts() {
   printf '%s\n' "${json}" | python3 -c '
 import json, sys
 value = json.load(sys.stdin)
-print(f"{int(value.get(chr(97)+chr(99)+chr(116)+chr(105)+chr(118)+chr(101)+chr(95)+chr(99)+chr(111)+chr(117)+chr(110)+chr(116), 0))}|{int(value.get(chr(113)+chr(117)+chr(101)+chr(117)+chr(101)+chr(100)+chr(95)+chr(101)+chr(110)+chr(116)+chr(114)+chr(121)+chr(95)+chr(99)+chr(111)+chr(117)+chr(110)+chr(116), 0))}|{int(value.get(chr(100)+chr(114)+chr(97)+chr(105)+chr(110)+chr(105)+chr(110)+chr(103)+chr(95)+chr(99)+chr(111)+chr(117)+chr(110)+chr(116), 0))}")
+print("{}|{}|{}".format(
+    int(value.get("active_count", 0)),
+    int(value.get("queued_entry_count", 0)),
+    int(value.get("draining_count", 0)),
+))
 '
 }
 
 sync_cmux_status_for_workspace() {
   local cmux_cli="$1"
   local workspace_id="$2"
-  local state_json vm_state profile actions_worker counts active queued draining
+  local state_json vm_state profile actions_worker counts active queued draining label
 
-  state_json="$(bash "${vm_helper}" ui-state)" || return 1
+  state_json="$(bash "${state_helper}")" || return 1
   IFS='|' read -r vm_state profile actions_worker <<EOF_STATE
 $(printf '%s\n' "${state_json}" | python3 -c '
 import json, sys
@@ -405,7 +409,7 @@ launch_cmux() {
 
 notify_doctor() {
   local status="${1:-}"
-  local cmux_cli body
+  local cmux_cli body workspace_id
 
   case "${status}" in
     0) body='Doctor completed successfully.' ;;
