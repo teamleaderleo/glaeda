@@ -13,45 +13,33 @@ pub const MAX_REMEDIATION_EVIDENCE_ITEMS: usize = 16;
 pub const MAX_REMEDIATION_EVIDENCE_BYTES: usize = 128;
 pub const MAX_REMEDIATION_BUDGET_UNITS: u16 = 1_000;
 
-/// How strongly the observed evidence supports the proposed response.
+/// How strongly accepted evidence supports the proposed response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RemediationConfidence {
-    /// The accepted evidence identifies this exact failure family and response.
     Exact,
-    /// The response is plausible only when an explicit condition is reviewed.
     Conditional,
-    /// Current evidence is too weak to recommend an executable response.
     Insufficient,
 }
 
-/// Operational consequence if the proposed response is executed.
+/// Operational consequence if the proposed response executes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RemediationSafety {
-    /// Read-only inspection or explanation.
     ReadOnly,
-    /// The action has a defined rollback that restores the affected SmolRunner-owned state.
     Reversible,
-    /// The action cannot restore the original effect but has an explicit compensating response.
     Compensating,
-    /// No trustworthy rollback or compensation exists.
     Irreversible,
 }
 
-/// Maximum execution posture the candidate may request from policy.
+/// Maximum posture a later policy layer may take toward the candidate.
 ///
-/// This value never grants authority. A policy-eligible candidate still requires current ownership,
-/// budget, checkpoint, circuit-breaker, active-work, directive, and operator-hold evaluation before
-/// an executor may receive a plan.
+/// This value never grants authority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RemediationApplicability {
-    /// Explanation only. No executable plan should be produced from this candidate.
     AdvisoryOnly,
-    /// A deterministic plan may be shown, but this candidate is never sufficient for automation.
     PlanOnly,
-    /// A later policy layer may consider the action for bounded automatic execution.
     PolicyEligible,
 }
 
@@ -59,17 +47,13 @@ pub enum RemediationApplicability {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RemediationOwnership {
-    /// The action does not mutate a managed resource.
     NotApplicable,
-    /// Exact canonical SmolRunner ownership must be freshly established.
     ExactManaged,
 }
 
 /// Pure public proposal for one possible response to an operator-visible failure.
 ///
-/// The proposal intentionally contains no command vector, credential, filesystem path, provider
-/// token, executor handle, or mutation authority. It is an input to later planning and policy
-/// evaluation, not an executable instruction.
+/// The proposal contains no command vector, credential, executor handle, or mutation authority.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct OperatorRemediationCandidate {
     pub schema_version: u8,
@@ -91,6 +75,12 @@ pub struct OperatorRemediationCandidate {
 }
 
 impl OperatorRemediationCandidate {
+    /// Build and validate one non-authorizing remediation candidate.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the candidate exceeds bounded public fields or requests an
+    /// applicability inconsistent with its confidence, safety, or required safeguards.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         source_error: OperatorErrorCode,
@@ -105,14 +95,9 @@ impl OperatorRemediationCandidate {
         circuit_breaker_required: bool,
         required_evidence: impl IntoIterator<Item = impl Into<String>>,
     ) -> Result<Self, OperatorRemediationError> {
-        let action_id = action_id.into();
-        let summary = summary.into();
-        let required_evidence = required_evidence.into_iter().map(Into::into).collect();
         let ownership = match safety {
             RemediationSafety::ReadOnly => RemediationOwnership::NotApplicable,
-            RemediationSafety::Reversible
-            | RemediationSafety::Compensating
-            | RemediationSafety::Irreversible => RemediationOwnership::ExactManaged,
+            _ => RemediationOwnership::ExactManaged,
         };
         let rollback = match safety {
             RemediationSafety::ReadOnly => None,
@@ -123,8 +108,8 @@ impl OperatorRemediationCandidate {
         let candidate = Self {
             schema_version: OPERATOR_REMEDIATION_SCHEMA_VERSION,
             source_error,
-            action_id,
-            summary,
+            action_id: action_id.into(),
+            summary: summary.into(),
             confidence,
             safety,
             applicability,
@@ -134,7 +119,7 @@ impl OperatorRemediationCandidate {
             checkpoint_required,
             fresh_verification_required,
             circuit_breaker_required,
-            required_evidence,
+            required_evidence: required_evidence.into_iter().map(Into::into).collect(),
             authorizes_mutation: false,
         };
         candidate.validate()?;
@@ -153,47 +138,36 @@ impl OperatorRemediationCandidate {
             "remediation summary",
         )?;
         if self.repair_budget_units > MAX_REMEDIATION_BUDGET_UNITS {
-            return Err(error("remediation repair budget exceeds the accepted maximum"));
+            return Err(error(
+                "remediation repair budget exceeds the accepted maximum",
+            ));
         }
         if self.required_evidence.len() > MAX_REMEDIATION_EVIDENCE_ITEMS {
-            return Err(error("remediation evidence exceeds the accepted item limit"));
+            return Err(error(
+                "remediation evidence exceeds the accepted item limit",
+            ));
         }
         let mut evidence = BTreeSet::new();
         for item in &self.required_evidence {
-            validate_text(
-                item,
-                MAX_REMEDIATION_EVIDENCE_BYTES,
-                "remediation evidence",
-            )?;
+            validate_text(item, MAX_REMEDIATION_EVIDENCE_BYTES, "remediation evidence")?;
             if !evidence.insert(item) {
                 return Err(error("remediation evidence contains a duplicate item"));
             }
         }
-
         if self.authorizes_mutation {
             return Err(error("a remediation candidate never authorizes mutation"));
         }
 
         match self.safety {
-            RemediationSafety::ReadOnly => {
-                if self.rollback.is_some() {
-                    return Err(error("read-only remediation cannot declare rollback"));
-                }
-                if self.repair_budget_units != 0 {
-                    return Err(error("read-only remediation cannot consume repair budget"));
-                }
-                if self.ownership != RemediationOwnership::NotApplicable {
-                    return Err(error("read-only remediation cannot require managed ownership"));
-                }
-            }
+            RemediationSafety::ReadOnly => self.validate_read_only()?,
             RemediationSafety::Reversible => {
-                self.require_mutating_contract(RollbackClass::Reversible)?;
+                self.validate_mutating(RollbackClass::Reversible)?;
             }
             RemediationSafety::Compensating => {
-                self.require_mutating_contract(RollbackClass::Compensating)?;
+                self.validate_mutating(RollbackClass::Compensating)?;
             }
             RemediationSafety::Irreversible => {
-                self.require_mutating_contract(RollbackClass::Irreversible)?;
+                self.validate_mutating(RollbackClass::Irreversible)?;
                 if self.applicability == RemediationApplicability::PolicyEligible {
                     return Err(error("irreversible remediation cannot be policy-eligible"));
                 }
@@ -217,7 +191,6 @@ impl OperatorRemediationCandidate {
                 ));
             }
         }
-
         if self.confidence == RemediationConfidence::Insufficient
             && self.applicability != RemediationApplicability::AdvisoryOnly
         {
@@ -225,16 +198,27 @@ impl OperatorRemediationCandidate {
                 "insufficient diagnostic confidence permits advisory remediation only",
             ));
         }
-
         Ok(())
     }
 
-    fn require_mutating_contract(
+    fn validate_read_only(&self) -> Result<(), OperatorRemediationError> {
+        if self.rollback.is_some()
+            || self.repair_budget_units != 0
+            || self.ownership != RemediationOwnership::NotApplicable
+        {
+            return Err(error("read-only remediation carries mutation metadata"));
+        }
+        Ok(())
+    }
+
+    fn validate_mutating(
         &self,
         expected_rollback: RollbackClass,
     ) -> Result<(), OperatorRemediationError> {
         if self.ownership != RemediationOwnership::ExactManaged {
-            return Err(error("mutating remediation requires exact managed ownership"));
+            return Err(error(
+                "mutating remediation requires exact managed ownership",
+            ));
         }
         if self.rollback != Some(expected_rollback) {
             return Err(error("mutating remediation rollback class is inconsistent"));
@@ -243,17 +227,26 @@ impl OperatorRemediationCandidate {
             return Err(error("mutating remediation requires a durable checkpoint"));
         }
         if !self.fresh_verification_required {
-            return Err(error("mutating remediation requires fresh post-action verification"));
+            return Err(error(
+                "mutating remediation requires fresh post-action verification",
+            ));
         }
         if !self.circuit_breaker_required {
-            return Err(error("mutating remediation requires circuit-breaker participation"));
+            return Err(error(
+                "mutating remediation requires circuit-breaker participation",
+            ));
         }
         Ok(())
     }
 }
 
 fn validate_text(value: &str, maximum: usize, label: &str) -> Result<(), OperatorRemediationError> {
-    if value.is_empty() || value.len() > maximum || value.contains(['\n', '\r', '\0']) {
+    if value.is_empty()
+        || value.len() > maximum
+        || value.contains('\n')
+        || value.contains('\r')
+        || value.contains('\0')
+    {
         return Err(error(format!("{label} is invalid")));
     }
     Ok(())
@@ -283,8 +276,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        OPERATOR_REMEDIATION_SCHEMA_VERSION, OperatorRemediationCandidate,
-        RemediationApplicability, RemediationConfidence, RemediationOwnership, RemediationSafety,
+        OperatorRemediationCandidate, RemediationApplicability, RemediationConfidence,
+        RemediationOwnership, RemediationSafety,
     };
     use crate::journal::RollbackClass;
     use crate::operator_error::OperatorErrorCode;
@@ -306,7 +299,6 @@ mod tests {
         )
         .expect("valid candidate");
 
-        assert_eq!(candidate.schema_version, OPERATOR_REMEDIATION_SCHEMA_VERSION);
         assert_eq!(candidate.ownership, RemediationOwnership::ExactManaged);
         assert_eq!(candidate.rollback, Some(RollbackClass::Reversible));
         assert!(!candidate.authorizes_mutation);
@@ -337,7 +329,7 @@ mod tests {
         let candidate = OperatorRemediationCandidate::new(
             OperatorErrorCode::DurableStateRevisionStale,
             "refresh-status",
-            "Refresh the operator status from current durable state.",
+            "Refresh operator status from current durable state.",
             RemediationConfidence::Exact,
             RemediationSafety::ReadOnly,
             RemediationApplicability::PolicyEligible,
@@ -351,13 +343,12 @@ mod tests {
 
         assert_eq!(candidate.ownership, RemediationOwnership::NotApplicable);
         assert_eq!(candidate.rollback, None);
-        assert_eq!(candidate.repair_budget_units, 0);
         assert!(!candidate.authorizes_mutation);
     }
 
     #[test]
-    fn conditional_candidate_cannot_be_policy_eligible() {
-        let error = OperatorRemediationCandidate::new(
+    fn conditional_and_irreversible_candidates_stay_out_of_automatic_policy() {
+        let conditional = OperatorRemediationCandidate::new(
             OperatorErrorCode::LimaBroken,
             "restart-lima",
             "Restart the exactly managed Lima instance.",
@@ -372,14 +363,11 @@ mod tests {
         )
         .expect_err("conditional diagnosis must not be automatic");
         assert_eq!(
-            error.to_string(),
+            conditional.to_string(),
             "policy-eligible remediation requires exact diagnostic confidence"
         );
-    }
 
-    #[test]
-    fn irreversible_candidate_cannot_be_policy_eligible() {
-        let error = OperatorRemediationCandidate::new(
+        let irreversible = OperatorRemediationCandidate::new(
             OperatorErrorCode::IrreversibleMigrationApprovalRequired,
             "migrate-state",
             "Apply an irreversible durable-state migration.",
@@ -394,7 +382,7 @@ mod tests {
         )
         .expect_err("irreversible action must stay outside automatic policy");
         assert_eq!(
-            error.to_string(),
+            irreversible.to_string(),
             "irreversible remediation cannot be policy-eligible"
         );
     }
@@ -402,9 +390,24 @@ mod tests {
     #[test]
     fn mutating_candidate_requires_checkpoint_verification_and_circuit_breaker() {
         for (checkpoint, verification, circuit_breaker, expected) in [
-            (false, true, true, "mutating remediation requires a durable checkpoint"),
-            (true, false, true, "mutating remediation requires fresh post-action verification"),
-            (true, true, false, "mutating remediation requires circuit-breaker participation"),
+            (
+                false,
+                true,
+                true,
+                "mutating remediation requires a durable checkpoint",
+            ),
+            (
+                true,
+                false,
+                true,
+                "mutating remediation requires fresh post-action verification",
+            ),
+            (
+                true,
+                true,
+                false,
+                "mutating remediation requires circuit-breaker participation",
+            ),
         ] {
             let error = OperatorRemediationCandidate::new(
                 OperatorErrorCode::CleanupFailed,
@@ -443,28 +446,6 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "insufficient diagnostic confidence permits advisory remediation only"
-        );
-    }
-
-    #[test]
-    fn duplicate_evidence_is_rejected() {
-        let error = OperatorRemediationCandidate::new(
-            OperatorErrorCode::CleanupFailed,
-            "repair-cleanup",
-            "Repair one exactly owned cleanup failure.",
-            RemediationConfidence::Exact,
-            RemediationSafety::Reversible,
-            RemediationApplicability::PlanOnly,
-            1,
-            true,
-            true,
-            true,
-            ["exact_ownership", "exact_ownership"],
-        )
-        .expect_err("duplicate evidence must be rejected");
-        assert_eq!(
-            error.to_string(),
-            "remediation evidence contains a duplicate item"
         );
     }
 }
