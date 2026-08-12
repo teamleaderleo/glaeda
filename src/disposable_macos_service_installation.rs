@@ -351,6 +351,7 @@ impl DisposableMacosServicePlan {
             || document.journal().schema_version != JOURNAL_SCHEMA_VERSION
             || document.journal().stopped_after.is_some()
             || document.journal().records.len() != initial.journal().records.len()
+            || document.journal().records.first() != initial.journal().records.first()
         {
             return Err(());
         }
@@ -1259,6 +1260,23 @@ mod tests {
             crate::journal_document::decode_journal_document(&encoded).unwrap(),
             journal
         );
+    }
+
+    #[test]
+    fn lifecycle_journal_rejects_an_unpublished_initial_record() {
+        let plan = plan(DisposableMacosServiceDesiredState::Installed);
+        let initial = plan.initial_journal_document();
+        let mut journal = initial.journal().clone();
+        journal.records[0].outcome = ActionOutcome::Pending;
+        journal.records[0].message = None;
+        let forged = JournalStateDocument::new(
+            initial.installation_id().clone(),
+            initial.journal_id().clone(),
+            journal,
+        )
+        .unwrap();
+
+        assert!(plan.validate_lifecycle_journal(&forged).is_err());
     }
 
     #[test]
