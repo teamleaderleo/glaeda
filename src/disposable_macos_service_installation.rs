@@ -19,12 +19,17 @@ use crate::disposable_network_gate_activation::{
     DISPOSABLE_NETWORK_PF_CONFIGURATION_PATH, plan_disposable_network_gate_activation,
 };
 use crate::disposable_worker_enrollment::decode_disposable_worker_enrollment;
+use crate::journal::RollbackClass;
+#[cfg(any(target_os = "macos", test))]
 use crate::journal::{
     ActionOutcome, ExecutionJournal, ExecutionLane, JOURNAL_SCHEMA_VERSION, JournalRecord,
-    PlannedMutation, Preconditions, RollbackClass,
+    PlannedMutation, Preconditions,
 };
+#[cfg(any(target_os = "macos", test))]
 use crate::journal_document::JournalStateDocument;
-use crate::state::{InstallationId, JournalId};
+use crate::state::InstallationId;
+#[cfg(any(target_os = "macos", test))]
+use crate::state::JournalId;
 
 pub const DISPOSABLE_MACOS_SERVICE_INSTALLATION_SCHEMA_VERSION: u8 = 1;
 pub const DISPOSABLE_MACOS_SERVICE_ACCOUNT: &str = "_smolrunner";
@@ -259,6 +264,133 @@ impl DisposableMacosServicePlan {
             },
         )
         .expect("fixed production lifecycle journal is valid")
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    #[allow(
+        dead_code,
+        reason = "consumed by the in-progress production apply boundary"
+    )]
+    pub(crate) fn validate_lifecycle_journal(
+        &self,
+        document: &JournalStateDocument,
+    ) -> Result<(), ()> {
+        let initial = self.initial_journal_document();
+        if document.installation_id() != initial.installation_id()
+            || document.journal_id() != initial.journal_id()
+            || document.journal().schema_version != JOURNAL_SCHEMA_VERSION
+            || document.journal().stopped_after.is_some()
+            || document.journal().records.len() != initial.journal().records.len()
+        {
+            return Err(());
+        }
+
+        let mut saw_executing = false;
+        let mut saw_pending = false;
+        for (index, (record, expected)) in document
+            .journal()
+            .records
+            .iter()
+            .zip(&initial.journal().records)
+            .enumerate()
+        {
+            if record.action != expected.action {
+                return Err(());
+            }
+            match record.outcome {
+                ActionOutcome::Completed if !saw_executing && !saw_pending => {
+                    let expected_message = if index == 0 {
+                        "exact lifecycle journal published"
+                    } else {
+                        "action completed"
+                    };
+                    if record.message.as_deref() != Some(expected_message) {
+                        return Err(());
+                    }
+                }
+                ActionOutcome::Executing if !saw_executing && !saw_pending && index != 0 => {
+                    saw_executing = true;
+                    if record.message.is_some() {
+                        return Err(());
+                    }
+                }
+                ActionOutcome::Pending if !saw_executing => {
+                    saw_pending = true;
+                    if record.message.is_some() {
+                        return Err(());
+                    }
+                }
+                ActionOutcome::Pending if saw_executing => {
+                    if record.message.is_some() {
+                        return Err(());
+                    }
+                }
+                _ => return Err(()),
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    #[allow(
+        dead_code,
+        reason = "consumed by the in-progress production apply boundary"
+    )]
+    pub(crate) fn begin_next_lifecycle_action(
+        &self,
+        current: &JournalStateDocument,
+    ) -> Result<JournalStateDocument, ()> {
+        self.validate_lifecycle_journal(current)?;
+        if current
+            .journal()
+            .records
+            .iter()
+            .any(|record| record.outcome == ActionOutcome::Executing)
+        {
+            return Err(());
+        }
+        let mut journal = current.journal().clone();
+        let next = journal
+            .records
+            .iter_mut()
+            .find(|record| record.outcome == ActionOutcome::Pending)
+            .ok_or(())?;
+        next.outcome = ActionOutcome::Executing;
+        JournalStateDocument::new(
+            current.installation_id().clone(),
+            current.journal_id().clone(),
+            journal,
+        )
+        .map_err(|_| ())
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    #[allow(
+        dead_code,
+        reason = "consumed by the in-progress production apply boundary"
+    )]
+    pub(crate) fn complete_executing_lifecycle_action(
+        &self,
+        current: &JournalStateDocument,
+    ) -> Result<JournalStateDocument, ()> {
+        self.validate_lifecycle_journal(current)?;
+        let mut journal = current.journal().clone();
+        let mut executing = journal
+            .records
+            .iter_mut()
+            .filter(|record| record.outcome == ActionOutcome::Executing);
+        let record = executing.next().ok_or(())?;
+        if executing.next().is_some() {
+            return Err(());
+        }
+        record.outcome = ActionOutcome::Completed;
+        record.message = Some("action completed".to_owned());
+        JournalStateDocument::new(
+            current.installation_id().clone(),
+            current.journal_id().clone(),
+            journal,
+        )
+        .map_err(|_| ())
     }
 }
 

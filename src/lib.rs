@@ -24,6 +24,9 @@ pub mod disposable_lima_worker;
 /// Pure exact installation plan for the production macOS disposable-worker services.
 #[cfg(unix)]
 pub mod disposable_macos_service_installation;
+/// Crash-safe root lifecycle journal for production macOS service installation and removal.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) mod disposable_macos_service_lifecycle;
 /// Canonical boot-volatile receipt for the root-owned hostile-CI network gate.
 pub mod disposable_network_gate;
 /// Exact root activation plan for the macOS hostile-CI PF gate.
