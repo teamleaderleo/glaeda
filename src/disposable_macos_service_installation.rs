@@ -45,6 +45,7 @@ pub const DISPOSABLE_MACOS_NETWORK_PLIST_PATH: &str =
     "/Library/LaunchDaemons/io.smolrunner.disposable-network-gate.plist";
 pub const DISPOSABLE_MACOS_WORKER_PLIST_PATH: &str =
     "/Library/LaunchDaemons/io.smolrunner.disposable-worker.plist";
+pub const DISPOSABLE_MACOS_INSTALLATION_ROOT: &str = "/private/var/db/smolrunner";
 pub const DISPOSABLE_MACOS_INSTALLATION_RECORD_PATH: &str =
     "/private/var/db/smolrunner/disposable-service-installation-v1.json";
 

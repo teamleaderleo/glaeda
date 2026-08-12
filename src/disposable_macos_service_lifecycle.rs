@@ -20,6 +20,8 @@ use std::path::{Path, PathBuf};
 use rustix::fs::{self, AtFlags, FileType, FlockOperation, Mode, OFlags, RenameFlags, Stat};
 use serde::Serialize;
 
+#[cfg(target_os = "macos")]
+use crate::disposable_macos_service_installation::DISPOSABLE_MACOS_INSTALLATION_ROOT;
 use crate::disposable_macos_service_installation::{
     DisposableMacosServiceActionKind, DisposableMacosServicePlan,
 };
@@ -243,6 +245,39 @@ impl fmt::Debug for DisposableMacosServiceLifecycleStore {
 }
 
 impl DisposableMacosServiceLifecycleStore {
+    /// Create or open the fixed root-owned production lifecycle directory.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn open_or_create_production() -> Result<Self, DisposableMacosServiceLifecycleError>
+    {
+        if !rustix::process::geteuid().is_root() {
+            return Err(lifecycle_error(
+                DisposableMacosServiceLifecycleErrorKind::UnsafeState,
+                "disposable_service_lifecycle_root_required",
+            ));
+        }
+        let parent_path = Path::new("/private/var/db");
+        let parent =
+            fs::open(parent_path, DIRECTORY_FLAGS, Mode::empty()).map_err(|_| unsafe_state())?;
+        let before = fs::fstat(&parent).map_err(|_| unsafe_state())?;
+        inspect_root_parent(&before)?;
+        let resolved = fs::stat(parent_path).map_err(|_| unsafe_state())?;
+        if !same_directory(&before, &resolved) {
+            return Err(unsafe_state());
+        }
+        match fs::mkdirat(&parent, "smolrunner", Mode::from_raw_mode(0o700)) {
+            Ok(()) => fs::fsync(&parent).map_err(|_| io_error())?,
+            Err(rustix::io::Errno::EXIST) => {}
+            Err(_) => return Err(io_error()),
+        }
+        let store = Self::open_existing(Path::new(DISPOSABLE_MACOS_INSTALLATION_ROOT), (0, 0))?;
+        let after = fs::fstat(&parent).map_err(|_| unsafe_state())?;
+        let resolved_after = fs::stat(parent_path).map_err(|_| unsafe_state())?;
+        if !same_directory(&before, &after) || !same_directory(&before, &resolved_after) {
+            return Err(unsafe_state());
+        }
+        Ok(store)
+    }
+
     /// Open an already-created private lifecycle directory.
     ///
     /// Production will call this with root/wheel after the separately reviewed root-directory
@@ -794,6 +829,18 @@ fn inspect_directory(
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+fn inspect_root_parent(stat: &Stat) -> Result<(), DisposableMacosServiceLifecycleError> {
+    if !FileType::from_raw_mode(stat.st_mode).is_dir()
+        || stat.st_uid != 0
+        || stat.st_gid != 0
+        || stat.st_mode & 0o022 != 0
+    {
+        return Err(unsafe_state());
+    }
+    Ok(())
+}
+
 fn inspect_private_file(
     stat: &Stat,
     owner: (u32, u32),
@@ -1292,5 +1339,15 @@ mod tests {
         ));
         assert_eq!(recovered.prepared, 0);
         assert_eq!(recovered.executed, 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn production_directory_creation_refuses_non_root_before_mutation() {
+        if rustix::process::geteuid().is_root() {
+            return;
+        }
+        let error = DisposableMacosServiceLifecycleStore::open_or_create_production().unwrap_err();
+        assert_eq!(error.code(), "disposable_service_lifecycle_root_required");
     }
 }

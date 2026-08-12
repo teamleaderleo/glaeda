@@ -21,6 +21,9 @@ pub mod disposable_clone_runtime;
 pub mod disposable_launchd_service;
 /// Sealed fixed Lima command plans for one durably planned disposable worker.
 pub mod disposable_lima_worker;
+/// Exact dedicated macOS service-account lifecycle delegated to Directory Services.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) mod disposable_macos_service_account;
 /// Pure exact installation plan for the production macOS disposable-worker services.
 #[cfg(unix)]
 pub mod disposable_macos_service_installation;
