@@ -2,13 +2,13 @@ use super::*;
 
 use crate::github_scale_set_delivery_state::{
     MAX_SCALE_SET_DELIVERY_RECOVERY_BYTES, ScaleSetDeliveryRecoveryError,
-    ScaleSetDeliveryRecoveryErrorKind, ScaleSetDeliveryRecoveryPhase, ScaleSetDeliveryRecoveryState,
-    decode_scale_set_delivery_recovery, encode_scale_set_delivery_recovery,
+    ScaleSetDeliveryRecoveryErrorKind, ScaleSetDeliveryRecoveryPhase,
+    ScaleSetDeliveryRecoveryState, decode_scale_set_delivery_recovery,
+    encode_scale_set_delivery_recovery,
 };
 
 pub(super) const DELIVERY_RECOVERY_DOCUMENT: &str = "scale-set-delivery-recovery.json";
-pub(super) const STAGED_DELIVERY_RECOVERY_DOCUMENT: &str =
-    ".scale-set-delivery-recovery.next.json";
+pub(super) const STAGED_DELIVERY_RECOVERY_DOCUMENT: &str = ".scale-set-delivery-recovery.next.json";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecoveryPlan {
@@ -71,7 +71,11 @@ impl UnixPersonalWorkerStore {
         &mut self,
         state: &ScaleSetDeliveryRecoveryState,
     ) -> Result<ScaleSetDeliveryRecoveryState, PersonalWorkerStoreError> {
-        if state.revision() != 1 || !matches!(state.phase(), ScaleSetDeliveryRecoveryPhase::Reconciled)
+        if state.revision() != 1
+            || !matches!(
+                state.phase(),
+                ScaleSetDeliveryRecoveryPhase::Reconciled
+            )
         {
             return Err(store_error(
                 PersonalWorkerStoreErrorKind::RevisionConflict,
@@ -126,7 +130,9 @@ impl UnixPersonalWorkerStore {
         Ok(successor.clone())
     }
 
-    fn refuse_other_unsettled_scale_set_state(&self) -> Result<(), PersonalWorkerStoreError> {
+    fn refuse_other_unsettled_scale_set_state(
+        &self,
+    ) -> Result<(), PersonalWorkerStoreError> {
         match self.recovery_plan()? {
             StoreRecoveryPlan::Clean { .. } => {}
             StoreRecoveryPlan::PublishStaged { .. }
@@ -161,15 +167,18 @@ impl UnixPersonalWorkerStore {
     }
 
     fn scale_set_delivery_recovery_plan(&self) -> Result<RecoveryPlan, PersonalWorkerStoreError> {
-        let Some(staged) =
-            self.load_scale_set_delivery_named(STAGED_DELIVERY_RECOVERY_DOCUMENT)?
+        let Some(staged) = self.load_scale_set_delivery_named(STAGED_DELIVERY_RECOVERY_DOCUMENT)?
         else {
             return Ok(RecoveryPlan::Clean);
         };
         let current = self.load_scale_set_delivery_named(DELIVERY_RECOVERY_DOCUMENT)?;
         match current {
-            None if staged.revision() == 1
-                && matches!(staged.phase(), ScaleSetDeliveryRecoveryPhase::Reconciled) =>
+            None
+                if staged.revision() == 1
+                    && matches!(
+                        staged.phase(),
+                        ScaleSetDeliveryRecoveryPhase::Reconciled
+                    ) =>
             {
                 Ok(RecoveryPlan::PublishStaged { no_replace: true })
             }
@@ -249,7 +258,9 @@ impl UnixPersonalWorkerStore {
                 STAGED_DELIVERY_RECOVERY_DOCUMENT,
                 AtFlags::empty(),
             ) {
-                Ok(()) => synchronize_directory(&self.directory, "personal worker store directory"),
+                Ok(()) => {
+                    synchronize_directory(&self.directory, "personal worker store directory")
+                }
                 Err(Errno::NOENT) => Ok(()),
                 Err(_) => Err(store_error(
                     PersonalWorkerStoreErrorKind::Io,
@@ -408,10 +419,9 @@ mod tests {
     #[test]
     fn create_replace_and_reopen_exact_recovery_state() {
         let root = TempRoot::new("publish");
-        let mut store = UnixPersonalWorkerStore::open_or_create_scale_set_delivery_recovery(
-            root.path(),
-        )
-        .unwrap();
+        let mut store =
+            UnixPersonalWorkerStore::open_or_create_scale_set_delivery_recovery(root.path())
+                .unwrap();
         let initial = initial();
         store.create_scale_set_delivery_recovery(&initial).unwrap();
         let started = initial.begin_ack().unwrap();
@@ -424,10 +434,9 @@ mod tests {
         );
 
         drop(store);
-        let reopened = UnixPersonalWorkerStore::open_or_create_scale_set_delivery_recovery(
-            root.path(),
-        )
-        .unwrap();
+        let reopened =
+            UnixPersonalWorkerStore::open_or_create_scale_set_delivery_recovery(root.path())
+                .unwrap();
         assert_eq!(
             reopened.load_scale_set_delivery_recovery().unwrap(),
             Some(started)
@@ -437,10 +446,9 @@ mod tests {
     #[test]
     fn stale_or_skipped_successor_is_refused() {
         let root = TempRoot::new("stale");
-        let mut store = UnixPersonalWorkerStore::open_or_create_scale_set_delivery_recovery(
-            root.path(),
-        )
-        .unwrap();
+        let mut store =
+            UnixPersonalWorkerStore::open_or_create_scale_set_delivery_recovery(root.path())
+                .unwrap();
         let initial = initial();
         store.create_scale_set_delivery_recovery(&initial).unwrap();
         let started = initial.begin_ack().unwrap();
@@ -457,12 +465,41 @@ mod tests {
     }
 
     #[test]
+    fn restart_publishes_exact_initial_stage() {
+        let root = TempRoot::new("recover-initial");
+        let store =
+            UnixPersonalWorkerStore::open_or_create_scale_set_delivery_recovery(root.path())
+                .unwrap();
+        let initial = initial();
+        write_private(
+            &root
+                .store_directory()
+                .join(STAGED_DELIVERY_RECOVERY_DOCUMENT),
+            &encode_scale_set_delivery_recovery(&initial).unwrap(),
+        );
+        drop(store);
+
+        let recovered =
+            UnixPersonalWorkerStore::open_or_create_scale_set_delivery_recovery(root.path())
+                .unwrap();
+        assert_eq!(
+            recovered.load_scale_set_delivery_recovery().unwrap(),
+            Some(initial)
+        );
+        assert!(
+            !root
+                .store_directory()
+                .join(STAGED_DELIVERY_RECOVERY_DOCUMENT)
+                .exists()
+        );
+    }
+
+    #[test]
     fn restart_publishes_exact_staged_successor() {
         let root = TempRoot::new("recover-successor");
-        let mut store = UnixPersonalWorkerStore::open_or_create_scale_set_delivery_recovery(
-            root.path(),
-        )
-        .unwrap();
+        let mut store =
+            UnixPersonalWorkerStore::open_or_create_scale_set_delivery_recovery(root.path())
+                .unwrap();
         let initial = initial();
         store.create_scale_set_delivery_recovery(&initial).unwrap();
         let started = initial.begin_ack().unwrap();
@@ -474,10 +511,9 @@ mod tests {
         );
         drop(store);
 
-        let recovered = UnixPersonalWorkerStore::open_or_create_scale_set_delivery_recovery(
-            root.path(),
-        )
-        .unwrap();
+        let recovered =
+            UnixPersonalWorkerStore::open_or_create_scale_set_delivery_recovery(root.path())
+                .unwrap();
         assert_eq!(
             recovered.load_scale_set_delivery_recovery().unwrap(),
             Some(started)
@@ -491,12 +527,42 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_staged_current_is_removed_after_restart() {
+        let root = TempRoot::new("duplicate-stage");
+        let mut store =
+            UnixPersonalWorkerStore::open_or_create_scale_set_delivery_recovery(root.path())
+                .unwrap();
+        let initial = initial();
+        store.create_scale_set_delivery_recovery(&initial).unwrap();
+        write_private(
+            &root
+                .store_directory()
+                .join(STAGED_DELIVERY_RECOVERY_DOCUMENT),
+            &encode_scale_set_delivery_recovery(&initial).unwrap(),
+        );
+        drop(store);
+
+        let reopened =
+            UnixPersonalWorkerStore::open_or_create_scale_set_delivery_recovery(root.path())
+                .unwrap();
+        assert_eq!(
+            reopened.load_scale_set_delivery_recovery().unwrap(),
+            Some(initial)
+        );
+        assert!(
+            !root
+                .store_directory()
+                .join(STAGED_DELIVERY_RECOVERY_DOCUMENT)
+                .exists()
+        );
+    }
+
+    #[test]
     fn conflicting_stage_is_preserved_and_refused() {
         let root = TempRoot::new("conflict");
-        let mut store = UnixPersonalWorkerStore::open_or_create_scale_set_delivery_recovery(
-            root.path(),
-        )
-        .unwrap();
+        let mut store =
+            UnixPersonalWorkerStore::open_or_create_scale_set_delivery_recovery(root.path())
+                .unwrap();
         let initial = initial();
         store.create_scale_set_delivery_recovery(&initial).unwrap();
         let foreign = ScaleSetDeliveryRecoveryState::reconciled(
@@ -540,12 +606,88 @@ mod tests {
     }
 
     #[test]
+    fn writer_lock_blocks_delivery_reads() {
+        let root = TempRoot::new("busy");
+        let store =
+            UnixPersonalWorkerStore::open_or_create_scale_set_delivery_recovery(root.path())
+                .unwrap();
+        let _guard = store.acquire_mutation_lock().unwrap();
+        assert_eq!(
+            store
+                .load_scale_set_delivery_recovery()
+                .unwrap_err()
+                .kind(),
+            PersonalWorkerStoreErrorKind::Busy
+        );
+    }
+
+    #[test]
+    fn staged_symlink_is_refused_and_preserved() {
+        let root = TempRoot::new("symlink-stage");
+        let store =
+            UnixPersonalWorkerStore::open_or_create_scale_set_delivery_recovery(root.path())
+                .unwrap();
+        let staged = root
+            .store_directory()
+            .join(STAGED_DELIVERY_RECOVERY_DOCUMENT);
+        std::os::unix::fs::symlink(DELIVERY_RECOVERY_DOCUMENT, &staged).unwrap();
+        drop(store);
+
+        assert_eq!(
+            UnixPersonalWorkerStore::open_or_create_scale_set_delivery_recovery(root.path())
+                .unwrap_err()
+                .kind(),
+            PersonalWorkerStoreErrorKind::UnsafeFilesystem
+        );
+        assert!(fs::symlink_metadata(staged).unwrap().file_type().is_symlink());
+    }
+
+    #[test]
+    fn hard_linked_current_is_refused() {
+        let root = TempRoot::new("hard-link-current");
+        let mut store =
+            UnixPersonalWorkerStore::open_or_create_scale_set_delivery_recovery(root.path())
+                .unwrap();
+        let initial = initial();
+        store.create_scale_set_delivery_recovery(&initial).unwrap();
+        let current = root.store_directory().join(DELIVERY_RECOVERY_DOCUMENT);
+        fs::hard_link(&current, root.store_directory().join("current-alias")).unwrap();
+
+        assert_eq!(
+            store
+                .load_scale_set_delivery_recovery()
+                .unwrap_err()
+                .kind(),
+            PersonalWorkerStoreErrorKind::UnsafeFilesystem
+        );
+    }
+
+    #[test]
+    fn permissive_current_mode_is_refused() {
+        let root = TempRoot::new("permissive-current");
+        let mut store =
+            UnixPersonalWorkerStore::open_or_create_scale_set_delivery_recovery(root.path())
+                .unwrap();
+        let initial = initial();
+        store.create_scale_set_delivery_recovery(&initial).unwrap();
+        let current = root.store_directory().join(DELIVERY_RECOVERY_DOCUMENT);
+        fs::set_permissions(&current, fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert_eq!(
+            store
+                .load_scale_set_delivery_recovery()
+                .unwrap_err()
+                .kind(),
+            PersonalWorkerStoreErrorKind::UnsafeFilesystem
+        );
+    }
+
+    #[test]
     fn recovery_acquisition_successor_persists_positive_subset() {
         let root = TempRoot::new("replay-acquire");
-        let mut store = UnixPersonalWorkerStore::open_or_create_scale_set_delivery_recovery(
-            root.path(),
-        )
-        .unwrap();
+        let mut store =
+            UnixPersonalWorkerStore::open_or_create_scale_set_delivery_recovery(root.path())
+                .unwrap();
         let initial = initial();
         store.create_scale_set_delivery_recovery(&initial).unwrap();
         let started = initial.begin_ack().unwrap();
