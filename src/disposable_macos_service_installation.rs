@@ -50,6 +50,7 @@ pub const DISPOSABLE_MACOS_INSTALLATION_RECORD_PATH: &str =
 
 const MAX_PRIVATE_PATH_BYTES: usize = 1_024;
 const INSTALLATION_DOMAIN: &[u8] = b"smolrunner.disposable-macos-service-installation.v1\0";
+const ACCOUNT_IDENTITY_DOMAIN: &[u8] = b"smolrunner.disposable-macos-service-account.v1\0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -119,6 +120,8 @@ pub struct DisposableMacosServicePlanReport {
     installation_id: InstallationId,
     service_uid: u32,
     primary_group_id: u32,
+    service_user_uuid: String,
+    service_group_uuid: String,
     max_workers: u8,
     network_policy_identity: Sha256Digest,
     network_activation_identity: Sha256Digest,
@@ -143,6 +146,16 @@ impl DisposableMacosServicePlanReport {
     #[must_use]
     pub const fn primary_group_id(&self) -> u32 {
         self.primary_group_id
+    }
+
+    #[must_use]
+    pub fn service_user_uuid(&self) -> &str {
+        &self.service_user_uuid
+    }
+
+    #[must_use]
+    pub fn service_group_uuid(&self) -> &str {
+        &self.service_group_uuid
     }
 
     #[must_use]
@@ -208,6 +221,8 @@ pub(crate) struct DisposableMacosServiceApplyParts<'a> {
     pub(crate) installation_id: &'a InstallationId,
     pub(crate) service_uid: u32,
     pub(crate) primary_group_id: u32,
+    pub(crate) service_user_uuid: &'a str,
+    pub(crate) service_group_uuid: &'a str,
     pub(crate) program_source: &'a Path,
     pub(crate) program_digest: &'a Sha256Digest,
     pub(crate) bridge_source: &'a Path,
@@ -249,6 +264,8 @@ impl DisposableMacosServicePlan {
             installation_id: &self.report.installation_id,
             service_uid: self.report.service_uid,
             primary_group_id: self.report.primary_group_id,
+            service_user_uuid: &self.report.service_user_uuid,
+            service_group_uuid: &self.report.service_group_uuid,
             program_source: &self.program_source,
             program_digest: &self.program_digest,
             bridge_source: &self.bridge_source,
@@ -559,6 +576,8 @@ pub fn plan_disposable_macos_service(
     }
     let service_uid = parts.network_policy.report().service_uid();
     let primary_group_id = service_uid;
+    let service_user_uuid = account_uuid(installation_id, service_uid, b"user");
+    let service_group_uuid = account_uuid(installation_id, primary_group_id, b"group");
     let network_policy_identity = parts.network_policy.report().policy_identity().clone();
     let activation = plan_disposable_network_gate_activation(&parts.network_policy)
         .map_err(|_| invalid_configuration())?;
@@ -573,6 +592,8 @@ pub fn plan_disposable_macos_service(
         installation_id,
         service_uid,
         primary_group_id,
+        &service_user_uuid,
+        &service_group_uuid,
         program_digest,
         bridge_digest,
         &enrollment_digest,
@@ -588,6 +609,8 @@ pub fn plan_disposable_macos_service(
         installation_id,
         service_uid,
         primary_group_id,
+        &service_user_uuid,
+        &service_group_uuid,
         program_source,
         program_digest,
         bridge_source,
@@ -613,6 +636,8 @@ pub fn plan_disposable_macos_service(
             installation_id: installation_id.clone(),
             service_uid,
             primary_group_id,
+            service_user_uuid,
+            service_group_uuid,
             max_workers: 1,
             network_policy_identity,
             network_activation_identity,
@@ -792,6 +817,8 @@ fn plan_identity(
     installation_id: &InstallationId,
     service_uid: u32,
     primary_group_id: u32,
+    service_user_uuid: &str,
+    service_group_uuid: &str,
     program_source: &Path,
     program_digest: &Sha256Digest,
     bridge_source: &Path,
@@ -818,6 +845,8 @@ fn plan_identity(
     hash_field(&mut hasher, installation_id.as_str().as_bytes());
     hash_field(&mut hasher, &service_uid.to_be_bytes());
     hash_field(&mut hasher, &primary_group_id.to_be_bytes());
+    hash_field(&mut hasher, service_user_uuid.as_bytes());
+    hash_field(&mut hasher, service_group_uuid.as_bytes());
     hash_field(&mut hasher, program_source.as_os_str().as_bytes());
     hash_field(&mut hasher, program_digest.as_str().as_bytes());
     hash_field(&mut hasher, bridge_source.as_os_str().as_bytes());
@@ -857,11 +886,45 @@ fn digest_bytes(bytes: &[u8]) -> Sha256Digest {
         .expect("SHA-256 output is canonical")
 }
 
+fn account_uuid(installation_id: &InstallationId, numeric_id: u32, role: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(ACCOUNT_IDENTITY_DOMAIN);
+    hash_field(&mut hasher, installation_id.as_str().as_bytes());
+    hash_field(&mut hasher, &numeric_id.to_be_bytes());
+    hash_field(&mut hasher, role);
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format!(
+        "{:02X}{:02X}{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15],
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_installation_record(
     installation_id: &InstallationId,
     service_uid: u32,
     primary_group_id: u32,
+    service_user_uuid: &str,
+    service_group_uuid: &str,
     program_digest: &Sha256Digest,
     bridge_digest: &Sha256Digest,
     enrollment_digest: &Sha256Digest,
@@ -881,6 +944,8 @@ fn render_installation_record(
             "  \"service_group\": \"{}\",\n",
             "  \"service_uid\": {},\n",
             "  \"primary_group_id\": {},\n",
+            "  \"service_user_uuid\": \"{}\",\n",
+            "  \"service_group_uuid\": \"{}\",\n",
             "  \"program_digest\": \"{}\",\n",
             "  \"bridge_digest\": \"{}\",\n",
             "  \"enrollment_digest\": \"{}\",\n",
@@ -895,6 +960,8 @@ fn render_installation_record(
         DISPOSABLE_MACOS_SERVICE_GROUP,
         service_uid,
         primary_group_id,
+        service_user_uuid,
+        service_group_uuid,
         program_digest.as_str(),
         bridge_digest.as_str(),
         enrollment_digest.as_str(),
@@ -1136,6 +1203,14 @@ mod tests {
         let plan = plan(DisposableMacosServiceDesiredState::Installed);
         assert_eq!(plan.report().service_uid(), 502);
         assert_eq!(plan.report().primary_group_id(), 502);
+        assert_eq!(plan.report().service_user_uuid().len(), 36);
+        assert_eq!(plan.report().service_group_uuid().len(), 36);
+        assert_ne!(
+            plan.report().service_user_uuid(),
+            plan.report().service_group_uuid()
+        );
+        assert_eq!(plan.report().service_user_uuid().as_bytes()[14], b'5');
+        assert!(b"89AB".contains(&plan.report().service_user_uuid().as_bytes()[19]));
         assert_eq!(
             plan.report().network_policy_identity().as_str(),
             NETWORK_DIGEST
@@ -1160,6 +1235,8 @@ mod tests {
 
         let ownership = String::from_utf8(plan.installation_record.clone()).unwrap();
         assert!(ownership.contains("\"installation_id\": \"smolrunner-install-0001\""));
+        assert!(ownership.contains(plan.report().service_user_uuid()));
+        assert!(ownership.contains(plan.report().service_group_uuid()));
         assert!(ownership.contains(DIGEST_A));
         assert!(ownership.contains(DIGEST_B));
         assert!(!ownership.contains("acme-ci"));
