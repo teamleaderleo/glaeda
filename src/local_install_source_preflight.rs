@@ -1,7 +1,6 @@
 use std::collections::BTreeSet;
-use std::ffi::OsStr;
 use std::fs::File;
-use std::io::Read as _;
+use std::io::Read;
 use std::os::fd::AsFd as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Component, Path};
@@ -184,7 +183,7 @@ pub fn observe_local_install_source_preflight(
         }
     };
 
-    if first_lock != second_lock
+    if !first_lock.same_as(&second_lock)
         || first_lock.materialization_id != *checkout_observation.materialization_id()
     {
         return root_cause_receipt(expected, LocalInstallSourceBlockingCode::SourceChanged);
@@ -211,8 +210,8 @@ fn stable_receipt(
     let commit_match = observation.commit() == expected.commit();
     let tree_match = observation.tree() == expected.tree();
     let lockfile_digest_match = lock.digest == *expected.cargo_lock_digest();
-    let checkout_clean = !observation.tracked_changes_present()
-        && observation.untracked_entry_count() == 0;
+    let checkout_clean =
+        !observation.tracked_changes_present() && observation.untracked_entry_count() == 0;
 
     let mut blocking_codes = BTreeSet::new();
     if observed_project != LocalInstallSourceProjectDisposition::ExactSmolrunner {
@@ -264,7 +263,7 @@ fn root_cause_receipt(
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct LockSnapshot {
     materialization_id: Sha256Digest,
     root: PrivateMetadata,
@@ -272,7 +271,16 @@ struct LockSnapshot {
     digest: Sha256Digest,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl LockSnapshot {
+    fn same_as(&self, other: &Self) -> bool {
+        self.materialization_id == other.materialization_id
+            && self.root.same_as(&other.root)
+            && self.lock.same_as(&other.lock)
+            && self.digest == other.digest
+    }
+}
+
+#[derive(Debug, Clone)]
 struct PrivateMetadata {
     device: u64,
     inode: u64,
@@ -303,6 +311,20 @@ impl PrivateMetadata {
             changed_nanoseconds: metadata.ctime_nsec(),
         }
     }
+
+    fn same_as(&self, other: &Self) -> bool {
+        self.device == other.device
+            && self.inode == other.inode
+            && self.uid == other.uid
+            && self.gid == other.gid
+            && self.mode == other.mode
+            && self.links == other.links
+            && self.size == other.size
+            && self.modified_seconds == other.modified_seconds
+            && self.modified_nanoseconds == other.modified_nanoseconds
+            && self.changed_seconds == other.changed_seconds
+            && self.changed_nanoseconds == other.changed_nanoseconds
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -320,8 +342,8 @@ fn observe_lock_snapshot(checkout: &Path) -> Result<LockSnapshot, LockSnapshotEr
     let root_before = root.metadata().map_err(|_| LockSnapshotError::Unknown)?;
     validate_checkout_root(&root_before)?;
 
-    let lock = fs::openat(root.as_fd(), "Cargo.lock", FILE_FLAGS, Mode::empty())
-        .map_err(map_lock_open)?;
+    let lock =
+        fs::openat(root.as_fd(), "Cargo.lock", FILE_FLAGS, Mode::empty()).map_err(map_lock_open)?;
     let mut lock = File::from(lock);
     let lock_before = lock.metadata().map_err(|_| LockSnapshotError::Unknown)?;
     validate_lockfile(&lock_before)?;
@@ -337,9 +359,7 @@ fn observe_lock_snapshot(checkout: &Path) -> Result<LockSnapshot, LockSnapshotEr
 
     let lock_after = lock.metadata().map_err(|_| LockSnapshotError::Unknown)?;
     let root_after = root.metadata().map_err(|_| LockSnapshotError::Unknown)?;
-    if !stable_metadata(&lock_before, &lock_after)
-        || !stable_metadata(&root_before, &root_after)
-    {
+    if !stable_metadata(&lock_before, &lock_after) || !stable_metadata(&root_before, &root_after) {
         return Err(LockSnapshotError::Changed);
     }
 
@@ -400,7 +420,7 @@ fn validate_lockfile(metadata: &std::fs::Metadata) -> Result<(), LockSnapshotErr
 }
 
 fn stable_metadata(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
-    PrivateMetadata::from_metadata(before) == PrivateMetadata::from_metadata(after)
+    PrivateMetadata::from_metadata(before).same_as(&PrivateMetadata::from_metadata(after))
 }
 
 fn valid_checkout_path(path: &Path) -> bool {
@@ -531,8 +551,8 @@ mod tests {
             }
         }
 
-        fn with_lock_replacement(mut self, path: PathBuf, bytes: Vec<u8>) -> Self {
-            self.mutation = RefCell::new(Some((path, bytes)));
+        fn with_lock_replacement(self, path: PathBuf, bytes: Vec<u8>) -> Self {
+            self.mutation.replace(Some((path, bytes)));
             self
         }
     }
@@ -592,17 +612,13 @@ mod tests {
             Response::success(remotes),
             Response::success(status),
             Response::success("100644\n"),
-            Response::success("worktree /private/path\0HEAD 1111111111111111111111111111111111111111\0branch refs/heads/main\0\0"),
+            Response::success(
+                "worktree /private/path\0HEAD 1111111111111111111111111111111111111111\0branch refs/heads/main\0\0",
+            ),
         ]
     }
 
-    fn script(
-        root: &Path,
-        remotes: &str,
-        status: &str,
-        commit: &str,
-        tree: &str,
-    ) -> Vec<Response> {
+    fn script(root: &Path, remotes: &str, status: &str, commit: &str, tree: &str) -> Vec<Response> {
         let snapshot = snapshot_responses(remotes, status, commit, tree);
         let mut responses = vec![
             Response::success("false\n"),
