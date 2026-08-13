@@ -337,15 +337,10 @@ fn executable_snapshot(path: &Path) -> Result<ExecutableSnapshot, ExecutableObse
     let root = fs::open("/", DIRECTORY_FLAGS, Mode::empty())
         .map_err(|_| ExecutableObservationError::Unknown)?;
     let mut current = File::from(root);
-    let mut directories = vec![metadata(&current)?];
+    let mut directories = vec![PrivateMetadata::from_metadata(&metadata(&current)?)];
     for component in parent_components {
-        let opened = fs::openat(
-            current.as_fd(),
-            *component,
-            DIRECTORY_FLAGS,
-            Mode::empty(),
-        )
-        .map_err(map_directory_open)?;
+        let opened = fs::openat(current.as_fd(), *component, DIRECTORY_FLAGS, Mode::empty())
+            .map_err(map_directory_open)?;
         let opened = File::from(opened);
         let observed = metadata(&opened)?;
         if !observed.is_dir() {
@@ -382,12 +377,17 @@ fn metadata(file: &File) -> Result<std::fs::Metadata, ExecutableObservationError
 }
 
 fn valid_executable_metadata(metadata: &std::fs::Metadata) -> bool {
+    let private = PrivateMetadata::from_metadata(metadata);
     metadata.is_file()
         && metadata.nlink() == 1
-        && (metadata.uid() == 0 || metadata.uid() == geteuid().as_raw())
-        && metadata.mode() & 0o022 == 0
-        && metadata.mode() & 0o111 != 0
+        && owner_and_mode_are_reviewed(&private)
         && metadata.len() >= 4
+}
+
+fn owner_and_mode_are_reviewed(metadata: &PrivateMetadata) -> bool {
+    (metadata.uid == 0 || metadata.uid == geteuid().as_raw())
+        && metadata.mode & 0o022 == 0
+        && metadata.mode & 0o111 != 0
 }
 
 fn reviewed_executable_magic(magic: [u8; 4]) -> bool {
@@ -475,8 +475,7 @@ fn probe_version(
     {
         return VersionProbe::Unknown;
     }
-    parse_version_output(kind, &record.stdout)
-        .map_or(VersionProbe::Unknown, VersionProbe::Version)
+    parse_version_output(kind, &record.stdout).map_or(VersionProbe::Unknown, VersionProbe::Version)
 }
 
 fn parse_version_output(kind: ToolKind, output: &str) -> Option<String> {
@@ -524,9 +523,9 @@ fn valid_version(version: &str) -> bool {
         return false;
     };
     components.next().is_none()
-        && [major, minor, patch]
-            .into_iter()
-            .all(|component| !component.is_empty() && component.bytes().all(|byte| byte.is_ascii_digit()))
+        && [major, minor, patch].into_iter().all(|component| {
+            !component.is_empty() && component.bytes().all(|byte| byte.is_ascii_digit())
+        })
 }
 
 #[cfg(test)]
@@ -601,8 +600,7 @@ mod tests {
         };
         bytes.extend_from_slice(b"-body");
         fs::write(path, bytes).expect("write executable fixture");
-        fs::set_permissions(path, fs::Permissions::from_mode(0o755))
-            .expect("set executable mode");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("set executable mode");
     }
 
     #[derive(Clone)]
@@ -706,24 +704,37 @@ mod tests {
         let fixture = TempToolchain::new("exact");
         let context = fixture.context();
         let executor = ScriptedExecutor::new(exact_responses());
-        let receipt = observe_local_install_toolchain_preflight(
-            &expected(),
-            &context,
-            &executor,
-        );
+        let receipt = observe_local_install_toolchain_preflight(&expected(), &context, &executor);
 
         assert!(receipt.ready());
-        assert_eq!(receipt.cargo(), LocalInstallToolchainExecutableDisposition::Exact);
-        assert_eq!(receipt.rustc(), LocalInstallToolchainExecutableDisposition::Exact);
-        assert_eq!(receipt.rustdoc(), LocalInstallToolchainExecutableDisposition::Exact);
+        assert_eq!(
+            receipt.cargo(),
+            LocalInstallToolchainExecutableDisposition::Exact
+        );
+        assert_eq!(
+            receipt.rustc(),
+            LocalInstallToolchainExecutableDisposition::Exact
+        );
+        assert_eq!(
+            receipt.rustdoc(),
+            LocalInstallToolchainExecutableDisposition::Exact
+        );
         assert!(receipt.blocking_codes().is_empty());
         let commands = executor.commands.borrow();
         assert_eq!(commands.len(), 3);
-        for command in commands.iter() {
-            assert_eq!(command.arguments.len(), 1);
-            assert_eq!(command.arguments[0].display_value(), "--version");
+        for (command, expected_program) in commands
+            .iter()
+            .zip([&fixture.cargo, &fixture.rustc, &fixture.rustdoc])
+        {
+            assert_eq!(&command.program, expected_program);
+            assert_eq!(command.displayed_argv().len(), 2);
+            assert_eq!(command.displayed_argv()[1], "--version");
             assert_eq!(
-                command.environment.keys().map(String::as_str).collect::<Vec<_>>(),
+                command
+                    .environment
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
                 ["LANG", "LC_ALL"]
             );
             assert!(!command.environment.contains_key("PATH"));
@@ -742,15 +753,20 @@ mod tests {
             Response::success("rustc 1.97.1 (exact)\n"),
             Response::success("surprising rustdoc output\n"),
         ]);
-        let receipt = observe_local_install_toolchain_preflight(
-            &expected(),
-            &context,
-            &executor,
-        );
+        let receipt = observe_local_install_toolchain_preflight(&expected(), &context, &executor);
 
-        assert_eq!(receipt.cargo(), LocalInstallToolchainExecutableDisposition::Mismatch);
-        assert_eq!(receipt.rustc(), LocalInstallToolchainExecutableDisposition::Exact);
-        assert_eq!(receipt.rustdoc(), LocalInstallToolchainExecutableDisposition::Unknown);
+        assert_eq!(
+            receipt.cargo(),
+            LocalInstallToolchainExecutableDisposition::Mismatch
+        );
+        assert_eq!(
+            receipt.rustc(),
+            LocalInstallToolchainExecutableDisposition::Exact
+        );
+        assert_eq!(
+            receipt.rustdoc(),
+            LocalInstallToolchainExecutableDisposition::Unknown
+        );
         assert_eq!(
             receipt.blocking_codes(),
             [
@@ -764,14 +780,14 @@ mod tests {
     fn executable_replacement_during_probe_is_changed() {
         let fixture = TempToolchain::new("replacement");
         let context = fixture.context();
-        let executor = ScriptedExecutor::new(exact_responses()).replace_on_call(0, fixture.cargo.clone());
-        let receipt = observe_local_install_toolchain_preflight(
-            &expected(),
-            &context,
-            &executor,
-        );
+        let executor =
+            ScriptedExecutor::new(exact_responses()).replace_on_call(0, fixture.cargo.clone());
+        let receipt = observe_local_install_toolchain_preflight(&expected(), &context, &executor);
 
-        assert_eq!(receipt.cargo(), LocalInstallToolchainExecutableDisposition::Changed);
+        assert_eq!(
+            receipt.cargo(),
+            LocalInstallToolchainExecutableDisposition::Changed
+        );
         assert_eq!(
             receipt.blocking_codes(),
             [LocalInstallToolchainBlockingCode::CargoChanged]
@@ -800,12 +816,12 @@ mod tests {
                 Response::success("rustc 1.97.1 (exact)\n"),
                 Response::success("rustdoc 1.97.1 (exact)\n"),
             ]);
-            let receipt = observe_local_install_toolchain_preflight(
-                &expected(),
-                &context,
-                &executor,
+            let receipt =
+                observe_local_install_toolchain_preflight(&expected(), &context, &executor);
+            assert_eq!(
+                receipt.cargo(),
+                LocalInstallToolchainExecutableDisposition::Unsafe
             );
-            assert_eq!(receipt.cargo(), LocalInstallToolchainExecutableDisposition::Unsafe);
             assert_eq!(
                 receipt.blocking_codes(),
                 [LocalInstallToolchainBlockingCode::CargoUnsafe]
@@ -822,8 +838,6 @@ mod tests {
         private.uid = geteuid().as_raw().saturating_add(1).max(1);
         assert_ne!(private.uid, 0);
         assert_ne!(private.uid, geteuid().as_raw());
-        assert!(metadata.is_file());
-        assert!(metadata.nlink() == 1);
         assert!(!owner_and_mode_are_reviewed(&private));
     }
 
@@ -834,22 +848,12 @@ mod tests {
         let expected = LocalInstallToolchainIdentity::parse("opaque-toolchain-token")
             .expect("lexically valid old identity");
         let executor = ScriptedExecutor::new(Vec::new());
-        let receipt = observe_local_install_toolchain_preflight(
-            &expected,
-            &context,
-            &executor,
-        );
+        let receipt = observe_local_install_toolchain_preflight(&expected, &context, &executor);
         assert_eq!(
             receipt.blocking_codes(),
             [LocalInstallToolchainBlockingCode::ExpectedIdentityUnsupported]
         );
         assert!(executor.commands.borrow().is_empty());
-    }
-
-    fn owner_and_mode_are_reviewed(metadata: &PrivateMetadata) -> bool {
-        (metadata.uid == 0 || metadata.uid == geteuid().as_raw())
-            && metadata.mode & 0o022 == 0
-            && metadata.mode & 0o111 != 0
     }
 
     #[test]
