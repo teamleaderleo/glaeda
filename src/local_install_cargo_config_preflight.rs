@@ -705,14 +705,14 @@ fn inspect_config_file(
     context: &LocalInstallCargoConfigPreflightContext,
 ) -> ConfigObservation {
     let components = normal_components(path);
-    let Some((file_name, parents)) = components.split_last() else {
+    let Some((&file_name, parents)) = components.split_last() else {
         return ConfigObservation::Unsafe;
     };
     let mut directory = match fs::open("/", DIRECTORY_FLAGS, Mode::empty()) {
         Ok(directory) => directory,
         Err(_) => return ConfigObservation::Unknown,
     };
-    for component in parents {
+    for &component in parents {
         let opened = match fs::openat(directory.as_fd(), component, DIRECTORY_FLAGS, Mode::empty())
         {
             Ok(opened) => opened,
