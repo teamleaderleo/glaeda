@@ -354,8 +354,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        OperatorRemediationCandidate, RemediationApplicability, RemediationConfidence,
-        RemediationOwnership, RemediationSafety,
+        OPERATOR_REMEDIATION_SCHEMA_VERSION, OperatorRemediationCandidate, RemediationApplicability,
+        RemediationConfidence, RemediationOwnership, RemediationSafety,
     };
     use crate::journal::RollbackClass;
     use crate::operator_error::OperatorErrorCode;
@@ -380,7 +380,10 @@ mod tests {
         assert_eq!(candidate.ownership(), RemediationOwnership::ExactManaged);
         assert_eq!(candidate.rollback(), Some(&RollbackClass::Reversible));
         assert!(!candidate.authorizes_mutation());
-        assert_eq!(candidate.schema_version(), OPERATOR_REMEDIATION_SCHEMA_VERSION);
+        assert_eq!(
+            candidate.schema_version(),
+            OPERATOR_REMEDIATION_SCHEMA_VERSION
+        );
         assert_eq!(candidate.source_error(), &OperatorErrorCode::CleanupFailed);
         assert_eq!(candidate.action_id(), "remove-owned-expired-worker");
         assert_eq!(candidate.confidence(), RemediationConfidence::Exact);
