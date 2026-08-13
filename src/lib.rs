@@ -56,12 +56,6 @@ pub mod host;
 #[cfg(target_os = "linux")]
 pub mod host_package_plan;
 #[cfg(target_os = "linux")]
-pub mod debian_package_plan;
-#[cfg(target_os = "linux")]
-pub mod debian_package_probe;
-#[cfg(target_os = "linux")]
-pub mod debian_package_recovery;
-#[cfg(target_os = "linux")]
 pub mod host_preparation_command;
 #[cfg(target_os = "linux")]
 pub mod host_preparation_execution;
