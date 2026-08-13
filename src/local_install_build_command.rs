@@ -472,9 +472,9 @@ mod tests {
         LocalInstallBuildCommandContext::new(
             format!("/{prefix}/source"),
             format!("/{prefix}-build"),
-            format!("/{prefix}/toolchain/cargo"),
-            format!("/{prefix}/toolchain/rustc"),
-            format!("/{prefix}/toolchain/rustdoc"),
+            "/reviewed-toolchain/cargo",
+            "/reviewed-toolchain/rustc",
+            "/reviewed-toolchain/rustdoc",
         )
         .expect("context")
     }
