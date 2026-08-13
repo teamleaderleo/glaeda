@@ -61,9 +61,10 @@ cat >"$test_root/bin/cmux" <<'FAKE_CMUX'
 #!/usr/bin/env bash
 set -euo pipefail
 workspace=0
-split=0
+split_count=0
 host_named=0
-vm_named=0
+surface2_kind=none
+surface3_kind=none
 if [[ -f "$TEST_CMUX_STATE" ]]; then
   # shellcheck disable=SC1090
   source "$TEST_CMUX_STATE"
@@ -71,10 +72,18 @@ fi
 save_state() {
   cat >"$TEST_CMUX_STATE" <<EOF_STATE
 workspace=$workspace
-split=$split
+split_count=$split_count
 host_named=$host_named
-vm_named=$vm_named
+surface2_kind=$surface2_kind
+surface3_kind=$surface3_kind
 EOF_STATE
+}
+surface_title() {
+  case "$1" in
+    vm) printf 'Lima VM' ;;
+    custom) printf 'Operator notes' ;;
+    *) printf '' ;;
+  esac
 }
 printf '%s\n' "$*" >>"$TEST_CMUX_LOG"
 case "${1:-}" in
@@ -90,9 +99,10 @@ case "${1:-}" in
     ;;
   new-workspace)
     workspace=1
-    split=0
+    split_count=0
     host_named=0
-    vm_named=0
+    surface2_kind=none
+    surface3_kind=none
     save_state
     ;;
   current-workspace)
@@ -100,25 +110,40 @@ case "${1:-}" in
     ;;
   tree)
     host_title=''
-    vm_title=''
     [[ "$host_named" -eq 1 ]] && host_title='Mac host'
-    [[ "$vm_named" -eq 1 ]] && vm_title='Lima VM'
-    if [[ "$split" -eq 1 ]]; then
-      printf '{"workspace":{"id":"ws-1","ref":"workspace:1","panes":[{"surfaces":[{"id":"surface-host","ref":"surface:1","title":"%s"},{"id":"surface-vm","ref":"surface:2","title":"%s"}]}]}}\n' "$host_title" "$vm_title"
-    else
-      printf '{"workspace":{"id":"ws-1","ref":"workspace:1","panes":[{"surfaces":[{"id":"surface-host","ref":"surface:1","title":"%s"}]}]}}\n' "$host_title"
-    fi
+    surface2_title="$(surface_title "$surface2_kind")"
+    surface3_title="$(surface_title "$surface3_kind")"
+    case "$split_count" in
+      0)
+        printf '{"workspace":{"id":"ws-1","ref":"workspace:1","panes":[{"surfaces":[{"id":"surface-host","ref":"surface:1","title":"%s"}]}]}}\n' "$host_title"
+        ;;
+      1)
+        printf '{"workspace":{"id":"ws-1","ref":"workspace:1","panes":[{"surfaces":[{"id":"surface-host","ref":"surface:1","title":"%s"},{"id":"surface-2","ref":"surface:2","title":"%s"}]}]}}\n' "$host_title" "$surface2_title"
+        ;;
+      *)
+        printf '{"workspace":{"id":"ws-1","ref":"workspace:1","panes":[{"surfaces":[{"id":"surface-host","ref":"surface:1","title":"%s"},{"id":"surface-2","ref":"surface:2","title":"%s"},{"id":"surface-3","ref":"surface:3","title":"%s"}]}]}}\n' "$host_title" "$surface2_title" "$surface3_title"
+        ;;
+    esac
     ;;
   rename-tab)
-    title="${*: -1}"
-    case "$title" in
-      'Mac host') host_named=1 ;;
-      'Lima VM') vm_named=1 ;;
+    case "$*" in
+      *'--surface surface-host -- Mac host') host_named=1 ;;
+      *'--surface surface-2 -- Lima VM') surface2_kind=vm ;;
+      *'--surface surface-3 -- Lima VM') surface3_kind=vm ;;
     esac
     save_state
     ;;
   new-split)
-    split=1
+    if [[ "$split_count" -eq 0 ]]; then
+      split_count=1
+      surface2_kind=blank
+    elif [[ "$split_count" -eq 1 ]]; then
+      split_count=2
+      surface3_kind=blank
+    else
+      printf 'fake cmux supports at most three surfaces\n' >&2
+      exit 1
+    fi
     save_state
     ;;
   send|set-status|clear-status|select-workspace|log|notify|trigger-flash)
@@ -147,8 +172,8 @@ bash "$ROOT/scripts/macbook-workspace.sh" cmux
 grep -Fq 'new-workspace --name smolrunner --cwd' "$TEST_CMUX_LOG"
 grep -Fq 'new-split right --workspace ws-1 --surface surface-host' "$TEST_CMUX_LOG"
 grep -Fq 'rename-tab --surface surface-host -- Mac host' "$TEST_CMUX_LOG"
-grep -Fq 'rename-tab --surface surface-vm -- Lima VM' "$TEST_CMUX_LOG"
-grep -Fq 'send --surface surface-vm exec /bin/bash' "$TEST_CMUX_LOG"
+grep -Fq 'rename-tab --surface surface-2 -- Lima VM' "$TEST_CMUX_LOG"
+grep -Fq 'send --surface surface-2 exec /bin/bash' "$TEST_CMUX_LOG"
 grep -Fq 'set-status lima work --workspace ws-1' "$TEST_CMUX_LOG"
 grep -Fq 'set-status worker 1 active --workspace ws-1' "$TEST_CMUX_LOG"
 grep -Fq 'set-status queue 2 queued --workspace ws-1' "$TEST_CMUX_LOG"
@@ -158,6 +183,27 @@ if grep -Fq 'osascript' "$ROOT/scripts/macbook-workspace.sh"; then
   printf 'error: cmux workspace still depends on AppleScript\n' >&2
   exit 1
 fi
+
+cat >"$TEST_CMUX_STATE" <<'EOF_REPAIR_STATE'
+workspace=1
+split_count=1
+host_named=1
+surface2_kind=custom
+surface3_kind=none
+EOF_REPAIR_STATE
+: >"$TEST_CMUX_LOG"
+bash "$ROOT/scripts/macbook-workspace.sh" cmux
+grep -Fq 'new-split right --workspace ws-1 --surface surface-host' "$TEST_CMUX_LOG"
+grep -Fq 'rename-tab --surface surface-3 -- Lima VM' "$TEST_CMUX_LOG"
+grep -Fq 'send --surface surface-3 exec /bin/bash' "$TEST_CMUX_LOG"
+if grep -Fq 'rename-tab --surface surface-2 -- Lima VM' "$TEST_CMUX_LOG"; then
+  printf 'error: cmux repair commandeered an operator-owned surface\n' >&2
+  exit 1
+fi
+# shellcheck disable=SC1090
+source "$TEST_CMUX_STATE"
+[[ "$surface2_kind" = custom ]]
+[[ "$surface3_kind" = vm ]]
 
 FAKE_LIMA_STATE=Stopped bash "$ROOT/scripts/macbook-workspace.sh" sync-cmux
 grep -Fq 'clear-status lima --workspace ws-1' "$TEST_CMUX_LOG"
