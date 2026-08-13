@@ -329,7 +329,7 @@ fn policy(
     let timeout_seconds = LOCAL_INSTALL_BUILD_TIMEOUT.as_secs();
     let document = IdentityDocument {
         schema_version: LOCAL_INSTALL_BUILD_COMMAND_SCHEMA_VERSION,
-        source_digest: &build.source.digest,
+        source_digest: build.source.digest(),
         target_generation: build.target_generation,
         expected_predecessor: &build.expected_predecessor,
         platform,
@@ -347,7 +347,7 @@ fn policy(
     Ok(LocalInstallBuildCommandPolicy {
         schema_version: LOCAL_INSTALL_BUILD_COMMAND_SCHEMA_VERSION,
         identity: LocalInstallBuildCommandIdentity { digest },
-        source_digest: build.source.digest.clone(),
+        source_digest: build.source.digest().clone(),
         target_generation: build.target_generation,
         expected_predecessor: build.expected_predecessor.clone(),
         platform,
