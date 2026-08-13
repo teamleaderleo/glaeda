@@ -534,7 +534,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::fs;
     use std::io;
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    use std::os::unix::fs::PermissionsExt as _;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
