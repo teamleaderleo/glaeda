@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fmt;
 use std::os::fd::{AsFd, OwnedFd};
@@ -131,6 +131,11 @@ pub enum LocalInstallCargoConfigRepairCode {
     CreateIsolatedCargoHome,
 }
 
+/// Path-private proof for one exact isolated Cargo lookup observation.
+///
+/// The type is non-exhaustive so external crates may inspect and serialize evidence but cannot
+/// fabricate a readiness receipt with a struct literal.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LocalInstallCargoConfigPreflightReceipt {
     pub schema_version: u8,
@@ -217,36 +222,42 @@ impl PrivateSnapshot {
             LocalInstallBuildRootDisposition::Unknown => {
                 blocking_codes.insert(LocalInstallCargoConfigBlockingCode::BuildRootUnknown);
             }
-            LocalInstallBuildRootDisposition::Ready => {}
-        }
-        match lineage_config {
-            LocalInstallCargoConfigDisposition::Present => {
-                blocking_codes.insert(LocalInstallCargoConfigBlockingCode::LineageConfigPresent);
+            LocalInstallBuildRootDisposition::Ready => {
+                match lineage_config {
+                    LocalInstallCargoConfigDisposition::Present => {
+                        blocking_codes
+                            .insert(LocalInstallCargoConfigBlockingCode::LineageConfigPresent);
+                    }
+                    LocalInstallCargoConfigDisposition::Unsafe => {
+                        blocking_codes.insert(LocalInstallCargoConfigBlockingCode::LineageUnsafe);
+                    }
+                    LocalInstallCargoConfigDisposition::Unknown => {
+                        blocking_codes.insert(LocalInstallCargoConfigBlockingCode::LineageUnknown);
+                    }
+                    LocalInstallCargoConfigDisposition::Absent => {}
+                }
+                match cargo_home_config {
+                    LocalInstallCargoHomeConfigDisposition::Missing => {
+                        blocking_codes
+                            .insert(LocalInstallCargoConfigBlockingCode::CargoHomeMissing);
+                        repair_codes
+                            .insert(LocalInstallCargoConfigRepairCode::CreateIsolatedCargoHome);
+                    }
+                    LocalInstallCargoHomeConfigDisposition::Present => {
+                        blocking_codes
+                            .insert(LocalInstallCargoConfigBlockingCode::CargoHomeConfigPresent);
+                    }
+                    LocalInstallCargoHomeConfigDisposition::Unsafe => {
+                        blocking_codes
+                            .insert(LocalInstallCargoConfigBlockingCode::CargoHomeUnsafe);
+                    }
+                    LocalInstallCargoHomeConfigDisposition::Unknown => {
+                        blocking_codes
+                            .insert(LocalInstallCargoConfigBlockingCode::CargoHomeUnknown);
+                    }
+                    LocalInstallCargoHomeConfigDisposition::Absent => {}
+                }
             }
-            LocalInstallCargoConfigDisposition::Unsafe => {
-                blocking_codes.insert(LocalInstallCargoConfigBlockingCode::LineageUnsafe);
-            }
-            LocalInstallCargoConfigDisposition::Unknown => {
-                blocking_codes.insert(LocalInstallCargoConfigBlockingCode::LineageUnknown);
-            }
-            LocalInstallCargoConfigDisposition::Absent => {}
-        }
-        match cargo_home_config {
-            LocalInstallCargoHomeConfigDisposition::Missing => {
-                blocking_codes.insert(LocalInstallCargoConfigBlockingCode::CargoHomeMissing);
-                repair_codes.insert(LocalInstallCargoConfigRepairCode::CreateIsolatedCargoHome);
-            }
-            LocalInstallCargoHomeConfigDisposition::Present => {
-                blocking_codes
-                    .insert(LocalInstallCargoConfigBlockingCode::CargoHomeConfigPresent);
-            }
-            LocalInstallCargoHomeConfigDisposition::Unsafe => {
-                blocking_codes.insert(LocalInstallCargoConfigBlockingCode::CargoHomeUnsafe);
-            }
-            LocalInstallCargoHomeConfigDisposition::Unknown => {
-                blocking_codes.insert(LocalInstallCargoConfigBlockingCode::CargoHomeUnknown);
-            }
-            LocalInstallCargoHomeConfigDisposition::Absent => {}
         }
 
         LocalInstallCargoConfigPreflightReceipt {
@@ -298,11 +309,11 @@ fn snapshot(
         context,
     );
 
-    let lineage = if build_root.is_ready()
+    let layout_is_safe = build_root.is_ready()
         && !work.is_unsafe_or_unknown()
         && !home.is_unsafe_or_unknown()
-        && !target.is_unsafe_or_unknown()
-    {
+        && !target.is_unsafe_or_unknown();
+    let lineage = if layout_is_safe {
         observe_lineage(context, filesystem)
     } else {
         vec![]
@@ -310,11 +321,7 @@ fn snapshot(
     let cargo_home = if build_root.is_ready() {
         observe_cargo_home(context, filesystem)
     } else {
-        CargoHomeObservation {
-            directory: DirectoryObservation::Missing,
-            modern: ConfigObservation::Missing,
-            legacy: ConfigObservation::Missing,
-        }
+        CargoHomeObservation::missing()
     };
 
     PrivateSnapshot {
@@ -331,12 +338,12 @@ fn observe_lineage(
     context: &LocalInstallCargoConfigPreflightContext,
     filesystem: &impl CargoConfigFilesystem,
 ) -> Vec<LineageObservation> {
-    context
-        .working_directory()
+    let working_directory = context.working_directory();
+    working_directory
         .ancestors()
         .map(|ancestor| {
-            let exact_private = ancestor == context.working_directory()
-                || ancestor == context.build_root.as_path();
+            let exact_private =
+                ancestor == working_directory.as_path() || ancestor == context.build_root.as_path();
             let ancestor_state = filesystem.directory(
                 ancestor,
                 if exact_private {
@@ -348,11 +355,7 @@ fn observe_lineage(
             );
             let cargo_path = ancestor.join(CONFIG_DIRECTORY);
             let cargo_directory = if ancestor_state.is_ready() {
-                filesystem.directory(
-                    &cargo_path,
-                    DirectoryExpectation::TrustedAncestor,
-                    context,
-                )
+                filesystem.directory(&cargo_path, DirectoryExpectation::TrustedAncestor, context)
             } else {
                 DirectoryObservation::Missing
             };
@@ -465,14 +468,23 @@ enum DirectoryExpectation {
     TrustedAncestor,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Eq)]
 struct ObjectIdentity {
     device: u64,
     inode: u64,
     uid: u32,
     gid: u32,
     mode: u32,
-    links: u64,
+}
+
+impl PartialEq for ObjectIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        self.device == other.device
+            && self.inode == other.inode
+            && self.uid == other.uid
+            && self.gid == other.gid
+            && self.mode == other.mode
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -526,36 +538,30 @@ struct LineageObservation {
 impl LineageObservation {
     fn unsafe_evidence(&self) -> bool {
         matches!(
-            (self.ancestor, self.cargo_directory, self.modern, self.legacy),
             (
-                DirectoryObservation::Unsafe,
-                _,
-                _,
-                _
-            ) | (
-                _,
-                DirectoryObservation::Unsafe,
-                _,
-                _
-            ) | (_, _, ConfigObservation::Unsafe, _)
+                self.ancestor,
+                self.cargo_directory,
+                self.modern,
+                self.legacy
+            ),
+            (DirectoryObservation::Unsafe, _, _, _)
+                | (_, DirectoryObservation::Unsafe, _, _)
+                | (_, _, ConfigObservation::Unsafe, _)
                 | (_, _, _, ConfigObservation::Unsafe)
         )
     }
 
     fn unknown_evidence(&self) -> bool {
         matches!(
-            (self.ancestor, self.cargo_directory, self.modern, self.legacy),
             (
-                DirectoryObservation::Unknown,
-                _,
-                _,
-                _
-            ) | (
-                _,
-                DirectoryObservation::Unknown,
-                _,
-                _
-            ) | (_, _, ConfigObservation::Unknown, _)
+                self.ancestor,
+                self.cargo_directory,
+                self.modern,
+                self.legacy
+            ),
+            (DirectoryObservation::Unknown, _, _, _)
+                | (_, DirectoryObservation::Unknown, _, _)
+                | (_, _, ConfigObservation::Unknown, _)
                 | (_, _, _, ConfigObservation::Unknown)
         )
     }
@@ -570,6 +576,16 @@ struct CargoHomeObservation {
     directory: DirectoryObservation,
     modern: ConfigObservation,
     legacy: ConfigObservation,
+}
+
+impl CargoHomeObservation {
+    fn missing() -> Self {
+        Self {
+            directory: DirectoryObservation::Missing,
+            modern: ConfigObservation::Missing,
+            legacy: ConfigObservation::Missing,
+        }
+    }
 }
 
 trait CargoConfigFilesystem {
@@ -622,9 +638,13 @@ fn inspect_directory(
         Err(_) => return DirectoryObservation::Unknown,
     };
     if path == Path::new("/") {
-        return inspect_open_directory(&directory, DirectoryExpectation::TrustedAncestor, context);
+        return inspect_open_directory(
+            &directory,
+            DirectoryExpectation::TrustedAncestor,
+            context,
+        );
     }
-    for (index, component) in components.iter().enumerate() {
+    for (index, component) in components.iter().copied().enumerate() {
         let opened = match fs::openat(directory.as_fd(), component, DIRECTORY_FLAGS, Mode::empty()) {
             Ok(opened) => opened,
             Err(Errno::NOENT) => return DirectoryObservation::Missing,
@@ -662,7 +682,7 @@ fn inspect_open_directory(
         return DirectoryObservation::Unsafe;
     }
     let mode = stat.st_mode & 0o7777;
-    let owner_ok = match expectation {
+    let metadata_ok = match expectation {
         DirectoryExpectation::ExactPrivateRunner => {
             stat.st_uid == context.runner_uid
                 && stat.st_gid == context.runner_gid
@@ -672,16 +692,15 @@ fn inspect_open_directory(
             trusted_owner(stat.st_uid, stat.st_gid, context) && mode & 0o022 == 0
         }
     };
-    if !owner_ok {
+    if !metadata_ok {
         return DirectoryObservation::Unsafe;
     }
     DirectoryObservation::Ready(ObjectIdentity {
-        device: stat.st_dev,
-        inode: stat.st_ino,
+        device: u64::from(stat.st_dev),
+        inode: u64::from(stat.st_ino),
         uid: stat.st_uid,
         gid: stat.st_gid,
         mode,
-        links: stat.st_nlink,
     })
 }
 
@@ -704,11 +723,13 @@ fn inspect_config_file(
             Err(Errno::LOOP | Errno::NOTDIR) => return ConfigObservation::Unsafe,
             Err(_) => return ConfigObservation::Unknown,
         };
-        if !inspect_open_directory(&opened, DirectoryExpectation::TrustedAncestor, context).is_ready()
-        {
-            return ConfigObservation::Unsafe;
+        match inspect_open_directory(&opened, DirectoryExpectation::TrustedAncestor, context) {
+            DirectoryObservation::Ready(_) => directory = opened,
+            DirectoryObservation::Unknown => return ConfigObservation::Unknown,
+            DirectoryObservation::Missing | DirectoryObservation::Unsafe => {
+                return ConfigObservation::Unsafe;
+            }
         }
-        directory = opened;
     }
     let file = match fs::openat(directory.as_fd(), file_name, FILE_FLAGS, Mode::empty()) {
         Ok(file) => file,
@@ -728,20 +749,15 @@ fn inspect_config_file(
         return ConfigObservation::Unsafe;
     }
     ConfigObservation::Present(ObjectIdentity {
-        device: stat.st_dev,
-        inode: stat.st_ino,
+        device: u64::from(stat.st_dev),
+        inode: u64::from(stat.st_ino),
         uid: stat.st_uid,
         gid: stat.st_gid,
         mode: stat.st_mode & 0o7777,
-        links: stat.st_nlink,
     })
 }
 
-fn trusted_owner(
-    uid: u32,
-    gid: u32,
-    context: &LocalInstallCargoConfigPreflightContext,
-) -> bool {
+fn trusted_owner(uid: u32, gid: u32, context: &LocalInstallCargoConfigPreflightContext) -> bool {
     (uid == 0 && gid == 0) || (uid == context.runner_uid && gid == context.runner_gid)
 }
 
@@ -778,6 +794,7 @@ fn canonical_private_path(path: PathBuf) -> Result<PathBuf, LocalInstallCargoCon
 #[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
+    use std::collections::BTreeMap;
 
     use serde_json::json;
 
@@ -860,8 +877,7 @@ mod tests {
     }
 
     fn context() -> LocalInstallCargoConfigPreflightContext {
-        LocalInstallCargoConfigPreflightContext::new("/var/lib/smolrunner-build", 501, 20)
-            .unwrap()
+        LocalInstallCargoConfigPreflightContext::new("/var/lib/smolrunner-build", 501, 20).unwrap()
     }
 
     fn identity(seed: u64) -> ObjectIdentity {
@@ -871,7 +887,6 @@ mod tests {
             uid: 501,
             gid: 20,
             mode: PRIVATE_DIRECTORY_MODE,
-            links: 1,
         }
     }
 
@@ -880,7 +895,9 @@ mod tests {
             .as_os_str()
             .as_encoded_bytes()
             .iter()
-            .fold(17_u64, |value, byte| value.wrapping_mul(31) + u64::from(*byte));
+            .fold(17_u64, |value, byte| {
+                value.wrapping_mul(31) + u64::from(*byte)
+            });
         DirectoryObservation::Ready(identity(seed))
     }
 
@@ -923,16 +940,21 @@ mod tests {
     }
 
     #[test]
-    fn missing_build_root_and_cargo_home_are_typed_repairs() {
-        let filesystem = FakeFilesystem::new()
-            .directory("/var/lib/smolrunner-build", DirectoryObservation::Missing)
-            .directory(
-                "/var/lib/smolrunner-build/cargo-home",
-                DirectoryObservation::Missing,
-            );
+    fn missing_build_root_is_one_root_cause_repair() {
+        let filesystem = FakeFilesystem::new().directory(
+            "/var/lib/smolrunner-build",
+            DirectoryObservation::Missing,
+        );
         let receipt = observe_with(&context(), &filesystem);
         assert!(!receipt.ready);
-        assert_eq!(receipt.build_root, LocalInstallBuildRootDisposition::Missing);
+        assert_eq!(
+            receipt.build_root,
+            LocalInstallBuildRootDisposition::Missing
+        );
+        assert_eq!(
+            receipt.blocking_codes,
+            vec![LocalInstallCargoConfigBlockingCode::BuildRootMissing]
+        );
         assert_eq!(
             receipt.repair_codes,
             vec![LocalInstallCargoConfigRepairCode::CreateIsolatedBuildRoot]
@@ -959,9 +981,8 @@ mod tests {
         }
 
         let filesystem = FakeFilesystem::new().file("/.cargo/config.toml", present(45));
-        let receipt = observe_with(&context(), &filesystem);
         assert_eq!(
-            receipt.lineage_config,
+            observe_with(&context(), &filesystem).lineage_config,
             LocalInstallCargoConfigDisposition::Present
         );
     }
@@ -979,10 +1000,19 @@ mod tests {
             receipt.lineage_config,
             LocalInstallCargoConfigDisposition::Unsafe
         );
+
+        let unsafe_file = FakeFilesystem::new().file(
+            "/var/lib/smolrunner-build/work/.cargo/config.toml",
+            ConfigObservation::Unsafe,
+        );
+        assert_eq!(
+            observe_with(&context(), &unsafe_file).lineage_config,
+            LocalInstallCargoConfigDisposition::Unsafe
+        );
     }
 
     #[test]
-    fn cargo_home_missing_present_and_unsafe_are_distinct() {
+    fn cargo_home_missing_present_unsafe_and_unknown_are_distinct() {
         let missing = FakeFilesystem::new().directory(
             "/var/lib/smolrunner-build/cargo-home",
             DirectoryObservation::Missing,
@@ -1014,10 +1044,19 @@ mod tests {
             observe_with(&context(), &unsafe_fs).cargo_home_config,
             LocalInstallCargoHomeConfigDisposition::Unsafe
         );
+
+        let unknown_fs = FakeFilesystem::new().directory(
+            "/var/lib/smolrunner-build/cargo-home",
+            DirectoryObservation::Unknown,
+        );
+        assert_eq!(
+            observe_with(&context(), &unknown_fs).cargo_home_config,
+            LocalInstallCargoHomeConfigDisposition::Unknown
+        );
     }
 
     #[test]
-    fn unsafe_existing_layout_child_blocks_build_root_readiness() {
+    fn unsafe_existing_layout_child_blocks_only_at_build_root_boundary() {
         for child in ["work", "home", "target"] {
             let filesystem = FakeFilesystem::new().directory(
                 &format!("/var/lib/smolrunner-build/{child}"),
@@ -1025,6 +1064,10 @@ mod tests {
             );
             let receipt = observe_with(&context(), &filesystem);
             assert_eq!(receipt.build_root, LocalInstallBuildRootDisposition::Unsafe);
+            assert_eq!(
+                receipt.blocking_codes,
+                vec![LocalInstallCargoConfigBlockingCode::UnsafeBuildRoot]
+            );
             assert!(!receipt.ready);
         }
     }
@@ -1037,8 +1080,16 @@ mod tests {
         let receipt = observe_with(&context(), &filesystem);
         assert!(receipt.ready);
         let queries = filesystem.queries.borrow();
-        assert!(queries.iter().all(|path| !path.starts_with("/secret-source")));
-        assert!(queries.iter().all(|path| !path.starts_with("/home/operator")));
+        assert!(
+            queries
+                .iter()
+                .all(|path| !path.starts_with("/secret-source"))
+        );
+        assert!(
+            queries
+                .iter()
+                .all(|path| !path.starts_with("/home/operator"))
+        );
     }
 
     #[test]
@@ -1050,7 +1101,21 @@ mod tests {
             receipt.blocking_codes,
             vec![LocalInstallCargoConfigBlockingCode::ObservationChanged]
         );
-        assert_eq!(receipt.build_root, LocalInstallBuildRootDisposition::Unknown);
+        assert_eq!(
+            receipt.build_root,
+            LocalInstallBuildRootDisposition::Unknown
+        );
+        let public = serde_json::to_string(&receipt).unwrap();
+        assert!(!public.contains("smolrunner-build"));
+        assert!(!public.contains("99"));
+    }
+
+    #[test]
+    fn stable_observation_is_deterministic() {
+        let filesystem = FakeFilesystem::new();
+        let first = observe_with(&context(), &filesystem);
+        let second = observe_with(&context(), &filesystem);
+        assert_eq!(first, second);
     }
 
     #[test]
