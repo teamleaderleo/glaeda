@@ -467,23 +467,13 @@ enum DirectoryExpectation {
     TrustedAncestor,
 }
 
-#[derive(Debug, Clone, Copy, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ObjectIdentity {
-    device: u64,
-    inode: u64,
+    device: i128,
+    inode: u128,
     uid: u32,
     gid: u32,
-    mode: u32,
-}
-
-impl PartialEq for ObjectIdentity {
-    fn eq(&self, other: &Self) -> bool {
-        self.device == other.device
-            && self.inode == other.inode
-            && self.uid == other.uid
-            && self.gid == other.gid
-            && self.mode == other.mode
-    }
+    mode: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -682,7 +672,7 @@ fn inspect_open_directory(
         DirectoryExpectation::ExactPrivateRunner => {
             stat.st_uid == context.runner_uid
                 && stat.st_gid == context.runner_gid
-                && mode == PRIVATE_DIRECTORY_MODE
+                && u64::from(mode) == u64::from(PRIVATE_DIRECTORY_MODE)
         }
         DirectoryExpectation::TrustedAncestor => {
             trusted_owner(stat.st_uid, stat.st_gid, context) && mode & 0o022 == 0
@@ -692,11 +682,11 @@ fn inspect_open_directory(
         return DirectoryObservation::Unsafe;
     }
     DirectoryObservation::Ready(ObjectIdentity {
-        device: u64::from(stat.st_dev),
-        inode: u64::from(stat.st_ino),
+        device: i128::from(stat.st_dev),
+        inode: u128::from(stat.st_ino),
         uid: stat.st_uid,
         gid: stat.st_gid,
-        mode,
+        mode: u64::from(mode),
     })
 }
 
@@ -738,19 +728,20 @@ fn inspect_config_file(
         Ok(stat) => stat,
         Err(_) => return ConfigObservation::Unknown,
     };
+    let mode = stat.st_mode & 0o7777;
     if !FileType::from_raw_mode(stat.st_mode).is_file()
         || stat.st_nlink != 1
         || !trusted_owner(stat.st_uid, stat.st_gid, context)
-        || stat.st_mode & 0o022 != 0
+        || mode & 0o022 != 0
     {
         return ConfigObservation::Unsafe;
     }
     ConfigObservation::Present(ObjectIdentity {
-        device: u64::from(stat.st_dev),
-        inode: u64::from(stat.st_ino),
+        device: i128::from(stat.st_dev),
+        inode: u128::from(stat.st_ino),
         uid: stat.st_uid,
         gid: stat.st_gid,
-        mode: stat.st_mode & 0o7777,
+        mode: u64::from(mode),
     })
 }
 
@@ -880,10 +871,10 @@ mod tests {
     fn identity(seed: u64) -> ObjectIdentity {
         ObjectIdentity {
             device: 1,
-            inode: seed,
+            inode: u128::from(seed),
             uid: 501,
             gid: 20,
-            mode: PRIVATE_DIRECTORY_MODE,
+            mode: u64::from(PRIVATE_DIRECTORY_MODE),
         }
     }
 
