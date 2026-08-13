@@ -810,3 +810,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(unix)]
+pub mod directory_preflight;
