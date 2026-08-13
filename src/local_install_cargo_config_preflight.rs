@@ -168,9 +168,10 @@ impl std::error::Error for LocalInstallCargoConfigPreflightError {}
 /// Prove the isolated self-build Cargo lookup path from direct filesystem evidence.
 ///
 /// The observation runs twice. Private directory/file identities participate in snapshot equality,
-/// but never enter the public receipt. Any difference becomes one bounded `observation_changed`
-/// refusal. No source-checkout or personal-home Cargo path is inspected unless it is literally an
-/// ancestor of the selected isolated build root.
+/// including change-time evidence for same-inode entry churn, but never enter the public receipt.
+/// Any difference becomes one bounded `observation_changed` refusal. No source-checkout or
+/// personal-home Cargo path is inspected unless it is literally an ancestor of the selected
+/// isolated build root.
 #[must_use]
 pub fn observe_local_install_cargo_config_preflight(
     context: &LocalInstallCargoConfigPreflightContext,
@@ -474,6 +475,8 @@ struct ObjectIdentity {
     uid: u32,
     gid: u32,
     mode: u64,
+    change_seconds: i128,
+    change_nanoseconds: i128,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -687,6 +690,8 @@ fn inspect_open_directory(
         uid: stat.st_uid,
         gid: stat.st_gid,
         mode: u64::from(mode),
+        change_seconds: i128::from(stat.st_ctime),
+        change_nanoseconds: i128::from(stat.st_ctime_nsec),
     })
 }
 
@@ -742,6 +747,8 @@ fn inspect_config_file(
         uid: stat.st_uid,
         gid: stat.st_gid,
         mode: u64::from(mode),
+        change_seconds: i128::from(stat.st_ctime),
+        change_nanoseconds: i128::from(stat.st_ctime_nsec),
     })
 }
 
@@ -875,6 +882,8 @@ mod tests {
             uid: 501,
             gid: 20,
             mode: u64::from(PRIVATE_DIRECTORY_MODE),
+            change_seconds: i128::from(seed),
+            change_nanoseconds: 0,
         }
     }
 
