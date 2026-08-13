@@ -229,12 +229,16 @@ workspace_tree_json() {
   "${cmux_cli}" tree --workspace "${workspace_id}" --json --id-format both
 }
 
+surface_ids() {
+  local cmux_cli="$1"
+  local workspace_id="$2"
+  workspace_tree_json "${cmux_cli}" "${workspace_id}" | surface_id_from_json
+}
+
 first_surface_id() {
   local cmux_cli="$1"
   local workspace_id="$2"
-  workspace_tree_json "${cmux_cli}" "${workspace_id}" \
-    | surface_id_from_json \
-    | sed -n '1p'
+  surface_ids "${cmux_cli}" "${workspace_id}" | sed -n '1p'
 }
 
 named_surface_id() {
@@ -245,17 +249,18 @@ named_surface_id() {
     | surface_id_from_json "${title}"
 }
 
-second_surface_id() {
+new_surface_id_since() {
   local cmux_cli="$1"
   local workspace_id="$2"
-  local host_surface="$3"
+  local before="$3"
   local surface
+
   while IFS= read -r surface; do
-    if [ -n "${surface}" ] && [ "${surface}" != "${host_surface}" ]; then
+    if [ -n "${surface}" ] && ! printf '%s\n' "${before}" | grep -Fqx -- "${surface}"; then
       printf '%s\n' "${surface}"
       return 0
     fi
-  done < <(workspace_tree_json "${cmux_cli}" "${workspace_id}" | surface_id_from_json)
+  done < <(surface_ids "${cmux_cli}" "${workspace_id}")
   return 1
 }
 
@@ -267,28 +272,36 @@ shell_quote() {
 ensure_standard_surfaces() {
   local cmux_cli="$1"
   local workspace_id="$2"
-  local host_surface vm_surface vm_command
+  local workspace_created="${3:-0}"
+  local host_surface vm_surface vm_command before_surfaces anchor_surface host_command
 
   host_surface="$(named_surface_id "${cmux_cli}" "${workspace_id}" 'Mac host' 2>/dev/null || true)"
   if [ -z "${host_surface}" ]; then
-    host_surface="$(first_surface_id "${cmux_cli}" "${workspace_id}")"
-    [ -n "${host_surface}" ] || die 'cmux workspace has no terminal surface'
+    if [ "${workspace_created}" = 1 ]; then
+      host_surface="$(first_surface_id "${cmux_cli}" "${workspace_id}")"
+      [ -n "${host_surface}" ] || die 'cmux workspace has no terminal surface'
+    else
+      before_surfaces="$(surface_ids "${cmux_cli}" "${workspace_id}")"
+      anchor_surface="$(printf '%s\n' "${before_surfaces}" | sed -n '1p')"
+      [ -n "${anchor_surface}" ] || die 'existing cmux workspace has no terminal surface'
+      "${cmux_cli}" new-split right --workspace "${workspace_id}" --surface "${anchor_surface}" >/dev/null
+      host_surface="$(new_surface_id_since "${cmux_cli}" "${workspace_id}" "${before_surfaces}")"
+      [ -n "${host_surface}" ] || die 'cmux did not expose the new Mac host surface'
+      host_command="cd -- $(shell_quote "${repo_root}")"
+      "${cmux_cli}" send --surface "${host_surface}" "${host_command}\n" >/dev/null
+    fi
     "${cmux_cli}" rename-tab --surface "${host_surface}" -- 'Mac host' >/dev/null
   fi
 
   vm_surface="$(named_surface_id "${cmux_cli}" "${workspace_id}" 'Lima VM' 2>/dev/null || true)"
   if [ -z "${vm_surface}" ]; then
-    vm_surface="$(second_surface_id "${cmux_cli}" "${workspace_id}" "${host_surface}" 2>/dev/null || true)"
-  fi
-  if [ -z "${vm_surface}" ]; then
+    before_surfaces="$(surface_ids "${cmux_cli}" "${workspace_id}")"
     "${cmux_cli}" new-split right --workspace "${workspace_id}" --surface "${host_surface}" >/dev/null
-    vm_surface="$(second_surface_id "${cmux_cli}" "${workspace_id}" "${host_surface}")"
+    vm_surface="$(new_surface_id_since "${cmux_cli}" "${workspace_id}" "${before_surfaces}")"
     [ -n "${vm_surface}" ] || die 'cmux did not expose the new Lima surface'
     "${cmux_cli}" rename-tab --surface "${vm_surface}" -- 'Lima VM' >/dev/null
     vm_command="exec /bin/bash $(shell_quote "${vm_helper}") shell"
     "${cmux_cli}" send --surface "${vm_surface}" "${vm_command}\n" >/dev/null
-  elif ! named_surface_id "${cmux_cli}" "${workspace_id}" 'Lima VM' >/dev/null 2>&1; then
-    "${cmux_cli}" rename-tab --surface "${vm_surface}" -- 'Lima VM' >/dev/null
   fi
 }
 
@@ -386,7 +399,7 @@ sync_cmux() {
 
 launch_cmux() {
   local cmux_cli="$1"
-  local workspace_id
+  local workspace_id workspace_created=0
 
   ensure_lima
   bash "${vm_helper}" up
@@ -397,11 +410,12 @@ launch_cmux() {
     "${cmux_cli}" new-workspace --name "${session}" --cwd "${repo_root}" >/dev/null
     workspace_id="$(current_workspace_id "${cmux_cli}")"
     [ -n "${workspace_id}" ] || die 'cmux did not report the newly created workspace'
+    workspace_created=1
     "${cmux_cli}" log --workspace "${workspace_id}" --level info -- "Mac checkout: ${repo_root}" >/dev/null
     "${cmux_cli}" log --workspace "${workspace_id}" --level info -- 'Pull requests: https://github.com/teamleaderleo/smolrunner/pulls' >/dev/null
   fi
 
-  ensure_standard_surfaces "${cmux_cli}" "${workspace_id}"
+  ensure_standard_surfaces "${cmux_cli}" "${workspace_id}" "${workspace_created}"
   sync_cmux_status_for_workspace "${cmux_cli}" "${workspace_id}"
   "${cmux_cli}" select-workspace --workspace "${workspace_id}" >/dev/null
   command -v open >/dev/null 2>&1 && open -a cmux >/dev/null 2>&1 || true
