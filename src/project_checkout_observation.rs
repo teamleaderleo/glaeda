@@ -134,6 +134,16 @@ impl ProjectCheckoutObservation {
     }
 
     #[must_use]
+    pub const fn commit(&self) -> &CommitId {
+        &self.commit
+    }
+
+    #[must_use]
+    pub const fn tree(&self) -> &GitTreeId {
+        &self.tree
+    }
+
+    #[must_use]
     pub const fn branch(&self) -> &ProjectBranchState {
         &self.branch
     }
@@ -918,6 +928,8 @@ mod tests {
             observation.primary_project().expect("project").as_str(),
             "github.com/teamleaderleo/smolrunner"
         );
+        assert_eq!(observation.commit().as_str(), COMMIT);
+        assert_eq!(observation.tree().as_str(), TREE);
         assert!(!observation.source_ambiguous());
         assert!(!observation.tracked_changes_present());
         assert_eq!(observation.local_commits_ahead(), Some(0));
