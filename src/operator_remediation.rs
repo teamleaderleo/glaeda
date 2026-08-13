@@ -55,6 +55,7 @@ pub enum RemediationOwnership {
 ///
 /// The proposal contains no command vector, credential, executor handle, or mutation authority.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
 pub struct OperatorRemediationCandidate {
     pub schema_version: u8,
     pub source_error: OperatorErrorCode,
