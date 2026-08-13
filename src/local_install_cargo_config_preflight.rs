@@ -248,8 +248,7 @@ impl PrivateSnapshot {
                             .insert(LocalInstallCargoConfigBlockingCode::CargoHomeConfigPresent);
                     }
                     LocalInstallCargoHomeConfigDisposition::Unsafe => {
-                        blocking_codes
-                            .insert(LocalInstallCargoConfigBlockingCode::CargoHomeUnsafe);
+                        blocking_codes.insert(LocalInstallCargoConfigBlockingCode::CargoHomeUnsafe);
                     }
                     LocalInstallCargoHomeConfigDisposition::Unknown => {
                         blocking_codes
@@ -638,14 +637,11 @@ fn inspect_directory(
         Err(_) => return DirectoryObservation::Unknown,
     };
     if path == Path::new("/") {
-        return inspect_open_directory(
-            &directory,
-            DirectoryExpectation::TrustedAncestor,
-            context,
-        );
+        return inspect_open_directory(&directory, DirectoryExpectation::TrustedAncestor, context);
     }
     for (index, component) in components.iter().copied().enumerate() {
-        let opened = match fs::openat(directory.as_fd(), component, DIRECTORY_FLAGS, Mode::empty()) {
+        let opened = match fs::openat(directory.as_fd(), component, DIRECTORY_FLAGS, Mode::empty())
+        {
             Ok(opened) => opened,
             Err(Errno::NOENT) => return DirectoryObservation::Missing,
             Err(Errno::LOOP | Errno::NOTDIR) => return DirectoryObservation::Unsafe,
@@ -717,7 +713,8 @@ fn inspect_config_file(
         Err(_) => return ConfigObservation::Unknown,
     };
     for component in parents {
-        let opened = match fs::openat(directory.as_fd(), component, DIRECTORY_FLAGS, Mode::empty()) {
+        let opened = match fs::openat(directory.as_fd(), component, DIRECTORY_FLAGS, Mode::empty())
+        {
             Ok(opened) => opened,
             Err(Errno::NOENT) => return ConfigObservation::Missing,
             Err(Errno::LOOP | Errno::NOTDIR) => return ConfigObservation::Unsafe,
@@ -941,10 +938,8 @@ mod tests {
 
     #[test]
     fn missing_build_root_is_one_root_cause_repair() {
-        let filesystem = FakeFilesystem::new().directory(
-            "/var/lib/smolrunner-build",
-            DirectoryObservation::Missing,
-        );
+        let filesystem = FakeFilesystem::new()
+            .directory("/var/lib/smolrunner-build", DirectoryObservation::Missing);
         let receipt = observe_with(&context(), &filesystem);
         assert!(!receipt.ready);
         assert_eq!(
