@@ -133,18 +133,55 @@ pub enum LocalInstallCargoConfigRepairCode {
 
 /// Path-private proof for one exact isolated Cargo lookup observation.
 ///
-/// The type is non-exhaustive so external crates may inspect and serialize evidence but cannot
-/// fabricate a readiness receipt with a struct literal.
+/// External crates may inspect and serialize the evidence through read-only accessors but cannot
+/// construct or mutate the proof fields directly.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LocalInstallCargoConfigPreflightReceipt {
-    pub schema_version: u8,
-    pub build_root: LocalInstallBuildRootDisposition,
-    pub lineage_config: LocalInstallCargoConfigDisposition,
-    pub cargo_home_config: LocalInstallCargoHomeConfigDisposition,
-    pub ready: bool,
-    pub blocking_codes: Vec<LocalInstallCargoConfigBlockingCode>,
-    pub repair_codes: Vec<LocalInstallCargoConfigRepairCode>,
+    schema_version: u8,
+    build_root: LocalInstallBuildRootDisposition,
+    lineage_config: LocalInstallCargoConfigDisposition,
+    cargo_home_config: LocalInstallCargoHomeConfigDisposition,
+    ready: bool,
+    blocking_codes: Vec<LocalInstallCargoConfigBlockingCode>,
+    repair_codes: Vec<LocalInstallCargoConfigRepairCode>,
+}
+
+impl LocalInstallCargoConfigPreflightReceipt {
+    #[must_use]
+    pub const fn schema_version(&self) -> u8 {
+        self.schema_version
+    }
+
+    #[must_use]
+    pub const fn build_root(&self) -> LocalInstallBuildRootDisposition {
+        self.build_root
+    }
+
+    #[must_use]
+    pub const fn lineage_config(&self) -> LocalInstallCargoConfigDisposition {
+        self.lineage_config
+    }
+
+    #[must_use]
+    pub const fn cargo_home_config(&self) -> LocalInstallCargoHomeConfigDisposition {
+        self.cargo_home_config
+    }
+
+    #[must_use]
+    pub const fn ready(&self) -> bool {
+        self.ready
+    }
+
+    #[must_use]
+    pub fn blocking_codes(&self) -> &[LocalInstallCargoConfigBlockingCode] {
+        &self.blocking_codes
+    }
+
+    #[must_use]
+    pub fn repair_codes(&self) -> &[LocalInstallCargoConfigRepairCode] {
+        &self.repair_codes
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -906,18 +943,25 @@ mod tests {
     fn empty_private_layout_is_ready_and_path_private() {
         let filesystem = FakeFilesystem::new();
         let receipt = observe_with(&context(), &filesystem);
-        assert!(receipt.ready);
-        assert_eq!(receipt.build_root, LocalInstallBuildRootDisposition::Ready);
+        assert!(receipt.ready());
         assert_eq!(
-            receipt.lineage_config,
+            receipt.build_root(),
+            LocalInstallBuildRootDisposition::Ready
+        );
+        assert_eq!(
+            receipt.lineage_config(),
             LocalInstallCargoConfigDisposition::Absent
         );
         assert_eq!(
-            receipt.cargo_home_config,
+            receipt.cargo_home_config(),
             LocalInstallCargoHomeConfigDisposition::Absent
         );
-        assert!(receipt.blocking_codes.is_empty());
-        assert!(receipt.repair_codes.is_empty());
+        assert!(receipt.blocking_codes().is_empty());
+        assert!(receipt.repair_codes().is_empty());
+        assert_eq!(
+            receipt.schema_version(),
+            LOCAL_INSTALL_CARGO_CONFIG_PREFLIGHT_SCHEMA_VERSION
+        );
 
         let public = serde_json::to_string(&receipt).unwrap();
         assert!(!public.contains("/var/lib"));
