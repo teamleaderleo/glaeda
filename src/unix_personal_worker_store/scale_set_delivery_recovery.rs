@@ -1,3 +1,6 @@
+// This store lands one slice before #429 wires its production caller.
+#![allow(dead_code)]
+
 use super::*;
 
 use crate::github_scale_set_delivery_state::{
@@ -264,7 +267,7 @@ fn exact_recovery_successor(
     current: &ScaleSetDeliveryRecoveryState,
     candidate: &ScaleSetDeliveryRecoveryState,
 ) -> bool {
-    if candidate.revision() != current.revision().checked_add(1).unwrap_or(u64::MAX)
+    if candidate.revision() != current.revision().saturating_add(1)
         || candidate.catalog_revision() != current.catalog_revision()
         || candidate.delivery() != current.delivery()
     {
