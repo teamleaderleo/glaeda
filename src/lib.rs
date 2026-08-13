@@ -56,6 +56,12 @@ pub mod host;
 #[cfg(target_os = "linux")]
 pub mod host_package_plan;
 #[cfg(target_os = "linux")]
+pub mod debian_package_plan;
+#[cfg(target_os = "linux")]
+pub mod debian_package_probe;
+#[cfg(target_os = "linux")]
+pub mod debian_package_recovery;
+#[cfg(target_os = "linux")]
 pub mod host_preparation_command;
 #[cfg(target_os = "linux")]
 pub mod host_preparation_execution;
@@ -143,6 +149,8 @@ pub mod linux_state;
 pub mod linux_state_prepare;
 #[cfg(target_os = "linux")]
 pub mod linux_state_recovery;
+/// Read-only, path-private proof that the isolated self-build Cargo lookup path is config-free.
+pub mod local_install_cargo_config_preflight;
 /// Pure fixed offline Cargo command policy for exact local self-builds.
 pub mod local_install_build_command;
 /// Pure exact-source local binary generation and stable launcher planning.
