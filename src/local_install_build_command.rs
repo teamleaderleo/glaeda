@@ -283,7 +283,10 @@ pub fn plan_local_install_build_command(
         .argument(jobs.to_string())
         .secret_environment("HOME", private_utf8(&context.isolated_home()))
         .secret_environment("CARGO_HOME", private_utf8(&context.cargo_home()))
-        .secret_environment("CARGO_TARGET_DIR", private_utf8(&context.target_directory()))
+        .secret_environment(
+            "CARGO_TARGET_DIR",
+            private_utf8(&context.target_directory()),
+        )
         .secret_environment("RUSTC", private_utf8(&context.rustc_program))
         .secret_environment("RUSTDOC", private_utf8(&context.rustdoc_program))
         .environment("PATH", system_path)
