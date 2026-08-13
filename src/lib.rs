@@ -156,6 +156,8 @@ pub mod operator_config;
 pub mod operator_config_store;
 /// Closed public operator error, retry, remediation, dependency, approval, and command vocabulary.
 pub mod operator_error;
+/// Pure non-authorizing remediation applicability, safety, and confidence vocabulary.
+pub mod operator_remediation;
 /// Pure unified personal-worker operator status report and human renderer.
 pub mod operator_status;
 /// Typed, read-only aggregation of one coherent operator status evidence bundle.
