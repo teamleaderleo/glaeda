@@ -12,6 +12,9 @@ use crate::local_install_plan::{
 };
 use crate::process::CommandSpec;
 
+#[cfg(unix)]
+pub mod toolchain_preflight;
+
 pub const LOCAL_INSTALL_BUILD_COMMAND_SCHEMA_VERSION: u8 = 3;
 pub const LOCAL_INSTALL_BUILD_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 pub const MAX_LOCAL_INSTALL_BUILD_JOBS: u8 = 4;
