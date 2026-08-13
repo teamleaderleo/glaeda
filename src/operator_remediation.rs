@@ -354,8 +354,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        OPERATOR_REMEDIATION_SCHEMA_VERSION, OperatorRemediationCandidate, RemediationApplicability,
-        RemediationConfidence, RemediationOwnership, RemediationSafety,
+        OPERATOR_REMEDIATION_SCHEMA_VERSION, OperatorRemediationCandidate,
+        RemediationApplicability, RemediationConfidence, RemediationOwnership, RemediationSafety,
     };
     use crate::journal::RollbackClass;
     use crate::operator_error::OperatorErrorCode;
