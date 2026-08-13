@@ -72,10 +72,7 @@ impl UnixPersonalWorkerStore {
         state: &ScaleSetDeliveryRecoveryState,
     ) -> Result<ScaleSetDeliveryRecoveryState, PersonalWorkerStoreError> {
         if state.revision() != 1
-            || !matches!(
-                state.phase(),
-                ScaleSetDeliveryRecoveryPhase::Reconciled
-            )
+            || !matches!(state.phase(), ScaleSetDeliveryRecoveryPhase::Reconciled)
         {
             return Err(store_error(
                 PersonalWorkerStoreErrorKind::RevisionConflict,
@@ -130,9 +127,7 @@ impl UnixPersonalWorkerStore {
         Ok(successor.clone())
     }
 
-    fn refuse_other_unsettled_scale_set_state(
-        &self,
-    ) -> Result<(), PersonalWorkerStoreError> {
+    fn refuse_other_unsettled_scale_set_state(&self) -> Result<(), PersonalWorkerStoreError> {
         match self.recovery_plan()? {
             StoreRecoveryPlan::Clean { .. } => {}
             StoreRecoveryPlan::PublishStaged { .. }
@@ -173,12 +168,8 @@ impl UnixPersonalWorkerStore {
         };
         let current = self.load_scale_set_delivery_named(DELIVERY_RECOVERY_DOCUMENT)?;
         match current {
-            None
-                if staged.revision() == 1
-                    && matches!(
-                        staged.phase(),
-                        ScaleSetDeliveryRecoveryPhase::Reconciled
-                    ) =>
+            None if staged.revision() == 1
+                && matches!(staged.phase(), ScaleSetDeliveryRecoveryPhase::Reconciled) =>
             {
                 Ok(RecoveryPlan::PublishStaged { no_replace: true })
             }
@@ -258,9 +249,7 @@ impl UnixPersonalWorkerStore {
                 STAGED_DELIVERY_RECOVERY_DOCUMENT,
                 AtFlags::empty(),
             ) {
-                Ok(()) => {
-                    synchronize_directory(&self.directory, "personal worker store directory")
-                }
+                Ok(()) => synchronize_directory(&self.directory, "personal worker store directory"),
                 Err(Errno::NOENT) => Ok(()),
                 Err(_) => Err(store_error(
                     PersonalWorkerStoreErrorKind::Io,
@@ -613,10 +602,7 @@ mod tests {
                 .unwrap();
         let _guard = store.acquire_mutation_lock().unwrap();
         assert_eq!(
-            store
-                .load_scale_set_delivery_recovery()
-                .unwrap_err()
-                .kind(),
+            store.load_scale_set_delivery_recovery().unwrap_err().kind(),
             PersonalWorkerStoreErrorKind::Busy
         );
     }
@@ -639,7 +625,12 @@ mod tests {
                 .kind(),
             PersonalWorkerStoreErrorKind::UnsafeFilesystem
         );
-        assert!(fs::symlink_metadata(staged).unwrap().file_type().is_symlink());
+        assert!(
+            fs::symlink_metadata(staged)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 
     #[test]
@@ -654,10 +645,7 @@ mod tests {
         fs::hard_link(&current, root.store_directory().join("current-alias")).unwrap();
 
         assert_eq!(
-            store
-                .load_scale_set_delivery_recovery()
-                .unwrap_err()
-                .kind(),
+            store.load_scale_set_delivery_recovery().unwrap_err().kind(),
             PersonalWorkerStoreErrorKind::UnsafeFilesystem
         );
     }
@@ -674,10 +662,7 @@ mod tests {
         fs::set_permissions(&current, fs::Permissions::from_mode(0o644)).unwrap();
 
         assert_eq!(
-            store
-                .load_scale_set_delivery_recovery()
-                .unwrap_err()
-                .kind(),
+            store.load_scale_set_delivery_recovery().unwrap_err().kind(),
             PersonalWorkerStoreErrorKind::UnsafeFilesystem
         );
     }
