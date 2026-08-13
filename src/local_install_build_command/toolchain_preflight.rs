@@ -722,9 +722,10 @@ mod tests {
         assert!(receipt.blocking_codes().is_empty());
         let commands = executor.commands.borrow();
         assert_eq!(commands.len(), 3);
-        for (command, expected_program) in commands
-            .iter()
-            .zip([&fixture.cargo, &fixture.rustc, &fixture.rustdoc])
+        for (command, expected_program) in
+            commands
+                .iter()
+                .zip([&fixture.cargo, &fixture.rustc, &fixture.rustdoc])
         {
             assert_eq!(&command.program, expected_program);
             assert_eq!(command.displayed_argv().len(), 2);
