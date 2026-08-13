@@ -149,6 +149,9 @@ pub mod local_install_build_command;
 pub mod local_install_cargo_config_preflight;
 /// Pure exact-source local binary generation and stable launcher planning.
 pub mod local_install_plan;
+/// Read-only exact checkout and Cargo.lock proof for local self-builds.
+#[cfg(unix)]
+pub mod local_install_source_preflight;
 pub mod mac_availability;
 pub mod macos_resource_observation;
 pub mod manifest;
