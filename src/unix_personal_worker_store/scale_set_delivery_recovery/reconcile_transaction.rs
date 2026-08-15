@@ -128,10 +128,7 @@ impl UnixPersonalWorkerStore {
                 .stage_catalog(catalog_successor)
                 .map_err(map_catalog_error)?;
             // Persist both stage names before publishing either current document.
-            synchronize_directory(
-                &self.directory,
-                "paired Scale Set reconciliation stages",
-            )?;
+            synchronize_directory(&self.directory, "paired Scale Set reconciliation stages")?;
             self.publish_named_staged(&mut staged_catalog, CATALOG_DOCUMENT, false)?;
         }
         self.publish_named_staged(&mut staged_delivery, DELIVERY_RECOVERY_DOCUMENT, true)?;
