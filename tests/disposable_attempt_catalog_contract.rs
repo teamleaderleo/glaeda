@@ -934,12 +934,24 @@ fn exact_job_ids_cannot_be_reused_across_concurrent_attempts() {
         DisposableAttemptCatalogAction::RecordCloneStarted,
     );
     let one_started = bind_vm_fixture(&mut catalog, &one_started, 1, 1);
-    let one_terminal = transition(
+    let one_registering = transition(
         &mut catalog,
         &one_started,
         1,
+        DisposableAttemptCatalogAction::BeginRegistration,
+    );
+    let one_assigned = transition(
+        &mut catalog,
+        &one_registering,
+        1,
+        DisposableAttemptCatalogAction::RecordAssigned(shared_job.clone()),
+    );
+    let one_terminal = transition(
+        &mut catalog,
+        &one_assigned,
+        1,
         DisposableAttemptCatalogAction::RecordTerminal {
-            runner: Some(runner(1, 11)),
+            runner: None,
             job_id: shared_job.clone(),
             result: ScaleSetJobResult::parse("canceled").unwrap(),
         },
@@ -951,21 +963,23 @@ fn exact_job_ids_cannot_be_reused_across_concurrent_attempts() {
         DisposableAttemptCatalogAction::RecordCloneStarted,
     );
     let two_started = bind_vm_fixture(&mut catalog, &two_started, 2, 2);
+    let two_registering = transition(
+        &mut catalog,
+        &two_started,
+        2,
+        DisposableAttemptCatalogAction::BeginRegistration,
+    );
     let attempt_id = DisposableAttemptId::parse("attempt-2").unwrap();
     let duplicate_job_id = catalog
         .transition(
-            two_started.revision(),
+            two_registering.revision(),
             &attempt_id,
-            two_started
+            two_registering
                 .find_active(&attempt_id)
                 .unwrap()
                 .attempt()
                 .revision(),
-            DisposableAttemptCatalogAction::RecordTerminal {
-                runner: Some(runner(2, 22)),
-                job_id: shared_job,
-                result: ScaleSetJobResult::parse("canceled").unwrap(),
-            },
+            DisposableAttemptCatalogAction::RecordAssigned(shared_job),
         )
         .unwrap_err();
     assert_eq!(

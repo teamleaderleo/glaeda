@@ -467,9 +467,22 @@ fn saturated_tombstone_history_retains_a_safe_revision_lower_bound() {
             &mut catalog,
             &document,
             index,
+            DisposableAttemptCatalogAction::BeginRegistration,
+        );
+        let job_id = ScaleSetJobId::parse(&format!("completed-job-{index}")).unwrap();
+        document = transition(
+            &mut catalog,
+            &document,
+            index,
+            DisposableAttemptCatalogAction::RecordAssigned(job_id.clone()),
+        );
+        document = transition(
+            &mut catalog,
+            &document,
+            index,
             DisposableAttemptCatalogAction::RecordTerminal {
-                runner: Some(runner(index, 1_000 + u64::try_from(index).unwrap())),
-                job_id: ScaleSetJobId::parse(&format!("completed-job-{index}")).unwrap(),
+                runner: None,
+                job_id,
                 result: ScaleSetJobResult::parse("canceled").unwrap(),
             },
         );
