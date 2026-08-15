@@ -1,7 +1,8 @@
 use smolrunner::disposable_attempt_catalog::{
-    DisposableAttemptCatalog, DisposableAttemptCatalogAction,
-    DisposableAttemptCatalogCodecErrorKind, DisposableAttemptCatalogDocument,
-    DisposableAttemptCatalogError, DisposableAttemptCatalogRevision, DisposableAttemptCatalogStore,
+    DISPOSABLE_ATTEMPT_CATALOG_SCHEMA_VERSION, DisposableAttemptCatalog,
+    DisposableAttemptCatalogAction, DisposableAttemptCatalogCodecErrorKind,
+    DisposableAttemptCatalogDocument, DisposableAttemptCatalogError,
+    DisposableAttemptCatalogRevision, DisposableAttemptCatalogStore,
     DisposableAttemptCatalogWriteDisposition, DisposableAttemptCatalogWriteReceipt,
     DisposableAttemptReservation, MAX_DISPOSABLE_ATTEMPT_CATALOG_DOCUMENT_BYTES,
     MAX_DISPOSABLE_ATTEMPT_TOMBSTONES, MemoryDisposableAttemptCatalogStore,
@@ -20,7 +21,8 @@ use smolrunner::disposable_worker_reconciler::{
 };
 use smolrunner::execution_admission::EpochMillis;
 use smolrunner::github_scale_set_protocol::{
-    ScaleSetJobId, ScaleSetJobResult, ScaleSetRunnerId, ScaleSetRunnerName, ScaleSetRunnerReference,
+    ScaleSetJobId, ScaleSetJobResult, ScaleSetRunnerId, ScaleSetRunnerName,
+    ScaleSetRunnerReference, ScaleSetRunnerRequestId,
 };
 
 fn attempt(index: usize) -> DisposableAttemptState {
@@ -29,6 +31,7 @@ fn attempt(index: usize) -> DisposableAttemptState {
         CapacityClaimId::parse(&format!("claim-{index}")).unwrap(),
         DisposableVmId::parse(&format!("vm-{index}")).unwrap(),
         ScaleSetRunnerName::parse(&format!("smol-attempt-{index}")).unwrap(),
+        ScaleSetRunnerRequestId::new(1_000 + u64::try_from(index).unwrap()).unwrap(),
         EpochMillis::new(200_000 + u64::try_from(index).unwrap()).unwrap(),
     )
 }
@@ -522,7 +525,15 @@ fn top_level_future_schema_and_unknown_fields_fail_closed() {
         DisposableAttemptCatalogCodecErrorKind::VersionIncompatible
     );
 
-    value["schema_version"] = serde_json::json!(6);
+    previous_catalog["schema_version"] = serde_json::json!(5);
+    assert_eq!(
+        decode_disposable_attempt_catalog(&serde_json::to_vec(&previous_catalog).unwrap())
+            .unwrap_err()
+            .kind(),
+        DisposableAttemptCatalogCodecErrorKind::VersionIncompatible
+    );
+
+    value["schema_version"] = serde_json::json!(DISPOSABLE_ATTEMPT_CATALOG_SCHEMA_VERSION + 1);
     let future = serde_json::to_vec(&value).unwrap();
     assert_eq!(
         decode_disposable_attempt_catalog(&future)
@@ -531,7 +542,7 @@ fn top_level_future_schema_and_unknown_fields_fail_closed() {
         DisposableAttemptCatalogCodecErrorKind::VersionIncompatible
     );
 
-    value["schema_version"] = serde_json::json!(5);
+    value["schema_version"] = serde_json::json!(DISPOSABLE_ATTEMPT_CATALOG_SCHEMA_VERSION);
     value["unexpected"] = serde_json::json!(true);
     let unknown = serde_json::to_vec(&value).unwrap();
     assert_eq!(
@@ -589,6 +600,29 @@ fn global_identity_collisions_are_revalidated_after_decode() {
     value["active"][1]["attempt"]["runner_name"] = first_name;
     let collision = serde_json::to_vec(&value).unwrap();
 
+    assert_eq!(
+        decode_disposable_attempt_catalog(&collision)
+            .unwrap_err()
+            .kind(),
+        DisposableAttemptCatalogCodecErrorKind::CorruptState
+    );
+
+    let mut value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+    let first_request = value["active"][0]["attempt"]["runner_request_id"].clone();
+    value["active"][1]["attempt"]["runner_request_id"] = first_request;
+    let collision = serde_json::to_vec(&value).unwrap();
+    assert_eq!(
+        decode_disposable_attempt_catalog(&collision)
+            .unwrap_err()
+            .kind(),
+        DisposableAttemptCatalogCodecErrorKind::CorruptState
+    );
+
+    let encoded = encode_disposable_attempt_catalog(&populated_catalog()).unwrap();
+    let mut value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+    let completed_request = value["tombstones"][0]["runner_request_id"].clone();
+    value["active"][0]["attempt"]["runner_request_id"] = completed_request;
+    let collision = serde_json::to_vec(&value).unwrap();
     assert_eq!(
         decode_disposable_attempt_catalog(&collision)
             .unwrap_err()

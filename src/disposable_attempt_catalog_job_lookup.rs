@@ -2,9 +2,35 @@ use crate::disposable_attempt_catalog::{
     DisposableAttemptCatalogDocument, DisposableAttemptReservation,
 };
 use crate::disposable_attempt_state::DisposableAttemptState;
-use crate::github_scale_set_protocol::ScaleSetJobId;
+use crate::github_scale_set_protocol::{ScaleSetJobId, ScaleSetRunnerRequestId};
 
 impl DisposableAttemptCatalogDocument {
+    /// Find the one active attempt that owns this exact pre-assignment runner request.
+    ///
+    /// Catalog validation enforces request-ID uniqueness across active attempts and replay
+    /// tombstones, so service events never need to infer ownership from event order or a mutable
+    /// runner name.
+    #[must_use]
+    pub fn find_active_by_runner_request_id(
+        &self,
+        request_id: ScaleSetRunnerRequestId,
+    ) -> Option<&DisposableAttemptReservation> {
+        self.active()
+            .iter()
+            .find(|reservation| reservation.attempt().runner_request_id() == request_id)
+    }
+
+    /// Find the completed replay tombstone that retained this exact runner request identity.
+    #[must_use]
+    pub fn find_tombstone_by_runner_request_id(
+        &self,
+        request_id: ScaleSetRunnerRequestId,
+    ) -> Option<&DisposableAttemptState> {
+        self.tombstones()
+            .iter()
+            .find(|attempt| attempt.runner_request_id() == request_id)
+    }
+
     /// Find the one active attempt already bound to this exact GitHub job identity.
     ///
     /// Catalog validation enforces job-ID uniqueness across active attempts and replay tombstones,
@@ -47,7 +73,7 @@ mod tests {
     use crate::execution_admission::EpochMillis;
     use crate::github_scale_set_protocol::{
         ScaleSetJobId, ScaleSetJobResult, ScaleSetRunnerId, ScaleSetRunnerName,
-        ScaleSetRunnerReference,
+        ScaleSetRunnerReference, ScaleSetRunnerRequestId,
     };
 
     fn assigned_attempt(label: &str, job_id: &ScaleSetJobId) -> DisposableAttemptState {
@@ -56,6 +82,8 @@ mod tests {
             CapacityClaimId::parse(&format!("claim-{label}")).expect("capacity claim"),
             DisposableVmId::parse(&format!("vm-{label}")).expect("vm id"),
             ScaleSetRunnerName::parse(&format!("smol-{label}")).expect("runner name"),
+            ScaleSetRunnerRequestId::new(if label == "active" { 41 } else { 42 })
+                .expect("runner request id"),
             EpochMillis::new(50_000).expect("expiry"),
         );
         let authorized = reserved.authorize_clone().expect("authorize clone");
@@ -122,7 +150,7 @@ mod tests {
             .expect("prepared-template identity");
         let revision = 1 + active.revision().get() + tombstone.revision().get() + 1;
         let bytes = format!(
-            "{{\"schema_version\":5,\"revision\":{revision},\"active\":[{{\"attempt\":{active_json},\"resources\":{{\"cpu_millis\":2000,\"memory_bytes\":2147483648,\"disk_bytes\":21474836480}},\"prepared_template_digest\":\"{}\"}}],\"tombstones\":[{tombstone_json}]}}",
+            "{{\"schema_version\":6,\"revision\":{revision},\"active\":[{{\"attempt\":{active_json},\"resources\":{{\"cpu_millis\":2000,\"memory_bytes\":2147483648,\"disk_bytes\":21474836480}},\"prepared_template_digest\":\"{}\"}}],\"tombstones\":[{tombstone_json}]}}",
             template.as_str()
         )
         .into_bytes();
@@ -155,5 +183,42 @@ mod tests {
         );
         assert!(document.find_active_by_job_id(&unknown_job).is_none());
         assert!(document.find_tombstone_by_job_id(&unknown_job).is_none());
+
+        let active_request = active.runner_request_id();
+        let completed_request = tombstone.runner_request_id();
+        let unknown_request = ScaleSetRunnerRequestId::new(99).expect("unknown request id");
+        assert_eq!(
+            document
+                .find_active_by_runner_request_id(active_request)
+                .expect("active request owner")
+                .attempt(),
+            &active
+        );
+        assert!(
+            document
+                .find_tombstone_by_runner_request_id(active_request)
+                .is_none()
+        );
+        assert!(
+            document
+                .find_active_by_runner_request_id(completed_request)
+                .is_none()
+        );
+        assert_eq!(
+            document
+                .find_tombstone_by_runner_request_id(completed_request)
+                .expect("completed request owner"),
+            &tombstone
+        );
+        assert!(
+            document
+                .find_active_by_runner_request_id(unknown_request)
+                .is_none()
+        );
+        assert!(
+            document
+                .find_tombstone_by_runner_request_id(unknown_request)
+                .is_none()
+        );
     }
 }

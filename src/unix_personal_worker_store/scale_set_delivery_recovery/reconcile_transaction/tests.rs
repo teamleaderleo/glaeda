@@ -18,7 +18,9 @@ use crate::execution_admission::EpochMillis;
 use crate::github_scale_set_bridge::{
     ScaleSetBridgeEvent, ScaleSetBridgeJobEvidence, ScaleSetBridgePoll, ScaleSetStatistics,
 };
-use crate::github_scale_set_protocol::{ScaleSetJobId, ScaleSetRunnerName};
+use crate::github_scale_set_protocol::{
+    ScaleSetJobId, ScaleSetRunnerName, ScaleSetRunnerRequestId,
+};
 
 use super::super::super::publication_fault::{PublicationFaultPoint, inject_publication_fault};
 use super::*;
@@ -108,6 +110,8 @@ fn reservation(index: usize) -> DisposableAttemptReservation {
             CapacityClaimId::parse(&format!("claim-{index}")).expect("claim id"),
             DisposableVmId::parse(&format!("vm-{index}")).expect("vm id"),
             ScaleSetRunnerName::parse(&format!("smol-attempt-{index}")).expect("runner name"),
+            ScaleSetRunnerRequestId::new(1_000 + u64::try_from(index).expect("bounded index"))
+                .expect("runner request id"),
             EpochMillis::new(100_000 + u64::try_from(index).expect("bounded index"))
                 .expect("expiry"),
         ),

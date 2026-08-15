@@ -22,7 +22,8 @@ use smolrunner::disposable_worker_reconciler::{
 };
 use smolrunner::execution_admission::EpochMillis;
 use smolrunner::github_scale_set_protocol::{
-    ScaleSetJobId, ScaleSetJobResult, ScaleSetRunnerId, ScaleSetRunnerName, ScaleSetRunnerReference,
+    ScaleSetJobId, ScaleSetJobResult, ScaleSetRunnerId, ScaleSetRunnerName,
+    ScaleSetRunnerReference, ScaleSetRunnerRequestId,
 };
 
 type Catalog = DisposableAttemptCatalog<FixtureStore>;
@@ -171,6 +172,7 @@ fn attempt(index: usize) -> DisposableAttemptState {
         CapacityClaimId::parse(&format!("claim-{index}")).unwrap(),
         DisposableVmId::parse(&format!("vm-{index}")).unwrap(),
         ScaleSetRunnerName::parse(&format!("smol-attempt-{index}")).unwrap(),
+        ScaleSetRunnerRequestId::new(1_000 + u64::try_from(index).unwrap()).unwrap(),
         EpochMillis::new(100_000 + u64::try_from(index).unwrap()).unwrap(),
     )
 }
@@ -530,6 +532,7 @@ fn global_ownership_identities_are_unique_across_attempts() {
         CapacityClaimId::parse("claim-2").unwrap(),
         DisposableVmId::parse("vm-2").unwrap(),
         ScaleSetRunnerName::parse("smol-attempt-1").unwrap(),
+        ScaleSetRunnerRequestId::new(1_002).unwrap(),
         EpochMillis::new(100_002).unwrap(),
     );
     let conflicting = DisposableAttemptReservation::new(
@@ -539,6 +542,27 @@ fn global_ownership_identities_are_unique_across_attempts() {
     )
     .unwrap();
 
+    let error = catalog.reserve(one.revision(), conflicting).unwrap_err();
+    assert_eq!(
+        error.kind(),
+        DisposableAttemptCatalogErrorKind::CorruptState
+    );
+    assert_eq!(catalog.load().unwrap().active().len(), 1);
+
+    let duplicate_request = DisposableAttemptState::reserved(
+        DisposableAttemptId::parse("attempt-3").unwrap(),
+        CapacityClaimId::parse("claim-3").unwrap(),
+        DisposableVmId::parse("vm-3").unwrap(),
+        ScaleSetRunnerName::parse("smol-attempt-3").unwrap(),
+        one.active()[0].attempt().runner_request_id(),
+        EpochMillis::new(100_003).unwrap(),
+    );
+    let conflicting = DisposableAttemptReservation::new(
+        duplicate_request,
+        DisposableWorkerResources::new(1_000, 2 * 1024 * 1024, 8 * 1024 * 1024).unwrap(),
+        template_digest(),
+    )
+    .unwrap();
     let error = catalog.reserve(one.revision(), conflicting).unwrap_err();
     assert_eq!(
         error.kind(),

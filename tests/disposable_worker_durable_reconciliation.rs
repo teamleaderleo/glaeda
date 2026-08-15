@@ -26,7 +26,7 @@ use smolrunner::disposable_worker_reconciler::{
 use smolrunner::execution_admission::EpochMillis;
 use smolrunner::github_scale_set_protocol::{
     ScaleSetJobEvent, ScaleSetJobId, ScaleSetJobResult, ScaleSetRunnerId, ScaleSetRunnerName,
-    ScaleSetRunnerReference,
+    ScaleSetRunnerReference, ScaleSetRunnerRequestId,
 };
 use smolrunner::unix_personal_worker_store::UnixPersonalWorkerStore;
 
@@ -80,6 +80,7 @@ fn vm_identity() -> &'static DisposableVmIdentity {
                 CapacityClaimId::parse("claim-restart-1").unwrap(),
                 DisposableVmId::parse("vm-restart-1").unwrap(),
                 ScaleSetRunnerName::parse("smol-attempt-restart-1").unwrap(),
+                ScaleSetRunnerRequestId::new(41).unwrap(),
                 epoch(100_000),
             )
             .authorize_clone()
@@ -152,6 +153,7 @@ fn initialize(root: &Path) -> DisposableAttemptCatalogDocument {
         CapacityClaimId::parse("claim-restart-1").unwrap(),
         DisposableVmId::parse("vm-restart-1").unwrap(),
         ScaleSetRunnerName::parse("smol-attempt-restart-1").unwrap(),
+        ScaleSetRunnerRequestId::new(41).unwrap(),
         epoch(100_000),
     );
     catalog

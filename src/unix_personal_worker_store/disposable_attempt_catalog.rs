@@ -418,7 +418,7 @@ mod tests {
         DisposableWorkerResources,
     };
     use crate::execution_admission::EpochMillis;
-    use crate::github_scale_set_protocol::ScaleSetRunnerName;
+    use crate::github_scale_set_protocol::{ScaleSetRunnerName, ScaleSetRunnerRequestId};
 
     static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
 
@@ -466,6 +466,7 @@ mod tests {
                 CapacityClaimId::parse(&format!("claim-{index}")).unwrap(),
                 DisposableVmId::parse(&format!("vm-{index}")).unwrap(),
                 ScaleSetRunnerName::parse(&format!("smol-attempt-{index}")).unwrap(),
+                ScaleSetRunnerRequestId::new(1_000 + u64::try_from(index).unwrap()).unwrap(),
                 EpochMillis::new(100_000 + u64::try_from(index).unwrap()).unwrap(),
             ),
             DisposableWorkerResources::new(1_000, 2_000, 3_000).unwrap(),

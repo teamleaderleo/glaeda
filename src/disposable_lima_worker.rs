@@ -542,7 +542,7 @@ mod tests {
         CapacityClaimId, DisposableAttemptId, DisposableVmId,
     };
     use crate::execution_admission::EpochMillis;
-    use crate::github_scale_set_protocol::ScaleSetRunnerName;
+    use crate::github_scale_set_protocol::{ScaleSetRunnerName, ScaleSetRunnerRequestId};
 
     fn resources() -> DisposableWorkerResources {
         DisposableWorkerResources::new(4_000, 8 * GIB, 64 * GIB).unwrap()
@@ -584,6 +584,7 @@ mod tests {
                 CapacityClaimId::parse("claim-1").unwrap(),
                 DisposableVmId::parse("smol-worker-1").unwrap(),
                 ScaleSetRunnerName::parse("runner-1").unwrap(),
+                ScaleSetRunnerRequestId::new(41).unwrap(),
                 EpochMillis::new(10_000).unwrap(),
             ),
             resources,
