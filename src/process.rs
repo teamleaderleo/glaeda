@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use rustix::io::Errno;
 use rustix::process::{self, Pid, Signal};
 use serde::Serialize;
+use zeroize::Zeroizing;
 
 const REDACTED: &str = "[REDACTED]";
 const CAPTURE_BUFFER_BYTES: usize = 8_192;
@@ -19,16 +20,26 @@ pub const MAX_CAPTURED_STREAM_BYTES: usize = 1_048_576;
 pub const MAX_COMMAND_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Clone, PartialEq, Eq)]
-pub struct SecretString(String);
+pub struct SecretString(Zeroizing<String>);
 
 impl SecretString {
     #[must_use]
     pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
+        Self(Zeroizing::new(value.into()))
+    }
+
+    pub(crate) fn from_zeroizing(value: Zeroizing<String>) -> Self {
+        Self(value)
     }
 
     fn expose(&self) -> &str {
         &self.0
+    }
+
+    fn zeroizing_bytes(&self) -> Zeroizing<Vec<u8>> {
+        let mut bytes = Vec::with_capacity(self.0.len());
+        bytes.extend_from_slice(self.0.as_bytes());
+        Zeroizing::new(bytes)
     }
 }
 
@@ -83,6 +94,8 @@ pub struct CommandSpec {
     pub program: PathBuf,
     pub arguments: Vec<CommandValue>,
     pub environment: BTreeMap<String, CommandValue>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    secret_stdin: Option<Box<SecretString>>,
 }
 
 impl CommandSpec {
@@ -92,6 +105,7 @@ impl CommandSpec {
             program: program.into(),
             arguments: Vec::new(),
             environment: BTreeMap::new(),
+            secret_stdin: None,
         }
     }
 
@@ -119,6 +133,18 @@ impl CommandSpec {
     pub fn secret_environment(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.environment
             .insert(key.into(), CommandValue::Secret(SecretString::new(value)));
+        self
+    }
+
+    /// Supply one secret line on standard input without placing it in argv or the environment.
+    ///
+    /// The production executor writes the value followed by one newline from a separately
+    /// zeroizing buffer, closes the pipe, discards both output streams at the operating-system
+    /// boundary, and treats a write failure as command failure. Discarding output prevents a
+    /// hostile child from reflecting the secret into ordinary host capture allocations.
+    #[must_use]
+    pub(crate) fn zeroizing_secret_stdin_line(mut self, value: Zeroizing<String>) -> Self {
+        self.secret_stdin = Some(Box::new(SecretString::from_zeroizing(value)));
         self
     }
 
@@ -214,6 +240,9 @@ fn execute_process_with_spawner<S: CaptureThreadSpawner>(
             })
         })
         .transpose()?;
+    if spec.secret_stdin.is_some() {
+        return execute_secret_process_with_discarded_output(spec, deadline, spawner);
+    }
 
     let mut command = Command::new(&spec.program);
     command
@@ -251,18 +280,17 @@ fn execute_process_with_spawner<S: CaptureThreadSpawner>(
     let stdout_reader = match spawner.spawn(stdout, CapturedStream::Stdout, sender.clone()) {
         Ok(reader) => reader,
         Err(error) => {
-            cleanup_capture_setup_failure(&mut child, None)?;
+            cleanup_capture_setup_failure(&mut child, Vec::new())?;
             return Err(error);
         }
     };
     let stderr_reader = match spawner.spawn(stderr, CapturedStream::Stderr, sender) {
         Ok(reader) => reader,
         Err(error) => {
-            cleanup_capture_setup_failure(&mut child, Some(stdout_reader))?;
+            cleanup_capture_setup_failure(&mut child, vec![stdout_reader])?;
             return Err(error);
         }
     };
-
     let mut stdout_bytes = None;
     let mut stderr_bytes = None;
     let mut exceeded = BTreeSet::new();
@@ -362,7 +390,6 @@ fn execute_process_with_spawner<S: CaptureThreadSpawner>(
     };
     join_capture_reader(stdout_reader)?;
     join_capture_reader(stderr_reader)?;
-
     if timed_out {
         return Err(io::Error::new(
             io::ErrorKind::TimedOut,
@@ -383,7 +410,6 @@ fn execute_process_with_spawner<S: CaptureThreadSpawner>(
             format!("child {streams} exceeded the {MAX_CAPTURED_STREAM_BYTES}-byte capture limit"),
         ));
     }
-
     let stdout_bytes = stdout_bytes.expect("stdout completion recorded");
     let stderr_bytes = stderr_bytes.expect("stderr completion recorded");
     let secrets = spec
@@ -400,6 +426,104 @@ fn execute_process_with_spawner<S: CaptureThreadSpawner>(
         success: status.success(),
         stdout: redact(&String::from_utf8_lossy(&stdout_bytes), &secrets),
         stderr: redact(&String::from_utf8_lossy(&stderr_bytes), &secrets),
+    })
+}
+
+fn execute_secret_process_with_discarded_output<S: CaptureThreadSpawner>(
+    spec: &CommandSpec,
+    deadline: Option<Instant>,
+    spawner: &S,
+) -> io::Result<ExecutionRecord> {
+    let deadline = deadline.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "secret-input commands require a reviewed wall-clock timeout",
+        )
+    })?;
+    let secret = spec
+        .secret_stdin
+        .as_ref()
+        .expect("secret-output path requires secret standard input");
+    let mut command = Command::new(&spec.program);
+    command
+        .env_clear()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0);
+    command.args(spec.arguments.iter().map(CommandValue::exposed));
+    for (key, value) in &spec.environment {
+        command.env(key, value.exposed());
+    }
+
+    let mut child = command.spawn()?;
+    let stdin = match child.stdin.take() {
+        Some(stdin) => stdin,
+        None => {
+            abort_spawned_child(&mut child)?;
+            return Err(io::Error::other(
+                "child stdin was not available after requesting a pipe",
+            ));
+        }
+    };
+    let writer = match spawner.spawn_secret_writer(stdin, secret.zeroizing_bytes()) {
+        Ok(writer) => writer,
+        Err(error) => {
+            abort_spawned_child(&mut child)?;
+            return Err(error);
+        }
+    };
+    while !writer.is_finished() {
+        let now = Instant::now();
+        if now >= deadline {
+            let termination_result = terminate_process_group(&mut child);
+            let wait_result = child.wait();
+            let _writer_result = join_secret_writer(writer);
+            termination_result?;
+            wait_result?;
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "child exceeded the reviewed wall-clock timeout",
+            ));
+        }
+        thread::sleep(
+            deadline
+                .saturating_duration_since(now)
+                .min(CAPTURE_POLL_INTERVAL),
+        );
+    }
+    if let Err(error) = join_secret_writer(writer) {
+        let termination_result = terminate_process_group(&mut child);
+        let wait_result = child.wait();
+        termination_result?;
+        wait_result?;
+        return Err(error);
+    }
+    let mut timed_out = false;
+    let status = match wait_for_child(&mut child, Some(deadline), &mut timed_out) {
+        Ok(status) => status,
+        Err(error) => {
+            let termination_result = terminate_process_group(&mut child);
+            let wait_result = child.wait();
+            termination_result?;
+            wait_result?;
+            return Err(error);
+        }
+    };
+    if timed_out {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "child exceeded the reviewed wall-clock timeout",
+        ));
+    }
+
+    Ok(ExecutionRecord {
+        argv: spec.displayed_argv(),
+        environment_keys: spec.environment.keys().cloned().collect(),
+        status: status.code(),
+        success: status.success(),
+        stdout: String::new(),
+        stderr: String::new(),
     })
 }
 
@@ -430,6 +554,12 @@ trait CaptureThreadSpawner {
         stream: CapturedStream,
         sender: Sender<CaptureEvent>,
     ) -> io::Result<JoinHandle<()>>;
+
+    fn spawn_secret_writer<W: Write + Send + 'static>(
+        &self,
+        writer: W,
+        secret: Zeroizing<Vec<u8>>,
+    ) -> io::Result<JoinHandle<io::Result<()>>>;
 }
 
 struct ThreadCaptureSpawner;
@@ -444,6 +574,18 @@ impl CaptureThreadSpawner for ThreadCaptureSpawner {
         thread::Builder::new().spawn(move || {
             let result = capture_stream(reader, stream, &sender);
             let _ = sender.send(CaptureEvent::Completed(stream, result));
+        })
+    }
+
+    fn spawn_secret_writer<W: Write + Send + 'static>(
+        &self,
+        mut writer: W,
+        secret: Zeroizing<Vec<u8>>,
+    ) -> io::Result<JoinHandle<io::Result<()>>> {
+        thread::Builder::new().spawn(move || {
+            writer.write_all(&secret)?;
+            writer.write_all(b"\n")?;
+            writer.flush()
         })
     }
 }
@@ -500,11 +642,14 @@ fn abort_spawned_child(child: &mut Child) -> io::Result<()> {
 
 fn cleanup_capture_setup_failure(
     child: &mut Child,
-    started_reader: Option<JoinHandle<()>>,
+    started_readers: Vec<JoinHandle<()>>,
 ) -> io::Result<()> {
     let termination_result = terminate_process_group(child);
     let wait_result = child.wait();
-    let join_result = started_reader.map(join_capture_reader).transpose();
+    let join_result = started_readers
+        .into_iter()
+        .map(join_capture_reader)
+        .collect::<io::Result<Vec<_>>>();
     termination_result?;
     wait_result?;
     join_result?;
@@ -547,6 +692,12 @@ fn join_capture_reader(handle: JoinHandle<()>) -> io::Result<()> {
         .map_err(|_| io::Error::other("output capture worker panicked"))
 }
 
+fn join_secret_writer(handle: JoinHandle<io::Result<()>>) -> io::Result<()> {
+    handle
+        .join()
+        .map_err(|_| io::Error::other("secret-input worker panicked"))?
+}
+
 fn ensure_absolute_program(program: &Path) -> io::Result<()> {
     if program.is_absolute() {
         Ok(())
@@ -570,7 +721,7 @@ fn redact(value: &str, secrets: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::io::{self, Read};
+    use std::io::{self, Read, Write};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc::Sender;
@@ -581,7 +732,7 @@ mod tests {
     use super::{
         CaptureEvent, CaptureThreadSpawner, CapturedStream, CommandExecutor, CommandSpec,
         MAX_CAPTURED_STREAM_BYTES, MAX_COMMAND_TIMEOUT, ProcessExecutor, REDACTED,
-        ThreadCaptureSpawner, TimedCommandExecutor, execute_process_with_spawner,
+        ThreadCaptureSpawner, TimedCommandExecutor, Zeroizing, execute_process_with_spawner,
     };
 
     struct FailingCaptureSpawner {
@@ -611,6 +762,18 @@ mod tests {
             }
             ThreadCaptureSpawner.spawn(reader, stream, sender)
         }
+
+        fn spawn_secret_writer<W: Write + Send + 'static>(
+            &self,
+            writer: W,
+            secret: Zeroizing<Vec<u8>>,
+        ) -> io::Result<JoinHandle<io::Result<()>>> {
+            let call = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
+            if call == self.fail_on_call {
+                return Err(io::Error::other("injected secret-input thread failure"));
+            }
+            ThreadCaptureSpawner.spawn_secret_writer(writer, secret)
+        }
     }
 
     #[test]
@@ -618,15 +781,59 @@ mod tests {
         let spec = CommandSpec::new("/usr/bin/example")
             .argument("visible")
             .secret_argument("very-secret")
-            .secret_environment("TOKEN", "environment-secret");
+            .secret_environment("TOKEN", "environment-secret")
+            .zeroizing_secret_stdin_line(Zeroizing::new("stdin-secret".to_owned()));
 
         let debug = format!("{spec:?}");
         let json = serde_json::to_string(&spec).expect("serialize command spec");
         assert!(!debug.contains("very-secret"));
         assert!(!debug.contains("environment-secret"));
+        assert!(!debug.contains("stdin-secret"));
         assert!(!json.contains("very-secret"));
         assert!(!json.contains("environment-secret"));
+        assert!(!json.contains("stdin-secret"));
         assert!(json.contains(REDACTED));
+    }
+
+    #[test]
+    fn secret_standard_input_is_written_once_with_output_discarded() -> io::Result<()> {
+        let cat = Path::new("/bin/cat");
+        if !cat.is_file() {
+            return Ok(());
+        }
+        let secret = "guest-jit-secret";
+        let spec =
+            CommandSpec::new(cat).zeroizing_secret_stdin_line(Zeroizing::new(secret.to_owned()));
+        let record = ProcessExecutor.execute_with_timeout(&spec, Duration::from_secs(1))?;
+
+        assert!(record.success);
+        assert!(record.stdout.is_empty());
+        assert!(record.stderr.is_empty());
+        assert!(!record.argv.join(" ").contains(secret));
+        assert!(record.environment_keys.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn secret_reflection_to_both_streams_never_enters_the_execution_record() -> io::Result<()> {
+        let python = Path::new("/usr/bin/python3");
+        if !python.is_file() {
+            return Ok(());
+        }
+        let secret = "reflected-jit-secret";
+        let spec = CommandSpec::new(python)
+            .argument("-c")
+            .argument(
+                "import os,sys; value=sys.stdin.buffer.readline(); os.write(1,value); os.write(2,value)",
+            )
+            .zeroizing_secret_stdin_line(Zeroizing::new(secret.to_owned()));
+        let record = ProcessExecutor.execute_with_timeout(&spec, Duration::from_secs(1))?;
+
+        assert!(record.success);
+        assert!(record.stdout.is_empty());
+        assert!(record.stderr.is_empty());
+        assert!(!format!("{record:?}").contains(secret));
+        Ok(())
     }
 
     #[test]
@@ -764,6 +971,37 @@ mod tests {
     }
 
     #[test]
+    fn secret_writer_deadline_survives_direct_child_exit_with_inherited_stdin() -> io::Result<()> {
+        let python = Path::new("/usr/bin/python3");
+        if !python.is_file() {
+            return Ok(());
+        }
+
+        let fixture = timeout_fixture_directory()?;
+        let marker = fixture.join("secret-stdin-descendant-survived");
+        let script = "import os,pathlib,sys,time; pid=os.fork(); pid and os._exit(0); time.sleep(0.6); pathlib.Path(sys.argv[1]).write_text('survived'); time.sleep(10)";
+        let error = ProcessExecutor
+            .execute_with_timeout(
+                &CommandSpec::new(python)
+                    .argument("-c")
+                    .argument(script)
+                    .argument(marker.to_string_lossy())
+                    .zeroizing_secret_stdin_line(Zeroizing::new("s".repeat(65_536))),
+                Duration::from_millis(100),
+            )
+            .expect_err("an inherited unread secret pipe must not outlive the deadline");
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        thread::sleep(Duration::from_millis(800));
+        assert!(
+            !marker.exists(),
+            "secret-input descendant survived group timeout"
+        );
+        fs::remove_dir(&fixture)?;
+        Ok(())
+    }
+
+    #[test]
     fn timed_execution_preserves_output_limit_precedence() -> io::Result<()> {
         let yes = Path::new("/usr/bin/yes");
         if !yes.is_file() {
@@ -793,12 +1031,13 @@ mod tests {
             let fixture = timeout_fixture_directory()?;
             let marker = fixture.join("process-survived-capture-setup-failure");
             let script = "import pathlib,sys,time; time.sleep(0.6); pathlib.Path(sys.argv[1]).write_text('survived'); time.sleep(10)";
+            let spec = CommandSpec::new(python)
+                .argument("-c")
+                .argument(script)
+                .argument(marker.to_string_lossy());
             let error = execute_process_with_spawner(
-                &CommandSpec::new(python)
-                    .argument("-c")
-                    .argument(script)
-                    .argument(marker.to_string_lossy()),
-                None,
+                &spec,
+                Some(Duration::from_secs(2)),
                 &FailingCaptureSpawner::new(fail_on_call),
             )
             .expect_err("capture thread setup failure must abort the spawned process group");
@@ -812,6 +1051,29 @@ mod tests {
             );
             fs::remove_dir(&fixture)?;
         }
+
+        let fixture = timeout_fixture_directory()?;
+        let marker = fixture.join("process-survived-secret-writer-setup-failure");
+        let script = "import pathlib,sys,time; time.sleep(0.6); pathlib.Path(sys.argv[1]).write_text('survived'); time.sleep(10)";
+        let spec = CommandSpec::new(python)
+            .argument("-c")
+            .argument(script)
+            .argument(marker.to_string_lossy())
+            .zeroizing_secret_stdin_line(Zeroizing::new("secret".to_owned()));
+        let error = execute_process_with_spawner(
+            &spec,
+            Some(Duration::from_secs(2)),
+            &FailingCaptureSpawner::new(1),
+        )
+        .expect_err("secret-input setup failure must abort the spawned process group");
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(error.to_string(), "injected secret-input thread failure");
+        thread::sleep(Duration::from_millis(800));
+        assert!(
+            !marker.exists(),
+            "spawned process survived writer setup failure"
+        );
+        fs::remove_dir(&fixture)?;
         Ok(())
     }
 

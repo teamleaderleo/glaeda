@@ -79,6 +79,10 @@ provision:
       readonly install_parent="/opt/smolrunner"
       readonly install_dir="${install_parent}/actions-runner"
       readonly install_stage="${install_parent}/actions-runner.staging"
+      readonly launcher_dir="${install_parent}/bin"
+      readonly jit_launcher="${launcher_dir}/smolrunner-jit-launcher"
+      readonly jit_launcher_stage="/var/tmp/smolrunner-jit-launcher.new"
+      readonly jit_launcher_sha256="9b7cc857f2de1181f64bb067e4d4870e0bcb679d597ec047d885395ac6160996"
       readonly archive="/var/tmp/actions-runner-linux-arm64-2.336.0.tar.gz"
       readonly runner_url="https://github.com/actions/runner/releases/download/v2.336.0/actions-runner-linux-arm64-2.336.0.tar.gz"
       readonly runner_bytes="138824064"
@@ -143,9 +147,14 @@ provision:
               "${install_dir}/bin/Runner.Listener" --version
         )"
         [[ "${installed_version}" == "2.336.0" ]]
+        [[ -f "${jit_launcher}" && ! -L "${jit_launcher}" ]]
+        [[ "$(/usr/bin/stat --format=%U:%G:%a "${jit_launcher}")" == "root:root:755" ]]
+        /usr/bin/printf '%s  %s\n' "${jit_launcher_sha256}" "${jit_launcher}" \
+          | /usr/bin/sha256sum --check --status
       }
 
-      /usr/bin/install -d -o root -g root -m 0755 "${install_parent}" "${marker_dir}"
+      /usr/bin/install -d -o root -g root -m 0755 \
+        "${install_parent}" "${launcher_dir}" "${marker_dir}"
       /usr/bin/install -d -o "${runner_user}" -g "${runner_user}" -m 0750 "${runner_home}" "${runner_work}"
 
       if [[ -f "${marker}" && -x "${install_dir}/bin/Runner.Listener" ]]; then
@@ -156,7 +165,9 @@ provision:
           '  "actions_runner_digest": "sha256:58b758e420b87093fbd4bfddd368074960053e2f1388f01848c82624b90f27d1",' \
           '  "workload_user": "smolrunner-runner",' \
           '  "runner_install_directory": "/opt/smolrunner/actions-runner",' \
-          '  "runner_work_directory": "/var/lib/smolrunner-runner/work"' \
+          '  "runner_work_directory": "/var/lib/smolrunner-runner/work",' \
+          '  "jit_launcher_path": "/opt/smolrunner/bin/smolrunner-jit-launcher",' \
+          '  "jit_launcher_digest": "sha256:9b7cc857f2de1181f64bb067e4d4870e0bcb679d597ec047d885395ac6160996"' \
           '}')
         verify_runner_install
         verify_automatic_updates_disabled
@@ -200,6 +211,14 @@ provision:
       /usr/bin/mv -- "${install_stage}" "${install_dir}"
       /usr/bin/rm -f -- "${archive}"
 
+      /usr/bin/printf '%s' \
+        'IyEvYmluL2Jhc2gKc2V0IC1ldW8gcGlwZWZhaWwKCnJlYWRvbmx5IHJ1bm5lcl9saXN0ZW5lcj0iL29wdC9zbW9scnVubmVyL2FjdGlvbnMtcnVubmVyL2Jpbi9SdW5uZXIuTGlzdGVuZXIiCnJlYWRvbmx5IG1heF9qaXRfYnl0ZXM9NjU1MzYKCnVtYXNrIDA3NwpqaXRfY29uZmlnPSIiCklGUz0gcmVhZCAtciBqaXRfY29uZmlnIHx8IGV4aXQgNjQKW1sgLW4gIiR7aml0X2NvbmZpZ30iICYmICR7I2ppdF9jb25maWd9IC1sZSAke21heF9qaXRfYnl0ZXN9IF1dCltbICIke2ppdF9jb25maWd9IiA9fiBeW0EtWmEtejAtOSsvPV8tXSskIF1dCmlmIElGUz0gcmVhZCAtciBfOyB0aGVuCiAgZXhpdCA2NApmaQoKZXhwb3J0IEFDVElPTlNfUlVOTkVSX0lOUFVUX0pJVENPTkZJRz0iJHtqaXRfY29uZmlnfSIKZXhwb3J0IEFDVElPTlNfUlVOTkVSX1JFVFVSTl9KT0JfUkVTVUxUX0ZPUl9IT1NURUQ9dHJ1ZQpleGVjICIke3J1bm5lcl9saXN0ZW5lcn0iIHJ1biAtLXN0YXJ0dXB0eXBlIHNlcnZpY2UK' \
+        | /usr/bin/base64 --decode >"${jit_launcher_stage}"
+      /usr/bin/printf '%s  %s\n' "${jit_launcher_sha256}" "${jit_launcher_stage}" \
+        | /usr/bin/sha256sum --check --status
+      /usr/bin/install -o root -g root -m 0755 "${jit_launcher_stage}" "${jit_launcher}"
+      /usr/bin/rm -f -- "${jit_launcher_stage}"
+
       verify_runner_install
       verify_automatic_updates_disabled
 
@@ -211,7 +230,9 @@ provision:
         '  "actions_runner_digest": "sha256:58b758e420b87093fbd4bfddd368074960053e2f1388f01848c82624b90f27d1",' \
         '  "workload_user": "smolrunner-runner",' \
         '  "runner_install_directory": "/opt/smolrunner/actions-runner",' \
-        '  "runner_work_directory": "/var/lib/smolrunner-runner/work"' \
+        '  "runner_work_directory": "/var/lib/smolrunner-runner/work",' \
+        '  "jit_launcher_path": "/opt/smolrunner/bin/smolrunner-jit-launcher",' \
+        '  "jit_launcher_digest": "sha256:9b7cc857f2de1181f64bb067e4d4870e0bcb679d597ec047d885395ac6160996"' \
         '}' >"${marker_stage}"
       /usr/bin/chown root:root "${marker_stage}"
       /usr/bin/chmod 0444 "${marker_stage}"
@@ -225,4 +246,5 @@ probes:
       set -euo pipefail
       /usr/bin/test -r /etc/smolrunner/prepared-template.json
       /usr/bin/test -x /opt/smolrunner/actions-runner/bin/Runner.Listener
+      /usr/bin/test -x /opt/smolrunner/bin/smolrunner-jit-launcher
       /usr/bin/test "$(/usr/bin/id -Gn smolrunner-runner)" = "smolrunner-runner"

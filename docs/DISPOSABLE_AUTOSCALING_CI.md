@@ -140,8 +140,20 @@ catalog effect replace the original fence as one recoverable paired transaction 
 is acknowledged. A lost lifecycle-ack response converges only from exact redelivery or a fresh
 cursor poll proving the message absent; a newly observed later message is left unacknowledged for
 redelivery. Conflicting, runner-bearing, or Started evidence before durable clone ownership remains
-recovery debt. Enrollment, the service loop, and guest JIT handoff do not exist yet, so this is not
-production capacity.
+recovery debt.
+
+A private guest-handoff foundation consumes the bridge's guaranteed-zeroization JIT value as one
+secret standard-input line to a fixed template-bound guest launcher, without placing the value in
+argv, the inherited environment, logs, Debug, serialization, or an ordinary copied `String`. The
+launcher sets only the official runner's JIT input and hosted-result switch immediately before
+`exec`. The plan fixes the Lima shell, guest `sudo`, launcher, work directory, and empty inherited
+environment, and binds the candidate to the exact durable attempt, cloned VM identity, runner name,
+runner ID, and deadline. It intentionally exposes
+no execution path yet: the production service must still freshly prove the complete target ready,
+durably record the GitHub registration, publish a no-replay runner-start checkpoint, and only then
+consume the command. No operator enrollment path, executable guest handoff, terminal cleanup, or
+supervised service loop exists yet, so this remains control-plane foundation rather than production
+capacity.
 
 Acceptance: an enrolled test repository targets the SmolRunner scale-set label, queues a job, and receives its result without operator commands; the JIT runner cannot accept a second job and its credential is absent after VM destruction.
 

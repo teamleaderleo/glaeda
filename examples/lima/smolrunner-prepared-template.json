@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "guest_image": {
     "location": "https://cloud-images.ubuntu.com/releases/noble/release-20260705/ubuntu-24.04-server-cloudimg-arm64.img",
     "architecture": "aarch64",
@@ -19,8 +19,8 @@
     "disk_bytes": 21474836480
   },
   "provisioning": {
-    "recipe_revision": 2,
-    "lima_template_digest": "sha256:f602539881c741e3db4e69a7658123db6dd5cb01ca4f755c80972e3bf8674974",
+    "recipe_revision": 3,
+    "lima_template_digest": "sha256:7adc6bf690b4604c555b32c333d97fe8df0641b69976604f4826076244bc0e2c",
     "admin_user": "smolrunner-admin",
     "admin_uid": 1000,
     "admin_comment": "SmolRunner controller",
@@ -28,6 +28,8 @@
     "workload_user": "smolrunner-runner",
     "runner_install_directory": "/opt/smolrunner/actions-runner",
     "runner_work_directory": "/var/lib/smolrunner-runner/work",
+    "jit_launcher_path": "/opt/smolrunner/bin/smolrunner-jit-launcher",
+    "jit_launcher_digest": "sha256:9b7cc857f2de1181f64bb067e4d4870e0bcb679d597ec047d885395ac6160996",
     "ready_marker_path": "/etc/smolrunner/prepared-template.json",
     "runner_dependency_install": "official_archive_script",
     "os_package_source": "ubuntu_noble_signed_repositories_at_build",

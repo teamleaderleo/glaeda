@@ -48,6 +48,8 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const DISCARD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const GUEST_CACHE_PATH: &str = "/var/lib/smolrunner-runner/work";
 const RUNNER_LISTENER: &str = "/opt/smolrunner/actions-runner/bin/Runner.Listener";
+const JIT_LAUNCHER: &str = "/opt/smolrunner/bin/smolrunner-jit-launcher";
+const JIT_LAUNCHER_BYTES: &[u8] = include_bytes!("../examples/lima/smolrunner-jit-launcher");
 const RUNNER_USER: &str = "smolrunner-runner";
 const EXPECTED_RUNNER_VERSION: &str = "2.336.0\n";
 const EXPECTED_RUNNER_GROUPS: &str = "smolrunner-runner\n";
@@ -59,7 +61,7 @@ const MASKED_APT_UNITS: [&str; 4] = [
     "apt-daily.service",
     "apt-daily-upgrade.service",
 ];
-const READY_MARKER_BYTES: &[u8] = b"{\n  \"schema_version\": 1,\n  \"actions_runner_version\": \"2.336.0\",\n  \"actions_runner_digest\": \"sha256:58b758e420b87093fbd4bfddd368074960053e2f1388f01848c82624b90f27d1\",\n  \"workload_user\": \"smolrunner-runner\",\n  \"runner_install_directory\": \"/opt/smolrunner/actions-runner\",\n  \"runner_work_directory\": \"/var/lib/smolrunner-runner/work\"\n}\n";
+const READY_MARKER_BYTES: &[u8] = b"{\n  \"schema_version\": 1,\n  \"actions_runner_version\": \"2.336.0\",\n  \"actions_runner_digest\": \"sha256:58b758e420b87093fbd4bfddd368074960053e2f1388f01848c82624b90f27d1\",\n  \"workload_user\": \"smolrunner-runner\",\n  \"runner_install_directory\": \"/opt/smolrunner/actions-runner\",\n  \"runner_work_directory\": \"/var/lib/smolrunner-runner/work\",\n  \"jit_launcher_path\": \"/opt/smolrunner/bin/smolrunner-jit-launcher\",\n  \"jit_launcher_digest\": \"sha256:9b7cc857f2de1181f64bb067e4d4870e0bcb679d597ec047d885395ac6160996\"\n}\n";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -537,6 +539,10 @@ mod tests {
         }
         assert!(template.contains("verify_runner_install"));
         assert!(template.contains("verify_automatic_updates_disabled"));
+        let launcher_digest = format!("{:x}", Sha256::digest(JIT_LAUNCHER_BYTES));
+        assert!(template.contains(&format!(
+            "readonly jit_launcher_sha256=\"{launcher_digest}\""
+        )));
     }
 
     #[test]
@@ -1070,6 +1076,14 @@ impl DisposableTemplateRuntime {
             OBSERVATION_TIMEOUT,
             EXPECTED_RUNNER_VERSION,
         )? {
+            return Ok(false);
+        }
+        let launcher_digest = format!("{:x}", Sha256::digest(JIT_LAUNCHER_BYTES));
+        let expected_launcher = format!("{launcher_digest}  {JIT_LAUNCHER}\n");
+        let launcher = self
+            .guest_command("/usr/bin/sha256sum")
+            .argument(JIT_LAUNCHER);
+        if !command_matches(executor, &launcher, OBSERVATION_TIMEOUT, &expected_launcher)? {
             return Ok(false);
         }
         let apt_policy_digest = format!("{:x}", Sha256::digest(APT_POLICY_BYTES));
