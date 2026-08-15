@@ -21,7 +21,10 @@ impl DisposableAttemptCatalogDocument {
 
     /// Find the one completed replay tombstone already bound to this exact GitHub job identity.
     #[must_use]
-    pub fn find_tombstone_by_job_id(&self, job_id: &ScaleSetJobId) -> Option<&DisposableAttemptState> {
+    pub fn find_tombstone_by_job_id(
+        &self,
+        job_id: &ScaleSetJobId,
+    ) -> Option<&DisposableAttemptState> {
         self.tombstones()
             .iter()
             .find(|attempt| attempt.github_job_id() == Some(job_id))
