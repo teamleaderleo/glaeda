@@ -49,6 +49,7 @@ impl UnixPersonalWorkerStore {
         super::disposable_template_generation::refuse_unsettled(&store)
             .map_err(map_personal_error)?;
         refuse_unsettled_lima_authority(&store)?;
+        refuse_unsettled_scale_set_delivery(&store)?;
         store.recover_catalog_locked()?;
         Ok(store)
     }
@@ -187,6 +188,7 @@ impl DisposableAttemptCatalogStore for UnixPersonalWorkerStore {
         super::disposable_template_generation::refuse_unsettled(self)
             .map_err(map_personal_error)?;
         refuse_unsettled_lima_authority(self)?;
+        refuse_unsettled_scale_set_delivery(self)?;
         self.recover_catalog_locked()
     }
 
@@ -225,6 +227,7 @@ impl DisposableAttemptCatalogStore for UnixPersonalWorkerStore {
         super::disposable_template_generation::refuse_unsettled(self)
             .map_err(map_personal_error)?;
         refuse_unsettled_lima_authority(self)?;
+        refuse_unsettled_scale_set_delivery(self)?;
         self.recover_catalog_locked()?;
         if self.load_catalog_named(CATALOG_DOCUMENT)?.is_some() {
             return Err(public(
@@ -252,6 +255,7 @@ impl DisposableAttemptCatalogStore for UnixPersonalWorkerStore {
         super::disposable_template_generation::refuse_unsettled(self)
             .map_err(map_personal_error)?;
         refuse_unsettled_lima_authority(self)?;
+        refuse_unsettled_scale_set_delivery(self)?;
         self.recover_catalog_locked()?;
         let current = self.load_catalog_named(CATALOG_DOCUMENT)?.ok_or_else(|| {
             public(
@@ -335,6 +339,21 @@ fn refuse_unsettled_lima_authority(
             public(
                 DisposableAttemptCatalogErrorKind::RecoveryRequired,
                 "Lima lifecycle recovery must complete before disposable-attempt mutation",
+            )
+        } else {
+            map_personal_error(error)
+        }
+    })
+}
+
+fn refuse_unsettled_scale_set_delivery(
+    store: &UnixPersonalWorkerStore,
+) -> Result<(), DisposableAttemptCatalogError> {
+    super::scale_set_delivery_recovery::refuse_unsettled(store).map_err(|error| {
+        if error.kind() == PersonalWorkerStoreErrorKind::RevisionConflict {
+            public(
+                DisposableAttemptCatalogErrorKind::RecoveryRequired,
+                "Scale Set delivery reconciliation must complete before disposable-attempt mutation",
             )
         } else {
             map_personal_error(error)

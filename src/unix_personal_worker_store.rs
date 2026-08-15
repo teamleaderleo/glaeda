@@ -213,6 +213,7 @@ impl UnixPersonalWorkerStore {
         // success from the store.
         synchronize_directory(&store._root, "personal worker state root")?;
         disposable_attempt_catalog::refuse_unsettled(&store)?;
+        scale_set_delivery_recovery::refuse_unsettled(&store)?;
         disposable_template_generation::refuse_unsettled(&store)?;
         lima_authority::refuse_unsettled_lima_authority(&store)?;
         match store.recovery_plan()? {
@@ -265,6 +266,7 @@ impl UnixPersonalWorkerStore {
         let _lock = store.acquire_mutation_lock()?;
         synchronize_directory(&store._root, "personal worker state root")?;
         disposable_attempt_catalog::refuse_unsettled(&store)?;
+        scale_set_delivery_recovery::refuse_unsettled(&store)?;
         disposable_template_generation::refuse_unsettled(&store)?;
         lima_authority::refuse_unsettled_lima_authority(&store)?;
 
@@ -653,6 +655,7 @@ impl PersonalWorkerStore for UnixPersonalWorkerStore {
         }
         let _lock = self.acquire_mutation_lock()?;
         disposable_attempt_catalog::refuse_unsettled(self)?;
+        scale_set_delivery_recovery::refuse_unsettled(self)?;
         disposable_template_generation::refuse_unsettled(self)?;
         lima_authority::refuse_unsettled_lima_authority(self)?;
         self.recover_locked()?;
@@ -679,6 +682,7 @@ impl PersonalWorkerStore for UnixPersonalWorkerStore {
     ) -> Result<PersonalWorkerStoreWriteReceipt, PersonalWorkerStoreError> {
         let _lock = self.acquire_mutation_lock()?;
         disposable_attempt_catalog::refuse_unsettled(self)?;
+        scale_set_delivery_recovery::refuse_unsettled(self)?;
         disposable_template_generation::refuse_unsettled(self)?;
         lima_authority::refuse_unsettled_lima_authority(self)?;
         self.recover_locked()?;
@@ -708,6 +712,7 @@ impl PersonalWorkerStore for UnixPersonalWorkerStore {
     fn recover(&mut self) -> Result<PersonalWorkerStoreRecovery, PersonalWorkerStoreError> {
         let _lock = self.acquire_mutation_lock()?;
         disposable_attempt_catalog::refuse_unsettled(self)?;
+        scale_set_delivery_recovery::refuse_unsettled(self)?;
         disposable_template_generation::refuse_unsettled(self)?;
         lima_authority::refuse_unsettled_lima_authority(self)?;
         self.recover_locked()

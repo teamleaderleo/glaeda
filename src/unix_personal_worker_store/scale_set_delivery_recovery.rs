@@ -10,6 +10,8 @@ use crate::github_scale_set_delivery_state::{
     encode_scale_set_delivery_recovery,
 };
 
+mod reconcile_transaction;
+
 pub(super) const DELIVERY_RECOVERY_DOCUMENT: &str = "scale-set-delivery-recovery.json";
 pub(super) const STAGED_DELIVERY_RECOVERY_DOCUMENT: &str = ".scale-set-delivery-recovery.next.json";
 
@@ -23,8 +25,8 @@ enum RecoveryPlan {
 impl UnixPersonalWorkerStore {
     /// Open or create the shared private store and recover Scale Set delivery state.
     ///
-    /// This slice owns only the delivery document. The later consumer transaction will make other
-    /// cooperating mutators refuse a live delivery and will define the exact retirement proof.
+    /// Other cooperating mutators refuse a staged or live delivery. The later consumer transaction
+    /// will define the exact acknowledgement/acquisition proof that permits retirement.
     pub(crate) fn open_or_create_scale_set_delivery_recovery(
         root_path: impl AsRef<Path>,
     ) -> Result<Self, PersonalWorkerStoreError> {
@@ -261,6 +263,33 @@ impl UnixPersonalWorkerStore {
             },
         }
     }
+}
+
+/// Refuse unrelated store recovery or mutation while one delivery transaction is unsettled.
+///
+/// Both the staged marker and current document bind the catalog revision that the consumer must
+/// preserve through acknowledgement/acquisition recovery. Only the paired delivery transaction may
+/// classify or advance them.
+pub(super) fn refuse_unsettled(
+    store: &UnixPersonalWorkerStore,
+) -> Result<(), PersonalWorkerStoreError> {
+    // Close any prior rename/directory-fsync ambiguity before treating absence as authoritative.
+    synchronize_directory(&store.directory, "personal worker store directory")?;
+    let staged = store.read_named_bytes_bounded(
+        STAGED_DELIVERY_RECOVERY_DOCUMENT,
+        MAX_SCALE_SET_DELIVERY_RECOVERY_BYTES,
+    )?;
+    let current = store.read_named_bytes_bounded(
+        DELIVERY_RECOVERY_DOCUMENT,
+        MAX_SCALE_SET_DELIVERY_RECOVERY_BYTES,
+    )?;
+    if staged.is_some() || current.is_some() {
+        return Err(store_error(
+            PersonalWorkerStoreErrorKind::RevisionConflict,
+            "Scale Set delivery reconciliation must settle before unrelated mutation",
+        ));
+    }
+    Ok(())
 }
 
 fn exact_recovery_successor(

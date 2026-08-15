@@ -26,6 +26,9 @@ impl UnixPersonalWorkerStore {
         })?;
         super::lima_authority::refuse_unsettled_lima_authority(self)
             .map_err(|_| DisposableCloneRuntimeError::recovery("clone_lima_recovery_required"))?;
+        super::scale_set_delivery_recovery::refuse_unsettled(self).map_err(|_| {
+            DisposableCloneRuntimeError::recovery("clone_delivery_recovery_required")
+        })?;
         self.refuse_unsettled_personal_worker_state()
             .map_err(|_| DisposableCloneRuntimeError::recovery("clone_worker_recovery_required"))?;
         self.recover_catalog_locked()
