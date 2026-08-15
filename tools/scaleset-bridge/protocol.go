@@ -18,7 +18,7 @@ import (
 	"github.com/hashicorp/go-retryablehttp"
 )
 
-const protocolVersion = 1
+const protocolVersion = 2
 const bridgeVersion = "0.1.0"
 const maxServiceResponseBytes = 2 * 1024 * 1024
 
@@ -27,6 +27,8 @@ type protocolRequest struct {
 	Operation        string      `json:"operation"`
 	Start            startConfig `json:"start,omitempty"`
 	MessageID        int         `json:"message_id,omitempty"`
+	LastAckedID      int         `json:"last_acked_message_id,omitempty"`
+	MaxCapacity      int         `json:"max_capacity,omitempty"`
 	RunnerRequestIDs []int64     `json:"runner_request_ids,omitempty"`
 	RunnerName       string      `json:"runner_name,omitempty"`
 	RunnerID         int64       `json:"runner_id,omitempty"`
@@ -398,6 +400,7 @@ type server struct {
 	lastStatistics statistics
 	lastAckedID    int
 	pending        *pendingMessage
+	cursorSet      bool
 }
 
 func newServer(factory backendFactory) *server { return &server{factory: factory} }
@@ -413,7 +416,9 @@ func (server *server) handle(ctx context.Context, request protocolRequest) proto
 	case "start":
 		return server.start(ctx, request.Start)
 	case "poll":
-		return server.poll(ctx)
+		return server.poll(ctx, request.MaxCapacity)
+	case "resume":
+		return server.resume(request.LastAckedID)
 	case "ack":
 		return server.ack(ctx, request.MessageID)
 	case "acquire":
@@ -427,6 +432,21 @@ func (server *server) handle(ctx context.Context, request protocolRequest) proto
 	default:
 		return errorResponse("unsupported_operation")
 	}
+}
+
+// resume restores only the durable acknowledged-message cursor in a fresh bridge process. It is
+// intentionally a one-shot, pre-poll operation: Rust owns the durable cursor and uses zero-capacity
+// polling after an ambiguous acquisition so later lifecycle evidence cannot admit another job.
+func (server *server) resume(lastAckedID int) protocolResponse {
+	if server.backend == nil {
+		return errorResponse("not_started")
+	}
+	if server.cursorSet || server.pending != nil || server.lastAckedID != 0 || lastAckedID <= 0 {
+		return errorResponse("invalid_recovery")
+	}
+	server.lastAckedID = lastAckedID
+	server.cursorSet = true
+	return protocolResponse{Version: protocolVersion, Type: "restored", MessageID: lastAckedID}
 }
 
 func (server *server) start(ctx context.Context, config startConfig) protocolResponse {
@@ -452,14 +472,18 @@ func (server *server) start(ctx context.Context, config startConfig) protocolRes
 	return protocolResponse{Version: protocolVersion, Type: "ready", ScaleSetID: config.ScaleSetID, Statistics: initial}
 }
 
-func (server *server) poll(ctx context.Context) protocolResponse {
+func (server *server) poll(ctx context.Context, maxCapacity int) protocolResponse {
 	if server.backend == nil {
 		return errorResponse("not_started")
+	}
+	if maxCapacity < 0 || maxCapacity > server.config.MaxCapacity {
+		return errorResponse("invalid_capacity")
 	}
 	if server.pending != nil {
 		return errorResponse("ack_required")
 	}
-	message, err := server.backend.Poll(ctx, server.lastAckedID, server.config.MaxCapacity)
+	server.cursorSet = true
+	message, err := server.backend.Poll(ctx, server.lastAckedID, maxCapacity)
 	if err != nil {
 		return errorResponse("poll_failed")
 	}
@@ -471,7 +495,7 @@ func (server *server) poll(ctx context.Context) protocolResponse {
 		return errorResponse("invalid_message")
 	}
 	response, available, normalizeErr := normalizeMessage(message)
-	if normalizeErr != nil {
+	if normalizeErr != nil || len(available) > maxCapacity {
 		return errorResponse("invalid_message")
 	}
 	if !responseFitsProtocolLine(response) {

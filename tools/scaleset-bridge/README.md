@@ -21,13 +21,15 @@ poll through official client
 
 The binary rejects arguments, clears its inherited environment, and exchanges one bounded JSON
 object per line on stdin/stdout. A bounded strict response gate rejects unknown service lifecycle
-types before the pinned official client can normalize them. Protocol version 1 supports:
+types before the pinned official client can normalize them. Protocol version 2 supports:
 
 - `start`: accept the GitHub App private key through stdin, verify one already-enrolled exact scale
   set by ID/name/group/labels/disabled-update policy, and create a message session;
-- `poll` and `ack`: expose the latest validated statistics and bounded job lifecycle messages
-  without automatic acknowledgement, and accept only positive unique acquired IDs from the exact
-  persisted available-job set;
+- `poll` and `ack`: expose the latest validated statistics and bounded job lifecycle messages at an
+  explicit capacity from zero through the enrolled maximum, without automatic acknowledgement,
+  and accept only positive unique acquired IDs from the exact persisted available-job set;
+- `resume`: restore one positive durable acknowledged-message cursor exactly once in a fresh
+  process before polling, so zero-capacity lifecycle observation cannot admit another job;
 - `generate_jit`: return one exact runner ID/name plus its one-time encoded JIT configuration;
 - `observe_runner` and `remove_runner`: observe by exact name and remove only after re-observing the
   exact numeric ID, name, and configured scale-set identity.
@@ -38,9 +40,9 @@ and remains secret-bearing data for the future Rust/guest handoff.
 
 ## Current nonclaims
 
-This package is not yet called by the Rust controller. It does not read the Mac Keychain, create or
-adopt a scale set, persist message receipts, reserve host capacity, launch a VM, transfer JIT data
-to a guest, supervise a runner, or recover a bridge/process crash or ambiguous network outcome
-between message deletion and job acquisition. Those remain M3 integration work. Until the Rust
-adapter persists a polled message and its available request IDs before `ack`, this bridge is a
-tested protocol foundation, not a usable autoscaler.
+The private Rust adapter and durable delivery controller now call this package, load the
+pre-enrolled App key from the Mac Keychain, persist/reconcile messages before acknowledgement, and
+recover ambiguous acquisition without replaying acknowledgement. This package still does not
+create or adopt a scale set, launch a VM, transfer JIT data to a guest, supervise a runner, or by
+itself settle an empty ambiguous acquisition. Cursor restore and zero-capacity polling are only the
+process prerequisite for the next durable lifecycle-evidence transaction, not a usable autoscaler.

@@ -132,8 +132,11 @@ positive recovery evidence now enters a paired settlement: the durable intent bi
 target catalog, positively acquired attempts remain reserved, definitively unacquired Available
 requests complete without VM-cleanup authority and move to bounded replay history, and only then is
 the delivery fence removed. Crashes before or after either catalog publication recover this exact
-ordering. Enrollment, the service loop, and guest JIT handoff do not exist yet, so this is not
-production capacity.
+ordering. The versioned bridge can restore one durable acknowledged-message cursor in a fresh
+session and poll at zero capacity, providing the official-client mechanism needed to resolve empty
+acquisition ambiguity from later lifecycle evidence without admitting another job; the durable
+multi-message resolution transaction is still pending. Enrollment, the service loop, and guest JIT
+handoff do not exist yet, so this is not production capacity.
 
 Acceptance: an enrolled test repository targets the SmolRunner scale-set label, queues a job, and receives its result without operator commands; the JIT runner cannot accept a second job and its credential is absent after VM destruction.
 

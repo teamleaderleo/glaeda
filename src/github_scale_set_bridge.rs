@@ -33,7 +33,7 @@ use crate::github_scale_set_protocol::{
 };
 use crate::{disposable_worker_reconciler::ScaleSetDemand, execution_admission::EpochMillis};
 
-const PROTOCOL_VERSION: u8 = 1;
+const PROTOCOL_VERSION: u8 = 2;
 const MAX_PROTOCOL_LINE_BYTES: usize = 128 * 1024;
 const MAX_PRIVATE_KEY_BYTES: usize = 64 * 1024;
 const MAX_JIT_CONFIG_BYTES: usize = 64 * 1024;
@@ -790,8 +790,17 @@ impl ScaleSetBridgeClient {
         })
     }
 
-    pub(crate) fn poll(&mut self) -> Result<ScaleSetBridgePoll, ScaleSetBridgeError> {
-        let mut response = exchange_and_decode(self.transport.as_mut(), &BridgeRequest::poll())?;
+    pub(crate) fn poll(
+        &mut self,
+        available_capacity: u16,
+    ) -> Result<ScaleSetBridgePoll, ScaleSetBridgeError> {
+        if available_capacity > self.target.max_capacity {
+            return Err(ScaleSetBridgeError::new("invalid_bridge_capacity"));
+        }
+        let mut response = exchange_and_decode(
+            self.transport.as_mut(),
+            &BridgeRequest::poll(available_capacity),
+        )?;
         let result = (|| match response.response_type.as_str() {
             "idle" => {
                 response.require_idle_shape()?;
@@ -810,6 +819,13 @@ impl ScaleSetBridgeClient {
                     .into_iter()
                     .map(|event| normalize_event(event, self.target.id))
                     .collect::<Result<Vec<_>, _>>()?;
+                let available = events
+                    .iter()
+                    .filter(|event| matches!(event, ScaleSetBridgeEvent::Available(_)))
+                    .count();
+                if available > usize::from(available_capacity) {
+                    return Err(ScaleSetBridgeError::new("invalid_bridge_message"));
+                }
                 Ok(ScaleSetBridgePoll::Message {
                     message_id,
                     statistics,
@@ -819,6 +835,41 @@ impl ScaleSetBridgeClient {
             "error" => Err(response.bridge_error()?),
             _ => Err(ScaleSetBridgeError::new("invalid_bridge_response")),
         })();
+        self.finish_response(result)
+    }
+
+    /// Restore a fresh bridge process to one exact durable acknowledged-message cursor.
+    ///
+    /// The bridge accepts this only before its first poll. A caller may first perform the standalone
+    /// acquisition recovery, then restore the cursor and poll with capacity zero to observe later
+    /// lifecycle evidence without admitting another job.
+    pub(crate) fn resume_after(
+        &mut self,
+        last_acked_message_id: u32,
+    ) -> Result<(), ScaleSetBridgeError> {
+        if last_acked_message_id == 0 {
+            return Err(ScaleSetBridgeError::new("invalid_recovery"));
+        }
+        let response = exchange_and_decode(
+            self.transport.as_mut(),
+            &BridgeRequest::resume(last_acked_message_id),
+        )?;
+        let result = if response.response_type == "error" {
+            Err(response.bridge_error()?)
+        } else if response.response_type == "restored"
+            && response.message_id == Some(u64::from(last_acked_message_id))
+            && response.code.is_none()
+            && response.scale_set_id.is_none()
+            && response.statistics.is_none()
+            && response.events.is_empty()
+            && response.acquired_requests.is_empty()
+            && response.runner.is_none()
+            && response.encoded_jit_config.is_none()
+        {
+            Ok(())
+        } else {
+            Err(ScaleSetBridgeError::new("invalid_bridge_response"))
+        };
         self.finish_response(result)
     }
 
@@ -1101,6 +1152,10 @@ struct BridgeRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     message_id: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    last_acked_message_id: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_capacity: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     runner_request_ids: Option<&'a [ScaleSetRunnerRequestId]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     runner_name: Option<&'a str>,
@@ -1150,6 +1205,8 @@ impl<'a> BridgeRequest<'a> {
                 max_capacity: config.target.max_capacity,
             }),
             message_id: None,
+            last_acked_message_id: None,
+            max_capacity: None,
             runner_request_ids: None,
             runner_name: None,
             runner_id: None,
@@ -1157,12 +1214,29 @@ impl<'a> BridgeRequest<'a> {
         }
     }
 
-    const fn poll() -> Self {
+    const fn poll(max_capacity: u16) -> Self {
         Self {
             version: PROTOCOL_VERSION,
             operation: "poll",
             start: None,
             message_id: None,
+            last_acked_message_id: None,
+            max_capacity: Some(max_capacity),
+            runner_request_ids: None,
+            runner_name: None,
+            runner_id: None,
+            work_folder: None,
+        }
+    }
+
+    const fn resume(last_acked_message_id: u32) -> Self {
+        Self {
+            version: PROTOCOL_VERSION,
+            operation: "resume",
+            start: None,
+            message_id: None,
+            last_acked_message_id: Some(last_acked_message_id),
+            max_capacity: None,
             runner_request_ids: None,
             runner_name: None,
             runner_id: None,
@@ -1176,6 +1250,8 @@ impl<'a> BridgeRequest<'a> {
             operation: "ack",
             start: None,
             message_id: Some(message_id),
+            last_acked_message_id: None,
+            max_capacity: None,
             runner_request_ids: None,
             runner_name: None,
             runner_id: None,
@@ -1189,6 +1265,8 @@ impl<'a> BridgeRequest<'a> {
             operation: "acquire",
             start: None,
             message_id: None,
+            last_acked_message_id: None,
+            max_capacity: None,
             runner_request_ids: Some(request_ids),
             runner_name: None,
             runner_id: None,
@@ -1207,6 +1285,8 @@ impl<'a> BridgeRequest<'a> {
             operation,
             start: None,
             message_id: None,
+            last_acked_message_id: None,
+            max_capacity: None,
             runner_request_ids: None,
             runner_name: Some(runner_name),
             runner_id,
@@ -1521,6 +1601,8 @@ fn known_bridge_error(code: &str) -> Option<&'static str> {
         "not_started" => "not_started",
         "ack_required" => "ack_required",
         "poll_failed" => "poll_failed",
+        "invalid_capacity" => "invalid_capacity",
+        "invalid_recovery" => "invalid_recovery",
         "invalid_message" => "invalid_message",
         "message_mismatch" => "message_mismatch",
         "ack_failed" => "ack_failed",
@@ -1699,9 +1781,9 @@ mod tests {
     #[test]
     fn session_maps_demand_events_and_exact_ack() {
         let transport = ScriptedTransport::new(&[
-            r#"{"version":1,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
-            r#"{"version":1,"type":"message","message_id":7,"statistics":{"available_jobs":1,"acquired_jobs":0,"assigned_jobs":1,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0},"events":[{"kind":"available","runner_request_id":41,"repository":"project","owner":"example","job_id":"job-1","workflow_run_id":99,"request_labels":["smolrunner"]}]}"#,
-            r#"{"version":1,"type":"acked","message_id":7,"acquired_requests":[41]}"#,
+            r#"{"version":2,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
+            r#"{"version":2,"type":"message","message_id":7,"statistics":{"available_jobs":1,"acquired_jobs":0,"assigned_jobs":1,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0},"events":[{"kind":"available","runner_request_id":41,"repository":"project","owner":"example","job_id":"job-1","workflow_run_id":99,"request_labels":["smolrunner"]}]}"#,
+            r#"{"version":2,"type":"acked","message_id":7,"acquired_requests":[41]}"#,
         ]);
         let mut client = ScaleSetBridgeClient::connect_with_transport(
             config(),
@@ -1713,7 +1795,7 @@ mod tests {
             message_id,
             statistics,
             events,
-        } = client.poll().unwrap()
+        } = client.poll(1).unwrap()
         else {
             panic!("expected message")
         };
@@ -1733,11 +1815,64 @@ mod tests {
     }
 
     #[test]
+    fn fresh_session_restores_cursor_and_polls_lifecycle_at_zero_capacity() {
+        let transport = ScriptedTransport::new(&[
+            r#"{"version":2,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
+            r#"{"version":2,"type":"restored","message_id":7}"#,
+            r#"{"version":2,"type":"message","message_id":8,"statistics":{"available_jobs":0,"acquired_jobs":1,"assigned_jobs":1,"running_jobs":1,"registered_runners":1,"busy_runners":1,"idle_runners":0},"events":[{"kind":"started","runner_request_id":41,"repository":"project","owner":"example","job_id":"job-1","workflow_run_id":99,"request_labels":["smolrunner"],"runner_id":81,"runner_name":"smolrunner-job-1"}]}"#,
+        ]);
+        let mut client = ScaleSetBridgeClient::connect_with_transport(
+            config(),
+            GitHubAppPrivateKey::parse(b"private-key".to_vec()).unwrap(),
+            Box::new(transport),
+        )
+        .unwrap();
+
+        assert_eq!(
+            client.resume_after(0).unwrap_err().code(),
+            "invalid_recovery"
+        );
+        client.resume_after(7).unwrap();
+        let ScaleSetBridgePoll::Message {
+            message_id, events, ..
+        } = client.poll(0).unwrap()
+        else {
+            panic!("expected lifecycle message")
+        };
+        assert_eq!(message_id, 8);
+        assert!(matches!(
+            events.as_slice(),
+            [ScaleSetBridgeEvent::Started { .. }]
+        ));
+    }
+
+    #[test]
+    fn zero_capacity_poll_rejects_available_work_and_poisons_the_session() {
+        let (transport, poisoned) = ScriptedTransport::with_poison_probe(&[
+            r#"{"version":2,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
+            r#"{"version":2,"type":"message","message_id":8,"statistics":{"available_jobs":1,"acquired_jobs":0,"assigned_jobs":1,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0},"events":[{"kind":"available","runner_request_id":41,"repository":"project","owner":"example","job_id":"job-1","workflow_run_id":99,"request_labels":["smolrunner"]}]}"#,
+        ]);
+        let mut client = ScaleSetBridgeClient::connect_with_transport(
+            config(),
+            GitHubAppPrivateKey::parse(b"private-key".to_vec()).unwrap(),
+            Box::new(transport),
+        )
+        .unwrap();
+
+        assert_eq!(client.poll(0).unwrap_err().code(), "invalid_bridge_message");
+        assert!(poisoned.get());
+        assert_eq!(
+            client.poll(0).unwrap_err().code(),
+            "bridge_session_poisoned"
+        );
+    }
+
+    #[test]
     fn replayable_acquire_accepts_exact_subset_and_empty_replay() {
         let transport = ScriptedTransport::new(&[
-            r#"{"version":1,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
-            r#"{"version":1,"type":"acquired","acquired_requests":[41,43]}"#,
-            r#"{"version":1,"type":"acquired","acquired_requests":[]}"#,
+            r#"{"version":2,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
+            r#"{"version":2,"type":"acquired","acquired_requests":[41,43]}"#,
+            r#"{"version":2,"type":"acquired","acquired_requests":[]}"#,
         ]);
         let mut client = ScaleSetBridgeClient::connect_with_transport(
             config(),
@@ -1756,8 +1891,8 @@ mod tests {
     #[test]
     fn replayable_acquire_rejects_invalid_requests_before_exchange() {
         let transport = ScriptedTransport::new(&[
-            r#"{"version":1,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
-            r#"{"version":1,"type":"acquired","acquired_requests":[41]}"#,
+            r#"{"version":2,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
+            r#"{"version":2,"type":"acquired","acquired_requests":[41]}"#,
         ]);
         let mut client = ScaleSetBridgeClient::connect_with_transport(
             config(),
@@ -1791,8 +1926,8 @@ mod tests {
     #[test]
     fn replayable_acquire_poisons_foreign_response() {
         let (transport, poisoned) = ScriptedTransport::with_poison_probe(&[
-            r#"{"version":1,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
-            r#"{"version":1,"type":"acquired","acquired_requests":[99]}"#,
+            r#"{"version":2,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
+            r#"{"version":2,"type":"acquired","acquired_requests":[99]}"#,
         ]);
         let mut client = ScaleSetBridgeClient::connect_with_transport(
             config(),
@@ -1806,14 +1941,17 @@ mod tests {
             "invalid_bridge_response"
         );
         assert!(poisoned.get());
-        assert_eq!(client.poll().unwrap_err().code(), "bridge_session_poisoned");
+        assert_eq!(
+            client.poll(1).unwrap_err().code(),
+            "bridge_session_poisoned"
+        );
     }
 
     #[test]
     fn replayable_acquire_preserves_known_service_refusal() {
         let (transport, poisoned) = ScriptedTransport::with_poison_probe(&[
-            r#"{"version":1,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
-            r#"{"version":1,"type":"error","code":"invalid_acquisition_request"}"#,
+            r#"{"version":2,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
+            r#"{"version":2,"type":"error","code":"invalid_acquisition_request"}"#,
         ]);
         let mut client = ScaleSetBridgeClient::connect_with_transport(
             config(),
@@ -1832,8 +1970,8 @@ mod tests {
     #[test]
     fn jit_secret_is_redacted_and_runner_is_exact() {
         let transport = ScriptedTransport::new(&[
-            r#"{"version":1,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
-            r#"{"version":1,"type":"jit","runner":{"id":81,"name":"smolrunner-job-1","scale_set_id":23},"encoded_jit_config":"one-time-secret"}"#,
+            r#"{"version":2,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
+            r#"{"version":2,"type":"jit","runner":{"id":81,"name":"smolrunner-job-1","scale_set_id":23},"encoded_jit_config":"one-time-secret"}"#,
         ]);
         let mut client = ScaleSetBridgeClient::connect_with_transport(
             config(),
@@ -1849,8 +1987,8 @@ mod tests {
         assert_eq!(receipt.config.expose_to_guest_handoff(), b"one-time-secret");
 
         let (transport, poisoned) = ScriptedTransport::with_poison_probe(&[
-            r#"{"version":1,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
-            r#"{"version":1,"type":"jit","runner":{"id":81,"name":"smolrunner-job-1","scale_set_id":23},"encoded_jit_config":"escaped\u002dsecret"}"#,
+            r#"{"version":2,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
+            r#"{"version":2,"type":"jit","runner":{"id":81,"name":"smolrunner-job-1","scale_set_id":23},"encoded_jit_config":"escaped\u002dsecret"}"#,
         ]);
         let mut client = ScaleSetBridgeClient::connect_with_transport(
             config(),
@@ -1869,7 +2007,12 @@ mod tests {
 
     #[test]
     fn unknown_response_fields_and_runnerless_non_cancel_fail_closed() {
-        let unknown_error = match decode_response(br#"{"version":1,"type":"idle","unknown":true}"#)
+        let old_version = match decode_response(br#"{"version":1,"type":"idle"}"#) {
+            Ok(_) => panic!("old protocol response was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(old_version.code(), "invalid_bridge_response");
+        let unknown_error = match decode_response(br#"{"version":2,"type":"idle","unknown":true}"#)
         {
             Ok(_) => panic!("unknown response field was accepted"),
             Err(error) => error,
@@ -1877,8 +2020,8 @@ mod tests {
         assert_eq!(unknown_error.code(), "invalid_bridge_response");
 
         let (transport, poisoned) = ScriptedTransport::with_poison_probe(&[
-            r#"{"version":1,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
-            r#"{"version":1,"type":"idle","unknown":true}"#,
+            r#"{"version":2,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
+            r#"{"version":2,"type":"idle","unknown":true}"#,
         ]);
         let mut client = ScaleSetBridgeClient::connect_with_transport(
             config(),
@@ -1886,11 +2029,14 @@ mod tests {
             Box::new(transport),
         )
         .unwrap();
-        assert_eq!(client.poll().unwrap_err().code(), "invalid_bridge_response");
+        assert_eq!(
+            client.poll(1).unwrap_err().code(),
+            "invalid_bridge_response"
+        );
         assert!(poisoned.get());
 
         let mut response = decode_response(
-            br#"{"version":1,"type":"message","message_id":7,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0},"events":[{"kind":"completed","runner_request_id":41,"repository":"project","owner":"example","job_id":"job-1","workflow_run_id":99,"request_labels":["smolrunner"],"result":"failed"}]}"#,
+            br#"{"version":2,"type":"message","message_id":7,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0},"events":[{"kind":"completed","runner_request_id":41,"repository":"project","owner":"example","job_id":"job-1","workflow_run_id":99,"request_labels":["smolrunner"],"result":"failed"}]}"#,
         )
         .unwrap();
         assert_eq!(
@@ -1907,8 +2053,8 @@ mod tests {
         );
 
         let (transport, poisoned) = ScriptedTransport::with_poison_probe(&[
-            r#"{"version":1,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
-            r#"{"version":1,"type":"message","message_id":8,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0},"events":[{"kind":"completed","runner_request_id":41,"repository":"project","owner":"example","job_id":"job-1","workflow_run_id":99,"request_labels":["smolrunner"],"result":"failed"}]}"#,
+            r#"{"version":2,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
+            r#"{"version":2,"type":"message","message_id":8,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0},"events":[{"kind":"completed","runner_request_id":41,"repository":"project","owner":"example","job_id":"job-1","workflow_run_id":99,"request_labels":["smolrunner"],"result":"failed"}]}"#,
         ]);
         let mut client = ScaleSetBridgeClient::connect_with_transport(
             config(),
@@ -1916,9 +2062,12 @@ mod tests {
             Box::new(transport),
         )
         .unwrap();
-        assert_eq!(client.poll().unwrap_err().code(), "invalid_bridge_event");
+        assert_eq!(client.poll(1).unwrap_err().code(), "invalid_bridge_event");
         assert!(poisoned.get());
-        assert_eq!(client.poll().unwrap_err().code(), "bridge_session_poisoned");
+        assert_eq!(
+            client.poll(1).unwrap_err().code(),
+            "bridge_session_poisoned"
+        );
     }
 
     #[test]
@@ -1929,7 +2078,7 @@ mod tests {
         }
         let mut transport = ChildBridgeTransport::spawn(program).unwrap();
         let error = transport
-            .exchange_with_timeout(&BridgeRequest::poll(), Duration::from_millis(20))
+            .exchange_with_timeout(&BridgeRequest::poll(1), Duration::from_millis(20))
             .unwrap_err();
         assert_eq!(error.code(), "bridge_response_timeout");
         assert!(transport.poisoned);

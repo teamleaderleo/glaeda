@@ -24,7 +24,7 @@ use crate::unix_personal_worker_store::scale_set_delivery_recovery::ScaleSetExte
 /// The production implementation delegates protocol semantics to the pinned official-client
 /// bridge. The trait remains private so callers cannot substitute external mutation authority.
 trait DeliveryBridge {
-    fn poll(&mut self) -> Result<ScaleSetBridgePoll, ScaleSetBridgeError>;
+    fn poll(&mut self, available_capacity: u16) -> Result<ScaleSetBridgePoll, ScaleSetBridgeError>;
     fn ack(&mut self, message_id: u32) -> Result<Vec<u64>, ScaleSetBridgeError>;
     fn acquire(
         &mut self,
@@ -34,8 +34,8 @@ trait DeliveryBridge {
 }
 
 impl DeliveryBridge for ScaleSetBridgeClient {
-    fn poll(&mut self) -> Result<ScaleSetBridgePoll, ScaleSetBridgeError> {
-        self.poll()
+    fn poll(&mut self, available_capacity: u16) -> Result<ScaleSetBridgePoll, ScaleSetBridgeError> {
+        self.poll(available_capacity)
     }
 
     fn ack(&mut self, message_id: u32) -> Result<Vec<u64>, ScaleSetBridgeError> {
@@ -100,7 +100,7 @@ fn consume_with_bridge<B: DeliveryBridge>(
     }
     drop(recovery_store);
 
-    let poll = bridge.poll().map_err(map_bridge_error)?;
+    let poll = bridge.poll(1).map_err(map_bridge_error)?;
     let delivery = match ScaleSetDelivery::from_bridge_poll(&poll) {
         Ok(Some(delivery)) => delivery,
         Ok(None) => return Ok(ScaleSetDeliveryControllerDisposition::Idle),
@@ -153,7 +153,7 @@ fn resume_delivery<B: DeliveryBridge>(
 ) -> Result<ScaleSetDeliveryControllerDisposition, ScaleSetDeliveryControllerError> {
     match current.phase() {
         ScaleSetDeliveryRecoveryPhase::Reconciled => {
-            let poll = bridge.poll().map_err(map_bridge_error)?;
+            let poll = bridge.poll(1).map_err(map_bridge_error)?;
             let observed = match ScaleSetDelivery::from_bridge_poll(&poll) {
                 Ok(Some(delivery)) => delivery,
                 Ok(None) => {

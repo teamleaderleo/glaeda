@@ -173,7 +173,9 @@ Make GitHub the normal control path for agents and humans.
   - [x] Reconcile each canonical delivery with the attempt catalog, checkpoint acknowledgement,
     recover ambiguous acquisition without replaying acknowledgement, and atomically settle the
     delivery fence while preserving acquired work or retiring definitively unacquired capacity.
-    The supervised service loop remains open.
+  - [x] Version the bridge cursor-restore and explicit-capacity polling contract so a fresh session
+    can observe later lifecycle evidence at zero capacity without admitting another job.
+    Durable multi-message ambiguity resolution and the supervised service loop remain open.
 - [ ] Validate every upstream response before it can advance durable state; malformed or internally inconsistent responses retain the prior attempt and fail closed.
 - [ ] Persist a unique runner name before JIT creation; bind the service-assigned runner ID only after exact scale-set identity is observed.
 - [ ] Transfer JIT configuration without argv, public logs, public journals, reusable guest storage, or a long-lived parent environment carrying the secret.
