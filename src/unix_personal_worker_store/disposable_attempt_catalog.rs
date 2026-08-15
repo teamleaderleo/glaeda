@@ -115,7 +115,7 @@ impl UnixPersonalWorkerStore {
             .map_err(map_personal_error)
     }
 
-    fn synchronize_existing_catalog_stage(
+    pub(super) fn synchronize_existing_catalog_stage(
         &self,
         expected: &DisposableAttemptCatalogDocument,
     ) -> Result<(), DisposableAttemptCatalogError> {
@@ -153,7 +153,7 @@ impl UnixPersonalWorkerStore {
         Ok(())
     }
 
-    fn remove_catalog_stage(&self) -> Result<(), DisposableAttemptCatalogError> {
+    pub(super) fn remove_catalog_stage(&self) -> Result<(), DisposableAttemptCatalogError> {
         match fs::unlinkat(&self.directory, STAGED_CATALOG_DOCUMENT, AtFlags::empty()) {
             Ok(()) => synchronize_directory(&self.directory, "personal worker store directory")
                 .map_err(map_personal_error),

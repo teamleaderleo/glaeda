@@ -3,7 +3,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::disposable_attempt_catalog::DisposableAttemptCatalogRevision;
+use crate::disposable_attempt_catalog::DisposableAttemptCatalogDocument;
 use crate::github_scale_set_bridge::{
     ScaleSetBridgeEvent, ScaleSetBridgeJobEvidence, ScaleSetBridgePoll, ScaleSetStatistics,
 };
@@ -97,7 +97,8 @@ fn initial() -> ScaleSetDeliveryRecoveryState {
     .expect("message delivery");
     ScaleSetDeliveryRecoveryState::reconciled(
         delivery,
-        DisposableAttemptCatalogRevision::new(8).expect("catalog revision"),
+        &DisposableAttemptCatalogDocument::empty(),
+        &DisposableAttemptCatalogDocument::empty(),
     )
     .expect("initial recovery state")
 }

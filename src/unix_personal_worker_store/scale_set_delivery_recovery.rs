@@ -341,7 +341,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
-    use crate::disposable_attempt_catalog::DisposableAttemptCatalogRevision;
+    use crate::disposable_attempt_catalog::DisposableAttemptCatalogDocument;
     use crate::github_scale_set_bridge::{
         ScaleSetBridgeEvent, ScaleSetBridgeJobEvidence, ScaleSetBridgePoll, ScaleSetStatistics,
     };
@@ -427,7 +427,8 @@ mod tests {
         .unwrap();
         ScaleSetDeliveryRecoveryState::reconciled(
             delivery,
-            DisposableAttemptCatalogRevision::new(8).unwrap(),
+            &DisposableAttemptCatalogDocument::empty(),
+            &DisposableAttemptCatalogDocument::empty(),
         )
         .unwrap()
     }
@@ -602,7 +603,8 @@ mod tests {
             })
             .unwrap()
             .unwrap(),
-            DisposableAttemptCatalogRevision::new(9).unwrap(),
+            &DisposableAttemptCatalogDocument::empty(),
+            &DisposableAttemptCatalogDocument::empty(),
         )
         .unwrap();
         write_private(
