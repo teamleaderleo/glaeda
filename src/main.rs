@@ -2,8 +2,15 @@ mod personal_worker_cancel_command;
 mod personal_worker_read_command;
 mod personal_worker_submit_command;
 
+#[cfg(target_os = "macos")]
+use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+#[cfg(target_os = "macos")]
+use std::{
+    fs::File,
+    io::{Read as _, Seek as _, SeekFrom},
+};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use personal_worker_cancel_command::{
@@ -19,7 +26,18 @@ use personal_worker_submit_command::{
 };
 #[cfg(target_os = "linux")]
 use rustix::rand::{GetRandomFlags, getrandom};
+#[cfg(target_os = "macos")]
+use rustix::{
+    fs::{self as rustix_fs, AtFlags, FileType, Mode, OFlags},
+    process::{getegid, geteuid},
+};
 use serde::Serialize;
+#[cfg(target_os = "macos")]
+use smolrunner::disposable_worker_enrollment::{
+    MAX_DISPOSABLE_WORKER_ENROLLMENT_BYTES, decode_disposable_worker_enrollment,
+};
+#[cfg(target_os = "macos")]
+use smolrunner::disposable_worker_service::serve_disposable_worker;
 use smolrunner::doctor::{inspect_host, render_human as render_doctor};
 #[cfg(target_os = "linux")]
 use smolrunner::durable_journal::StateStoreJournalCheckpoint;
@@ -148,6 +166,12 @@ enum WorkerCommand {
         /// Explicit absolute normalized personal-worker state root.
         #[arg(long)]
         store_root: PathBuf,
+    },
+    /// Run the enrolled disposable-worker reconciler until the process supervisor stops it.
+    Serve {
+        /// Explicit absolute normalized canonical enrollment document.
+        #[arg(long)]
+        enrollment: PathBuf,
     },
 }
 
@@ -307,6 +331,7 @@ fn main() -> ExitCode {
         },
         Command::Worker { command } => match command {
             WorkerCommand::Status { store_root } => run_worker_status(cli.output, &store_root),
+            WorkerCommand::Serve { enrollment } => run_worker_serve(cli.output, &enrollment),
         },
         Command::Queue { command } => match command {
             QueueCommand::List {
@@ -418,6 +443,207 @@ fn run_worker_status(output: OutputFormat, store_root: &Path) -> ExitCode {
         }
     }
     ExitCode::SUCCESS
+}
+
+#[cfg(target_os = "macos")]
+fn explicit_normalized_absolute_path(path: &Path) -> bool {
+    let normalized = path.components().collect::<PathBuf>();
+    path.is_absolute()
+        && normalized.as_os_str() == path.as_os_str()
+        && !path
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+}
+
+#[cfg(target_os = "macos")]
+fn run_worker_serve(output: OutputFormat, enrollment_path: &Path) -> ExitCode {
+    if !explicit_normalized_absolute_path(enrollment_path) {
+        return emit_runtime_error(
+            output,
+            "disposable_worker_service",
+            "disposable worker enrollment path must be explicit, absolute, and normalized"
+                .to_owned(),
+        );
+    }
+    let bytes = match read_private_disposable_worker_enrollment(enrollment_path) {
+        Ok(bytes) => bytes,
+        Err(()) => {
+            return emit_runtime_error(
+                output,
+                "disposable_worker_service",
+                "disposable worker enrollment is unavailable".to_owned(),
+            );
+        }
+    };
+    let enrollment = match decode_disposable_worker_enrollment(&bytes) {
+        Ok(enrollment) => enrollment,
+        Err(error) => {
+            return emit_runtime_error(
+                output,
+                error.code(),
+                "disposable worker enrollment was refused".to_owned(),
+            );
+        }
+    };
+    match serve_disposable_worker(enrollment) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => emit_runtime_error(
+            output,
+            error.code(),
+            "disposable worker service stopped with a durable blocker".to_owned(),
+        ),
+    }
+}
+
+#[cfg(target_os = "macos")]
+const ENROLLMENT_DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
+    .union(OFlags::DIRECTORY)
+    .union(OFlags::NOFOLLOW)
+    .union(OFlags::CLOEXEC);
+
+#[cfg(target_os = "macos")]
+const ENROLLMENT_FILE_FLAGS: OFlags = OFlags::RDONLY
+    .union(OFlags::NOFOLLOW)
+    .union(OFlags::NONBLOCK)
+    .union(OFlags::CLOEXEC);
+
+#[cfg(target_os = "macos")]
+fn read_private_disposable_worker_enrollment(path: &Path) -> Result<Vec<u8>, ()> {
+    if !explicit_normalized_absolute_path(path) {
+        return Err(());
+    }
+    let parent_path = path.parent().ok_or(())?;
+    let file_name = path.file_name().ok_or(())?;
+    let parent = open_enrollment_directory_chain(parent_path)?;
+    let parent_before = rustix_fs::fstat(&parent).map_err(|_| ())?;
+    inspect_enrollment_parent(&parent_before)?;
+    let resolved_parent = rustix_fs::stat(parent_path).map_err(|_| ())?;
+    if !same_enrollment_directory(&parent_before, &resolved_parent) {
+        return Err(());
+    }
+
+    let held = rustix_fs::openat(&parent, file_name, ENROLLMENT_FILE_FLAGS, Mode::empty())
+        .map_err(|_| ())?;
+    let mut file = File::from(held);
+    let before = rustix_fs::fstat(&file).map_err(|_| ())?;
+    inspect_enrollment_file(&before)?;
+    let path_before =
+        rustix_fs::statat(&parent, file_name, AtFlags::SYMLINK_NOFOLLOW).map_err(|_| ())?;
+    if !same_enrollment_snapshot(&before, &path_before) {
+        return Err(());
+    }
+
+    let mut bytes = Vec::with_capacity(MAX_DISPOSABLE_WORKER_ENROLLMENT_BYTES);
+    file.by_ref()
+        .take((MAX_DISPOSABLE_WORKER_ENROLLMENT_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ())?;
+    if bytes.len() > MAX_DISPOSABLE_WORKER_ENROLLMENT_BYTES {
+        return Err(());
+    }
+    file.seek(SeekFrom::Start(0)).map_err(|_| ())?;
+    let mut confirmation = Vec::with_capacity(bytes.len());
+    file.by_ref()
+        .take((MAX_DISPOSABLE_WORKER_ENROLLMENT_BYTES + 1) as u64)
+        .read_to_end(&mut confirmation)
+        .map_err(|_| ())?;
+    if confirmation != bytes {
+        return Err(());
+    }
+
+    let after = rustix_fs::fstat(&file).map_err(|_| ())?;
+    let path_after =
+        rustix_fs::statat(&parent, file_name, AtFlags::SYMLINK_NOFOLLOW).map_err(|_| ())?;
+    let parent_after = rustix_fs::fstat(&parent).map_err(|_| ())?;
+    let resolved_parent_after = rustix_fs::stat(parent_path).map_err(|_| ())?;
+    if !same_enrollment_snapshot(&before, &after)
+        || !same_enrollment_snapshot(&before, &path_after)
+        || !same_enrollment_directory(&parent_before, &parent_after)
+        || !same_enrollment_directory(&parent_before, &resolved_parent_after)
+    {
+        return Err(());
+    }
+    Ok(bytes)
+}
+
+#[cfg(target_os = "macos")]
+fn open_enrollment_directory_chain(path: &Path) -> Result<std::os::fd::OwnedFd, ()> {
+    let mut directory =
+        rustix_fs::open("/", ENROLLMENT_DIRECTORY_FLAGS, Mode::empty()).map_err(|_| ())?;
+    for component in path.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(name) => {
+                directory =
+                    rustix_fs::openat(&directory, name, ENROLLMENT_DIRECTORY_FLAGS, Mode::empty())
+                        .map_err(|_| ())?;
+            }
+            _ => return Err(()),
+        }
+    }
+    Ok(directory)
+}
+
+#[cfg(target_os = "macos")]
+fn inspect_enrollment_parent(stat: &rustix_fs::Stat) -> Result<(), ()> {
+    if !FileType::from_raw_mode(stat.st_mode).is_dir()
+        || stat.st_uid != geteuid().as_raw()
+        || stat.st_gid != getegid().as_raw()
+        || stat.st_mode & 0o022 != 0
+    {
+        return Err(());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn inspect_enrollment_file(stat: &rustix_fs::Stat) -> Result<(), ()> {
+    if !FileType::from_raw_mode(stat.st_mode).is_file()
+        || stat.st_nlink != 1
+        || stat.st_uid != geteuid().as_raw()
+        || stat.st_gid != getegid().as_raw()
+        || stat.st_mode & 0o7777 != 0o600
+        || stat.st_size < 0
+        || usize::try_from(stat.st_size)
+            .ok()
+            .is_none_or(|size| size > MAX_DISPOSABLE_WORKER_ENROLLMENT_BYTES)
+    {
+        return Err(());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn same_enrollment_snapshot(left: &rustix_fs::Stat, right: &rustix_fs::Stat) -> bool {
+    left.st_dev == right.st_dev
+        && left.st_ino == right.st_ino
+        && left.st_mode == right.st_mode
+        && left.st_nlink == right.st_nlink
+        && left.st_uid == right.st_uid
+        && left.st_gid == right.st_gid
+        && left.st_size == right.st_size
+        && left.st_mtime == right.st_mtime
+        && left.st_mtime_nsec == right.st_mtime_nsec
+        && left.st_ctime == right.st_ctime
+        && left.st_ctime_nsec == right.st_ctime_nsec
+}
+
+#[cfg(target_os = "macos")]
+fn same_enrollment_directory(left: &rustix_fs::Stat, right: &rustix_fs::Stat) -> bool {
+    left.st_dev == right.st_dev
+        && left.st_ino == right.st_ino
+        && left.st_mode == right.st_mode
+        && left.st_uid == right.st_uid
+        && left.st_gid == right.st_gid
+}
+
+#[cfg(not(target_os = "macos"))]
+fn run_worker_serve(output: OutputFormat, _enrollment_path: &Path) -> ExitCode {
+    emit_runtime_error(
+        output,
+        "disposable_worker_service_unsupported",
+        "disposable worker service currently requires macOS".to_owned(),
+    )
 }
 
 fn run_queue_list(
@@ -949,7 +1175,13 @@ fn print_json(value: &impl Serialize) -> Result<(), serde_json::Error> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    use std::fs;
+    #[cfg(target_os = "macos")]
+    use std::os::unix::fs::{PermissionsExt, symlink};
     use std::path::PathBuf;
+    #[cfg(target_os = "macos")]
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use clap::Parser;
 
@@ -960,9 +1192,14 @@ mod tests {
     #[cfg(target_os = "linux")]
     use smolrunner::lane_command::LaneCommandKind;
 
+    #[cfg(target_os = "macos")]
+    use super::read_private_disposable_worker_enrollment;
     use super::{Cli, Command, HostCommand, JobCommand, QueueCommand, WorkerCommand};
     #[cfg(target_os = "linux")]
     use super::{HostPreparePhaseKind, classify_host_prepare_actions};
+
+    #[cfg(target_os = "macos")]
+    static NEXT_ENROLLMENT_ROOT: AtomicU64 = AtomicU64::new(1);
 
     #[test]
     fn host_prepare_accepts_explicit_confirmation_and_account_policy() {
@@ -1111,6 +1348,55 @@ mod tests {
         assert_eq!(generation, 11);
         assert_eq!(cancelled_at, 123456);
         assert_eq!(request_id, "job-one");
+    }
+
+    #[test]
+    fn worker_serve_requires_one_explicit_enrollment_path() {
+        let cli = Cli::try_parse_from([
+            "smolrunner",
+            "worker",
+            "serve",
+            "--enrollment",
+            "/private/etc/smolrunner/worker.json",
+        ])
+        .expect("parse worker serve");
+        let Command::Worker {
+            command: WorkerCommand::Serve { enrollment },
+        } = cli.command
+        else {
+            panic!("expected worker serve command");
+        };
+        assert_eq!(
+            enrollment,
+            PathBuf::from("/private/etc/smolrunner/worker.json")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn worker_serve_reader_accepts_only_a_private_regular_exact_file() {
+        let root = std::env::temp_dir().join(format!(
+            "smolrunner-worker-serve-{}-{}",
+            std::process::id(),
+            NEXT_ENROLLMENT_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let enrollment = root.join("worker.json");
+        fs::write(&enrollment, b"exact-enrollment\n").unwrap();
+        fs::set_permissions(&enrollment, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            read_private_disposable_worker_enrollment(&enrollment).unwrap(),
+            b"exact-enrollment\n"
+        );
+
+        let alias = root.join("alias.json");
+        symlink(&enrollment, &alias).unwrap();
+        assert!(read_private_disposable_worker_enrollment(&alias).is_err());
+        fs::remove_file(alias).unwrap();
+        fs::remove_file(enrollment).unwrap();
+        fs::remove_dir(root).unwrap();
     }
 
     #[cfg(target_os = "linux")]

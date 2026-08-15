@@ -116,6 +116,7 @@ impl UnixPersonalWorkerStore {
     /// This neutral opener intentionally does not inspect or recover any product document. It is
     /// used to acquire the process-lifetime service lease before choosing which document owner is
     /// allowed to recover a crash stage.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn open_or_create_disposable_worker_service_store(
         root_path: impl AsRef<Path>,
     ) -> Result<Self, PersonalWorkerStoreError> {

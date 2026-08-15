@@ -38,7 +38,7 @@ pub mod disposable_worker_enrollment;
 pub mod disposable_worker_reconciler;
 /// Process-lifetime composition of enrollment, durable recovery, coordinator, and supervisor.
 #[cfg(unix)]
-pub(crate) mod disposable_worker_service;
+pub mod disposable_worker_service;
 #[cfg(unix)]
 pub(crate) mod disposable_worker_supervisor;
 pub mod doctor;
