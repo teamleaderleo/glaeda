@@ -31,6 +31,9 @@ pub mod disposable_template_generation;
 pub mod disposable_template_runtime;
 #[cfg(unix)]
 pub(crate) mod disposable_worker_coordinator;
+/// Canonical, secret-free operator enrollment for one disposable Scale Set worker.
+#[cfg(unix)]
+pub mod disposable_worker_enrollment;
 /// Pure capacity and lifecycle reconciliation for one-job disposable workers.
 pub mod disposable_worker_reconciler;
 #[cfg(unix)]
