@@ -12,6 +12,7 @@ use crate::github_scale_set_delivery_state::{
 
 mod controller_transaction;
 mod reconcile_transaction;
+mod settlement_transaction;
 
 pub(crate) use controller_transaction::ScaleSetExternalTransaction;
 
@@ -313,6 +314,16 @@ fn exact_recovery_successor(
         ScaleSetDeliveryRecoveryPhase::AcquisitionRecoveryObserved { acquired } => {
             current.record_recovery_acquire(acquired)
         }
+        ScaleSetDeliveryRecoveryPhase::SettlementPrepared {
+            prior_catalog,
+            catalog_revision,
+            catalog_digest,
+            ..
+        } => current.prepare_settlement_binding(
+            prior_catalog.clone(),
+            *catalog_revision,
+            catalog_digest.clone(),
+        ),
         ScaleSetDeliveryRecoveryPhase::Reconciled => return false,
     };
     expected.is_ok_and(|expected| expected == *candidate)

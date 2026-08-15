@@ -142,7 +142,7 @@ impl UnixPersonalWorkerStore {
         Ok((catalog_successor, recovery))
     }
 
-    fn recover_scale_set_reconcile_transaction_locked(
+    pub(super) fn recover_scale_set_reconcile_transaction_locked(
         &mut self,
     ) -> Result<(), PersonalWorkerStoreError> {
         self.refuse_unsettled_scale_set_neighbors()?;

@@ -187,6 +187,15 @@ fn initialize(root: &TempRoot) -> DisposableAttemptCatalogDocument {
         .0
 }
 
+fn load_catalog(root: &TempRoot) -> DisposableAttemptCatalogDocument {
+    DisposableAttemptCatalog::new(
+        UnixPersonalWorkerStore::open_or_create_disposable_catalog(root.path())
+            .expect("open catalog"),
+    )
+    .load()
+    .expect("load catalog")
+}
+
 fn prepare_reconciled(root: &TempRoot, poll: &ScaleSetBridgePoll) -> ScaleSetDeliveryRecoveryState {
     let catalog = DisposableAttemptCatalog::new(
         UnixPersonalWorkerStore::open_or_create_disposable_catalog(root.path())
@@ -219,6 +228,13 @@ fn load_recovery(root: &TempRoot) -> ScaleSetDeliveryRecoveryState {
         .expect("recovery exists")
 }
 
+fn maybe_recovery(root: &TempRoot) -> Option<ScaleSetDeliveryRecoveryState> {
+    UnixPersonalWorkerStore::open_or_create_scale_set_delivery_controller(root.path())
+        .expect("open controller store")
+        .load_scale_set_delivery_recovery()
+        .expect("load recovery")
+}
+
 #[test]
 fn poll_persists_before_ack_and_records_the_exact_acquired_subset() {
     let root = TempRoot::new("happy");
@@ -233,14 +249,40 @@ fn poll_persists_before_ack_and_records_the_exact_acquired_subset() {
         .expect("consume message");
     assert_eq!(
         result,
-        ScaleSetDeliveryControllerDisposition::Acknowledged { acquired: 1 }
+        ScaleSetDeliveryControllerDisposition::Settled { acquired: 1 }
     );
     assert_eq!(bridge.calls, ["poll", "ack"]);
-    assert!(matches!(
-        load_recovery(&root).phase(),
-        ScaleSetDeliveryRecoveryPhase::Acknowledged { acquired }
-            if acquired == &[ScaleSetRunnerRequestId::new(41).unwrap()]
-    ));
+    assert!(maybe_recovery(&root).is_none());
+    assert!(
+        load_catalog(&root)
+            .find_active_by_runner_request_id(ScaleSetRunnerRequestId::new(41).unwrap())
+            .is_some()
+    );
+}
+
+#[test]
+fn definitively_unacquired_available_request_retires_with_the_delivery_fence() {
+    let root = TempRoot::new("unacquired");
+    initialize(&root);
+    let request = ScaleSetRunnerRequestId::new(141).expect("request id");
+    let mut bridge = FakeBridge {
+        polls: VecDeque::from([message(107, request.get())]),
+        acknowledgements: VecDeque::from([Ok(Vec::new())]),
+        ..FakeBridge::default()
+    };
+
+    assert_eq!(
+        consume_with_bridge(root.path(), &policy(), &mut bridge, observed_at()).unwrap(),
+        ScaleSetDeliveryControllerDisposition::Settled { acquired: 0 }
+    );
+    assert!(maybe_recovery(&root).is_none());
+    let catalog = load_catalog(&root);
+    assert!(catalog.active().is_empty());
+    assert!(
+        catalog
+            .find_tombstone_by_runner_request_id(request)
+            .is_some()
+    );
 }
 
 #[test]
@@ -248,7 +290,7 @@ fn reconciled_restart_requires_exact_redelivery_before_ack() {
     let root = TempRoot::new("redelivery");
     initialize(&root);
     let poll = message(8, 42);
-    let initial = prepare_reconciled(&root, &poll);
+    prepare_reconciled(&root, &poll);
     let mut bridge = FakeBridge {
         polls: VecDeque::from([poll]),
         acknowledgements: VecDeque::from([Ok(vec![42])]),
@@ -257,10 +299,10 @@ fn reconciled_restart_requires_exact_redelivery_before_ack() {
 
     assert_eq!(
         consume_with_bridge(root.path(), &policy(), &mut bridge, observed_at()).unwrap(),
-        ScaleSetDeliveryControllerDisposition::Acknowledged { acquired: 1 }
+        ScaleSetDeliveryControllerDisposition::Settled { acquired: 1 }
     );
     assert_eq!(bridge.calls, ["poll", "ack"]);
-    assert_eq!(load_recovery(&root).revision(), initial.revision() + 2);
+    assert!(maybe_recovery(&root).is_none());
 }
 
 #[test]
@@ -301,7 +343,7 @@ fn acknowledgement_failure_leaves_started_and_never_replays_ack() {
     };
     assert_eq!(
         consume_with_bridge(root.path(), &policy(), &mut recovery_bridge, observed_at(),).unwrap(),
-        ScaleSetDeliveryControllerDisposition::AcquisitionRecoveryObserved { acquired: 1 }
+        ScaleSetDeliveryControllerDisposition::Settled { acquired: 1 }
     );
     assert_eq!(recovery_bridge.calls, ["acquire"]);
 }
@@ -318,7 +360,7 @@ fn canonical_writer_lock_spans_the_acknowledgement_call() {
 
     assert_eq!(
         consume_with_bridge(root.path(), &policy(), &mut bridge, observed_at()).unwrap(),
-        ScaleSetDeliveryControllerDisposition::Acknowledged { acquired: 1 }
+        ScaleSetDeliveryControllerDisposition::Settled { acquired: 1 }
     );
     assert!(bridge.saw_busy);
 }
@@ -367,14 +409,10 @@ fn acknowledgement_started_uses_only_standalone_acquisition_after_restart() {
 
     assert_eq!(
         consume_with_bridge(root.path(), &policy(), &mut bridge, observed_at()).unwrap(),
-        ScaleSetDeliveryControllerDisposition::AcquisitionRecoveryObserved { acquired: 1 }
+        ScaleSetDeliveryControllerDisposition::Settled { acquired: 1 }
     );
     assert_eq!(bridge.calls, ["acquire"]);
-    assert!(matches!(
-        load_recovery(&root).phase(),
-        ScaleSetDeliveryRecoveryPhase::AcquisitionRecoveryObserved { acquired }
-            if acquired == &[request]
-    ));
+    assert!(maybe_recovery(&root).is_none());
 }
 
 #[test]
@@ -405,6 +443,12 @@ fn empty_acquisition_replay_remains_explicit_recovery_debt() {
         ScaleSetDeliveryRecoveryPhase::AcquisitionRecoveryObserved { acquired }
             if acquired.is_empty()
     ));
+    assert_eq!(
+        UnixPersonalWorkerStore::open_or_create_disposable_catalog(root.path())
+            .expect_err("ambiguous acquisition must retain the catalog fence")
+            .kind(),
+        DisposableAttemptCatalogErrorKind::RecoveryRequired
+    );
 }
 
 #[test]

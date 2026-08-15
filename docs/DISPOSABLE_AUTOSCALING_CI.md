@@ -127,8 +127,13 @@ staged and recovered as one transaction, including messages that advance several
 revisions. The acknowledgement controller retains that lock across the durable Started checkpoint,
 one bounded bridge call, and publication of the acquired subset. After response loss it never
 replays acknowledgement; a fresh session may only replay acquisition for the exact retained
-request IDs, and an empty response remains explicit recovery debt. Delivery settlement, enrollment,
-the service loop, and guest JIT handoff do not exist yet, so this is not production capacity.
+request IDs, and an empty response remains explicit recovery debt. Conclusive acknowledgement or
+positive recovery evidence now enters a paired settlement: the durable intent binds the exact
+target catalog, positively acquired attempts remain reserved, definitively unacquired Available
+requests complete without VM-cleanup authority and move to bounded replay history, and only then is
+the delivery fence removed. Crashes before or after either catalog publication recover this exact
+ordering. Enrollment, the service loop, and guest JIT handoff do not exist yet, so this is not
+production capacity.
 
 Acceptance: an enrolled test repository targets the SmolRunner scale-set label, queues a job, and receives its result without operator commands; the JIT runner cannot accept a second job and its credential is absent after VM destruction.
 

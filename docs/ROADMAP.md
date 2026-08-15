@@ -169,7 +169,11 @@ Make GitHub the normal control path for agents and humans.
   reviewed SHA-256 identity, and bound every bridge operation with a finite deadline.
 - [ ] Integrate a pinned Runner Scale Set Client behind a narrow adapter for demand, sessions, acknowledgement, JIT generation, job-start, and job-completion observations.
   - [x] Pin the official Go client behind a bounded empty-environment bridge whose messages require
-    an explicit post-persistence acknowledgement; the durable service consumer remains open.
+    an explicit post-persistence acknowledgement.
+  - [x] Reconcile each canonical delivery with the attempt catalog, checkpoint acknowledgement,
+    recover ambiguous acquisition without replaying acknowledgement, and atomically settle the
+    delivery fence while preserving acquired work or retiring definitively unacquired capacity.
+    The supervised service loop remains open.
 - [ ] Validate every upstream response before it can advance durable state; malformed or internally inconsistent responses retain the prior attempt and fail closed.
 - [ ] Persist a unique runner name before JIT creation; bind the service-assigned runner ID only after exact scale-set identity is observed.
 - [ ] Transfer JIT configuration without argv, public logs, public journals, reusable guest storage, or a long-lived parent environment carrying the secret.
