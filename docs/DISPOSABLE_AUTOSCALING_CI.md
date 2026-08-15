@@ -184,6 +184,11 @@ clone process, network-gate composition, and the physical GitHub/Lima acceptance
 The coordinator is therefore the complete one-step lifecycle engine, not yet an installed
 unattended service.
 
+The next narrow supervisor layer fixes idle pacing, caps immediate progress bursts, discards a
+failed or recovery-required bridge session before reconnect, applies bounded retry delays, and
+opens a five-minute circuit after five consecutive failures. Its stop/wait and session-connection
+surfaces remain injected until the operator enrollment and launchd entry point are connected.
+
 Acceptance: an enrolled test repository targets the SmolRunner scale-set label, queues a job, and receives its result without operator commands; the JIT runner cannot accept a second job and its credential is absent after VM destruction.
 
 ### M4 — hostile-CI network and nested-container policy

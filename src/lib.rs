@@ -33,6 +33,8 @@ pub mod disposable_template_runtime;
 pub(crate) mod disposable_worker_coordinator;
 /// Pure capacity and lifecycle reconciliation for one-job disposable workers.
 pub mod disposable_worker_reconciler;
+#[cfg(unix)]
+pub(crate) mod disposable_worker_supervisor;
 pub mod doctor;
 pub mod durable_journal;
 #[cfg(target_os = "linux")]
