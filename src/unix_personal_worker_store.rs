@@ -21,6 +21,8 @@ use crate::personal_worker_store::{
 
 /// Same-lock durable persistence for the disposable-attempt catalog.
 mod disposable_attempt_catalog;
+/// Same-lock observation-first teardown of one exact disposable VM and runner registration.
+pub(crate) mod disposable_cleanup_transaction;
 /// Same-lock clone checkpoint, execution, and identity publication.
 mod disposable_clone_transaction;
 /// Same-lock JIT generation, runner registration, and guest start transaction.

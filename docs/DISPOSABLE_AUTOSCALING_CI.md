@@ -163,9 +163,15 @@ post-checkpoint rediscovered runner ID, publishes the start no-replay checkpoint
 zeroizing secret once through the fixed bounded command, and confirms the retained target identity
 again after execution. A failed or response-lost JIT request remains recovery debt and is never
 regenerated; a rediscovered registration is retained for cleanup without receiving a second secret.
-Injected crash and drift tests exercise this transaction. Production service composition,
-operator enrollment, terminal cleanup, and the physical GitHub/Lima acceptance run remain open, so
-this is executable lifecycle foundation rather than unattended production capacity.
+Injected crash and drift tests exercise this transaction. A separate private cleanup transaction
+now advances one terminal attempt through Destroying, Deregistering, Releasing, and Complete under
+that same lock. It observes before every external mutation, deletes only a freshly reconfirmed
+descriptor-bound VM and the exact durable runner ID, treats response-lost deletion as unchanged
+cleanup debt, remains able to remove an old worker after a prepared-template upgrade, and releases
+the host budget only after both external objects are proven absent.
+Production service composition, operator enrollment, complete-attempt retirement, and the physical
+GitHub/Lima acceptance run remain open, so this is executable lifecycle foundation rather than
+unattended production capacity.
 
 Acceptance: an enrolled test repository targets the SmolRunner scale-set label, queues a job, and receives its result without operator commands; the JIT runner cannot accept a second job and its credential is absent after VM destruction.
 
