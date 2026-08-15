@@ -138,8 +138,7 @@ fn delivery(message_id: u32, request_id: u64) -> ScaleSetDelivery {
 
 fn write_private(path: &Path, bytes: &[u8]) {
     fs::write(path, bytes).expect("write private fixture");
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-        .expect("set private fixture mode");
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("set private fixture mode");
 }
 
 #[test]
@@ -191,6 +190,7 @@ fn delivery_only_future_stage_rolls_back_without_advancing_catalog() {
         .stage_scale_set_delivery(&recovery)
         .expect("stage delivery");
     staged.disarm();
+    drop(staged);
     drop(store);
 
     let reopened =
@@ -232,6 +232,8 @@ fn both_exact_stages_recover_catalog_then_delivery() {
     staged_delivery.disarm();
     let mut staged_catalog = store.stage_catalog(&next).expect("stage catalog");
     staged_catalog.disarm();
+    drop(staged_catalog);
+    drop(staged_delivery);
     drop(store);
 
     let reopened =
@@ -261,6 +263,7 @@ fn catalog_only_stage_keeps_ordinary_catalog_recovery_semantics() {
             .expect("open reconcile transaction");
     let mut staged_catalog = store.stage_catalog(&next).expect("stage catalog");
     staged_catalog.disarm();
+    drop(staged_catalog);
     drop(store);
 
     let reopened =
