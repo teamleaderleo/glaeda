@@ -28,7 +28,8 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::artifact::Sha256Digest;
 use crate::github_scale_set_protocol::{
-    ScaleSetJobId, ScaleSetJobResult, ScaleSetRunnerId, ScaleSetRunnerName, ScaleSetRunnerReference,
+    ScaleSetJobId, ScaleSetJobResult, ScaleSetRunnerId, ScaleSetRunnerName,
+    ScaleSetRunnerReference, ScaleSetRunnerRequestId,
 };
 use crate::{disposable_worker_reconciler::ScaleSetDemand, execution_admission::EpochMillis};
 
@@ -37,6 +38,7 @@ const MAX_PROTOCOL_LINE_BYTES: usize = 128 * 1024;
 const MAX_PRIVATE_KEY_BYTES: usize = 64 * 1024;
 const MAX_JIT_CONFIG_BYTES: usize = 64 * 1024;
 const MAX_EVENTS: usize = 50;
+const MAX_ACQUIRE_REQUESTS: usize = 50;
 const MAX_LABELS: usize = 32;
 const MAX_BRIDGE_PROGRAM_BYTES: u64 = 64 * 1024 * 1024;
 const BRIDGE_PROGRAM: &str = "/opt/smolrunner/bin/scaleset-bridge";
@@ -849,6 +851,63 @@ impl ScaleSetBridgeClient {
         self.finish_response(result)
     }
 
+    pub(crate) fn acquire(
+        &mut self,
+        request_ids: &[ScaleSetRunnerRequestId],
+    ) -> Result<Vec<ScaleSetRunnerRequestId>, ScaleSetBridgeError> {
+        if request_ids.is_empty() || request_ids.len() > MAX_ACQUIRE_REQUESTS {
+            return Err(ScaleSetBridgeError::new("invalid_acquisition_request"));
+        }
+        let mut requested = BTreeSet::new();
+        for request_id in request_ids {
+            if !requested.insert(request_id.get()) {
+                return Err(ScaleSetBridgeError::new("invalid_acquisition_request"));
+            }
+        }
+
+        let mut response = exchange_and_decode(
+            self.transport.as_mut(),
+            &BridgeRequest::acquire(request_ids),
+        )?;
+        let result = (|| {
+            if response.response_type == "error" {
+                return Err(response.bridge_error()?);
+            }
+            if response.response_type != "acquired"
+                || response.code.is_some()
+                || response.scale_set_id.is_some()
+                || response.message_id.is_some()
+                || response.statistics.is_some()
+                || !response.events.is_empty()
+                || response.runner.is_some()
+                || response.encoded_jit_config.is_some()
+                || response.acquired_requests.len() > request_ids.len()
+            {
+                return Err(ScaleSetBridgeError::new("invalid_bridge_response"));
+            }
+
+            let mut seen = BTreeSet::new();
+            let mut previous = None;
+            let mut acquired = Vec::with_capacity(response.acquired_requests.len());
+            for id in std::mem::take(&mut response.acquired_requests) {
+                if id == 0
+                    || !requested.contains(&id)
+                    || !seen.insert(id)
+                    || previous.is_some_and(|previous| previous >= id)
+                {
+                    return Err(ScaleSetBridgeError::new("invalid_bridge_response"));
+                }
+                previous = Some(id);
+                acquired.push(
+                    ScaleSetRunnerRequestId::new(id)
+                        .map_err(|_| ScaleSetBridgeError::new("invalid_bridge_response"))?,
+                );
+            }
+            Ok(acquired)
+        })();
+        self.finish_response(result)
+    }
+
     pub(crate) fn generate_jit(
         &mut self,
         runner_name: &ScaleSetRunnerName,
@@ -1038,6 +1097,8 @@ struct BridgeRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     message_id: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    runner_request_ids: Option<&'a [ScaleSetRunnerRequestId]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     runner_name: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     runner_id: Option<u64>,
@@ -1085,6 +1146,7 @@ impl<'a> BridgeRequest<'a> {
                 max_capacity: config.target.max_capacity,
             }),
             message_id: None,
+            runner_request_ids: None,
             runner_name: None,
             runner_id: None,
             work_folder: None,
@@ -1097,6 +1159,7 @@ impl<'a> BridgeRequest<'a> {
             operation: "poll",
             start: None,
             message_id: None,
+            runner_request_ids: None,
             runner_name: None,
             runner_id: None,
             work_folder: None,
@@ -1109,6 +1172,20 @@ impl<'a> BridgeRequest<'a> {
             operation: "ack",
             start: None,
             message_id: Some(message_id),
+            runner_request_ids: None,
+            runner_name: None,
+            runner_id: None,
+            work_folder: None,
+        }
+    }
+
+    const fn acquire(request_ids: &'a [ScaleSetRunnerRequestId]) -> Self {
+        Self {
+            version: PROTOCOL_VERSION,
+            operation: "acquire",
+            start: None,
+            message_id: None,
+            runner_request_ids: Some(request_ids),
             runner_name: None,
             runner_id: None,
             work_folder: None,
@@ -1126,6 +1203,7 @@ impl<'a> BridgeRequest<'a> {
             operation,
             start: None,
             message_id: None,
+            runner_request_ids: None,
             runner_name: Some(runner_name),
             runner_id,
             work_folder,
@@ -1442,6 +1520,7 @@ fn known_bridge_error(code: &str) -> Option<&'static str> {
         "invalid_message" => "invalid_message",
         "message_mismatch" => "message_mismatch",
         "ack_failed" => "ack_failed",
+        "invalid_acquisition_request" => "invalid_acquisition_request",
         "acquire_failed" => "acquire_failed",
         "invalid_acquisition" => "invalid_acquisition",
         "invalid_runner" => "invalid_runner",
@@ -1562,6 +1641,10 @@ mod tests {
         .unwrap()
     }
 
+    fn request_id(value: u64) -> ScaleSetRunnerRequestId {
+        ScaleSetRunnerRequestId::new(value).unwrap()
+    }
+
     #[test]
     fn keychain_and_program_configuration_fail_closed() {
         assert!(
@@ -1643,6 +1726,103 @@ mod tests {
             [ScaleSetBridgeEvent::Available(_)]
         ));
         assert_eq!(client.ack(7).unwrap(), vec![41]);
+    }
+
+    #[test]
+    fn replayable_acquire_accepts_exact_subset_and_empty_replay() {
+        let transport = ScriptedTransport::new(&[
+            r#"{"version":1,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
+            r#"{"version":1,"type":"acquired","acquired_requests":[41,43]}"#,
+            r#"{"version":1,"type":"acquired","acquired_requests":[]}"#,
+        ]);
+        let mut client = ScaleSetBridgeClient::connect_with_transport(
+            config(),
+            GitHubAppPrivateKey::parse(b"private-key".to_vec()).unwrap(),
+            Box::new(transport),
+        )
+        .unwrap();
+        let requested = [request_id(41), request_id(42), request_id(43)];
+        assert_eq!(
+            client.acquire(&requested).unwrap(),
+            vec![request_id(41), request_id(43)]
+        );
+        assert!(client.acquire(&requested).unwrap().is_empty());
+    }
+
+    #[test]
+    fn replayable_acquire_rejects_invalid_requests_before_exchange() {
+        let transport = ScriptedTransport::new(&[
+            r#"{"version":1,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
+            r#"{"version":1,"type":"acquired","acquired_requests":[41]}"#,
+        ]);
+        let mut client = ScaleSetBridgeClient::connect_with_transport(
+            config(),
+            GitHubAppPrivateKey::parse(b"private-key".to_vec()).unwrap(),
+            Box::new(transport),
+        )
+        .unwrap();
+
+        assert_eq!(
+            client.acquire(&[]).unwrap_err().code(),
+            "invalid_acquisition_request"
+        );
+        assert_eq!(
+            client
+                .acquire(&[request_id(41), request_id(41)])
+                .unwrap_err()
+                .code(),
+            "invalid_acquisition_request"
+        );
+        let oversized = (1..=51).map(request_id).collect::<Vec<_>>();
+        assert_eq!(
+            client.acquire(&oversized).unwrap_err().code(),
+            "invalid_acquisition_request"
+        );
+        assert_eq!(
+            client.acquire(&[request_id(41)]).unwrap(),
+            vec![request_id(41)]
+        );
+    }
+
+    #[test]
+    fn replayable_acquire_poisons_foreign_response() {
+        let (transport, poisoned) = ScriptedTransport::with_poison_probe(&[
+            r#"{"version":1,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
+            r#"{"version":1,"type":"acquired","acquired_requests":[99]}"#,
+        ]);
+        let mut client = ScaleSetBridgeClient::connect_with_transport(
+            config(),
+            GitHubAppPrivateKey::parse(b"private-key".to_vec()).unwrap(),
+            Box::new(transport),
+        )
+        .unwrap();
+
+        assert_eq!(
+            client.acquire(&[request_id(41)]).unwrap_err().code(),
+            "invalid_bridge_response"
+        );
+        assert!(poisoned.get());
+        assert_eq!(client.poll().unwrap_err().code(), "bridge_session_poisoned");
+    }
+
+    #[test]
+    fn replayable_acquire_preserves_known_service_refusal() {
+        let (transport, poisoned) = ScriptedTransport::with_poison_probe(&[
+            r#"{"version":1,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
+            r#"{"version":1,"type":"error","code":"invalid_acquisition_request"}"#,
+        ]);
+        let mut client = ScaleSetBridgeClient::connect_with_transport(
+            config(),
+            GitHubAppPrivateKey::parse(b"private-key".to_vec()).unwrap(),
+            Box::new(transport),
+        )
+        .unwrap();
+
+        assert_eq!(
+            client.acquire(&[request_id(41)]).unwrap_err().code(),
+            "invalid_acquisition_request"
+        );
+        assert!(!poisoned.get());
     }
 
     #[test]
