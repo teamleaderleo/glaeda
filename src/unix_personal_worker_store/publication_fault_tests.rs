@@ -9,7 +9,7 @@ use crate::github_scale_set_bridge::{
 };
 use crate::github_scale_set_delivery::ScaleSetDelivery;
 use crate::github_scale_set_delivery_state::ScaleSetDeliveryRecoveryState;
-use crate::github_scale_set_protocol::{ScaleSetJobId, ScaleSetRunnerRequestId};
+use crate::github_scale_set_protocol::ScaleSetJobId;
 use crate::personal_worker_store::PersonalWorkerStoreErrorKind;
 
 use super::publication_fault::{PublicationFaultPoint, inject_publication_fault};
