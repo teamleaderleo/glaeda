@@ -119,10 +119,9 @@ fn pre_rename_publication_faults_leave_initial_delivery_unpublished() {
             PublicationFaultPoint::PublishRename => "create-rename",
             PublicationFaultPoint::PublicationDirectorySync => unreachable!(),
         });
-        let mut store = UnixPersonalWorkerStore::open_or_create_scale_set_delivery_recovery(
-            root.path(),
-        )
-        .expect("open delivery store");
+        let mut store =
+            UnixPersonalWorkerStore::open_or_create_scale_set_delivery_recovery(root.path())
+                .expect("open delivery store");
         let state = initial();
         let fault = inject_publication_fault(point);
         let error = store
@@ -140,10 +139,9 @@ fn pre_rename_publication_faults_leave_initial_delivery_unpublished() {
         assert!(!root.staged_delivery().exists());
         drop(store);
 
-        let reopened = UnixPersonalWorkerStore::open_or_create_scale_set_delivery_recovery(
-            root.path(),
-        )
-        .expect("reopen delivery store");
+        let reopened =
+            UnixPersonalWorkerStore::open_or_create_scale_set_delivery_recovery(root.path())
+                .expect("reopen delivery store");
         assert_eq!(
             reopened
                 .load_scale_set_delivery_recovery()
@@ -200,10 +198,9 @@ fn replacement_faults_preserve_old_or_publish_successor_truthfully() {
             PublicationFaultPoint::PublishRename => "replace-rename",
             PublicationFaultPoint::PublicationDirectorySync => "replace-directory-sync",
         });
-        let mut store = UnixPersonalWorkerStore::open_or_create_scale_set_delivery_recovery(
-            root.path(),
-        )
-        .expect("open delivery store");
+        let mut store =
+            UnixPersonalWorkerStore::open_or_create_scale_set_delivery_recovery(root.path())
+                .expect("open delivery store");
         let current = initial();
         store
             .create_scale_set_delivery_recovery(&current)
@@ -231,10 +228,9 @@ fn replacement_faults_preserve_old_or_publish_successor_truthfully() {
         assert!(!root.staged_delivery().exists());
         drop(store);
 
-        let reopened = UnixPersonalWorkerStore::open_or_create_scale_set_delivery_recovery(
-            root.path(),
-        )
-        .expect("reopen delivery store");
+        let reopened =
+            UnixPersonalWorkerStore::open_or_create_scale_set_delivery_recovery(root.path())
+                .expect("reopen delivery store");
         assert_eq!(
             reopened
                 .load_scale_set_delivery_recovery()
