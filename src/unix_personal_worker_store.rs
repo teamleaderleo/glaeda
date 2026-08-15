@@ -111,6 +111,33 @@ impl PersonalWorkerStoreReadOnlyInspection {
 }
 
 impl UnixPersonalWorkerStore {
+    /// Open or create only the shared disposable-worker store and its canonical lock.
+    ///
+    /// This neutral opener intentionally does not inspect or recover any product document. It is
+    /// used to acquire the process-lifetime service lease before choosing which document owner is
+    /// allowed to recover a crash stage.
+    pub(crate) fn open_or_create_disposable_worker_service_store(
+        root_path: impl AsRef<Path>,
+    ) -> Result<Self, PersonalWorkerStoreError> {
+        let root = fs::open(root_path.as_ref(), DIRECTORY_FLAGS, Mode::empty())
+            .map_err(map_root_open_error)?;
+        let root_stat = inspect_directory(&root, "disposable worker service root", None)?;
+        let owner = (root_stat.st_uid, root_stat.st_gid);
+        let (directory, publication_lock) = open_or_publish_initialization_directory(&root, owner)?;
+        let store = Self {
+            _root: root,
+            directory,
+            owner,
+        };
+        let _lock = match publication_lock {
+            Some(lock) => lock,
+            None => store.acquire_mutation_lock()?,
+        };
+        synchronize_directory(&store._root, "disposable worker service root")?;
+        synchronize_directory(&store.directory, "personal worker store directory")?;
+        Ok(store)
+    }
+
     pub fn open_or_create(
         root_path: impl AsRef<Path>,
     ) -> Result<(Self, PersonalWorkerStoreRecovery), PersonalWorkerStoreError> {

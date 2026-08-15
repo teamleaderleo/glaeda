@@ -179,10 +179,11 @@ and final bounded tombstone retirement. Restart tests cover a reconciled-but-una
 delivery, and an injected lifecycle test reaches an empty catalog after one runner and VM are
 removed.
 
-Operator enrollment, launchd supervision/backoff, automatic quiescence of an unbound ambiguous
-clone process, network-gate composition, and the physical GitHub/Lima acceptance run remain open.
-The coordinator is therefore the complete one-step lifecycle engine, not yet an installed
-unattended service.
+The current-main service driver now recovers local delivery/catalog state, acquires one
+process-lifetime controller lease before credential access, and composes the coordinator with the
+bounded supervisor loop. The `worker serve` CLI, launchd installation, automatic quiescence of an
+unbound ambiguous clone process, network-gate composition, and the physical GitHub/Lima acceptance
+run remain open; this is not yet an installed unattended service.
 
 The next narrow supervisor layer fixes idle pacing, caps immediate progress bursts, discards a
 failed or recovery-required bridge session before reconnect, applies bounded retry delays, and
