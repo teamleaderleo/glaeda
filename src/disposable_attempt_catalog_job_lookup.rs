@@ -100,18 +100,22 @@ mod tests {
             .expect("complete cleanup")
     }
 
+    fn canonical_embedded_attempt_json(attempt: &DisposableAttemptState) -> String {
+        let encoded = encode_disposable_attempt_state(attempt).expect("encode attempt");
+        let value: serde_json::Value =
+            serde_json::from_slice(&encoded).expect("parse encoded attempt value");
+        serde_json::to_string(&value).expect("canonicalize embedded attempt value")
+    }
+
     fn canonical_catalog(
         active: &DisposableAttemptState,
         tombstone: &DisposableAttemptState,
     ) -> DisposableAttemptCatalogDocument {
-        let active_json = String::from_utf8(
-            encode_disposable_attempt_state(active).expect("encode active attempt"),
-        )
-        .expect("active attempt JSON");
-        let tombstone_json = String::from_utf8(
-            encode_disposable_attempt_state(tombstone).expect("encode tombstone"),
-        )
-        .expect("tombstone JSON");
+        // The catalog codec embeds attempt documents through `serde_json::Value`, which applies
+        // the value-map key ordering before the outer catalog is serialized. Mirror that exact
+        // boundary here instead of splicing the standalone attempt codec bytes directly.
+        let active_json = canonical_embedded_attempt_json(active);
+        let tombstone_json = canonical_embedded_attempt_json(tombstone);
         let template = current_disposable_prepared_template()
             .expect("prepared template")
             .identity()
