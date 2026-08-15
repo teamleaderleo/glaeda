@@ -10,6 +10,8 @@ use crate::github_scale_set_delivery_state::{
     encode_scale_set_delivery_recovery,
 };
 
+mod reconcile_transaction;
+
 pub(super) const DELIVERY_RECOVERY_DOCUMENT: &str = "scale-set-delivery-recovery.json";
 pub(super) const STAGED_DELIVERY_RECOVERY_DOCUMENT: &str = ".scale-set-delivery-recovery.next.json";
 
