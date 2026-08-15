@@ -7,7 +7,8 @@ use smolrunner::disposable_worker_reconciler::{
 };
 use smolrunner::execution_admission::EpochMillis;
 use smolrunner::github_scale_set_protocol::{
-    ScaleSetJobId, ScaleSetJobResult, ScaleSetRunnerId, ScaleSetRunnerName, ScaleSetRunnerReference,
+    ScaleSetJobId, ScaleSetJobResult, ScaleSetRunnerId, ScaleSetRunnerName,
+    ScaleSetRunnerReference, ScaleSetRunnerRequestId,
 };
 
 fn reserved() -> DisposableAttemptState {
@@ -16,6 +17,7 @@ fn reserved() -> DisposableAttemptState {
         CapacityClaimId::parse("claim-1").unwrap(),
         DisposableVmId::parse("vm-attempt-1").unwrap(),
         ScaleSetRunnerName::parse("smol-attempt-1").unwrap(),
+        ScaleSetRunnerRequestId::new(41).unwrap(),
         EpochMillis::new(50_000).unwrap(),
     )
 }
@@ -338,6 +340,7 @@ fn canonical_codec_round_trips_exact_state_and_revision() {
     );
     assert_eq!(decoded.revision(), state.revision());
     assert_eq!(decoded.runner_name().as_str(), "smol-attempt-1");
+    assert_eq!(decoded.runner_request_id().get(), 41);
     assert_eq!(decoded.runner_id().unwrap().get(), 77);
 }
 
@@ -353,7 +356,7 @@ fn codec_rejects_future_versions_unknown_fields_and_inconsistent_phase_evidence(
         "version_incompatible"
     );
 
-    value["schema_version"] = serde_json::json!(1);
+    value["schema_version"] = serde_json::json!(DISPOSABLE_ATTEMPT_STATE_SCHEMA_VERSION);
     value["unexpected"] = serde_json::json!(true);
     let unknown = serde_json::to_vec(&value).unwrap();
     assert_eq!(
@@ -364,7 +367,8 @@ fn codec_rejects_future_versions_unknown_fields_and_inconsistent_phase_evidence(
     );
 
     value.as_object_mut().unwrap().remove("unexpected");
-    value["schema_version"] = serde_json::json!(2);
+    value["schema_version"] = serde_json::json!(4);
+    value.as_object_mut().unwrap().remove("runner_request_id");
     assert_eq!(
         decode_disposable_attempt_state(&serde_json::to_vec(&value).unwrap())
             .unwrap_err()

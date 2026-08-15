@@ -18,7 +18,7 @@ pub use codec::{
     encode_disposable_attempt_catalog,
 };
 
-pub const DISPOSABLE_ATTEMPT_CATALOG_SCHEMA_VERSION: u8 = 5;
+pub const DISPOSABLE_ATTEMPT_CATALOG_SCHEMA_VERSION: u8 = 6;
 pub const MAX_ACTIVE_DISPOSABLE_ATTEMPTS: usize = 64;
 pub const MAX_DISPOSABLE_ATTEMPT_TOMBSTONES: usize = 64;
 const MAX_DISPOSABLE_ATTEMPT_CATALOG_REVISION: u64 = 1_000_000_000_000;
@@ -429,6 +429,7 @@ impl DisposableAttemptCatalogDocument {
         let mut vm_ids = BTreeSet::new();
         let mut vm_identities = BTreeSet::new();
         let mut runner_names = BTreeSet::new();
+        let mut runner_request_ids = BTreeSet::new();
         let mut runner_ids = BTreeSet::new();
         let mut job_ids = BTreeSet::new();
 
@@ -442,6 +443,7 @@ impl DisposableAttemptCatalogDocument {
                 || !claim_ids.insert(attempt.capacity_claim_id().clone())
                 || !vm_ids.insert(attempt.vm_id().clone())
                 || !runner_names.insert(attempt.runner_name().clone())
+                || !runner_request_ids.insert(attempt.runner_request_id())
             {
                 return Err(duplicate_identity());
             }
@@ -560,6 +562,7 @@ impl DisposableAttemptCatalogDocument {
                 && next.attempt.capacity_claim_id() == prior.attempt.capacity_claim_id()
                 && next.attempt.vm_id() == prior.attempt.vm_id()
                 && next.attempt.runner_name() == prior.attempt.runner_name()
+                && next.attempt.runner_request_id() == prior.attempt.runner_request_id()
                 && next.attempt.runner_id() == prior.attempt.runner_id()
                 && next.attempt.github_job_id() == prior.attempt.github_job_id()
                 && next.attempt.result() == prior.attempt.result()
@@ -1086,7 +1089,7 @@ mod clone_identity_tests {
         CapacityClaimId, DisposableVmId, DisposableWorkerResources,
     };
     use crate::execution_admission::EpochMillis;
-    use crate::github_scale_set_protocol::ScaleSetRunnerName;
+    use crate::github_scale_set_protocol::{ScaleSetRunnerName, ScaleSetRunnerRequestId};
 
     fn started_catalog() -> (DisposableAttemptCatalogDocument, DisposableAttemptId) {
         let mut catalog =
@@ -1098,6 +1101,7 @@ mod clone_identity_tests {
             CapacityClaimId::parse("claim-clone-bind").unwrap(),
             DisposableVmId::parse("vm-clone-bind").unwrap(),
             ScaleSetRunnerName::parse("smol-clone-bind").unwrap(),
+            ScaleSetRunnerRequestId::new(41).unwrap(),
             EpochMillis::new(50_000).unwrap(),
         );
         let reservation = DisposableAttemptReservation::new(

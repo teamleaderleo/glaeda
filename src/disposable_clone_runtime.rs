@@ -651,7 +651,7 @@ mod tests {
     use crate::disposable_worker_reconciler::{
         CapacityClaimId, DisposableVmId, DisposableWorkerResources,
     };
-    use crate::github_scale_set_protocol::ScaleSetRunnerName;
+    use crate::github_scale_set_protocol::{ScaleSetRunnerName, ScaleSetRunnerRequestId};
     use crate::lima_observation::{LimaArchitecture, LimaVmType};
     use crate::unix_personal_worker_store::STORE_DIRECTORY;
 
@@ -1029,6 +1029,7 @@ mod tests {
             CapacityClaimId::parse("claim-clone-1").unwrap(),
             DisposableVmId::parse(TARGET).unwrap(),
             ScaleSetRunnerName::parse("smol-clone-1").unwrap(),
+            ScaleSetRunnerRequestId::new(41).unwrap(),
             EpochMillis::new(1_900_000_600_000).unwrap(),
         );
         let reservation = DisposableAttemptReservation::new(

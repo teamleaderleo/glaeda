@@ -14,7 +14,7 @@ use smolrunner::disposable_worker_reconciler::{
 use smolrunner::execution_admission::EpochMillis;
 use smolrunner::github_scale_set_protocol::{
     ScaleSetJobEvent, ScaleSetJobId, ScaleSetJobResult, ScaleSetRunnerId, ScaleSetRunnerName,
-    ScaleSetRunnerReference,
+    ScaleSetRunnerReference, ScaleSetRunnerRequestId,
 };
 
 fn time(value: u64) -> EpochMillis {
@@ -31,6 +31,7 @@ fn attempt() -> DisposableAttemptState {
         CapacityClaimId::parse("claim-1").unwrap(),
         DisposableVmId::parse("vm-1").unwrap(),
         ScaleSetRunnerName::parse("smol-attempt-1").unwrap(),
+        ScaleSetRunnerRequestId::new(41).unwrap(),
         time(10_000),
     )
 }
@@ -519,6 +520,14 @@ fn legacy_provisioning_schema_and_current_schema_alias_are_both_refused() {
     );
 
     legacy["schema_version"] = serde_json::json!(4);
+    assert_eq!(
+        decode_disposable_attempt_state(&serde_json::to_vec(&legacy).unwrap())
+            .unwrap_err()
+            .code(),
+        "version_incompatible"
+    );
+
+    legacy["schema_version"] = serde_json::json!(5);
     assert_eq!(
         decode_disposable_attempt_state(&serde_json::to_vec(&legacy).unwrap())
             .unwrap_err()

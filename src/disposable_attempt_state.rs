@@ -8,10 +8,11 @@ use crate::disposable_worker_reconciler::{
 };
 use crate::execution_admission::EpochMillis;
 use crate::github_scale_set_protocol::{
-    ScaleSetJobId, ScaleSetJobResult, ScaleSetRunnerId, ScaleSetRunnerName, ScaleSetRunnerReference,
+    ScaleSetJobId, ScaleSetJobResult, ScaleSetRunnerId, ScaleSetRunnerName,
+    ScaleSetRunnerReference, ScaleSetRunnerRequestId,
 };
 
-pub const DISPOSABLE_ATTEMPT_STATE_SCHEMA_VERSION: u8 = 4;
+pub const DISPOSABLE_ATTEMPT_STATE_SCHEMA_VERSION: u8 = 5;
 pub const MAX_DISPOSABLE_ATTEMPT_STATE_BYTES: usize = 16_384;
 const MAX_DISPOSABLE_ATTEMPT_REVISION: u64 = 1_000_000_000_000;
 
@@ -68,6 +69,7 @@ pub struct DisposableAttemptState {
     vm_id: DisposableVmId,
     vm_identity: Option<DisposableVmIdentity>,
     runner_name: ScaleSetRunnerName,
+    runner_request_id: ScaleSetRunnerRequestId,
     runner_id: Option<ScaleSetRunnerId>,
     phase: DisposableAttemptPhase,
     github_job_id: Option<ScaleSetJobId>,
@@ -83,6 +85,7 @@ impl DisposableAttemptState {
         capacity_claim_id: CapacityClaimId,
         vm_id: DisposableVmId,
         runner_name: ScaleSetRunnerName,
+        runner_request_id: ScaleSetRunnerRequestId,
         not_after: EpochMillis,
     ) -> Self {
         Self {
@@ -93,6 +96,7 @@ impl DisposableAttemptState {
             vm_id,
             vm_identity: None,
             runner_name,
+            runner_request_id,
             runner_id: None,
             phase: DisposableAttemptPhase::Reserved,
             github_job_id: None,
@@ -135,6 +139,13 @@ impl DisposableAttemptState {
     #[must_use]
     pub const fn runner_name(&self) -> &ScaleSetRunnerName {
         &self.runner_name
+    }
+
+    /// Return the exact service request identity that this attempt owns from reservation through
+    /// bounded replay history.
+    #[must_use]
+    pub const fn runner_request_id(&self) -> ScaleSetRunnerRequestId {
+        self.runner_request_id
     }
 
     #[must_use]
@@ -636,6 +647,7 @@ impl DisposableAttemptState {
             vm_id: self.vm_id.clone(),
             vm_identity: self.vm_identity.clone(),
             runner_name: self.runner_name.clone(),
+            runner_request_id: self.runner_request_id,
             runner_id,
             phase,
             github_job_id,
@@ -837,6 +849,7 @@ struct AttemptWire<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     vm_identity_digest: Option<&'a str>,
     runner_name: &'a str,
+    runner_request_id: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     runner_id: Option<u64>,
     phase: &'static str,
@@ -845,6 +858,11 @@ struct AttemptWire<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     result: Option<&'a str>,
     not_after: u64,
+}
+
+#[derive(Deserialize)]
+struct AttemptVersionWire {
+    schema_version: u8,
 }
 
 #[derive(Deserialize)]
@@ -857,6 +875,7 @@ struct OwnedAttemptWire {
     vm_id: String,
     vm_identity_digest: Option<String>,
     runner_name: String,
+    runner_request_id: u64,
     runner_id: Option<u64>,
     phase: String,
     github_job_id: Option<String>,
@@ -881,6 +900,7 @@ pub fn encode_disposable_attempt_state(
         vm_id: state.vm_id.as_str(),
         vm_identity_digest: state.vm_identity.as_ref().map(DisposableVmIdentity::as_str),
         runner_name: state.runner_name.as_str(),
+        runner_request_id: state.runner_request_id.get(),
         runner_id: state.runner_id.map(ScaleSetRunnerId::get),
         phase: phase_name(state.phase),
         github_job_id: state.github_job_id.as_ref().map(ScaleSetJobId::as_str),
@@ -914,15 +934,17 @@ pub fn decode_disposable_attempt_state(
             "disposable attempt document exceeds the reviewed byte bound",
         ));
     }
-    let wire: OwnedAttemptWire =
+    let version: AttemptVersionWire =
         serde_json::from_slice(bytes).map_err(|_| invalid_document("attempt JSON is invalid"))?;
-    if wire.schema_version != DISPOSABLE_ATTEMPT_STATE_SCHEMA_VERSION {
+    if version.schema_version != DISPOSABLE_ATTEMPT_STATE_SCHEMA_VERSION {
         return Err(DisposableAttemptStateError::new(
             "schema_version",
             "version_incompatible",
             "disposable attempt schema version is unsupported",
         ));
     }
+    let wire: OwnedAttemptWire =
+        serde_json::from_slice(bytes).map_err(|_| invalid_document("attempt JSON is invalid"))?;
     let state = DisposableAttemptState {
         schema_version: wire.schema_version,
         revision: DisposableAttemptRevision::new(wire.revision)?,
@@ -939,6 +961,8 @@ pub fn decode_disposable_attempt_state(
             .map_err(|_| invalid_document("VM identity digest is invalid"))?,
         runner_name: ScaleSetRunnerName::parse(&wire.runner_name)
             .map_err(|_| invalid_document("runner name is invalid"))?,
+        runner_request_id: ScaleSetRunnerRequestId::new(wire.runner_request_id)
+            .map_err(|_| invalid_document("runner request ID is invalid"))?,
         runner_id: wire
             .runner_id
             .map(ScaleSetRunnerId::new)
