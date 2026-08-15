@@ -211,7 +211,7 @@ impl DisposableAttemptCatalogDocument {
         DisposableHostUsage::new(workers, resources).map_err(|_| resource_overflow())
     }
 
-    fn reserve(
+    pub(crate) fn reserve(
         &self,
         reservation: DisposableAttemptReservation,
     ) -> Result<Self, DisposableAttemptCatalogError> {
@@ -247,7 +247,7 @@ impl DisposableAttemptCatalogDocument {
         Ok(next)
     }
 
-    fn replace_attempt(
+    pub(crate) fn replace_attempt(
         &self,
         attempt_id: &DisposableAttemptId,
         expected_attempt_revision: DisposableAttemptRevision,
@@ -282,7 +282,7 @@ impl DisposableAttemptCatalogDocument {
         Ok(next)
     }
 
-    fn retire_complete(
+    pub(crate) fn retire_complete(
         &self,
         attempt_id: &DisposableAttemptId,
         expected_attempt_revision: DisposableAttemptRevision,

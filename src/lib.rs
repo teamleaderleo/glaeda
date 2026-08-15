@@ -44,6 +44,9 @@ pub(crate) mod github_scale_set_bridge;
 /// Canonical bounded durable record of one polled Runner Scale Set delivery.
 #[cfg(unix)]
 pub(crate) mod github_scale_set_delivery;
+/// Pure exact reconciliation of one retained Scale Set delivery into disposable-attempt state.
+#[cfg(unix)]
+pub(crate) mod github_scale_set_delivery_consumer;
 /// Pure crash/replay phases for one durably reconciled Scale Set delivery.
 #[cfg(unix)]
 pub(crate) mod github_scale_set_delivery_state;
