@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 use crate::artifact::Sha256Digest;
 use crate::disposable_attempt_catalog::{
     DisposableAttemptCatalogDocument, DisposableAttemptCatalogRevision,
+    MAX_DISPOSABLE_ATTEMPT_CATALOG_DOCUMENT_BYTES, decode_disposable_attempt_catalog,
     encode_disposable_attempt_catalog,
 };
 use crate::github_scale_set_delivery::{
@@ -17,9 +18,10 @@ use crate::github_scale_set_delivery::{
 };
 use crate::github_scale_set_protocol::ScaleSetRunnerRequestId;
 
-pub(crate) const SCALE_SET_DELIVERY_RECOVERY_SCHEMA_VERSION: u8 = 2;
-pub(crate) const MAX_SCALE_SET_DELIVERY_RECOVERY_BYTES: usize =
-    MAX_SCALE_SET_DELIVERY_BYTES * 4 + 16 * 1024;
+pub(crate) const SCALE_SET_DELIVERY_RECOVERY_SCHEMA_VERSION: u8 = 3;
+pub(crate) const MAX_SCALE_SET_DELIVERY_RECOVERY_BYTES: usize = MAX_SCALE_SET_DELIVERY_BYTES * 4
+    + MAX_DISPOSABLE_ATTEMPT_CATALOG_DOCUMENT_BYTES * 2
+    + 64 * 1024;
 const MAX_DELIVERY_RECOVERY_REVISION: u64 = 1_000_000_000_000;
 const CATALOG_BINDING_DOMAIN: &[u8] = b"smolrunner.scale-set-catalog-binding.v1\0";
 
@@ -161,6 +163,90 @@ impl ScaleSetDeliveryRecoveryState {
         self.successor(phase)
     }
 
+    pub(crate) fn prepare_settlement(
+        &self,
+        prior_catalog: &DisposableAttemptCatalogDocument,
+        target_catalog: &DisposableAttemptCatalogDocument,
+    ) -> Result<Self, ScaleSetDeliveryRecoveryError> {
+        if !self.matches_catalog(prior_catalog) {
+            return Err(recovery_error(
+                ScaleSetDeliveryRecoveryErrorKind::Conflict,
+                "Scale Set settlement prior catalog does not match durable recovery",
+            ));
+        }
+        self.prepare_settlement_binding(
+            prior_catalog.clone(),
+            target_catalog.revision(),
+            catalog_digest(target_catalog)?,
+        )
+    }
+
+    pub(crate) fn prepare_settlement_binding(
+        &self,
+        prior_catalog: DisposableAttemptCatalogDocument,
+        catalog_revision: DisposableAttemptCatalogRevision,
+        catalog_digest: Sha256Digest,
+    ) -> Result<Self, ScaleSetDeliveryRecoveryError> {
+        let (proof, acquired) = match &self.phase {
+            ScaleSetDeliveryRecoveryPhase::Acknowledged { acquired } => (
+                ScaleSetDeliverySettlementProof::Acknowledged,
+                acquired.clone(),
+            ),
+            ScaleSetDeliveryRecoveryPhase::AcquisitionRecoveryObserved { acquired }
+                if !acquired.is_empty() =>
+            {
+                (
+                    ScaleSetDeliverySettlementProof::AcquisitionRecovery,
+                    acquired.clone(),
+                )
+            }
+            _ => {
+                return Err(recovery_error(
+                    ScaleSetDeliveryRecoveryErrorKind::Conflict,
+                    "Scale Set delivery lacks conclusive settlement evidence",
+                ));
+            }
+        };
+        self.successor(ScaleSetDeliveryRecoveryPhase::SettlementPrepared {
+            proof,
+            acquired,
+            prior_catalog,
+            catalog_revision,
+            catalog_digest,
+        })
+    }
+
+    pub(crate) fn matches_settlement_catalog(
+        &self,
+        catalog: &DisposableAttemptCatalogDocument,
+    ) -> bool {
+        matches!(
+            &self.phase,
+            ScaleSetDeliveryRecoveryPhase::SettlementPrepared {
+                catalog_revision,
+                catalog_digest: expected,
+                ..
+            } if *catalog_revision == catalog.revision()
+                && catalog_digest(catalog).is_ok_and(|actual| actual == *expected)
+        )
+    }
+
+    pub(crate) fn settlement_acquired(&self) -> Option<&[ScaleSetRunnerRequestId]> {
+        match &self.phase {
+            ScaleSetDeliveryRecoveryPhase::SettlementPrepared { acquired, .. } => Some(acquired),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn settlement_prior_catalog(&self) -> Option<&DisposableAttemptCatalogDocument> {
+        match &self.phase {
+            ScaleSetDeliveryRecoveryPhase::SettlementPrepared { prior_catalog, .. } => {
+                Some(prior_catalog)
+            }
+            _ => None,
+        }
+    }
+
     fn successor(
         &self,
         phase: ScaleSetDeliveryRecoveryPhase,
@@ -222,14 +308,56 @@ impl ScaleSetDeliveryRecoveryState {
         }
         encode_scale_set_delivery(&self.delivery).map_err(|_| corrupt_state())?;
         match &self.phase {
-            ScaleSetDeliveryRecoveryPhase::Reconciled
-            | ScaleSetDeliveryRecoveryPhase::AcknowledgementStarted => Ok(()),
-            ScaleSetDeliveryRecoveryPhase::Acknowledged { acquired }
-            | ScaleSetDeliveryRecoveryPhase::AcquisitionRecoveryObserved { acquired } => {
+            ScaleSetDeliveryRecoveryPhase::Reconciled if self.revision == 1 => Ok(()),
+            ScaleSetDeliveryRecoveryPhase::AcknowledgementStarted if self.revision == 2 => Ok(()),
+            ScaleSetDeliveryRecoveryPhase::Acknowledged { acquired } if self.revision == 3 => {
                 self.validated_acquired(acquired).map(|_| ())
             }
+            ScaleSetDeliveryRecoveryPhase::AcquisitionRecoveryObserved { acquired }
+                if self.revision >= 3 =>
+            {
+                self.validated_acquired(acquired).map(|_| ())
+            }
+            ScaleSetDeliveryRecoveryPhase::SettlementPrepared {
+                proof,
+                acquired,
+                prior_catalog,
+                catalog_revision,
+                catalog_digest,
+            } => {
+                self.validated_acquired(acquired)?;
+                if !self.matches_catalog(prior_catalog) {
+                    return Err(corrupt_state());
+                }
+                if matches!(proof, ScaleSetDeliverySettlementProof::AcquisitionRecovery)
+                    && acquired.is_empty()
+                {
+                    return Err(corrupt_state());
+                }
+                if (matches!(proof, ScaleSetDeliverySettlementProof::Acknowledged)
+                    && self.revision != 4)
+                    || (matches!(proof, ScaleSetDeliverySettlementProof::AcquisitionRecovery)
+                        && self.revision < 4)
+                {
+                    return Err(corrupt_state());
+                }
+                if catalog_revision.get() < self.catalog_revision.get()
+                    || (*catalog_revision == self.catalog_revision
+                        && catalog_digest != &self.catalog_digest)
+                {
+                    return Err(corrupt_state());
+                }
+                Ok(())
+            }
+            _ => Err(corrupt_state()),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScaleSetDeliverySettlementProof {
+    Acknowledged,
+    AcquisitionRecovery,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -241,6 +369,13 @@ pub(crate) enum ScaleSetDeliveryRecoveryPhase {
     },
     AcquisitionRecoveryObserved {
         acquired: Vec<ScaleSetRunnerRequestId>,
+    },
+    SettlementPrepared {
+        proof: ScaleSetDeliverySettlementProof,
+        acquired: Vec<ScaleSetRunnerRequestId>,
+        prior_catalog: DisposableAttemptCatalogDocument,
+        catalog_revision: DisposableAttemptCatalogRevision,
+        catalog_digest: Sha256Digest,
     },
 }
 
@@ -327,7 +462,7 @@ impl RecoveryWire {
             catalog_revision: state.catalog_revision.get(),
             catalog_digest: state.catalog_digest.as_str().to_owned(),
             delivery_json,
-            phase: RecoveryPhaseWire::from_phase(&state.phase),
+            phase: RecoveryPhaseWire::from_phase(&state.phase)?,
         })
     }
 
@@ -378,13 +513,33 @@ fn catalog_digest(
 enum RecoveryPhaseWire {
     Reconciled,
     AcknowledgementStarted,
-    Acknowledged { acquired_request_ids: Vec<u64> },
-    AcquisitionRecoveryObserved { acquired_request_ids: Vec<u64> },
+    Acknowledged {
+        acquired_request_ids: Vec<u64>,
+    },
+    AcquisitionRecoveryObserved {
+        acquired_request_ids: Vec<u64>,
+    },
+    SettlementPrepared {
+        proof: SettlementProofWire,
+        acquired_request_ids: Vec<u64>,
+        prior_catalog_json: String,
+        catalog_revision: u64,
+        catalog_digest: String,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SettlementProofWire {
+    Acknowledged,
+    AcquisitionRecovery,
 }
 
 impl RecoveryPhaseWire {
-    fn from_phase(phase: &ScaleSetDeliveryRecoveryPhase) -> Self {
-        match phase {
+    fn from_phase(
+        phase: &ScaleSetDeliveryRecoveryPhase,
+    ) -> Result<Self, ScaleSetDeliveryRecoveryError> {
+        Ok(match phase {
             ScaleSetDeliveryRecoveryPhase::Reconciled => Self::Reconciled,
             ScaleSetDeliveryRecoveryPhase::AcknowledgementStarted => Self::AcknowledgementStarted,
             ScaleSetDeliveryRecoveryPhase::Acknowledged { acquired } => Self::Acknowledged {
@@ -395,7 +550,31 @@ impl RecoveryPhaseWire {
                     acquired_request_ids: acquired.iter().map(|id| id.get()).collect(),
                 }
             }
-        }
+            ScaleSetDeliveryRecoveryPhase::SettlementPrepared {
+                proof,
+                acquired,
+                prior_catalog,
+                catalog_revision,
+                catalog_digest,
+            } => Self::SettlementPrepared {
+                proof: match proof {
+                    ScaleSetDeliverySettlementProof::Acknowledged => {
+                        SettlementProofWire::Acknowledged
+                    }
+                    ScaleSetDeliverySettlementProof::AcquisitionRecovery => {
+                        SettlementProofWire::AcquisitionRecovery
+                    }
+                },
+                acquired_request_ids: acquired.iter().map(|id| id.get()).collect(),
+                prior_catalog_json: String::from_utf8(
+                    encode_disposable_attempt_catalog(prior_catalog)
+                        .map_err(|_| corrupt_state())?,
+                )
+                .map_err(|_| corrupt_state())?,
+                catalog_revision: catalog_revision.get(),
+                catalog_digest: catalog_digest.as_str().to_owned(),
+            },
+        })
     }
 
     fn into_phase(self) -> Result<ScaleSetDeliveryRecoveryPhase, ScaleSetDeliveryRecoveryError> {
@@ -413,6 +592,29 @@ impl RecoveryPhaseWire {
                 acquired_request_ids,
             } => Ok(ScaleSetDeliveryRecoveryPhase::AcquisitionRecoveryObserved {
                 acquired: parse_request_ids(acquired_request_ids)?,
+            }),
+            Self::SettlementPrepared {
+                proof,
+                acquired_request_ids,
+                prior_catalog_json,
+                catalog_revision,
+                catalog_digest,
+            } => Ok(ScaleSetDeliveryRecoveryPhase::SettlementPrepared {
+                proof: match proof {
+                    SettlementProofWire::Acknowledged => {
+                        ScaleSetDeliverySettlementProof::Acknowledged
+                    }
+                    SettlementProofWire::AcquisitionRecovery => {
+                        ScaleSetDeliverySettlementProof::AcquisitionRecovery
+                    }
+                },
+                acquired: parse_request_ids(acquired_request_ids)?,
+                prior_catalog: decode_disposable_attempt_catalog(prior_catalog_json.as_bytes())
+                    .map_err(|_| corrupt_state())?,
+                catalog_revision: DisposableAttemptCatalogRevision::new(catalog_revision)
+                    .map_err(|_| corrupt_state())?,
+                catalog_digest: Sha256Digest::parse(&catalog_digest)
+                    .map_err(|_| corrupt_state())?,
             }),
         }
     }
@@ -579,6 +781,43 @@ mod tests {
     }
 
     #[test]
+    fn settlement_requires_conclusive_acknowledgement_evidence_and_binds_target_catalog() {
+        let started = ScaleSetDeliveryRecoveryState::reconciled(delivery(), &catalog(), &catalog())
+            .unwrap()
+            .begin_ack()
+            .unwrap();
+        let empty_recovery = started.record_recovery_acquire(&[]).unwrap();
+        assert_eq!(
+            empty_recovery
+                .prepare_settlement(&catalog(), &catalog())
+                .unwrap_err()
+                .kind(),
+            ScaleSetDeliveryRecoveryErrorKind::Conflict
+        );
+
+        let acknowledged = started.record_ack_response(&[]).unwrap();
+        let prepared = acknowledged
+            .prepare_settlement(&catalog(), &catalog())
+            .unwrap();
+        assert!(prepared.matches_settlement_catalog(&catalog()));
+        assert_eq!(prepared.settlement_acquired(), Some([].as_slice()));
+        assert_eq!(
+            decode_scale_set_delivery_recovery(
+                &encode_scale_set_delivery_recovery(&prepared).unwrap()
+            )
+            .unwrap(),
+            prepared
+        );
+
+        let positive = started
+            .record_recovery_acquire(&[ScaleSetRunnerRequestId::new(41).unwrap()])
+            .unwrap()
+            .prepare_settlement(&catalog(), &catalog())
+            .unwrap();
+        assert_eq!(positive.settlement_acquired().unwrap().len(), 1);
+    }
+
+    #[test]
     fn foreign_or_duplicate_acquisition_evidence_conflicts() {
         let started = ScaleSetDeliveryRecoveryState::reconciled(delivery(), &catalog(), &catalog())
             .unwrap()
@@ -612,7 +851,7 @@ mod tests {
 
         let prior = String::from_utf8(encoded.clone())
             .unwrap()
-            .replacen("\"schema_version\":2", "\"schema_version\":1", 1)
+            .replacen("\"schema_version\":3", "\"schema_version\":2", 1)
             .into_bytes();
         assert_eq!(
             decode_scale_set_delivery_recovery(&prior)
@@ -623,7 +862,7 @@ mod tests {
 
         let future = String::from_utf8(encoded.clone())
             .unwrap()
-            .replacen("\"schema_version\":2", "\"schema_version\":3", 1)
+            .replacen("\"schema_version\":3", "\"schema_version\":4", 1)
             .into_bytes();
         assert_eq!(
             decode_scale_set_delivery_recovery(&future)

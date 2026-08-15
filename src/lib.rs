@@ -50,6 +50,9 @@ pub(crate) mod github_scale_set_delivery_consumer;
 /// Crash-safe poll, durable reconciliation, acknowledgement, and acquisition recovery.
 #[cfg(unix)]
 pub(crate) mod github_scale_set_delivery_controller;
+/// Pure catalog settlement after conclusive Scale Set acknowledgement evidence.
+#[cfg(unix)]
+pub(crate) mod github_scale_set_delivery_settlement;
 /// Pure crash/replay phases for one durably reconciled Scale Set delivery.
 #[cfg(unix)]
 pub(crate) mod github_scale_set_delivery_state;

@@ -57,8 +57,7 @@ impl DeliveryBridge for ScaleSetBridgeClient {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ScaleSetDeliveryControllerDisposition {
     Idle,
-    Acknowledged { acquired: usize },
-    AcquisitionRecoveryObserved { acquired: usize },
+    Settled { acquired: usize },
     RecoveryRequired,
 }
 
@@ -84,7 +83,7 @@ fn consume_with_bridge<B: DeliveryBridge>(
     observed_at: EpochMillis,
 ) -> Result<ScaleSetDeliveryControllerDisposition, ScaleSetDeliveryControllerError> {
     let mut recovery_store =
-        UnixPersonalWorkerStore::open_or_create_scale_set_delivery_recovery(root_path)
+        UnixPersonalWorkerStore::open_or_create_scale_set_delivery_controller(root_path)
             .map_err(map_store_error)?;
     if let Some(current) = recovery_store
         .load_scale_set_delivery_recovery()
@@ -139,7 +138,7 @@ fn consume_with_bridge<B: DeliveryBridge>(
     drop(paired);
 
     let mut recovery_store =
-        UnixPersonalWorkerStore::open_or_create_scale_set_delivery_recovery(root_path)
+        UnixPersonalWorkerStore::open_or_create_scale_set_delivery_controller(root_path)
             .map_err(map_store_error)?;
     acknowledge_delivery(&mut recovery_store, bridge, recovery)
 }
@@ -196,15 +195,14 @@ fn resume_delivery<B: DeliveryBridge>(
         {
             recover_acquisition(recovery_store, bridge, current)
         }
-        ScaleSetDeliveryRecoveryPhase::AcquisitionRecoveryObserved { acquired } => Ok(
-            ScaleSetDeliveryControllerDisposition::AcquisitionRecoveryObserved {
-                acquired: acquired.len(),
-            },
-        ),
+        ScaleSetDeliveryRecoveryPhase::AcquisitionRecoveryObserved { acquired } => {
+            Ok(settle_delivery(recovery_store, &current, acquired.len())?)
+        }
         ScaleSetDeliveryRecoveryPhase::Acknowledged { acquired } => {
-            Ok(ScaleSetDeliveryControllerDisposition::Acknowledged {
-                acquired: acquired.len(),
-            })
+            Ok(settle_delivery(recovery_store, &current, acquired.len())?)
+        }
+        ScaleSetDeliveryRecoveryPhase::SettlementPrepared { acquired, .. } => {
+            Ok(settle_delivery(recovery_store, &current, acquired.len())?)
         }
     }
 }
@@ -255,9 +253,7 @@ fn acknowledge_delivery<B: DeliveryBridge>(
     let ScaleSetDeliveryRecoveryPhase::Acknowledged { acquired } = acknowledged.phase() else {
         return Err(controller_error("scale_set_delivery_recovery_conflict"));
     };
-    Ok(ScaleSetDeliveryControllerDisposition::Acknowledged {
-        acquired: acquired.len(),
-    })
+    settle_delivery(store, &acknowledged, acquired.len())
 }
 
 fn recover_acquisition<B: DeliveryBridge>(
@@ -289,12 +285,24 @@ fn recover_acquisition<B: DeliveryBridge>(
     if acquired.is_empty() {
         Ok(ScaleSetDeliveryControllerDisposition::RecoveryRequired)
     } else {
-        Ok(
-            ScaleSetDeliveryControllerDisposition::AcquisitionRecoveryObserved {
-                acquired: acquired.len(),
-            },
-        )
+        settle_delivery(store, &successor, acquired.len())
     }
+}
+
+fn settle_delivery(
+    store: &mut UnixPersonalWorkerStore,
+    current: &ScaleSetDeliveryRecoveryState,
+    expected_acquired: usize,
+) -> Result<ScaleSetDeliveryControllerDisposition, ScaleSetDeliveryControllerError> {
+    let settled = store
+        .settle_scale_set_delivery_locked(current)
+        .map_err(map_store_error)?;
+    if settled.acquired() != expected_acquired {
+        return Err(controller_error("scale_set_delivery_recovery_conflict"));
+    }
+    Ok(ScaleSetDeliveryControllerDisposition::Settled {
+        acquired: settled.acquired(),
+    })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
