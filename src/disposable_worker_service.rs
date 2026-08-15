@@ -5,10 +5,11 @@
 //! a time to the existing coordinator and supervisor. Template readiness gates new capacity inside
 //! the coordinator; it does not gate delivery recovery or cleanup of an existing attempt.
 
-#![allow(dead_code)] // The next narrow slice exposes this driver through `worker serve`.
+#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
 use std::fmt;
 use std::io;
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::disposable_attempt_catalog::DisposableAttemptCatalog;
@@ -31,23 +32,23 @@ use crate::process::ProcessExecutor;
 use crate::unix_personal_worker_store::{DisposableWorkerServiceLock, UnixPersonalWorkerStore};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DisposableWorkerServiceErrorKind {
+pub enum DisposableWorkerServiceErrorKind {
     DurableState,
     Supervisor,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) struct DisposableWorkerServiceError {
+pub struct DisposableWorkerServiceError {
     kind: DisposableWorkerServiceErrorKind,
     code: &'static str,
 }
 
 impl DisposableWorkerServiceError {
-    pub(crate) const fn kind(self) -> DisposableWorkerServiceErrorKind {
+    pub const fn kind(self) -> DisposableWorkerServiceErrorKind {
         self.kind
     }
 
-    pub(crate) const fn code(self) -> &'static str {
+    pub const fn code(self) -> &'static str {
         self.code
     }
 }
@@ -185,13 +186,47 @@ impl DisposableWorkerSupervisorDriver for DisposableWorkerServiceDriver {
     }
 }
 
-pub(crate) fn serve_disposable_worker(
+fn serve_disposable_worker_with_control(
     enrollment: DisposableWorkerEnrollment,
     control: &mut impl DisposableWorkerSupervisorControl,
 ) -> Result<DisposableWorkerSupervisorDisposition, DisposableWorkerServiceError> {
     let mut driver = prepare_disposable_worker_service(enrollment)?;
     supervise_disposable_worker(&mut driver, control)
         .map_err(|error| supervisor_error(error.code()))
+}
+
+/// Run one enrolled disposable-worker controller until the outer process supervisor terminates
+/// the process.
+///
+/// Local durable recovery and exclusive service ownership complete before the bridge reads the
+/// GitHub App key from Keychain. Retry pacing and circuit breaking remain inside the bounded
+/// supervisor loop; `launchd` owns process termination and restart.
+///
+/// # Errors
+///
+/// Returns a bounded, path-free error if local durable preparation cannot begin.
+#[cfg(target_os = "macos")]
+pub fn serve_disposable_worker(
+    enrollment: DisposableWorkerEnrollment,
+) -> Result<(), DisposableWorkerServiceError> {
+    let mut control = ThreadSupervisorControl;
+    serve_disposable_worker_with_control(enrollment, &mut control).map(|_| ())
+}
+
+struct ThreadSupervisorControl;
+
+impl DisposableWorkerSupervisorControl for ThreadSupervisorControl {
+    fn stop_requested(&self) -> bool {
+        false
+    }
+
+    fn wait_or_stop(
+        &mut self,
+        duration: std::time::Duration,
+    ) -> Result<bool, DisposableWorkerSupervisorError> {
+        thread::sleep(duration);
+        Ok(false)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
