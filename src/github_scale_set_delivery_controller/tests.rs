@@ -75,11 +75,17 @@ struct FakeBridge {
 
 impl DeliveryBridge for FakeBridge {
     fn poll(&mut self) -> Result<ScaleSetBridgePoll, ScaleSetBridgeError> {
+        if self.poisoned {
+            return Err(ScaleSetBridgeError::new("poisoned"));
+        }
         self.calls.push("poll");
         Ok(self.polls.pop_front().expect("expected poll response"))
     }
 
     fn ack(&mut self, _: u32) -> Result<Vec<u64>, ScaleSetBridgeError> {
+        if self.poisoned {
+            return Err(ScaleSetBridgeError::new("poisoned"));
+        }
         self.calls.push("ack");
         self.acknowledgements
             .pop_front()
@@ -90,6 +96,9 @@ impl DeliveryBridge for FakeBridge {
         &mut self,
         _: &[ScaleSetRunnerRequestId],
     ) -> Result<Vec<ScaleSetRunnerRequestId>, ScaleSetBridgeError> {
+        if self.poisoned {
+            return Err(ScaleSetBridgeError::new("poisoned"));
+        }
         self.calls.push("acquire");
         self.acquisitions
             .pop_front()
@@ -271,10 +280,19 @@ fn acknowledgement_failure_leaves_started_and_never_replays_ack() {
         "scale_set_bridge_failed"
     );
     assert_eq!(failed_bridge.calls, ["poll", "ack"]);
+    assert!(failed_bridge.poisoned);
     assert!(matches!(
         load_recovery(&root).phase(),
         ScaleSetDeliveryRecoveryPhase::AcknowledgementStarted
     ));
+
+    assert_eq!(
+        consume_with_bridge(root.path(), &policy(), &mut failed_bridge, observed_at())
+            .unwrap_err()
+            .code(),
+        "scale_set_bridge_failed"
+    );
+    assert_eq!(failed_bridge.calls, ["poll", "ack"]);
 
     let request = ScaleSetRunnerRequestId::new(47).expect("request id");
     let mut recovery_bridge = FakeBridge {

@@ -243,7 +243,14 @@ fn acknowledge_delivery<B: DeliveryBridge>(
         .map_err(map_store_error)?;
     let acknowledged = match transaction {
         ScaleSetExternalTransaction::Completed(state) => state,
-        ScaleSetExternalTransaction::ExternalFailed(error) => return Err(error),
+        ScaleSetExternalTransaction::ExternalFailed(error) => {
+            // The Go bridge deliberately retains its session-local pending message when either
+            // deletion or acquisition fails. That session cannot perform the standalone
+            // acquisition recovery required by the durable Started checkpoint, so it must not
+            // remain authoritative after an ambiguous acknowledgement outcome.
+            bridge.poison();
+            return Err(error);
+        }
     };
     let ScaleSetDeliveryRecoveryPhase::Acknowledged { acquired } = acknowledged.phase() else {
         return Err(controller_error("scale_set_delivery_recovery_conflict"));
