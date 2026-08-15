@@ -28,8 +28,8 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::artifact::Sha256Digest;
 use crate::github_scale_set_protocol::{
-    ScaleSetJobId, ScaleSetJobResult, ScaleSetRunnerId, ScaleSetRunnerName, ScaleSetRunnerReference,
-    ScaleSetRunnerRequestId,
+    ScaleSetJobId, ScaleSetJobResult, ScaleSetRunnerId, ScaleSetRunnerName,
+    ScaleSetRunnerReference, ScaleSetRunnerRequestId,
 };
 use crate::{disposable_worker_reconciler::ScaleSetDemand, execution_admission::EpochMillis};
 
@@ -1778,7 +1778,10 @@ mod tests {
             client.acquire(&oversized).unwrap_err().code(),
             "invalid_acquisition_request"
         );
-        assert_eq!(client.acquire(&[request_id(41)]).unwrap(), vec![request_id(41)]);
+        assert_eq!(
+            client.acquire(&[request_id(41)]).unwrap(),
+            vec![request_id(41)]
+        );
     }
 
     #[test]
