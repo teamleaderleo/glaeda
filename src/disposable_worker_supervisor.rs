@@ -145,6 +145,10 @@ impl DisposableWorkerSupervisorError {
     pub(crate) const fn new(code: &'static str) -> Self {
         Self { code }
     }
+
+    pub(crate) const fn code(self) -> &'static str {
+        self.code
+    }
 }
 
 impl fmt::Debug for DisposableWorkerSupervisorError {

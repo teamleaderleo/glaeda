@@ -75,6 +75,26 @@ impl UnixPersonalWorkerStore {
         self.load_scale_set_delivery_named(DELIVERY_RECOVERY_DOCUMENT)
     }
 
+    /// Report whether either current or staged delivery recovery evidence exists.
+    ///
+    /// The neutral service opener uses this only to choose the delivery owner before attempting
+    /// unrelated template/catalog recovery. The owning controller still performs all decoding and
+    /// recovery classification.
+    pub(crate) fn has_scale_set_delivery_recovery_evidence(
+        &self,
+    ) -> Result<bool, PersonalWorkerStoreError> {
+        let _lock = self.acquire_read_lock()?;
+        let staged = self.read_named_bytes_bounded(
+            STAGED_DELIVERY_RECOVERY_DOCUMENT,
+            MAX_SCALE_SET_DELIVERY_RECOVERY_BYTES,
+        )?;
+        let current = self.read_named_bytes_bounded(
+            DELIVERY_RECOVERY_DOCUMENT,
+            MAX_SCALE_SET_DELIVERY_RECOVERY_BYTES,
+        )?;
+        Ok(staged.is_some() || current.is_some())
+    }
+
     /// Publish the first exact `reconciled` recovery document.
     pub(crate) fn create_scale_set_delivery_recovery(
         &mut self,
