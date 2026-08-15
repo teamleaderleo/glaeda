@@ -12,6 +12,7 @@ pub mod debian_package_recovery;
 pub mod descriptor_bound_launcher;
 /// Pure bounded multi-attempt resource ledger and atomic store contract.
 pub mod disposable_attempt_catalog;
+mod disposable_attempt_catalog_job_lookup;
 /// Pure durable state, revisions, and codec for one disposable worker attempt.
 pub mod disposable_attempt_state;
 /// Same-lock execution of one authorized disposable Lima clone.
