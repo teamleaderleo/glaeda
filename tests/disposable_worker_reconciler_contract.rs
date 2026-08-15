@@ -722,6 +722,50 @@ fn terminal_cleanup_orders_vm_runner_and_capacity_release() {
 }
 
 #[test]
+fn cancellation_before_jit_never_adopts_a_same_name_runner_for_deletion() {
+    let mut state = attempt()
+        .authorize_clone()
+        .unwrap()
+        .record_clone_started()
+        .unwrap()
+        .bind_vm_fixture()
+        .begin_registration()
+        .unwrap();
+    let mut cancel = input(
+        &state,
+        DisposableVmObservation::Ready,
+        ScaleSetRunnerObservation::Absent,
+    );
+    cancel.cancellation_requested = true;
+    let action = reconcile_attempt(cancel).unwrap();
+    state = apply(&state, &action);
+    assert_eq!(state.phase(), DisposableAttemptPhase::Destroying);
+    assert!(!state.jit_generation_started());
+
+    let action = reconcile_attempt(input(
+        &state,
+        DisposableVmObservation::Absent,
+        ScaleSetRunnerObservation::Absent,
+    ))
+    .unwrap();
+    state = apply(&state, &action);
+    assert_eq!(state.phase(), DisposableAttemptPhase::Deregistering);
+
+    assert_eq!(
+        reconcile_attempt(input(
+            &state,
+            DisposableVmObservation::Absent,
+            ScaleSetRunnerObservation::RegistrationOnly { runner: runner(41) },
+        ))
+        .unwrap(),
+        DisposableWorkerAction::Blocked {
+            code: "runner_exists_before_jit_checkpoint",
+        }
+    );
+    assert!(state.runner_id().is_none());
+}
+
+#[test]
 fn reserved_cancellation_releases_capacity_without_claiming_vm_cleanup() {
     let state = attempt();
     let mut cancelled = input(

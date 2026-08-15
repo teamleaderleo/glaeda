@@ -693,12 +693,21 @@ pub fn reconcile_attempt(
             ),
             ScaleSetRunnerObservation::RegistrationOnly { runner }
             | ScaleSetRunnerObservation::IdleReady { runner }
-                if input.attempt.runner_id().is_none() =>
+                if input.attempt.runner_id().is_none()
+                    && input.attempt.jit_generation_started() =>
             {
                 persist(validate_transition(
                     input.attempt,
                     DisposableAttemptCatalogAction::RecordRegistration(runner.clone()),
                 )?)
+            }
+            ScaleSetRunnerObservation::RegistrationOnly { .. }
+            | ScaleSetRunnerObservation::IdleReady { .. }
+                if input.attempt.runner_id().is_none() =>
+            {
+                Action::Blocked {
+                    code: "runner_exists_before_jit_checkpoint",
+                }
             }
             ScaleSetRunnerObservation::RegistrationOnly { runner }
             | ScaleSetRunnerObservation::IdleReady { runner } => Action::DeleteRunner {

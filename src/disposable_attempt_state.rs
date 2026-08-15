@@ -350,7 +350,8 @@ impl DisposableAttemptState {
     ///
     /// This deliberately stays in the current phase: an existing registration does not prove that
     /// the guest listener is alive or that the one-time JIT configuration remains usable. During
-    /// cleanup, binding a rediscovered service ID is the durable prerequisite for exact deletion.
+    /// cleanup, binding a rediscovered service ID is the durable prerequisite for exact deletion,
+    /// but only after the JIT checkpoint proves this attempt could have created that registration.
     pub fn record_registration(
         &self,
         runner: &ScaleSetRunnerReference,
@@ -367,11 +368,7 @@ impl DisposableAttemptState {
                 "runner registration can only be recorded while registering or cleaning up",
             ));
         }
-        if matches!(
-            self.phase,
-            DisposableAttemptPhase::Registering | DisposableAttemptPhase::Assigned
-        ) && !self.jit_generation_started
-        {
+        if !self.jit_generation_started {
             return Err(invalid_transition(
                 "runner registration requires the durable JIT checkpoint",
             ));
@@ -796,6 +793,11 @@ impl DisposableAttemptState {
         if self.jit_generation_started && self.vm_identity.is_none() {
             return Err(invalid_document(
                 "JIT checkpoint requires exact VM identity evidence",
+            ));
+        }
+        if self.runner_id.is_some() && !self.jit_generation_started {
+            return Err(invalid_document(
+                "runner identity requires the durable JIT checkpoint",
             ));
         }
         if self

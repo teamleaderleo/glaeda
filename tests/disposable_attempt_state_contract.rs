@@ -170,6 +170,30 @@ fn jit_generation_and_runner_start_are_distinct_no_replay_checkpoints() {
         runner_started.record_runner_start_started().unwrap(),
         runner_started
     );
+
+    let pre_jit_cleanup = registering
+        .begin_cleanup()
+        .unwrap()
+        .advance_cleanup(DisposableAttemptPhase::Deregistering)
+        .unwrap();
+    assert_eq!(
+        pre_jit_cleanup
+            .record_registration(&runner(41))
+            .unwrap_err()
+            .code(),
+        "invalid_transition"
+    );
+    assert_eq!(
+        pre_jit_cleanup
+            .record_terminal(
+                Some(&runner(41)),
+                job("canceled-before-jit"),
+                ScaleSetJobResult::parse("canceled").unwrap(),
+            )
+            .unwrap_err()
+            .code(),
+        "invalid_document"
+    );
 }
 
 #[test]
