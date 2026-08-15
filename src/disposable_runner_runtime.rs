@@ -102,9 +102,13 @@ impl DisposableRunnerRuntime {
         jit: ScaleSetJitReceipt,
     ) -> Result<DisposableRunnerLaunchPlan, DisposableRunnerRuntimeError> {
         let attempt = reservation.attempt();
-        if attempt.phase() != DisposableAttemptPhase::Registering
-            || attempt.vm_identity().is_none()
+        if !matches!(
+            attempt.phase(),
+            DisposableAttemptPhase::Registering | DisposableAttemptPhase::Assigned
+        ) || attempt.vm_identity().is_none()
             || attempt.runner_id().is_some()
+            || !attempt.jit_generation_started()
+            || attempt.runner_start_started()
             || now > attempt.not_after()
         {
             return Err(runtime_error(
@@ -336,11 +340,18 @@ mod tests {
                 DisposableVmIdentity::parse(&format!("sha256:{}", "11".repeat(32))).unwrap(),
             )
             .unwrap();
-        catalog
+        let catalog = catalog
             .replace_attempt(
                 &attempt_id,
                 DisposableAttemptRevision::new(4).unwrap(),
                 DisposableAttemptCatalogAction::BeginRegistration,
+            )
+            .unwrap();
+        catalog
+            .replace_attempt(
+                &attempt_id,
+                DisposableAttemptRevision::new(5).unwrap(),
+                DisposableAttemptCatalogAction::RecordJitGenerationStarted,
             )
             .unwrap()
             .find_active(&attempt_id)

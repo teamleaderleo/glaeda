@@ -228,6 +228,38 @@ fn transition(
         .0
 }
 
+fn checkpoint_runner_start(
+    catalog: &mut Catalog,
+    document: &DisposableAttemptCatalogDocument,
+    index: usize,
+    runner_id: u64,
+) -> DisposableAttemptCatalogDocument {
+    let registering = transition(
+        catalog,
+        document,
+        index,
+        DisposableAttemptCatalogAction::BeginRegistration,
+    );
+    let jit_started = transition(
+        catalog,
+        &registering,
+        index,
+        DisposableAttemptCatalogAction::RecordJitGenerationStarted,
+    );
+    let registered = transition(
+        catalog,
+        &jit_started,
+        index,
+        DisposableAttemptCatalogAction::RecordRegistration(runner(index, runner_id)),
+    );
+    transition(
+        catalog,
+        &registered,
+        index,
+        DisposableAttemptCatalogAction::RecordRunnerStartStarted,
+    )
+}
+
 #[test]
 fn initialization_and_exact_duplicate_reservation_are_idempotent() {
     let (mut catalog, empty) = initialized();
@@ -588,6 +620,7 @@ fn duplicate_terminal_observation_is_satisfied_without_catalog_churn() {
         DisposableAttemptCatalogAction::RecordCloneStarted,
     );
     let started = bind_vm_fixture(&mut catalog, &started, 1, 1);
+    let started = checkpoint_runner_start(&mut catalog, &started, 1, 11);
     let job = ScaleSetJobId::parse("opaque-job-1").unwrap();
     let result = ScaleSetJobResult::parse("future-service-result").unwrap();
 
@@ -652,6 +685,12 @@ fn identity_drift_remains_distinct_from_an_illegal_phase_action() {
         1,
         DisposableAttemptCatalogAction::BeginRegistration,
     );
+    let registering = transition(
+        &mut catalog,
+        &registering,
+        1,
+        DisposableAttemptCatalogAction::RecordJitGenerationStarted,
+    );
 
     let attempt_id = DisposableAttemptId::parse("attempt-1").unwrap();
     let attempt_revision = registering
@@ -694,6 +733,7 @@ fn completed_attempt_releases_usage_then_moves_to_bounded_replay_history() {
         DisposableAttemptCatalogAction::RecordCloneStarted,
     );
     let started = bind_vm_fixture(&mut catalog, &started, 1, 1);
+    let started = checkpoint_runner_start(&mut catalog, &started, 1, 11);
     let terminal = transition(
         &mut catalog,
         &started,
@@ -811,6 +851,12 @@ fn exact_runner_ids_cannot_be_reused_across_concurrent_attempts() {
         1,
         DisposableAttemptCatalogAction::BeginRegistration,
     );
+    let one_registering = transition(
+        &mut catalog,
+        &one_registering,
+        1,
+        DisposableAttemptCatalogAction::RecordJitGenerationStarted,
+    );
     let one_registered = transition(
         &mut catalog,
         &one_registering,
@@ -836,6 +882,12 @@ fn exact_runner_ids_cannot_be_reused_across_concurrent_attempts() {
         &two_started,
         2,
         DisposableAttemptCatalogAction::BeginRegistration,
+    );
+    let two_registering = transition(
+        &mut catalog,
+        &two_registering,
+        2,
+        DisposableAttemptCatalogAction::RecordJitGenerationStarted,
     );
     let attempt_id = DisposableAttemptId::parse("attempt-2").unwrap();
     let duplicate_runner_id = catalog
@@ -882,12 +934,24 @@ fn exact_job_ids_cannot_be_reused_across_concurrent_attempts() {
         DisposableAttemptCatalogAction::RecordCloneStarted,
     );
     let one_started = bind_vm_fixture(&mut catalog, &one_started, 1, 1);
-    let one_terminal = transition(
+    let one_registering = transition(
         &mut catalog,
         &one_started,
         1,
+        DisposableAttemptCatalogAction::BeginRegistration,
+    );
+    let one_assigned = transition(
+        &mut catalog,
+        &one_registering,
+        1,
+        DisposableAttemptCatalogAction::RecordAssigned(shared_job.clone()),
+    );
+    let one_terminal = transition(
+        &mut catalog,
+        &one_assigned,
+        1,
         DisposableAttemptCatalogAction::RecordTerminal {
-            runner: Some(runner(1, 11)),
+            runner: None,
             job_id: shared_job.clone(),
             result: ScaleSetJobResult::parse("canceled").unwrap(),
         },
@@ -899,21 +963,23 @@ fn exact_job_ids_cannot_be_reused_across_concurrent_attempts() {
         DisposableAttemptCatalogAction::RecordCloneStarted,
     );
     let two_started = bind_vm_fixture(&mut catalog, &two_started, 2, 2);
+    let two_registering = transition(
+        &mut catalog,
+        &two_started,
+        2,
+        DisposableAttemptCatalogAction::BeginRegistration,
+    );
     let attempt_id = DisposableAttemptId::parse("attempt-2").unwrap();
     let duplicate_job_id = catalog
         .transition(
-            two_started.revision(),
+            two_registering.revision(),
             &attempt_id,
-            two_started
+            two_registering
                 .find_active(&attempt_id)
                 .unwrap()
                 .attempt()
                 .revision(),
-            DisposableAttemptCatalogAction::RecordTerminal {
-                runner: Some(runner(2, 22)),
-                job_id: shared_job,
-                result: ScaleSetJobResult::parse("canceled").unwrap(),
-            },
+            DisposableAttemptCatalogAction::RecordAssigned(shared_job),
         )
         .unwrap_err();
     assert_eq!(

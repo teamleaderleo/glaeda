@@ -113,16 +113,87 @@ fn registration_and_listener_readiness_are_distinct_durable_checkpoints() {
         .bind_vm_fixture()
         .begin_registration()
         .unwrap();
-    let registered = registering.record_registration(&runner(41)).unwrap();
+    let jit_started = registering.record_jit_generation_started().unwrap();
+    let registered = jit_started.record_registration(&runner(41)).unwrap();
 
     assert_eq!(registered.phase(), DisposableAttemptPhase::Registering);
     assert_eq!(registered.runner_id().unwrap().get(), 41);
     assert!(registered.github_job_id().is_none());
 
-    let ready = registered.record_runner_ready(&runner(41)).unwrap();
+    let runner_started = registered.record_runner_start_started().unwrap();
+    let ready = runner_started.record_runner_ready(&runner(41)).unwrap();
     assert_eq!(ready.phase(), DisposableAttemptPhase::Waiting);
     assert_eq!(ready.runner_id().unwrap().get(), 41);
     assert!(ready.revision().get() > registered.revision().get());
+}
+
+#[test]
+fn jit_generation_and_runner_start_are_distinct_no_replay_checkpoints() {
+    let registering = reserved()
+        .authorize_clone()
+        .unwrap()
+        .record_clone_started()
+        .unwrap()
+        .bind_vm_fixture()
+        .begin_registration()
+        .unwrap();
+    assert!(!registering.jit_generation_started());
+    assert!(!registering.runner_start_started());
+
+    let jit_started = registering.record_jit_generation_started().unwrap();
+    assert!(jit_started.jit_generation_started());
+    assert!(!jit_started.runner_start_started());
+    assert_eq!(
+        jit_started.record_jit_generation_started().unwrap(),
+        jit_started
+    );
+    assert_eq!(
+        jit_started
+            .record_runner_start_started()
+            .unwrap_err()
+            .code(),
+        "invalid_transition"
+    );
+    assert_eq!(
+        jit_started
+            .record_runner_ready(&runner(41))
+            .unwrap_err()
+            .code(),
+        "invalid_transition"
+    );
+
+    let registered = jit_started.record_registration(&runner(41)).unwrap();
+    let runner_started = registered.record_runner_start_started().unwrap();
+    assert!(runner_started.jit_generation_started());
+    assert!(runner_started.runner_start_started());
+    assert_eq!(
+        runner_started.record_runner_start_started().unwrap(),
+        runner_started
+    );
+
+    let pre_jit_cleanup = registering
+        .begin_cleanup()
+        .unwrap()
+        .advance_cleanup(DisposableAttemptPhase::Deregistering)
+        .unwrap();
+    assert_eq!(
+        pre_jit_cleanup
+            .record_registration(&runner(41))
+            .unwrap_err()
+            .code(),
+        "invalid_transition"
+    );
+    assert_eq!(
+        pre_jit_cleanup
+            .record_terminal(
+                Some(&runner(41)),
+                job("canceled-before-jit"),
+                ScaleSetJobResult::parse("canceled").unwrap(),
+            )
+            .unwrap_err()
+            .code(),
+        "invalid_document"
+    );
 }
 
 #[test]
@@ -143,6 +214,12 @@ fn job_assignment_does_not_bind_a_runner_before_job_started() {
     assert_eq!(assigned.github_job_id().unwrap().as_str(), "job_opaque-7");
 
     let running = assigned
+        .record_jit_generation_started()
+        .unwrap()
+        .record_registration(&runner(9))
+        .unwrap()
+        .record_runner_start_started()
+        .unwrap()
         .record_running(&runner(9), job("job_opaque-7"))
         .unwrap();
     assert_eq!(running.phase(), DisposableAttemptPhase::Running);
@@ -215,6 +292,12 @@ fn unknown_completion_result_still_reaches_cleanup() {
         .bind_vm_fixture()
         .begin_registration()
         .unwrap()
+        .record_jit_generation_started()
+        .unwrap()
+        .record_registration(&runner(41))
+        .unwrap()
+        .record_runner_start_started()
+        .unwrap()
         .record_assigned(job("job-future-result"))
         .unwrap()
         .record_terminal(
@@ -247,6 +330,14 @@ fn late_job_evidence_binds_without_reversing_cleanup_and_conflicts_fail_closed()
         .record_clone_started()
         .unwrap()
         .bind_vm_fixture()
+        .begin_registration()
+        .unwrap()
+        .record_jit_generation_started()
+        .unwrap()
+        .record_registration(&exact_runner)
+        .unwrap()
+        .record_runner_start_started()
+        .unwrap()
         .begin_cleanup()
         .unwrap()
         .record_running(&exact_runner, job("late-job"))
@@ -287,6 +378,8 @@ fn exact_runner_and_job_identity_drift_fails_closed() {
         .bind_vm_fixture()
         .begin_registration()
         .unwrap()
+        .record_jit_generation_started()
+        .unwrap()
         .record_registration(&runner(7))
         .unwrap();
 
@@ -299,6 +392,8 @@ fn exact_runner_and_job_identity_drift_fails_closed() {
     );
 
     let running = registered
+        .record_runner_start_started()
+        .unwrap()
         .record_runner_ready(&runner(7))
         .unwrap()
         .record_assigned(job("job-a"))
@@ -327,6 +422,8 @@ fn canonical_codec_round_trips_exact_state_and_revision() {
         .unwrap()
         .bind_vm_fixture()
         .begin_registration()
+        .unwrap()
+        .record_jit_generation_started()
         .unwrap()
         .record_registration(&runner(77))
         .unwrap();
@@ -375,6 +472,13 @@ fn codec_rejects_future_versions_unknown_fields_and_inconsistent_phase_evidence(
             .code(),
         "version_incompatible"
     );
+    value["schema_version"] = serde_json::json!(5);
+    assert_eq!(
+        decode_disposable_attempt_state(&serde_json::to_vec(&value).unwrap())
+            .unwrap_err()
+            .code(),
+        "version_incompatible"
+    );
 
     let mut inconsistent: serde_json::Value = serde_json::from_slice(&base).unwrap();
     inconsistent["phase"] = serde_json::json!("running");
@@ -392,6 +496,33 @@ fn codec_rejects_future_versions_unknown_fields_and_inconsistent_phase_evidence(
     impossible_started["phase"] = serde_json::json!("clone_started");
     assert_eq!(
         decode_disposable_attempt_state(&serde_json::to_vec(&impossible_started).unwrap())
+            .unwrap_err()
+            .code(),
+        "invalid_document"
+    );
+
+    let registering = reserved()
+        .authorize_clone()
+        .unwrap()
+        .record_clone_started()
+        .unwrap()
+        .bind_vm_fixture()
+        .begin_registration()
+        .unwrap();
+    let mut forged: serde_json::Value =
+        serde_json::from_slice(&encode_disposable_attempt_state(&registering).unwrap()).unwrap();
+    forged["runner_start_started"] = serde_json::json!(true);
+    assert_eq!(
+        decode_disposable_attempt_state(&serde_json::to_vec(&forged).unwrap())
+            .unwrap_err()
+            .code(),
+        "invalid_document"
+    );
+
+    let mut preclone: serde_json::Value = serde_json::from_slice(&base).unwrap();
+    preclone["jit_generation_started"] = serde_json::json!(true);
+    assert_eq!(
+        decode_disposable_attempt_state(&serde_json::to_vec(&preclone).unwrap())
             .unwrap_err()
             .code(),
         "invalid_document"

@@ -148,12 +148,19 @@ argv, the inherited environment, logs, Debug, serialization, or an ordinary copi
 launcher sets only the official runner's JIT input and hosted-result switch immediately before
 `exec`. The plan fixes the Lima shell, guest `sudo`, launcher, work directory, and empty inherited
 environment, and binds the candidate to the exact durable attempt, cloned VM identity, runner name,
-runner ID, and deadline. It intentionally exposes
-no execution path yet: the production service must still freshly prove the complete target ready,
-durably record the GitHub registration, publish a no-replay runner-start checkpoint, and only then
-consume the command. No operator enrollment path, executable guest handoff, terminal cleanup, or
-supervised service loop exists yet, so this remains control-plane foundation rather than production
-capacity.
+runner ID, and deadline. Durable attempt schema v6 and catalog schema v7 now separate the two
+irreversible boundaries: one checkpoint is published before requesting a one-time JIT value, and a
+second is published only after the exact returned runner ID is bound and immediately before guest
+start. A restart after the first checkpoint may bind an exact rediscovered registration for cleanup
+but never regenerate JIT; readiness, job start, and non-canceled completion require the second
+checkpoint. The reconciler likewise refuses a same-name registration that appears before JIT
+authority and classifies absent state after an ambiguous JIT request as explicit recovery debt.
+It intentionally exposes no execution path yet: the production transaction must still freshly
+prove the complete target and runner installation, hold the canonical lock across JIT generation,
+both checkpoints, secret consumption, and post-command identity confirmation, and quiesce its
+owned process group before automatic cleanup after ambiguity. No operator enrollment path,
+executable guest handoff, terminal cleanup, or supervised service loop exists yet, so this remains
+control-plane foundation rather than production capacity.
 
 Acceptance: an enrolled test repository targets the SmolRunner scale-set label, queues a job, and receives its result without operator commands; the JIT runner cannot accept a second job and its credential is absent after VM destruction.
 

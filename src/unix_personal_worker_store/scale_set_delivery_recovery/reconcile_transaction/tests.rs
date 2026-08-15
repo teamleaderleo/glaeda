@@ -202,13 +202,28 @@ fn registering_catalog(request_id: u64) -> DisposableAttemptCatalogDocument {
         )
         .expect("bind VM identity");
     attempt_revision = catalog.active()[0].attempt().revision();
-    catalog
+    catalog = catalog
         .replace_attempt(
             &attempt_id,
             attempt_revision,
             DisposableAttemptCatalogAction::BeginRegistration,
         )
-        .expect("begin registration")
+        .expect("begin registration");
+    let runner = ScaleSetRunnerReference::new(
+        ScaleSetRunnerId::new(501).expect("runner id"),
+        catalog.active()[0].attempt().runner_name().clone(),
+    );
+    for action in [
+        DisposableAttemptCatalogAction::RecordJitGenerationStarted,
+        DisposableAttemptCatalogAction::RecordRegistration(runner),
+        DisposableAttemptCatalogAction::RecordRunnerStartStarted,
+    ] {
+        attempt_revision = catalog.active()[0].attempt().revision();
+        catalog = catalog
+            .replace_attempt(&attempt_id, attempt_revision, action)
+            .expect("checkpoint runner start");
+    }
+    catalog
 }
 
 fn write_private(path: &Path, bytes: &[u8]) {

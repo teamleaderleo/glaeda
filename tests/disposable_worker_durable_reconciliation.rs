@@ -238,6 +238,17 @@ fn tick_with_cancellation(
                 .unwrap()
                 .0
         }
+        DisposableWorkerAction::CheckpointAndGenerateJit => {
+            catalog
+                .transition(
+                    current.revision(),
+                    state.attempt_id(),
+                    state.revision(),
+                    DisposableAttemptCatalogAction::RecordJitGenerationStarted,
+                )
+                .unwrap()
+                .0
+        }
         _ => current,
     };
     drop(catalog);
@@ -319,16 +330,58 @@ fn every_durable_checkpoint_reopens_without_duplicate_capacity_or_cleanup_loss()
         state.find_active(&attempt_id()).unwrap().attempt().phase(),
         DisposableAttemptPhase::Registering
     );
-    for _ in 0..2 {
-        let (_, action) = tick(
-            root.path(),
-            DisposableVmObservation::Ready,
-            ScaleSetRunnerObservation::Absent,
-            None,
-            true,
-        );
-        assert_eq!(action, DisposableWorkerAction::GenerateJitAndStartRunner);
-    }
+    let (jit_state, action) = tick(
+        root.path(),
+        DisposableVmObservation::Ready,
+        ScaleSetRunnerObservation::Absent,
+        None,
+        true,
+    );
+    assert_eq!(action, DisposableWorkerAction::CheckpointAndGenerateJit);
+    let attempt = jit_state.find_active(&attempt_id()).unwrap().attempt();
+    assert!(attempt.jit_generation_started());
+    assert!(!attempt.runner_start_started());
+    let (_, action) = tick(
+        root.path(),
+        DisposableVmObservation::Ready,
+        ScaleSetRunnerObservation::Absent,
+        None,
+        true,
+    );
+    assert_eq!(
+        action,
+        DisposableWorkerAction::Blocked {
+            code: "jit_generation_outcome_unknown"
+        }
+    );
+
+    let store = UnixPersonalWorkerStore::open_or_create_disposable_catalog(root.path()).unwrap();
+    let mut catalog = DisposableAttemptCatalog::new(store);
+    let current = catalog.load().unwrap();
+    let attempt = current.find_active(&attempt_id()).unwrap().attempt();
+    let registered = catalog
+        .transition(
+            current.revision(),
+            attempt.attempt_id(),
+            attempt.revision(),
+            DisposableAttemptCatalogAction::RecordRegistration(runner()),
+        )
+        .unwrap()
+        .0;
+    let attempt = registered.find_active(&attempt_id()).unwrap().attempt();
+    let runner_started = catalog
+        .transition(
+            registered.revision(),
+            attempt.attempt_id(),
+            attempt.revision(),
+            DisposableAttemptCatalogAction::RecordRunnerStartStarted,
+        )
+        .unwrap()
+        .0;
+    let attempt = runner_started.find_active(&attempt_id()).unwrap().attempt();
+    assert!(attempt.jit_generation_started());
+    assert!(attempt.runner_start_started());
+    drop(catalog);
 
     let exact_runner = runner();
     let (state, _) = tick(

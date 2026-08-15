@@ -140,8 +140,14 @@ fn apply(
         }
         DisposableAttemptCatalogAction::CompleteUnprovisioned => state.complete_unprovisioned(),
         DisposableAttemptCatalogAction::BeginRegistration => state.begin_registration(),
+        DisposableAttemptCatalogAction::RecordJitGenerationStarted => {
+            state.record_jit_generation_started()
+        }
         DisposableAttemptCatalogAction::RecordRegistration(runner) => {
             state.record_registration(runner)
+        }
+        DisposableAttemptCatalogAction::RecordRunnerStartStarted => {
+            state.record_runner_start_started()
         }
         DisposableAttemptCatalogAction::RecordRunnerReady(runner) => {
             state.record_runner_ready(runner)
@@ -281,8 +287,11 @@ fn happy_path_uses_canonical_durable_transitions() {
             ScaleSetRunnerObservation::Absent,
         ))
         .unwrap(),
-        DisposableWorkerAction::GenerateJitAndStartRunner
+        DisposableWorkerAction::CheckpointAndGenerateJit
     );
+    state = state.record_jit_generation_started().unwrap();
+    state = state.record_registration(&runner(41)).unwrap();
+    state = state.record_runner_start_started().unwrap();
 
     let exact_runner = runner(41);
     let action = reconcile_attempt(input(
@@ -532,7 +541,7 @@ fn legacy_provisioning_schema_and_current_schema_alias_are_both_refused() {
         decode_disposable_attempt_state(&serde_json::to_vec(&legacy).unwrap())
             .unwrap_err()
             .code(),
-        "invalid_document"
+        "version_incompatible"
     );
     assert_eq!(
         attempt().begin_provisioning().unwrap_err().code(),
@@ -547,6 +556,31 @@ fn crash_discovered_registration_is_durably_bound_before_cleanup() {
     state = bind_vm(state);
     state = state.begin_registration().unwrap();
     let exact_runner = runner(41);
+    assert_eq!(
+        reconcile_attempt(input(
+            &state,
+            DisposableVmObservation::Ready,
+            ScaleSetRunnerObservation::RegistrationOnly {
+                runner: exact_runner.clone(),
+            },
+        ))
+        .unwrap(),
+        DisposableWorkerAction::Blocked {
+            code: "runner_exists_before_jit_checkpoint"
+        }
+    );
+    state = state.record_jit_generation_started().unwrap();
+    assert_eq!(
+        reconcile_attempt(input(
+            &state,
+            DisposableVmObservation::Ready,
+            ScaleSetRunnerObservation::Absent,
+        ))
+        .unwrap(),
+        DisposableWorkerAction::Blocked {
+            code: "jit_generation_outcome_unknown"
+        }
+    );
     let action = reconcile_attempt(input(
         &state,
         DisposableVmObservation::Ready,
@@ -613,6 +647,12 @@ fn terminal_cleanup_orders_vm_runner_and_capacity_release() {
         .bind_vm_fixture()
         .begin_registration()
         .unwrap()
+        .record_jit_generation_started()
+        .unwrap()
+        .record_registration(&exact_runner)
+        .unwrap()
+        .record_runner_start_started()
+        .unwrap()
         .record_assigned(job("job-cleanup"))
         .unwrap()
         .record_terminal(None, job("job-cleanup"), result("failed"))
@@ -638,22 +678,6 @@ fn terminal_cleanup_orders_vm_runner_and_capacity_release() {
         },
     ))
     .unwrap();
-    state = apply(&state, &action);
-    assert_eq!(state.phase(), DisposableAttemptPhase::Deregistering);
-    let action = reconcile_attempt(input(
-        &state,
-        DisposableVmObservation::Absent,
-        ScaleSetRunnerObservation::RegistrationOnly {
-            runner: exact_runner.clone(),
-        },
-    ))
-    .unwrap();
-    assert_eq!(
-        action,
-        persist(DisposableAttemptCatalogAction::RecordRegistration(
-            exact_runner.clone()
-        ))
-    );
     state = apply(&state, &action);
     assert_eq!(state.phase(), DisposableAttemptPhase::Deregistering);
     assert_eq!(
@@ -695,6 +719,50 @@ fn terminal_cleanup_orders_vm_runner_and_capacity_release() {
     let action = reconcile_attempt(released).unwrap();
     state = apply(&state, &action);
     assert_eq!(state.phase(), DisposableAttemptPhase::Complete);
+}
+
+#[test]
+fn cancellation_before_jit_never_adopts_a_same_name_runner_for_deletion() {
+    let mut state = attempt()
+        .authorize_clone()
+        .unwrap()
+        .record_clone_started()
+        .unwrap()
+        .bind_vm_fixture()
+        .begin_registration()
+        .unwrap();
+    let mut cancel = input(
+        &state,
+        DisposableVmObservation::Ready,
+        ScaleSetRunnerObservation::Absent,
+    );
+    cancel.cancellation_requested = true;
+    let action = reconcile_attempt(cancel).unwrap();
+    state = apply(&state, &action);
+    assert_eq!(state.phase(), DisposableAttemptPhase::Destroying);
+    assert!(!state.jit_generation_started());
+
+    let action = reconcile_attempt(input(
+        &state,
+        DisposableVmObservation::Absent,
+        ScaleSetRunnerObservation::Absent,
+    ))
+    .unwrap();
+    state = apply(&state, &action);
+    assert_eq!(state.phase(), DisposableAttemptPhase::Deregistering);
+
+    assert_eq!(
+        reconcile_attempt(input(
+            &state,
+            DisposableVmObservation::Absent,
+            ScaleSetRunnerObservation::RegistrationOnly { runner: runner(41) },
+        ))
+        .unwrap(),
+        DisposableWorkerAction::Blocked {
+            code: "runner_exists_before_jit_checkpoint",
+        }
+    );
+    assert!(state.runner_id().is_none());
 }
 
 #[test]
@@ -832,6 +900,12 @@ fn duplicate_job_event_is_a_no_op_but_identity_drift_is_refused() {
         .bind_vm_fixture()
         .begin_registration()
         .unwrap()
+        .record_jit_generation_started()
+        .unwrap()
+        .record_registration(&exact_runner)
+        .unwrap()
+        .record_runner_start_started()
+        .unwrap()
         .record_runner_ready(&exact_runner)
         .unwrap()
         .record_running(&exact_runner, job("job-one"))
@@ -878,6 +952,14 @@ fn late_duplicate_event_does_not_reverse_cleanup() {
         .record_clone_started()
         .unwrap()
         .bind_vm_fixture()
+        .begin_registration()
+        .unwrap()
+        .record_jit_generation_started()
+        .unwrap()
+        .record_registration(&exact_runner)
+        .unwrap()
+        .record_runner_start_started()
+        .unwrap()
         .record_terminal(Some(&exact_runner), job("job-late"), result("succeeded"))
         .unwrap()
         .begin_cleanup()
@@ -909,6 +991,14 @@ fn first_late_job_events_are_checkpointed_without_reversing_cleanup() {
         .record_clone_started()
         .unwrap()
         .bind_vm_fixture()
+        .begin_registration()
+        .unwrap()
+        .record_jit_generation_started()
+        .unwrap()
+        .record_registration(&exact_runner)
+        .unwrap()
+        .record_runner_start_started()
+        .unwrap()
         .begin_cleanup()
         .unwrap();
     let mut started = input(
