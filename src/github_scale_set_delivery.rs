@@ -34,6 +34,41 @@ pub(crate) struct ScaleSetDelivery {
     events: Vec<ScaleSetDeliveryEvent>,
 }
 
+/// Validated job evidence projected from one canonical durable Scale Set delivery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScaleSetDeliveryJobEvidence {
+    pub(crate) runner_request_id: ScaleSetRunnerRequestId,
+    pub(crate) repository: String,
+    pub(crate) owner: String,
+    pub(crate) job_id: ScaleSetJobId,
+    pub(crate) workflow_run_id: u64,
+    pub(crate) request_labels: Vec<String>,
+}
+
+/// Typed lifecycle evidence retained by one canonical durable Scale Set delivery.
+///
+/// This projection is intentionally separate from the bridge adapter's response type. Consumers
+/// reconstruct it from validated durable bytes after restart instead of retaining bridge-process
+/// objects across the durability boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ScaleSetDeliveryLifecycleEvent {
+    Available {
+        job: ScaleSetDeliveryJobEvidence,
+    },
+    Assigned {
+        job: ScaleSetDeliveryJobEvidence,
+    },
+    Started {
+        job: ScaleSetDeliveryJobEvidence,
+        runner: ScaleSetRunnerReference,
+    },
+    Completed {
+        job: ScaleSetDeliveryJobEvidence,
+        runner: Option<ScaleSetRunnerReference>,
+        result: ScaleSetJobResult,
+    },
+}
+
 impl ScaleSetDelivery {
     pub(crate) fn from_bridge_poll(
         poll: &ScaleSetBridgePoll,
@@ -78,6 +113,17 @@ impl ScaleSetDelivery {
             .iter()
             .copied()
             .map(parse_runner_request_id)
+            .collect()
+    }
+
+    /// Reconstruct every retained lifecycle event using validated protocol identities.
+    pub(crate) fn retained_events(
+        &self,
+    ) -> Result<Vec<ScaleSetDeliveryLifecycleEvent>, ScaleSetDeliveryError> {
+        self.validate()?;
+        self.events
+            .iter()
+            .map(ScaleSetDeliveryEvent::to_lifecycle_event)
             .collect()
     }
 
@@ -215,6 +261,39 @@ impl ScaleSetDeliveryEvent {
         }
     }
 
+    fn to_lifecycle_event(&self) -> Result<ScaleSetDeliveryLifecycleEvent, ScaleSetDeliveryError> {
+        self.validate()?;
+        Ok(match self {
+            Self::Available { job } => ScaleSetDeliveryLifecycleEvent::Available {
+                job: job.to_job_evidence()?,
+            },
+            Self::Assigned { job } => ScaleSetDeliveryLifecycleEvent::Assigned {
+                job: job.to_job_evidence()?,
+            },
+            Self::Started { job, runner } => ScaleSetDeliveryLifecycleEvent::Started {
+                job: job.to_job_evidence()?,
+                runner: runner.to_runner_reference()?,
+            },
+            Self::Completed {
+                job,
+                runner,
+                result,
+            } => ScaleSetDeliveryLifecycleEvent::Completed {
+                job: job.to_job_evidence()?,
+                runner: runner
+                    .as_ref()
+                    .map(ScaleSetDeliveryRunner::to_runner_reference)
+                    .transpose()?,
+                result: ScaleSetJobResult::parse(result).map_err(|_| {
+                    delivery_error(
+                        ScaleSetDeliveryErrorKind::CorruptEvidence,
+                        "Scale Set completion result is invalid",
+                    )
+                })?,
+            },
+        })
+    }
+
     fn validate(&self) -> Result<(), ScaleSetDeliveryError> {
         match self {
             Self::Available { job } | Self::Assigned { job } => job.validate(),
@@ -271,6 +350,23 @@ impl ScaleSetDeliveryJob {
         }
     }
 
+    fn to_job_evidence(&self) -> Result<ScaleSetDeliveryJobEvidence, ScaleSetDeliveryError> {
+        self.validate()?;
+        Ok(ScaleSetDeliveryJobEvidence {
+            runner_request_id: parse_runner_request_id(self.runner_request_id)?,
+            repository: self.repository.clone(),
+            owner: self.owner.clone(),
+            job_id: ScaleSetJobId::parse(&self.job_id).map_err(|_| {
+                delivery_error(
+                    ScaleSetDeliveryErrorKind::CorruptEvidence,
+                    "Scale Set job identity is invalid",
+                )
+            })?,
+            workflow_run_id: self.workflow_run_id,
+            request_labels: self.request_labels.clone(),
+        })
+    }
+
     fn validate(&self) -> Result<(), ScaleSetDeliveryError> {
         parse_runner_request_id(self.runner_request_id)?;
         ScaleSetJobId::parse(&self.job_id).map_err(|_| {
@@ -310,6 +406,24 @@ impl ScaleSetDeliveryRunner {
             id: runner.id.get(),
             name: runner.name.as_str().to_owned(),
         }
+    }
+
+    fn to_runner_reference(&self) -> Result<ScaleSetRunnerReference, ScaleSetDeliveryError> {
+        self.validate()?;
+        Ok(ScaleSetRunnerReference::new(
+            ScaleSetRunnerId::new(self.id).map_err(|_| {
+                delivery_error(
+                    ScaleSetDeliveryErrorKind::CorruptEvidence,
+                    "Scale Set runner ID is invalid",
+                )
+            })?,
+            ScaleSetRunnerName::parse(&self.name).map_err(|_| {
+                delivery_error(
+                    ScaleSetDeliveryErrorKind::CorruptEvidence,
+                    "Scale Set runner name is invalid",
+                )
+            })?,
+        ))
     }
 
     fn validate(&self) -> Result<(), ScaleSetDeliveryError> {
@@ -461,6 +575,18 @@ mod tests {
         }
     }
 
+    fn lifecycle_statistics() -> ScaleSetStatistics {
+        ScaleSetStatistics {
+            available_jobs: 1,
+            acquired_jobs: 0,
+            assigned_jobs: 3,
+            running_jobs: 1,
+            registered_runners: 1,
+            busy_runners: 1,
+            idle_runners: 0,
+        }
+    }
+
     fn job(request_id: u64, job_id: &str) -> ScaleSetBridgeJobEvidence {
         ScaleSetBridgeJobEvidence {
             runner_request_id: request_id,
@@ -470,6 +596,24 @@ mod tests {
             workflow_run_id: 99,
             request_labels: vec!["smolrunner".to_owned()],
         }
+    }
+
+    fn retained_job(request_id: u64, job_id: &str) -> ScaleSetDeliveryJobEvidence {
+        ScaleSetDeliveryJobEvidence {
+            runner_request_id: ScaleSetRunnerRequestId::new(request_id).unwrap(),
+            repository: "project".to_owned(),
+            owner: "example".to_owned(),
+            job_id: ScaleSetJobId::parse(job_id).unwrap(),
+            workflow_run_id: 99,
+            request_labels: vec!["smolrunner".to_owned()],
+        }
+    }
+
+    fn runner(id: u64, name: &str) -> ScaleSetRunnerReference {
+        ScaleSetRunnerReference::new(
+            ScaleSetRunnerId::new(id).unwrap(),
+            ScaleSetRunnerName::parse(name).unwrap(),
+        )
     }
 
     #[test]
@@ -498,6 +642,64 @@ mod tests {
 
         let encoded = encode_scale_set_delivery(&delivery).unwrap();
         assert_eq!(decode_scale_set_delivery(&encoded).unwrap(), delivery);
+    }
+
+    #[test]
+    fn decoded_delivery_reconstructs_every_retained_lifecycle_event() {
+        let runner = runner(500, "smol-attempt-1");
+        let poll = ScaleSetBridgePoll::Message {
+            message_id: 8,
+            statistics: lifecycle_statistics(),
+            events: vec![
+                ScaleSetBridgeEvent::Available(job(41, "job-1")),
+                ScaleSetBridgeEvent::Assigned(job(42, "job-2")),
+                ScaleSetBridgeEvent::Started {
+                    job: job(43, "job-3"),
+                    runner: runner.clone(),
+                },
+                ScaleSetBridgeEvent::Completed {
+                    job: job(44, "job-4"),
+                    runner: Some(runner.clone()),
+                    result: ScaleSetJobResult::parse("succeeded").unwrap(),
+                },
+                ScaleSetBridgeEvent::Completed {
+                    job: job(45, "job-5"),
+                    runner: None,
+                    result: ScaleSetJobResult::parse("canceled").unwrap(),
+                },
+            ],
+        };
+        let delivery = ScaleSetDelivery::from_bridge_poll(&poll)
+            .unwrap()
+            .expect("message must produce a delivery");
+        let encoded = encode_scale_set_delivery(&delivery).unwrap();
+        let decoded = decode_scale_set_delivery(&encoded).unwrap();
+
+        assert_eq!(
+            decoded.retained_events().unwrap(),
+            vec![
+                ScaleSetDeliveryLifecycleEvent::Available {
+                    job: retained_job(41, "job-1"),
+                },
+                ScaleSetDeliveryLifecycleEvent::Assigned {
+                    job: retained_job(42, "job-2"),
+                },
+                ScaleSetDeliveryLifecycleEvent::Started {
+                    job: retained_job(43, "job-3"),
+                    runner: runner.clone(),
+                },
+                ScaleSetDeliveryLifecycleEvent::Completed {
+                    job: retained_job(44, "job-4"),
+                    runner: Some(runner),
+                    result: ScaleSetJobResult::parse("succeeded").unwrap(),
+                },
+                ScaleSetDeliveryLifecycleEvent::Completed {
+                    job: retained_job(45, "job-5"),
+                    runner: None,
+                    result: ScaleSetJobResult::parse("canceled").unwrap(),
+                },
+            ]
+        );
     }
 
     #[test]
