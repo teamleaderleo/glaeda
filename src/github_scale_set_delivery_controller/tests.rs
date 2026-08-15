@@ -343,6 +343,46 @@ fn poll_persists_before_ack_and_records_the_exact_acquired_subset() {
 }
 
 #[test]
+fn stale_empty_capacity_snapshot_cannot_reserve_a_second_worker() {
+    let root = TempRoot::new("stale-empty-capacity");
+    let empty = initialize(&root);
+    let mut first = FakeBridge {
+        polls: VecDeque::from([message(108, 141)]),
+        acknowledgements: VecDeque::from([Ok(vec![141])]),
+        ..FakeBridge::default()
+    };
+    assert_eq!(
+        consume_with_bridge(root.path(), &policy(), &mut first, observed_at()).unwrap(),
+        ScaleSetDeliveryControllerDisposition::Settled { acquired: 1 }
+    );
+
+    let mut stale = FakeBridge {
+        polls: VecDeque::from([message(109, 142)]),
+        acknowledgements: VecDeque::from([Ok(vec![142])]),
+        ..FakeBridge::default()
+    };
+    let error = consume_with_bridge_capacity_at_revision(
+        root.path(),
+        &policy(),
+        &mut stale,
+        observed_at(),
+        1,
+        empty.revision(),
+    )
+    .expect_err("the stale empty-catalog decision must not reserve another worker");
+    assert_eq!(error.code(), "scale_set_delivery_store_failed");
+    assert_eq!(stale.calls, ["poll"]);
+    assert!(stale.poisoned);
+    let catalog = load_catalog(&root);
+    assert_eq!(catalog.active().len(), 1);
+    assert!(
+        catalog
+            .find_active_by_runner_request_id(ScaleSetRunnerRequestId::new(141).unwrap())
+            .is_some()
+    );
+}
+
+#[test]
 fn definitively_unacquired_available_request_retires_with_the_delivery_fence() {
     let root = TempRoot::new("unacquired");
     initialize(&root);

@@ -33,7 +33,7 @@ use crate::github_scale_set_delivery::ScaleSetDelivery;
 use crate::github_scale_set_delivery_consumer::ScaleSetDeliveryConsumerPolicy;
 use crate::github_scale_set_delivery_controller::{
     DeliveryBridge, ScaleSetDeliveryControllerDisposition, consume_with_bridge_capacity,
-    reconcile_and_ack_delivery,
+    consume_with_bridge_capacity_at_revision, reconcile_and_ack_delivery,
 };
 use crate::github_scale_set_protocol::{ScaleSetRunnerName, ScaleSetRunnerReference};
 use crate::process::TimedCommandExecutor;
@@ -194,15 +194,25 @@ impl DisposableWorkerCoordinator {
         let observed_at = clock
             .epoch_millis()
             .map_err(|_| coordinator_error("disposable_clock_unavailable"))?;
-        match consume_with_bridge_capacity(
-            &self.state_root,
-            &self.policy,
-            bridge,
-            observed_at,
-            available_capacity,
-        )
-        .map_err(|error| coordinator_error(error.code()))?
-        {
+        let delivery = if available_capacity == 1 {
+            consume_with_bridge_capacity_at_revision(
+                &self.state_root,
+                &self.policy,
+                bridge,
+                observed_at,
+                available_capacity,
+                catalog.revision(),
+            )
+        } else {
+            consume_with_bridge_capacity(
+                &self.state_root,
+                &self.policy,
+                bridge,
+                observed_at,
+                available_capacity,
+            )
+        };
+        match delivery.map_err(|error| coordinator_error(error.code()))? {
             ScaleSetDeliveryControllerDisposition::Settled { acquired } => {
                 return Ok(DisposableWorkerCoordinatorDisposition::DeliverySettled { acquired });
             }
