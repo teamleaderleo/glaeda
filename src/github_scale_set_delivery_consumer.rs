@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use std::collections::BTreeSet;
 use std::fmt;
 
 use sha2::{Digest, Sha256};
@@ -120,6 +121,111 @@ pub(crate) fn reconcile_scale_set_delivery(
         .try_fold(catalog.clone(), |current, event| {
             reconcile_event(policy, &event, &current, observed_at)
         })
+}
+
+/// Reconcile one zero-capacity lifecycle delivery that resolves an earlier ambiguous acquisition.
+///
+/// The earlier Available delivery has already reserved local capacity but its acknowledgement
+/// response was lost. A later exact Assigned event is positive service evidence that GitHub
+/// acquired that request, while the documented runnerless Completed(canceled) shape proves that
+/// the acquired assignment ended before any runner accepted it. The latter is released through the
+/// unprovisioned path and never gains VM-cleanup authority. Started or runner-bearing completion
+/// cannot legitimately precede SmolRunner's durable clone and runner bindings and therefore fail
+/// closed.
+pub(crate) fn reconcile_scale_set_acquisition_resolution(
+    policy: &ScaleSetDeliveryConsumerPolicy,
+    ambiguous_requests: &[crate::github_scale_set_protocol::ScaleSetRunnerRequestId],
+    delivery: &ScaleSetDelivery,
+    catalog: &DisposableAttemptCatalogDocument,
+) -> Result<
+    (
+        DisposableAttemptCatalogDocument,
+        Vec<crate::github_scale_set_protocol::ScaleSetRunnerRequestId>,
+    ),
+    ScaleSetDeliveryConsumerError,
+> {
+    if ambiguous_requests.is_empty()
+        || !delivery
+            .available_request_ids()
+            .map_err(|_| consumer_error("delivery_consumer_evidence_invalid"))?
+            .is_empty()
+    {
+        return Err(consumer_error("delivery_consumer_resolution_invalid"));
+    }
+    let ambiguous = ambiguous_requests.iter().copied().collect::<BTreeSet<_>>();
+    if ambiguous.len() != ambiguous_requests.len() {
+        return Err(consumer_error("delivery_consumer_resolution_invalid"));
+    }
+
+    let mut next = catalog.clone();
+    let mut acquired = BTreeSet::new();
+    for event in delivery
+        .retained_events()
+        .map_err(|_| consumer_error("delivery_consumer_evidence_invalid"))?
+    {
+        let job = event_job(&event);
+        if !ambiguous.contains(&job.runner_request_id) {
+            return Err(consumer_error("delivery_consumer_resolution_conflict"));
+        }
+
+        validate_job(policy, job)?;
+        let identities = derive_identities(policy, job)?;
+        let reservation = next
+            .find_active_by_runner_request_id(job.runner_request_id)
+            .ok_or_else(|| consumer_error("delivery_consumer_attempt_missing"))?;
+        validate_reservation(policy, reservation, job, &identities)?;
+        if reservation.attempt().phase()
+            != crate::disposable_worker_reconciler::DisposableAttemptPhase::Reserved
+        {
+            return Err(consumer_error("delivery_consumer_resolution_conflict"));
+        }
+
+        match &event {
+            ScaleSetDeliveryLifecycleEvent::Assigned { .. } => {
+                acquired.insert(job.runner_request_id);
+            }
+            ScaleSetDeliveryLifecycleEvent::Completed {
+                runner: None,
+                result,
+                ..
+            } if result.as_str() == "canceled" => {
+                acquired.insert(job.runner_request_id);
+                let attempt_id = reservation.attempt().attempt_id().clone();
+                let releasing = next
+                    .replace_attempt(
+                        &attempt_id,
+                        reservation.attempt().revision(),
+                        DisposableAttemptCatalogAction::BeginUnprovisionedRelease,
+                    )
+                    .map_err(|_| consumer_error("delivery_consumer_resolution_conflict"))?;
+                let releasing_attempt = releasing
+                    .find_active_by_runner_request_id(job.runner_request_id)
+                    .ok_or_else(|| consumer_error("delivery_consumer_attempt_missing"))?;
+                let complete = releasing
+                    .replace_attempt(
+                        &attempt_id,
+                        releasing_attempt.attempt().revision(),
+                        DisposableAttemptCatalogAction::CompleteUnprovisioned,
+                    )
+                    .map_err(|_| consumer_error("delivery_consumer_resolution_conflict"))?;
+                let complete_attempt = complete
+                    .find_active_by_runner_request_id(job.runner_request_id)
+                    .ok_or_else(|| consumer_error("delivery_consumer_attempt_missing"))?;
+                next = complete
+                    .retire_complete(&attempt_id, complete_attempt.attempt().revision())
+                    .map_err(|_| consumer_error("delivery_consumer_resolution_conflict"))?;
+            }
+            ScaleSetDeliveryLifecycleEvent::Available { .. }
+            | ScaleSetDeliveryLifecycleEvent::Started { .. }
+            | ScaleSetDeliveryLifecycleEvent::Completed { .. } => {
+                return Err(consumer_error("delivery_consumer_resolution_conflict"));
+            }
+        }
+    }
+    if acquired.is_empty() {
+        return Err(consumer_error("delivery_consumer_resolution_inconclusive"));
+    }
+    Ok((next, acquired.into_iter().collect()))
 }
 
 fn reconcile_event(
@@ -425,6 +531,7 @@ mod tests {
     };
     use crate::github_scale_set_protocol::{
         ScaleSetJobId, ScaleSetJobResult, ScaleSetRunnerId, ScaleSetRunnerReference,
+        ScaleSetRunnerRequestId,
     };
 
     fn policy() -> ScaleSetDeliveryConsumerPolicy {
@@ -510,6 +617,80 @@ mod tests {
             .code(),
             "delivery_consumer_identity_drift"
         );
+    }
+
+    #[test]
+    fn later_assignment_resolves_ambiguous_acquisition_without_premature_worker_authority() {
+        let reserved = reserve();
+        let request = ScaleSetRunnerRequestId::new(41).unwrap();
+        let assigned = delivery(vec![ScaleSetBridgeEvent::Assigned(job(41, "job-1"))]);
+        let (resolved, acquired) =
+            reconcile_scale_set_acquisition_resolution(&policy(), &[request], &assigned, &reserved)
+                .unwrap();
+
+        assert_eq!(resolved, reserved);
+        assert_eq!(acquired, [request]);
+        assert_eq!(
+            resolved.active()[0].attempt().phase(),
+            DisposableAttemptPhase::Reserved
+        );
+        assert!(resolved.active()[0].attempt().github_job_id().is_none());
+    }
+
+    #[test]
+    fn runnerless_cancellation_resolves_and_retires_without_vm_cleanup_authority() {
+        let reserved = reserve();
+        let request = ScaleSetRunnerRequestId::new(41).unwrap();
+        let canceled = delivery(vec![ScaleSetBridgeEvent::Completed {
+            job: job(41, "job-1"),
+            runner: None,
+            result: ScaleSetJobResult::parse("canceled").unwrap(),
+        }]);
+        let (resolved, acquired) =
+            reconcile_scale_set_acquisition_resolution(&policy(), &[request], &canceled, &reserved)
+                .unwrap();
+
+        assert!(resolved.active().is_empty());
+        let tombstone = resolved
+            .find_tombstone_by_runner_request_id(request)
+            .expect("canceled request must enter bounded replay history");
+        assert_eq!(tombstone.phase(), DisposableAttemptPhase::Complete);
+        assert!(tombstone.vm_identity().is_none());
+        assert!(tombstone.github_job_id().is_none());
+        assert_eq!(acquired, [request]);
+    }
+
+    #[test]
+    fn preclone_started_or_runner_bearing_completion_cannot_resolve_acquisition() {
+        let reserved = reserve();
+        let request = ScaleSetRunnerRequestId::new(41).unwrap();
+        let runner = ScaleSetRunnerReference::new(
+            ScaleSetRunnerId::new(501).unwrap(),
+            reserved.active()[0].attempt().runner_name().clone(),
+        );
+        for event in [
+            ScaleSetBridgeEvent::Started {
+                job: job(41, "job-1"),
+                runner: runner.clone(),
+            },
+            ScaleSetBridgeEvent::Completed {
+                job: job(41, "job-1"),
+                runner: Some(runner.clone()),
+                result: ScaleSetJobResult::parse("succeeded").unwrap(),
+            },
+        ] {
+            assert_eq!(
+                reconcile_scale_set_acquisition_resolution(
+                    &policy(),
+                    &[request],
+                    &delivery(vec![event]),
+                    &reserved,
+                )
+                .unwrap_err()
+                .code(),
+                "delivery_consumer_resolution_conflict"
+            );
+        }
     }
 
     #[test]

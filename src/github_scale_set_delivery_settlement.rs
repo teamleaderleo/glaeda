@@ -31,6 +31,9 @@ pub(crate) fn settle_scale_set_delivery_catalog(
         {
             acquired
         }
+        ScaleSetDeliveryRecoveryPhase::LifecycleAcknowledged { resolution } => {
+            resolution.acquired()
+        }
         ScaleSetDeliveryRecoveryPhase::SettlementPrepared { acquired, .. } => acquired,
         _ => return Err(settlement_error("scale_set_settlement_evidence_incomplete")),
     };

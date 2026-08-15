@@ -8,9 +8,9 @@ use sha2::{Digest, Sha256};
 
 use crate::artifact::Sha256Digest;
 use crate::disposable_attempt_catalog::{
-    DisposableAttemptCatalogDocument, DisposableAttemptCatalogRevision,
-    MAX_DISPOSABLE_ATTEMPT_CATALOG_DOCUMENT_BYTES, decode_disposable_attempt_catalog,
-    encode_disposable_attempt_catalog,
+    DisposableAttemptCatalogAction, DisposableAttemptCatalogDocument,
+    DisposableAttemptCatalogRevision, MAX_DISPOSABLE_ATTEMPT_CATALOG_DOCUMENT_BYTES,
+    decode_disposable_attempt_catalog, encode_disposable_attempt_catalog,
 };
 use crate::github_scale_set_delivery::{
     MAX_SCALE_SET_DELIVERY_BYTES, ScaleSetDelivery, decode_scale_set_delivery,
@@ -18,9 +18,9 @@ use crate::github_scale_set_delivery::{
 };
 use crate::github_scale_set_protocol::ScaleSetRunnerRequestId;
 
-pub(crate) const SCALE_SET_DELIVERY_RECOVERY_SCHEMA_VERSION: u8 = 3;
+pub(crate) const SCALE_SET_DELIVERY_RECOVERY_SCHEMA_VERSION: u8 = 4;
 pub(crate) const MAX_SCALE_SET_DELIVERY_RECOVERY_BYTES: usize = MAX_SCALE_SET_DELIVERY_BYTES * 4
-    + MAX_DISPOSABLE_ATTEMPT_CATALOG_DOCUMENT_BYTES * 2
+    + MAX_DISPOSABLE_ATTEMPT_CATALOG_DOCUMENT_BYTES * 4
     + 64 * 1024;
 const MAX_DELIVERY_RECOVERY_REVISION: u64 = 1_000_000_000_000;
 const CATALOG_BINDING_DOMAIN: &[u8] = b"smolrunner.scale-set-catalog-binding.v1\0";
@@ -163,6 +163,139 @@ impl ScaleSetDeliveryRecoveryState {
         self.successor(phase)
     }
 
+    pub(crate) fn prepare_lifecycle_resolution(
+        &self,
+        delivery: ScaleSetDelivery,
+        acquired: &[ScaleSetRunnerRequestId],
+        prior_catalog: &DisposableAttemptCatalogDocument,
+        target_catalog: &DisposableAttemptCatalogDocument,
+    ) -> Result<Self, ScaleSetDeliveryRecoveryError> {
+        if !matches!(
+            &self.phase,
+            ScaleSetDeliveryRecoveryPhase::AcquisitionRecoveryObserved { acquired }
+                if acquired.is_empty()
+        ) || !self.matches_catalog(prior_catalog)
+            || delivery.message_id() <= self.delivery.message_id()
+            || !delivery
+                .available_request_ids()
+                .map_err(|_| corrupt_state())?
+                .is_empty()
+        {
+            return Err(recovery_error(
+                ScaleSetDeliveryRecoveryErrorKind::Conflict,
+                "lifecycle evidence cannot resolve this Scale Set acquisition",
+            ));
+        }
+        let acquired = self.validated_acquired(acquired)?;
+        if acquired.is_empty() {
+            return Err(recovery_error(
+                ScaleSetDeliveryRecoveryErrorKind::Conflict,
+                "lifecycle resolution requires positive acquisition evidence",
+            ));
+        }
+        let lifecycle_requests = delivery
+            .retained_events()
+            .map_err(|_| corrupt_state())?
+            .into_iter()
+            .filter_map(|event| match event {
+                crate::github_scale_set_delivery::ScaleSetDeliveryLifecycleEvent::Available {
+                    ..
+                } => None,
+                crate::github_scale_set_delivery::ScaleSetDeliveryLifecycleEvent::Assigned {
+                    job,
+                }
+                | crate::github_scale_set_delivery::ScaleSetDeliveryLifecycleEvent::Started {
+                    job,
+                    ..
+                }
+                | crate::github_scale_set_delivery::ScaleSetDeliveryLifecycleEvent::Completed {
+                    job,
+                    ..
+                } => Some(job.runner_request_id),
+            })
+            .collect::<BTreeSet<_>>();
+        if acquired
+            .iter()
+            .any(|request_id| !lifecycle_requests.contains(request_id))
+        {
+            return Err(recovery_error(
+                ScaleSetDeliveryRecoveryErrorKind::Conflict,
+                "lifecycle resolution does not contain the acquired request evidence",
+            ));
+        }
+        let resolution = ScaleSetLifecycleResolution {
+            base_revision: self.revision,
+            delivery,
+            acquired,
+            prior_catalog: prior_catalog.clone(),
+            catalog_revision: target_catalog.revision(),
+            catalog_digest: catalog_digest(target_catalog)?,
+        };
+        self.successor_with_catalog(
+            ScaleSetDeliveryRecoveryPhase::LifecycleReconciled { resolution },
+            target_catalog,
+        )
+    }
+
+    pub(crate) fn begin_lifecycle_ack(&self) -> Result<Self, ScaleSetDeliveryRecoveryError> {
+        match &self.phase {
+            ScaleSetDeliveryRecoveryPhase::LifecycleReconciled { resolution } => self.successor(
+                ScaleSetDeliveryRecoveryPhase::LifecycleAcknowledgementStarted {
+                    resolution: resolution.clone(),
+                },
+            ),
+            ScaleSetDeliveryRecoveryPhase::LifecycleAcknowledgementStarted { .. } => {
+                Ok(self.clone())
+            }
+            _ => Err(recovery_error(
+                ScaleSetDeliveryRecoveryErrorKind::Conflict,
+                "only reconciled lifecycle evidence may begin acknowledgement",
+            )),
+        }
+    }
+
+    pub(crate) fn record_lifecycle_ack(&self) -> Result<Self, ScaleSetDeliveryRecoveryError> {
+        match &self.phase {
+            ScaleSetDeliveryRecoveryPhase::LifecycleAcknowledgementStarted { resolution } => self
+                .successor(ScaleSetDeliveryRecoveryPhase::LifecycleAcknowledged {
+                    resolution: resolution.clone(),
+                }),
+            ScaleSetDeliveryRecoveryPhase::LifecycleAcknowledged { .. } => Ok(self.clone()),
+            _ => Err(recovery_error(
+                ScaleSetDeliveryRecoveryErrorKind::Conflict,
+                "lifecycle acknowledgement conflicts with the durable recovery phase",
+            )),
+        }
+    }
+
+    pub(crate) fn lifecycle_resolution(&self) -> Option<&ScaleSetLifecycleResolution> {
+        match &self.phase {
+            ScaleSetDeliveryRecoveryPhase::LifecycleReconciled { resolution }
+            | ScaleSetDeliveryRecoveryPhase::LifecycleAcknowledgementStarted { resolution }
+            | ScaleSetDeliveryRecoveryPhase::LifecycleAcknowledged { resolution } => {
+                Some(resolution)
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn is_lifecycle_resolution_of(
+        &self,
+        predecessor: &Self,
+        prior_catalog: &DisposableAttemptCatalogDocument,
+    ) -> bool {
+        matches!(
+            self.lifecycle_resolution(),
+            Some(resolution)
+                if resolution.base_revision == predecessor.revision
+                    && predecessor.matches_catalog(prior_catalog)
+                    && resolution.prior_catalog == *prior_catalog
+                    && self.prior_catalog_revision == predecessor.prior_catalog_revision
+                    && self.prior_catalog_digest == predecessor.prior_catalog_digest
+                    && self.delivery == predecessor.delivery
+        )
+    }
+
     pub(crate) fn prepare_settlement(
         &self,
         prior_catalog: &DisposableAttemptCatalogDocument,
@@ -200,6 +333,12 @@ impl ScaleSetDeliveryRecoveryState {
                     acquired.clone(),
                 )
             }
+            ScaleSetDeliveryRecoveryPhase::LifecycleAcknowledged { resolution } => (
+                ScaleSetDeliverySettlementProof::LifecycleEvidence {
+                    resolution: Box::new(resolution.clone()),
+                },
+                resolution.acquired.clone(),
+            ),
             _ => {
                 return Err(recovery_error(
                     ScaleSetDeliveryRecoveryErrorKind::Conflict,
@@ -275,6 +414,43 @@ impl ScaleSetDeliveryRecoveryState {
         Ok(state)
     }
 
+    fn successor_with_catalog(
+        &self,
+        phase: ScaleSetDeliveryRecoveryPhase,
+        catalog: &DisposableAttemptCatalogDocument,
+    ) -> Result<Self, ScaleSetDeliveryRecoveryError> {
+        let revision = self
+            .revision
+            .checked_add(1)
+            .filter(|revision| *revision <= MAX_DELIVERY_RECOVERY_REVISION)
+            .ok_or_else(|| {
+                recovery_error(
+                    ScaleSetDeliveryRecoveryErrorKind::Conflict,
+                    "delivery recovery revision cannot advance",
+                )
+            })?;
+        let state = Self {
+            schema_version: self.schema_version,
+            revision,
+            prior_catalog_revision: self.prior_catalog_revision,
+            prior_catalog_digest: self.prior_catalog_digest.clone(),
+            catalog_revision: catalog.revision(),
+            catalog_digest: catalog_digest(catalog)?,
+            delivery: self.delivery.clone(),
+            phase,
+        };
+        state.validate()?;
+        Ok(state)
+    }
+
+    fn matches_catalog_digest(
+        &self,
+        revision: DisposableAttemptCatalogRevision,
+        digest: &Sha256Digest,
+    ) -> bool {
+        self.catalog_revision == revision && &self.catalog_digest == digest
+    }
+
     fn validated_acquired(
         &self,
         acquired: &[ScaleSetRunnerRequestId],
@@ -311,12 +487,25 @@ impl ScaleSetDeliveryRecoveryState {
             ScaleSetDeliveryRecoveryPhase::Reconciled if self.revision == 1 => Ok(()),
             ScaleSetDeliveryRecoveryPhase::AcknowledgementStarted if self.revision == 2 => Ok(()),
             ScaleSetDeliveryRecoveryPhase::Acknowledged { acquired } if self.revision == 3 => {
-                self.validated_acquired(acquired).map(|_| ())
+                if self.validated_acquired(acquired)? == *acquired {
+                    Ok(())
+                } else {
+                    Err(corrupt_state())
+                }
             }
             ScaleSetDeliveryRecoveryPhase::AcquisitionRecoveryObserved { acquired }
-                if self.revision >= 3 =>
+                if self.revision >= 3 && (!acquired.is_empty() || self.revision == 3) =>
             {
-                self.validated_acquired(acquired).map(|_| ())
+                if self.validated_acquired(acquired)? == *acquired {
+                    Ok(())
+                } else {
+                    Err(corrupt_state())
+                }
+            }
+            ScaleSetDeliveryRecoveryPhase::LifecycleReconciled { resolution }
+            | ScaleSetDeliveryRecoveryPhase::LifecycleAcknowledgementStarted { resolution }
+            | ScaleSetDeliveryRecoveryPhase::LifecycleAcknowledged { resolution } => {
+                resolution.validate(self)
             }
             ScaleSetDeliveryRecoveryPhase::SettlementPrepared {
                 proof,
@@ -325,7 +514,9 @@ impl ScaleSetDeliveryRecoveryState {
                 catalog_revision,
                 catalog_digest,
             } => {
-                self.validated_acquired(acquired)?;
+                if self.validated_acquired(acquired)? != *acquired {
+                    return Err(corrupt_state());
+                }
                 if !self.matches_catalog(prior_catalog) {
                     return Err(corrupt_state());
                 }
@@ -341,6 +532,30 @@ impl ScaleSetDeliveryRecoveryState {
                 {
                     return Err(corrupt_state());
                 }
+                if let ScaleSetDeliverySettlementProof::LifecycleEvidence { resolution } = proof {
+                    if acquired != &resolution.acquired
+                        || self.revision
+                            != resolution
+                                .base_revision
+                                .checked_add(4)
+                                .ok_or_else(corrupt_state)?
+                    {
+                        return Err(corrupt_state());
+                    }
+                    let acknowledged = Self {
+                        schema_version: self.schema_version,
+                        revision: self.revision - 1,
+                        prior_catalog_revision: self.prior_catalog_revision,
+                        prior_catalog_digest: self.prior_catalog_digest.clone(),
+                        catalog_revision: self.catalog_revision,
+                        catalog_digest: self.catalog_digest.clone(),
+                        delivery: self.delivery.clone(),
+                        phase: ScaleSetDeliveryRecoveryPhase::LifecycleAcknowledged {
+                            resolution: resolution.as_ref().clone(),
+                        },
+                    };
+                    acknowledged.validate()?;
+                }
                 if catalog_revision.get() < self.catalog_revision.get()
                     || (*catalog_revision == self.catalog_revision
                         && catalog_digest != &self.catalog_digest)
@@ -354,10 +569,182 @@ impl ScaleSetDeliveryRecoveryState {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ScaleSetDeliverySettlementProof {
     Acknowledged,
     AcquisitionRecovery,
+    LifecycleEvidence {
+        resolution: Box<ScaleSetLifecycleResolution>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScaleSetLifecycleResolution {
+    base_revision: u64,
+    delivery: ScaleSetDelivery,
+    acquired: Vec<ScaleSetRunnerRequestId>,
+    prior_catalog: DisposableAttemptCatalogDocument,
+    catalog_revision: DisposableAttemptCatalogRevision,
+    catalog_digest: Sha256Digest,
+}
+
+impl ScaleSetLifecycleResolution {
+    pub(crate) const fn delivery(&self) -> &ScaleSetDelivery {
+        &self.delivery
+    }
+
+    pub(crate) fn acquired(&self) -> &[ScaleSetRunnerRequestId] {
+        &self.acquired
+    }
+
+    pub(crate) const fn prior_catalog(&self) -> &DisposableAttemptCatalogDocument {
+        &self.prior_catalog
+    }
+
+    pub(crate) fn matches_catalog(&self, catalog: &DisposableAttemptCatalogDocument) -> bool {
+        self.catalog_revision == catalog.revision()
+            && catalog_digest(catalog).is_ok_and(|digest| digest == self.catalog_digest)
+    }
+
+    fn validate(
+        &self,
+        state: &ScaleSetDeliveryRecoveryState,
+    ) -> Result<(), ScaleSetDeliveryRecoveryError> {
+        let expected_revision = match state.phase() {
+            ScaleSetDeliveryRecoveryPhase::LifecycleReconciled { .. } => 1,
+            ScaleSetDeliveryRecoveryPhase::LifecycleAcknowledgementStarted { .. } => 2,
+            ScaleSetDeliveryRecoveryPhase::LifecycleAcknowledged { .. } => 3,
+            _ => return Err(corrupt_state()),
+        };
+        if state.revision
+            != self
+                .base_revision
+                .checked_add(expected_revision)
+                .ok_or_else(corrupt_state)?
+            || self.base_revision != 3
+            || self.delivery.message_id() <= state.delivery.message_id()
+            || !self
+                .delivery
+                .available_request_ids()
+                .map_err(|_| corrupt_state())?
+                .is_empty()
+            || self.acquired.is_empty()
+            || !state.matches_catalog_digest(self.catalog_revision, &self.catalog_digest)
+            || self.prior_catalog.revision().get() > self.catalog_revision.get()
+        {
+            return Err(corrupt_state());
+        }
+        let predecessor = ScaleSetDeliveryRecoveryState {
+            schema_version: state.schema_version,
+            revision: self.base_revision,
+            prior_catalog_revision: state.prior_catalog_revision,
+            prior_catalog_digest: state.prior_catalog_digest.clone(),
+            catalog_revision: self.prior_catalog.revision(),
+            catalog_digest: catalog_digest(&self.prior_catalog)?,
+            delivery: state.delivery.clone(),
+            phase: ScaleSetDeliveryRecoveryPhase::AcquisitionRecoveryObserved {
+                acquired: Vec::new(),
+            },
+        };
+        predecessor.validate()?;
+        if !predecessor.matches_catalog(&self.prior_catalog) {
+            return Err(corrupt_state());
+        }
+        if state.validated_acquired(&self.acquired)? != self.acquired {
+            return Err(corrupt_state());
+        }
+        let original_events = state
+            .delivery
+            .retained_events()
+            .map_err(|_| corrupt_state())?;
+        let lifecycle_events = self
+            .delivery
+            .retained_events()
+            .map_err(|_| corrupt_state())?;
+        let mut reconstructed = self.prior_catalog.clone();
+        let mut reconstructed_acquired = BTreeSet::new();
+        for event in &lifecycle_events {
+            let lifecycle_job = match event {
+                crate::github_scale_set_delivery::ScaleSetDeliveryLifecycleEvent::Assigned {
+                    job,
+                }
+                | crate::github_scale_set_delivery::ScaleSetDeliveryLifecycleEvent::Started {
+                    job,
+                    ..
+                }
+                | crate::github_scale_set_delivery::ScaleSetDeliveryLifecycleEvent::Completed {
+                    job,
+                    ..
+                } => job,
+                crate::github_scale_set_delivery::ScaleSetDeliveryLifecycleEvent::Available {
+                    ..
+                } => return Err(corrupt_state()),
+            };
+            let original_job = original_events.iter().find_map(|original| match original {
+                crate::github_scale_set_delivery::ScaleSetDeliveryLifecycleEvent::Available {
+                    job,
+                } if job.runner_request_id == lifecycle_job.runner_request_id => Some(job),
+                _ => None,
+            });
+            let Some(original_job) = original_job else {
+                return Err(corrupt_state());
+            };
+            if original_job != lifecycle_job {
+                return Err(corrupt_state());
+            }
+            let reservation = reconstructed
+                .find_active_by_runner_request_id(lifecycle_job.runner_request_id)
+                .ok_or_else(corrupt_state)?;
+            if reservation.attempt().phase()
+                != crate::disposable_worker_reconciler::DisposableAttemptPhase::Reserved
+            {
+                return Err(corrupt_state());
+            }
+            reconstructed_acquired.insert(lifecycle_job.runner_request_id);
+            match event {
+                crate::github_scale_set_delivery::ScaleSetDeliveryLifecycleEvent::Assigned {
+                    ..
+                } => {}
+                crate::github_scale_set_delivery::ScaleSetDeliveryLifecycleEvent::Completed {
+                    runner: None,
+                    result,
+                    ..
+                } if result.as_str() == "canceled" => {
+                    let attempt_id = reservation.attempt().attempt_id().clone();
+                    let releasing = reconstructed
+                        .replace_attempt(
+                            &attempt_id,
+                            reservation.attempt().revision(),
+                            DisposableAttemptCatalogAction::BeginUnprovisionedRelease,
+                        )
+                        .map_err(|_| corrupt_state())?;
+                    let releasing_attempt = releasing
+                        .find_active_by_runner_request_id(lifecycle_job.runner_request_id)
+                        .ok_or_else(corrupt_state)?;
+                    let complete = releasing
+                        .replace_attempt(
+                            &attempt_id,
+                            releasing_attempt.attempt().revision(),
+                            DisposableAttemptCatalogAction::CompleteUnprovisioned,
+                        )
+                        .map_err(|_| corrupt_state())?;
+                    let complete_attempt = complete
+                        .find_active_by_runner_request_id(lifecycle_job.runner_request_id)
+                        .ok_or_else(corrupt_state)?;
+                    reconstructed = complete
+                        .retire_complete(&attempt_id, complete_attempt.attempt().revision())
+                        .map_err(|_| corrupt_state())?;
+                }
+                _ => return Err(corrupt_state()),
+            }
+        }
+        if reconstructed_acquired.into_iter().collect::<Vec<_>>() != self.acquired
+            || !state.matches_catalog(&reconstructed)
+        {
+            return Err(corrupt_state());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -369,6 +756,15 @@ pub(crate) enum ScaleSetDeliveryRecoveryPhase {
     },
     AcquisitionRecoveryObserved {
         acquired: Vec<ScaleSetRunnerRequestId>,
+    },
+    LifecycleReconciled {
+        resolution: ScaleSetLifecycleResolution,
+    },
+    LifecycleAcknowledgementStarted {
+        resolution: ScaleSetLifecycleResolution,
+    },
+    LifecycleAcknowledged {
+        resolution: ScaleSetLifecycleResolution,
     },
     SettlementPrepared {
         proof: ScaleSetDeliverySettlementProof,
@@ -519,6 +915,15 @@ enum RecoveryPhaseWire {
     AcquisitionRecoveryObserved {
         acquired_request_ids: Vec<u64>,
     },
+    LifecycleReconciled {
+        resolution: LifecycleResolutionWire,
+    },
+    LifecycleAcknowledgementStarted {
+        resolution: LifecycleResolutionWire,
+    },
+    LifecycleAcknowledged {
+        resolution: LifecycleResolutionWire,
+    },
     SettlementPrepared {
         proof: SettlementProofWire,
         acquired_request_ids: Vec<u64>,
@@ -533,6 +938,55 @@ enum RecoveryPhaseWire {
 enum SettlementProofWire {
     Acknowledged,
     AcquisitionRecovery,
+    LifecycleEvidence { resolution: LifecycleResolutionWire },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LifecycleResolutionWire {
+    base_revision: u64,
+    delivery_json: String,
+    acquired_request_ids: Vec<u64>,
+    prior_catalog_json: String,
+    catalog_revision: u64,
+    catalog_digest: String,
+}
+
+impl LifecycleResolutionWire {
+    fn from_resolution(
+        resolution: &ScaleSetLifecycleResolution,
+    ) -> Result<Self, ScaleSetDeliveryRecoveryError> {
+        Ok(Self {
+            base_revision: resolution.base_revision,
+            delivery_json: String::from_utf8(
+                encode_scale_set_delivery(&resolution.delivery).map_err(|_| corrupt_state())?,
+            )
+            .map_err(|_| corrupt_state())?,
+            acquired_request_ids: resolution.acquired.iter().map(|id| id.get()).collect(),
+            prior_catalog_json: String::from_utf8(
+                encode_disposable_attempt_catalog(&resolution.prior_catalog)
+                    .map_err(|_| corrupt_state())?,
+            )
+            .map_err(|_| corrupt_state())?,
+            catalog_revision: resolution.catalog_revision.get(),
+            catalog_digest: resolution.catalog_digest.as_str().to_owned(),
+        })
+    }
+
+    fn into_resolution(self) -> Result<ScaleSetLifecycleResolution, ScaleSetDeliveryRecoveryError> {
+        Ok(ScaleSetLifecycleResolution {
+            base_revision: self.base_revision,
+            delivery: decode_scale_set_delivery(self.delivery_json.as_bytes())
+                .map_err(|_| corrupt_state())?,
+            acquired: parse_request_ids(self.acquired_request_ids)?,
+            prior_catalog: decode_disposable_attempt_catalog(self.prior_catalog_json.as_bytes())
+                .map_err(|_| corrupt_state())?,
+            catalog_revision: DisposableAttemptCatalogRevision::new(self.catalog_revision)
+                .map_err(|_| corrupt_state())?,
+            catalog_digest: Sha256Digest::parse(&self.catalog_digest)
+                .map_err(|_| corrupt_state())?,
+        })
+    }
 }
 
 impl RecoveryPhaseWire {
@@ -550,6 +1004,21 @@ impl RecoveryPhaseWire {
                     acquired_request_ids: acquired.iter().map(|id| id.get()).collect(),
                 }
             }
+            ScaleSetDeliveryRecoveryPhase::LifecycleReconciled { resolution } => {
+                Self::LifecycleReconciled {
+                    resolution: LifecycleResolutionWire::from_resolution(resolution)?,
+                }
+            }
+            ScaleSetDeliveryRecoveryPhase::LifecycleAcknowledgementStarted { resolution } => {
+                Self::LifecycleAcknowledgementStarted {
+                    resolution: LifecycleResolutionWire::from_resolution(resolution)?,
+                }
+            }
+            ScaleSetDeliveryRecoveryPhase::LifecycleAcknowledged { resolution } => {
+                Self::LifecycleAcknowledged {
+                    resolution: LifecycleResolutionWire::from_resolution(resolution)?,
+                }
+            }
             ScaleSetDeliveryRecoveryPhase::SettlementPrepared {
                 proof,
                 acquired,
@@ -563,6 +1032,11 @@ impl RecoveryPhaseWire {
                     }
                     ScaleSetDeliverySettlementProof::AcquisitionRecovery => {
                         SettlementProofWire::AcquisitionRecovery
+                    }
+                    ScaleSetDeliverySettlementProof::LifecycleEvidence { resolution } => {
+                        SettlementProofWire::LifecycleEvidence {
+                            resolution: LifecycleResolutionWire::from_resolution(resolution)?,
+                        }
                     }
                 },
                 acquired_request_ids: acquired.iter().map(|id| id.get()).collect(),
@@ -593,6 +1067,21 @@ impl RecoveryPhaseWire {
             } => Ok(ScaleSetDeliveryRecoveryPhase::AcquisitionRecoveryObserved {
                 acquired: parse_request_ids(acquired_request_ids)?,
             }),
+            Self::LifecycleReconciled { resolution } => {
+                Ok(ScaleSetDeliveryRecoveryPhase::LifecycleReconciled {
+                    resolution: resolution.into_resolution()?,
+                })
+            }
+            Self::LifecycleAcknowledgementStarted { resolution } => Ok(
+                ScaleSetDeliveryRecoveryPhase::LifecycleAcknowledgementStarted {
+                    resolution: resolution.into_resolution()?,
+                },
+            ),
+            Self::LifecycleAcknowledged { resolution } => {
+                Ok(ScaleSetDeliveryRecoveryPhase::LifecycleAcknowledged {
+                    resolution: resolution.into_resolution()?,
+                })
+            }
             Self::SettlementPrepared {
                 proof,
                 acquired_request_ids,
@@ -606,6 +1095,11 @@ impl RecoveryPhaseWire {
                     }
                     SettlementProofWire::AcquisitionRecovery => {
                         ScaleSetDeliverySettlementProof::AcquisitionRecovery
+                    }
+                    SettlementProofWire::LifecycleEvidence { resolution } => {
+                        ScaleSetDeliverySettlementProof::LifecycleEvidence {
+                            resolution: Box::new(resolution.into_resolution()?),
+                        }
                     }
                 },
                 acquired: parse_request_ids(acquired_request_ids)?,
@@ -684,6 +1178,13 @@ const fn invalid_document() -> ScaleSetDeliveryRecoveryError {
 
 #[cfg(test)]
 mod tests {
+    use crate::disposable_attempt_catalog::DisposableAttemptReservation;
+    use crate::disposable_attempt_state::DisposableAttemptState;
+    use crate::disposable_prepared_template::current_disposable_prepared_template;
+    use crate::disposable_worker_reconciler::{
+        CapacityClaimId, DisposableAttemptId, DisposableVmId, DisposableWorkerResources,
+    };
+    use crate::execution_admission::EpochMillis;
     use crate::github_scale_set_bridge::{
         ScaleSetBridgeEvent, ScaleSetBridgeJobEvidence, ScaleSetBridgePoll, ScaleSetStatistics,
     };
@@ -725,6 +1226,45 @@ mod tests {
 
     fn catalog() -> DisposableAttemptCatalogDocument {
         DisposableAttemptCatalogDocument::empty()
+    }
+
+    fn reserved_catalog(request_id: u64) -> DisposableAttemptCatalogDocument {
+        let reservation = DisposableAttemptReservation::new(
+            DisposableAttemptState::reserved(
+                DisposableAttemptId::parse("attempt-lifecycle").unwrap(),
+                CapacityClaimId::parse("claim-lifecycle").unwrap(),
+                DisposableVmId::parse("vm-lifecycle").unwrap(),
+                crate::github_scale_set_protocol::ScaleSetRunnerName::parse("smolrunner-lifecycle")
+                    .unwrap(),
+                ScaleSetRunnerRequestId::new(request_id).unwrap(),
+                EpochMillis::new(10_000).unwrap(),
+            ),
+            DisposableWorkerResources::new(1_000, 2_000, 3_000).unwrap(),
+            current_disposable_prepared_template()
+                .unwrap()
+                .identity()
+                .unwrap(),
+        )
+        .unwrap();
+        catalog().reserve(reservation).unwrap()
+    }
+
+    fn lifecycle_delivery(message_id: u32, request_id: u64) -> ScaleSetDelivery {
+        ScaleSetDelivery::from_bridge_poll(&ScaleSetBridgePoll::Message {
+            message_id,
+            statistics: ScaleSetStatistics {
+                available_jobs: 0,
+                acquired_jobs: 1,
+                assigned_jobs: 1,
+                running_jobs: 0,
+                registered_runners: 0,
+                busy_runners: 0,
+                idle_runners: 0,
+            },
+            events: vec![ScaleSetBridgeEvent::Assigned(job(request_id, "job-1"))],
+        })
+        .unwrap()
+        .unwrap()
     }
 
     #[test]
@@ -778,6 +1318,77 @@ mod tests {
             ScaleSetDeliveryRecoveryPhase::AcquisitionRecoveryObserved { acquired }
                 if acquired.iter().map(|id| id.get()).collect::<Vec<_>>() == vec![41, 42]
         ));
+    }
+
+    #[test]
+    fn lifecycle_resolution_is_revision_bound_canonical_and_acknowledgeable() {
+        let reserved = reserved_catalog(41);
+        let empty = ScaleSetDeliveryRecoveryState::reconciled(delivery(), &catalog(), &reserved)
+            .unwrap()
+            .begin_ack()
+            .unwrap()
+            .record_recovery_acquire(&[])
+            .unwrap();
+        let request = ScaleSetRunnerRequestId::new(41).unwrap();
+        let reconciled = empty
+            .prepare_lifecycle_resolution(
+                lifecycle_delivery(8, 41),
+                &[request],
+                &reserved,
+                &reserved,
+            )
+            .unwrap();
+        assert!(reconciled.is_lifecycle_resolution_of(&empty, &reserved));
+        let started = reconciled.begin_lifecycle_ack().unwrap();
+        let acknowledged = started.record_lifecycle_ack().unwrap();
+        assert_eq!(
+            acknowledged.lifecycle_resolution().unwrap().acquired(),
+            [request]
+        );
+        let prepared = acknowledged
+            .prepare_settlement(&reserved, &reserved)
+            .unwrap();
+        assert_eq!(prepared.settlement_acquired(), Some([request].as_slice()));
+        assert_eq!(
+            decode_scale_set_delivery_recovery(
+                &encode_scale_set_delivery_recovery(&prepared).unwrap()
+            )
+            .unwrap(),
+            prepared
+        );
+    }
+
+    #[test]
+    fn lifecycle_resolution_rejects_a_catalog_not_exactly_derived_from_its_evidence() {
+        let reserved = reserved_catalog(41);
+        let ambiguous =
+            ScaleSetDeliveryRecoveryState::reconciled(delivery(), &catalog(), &reserved)
+                .unwrap()
+                .begin_ack()
+                .unwrap()
+                .record_recovery_acquire(&[])
+                .unwrap();
+        let attempt = reserved.active()[0].attempt();
+        let unrelated = reserved
+            .replace_attempt(
+                attempt.attempt_id(),
+                attempt.revision(),
+                DisposableAttemptCatalogAction::AuthorizeClone,
+            )
+            .unwrap();
+
+        assert_eq!(
+            ambiguous
+                .prepare_lifecycle_resolution(
+                    lifecycle_delivery(8, 41),
+                    &[ScaleSetRunnerRequestId::new(41).unwrap()],
+                    &reserved,
+                    &unrelated,
+                )
+                .unwrap_err()
+                .kind(),
+            ScaleSetDeliveryRecoveryErrorKind::CorruptState
+        );
     }
 
     #[test]
@@ -851,7 +1462,7 @@ mod tests {
 
         let prior = String::from_utf8(encoded.clone())
             .unwrap()
-            .replacen("\"schema_version\":3", "\"schema_version\":2", 1)
+            .replacen("\"schema_version\":4", "\"schema_version\":3", 1)
             .into_bytes();
         assert_eq!(
             decode_scale_set_delivery_recovery(&prior)
@@ -862,7 +1473,7 @@ mod tests {
 
         let future = String::from_utf8(encoded.clone())
             .unwrap()
-            .replacen("\"schema_version\":3", "\"schema_version\":4", 1)
+            .replacen("\"schema_version\":4", "\"schema_version\":5", 1)
             .into_bytes();
         assert_eq!(
             decode_scale_set_delivery_recovery(&future)
@@ -878,6 +1489,19 @@ mod tests {
                 .unwrap_err()
                 .kind(),
             ScaleSetDeliveryRecoveryErrorKind::NonCanonical
+        );
+
+        let impossible_empty = state.record_recovery_acquire(&[]).unwrap();
+        let impossible_empty =
+            String::from_utf8(encode_scale_set_delivery_recovery(&impossible_empty).unwrap())
+                .unwrap()
+                .replacen("\"revision\":3", "\"revision\":4", 1)
+                .into_bytes();
+        assert_eq!(
+            decode_scale_set_delivery_recovery(&impossible_empty)
+                .unwrap_err()
+                .kind(),
+            ScaleSetDeliveryRecoveryErrorKind::CorruptState
         );
     }
 }
