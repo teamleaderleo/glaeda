@@ -36,6 +36,9 @@ use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 #[cfg(target_os = "macos")]
 use smolrunner::artifact::Sha256Digest;
+use smolrunner::disposable_launchd_service::DisposableLaunchdServiceDesiredState;
+#[cfg(target_os = "macos")]
+use smolrunner::disposable_launchd_service::plan_disposable_launchd_service;
 #[cfg(target_os = "macos")]
 use smolrunner::disposable_worker_enrollment::{
     MAX_DISPOSABLE_WORKER_ENROLLMENT_BYTES, decode_disposable_worker_enrollment,
@@ -121,6 +124,11 @@ enum Command {
         #[command(subcommand)]
         command: HostCommand,
     },
+    /// Plan macOS service installation or removal without mutating the host.
+    Service {
+        #[command(subcommand)]
+        command: ServiceCommand,
+    },
     /// Inspect one exact durable personal-worker snapshot.
     Worker {
         #[command(subcommand)]
@@ -136,6 +144,46 @@ enum Command {
         #[command(subcommand)]
         command: JobCommand,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum ServiceCommand {
+    /// Build an exact LaunchAgent install or removal plan without applying it.
+    Plan {
+        /// Desired LaunchAgent state.
+        #[arg(long, value_enum)]
+        desired: ServiceDesiredState,
+        /// Explicit absolute normalized operator home directory.
+        #[arg(long)]
+        operator_home: PathBuf,
+        /// Exact absolute normalized SmolRunner executable path.
+        #[arg(long)]
+        program: PathBuf,
+        /// Exact reviewed SmolRunner executable content digest.
+        #[arg(long)]
+        program_digest: String,
+        /// Exact absolute normalized canonical enrollment document.
+        #[arg(long)]
+        enrollment: PathBuf,
+        /// Exact canonical enrollment-document content digest.
+        #[arg(long)]
+        enrollment_digest: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ServiceDesiredState {
+    Installed,
+    Removed,
+}
+
+impl From<ServiceDesiredState> for DisposableLaunchdServiceDesiredState {
+    fn from(value: ServiceDesiredState) -> Self {
+        match value {
+            ServiceDesiredState::Installed => Self::Installed,
+            ServiceDesiredState::Removed => Self::Removed,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -336,6 +384,24 @@ fn main() -> ExitCode {
                 confirm.as_deref(),
             ),
         },
+        Command::Service { command } => match command {
+            ServiceCommand::Plan {
+                desired,
+                operator_home,
+                program,
+                program_digest,
+                enrollment,
+                enrollment_digest,
+            } => run_disposable_launchd_service_plan(
+                cli.output,
+                desired.into(),
+                &operator_home,
+                &program,
+                &program_digest,
+                &enrollment,
+                &enrollment_digest,
+            ),
+        },
         Command::Worker { command } => match command {
             WorkerCommand::Status { store_root } => run_worker_status(cli.output, &store_root),
             WorkerCommand::Serve {
@@ -437,6 +503,102 @@ fn run_plan(output: OutputFormat, file: &Path) -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+#[cfg(target_os = "macos")]
+fn run_disposable_launchd_service_plan(
+    output: OutputFormat,
+    desired: DisposableLaunchdServiceDesiredState,
+    operator_home: &Path,
+    program: &Path,
+    program_digest: &str,
+    enrollment: &Path,
+    enrollment_digest: &str,
+) -> ExitCode {
+    let program_digest = match Sha256Digest::parse(program_digest) {
+        Ok(digest) => digest,
+        Err(_) => {
+            return emit_runtime_error(
+                output,
+                "disposable_launchd_service_plan",
+                "disposable-worker LaunchAgent plan inputs are invalid".to_owned(),
+            );
+        }
+    };
+    let enrollment_digest = match Sha256Digest::parse(enrollment_digest) {
+        Ok(digest) => digest,
+        Err(_) => {
+            return emit_runtime_error(
+                output,
+                "disposable_launchd_service_plan",
+                "disposable-worker LaunchAgent plan inputs are invalid".to_owned(),
+            );
+        }
+    };
+    let plan = match plan_disposable_launchd_service(
+        desired,
+        geteuid().as_raw(),
+        operator_home,
+        program,
+        &program_digest,
+        enrollment,
+        &enrollment_digest,
+    ) {
+        Ok(plan) => plan,
+        Err(_) => {
+            return emit_runtime_error(
+                output,
+                "disposable_launchd_service_plan",
+                "disposable-worker LaunchAgent plan inputs are invalid".to_owned(),
+            );
+        }
+    };
+    match output {
+        OutputFormat::Json => {
+            if print_json(plan.report()).is_err() {
+                return ExitCode::from(2);
+            }
+        }
+        OutputFormat::Human => {
+            println!(
+                "disposable worker service plan: {:?}",
+                plan.report().desired_state()
+            );
+            println!(
+                "domain={}, plan={}, approval=required",
+                plan.report().launchd_domain(),
+                plan.report().plan_identity().as_str(),
+            );
+            for action in plan.report().actions() {
+                println!(
+                    "{}. {:?}: {} (rollback={:?})",
+                    action.sequence(),
+                    action.kind(),
+                    action.summary(),
+                    action.rollback(),
+                );
+            }
+            println!("No changes were made.");
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+#[cfg(not(target_os = "macos"))]
+fn run_disposable_launchd_service_plan(
+    output: OutputFormat,
+    _desired: DisposableLaunchdServiceDesiredState,
+    _operator_home: &Path,
+    _program: &Path,
+    _program_digest: &str,
+    _enrollment: &Path,
+    _enrollment_digest: &str,
+) -> ExitCode {
+    emit_runtime_error(
+        output,
+        "disposable_launchd_service_plan_unsupported",
+        "disposable-worker LaunchAgent planning requires macOS".to_owned(),
+    )
 }
 
 fn run_worker_status(output: OutputFormat, store_root: &Path) -> ExitCode {
@@ -1229,7 +1391,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     use smolrunner::lane_command::LaneCommandKind;
 
-    use super::{Cli, Command, HostCommand, JobCommand, QueueCommand, WorkerCommand};
+    use super::{
+        Cli, Command, HostCommand, JobCommand, QueueCommand, ServiceCommand, ServiceDesiredState,
+        WorkerCommand,
+    };
     #[cfg(target_os = "linux")]
     use super::{HostPreparePhaseKind, classify_host_prepare_actions};
     #[cfg(target_os = "macos")]
@@ -1412,6 +1577,57 @@ mod tests {
         assert_eq!(
             enrollment,
             PathBuf::from("/private/etc/smolrunner/worker.json")
+        );
+        assert_eq!(
+            enrollment_digest,
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+    }
+
+    #[test]
+    fn launchd_service_plan_parses_exact_private_inputs() {
+        let cli = Cli::try_parse_from([
+            "smolrunner",
+            "service",
+            "plan",
+            "--desired",
+            "installed",
+            "--operator-home",
+            "/Users/operator",
+            "--program",
+            "/opt/smolrunner/bin/smolrunner",
+            "--program-digest",
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--enrollment",
+            "/Users/operator/.config/smolrunner/enrollment.json",
+            "--enrollment-digest",
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ])
+        .expect("parse disposable LaunchAgent plan");
+        let Command::Service {
+            command:
+                ServiceCommand::Plan {
+                    desired,
+                    operator_home,
+                    program,
+                    program_digest,
+                    enrollment,
+                    enrollment_digest,
+                },
+        } = cli.command
+        else {
+            panic!("expected disposable LaunchAgent plan");
+        };
+        assert!(matches!(desired, ServiceDesiredState::Installed));
+        assert_eq!(operator_home, PathBuf::from("/Users/operator"));
+        assert_eq!(program, PathBuf::from("/opt/smolrunner/bin/smolrunner"));
+        assert_eq!(
+            program_digest,
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(
+            enrollment,
+            PathBuf::from("/Users/operator/.config/smolrunner/enrollment.json")
         );
         assert_eq!(
             enrollment_digest,
