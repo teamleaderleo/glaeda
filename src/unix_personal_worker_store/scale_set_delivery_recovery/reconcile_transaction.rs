@@ -114,15 +114,24 @@ impl UnixPersonalWorkerStore {
         // future catalog revision that recovery can identify as an uncommitted paired transaction.
         let mut staged_delivery = self.stage_scale_set_delivery(&recovery)?;
         if catalog_changes {
+            // Make the delivery stage name durable before a catalog stage can exist. This prevents
+            // a power loss from exposing a catalog-only stage created by this transaction, which
+            // would otherwise be indistinguishable from ordinary catalog recovery.
+            synchronize_directory(
+                &self.directory,
+                "paired Scale Set reconciliation delivery stage",
+            )?;
+            // From this point onward the durable delivery marker carries recovery intent across
+            // every catalog-stage or catalog-publication error.
+            staged_delivery.disarm();
             let mut staged_catalog = self
                 .stage_catalog(catalog_successor)
                 .map_err(map_catalog_error)?;
-
-            // Preserve the durable delivery stage across every catalog-publication error. If the
-            // catalog rename never happened, recovery rolls this future stage back. If rename did
-            // happen and only the directory sync failed, recovery sees the target catalog revision
-            // current and completes the delivery publication.
-            staged_delivery.disarm();
+            // Persist both stage names before publishing either current document.
+            synchronize_directory(
+                &self.directory,
+                "paired Scale Set reconciliation stages",
+            )?;
             self.publish_named_staged(&mut staged_catalog, CATALOG_DOCUMENT, false)?;
         }
         self.publish_named_staged(&mut staged_delivery, DELIVERY_RECOVERY_DOCUMENT, true)?;
