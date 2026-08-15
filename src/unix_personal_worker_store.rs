@@ -27,6 +27,12 @@ mod disposable_clone_transaction;
 pub(crate) mod disposable_template_generation;
 /// Same-lock durable persistence for the personal-worker Lima lifecycle authority.
 pub mod lima_authority;
+#[cfg(test)]
+mod publication_fault;
+#[cfg(test)]
+mod publication_fault_tests;
+/// Same-lock durable persistence for Runner Scale Set delivery recovery state.
+pub(crate) mod scale_set_delivery_recovery;
 
 const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::DIRECTORY)
@@ -438,12 +444,20 @@ impl UnixPersonalWorkerStore {
             Some(0),
         )?;
         let mut file = File::from(staged.file.take().expect("staged file is present"));
+        #[cfg(test)]
+        publication_fault::maybe_fail_publication(
+            publication_fault::PublicationFaultPoint::StageWrite,
+        )?;
         file.write_all(encoded).map_err(|_| {
             store_error(
                 PersonalWorkerStoreErrorKind::Io,
                 "could not write the staged personal worker document",
             )
         })?;
+        #[cfg(test)]
+        publication_fault::maybe_fail_publication(
+            publication_fault::PublicationFaultPoint::StageFileSync,
+        )?;
         file.sync_all().map_err(|_| {
             store_error(
                 PersonalWorkerStoreErrorKind::Io,
@@ -479,6 +493,10 @@ impl UnixPersonalWorkerStore {
         } else {
             RenameFlags::empty()
         };
+        #[cfg(test)]
+        publication_fault::maybe_fail_publication(
+            publication_fault::PublicationFaultPoint::PublishRename,
+        )?;
         fs::renameat_with(
             &self.directory,
             staged.name,
@@ -488,6 +506,10 @@ impl UnixPersonalWorkerStore {
         )
         .map_err(|error| map_publish_error(error, no_replace))?;
         staged.disarm();
+        #[cfg(test)]
+        publication_fault::maybe_fail_publication(
+            publication_fault::PublicationFaultPoint::PublicationDirectorySync,
+        )?;
         synchronize_directory(&self.directory, "personal worker store directory")
     }
 
