@@ -372,7 +372,7 @@ pub(crate) struct ScaleSetBridgeError {
 }
 
 impl ScaleSetBridgeError {
-    const fn new(code: &'static str) -> Self {
+    pub(crate) const fn new(code: &'static str) -> Self {
         Self { code }
     }
 
@@ -820,6 +820,10 @@ impl ScaleSetBridgeClient {
             _ => Err(ScaleSetBridgeError::new("invalid_bridge_response")),
         })();
         self.finish_response(result)
+    }
+
+    pub(crate) fn poison(&mut self) {
+        self.transport.poison();
     }
 
     pub(crate) fn ack(&mut self, message_id: u32) -> Result<Vec<u64>, ScaleSetBridgeError> {

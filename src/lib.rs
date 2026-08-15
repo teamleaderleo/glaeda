@@ -47,6 +47,9 @@ pub(crate) mod github_scale_set_delivery;
 /// Pure exact reconciliation of one retained Scale Set delivery into disposable-attempt state.
 #[cfg(unix)]
 pub(crate) mod github_scale_set_delivery_consumer;
+/// Crash-safe poll, durable reconciliation, acknowledgement, and acquisition recovery.
+#[cfg(unix)]
+pub(crate) mod github_scale_set_delivery_controller;
 /// Pure crash/replay phases for one durably reconciled Scale Set delivery.
 #[cfg(unix)]
 pub(crate) mod github_scale_set_delivery_state;
