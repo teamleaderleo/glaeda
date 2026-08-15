@@ -210,6 +210,11 @@ disk reservation. The App private key remains in Keychain. Decoding delegates to
 bridge, current prepared-template, resource, consumer, clone, and runner constructors so the
 service entry point cannot invent a weaker parallel configuration path.
 
+The pure LaunchAgent planner binds the exact executable and enrollment digests, canonical private
+plist bytes, user launchd domain, ordered install/remove actions, and the enrollment digest passed
+to `worker serve`. It rejects collisions with its future plist, staging, and lock namespaces. It
+does not create files or invoke `launchctl`; durable apply and removal remain a separate slice.
+
 Acceptance: sleep/wake, controller kill, Mac reboot, network loss, GitHub outage, failed provisioning, stuck job, and failed teardown tests all converge automatically or stop behind a precise durable blocker.
 
 ### M6 — production acceptance and safe optimization
