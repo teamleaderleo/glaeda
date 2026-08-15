@@ -181,14 +181,15 @@ removed.
 
 The current-main service driver now recovers local delivery/catalog state, acquires one
 process-lifetime controller lease before credential access, and composes the coordinator with the
-bounded supervisor loop. The `worker serve` CLI, launchd installation, automatic quiescence of an
-unbound ambiguous clone process, network-gate composition, and the physical GitHub/Lima acceptance
-run remain open; this is not yet an installed unattended service.
+bounded supervisor loop. The `worker serve` CLI reads one protected enrollment and requires its
+exact approved SHA-256 before credential or process authority. Launchd installation, automatic
+quiescence of an unbound ambiguous clone process, network-gate composition, and the physical
+GitHub/Lima acceptance run remain open; this is not yet an installed unattended service.
 
 The next narrow supervisor layer fixes idle pacing, caps immediate progress bursts, discards a
 failed or recovery-required bridge session before reconnect, applies bounded retry delays, and
-opens a five-minute circuit after five consecutive failures. Its stop/wait and session-connection
-surfaces remain injected until the operator enrollment and launchd entry point are connected.
+opens a five-minute circuit after five consecutive failures. Launchd still needs to own process
+restart and termination around this bounded service loop.
 
 Acceptance: an enrolled test repository targets the SmolRunner scale-set label, queues a job, and receives its result without operator commands; the JIT runner cannot accept a second job and its credential is absent after VM destruction.
 
