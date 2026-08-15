@@ -23,7 +23,7 @@ use crate::unix_personal_worker_store::scale_set_delivery_recovery::ScaleSetExte
 ///
 /// The production implementation delegates protocol semantics to the pinned official-client
 /// bridge. The trait remains private so callers cannot substitute external mutation authority.
-trait DeliveryBridge {
+pub(crate) trait DeliveryBridge {
     fn resume_after(&mut self, last_acked_message_id: u32) -> Result<(), ScaleSetBridgeError>;
     fn poll(&mut self, available_capacity: u16) -> Result<ScaleSetBridgePoll, ScaleSetBridgeError>;
     fn ack(&mut self, message_id: u32) -> Result<Vec<u64>, ScaleSetBridgeError>;
@@ -88,6 +88,19 @@ fn consume_with_bridge<B: DeliveryBridge>(
     bridge: &mut B,
     observed_at: EpochMillis,
 ) -> Result<ScaleSetDeliveryControllerDisposition, ScaleSetDeliveryControllerError> {
+    consume_with_bridge_capacity(root_path, policy, bridge, observed_at, 1)
+}
+
+pub(crate) fn consume_with_bridge_capacity<B: DeliveryBridge>(
+    root_path: &Path,
+    policy: &ScaleSetDeliveryConsumerPolicy,
+    bridge: &mut B,
+    observed_at: EpochMillis,
+    available_capacity: u16,
+) -> Result<ScaleSetDeliveryControllerDisposition, ScaleSetDeliveryControllerError> {
+    if available_capacity > 1 {
+        return Err(controller_error("scale_set_capacity_invalid"));
+    }
     let mut recovery_store =
         UnixPersonalWorkerStore::open_or_create_scale_set_delivery_controller(root_path)
             .map_err(map_store_error)?;
@@ -106,7 +119,7 @@ fn consume_with_bridge<B: DeliveryBridge>(
     }
     drop(recovery_store);
 
-    let poll = bridge.poll(1).map_err(map_bridge_error)?;
+    let poll = bridge.poll(available_capacity).map_err(map_bridge_error)?;
     let delivery = match ScaleSetDelivery::from_bridge_poll(&poll) {
         Ok(Some(delivery)) => delivery,
         Ok(None) => return Ok(ScaleSetDeliveryControllerDisposition::Idle),
@@ -115,6 +128,16 @@ fn consume_with_bridge<B: DeliveryBridge>(
             return Err(controller_error("scale_set_delivery_invalid"));
         }
     };
+    reconcile_and_ack_delivery(root_path, policy, bridge, delivery, observed_at)
+}
+
+pub(crate) fn reconcile_and_ack_delivery<B: DeliveryBridge>(
+    root_path: &Path,
+    policy: &ScaleSetDeliveryConsumerPolicy,
+    bridge: &mut B,
+    delivery: ScaleSetDelivery,
+    observed_at: EpochMillis,
+) -> Result<ScaleSetDeliveryControllerDisposition, ScaleSetDeliveryControllerError> {
     let publication = (|| {
         let catalog_store = UnixPersonalWorkerStore::open_or_create_disposable_catalog(root_path)
             .map_err(|_| controller_error("scale_set_catalog_unavailable"))?;
@@ -159,7 +182,14 @@ fn resume_delivery<B: DeliveryBridge>(
 ) -> Result<ScaleSetDeliveryControllerDisposition, ScaleSetDeliveryControllerError> {
     match current.phase() {
         ScaleSetDeliveryRecoveryPhase::Reconciled => {
-            let poll = bridge.poll(1).map_err(map_bridge_error)?;
+            let recovery_capacity = u16::from(
+                !current
+                    .delivery()
+                    .available_request_ids()
+                    .map_err(|_| controller_error("scale_set_delivery_invalid"))?
+                    .is_empty(),
+            );
+            let poll = bridge.poll(recovery_capacity).map_err(map_bridge_error)?;
             let observed = match ScaleSetDelivery::from_bridge_poll(&poll) {
                 Ok(Some(delivery)) => delivery,
                 Ok(None) => {

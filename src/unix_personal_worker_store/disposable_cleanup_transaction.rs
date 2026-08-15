@@ -4,8 +4,6 @@
 //! VM and runner deletion are observation-first and idempotent: an ambiguous result leaves the
 //! cleanup phase unchanged, so the next tick observes exact ownership or absence before retrying.
 
-#![allow(dead_code)] // Wired into the production supervisor in the next composition slice.
-
 use super::*;
 
 use crate::disposable_attempt_catalog::{
@@ -59,6 +57,35 @@ impl UnixPersonalWorkerStore {
             .find_active(attempt_id)
             .ok_or_else(|| DisposableCloneRuntimeError::durable("cleanup_attempt_missing"))?;
         let phase = reservation.attempt().phase();
+        if phase == DisposableAttemptPhase::UnprovisionedReleasing {
+            return self.publish_cleanup_action(
+                &current,
+                attempt_id,
+                DisposableAttemptCatalogAction::CompleteUnprovisioned,
+            );
+        }
+        if phase == DisposableAttemptPhase::Complete {
+            let retired = current
+                .retire_complete(attempt_id, reservation.attempt().revision())
+                .map_err(|_| DisposableCloneRuntimeError::recovery("cleanup_retirement_refused"))?;
+            retired
+                .validate_successor_of(&current)
+                .map_err(|_| DisposableCloneRuntimeError::recovery("cleanup_retirement_invalid"))?;
+            let mut staged = self.stage_catalog(&retired).map_err(|_| {
+                DisposableCloneRuntimeError::durable("cleanup_retirement_stage_failed")
+            })?;
+            self.publish_named_staged(
+                &mut staged,
+                super::disposable_attempt_catalog::CATALOG_DOCUMENT,
+                false,
+            )
+            .map_err(|_| {
+                DisposableCloneRuntimeError::recovery("cleanup_retirement_publish_ambiguous")
+            })?;
+            return Ok(DisposableCleanupTransactionOutcome::AttemptRetired {
+                attempt_id: attempt_id.as_str().to_owned(),
+            });
+        }
         if phase == DisposableAttemptPhase::Terminal {
             return self.publish_cleanup_action(
                 &current,
