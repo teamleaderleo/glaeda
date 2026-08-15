@@ -295,7 +295,7 @@ mod tests {
     };
     use crate::github_scale_set_bridge::EncodedJitConfig;
     use crate::github_scale_set_protocol::{
-        ScaleSetRunnerId, ScaleSetRunnerName, ScaleSetRunnerReference,
+        ScaleSetRunnerId, ScaleSetRunnerName, ScaleSetRunnerReference, ScaleSetRunnerRequestId,
     };
 
     fn registration_reservation() -> DisposableAttemptReservation {
@@ -306,6 +306,7 @@ mod tests {
                 CapacityClaimId::parse("claim-jit").unwrap(),
                 DisposableVmId::parse("vm-jit").unwrap(),
                 ScaleSetRunnerName::parse("runner-jit").unwrap(),
+                ScaleSetRunnerRequestId::new(91).unwrap(),
                 EpochMillis::new(10_000).unwrap(),
             ),
             DisposableWorkerResources::new(2_000, 2 << 30, 20 << 30).unwrap(),
