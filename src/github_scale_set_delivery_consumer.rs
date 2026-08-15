@@ -589,6 +589,28 @@ mod tests {
         .unwrap()
     }
 
+    fn checkpoint_runner_start(
+        mut catalog: DisposableAttemptCatalogDocument,
+        attempt_id: &DisposableAttemptId,
+        runner: &ScaleSetRunnerReference,
+    ) -> DisposableAttemptCatalogDocument {
+        for action in [
+            DisposableAttemptCatalogAction::RecordJitGenerationStarted,
+            DisposableAttemptCatalogAction::RecordRegistration(runner.clone()),
+            DisposableAttemptCatalogAction::RecordRunnerStartStarted,
+        ] {
+            let revision = catalog
+                .find_active(attempt_id)
+                .unwrap()
+                .attempt()
+                .revision();
+            catalog = catalog
+                .replace_attempt(attempt_id, revision, action)
+                .unwrap();
+        }
+        catalog
+    }
+
     #[test]
     fn available_delivery_reserves_once_with_exact_request_and_deadline() {
         let delivery = delivery(vec![ScaleSetBridgeEvent::Available(job(41, "job-1"))]);
@@ -755,6 +777,7 @@ mod tests {
             ScaleSetRunnerId::new(501).unwrap(),
             catalog.active()[0].attempt().runner_name().clone(),
         );
+        catalog = checkpoint_runner_start(catalog, &attempt_id, &runner);
         let lifecycle = delivery(vec![
             ScaleSetBridgeEvent::Assigned(job(41, "job-1")),
             ScaleSetBridgeEvent::Started {
@@ -814,6 +837,7 @@ mod tests {
             ScaleSetRunnerId::new(501).unwrap(),
             catalog.active()[0].attempt().runner_name().clone(),
         );
+        catalog = checkpoint_runner_start(catalog, &attempt_id, &runner);
         let terminal_delivery = delivery(vec![ScaleSetBridgeEvent::Completed {
             job: job(41, "job-1"),
             runner: Some(runner.clone()),

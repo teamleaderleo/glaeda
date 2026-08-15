@@ -110,6 +110,12 @@ mod tests {
             assigned.runner_name().clone(),
         );
         let terminal = assigned
+            .record_jit_generation_started()
+            .expect("record JIT start")
+            .record_registration(&runner)
+            .expect("record registration")
+            .record_runner_start_started()
+            .expect("record runner start")
             .record_terminal(
                 Some(&runner),
                 job_id.clone(),
