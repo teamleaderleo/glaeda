@@ -455,6 +455,23 @@ struct LimaResources {
     disk_gib: String,
 }
 
+/// Validate that one resource reservation is exactly representable by the fixed Lima backend.
+///
+/// The enrollment boundary uses this before GitHub demand can persist the reservation. Keeping
+/// the check here prevents configuration admission and command planning from drifting apart.
+pub(crate) fn validate_disposable_lima_resources(
+    resources: DisposableWorkerResources,
+    prepared_template: &DisposablePreparedTemplateManifest,
+) -> Result<(), DisposableLimaWorkerError> {
+    lima_resources(
+        resources,
+        prepared_template.source_cpu_count(),
+        prepared_template.source_memory_bytes(),
+        prepared_template.source_disk_bytes(),
+    )
+    .map(|_| ())
+}
+
 fn lima_resources(
     resources: DisposableWorkerResources,
     source_cpu_count: u32,

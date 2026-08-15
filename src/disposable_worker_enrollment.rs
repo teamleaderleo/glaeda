@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::artifact::Sha256Digest;
 use crate::disposable_clone_runtime::DisposableCloneRuntime;
+use crate::disposable_lima_worker::validate_disposable_lima_resources;
 use crate::disposable_prepared_template::current_disposable_prepared_template;
 use crate::disposable_runner_runtime::DisposableRunnerRuntime;
 use crate::disposable_worker_reconciler::DisposableWorkerResources;
@@ -198,6 +199,8 @@ fn build_enrollment(
         wire.resources.disk_bytes,
     )
     .map_err(|_| invalid_configuration())?;
+    validate_disposable_lima_resources(resources, &prepared)
+        .map_err(|_| invalid_configuration())?;
     let consumer_policy = ScaleSetDeliveryConsumerPolicy::new(
         wire.scale_set.id,
         &wire.scale_set.repository,
@@ -423,6 +426,12 @@ mod tests {
             current.replace("/opt/homebrew/bin/limactl", "relative/limactl"),
             current.replace(DIGEST, "sha256:not-a-digest"),
             current.replace("\"cpu_millis\": 2000", "\"cpu_millis\": 1"),
+            current.replace("\"cpu_millis\": 2000", "\"cpu_millis\": 2001"),
+            current.replace(
+                "\"memory_bytes\": 2147483648",
+                "\"memory_bytes\": 2147483649",
+            ),
+            current.replace("\"disk_bytes\": 21474836480", "\"disk_bytes\": 21474836481"),
             current.replace(
                 "\"self-hosted\",\n      \"smolrunner\"",
                 "\"smolrunner\",\n      \"self-hosted\"",
