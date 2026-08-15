@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::disposable_attempt_catalog::{
-    DisposableAttemptCatalog, DisposableAttemptReservation, MemoryDisposableAttemptCatalogStore,
+    DisposableAttemptCatalog, DisposableAttemptCatalogErrorKind, DisposableAttemptCatalogStore,
+    DisposableAttemptReservation, MemoryDisposableAttemptCatalogStore,
 };
 use crate::disposable_attempt_state::DisposableAttemptState;
 use crate::disposable_prepared_template::{
@@ -85,6 +86,18 @@ fn successor(index: usize) -> DisposableAttemptCatalogDocument {
     catalog
         .reserve(empty.revision(), reservation(index))
         .expect("reserve successor")
+        .0
+}
+
+fn successor_after(first: usize, second: usize) -> DisposableAttemptCatalogDocument {
+    let mut catalog = DisposableAttemptCatalog::new(MemoryDisposableAttemptCatalogStore::default());
+    let (empty, _) = catalog.initialize().expect("initialize memory catalog");
+    let (one, _) = catalog
+        .reserve(empty.revision(), reservation(first))
+        .expect("reserve first successor");
+    catalog
+        .reserve(one.revision(), reservation(second))
+        .expect("reserve later successor")
         .0
 }
 
@@ -428,4 +441,100 @@ fn malformed_delivery_only_stage_is_preserved_as_corruption() {
             .join(STAGED_DELIVERY_RECOVERY_DOCUMENT)
             .exists()
     );
+}
+
+#[test]
+fn future_delivery_marker_blocks_a_competing_same_revision_catalog() {
+    let root = TempRoot::new("future-delivery-fence");
+    let empty = initialize_catalog(&root);
+    let intended = successor(1);
+    let competing = successor(2);
+    assert_eq!(intended.revision(), competing.revision());
+    let recovery = ScaleSetDeliveryRecoveryState::reconciled(delivery(15, 49), intended.revision())
+        .expect("future delivery state");
+
+    let mut ordinary = UnixPersonalWorkerStore::open_or_create_disposable_catalog(root.path())
+        .expect("open ordinary catalog writer");
+    let paired =
+        UnixPersonalWorkerStore::open_or_create_scale_set_reconcile_transaction(root.path())
+            .expect("open paired transaction");
+    let mut staged = paired
+        .stage_scale_set_delivery(&recovery)
+        .expect("stage future delivery");
+    staged.disarm();
+    drop(staged);
+    drop(paired);
+
+    let error = DisposableAttemptCatalogStore::replace_if_revision(
+        &mut ordinary,
+        empty.revision(),
+        &competing,
+    )
+    .expect_err("future delivery must fence an unrelated catalog successor");
+    assert_eq!(
+        error.kind(),
+        DisposableAttemptCatalogErrorKind::RecoveryRequired
+    );
+    assert!(
+        root.store_directory()
+            .join(STAGED_DELIVERY_RECOVERY_DOCUMENT)
+            .exists()
+    );
+    drop(ordinary);
+
+    let recovered =
+        UnixPersonalWorkerStore::open_or_create_scale_set_reconcile_transaction(root.path())
+            .expect("recover intended paired transaction");
+    assert_eq!(
+        recovered
+            .load_catalog_named(CATALOG_DOCUMENT)
+            .expect("load fenced catalog"),
+        Some(empty)
+    );
+    assert_eq!(
+        recovered
+            .load_scale_set_delivery_recovery()
+            .expect("load rolled-back delivery"),
+        None
+    );
+}
+
+#[test]
+fn live_delivery_blocks_a_later_catalog_successor() {
+    let root = TempRoot::new("live-delivery-fence");
+    let empty = initialize_catalog(&root);
+    let one = successor(1);
+    let two = successor_after(1, 2);
+    one.validate_successor_of(&empty)
+        .expect("first catalog successor");
+    two.validate_successor_of(&one)
+        .expect("later catalog successor");
+    let delivery = delivery(16, 50);
+
+    let mut store =
+        UnixPersonalWorkerStore::open_or_create_scale_set_reconcile_transaction(root.path())
+            .expect("open paired transaction");
+    store
+        .publish_scale_set_reconciled_delivery(empty.revision(), &one, &delivery)
+        .expect("publish live delivery");
+
+    let error =
+        DisposableAttemptCatalogStore::replace_if_revision(&mut store, one.revision(), &two)
+            .expect_err("live delivery must fence later catalog mutation");
+    assert_eq!(
+        error.kind(),
+        DisposableAttemptCatalogErrorKind::RecoveryRequired
+    );
+    assert_eq!(
+        store
+            .load_catalog_named(CATALOG_DOCUMENT)
+            .expect("load preserved catalog"),
+        Some(one.clone())
+    );
+    let current_delivery = store
+        .load_scale_set_delivery_named(DELIVERY_RECOVERY_DOCUMENT)
+        .expect("load preserved delivery")
+        .expect("live delivery exists");
+    assert_eq!(current_delivery.catalog_revision(), one.revision());
+    assert_eq!(current_delivery.delivery(), &delivery);
 }

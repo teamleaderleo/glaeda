@@ -149,6 +149,12 @@ impl UnixPersonalWorkerLimaAuthorityGuard {
             }
             return Err(error.into());
         }
+        if let Err(error) = super::scale_set_delivery_recovery::refuse_unsettled(&store) {
+            if error.kind() == PersonalWorkerStoreErrorKind::RevisionConflict {
+                return Err(authority_recovery_required());
+            }
+            return Err(error.into());
+        }
         if let Err(error) = super::disposable_template_generation::refuse_unsettled(&store) {
             if error.kind() == PersonalWorkerStoreErrorKind::RevisionConflict {
                 return Err(authority_recovery_required());

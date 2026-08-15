@@ -463,6 +463,7 @@ impl UnixPersonalWorkerStore {
 
     pub(super) fn refuse_other_unsettled_state(&self) -> Result<(), PersonalWorkerStoreError> {
         disposable_attempt_catalog::refuse_unsettled(self)?;
+        scale_set_delivery_recovery::refuse_unsettled(self)?;
         lima_authority::refuse_unsettled_lima_authority(self)?;
         match self.recovery_plan()? {
             StoreRecoveryPlan::Clean { .. } => Ok(()),
