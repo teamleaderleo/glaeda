@@ -586,7 +586,7 @@ mod tests {
         );
         assert_eq!(
             manifest.lima_template_digest().as_str(),
-            "sha256:7adc6bf690b4604c555b32c333d97fe8df0641b69976604f4826076244bc0e2c"
+            "sha256:39b371c566c150d8d2806f351dab08924f654609fcdb785f67762ab8852fb638"
         );
         assert_eq!(
             manifest.ready_marker_path(),
@@ -601,7 +601,7 @@ mod tests {
         );
         assert_eq!(
             manifest.identity().unwrap().as_str(),
-            "sha256:df14b5d9fea12a48bc827ed0d6229e46d204df0296063e090a6beff2d7d71ac6"
+            "sha256:bb99009dfaf80d20da24c3af05f85320737c6f1cad09fdd651e37f4900f9711a"
         );
     }
 
@@ -718,7 +718,7 @@ mod tests {
         changed_manifests.push(redecode(&changed));
 
         let mut changed = baseline.clone();
-        changed.wire.provisioning.recipe_revision = 4;
+        changed.wire.provisioning.recipe_revision = 5;
         changed_manifests.push(redecode(&changed));
 
         for changed_manifest in changed_manifests {

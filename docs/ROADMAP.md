@@ -180,9 +180,9 @@ Make GitHub the normal control path for agents and humans.
     response loss without replaying job acquisition.
     The supervised service loop remains open.
 - [ ] Validate every upstream response before it can advance durable state; malformed or internally inconsistent responses retain the prior attempt and fail closed.
-- [ ] Persist a unique runner name before JIT creation; bind the service-assigned runner ID only after exact scale-set identity is observed.
-- [ ] Transfer JIT configuration without argv, public logs, public journals, reusable guest storage, or a long-lived parent environment carrying the secret.
-- [ ] Prefer direct execution of the official `Runner.Listener`; add only a tiny bounded exec-only guest launcher if the existing control path cannot deliver the secret cleanly.
+- [x] Persist a unique runner name before JIT creation; bind the service-assigned runner ID only after exact scale-set identity is observed.
+- [x] Transfer JIT configuration without argv, public logs, public journals, reusable guest storage, or a long-lived parent environment carrying the secret.
+- [x] Use a tiny bounded exec-only guest launcher because the existing Lima control path cannot deliver the secret without exposing it in process arguments.
 - [ ] Bind the actual started job identity to the exact runner and VM rather than inferring assignment from demand.
 - [ ] Run the pinned official runner for exactly one job and collect only bounded external lifecycle diagnostics.
 - [ ] Observe terminal GitHub evidence, destroy the VM, remove stale runner registration, and release capacity automatically.
