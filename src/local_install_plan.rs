@@ -52,11 +52,11 @@ impl LocalInstallToolchainIdentity {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LocalInstallSourceIdentity {
-    pub commit: CommitId,
-    pub tree: GitTreeId,
-    pub cargo_lock_digest: Sha256Digest,
-    pub toolchain: LocalInstallToolchainIdentity,
-    pub digest: Sha256Digest,
+    commit: CommitId,
+    tree: GitTreeId,
+    cargo_lock_digest: Sha256Digest,
+    toolchain: LocalInstallToolchainIdentity,
+    digest: Sha256Digest,
 }
 
 impl LocalInstallSourceIdentity {
@@ -94,6 +94,31 @@ impl LocalInstallSourceIdentity {
             toolchain,
             digest,
         })
+    }
+
+    #[must_use]
+    pub const fn commit(&self) -> &CommitId {
+        &self.commit
+    }
+
+    #[must_use]
+    pub const fn tree(&self) -> &GitTreeId {
+        &self.tree
+    }
+
+    #[must_use]
+    pub const fn cargo_lock_digest(&self) -> &Sha256Digest {
+        &self.cargo_lock_digest
+    }
+
+    #[must_use]
+    pub const fn toolchain(&self) -> &LocalInstallToolchainIdentity {
+        &self.toolchain
+    }
+
+    #[must_use]
+    pub const fn digest(&self) -> &Sha256Digest {
+        &self.digest
     }
 }
 

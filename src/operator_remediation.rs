@@ -54,25 +54,27 @@ pub enum RemediationOwnership {
 /// Pure public proposal for one possible response to an operator-visible failure.
 ///
 /// The proposal contains no command vector, credential, executor handle, or mutation authority.
+/// Its fields remain externally immutable so construction-time validation stays true for the
+/// lifetime of the value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[non_exhaustive]
 pub struct OperatorRemediationCandidate {
-    pub schema_version: u8,
-    pub source_error: OperatorErrorCode,
-    pub action_id: String,
-    pub summary: String,
-    pub confidence: RemediationConfidence,
-    pub safety: RemediationSafety,
-    pub applicability: RemediationApplicability,
-    pub ownership: RemediationOwnership,
+    schema_version: u8,
+    source_error: OperatorErrorCode,
+    action_id: String,
+    summary: String,
+    confidence: RemediationConfidence,
+    safety: RemediationSafety,
+    applicability: RemediationApplicability,
+    ownership: RemediationOwnership,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub rollback: Option<RollbackClass>,
-    pub repair_budget_units: u16,
-    pub checkpoint_required: bool,
-    pub fresh_verification_required: bool,
-    pub circuit_breaker_required: bool,
-    pub required_evidence: Vec<String>,
-    pub authorizes_mutation: bool,
+    rollback: Option<RollbackClass>,
+    repair_budget_units: u16,
+    checkpoint_required: bool,
+    fresh_verification_required: bool,
+    circuit_breaker_required: bool,
+    required_evidence: Vec<String>,
+    authorizes_mutation: bool,
 }
 
 impl OperatorRemediationCandidate {
@@ -125,6 +127,81 @@ impl OperatorRemediationCandidate {
         };
         candidate.validate()?;
         Ok(candidate)
+    }
+
+    #[must_use]
+    pub const fn schema_version(&self) -> u8 {
+        self.schema_version
+    }
+
+    #[must_use]
+    pub const fn source_error(&self) -> &OperatorErrorCode {
+        &self.source_error
+    }
+
+    #[must_use]
+    pub fn action_id(&self) -> &str {
+        &self.action_id
+    }
+
+    #[must_use]
+    pub fn summary(&self) -> &str {
+        &self.summary
+    }
+
+    #[must_use]
+    pub const fn confidence(&self) -> RemediationConfidence {
+        self.confidence
+    }
+
+    #[must_use]
+    pub const fn safety(&self) -> RemediationSafety {
+        self.safety
+    }
+
+    #[must_use]
+    pub const fn applicability(&self) -> RemediationApplicability {
+        self.applicability
+    }
+
+    #[must_use]
+    pub const fn ownership(&self) -> RemediationOwnership {
+        self.ownership
+    }
+
+    #[must_use]
+    pub fn rollback(&self) -> Option<&RollbackClass> {
+        self.rollback.as_ref()
+    }
+
+    #[must_use]
+    pub const fn repair_budget_units(&self) -> u16 {
+        self.repair_budget_units
+    }
+
+    #[must_use]
+    pub const fn checkpoint_required(&self) -> bool {
+        self.checkpoint_required
+    }
+
+    #[must_use]
+    pub const fn fresh_verification_required(&self) -> bool {
+        self.fresh_verification_required
+    }
+
+    #[must_use]
+    pub const fn circuit_breaker_required(&self) -> bool {
+        self.circuit_breaker_required
+    }
+
+    #[must_use]
+    pub fn required_evidence(&self) -> &[String] {
+        &self.required_evidence
+    }
+
+    #[must_use]
+    pub const fn authorizes_mutation(&self) -> bool {
+        self.authorizes_mutation
     }
 
     fn validate(&self) -> Result<(), OperatorRemediationError> {
@@ -277,8 +354,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        OperatorRemediationCandidate, RemediationApplicability, RemediationConfidence,
-        RemediationOwnership, RemediationSafety,
+        OPERATOR_REMEDIATION_SCHEMA_VERSION, OperatorRemediationCandidate,
+        RemediationApplicability, RemediationConfidence, RemediationOwnership, RemediationSafety,
     };
     use crate::journal::RollbackClass;
     use crate::operator_error::OperatorErrorCode;
@@ -300,9 +377,29 @@ mod tests {
         )
         .expect("valid candidate");
 
-        assert_eq!(candidate.ownership, RemediationOwnership::ExactManaged);
-        assert_eq!(candidate.rollback, Some(RollbackClass::Reversible));
-        assert!(!candidate.authorizes_mutation);
+        assert_eq!(candidate.ownership(), RemediationOwnership::ExactManaged);
+        assert_eq!(candidate.rollback(), Some(&RollbackClass::Reversible));
+        assert!(!candidate.authorizes_mutation());
+        assert_eq!(
+            candidate.schema_version(),
+            OPERATOR_REMEDIATION_SCHEMA_VERSION
+        );
+        assert_eq!(candidate.source_error(), &OperatorErrorCode::CleanupFailed);
+        assert_eq!(candidate.action_id(), "remove-owned-expired-worker");
+        assert_eq!(candidate.confidence(), RemediationConfidence::Exact);
+        assert_eq!(candidate.safety(), RemediationSafety::Reversible);
+        assert_eq!(
+            candidate.applicability(),
+            RemediationApplicability::PolicyEligible
+        );
+        assert_eq!(candidate.repair_budget_units(), 1);
+        assert!(candidate.checkpoint_required());
+        assert!(candidate.fresh_verification_required());
+        assert!(candidate.circuit_breaker_required());
+        assert_eq!(
+            candidate.required_evidence(),
+            ["exact_ownership", "expired_lease", "no_active_job"]
+        );
         assert_eq!(
             serde_json::to_value(&candidate).expect("serialize candidate"),
             json!({
@@ -342,9 +439,9 @@ mod tests {
         )
         .expect("valid read-only candidate");
 
-        assert_eq!(candidate.ownership, RemediationOwnership::NotApplicable);
-        assert_eq!(candidate.rollback, None);
-        assert!(!candidate.authorizes_mutation);
+        assert_eq!(candidate.ownership(), RemediationOwnership::NotApplicable);
+        assert_eq!(candidate.rollback(), None);
+        assert!(!candidate.authorizes_mutation());
     }
 
     #[test]
