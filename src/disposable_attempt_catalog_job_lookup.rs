@@ -150,7 +150,7 @@ mod tests {
             .expect("prepared-template identity");
         let revision = 1 + active.revision().get() + tombstone.revision().get() + 1;
         let bytes = format!(
-            "{{\"schema_version\":6,\"revision\":{revision},\"active\":[{{\"attempt\":{active_json},\"resources\":{{\"cpu_millis\":2000,\"memory_bytes\":2147483648,\"disk_bytes\":21474836480}},\"prepared_template_digest\":\"{}\"}}],\"tombstones\":[{tombstone_json}]}}",
+            "{{\"schema_version\":7,\"revision\":{revision},\"active\":[{{\"attempt\":{active_json},\"resources\":{{\"cpu_millis\":2000,\"memory_bytes\":2147483648,\"disk_bytes\":21474836480}},\"prepared_template_digest\":\"{}\"}}],\"tombstones\":[{tombstone_json}]}}",
             template.as_str()
         )
         .into_bytes();

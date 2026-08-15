@@ -12,7 +12,7 @@ use crate::github_scale_set_protocol::{
     ScaleSetRunnerReference, ScaleSetRunnerRequestId,
 };
 
-pub const DISPOSABLE_ATTEMPT_STATE_SCHEMA_VERSION: u8 = 5;
+pub const DISPOSABLE_ATTEMPT_STATE_SCHEMA_VERSION: u8 = 6;
 pub const MAX_DISPOSABLE_ATTEMPT_STATE_BYTES: usize = 16_384;
 const MAX_DISPOSABLE_ATTEMPT_REVISION: u64 = 1_000_000_000_000;
 
@@ -71,6 +71,8 @@ pub struct DisposableAttemptState {
     runner_name: ScaleSetRunnerName,
     runner_request_id: ScaleSetRunnerRequestId,
     runner_id: Option<ScaleSetRunnerId>,
+    jit_generation_started: bool,
+    runner_start_started: bool,
     phase: DisposableAttemptPhase,
     github_job_id: Option<ScaleSetJobId>,
     result: Option<ScaleSetJobResult>,
@@ -98,6 +100,8 @@ impl DisposableAttemptState {
             runner_name,
             runner_request_id,
             runner_id: None,
+            jit_generation_started: false,
+            runner_start_started: false,
             phase: DisposableAttemptPhase::Reserved,
             github_job_id: None,
             result: None,
@@ -153,6 +157,18 @@ impl DisposableAttemptState {
         self.runner_id
     }
 
+    /// Return whether the one-time GitHub JIT request crossed its durable no-replay checkpoint.
+    #[must_use]
+    pub const fn jit_generation_started(&self) -> bool {
+        self.jit_generation_started
+    }
+
+    /// Return whether the exact returned JIT value crossed its durable guest-start checkpoint.
+    #[must_use]
+    pub const fn runner_start_started(&self) -> bool {
+        self.runner_start_started
+    }
+
     #[must_use]
     pub const fn phase(&self) -> DisposableAttemptPhase {
         self.phase
@@ -182,6 +198,8 @@ impl DisposableAttemptState {
             || matches(current.begin_unprovisioned_release())
             || matches(current.complete_unprovisioned())
             || matches(current.begin_registration())
+            || matches(current.record_jit_generation_started())
+            || matches(current.record_runner_start_started())
             || matches(current.begin_cleanup())
             || matches(current.advance_cleanup(self.phase))
         {
@@ -307,6 +325,27 @@ impl DisposableAttemptState {
         )
     }
 
+    /// Consume the authority to request one JIT configuration before the external mutation.
+    pub fn record_jit_generation_started(&self) -> Result<Self, DisposableAttemptStateError> {
+        if !matches!(
+            self.phase,
+            DisposableAttemptPhase::Registering | DisposableAttemptPhase::Assigned
+        ) || self.runner_id.is_some()
+        {
+            return Err(invalid_transition(
+                "JIT generation requires an unbound registering attempt",
+            ));
+        }
+        if self.jit_generation_started {
+            return Ok(self.clone());
+        }
+        let mut next = self.clone();
+        next.revision = self.revision.next()?;
+        next.jit_generation_started = true;
+        next.validate()?;
+        Ok(next)
+    }
+
     /// Record the exact GitHub registration returned or rediscovered after JIT creation.
     ///
     /// This deliberately stays in the current phase: an existing registration does not prove that
@@ -319,12 +358,22 @@ impl DisposableAttemptState {
         if !matches!(
             self.phase,
             DisposableAttemptPhase::Registering
+                | DisposableAttemptPhase::Assigned
                 | DisposableAttemptPhase::Destroying
                 | DisposableAttemptPhase::Deregistering
                 | DisposableAttemptPhase::Releasing
         ) {
             return Err(invalid_transition(
                 "runner registration can only be recorded while registering or cleaning up",
+            ));
+        }
+        if matches!(
+            self.phase,
+            DisposableAttemptPhase::Registering | DisposableAttemptPhase::Assigned
+        ) && !self.jit_generation_started
+        {
+            return Err(invalid_transition(
+                "runner registration requires the durable JIT checkpoint",
             ));
         }
         let runner_id = self.validate_runner(runner)?;
@@ -339,12 +388,39 @@ impl DisposableAttemptState {
         )
     }
 
+    /// Consume the exact returned JIT configuration before starting the guest listener.
+    pub fn record_runner_start_started(&self) -> Result<Self, DisposableAttemptStateError> {
+        if !matches!(
+            self.phase,
+            DisposableAttemptPhase::Registering | DisposableAttemptPhase::Assigned
+        ) || !self.jit_generation_started
+            || self.runner_id.is_none()
+        {
+            return Err(invalid_transition(
+                "runner start requires a checkpointed JIT request and exact registration",
+            ));
+        }
+        if self.runner_start_started {
+            return Ok(self.clone());
+        }
+        let mut next = self.clone();
+        next.revision = self.revision.next()?;
+        next.runner_start_started = true;
+        next.validate()?;
+        Ok(next)
+    }
+
     /// Record independent evidence that the exact registered runner listener is alive and ready.
     pub fn record_runner_ready(
         &self,
         runner: &ScaleSetRunnerReference,
     ) -> Result<Self, DisposableAttemptStateError> {
         let runner_id = self.validate_runner(runner)?;
+        if !self.runner_start_started {
+            return Err(invalid_transition(
+                "runner readiness requires the durable runner-start checkpoint",
+            ));
+        }
         match self.phase {
             DisposableAttemptPhase::Registering => {
                 self.advance_with(DisposableAttemptPhase::Waiting, Some(runner_id), None, None)
@@ -403,6 +479,11 @@ impl DisposableAttemptState {
         job_id: ScaleSetJobId,
     ) -> Result<Self, DisposableAttemptStateError> {
         let runner_id = self.validate_runner(runner)?;
+        if !self.runner_start_started {
+            return Err(invalid_transition(
+                "job start requires the durable runner-start checkpoint",
+            ));
+        }
         self.validate_job(&job_id)?;
         match self.phase {
             DisposableAttemptPhase::Registering
@@ -621,10 +702,10 @@ impl DisposableAttemptState {
             | DisposableAttemptPhase::Assigned
             | DisposableAttemptPhase::Running
             | DisposableAttemptPhase::Terminal => true,
-            DisposableAttemptPhase::Destroying => revision >= 4,
-            DisposableAttemptPhase::Deregistering => revision >= 5,
-            DisposableAttemptPhase::Releasing => revision >= 6,
-            DisposableAttemptPhase::Complete => revision >= 7,
+            DisposableAttemptPhase::Destroying => revision >= 5,
+            DisposableAttemptPhase::Deregistering => revision >= 6,
+            DisposableAttemptPhase::Releasing => revision >= 7,
+            DisposableAttemptPhase::Complete => revision >= 8,
             DisposableAttemptPhase::Reserved
             | DisposableAttemptPhase::UnprovisionedReleasing
             | DisposableAttemptPhase::Provisioning
@@ -649,6 +730,8 @@ impl DisposableAttemptState {
             runner_name: self.runner_name.clone(),
             runner_request_id: self.runner_request_id,
             runner_id,
+            jit_generation_started: self.jit_generation_started,
+            runner_start_started: self.runner_start_started,
             phase,
             github_job_id,
             result,
@@ -701,6 +784,29 @@ impl DisposableAttemptState {
                 "terminal result requires an exact Scale Set job identity",
             ));
         }
+        if self.runner_start_started
+            && (!self.jit_generation_started
+                || self.vm_identity.is_none()
+                || self.runner_id.is_none())
+        {
+            return Err(invalid_document(
+                "runner-start checkpoint requires JIT, VM, and runner identity evidence",
+            ));
+        }
+        if self.jit_generation_started && self.vm_identity.is_none() {
+            return Err(invalid_document(
+                "JIT checkpoint requires exact VM identity evidence",
+            ));
+        }
+        if self
+            .result
+            .as_ref()
+            .is_some_and(|result| !self.runner_start_started && result.as_str() != "canceled")
+        {
+            return Err(invalid_document(
+                "pre-start terminal evidence must be cancellation",
+            ));
+        }
         let revision = self.revision.get();
         let revision_shape_valid = match self.phase {
             DisposableAttemptPhase::Reserved => revision == 1,
@@ -708,15 +814,15 @@ impl DisposableAttemptState {
             DisposableAttemptPhase::CloneAuthorized => revision == 2,
             DisposableAttemptPhase::CloneStarted => matches!(revision, 3 | 4),
             DisposableAttemptPhase::Provisioning => false,
-            DisposableAttemptPhase::Registering => revision >= 5,
-            DisposableAttemptPhase::Waiting
-            | DisposableAttemptPhase::Assigned
-            | DisposableAttemptPhase::Running => revision >= 6,
-            DisposableAttemptPhase::Terminal => revision >= 5,
-            DisposableAttemptPhase::Destroying => revision >= 4,
-            DisposableAttemptPhase::Deregistering => revision >= 5,
-            DisposableAttemptPhase::Releasing => revision >= 6,
-            DisposableAttemptPhase::Complete => matches!(revision, 2..=4) || revision >= 7,
+            DisposableAttemptPhase::Registering => matches!(revision, 5..=8),
+            DisposableAttemptPhase::Waiting => revision == 9,
+            DisposableAttemptPhase::Assigned => matches!(revision, 6..=10),
+            DisposableAttemptPhase::Running => matches!(revision, 9..=11),
+            DisposableAttemptPhase::Terminal => matches!(revision, 5..=12),
+            DisposableAttemptPhase::Destroying => revision >= 5,
+            DisposableAttemptPhase::Deregistering => revision >= 6,
+            DisposableAttemptPhase::Releasing => revision >= 7,
+            DisposableAttemptPhase::Complete => matches!(revision, 2..=4) || revision >= 8,
         };
         if !revision_shape_valid {
             return Err(invalid_document(
@@ -729,6 +835,8 @@ impl DisposableAttemptState {
             | DisposableAttemptPhase::CloneAuthorized => {
                 if self.vm_identity.is_some()
                     || self.runner_id.is_some()
+                    || self.jit_generation_started
+                    || self.runner_start_started
                     || self.github_job_id.is_some()
                     || self.result.is_some()
                 {
@@ -740,6 +848,8 @@ impl DisposableAttemptState {
             DisposableAttemptPhase::CloneStarted => {
                 if (revision == 3) != self.vm_identity.is_none()
                     || self.runner_id.is_some()
+                    || self.jit_generation_started
+                    || self.runner_start_started
                     || self.github_job_id.is_some()
                     || self.result.is_some()
                 {
@@ -757,6 +867,19 @@ impl DisposableAttemptState {
                 if self.vm_identity.is_none()
                     || self.github_job_id.is_some()
                     || self.result.is_some()
+                    || (self.runner_id.is_some() && !self.jit_generation_started)
+                    || !matches!(
+                        (
+                            revision,
+                            self.jit_generation_started,
+                            self.runner_id.is_some(),
+                            self.runner_start_started,
+                        ),
+                        (5, false, false, false)
+                            | (6, true, false, false)
+                            | (7, true, true, false)
+                            | (8, true, true, true)
+                    )
                 {
                     return Err(invalid_document(
                         "registering attempt requires VM identity and no job terminal evidence",
@@ -766,6 +889,8 @@ impl DisposableAttemptState {
             DisposableAttemptPhase::Waiting => {
                 if self.vm_identity.is_none()
                     || self.runner_id.is_none()
+                    || !self.jit_generation_started
+                    || !self.runner_start_started
                     || self.github_job_id.is_some()
                     || self.result.is_some()
                 {
@@ -778,6 +903,19 @@ impl DisposableAttemptState {
                 if self.vm_identity.is_none()
                     || self.github_job_id.is_none()
                     || self.result.is_some()
+                    || (self.runner_id.is_some() && !self.jit_generation_started)
+                    || !matches!(
+                        (
+                            revision,
+                            self.jit_generation_started,
+                            self.runner_id.is_some(),
+                            self.runner_start_started,
+                        ),
+                        (6, false, false, false)
+                            | (7, true, false, false)
+                            | (8, true, true, false)
+                            | (9 | 10, true, true, true)
+                    )
                 {
                     return Err(invalid_document(
                         "assigned attempt requires exact VM and job identities without terminal result",
@@ -788,6 +926,8 @@ impl DisposableAttemptState {
                 if self.vm_identity.is_none()
                     || self.runner_id.is_none()
                     || self.github_job_id.is_none()
+                    || !self.jit_generation_started
+                    || !self.runner_start_started
                     || self.result.is_some()
                 {
                     return Err(invalid_document(
@@ -820,6 +960,8 @@ impl DisposableAttemptState {
             && revision <= 4
             && (self.vm_identity.is_some()
                 || self.runner_id.is_some()
+                || self.jit_generation_started
+                || self.runner_start_started
                 || self.github_job_id.is_some()
                 || self.result.is_some())
         {
@@ -852,6 +994,8 @@ struct AttemptWire<'a> {
     runner_request_id: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     runner_id: Option<u64>,
+    jit_generation_started: bool,
+    runner_start_started: bool,
     phase: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     github_job_id: Option<&'a str>,
@@ -877,6 +1021,8 @@ struct OwnedAttemptWire {
     runner_name: String,
     runner_request_id: u64,
     runner_id: Option<u64>,
+    jit_generation_started: bool,
+    runner_start_started: bool,
     phase: String,
     github_job_id: Option<String>,
     result: Option<String>,
@@ -902,6 +1048,8 @@ pub fn encode_disposable_attempt_state(
         runner_name: state.runner_name.as_str(),
         runner_request_id: state.runner_request_id.get(),
         runner_id: state.runner_id.map(ScaleSetRunnerId::get),
+        jit_generation_started: state.jit_generation_started,
+        runner_start_started: state.runner_start_started,
         phase: phase_name(state.phase),
         github_job_id: state.github_job_id.as_ref().map(ScaleSetJobId::as_str),
         result: state.result.as_ref().map(ScaleSetJobResult::as_str),
@@ -968,6 +1116,8 @@ pub fn decode_disposable_attempt_state(
             .map(ScaleSetRunnerId::new)
             .transpose()
             .map_err(|_| invalid_document("runner ID is invalid"))?,
+        jit_generation_started: wire.jit_generation_started,
+        runner_start_started: wire.runner_start_started,
         phase: parse_phase(&wire.phase)?,
         github_job_id: wire
             .github_job_id

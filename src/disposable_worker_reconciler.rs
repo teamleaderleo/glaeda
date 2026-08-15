@@ -418,7 +418,8 @@ pub enum DisposableWorkerAction {
     CheckpointAndCloneVm,
     /// Remove a stopped destination left by an interrupted clone after the durable absence marker.
     DiscardIncompleteVm,
-    GenerateJitAndStartRunner,
+    /// Under one durable lock, persist the JIT no-replay checkpoint before requesting one secret.
+    CheckpointAndGenerateJit,
     Wait,
     DestroyVm,
     DeleteRunner {
@@ -535,38 +536,71 @@ pub fn reconcile_attempt(
             DisposableVmObservation::Conflicting => unreachable!(),
         },
         Phase::Registering if cleanup => persist(DisposableAttemptCatalogAction::BeginCleanup),
-        Phase::Registering if matches!(input.vm, DisposableVmObservation::Unknown) => {
+        Phase::Assigned if !input.attempt.runner_start_started() && cleanup => {
+            persist(DisposableAttemptCatalogAction::BeginCleanup)
+        }
+        Phase::Registering | Phase::Assigned
+            if !input.attempt.runner_start_started()
+                && matches!(input.vm, DisposableVmObservation::Unknown) =>
+        {
             Action::Observe {
                 target: DisposableWorkerObservationTarget::Vm,
             }
         }
-        Phase::Registering
-            if matches!(
-                input.vm,
-                DisposableVmObservation::Absent | DisposableVmObservation::Stopped
-            ) =>
+        Phase::Registering | Phase::Assigned
+            if !input.attempt.runner_start_started()
+                && matches!(
+                    input.vm,
+                    DisposableVmObservation::Absent | DisposableVmObservation::Stopped
+                ) =>
         {
             persist(DisposableAttemptCatalogAction::BeginCleanup)
+        }
+        Phase::Registering | Phase::Assigned if !input.attempt.runner_start_started() => {
+            match &input.runner {
+                ScaleSetRunnerObservation::Unknown => Action::Observe {
+                    target: DisposableWorkerObservationTarget::Runner,
+                },
+                ScaleSetRunnerObservation::Absent if !input.attempt.jit_generation_started() => {
+                    Action::CheckpointAndGenerateJit
+                }
+                ScaleSetRunnerObservation::Absent if input.attempt.runner_id().is_none() => {
+                    Action::Blocked {
+                        code: "jit_generation_outcome_unknown",
+                    }
+                }
+                ScaleSetRunnerObservation::Absent => {
+                    persist(DisposableAttemptCatalogAction::BeginCleanup)
+                }
+                ScaleSetRunnerObservation::RegistrationOnly { runner }
+                | ScaleSetRunnerObservation::IdleReady { runner }
+                    if input.attempt.jit_generation_started()
+                        && input.attempt.runner_id().is_none() =>
+                {
+                    persist(validate_transition(
+                        input.attempt,
+                        DisposableAttemptCatalogAction::RecordRegistration(runner.clone()),
+                    )?)
+                }
+                ScaleSetRunnerObservation::RegistrationOnly { .. }
+                | ScaleSetRunnerObservation::IdleReady { .. }
+                    if input.attempt.jit_generation_started() =>
+                {
+                    persist(DisposableAttemptCatalogAction::BeginCleanup)
+                }
+                ScaleSetRunnerObservation::RegistrationOnly { .. }
+                | ScaleSetRunnerObservation::IdleReady { .. } => Action::Blocked {
+                    code: "runner_exists_before_jit_checkpoint",
+                },
+                ScaleSetRunnerObservation::Conflicting => unreachable!(),
+            }
         }
         Phase::Registering => match &input.runner {
             ScaleSetRunnerObservation::Unknown => Action::Observe {
                 target: DisposableWorkerObservationTarget::Runner,
             },
-            ScaleSetRunnerObservation::Absent if input.attempt.runner_id().is_none() => {
-                Action::GenerateJitAndStartRunner
-            }
-            ScaleSetRunnerObservation::Absent => {
-                persist(DisposableAttemptCatalogAction::BeginCleanup)
-            }
-            ScaleSetRunnerObservation::RegistrationOnly { runner }
-                if input.attempt.runner_id().is_none() =>
-            {
-                persist(validate_transition(
-                    input.attempt,
-                    DisposableAttemptCatalogAction::RecordRegistration(runner.clone()),
-                )?)
-            }
-            ScaleSetRunnerObservation::RegistrationOnly { .. } => {
+            ScaleSetRunnerObservation::Absent
+            | ScaleSetRunnerObservation::RegistrationOnly { .. } => {
                 persist(DisposableAttemptCatalogAction::BeginCleanup)
             }
             ScaleSetRunnerObservation::IdleReady { runner } => persist(validate_transition(
@@ -759,8 +793,14 @@ fn validate_transition(
         }
         DisposableAttemptCatalogAction::CompleteUnprovisioned => attempt.complete_unprovisioned(),
         DisposableAttemptCatalogAction::BeginRegistration => attempt.begin_registration(),
+        DisposableAttemptCatalogAction::RecordJitGenerationStarted => {
+            attempt.record_jit_generation_started()
+        }
         DisposableAttemptCatalogAction::RecordRegistration(runner) => {
             attempt.record_registration(runner)
+        }
+        DisposableAttemptCatalogAction::RecordRunnerStartStarted => {
+            attempt.record_runner_start_started()
         }
         DisposableAttemptCatalogAction::RecordRunnerReady(runner) => {
             attempt.record_runner_ready(runner)

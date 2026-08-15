@@ -226,9 +226,15 @@ fn populated_catalog() -> DisposableAttemptCatalogDocument {
         2,
         DisposableAttemptCatalogAction::BeginRegistration,
     );
-    let registered = transition(
+    let jit_started = transition(
         &mut catalog,
         &registering,
+        2,
+        DisposableAttemptCatalogAction::RecordJitGenerationStarted,
+    );
+    let registered = transition(
+        &mut catalog,
+        &jit_started,
         2,
         DisposableAttemptCatalogAction::RecordRegistration(runner(2, 22)),
     );
@@ -248,9 +254,34 @@ fn populated_catalog() -> DisposableAttemptCatalogDocument {
     let both_started = bind_vm_fixture(&both_started, 1);
     catalog = DisposableAttemptCatalog::new(FixtureStore::with_document(both_started.clone()));
 
-    let terminal = transition(
+    let registering = transition(
         &mut catalog,
         &both_started,
+        1,
+        DisposableAttemptCatalogAction::BeginRegistration,
+    );
+    let jit_started = transition(
+        &mut catalog,
+        &registering,
+        1,
+        DisposableAttemptCatalogAction::RecordJitGenerationStarted,
+    );
+    let registered = transition(
+        &mut catalog,
+        &jit_started,
+        1,
+        DisposableAttemptCatalogAction::RecordRegistration(runner(1, 11)),
+    );
+    let runner_started = transition(
+        &mut catalog,
+        &registered,
+        1,
+        DisposableAttemptCatalogAction::RecordRunnerStartStarted,
+    );
+
+    let terminal = transition(
+        &mut catalog,
+        &runner_started,
         1,
         DisposableAttemptCatalogAction::RecordTerminal {
             runner: Some(runner(1, 11)),
@@ -439,7 +470,7 @@ fn saturated_tombstone_history_retains_a_safe_revision_lower_bound() {
             DisposableAttemptCatalogAction::RecordTerminal {
                 runner: Some(runner(index, 1_000 + u64::try_from(index).unwrap())),
                 job_id: ScaleSetJobId::parse(&format!("completed-job-{index}")).unwrap(),
-                result: ScaleSetJobResult::parse("succeeded").unwrap(),
+                result: ScaleSetJobResult::parse("canceled").unwrap(),
             },
         );
         for phase in [
@@ -526,6 +557,14 @@ fn top_level_future_schema_and_unknown_fields_fail_closed() {
     );
 
     previous_catalog["schema_version"] = serde_json::json!(5);
+    assert_eq!(
+        decode_disposable_attempt_catalog(&serde_json::to_vec(&previous_catalog).unwrap())
+            .unwrap_err()
+            .kind(),
+        DisposableAttemptCatalogCodecErrorKind::VersionIncompatible
+    );
+
+    previous_catalog["schema_version"] = serde_json::json!(6);
     assert_eq!(
         decode_disposable_attempt_catalog(&serde_json::to_vec(&previous_catalog).unwrap())
             .unwrap_err()
