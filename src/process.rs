@@ -95,7 +95,7 @@ pub struct CommandSpec {
     pub arguments: Vec<CommandValue>,
     pub environment: BTreeMap<String, CommandValue>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    secret_stdin: Option<SecretString>,
+    secret_stdin: Option<Box<SecretString>>,
 }
 
 impl CommandSpec {
@@ -144,7 +144,7 @@ impl CommandSpec {
     /// hostile child from reflecting the secret into ordinary host capture allocations.
     #[must_use]
     pub(crate) fn zeroizing_secret_stdin_line(mut self, value: Zeroizing<String>) -> Self {
-        self.secret_stdin = Some(SecretString::from_zeroizing(value));
+        self.secret_stdin = Some(Box::new(SecretString::from_zeroizing(value)));
         self
     }
 
