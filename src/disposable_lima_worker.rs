@@ -155,7 +155,12 @@ impl DisposableLimaWorkerAdapter {
         action: &DisposableWorkerAction,
     ) -> Result<DisposableLimaWorkerCommandPlan, DisposableLimaWorkerError> {
         let attempt = reservation.attempt();
-        if reservation.prepared_template_identity() != &self.prepared_template_identity {
+        // Creation consumes the currently configured source template. Destruction does not: an
+        // already-owned worker must remain removable after a deliberate template upgrade. The
+        // delete plan binds the reservation's original template identity below instead.
+        if matches!(action, DisposableWorkerAction::CheckpointAndCloneVm)
+            && reservation.prepared_template_identity() != &self.prepared_template_identity
+        {
             return Err(error(
                 DisposableLimaWorkerErrorKind::InvalidAction,
                 "prepared_template_identity_drift",
@@ -226,7 +231,12 @@ impl DisposableLimaWorkerAdapter {
                 )
             }
             DisposableWorkerAction::DestroyVm
-                if attempt.phase() == DisposableAttemptPhase::Destroying =>
+                if matches!(
+                    attempt.phase(),
+                    DisposableAttemptPhase::Destroying
+                        | DisposableAttemptPhase::Deregistering
+                        | DisposableAttemptPhase::Releasing
+                ) =>
             {
                 (
                     DisposableLimaWorkerCommandKind::Destroy,
@@ -258,7 +268,7 @@ impl DisposableLimaWorkerAdapter {
             &command,
             timeout,
             &self.lima_home,
-            &self.prepared_template_identity,
+            reservation.prepared_template_identity(),
         )?;
         Ok(DisposableLimaWorkerCommandPlan {
             schema_version: DISPOSABLE_LIMA_WORKER_SCHEMA_VERSION,
@@ -266,7 +276,7 @@ impl DisposableLimaWorkerAdapter {
             attempt_id: attempt.attempt_id().as_str().to_owned(),
             attempt_revision: attempt.revision().get(),
             vm_id: attempt.vm_id().as_str().to_owned(),
-            prepared_template_identity: self.prepared_template_identity.clone(),
+            prepared_template_identity: reservation.prepared_template_identity().clone(),
             command_identity,
             timeout_seconds: timeout.as_secs(),
             observation_required: true,
@@ -631,7 +641,6 @@ mod tests {
         if phase == DisposableAttemptPhase::CloneStarted {
             return started.find_active(&attempt_id).unwrap().clone();
         }
-        assert_eq!(phase, DisposableAttemptPhase::Destroying);
         let started_attempt = started.find_active(&attempt_id).unwrap().attempt();
         let mut encoded =
             String::from_utf8(encode_disposable_attempt_state(started_attempt).unwrap()).unwrap();
@@ -647,7 +656,26 @@ mod tests {
         let bound = decode_disposable_attempt_state(encoded.as_bytes()).unwrap();
         let destroying_attempt = bound.begin_cleanup().unwrap();
         let destroying = replace_attempt_fixture(&started, started_attempt, &destroying_attempt, 2);
-        destroying.find_active(&attempt_id).unwrap().clone()
+        if phase == DisposableAttemptPhase::Destroying {
+            return destroying.find_active(&attempt_id).unwrap().clone();
+        }
+        let destroying_attempt = destroying.find_active(&attempt_id).unwrap().attempt();
+        let deregistering_attempt = destroying_attempt
+            .advance_cleanup(DisposableAttemptPhase::Deregistering)
+            .unwrap();
+        let deregistering =
+            replace_attempt_fixture(&destroying, destroying_attempt, &deregistering_attempt, 1);
+        if phase == DisposableAttemptPhase::Deregistering {
+            return deregistering.find_active(&attempt_id).unwrap().clone();
+        }
+        assert_eq!(phase, DisposableAttemptPhase::Releasing);
+        let deregistering_attempt = deregistering.find_active(&attempt_id).unwrap().attempt();
+        let releasing_attempt = deregistering_attempt
+            .advance_cleanup(DisposableAttemptPhase::Releasing)
+            .unwrap();
+        let releasing =
+            replace_attempt_fixture(&deregistering, deregistering_attempt, &releasing_attempt, 1);
+        releasing.find_active(&attempt_id).unwrap().clone()
     }
 
     fn replace_attempt_fixture(
@@ -798,6 +826,41 @@ mod tests {
                 "smol-worker-1",
             ]
         );
+
+        let old_template = other_template_identity();
+        let destroying_old_template = reservation_in_phase_with_identity(
+            DisposableAttemptPhase::Destroying,
+            old_template.clone(),
+        );
+        let destroy_old_template = adapter()
+            .plan(
+                EpochMillis::new(20_000).unwrap(),
+                &destroying_old_template,
+                &DisposableWorkerAction::DestroyVm,
+            )
+            .unwrap();
+        assert_eq!(
+            destroy_old_template.prepared_template_identity(),
+            &old_template
+        );
+
+        for cleanup_phase in [
+            DisposableAttemptPhase::Deregistering,
+            DisposableAttemptPhase::Releasing,
+        ] {
+            let late_worker = reservation_in_phase(cleanup_phase);
+            assert_eq!(
+                adapter()
+                    .plan(
+                        EpochMillis::new(20_000).unwrap(),
+                        &late_worker,
+                        &DisposableWorkerAction::DestroyVm,
+                    )
+                    .unwrap()
+                    .kind(),
+                DisposableLimaWorkerCommandKind::Destroy
+            );
+        }
     }
 
     #[test]
