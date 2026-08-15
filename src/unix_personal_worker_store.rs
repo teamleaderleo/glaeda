@@ -62,6 +62,7 @@ const MANAGED_DIRECTORY_MODE: Mode = Mode::RUSR
 const PRIVATE_FILE_MODE: Mode = Mode::RUSR.union(Mode::WUSR);
 pub(crate) const STORE_DIRECTORY: &str = "personal-worker";
 const STORE_LOCK_FILE: &str = "store.lock";
+const DISPOSABLE_WORKER_SERVICE_LOCK_FILE: &str = "disposable-worker-service.lock";
 const CURRENT_DOCUMENT: &str = "current.json";
 const STAGED_DOCUMENT: &str = ".next.json";
 static NEXT_INITIALIZATION_STAGE: AtomicU64 = AtomicU64::new(1);
@@ -341,6 +342,43 @@ impl UnixPersonalWorkerStore {
 
     fn acquire_mutation_lock(&self) -> Result<StoreMutationLock, PersonalWorkerStoreError> {
         acquire_mutation_lock_in(&self.directory, self.owner)
+    }
+
+    /// Acquire the process-lifetime lease for the single disposable-worker controller.
+    ///
+    /// Individual durable mutations continue to use `store.lock`; this separate inode prevents
+    /// two bridge sessions from racing across otherwise valid short store transactions. The guard
+    /// must remain owned until the bridge and supervisor have stopped.
+    #[allow(dead_code)] // Consumed by the next service-driver slice.
+    pub(crate) fn acquire_disposable_worker_service_lock(
+        &self,
+    ) -> Result<DisposableWorkerServiceLock, PersonalWorkerStoreError> {
+        let _mutation = self.acquire_mutation_lock()?;
+        ensure_named_lock_file(
+            &self.directory,
+            self.owner,
+            DISPOSABLE_WORKER_SERVICE_LOCK_FILE,
+            "disposable worker service lock",
+        )?;
+        let lock = fs::openat(
+            &self.directory,
+            DISPOSABLE_WORKER_SERVICE_LOCK_FILE,
+            EXISTING_LOCK_FLAGS,
+            Mode::empty(),
+        )
+        .map_err(map_lock_open_error)?;
+        inspect_private_file(&lock, self.owner, "disposable worker service lock", Some(0))?;
+        match fs::flock(&lock, FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => Ok(DisposableWorkerServiceLock { _lock: lock }),
+            Err(Errno::AGAIN) => Err(store_error(
+                PersonalWorkerStoreErrorKind::Busy,
+                "another disposable worker service owns the controller lease",
+            )),
+            Err(_) => Err(store_error(
+                PersonalWorkerStoreErrorKind::Io,
+                "could not acquire the disposable worker service lock",
+            )),
+        }
     }
 
     fn acquire_read_lock(&self) -> Result<StoreReadLock, PersonalWorkerStoreError> {
@@ -747,6 +785,11 @@ struct StoreReadLock {
     _lock: OwnedFd,
 }
 
+#[derive(Debug)]
+pub(crate) struct DisposableWorkerServiceLock {
+    _lock: OwnedFd,
+}
+
 impl Drop for StoreMutationLock {
     fn drop(&mut self) {
         // `CLOEXEC` closes this descriptor at exec, but a concurrent fork can briefly inherit the
@@ -759,6 +802,14 @@ impl Drop for StoreMutationLock {
 impl Drop for StoreReadLock {
     fn drop(&mut self) {
         // Keep read-only inspection from leaving the same transient inherited-lock window.
+        let _ = fs::flock(&self._lock, FlockOperation::Unlock);
+    }
+}
+
+impl Drop for DisposableWorkerServiceLock {
+    fn drop(&mut self) {
+        // A fork can briefly retain the same open-file description. Explicit unlock keeps that
+        // inherited duplicate from extending process-lifetime controller ownership.
         let _ = fs::flock(&self._lock, FlockOperation::Unlock);
     }
 }
@@ -862,12 +913,21 @@ fn ensure_lock_file(
     directory: &OwnedFd,
     owner: (u32, u32),
 ) -> Result<(), PersonalWorkerStoreError> {
-    match fs::openat(
+    ensure_named_lock_file(
         directory,
+        owner,
         STORE_LOCK_FILE,
-        NEW_LOCK_FLAGS,
-        PRIVATE_FILE_MODE,
-    ) {
+        "personal worker store lock",
+    )
+}
+
+fn ensure_named_lock_file(
+    directory: &OwnedFd,
+    owner: (u32, u32),
+    name: &str,
+    description: &'static str,
+) -> Result<(), PersonalWorkerStoreError> {
+    match fs::openat(directory, name, NEW_LOCK_FLAGS, PRIVATE_FILE_MODE) {
         Ok(lock) => {
             // The canonical lock inode becomes synchronization authority as soon as the directory
             // entry is visible. Never unlink it after that point: another process may already hold
@@ -878,7 +938,7 @@ fn ensure_lock_file(
                     "could not set personal worker store lock permissions",
                 )
             })?;
-            inspect_private_file(&lock, owner, "personal worker store lock", Some(0))?;
+            inspect_private_file(&lock, owner, description, Some(0))?;
             fs::fsync(&lock).map_err(|_| {
                 store_error(
                     PersonalWorkerStoreErrorKind::Io,
@@ -889,14 +949,9 @@ fn ensure_lock_file(
             Ok(())
         }
         Err(Errno::EXIST) => {
-            let lock = fs::openat(
-                directory,
-                STORE_LOCK_FILE,
-                EXISTING_LOCK_FLAGS,
-                Mode::empty(),
-            )
-            .map_err(map_lock_open_error)?;
-            inspect_private_file(&lock, owner, "personal worker store lock", Some(0))
+            let lock = fs::openat(directory, name, EXISTING_LOCK_FLAGS, Mode::empty())
+                .map_err(map_lock_open_error)?;
+            inspect_private_file(&lock, owner, description, Some(0))
         }
         Err(error) => Err(map_lock_open_error(error)),
     }
@@ -1249,6 +1304,7 @@ mod tests {
     use rustix::io::dup;
 
     use super::UnixPersonalWorkerStore;
+    use crate::personal_worker_store::PersonalWorkerStoreErrorKind;
 
     static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
 
@@ -1309,6 +1365,29 @@ mod tests {
             .expect("read guard drop must explicitly unlock inherited description");
 
         drop(mutation);
+        drop(inherited);
+    }
+
+    #[test]
+    fn service_lock_is_exclusive_and_drop_unlocks_an_inherited_description() {
+        let root = TempRoot::new("service");
+        let (store, _) = UnixPersonalWorkerStore::open_or_create(root.path()).expect("open store");
+        let guard = store
+            .acquire_disposable_worker_service_lock()
+            .expect("acquire service lock");
+        let inherited = dup(&guard._lock).expect("duplicate inherited service-lock descriptor");
+
+        let busy = store
+            .acquire_disposable_worker_service_lock()
+            .expect_err("a competing service must be refused");
+        assert_eq!(busy.kind(), PersonalWorkerStoreErrorKind::Busy);
+
+        drop(guard);
+        let reacquired = store
+            .acquire_disposable_worker_service_lock()
+            .expect("service guard drop must explicitly unlock inherited description");
+
+        drop(reacquired);
         drop(inherited);
     }
 }
