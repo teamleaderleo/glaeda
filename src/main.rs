@@ -33,6 +33,10 @@ use rustix::{
 };
 use serde::Serialize;
 #[cfg(target_os = "macos")]
+use sha2::{Digest as _, Sha256};
+#[cfg(target_os = "macos")]
+use smolrunner::artifact::Sha256Digest;
+#[cfg(target_os = "macos")]
 use smolrunner::disposable_worker_enrollment::{
     MAX_DISPOSABLE_WORKER_ENROLLMENT_BYTES, decode_disposable_worker_enrollment,
 };
@@ -172,6 +176,9 @@ enum WorkerCommand {
         /// Explicit absolute normalized canonical enrollment document.
         #[arg(long)]
         enrollment: PathBuf,
+        /// Exact approved canonical enrollment-document content digest.
+        #[arg(long)]
+        enrollment_digest: String,
     },
 }
 
@@ -331,7 +338,10 @@ fn main() -> ExitCode {
         },
         Command::Worker { command } => match command {
             WorkerCommand::Status { store_root } => run_worker_status(cli.output, &store_root),
-            WorkerCommand::Serve { enrollment } => run_worker_serve(cli.output, &enrollment),
+            WorkerCommand::Serve {
+                enrollment,
+                enrollment_digest,
+            } => run_worker_serve(cli.output, &enrollment, &enrollment_digest),
         },
         Command::Queue { command } => match command {
             QueueCommand::List {
@@ -456,7 +466,11 @@ fn explicit_normalized_absolute_path(path: &Path) -> bool {
 }
 
 #[cfg(target_os = "macos")]
-fn run_worker_serve(output: OutputFormat, enrollment_path: &Path) -> ExitCode {
+fn run_worker_serve(
+    output: OutputFormat,
+    enrollment_path: &Path,
+    enrollment_digest: &str,
+) -> ExitCode {
     if !explicit_normalized_absolute_path(enrollment_path) {
         return emit_runtime_error(
             output,
@@ -475,6 +489,13 @@ fn run_worker_serve(output: OutputFormat, enrollment_path: &Path) -> ExitCode {
             );
         }
     };
+    if !approved_enrollment_bytes(&bytes, enrollment_digest) {
+        return emit_runtime_error(
+            output,
+            "disposable_worker_service_enrollment_digest_mismatch",
+            "disposable worker enrollment does not match the approved service plan".to_owned(),
+        );
+    }
     let enrollment = match decode_disposable_worker_enrollment(&bytes) {
         Ok(enrollment) => enrollment,
         Err(error) => {
@@ -493,6 +514,16 @@ fn run_worker_serve(output: OutputFormat, enrollment_path: &Path) -> ExitCode {
             "disposable worker service stopped with a durable blocker".to_owned(),
         ),
     }
+}
+
+#[cfg(target_os = "macos")]
+fn approved_enrollment_bytes(bytes: &[u8], expected: &str) -> bool {
+    let Ok(expected) = Sha256Digest::parse(expected) else {
+        return false;
+    };
+    let observed = Sha256Digest::parse(&format!("sha256:{:x}", Sha256::digest(bytes)))
+        .expect("SHA-256 output is a canonical digest");
+    observed == expected
 }
 
 #[cfg(target_os = "macos")]
@@ -638,7 +669,11 @@ fn same_enrollment_directory(left: &rustix_fs::Stat, right: &rustix_fs::Stat) ->
 }
 
 #[cfg(not(target_os = "macos"))]
-fn run_worker_serve(output: OutputFormat, _enrollment_path: &Path) -> ExitCode {
+fn run_worker_serve(
+    output: OutputFormat,
+    _enrollment_path: &Path,
+    _enrollment_digest: &str,
+) -> ExitCode {
     emit_runtime_error(
         output,
         "disposable_worker_service_unsupported",
@@ -1184,6 +1219,8 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use clap::Parser;
+    #[cfg(target_os = "macos")]
+    use sha2::{Digest as _, Sha256};
 
     #[cfg(target_os = "linux")]
     use smolrunner::host_preparation_plan::ExecutableHostPreparationAction;
@@ -1192,11 +1229,11 @@ mod tests {
     #[cfg(target_os = "linux")]
     use smolrunner::lane_command::LaneCommandKind;
 
-    #[cfg(target_os = "macos")]
-    use super::read_private_disposable_worker_enrollment;
     use super::{Cli, Command, HostCommand, JobCommand, QueueCommand, WorkerCommand};
     #[cfg(target_os = "linux")]
     use super::{HostPreparePhaseKind, classify_host_prepare_actions};
+    #[cfg(target_os = "macos")]
+    use super::{approved_enrollment_bytes, read_private_disposable_worker_enrollment};
 
     #[cfg(target_os = "macos")]
     static NEXT_ENROLLMENT_ROOT: AtomicU64 = AtomicU64::new(1);
@@ -1351,17 +1388,23 @@ mod tests {
     }
 
     #[test]
-    fn worker_serve_requires_one_explicit_enrollment_path() {
+    fn worker_serve_requires_one_explicit_enrollment_identity() {
         let cli = Cli::try_parse_from([
             "smolrunner",
             "worker",
             "serve",
             "--enrollment",
             "/private/etc/smolrunner/worker.json",
+            "--enrollment-digest",
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         ])
         .expect("parse worker serve");
         let Command::Worker {
-            command: WorkerCommand::Serve { enrollment },
+            command:
+                WorkerCommand::Serve {
+                    enrollment,
+                    enrollment_digest,
+                },
         } = cli.command
         else {
             panic!("expected worker serve command");
@@ -1369,6 +1412,10 @@ mod tests {
         assert_eq!(
             enrollment,
             PathBuf::from("/private/etc/smolrunner/worker.json")
+        );
+        assert_eq!(
+            enrollment_digest,
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
         );
     }
 
@@ -1390,6 +1437,19 @@ mod tests {
             read_private_disposable_worker_enrollment(&enrollment).unwrap(),
             b"exact-enrollment\n"
         );
+        let approved_digest = format!("sha256:{:x}", Sha256::digest(b"exact-enrollment\n"));
+        assert!(approved_enrollment_bytes(
+            b"exact-enrollment\n",
+            &approved_digest
+        ));
+        assert!(!approved_enrollment_bytes(
+            b"changed-enrollment\n",
+            &approved_digest
+        ));
+        assert!(!approved_enrollment_bytes(
+            b"exact-enrollment\n",
+            "sha256:not-a-digest"
+        ));
 
         let alias = root.join("alias.json");
         symlink(&enrollment, &alias).unwrap();
