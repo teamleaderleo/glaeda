@@ -29,6 +29,8 @@ pub mod disposable_template_generation;
 /// Same-lock bounded Lima supervisor for the disposable source-template lifecycle.
 #[cfg(unix)]
 pub mod disposable_template_runtime;
+#[cfg(unix)]
+pub(crate) mod disposable_worker_coordinator;
 /// Pure capacity and lifecycle reconciliation for one-job disposable workers.
 pub mod disposable_worker_reconciler;
 pub mod doctor;

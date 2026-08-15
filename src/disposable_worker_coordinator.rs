@@ -1,0 +1,829 @@
+//! One-step production composition of disposable Scale Set delivery and worker lifecycle.
+//!
+//! The coordinator owns no new external semantics. It gives durable delivery recovery priority,
+//! keeps advertised capacity at zero while one attempt is active, and dispatches exactly one
+//! already-reviewed canonical-lock transaction per call. A live zero-capacity Scale Set poll is
+//! repeated inside every pre-clone checkpoint boundary; a message observed there is durably
+//! reconciled through the existing paired delivery transaction before any retry.
+
+#![allow(dead_code)] // The launchd service entry point is the next operator-facing slice.
+
+use std::cell::RefCell;
+use std::fmt;
+use std::path::{Path, PathBuf};
+
+use crate::disposable_attempt_catalog::{
+    DisposableAttemptCatalog, DisposableAttemptCatalogDocument, DisposableAttemptReservation,
+};
+use crate::disposable_clone_runtime::{
+    CloneRuntimeClock, DisposableCleanupRunnerSource, DisposableCleanupTransactionOutcome,
+    DisposableCloneAdmissionObservation, DisposableCloneAdmissionSource, DisposableCloneRuntime,
+    DisposableCloneRuntimeError, DisposableCloneTransactionOutcome, admission_seal,
+};
+use crate::disposable_runner_runtime::{
+    DisposableRunnerRegistrationSource, DisposableRunnerRuntime, DisposableRunnerRuntimeError,
+};
+use crate::disposable_template_runtime::DisposableTemplateRuntimeDisposition;
+use crate::disposable_worker_reconciler::DisposableAttemptPhase;
+use crate::execution_admission::EpochMillis;
+use crate::github_scale_set_bridge::{
+    ScaleSetBridgeClient, ScaleSetBridgeError, ScaleSetJitReceipt, ScaleSetRunnerLookup,
+};
+use crate::github_scale_set_delivery::ScaleSetDelivery;
+use crate::github_scale_set_delivery_consumer::ScaleSetDeliveryConsumerPolicy;
+use crate::github_scale_set_delivery_controller::{
+    DeliveryBridge, ScaleSetDeliveryControllerDisposition, consume_with_bridge_capacity,
+    consume_with_bridge_capacity_at_revision, reconcile_and_ack_delivery,
+};
+use crate::github_scale_set_protocol::{ScaleSetRunnerName, ScaleSetRunnerReference};
+use crate::process::TimedCommandExecutor;
+use crate::unix_personal_worker_store::UnixPersonalWorkerStore;
+use crate::unix_personal_worker_store::disposable_runner_transaction::DisposableRunnerTransactionOutcome;
+
+const LIVE_ADMISSION_MILLIS: u64 = 30_000;
+
+pub(crate) trait DisposableWorkerServiceBridge: DeliveryBridge {
+    fn observe_runner(
+        &mut self,
+        runner_name: &ScaleSetRunnerName,
+    ) -> Result<ScaleSetRunnerLookup, ScaleSetBridgeError>;
+
+    fn generate_jit(
+        &mut self,
+        runner_name: &ScaleSetRunnerName,
+    ) -> Result<ScaleSetJitReceipt, ScaleSetBridgeError>;
+
+    fn remove_runner(
+        &mut self,
+        runner: &ScaleSetRunnerReference,
+    ) -> Result<(), ScaleSetBridgeError>;
+}
+
+impl DisposableWorkerServiceBridge for ScaleSetBridgeClient {
+    fn observe_runner(
+        &mut self,
+        runner_name: &ScaleSetRunnerName,
+    ) -> Result<ScaleSetRunnerLookup, ScaleSetBridgeError> {
+        ScaleSetBridgeClient::observe_runner(self, runner_name)
+    }
+
+    fn generate_jit(
+        &mut self,
+        runner_name: &ScaleSetRunnerName,
+    ) -> Result<ScaleSetJitReceipt, ScaleSetBridgeError> {
+        ScaleSetBridgeClient::generate_jit(self, runner_name)
+    }
+
+    fn remove_runner(
+        &mut self,
+        runner: &ScaleSetRunnerReference,
+    ) -> Result<(), ScaleSetBridgeError> {
+        ScaleSetBridgeClient::remove_runner(self, runner)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DisposableWorkerCoordinatorDisposition {
+    Idle,
+    TemplateAdvanced(DisposableTemplateRuntimeDisposition),
+    DeliverySettled {
+        acquired: usize,
+    },
+    DeliveryRecoveryRequired,
+    PrecloneCheckpointed {
+        attempt_id: String,
+        phase: DisposableAttemptPhase,
+    },
+    CloneCompleted {
+        attempt_id: String,
+    },
+    RegistrationCheckpointed {
+        attempt_id: String,
+        phase: DisposableAttemptPhase,
+    },
+    RunnerRegistrationRecovered {
+        attempt_id: String,
+    },
+    RunnerCommandCompleted {
+        attempt_id: String,
+    },
+    CleanupCheckpointed {
+        attempt_id: String,
+        phase: DisposableAttemptPhase,
+    },
+    VmDestroyed {
+        attempt_id: String,
+    },
+    RunnerDeleted {
+        attempt_id: String,
+    },
+    CapacityReleased {
+        attempt_id: String,
+    },
+    AttemptRetired {
+        attempt_id: String,
+    },
+}
+
+pub(crate) struct DisposableWorkerCoordinator {
+    state_root: PathBuf,
+    policy: ScaleSetDeliveryConsumerPolicy,
+}
+
+impl DisposableWorkerCoordinator {
+    pub(crate) fn new(
+        state_root: impl Into<PathBuf>,
+        policy: ScaleSetDeliveryConsumerPolicy,
+    ) -> Self {
+        Self {
+            state_root: state_root.into(),
+            policy,
+        }
+    }
+
+    pub(crate) fn supervise_once(
+        &self,
+        bridge: &mut ScaleSetBridgeClient,
+        clone_runtime: &DisposableCloneRuntime,
+        runner_runtime: &DisposableRunnerRuntime,
+        executor: &impl TimedCommandExecutor,
+        clock: &impl CloneRuntimeClock,
+    ) -> Result<DisposableWorkerCoordinatorDisposition, DisposableWorkerCoordinatorError> {
+        self.supervise_with_bridge(bridge, clone_runtime, runner_runtime, executor, clock)
+    }
+
+    pub(crate) fn supervise_with_bridge<B: DisposableWorkerServiceBridge>(
+        &self,
+        bridge: &mut B,
+        clone_runtime: &DisposableCloneRuntime,
+        runner_runtime: &DisposableRunnerRuntime,
+        executor: &impl TimedCommandExecutor,
+        clock: &impl CloneRuntimeClock,
+    ) -> Result<DisposableWorkerCoordinatorDisposition, DisposableWorkerCoordinatorError> {
+        if has_delivery_recovery(&self.state_root)? {
+            let observed_at = clock
+                .epoch_millis()
+                .map_err(|_| coordinator_error("disposable_clock_unavailable"))?;
+            return consume_with_bridge_capacity(
+                &self.state_root,
+                &self.policy,
+                bridge,
+                observed_at,
+                0,
+            )
+            .map_err(|error| coordinator_error(error.code()))
+            .and_then(map_delivery_disposition);
+        }
+        let catalog = load_catalog(&self.state_root)?;
+        if catalog.active().len() > 1 {
+            return Err(coordinator_error("disposable_capacity_invariant_violated"));
+        }
+
+        if catalog.active().is_empty() {
+            let template = clone_runtime
+                .reconcile_template_once(executor, clock)
+                .map_err(map_clone_error)?;
+            if template != DisposableTemplateRuntimeDisposition::Satisfied {
+                return Ok(DisposableWorkerCoordinatorDisposition::TemplateAdvanced(
+                    template,
+                ));
+            }
+        }
+
+        let available_capacity = u16::from(catalog.active().is_empty());
+        let observed_at = clock
+            .epoch_millis()
+            .map_err(|_| coordinator_error("disposable_clock_unavailable"))?;
+        let delivery = if available_capacity == 1 {
+            consume_with_bridge_capacity_at_revision(
+                &self.state_root,
+                &self.policy,
+                bridge,
+                observed_at,
+                available_capacity,
+                catalog.revision(),
+            )
+        } else {
+            consume_with_bridge_capacity(
+                &self.state_root,
+                &self.policy,
+                bridge,
+                observed_at,
+                available_capacity,
+            )
+        };
+        match delivery.map_err(|error| coordinator_error(error.code()))? {
+            ScaleSetDeliveryControllerDisposition::Settled { acquired } => {
+                return Ok(DisposableWorkerCoordinatorDisposition::DeliverySettled { acquired });
+            }
+            ScaleSetDeliveryControllerDisposition::RecoveryRequired => {
+                return Ok(DisposableWorkerCoordinatorDisposition::DeliveryRecoveryRequired);
+            }
+            ScaleSetDeliveryControllerDisposition::Idle => {}
+        }
+
+        let catalog = load_catalog(&self.state_root)?;
+        let Some(reservation) = catalog.active().first() else {
+            return Ok(DisposableWorkerCoordinatorDisposition::Idle);
+        };
+        let attempt_id = reservation.attempt().attempt_id().clone();
+        match operation_for(reservation)? {
+            CoordinatorOperation::AuthorizeClone => {
+                self.with_live_admission(bridge, clock, |admission| {
+                    let mut store = open_catalog(&self.state_root)?;
+                    store
+                        .authorize_disposable_clone_transaction(
+                            clone_runtime,
+                            &attempt_id,
+                            admission,
+                            executor,
+                            clock,
+                        )
+                        .map_err(map_clone_error)
+                })
+            }
+            CoordinatorOperation::ExecuteClone => {
+                self.with_live_admission(bridge, clock, |admission| {
+                    let mut store = open_catalog(&self.state_root)?;
+                    store
+                        .execute_disposable_clone_transaction(
+                            clone_runtime,
+                            &attempt_id,
+                            admission,
+                            executor,
+                            clock,
+                        )
+                        .map_err(map_clone_error)
+                })
+            }
+            CoordinatorOperation::CheckpointRegistration => {
+                self.with_live_admission(bridge, clock, |admission| {
+                    let mut store = open_catalog(&self.state_root)?;
+                    store
+                        .checkpoint_disposable_registration_transaction(
+                            clone_runtime,
+                            &attempt_id,
+                            admission,
+                            executor,
+                            clock,
+                        )
+                        .map_err(map_clone_error)
+                })
+            }
+            CoordinatorOperation::RunRunner => {
+                let mut source = LiveRunnerSource { bridge };
+                let mut store = open_catalog(&self.state_root)?;
+                match store
+                    .execute_disposable_runner_transaction(
+                        runner_runtime,
+                        clone_runtime,
+                        &attempt_id,
+                        &mut source,
+                        executor,
+                        clock,
+                    )
+                    .map_err(map_runner_error)?
+                {
+                    DisposableRunnerTransactionOutcome::RegistrationRecovered { attempt_id } => Ok(
+                        DisposableWorkerCoordinatorDisposition::RunnerRegistrationRecovered {
+                            attempt_id,
+                        },
+                    ),
+                    DisposableRunnerTransactionOutcome::CommandCompleted(receipt) => Ok(
+                        DisposableWorkerCoordinatorDisposition::RunnerCommandCompleted {
+                            attempt_id: receipt.attempt_id().as_str().to_owned(),
+                        },
+                    ),
+                }
+            }
+            CoordinatorOperation::Cleanup => {
+                let mut source = LiveRunnerSource { bridge };
+                let mut store = open_catalog(&self.state_root)?;
+                map_cleanup_outcome(
+                    store
+                        .execute_disposable_cleanup_transaction(
+                            clone_runtime,
+                            &attempt_id,
+                            &mut source,
+                            executor,
+                            clock,
+                        )
+                        .map_err(map_clone_error)?,
+                )
+            }
+            CoordinatorOperation::Wait => Ok(DisposableWorkerCoordinatorDisposition::Idle),
+        }
+    }
+
+    fn with_live_admission<B, C, F>(
+        &self,
+        bridge: &mut B,
+        clock: &C,
+        transaction: F,
+    ) -> Result<DisposableWorkerCoordinatorDisposition, DisposableWorkerCoordinatorError>
+    where
+        B: DisposableWorkerServiceBridge,
+        C: CloneRuntimeClock,
+        F: FnOnce(
+            &LiveScaleSetAdmission<'_, B, C>,
+        )
+            -> Result<DisposableCloneTransactionOutcome, DisposableWorkerCoordinatorError>,
+    {
+        let admission = LiveScaleSetAdmission::new(bridge, clock);
+        let result = transaction(&admission);
+        let pending = admission.take_pending();
+        drop(admission);
+        if let Some((delivery, observed_at)) = pending {
+            return reconcile_and_ack_delivery(
+                &self.state_root,
+                &self.policy,
+                bridge,
+                delivery,
+                observed_at,
+            )
+            .map_err(|error| coordinator_error(error.code()))
+            .and_then(map_delivery_disposition);
+        }
+        map_clone_outcome(result?)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CoordinatorOperation {
+    AuthorizeClone,
+    ExecuteClone,
+    CheckpointRegistration,
+    RunRunner,
+    Cleanup,
+    Wait,
+}
+
+fn operation_for(
+    reservation: &DisposableAttemptReservation,
+) -> Result<CoordinatorOperation, DisposableWorkerCoordinatorError> {
+    let attempt = reservation.attempt();
+    match attempt.phase() {
+        DisposableAttemptPhase::Reserved => Ok(CoordinatorOperation::AuthorizeClone),
+        DisposableAttemptPhase::CloneAuthorized => Ok(CoordinatorOperation::ExecuteClone),
+        DisposableAttemptPhase::CloneStarted => Ok(CoordinatorOperation::CheckpointRegistration),
+        DisposableAttemptPhase::Registering | DisposableAttemptPhase::Assigned
+            if !attempt.runner_start_started() =>
+        {
+            Ok(CoordinatorOperation::RunRunner)
+        }
+        DisposableAttemptPhase::Terminal
+        | DisposableAttemptPhase::Destroying
+        | DisposableAttemptPhase::Deregistering
+        | DisposableAttemptPhase::Releasing
+        | DisposableAttemptPhase::UnprovisionedReleasing
+        | DisposableAttemptPhase::Complete => Ok(CoordinatorOperation::Cleanup),
+        DisposableAttemptPhase::Registering
+        | DisposableAttemptPhase::Waiting
+        | DisposableAttemptPhase::Assigned
+        | DisposableAttemptPhase::Running => Ok(CoordinatorOperation::Wait),
+        DisposableAttemptPhase::Provisioning => Err(coordinator_error(
+            "disposable_legacy_provisioning_recovery_required",
+        )),
+    }
+}
+
+struct LiveScaleSetAdmission<'a, B, C> {
+    bridge: RefCell<&'a mut B>,
+    clock: &'a C,
+    pending: RefCell<Option<(ScaleSetDelivery, EpochMillis)>>,
+}
+
+impl<'a, B, C> LiveScaleSetAdmission<'a, B, C> {
+    fn new(bridge: &'a mut B, clock: &'a C) -> Self {
+        Self {
+            bridge: RefCell::new(bridge),
+            clock,
+            pending: RefCell::new(None),
+        }
+    }
+
+    fn take_pending(&self) -> Option<(ScaleSetDelivery, EpochMillis)> {
+        self.pending.borrow_mut().take()
+    }
+}
+
+impl<B, C> admission_seal::Sealed for LiveScaleSetAdmission<'_, B, C> {}
+
+impl<B: DeliveryBridge, C: CloneRuntimeClock> DisposableCloneAdmissionSource
+    for LiveScaleSetAdmission<'_, B, C>
+{
+    fn observe(
+        &self,
+        catalog: &DisposableAttemptCatalogDocument,
+        reservation: &DisposableAttemptReservation,
+    ) -> Result<DisposableCloneAdmissionObservation, DisposableCloneRuntimeError> {
+        if self.pending.borrow().is_some() {
+            return Err(DisposableCloneRuntimeError::recovery(
+                "clone_scale_set_message_pending",
+            ));
+        }
+        let poll =
+            self.bridge.borrow_mut().poll(0).map_err(|_| {
+                DisposableCloneRuntimeError::observation("clone_scale_set_poll_failed")
+            })?;
+        let observed_at = self
+            .clock
+            .epoch_millis()
+            .map_err(|_| DisposableCloneRuntimeError::observation("clone_clock_unavailable"))?;
+        let delivery = match ScaleSetDelivery::from_bridge_poll(&poll) {
+            Ok(delivery) => delivery,
+            Err(_) => {
+                self.bridge.borrow_mut().poison();
+                return Err(DisposableCloneRuntimeError::recovery(
+                    "clone_scale_set_message_invalid",
+                ));
+            }
+        };
+        if let Some(delivery) = delivery {
+            self.pending.replace(Some((delivery, observed_at)));
+            return Err(DisposableCloneRuntimeError::recovery(
+                "clone_scale_set_message_pending",
+            ));
+        }
+        let expires_at = observed_at
+            .get()
+            .checked_add(LIVE_ADMISSION_MILLIS)
+            .and_then(|value| EpochMillis::new(value).ok())
+            .ok_or_else(|| DisposableCloneRuntimeError::observation("clone_clock_unavailable"))?;
+        let capacity_reserved = catalog
+            .find_active(reservation.attempt().attempt_id())
+            .is_some_and(|current| current == reservation)
+            && catalog.host_usage().is_ok_and(|usage| usage.workers() == 1);
+        Ok(DisposableCloneAdmissionObservation::new(
+            catalog,
+            reservation,
+            observed_at,
+            expires_at,
+            capacity_reserved,
+            false,
+        ))
+    }
+}
+
+struct LiveRunnerSource<'a, B> {
+    bridge: &'a mut B,
+}
+
+impl<B: DisposableWorkerServiceBridge> DisposableRunnerRegistrationSource
+    for LiveRunnerSource<'_, B>
+{
+    fn observe_runner(
+        &mut self,
+        runner_name: &ScaleSetRunnerName,
+    ) -> Result<ScaleSetRunnerLookup, DisposableRunnerRuntimeError> {
+        self.bridge
+            .observe_runner(runner_name)
+            .map_err(|_| DisposableRunnerRuntimeError::bridge("runner_observation_failed"))
+    }
+
+    fn generate_jit(
+        &mut self,
+        runner_name: &ScaleSetRunnerName,
+    ) -> Result<ScaleSetJitReceipt, DisposableRunnerRuntimeError> {
+        self.bridge
+            .generate_jit(runner_name)
+            .map_err(|_| DisposableRunnerRuntimeError::bridge("runner_jit_generation_failed"))
+    }
+}
+
+impl<B: DisposableWorkerServiceBridge> DisposableCleanupRunnerSource for LiveRunnerSource<'_, B> {
+    fn observe_runner(
+        &mut self,
+        runner_name: &ScaleSetRunnerName,
+    ) -> Result<ScaleSetRunnerLookup, DisposableCloneRuntimeError> {
+        self.bridge.observe_runner(runner_name).map_err(|_| {
+            DisposableCloneRuntimeError::observation("cleanup_runner_observation_failed")
+        })
+    }
+
+    fn remove_runner(
+        &mut self,
+        runner: &ScaleSetRunnerReference,
+    ) -> Result<(), DisposableCloneRuntimeError> {
+        self.bridge
+            .remove_runner(runner)
+            .map_err(|_| DisposableCloneRuntimeError::recovery("cleanup_runner_delete_failed"))
+    }
+}
+
+fn load_catalog(
+    root: &Path,
+) -> Result<DisposableAttemptCatalogDocument, DisposableWorkerCoordinatorError> {
+    let store = open_catalog(root)?;
+    DisposableAttemptCatalog::new(store)
+        .load()
+        .map_err(|_| coordinator_error("disposable_catalog_unavailable"))
+}
+
+fn has_delivery_recovery(root: &Path) -> Result<bool, DisposableWorkerCoordinatorError> {
+    let store = UnixPersonalWorkerStore::open_or_create_scale_set_delivery_controller(root)
+        .map_err(|_| coordinator_error("disposable_delivery_recovery_unavailable"))?;
+    store
+        .load_scale_set_delivery_recovery()
+        .map(|current| current.is_some())
+        .map_err(|_| coordinator_error("disposable_delivery_recovery_unavailable"))
+}
+
+fn open_catalog(root: &Path) -> Result<UnixPersonalWorkerStore, DisposableWorkerCoordinatorError> {
+    UnixPersonalWorkerStore::open_or_create_disposable_catalog(root)
+        .map_err(|_| coordinator_error("disposable_catalog_unavailable"))
+}
+
+fn map_clone_outcome(
+    outcome: DisposableCloneTransactionOutcome,
+) -> Result<DisposableWorkerCoordinatorDisposition, DisposableWorkerCoordinatorError> {
+    Ok(match outcome {
+        DisposableCloneTransactionOutcome::PrecloneCheckpointed { attempt_id, phase } => {
+            DisposableWorkerCoordinatorDisposition::PrecloneCheckpointed { attempt_id, phase }
+        }
+        DisposableCloneTransactionOutcome::RegistrationCheckpointed { attempt_id, phase } => {
+            DisposableWorkerCoordinatorDisposition::RegistrationCheckpointed { attempt_id, phase }
+        }
+        DisposableCloneTransactionOutcome::Completed(receipt) => {
+            DisposableWorkerCoordinatorDisposition::CloneCompleted {
+                attempt_id: receipt.attempt_id().to_owned(),
+            }
+        }
+    })
+}
+
+fn map_cleanup_outcome(
+    outcome: DisposableCleanupTransactionOutcome,
+) -> Result<DisposableWorkerCoordinatorDisposition, DisposableWorkerCoordinatorError> {
+    Ok(match outcome {
+        DisposableCleanupTransactionOutcome::CleanupCheckpointed { attempt_id, phase } => {
+            DisposableWorkerCoordinatorDisposition::CleanupCheckpointed { attempt_id, phase }
+        }
+        DisposableCleanupTransactionOutcome::VmDestroyed { attempt_id } => {
+            DisposableWorkerCoordinatorDisposition::VmDestroyed { attempt_id }
+        }
+        DisposableCleanupTransactionOutcome::RunnerDeleted { attempt_id } => {
+            DisposableWorkerCoordinatorDisposition::RunnerDeleted { attempt_id }
+        }
+        DisposableCleanupTransactionOutcome::CapacityReleased { attempt_id } => {
+            DisposableWorkerCoordinatorDisposition::CapacityReleased { attempt_id }
+        }
+        DisposableCleanupTransactionOutcome::AttemptRetired { attempt_id } => {
+            DisposableWorkerCoordinatorDisposition::AttemptRetired { attempt_id }
+        }
+    })
+}
+
+fn map_delivery_disposition(
+    disposition: ScaleSetDeliveryControllerDisposition,
+) -> Result<DisposableWorkerCoordinatorDisposition, DisposableWorkerCoordinatorError> {
+    Ok(match disposition {
+        ScaleSetDeliveryControllerDisposition::Idle => DisposableWorkerCoordinatorDisposition::Idle,
+        ScaleSetDeliveryControllerDisposition::Settled { acquired } => {
+            DisposableWorkerCoordinatorDisposition::DeliverySettled { acquired }
+        }
+        ScaleSetDeliveryControllerDisposition::RecoveryRequired => {
+            DisposableWorkerCoordinatorDisposition::DeliveryRecoveryRequired
+        }
+    })
+}
+
+fn map_clone_error(error: DisposableCloneRuntimeError) -> DisposableWorkerCoordinatorError {
+    coordinator_error(error.code())
+}
+
+fn map_runner_error(error: DisposableRunnerRuntimeError) -> DisposableWorkerCoordinatorError {
+    coordinator_error(error.code())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DisposableWorkerCoordinatorError {
+    code: &'static str,
+}
+
+impl DisposableWorkerCoordinatorError {
+    pub(crate) const fn code(self) -> &'static str {
+        self.code
+    }
+}
+
+impl fmt::Debug for DisposableWorkerCoordinatorError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DisposableWorkerCoordinatorError")
+            .field("code", &self.code)
+            .finish()
+    }
+}
+
+impl fmt::Display for DisposableWorkerCoordinatorError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.code)
+    }
+}
+
+impl std::error::Error for DisposableWorkerCoordinatorError {}
+
+const fn coordinator_error(code: &'static str) -> DisposableWorkerCoordinatorError {
+    DisposableWorkerCoordinatorError { code }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+    use std::io;
+
+    use super::*;
+    use crate::disposable_prepared_template::current_disposable_prepared_template;
+    use crate::disposable_worker_reconciler::{
+        CapacityClaimId, DisposableAttemptId, DisposableVmId, DisposableWorkerResources,
+    };
+    use crate::github_scale_set_bridge::{
+        ScaleSetBridgeEvent, ScaleSetBridgeJobEvidence, ScaleSetBridgePoll, ScaleSetStatistics,
+    };
+    use crate::github_scale_set_protocol::{ScaleSetJobId, ScaleSetRunnerRequestId};
+    use crate::lima_observation::LimaObservationClock;
+
+    const GIB: u64 = 1 << 30;
+
+    struct FixedClock;
+
+    impl LimaObservationClock for FixedClock {
+        fn unix_seconds(&self) -> io::Result<u64> {
+            Ok(1_900_000_000)
+        }
+    }
+
+    impl CloneRuntimeClock for FixedClock {
+        fn epoch_millis(&self) -> io::Result<EpochMillis> {
+            EpochMillis::new(1_900_000_000_000).map_err(io::Error::other)
+        }
+    }
+
+    struct FakeDeliveryBridge {
+        polls: VecDeque<ScaleSetBridgePoll>,
+        capacities: Vec<u16>,
+        poisoned: bool,
+    }
+
+    impl DeliveryBridge for FakeDeliveryBridge {
+        fn resume_after(&mut self, _: u32) -> Result<(), ScaleSetBridgeError> {
+            Ok(())
+        }
+
+        fn poll(
+            &mut self,
+            available_capacity: u16,
+        ) -> Result<ScaleSetBridgePoll, ScaleSetBridgeError> {
+            self.capacities.push(available_capacity);
+            self.polls
+                .pop_front()
+                .ok_or_else(|| ScaleSetBridgeError::new("missing_fake_poll"))
+        }
+
+        fn ack(&mut self, _: u32) -> Result<Vec<u64>, ScaleSetBridgeError> {
+            Ok(Vec::new())
+        }
+
+        fn acquire(
+            &mut self,
+            _: &[ScaleSetRunnerRequestId],
+        ) -> Result<Vec<ScaleSetRunnerRequestId>, ScaleSetBridgeError> {
+            Ok(Vec::new())
+        }
+
+        fn poison(&mut self) {
+            self.poisoned = true;
+        }
+    }
+
+    fn reservation() -> DisposableAttemptReservation {
+        DisposableAttemptReservation::new(
+            crate::disposable_attempt_state::DisposableAttemptState::reserved(
+                DisposableAttemptId::parse("attempt-1").unwrap(),
+                CapacityClaimId::parse("claim-1").unwrap(),
+                DisposableVmId::parse("smol-1").unwrap(),
+                ScaleSetRunnerName::parse("smol-1").unwrap(),
+                ScaleSetRunnerRequestId::new(41).unwrap(),
+                EpochMillis::new(1_900_000_600_000).unwrap(),
+            ),
+            DisposableWorkerResources::new(4_000, 8 * GIB, 80 * GIB).unwrap(),
+            current_disposable_prepared_template()
+                .unwrap()
+                .identity()
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn catalog() -> DisposableAttemptCatalogDocument {
+        DisposableAttemptCatalogDocument::empty()
+            .reserve(reservation())
+            .unwrap()
+    }
+
+    fn statistics() -> ScaleSetStatistics {
+        ScaleSetStatistics {
+            available_jobs: 0,
+            acquired_jobs: 1,
+            assigned_jobs: 0,
+            running_jobs: 0,
+            registered_runners: 0,
+            busy_runners: 0,
+            idle_runners: 0,
+        }
+    }
+
+    #[test]
+    fn live_idle_admission_is_exactly_zero_capacity_and_catalog_bound() {
+        let catalog = catalog();
+        let reservation = catalog.active().first().unwrap();
+        let mut bridge = FakeDeliveryBridge {
+            polls: VecDeque::from([ScaleSetBridgePoll::Idle {
+                statistics: statistics(),
+            }]),
+            capacities: Vec::new(),
+            poisoned: false,
+        };
+        let admission = LiveScaleSetAdmission::new(&mut bridge, &FixedClock);
+        let observation = admission.observe(&catalog, reservation).unwrap();
+        observation
+            .validate_for(
+                &catalog,
+                reservation,
+                EpochMillis::new(1_900_000_000_000).unwrap(),
+            )
+            .unwrap();
+        assert!(admission.take_pending().is_none());
+        drop(admission);
+        assert_eq!(bridge.capacities, [0]);
+    }
+
+    #[test]
+    fn live_message_is_retained_for_durable_delivery_before_clone_retry() {
+        let catalog = catalog();
+        let reservation = catalog.active().first().unwrap();
+        let event = ScaleSetBridgeEvent::Assigned(ScaleSetBridgeJobEvidence {
+            runner_request_id: 41,
+            repository: "repo".to_owned(),
+            owner: "owner".to_owned(),
+            job_id: ScaleSetJobId::parse("job-1").unwrap(),
+            workflow_run_id: 7,
+            request_labels: vec!["self-hosted".to_owned()],
+        });
+        let mut bridge = FakeDeliveryBridge {
+            polls: VecDeque::from([ScaleSetBridgePoll::Message {
+                message_id: 9,
+                statistics: statistics(),
+                events: vec![event],
+            }]),
+            capacities: Vec::new(),
+            poisoned: false,
+        };
+        let admission = LiveScaleSetAdmission::new(&mut bridge, &FixedClock);
+        let error = match admission.observe(&catalog, reservation) {
+            Ok(_) => panic!("a live message must block clone admission"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), "clone_scale_set_message_pending");
+        let (delivery, observed_at) = admission.take_pending().unwrap();
+        assert_eq!(delivery.message_id(), 9);
+        assert_eq!(observed_at.get(), 1_900_000_000_000);
+        drop(admission);
+        assert_eq!(bridge.capacities, [0]);
+    }
+
+    #[test]
+    fn phase_dispatch_separates_clone_wait_and_unprovisioned_cleanup() {
+        let catalog = catalog();
+        let reserved = catalog.active().first().unwrap();
+        assert_eq!(
+            operation_for(reserved).unwrap(),
+            CoordinatorOperation::AuthorizeClone
+        );
+        let authorized_catalog = catalog
+            .replace_attempt(
+                reserved.attempt().attempt_id(),
+                reserved.attempt().revision(),
+                crate::disposable_attempt_catalog::DisposableAttemptCatalogAction::AuthorizeClone,
+            )
+            .unwrap();
+        let authorized = authorized_catalog.active().first().unwrap();
+        assert_eq!(
+            operation_for(authorized).unwrap(),
+            CoordinatorOperation::ExecuteClone
+        );
+        let releasing_catalog = catalog
+            .replace_attempt(
+                reserved.attempt().attempt_id(),
+                reserved.attempt().revision(),
+                crate::disposable_attempt_catalog::DisposableAttemptCatalogAction::BeginUnprovisionedRelease,
+            )
+            .unwrap();
+        let releasing = releasing_catalog.active().first().unwrap();
+        assert_eq!(
+            operation_for(releasing).unwrap(),
+            CoordinatorOperation::Cleanup
+        );
+    }
+}
