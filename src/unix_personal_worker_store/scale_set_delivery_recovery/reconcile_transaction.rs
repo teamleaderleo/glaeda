@@ -4,7 +4,11 @@ use crate::disposable_attempt_catalog::{
     DisposableAttemptCatalogDocument, DisposableAttemptCatalogError,
     DisposableAttemptCatalogErrorKind, DisposableAttemptCatalogRevision,
 };
+use crate::execution_admission::EpochMillis;
 use crate::github_scale_set_delivery::ScaleSetDelivery;
+use crate::github_scale_set_delivery_consumer::{
+    ScaleSetDeliveryConsumerPolicy, reconcile_scale_set_delivery,
+};
 
 use super::super::disposable_attempt_catalog::{CATALOG_DOCUMENT, STAGED_CATALOG_DOCUMENT};
 
@@ -40,15 +44,17 @@ impl UnixPersonalWorkerStore {
 
     /// Publish one bounded durable reconciliation under the canonical writer lock.
     ///
-    /// `catalog_successor` may be the exact current catalog (no catalog mutation) or one ordinary
-    /// catalog successor. The initial delivery recovery state is always constructed here and bound
-    /// to the resulting catalog revision. Both changed documents are staged and fsynced before the
-    /// first rename. Network acknowledgement remains outside this transaction.
+    /// The exact successor is derived from every retained delivery event while the canonical lock
+    /// is held, so one message may advance several catalog revisions. The recovery state binds the
+    /// canonical bytes of both the prior and resulting catalogs. Both changed documents are staged
+    /// and fsynced before the first rename. Network acknowledgement remains outside this
+    /// transaction.
     pub(crate) fn publish_scale_set_reconciled_delivery(
         &mut self,
         expected_catalog_revision: DisposableAttemptCatalogRevision,
-        catalog_successor: &DisposableAttemptCatalogDocument,
+        policy: &ScaleSetDeliveryConsumerPolicy,
         delivery: &ScaleSetDelivery,
+        observed_at: EpochMillis,
     ) -> Result<
         (
             DisposableAttemptCatalogDocument,
@@ -74,14 +80,10 @@ impl UnixPersonalWorkerStore {
             self.load_scale_set_delivery_named(DELIVERY_RECOVERY_DOCUMENT)?
         {
             let expected_is_replay = expected_catalog_revision == current_catalog.revision()
-                || expected_catalog_revision
-                    .get()
-                    .checked_add(1)
-                    .is_some_and(|revision| revision == current_catalog.revision().get());
+                || expected_catalog_revision == current_delivery.prior_catalog_revision();
             if expected_is_replay
-                && current_delivery.catalog_revision() == current_catalog.revision()
+                && current_delivery.matches_catalog(&current_catalog)
                 && current_delivery.delivery() == delivery
-                && catalog_successor == &current_catalog
             {
                 return Ok((current_catalog, current_delivery));
             }
@@ -98,15 +100,20 @@ impl UnixPersonalWorkerStore {
             ));
         }
 
-        let catalog_changes = catalog_successor != &current_catalog;
-        if catalog_changes {
-            catalog_successor
-                .validate_successor_of(&current_catalog)
-                .map_err(map_catalog_error)?;
-        }
+        let catalog_successor =
+            reconcile_scale_set_delivery(policy, delivery, &current_catalog, observed_at).map_err(
+                |_| {
+                    store_error(
+                        PersonalWorkerStoreErrorKind::RevisionConflict,
+                        "Scale Set delivery conflicts with the disposable-attempt catalog",
+                    )
+                },
+            )?;
+        let catalog_changes = catalog_successor != current_catalog;
         let recovery = ScaleSetDeliveryRecoveryState::reconciled(
             delivery.clone(),
-            catalog_successor.revision(),
+            &current_catalog,
+            &catalog_successor,
         )
         .map_err(map_recovery_error)?;
 
@@ -125,14 +132,14 @@ impl UnixPersonalWorkerStore {
             // every catalog-stage or catalog-publication error.
             staged_delivery.disarm();
             let mut staged_catalog = self
-                .stage_catalog(catalog_successor)
+                .stage_catalog(&catalog_successor)
                 .map_err(map_catalog_error)?;
             // Persist both stage names before publishing either current document.
             synchronize_directory(&self.directory, "paired Scale Set reconciliation stages")?;
             self.publish_named_staged(&mut staged_catalog, CATALOG_DOCUMENT, false)?;
         }
         self.publish_named_staged(&mut staged_delivery, DELIVERY_RECOVERY_DOCUMENT, true)?;
-        Ok((catalog_successor.clone(), recovery))
+        Ok((catalog_successor, recovery))
     }
 
     fn recover_scale_set_reconcile_transaction_locked(
@@ -153,7 +160,7 @@ impl UnixPersonalWorkerStore {
         if let Some(current_delivery) = current_delivery {
             let current_catalog =
                 current_catalog.ok_or_else(PersonalWorkerStoreError::corrupt_state)?;
-            if current_delivery.catalog_revision() != current_catalog.revision() {
+            if !current_delivery.matches_catalog(&current_catalog) {
                 return Err(PersonalWorkerStoreError::corrupt_state());
             }
             if staged_catalog.is_some() {
@@ -186,26 +193,42 @@ impl UnixPersonalWorkerStore {
             current_catalog.ok_or_else(PersonalWorkerStoreError::corrupt_state)?;
 
         if let Some(staged_catalog) = staged_catalog {
-            let target_matches = staged_delivery.catalog_revision() == staged_catalog.revision();
-            let catalog_stage_is_stale = staged_catalog == current_catalog;
-            let catalog_stage_is_successor = staged_catalog
-                .validate_successor_of(&current_catalog)
-                .is_ok();
-            if !target_matches || (!catalog_stage_is_stale && !catalog_stage_is_successor) {
+            if staged_delivery.matches_catalog(&current_catalog)
+                && staged_catalog == current_catalog
+            {
+                self.remove_catalog_stage().map_err(map_catalog_error)?;
+                self.synchronize_existing_scale_set_delivery_stage(&staged_delivery)?;
+                let mut delivery_guard = StagedDocument::existing(
+                    self.directory.as_fd(),
+                    STAGED_DELIVERY_RECOVERY_DOCUMENT,
+                );
+                return self.publish_named_staged(
+                    &mut delivery_guard,
+                    DELIVERY_RECOVERY_DOCUMENT,
+                    true,
+                );
+            }
+            if !staged_delivery.matches_prior_catalog(&current_catalog)
+                || !staged_delivery.matches_catalog(&staged_catalog)
+            {
                 return Err(PersonalWorkerStoreError::corrupt_state());
             }
 
             // Re-establish durability for the delivery stage before allowing catalog recovery to
             // publish the first half of the pair.
             self.synchronize_existing_scale_set_delivery_stage(&staged_delivery)?;
-            self.recover_catalog_locked().map_err(map_catalog_error)?;
+            self.synchronize_existing_catalog_stage(&staged_catalog)
+                .map_err(map_catalog_error)?;
+            let mut catalog_guard =
+                StagedDocument::existing(self.directory.as_fd(), STAGED_CATALOG_DOCUMENT);
+            self.publish_named_staged(&mut catalog_guard, CATALOG_DOCUMENT, false)?;
             let mut delivery_guard =
                 StagedDocument::existing(self.directory.as_fd(), STAGED_DELIVERY_RECOVERY_DOCUMENT);
             self.publish_named_staged(&mut delivery_guard, DELIVERY_RECOVERY_DOCUMENT, true)?;
             return Ok(());
         }
 
-        if staged_delivery.catalog_revision() == current_catalog.revision() {
+        if staged_delivery.matches_catalog(&current_catalog) {
             // The catalog rename is already current (or this was an intentional zero-change
             // reconciliation). Complete the second half of the transaction.
             self.synchronize_existing_scale_set_delivery_stage(&staged_delivery)?;
@@ -218,8 +241,7 @@ impl UnixPersonalWorkerStore {
             );
         }
 
-        let future_catalog_revision = current_catalog.revision().get().checked_add(1);
-        if future_catalog_revision == Some(staged_delivery.catalog_revision().get()) {
+        if staged_delivery.matches_prior_catalog(&current_catalog) {
             // Delivery-first staging crashed before the catalog stage became durable. No catalog
             // authority changed, so remove only this uncommitted transaction marker.
             return remove_uncommitted_delivery_stage(self);

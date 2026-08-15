@@ -4,18 +4,24 @@ use std::collections::BTreeSet;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
-use crate::disposable_attempt_catalog::DisposableAttemptCatalogRevision;
+use crate::artifact::Sha256Digest;
+use crate::disposable_attempt_catalog::{
+    DisposableAttemptCatalogDocument, DisposableAttemptCatalogRevision,
+    encode_disposable_attempt_catalog,
+};
 use crate::github_scale_set_delivery::{
     MAX_SCALE_SET_DELIVERY_BYTES, ScaleSetDelivery, decode_scale_set_delivery,
     encode_scale_set_delivery,
 };
 use crate::github_scale_set_protocol::ScaleSetRunnerRequestId;
 
-pub(crate) const SCALE_SET_DELIVERY_RECOVERY_SCHEMA_VERSION: u8 = 1;
+pub(crate) const SCALE_SET_DELIVERY_RECOVERY_SCHEMA_VERSION: u8 = 2;
 pub(crate) const MAX_SCALE_SET_DELIVERY_RECOVERY_BYTES: usize =
     MAX_SCALE_SET_DELIVERY_BYTES * 4 + 16 * 1024;
 const MAX_DELIVERY_RECOVERY_REVISION: u64 = 1_000_000_000_000;
+const CATALOG_BINDING_DOMAIN: &[u8] = b"smolrunner.scale-set-catalog-binding.v1\0";
 
 /// Pure recovery state for one durably reconciled Runner Scale Set delivery.
 ///
@@ -26,7 +32,10 @@ const MAX_DELIVERY_RECOVERY_REVISION: u64 = 1_000_000_000_000;
 pub(crate) struct ScaleSetDeliveryRecoveryState {
     schema_version: u8,
     revision: u64,
+    prior_catalog_revision: DisposableAttemptCatalogRevision,
+    prior_catalog_digest: Sha256Digest,
     catalog_revision: DisposableAttemptCatalogRevision,
+    catalog_digest: Sha256Digest,
     delivery: ScaleSetDelivery,
     phase: ScaleSetDeliveryRecoveryPhase,
 }
@@ -34,12 +43,16 @@ pub(crate) struct ScaleSetDeliveryRecoveryState {
 impl ScaleSetDeliveryRecoveryState {
     pub(crate) fn reconciled(
         delivery: ScaleSetDelivery,
-        catalog_revision: DisposableAttemptCatalogRevision,
+        prior_catalog: &DisposableAttemptCatalogDocument,
+        catalog: &DisposableAttemptCatalogDocument,
     ) -> Result<Self, ScaleSetDeliveryRecoveryError> {
         let state = Self {
             schema_version: SCALE_SET_DELIVERY_RECOVERY_SCHEMA_VERSION,
             revision: 1,
-            catalog_revision,
+            prior_catalog_revision: prior_catalog.revision(),
+            prior_catalog_digest: catalog_digest(prior_catalog)?,
+            catalog_revision: catalog.revision(),
+            catalog_digest: catalog_digest(catalog)?,
             delivery,
             phase: ScaleSetDeliveryRecoveryPhase::Reconciled,
         };
@@ -55,6 +68,21 @@ impl ScaleSetDeliveryRecoveryState {
     #[must_use]
     pub(crate) const fn catalog_revision(&self) -> DisposableAttemptCatalogRevision {
         self.catalog_revision
+    }
+
+    #[must_use]
+    pub(crate) const fn prior_catalog_revision(&self) -> DisposableAttemptCatalogRevision {
+        self.prior_catalog_revision
+    }
+
+    pub(crate) fn matches_prior_catalog(&self, catalog: &DisposableAttemptCatalogDocument) -> bool {
+        self.prior_catalog_revision == catalog.revision()
+            && catalog_digest(catalog).is_ok_and(|digest| digest == self.prior_catalog_digest)
+    }
+
+    pub(crate) fn matches_catalog(&self, catalog: &DisposableAttemptCatalogDocument) -> bool {
+        self.catalog_revision == catalog.revision()
+            && catalog_digest(catalog).is_ok_and(|digest| digest == self.catalog_digest)
     }
 
     #[must_use]
@@ -150,7 +178,10 @@ impl ScaleSetDeliveryRecoveryState {
         let state = Self {
             schema_version: self.schema_version,
             revision,
+            prior_catalog_revision: self.prior_catalog_revision,
+            prior_catalog_digest: self.prior_catalog_digest.clone(),
             catalog_revision: self.catalog_revision,
+            catalog_digest: self.catalog_digest.clone(),
             delivery: self.delivery.clone(),
             phase,
         };
@@ -183,6 +214,9 @@ impl ScaleSetDeliveryRecoveryState {
     fn validate(&self) -> Result<(), ScaleSetDeliveryRecoveryError> {
         if self.schema_version != SCALE_SET_DELIVERY_RECOVERY_SCHEMA_VERSION
             || !(1..=MAX_DELIVERY_RECOVERY_REVISION).contains(&self.revision)
+            || self.prior_catalog_revision.get() > self.catalog_revision.get()
+            || (self.prior_catalog_revision == self.catalog_revision
+                && self.prior_catalog_digest != self.catalog_digest)
         {
             return Err(corrupt_state());
         }
@@ -270,7 +304,10 @@ struct RecoveryVersion {
 struct RecoveryWire {
     schema_version: u8,
     revision: u64,
+    prior_catalog_revision: u64,
+    prior_catalog_digest: String,
     catalog_revision: u64,
+    catalog_digest: String,
     delivery_json: String,
     phase: RecoveryPhaseWire,
 }
@@ -285,7 +322,10 @@ impl RecoveryWire {
         Ok(Self {
             schema_version: state.schema_version,
             revision: state.revision,
+            prior_catalog_revision: state.prior_catalog_revision.get(),
+            prior_catalog_digest: state.prior_catalog_digest.as_str().to_owned(),
             catalog_revision: state.catalog_revision.get(),
+            catalog_digest: state.catalog_digest.as_str().to_owned(),
             delivery_json,
             phase: RecoveryPhaseWire::from_phase(&state.phase),
         })
@@ -294,18 +334,43 @@ impl RecoveryWire {
     fn into_state(self) -> Result<ScaleSetDeliveryRecoveryState, ScaleSetDeliveryRecoveryError> {
         let delivery = decode_scale_set_delivery(self.delivery_json.as_bytes())
             .map_err(|_| corrupt_state())?;
+        let prior_catalog_revision =
+            DisposableAttemptCatalogRevision::new(self.prior_catalog_revision)
+                .map_err(|_| corrupt_state())?;
+        let prior_catalog_digest =
+            Sha256Digest::parse(&self.prior_catalog_digest).map_err(|_| corrupt_state())?;
         let catalog_revision = DisposableAttemptCatalogRevision::new(self.catalog_revision)
             .map_err(|_| corrupt_state())?;
+        let catalog_digest =
+            Sha256Digest::parse(&self.catalog_digest).map_err(|_| corrupt_state())?;
         let state = ScaleSetDeliveryRecoveryState {
             schema_version: self.schema_version,
             revision: self.revision,
+            prior_catalog_revision,
+            prior_catalog_digest,
             catalog_revision,
+            catalog_digest,
             delivery,
             phase: self.phase.into_phase()?,
         };
         state.validate()?;
         Ok(state)
     }
+}
+
+fn catalog_digest(
+    catalog: &DisposableAttemptCatalogDocument,
+) -> Result<Sha256Digest, ScaleSetDeliveryRecoveryError> {
+    let bytes = encode_disposable_attempt_catalog(catalog).map_err(|_| corrupt_state())?;
+    let mut hasher = Sha256::new();
+    hasher.update(CATALOG_BINDING_DOMAIN);
+    hasher.update(
+        u64::try_from(bytes.len())
+            .map_err(|_| corrupt_state())?
+            .to_be_bytes(),
+    );
+    hasher.update(bytes);
+    Sha256Digest::parse(&format!("sha256:{:x}", hasher.finalize())).map_err(|_| corrupt_state())
 }
 
 #[derive(Serialize, Deserialize)]
@@ -456,13 +521,14 @@ mod tests {
         }
     }
 
+    fn catalog() -> DisposableAttemptCatalogDocument {
+        DisposableAttemptCatalogDocument::empty()
+    }
+
     #[test]
     fn ack_response_is_distinct_from_recovery_acquisition() {
-        let initial = ScaleSetDeliveryRecoveryState::reconciled(
-            delivery(),
-            DisposableAttemptCatalogRevision::new(8).unwrap(),
-        )
-        .unwrap();
+        let initial =
+            ScaleSetDeliveryRecoveryState::reconciled(delivery(), &catalog(), &catalog()).unwrap();
         let started = initial.begin_ack().unwrap();
         assert_eq!(started.begin_ack().unwrap().revision(), started.revision());
 
@@ -495,13 +561,10 @@ mod tests {
 
     #[test]
     fn repeated_recovery_acquisition_unions_positive_evidence() {
-        let started = ScaleSetDeliveryRecoveryState::reconciled(
-            delivery(),
-            DisposableAttemptCatalogRevision::new(8).unwrap(),
-        )
-        .unwrap()
-        .begin_ack()
-        .unwrap();
+        let started = ScaleSetDeliveryRecoveryState::reconciled(delivery(), &catalog(), &catalog())
+            .unwrap()
+            .begin_ack()
+            .unwrap();
         let first = started
             .record_recovery_acquire(&[ScaleSetRunnerRequestId::new(42).unwrap()])
             .unwrap();
@@ -517,13 +580,10 @@ mod tests {
 
     #[test]
     fn foreign_or_duplicate_acquisition_evidence_conflicts() {
-        let started = ScaleSetDeliveryRecoveryState::reconciled(
-            delivery(),
-            DisposableAttemptCatalogRevision::new(8).unwrap(),
-        )
-        .unwrap()
-        .begin_ack()
-        .unwrap();
+        let started = ScaleSetDeliveryRecoveryState::reconciled(delivery(), &catalog(), &catalog())
+            .unwrap()
+            .begin_ack()
+            .unwrap();
         assert_eq!(
             started
                 .record_ack_response(&[ScaleSetRunnerRequestId::new(43).unwrap()])
@@ -543,19 +603,27 @@ mod tests {
 
     #[test]
     fn recovery_codec_is_canonical_and_versioned() {
-        let state = ScaleSetDeliveryRecoveryState::reconciled(
-            delivery(),
-            DisposableAttemptCatalogRevision::new(8).unwrap(),
-        )
-        .unwrap()
-        .begin_ack()
-        .unwrap();
+        let state = ScaleSetDeliveryRecoveryState::reconciled(delivery(), &catalog(), &catalog())
+            .unwrap()
+            .begin_ack()
+            .unwrap();
         let encoded = encode_scale_set_delivery_recovery(&state).unwrap();
         assert_eq!(decode_scale_set_delivery_recovery(&encoded).unwrap(), state);
 
+        let prior = String::from_utf8(encoded.clone())
+            .unwrap()
+            .replacen("\"schema_version\":2", "\"schema_version\":1", 1)
+            .into_bytes();
+        assert_eq!(
+            decode_scale_set_delivery_recovery(&prior)
+                .unwrap_err()
+                .kind(),
+            ScaleSetDeliveryRecoveryErrorKind::VersionIncompatible
+        );
+
         let future = String::from_utf8(encoded.clone())
             .unwrap()
-            .replacen("\"schema_version\":1", "\"schema_version\":2", 1)
+            .replacen("\"schema_version\":2", "\"schema_version\":3", 1)
             .into_bytes();
         assert_eq!(
             decode_scale_set_delivery_recovery(&future)

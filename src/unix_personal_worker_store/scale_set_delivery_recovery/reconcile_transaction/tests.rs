@@ -4,22 +4,25 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::disposable_attempt_catalog::{
-    DisposableAttemptCatalog, DisposableAttemptCatalogErrorKind, DisposableAttemptCatalogStore,
-    DisposableAttemptReservation, MemoryDisposableAttemptCatalogStore,
+    DisposableAttemptCatalog, DisposableAttemptCatalogAction, DisposableAttemptCatalogErrorKind,
+    DisposableAttemptCatalogStore, DisposableAttemptReservation,
+    MemoryDisposableAttemptCatalogStore, encode_disposable_attempt_catalog,
 };
 use crate::disposable_attempt_state::DisposableAttemptState;
 use crate::disposable_prepared_template::{
     DisposablePreparedTemplateIdentity, current_disposable_prepared_template,
 };
 use crate::disposable_worker_reconciler::{
-    CapacityClaimId, DisposableAttemptId, DisposableVmId, DisposableWorkerResources,
+    CapacityClaimId, DisposableAttemptId, DisposableVmId, DisposableVmIdentity,
+    DisposableWorkerResources,
 };
 use crate::execution_admission::EpochMillis;
 use crate::github_scale_set_bridge::{
     ScaleSetBridgeEvent, ScaleSetBridgeJobEvidence, ScaleSetBridgePoll, ScaleSetStatistics,
 };
 use crate::github_scale_set_protocol::{
-    ScaleSetJobId, ScaleSetRunnerName, ScaleSetRunnerRequestId,
+    ScaleSetJobId, ScaleSetJobResult, ScaleSetRunnerId, ScaleSetRunnerName,
+    ScaleSetRunnerReference, ScaleSetRunnerRequestId,
 };
 
 use super::super::super::publication_fault::{PublicationFaultPoint, inject_publication_fault};
@@ -91,18 +94,6 @@ fn successor(index: usize) -> DisposableAttemptCatalogDocument {
         .0
 }
 
-fn successor_after(first: usize, second: usize) -> DisposableAttemptCatalogDocument {
-    let mut catalog = DisposableAttemptCatalog::new(MemoryDisposableAttemptCatalogStore::default());
-    let (empty, _) = catalog.initialize().expect("initialize memory catalog");
-    let (one, _) = catalog
-        .reserve(empty.revision(), reservation(first))
-        .expect("reserve first successor");
-    catalog
-        .reserve(one.revision(), reservation(second))
-        .expect("reserve later successor")
-        .0
-}
-
 fn reservation(index: usize) -> DisposableAttemptReservation {
     DisposableAttemptReservation::new(
         DisposableAttemptState::reserved(
@@ -128,7 +119,38 @@ fn prepared_template_identity() -> DisposablePreparedTemplateIdentity {
         .expect("prepared template identity")
 }
 
+fn consumer_policy() -> ScaleSetDeliveryConsumerPolicy {
+    ScaleSetDeliveryConsumerPolicy::new(
+        23,
+        "project",
+        "example",
+        &["smolrunner".to_owned()],
+        DisposableWorkerResources::new(2_000, 2 << 30, 20 << 30).expect("consumer resources"),
+        &current_disposable_prepared_template().expect("current prepared template"),
+    )
+    .expect("consumer policy")
+}
+
+fn observed_at() -> EpochMillis {
+    EpochMillis::new(100_000).expect("observation time")
+}
+
+fn reconciled_catalog(
+    current: &DisposableAttemptCatalogDocument,
+    delivery: &ScaleSetDelivery,
+) -> DisposableAttemptCatalogDocument {
+    reconcile_scale_set_delivery(&consumer_policy(), delivery, current, observed_at())
+        .expect("reconcile delivery")
+}
+
 fn delivery(message_id: u32, request_id: u64) -> ScaleSetDelivery {
+    delivery_with_events(
+        message_id,
+        vec![ScaleSetBridgeEvent::Available(job(request_id))],
+    )
+}
+
+fn delivery_with_events(message_id: u32, events: Vec<ScaleSetBridgeEvent>) -> ScaleSetDelivery {
     ScaleSetDelivery::from_bridge_poll(&ScaleSetBridgePoll::Message {
         message_id,
         statistics: ScaleSetStatistics {
@@ -140,17 +162,53 @@ fn delivery(message_id: u32, request_id: u64) -> ScaleSetDelivery {
             busy_runners: 0,
             idle_runners: 0,
         },
-        events: vec![ScaleSetBridgeEvent::Available(ScaleSetBridgeJobEvidence {
-            runner_request_id: request_id,
-            repository: "project".to_owned(),
-            owner: "example".to_owned(),
-            job_id: ScaleSetJobId::parse(&format!("job-{request_id}")).expect("job id"),
-            workflow_run_id: 99,
-            request_labels: vec!["smolrunner".to_owned()],
-        })],
+        events,
     })
     .expect("canonical delivery")
     .expect("message delivery")
+}
+
+fn job(request_id: u64) -> ScaleSetBridgeJobEvidence {
+    ScaleSetBridgeJobEvidence {
+        runner_request_id: request_id,
+        repository: "project".to_owned(),
+        owner: "example".to_owned(),
+        job_id: ScaleSetJobId::parse(&format!("job-{request_id}")).expect("job id"),
+        workflow_run_id: 99,
+        request_labels: vec!["smolrunner".to_owned()],
+    }
+}
+
+fn registering_catalog(request_id: u64) -> DisposableAttemptCatalogDocument {
+    let available = delivery(90, request_id);
+    let mut catalog = reconciled_catalog(&DisposableAttemptCatalogDocument::empty(), &available);
+    let attempt_id = catalog.active()[0].attempt().attempt_id().clone();
+    let mut attempt_revision = catalog.active()[0].attempt().revision();
+    for action in [
+        DisposableAttemptCatalogAction::AuthorizeClone,
+        DisposableAttemptCatalogAction::RecordCloneStarted,
+    ] {
+        catalog = catalog
+            .replace_attempt(&attempt_id, attempt_revision, action)
+            .expect("advance clone state");
+        attempt_revision = catalog.active()[0].attempt().revision();
+    }
+    catalog = catalog
+        .bind_vm_identity_after_clone(
+            &attempt_id,
+            attempt_revision,
+            DisposableVmIdentity::parse(&format!("sha256:{}", "11".repeat(32)))
+                .expect("VM identity"),
+        )
+        .expect("bind VM identity");
+    attempt_revision = catalog.active()[0].attempt().revision();
+    catalog
+        .replace_attempt(
+            &attempt_id,
+            attempt_revision,
+            DisposableAttemptCatalogAction::BeginRegistration,
+        )
+        .expect("begin registration")
 }
 
 fn write_private(path: &Path, bytes: &[u8]) {
@@ -162,14 +220,19 @@ fn write_private(path: &Path, bytes: &[u8]) {
 fn publishes_catalog_and_delivery_under_one_recoverable_transaction() {
     let root = TempRoot::new("publish");
     let empty = initialize_catalog(&root);
-    let next = successor(1);
     let delivery = delivery(7, 41);
+    let next = reconciled_catalog(&empty, &delivery);
 
     let mut store =
         UnixPersonalWorkerStore::open_or_create_scale_set_reconcile_transaction(root.path())
             .expect("open reconcile transaction");
     let (written_catalog, recovery) = store
-        .publish_scale_set_reconciled_delivery(empty.revision(), &next, &delivery)
+        .publish_scale_set_reconciled_delivery(
+            empty.revision(),
+            &consumer_policy(),
+            &delivery,
+            observed_at(),
+        )
         .expect("publish paired reconciliation");
     assert_eq!(written_catalog, next);
     assert_eq!(recovery.catalog_revision(), next.revision());
@@ -198,7 +261,7 @@ fn delivery_only_future_stage_rolls_back_without_advancing_catalog() {
     let root = TempRoot::new("delivery-only-future");
     let empty = initialize_catalog(&root);
     let next = successor(1);
-    let recovery = ScaleSetDeliveryRecoveryState::reconciled(delivery(8, 42), next.revision())
+    let recovery = ScaleSetDeliveryRecoveryState::reconciled(delivery(8, 42), &empty, &next)
         .expect("recovery state");
     let store =
         UnixPersonalWorkerStore::open_or_create_scale_set_reconcile_transaction(root.path())
@@ -236,9 +299,9 @@ fn delivery_only_future_stage_rolls_back_without_advancing_catalog() {
 #[test]
 fn both_exact_stages_recover_catalog_then_delivery() {
     let root = TempRoot::new("both-stages");
-    initialize_catalog(&root);
+    let empty = initialize_catalog(&root);
     let next = successor(1);
-    let recovery = ScaleSetDeliveryRecoveryState::reconciled(delivery(9, 43), next.revision())
+    let recovery = ScaleSetDeliveryRecoveryState::reconciled(delivery(9, 43), &empty, &next)
         .expect("recovery state");
     let store =
         UnixPersonalWorkerStore::open_or_create_scale_set_reconcile_transaction(root.path())
@@ -304,14 +367,18 @@ fn catalog_only_stage_keeps_ordinary_catalog_recovery_semantics() {
 fn rename_failure_retains_delivery_marker_then_recovery_rolls_it_back() {
     let root = TempRoot::new("rename-fault");
     let empty = initialize_catalog(&root);
-    let next = successor(1);
     let delivery = delivery(10, 44);
     let mut store =
         UnixPersonalWorkerStore::open_or_create_scale_set_reconcile_transaction(root.path())
             .expect("open reconcile transaction");
     let fault = inject_publication_fault(PublicationFaultPoint::PublishRename);
     let error = store
-        .publish_scale_set_reconciled_delivery(empty.revision(), &next, &delivery)
+        .publish_scale_set_reconciled_delivery(
+            empty.revision(),
+            &consumer_policy(),
+            &delivery,
+            observed_at(),
+        )
         .expect_err("catalog rename fault");
     assert_eq!(error.kind(), PersonalWorkerStoreErrorKind::Io);
     drop(fault);
@@ -346,17 +413,98 @@ fn rename_failure_retains_delivery_marker_then_recovery_rolls_it_back() {
 }
 
 #[test]
+fn one_delivery_atomically_publishes_a_multi_revision_lifecycle_fold() {
+    let root = TempRoot::new("multi-revision-fold");
+    initialize_catalog(&root);
+    let prior = registering_catalog(61);
+    let catalog_path = root.store_directory().join(CATALOG_DOCUMENT);
+    write_private(
+        &catalog_path,
+        &encode_disposable_attempt_catalog(&prior).expect("encode prior catalog"),
+    );
+
+    let runner = ScaleSetRunnerReference::new(
+        ScaleSetRunnerId::new(501).expect("runner id"),
+        prior.active()[0].attempt().runner_name().clone(),
+    );
+    let delivery = delivery_with_events(
+        17,
+        vec![
+            ScaleSetBridgeEvent::Assigned(job(61)),
+            ScaleSetBridgeEvent::Started {
+                job: job(61),
+                runner: runner.clone(),
+            },
+            ScaleSetBridgeEvent::Completed {
+                job: job(61),
+                runner: Some(runner),
+                result: ScaleSetJobResult::parse("succeeded").expect("job result"),
+            },
+        ],
+    );
+    let expected = reconciled_catalog(&prior, &delivery);
+    assert_eq!(expected.revision().get(), prior.revision().get() + 3);
+
+    let mut store =
+        UnixPersonalWorkerStore::open_or_create_scale_set_reconcile_transaction(root.path())
+            .expect("open reconcile transaction");
+    let (published, recovery) = store
+        .publish_scale_set_reconciled_delivery(
+            prior.revision(),
+            &consumer_policy(),
+            &delivery,
+            observed_at(),
+        )
+        .expect("publish multi-revision fold");
+    assert_eq!(published, expected);
+    assert!(recovery.matches_prior_catalog(&prior));
+    assert!(recovery.matches_catalog(&published));
+    let (replayed, replay_recovery) = store
+        .publish_scale_set_reconciled_delivery(
+            prior.revision(),
+            &consumer_policy(),
+            &delivery,
+            observed_at(),
+        )
+        .expect("replay multi-revision fold");
+    assert_eq!(replayed, published);
+    assert_eq!(replay_recovery, recovery);
+    drop(store);
+
+    let reopened =
+        UnixPersonalWorkerStore::open_or_create_scale_set_reconcile_transaction(root.path())
+            .expect("reopen multi-revision transaction");
+    assert_eq!(
+        reopened
+            .load_catalog_named(CATALOG_DOCUMENT)
+            .expect("load catalog"),
+        Some(expected)
+    );
+    assert_eq!(
+        reopened
+            .load_scale_set_delivery_recovery()
+            .expect("load delivery recovery"),
+        Some(recovery)
+    );
+}
+
+#[test]
 fn directory_sync_failure_after_catalog_rename_completes_delivery_on_reopen() {
     let root = TempRoot::new("directory-sync-fault");
     let empty = initialize_catalog(&root);
-    let next = successor(1);
     let delivery = delivery(11, 45);
+    let next = reconciled_catalog(&empty, &delivery);
     let mut store =
         UnixPersonalWorkerStore::open_or_create_scale_set_reconcile_transaction(root.path())
             .expect("open reconcile transaction");
     let fault = inject_publication_fault(PublicationFaultPoint::PublicationDirectorySync);
     let error = store
-        .publish_scale_set_reconciled_delivery(empty.revision(), &next, &delivery)
+        .publish_scale_set_reconciled_delivery(
+            empty.revision(),
+            &consumer_policy(),
+            &delivery,
+            observed_at(),
+        )
         .expect_err("catalog directory sync fault");
     assert_eq!(error.kind(), PersonalWorkerStoreErrorKind::Io);
     drop(fault);
@@ -385,21 +533,65 @@ fn directory_sync_failure_after_catalog_rename_completes_delivery_on_reopen() {
 }
 
 #[test]
-fn zero_change_reconciliation_and_exact_replay_are_idempotent() {
-    let root = TempRoot::new("zero-change");
+fn exact_reconciliation_replay_is_idempotent() {
+    let root = TempRoot::new("exact-replay");
     let empty = initialize_catalog(&root);
     let delivery = delivery(12, 46);
+    let expected = reconciled_catalog(&empty, &delivery);
     let mut store =
         UnixPersonalWorkerStore::open_or_create_scale_set_reconcile_transaction(root.path())
             .expect("open reconcile transaction");
     let (_, initial) = store
-        .publish_scale_set_reconciled_delivery(empty.revision(), &empty, &delivery)
-        .expect("publish zero-change reconciliation");
+        .publish_scale_set_reconciled_delivery(
+            empty.revision(),
+            &consumer_policy(),
+            &delivery,
+            observed_at(),
+        )
+        .expect("publish reconciliation");
     let (same_catalog, same_recovery) = store
-        .publish_scale_set_reconciled_delivery(empty.revision(), &empty, &delivery)
+        .publish_scale_set_reconciled_delivery(
+            empty.revision(),
+            &consumer_policy(),
+            &delivery,
+            observed_at(),
+        )
         .expect("replay exact reconciliation");
-    assert_eq!(same_catalog, empty);
+    assert_eq!(same_catalog, expected);
     assert_eq!(same_recovery, initial);
+}
+
+#[test]
+fn exact_existing_event_publishes_a_zero_change_delivery_binding() {
+    let root = TempRoot::new("zero-change");
+    initialize_catalog(&root);
+    let delivery = delivery(18, 62);
+    let current = reconciled_catalog(&DisposableAttemptCatalogDocument::empty(), &delivery);
+    write_private(
+        &root.store_directory().join(CATALOG_DOCUMENT),
+        &encode_disposable_attempt_catalog(&current).expect("encode current catalog"),
+    );
+
+    let mut store =
+        UnixPersonalWorkerStore::open_or_create_scale_set_reconcile_transaction(root.path())
+            .expect("open reconcile transaction");
+    let (published, recovery) = store
+        .publish_scale_set_reconciled_delivery(
+            current.revision(),
+            &consumer_policy(),
+            &delivery,
+            observed_at(),
+        )
+        .expect("publish zero-change reconciliation");
+    assert_eq!(published, current);
+    assert!(recovery.matches_prior_catalog(&current));
+    assert!(recovery.matches_catalog(&current));
+    assert!(
+        !root
+            .store_directory()
+            .join(STAGED_CATALOG_DOCUMENT)
+            .exists()
+    );
 }
 
 #[test]
@@ -412,10 +604,20 @@ fn foreign_live_delivery_blocks_another_reconciliation() {
         UnixPersonalWorkerStore::open_or_create_scale_set_reconcile_transaction(root.path())
             .expect("open reconcile transaction");
     store
-        .publish_scale_set_reconciled_delivery(empty.revision(), &empty, &first)
+        .publish_scale_set_reconciled_delivery(
+            empty.revision(),
+            &consumer_policy(),
+            &first,
+            observed_at(),
+        )
         .expect("publish first delivery");
     let error = store
-        .publish_scale_set_reconciled_delivery(empty.revision(), &empty, &second)
+        .publish_scale_set_reconciled_delivery(
+            empty.revision(),
+            &consumer_policy(),
+            &second,
+            observed_at(),
+        )
         .expect_err("foreign live delivery must block");
     assert_eq!(error.kind(), PersonalWorkerStoreErrorKind::RevisionConflict);
 }
@@ -454,7 +656,7 @@ fn future_delivery_marker_blocks_a_competing_same_revision_catalog() {
     let intended = successor(1);
     let competing = successor(2);
     assert_eq!(intended.revision(), competing.revision());
-    let recovery = ScaleSetDeliveryRecoveryState::reconciled(delivery(15, 49), intended.revision())
+    let recovery = ScaleSetDeliveryRecoveryState::reconciled(delivery(15, 49), &empty, &intended)
         .expect("future delivery state");
 
     let mut ordinary = UnixPersonalWorkerStore::open_or_create_disposable_catalog(root.path())
@@ -504,22 +706,70 @@ fn future_delivery_marker_blocks_a_competing_same_revision_catalog() {
 }
 
 #[test]
+fn delivery_binding_refuses_a_same_revision_different_catalog_stage() {
+    let root = TempRoot::new("different-catalog-digest");
+    let empty = initialize_catalog(&root);
+    let intended = successor(1);
+    let competing = successor(2);
+    assert_eq!(intended.revision(), competing.revision());
+    let recovery = ScaleSetDeliveryRecoveryState::reconciled(delivery(19, 63), &empty, &intended)
+        .expect("recovery state");
+    let store =
+        UnixPersonalWorkerStore::open_or_create_scale_set_reconcile_transaction(root.path())
+            .expect("open reconcile transaction");
+    let mut staged_delivery = store
+        .stage_scale_set_delivery(&recovery)
+        .expect("stage delivery");
+    staged_delivery.disarm();
+    let mut staged_catalog = store.stage_catalog(&competing).expect("stage catalog");
+    staged_catalog.disarm();
+    drop(staged_catalog);
+    drop(staged_delivery);
+    drop(store);
+
+    assert_eq!(
+        UnixPersonalWorkerStore::open_or_create_scale_set_reconcile_transaction(root.path())
+            .expect_err("different catalog bytes must fail closed")
+            .kind(),
+        PersonalWorkerStoreErrorKind::CorruptState
+    );
+    assert!(
+        root.store_directory()
+            .join(STAGED_CATALOG_DOCUMENT)
+            .exists()
+    );
+    assert!(
+        root.store_directory()
+            .join(STAGED_DELIVERY_RECOVERY_DOCUMENT)
+            .exists()
+    );
+}
+
+#[test]
 fn live_delivery_blocks_a_later_catalog_successor() {
     let root = TempRoot::new("live-delivery-fence");
     let empty = initialize_catalog(&root);
-    let one = successor(1);
-    let two = successor_after(1, 2);
-    one.validate_successor_of(&empty)
-        .expect("first catalog successor");
-    two.validate_successor_of(&one)
-        .expect("later catalog successor");
     let delivery = delivery(16, 50);
+    let one = reconciled_catalog(&empty, &delivery);
+    let current_attempt = one.active()[0].attempt();
+    let two = one
+        .replace_attempt(
+            current_attempt.attempt_id(),
+            current_attempt.revision(),
+            DisposableAttemptCatalogAction::AuthorizeClone,
+        )
+        .expect("later catalog successor");
 
     let mut store =
         UnixPersonalWorkerStore::open_or_create_scale_set_reconcile_transaction(root.path())
             .expect("open paired transaction");
     store
-        .publish_scale_set_reconciled_delivery(empty.revision(), &one, &delivery)
+        .publish_scale_set_reconciled_delivery(
+            empty.revision(),
+            &consumer_policy(),
+            &delivery,
+            observed_at(),
+        )
         .expect("publish live delivery");
 
     let error =
