@@ -14,7 +14,7 @@ use crate::github_scale_set_bridge::{
     ScaleSetBridgeEvent, ScaleSetBridgeJobEvidence, ScaleSetStatistics,
 };
 use crate::github_scale_set_delivery_state::ScaleSetDeliveryRecoveryPhase;
-use crate::github_scale_set_protocol::{ScaleSetJobId, ScaleSetRunnerRequestId};
+use crate::github_scale_set_protocol::{ScaleSetJobId, ScaleSetJobResult, ScaleSetRunnerRequestId};
 
 use super::*;
 
@@ -74,12 +74,24 @@ struct FakeBridge {
 }
 
 impl DeliveryBridge for FakeBridge {
+    fn resume_after(&mut self, _: u32) -> Result<(), ScaleSetBridgeError> {
+        if self.poisoned {
+            return Err(ScaleSetBridgeError::new("poisoned"));
+        }
+        self.calls.push("resume");
+        Ok(())
+    }
+
     fn poll(&mut self, available_capacity: u16) -> Result<ScaleSetBridgePoll, ScaleSetBridgeError> {
         if self.poisoned {
             return Err(ScaleSetBridgeError::new("poisoned"));
         }
-        assert_eq!(available_capacity, 1);
-        self.calls.push("poll");
+        assert!(available_capacity <= 1);
+        self.calls.push(if available_capacity == 0 {
+            "poll_zero"
+        } else {
+            "poll"
+        });
         Ok(self.polls.pop_front().expect("expected poll response"))
     }
 
@@ -118,6 +130,10 @@ struct LockCheckingBridge<'a> {
 }
 
 impl DeliveryBridge for LockCheckingBridge<'_> {
+    fn resume_after(&mut self, _: u32) -> Result<(), ScaleSetBridgeError> {
+        panic!("resume is not expected")
+    }
+
     fn poll(&mut self, available_capacity: u16) -> Result<ScaleSetBridgePoll, ScaleSetBridgeError> {
         assert_eq!(available_capacity, 1);
         Ok(self.poll.take().expect("one poll"))
@@ -177,6 +193,70 @@ fn message(message_id: u32, request_id: u64) -> ScaleSetBridgePoll {
             workflow_run_id: 99,
             request_labels: vec!["smolrunner".to_owned()],
         })],
+    }
+}
+
+fn assigned_message(message_id: u32, request_id: u64) -> ScaleSetBridgePoll {
+    ScaleSetBridgePoll::Message {
+        message_id,
+        statistics: ScaleSetStatistics {
+            available_jobs: 0,
+            acquired_jobs: 1,
+            assigned_jobs: 1,
+            running_jobs: 0,
+            registered_runners: 0,
+            busy_runners: 0,
+            idle_runners: 0,
+        },
+        events: vec![ScaleSetBridgeEvent::Assigned(ScaleSetBridgeJobEvidence {
+            runner_request_id: request_id,
+            repository: "project".to_owned(),
+            owner: "example".to_owned(),
+            job_id: ScaleSetJobId::parse(&format!("job-{request_id}")).expect("job id"),
+            workflow_run_id: 99,
+            request_labels: vec!["smolrunner".to_owned()],
+        })],
+    }
+}
+
+fn canceled_message(message_id: u32, request_id: u64) -> ScaleSetBridgePoll {
+    ScaleSetBridgePoll::Message {
+        message_id,
+        statistics: ScaleSetStatistics {
+            available_jobs: 0,
+            acquired_jobs: 0,
+            assigned_jobs: 0,
+            running_jobs: 0,
+            registered_runners: 0,
+            busy_runners: 0,
+            idle_runners: 0,
+        },
+        events: vec![ScaleSetBridgeEvent::Completed {
+            job: ScaleSetBridgeJobEvidence {
+                runner_request_id: request_id,
+                repository: "project".to_owned(),
+                owner: "example".to_owned(),
+                job_id: ScaleSetJobId::parse(&format!("job-{request_id}")).expect("job id"),
+                workflow_run_id: 99,
+                request_labels: vec!["smolrunner".to_owned()],
+            },
+            runner: None,
+            result: ScaleSetJobResult::parse("canceled").expect("result"),
+        }],
+    }
+}
+
+fn idle() -> ScaleSetBridgePoll {
+    ScaleSetBridgePoll::Idle {
+        statistics: ScaleSetStatistics {
+            available_jobs: 0,
+            acquired_jobs: 1,
+            assigned_jobs: 1,
+            running_jobs: 0,
+            registered_runners: 0,
+            busy_runners: 0,
+            idle_runners: 0,
+        },
     }
 }
 
@@ -431,6 +511,7 @@ fn empty_acquisition_replay_remains_explicit_recovery_debt() {
         .expect("publish acknowledgement start");
     drop(store);
     let mut bridge = FakeBridge {
+        polls: VecDeque::from([idle()]),
         acquisitions: VecDeque::from([Ok(vec![])]),
         ..FakeBridge::default()
     };
@@ -439,7 +520,8 @@ fn empty_acquisition_replay_remains_explicit_recovery_debt() {
         consume_with_bridge(root.path(), &policy(), &mut bridge, observed_at()).unwrap(),
         ScaleSetDeliveryControllerDisposition::RecoveryRequired
     );
-    assert_eq!(bridge.calls, ["acquire"]);
+    assert_eq!(bridge.calls, ["acquire", "resume", "poll_zero"]);
+    assert!(bridge.poisoned);
     assert!(matches!(
         load_recovery(&root).phase(),
         ScaleSetDeliveryRecoveryPhase::AcquisitionRecoveryObserved { acquired }
@@ -451,6 +533,205 @@ fn empty_acquisition_replay_remains_explicit_recovery_debt() {
             .kind(),
         DisposableAttemptCatalogErrorKind::RecoveryRequired
     );
+}
+
+#[test]
+fn later_assignment_resolves_empty_acquisition_without_admitting_more_work() {
+    let root = TempRoot::new("lifecycle-resolution");
+    initialize(&root);
+    let initial = prepare_reconciled(&root, &message(30, 61));
+    let started = initial.begin_ack().expect("begin acknowledgement");
+    let mut store =
+        UnixPersonalWorkerStore::open_or_create_scale_set_delivery_recovery(root.path())
+            .expect("open recovery store");
+    store
+        .replace_scale_set_delivery_recovery(initial.revision(), &started)
+        .expect("publish acknowledgement start");
+    drop(store);
+    let mut bridge = FakeBridge {
+        polls: VecDeque::from([assigned_message(31, 61)]),
+        acknowledgements: VecDeque::from([Ok(Vec::new())]),
+        acquisitions: VecDeque::from([Ok(Vec::new())]),
+        ..FakeBridge::default()
+    };
+
+    assert_eq!(
+        consume_with_bridge(root.path(), &policy(), &mut bridge, observed_at()).unwrap(),
+        ScaleSetDeliveryControllerDisposition::Settled { acquired: 1 }
+    );
+    assert_eq!(bridge.calls, ["acquire", "resume", "poll_zero", "ack"]);
+    assert!(!bridge.poisoned);
+    assert!(maybe_recovery(&root).is_none());
+    let catalog = load_catalog(&root);
+    let reservation = catalog
+        .find_active_by_runner_request_id(ScaleSetRunnerRequestId::new(61).unwrap())
+        .expect("acquired request remains reserved for provisioning");
+    assert_eq!(
+        reservation.attempt().phase(),
+        crate::disposable_worker_reconciler::DisposableAttemptPhase::Reserved
+    );
+}
+
+#[test]
+fn later_runnerless_cancellation_releases_without_vm_cleanup_authority() {
+    let root = TempRoot::new("lifecycle-cancellation");
+    initialize(&root);
+    let initial = prepare_reconciled(&root, &message(40, 71));
+    let ambiguous = initial
+        .begin_ack()
+        .unwrap()
+        .record_recovery_acquire(&[])
+        .unwrap();
+    let mut store =
+        UnixPersonalWorkerStore::open_or_create_scale_set_delivery_recovery(root.path()).unwrap();
+    store
+        .replace_scale_set_delivery_recovery(initial.revision(), &initial.begin_ack().unwrap())
+        .unwrap();
+    store
+        .replace_scale_set_delivery_recovery(initial.begin_ack().unwrap().revision(), &ambiguous)
+        .unwrap();
+    drop(store);
+    let mut bridge = FakeBridge {
+        polls: VecDeque::from([canceled_message(41, 71)]),
+        acknowledgements: VecDeque::from([Ok(Vec::new())]),
+        ..FakeBridge::default()
+    };
+
+    assert_eq!(
+        consume_with_bridge(root.path(), &policy(), &mut bridge, observed_at()).unwrap(),
+        ScaleSetDeliveryControllerDisposition::Settled { acquired: 1 }
+    );
+    assert_eq!(bridge.calls, ["resume", "poll_zero", "ack"]);
+    let catalog = load_catalog(&root);
+    assert!(catalog.active().is_empty());
+    let tombstone = catalog
+        .find_tombstone_by_runner_request_id(ScaleSetRunnerRequestId::new(71).unwrap())
+        .expect("canceled request tombstone");
+    assert!(tombstone.vm_identity().is_none());
+}
+
+#[test]
+fn lifecycle_ack_failure_requires_exact_redelivery_before_safe_retry() {
+    let root = TempRoot::new("lifecycle-ack-retry");
+    initialize(&root);
+    let initial = prepare_reconciled(&root, &message(50, 81));
+    let started = initial.begin_ack().unwrap();
+    let ambiguous = started.record_recovery_acquire(&[]).unwrap();
+    let mut store =
+        UnixPersonalWorkerStore::open_or_create_scale_set_delivery_recovery(root.path()).unwrap();
+    store
+        .replace_scale_set_delivery_recovery(initial.revision(), &started)
+        .unwrap();
+    store
+        .replace_scale_set_delivery_recovery(started.revision(), &ambiguous)
+        .unwrap();
+    drop(store);
+
+    let lifecycle = assigned_message(51, 81);
+    let mut failed = FakeBridge {
+        polls: VecDeque::from([lifecycle.clone()]),
+        acknowledgements: VecDeque::from([Err(ScaleSetBridgeError::new("injected"))]),
+        ..FakeBridge::default()
+    };
+    assert_eq!(
+        consume_with_bridge(root.path(), &policy(), &mut failed, observed_at())
+            .unwrap_err()
+            .code(),
+        "scale_set_bridge_failed"
+    );
+    assert!(failed.poisoned);
+    assert!(matches!(
+        load_recovery(&root).phase(),
+        ScaleSetDeliveryRecoveryPhase::LifecycleAcknowledgementStarted { .. }
+    ));
+
+    let mut retry = FakeBridge {
+        polls: VecDeque::from([lifecycle]),
+        acknowledgements: VecDeque::from([Ok(Vec::new())]),
+        ..FakeBridge::default()
+    };
+    assert_eq!(
+        consume_with_bridge(root.path(), &policy(), &mut retry, observed_at()).unwrap(),
+        ScaleSetDeliveryControllerDisposition::Settled { acquired: 1 }
+    );
+    assert_eq!(retry.calls, ["resume", "poll_zero", "ack"]);
+}
+
+#[test]
+fn lifecycle_ack_response_loss_settles_when_fresh_cursor_poll_proves_absence() {
+    let root = TempRoot::new("lifecycle-ack-absence");
+    initialize(&root);
+    let initial = prepare_reconciled(&root, &message(60, 91));
+    let started = initial.begin_ack().unwrap();
+    let ambiguous = started.record_recovery_acquire(&[]).unwrap();
+    let mut store =
+        UnixPersonalWorkerStore::open_or_create_scale_set_delivery_recovery(root.path()).unwrap();
+    store
+        .replace_scale_set_delivery_recovery(initial.revision(), &started)
+        .unwrap();
+    store
+        .replace_scale_set_delivery_recovery(started.revision(), &ambiguous)
+        .unwrap();
+    drop(store);
+
+    let mut failed = FakeBridge {
+        polls: VecDeque::from([assigned_message(61, 91)]),
+        acknowledgements: VecDeque::from([Err(ScaleSetBridgeError::new("response-lost"))]),
+        ..FakeBridge::default()
+    };
+    assert_eq!(
+        consume_with_bridge(root.path(), &policy(), &mut failed, observed_at())
+            .unwrap_err()
+            .code(),
+        "scale_set_bridge_failed"
+    );
+
+    let mut recovery = FakeBridge {
+        polls: VecDeque::from([idle()]),
+        ..FakeBridge::default()
+    };
+    assert_eq!(
+        consume_with_bridge(root.path(), &policy(), &mut recovery, observed_at()).unwrap(),
+        ScaleSetDeliveryControllerDisposition::Settled { acquired: 1 }
+    );
+    assert_eq!(recovery.calls, ["resume", "poll_zero"]);
+    assert!(recovery.poisoned);
+    assert!(maybe_recovery(&root).is_none());
+}
+
+#[test]
+fn later_unacknowledged_message_is_not_consumed_as_ack_recovery_evidence() {
+    let root = TempRoot::new("lifecycle-ack-later-message");
+    initialize(&root);
+    let initial = prepare_reconciled(&root, &message(70, 101));
+    let started = initial.begin_ack().unwrap();
+    let ambiguous = started.record_recovery_acquire(&[]).unwrap();
+    let mut store =
+        UnixPersonalWorkerStore::open_or_create_scale_set_delivery_recovery(root.path()).unwrap();
+    store
+        .replace_scale_set_delivery_recovery(initial.revision(), &started)
+        .unwrap();
+    store
+        .replace_scale_set_delivery_recovery(started.revision(), &ambiguous)
+        .unwrap();
+    drop(store);
+    let mut failed = FakeBridge {
+        polls: VecDeque::from([assigned_message(71, 101)]),
+        acknowledgements: VecDeque::from([Err(ScaleSetBridgeError::new("response-lost"))]),
+        ..FakeBridge::default()
+    };
+    assert!(consume_with_bridge(root.path(), &policy(), &mut failed, observed_at()).is_err());
+
+    let mut recovery = FakeBridge {
+        polls: VecDeque::from([assigned_message(72, 101)]),
+        ..FakeBridge::default()
+    };
+    assert_eq!(
+        consume_with_bridge(root.path(), &policy(), &mut recovery, observed_at()).unwrap(),
+        ScaleSetDeliveryControllerDisposition::Settled { acquired: 1 }
+    );
+    assert_eq!(recovery.calls, ["resume", "poll_zero"]);
+    assert!(recovery.poisoned);
 }
 
 #[test]

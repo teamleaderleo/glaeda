@@ -314,6 +314,12 @@ fn exact_recovery_successor(
         ScaleSetDeliveryRecoveryPhase::AcquisitionRecoveryObserved { acquired } => {
             current.record_recovery_acquire(acquired)
         }
+        ScaleSetDeliveryRecoveryPhase::LifecycleAcknowledgementStarted { .. } => {
+            current.begin_lifecycle_ack()
+        }
+        ScaleSetDeliveryRecoveryPhase::LifecycleAcknowledged { .. } => {
+            current.record_lifecycle_ack()
+        }
         ScaleSetDeliveryRecoveryPhase::SettlementPrepared {
             prior_catalog,
             catalog_revision,
@@ -324,7 +330,8 @@ fn exact_recovery_successor(
             *catalog_revision,
             catalog_digest.clone(),
         ),
-        ScaleSetDeliveryRecoveryPhase::Reconciled => return false,
+        ScaleSetDeliveryRecoveryPhase::Reconciled
+        | ScaleSetDeliveryRecoveryPhase::LifecycleReconciled { .. } => return false,
     };
     expected.is_ok_and(|expected| expected == *candidate)
 }

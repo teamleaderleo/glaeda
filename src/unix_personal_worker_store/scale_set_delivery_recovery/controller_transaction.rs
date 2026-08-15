@@ -117,6 +117,96 @@ impl UnixPersonalWorkerStore {
         Ok(ScaleSetExternalTransaction::Completed(successor))
     }
 
+    /// Checkpoint and acknowledge one lifecycle-only message used to resolve acquisition debt.
+    ///
+    /// The resolution delivery contains no Available event, so acknowledgement has no acquisition
+    /// side effect. A restart may therefore retry only after the exact message is redelivered.
+    pub(crate) fn acknowledge_scale_set_lifecycle_locked<E, F>(
+        &mut self,
+        expected: &ScaleSetDeliveryRecoveryState,
+        acknowledge: F,
+    ) -> Result<
+        ScaleSetExternalTransaction<ScaleSetDeliveryRecoveryState, E>,
+        PersonalWorkerStoreError,
+    >
+    where
+        F: FnOnce(u32) -> Result<Vec<ScaleSetRunnerRequestId>, E>,
+    {
+        let _lock = self.acquire_mutation_lock()?;
+        synchronize_directory(&self.directory, "personal worker store directory")?;
+        self.refuse_other_unsettled_scale_set_state()?;
+        self.recover_scale_set_delivery_locked()?;
+        let current = self
+            .load_scale_set_delivery_named(DELIVERY_RECOVERY_DOCUMENT)?
+            .ok_or_else(|| {
+                store_error(
+                    PersonalWorkerStoreErrorKind::Missing,
+                    "Scale Set lifecycle recovery state does not exist",
+                )
+            })?;
+        if current != *expected
+            || !matches!(
+                current.phase(),
+                ScaleSetDeliveryRecoveryPhase::LifecycleReconciled { .. }
+                    | ScaleSetDeliveryRecoveryPhase::LifecycleAcknowledgementStarted { .. }
+            )
+        {
+            return Err(store_error(
+                PersonalWorkerStoreErrorKind::RevisionConflict,
+                "Scale Set lifecycle delivery is not the exact acknowledgement candidate",
+            ));
+        }
+        self.require_scale_set_catalog_binding(&current)?;
+        let started = current.begin_lifecycle_ack().map_err(map_recovery_error)?;
+        if started != current {
+            self.publish_scale_set_delivery_successor_locked(&current, &started)?;
+        }
+        let resolution = started
+            .lifecycle_resolution()
+            .ok_or_else(PersonalWorkerStoreError::corrupt_state)?;
+        let acquired = match acknowledge(resolution.delivery().message_id()) {
+            Ok(acquired) => acquired,
+            Err(error) => return Ok(ScaleSetExternalTransaction::ExternalFailed(error)),
+        };
+        if !acquired.is_empty() {
+            return Err(PersonalWorkerStoreError::corrupt_state());
+        }
+        let acknowledged = started.record_lifecycle_ack().map_err(map_recovery_error)?;
+        self.publish_scale_set_delivery_successor_locked(&started, &acknowledged)?;
+        Ok(ScaleSetExternalTransaction::Completed(acknowledged))
+    }
+
+    /// Record that a previously Started lifecycle acknowledgement is absent beyond its predecessor
+    /// cursor. The caller obtains this evidence only from a fresh zero-capacity poll; no external
+    /// mutation occurs in this transaction.
+    pub(crate) fn confirm_scale_set_lifecycle_acknowledged_locked(
+        &mut self,
+        expected: &ScaleSetDeliveryRecoveryState,
+    ) -> Result<ScaleSetDeliveryRecoveryState, PersonalWorkerStoreError> {
+        let _lock = self.acquire_mutation_lock()?;
+        synchronize_directory(&self.directory, "personal worker store directory")?;
+        self.refuse_other_unsettled_scale_set_state()?;
+        self.recover_scale_set_delivery_locked()?;
+        let current = self
+            .load_scale_set_delivery_named(DELIVERY_RECOVERY_DOCUMENT)?
+            .ok_or_else(PersonalWorkerStoreError::corrupt_state)?;
+        if current != *expected
+            || !matches!(
+                current.phase(),
+                ScaleSetDeliveryRecoveryPhase::LifecycleAcknowledgementStarted { .. }
+            )
+        {
+            return Err(store_error(
+                PersonalWorkerStoreErrorKind::RevisionConflict,
+                "Scale Set lifecycle acknowledgement absence does not match durable state",
+            ));
+        }
+        self.require_scale_set_catalog_binding(&current)?;
+        let acknowledged = current.record_lifecycle_ack().map_err(map_recovery_error)?;
+        self.publish_scale_set_delivery_successor_locked(&current, &acknowledged)?;
+        Ok(acknowledged)
+    }
+
     fn publish_scale_set_delivery_successor_locked(
         &self,
         current: &ScaleSetDeliveryRecoveryState,

@@ -7,7 +7,8 @@ use crate::disposable_attempt_catalog::{
 use crate::execution_admission::EpochMillis;
 use crate::github_scale_set_delivery::ScaleSetDelivery;
 use crate::github_scale_set_delivery_consumer::{
-    ScaleSetDeliveryConsumerPolicy, reconcile_scale_set_delivery,
+    ScaleSetDeliveryConsumerPolicy, reconcile_scale_set_acquisition_resolution,
+    reconcile_scale_set_delivery,
 };
 
 use super::super::disposable_attempt_catalog::{CATALOG_DOCUMENT, STAGED_CATALOG_DOCUMENT};
@@ -142,6 +143,94 @@ impl UnixPersonalWorkerStore {
         Ok((catalog_successor, recovery))
     }
 
+    /// Replace one empty acquisition-recovery fence with exact later lifecycle evidence.
+    ///
+    /// The original delivery remains current until both the lifecycle-derived catalog and its
+    /// recovery successor are durable. Publication uses the same catalog-first ordering as initial
+    /// reconciliation, so every crash either preserves the original fence or completes the exact
+    /// successor pair.
+    pub(crate) fn publish_scale_set_lifecycle_resolution(
+        &mut self,
+        expected: &ScaleSetDeliveryRecoveryState,
+        policy: &ScaleSetDeliveryConsumerPolicy,
+        delivery: &ScaleSetDelivery,
+    ) -> Result<ScaleSetDeliveryRecoveryState, PersonalWorkerStoreError> {
+        let _lock = self.acquire_mutation_lock()?;
+        synchronize_directory(&self.directory, "personal worker store directory")?;
+        self.recover_scale_set_reconcile_transaction_locked()?;
+
+        let current = self
+            .load_scale_set_delivery_named(DELIVERY_RECOVERY_DOCUMENT)?
+            .ok_or_else(|| {
+                store_error(
+                    PersonalWorkerStoreErrorKind::Missing,
+                    "ambiguous Scale Set delivery recovery state does not exist",
+                )
+            })?;
+        if current != *expected
+            || !matches!(
+                current.phase(),
+                ScaleSetDeliveryRecoveryPhase::AcquisitionRecoveryObserved { acquired }
+                    if acquired.is_empty()
+            )
+        {
+            return Err(store_error(
+                PersonalWorkerStoreErrorKind::RevisionConflict,
+                "Scale Set delivery is not the exact lifecycle-resolution candidate",
+            ));
+        }
+        let current_catalog = self
+            .load_catalog_named(CATALOG_DOCUMENT)
+            .map_err(map_catalog_error)?
+            .ok_or_else(PersonalWorkerStoreError::corrupt_state)?;
+        if !current.matches_catalog(&current_catalog) {
+            return Err(PersonalWorkerStoreError::corrupt_state());
+        }
+        let ambiguous = current
+            .delivery()
+            .available_request_ids()
+            .map_err(|_| PersonalWorkerStoreError::corrupt_state())?;
+        let (target_catalog, acquired) = reconcile_scale_set_acquisition_resolution(
+            policy,
+            &ambiguous,
+            delivery,
+            &current_catalog,
+        )
+        .map_err(|_| {
+            store_error(
+                PersonalWorkerStoreErrorKind::RevisionConflict,
+                "later Scale Set lifecycle evidence conflicts with acquisition recovery",
+            )
+        })?;
+        let successor = current
+            .prepare_lifecycle_resolution(
+                delivery.clone(),
+                &acquired,
+                &current_catalog,
+                &target_catalog,
+            )
+            .map_err(map_recovery_error)?;
+
+        let mut staged_delivery = self.stage_scale_set_delivery(&successor)?;
+        if target_catalog != current_catalog {
+            synchronize_directory(
+                &self.directory,
+                "paired Scale Set lifecycle resolution delivery stage",
+            )?;
+            staged_delivery.disarm();
+            let mut staged_catalog = self
+                .stage_catalog(&target_catalog)
+                .map_err(map_catalog_error)?;
+            synchronize_directory(
+                &self.directory,
+                "paired Scale Set lifecycle resolution stages",
+            )?;
+            self.publish_named_staged(&mut staged_catalog, CATALOG_DOCUMENT, false)?;
+        }
+        self.publish_named_staged(&mut staged_delivery, DELIVERY_RECOVERY_DOCUMENT, false)?;
+        Ok(successor)
+    }
+
     pub(super) fn recover_scale_set_reconcile_transaction_locked(
         &mut self,
     ) -> Result<(), PersonalWorkerStoreError> {
@@ -160,6 +249,57 @@ impl UnixPersonalWorkerStore {
         if let Some(current_delivery) = current_delivery {
             let current_catalog =
                 current_catalog.ok_or_else(PersonalWorkerStoreError::corrupt_state)?;
+            if let Some(staged_delivery) = staged_delivery.as_ref()
+                && staged_delivery.is_lifecycle_resolution_of(
+                    &current_delivery,
+                    staged_delivery
+                        .lifecycle_resolution()
+                        .ok_or_else(PersonalWorkerStoreError::corrupt_state)?
+                        .prior_catalog(),
+                )
+            {
+                let resolution = staged_delivery
+                    .lifecycle_resolution()
+                    .ok_or_else(PersonalWorkerStoreError::corrupt_state)?;
+                if current_delivery.matches_catalog(&current_catalog) {
+                    match staged_catalog {
+                        Some(ref staged) if resolution.matches_catalog(staged) => {
+                            self.synchronize_existing_scale_set_delivery_stage(staged_delivery)?;
+                            self.synchronize_existing_catalog_stage(staged)
+                                .map_err(map_catalog_error)?;
+                            let mut catalog_guard = StagedDocument::existing(
+                                self.directory.as_fd(),
+                                STAGED_CATALOG_DOCUMENT,
+                            );
+                            self.publish_named_staged(&mut catalog_guard, CATALOG_DOCUMENT, false)?;
+                        }
+                        None if resolution.matches_catalog(&current_catalog) => {
+                            self.synchronize_existing_scale_set_delivery_stage(staged_delivery)?;
+                        }
+                        None => return remove_uncommitted_delivery_stage(self),
+                        Some(_) => return Err(PersonalWorkerStoreError::corrupt_state()),
+                    }
+                } else if resolution.matches_catalog(&current_catalog) {
+                    if let Some(staged) = staged_catalog {
+                        if staged != current_catalog {
+                            return Err(PersonalWorkerStoreError::corrupt_state());
+                        }
+                        self.remove_catalog_stage().map_err(map_catalog_error)?;
+                    }
+                    self.synchronize_existing_scale_set_delivery_stage(staged_delivery)?;
+                } else {
+                    return Err(PersonalWorkerStoreError::corrupt_state());
+                }
+                let mut delivery_guard = StagedDocument::existing(
+                    self.directory.as_fd(),
+                    STAGED_DELIVERY_RECOVERY_DOCUMENT,
+                );
+                return self.publish_named_staged(
+                    &mut delivery_guard,
+                    DELIVERY_RECOVERY_DOCUMENT,
+                    false,
+                );
+            }
             if !current_delivery.matches_catalog(&current_catalog) {
                 return Err(PersonalWorkerStoreError::corrupt_state());
             }

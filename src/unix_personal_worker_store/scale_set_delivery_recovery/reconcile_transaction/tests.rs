@@ -216,6 +216,46 @@ fn write_private(path: &Path, bytes: &[u8]) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("set private fixture mode");
 }
 
+fn prepare_ambiguous(
+    root: &TempRoot,
+    message_id: u32,
+    request_id: u64,
+) -> ScaleSetDeliveryRecoveryState {
+    let current = DisposableAttemptCatalog::new(
+        UnixPersonalWorkerStore::open_or_create_disposable_catalog(root.path())
+            .expect("open catalog"),
+    )
+    .load()
+    .expect("load catalog");
+    let mut paired =
+        UnixPersonalWorkerStore::open_or_create_scale_set_reconcile_transaction(root.path())
+            .expect("open paired transaction");
+    let initial = paired
+        .publish_scale_set_reconciled_delivery(
+            current.revision(),
+            &consumer_policy(),
+            &delivery(message_id, request_id),
+            observed_at(),
+        )
+        .expect("publish available delivery")
+        .1;
+    drop(paired);
+    let started = initial.begin_ack().expect("begin acknowledgement");
+    let ambiguous = started
+        .record_recovery_acquire(&[])
+        .expect("record empty recovery acquisition");
+    let mut store =
+        UnixPersonalWorkerStore::open_or_create_scale_set_delivery_recovery(root.path())
+            .expect("open recovery store");
+    store
+        .replace_scale_set_delivery_recovery(initial.revision(), &started)
+        .expect("publish acknowledgement start");
+    store
+        .replace_scale_set_delivery_recovery(started.revision(), &ambiguous)
+        .expect("publish empty acquisition evidence");
+    ambiguous
+}
+
 #[test]
 fn publishes_catalog_and_delivery_under_one_recoverable_transaction() {
     let root = TempRoot::new("publish");
@@ -254,6 +294,123 @@ fn publishes_catalog_and_delivery_under_one_recoverable_transaction() {
             .expect("load delivery recovery"),
         Some(recovery)
     );
+}
+
+#[test]
+fn lifecycle_resolution_replaces_the_original_fence_without_changing_reserved_capacity() {
+    let root = TempRoot::new("lifecycle-resolution");
+    initialize_catalog(&root);
+    let ambiguous = prepare_ambiguous(&root, 70, 91);
+    let assigned = delivery_with_events(71, vec![ScaleSetBridgeEvent::Assigned(job(91))]);
+    let mut store =
+        UnixPersonalWorkerStore::open_or_create_scale_set_reconcile_transaction(root.path())
+            .expect("open resolution transaction");
+    let resolved = store
+        .publish_scale_set_lifecycle_resolution(&ambiguous, &consumer_policy(), &assigned)
+        .expect("publish lifecycle resolution");
+    assert!(matches!(
+        resolved.phase(),
+        ScaleSetDeliveryRecoveryPhase::LifecycleReconciled { resolution }
+            if resolution.delivery() == &assigned && resolution.acquired().len() == 1
+    ));
+    let catalog = store
+        .load_catalog_named(CATALOG_DOCUMENT)
+        .expect("load catalog")
+        .expect("catalog exists");
+    assert_eq!(catalog.active().len(), 1);
+    assert!(resolved.matches_catalog(&catalog));
+}
+
+#[test]
+fn assigned_resolution_recovers_delivery_after_directory_sync_ambiguity() {
+    let root = TempRoot::new("lifecycle-assigned-recovery");
+    initialize_catalog(&root);
+    let ambiguous = prepare_ambiguous(&root, 75, 96);
+    let assigned = delivery_with_events(76, vec![ScaleSetBridgeEvent::Assigned(job(96))]);
+    let mut store =
+        UnixPersonalWorkerStore::open_or_create_scale_set_reconcile_transaction(root.path())
+            .expect("open resolution transaction");
+    let fault = inject_publication_fault(PublicationFaultPoint::PublicationDirectorySync);
+    assert_eq!(
+        store
+            .publish_scale_set_lifecycle_resolution(&ambiguous, &consumer_policy(), &assigned,)
+            .expect_err("directory sync ambiguity")
+            .kind(),
+        PersonalWorkerStoreErrorKind::Io
+    );
+    drop(fault);
+    drop(store);
+
+    let reopened =
+        UnixPersonalWorkerStore::open_or_create_scale_set_reconcile_transaction(root.path())
+            .expect("recover lifecycle delivery");
+    let catalog = reopened
+        .load_catalog_named(CATALOG_DOCUMENT)
+        .expect("load catalog")
+        .expect("catalog exists");
+    assert_eq!(catalog.active().len(), 1);
+    let recovery = reopened
+        .load_scale_set_delivery_recovery()
+        .expect("load recovery")
+        .expect("recovery exists");
+    assert!(matches!(
+        recovery.phase(),
+        ScaleSetDeliveryRecoveryPhase::LifecycleReconciled { resolution }
+            if resolution.delivery() == &assigned
+    ));
+    assert!(recovery.matches_catalog(&catalog));
+}
+
+#[test]
+fn canceled_resolution_recovers_catalog_then_recovery_after_directory_sync_ambiguity() {
+    let root = TempRoot::new("lifecycle-cancel-recovery");
+    initialize_catalog(&root);
+    let ambiguous = prepare_ambiguous(&root, 80, 101);
+    let canceled = delivery_with_events(
+        81,
+        vec![ScaleSetBridgeEvent::Completed {
+            job: job(101),
+            runner: None,
+            result: ScaleSetJobResult::parse("canceled").expect("result"),
+        }],
+    );
+    let mut store =
+        UnixPersonalWorkerStore::open_or_create_scale_set_reconcile_transaction(root.path())
+            .expect("open resolution transaction");
+    let fault = inject_publication_fault(PublicationFaultPoint::PublicationDirectorySync);
+    assert_eq!(
+        store
+            .publish_scale_set_lifecycle_resolution(&ambiguous, &consumer_policy(), &canceled,)
+            .expect_err("directory sync ambiguity")
+            .kind(),
+        PersonalWorkerStoreErrorKind::Io
+    );
+    drop(fault);
+    drop(store);
+
+    let reopened =
+        UnixPersonalWorkerStore::open_or_create_scale_set_reconcile_transaction(root.path())
+            .expect("recover lifecycle pair");
+    let catalog = reopened
+        .load_catalog_named(CATALOG_DOCUMENT)
+        .expect("load catalog")
+        .expect("catalog exists");
+    assert!(catalog.active().is_empty());
+    assert!(
+        catalog
+            .find_tombstone_by_runner_request_id(ScaleSetRunnerRequestId::new(101).unwrap())
+            .is_some()
+    );
+    let recovery = reopened
+        .load_scale_set_delivery_recovery()
+        .expect("load recovery")
+        .expect("recovery exists");
+    assert!(matches!(
+        recovery.phase(),
+        ScaleSetDeliveryRecoveryPhase::LifecycleReconciled { resolution }
+            if resolution.delivery() == &canceled
+    ));
+    assert!(recovery.matches_catalog(&catalog));
 }
 
 #[test]

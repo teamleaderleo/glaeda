@@ -24,6 +24,7 @@ use crate::unix_personal_worker_store::scale_set_delivery_recovery::ScaleSetExte
 /// The production implementation delegates protocol semantics to the pinned official-client
 /// bridge. The trait remains private so callers cannot substitute external mutation authority.
 trait DeliveryBridge {
+    fn resume_after(&mut self, last_acked_message_id: u32) -> Result<(), ScaleSetBridgeError>;
     fn poll(&mut self, available_capacity: u16) -> Result<ScaleSetBridgePoll, ScaleSetBridgeError>;
     fn ack(&mut self, message_id: u32) -> Result<Vec<u64>, ScaleSetBridgeError>;
     fn acquire(
@@ -34,6 +35,10 @@ trait DeliveryBridge {
 }
 
 impl DeliveryBridge for ScaleSetBridgeClient {
+    fn resume_after(&mut self, last_acked_message_id: u32) -> Result<(), ScaleSetBridgeError> {
+        self.resume_after(last_acked_message_id)
+    }
+
     fn poll(&mut self, available_capacity: u16) -> Result<ScaleSetBridgePoll, ScaleSetBridgeError> {
         self.poll(available_capacity)
     }
@@ -66,7 +71,8 @@ pub(crate) enum ScaleSetDeliveryControllerDisposition {
 /// A new message is reconciled and published before acknowledgement begins. A durable
 /// `AcknowledgementStarted` phase is never replayed through `ack`; a fresh bridge may only invoke
 /// standalone acquisition for the exact retained available request IDs. Empty acquisition replay
-/// stays explicit recovery debt for later service lifecycle evidence.
+/// restores the original cursor and admits only zero-capacity lifecycle evidence; exact assignment
+/// or runnerless cancellation then replaces the original fence before its own acknowledgement.
 pub(crate) fn consume_scale_set_delivery_once(
     root_path: &Path,
     policy: &ScaleSetDeliveryConsumerPolicy,
@@ -188,12 +194,12 @@ fn resume_delivery<B: DeliveryBridge>(
             acknowledge_delivery(recovery_store, bridge, current)
         }
         ScaleSetDeliveryRecoveryPhase::AcknowledgementStarted => {
-            recover_acquisition(recovery_store, bridge, current)
+            recover_acquisition(root_path, policy, recovery_store, bridge, current)
         }
         ScaleSetDeliveryRecoveryPhase::AcquisitionRecoveryObserved { acquired }
             if acquired.is_empty() =>
         {
-            recover_acquisition(recovery_store, bridge, current)
+            observe_lifecycle_resolution(root_path, policy, recovery_store, bridge, current)
         }
         ScaleSetDeliveryRecoveryPhase::AcquisitionRecoveryObserved { acquired } => {
             Ok(settle_delivery(recovery_store, &current, acquired.len())?)
@@ -201,6 +207,15 @@ fn resume_delivery<B: DeliveryBridge>(
         ScaleSetDeliveryRecoveryPhase::Acknowledged { acquired } => {
             Ok(settle_delivery(recovery_store, &current, acquired.len())?)
         }
+        ScaleSetDeliveryRecoveryPhase::LifecycleReconciled { .. }
+        | ScaleSetDeliveryRecoveryPhase::LifecycleAcknowledgementStarted { .. } => {
+            recover_lifecycle_ack(recovery_store, bridge, current)
+        }
+        ScaleSetDeliveryRecoveryPhase::LifecycleAcknowledged { resolution } => Ok(settle_delivery(
+            recovery_store,
+            &current,
+            resolution.acquired().len(),
+        )?),
         ScaleSetDeliveryRecoveryPhase::SettlementPrepared { acquired, .. } => {
             Ok(settle_delivery(recovery_store, &current, acquired.len())?)
         }
@@ -257,6 +272,8 @@ fn acknowledge_delivery<B: DeliveryBridge>(
 }
 
 fn recover_acquisition<B: DeliveryBridge>(
+    root_path: &Path,
+    policy: &ScaleSetDeliveryConsumerPolicy,
     store: &mut UnixPersonalWorkerStore,
     bridge: &mut B,
     current: ScaleSetDeliveryRecoveryState,
@@ -283,10 +300,150 @@ fn recover_acquisition<B: DeliveryBridge>(
         return Err(controller_error("scale_set_delivery_recovery_conflict"));
     };
     if acquired.is_empty() {
-        Ok(ScaleSetDeliveryControllerDisposition::RecoveryRequired)
+        observe_lifecycle_resolution(root_path, policy, store, bridge, successor)
     } else {
         settle_delivery(store, &successor, acquired.len())
     }
+}
+
+fn observe_lifecycle_resolution<B: DeliveryBridge>(
+    root_path: &Path,
+    policy: &ScaleSetDeliveryConsumerPolicy,
+    store: &mut UnixPersonalWorkerStore,
+    bridge: &mut B,
+    current: ScaleSetDeliveryRecoveryState,
+) -> Result<ScaleSetDeliveryControllerDisposition, ScaleSetDeliveryControllerError> {
+    bridge
+        .resume_after(current.delivery().message_id())
+        .map_err(map_bridge_error)?;
+    let poll = bridge.poll(0).map_err(map_bridge_error)?;
+    let delivery = match ScaleSetDelivery::from_bridge_poll(&poll) {
+        Ok(Some(delivery)) => delivery,
+        Ok(None) => {
+            // The next attempt requires a fresh bridge because resume is intentionally one-shot.
+            bridge.poison();
+            return Ok(ScaleSetDeliveryControllerDisposition::RecoveryRequired);
+        }
+        Err(_) => {
+            bridge.poison();
+            return Err(controller_error("scale_set_delivery_invalid"));
+        }
+    };
+    let mut paired =
+        UnixPersonalWorkerStore::open_or_create_scale_set_reconcile_transaction(root_path)
+            .map_err(|error| {
+                bridge.poison();
+                map_store_error(error)
+            })?;
+    let resolved = paired
+        .publish_scale_set_lifecycle_resolution(&current, policy, &delivery)
+        .map_err(|error| {
+            bridge.poison();
+            map_store_error(error)
+        })?;
+    drop(paired);
+    acknowledge_lifecycle(store, bridge, resolved)
+}
+
+fn recover_lifecycle_ack<B: DeliveryBridge>(
+    store: &mut UnixPersonalWorkerStore,
+    bridge: &mut B,
+    current: ScaleSetDeliveryRecoveryState,
+) -> Result<ScaleSetDeliveryControllerDisposition, ScaleSetDeliveryControllerError> {
+    let resolution_delivery = current
+        .lifecycle_resolution()
+        .ok_or_else(|| controller_error("scale_set_delivery_recovery_conflict"))?
+        .delivery()
+        .clone();
+    let acknowledgement_started = matches!(
+        current.phase(),
+        ScaleSetDeliveryRecoveryPhase::LifecycleAcknowledgementStarted { .. }
+    );
+    bridge
+        .resume_after(current.delivery().message_id())
+        .map_err(map_bridge_error)?;
+    let poll = bridge.poll(0).map_err(map_bridge_error)?;
+    let redelivered = match ScaleSetDelivery::from_bridge_poll(&poll) {
+        Ok(Some(delivery)) => delivery,
+        Ok(None) if acknowledgement_started => {
+            bridge.poison();
+            return confirm_lifecycle_ack(store, current);
+        }
+        Ok(None) => {
+            bridge.poison();
+            return Ok(ScaleSetDeliveryControllerDisposition::RecoveryRequired);
+        }
+        Err(_) => {
+            bridge.poison();
+            return Err(controller_error("scale_set_delivery_invalid"));
+        }
+    };
+    if redelivered == resolution_delivery {
+        return acknowledge_lifecycle(store, bridge, current);
+    }
+    if acknowledgement_started
+        && redelivered.message_id() > resolution_delivery.message_id()
+        && redelivered
+            .available_request_ids()
+            .map_err(|_| controller_error("scale_set_delivery_invalid"))?
+            .is_empty()
+    {
+        // The later message remains unacknowledged. Terminating this bridge makes it redeliver to
+        // the next fresh controller session after the prior acknowledgement is settled.
+        bridge.poison();
+        return confirm_lifecycle_ack(store, current);
+    }
+    bridge.poison();
+    Err(controller_error("scale_set_delivery_recovery_conflict"))
+}
+
+fn confirm_lifecycle_ack(
+    store: &mut UnixPersonalWorkerStore,
+    current: ScaleSetDeliveryRecoveryState,
+) -> Result<ScaleSetDeliveryControllerDisposition, ScaleSetDeliveryControllerError> {
+    let acknowledged = store
+        .confirm_scale_set_lifecycle_acknowledged_locked(&current)
+        .map_err(map_store_error)?;
+    let acquired = acknowledged
+        .lifecycle_resolution()
+        .ok_or_else(|| controller_error("scale_set_delivery_recovery_conflict"))?
+        .acquired()
+        .len();
+    settle_delivery(store, &acknowledged, acquired)
+}
+
+fn acknowledge_lifecycle<B: DeliveryBridge>(
+    store: &mut UnixPersonalWorkerStore,
+    bridge: &mut B,
+    current: ScaleSetDeliveryRecoveryState,
+) -> Result<ScaleSetDeliveryControllerDisposition, ScaleSetDeliveryControllerError> {
+    let transaction = store
+        .acknowledge_scale_set_lifecycle_locked(&current, |message_id| {
+            bridge
+                .ack(message_id)
+                .map_err(map_bridge_error)
+                .and_then(|acquired| {
+                    if acquired.is_empty() {
+                        Ok(Vec::new())
+                    } else {
+                        Err(controller_error("scale_set_ack_response_invalid"))
+                    }
+                })
+        })
+        .map_err(map_store_error)?;
+    let acknowledged = match transaction {
+        ScaleSetExternalTransaction::Completed(state) => state,
+        ScaleSetExternalTransaction::ExternalFailed(error) => {
+            bridge.poison();
+            return Err(error);
+        }
+    };
+    let acquired = acknowledged
+        .lifecycle_resolution()
+        .ok_or_else(|| controller_error("scale_set_delivery_recovery_conflict"))?
+        .acquired()
+        .len();
+    settle_delivery(store, &acknowledged, acquired)
 }
 
 fn settle_delivery(
