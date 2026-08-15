@@ -147,8 +147,8 @@ secret standard-input line to a fixed template-bound guest launcher, without pla
 argv, the inherited environment, logs, Debug, serialization, or an ordinary copied `String`. The
 launcher sets only the official runner's JIT input and hosted-result switch immediately before
 `exec`. The plan fixes the Lima shell, guest `sudo`, launcher, work directory, and empty inherited
-environment, and binds the candidate to the exact
-durable attempt, cloned VM identity, runner name, runner ID, and deadline. It intentionally exposes
+environment, and binds the candidate to the exact durable attempt, cloned VM identity, runner name,
+runner ID, and deadline. It intentionally exposes
 no execution path yet: the production service must still freshly prove the complete target ready,
 durably record the GitHub registration, publish a no-replay runner-start checkpoint, and only then
 consume the command. No operator enrollment path, executable guest handoff, terminal cleanup, or
