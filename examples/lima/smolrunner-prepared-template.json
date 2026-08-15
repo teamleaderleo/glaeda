@@ -19,8 +19,8 @@
     "disk_bytes": 21474836480
   },
   "provisioning": {
-    "recipe_revision": 3,
-    "lima_template_digest": "sha256:7adc6bf690b4604c555b32c333d97fe8df0641b69976604f4826076244bc0e2c",
+    "recipe_revision": 4,
+    "lima_template_digest": "sha256:39b371c566c150d8d2806f351dab08924f654609fcdb785f67762ab8852fb638",
     "admin_user": "smolrunner-admin",
     "admin_uid": 1000,
     "admin_comment": "SmolRunner controller",

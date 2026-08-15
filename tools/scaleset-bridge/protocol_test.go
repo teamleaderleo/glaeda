@@ -392,6 +392,27 @@ func TestJITRevalidatesScaleSetPolicyBeforeAndAfterMutation(t *testing.T) {
 	}
 }
 
+func TestObserveRunnerDistinguishesProvenAbsenceFromExactPresence(t *testing.T) {
+	backend := &fakeBackend{}
+	server := startedServer(t, backend)
+	absent := server.handle(context.Background(), protocolRequest{Version: protocolVersion, Operation: "observe_runner", RunnerName: "smolrunner-job-1"})
+	if absent.Type != "runner_absent" || absent.Runner != nil {
+		t.Fatalf("absent response=%#v", absent)
+	}
+
+	backend.runner = &scaleset.RunnerReference{ID: 81, Name: "smolrunner-job-1", RunnerScaleSetID: 23}
+	present := server.handle(context.Background(), protocolRequest{Version: protocolVersion, Operation: "observe_runner", RunnerName: "smolrunner-job-1"})
+	if present.Type != "runner" || present.Runner == nil || present.Runner.ID != 81 || present.Runner.Name != "smolrunner-job-1" {
+		t.Fatalf("present response=%#v", present)
+	}
+
+	backend.runner.Name = "replacement"
+	refused := server.handle(context.Background(), protocolRequest{Version: protocolVersion, Operation: "observe_runner", RunnerName: "smolrunner-job-1"})
+	if refused.Code != "runner_unavailable" || refused.Runner != nil {
+		t.Fatalf("rebound response=%#v", refused)
+	}
+}
+
 func TestRawMessageGateRejectsUnknownLifecycleBeforeOfficialParser(t *testing.T) {
 	statistics := `{"totalAvailableJobs":0,"totalAcquiredJobs":0,"totalAssignedJobs":0,"totalRunningJobs":0,"totalRegisteredRunners":0,"totalBusyRunners":0,"totalIdleRunners":0}`
 	knownBody, err := json.Marshal([]map[string]any{{

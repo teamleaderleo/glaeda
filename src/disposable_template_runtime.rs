@@ -25,6 +25,7 @@ use crate::disposable_template_generation::{
     DisposableTemplatePriorOperationState, DisposableTemplateSourceIdentity,
     reconcile_disposable_template_generation, runtime_disposable_template_observation,
 };
+use crate::disposable_worker_reconciler::DisposableWorkerResources;
 use crate::lima_host_identity::{LimaHostIdentityAdapter, LimaHostIdentityObservation};
 use crate::lima_observation::{
     LIMACTL_SAFE_HOME, LimaArchitecture, LimaGuestObservation, LimaInstanceName,
@@ -47,12 +48,14 @@ const CREATE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const STOP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const DISCARD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const GUEST_CACHE_PATH: &str = "/var/lib/smolrunner-runner/work";
-const RUNNER_LISTENER: &str = "/opt/smolrunner/actions-runner/bin/Runner.Listener";
 const JIT_LAUNCHER: &str = "/opt/smolrunner/bin/smolrunner-jit-launcher";
 const JIT_LAUNCHER_BYTES: &[u8] = include_bytes!("../examples/lima/smolrunner-jit-launcher");
+const RUNNER_INTEGRITY: &str = "/opt/smolrunner/bin/smolrunner-runner-integrity";
+const RUNNER_INTEGRITY_BYTES: &[u8] =
+    include_bytes!("../examples/lima/smolrunner-runner-integrity");
 const RUNNER_USER: &str = "smolrunner-runner";
-const EXPECTED_RUNNER_VERSION: &str = "2.336.0\n";
 const EXPECTED_RUNNER_GROUPS: &str = "smolrunner-runner\n";
+const EXPECTED_RUNNER_INTEGRITY: &str = "smolrunner-runner-integrity-ok\n";
 const APT_POLICY_PATH: &str = "/etc/apt/apt.conf.d/99-smolrunner-no-automatic-updates";
 const APT_POLICY_BYTES: &[u8] = b"APT::Periodic::Enable \"0\";\nAPT::Periodic::Update-Package-Lists \"0\";\nAPT::Periodic::Unattended-Upgrade \"0\";\n";
 const MASKED_APT_UNITS: [&str; 4] = [
@@ -543,6 +546,12 @@ mod tests {
         assert!(template.contains(&format!(
             "readonly jit_launcher_sha256=\"{launcher_digest}\""
         )));
+        let integrity_digest = format!("{:x}", Sha256::digest(RUNNER_INTEGRITY_BYTES));
+        assert!(template.contains(&format!(
+            "readonly integrity_verifier_sha256=\"{integrity_digest}\""
+        )));
+        assert!(template.contains("/usr/bin/chown -R root:root \"${install_stage}\""));
+        assert!(template.contains("/usr/bin/chmod 1775 \"${install_stage}\""));
     }
 
     #[test]
@@ -894,6 +903,83 @@ impl DisposableTemplateRuntime {
         })
     }
 
+    /// Reconfirm one running disposable clone against the prepared-template isolation policy.
+    #[allow(dead_code)] // Consumed by the pending production runner-service composition.
+    pub(crate) fn confirm_running_clone_target(
+        &self,
+        request: &LimaObservationRequest,
+        resources: DisposableWorkerResources,
+        executor: &impl TimedCommandExecutor,
+        clock: &impl LimaObservationClock,
+    ) -> Result<LimaHostIdentityObservation, DisposableTemplateRuntimeError> {
+        let composite_started = clock
+            .unix_seconds()
+            .map_err(|_| observation_failure("template_observation_clock_failed"))?;
+        self.verify_limactl(executor)?;
+        let bounded = BoundedExecutor { executor };
+        let adapter = LimaObservationAdapter::new(&self.limactl_program)
+            .map_err(|_| invalid_configuration())?;
+        let observed = adapter
+            .observe(request, &bounded, clock)
+            .map_err(|error| observation_error(&error))?;
+        let report = observed.report();
+        let expected_cpus = u16::try_from(resources.cpu_millis() / 1_000)
+            .map_err(|_| observation_failure("template_clone_resources_invalid"))?;
+        if !resources.cpu_millis().is_multiple_of(1_000)
+            || !resources.memory_bytes().is_multiple_of(1 << 30)
+            || !resources.disk_bytes().is_multiple_of(1 << 30)
+            || report.configured.runtime_state != LimaRuntimeState::Running
+            || report.configured.cpus != expected_cpus
+            || report.configured.memory_bytes != resources.memory_bytes()
+            || report.configured.primary_disk_bytes != resources.disk_bytes()
+            || !matches!(report.guest, LimaGuestObservation::Observed(_))
+        {
+            return Err(observation_failure(
+                "template_clone_resources_or_state_mismatch",
+            ));
+        }
+
+        let expected_config = self.validated_clone_config(resources, executor)?;
+        let first_config = self.observed_instance_config_for(request.instance(), executor)?;
+        if first_config.runtime_state != LimaRuntimeState::Running
+            || first_config.config != expected_config
+            || !self.ready_probe_for(request.instance(), executor)?
+        {
+            return Err(observation_failure("template_clone_policy_mismatch"));
+        }
+        let host = LimaHostIdentityAdapter
+            .observe(request)
+            .map_err(|_| observation_failure("template_host_identity_unavailable"))?;
+        if host.root_disk_bytes() != resources.disk_bytes() {
+            return Err(observation_failure("template_host_disk_mismatch"));
+        }
+        host.confirm(request)
+            .map_err(|_| observation_failure("template_host_identity_drift"))?;
+
+        let middle_config = self.observed_instance_config_for(request.instance(), executor)?;
+        let final_observed = adapter
+            .observe(request, &bounded, clock)
+            .map_err(|error| observation_error(&error))?;
+        if final_observed.report().configured != report.configured
+            || final_observed.report().guest != report.guest
+        {
+            return Err(observation_failure("template_composite_observation_drift"));
+        }
+        let final_config = self.observed_instance_config_for(request.instance(), executor)?;
+        self.verify_limactl(executor)?;
+        if !exact_realized_config_matches(
+            &expected_config,
+            [&first_config, &middle_config, &final_config],
+        ) || final_config.runtime_state != LimaRuntimeState::Running
+        {
+            return Err(observation_failure("template_clone_policy_mismatch"));
+        }
+        host.confirm(request)
+            .map_err(|_| observation_failure("template_host_identity_drift"))?;
+        ensure_composite_observation_fresh(clock, composite_started)?;
+        Ok(host)
+    }
+
     fn validate_document_identity(
         &self,
         document: &DisposableTemplateGenerationDocument,
@@ -1058,30 +1144,54 @@ impl DisposableTemplateRuntime {
         &self,
         executor: &impl TimedCommandExecutor,
     ) -> Result<bool, DisposableTemplateRuntimeError> {
+        self.ready_probe_for(&self.source_instance, executor)
+    }
+
+    fn ready_probe_for(
+        &self,
+        instance: &LimaInstanceName,
+        executor: &impl TimedCommandExecutor,
+    ) -> Result<bool, DisposableTemplateRuntimeError> {
         let marker_digest = format!("{:x}", Sha256::digest(READY_MARKER_BYTES));
         let expected_marker = format!(
             "{marker_digest}  {}\n",
             self.prepared_template.ready_marker_path()
         );
         let marker = self
-            .guest_command("/usr/bin/sha256sum")
+            .guest_command_for(instance, "/usr/bin/sha256sum")
             .argument(self.prepared_template.ready_marker_path());
         if !command_matches(executor, &marker, OBSERVATION_TIMEOUT, &expected_marker)? {
             return Ok(false);
         }
-        let version = self.guest_command(RUNNER_LISTENER).argument("--version");
+        let integrity_digest = format!("{:x}", Sha256::digest(RUNNER_INTEGRITY_BYTES));
+        let expected_integrity = format!("{integrity_digest}  {RUNNER_INTEGRITY}\n");
+        let integrity_file = self
+            .guest_command_for(instance, "/usr/bin/sha256sum")
+            .argument(RUNNER_INTEGRITY);
         if !command_matches(
             executor,
-            &version,
+            &integrity_file,
             OBSERVATION_TIMEOUT,
-            EXPECTED_RUNNER_VERSION,
+            &expected_integrity,
+        )? {
+            return Ok(false);
+        }
+        let integrity = self
+            .guest_command_for(instance, "/usr/bin/sudo")
+            .argument("--non-interactive")
+            .argument(RUNNER_INTEGRITY);
+        if !command_matches(
+            executor,
+            &integrity,
+            OBSERVATION_TIMEOUT,
+            EXPECTED_RUNNER_INTEGRITY,
         )? {
             return Ok(false);
         }
         let launcher_digest = format!("{:x}", Sha256::digest(JIT_LAUNCHER_BYTES));
         let expected_launcher = format!("{launcher_digest}  {JIT_LAUNCHER}\n");
         let launcher = self
-            .guest_command("/usr/bin/sha256sum")
+            .guest_command_for(instance, "/usr/bin/sha256sum")
             .argument(JIT_LAUNCHER);
         if !command_matches(executor, &launcher, OBSERVATION_TIMEOUT, &expected_launcher)? {
             return Ok(false);
@@ -1089,7 +1199,7 @@ impl DisposableTemplateRuntime {
         let apt_policy_digest = format!("{:x}", Sha256::digest(APT_POLICY_BYTES));
         let expected_apt_policy = format!("{apt_policy_digest}  {APT_POLICY_PATH}\n");
         let apt_policy = self
-            .guest_command("/usr/bin/sha256sum")
+            .guest_command_for(instance, "/usr/bin/sha256sum")
             .argument(APT_POLICY_PATH);
         if !command_matches(
             executor,
@@ -1101,7 +1211,7 @@ impl DisposableTemplateRuntime {
         }
         for unit in MASKED_APT_UNITS {
             let masked = self
-                .guest_command("/usr/bin/systemctl")
+                .guest_command_for(instance, "/usr/bin/systemctl")
                 .argument("is-enabled")
                 .argument(unit);
             if !command_matches_status(
@@ -1116,7 +1226,7 @@ impl DisposableTemplateRuntime {
             }
         }
         let groups = self
-            .guest_command("/usr/bin/id")
+            .guest_command_for(instance, "/usr/bin/id")
             .argument("-Gn")
             .argument(RUNNER_USER);
         command_matches(
@@ -1161,8 +1271,49 @@ impl DisposableTemplateRuntime {
         Ok(value)
     }
 
+    #[allow(dead_code)] // Consumed through the pending production runner-service composition.
+    fn validated_clone_config(
+        &self,
+        resources: DisposableWorkerResources,
+        executor: &impl TimedCommandExecutor,
+    ) -> Result<serde_json::Value, DisposableTemplateRuntimeError> {
+        const GIB: u64 = 1 << 30;
+        if !resources.cpu_millis().is_multiple_of(1_000)
+            || !resources.memory_bytes().is_multiple_of(GIB)
+            || !resources.disk_bytes().is_multiple_of(GIB)
+        {
+            return Err(observation_failure("template_clone_resources_invalid"));
+        }
+        let mut config = self.validated_template_config(executor)?;
+        let object = config
+            .as_object_mut()
+            .ok_or_else(|| observation_failure("template_normalized_config_invalid"))?;
+        object.insert(
+            "cpus".to_owned(),
+            serde_json::json!(resources.cpu_millis() / 1_000),
+        );
+        object.insert(
+            "memory".to_owned(),
+            serde_json::json!(format!("{}GiB", resources.memory_bytes() / GIB)),
+        );
+        object.insert(
+            "disk".to_owned(),
+            serde_json::json!(format!("{}GiB", resources.disk_bytes() / GIB)),
+        );
+        object.insert("mounts".to_owned(), serde_json::json!([]));
+        Ok(config)
+    }
+
     fn observed_instance_config(
         &self,
+        executor: &impl TimedCommandExecutor,
+    ) -> Result<RealizedInstanceConfig, DisposableTemplateRuntimeError> {
+        self.observed_instance_config_for(&self.source_instance, executor)
+    }
+
+    fn observed_instance_config_for(
+        &self,
+        instance: &LimaInstanceName,
         executor: &impl TimedCommandExecutor,
     ) -> Result<RealizedInstanceConfig, DisposableTemplateRuntimeError> {
         let command = self
@@ -1170,7 +1321,7 @@ impl DisposableTemplateRuntime {
             .argument("list")
             .argument("--format=json")
             .argument("--all-fields")
-            .argument(self.source_instance.as_str());
+            .argument(instance.as_str());
         let output = exact_observation_output(executor, &command)?;
         let line = output
             .strip_suffix('\n')
@@ -1185,7 +1336,7 @@ impl DisposableTemplateRuntime {
             .get("name")
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| observation_failure("template_realized_config_invalid"))?;
-        if name != self.source_instance.as_str()
+        if name != instance.as_str()
             || object
                 .get("errors")
                 .is_some_and(|errors| errors.as_array().is_none_or(|items| !items.is_empty()))
@@ -1293,10 +1444,10 @@ impl DisposableTemplateRuntime {
             .environment("LC_ALL", "C")
     }
 
-    fn guest_command(&self, program: &str) -> CommandSpec {
+    fn guest_command_for(&self, instance: &LimaInstanceName, program: &str) -> CommandSpec {
         self.base_command()
             .argument("shell")
-            .argument(self.source_instance.as_str())
+            .argument(instance.as_str())
             .argument("--")
             .argument(program)
     }

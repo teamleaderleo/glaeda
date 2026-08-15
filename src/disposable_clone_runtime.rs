@@ -491,6 +491,52 @@ impl DisposableCloneRuntime {
         })
     }
 
+    /// Reconfirm the exact running clone and its realized isolation policy before JIT handoff.
+    #[allow(dead_code)] // Consumed by the pending production runner-service composition.
+    pub(crate) fn confirm_ready_worker(
+        &self,
+        reservation: &DisposableAttemptReservation,
+        executor: &impl TimedCommandExecutor,
+        clock: &impl CloneRuntimeClock,
+    ) -> Result<ConfirmedDisposableWorker, DisposableCloneRuntimeError> {
+        let attempt = reservation.attempt();
+        if !matches!(
+            attempt.phase(),
+            DisposableAttemptPhase::Registering | DisposableAttemptPhase::Assigned
+        ) {
+            return Err(DisposableCloneRuntimeError::recovery(
+                "clone_worker_phase_mismatch",
+            ));
+        }
+        let expected_identity = attempt.vm_identity().ok_or_else(|| {
+            DisposableCloneRuntimeError::recovery("clone_worker_identity_missing")
+        })?;
+        let prepared_template_identity = current_disposable_prepared_template()
+            .and_then(|manifest| manifest.identity())
+            .map_err(|_| invalid_configuration("clone_prepared_template_invalid"))?;
+        if reservation.prepared_template_identity() != &prepared_template_identity {
+            return Err(DisposableCloneRuntimeError::recovery(
+                "clone_prepared_template_drift",
+            ));
+        }
+        let request = self
+            .worker
+            .target_observation_request(reservation)
+            .map_err(|_| invalid_configuration("clone_target_request_invalid"))?;
+        let host = self
+            .template_runtime
+            .confirm_running_clone_target(&request, reservation.resources(), executor, clock)
+            .map_err(|_| observation("clone_worker_not_ready"))?;
+        if &DisposableVmIdentity::from_host_identity(host.identity()) != expected_identity {
+            return Err(DisposableCloneRuntimeError::recovery(
+                "clone_worker_identity_drift",
+            ));
+        }
+        host.confirm(&request)
+            .map_err(|_| observation("clone_worker_identity_drift"))?;
+        Ok(ConfirmedDisposableWorker { host, request })
+    }
+
     fn verify_limactl(
         &self,
         executor: &impl TimedCommandExecutor,
@@ -537,6 +583,22 @@ pub(crate) struct PreparedClone {
     target_request: LimaObservationRequest,
     source: ConfirmedDisposableCloneSource,
     generation: DisposableTemplateGenerationDocument,
+}
+
+/// Descriptor-retaining proof of the exact disposable target observed ready for JIT handoff.
+#[allow(dead_code)] // Consumed by the pending production runner-service composition.
+pub(crate) struct ConfirmedDisposableWorker {
+    host: crate::lima_host_identity::LimaHostIdentityObservation,
+    request: LimaObservationRequest,
+}
+
+impl ConfirmedDisposableWorker {
+    #[allow(dead_code)] // Consumed by the pending production runner-service composition.
+    pub(crate) fn confirm_current(&self) -> Result<(), DisposableCloneRuntimeError> {
+        self.host
+            .confirm(&self.request)
+            .map_err(|_| observation("clone_worker_identity_drift"))
+    }
 }
 
 pub(crate) trait CloneRuntimeClock: LimaObservationClock {
@@ -644,6 +706,9 @@ mod tests {
     };
     use crate::disposable_attempt_state::DisposableAttemptState;
     use crate::disposable_prepared_template::current_disposable_prepared_template;
+    use crate::disposable_runner_runtime::{
+        DisposableRunnerRegistrationSource, DisposableRunnerRuntime, DisposableRunnerRuntimeError,
+    };
     use crate::disposable_template_generation::{
         DisposableTemplateGenerationAction, DisposableTemplateObjectIdentity,
         encode_disposable_template_generation,
@@ -651,9 +716,15 @@ mod tests {
     use crate::disposable_worker_reconciler::{
         CapacityClaimId, DisposableVmId, DisposableWorkerResources,
     };
-    use crate::github_scale_set_protocol::{ScaleSetRunnerName, ScaleSetRunnerRequestId};
+    use crate::github_scale_set_bridge::{
+        EncodedJitConfig, ScaleSetJitReceipt, ScaleSetRunnerLookup,
+    };
+    use crate::github_scale_set_protocol::{
+        ScaleSetRunnerId, ScaleSetRunnerName, ScaleSetRunnerReference, ScaleSetRunnerRequestId,
+    };
     use crate::lima_observation::{LimaArchitecture, LimaVmType};
     use crate::unix_personal_worker_store::STORE_DIRECTORY;
+    use crate::unix_personal_worker_store::disposable_runner_transaction::DisposableRunnerTransactionOutcome;
 
     #[allow(dead_code)]
     mod lima_host_identity_support {
@@ -759,6 +830,9 @@ mod tests {
         host: &'a LimaHostIdentityFixture,
         calls: RefCell<Vec<Vec<String>>>,
         fail_clone: bool,
+        fail_runner: bool,
+        rewrite_target_after_runner: bool,
+        target_ready: bool,
         rewrite_target_during_final_source: bool,
         target_rewritten: Cell<bool>,
         version_calls: Cell<u8>,
@@ -808,11 +882,49 @@ mod tests {
                 + "\n"
         }
 
+        fn target_config() -> serde_json::Value {
+            let mut config = Self::source_config();
+            let object = config.as_object_mut().unwrap();
+            object.insert("cpus".to_owned(), serde_json::json!(4));
+            object.insert("memory".to_owned(), serde_json::json!("8GiB"));
+            object.insert("disk".to_owned(), serde_json::json!("80GiB"));
+            config
+        }
+
+        fn target_json(&self) -> String {
+            serde_json::json!({
+                "name": TARGET,
+                "status": "Running",
+                "dir": self.host.lima_home().join(TARGET),
+                "vmType": "vz",
+                "arch": "aarch64",
+                "cpus": 4,
+                "memory": 8 * GIB,
+                "disk": TARGET_DISK,
+                "errors": [],
+                "config": Self::target_config()
+            })
+            .to_string()
+                + "\n"
+        }
+
         fn clone_count(&self) -> usize {
             self.calls
                 .borrow()
                 .iter()
                 .filter(|argv| argv.iter().any(|value| value == "clone"))
+                .count()
+        }
+
+        fn runner_launch_count(&self) -> usize {
+            self.calls
+                .borrow()
+                .iter()
+                .filter(|argv| {
+                    argv.iter()
+                        .any(|value| value == "/opt/smolrunner/bin/smolrunner-jit-launcher")
+                        && !argv.iter().any(|value| value == "/usr/bin/sha256sum")
+                })
                 .count()
         }
     }
@@ -866,8 +978,79 @@ mod tests {
                     self.source_json()
                 } else if target == TARGET && !self.host.lima_home().join(TARGET).exists() {
                     "\n".to_owned()
+                } else if target == TARGET && self.target_ready {
+                    self.target_json()
                 } else {
                     return Err(io::Error::other("unexpected present target observation"));
+                };
+                return Ok(Self::record(spec, stdout));
+            }
+            if self.target_ready && argv.iter().any(|value| value == TARGET) {
+                let runner_launch = argv
+                    .iter()
+                    .any(|value| value == "/opt/smolrunner/bin/smolrunner-jit-launcher")
+                    && !argv.iter().any(|value| value == "/usr/bin/sha256sum");
+                if runner_launch && self.fail_runner {
+                    return Err(io::Error::other("injected runner failure"));
+                }
+                if runner_launch && self.rewrite_target_after_runner {
+                    self.host.rewrite_disk_identity(TARGET, 0x99);
+                }
+                let stdout = if argv.iter().any(|value| value == "/usr/bin/uname") {
+                    "aarch64\n".to_owned()
+                } else if argv.iter().any(|value| value == "_NPROCESSORS_ONLN") {
+                    "4\n".to_owned()
+                } else if argv.iter().any(|value| value == "PAGE_SIZE") {
+                    "4096\n".to_owned()
+                } else if argv.iter().any(|value| value == "_PHYS_PAGES") {
+                    "2097152\n".to_owned()
+                } else if argv.iter().any(|value| value == "/etc/machine-id") {
+                    format!("{}  /etc/machine-id\n", "aa".repeat(32))
+                } else if argv.last().is_some_and(|value| value == "/") {
+                    "1:2\n".to_owned()
+                } else if argv.last().is_some_and(|value| value == "[REDACTED]") {
+                    "3:4\n".to_owned()
+                } else if argv
+                    .last()
+                    .is_some_and(|value| value == "/etc/smolrunner/prepared-template.json")
+                {
+                    "a330312e82193d07907ebd7ef291d5d5851f9106234ab58e72d662acc6bbb3b2  /etc/smolrunner/prepared-template.json\n".to_owned()
+                } else if argv
+                    .last()
+                    .is_some_and(|value| value == "/opt/smolrunner/bin/smolrunner-runner-integrity")
+                    && argv.iter().any(|value| value == "/usr/bin/sha256sum")
+                {
+                    "38ab837c98c697f91be7e0fda94492d342dea1c2515c20d3a643078da5dea8da  /opt/smolrunner/bin/smolrunner-runner-integrity\n".to_owned()
+                } else if argv
+                    .last()
+                    .is_some_and(|value| value == "/opt/smolrunner/bin/smolrunner-runner-integrity")
+                {
+                    "smolrunner-runner-integrity-ok\n".to_owned()
+                } else if argv
+                    .last()
+                    .is_some_and(|value| value == "/opt/smolrunner/bin/smolrunner-jit-launcher")
+                    && argv.iter().any(|value| value == "/usr/bin/sha256sum")
+                {
+                    "9b7cc857f2de1181f64bb067e4d4870e0bcb679d597ec047d885395ac6160996  /opt/smolrunner/bin/smolrunner-jit-launcher\n".to_owned()
+                } else if argv.last().is_some_and(|value| {
+                    value == "/etc/apt/apt.conf.d/99-smolrunner-no-automatic-updates"
+                }) {
+                    "b10384a904cdd14d18af31a7754a19ca0c67c237f3ca7bd239f4cf64102ffedb  /etc/apt/apt.conf.d/99-smolrunner-no-automatic-updates\n".to_owned()
+                } else if argv.iter().any(|value| value == "/usr/bin/id") {
+                    "smolrunner-runner\n".to_owned()
+                } else if argv.iter().any(|value| value == "/usr/bin/systemctl") {
+                    return Ok(ExecutionRecord {
+                        argv: spec.displayed_argv(),
+                        environment_keys: spec.environment.keys().cloned().collect(),
+                        status: Some(1),
+                        success: false,
+                        stdout: "masked\n".to_owned(),
+                        stderr: String::new(),
+                    });
+                } else if runner_launch {
+                    String::new()
+                } else {
+                    return Err(io::Error::other("unexpected target guest command"));
                 };
                 return Ok(Self::record(spec, stdout));
             }
@@ -890,10 +1073,49 @@ mod tests {
             host,
             calls: RefCell::new(Vec::new()),
             fail_clone,
+            fail_runner: false,
+            rewrite_target_after_runner: false,
+            target_ready: false,
             rewrite_target_during_final_source: false,
             target_rewritten: Cell::new(false),
             version_calls: Cell::new(0),
             drift_version_on: None,
+        }
+    }
+
+    struct FakeRegistration {
+        observed: ScaleSetRunnerLookup,
+        observe_calls: u8,
+        jit_calls: u8,
+        fail_jit: bool,
+    }
+
+    impl DisposableRunnerRegistrationSource for FakeRegistration {
+        fn observe_runner(
+            &mut self,
+            _runner_name: &ScaleSetRunnerName,
+        ) -> Result<ScaleSetRunnerLookup, DisposableRunnerRuntimeError> {
+            self.observe_calls = self.observe_calls.saturating_add(1);
+            Ok(self.observed.clone())
+        }
+
+        fn generate_jit(
+            &mut self,
+            runner_name: &ScaleSetRunnerName,
+        ) -> Result<ScaleSetJitReceipt, DisposableRunnerRuntimeError> {
+            self.jit_calls = self.jit_calls.saturating_add(1);
+            if self.fail_jit {
+                return Err(DisposableRunnerRuntimeError::bridge(
+                    "runner_jit_generation_failed",
+                ));
+            }
+            Ok(ScaleSetJitReceipt {
+                runner: ScaleSetRunnerReference::new(
+                    ScaleSetRunnerId::new(77).unwrap(),
+                    runner_name.clone(),
+                ),
+                config: EncodedJitConfig::for_test("eyJ0b2tlbiI6InNlY3JldCJ9"),
+            })
         }
     }
 
@@ -1070,6 +1292,349 @@ mod tests {
             .unwrap()
             .attempt()
             .clone()
+    }
+
+    fn install_running_registering_attempt(
+        root: &TempRoot,
+        host: &LimaHostIdentityFixture,
+        runtime: &DisposableCloneRuntime,
+        executor: &mut FakeExecutor<'_>,
+    ) -> DisposableAttemptId {
+        install_ready_generation(root, host, runtime);
+        let attempt_id = install_authorized_attempt(root);
+        runtime
+            .clone_once_with(
+                &attempt_id,
+                &FakeAdmission::available(),
+                executor,
+                &FixedClock,
+            )
+            .unwrap();
+        executor.target_ready = true;
+        let store =
+            UnixPersonalWorkerStore::open_or_create_disposable_catalog(root.path()).unwrap();
+        let mut catalog = DisposableAttemptCatalog::new(store);
+        let cloned = catalog.load().unwrap();
+        catalog
+            .transition(
+                cloned.revision(),
+                &attempt_id,
+                cloned
+                    .find_active(&attempt_id)
+                    .unwrap()
+                    .attempt()
+                    .revision(),
+                DisposableAttemptCatalogAction::BeginRegistration,
+            )
+            .unwrap();
+        attempt_id
+    }
+
+    fn runner_runtime(host: &LimaHostIdentityFixture) -> DisposableRunnerRuntime {
+        DisposableRunnerRuntime::new("/opt/homebrew/bin/limactl", host.lima_home()).unwrap()
+    }
+
+    #[test]
+    fn runner_transaction_checkpoints_jit_registration_and_start_before_one_command() {
+        let root = TempRoot::new("runner-transaction");
+        let host = LimaHostIdentityFixture::new_with_disk_bytes(
+            "clone-runtime-runner-transaction",
+            SOURCE,
+            SOURCE_DISK,
+        );
+        let clone_runtime = runtime(&root, &host);
+        let mut executor = executor(&host, false);
+        let attempt_id =
+            install_running_registering_attempt(&root, &host, &clone_runtime, &mut executor);
+        let mut store =
+            UnixPersonalWorkerStore::open_or_create_disposable_catalog(root.path()).unwrap();
+        let mut registration = FakeRegistration {
+            observed: ScaleSetRunnerLookup::Absent,
+            observe_calls: 0,
+            jit_calls: 0,
+            fail_jit: false,
+        };
+
+        let outcome = store
+            .execute_disposable_runner_transaction(
+                &runner_runtime(&host),
+                &clone_runtime,
+                &attempt_id,
+                &mut registration,
+                &executor,
+                &FixedClock,
+            )
+            .unwrap();
+
+        let DisposableRunnerTransactionOutcome::CommandCompleted(receipt) = outcome else {
+            panic!("expected completed runner command")
+        };
+        assert_eq!(receipt.runner().id.get(), 77);
+        assert_eq!(registration.observe_calls, 1);
+        assert_eq!(registration.jit_calls, 1);
+        assert_eq!(executor.runner_launch_count(), 1);
+        let durable = durable_attempt(&root, &attempt_id);
+        assert!(durable.jit_generation_started());
+        assert!(durable.runner_start_started());
+        assert_eq!(durable.runner_id().map(ScaleSetRunnerId::get), Some(77));
+    }
+
+    #[test]
+    fn failed_jit_leaves_no_replay_checkpoint_and_retry_cannot_regenerate() {
+        let root = TempRoot::new("runner-jit-failure");
+        let host = LimaHostIdentityFixture::new_with_disk_bytes(
+            "clone-runtime-runner-jit-failure",
+            SOURCE,
+            SOURCE_DISK,
+        );
+        let clone_runtime = runtime(&root, &host);
+        let mut executor = executor(&host, false);
+        let attempt_id =
+            install_running_registering_attempt(&root, &host, &clone_runtime, &mut executor);
+        let mut store =
+            UnixPersonalWorkerStore::open_or_create_disposable_catalog(root.path()).unwrap();
+        let mut registration = FakeRegistration {
+            observed: ScaleSetRunnerLookup::Absent,
+            observe_calls: 0,
+            jit_calls: 0,
+            fail_jit: true,
+        };
+
+        assert_eq!(
+            store
+                .execute_disposable_runner_transaction(
+                    &runner_runtime(&host),
+                    &clone_runtime,
+                    &attempt_id,
+                    &mut registration,
+                    &executor,
+                    &FixedClock,
+                )
+                .unwrap_err()
+                .code(),
+            "runner_jit_generation_failed"
+        );
+        assert!(durable_attempt(&root, &attempt_id).jit_generation_started());
+        registration.fail_jit = false;
+        assert_eq!(
+            store
+                .execute_disposable_runner_transaction(
+                    &runner_runtime(&host),
+                    &clone_runtime,
+                    &attempt_id,
+                    &mut registration,
+                    &executor,
+                    &FixedClock,
+                )
+                .unwrap_err()
+                .code(),
+            "runner_jit_outcome_unknown"
+        );
+        assert_eq!(registration.jit_calls, 1);
+        assert_eq!(executor.runner_launch_count(), 0);
+    }
+
+    #[test]
+    fn pre_jit_same_name_runner_is_never_adopted_or_deleted() {
+        let root = TempRoot::new("runner-pre-jit-conflict");
+        let host = LimaHostIdentityFixture::new_with_disk_bytes(
+            "clone-runtime-runner-pre-jit-conflict",
+            SOURCE,
+            SOURCE_DISK,
+        );
+        let clone_runtime = runtime(&root, &host);
+        let mut executor = executor(&host, false);
+        let attempt_id =
+            install_running_registering_attempt(&root, &host, &clone_runtime, &mut executor);
+        let mut store =
+            UnixPersonalWorkerStore::open_or_create_disposable_catalog(root.path()).unwrap();
+        let mut registration = FakeRegistration {
+            observed: ScaleSetRunnerLookup::Present(ScaleSetRunnerReference::new(
+                ScaleSetRunnerId::new(78).unwrap(),
+                ScaleSetRunnerName::parse(TARGET).unwrap(),
+            )),
+            observe_calls: 0,
+            jit_calls: 0,
+            fail_jit: false,
+        };
+
+        assert_eq!(
+            store
+                .execute_disposable_runner_transaction(
+                    &runner_runtime(&host),
+                    &clone_runtime,
+                    &attempt_id,
+                    &mut registration,
+                    &executor,
+                    &FixedClock,
+                )
+                .unwrap_err()
+                .code(),
+            "runner_pre_jit_name_conflict"
+        );
+        let durable = durable_attempt(&root, &attempt_id);
+        assert!(!durable.jit_generation_started());
+        assert!(durable.runner_id().is_none());
+        assert_eq!(registration.jit_calls, 0);
+    }
+
+    #[test]
+    fn post_jit_discovered_runner_is_bound_for_cleanup_without_secret_replay() {
+        let root = TempRoot::new("runner-registration-recovery");
+        let host = LimaHostIdentityFixture::new_with_disk_bytes(
+            "clone-runtime-runner-registration-recovery",
+            SOURCE,
+            SOURCE_DISK,
+        );
+        let clone_runtime = runtime(&root, &host);
+        let mut executor = executor(&host, false);
+        let attempt_id =
+            install_running_registering_attempt(&root, &host, &clone_runtime, &mut executor);
+        let store =
+            UnixPersonalWorkerStore::open_or_create_disposable_catalog(root.path()).unwrap();
+        let mut catalog = DisposableAttemptCatalog::new(store);
+        let current = catalog.load().unwrap();
+        catalog
+            .transition(
+                current.revision(),
+                &attempt_id,
+                current
+                    .find_active(&attempt_id)
+                    .unwrap()
+                    .attempt()
+                    .revision(),
+                DisposableAttemptCatalogAction::RecordJitGenerationStarted,
+            )
+            .unwrap();
+        let mut store =
+            UnixPersonalWorkerStore::open_or_create_disposable_catalog(root.path()).unwrap();
+        let mut registration = FakeRegistration {
+            observed: ScaleSetRunnerLookup::Present(ScaleSetRunnerReference::new(
+                ScaleSetRunnerId::new(78).unwrap(),
+                ScaleSetRunnerName::parse(TARGET).unwrap(),
+            )),
+            observe_calls: 0,
+            jit_calls: 0,
+            fail_jit: false,
+        };
+
+        assert!(matches!(
+            store
+                .execute_disposable_runner_transaction(
+                    &runner_runtime(&host),
+                    &clone_runtime,
+                    &attempt_id,
+                    &mut registration,
+                    &executor,
+                    &FixedClock,
+                )
+                .unwrap(),
+            DisposableRunnerTransactionOutcome::RegistrationRecovered { .. }
+        ));
+        let durable = durable_attempt(&root, &attempt_id);
+        assert_eq!(durable.runner_id().map(ScaleSetRunnerId::get), Some(78));
+        assert!(!durable.runner_start_started());
+        assert_eq!(registration.jit_calls, 0);
+        assert_eq!(executor.runner_launch_count(), 0);
+    }
+
+    #[test]
+    fn failed_runner_command_leaves_started_debt_and_never_replays_secret() {
+        let root = TempRoot::new("runner-command-failure");
+        let host = LimaHostIdentityFixture::new_with_disk_bytes(
+            "clone-runtime-runner-command-failure",
+            SOURCE,
+            SOURCE_DISK,
+        );
+        let clone_runtime = runtime(&root, &host);
+        let mut executor = executor(&host, false);
+        let attempt_id =
+            install_running_registering_attempt(&root, &host, &clone_runtime, &mut executor);
+        executor.fail_runner = true;
+        let mut store =
+            UnixPersonalWorkerStore::open_or_create_disposable_catalog(root.path()).unwrap();
+        let mut registration = FakeRegistration {
+            observed: ScaleSetRunnerLookup::Absent,
+            observe_calls: 0,
+            jit_calls: 0,
+            fail_jit: false,
+        };
+
+        assert_eq!(
+            store
+                .execute_disposable_runner_transaction(
+                    &runner_runtime(&host),
+                    &clone_runtime,
+                    &attempt_id,
+                    &mut registration,
+                    &executor,
+                    &FixedClock,
+                )
+                .unwrap_err()
+                .code(),
+            "runner_command_failed"
+        );
+        assert!(durable_attempt(&root, &attempt_id).runner_start_started());
+        assert_eq!(registration.jit_calls, 1);
+        assert_eq!(executor.runner_launch_count(), 1);
+
+        assert_eq!(
+            store
+                .execute_disposable_runner_transaction(
+                    &runner_runtime(&host),
+                    &clone_runtime,
+                    &attempt_id,
+                    &mut registration,
+                    &executor,
+                    &FixedClock,
+                )
+                .unwrap_err()
+                .code(),
+            "runner_handoff_already_checkpointed"
+        );
+        assert_eq!(registration.jit_calls, 1);
+        assert_eq!(executor.runner_launch_count(), 1);
+    }
+
+    #[test]
+    fn post_command_target_rebind_withholds_success_without_replay() {
+        let root = TempRoot::new("runner-post-command-rebind");
+        let host = LimaHostIdentityFixture::new_with_disk_bytes(
+            "clone-runtime-runner-post-command-rebind",
+            SOURCE,
+            SOURCE_DISK,
+        );
+        let clone_runtime = runtime(&root, &host);
+        let mut executor = executor(&host, false);
+        let attempt_id =
+            install_running_registering_attempt(&root, &host, &clone_runtime, &mut executor);
+        executor.rewrite_target_after_runner = true;
+        let mut store =
+            UnixPersonalWorkerStore::open_or_create_disposable_catalog(root.path()).unwrap();
+        let mut registration = FakeRegistration {
+            observed: ScaleSetRunnerLookup::Absent,
+            observe_calls: 0,
+            jit_calls: 0,
+            fail_jit: false,
+        };
+
+        assert_eq!(
+            store
+                .execute_disposable_runner_transaction(
+                    &runner_runtime(&host),
+                    &clone_runtime,
+                    &attempt_id,
+                    &mut registration,
+                    &executor,
+                    &FixedClock,
+                )
+                .unwrap_err()
+                .code(),
+            "runner_target_post_command_drift"
+        );
+        assert!(durable_attempt(&root, &attempt_id).runner_start_started());
+        assert_eq!(registration.jit_calls, 1);
+        assert_eq!(executor.runner_launch_count(), 1);
     }
 
     #[test]

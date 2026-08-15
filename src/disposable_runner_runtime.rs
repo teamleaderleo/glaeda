@@ -1,15 +1,16 @@
 //! Secret-safe fixed guest command for one disposable GitHub Actions runner.
 //!
-//! This module deliberately stops before process execution. It converts one bridge-issued JIT
-//! configuration into a non-cloneable, non-serializable command plan whose secret exists only in
-//! a guaranteed-zeroizing standard-input value. A later same-lock service must freshly prove the
-//! exact disposable target ready, durably record the returned runner ID, publish a no-replay
-//! runner-start checkpoint, and only then consume the command.
+//! This module converts one bridge-issued JIT configuration into a non-cloneable, non-serializable
+//! command plan whose secret exists only in a guaranteed-zeroizing standard-input value. The Unix
+//! store transaction freshly proves the exact disposable target ready, publishes the JIT no-replay
+//! checkpoint, binds the returned runner ID, publishes the runner-start checkpoint, and only then
+//! consumes the command.
 
 #![allow(dead_code)]
 
 use std::fmt;
 use std::path::{Component, PathBuf};
+use std::time::Duration;
 
 use zeroize::Zeroizing;
 
@@ -19,7 +20,10 @@ use crate::disposable_worker_reconciler::{
     DisposableAttemptId, DisposableAttemptPhase, DisposableVmIdentity,
 };
 use crate::execution_admission::EpochMillis;
-use crate::github_scale_set_bridge::ScaleSetJitReceipt;
+use crate::github_scale_set_bridge::{
+    ScaleSetBridgeClient, ScaleSetJitReceipt, ScaleSetRunnerLookup,
+};
+use crate::github_scale_set_protocol::ScaleSetRunnerName;
 use crate::github_scale_set_protocol::ScaleSetRunnerReference;
 use crate::lima_observation::LIMACTL_SAFE_HOME;
 use crate::process::CommandSpec;
@@ -37,6 +41,11 @@ pub(crate) enum DisposableRunnerRuntimeErrorKind {
     Configuration,
     State,
     JitConfiguration,
+    DurableState,
+    Observation,
+    Bridge,
+    Command,
+    RecoveryRequired,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -52,6 +61,26 @@ impl DisposableRunnerRuntimeError {
 
     pub(crate) const fn code(self) -> &'static str {
         self.code
+    }
+
+    pub(crate) const fn durable(code: &'static str) -> Self {
+        runtime_error(DisposableRunnerRuntimeErrorKind::DurableState, code)
+    }
+
+    pub(crate) const fn observation(code: &'static str) -> Self {
+        runtime_error(DisposableRunnerRuntimeErrorKind::Observation, code)
+    }
+
+    pub(crate) const fn bridge(code: &'static str) -> Self {
+        runtime_error(DisposableRunnerRuntimeErrorKind::Bridge, code)
+    }
+
+    pub(crate) const fn command(code: &'static str) -> Self {
+        runtime_error(DisposableRunnerRuntimeErrorKind::Command, code)
+    }
+
+    pub(crate) const fn recovery(code: &'static str) -> Self {
+        runtime_error(DisposableRunnerRuntimeErrorKind::RecoveryRequired, code)
     }
 }
 
@@ -77,6 +106,36 @@ impl std::error::Error for DisposableRunnerRuntimeError {}
 pub(crate) struct DisposableRunnerRuntime {
     limactl_program: PathBuf,
     lima_home: PathBuf,
+}
+
+pub(crate) trait DisposableRunnerRegistrationSource {
+    fn observe_runner(
+        &mut self,
+        runner_name: &ScaleSetRunnerName,
+    ) -> Result<ScaleSetRunnerLookup, DisposableRunnerRuntimeError>;
+
+    fn generate_jit(
+        &mut self,
+        runner_name: &ScaleSetRunnerName,
+    ) -> Result<ScaleSetJitReceipt, DisposableRunnerRuntimeError>;
+}
+
+impl DisposableRunnerRegistrationSource for ScaleSetBridgeClient {
+    fn observe_runner(
+        &mut self,
+        runner_name: &ScaleSetRunnerName,
+    ) -> Result<ScaleSetRunnerLookup, DisposableRunnerRuntimeError> {
+        ScaleSetBridgeClient::observe_runner(self, runner_name)
+            .map_err(|_| DisposableRunnerRuntimeError::bridge("runner_observation_failed"))
+    }
+
+    fn generate_jit(
+        &mut self,
+        runner_name: &ScaleSetRunnerName,
+    ) -> Result<ScaleSetJitReceipt, DisposableRunnerRuntimeError> {
+        ScaleSetBridgeClient::generate_jit(self, runner_name)
+            .map_err(|_| DisposableRunnerRuntimeError::bridge("runner_jit_generation_failed"))
+    }
 }
 
 impl DisposableRunnerRuntime {
@@ -162,6 +221,28 @@ impl DisposableRunnerRuntime {
         })
     }
 
+    pub(crate) fn validate_pre_jit_candidate(
+        &self,
+        reservation: &DisposableAttemptReservation,
+        now: EpochMillis,
+    ) -> Result<(), DisposableRunnerRuntimeError> {
+        let attempt = reservation.attempt();
+        if !matches!(
+            attempt.phase(),
+            DisposableAttemptPhase::Registering | DisposableAttemptPhase::Assigned
+        ) || attempt.vm_identity().is_none()
+            || attempt.runner_id().is_some()
+            || attempt.jit_generation_started()
+            || attempt.runner_start_started()
+            || now > attempt.not_after()
+        {
+            return Err(DisposableRunnerRuntimeError::recovery(
+                "runner_pre_jit_state_invalid",
+            ));
+        }
+        Ok(())
+    }
+
     fn base_command(&self) -> CommandSpec {
         CommandSpec::new(&self.limactl_program)
             .argument("--tty=false")
@@ -220,6 +301,99 @@ impl DisposableRunnerLaunchPlan {
 
     pub(crate) const fn command(&self) -> &CommandSpec {
         &self.command
+    }
+
+    pub(crate) fn validate_registered(
+        &self,
+        reservation: &DisposableAttemptReservation,
+        now: EpochMillis,
+    ) -> Result<(), DisposableRunnerRuntimeError> {
+        let attempt = reservation.attempt();
+        if attempt.attempt_id() != &self.attempt_id
+            || attempt.revision().get() != self.attempt_revision.get() + 1
+            || attempt.vm_identity() != Some(&self.vm_identity)
+            || attempt.runner_id() != Some(self.runner.id)
+            || attempt.runner_name() != &self.runner.name
+            || !attempt.jit_generation_started()
+            || attempt.runner_start_started()
+            || attempt.not_after() != self.not_after
+            || now > self.not_after
+        {
+            return Err(DisposableRunnerRuntimeError::recovery(
+                "runner_registration_checkpoint_mismatch",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn execute_started(
+        self,
+        reservation: &DisposableAttemptReservation,
+        now: EpochMillis,
+        executor: &impl crate::process::TimedCommandExecutor,
+    ) -> Result<DisposableRunnerCommandReceipt, DisposableRunnerRuntimeError> {
+        let attempt = reservation.attempt();
+        if attempt.attempt_id() != &self.attempt_id
+            || attempt.revision().get() != self.attempt_revision.get() + 2
+            || attempt.vm_identity() != Some(&self.vm_identity)
+            || attempt.runner_id() != Some(self.runner.id)
+            || attempt.runner_name() != &self.runner.name
+            || !attempt.jit_generation_started()
+            || !attempt.runner_start_started()
+            || attempt.not_after() != self.not_after
+            || now > self.not_after
+        {
+            return Err(DisposableRunnerRuntimeError::recovery(
+                "runner_start_checkpoint_mismatch",
+            ));
+        }
+        let remaining_millis = self
+            .not_after
+            .get()
+            .checked_sub(now.get())
+            .filter(|remaining| *remaining > 0)
+            .ok_or_else(|| DisposableRunnerRuntimeError::recovery("runner_attempt_expired"))?;
+        let record = executor
+            .execute_with_timeout(&self.command, Duration::from_millis(remaining_millis))
+            .map_err(|_| DisposableRunnerRuntimeError::command("runner_command_failed"))?;
+        if record.argv != self.command.displayed_argv()
+            || record.environment_keys
+                != self.command.environment.keys().cloned().collect::<Vec<_>>()
+            || record.status != Some(0)
+            || !record.success
+            || !record.stdout.is_empty()
+            || !record.stderr.is_empty()
+        {
+            return Err(DisposableRunnerRuntimeError::command(
+                "runner_command_record_mismatch",
+            ));
+        }
+        Ok(DisposableRunnerCommandReceipt {
+            attempt_id: self.attempt_id,
+            attempt_revision: attempt.revision(),
+            runner: self.runner,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DisposableRunnerCommandReceipt {
+    attempt_id: DisposableAttemptId,
+    attempt_revision: DisposableAttemptRevision,
+    runner: ScaleSetRunnerReference,
+}
+
+impl DisposableRunnerCommandReceipt {
+    pub(crate) const fn attempt_id(&self) -> &DisposableAttemptId {
+        &self.attempt_id
+    }
+
+    pub(crate) const fn attempt_revision(&self) -> DisposableAttemptRevision {
+        self.attempt_revision
+    }
+
+    pub(crate) const fn runner(&self) -> &ScaleSetRunnerReference {
+        &self.runner
     }
 }
 

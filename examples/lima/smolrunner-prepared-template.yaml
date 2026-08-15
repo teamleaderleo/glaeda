@@ -71,11 +71,13 @@ provision:
       #!/bin/bash
       set -euo pipefail
       export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+      export LC_ALL=C
       umask 022
 
       readonly runner_user="smolrunner-runner"
       readonly runner_home="/var/lib/smolrunner-runner"
       readonly runner_work="${runner_home}/work"
+      readonly runner_diag="${runner_home}/diag"
       readonly install_parent="/opt/smolrunner"
       readonly install_dir="${install_parent}/actions-runner"
       readonly install_stage="${install_parent}/actions-runner.staging"
@@ -83,11 +85,18 @@ provision:
       readonly jit_launcher="${launcher_dir}/smolrunner-jit-launcher"
       readonly jit_launcher_stage="/var/tmp/smolrunner-jit-launcher.new"
       readonly jit_launcher_sha256="9b7cc857f2de1181f64bb067e4d4870e0bcb679d597ec047d885395ac6160996"
+      readonly integrity_verifier="${launcher_dir}/smolrunner-runner-integrity"
+      readonly integrity_verifier_stage="${integrity_verifier}.new"
+      readonly integrity_verifier_sha256="38ab837c98c697f91be7e0fda94492d342dea1c2515c20d3a643078da5dea8da"
+      readonly marker_dir="/etc/smolrunner"
+      readonly runner_entries="${marker_dir}/actions-runner.entries"
+      readonly runner_entries_stage="${runner_entries}.new"
+      readonly runner_checksums="${marker_dir}/actions-runner.sha256"
+      readonly runner_checksums_stage="${runner_checksums}.new"
       readonly archive="/var/tmp/actions-runner-linux-arm64-2.336.0.tar.gz"
       readonly runner_url="https://github.com/actions/runner/releases/download/v2.336.0/actions-runner-linux-arm64-2.336.0.tar.gz"
       readonly runner_bytes="138824064"
       readonly runner_sha256="58b758e420b87093fbd4bfddd368074960053e2f1388f01848c82624b90f27d1"
-      readonly marker_dir="/etc/smolrunner"
       readonly marker="${marker_dir}/prepared-template.json"
       readonly apt_policy="/etc/apt/apt.conf.d/99-smolrunner-no-automatic-updates"
 
@@ -134,28 +143,21 @@ provision:
       [[ "$(/usr/bin/id -Gn "${runner_user}")" == "${runner_user}" ]]
 
       verify_runner_install() {
-        [[ -d "${install_dir}" && ! -L "${install_dir}" ]]
-        [[ "$(/usr/bin/stat --format=%U:%G "${install_dir}")" == "${runner_user}:${runner_user}" ]]
-        [[ -f "${install_dir}/bin/Runner.Listener" && ! -L "${install_dir}/bin/Runner.Listener" ]]
-        local installed_version
-        installed_version="$(
-          cd "${install_dir}"
-          /usr/sbin/runuser --user "${runner_user}" -- \
-            /usr/bin/env -i \
-              HOME="${runner_home}" \
-              PATH=/usr/bin:/bin \
-              "${install_dir}/bin/Runner.Listener" --version
-        )"
-        [[ "${installed_version}" == "2.336.0" ]]
-        [[ -f "${jit_launcher}" && ! -L "${jit_launcher}" ]]
-        [[ "$(/usr/bin/stat --format=%U:%G:%a "${jit_launcher}")" == "root:root:755" ]]
-        /usr/bin/printf '%s  %s\n' "${jit_launcher_sha256}" "${jit_launcher}" \
-          | /usr/bin/sha256sum --check --status
+        [[ "$(${integrity_verifier})" == "smolrunner-runner-integrity-ok" ]]
       }
 
       /usr/bin/install -d -o root -g root -m 0755 \
         "${install_parent}" "${launcher_dir}" "${marker_dir}"
-      /usr/bin/install -d -o "${runner_user}" -g "${runner_user}" -m 0750 "${runner_home}" "${runner_work}"
+      /usr/bin/install -d -o "${runner_user}" -g "${runner_user}" -m 0750 \
+        "${runner_home}" "${runner_work}" "${runner_diag}"
+
+      /usr/bin/printf '%s' \
+        'IyEvYmluL2Jhc2gKc2V0IC1ldW8gcGlwZWZhaWwKCmV4cG9ydCBQQVRIPS91c3Ivc2JpbjovdXNyL2Jpbjovc2JpbjovYmluCgpyZWFkb25seSBpbnN0YWxsX2Rpcj0iL29wdC9zbW9scnVubmVyL2FjdGlvbnMtcnVubmVyIgpyZWFkb25seSBlbnRyaWVzPSIvZXRjL3Ntb2xydW5uZXIvYWN0aW9ucy1ydW5uZXIuZW50cmllcyIKcmVhZG9ubHkgY2hlY2tzdW1zPSIvZXRjL3Ntb2xydW5uZXIvYWN0aW9ucy1ydW5uZXIuc2hhMjU2IgpyZWFkb25seSBydW5uZXJfd29yaz0iL3Zhci9saWIvc21vbHJ1bm5lci1ydW5uZXIvd29yayIKcmVhZG9ubHkgcnVubmVyX2RpYWc9Ii92YXIvbGliL3Ntb2xydW5uZXItcnVubmVyL2RpYWciCnJlYWRvbmx5IGppdF9sYXVuY2hlcj0iL29wdC9zbW9scnVubmVyL2Jpbi9zbW9scnVubmVyLWppdC1sYXVuY2hlciIKcmVhZG9ubHkgaml0X2xhdW5jaGVyX3NoYTI1Nj0iOWI3Y2M4NTdmMmRlMTE4MWY2NGJiMDY3ZTRkNDg3MGUwYmNiNjc5ZDU5N2VjMDQ3ZDg4NTM5NWFjNjE2MDk5NiIKCltbICIkKC91c3IvYmluL2lkIC11KSIgPT0gIjAiIF1dCltbICIkKC91c3IvYmluL3N0YXQgLS1mb3JtYXQ9JVU6JUc6JWE6JUYgIiR7aW5zdGFsbF9kaXJ9IikiID09ICJyb290OnNtb2xydW5uZXItcnVubmVyOjE3NzU6ZGlyZWN0b3J5IiBdXQpbWyAiJCgvdXNyL2Jpbi9zdGF0IC0tZm9ybWF0PSVVOiVHOiVhOiVGICIke2VudHJpZXN9IikiID09ICJyb290OnJvb3Q6NDQ0OnJlZ3VsYXIgZmlsZSIgXV0KW1sgIiQoL3Vzci9iaW4vc3RhdCAtLWZvcm1hdD0lVTolRzolYTolRiAiJHtjaGVja3N1bXN9IikiID09ICJyb290OnJvb3Q6NDQ0OnJlZ3VsYXIgZmlsZSIgXV0KW1sgIiQoL3Vzci9iaW4vc3RhdCAtLWZvcm1hdD0lVTolRzolYTolRiAiJHtqaXRfbGF1bmNoZXJ9IikiID09ICJyb290OnJvb3Q6NzU1OnJlZ3VsYXIgZmlsZSIgXV0KW1sgLUwgIiR7aW5zdGFsbF9kaXJ9L193b3JrIiAmJiAiJCgvdXNyL2Jpbi9yZWFkbGluayAiJHtpbnN0YWxsX2Rpcn0vX3dvcmsiKSIgPT0gIiR7cnVubmVyX3dvcmt9IiBdXQpbWyAtTCAiJHtpbnN0YWxsX2Rpcn0vX2RpYWciICYmICIkKC91c3IvYmluL3JlYWRsaW5rICIke2luc3RhbGxfZGlyfS9fZGlhZyIpIiA9PSAiJHtydW5uZXJfZGlhZ30iIF1dCltbICIkKC91c3IvYmluL3N0YXQgLS1mb3JtYXQ9JVU6JUc6JWE6JUYgIiR7cnVubmVyX3dvcmt9IikiID09ICJzbW9scnVubmVyLXJ1bm5lcjpzbW9scnVubmVyLXJ1bm5lcjo3NTA6ZGlyZWN0b3J5IiBdXQpbWyAiJCgvdXNyL2Jpbi9zdGF0IC0tZm9ybWF0PSVVOiVHOiVhOiVGICIke3J1bm5lcl9kaWFnfSIpIiA9PSAic21vbHJ1bm5lci1ydW5uZXI6c21vbHJ1bm5lci1ydW5uZXI6NzUwOmRpcmVjdG9yeSIgXV0KCmlmIC91c3IvYmluL2ZpbmQgLVAgIiR7aW5zdGFsbF9kaXJ9IiAteGRldiAtbWluZGVwdGggMSAhIC11c2VyIHJvb3QgLXByaW50IC1xdWl0IHwgL3Vzci9iaW4vZ3JlcCAtcSAuOyB0aGVuCiAgZXhpdCAxCmZpCmlmIC91c3IvYmluL2ZpbmQgLVAgIiR7aW5zdGFsbF9kaXJ9IiAteGRldiAtbWluZGVwdGggMSAhIC10eXBlIGwgLXBlcm0gLzAyMiAtcHJpbnQgLXF1aXQgfCAvdXNyL2Jpbi9ncmVwIC1xIC47IHRoZW4KICBleGl0IDEKZmkKCigKICBjZCAiJHtpbnN0YWxsX2Rpcn0iCiAgL3Vzci9iaW4vZmluZCAtUCAuIC14ZGV2IC1taW5kZXB0aCAxIC1wcmludGYgJyV5ICVtICVQICVsXG4nIHwgL3Vzci9iaW4vc29ydAopIHwgL3Vzci9iaW4vY21wIC0tc2lsZW50IC0gIiR7ZW50cmllc30iCigKICBjZCAiJHtpbnN0YWxsX2Rpcn0iCiAgL3Vzci9iaW4vc2hhMjU2c3VtIC0tY2hlY2sgLS1zdHJpY3QgLS1xdWlldCAiJHtjaGVja3N1bXN9IgopCi91c3IvYmluL3ByaW50ZiAnJXNcbicgIiR7aml0X2xhdW5jaGVyX3NoYTI1Nn0gICR7aml0X2xhdW5jaGVyfSIgfCAvdXNyL2Jpbi9zaGEyNTZzdW0gLS1jaGVjayAtLXN0YXR1cwoKL3Vzci9iaW4vcHJpbnRmICclc1xuJyAnc21vbHJ1bm5lci1ydW5uZXItaW50ZWdyaXR5LW9rJwo=' \
+        | /usr/bin/base64 --decode >"${integrity_verifier_stage}"
+      /usr/bin/printf '%s  %s\n' "${integrity_verifier_sha256}" "${integrity_verifier_stage}" \
+        | /usr/bin/sha256sum --check --status
+      /usr/bin/install -o root -g root -m 0755 "${integrity_verifier_stage}" "${integrity_verifier}"
+      /usr/bin/rm -f -- "${integrity_verifier_stage}"
 
       if [[ -f "${marker}" && -x "${install_dir}/bin/Runner.Listener" ]]; then
         /usr/bin/cmp --silent "${marker}" <(/usr/bin/printf '%s\n' \
@@ -207,8 +209,25 @@ provision:
         DEBIAN_FRONTEND=noninteractive \
         PATH=/usr/sbin:/usr/bin:/sbin:/bin \
         "${install_stage}/bin/installdependencies.sh"
-      /usr/bin/chown -R "${runner_user}:${runner_user}" "${install_stage}"
+      /usr/bin/chown -R root:root "${install_stage}"
+      /usr/bin/chown root:"${runner_user}" "${install_stage}"
+      /usr/bin/chmod 1775 "${install_stage}"
+      /usr/bin/ln --symbolic "${runner_work}" "${install_stage}/_work"
+      /usr/bin/ln --symbolic "${runner_diag}" "${install_stage}/_diag"
+      (
+        cd "${install_stage}"
+        /usr/bin/find -P . -xdev -mindepth 1 -printf '%y %m %P %l\n' | /usr/bin/sort
+      ) >"${runner_entries_stage}"
+      (
+        cd "${install_stage}"
+        /usr/bin/find -P . -xdev -type f -print0 \
+          | /usr/bin/sort --zero-terminated \
+          | /usr/bin/xargs --null /usr/bin/sha256sum
+      ) >"${runner_checksums_stage}"
       /usr/bin/mv -- "${install_stage}" "${install_dir}"
+      /usr/bin/install -o root -g root -m 0444 "${runner_entries_stage}" "${runner_entries}"
+      /usr/bin/install -o root -g root -m 0444 "${runner_checksums_stage}" "${runner_checksums}"
+      /usr/bin/rm -f -- "${runner_entries_stage}" "${runner_checksums_stage}"
       /usr/bin/rm -f -- "${archive}"
 
       /usr/bin/printf '%s' \
