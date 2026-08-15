@@ -121,8 +121,14 @@ configuration only in a redacted guaranteed-zeroization value. Before reading th
 the bridge at the one fixed root-owned, non-writable installation path with exact SHA-256 content,
 and it reconfirms that held file around spawn. Every exchange has a finite deadline; malformed
 decoded or semantic responses poison and terminate the session. The personal-Mac adapter fixes
-advertised Scale Set capacity at one. No durable message consumer, enrollment path,
-service loop, or guest JIT handoff exists yet, so this adapter is not production capacity.
+advertised Scale Set capacity at one. A canonical delivery is now reconciled with the exact
+disposable-attempt catalog under the shared writer lock before acknowledgement: both documents are
+staged and recovered as one transaction, including messages that advance several lifecycle
+revisions. The acknowledgement controller retains that lock across the durable Started checkpoint,
+one bounded bridge call, and publication of the acquired subset. After response loss it never
+replays acknowledgement; a fresh session may only replay acquisition for the exact retained
+request IDs, and an empty response remains explicit recovery debt. Delivery settlement, enrollment,
+the service loop, and guest JIT handoff do not exist yet, so this is not production capacity.
 
 Acceptance: an enrolled test repository targets the SmolRunner scale-set label, queues a job, and receives its result without operator commands; the JIT runner cannot accept a second job and its credential is absent after VM destruction.
 
