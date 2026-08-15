@@ -20,7 +20,10 @@ pub(super) struct PublicationFaultGuard;
 
 pub(super) fn inject_publication_fault(point: PublicationFaultPoint) -> PublicationFaultGuard {
     PUBLICATION_FAULT.with(|slot| {
-        assert!(slot.replace(Some(point)).is_none(), "publication fault already armed");
+        assert!(
+            slot.replace(Some(point)).is_none(),
+            "publication fault already armed"
+        );
     });
     PublicationFaultGuard
 }
