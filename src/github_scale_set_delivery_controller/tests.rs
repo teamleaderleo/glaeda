@@ -74,10 +74,11 @@ struct FakeBridge {
 }
 
 impl DeliveryBridge for FakeBridge {
-    fn poll(&mut self) -> Result<ScaleSetBridgePoll, ScaleSetBridgeError> {
+    fn poll(&mut self, available_capacity: u16) -> Result<ScaleSetBridgePoll, ScaleSetBridgeError> {
         if self.poisoned {
             return Err(ScaleSetBridgeError::new("poisoned"));
         }
+        assert_eq!(available_capacity, 1);
         self.calls.push("poll");
         Ok(self.polls.pop_front().expect("expected poll response"))
     }
@@ -117,7 +118,8 @@ struct LockCheckingBridge<'a> {
 }
 
 impl DeliveryBridge for LockCheckingBridge<'_> {
-    fn poll(&mut self) -> Result<ScaleSetBridgePoll, ScaleSetBridgeError> {
+    fn poll(&mut self, available_capacity: u16) -> Result<ScaleSetBridgePoll, ScaleSetBridgeError> {
+        assert_eq!(available_capacity, 1);
         Ok(self.poll.take().expect("one poll"))
     }
 

@@ -9,7 +9,7 @@ import (
 )
 
 func TestDecodeReplayableAcquireRequest(t *testing.T) {
-	request, err := decodeRequest([]byte(`{"version":1,"operation":"acquire","runner_request_ids":[41,42]}`))
+	request, err := decodeRequest([]byte(`{"version":2,"operation":"acquire","runner_request_ids":[41,42]}`))
 	if err != nil {
 		t.Fatalf("decode acquire request: %v", err)
 	}
@@ -67,7 +67,7 @@ func TestReplayableAcquireRefusesPendingMessage(t *testing.T) {
 		},
 	}
 	server := startedServer(t, backend)
-	if response := server.handle(context.Background(), protocolRequest{Version: 1, Operation: "poll"}); response.Type != "message" {
+	if response := server.handle(context.Background(), protocolRequest{Version: protocolVersion, Operation: "poll", MaxCapacity: 1}); response.Type != "message" {
 		t.Fatalf("poll response = %#v", response)
 	}
 	response := server.handle(context.Background(), protocolRequest{

@@ -111,15 +111,15 @@ func startedServer(t *testing.T, fake *fakeBackend) *server {
 }
 
 func TestDecodeRequestIsStrictAndVersioned(t *testing.T) {
-	valid := []byte(`{"version":1,"operation":"poll"}`)
+	valid := []byte(`{"version":2,"operation":"poll"}`)
 	request, err := decodeRequest(valid)
 	if err != nil || request.Operation != "poll" {
 		t.Fatalf("valid request: request=%#v err=%v", request, err)
 	}
 	for _, input := range [][]byte{
-		[]byte(`{"version":2,"operation":"poll"}`),
-		[]byte(`{"version":1,"operation":"poll","unknown":true}`),
-		[]byte(`{"version":1,"operation":"poll"} {}`),
+		[]byte(`{"version":1,"operation":"poll"}`),
+		[]byte(`{"version":2,"operation":"poll","unknown":true}`),
+		[]byte(`{"version":2,"operation":"poll"} {}`),
 	} {
 		if _, err := decodeRequest(input); err == nil {
 			t.Fatalf("accepted invalid request %s", input)
@@ -151,18 +151,18 @@ func TestPollRequiresDurableAckBeforeAdvancing(t *testing.T) {
 	}
 	server := startedServer(t, backend)
 
-	message := server.handle(context.Background(), protocolRequest{Version: 1, Operation: "poll"})
+	message := server.handle(context.Background(), protocolRequest{Version: protocolVersion, Operation: "poll", MaxCapacity: 1})
 	if message.Type != "message" || message.MessageID != 7 || len(message.Events) != 1 {
 		t.Fatalf("message response = %#v", message)
 	}
-	if response := server.handle(context.Background(), protocolRequest{Version: 1, Operation: "poll"}); response.Code != "ack_required" {
+	if response := server.handle(context.Background(), protocolRequest{Version: protocolVersion, Operation: "poll", MaxCapacity: 1}); response.Code != "ack_required" {
 		t.Fatalf("second poll response = %#v", response)
 	}
 	if !reflect.DeepEqual(backend.calls, []string{"poll"}) {
 		t.Fatalf("calls before ack = %v", backend.calls)
 	}
 
-	acked := server.handle(context.Background(), protocolRequest{Version: 1, Operation: "ack", MessageID: 7})
+	acked := server.handle(context.Background(), protocolRequest{Version: protocolVersion, Operation: "ack", MessageID: 7})
 	if acked.Type != "acked" || !reflect.DeepEqual(acked.AcquiredRequests, []int64{41}) {
 		t.Fatalf("ack response = %#v", acked)
 	}
@@ -183,16 +183,88 @@ func TestIdleRetainsLatestValidatedStatistics(t *testing.T) {
 		},
 	}
 	server := startedServer(t, backend)
-	message := server.handle(context.Background(), protocolRequest{Version: 1, Operation: "poll"})
+	message := server.handle(context.Background(), protocolRequest{Version: protocolVersion, Operation: "poll", MaxCapacity: 1})
 	if message.Type != "message" || message.Statistics == nil || message.Statistics.AssignedJobs != 3 {
 		t.Fatalf("message response=%#v", message)
 	}
-	if response := server.handle(context.Background(), protocolRequest{Version: 1, Operation: "ack", MessageID: 7}); response.Type != "acked" {
+	if response := server.handle(context.Background(), protocolRequest{Version: protocolVersion, Operation: "ack", MessageID: 7}); response.Type != "acked" {
 		t.Fatalf("ack response=%#v", response)
 	}
-	idle := server.handle(context.Background(), protocolRequest{Version: 1, Operation: "poll"})
+	idle := server.handle(context.Background(), protocolRequest{Version: protocolVersion, Operation: "poll", MaxCapacity: 1})
 	if idle.Type != "idle" || idle.Statistics == nil || idle.Statistics.AssignedJobs != 3 {
 		t.Fatalf("idle reverted to startup statistics: %#v", idle)
+	}
+}
+
+func TestResumeRestoresDurableCursorBeforeZeroCapacityLifecyclePoll(t *testing.T) {
+	backend := &fakeBackend{message: &scaleset.RunnerScaleSetMessage{
+		MessageID:  8,
+		Statistics: &scaleset.RunnerScaleSetStatistic{TotalAssignedJobs: 1, TotalRunningJobs: 1},
+		JobStartedMessages: []*scaleset.JobStarted{{
+			RunnerID:   81,
+			RunnerName: "smolrunner-job-1",
+			JobMessageBase: scaleset.JobMessageBase{
+				RunnerRequestID: 41,
+				RepositoryName:  "project",
+				OwnerName:       "example",
+				JobID:           "job-1",
+				WorkflowRunID:   99,
+				RequestLabels:   []string{"smolrunner"},
+			},
+		}},
+	}}
+	server := startedServer(t, backend)
+	restored := server.handle(context.Background(), protocolRequest{
+		Version:     protocolVersion,
+		Operation:   "resume",
+		LastAckedID: 7,
+	})
+	if restored.Type != "restored" || restored.MessageID != 7 || server.lastAckedID != 7 || !server.cursorSet {
+		t.Fatalf("resume response=%#v server=%#v", restored, server)
+	}
+	message := server.handle(context.Background(), protocolRequest{
+		Version:     protocolVersion,
+		Operation:   "poll",
+		MaxCapacity: 0,
+	})
+	if message.Type != "message" || message.MessageID != 8 || len(message.Events) != 1 || backend.maxCapacity != 0 {
+		t.Fatalf("zero-capacity lifecycle poll=%#v max_capacity=%d", message, backend.maxCapacity)
+	}
+}
+
+func TestResumeAndZeroCapacityPollFailClosed(t *testing.T) {
+	backend := &fakeBackend{message: &scaleset.RunnerScaleSetMessage{
+		MessageID:  8,
+		Statistics: &scaleset.RunnerScaleSetStatistic{TotalAvailableJobs: 1},
+		JobAvailableMessages: []*scaleset.JobAvailable{{JobMessageBase: scaleset.JobMessageBase{
+			RunnerRequestID: 41,
+			RepositoryName:  "project",
+			OwnerName:       "example",
+			JobID:           "job-1",
+			WorkflowRunID:   99,
+			RequestLabels:   []string{"smolrunner"},
+		}}},
+	}}
+	server := startedServer(t, backend)
+	if response := server.handle(context.Background(), protocolRequest{Version: protocolVersion, Operation: "resume", LastAckedID: 7}); response.Type != "restored" {
+		t.Fatalf("resume response=%#v", response)
+	}
+	if response := server.handle(context.Background(), protocolRequest{Version: protocolVersion, Operation: "resume", LastAckedID: 7}); response.Code != "invalid_recovery" {
+		t.Fatalf("repeated resume response=%#v", response)
+	}
+	if response := server.handle(context.Background(), protocolRequest{Version: protocolVersion, Operation: "poll", MaxCapacity: 0}); response.Code != "invalid_message" || server.pending != nil {
+		t.Fatalf("zero-capacity available response=%#v pending=%#v", response, server.pending)
+	}
+
+	idle := startedServer(t, &fakeBackend{})
+	if response := idle.handle(context.Background(), protocolRequest{Version: protocolVersion, Operation: "poll", MaxCapacity: 0}); response.Type != "idle" {
+		t.Fatalf("idle response=%#v", response)
+	}
+	if response := idle.handle(context.Background(), protocolRequest{Version: protocolVersion, Operation: "resume", LastAckedID: 7}); response.Code != "invalid_recovery" {
+		t.Fatalf("post-poll resume response=%#v", response)
+	}
+	if response := idle.handle(context.Background(), protocolRequest{Version: protocolVersion, Operation: "poll", MaxCapacity: 2}); response.Code != "invalid_capacity" {
+		t.Fatalf("oversized capacity response=%#v", response)
 	}
 }
 
@@ -213,15 +285,15 @@ func TestAckRejectsForeignOrDuplicateAcquisitionWithoutRepeatingDelete(t *testin
 		},
 	}
 	server := startedServer(t, backend)
-	if response := server.handle(context.Background(), protocolRequest{Version: 1, Operation: "poll"}); response.Type != "message" {
+	if response := server.handle(context.Background(), protocolRequest{Version: protocolVersion, Operation: "poll", MaxCapacity: 1}); response.Type != "message" {
 		t.Fatalf("poll response=%#v", response)
 	}
-	invalid := server.handle(context.Background(), protocolRequest{Version: 1, Operation: "ack", MessageID: 7})
+	invalid := server.handle(context.Background(), protocolRequest{Version: protocolVersion, Operation: "ack", MessageID: 7})
 	if invalid.Code != "invalid_acquisition" || server.pending == nil || !server.pending.deleted || server.lastAckedID != 0 {
 		t.Fatalf("invalid acquisition advanced state: response=%#v pending=%#v", invalid, server.pending)
 	}
 	backend.acquired = []int64{41}
-	valid := server.handle(context.Background(), protocolRequest{Version: 1, Operation: "ack", MessageID: 7})
+	valid := server.handle(context.Background(), protocolRequest{Version: protocolVersion, Operation: "ack", MessageID: 7})
 	if valid.Type != "acked" || !reflect.DeepEqual(valid.AcquiredRequests, []int64{41}) || !reflect.DeepEqual(backend.calls, []string{"poll", "delete:7", "acquire:[41]", "acquire:[41]"}) {
 		t.Fatalf("acquisition retry response=%#v calls=%v", valid, backend.calls)
 	}
@@ -241,14 +313,14 @@ func TestAcquiredJobIDsArePositiveUniqueSubset(t *testing.T) {
 func TestPollRejectsNonAdvancingMessageID(t *testing.T) {
 	backend := &fakeBackend{message: &scaleset.RunnerScaleSetMessage{MessageID: 7, Statistics: &scaleset.RunnerScaleSetStatistic{}}}
 	server := startedServer(t, backend)
-	if response := server.handle(context.Background(), protocolRequest{Version: 1, Operation: "poll"}); response.Type != "message" {
+	if response := server.handle(context.Background(), protocolRequest{Version: protocolVersion, Operation: "poll", MaxCapacity: 1}); response.Type != "message" {
 		t.Fatalf("first poll response=%#v", response)
 	}
-	if response := server.handle(context.Background(), protocolRequest{Version: 1, Operation: "ack", MessageID: 7}); response.Type != "acked" {
+	if response := server.handle(context.Background(), protocolRequest{Version: protocolVersion, Operation: "ack", MessageID: 7}); response.Type != "acked" {
 		t.Fatalf("ack response=%#v", response)
 	}
 	backend.message = &scaleset.RunnerScaleSetMessage{MessageID: 7, Statistics: &scaleset.RunnerScaleSetStatistic{}}
-	response := server.handle(context.Background(), protocolRequest{Version: 1, Operation: "poll"})
+	response := server.handle(context.Background(), protocolRequest{Version: protocolVersion, Operation: "poll", MaxCapacity: 1})
 	if response.Code != "invalid_message" || server.pending != nil || server.lastAckedID != 7 {
 		t.Fatalf("nonadvancing message response=%#v pending=%#v", response, server.pending)
 	}
@@ -314,7 +386,7 @@ func TestJITRevalidatesScaleSetPolicyBeforeAndAfterMutation(t *testing.T) {
 		validation: []error{nil, errors.New("injected post-JIT drift")},
 	}
 	server := startedServer(t, backend)
-	response := server.handle(context.Background(), protocolRequest{Version: 1, Operation: "generate_jit", RunnerName: "smolrunner-job-1", WorkFolder: "_work"})
+	response := server.handle(context.Background(), protocolRequest{Version: protocolVersion, Operation: "generate_jit", RunnerName: "smolrunner-job-1", WorkFolder: "_work"})
 	if response.Code != "scale_set_drift" || response.EncodedJITConfig != "" || response.Runner != nil || !reflect.DeepEqual(backend.calls, []string{"validate-set", "jit:smolrunner-job-1:_work", "validate-set"}) {
 		t.Fatalf("post-JIT drift response=%#v calls=%v", response, backend.calls)
 	}
@@ -406,21 +478,21 @@ func TestScaleSetValidationBindsIdentityLabelsAndUpdatePolicy(t *testing.T) {
 func TestRunnerRemovalReobservesExactScaleSetIdentity(t *testing.T) {
 	backend := &fakeBackend{runner: &scaleset.RunnerReference{ID: 81, Name: "smolrunner-job-1", RunnerScaleSetID: 23}}
 	server := startedServer(t, backend)
-	response := server.handle(context.Background(), protocolRequest{Version: 1, Operation: "remove_runner", RunnerID: 81, RunnerName: "smolrunner-job-1"})
+	response := server.handle(context.Background(), protocolRequest{Version: protocolVersion, Operation: "remove_runner", RunnerID: 81, RunnerName: "smolrunner-job-1"})
 	if response.Type != "removed" || response.Runner == nil || response.Runner.ID != 81 || response.Runner.Name != "smolrunner-job-1" || response.Runner.ScaleSetID != 23 || !reflect.DeepEqual(backend.calls, []string{"runner-id:81", "remove:81"}) {
 		t.Fatalf("remove response=%#v calls=%v", response, backend.calls)
 	}
 
 	backend.calls = nil
 	backend.runner.RunnerScaleSetID = 24
-	refused := server.handle(context.Background(), protocolRequest{Version: 1, Operation: "remove_runner", RunnerID: 81, RunnerName: "smolrunner-job-1"})
+	refused := server.handle(context.Background(), protocolRequest{Version: protocolVersion, Operation: "remove_runner", RunnerID: 81, RunnerName: "smolrunner-job-1"})
 	if refused.Code != "runner_unavailable" || !reflect.DeepEqual(backend.calls, []string{"runner-id:81"}) {
 		t.Fatalf("foreign remove response=%#v calls=%v", refused, backend.calls)
 	}
 
 	backend.calls = nil
 	backend.runner.RunnerScaleSetID = 23
-	refused = server.handle(context.Background(), protocolRequest{Version: 1, Operation: "remove_runner", RunnerID: 81, RunnerName: "replacement"})
+	refused = server.handle(context.Background(), protocolRequest{Version: protocolVersion, Operation: "remove_runner", RunnerID: 81, RunnerName: "replacement"})
 	if refused.Code != "runner_unavailable" || !reflect.DeepEqual(backend.calls, []string{"runner-id:81"}) {
 		t.Fatalf("name-rebound remove response=%#v calls=%v", refused, backend.calls)
 	}
@@ -444,7 +516,7 @@ func TestMessageBoundsFailBeforeAckAuthority(t *testing.T) {
 		}},
 	}}
 	server := startedServer(t, backend)
-	response := server.handle(context.Background(), protocolRequest{Version: 1, Operation: "poll"})
+	response := server.handle(context.Background(), protocolRequest{Version: protocolVersion, Operation: "poll", MaxCapacity: 1})
 	if response.Code != "invalid_message" || server.pending != nil || !reflect.DeepEqual(backend.calls, []string{"poll"}) {
 		t.Fatalf("invalid message response=%#v calls=%v", response, backend.calls)
 	}
@@ -476,7 +548,7 @@ func TestSerializedMessageBoundFailsBeforeAckAuthority(t *testing.T) {
 		JobStartedMessages: events,
 	}}
 	server := startedServer(t, backend)
-	response := server.handle(context.Background(), protocolRequest{Version: 1, Operation: "poll"})
+	response := server.handle(context.Background(), protocolRequest{Version: protocolVersion, Operation: "poll", MaxCapacity: 1})
 	if response.Code != "invalid_message" || server.pending != nil {
 		t.Fatalf("oversized serialized message response=%#v pending=%#v", response, server.pending)
 	}
@@ -498,7 +570,7 @@ func TestMessageRequiresExactRunnerLifecycleEvidenceBeforeAck(t *testing.T) {
 		}},
 	}}
 	server := startedServer(t, backend)
-	response := server.handle(context.Background(), protocolRequest{Version: 1, Operation: "poll"})
+	response := server.handle(context.Background(), protocolRequest{Version: protocolVersion, Operation: "poll", MaxCapacity: 1})
 	if response.Code != "invalid_message" || server.pending != nil || !reflect.DeepEqual(backend.calls, []string{"poll"}) {
 		t.Fatalf("incomplete start response=%#v calls=%v", response, backend.calls)
 	}
@@ -519,7 +591,7 @@ func TestMessageRequiresExactRunnerLifecycleEvidenceBeforeAck(t *testing.T) {
 			},
 		}},
 	}
-	response = server.handle(context.Background(), protocolRequest{Version: 1, Operation: "poll"})
+	response = server.handle(context.Background(), protocolRequest{Version: protocolVersion, Operation: "poll", MaxCapacity: 1})
 	if response.Code != "invalid_message" || server.pending != nil {
 		t.Fatalf("incomplete completion response=%#v", response)
 	}
@@ -542,7 +614,7 @@ func TestMessageAdmitsExactRunnerlessReassignmentCancellation(t *testing.T) {
 		}},
 	}}
 	server := startedServer(t, backend)
-	response := server.handle(context.Background(), protocolRequest{Version: 1, Operation: "poll"})
+	response := server.handle(context.Background(), protocolRequest{Version: protocolVersion, Operation: "poll", MaxCapacity: 1})
 	if response.Type != "message" || response.MessageID != 11 || len(response.Events) != 1 {
 		t.Fatalf("runnerless cancellation response=%#v", response)
 	}
@@ -556,7 +628,7 @@ func TestServeNeverWritesPrivateKeyOnStartFailure(t *testing.T) {
 	server := newServer(func(context.Context, startConfig) (backend, error) {
 		return nil, errors.New("injected start failure containing private key")
 	})
-	request := protocolRequest{Version: 1, Operation: "start", Start: validStart()}
+	request := protocolRequest{Version: protocolVersion, Operation: "start", Start: validStart()}
 	input, err := json.Marshal(request)
 	if err != nil {
 		t.Fatal(err)
