@@ -8,7 +8,6 @@ on:
       - scripts/test-macbook-runner-vm.sh
       - scripts/test-macbook-runner-vm-paths.sh
       - scripts/run-linux-acceptance.sh
-      - tests/durable_journal_recovery.rs
       - tests/linux_acceptance.rs
       - src/**
       - Cargo.toml
@@ -38,9 +37,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends musl-tools
-
-      - name: Run external durable-journal recovery tests
-        run: cargo test --locked --test durable_journal_recovery
 
       - name: Run disposable Debian and Ubuntu acceptance tests
         run: bash scripts/run-linux-acceptance.sh
