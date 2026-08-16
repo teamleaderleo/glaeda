@@ -41,6 +41,10 @@ const MAX_ENROLLMENT_BYTES: u64 = 64 * 1024;
 const MAX_PLIST_BYTES: u64 = 64 * 1024;
 #[cfg(target_os = "macos")]
 const LAUNCHCTL_TIMEOUT: Duration = Duration::from_secs(15);
+// The longest bridge exchange is the official Scale Set long poll, bounded at 75 seconds. Give
+// SIGTERM enough time to return from that exchange so normal Rust Drop can terminate and reap the
+// secret-bearing bridge child before launchd escalates to SIGKILL.
+const SERVICE_EXIT_TIMEOUT_SECONDS: u16 = 90;
 #[cfg(target_os = "macos")]
 const LAUNCHCTL_PROGRAM: &str = "/bin/launchctl";
 const APPLY_LOCK: &str = ".io.smolrunner.disposable-worker.apply.lock";
@@ -1240,6 +1244,8 @@ fn canonical_plist(
   <string>Background</string>\n\
   <key>ThrottleInterval</key>\n\
   <integer>10</integer>\n\
+  <key>ExitTimeOut</key>\n\
+  <integer>{SERVICE_EXIT_TIMEOUT_SECONDS}</integer>\n\
   <key>Umask</key>\n\
   <integer>63</integer>\n\
   <key>WorkingDirectory</key>\n\
@@ -1363,6 +1369,8 @@ mod tests {
         assert!(plist.contains("<string>--enrollment-digest</string>"));
         assert!(plist.contains(digest('b').as_str()));
         assert!(plist.contains("<key>KeepAlive</key>"));
+        assert!(plist.contains("<key>ExitTimeOut</key>"));
+        assert!(plist.contains("<integer>90</integer>"));
         assert!(!plist.contains("EnvironmentVariables"));
 
         let report = serde_json::to_string(plan.report()).unwrap();

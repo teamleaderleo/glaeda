@@ -192,7 +192,11 @@ then reads one protected canonical enrollment and requires its exact approved SH
 credential or process authority. The bounded supervisor already owns idle pacing,
 progress-burst yielding, failed/recovery-session discard, reconnect delays, retry backoff, and its
 five-minute circuit breaker. SIGTERM and SIGINT now interrupt those waits through the same bounded
-stop path without manufacturing external-operation success. #469/#470 add the pure exact
+stop path without manufacturing external-operation success. The secret-bearing bridge remains in
+the controller's launchd-owned process group, so launchd removes it even when SIGKILL prevents Rust
+unwinding. The LaunchAgent also gives the graceful stop path 90 seconds before escalation,
+exceeding the bridge's 75-second maximum long-poll exchange so normal Drop can terminate and reap
+the child first. #469/#470 add the pure exact
 LaunchAgent install/remove contract and CLI plan report around that service. The exact apply/remove
 engine consumes one explicitly approved plan and revalidates installation inputs while permitting
 exact cleanup after those inputs are lost or rotated. The CLI now exposes that engine only after

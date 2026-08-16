@@ -13,7 +13,6 @@ use std::io::{ErrorKind, Read, Write};
 use std::os::fd::AsFd;
 #[cfg(target_os = "macos")]
 use std::os::unix::fs::MetadataExt;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -591,8 +590,10 @@ impl ChildBridgeTransport {
             .current_dir("/")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .process_group(0);
+            .stderr(Stdio::null());
+        // Keep the bridge in the controller's process group. launchd kills every remaining
+        // member of a job's process group when the controller dies, including SIGKILL paths that
+        // cannot run Rust Drop. Explicit per-child termination below remains the normal path.
         let mut child = command
             .spawn()
             .map_err(|_| ScaleSetBridgeError::new("bridge_spawn_failed"))?;
@@ -2169,5 +2170,18 @@ mod tests {
         assert_eq!(error.code(), "bridge_response_timeout");
         assert!(transport.poisoned);
         assert!(transport.child.try_wait().unwrap().is_some());
+    }
+
+    #[test]
+    fn bridge_inherits_the_controller_process_group() {
+        use rustix::process::{Pid, getpgid, getpgrp};
+
+        let program = Path::new("/usr/bin/tail");
+        if !program.exists() {
+            return;
+        }
+        let transport = ChildBridgeTransport::spawn(program).unwrap();
+        let child = Pid::from_raw(transport.child.id() as _).unwrap();
+        assert_eq!(getpgid(Some(child)).unwrap(), getpgrp());
     }
 }
