@@ -24,7 +24,7 @@ use crate::disposable_launchd_service::{
 };
 use crate::process::{CommandSpec, ExecutionRecord, TimedCommandExecutor};
 
-pub const DISPOSABLE_LAUNCHD_SERVICE_STATUS_SCHEMA_VERSION: u8 = 1;
+pub const DISPOSABLE_LAUNCHD_SERVICE_STATUS_SCHEMA_VERSION: u8 = 2;
 const MAX_UID: u32 = 2_147_483_647;
 const MAX_PLIST_BYTES: u64 = 64 * 1024;
 const LAUNCHCTL_TIMEOUT: Duration = Duration::from_secs(15);
@@ -35,8 +35,25 @@ const LAUNCHCTL_PROGRAM: &str = "/bin/launchctl";
 pub enum DisposableLaunchdServiceObservedState {
     Absent,
     ConfigurationOnly,
-    RunningExact,
+    LoadedExact,
     LoadedWithoutConfiguration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DisposableLaunchdServiceRuntimeHealth {
+    NotRunning,
+    Unknown,
+}
+
+impl DisposableLaunchdServiceRuntimeHealth {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotRunning => "not_running",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -57,6 +74,8 @@ pub struct DisposableLaunchdServiceStatusReport {
     plan_identity: Sha256Digest,
     configuration_present: bool,
     service_loaded: bool,
+    runtime_health: DisposableLaunchdServiceRuntimeHealth,
+    #[serde(rename = "installation_remediation")]
     remediation: DisposableLaunchdServiceRemediation,
 }
 
@@ -84,6 +103,16 @@ impl DisposableLaunchdServiceStatusReport {
     #[must_use]
     pub const fn service_loaded(&self) -> bool {
         self.service_loaded
+    }
+
+    #[must_use]
+    pub const fn runtime_health(&self) -> DisposableLaunchdServiceRuntimeHealth {
+        self.runtime_health
+    }
+
+    #[must_use]
+    pub const fn installation_remediation(&self) -> DisposableLaunchdServiceRemediation {
+        self.remediation
     }
 
     #[must_use]
@@ -212,24 +241,7 @@ pub fn inspect_disposable_launchd_service_status(
         executor,
     )?;
     let service_loaded = launchd == LaunchdObservation::Exact;
-    let (state, remediation) = match (configuration_present, launchd) {
-        (false, LaunchdObservation::Absent) => (
-            DisposableLaunchdServiceObservedState::Absent,
-            DisposableLaunchdServiceRemediation::PlanAndApplyInstall,
-        ),
-        (true, LaunchdObservation::Absent) => (
-            DisposableLaunchdServiceObservedState::ConfigurationOnly,
-            DisposableLaunchdServiceRemediation::PlanAndApplyInstall,
-        ),
-        (true, LaunchdObservation::Exact) => (
-            DisposableLaunchdServiceObservedState::RunningExact,
-            DisposableLaunchdServiceRemediation::None,
-        ),
-        (false, LaunchdObservation::Exact) => (
-            DisposableLaunchdServiceObservedState::LoadedWithoutConfiguration,
-            DisposableLaunchdServiceRemediation::InspectUnsafeState,
-        ),
-    };
+    let (state, runtime_health, remediation) = classify_status(configuration_present, launchd);
 
     Ok(DisposableLaunchdServiceStatusReport {
         schema_version: DISPOSABLE_LAUNCHD_SERVICE_STATUS_SCHEMA_VERSION,
@@ -240,8 +252,41 @@ pub fn inspect_disposable_launchd_service_status(
         plan_identity: plan.report().plan_identity().clone(),
         configuration_present,
         service_loaded,
+        runtime_health,
         remediation,
     })
+}
+
+fn classify_status(
+    configuration_present: bool,
+    launchd: LaunchdObservation,
+) -> (
+    DisposableLaunchdServiceObservedState,
+    DisposableLaunchdServiceRuntimeHealth,
+    DisposableLaunchdServiceRemediation,
+) {
+    match (configuration_present, launchd) {
+        (false, LaunchdObservation::Absent) => (
+            DisposableLaunchdServiceObservedState::Absent,
+            DisposableLaunchdServiceRuntimeHealth::NotRunning,
+            DisposableLaunchdServiceRemediation::PlanAndApplyInstall,
+        ),
+        (true, LaunchdObservation::Absent) => (
+            DisposableLaunchdServiceObservedState::ConfigurationOnly,
+            DisposableLaunchdServiceRuntimeHealth::NotRunning,
+            DisposableLaunchdServiceRemediation::PlanAndApplyInstall,
+        ),
+        (true, LaunchdObservation::Exact) => (
+            DisposableLaunchdServiceObservedState::LoadedExact,
+            DisposableLaunchdServiceRuntimeHealth::Unknown,
+            DisposableLaunchdServiceRemediation::None,
+        ),
+        (false, LaunchdObservation::Exact) => (
+            DisposableLaunchdServiceObservedState::LoadedWithoutConfiguration,
+            DisposableLaunchdServiceRuntimeHealth::Unknown,
+            DisposableLaunchdServiceRemediation::InspectUnsafeState,
+        ),
+    }
 }
 
 fn launch_agent_path(operator_home: &Path) -> PathBuf {
@@ -603,19 +648,47 @@ mod tests {
     }
 
     #[test]
+    fn loaded_identity_never_claims_runtime_health() {
+        let (state, runtime_health, remediation) = classify_status(true, LaunchdObservation::Exact);
+        assert_eq!(state, DisposableLaunchdServiceObservedState::LoadedExact);
+        assert_eq!(
+            runtime_health,
+            DisposableLaunchdServiceRuntimeHealth::Unknown
+        );
+        assert_eq!(remediation, DisposableLaunchdServiceRemediation::None);
+
+        let (state, runtime_health, _) = classify_status(true, LaunchdObservation::Absent);
+        assert_eq!(
+            state,
+            DisposableLaunchdServiceObservedState::ConfigurationOnly
+        );
+        assert_eq!(
+            runtime_health,
+            DisposableLaunchdServiceRuntimeHealth::NotRunning
+        );
+    }
+
+    #[test]
     fn public_report_and_errors_are_path_free() {
         let report = DisposableLaunchdServiceStatusReport {
             schema_version: DISPOSABLE_LAUNCHD_SERVICE_STATUS_SCHEMA_VERSION,
-            state: DisposableLaunchdServiceObservedState::RunningExact,
+            state: DisposableLaunchdServiceObservedState::LoadedExact,
             service_label: DISPOSABLE_LAUNCHD_SERVICE_LABEL,
             service_scope: "user_launch_agent",
             launchd_domain: "gui/501".to_owned(),
             plan_identity: digest('a'),
             configuration_present: true,
             service_loaded: true,
+            runtime_health: DisposableLaunchdServiceRuntimeHealth::Unknown,
             remediation: DisposableLaunchdServiceRemediation::None,
         };
         let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("\"schema_version\":2"));
+        assert!(json.contains("\"state\":\"loaded_exact\""));
+        assert!(json.contains("\"runtime_health\":\"unknown\""));
+        assert!(json.contains("\"installation_remediation\":\"none\""));
+        assert!(!json.contains("running_exact"));
+        assert!(!json.contains("\"remediation\":"));
         assert!(!json.contains("/Users/"));
         assert!(!json.contains("/opt/"));
         assert!(!format!("{:?}", unsafe_state()).contains("/Users/"));

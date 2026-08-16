@@ -837,14 +837,15 @@ fn run_disposable_launchd_service_status(
             }
         }
         OutputFormat::Human => println!(
-            "disposable worker service status: state={}, label={}, scope=user_launch_agent, domain={}, plan={}, configuration_present={}, service_loaded={}, remediation={}",
+            "disposable worker service status: state={}, label={}, scope=user_launch_agent, domain={}, plan={}, configuration_present={}, service_loaded={}, runtime_health={}, installation_remediation={}",
             disposable_launchd_service_observed_state(report.state()),
             DISPOSABLE_LAUNCHD_SERVICE_LABEL,
             report.launchd_domain(),
             report.plan_identity().as_str(),
             report.configuration_present(),
             report.service_loaded(),
-            disposable_launchd_service_remediation(report.remediation()),
+            report.runtime_health().as_str(),
+            disposable_launchd_service_remediation(report.installation_remediation()),
         ),
     }
     ExitCode::SUCCESS
@@ -886,7 +887,7 @@ const fn disposable_launchd_service_observed_state(
     match state {
         DisposableLaunchdServiceObservedState::Absent => "absent",
         DisposableLaunchdServiceObservedState::ConfigurationOnly => "configuration_only",
-        DisposableLaunchdServiceObservedState::RunningExact => "running_exact",
+        DisposableLaunchdServiceObservedState::LoadedExact => "loaded_exact",
         DisposableLaunchdServiceObservedState::LoadedWithoutConfiguration => {
             "loaded_without_configuration"
         }
