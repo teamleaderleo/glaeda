@@ -26,13 +26,21 @@ pub enum DisposableServiceFailureKind {
 pub struct DisposableServiceFailureCode(String);
 
 impl DisposableServiceFailureCode {
-    /// Parse one bounded machine-only service failure code.
+    /// Validate one compile-time machine-only service failure code for a new receipt.
+    ///
+    /// Requiring `&'static str` preserves the existing disposable-service error boundary: normal
+    /// producers can record reviewed fixed codes, not runtime diagnostics or attacker-controlled
+    /// text. Strict document decoding validates the same grammar separately for retained receipts.
     ///
     /// # Errors
     ///
     /// Returns a fixed public error unless the code begins with a lowercase ASCII letter and then
     /// contains only lowercase ASCII letters, digits, or underscores within the v1 size bound.
-    pub fn parse(value: &str) -> Result<Self, DisposableServiceFailureReceiptError> {
+    pub fn from_static(value: &'static str) -> Result<Self, DisposableServiceFailureReceiptError> {
+        Self::parse_document(value)
+    }
+
+    fn parse_document(value: &str) -> Result<Self, DisposableServiceFailureReceiptError> {
         let mut bytes = value.bytes();
         if value.len() > MAX_FAILURE_CODE_BYTES
             || !bytes.next().is_some_and(|byte| byte.is_ascii_lowercase())
@@ -143,7 +151,7 @@ impl DisposableServiceFailureReceipt {
         let program_digest = parse_digest(&raw.program_digest)?;
         let enrollment_digest = parse_digest(&raw.enrollment_digest)?;
         let service_plan_identity = parse_digest(&raw.service_plan_identity)?;
-        let failure_code = DisposableServiceFailureCode::parse(&raw.failure_code)?;
+        let failure_code = DisposableServiceFailureCode::parse_document(&raw.failure_code)?;
         Self::new(
             program_digest,
             enrollment_digest,
@@ -306,7 +314,8 @@ mod tests {
             digest('2'),
             digest('3'),
             DisposableServiceFailureKind::Supervisor,
-            DisposableServiceFailureCode::parse("disposable_worker_bridge_unavailable").unwrap(),
+            DisposableServiceFailureCode::from_static("disposable_worker_bridge_unavailable")
+                .unwrap(),
             1_725_000_000_000,
             1_725_000_001_234,
             7,
@@ -394,7 +403,7 @@ mod tests {
             "contains/slash",
             "/Users/operator/private",
         ] {
-            let error = DisposableServiceFailureCode::parse(invalid).unwrap_err();
+            let error = DisposableServiceFailureCode::parse_document(invalid).unwrap_err();
             assert_eq!(
                 error.kind(),
                 DisposableServiceFailureReceiptErrorKind::InvalidFailureCode
@@ -403,7 +412,7 @@ mod tests {
         }
         let oversized = format!("a{}", "b".repeat(MAX_FAILURE_CODE_BYTES));
         assert_eq!(
-            DisposableServiceFailureCode::parse(&oversized)
+            DisposableServiceFailureCode::parse_document(&oversized)
                 .unwrap_err()
                 .kind(),
             DisposableServiceFailureReceiptErrorKind::InvalidFailureCode
@@ -417,7 +426,8 @@ mod tests {
             digest('2'),
             digest('3'),
             DisposableServiceFailureKind::DurableState,
-            DisposableServiceFailureCode::parse("disposable_worker_recovery_required").unwrap(),
+            DisposableServiceFailureCode::from_static("disposable_worker_recovery_required")
+                .unwrap(),
             10,
             9,
             0,
