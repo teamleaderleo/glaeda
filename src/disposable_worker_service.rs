@@ -234,11 +234,8 @@ impl InterruptibleSupervisorControl {
     fn for_process_signals() -> Result<Self, DisposableWorkerSupervisorError> {
         use signal_hook::consts::signal::{SIGINT, SIGTERM};
 
-        let (wake_read, wake_write) =
-            UnixStream::pair().map_err(|_| signal_control_error())?;
-        let sigint_write = wake_write
-            .try_clone()
-            .map_err(|_| signal_control_error())?;
+        let (wake_read, wake_write) = UnixStream::pair().map_err(|_| signal_control_error())?;
+        let sigint_write = wake_write.try_clone().map_err(|_| signal_control_error())?;
         let stop = Arc::new(AtomicBool::new(false));
         let mut signal_actions = Vec::with_capacity(4);
 
@@ -246,7 +243,10 @@ impl InterruptibleSupervisorControl {
             signal_actions.push(signal_hook::flag::register(SIGTERM, Arc::clone(&stop))?);
             signal_actions.push(signal_hook::low_level::pipe::register(SIGTERM, wake_write)?);
             signal_actions.push(signal_hook::flag::register(SIGINT, Arc::clone(&stop))?);
-            signal_actions.push(signal_hook::low_level::pipe::register(SIGINT, sigint_write)?);
+            signal_actions.push(signal_hook::low_level::pipe::register(
+                SIGINT,
+                sigint_write,
+            )?);
             Ok(())
         })();
         if setup.is_err() {
@@ -301,8 +301,8 @@ impl DisposableWorkerSupervisorControl for InterruptibleSupervisorControl {
         let started = Instant::now();
         loop {
             let remaining = duration.saturating_sub(started.elapsed());
-            let timeout = rustix::event::Timespec::try_from(remaining)
-                .map_err(|_| signal_control_error())?;
+            let timeout =
+                rustix::event::Timespec::try_from(remaining).map_err(|_| signal_control_error())?;
             let mut fds = [rustix::event::PollFd::new(
                 &self.wake_read,
                 rustix::event::PollFlags::IN,
@@ -474,8 +474,7 @@ mod tests {
     fn interruptible_control_wakes_promptly_when_stop_is_notified() {
         let (wake_read, mut wake_write) = UnixStream::pair().unwrap();
         let stop = Arc::new(AtomicBool::new(false));
-        let mut control =
-            InterruptibleSupervisorControl::for_test(Arc::clone(&stop), wake_read);
+        let mut control = InterruptibleSupervisorControl::for_test(Arc::clone(&stop), wake_read);
         let notifier = thread::spawn(move || {
             thread::sleep(Duration::from_millis(20));
             stop.store(true, Ordering::SeqCst);
