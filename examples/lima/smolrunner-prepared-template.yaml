@@ -76,18 +76,18 @@ provision:
 
       readonly runner_user="smolrunner-runner"
       readonly runner_home="/var/lib/smolrunner-runner"
-      readonly runner_work="${runner_home}/work"
-      readonly runner_diag="${runner_home}/diag"
       readonly install_parent="/opt/smolrunner"
       readonly install_dir="${install_parent}/actions-runner"
       readonly install_stage="${install_parent}/actions-runner.staging"
+      readonly runner_work="${install_dir}/_work"
+      readonly runner_diag="${install_dir}/_diag"
       readonly launcher_dir="${install_parent}/bin"
       readonly jit_launcher="${launcher_dir}/smolrunner-jit-launcher"
       readonly jit_launcher_stage="/var/tmp/smolrunner-jit-launcher.new"
       readonly jit_launcher_sha256="6f096fb518b6d40d45ca1a9923e423da436b6269fceec5a5989566abbc93a76a"
       readonly integrity_verifier="${launcher_dir}/smolrunner-runner-integrity"
       readonly integrity_verifier_stage="${integrity_verifier}.new"
-      readonly integrity_verifier_sha256="a1263acc41a6dd9dc31c6a93a2380e0f9c902afd5fc172c03aea0198ca16673a"
+      readonly integrity_verifier_sha256="c395062a45f0cb08270f581f912e16d550bc5f33d192af68f205e06609dd0cf7"
       readonly marker_dir="/etc/smolrunner"
       readonly runner_entries="${marker_dir}/actions-runner.entries"
       readonly runner_entries_stage="${runner_entries}.new"
@@ -149,10 +149,10 @@ provision:
       /usr/bin/install -d -o root -g root -m 0755 \
         "${install_parent}" "${launcher_dir}" "${marker_dir}"
       /usr/bin/install -d -o "${runner_user}" -g "${runner_user}" -m 0750 \
-        "${runner_home}" "${runner_work}" "${runner_diag}"
+        "${runner_home}"
 
       /usr/bin/printf '%s' \
-        'IyEvYmluL2Jhc2gKc2V0IC1ldW8gcGlwZWZhaWwKCmV4cG9ydCBQQVRIPS91c3Ivc2JpbjovdXNyL2Jpbjovc2JpbjovYmluCgpyZWFkb25seSBpbnN0YWxsX2Rpcj0iL29wdC9zbW9scnVubmVyL2FjdGlvbnMtcnVubmVyIgpyZWFkb25seSBlbnRyaWVzPSIvZXRjL3Ntb2xydW5uZXIvYWN0aW9ucy1ydW5uZXIuZW50cmllcyIKcmVhZG9ubHkgY2hlY2tzdW1zPSIvZXRjL3Ntb2xydW5uZXIvYWN0aW9ucy1ydW5uZXIuc2hhMjU2IgpyZWFkb25seSBydW5uZXJfd29yaz0iL3Zhci9saWIvc21vbHJ1bm5lci1ydW5uZXIvd29yayIKcmVhZG9ubHkgcnVubmVyX2RpYWc9Ii92YXIvbGliL3Ntb2xydW5uZXItcnVubmVyL2RpYWciCnJlYWRvbmx5IGppdF9sYXVuY2hlcj0iL29wdC9zbW9scnVubmVyL2Jpbi9zbW9scnVubmVyLWppdC1sYXVuY2hlciIKcmVhZG9ubHkgaml0X2xhdW5jaGVyX3NoYTI1Nj0iNmYwOTZmYjUxOGI2ZDQwZDQ1Y2ExYTk5MjNlNDIzZGE0MzZiNjI2OWZjZWVjNWE1OTg5NTY2YWJiYzkzYTc2YSIKCltbICIkKC91c3IvYmluL2lkIC11KSIgPT0gIjAiIF1dCltbICIkKC91c3IvYmluL3N0YXQgLS1mb3JtYXQ9JVU6JUc6JWE6JUYgIiR7aW5zdGFsbF9kaXJ9IikiID09ICJyb290OnNtb2xydW5uZXItcnVubmVyOjE3NzU6ZGlyZWN0b3J5IiBdXQpbWyAiJCgvdXNyL2Jpbi9zdGF0IC0tZm9ybWF0PSVVOiVHOiVhOiVGICIke2VudHJpZXN9IikiID09ICJyb290OnJvb3Q6NDQ0OnJlZ3VsYXIgZmlsZSIgXV0KW1sgIiQoL3Vzci9iaW4vc3RhdCAtLWZvcm1hdD0lVTolRzolYTolRiAiJHtjaGVja3N1bXN9IikiID09ICJyb290OnJvb3Q6NDQ0OnJlZ3VsYXIgZmlsZSIgXV0KW1sgIiQoL3Vzci9iaW4vc3RhdCAtLWZvcm1hdD0lVTolRzolYTolRiAiJHtqaXRfbGF1bmNoZXJ9IikiID09ICJyb290OnJvb3Q6NzU1OnJlZ3VsYXIgZmlsZSIgXV0KW1sgLUwgIiR7aW5zdGFsbF9kaXJ9L193b3JrIiAmJiAiJCgvdXNyL2Jpbi9yZWFkbGluayAiJHtpbnN0YWxsX2Rpcn0vX3dvcmsiKSIgPT0gIiR7cnVubmVyX3dvcmt9IiBdXQpbWyAtTCAiJHtpbnN0YWxsX2Rpcn0vX2RpYWciICYmICIkKC91c3IvYmluL3JlYWRsaW5rICIke2luc3RhbGxfZGlyfS9fZGlhZyIpIiA9PSAiJHtydW5uZXJfZGlhZ30iIF1dCltbICIkKC91c3IvYmluL3N0YXQgLS1mb3JtYXQ9JVU6JUc6JWE6JUYgIiR7cnVubmVyX3dvcmt9IikiID09ICJzbW9scnVubmVyLXJ1bm5lcjpzbW9scnVubmVyLXJ1bm5lcjo3NTA6ZGlyZWN0b3J5IiBdXQpbWyAiJCgvdXNyL2Jpbi9zdGF0IC0tZm9ybWF0PSVVOiVHOiVhOiVGICIke3J1bm5lcl9kaWFnfSIpIiA9PSAic21vbHJ1bm5lci1ydW5uZXI6c21vbHJ1bm5lci1ydW5uZXI6NzUwOmRpcmVjdG9yeSIgXV0KCmlmIC91c3IvYmluL2ZpbmQgLVAgIiR7aW5zdGFsbF9kaXJ9IiAteGRldiAtbWluZGVwdGggMSAhIC11c2VyIHJvb3QgLXByaW50IC1xdWl0IHwgL3Vzci9iaW4vZ3JlcCAtcSAuOyB0aGVuCiAgZXhpdCAxCmZpCmlmIC91c3IvYmluL2ZpbmQgLVAgIiR7aW5zdGFsbF9kaXJ9IiAteGRldiAtbWluZGVwdGggMSAhIC10eXBlIGwgLXBlcm0gLzAyMiAtcHJpbnQgLXF1aXQgfCAvdXNyL2Jpbi9ncmVwIC1xIC47IHRoZW4KICBleGl0IDEKZmkKCigKICBjZCAiJHtpbnN0YWxsX2Rpcn0iCiAgL3Vzci9iaW4vZmluZCAtUCAuIC14ZGV2IC1taW5kZXB0aCAxIC1wcmludGYgJyV5ICVtICVQICVsXG4nIHwgL3Vzci9iaW4vc29ydAopIHwgL3Vzci9iaW4vY21wIC0tc2lsZW50IC0gIiR7ZW50cmllc30iCigKICBjZCAiJHtpbnN0YWxsX2Rpcn0iCiAgL3Vzci9iaW4vc2hhMjU2c3VtIC0tY2hlY2sgLS1zdHJpY3QgLS1xdWlldCAiJHtjaGVja3N1bXN9IgopCi91c3IvYmluL3ByaW50ZiAnJXNcbicgIiR7aml0X2xhdW5jaGVyX3NoYTI1Nn0gICR7aml0X2xhdW5jaGVyfSIgfCAvdXNyL2Jpbi9zaGEyNTZzdW0gLS1jaGVjayAtLXN0YXR1cwoKL3Vzci9iaW4vcHJpbnRmICclc1xuJyAnc21vbHJ1bm5lci1ydW5uZXItaW50ZWdyaXR5LW9rJwo=' \
+        'IyEvYmluL2Jhc2gKc2V0IC1ldW8gcGlwZWZhaWwKCmV4cG9ydCBQQVRIPS91c3Ivc2JpbjovdXNyL2Jpbjovc2JpbjovYmluCgpyZWFkb25seSBpbnN0YWxsX2Rpcj0iL29wdC9zbW9scnVubmVyL2FjdGlvbnMtcnVubmVyIgpyZWFkb25seSBlbnRyaWVzPSIvZXRjL3Ntb2xydW5uZXIvYWN0aW9ucy1ydW5uZXIuZW50cmllcyIKcmVhZG9ubHkgY2hlY2tzdW1zPSIvZXRjL3Ntb2xydW5uZXIvYWN0aW9ucy1ydW5uZXIuc2hhMjU2IgpyZWFkb25seSBydW5uZXJfd29yaz0iJHtpbnN0YWxsX2Rpcn0vX3dvcmsiCnJlYWRvbmx5IHJ1bm5lcl9kaWFnPSIke2luc3RhbGxfZGlyfS9fZGlhZyIKcmVhZG9ubHkgaml0X2xhdW5jaGVyPSIvb3B0L3Ntb2xydW5uZXIvYmluL3Ntb2xydW5uZXItaml0LWxhdW5jaGVyIgpyZWFkb25seSBqaXRfbGF1bmNoZXJfc2hhMjU2PSI2ZjA5NmZiNTE4YjZkNDBkNDVjYTFhOTkyM2U0MjNkYTQzNmI2MjY5ZmNlZWM1YTU5ODk1NjZhYmJjOTNhNzZhIgoKW1sgIiQoL3Vzci9iaW4vaWQgLXUpIiA9PSAiMCIgXV0KW1sgIiQoL3Vzci9iaW4vc3RhdCAtLWZvcm1hdD0lVTolRzolYTolRiAiJHtpbnN0YWxsX2Rpcn0iKSIgPT0gInJvb3Q6c21vbHJ1bm5lci1ydW5uZXI6MTc3NTpkaXJlY3RvcnkiIF1dCltbICIkKC91c3IvYmluL3N0YXQgLS1mb3JtYXQ9JVU6JUc6JWE6JUYgIiR7ZW50cmllc30iKSIgPT0gInJvb3Q6cm9vdDo0NDQ6cmVndWxhciBmaWxlIiBdXQpbWyAiJCgvdXNyL2Jpbi9zdGF0IC0tZm9ybWF0PSVVOiVHOiVhOiVGICIke2NoZWNrc3Vtc30iKSIgPT0gInJvb3Q6cm9vdDo0NDQ6cmVndWxhciBmaWxlIiBdXQpbWyAiJCgvdXNyL2Jpbi9zdGF0IC0tZm9ybWF0PSVVOiVHOiVhOiVGICIke2ppdF9sYXVuY2hlcn0iKSIgPT0gInJvb3Q6cm9vdDo3NTU6cmVndWxhciBmaWxlIiBdXQpbWyAiJCgvdXNyL2Jpbi9zdGF0IC0tZm9ybWF0PSVVOiVHOiVhOiVGICIke3J1bm5lcl93b3JrfSIpIiA9PSAic21vbHJ1bm5lci1ydW5uZXI6c21vbHJ1bm5lci1ydW5uZXI6NzUwOmRpcmVjdG9yeSIgXV0KW1sgIiQoL3Vzci9iaW4vc3RhdCAtLWZvcm1hdD0lVTolRzolYTolRiAiJHtydW5uZXJfZGlhZ30iKSIgPT0gInNtb2xydW5uZXItcnVubmVyOnNtb2xydW5uZXItcnVubmVyOjc1MDpkaXJlY3RvcnkiIF1dCgppZiAvdXNyL2Jpbi9maW5kIC1QICIke2luc3RhbGxfZGlyfSIgLXhkZXYgLW1pbmRlcHRoIDEgXAogIFwoIC1wYXRoICIke3J1bm5lcl93b3JrfSIgLW8gLXBhdGggIiR7cnVubmVyX2RpYWd9IiBcKSAtcHJ1bmUgLW8gXAogICEgLXVzZXIgcm9vdCAtcHJpbnQgLXF1aXQgfCAvdXNyL2Jpbi9ncmVwIC1xIC47IHRoZW4KICBleGl0IDEKZmkKaWYgL3Vzci9iaW4vZmluZCAtUCAiJHtpbnN0YWxsX2Rpcn0iIC14ZGV2IC1taW5kZXB0aCAxIFwKICBcKCAtcGF0aCAiJHtydW5uZXJfd29ya30iIC1vIC1wYXRoICIke3J1bm5lcl9kaWFnfSIgXCkgLXBydW5lIC1vIFwKICAtcGVybSAvMDIyIC1wcmludCAtcXVpdCB8IC91c3IvYmluL2dyZXAgLXEgLjsgdGhlbgogIGV4aXQgMQpmaQoKKAogIGNkICIke2luc3RhbGxfZGlyfSIKICAvdXNyL2Jpbi9maW5kIC1QIC4gLXhkZXYgLW1pbmRlcHRoIDEgLXByaW50ZiAnJXkgJW0gJVAgJWxcbicgfCAvdXNyL2Jpbi9zb3J0CikgfCAvdXNyL2Jpbi9jbXAgLS1zaWxlbnQgLSAiJHtlbnRyaWVzfSIKKAogIGNkICIke2luc3RhbGxfZGlyfSIKICAvdXNyL2Jpbi9zaGEyNTZzdW0gLS1jaGVjayAtLXN0cmljdCAtLXF1aWV0ICIke2NoZWNrc3Vtc30iCikKL3Vzci9iaW4vcHJpbnRmICclc1xuJyAiJHtqaXRfbGF1bmNoZXJfc2hhMjU2fSAgJHtqaXRfbGF1bmNoZXJ9IiB8IC91c3IvYmluL3NoYTI1NnN1bSAtLWNoZWNrIC0tc3RhdHVzCgovdXNyL2Jpbi9wcmludGYgJyVzXG4nICdzbW9scnVubmVyLXJ1bm5lci1pbnRlZ3JpdHktb2snCg==' \
         | /usr/bin/base64 --decode >"${integrity_verifier_stage}"
       /usr/bin/printf '%s  %s\n' "${integrity_verifier_sha256}" "${integrity_verifier_stage}" \
         | /usr/bin/sha256sum --check --status
@@ -167,7 +167,7 @@ provision:
           '  "actions_runner_digest": "sha256:58b758e420b87093fbd4bfddd368074960053e2f1388f01848c82624b90f27d1",' \
           '  "workload_user": "smolrunner-runner",' \
           '  "runner_install_directory": "/opt/smolrunner/actions-runner",' \
-          '  "runner_work_directory": "/var/lib/smolrunner-runner/work",' \
+          '  "runner_work_directory": "/opt/smolrunner/actions-runner/_work",' \
           '  "jit_launcher_path": "/opt/smolrunner/bin/smolrunner-jit-launcher",' \
           '  "jit_launcher_digest": "sha256:6f096fb518b6d40d45ca1a9923e423da436b6269fceec5a5989566abbc93a76a"' \
           '}')
@@ -221,8 +221,8 @@ provision:
       /usr/bin/chown -R root:root "${install_stage}"
       /usr/bin/chown root:"${runner_user}" "${install_stage}"
       /usr/bin/chmod 1775 "${install_stage}"
-      /usr/bin/ln --symbolic "${runner_work}" "${install_stage}/_work"
-      /usr/bin/ln --symbolic "${runner_diag}" "${install_stage}/_diag"
+      /usr/bin/install -d -o "${runner_user}" -g "${runner_user}" -m 0750 \
+        "${install_stage}/_work" "${install_stage}/_diag"
       (
         cd "${install_stage}"
         /usr/bin/find -P . -xdev -mindepth 1 -printf '%y %m %P %l\n' | /usr/bin/sort
@@ -258,7 +258,7 @@ provision:
         '  "actions_runner_digest": "sha256:58b758e420b87093fbd4bfddd368074960053e2f1388f01848c82624b90f27d1",' \
         '  "workload_user": "smolrunner-runner",' \
         '  "runner_install_directory": "/opt/smolrunner/actions-runner",' \
-        '  "runner_work_directory": "/var/lib/smolrunner-runner/work",' \
+        '  "runner_work_directory": "/opt/smolrunner/actions-runner/_work",' \
         '  "jit_launcher_path": "/opt/smolrunner/bin/smolrunner-jit-launcher",' \
         '  "jit_launcher_digest": "sha256:6f096fb518b6d40d45ca1a9923e423da436b6269fceec5a5989566abbc93a76a"' \
         '}' >"${marker_stage}"

@@ -443,7 +443,7 @@ fn validate_wire(
         || provisioning.workload_user != "smolrunner-runner"
         || provisioning.admin_user == provisioning.workload_user
         || provisioning.runner_install_directory != "/opt/smolrunner/actions-runner"
-        || provisioning.runner_work_directory != "/var/lib/smolrunner-runner/work"
+        || provisioning.runner_work_directory != "/opt/smolrunner/actions-runner/_work"
         || provisioning.jit_launcher_path != "/opt/smolrunner/bin/smolrunner-jit-launcher"
         || provisioning.jit_launcher_digest
             != "sha256:6f096fb518b6d40d45ca1a9923e423da436b6269fceec5a5989566abbc93a76a"
@@ -586,7 +586,7 @@ mod tests {
         );
         assert_eq!(
             manifest.lima_template_digest().as_str(),
-            "sha256:7d291591b6ce6b21af010c26bef26decff6b29a2fdf81dcb7310c3d438801d7c"
+            "sha256:d1212b6ffd204f536bea99e6a1a4a59d65f2d144a1c84c535e43d1f4029f7fb7"
         );
         assert_eq!(
             manifest.ready_marker_path(),
@@ -601,7 +601,7 @@ mod tests {
         );
         assert_eq!(
             manifest.identity().unwrap().as_str(),
-            "sha256:15ffb8b3b363ef33fd95377208d38b4f47f5eaf80e9625c264efffde3f1b6f37"
+            "sha256:9adca6ac0f626dcb85cd0efc27ef2d4c33f394b01b1db2809cf53f6ab003268a"
         );
     }
 

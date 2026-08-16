@@ -6,8 +6,8 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 readonly install_dir="/opt/smolrunner/actions-runner"
 readonly entries="/etc/smolrunner/actions-runner.entries"
 readonly checksums="/etc/smolrunner/actions-runner.sha256"
-readonly runner_work="/var/lib/smolrunner-runner/work"
-readonly runner_diag="/var/lib/smolrunner-runner/diag"
+readonly runner_work="${install_dir}/_work"
+readonly runner_diag="${install_dir}/_diag"
 readonly jit_launcher="/opt/smolrunner/bin/smolrunner-jit-launcher"
 readonly jit_launcher_sha256="6f096fb518b6d40d45ca1a9923e423da436b6269fceec5a5989566abbc93a76a"
 
@@ -16,15 +16,17 @@ readonly jit_launcher_sha256="6f096fb518b6d40d45ca1a9923e423da436b6269fceec5a598
 [[ "$(/usr/bin/stat --format=%U:%G:%a:%F "${entries}")" == "root:root:444:regular file" ]]
 [[ "$(/usr/bin/stat --format=%U:%G:%a:%F "${checksums}")" == "root:root:444:regular file" ]]
 [[ "$(/usr/bin/stat --format=%U:%G:%a:%F "${jit_launcher}")" == "root:root:755:regular file" ]]
-[[ -L "${install_dir}/_work" && "$(/usr/bin/readlink "${install_dir}/_work")" == "${runner_work}" ]]
-[[ -L "${install_dir}/_diag" && "$(/usr/bin/readlink "${install_dir}/_diag")" == "${runner_diag}" ]]
 [[ "$(/usr/bin/stat --format=%U:%G:%a:%F "${runner_work}")" == "smolrunner-runner:smolrunner-runner:750:directory" ]]
 [[ "$(/usr/bin/stat --format=%U:%G:%a:%F "${runner_diag}")" == "smolrunner-runner:smolrunner-runner:750:directory" ]]
 
-if /usr/bin/find -P "${install_dir}" -xdev -mindepth 1 ! -user root -print -quit | /usr/bin/grep -q .; then
+if /usr/bin/find -P "${install_dir}" -xdev -mindepth 1 \
+  \( -path "${runner_work}" -o -path "${runner_diag}" \) -prune -o \
+  ! -user root -print -quit | /usr/bin/grep -q .; then
   exit 1
 fi
-if /usr/bin/find -P "${install_dir}" -xdev -mindepth 1 ! -type l -perm /022 -print -quit | /usr/bin/grep -q .; then
+if /usr/bin/find -P "${install_dir}" -xdev -mindepth 1 \
+  \( -path "${runner_work}" -o -path "${runner_diag}" \) -prune -o \
+  -perm /022 -print -quit | /usr/bin/grep -q .; then
   exit 1
 fi
 

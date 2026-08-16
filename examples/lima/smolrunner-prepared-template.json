@@ -19,15 +19,15 @@
     "disk_bytes": 21474836480
   },
   "provisioning": {
-    "recipe_revision": 5,
-    "lima_template_digest": "sha256:7d291591b6ce6b21af010c26bef26decff6b29a2fdf81dcb7310c3d438801d7c",
+    "recipe_revision": 6,
+    "lima_template_digest": "sha256:d1212b6ffd204f536bea99e6a1a4a59d65f2d144a1c84c535e43d1f4029f7fb7",
     "admin_user": "smolrunner-admin",
     "admin_uid": 1000,
     "admin_comment": "SmolRunner controller",
     "admin_passwordless_sudo": true,
     "workload_user": "smolrunner-runner",
     "runner_install_directory": "/opt/smolrunner/actions-runner",
-    "runner_work_directory": "/var/lib/smolrunner-runner/work",
+    "runner_work_directory": "/opt/smolrunner/actions-runner/_work",
     "jit_launcher_path": "/opt/smolrunner/bin/smolrunner-jit-launcher",
     "jit_launcher_digest": "sha256:6f096fb518b6d40d45ca1a9923e423da436b6269fceec5a5989566abbc93a76a",
     "ready_marker_path": "/etc/smolrunner/prepared-template.json",

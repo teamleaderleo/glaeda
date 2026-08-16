@@ -1362,7 +1362,6 @@ mod tests {
                 "vmType": "vz",
                 "arch": "aarch64",
                 "plain": true,
-                "mounts": [],
                 "networks": [],
                 "portForwards": [],
                 "propagateProxyEnv": false,
@@ -1529,13 +1528,13 @@ mod tests {
                     .last()
                     .is_some_and(|value| value == "/etc/smolrunner/prepared-template.json")
                 {
-                    "5f87e7b3086c99c4b3cfd8d7404bdc8f855cf89d37b79980f9c8549ed154a26d  /etc/smolrunner/prepared-template.json\n".to_owned()
+                    "639a1e7b41aa6c9ac1c6bc371a23ea954117c6227a65bfda2d2eba4fa7d83091  /etc/smolrunner/prepared-template.json\n".to_owned()
                 } else if argv
                     .last()
                     .is_some_and(|value| value == "/opt/smolrunner/bin/smolrunner-runner-integrity")
                     && argv.iter().any(|value| value == "/usr/bin/sha256sum")
                 {
-                    "a1263acc41a6dd9dc31c6a93a2380e0f9c902afd5fc172c03aea0198ca16673a  /opt/smolrunner/bin/smolrunner-runner-integrity\n".to_owned()
+                    "c395062a45f0cb08270f581f912e16d550bc5f33d192af68f205e06609dd0cf7  /opt/smolrunner/bin/smolrunner-runner-integrity\n".to_owned()
                 } else if argv
                     .last()
                     .is_some_and(|value| value == "/opt/smolrunner/bin/smolrunner-runner-integrity")
@@ -1866,7 +1865,7 @@ mod tests {
             host.lima_home(),
             LimaVmType::Vz,
             LimaArchitecture::Aarch64,
-            "/var/lib/smolrunner-runner/work",
+            "/opt/smolrunner/actions-runner/_work",
             30,
         )
         .unwrap();
