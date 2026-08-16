@@ -3,12 +3,11 @@
 use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::fs::{self, DirBuilder, File, OpenOptions};
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _};
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -26,6 +25,7 @@ const CHILD_MODE: &str = "controller";
 const LAUNCHCTL: &str = "/bin/launchctl";
 const ENV: &str = "/usr/bin/env";
 const SLEEP: &str = "/bin/sleep";
+const SYSTEM_RANDOM_SOURCE: &str = "/dev/urandom";
 const SLEEP_SECONDS: &str = "120";
 const PLIST_NAME: &str = "transient-execution.plist";
 const OWNERSHIP_MARKER: &str = "ownership-committed";
@@ -36,8 +36,6 @@ const STARTED_BYTES: &[u8] = b"started-v1\n";
 const LAUNCHCTL_TIMEOUT: Duration = Duration::from_secs(15);
 const CHECKPOINT_WAIT: Duration = Duration::from_secs(30);
 const START_WAIT: Duration = Duration::from_secs(30);
-
-static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy)]
 struct DirectoryIdentity {
@@ -93,21 +91,15 @@ impl FileIdentity {
     fn capture(path: &Path, expected: &[u8], uid: u32, gid: u32) -> Self {
         let before = fs::symlink_metadata(path).expect("capture exact launchd proof plist identity");
         assert!(
-            before.file_type().is_file() && !before.file_type().is_symlink(),
-            "launchd proof plist must be one real file"
-        );
-        assert_eq!(before.uid(), uid, "launchd proof plist owner drifted");
-        assert_eq!(before.gid(), gid, "launchd proof plist group drifted");
-        assert_eq!(
-            before.mode() & 0o7777,
-            0o600,
-            "launchd proof plist mode drifted"
-        );
-        assert_eq!(before.nlink(), 1, "launchd proof plist must not be hard-linked");
-        assert_eq!(
-            before.len(),
-            u64::try_from(expected.len()).expect("plist length fits u64"),
-            "launchd proof plist length drifted"
+            before.file_type().is_file()
+                && !before.file_type().is_symlink()
+                && before.uid() == uid
+                && before.gid() == gid
+                && before.mode() & 0o7777 == 0o600
+                && before.nlink() == 1
+                && before.len()
+                    == u64::try_from(expected.len()).expect("plist length fits u64"),
+            "launchd proof plist metadata is not exact"
         );
         assert!(
             fs::read(path).is_ok_and(|bytes| bytes == expected),
@@ -206,7 +198,7 @@ impl Drop for ControllerChildGuard {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum LaunchdObservation {
     Absent,
     Exact { pid: Option<u32> },
@@ -226,33 +218,43 @@ struct PhysicalLaunchdFixture {
 
 impl PhysicalLaunchdFixture {
     fn new() -> Self {
-        assert_eq!(
-            std::env::consts::ARCH,
-            "aarch64",
+        assert!(
+            std::env::consts::ARCH == "aarch64",
             "launchd execution proof requires Apple silicon"
         );
         let uid = geteuid().as_raw();
         let gid = getegid().as_raw();
-        assert_ne!(uid, 0, "launchd execution proof must run as the non-root operator");
-        assert!(Path::new(LAUNCHCTL).is_file(), "launchctl must exist at the reviewed path");
-        assert!(Path::new(ENV).is_file(), "env must exist at the reviewed path");
-        assert!(Path::new(SLEEP).is_file(), "sleep must exist at the reviewed path");
+        assert!(
+            uid != 0,
+            "launchd execution proof must run as the non-root operator"
+        );
+        assert!(
+            Path::new(LAUNCHCTL).is_file(),
+            "launchctl must exist at the reviewed path"
+        );
+        assert!(
+            Path::new(ENV).is_file(),
+            "env must exist at the reviewed path"
+        );
+        assert!(
+            Path::new(SLEEP).is_file(),
+            "sleep must exist at the reviewed path"
+        );
 
-        let sequence = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
-        let root = PathBuf::from("/private/tmp").join(format!(
-            "smolrunner-launchd-exec-proof-{}-{sequence}",
-            std::process::id()
-        ));
+        let identity = fresh_execution_identity();
+        let root = PathBuf::from("/private/tmp")
+            .join(format!("smolrunner-launchd-exec-proof-{identity}"));
         DirBuilder::new()
             .mode(0o700)
             .create(&root)
             .expect("create exact launchd proof root");
         let root_identity = DirectoryIdentity::capture(&root);
-        assert_eq!(root_identity.uid, uid, "launchd proof root owner drifted");
-        assert_eq!(root_identity.gid, gid, "launchd proof root group drifted");
-        assert_eq!(root_identity.mode, 0o700, "launchd proof root mode drifted");
+        assert!(
+            root_identity.uid == uid && root_identity.gid == gid && root_identity.mode == 0o700,
+            "launchd proof root ownership or mode drifted"
+        );
 
-        let label = format!("io.smolrunner.execution-proof.{}-{sequence}", std::process::id());
+        let label = format!("io.smolrunner.execution-proof.{identity}");
         let plist_bytes = plist_bytes(&label);
         let plist = root.join(PLIST_NAME);
         publish_exact_file(&root, &plist, &plist_bytes);
@@ -275,9 +277,10 @@ impl PhysicalLaunchdFixture {
         let uid = geteuid().as_raw();
         let gid = getegid().as_raw();
         let root_identity = DirectoryIdentity::capture(&root);
-        assert_eq!(root_identity.uid, uid, "launchd proof root owner drifted");
-        assert_eq!(root_identity.gid, gid, "launchd proof root group drifted");
-        assert_eq!(root_identity.mode, 0o700, "launchd proof root mode drifted");
+        assert!(
+            root_identity.uid == uid && root_identity.gid == gid && root_identity.mode == 0o700,
+            "launchd proof root ownership or mode drifted"
+        );
         let plist_bytes = plist_bytes(&label);
         let plist = root.join(PLIST_NAME);
         let plist_identity = FileIdentity::capture(&plist, &plist_bytes, uid, gid);
@@ -555,6 +558,18 @@ impl Drop for PhysicalLaunchdFixture {
     }
 }
 
+fn fresh_execution_identity() -> String {
+    let mut source = File::open(SYSTEM_RANDOM_SOURCE).expect("open system random source");
+    let mut random = [0_u8; 16];
+    source
+        .read_exact(&mut random)
+        .expect("read exact launchd proof identity entropy");
+    random
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 fn plist_bytes(label: &str) -> Vec<u8> {
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n  <key>Label</key>\n  <string>{label}</string>\n  <key>ProgramArguments</key>\n  <array>\n    <string>{ENV}</string>\n    <string>-i</string>\n    <string>{SLEEP}</string>\n    <string>{SLEEP_SECONDS}</string>\n  </array>\n</dict>\n</plist>\n"
@@ -635,17 +650,19 @@ fn physical_transient_launchd_execution_controller_child() {
     let label = std::env::var(LABEL_ENV).expect("child launchd proof label");
     let fixture = PhysicalLaunchdFixture::reopen(root, label);
 
-    assert_eq!(
-        fixture.observe().expect("observe initial exact launchd state"),
-        LaunchdObservation::Absent,
+    let initial = fixture.observe().expect("observe initial exact launchd state");
+    assert!(
+        initial == LaunchdObservation::Absent,
         "transient launchd proof service must begin absent"
     );
-    fixture.bootstrap().expect("bootstrap exact transient launchd job");
-    assert_eq!(
-        fixture
-            .observe()
-            .expect("observe exact bootstrapped launchd job"),
-        LaunchdObservation::Exact { pid: None },
+    fixture
+        .bootstrap()
+        .expect("bootstrap exact transient launchd job");
+    let bootstrapped = fixture
+        .observe()
+        .expect("observe exact bootstrapped launchd job");
+    assert!(
+        matches!(bootstrapped, LaunchdObservation::Exact { pid: None }),
         "bootstrap must register the exact job without starting it"
     );
 
@@ -658,15 +675,17 @@ fn physical_transient_launchd_execution_controller_child() {
         ),
         "parent never durably authorized the exact transient launchd start"
     );
-    assert_eq!(
-        fixture
-            .observe()
-            .expect("re-observe exact launchd job before kickstart"),
-        LaunchdObservation::Exact { pid: None },
+    let gated = fixture
+        .observe()
+        .expect("re-observe exact launchd job before kickstart");
+    assert!(
+        matches!(gated, LaunchdObservation::Exact { pid: None }),
         "transient launchd job started before the exact external start gate"
     );
 
-    fixture.kickstart().expect("kickstart exact transient launchd job");
+    fixture
+        .kickstart()
+        .expect("kickstart exact transient launchd job");
     fixture
         .wait_for_running(START_WAIT)
         .expect("observe exact transient launchd job running");
@@ -685,9 +704,9 @@ fn physical_transient_launchd_execution_is_registered_before_start_and_survives_
         "set the exact transient launchd execution physical acceptance token"
     );
     let fixture = PhysicalLaunchdFixture::new();
-    assert_eq!(
-        fixture.observe().expect("observe initial launchd proof state"),
-        LaunchdObservation::Absent,
+    let initial = fixture.observe().expect("observe initial launchd proof state");
+    assert!(
+        initial == LaunchdObservation::Absent,
         "transient launchd proof service must begin absent"
     );
 
@@ -716,12 +735,15 @@ fn physical_transient_launchd_execution_is_registered_before_start_and_survives_
         fixture.wait_for_marker(OWNERSHIP_MARKER, &ownership, CHECKPOINT_WAIT),
         "controller never durably published exact launchd execution ownership"
     );
-    assert!(controller.is_running(), "launchd proof controller exited before start authorization");
-    assert_eq!(
-        fixture
-            .observe()
-            .expect("independently observe registered launchd job before start"),
-        LaunchdObservation::Exact { pid: None },
+    assert!(
+        controller.is_running(),
+        "launchd proof controller exited before start authorization"
+    );
+    let registered = fixture
+        .observe()
+        .expect("independently observe registered launchd job before start");
+    assert!(
+        matches!(registered, LaunchdObservation::Exact { pid: None }),
         "launchd job was not loaded and process-free at the durable ownership boundary"
     );
     eprintln!("launchd execution proof: register_before_start=true");
@@ -734,18 +756,21 @@ fn physical_transient_launchd_execution_is_registered_before_start_and_survives_
     let running_pid = fixture
         .wait_for_running(START_WAIT)
         .expect("independently observe exact launchd job running");
-    assert!(controller.is_running(), "launchd proof controller exited before SIGKILL");
+    assert!(
+        controller.is_running(),
+        "launchd proof controller exited before SIGKILL"
+    );
 
     let killed = controller.kill_and_reap();
-    assert_eq!(killed.signal(), Some(9), "controller must die by SIGKILL");
+    assert!(
+        killed.signal() == Some(9),
+        "controller must die by SIGKILL"
+    );
     let after_kill = fixture
         .observe()
         .expect("re-observe exact launchd job after controller SIGKILL");
-    assert_eq!(
-        after_kill,
-        LaunchdObservation::Exact {
-            pid: Some(running_pid)
-        },
+    assert!(
+        matches!(after_kill, LaunchdObservation::Exact { pid: Some(pid) } if pid == running_pid),
         "launchd-owned job identity did not survive controller SIGKILL exactly"
     );
     fixture
@@ -756,11 +781,16 @@ fn physical_transient_launchd_execution_is_registered_before_start_and_survives_
     fixture
         .authorize_cleanup()
         .expect("authorize exact launchd proof cleanup");
-    fixture.cleanup().expect("clean exact launchd proof service and namespace");
-    assert!(!fixture.root.exists(), "launchd proof root must be absent after cleanup");
-    assert_eq!(
-        fixture.observe().expect("prove final launchd proof absence"),
-        LaunchdObservation::Absent,
+    fixture
+        .cleanup()
+        .expect("clean exact launchd proof service and namespace");
+    assert!(
+        !fixture.root.exists(),
+        "launchd proof root must be absent after cleanup"
+    );
+    let final_state = fixture.observe().expect("prove final launchd proof absence");
+    assert!(
+        final_state == LaunchdObservation::Absent,
         "transient launchd proof service must be absent after cleanup"
     );
     eprintln!("launchd execution proof: cleanup=true");
