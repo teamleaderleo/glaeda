@@ -106,22 +106,38 @@ fn canonical_exact(path: &Path) -> bool {
 }
 
 fn inspect_directory(path: &Path, uid: u32, gid: u32) {
-    assert!(exact_absolute(path), "directory path must be exact and absolute");
+    assert!(
+        exact_absolute(path),
+        "directory path must be exact and absolute"
+    );
     assert!(canonical_exact(path), "directory path must be canonical");
     let metadata = fs::symlink_metadata(path).expect("inspect exact directory");
     assert!(metadata.file_type().is_dir(), "expected a directory");
-    assert!(!metadata.file_type().is_symlink(), "directory may not be a symlink");
+    assert!(
+        !metadata.file_type().is_symlink(),
+        "directory may not be a symlink"
+    );
     assert_eq!(metadata.uid(), uid, "directory owner must match operator");
     assert_eq!(metadata.gid(), gid, "directory group must match operator");
-    assert_eq!(metadata.mode() & 0o022, 0, "directory may not be group/world writable");
+    assert_eq!(
+        metadata.mode() & 0o022,
+        0,
+        "directory may not be group/world writable"
+    );
 }
 
 fn observe_protected(path: &Path, kind: ProtectedKind) -> ProtectedObservation {
-    assert!(exact_absolute(path), "protected path must be exact and absolute");
+    assert!(
+        exact_absolute(path),
+        "protected path must be exact and absolute"
+    );
     assert!(canonical_exact(path), "protected path must be canonical");
 
     let path_before = fs::symlink_metadata(path).expect("inspect protected path before open");
-    assert!(!path_before.file_type().is_symlink(), "protected path may not be a symlink");
+    assert!(
+        !path_before.file_type().is_symlink(),
+        "protected path may not be a symlink"
+    );
     let before = Snapshot::from_metadata(&path_before);
     assert_eq!(before.nlink, 1, "protected file must have one hard link");
     assert_ne!(before.size, 0, "protected file must be nonempty");
@@ -131,13 +147,31 @@ fn observe_protected(path: &Path, kind: ProtectedKind) -> ProtectedObservation {
     match kind {
         ProtectedKind::Program | ProtectedKind::Bridge => {
             assert_eq!(before.uid, 0, "executable must be root-owned");
-            assert_eq!(before.mode & 0o022, 0, "executable may not be group/world writable");
-            assert_ne!(before.mode & 0o111, 0, "executable must have an execute bit");
+            assert_eq!(
+                before.mode & 0o022,
+                0,
+                "executable may not be group/world writable"
+            );
+            assert_ne!(
+                before.mode & 0o111,
+                0,
+                "executable must have an execute bit"
+            );
         }
         ProtectedKind::Enrollment => {
-            assert_eq!(before.uid, current_uid, "enrollment owner must match operator");
-            assert_eq!(before.gid, current_gid, "enrollment group must match operator");
-            assert_eq!(before.mode & 0o7777, 0o600, "enrollment mode must be exactly 0600");
+            assert_eq!(
+                before.uid, current_uid,
+                "enrollment owner must match operator"
+            );
+            assert_eq!(
+                before.gid, current_gid,
+                "enrollment group must match operator"
+            );
+            assert_eq!(
+                before.mode & 0o7777,
+                0o600,
+                "enrollment mode must be exactly 0600"
+            );
         }
     }
 
@@ -146,7 +180,10 @@ fn observe_protected(path: &Path, kind: ProtectedKind) -> ProtectedObservation {
         ProtectedKind::Bridge => MAX_BRIDGE_BYTES,
         ProtectedKind::Enrollment => MAX_DISPOSABLE_WORKER_ENROLLMENT_BYTES as u64,
     };
-    assert!(before.size <= limit, "protected file exceeds reviewed byte bound");
+    assert!(
+        before.size <= limit,
+        "protected file exceeds reviewed byte bound"
+    );
 
     let mut file = File::open(path).expect("open exact protected file");
     let held_before = Snapshot::from_metadata(&file.metadata().expect("inspect held file"));
@@ -165,7 +202,10 @@ fn observe_protected(path: &Path, kind: ProtectedKind) -> ProtectedObservation {
         total = total
             .checked_add(u64::try_from(read).expect("read length fits u64"))
             .expect("protected file byte count does not overflow");
-        assert!(total <= limit, "protected file exceeded reviewed byte bound while reading");
+        assert!(
+            total <= limit,
+            "protected file exceeded reviewed byte bound while reading"
+        );
         hasher.update(&buffer[..read]);
         if let Some(bytes) = &mut bytes {
             bytes.extend_from_slice(&buffer[..read]);
@@ -174,7 +214,8 @@ fn observe_protected(path: &Path, kind: ProtectedKind) -> ProtectedObservation {
     let digest = Sha256Digest::parse(&format!("sha256:{:x}", hasher.finalize()))
         .expect("SHA-256 output is canonical");
 
-    file.seek(SeekFrom::Start(0)).expect("rewind held protected file");
+    file.seek(SeekFrom::Start(0))
+        .expect("rewind held protected file");
     let mut confirmation_hasher = Sha256::new();
     let mut confirmation_total = 0_u64;
     loop {
@@ -193,20 +234,26 @@ fn observe_protected(path: &Path, kind: ProtectedKind) -> ProtectedObservation {
         );
         confirmation_hasher.update(&buffer[..read]);
     }
-    let confirmation = Sha256Digest::parse(&format!(
-        "sha256:{:x}",
-        confirmation_hasher.finalize()
-    ))
-    .expect("confirmation SHA-256 output is canonical");
-    assert_eq!(digest, confirmation, "protected file bytes changed while held");
+    let confirmation = Sha256Digest::parse(&format!("sha256:{:x}", confirmation_hasher.finalize()))
+        .expect("confirmation SHA-256 output is canonical");
+    assert_eq!(
+        digest, confirmation,
+        "protected file bytes changed while held"
+    );
 
     let held_after = Snapshot::from_metadata(&file.metadata().expect("reinspect held file"));
     let path_after = Snapshot::from_metadata(
         &fs::symlink_metadata(path).expect("reinspect protected path after read"),
     );
-    assert_eq!(before, held_after, "held protected file changed while reading");
+    assert_eq!(
+        before, held_after,
+        "held protected file changed while reading"
+    );
     assert_eq!(before, path_after, "protected path changed while reading");
-    assert!(canonical_exact(path), "protected path stopped being canonical");
+    assert!(
+        canonical_exact(path),
+        "protected path stopped being canonical"
+    );
 
     ProtectedObservation { digest, bytes }
 }
@@ -232,7 +279,14 @@ fn target_plan(
     let output = Command::new(program)
         .env_clear()
         .current_dir("/")
-        .args(["--output", "json", "service", "plan", "--desired", "installed"])
+        .args([
+            "--output",
+            "json",
+            "service",
+            "plan",
+            "--desired",
+            "installed",
+        ])
         .arg("--operator-home")
         .arg(operator_home)
         .arg("--program")
@@ -246,10 +300,17 @@ fn target_plan(
         .stdin(Stdio::null())
         .output()
         .expect("run exact target SmolRunner service plan");
-    assert!(output.status.success(), "target SmolRunner service plan must succeed");
-    assert!(output.stderr.is_empty(), "successful JSON service plan must not use stderr");
+    assert!(
+        output.status.success(),
+        "target SmolRunner service plan must succeed"
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "successful JSON service plan must not use stderr"
+    );
 
-    let stdout = String::from_utf8(output.stdout).expect("target service plan output must be UTF-8");
+    let stdout =
+        String::from_utf8(output.stdout).expect("target service plan output must be UTF-8");
     for private in [operator_home, program, enrollment] {
         let private = private.to_str().expect("acceptance paths must be UTF-8");
         assert!(
@@ -271,7 +332,10 @@ fn installed_service_identities_produce_one_exact_approval_plan() {
 
     let current_uid = rustix::process::geteuid().as_raw();
     let current_gid = rustix::process::getegid().as_raw();
-    assert_ne!(current_uid, 0, "installed service preflight must run as the operator, not root");
+    assert_ne!(
+        current_uid, 0,
+        "installed service preflight must run as the operator, not root"
+    );
 
     let program = PathBuf::from(
         std::env::var_os(PROGRAM_ENV).expect("explicit target SmolRunner program path is required"),
@@ -344,7 +408,9 @@ fn installed_service_identities_produce_one_exact_approval_plan() {
         Some(plan.report().launchd_domain())
     );
     assert_eq!(
-        target.get("requires_operator_approval").and_then(Value::as_bool),
+        target
+            .get("requires_operator_approval")
+            .and_then(Value::as_bool),
         Some(true)
     );
 
@@ -368,8 +434,14 @@ fn installed_service_identities_produce_one_exact_approval_plan() {
     let json = serde_json::to_string_pretty(&receipt).expect("serialize bounded preflight receipt");
     for private in [&operator_home, &program, &enrollment] {
         let private = private.to_str().expect("acceptance paths must be UTF-8");
-        assert!(!json.contains(private), "preflight receipt exposed a private path");
+        assert!(
+            !json.contains(private),
+            "preflight receipt exposed a private path"
+        );
     }
-    assert!(!json.contains(BRIDGE_PROGRAM), "preflight receipt exposed the bridge path");
+    assert!(
+        !json.contains(BRIDGE_PROGRAM),
+        "preflight receipt exposed the bridge path"
+    );
     println!("{json}");
 }
