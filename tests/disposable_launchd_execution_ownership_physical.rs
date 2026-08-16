@@ -12,7 +12,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use rustix::fs::{self as rustix_fs, Mode, OFlags};
-use rustix::process::{Pid, getegid, geteuid, test_kill_process};
+use rustix::process::{Gid, Pid, getegid, geteuid, test_kill_process};
 use sha2::{Digest as _, Sha256};
 use smolrunner::process::{CommandSpec, ExecutionRecord, ProcessExecutor, TimedCommandExecutor};
 
@@ -247,6 +247,8 @@ impl PhysicalLaunchdFixture {
             .mode(0o700)
             .create(&root)
             .expect("create exact launchd proof root");
+        rustix_fs::chown(&root, None, Some(Gid::from_raw(gid)))
+            .expect("set exact launchd proof root group");
         let root_identity = DirectoryIdentity::capture(&root);
         assert!(
             root_identity.uid == uid && root_identity.gid == gid && root_identity.mode == 0o700,
