@@ -14,5 +14,4 @@ if IFS= read -r _; then
 fi
 
 export ACTIONS_RUNNER_INPUT_JITCONFIG="${jit_config}"
-export ACTIONS_RUNNER_RETURN_JOB_RESULT_FOR_HOSTED=true
 exec "${runner_listener}" run --startuptype service

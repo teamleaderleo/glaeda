@@ -1540,13 +1540,13 @@ mod tests {
                     .last()
                     .is_some_and(|value| value == "/etc/smolrunner/prepared-template.json")
                 {
-                    "a330312e82193d07907ebd7ef291d5d5851f9106234ab58e72d662acc6bbb3b2  /etc/smolrunner/prepared-template.json\n".to_owned()
+                    "5f87e7b3086c99c4b3cfd8d7404bdc8f855cf89d37b79980f9c8549ed154a26d  /etc/smolrunner/prepared-template.json\n".to_owned()
                 } else if argv
                     .last()
                     .is_some_and(|value| value == "/opt/smolrunner/bin/smolrunner-runner-integrity")
                     && argv.iter().any(|value| value == "/usr/bin/sha256sum")
                 {
-                    "38ab837c98c697f91be7e0fda94492d342dea1c2515c20d3a643078da5dea8da  /opt/smolrunner/bin/smolrunner-runner-integrity\n".to_owned()
+                    "a1263acc41a6dd9dc31c6a93a2380e0f9c902afd5fc172c03aea0198ca16673a  /opt/smolrunner/bin/smolrunner-runner-integrity\n".to_owned()
                 } else if argv
                     .last()
                     .is_some_and(|value| value == "/opt/smolrunner/bin/smolrunner-runner-integrity")
@@ -1557,7 +1557,7 @@ mod tests {
                     .is_some_and(|value| value == "/opt/smolrunner/bin/smolrunner-jit-launcher")
                     && argv.iter().any(|value| value == "/usr/bin/sha256sum")
                 {
-                    "9b7cc857f2de1181f64bb067e4d4870e0bcb679d597ec047d885395ac6160996  /opt/smolrunner/bin/smolrunner-jit-launcher\n".to_owned()
+                    "6f096fb518b6d40d45ca1a9923e423da436b6269fceec5a5989566abbc93a76a  /opt/smolrunner/bin/smolrunner-jit-launcher\n".to_owned()
                 } else if argv.last().is_some_and(|value| {
                     value == "/etc/apt/apt.conf.d/99-smolrunner-no-automatic-updates"
                 }) {

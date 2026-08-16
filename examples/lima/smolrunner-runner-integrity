@@ -9,7 +9,7 @@ readonly checksums="/etc/smolrunner/actions-runner.sha256"
 readonly runner_work="/var/lib/smolrunner-runner/work"
 readonly runner_diag="/var/lib/smolrunner-runner/diag"
 readonly jit_launcher="/opt/smolrunner/bin/smolrunner-jit-launcher"
-readonly jit_launcher_sha256="9b7cc857f2de1181f64bb067e4d4870e0bcb679d597ec047d885395ac6160996"
+readonly jit_launcher_sha256="6f096fb518b6d40d45ca1a9923e423da436b6269fceec5a5989566abbc93a76a"
 
 [[ "$(/usr/bin/id -u)" == "0" ]]
 [[ "$(/usr/bin/stat --format=%U:%G:%a:%F "${install_dir}")" == "root:smolrunner-runner:1775:directory" ]]
