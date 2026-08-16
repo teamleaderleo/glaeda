@@ -9,8 +9,10 @@
 
 use std::fmt;
 use std::io;
-use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::os::unix::net::UnixStream;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::disposable_attempt_catalog::DisposableAttemptCatalog;
 use crate::disposable_clone_runtime::CloneRuntimeClock;
@@ -199,38 +201,134 @@ fn serve_disposable_worker_with_control(
         .map_err(|error| supervisor_error(error.code()))
 }
 
-/// Run one enrolled disposable-worker controller until the outer process supervisor terminates
-/// the process.
+/// Run one enrolled disposable-worker controller until macOS termination is requested.
 ///
-/// Local durable recovery and exclusive service ownership complete before the bridge reads the
-/// GitHub App key from Keychain. Retry pacing and circuit breaking remain inside the bounded
-/// supervisor loop; `launchd` owns process termination and restart.
+/// SIGTERM from `launchd` and SIGINT from a foreground operator are converted into the supervisor's
+/// existing bounded stop path. Local durable recovery and exclusive service ownership still
+/// complete before the bridge reads the GitHub App key from Keychain. Stopping the outer loop does
+/// not prove or roll back an in-flight external transaction; normal restart reconciliation owns any
+/// unsettled durable or external state.
 ///
 /// # Errors
 ///
-/// Returns a bounded, path-free error if local durable preparation cannot begin.
+/// Returns a bounded, path-free error if signal notification or local durable preparation cannot
+/// begin, or if the supervisor cannot continue.
 #[cfg(target_os = "macos")]
 pub fn serve_disposable_worker(
     enrollment: DisposableWorkerEnrollment,
 ) -> Result<(), DisposableWorkerServiceError> {
-    let mut control = ThreadSupervisorControl;
+    let mut control = InterruptibleSupervisorControl::for_process_signals()
+        .map_err(|error| supervisor_error(error.code()))?;
     serve_disposable_worker_with_control(enrollment, &mut control).map(|_| ())
 }
 
-struct ThreadSupervisorControl;
+struct InterruptibleSupervisorControl {
+    stop: Arc<AtomicBool>,
+    wake_read: UnixStream,
+    #[cfg(target_os = "macos")]
+    signal_actions: Vec<signal_hook::SigId>,
+}
 
-impl DisposableWorkerSupervisorControl for ThreadSupervisorControl {
+#[cfg(target_os = "macos")]
+impl InterruptibleSupervisorControl {
+    fn for_process_signals() -> Result<Self, DisposableWorkerSupervisorError> {
+        use signal_hook::consts::signal::{SIGINT, SIGTERM};
+
+        let (wake_read, wake_write) =
+            UnixStream::pair().map_err(|_| signal_control_error())?;
+        let sigint_write = wake_write
+            .try_clone()
+            .map_err(|_| signal_control_error())?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut signal_actions = Vec::with_capacity(4);
+
+        let setup = (|| -> io::Result<()> {
+            signal_actions.push(signal_hook::flag::register(SIGTERM, Arc::clone(&stop))?);
+            signal_actions.push(signal_hook::low_level::pipe::register(SIGTERM, wake_write)?);
+            signal_actions.push(signal_hook::flag::register(SIGINT, Arc::clone(&stop))?);
+            signal_actions.push(signal_hook::low_level::pipe::register(SIGINT, sigint_write)?);
+            Ok(())
+        })();
+        if setup.is_err() {
+            for action in signal_actions.drain(..) {
+                let _ = signal_hook::low_level::unregister(action);
+            }
+            return Err(signal_control_error());
+        }
+
+        Ok(Self {
+            stop,
+            wake_read,
+            signal_actions,
+        })
+    }
+}
+
+#[cfg(test)]
+impl InterruptibleSupervisorControl {
+    fn for_test(stop: Arc<AtomicBool>, wake_read: UnixStream) -> Self {
+        Self {
+            stop,
+            wake_read,
+            #[cfg(target_os = "macos")]
+            signal_actions: Vec::new(),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for InterruptibleSupervisorControl {
+    fn drop(&mut self) {
+        for action in self.signal_actions.drain(..) {
+            let _ = signal_hook::low_level::unregister(action);
+        }
+    }
+}
+
+impl DisposableWorkerSupervisorControl for InterruptibleSupervisorControl {
     fn stop_requested(&self) -> bool {
-        false
+        self.stop.load(Ordering::SeqCst)
     }
 
     fn wait_or_stop(
         &mut self,
-        duration: std::time::Duration,
+        duration: Duration,
     ) -> Result<bool, DisposableWorkerSupervisorError> {
-        thread::sleep(duration);
-        Ok(false)
+        if self.stop_requested() {
+            return Ok(true);
+        }
+
+        let started = Instant::now();
+        loop {
+            let remaining = duration.saturating_sub(started.elapsed());
+            let timeout = rustix::event::Timespec::try_from(remaining)
+                .map_err(|_| signal_control_error())?;
+            let mut fds = [rustix::event::PollFd::new(
+                &self.wake_read,
+                rustix::event::PollFlags::IN,
+            )];
+            match rustix::event::poll(&mut fds, Some(&timeout)) {
+                Ok(0) => return Ok(self.stop_requested()),
+                Ok(_) if self.stop_requested() => return Ok(true),
+                Ok(_) => {
+                    return Err(DisposableWorkerSupervisorError::new(
+                        "disposable_worker_signal_wakeup_inconsistent",
+                    ));
+                }
+                Err(rustix::io::Errno::INTR) if self.stop_requested() => return Ok(true),
+                Err(rustix::io::Errno::INTR) => {
+                    if started.elapsed() >= duration {
+                        return Ok(false);
+                    }
+                }
+                Err(_) => return Err(signal_control_error()),
+            }
+        }
     }
+}
+
+const fn signal_control_error() -> DisposableWorkerSupervisorError {
+    DisposableWorkerSupervisorError::new("disposable_worker_signal_control_unavailable")
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -279,6 +377,7 @@ mod tests {
     use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::thread;
 
     use super::*;
     use crate::artifact::Sha256Digest;
@@ -358,6 +457,58 @@ mod tests {
             DIGEST = DIGEST,
         );
         decode_disposable_worker_enrollment(document.as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn interruptible_control_observes_preexisting_stop_without_waiting() {
+        let (wake_read, _wake_write) = UnixStream::pair().unwrap();
+        let stop = Arc::new(AtomicBool::new(true));
+        let mut control = InterruptibleSupervisorControl::for_test(stop, wake_read);
+
+        let started = Instant::now();
+        assert!(control.wait_or_stop(Duration::from_secs(2)).unwrap());
+        assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn interruptible_control_wakes_promptly_when_stop_is_notified() {
+        let (wake_read, mut wake_write) = UnixStream::pair().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut control =
+            InterruptibleSupervisorControl::for_test(Arc::clone(&stop), wake_read);
+        let notifier = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            stop.store(true, Ordering::SeqCst);
+            wake_write.write_all(&[1]).unwrap();
+        });
+
+        let started = Instant::now();
+        assert!(control.wait_or_stop(Duration::from_secs(5)).unwrap());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        notifier.join().unwrap();
+    }
+
+    #[test]
+    fn interruptible_control_refuses_wakeup_without_stop_evidence() {
+        let (wake_read, mut wake_write) = UnixStream::pair().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut control = InterruptibleSupervisorControl::for_test(stop, wake_read);
+        wake_write.write_all(&[1]).unwrap();
+
+        let error = control.wait_or_stop(Duration::from_secs(1)).unwrap_err();
+        assert_eq!(error.code(), "disposable_worker_signal_wakeup_inconsistent");
+    }
+
+    #[test]
+    fn repeated_stop_notifications_are_idempotent() {
+        let (wake_read, mut wake_write) = UnixStream::pair().unwrap();
+        let stop = Arc::new(AtomicBool::new(true));
+        let mut control = InterruptibleSupervisorControl::for_test(stop, wake_read);
+        wake_write.write_all(&[1, 1]).unwrap();
+
+        assert!(control.stop_requested());
+        assert!(control.wait_or_stop(Duration::from_secs(1)).unwrap());
+        assert!(control.wait_or_stop(Duration::from_secs(1)).unwrap());
     }
 
     #[test]
