@@ -130,8 +130,10 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use std::fs;
     #[cfg(target_os = "macos")]
-    use std::io::Read as _;
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    use std::fs::OpenOptions;
+    #[cfg(target_os = "macos")]
+    use std::io::{Read as _, Write as _};
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -254,55 +256,52 @@ mod tests {
                 manifest.guest_image_digest().as_str().as_bytes(),
                 "physical cache entry digest drifted"
             );
-
-            let destination = self
-                .state_root
-                .join("Library/Caches/lima/download/by-url-sha256")
-                .join(cache_key);
-            fs::create_dir_all(&destination).expect("create isolated physical Lima cache entry");
-            fs::set_permissions(&destination, fs::Permissions::from_mode(0o700))
-                .expect("protect isolated physical Lima cache entry");
-            for name in ["data", "sha256.digest", "url", "time", "type"] {
-                let source_file = source.join(name);
-                let metadata =
-                    fs::symlink_metadata(&source_file).expect("inspect physical cache source file");
-                assert!(
-                    metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
-                    "physical cache source entries must be regular files"
-                );
-                fs::copy(&source_file, destination.join(name))
-                    .expect("copy exact image cache entry into isolated physical home");
-            }
+            self.seed_verified_image(&source.join("data"), &manifest, &cache_key);
         }
 
         fn seed_image_file(&self, source: &Path) {
-            let source = fs::canonicalize(source).expect("canonicalize physical image source");
-            let metadata = fs::symlink_metadata(&source).expect("inspect physical image source");
-            assert!(
-                metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
-                "physical image source must be one regular file"
-            );
             let manifest = current_disposable_prepared_template().expect("current manifest");
-            let mut file = fs::File::open(&source).expect("open physical image source");
-            let mut hasher = Sha256::new();
-            let mut buffer = vec![0_u8; 1024 * 1024];
-            loop {
-                let read = file.read(&mut buffer).expect("hash physical image source");
-                if read == 0 {
-                    break;
-                }
-                hasher.update(&buffer[..read]);
-            }
-            assert_eq!(
-                format!("sha256:{:x}", hasher.finalize()),
-                manifest.guest_image_digest().as_str(),
-                "physical image source digest drifted"
-            );
-
             let cache_key = format!(
                 "{:x}",
                 Sha256::digest(manifest.guest_image_location().as_bytes())
             );
+            self.seed_verified_image(source, &manifest, &cache_key);
+        }
+
+        fn seed_verified_image(
+            &self,
+            source: &Path,
+            manifest: &DisposablePreparedTemplateManifest,
+            cache_key: &str,
+        ) {
+            let original_metadata =
+                fs::symlink_metadata(source).expect("inspect physical image source pathname");
+            assert!(
+                original_metadata.file_type().is_file()
+                    && !original_metadata.file_type().is_symlink(),
+                "physical image source must be one regular file"
+            );
+            let source_path = fs::canonicalize(source).expect("canonicalize physical image source");
+            let path_metadata =
+                fs::symlink_metadata(&source_path).expect("inspect physical image source");
+            assert!(
+                path_metadata.file_type().is_file()
+                    && !path_metadata.file_type().is_symlink()
+                    && path_metadata.dev() == original_metadata.dev()
+                    && path_metadata.ino() == original_metadata.ino(),
+                "physical image source pathname changed before copy"
+            );
+            let mut source_file = fs::File::open(&source_path).expect("open physical image source");
+            let held_metadata = source_file
+                .metadata()
+                .expect("inspect held physical image source");
+            assert!(
+                held_metadata.file_type().is_file()
+                    && held_metadata.dev() == path_metadata.dev()
+                    && held_metadata.ino() == path_metadata.ino(),
+                "physical image source changed before copy"
+            );
+
             let destination = self
                 .state_root
                 .join("Library/Caches/lima/download/by-url-sha256")
@@ -310,8 +309,43 @@ mod tests {
             fs::create_dir_all(&destination).expect("create isolated physical Lima cache entry");
             fs::set_permissions(&destination, fs::Permissions::from_mode(0o700))
                 .expect("protect isolated physical Lima cache entry");
-            fs::copy(&source, destination.join("data"))
-                .expect("copy pinned image into isolated physical home");
+            let data_path = destination.join("data");
+            let mut data_file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&data_path)
+                .expect("create isolated physical image cache data");
+            let mut hasher = Sha256::new();
+            let mut buffer = vec![0_u8; 1024 * 1024];
+            loop {
+                let read = source_file
+                    .read(&mut buffer)
+                    .expect("read held physical image source");
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
+                data_file
+                    .write_all(&buffer[..read])
+                    .expect("write isolated physical image cache data");
+            }
+            data_file
+                .sync_all()
+                .expect("synchronize isolated physical image cache data");
+            let copied_digest = format!("sha256:{:x}", hasher.finalize());
+            assert_eq!(
+                copied_digest,
+                manifest.guest_image_digest().as_str(),
+                "physical image source digest drifted"
+            );
+            drop(data_file);
+            let destination_digest = hash_physical_image(&data_path);
+            assert_eq!(
+                destination_digest,
+                manifest.guest_image_digest().as_str(),
+                "isolated physical image cache data drifted"
+            );
             fs::write(destination.join("url"), manifest.guest_image_location())
                 .expect("write isolated cache URL");
             fs::write(
@@ -370,6 +404,42 @@ mod tests {
                 eprintln!("physical template acceptance retained recovery state");
             }
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn hash_physical_image(path: &Path) -> String {
+        let path_metadata = fs::symlink_metadata(path).expect("inspect physical image cache data");
+        assert!(
+            path_metadata.file_type().is_file() && !path_metadata.file_type().is_symlink(),
+            "physical image cache data must be one regular file"
+        );
+        let mut file = fs::File::open(path).expect("open physical image cache data");
+        let held_metadata = file.metadata().expect("inspect held image cache data");
+        assert!(
+            held_metadata.file_type().is_file()
+                && held_metadata.dev() == path_metadata.dev()
+                && held_metadata.ino() == path_metadata.ino(),
+            "physical image cache data changed before hashing"
+        );
+        let mut hasher = Sha256::new();
+        let mut buffer = vec![0_u8; 1024 * 1024];
+        loop {
+            let read = file
+                .read(&mut buffer)
+                .expect("hash physical image cache data");
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        let final_metadata = fs::symlink_metadata(path).expect("reinspect image cache data");
+        assert!(
+            final_metadata.dev() == held_metadata.dev()
+                && final_metadata.ino() == held_metadata.ino()
+                && final_metadata.len() == held_metadata.len(),
+            "physical image cache data changed while hashing"
+        );
+        format!("sha256:{:x}", hasher.finalize())
     }
 
     #[cfg(target_os = "macos")]
@@ -934,6 +1004,40 @@ mod tests {
                 .iter()
                 .any(|(argv, _)| argv.iter().any(|value| value == "start"))
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[should_panic(expected = "physical image source digest drifted")]
+    fn physical_file_seed_rejects_bytes_that_do_not_match_the_manifest() {
+        let fixture = PhysicalTemplateFixture::new();
+        let source = fixture.root.join("wrong-image.img");
+        fs::write(&source, b"not the pinned Ubuntu image").unwrap();
+
+        fixture.seed_image_file(&source);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[should_panic(expected = "physical image source digest drifted")]
+    fn physical_cache_seed_rejects_valid_sidecars_with_poisoned_data() {
+        let fixture = PhysicalTemplateFixture::new();
+        let manifest = current_disposable_prepared_template().unwrap();
+        let cache_key = format!(
+            "{:x}",
+            Sha256::digest(manifest.guest_image_location().as_bytes())
+        );
+        let source = fixture.root.join(cache_key);
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("url"), manifest.guest_image_location()).unwrap();
+        fs::write(
+            source.join("sha256.digest"),
+            manifest.guest_image_digest().as_str(),
+        )
+        .unwrap();
+        fs::write(source.join("data"), b"poisoned cached image").unwrap();
+
+        fixture.seed_image_cache(&source);
     }
 
     #[cfg(target_os = "macos")]
