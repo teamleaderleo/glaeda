@@ -698,11 +698,15 @@ fn physical_controller_death_during_template_create_is_observed_and_fenced() {
         0,
         "post-quiescence reconciliation attempted an external mutation before cleanup"
     );
-    post_quiescence.expect(
-        "fresh post-quiescence reconciliation must succeed without mutation before cleanup authority exists",
+    let recovery_gap = post_quiescence
+        .expect_err("current recovery must not claim a partial interrupted create is observable");
+    assert_eq!(
+        recovery_gap.code(),
+        "template_host_identity_unavailable",
+        "controller-death recovery must retain the exact current fail-closed classification"
     );
     fixture.authorize_cleanup(mutation_pgid).expect(
-        "authorize cleanup from fresh quiescent reconciliation and exact namespace identity",
+        "authorize fixture cleanup from process-group absence and exact namespace identity",
     );
     fixture
         .cleanup(mutation_pgid)
