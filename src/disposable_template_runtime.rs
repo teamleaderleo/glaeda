@@ -915,6 +915,22 @@ mod tests {
         }
         assert!(template.contains("verify_runner_install"));
         assert!(template.contains("verify_automatic_updates_disabled"));
+        for download_argument in [
+            "--retry 8",
+            "--retry-all-errors",
+            "--retry-delay 2",
+            "--retry-max-time 300",
+            "--max-time 300",
+            "--connect-timeout 30",
+            "--speed-limit 1024",
+            "--speed-time 60",
+            "--continue-at -",
+        ] {
+            assert!(
+                template.contains(download_argument),
+                "runner download must retain {download_argument}"
+            );
+        }
         let launcher_digest = format!("{:x}", Sha256::digest(JIT_LAUNCHER_BYTES));
         assert!(template.contains(&format!(
             "readonly jit_launcher_sha256=\"{launcher_digest}\""
