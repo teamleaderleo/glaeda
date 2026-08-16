@@ -21,9 +21,15 @@ use crate::lima_observation::{
 use crate::process::CommandSpec;
 
 pub const DISPOSABLE_LIMA_WORKER_SCHEMA_VERSION: u8 = 4;
+/// Hex characters retained in a generated disposable Lima VM name (96 bits).
+pub(crate) const DISPOSABLE_LIMA_VM_ID_HEX_CHARS: usize = 24;
 
 const GIB: u64 = 1 << 30;
 const MAX_PRIVATE_PATH_BYTES: usize = 1_024;
+// Lima 2.2.0 validates this longest candidate SSH socket path before cloning on macOS. The pinned
+// Lima contract requires the terminating NUL to fit in sockaddr_un.sun_path[104].
+const LIMA_UNIX_PATH_MAX: usize = 104;
+const LIMA_SSH_SOCKET_SUFFIX: &str = "/ssh.sock.1234567890123456";
 const CLONE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const DESTROY_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const OBSERVATION_MAX_AGE_SECONDS: u64 = 30;
@@ -476,6 +482,32 @@ pub(crate) fn validate_disposable_lima_resources(
     .map(|_| ())
 }
 
+/// Validate that the enrolled Lima home can contain every newly generated disposable VM name.
+///
+/// This is a composition-time gate: an invalid operator enrollment is refused before GitHub demand
+/// can create durable clone authority. Existing durable VM names remain decodable for recovery.
+pub(crate) fn validate_disposable_lima_home_path_budget(
+    lima_home: &Path,
+) -> Result<(), DisposableLimaWorkerError> {
+    let generated_instance_bytes = 2_usize
+        .checked_add(DISPOSABLE_LIMA_VM_ID_HEX_CHARS)
+        .ok_or_else(invalid_configuration)?;
+    let fits = lima_home
+        .to_str()
+        .and_then(|home| home.len().checked_add(1))
+        .and_then(|length| length.checked_add(generated_instance_bytes))
+        .and_then(|length| length.checked_add(LIMA_SSH_SOCKET_SUFFIX.len()))
+        .is_some_and(|length| length < LIMA_UNIX_PATH_MAX);
+    if !fits {
+        return Err(error(
+            DisposableLimaWorkerErrorKind::InvalidConfiguration,
+            "lima_home_socket_path_too_long",
+            "the Lima home cannot fit a generated worker within the pinned Unix-socket budget",
+        ));
+    }
+    Ok(())
+}
+
 fn lima_resources(
     resources: DisposableWorkerResources,
     source_cpu_count: u32,
@@ -803,6 +835,25 @@ mod tests {
         assert!(!format!("{:?}", adapter()).contains("/Users/runner"));
         assert!(!format!("{plan:?}").contains("/opt/homebrew"));
         assert!(!format!("{plan:?}").contains("/Users/runner"));
+    }
+
+    #[test]
+    fn enrollment_refuses_a_lima_home_outside_the_pinned_socket_path_budget() {
+        assert!(
+            validate_disposable_lima_home_path_budget(Path::new(
+                "/Users/leoli/.local/share/smolrunner/quarry/lima"
+            ))
+            .is_ok()
+        );
+        let error = validate_disposable_lima_home_path_budget(Path::new(
+            "/Users/leoli/.local/share/smolrunner/quarry/lima-too-long",
+        ))
+        .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            DisposableLimaWorkerErrorKind::InvalidConfiguration
+        );
+        assert_eq!(error.code(), "lima_home_socket_path_too_long");
     }
 
     #[test]

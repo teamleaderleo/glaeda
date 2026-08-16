@@ -9,6 +9,7 @@ use crate::disposable_attempt_catalog::{
     DisposableAttemptCatalogAction, DisposableAttemptCatalogDocument, DisposableAttemptReservation,
 };
 use crate::disposable_attempt_state::DisposableAttemptState;
+use crate::disposable_lima_worker::DISPOSABLE_LIMA_VM_ID_HEX_CHARS;
 use crate::disposable_prepared_template::{
     DisposablePreparedTemplateIdentity, DisposablePreparedTemplateManifest,
 };
@@ -424,12 +425,15 @@ fn derive_identities(
     }
     let digest = format!("{:x}", hasher.finalize());
     let short = &digest[..32];
+    // Lima appends a private Unix socket beneath LIMA_HOME/<instance>. Keep only the shared 96-bit
+    // VM suffix while the attempt retains 128 bits and the capacity claim retains the full digest.
+    let vm_short = &digest[..DISPOSABLE_LIMA_VM_ID_HEX_CHARS];
     Ok(DerivedIdentities {
         attempt_id: DisposableAttemptId::parse(&format!("attempt-{short}"))
             .map_err(|_| consumer_error("delivery_consumer_identity_invalid"))?,
         claim_id: CapacityClaimId::parse(&format!("claim-{digest}"))
             .map_err(|_| consumer_error("delivery_consumer_identity_invalid"))?,
-        vm_id: DisposableVmId::parse(&format!("worker-{short}"))
+        vm_id: DisposableVmId::parse(&format!("w-{vm_short}"))
             .map_err(|_| consumer_error("delivery_consumer_identity_invalid"))?,
         runner_name: ScaleSetRunnerName::parse(&format!("smolrunner-{short}"))
             .map_err(|_| consumer_error("delivery_consumer_identity_invalid"))?,
@@ -711,6 +715,10 @@ mod tests {
         .unwrap();
         assert_eq!(reserved.active().len(), 1);
         assert_eq!(reserved.active()[0].attempt().runner_request_id().get(), 41);
+        let vm_id = reserved.active()[0].attempt().vm_id().as_str();
+        assert_eq!(vm_id.len(), 2 + DISPOSABLE_LIMA_VM_ID_HEX_CHARS);
+        assert!(vm_id.starts_with("w-"));
+        assert!(vm_id[2..].bytes().all(|byte| byte.is_ascii_hexdigit()));
         assert_eq!(reserved.active()[0].attempt().not_after().get(), 21_700_000);
         assert_eq!(
             reconcile_scale_set_delivery(&policy(), &delivery, &reserved, observed_at()).unwrap(),
