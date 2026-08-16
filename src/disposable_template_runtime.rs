@@ -133,7 +133,9 @@ mod tests {
     use std::fs::OpenOptions;
     #[cfg(target_os = "macos")]
     use std::io::{Read as _, Write as _};
-    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+    #[cfg(target_os = "macos")]
+    use std::os::unix::fs::OpenOptionsExt as _;
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
