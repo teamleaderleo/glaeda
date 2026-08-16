@@ -311,7 +311,12 @@ pub fn apply_disposable_launchd_service(
         ));
     }
     let operator_gid = getegid().as_raw();
-    verify_plan_inputs(plan, operator_gid)?;
+    // Installation consumes the current executable and enrollment bytes. Removal consumes only
+    // the exact approved plist plus the exact loaded launchd identity: those inputs may have been
+    // deleted or rotated precisely because the service is being recovered or removed.
+    if plan.report.desired_state == DisposableLaunchdServiceDesiredState::Installed {
+        verify_plan_inputs(plan, operator_gid)?;
+    }
     let directory = open_launch_agent_directory(plan, operator_gid)?;
     preflight_configuration(plan, &directory, operator_gid)?;
     let _apply_lock = acquire_apply_lock(plan, &directory, operator_gid)?;
@@ -949,8 +954,9 @@ fn observe_launchd_service(
         let expected_path = format!("\n\tpath = {}\n", private_text(&plan.launch_agent)?);
         let expected_program = format!("\n\tprogram = {}\n", private_text(&plan.program)?);
         let expected_arguments = format!(
-            "\n\targuments = {{\n\t\t{}\n\t\tworker\n\t\tserve\n\t\t--enrollment\n\t\t{}\n\t\t--enrollment-digest\n\t\t{}\n\t}}\n",
+            "\n\targuments = {{\n\t\t{}\n\t\tworker\n\t\tserve\n\t\t--program-digest\n\t\t{}\n\t\t--enrollment\n\t\t{}\n\t\t--enrollment-digest\n\t\t{}\n\t}}\n",
             private_text(&plan.program)?,
+            plan.program_digest.as_str(),
             private_text(&plan.enrollment)?,
             plan.enrollment_digest.as_str(),
         );
@@ -1096,7 +1102,7 @@ pub fn plan_disposable_launchd_service(
             return Err(invalid_configuration());
         }
     }
-    let plist = canonical_plist(program, enrollment, enrollment_digest)?;
+    let plist = canonical_plist(program, program_digest, enrollment, enrollment_digest)?;
     let plan_identity = plan_identity(
         desired_state,
         operator_uid,
@@ -1197,12 +1203,14 @@ fn plan_identity(
 
 fn canonical_plist(
     program: &Path,
+    program_digest: &Sha256Digest,
     enrollment: &Path,
     enrollment_digest: &Sha256Digest,
 ) -> Result<Vec<u8>, DisposableLaunchdServicePlanError> {
     let program = program.to_str().ok_or_else(invalid_configuration)?;
     let enrollment = enrollment.to_str().ok_or_else(invalid_configuration)?;
     let program = xml_text(program);
+    let program_digest = xml_text(program_digest.as_str());
     let enrollment = xml_text(enrollment);
     let enrollment_digest = xml_text(enrollment_digest.as_str());
     Ok(format!(
@@ -1217,6 +1225,8 @@ fn canonical_plist(
     <string>{program}</string>\n\
     <string>worker</string>\n\
     <string>serve</string>\n\
+    <string>--program-digest</string>\n\
+    <string>{program_digest}</string>\n\
     <string>--enrollment</string>\n\
     <string>{enrollment}</string>\n\
     <string>--enrollment-digest</string>\n\
@@ -1325,6 +1335,7 @@ mod tests {
             Path::new("/Users/operator/Library/LaunchAgents/io.smolrunner.disposable-worker.plist");
         let plist = canonical_plist(
             Path::new("/opt/smolrunner/bin/smolrunner"),
+            &digest('a'),
             Path::new("/Users/operator/.config/smolrunner/enrollment.json"),
             &digest('b'),
         )
@@ -1347,6 +1358,7 @@ mod tests {
         );
         let plist = std::str::from_utf8(&plist).unwrap();
         assert!(plist.contains("<string>/opt/smolrunner/bin/smolrunner</string>"));
+        assert!(plist.contains(digest('a').as_str()));
         assert!(plist.contains("<string>--enrollment</string>"));
         assert!(plist.contains("<string>--enrollment-digest</string>"));
         assert!(plist.contains(digest('b').as_str()));
@@ -1360,6 +1372,15 @@ mod tests {
         assert_eq!(plan.report().launchd_domain(), "gui/501");
         assert_eq!(plan.report().preconditions().len(), 5);
         assert_eq!(plan.report().actions().len(), 2);
+
+        let different_program = canonical_plist(
+            Path::new("/opt/smolrunner/bin/smolrunner"),
+            &digest('f'),
+            Path::new("/Users/operator/.config/smolrunner/enrollment.json"),
+            &digest('b'),
+        )
+        .unwrap();
+        assert_ne!(different_program, plan.plist);
     }
 
     #[test]
@@ -1453,6 +1474,7 @@ mod tests {
     fn plist_escapes_private_path_metacharacters_without_changing_argv_shape() {
         let plist = canonical_plist(
             Path::new("/opt/smolrunner/bin/smol&runner"),
+            &digest('a'),
             Path::new("/Users/operator/config<one>.json"),
             &digest('b'),
         )
@@ -1543,6 +1565,7 @@ mod tests {
         loaded: Cell<bool>,
         path: PathBuf,
         program: PathBuf,
+        program_digest: String,
         enrollment: PathBuf,
         enrollment_digest: String,
         calls: RefCell<Vec<Vec<String>>>,
@@ -1555,6 +1578,7 @@ mod tests {
                 loaded: Cell::new(false),
                 path: plan.launch_agent.clone(),
                 program: plan.program.clone(),
+                program_digest: plan.program_digest.as_str().to_owned(),
                 enrollment: plan.enrollment.clone(),
                 enrollment_digest: plan.enrollment_digest.as_str().to_owned(),
                 calls: RefCell::new(Vec::new()),
@@ -1572,12 +1596,13 @@ mod tests {
                     status: Some(0),
                     success: true,
                     stdout: format!(
-                        "gui/{}/{} = {{\n\tpath = {}\n\ttype = LaunchAgent\n\tprogram = {}\n\targuments = {{\n\t\t{}\n\t\tworker\n\t\tserve\n\t\t--enrollment\n\t\t{}\n\t\t--enrollment-digest\n\t\t{}\n\t}}\n}}\n",
+                        "gui/{}/{} = {{\n\tpath = {}\n\ttype = LaunchAgent\n\tprogram = {}\n\targuments = {{\n\t\t{}\n\t\tworker\n\t\tserve\n\t\t--program-digest\n\t\t{}\n\t\t--enrollment\n\t\t{}\n\t\t--enrollment-digest\n\t\t{}\n\t}}\n}}\n",
                         rustix::process::geteuid().as_raw(),
                         DISPOSABLE_LAUNCHD_SERVICE_LABEL,
                         self.path.display(),
                         self.program.display(),
                         self.program.display(),
+                        self.program_digest,
                         self.enrollment.display(),
                         self.enrollment_digest,
                     ),
@@ -1674,6 +1699,7 @@ mod tests {
         );
 
         let removal = fixture.plan(DisposableLaunchdServiceDesiredState::Removed);
+        std::fs::remove_file(&fixture.enrollment).unwrap();
         let removed =
             apply_disposable_launchd_service(&removal, removal.report().plan_identity(), &executor)
                 .unwrap();
