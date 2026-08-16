@@ -85,6 +85,42 @@ impl Drop for ControllerChildGuard {
     }
 }
 
+#[derive(Clone, Copy)]
+struct DirectoryIdentity {
+    device: u64,
+    inode: u64,
+    uid: u32,
+    mode: u32,
+}
+
+impl DirectoryIdentity {
+    fn capture(path: &Path) -> Self {
+        let metadata = fs::symlink_metadata(path).expect("capture exact directory identity");
+        assert!(
+            metadata.file_type().is_dir() && !metadata.file_type().is_symlink(),
+            "exact controller-death namespace entry must be one directory"
+        );
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            uid: metadata.uid(),
+            mode: metadata.mode() & 0o777,
+        }
+    }
+
+    fn verify(self, path: &Path) -> bool {
+        let Ok(metadata) = fs::symlink_metadata(path) else {
+            return false;
+        };
+        metadata.file_type().is_dir()
+            && !metadata.file_type().is_symlink()
+            && metadata.dev() == self.device
+            && metadata.ino() == self.inode
+            && metadata.uid() == self.uid
+            && metadata.mode() & 0o777 == self.mode
+    }
+}
+
 struct ProcessObservation {
     ppid: u32,
     pgid: Pid,
@@ -97,9 +133,10 @@ struct PhysicalControllerFixture {
     lima_home: PathBuf,
     instance: LimaInstanceName,
     mutation_pgid: Cell<Option<Pid>>,
-    root_device: u64,
-    root_inode: u64,
-    root_uid: u32,
+    cleanup_authorized: Cell<bool>,
+    root_identity: DirectoryIdentity,
+    state_root_identity: DirectoryIdentity,
+    lima_home_identity: DirectoryIdentity,
 }
 
 impl PhysicalControllerFixture {
@@ -122,7 +159,6 @@ impl PhysicalControllerFixture {
         fs::create_dir(&root).expect("create exact controller-death root");
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
             .expect("protect exact controller-death root");
-        let metadata = fs::symlink_metadata(&root).expect("inspect exact controller-death root");
         let state_root = root.join("state");
         let lima_home = root.join("lima");
         fs::create_dir(&state_root).expect("create exact controller-death state root");
@@ -131,6 +167,20 @@ impl PhysicalControllerFixture {
         fs::create_dir(&lima_home).expect("create exact controller-death Lima home");
         fs::set_permissions(&lima_home, fs::Permissions::from_mode(0o700))
             .expect("protect exact controller-death Lima home");
+
+        let root_identity = DirectoryIdentity::capture(&root);
+        let state_root_identity = DirectoryIdentity::capture(&state_root);
+        let lima_home_identity = DirectoryIdentity::capture(&lima_home);
+        assert_eq!(root_identity.mode, 0o700, "exact root mode drifted");
+        assert_eq!(
+            state_root_identity.mode, 0o750,
+            "exact state-root mode drifted"
+        );
+        assert_eq!(
+            lima_home_identity.mode, 0o700,
+            "exact Lima-home mode drifted"
+        );
+
         let instance =
             LimaInstanceName::parse(&format!("smolrunner-cd-{}-{sequence}", std::process::id()))
                 .expect("build exact controller-death instance name");
@@ -141,9 +191,10 @@ impl PhysicalControllerFixture {
             lima_home,
             instance,
             mutation_pgid: Cell::new(None),
-            root_device: metadata.dev(),
-            root_inode: metadata.ino(),
-            root_uid: metadata.uid(),
+            cleanup_authorized: Cell::new(false),
+            root_identity,
+            state_root_identity,
+            lima_home_identity,
         }
     }
 
@@ -301,7 +352,34 @@ impl PhysicalControllerFixture {
         }
     }
 
+    fn verify_namespace_identity(&self) -> Result<(), &'static str> {
+        if !self.root_identity.verify(&self.root)
+            || !self.state_root_identity.verify(&self.state_root)
+            || !self.lima_home_identity.verify(&self.lima_home)
+        {
+            return Err("controller-death namespace identity drifted");
+        }
+        Ok(())
+    }
+
+    fn authorize_cleanup(&self, mutation_pgid: Pid) -> Result<(), &'static str> {
+        if self.mutation_pgid.get() != Some(mutation_pgid) {
+            return Err("owned controller-death process-group identity is unavailable");
+        }
+        match Self::process_group_is_live(mutation_pgid) {
+            Ok(false) => {}
+            Ok(true) => return Err("owned controller-death mutation is still running"),
+            Err(_) => return Err("owned controller-death process-group state is unavailable"),
+        }
+        self.verify_namespace_identity()?;
+        self.cleanup_authorized.set(true);
+        Ok(())
+    }
+
     fn cleanup(&self, mutation_pgid: Pid) -> Result<(), &'static str> {
+        if !self.cleanup_authorized.get() {
+            return Err("controller-death cleanup lacks fresh reconciliation authority");
+        }
         if self.mutation_pgid.get() != Some(mutation_pgid) {
             return Err("owned controller-death process-group identity is unavailable");
         }
@@ -311,8 +389,20 @@ impl PhysicalControllerFixture {
             Err(_) => return Err("owned controller-death process-group state is unavailable"),
         }
 
+        self.verify_namespace_identity()?;
         let instance_directory = self.lima_home.join(self.instance.as_str());
-        if instance_directory.exists() {
+        let instance_present = match fs::symlink_metadata(&instance_directory) {
+            Ok(metadata) => {
+                if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+                    return Err("exact controller-death Lima instance identity drifted");
+                }
+                true
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(_) => return Err("exact controller-death Lima instance state is unavailable"),
+        };
+        if instance_present {
+            self.verify_namespace_identity()?;
             let command = CommandSpec::new(LIMACTL)
                 .argument("--tty=false")
                 .secret_environment("HOME", exact_path(&self.state_root))
@@ -326,22 +416,16 @@ impl PhysicalControllerFixture {
             let record = ProcessExecutor
                 .execute_with_timeout(&command, CLEANUP_TIMEOUT)
                 .map_err(|_| "exact controller-death Lima cleanup command failed")?;
-            if !record.success || instance_directory.exists() {
-                return Err("exact controller-death Lima cleanup was not proven");
+            if !record.success {
+                return Err("exact controller-death Lima cleanup command was unsuccessful");
+            }
+            match fs::symlink_metadata(&instance_directory) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                _ => return Err("exact controller-death Lima cleanup was not proven"),
             }
         }
 
-        let metadata = fs::symlink_metadata(&self.root)
-            .map_err(|_| "controller-death root became unavailable")?;
-        if !metadata.file_type().is_dir()
-            || metadata.file_type().is_symlink()
-            || metadata.dev() != self.root_device
-            || metadata.ino() != self.root_inode
-            || metadata.uid() != self.root_uid
-            || metadata.mode() & 0o777 != 0o700
-        {
-            return Err("controller-death root identity drifted");
-        }
+        self.verify_namespace_identity()?;
         fs::remove_dir_all(&self.root).map_err(|_| "controller-death root cleanup failed")?;
         Ok(())
     }
@@ -350,6 +434,12 @@ impl PhysicalControllerFixture {
 impl Drop for PhysicalControllerFixture {
     fn drop(&mut self) {
         if !self.root.exists() {
+            return;
+        }
+        if !self.cleanup_authorized.get() {
+            eprintln!(
+                "controller-death acceptance retained recovery state without cleanup authority"
+            );
             return;
         }
         let Some(mutation_pgid) = self.mutation_pgid.get() else {
@@ -376,14 +466,27 @@ impl Drop for PhysicalControllerFixture {
     }
 }
 
-#[derive(Default)]
 struct RestartProbeExecutor {
+    mutation_pgid: Pid,
     mutation_attempts: Cell<u32>,
+    conflicting_mutation_attempts: Cell<u32>,
 }
 
 impl RestartProbeExecutor {
+    fn new(mutation_pgid: Pid) -> Self {
+        Self {
+            mutation_pgid,
+            mutation_attempts: Cell::new(0),
+            conflicting_mutation_attempts: Cell::new(0),
+        }
+    }
+
     fn mutation_attempts(&self) -> u32 {
         self.mutation_attempts.get()
+    }
+
+    fn conflicting_mutation_attempts(&self) -> u32 {
+        self.conflicting_mutation_attempts.get()
     }
 
     fn refuse_mutation(&self, spec: &CommandSpec) -> io::Result<()> {
@@ -394,6 +497,14 @@ impl RestartProbeExecutor {
         {
             self.mutation_attempts
                 .set(self.mutation_attempts.get().saturating_add(1));
+            match PhysicalControllerFixture::process_group_is_live(self.mutation_pgid) {
+                Ok(false) => {}
+                Ok(true) | Err(_) => self.conflicting_mutation_attempts.set(
+                    self.conflicting_mutation_attempts
+                        .get()
+                        .saturating_add(1),
+                ),
+            }
             return Err(io::Error::other(
                 "controller-death proof refused a second external mutation",
             ));
@@ -542,6 +653,10 @@ fn physical_controller_death_during_template_create_is_observed_and_fenced() {
         "child controller exited before the SIGKILL checkpoint"
     );
 
+    let runtime = fixture.runtime();
+    let clock = SystemLimaObservationClock;
+    let probe = RestartProbeExecutor::new(mutation_pgid);
+
     let killed = controller
         .kill_and_reap()
         .expect("SIGKILL and reap exact child controller");
@@ -552,7 +667,6 @@ fn physical_controller_death_during_template_create_is_observed_and_fenced() {
         "controller death must retain the exact durable Started checkpoint"
     );
 
-    thread::sleep(Duration::from_millis(250));
     let child_survived_controller_death =
         PhysicalControllerFixture::process_group_is_live(mutation_pgid)
             .expect("observe exact owned mutation process group after controller death");
@@ -560,23 +674,17 @@ fn physical_controller_death_during_template_create_is_observed_and_fenced() {
         "controller-death proof: owned mutation process group survived SIGKILL={child_survived_controller_death}"
     );
 
-    let runtime = fixture.runtime();
-    let clock = SystemLimaObservationClock;
-    let probe = RestartProbeExecutor::default();
-    let mut conflicting_restart_mutation = false;
-    for _ in 0..4 {
+    let _ = runtime.reconcile_once(&probe, &clock);
+    for _ in 0..3 {
         if !PhysicalControllerFixture::process_group_is_live(mutation_pgid)
             .expect("observe exact owned mutation process group before restart probe")
         {
             break;
         }
-        let _ = runtime.reconcile_once(&probe, &clock);
-        if probe.mutation_attempts() != 0 {
-            conflicting_restart_mutation = true;
-            break;
-        }
         thread::sleep(Duration::from_millis(250));
+        let _ = runtime.reconcile_once(&probe, &clock);
     }
+    let conflicting_restart_mutation = probe.conflicting_mutation_attempts() != 0;
 
     assert!(
         PhysicalControllerFixture::wait_for_quiescence(mutation_pgid, QUIESCENCE_WAIT)
@@ -584,8 +692,20 @@ fn physical_controller_death_during_template_create_is_observed_and_fenced() {
         "the exact owned Lima mutation process group did not quiesce within the bounded physical proof window"
     );
 
-    let post_quiescence = runtime.reconcile_once(&RestartProbeExecutor::default(), &clock);
+    let post_probe = RestartProbeExecutor::new(mutation_pgid);
+    let post_quiescence = runtime.reconcile_once(&post_probe, &clock);
     eprintln!("controller-death proof: post-quiescence restart outcome={post_quiescence:?}");
+    assert_eq!(
+        post_probe.mutation_attempts(),
+        0,
+        "post-quiescence reconciliation attempted an external mutation before cleanup"
+    );
+    post_quiescence.expect(
+        "fresh post-quiescence reconciliation must succeed without mutation before cleanup authority exists",
+    );
+    fixture
+        .authorize_cleanup(mutation_pgid)
+        .expect("authorize cleanup from fresh quiescent reconciliation and exact namespace identity");
     fixture
         .cleanup(mutation_pgid)
         .expect("remove the exact quiescent controller-death namespace");
