@@ -191,13 +191,12 @@ progress-burst yielding, failed/recovery-session discard, reconnect delays, retr
 five-minute circuit breaker. SIGTERM and SIGINT now interrupt those waits through the same bounded
 stop path without manufacturing external-operation success. #469/#470 add the pure exact
 LaunchAgent install/remove contract and CLI plan report around that service. The exact apply/remove
-engine consumes one explicit approved
-plan and revalidates installation inputs while permitting exact cleanup after those inputs are
-lost or rotated. CLI apply exposure, installed bridge/executable/enrollment verification,
-automatic quiescence of an unbound
-ambiguous clone process, and the first physical GitHub/Lima acceptance run remain open. The
-hostile-CI network gate remains the production boundary before arbitrary repository code is an
-intended workload.
+engine consumes one explicitly approved plan and revalidates installation inputs while permitting
+exact cleanup after those inputs are lost or rotated. The CLI now exposes that engine only after
+an exact plan identity is supplied through `--approve-plan`. Installed
+bridge/executable/enrollment verification, automatic quiescence of an unbound ambiguous clone
+process, and the first physical GitHub/Lima acceptance run remain open. The hostile-CI network gate
+remains the production boundary before arbitrary repository code is an intended workload.
 
 Acceptance: an enrolled test repository targets the SmolRunner scale-set label, queues a job, and receives its result without operator commands; the JIT runner cannot accept a second job and its credential is absent after VM destruction.
 
@@ -212,13 +211,12 @@ Acceptance: ordinary clone/download/build/test fixtures pass; hostile fixtures c
 The bounded `worker serve` loop and its durable service composition are on `main`. The current
 LaunchAgent contract binds the exact executable and enrollment digests, canonical private plist
 bytes, user launchd domain, ordered install/remove actions, and both identities passed to
-`worker serve`. Its apply engine remains inaccessible until the separate CLI slice.
+`worker serve`. The CLI rebuilds that exact plan from current inputs and applies it only when its
+identity matches an explicit `--approve-plan` value.
 
 The immediate service frontier is deliberately small:
 
-1. #471 applies or removes only the explicitly approved exact LaunchAgent plan, with fresh
-   executable/enrollment/filesystem/launchd observation and idempotent recovery.
-2. The installed service path then proves bridge/executable/enrollment installation, physical
+1. The installed service path proves bridge/executable/enrollment installation, physical
    queued-job-to-zero acceptance, controller-death quiescence, sleep/wake and reboot recovery,
    outage handling, orphan cleanup, and precise status/remediation.
 
