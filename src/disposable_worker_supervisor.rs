@@ -1,11 +1,10 @@
 //! Bounded retry and pacing loop for the disposable worker coordinator.
 //!
-//! This module owns no GitHub, credential, process, VM, filesystem, or clock authority. A later
-//! installed-service adapter supplies one session-bound coordinator driver and the stop/wait
-//! mechanism. Session failures always discard the session before retry; durable reconciliation,
-//! rather than an in-memory retry, decides which external action may run next.
-
-#![allow(dead_code)] // The operator enrollment/launchd adapter is the next small composition slice.
+//! This module owns no GitHub, credential, process, VM, filesystem, or clock authority. The
+//! production disposable-worker service supplies the session-bound coordinator driver; stop/wait
+//! remains an injected control boundary so process termination can be composed separately. Session
+//! failures always discard the session before retry; durable reconciliation, rather than an
+//! in-memory retry, decides which external action may run next.
 
 use std::fmt;
 use std::time::Duration;
@@ -40,8 +39,10 @@ pub(crate) trait DisposableWorkerSupervisorControl {
     fn stop_requested(&self) -> bool;
 
     /// Wait up to the supplied delay, returning `true` when stop was requested during the wait.
-    fn wait_or_stop(&mut self, duration: Duration)
-    -> Result<bool, DisposableWorkerSupervisorError>;
+    fn wait_or_stop(
+        &mut self,
+        duration: Duration,
+    ) -> Result<bool, DisposableWorkerSupervisorError>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
