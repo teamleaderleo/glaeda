@@ -495,6 +495,54 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    struct PhysicalTimedOutCreateExecutor {
+        delegate: PhysicalAcceptanceExecutor,
+        create_calls: Cell<u8>,
+        create_error_kind: Cell<Option<io::ErrorKind>>,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Default for PhysicalTimedOutCreateExecutor {
+        fn default() -> Self {
+            Self {
+                delegate: PhysicalAcceptanceExecutor::default(),
+                create_calls: Cell::new(0),
+                create_error_kind: Cell::new(None),
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl CommandExecutor for PhysicalTimedOutCreateExecutor {
+        fn execute(&self, spec: &CommandSpec) -> io::Result<ExecutionRecord> {
+            self.delegate.execute(spec)
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl TimedCommandExecutor for PhysicalTimedOutCreateExecutor {
+        fn execute_with_timeout(
+            &self,
+            spec: &CommandSpec,
+            timeout: Duration,
+        ) -> io::Result<ExecutionRecord> {
+            let argv = spec.displayed_argv();
+            if argv.iter().any(|value| value == "start")
+                && argv.iter().any(|value| value == "--name")
+            {
+                self.create_calls
+                    .set(self.create_calls.get().saturating_add(1));
+                let result = ProcessExecutor.execute_with_timeout(spec, Duration::from_secs(20));
+                if let Err(error) = &result {
+                    self.create_error_kind.set(Some(error.kind()));
+                }
+                return result;
+            }
+            self.delegate.execute_with_timeout(spec, timeout)
+        }
+    }
+
     #[derive(Default)]
     struct FixedClock;
 
@@ -1123,6 +1171,73 @@ mod tests {
         fixture
             .cleanup()
             .expect("delete the exact accepted source and its isolated state");
+        assert!(!fixture.root.exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "forces one isolated physical Lima/VZ create timeout and deletes all test state"]
+    fn physical_timed_out_create_retains_started_debt_without_replay_and_cleans_up() {
+        assert_eq!(
+            std::env::var("SMOLRUNNER_PHYSICAL_TEMPLATE_ACCEPTANCE").as_deref(),
+            Ok("create-timeout-delete"),
+            "set the exact physical failure-acceptance opt-in token"
+        );
+        let mut fixture = PhysicalTemplateFixture::new();
+        if let Some(source) = std::env::var_os("SMOLRUNNER_PHYSICAL_TEMPLATE_IMAGE_CACHE_ENTRY") {
+            fixture.seed_image_cache(Path::new(&source));
+        } else if let Some(source) = std::env::var_os("SMOLRUNNER_PHYSICAL_TEMPLATE_IMAGE_FILE") {
+            fixture.seed_image_file(Path::new(&source));
+        }
+        let runtime = fixture.runtime();
+        let executor = PhysicalTimedOutCreateExecutor::default();
+        let clock = SystemLimaObservationClock;
+
+        let authorized = runtime
+            .reconcile_once(&executor, &clock)
+            .expect("authorize physical source creation from proven absence");
+        assert_eq!(
+            authorized.phase,
+            DisposableTemplateGenerationPhase::CreateAuthorized
+        );
+        fixture.arm_cleanup();
+
+        let error = runtime
+            .reconcile_once(&executor, &clock)
+            .expect_err("the physical create command must hit the injected wall timeout");
+        assert_eq!(
+            error.kind(),
+            DisposableTemplateRuntimeErrorKind::RecoveryRequired
+        );
+        assert_eq!(
+            executor.create_error_kind.get(),
+            Some(io::ErrorKind::TimedOut)
+        );
+        let durable = UnixPersonalWorkerStore::open_or_create_disposable_template_generation(
+            &fixture.state_root,
+        )
+        .expect("reopen exact physical template store")
+        .load_disposable_template_generation()
+        .expect("read exact physical template generation")
+        .expect("physical template generation exists");
+        assert_eq!(
+            durable.phase(),
+            DisposableTemplateGenerationPhase::CreateStarted
+        );
+
+        let retry = runtime
+            .reconcile_once(&executor, &clock)
+            .expect_err("a timed-out Started command must never replay");
+        assert!(matches!(
+            retry.kind(),
+            DisposableTemplateRuntimeErrorKind::Observation
+                | DisposableTemplateRuntimeErrorKind::RecoveryRequired
+        ));
+        assert_eq!(executor.create_calls.get(), 1);
+
+        fixture
+            .cleanup()
+            .expect("delete the timed-out source and its isolated state");
         assert!(!fixture.root.exists());
     }
 }
