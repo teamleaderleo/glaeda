@@ -179,17 +179,17 @@ and final bounded tombstone retirement. Restart tests cover a reconciled-but-una
 delivery, and an injected lifecycle test reaches an empty catalog after one runner and VM are
 removed.
 
-The current-main service driver now recovers local delivery/catalog state, acquires one
-process-lifetime controller lease before credential access, and composes the coordinator with the
-bounded supervisor loop. The `worker serve` CLI reads one protected enrollment and requires its
-exact approved SHA-256 before credential or process authority. Launchd installation, automatic
-quiescence of an unbound ambiguous clone process, network-gate composition, and the physical
-GitHub/Lima acceptance run remain open; this is not yet an installed unattended service.
-
-The next narrow supervisor layer fixes idle pacing, caps immediate progress bursts, discards a
-failed or recovery-required bridge session before reconnect, applies bounded retry delays, and
-opens a five-minute circuit after five consecutive failures. Launchd still needs to own process
-restart and termination around this bounded service loop.
+The current-main service driver recovers local delivery/catalog state, acquires one process-lifetime
+controller lease before credential access, and composes the coordinator with the bounded supervisor
+loop. `worker serve` reads one protected canonical enrollment and requires its exact approved
+SHA-256 before credential or process authority. The bounded supervisor already owns idle pacing,
+progress-burst yielding, failed/recovery-session discard, reconnect delays, retry backoff, and its
+five-minute circuit breaker. #469/#470 add the pure exact LaunchAgent install/remove contract and
+CLI plan report around that service. Approved LaunchAgent apply/removal, real macOS stop-signal
+wiring, installed bridge/executable/enrollment verification, automatic quiescence of an unbound
+ambiguous clone process, and the first physical GitHub/Lima acceptance run remain open. The
+hostile-CI network gate remains the production boundary before arbitrary repository code is an
+intended workload.
 
 Acceptance: an enrolled test repository targets the SmolRunner scale-set label, queues a job, and receives its result without operator commands; the JIT runner cannot accept a second job and its credential is absent after VM destruction.
 
@@ -201,19 +201,24 @@ Acceptance: ordinary clone/download/build/test fixtures pass; hostile fixtures c
 
 ### M5 — supervised reconciliation and autoscaling
 
-Add `smolrunner worker serve` under `launchd`: observe demand, reserve bounded capacity, advance attempts, back off transient failures, enforce circuit breakers and operator holds, clean orphans, reconcile after reboot, remove stale runners, and scale to zero. Status must explain current capacity, attempts, blockers, retries, and cleanup debt without exposing secrets.
+The bounded `worker serve` loop and its durable service composition are on `main`. The current
+LaunchAgent planner binds the exact executable and enrollment digests, canonical private plist
+bytes, user launchd domain, ordered install/remove actions, and the enrollment digest passed to
+`worker serve`, while remaining plan-only.
 
-The enrollment boundary is one canonical, bounded, secret-free document. It binds the private
-state root, Lima program/home/source instance, exact installed bridge digest, GitHub App identity
-and Keychain reference, exact Scale Set/repository/labels, and the single worker's CPU, memory, and
-disk reservation. The App private key remains in Keychain. Decoding delegates to the existing
-bridge, current prepared-template, resource, consumer, clone, and runner constructors so the
-service entry point cannot invent a weaker parallel configuration path.
+The immediate service frontier is deliberately small:
 
-The pure LaunchAgent planner binds the exact executable and enrollment digests, canonical private
-plist bytes, user launchd domain, ordered install/remove actions, and the enrollment digest passed
-to `worker serve`. It rejects collisions with its future plist, staging, and lock namespaces. It
-does not create files or invoke `launchctl`; durable apply and removal remain a separate slice.
+1. #471 applies or removes only the explicitly approved exact LaunchAgent plan, with fresh
+   executable/enrollment/filesystem/launchd observation and idempotent recovery.
+2. #472 connects macOS termination intent to the supervisor's existing interruptible control
+   boundary so launchd/foreground stops break bounded waits cleanly.
+3. The installed service path then proves bridge/executable/enrollment installation, physical
+   queued-job-to-zero acceptance, controller-death quiescence, sleep/wake and reboot recovery,
+   outage handling, orphan cleanup, and precise status/remediation.
+
+Do not use this milestone as a reason to reopen the retired persistent-worker/run-once programme or
+the host-rootless-Podman critical path. Historical branches may supply reviewed tests and design
+ideas, but current-main contracts remain authoritative and should be salvaged in small slices.
 
 Acceptance: sleep/wake, controller kill, Mac reboot, network loss, GitHub outage, failed provisioning, stuck job, and failed teardown tests all converge automatically or stop behind a precise durable blocker.
 
