@@ -708,17 +708,17 @@ fn run_disposable_launchd_service_apply(
             );
         }
     };
-    let report = match apply_disposable_launchd_service(&plan, &approved_plan_identity, &ProcessExecutor)
-    {
-        Ok(report) => report,
-        Err(error) => {
-            return emit_runtime_error(
-                output,
-                error.code(),
-                "disposable-worker LaunchAgent apply was refused".to_owned(),
-            );
-        }
-    };
+    let report =
+        match apply_disposable_launchd_service(&plan, &approved_plan_identity, &ProcessExecutor) {
+            Ok(report) => report,
+            Err(error) => {
+                return emit_runtime_error(
+                    output,
+                    error.code(),
+                    "disposable-worker LaunchAgent apply was refused".to_owned(),
+                );
+            }
+        };
     match output {
         OutputFormat::Json => {
             if print_json(&report).is_err() {
