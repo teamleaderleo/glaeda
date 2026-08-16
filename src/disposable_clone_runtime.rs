@@ -142,8 +142,10 @@ impl DisposableCloneAdmissionObservation {
 /// Live source for current capacity ownership and cancellation state.
 ///
 /// The disposable worker coordinator supplies this evidence from a live zero-capacity Scale Set
-/// poll. The clone transaction invokes it while holding the canonical store lock immediately
-/// before both the durable start checkpoint and the external command.
+/// poll. The clone transaction invokes it exactly once, after every other non-mutating preflight,
+/// while holding the canonical store lock immediately before both the durable start checkpoint
+/// and the external command. Earlier lifecycle polls belong to the coordinator and are not reused
+/// as command authority.
 pub(crate) mod admission_seal {
     pub trait Sealed {}
 }
@@ -422,7 +424,6 @@ impl DisposableCloneRuntime {
         &self,
         catalog: &DisposableAttemptCatalogDocument,
         attempt_id: &DisposableAttemptId,
-        admission: &impl DisposableCloneAdmissionSource,
         executor: &impl TimedCommandExecutor,
         clock: &impl CloneRuntimeClock,
     ) -> Result<DisposableAttemptCatalogAction, DisposableCloneRuntimeError> {
@@ -448,49 +449,15 @@ impl DisposableCloneRuntime {
             .map_err(|_| invalid_configuration("clone_target_request_invalid"))?;
         self.verify_limactl(executor)?;
         self.confirm_target_absent(&target_request, executor, clock)?;
-        let admission_observation = admission.observe(catalog, reservation)?;
-        let observed_at = clock
-            .epoch_millis()
-            .map_err(|_| observation("clone_clock_unavailable"))?;
-        admission_observation.validate_identity_and_freshness_for(
-            catalog,
-            reservation,
-            observed_at,
-        )?;
         self.confirm_target_absent(&target_request, executor, clock)?;
         self.verify_limactl(executor)?;
         let checkpoint_at = clock
             .epoch_millis()
             .map_err(|_| observation("clone_clock_unavailable"))?;
-        admission_observation.validate_identity_and_freshness_for(
-            catalog,
-            reservation,
-            checkpoint_at,
-        )?;
-        let action = reconcile_attempt(DisposableWorkerReconcileInput {
-            now: checkpoint_at,
-            attempt: reservation.attempt(),
-            vm: DisposableVmObservation::Absent,
-            vm_identity: None,
-            runner: ScaleSetRunnerObservation::Absent,
-            job_event: None,
-            capacity_reserved: admission_observation.capacity_reserved,
-            cancellation_requested: admission_observation.cancellation_requested,
-        })
-        .map_err(|_| DisposableCloneRuntimeError::recovery("clone_reconcile_failed"))?;
-        match action {
-            DisposableWorkerAction::Persist { transition }
-                if matches!(
-                    transition,
-                    DisposableAttemptCatalogAction::AuthorizeClone
-                        | DisposableAttemptCatalogAction::BeginUnprovisionedRelease
-                ) =>
-            {
-                Ok(transition)
-            }
-            _ => Err(DisposableCloneRuntimeError::recovery(
-                "clone_authorization_refused",
-            )),
+        if checkpoint_at > reservation.attempt().not_after() {
+            Ok(DisposableAttemptCatalogAction::BeginUnprovisionedRelease)
+        } else {
+            Ok(DisposableAttemptCatalogAction::AuthorizeClone)
         }
     }
 
@@ -498,7 +465,6 @@ impl DisposableCloneRuntime {
         &self,
         catalog: &DisposableAttemptCatalogDocument,
         attempt_id: &DisposableAttemptId,
-        admission: &impl DisposableCloneAdmissionSource,
         executor: &impl TimedCommandExecutor,
         clock: &impl CloneRuntimeClock,
     ) -> Result<Option<DisposableAttemptCatalogAction>, DisposableCloneRuntimeError> {
@@ -511,42 +477,15 @@ impl DisposableCloneRuntime {
             ));
         }
         let _ = executor;
-        let admission_observation = admission.observe(catalog, reservation)?;
         let checkpoint_at = clock
             .epoch_millis()
             .map_err(|_| observation("clone_clock_unavailable"))?;
-        admission_observation.validate_identity_and_freshness_for(
-            catalog,
-            reservation,
-            checkpoint_at,
-        )?;
-        if !admission_observation.capacity_reserved {
-            return Err(DisposableCloneRuntimeError::recovery("clone_capacity_lost"));
-        }
-        if admission_observation.cancellation_requested {
-            return Err(DisposableCloneRuntimeError::recovery("clone_cancelled"));
-        }
-        let action = reconcile_attempt(DisposableWorkerReconcileInput {
-            now: checkpoint_at,
-            attempt: reservation.attempt(),
-            vm: DisposableVmObservation::Absent,
-            vm_identity: None,
-            runner: ScaleSetRunnerObservation::Absent,
-            job_event: None,
-            capacity_reserved: admission_observation.capacity_reserved,
-            cancellation_requested: admission_observation.cancellation_requested,
-        })
-        .map_err(|_| DisposableCloneRuntimeError::recovery("clone_reconcile_failed"))?;
-        match action {
-            DisposableWorkerAction::CheckpointAndCloneVm => Ok(None),
-            DisposableWorkerAction::Persist {
-                transition: DisposableAttemptCatalogAction::BeginUnprovisionedRelease,
-            } => Ok(Some(
+        if checkpoint_at > reservation.attempt().not_after() {
+            Ok(Some(
                 DisposableAttemptCatalogAction::BeginUnprovisionedRelease,
-            )),
-            _ => Err(DisposableCloneRuntimeError::recovery(
-                "clone_execution_refused",
-            )),
+            ))
+        } else {
+            Ok(None)
         }
     }
 
@@ -555,13 +494,17 @@ impl DisposableCloneRuntime {
         catalog: &DisposableAttemptCatalogDocument,
         generation: &DisposableTemplateGenerationDocument,
         attempt_id: &DisposableAttemptId,
-        admission: &impl DisposableCloneAdmissionSource,
         executor: &impl TimedCommandExecutor,
         clock: &impl CloneRuntimeClock,
     ) -> Result<PreparedClone, DisposableCloneRuntimeError> {
         let reservation = catalog
             .find_active(attempt_id)
             .ok_or_else(|| DisposableCloneRuntimeError::durable("clone_attempt_missing"))?;
+        if reservation.attempt().phase() != DisposableAttemptPhase::CloneAuthorized {
+            return Err(DisposableCloneRuntimeError::recovery(
+                "clone_execution_phase_mismatch",
+            ));
+        }
         let source = self
             .template_runtime
             .confirm_stopped_clone_source(generation, executor, clock)
@@ -575,27 +518,15 @@ impl DisposableCloneRuntime {
         source
             .confirm_current()
             .map_err(|_| observation("clone_source_drift"))?;
-        let admission_observation = admission.observe(catalog, reservation)?;
         let now = clock
             .epoch_millis()
             .map_err(|_| observation("clone_clock_unavailable"))?;
-        admission_observation.validate_for(catalog, reservation, now)?;
-        let action = reconcile_attempt(DisposableWorkerReconcileInput {
-            now,
-            attempt: reservation.attempt(),
-            vm: DisposableVmObservation::Absent,
-            vm_identity: None,
-            runner: ScaleSetRunnerObservation::Absent,
-            job_event: None,
-            capacity_reserved: admission_observation.capacity_reserved,
-            cancellation_requested: admission_observation.cancellation_requested,
-        })
-        .map_err(|_| DisposableCloneRuntimeError::recovery("clone_reconcile_failed"))?;
-        if action != DisposableWorkerAction::CheckpointAndCloneVm {
+        if now > reservation.attempt().not_after() {
             return Err(DisposableCloneRuntimeError::recovery(
-                "clone_no_longer_authorized",
+                "clone_expired_before_command",
             ));
         }
+        let action = DisposableWorkerAction::CheckpointAndCloneVm;
         let plan = self
             .worker
             .plan(now, reservation, &action)
@@ -658,12 +589,10 @@ impl DisposableCloneRuntime {
         fresh_source
             .confirm_current()
             .map_err(|_| observation("clone_source_drift"))?;
-        let admission_observation = admission.observe(started, reservation)?;
-        let admission_now = clock
-            .epoch_millis()
-            .map_err(|_| observation("clone_clock_unavailable"))?;
-        admission_observation.validate_for(started, reservation, admission_now)?;
         self.verify_limactl(executor)?;
+        // This is the only live admission poll in the clone transaction. Any earlier sample would
+        // be superseded by the source, target, and Lima checks above while adding a full GitHub
+        // long-poll interval to the assignment-to-runner latency.
         let final_admission_observation = admission.observe(started, reservation)?;
         let command_now = clock
             .epoch_millis()
@@ -2155,7 +2084,6 @@ mod tests {
                 .authorize_disposable_clone_transaction(
                     &runtime,
                     &attempt_id,
-                    &FakeAdmission::available(),
                     &executor,
                     &FixedClock,
                 )
@@ -2358,6 +2286,9 @@ mod tests {
                 .unwrap(),
             DisposableWorkerCoordinatorDisposition::CloneCompleted { .. }
         ));
+        // One coordinator lifecycle poll precedes each phase. The clone transaction adds exactly
+        // one final under-lock poll after its non-mutating source/target/Lima preflight.
+        assert_eq!(bridge.capacities, [0, 0, 0]);
         executor.target_ready = true;
         assert!(matches!(
             coordinator
@@ -3174,6 +3105,7 @@ mod tests {
             .unwrap();
         assert_eq!(receipt.schema_version(), 1);
         assert_eq!(receipt.attempt_revision(), 4);
+        assert_eq!(admission.calls.get(), 1);
         assert_eq!(executor.clone_count(), 1);
         let attempt = durable_attempt(&root, &attempt_id);
         assert_eq!(attempt.phase(), DisposableAttemptPhase::CloneStarted);
@@ -3315,7 +3247,7 @@ mod tests {
         let admission = FakeAdmission {
             calls: Cell::new(0),
             lose_capacity_on: None,
-            cancel_on: Some(4),
+            cancel_on: Some(1),
             error_on: None,
         };
 
@@ -3323,6 +3255,7 @@ mod tests {
             .clone_once_with(&attempt_id, &admission, &executor, &FixedClock)
             .unwrap_err();
         assert_eq!(error.code(), "clone_cancelled");
+        assert_eq!(admission.calls.get(), 1);
         assert_eq!(executor.clone_count(), 0);
         let attempt = durable_attempt(&root, &attempt_id);
         assert_eq!(attempt.phase(), DisposableAttemptPhase::CloneAuthorized);
@@ -3345,13 +3278,14 @@ mod tests {
             calls: Cell::new(0),
             lose_capacity_on: None,
             cancel_on: None,
-            error_on: Some(4),
+            error_on: Some(1),
         };
 
         let error = runtime
             .clone_once_with(&attempt_id, &admission, &executor, &FixedClock)
             .unwrap_err();
         assert_eq!(error.code(), "clone_test_admission_failed");
+        assert_eq!(admission.calls.get(), 1);
         assert_eq!(executor.clone_count(), 0);
         let attempt = durable_attempt(&root, &attempt_id);
         assert_eq!(attempt.phase(), DisposableAttemptPhase::CloneAuthorized);

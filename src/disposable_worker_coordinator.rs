@@ -247,18 +247,17 @@ impl DisposableWorkerCoordinator {
         let attempt_id = reservation.attempt().attempt_id().clone();
         match operation_for(reservation)? {
             CoordinatorOperation::AuthorizeClone => {
-                self.with_live_admission(bridge, clock, |admission| {
-                    let mut store = open_catalog(&self.state_root)?;
+                let mut store = open_catalog(&self.state_root)?;
+                map_clone_outcome(
                     store
                         .authorize_disposable_clone_transaction(
                             clone_runtime,
                             &attempt_id,
-                            admission,
                             executor,
                             clock,
                         )
-                        .map_err(map_clone_error)
-                })
+                        .map_err(map_clone_error)?,
+                )
             }
             CoordinatorOperation::ExecuteClone => {
                 self.with_live_admission(bridge, clock, |admission| {

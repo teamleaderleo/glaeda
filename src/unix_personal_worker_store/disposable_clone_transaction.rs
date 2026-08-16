@@ -12,14 +12,12 @@ impl UnixPersonalWorkerStore {
         &mut self,
         runtime: &DisposableCloneRuntime,
         attempt_id: &DisposableAttemptId,
-        admission: &impl DisposableCloneAdmissionSource,
         executor: &impl TimedCommandExecutor,
         clock: &impl CloneRuntimeClock,
     ) -> Result<DisposableCloneTransactionOutcome, DisposableCloneRuntimeError> {
         let _lock = self.prepare_clone_transaction()?;
         let current = self.load_clone_catalog()?;
-        let transition =
-            runtime.authorize_locked(&current, attempt_id, admission, executor, clock)?;
+        let transition = runtime.authorize_locked(&current, attempt_id, executor, clock)?;
         let reservation = current
             .find_active(attempt_id)
             .ok_or_else(|| DisposableCloneRuntimeError::durable("clone_attempt_missing"))?;
@@ -54,8 +52,8 @@ impl UnixPersonalWorkerStore {
     ) -> Result<DisposableCloneTransactionOutcome, DisposableCloneRuntimeError> {
         let _lock = self.prepare_clone_transaction()?;
         let current = self.load_clone_catalog()?;
-        if let Some(transition) = runtime
-            .authorize_clone_execution_locked(&current, attempt_id, admission, executor, clock)?
+        if let Some(transition) =
+            runtime.authorize_clone_execution_locked(&current, attempt_id, executor, clock)?
         {
             let reservation = current
                 .find_active(attempt_id)
@@ -89,14 +87,8 @@ impl UnixPersonalWorkerStore {
             )
             .map_err(|_| DisposableCloneRuntimeError::durable("clone_generation_unavailable"))?
             .ok_or_else(|| DisposableCloneRuntimeError::durable("clone_generation_missing"))?;
-        let prepared = runtime.prepare_locked(
-            &current,
-            &generation,
-            attempt_id,
-            admission,
-            executor,
-            clock,
-        )?;
+        let prepared =
+            runtime.prepare_locked(&current, &generation, attempt_id, executor, clock)?;
         let expected_attempt_revision = current
             .find_active(attempt_id)
             .ok_or_else(|| DisposableCloneRuntimeError::durable("clone_attempt_missing"))?
