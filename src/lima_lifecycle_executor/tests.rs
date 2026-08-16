@@ -391,11 +391,15 @@ fn start_uses_one_fixed_command_and_verifies_running_identity() {
     assert_eq!(commands.timeouts(), vec![LIMA_LIFECYCLE_COMMAND_TIMEOUT]);
     assert_eq!(
         calls[0].environment.keys().cloned().collect::<Vec<_>>(),
-        vec!["HOME", "LANG", "LC_ALL", "LIMA_HOME"]
+        vec!["HOME", "LANG", "LC_ALL", "LIMA_HOME", "PATH"]
     );
     assert_eq!(
         calls[0].environment.get("HOME"),
         Some(&CommandValue::Plain(LIMACTL_SAFE_HOME.to_owned()))
+    );
+    assert_eq!(
+        calls[0].environment.get("PATH"),
+        Some(&CommandValue::Plain(LIMACTL_SAFE_PATH.to_owned()))
     );
     let public = serde_json::to_string(&execution).expect("public execution JSON");
     assert!(!public.contains(PRIVATE_HOME));

@@ -974,10 +974,12 @@ fn exact_millisecond_start_checkpoints_completes_and_settles_under_one_lock() {
             .all(|(_, timeout)| *timeout == Duration::from_secs(5))
     );
     assert!(seen.iter().all(|(command, _)| {
-        command
-            .environment
-            .keys()
-            .all(|key| matches!(key.as_str(), "HOME" | "LANG" | "LC_ALL" | "LIMA_HOME"))
+        command.environment.keys().all(|key| {
+            matches!(
+                key.as_str(),
+                "HOME" | "LANG" | "LC_ALL" | "LIMA_HOME" | "PATH"
+            )
+        })
     }));
     let public = serde_json::to_string(&execution).expect("public JSON");
     let debug = format!("{execution:?}");

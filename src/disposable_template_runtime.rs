@@ -28,7 +28,7 @@ use crate::disposable_template_generation::{
 use crate::disposable_worker_reconciler::DisposableWorkerResources;
 use crate::lima_host_identity::{LimaHostIdentityAdapter, LimaHostIdentityObservation};
 use crate::lima_observation::{
-    LIMACTL_SAFE_HOME, LimaArchitecture, LimaGuestObservation, LimaInstanceName,
+    LIMACTL_SAFE_PATH, LimaArchitecture, LimaGuestObservation, LimaInstanceName,
     LimaObservationAdapter, LimaObservationClock, LimaObservationFailure,
     LimaObservationRefusalCode, LimaObservationRequest, LimaRuntimeState, LimaVmType,
 };
@@ -39,7 +39,7 @@ use crate::unix_personal_worker_store::{STORE_DIRECTORY, UnixPersonalWorkerStore
 
 pub const DISPOSABLE_TEMPLATE_RUNTIME_SCHEMA_VERSION: u8 = 1;
 
-const SOURCE_IDENTITY_DOMAIN: &[u8] = b"smolrunner-disposable-template-source-v2";
+const SOURCE_IDENTITY_DOMAIN: &[u8] = b"smolrunner-disposable-template-source-v3";
 const GENERATION_ID_DOMAIN: &[u8] = b"smolrunner-disposable-template-generation-v1";
 const MAX_PRIVATE_PATH_BYTES: usize = 1_024;
 const OBSERVATION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -129,12 +129,19 @@ impl DisposableTemplateRuntimeError {
 mod tests {
     use std::cell::{Cell, RefCell};
     use std::fs;
+    #[cfg(target_os = "macos")]
+    use std::io::Read as _;
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
     use crate::disposable_template_generation::DisposableTemplateGenerationAction;
+    #[cfg(target_os = "macos")]
+    use crate::lima_observation::SystemLimaObservationClock;
+    #[cfg(target_os = "macos")]
+    use crate::process::ProcessExecutor;
+    use crate::process::{CommandValue, SecretString};
 
     static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
 
@@ -160,6 +167,259 @@ mod tests {
     impl Drop for TempRoot {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    struct PhysicalTemplateFixture {
+        root: PathBuf,
+        state_root: PathBuf,
+        lima_home: PathBuf,
+        instance: LimaInstanceName,
+        root_device: u64,
+        root_inode: u64,
+        root_uid: u32,
+        cleanup_armed: bool,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl PhysicalTemplateFixture {
+        fn new() -> Self {
+            let sequence = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
+            let root = PathBuf::from("/private/tmp").join(format!(
+                "smolrunner-physical-template-{}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir(&root).expect("create exact physical acceptance root");
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+                .expect("protect exact physical acceptance root");
+            let metadata = fs::symlink_metadata(&root).expect("inspect physical acceptance root");
+            let state_root = root.join("state");
+            let lima_home = root.join("lima");
+            fs::create_dir(&state_root).expect("create physical acceptance state root");
+            fs::set_permissions(&state_root, fs::Permissions::from_mode(0o750))
+                .expect("protect physical acceptance state root");
+            fs::create_dir(&lima_home).expect("create physical acceptance Lima home");
+            fs::set_permissions(&lima_home, fs::Permissions::from_mode(0o700))
+                .expect("protect physical acceptance Lima home");
+            Self {
+                root,
+                state_root,
+                lima_home,
+                instance: LimaInstanceName::parse(&format!(
+                    "smolrunner-pt-{}-{sequence}",
+                    std::process::id()
+                ))
+                .expect("physical instance name"),
+                root_device: metadata.dev(),
+                root_inode: metadata.ino(),
+                root_uid: metadata.uid(),
+                cleanup_armed: false,
+            }
+        }
+
+        fn runtime(&self) -> DisposableTemplateRuntime {
+            DisposableTemplateRuntime::new(
+                &self.state_root,
+                "/opt/homebrew/bin/limactl",
+                &self.lima_home,
+                self.instance.clone(),
+            )
+            .expect("construct physical template runtime")
+        }
+
+        fn seed_image_cache(&self, source: &Path) {
+            let source = fs::canonicalize(source).expect("canonicalize physical cache source");
+            assert!(
+                source.is_absolute(),
+                "physical cache source must be absolute"
+            );
+            let manifest = current_disposable_prepared_template().expect("current manifest");
+            let cache_key = format!(
+                "{:x}",
+                Sha256::digest(manifest.guest_image_location().as_bytes())
+            );
+            assert_eq!(
+                source.file_name().and_then(|name| name.to_str()),
+                Some(cache_key.as_str()),
+                "physical cache entry must match the pinned image URL"
+            );
+            assert_eq!(
+                fs::read(source.join("url")).expect("read cached image URL"),
+                manifest.guest_image_location().as_bytes(),
+                "physical cache entry URL drifted"
+            );
+            assert_eq!(
+                fs::read(source.join("sha256.digest")).expect("read cached image digest"),
+                manifest.guest_image_digest().as_str().as_bytes(),
+                "physical cache entry digest drifted"
+            );
+
+            let destination = self
+                .state_root
+                .join("Library/Caches/lima/download/by-url-sha256")
+                .join(cache_key);
+            fs::create_dir_all(&destination).expect("create isolated physical Lima cache entry");
+            fs::set_permissions(&destination, fs::Permissions::from_mode(0o700))
+                .expect("protect isolated physical Lima cache entry");
+            for name in ["data", "sha256.digest", "url", "time", "type"] {
+                let source_file = source.join(name);
+                let metadata =
+                    fs::symlink_metadata(&source_file).expect("inspect physical cache source file");
+                assert!(
+                    metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
+                    "physical cache source entries must be regular files"
+                );
+                fs::copy(&source_file, destination.join(name))
+                    .expect("copy exact image cache entry into isolated physical home");
+            }
+        }
+
+        fn seed_image_file(&self, source: &Path) {
+            let source = fs::canonicalize(source).expect("canonicalize physical image source");
+            let metadata = fs::symlink_metadata(&source).expect("inspect physical image source");
+            assert!(
+                metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
+                "physical image source must be one regular file"
+            );
+            let manifest = current_disposable_prepared_template().expect("current manifest");
+            let mut file = fs::File::open(&source).expect("open physical image source");
+            let mut hasher = Sha256::new();
+            let mut buffer = vec![0_u8; 1024 * 1024];
+            loop {
+                let read = file.read(&mut buffer).expect("hash physical image source");
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
+            }
+            assert_eq!(
+                format!("sha256:{:x}", hasher.finalize()),
+                manifest.guest_image_digest().as_str(),
+                "physical image source digest drifted"
+            );
+
+            let cache_key = format!(
+                "{:x}",
+                Sha256::digest(manifest.guest_image_location().as_bytes())
+            );
+            let destination = self
+                .state_root
+                .join("Library/Caches/lima/download/by-url-sha256")
+                .join(cache_key);
+            fs::create_dir_all(&destination).expect("create isolated physical Lima cache entry");
+            fs::set_permissions(&destination, fs::Permissions::from_mode(0o700))
+                .expect("protect isolated physical Lima cache entry");
+            fs::copy(&source, destination.join("data"))
+                .expect("copy pinned image into isolated physical home");
+            fs::write(destination.join("url"), manifest.guest_image_location())
+                .expect("write isolated cache URL");
+            fs::write(
+                destination.join("sha256.digest"),
+                manifest.guest_image_digest().as_str(),
+            )
+            .expect("write isolated cache digest");
+        }
+
+        fn arm_cleanup(&mut self) {
+            self.cleanup_armed = true;
+        }
+
+        fn cleanup(&mut self) -> Result<(), &'static str> {
+            let instance_directory = self.lima_home.join(self.instance.as_str());
+            if self.cleanup_armed && instance_directory.exists() {
+                let command = CommandSpec::new("/opt/homebrew/bin/limactl")
+                    .argument("--tty=false")
+                    .secret_environment("HOME", exact_path(&self.state_root))
+                    .secret_environment("LIMA_HOME", exact_path(&self.lima_home))
+                    .environment("LANG", "C")
+                    .environment("LC_ALL", "C")
+                    .environment("PATH", LIMACTL_SAFE_PATH)
+                    .argument("delete")
+                    .argument("--force")
+                    .argument(self.instance.as_str());
+                let record = ProcessExecutor
+                    .execute_with_timeout(&command, DISCARD_TIMEOUT)
+                    .map_err(|_| "physical acceptance cleanup command failed")?;
+                if !record.success || instance_directory.exists() {
+                    return Err("physical acceptance instance cleanup was not proven");
+                }
+            }
+            let metadata = fs::symlink_metadata(&self.root)
+                .map_err(|_| "physical acceptance root is unavailable")?;
+            if !metadata.file_type().is_dir()
+                || metadata.file_type().is_symlink()
+                || metadata.dev() != self.root_device
+                || metadata.ino() != self.root_inode
+                || metadata.uid() != self.root_uid
+                || metadata.mode() & 0o777 != 0o700
+            {
+                return Err("physical acceptance root identity drifted");
+            }
+            fs::remove_dir_all(&self.root)
+                .map_err(|_| "physical acceptance root cleanup failed")?;
+            self.cleanup_armed = false;
+            Ok(())
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for PhysicalTemplateFixture {
+        fn drop(&mut self) {
+            if self.root.exists() && self.cleanup().is_err() {
+                eprintln!("physical template acceptance retained recovery state");
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[derive(Default)]
+    struct PhysicalAcceptanceExecutor {
+        records: RefCell<Vec<ExecutionRecord>>,
+    }
+
+    #[cfg(target_os = "macos")]
+    type PhysicalCommandDiagnostic = (Vec<String>, Option<i32>, bool, String, String);
+
+    #[cfg(target_os = "macos")]
+    impl PhysicalAcceptanceExecutor {
+        fn redacted_records(&self, private_root: &Path) -> Vec<PhysicalCommandDiagnostic> {
+            let private_root = exact_path(private_root);
+            self.records
+                .borrow()
+                .iter()
+                .map(|record| {
+                    (
+                        record.argv.clone(),
+                        record.status,
+                        record.success,
+                        record.stdout.replace(&private_root, "<physical-root>"),
+                        record.stderr.replace(&private_root, "<physical-root>"),
+                    )
+                })
+                .collect()
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl CommandExecutor for PhysicalAcceptanceExecutor {
+        fn execute(&self, spec: &CommandSpec) -> io::Result<ExecutionRecord> {
+            let record = ProcessExecutor.execute(spec)?;
+            self.records.borrow_mut().push(record.clone());
+            Ok(record)
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl TimedCommandExecutor for PhysicalAcceptanceExecutor {
+        fn execute_with_timeout(
+            &self,
+            spec: &CommandSpec,
+            timeout: Duration,
+        ) -> io::Result<ExecutionRecord> {
+            let record = ProcessExecutor.execute_with_timeout(spec, timeout)?;
+            self.records.borrow_mut().push(record.clone());
+            Ok(record)
         }
     }
 
@@ -243,6 +503,20 @@ mod tests {
             self.calls.borrow_mut().push((argv.clone(), timeout));
             if argv.iter().any(|value| value == "start") && self.fail_start {
                 return Err(io::Error::other("injected start failure"));
+            }
+            if argv.iter().any(|value| value == "list") {
+                return Ok(ExecutionRecord {
+                    argv: spec.displayed_argv(),
+                    environment_keys: spec.environment.keys().cloned().collect(),
+                    status: Some(1),
+                    success: false,
+                    stdout: String::new(),
+                    stderr: concat!(
+                        "time=\"2026-08-16T14:39:23+08:00\" level=warning msg=\"No instance matching smolrunner-source found.\"\n",
+                        "time=\"2026-08-16T14:39:23+08:00\" level=fatal msg=\"unmatched instances\"\n",
+                    )
+                    .to_owned(),
+                });
             }
             let stdout = if argv.iter().any(|value| value == "start") {
                 "source started\n"
@@ -532,6 +806,33 @@ mod tests {
     }
 
     #[test]
+    fn lima_client_cache_home_is_private_separate_and_source_bound() {
+        let first_root = TempRoot::new("client-home-first");
+        let second_root = TempRoot::new("client-home-second");
+        let first = runtime(&first_root);
+        let second = runtime(&second_root);
+        let (command, _) = first.fixed_command(DisposableTemplateRuntimeCommandKind::Create);
+
+        assert_eq!(
+            command.environment.get("HOME"),
+            Some(&CommandValue::Secret(SecretString::new(exact_path(
+                first_root.path()
+            ))))
+        );
+        assert_eq!(
+            command.environment.get("LIMA_HOME"),
+            Some(&CommandValue::Secret(SecretString::new(
+                "/private/var/lib/smolrunner/lima"
+            )))
+        );
+        assert_ne!(
+            first.initial_document().source_identity(),
+            second.initial_document().source_identity(),
+            "the private Lima client home participates in source identity"
+        );
+    }
+
+    #[test]
     fn readiness_marker_bytes_match_the_checked_in_provisioning_recipe() {
         let template = std::str::from_utf8(current_disposable_lima_template_bytes()).unwrap();
         for line in std::str::from_utf8(READY_MARKER_BYTES).unwrap().lines() {
@@ -633,6 +934,74 @@ mod tests {
                 .iter()
                 .any(|(argv, _)| argv.iter().any(|value| value == "start"))
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "creates and deletes one isolated physical Lima/VZ prepared template"]
+    fn physical_prepared_template_reaches_ready_stopped_and_cleans_up() {
+        assert_eq!(
+            std::env::var("SMOLRUNNER_PHYSICAL_TEMPLATE_ACCEPTANCE").as_deref(),
+            Ok("create-ready-stop-delete"),
+            "set the exact physical acceptance opt-in token"
+        );
+        let mut fixture = PhysicalTemplateFixture::new();
+        if let Some(source) = std::env::var_os("SMOLRUNNER_PHYSICAL_TEMPLATE_IMAGE_CACHE_ENTRY") {
+            fixture.seed_image_cache(Path::new(&source));
+        } else if let Some(source) = std::env::var_os("SMOLRUNNER_PHYSICAL_TEMPLATE_IMAGE_FILE") {
+            fixture.seed_image_file(Path::new(&source));
+        }
+        let runtime = fixture.runtime();
+        let executor = PhysicalAcceptanceExecutor::default();
+        let clock = SystemLimaObservationClock;
+
+        let authorized = runtime
+            .reconcile_once(&executor, &clock)
+            .expect("authorize physical source creation from proven absence");
+        assert_eq!(
+            authorized.phase,
+            DisposableTemplateGenerationPhase::CreateAuthorized
+        );
+        fixture.arm_cleanup();
+
+        let mut receipts = vec![authorized];
+        for _ in 0..8 {
+            let receipt = runtime
+                .reconcile_once(&executor, &clock)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "advance physical prepared-template lifecycle: {error:?}; records={:?}",
+                        executor.redacted_records(&fixture.root)
+                    )
+                });
+            let satisfied = receipt.disposition == DisposableTemplateRuntimeDisposition::Satisfied;
+            receipts.push(receipt);
+            if satisfied {
+                break;
+            }
+        }
+        assert_eq!(
+            receipts.last().map(|receipt| receipt.disposition),
+            Some(DisposableTemplateRuntimeDisposition::Satisfied),
+            "physical source did not converge to ready and stopped: {receipts:?}"
+        );
+        assert!(receipts.iter().any(|receipt| {
+            receipt.disposition
+                == DisposableTemplateRuntimeDisposition::CommandCompleted {
+                    command: DisposableTemplateRuntimeCommandKind::Create,
+                }
+        }));
+        assert!(receipts.iter().any(|receipt| {
+            receipt.disposition
+                == DisposableTemplateRuntimeDisposition::CommandCompleted {
+                    command: DisposableTemplateRuntimeCommandKind::Stop,
+                }
+        }));
+
+        fixture
+            .cleanup()
+            .expect("delete the exact accepted source and its isolated state");
+        assert!(!fixture.root.exists());
     }
 }
 
@@ -743,6 +1112,7 @@ impl DisposableTemplateRuntime {
             .map_err(|_| invalid_configuration())?;
         let source_identity = derive_source_identity(
             &source_instance,
+            &state_root,
             &lima_home,
             &limactl_program,
             prepared_template.lima_version(),
@@ -1438,10 +1808,14 @@ impl DisposableTemplateRuntime {
     fn base_command(&self) -> CommandSpec {
         CommandSpec::new(&self.limactl_program)
             .argument("--tty=false")
-            .environment("HOME", LIMACTL_SAFE_HOME)
+            // Lima 2.2 uses macOS's user-cache directory while fetching the pinned image. Keep
+            // that cache inside the already-private, source-identity-bound state root instead of
+            // exposing the operator's real home or mixing cache entries into LIMA_HOME.
+            .secret_environment("HOME", exact_path(&self.state_root))
             .secret_environment("LIMA_HOME", exact_path(&self.lima_home))
             .environment("LANG", "C")
             .environment("LC_ALL", "C")
+            .environment("PATH", LIMACTL_SAFE_PATH)
     }
 
     fn guest_command_for(&self, instance: &LimaInstanceName, program: &str) -> CommandSpec {
@@ -1621,15 +1995,18 @@ fn receipt(
 
 fn derive_source_identity(
     instance: &LimaInstanceName,
+    state_root: &Path,
     lima_home: &Path,
     limactl_program: &Path,
     lima_version: &str,
 ) -> Result<DisposableTemplateSourceIdentity, DisposableTemplateRuntimeError> {
+    let client_home = exact_path(state_root);
     let home = exact_path(lima_home);
     let program = exact_path(limactl_program);
     let mut hasher = Sha256::new();
     hasher.update(SOURCE_IDENTITY_DOMAIN);
     hash_field(&mut hasher, instance.as_str().as_bytes());
+    hash_field(&mut hasher, client_home.as_bytes());
     hash_field(&mut hasher, home.as_bytes());
     hash_field(&mut hasher, program.as_bytes());
     hash_field(&mut hasher, lima_version.as_bytes());
