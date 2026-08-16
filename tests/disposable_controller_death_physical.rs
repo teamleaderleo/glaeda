@@ -499,11 +499,9 @@ impl RestartProbeExecutor {
                 .set(self.mutation_attempts.get().saturating_add(1));
             match PhysicalControllerFixture::process_group_is_live(self.mutation_pgid) {
                 Ok(false) => {}
-                Ok(true) | Err(_) => self.conflicting_mutation_attempts.set(
-                    self.conflicting_mutation_attempts
-                        .get()
-                        .saturating_add(1),
-                ),
+                Ok(true) | Err(_) => self
+                    .conflicting_mutation_attempts
+                    .set(self.conflicting_mutation_attempts.get().saturating_add(1)),
             }
             return Err(io::Error::other(
                 "controller-death proof refused a second external mutation",
@@ -703,9 +701,9 @@ fn physical_controller_death_during_template_create_is_observed_and_fenced() {
     post_quiescence.expect(
         "fresh post-quiescence reconciliation must succeed without mutation before cleanup authority exists",
     );
-    fixture
-        .authorize_cleanup(mutation_pgid)
-        .expect("authorize cleanup from fresh quiescent reconciliation and exact namespace identity");
+    fixture.authorize_cleanup(mutation_pgid).expect(
+        "authorize cleanup from fresh quiescent reconciliation and exact namespace identity",
+    );
     fixture
         .cleanup(mutation_pgid)
         .expect("remove the exact quiescent controller-death namespace");
