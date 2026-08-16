@@ -168,12 +168,18 @@ jobs:
       - name: Check ARM64 Linux build
         run: cargo check --locked --target aarch64-unknown-linux-gnu
 
-      # Keep the operator CLI buildable on its supported Apple Silicon host.
+      # Keep the production library and operator CLI buildable on the supported
+      # Apple Silicon host. The required macOS verification profile compiles and
+      # runs all test targets before merge; do not duplicate all 45 test harnesses
+      # in this cross-target production check.
       - name: Install Apple Silicon target
         run: rustup target add aarch64-apple-darwin
 
       - name: Check Apple Silicon build
-        run: cargo check --locked --all-targets --all-features --target aarch64-apple-darwin
+        run: >-
+          cargo check --locked --all-features
+          --target aarch64-apple-darwin
+          --lib --bin smolrunner
 
       - name: Run Clippy
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
