@@ -20,7 +20,8 @@ pub mod disposable_attempt_state;
 pub mod disposable_clone_runtime;
 #[cfg(unix)]
 pub(crate) mod disposable_host_storage;
-/// Pure exact plan for the macOS disposable-worker LaunchAgent lifecycle.
+/// Exact plan plus explicitly approved macOS apply boundary for the disposable-worker LaunchAgent.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub mod disposable_launchd_service;
 /// Sealed fixed Lima command plans for one durably planned disposable worker.
 pub mod disposable_lima_worker;
