@@ -2,8 +2,18 @@ name: Bootstrap compatibility
 
 on:
   pull_request:
+    paths:
+      - ".github/workflows/bootstrap-compatibility.yml"
+      - "scripts/bootstrap-profile-compatibility"
+      - "scripts/test-bootstrap-profile-compatibility.sh"
+      - "scripts/workspace_bootstrap/profile_bridge.py"
   push:
     branches: [main]
+    paths:
+      - ".github/workflows/bootstrap-compatibility.yml"
+      - "scripts/bootstrap-profile-compatibility"
+      - "scripts/test-bootstrap-profile-compatibility.sh"
+      - "scripts/workspace_bootstrap/profile_bridge.py"
 
 permissions:
   contents: read
