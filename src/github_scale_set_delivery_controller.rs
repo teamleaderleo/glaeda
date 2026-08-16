@@ -71,10 +71,13 @@ pub(crate) enum ScaleSetDeliveryControllerDisposition {
 /// Advance at most one exact Scale Set delivery across its external acknowledgement boundary.
 ///
 /// A new message is reconciled and published before acknowledgement begins. A durable
-/// `AcknowledgementStarted` phase is never replayed through `ack`; a fresh bridge may only invoke
-/// standalone acquisition for the exact retained available request IDs. Empty acquisition replay
-/// restores the original cursor and admits only zero-capacity lifecycle evidence; exact assignment
-/// or runnerless cancellation then replaces the original fence before its own acknowledgement.
+/// `AcknowledgementStarted` with Available work is never replayed through `ack`; a fresh bridge may
+/// only invoke standalone acquisition for the exact retained available request IDs. A
+/// lifecycle-only message has no acquisition side effect, so a fresh zero-capacity session either
+/// re-acknowledges its exact redelivery or confirms its absence before settlement. Empty acquisition
+/// replay restores the original cursor and admits only zero-capacity lifecycle evidence; exact
+/// assignment or runnerless cancellation then replaces the original fence before its own
+/// acknowledgement.
 pub(crate) fn consume_scale_set_delivery_once(
     root_path: &Path,
     policy: &ScaleSetDeliveryConsumerPolicy,
@@ -377,7 +380,7 @@ fn recover_acquisition<B: DeliveryBridge>(
         .map_err(|_| controller_error("scale_set_delivery_invalid"))?
         .is_empty()
     {
-        return Ok(ScaleSetDeliveryControllerDisposition::RecoveryRequired);
+        return recover_acknowledgement_without_acquisition(store, bridge, current);
     }
     let transaction = store
         .recover_scale_set_acquisition_locked(&current, |available| {
@@ -397,6 +400,56 @@ fn recover_acquisition<B: DeliveryBridge>(
     } else {
         settle_delivery(store, &successor, acquired.len())
     }
+}
+
+fn recover_acknowledgement_without_acquisition<B: DeliveryBridge>(
+    store: &mut UnixPersonalWorkerStore,
+    bridge: &mut B,
+    current: ScaleSetDeliveryRecoveryState,
+) -> Result<ScaleSetDeliveryControllerDisposition, ScaleSetDeliveryControllerError> {
+    let poll = bridge.poll(0).map_err(map_bridge_error)?;
+    let observed = match ScaleSetDelivery::from_bridge_poll(&poll) {
+        Ok(value) => value,
+        Err(_) => {
+            bridge.poison();
+            return Err(controller_error("scale_set_delivery_invalid"));
+        }
+    };
+    if observed.as_ref() == Some(current.delivery()) {
+        let transaction = store
+            .retry_scale_set_delivery_acknowledgement_locked(&current, |message_id| {
+                let acquired = bridge.ack(message_id).map_err(map_bridge_error)?;
+                if !acquired.is_empty() {
+                    bridge.poison();
+                    return Err(controller_error("scale_set_ack_response_invalid"));
+                }
+                Ok(Vec::new())
+            })
+            .map_err(map_store_error)?;
+        let acknowledged = match transaction {
+            ScaleSetExternalTransaction::Completed(state) => state,
+            ScaleSetExternalTransaction::ExternalFailed(error) => {
+                bridge.poison();
+                return Err(error);
+            }
+        };
+        return settle_delivery(store, &acknowledged, 0);
+    }
+
+    let original_absent = observed.as_ref().is_none_or(|delivery| {
+        delivery.message_id() > current.delivery().message_id()
+            && delivery
+                .available_request_ids()
+                .is_ok_and(|available| available.is_empty())
+    });
+    bridge.poison();
+    if !original_absent {
+        return Err(controller_error("scale_set_delivery_recovery_conflict"));
+    }
+    let acknowledged = store
+        .confirm_scale_set_delivery_acknowledged_locked(&current)
+        .map_err(map_store_error)?;
+    settle_delivery(store, &acknowledged, 0)
 }
 
 fn observe_lifecycle_resolution<B: DeliveryBridge>(

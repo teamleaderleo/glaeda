@@ -57,6 +57,96 @@ impl UnixPersonalWorkerStore {
         Ok(ScaleSetExternalTransaction::Completed(acknowledged))
     }
 
+    /// Retry deletion only after a fresh session redelivers the exact lifecycle-only message.
+    ///
+    /// A delivery with no Available identities has no acquisition side effect. The exact
+    /// redelivery therefore proves that the earlier delete did not take effect and makes one
+    /// replay safe; the empty response remains mandatory.
+    pub(crate) fn retry_scale_set_delivery_acknowledgement_locked<E, F>(
+        &mut self,
+        expected: &ScaleSetDeliveryRecoveryState,
+        acknowledge: F,
+    ) -> Result<
+        ScaleSetExternalTransaction<ScaleSetDeliveryRecoveryState, E>,
+        PersonalWorkerStoreError,
+    >
+    where
+        F: FnOnce(u32) -> Result<Vec<ScaleSetRunnerRequestId>, E>,
+    {
+        let _lock = self.acquire_mutation_lock()?;
+        synchronize_directory(&self.directory, "personal worker store directory")?;
+        self.refuse_other_unsettled_scale_set_state()?;
+        self.recover_scale_set_delivery_locked()?;
+        let current = self
+            .load_scale_set_delivery_named(DELIVERY_RECOVERY_DOCUMENT)?
+            .ok_or_else(PersonalWorkerStoreError::corrupt_state)?;
+        if current != *expected
+            || !matches!(
+                current.phase(),
+                ScaleSetDeliveryRecoveryPhase::AcknowledgementStarted
+            )
+            || !current
+                .delivery()
+                .available_request_ids()
+                .map_err(|_| PersonalWorkerStoreError::corrupt_state())?
+                .is_empty()
+        {
+            return Err(store_error(
+                PersonalWorkerStoreErrorKind::RevisionConflict,
+                "Scale Set delivery is not the exact lifecycle-only acknowledgement candidate",
+            ));
+        }
+        self.require_scale_set_catalog_binding(&current)?;
+        let acquired = match acknowledge(current.delivery().message_id()) {
+            Ok(acquired) => acquired,
+            Err(error) => return Ok(ScaleSetExternalTransaction::ExternalFailed(error)),
+        };
+        if !acquired.is_empty() {
+            return Err(PersonalWorkerStoreError::corrupt_state());
+        }
+        let acknowledged = current
+            .record_ack_response(&[])
+            .map_err(map_recovery_error)?;
+        self.publish_scale_set_delivery_successor_locked(&current, &acknowledged)?;
+        Ok(ScaleSetExternalTransaction::Completed(acknowledged))
+    }
+
+    /// Confirm deletion after a fresh zero-capacity session proves the exact message absent.
+    pub(crate) fn confirm_scale_set_delivery_acknowledged_locked(
+        &mut self,
+        expected: &ScaleSetDeliveryRecoveryState,
+    ) -> Result<ScaleSetDeliveryRecoveryState, PersonalWorkerStoreError> {
+        let _lock = self.acquire_mutation_lock()?;
+        synchronize_directory(&self.directory, "personal worker store directory")?;
+        self.refuse_other_unsettled_scale_set_state()?;
+        self.recover_scale_set_delivery_locked()?;
+        let current = self
+            .load_scale_set_delivery_named(DELIVERY_RECOVERY_DOCUMENT)?
+            .ok_or_else(PersonalWorkerStoreError::corrupt_state)?;
+        if current != *expected
+            || !matches!(
+                current.phase(),
+                ScaleSetDeliveryRecoveryPhase::AcknowledgementStarted
+            )
+            || !current
+                .delivery()
+                .available_request_ids()
+                .map_err(|_| PersonalWorkerStoreError::corrupt_state())?
+                .is_empty()
+        {
+            return Err(store_error(
+                PersonalWorkerStoreErrorKind::RevisionConflict,
+                "Scale Set acknowledgement absence does not match durable state",
+            ));
+        }
+        self.require_scale_set_catalog_binding(&current)?;
+        let acknowledged = current
+            .record_ack_response(&[])
+            .map_err(map_recovery_error)?;
+        self.publish_scale_set_delivery_successor_locked(&current, &acknowledged)?;
+        Ok(acknowledged)
+    }
+
     /// Replay acquisition once and publish the accumulated positive evidence under one lock.
     pub(crate) fn recover_scale_set_acquisition_locked<E, F>(
         &mut self,

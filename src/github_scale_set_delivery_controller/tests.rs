@@ -471,6 +471,73 @@ fn acknowledgement_failure_leaves_started_and_never_replays_ack() {
 }
 
 #[test]
+fn direct_assignment_ack_failure_retries_only_after_exact_redelivery() {
+    let root = TempRoot::new("direct-ack-redelivery");
+    initialize(&root);
+    let direct = assigned_message(120, (1_u64 << 62) + 41);
+    let mut failed = FakeBridge {
+        polls: VecDeque::from([direct.clone()]),
+        acknowledgements: VecDeque::from([Err(ScaleSetBridgeError::new("response-lost"))]),
+        ..FakeBridge::default()
+    };
+    assert_eq!(
+        consume_with_bridge(root.path(), &policy(), &mut failed, observed_at())
+            .unwrap_err()
+            .code(),
+        "scale_set_bridge_failed"
+    );
+    assert!(failed.poisoned);
+    assert!(matches!(
+        load_recovery(&root).phase(),
+        ScaleSetDeliveryRecoveryPhase::AcknowledgementStarted
+    ));
+
+    let mut retry = FakeBridge {
+        polls: VecDeque::from([direct]),
+        acknowledgements: VecDeque::from([Ok(Vec::new())]),
+        ..FakeBridge::default()
+    };
+    assert_eq!(
+        consume_with_bridge(root.path(), &policy(), &mut retry, observed_at()).unwrap(),
+        ScaleSetDeliveryControllerDisposition::Settled { acquired: 0 }
+    );
+    assert_eq!(retry.calls, ["poll_zero", "ack"]);
+    assert!(!retry.poisoned);
+    assert!(maybe_recovery(&root).is_none());
+    assert_eq!(load_catalog(&root).active().len(), 1);
+}
+
+#[test]
+fn direct_assignment_ack_response_loss_settles_from_fresh_absence() {
+    let root = TempRoot::new("direct-ack-absence");
+    initialize(&root);
+    let direct_request = (1_u64 << 62) + 42;
+    let mut failed = FakeBridge {
+        polls: VecDeque::from([assigned_message(121, direct_request)]),
+        acknowledgements: VecDeque::from([Err(ScaleSetBridgeError::new("response-lost"))]),
+        ..FakeBridge::default()
+    };
+    assert!(consume_with_bridge(root.path(), &policy(), &mut failed, observed_at()).is_err());
+
+    let mut recovery = FakeBridge {
+        polls: VecDeque::from([idle()]),
+        ..FakeBridge::default()
+    };
+    assert_eq!(
+        consume_with_bridge(root.path(), &policy(), &mut recovery, observed_at()).unwrap(),
+        ScaleSetDeliveryControllerDisposition::Settled { acquired: 0 }
+    );
+    assert_eq!(recovery.calls, ["poll_zero"]);
+    assert!(recovery.poisoned);
+    assert!(maybe_recovery(&root).is_none());
+    assert!(
+        load_catalog(&root)
+            .find_active_by_runner_request_id(ScaleSetRunnerRequestId::new(direct_request).unwrap())
+            .is_some()
+    );
+}
+
+#[test]
 fn canonical_writer_lock_spans_the_acknowledgement_call() {
     let root = TempRoot::new("ack-lock");
     initialize(&root);

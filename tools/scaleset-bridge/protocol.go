@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"io"
@@ -12,6 +14,7 @@ import (
 	"runtime/debug"
 	"slices"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/actions/scaleset"
@@ -21,6 +24,8 @@ import (
 const protocolVersion = 2
 const bridgeVersion = "0.1.0"
 const maxServiceResponseBytes = 2 * 1024 * 1024
+const syntheticRunnerRequestMarker int64 = 1 << 62
+const syntheticRunnerRequestDomain = "smolrunner.scale-set.direct-assignment.v1"
 
 type protocolRequest struct {
 	Version          int         `json:"version"`
@@ -725,7 +730,7 @@ func normalizeMessage(message *scaleset.RunnerScaleSetMessage) (protocolResponse
 }
 
 func normalizeJob(kind string, input scaleset.JobMessageBase, runnerID int, runnerName, result string) (jobEvent, error) {
-	if input.RunnerRequestID <= 0 || input.WorkflowRunID <= 0 || !boundedToken(input.RepositoryName, 100) || !boundedToken(input.OwnerName, 100) || !boundedToken(input.JobID, 256) || len(input.RequestLabels) > 32 {
+	if input.RunnerRequestID < 0 || input.WorkflowRunID <= 0 || !boundedToken(input.RepositoryName, 100) || !boundedToken(input.OwnerName, 100) || !boundedToken(input.JobID, 256) || len(input.RequestLabels) > 32 {
 		return jobEvent{}, errors.New("invalid job event")
 	}
 	for _, label := range input.RequestLabels {
@@ -754,7 +759,44 @@ func normalizeJob(kind string, input scaleset.JobMessageBase, runnerID int, runn
 	default:
 		return jobEvent{}, errors.New("unsupported job event")
 	}
-	return jobEvent{Kind: kind, RunnerRequestID: input.RunnerRequestID, Repository: input.RepositoryName, Owner: input.OwnerName, JobID: input.JobID, WorkflowRunID: input.WorkflowRunID, RequestLabels: append([]string(nil), input.RequestLabels...), RunnerID: runnerID, RunnerName: runnerName, Result: result}, nil
+	requestID := input.RunnerRequestID
+	if requestID == 0 {
+		if kind == "available" || input.ScaleSetAssignTime.IsZero() {
+			return jobEvent{}, errors.New("job is missing its service assignment identity")
+		}
+		requestID = syntheticRunnerRequestID(input)
+	}
+	return jobEvent{Kind: kind, RunnerRequestID: requestID, Repository: input.RepositoryName, Owner: input.OwnerName, JobID: input.JobID, WorkflowRunID: input.WorkflowRunID, RequestLabels: append([]string(nil), input.RequestLabels...), RunnerID: runnerID, RunnerName: runnerName, Result: result}, nil
+}
+
+// GitHub can directly assign organization Scale Set work while reporting runnerRequestId=0. The
+// durable Rust side still needs one stable positive join key across Assigned/Started/Completed.
+// Service request IDs are positive signed integers, so the marked digest-derived namespace keeps
+// direct assignments distinct in normal operation; the full job evidence remains independently
+// validated and makes a theoretical truncated-digest collision fail closed rather than adopt work.
+func syntheticRunnerRequestID(input scaleset.JobMessageBase) int64 {
+	hasher := sha256.New()
+	hasher.Write([]byte(syntheticRunnerRequestDomain))
+	var framed [8]byte
+	writeField := func(value string) {
+		binary.BigEndian.PutUint64(framed[:], uint64(len(value)))
+		hasher.Write(framed[:])
+		hasher.Write([]byte(value))
+	}
+	writeField(input.OwnerName)
+	writeField(input.RepositoryName)
+	writeField(input.JobID)
+	binary.BigEndian.PutUint64(framed[:], uint64(input.WorkflowRunID))
+	hasher.Write(framed[:])
+	writeField(input.ScaleSetAssignTime.UTC().Format(time.RFC3339Nano))
+	labels := append([]string(nil), input.RequestLabels...)
+	slices.Sort(labels)
+	for _, label := range labels {
+		writeField(label)
+	}
+	digest := hasher.Sum(nil)
+	value := int64(binary.BigEndian.Uint64(digest[:8]) & uint64(syntheticRunnerRequestMarker-1))
+	return syntheticRunnerRequestMarker | value
 }
 
 func normalizeRunner(input *scaleset.RunnerReference) *runner {
