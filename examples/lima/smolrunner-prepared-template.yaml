@@ -188,6 +188,15 @@ provision:
         --tlsv1.2 \
         --fail \
         --location \
+        --retry 8 \
+        --retry-all-errors \
+        --retry-delay 2 \
+        --retry-max-time 300 \
+        --max-time 300 \
+        --connect-timeout 30 \
+        --speed-limit 1024 \
+        --speed-time 60 \
+        --continue-at - \
         --silent \
         --show-error \
         --output "${archive}" \

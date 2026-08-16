@@ -20,7 +20,7 @@
   },
   "provisioning": {
     "recipe_revision": 4,
-    "lima_template_digest": "sha256:39b371c566c150d8d2806f351dab08924f654609fcdb785f67762ab8852fb638",
+    "lima_template_digest": "sha256:2c7fe04536d10ddb932f4e41176acb8a281cddeb86f592559d210e300cf5941f",
     "admin_user": "smolrunner-admin",
     "admin_uid": 1000,
     "admin_comment": "SmolRunner controller",
