@@ -203,41 +203,57 @@ impl DisposableWorkerCoordinator {
             }
         }
 
-        let available_capacity = advertised_capacity(&catalog, self.host_storage.as_ref());
-        let host_storage_available = available_capacity == 1;
-        let observed_at = clock
-            .epoch_millis()
-            .map_err(|_| coordinator_error("disposable_clock_unavailable"))?;
-        let delivery = if available_capacity == 1 {
-            consume_with_bridge_capacity_at_revision(
-                &self.state_root,
-                &self.policy,
-                bridge,
-                observed_at,
-                available_capacity,
-                catalog.revision(),
-            )
-        } else {
-            consume_with_bridge_capacity(
-                &self.state_root,
-                &self.policy,
-                bridge,
-                observed_at,
-                available_capacity,
-            )
-        };
-        match delivery.map_err(|error| coordinator_error(error.code()))? {
-            ScaleSetDeliveryControllerDisposition::Settled { acquired } => {
-                return Ok(DisposableWorkerCoordinatorDisposition::DeliverySettled { acquired });
+        let operation_owns_live_poll = catalog
+            .active()
+            .first()
+            .map(operation_for)
+            .transpose()?
+            .is_some_and(|operation| {
+                matches!(
+                    operation,
+                    CoordinatorOperation::ExecuteClone
+                        | CoordinatorOperation::CheckpointRegistration
+                )
+            });
+        if !operation_owns_live_poll {
+            let available_capacity = advertised_capacity(&catalog, self.host_storage.as_ref());
+            let host_storage_available = available_capacity == 1;
+            let observed_at = clock
+                .epoch_millis()
+                .map_err(|_| coordinator_error("disposable_clock_unavailable"))?;
+            let delivery = if available_capacity == 1 {
+                consume_with_bridge_capacity_at_revision(
+                    &self.state_root,
+                    &self.policy,
+                    bridge,
+                    observed_at,
+                    available_capacity,
+                    catalog.revision(),
+                )
+            } else {
+                consume_with_bridge_capacity(
+                    &self.state_root,
+                    &self.policy,
+                    bridge,
+                    observed_at,
+                    available_capacity,
+                )
+            };
+            match delivery.map_err(|error| coordinator_error(error.code()))? {
+                ScaleSetDeliveryControllerDisposition::Settled { acquired } => {
+                    return Ok(DisposableWorkerCoordinatorDisposition::DeliverySettled {
+                        acquired,
+                    });
+                }
+                ScaleSetDeliveryControllerDisposition::RecoveryRequired => {
+                    return Ok(DisposableWorkerCoordinatorDisposition::DeliveryRecoveryRequired);
+                }
+                ScaleSetDeliveryControllerDisposition::Idle => {}
             }
-            ScaleSetDeliveryControllerDisposition::RecoveryRequired => {
-                return Ok(DisposableWorkerCoordinatorDisposition::DeliveryRecoveryRequired);
-            }
-            ScaleSetDeliveryControllerDisposition::Idle => {}
-        }
 
-        if catalog.active().is_empty() && !host_storage_available {
-            return Ok(DisposableWorkerCoordinatorDisposition::HostStorageUnavailable);
+            if catalog.active().is_empty() && !host_storage_available {
+                return Ok(DisposableWorkerCoordinatorDisposition::HostStorageUnavailable);
+            }
         }
 
         let catalog = load_catalog(&self.state_root)?;

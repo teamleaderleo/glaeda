@@ -142,10 +142,10 @@ impl DisposableCloneAdmissionObservation {
 /// Live source for current capacity ownership and cancellation state.
 ///
 /// The disposable worker coordinator supplies this evidence from a live zero-capacity Scale Set
-/// poll. The clone transaction invokes it exactly once, after every other non-mutating preflight,
-/// while holding the canonical store lock immediately before both the durable start checkpoint
-/// and the external command. Earlier lifecycle polls belong to the coordinator and are not reused
-/// as command authority.
+/// poll. Clone execution and registration checkpointing each invoke it exactly once, after their
+/// other non-mutating preflight, while holding the canonical store lock immediately before their
+/// durable authority checkpoint. Earlier lifecycle polls belong to other phases and are not reused
+/// as command or registration authority.
 pub(crate) mod admission_seal {
     pub trait Sealed {}
 }
@@ -688,6 +688,43 @@ impl DisposableCloneRuntime {
                 "clone_registration_phase_mismatch",
             ));
         }
+        let preflight_at = clock
+            .epoch_millis()
+            .map_err(|_| observation("clone_clock_unavailable"))?;
+        if preflight_at > reservation.attempt().not_after() {
+            let action = reconcile_attempt(DisposableWorkerReconcileInput {
+                now: preflight_at,
+                attempt: reservation.attempt(),
+                vm: DisposableVmObservation::Unknown,
+                vm_identity: None,
+                runner: ScaleSetRunnerObservation::Unknown,
+                job_event: None,
+                capacity_reserved: true,
+                cancellation_requested: false,
+            })
+            .map_err(|_| DisposableCloneRuntimeError::recovery("clone_reconcile_failed"))?;
+            if action
+                == (DisposableWorkerAction::Persist {
+                    transition: DisposableAttemptCatalogAction::BeginCleanup,
+                })
+            {
+                return Ok(DisposableAttemptCatalogAction::BeginCleanup);
+            }
+            return Err(DisposableCloneRuntimeError::recovery(
+                "clone_cleanup_checkpoint_refused",
+            ));
+        }
+        let ready = self.confirm_ready_worker_bound(reservation, executor, clock)?;
+        let second_ready = self.confirm_ready_worker_bound(reservation, executor, clock)?;
+        ready
+            .confirm_current()
+            .map_err(|_| observation("clone_worker_identity_drift"))?;
+        second_ready
+            .confirm_current()
+            .map_err(|_| observation("clone_worker_identity_drift"))?;
+        // Guest readiness is the expensive part of this transaction. Observe it before the live
+        // Scale Set gate so the gate remains fresh at the checkpoint barrier. No workload or JIT
+        // credential exists yet, and the retained host observations bracket the live poll below.
         let admission_observation = admission.observe(catalog, reservation)?;
         let observed_at = clock
             .epoch_millis()
@@ -697,6 +734,12 @@ impl DisposableCloneRuntime {
             reservation,
             observed_at,
         )?;
+        ready
+            .confirm_current()
+            .map_err(|_| observation("clone_worker_identity_drift"))?;
+        second_ready
+            .confirm_current()
+            .map_err(|_| observation("clone_worker_identity_drift"))?;
         let cleanup = !admission_observation.capacity_reserved
             || admission_observation.cancellation_requested
             || observed_at > reservation.attempt().not_after();
@@ -724,15 +767,6 @@ impl DisposableCloneRuntime {
             ));
         }
 
-        let ready = self.confirm_ready_worker_bound(reservation, executor, clock)?;
-        let ready_after_admission =
-            self.confirm_ready_worker_bound(reservation, executor, clock)?;
-        ready
-            .confirm_current()
-            .map_err(|_| observation("clone_worker_identity_drift"))?;
-        ready_after_admission
-            .confirm_current()
-            .map_err(|_| observation("clone_worker_identity_drift"))?;
         let checkpoint_at = clock
             .epoch_millis()
             .map_err(|_| observation("clone_clock_unavailable"))?;
@@ -770,7 +804,7 @@ impl DisposableCloneRuntime {
             ready
                 .confirm_current()
                 .map_err(|_| observation("clone_worker_identity_drift"))?;
-            ready_after_admission
+            second_ready
                 .confirm_current()
                 .map_err(|_| observation("clone_worker_identity_drift"))?;
         }
@@ -2286,9 +2320,9 @@ mod tests {
                 .unwrap(),
             DisposableWorkerCoordinatorDisposition::CloneCompleted { .. }
         ));
-        // One coordinator lifecycle poll precedes each phase. The clone transaction adds exactly
-        // one final under-lock poll after its non-mutating source/target/Lima preflight.
-        assert_eq!(bridge.capacities, [0, 0, 0]);
+        // Reserved authorization used the normal coordinator poll; clone execution added only its
+        // exact under-lock live poll and no stale outer poll.
+        assert_eq!(bridge.capacities, [0, 0]);
         executor.target_ready = true;
         assert!(matches!(
             coordinator
@@ -2305,6 +2339,8 @@ mod tests {
                 ..
             }
         ));
+        // Registration likewise adds only its exact under-lock live poll.
+        assert_eq!(bridge.capacities, [0, 0, 0]);
         assert!(matches!(
             coordinator
                 .supervise_with_bridge(
