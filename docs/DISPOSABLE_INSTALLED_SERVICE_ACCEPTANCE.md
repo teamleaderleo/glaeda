@@ -20,8 +20,11 @@ Retain only bounded evidence needed to identify the exact accepted run:
 - canonical enrollment SHA-256;
 - exact LaunchAgent plan identity;
 - typed `service apply` report;
+- read-only `service status` evidence that the exact LaunchAgent identity is `loaded_exact` with `installation_remediation=none`;
 - GitHub workflow/run and bounded durable attempt identities needed to follow the one job;
-- terminal proof that the runner is absent, the VM is absent, capacity is released, and the supervised service remains healthy at zero capacity.
+- terminal proof that the runner is absent, the VM is absent, capacity is released, no worker-specific durable debt remains, and the exact LaunchAgent identity remains loaded.
+
+Current status schema v2 deliberately reports `runtime_health=unknown` for an exact loaded LaunchAgent. That is the truthful accepted value until a separately reviewed observer can prove controller progress. Do not translate `loaded_exact` into a claim that the supervised process is healthy or polling.
 
 Do not retain or paste:
 
@@ -121,13 +124,34 @@ The apply engine revalidates the current protected inputs and exact LaunchAgent 
 
 If apply reports foreign, unsafe, ambiguous, or changed state, stop. Re-observe before proposing retry or cleanup.
 
+After a successful apply, inspect the exact installed state through the read-only status surface:
+
+```sh
+"$PROGRAM" --output json service status \
+  --operator-home "$OPERATOR_HOME" \
+  --program "$PROGRAM" \
+  --program-digest "$PROGRAM_DIGEST" \
+  --enrollment "$ENROLLMENT" \
+  --enrollment-digest "$ENROLLMENT_DIGEST"
+```
+
+Before proceeding, require all of these from the same bounded report:
+
+- `state` is `loaded_exact`;
+- `service_loaded` is `true`;
+- `plan_identity` is the exact approved installed plan identity;
+- `installation_remediation` is `none`;
+- `runtime_health` is `unknown`.
+
+`runtime_health=unknown` is expected. The current observer proves exact installed/load identity and intentionally does not infer controller liveness, polling progress, or crash-loop health from `launchctl print` fields.
+
 ## 4. Operator gate: live credentials and enrolled repository
 
 Before allowing the installed service to contact GitHub, explicitly approve use of the selected live GitHub App credential and enrolled benign test repository.
 
 Keep credential material in the Mac control plane. Do not copy private-key bytes, tokens, JIT configuration, or secret environment values into the runbook transcript or acceptance artifacts.
 
-Confirm the service remains supervised and reaches its ordinary zero-capacity polling state before queueing work. The accepted service/apply path must be the one under test; do not start a second manual worker process as a substitute.
+Freshly confirm `service status` remains `loaded_exact` with `installation_remediation=none`. Separately require worker-side durable evidence that no prior disposable attempt, runner, VM, or capacity debt is present before queueing work. Do not use `runtime_health=unknown` as either success or failure evidence for worker progress, and do not start a second manual worker process as a substitute for the installed service.
 
 ## 5. Operator gate: queue exactly one benign job
 
@@ -156,7 +180,9 @@ Do not call the run successful at GitHub job completion alone. Require fresh evi
 - the exact disposable VM is absent after teardown;
 - the reservation/capacity is released and reported capacity is zero;
 - no acceptance-specific VM, runner registration, durable reservation, or temporary acceptance artifact remains;
-- the supervised service remains healthy and able to poll at zero capacity.
+- fresh `service status` still reports `loaded_exact`, `service_loaded=true`, the exact approved plan identity, `installation_remediation=none`, and `runtime_health=unknown`.
+
+The zero-capacity/no-debt proof comes from the worker lifecycle evidence. The service-status proof establishes only that the exact accepted LaunchAgent remains installed and loaded; it does not establish runtime progress or health.
 
 If teardown or release remains uncertain, retain the exact durable recovery evidence and stop. Do not replay JIT generation, acquisition acknowledgement, clone creation, or another conflicting mutation across an ambiguous Started/debt state.
 
@@ -204,9 +230,9 @@ A #492 acceptance comment should summarize only:
 - terminal result;
 - runner absence;
 - VM absence;
-- capacity zero;
-- supervised service healthy at zero capacity;
+- capacity zero and absence of worker-specific durable debt;
+- final LaunchAgent state `loaded_exact` with `installation_remediation=none` and `runtime_health=unknown` if the service is retained;
 - secret/private-path sentinel result;
 - whether the operator retained or removed the installed service afterward.
 
-The acceptance is complete only when the one real GitHub Actions job ran once through the installed LaunchAgent-supervised disposable-worker path and the worker-specific state converged back to zero.
+The acceptance is complete only when the one real GitHub Actions job ran once through the installed LaunchAgent-supervised disposable-worker path and the worker-specific state converged back to zero. A retained service must still match the exact accepted loaded identity; current status does not claim runtime health.
