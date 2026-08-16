@@ -20,6 +20,7 @@ use crate::disposable_clone_runtime::{
     DisposableCloneAdmissionObservation, DisposableCloneAdmissionSource, DisposableCloneRuntime,
     DisposableCloneRuntimeError, DisposableCloneTransactionOutcome, admission_seal,
 };
+use crate::disposable_host_storage::{DisposableHostStorageSource, HOST_STORAGE_UNAVAILABLE_CODE};
 use crate::disposable_runner_runtime::{
     DisposableRunnerRegistrationSource, DisposableRunnerRuntime, DisposableRunnerRuntimeError,
 };
@@ -85,6 +86,7 @@ impl DisposableWorkerServiceBridge for ScaleSetBridgeClient {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DisposableWorkerCoordinatorDisposition {
     Idle,
+    HostStorageUnavailable,
     TemplateAdvanced(DisposableTemplateRuntimeDisposition),
     DeliverySettled {
         acquired: usize,
@@ -128,17 +130,28 @@ pub(crate) enum DisposableWorkerCoordinatorDisposition {
 pub(crate) struct DisposableWorkerCoordinator {
     state_root: PathBuf,
     policy: ScaleSetDeliveryConsumerPolicy,
+    host_storage: Box<dyn DisposableHostStorageSource>,
 }
 
 impl DisposableWorkerCoordinator {
     pub(crate) fn new(
         state_root: impl Into<PathBuf>,
         policy: ScaleSetDeliveryConsumerPolicy,
+        host_storage: Box<dyn DisposableHostStorageSource>,
     ) -> Self {
         Self {
             state_root: state_root.into(),
             policy,
+            host_storage,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        state_root: impl Into<PathBuf>,
+        policy: ScaleSetDeliveryConsumerPolicy,
+    ) -> Self {
+        Self::new(state_root, policy, Box::new(AlwaysAvailableHostStorage))
     }
 
     pub(crate) fn supervise_once(
@@ -190,7 +203,8 @@ impl DisposableWorkerCoordinator {
             }
         }
 
-        let available_capacity = u16::from(catalog.active().is_empty());
+        let available_capacity = advertised_capacity(&catalog, self.host_storage.as_ref());
+        let host_storage_available = available_capacity == 1;
         let observed_at = clock
             .epoch_millis()
             .map_err(|_| coordinator_error("disposable_clock_unavailable"))?;
@@ -220,6 +234,10 @@ impl DisposableWorkerCoordinator {
                 return Ok(DisposableWorkerCoordinatorDisposition::DeliveryRecoveryRequired);
             }
             ScaleSetDeliveryControllerDisposition::Idle => {}
+        }
+
+        if catalog.active().is_empty() && !host_storage_available {
+            return Ok(DisposableWorkerCoordinatorDisposition::HostStorageUnavailable);
         }
 
         let catalog = load_catalog(&self.state_root)?;
@@ -329,7 +347,7 @@ impl DisposableWorkerCoordinator {
         )
             -> Result<DisposableCloneTransactionOutcome, DisposableWorkerCoordinatorError>,
     {
-        let admission = LiveScaleSetAdmission::new(bridge, clock);
+        let admission = LiveScaleSetAdmission::new(bridge, clock, self.host_storage.as_ref());
         let result = transaction(&admission);
         let pending = admission.take_pending();
         drop(admission);
@@ -344,7 +362,32 @@ impl DisposableWorkerCoordinator {
             .map_err(|error| coordinator_error(error.code()))
             .and_then(map_delivery_disposition);
         }
-        map_clone_outcome(result?)
+        match result {
+            Err(error) if error.code() == HOST_STORAGE_UNAVAILABLE_CODE => {
+                Ok(DisposableWorkerCoordinatorDisposition::HostStorageUnavailable)
+            }
+            result => map_clone_outcome(result?),
+        }
+    }
+}
+
+fn advertised_capacity(
+    catalog: &DisposableAttemptCatalogDocument,
+    host_storage: &dyn DisposableHostStorageSource,
+) -> u16 {
+    if !catalog.active().is_empty() {
+        return 0;
+    }
+    u16::from(host_storage_available(host_storage))
+}
+
+fn host_storage_available(host_storage: &dyn DisposableHostStorageSource) -> bool {
+    match host_storage.admits_new_worker() {
+        Ok(available) => available,
+        Err(error) => {
+            debug_assert_eq!(error.code(), HOST_STORAGE_UNAVAILABLE_CODE);
+            false
+        }
     }
 }
 
@@ -390,14 +433,20 @@ fn operation_for(
 struct LiveScaleSetAdmission<'a, B, C> {
     bridge: RefCell<&'a mut B>,
     clock: &'a C,
+    host_storage: &'a dyn DisposableHostStorageSource,
     pending: RefCell<Option<(ScaleSetDelivery, EpochMillis)>>,
 }
 
 impl<'a, B, C> LiveScaleSetAdmission<'a, B, C> {
-    fn new(bridge: &'a mut B, clock: &'a C) -> Self {
+    fn new(
+        bridge: &'a mut B,
+        clock: &'a C,
+        host_storage: &'a dyn DisposableHostStorageSource,
+    ) -> Self {
         Self {
             bridge: RefCell::new(bridge),
             clock,
+            host_storage,
             pending: RefCell::new(None),
         }
     }
@@ -445,6 +494,11 @@ impl<B: DeliveryBridge, C: CloneRuntimeClock> DisposableCloneAdmissionSource
                 "clone_scale_set_message_pending",
             ));
         }
+        if requires_host_storage(reservation) && !host_storage_available(self.host_storage) {
+            return Err(DisposableCloneRuntimeError::observation(
+                HOST_STORAGE_UNAVAILABLE_CODE,
+            ));
+        }
         let expires_at = observed_at
             .get()
             .checked_add(LIVE_ADMISSION_MILLIS)
@@ -462,6 +516,27 @@ impl<B: DeliveryBridge, C: CloneRuntimeClock> DisposableCloneAdmissionSource
             capacity_reserved,
             false,
         ))
+    }
+}
+
+fn requires_host_storage(reservation: &DisposableAttemptReservation) -> bool {
+    let attempt = reservation.attempt();
+    matches!(
+        attempt.phase(),
+        DisposableAttemptPhase::Reserved | DisposableAttemptPhase::CloneAuthorized
+    ) || (attempt.phase() == DisposableAttemptPhase::CloneStarted
+        && attempt.vm_identity().is_none())
+}
+
+#[cfg(test)]
+struct AlwaysAvailableHostStorage;
+
+#[cfg(test)]
+impl DisposableHostStorageSource for AlwaysAvailableHostStorage {
+    fn admits_new_worker(
+        &self,
+    ) -> Result<bool, crate::disposable_host_storage::DisposableHostStorageError> {
+        Ok(true)
     }
 }
 
@@ -648,6 +723,18 @@ mod tests {
 
     struct FixedClock;
 
+    struct FixedHostStorage(
+        Result<bool, crate::disposable_host_storage::DisposableHostStorageError>,
+    );
+
+    impl DisposableHostStorageSource for FixedHostStorage {
+        fn admits_new_worker(
+            &self,
+        ) -> Result<bool, crate::disposable_host_storage::DisposableHostStorageError> {
+            self.0
+        }
+    }
+
     impl LimaObservationClock for FixedClock {
         fn unix_seconds(&self) -> io::Result<u64> {
             Ok(1_900_000_000)
@@ -722,6 +809,15 @@ mod tests {
             .unwrap()
     }
 
+    fn unavailable_storage_error() -> crate::disposable_host_storage::DisposableHostStorageError {
+        crate::disposable_host_storage::DisposableHostStorage::new(
+            PathBuf::from("/unused"),
+            u64::MAX,
+        )
+        .err()
+        .unwrap()
+    }
+
     fn statistics() -> ScaleSetStatistics {
         ScaleSetStatistics {
             available_jobs: 0,
@@ -745,7 +841,8 @@ mod tests {
             capacities: Vec::new(),
             poisoned: false,
         };
-        let admission = LiveScaleSetAdmission::new(&mut bridge, &FixedClock);
+        let admission =
+            LiveScaleSetAdmission::new(&mut bridge, &FixedClock, &AlwaysAvailableHostStorage);
         let observation = admission.observe(&catalog, reservation).unwrap();
         observation
             .validate_for(
@@ -757,6 +854,88 @@ mod tests {
         assert!(admission.take_pending().is_none());
         drop(admission);
         assert_eq!(bridge.capacities, [0]);
+    }
+
+    #[test]
+    fn host_storage_refusal_and_unknown_state_advertise_zero_capacity() {
+        let empty = DisposableAttemptCatalogDocument::empty();
+        assert_eq!(advertised_capacity(&empty, &FixedHostStorage(Ok(true))), 1);
+        assert_eq!(advertised_capacity(&empty, &FixedHostStorage(Ok(false))), 0);
+        assert_eq!(
+            advertised_capacity(&empty, &FixedHostStorage(Err(unavailable_storage_error()))),
+            0
+        );
+        assert_eq!(
+            advertised_capacity(&catalog(), &FixedHostStorage(Ok(true))),
+            0
+        );
+    }
+
+    #[test]
+    fn live_preclone_admission_polls_then_refuses_low_host_storage() {
+        let catalog = catalog();
+        let reservation = catalog.active().first().unwrap();
+        let mut bridge = FakeDeliveryBridge {
+            polls: VecDeque::from([ScaleSetBridgePoll::Idle {
+                statistics: statistics(),
+            }]),
+            capacities: Vec::new(),
+            poisoned: false,
+        };
+        let admission =
+            LiveScaleSetAdmission::new(&mut bridge, &FixedClock, &FixedHostStorage(Ok(false)));
+        let error = match admission.observe(&catalog, reservation) {
+            Ok(_) => panic!("low host storage unexpectedly admitted the clone"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), HOST_STORAGE_UNAVAILABLE_CODE);
+        assert!(admission.take_pending().is_none());
+        drop(admission);
+        assert_eq!(bridge.capacities, [0]);
+    }
+
+    #[test]
+    fn storage_gate_ends_after_exact_vm_binding_and_never_applies_to_cleanup() {
+        let catalog = catalog();
+        let reserved = catalog.active().first().unwrap();
+        assert!(requires_host_storage(reserved));
+        let authorized = catalog
+            .replace_attempt(
+                reserved.attempt().attempt_id(),
+                reserved.attempt().revision(),
+                crate::disposable_attempt_catalog::DisposableAttemptCatalogAction::AuthorizeClone,
+            )
+            .unwrap();
+        let authorized_reservation = authorized.active().first().unwrap();
+        assert!(requires_host_storage(authorized_reservation));
+        let started = authorized
+            .checkpoint_clone_started(
+                authorized_reservation.attempt().attempt_id(),
+                authorized_reservation.attempt().revision(),
+            )
+            .unwrap();
+        let started_reservation = started.active().first().unwrap();
+        assert!(requires_host_storage(started_reservation));
+        let bound = started
+            .bind_vm_identity_after_clone(
+                started_reservation.attempt().attempt_id(),
+                started_reservation.attempt().revision(),
+                crate::disposable_worker_reconciler::DisposableVmIdentity::parse(&format!(
+                    "sha256:{}",
+                    "44".repeat(32)
+                ))
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(!requires_host_storage(bound.active().first().unwrap()));
+        let destroying = bound
+            .replace_attempt(
+                bound.active()[0].attempt().attempt_id(),
+                bound.active()[0].attempt().revision(),
+                crate::disposable_attempt_catalog::DisposableAttemptCatalogAction::BeginCleanup,
+            )
+            .unwrap();
+        assert!(!requires_host_storage(destroying.active().first().unwrap()));
     }
 
     #[test]
@@ -780,7 +959,8 @@ mod tests {
             capacities: Vec::new(),
             poisoned: false,
         };
-        let admission = LiveScaleSetAdmission::new(&mut bridge, &FixedClock);
+        let admission =
+            LiveScaleSetAdmission::new(&mut bridge, &FixedClock, &AlwaysAvailableHostStorage);
         let error = match admission.observe(&catalog, reservation) {
             Ok(_) => panic!("a live message must block clone admission"),
             Err(error) => error,

@@ -18,6 +18,8 @@ pub mod disposable_attempt_state;
 /// Same-lock execution of one authorized disposable Lima clone.
 #[cfg(unix)]
 pub mod disposable_clone_runtime;
+#[cfg(unix)]
+pub(crate) mod disposable_host_storage;
 /// Pure exact plan for the macOS disposable-worker LaunchAgent lifecycle.
 pub mod disposable_launchd_service;
 /// Sealed fixed Lima command plans for one durably planned disposable worker.

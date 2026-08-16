@@ -144,7 +144,11 @@ fn build_driver(
     DisposableWorkerServiceDriver {
         _service_lock: service_lock,
         bridge_config: parts.bridge_config,
-        coordinator: DisposableWorkerCoordinator::new(parts.state_root, parts.consumer_policy),
+        coordinator: DisposableWorkerCoordinator::new(
+            parts.state_root,
+            parts.consumer_policy,
+            Box::new(parts.host_storage),
+        ),
         clone_runtime: parts.clone_runtime,
         runner_runtime: parts.runner_runtime,
         executor: ProcessExecutor,

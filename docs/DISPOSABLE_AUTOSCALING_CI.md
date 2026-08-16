@@ -169,15 +169,18 @@ that same lock. It observes before every external mutation, deletes only a fresh
 descriptor-bound VM and the exact durable runner ID, treats response-lost deletion as unchanged
 cleanup debt, remains able to remove an old worker after a prepared-template upgrade, and releases
 the host budget only after both external objects are proven absent. The private production
-coordinator now gives durable delivery recovery priority, advertises one unit of capacity only
-when the catalog is empty and the prepared source is satisfied, and otherwise polls at zero
-capacity before dispatching exactly one phase transaction. Its sealed live admission source polls
-again under the canonical lock before clone authorization, clone start, and registration; a
-message observed at that boundary is handed directly to the paired durable delivery transaction
-before retry. The same loop drives the one JIT handoff, terminal cleanup, unprovisioned release,
-and final bounded tombstone retirement. Restart tests cover a reconciled-but-unacknowledged
-delivery, and an injected lifecycle test reaches an empty catalog after one runner and VM are
-removed.
+coordinator now gives durable delivery recovery priority and advertises one unit of capacity only
+when the catalog is empty, the prepared source is satisfied, and the exact private `LIMA_HOME`
+filesystem has room for the enrolled worker's full disk ceiling plus a fixed 10 GiB host reserve.
+It otherwise polls at zero capacity before dispatching exactly one phase transaction. Its sealed
+live admission source polls again under the canonical lock and rechecks the same storage floor
+before clone authorization and every pre-command clone barrier; a message observed at that
+boundary is handed directly to the paired durable delivery transaction before retry. Low or
+unobservable storage uses normal idle pacing and blocks no registration, teardown, runner
+deletion, capacity release, or delivery recovery. The same loop drives the one JIT handoff,
+terminal cleanup, unprovisioned release, and final bounded tombstone retirement. Restart tests
+cover a reconciled-but-unacknowledged delivery, and an injected lifecycle test reaches an empty
+catalog after one runner and VM are removed.
 
 The current-main service driver recovers local delivery/catalog state, acquires one process-lifetime
 controller lease before credential access, and composes the coordinator with the bounded supervisor

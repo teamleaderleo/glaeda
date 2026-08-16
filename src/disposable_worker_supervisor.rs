@@ -93,7 +93,10 @@ where
                     }
                     break;
                 }
-                Ok(DisposableWorkerCoordinatorDisposition::Idle) => {
+                Ok(
+                    DisposableWorkerCoordinatorDisposition::Idle
+                    | DisposableWorkerCoordinatorDisposition::HostStorageUnavailable,
+                ) => {
                     consecutive_failures = 0;
                     immediate_progress = 0;
                     if control.wait_or_stop(IDLE_DELAY)? {
@@ -240,6 +243,23 @@ mod tests {
     #[test]
     fn idle_uses_fixed_cadence_and_observes_stop_before_another_step() {
         let mut driver = driver([Ok(DisposableWorkerCoordinatorDisposition::Idle)]);
+        let mut control = FakeControl {
+            waits: Vec::new(),
+            stop_after_waits: 1,
+        };
+        assert_eq!(
+            supervise_disposable_worker(&mut driver, &mut control).unwrap(),
+            DisposableWorkerSupervisorDisposition::Stopped
+        );
+        assert_eq!(control.waits, [IDLE_DELAY]);
+        assert_eq!(driver.connections, 1);
+    }
+
+    #[test]
+    fn unavailable_host_storage_uses_idle_cadence_without_opening_the_failure_circuit() {
+        let mut driver = driver([Ok(
+            DisposableWorkerCoordinatorDisposition::HostStorageUnavailable,
+        )]);
         let mut control = FakeControl {
             waits: Vec::new(),
             stop_after_waits: 1,
