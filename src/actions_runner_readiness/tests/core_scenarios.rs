@@ -91,7 +91,7 @@ fn idle_ready_observation_binds_exact_commands_identity_and_freshness() {
                 .keys()
                 .map(String::as_str)
                 .collect::<Vec<_>>(),
-            vec!["HOME", "LANG", "LC_ALL", "LIMA_HOME"]
+            vec!["HOME", "LANG", "LC_ALL", "LIMA_HOME", "PATH"]
         );
         assert_eq!(
             command.environment.get("LIMA_HOME"),
@@ -100,6 +100,10 @@ fn idle_ready_observation_binds_exact_commands_identity_and_freshness() {
         assert_eq!(
             command.environment.get("HOME"),
             Some(&CommandValue::Plain(LIMACTL_SAFE_HOME.to_owned()))
+        );
+        assert_eq!(
+            command.environment.get("PATH"),
+            Some(&CommandValue::Plain(LIMACTL_SAFE_PATH.to_owned()))
         );
         let argv = command.displayed_argv();
         assert!(!argv.iter().any(|argument| {

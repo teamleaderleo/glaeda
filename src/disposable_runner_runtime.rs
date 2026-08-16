@@ -25,7 +25,7 @@ use crate::github_scale_set_bridge::{
 };
 use crate::github_scale_set_protocol::ScaleSetRunnerName;
 use crate::github_scale_set_protocol::ScaleSetRunnerReference;
-use crate::lima_observation::LIMACTL_SAFE_HOME;
+use crate::lima_observation::{LIMACTL_SAFE_HOME, LIMACTL_SAFE_PATH};
 use crate::process::CommandSpec;
 
 const MAX_PRIVATE_PATH_BYTES: usize = 1_024;
@@ -255,6 +255,7 @@ impl DisposableRunnerRuntime {
             )
             .environment("LANG", "C")
             .environment("LC_ALL", "C")
+            .environment("PATH", LIMACTL_SAFE_PATH)
     }
 }
 
@@ -577,6 +578,7 @@ mod tests {
                 "LANG".to_owned(),
                 "LC_ALL".to_owned(),
                 "LIMA_HOME".to_owned(),
+                "PATH".to_owned(),
             ]
         );
         let debug = format!("{plan:?}");

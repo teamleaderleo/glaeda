@@ -195,7 +195,7 @@ fn running_instance_produces_exact_bounded_observation() {
                 .keys()
                 .map(String::as_str)
                 .collect::<Vec<_>>(),
-            vec!["HOME", "LANG", "LC_ALL", "LIMA_HOME"]
+            vec!["HOME", "LANG", "LC_ALL", "LIMA_HOME", "PATH"]
         );
         assert_eq!(
             command.environment.get("LIMA_HOME"),
@@ -204,6 +204,10 @@ fn running_instance_produces_exact_bounded_observation() {
         assert_eq!(
             command.environment.get("HOME"),
             Some(&CommandValue::Plain(LIMACTL_SAFE_HOME.to_owned()))
+        );
+        assert_eq!(
+            command.environment.get("PATH"),
+            Some(&CommandValue::Plain(LIMACTL_SAFE_PATH.to_owned()))
         );
         let argv = command.displayed_argv();
         assert!(!argv.iter().any(|argument| {
@@ -221,6 +225,8 @@ fn running_instance_produces_exact_bounded_observation() {
             "shell",
             "smolrunner",
             "--",
+            "/usr/bin/sudo",
+            "--non-interactive",
             "/usr/bin/stat",
             "-Lc",
             "%d:%i",
@@ -246,6 +252,65 @@ fn stopped_instance_is_observed_without_guest_execution() {
     ));
     assert_eq!(observation.private_evidence().commands().len(), 2);
     assert_eq!(executor.seen().len(), 2);
+}
+
+#[test]
+fn exact_lima_2_2_named_absence_is_missing_evidence() {
+    let executor = ScriptedExecutor::new([ScriptedStep::Output(ScriptedOutput {
+        stdout: String::new(),
+        stderr: concat!(
+            "time=\"2026-08-16T14:39:23+08:00\" level=warning msg=\"No instance matching smolrunner found.\"\n",
+            "time=\"2026-08-16T14:39:23+08:00\" level=fatal msg=\"unmatched instances\"\n",
+        )
+        .to_owned(),
+        status: Some(1),
+        success: false,
+        argv_override: None,
+        environment_override: None,
+    })]);
+    let failure = adapter()
+        .observe(&request(30), &executor, &FakeClock::new([100]))
+        .expect_err("exact named absence");
+    assert_eq!(
+        failure.code,
+        LimaObservationRefusalCode::MissingInstanceEvidence
+    );
+    assert_eq!(failure.private_evidence().commands().len(), 1);
+}
+
+#[test]
+fn near_miss_absence_diagnostics_remain_command_failures() {
+    for stderr in [
+        concat!(
+            "time=\"2026-08-16T14:39:23+08:00\" level=warning msg=\"No instance matching other found.\"\n",
+            "time=\"2026-08-16T14:39:23+08:00\" level=fatal msg=\"unmatched instances\"\n",
+        ),
+        concat!(
+            "time=\"2026-08-16T14:39:23+08:00\" level=warning msg=\"No instance matching smolrunner found.\"\n",
+            "time=\"2026-08-16T14:39:23+08:00\" level=fatal msg=\"different failure\"\n",
+        ),
+        concat!(
+            "time=\"not-a-time\" level=warning msg=\"No instance matching smolrunner found.\"\n",
+            "time=\"2026-08-16T14:39:23+08:00\" level=fatal msg=\"unmatched instances\"\n",
+        ),
+        concat!(
+            "time=\"2026-08-16T14:39:23+08:00\" level=warning msg=\"No instance matching smolrunner found.\"\r\n",
+            "time=\"2026-08-16T14:39:23+08:00\" level=fatal msg=\"unmatched instances\"\r\n",
+        ),
+    ] {
+        let executor = ScriptedExecutor::new([ScriptedStep::Output(ScriptedOutput {
+            stdout: String::new(),
+            stderr: stderr.to_owned(),
+            status: Some(1),
+            success: false,
+            argv_override: None,
+            environment_override: None,
+        })]);
+        let failure = adapter()
+            .observe(&request(30), &executor, &FakeClock::new([100]))
+            .expect_err("near-miss absence diagnostic");
+        assert_eq!(failure.code, LimaObservationRefusalCode::CommandFailed);
+    }
 }
 
 #[test]

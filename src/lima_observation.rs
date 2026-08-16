@@ -21,9 +21,11 @@ const GUEST_UNAME: &str = "/usr/bin/uname";
 const GUEST_GETCONF: &str = "/usr/bin/getconf";
 const GUEST_SHA256SUM: &str = "/usr/bin/sha256sum";
 const GUEST_STAT: &str = "/usr/bin/stat";
+const GUEST_SUDO: &str = "/usr/bin/sudo";
 const GUEST_MACHINE_ID: &str = "/etc/machine-id";
 const REDACTED_PRIVATE_EVIDENCE: &str = "<private-lima-command-evidence>";
 pub(crate) const LIMACTL_SAFE_HOME: &str = "/var/empty";
+pub(crate) const LIMACTL_SAFE_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 const LIMA_OBSERVATION_REQUEST_IDENTITY_DOCUMENT_TYPE: &str =
     "smolrunner-lima-observation-request-identity";
 
@@ -451,11 +453,12 @@ impl LimaObservationAdapter {
             )
         })?;
 
-        let list_output = self.run_command(
+        let list_output = self.run_instance_command(
             executor,
             evidence,
             LimaObservationPhase::InstanceObservation,
             self.list_command(request),
+            request.instance.as_str(),
         )?;
         let raw_instance = parse_instance_output(&list_output)?;
         let configured = validate_instance_evidence(request, raw_instance)?;
@@ -473,11 +476,12 @@ impl LimaObservationAdapter {
             }
         };
 
-        let final_list_output = self.run_command(
+        let final_list_output = self.run_instance_command(
             executor,
             evidence,
             LimaObservationPhase::InstanceObservation,
             self.list_command(request),
+            request.instance.as_str(),
         )?;
         let final_raw_instance = parse_instance_output(&final_list_output)?;
         let final_configured = validate_instance_evidence(request, final_raw_instance)?;
@@ -635,8 +639,8 @@ impl LimaObservationAdapter {
                 LimaObservationPhase::GuestCacheIdentity,
                 self.guest_command(
                     request,
-                    GUEST_STAT,
-                    ["-Lc", "%d:%i", "--"],
+                    GUEST_SUDO,
+                    ["--non-interactive", GUEST_STAT, "-Lc", "%d:%i", "--"],
                     Some(&request.guest_cache_path),
                 ),
             )?,
@@ -695,6 +699,7 @@ impl LimaObservationAdapter {
             .environment("LIMA_HOME", exact_private_path(&request.lima_home))
             .environment("LANG", "C")
             .environment("LC_ALL", "C")
+            .environment("PATH", LIMACTL_SAFE_PATH)
     }
 
     fn run_command(
@@ -703,6 +708,28 @@ impl LimaObservationAdapter {
         evidence: &mut LimaObservationPrivateEvidence,
         phase: LimaObservationPhase,
         command: CommandSpec,
+    ) -> Result<String, ObservationProblem> {
+        self.run_command_inner(executor, evidence, phase, command, None)
+    }
+
+    fn run_instance_command(
+        &self,
+        executor: &impl CommandExecutor,
+        evidence: &mut LimaObservationPrivateEvidence,
+        phase: LimaObservationPhase,
+        command: CommandSpec,
+        instance: &str,
+    ) -> Result<String, ObservationProblem> {
+        self.run_command_inner(executor, evidence, phase, command, Some(instance))
+    }
+
+    fn run_command_inner(
+        &self,
+        executor: &impl CommandExecutor,
+        evidence: &mut LimaObservationPrivateEvidence,
+        phase: LimaObservationPhase,
+        command: CommandSpec,
+        missing_instance: Option<&str>,
     ) -> Result<String, ObservationProblem> {
         let record = executor.execute(&command).map_err(|_| {
             ObservationProblem::new(
@@ -734,6 +761,14 @@ impl LimaObservationAdapter {
                 "the Lima subprocess output exceeded the reviewed observation bound",
             ));
         }
+        if missing_instance.is_some_and(|instance| exact_missing_instance_record(&record, instance))
+        {
+            return Err(ObservationProblem::new(
+                LimaObservationRefusalCode::MissingInstanceEvidence,
+                phase,
+                "limactl reported that the exact requested instance is absent",
+            ));
+        }
         if record.status != Some(0) || !record.success || !record.stderr.is_empty() {
             return Err(ObservationProblem::new(
                 LimaObservationRefusalCode::CommandFailed,
@@ -755,6 +790,66 @@ impl LimaObservationAdapter {
         }
         Ok(record.stdout)
     }
+}
+
+fn exact_missing_instance_record(record: &ExecutionRecord, instance: &str) -> bool {
+    if record.status != Some(1) || record.success || !record.stdout.is_empty() {
+        return false;
+    }
+    let Some(body) = record.stderr.strip_suffix('\n') else {
+        return false;
+    };
+    let mut lines = body.split('\n');
+    let Some(warning) = lines.next() else {
+        return false;
+    };
+    let Some(fatal) = lines.next() else {
+        return false;
+    };
+    if lines.next().is_some() {
+        return false;
+    }
+    let warning_suffix = format!(" level=warning msg=\"No instance matching {instance} found.\"");
+    exact_lima_log_line(warning, &warning_suffix)
+        && exact_lima_log_line(fatal, " level=fatal msg=\"unmatched instances\"")
+}
+
+fn exact_lima_log_line(line: &str, suffix: &str) -> bool {
+    let Some(prefix) = line.strip_suffix(suffix) else {
+        return false;
+    };
+    let Some(timestamp) = prefix
+        .strip_prefix("time=\"")
+        .and_then(|value| value.strip_suffix('"'))
+    else {
+        return false;
+    };
+    exact_rfc3339_seconds_shape(timestamp)
+}
+
+fn exact_rfc3339_seconds_shape(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let fixed = bytes.len() >= 20
+        && bytes[..19]
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| match index {
+                4 | 7 => *byte == b'-',
+                10 => *byte == b'T',
+                13 | 16 => *byte == b':',
+                _ => byte.is_ascii_digit(),
+            });
+    if !fixed {
+        return false;
+    }
+    matches!(bytes.get(19..), Some(b"Z"))
+        || bytes.get(19..).is_some_and(|zone| {
+            zone.len() == 6
+                && matches!(zone[0], b'+' | b'-')
+                && zone[1..3].iter().all(u8::is_ascii_digit)
+                && zone[3] == b':'
+                && zone[4..6].iter().all(u8::is_ascii_digit)
+        })
 }
 
 impl fmt::Debug for LimaObservationAdapter {

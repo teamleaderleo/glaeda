@@ -15,11 +15,12 @@ use crate::disposable_worker_reconciler::{
 };
 use crate::execution_admission::EpochMillis;
 use crate::lima_observation::{
-    LIMACTL_SAFE_HOME, LimaArchitecture, LimaInstanceName, LimaObservationRequest, LimaVmType,
+    LIMACTL_SAFE_HOME, LIMACTL_SAFE_PATH, LimaArchitecture, LimaInstanceName,
+    LimaObservationRequest, LimaVmType,
 };
 use crate::process::CommandSpec;
 
-pub const DISPOSABLE_LIMA_WORKER_SCHEMA_VERSION: u8 = 3;
+pub const DISPOSABLE_LIMA_WORKER_SCHEMA_VERSION: u8 = 4;
 
 const GIB: u64 = 1 << 30;
 const MAX_PRIVATE_PATH_BYTES: usize = 1_024;
@@ -322,6 +323,7 @@ impl DisposableLimaWorkerAdapter {
             .secret_environment("LIMA_HOME", exact_path(&self.lima_home))
             .environment("LANG", "C")
             .environment("LC_ALL", "C")
+            .environment("PATH", LIMACTL_SAFE_PATH)
     }
 }
 
@@ -422,6 +424,7 @@ struct CommandIdentityDocument<'a> {
     lima_home: &'a str,
     lang: &'static str,
     lc_all: &'static str,
+    path: &'static str,
     timeout_seconds: u64,
     prepared_template_identity: &'a str,
 }
@@ -441,6 +444,7 @@ fn command_identity(
             .expect("validated private Lima path remains UTF-8"),
         lang: "C",
         lc_all: "C",
+        path: LIMACTL_SAFE_PATH,
         timeout_seconds: timeout.as_secs(),
         prepared_template_identity: prepared_template_identity.as_str(),
     };
@@ -764,7 +768,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(plan.kind(), DisposableLimaWorkerCommandKind::Clone);
-        assert_eq!(plan.schema_version(), 3);
+        assert_eq!(plan.schema_version(), 4);
         assert_eq!(plan.prepared_template_identity(), &template_identity());
         assert!(plan.observation_required());
         assert_eq!(plan.attempt_revision(), 2);
@@ -793,7 +797,7 @@ mod tests {
                 .keys()
                 .map(String::as_str)
                 .collect::<Vec<_>>(),
-            ["HOME", "LANG", "LC_ALL", "LIMA_HOME"]
+            ["HOME", "LANG", "LC_ALL", "LIMA_HOME", "PATH"]
         );
         assert!(!format!("{:?}", adapter()).contains("/Users/runner"));
         assert!(!format!("{plan:?}").contains("/opt/homebrew"));

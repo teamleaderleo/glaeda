@@ -330,7 +330,9 @@ impl MacExecutor {
             Some("/usr/bin/stat") if argv.last().map(String::as_str) == Some("/") => {
                 Ok("2049:2\n".to_owned())
             }
-            Some("/usr/bin/stat") => Ok("2049:3\n".to_owned()),
+            Some("/usr/bin/sudo") if argv.get(7).map(String::as_str) == Some("/usr/bin/stat") => {
+                Ok("2049:3\n".to_owned())
+            }
             _ => Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 "private Mac command fixture missing",
@@ -689,7 +691,7 @@ fn idle_ready_binds_exact_sources_timeout_and_private_evidence() {
             .keys()
             .map(String::as_str)
             .collect::<Vec<_>>()
-            == vec!["HOME", "LANG", "LC_ALL", "LIMA_HOME"]
+            == vec!["HOME", "LANG", "LC_ALL", "LIMA_HOME", "PATH"]
     }));
     let debug = format!("{observation:?}");
     let json = serde_json::to_string(report).expect("JSON");

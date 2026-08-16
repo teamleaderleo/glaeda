@@ -200,6 +200,7 @@ impl B02Fixture {
             .environment("LIMA_HOME", &self.lima_home)
             .environment("LANG", "C")
             .environment("LC_ALL", "C")
+            .environment("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
             .argument("--tty=false")
             .argument("list")
             .argument("--format=json")
@@ -333,7 +334,7 @@ fn exact_stopped_observation_binds_config_host_lima_profile_and_one_timeout() {
             .keys()
             .map(String::as_str)
             .collect::<Vec<_>>()
-            == vec!["HOME", "LANG", "LC_ALL", "LIMA_HOME"]
+            == vec!["HOME", "LANG", "LC_ALL", "LIMA_HOME", "PATH"]
     }));
     assert!(vm_stat_command().environment.is_empty());
     assert!(logical_cpu_command().environment.is_empty());

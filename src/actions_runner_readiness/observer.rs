@@ -474,6 +474,7 @@ impl ActionsRunnerReadinessAdapter {
             .environment("LIMA_HOME", exact_path(&request.lima_home))
             .environment("LANG", "C")
             .environment("LC_ALL", "C")
+            .environment("PATH", LIMACTL_SAFE_PATH)
     }
 
     fn guest_plain_command<const N: usize>(
