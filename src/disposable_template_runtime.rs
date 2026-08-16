@@ -64,7 +64,7 @@ const MASKED_APT_UNITS: [&str; 4] = [
     "apt-daily.service",
     "apt-daily-upgrade.service",
 ];
-const READY_MARKER_BYTES: &[u8] = b"{\n  \"schema_version\": 1,\n  \"actions_runner_version\": \"2.336.0\",\n  \"actions_runner_digest\": \"sha256:58b758e420b87093fbd4bfddd368074960053e2f1388f01848c82624b90f27d1\",\n  \"workload_user\": \"smolrunner-runner\",\n  \"runner_install_directory\": \"/opt/smolrunner/actions-runner\",\n  \"runner_work_directory\": \"/var/lib/smolrunner-runner/work\",\n  \"jit_launcher_path\": \"/opt/smolrunner/bin/smolrunner-jit-launcher\",\n  \"jit_launcher_digest\": \"sha256:9b7cc857f2de1181f64bb067e4d4870e0bcb679d597ec047d885395ac6160996\"\n}\n";
+const READY_MARKER_BYTES: &[u8] = b"{\n  \"schema_version\": 1,\n  \"actions_runner_version\": \"2.336.0\",\n  \"actions_runner_digest\": \"sha256:58b758e420b87093fbd4bfddd368074960053e2f1388f01848c82624b90f27d1\",\n  \"workload_user\": \"smolrunner-runner\",\n  \"runner_install_directory\": \"/opt/smolrunner/actions-runner\",\n  \"runner_work_directory\": \"/var/lib/smolrunner-runner/work\",\n  \"jit_launcher_path\": \"/opt/smolrunner/bin/smolrunner-jit-launcher\",\n  \"jit_launcher_digest\": \"sha256:6f096fb518b6d40d45ca1a9923e423da436b6269fceec5a5989566abbc93a76a\"\n}\n";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]

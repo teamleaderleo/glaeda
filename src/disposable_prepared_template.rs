@@ -446,7 +446,7 @@ fn validate_wire(
         || provisioning.runner_work_directory != "/var/lib/smolrunner-runner/work"
         || provisioning.jit_launcher_path != "/opt/smolrunner/bin/smolrunner-jit-launcher"
         || provisioning.jit_launcher_digest
-            != "sha256:9b7cc857f2de1181f64bb067e4d4870e0bcb679d597ec047d885395ac6160996"
+            != "sha256:6f096fb518b6d40d45ca1a9923e423da436b6269fceec5a5989566abbc93a76a"
         || provisioning.ready_marker_path != "/etc/smolrunner/prepared-template.json"
         || provisioning.runner_dependency_install != "official_archive_script"
         || provisioning.os_package_source != "ubuntu_noble_signed_repositories_at_build"
@@ -586,7 +586,7 @@ mod tests {
         );
         assert_eq!(
             manifest.lima_template_digest().as_str(),
-            "sha256:2c7fe04536d10ddb932f4e41176acb8a281cddeb86f592559d210e300cf5941f"
+            "sha256:7d291591b6ce6b21af010c26bef26decff6b29a2fdf81dcb7310c3d438801d7c"
         );
         assert_eq!(
             manifest.ready_marker_path(),
@@ -601,7 +601,7 @@ mod tests {
         );
         assert_eq!(
             manifest.identity().unwrap().as_str(),
-            "sha256:e9743d34363a085fd44dba845f771f997dd35874fcd76d386428b5f6fd1fe677"
+            "sha256:15ffb8b3b363ef33fd95377208d38b4f47f5eaf80e9625c264efffde3f1b6f37"
         );
     }
 
@@ -718,7 +718,7 @@ mod tests {
         changed_manifests.push(redecode(&changed));
 
         let mut changed = baseline.clone();
-        changed.wire.provisioning.recipe_revision = 5;
+        changed.wire.provisioning.recipe_revision = baseline.provisioning_recipe_revision() + 1;
         changed_manifests.push(redecode(&changed));
 
         for changed_manifest in changed_manifests {

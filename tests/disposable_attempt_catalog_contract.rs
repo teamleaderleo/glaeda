@@ -155,9 +155,10 @@ fn bind_vm_fixture(
 fn changed_template_identity() -> DisposablePreparedTemplateIdentity {
     let current = current_disposable_prepared_template().unwrap();
     let bytes = encode_disposable_prepared_template(&current).unwrap();
+    let revision = current.provisioning_recipe_revision();
     let changed = String::from_utf8(bytes).unwrap().replacen(
-        "\"recipe_revision\": 4",
-        "\"recipe_revision\": 5",
+        &format!("\"recipe_revision\": {revision}"),
+        &format!("\"recipe_revision\": {}", revision + 1),
         1,
     );
     decode_disposable_prepared_template(changed.as_bytes())
