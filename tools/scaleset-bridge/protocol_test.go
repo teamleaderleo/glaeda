@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/actions/scaleset"
 )
@@ -642,6 +643,82 @@ func TestMessageAdmitsExactRunnerlessReassignmentCancellation(t *testing.T) {
 	event := response.Events[0]
 	if event.Kind != "completed" || event.RunnerID != 0 || event.RunnerName != "" || event.Result != "canceled" || server.pending == nil {
 		t.Fatalf("runnerless cancellation event=%#v pending=%#v", event, server.pending)
+	}
+}
+
+func TestDirectAssignmentWithoutServiceRequestIDGetsStablePrivateJoinIdentity(t *testing.T) {
+	base := scaleset.JobMessageBase{
+		RunnerRequestID: 0,
+		RepositoryName:  "project",
+		OwnerName:       "example",
+		JobID:           "86290767-4bda-5f2d-a642-b9eebbcc9312",
+		WorkflowRunID:   99,
+		RequestLabels:   []string{"smolrunner"},
+		ScaleSetAssignTime: time.Date(
+			2026, time.August, 16, 14, 9, 50, 115613818, time.UTC,
+		),
+	}
+	assigned, err := normalizeJob("assigned", base, 0, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	started, err := normalizeJob("started", base, 81, "smolrunner-job-1", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	completed, err := normalizeJob("completed", base, 81, "smolrunner-job-1", "succeeded")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if assigned.RunnerRequestID < syntheticRunnerRequestMarker || assigned.RunnerRequestID != started.RunnerRequestID || assigned.RunnerRequestID != completed.RunnerRequestID {
+		t.Fatalf("direct assignment identities assigned=%d started=%d completed=%d", assigned.RunnerRequestID, started.RunnerRequestID, completed.RunnerRequestID)
+	}
+	changed := base
+	changed.JobID = "different-job"
+	if syntheticRunnerRequestID(changed) == assigned.RunnerRequestID {
+		t.Fatal("different exact job evidence reused the synthetic request identity")
+	}
+	if _, err := normalizeJob("available", base, 0, "", ""); err == nil {
+		t.Fatal("available work without the service acquisition identity was accepted")
+	}
+	changed = base
+	changed.ScaleSetAssignTime = changed.ScaleSetAssignTime.Add(time.Second)
+	if syntheticRunnerRequestID(changed) == assigned.RunnerRequestID {
+		t.Fatal("a later assignment of the same workflow job reused the synthetic request identity")
+	}
+	reordered := base
+	reordered.RequestLabels = []string{"second", "smolrunner"}
+	canonical := base
+	canonical.RequestLabels = []string{"smolrunner", "second"}
+	if syntheticRunnerRequestID(reordered) != syntheticRunnerRequestID(canonical) {
+		t.Fatal("equivalent request-label sets changed the synthetic request identity")
+	}
+}
+
+func TestDirectAssignmentPollAndAckDoNotInvokeAvailableJobAcquisition(t *testing.T) {
+	backend := &fakeBackend{message: &scaleset.RunnerScaleSetMessage{
+		MessageID:  100000001,
+		Statistics: &scaleset.RunnerScaleSetStatistic{TotalAssignedJobs: 1},
+		JobAssignedMessages: []*scaleset.JobAssigned{{JobMessageBase: scaleset.JobMessageBase{
+			RunnerRequestID: 0,
+			RepositoryName:  "quarry",
+			OwnerName:       "Quarry-Labs",
+			JobID:           "86290767-4bda-5f2d-a642-b9eebbcc9312",
+			WorkflowRunID:   31951901986,
+			RequestLabels:   []string{"smolrunner-quarry-pilot"},
+			ScaleSetAssignTime: time.Date(
+				2026, time.August, 16, 14, 9, 50, 115613818, time.UTC,
+			),
+		}}},
+	}}
+	server := startedServer(t, backend)
+	response := server.handle(context.Background(), protocolRequest{Version: protocolVersion, Operation: "poll", MaxCapacity: 1})
+	if response.Type != "message" || len(response.Events) != 1 || response.Events[0].Kind != "assigned" || response.Events[0].RunnerRequestID < syntheticRunnerRequestMarker || server.pending == nil || len(server.pending.available) != 0 {
+		t.Fatalf("direct assignment response=%#v pending=%#v", response, server.pending)
+	}
+	acked := server.handle(context.Background(), protocolRequest{Version: protocolVersion, Operation: "ack", MessageID: response.MessageID})
+	if acked.Type != "acked" || len(acked.AcquiredRequests) != 0 || !reflect.DeepEqual(backend.calls, []string{"poll", "delete:100000001"}) {
+		t.Fatalf("direct assignment ack=%#v calls=%v", acked, backend.calls)
 	}
 }
 

@@ -238,18 +238,36 @@ fn reconcile_event(
     validate_job(policy, job)?;
     let identities = derive_identities(policy, job)?;
 
-    if matches!(event, ScaleSetDeliveryLifecycleEvent::Available { .. }) {
+    if matches!(
+        event,
+        ScaleSetDeliveryLifecycleEvent::Available { .. }
+            | ScaleSetDeliveryLifecycleEvent::Assigned { .. }
+    ) {
+        let available = matches!(event, ScaleSetDeliveryLifecycleEvent::Available { .. });
         let not_after = attempt_not_after(observed_at)?;
         if let Some(existing) = catalog.find_active_by_runner_request_id(job.runner_request_id) {
             validate_reservation(policy, existing, job, &identities)?;
-            if existing.attempt().not_after() != not_after {
-                return Err(consumer_error("delivery_consumer_identity_drift"));
+            if available
+                || (existing.attempt().phase()
+                    == crate::disposable_worker_reconciler::DisposableAttemptPhase::Reserved
+                    && existing.attempt().github_job_id().is_none())
+            {
+                if existing.attempt().not_after() != not_after {
+                    return Err(consumer_error("delivery_consumer_identity_drift"));
+                }
+                return Ok(catalog.clone());
             }
-            return Ok(catalog.clone());
+            return catalog
+                .replace_attempt(
+                    existing.attempt().attempt_id(),
+                    existing.attempt().revision(),
+                    event_action(event)?,
+                )
+                .map_err(|_| consumer_error("delivery_consumer_event_conflict"));
         }
         if let Some(existing) = catalog.find_tombstone_by_runner_request_id(job.runner_request_id) {
             validate_attempt(existing, job, &identities)?;
-            if existing.not_after() != not_after {
+            if available && existing.not_after() != not_after {
                 return Err(consumer_error("delivery_consumer_identity_drift"));
             }
             validate_tombstone_event(existing, event)?;
@@ -728,18 +746,26 @@ mod tests {
     }
 
     #[test]
-    fn unknown_assignment_cannot_select_an_attempt() {
-        let assigned = delivery(vec![ScaleSetBridgeEvent::Assigned(job(41, "job-1"))]);
+    fn direct_assignment_reserves_capacity_without_premature_runner_authority() {
+        let request_id = (1_u64 << 62) + 41;
+        let assigned = delivery(vec![ScaleSetBridgeEvent::Assigned(job(
+            request_id, "job-1",
+        ))]);
+        let reserved = reconcile_scale_set_delivery(
+            &policy(),
+            &assigned,
+            &DisposableAttemptCatalogDocument::empty(),
+            observed_at(),
+        )
+        .unwrap();
+        let attempt = reserved.active()[0].attempt();
+        assert_eq!(attempt.phase(), DisposableAttemptPhase::Reserved);
+        assert_eq!(attempt.runner_request_id().get(), request_id);
+        assert_eq!(attempt.not_after().get(), 21_700_000);
+        assert!(attempt.github_job_id().is_none());
         assert_eq!(
-            reconcile_scale_set_delivery(
-                &policy(),
-                &assigned,
-                &DisposableAttemptCatalogDocument::empty(),
-                observed_at(),
-            )
-            .unwrap_err()
-            .code(),
-            "delivery_consumer_attempt_missing"
+            reconcile_scale_set_delivery(&policy(), &assigned, &reserved, observed_at()).unwrap(),
+            reserved
         );
     }
 

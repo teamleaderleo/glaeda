@@ -38,6 +38,12 @@ Errors contain fixed codes only. The App private key never appears in argv, the 
 stdout, or an error. The encoded JIT configuration appears only in the successful `jit` response
 and remains secret-bearing data for the future Rust/guest handoff.
 
+GitHub.com can directly assign organization Scale Set work with `runnerRequestId=0`, without a
+preceding Available event. For that shape only, the bridge derives a stable positive private join
+key from the exact job and assignment evidence. Distinct assignment times remain distinct, and the
+Rust consumer reserves capacity directly from the Assigned event without calling `AcquireJobs` or
+claiming a runner identity before JIT registration.
+
 ## Current nonclaims
 
 The private Rust adapter and durable delivery controller now call this package, load the
