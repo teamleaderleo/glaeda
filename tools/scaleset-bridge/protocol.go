@@ -219,6 +219,10 @@ func newOfficialBackend(ctx context.Context, config startConfig) (backend, error
 
 func newStrictHTTPClient() *retryablehttp.Client {
 	client := retryablehttp.NewClient()
+	client.RetryMax = 0
+	client.HTTPClient.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
 	basePolicy := client.CheckRetry
 	client.CheckRetry = func(ctx context.Context, response *http.Response, requestErr error) (bool, error) {
 		retry, policyErr := basePolicy(ctx, response, requestErr)
