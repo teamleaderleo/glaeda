@@ -184,12 +184,17 @@ catalog after one runner and VM are removed.
 
 The current-main service driver recovers local delivery/catalog state, acquires one process-lifetime
 controller lease before credential access, and composes the coordinator with the bounded supervisor
-loop. `worker serve` reads one protected canonical enrollment and requires its exact approved
-SHA-256 before credential or process authority. The bounded supervisor already owns idle pacing,
+loop. `worker serve` requires the exact executable identity bound into its LaunchAgent arguments,
+then reads one protected canonical enrollment and requires its exact approved SHA-256 before
+credential or process authority. The bounded supervisor already owns idle pacing,
 progress-burst yielding, failed/recovery-session discard, reconnect delays, retry backoff, and its
-five-minute circuit breaker. #469/#470 add the pure exact LaunchAgent install/remove contract and
-CLI plan report around that service. Approved LaunchAgent apply/removal, real macOS stop-signal
-wiring, installed bridge/executable/enrollment verification, automatic quiescence of an unbound
+five-minute circuit breaker. SIGTERM and SIGINT now interrupt those waits through the same bounded
+stop path without manufacturing external-operation success. #469/#470 add the pure exact
+LaunchAgent install/remove contract and CLI plan report around that service. The exact apply/remove
+engine consumes one explicit approved
+plan and revalidates installation inputs while permitting exact cleanup after those inputs are
+lost or rotated. CLI apply exposure, installed bridge/executable/enrollment verification,
+automatic quiescence of an unbound
 ambiguous clone process, and the first physical GitHub/Lima acceptance run remain open. The
 hostile-CI network gate remains the production boundary before arbitrary repository code is an
 intended workload.
@@ -205,17 +210,15 @@ Acceptance: ordinary clone/download/build/test fixtures pass; hostile fixtures c
 ### M5 — supervised reconciliation and autoscaling
 
 The bounded `worker serve` loop and its durable service composition are on `main`. The current
-LaunchAgent planner binds the exact executable and enrollment digests, canonical private plist
-bytes, user launchd domain, ordered install/remove actions, and the enrollment digest passed to
-`worker serve`, while remaining plan-only.
+LaunchAgent contract binds the exact executable and enrollment digests, canonical private plist
+bytes, user launchd domain, ordered install/remove actions, and both identities passed to
+`worker serve`. Its apply engine remains inaccessible until the separate CLI slice.
 
 The immediate service frontier is deliberately small:
 
 1. #471 applies or removes only the explicitly approved exact LaunchAgent plan, with fresh
    executable/enrollment/filesystem/launchd observation and idempotent recovery.
-2. #472 connects macOS termination intent to the supervisor's existing interruptible control
-   boundary so launchd/foreground stops break bounded waits cleanly.
-3. The installed service path then proves bridge/executable/enrollment installation, physical
+2. The installed service path then proves bridge/executable/enrollment installation, physical
    queued-job-to-zero acceptance, controller-death quiescence, sleep/wake and reboot recovery,
    outage handling, orphan cleanup, and precise status/remediation.
 

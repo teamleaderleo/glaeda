@@ -221,6 +221,9 @@ enum WorkerCommand {
     },
     /// Run the enrolled disposable-worker reconciler until the process supervisor stops it.
     Serve {
+        /// Exact executable digest bound by the approved LaunchAgent configuration.
+        #[arg(long)]
+        program_digest: String,
         /// Explicit absolute normalized canonical enrollment document.
         #[arg(long)]
         enrollment: PathBuf,
@@ -405,9 +408,10 @@ fn main() -> ExitCode {
         Command::Worker { command } => match command {
             WorkerCommand::Status { store_root } => run_worker_status(cli.output, &store_root),
             WorkerCommand::Serve {
+                program_digest,
                 enrollment,
                 enrollment_digest,
-            } => run_worker_serve(cli.output, &enrollment, &enrollment_digest),
+            } => run_worker_serve(cli.output, &program_digest, &enrollment, &enrollment_digest),
         },
         Command::Queue { command } => match command {
             QueueCommand::List {
@@ -630,9 +634,17 @@ fn explicit_normalized_absolute_path(path: &Path) -> bool {
 #[cfg(target_os = "macos")]
 fn run_worker_serve(
     output: OutputFormat,
+    program_digest: &str,
     enrollment_path: &Path,
     enrollment_digest: &str,
 ) -> ExitCode {
+    if Sha256Digest::parse(program_digest).is_err() {
+        return emit_runtime_error(
+            output,
+            "disposable_worker_service_program_identity_invalid",
+            "disposable worker executable identity is invalid".to_owned(),
+        );
+    }
     if !explicit_normalized_absolute_path(enrollment_path) {
         return emit_runtime_error(
             output,
@@ -833,6 +845,7 @@ fn same_enrollment_directory(left: &rustix_fs::Stat, right: &rustix_fs::Stat) ->
 #[cfg(not(target_os = "macos"))]
 fn run_worker_serve(
     output: OutputFormat,
+    _program_digest: &str,
     _enrollment_path: &Path,
     _enrollment_digest: &str,
 ) -> ExitCode {
@@ -1558,6 +1571,8 @@ mod tests {
             "smolrunner",
             "worker",
             "serve",
+            "--program-digest",
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "--enrollment",
             "/private/etc/smolrunner/worker.json",
             "--enrollment-digest",
@@ -1567,6 +1582,7 @@ mod tests {
         let Command::Worker {
             command:
                 WorkerCommand::Serve {
+                    program_digest,
                     enrollment,
                     enrollment_digest,
                 },
@@ -1574,6 +1590,10 @@ mod tests {
         else {
             panic!("expected worker serve command");
         };
+        assert_eq!(
+            program_digest,
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
         assert_eq!(
             enrollment,
             PathBuf::from("/private/etc/smolrunner/worker.json")
