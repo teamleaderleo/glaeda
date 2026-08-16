@@ -23,6 +23,9 @@ pub(crate) mod disposable_host_storage;
 /// Exact plan plus explicitly approved macOS apply boundary for the disposable-worker LaunchAgent.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub mod disposable_launchd_service;
+/// Read-only exact installed-state observation for the disposable-worker LaunchAgent.
+#[cfg(target_os = "macos")]
+pub mod disposable_launchd_service_status;
 /// Sealed fixed Lima command plans for one durably planned disposable worker.
 pub mod disposable_lima_worker;
 /// Canonical supply-chain and isolation identity for the prepared disposable VM template.
