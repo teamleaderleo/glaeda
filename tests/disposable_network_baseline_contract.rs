@@ -42,10 +42,7 @@ fn prepared_vz_template_keeps_the_network_selector_observation_baseline() {
         ssh.get("forwardAgent").and_then(Value::as_bool),
         Some(false)
     );
-    assert_eq!(
-        ssh.get("forwardX11").and_then(Value::as_bool),
-        Some(false)
-    );
+    assert_eq!(ssh.get("forwardX11").and_then(Value::as_bool), Some(false));
     assert_eq!(
         ssh.get("forwardX11Trusted").and_then(Value::as_bool),
         Some(false)
