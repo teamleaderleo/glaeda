@@ -449,7 +449,6 @@ impl DisposableCloneRuntime {
             .map_err(|_| invalid_configuration("clone_target_request_invalid"))?;
         self.verify_limactl(executor)?;
         self.confirm_target_absent(&target_request, executor, clock)?;
-        self.confirm_target_absent(&target_request, executor, clock)?;
         self.verify_limactl(executor)?;
         let checkpoint_at = clock
             .epoch_millis()
@@ -715,11 +714,7 @@ impl DisposableCloneRuntime {
             ));
         }
         let ready = self.confirm_ready_worker_bound(reservation, executor, clock)?;
-        let second_ready = self.confirm_ready_worker_bound(reservation, executor, clock)?;
         ready
-            .confirm_current()
-            .map_err(|_| observation("clone_worker_identity_drift"))?;
-        second_ready
             .confirm_current()
             .map_err(|_| observation("clone_worker_identity_drift"))?;
         // Guest readiness is the expensive part of this transaction. Observe it before the live
@@ -735,9 +730,6 @@ impl DisposableCloneRuntime {
             observed_at,
         )?;
         ready
-            .confirm_current()
-            .map_err(|_| observation("clone_worker_identity_drift"))?;
-        second_ready
             .confirm_current()
             .map_err(|_| observation("clone_worker_identity_drift"))?;
         let cleanup = !admission_observation.capacity_reserved
@@ -802,9 +794,6 @@ impl DisposableCloneRuntime {
         }
         if transition == DisposableAttemptCatalogAction::BeginRegistration {
             ready
-                .confirm_current()
-                .map_err(|_| observation("clone_worker_identity_drift"))?;
-            second_ready
                 .confirm_current()
                 .map_err(|_| observation("clone_worker_identity_drift"))?;
         }
@@ -2111,6 +2100,7 @@ mod tests {
         let attempt_id = install_reserved_attempt(&root);
         let mut store =
             UnixPersonalWorkerStore::open_or_create_disposable_catalog(root.path()).unwrap();
+        let commands_before_clone_authorization = executor.calls.borrow().len();
 
         assert!(matches!(
             store
@@ -2126,6 +2116,11 @@ mod tests {
                 ..
             }
         ));
+        assert_eq!(
+            executor.calls.borrow().len() - commands_before_clone_authorization,
+            3,
+            "clone authorization must not repeat an already-bracketed absence observation"
+        );
         assert_eq!(executor.clone_count(), 0);
 
         assert!(matches!(
@@ -2141,6 +2136,7 @@ mod tests {
             DisposableCloneTransactionOutcome::Completed(_)
         ));
         executor.target_ready = true;
+        let commands_before_registration_checkpoint = executor.calls.borrow().len();
         assert!(matches!(
             store
                 .checkpoint_disposable_registration_transaction(
@@ -2156,6 +2152,11 @@ mod tests {
                 ..
             }
         ));
+        assert_eq!(
+            executor.calls.borrow().len() - commands_before_registration_checkpoint,
+            34,
+            "registration must perform one complete readiness composite"
+        );
         assert_eq!(
             durable_attempt(&root, &attempt_id).phase(),
             DisposableAttemptPhase::Registering
@@ -2529,6 +2530,7 @@ mod tests {
             jit_calls: 0,
             fail_jit: false,
         };
+        let commands_before_runner_transaction = executor.calls.borrow().len();
 
         let outcome = store
             .execute_disposable_runner_transaction(
@@ -2540,6 +2542,11 @@ mod tests {
                 &FixedClock,
             )
             .unwrap();
+        assert_eq!(
+            executor.calls.borrow().len() - commands_before_runner_transaction,
+            171,
+            "runner transaction command budget changed"
+        );
 
         let DisposableRunnerTransactionOutcome::CommandCompleted(receipt) = outcome else {
             panic!("expected completed runner command")
