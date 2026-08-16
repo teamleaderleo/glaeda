@@ -48,7 +48,8 @@ struct DirectoryIdentity {
 
 impl DirectoryIdentity {
     fn capture(path: &Path) -> Self {
-        let metadata = fs::symlink_metadata(path).expect("capture exact launchd proof root identity");
+        let metadata =
+            fs::symlink_metadata(path).expect("capture exact launchd proof root identity");
         assert!(
             metadata.file_type().is_dir() && !metadata.file_type().is_symlink(),
             "launchd proof root must be one real directory"
@@ -89,7 +90,8 @@ struct FileIdentity {
 
 impl FileIdentity {
     fn capture(path: &Path, expected: &[u8], uid: u32, gid: u32) -> Self {
-        let before = fs::symlink_metadata(path).expect("capture exact launchd proof plist identity");
+        let before =
+            fs::symlink_metadata(path).expect("capture exact launchd proof plist identity");
         assert!(
             before.file_type().is_file()
                 && !before.file_type().is_symlink()
@@ -97,8 +99,7 @@ impl FileIdentity {
                 && before.gid() == gid
                 && before.mode() & 0o7777 == 0o600
                 && before.nlink() == 1
-                && before.len()
-                    == u64::try_from(expected.len()).expect("plist length fits u64"),
+                && before.len() == u64::try_from(expected.len()).expect("plist length fits u64"),
             "launchd proof plist metadata is not exact"
         );
         assert!(
@@ -138,8 +139,7 @@ impl FileIdentity {
         {
             return false;
         }
-        fs::symlink_metadata(path)
-            .is_ok_and(|after| same_metadata(&before, &after))
+        fs::symlink_metadata(path).is_ok_and(|after| same_metadata(&before, &after))
     }
 }
 
@@ -172,11 +172,10 @@ impl ControllerChildGuard {
     }
 
     fn kill_and_reap(&mut self) -> ExitStatus {
-        let child = self
-            .child
-            .as_mut()
-            .expect("controller guard retains child");
-        child.kill().expect("SIGKILL exact launchd proof controller");
+        let child = self.child.as_mut().expect("controller guard retains child");
+        child
+            .kill()
+            .expect("SIGKILL exact launchd proof controller");
         let status = child.wait().expect("reap exact launchd proof controller");
         self.child = None;
         status
@@ -242,8 +241,8 @@ impl PhysicalLaunchdFixture {
         );
 
         let identity = fresh_execution_identity();
-        let root = PathBuf::from("/private/tmp")
-            .join(format!("smolrunner-launchd-exec-proof-{identity}"));
+        let root =
+            PathBuf::from("/private/tmp").join(format!("smolrunner-launchd-exec-proof-{identity}"));
         DirBuilder::new()
             .mode(0o700)
             .create(&root)
@@ -415,11 +414,7 @@ impl PhysicalLaunchdFixture {
     }
 
     fn publish_started(&self) {
-        publish_exact_file(
-            &self.root,
-            &self.root.join(STARTED_MARKER),
-            STARTED_BYTES,
-        );
+        publish_exact_file(&self.root, &self.root.join(STARTED_MARKER), STARTED_BYTES);
     }
 
     fn marker_matches(&self, name: &str, expected: &[u8]) -> bool {
@@ -449,7 +444,7 @@ impl PhysicalLaunchdFixture {
                 LaunchdObservation::Exact { pid: Some(pid) } => return Ok(pid),
                 LaunchdObservation::Exact { pid: None } => {}
                 LaunchdObservation::Absent => {
-                    return Err("launchd execution proof service disappeared before running")
+                    return Err("launchd execution proof service disappeared before running");
                 }
             }
             if Instant::now() >= deadline {
@@ -539,8 +534,7 @@ impl PhysicalLaunchdFixture {
             .map_err(|_| "launchd execution proof authorization marker cleanup failed")?;
         fs::remove_file(self.root.join(OWNERSHIP_MARKER))
             .map_err(|_| "launchd execution proof ownership marker cleanup failed")?;
-        fs::remove_file(&self.plist)
-            .map_err(|_| "launchd execution proof plist cleanup failed")?;
+        fs::remove_file(&self.plist).map_err(|_| "launchd execution proof plist cleanup failed")?;
         fsync_directory(&self.root);
         fs::remove_dir(&self.root).map_err(|_| "launchd execution proof root cleanup failed")?;
         Ok(())
@@ -564,10 +558,7 @@ fn fresh_execution_identity() -> String {
     source
         .read_exact(&mut random)
         .expect("read exact launchd proof identity entropy");
-    random
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    random.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn plist_bytes(label: &str) -> Vec<u8> {
@@ -650,7 +641,9 @@ fn physical_transient_launchd_execution_controller_child() {
     let label = std::env::var(LABEL_ENV).expect("child launchd proof label");
     let fixture = PhysicalLaunchdFixture::reopen(root, label);
 
-    let initial = fixture.observe().expect("observe initial exact launchd state");
+    let initial = fixture
+        .observe()
+        .expect("observe initial exact launchd state");
     assert!(
         initial == LaunchdObservation::Absent,
         "transient launchd proof service must begin absent"
@@ -704,7 +697,9 @@ fn physical_transient_launchd_execution_is_registered_before_start_and_survives_
         "set the exact transient launchd execution physical acceptance token"
     );
     let fixture = PhysicalLaunchdFixture::new();
-    let initial = fixture.observe().expect("observe initial launchd proof state");
+    let initial = fixture
+        .observe()
+        .expect("observe initial launchd proof state");
     assert!(
         initial == LaunchdObservation::Absent,
         "transient launchd proof service must begin absent"
@@ -762,10 +757,7 @@ fn physical_transient_launchd_execution_is_registered_before_start_and_survives_
     );
 
     let killed = controller.kill_and_reap();
-    assert!(
-        killed.signal() == Some(9),
-        "controller must die by SIGKILL"
-    );
+    assert!(killed.signal() == Some(9), "controller must die by SIGKILL");
     let after_kill = fixture
         .observe()
         .expect("re-observe exact launchd job after controller SIGKILL");
@@ -788,7 +780,9 @@ fn physical_transient_launchd_execution_is_registered_before_start_and_survives_
         !fixture.root.exists(),
         "launchd proof root must be absent after cleanup"
     );
-    let final_state = fixture.observe().expect("prove final launchd proof absence");
+    let final_state = fixture
+        .observe()
+        .expect("prove final launchd proof absence");
     assert!(
         final_state == LaunchdObservation::Absent,
         "transient launchd proof service must be absent after cleanup"
