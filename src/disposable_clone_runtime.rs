@@ -1174,6 +1174,7 @@ mod tests {
         DisposableAttemptCatalog, DisposableAttemptCatalogAction, DisposableAttemptReservation,
     };
     use crate::disposable_attempt_state::DisposableAttemptState;
+    use crate::disposable_host_storage::{DisposableHostStorageError, DisposableHostStorageSource};
     use crate::disposable_prepared_template::current_disposable_prepared_template;
     use crate::disposable_runner_runtime::{
         DisposableRunnerRegistrationSource, DisposableRunnerRuntime, DisposableRunnerRuntimeError,
@@ -1687,6 +1688,14 @@ mod tests {
         capacities: Vec<u16>,
         polls: std::collections::VecDeque<ScaleSetBridgePoll>,
         acknowledged: Vec<u64>,
+    }
+
+    struct MutableHostStorage(Rc<Cell<bool>>);
+
+    impl DisposableHostStorageSource for MutableHostStorage {
+        fn admits_new_worker(&self) -> Result<bool, DisposableHostStorageError> {
+            Ok(self.0.get())
+        }
     }
 
     impl DeliveryBridge for FakeCoordinatorBridge {
@@ -2276,7 +2285,12 @@ mod tests {
             &prepared,
         )
         .unwrap();
-        let coordinator = DisposableWorkerCoordinator::new(root.path(), policy);
+        let host_storage_available = Rc::new(Cell::new(true));
+        let coordinator = DisposableWorkerCoordinator::new(
+            root.path(),
+            policy,
+            Box::new(MutableHostStorage(Rc::clone(&host_storage_available))),
+        );
         let mut bridge = FakeCoordinatorBridge {
             runner: None,
             capacities: Vec::new(),
@@ -2376,6 +2390,8 @@ mod tests {
             )
             .unwrap();
 
+        host_storage_available.set(false);
+
         let mut dispositions = Vec::new();
         for _ in 0..7 {
             dispositions.push(
@@ -2467,7 +2483,7 @@ mod tests {
             .unwrap();
         drop(paired);
 
-        let coordinator = DisposableWorkerCoordinator::new(root.path(), policy);
+        let coordinator = DisposableWorkerCoordinator::new_for_test(root.path(), policy);
         let mut bridge = FakeCoordinatorBridge {
             runner: None,
             capacities: Vec::new(),

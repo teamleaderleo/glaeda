@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::artifact::Sha256Digest;
 use crate::disposable_clone_runtime::DisposableCloneRuntime;
+use crate::disposable_host_storage::DisposableHostStorage;
 use crate::disposable_lima_worker::validate_disposable_lima_resources;
 use crate::disposable_prepared_template::current_disposable_prepared_template;
 use crate::disposable_runner_runtime::DisposableRunnerRuntime;
@@ -84,6 +85,7 @@ pub struct DisposableWorkerEnrollment {
     state_root: PathBuf,
     bridge_config: ScaleSetBridgeConfig,
     consumer_policy: ScaleSetDeliveryConsumerPolicy,
+    host_storage: DisposableHostStorage,
     clone_runtime: DisposableCloneRuntime,
     runner_runtime: DisposableRunnerRuntime,
 }
@@ -103,6 +105,7 @@ pub(crate) struct DisposableWorkerEnrollmentParts {
     pub(crate) state_root: PathBuf,
     pub(crate) bridge_config: ScaleSetBridgeConfig,
     pub(crate) consumer_policy: ScaleSetDeliveryConsumerPolicy,
+    pub(crate) host_storage: DisposableHostStorage,
     pub(crate) clone_runtime: DisposableCloneRuntime,
     pub(crate) runner_runtime: DisposableRunnerRuntime,
 }
@@ -113,6 +116,7 @@ impl DisposableWorkerEnrollment {
             state_root: self.state_root,
             bridge_config: self.bridge_config,
             consumer_policy: self.consumer_policy,
+            host_storage: self.host_storage,
             clone_runtime: self.clone_runtime,
             runner_runtime: self.runner_runtime,
         }
@@ -217,12 +221,15 @@ fn build_enrollment(
         source_instance,
     )
     .map_err(|_| invalid_configuration())?;
+    let host_storage = DisposableHostStorage::new(lima_home.clone(), resources.disk_bytes())
+        .map_err(|_| invalid_configuration())?;
     let runner_runtime = DisposableRunnerRuntime::new(limactl_program, lima_home)
         .map_err(|_| invalid_configuration())?;
     Ok(DisposableWorkerEnrollment {
         state_root,
         bridge_config,
         consumer_policy,
+        host_storage,
         clone_runtime,
         runner_runtime,
     })
@@ -375,8 +382,14 @@ mod tests {
 
         let parts = enrollment.into_parts();
         assert_eq!(parts.state_root, Path::new("/private/var/lib/smolrunner"));
+        assert_eq!(
+            parts.host_storage.test_lima_home(),
+            Path::new("/private/var/lib/smolrunner/lima")
+        );
+        assert_eq!(parts.host_storage.test_required_available_bytes(), 30 << 30);
         let _ = parts.bridge_config;
         let _ = parts.consumer_policy;
+        let _ = parts.host_storage;
         let _ = parts.clone_runtime;
         let _ = parts.runner_runtime;
     }

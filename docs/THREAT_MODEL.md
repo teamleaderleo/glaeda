@@ -34,7 +34,7 @@ Unless an operator explicitly selects a separately documented weaker backend:
 - A GitHub runner is just-in-time/ephemeral, uniquely bound to the admitted attempt, and cannot receive a second job.
 - Long-lived GitHub credentials stay on the Mac control plane. Ephemeral configuration is bounded, redacted, never public-journal data, and destroyed with the VM.
 - The job has no inbound reachability. Outbound policy denies the host, private/LAN, link-local, metadata, controller, and peer-worker destinations while allowing the explicit internet access ordinary CI requires.
-- Admission reserves host-wide CPU, memory, disk, and concurrency capacity before provisioning. VM and wall-time limits are hard ceilings. No work means no running worker VM.
+- Admission reserves host-wide CPU, memory, disk, and concurrency capacity before provisioning. New capacity is advertised only when the exact Lima storage filesystem has room for the full hostile-worker disk ceiling plus the fixed host reserve, and that fact is rechecked before clone. VM and wall-time limits are hard ceilings. No work means no running worker VM.
 - The guest runner user has no sudo or equivalent administrative authority. Nested containers, when enabled, are rootless inside the guest and expose no host runtime socket.
 - Every provision, registration, start, terminal observation, deregistration, destruction, and capacity-release transition is durably checkpointed or safely rediscovered after a crash.
 - Unknown ownership, conflicting identity, stale authority, partial cleanup, and ambiguous external mutation block reuse. Recovery prefers destroying the disposable worker over adopting uncertain state.
