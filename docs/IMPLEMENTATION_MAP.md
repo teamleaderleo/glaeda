@@ -185,18 +185,13 @@ strict commands are evidence-bearing advanced surfaces and should survive conven
 | `renderprove_vision_profile` | all | pure foundation | renderprove | `smolrunner::renderprove_vision_profile` | none | pure | typed caller-owned identities/evidence | bounded vision model/profile identity | none | focused tests; PRs #226/#229; Linux acceptance | separate Renderprove product route; no W02–W04 consumer | #224; PRs #226/#229 | keep separate from personal-worker alpha |
 | `renderprove_vision_result` | all | pure foundation | renderprove | `smolrunner::renderprove_vision_result` | none | pure | typed caller-owned identities/evidence | bounded vision result and evidence | none | focused tests; PRs #226/#229; Linux acceptance | separate Renderprove product route; no W02–W04 consumer | #224; PRs #226/#229 | keep separate from personal-worker alpha |
 
-## Research and preview modules
+## Research modules
 
 | module | cfg/platform | primary classification | product track | public entry point | current CLI command (or none) | authority/effect class | required upstream evidence | user step unlocked | W02–W04 consumer (or none) | current tests/evidence | missing integration proof | canonical issue/PR | consolidation note |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `lease` | all | experimental | research | `smolrunner::lease` | none | pure | typed caller-owned identities/evidence | revisioned lease lifecycle policy | none | module tests; ADR/roadmap evidence | no accepted personal-worker alpha consumer | ROADMAP; ADRs 0004–0013 | research lease vocabulary; no alpha coupling |
 | `lease_catalog` | all | experimental | research | `smolrunner::lease_catalog` | none | pure | typed caller-owned identities/evidence | in-memory lease CAS/catalogue contract | none | module tests; ADR/roadmap evidence | no accepted personal-worker alpha consumer | ROADMAP; ADRs 0004–0013 | research in-memory catalogue; no alpha coupling |
 | `lease_document` | all | experimental | research | `smolrunner::lease_document` | none | pure | typed caller-owned identities/evidence | versioned lease persistence document | none | module tests; ADR/roadmap evidence | no accepted personal-worker alpha consumer | ROADMAP; ADRs 0004–0013 | research persistence schema; no alpha coupling |
-| `podman_preview` | all | experimental | research | `smolrunner::podman_preview` | none | pure | typed caller-owned identities/evidence | reviewed Podman preview command planning | none | module tests; ADR/roadmap evidence | no accepted personal-worker alpha consumer | ROADMAP; ADRs 0004–0013 | keep experimental until a canonical consumer exists |
-| `podman_preview_execution` | all | experimental | research | `smolrunner::podman_preview_execution` | none | process | reviewed plan/argv; empty env; timeout/output bounds | execute bounded preview commands | none | module tests; ADR/roadmap evidence | no accepted personal-worker alpha consumer | ROADMAP; ADRs 0004–0013 | keep experimental until a canonical consumer exists |
-| `podman_preview_inspect` | all | experimental | research | `smolrunner::podman_preview_inspect` | none | pure | typed caller-owned identities/evidence | bind and decode Podman inspect evidence | none | module tests; ADR/roadmap evidence | no accepted personal-worker alpha consumer | ROADMAP; ADRs 0004–0013 | keep experimental until a canonical consumer exists |
-| `podman_preview_state` | all | experimental | research | `smolrunner::podman_preview_state` | none | pure | typed caller-owned identities/evidence | state-aware preview reconciliation | none | module tests; ADR/roadmap evidence | no accepted personal-worker alpha consumer | ROADMAP; ADRs 0004–0013 | keep experimental until a canonical consumer exists |
-| `preview` | all | experimental | research | `smolrunner::preview` | none | pure | typed caller-owned identities/evidence | preview-slot generation and coalescing policy | none | module tests; ADR/roadmap evidence | no accepted personal-worker alpha consumer | ROADMAP; ADRs 0004–0013 | keep experimental until a canonical consumer exists |
 
 ## W02–W04 integration summary
 
@@ -235,8 +230,8 @@ These are findings for later owners, not changes authorised by P02:
   to the run-once alpha would prematurely import GitHub observation and credential concerns.
 - Renderprove modules are mature within their own track. They should remain separate from the
   personal-worker journey unless a later canonical lane names an exact shared contract.
-- Lease and preview modules remain experimental for this programme. Their accepted ADRs do not make
-  them personal-worker alpha dependencies.
+- Lease modules remain experimental for this programme. The retired preview ADRs remain historical
+  design records and do not make preview execution a personal-worker dependency.
 - Broad implementation modules can move behind narrower operator services after W04 API review.
   `src/lib.rs` integration remains owned by W04 I03; this document grants no visibility change.
 - No current public module has canonical evidence of supersession. Historical PRs alone are
