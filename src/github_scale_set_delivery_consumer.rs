@@ -306,12 +306,12 @@ fn reconcile_event(
                 DisposableAttemptPhase::Destroying
                 | DisposableAttemptPhase::Deregistering
                 | DisposableAttemptPhase::Releasing
+                | DisposableAttemptPhase::UnprovisionedReleasing
                 | DisposableAttemptPhase::Complete => Ok(catalog.clone()),
                 DisposableAttemptPhase::Provisioning
                 | DisposableAttemptPhase::Assigned
                 | DisposableAttemptPhase::Running
-                | DisposableAttemptPhase::Terminal
-                | DisposableAttemptPhase::UnprovisionedReleasing => {
+                | DisposableAttemptPhase::Terminal => {
                     Err(consumer_error("delivery_consumer_event_conflict"))
                 }
             };
@@ -979,6 +979,64 @@ mod tests {
         assert_eq!(tombstone.phase(), DisposableAttemptPhase::Complete);
         assert!(tombstone.vm_identity().is_none());
         assert!(tombstone.github_job_id().is_none());
+    }
+
+    #[test]
+    fn direct_cancellation_does_not_block_unprovisioned_release() {
+        let request_id = (1_u64 << 62) + 62;
+        let mut catalog = reconcile_scale_set_delivery(
+            &policy(),
+            &delivery(vec![ScaleSetBridgeEvent::Assigned(job(
+                request_id, "job-1",
+            ))]),
+            &DisposableAttemptCatalogDocument::empty(),
+            observed_at(),
+        )
+        .unwrap();
+        let attempt_id = catalog.active()[0].attempt().attempt_id().clone();
+        catalog = catalog
+            .replace_attempt(
+                &attempt_id,
+                catalog.active()[0].attempt().revision(),
+                DisposableAttemptCatalogAction::BeginUnprovisionedRelease,
+            )
+            .unwrap();
+        let canceled = delivery(vec![ScaleSetBridgeEvent::Completed {
+            job: job(request_id, "job-1"),
+            runner: None,
+            result: ScaleSetJobResult::parse("canceled").unwrap(),
+        }]);
+
+        assert_eq!(
+            reconcile_scale_set_delivery(
+                &policy(),
+                &canceled,
+                &catalog,
+                EpochMillis::new(200_000).unwrap(),
+            )
+            .unwrap(),
+            catalog
+        );
+        let completed = catalog
+            .replace_attempt(
+                &attempt_id,
+                catalog.active()[0].attempt().revision(),
+                DisposableAttemptCatalogAction::CompleteUnprovisioned,
+            )
+            .unwrap();
+        let retired = completed
+            .retire_complete(&attempt_id, completed.active()[0].attempt().revision())
+            .unwrap();
+        assert_eq!(
+            reconcile_scale_set_delivery(
+                &policy(),
+                &canceled,
+                &retired,
+                EpochMillis::new(300_000).unwrap(),
+            )
+            .unwrap(),
+            retired
+        );
     }
 
     #[test]
