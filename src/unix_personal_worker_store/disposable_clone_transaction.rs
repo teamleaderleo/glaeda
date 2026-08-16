@@ -108,6 +108,9 @@ impl UnixPersonalWorkerStore {
         started
             .validate_successor_of(&current)
             .map_err(|_| DisposableCloneRuntimeError::recovery("clone_checkpoint_invalid"))?;
+        let checkpoint_ready = runtime.preflight_checkpointed_clone_locked(
+            &started, attempt_id, prepared, admission, executor, clock,
+        )?;
         let mut staged = self
             .stage_catalog(&started)
             .map_err(|_| DisposableCloneRuntimeError::durable("clone_checkpoint_stage_failed"))?;
@@ -118,8 +121,8 @@ impl UnixPersonalWorkerStore {
         )
         .map_err(|_| DisposableCloneRuntimeError::recovery("clone_checkpoint_publish_ambiguous"))?;
 
-        let identity =
-            runtime.execute_locked(&started, attempt_id, &prepared, admission, executor, clock)?;
+        let (identity, plan) =
+            runtime.execute_checkpointed_clone_locked(checkpoint_ready, executor, clock)?;
         let started_attempt_revision = started
             .find_active(attempt_id)
             .ok_or_else(|| DisposableCloneRuntimeError::durable("clone_attempt_missing"))?
@@ -141,7 +144,7 @@ impl UnixPersonalWorkerStore {
         )
         .map_err(|_| DisposableCloneRuntimeError::recovery("clone_identity_publish_ambiguous"))?;
         runtime
-            .receipt(&bound, attempt_id, &prepared.plan)
+            .receipt(&bound, attempt_id, &plan)
             .map(DisposableCloneTransactionOutcome::Completed)
     }
 
