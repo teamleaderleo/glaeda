@@ -32,3 +32,12 @@ unsafe_code = "forbid"
 
 [lints.clippy]
 all = "warn"
+
+# macOS defaults to unpacked split debug information. With this crate's many test targets that
+# creates hundreds of thousands of sidecar objects and makes each newly linked test stall in dyld
+# before main. Keep DWARF in the binaries instead; Linux already defaults to this layout.
+[profile.dev]
+split-debuginfo = "off"
+
+[profile.test]
+split-debuginfo = "off"
