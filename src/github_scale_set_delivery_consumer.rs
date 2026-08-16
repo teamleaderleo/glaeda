@@ -190,29 +190,7 @@ pub(crate) fn reconcile_scale_set_acquisition_resolution(
                 ..
             } if result.as_str() == "canceled" => {
                 acquired.insert(job.runner_request_id);
-                let attempt_id = reservation.attempt().attempt_id().clone();
-                let releasing = next
-                    .replace_attempt(
-                        &attempt_id,
-                        reservation.attempt().revision(),
-                        DisposableAttemptCatalogAction::BeginUnprovisionedRelease,
-                    )
-                    .map_err(|_| consumer_error("delivery_consumer_resolution_conflict"))?;
-                let releasing_attempt = releasing
-                    .find_active_by_runner_request_id(job.runner_request_id)
-                    .ok_or_else(|| consumer_error("delivery_consumer_attempt_missing"))?;
-                let complete = releasing
-                    .replace_attempt(
-                        &attempt_id,
-                        releasing_attempt.attempt().revision(),
-                        DisposableAttemptCatalogAction::CompleteUnprovisioned,
-                    )
-                    .map_err(|_| consumer_error("delivery_consumer_resolution_conflict"))?;
-                let complete_attempt = complete
-                    .find_active_by_runner_request_id(job.runner_request_id)
-                    .ok_or_else(|| consumer_error("delivery_consumer_attempt_missing"))?;
-                next = complete
-                    .retire_complete(&attempt_id, complete_attempt.attempt().revision())
+                next = retire_unprovisioned_cancellation(&next, reservation)
                     .map_err(|_| consumer_error("delivery_consumer_resolution_conflict"))?;
             }
             ScaleSetDeliveryLifecycleEvent::Available { .. }
@@ -301,6 +279,19 @@ fn reconcile_event(
 
     if let Some(existing) = catalog.find_active_by_runner_request_id(job.runner_request_id) {
         validate_reservation(policy, existing, job, &identities)?;
+        if matches!(
+            event,
+            ScaleSetDeliveryLifecycleEvent::Completed {
+                runner: None,
+                result,
+                ..
+            } if result.as_str() == "canceled"
+        ) && existing.attempt().phase()
+            == crate::disposable_worker_reconciler::DisposableAttemptPhase::Reserved
+            && existing.attempt().github_job_id().is_none()
+        {
+            return retire_unprovisioned_cancellation(catalog, existing);
+        }
         return catalog
             .replace_attempt(
                 existing.attempt().attempt_id(),
@@ -315,6 +306,40 @@ fn reconcile_event(
         return Ok(catalog.clone());
     }
     Err(consumer_error("delivery_consumer_attempt_missing"))
+}
+
+fn retire_unprovisioned_cancellation(
+    catalog: &DisposableAttemptCatalogDocument,
+    reservation: &DisposableAttemptReservation,
+) -> Result<DisposableAttemptCatalogDocument, ScaleSetDeliveryConsumerError> {
+    let attempt_id = reservation.attempt().attempt_id().clone();
+    let releasing = catalog
+        .replace_attempt(
+            &attempt_id,
+            reservation.attempt().revision(),
+            DisposableAttemptCatalogAction::BeginUnprovisionedRelease,
+        )
+        .map_err(|_| consumer_error("delivery_consumer_event_conflict"))?;
+    let releasing_attempt = releasing
+        .active()
+        .iter()
+        .find(|candidate| candidate.attempt().attempt_id() == &attempt_id)
+        .ok_or_else(|| consumer_error("delivery_consumer_attempt_missing"))?;
+    let complete = releasing
+        .replace_attempt(
+            &attempt_id,
+            releasing_attempt.attempt().revision(),
+            DisposableAttemptCatalogAction::CompleteUnprovisioned,
+        )
+        .map_err(|_| consumer_error("delivery_consumer_event_conflict"))?;
+    let complete_attempt = complete
+        .active()
+        .iter()
+        .find(|candidate| candidate.attempt().attempt_id() == &attempt_id)
+        .ok_or_else(|| consumer_error("delivery_consumer_attempt_missing"))?;
+    complete
+        .retire_complete(&attempt_id, complete_attempt.attempt().revision())
+        .map_err(|_| consumer_error("delivery_consumer_event_conflict"))
 }
 
 fn attempt_not_after(
@@ -477,11 +502,19 @@ fn validate_tombstone_event(
             runner,
             result,
         } => {
-            attempt.github_job_id() == Some(&job.job_id)
+            (attempt.github_job_id() == Some(&job.job_id)
                 && attempt.result() == Some(result)
                 && runner.as_ref().is_none_or(|runner| {
                     attempt.runner_id() == Some(runner.id) && attempt.runner_name() == &runner.name
-                })
+                }))
+                || (attempt.phase()
+                    == crate::disposable_worker_reconciler::DisposableAttemptPhase::Complete
+                    && attempt.vm_identity().is_none()
+                    && attempt.runner_id().is_none()
+                    && attempt.github_job_id().is_none()
+                    && attempt.result().is_none()
+                    && runner.is_none()
+                    && result.as_str() == "canceled")
         }
     };
     if valid {
@@ -766,6 +799,105 @@ mod tests {
         assert_eq!(
             reconcile_scale_set_delivery(&policy(), &assigned, &reserved, observed_at()).unwrap(),
             reserved
+        );
+    }
+
+    #[test]
+    fn direct_assignment_cancellation_releases_without_external_object_authority() {
+        let request_id = (1_u64 << 62) + 41;
+        let assigned = delivery(vec![ScaleSetBridgeEvent::Assigned(job(
+            request_id, "job-1",
+        ))]);
+        let reserved = reconcile_scale_set_delivery(
+            &policy(),
+            &assigned,
+            &DisposableAttemptCatalogDocument::empty(),
+            observed_at(),
+        )
+        .unwrap();
+        let canceled = delivery(vec![ScaleSetBridgeEvent::Completed {
+            job: job(request_id, "job-1"),
+            runner: None,
+            result: ScaleSetJobResult::parse("canceled").unwrap(),
+        }]);
+        let retired = reconcile_scale_set_delivery(
+            &policy(),
+            &canceled,
+            &reserved,
+            EpochMillis::new(200_000).unwrap(),
+        )
+        .unwrap();
+
+        assert!(retired.active().is_empty());
+        let tombstone = retired
+            .find_tombstone_by_runner_request_id(ScaleSetRunnerRequestId::new(request_id).unwrap())
+            .unwrap();
+        assert_eq!(tombstone.phase(), DisposableAttemptPhase::Complete);
+        assert!(tombstone.vm_identity().is_none());
+        assert!(tombstone.runner_id().is_none());
+        assert!(tombstone.github_job_id().is_none());
+        assert!(tombstone.result().is_none());
+        assert_eq!(
+            reconcile_scale_set_delivery(
+                &policy(),
+                &canceled,
+                &retired,
+                EpochMillis::new(300_000).unwrap(),
+            )
+            .unwrap(),
+            retired
+        );
+
+        let reassigned_request_id = request_id + 1;
+        let reassigned = delivery(vec![ScaleSetBridgeEvent::Assigned(job(
+            reassigned_request_id,
+            "job-1",
+        ))]);
+        let next = reconcile_scale_set_delivery(
+            &policy(),
+            &reassigned,
+            &retired,
+            EpochMillis::new(300_000).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(next.active().len(), 1);
+        assert_eq!(
+            next.active()[0].attempt().runner_request_id().get(),
+            reassigned_request_id
+        );
+    }
+
+    #[test]
+    fn direct_preclone_completion_refuses_runner_bearing_evidence() {
+        let request_id = (1_u64 << 62) + 41;
+        let reserved = reconcile_scale_set_delivery(
+            &policy(),
+            &delivery(vec![ScaleSetBridgeEvent::Assigned(job(
+                request_id, "job-1",
+            ))]),
+            &DisposableAttemptCatalogDocument::empty(),
+            observed_at(),
+        )
+        .unwrap();
+        let runner = ScaleSetRunnerReference::new(
+            ScaleSetRunnerId::new(501).unwrap(),
+            reserved.active()[0].attempt().runner_name().clone(),
+        );
+        let event = ScaleSetBridgeEvent::Completed {
+            job: job(request_id, "job-1"),
+            runner: Some(runner),
+            result: ScaleSetJobResult::parse("canceled").unwrap(),
+        };
+        assert_eq!(
+            reconcile_scale_set_delivery(
+                &policy(),
+                &delivery(vec![event]),
+                &reserved,
+                EpochMillis::new(200_000).unwrap(),
+            )
+            .unwrap_err()
+            .code(),
+            "delivery_consumer_event_conflict"
         );
     }
 

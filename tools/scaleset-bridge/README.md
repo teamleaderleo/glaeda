@@ -42,7 +42,12 @@ GitHub.com can directly assign organization Scale Set work with `runnerRequestId
 preceding Available event. For that shape only, the bridge derives a stable positive private join
 key from the exact job and assignment evidence. Distinct assignment times remain distinct, and the
 Rust consumer reserves capacity directly from the Assigned event without calling `AcquireJobs` or
-claiming a runner identity before JIT registration.
+claiming a runner identity before JIT registration. A runnerless `Completed(canceled)` for that
+exact assignment releases and retires the untouched reservation without acquiring VM or runner
+deletion authority. The Quarry pilot observed GitHub.com repeat the exact nanosecond assignment
+timestamp from message `100000001` (`Assigned`) in message `100000002`
+(`Completed(canceled)`), for workflow run `31951901986`; this is the bounded live-service evidence
+for the private join across the pre-runner reassignment lifecycle.
 
 ## Current nonclaims
 
