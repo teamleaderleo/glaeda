@@ -54,7 +54,10 @@ impl DisposableServiceFailureCode {
 
 impl fmt::Debug for DisposableServiceFailureCode {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_tuple("DisposableServiceFailureCode").field(&self.0).finish()
+        formatter
+            .debug_tuple("DisposableServiceFailureCode")
+            .field(&self.0)
+            .finish()
     }
 }
 
@@ -124,12 +127,13 @@ impl DisposableServiceFailureReceipt {
                 "disposable_service_failure_document_too_large",
             ));
         }
-        let raw: RawDisposableServiceFailureReceipt = serde_json::from_slice(bytes).map_err(|_| {
-            receipt_error(
-                DisposableServiceFailureReceiptErrorKind::InvalidDocument,
-                "disposable_service_failure_document_invalid",
-            )
-        })?;
+        let raw: RawDisposableServiceFailureReceipt =
+            serde_json::from_slice(bytes).map_err(|_| {
+                receipt_error(
+                    DisposableServiceFailureReceiptErrorKind::InvalidDocument,
+                    "disposable_service_failure_document_invalid",
+                )
+            })?;
         if raw.schema_version != DISPOSABLE_SERVICE_FAILURE_RECEIPT_SCHEMA_VERSION {
             return Err(receipt_error(
                 DisposableServiceFailureReceiptErrorKind::UnsupportedSchema,
@@ -323,13 +327,15 @@ mod tests {
 
     #[test]
     fn unknown_and_duplicate_fields_fail_closed() {
-        let mut value: serde_json::Value = serde_json::from_slice(&receipt().canonical_json()).unwrap();
-        value
-            .as_object_mut()
-            .unwrap()
-            .insert("private_path".to_owned(), serde_json::Value::String("/Users/operator".to_owned()));
-        let error = DisposableServiceFailureReceipt::from_json(&serde_json::to_vec(&value).unwrap())
-            .unwrap_err();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&receipt().canonical_json()).unwrap();
+        value.as_object_mut().unwrap().insert(
+            "private_path".to_owned(),
+            serde_json::Value::String("/Users/operator".to_owned()),
+        );
+        let error =
+            DisposableServiceFailureReceipt::from_json(&serde_json::to_vec(&value).unwrap())
+                .unwrap_err();
         assert_eq!(
             error.kind(),
             DisposableServiceFailureReceiptErrorKind::InvalidDocument
@@ -350,10 +356,12 @@ mod tests {
 
     #[test]
     fn unsupported_schema_is_distinct() {
-        let mut value: serde_json::Value = serde_json::from_slice(&receipt().canonical_json()).unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&receipt().canonical_json()).unwrap();
         value["schema_version"] = serde_json::Value::from(2);
-        let error = DisposableServiceFailureReceipt::from_json(&serde_json::to_vec(&value).unwrap())
-            .unwrap_err();
+        let error =
+            DisposableServiceFailureReceipt::from_json(&serde_json::to_vec(&value).unwrap())
+                .unwrap_err();
         assert_eq!(
             error.kind(),
             DisposableServiceFailureReceiptErrorKind::UnsupportedSchema
@@ -362,10 +370,12 @@ mod tests {
 
     #[test]
     fn invalid_digest_is_rejected_without_echoing_input() {
-        let mut value: serde_json::Value = serde_json::from_slice(&receipt().canonical_json()).unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&receipt().canonical_json()).unwrap();
         value["program_digest"] = serde_json::Value::String("/Users/operator/private".to_owned());
-        let error = DisposableServiceFailureReceipt::from_json(&serde_json::to_vec(&value).unwrap())
-            .unwrap_err();
+        let error =
+            DisposableServiceFailureReceipt::from_json(&serde_json::to_vec(&value).unwrap())
+                .unwrap_err();
         assert_eq!(
             error.kind(),
             DisposableServiceFailureReceiptErrorKind::InvalidIdentity
@@ -445,7 +455,10 @@ mod tests {
             "jit",
             "message",
         ] {
-            assert!(!json.contains(forbidden), "forbidden public field fragment: {forbidden}");
+            assert!(
+                !json.contains(forbidden),
+                "forbidden public field fragment: {forbidden}"
+            );
         }
     }
 }
