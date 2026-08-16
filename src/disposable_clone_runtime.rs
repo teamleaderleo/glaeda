@@ -1534,7 +1534,7 @@ mod tests {
                     .is_some_and(|value| value == "/opt/smolrunner/bin/smolrunner-runner-integrity")
                     && argv.iter().any(|value| value == "/usr/bin/sha256sum")
                 {
-                    "c395062a45f0cb08270f581f912e16d550bc5f33d192af68f205e06609dd0cf7  /opt/smolrunner/bin/smolrunner-runner-integrity\n".to_owned()
+                    "70626f66fc76aa947aee3f45d4c2ee048d915bdcc543c58e953a3f05ee00637d  /opt/smolrunner/bin/smolrunner-runner-integrity\n".to_owned()
                 } else if argv
                     .last()
                     .is_some_and(|value| value == "/opt/smolrunner/bin/smolrunner-runner-integrity")

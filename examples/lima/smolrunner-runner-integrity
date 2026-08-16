@@ -26,7 +26,7 @@ if /usr/bin/find -P "${install_dir}" -xdev -mindepth 1 \
 fi
 if /usr/bin/find -P "${install_dir}" -xdev -mindepth 1 \
   \( -path "${runner_work}" -o -path "${runner_diag}" \) -prune -o \
-  -perm /022 -print -quit | /usr/bin/grep -q .; then
+  ! -type l -perm /022 -print -quit | /usr/bin/grep -q .; then
   exit 1
 fi
 
