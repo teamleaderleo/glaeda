@@ -47,8 +47,6 @@ pub mod doctor;
 pub mod durable_journal;
 #[cfg(target_os = "linux")]
 pub mod durable_lane_execution;
-/// Pure exact-commit runner-to-publisher handoff contracts and reports.
-pub mod exact_commit_handoff;
 #[cfg_attr(test, allow(clippy::too_many_arguments))]
 pub mod execution_admission;
 pub mod execution_receipt;
@@ -265,8 +263,6 @@ pub mod rootless_podman_preflight;
 pub mod runner_account_observation;
 #[cfg(target_os = "linux")]
 pub mod runner_account_plan;
-/// Credentialless, bounded exact-commit Git bundle export execution and records.
-pub mod runner_export;
 #[cfg(target_os = "linux")]
 pub mod runner_user;
 #[cfg(target_os = "linux")]
