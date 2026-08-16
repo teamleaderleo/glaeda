@@ -33,7 +33,7 @@ const LIMA_SSH_SOCKET_SUFFIX: &str = "/ssh.sock.1234567890123456";
 const CLONE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const DESTROY_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const OBSERVATION_MAX_AGE_SECONDS: u64 = 30;
-const GUEST_CACHE_PATH: &str = "/var/lib/smolrunner-runner/work";
+const GUEST_CACHE_PATH: &str = "/opt/smolrunner/actions-runner/_work";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]

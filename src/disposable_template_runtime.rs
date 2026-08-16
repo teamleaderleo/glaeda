@@ -47,7 +47,7 @@ const OBSERVATION_MAX_AGE_SECONDS: u64 = 30;
 const CREATE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const STOP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const DISCARD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-const GUEST_CACHE_PATH: &str = "/var/lib/smolrunner-runner/work";
+const GUEST_CACHE_PATH: &str = "/opt/smolrunner/actions-runner/_work";
 const JIT_LAUNCHER: &str = "/opt/smolrunner/bin/smolrunner-jit-launcher";
 const JIT_LAUNCHER_BYTES: &[u8] = include_bytes!("../examples/lima/smolrunner-jit-launcher");
 const RUNNER_INTEGRITY: &str = "/opt/smolrunner/bin/smolrunner-runner-integrity";
@@ -64,7 +64,7 @@ const MASKED_APT_UNITS: [&str; 4] = [
     "apt-daily.service",
     "apt-daily-upgrade.service",
 ];
-const READY_MARKER_BYTES: &[u8] = b"{\n  \"schema_version\": 1,\n  \"actions_runner_version\": \"2.336.0\",\n  \"actions_runner_digest\": \"sha256:58b758e420b87093fbd4bfddd368074960053e2f1388f01848c82624b90f27d1\",\n  \"workload_user\": \"smolrunner-runner\",\n  \"runner_install_directory\": \"/opt/smolrunner/actions-runner\",\n  \"runner_work_directory\": \"/var/lib/smolrunner-runner/work\",\n  \"jit_launcher_path\": \"/opt/smolrunner/bin/smolrunner-jit-launcher\",\n  \"jit_launcher_digest\": \"sha256:6f096fb518b6d40d45ca1a9923e423da436b6269fceec5a5989566abbc93a76a\"\n}\n";
+const READY_MARKER_BYTES: &[u8] = b"{\n  \"schema_version\": 1,\n  \"actions_runner_version\": \"2.336.0\",\n  \"actions_runner_digest\": \"sha256:58b758e420b87093fbd4bfddd368074960053e2f1388f01848c82624b90f27d1\",\n  \"workload_user\": \"smolrunner-runner\",\n  \"runner_install_directory\": \"/opt/smolrunner/actions-runner\",\n  \"runner_work_directory\": \"/opt/smolrunner/actions-runner/_work\",\n  \"jit_launcher_path\": \"/opt/smolrunner/bin/smolrunner-jit-launcher\",\n  \"jit_launcher_digest\": \"sha256:6f096fb518b6d40d45ca1a9923e423da436b6269fceec5a5989566abbc93a76a\"\n}\n";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -989,6 +989,8 @@ mod tests {
         )));
         assert!(template.contains("/usr/bin/chown -R root:root \"${install_stage}\""));
         assert!(template.contains("/usr/bin/chmod 1775 \"${install_stage}\""));
+        assert!(template.contains("\"${install_stage}/_work\" \"${install_stage}/_diag\""));
+        assert!(!template.contains("/usr/bin/ln --symbolic \"${runner_work}\""));
     }
 
     #[test]
@@ -997,7 +999,6 @@ mod tests {
             "vmType": "vz",
             "arch": "aarch64",
             "plain": true,
-            "mounts": [],
             "networks": [],
             "portForwards": [],
             "propagateProxyEnv": false,
@@ -1033,6 +1034,23 @@ mod tests {
             &expected,
             [&before, &middle, &unsafe_after]
         ));
+    }
+
+    #[test]
+    fn clone_mount_policy_uses_lima_canonical_absence_and_rejects_real_mounts() {
+        let mut omitted = serde_json::Map::new();
+        assert!(remove_canonical_empty_mounts(&mut omitted));
+        assert!(!omitted.contains_key("mounts"));
+
+        let mut empty = serde_json::Map::from_iter([("mounts".to_owned(), serde_json::json!([]))]);
+        assert!(remove_canonical_empty_mounts(&mut empty));
+        assert!(!empty.contains_key("mounts"));
+
+        let mut configured = serde_json::Map::from_iter([(
+            "mounts".to_owned(),
+            serde_json::json!([{ "location": "/Users/operator" }]),
+        )]);
+        assert!(!remove_canonical_empty_mounts(&mut configured));
     }
 
     #[test]
@@ -1907,7 +1925,9 @@ impl DisposableTemplateRuntime {
             "disk".to_owned(),
             serde_json::json!(format!("{}GiB", resources.disk_bytes() / GIB)),
         );
-        object.insert("mounts".to_owned(), serde_json::json!([]));
+        if !remove_canonical_empty_mounts(object) {
+            return Err(observation_failure("template_clone_mount_policy_invalid"));
+        }
         Ok(config)
     }
 
@@ -2171,6 +2191,14 @@ fn exact_realized_config_matches(
         && observed
             .windows(2)
             .all(|pair| pair[0].runtime_state == pair[1].runtime_state)
+}
+
+fn remove_canonical_empty_mounts(object: &mut serde_json::Map<String, serde_json::Value>) -> bool {
+    match object.remove("mounts") {
+        None => true,
+        Some(serde_json::Value::Array(mounts)) => mounts.is_empty(),
+        Some(_) => false,
+    }
 }
 
 fn ensure_composite_observation_fresh(
