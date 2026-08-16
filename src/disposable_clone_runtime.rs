@@ -613,15 +613,15 @@ impl DisposableCloneRuntime {
         })
     }
 
-    pub(crate) fn execute_locked(
+    pub(crate) fn preflight_checkpointed_clone_locked(
         &self,
         started: &DisposableAttemptCatalogDocument,
         attempt_id: &DisposableAttemptId,
-        prepared: &PreparedClone,
+        prepared: PreparedClone,
         admission: &impl DisposableCloneAdmissionSource,
         executor: &impl TimedCommandExecutor,
         clock: &impl CloneRuntimeClock,
-    ) -> Result<DisposableVmIdentity, DisposableCloneRuntimeError> {
+    ) -> Result<CheckpointReadyClone, DisposableCloneRuntimeError> {
         let reservation = started
             .find_active(attempt_id)
             .ok_or_else(|| DisposableCloneRuntimeError::durable("clone_attempt_missing"))?;
@@ -675,6 +675,23 @@ impl DisposableCloneRuntime {
         }
         final_admission_observation.validate_for(started, reservation, command_now)?;
 
+        Ok(CheckpointReadyClone {
+            prepared,
+            expected_disk_bytes: reservation.resources().disk_bytes(),
+        })
+    }
+
+    pub(crate) fn execute_checkpointed_clone_locked(
+        &self,
+        checkpoint_ready: CheckpointReadyClone,
+        executor: &impl TimedCommandExecutor,
+        clock: &impl CloneRuntimeClock,
+    ) -> Result<(DisposableVmIdentity, DisposableLimaWorkerCommandPlan), DisposableCloneRuntimeError>
+    {
+        let CheckpointReadyClone {
+            prepared,
+            expected_disk_bytes,
+        } = checkpoint_ready;
         let record = executor
             .execute_with_timeout(prepared.plan.command(), prepared.plan.timeout())
             .map_err(|_| command("clone_command_failed"))?;
@@ -682,7 +699,7 @@ impl DisposableCloneRuntime {
         let host = LimaHostIdentityAdapter
             .observe(&prepared.target_request)
             .map_err(|_| observation("clone_host_identity_unavailable"))?;
-        if host.root_disk_bytes() != reservation.resources().disk_bytes() {
+        if host.root_disk_bytes() != expected_disk_bytes {
             return Err(observation("clone_host_disk_mismatch"));
         }
         host.confirm(&prepared.target_request)
@@ -692,7 +709,10 @@ impl DisposableCloneRuntime {
             .map_err(|_| observation("clone_source_drift"))?;
         host.confirm(&prepared.target_request)
             .map_err(|_| observation("clone_host_identity_drift"))?;
-        Ok(DisposableVmIdentity::from_host_identity(host.identity()))
+        Ok((
+            DisposableVmIdentity::from_host_identity(host.identity()),
+            prepared.plan,
+        ))
     }
 
     pub(crate) fn receipt(
@@ -1036,6 +1056,12 @@ pub(crate) struct PreparedClone {
     target_request: LimaObservationRequest,
     source: ConfirmedDisposableCloneSource,
     generation: DisposableTemplateGenerationDocument,
+}
+
+/// Single-use proof that every fallible pre-command gate passed for one exact proposed checkpoint.
+pub(crate) struct CheckpointReadyClone {
+    prepared: PreparedClone,
+    expected_disk_bytes: u64,
 }
 
 /// Descriptor-retaining proof of the exact disposable target observed ready for JIT handoff.
@@ -1780,6 +1806,7 @@ mod tests {
         calls: Cell<u8>,
         lose_capacity_on: Option<u8>,
         cancel_on: Option<u8>,
+        error_on: Option<u8>,
     }
 
     struct TimedAdmission {
@@ -1811,6 +1838,7 @@ mod tests {
                 calls: Cell::new(0),
                 lose_capacity_on: None,
                 cancel_on: None,
+                error_on: None,
             }
         }
     }
@@ -1825,6 +1853,11 @@ mod tests {
         ) -> Result<DisposableCloneAdmissionObservation, DisposableCloneRuntimeError> {
             let call = self.calls.get().saturating_add(1);
             self.calls.set(call);
+            if self.error_on == Some(call) {
+                return Err(DisposableCloneRuntimeError::observation(
+                    "clone_test_admission_failed",
+                ));
+            }
             Ok(DisposableCloneAdmissionObservation::new(
                 catalog,
                 reservation,
@@ -3208,7 +3241,7 @@ mod tests {
     }
 
     #[test]
-    fn expiry_during_post_checkpoint_preflight_blocks_before_clone() {
+    fn expiry_during_precheckpoint_preflight_preserves_clone_authority() {
         let root = TempRoot::new("deadline");
         let host = LimaHostIdentityFixture::new_with_disk_bytes(
             "clone-runtime-deadline",
@@ -3235,7 +3268,7 @@ mod tests {
         assert_eq!(error.code(), "clone_expired_before_command");
         assert_eq!(executor.clone_count(), 0);
         let attempt = durable_attempt(&root, &attempt_id);
-        assert_eq!(attempt.phase(), DisposableAttemptPhase::CloneStarted);
+        assert_eq!(attempt.phase(), DisposableAttemptPhase::CloneAuthorized);
         assert!(attempt.vm_identity().is_none());
     }
 
@@ -3255,6 +3288,7 @@ mod tests {
             calls: Cell::new(0),
             lose_capacity_on: Some(1),
             cancel_on: None,
+            error_on: None,
         };
 
         let error = runtime
@@ -3281,7 +3315,8 @@ mod tests {
         let admission = FakeAdmission {
             calls: Cell::new(0),
             lose_capacity_on: None,
-            cancel_on: Some(3),
+            cancel_on: Some(4),
+            error_on: None,
         };
 
         let error = runtime
@@ -3290,8 +3325,48 @@ mod tests {
         assert_eq!(error.code(), "clone_cancelled");
         assert_eq!(executor.clone_count(), 0);
         let attempt = durable_attempt(&root, &attempt_id);
-        assert_eq!(attempt.phase(), DisposableAttemptPhase::CloneStarted);
+        assert_eq!(attempt.phase(), DisposableAttemptPhase::CloneAuthorized);
         assert!(attempt.vm_identity().is_none());
+    }
+
+    #[test]
+    fn final_admission_failure_preserves_clone_authority_for_retry() {
+        let root = TempRoot::new("admission-failure");
+        let host = LimaHostIdentityFixture::new_with_disk_bytes(
+            "clone-runtime-admission-failure",
+            SOURCE,
+            SOURCE_DISK,
+        );
+        let runtime = runtime(&root, &host);
+        install_ready_generation(&root, &host, &runtime);
+        let attempt_id = install_authorized_attempt(&root);
+        let executor = executor(&host, false);
+        let admission = FakeAdmission {
+            calls: Cell::new(0),
+            lose_capacity_on: None,
+            cancel_on: None,
+            error_on: Some(4),
+        };
+
+        let error = runtime
+            .clone_once_with(&attempt_id, &admission, &executor, &FixedClock)
+            .unwrap_err();
+        assert_eq!(error.code(), "clone_test_admission_failed");
+        assert_eq!(executor.clone_count(), 0);
+        let attempt = durable_attempt(&root, &attempt_id);
+        assert_eq!(attempt.phase(), DisposableAttemptPhase::CloneAuthorized);
+        assert!(attempt.vm_identity().is_none());
+
+        let receipt = runtime
+            .clone_once_with(
+                &attempt_id,
+                &FakeAdmission::available(),
+                &executor,
+                &FixedClock,
+            )
+            .unwrap();
+        assert_eq!(receipt.attempt_revision(), 4);
+        assert_eq!(executor.clone_count(), 1);
     }
 
     #[test]
@@ -3341,7 +3416,7 @@ mod tests {
         assert_eq!(executor.version_calls.get(), 6);
         assert_eq!(executor.clone_count(), 0);
         let attempt = durable_attempt(&root, &attempt_id);
-        assert_eq!(attempt.phase(), DisposableAttemptPhase::CloneStarted);
+        assert_eq!(attempt.phase(), DisposableAttemptPhase::CloneAuthorized);
         assert!(attempt.vm_identity().is_none());
     }
 }
