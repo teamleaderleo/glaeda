@@ -548,7 +548,6 @@ fn validate_tombstone_event(
                 }))
                 || (attempt.phase()
                     == crate::disposable_worker_reconciler::DisposableAttemptPhase::Complete
-                    && attempt.runner_id().is_none()
                     && attempt.github_job_id().is_none()
                     && attempt.result().is_none()
                     && runner.is_none()
@@ -1041,9 +1040,12 @@ mod tests {
 
     #[test]
     fn direct_cancellation_after_owned_clone_start_enters_and_replays_cleanup() {
-        for (request_id, begin_registration) in
-            [((1_u64 << 62) + 71, false), ((1_u64 << 62) + 72, true)]
-        {
+        for (request_id, begin_registration, bind_runner, mark_ready) in [
+            ((1_u64 << 62) + 71, false, false, false),
+            ((1_u64 << 62) + 72, true, false, false),
+            ((1_u64 << 62) + 74, true, true, false),
+            ((1_u64 << 62) + 75, true, true, true),
+        ] {
             let mut catalog = reconcile_scale_set_delivery(
                 &policy(),
                 &delivery(vec![ScaleSetBridgeEvent::Assigned(job(
@@ -1081,6 +1083,38 @@ mod tests {
                         DisposableAttemptCatalogAction::BeginRegistration,
                     )
                     .unwrap();
+            }
+            let runner = ScaleSetRunnerReference::new(
+                ScaleSetRunnerId::new(request_id).unwrap(),
+                catalog.active()[0].attempt().runner_name().clone(),
+            );
+            if bind_runner {
+                for action in [
+                    DisposableAttemptCatalogAction::RecordJitGenerationStarted,
+                    DisposableAttemptCatalogAction::RecordRegistration(runner.clone()),
+                ] {
+                    catalog = catalog
+                        .replace_attempt(
+                            &attempt_id,
+                            catalog.active()[0].attempt().revision(),
+                            action,
+                        )
+                        .unwrap();
+                }
+            }
+            if mark_ready {
+                for action in [
+                    DisposableAttemptCatalogAction::RecordRunnerStartStarted,
+                    DisposableAttemptCatalogAction::RecordRunnerReady(runner.clone()),
+                ] {
+                    catalog = catalog
+                        .replace_attempt(
+                            &attempt_id,
+                            catalog.active()[0].attempt().revision(),
+                            action,
+                        )
+                        .unwrap();
+                }
             }
             let canceled = delivery(vec![ScaleSetBridgeEvent::Completed {
                 job: job(request_id, "job-1"),
