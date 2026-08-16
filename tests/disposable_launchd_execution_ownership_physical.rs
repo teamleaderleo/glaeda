@@ -12,7 +12,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use rustix::fs::{self as rustix_fs, Mode, OFlags};
-use rustix::process::{getegid, geteuid};
+use rustix::process::{Pid, getegid, geteuid, test_kill_process};
 use sha2::{Digest as _, Sha256};
 use smolrunner::process::{CommandSpec, ExecutionRecord, ProcessExecutor, TimedCommandExecutor};
 
@@ -480,7 +480,7 @@ impl PhysicalLaunchdFixture {
         Ok(())
     }
 
-    fn cleanup(&self) -> Result<(), &'static str> {
+    fn cleanup(&self, observed_pid: u32) -> Result<(), &'static str> {
         if !self.cleanup_authorized.replace(false) {
             return Err("launchd execution proof cleanup authority was not freshly granted");
         }
@@ -497,6 +497,7 @@ impl PhysicalLaunchdFixture {
             return Err("launchd execution proof bootout command failed");
         }
         self.wait_for_absence(START_WAIT)?;
+        wait_for_process_absence(observed_pid, START_WAIT)?;
         self.verify_namespace()?;
 
         if !self.marker_matches(OWNERSHIP_MARKER, &self.ownership_record())
@@ -559,6 +560,29 @@ fn fresh_execution_identity() -> String {
         .read_exact(&mut random)
         .expect("read exact launchd proof identity entropy");
     random.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn process_is_live(pid: u32) -> Result<bool, &'static str> {
+    let raw = i32::try_from(pid).map_err(|_| "launchd execution proof PID was out of range")?;
+    let pid = Pid::from_raw(raw).ok_or("launchd execution proof PID was invalid")?;
+    match test_kill_process(pid) {
+        Ok(()) => Ok(true),
+        Err(error) if error == rustix::io::Errno::SRCH => Ok(false),
+        Err(_) => Err("launchd execution proof process liveness was unavailable"),
+    }
+}
+
+fn wait_for_process_absence(pid: u32, timeout: Duration) -> Result<(), &'static str> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if !process_is_live(pid)? {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err("launchd execution proof process did not become absent in time");
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
 }
 
 fn plist_bytes(label: &str) -> Vec<u8> {
@@ -774,7 +798,7 @@ fn physical_transient_launchd_execution_is_registered_before_start_and_survives_
         .authorize_cleanup()
         .expect("authorize exact launchd proof cleanup");
     fixture
-        .cleanup()
+        .cleanup(running_pid)
         .expect("clean exact launchd proof service and namespace");
     assert!(
         !fixture.root.exists(),
