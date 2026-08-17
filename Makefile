@@ -1,4 +1,4 @@
-.PHONY: work work-cmux work-cmux-setup work-tmux vm vm-create vm-bootstrap vm-check vm-up vm-tmux vm-status vm-sync vm-doctor vm-observe vm-stop quarry-runner-install quarry-runner-status quarry-runner-route quarry-runner-unroute quarry-runner-pause quarry-runner-resume quarry-runner-remove
+.PHONY: work work-cmux work-cmux-setup work-tmux vm vm-create vm-bootstrap vm-check vm-up vm-tmux vm-status vm-sync vm-doctor vm-observe vm-stop quarry-runner-install quarry-runner-status quarry-runner-route quarry-runner-unroute quarry-runner-pause quarry-runner-resume quarry-runner-remove quarry-runner-autoidle-enable quarry-runner-autoidle-disable quarry-runner-autoidle-status
 
 work:
 	@bash scripts/macbook-workspace.sh tmux
@@ -67,3 +67,13 @@ quarry-runner-resume:
 
 quarry-runner-remove:
 	@bash scripts/quarry-trusted-runner.sh remove
+
+quarry-runner-autoidle-enable:
+	@bash scripts/quarry-trusted-runner.sh autoidle-enable
+
+quarry-runner-autoidle-disable:
+	@bash scripts/quarry-trusted-runner.sh autoidle-disable
+
+quarry-runner-autoidle-status:
+	@bash scripts/quarry-trusted-runner.sh autoidle-status
+
