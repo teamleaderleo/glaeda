@@ -1,6 +1,49 @@
 # MacBook runner quickstart
 
-This is the short operator path for the existing `smolrunner` Lima development VM. It does not install or register a GitHub Actions runner.
+This is the short operator path for the existing `smolrunner` Lima development VM.
+
+## Trusted Quarry fast lane
+
+Quarry's operator-authored private workflows may use a separate persistent fast
+lane. It keeps one official GitHub Actions runner online in the existing Lima VM,
+preserves its workspace and caches, and routes Quarry's shared Linux runner
+variable to the unique `quarry-trusted-local` label:
+
+```bash
+make quarry-runner-install
+make quarry-runner-status
+```
+
+The install is idempotent after the first registration. It starts the guest
+systemd service, enables Lima startup at Mac login, and waits for GitHub to
+report the exact runner online before routing jobs. The one-time GitHub token is
+piped to the guest over stdin and is not placed in the host process arguments,
+environment, filesystem, or output.
+
+Every service start, stop, or uninstall first requires the guest's numeric
+runner ID, fixed name, operating system, architecture, and labels to match the
+exact Quarry repository registration returned by GitHub. Removal refuses an
+absent VM or absent guest registration instead of guessing that cleanup already
+completed.
+
+Temporarily route common Quarry jobs back to GitHub-hosted Linux without deleting
+anything:
+
+```bash
+make quarry-runner-unroute
+make quarry-runner-route
+```
+
+Remove the registration and autostart while deliberately preserving the VM disk,
+workspace, toolchains, and caches:
+
+```bash
+make quarry-runner-remove
+```
+
+This is an explicit trusted-repository optimization, not the hostile-workload
+boundary. Third-party and potentially malicious repositories must continue to
+use the disposable VM lifecycle described in `DISPOSABLE_AUTOSCALING_CI.md`.
 
 Run commands from the SmolRunner checkout on the Mac.
 
@@ -166,13 +209,15 @@ git remote -v
 
 ## Current boundary
 
-The VM is currently a development and field-validation environment:
+The VM is a development and field-validation environment with one optional
+trusted Quarry fast lane:
 
 - ARM64 Ubuntu, systemd, cgroup v2, Rust, and rootless Podman are working;
-- GitHub-hosted runners still execute the repository's ordinary Actions workflows;
-- no official Actions listener is registered in this Lima VM;
-- no daemon, timer, queue polling, webhook, automatic wake-up/shutdown, cache deletion, host-home mount, or credential propagation is added by the profile helper;
+- GitHub-hosted runners remain the explicit fallback for Quarry's ordinary Actions workflows;
+- `quarry-trusted-runner.sh install` registers one persistent official listener for the exact Quarry repository and routes only its shared Linux label;
+- Lima login autostart plus the guest systemd service recover that listener without an operator password;
+- no webhook, cache deletion, host-home mount, SSH-agent forwarding, or Mac credential propagation is added by the trusted lane;
 - cmux remains a human-facing view and never becomes privileged execution transport;
-- no project bootstrap, runner registration, automatic update, or production deployment authority is implied by these shortcuts.
+- no production deployment authority is implied by these shortcuts.
 
 Repository-specific dependency installation and verification remain repository-owned. SmolRunner will eventually provide the surrounding one-command host, runner, release-channel, rollback, and disposable-execution lifecycle after the reviewed preparation and registration paths exist.

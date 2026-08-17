@@ -142,12 +142,15 @@ jobs:
             scripts/macbook-runner-observe.sh \
             scripts/macbook-runner-vm.sh \
             scripts/macbook-workspace.sh \
+            scripts/quarry-trusted-runner.sh \
             scripts/test-macbook-runner-bootstrap.sh \
             scripts/test-macbook-runner-vm.sh \
-            scripts/test-macbook-runner-vm-paths.sh
+            scripts/test-macbook-runner-vm-paths.sh \
+            scripts/test-quarry-trusted-runner.sh
           bash scripts/test-macbook-runner-bootstrap.sh
           bash scripts/test-macbook-runner-vm.sh
           bash scripts/test-macbook-runner-vm-paths.sh
+          bash scripts/test-quarry-trusted-runner.sh
           bash scripts/macbook-workspace.sh help >/dev/null
           bash scripts/macbook-workspace.sh notify-doctor 0
           if grep -Eq 'allowAll|openAccess|CMUX_SOCKET_(PATH|PASSWORD)' scripts/macbook-workspace.sh; then
