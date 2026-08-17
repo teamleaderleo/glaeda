@@ -32,7 +32,12 @@ case "$*" in
   'api --method POST repos/Quarry-Labs/quarry/actions/runners/remove-token --jq .token')
     printf 'removal-secret\n'
     ;;
-  *'actions/runners --jq '*'.id == 22'*'@tsv'*)
+  *'actions/runners --jq '*'.id == 22'*'[.id, .status, .busy] | @tsv'*)
+    if [ "${TRUSTED_RUNNER_TEST_GITHUB_BINDING:-exact}" = exact ]; then
+      printf '22\tonline\tfalse\n'
+    fi
+    ;;
+  *'actions/runners --jq '*'.id == 22'*'[.status, .busy] | @tsv'*)
     if [ "${TRUSTED_RUNNER_TEST_GITHUB_BINDING:-exact}" = exact ]; then
       printf 'online\tfalse\n'
     fi
@@ -62,7 +67,9 @@ printf 'limactl %s\n' "$*" >> "${TRUSTED_RUNNER_TEST_LOG}"
 case "${1:-}" in
   list)
     if [ "${2:-}" = --quiet ]; then
-      printf 'smolrunner\n'
+      if [ "${TRUSTED_RUNNER_TEST_INSTANCE_EXISTS:-1}" = 1 ]; then
+        printf 'smolrunner\n'
+      fi
     elif [ "${2:-}" = --format ]; then
       printf 'Running\n'
     else
@@ -150,6 +157,9 @@ grep -F 'runner=quarry-trusted-mac-arm64 state=online' "${install_output}" >/dev
 [ -f "${configured}" ]
 grep -F 'autostart enable --condition=login --tty=false smolrunner' "${log}" >/dev/null
 grep -F '.id == 22' "${log}" >/dev/null
+binding_line="$(grep -n -m1 -F '[.id, .status, .busy] | @tsv' "${log}" | cut -d: -f1)"
+service_start_line="$(grep -n -m1 -F '/usr/bin/sudo ./svc.sh start' "${log}" | cut -d: -f1)"
+[ "${binding_line}" -lt "${service_start_line}" ]
 
 status_output="${tmp}/status.out"
 run_helper status > "${status_output}"
@@ -161,6 +171,7 @@ run_helper unroute > /dev/null
 [ "$(cat "${routing}")" = ubuntu-24.04 ]
 
 binding_output="${tmp}/binding.out"
+service_starts_before="$(grep -c -F '/usr/bin/sudo ./svc.sh start' "${log}")"
 set +e
 TRUSTED_RUNNER_TEST_GITHUB_BINDING=foreign \
   run_helper route > "${binding_output}" 2>&1
@@ -168,12 +179,47 @@ binding_status=$?
 set -e
 [ "${binding_status}" -ne 0 ]
 [ "$(cat "${routing}")" = ubuntu-24.04 ]
-grep -F 'did not become online' "${binding_output}" >/dev/null
+grep -F 'not bound to the exact Quarry runner' "${binding_output}" >/dev/null
+[ "$(grep -c -F '/usr/bin/sudo ./svc.sh start' "${log}")" = "${service_starts_before}" ]
 
 run_helper route > /dev/null
 [ "$(cat "${routing}")" = quarry-trusted-local ]
 
+absent_remove_output="${tmp}/remove-absent.out"
+set +e
+TRUSTED_RUNNER_TEST_INSTANCE_EXISTS=0 \
+  run_helper remove > "${absent_remove_output}" 2>&1
+absent_remove_status=$?
+set -e
+[ "${absent_remove_status}" -ne 0 ]
+grep -F 'exact runner removal cannot be proven' "${absent_remove_output}" >/dev/null
+if grep -F 'state=removed' "${absent_remove_output}" >/dev/null; then
+  printf 'absent instance was reported as removed\n' >&2
+  exit 1
+fi
+[ -f "${configured}" ]
+
+run_helper route > /dev/null
+
+foreign_remove_output="${tmp}/remove-foreign.out"
+service_stops_before="$(grep -c -F '/usr/bin/sudo ./svc.sh stop' "${log}" || true)"
+autostart_disables_before="$(grep -c -F 'autostart disable --tty=false smolrunner' "${log}" || true)"
+set +e
+TRUSTED_RUNNER_TEST_GITHUB_BINDING=foreign \
+  run_helper remove > "${foreign_remove_output}" 2>&1
+foreign_remove_status=$?
+set -e
+[ "${foreign_remove_status}" -ne 0 ]
+grep -F 'not bound to the exact Quarry runner' "${foreign_remove_output}" >/dev/null
+[ "$(grep -c -F '/usr/bin/sudo ./svc.sh stop' "${log}" || true)" = "${service_stops_before}" ]
+[ "$(grep -c -F 'autostart disable --tty=false smolrunner' "${log}" || true)" = "${autostart_disables_before}" ]
+[ -f "${configured}" ]
+
+run_helper route > /dev/null
+
 failed_remove_output="${tmp}/remove-failed.out"
+removal_tokens_before="$(grep -c -F 'actions/runners/remove-token' "${log}" || true)"
+service_stops_before="$(grep -c -F '/usr/bin/sudo ./svc.sh stop' "${log}" || true)"
 set +e
 TRUSTED_RUNNER_TEST_AUTOSTART_DISABLE_STATUS=7 \
   run_helper remove > "${failed_remove_output}" 2>&1
@@ -184,6 +230,9 @@ if grep -F 'state=removed' "${failed_remove_output}" >/dev/null; then
   printf 'failed autostart disable was reported as removed\n' >&2
   exit 1
 fi
+[ -f "${configured}" ]
+[ "$(grep -c -F 'actions/runners/remove-token' "${log}" || true)" = "${removal_tokens_before}" ]
+[ "$(grep -c -F '/usr/bin/sudo ./svc.sh stop' "${log}" || true)" = "${service_stops_before}" ]
 
 remove_output="${tmp}/remove.out"
 run_helper remove > "${remove_output}"
@@ -195,7 +244,9 @@ grep -F 'vm_disk=preserved caches=preserved' "${remove_output}" >/dev/null
 for secret in registration-secret removal-secret; do
   if grep -F "${secret}" \
     "${log}" "${install_output}" "${status_output}" \
-    "${binding_output}" "${failed_remove_output}" "${remove_output}" >/dev/null; then
+    "${binding_output}" "${absent_remove_output}" \
+    "${foreign_remove_output}" "${failed_remove_output}" \
+    "${remove_output}" >/dev/null; then
     printf 'one-time token escaped into observable output: %s\n' "${secret}" >&2
     exit 1
   fi

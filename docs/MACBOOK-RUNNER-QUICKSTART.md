@@ -20,6 +20,12 @@ report the exact runner online before routing jobs. The one-time GitHub token is
 piped to the guest over stdin and is not placed in the host process arguments,
 environment, filesystem, or output.
 
+Every service start, stop, or uninstall first requires the guest's numeric
+runner ID, fixed name, operating system, architecture, and labels to match the
+exact Quarry repository registration returned by GitHub. Removal refuses an
+absent VM or absent guest registration instead of guessing that cleanup already
+completed.
+
 Temporarily route common Quarry jobs back to GitHub-hosted Linux without deleting
 anything:
 

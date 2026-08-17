@@ -89,6 +89,30 @@ EOF_IDENTITY
   printf '%s\n' "${configured_id}"
 }
 
+require_github_binding() {
+  local configured_id observation observed_id observed_state observed_busy
+  configured_id="$(configured_runner_id)"
+  observation="$(
+    gh api "repos/${repository}/actions/runners" \
+      --jq ".runners[] | select( \
+        .id == ${configured_id} and \
+        .name == \"${runner_name}\" and \
+        .os == \"Linux\" and \
+        ([.labels[].name] | index(\"ARM64\")) != null and \
+        ([.labels[].name] | index(\"${runner_label}\")) != null and \
+        ([.labels[].name] | index(\"${pilot_label}\")) != null \
+      ) | [.id, .status, .busy] | @tsv"
+  )" || die 'unable to observe the GitHub runner binding'
+  [ -n "${observation}" ] \
+    || die 'the configured guest runner is not bound to the exact Quarry runner'
+  IFS=$'\t' read -r observed_id observed_state observed_busy <<EOF_RUNNER
+${observation}
+EOF_RUNNER
+  [ "${observed_id}" = "${configured_id}" ] \
+    || die 'the GitHub runner binding changed during observation'
+  printf '%s\n' "${configured_id}"
+}
+
 install_runner_package() {
   limactl shell "${instance}" -- \
     /usr/bin/env \
@@ -174,9 +198,9 @@ fi
 }
 
 wait_until_online() {
-  local attempt configured_id state
+  local configured_id="$1"
+  local attempt state
   for attempt in $(seq 1 15); do
-    configured_id="$(configured_runner_id)"
     state="$(
       gh api "repos/${repository}/actions/runners" \
         --jq ".runners[] | select( \
@@ -207,17 +231,18 @@ unroute_jobs() {
 }
 
 install() {
+  local configured_id
   start_instance
   if runner_is_configured; then
-    configured_runner_id >/dev/null
+    configured_id="$(require_github_binding)"
   else
     install_runner_package
     register_runner
-    configured_runner_id >/dev/null
+    configured_id="$(require_github_binding)"
   fi
   start_runner_service
   limactl autostart enable --condition=login --tty=false "${instance}"
-  wait_until_online
+  wait_until_online "${configured_id}"
   route_jobs
   printf 'runner=%s state=online vm=%s persistence=enabled caches=preserved\n' \
     "${runner_name}" "${instance}"
@@ -262,14 +287,26 @@ EOF_RUNNER
 }
 
 remove_runner() {
-  local removal_token
+  local configured_id removal_token
   unroute_jobs
-  if instance_exists; then
-    start_instance
-    if runner_is_configured; then
-      configured_runner_id >/dev/null
-      limactl shell "${instance}" -- \
-        /usr/bin/env RUNNER_DIR="${runner_dir}" /usr/bin/bash -c '
+  instance_exists \
+    || die 'the Lima instance is absent; exact runner removal cannot be proven'
+  start_instance
+  runner_is_configured \
+    || die 'the guest runner configuration is absent; exact removal cannot be proven'
+  configured_id="$(require_github_binding)"
+  [ -n "${configured_id}" ] || die 'the exact GitHub runner binding is unavailable'
+
+  # Disable automatic VM restart while the exact local and GitHub identities
+  # are still available for a safe retry if the host operation fails.
+  if [ -e "${autostart_plist}" ]; then
+    limactl autostart disable --tty=false "${instance}"
+  fi
+  [ ! -e "${autostart_plist}" ] \
+    || die 'Lima autostart remained installed after removal'
+
+  limactl shell "${instance}" -- \
+    /usr/bin/env RUNNER_DIR="${runner_dir}" /usr/bin/bash -c '
 set -euo pipefail
 cd "${RUNNER_DIR}"
 unit="/etc/systemd/system/actions.runner.Quarry-Labs-quarry.quarry-trusted-mac-arm64.service"
@@ -278,28 +315,21 @@ if /usr/bin/sudo /usr/bin/test -f "${unit}"; then
   /usr/bin/sudo ./svc.sh uninstall
 fi
 '
-      removal_token="$(
-        gh api --method POST \
-          "repos/${repository}/actions/runners/remove-token" \
-          --jq .token
-      )" || die 'unable to obtain a one-time runner removal token'
-      printf '%s\n' "${removal_token}" | \
-        limactl shell "${instance}" -- \
-          /usr/bin/env RUNNER_DIR="${runner_dir}" /usr/bin/bash -c '
+  removal_token="$(
+    gh api --method POST \
+      "repos/${repository}/actions/runners/remove-token" \
+      --jq .token
+  )" || die 'unable to obtain a one-time runner removal token'
+  printf '%s\n' "${removal_token}" | \
+    limactl shell "${instance}" -- \
+      /usr/bin/env RUNNER_DIR="${runner_dir}" /usr/bin/bash -c '
 set -euo pipefail
 IFS= read -r removal_token
 cd "${RUNNER_DIR}"
 ./config.sh remove --token "${removal_token}"
 unset removal_token
 '
-      unset removal_token
-    fi
-    if [ -e "${autostart_plist}" ]; then
-      limactl autostart disable --tty=false "${instance}"
-    fi
-    [ ! -e "${autostart_plist}" ] \
-      || die 'Lima autostart remained installed after removal'
-  fi
+  unset removal_token
   printf 'runner=%s state=removed vm_disk=preserved caches=preserved\n' "${runner_name}"
 }
 
@@ -311,7 +341,13 @@ require_command gh
 case "${1:-}" in
   install) install ;;
   status) status ;;
-  route) start_instance; start_runner_service; wait_until_online; route_jobs ;;
+  route)
+    start_instance
+    configured_id="$(require_github_binding)"
+    start_runner_service
+    wait_until_online "${configured_id}"
+    route_jobs
+    ;;
   unroute) unroute_jobs ;;
   remove) remove_runner ;;
   help|-h|--help|'') usage ;;
