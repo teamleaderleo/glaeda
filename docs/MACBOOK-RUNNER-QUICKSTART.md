@@ -55,15 +55,24 @@ reuses the existing registration and warm disk, restores both scheduling labels,
 re-enables login autostart, waits for the exact runner online, and routes Quarry
 back locally.
 
-The first comparable Quarry `pr-check` measurement on 2026-08-17 took 169
-seconds on `ubuntu-24.04` and 26 seconds on the warm trusted runner: a 6.5x job
-speedup. End-to-end workflow wall time was 173 seconds hosted versus 33 seconds
-local, a 5.2x speedup. The warm and cold focused pilots completed in 21 and 63
-seconds respectively. The final all-label-drained physical idle pause completed
-in 10.17 seconds and a warm resume through label restoration and exact
-GitHub-online confirmation completed in 16.76 seconds; the paused check showed
-no remaining Lima/VZ process. These are observed
-single-run measurements, not promised service levels.
+An early 26-second warm-runner control on 2026-08-17 had no changed pytest
+scope, so it is not workload evidence and must not be compared with a hosted
+pull-request run. The first exact same-SHA, same-workflow comparison used Quarry
+head `2efb636f653d52ea5f0fe7c66a4bf9762d33bc6c`: the warm trusted runner passed
+2,107 tests in 34.54 seconds and completed the job in 66 seconds; hosted
+`ubuntu-24.04` passed the same 2,107 tests in 96.47 seconds and completed the
+job in 133 seconds. That is a 2.79x pytest speedup and a 2.02x whole-job
+speedup for this single run.
+
+A second exact comparison on verifier-control head
+`f4a60a1c62c4524acd644c28f404d189ebff4326` passed 2,093 tests in 50.00
+seconds on the trusted runner versus 144.93 seconds hosted, while the whole
+jobs took 84 and 188 seconds respectively. Warm resume from a stopped VM took
+17.63 seconds in the ordinary comparison; adding that wake to the 66-second
+job still finished before the 133-second hosted job. The all-label-drained
+physical pauses completed in about nine seconds and left no running Lima/VZ
+process. These are observed single-run measurements, not promised service
+levels; use repeated medians before making capacity or service-level claims.
 
 ## Automatic idle-stop (auto-idle)
 
