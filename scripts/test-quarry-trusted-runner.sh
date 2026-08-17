@@ -174,7 +174,46 @@ case "${1:-}" in
 esac
 STUB
 
-chmod +x "${bin}/uname" "${bin}/gh" "${bin}/limactl"
+cat > "${bin}/launchctl" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'launchctl %s\n' "$*" >> "${TRUSTED_RUNNER_TEST_LOG}"
+case "${1:-}" in
+  print)
+    target="${2:-}"
+    if [ -f "${TRUSTED_RUNNER_TEST_LAUNCHD_LOADED:-}" ]; then
+      printf 'state = running\n'
+    else
+      exit 113
+    fi
+    ;;
+  bootstrap)
+    domain="${2:-}"
+    plist="${3:-}"
+    [ -f "${plist}" ] || exit 1
+    : > "${TRUSTED_RUNNER_TEST_LAUNCHD_LOADED}"
+    ;;
+  bootout)
+    target="${2:-}"
+    rm -f -- "${TRUSTED_RUNNER_TEST_LAUNCHD_LOADED:-}"
+    ;;
+  load)
+    plist="${2:-}"
+    [ -f "${plist}" ] || exit 1
+    : > "${TRUSTED_RUNNER_TEST_LAUNCHD_LOADED}"
+    ;;
+  unload)
+    plist="${2:-}"
+    rm -f -- "${TRUSTED_RUNNER_TEST_LAUNCHD_LOADED:-}"
+    ;;
+  *)
+    printf 'unexpected launchctl invocation: %s\n' "$*" >&2
+    exit 96
+    ;;
+esac
+STUB
+
+chmod +x "${bin}/uname" "${bin}/gh" "${bin}/limactl" "${bin}/launchctl"
 
 cat > "${bin}/sleep" <<'STUB'
 #!/usr/bin/env bash
@@ -182,9 +221,14 @@ exit 0
 STUB
 chmod +x "${bin}/sleep"
 
+launchd_loaded="${state}/launchd-loaded"
+autoidle_state="${state}/autoidle.state"
+
 run_helper() {
   PATH="${bin}:/usr/bin:/bin" \
     HOME="${home}" \
+    LAUNCHCTL="${bin}/launchctl" \
+    SMOLRUNNER_QUARRY_AUTOIDLE_STATE="${autoidle_state}" \
     TRUSTED_RUNNER_TEST_LOG="${log}" \
     TRUSTED_RUNNER_TEST_CONFIGURED="${configured}" \
     TRUSTED_RUNNER_TEST_ROUTING="${routing}" \
@@ -193,6 +237,7 @@ run_helper() {
     TRUSTED_RUNNER_TEST_SCHEDULING_LABEL="${scheduling_label}" \
     TRUSTED_RUNNER_TEST_PILOT_SCHEDULING_LABEL="${pilot_scheduling_label}" \
     TRUSTED_RUNNER_TEST_BUSY_LATCHED="${busy_latched}" \
+    TRUSTED_RUNNER_TEST_LAUNCHD_LOADED="${launchd_loaded}" \
     bash "${helper}" "$@"
 }
 
@@ -348,6 +393,135 @@ run_helper remove > "${remove_output}"
 grep -F 'autostart disable --tty=false smolrunner' "${log}" >/dev/null
 grep -F 'vm_disk=preserved caches=preserved' "${remove_output}" >/dev/null
 
+# Re-install runner to test autoidle lifecycle
+autoidle_install_output="${tmp}/autoidle-install.out"
+run_helper install > "${autoidle_install_output}"
+[ -f "${running}" ]
+[ -f "${configured}" ]
+[ "$(cat "${routing}")" = quarry-trusted-local ]
+
+autoidle_enable_output="${tmp}/autoidle-enable.out"
+run_helper autoidle-enable > "${autoidle_enable_output}"
+grep -F 'autoidle=enabled timeout=900s vm=smolrunner' "${autoidle_enable_output}" >/dev/null
+plist_file="${home}/Library/LaunchAgents/io.smolrunner.quarry-autoidle.smolrunner.plist"
+[ -f "${plist_file}" ]
+grep -F '<string>io.smolrunner.quarry-autoidle.smolrunner</string>' "${plist_file}" >/dev/null
+grep -F '<string>autoidle-daemon</string>' "${plist_file}" >/dev/null
+grep -F '<key>KeepAlive</key>' "${plist_file}" >/dev/null
+[ -f "${launchd_loaded}" ]
+
+# Idempotent enable test
+run_helper autoidle-enable > /dev/null
+[ -f "${plist_file}" ]
+[ -f "${launchd_loaded}" ]
+
+# Autoidle status test
+autoidle_status_output="${tmp}/autoidle-status.out"
+run_helper autoidle-status > "${autoidle_status_output}"
+grep -F 'autoidle=enabled timeout=900s elapsed=0s' "${autoidle_status_output}" >/dev/null
+grep -F 'vm=smolrunner state=Running' "${autoidle_status_output}" >/dev/null
+grep -F 'runner=quarry-trusted-mac-arm64 state=online busy=false' "${autoidle_status_output}" >/dev/null
+grep -F 'runner_schedulable=true' "${autoidle_status_output}" >/dev/null
+grep -F 'routing=quarry-trusted-local' "${autoidle_status_output}" >/dev/null
+
+# 1. Under threshold: ticks do not invoke pause
+run_helper autoidle-tick 300
+[ -f "${running}" ]
+[ -f "${service_active}" ]
+[ "$(cat "${routing}")" = quarry-trusted-local ]
+status_300="${tmp}/status-300.out"
+run_helper autoidle-status > "${status_300}"
+grep -F 'autoidle=enabled timeout=900s elapsed=300s' "${status_300}" >/dev/null
+
+run_helper autoidle-tick 300
+status_600="${tmp}/status-600.out"
+run_helper autoidle-status > "${status_600}"
+grep -F 'autoidle=enabled timeout=900s elapsed=600s' "${status_600}" >/dev/null
+[ -f "${running}" ]
+[ "$(cat "${routing}")" = quarry-trusted-local ]
+
+# 2. Busy resets the timer
+status_busy="${tmp}/status-busy.out"
+TRUSTED_RUNNER_TEST_BUSY=true run_helper autoidle-tick 15
+run_helper autoidle-status > "${status_busy}"
+grep -F 'autoidle=enabled timeout=900s elapsed=0s' "${status_busy}" >/dev/null
+grep -F 'runner=quarry-trusted-mac-arm64 state=online busy=false' "${status_busy}" >/dev/null
+[ -f "${running}" ]
+[ "$(cat "${routing}")" = quarry-trusted-local ]
+
+# Accumulate to 600s again after busy reset
+run_helper autoidle-tick 600
+status_resumed="${tmp}/status-resumed.out"
+run_helper autoidle-status > "${status_resumed}"
+grep -F 'autoidle=enabled timeout=900s elapsed=600s' "${status_resumed}" >/dev/null
+[ -f "${running}" ]
+
+# 3. Exact threshold invokes pause once
+pauses_before="$(grep -c -F 'limactl stop --tty=false smolrunner' "${log}" || true)"
+run_helper autoidle-tick 300 # 600 + 300 = 900s threshold reached
+[ ! -f "${running}" ]
+[ ! -f "${service_active}" ]
+[ "$(cat "${routing}")" = ubuntu-24.04 ]
+[ "$(grep -c -F 'limactl stop --tty=false smolrunner' "${log}")" = "$(( pauses_before + 1 ))" ]
+
+status_paused="${tmp}/status-paused.out"
+run_helper autoidle-status > "${status_paused}"
+grep -F 'autoidle=enabled timeout=900s elapsed=0s' "${status_paused}" >/dev/null
+grep -F 'vm=smolrunner state=Stopped' "${status_paused}" >/dev/null
+grep -F 'routing=ubuntu-24.04' "${status_paused}" >/dev/null
+
+# 4. Hosted / stopped quiescence (zero gh api calls while stopped)
+gh_calls_before="$(grep -c -F 'gh api' "${log}" || true)"
+run_helper autoidle-tick 15
+run_helper autoidle-tick 15
+gh_calls_after="$(grep -c -F 'gh api' "${log}" || true)"
+[ "${gh_calls_before}" = "${gh_calls_after}" ]
+[ "$(grep -c -F 'limactl stop --tty=false smolrunner' "${log}")" = "$(( pauses_before + 1 ))" ]
+
+# 5. Busy race during pause retries gracefully
+run_helper resume > /dev/null
+[ -f "${running}" ]
+[ "$(cat "${routing}")" = quarry-trusted-local ]
+run_helper autoidle-tick 885
+status_885="${tmp}/status-885.out"
+run_helper autoidle-status > "${status_885}"
+grep -F 'autoidle=enabled timeout=900s elapsed=885s' "${status_885}" >/dev/null
+
+pauses_before="$(grep -c -F 'limactl stop --tty=false smolrunner' "${log}" || true)"
+TRUSTED_RUNNER_TEST_PILOT_ASSIGN_AFTER_COMMON_DRAIN=1 \
+  run_helper autoidle-tick 15
+[ -f "${running}" ]
+[ -f "${service_active}" ]
+[ "$(grep -c -F 'limactl stop --tty=false smolrunner' "${log}")" = "${pauses_before}" ]
+
+rm -f -- "${busy_latched}"
+run_helper route > /dev/null
+
+run_helper autoidle-tick 900
+[ ! -f "${running}" ]
+[ "$(cat "${routing}")" = ubuntu-24.04 ]
+[ "$(grep -c -F 'limactl stop --tty=false smolrunner' "${log}")" = "$(( pauses_before + 1 ))" ]
+
+# 6. Disable/uninstall is idempotent and preserves VM disk, caches, and registration
+run_helper autoidle-disable > /dev/null
+[ ! -f "${plist_file}" ]
+[ ! -f "${launchd_loaded}" ]
+[ -f "${configured}" ]
+
+run_helper autoidle-disable > /dev/null
+[ ! -f "${plist_file}" ]
+[ ! -f "${launchd_loaded}" ]
+[ -f "${configured}" ]
+
+autoidle_disabled_status="${tmp}/autoidle-disabled-status.out"
+run_helper autoidle-status > "${autoidle_disabled_status}"
+grep -F 'autoidle=disabled timeout=900s elapsed=0s' "${autoidle_disabled_status}" >/dev/null
+
+# Clean removal
+final_remove_output="${tmp}/final-remove.out"
+run_helper remove > "${final_remove_output}"
+[ ! -e "${configured}" ]
+
 for secret in registration-secret removal-secret; do
   if grep -F "${secret}" \
     "${log}" "${install_output}" "${status_output}" \
@@ -355,7 +529,11 @@ for secret in registration-secret removal-secret; do
     "${stopped_pause_output}" \
     "${resume_output}" "${absent_remove_output}" \
     "${foreign_remove_output}" "${failed_remove_output}" \
-    "${remove_output}" >/dev/null; then
+    "${remove_output}" "${autoidle_install_output}" \
+    "${autoidle_enable_output}" "${autoidle_status_output}" \
+    "${status_300}" "${status_600}" "${status_busy}" \
+    "${status_resumed}" "${status_paused}" "${status_885}" \
+    "${autoidle_disabled_status}" "${final_remove_output}" >/dev/null; then
     printf 'one-time token escaped into observable output: %s\n' "${secret}" >&2
     exit 1
   fi

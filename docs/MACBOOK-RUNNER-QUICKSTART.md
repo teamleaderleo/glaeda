@@ -65,6 +65,29 @@ GitHub-online confirmation completed in 16.76 seconds; the paused check showed
 no remaining Lima/VZ process. These are observed
 single-run measurements, not promised service levels.
 
+## Automatic idle-stop (auto-idle)
+
+Automatically release the VM's memory after 15 continuous idle minutes while preserving its disk, toolchains, caches, and registration:
+
+```bash
+make quarry-runner-autoidle-enable
+make quarry-runner-autoidle-status
+```
+
+The auto-idle layer runs as an unprivileged user-level macOS `launchd` service (`io.smolrunner.quarry-autoidle.smolrunner`). While Quarry CI jobs are active (`busy=true`), the continuous idle timer resets. When the runner has been continuously idle for 15 minutes, auto-idle invokes the reviewed `pause` primitive, which unroutes new work, drains both scheduling labels, verifies the runner is idle, stops the guest service, and stops the VM.
+
+Quarry workflows automatically fall back to GitHub-hosted Linux (`ubuntu-24.04`) while the VM is stopped. There is no automatic demand wake: ordinary work stays hosted until you explicitly resume the local runner:
+
+```bash
+make quarry-runner-resume
+```
+
+Disable auto-idle without removing the VM, runner registration, or caches:
+
+```bash
+make quarry-runner-autoidle-disable
+```
+
 Remove the registration and autostart while deliberately preserving the VM disk,
 workspace, toolchains, and caches:
 

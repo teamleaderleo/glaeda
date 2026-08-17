@@ -14,19 +14,28 @@ runner_size="138824064"
 runner_sha256="58b758e420b87093fbd4bfddd368074960053e2f1388f01848c82624b90f27d1"
 hosted_fallback="ubuntu-24.04"
 autostart_plist="${HOME}/Library/LaunchAgents/io.lima-vm.autostart.${instance}.plist"
+autoidle_label="io.smolrunner.quarry-autoidle.${instance}"
+autoidle_plist="${HOME}/Library/LaunchAgents/${autoidle_label}.plist"
+autoidle_timeout="${SMOLRUNNER_QUARRY_IDLE_TIMEOUT:-900}"
+autoidle_state="${SMOLRUNNER_QUARRY_AUTOIDLE_STATE:-${HOME}/Library/LaunchAgents/.${autoidle_label}.state}"
+launchctl_cmd="${LAUNCHCTL:-$(command -v launchctl 2>/dev/null || printf '/bin/launchctl')}"
 
 usage() {
   cat <<'USAGE'
 Usage: bash scripts/quarry-trusted-runner.sh COMMAND
 
 Commands:
-  install   Install/start the persistent Quarry runner and route Quarry CI to it.
-  status    Show the VM, guest service, GitHub runner, and routing state.
-  route     Route Quarry's common Linux jobs to the trusted runner.
-  unroute   Route Quarry's common Linux jobs back to GitHub-hosted Linux.
-  pause     Route to hosted, stop the idle VM, and preserve its disk/caches.
-  resume    Start the warm VM and route Quarry back to the trusted runner.
-  remove    Unroute, unregister, and disable autostart; preserve VM disk/caches.
+  install           Install/start the persistent Quarry runner and route Quarry CI to it.
+  status            Show the VM, guest service, GitHub runner, and routing state.
+  route             Route Quarry's common Linux jobs to the trusted runner.
+  unroute           Route Quarry's common Linux jobs back to GitHub-hosted Linux.
+  pause             Route to hosted, stop the idle VM, and preserve its disk/caches.
+  resume            Start the warm VM and route Quarry back to the trusted runner.
+  remove            Unroute, unregister, and disable autostart; preserve VM disk/caches.
+  autoidle-enable   Enable automatic idle stop LaunchAgent after continuous idle timeout.
+  autoidle-disable  Disable automatic idle stop LaunchAgent without removing VM or caches.
+  autoidle-status   Show autoidle LaunchAgent enablement, elapsed idle time, and runner state.
+
 
 This lane is for operator-trusted Quarry jobs. It preserves the VM, workspace,
 toolchains, package caches, and Actions caches between jobs for minimum latency.
@@ -426,17 +435,240 @@ EOF_RUNNER
     fi
   fi
 
+  local is_enabled="disabled"
+  local elapsed
+  elapsed="$(load_autoidle_elapsed)"
+  if [ -f "${autoidle_plist}" ]; then
+    is_enabled="enabled"
+  fi
+
   printf 'vm=%s state=%s\n' "${instance}" "${vm_state:-unknown}"
   printf 'runner=%s state=%s busy=%s\n' \
     "${runner_name}" "${runner_state:-absent}" "${runner_busy:-unknown}"
   printf 'runner_schedulable=%s\n' "${runner_schedulable}"
   printf 'routing=%s\n' "${routing:-unset}"
+  printf 'autoidle=%s timeout=%ss elapsed=%ss\n' "${is_enabled}" "${autoidle_timeout}" "${elapsed}"
 
   if [ "${runner_state}" != absent ]; then
     limactl shell "${instance}" -- \
       /usr/bin/systemctl is-active \
         actions.runner.Quarry-Labs-quarry.quarry-trusted-mac-arm64.service
   fi
+}
+
+load_autoidle_elapsed() {
+  if [ -f "${autoidle_state}" ]; then
+    local elapsed
+    elapsed="$(grep -E '^elapsed=[0-9]+$' "${autoidle_state}" 2>/dev/null | cut -d= -f2 || true)"
+    if [ -n "${elapsed}" ]; then
+      printf '%s\n' "${elapsed}"
+      return 0
+    fi
+  fi
+  printf '0\n'
+}
+
+save_autoidle_state() {
+  local elapsed="$1"
+  local last_status="$2"
+  local state_dir tmp_state
+  state_dir="$(dirname "${autoidle_state}")"
+  mkdir -p "${state_dir}"
+  tmp_state="${autoidle_state}.next.$$"
+  printf 'elapsed=%s\nlast_status=%s\n' "${elapsed}" "${last_status}" > "${tmp_state}"
+  chmod 0600 "${tmp_state}"
+  mv "${tmp_state}" "${autoidle_state}"
+}
+
+write_autoidle_plist() {
+  local target="$1"
+  local script_path="$2"
+  local tmp_plist="${target}.next.$$"
+  mkdir -p "$(dirname "${target}")"
+  cat > "${tmp_plist}" <<EOF_PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>${autoidle_label}</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>${script_path}</string>
+		<string>autoidle-daemon</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>StandardOutPath</key>
+	<string>/dev/null</string>
+	<key>StandardErrorPath</key>
+	<string>/dev/null</string>
+</dict>
+</plist>
+EOF_PLIST
+  chmod 0644 "${tmp_plist}"
+  mv "${tmp_plist}" "${target}"
+}
+
+autoidle_enable() {
+  local script_path
+  script_path="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/$(basename -- "${BASH_SOURCE[0]}")"
+  [ -f "${script_path}" ] || die 'unable to locate quarry-trusted-runner.sh script'
+
+  write_autoidle_plist "${autoidle_plist}" "${script_path}"
+  [ -f "${autoidle_plist}" ] || die 'failed to create autoidle LaunchAgent property list'
+
+  local uid
+  uid="$(id -u)"
+  if "${launchctl_cmd}" print "gui/${uid}/${autoidle_label}" >/dev/null 2>&1; then
+    "${launchctl_cmd}" bootout "gui/${uid}/${autoidle_label}" >/dev/null 2>&1 || true
+  fi
+  "${launchctl_cmd}" bootstrap "gui/${uid}" "${autoidle_plist}" 2>/dev/null \
+    || "${launchctl_cmd}" load "${autoidle_plist}" 2>/dev/null \
+    || die 'unable to bootstrap autoidle LaunchAgent with launchctl'
+
+  printf 'autoidle=enabled timeout=%ss vm=%s\n' "${autoidle_timeout}" "${instance}"
+}
+
+autoidle_disable() {
+  local uid
+  uid="$(id -u)"
+  if "${launchctl_cmd}" print "gui/${uid}/${autoidle_label}" >/dev/null 2>&1; then
+    "${launchctl_cmd}" bootout "gui/${uid}/${autoidle_label}" >/dev/null 2>&1 || true
+  elif [ -e "${autoidle_plist}" ]; then
+    "${launchctl_cmd}" unload "${autoidle_plist}" 2>/dev/null || true
+  fi
+  rm -f -- "${autoidle_plist}" "${autoidle_state}"
+  [ ! -e "${autoidle_plist}" ] || die 'autoidle LaunchAgent property list remained after disable'
+  printf 'autoidle=disabled vm=%s\n' "${instance}"
+}
+
+autoidle_status() {
+  local is_enabled="disabled"
+  local elapsed
+  elapsed="$(load_autoidle_elapsed)"
+  if [ -f "${autoidle_plist}" ]; then
+    is_enabled="enabled"
+  fi
+
+  local configured_id observed_id runner_observation vm_state routing
+  local runner_state runner_busy runner_schedulable
+  local common_label pilot_label_state
+  vm_state="$(limactl list --format '{{.Status}}' "${instance}" 2>/dev/null || true)"
+  routing="$(gh variable get CI_LINUX_RUNNER --repo "${repository}" 2>/dev/null || true)"
+  runner_state=absent
+  runner_busy=unknown
+  runner_schedulable=unknown
+  if instance_running && runner_is_configured; then
+    configured_id="$(configured_runner_id 2>/dev/null || true)"
+    if [ -n "${configured_id}" ]; then
+      runner_observation="$(observe_github_runner "${configured_id}" 2>/dev/null || true)"
+      if [ -n "${runner_observation}" ]; then
+        IFS=$'\t' read -r \
+          observed_id runner_state runner_busy \
+          common_label pilot_label_state <<EOF_RUNNER
+${runner_observation}
+EOF_RUNNER
+        if [ "${common_label}" = true ] || [ "${pilot_label_state}" = true ]; then
+          runner_schedulable=true
+        else
+          runner_schedulable=false
+        fi
+      fi
+    fi
+  fi
+
+  printf 'autoidle=%s timeout=%ss elapsed=%ss\n' "${is_enabled}" "${autoidle_timeout}" "${elapsed}"
+  printf 'vm=%s state=%s\n' "${instance}" "${vm_state:-unknown}"
+  printf 'runner=%s state=%s busy=%s\n' \
+    "${runner_name}" "${runner_state:-absent}" "${runner_busy:-unknown}"
+  printf 'runner_schedulable=%s\n' "${runner_schedulable}"
+  printf 'routing=%s\n' "${routing:-unset}"
+}
+
+autoidle_tick() {
+  local step_seconds="${1:-15}"
+  if ! instance_running; then
+    # VM is stopped: quiescent state, do not issue GitHub API calls.
+    save_autoidle_state 0 "stopped"
+    return 0
+  fi
+
+  if ! runner_is_configured; then
+    save_autoidle_state 0 "unconfigured"
+    return 0
+  fi
+
+  local configured_id observation observed_id runner_state runner_busy common_label pilot_label_state
+  configured_id="$(configured_runner_id 2>/dev/null || true)"
+  if [ -z "${configured_id}" ]; then
+    save_autoidle_state 0 "unidentified"
+    return 0
+  fi
+
+  observation="$(observe_github_runner "${configured_id}" 2>/dev/null || true)"
+  if [ -z "${observation}" ]; then
+    save_autoidle_state 0 "unobserved"
+    return 0
+  fi
+
+  local IFS=$'\t'
+  read -r \
+    observed_id runner_state runner_busy common_label pilot_label_state <<EOF_RUNNER
+${observation}
+EOF_RUNNER
+
+  if [ "${runner_busy}" = true ]; then
+    # Busy -> reset idle timer immediately.
+    save_autoidle_state 0 "busy"
+    return 0
+  fi
+
+  if [ "${runner_state}" = online ] && { [ "${common_label}" = true ] || [ "${pilot_label_state}" = true ]; }; then
+    # Online, schedulable, and not busy.
+    local elapsed
+    elapsed="$(load_autoidle_elapsed)"
+    elapsed=$(( elapsed + step_seconds ))
+    if [ "${elapsed}" -ge "${autoidle_timeout}" ]; then
+      if ( pause ) >/dev/null 2>&1; then
+        save_autoidle_state 0 "paused"
+      else
+        # Pause busy race is expected and retried without stopping outside pause primitive.
+        save_autoidle_state 0 "pause_retry"
+      fi
+    else
+      save_autoidle_state "${elapsed}" "idle"
+    fi
+  else
+    # Runner is not schedulable or already unrouted / drained.
+    save_autoidle_state 0 "unscheduled"
+  fi
+}
+
+autoidle_daemon() {
+  local poll_interval="${SMOLRUNNER_QUARRY_POLL_INTERVAL:-15}"
+  local quiescent_interval="${SMOLRUNNER_QUARRY_QUIESCENT_INTERVAL:-60}"
+  local current_interval
+  while true; do
+    if instance_running; then
+      current_interval="${poll_interval}"
+      autoidle_tick "${current_interval}" || true
+    else
+      current_interval="${quiescent_interval}"
+      save_autoidle_state 0 "stopped"
+    fi
+    sleep "${current_interval}"
+  done
 }
 
 remove_runner() {
@@ -509,6 +741,11 @@ case "${1:-}" in
   pause) pause ;;
   resume) install ;;
   remove) remove_runner ;;
+  autoidle-enable) autoidle_enable ;;
+  autoidle-disable) autoidle_disable ;;
+  autoidle-status) autoidle_status ;;
+  autoidle-daemon) autoidle_daemon ;;
+  autoidle-tick) autoidle_tick "${2:-15}" ;;
   help|-h|--help|'') usage ;;
   *) die "unknown command: ${1}" ;;
 esac
