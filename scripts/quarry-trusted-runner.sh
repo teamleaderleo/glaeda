@@ -24,6 +24,8 @@ Commands:
   status    Show the VM, guest service, GitHub runner, and routing state.
   route     Route Quarry's common Linux jobs to the trusted runner.
   unroute   Route Quarry's common Linux jobs back to GitHub-hosted Linux.
+  pause     Route to hosted, stop the idle VM, and preserve its disk/caches.
+  resume    Start the warm VM and route Quarry back to the trusted runner.
   remove    Unroute, unregister, and disable autostart; preserve VM disk/caches.
 
 This lane is for operator-trusted Quarry jobs. It preserves the VM, workspace,
@@ -113,6 +115,19 @@ EOF_RUNNER
   printf '%s\n' "${configured_id}"
 }
 
+observe_github_runner() {
+  local configured_id="$1"
+  gh api "repos/${repository}/actions/runners" \
+    --jq ".runners[] | select( \
+      .id == ${configured_id} and \
+      .name == \"${runner_name}\" and \
+      .os == \"Linux\" and \
+      ([.labels[].name] | index(\"ARM64\")) != null and \
+      ([.labels[].name] | index(\"${runner_label}\")) != null and \
+      ([.labels[].name] | index(\"${pilot_label}\")) != null \
+    ) | [.status, .busy] | @tsv"
+}
+
 install_runner_package() {
   limactl shell "${instance}" -- \
     /usr/bin/env \
@@ -197,27 +212,65 @@ fi
 '
 }
 
+stop_runner_service() {
+  limactl shell "${instance}" -- \
+    /usr/bin/env RUNNER_DIR="${runner_dir}" /usr/bin/bash -c '
+set -euo pipefail
+cd "${RUNNER_DIR}"
+unit="/etc/systemd/system/actions.runner.Quarry-Labs-quarry.quarry-trusted-mac-arm64.service"
+if /usr/bin/sudo /usr/bin/test -f "${unit}"; then
+  /usr/bin/sudo ./svc.sh stop
+fi
+'
+}
+
 wait_until_online() {
   local configured_id="$1"
   local attempt state
   for attempt in $(seq 1 15); do
-    state="$(
-      gh api "repos/${repository}/actions/runners" \
-        --jq ".runners[] | select( \
-          .id == ${configured_id} and \
-          .name == \"${runner_name}\" and \
-          .os == \"Linux\" and \
-          ([.labels[].name] | index(\"ARM64\")) != null and \
-          ([.labels[].name] | index(\"${runner_label}\")) != null and \
-          ([.labels[].name] | index(\"${pilot_label}\")) != null \
-        ) | .status"
-    )" || die 'unable to observe the GitHub runner'
+    state="$(observe_github_runner "${configured_id}" | /usr/bin/cut -f 1)" \
+      || die 'unable to observe the GitHub runner'
     if [ "${state}" = online ]; then
       return 0
     fi
     sleep 2
   done
   die 'the trusted runner did not become online within 30 seconds'
+}
+
+require_runner_idle() {
+  local configured_id="$1"
+  local observation state busy
+  observation="$(observe_github_runner "${configured_id}")" \
+    || die 'unable to observe the GitHub runner before pausing'
+  [ -n "${observation}" ] \
+    || die 'the exact GitHub runner disappeared before pausing'
+  IFS=$'\t' read -r state busy <<EOF_RUNNER
+${observation}
+EOF_RUNNER
+  [ "${state}" = online ] \
+    || die 'the exact GitHub runner is not online for a graceful pause'
+  [ "${busy}" = false ] \
+    || die 'the trusted runner is busy; Quarry is routed to hosted and pause can be retried'
+}
+
+wait_until_offline() {
+  local configured_id="$1"
+  local attempt observation state busy
+  for attempt in $(seq 1 15); do
+    observation="$(observe_github_runner "${configured_id}")" \
+      || die 'unable to observe the GitHub runner while pausing'
+    [ -n "${observation}" ] \
+      || die 'the exact GitHub runner disappeared while pausing'
+    IFS=$'\t' read -r state busy <<EOF_RUNNER
+${observation}
+EOF_RUNNER
+    if [ "${state}" = offline ] && [ "${busy}" = false ]; then
+      return 0
+    fi
+    sleep 2
+  done
+  die 'the trusted runner did not become offline within 30 seconds'
 }
 
 route_jobs() {
@@ -245,6 +298,40 @@ install() {
   wait_until_online "${configured_id}"
   route_jobs
   printf 'runner=%s state=online vm=%s persistence=enabled caches=preserved\n' \
+    "${runner_name}" "${instance}"
+}
+
+pause() {
+  local configured_id
+  unroute_jobs
+  instance_exists || die "Lima instance '${instance}' does not exist"
+
+  if ! instance_running; then
+    if [ -e "${autostart_plist}" ]; then
+      limactl autostart disable --tty=false "${instance}"
+    fi
+    [ ! -e "${autostart_plist}" ] \
+      || die 'Lima autostart remained installed while pausing'
+    printf 'runner=%s state=paused vm=%s memory=released caches=preserved\n' \
+      "${runner_name}" "${instance}"
+    return 0
+  fi
+
+  runner_is_configured \
+    || die 'the guest runner configuration is absent; a graceful pause cannot be proven'
+  configured_id="$(require_github_binding)"
+  require_runner_idle "${configured_id}"
+
+  if [ -e "${autostart_plist}" ]; then
+    limactl autostart disable --tty=false "${instance}"
+  fi
+  [ ! -e "${autostart_plist}" ] \
+    || die 'Lima autostart remained installed while pausing'
+  stop_runner_service
+  wait_until_offline "${configured_id}"
+  limactl stop --tty=false "${instance}"
+  instance_running && die 'the Lima instance remained running after pause'
+  printf 'runner=%s state=paused vm=%s memory=released caches=preserved\n' \
     "${runner_name}" "${instance}"
 }
 
@@ -349,6 +436,8 @@ case "${1:-}" in
     route_jobs
     ;;
   unroute) unroute_jobs ;;
+  pause) pause ;;
+  resume) install ;;
   remove) remove_runner ;;
   help|-h|--help|'') usage ;;
   *) die "unknown command: ${1}" ;;

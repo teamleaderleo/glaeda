@@ -13,7 +13,10 @@ mkdir -p "${bin}" "${state}" "${home}/Library/LaunchAgents"
 log="${state}/commands.log"
 configured="${state}/configured"
 routing="${state}/routing"
+running="${state}/running"
+service_active="${state}/service-active"
 : > "${log}"
+: > "${running}"
 printf 'ubuntu-24.04\n' > "${routing}"
 
 cat > "${bin}/uname" <<'STUB'
@@ -34,12 +37,17 @@ case "$*" in
     ;;
   *'actions/runners --jq '*'.id == 22'*'[.id, .status, .busy] | @tsv'*)
     if [ "${TRUSTED_RUNNER_TEST_GITHUB_BINDING:-exact}" = exact ]; then
-      printf '22\tonline\tfalse\n'
+      runner_state=offline
+      [ ! -f "${TRUSTED_RUNNER_TEST_SERVICE_ACTIVE}" ] || runner_state=online
+      printf '22\t%s\t%s\n' \
+        "${runner_state}" "${TRUSTED_RUNNER_TEST_BUSY:-false}"
     fi
     ;;
   *'actions/runners --jq '*'.id == 22'*'[.status, .busy] | @tsv'*)
     if [ "${TRUSTED_RUNNER_TEST_GITHUB_BINDING:-exact}" = exact ]; then
-      printf 'online\tfalse\n'
+      runner_state=offline
+      [ ! -f "${TRUSTED_RUNNER_TEST_SERVICE_ACTIVE}" ] || runner_state=online
+      printf '%s\t%s\n' "${runner_state}" "${TRUSTED_RUNNER_TEST_BUSY:-false}"
     fi
     ;;
   *'actions/runners --jq '*'.id == 22'*'.status'*)
@@ -68,15 +76,25 @@ case "${1:-}" in
   list)
     if [ "${2:-}" = --quiet ]; then
       if [ "${TRUSTED_RUNNER_TEST_INSTANCE_EXISTS:-1}" = 1 ]; then
-        printf 'smolrunner\n'
+        if [[ "$*" != *'--filter'* ]] || [ -f "${TRUSTED_RUNNER_TEST_RUNNING}" ]; then
+          printf 'smolrunner\n'
+        fi
       fi
     elif [ "${2:-}" = --format ]; then
-      printf 'Running\n'
+      if [ -f "${TRUSTED_RUNNER_TEST_RUNNING}" ]; then
+        printf 'Running\n'
+      else
+        printf 'Stopped\n'
+      fi
     else
       exit 92
     fi
     ;;
   start)
+    : > "${TRUSTED_RUNNER_TEST_RUNNING}"
+    ;;
+  stop)
+    rm -f -- "${TRUSTED_RUNNER_TEST_RUNNING}"
     ;;
   autostart)
     if [ "${2:-}" = enable ]; then
@@ -116,8 +134,15 @@ case "${1:-}" in
         rm -f -- "${TRUSTED_RUNNER_TEST_CONFIGURED}"
         ;;
       *'RUNNER_DIR=/home/lima/actions-runner'*)
+        if [[ "${command_line}" == *'svc.sh start'* ]]; then
+          : > "${TRUSTED_RUNNER_TEST_SERVICE_ACTIVE}"
+        fi
+        if [[ "${command_line}" == *'svc.sh stop'* ]]; then
+          rm -f -- "${TRUSTED_RUNNER_TEST_SERVICE_ACTIVE}"
+        fi
         ;;
       '/usr/bin/systemctl is-active actions.runner.Quarry-Labs-quarry.quarry-trusted-mac-arm64.service')
+        [ -f "${TRUSTED_RUNNER_TEST_SERVICE_ACTIVE}" ]
         printf 'active\n'
         ;;
       *)
@@ -147,6 +172,8 @@ run_helper() {
     TRUSTED_RUNNER_TEST_LOG="${log}" \
     TRUSTED_RUNNER_TEST_CONFIGURED="${configured}" \
     TRUSTED_RUNNER_TEST_ROUTING="${routing}" \
+    TRUSTED_RUNNER_TEST_RUNNING="${running}" \
+    TRUSTED_RUNNER_TEST_SERVICE_ACTIVE="${service_active}" \
     bash "${helper}" "$@"
 }
 
@@ -184,6 +211,44 @@ grep -F 'not bound to the exact Quarry runner' "${binding_output}" >/dev/null
 
 run_helper route > /dev/null
 [ "$(cat "${routing}")" = quarry-trusted-local ]
+
+busy_pause_output="${tmp}/pause-busy.out"
+service_stops_before="$(grep -c -F '/usr/bin/sudo ./svc.sh stop' "${log}" || true)"
+set +e
+TRUSTED_RUNNER_TEST_BUSY=true \
+  run_helper pause > "${busy_pause_output}" 2>&1
+busy_pause_status=$?
+set -e
+[ "${busy_pause_status}" -ne 0 ]
+[ "$(cat "${routing}")" = ubuntu-24.04 ]
+grep -F 'runner is busy' "${busy_pause_output}" >/dev/null
+[ "$(grep -c -F '/usr/bin/sudo ./svc.sh stop' "${log}" || true)" = "${service_stops_before}" ]
+[ -f "${running}" ]
+[ -f "${service_active}" ]
+
+run_helper route > /dev/null
+
+pause_output="${tmp}/pause.out"
+run_helper pause > "${pause_output}"
+[ "$(cat "${routing}")" = ubuntu-24.04 ]
+[ ! -f "${running}" ]
+[ ! -f "${service_active}" ]
+[ -f "${configured}" ]
+[ ! -e "${home}/Library/LaunchAgents/io.lima-vm.autostart.smolrunner.plist" ]
+grep -F 'state=paused' "${pause_output}" >/dev/null
+grep -F 'memory=released caches=preserved' "${pause_output}" >/dev/null
+
+stops_before="$(grep -c -F 'limactl stop --tty=false smolrunner' "${log}")"
+run_helper pause > /dev/null
+[ "$(grep -c -F 'limactl stop --tty=false smolrunner' "${log}")" = "${stops_before}" ]
+
+resume_output="${tmp}/resume.out"
+run_helper resume > "${resume_output}"
+[ -f "${running}" ]
+[ -f "${service_active}" ]
+[ -f "${home}/Library/LaunchAgents/io.lima-vm.autostart.smolrunner.plist" ]
+[ "$(cat "${routing}")" = quarry-trusted-local ]
+grep -F 'state=online' "${resume_output}" >/dev/null
 
 absent_remove_output="${tmp}/remove-absent.out"
 set +e
@@ -244,7 +309,8 @@ grep -F 'vm_disk=preserved caches=preserved' "${remove_output}" >/dev/null
 for secret in registration-secret removal-secret; do
   if grep -F "${secret}" \
     "${log}" "${install_output}" "${status_output}" \
-    "${binding_output}" "${absent_remove_output}" \
+    "${binding_output}" "${busy_pause_output}" "${pause_output}" \
+    "${resume_output}" "${absent_remove_output}" \
     "${foreign_remove_output}" "${failed_remove_output}" \
     "${remove_output}" >/dev/null; then
     printf 'one-time token escaped into observable output: %s\n' "${secret}" >&2
