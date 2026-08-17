@@ -1,4 +1,4 @@
-.PHONY: work work-cmux work-cmux-setup work-tmux vm vm-create vm-bootstrap vm-check vm-up vm-tmux vm-status vm-sync vm-doctor vm-observe vm-stop quarry-runner-install quarry-runner-status quarry-runner-route quarry-runner-unroute quarry-runner-remove
+.PHONY: work work-cmux work-cmux-setup work-tmux vm vm-create vm-bootstrap vm-check vm-up vm-tmux vm-status vm-sync vm-doctor vm-observe vm-stop quarry-runner-install quarry-runner-status quarry-runner-route quarry-runner-unroute quarry-runner-pause quarry-runner-resume quarry-runner-remove
 
 work:
 	@bash scripts/macbook-workspace.sh tmux
@@ -58,6 +58,12 @@ quarry-runner-route:
 
 quarry-runner-unroute:
 	@bash scripts/quarry-trusted-runner.sh unroute
+
+quarry-runner-pause:
+	@bash scripts/quarry-trusted-runner.sh pause
+
+quarry-runner-resume:
+	@bash scripts/quarry-trusted-runner.sh resume
 
 quarry-runner-remove:
 	@bash scripts/quarry-trusted-runner.sh remove
