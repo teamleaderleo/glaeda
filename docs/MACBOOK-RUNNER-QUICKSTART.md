@@ -42,19 +42,26 @@ make quarry-runner-pause
 make quarry-runner-resume
 ```
 
-Pause first routes new Quarry work to `ubuntu-24.04`, refuses to interrupt a
-busy exact runner, disables Lima login autostart, stops the guest listener, waits
-for GitHub to observe it offline, and gracefully stops the VM. Resume reuses the
-existing registration and warm disk, re-enables login autostart, waits for the
-exact runner online, and routes Quarry back locally.
+Pause first routes new Quarry work to `ubuntu-24.04`, removes the scheduling
+label from the exact numeric runner, and confirms that drained runner is idle.
+It then disables Lima login autostart, stops the guest listener, confirms systemd
+made the service inactive, and gracefully stops the VM. GitHub's externally
+reported online state may lag the local stop, but the scheduling label is already
+absent. If a job wins the race before label removal, pause leaves the drained VM
+running and can be retried after the job finishes. An already-stopped VM is
+reported as unobserved rather than fabricating an exact runner receipt. Resume
+reuses the existing registration and warm disk, restores the scheduling label,
+re-enables login autostart, waits for the exact runner online, and routes Quarry
+back locally.
 
 The first comparable Quarry `pr-check` measurement on 2026-08-17 took 169
 seconds on `ubuntu-24.04` and 26 seconds on the warm trusted runner: a 6.5x job
 speedup. End-to-end workflow wall time was 173 seconds hosted versus 33 seconds
 local, a 5.2x speedup. The warm and cold focused pilots completed in 21 and 63
-seconds respectively. A physical idle pause completed in 18.25 seconds and a
-warm resume through exact GitHub-online confirmation completed in 13.02 seconds;
-the paused check showed no remaining Lima/VZ process. These are observed
+seconds respectively. The final label-drained physical idle pause completed in
+7.90 seconds and a warm resume through label restoration and exact GitHub-online
+confirmation completed in 15.67 seconds; the paused check showed no remaining
+Lima/VZ process. These are observed
 single-run measurements, not promised service levels.
 
 Remove the registration and autostart while deliberately preserving the VM disk,

@@ -15,6 +15,7 @@ configured="${state}/configured"
 routing="${state}/routing"
 running="${state}/running"
 service_active="${state}/service-active"
+scheduling_label="${state}/scheduling-label"
 : > "${log}"
 : > "${running}"
 printf 'ubuntu-24.04\n' > "${routing}"
@@ -35,24 +36,27 @@ case "$*" in
   'api --method POST repos/Quarry-Labs/quarry/actions/runners/remove-token --jq .token')
     printf 'removal-secret\n'
     ;;
-  *'actions/runners --jq '*'.id == 22'*'[.id, .status, .busy] | @tsv'*)
+  'api --method POST repos/Quarry-Labs/quarry/actions/runners/22/labels --input -')
+    IFS= read -r payload
+    [ "${payload}" = '{"labels":["quarry-trusted-local"]}' ]
+    : > "${TRUSTED_RUNNER_TEST_SCHEDULING_LABEL}"
+    ;;
+  'api --method DELETE repos/Quarry-Labs/quarry/actions/runners/22/labels/quarry-trusted-local')
+    rm -f -- "${TRUSTED_RUNNER_TEST_SCHEDULING_LABEL}"
+    ;;
+  *'actions/runners --jq '*'.id == 22'*'| @tsv'*)
     if [ "${TRUSTED_RUNNER_TEST_GITHUB_BINDING:-exact}" = exact ]; then
       runner_state=offline
       [ ! -f "${TRUSTED_RUNNER_TEST_SERVICE_ACTIVE}" ] || runner_state=online
-      printf '22\t%s\t%s\n' \
-        "${runner_state}" "${TRUSTED_RUNNER_TEST_BUSY:-false}"
-    fi
-    ;;
-  *'actions/runners --jq '*'.id == 22'*'[.status, .busy] | @tsv'*)
-    if [ "${TRUSTED_RUNNER_TEST_GITHUB_BINDING:-exact}" = exact ]; then
-      runner_state=offline
-      [ ! -f "${TRUSTED_RUNNER_TEST_SERVICE_ACTIVE}" ] || runner_state=online
-      printf '%s\t%s\n' "${runner_state}" "${TRUSTED_RUNNER_TEST_BUSY:-false}"
-    fi
-    ;;
-  *'actions/runners --jq '*'.id == 22'*'.status'*)
-    if [ "${TRUSTED_RUNNER_TEST_GITHUB_BINDING:-exact}" = exact ]; then
-      printf 'online\n'
+      busy="${TRUSTED_RUNNER_TEST_BUSY:-false}"
+      if [ "${TRUSTED_RUNNER_TEST_BUSY_AFTER_DRAIN:-0}" = 1 ] \
+        && [ ! -f "${TRUSTED_RUNNER_TEST_SCHEDULING_LABEL}" ]; then
+        busy=true
+      fi
+      schedulable=false
+      [ ! -f "${TRUSTED_RUNNER_TEST_SCHEDULING_LABEL}" ] || schedulable=true
+      printf '22\t%s\t%s\t%s\n' \
+        "${runner_state}" "${busy}" "${schedulable}"
     fi
     ;;
   'variable set CI_LINUX_RUNNER --repo Quarry-Labs/quarry --body '*)
@@ -127,6 +131,7 @@ case "${1:-}" in
         IFS= read -r token
         [ "${token}" = registration-secret ]
         : > "${TRUSTED_RUNNER_TEST_CONFIGURED}"
+        : > "${TRUSTED_RUNNER_TEST_SCHEDULING_LABEL}"
         ;;
       *'config.sh remove --token'*)
         IFS= read -r token
@@ -174,6 +179,7 @@ run_helper() {
     TRUSTED_RUNNER_TEST_ROUTING="${routing}" \
     TRUSTED_RUNNER_TEST_RUNNING="${running}" \
     TRUSTED_RUNNER_TEST_SERVICE_ACTIVE="${service_active}" \
+    TRUSTED_RUNNER_TEST_SCHEDULING_LABEL="${scheduling_label}" \
     bash "${helper}" "$@"
 }
 
@@ -184,13 +190,14 @@ grep -F 'runner=quarry-trusted-mac-arm64 state=online' "${install_output}" >/dev
 [ -f "${configured}" ]
 grep -F 'autostart enable --condition=login --tty=false smolrunner' "${log}" >/dev/null
 grep -F '.id == 22' "${log}" >/dev/null
-binding_line="$(grep -n -m1 -F '[.id, .status, .busy] | @tsv' "${log}" | cut -d: -f1)"
+binding_line="$(grep -n -m1 -F '.id == 22' "${log}" | cut -d: -f1)"
 service_start_line="$(grep -n -m1 -F '/usr/bin/sudo ./svc.sh start' "${log}" | cut -d: -f1)"
 [ "${binding_line}" -lt "${service_start_line}" ]
 
 status_output="${tmp}/status.out"
 run_helper status > "${status_output}"
 grep -F 'runner=quarry-trusted-mac-arm64 state=online busy=false' "${status_output}" >/dev/null
+grep -F 'runner_schedulable=true' "${status_output}" >/dev/null
 grep -F 'routing=quarry-trusted-local' "${status_output}" >/dev/null
 grep -Fx active "${status_output}" >/dev/null
 
@@ -206,7 +213,7 @@ binding_status=$?
 set -e
 [ "${binding_status}" -ne 0 ]
 [ "$(cat "${routing}")" = ubuntu-24.04 ]
-grep -F 'not bound to the exact Quarry runner' "${binding_output}" >/dev/null
+grep -F 'not the exact Quarry runner' "${binding_output}" >/dev/null
 [ "$(grep -c -F '/usr/bin/sudo ./svc.sh start' "${log}")" = "${service_starts_before}" ]
 
 run_helper route > /dev/null
@@ -215,7 +222,7 @@ run_helper route > /dev/null
 busy_pause_output="${tmp}/pause-busy.out"
 service_stops_before="$(grep -c -F '/usr/bin/sudo ./svc.sh stop' "${log}" || true)"
 set +e
-TRUSTED_RUNNER_TEST_BUSY=true \
+TRUSTED_RUNNER_TEST_BUSY_AFTER_DRAIN=1 \
   run_helper pause > "${busy_pause_output}" 2>&1
 busy_pause_status=$?
 set -e
@@ -225,8 +232,11 @@ grep -F 'runner is busy' "${busy_pause_output}" >/dev/null
 [ "$(grep -c -F '/usr/bin/sudo ./svc.sh stop' "${log}" || true)" = "${service_stops_before}" ]
 [ -f "${running}" ]
 [ -f "${service_active}" ]
+[ ! -f "${scheduling_label}" ]
+grep -F 'labels/quarry-trusted-local' "${log}" >/dev/null
 
 run_helper route > /dev/null
+[ -f "${scheduling_label}" ]
 
 pause_output="${tmp}/pause.out"
 run_helper pause > "${pause_output}"
@@ -239,7 +249,17 @@ grep -F 'state=paused' "${pause_output}" >/dev/null
 grep -F 'memory=released caches=preserved' "${pause_output}" >/dev/null
 
 stops_before="$(grep -c -F 'limactl stop --tty=false smolrunner' "${log}")"
-run_helper pause > /dev/null
+stopped_pause_output="${tmp}/pause-stopped.out"
+set +e
+run_helper pause > "${stopped_pause_output}" 2>&1
+stopped_pause_status=$?
+set -e
+[ "${stopped_pause_status}" -ne 0 ]
+grep -F 'exact runner offline state is unobserved' "${stopped_pause_output}" >/dev/null
+if grep -F 'state=paused' "${stopped_pause_output}" >/dev/null; then
+  printf 'already-stopped VM was reported as an exact paused runner\n' >&2
+  exit 1
+fi
 [ "$(grep -c -F 'limactl stop --tty=false smolrunner' "${log}")" = "${stops_before}" ]
 
 resume_output="${tmp}/resume.out"
@@ -248,6 +268,7 @@ run_helper resume > "${resume_output}"
 [ -f "${service_active}" ]
 [ -f "${home}/Library/LaunchAgents/io.lima-vm.autostart.smolrunner.plist" ]
 [ "$(cat "${routing}")" = quarry-trusted-local ]
+[ -f "${scheduling_label}" ]
 grep -F 'state=online' "${resume_output}" >/dev/null
 
 absent_remove_output="${tmp}/remove-absent.out"
@@ -275,7 +296,7 @@ TRUSTED_RUNNER_TEST_GITHUB_BINDING=foreign \
 foreign_remove_status=$?
 set -e
 [ "${foreign_remove_status}" -ne 0 ]
-grep -F 'not bound to the exact Quarry runner' "${foreign_remove_output}" >/dev/null
+grep -F 'not the exact Quarry runner' "${foreign_remove_output}" >/dev/null
 [ "$(grep -c -F '/usr/bin/sudo ./svc.sh stop' "${log}" || true)" = "${service_stops_before}" ]
 [ "$(grep -c -F 'autostart disable --tty=false smolrunner' "${log}" || true)" = "${autostart_disables_before}" ]
 [ -f "${configured}" ]
@@ -310,6 +331,7 @@ for secret in registration-secret removal-secret; do
   if grep -F "${secret}" \
     "${log}" "${install_output}" "${status_output}" \
     "${binding_output}" "${busy_pause_output}" "${pause_output}" \
+    "${stopped_pause_output}" \
     "${resume_output}" "${absent_remove_output}" \
     "${foreign_remove_output}" "${failed_remove_output}" \
     "${remove_output}" >/dev/null; then
