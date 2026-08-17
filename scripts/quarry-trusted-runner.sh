@@ -13,6 +13,7 @@ runner_version="2.336.0"
 runner_size="138824064"
 runner_sha256="58b758e420b87093fbd4bfddd368074960053e2f1388f01848c82624b90f27d1"
 hosted_fallback="ubuntu-24.04"
+autostart_plist="${HOME}/Library/LaunchAgents/io.lima-vm.autostart.${instance}.plist"
 
 usage() {
   cat <<'USAGE'
@@ -71,13 +72,21 @@ runner_is_configured() {
   limactl shell "${instance}" -- /usr/bin/test -f "${runner_dir}/.runner" >/dev/null 2>&1
 }
 
-verify_configured_name() {
-  local configured_name
-  configured_name="$(
-    limactl shell "${instance}" -- /usr/bin/jq -r .agentName "${runner_dir}/.runner"
+configured_runner_id() {
+  local configured_identity configured_id configured_name
+  configured_identity="$(
+    limactl shell "${instance}" -- \
+      /usr/bin/jq -r '[.agentId, .agentName] | @tsv' "${runner_dir}/.runner"
   )" || die 'unable to inspect the configured guest runner identity'
+  IFS=$'\t' read -r configured_id configured_name <<EOF_IDENTITY
+${configured_identity}
+EOF_IDENTITY
+  case "${configured_id}" in
+    ''|0|*[!0-9]*) die 'the configured guest runner ID is invalid' ;;
+  esac
   [ "${configured_name}" = "${runner_name}" ] \
     || die 'the persistent VM is configured for a different Actions runner'
+  printf '%s\n' "${configured_id}"
 }
 
 install_runner_package() {
@@ -165,11 +174,19 @@ fi
 }
 
 wait_until_online() {
-  local attempt state
+  local attempt configured_id state
   for attempt in $(seq 1 15); do
+    configured_id="$(configured_runner_id)"
     state="$(
       gh api "repos/${repository}/actions/runners" \
-        --jq ".runners[] | select(.name == \"${runner_name}\") | .status"
+        --jq ".runners[] | select( \
+          .id == ${configured_id} and \
+          .name == \"${runner_name}\" and \
+          .os == \"Linux\" and \
+          ([.labels[].name] | index(\"ARM64\")) != null and \
+          ([.labels[].name] | index(\"${runner_label}\")) != null and \
+          ([.labels[].name] | index(\"${pilot_label}\")) != null \
+        ) | .status"
     )" || die 'unable to observe the GitHub runner'
     if [ "${state}" = online ]; then
       return 0
@@ -192,11 +209,11 @@ unroute_jobs() {
 install() {
   start_instance
   if runner_is_configured; then
-    verify_configured_name
+    configured_runner_id >/dev/null
   else
     install_runner_package
     register_runner
-    verify_configured_name
+    configured_runner_id >/dev/null
   fi
   start_runner_service
   limactl autostart enable --condition=login --tty=false "${instance}"
@@ -207,24 +224,37 @@ install() {
 }
 
 status() {
-  local vm_state routing runner_state runner_busy
+  local configured_id runner_observation vm_state routing runner_state runner_busy
   vm_state="$(limactl list --format '{{.Status}}' "${instance}" 2>/dev/null || true)"
   routing="$(gh variable get CI_LINUX_RUNNER --repo "${repository}" 2>/dev/null || true)"
-  runner_state="$(
-    gh api "repos/${repository}/actions/runners" \
-      --jq ".runners[] | select(.name == \"${runner_name}\") | .status" 2>/dev/null || true
-  )"
-  runner_busy="$(
-    gh api "repos/${repository}/actions/runners" \
-      --jq ".runners[] | select(.name == \"${runner_name}\") | .busy" 2>/dev/null || true
-  )"
+  runner_state=absent
+  runner_busy=unknown
+  if instance_running && runner_is_configured; then
+    configured_id="$(configured_runner_id)"
+    runner_observation="$(
+      gh api "repos/${repository}/actions/runners" \
+        --jq ".runners[] | select( \
+          .id == ${configured_id} and \
+          .name == \"${runner_name}\" and \
+          .os == \"Linux\" and \
+          ([.labels[].name] | index(\"ARM64\")) != null and \
+          ([.labels[].name] | index(\"${runner_label}\")) != null and \
+          ([.labels[].name] | index(\"${pilot_label}\")) != null \
+        ) | [.status, .busy] | @tsv" 2>/dev/null || true
+    )"
+    if [ -n "${runner_observation}" ]; then
+      IFS=$'\t' read -r runner_state runner_busy <<EOF_RUNNER
+${runner_observation}
+EOF_RUNNER
+    fi
+  fi
 
   printf 'vm=%s state=%s\n' "${instance}" "${vm_state:-unknown}"
   printf 'runner=%s state=%s busy=%s\n' \
     "${runner_name}" "${runner_state:-absent}" "${runner_busy:-unknown}"
   printf 'routing=%s\n' "${routing:-unset}"
 
-  if instance_running && runner_is_configured; then
+  if [ "${runner_state}" != absent ]; then
     limactl shell "${instance}" -- \
       /usr/bin/systemctl is-active \
         actions.runner.Quarry-Labs-quarry.quarry-trusted-mac-arm64.service
@@ -237,13 +267,16 @@ remove_runner() {
   if instance_exists; then
     start_instance
     if runner_is_configured; then
-      verify_configured_name
+      configured_runner_id >/dev/null
       limactl shell "${instance}" -- \
         /usr/bin/env RUNNER_DIR="${runner_dir}" /usr/bin/bash -c '
 set -euo pipefail
 cd "${RUNNER_DIR}"
-/usr/bin/sudo ./svc.sh stop || true
-/usr/bin/sudo ./svc.sh uninstall || true
+unit="/etc/systemd/system/actions.runner.Quarry-Labs-quarry.quarry-trusted-mac-arm64.service"
+if /usr/bin/sudo /usr/bin/test -f "${unit}"; then
+  /usr/bin/sudo ./svc.sh stop
+  /usr/bin/sudo ./svc.sh uninstall
+fi
 '
       removal_token="$(
         gh api --method POST \
@@ -261,7 +294,11 @@ unset removal_token
 '
       unset removal_token
     fi
-    limactl autostart disable --tty=false "${instance}" || true
+    if [ -e "${autostart_plist}" ]; then
+      limactl autostart disable --tty=false "${instance}"
+    fi
+    [ ! -e "${autostart_plist}" ] \
+      || die 'Lima autostart remained installed after removal'
   fi
   printf 'runner=%s state=removed vm_disk=preserved caches=preserved\n' "${runner_name}"
 }
