@@ -16,6 +16,8 @@ routing="${state}/routing"
 running="${state}/running"
 service_active="${state}/service-active"
 scheduling_label="${state}/scheduling-label"
+pilot_scheduling_label="${state}/pilot-scheduling-label"
+busy_latched="${state}/busy-latched"
 : > "${log}"
 : > "${running}"
 printf 'ubuntu-24.04\n' > "${routing}"
@@ -38,25 +40,33 @@ case "$*" in
     ;;
   'api --method POST repos/Quarry-Labs/quarry/actions/runners/22/labels --input -')
     IFS= read -r payload
-    [ "${payload}" = '{"labels":["quarry-trusted-local"]}' ]
+    [ "${payload}" = \
+      '{"labels":["quarry-trusted-local","smolrunner-quarry-pilot"]}' ]
     : > "${TRUSTED_RUNNER_TEST_SCHEDULING_LABEL}"
+    : > "${TRUSTED_RUNNER_TEST_PILOT_SCHEDULING_LABEL}"
     ;;
   'api --method DELETE repos/Quarry-Labs/quarry/actions/runners/22/labels/quarry-trusted-local')
     rm -f -- "${TRUSTED_RUNNER_TEST_SCHEDULING_LABEL}"
+    if [ "${TRUSTED_RUNNER_TEST_PILOT_ASSIGN_AFTER_COMMON_DRAIN:-0}" = 1 ] \
+      && [ -f "${TRUSTED_RUNNER_TEST_PILOT_SCHEDULING_LABEL}" ]; then
+      : > "${TRUSTED_RUNNER_TEST_BUSY_LATCHED}"
+    fi
+    ;;
+  'api --method DELETE repos/Quarry-Labs/quarry/actions/runners/22/labels/smolrunner-quarry-pilot')
+    rm -f -- "${TRUSTED_RUNNER_TEST_PILOT_SCHEDULING_LABEL}"
     ;;
   *'actions/runners --jq '*'.id == 22'*'| @tsv'*)
     if [ "${TRUSTED_RUNNER_TEST_GITHUB_BINDING:-exact}" = exact ]; then
       runner_state=offline
       [ ! -f "${TRUSTED_RUNNER_TEST_SERVICE_ACTIVE}" ] || runner_state=online
       busy="${TRUSTED_RUNNER_TEST_BUSY:-false}"
-      if [ "${TRUSTED_RUNNER_TEST_BUSY_AFTER_DRAIN:-0}" = 1 ] \
-        && [ ! -f "${TRUSTED_RUNNER_TEST_SCHEDULING_LABEL}" ]; then
-        busy=true
-      fi
-      schedulable=false
-      [ ! -f "${TRUSTED_RUNNER_TEST_SCHEDULING_LABEL}" ] || schedulable=true
-      printf '22\t%s\t%s\t%s\n' \
-        "${runner_state}" "${busy}" "${schedulable}"
+      [ ! -f "${TRUSTED_RUNNER_TEST_BUSY_LATCHED}" ] || busy=true
+      common_label=false
+      pilot_label=false
+      [ ! -f "${TRUSTED_RUNNER_TEST_SCHEDULING_LABEL}" ] || common_label=true
+      [ ! -f "${TRUSTED_RUNNER_TEST_PILOT_SCHEDULING_LABEL}" ] || pilot_label=true
+      printf '22\t%s\t%s\t%s\t%s\n' \
+        "${runner_state}" "${busy}" "${common_label}" "${pilot_label}"
     fi
     ;;
   'variable set CI_LINUX_RUNNER --repo Quarry-Labs/quarry --body '*)
@@ -132,6 +142,7 @@ case "${1:-}" in
         [ "${token}" = registration-secret ]
         : > "${TRUSTED_RUNNER_TEST_CONFIGURED}"
         : > "${TRUSTED_RUNNER_TEST_SCHEDULING_LABEL}"
+        : > "${TRUSTED_RUNNER_TEST_PILOT_SCHEDULING_LABEL}"
         ;;
       *'config.sh remove --token'*)
         IFS= read -r token
@@ -180,6 +191,8 @@ run_helper() {
     TRUSTED_RUNNER_TEST_RUNNING="${running}" \
     TRUSTED_RUNNER_TEST_SERVICE_ACTIVE="${service_active}" \
     TRUSTED_RUNNER_TEST_SCHEDULING_LABEL="${scheduling_label}" \
+    TRUSTED_RUNNER_TEST_PILOT_SCHEDULING_LABEL="${pilot_scheduling_label}" \
+    TRUSTED_RUNNER_TEST_BUSY_LATCHED="${busy_latched}" \
     bash "${helper}" "$@"
 }
 
@@ -222,7 +235,7 @@ run_helper route > /dev/null
 busy_pause_output="${tmp}/pause-busy.out"
 service_stops_before="$(grep -c -F '/usr/bin/sudo ./svc.sh stop' "${log}" || true)"
 set +e
-TRUSTED_RUNNER_TEST_BUSY_AFTER_DRAIN=1 \
+TRUSTED_RUNNER_TEST_PILOT_ASSIGN_AFTER_COMMON_DRAIN=1 \
   run_helper pause > "${busy_pause_output}" 2>&1
 busy_pause_status=$?
 set -e
@@ -233,10 +246,15 @@ grep -F 'runner is busy' "${busy_pause_output}" >/dev/null
 [ -f "${running}" ]
 [ -f "${service_active}" ]
 [ ! -f "${scheduling_label}" ]
+[ ! -f "${pilot_scheduling_label}" ]
+[ -f "${busy_latched}" ]
 grep -F 'labels/quarry-trusted-local' "${log}" >/dev/null
+grep -F 'labels/smolrunner-quarry-pilot' "${log}" >/dev/null
 
+rm -f -- "${busy_latched}"
 run_helper route > /dev/null
 [ -f "${scheduling_label}" ]
+[ -f "${pilot_scheduling_label}" ]
 
 pause_output="${tmp}/pause.out"
 run_helper pause > "${pause_output}"
@@ -244,6 +262,8 @@ run_helper pause > "${pause_output}"
 [ ! -f "${running}" ]
 [ ! -f "${service_active}" ]
 [ -f "${configured}" ]
+[ ! -f "${scheduling_label}" ]
+[ ! -f "${pilot_scheduling_label}" ]
 [ ! -e "${home}/Library/LaunchAgents/io.lima-vm.autostart.smolrunner.plist" ]
 grep -F 'state=paused' "${pause_output}" >/dev/null
 grep -F 'memory=released caches=preserved' "${pause_output}" >/dev/null
@@ -269,6 +289,7 @@ run_helper resume > "${resume_output}"
 [ -f "${home}/Library/LaunchAgents/io.lima-vm.autostart.smolrunner.plist" ]
 [ "$(cat "${routing}")" = quarry-trusted-local ]
 [ -f "${scheduling_label}" ]
+[ -f "${pilot_scheduling_label}" ]
 grep -F 'state=online' "${resume_output}" >/dev/null
 
 absent_remove_output="${tmp}/remove-absent.out"

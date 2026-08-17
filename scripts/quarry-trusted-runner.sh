@@ -98,25 +98,27 @@ observe_github_runner() {
       .id == ${configured_id} and \
       .name == \"${runner_name}\" and \
       .os == \"Linux\" and \
-      ([.labels[].name] | index(\"ARM64\")) != null and \
-      ([.labels[].name] | index(\"${pilot_label}\")) != null \
+      ([.labels[].name] | index(\"ARM64\")) != null \
     ) | [ \
       .id, \
       .status, \
       .busy, \
-      (([.labels[].name] | index(\"${runner_label}\")) != null) \
+      (([.labels[].name] | index(\"${runner_label}\")) != null), \
+      (([.labels[].name] | index(\"${pilot_label}\")) != null) \
     ] | @tsv"
 }
 
 require_github_identity() {
-  local configured_id observation observed_id observed_state observed_busy observed_schedulable
+  local configured_id observation observed_id observed_state observed_busy
+  local observed_common_label observed_pilot_label
   configured_id="$(configured_runner_id)"
   observation="$(observe_github_runner "${configured_id}")" \
     || die 'unable to observe the GitHub runner identity'
   [ -n "${observation}" ] \
     || die 'the configured guest runner is not the exact Quarry runner'
   IFS=$'\t' read -r \
-    observed_id observed_state observed_busy observed_schedulable <<EOF_RUNNER
+    observed_id observed_state observed_busy \
+    observed_common_label observed_pilot_label <<EOF_RUNNER
 ${observation}
 EOF_RUNNER
   [ "${observed_id}" = "${configured_id}" ] \
@@ -125,28 +127,30 @@ EOF_RUNNER
 }
 
 require_github_binding() {
-  local configured_id observation observed_id state busy schedulable
+  local configured_id observation observed_id state busy common_label pilot_label_state
   configured_id="$(require_github_identity)"
   observation="$(observe_github_runner "${configured_id}")" \
     || die 'unable to observe the GitHub runner binding'
-  IFS=$'\t' read -r observed_id state busy schedulable <<EOF_RUNNER
+  IFS=$'\t' read -r \
+    observed_id state busy common_label pilot_label_state <<EOF_RUNNER
 ${observation}
 EOF_RUNNER
-  [ "${schedulable}" = true ] \
-    || die 'the exact Quarry runner is missing its scheduling label'
+  [ "${common_label}" = true ] && [ "${pilot_label_state}" = true ] \
+    || die 'the exact Quarry runner is missing a scheduling label'
   printf '%s\n' "${configured_id}"
 }
 
 ensure_scheduling_label() {
   local configured_id="$1"
-  local observation observed_id state busy schedulable
+  local observation observed_id state busy common_label pilot_label_state
   observation="$(observe_github_runner "${configured_id}")" \
     || die 'unable to observe the GitHub runner before routing'
-  IFS=$'\t' read -r observed_id state busy schedulable <<EOF_RUNNER
+  IFS=$'\t' read -r \
+    observed_id state busy common_label pilot_label_state <<EOF_RUNNER
 ${observation}
 EOF_RUNNER
-  if [ "${schedulable}" != true ]; then
-    printf '{"labels":["%s"]}\n' "${runner_label}" | \
+  if [ "${common_label}" != true ] || [ "${pilot_label_state}" != true ]; then
+    printf '{"labels":["%s","%s"]}\n' "${runner_label}" "${pilot_label}" | \
       gh api --method POST \
         "repos/${repository}/actions/runners/${configured_id}/labels" \
         --input - >/dev/null \
@@ -155,27 +159,35 @@ EOF_RUNNER
   require_github_binding >/dev/null
 }
 
-drain_scheduling_label() {
+drain_scheduling_labels() {
   local configured_id="$1"
-  local observation observed_id state busy schedulable
+  local observation observed_id state busy common_label pilot_label_state
   observation="$(observe_github_runner "${configured_id}")" \
     || die 'unable to observe the GitHub runner before draining'
-  IFS=$'\t' read -r observed_id state busy schedulable <<EOF_RUNNER
+  IFS=$'\t' read -r \
+    observed_id state busy common_label pilot_label_state <<EOF_RUNNER
 ${observation}
 EOF_RUNNER
-  if [ "${schedulable}" = true ]; then
+  if [ "${common_label}" = true ]; then
     gh api --method DELETE \
       "repos/${repository}/actions/runners/${configured_id}/labels/${runner_label}" \
       >/dev/null \
       || die 'unable to drain the exact runner scheduling label'
   fi
+  if [ "${pilot_label_state}" = true ]; then
+    gh api --method DELETE \
+      "repos/${repository}/actions/runners/${configured_id}/labels/${pilot_label}" \
+      >/dev/null \
+      || die 'unable to drain the exact pilot scheduling label'
+  fi
   observation="$(observe_github_runner "${configured_id}")" \
     || die 'unable to confirm the drained GitHub runner'
-  IFS=$'\t' read -r observed_id state busy schedulable <<EOF_RUNNER
+  IFS=$'\t' read -r \
+    observed_id state busy common_label pilot_label_state <<EOF_RUNNER
 ${observation}
 EOF_RUNNER
-  [ "${schedulable}" = false ] \
-    || die 'the exact runner remained schedulable after the drain request'
+  [ "${common_label}" = false ] && [ "${pilot_label_state}" = false ] \
+    || die 'the exact runner retained a scheduling label after the drain request'
 }
 
 install_runner_package() {
@@ -293,15 +305,16 @@ wait_until_online() {
 
 require_runner_drained_idle() {
   local configured_id="$1"
-  local observation observed_id state busy schedulable
+  local observation observed_id state busy common_label pilot_label_state
   observation="$(observe_github_runner "${configured_id}")" \
     || die 'unable to observe the GitHub runner before pausing'
   [ -n "${observation}" ] \
     || die 'the exact GitHub runner disappeared before pausing'
-  IFS=$'\t' read -r observed_id state busy schedulable <<EOF_RUNNER
+  IFS=$'\t' read -r \
+    observed_id state busy common_label pilot_label_state <<EOF_RUNNER
 ${observation}
 EOF_RUNNER
-  [ "${schedulable}" = false ] \
+  [ "${common_label}" = false ] && [ "${pilot_label_state}" = false ] \
     || die 'the exact GitHub runner is not drained before pausing'
   [ "${state}" = online ] \
     || die 'the exact GitHub runner is not online for a graceful pause'
@@ -311,15 +324,16 @@ EOF_RUNNER
 
 require_runner_drained_not_busy() {
   local configured_id="$1"
-  local observation observed_id state busy schedulable
+  local observation observed_id state busy common_label pilot_label_state
   observation="$(observe_github_runner "${configured_id}")" \
     || die 'unable to observe the GitHub runner before removal'
   [ -n "${observation}" ] \
     || die 'the exact GitHub runner disappeared before removal'
-  IFS=$'\t' read -r observed_id state busy schedulable <<EOF_RUNNER
+  IFS=$'\t' read -r \
+    observed_id state busy common_label pilot_label_state <<EOF_RUNNER
 ${observation}
 EOF_RUNNER
-  [ "${schedulable}" = false ] \
+  [ "${common_label}" = false ] && [ "${pilot_label_state}" = false ] \
     || die 'the exact GitHub runner is not drained before removal'
   case "${state}" in
     online|offline) ;;
@@ -371,7 +385,7 @@ pause() {
   runner_is_configured \
     || die 'the guest runner configuration is absent; a graceful pause cannot be proven'
   configured_id="$(require_github_identity)"
-  drain_scheduling_label "${configured_id}"
+  drain_scheduling_labels "${configured_id}"
   require_runner_drained_idle "${configured_id}"
 
   if [ -e "${autostart_plist}" ]; then
@@ -389,6 +403,7 @@ pause() {
 status() {
   local configured_id observed_id runner_observation vm_state routing
   local runner_state runner_busy runner_schedulable
+  local common_label pilot_label_state
   vm_state="$(limactl list --format '{{.Status}}' "${instance}" 2>/dev/null || true)"
   routing="$(gh variable get CI_LINUX_RUNNER --repo "${repository}" 2>/dev/null || true)"
   runner_state=absent
@@ -399,9 +414,15 @@ status() {
     runner_observation="$(observe_github_runner "${configured_id}" 2>/dev/null || true)"
     if [ -n "${runner_observation}" ]; then
       IFS=$'\t' read -r \
-        observed_id runner_state runner_busy runner_schedulable <<EOF_RUNNER
+        observed_id runner_state runner_busy \
+        common_label pilot_label_state <<EOF_RUNNER
 ${runner_observation}
 EOF_RUNNER
+      if [ "${common_label}" = true ] || [ "${pilot_label_state}" = true ]; then
+        runner_schedulable=true
+      else
+        runner_schedulable=false
+      fi
     fi
   fi
 
@@ -428,7 +449,7 @@ remove_runner() {
     || die 'the guest runner configuration is absent; exact removal cannot be proven'
   configured_id="$(require_github_identity)"
   [ -n "${configured_id}" ] || die 'the exact GitHub runner binding is unavailable'
-  drain_scheduling_label "${configured_id}"
+  drain_scheduling_labels "${configured_id}"
   require_runner_drained_not_busy "${configured_id}"
 
   # Disable automatic VM restart while the exact local and GitHub identities
