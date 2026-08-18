@@ -1,13 +1,14 @@
 use std::fmt;
 
 use serde::Serialize;
+use sha2::{Digest as _, Sha256};
 
 use crate::host_preparation_plan::{
     ExecutableHostPreparationPhase, HostPreparationProposal, HostPreparationResult,
 };
 
-pub const HOST_PREPARATION_COMMAND_SCHEMA_VERSION: u8 = 1;
-pub const HOST_PREPARATION_CONFIRMATION_PREFIX: &str = "host-preparation-v1.";
+pub const HOST_PREPARATION_COMMAND_SCHEMA_VERSION: u8 = 2;
+pub const HOST_PREPARATION_CONFIRMATION_PREFIX: &str = "host-preparation-v2.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -144,13 +145,30 @@ impl std::error::Error for HostPreparationCommandError {}
 pub fn host_preparation_confirmation(
     proposal: &HostPreparationProposal,
 ) -> Result<HostPreparationConfirmation, HostPreparationCommandError> {
-    let public_proposal =
-        serde_json::to_vec(proposal).map_err(|_| HostPreparationCommandError::serialization())?;
+    #[derive(Serialize)]
+    struct ConfirmationBinding<'a> {
+        public_proposal: &'a HostPreparationProposal,
+        durable_plan_sha256: Option<String>,
+    }
+
+    let durable_plan_sha256 = match &proposal.result {
+        HostPreparationResult::Executable { phase, .. } => {
+            let exact_plan = serde_json::to_vec(&phase.durable_plan())
+                .map_err(|_| HostPreparationCommandError::serialization())?;
+            Some(hex_encode(&Sha256::digest(exact_plan)))
+        }
+        HostPreparationResult::Ready | HostPreparationResult::Blocked { .. } => None,
+    };
+    let confirmation_binding = serde_json::to_vec(&ConfirmationBinding {
+        public_proposal: proposal,
+        durable_plan_sha256,
+    })
+    .map_err(|_| HostPreparationCommandError::serialization())?;
     Ok(HostPreparationConfirmation {
         schema_version: HOST_PREPARATION_COMMAND_SCHEMA_VERSION,
         value: format!(
             "{HOST_PREPARATION_CONFIRMATION_PREFIX}{}",
-            hex_encode(&public_proposal)
+            hex_encode(&confirmation_binding)
         ),
     })
 }

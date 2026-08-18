@@ -34,10 +34,14 @@ use super::{
 };
 
 fn desired() -> DesiredRunnerAccount {
+    desired_with_group("project-runner")
+}
+
+fn desired_with_group(primary_group: &str) -> DesiredRunnerAccount {
     let account = LinuxAccountName::parse("project-runner").expect("account");
     DesiredRunnerAccount::new(
         account.clone(),
-        account,
+        LinuxAccountName::parse(primary_group).expect("primary group"),
         "/var/lib/project-runner",
         PlannedSubordinateRange::new(100_000, 65_536).expect("UID range"),
         PlannedSubordinateRange::new(200_000, 65_536).expect("GID range"),
@@ -205,8 +209,22 @@ fn proposal(
     package_presence: Presence,
     account_state: PreparationObservationState,
 ) -> crate::host_preparation_plan::HostPreparationProposal {
-    let desired = desired();
-    let observations = observations(account_state);
+    proposal_from_account(
+        repository,
+        package_presence,
+        desired(),
+        observations(account_state),
+        account_state,
+    )
+}
+
+fn proposal_from_account(
+    repository: &str,
+    package_presence: Presence,
+    desired: DesiredRunnerAccount,
+    observations: RunnerAccountObservations,
+    account_state: PreparationObservationState,
+) -> crate::host_preparation_plan::HostPreparationProposal {
     let package_plan = packages(package_presence);
     let account_plan =
         build_runner_account_plan(desired.clone(), observations.clone()).expect("account plan");
@@ -279,7 +297,13 @@ fn executable_confirmation_is_stable_and_exact() {
     assert_eq!(
         first_confirmation.value.len(),
         HOST_PREPARATION_CONFIRMATION_PREFIX.len()
-            + serde_json::to_vec(&first).expect("public proposal").len() * 2
+            + serde_json::to_vec(&serde_json::json!({
+                "public_proposal": first,
+                "durable_plan_sha256": "0".repeat(64),
+            }))
+            .expect("confirmation binding")
+            .len()
+                * 2
     );
 
     let changed = proposal(
@@ -290,6 +314,43 @@ fn executable_confirmation_is_stable_and_exact() {
     assert_ne!(
         first_confirmation,
         host_preparation_confirmation(&changed).expect("changed confirmation")
+    );
+}
+
+#[test]
+fn confirmation_binds_hidden_durable_command_arguments() {
+    let home_missing = RunnerAccountObservations {
+        group: observation(PreparationObservationState::Matching, "group"),
+        user: observation(PreparationObservationState::Matching, "user"),
+        home: observation(PreparationObservationState::Absent, "home"),
+        subordinate_uids: observation(PreparationObservationState::Matching, "subordinate UIDs"),
+        subordinate_gids: observation(PreparationObservationState::Matching, "subordinate GIDs"),
+        linger: observation(PreparationObservationState::Matching, "linger"),
+    };
+    let reviewed = proposal_from_account(
+        "owner/repository",
+        Presence::Present,
+        desired_with_group("project-runner"),
+        home_missing.clone(),
+        PreparationObservationState::Matching,
+    );
+    let altered = proposal_from_account(
+        "owner/repository",
+        Presence::Present,
+        desired_with_group("privgroup"),
+        home_missing,
+        PreparationObservationState::Matching,
+    );
+
+    assert_eq!(
+        serde_json::to_vec(&reviewed).expect("reviewed public proposal"),
+        serde_json::to_vec(&altered).expect("altered public proposal"),
+        "the public proposal intentionally omits exact command details"
+    );
+    assert_ne!(
+        host_preparation_confirmation(&reviewed).expect("reviewed confirmation"),
+        host_preparation_confirmation(&altered).expect("altered confirmation"),
+        "confirmation must bind the primary group in the hidden install command"
     );
 }
 
