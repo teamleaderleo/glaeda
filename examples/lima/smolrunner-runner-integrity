@@ -7,11 +7,18 @@ readonly install_dir="/opt/smolrunner/actions-runner"
 readonly entries="/etc/smolrunner/actions-runner.entries"
 readonly checksums="/etc/smolrunner/actions-runner.sha256"
 readonly runner_work="${install_dir}/_work"
+readonly runner_guard_group="smolrunner-runner-guard"
 readonly runner_diag="${install_dir}/_diag"
 readonly jit_launcher="/opt/smolrunner/bin/smolrunner-jit-launcher"
 readonly jit_launcher_sha256="6f096fb518b6d40d45ca1a9923e423da436b6269fceec5a5989566abbc93a76a"
 
 [[ "$(/usr/bin/id -u)" == "0" ]]
+[[ "$(/usr/sbin/sysctl -n fs.suid_dumpable)" == "0" ]]
+listener_mount_options="$(/usr/bin/findmnt --noheadings --output OPTIONS --target "${install_dir}/bin/Runner.Listener")"
+readonly listener_mount_options
+[[ -n "${listener_mount_options}" ]]
+! /usr/bin/grep --quiet --word-regexp nosuid <<<"${listener_mount_options}"
+[[ "$(/usr/bin/stat --format=%U:%G:%a "${install_dir}/bin/Runner.Listener")" == "root:${runner_guard_group}:2755" ]]
 [[ "$(/usr/bin/stat --format=%U:%G:%a:%F "${install_dir}")" == "root:smolrunner-runner:1775:directory" ]]
 [[ "$(/usr/bin/stat --format=%U:%G:%a:%F "${entries}")" == "root:root:444:regular file" ]]
 [[ "$(/usr/bin/stat --format=%U:%G:%a:%F "${checksums}")" == "root:root:444:regular file" ]]
