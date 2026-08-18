@@ -75,6 +75,7 @@ provision:
       umask 022
 
       readonly runner_user="smolrunner-runner"
+      readonly runner_guard_group="smolrunner-runner-guard"
       readonly runner_home="/var/lib/smolrunner-runner"
       readonly install_parent="/opt/smolrunner"
       readonly install_dir="${install_parent}/actions-runner"
@@ -87,7 +88,7 @@ provision:
       readonly jit_launcher_sha256="6f096fb518b6d40d45ca1a9923e423da436b6269fceec5a5989566abbc93a76a"
       readonly integrity_verifier="${launcher_dir}/smolrunner-runner-integrity"
       readonly integrity_verifier_stage="${integrity_verifier}.new"
-      readonly integrity_verifier_sha256="70626f66fc76aa947aee3f45d4c2ee048d915bdcc543c58e953a3f05ee00637d"
+      readonly integrity_verifier_sha256="d8ee50c0981fb6eec4fdc957491e492f3a5befc7153b8916466627c9812a379f"
       readonly marker_dir="/etc/smolrunner"
       readonly runner_entries="${marker_dir}/actions-runner.entries"
       readonly runner_entries_stage="${runner_entries}.new"
@@ -99,6 +100,7 @@ provision:
       readonly runner_sha256="58b758e420b87093fbd4bfddd368074960053e2f1388f01848c82624b90f27d1"
       readonly marker="${marker_dir}/prepared-template.json"
       readonly apt_policy="/etc/apt/apt.conf.d/99-smolrunner-no-automatic-updates"
+      readonly suid_dumpable_policy="/etc/sysctl.d/99-smolrunner-runner-secrets.conf"
 
       if [[ "$(/usr/bin/id -u)" != "0" ]]; then
         echo "prepared-template provisioning requires root" >&2
@@ -140,7 +142,23 @@ provision:
           "${runner_user}"
       fi
       /usr/bin/passwd --lock "${runner_user}" >/dev/null
+      if ! /usr/bin/getent group "${runner_guard_group}" >/dev/null; then
+        /usr/sbin/groupadd --system "${runner_guard_group}"
+      fi
+      [[ -z "$(/usr/bin/getent group "${runner_guard_group}" | /usr/bin/cut --delimiter=: --fields=4)" ]]
+      /usr/bin/install -o root -g root -m 0644 /dev/null "${suid_dumpable_policy}"
+      /usr/bin/printf '%s\n' 'fs.suid_dumpable = 0' >"${suid_dumpable_policy}"
+      /usr/sbin/sysctl --load "${suid_dumpable_policy}" >/dev/null
       [[ "$(/usr/bin/id -Gn "${runner_user}")" == "${runner_user}" ]]
+
+      verify_runner_secret_protection() {
+        [[ "$(/usr/sbin/sysctl -n fs.suid_dumpable)" == "0" ]]
+        local listener_mount_options
+        listener_mount_options="$(/usr/bin/findmnt --noheadings --output OPTIONS --target "${install_dir}/bin/Runner.Listener")"
+        [[ -n "${listener_mount_options}" ]]
+        ! /usr/bin/grep --quiet --word-regexp nosuid <<<"${listener_mount_options}"
+        [[ "$(/usr/bin/stat --format=%U:%G:%a "${install_dir}/bin/Runner.Listener")" == "root:${runner_guard_group}:2755" ]]
+      }
 
       verify_runner_install() {
         [[ "$(${integrity_verifier})" == "smolrunner-runner-integrity-ok" ]]
@@ -152,7 +170,7 @@ provision:
         "${runner_home}"
 
       /usr/bin/printf '%s' \
-        'IyEvYmluL2Jhc2gKc2V0IC1ldW8gcGlwZWZhaWwKCmV4cG9ydCBQQVRIPS91c3Ivc2JpbjovdXNyL2Jpbjovc2JpbjovYmluCgpyZWFkb25seSBpbnN0YWxsX2Rpcj0iL29wdC9zbW9scnVubmVyL2FjdGlvbnMtcnVubmVyIgpyZWFkb25seSBlbnRyaWVzPSIvZXRjL3Ntb2xydW5uZXIvYWN0aW9ucy1ydW5uZXIuZW50cmllcyIKcmVhZG9ubHkgY2hlY2tzdW1zPSIvZXRjL3Ntb2xydW5uZXIvYWN0aW9ucy1ydW5uZXIuc2hhMjU2IgpyZWFkb25seSBydW5uZXJfd29yaz0iJHtpbnN0YWxsX2Rpcn0vX3dvcmsiCnJlYWRvbmx5IHJ1bm5lcl9kaWFnPSIke2luc3RhbGxfZGlyfS9fZGlhZyIKcmVhZG9ubHkgaml0X2xhdW5jaGVyPSIvb3B0L3Ntb2xydW5uZXIvYmluL3Ntb2xydW5uZXItaml0LWxhdW5jaGVyIgpyZWFkb25seSBqaXRfbGF1bmNoZXJfc2hhMjU2PSI2ZjA5NmZiNTE4YjZkNDBkNDVjYTFhOTkyM2U0MjNkYTQzNmI2MjY5ZmNlZWM1YTU5ODk1NjZhYmJjOTNhNzZhIgoKW1sgIiQoL3Vzci9iaW4vaWQgLXUpIiA9PSAiMCIgXV0KW1sgIiQoL3Vzci9iaW4vc3RhdCAtLWZvcm1hdD0lVTolRzolYTolRiAiJHtpbnN0YWxsX2Rpcn0iKSIgPT0gInJvb3Q6c21vbHJ1bm5lci1ydW5uZXI6MTc3NTpkaXJlY3RvcnkiIF1dCltbICIkKC91c3IvYmluL3N0YXQgLS1mb3JtYXQ9JVU6JUc6JWE6JUYgIiR7ZW50cmllc30iKSIgPT0gInJvb3Q6cm9vdDo0NDQ6cmVndWxhciBmaWxlIiBdXQpbWyAiJCgvdXNyL2Jpbi9zdGF0IC0tZm9ybWF0PSVVOiVHOiVhOiVGICIke2NoZWNrc3Vtc30iKSIgPT0gInJvb3Q6cm9vdDo0NDQ6cmVndWxhciBmaWxlIiBdXQpbWyAiJCgvdXNyL2Jpbi9zdGF0IC0tZm9ybWF0PSVVOiVHOiVhOiVGICIke2ppdF9sYXVuY2hlcn0iKSIgPT0gInJvb3Q6cm9vdDo3NTU6cmVndWxhciBmaWxlIiBdXQpbWyAiJCgvdXNyL2Jpbi9zdGF0IC0tZm9ybWF0PSVVOiVHOiVhOiVGICIke3J1bm5lcl93b3JrfSIpIiA9PSAic21vbHJ1bm5lci1ydW5uZXI6c21vbHJ1bm5lci1ydW5uZXI6NzUwOmRpcmVjdG9yeSIgXV0KW1sgIiQoL3Vzci9iaW4vc3RhdCAtLWZvcm1hdD0lVTolRzolYTolRiAiJHtydW5uZXJfZGlhZ30iKSIgPT0gInNtb2xydW5uZXItcnVubmVyOnNtb2xydW5uZXItcnVubmVyOjc1MDpkaXJlY3RvcnkiIF1dCgppZiAvdXNyL2Jpbi9maW5kIC1QICIke2luc3RhbGxfZGlyfSIgLXhkZXYgLW1pbmRlcHRoIDEgXAogIFwoIC1wYXRoICIke3J1bm5lcl93b3JrfSIgLW8gLXBhdGggIiR7cnVubmVyX2RpYWd9IiBcKSAtcHJ1bmUgLW8gXAogICEgLXVzZXIgcm9vdCAtcHJpbnQgLXF1aXQgfCAvdXNyL2Jpbi9ncmVwIC1xIC47IHRoZW4KICBleGl0IDEKZmkKaWYgL3Vzci9iaW4vZmluZCAtUCAiJHtpbnN0YWxsX2Rpcn0iIC14ZGV2IC1taW5kZXB0aCAxIFwKICBcKCAtcGF0aCAiJHtydW5uZXJfd29ya30iIC1vIC1wYXRoICIke3J1bm5lcl9kaWFnfSIgXCkgLXBydW5lIC1vIFwKICAhIC10eXBlIGwgLXBlcm0gLzAyMiAtcHJpbnQgLXF1aXQgfCAvdXNyL2Jpbi9ncmVwIC1xIC47IHRoZW4KICBleGl0IDEKZmkKCigKICBjZCAiJHtpbnN0YWxsX2Rpcn0iCiAgL3Vzci9iaW4vZmluZCAtUCAuIC14ZGV2IC1taW5kZXB0aCAxIC1wcmludGYgJyV5ICVtICVQICVsXG4nIHwgL3Vzci9iaW4vc29ydAopIHwgL3Vzci9iaW4vY21wIC0tc2lsZW50IC0gIiR7ZW50cmllc30iCigKICBjZCAiJHtpbnN0YWxsX2Rpcn0iCiAgL3Vzci9iaW4vc2hhMjU2c3VtIC0tY2hlY2sgLS1zdHJpY3QgLS1xdWlldCAiJHtjaGVja3N1bXN9IgopCi91c3IvYmluL3ByaW50ZiAnJXNcbicgIiR7aml0X2xhdW5jaGVyX3NoYTI1Nn0gICR7aml0X2xhdW5jaGVyfSIgfCAvdXNyL2Jpbi9zaGEyNTZzdW0gLS1jaGVjayAtLXN0YXR1cwoKL3Vzci9iaW4vcHJpbnRmICclc1xuJyAnc21vbHJ1bm5lci1ydW5uZXItaW50ZWdyaXR5LW9rJwo=' \
+        'IyEvYmluL2Jhc2gKc2V0IC1ldW8gcGlwZWZhaWwKCmV4cG9ydCBQQVRIPS91c3Ivc2JpbjovdXNyL2Jpbjovc2JpbjovYmluCgpyZWFkb25seSBpbnN0YWxsX2Rpcj0iL29wdC9zbW9scnVubmVyL2FjdGlvbnMtcnVubmVyIgpyZWFkb25seSBlbnRyaWVzPSIvZXRjL3Ntb2xydW5uZXIvYWN0aW9ucy1ydW5uZXIuZW50cmllcyIKcmVhZG9ubHkgY2hlY2tzdW1zPSIvZXRjL3Ntb2xydW5uZXIvYWN0aW9ucy1ydW5uZXIuc2hhMjU2IgpyZWFkb25seSBydW5uZXJfd29yaz0iJHtpbnN0YWxsX2Rpcn0vX3dvcmsiCnJlYWRvbmx5IHJ1bm5lcl9ndWFyZF9ncm91cD0ic21vbHJ1bm5lci1ydW5uZXItZ3VhcmQiCnJlYWRvbmx5IHJ1bm5lcl9kaWFnPSIke2luc3RhbGxfZGlyfS9fZGlhZyIKcmVhZG9ubHkgaml0X2xhdW5jaGVyPSIvb3B0L3Ntb2xydW5uZXIvYmluL3Ntb2xydW5uZXItaml0LWxhdW5jaGVyIgpyZWFkb25seSBqaXRfbGF1bmNoZXJfc2hhMjU2PSI2ZjA5NmZiNTE4YjZkNDBkNDVjYTFhOTkyM2U0MjNkYTQzNmI2MjY5ZmNlZWM1YTU5ODk1NjZhYmJjOTNhNzZhIgoKW1sgIiQoL3Vzci9iaW4vaWQgLXUpIiA9PSAiMCIgXV0KW1sgIiQoL3Vzci9zYmluL3N5c2N0bCAtbiBmcy5zdWlkX2R1bXBhYmxlKSIgPT0gIjAiIF1dCmxpc3RlbmVyX21vdW50X29wdGlvbnM9IiQoL3Vzci9iaW4vZmluZG1udCAtLW5vaGVhZGluZ3MgLS1vdXRwdXQgT1BUSU9OUyAtLXRhcmdldCAiJHtpbnN0YWxsX2Rpcn0vYmluL1J1bm5lci5MaXN0ZW5lciIpIgpyZWFkb25seSBsaXN0ZW5lcl9tb3VudF9vcHRpb25zCltbIC1uICIke2xpc3RlbmVyX21vdW50X29wdGlvbnN9IiBdXQohIC91c3IvYmluL2dyZXAgLS1xdWlldCAtLXdvcmQtcmVnZXhwIG5vc3VpZCA8PDwiJHtsaXN0ZW5lcl9tb3VudF9vcHRpb25zfSIKW1sgIiQoL3Vzci9iaW4vc3RhdCAtLWZvcm1hdD0lVTolRzolYSAiJHtpbnN0YWxsX2Rpcn0vYmluL1J1bm5lci5MaXN0ZW5lciIpIiA9PSAicm9vdDoke3J1bm5lcl9ndWFyZF9ncm91cH06Mjc1NSIgXV0KW1sgIiQoL3Vzci9iaW4vc3RhdCAtLWZvcm1hdD0lVTolRzolYTolRiAiJHtpbnN0YWxsX2Rpcn0iKSIgPT0gInJvb3Q6c21vbHJ1bm5lci1ydW5uZXI6MTc3NTpkaXJlY3RvcnkiIF1dCltbICIkKC91c3IvYmluL3N0YXQgLS1mb3JtYXQ9JVU6JUc6JWE6JUYgIiR7ZW50cmllc30iKSIgPT0gInJvb3Q6cm9vdDo0NDQ6cmVndWxhciBmaWxlIiBdXQpbWyAiJCgvdXNyL2Jpbi9zdGF0IC0tZm9ybWF0PSVVOiVHOiVhOiVGICIke2NoZWNrc3Vtc30iKSIgPT0gInJvb3Q6cm9vdDo0NDQ6cmVndWxhciBmaWxlIiBdXQpbWyAiJCgvdXNyL2Jpbi9zdGF0IC0tZm9ybWF0PSVVOiVHOiVhOiVGICIke2ppdF9sYXVuY2hlcn0iKSIgPT0gInJvb3Q6cm9vdDo3NTU6cmVndWxhciBmaWxlIiBdXQpbWyAiJCgvdXNyL2Jpbi9zdGF0IC0tZm9ybWF0PSVVOiVHOiVhOiVGICIke3J1bm5lcl93b3JrfSIpIiA9PSAic21vbHJ1bm5lci1ydW5uZXI6c21vbHJ1bm5lci1ydW5uZXI6NzUwOmRpcmVjdG9yeSIgXV0KW1sgIiQoL3Vzci9iaW4vc3RhdCAtLWZvcm1hdD0lVTolRzolYTolRiAiJHtydW5uZXJfZGlhZ30iKSIgPT0gInNtb2xydW5uZXItcnVubmVyOnNtb2xydW5uZXItcnVubmVyOjc1MDpkaXJlY3RvcnkiIF1dCgppZiAvdXNyL2Jpbi9maW5kIC1QICIke2luc3RhbGxfZGlyfSIgLXhkZXYgLW1pbmRlcHRoIDEgXAogIFwoIC1wYXRoICIke3J1bm5lcl93b3JrfSIgLW8gLXBhdGggIiR7cnVubmVyX2RpYWd9IiBcKSAtcHJ1bmUgLW8gXAogICEgLXVzZXIgcm9vdCAtcHJpbnQgLXF1aXQgfCAvdXNyL2Jpbi9ncmVwIC1xIC47IHRoZW4KICBleGl0IDEKZmkKaWYgL3Vzci9iaW4vZmluZCAtUCAiJHtpbnN0YWxsX2Rpcn0iIC14ZGV2IC1taW5kZXB0aCAxIFwKICBcKCAtcGF0aCAiJHtydW5uZXJfd29ya30iIC1vIC1wYXRoICIke3J1bm5lcl9kaWFnfSIgXCkgLXBydW5lIC1vIFwKICAhIC10eXBlIGwgLXBlcm0gLzAyMiAtcHJpbnQgLXF1aXQgfCAvdXNyL2Jpbi9ncmVwIC1xIC47IHRoZW4KICBleGl0IDEKZmkKCigKICBjZCAiJHtpbnN0YWxsX2Rpcn0iCiAgL3Vzci9iaW4vZmluZCAtUCAuIC14ZGV2IC1taW5kZXB0aCAxIC1wcmludGYgJyV5ICVtICVQICVsXG4nIHwgL3Vzci9iaW4vc29ydAopIHwgL3Vzci9iaW4vY21wIC0tc2lsZW50IC0gIiR7ZW50cmllc30iCigKICBjZCAiJHtpbnN0YWxsX2Rpcn0iCiAgL3Vzci9iaW4vc2hhMjU2c3VtIC0tY2hlY2sgLS1zdHJpY3QgLS1xdWlldCAiJHtjaGVja3N1bXN9IgopCi91c3IvYmluL3ByaW50ZiAnJXNcbicgIiR7aml0X2xhdW5jaGVyX3NoYTI1Nn0gICR7aml0X2xhdW5jaGVyfSIgfCAvdXNyL2Jpbi9zaGEyNTZzdW0gLS1jaGVjayAtLXN0YXR1cwoKL3Vzci9iaW4vcHJpbnRmICclc1xuJyAnc21vbHJ1bm5lci1ydW5uZXItaW50ZWdyaXR5LW9rJwo=' \
         | /usr/bin/base64 --decode >"${integrity_verifier_stage}"
       /usr/bin/printf '%s  %s\n' "${integrity_verifier_sha256}" "${integrity_verifier_stage}" \
         | /usr/bin/sha256sum --check --status
@@ -162,16 +180,18 @@ provision:
       if [[ -f "${marker}" && -x "${install_dir}/bin/Runner.Listener" ]]; then
         /usr/bin/cmp --silent "${marker}" <(/usr/bin/printf '%s\n' \
           '{' \
-          '  "schema_version": 1,' \
+          '  "schema_version": 2,' \
           '  "actions_runner_version": "2.336.0",' \
           '  "actions_runner_digest": "sha256:58b758e420b87093fbd4bfddd368074960053e2f1388f01848c82624b90f27d1",' \
           '  "workload_user": "smolrunner-runner",' \
+          '  "runner_listener_protection": "setgid_nondumpable",' \
           '  "runner_install_directory": "/opt/smolrunner/actions-runner",' \
           '  "runner_work_directory": "/opt/smolrunner/actions-runner/_work",' \
           '  "jit_launcher_path": "/opt/smolrunner/bin/smolrunner-jit-launcher",' \
           '  "jit_launcher_digest": "sha256:6f096fb518b6d40d45ca1a9923e423da436b6269fceec5a5989566abbc93a76a"' \
           '}')
         verify_runner_install
+        verify_runner_secret_protection
         verify_automatic_updates_disabled
         exit 0
       fi
@@ -221,6 +241,10 @@ provision:
       /usr/bin/chown -R root:root "${install_stage}"
       /usr/bin/chown root:"${runner_user}" "${install_stage}"
       /usr/bin/chmod 1775 "${install_stage}"
+      # A distinct setgid identity makes Linux mark the listener non-dumpable at exec.
+      # With fs.suid_dumpable=0, same-UID workflow processes cannot read its JIT environment.
+      /usr/bin/chown root:"${runner_guard_group}" "${install_stage}/bin/Runner.Listener"
+      /usr/bin/chmod 2755 "${install_stage}/bin/Runner.Listener"
       /usr/bin/install -d -o "${runner_user}" -g "${runner_user}" -m 0750 \
         "${install_stage}/_work" "${install_stage}/_diag"
       (
@@ -248,15 +272,17 @@ provision:
       /usr/bin/rm -f -- "${jit_launcher_stage}"
 
       verify_runner_install
+      verify_runner_secret_protection
       verify_automatic_updates_disabled
 
       readonly marker_stage="${marker}.new"
       /usr/bin/printf '%s\n' \
         '{' \
-        '  "schema_version": 1,' \
+        '  "schema_version": 2,' \
         '  "actions_runner_version": "2.336.0",' \
         '  "actions_runner_digest": "sha256:58b758e420b87093fbd4bfddd368074960053e2f1388f01848c82624b90f27d1",' \
         '  "workload_user": "smolrunner-runner",' \
+        '  "runner_listener_protection": "setgid_nondumpable",' \
         '  "runner_install_directory": "/opt/smolrunner/actions-runner",' \
         '  "runner_work_directory": "/opt/smolrunner/actions-runner/_work",' \
         '  "jit_launcher_path": "/opt/smolrunner/bin/smolrunner-jit-launcher",' \
