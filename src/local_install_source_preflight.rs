@@ -532,6 +532,14 @@ mod tests {
                 status: 0,
             }
         }
+
+        fn failed(status: i32, stderr: impl Into<String>) -> Self {
+            Self {
+                stdout: String::new(),
+                stderr: stderr.into(),
+                status,
+            }
+        }
     }
 
     struct ScriptedExecutor {
@@ -610,6 +618,7 @@ mod tests {
             Response::success(format!("{commit}\n")),
             Response::success(format!("{tree}\n")),
             Response::success(remotes),
+            Response::failed(1, ""),
             Response::success(status),
             Response::success("100644\n"),
             Response::success(
@@ -665,7 +674,7 @@ mod tests {
             LocalInstallSourceProjectDisposition::ExactSmolrunner
         );
         assert!(receipt.blocking_codes().is_empty());
-        assert_eq!(executor.commands.borrow().len(), 14);
+        assert_eq!(executor.commands.borrow().len(), 16);
         let public = serde_json::to_string(&receipt).expect("receipt JSON");
         assert!(!public.contains(checkout.path().to_string_lossy().as_ref()));
         assert!(!public.contains("/private/path"));

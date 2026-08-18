@@ -831,6 +831,7 @@ projects:
             Response::success(format!("{COMMIT}\n")),
             Response::success(format!("{TREE}\n")),
             Response::success(remotes),
+            Response::failed(1, ""),
             Response::success(status),
             Response::success("100644\n"),
             Response::success(worktrees),
@@ -881,7 +882,7 @@ projects:
         assert!(recovery.source_ambiguous);
         assert!(recovery.local_only_state_present());
         assert_eq!(report.summary().catalogued_checkout_count, 1);
-        assert_eq!(executor.commands.borrow().len(), 14);
+        assert_eq!(executor.commands.borrow().len(), 16);
 
         let json = serde_json::to_string(&report).expect("public report");
         assert!(!json.contains(root.path().to_string_lossy().as_ref()));
