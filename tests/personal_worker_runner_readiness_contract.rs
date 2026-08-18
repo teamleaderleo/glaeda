@@ -623,6 +623,11 @@ fn append_identity(steps: &mut Vec<Step>) {
     steps.push(Step::Output(Output::success(format!(
         "{CONFIG_HEX}  [REDACTED]\n"
     ))));
+    for _ in 0..4 {
+        steps.push(Step::Output(Output::success(format!(
+            "{CONFIG_HEX}  [REDACTED]\n"
+        ))));
+    }
 }
 
 fn append_process_snapshot(steps: &mut Vec<Step>, worker: bool) {
@@ -641,6 +646,9 @@ fn append_process_snapshot(steps: &mut Vec<Step>, worker: bool) {
 fn append_process_identity(steps: &mut Vec<Step>, name: &str, inode: u64, pid: u32) {
     steps.push(Step::Output(Output::success(format!(
         "{RUNNER_ROOT}/bin/{name}\n"
+    ))));
+    steps.push(Step::Output(Output::success(format!(
+        "{CONFIG_HEX}  [REDACTED]\n"
     ))));
     steps.push(Step::Output(Output::success(format!("{RUNNER_ROOT}\n"))));
     steps.push(Step::Output(Output::success(format!("900:{inode}\n"))));
@@ -682,7 +690,7 @@ fn idle_ready_binds_exact_sources_timeout_and_private_evidence() {
     assert!(observation.private_runner_observation().is_some());
     assert!(observation.private_runner_failure().is_none());
     let seen = executor.seen();
-    assert_eq!(seen.len(), 16);
+    assert_eq!(seen.len(), 26);
     assert!(
         seen.iter()
             .all(|(_, timeout)| *timeout == Duration::from_secs(5))
