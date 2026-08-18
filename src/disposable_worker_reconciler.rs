@@ -54,7 +54,15 @@ impl DisposableVmIdentity {
     #[cfg(unix)]
     #[must_use]
     pub(crate) fn from_host_identity(identity: &LimaHostInstanceIdentity) -> Self {
-        Self(identity.digest().clone())
+        Self(identity.ownership_digest().clone())
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn matches_host_identity(&self, identity: &LimaHostInstanceIdentity) -> bool {
+        &self.0 == identity.ownership_digest()
+            || identity
+                .legacy_digest()
+                .is_some_and(|digest| &self.0 == digest)
     }
 
     /// Parse one canonical identity digest.

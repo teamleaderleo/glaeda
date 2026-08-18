@@ -36,12 +36,25 @@ const DISK_DOMAIN: &[u8] = b"smolrunner-lima-root-disk-gpt-v1";
 #[derive(Clone, PartialEq, Eq)]
 pub struct LimaHostInstanceIdentity {
     digest: Sha256Digest,
+    ownership_digest: Sha256Digest,
+    legacy_digest: Option<Sha256Digest>,
 }
 
 impl LimaHostInstanceIdentity {
     #[must_use]
     pub const fn digest(&self) -> &Sha256Digest {
         &self.digest
+    }
+
+    /// Host-controlled VZ identity used to bind cleanup authority. Unlike the full clone
+    /// identity, this digest excludes root-disk bytes that privileged guest code can modify.
+    #[must_use]
+    pub(crate) const fn ownership_digest(&self) -> &Sha256Digest {
+        &self.ownership_digest
+    }
+
+    pub(crate) const fn legacy_digest(&self) -> Option<&Sha256Digest> {
+        self.legacy_digest.as_ref()
     }
 }
 
@@ -65,6 +78,7 @@ pub struct LimaHostIdentityObservation {
     root_disk: File,
     root_disk_stat: rustix::fs::Stat,
     root_disk_bytes: u64,
+    verify_disk_identity: bool,
 }
 
 impl LimaHostIdentityObservation {
@@ -93,9 +107,22 @@ impl LimaHostIdentityObservation {
         };
         held_evidence.verify_bindings(request)?;
         let identifier = read_identifier(&self.platform_identifier, &self.identifier_stat)?;
-        let disk = read_disk_evidence(&self.root_disk, self.root_disk_bytes)?;
+        let disk = if self.verify_disk_identity {
+            Some(read_disk_evidence(&self.root_disk, self.root_disk_bytes)?)
+        } else {
+            None
+        };
         held_evidence.verify_bindings(request)?;
-        if derive_identity(&identifier, self.root_disk_bytes, &disk)? != self.identity {
+        let current = match disk {
+            Some(disk) => derive_identity(&identifier, self.root_disk_bytes, &disk)?,
+            None => derive_cleanup_identity(&identifier, None)?,
+        };
+        let matches = if self.verify_disk_identity {
+            current == self.identity
+        } else {
+            current.ownership_digest == self.identity.ownership_digest
+        };
+        if !matches {
             return Err(drift("host_identity"));
         }
         Ok(())
@@ -195,6 +222,24 @@ impl LimaHostIdentityAdapter {
         &self,
         request: &LimaObservationRequest,
     ) -> Result<LimaHostIdentityObservation, LimaHostIdentityError> {
+        self.observe_with_disk_identity(request, true)
+    }
+
+    /// Observe cleanup ownership from host-controlled VZ evidence while retaining the root disk
+    /// descriptor for name-to-inode and size checks. Guest-mutable GPT contents are deliberately
+    /// excluded so a hostile guest cannot veto destruction by corrupting its own disk.
+    pub(crate) fn observe_cleanup(
+        &self,
+        request: &LimaObservationRequest,
+    ) -> Result<LimaHostIdentityObservation, LimaHostIdentityError> {
+        self.observe_with_disk_identity(request, false)
+    }
+
+    fn observe_with_disk_identity(
+        &self,
+        request: &LimaObservationRequest,
+        verify_disk_identity: bool,
+    ) -> Result<LimaHostIdentityObservation, LimaHostIdentityError> {
         if request.expected_vm_type() != LimaVmType::Vz
             || request.expected_architecture() != LimaArchitecture::Aarch64
         {
@@ -229,7 +274,9 @@ impl LimaHostIdentityAdapter {
         let root_disk_stat = validate_identity_file(&root_disk, "root_disk")?;
         let root_disk_bytes =
             u64::try_from(root_disk_stat.st_size).map_err(|_| malformed_disk())?;
-        let disk_evidence = read_disk_evidence(&root_disk, root_disk_bytes)?;
+        let disk_evidence = verify_disk_identity
+            .then(|| read_disk_evidence(&root_disk, root_disk_bytes))
+            .transpose()?;
 
         let held_evidence = HeldIdentityEvidence {
             lima_home: &lima_home,
@@ -247,14 +294,24 @@ impl LimaHostIdentityAdapter {
         if identifier_again != identifier_bytes {
             return Err(drift("platform_identifier"));
         }
-        let disk_evidence_again = read_disk_evidence(&root_disk, root_disk_bytes)?;
-        if disk_evidence_again != disk_evidence {
+        let disk_evidence_again = if verify_disk_identity {
+            Some(read_disk_evidence(&root_disk, root_disk_bytes)?)
+        } else {
+            read_disk_evidence(&root_disk, root_disk_bytes).ok()
+        };
+        if verify_disk_identity && disk_evidence_again != disk_evidence {
             return Err(drift("root_disk"));
         }
         held_evidence.verify_bindings(request)?;
 
         Ok(LimaHostIdentityObservation {
-            identity: derive_identity(&identifier_again, root_disk_bytes, &disk_evidence_again)?,
+            identity: match disk_evidence_again.as_deref() {
+                Some(disk) if !verify_disk_identity => {
+                    derive_cleanup_identity(&identifier_again, Some((root_disk_bytes, disk)))?
+                }
+                Some(disk) => derive_identity(&identifier_again, root_disk_bytes, disk)?,
+                None => derive_cleanup_identity(&identifier_again, None)?,
+            },
             lima_home,
             lima_home_stat,
             instance_directory,
@@ -264,6 +321,7 @@ impl LimaHostIdentityAdapter {
             root_disk,
             root_disk_stat,
             root_disk_bytes,
+            verify_disk_identity,
         })
     }
 }
@@ -701,6 +759,24 @@ fn derive_identity(
     );
     Ok(LimaHostInstanceIdentity {
         digest: parse_digest(digest)?,
+        ownership_digest: parse_digest(identifier_digest)?,
+        legacy_digest: Some(parse_digest(digest)?),
+    })
+}
+
+fn derive_cleanup_identity(
+    identifier: &[u8],
+    legacy_disk: Option<(u64, &[u8])>,
+) -> Result<LimaHostInstanceIdentity, LimaHostIdentityError> {
+    let ownership = digest_fields(b"smolrunner-lima-vz-identifier-v1", [identifier]);
+    let legacy_digest = legacy_disk
+        .map(|(bytes, disk)| derive_identity(identifier, bytes, disk))
+        .transpose()?
+        .map(|identity| identity.digest);
+    Ok(LimaHostInstanceIdentity {
+        digest: parse_digest(ownership)?,
+        ownership_digest: parse_digest(ownership)?,
+        legacy_digest,
     })
 }
 
