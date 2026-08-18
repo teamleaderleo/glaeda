@@ -403,6 +403,24 @@ impl ProjectCheckoutObserver {
         checkout: &Path,
         executor: &impl TimedCommandExecutor,
     ) -> Result<String, ProjectCheckoutObservationError> {
+        let filters = self.git(
+            checkout,
+            &[
+                "config",
+                "--includes",
+                "--get-regexp",
+                "^filter\\..*\\.(clean|process)$",
+            ],
+            executor,
+        )?;
+        if filters.success
+            || filters.status != Some(1)
+            || !filters.stdout.is_empty()
+            || !filters.stderr.is_empty()
+        {
+            return Err(unavailable());
+        }
+
         let record = self.git(
             checkout,
             &[
@@ -879,6 +897,7 @@ mod tests {
             Response::success(format!("{COMMIT}\n")),
             Response::success(format!("{TREE}\n")),
             Response::success(remotes),
+            Response::failed(1, ""),
             Response::success(status),
             Response::success(modes),
             Response::success(worktrees),
@@ -940,7 +959,7 @@ mod tests {
             !format!("{:?}", observation.location_identity())
                 .contains(checkout.path().to_string_lossy().as_ref())
         );
-        assert_eq!(executor.commands.borrow().len(), 14);
+        assert_eq!(executor.commands.borrow().len(), 16);
     }
 
     #[test]
@@ -1016,6 +1035,30 @@ mod tests {
                 .expect("error JSON")
                 .contains("private path")
         );
+    }
+
+    #[test]
+    fn configured_content_filter_is_refused_before_status() {
+        let checkout = TempDirectory::new("content-filter");
+        let executor = ScriptedExecutor::new(vec![
+            Response::success("false\n"),
+            Response::success(format!("{}\n", checkout.path().display())),
+            Response::success(format!("{COMMIT}\n")),
+            Response::success(format!("{TREE}\n")),
+            Response::failed(1, ""),
+            Response::success("filter.pwn.clean /tmp/payload\n"),
+        ]);
+
+        let error = observer()
+            .observe(checkout.path(), &executor)
+            .expect_err("configured content filter must fail closed");
+        assert_eq!(error.kind, ProjectCheckoutObservationErrorKind::Unavailable);
+        assert!(!executor.commands.borrow().iter().any(|command| {
+            command
+                .displayed_argv()
+                .iter()
+                .any(|argument| argument == "status")
+        }));
     }
 
     #[test]

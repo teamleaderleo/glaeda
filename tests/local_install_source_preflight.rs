@@ -67,6 +67,14 @@ impl Response {
             status: 0,
         }
     }
+
+    fn failed(status: i32, stderr: impl Into<String>) -> Self {
+        Self {
+            stdout: String::new(),
+            stderr: stderr.into(),
+            status,
+        }
+    }
 }
 
 struct ScriptedExecutor {
@@ -144,6 +152,7 @@ fn snapshot(commit: &str) -> Vec<Response> {
         Response::success(format!("{commit}\n")),
         Response::success(format!("{TREE}\n")),
         Response::success("remote.origin.url\nhttps://github.com/teamleaderleo/smolrunner.git\0"),
+        Response::failed(1, ""),
         Response::success(format!("# branch.oid {commit}\0# branch.head main\0")),
         Response::success("100644\n"),
         Response::success(
@@ -233,7 +242,7 @@ fn git_snapshot_drift_maps_to_one_source_changed_refusal() {
         receipt.blocking_codes(),
         [LocalInstallSourceBlockingCode::SourceChanged]
     );
-    assert_eq!(executor.commands.borrow().len(), 14);
+    assert_eq!(executor.commands.borrow().len(), 16);
     let public = serde_json::to_string(&receipt).expect("receipt JSON");
     assert!(!public.contains(checkout.path().to_string_lossy().as_ref()));
     assert!(!public.contains(CHANGED_COMMIT));
