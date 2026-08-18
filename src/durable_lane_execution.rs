@@ -38,7 +38,7 @@ impl std::error::Error for DurableLanePlanError {}
 /// The first durable execution slice accepts only irreversible actions. SmolRunner does not yet
 /// claim that package, account, mapping, linger, or rootless Podman changes can be automatically
 /// rolled back safely.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DurableLanePlan {
     actions: Vec<PlannedMutation>,
     commands: BTreeMap<String, LaneCommand>,
