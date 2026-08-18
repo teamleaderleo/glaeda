@@ -1516,13 +1516,13 @@ mod tests {
                     .last()
                     .is_some_and(|value| value == "/etc/smolrunner/prepared-template.json")
                 {
-                    "639a1e7b41aa6c9ac1c6bc371a23ea954117c6227a65bfda2d2eba4fa7d83091  /etc/smolrunner/prepared-template.json\n".to_owned()
+                    "091e1324f9371a31f0f01ffd2696ff3cc23c459654d2701b0b0149643ed7957f  /etc/smolrunner/prepared-template.json\n".to_owned()
                 } else if argv
                     .last()
                     .is_some_and(|value| value == "/opt/smolrunner/bin/smolrunner-runner-integrity")
                     && argv.iter().any(|value| value == "/usr/bin/sha256sum")
                 {
-                    "70626f66fc76aa947aee3f45d4c2ee048d915bdcc543c58e953a3f05ee00637d  /opt/smolrunner/bin/smolrunner-runner-integrity\n".to_owned()
+                    "d8ee50c0981fb6eec4fdc957491e492f3a5befc7153b8916466627c9812a379f  /opt/smolrunner/bin/smolrunner-runner-integrity\n".to_owned()
                 } else if argv
                     .last()
                     .is_some_and(|value| value == "/opt/smolrunner/bin/smolrunner-runner-integrity")
