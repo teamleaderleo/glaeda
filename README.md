@@ -122,15 +122,18 @@ cargo run --locked -- host plan --file examples/quarry.yml
 cargo run --locked -- --output json host plan --file examples/glossless.yml
 ```
 
-On Linux, propose one host-preparation phase and require its exact deterministic confirmation before mutation:
+On Linux, first build SmolRunner as an unprivileged user. Then elevate only the built binary to propose one host-preparation phase and require its exact deterministic confirmation before mutation:
 
 ```bash
-sudo cargo run --locked -- host prepare --file examples/quarry.yml
-sudo cargo run --locked -- host prepare --file examples/quarry.yml --confirm EXACT_CONFIRMATION
-sudo cargo run --locked -- --output json host prepare --file examples/quarry.yml --confirm EXACT_CONFIRMATION
+cargo build --locked
+sudo ./target/debug/smolrunner host prepare --file examples/quarry.yml
+sudo ./target/debug/smolrunner host prepare --file examples/quarry.yml --confirm EXACT_CONFIRMATION
+sudo ./target/debug/smolrunner --output json host prepare --file examples/quarry.yml --confirm EXACT_CONFIRMATION
 ```
 
-The first command re-observes the host, prints the reviewed proposal and confirmation requirement, and performs no mutation. The confirmed command re-observes and replans in the same elevated process, executes only the matching single phase, checkpoints the journal before and after each action, and stops at any fresh-observation barrier. Initial host mutations are deliberately treated as irreversible; there is no generic `apply`, multi-phase continuation, automatic retry, or unattended repair path.
+The first elevated command re-observes the host, prints the reviewed proposal and confirmation requirement, and performs no mutation. The confirmed command re-observes and replans in the same elevated process, executes only the matching single phase, checkpoints the journal before and after each action, and stops at any fresh-observation barrier. Initial host mutations are deliberately treated as irreversible; there is no generic `apply`, multi-phase continuation, automatic retry, or unattended repair path.
+
+Do not run Cargo with `sudo`: Cargo may execute build scripts, procedural macros, compiler wrappers, and other build-time code before SmolRunner's own controls start. Only the reviewed, already-built SmolRunner binary should receive elevated privileges.
 
 `doctor` probes Linux support, architecture, systemd, cgroup v2, Podman, and Git. `plan` validates the versioned manifest and describes the runner user, registration, container image, and disposable verification boundary SmolRunner would eventually reconcile. `host plan` additionally reads bounded host state and distinguishes proven absence from facts that still need a privileged or authenticated inspection path. These three commands are read-only. `host prepare` is the narrow mutating exception and requires explicit elevation plus an exact confirmation derived from the immediately preceding public proposal. Human and JSON output come from the same typed reports.
 
