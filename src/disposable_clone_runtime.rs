@@ -610,7 +610,7 @@ impl DisposableCloneRuntime {
             .map_err(|_| invalid_configuration("cleanup_observer_invalid"))?;
         let bounded = BoundedExecutor { executor };
         let lima = adapter.observe(&request, &bounded, clock);
-        let host = LimaHostIdentityAdapter.observe(&request);
+        let host = LimaHostIdentityAdapter.observe_cleanup(&request);
         match (lima, host) {
             (Err(lima_error), Err(host_error))
                 if lima_error.code == LimaObservationRefusalCode::MissingInstanceEvidence
@@ -620,8 +620,7 @@ impl DisposableCloneRuntime {
             }
             (Ok(_), Ok(host)) => {
                 if host.root_disk_bytes() != reservation.resources().disk_bytes()
-                    || &DisposableVmIdentity::from_host_identity(host.identity())
-                        != expected_identity
+                    || !expected_identity.matches_host_identity(host.identity())
                 {
                     return Err(DisposableCloneRuntimeError::recovery(
                         "cleanup_vm_identity_drift",
@@ -2171,6 +2170,50 @@ mod tests {
             durable_attempt(&root, &attempt_id).phase(),
             DisposableAttemptPhase::Destroying
         );
+    }
+
+    #[test]
+    fn cleanup_deletes_owned_vm_after_guest_disk_identity_drift() {
+        let root = TempRoot::new("cleanup-guest-disk-drift");
+        let host = LimaHostIdentityFixture::new_with_disk_bytes(
+            "clone-runtime-cleanup-guest-disk-drift",
+            SOURCE,
+            SOURCE_DISK,
+        );
+        let clone_runtime = runtime(&root, &host);
+        let mut executor = executor(&host, false);
+        let (mut store, attempt_id, runner) =
+            install_terminal_attempt(&root, &host, &clone_runtime, &mut executor);
+        let mut cleanup = FakeCleanup {
+            runner: Some(runner),
+            remove_calls: 0,
+            fail_remove_after_remove: false,
+        };
+        store
+            .execute_disposable_cleanup_transaction(
+                &clone_runtime,
+                &attempt_id,
+                &mut cleanup,
+                &executor,
+                &FixedClock,
+            )
+            .unwrap();
+
+        host.rewrite_disk_identity(TARGET, 0x77);
+
+        assert!(matches!(
+            store
+                .execute_disposable_cleanup_transaction(
+                    &clone_runtime,
+                    &attempt_id,
+                    &mut cleanup,
+                    &executor,
+                    &FixedClock,
+                )
+                .unwrap(),
+            DisposableCleanupTransactionOutcome::VmDestroyed { .. }
+        ));
+        assert!(!host.lima_home().join(TARGET).exists());
     }
 
     #[test]
