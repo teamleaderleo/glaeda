@@ -707,6 +707,7 @@ fn classify_failure(
         | ActionsRunnerReadinessRefusalCode::MissingIdentityEvidence
         | ActionsRunnerReadinessRefusalCode::MalformedIdentityEvidence
         | ActionsRunnerReadinessRefusalCode::ConfigurationIdentityMismatch
+        | ActionsRunnerReadinessRefusalCode::InstallationIdentityMismatch
         | ActionsRunnerReadinessRefusalCode::IdentityDrift => {
             (RepairRequired, RunnerIdentityMismatch)
         }

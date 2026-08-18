@@ -373,6 +373,10 @@ fn runner_request_for(lima_home: &str) -> ActionsRunnerReadinessRequest {
         RUNNER_ROOT,
         DRAIN_MARKER,
         digest("b"),
+        digest("b"),
+        digest("b"),
+        digest("b"),
+        digest("b"),
     )
     .expect("runner request")
 }

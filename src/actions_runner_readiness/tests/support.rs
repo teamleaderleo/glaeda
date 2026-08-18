@@ -10,6 +10,10 @@ fn request() -> ActionsRunnerReadinessRequest {
         RUNNER_ROOT,
         DRAIN_MARKER,
         digest(),
+        digest(),
+        digest(),
+        digest(),
+        digest(),
     )
     .expect("request")
 }
@@ -122,6 +126,11 @@ fn append_identity(steps: &mut Vec<ScriptedStep>) {
     steps.push(ScriptedStep::Output(ScriptedOutput::success(format!(
         "{CONFIG_HEX}  [REDACTED]\n"
     ))));
+    for _ in 0..4 {
+        steps.push(ScriptedStep::Output(ScriptedOutput::success(format!(
+            "{CONFIG_HEX}  [REDACTED]\n"
+        ))));
+    }
 }
 
 fn append_process_snapshot(
@@ -152,6 +161,9 @@ fn append_process_snapshot(
 fn append_process_identity(steps: &mut Vec<ScriptedStep>, process_name: &str, inode: u64) {
     steps.push(ScriptedStep::Output(ScriptedOutput::success(format!(
         "{RUNNER_ROOT}/bin/{process_name}\n"
+    ))));
+    steps.push(ScriptedStep::Output(ScriptedOutput::success(format!(
+        "{CONFIG_HEX}  [REDACTED]\n"
     ))));
     steps.push(ScriptedStep::Output(ScriptedOutput::success(format!(
         "{RUNNER_ROOT}\n"
