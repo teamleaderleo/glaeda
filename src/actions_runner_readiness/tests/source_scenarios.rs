@@ -96,7 +96,7 @@ fn stale_source_or_expired_during_probe_returns_stale_without_claiming_identity(
         .expect("expired while probing");
     assert_eq!(expired.report().state, ActionsRunnerReadinessState::Stale);
     assert!(expired.report().configured_identity.is_none());
-    assert_eq!(expired.private_evidence().commands().len(), 16);
+    assert_eq!(expired.private_evidence().commands().len(), 26);
 }
 
 #[test]

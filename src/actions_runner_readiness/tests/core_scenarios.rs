@@ -41,7 +41,7 @@ fn idle_ready_observation_binds_exact_commands_identity_and_freshness() {
     assert_eq!(executor.remaining(), 0);
 
     let commands = executor.seen();
-    assert_eq!(commands.len(), 16);
+    assert_eq!(commands.len(), 26);
     assert_eq!(
         commands[0].displayed_argv(),
         vec![
@@ -58,7 +58,7 @@ fn idle_ready_observation_binds_exact_commands_identity_and_freshness() {
         ]
     );
     assert_eq!(
-        commands[3].displayed_argv(),
+        commands[7].displayed_argv(),
         vec![
             "/opt/homebrew/bin/limactl",
             "--tty=false",
@@ -71,7 +71,7 @@ fn idle_ready_observation_binds_exact_commands_identity_and_freshness() {
         ]
     );
     assert_eq!(
-        commands[5].displayed_argv(),
+        commands[9].displayed_argv(),
         vec![
             "/opt/homebrew/bin/limactl",
             "--tty=false",

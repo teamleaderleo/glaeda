@@ -18,8 +18,26 @@ fn configuration_process_identity_and_drain_drift_are_refused() {
         ActionsRunnerReadinessRefusalCode::ConfigurationIdentityMismatch
     );
 
+    let mut installation_steps = running_steps(false, false);
+    let ScriptedStep::Output(listener_digest) = &mut installation_steps[2] else {
+        panic!("listener digest output");
+    };
+    listener_digest.stdout = format!("{}  [REDACTED]\n", "c".repeat(64));
+    let installation_failure = adapter()
+        .observe(
+            &request(),
+            &source(LimaRuntimeState::Running, true, 130),
+            &ScriptedExecutor::new(installation_steps),
+            &FakeClock::new([100]),
+        )
+        .expect_err("installation mismatch");
+    assert_eq!(
+        installation_failure.code,
+        ActionsRunnerReadinessRefusalCode::InstallationIdentityMismatch
+    );
+
     let mut process_steps = running_steps(false, false);
-    let ScriptedStep::Output(exe) = &mut process_steps[5] else {
+    let ScriptedStep::Output(exe) = &mut process_steps[9] else {
         panic!("listener executable output");
     };
     exe.stdout = "/tmp/Runner.Listener\n".to_owned();
@@ -36,20 +54,38 @@ fn configuration_process_identity_and_drain_drift_are_refused() {
         ActionsRunnerReadinessRefusalCode::ProcessIdentityMismatch
     );
 
+    let mut process_digest_steps = running_steps(false, false);
+    let ScriptedStep::Output(executable_digest) = &mut process_digest_steps[10] else {
+        panic!("listener executable digest output");
+    };
+    executable_digest.stdout = format!("{}  [REDACTED]\n", "c".repeat(64));
+    let process_digest_failure = adapter()
+        .observe(
+            &request(),
+            &source(LimaRuntimeState::Running, true, 130),
+            &ScriptedExecutor::new(process_digest_steps),
+            &FakeClock::new([100]),
+        )
+        .expect_err("process executable digest mismatch");
+    assert_eq!(
+        process_digest_failure.code,
+        ActionsRunnerReadinessRefusalCode::ProcessIdentityMismatch
+    );
+
     let mut drift_steps = running_steps(false, false);
-    let ScriptedStep::Output(final_listener) = &mut drift_steps[8] else {
+    let ScriptedStep::Output(final_listener) = &mut drift_steps[13] else {
         panic!("final listener query");
     };
     final_listener.stdout = "44\n".to_owned();
-    let ScriptedStep::Output(final_exe) = &mut drift_steps[10] else {
+    let ScriptedStep::Output(final_exe) = &mut drift_steps[15] else {
         panic!("final listener executable");
     };
     final_exe.stdout = format!("{RUNNER_ROOT}/bin/Runner.Listener\n");
-    let ScriptedStep::Output(final_cwd) = &mut drift_steps[11] else {
+    let ScriptedStep::Output(final_cwd) = &mut drift_steps[17] else {
         panic!("final listener cwd");
     };
     final_cwd.stdout = format!("{RUNNER_ROOT}\n");
-    let ScriptedStep::Output(final_proc) = &mut drift_steps[12] else {
+    let ScriptedStep::Output(final_proc) = &mut drift_steps[18] else {
         panic!("final listener proc");
     };
     final_proc.stdout = "900:4400\n".to_owned();
@@ -67,7 +103,7 @@ fn configuration_process_identity_and_drain_drift_are_refused() {
     );
 
     let mut drain_steps = running_steps(false, false);
-    drain_steps[15] = ScriptedStep::Output(ScriptedOutput::success(""));
+    drain_steps[25] = ScriptedStep::Output(ScriptedOutput::success(""));
     let drain_failure = adapter()
         .observe(
             &request(),
@@ -85,7 +121,7 @@ fn configuration_process_identity_and_drain_drift_are_refused() {
 #[test]
 fn ambiguity_worker_without_listener_spawn_record_and_output_bounds_fail_closed() {
     let mut ambiguous_steps = running_steps(false, false);
-    let ScriptedStep::Output(listener) = &mut ambiguous_steps[3] else {
+    let ScriptedStep::Output(listener) = &mut ambiguous_steps[7] else {
         panic!("listener query");
     };
     listener.stdout = "42\n44\n".to_owned();

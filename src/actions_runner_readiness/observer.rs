@@ -203,10 +203,52 @@ impl ActionsRunnerReadinessAdapter {
                 "the official runner configuration digest differs from the reviewed identity",
             ));
         }
+        let listener_digest = self.observe_private_digest(request, executor, evidence, &request.listener_path)?;
+        let worker_digest = self.observe_private_digest(request, executor, evidence, &request.worker_path)?;
+        let credentials_digest =
+            self.observe_private_digest(request, executor, evidence, &request.credentials_path)?;
+        let credentials_rsa_parameters_digest = self.observe_private_digest(
+            request,
+            executor,
+            evidence,
+            &request.credentials_rsa_parameters_path,
+        )?;
+        if listener_digest != request.expected_listener_digest
+            || worker_digest != request.expected_worker_digest
+            || credentials_digest != request.expected_credentials_digest
+            || credentials_rsa_parameters_digest
+                != request.expected_credentials_rsa_parameters_digest
+        {
+            return Err(ObservationProblem::new(
+                ActionsRunnerReadinessRefusalCode::InstallationIdentityMismatch,
+                ActionsRunnerReadinessPhase::RunnerInstallationIdentity,
+                "the official runner installation differs from the reviewed identity",
+            ));
+        }
         Ok(IdentitySnapshot {
             root,
             configuration_digest,
+            listener_digest,
+            worker_digest,
+            credentials_digest,
+            credentials_rsa_parameters_digest,
         })
+    }
+
+    fn observe_private_digest(
+        &self,
+        request: &ActionsRunnerReadinessRequest,
+        executor: &impl CommandExecutor,
+        evidence: &mut ActionsRunnerReadinessPrivateEvidence,
+        path: &Path,
+    ) -> Result<Sha256Digest, ObservationProblem> {
+        parse_private_sha256(&self.run_success(
+            request,
+            executor,
+            evidence,
+            ActionsRunnerReadinessPhase::RunnerInstallationIdentity,
+            self.guest_private_path_command(request, GUEST_SHA256SUM, ["--"], path),
+        )?)
     }
 
     fn observe_drain_marker(
@@ -292,7 +334,7 @@ impl ActionsRunnerReadinessAdapter {
                     evidence,
                     ActionsRunnerReadinessPhase::ListenerIdentity,
                     pid,
-                    &request.listener_path,
+                    (&request.listener_path, &request.expected_listener_digest),
                 )
             })
             .transpose()?;
@@ -306,7 +348,7 @@ impl ActionsRunnerReadinessAdapter {
                     evidence,
                     ActionsRunnerReadinessPhase::WorkerIdentity,
                     pid,
-                    &request.worker_path,
+                    (&request.worker_path, &request.expected_worker_digest),
                 )
             })
             .transpose()?;
@@ -349,7 +391,7 @@ impl ActionsRunnerReadinessAdapter {
         evidence: &mut ActionsRunnerReadinessPrivateEvidence,
         phase: ActionsRunnerReadinessPhase,
         pid: u32,
-        expected_executable: &Path,
+        expected_executable: (&Path, &Sha256Digest),
     ) -> Result<ProcessIdentity, ObservationProblem> {
         let proc_root = format!("/proc/{pid}");
         let proc_exe = format!("{proc_root}/exe");
@@ -362,11 +404,25 @@ impl ActionsRunnerReadinessAdapter {
             self.guest_plain_command(request, GUEST_READLINK, ["-e", "--", proc_exe.as_str()]),
         )?;
         let executable = parse_single_line(&executable_output, phase)?;
-        if Path::new(executable) != expected_executable {
+        if Path::new(executable) != expected_executable.0 {
             return Err(ObservationProblem::new(
                 ActionsRunnerReadinessRefusalCode::ProcessIdentityMismatch,
                 phase,
                 "the official runner process executable differs from the reviewed identity",
+            ));
+        }
+        let executable_digest = parse_private_sha256(&self.run_success(
+            request,
+            executor,
+            evidence,
+            phase,
+            self.guest_private_path_command(request, GUEST_SHA256SUM, ["--"], Path::new(&proc_exe)),
+        )?)?;
+        if &executable_digest != expected_executable.1 {
+            return Err(ObservationProblem::new(
+                ActionsRunnerReadinessRefusalCode::ProcessIdentityMismatch,
+                phase,
+                "the official runner process executable digest differs from the reviewed identity",
             ));
         }
         let cwd_output = self.run_success(

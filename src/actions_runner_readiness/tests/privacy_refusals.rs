@@ -2,7 +2,7 @@
 fn public_json_and_debug_suppress_private_paths_processes_and_raw_output() {
     let private_marker = "PRIVATE_RUNNER_RAW_OUTPUT";
     let mut steps = running_steps(false, false);
-    let ScriptedStep::Output(proc_identity) = &mut steps[7] else {
+    let ScriptedStep::Output(proc_identity) = &mut steps[12] else {
         panic!("process identity");
     };
     proc_identity.stderr = private_marker.to_owned();
@@ -44,7 +44,7 @@ fn public_json_and_debug_suppress_private_paths_processes_and_raw_output() {
     }
     assert!(debug.contains(REDACTED));
     assert!(
-        observation.private_evidence().commands()[5]
+        observation.private_evidence().commands()[9]
             .record()
             .stdout
             .contains(RUNNER_ROOT)
@@ -63,6 +63,10 @@ fn request_rejects_aliased_relative_external_and_non_utf8_paths() {
         RUNNER_ROOT,
         DRAIN_MARKER,
         expected_digest.clone(),
+        expected_digest.clone(),
+        expected_digest.clone(),
+        expected_digest.clone(),
+        expected_digest.clone(),
     )
     .expect_err("aliased home");
     assert_eq!(
@@ -77,6 +81,10 @@ fn request_rejects_aliased_relative_external_and_non_utf8_paths() {
         "relative/runner",
         DRAIN_MARKER,
         expected_digest.clone(),
+        expected_digest.clone(),
+        expected_digest.clone(),
+        expected_digest.clone(),
+        expected_digest.clone(),
     )
     .expect_err("relative root");
     assert_eq!(
@@ -90,6 +98,10 @@ fn request_rejects_aliased_relative_external_and_non_utf8_paths() {
         LIMA_HOME,
         RUNNER_ROOT,
         "/tmp/draining",
+        expected_digest.clone(),
+        expected_digest.clone(),
+        expected_digest.clone(),
+        expected_digest.clone(),
         expected_digest,
     )
     .expect_err("external marker");
@@ -110,6 +122,10 @@ fn request_rejects_aliased_relative_external_and_non_utf8_paths() {
             LIMA_HOME,
             non_utf8,
             DRAIN_MARKER,
+            digest(),
+            digest(),
+            digest(),
+            digest(),
             digest(),
         )
         .expect_err("non-UTF-8 root");

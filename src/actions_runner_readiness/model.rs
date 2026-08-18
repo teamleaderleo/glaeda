@@ -52,6 +52,7 @@ pub enum ActionsRunnerReadinessRefusalCode {
     MissingIdentityEvidence,
     MalformedIdentityEvidence,
     ConfigurationIdentityMismatch,
+    InstallationIdentityMismatch,
     AmbiguousListener,
     AmbiguousWorker,
     ProcessIdentityMismatch,
@@ -68,6 +69,7 @@ pub enum ActionsRunnerReadinessPhase {
     SourceObservation,
     RunnerRootIdentity,
     RunnerConfigurationIdentity,
+    RunnerInstallationIdentity,
     DrainMarker,
     ListenerDiscovery,
     WorkerDiscovery,
@@ -184,8 +186,14 @@ pub struct ActionsRunnerReadinessRequest {
     configuration_path: PathBuf,
     listener_path: PathBuf,
     worker_path: PathBuf,
+    credentials_path: PathBuf,
+    credentials_rsa_parameters_path: PathBuf,
     drain_marker_path: PathBuf,
     expected_configuration_digest: Sha256Digest,
+    expected_listener_digest: Sha256Digest,
+    expected_worker_digest: Sha256Digest,
+    expected_credentials_digest: Sha256Digest,
+    expected_credentials_rsa_parameters_digest: Sha256Digest,
 }
 
 impl ActionsRunnerReadinessRequest {
@@ -195,6 +203,7 @@ impl ActionsRunnerReadinessRequest {
     ///
     /// Returns a bounded error unless every private path is canonical, absolute, exact UTF-8, and
     /// the drain marker remains beneath the reviewed runner root.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         instance: LimaInstanceName,
         runner_name: ActionsRunnerName,
@@ -202,6 +211,10 @@ impl ActionsRunnerReadinessRequest {
         runner_root: impl Into<PathBuf>,
         drain_marker_path: impl Into<PathBuf>,
         expected_configuration_digest: Sha256Digest,
+        expected_listener_digest: Sha256Digest,
+        expected_worker_digest: Sha256Digest,
+        expected_credentials_digest: Sha256Digest,
+        expected_credentials_rsa_parameters_digest: Sha256Digest,
     ) -> Result<Self, ActionsRunnerReadinessFailure> {
         let lima_home = validate_private_path(lima_home.into(), false)?;
         let runner_root = validate_private_path(runner_root.into(), false)?;
@@ -214,7 +227,15 @@ impl ActionsRunnerReadinessRequest {
         let configuration_path = runner_root.join(".runner");
         let listener_path = runner_root.join("bin/Runner.Listener");
         let worker_path = runner_root.join("bin/Runner.Worker");
-        for path in [&configuration_path, &listener_path, &worker_path] {
+        let credentials_path = runner_root.join(".credentials");
+        let credentials_rsa_parameters_path = runner_root.join(".credentials_rsaparams");
+        for path in [
+            &configuration_path,
+            &listener_path,
+            &worker_path,
+            &credentials_path,
+            &credentials_rsa_parameters_path,
+        ] {
             if !valid_absolute_path(path, false) {
                 return Err(input_failure(
                     "derived official runner paths are not canonical absolute paths",
@@ -229,8 +250,14 @@ impl ActionsRunnerReadinessRequest {
             configuration_path,
             listener_path,
             worker_path,
+            credentials_path,
+            credentials_rsa_parameters_path,
             drain_marker_path,
             expected_configuration_digest,
+            expected_listener_digest,
+            expected_worker_digest,
+            expected_credentials_digest,
+            expected_credentials_rsa_parameters_digest,
         })
     }
 
@@ -264,10 +291,22 @@ impl fmt::Debug for ActionsRunnerReadinessRequest {
             .field("configuration_path", &"<private-runner-configuration>")
             .field("listener_path", &"<private-listener-path>")
             .field("worker_path", &"<private-worker-path>")
+            .field("credentials_path", &"<private-credentials-path>")
+            .field(
+                "credentials_rsa_parameters_path",
+                &"<private-credentials-rsa-parameters-path>",
+            )
             .field("drain_marker_path", &"<private-drain-marker>")
             .field(
                 "expected_configuration_digest",
                 &self.expected_configuration_digest,
+            )
+            .field("expected_listener_digest", &self.expected_listener_digest)
+            .field("expected_worker_digest", &self.expected_worker_digest)
+            .field("expected_credentials_digest", &"<private-digest>")
+            .field(
+                "expected_credentials_rsa_parameters_digest",
+                &"<private-digest>",
             )
             .finish()
     }
@@ -375,6 +414,10 @@ impl fmt::Debug for ActionsRunnerPrivateCommandEvidence {
 struct IdentitySnapshot {
     root: LimaFilesystemObjectIdentity,
     configuration_digest: Sha256Digest,
+    listener_digest: Sha256Digest,
+    worker_digest: Sha256Digest,
+    credentials_digest: Sha256Digest,
+    credentials_rsa_parameters_digest: Sha256Digest,
 }
 
 #[derive(Clone, PartialEq, Eq)]
