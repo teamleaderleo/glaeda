@@ -184,10 +184,10 @@ pub fn plan_renderprove_command(
             "must be valid UTF-8 for the explicit child environment",
         )
     })?;
-    let wrapper_path = context.workspace_root.join(WRAPPER_RELATIVE_PATH);
+    let wrapper_path = context.renderprove_checkout.join(WRAPPER_RELATIVE_PATH);
     let wrapper = wrapper_path
         .to_str()
-        .expect("validated UTF-8 workspace plus fixed ASCII wrapper path");
+        .expect("validated UTF-8 checkout plus fixed ASCII wrapper path");
     let username = context.runner.username().as_str();
 
     let spec = CommandSpec::new(RUNUSER)
@@ -621,9 +621,7 @@ mod tests {
             .argument("PATH=/usr/local/bin:/usr/bin:/bin")
             .secret_argument("RENDERPROVE_CHECKOUT=/opt/renderprove")
             .secret_argument("SMOLRUNNER_EVIDENCE_DIR=.smolrunner/renderprove")
-            .secret_argument(
-                "/srv/smolrunner/workspaces/job-1/examples/renderprove/run-renderprove-review.sh",
-            )
+            .secret_argument("/opt/renderprove/examples/renderprove/run-renderprove-review.sh")
             .argument("render");
         assert_eq!(command.spec(), &expected_spec);
         assert_eq!(
@@ -653,10 +651,9 @@ mod tests {
         assert!(command.spec().environment.is_empty());
         assert_eq!(
             command.required_programs()[2],
-            Path::new(
-                "/srv/smolrunner/workspaces/job-1/examples/renderprove/run-renderprove-review.sh"
-            )
+            Path::new("/opt/renderprove/examples/renderprove/run-renderprove-review.sh")
         );
+        assert!(!command.required_programs()[2].starts_with(command.working_directory()));
 
         let json = serde_json::to_string(command.spec()).expect("command JSON");
         let debug = format!("{command:?}");
@@ -665,7 +662,7 @@ mod tests {
             "/opt/renderprove",
             ".smolrunner/renderprove",
             "/srv/smolrunner/workspaces/job-1",
-            "/srv/smolrunner/workspaces/job-1/examples/renderprove/run-renderprove-review.sh",
+            "/opt/renderprove/examples/renderprove/run-renderprove-review.sh",
             "/var/lib/project-runner",
             "/run/user/1001",
         ] {
@@ -750,7 +747,7 @@ mod tests {
     }
 
     #[test]
-    fn private_checkout_evidence_and_wrapper_values_must_match_exactly() {
+    fn private_checkout_and_evidence_values_must_match_exactly() {
         let command = plan_renderprove_command(
             request(RenderproveReviewNetworkPolicy::LoopbackOnly),
             &context(),
@@ -779,17 +776,17 @@ mod tests {
         .expect("altered evidence command");
         assert_private_command_rejected(&command, altered_evidence.spec().clone());
 
-        let altered_wrapper = plan_renderprove_command(
+        let altered_workspace = plan_renderprove_command(
             request(RenderproveReviewNetworkPolicy::LoopbackOnly),
             &RenderproveExecutionContext::new(
                 "/srv/smolrunner/workspaces/job-2",
                 "/opt/renderprove",
                 runner(),
             )
-            .expect("altered wrapper context"),
+            .expect("altered workspace context"),
         )
-        .expect("altered wrapper command");
-        assert_private_command_rejected(&command, altered_wrapper.spec().clone());
+        .expect("altered workspace command");
+        assert_eq!(command.spec(), altered_workspace.spec());
     }
 
     #[test]
@@ -820,7 +817,7 @@ mod tests {
             "/opt/renderprove",
             ".smolrunner/renderprove",
             "/srv/smolrunner/workspaces/job-1",
-            "/srv/smolrunner/workspaces/job-1/examples/renderprove/run-renderprove-review.sh",
+            "/opt/renderprove/examples/renderprove/run-renderprove-review.sh",
             "/var/lib/project-runner",
             "/run/user/1001",
             "private Renderprove log",
