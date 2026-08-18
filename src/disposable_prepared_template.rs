@@ -586,7 +586,7 @@ mod tests {
         );
         assert_eq!(
             manifest.lima_template_digest().as_str(),
-            "sha256:48e48d8ed42560cf301cd54dbc824154c7a47889c90fab382eaaf793b057e67f"
+            "sha256:7051a881544cc083677a569c1f1d69c027accd2b64c2b6577c4d3a53b5f661a2"
         );
         assert_eq!(
             manifest.ready_marker_path(),
@@ -601,7 +601,7 @@ mod tests {
         );
         assert_eq!(
             manifest.identity().unwrap().as_str(),
-            "sha256:43aeab93110468a9b5afc23a71790020e8678e66c1bde819cf654aab31eaf3eb"
+            "sha256:6a47d79a6a66e0e267104c39b8de7b818aaaffd691c653013a4cce907ae87a15"
         );
     }
 
