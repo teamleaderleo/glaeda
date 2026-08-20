@@ -5,7 +5,7 @@
 SmolRunner, pronounced “small runner,” automatically provisions isolated, one-job GitHub Actions workers on an operator-owned Mac and scales them back to zero. It is aimed at developers who want their own repositories and known open-source projects to use local compute without babysitting runners or exposing the host to potentially hostile CI code.
 
 > [!IMPORTANT]
-> SmolRunner is pre-alpha. The current executable has substantial durable state, queue, resource-admission, Lima lifecycle, GitHub observation, and recovery foundations, but it does not yet register a disposable JIT runner or run the unattended control loop. The governing path to that outcome is [Disposable autoscaling CI](docs/DISPOSABLE_AUTOSCALING_CI.md). The older Linux/rootless-Podman path is preserved as optional hardening, not the product critical path.
+> SmolRunner is pre-alpha, but the disposable path is already in repeated physical acceptance on Apple silicon. The repository has exercised prepared Lima/VZ worker lifecycle, the official GitHub Runner Scale Set bridge, durable assignment/clone/JIT/teardown composition, LaunchAgent supervision, controller-death recovery, and repeated Quarry pilot runs. Current work is closing integration and recovery failures exposed by those runs before treating the full installed-service one-job path as dependable. See [Disposable autoscaling CI](docs/DISPOSABLE_AUTOSCALING_CI.md) and the live programme issue for the current critical path.
 
 ## The problem
 
@@ -29,28 +29,28 @@ A direct Lima workflow can create, start, stop, clone, and delete virtual machin
 | Problem | Handwritten Lima commands | SmolRunner |
 |---|---|---|
 | Boot a Linux VM | ✅ | ✅ |
-| Clone a prepared VM | ✅ | ✅ Current M2 path |
+| Clone a prepared VM | ✅ | ✅ Physical path exercised |
 | Pin the exact guest image | You manage it | ✅ Current |
 | Pin the exact Actions runner | You manage it | ✅ Current |
 | Bind one VM to one durable attempt | Manual convention | ✅ Current |
 | Reserve CPU/RAM/disk before creation | Manual | ✅ Current |
 | Prevent two attempts from claiming the same capacity | Manual | ✅ Current |
-| Recover after the controller/process crashes | Human recovery | ✅ Current |
+| Recover after the controller/process crashes | Human recovery | ✅ Current, with physical SIGKILL evidence |
 | Distinguish an interrupted clone from a valid worker | Human investigation | ✅ Current |
 | Prove a VM belongs to the exact attempt before deletion | Usually name-based | ✅ Current model |
 | Refuse stale observations before mutation | Manual discipline | ✅ Current |
 | Preserve ambiguous clone outcomes for recovery | Human investigation | ✅ Current |
-| Recover exactly owned orphan workers after reboot | Script/manual cleanup | M2/M5 |
-| Poll GitHub Scale Sets through the official client | DIY integration | ✅ Current M3 foundation |
-| Read the controller GitHub App key from macOS Keychain | DIY | ✅ Current M3 foundation |
-| Execute one job in one fresh worker | Manual | M3 |
-| Bind the actual GitHub job to the exact runner and VM | Manual | M3 |
-| Automatically create workers from GitHub demand | DIY controller | M3 |
-| Keep long-lived controller credentials outside workers | DIY | M3/M4 |
-| Block worker access to the Mac, LAN, controller, and peers | DIY network policy | M4 |
+| Recover exactly owned orphan workers after reboot | Script/manual cleanup | Active M5 recovery work |
+| Poll GitHub Scale Sets through the official client | DIY integration | ✅ Current |
+| Read the controller GitHub App key from macOS Keychain | DIY | ✅ Current |
+| Execute one job in one fresh worker | Manual | Physical installed-service acceptance active |
+| Bind the actual GitHub job to the exact runner and VM | Manual | ✅ Composed; physical acceptance active |
+| Automatically create workers from GitHub demand | DIY controller | ✅ Composed; physical acceptance active |
+| Keep long-lived controller credentials outside workers | DIY | ✅ Current control-plane boundary |
+| Block worker access to the Mac, LAN, controller, and peers | DIY network policy | M4 physical network-policy work |
 | Run container actions inside the disposable guest | DIY | M4 |
-| Scale back to zero while idle | DIY controller | M5 |
-| Recover from sleep, reboot, GitHub outage, or failed teardown | DIY controller | M5 |
+| Scale back to zero while idle | DIY controller | ✅ Recovery/cancellation convergence exercised; full one-job acceptance active |
+| Recover from sleep, reboot, GitHub outage, or failed teardown | DIY controller | M5 physical recovery matrix |
 | Preserve safe hot inputs while destroying job-specific state | DIY cache policy | M6 |
 | Let multiple agents treat the Mac like a private build farm | DIY system | M7 |
 
@@ -81,11 +81,13 @@ The `limactl` invocation is the VM primitive. SmolRunner owns the lifecycle, own
 
 ### Where the disposable path is today
 
-Milestone 1, durable disposable-attempt reconciliation, is complete. M2 now includes pinned Ubuntu/Lima/runner inputs, durable prepared-template generations, clone recovery rules, and live `clone --start` execution under the canonical lock with ambiguous outcomes retained as recovery debt. Physical prepared-template/worker acceptance and the remaining exact cleanup/orphan path still gate M2 acceptance.
+Milestone 1, durable disposable-attempt reconciliation, is complete. The prepared-worker path has moved through physical Apple-silicon acceptance for exact template create/provision/ready/stop/delete, bounded runner download and disk admission, create-failure cleanup, and controller-SIGKILL behavior. Live clone/JIT acceptance has also exposed and driven repairs for real macOS/Lima and GitHub assignment behavior rather than synthetic-only assumptions.
 
-M3 has also started: the repository pins GitHub's official Runner Scale Set client behind a bounded bridge, and a private macOS adapter reads the GitHub App key directly from Keychain, validates the installed bridge identity, bounds every exchange, and zeroizes secret-bearing buffers. Durable message consumption, enrollment, guest JIT handoff, one-job execution, and the unattended service loop remain ahead.
+The GitHub-native lifecycle is composed behind `worker serve`: the repository pins the official Runner Scale Set client behind a bounded bridge, reads the GitHub App key from Keychain, durably consumes assignment state, reserves capacity, drives clone/JIT handoff, binds runner/VM/job identity, tears terminal state down, and runs under LaunchAgent supervision. Repeated Quarry pilots have reached progressively deeper checkpoints and surfaced concrete failures including Scale Set assignment-lease timing, Lima socket-path limits, service-child lifetime, cancellation/reassignment recovery, and restart-safe ownership of in-flight mutations.
 
-The intended end state stays simple:
+The first controller-death physical proof is complete and retained as production recovery evidence. The current critical path is therefore post-composition reliability: finish the clean installed-service one-job lifecycle, close restart/replay ambiguity, extend physical recovery across cancellation/sleep/reboot/outage/teardown cases, and then enforce the hostile-CI network boundary before arbitrary repository code is treated as a production workload.
+
+The intended user-visible loop stays simple:
 
 ```text
 GitHub job appears
@@ -96,7 +98,7 @@ GitHub job appears
 → capacity returns to zero
 ```
 
-The operator should care about the GitHub job, not the VM lifecycle underneath it. See the [roadmap](docs/ROADMAP.md) for the M1–M7 progression.
+The operator should care about the GitHub job, not the VM lifecycle underneath it. See the [roadmap](docs/ROADMAP.md) and the current disposable-autoscaling programme for the live acceptance sequence.
 
 ## Current commands
 
@@ -285,7 +287,9 @@ Live `host prepare` acceptance additionally belongs in disposable Debian and Ubu
 
 ## Project status
 
-SmolRunner has a dependable diagnostic and desired-state foundation plus its first explicitly confirmed, one-phase durable host-mutation path. It can prepare reviewed portions of Linux host state and stop at fresh-observation barriers; it does not yet register the official runner, reconcile runner services, enroll projects through the public CLI, or operate an unattended control loop. Runner lifecycle, disposable execution, and small-fleet operations remain the next product milestones. A dashboard and broader distribution support remain deferred until the CLI and security model have proven themselves.
+SmolRunner is in live systems acceptance, with a substantial part of the disposable-worker controller already composed and repeatedly exercised on the operator Mac. Physical work has validated the prepared Lima/VZ lifecycle, controller-death behavior, exact service installation/supervision pieces, and multiple real GitHub/Quarry assignment paths; those runs have produced the current recovery and integration queue.
+
+The immediate goal is a dependable installed-service journey from GitHub demand through one disposable VM/JIT runner and back to proven runner/VM absence and zero reserved capacity. From there the emphasis moves into broader crash/reboot/sleep/outage recovery, hostile-CI network isolation, and measured performance/agent-fleet behavior. The live programme issue is the authoritative status record; older host-preparation and Podman material remains useful foundation and historical context rather than the current product frontier.
 
 ## License
 
