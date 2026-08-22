@@ -1,0 +1,132 @@
+{
+  "filesystem": {
+    "runner_temp": "/dev/sda1 ext4   rw,relatime,discard,errors=remount-ro,commit=30",
+    "runner_temp_df": "Filesystem     Type    1B-blocks        Used    Available Use% Mounted on\n/dev/root      ext4 154894188544 38499094528 116378316800  25% /",
+    "workspace": "/dev/sda1 ext4   rw,relatime,discard,errors=remount-ro,commit=30",
+    "workspace_df": "Filesystem     Type    1B-blocks        Used    Available Use% Mounted on\n/dev/root      ext4 154894188544 38499094528 116378316800  25% /"
+  },
+  "git_worktree_plain": {
+    "add": {
+      "argv": [
+        "git",
+        "worktree",
+        "add",
+        "--detach",
+        "/home/runner/work/_temp/smolrunner-gh-arm-7t52uaon/plain-worktree",
+        "HEAD"
+      ],
+      "elapsed_ms": 28.345,
+      "returncode": 0,
+      "stderr": "Preparing worktree (detached HEAD a4a4cc5)",
+      "stdout": "HEAD is now at a4a4cc5 research: add hosted runner control signal"
+    },
+    "filesystem_used_delta_after_add": 8380416,
+    "remove": {
+      "argv": [
+        "git",
+        "worktree",
+        "remove",
+        "--force",
+        "/home/runner/work/_temp/smolrunner-gh-arm-7t52uaon/plain-worktree"
+      ],
+      "elapsed_ms": 5.69,
+      "returncode": 0,
+      "stderr": "",
+      "stdout": ""
+    }
+  },
+  "git_worktree_split": {
+    "materialization_filesystem_used_delta": 8339456,
+    "materialize": {
+      "argv": [
+        "git",
+        "reset",
+        "--hard",
+        "HEAD"
+      ],
+      "elapsed_ms": 26.56,
+      "returncode": 0,
+      "stderr": "",
+      "stdout": "HEAD is now at a4a4cc5 research: add hosted runner control signal"
+    },
+    "metadata_add": {
+      "argv": [
+        "git",
+        "worktree",
+        "add",
+        "--detach",
+        "--no-checkout",
+        "/home/runner/work/_temp/smolrunner-gh-arm-7t52uaon/split-worktree",
+        "HEAD"
+      ],
+      "elapsed_ms": 1.821,
+      "returncode": 0,
+      "stderr": "Preparing worktree (detached HEAD a4a4cc5)",
+      "stdout": ""
+    },
+    "metadata_filesystem_used_delta": 40960,
+    "remove": {
+      "argv": [
+        "git",
+        "worktree",
+        "remove",
+        "--force",
+        "/home/runner/work/_temp/smolrunner-gh-arm-7t52uaon/split-worktree"
+      ],
+      "elapsed_ms": 5.698,
+      "returncode": 0,
+      "stderr": "",
+      "stdout": ""
+    }
+  },
+  "ordinary_copy": {
+    "copy": {
+      "argv": [
+        "cp",
+        "--reflink=never",
+        "/home/runner/work/_temp/smolrunner-gh-arm-7t52uaon/source.bin",
+        "/home/runner/work/_temp/smolrunner-gh-arm-7t52uaon/ordinary.bin"
+      ],
+      "elapsed_ms": 7.93,
+      "returncode": 0,
+      "stderr": "",
+      "stdout": ""
+    },
+    "filesystem_used_delta": 33554432
+  },
+  "reflink": {
+    "copy": {
+      "argv": [
+        "cp",
+        "--reflink=always",
+        "/home/runner/work/_temp/smolrunner-gh-arm-7t52uaon/source.bin",
+        "/home/runner/work/_temp/smolrunner-gh-arm-7t52uaon/reflink.bin"
+      ],
+      "elapsed_ms": 1.158,
+      "returncode": 1,
+      "stderr": "cp: failed to clone '/home/runner/work/_temp/smolrunner-gh-arm-7t52uaon/reflink.bin' from '/home/runner/work/_temp/smolrunner-gh-arm-7t52uaon/source.bin': Operation not supported",
+      "stdout": ""
+    },
+    "filesystem_used_delta": 0
+  },
+  "runner": {
+    "arch": "ARM64",
+    "cpu_count": 4,
+    "kernel": "6.17.0-1022-azure",
+    "lscpu": "Architecture:                            aarch64\nCPU op-mode(s):                          32-bit, 64-bit\nByte Order:                              Little Endian\nCPU(s):                                  4\nOn-line CPU(s) list:                     0-3\nVendor ID:                               ARM\nModel name:                              Neoverse-N2\nModel:                                   0\nThread(s) per core:                      1\nCore(s) per socket:                      4\nSocket(s):                               1\nStepping:                                r0p0\nBogoMIPS:                                2000.00\nFlags:                                   fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 sm3 sm4 asimddp sha512 sve asimdfhm uscat ilrcpc flagm sb paca pacg dcpodp sve2 sveaes svebitperm svesha3 svesm4 flagm2 frint svei8mm svebf16 i8mm bf16\nL1d cache:                               256 KiB (4 instances)\nL1i cache:                               256 KiB (4 instances)\nL2 cache:                                4 MiB (4 instances)\nL3 cache:                                128 MiB (1 instance)\nNUMA node(s):                            1\nNUMA node0 CPU(s):                       0-3\nVulnerability Gather data sampling:      Not affected\nVulnerability Ghostwrite:                Not affected\nVulnerability Indirect target selection: Not affected\nVulnerability Itlb multihit:             Not affected\nVulnerability L1tf:                      Not affected\nVulnerability Mds:                       Not affected\nVulnerability Meltdown:                  Not affected\nVulnerability Mmio stale data:           Not affected\nVulnerability Old microcode:             Not affected\nVulnerability Reg file data sampling:    Not affected\nVulnerability Retbleed:                  Not affected\nVulnerability Spec rstack overflow:      Not affected\nVulnerability Spec store bypass:         Mitigation; Speculative Store Bypass disabled via prctl\nVulnerability Spectre v1:                Mitigation; __user pointer sanitization\nVulnerability Spectre v2:                Mitigation; CSV2, BHB\nVulnerability Srbds:                     Not affected\nVulnerability Tsa:                       Not affected\nVulnerability Tsx async abort:           Not affected\nVulnerability Vmscape:                   Not affected",
+    "machine": "aarch64",
+    "name": "GitHub Actions 1000230256",
+    "os": "Linux"
+  },
+  "schema_version": 1,
+  "small_file_create_10k_ms": 245.342,
+  "small_file_delete_10k_ms": 95.596,
+  "small_file_stat_10k_ms": 39.015,
+  "source_create_32m_ms": 15.698,
+  "tools": {
+    "cargo": "cargo 1.97.1 (c980f4866 2026-06-30)",
+    "clang": "Ubuntu clang version 18.1.3 (1ubuntu1)\nTarget: aarch64-unknown-linux-gnu\nThread model: posix\nInstalledDir: /usr/bin",
+    "git": "git version 2.55.0",
+    "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)"
+  }
+}
