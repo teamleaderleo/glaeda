@@ -1,0 +1,45 @@
+{
+  "arch": "arm64",
+  "cargo": "cargo 1.97.1 (c980f4866 2026-06-30)",
+  "generated_source_files": 481,
+  "modules": 480,
+  "runner": {
+    "cpu_count": 4,
+    "kernel": "6.17.0-1022-azure",
+    "machine": "aarch64"
+  },
+  "runs": [
+    {
+      "elapsed_ms": 5595.044,
+      "label": "cold",
+      "returncode": 0,
+      "stderr": "",
+      "stdout": "running 1 test\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+    },
+    {
+      "elapsed_ms": 16.833,
+      "label": "warm_no_edit",
+      "returncode": 0,
+      "stderr": "",
+      "stdout": "running 1 test\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+    },
+    {
+      "elapsed_ms": 562.218,
+      "label": "one_module_edit",
+      "returncode": 0,
+      "stderr": "",
+      "stdout": "running 1 test\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+    },
+    {
+      "elapsed_ms": 784.523,
+      "label": "fifty_module_edit",
+      "returncode": 0,
+      "stderr": "",
+      "stdout": "running 1 test\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+    }
+  ],
+  "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+  "schema_version": 1,
+  "target_bytes_after_cold": 28766208,
+  "target_bytes_final": 47542272
+}
