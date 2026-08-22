@@ -1,0 +1,88 @@
+{
+  "counts": {
+    "1": {
+      "baseline": {
+        "cleanup_wall_ms": 9.221,
+        "materialize_wall_ms": 27.254,
+        "metadata_wall_ms": 3.794,
+        "successes": 1,
+        "used_delta": 8372224,
+        "verify_wall_ms": 71.264,
+        "work_wall_ms": 102.312
+      },
+      "cow": {
+        "cleanup_wall_ms": 9.41,
+        "metadata_wall_ms": 2.776,
+        "populate_successes": 1,
+        "populate_wall_ms": 23.376,
+        "read_tree_wall_ms": 7.592,
+        "successes": 1,
+        "used_delta": 278528,
+        "verify_wall_ms": 38.506,
+        "work_wall_ms": 72.25
+      }
+    },
+    "32": {
+      "baseline": {
+        "cleanup_wall_ms": 859.803,
+        "materialize_wall_ms": 459.241,
+        "metadata_wall_ms": 33.05,
+        "successes": 32,
+        "used_delta": 267718656,
+        "verify_wall_ms": 361.942,
+        "work_wall_ms": 854.233
+      },
+      "cow": {
+        "cleanup_wall_ms": 353.328,
+        "metadata_wall_ms": 31.056,
+        "populate_successes": 32,
+        "populate_wall_ms": 1799.112,
+        "read_tree_wall_ms": 29.237,
+        "successes": 32,
+        "used_delta": 8720384,
+        "verify_wall_ms": 391.534,
+        "work_wall_ms": 2250.939
+      }
+    },
+    "8": {
+      "baseline": {
+        "cleanup_wall_ms": 73.811,
+        "materialize_wall_ms": 116.296,
+        "metadata_wall_ms": 11.333,
+        "successes": 8,
+        "used_delta": 66912256,
+        "verify_wall_ms": 181.915,
+        "work_wall_ms": 309.544
+      },
+      "cow": {
+        "cleanup_wall_ms": 71.388,
+        "metadata_wall_ms": 7.646,
+        "populate_successes": 8,
+        "populate_wall_ms": 469.175,
+        "read_tree_wall_ms": 8.223,
+        "successes": 8,
+        "used_delta": 2162688,
+        "verify_wall_ms": 103.7,
+        "work_wall_ms": 588.744
+      }
+    }
+  },
+  "schema_version": 1,
+  "source": {
+    "add": {
+      "elapsed_ms": 30.759,
+      "returncode": 0,
+      "stderr": "Preparing worktree (detached HEAD 5fa78e0)",
+      "stdout": "HEAD is now at 5fa78e0 research: benchmark concurrent XFS CoW task fanout"
+    },
+    "logical_bytes": 7255332,
+    "regular_entries": 390,
+    "verify": {
+      "diff_files_ms": 23.287,
+      "diff_index_ms": 23.493,
+      "returncode": 0,
+      "status": "",
+      "status_ms": 24.325
+    }
+  }
+}
