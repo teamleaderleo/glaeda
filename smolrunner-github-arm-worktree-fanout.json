@@ -1,0 +1,1457 @@
+{
+  "counts": {
+    "1": {
+      "plain": {
+        "add_records": [
+          {
+            "elapsed_ms": 29.34,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/plain-1/task-00",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          }
+        ],
+        "add_wall_ms": 31.019,
+        "remove_records": [
+          {
+            "elapsed_ms": 7.334,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          }
+        ],
+        "remove_wall_ms": 9.394,
+        "successes": 1,
+        "used_delta": 8372224
+      },
+      "split": {
+        "materialize_records": [
+          {
+            "elapsed_ms": 26.965,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-1/task-00",
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          }
+        ],
+        "materialize_successes": 1,
+        "materialize_used_delta": 8331264,
+        "materialize_wall_ms": 27.372,
+        "metadata_records": [
+          {
+            "elapsed_ms": 2.525,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-1/task-00",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": ""
+          }
+        ],
+        "metadata_successes": 1,
+        "metadata_used_delta": 40960,
+        "metadata_wall_ms": 2.964,
+        "remove_records": [
+          {
+            "elapsed_ms": 7.34,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          }
+        ],
+        "remove_wall_ms": 9.214
+      }
+    },
+    "32": {
+      "plain": {
+        "add_records": [
+          {
+            "elapsed_ms": 166.275,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/plain-32/task-00",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 177.948,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/plain-32/task-01",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 97.956,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/plain-32/task-02",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 131.527,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/plain-32/task-03",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 180.681,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/plain-32/task-04",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 78.046,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/plain-32/task-05",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 246.21,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/plain-32/task-06",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 258.081,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/plain-32/task-07",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 255.255,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/plain-32/task-08",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 216.369,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/plain-32/task-09",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 226.438,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/plain-32/task-10",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 219.874,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/plain-32/task-11",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 283.04,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/plain-32/task-12",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 250.712,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/plain-32/task-13",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 207.214,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/plain-32/task-14",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 209.794,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/plain-32/task-15",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 238.269,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/plain-32/task-16",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 263.957,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/plain-32/task-17",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 263.612,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/plain-32/task-18",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 257.379,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/plain-32/task-19",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 199.676,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/plain-32/task-20",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 244.302,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/plain-32/task-21",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 236.661,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/plain-32/task-22",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 239.769,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/plain-32/task-23",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 237.257,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/plain-32/task-24",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 238.765,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/plain-32/task-25",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 233.442,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/plain-32/task-26",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 172.504,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/plain-32/task-27",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 207.183,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/plain-32/task-28",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 202.782,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/plain-32/task-29",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 191.424,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/plain-32/task-30",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 210.656,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/plain-32/task-31",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          }
+        ],
+        "add_wall_ms": 315.806,
+        "remove_records": [
+          {
+            "elapsed_ms": 31.867,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 25.847,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 25.212,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 31.045,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 53.635,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 31.691,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 53.16,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 52.2,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 51.995,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 57.852,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 18.868,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 63.516,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 42.786,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 72.49,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 28.703,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 50.992,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 57.712,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 41.951,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 57.519,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 36.483,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 57.208,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 55.182,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 50.818,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 36.1,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 42.959,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 46.468,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 42.206,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 46.255,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 44.355,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 39.18,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 22.687,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 30.074,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          }
+        ],
+        "remove_wall_ms": 98.83,
+        "successes": 32,
+        "used_delta": 267784192
+      },
+      "split": {
+        "materialize_records": [
+          {
+            "elapsed_ms": 115.379,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-00",
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 182.185,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-01",
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 147.591,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-02",
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 123.73,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-03",
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 187.667,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-04",
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 190.09,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-05",
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 173.961,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-06",
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 180.18,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-07",
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 202.508,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-08",
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 199.447,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-09",
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 174.779,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-10",
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 210.191,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-11",
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 211.662,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-12",
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 184.015,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-13",
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 186.024,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-14",
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 200.88,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-15",
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 209.753,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-16",
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 196.919,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-17",
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 201.019,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-18",
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 197.963,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-19",
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 181.608,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-20",
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 170.482,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-21",
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 186.609,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-22",
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 187.035,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-23",
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 191.797,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-24",
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 172.786,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-25",
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 161.177,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-26",
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 158.682,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-27",
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 171.364,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-28",
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 170.088,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-29",
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 162.071,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-30",
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 134.79,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-31",
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          }
+        ],
+        "materialize_successes": 32,
+        "materialize_used_delta": 266600448,
+        "materialize_wall_ms": 249.843,
+        "metadata_records": [
+          {
+            "elapsed_ms": 2.737,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-00",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 6.589,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-01",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 3.1,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-02",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 6.543,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-03",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 5.7,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-04",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 4.247,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-05",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 4.803,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-06",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 4.642,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-07",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 4.896,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-08",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 5.231,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-09",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 6.163,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-10",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 7.868,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-11",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 5.645,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-12",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 7.518,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-13",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 5.929,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-14",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 7.086,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-15",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 9.302,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-16",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 5.858,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-17",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 5.498,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-18",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 13.91,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-19",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 11.714,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-20",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 7.23,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-21",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 10.751,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-22",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 8.326,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-23",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 4.858,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-24",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 8.815,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-25",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 8.73,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-26",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 9.495,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-27",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 7.223,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-28",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 7.219,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-29",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 9.096,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-30",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 6.128,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-32/task-31",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": ""
+          }
+        ],
+        "metadata_successes": 32,
+        "metadata_used_delta": 1183744,
+        "metadata_wall_ms": 31.361,
+        "remove_records": [
+          {
+            "elapsed_ms": 53.764,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 60.345,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 51.346,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 63.373,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 62.97,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 65.02,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 31.354,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 59.475,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 60.197,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 30.576,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 74.273,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 28.116,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 27.761,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 38.479,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 35.6,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 46.785,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 46.963,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 27.562,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 45.208,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 28.199,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 33.845,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 41.615,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 49.367,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 29.298,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 27.659,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 26.755,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 37.71,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 32.48,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 34.709,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 33.517,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 27.115,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 18.906,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          }
+        ],
+        "remove_wall_ms": 100.59
+      }
+    },
+    "8": {
+      "plain": {
+        "add_records": [
+          {
+            "elapsed_ms": 73.693,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/plain-8/task-00",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 94.608,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/plain-8/task-01",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 71.941,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/plain-8/task-02",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 86.343,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/plain-8/task-03",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 90.527,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/plain-8/task-04",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 88.982,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/plain-8/task-05",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 85.308,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/plain-8/task-06",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 74.514,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/plain-8/task-07",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          }
+        ],
+        "add_wall_ms": 95.83,
+        "remove_records": [
+          {
+            "elapsed_ms": 20.429,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 19.422,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 18.228,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 20.973,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 17.024,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 16.94,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 20.221,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 17.415,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          }
+        ],
+        "remove_wall_ms": 26.404,
+        "successes": 8,
+        "used_delta": 66949120
+      },
+      "split": {
+        "materialize_records": [
+          {
+            "elapsed_ms": 62.323,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-8/task-00",
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 54.574,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-8/task-01",
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 52.127,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-8/task-02",
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 48.054,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-8/task-03",
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 28.731,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-8/task-04",
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 58.529,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-8/task-05",
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 56.29,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-8/task-06",
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          },
+          {
+            "elapsed_ms": 49.406,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-8/task-07",
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "HEAD is now at 94f2139 research: benchmark ARM worktree fan-out"
+          }
+        ],
+        "materialize_successes": 8,
+        "materialize_used_delta": 66650112,
+        "materialize_wall_ms": 66.058,
+        "metadata_records": [
+          {
+            "elapsed_ms": 3.717,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-8/task-00",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 5.852,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-8/task-01",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 5.877,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-8/task-02",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 4.099,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-8/task-03",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 4.512,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-8/task-04",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 3.252,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-8/task-05",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 3.52,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-8/task-06",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 2.914,
+            "path": "/home/runner/work/_temp/smolrunner-fanout-quar8u2v/split-8/task-07",
+            "returncode": 0,
+            "stderr": "Preparing worktree (detached HEAD 94f2139)",
+            "stdout": ""
+          }
+        ],
+        "metadata_successes": 8,
+        "metadata_used_delta": 299008,
+        "metadata_wall_ms": 7.787,
+        "remove_records": [
+          {
+            "elapsed_ms": 14.334,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 19.306,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 10.457,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 20.573,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 20.219,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 23.789,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 21.178,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          },
+          {
+            "elapsed_ms": 12.802,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": ""
+          }
+        ],
+        "remove_wall_ms": 27.834
+      }
+    }
+  },
+  "filesystem": {
+    "elapsed_ms": 1.933,
+    "returncode": 0,
+    "stderr": "",
+    "stdout": "/dev/sda1 ext4   rw,relatime,discard,errors=remount-ro,commit=30"
+  },
+  "git": {
+    "elapsed_ms": 1.282,
+    "returncode": 0,
+    "stderr": "",
+    "stdout": "git version 2.55.0"
+  },
+  "runner": {
+    "arch": "ARM64",
+    "cpu_count": 4,
+    "kernel": "6.17.0-1022-azure",
+    "machine": "aarch64"
+  },
+  "schema_version": 1
+}
