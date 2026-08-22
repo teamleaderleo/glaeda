@@ -1,294 +1,339 @@
 # Roadmap
 
-SmolRunner's product goal is a **hot, autoscaling Linux build server on an operator-owned Mac where every individual execution is disposable**.
+SmolRunner's product goal is a **blazingly hot Linux execution substrate for coding agents and GitHub Actions on compute the operator controls**.
 
-Trusted agents and humans stay outside the worker boundary. They use GitHub as the scheduler, workflow engine, status surface, and canonical job-log store. SmolRunner supplies bounded local compute underneath GitHub: it admits capacity, creates one fresh Linux VM for one job, runs the official GitHub Actions runner, destroys the worker, proves cleanup, and releases the reserved capacity.
+The core rule is:
 
-The operator experience should converge on three properties:
+> **Disposable is a capability, not a mandate. Trust decides residency.**
 
-- **hot** — reviewed VM images, toolchains, dependency inputs, compiler caches, and container-build caches stay locally reusable where their trust model permits it;
-- **disposable** — checked-out source, writable build state, job credentials, services, processes, and uncertain cache writes die with the worker;
-- **quiet** — queueing, capacity, crashes, stale registrations, orphan workers, retries, and cleanup normally reconcile without operator work.
+SmolRunner should do every reusable, trustworthy piece of work before the next task asks for it. Hostile work receives a fresh isolated worker and exact teardown. Trusted CI can use prepared workers, repository seeds, reviewed caches, and warm pools. Ultra-trusted agent work can keep project sandboxes, incremental compiler state, package state, indexes, and selected services resident across edit/test/build loops.
 
-The governing security boundary and end-to-end acceptance criteria are in [Disposable autoscaling CI](DISPOSABLE_AUTOSCALING_CI.md). Cache lifecycle and trust research belongs in [#21](https://github.com/teamleaderleo/smolrunner/issues/21). Dependency/backend selection is tracked in [#368](https://github.com/teamleaderleo/smolrunner/issues/368).
+The shared correctness requirement across all of those modes is durable execution truth: destroying physical state must preserve enough exact evidence to recover safely, and retaining physical state must never make correctness depend on that state surviving.
+
+The operator experience should converge on four properties:
+
+- **blazingly hot** — queue/edit-to-first-useful-command and edit-to-first-test-result approach the cost of the useful work itself;
+- **trust-tiered** — worker lifetime, writable-state reuse, cache publication, credentials, and networking follow explicit trust policy;
+- **recoverable** — VMs, sandboxes, workspaces, caches, indexes, and prepared materializations can disappear without losing execution truth;
+- **quiet** — queueing, capacity, crashes, stale registrations, retries, cleanup, revalidation, and eviction normally converge without operator work.
+
+The strict hostile-work lifecycle remains governed by [Disposable autoscaling CI](DISPOSABLE_AUTOSCALING_CI.md) and [#365](https://github.com/teamleaderleo/smolrunner/issues/365). The top-level hot execution direction is tracked in [#557](https://github.com/teamleaderleo/smolrunner/issues/557) and the destroyability/residency invariant in [#556](https://github.com/teamleaderleo/smolrunner/issues/556). Observations, adaptive placement, verification compilation, and diagnostics are tracked in [#21](https://github.com/teamleaderleo/smolrunner/issues/21), [#546](https://github.com/teamleaderleo/smolrunner/issues/546), [#547](https://github.com/teamleaderleo/smolrunner/issues/547), and [#548](https://github.com/teamleaderleo/smolrunner/issues/548).
 
 ## Product boundary
 
-GitHub Actions remains the orchestrator. SmolRunner does not need another workflow language, job scheduler, or generic agent execution protocol.
+GitHub Actions remains the ordinary workflow scheduler, check/status surface, and canonical hosted job-log surface for GitHub jobs. SmolRunner owns execution admission, trust policy, durable identity, local lifecycle, recovery, hot-state lifecycle, and measured execution decisions around that interface.
 
-The first production backend remains Lima with Apple Virtualization Framework. The intended stack is deliberately composed from mature components:
+The first production host/backend remains an operator-owned Apple-silicon Mac running Lima with Apple Virtualization Framework and pinned ARM64 Linux guests. Linux carries the repository filesystem workload; macOS remains the trusted control plane.
+
+The product intentionally supports two very different excellent paths:
 
 ```text
-trusted agent / human
-        |
-        v
-GitHub Actions
-        |
-        v
-GitHub Runner Scale Set Client
-        |
-        v
-SmolRunner
-  admission + durable attempts + policy + recovery
-        |
-        v
-Lima / Apple VZ
-        |
-        v
-pinned Ubuntu worker clone
-        |
-        v
-official one-job GitHub Actions runner
-        |
-        v
-hostile build/test code
+hostile / unknown work
+    -> fresh prepared Linux worker
+    -> one bounded job
+    -> exact teardown
+    -> prove absence
+
+ultra-trusted agent work
+    -> resident Linux project sandbox
+    -> revalidate exact project/source/toolchain lease
+    -> edit / test / inspect / build
+    -> retain useful incremental state
 ```
 
-Prefer mature components for GitHub protocol semantics, VM isolation, guest OS, networking enforcement, compiler/dependency caching, container builds, and macOS service supervision. SmolRunner should own the Mac-specific policy and reconciliation layer that those components intentionally leave to the infrastructure provider.
+Trusted CI sits between those poles and may combine prepared disposable workers with reviewed reusable generations, repository seeds, warm pools, compiler caches, and derived verification artifacts.
 
-## What SmolRunner should own
+Prefer mature components for GitHub protocol semantics, VM isolation, guest OS, networking enforcement, filesystems, compiler/dependency caching, container builds, and macOS service supervision. SmolRunner should own the policy and recovery layer that joins them.
 
-- exact host-wide CPU, memory, disk, wall-time, and concurrency admission;
-- one durable attempt identity joining capacity, worker, GitHub runner, actual job, and cleanup;
-- crash recovery across ambiguous GitHub and VM mutations;
-- exact worker/resource ownership before mutation, deletion, reuse, or capacity release;
-- trust classification for jobs and cache publication;
-- network-policy intent for hostile CI;
-- least-privilege credential boundaries and secret lifetime;
-- cleanup proof, retry debt, holds, quarantine, and agent-readable status;
-- backend-independent worker contracts so implementation details can evolve without changing durable lifecycle semantics.
+## Durable execution kernel
+
+Persist only the facts a restarted controller genuinely needs and cannot safely infer again, including where applicable:
+
+- job / attempt / execution identity;
+- capacity reservation and ownership generations;
+- exact external mutation intent and restart-safe execution ownership;
+- immutable template / toolchain / input generation identities;
+- GitHub delivery, acquisition, runner, and no-replay identities;
+- VM / sandbox / project-lease bindings required for reconciliation;
+- terminal outcome and teardown receipts;
+- causation / idempotency identities;
+- explicit recovery debt when ownership or external state remains ambiguous.
+
+The durable kernel stays bounded and non-executable. Workspaces, process lists, logs, arbitrary shell state, compiler trees, indexes, package stores, and resident services remain physical execution state with separately reviewed lifetimes.
+
+## Trust-tiered hot state
+
+### Tier 1 — hostile / unknown
+
+Use the strict disposable contract:
+
+- fresh isolated worker;
+- one bounded job;
+- no inherited mutable workspace;
+- short-lived job authority only;
+- reviewed immutable/read-only reusable generations where policy permits;
+- exact runner/VM teardown and proven absence.
+
+### Tier 2 — trusted CI
+
+Allow much hotter preparation while preserving a clean job boundary:
+
+- prepared worker generations and snapshots;
+- local Git object/repository seeds;
+- dependency and compiler cache generations;
+- derived verification artifacts;
+- deterministic test plans and shard plans;
+- warm pools;
+- overlapping admission, repository hydration, JIT preparation, and verification planning.
+
+### Tier 3 — ultra-trusted agent/project work
+
+Persistence becomes a first-class performance tool:
+
+- resident project sandboxes;
+- project-local and task-local worktrees;
+- incremental compiler/build trees;
+- language-server and code-search indexes;
+- warmed package/dependency state;
+- resident containers and selected development services;
+- long-lived project-local caches;
+- reusable checkout/object data;
+- prewarmed verification/test daemons.
+
+Residency requires exact project/lease identity, source state, toolchain generation, dirty/task-local state classification, credential/network capability generation, validity parents, and explicit reset/revalidation/expiry policy.
 
 ## Useful foundation already built
 
 - [x] Rust CLI with shared typed human/JSON reports.
-- [x] Canonical configuration, host observations, ownership classifications, and public error vocabulary.
+- [x] Canonical configuration, host observations, ownership classifications, and bounded public error vocabulary.
 - [x] Bounded shell-free process execution with an empty explicit environment.
 - [x] Crash-safe durable stores, atomic journals, recovery classification, revisions, and queue generations.
-- [x] Typed personal-worker queue, admission, reservations, resource limits, cancellation, and terminal identities.
 - [x] Mac capacity observation and Lima observation/lifecycle authority.
-- [x] GitHub workflow-job mapping and snapshot reconciliation foundations.
-- [x] Pure disposable-worker capacity and lifecycle reconciler on `main`.
-- [x] Extensive optional Linux/rootless-Podman R01 prerequisite and closure evidence.
+- [x] Durable disposable-worker capacity and lifecycle reconciliation.
+- [x] Pinned prepared Lima/VZ worker inputs and exact template identity.
+- [x] Physical prepared-template create/provision/ready/stop/delete acceptance on Apple silicon.
+- [x] Official Runner Scale Set bridge, Keychain credential acquisition, durable delivery recovery, and JIT handoff composition.
+- [x] LaunchAgent plan/apply/status and service supervision path.
+- [x] Physical controller-death evidence and explicit recovery debt for in-flight Lima mutation gaps.
+- [x] Trusted persistent Quarry runner lane with warm workspace/toolchain/cache retention.
+- [x] Warm pause/resume and auto-idle controls for the trusted lane.
+- [x] Recent security hardening around runner JIT secrecy, immutable readiness identity, Git filter execution, teardown authority, wrapper provenance, and exact elevated-command confirmation.
 
-The R01 implementation remains useful defense-in-depth and future Linux/container work. No additional narrow R01 proof slice blocks the disposable VM product path.
+## Current sequencing
 
-## Adjacent operator lane — developer namespace and blank-Mac recovery
+The strict disposable lifecycle remains the immediate production prerequisite for hostile work. Hot trusted execution should progress in parallel whenever it does not weaken that lane.
 
-The disposable worker path is the production critical path. A separate operator-experience lane may make the **development machine itself reproducible** without turning persistent developer state into CI execution state. The governing design is [Developer project namespace and workstation recovery](PROJECT_WORKSPACES.md), tracked in [#372](https://github.com/teamleaderleo/smolrunner/issues/372).
+Current priorities:
 
-The target experience is:
-
-```text
-replacement Mac
--> restore reviewed operator catalog
--> converge developer environment
--> smolrunner project enter PROJECT
--> work
-```
-
-This lane owns logical project names, a portable secret-free catalog, adoption of existing Mac checkouts, lazy repository materialization, one trusted persistent developer Lima environment, generation-based publication/recovery, and eventual blank-Mac convergence. It borrows Nix/OSTree-style prepare/prove/switch semantics plus SmolRunner's existing compare-and-swap and reconciliation discipline.
-
-It must preserve the production boundary:
-
-- persistent developer checkouts never mount into hostile CI workers;
-- developer credentials never flow into disposable workers;
-- persistent writable developer caches carry no verification authority merely by existing;
-- exact source identity remains separate from materialization and execution identity;
-- destructive project cleanup still requires exact ownership evidence and separate authority.
-
-Initial sequence:
-
-- [x] P1 design and canonical identity contract in `docs/PROJECT_WORKSPACES.md` and #372.
-- [ ] P2 read-only catalog parsing, alias resolution, and explicit-root checkout discovery.
-- [ ] P3 in-place adoption of existing `~/Projects` checkouts plus durable catalog generations and local-only-risk reporting.
-- [ ] P4 one persistent developer Lima environment plus `project ensure` / `project enter` for a public repository.
-- [ ] P5 reviewed blank-Mac convergence with eager essential projects, lazy remainder, and explicit credential blockers.
-
-P2/P3 can progress as bounded read-only/durable-state work when they do not collide with disposable-worker milestones. P4/P5 must reuse mature host/VM/dependency tooling and may not divert the hostile-CI backend into a persistent worker model.
-
-## Gate A — dependency and adapter boundary
-
-Before broad M2-M4 implementation, finish the research in [#368](https://github.com/teamleaderleo/smolrunner/issues/368) far enough to keep the core from duplicating mature projects.
-
-- [ ] Compare direct pinned `actions/scaleset` integration with GARM, GHA Outrunner, Graftery, and related autoscaler/provider contracts.
-- [ ] Keep Lima/VZ as the first backend while defining a small backend-independent disposable-worker contract.
-- [ ] Decide whether the one-time JIT secret can be delivered through direct runner execution over the existing Lima control path or needs a tiny exec-only guest launcher.
-- [ ] Select or bound the M4 network-enforcement backend; keep network policy intent independent of that implementation.
-- [ ] Record source/version/license implications for candidate dependencies before they become required distribution components.
-
-This gate is meant to shrink custom code, not delay the first worker indefinitely. The default remains direct `actions/scaleset` + Lima/VZ unless research finds a clearly better boundary.
+1. complete the installed-service one-job disposable path and converge back to runner/VM absence plus zero reserved capacity;
+2. close restart-safe ownership for in-flight Lima mutations and extend controller-death/reboot/sleep/outage recovery;
+3. prove and implement the hostile-worker network boundary;
+4. benchmark resident trusted execution as a first-class product path;
+5. instrument queue/edit-to-useful-result latency and hot-state hit/miss/reset behavior;
+6. evaluate Linux-native project storage, cheap task forks, repository seeds, compiler caches, and warm services from measured agent loops;
+7. feed those measurements into adaptive execution placement, verification compilation, and diagnostics.
 
 ## Milestone 1 — durable disposable-attempt reconciliation
 
-The pure reconciler now consumes the bounded Scale Set protocol and canonical durable attempt
-catalog directly. Restart-at-every-checkpoint coverage exercises the real crash-safe Unix store.
+The durable reconciler establishes the correctness kernel for fresh one-job workers.
 
-- [x] Define a small phase graph from reservation through provisioning, registration, assignment, execution, teardown, deregistration, release, and completion.
-- [x] Emit one idempotent next action per reconciliation tick.
-- [x] Enforce concurrency, CPU, memory, and disk budgets before additional workers are admitted.
-- [x] Model cancellation, expiry, reservation loss, runner loss, missing/orphan VM state, duplicate/out-of-order job events, and cleanup ordering.
-- [x] Persist the attempt through the existing crash-safe state machinery with exact revisions and recovery semantics.
-- [x] Split prechosen runner name from GitHub-assigned runner ID so ambiguous JIT registration can recover by stable identity.
-- [x] Preserve Scale Set job identity and result as bounded protocol values instead of assuming narrower REST/enum forms.
-- [x] Cover crash-after-every-checkpoint, exact late-event binding, refusal of unbound runnerless completion, unknown completion strings, exact stale-registration cleanup, and scale-to-zero in deterministic persistence tests.
+- [x] Durable attempt identity from reservation through provisioning, registration, assignment, execution, teardown, deregistration, release, and completion.
+- [x] Exact resource budgets and no-duplicate capacity ownership.
+- [x] Cancellation, expiry, runner loss, missing/orphan VM state, duplicate/out-of-order events, and cleanup ordering.
+- [x] Crash-at-checkpoint persistence tests and exact stale-registration cleanup semantics.
 
-**M1 acceptance:** killing the controller at every lifecycle boundary and restarting it never creates a second worker for the same attempt, loses owned cleanup debt, or releases capacity before cleanup is proven.
+**M1 acceptance:** restart at any durable lifecycle boundary preserves exact ownership and prevents duplicate worker authority or premature capacity release.
 
 ## Milestone 2 — prepared disposable Lima/VZ worker
 
-Build a worker factory that makes **fresh writable state cheap**.
+Build a worker factory that makes fresh hostile-writable state cheap and exact.
 
-- [x] Distinguish absent, exact stopped, and exact ready workers so clone-with-start success and interrupted-clone cleanup are independently recoverable across controller crashes.
-- [x] Define sealed fixed shell-free clone and force-delete Lima command plans with an empty explicit environment, fixed deadlines, and exact durable attempt/resource inputs; omit standalone start, and keep all execution private until the same-lock durable authority exists.
-- [x] Persist the controller's observed-absent decision as versioned `CloneAuthorized` state before cloning; use clone-with-start and discard only a stopped partial clone inside that authorized creation window, avoiding Lima's create-or-start `start NAME` behavior. Schema-v1 attempts and the legacy `Provisioning` phase fail closed. The future mutation boundary must still revalidate sealed absence under the catalog lock.
-- [x] Remove moving Ubuntu fallbacks from checked-in Lima inputs, pin one dated ARM64 cloud image by its published SHA-256, and bind every durable reservation and Lima command plan to an exact prepared-template digest. Template construction and post-clone provenance observation remain required before live execution.
-- [x] Pin Lima 2.2.0 and the official Linux ARM64 runner 2.336.0 archive by its GitHub-published and independently verified SHA-256; derive one canonical prepared-template identity from that archive, the pinned guest image, the provisioning recipe/account split, and the fail-closed no-host-integration policy. Durable reservations and Lima command plans consume the typed identity.
-- [x] Define the canonical prepared-template source-generation history and pure recovery planner: sealed observations are exact-generation/revision-bound, mutation candidates are opaque advisory values that require a second fresh private reconfirmation before future execution, started external operations are never blindly replayed, existing names remain protected, and incomplete construction becomes destroy-and-rebuild debt rather than adoption.
-- [x] Persist prepared-template generation under the existing canonical Unix lock with strict current/staged recovery, exact-successor checks, cross-document recovery refusal, and a plan-plus-second-sealed-observation transition API that rejects VM command candidates.
-- [ ] Produce a controller-owned prepared template containing the runner, required guest account separation, selected toolchains, and static provisioning inputs.
-- [ ] Evaluate Ubuntu 26.04 ARM64 first where it simplifies VZ/vsock control; retain the final distro/version as an explicit reviewed input.
-- [ ] Clone the stopped template into a unique attempt-bound worker through Lima's copy-on-write-capable clone path.
-- [ ] Create, start, observe, stop, force-stop, and destroy the exact worker through bounded Lima commands.
-- [ ] Use Lima plain mode or an equivalent exact configuration with no host mounts, SSH-agent forwarding, dynamic port forwarding, guest agent, Rosetta, or inherited host environment.
-- [ ] Keep the Actions workload account distinct from any provisioning/admin account and remove sudo/equivalent authority from the workload identity.
-- [ ] Apply exact CPU, memory, disk, and wall-time ceilings.
-- [ ] Discover and destroy exactly owned orphan workers after controller crash or reboot.
-- [ ] Invoke the official runner's supported warmup path where measurements show it improves ready-to-job latency.
-- [ ] Prove the lifecycle first with injected/fake executors, then on the physical acceptance Mac.
+- [x] Pin Lima, guest image, Actions runner archive, provisioning recipe, account separation, and no-host-integration policy into one prepared-template identity.
+- [x] Bound clone/delete commands, exact resource inputs, filesystem-space admission, and post-command observation.
+- [x] Physically prove prepared-template lifecycle and create-failure cleanup.
+- [x] Keep repository code inside Linux with no host mounts, SSH-agent forwarding, proxy inheritance, Rosetta, or host filesystem sharing.
+- [ ] Finish restart-safe ownership/quiescence for in-flight Lima mutations.
+- [ ] Extend the physical crash matrix through clone/start/delete and ambiguous response cases.
 
-**M2 acceptance:** a fresh worker clone reaches bounded controller-ready state quickly, has no Mac integration visible to the workload identity, and leaves no attempt-specific VM/process/disk allocation after deletion outside documented shared image/cache state.
+**M2 acceptance:** a fresh worker reaches controller-ready state from exact prepared inputs and can be removed after any supported failure without adopting foreign state.
 
 ## Milestone 3 — GitHub-native one-job execution
 
-Make GitHub the normal control path for agents and humans.
+Make ordinary GitHub demand the normal strict-disposable control path.
 
-- [ ] Store the least-privilege controller GitHub App credential in the Mac Keychain.
-- [x] Read the pre-enrolled GitHub App credential directly through macOS Security.framework without
-  a secret-bearing subprocess, argv, environment, or public execution record.
-- [x] Refuse secret-bearing bridge startup unless the fixed protected installation path matches the
-  reviewed SHA-256 identity, and bound every bridge operation with a finite deadline.
-- [ ] Integrate a pinned Runner Scale Set Client behind a narrow adapter for demand, sessions, acknowledgement, JIT generation, job-start, and job-completion observations.
-  - [x] Pin the official Go client behind a bounded empty-environment bridge whose messages require
-    an explicit post-persistence acknowledgement.
-  - [x] Reconcile each canonical delivery with the attempt catalog, checkpoint acknowledgement,
-    recover ambiguous acquisition without replaying acknowledgement, and atomically settle the
-    delivery fence while preserving acquired work or retiring definitively unacquired capacity.
-  - [x] Version the bridge cursor-restore and explicit-capacity polling contract so a fresh session
-    can observe later lifecycle evidence at zero capacity without admitting another job.
-  - [x] Resolve empty acquisition responses from exact later Assigned or runnerless canceled
-    lifecycle evidence through a paired catalog/recovery transaction, including acknowledgement
-    response loss without replaying job acquisition.
-    The supervised service loop remains open.
-- [ ] Validate every upstream response before it can advance durable state; malformed or internally inconsistent responses retain the prior attempt and fail closed.
-- [x] Persist a unique runner name before JIT creation; bind the service-assigned runner ID only after exact scale-set identity is observed.
-- [x] Transfer JIT configuration without argv, public logs, public journals, reusable guest storage, or a long-lived parent environment carrying the secret.
-- [x] Use a tiny bounded exec-only guest launcher because the existing Lima control path cannot deliver the secret without exposing it in process arguments.
-- [ ] Bind the actual started job identity to the exact runner and VM rather than inferring assignment from demand.
-- [ ] Run the pinned official runner for exactly one job and collect only bounded external lifecycle diagnostics.
-- [ ] Observe terminal GitHub evidence, destroy the VM, remove stale runner registration, and release capacity automatically.
-- [ ] Demonstrate the complete benign path against an enrolled test repository without routine operator commands.
+- [x] Pin the official Runner Scale Set client behind a bounded private bridge.
+- [x] Keep long-lived GitHub App credentials in the Mac Keychain/control plane.
+- [x] Durably consume assignment state and preserve explicit no-replay recovery.
+- [x] Transfer one-time JIT material through the reviewed secret-safe guest launcher.
+- [x] Compose clone, JIT, runner start, terminal teardown, and capacity release behind `worker serve`.
+- [ ] Complete the installed LaunchAgent -> queued job -> disposable VM -> one job -> runner removal -> VM deletion -> zero-capacity physical journey.
+- [ ] Extend reassignment/backlog and graceful shutdown behavior from physical evidence.
 
-**M3 acceptance:** an agent can submit ordinary GitHub work and receive the normal GitHub result while SmolRunner automatically creates and removes the required local worker.
+**M3 acceptance:** one ordinary GitHub job executes exactly once in one disposable Linux worker and converges to zero worker-specific state automatically.
 
 ## Milestone 4 — hostile-CI credential and network boundary
 
-M3 proves functionality. M4 makes arbitrary repository code an intended workload.
+Make arbitrary repository code an intended workload.
 
-- [ ] Keep durable agent/API credentials in the trusted agent/control plane and outside workers entirely.
-- [ ] Give each worker only the short-lived JIT/Actions authority required for its exact job; assume every credential visible in the guest may be stolen.
-- [ ] Deny inbound access and outbound Mac host, private/LAN, link-local, metadata, controller, and peer-worker destinations outside explicit workload authority.
-- [ ] Preserve explicit DNS and ordinary outbound source/package/build access without depending on or exposing the Mac's local resolver state.
-- [ ] Add bounded connection/rate/byte policy where the selected mature enforcement backend supports it.
-- [ ] Allow explicit project network exceptions as reviewed policy rather than arbitrary workflow expansion.
-- [ ] Enable rootless nested containers inside the disposable VM for container actions, service containers, and ordinary container builds.
-- [ ] Verify benign CI plus hostile credential, network, process, disk, CPU, memory, nested-container, and persistence fixtures.
+- [x] Keep durable controller credentials outside the worker.
+- [x] Harden JIT/runner process secrecy against same-UID workflow reads.
+- [ ] Deny worker access to the Mac host, LAN/private ranges, link-local, metadata-style destinations, controller, and peer workers while preserving ordinary public build egress.
+- [ ] Physically identify and prove the VZ networking enforcement point before selecting the policy backend.
+- [ ] Add least-privilege nested-container behavior and hostile fixtures.
+- [ ] Preserve exact teardown even when the guest mutates its own writable disk state.
 
-**M4 acceptance:** complete compromise of the guest yields no durable Mac/agent credential, useful host persistence, LAN/controller/peer-worker reachability, or reusable execution state after worker destruction.
+**M4 acceptance:** complete guest compromise yields no durable Mac/agent credential, useful host persistence, controller/LAN/peer reachability, or reusable hostile writable state after teardown.
 
 ## Milestone 5 — supervised autoscaling and recovery
 
-Make the service disappear from the operator's attention during normal use.
+Make execution disappear from the operator's attention.
 
-- [ ] Add `smolrunner worker serve` as a bounded reconciler supervised by `launchd`.
-- [ ] Run scale-set long polling with durable acknowledgement/session recovery; keep the first path outbound-only rather than adding an inbound webhook.
-- [ ] Scale within exact host-wide resource budgets and return to zero running workers when idle.
-- [ ] Let multiple trusted agents submit work concurrently without giving them direct host/VM control.
-- [ ] Add backoff, retry budgets, circuit breakers, operator holds, quarantine, and precise status/remediation.
-- [ ] Reconcile controller kill, sleep/wake, reboot, GitHub outage, failed provisioning, lost runner, stuck job, failed teardown, and partial stale-registration cleanup.
-- [ ] Keep secrets, arbitrary job logs, and raw repository data out of durable SmolRunner diagnostics.
+- [x] Bounded long-poll supervisor, pacing, retry budget, and circuit breaker.
+- [x] LaunchAgent-supervised production service path.
+- [x] Signal handling, exact service installation identity, and read-only status vocabulary.
+- [x] First physical controller-SIGKILL proof.
+- [ ] Restart-safe execution ownership for in-flight mutations.
+- [ ] Sleep/wake, reboot, GitHub outage, failed provisioning, lost runner, stuck job, failed teardown, and stale-registration recovery.
+- [ ] Bounded private diagnostic/failure receipts that preserve useful evidence without turning logs into authority.
 
-**M5 acceptance:** agents may stop paying attention after submitting work; queueing and host contention may delay execution, but ordinary completion and failure converge without routine operator cleanup.
+**M5 acceptance:** ordinary success, failure, cancellation, host restart, and service restart converge with bounded operator attention and exact recovery semantics.
 
-## Milestone 6 — hot disposable performance
+## Milestone 6 — blazingly hot execution
 
-Recover as much of a persistent runner's speed as possible without carrying its compromise persistence forward.
+M6 is a primary product programme. The target is **agent wall-clock latency**, across both prepared-disposable and resident trusted execution.
 
-Optimization rule:
+Measure the full path:
 
-> Keep state across jobs only when reusing it does not make compromise recovery materially harder.
+```text
+work becomes known
+-> execution target / resident sandbox selected
+-> capacity admitted
+-> environment ready
+-> repo/revision usable
+-> dependency/build state usable
+-> first useful command
+-> first useful test/build result
+-> final trustworthy result
+-> teardown or residency transition
+```
 
-- [ ] Measure queue-to-start, VM clone/create, boot-to-control-ready, JIT-to-job-start, job overhead, teardown, RAM/disk, failure convergence, and idle footprint.
-- [ ] Benchmark representative Maven, Node/npm/pnpm, Rust, container-build, Git, and browser workloads on native macOS versus cold and prepared Linux/VZ workers on the same Mac.
-- [ ] Keep reviewed toolchains and common static dependencies inside a pinned prepared VM template where rebuild cost justifies it.
-- [ ] Use GitHub Actions cache/artifacts as the first cross-job dependency/cache path.
-- [ ] Evaluate `sccache` before retaining whole writable compiler output trees; use read-only consumption for lower-trust jobs where appropriate.
-- [ ] Use BuildKit's GitHub Actions cache backend for container-layer reuse before introducing a host cache service.
-- [ ] Separate cache **consumer** authority from **publisher** authority so low-trust jobs cannot poison reusable cache state for trusted work.
-- [ ] Namespace and quota any host-local cache that later proves worthwhile; record cold/warm state and cache identity in performance evidence.
-- [ ] Keep checkouts, mutable build trees, temporary services, job credentials, and uncertain cache writes in the disposable worker layer.
-- [ ] Add cache-poisoning fixtures and prove a suspected-compromise response can discard the affected writable/cache generation and continue from known reusable state.
+Headline metrics:
 
-**M6 acceptance:** repeated common builds approach warm-runner latency while the operator can still respond to suspected worker compromise primarily by discarding attempt-specific state rather than rebuilding the Mac or a pet runner.
+- queue-to-first-useful-command;
+- edit-to-first-test-result;
+- edit-to-final-relevant-verification;
+- task completion wall time;
+- fleet throughput under 1 / 2 / 4 / N concurrent agents;
+- disk/RAM/CPU residency cost per active project;
+- reset/invalidation frequency and time lost to cold reconstruction.
 
-## Milestone 7 — trusted-agent build-farm experience
+### M6A — hot execution environments
 
-Turn the implementation into the simple experience that motivated it.
+- [ ] Benchmark cold disposable, prepared disposable, warm-pool disposable, resident project after idle, immediate resident reuse, and resident task loop.
+- [ ] Benchmark Lima/VZ clone/start and snapshot/fork alternatives using the same workload receipts.
+- [ ] Evaluate Apple `container` and other mature local backends only where measurements show a credible win.
+- [ ] Make project residency an explicit leased state with revalidate/reset/quarantine/retire semantics.
+- [ ] Keep active ultra-trusted projects resident when expected reuse value exceeds idle resource cost.
 
-- [ ] Make ordinary repository-owned GitHub workflows the default agent interface: push/PR/dispatch, wait for GitHub result, continue work.
-- [ ] Provide a narrow optional path for testing reputable external open-source repositories without granting their workflow YAML infrastructure authority; the trusted harness may check out an exact repository/commit and run an explicit reviewed command inside the same hostile worker boundary.
-- [ ] Keep agent identities/API keys outside workers and avoid direct SSH/shell authority to SmolRunner hosts as a routine interface.
-- [ ] Report capacity, queue delay, worker phase, blockers, retries, cleanup debt, and result through stable human/JSON status suitable for unattended agents.
-- [ ] Measure multiple concurrent agent workloads and tune resource classes/admission from actual host behavior rather than fixed runner counts alone.
-- [ ] Preserve backend and capability identity so later experiments such as GPU-capable Linux workers or additional Mac VM engines do not rewrite the core lifecycle.
+### M6B — hot repository state
 
-**M7 acceptance:** the Mac behaves like a small private build farm: trusted agents can continuously submit varied work through GitHub, useful build inputs remain hot, hostile execution stays disposable, and the operator usually forgets the runner service exists.
+- [ ] Keep Git object/repository seeds locally reusable under exact project identity.
+- [ ] Reuse persistent trusted project checkouts/worktrees under exact source and dirty-state rules.
+- [ ] Explore shared read-only source/object bases with cheap task-local writable views.
+- [ ] Hydrate/fetch missing objects while admission and environment preparation run in parallel.
+- [ ] Benchmark 1 / 8 / 32 / N concurrent agent worktrees and branch/task forks.
+
+### M6C — Linux storage and cheap task forks
+
+The repository workload already runs inside Linux. Make that Linux storage layer an explicit performance lever.
+
+- [ ] Establish the current guest filesystem/virtual-disk path as the baseline.
+- [ ] Benchmark representative Git, pnpm/npm/Bun, Cargo, Maven, test-output, and cleanup workloads against XFS/reflink, XFS with a mature dedupe/compression layer where viable, and other credible Linux candidates.
+- [ ] Measure small-file creation/deletion, hardlink/reflink behavior, worktree creation, package installs from warm stores, compiler-tree reuse, disk growth, and CPU overhead.
+- [ ] Measure host-side Lima backing-file growth alongside guest-visible logical bytes.
+- [ ] Evaluate one resident project volume plus cheap task-local forks against many fully independent worker clones.
+- [ ] Keep the winning filesystem/storage choice behind a backend contract so execution semantics stay independent of one format.
+
+### M6D — hot dependency/build state
+
+- [ ] Make package-manager state, compiler caches, build outputs, container layers, and prepared dependency environments first-class typed hot-state classes.
+- [ ] Benchmark `sccache`/`ccache` and repository-native incremental build state from real edit/test loops.
+- [ ] Separate project-local mutable state from cross-job immutable generations.
+- [ ] Track hit/miss, bytes, restore/build cost, observed time saved, last useful hit, and invalidation causes.
+- [ ] Reclaim state that fails to earn its disk/RAM cost.
+
+### M6E — hot services and indexes
+
+- [ ] Keep language servers, test daemons/watchers, compiler servers, local fixtures, builders, and repository-specific services resident for ultra-trusted projects when their lifecycle is explicit.
+- [ ] Preserve/revalidate language and code-search indexes across related tasks.
+- [ ] Measure daemon/index warmup savings separately from repository and compiler-cache savings.
+
+### M6F — overlap and anticipate
+
+- [ ] Overlap target selection, capacity reservation, environment fork/materialization, repository hydration, cache/artifact selection, JIT preparation, and verification-plan compilation whenever their inputs permit it.
+- [ ] Prefetch likely next inputs from explicit project activity and queue evidence within bounded policy.
+- [ ] Expose which preparation hit, missed, reset, or ran in parallel for each execution.
+
+**M6 acceptance:** active trusted agent loops feel like local development: common iterations begin with useful work almost immediately, repeated setup disappears, fleet throughput remains efficient, and every hot state family has a proven reset/cold-reconstruction path.
+
+## Milestone 7 — adaptive agent execution runtime
+
+Turn the hot execution substrate into a system that improves from repeated work.
+
+- [ ] Use #21 observations to record bounded comparable-run timing/resource/cache evidence.
+- [ ] Use #546 to select execution target, resource profile, concurrency, and included/owned/burst capacity from predicted completion cost.
+- [ ] Use #547 to compile repeated verification work into exact reusable plans, derived artifacts, test selection, and deterministic partitioning.
+- [ ] Use #548 to classify recurring failures, propose discriminating probes, rank remedies, and promote known recurring causes into preflight checks.
+- [ ] Route trusted agent work toward already-hot project state when that beats a theoretically quicker cold machine.
+- [ ] Explain every decision through stable human/JSON reports: residency, source validity, cache hits, reset reasons, expected first-test latency, and selected target.
+- [ ] Preserve ordinary GitHub workflows as the default interface while allowing explicit trusted agent dispatch to consume routing/planning recommendations.
+
+**M7 acceptance:** SmolRunner behaves like an execution runtime that gets quicker and easier to operate as it sees the same projects repeatedly, while every optimization remains inspectable, reversible, and bounded by trust.
+
+## Hotness hierarchy
+
+Optimize in this order unless measurements say otherwise:
+
+1. keep valuable trusted state resident;
+2. remove avoidable semantic work;
+3. reuse exact work already completed;
+4. overlap independent preparation;
+5. share immutable inputs;
+6. parallelize genuinely independent work;
+7. optimize hot kernels and storage behavior;
+8. buy/rent additional compute.
+
+A giant runner rebuilding the world every iteration is cold.
 
 ## Suspected-compromise recovery target
 
-Security exists primarily to make recovery cheap and boring.
-
-For a dependency-worm or hostile-repository event, the desired routine response is:
+For hostile or compromised execution, the desired routine response remains small and exact:
 
 ```text
-mark attempt/cache generation suspect
+mark affected attempt/generation suspect
 -> stop admitting derived reusable writes
--> destroy the worker
--> remove stale GitHub runner state
--> allow job-scoped authority to expire or revoke narrow controller authority if evidence requires it
--> discard affected writable/cache generation
--> continue from pinned template + trusted reusable inputs
+-> destroy or quarantine the worker/sandbox
+-> remove stale GitHub runner state where exact authority exists
+-> revoke or expire narrow affected authority
+-> discard affected reusable generation when policy requires it
+-> continue from canonical durable truth + reviewed inputs
 ```
 
-The Mac host, trusted-agent credentials, unrelated repositories, LAN, and future workers should remain outside the blast radius. A worker compromise may fail jobs or invalidate a bounded cache generation; it should rarely imply rebuilding the operator machine.
+For ultra-trusted resident projects, ambiguity in project/source/toolchain/credential validity triggers revalidation, reset, quarantine, or destruction. Residency never gains authority merely by surviving.
 
 ## Deferred
 
-- Completion of the custom 40-class R01 runtime-readiness graph and host-rootless-Podman hostile-code backend.
-- Persistent workers and retained writable workspaces as the default execution model.
-- Shared authoritative compiled-output trees without a proven trust/content/producer model.
-- Linux fleet stewardship as the primary product path.
-- Multi-host selection, cloud providers, Kubernetes, and public multi-tenancy.
-- Previews, routing, deployment, and production credentials.
-- Automatic self-update, broad fleet policy, dashboard, and broad automatic repair.
-- A custom cache server, CAS, image registry, VM monitor, firewall implementation, or workflow scheduler before measurements demonstrate a missing mature component.
+- Public multi-tenancy and generic fleet management.
+- A replacement workflow language or general CI scheduler.
+- Cross-project writable-state sharing without an explicit portability and trust model.
+- Broad autonomous source modification from diagnostic guesses.
+- Custom hypervisors, container runtimes, package managers, filesystems, or cache servers before mature components fail a measured requirement.
+- Deployment authority inferred from verification success.
 
 ## Non-goals
 
 - Replacing GitHub Actions workflow YAML or the official runner protocol.
-- Giving agents unrestricted host or worker shell authority as the normal submission path.
-- Building a custom hypervisor, container runtime, package manager, init system, or service supervisor.
-- Building another general-purpose CI scheduler or Kubernetes-like placement system for the single-Mac product.
-- Weakening the isolation or credential boundary merely to produce a demo.
-- Treating the operator's repositories or reputable open-source repositories as inherently safe code.
-- Treating successful verification as deployment authority.
-- Treating worker disposal alone as a defense for long-lived credentials intentionally exposed to hostile code.
+- Giving agents unrestricted Mac host authority as the normal submission path.
+- Treating resident state, cache hits, process survival, filenames, PIDs, or directory presence as execution truth.
+- Letting performance preferences weaken credential, network, ownership, teardown, or recovery gates.
+- Treating one worker-lifetime policy as universally optimal.
