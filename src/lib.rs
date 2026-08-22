@@ -100,6 +100,8 @@ pub mod host_readiness;
 pub mod host_readiness_verdict;
 #[cfg(target_os = "linux")]
 pub mod host_rootless_podman;
+/// Pure bounded observation-only receipts for blazingly hot execution measurements.
+pub mod hot_execution_performance;
 #[cfg(target_os = "linux")]
 pub mod installation_id;
 pub mod journal;
