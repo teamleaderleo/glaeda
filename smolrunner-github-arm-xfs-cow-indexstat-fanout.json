@@ -1,0 +1,425 @@
+{
+  "counts": {
+    "1": {
+      "baseline": {
+        "cleanup_wall_ms": 8.649,
+        "materialize_wall_ms": 26.788,
+        "metadata_wall_ms": 3.816,
+        "successes": 1,
+        "used_delta": 8376320,
+        "verify_wall_ms": 45.796,
+        "work_wall_ms": 76.4
+      },
+      "cow_indexstat": {
+        "cleanup_wall_ms": 8.939,
+        "indexstat_records": [
+          {
+            "elapsed_ms": 10.475,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0,
+            "version": 2
+          }
+        ],
+        "indexstat_successes": 1,
+        "indexstat_wall_ms": 10.699,
+        "metadata_wall_ms": 2.644,
+        "populate_successes": 1,
+        "populate_wall_ms": 12.73,
+        "read_tree_successes": 1,
+        "read_tree_wall_ms": 8.584,
+        "successes": 1,
+        "used_delta": 278528,
+        "verify_wall_ms": 56.263,
+        "work_wall_ms": 90.92
+      }
+    },
+    "32": {
+      "baseline": {
+        "cleanup_wall_ms": 533.883,
+        "materialize_wall_ms": 449.751,
+        "metadata_wall_ms": 32.63,
+        "successes": 32,
+        "used_delta": 267915264,
+        "verify_wall_ms": 390.107,
+        "work_wall_ms": 872.488
+      },
+      "cow_indexstat": {
+        "cleanup_wall_ms": 332.132,
+        "indexstat_records": [
+          {
+            "elapsed_ms": 607.077,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0,
+            "version": 2
+          },
+          {
+            "elapsed_ms": 670.618,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0,
+            "version": 2
+          },
+          {
+            "elapsed_ms": 644.247,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0,
+            "version": 2
+          },
+          {
+            "elapsed_ms": 676.934,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0,
+            "version": 2
+          },
+          {
+            "elapsed_ms": 678.839,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0,
+            "version": 2
+          },
+          {
+            "elapsed_ms": 689.465,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0,
+            "version": 2
+          },
+          {
+            "elapsed_ms": 586.91,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0,
+            "version": 2
+          },
+          {
+            "elapsed_ms": 668.693,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0,
+            "version": 2
+          },
+          {
+            "elapsed_ms": 653.347,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0,
+            "version": 2
+          },
+          {
+            "elapsed_ms": 670.783,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0,
+            "version": 2
+          },
+          {
+            "elapsed_ms": 618.23,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0,
+            "version": 2
+          },
+          {
+            "elapsed_ms": 610.143,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0,
+            "version": 2
+          },
+          {
+            "elapsed_ms": 599.591,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0,
+            "version": 2
+          },
+          {
+            "elapsed_ms": 603.167,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0,
+            "version": 2
+          },
+          {
+            "elapsed_ms": 671.943,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0,
+            "version": 2
+          },
+          {
+            "elapsed_ms": 656.885,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0,
+            "version": 2
+          },
+          {
+            "elapsed_ms": 600.277,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0,
+            "version": 2
+          },
+          {
+            "elapsed_ms": 610.076,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0,
+            "version": 2
+          },
+          {
+            "elapsed_ms": 651.128,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0,
+            "version": 2
+          },
+          {
+            "elapsed_ms": 632.178,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0,
+            "version": 2
+          },
+          {
+            "elapsed_ms": 621.047,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0,
+            "version": 2
+          },
+          {
+            "elapsed_ms": 662.605,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0,
+            "version": 2
+          },
+          {
+            "elapsed_ms": 642.764,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0,
+            "version": 2
+          },
+          {
+            "elapsed_ms": 663.43,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0,
+            "version": 2
+          },
+          {
+            "elapsed_ms": 657.99,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0,
+            "version": 2
+          },
+          {
+            "elapsed_ms": 652.755,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0,
+            "version": 2
+          },
+          {
+            "elapsed_ms": 634.342,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0,
+            "version": 2
+          },
+          {
+            "elapsed_ms": 645.394,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0,
+            "version": 2
+          },
+          {
+            "elapsed_ms": 652.275,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0,
+            "version": 2
+          },
+          {
+            "elapsed_ms": 642.082,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0,
+            "version": 2
+          },
+          {
+            "elapsed_ms": 592.689,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0,
+            "version": 2
+          },
+          {
+            "elapsed_ms": 644.266,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0,
+            "version": 2
+          }
+        ],
+        "indexstat_successes": 32,
+        "indexstat_wall_ms": 694.025,
+        "metadata_wall_ms": 31.613,
+        "populate_successes": 32,
+        "populate_wall_ms": 464.424,
+        "read_tree_successes": 32,
+        "read_tree_wall_ms": 23.267,
+        "successes": 32,
+        "used_delta": 8753152,
+        "verify_wall_ms": 60.206,
+        "work_wall_ms": 1273.535
+      }
+    },
+    "8": {
+      "baseline": {
+        "cleanup_wall_ms": 65.825,
+        "materialize_wall_ms": 89.619,
+        "metadata_wall_ms": 7.817,
+        "successes": 8,
+        "used_delta": 66977792,
+        "verify_wall_ms": 96.595,
+        "work_wall_ms": 194.031
+      },
+      "cow_indexstat": {
+        "cleanup_wall_ms": 63.761,
+        "indexstat_records": [
+          {
+            "elapsed_ms": 162.554,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0,
+            "version": 2
+          },
+          {
+            "elapsed_ms": 167.776,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0,
+            "version": 2
+          },
+          {
+            "elapsed_ms": 168.753,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0,
+            "version": 2
+          },
+          {
+            "elapsed_ms": 132.934,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0,
+            "version": 2
+          },
+          {
+            "elapsed_ms": 158.868,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0,
+            "version": 2
+          },
+          {
+            "elapsed_ms": 166.149,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0,
+            "version": 2
+          },
+          {
+            "elapsed_ms": 165.632,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0,
+            "version": 2
+          },
+          {
+            "elapsed_ms": 158.666,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0,
+            "version": 2
+          }
+        ],
+        "indexstat_successes": 8,
+        "indexstat_wall_ms": 169.732,
+        "metadata_wall_ms": 7.123,
+        "populate_successes": 8,
+        "populate_wall_ms": 108.196,
+        "read_tree_successes": 8,
+        "read_tree_wall_ms": 6.764,
+        "successes": 8,
+        "used_delta": 2195456,
+        "verify_wall_ms": 13.006,
+        "work_wall_ms": 304.821
+      }
+    }
+  },
+  "schema_version": 1,
+  "source": {
+    "logical_bytes": 7262298,
+    "proof": {
+      "diff_files_ms": 22.877,
+      "diff_files_rc": 0,
+      "diff_index_ms": 22.649,
+      "diff_index_rc": 0,
+      "returncode": 0
+    },
+    "regular_entries": 390
+  }
+}
