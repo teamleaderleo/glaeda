@@ -1,0 +1,588 @@
+{
+  "counts": {
+    "32": {
+      "baseline": {
+        "cleanup_wall_ms": 361.882,
+        "materialize_wall_ms": 455.12,
+        "metadata_wall_ms": 25.786,
+        "successes": 32,
+        "used_delta": 267751424,
+        "verify_wall_ms": 395.012,
+        "work_wall_ms": 875.918
+      },
+      "cow_process_indexstat": {
+        "cleanup_wall_ms": 324.555,
+        "indexstat_successes": 32,
+        "indexstat_wall_ms": 354.935,
+        "metadata_wall_ms": 29.796,
+        "populate_successes": 32,
+        "populate_wall_ms": 452.557,
+        "read_tree_successes": 32,
+        "read_tree_wall_ms": 26.514,
+        "seed_records": [
+          {
+            "elapsed_ms": 299.027,
+            "returncode": 0,
+            "seed": {
+              "elapsed_ms": 62.748,
+              "entries": 390,
+              "extension_bytes": 1924,
+              "patched": 390,
+              "returncode": 0
+            },
+            "stderr": "",
+            "stdout": "{\"returncode\": 0, \"entries\": 390, \"patched\": 390, \"extension_bytes\": 1924, \"elapsed_ms\": 62.748}"
+          },
+          {
+            "elapsed_ms": 276.015,
+            "returncode": 0,
+            "seed": {
+              "elapsed_ms": 50.547,
+              "entries": 390,
+              "extension_bytes": 1924,
+              "patched": 390,
+              "returncode": 0
+            },
+            "stderr": "",
+            "stdout": "{\"returncode\": 0, \"entries\": 390, \"patched\": 390, \"extension_bytes\": 1924, \"elapsed_ms\": 50.547}"
+          },
+          {
+            "elapsed_ms": 195.5,
+            "returncode": 0,
+            "seed": {
+              "elapsed_ms": 56.681,
+              "entries": 390,
+              "extension_bytes": 1924,
+              "patched": 390,
+              "returncode": 0
+            },
+            "stderr": "",
+            "stdout": "{\"returncode\": 0, \"entries\": 390, \"patched\": 390, \"extension_bytes\": 1924, \"elapsed_ms\": 56.681}"
+          },
+          {
+            "elapsed_ms": 134.229,
+            "returncode": 0,
+            "seed": {
+              "elapsed_ms": 42.664,
+              "entries": 390,
+              "extension_bytes": 1924,
+              "patched": 390,
+              "returncode": 0
+            },
+            "stderr": "",
+            "stdout": "{\"returncode\": 0, \"entries\": 390, \"patched\": 390, \"extension_bytes\": 1924, \"elapsed_ms\": 42.664}"
+          },
+          {
+            "elapsed_ms": 269.672,
+            "returncode": 0,
+            "seed": {
+              "elapsed_ms": 56.135,
+              "entries": 390,
+              "extension_bytes": 1924,
+              "patched": 390,
+              "returncode": 0
+            },
+            "stderr": "",
+            "stdout": "{\"returncode\": 0, \"entries\": 390, \"patched\": 390, \"extension_bytes\": 1924, \"elapsed_ms\": 56.135}"
+          },
+          {
+            "elapsed_ms": 302.365,
+            "returncode": 0,
+            "seed": {
+              "elapsed_ms": 57.769,
+              "entries": 390,
+              "extension_bytes": 1924,
+              "patched": 390,
+              "returncode": 0
+            },
+            "stderr": "",
+            "stdout": "{\"returncode\": 0, \"entries\": 390, \"patched\": 390, \"extension_bytes\": 1924, \"elapsed_ms\": 57.769}"
+          },
+          {
+            "elapsed_ms": 258.126,
+            "returncode": 0,
+            "seed": {
+              "elapsed_ms": 43.807,
+              "entries": 390,
+              "extension_bytes": 1924,
+              "patched": 390,
+              "returncode": 0
+            },
+            "stderr": "",
+            "stdout": "{\"returncode\": 0, \"entries\": 390, \"patched\": 390, \"extension_bytes\": 1924, \"elapsed_ms\": 43.807}"
+          },
+          {
+            "elapsed_ms": 318.563,
+            "returncode": 0,
+            "seed": {
+              "elapsed_ms": 63.703,
+              "entries": 390,
+              "extension_bytes": 1924,
+              "patched": 390,
+              "returncode": 0
+            },
+            "stderr": "",
+            "stdout": "{\"returncode\": 0, \"entries\": 390, \"patched\": 390, \"extension_bytes\": 1924, \"elapsed_ms\": 63.703}"
+          },
+          {
+            "elapsed_ms": 313.255,
+            "returncode": 0,
+            "seed": {
+              "elapsed_ms": 74.676,
+              "entries": 390,
+              "extension_bytes": 1924,
+              "patched": 390,
+              "returncode": 0
+            },
+            "stderr": "",
+            "stdout": "{\"returncode\": 0, \"entries\": 390, \"patched\": 390, \"extension_bytes\": 1924, \"elapsed_ms\": 74.676}"
+          },
+          {
+            "elapsed_ms": 302.243,
+            "returncode": 0,
+            "seed": {
+              "elapsed_ms": 55.608,
+              "entries": 390,
+              "extension_bytes": 1924,
+              "patched": 390,
+              "returncode": 0
+            },
+            "stderr": "",
+            "stdout": "{\"returncode\": 0, \"entries\": 390, \"patched\": 390, \"extension_bytes\": 1924, \"elapsed_ms\": 55.608}"
+          },
+          {
+            "elapsed_ms": 208.047,
+            "returncode": 0,
+            "seed": {
+              "elapsed_ms": 51.207,
+              "entries": 390,
+              "extension_bytes": 1924,
+              "patched": 390,
+              "returncode": 0
+            },
+            "stderr": "",
+            "stdout": "{\"returncode\": 0, \"entries\": 390, \"patched\": 390, \"extension_bytes\": 1924, \"elapsed_ms\": 51.207}"
+          },
+          {
+            "elapsed_ms": 284.031,
+            "returncode": 0,
+            "seed": {
+              "elapsed_ms": 47.656,
+              "entries": 390,
+              "extension_bytes": 1924,
+              "patched": 390,
+              "returncode": 0
+            },
+            "stderr": "",
+            "stdout": "{\"returncode\": 0, \"entries\": 390, \"patched\": 390, \"extension_bytes\": 1924, \"elapsed_ms\": 47.656}"
+          },
+          {
+            "elapsed_ms": 314.1,
+            "returncode": 0,
+            "seed": {
+              "elapsed_ms": 50.167,
+              "entries": 390,
+              "extension_bytes": 1924,
+              "patched": 390,
+              "returncode": 0
+            },
+            "stderr": "",
+            "stdout": "{\"returncode\": 0, \"entries\": 390, \"patched\": 390, \"extension_bytes\": 1924, \"elapsed_ms\": 50.167}"
+          },
+          {
+            "elapsed_ms": 288.482,
+            "returncode": 0,
+            "seed": {
+              "elapsed_ms": 58.612,
+              "entries": 390,
+              "extension_bytes": 1924,
+              "patched": 390,
+              "returncode": 0
+            },
+            "stderr": "",
+            "stdout": "{\"returncode\": 0, \"entries\": 390, \"patched\": 390, \"extension_bytes\": 1924, \"elapsed_ms\": 58.612}"
+          },
+          {
+            "elapsed_ms": 273.801,
+            "returncode": 0,
+            "seed": {
+              "elapsed_ms": 54.917,
+              "entries": 390,
+              "extension_bytes": 1924,
+              "patched": 390,
+              "returncode": 0
+            },
+            "stderr": "",
+            "stdout": "{\"returncode\": 0, \"entries\": 390, \"patched\": 390, \"extension_bytes\": 1924, \"elapsed_ms\": 54.917}"
+          },
+          {
+            "elapsed_ms": 239.071,
+            "returncode": 0,
+            "seed": {
+              "elapsed_ms": 48.955,
+              "entries": 390,
+              "extension_bytes": 1924,
+              "patched": 390,
+              "returncode": 0
+            },
+            "stderr": "",
+            "stdout": "{\"returncode\": 0, \"entries\": 390, \"patched\": 390, \"extension_bytes\": 1924, \"elapsed_ms\": 48.955}"
+          },
+          {
+            "elapsed_ms": 298.295,
+            "returncode": 0,
+            "seed": {
+              "elapsed_ms": 32.161,
+              "entries": 390,
+              "extension_bytes": 1924,
+              "patched": 390,
+              "returncode": 0
+            },
+            "stderr": "",
+            "stdout": "{\"returncode\": 0, \"entries\": 390, \"patched\": 390, \"extension_bytes\": 1924, \"elapsed_ms\": 32.161}"
+          },
+          {
+            "elapsed_ms": 312.86,
+            "returncode": 0,
+            "seed": {
+              "elapsed_ms": 62.946,
+              "entries": 390,
+              "extension_bytes": 1924,
+              "patched": 390,
+              "returncode": 0
+            },
+            "stderr": "",
+            "stdout": "{\"returncode\": 0, \"entries\": 390, \"patched\": 390, \"extension_bytes\": 1924, \"elapsed_ms\": 62.946}"
+          },
+          {
+            "elapsed_ms": 284.434,
+            "returncode": 0,
+            "seed": {
+              "elapsed_ms": 57.767,
+              "entries": 390,
+              "extension_bytes": 1924,
+              "patched": 390,
+              "returncode": 0
+            },
+            "stderr": "",
+            "stdout": "{\"returncode\": 0, \"entries\": 390, \"patched\": 390, \"extension_bytes\": 1924, \"elapsed_ms\": 57.767}"
+          },
+          {
+            "elapsed_ms": 290.015,
+            "returncode": 0,
+            "seed": {
+              "elapsed_ms": 25.976,
+              "entries": 390,
+              "extension_bytes": 1924,
+              "patched": 390,
+              "returncode": 0
+            },
+            "stderr": "",
+            "stdout": "{\"returncode\": 0, \"entries\": 390, \"patched\": 390, \"extension_bytes\": 1924, \"elapsed_ms\": 25.976}"
+          },
+          {
+            "elapsed_ms": 288.564,
+            "returncode": 0,
+            "seed": {
+              "elapsed_ms": 49.196,
+              "entries": 390,
+              "extension_bytes": 1924,
+              "patched": 390,
+              "returncode": 0
+            },
+            "stderr": "",
+            "stdout": "{\"returncode\": 0, \"entries\": 390, \"patched\": 390, \"extension_bytes\": 1924, \"elapsed_ms\": 49.196}"
+          },
+          {
+            "elapsed_ms": 288.698,
+            "returncode": 0,
+            "seed": {
+              "elapsed_ms": 31.148,
+              "entries": 390,
+              "extension_bytes": 1924,
+              "patched": 390,
+              "returncode": 0
+            },
+            "stderr": "",
+            "stdout": "{\"returncode\": 0, \"entries\": 390, \"patched\": 390, \"extension_bytes\": 1924, \"elapsed_ms\": 31.148}"
+          },
+          {
+            "elapsed_ms": 279.645,
+            "returncode": 0,
+            "seed": {
+              "elapsed_ms": 44.787,
+              "entries": 390,
+              "extension_bytes": 1924,
+              "patched": 390,
+              "returncode": 0
+            },
+            "stderr": "",
+            "stdout": "{\"returncode\": 0, \"entries\": 390, \"patched\": 390, \"extension_bytes\": 1924, \"elapsed_ms\": 44.787}"
+          },
+          {
+            "elapsed_ms": 284.246,
+            "returncode": 0,
+            "seed": {
+              "elapsed_ms": 38.708,
+              "entries": 390,
+              "extension_bytes": 1924,
+              "patched": 390,
+              "returncode": 0
+            },
+            "stderr": "",
+            "stdout": "{\"returncode\": 0, \"entries\": 390, \"patched\": 390, \"extension_bytes\": 1924, \"elapsed_ms\": 38.708}"
+          },
+          {
+            "elapsed_ms": 268.601,
+            "returncode": 0,
+            "seed": {
+              "elapsed_ms": 31.069,
+              "entries": 390,
+              "extension_bytes": 1924,
+              "patched": 390,
+              "returncode": 0
+            },
+            "stderr": "",
+            "stdout": "{\"returncode\": 0, \"entries\": 390, \"patched\": 390, \"extension_bytes\": 1924, \"elapsed_ms\": 31.069}"
+          },
+          {
+            "elapsed_ms": 284.605,
+            "returncode": 0,
+            "seed": {
+              "elapsed_ms": 29.0,
+              "entries": 390,
+              "extension_bytes": 1924,
+              "patched": 390,
+              "returncode": 0
+            },
+            "stderr": "",
+            "stdout": "{\"returncode\": 0, \"entries\": 390, \"patched\": 390, \"extension_bytes\": 1924, \"elapsed_ms\": 29.0}"
+          },
+          {
+            "elapsed_ms": 280.153,
+            "returncode": 0,
+            "seed": {
+              "elapsed_ms": 71.893,
+              "entries": 390,
+              "extension_bytes": 1924,
+              "patched": 390,
+              "returncode": 0
+            },
+            "stderr": "",
+            "stdout": "{\"returncode\": 0, \"entries\": 390, \"patched\": 390, \"extension_bytes\": 1924, \"elapsed_ms\": 71.893}"
+          },
+          {
+            "elapsed_ms": 286.38,
+            "returncode": 0,
+            "seed": {
+              "elapsed_ms": 52.199,
+              "entries": 390,
+              "extension_bytes": 1924,
+              "patched": 390,
+              "returncode": 0
+            },
+            "stderr": "",
+            "stdout": "{\"returncode\": 0, \"entries\": 390, \"patched\": 390, \"extension_bytes\": 1924, \"elapsed_ms\": 52.199}"
+          },
+          {
+            "elapsed_ms": 270.783,
+            "returncode": 0,
+            "seed": {
+              "elapsed_ms": 44.179,
+              "entries": 390,
+              "extension_bytes": 1924,
+              "patched": 390,
+              "returncode": 0
+            },
+            "stderr": "",
+            "stdout": "{\"returncode\": 0, \"entries\": 390, \"patched\": 390, \"extension_bytes\": 1924, \"elapsed_ms\": 44.179}"
+          },
+          {
+            "elapsed_ms": 262.784,
+            "returncode": 0,
+            "seed": {
+              "elapsed_ms": 46.972,
+              "entries": 390,
+              "extension_bytes": 1924,
+              "patched": 390,
+              "returncode": 0
+            },
+            "stderr": "",
+            "stdout": "{\"returncode\": 0, \"entries\": 390, \"patched\": 390, \"extension_bytes\": 1924, \"elapsed_ms\": 46.972}"
+          },
+          {
+            "elapsed_ms": 268.337,
+            "returncode": 0,
+            "seed": {
+              "elapsed_ms": 47.018,
+              "entries": 390,
+              "extension_bytes": 1924,
+              "patched": 390,
+              "returncode": 0
+            },
+            "stderr": "",
+            "stdout": "{\"returncode\": 0, \"entries\": 390, \"patched\": 390, \"extension_bytes\": 1924, \"elapsed_ms\": 47.018}"
+          },
+          {
+            "elapsed_ms": 266.883,
+            "returncode": 0,
+            "seed": {
+              "elapsed_ms": 43.007,
+              "entries": 390,
+              "extension_bytes": 1924,
+              "patched": 390,
+              "returncode": 0
+            },
+            "stderr": "",
+            "stdout": "{\"returncode\": 0, \"entries\": 390, \"patched\": 390, \"extension_bytes\": 1924, \"elapsed_ms\": 43.007}"
+          }
+        ],
+        "successes": 32,
+        "used_delta": 8753152,
+        "verify_wall_ms": 50.526,
+        "work_wall_ms": 914.328
+      }
+    },
+    "8": {
+      "baseline": {
+        "cleanup_wall_ms": 54.852,
+        "materialize_wall_ms": 105.974,
+        "metadata_wall_ms": 7.824,
+        "successes": 8,
+        "used_delta": 66912256,
+        "verify_wall_ms": 117.205,
+        "work_wall_ms": 231.003
+      },
+      "cow_process_indexstat": {
+        "cleanup_wall_ms": 60.553,
+        "indexstat_successes": 8,
+        "indexstat_wall_ms": 88.452,
+        "metadata_wall_ms": 9.944,
+        "populate_successes": 8,
+        "populate_wall_ms": 104.99,
+        "read_tree_successes": 8,
+        "read_tree_wall_ms": 9.328,
+        "seed_records": [
+          {
+            "elapsed_ms": 71.353,
+            "returncode": 0,
+            "seed": {
+              "elapsed_ms": 13.666,
+              "entries": 390,
+              "extension_bytes": 1924,
+              "patched": 390,
+              "returncode": 0
+            },
+            "stderr": "",
+            "stdout": "{\"returncode\": 0, \"entries\": 390, \"patched\": 390, \"extension_bytes\": 1924, \"elapsed_ms\": 13.666}"
+          },
+          {
+            "elapsed_ms": 87.756,
+            "returncode": 0,
+            "seed": {
+              "elapsed_ms": 18.236,
+              "entries": 390,
+              "extension_bytes": 1924,
+              "patched": 390,
+              "returncode": 0
+            },
+            "stderr": "",
+            "stdout": "{\"returncode\": 0, \"entries\": 390, \"patched\": 390, \"extension_bytes\": 1924, \"elapsed_ms\": 18.236}"
+          },
+          {
+            "elapsed_ms": 75.203,
+            "returncode": 0,
+            "seed": {
+              "elapsed_ms": 12.731,
+              "entries": 390,
+              "extension_bytes": 1924,
+              "patched": 390,
+              "returncode": 0
+            },
+            "stderr": "",
+            "stdout": "{\"returncode\": 0, \"entries\": 390, \"patched\": 390, \"extension_bytes\": 1924, \"elapsed_ms\": 12.731}"
+          },
+          {
+            "elapsed_ms": 74.565,
+            "returncode": 0,
+            "seed": {
+              "elapsed_ms": 13.195,
+              "entries": 390,
+              "extension_bytes": 1924,
+              "patched": 390,
+              "returncode": 0
+            },
+            "stderr": "",
+            "stdout": "{\"returncode\": 0, \"entries\": 390, \"patched\": 390, \"extension_bytes\": 1924, \"elapsed_ms\": 13.195}"
+          },
+          {
+            "elapsed_ms": 40.102,
+            "returncode": 0,
+            "seed": {
+              "elapsed_ms": 8.718,
+              "entries": 390,
+              "extension_bytes": 1924,
+              "patched": 390,
+              "returncode": 0
+            },
+            "stderr": "",
+            "stdout": "{\"returncode\": 0, \"entries\": 390, \"patched\": 390, \"extension_bytes\": 1924, \"elapsed_ms\": 8.718}"
+          },
+          {
+            "elapsed_ms": 79.649,
+            "returncode": 0,
+            "seed": {
+              "elapsed_ms": 17.208,
+              "entries": 390,
+              "extension_bytes": 1924,
+              "patched": 390,
+              "returncode": 0
+            },
+            "stderr": "",
+            "stdout": "{\"returncode\": 0, \"entries\": 390, \"patched\": 390, \"extension_bytes\": 1924, \"elapsed_ms\": 17.208}"
+          },
+          {
+            "elapsed_ms": 75.655,
+            "returncode": 0,
+            "seed": {
+              "elapsed_ms": 16.482,
+              "entries": 390,
+              "extension_bytes": 1924,
+              "patched": 390,
+              "returncode": 0
+            },
+            "stderr": "",
+            "stdout": "{\"returncode\": 0, \"entries\": 390, \"patched\": 390, \"extension_bytes\": 1924, \"elapsed_ms\": 16.482}"
+          },
+          {
+            "elapsed_ms": 82.02,
+            "returncode": 0,
+            "seed": {
+              "elapsed_ms": 13.503,
+              "entries": 390,
+              "extension_bytes": 1924,
+              "patched": 390,
+              "returncode": 0
+            },
+            "stderr": "",
+            "stdout": "{\"returncode\": 0, \"entries\": 390, \"patched\": 390, \"extension_bytes\": 1924, \"elapsed_ms\": 13.503}"
+          }
+        ],
+        "successes": 8,
+        "used_delta": 2162688,
+        "verify_wall_ms": 12.498,
+        "work_wall_ms": 225.212
+      }
+    }
+  },
+  "schema_version": 1,
+  "source": {
+    "logical_bytes": 7257228,
+    "proof": {
+      "diff_files_ms": 16.754,
+      "diff_index_ms": 16.648,
+      "returncode": 0
+    },
+    "regular_entries": 390
+  }
+}
