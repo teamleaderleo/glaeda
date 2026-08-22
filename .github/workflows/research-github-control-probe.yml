@@ -1,0 +1,37 @@
+name: Research GitHub runner control
+
+on:
+  push:
+    branches:
+      - research/github-arm-hot-probe
+
+permissions:
+  contents: write
+
+jobs:
+  control:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - name: Record control
+        run: |
+          python3 - <<'PY'
+          import json, os, platform
+          from pathlib import Path
+          Path('smolrunner-github-control.json').write_text(json.dumps({
+              'runner_os': os.environ.get('RUNNER_OS'),
+              'runner_arch': os.environ.get('RUNNER_ARCH'),
+              'machine': platform.machine(),
+              'kernel': platform.release(),
+          }, indent=2, sort_keys=True) + '\n')
+          PY
+      - name: Persist control result
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -C research/results-smolrunner-github-control
+          git add -- smolrunner-github-control.json
+          git commit -m 'research: record GitHub-hosted control probe'
+          git push --force origin HEAD:refs/heads/research/results-smolrunner-github-control
