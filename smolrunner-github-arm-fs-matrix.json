@@ -1,0 +1,409 @@
+{
+  "runner": {
+    "arch": "ARM64",
+    "cpu_count": 4,
+    "kernel": "6.17.0-1022-azure",
+    "machine": "aarch64"
+  },
+  "schema_version": 1,
+  "sudo_check": {
+    "argv": [
+      "sudo",
+      "-n",
+      "true"
+    ],
+    "elapsed_ms": 5.741,
+    "returncode": 0,
+    "stderr": "",
+    "stdout": ""
+  },
+  "tools": {
+    "filefrag": "/usr/sbin/filefrag",
+    "mkfs_ext4": "/usr/sbin/mkfs.ext4",
+    "mkfs_xfs": "/usr/sbin/mkfs.xfs",
+    "sudo": "/usr/bin/sudo",
+    "xfs_info": "/usr/sbin/xfs_info"
+  },
+  "volumes": {
+    "ext4": {
+      "available": true,
+      "base_worktree_add": {
+        "argv": [
+          "git",
+          "worktree",
+          "add",
+          "--detach",
+          "/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/base-worktree",
+          "HEAD"
+        ],
+        "elapsed_ms": 28.856,
+        "returncode": 0,
+        "stderr": "Preparing worktree (detached HEAD b26e3d9)",
+        "stdout": "HEAD is now at b26e3d9 research: compare ext4 and XFS on hosted ARM"
+      },
+      "findmnt": "/dev/loop0 ext4   rw,relatime",
+      "format": {
+        "argv": [
+          "sudo",
+          "mkfs.ext4",
+          "-F",
+          "-q",
+          "/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/ext4.img"
+        ],
+        "elapsed_ms": 16.794,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": ""
+      },
+      "git_worktree_plain": {
+        "add": {
+          "argv": [
+            "git",
+            "worktree",
+            "add",
+            "--detach",
+            "/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/plain-worktree",
+            "HEAD"
+          ],
+          "elapsed_ms": 28.444,
+          "returncode": 0,
+          "stderr": "Preparing worktree (detached HEAD b26e3d9)",
+          "stdout": "HEAD is now at b26e3d9 research: compare ext4 and XFS on hosted ARM"
+        },
+        "remove": {
+          "argv": [
+            "git",
+            "worktree",
+            "remove",
+            "--force",
+            "/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/plain-worktree"
+          ],
+          "elapsed_ms": 6.045,
+          "returncode": 0,
+          "stderr": "",
+          "stdout": ""
+        },
+        "used_delta": 8298496
+      },
+      "git_worktree_split": {
+        "materialization_used_delta": 8290304,
+        "materialize": {
+          "argv": [
+            "git",
+            "reset",
+            "--hard",
+            "HEAD"
+          ],
+          "elapsed_ms": 26.048,
+          "returncode": 0,
+          "stderr": "",
+          "stdout": "HEAD is now at b26e3d9 research: compare ext4 and XFS on hosted ARM"
+        },
+        "metadata_add": {
+          "argv": [
+            "git",
+            "worktree",
+            "add",
+            "--detach",
+            "--no-checkout",
+            "/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/split-worktree",
+            "HEAD"
+          ],
+          "elapsed_ms": 2.033,
+          "returncode": 0,
+          "stderr": "Preparing worktree (detached HEAD b26e3d9)",
+          "stdout": ""
+        },
+        "metadata_used_delta": 8192,
+        "remove": {
+          "argv": [
+            "git",
+            "worktree",
+            "remove",
+            "--force",
+            "/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/split-worktree"
+          ],
+          "elapsed_ms": 5.773,
+          "returncode": 0,
+          "stderr": "",
+          "stdout": ""
+        }
+      },
+      "mount": {
+        "argv": [
+          "sudo",
+          "mount",
+          "-o",
+          "loop",
+          "/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/ext4.img",
+          "/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4"
+        ],
+        "elapsed_ms": 9.855,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": ""
+      },
+      "name": "ext4",
+      "ordinary_copy_64m": {
+        "copy": {
+          "argv": [
+            "cp",
+            "--reflink=never",
+            "/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/source-64m.bin",
+            "/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/copy-64m.bin"
+          ],
+          "elapsed_ms": 15.83,
+          "returncode": 0,
+          "stderr": "",
+          "stdout": ""
+        },
+        "used_delta": 67108864
+      },
+      "reflink_64m": {
+        "copy": {
+          "argv": [
+            "cp",
+            "--reflink=always",
+            "/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/source-64m.bin",
+            "/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/reflink-64m.bin"
+          ],
+          "elapsed_ms": 1.44,
+          "returncode": 1,
+          "stderr": "cp: failed to clone '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/reflink-64m.bin' from '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/source-64m.bin': Operation not supported",
+          "stdout": ""
+        },
+        "used_delta": 0
+      },
+      "resident_tree_ordinary_copy": {
+        "copy": {
+          "argv": [
+            "cp",
+            "-a",
+            "--reflink=never",
+            "/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/base-worktree/.",
+            "/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/normal-tree/"
+          ],
+          "elapsed_ms": 16.26,
+          "returncode": 0,
+          "stderr": "",
+          "stdout": ""
+        },
+        "used_delta": 8294400
+      },
+      "resident_tree_reflink_copy": {
+        "copy": {
+          "argv": [
+            "cp",
+            "-a",
+            "--reflink=always",
+            "/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/base-worktree/.",
+            "/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/cow-tree/"
+          ],
+          "elapsed_ms": 10.189,
+          "returncode": 1,
+          "stderr": "cp: failed to clone '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/cow-tree/./.git' from '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/base-worktree/./.git': Operation not supported\ncp: failed to clone '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/cow-tree/./.coderabbit.yaml' from '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/base-worktree/./.coderabbit.yaml': Operation not supported\ncp: failed to clone '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/cow-tree/./.github/workflows/bootstrap-compatibility.yml' from '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/base-worktree/./.github/workflows/bootstrap-compatibility.yml': Operation not supported\ncp: failed to clone '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/cow-tree/./.github/workflows/ci.yml' from '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/base-worktree/./.github/workflows/ci.yml': Operation not supported\ncp: failed to clone '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/cow-tree/./.github/workflows/linux-acceptance.yml' from '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/base-worktree/./.github/workflows/linux-acceptance.yml': Operation not supported\ncp: failed to clone '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/cow-tree/./.github/workflows/podman-closure-probe.yml' from '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/base-worktree/./.github/workflows/podman-closure-probe.yml': Operation not supported\ncp: failed to clone '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/cow-tree/./.github/workflows/podman-container-closure-probe.yml' from '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/base-worktree/./.github/workflows/podman-container-closure-probe.yml': Operation not supported\ncp: failed to clone '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/cow-tree/./.github/workflows/research-github-arm-fs-matrix.yml' from '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/base-worktree/./.github/workflows/research-github-arm-fs-matrix.yml': Operation not supported\ncp: failed to clone '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/cow-tree/./.gitignore' from '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/base-worktree/./.gitignore': Operation not supported\ncp: failed to clone '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/cow-tree/./AGENTS.md' from '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/base-worktree/./AGENTS.md': Operation not supported\ncp: failed to clone '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/cow-tree/./Cargo.lock' from '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/base-worktree/./Cargo.lock': Operation not supported\ncp: failed to clone '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/cow-tree/./Cargo.toml' from '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/base-worktree/./Cargo.toml': Operation not supported\ncp: failed to clone '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/cow-tree/./LICENSE' from '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/base-worktree/./LICENSE': Operation not supported\ncp: failed to clone '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/cow-tree/./Makefile' from '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/base-worktree/./Makefile': Operation not supported\ncp: failed to clone '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/cow-tree/./README.md' from '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/base-worktree/./README.md': Operation not supported\ncp: failed to clone '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/cow-tree/./docs/AGENT_COORDINATION.md' from '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/base-worktree/./docs/AGENT_COORDINATION.md': Operation not supported\ncp: failed to clone '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/cow-tree/./docs/BLAZINGLY_HOT.md' from '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/base-worktree/./docs/BLAZINGLY_HOT.md': Operation not supported\ncp: failed to clone '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/cow-tree/./docs/DESCRIPTOR_BOUND_LINUX_LAUNCHER.md' from '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/base-worktree/./docs/DESCRIPTOR_BOUND_LINUX_LAUNCHER.md': Operation not supported\ncp: failed to clone '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/cow-tree/./docs/DISPOSABLE_AUTOSCALING_CI.md' from '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/base-worktree/./docs/DISPOSABLE_AUTOSCALING_CI.md': Operation not supported\ncp: failed to clone '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/cow-tree/./docs/DISPOSABLE_DEPENDENCY_BOUNDARY.md' from '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/base-worktree/./docs/DISPOSABLE_DEPENDENCY_BOUNDARY.md': Operation not supported\ncp: failed to clone '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/cow-tree/./docs/DISPOSABLE_INSTALLED_SERVICE_ACCEPTANCE.md' from '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/base-worktree/./docs/DISPOSABLE_INSTALLED_SERVICE_ACCEPTANCE.md': Operation not supported\ncp: failed to clone '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/cow-tree/./docs/DISPOSABLE_VZ_NETWORK_SELECTOR_ACCEPTANCE.md' from '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/base-worktree/./docs/DISPOSABLE_VZ_NETWORK_SELECTOR_ACCEPTANCE.md': Operation not supported\ncp: failed to clone '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/cow-tree/./docs/EXECUTION_ADMISSION.md' from '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/base-worktree/./docs/EXECUTION_ADMISSION.md': Operation not supported\ncp: failed to clone '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/cow-tree/./docs/EXECUTION_RECEIPTS.md' from '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/base-worktree/./docs/EXECUTION_RECEIPTS.md': Operation not supported\ncp: failed to clone '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/cow-tree/./docs/EXECUTION_RECEIPT_STORAGE.md' from '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/base-worktree/./docs/EXECUTION_RECEIPT_STORAGE.md': Operation not supported\ncp: failed to clone '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/cow-tree/./docs/HOST_PREPARATION_RECEIPT_BINDING.md' from '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/base-worktree/./docs/HOST_PREPARATION_RECEIPT_BINDING.md': Operation not supported\ncp: failed to clone '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/cow-tree/./docs/HOST_PREPARATION_RECEIPT_MAPPING.md' from '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/base-worktree/./docs/HOST_PREPARATION_RECEIPT_MAPPING.md': Operation not supported\ncp: failed to clone '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/cow-tree/./docs/HOST_RECONCILIATION.md' from '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/base-worktree/./docs/HOST_RECONCILIATION.md': Operation not supported\ncp: failed to clone '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/cow-tree/./docs/IMPLEMENTATION_MAP.md' from '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/base-worktree/./docs/IMPLEMENTATION_MAP.md': Operation not supported\ncp: failed to clone '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/cow-tree/./docs/LEASED_EXECUTION.md' from '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/base-worktree/./docs/LEASED_EXECUTION.md': Operation not supported\ncp: failed to clone '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/cow-tree/./docs/LIMA_DEVELOPMENT.md' from '/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-ext4/base-worktree/./docs/LIMA_DEVELOPMENT.md': Operation not supported\ncp:",
+          "stdout": ""
+        },
+        "used_delta": 184320
+      },
+      "small_file_create_10k_ms": 252.428,
+      "small_file_delete_10k_ms": 91.941,
+      "small_file_stat_10k_ms": 38.735,
+      "source_create_64m_ms": 32.661,
+      "xfs_info": null
+    },
+    "xfs": {
+      "available": true,
+      "base_worktree_add": {
+        "argv": [
+          "git",
+          "worktree",
+          "add",
+          "--detach",
+          "/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-xfs/base-worktree",
+          "HEAD"
+        ],
+        "elapsed_ms": 258.843,
+        "returncode": 0,
+        "stderr": "Preparing worktree (detached HEAD b26e3d9)",
+        "stdout": "HEAD is now at b26e3d9 research: compare ext4 and XFS on hosted ARM"
+      },
+      "findmnt": "/dev/loop0 xfs    rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,noquota",
+      "format": {
+        "argv": [
+          "sudo",
+          "mkfs.xfs",
+          "-f",
+          "-q",
+          "-m",
+          "reflink=1",
+          "/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/xfs.img"
+        ],
+        "elapsed_ms": 166.588,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": ""
+      },
+      "git_worktree_plain": {
+        "add": {
+          "argv": [
+            "git",
+            "worktree",
+            "add",
+            "--detach",
+            "/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-xfs/plain-worktree",
+            "HEAD"
+          ],
+          "elapsed_ms": 29.364,
+          "returncode": 0,
+          "stderr": "Preparing worktree (detached HEAD b26e3d9)",
+          "stdout": "HEAD is now at b26e3d9 research: compare ext4 and XFS on hosted ARM"
+        },
+        "remove": {
+          "argv": [
+            "git",
+            "worktree",
+            "remove",
+            "--force",
+            "/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-xfs/plain-worktree"
+          ],
+          "elapsed_ms": 6.17,
+          "returncode": 0,
+          "stderr": "",
+          "stdout": ""
+        },
+        "used_delta": 16384000
+      },
+      "git_worktree_split": {
+        "materialization_used_delta": 16359424,
+        "materialize": {
+          "argv": [
+            "git",
+            "reset",
+            "--hard",
+            "HEAD"
+          ],
+          "elapsed_ms": 29.195,
+          "returncode": 0,
+          "stderr": "",
+          "stdout": "HEAD is now at b26e3d9 research: compare ext4 and XFS on hosted ARM"
+        },
+        "metadata_add": {
+          "argv": [
+            "git",
+            "worktree",
+            "add",
+            "--detach",
+            "--no-checkout",
+            "/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-xfs/split-worktree",
+            "HEAD"
+          ],
+          "elapsed_ms": 2.067,
+          "returncode": 0,
+          "stderr": "Preparing worktree (detached HEAD b26e3d9)",
+          "stdout": ""
+        },
+        "metadata_used_delta": -1028096,
+        "remove": {
+          "argv": [
+            "git",
+            "worktree",
+            "remove",
+            "--force",
+            "/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-xfs/split-worktree"
+          ],
+          "elapsed_ms": 6.444,
+          "returncode": 0,
+          "stderr": "",
+          "stdout": ""
+        }
+      },
+      "mount": {
+        "argv": [
+          "sudo",
+          "mount",
+          "-o",
+          "loop",
+          "/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/xfs.img",
+          "/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-xfs"
+        ],
+        "elapsed_ms": 116.798,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": ""
+      },
+      "name": "xfs",
+      "ordinary_copy_64m": {
+        "copy": {
+          "argv": [
+            "cp",
+            "--reflink=never",
+            "/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-xfs/source-64m.bin",
+            "/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-xfs/copy-64m.bin"
+          ],
+          "elapsed_ms": 13.181,
+          "returncode": 0,
+          "stderr": "",
+          "stdout": ""
+        },
+        "used_delta": 67395584
+      },
+      "reflink_64m": {
+        "clone_filefrag": "Filesystem type is: 58465342\nFile size of /home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-xfs/reflink-64m.bin is 67108864 (16384 blocks of 4096 bytes)\n ext:     logical_offset:        physical_offset: length:   expected: flags:\n   0:        0..   16383:         24..     16407:  16384:             last,shared,eof\n/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-xfs/reflink-64m.bin: 1 extent found",
+        "copy": {
+          "argv": [
+            "cp",
+            "--reflink=always",
+            "/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-xfs/source-64m.bin",
+            "/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-xfs/reflink-64m.bin"
+          ],
+          "elapsed_ms": 12.376,
+          "returncode": 0,
+          "stderr": "",
+          "stdout": ""
+        },
+        "cow_used_delta": 1073152,
+        "first_1m_write_ms": 2.473,
+        "source_filefrag": "Filesystem type is: 58465342\nFile size of /home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-xfs/source-64m.bin is 67108864 (16384 blocks of 4096 bytes)\n ext:     logical_offset:        physical_offset: length:   expected: flags:\n   0:        0..   16383:         24..     16407:  16384:             last,shared,eof\n/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-xfs/source-64m.bin: 1 extent found",
+        "used_delta": -286720
+      },
+      "resident_tree_ordinary_copy": {
+        "copy": {
+          "argv": [
+            "cp",
+            "-a",
+            "--reflink=never",
+            "/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-xfs/base-worktree/.",
+            "/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-xfs/normal-tree/"
+          ],
+          "elapsed_ms": 16.796,
+          "returncode": 0,
+          "stderr": "",
+          "stdout": ""
+        },
+        "used_delta": 16318464
+      },
+      "resident_tree_reflink_copy": {
+        "copy": {
+          "argv": [
+            "cp",
+            "-a",
+            "--reflink=always",
+            "/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-xfs/base-worktree/.",
+            "/home/runner/work/_temp/smolrunner-fs-matrix-hi0jlena/mnt-xfs/cow-tree/"
+          ],
+          "elapsed_ms": 37.768,
+          "returncode": 0,
+          "stderr": "",
+          "stdout": ""
+        },
+        "used_delta": -7766016
+      },
+      "small_file_create_10k_ms": 269.793,
+      "small_file_delete_10k_ms": 112.639,
+      "small_file_stat_10k_ms": 36.113,
+      "source_create_64m_ms": 29.424,
+      "xfs_info": "meta-data=/dev/loop0             isize=512    agcount=4, agsize=131072 blks\n         =                       sectsz=512   attr=2, projid32bit=1\n         =                       crc=1        finobt=1, sparse=1, rmapbt=1\n         =                       reflink=1    bigtime=1 inobtcount=1 nrext64=0\ndata     =                       bsize=4096   blocks=524288, imaxpct=25\n         =                       sunit=0      swidth=0 blks\nnaming   =version 2              bsize=4096   ascii-ci=0, ftype=1\nlog      =internal log           bsize=4096   blocks=16384, version=2\n         =                       sectsz=512   sunit=0 blks, lazy-count=1\nrealtime =none                   extsz=4096   blocks=0, rtextents=0"
+    }
+  }
+}
