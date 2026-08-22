@@ -1,0 +1,138 @@
+name: Research GitHub ARM XFS CoW fanout
+
+on:
+  push:
+    branches:
+      - research/github-arm-xfs-cow-fanout
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  fanout:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Compare baseline and CoW fanout on XFS
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import concurrent.futures, fcntl, json, os, shutil, stat, subprocess, tempfile, time
+          from pathlib import Path
+
+          FICLONE=0x40049409
+          repo=Path(os.environ['GITHUB_WORKSPACE']).resolve()
+          root=Path(tempfile.mkdtemp(prefix='smolrunner-xfs-fanout-',dir=os.environ['RUNNER_TEMP']))
+          image=root/'xfs.img'; mnt=root/'xfs'; mnt.mkdir()
+          result_path=repo/'smolrunner-github-arm-xfs-cow-fanout.json'
+          worktrees=[]; mounted=False
+
+          def command(argv,cwd=None):
+              start=time.monotonic_ns(); p=subprocess.run(argv,cwd=cwd,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=False)
+              return {'returncode':p.returncode,'elapsed_ms':round((time.monotonic_ns()-start)/1_000_000,3),'stdout':p.stdout.strip()[:1024],'stderr':p.stderr.strip()[:1024]}
+
+          def phase(items,fn,workers):
+              start=time.monotonic_ns()
+              with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool: records=list(pool.map(fn,items))
+              return round((time.monotonic_ns()-start)/1_000_000,3),records
+
+          def used(path):
+              subprocess.run(['sync','-f',str(path)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=False); time.sleep(.05)
+              s=os.statvfs(path); return (s.f_blocks-s.f_bfree)*s.f_frsize
+
+          def tree_entries(base):
+              p=subprocess.run(['git','ls-files','--stage','-z'],cwd=base,stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=False)
+              if p.returncode: raise RuntimeError('ls-files failed')
+              out=[]
+              for raw in p.stdout.split(b'\0'):
+                  if not raw: continue
+                  head,path=raw.split(b'\t',1); mode,_,_=head.decode().split(' '); rel=Path(os.fsdecode(path))
+                  if mode in ('100644','100755') and (base/rel).exists() and stat.S_ISREG(os.lstat(base/rel).st_mode): out.append((mode,rel))
+              return out
+
+          def clone_tree(base,target,entries):
+              start=time.monotonic_ns(); logical=0
+              try:
+                  for mode,rel in entries:
+                      src=base/rel; dst=target/rel; dst.parent.mkdir(parents=True,exist_ok=True)
+                      sfd=os.open(src,os.O_RDONLY|os.O_CLOEXEC)
+                      try:
+                          dfd=os.open(dst,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_CLOEXEC,0o755 if mode=='100755' else 0o644)
+                          try: fcntl.ioctl(dfd,FICLONE,sfd); os.fchmod(dfd,0o755 if mode=='100755' else 0o644)
+                          finally: os.close(dfd)
+                      finally: os.close(sfd)
+                      st=os.stat(src); os.utime(dst,ns=(st.st_atime_ns,st.st_mtime_ns)); logical+=st.st_size
+                  return {'returncode':0,'elapsed_ms':round((time.monotonic_ns()-start)/1_000_000,3),'logical_bytes':logical}
+              except Exception as exc:
+                  return {'returncode':1,'elapsed_ms':round((time.monotonic_ns()-start)/1_000_000,3),'error':type(exc).__name__}
+
+          def verify(path):
+              status=command(['git','status','--porcelain=v2','--untracked-files=no'],cwd=path)
+              df=command(['git','diff-files','--quiet'],cwd=path)
+              di=command(['git','diff-index','--quiet','HEAD','--'],cwd=path)
+              return {'returncode':0 if status['returncode']==0 and not status['stdout'] and df['returncode']==0 and di['returncode']==0 else 1,'status_ms':status['elapsed_ms'],'diff_files_ms':df['elapsed_ms'],'diff_index_ms':di['elapsed_ms'],'status':status['stdout'][:256]}
+
+          def cleanup(paths):
+              def one(path): return command(['git','worktree','remove','--force',str(path)],cwd=repo)
+              wall,records=phase(paths,one,max(1,len(paths)))
+              subprocess.run(['git','worktree','prune'],cwd=repo,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=False)
+              for p in paths:
+                  if p in worktrees: worktrees.remove(p)
+              return wall,records
+
+          result={'schema_version':1,'counts':{}}
+          try:
+              command(['truncate','-s','2G',str(image)])
+              if command(['sudo','mkfs.xfs','-f','-q','-m','reflink=1',str(image)])['returncode']: raise RuntimeError('mkfs')
+              if command(['sudo','mount','-o','loop',str(image),str(mnt)])['returncode']: raise RuntimeError('mount')
+              mounted=True; command(['sudo','chown',f'{os.getuid()}:{os.getgid()}',str(mnt)])
+              base=mnt/'base'; ba=command(['git','worktree','add','--detach',str(base),'HEAD'],cwd=repo); worktrees.append(base)
+              source_verify=verify(base)
+              if source_verify['returncode']: raise RuntimeError('base not clean')
+              entries=tree_entries(base); result['source']={'add':ba,'verify':source_verify,'regular_entries':len(entries),'logical_bytes':sum(os.stat(base/r).st_size for _,r in entries)}
+
+              for count in (1,8,32):
+                  case={}
+                  # Baseline: metadata then ordinary Git materialization, all phases parallel.
+                  br=mnt/f'baseline-{count}'; br.mkdir(); paths=[br/f'task-{i:02d}' for i in range(count)]
+                  before=used(mnt)
+                  mw,mr=phase(paths,lambda p:command(['git','worktree','add','--detach','--no-checkout',str(p),'HEAD'],cwd=repo),count)
+                  ok=[p for p,r in zip(paths,mr) if r['returncode']==0]; worktrees.extend(ok)
+                  rw,rr=phase(ok,lambda p:command(['git','reset','--hard','HEAD'],cwd=p),max(1,len(ok)))
+                  vw,vr=phase(ok,verify,max(1,len(ok))); after=used(mnt)
+                  cw,_=cleanup(ok); shutil.rmtree(br,ignore_errors=True); used(mnt)
+                  case['baseline']={'metadata_wall_ms':mw,'materialize_wall_ms':rw,'verify_wall_ms':vw,'work_wall_ms':round(mw+rw+vw,3),'successes':sum(r['returncode']==0 for r in vr),'used_delta':after-before,'cleanup_wall_ms':cw}
+
+                  # CoW: metadata, read-tree, FICLONE, final verification.
+                  cr=mnt/f'cow-{count}'; cr.mkdir(); paths=[cr/f'task-{i:02d}' for i in range(count)]
+                  before=used(mnt)
+                  mw,mr=phase(paths,lambda p:command(['git','worktree','add','--detach','--no-checkout',str(p),'HEAD'],cwd=repo),count)
+                  ok=[p for p,r in zip(paths,mr) if r['returncode']==0]; worktrees.extend(ok)
+                  iw,ir=phase(ok,lambda p:command(['git','read-tree','HEAD'],cwd=p),max(1,len(ok)))
+                  pw,pr=phase(ok,lambda p:clone_tree(base,p,entries),max(1,len(ok)))
+                  vw,vr=phase(ok,verify,max(1,len(ok))); after=used(mnt)
+                  cw,_=cleanup(ok); shutil.rmtree(cr,ignore_errors=True); used(mnt)
+                  case['cow']={'metadata_wall_ms':mw,'read_tree_wall_ms':iw,'populate_wall_ms':pw,'verify_wall_ms':vw,'work_wall_ms':round(mw+iw+pw+vw,3),'successes':sum(r['returncode']==0 for r in vr),'populate_successes':sum(r['returncode']==0 for r in pr),'used_delta':after-before,'cleanup_wall_ms':cw}
+                  result['counts'][str(count)]=case
+
+              result_path.write_text(json.dumps(result,indent=2,sort_keys=True)+'\n'); print(json.dumps(result,indent=2,sort_keys=True))
+          finally:
+              for wt in list(worktrees): command(['git','worktree','remove','--force',str(wt)],cwd=repo)
+              if mounted: command(['sudo','umount',str(mnt)])
+              shutil.rmtree(root,ignore_errors=True)
+          PY
+
+      - name: Persist result
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -C research/results-smolrunner-github-arm-xfs-cow-fanout
+          git add -- smolrunner-github-arm-xfs-cow-fanout.json
+          git commit -m 'research: record XFS CoW fanout'
+          git push --force origin HEAD:refs/heads/research/results-smolrunner-github-arm-xfs-cow-fanout
