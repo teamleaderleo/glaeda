@@ -1,0 +1,385 @@
+{
+  "runner": {
+    "arch": "ARM64",
+    "cpu_count": 4,
+    "kernel": "6.17.0-1022-azure",
+    "machine": "aarch64"
+  },
+  "schema_version": 2,
+  "volumes": {
+    "ext4": {
+      "available": true,
+      "base_add": {
+        "argv": [
+          "git",
+          "worktree",
+          "add",
+          "--detach",
+          "/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-ext4/base",
+          "HEAD"
+        ],
+        "elapsed_ms": 27.988,
+        "returncode": 0,
+        "stderr": "Preparing worktree (detached HEAD e15c920)",
+        "stdout": "HEAD is now at e15c920 research: sync filesystem allocation samples"
+      },
+      "copy_64m": {
+        "copy": {
+          "argv": [
+            "cp",
+            "--reflink=never",
+            "/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-ext4/source.bin",
+            "/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-ext4/copy.bin"
+          ],
+          "elapsed_ms": 16.095,
+          "returncode": 0,
+          "stderr": "",
+          "stdout": ""
+        },
+        "used_delta": 67108864
+      },
+      "findmnt": {
+        "argv": [
+          "findmnt",
+          "-T",
+          "/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-ext4",
+          "-n",
+          "-o",
+          "SOURCE,FSTYPE,OPTIONS"
+        ],
+        "elapsed_ms": 1.345,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "/dev/loop0 ext4   rw,relatime"
+      },
+      "format": {
+        "argv": [
+          "sudo",
+          "mkfs.ext4",
+          "-F",
+          "-q",
+          "/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/ext4.img"
+        ],
+        "elapsed_ms": 11.587,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": ""
+      },
+      "mount": {
+        "argv": [
+          "sudo",
+          "mount",
+          "-o",
+          "loop",
+          "/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/ext4.img",
+          "/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-ext4"
+        ],
+        "elapsed_ms": 10.704,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": ""
+      },
+      "plain_worktree": {
+        "add": {
+          "argv": [
+            "git",
+            "worktree",
+            "add",
+            "--detach",
+            "/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-ext4/plain",
+            "HEAD"
+          ],
+          "elapsed_ms": 28.46,
+          "returncode": 0,
+          "stderr": "Preparing worktree (detached HEAD e15c920)",
+          "stdout": "HEAD is now at e15c920 research: sync filesystem allocation samples"
+        },
+        "used_delta": 8290304
+      },
+      "reflink_64m": {
+        "copy": {
+          "argv": [
+            "cp",
+            "--reflink=always",
+            "/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-ext4/source.bin",
+            "/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-ext4/clone.bin"
+          ],
+          "elapsed_ms": 1.471,
+          "returncode": 1,
+          "stderr": "cp: failed to clone '/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-ext4/clone.bin' from '/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-ext4/source.bin': Operation not supported",
+          "stdout": ""
+        },
+        "used_delta": 0
+      },
+      "resident_copy_tree": {
+        "copy": {
+          "argv": [
+            "cp",
+            "-a",
+            "--reflink=never",
+            "/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-ext4/base/.",
+            "/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-ext4/normal-tree/"
+          ],
+          "elapsed_ms": 15.276,
+          "returncode": 0,
+          "stderr": "",
+          "stdout": ""
+        },
+        "used_delta": 8286208
+      },
+      "resident_reflink_tree": {
+        "copy": {
+          "argv": [
+            "cp",
+            "-a",
+            "--reflink=always",
+            "/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-ext4/base/.",
+            "/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-ext4/cow-tree/"
+          ],
+          "elapsed_ms": 10.172,
+          "returncode": 1,
+          "stderr": "cp: failed to clone '/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-ext4/cow-tree/./.git' from '/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-ext4/base/./.git': Operation not supported\ncp: failed to clone '/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-ext4/cow-tree/./.coderabbit.yaml' from '/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-ext4/base/./.coderabbit.yaml': Operation not supported\ncp: failed to clone '/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-ext4/cow-tree/./.github/workflows/bootstrap-compatibility.yml' from '/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-ext4/base/./.github/workflows/bootstrap-compatibility.yml': Operation not supported\ncp: failed to clone '/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-ext4/cow-tree/./.github/workflows/ci.yml' from '/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-ext4/base/./.github/workflows/ci.yml': Operation not supported\ncp: failed to clone '/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-ext4/cow-tree/./.github/workflows/linux-acceptance.yml' from '/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-ext4/base/./.github/workflows/linux-acceptance.yml': Operation not supported\ncp: failed to clone '/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-ext4/cow-tree/./.github/workflows/podman-closure-probe.yml' from '/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-ext4/base/./.github/workflows/podman-closure-probe.yml': Operation not supported\ncp: failed to clone '/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-ext4/cow-tree/./.github/workflows/podman-container-closure-probe.yml' from '/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-ext4/base/./.github/workflows/podman-container-closure-probe.yml': Operation not supported\ncp: failed to clone '/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-ext4/cow-tree/./.github/workflows/research-github-arm-fs-sync.yml' from '/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-ext4/base/./.github/workflows/research-github-arm-fs-sync.yml': Operation not supported\ncp: failed to clone '/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-ext4/cow-tree/./.gitignore' from '/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-ext4/base/./.gitignore': Operation not supported\ncp: failed to clone '/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-ext4/cow-tree/./AGENTS.md' from '/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-ext4/base/./AGENTS.md': Operation not supported\ncp: failed to clone '/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-ext4/cow-tree/./Cargo.lock' from '/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-ext4/base/./Cargo.lock': Operation not supported\ncp: failed to clone '/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-ext4/cow-tree/./Cargo.toml' from '/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-ext4/base/./Cargo.toml': Operation not supported\ncp: failed to clone '/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-ext4/cow-tree/./LICENSE' from '/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-ext4/base/./LICENSE': Operation not supported\ncp: failed to clone '/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-ext4/cow-tree/./Makefile' from '/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-ext4/base/./Makefile': Operation not supported\ncp: failed to clone '/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-ext4/cow-tree/./README.md' from '/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-ext4/base/./README.md': Operation not supported\ncp: failed to clone '/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-ext4/cow-tree/./docs/AGENT_COORDINATION.md' from '/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-ext4/base/./docs/AGENT_COORDINATION.md': Operation not supported\ncp: failed to clone '/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-ext4/cow-tree/./docs/BLAZINGLY_HOT.md' from '/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-ext4/base/./docs/BLAZINGLY_HOT.md': Operation not supported\ncp: ",
+          "stdout": ""
+        },
+        "used_delta": 184320
+      },
+      "source_create_64m_ms": 253.538,
+      "split_worktree": {
+        "materialize": {
+          "argv": [
+            "git",
+            "reset",
+            "--hard",
+            "HEAD"
+          ],
+          "elapsed_ms": 26.044,
+          "returncode": 0,
+          "stderr": "",
+          "stdout": "HEAD is now at e15c920 research: sync filesystem allocation samples"
+        },
+        "materialize_used_delta": 8282112,
+        "metadata": {
+          "argv": [
+            "git",
+            "worktree",
+            "add",
+            "--detach",
+            "--no-checkout",
+            "/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-ext4/split",
+            "HEAD"
+          ],
+          "elapsed_ms": 2.256,
+          "returncode": 0,
+          "stderr": "Preparing worktree (detached HEAD e15c920)",
+          "stdout": ""
+        },
+        "metadata_used_delta": 8192
+      }
+    },
+    "xfs": {
+      "available": true,
+      "base_add": {
+        "argv": [
+          "git",
+          "worktree",
+          "add",
+          "--detach",
+          "/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-xfs/base",
+          "HEAD"
+        ],
+        "elapsed_ms": 29.485,
+        "returncode": 0,
+        "stderr": "Preparing worktree (detached HEAD e15c920)",
+        "stdout": "HEAD is now at e15c920 research: sync filesystem allocation samples"
+      },
+      "copy_64m": {
+        "copy": {
+          "argv": [
+            "cp",
+            "--reflink=never",
+            "/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-xfs/source.bin",
+            "/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-xfs/copy.bin"
+          ],
+          "elapsed_ms": 12.533,
+          "returncode": 0,
+          "stderr": "",
+          "stdout": ""
+        },
+        "used_delta": 67108864
+      },
+      "findmnt": {
+        "argv": [
+          "findmnt",
+          "-T",
+          "/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-xfs",
+          "-n",
+          "-o",
+          "SOURCE,FSTYPE,OPTIONS"
+        ],
+        "elapsed_ms": 1.407,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "/dev/loop0 xfs    rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,noquota"
+      },
+      "format": {
+        "argv": [
+          "sudo",
+          "mkfs.xfs",
+          "-f",
+          "-q",
+          "-m",
+          "reflink=1",
+          "/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/xfs.img"
+        ],
+        "elapsed_ms": 59.47,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": ""
+      },
+      "mount": {
+        "argv": [
+          "sudo",
+          "mount",
+          "-o",
+          "loop",
+          "/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/xfs.img",
+          "/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-xfs"
+        ],
+        "elapsed_ms": 78.467,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": ""
+      },
+      "plain_worktree": {
+        "add": {
+          "argv": [
+            "git",
+            "worktree",
+            "add",
+            "--detach",
+            "/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-xfs/plain",
+            "HEAD"
+          ],
+          "elapsed_ms": 28.597,
+          "returncode": 0,
+          "stderr": "Preparing worktree (detached HEAD e15c920)",
+          "stdout": "HEAD is now at e15c920 research: sync filesystem allocation samples"
+        },
+        "used_delta": 8368128
+      },
+      "reflink_64m": {
+        "clone_filefrag": {
+          "argv": [
+            "filefrag",
+            "-v",
+            "/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-xfs/clone.bin"
+          ],
+          "elapsed_ms": 0.728,
+          "returncode": 0,
+          "stderr": "",
+          "stdout": "Filesystem type is: 58465342\nFile size of /home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-xfs/clone.bin is 67108864 (16384 blocks of 4096 bytes)\n ext:     logical_offset:        physical_offset: length:   expected: flags:\n   0:        0..   16383:         24..     16407:  16384:             last,shared,eof\n/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-xfs/clone.bin: 1 extent found"
+        },
+        "copy": {
+          "argv": [
+            "cp",
+            "--reflink=always",
+            "/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-xfs/source.bin",
+            "/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-xfs/clone.bin"
+          ],
+          "elapsed_ms": 1.616,
+          "returncode": 0,
+          "stderr": "",
+          "stdout": ""
+        },
+        "cow_used_delta": 1048576,
+        "first_1m_write_ms": 106.044,
+        "source_filefrag": {
+          "argv": [
+            "filefrag",
+            "-v",
+            "/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-xfs/source.bin"
+          ],
+          "elapsed_ms": 1.59,
+          "returncode": 0,
+          "stderr": "",
+          "stdout": "Filesystem type is: 58465342\nFile size of /home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-xfs/source.bin is 67108864 (16384 blocks of 4096 bytes)\n ext:     logical_offset:        physical_offset: length:   expected: flags:\n   0:        0..   16383:         24..     16407:  16384:             last,shared,eof\n/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-xfs/source.bin: 1 extent found"
+        },
+        "used_delta": 0
+      },
+      "resident_copy_tree": {
+        "copy": {
+          "argv": [
+            "cp",
+            "-a",
+            "--reflink=never",
+            "/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-xfs/base/.",
+            "/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-xfs/normal-tree/"
+          ],
+          "elapsed_ms": 16.671,
+          "returncode": 0,
+          "stderr": "",
+          "stdout": ""
+        },
+        "used_delta": 8368128
+      },
+      "resident_reflink_tree": {
+        "copy": {
+          "argv": [
+            "cp",
+            "-a",
+            "--reflink=always",
+            "/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-xfs/base/.",
+            "/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-xfs/cow-tree/"
+          ],
+          "elapsed_ms": 12.033,
+          "returncode": 0,
+          "stderr": "",
+          "stdout": ""
+        },
+        "used_delta": 241664
+      },
+      "source_create_64m_ms": 249.853,
+      "split_worktree": {
+        "materialize": {
+          "argv": [
+            "git",
+            "reset",
+            "--hard",
+            "HEAD"
+          ],
+          "elapsed_ms": 26.693,
+          "returncode": 0,
+          "stderr": "",
+          "stdout": "HEAD is now at e15c920 research: sync filesystem allocation samples"
+        },
+        "materialize_used_delta": 8364032,
+        "metadata": {
+          "argv": [
+            "git",
+            "worktree",
+            "add",
+            "--detach",
+            "--no-checkout",
+            "/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-xfs/split",
+            "HEAD"
+          ],
+          "elapsed_ms": 2.322,
+          "returncode": 0,
+          "stderr": "Preparing worktree (detached HEAD e15c920)",
+          "stdout": ""
+        },
+        "metadata_used_delta": 4096
+      },
+      "xfs_info": {
+        "argv": [
+          "xfs_info",
+          "/home/runner/work/_temp/smolrunner-fs-sync-8duea13r/mnt-xfs"
+        ],
+        "elapsed_ms": 66.135,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "meta-data=/dev/loop0             isize=512    agcount=4, agsize=131072 blks\n         =                       sectsz=512   attr=2, projid32bit=1\n         =                       crc=1        finobt=1, sparse=1, rmapbt=1\n         =                       reflink=1    bigtime=1 inobtcount=1 nrext64=0\ndata     =                       bsize=4096   blocks=524288, imaxpct=25\n         =                       sunit=0      swidth=0 blks\nnaming   =version 2              bsize=4096   ascii-ci=0, ftype=1\nlog      =internal log           bsize=4096   blocks=16384, version=2\n         =                       sectsz=512   sunit=0 blks, lazy-count=1\nrealtime =none                   extsz=4096   blocks=0, rtextents=0"
+      }
+    }
+  }
+}
