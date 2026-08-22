@@ -1,0 +1,91 @@
+{
+  "counts": {
+    "1": {
+      "baseline": {
+        "cleanup_wall_ms": 8.835,
+        "materialize_wall_ms": 27.336,
+        "metadata_wall_ms": 3.808,
+        "successes": 1,
+        "used_delta": 8372224,
+        "verify_wall_ms": 67.887,
+        "work_wall_ms": 99.031
+      },
+      "cow_bulk": {
+        "cleanup_wall_ms": 8.367,
+        "metadata_wall_ms": 2.739,
+        "populate_successes": 1,
+        "populate_wall_ms": 12.575,
+        "read_tree_successes": 1,
+        "read_tree_wall_ms": 2.727,
+        "successes": 1,
+        "used_delta": 278528,
+        "verify_wall_ms": 37.64,
+        "work_wall_ms": 55.681
+      }
+    },
+    "32": {
+      "baseline": {
+        "cleanup_wall_ms": 458.651,
+        "materialize_wall_ms": 532.251,
+        "metadata_wall_ms": 31.951,
+        "successes": 32,
+        "used_delta": 267718656,
+        "verify_wall_ms": 269.408,
+        "work_wall_ms": 833.61
+      },
+      "cow_bulk": {
+        "cleanup_wall_ms": 362.526,
+        "metadata_wall_ms": 27.461,
+        "populate_successes": 32,
+        "populate_wall_ms": 497.896,
+        "read_tree_successes": 32,
+        "read_tree_wall_ms": 26.165,
+        "successes": 32,
+        "used_delta": 8720384,
+        "verify_wall_ms": 392.161,
+        "work_wall_ms": 943.683
+      }
+    },
+    "8": {
+      "baseline": {
+        "cleanup_wall_ms": 72.501,
+        "materialize_wall_ms": 90.358,
+        "metadata_wall_ms": 7.651,
+        "successes": 8,
+        "used_delta": 66912256,
+        "verify_wall_ms": 149.725,
+        "work_wall_ms": 247.734
+      },
+      "cow_bulk": {
+        "cleanup_wall_ms": 67.911,
+        "metadata_wall_ms": 10.273,
+        "populate_successes": 8,
+        "populate_wall_ms": 104.934,
+        "read_tree_successes": 8,
+        "read_tree_wall_ms": 9.805,
+        "successes": 8,
+        "used_delta": 2195456,
+        "verify_wall_ms": 99.331,
+        "work_wall_ms": 224.343
+      }
+    }
+  },
+  "schema_version": 1,
+  "source": {
+    "add": {
+      "elapsed_ms": 29.597,
+      "returncode": 0,
+      "stderr": "Preparing worktree (detached HEAD 108cc7d)",
+      "stdout": "HEAD is now at 108cc7d research: benchmark bulk XFS CoW task fanout"
+    },
+    "logical_bytes": 7258338,
+    "regular_entries": 390,
+    "verify": {
+      "diff_files_ms": 22.5,
+      "diff_index_ms": 22.627,
+      "returncode": 0,
+      "status": "",
+      "status_ms": 23.361
+    }
+  }
+}
