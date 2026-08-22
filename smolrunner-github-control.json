@@ -1,0 +1,6 @@
+{
+  "kernel": "6.17.0-1022-azure",
+  "machine": "x86_64",
+  "runner_arch": "X64",
+  "runner_os": "Linux"
+}
