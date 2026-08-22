@@ -1,0 +1,86 @@
+{
+  "counts": {
+    "32": {
+      "no_refresh_broad": {
+        "cleanup_wall_ms": 357.997,
+        "metadata_wall_ms": 29.97,
+        "populate_wall_ms": 480.982,
+        "read_tree_wall_ms": 27.493,
+        "successes": 32,
+        "used_delta": 8753152,
+        "verify_wall_ms": 384.708,
+        "work_wall_ms": 923.153
+      },
+      "refresh_broad": {
+        "cleanup_wall_ms": 350.4,
+        "metadata_wall_ms": 27.855,
+        "populate_wall_ms": 470.807,
+        "read_tree_wall_ms": 24.259,
+        "refresh_successes": 32,
+        "refresh_wall_ms": 341.225,
+        "successes": 32,
+        "used_delta": 8720384,
+        "verify_wall_ms": 75.84,
+        "work_wall_ms": 939.986
+      },
+      "refresh_narrow": {
+        "cleanup_wall_ms": 366.441,
+        "metadata_wall_ms": 28.351,
+        "populate_wall_ms": 478.46,
+        "read_tree_wall_ms": 27.177,
+        "refresh_successes": 32,
+        "refresh_wall_ms": 344.234,
+        "successes": 32,
+        "used_delta": 8753152,
+        "verify_wall_ms": 49.175,
+        "work_wall_ms": 927.397
+      }
+    },
+    "8": {
+      "no_refresh_broad": {
+        "cleanup_wall_ms": 69.958,
+        "metadata_wall_ms": 12.34,
+        "populate_wall_ms": 136.549,
+        "read_tree_wall_ms": 10.438,
+        "successes": 8,
+        "used_delta": 2162688,
+        "verify_wall_ms": 188.425,
+        "work_wall_ms": 347.752
+      },
+      "refresh_broad": {
+        "cleanup_wall_ms": 60.734,
+        "metadata_wall_ms": 8.191,
+        "populate_wall_ms": 104.281,
+        "read_tree_wall_ms": 7.56,
+        "refresh_successes": 8,
+        "refresh_wall_ms": 89.846,
+        "successes": 8,
+        "used_delta": 2195456,
+        "verify_wall_ms": 92.502,
+        "work_wall_ms": 302.38
+      },
+      "refresh_narrow": {
+        "cleanup_wall_ms": 69.644,
+        "metadata_wall_ms": 7.345,
+        "populate_wall_ms": 100.735,
+        "read_tree_wall_ms": 7.992,
+        "refresh_successes": 8,
+        "refresh_wall_ms": 89.492,
+        "successes": 8,
+        "used_delta": 2162688,
+        "verify_wall_ms": 11.793,
+        "work_wall_ms": 217.357
+      }
+    }
+  },
+  "schema_version": 1,
+  "source": {
+    "add": {
+      "elapsed_ms": 29.212,
+      "returncode": 0,
+      "stderr": "Preparing worktree (detached HEAD 1f237bb)",
+      "stdout": "HEAD is now at 1f237bb research: benchmark CoW index refresh handoff"
+    },
+    "regular_entries": 390
+  }
+}
