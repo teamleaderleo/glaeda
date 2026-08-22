@@ -1,0 +1,146 @@
+name: Research GitHub ARM worktree fanout
+
+on:
+  push:
+    branches:
+      - research/github-arm-worktree-fanout
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  fanout:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Benchmark 1 8 32 worktree fanout
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import concurrent.futures
+          import json
+          import os
+          import platform
+          import shutil
+          import subprocess
+          import tempfile
+          import time
+          from pathlib import Path
+
+          workspace = Path(os.environ['GITHUB_WORKSPACE']).resolve()
+          root = Path(tempfile.mkdtemp(prefix='smolrunner-fanout-', dir=os.environ['RUNNER_TEMP']))
+          result_path = workspace / 'smolrunner-github-arm-worktree-fanout.json'
+
+          def command(argv, cwd=None):
+              start = time.monotonic_ns()
+              p = subprocess.run(argv, cwd=cwd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+              return {'returncode': p.returncode, 'elapsed_ms': round((time.monotonic_ns()-start)/1_000_000,3), 'stderr': p.stderr.strip()[:2048], 'stdout': p.stdout.strip()[:2048]}
+
+          def quiescent_used(path):
+              subprocess.run(['sync','-f',str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+              time.sleep(0.05)
+              s = os.statvfs(path)
+              return (s.f_blocks-s.f_bfree)*s.f_frsize
+
+          def parallel(count, fn):
+              started = time.monotonic_ns()
+              with concurrent.futures.ThreadPoolExecutor(max_workers=count) as pool:
+                  records = list(pool.map(fn, range(count)))
+              wall_ms = round((time.monotonic_ns()-started)/1_000_000,3)
+              return wall_ms, records
+
+          def cleanup(paths):
+              def one(path):
+                  return command(['git','worktree','remove','--force',str(path)], cwd=workspace)
+              started = time.monotonic_ns()
+              with concurrent.futures.ThreadPoolExecutor(max_workers=max(1,len(paths))) as pool:
+                  records = list(pool.map(one, paths))
+              subprocess.run(['git','worktree','prune'], cwd=workspace, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+              return round((time.monotonic_ns()-started)/1_000_000,3), records
+
+          report = {
+              'schema_version': 1,
+              'runner': {'arch': os.environ.get('RUNNER_ARCH'), 'machine': platform.machine(), 'kernel': platform.release(), 'cpu_count': os.cpu_count()},
+              'filesystem': command(['findmnt','-T',str(root),'-n','-o','SOURCE,FSTYPE,OPTIONS']),
+              'git': command(['git','--version']),
+              'counts': {},
+          }
+
+          try:
+              for count in (1,8,32):
+                  case = {}
+
+                  plain_root = root / f'plain-{count}'; plain_root.mkdir()
+                  before = quiescent_used(root)
+                  def add_plain(i):
+                      path = plain_root / f'task-{i:02d}'
+                      return {'path': str(path), **command(['git','worktree','add','--detach',str(path),'HEAD'], cwd=workspace)}
+                  wall, adds = parallel(count, add_plain)
+                  after = quiescent_used(root)
+                  paths = [Path(record['path']) for record in adds if record['returncode'] == 0]
+                  cleanup_wall, removes = cleanup(paths)
+                  case['plain'] = {
+                      'add_wall_ms': wall,
+                      'add_records': adds,
+                      'successes': len(paths),
+                      'used_delta': after-before,
+                      'remove_wall_ms': cleanup_wall,
+                      'remove_records': removes,
+                  }
+                  shutil.rmtree(plain_root, ignore_errors=True)
+                  quiescent_used(root)
+
+                  split_root = root / f'split-{count}'; split_root.mkdir()
+                  before = quiescent_used(root)
+                  def add_metadata(i):
+                      path = split_root / f'task-{i:02d}'
+                      return {'path': str(path), **command(['git','worktree','add','--detach','--no-checkout',str(path),'HEAD'], cwd=workspace)}
+                  meta_wall, metadata = parallel(count, add_metadata)
+                  after_meta = quiescent_used(root)
+                  paths = [Path(record['path']) for record in metadata if record['returncode'] == 0]
+                  def materialize_path(path):
+                      return {'path': str(path), **command(['git','reset','--hard','HEAD'], cwd=path)}
+                  started = time.monotonic_ns()
+                  with concurrent.futures.ThreadPoolExecutor(max_workers=max(1,len(paths))) as pool:
+                      mats = list(pool.map(materialize_path, paths))
+                  mat_wall = round((time.monotonic_ns()-started)/1_000_000,3)
+                  after_mat = quiescent_used(root)
+                  cleanup_wall, removes = cleanup(paths)
+                  case['split'] = {
+                      'metadata_wall_ms': meta_wall,
+                      'metadata_records': metadata,
+                      'metadata_successes': len(paths),
+                      'metadata_used_delta': after_meta-before,
+                      'materialize_wall_ms': mat_wall,
+                      'materialize_records': mats,
+                      'materialize_successes': sum(r['returncode']==0 for r in mats),
+                      'materialize_used_delta': after_mat-after_meta,
+                      'remove_wall_ms': cleanup_wall,
+                      'remove_records': removes,
+                  }
+                  shutil.rmtree(split_root, ignore_errors=True)
+                  quiescent_used(root)
+
+                  report['counts'][str(count)] = case
+
+              result_path.write_text(json.dumps(report, indent=2, sort_keys=True)+'\n')
+              print(json.dumps(report, indent=2, sort_keys=True))
+          finally:
+              subprocess.run(['git','worktree','prune'], cwd=workspace, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+              shutil.rmtree(root, ignore_errors=True)
+          PY
+
+      - name: Persist result
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -C research/results-smolrunner-github-arm-worktree-fanout
+          git add -- smolrunner-github-arm-worktree-fanout.json
+          git commit -m 'research: record hosted ARM worktree fanout'
+          git push --force origin HEAD:refs/heads/research/results-smolrunner-github-arm-worktree-fanout
