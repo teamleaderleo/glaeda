@@ -1,0 +1,127 @@
+{
+  "filesystem": {
+    "runner_temp": "/dev/nvme0n1p1 ext4   rw,relatime,discard,errors=remount-ro,commit=30",
+    "workspace": "/dev/nvme0n1p1 ext4   rw,relatime,discard,errors=remount-ro,commit=30"
+  },
+  "git_worktree_plain": {
+    "add": {
+      "argv": [
+        "git",
+        "worktree",
+        "add",
+        "--detach",
+        "/home/runner/work/_temp/smolrunner-gh-x64-vd507n6_/plain-worktree",
+        "HEAD"
+      ],
+      "elapsed_ms": 31.252,
+      "returncode": 0,
+      "stderr": "Preparing worktree (detached HEAD e9b9d42)",
+      "stdout": "HEAD is now at e9b9d42 research: probe GitHub-hosted x64 hot-path behavior"
+    },
+    "filesystem_used_delta_after_add": 8372224,
+    "remove": {
+      "argv": [
+        "git",
+        "worktree",
+        "remove",
+        "--force",
+        "/home/runner/work/_temp/smolrunner-gh-x64-vd507n6_/plain-worktree"
+      ],
+      "elapsed_ms": 4.198,
+      "returncode": 0,
+      "stderr": "",
+      "stdout": ""
+    }
+  },
+  "git_worktree_split": {
+    "materialization_filesystem_used_delta": 8331264,
+    "materialize": {
+      "argv": [
+        "git",
+        "reset",
+        "--hard",
+        "HEAD"
+      ],
+      "elapsed_ms": 25.811,
+      "returncode": 0,
+      "stderr": "",
+      "stdout": "HEAD is now at e9b9d42 research: probe GitHub-hosted x64 hot-path behavior"
+    },
+    "metadata_add": {
+      "argv": [
+        "git",
+        "worktree",
+        "add",
+        "--detach",
+        "--no-checkout",
+        "/home/runner/work/_temp/smolrunner-gh-x64-vd507n6_/split-worktree",
+        "HEAD"
+      ],
+      "elapsed_ms": 1.35,
+      "returncode": 0,
+      "stderr": "Preparing worktree (detached HEAD e9b9d42)",
+      "stdout": ""
+    },
+    "metadata_filesystem_used_delta": 40960,
+    "remove": {
+      "argv": [
+        "git",
+        "worktree",
+        "remove",
+        "--force",
+        "/home/runner/work/_temp/smolrunner-gh-x64-vd507n6_/split-worktree"
+      ],
+      "elapsed_ms": 4.06,
+      "returncode": 0,
+      "stderr": "",
+      "stdout": ""
+    }
+  },
+  "ordinary_copy": {
+    "copy": {
+      "argv": [
+        "cp",
+        "--reflink=never",
+        "/home/runner/work/_temp/smolrunner-gh-x64-vd507n6_/source.bin",
+        "/home/runner/work/_temp/smolrunner-gh-x64-vd507n6_/ordinary.bin"
+      ],
+      "elapsed_ms": 8.92,
+      "returncode": 0,
+      "stderr": "",
+      "stdout": ""
+    },
+    "filesystem_used_delta": 33554432
+  },
+  "reflink": {
+    "copy": {
+      "argv": [
+        "cp",
+        "--reflink=always",
+        "/home/runner/work/_temp/smolrunner-gh-x64-vd507n6_/source.bin",
+        "/home/runner/work/_temp/smolrunner-gh-x64-vd507n6_/reflink.bin"
+      ],
+      "elapsed_ms": 1.041,
+      "returncode": 1,
+      "stderr": "cp: failed to clone '/home/runner/work/_temp/smolrunner-gh-x64-vd507n6_/reflink.bin' from '/home/runner/work/_temp/smolrunner-gh-x64-vd507n6_/source.bin': Operation not supported",
+      "stdout": ""
+    },
+    "filesystem_used_delta": 0
+  },
+  "runner": {
+    "arch": "X64",
+    "cpu_count": 4,
+    "kernel": "6.17.0-1022-azure",
+    "lscpu": "Architecture:                            x86_64\nCPU op-mode(s):                          32-bit, 64-bit\nAddress sizes:                           48 bits physical, 57 bits virtual\nByte Order:                              Little Endian\nCPU(s):                                  4\nOn-line CPU(s) list:                     0-3\nVendor ID:                               GenuineIntel\nModel name:                              Intel(R) Xeon(R) 6973P-C\nCPU family:                              6\nModel:                                   173\nThread(s) per core:                      2\nCore(s) per socket:                      2\nSocket(s):                               1\nStepping:                                1\nCPU(s) scaling MHz:                      147%\nCPU max MHz:                             2600.0000\nCPU min MHz:                             800.0000\nBogoMIPS:                                5199.99\nFlags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ss ht syscall nx pdpe1gb rdtscp lm constant_tsc rep_good nopl xtopology tsc_reliable nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq vmx ssse3 fma cx16 pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand hypervisor lahf_lm abm 3dnowprefetch tpr_shadow ept vpid ept_ad fsgsbase tsc_adjust bmi1 hle avx2 smep bmi2 erms invpcid rtm avx512f avx512dq rdseed adx smap avx512ifma clflushopt clwb avx512cd sha_ni avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves user_shstk avx_vnni avx512_bf16 vnmi avx512vbmi umip waitpkg avx512_vbmi2 gfni vaes vpclmulqdq avx512_vnni avx512_bitalg avx512_vpopcntdq la57 rdpid cldemote movdiri movdir64b fsrm serialize tsxldtrk ibt amx_bf16 avx512_fp16 amx_tile amx_int8 arch_capabilities\nVirtualization:                          VT-x\nHypervisor vendor:                       Microsoft\nVirtualization type:                     full\nL1d cache:                               96 KiB (2 instances)\nL1i cache:                               128 KiB (2 instances)\nL2 cache:                                4 MiB (2 instances)\nL3 cache:                                480 MiB (1 instance)\nNUMA node(s):                            1\nNUMA node0 CPU(s):                       0-3\nVulnerability Gather data sampling:      Not affected\nVulnerability Ghostwrite:                Not affected\nVulnerability Indirect target selection: Mitigation; Aligned branch/return thunks\nVulnerability Itlb multihit:             Not affected\nVulnerability L1tf:                      Not affected\nVulnerability Mds:                       Not affected\nVulnerability Meltdown:                  Not affected\nVulnerability Mmio stale data:           Not affected\nVulnerability Old microcode:             Not affected\nVulnerability Reg file data sampling:    Not affected\nVulnerability Retbleed:                  Vulnerable\nVulnerability Spec rstack overflow:      Not affected\nVulnerability Spec store bypass:         Vulnerable\nVulnerability Spectre v1:                Mitigation; usercopy/swapgs barriers and __user pointer sanitization\nVulnerability Spectre v2:                Mitigation; Retpolines; STIBP disabled; RSB filling; PBRSB-eIBRS Not affected; BHI Retpoline\nVulnerability Srbds:                     Not affected\nVulnerability Tsa:                       Not affected\nVulnerability Tsx async abort:           Not affected\nVulnerability Vmscape:                   Not affected",
+    "machine": "x86_64"
+  },
+  "schema_version": 1,
+  "small_file_create_10k_ms": 200.436,
+  "small_file_delete_10k_ms": 76.016,
+  "small_file_stat_10k_ms": 30.385,
+  "source_create_32m_ms": 14.826,
+  "tools": {
+    "cargo": "cargo 1.97.1 (c980f4866 2026-06-30)",
+    "git": "git version 2.55.0",
+    "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)"
+  }
+}
