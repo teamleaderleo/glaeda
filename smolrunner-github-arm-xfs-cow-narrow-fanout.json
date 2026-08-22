@@ -1,0 +1,83 @@
+{
+  "counts": {
+    "1": {
+      "baseline_narrow": {
+        "cleanup_wall_ms": 8.419,
+        "materialize_wall_ms": 26.178,
+        "metadata_wall_ms": 3.612,
+        "successes": 1,
+        "used_delta": 8372224,
+        "verify_wall_ms": 45.124,
+        "work_wall_ms": 74.914
+      },
+      "cow_narrow": {
+        "cleanup_wall_ms": 7.692,
+        "metadata_wall_ms": 2.243,
+        "populate_successes": 1,
+        "populate_wall_ms": 12.013,
+        "read_tree_successes": 1,
+        "read_tree_wall_ms": 8.263,
+        "successes": 0,
+        "used_delta": 278528,
+        "verify_wall_ms": 2.875,
+        "work_wall_ms": 25.394
+      }
+    },
+    "32": {
+      "baseline_narrow": {
+        "cleanup_wall_ms": 363.904,
+        "materialize_wall_ms": 457.241,
+        "metadata_wall_ms": 27.576,
+        "successes": 32,
+        "used_delta": 267718656,
+        "verify_wall_ms": 352.319,
+        "work_wall_ms": 837.136
+      },
+      "cow_narrow": {
+        "cleanup_wall_ms": 301.802,
+        "metadata_wall_ms": 26.277,
+        "populate_successes": 32,
+        "populate_wall_ms": 452.217,
+        "read_tree_successes": 32,
+        "read_tree_wall_ms": 22.288,
+        "successes": 0,
+        "used_delta": 8720384,
+        "verify_wall_ms": 41.738,
+        "work_wall_ms": 542.52
+      }
+    },
+    "8": {
+      "baseline_narrow": {
+        "cleanup_wall_ms": 67.522,
+        "materialize_wall_ms": 101.829,
+        "metadata_wall_ms": 7.94,
+        "successes": 8,
+        "used_delta": 66912256,
+        "verify_wall_ms": 102.281,
+        "work_wall_ms": 212.05
+      },
+      "cow_narrow": {
+        "cleanup_wall_ms": 59.886,
+        "metadata_wall_ms": 7.484,
+        "populate_successes": 8,
+        "populate_wall_ms": 89.375,
+        "read_tree_successes": 8,
+        "read_tree_wall_ms": 7.678,
+        "successes": 0,
+        "used_delta": 2195456,
+        "verify_wall_ms": 9.872,
+        "work_wall_ms": 114.409
+      }
+    }
+  },
+  "schema_version": 1,
+  "source": {
+    "logical_bytes": 7256699,
+    "proof": {
+      "diff_files_ms": 22.588,
+      "diff_index_ms": 22.322,
+      "returncode": 0
+    },
+    "regular_entries": 390
+  }
+}
