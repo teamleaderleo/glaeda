@@ -1,0 +1,187 @@
+name: Research GitHub ARM hot probe
+
+on:
+  push:
+    branches:
+      - research/github-arm-hot-probe
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Probe native ARM filesystem and worktree behavior
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import platform
+          import shutil
+          import subprocess
+          import tempfile
+          import time
+          from pathlib import Path
+
+          workspace = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          runner_temp = Path(os.environ["RUNNER_TEMP"]).resolve()
+          root = Path(tempfile.mkdtemp(prefix="smolrunner-gh-arm-", dir=runner_temp))
+          result_path = workspace / "smolrunner-github-arm-probe.json"
+          worktrees = []
+
+          def command(argv, cwd=None):
+              start = time.monotonic_ns()
+              proc = subprocess.run(argv, cwd=cwd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+              return {
+                  "argv": argv,
+                  "returncode": proc.returncode,
+                  "elapsed_ms": round((time.monotonic_ns() - start) / 1_000_000, 3),
+                  "stdout": proc.stdout.strip()[:8192],
+                  "stderr": proc.stderr.strip()[:8192],
+              }
+
+          def output(argv, cwd=None):
+              record = command(argv, cwd=cwd)
+              return record["stdout"] if record["returncode"] == 0 else None
+
+          def used(path):
+              value = output(["df", "-B1", "--output=used", str(path)])
+              if not value:
+                  return None
+              lines = [line.strip() for line in value.splitlines() if line.strip()]
+              return int(lines[-1]) if len(lines) >= 2 else None
+
+          try:
+              probe = {
+                  "schema_version": 1,
+                  "runner": {
+                      "os": os.environ.get("RUNNER_OS"),
+                      "arch": os.environ.get("RUNNER_ARCH"),
+                      "name": os.environ.get("RUNNER_NAME"),
+                      "machine": platform.machine(),
+                      "kernel": platform.release(),
+                      "cpu_count": os.cpu_count(),
+                      "lscpu": output(["lscpu"]),
+                  },
+                  "filesystem": {
+                      "workspace": output(["findmnt", "-T", str(workspace), "-n", "-o", "SOURCE,FSTYPE,OPTIONS"]),
+                      "runner_temp": output(["findmnt", "-T", str(runner_temp), "-n", "-o", "SOURCE,FSTYPE,OPTIONS"]),
+                      "workspace_df": output(["df", "-T", "-B1", str(workspace)]),
+                      "runner_temp_df": output(["df", "-T", "-B1", str(runner_temp)]),
+                  },
+                  "tools": {
+                      "git": output(["git", "--version"]),
+                      "rustc": output(["rustc", "--version"]),
+                      "cargo": output(["cargo", "--version"]),
+                      "clang": output(["clang", "--version"]),
+                  },
+              }
+
+              source = root / "source.bin"
+              block = os.urandom(1024 * 1024)
+              start = time.monotonic_ns()
+              source.write_bytes(block * 32)
+              probe["source_create_32m_ms"] = round((time.monotonic_ns() - start) / 1_000_000, 3)
+
+              before = used(root)
+              reflink = root / "reflink.bin"
+              reflink_copy = command(["cp", "--reflink=always", str(source), str(reflink)])
+              after = used(root)
+              probe["reflink"] = {
+                  "copy": reflink_copy,
+                  "filesystem_used_delta": None if before is None or after is None else after - before,
+              }
+              if reflink_copy["returncode"] == 0:
+                  before_cow = used(root)
+                  start = time.monotonic_ns()
+                  with reflink.open("r+b", buffering=0) as handle:
+                      handle.write(os.urandom(1024 * 1024))
+                      handle.flush()
+                  after_cow = used(root)
+                  probe["reflink"]["first_1m_write_ms"] = round((time.monotonic_ns() - start) / 1_000_000, 3)
+                  probe["reflink"]["cow_used_delta"] = None if before_cow is None or after_cow is None else after_cow - before_cow
+
+              ordinary = root / "ordinary.bin"
+              before_copy = used(root)
+              ordinary_copy = command(["cp", "--reflink=never", str(source), str(ordinary)])
+              after_copy = used(root)
+              probe["ordinary_copy"] = {
+                  "copy": ordinary_copy,
+                  "filesystem_used_delta": None if before_copy is None or after_copy is None else after_copy - before_copy,
+              }
+
+              small = root / "small-files"
+              small.mkdir()
+              payload = b"hot\n" * 64
+              start = time.monotonic_ns()
+              for index in range(10_000):
+                  (small / f"f-{index:05d}").write_bytes(payload)
+              probe["small_file_create_10k_ms"] = round((time.monotonic_ns() - start) / 1_000_000, 3)
+              start = time.monotonic_ns()
+              for entry in small.iterdir():
+                  entry.stat()
+              probe["small_file_stat_10k_ms"] = round((time.monotonic_ns() - start) / 1_000_000, 3)
+              start = time.monotonic_ns()
+              shutil.rmtree(small)
+              probe["small_file_delete_10k_ms"] = round((time.monotonic_ns() - start) / 1_000_000, 3)
+
+              plain = root / "plain-worktree"
+              before_plain = used(root)
+              plain_add = command(["git", "worktree", "add", "--detach", str(plain), "HEAD"], cwd=workspace)
+              if plain_add["returncode"] == 0:
+                  worktrees.append(plain)
+              after_plain = used(root)
+              plain_remove = command(["git", "worktree", "remove", "--force", str(plain)], cwd=workspace) if plain_add["returncode"] == 0 else None
+              if plain in worktrees:
+                  worktrees.remove(plain)
+              probe["git_worktree_plain"] = {
+                  "add": plain_add,
+                  "remove": plain_remove,
+                  "filesystem_used_delta_after_add": None if before_plain is None or after_plain is None else after_plain - before_plain,
+              }
+
+              split = root / "split-worktree"
+              before_split = used(root)
+              split_add = command(["git", "worktree", "add", "--detach", "--no-checkout", str(split), "HEAD"], cwd=workspace)
+              if split_add["returncode"] == 0:
+                  worktrees.append(split)
+              after_metadata = used(root)
+              materialize = command(["git", "reset", "--hard", "HEAD"], cwd=split) if split_add["returncode"] == 0 else None
+              after_materialize = used(root)
+              split_remove = command(["git", "worktree", "remove", "--force", str(split)], cwd=workspace) if split_add["returncode"] == 0 else None
+              if split in worktrees:
+                  worktrees.remove(split)
+              probe["git_worktree_split"] = {
+                  "metadata_add": split_add,
+                  "materialize": materialize,
+                  "remove": split_remove,
+                  "metadata_filesystem_used_delta": None if before_split is None or after_metadata is None else after_metadata - before_split,
+                  "materialization_filesystem_used_delta": None if after_metadata is None or after_materialize is None else after_materialize - after_metadata,
+              }
+
+              result_path.write_text(json.dumps(probe, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+              print(json.dumps(probe, indent=2, sort_keys=True))
+          finally:
+              for worktree in list(worktrees):
+                  subprocess.run(["git", "worktree", "remove", "--force", str(worktree)], cwd=workspace, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+              shutil.rmtree(root, ignore_errors=True)
+          PY
+
+      - name: Persist result on research branch
+        run: |
+          set -euo pipefail
+          test -f smolrunner-github-arm-probe.json
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -C research/results-smolrunner-github-arm
+          git add -- smolrunner-github-arm-probe.json
+          git commit -m 'research: record GitHub-hosted ARM probe'
+          git push --force origin HEAD:refs/heads/research/results-smolrunner-github-arm
