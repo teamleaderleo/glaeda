@@ -1,0 +1,202 @@
+name: Research GitHub ARM XFS CoW worktree
+
+on:
+  push:
+    branches:
+      - research/github-arm-xfs-cow-worktree
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  prototype:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Prototype verified FICLONE worktree materialization
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import fcntl
+          import hashlib
+          import json
+          import os
+          import shutil
+          import stat
+          import subprocess
+          import tempfile
+          import time
+          from pathlib import Path
+
+          FICLONE = 0x40049409
+          workspace = Path(os.environ['GITHUB_WORKSPACE']).resolve()
+          root = Path(tempfile.mkdtemp(prefix='smolrunner-cow-wt-', dir=os.environ['RUNNER_TEMP']))
+          image = root / 'xfs.img'; mount = root / 'xfs'; mount.mkdir()
+          result_path = workspace / 'smolrunner-github-arm-xfs-cow-worktree.json'
+          worktrees = []
+          mounted = False
+
+          def run(argv, cwd=None):
+              start = time.monotonic_ns()
+              p = subprocess.run(argv, cwd=cwd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+              return {'argv': argv, 'returncode': p.returncode, 'elapsed_ms': round((time.monotonic_ns()-start)/1_000_000,3), 'stdout': p.stdout.strip()[:4096], 'stderr': p.stderr.strip()[:4096]}
+
+          def quiet_used(path):
+              run(['sync','-f',str(path)]); time.sleep(0.05)
+              s = os.statvfs(path)
+              return (s.f_blocks-s.f_bfree)*s.f_frsize
+
+          def remove_worktree(path):
+              if path in worktrees:
+                  run(['git','worktree','remove','--force',str(path)], cwd=workspace)
+                  worktrees.remove(path)
+
+          def git_blob_sha1(path):
+              size = path.stat().st_size
+              h = hashlib.sha1()
+              h.update(f'blob {size}\0'.encode())
+              with path.open('rb') as f:
+                  while True:
+                      chunk = f.read(1024*1024)
+                      if not chunk: break
+                      h.update(chunk)
+              return h.hexdigest(), size
+
+          def tracked_entries(base):
+              p = subprocess.run(['git','ls-files','--stage','-z'], cwd=base, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+              if p.returncode != 0: raise RuntimeError(p.stderr.decode(errors='replace'))
+              entries = []
+              for raw in p.stdout.split(b'\0'):
+                  if not raw: continue
+                  head, path = raw.split(b'\t',1)
+                  mode, oid, stage_no = head.decode().split(' ')
+                  entries.append((mode, oid, Path(os.fsdecode(path))))
+              return entries
+
+          def verified_reflink_populate(base, target):
+              entries = tracked_entries(base)
+              cloned_files = 0; cloned_logical = 0; skipped = 0
+              started = time.monotonic_ns()
+              for mode, oid, relative in entries:
+                  if mode not in ('100644','100755'):
+                      skipped += 1; continue
+                  source = base / relative
+                  try:
+                      st = os.lstat(source)
+                  except FileNotFoundError:
+                      skipped += 1; continue
+                  if not stat.S_ISREG(st.st_mode):
+                      skipped += 1; continue
+                  observed_oid, logical = git_blob_sha1(source)
+                  if observed_oid != oid:
+                      skipped += 1; continue
+                  destination = target / relative
+                  destination.parent.mkdir(parents=True, exist_ok=True)
+                  src_fd = os.open(source, os.O_RDONLY | os.O_CLOEXEC)
+                  try:
+                      dst_fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o755 if mode == '100755' else 0o644)
+                      try:
+                          fcntl.ioctl(dst_fd, FICLONE, src_fd)
+                          os.fchmod(dst_fd, 0o755 if mode == '100755' else 0o644)
+                      finally:
+                          os.close(dst_fd)
+                  finally:
+                      os.close(src_fd)
+                  os.utime(destination, ns=(st.st_atime_ns, st.st_mtime_ns), follow_symlinks=False)
+                  cloned_files += 1; cloned_logical += logical
+              return {
+                  'elapsed_ms': round((time.monotonic_ns()-started)/1_000_000,3),
+                  'tracked_entries': len(entries),
+                  'cloned_files': cloned_files,
+                  'cloned_logical_bytes': cloned_logical,
+                  'skipped_entries': skipped,
+              }
+
+          result = {'schema_version': 1}
+          try:
+              run(['truncate','-s','2G',str(image)])
+              fmt = run(['sudo','mkfs.xfs','-f','-q','-m','reflink=1',str(image)])
+              mnt = run(['sudo','mount','-o','loop',str(image),str(mount)])
+              if fmt['returncode'] or mnt['returncode']:
+                  raise RuntimeError('XFS setup failed')
+              mounted = True
+              run(['sudo','chown',f'{os.getuid()}:{os.getgid()}',str(mount)])
+              result['xfs_info'] = run(['xfs_info',str(mount)])
+              result['object_format'] = run(['git','rev-parse','--show-object-format'], cwd=workspace)
+              if result['object_format']['stdout'] != 'sha1':
+                  raise RuntimeError('prototype expects sha1 Git objects')
+
+              base = mount / 'base'
+              br = run(['git','worktree','add','--detach',str(base),'HEAD'], cwd=workspace)
+              if br['returncode']: raise RuntimeError('base worktree failed')
+              worktrees.append(base)
+              result['base_add'] = br
+
+              # Baseline split materialization on this exact XFS volume.
+              baseline = mount / 'baseline'
+              before = quiet_used(mount)
+              meta = run(['git','worktree','add','--detach','--no-checkout',str(baseline),'HEAD'], cwd=workspace)
+              if meta['returncode'] == 0: worktrees.append(baseline)
+              after_meta = quiet_used(mount)
+              reset = run(['git','reset','--hard','HEAD'], cwd=baseline) if meta['returncode'] == 0 else None
+              after_reset = quiet_used(mount)
+              status = run(['git','status','--porcelain=v2','--untracked-files=no'], cwd=baseline) if meta['returncode'] == 0 else None
+              result['baseline'] = {
+                  'metadata': meta,
+                  'metadata_used_delta': after_meta-before,
+                  'reset': reset,
+                  'materialize_used_delta': after_reset-after_meta,
+                  'status': status,
+              }
+              remove_worktree(baseline); quiet_used(mount)
+
+              # CoW candidate.
+              target = mount / 'cow'
+              before = quiet_used(mount)
+              cow_meta = run(['git','worktree','add','--detach','--no-checkout',str(target),'HEAD'], cwd=workspace)
+              if cow_meta['returncode'] == 0: worktrees.append(target)
+              after_cow_meta = quiet_used(mount)
+              populate = verified_reflink_populate(base, target) if cow_meta['returncode'] == 0 else None
+              after_populate = quiet_used(mount)
+              refresh = run(['git','update-index','--refresh'], cwd=target) if cow_meta['returncode'] == 0 else None
+              finish = run(['git','reset','--hard','HEAD'], cwd=target) if cow_meta['returncode'] == 0 else None
+              after_finish = quiet_used(mount)
+              status = run(['git','status','--porcelain=v2','--untracked-files=no'], cwd=target) if cow_meta['returncode'] == 0 else None
+              diff_files = run(['git','diff-files','--quiet'], cwd=target) if cow_meta['returncode'] == 0 else None
+              diff_index = run(['git','diff-index','--quiet','HEAD','--'], cwd=target) if cow_meta['returncode'] == 0 else None
+              result['cow'] = {
+                  'metadata': cow_meta,
+                  'metadata_used_delta': after_cow_meta-before,
+                  'populate': populate,
+                  'populate_used_delta': after_populate-after_cow_meta,
+                  'update_index_refresh': refresh,
+                  'finish_reset': finish,
+                  'finish_used_delta': after_finish-after_populate,
+                  'status': status,
+                  'diff_files': diff_files,
+                  'diff_index': diff_index,
+              }
+              remove_worktree(target)
+
+              result_path.write_text(json.dumps(result, indent=2, sort_keys=True)+'\n')
+              print(json.dumps(result, indent=2, sort_keys=True))
+          finally:
+              for path in list(worktrees): run(['git','worktree','remove','--force',str(path)], cwd=workspace)
+              if mounted: run(['sudo','umount',str(mount)])
+              shutil.rmtree(root, ignore_errors=True)
+          PY
+
+      - name: Persist result
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -C research/results-smolrunner-github-arm-xfs-cow-worktree
+          git add -- smolrunner-github-arm-xfs-cow-worktree.json
+          git commit -m 'research: record XFS CoW worktree prototype'
+          git push --force origin HEAD:refs/heads/research/results-smolrunner-github-arm-xfs-cow-worktree
