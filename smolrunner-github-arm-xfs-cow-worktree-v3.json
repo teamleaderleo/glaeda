@@ -1,0 +1,135 @@
+{
+  "base_add": {
+    "argv": [
+      "git",
+      "worktree",
+      "add",
+      "--detach",
+      "/home/runner/work/_temp/smolrunner-cow-v3-3a1i1aag/xfs/base",
+      "HEAD"
+    ],
+    "elapsed_ms": 29.6,
+    "returncode": 0,
+    "stderr": "Preparing worktree (detached HEAD 7e9e4d1)",
+    "stdout": "HEAD is now at 7e9e4d1 research: populate target index before CoW worktree clone"
+  },
+  "baseline": {
+    "materialize": {
+      "argv": [
+        "git",
+        "reset",
+        "--hard",
+        "HEAD"
+      ],
+      "elapsed_ms": 26.839,
+      "returncode": 0,
+      "stderr": "",
+      "stdout": "HEAD is now at 7e9e4d1 research: populate target index before CoW worktree clone"
+    },
+    "metadata": {
+      "argv": [
+        "git",
+        "worktree",
+        "add",
+        "--detach",
+        "--no-checkout",
+        "/home/runner/work/_temp/smolrunner-cow-v3-3a1i1aag/xfs/baseline",
+        "HEAD"
+      ],
+      "elapsed_ms": 2.386,
+      "returncode": 0,
+      "stderr": "Preparing worktree (detached HEAD 7e9e4d1)",
+      "stdout": ""
+    },
+    "total_ms": 29.225,
+    "used_delta": 8368128
+  },
+  "cow": {
+    "diff_files": {
+      "argv": [
+        "git",
+        "diff-files",
+        "--quiet"
+      ],
+      "elapsed_ms": 21.028,
+      "returncode": 0,
+      "stderr": "",
+      "stdout": ""
+    },
+    "diff_index": {
+      "argv": [
+        "git",
+        "diff-index",
+        "--quiet",
+        "HEAD",
+        "--"
+      ],
+      "elapsed_ms": 21.195,
+      "returncode": 0,
+      "stderr": "",
+      "stdout": ""
+    },
+    "metadata": {
+      "argv": [
+        "git",
+        "worktree",
+        "add",
+        "--detach",
+        "--no-checkout",
+        "/home/runner/work/_temp/smolrunner-cow-v3-3a1i1aag/xfs/cow",
+        "HEAD"
+      ],
+      "elapsed_ms": 2.336,
+      "returncode": 0,
+      "stderr": "Preparing worktree (detached HEAD 7e9e4d1)",
+      "stdout": ""
+    },
+    "metadata_used_delta": 4096,
+    "populate": {
+      "cloned_files": 390,
+      "cloned_logical_bytes": 7253795,
+      "elapsed_ms": 43.386,
+      "skipped": []
+    },
+    "populate_used_delta": 274432,
+    "read_tree": {
+      "argv": [
+        "git",
+        "read-tree",
+        "HEAD"
+      ],
+      "elapsed_ms": 3.03,
+      "returncode": 0,
+      "stderr": "",
+      "stdout": ""
+    },
+    "read_tree_used_delta": 0,
+    "refresh": {
+      "argv": [
+        "git",
+        "update-index",
+        "--refresh"
+      ],
+      "elapsed_ms": 33.441,
+      "returncode": 0,
+      "stderr": "",
+      "stdout": ""
+    },
+    "refresh_used_delta": 0,
+    "status": {
+      "argv": [
+        "git",
+        "status",
+        "--porcelain=v2",
+        "--untracked-files=no"
+      ],
+      "elapsed_ms": 21.858,
+      "returncode": 0,
+      "stderr": "",
+      "stdout": ""
+    },
+    "total_ms": 82.193,
+    "total_used_delta": 278528
+  },
+  "schema_version": 3
+}
