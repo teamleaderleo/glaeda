@@ -1,0 +1,254 @@
+name: Research GitHub ARM XFS CoW bulk fanout
+
+on:
+  push:
+    branches:
+      - research/github-arm-xfs-cow-bulk-fanout
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  fanout:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Compare Git materialization and bulk reflink fanout
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import concurrent.futures
+          import json
+          import os
+          import shutil
+          import subprocess
+          import tempfile
+          import time
+          from pathlib import Path
+
+          repo = Path(os.environ['GITHUB_WORKSPACE']).resolve()
+          root = Path(tempfile.mkdtemp(prefix='smolrunner-xfs-bulk-', dir=os.environ['RUNNER_TEMP']))
+          image = root / 'xfs.img'
+          mount = root / 'xfs'
+          mount.mkdir()
+          result_path = repo / 'smolrunner-github-arm-xfs-cow-bulk-fanout.json'
+          worktrees = []
+          mounted = False
+
+          def command(argv, cwd=None):
+              start = time.monotonic_ns()
+              proc = subprocess.run(
+                  argv,
+                  cwd=cwd,
+                  text=True,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+                  check=False,
+              )
+              return {
+                  'returncode': proc.returncode,
+                  'elapsed_ms': round((time.monotonic_ns() - start) / 1_000_000, 3),
+                  'stdout': proc.stdout.strip()[:1024],
+                  'stderr': proc.stderr.strip()[:1024],
+              }
+
+          def phase(items, function, workers):
+              start = time.monotonic_ns()
+              with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+                  records = list(pool.map(function, items))
+              return round((time.monotonic_ns() - start) / 1_000_000, 3), records
+
+          def quiet_used(path):
+              subprocess.run(['sync', '-f', str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+              time.sleep(0.05)
+              stat = os.statvfs(path)
+              return (stat.f_blocks - stat.f_bfree) * stat.f_frsize
+
+          def verify(path):
+              status = command(['git', 'status', '--porcelain=v2', '--untracked-files=no'], cwd=path)
+              diff_files = command(['git', 'diff-files', '--quiet'], cwd=path)
+              diff_index = command(['git', 'diff-index', '--quiet', 'HEAD', '--'], cwd=path)
+              clean = (
+                  status['returncode'] == 0
+                  and not status['stdout']
+                  and diff_files['returncode'] == 0
+                  and diff_index['returncode'] == 0
+              )
+              return {
+                  'returncode': 0 if clean else 1,
+                  'status_ms': status['elapsed_ms'],
+                  'diff_files_ms': diff_files['elapsed_ms'],
+                  'diff_index_ms': diff_index['elapsed_ms'],
+                  'status': status['stdout'][:256],
+              }
+
+          def remove_worktrees(paths):
+              def remove_one(path):
+                  return command(['git', 'worktree', 'remove', '--force', str(path)], cwd=repo)
+              wall, records = phase(paths, remove_one, len(paths))
+              subprocess.run(['git', 'worktree', 'prune'], cwd=repo, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+              for path in paths:
+                  if path in worktrees:
+                      worktrees.remove(path)
+              return wall, records
+
+          def tracked_regular_paths(base):
+              proc = subprocess.run(
+                  ['git', 'ls-files', '--stage', '-z'],
+                  cwd=base,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+                  check=False,
+              )
+              if proc.returncode != 0:
+                  raise RuntimeError('git ls-files failed')
+              paths = []
+              logical = 0
+              for raw in proc.stdout.split(b'\0'):
+                  if not raw:
+                      continue
+                  head, raw_path = raw.split(b'\t', 1)
+                  mode, _, _ = head.decode().split(' ')
+                  if mode not in ('100644', '100755'):
+                      continue
+                  relative = Path(os.fsdecode(raw_path))
+                  source = base / relative
+                  if not source.is_file() or source.is_symlink():
+                      continue
+                  paths.append(str(relative))
+                  logical += source.stat().st_size
+              return paths, logical
+
+          result = {'schema_version': 1, 'counts': {}}
+          try:
+              command(['truncate', '-s', '2G', str(image)])
+              if command(['sudo', 'mkfs.xfs', '-f', '-q', '-m', 'reflink=1', str(image)])['returncode']:
+                  raise RuntimeError('mkfs.xfs failed')
+              if command(['sudo', 'mount', '-o', 'loop', str(image), str(mount)])['returncode']:
+                  raise RuntimeError('XFS mount failed')
+              mounted = True
+              command(['sudo', 'chown', f'{os.getuid()}:{os.getgid()}', str(mount)])
+
+              base = mount / 'base'
+              base_add = command(['git', 'worktree', 'add', '--detach', str(base), 'HEAD'], cwd=repo)
+              if base_add['returncode']:
+                  raise RuntimeError('base worktree failed')
+              worktrees.append(base)
+              source_verify = verify(base)
+              if source_verify['returncode']:
+                  raise RuntimeError('base worktree is not clean')
+              tracked_paths, logical_bytes = tracked_regular_paths(base)
+              result['source'] = {
+                  'add': base_add,
+                  'verify': source_verify,
+                  'regular_entries': len(tracked_paths),
+                  'logical_bytes': logical_bytes,
+              }
+
+              for count in (1, 8, 32):
+                  case = {}
+
+                  baseline_root = mount / f'baseline-{count}'
+                  baseline_root.mkdir()
+                  baseline_paths = [baseline_root / f'task-{index:02d}' for index in range(count)]
+                  before = quiet_used(mount)
+                  metadata_wall, metadata_records = phase(
+                      baseline_paths,
+                      lambda path: command(['git', 'worktree', 'add', '--detach', '--no-checkout', str(path), 'HEAD'], cwd=repo),
+                      count,
+                  )
+                  baseline_ok = [path for path, record in zip(baseline_paths, metadata_records) if record['returncode'] == 0]
+                  worktrees.extend(baseline_ok)
+                  materialize_wall, materialize_records = phase(
+                      baseline_ok,
+                      lambda path: command(['git', 'reset', '--hard', 'HEAD'], cwd=path),
+                      len(baseline_ok),
+                  )
+                  verify_wall, verify_records = phase(baseline_ok, verify, len(baseline_ok))
+                  after = quiet_used(mount)
+                  cleanup_wall, _ = remove_worktrees(baseline_ok)
+                  shutil.rmtree(baseline_root, ignore_errors=True)
+                  quiet_used(mount)
+                  case['baseline'] = {
+                      'metadata_wall_ms': metadata_wall,
+                      'materialize_wall_ms': materialize_wall,
+                      'verify_wall_ms': verify_wall,
+                      'work_wall_ms': round(metadata_wall + materialize_wall + verify_wall, 3),
+                      'successes': sum(record['returncode'] == 0 for record in verify_records),
+                      'used_delta': after - before,
+                      'cleanup_wall_ms': cleanup_wall,
+                  }
+
+                  cow_root = mount / f'cow-{count}'
+                  cow_root.mkdir()
+                  cow_paths = [cow_root / f'task-{index:02d}' for index in range(count)]
+                  before = quiet_used(mount)
+                  metadata_wall, metadata_records = phase(
+                      cow_paths,
+                      lambda path: command(['git', 'worktree', 'add', '--detach', '--no-checkout', str(path), 'HEAD'], cwd=repo),
+                      count,
+                  )
+                  cow_ok = [path for path, record in zip(cow_paths, metadata_records) if record['returncode'] == 0]
+                  worktrees.extend(cow_ok)
+                  read_tree_wall, read_tree_records = phase(
+                      cow_ok,
+                      lambda path: command(['git', 'read-tree', 'HEAD'], cwd=path),
+                      len(cow_ok),
+                  )
+
+                  def bulk_clone(path):
+                      argv = [
+                          'cp',
+                          '-p',
+                          '--parents',
+                          '--reflink=always',
+                          f'--target-directory={path}',
+                          '--',
+                          *tracked_paths,
+                      ]
+                      return command(argv, cwd=base)
+
+                  populate_wall, populate_records = phase(cow_ok, bulk_clone, len(cow_ok))
+                  verify_wall, verify_records = phase(cow_ok, verify, len(cow_ok))
+                  after = quiet_used(mount)
+                  cleanup_wall, _ = remove_worktrees(cow_ok)
+                  shutil.rmtree(cow_root, ignore_errors=True)
+                  quiet_used(mount)
+                  case['cow_bulk'] = {
+                      'metadata_wall_ms': metadata_wall,
+                      'read_tree_wall_ms': read_tree_wall,
+                      'populate_wall_ms': populate_wall,
+                      'verify_wall_ms': verify_wall,
+                      'work_wall_ms': round(metadata_wall + read_tree_wall + populate_wall + verify_wall, 3),
+                      'read_tree_successes': sum(record['returncode'] == 0 for record in read_tree_records),
+                      'populate_successes': sum(record['returncode'] == 0 for record in populate_records),
+                      'successes': sum(record['returncode'] == 0 for record in verify_records),
+                      'used_delta': after - before,
+                      'cleanup_wall_ms': cleanup_wall,
+                  }
+                  result['counts'][str(count)] = case
+
+              result_path.write_text(json.dumps(result, indent=2, sort_keys=True) + '\n')
+              print(json.dumps(result, indent=2, sort_keys=True))
+          finally:
+              for worktree in list(worktrees):
+                  command(['git', 'worktree', 'remove', '--force', str(worktree)], cwd=repo)
+              if mounted:
+                  command(['sudo', 'umount', str(mount)])
+              shutil.rmtree(root, ignore_errors=True)
+          PY
+
+      - name: Persist result
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -C research/results-smolrunner-github-arm-xfs-cow-bulk-fanout
+          git add -- smolrunner-github-arm-xfs-cow-bulk-fanout.json
+          git commit -m 'research: record bulk XFS CoW fanout'
+          git push --force origin HEAD:refs/heads/research/results-smolrunner-github-arm-xfs-cow-bulk-fanout
