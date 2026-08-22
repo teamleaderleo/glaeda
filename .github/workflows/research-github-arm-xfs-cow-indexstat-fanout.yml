@@ -1,0 +1,309 @@
+name: Research GitHub ARM XFS CoW index stat fanout
+
+on:
+  push:
+    branches:
+      - research/github-arm-xfs-cow-indexstat-fanout
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  fanout:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Benchmark direct target-index stat seeding
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import concurrent.futures
+          import hashlib
+          import json
+          import os
+          import shutil
+          import stat
+          import struct
+          import subprocess
+          import tempfile
+          import time
+          from pathlib import Path
+
+          repo = Path(os.environ['GITHUB_WORKSPACE']).resolve()
+          root = Path(tempfile.mkdtemp(prefix='smolrunner-xfs-indexstat-', dir=os.environ['RUNNER_TEMP']))
+          image = root / 'xfs.img'
+          mount = root / 'xfs'
+          mount.mkdir()
+          result_path = repo / 'smolrunner-github-arm-xfs-cow-indexstat-fanout.json'
+          worktrees = []
+          mounted = False
+
+          def command(argv, cwd=None, env=None):
+              start = time.monotonic_ns()
+              proc = subprocess.run(
+                  argv,
+                  cwd=cwd,
+                  env=env,
+                  text=True,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+                  check=False,
+              )
+              return {
+                  'returncode': proc.returncode,
+                  'elapsed_ms': round((time.monotonic_ns() - start) / 1_000_000, 3),
+                  'stdout': proc.stdout.strip()[:1024],
+                  'stderr': proc.stderr.strip()[:1024],
+              }
+
+          def phase(items, function):
+              start = time.monotonic_ns()
+              with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(items))) as pool:
+                  records = list(pool.map(function, items))
+              return round((time.monotonic_ns() - start) / 1_000_000, 3), records
+
+          def quiet_used(path):
+              subprocess.run(['sync', '-f', str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+              time.sleep(0.05)
+              fs = os.statvfs(path)
+              return (fs.f_blocks - fs.f_bfree) * fs.f_frsize
+
+          def narrow_verify(path):
+              diff_files = command(['git', '--no-optional-locks', 'diff-files', '--quiet'], cwd=path)
+              diff_index = command(['git', '--no-optional-locks', 'diff-index', '--quiet', 'HEAD', '--'], cwd=path)
+              clean = diff_files['returncode'] == 0 and diff_index['returncode'] == 0
+              return {
+                  'returncode': 0 if clean else 1,
+                  'diff_files_ms': diff_files['elapsed_ms'],
+                  'diff_index_ms': diff_index['elapsed_ms'],
+                  'diff_files_rc': diff_files['returncode'],
+                  'diff_index_rc': diff_index['returncode'],
+              }
+
+          def remove_paths(paths):
+              wall, records = phase(paths, lambda path: command(['git', 'worktree', 'remove', '--force', str(path)], cwd=repo))
+              subprocess.run(['git', 'worktree', 'prune'], cwd=repo, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+              for path in paths:
+                  if path in worktrees:
+                      worktrees.remove(path)
+              return wall, records
+
+          def tracked_regular(base):
+              proc = subprocess.run(['git', 'ls-files', '--stage', '-z'], cwd=base, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+              if proc.returncode:
+                  raise RuntimeError('git ls-files failed')
+              paths = []
+              logical = 0
+              for raw in proc.stdout.split(b'\0'):
+                  if not raw:
+                      continue
+                  head, raw_path = raw.split(b'\t', 1)
+                  mode, _, _ = head.decode().split(' ')
+                  relative = Path(os.fsdecode(raw_path))
+                  source = base / relative
+                  if mode in ('100644', '100755') and source.is_file() and not source.is_symlink():
+                      paths.append(str(relative))
+                      logical += source.stat().st_size
+              return paths, logical
+
+          def bulk_clone(base, target, tracked):
+              return command([
+                  'cp', '-p', '--parents', '--reflink=always', f'--target-directory={target}', '--', *tracked
+              ], cwd=base)
+
+          def u32(value):
+              return int(value) & 0xFFFFFFFF
+
+          def stat_words(path):
+              st = os.stat(path, follow_symlinks=False)
+              ctime_ns = st.st_ctime_ns
+              mtime_ns = st.st_mtime_ns
+              return (
+                  u32(ctime_ns // 1_000_000_000),
+                  u32(ctime_ns % 1_000_000_000),
+                  u32(mtime_ns // 1_000_000_000),
+                  u32(mtime_ns % 1_000_000_000),
+                  u32(st.st_dev),
+                  u32(st.st_ino),
+                  u32(st.st_mode),
+                  u32(st.st_uid),
+                  u32(st.st_gid),
+                  u32(st.st_size),
+              )
+
+          def seed_index_stats(worktree):
+              start = time.monotonic_ns()
+              index_record = command(['git', 'rev-parse', '--git-path', 'index'], cwd=worktree)
+              if index_record['returncode'] != 0 or not index_record['stdout']:
+                  return {'returncode': 1, 'elapsed_ms': round((time.monotonic_ns() - start) / 1_000_000, 3), 'code': 'index_path'}
+              index_path = Path(index_record['stdout'])
+              if not index_path.is_absolute():
+                  index_path = (worktree / index_path).resolve()
+              data = bytearray(index_path.read_bytes())
+              if len(data) < 32 or data[:4] != b'DIRC':
+                  return {'returncode': 1, 'elapsed_ms': round((time.monotonic_ns() - start) / 1_000_000, 3), 'code': 'index_header'}
+              version, count = struct.unpack('>II', data[4:12])
+              if version != 2:
+                  return {'returncode': 1, 'elapsed_ms': round((time.monotonic_ns() - start) / 1_000_000, 3), 'code': f'index_version_{version}', 'entries': count}
+
+              offset = 12
+              patched = 0
+              for _ in range(count):
+                  entry_start = offset
+                  if entry_start + 62 > len(data) - 20:
+                      return {'returncode': 1, 'elapsed_ms': round((time.monotonic_ns() - start) / 1_000_000, 3), 'code': 'entry_truncated'}
+                  flags = struct.unpack('>H', data[entry_start + 60:entry_start + 62])[0]
+                  if flags & 0x4000:
+                      return {'returncode': 1, 'elapsed_ms': round((time.monotonic_ns() - start) / 1_000_000, 3), 'code': 'extended_entry'}
+                  name_start = entry_start + 62
+                  name_end = data.find(b'\0', name_start, len(data) - 20)
+                  if name_end < 0:
+                      return {'returncode': 1, 'elapsed_ms': round((time.monotonic_ns() - start) / 1_000_000, 3), 'code': 'name_terminator'}
+                  relative = Path(os.fsdecode(bytes(data[name_start:name_end])))
+                  target = worktree / relative
+                  if not target.exists() or target.is_symlink() or not target.is_file():
+                      return {
+                          'returncode': 1,
+                          'elapsed_ms': round((time.monotonic_ns() - start) / 1_000_000, 3),
+                          'code': 'target_entry_missing_or_nonregular',
+                          'entry': str(relative)[:256],
+                      }
+                  data[entry_start:entry_start + 40] = struct.pack('>10I', *stat_words(target))
+                  patched += 1
+                  entry_len = (name_end - entry_start) + 1
+                  offset = entry_start + ((entry_len + 7) & ~7)
+
+              checksum_offset = len(data) - 20
+              if offset > checksum_offset:
+                  return {'returncode': 1, 'elapsed_ms': round((time.monotonic_ns() - start) / 1_000_000, 3), 'code': 'entry_overrun'}
+              old_mode = index_path.stat().st_mode & 0o777
+              next_path = index_path.with_name(index_path.name + '.smolrunner-indexstat-next')
+              payload = bytes(data[:checksum_offset])
+              data[checksum_offset:] = hashlib.sha1(payload).digest()
+              with next_path.open('wb') as handle:
+                  handle.write(data)
+                  handle.flush()
+                  os.fsync(handle.fileno())
+              os.chmod(next_path, old_mode)
+              os.replace(next_path, index_path)
+              directory_fd = os.open(index_path.parent, os.O_RDONLY | os.O_DIRECTORY)
+              try:
+                  os.fsync(directory_fd)
+              finally:
+                  os.close(directory_fd)
+              return {
+                  'returncode': 0,
+                  'elapsed_ms': round((time.monotonic_ns() - start) / 1_000_000, 3),
+                  'version': version,
+                  'entries': count,
+                  'patched': patched,
+                  'extension_bytes': checksum_offset - offset,
+              }
+
+          result = {'schema_version': 1, 'counts': {}}
+          try:
+              command(['truncate', '-s', '2G', str(image)])
+              if command(['sudo', 'mkfs.xfs', '-f', '-q', '-m', 'reflink=1', str(image)])['returncode']:
+                  raise RuntimeError('mkfs.xfs failed')
+              if command(['sudo', 'mount', '-o', 'loop', str(image), str(mount)])['returncode']:
+                  raise RuntimeError('mount failed')
+              mounted = True
+              command(['sudo', 'chown', f'{os.getuid()}:{os.getgid()}', str(mount)])
+
+              base = mount / 'base'
+              base_add = command(['git', 'worktree', 'add', '--detach', str(base), 'HEAD'], cwd=repo)
+              if base_add['returncode']:
+                  raise RuntimeError('base add failed')
+              worktrees.append(base)
+              source_proof = narrow_verify(base)
+              if source_proof['returncode']:
+                  raise RuntimeError('base proof failed')
+              tracked, logical = tracked_regular(base)
+              result['source'] = {
+                  'regular_entries': len(tracked),
+                  'logical_bytes': logical,
+                  'proof': source_proof,
+              }
+
+              for count in (1, 8, 32):
+                  case = {}
+
+                  baseline_root = mount / f'baseline-{count}'
+                  baseline_root.mkdir()
+                  baseline_paths = [baseline_root / f'task-{index:02d}' for index in range(count)]
+                  before = quiet_used(mount)
+                  metadata_wall, metadata = phase(baseline_paths, lambda path: command(['git', 'worktree', 'add', '--detach', '--no-checkout', str(path), 'HEAD'], cwd=repo))
+                  baseline_ok = [path for path, record in zip(baseline_paths, metadata) if record['returncode'] == 0]
+                  worktrees.extend(baseline_ok)
+                  materialize_wall, materialize = phase(baseline_ok, lambda path: command(['git', 'reset', '--hard', 'HEAD'], cwd=path))
+                  verify_wall, verification = phase(baseline_ok, narrow_verify)
+                  after = quiet_used(mount)
+                  cleanup_wall, _ = remove_paths(baseline_ok)
+                  shutil.rmtree(baseline_root, ignore_errors=True)
+                  quiet_used(mount)
+                  case['baseline'] = {
+                      'metadata_wall_ms': metadata_wall,
+                      'materialize_wall_ms': materialize_wall,
+                      'verify_wall_ms': verify_wall,
+                      'work_wall_ms': round(metadata_wall + materialize_wall + verify_wall, 3),
+                      'successes': sum(record['returncode'] == 0 for record in verification),
+                      'used_delta': after - before,
+                      'cleanup_wall_ms': cleanup_wall,
+                  }
+
+                  cow_root = mount / f'cow-{count}'
+                  cow_root.mkdir()
+                  cow_paths = [cow_root / f'task-{index:02d}' for index in range(count)]
+                  before = quiet_used(mount)
+                  metadata_wall, metadata = phase(cow_paths, lambda path: command(['git', 'worktree', 'add', '--detach', '--no-checkout', str(path), 'HEAD'], cwd=repo))
+                  cow_ok = [path for path, record in zip(cow_paths, metadata) if record['returncode'] == 0]
+                  worktrees.extend(cow_ok)
+                  read_tree_wall, read_tree = phase(cow_ok, lambda path: command(['git', 'read-tree', 'HEAD'], cwd=path))
+                  populate_wall, populate = phase(cow_ok, lambda path: bulk_clone(base, path, tracked))
+                  indexstat_wall, indexstat = phase(cow_ok, seed_index_stats)
+                  verify_wall, verification = phase(cow_ok, narrow_verify)
+                  after = quiet_used(mount)
+                  cleanup_wall, _ = remove_paths(cow_ok)
+                  shutil.rmtree(cow_root, ignore_errors=True)
+                  quiet_used(mount)
+                  case['cow_indexstat'] = {
+                      'metadata_wall_ms': metadata_wall,
+                      'read_tree_wall_ms': read_tree_wall,
+                      'populate_wall_ms': populate_wall,
+                      'indexstat_wall_ms': indexstat_wall,
+                      'verify_wall_ms': verify_wall,
+                      'work_wall_ms': round(metadata_wall + read_tree_wall + populate_wall + indexstat_wall + verify_wall, 3),
+                      'read_tree_successes': sum(record['returncode'] == 0 for record in read_tree),
+                      'populate_successes': sum(record['returncode'] == 0 for record in populate),
+                      'indexstat_successes': sum(record['returncode'] == 0 for record in indexstat),
+                      'indexstat_records': indexstat,
+                      'successes': sum(record['returncode'] == 0 for record in verification),
+                      'used_delta': after - before,
+                      'cleanup_wall_ms': cleanup_wall,
+                  }
+                  result['counts'][str(count)] = case
+
+              result_path.write_text(json.dumps(result, indent=2, sort_keys=True) + '\n')
+              print(json.dumps(result, indent=2, sort_keys=True))
+          finally:
+              for worktree in list(worktrees):
+                  command(['git', 'worktree', 'remove', '--force', str(worktree)], cwd=repo)
+              if mounted:
+                  command(['sudo', 'umount', str(mount)])
+              shutil.rmtree(root, ignore_errors=True)
+          PY
+
+      - name: Persist result
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -C research/results-smolrunner-github-arm-xfs-cow-indexstat-fanout
+          git add -- smolrunner-github-arm-xfs-cow-indexstat-fanout.json
+          git commit -m 'research: record XFS CoW index stat fanout'
+          git push --force origin HEAD:refs/heads/research/results-smolrunner-github-arm-xfs-cow-indexstat-fanout
