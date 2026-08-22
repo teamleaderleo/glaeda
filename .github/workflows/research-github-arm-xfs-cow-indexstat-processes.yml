@@ -1,0 +1,142 @@
+name: Research GitHub ARM XFS CoW process index stat
+
+on:
+  push:
+    branches:
+      - research/github-arm-xfs-cow-indexstat-processes
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  fanout:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Benchmark process-parallel target index seeding
+        run: |
+          set -euo pipefail
+          cat > /tmp/smolrunner-seed-index.py <<'PYSEED'
+          import hashlib, json, os, struct, subprocess, sys, time
+          from pathlib import Path
+
+          start = time.monotonic_ns()
+          worktree = Path(sys.argv[1])
+          proc = subprocess.run(['git','rev-parse','--git-path','index'], cwd=worktree, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+          if proc.returncode or not proc.stdout.strip():
+              print(json.dumps({'returncode':1,'code':'index_path'})); raise SystemExit(1)
+          index_path = Path(proc.stdout.strip())
+          if not index_path.is_absolute(): index_path = (worktree / index_path).resolve()
+          data = bytearray(index_path.read_bytes())
+          if len(data) < 32 or data[:4] != b'DIRC':
+              print(json.dumps({'returncode':1,'code':'header'})); raise SystemExit(1)
+          version, count = struct.unpack('>II', data[4:12])
+          if version != 2:
+              print(json.dumps({'returncode':1,'code':f'version_{version}'})); raise SystemExit(1)
+          def u32(value): return int(value) & 0xffffffff
+          def words(path):
+              st=os.stat(path,follow_symlinks=False); c=st.st_ctime_ns; m=st.st_mtime_ns
+              return (u32(c//1_000_000_000),u32(c%1_000_000_000),u32(m//1_000_000_000),u32(m%1_000_000_000),u32(st.st_dev),u32(st.st_ino),u32(st.st_mode),u32(st.st_uid),u32(st.st_gid),u32(st.st_size))
+          offset=12; patched=0
+          for _ in range(count):
+              entry=offset
+              if entry+62 > len(data)-20:
+                  print(json.dumps({'returncode':1,'code':'truncated'})); raise SystemExit(1)
+              flags=struct.unpack('>H',data[entry+60:entry+62])[0]
+              if flags & 0x4000:
+                  print(json.dumps({'returncode':1,'code':'extended'})); raise SystemExit(1)
+              ns=entry+62; ne=data.find(b'\0',ns,len(data)-20)
+              if ne < 0:
+                  print(json.dumps({'returncode':1,'code':'name'})); raise SystemExit(1)
+              rel=Path(os.fsdecode(bytes(data[ns:ne]))); target=worktree/rel
+              if not target.is_file() or target.is_symlink():
+                  print(json.dumps({'returncode':1,'code':'target','entry':str(rel)[:256]})); raise SystemExit(1)
+              data[entry:entry+40]=struct.pack('>10I',*words(target)); patched+=1
+              raw_len=(ne-entry)+1; offset=entry+((raw_len+7)&~7)
+          checksum=len(data)-20
+          if offset > checksum:
+              print(json.dumps({'returncode':1,'code':'overrun'})); raise SystemExit(1)
+          data[checksum:]=hashlib.sha1(bytes(data[:checksum])).digest()
+          nxt=index_path.with_name(index_path.name+'.smolrunner-next')
+          nxt.write_bytes(data); os.chmod(nxt,index_path.stat().st_mode&0o777); os.replace(nxt,index_path)
+          print(json.dumps({'returncode':0,'entries':count,'patched':patched,'extension_bytes':checksum-offset,'elapsed_ms':round((time.monotonic_ns()-start)/1_000_000,3)}))
+          PYSEED
+
+          python3 - <<'PY'
+          import concurrent.futures, json, os, shutil, subprocess, tempfile, time
+          from pathlib import Path
+          repo=Path(os.environ['GITHUB_WORKSPACE']).resolve(); root=Path(tempfile.mkdtemp(prefix='smolrunner-xfs-procseed-',dir=os.environ['RUNNER_TEMP']))
+          image=root/'xfs.img'; mount=root/'xfs'; mount.mkdir(); result_path=repo/'smolrunner-github-arm-xfs-cow-indexstat-processes.json'; worktrees=[]; mounted=False
+          def command(argv,cwd=None):
+              start=time.monotonic_ns(); p=subprocess.run(argv,cwd=cwd,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=False)
+              return {'returncode':p.returncode,'elapsed_ms':round((time.monotonic_ns()-start)/1_000_000,3),'stdout':p.stdout.strip()[:512],'stderr':p.stderr.strip()[:512]}
+          def phase(items,fn):
+              start=time.monotonic_ns()
+              with concurrent.futures.ThreadPoolExecutor(max_workers=max(1,len(items))) as pool: records=list(pool.map(fn,items))
+              return round((time.monotonic_ns()-start)/1_000_000,3),records
+          def used(path):
+              subprocess.run(['sync','-f',str(path)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=False); time.sleep(.05); s=os.statvfs(path); return (s.f_blocks-s.f_bfree)*s.f_frsize
+          def verify(path):
+              a=command(['git','--no-optional-locks','diff-files','--quiet'],cwd=path); b=command(['git','--no-optional-locks','diff-index','--quiet','HEAD','--'],cwd=path)
+              return {'returncode':0 if a['returncode']==0 and b['returncode']==0 else 1,'diff_files_ms':a['elapsed_ms'],'diff_index_ms':b['elapsed_ms']}
+          def remove(paths):
+              wall,records=phase(paths,lambda p:command(['git','worktree','remove','--force',str(p)],cwd=repo)); subprocess.run(['git','worktree','prune'],cwd=repo,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=False)
+              for p in paths:
+                  if p in worktrees: worktrees.remove(p)
+              return wall,records
+          def tracked(base):
+              p=subprocess.run(['git','ls-files','--stage','-z'],cwd=base,stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=False); out=[]; logical=0
+              if p.returncode: raise RuntimeError('ls-files')
+              for raw in p.stdout.split(b'\0'):
+                  if not raw: continue
+                  head,path=raw.split(b'\t',1); mode,_,_=head.decode().split(' '); rel=Path(os.fsdecode(path)); src=base/rel
+                  if mode in ('100644','100755') and src.is_file() and not src.is_symlink(): out.append(str(rel)); logical+=src.stat().st_size
+              return out,logical
+          def seed_process(path):
+              r=command(['python3','/tmp/smolrunner-seed-index.py',str(path)])
+              if r['stdout']:
+                  try: r['seed']=json.loads(r['stdout'])
+                  except json.JSONDecodeError: pass
+              return r
+          result={'schema_version':1,'counts':{}}
+          try:
+              command(['truncate','-s','2G',str(image)]); 
+              if command(['sudo','mkfs.xfs','-f','-q','-m','reflink=1',str(image)])['returncode']: raise RuntimeError('mkfs')
+              if command(['sudo','mount','-o','loop',str(image),str(mount)])['returncode']: raise RuntimeError('mount')
+              mounted=True; command(['sudo','chown',f'{os.getuid()}:{os.getgid()}',str(mount)])
+              base=mount/'base'; ba=command(['git','worktree','add','--detach',str(base),'HEAD'],cwd=repo); worktrees.append(base); source_proof=verify(base)
+              if ba['returncode'] or source_proof['returncode']: raise RuntimeError('base')
+              paths,logical=tracked(base); result['source']={'regular_entries':len(paths),'logical_bytes':logical,'proof':source_proof}
+              def bulk(target): return command(['cp','-p','--parents','--reflink=always',f'--target-directory={target}','--',*paths],cwd=base)
+              for count in (8,32):
+                  case={}
+                  br=mount/f'baseline-{count}'; br.mkdir(); ps=[br/f'task-{i:02d}' for i in range(count)]; before=used(mount)
+                  mw,mr=phase(ps,lambda p:command(['git','worktree','add','--detach','--no-checkout',str(p),'HEAD'],cwd=repo)); ok=[p for p,r in zip(ps,mr) if r['returncode']==0]; worktrees.extend(ok)
+                  rw,rr=phase(ok,lambda p:command(['git','reset','--hard','HEAD'],cwd=p)); vw,vr=phase(ok,verify); after=used(mount); cw,_=remove(ok); shutil.rmtree(br,ignore_errors=True); used(mount)
+                  case['baseline']={'metadata_wall_ms':mw,'materialize_wall_ms':rw,'verify_wall_ms':vw,'work_wall_ms':round(mw+rw+vw,3),'successes':sum(r['returncode']==0 for r in vr),'used_delta':after-before,'cleanup_wall_ms':cw}
+                  cr=mount/f'cow-{count}'; cr.mkdir(); ps=[cr/f'task-{i:02d}' for i in range(count)]; before=used(mount)
+                  mw,mr=phase(ps,lambda p:command(['git','worktree','add','--detach','--no-checkout',str(p),'HEAD'],cwd=repo)); ok=[p for p,r in zip(ps,mr) if r['returncode']==0]; worktrees.extend(ok)
+                  iw,ir=phase(ok,lambda p:command(['git','read-tree','HEAD'],cwd=p)); pw,pr=phase(ok,bulk); sw,sr=phase(ok,seed_process); vw,vr=phase(ok,verify); after=used(mount); cw,_=remove(ok); shutil.rmtree(cr,ignore_errors=True); used(mount)
+                  case['cow_process_indexstat']={'metadata_wall_ms':mw,'read_tree_wall_ms':iw,'populate_wall_ms':pw,'indexstat_wall_ms':sw,'verify_wall_ms':vw,'work_wall_ms':round(mw+iw+pw+sw+vw,3),'read_tree_successes':sum(r['returncode']==0 for r in ir),'populate_successes':sum(r['returncode']==0 for r in pr),'indexstat_successes':sum(r['returncode']==0 and r.get('seed',{}).get('returncode')==0 for r in sr),'successes':sum(r['returncode']==0 for r in vr),'used_delta':after-before,'cleanup_wall_ms':cw,'seed_records':sr}
+                  result['counts'][str(count)]=case
+              result_path.write_text(json.dumps(result,indent=2,sort_keys=True)+'\n'); print(json.dumps(result,indent=2,sort_keys=True))
+          finally:
+              for wt in list(worktrees): command(['git','worktree','remove','--force',str(wt)],cwd=repo)
+              if mounted: command(['sudo','umount',str(mount)])
+              shutil.rmtree(root,ignore_errors=True)
+          PY
+
+      - name: Persist result
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -C research/results-smolrunner-github-arm-xfs-cow-indexstat-processes
+          git add -- smolrunner-github-arm-xfs-cow-indexstat-processes.json
+          git commit -m 'research: record process-parallel XFS index stat fanout'
+          git push --force origin HEAD:refs/heads/research/results-smolrunner-github-arm-xfs-cow-indexstat-processes
