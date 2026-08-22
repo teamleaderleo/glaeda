@@ -1,0 +1,110 @@
+name: Research GitHub x64 hot probe
+
+on:
+  push:
+    branches:
+      - research/github-x64-hot-probe
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Probe native x64 filesystem and worktree behavior
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, platform, shutil, subprocess, tempfile, time
+          from pathlib import Path
+
+          workspace = Path(os.environ['GITHUB_WORKSPACE']).resolve()
+          temp = Path(os.environ['RUNNER_TEMP']).resolve()
+          root = Path(tempfile.mkdtemp(prefix='smolrunner-gh-x64-', dir=temp))
+          result_path = workspace / 'smolrunner-github-x64-probe.json'
+          worktrees = []
+
+          def run(argv, cwd=None):
+              start = time.monotonic_ns()
+              p = subprocess.run(argv, cwd=cwd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+              return {'argv': argv, 'returncode': p.returncode, 'elapsed_ms': round((time.monotonic_ns()-start)/1_000_000, 3), 'stdout': p.stdout.strip()[:8192], 'stderr': p.stderr.strip()[:8192]}
+
+          def out(argv):
+              r = run(argv)
+              return r['stdout'] if r['returncode'] == 0 else None
+
+          def used(path):
+              s = os.statvfs(path)
+              return (s.f_blocks - s.f_bfree) * s.f_frsize
+
+          try:
+              report = {
+                  'schema_version': 1,
+                  'runner': {'arch': os.environ.get('RUNNER_ARCH'), 'machine': platform.machine(), 'kernel': platform.release(), 'cpu_count': os.cpu_count(), 'lscpu': out(['lscpu'])},
+                  'filesystem': {'workspace': out(['findmnt','-T',str(workspace),'-n','-o','SOURCE,FSTYPE,OPTIONS']), 'runner_temp': out(['findmnt','-T',str(temp),'-n','-o','SOURCE,FSTYPE,OPTIONS'])},
+                  'tools': {'git': out(['git','--version']), 'rustc': out(['rustc','--version']), 'cargo': out(['cargo','--version'])},
+              }
+
+              source = root / 'source.bin'
+              block = os.urandom(1024 * 1024)
+              start = time.monotonic_ns(); source.write_bytes(block * 32)
+              report['source_create_32m_ms'] = round((time.monotonic_ns()-start)/1_000_000, 3)
+
+              before = used(root); reflink = root / 'reflink.bin'; rr = run(['cp','--reflink=always',str(source),str(reflink)]); after = used(root)
+              report['reflink'] = {'copy': rr, 'filesystem_used_delta': after-before}
+              if rr['returncode'] == 0:
+                  before = used(root); start = time.monotonic_ns()
+                  with reflink.open('r+b', buffering=0) as f: f.write(os.urandom(1024*1024)); f.flush()
+                  after = used(root)
+                  report['reflink']['first_1m_write_ms'] = round((time.monotonic_ns()-start)/1_000_000, 3)
+                  report['reflink']['cow_used_delta'] = after-before
+
+              before = used(root); ordinary = root / 'ordinary.bin'; cr = run(['cp','--reflink=never',str(source),str(ordinary)]); after = used(root)
+              report['ordinary_copy'] = {'copy': cr, 'filesystem_used_delta': after-before}
+
+              small = root / 'small-files'; small.mkdir(); payload = b'hot\n' * 64
+              start = time.monotonic_ns()
+              for i in range(10_000): (small / f'f-{i:05d}').write_bytes(payload)
+              report['small_file_create_10k_ms'] = round((time.monotonic_ns()-start)/1_000_000, 3)
+              start = time.monotonic_ns()
+              for entry in small.iterdir(): entry.stat()
+              report['small_file_stat_10k_ms'] = round((time.monotonic_ns()-start)/1_000_000, 3)
+              start = time.monotonic_ns(); shutil.rmtree(small)
+              report['small_file_delete_10k_ms'] = round((time.monotonic_ns()-start)/1_000_000, 3)
+
+              plain = root / 'plain-worktree'; before = used(root); pa = run(['git','worktree','add','--detach',str(plain),'HEAD'], cwd=workspace)
+              if pa['returncode'] == 0: worktrees.append(plain)
+              after = used(root); pr = run(['git','worktree','remove','--force',str(plain)], cwd=workspace) if pa['returncode'] == 0 else None
+              if plain in worktrees: worktrees.remove(plain)
+              report['git_worktree_plain'] = {'add': pa, 'remove': pr, 'filesystem_used_delta_after_add': after-before}
+
+              split = root / 'split-worktree'; before = used(root); sa = run(['git','worktree','add','--detach','--no-checkout',str(split),'HEAD'], cwd=workspace)
+              if sa['returncode'] == 0: worktrees.append(split)
+              after_meta = used(root); mat = run(['git','reset','--hard','HEAD'], cwd=split) if sa['returncode'] == 0 else None; after_mat = used(root)
+              sr = run(['git','worktree','remove','--force',str(split)], cwd=workspace) if sa['returncode'] == 0 else None
+              if split in worktrees: worktrees.remove(split)
+              report['git_worktree_split'] = {'metadata_add': sa, 'materialize': mat, 'remove': sr, 'metadata_filesystem_used_delta': after_meta-before, 'materialization_filesystem_used_delta': after_mat-after_meta}
+
+              result_path.write_text(json.dumps(report, indent=2, sort_keys=True) + '\n')
+              print(json.dumps(report, indent=2, sort_keys=True))
+          finally:
+              for path in list(worktrees): run(['git','worktree','remove','--force',str(path)], cwd=workspace)
+              shutil.rmtree(root, ignore_errors=True)
+          PY
+
+      - name: Persist result
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -C research/results-smolrunner-github-x64
+          git add -- smolrunner-github-x64-probe.json
+          git commit -m 'research: record GitHub-hosted x64 probe'
+          git push --force origin HEAD:refs/heads/research/results-smolrunner-github-x64
