@@ -1,0 +1,122 @@
+name: Research GitHub ARM XFS CoW worktree v4
+
+on:
+  push:
+    branches:
+      - research/github-arm-xfs-cow-worktree-v4
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  prototype:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Benchmark same-HEAD clean-source CoW fast path
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import fcntl, json, os, shutil, stat, subprocess, tempfile, time
+          from pathlib import Path
+
+          FICLONE=0x40049409
+          repo=Path(os.environ['GITHUB_WORKSPACE']).resolve()
+          root=Path(tempfile.mkdtemp(prefix='smolrunner-cow-v4-',dir=os.environ['RUNNER_TEMP']))
+          image=root/'xfs.img'; mnt=root/'xfs'; mnt.mkdir()
+          result_path=repo/'smolrunner-github-arm-xfs-cow-worktree-v4.json'
+          worktrees=[]; mounted=False
+
+          def run(argv,cwd=None):
+              start=time.monotonic_ns(); p=subprocess.run(argv,cwd=cwd,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=False)
+              return {'argv':argv,'returncode':p.returncode,'elapsed_ms':round((time.monotonic_ns()-start)/1_000_000,3),'stdout':p.stdout.strip()[:4096],'stderr':p.stderr.strip()[:4096]}
+
+          def used(path):
+              run(['sync','-f',str(path)]); time.sleep(.05); s=os.statvfs(path); return (s.f_blocks-s.f_bfree)*s.f_frsize
+
+          def remove(path):
+              if path in worktrees: run(['git','worktree','remove','--force',str(path)],cwd=repo); worktrees.remove(path)
+
+          def entries(target):
+              p=subprocess.run(['git','ls-files','--stage','-z'],cwd=target,stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=False)
+              if p.returncode: raise RuntimeError(p.stderr.decode(errors='replace'))
+              out=[]
+              for raw in p.stdout.split(b'\0'):
+                  if not raw: continue
+                  head,path=raw.split(b'\t',1); mode,oid,_=head.decode().split(' '); out.append((mode,oid,Path(os.fsdecode(path))))
+              return out
+
+          def clone_same_head(base,target):
+              cloned=0; logical=0; skipped=[]; start=time.monotonic_ns()
+              for mode,_,rel in entries(target):
+                  src=base/rel
+                  if mode not in ('100644','100755') or not src.exists() or not stat.S_ISREG(os.lstat(src).st_mode): skipped.append(str(rel)); continue
+                  dst=target/rel; dst.parent.mkdir(parents=True,exist_ok=True)
+                  sfd=os.open(src,os.O_RDONLY|os.O_CLOEXEC)
+                  try:
+                      dfd=os.open(dst,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_CLOEXEC,0o755 if mode=='100755' else 0o644)
+                      try: fcntl.ioctl(dfd,FICLONE,sfd); os.fchmod(dfd,0o755 if mode=='100755' else 0o644)
+                      finally: os.close(dfd)
+                  finally: os.close(sfd)
+                  st=os.stat(src); os.utime(dst,ns=(st.st_atime_ns,st.st_mtime_ns)); cloned+=1; logical+=st.st_size
+              return {'elapsed_ms':round((time.monotonic_ns()-start)/1_000_000,3),'cloned_files':cloned,'cloned_logical_bytes':logical,'skipped':skipped}
+
+          result={'schema_version':4}
+          try:
+              run(['truncate','-s','2G',str(image)])
+              if run(['sudo','mkfs.xfs','-f','-q','-m','reflink=1',str(image)])['returncode']: raise RuntimeError('mkfs failed')
+              if run(['sudo','mount','-o','loop',str(image),str(mnt)])['returncode']: raise RuntimeError('mount failed')
+              mounted=True; run(['sudo','chown',f'{os.getuid()}:{os.getgid()}',str(mnt)])
+
+              base=mnt/'base'; base_add=run(['git','worktree','add','--detach',str(base),'HEAD'],cwd=repo); worktrees.append(base)
+              base_status=run(['git','status','--porcelain=v2','--untracked-files=no'],cwd=base)
+              base_diff=run(['git','diff-files','--quiet'],cwd=base)
+              base_head=run(['git','rev-parse','HEAD^{commit}'],cwd=base)
+              base_tree=run(['git','rev-parse','HEAD^{tree}'],cwd=base)
+              result['source']={'add':base_add,'status':base_status,'diff':base_diff,'commit':base_head,'tree':base_tree}
+              if base_status['stdout'] or base_diff['returncode']!=0: raise RuntimeError('source not clean')
+
+              baseline=mnt/'baseline'; before=used(mnt)
+              bm=run(['git','worktree','add','--detach','--no-checkout',str(baseline),'HEAD'],cwd=repo); worktrees.append(baseline)
+              bmat=run(['git','reset','--hard','HEAD'],cwd=baseline)
+              bstatus=run(['git','status','--porcelain=v2','--untracked-files=no'],cwd=baseline)
+              after=used(mnt)
+              result['baseline']={'metadata':bm,'materialize':bmat,'status':bstatus,'total_ms':round(bm['elapsed_ms']+bmat['elapsed_ms']+bstatus['elapsed_ms'],3),'used_delta':after-before}
+              remove(baseline); used(mnt)
+
+              target=mnt/'cow'; before=used(mnt)
+              meta=run(['git','worktree','add','--detach','--no-checkout',str(target),'HEAD'],cwd=repo); worktrees.append(target)
+              read_tree=run(['git','read-tree','HEAD'],cwd=target)
+              populate=clone_same_head(base,target)
+              status=run(['git','status','--porcelain=v2','--untracked-files=no'],cwd=target)
+              diff_files=run(['git','diff-files','--quiet'],cwd=target)
+              diff_index=run(['git','diff-index','--quiet','HEAD','--'],cwd=target)
+              after=used(mnt)
+              result['cow']={
+                  'metadata':meta,'read_tree':read_tree,'populate':populate,
+                  'status':status,'diff_files':diff_files,'diff_index':diff_index,
+                  'total_ms':round(meta['elapsed_ms']+read_tree['elapsed_ms']+populate['elapsed_ms']+status['elapsed_ms'],3),
+                  'used_delta':after-before,
+              }
+              remove(target)
+              result_path.write_text(json.dumps(result,indent=2,sort_keys=True)+'\n'); print(json.dumps(result,indent=2,sort_keys=True))
+          finally:
+              for wt in list(worktrees): run(['git','worktree','remove','--force',str(wt)],cwd=repo)
+              if mounted: run(['sudo','umount',str(mnt)])
+              shutil.rmtree(root,ignore_errors=True)
+          PY
+
+      - name: Persist result
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -C research/results-smolrunner-github-arm-xfs-cow-worktree-v4
+          git add -- smolrunner-github-arm-xfs-cow-worktree-v4.json
+          git commit -m 'research: record XFS CoW worktree v4'
+          git push --force origin HEAD:refs/heads/research/results-smolrunner-github-arm-xfs-cow-worktree-v4
