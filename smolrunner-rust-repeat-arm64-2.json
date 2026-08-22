@@ -1,0 +1,38 @@
+{
+  "arch": "arm64",
+  "cargo": "cargo 1.97.1 (c980f4866 2026-06-30)",
+  "repetition": 2,
+  "runner": {
+    "cpu_count": 4,
+    "kernel": "6.17.0-1022-azure",
+    "machine": "aarch64"
+  },
+  "runs": [
+    {
+      "elapsed_ms": 2384.827,
+      "label": "cold",
+      "returncode": 0,
+      "stderr": ""
+    },
+    {
+      "elapsed_ms": 16.067,
+      "label": "warm_no_edit",
+      "returncode": 0,
+      "stderr": ""
+    },
+    {
+      "elapsed_ms": 802.256,
+      "label": "one_module_edit",
+      "returncode": 0,
+      "stderr": ""
+    },
+    {
+      "elapsed_ms": 764.684,
+      "label": "fifty_module_edit",
+      "returncode": 0,
+      "stderr": ""
+    }
+  ],
+  "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+  "schema_version": 1
+}
