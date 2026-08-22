@@ -1,0 +1,126 @@
+name: Research GitHub ARM XFS CoW worktree v2
+
+on:
+  push:
+    branches:
+      - research/github-arm-xfs-cow-worktree-v2
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  prototype:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Verify CoW worktree without forced reset
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import fcntl, hashlib, json, os, shutil, stat, subprocess, tempfile, time
+          from pathlib import Path
+
+          FICLONE = 0x40049409
+          workspace = Path(os.environ['GITHUB_WORKSPACE']).resolve()
+          root = Path(tempfile.mkdtemp(prefix='smolrunner-cow-wt-v2-', dir=os.environ['RUNNER_TEMP']))
+          image = root / 'xfs.img'; mnt = root / 'xfs'; mnt.mkdir()
+          result_path = workspace / 'smolrunner-github-arm-xfs-cow-worktree-v2.json'
+          worktrees = []; mounted = False
+
+          def run(argv, cwd=None):
+              start=time.monotonic_ns(); p=subprocess.run(argv,cwd=cwd,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=False)
+              return {'argv':argv,'returncode':p.returncode,'elapsed_ms':round((time.monotonic_ns()-start)/1_000_000,3),'stdout':p.stdout.strip()[:4096],'stderr':p.stderr.strip()[:4096]}
+
+          def quiet_used(path):
+              run(['sync','-f',str(path)]); time.sleep(0.05); s=os.statvfs(path); return (s.f_blocks-s.f_bfree)*s.f_frsize
+
+          def remove(path):
+              if path in worktrees:
+                  run(['git','worktree','remove','--force',str(path)],cwd=workspace); worktrees.remove(path)
+
+          def blob_oid(path):
+              size=path.stat().st_size; h=hashlib.sha1(); h.update(f'blob {size}\0'.encode())
+              with path.open('rb') as f:
+                  for chunk in iter(lambda:f.read(1024*1024),b''): h.update(chunk)
+              return h.hexdigest(),size
+
+          def entries(base):
+              p=subprocess.run(['git','ls-files','--stage','-z'],cwd=base,stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=False)
+              if p.returncode: raise RuntimeError(p.stderr.decode(errors='replace'))
+              out=[]
+              for raw in p.stdout.split(b'\0'):
+                  if not raw: continue
+                  head,path=raw.split(b'\t',1); mode,oid,_=head.decode().split(' '); out.append((mode,oid,Path(os.fsdecode(path))))
+              return out
+
+          def populate(base,target):
+              cloned=0; logical=0; skipped=[]; start=time.monotonic_ns()
+              for mode,oid,rel in entries(base):
+                  src=base/rel
+                  if mode not in ('100644','100755') or not src.exists() or not stat.S_ISREG(os.lstat(src).st_mode):
+                      skipped.append(str(rel)); continue
+                  observed,size=blob_oid(src)
+                  if observed!=oid:
+                      skipped.append(str(rel)); continue
+                  dst=target/rel; dst.parent.mkdir(parents=True,exist_ok=True)
+                  sfd=os.open(src,os.O_RDONLY|os.O_CLOEXEC)
+                  try:
+                      dfd=os.open(dst,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_CLOEXEC,0o755 if mode=='100755' else 0o644)
+                      try:
+                          fcntl.ioctl(dfd,FICLONE,sfd); os.fchmod(dfd,0o755 if mode=='100755' else 0o644)
+                      finally: os.close(dfd)
+                  finally: os.close(sfd)
+                  st=os.stat(src); os.utime(dst,ns=(st.st_atime_ns,st.st_mtime_ns)); cloned+=1; logical+=size
+              return {'elapsed_ms':round((time.monotonic_ns()-start)/1_000_000,3),'cloned_files':cloned,'cloned_logical_bytes':logical,'skipped':skipped}
+
+          result={'schema_version':2}
+          try:
+              run(['truncate','-s','2G',str(image)])
+              if run(['sudo','mkfs.xfs','-f','-q','-m','reflink=1',str(image)])['returncode']: raise RuntimeError('mkfs failed')
+              if run(['sudo','mount','-o','loop',str(image),str(mnt)])['returncode']: raise RuntimeError('mount failed')
+              mounted=True; run(['sudo','chown',f'{os.getuid()}:{os.getgid()}',str(mnt)])
+
+              base=mnt/'base'; br=run(['git','worktree','add','--detach',str(base),'HEAD'],cwd=workspace); worktrees.append(base); result['base']=br
+
+              baseline=mnt/'baseline'; before=quiet_used(mnt)
+              bm=run(['git','worktree','add','--detach','--no-checkout',str(baseline),'HEAD'],cwd=workspace); worktrees.append(baseline)
+              bmat=run(['git','reset','--hard','HEAD'],cwd=baseline); after=quiet_used(mnt)
+              result['baseline']={'metadata':bm,'materialize':bmat,'used_delta':after-before}
+              remove(baseline); quiet_used(mnt)
+
+              target=mnt/'cow'; before=quiet_used(mnt)
+              meta=run(['git','worktree','add','--detach','--no-checkout',str(target),'HEAD'],cwd=workspace); worktrees.append(target)
+              after_meta=quiet_used(mnt); pop=populate(base,target); after_pop=quiet_used(mnt)
+              refresh=run(['git','update-index','--refresh'],cwd=target); after_refresh=quiet_used(mnt)
+              status=run(['git','status','--porcelain=v2','--untracked-files=no'],cwd=target)
+              diff_files=run(['git','diff-files','--quiet'],cwd=target)
+              diff_index=run(['git','diff-index','--quiet','HEAD','--'],cwd=target)
+              result['cow']={
+                  'metadata':meta,'metadata_used_delta':after_meta-before,
+                  'populate':pop,'populate_used_delta':after_pop-after_meta,
+                  'refresh':refresh,'refresh_used_delta':after_refresh-after_pop,
+                  'status':status,'diff_files':diff_files,'diff_index':diff_index,
+                  'total_candidate_ms':round(meta['elapsed_ms']+pop['elapsed_ms']+refresh['elapsed_ms'],3),
+              }
+              remove(target)
+              result_path.write_text(json.dumps(result,indent=2,sort_keys=True)+'\n'); print(json.dumps(result,indent=2,sort_keys=True))
+          finally:
+              for wt in list(worktrees): run(['git','worktree','remove','--force',str(wt)],cwd=workspace)
+              if mounted: run(['sudo','umount',str(mnt)])
+              shutil.rmtree(root,ignore_errors=True)
+          PY
+
+      - name: Persist result
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -C research/results-smolrunner-github-arm-xfs-cow-worktree-v2
+          git add -- smolrunner-github-arm-xfs-cow-worktree-v2.json
+          git commit -m 'research: record XFS CoW worktree v2'
+          git push --force origin HEAD:refs/heads/research/results-smolrunner-github-arm-xfs-cow-worktree-v2
