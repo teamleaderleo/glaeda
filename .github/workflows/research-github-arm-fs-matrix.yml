@@ -1,0 +1,277 @@
+name: Research GitHub ARM filesystem matrix
+
+on:
+  push:
+    branches:
+      - research/github-arm-fs-matrix
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  matrix:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Compare local ext4 and XFS loopback filesystems
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import platform
+          import shutil
+          import subprocess
+          import tempfile
+          import time
+          from pathlib import Path
+
+          workspace = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          temp = Path(os.environ["RUNNER_TEMP"]).resolve()
+          root = Path(tempfile.mkdtemp(prefix="smolrunner-fs-matrix-", dir=temp))
+          result_path = workspace / "smolrunner-github-arm-fs-matrix.json"
+          mounted = []
+          worktrees = []
+
+          def run(argv, cwd=None):
+              start = time.monotonic_ns()
+              proc = subprocess.run(argv, cwd=cwd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+              return {
+                  "argv": argv,
+                  "returncode": proc.returncode,
+                  "elapsed_ms": round((time.monotonic_ns() - start) / 1_000_000, 3),
+                  "stdout": proc.stdout.strip()[:8192],
+                  "stderr": proc.stderr.strip()[:8192],
+              }
+
+          def text(argv, cwd=None):
+              record = run(argv, cwd=cwd)
+              return record["stdout"] if record["returncode"] == 0 else None
+
+          def used_bytes(path):
+              stat = os.statvfs(path)
+              return (stat.f_blocks - stat.f_bfree) * stat.f_frsize
+
+          def rm_tree(path):
+              if path.exists():
+                  shutil.rmtree(path)
+
+          def remove_worktree(path):
+              if path in worktrees:
+                  run(["git", "worktree", "remove", "--force", str(path)], cwd=workspace)
+                  worktrees.remove(path)
+
+          def bench_volume(name, mountpoint):
+              report = {
+                  "name": name,
+                  "findmnt": text(["findmnt", "-T", str(mountpoint), "-n", "-o", "SOURCE,FSTYPE,OPTIONS"]),
+                  "xfs_info": text(["xfs_info", str(mountpoint)]) if shutil.which("xfs_info") else None,
+              }
+
+              # One large-file clone makes the CoW capability explicit.
+              source = mountpoint / "source-64m.bin"
+              block = os.urandom(1024 * 1024)
+              start = time.monotonic_ns()
+              source.write_bytes(block * 64)
+              report["source_create_64m_ms"] = round((time.monotonic_ns() - start) / 1_000_000, 3)
+
+              before = used_bytes(mountpoint)
+              reflink = mountpoint / "reflink-64m.bin"
+              clone = run(["cp", "--reflink=always", str(source), str(reflink)])
+              after = used_bytes(mountpoint)
+              report["reflink_64m"] = {
+                  "copy": clone,
+                  "used_delta": after - before,
+              }
+              if clone["returncode"] == 0:
+                  before_cow = used_bytes(mountpoint)
+                  start = time.monotonic_ns()
+                  with reflink.open("r+b", buffering=0) as handle:
+                      handle.write(os.urandom(1024 * 1024))
+                      handle.flush()
+                  after_cow = used_bytes(mountpoint)
+                  report["reflink_64m"]["first_1m_write_ms"] = round((time.monotonic_ns() - start) / 1_000_000, 3)
+                  report["reflink_64m"]["cow_used_delta"] = after_cow - before_cow
+                  if shutil.which("filefrag"):
+                      report["reflink_64m"]["source_filefrag"] = text(["filefrag", "-v", str(source)])
+                      report["reflink_64m"]["clone_filefrag"] = text(["filefrag", "-v", str(reflink)])
+
+              ordinary = mountpoint / "copy-64m.bin"
+              before = used_bytes(mountpoint)
+              copy = run(["cp", "--reflink=never", str(source), str(ordinary)])
+              after = used_bytes(mountpoint)
+              report["ordinary_copy_64m"] = {
+                  "copy": copy,
+                  "used_delta": after - before,
+              }
+
+              # Metadata-heavy workload.
+              small = mountpoint / "small-files"
+              small.mkdir()
+              payload = b"smolrunner-hot\n" * 16
+              start = time.monotonic_ns()
+              for index in range(10_000):
+                  (small / f"f-{index:05d}").write_bytes(payload)
+              report["small_file_create_10k_ms"] = round((time.monotonic_ns() - start) / 1_000_000, 3)
+              start = time.monotonic_ns()
+              for entry in small.iterdir():
+                  entry.stat()
+              report["small_file_stat_10k_ms"] = round((time.monotonic_ns() - start) / 1_000_000, 3)
+              start = time.monotonic_ns()
+              shutil.rmtree(small)
+              report["small_file_delete_10k_ms"] = round((time.monotonic_ns() - start) / 1_000_000, 3)
+
+              # Materialize one resident base worktree on this exact filesystem.
+              base = mountpoint / "base-worktree"
+              base_add = run(["git", "worktree", "add", "--detach", str(base), "HEAD"], cwd=workspace)
+              if base_add["returncode"] == 0:
+                  worktrees.append(base)
+              report["base_worktree_add"] = base_add
+
+              # Ordinary Git worktree baseline.
+              plain = mountpoint / "plain-worktree"
+              before = used_bytes(mountpoint)
+              plain_add = run(["git", "worktree", "add", "--detach", str(plain), "HEAD"], cwd=workspace)
+              if plain_add["returncode"] == 0:
+                  worktrees.append(plain)
+              after = used_bytes(mountpoint)
+              plain_remove = run(["git", "worktree", "remove", "--force", str(plain)], cwd=workspace) if plain_add["returncode"] == 0 else None
+              if plain in worktrees:
+                  worktrees.remove(plain)
+              report["git_worktree_plain"] = {
+                  "add": plain_add,
+                  "remove": plain_remove,
+                  "used_delta": after - before,
+              }
+
+              # Split Git metadata from file materialization.
+              split = mountpoint / "split-worktree"
+              before = used_bytes(mountpoint)
+              metadata = run(["git", "worktree", "add", "--detach", "--no-checkout", str(split), "HEAD"], cwd=workspace)
+              if metadata["returncode"] == 0:
+                  worktrees.append(split)
+              after_metadata = used_bytes(mountpoint)
+              materialize = run(["git", "reset", "--hard", "HEAD"], cwd=split) if metadata["returncode"] == 0 else None
+              after_materialize = used_bytes(mountpoint)
+              split_remove = run(["git", "worktree", "remove", "--force", str(split)], cwd=workspace) if metadata["returncode"] == 0 else None
+              if split in worktrees:
+                  worktrees.remove(split)
+              report["git_worktree_split"] = {
+                  "metadata_add": metadata,
+                  "materialize": materialize,
+                  "remove": split_remove,
+                  "metadata_used_delta": after_metadata - before,
+                  "materialization_used_delta": after_materialize - after_metadata,
+              }
+
+              # Upper-bound opportunity: clone the already-materialized resident tree directly.
+              if base_add["returncode"] == 0:
+                  cow_tree = mountpoint / "cow-tree"
+                  cow_tree.mkdir()
+                  before = used_bytes(mountpoint)
+                  cow_copy = run(["cp", "-a", "--reflink=always", str(base) + "/.", str(cow_tree) + "/"])
+                  after = used_bytes(mountpoint)
+                  report["resident_tree_reflink_copy"] = {
+                      "copy": cow_copy,
+                      "used_delta": after - before,
+                  }
+                  rm_tree(cow_tree)
+
+                  normal_tree = mountpoint / "normal-tree"
+                  normal_tree.mkdir()
+                  before = used_bytes(mountpoint)
+                  normal_copy = run(["cp", "-a", "--reflink=never", str(base) + "/.", str(normal_tree) + "/"])
+                  after = used_bytes(mountpoint)
+                  report["resident_tree_ordinary_copy"] = {
+                      "copy": normal_copy,
+                      "used_delta": after - before,
+                  }
+                  rm_tree(normal_tree)
+
+              remove_worktree(base)
+              return report
+
+          result = {
+              "schema_version": 1,
+              "runner": {
+                  "arch": os.environ.get("RUNNER_ARCH"),
+                  "machine": platform.machine(),
+                  "kernel": platform.release(),
+                  "cpu_count": os.cpu_count(),
+              },
+              "tools": {
+                  "mkfs_ext4": shutil.which("mkfs.ext4"),
+                  "mkfs_xfs": shutil.which("mkfs.xfs"),
+                  "xfs_info": shutil.which("xfs_info"),
+                  "filefrag": shutil.which("filefrag"),
+                  "sudo": shutil.which("sudo"),
+              },
+              "volumes": {},
+          }
+
+          try:
+              sudo = run(["sudo", "-n", "true"])
+              result["sudo_check"] = sudo
+              if sudo["returncode"] != 0:
+                  raise RuntimeError("passwordless sudo unavailable")
+
+              candidates = [
+                  ("ext4", ["sudo", "mkfs.ext4", "-F", "-q"]),
+                  ("xfs", ["sudo", "mkfs.xfs", "-f", "-q", "-m", "reflink=1"]),
+              ]
+              for name, mkfs in candidates:
+                  tool = shutil.which(mkfs[1])
+                  if tool is None:
+                      result["volumes"][name] = {"available": False, "reason": f"{mkfs[1]} unavailable"}
+                      continue
+
+                  image = root / f"{name}.img"
+                  mountpoint = root / f"mnt-{name}"
+                  mountpoint.mkdir()
+                  truncate = run(["truncate", "-s", "2G", str(image)])
+                  if truncate["returncode"] != 0:
+                      result["volumes"][name] = {"available": False, "truncate": truncate}
+                      continue
+                  formatted = run(mkfs + [str(image)])
+                  if formatted["returncode"] != 0:
+                      result["volumes"][name] = {"available": False, "format": formatted}
+                      continue
+                  mounted_result = run(["sudo", "mount", "-o", "loop", str(image), str(mountpoint)])
+                  if mounted_result["returncode"] != 0:
+                      result["volumes"][name] = {"available": False, "format": formatted, "mount": mounted_result}
+                      continue
+                  mounted.append(mountpoint)
+                  run(["sudo", "chown", f"{os.getuid()}:{os.getgid()}", str(mountpoint)])
+                  report = bench_volume(name, mountpoint)
+                  report["available"] = True
+                  report["format"] = formatted
+                  report["mount"] = mounted_result
+                  result["volumes"][name] = report
+                  run(["sudo", "umount", str(mountpoint)])
+                  mounted.remove(mountpoint)
+
+              result_path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+              print(json.dumps(result, indent=2, sort_keys=True))
+          finally:
+              for path in list(worktrees):
+                  run(["git", "worktree", "remove", "--force", str(path)], cwd=workspace)
+              for mountpoint in reversed(mounted):
+                  run(["sudo", "umount", str(mountpoint)])
+              shutil.rmtree(root, ignore_errors=True)
+          PY
+
+      - name: Persist matrix result
+        run: |
+          set -euo pipefail
+          test -f smolrunner-github-arm-fs-matrix.json
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -C research/results-smolrunner-github-arm-fs-matrix
+          git add -- smolrunner-github-arm-fs-matrix.json
+          git commit -m 'research: record hosted ARM filesystem matrix'
+          git push --force origin HEAD:refs/heads/research/results-smolrunner-github-arm-fs-matrix
