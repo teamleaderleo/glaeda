@@ -1,147 +1,257 @@
 # SmolRunner
 
-**Disposable GitHub Actions capacity on the Mac you already own.**
+**Blazingly hot Linux execution for coding agents and GitHub Actions on the Mac you already own.**
 
-SmolRunner, pronounced “small runner,” automatically provisions isolated, one-job GitHub Actions workers on an operator-owned Mac and scales them back to zero. It is aimed at developers who want their own repositories and known open-source projects to use local compute without babysitting runners or exposing the host to potentially hostile CI code.
+SmolRunner turns operator-owned Apple-silicon compute into a trust-tiered Linux execution layer. It keeps GitHub as the ordinary workflow surface, uses Lima/VZ for Linux execution, persists the minimum durable truth required for recovery, and chooses worker residency from trust and measured value.
 
-> [!IMPORTANT]
-> SmolRunner is pre-alpha, but the disposable path is already in repeated physical acceptance on Apple silicon. The repository has exercised prepared Lima/VZ worker lifecycle, the official GitHub Runner Scale Set bridge, durable assignment/clone/JIT/teardown composition, LaunchAgent supervision, controller-death recovery, and repeated Quarry pilot runs. Current work is closing integration and recovery failures exposed by those runs before treating the full installed-service one-job path as dependable. See [Disposable autoscaling CI](docs/DISPOSABLE_AUTOSCALING_CI.md) and the live programme issue for the current critical path.
+> **Disposable is a capability, not a mandate. Trust decides residency.**
 
-## The problem
+For hostile or unknown repository work, SmolRunner targets one fresh isolated worker, one bounded job, exact teardown, and proven absence. For trusted CI, it can reuse prepared workers, repository seeds, reviewed cache generations, and warm pools. For ultra-trusted agent work, it can keep project sandboxes, worktrees, compiler state, package state, indexes, and selected services resident across edit/test/build loops.
 
-GitHub Actions is easy to use until local capacity becomes another system to operate:
+The target experience is simple:
 
-- queued jobs need capacity without ten idle VMs consuming RAM;
-- persistent runners retain compromise and state across jobs;
-- repository code must not inherit host credentials, files, sockets, or LAN access;
-- failed provisioning, crashes, stale registrations, and orphan workers need automatic recovery;
-- agents and humans need a trustworthy answer to “what is running, blocked, or being cleaned up?”;
-- normal clones, dependency downloads, builds, tests, and nested containers still need to work.
+```text
+agent work appears
+-> SmolRunner selects the hottest valid execution path
+-> Linux environment is ready
+-> repo / dependencies / build state are already warm where trust permits
+-> useful command starts
+-> useful result returns
+-> state is retained, reset, or destroyed according to trust + validity + value
+```
 
-SmolRunner keeps GitHub as the workflow scheduler, status UI, and primary job log store. It focuses on bounded admission, disposable Lima/VZ workers, the official JIT runner lifecycle, hostile-CI network policy, automatic teardown, and recovery.
+## Status
 
-## Why not just call Lima?
+SmolRunner is pre-alpha and in live systems acceptance on Apple silicon.
 
-You can create a Linux VM on a Mac with a few Lima commands. SmolRunner starts where those commands stop.
+The strict disposable path already includes a substantial durable controller: prepared Lima/VZ generations, official GitHub Runner Scale Set integration, Keychain credential acquisition, durable assignment and no-replay handling, clone/JIT/teardown composition, LaunchAgent supervision, controller-death evidence, exact worker ownership, and repeated physical Quarry pilots.
 
-A direct Lima workflow can create, start, stop, clone, and delete virtual machines. SmolRunner adds the durable controller around those operations so GitHub jobs can safely consume local Mac compute without a human remembering which VM belongs to which job, whether a previous operation completed, which resources are still reserved, or what should happen after a crash.
+Recent work has also established the first trusted persistent runner lane, warm pause/resume, auto-idle behavior, and the new top-level product direction: **make SmolRunner blazingly hot**.
 
-| Problem | Handwritten Lima commands | SmolRunner |
+The immediate production work remains:
+
+- finish the installed-service one-job disposable journey;
+- close restart-safe ownership for in-flight Lima mutations;
+- extend sleep/reboot/outage/teardown recovery;
+- prove and implement the hostile-worker network boundary.
+
+Hot trusted execution progresses in parallel where it preserves those guarantees. See the [roadmap](docs/ROADMAP.md), [#557](https://github.com/teamleaderleo/smolrunner/issues/557), and the strict disposable programme [#365](https://github.com/teamleaderleo/smolrunner/issues/365).
+
+## What SmolRunner is optimizing
+
+The headline metric is **agent wall-clock latency**.
+
+Measure the whole path:
+
+```text
+work becomes known
+-> target / resident sandbox selected
+-> capacity admitted
+-> environment ready
+-> repo/revision usable
+-> dependency/build state usable
+-> first useful command
+-> first useful test/build result
+-> final trustworthy result
+-> teardown or residency transition
+```
+
+Useful product metrics include:
+
+- queue-to-first-useful-command;
+- edit-to-first-test-result;
+- edit-to-final-relevant-verification;
+- task completion wall time;
+- fleet throughput under concurrent agents;
+- disk/RAM/CPU residency cost;
+- hot-state hit/miss/reset behavior.
+
+## Trust-tiered execution
+
+### Hostile / unknown
+
+```text
+fresh prepared Linux worker
+-> one bounded job
+-> terminal result
+-> runner removal
+-> VM teardown
+-> prove absence
+```
+
+This lane carries the strongest isolation and cleanup contract. Job-specific writable state dies with the worker. Reusable inputs come from separately reviewed immutable/read-only generations where policy permits.
+
+### Trusted CI
+
+```text
+job arrives
+-> prepared worker / warm pool
+-> exact repo seed or already-present Git objects
+-> eligible dependency/compiler/artifact generations
+-> execute
+-> destroy or retire according to policy
+```
+
+The job can remain disposable while expensive preparation stays hot around it.
+
+### Ultra-trusted agent/project work
+
+```text
+resident project sandbox
+-> revalidate project/source/toolchain lease
+-> edit
+-> test
+-> inspect
+-> build
+-> test
+-> keep valuable incremental state resident
+```
+
+Useful resident state may include:
+
+- project checkout and task-local worktrees;
+- Rust incremental build trees and `sccache` state;
+- npm/pnpm/Bun package state;
+- Python environments;
+- Maven/Gradle state;
+- language-server and code-search indexes;
+- container/build caches;
+- test daemons/watchers and selected development services.
+
+Resident state remains working state. Durable execution truth, source identity, trust class, project lease, toolchain generation, credential/network capability generation, and reset policy remain authoritative.
+
+## Why Linux on a Mac?
+
+Agentic development creates intense filesystem churn: Git worktrees, package stores, `node_modules`, compiler trees, indexes, test outputs, caches, and large cleanup operations.
+
+SmolRunner keeps those repository filesystem operations inside Linux. macOS remains the trusted control plane while the guest handles the small-file-heavy developer workload using Linux filesystem semantics.
+
+The current prepared worker uses:
+
+- Apple Virtualization Framework through Lima/VZ;
+- ARM64 Ubuntu;
+- Lima plain mode;
+- no host mounts;
+- no SSH-agent/X11 forwarding;
+- no proxy-environment inheritance;
+- no Rosetta;
+- a separate workload account;
+- exact pinned runner/template identities.
+
+M6 makes the Linux storage layer itself a benchmark target: XFS/reflink and other credible Linux storage choices, project volumes, cheap task-local forks, package-manager behavior, compiler-tree reuse, and host backing-file growth.
+
+## Why SmolRunner instead of a few Lima commands?
+
+Lima supplies excellent VM primitives. SmolRunner supplies the durable execution runtime around them.
+
+| Capability | Direct Lima | SmolRunner |
 |---|---|---|
-| Boot a Linux VM | ✅ | ✅ |
-| Clone a prepared VM | ✅ | ✅ Physical path exercised |
-| Pin the exact guest image | You manage it | ✅ Current |
-| Pin the exact Actions runner | You manage it | ✅ Current |
-| Bind one VM to one durable attempt | Manual convention | ✅ Current |
-| Reserve CPU/RAM/disk before creation | Manual | ✅ Current |
-| Prevent two attempts from claiming the same capacity | Manual | ✅ Current |
-| Recover after the controller/process crashes | Human recovery | ✅ Current, with physical SIGKILL evidence |
-| Distinguish an interrupted clone from a valid worker | Human investigation | ✅ Current |
-| Prove a VM belongs to the exact attempt before deletion | Usually name-based | ✅ Current model |
-| Refuse stale observations before mutation | Manual discipline | ✅ Current |
-| Preserve ambiguous clone outcomes for recovery | Human investigation | ✅ Current |
-| Recover exactly owned orphan workers after reboot | Script/manual cleanup | Active M5 recovery work |
-| Poll GitHub Scale Sets through the official client | DIY integration | ✅ Current |
-| Read the controller GitHub App key from macOS Keychain | DIY | ✅ Current |
-| Execute one job in one fresh worker | Manual | Physical installed-service acceptance active |
-| Bind the actual GitHub job to the exact runner and VM | Manual | ✅ Composed; physical acceptance active |
-| Automatically create workers from GitHub demand | DIY controller | ✅ Composed; physical acceptance active |
-| Keep long-lived controller credentials outside workers | DIY | ✅ Current control-plane boundary |
-| Block worker access to the Mac, LAN, controller, and peers | DIY network policy | M4 physical network-policy work |
-| Run container actions inside the disposable guest | DIY | M4 |
-| Scale back to zero while idle | DIY controller | ✅ Recovery/cancellation convergence exercised; full one-job acceptance active |
-| Recover from sleep, reboot, GitHub outage, or failed teardown | DIY controller | M5 physical recovery matrix |
-| Preserve safe hot inputs while destroying job-specific state | DIY cache policy | M6 |
-| Let multiple agents treat the Mac like a private build farm | DIY system | M7 |
+| Create/start/stop/delete Linux VMs | ✅ | ✅ |
+| Clone a prepared VM | ✅ | ✅ |
+| Pin exact guest + runner inputs | Manual | ✅ |
+| Bind one VM to one durable execution identity | Manual | ✅ |
+| Reserve CPU/RAM/disk before admission | Manual | ✅ |
+| Recover across controller death | Human work | ✅ durable recovery model |
+| Preserve ambiguous mutation outcomes without replay | Human work | ✅ |
+| Poll GitHub Runner Scale Sets | DIY | ✅ official client bridge |
+| Keep controller GitHub credentials in Keychain | DIY | ✅ |
+| JIT one ephemeral GitHub runner | DIY | ✅ composed |
+| Exact runner/VM teardown and capacity release | DIY | ✅ composed |
+| LaunchAgent supervision | DIY | ✅ |
+| Hostile-CI network policy | DIY | Active M4 work |
+| Persistent trusted project residency | DIY | Active hot-execution programme |
+| Adaptive cache/verification/routing decisions | DIY | Planned #21/#546/#547 |
+| Agent-readable diagnosis and recovery hints | DIY | Planned #548 |
 
-The difference becomes clearest during failure. A manual sequence might look like:
+The distinction becomes clearest around crashes and ambiguity. SmolRunner persists exact authority before external mutations, freshly observes external state during recovery, and preserves debt when ownership or completion remains ambiguous.
 
-```text
-limactl clone --start template worker-123
-→ process dies
-→ a VM named worker-123 exists
-→ figure out what happened
-```
+## Hot execution programme
 
-SmolRunner is designed around a durable sequence:
+The roadmap now treats hot execution as a primary programme.
+
+### Hot environments
+
+Compare:
 
 ```text
-reserve bounded capacity
-→ bind attempt + prepared-template + VM identity
-→ prove the VM is absent
-→ durably authorize creation
-→ re-observe immediately before mutation
-→ execute one bounded Lima operation under the durable lock
-→ observe what actually exists
-→ durably checkpoint or preserve ambiguous recovery debt
-→ resume safely after interruption
+cold disposable
+prepared disposable
+warm-pool disposable
+resident project after idle
+resident project immediate reuse
+resident task loop
 ```
 
-The `limactl` invocation is the VM primitive. SmolRunner owns the lifecycle, ownership, admission, recovery, GitHub integration, hostile-job policy, and unattended operation around it.
+### Hot repository state
 
-### Where the disposable path is today
+Explore local Git object seeds, resident trusted checkouts, cheap task-local worktrees, read-only shared bases, and repository hydration overlapped with admission.
 
-Milestone 1, durable disposable-attempt reconciliation, is complete. The prepared-worker path has moved through physical Apple-silicon acceptance for exact template create/provision/ready/stop/delete, bounded runner download and disk admission, create-failure cleanup, and controller-SIGKILL behavior. Live clone/JIT acceptance has also exposed and driven repairs for real macOS/Lima and GitHub assignment behavior rather than synthetic-only assumptions.
+### Hot Linux storage
 
-The GitHub-native lifecycle is composed behind `worker serve`: the repository pins the official Runner Scale Set client behind a bounded bridge, reads the GitHub App key from Keychain, durably consumes assignment state, reserves capacity, drives clone/JIT handoff, binds runner/VM/job identity, tears terminal state down, and runs under LaunchAgent supervision. Repeated Quarry pilots have reached progressively deeper checkpoints and surfaced concrete failures including Scale Set assignment-lease timing, Lima socket-path limits, service-child lifetime, cancellation/reassignment recovery, and restart-safe ownership of in-flight mutations.
+Benchmark real agent workloads across credible Linux filesystem/storage choices:
 
-The first controller-death physical proof is complete and retained as production recovery evidence. The current critical path is therefore post-composition reliability: finish the clean installed-service one-job lifecycle, close restart/replay ambiguity, extend physical recovery across cancellation/sleep/reboot/outage/teardown cases, and then enforce the hostile-CI network boundary before arbitrary repository code is treated as a production workload.
+- Git worktree add/remove;
+- pnpm/npm/Bun install from warm state;
+- hardlink/reflink behavior;
+- Cargo incremental builds;
+- Maven/Gradle trees;
+- large small-file creation/deletion;
+- compiler/index state reuse;
+- many concurrent agent task forks;
+- guest logical bytes versus Mac-side Lima disk growth.
 
-The intended user-visible loop stays simple:
+The product question is simple: **which storage path gives the quickest repeated agent loop at an acceptable CPU/disk cost?**
 
-```text
-GitHub job appears
-→ SmolRunner reserves Mac capacity
-→ fresh Linux worker appears
-→ one official GitHub Actions runner executes one job
-→ worker is destroyed
-→ capacity returns to zero
-```
+### Hot build and dependency state
 
-The operator should care about the GitHub job, not the VM lifecycle underneath it. See the [roadmap](docs/ROADMAP.md) and the current disposable-autoscaling programme for the live acceptance sequence.
+Treat package state, compiler caches, build outputs, container layers, prepared dependency environments, indexes, and derived verification artifacts as typed state with explicit validity and utility accounting.
+
+### Hot services
+
+For ultra-trusted projects, keep expensive dev services resident when their lifecycle is explicit: language servers, test watchers, compiler servers, local fixtures, builders, and repository-specific daemons.
+
+## Durable execution truth
+
+SmolRunner persists the minimum facts required to decide the next safe action after restart. Physical execution state stays replaceable.
+
+Useful durable facts include:
+
+- job / attempt / execution identity;
+- capacity and ownership generations;
+- exact mutation intent and restart-safe execution ownership;
+- template/toolchain/input generation identities;
+- GitHub delivery/acquisition/runner identities;
+- VM/sandbox/project-lease bindings needed for reconciliation;
+- terminal outcome and teardown receipts;
+- explicit recovery debt.
+
+VMs, workspaces, caches, indexes, compiler trees, and resident services can be destroyed and reconstructed from canonical inputs. That destroyability is what makes aggressive trusted residency safe.
 
 ## Current commands
 
-Inspect whether the current machine has the basic SmolRunner prerequisites:
+Read-only machine/project inspection:
 
 ```bash
 cargo run --locked -- doctor
 cargo run --locked -- --output json doctor
-cargo run --locked -- doctor --strict
-```
-
-Validate a project manifest and print its deterministic desired-state plan:
-
-```bash
 cargo run --locked -- plan --file examples/quarry.yml
 cargo run --locked -- --output json plan --file examples/glossless.yml
-```
-
-Compare the manifest with bounded observations from the current Linux host:
-
-```bash
 cargo run --locked -- host plan --file examples/quarry.yml
-cargo run --locked -- --output json host plan --file examples/glossless.yml
 ```
 
-On Linux, first build SmolRunner as an unprivileged user. Then elevate only the built binary to propose one host-preparation phase and require its exact deterministic confirmation before mutation:
+For the legacy Linux host-preparation lane, build unprivileged and elevate only the reviewed binary:
 
 ```bash
 cargo build --locked
 sudo ./target/debug/smolrunner host prepare --file examples/quarry.yml
 sudo ./target/debug/smolrunner host prepare --file examples/quarry.yml --confirm EXACT_CONFIRMATION
-sudo ./target/debug/smolrunner --output json host prepare --file examples/quarry.yml --confirm EXACT_CONFIRMATION
 ```
 
-The first elevated command re-observes the host, prints the reviewed proposal and confirmation requirement, and performs no mutation. The confirmed command re-observes and replans in the same elevated process, executes only the matching single phase, checkpoints the journal before and after each action, and stops at any fresh-observation barrier. Initial host mutations are deliberately treated as irreversible; there is no generic `apply`, multi-phase continuation, automatic retry, or unattended repair path.
-
-Do not run Cargo with `sudo`: Cargo may execute build scripts, procedural macros, compiler wrappers, and other build-time code before SmolRunner's own controls start. Only the reviewed, already-built SmolRunner binary should receive elevated privileges.
-
-`doctor` probes Linux support, architecture, systemd, cgroup v2, Podman, and Git. `plan` validates the versioned manifest and describes the runner user, registration, container image, and disposable verification boundary SmolRunner would eventually reconcile. `host plan` additionally reads bounded host state and distinguishes proven absence from facts that still need a privileged or authenticated inspection path. These three commands are read-only. `host prepare` is the narrow mutating exception and requires explicit elevation plus an exact confirmation derived from the immediately preceding public proposal. Human and JSON output come from the same typed reports.
+Cargo can execute build-time code. Give elevation to the already-built reviewed SmolRunner binary.
 
 ## Manifest boundary
 
-A SmolRunner manifest describes host and execution policy, not build steps:
+A SmolRunner manifest describes host and execution policy while repositories continue to own build/test semantics and GitHub workflow YAML.
 
 ```yaml
 version: 1
@@ -172,79 +282,20 @@ trust:
   trigger: operator
 ```
 
-Individual repositories continue to own their Containerfiles, dependency installation, test commands, and GitHub workflow YAML. SmolRunner will not introduce another pipeline language. Unknown fields and future schema versions fail closed.
-
-See the [manifest reference](docs/MANIFEST.md) and the redacted [Quarry](examples/quarry.yml) and [Glossless](examples/glossless.yml) fixtures.
-
-## Reconciliation boundary
-
-SmolRunner models desired state, current state, proposed actions, execution, and ownership separately. Current observations are reported as `present`, `absent`, or `unknown`; unknown facts produce inspection actions rather than speculative mutations.
-
-The process layer is shell-free, clears ambient environment variables, requires absolute program paths, captures structured results, and redacts explicitly marked secret values. The public mutation path consumes only reviewed typed root or runner-user commands from one confirmed host-preparation phase. It does not accept free-form commands or continue through a fresh-observation barrier. See [host reconciliation](docs/HOST_RECONCILIATION.md).
-
-The execution-journal model assigns every future mutation an immutable ID, execution lane, rollback class, and precondition evidence. Invalid plans never reach an executor, unconfirmed irreversible work blocks the whole batch before its first mutation, and partial failures retain reverse-order rollback, compensation, and rollback-failure outcomes. The accepted architecture is recorded in [ADR 0001](docs/adr/0001-privilege-adoption-and-rollback.md).
-
-The ownership model protects existing infrastructure from name-based adoption. A resource is managed only when its versioned marker, project identity, host installation identity, locator, and required immutable evidence all match. An exact unmarked match is merely adoptable and still requires explicit confirmation; foreign, conflicting, and unknown state remains protected. Durable installation, lease, and execution-journal state is stored beneath the reviewed Linux state root at `/var/lib/smolrunner` through symlink-safe, permission-checked, atomic adapters. See [ADR 0002](docs/adr/0002-durable-ownership-state.md).
-
-Canonical constructors now define exact locators and minimum evidence for Linux users, managed directories, systemd services, official runner installations, rootless Podman images, and GitHub runner registrations. Desired identities cannot be created from names, mutable image tags, or labels alone; partial observations may omit evidence only so ownership classification can return `unknown`. The model also records which execution lane must collect each observation and which evidence survives host restore, repository transfer, or runner re-registration. See [ADR 0003](docs/adr/0003-canonical-resource-evidence.md).
-
-The long-term [reliable control-loop operating model](docs/OPERATING_MODEL.md) keeps the external interface small while separating development, canary, and stable releases; defining drain and rollback; bounding incident evidence; preserving backup and recovery; and requiring host-local vetoes, repair budgets, fresh verification, and circuit breakers before any self-healing or fleet-directed mutation.
-
-## Historical and optional expansion
-
-The Linux runner-steward, rootless-Podman, leased-workspace, and preview work remains useful foundation and optional future scope. It is not the first production path.
-
-The current policy keeps verification separate from deployment and puts a disposable Lima/VZ VM before host containers. Preview or deployment authority remains explicit and later.
-
-The first implementation slice is a platform-independent, revisioned lease lifecycle for runs, retained workspaces, and previews. It plans legal state transitions without persistence or host mutation. See [ADR 0004](docs/adr/0004-lease-lifecycle-core.md).
-
-The next slice adds fail-closed lease documents, an atomic no-replace and compare-and-swap storage contract, stale-revision rejection, and immutable artifact identities. The included memory store proves concurrency semantics for tests. See [ADR 0005](docs/adr/0005-lease-store-and-artifact-identity.md).
-
-Preview-slot planning now coalesces repeated requests for the same artifact, port, and health endpoint into one runtime generation with a renewed lease. Changed runtime inputs produce one checked replacement generation. Bounded typed ports, lifetimes, health paths, and generation counters prevent callers from forging invalid plans. See [ADR 0006](docs/adr/0006-preview-slot-coalescing.md).
-
-The local Podman command-planning slice binds an OCI artifact to bounded runtime limits, loopback-only publication, fixed ownership labels, and reviewed shell-free create/start/inspect/stop/remove vectors. It remains inert until a later executor proves ownership and authorizes each mutation. See [ADR 0007](docs/adr/0007-rootless-podman-preview-command-planning.md).
-
-Podman inspection now decodes one bounded JSON result, classifies exact container ownership, and authorizes existing-container mutations only when the name, image digest, and every required label match the planned preview generation. Authorized commands target the observed full container ID. See [ADR 0008](docs/adr/0008-podman-preview-inspection-authorization.md).
-
-Subprocess execution now captures stdout and stderr concurrently with a one-megabyte limit per stream. Excess output terminates the direct child and fails without producing a successful execution record. See [ADR 0009](docs/adr/0009-bounded-subprocess-output.md).
-
-Podman inspect evidence now binds to the exact reviewed command and successful execution record before decoding. The public mutation gate accepts only that typed receipt, while stderr remains diagnostic and carries no authority. See [ADR 0010](docs/adr/0010-podman-inspect-execution-receipts.md).
-
-Existing-container mutations now require a compatible observed Podman state in addition to exact ownership. Start is limited to inactive startable states, stop to running, and unforced remove to inactive removable states; missing, paused, transitional, dead, and unknown states fail closed. See [ADR 0011](docs/adr/0011-podman-state-aware-mutation-authorization.md).
-
-State reconciliation now distinguishes executable work, an already satisfied goal, and a blocked state before authorization. Running start requests and inactive stop requests become explicit no-ops, while blocked states still cannot produce a subprocess command. See [ADR 0012](docs/adr/0012-podman-state-reconciliation-plans.md).
-
-Lease records now have a process-durable Linux adapter beneath each installation. It validates filesystem ownership and permissions, serializes writers with a persistent lock, and publishes private versioned documents through synchronized atomic rename. See [ADR 0013](docs/adr/0013-durable-linux-lease-store.md).
-
-See [leased execution and previews](docs/LEASED_EXECUTION.md), the [reliable control-loop operating model](docs/OPERATING_MODEL.md), and the updated [roadmap](docs/ROADMAP.md).
-
-## Intended workflow
-
-The planned interface is deliberately small:
-
-```text
-smolrunner doctor
-smolrunner plan
-smolrunner host plan
-smolrunner host prepare
-smolrunner runner add
-smolrunner project enroll
-smolrunner status
-smolrunner remove
-```
-
-Later reliability commands such as upgrade, rollback, incident, backup, restore, and quarantine should preserve the same plan-before-mutation and stable-JSON contract rather than exposing the internal machinery directly.
+See the [manifest reference](docs/MANIFEST.md) and example [Quarry](examples/quarry.yml) / [Glossless](examples/glossless.yml) manifests.
 
 ## Design principles
 
-- **Official runner, managed safely.** SmolRunner does not reimplement the GitHub Actions protocol.
-- **Persistent listener, disposable execution.** Repository code belongs in bounded rootless containers, not directly on the host.
-- **Plan before mutation.** Host changes should be idempotent, inspectable, and reversible.
-- **Prove ownership.** Names and labels never authorize adoption or removal.
-- **Secure defaults.** Fork execution, host sockets, untracked files, and secret inheritance are denied by default.
-- **Boring infrastructure.** Debian or Ubuntu, systemd, cgroup v2, Podman, and one native binary.
-- **Human and agent friendly.** Stable JSON is a first-class interface, not terminal output scraped after the fact.
-- **Stay smol.** No mandatory daemon, database, dashboard, cloud controller, or Kubernetes cluster; reliability machinery stays behind an explicit compact interface.
+- **Blazingly hot.** Remove repeated work until the useful operation dominates wall time.
+- **Trust decides residency.** Hostile work evaporates; trusted projects may stay warm.
+- **Destroyability preserves freedom.** Physical state can disappear without losing execution truth.
+- **Official GitHub protocol.** Use the official runner and Scale Set client.
+- **Plan before mutation.** External side effects follow exact reviewed authority.
+- **Prove ownership.** Names, PIDs, labels, and directory presence carry zero cleanup authority by themselves.
+- **Linux executes; Mac controls.** Repository filesystem churn lives in Linux while secrets and durable control stay outside the worker.
+- **Measure complete loops.** Optimize queue/edit-to-useful-result and fleet throughput.
+- **Explain reuse.** Reports should say what stayed resident, what hit, what reset, and why.
+- **Stay smol.** Prefer mature components and a compact explicit control surface.
 
 ## Development
 
@@ -260,36 +311,18 @@ cargo run --locked --quiet -- --output json plan --file examples/glossless.yml
 cargo run --locked --quiet -- --output json host plan --file examples/quarry.yml
 ```
 
-Live `host prepare` acceptance additionally belongs in disposable Debian and Ubuntu environments because it requires Linux privilege, a reviewed state root, and exact host evidence.
-
 ## Project documents
 
+- [Roadmap](docs/ROADMAP.md)
+- [Product evolution](docs/PRODUCT_EVOLUTION.md)
+- [Disposable autoscaling CI](docs/DISPOSABLE_AUTOSCALING_CI.md)
 - [Threat model](docs/THREAT_MODEL.md)
 - [Manifest reference](docs/MANIFEST.md)
+- [Project workspaces](docs/PROJECT_WORKSPACES.md)
 - [Host reconciliation](docs/HOST_RECONCILIATION.md)
 - [Reliable control loop and fleet operating model](docs/OPERATING_MODEL.md)
 - [Leased execution and previews](docs/LEASED_EXECUTION.md)
-- [ADR 0001: privilege, adoption, and rollback](docs/adr/0001-privilege-adoption-and-rollback.md)
-- [ADR 0002: durable ownership and state identity](docs/adr/0002-durable-ownership-state.md)
-- [ADR 0003: canonical resource evidence](docs/adr/0003-canonical-resource-evidence.md)
-- [ADR 0004: lease lifecycle core](docs/adr/0004-lease-lifecycle-core.md)
-- [ADR 0005: atomic lease stores and artifact identity](docs/adr/0005-lease-store-and-artifact-identity.md)
-- [ADR 0006: preview slot coalescing (historical)](docs/adr/0006-preview-slot-coalescing.md)
-- [ADR 0007: rootless Podman preview command planning (historical)](docs/adr/0007-rootless-podman-preview-command-planning.md)
-- [ADR 0008: Podman preview inspection and mutation authorization (historical)](docs/adr/0008-podman-preview-inspection-authorization.md)
-- [ADR 0009: bounded subprocess output capture](docs/adr/0009-bounded-subprocess-output.md)
-- [ADR 0010: Podman inspect execution receipts (historical)](docs/adr/0010-podman-inspect-execution-receipts.md)
-- [ADR 0011: Podman state-aware mutation authorization (historical)](docs/adr/0011-podman-state-aware-mutation-authorization.md)
-- [ADR 0012: Podman state reconciliation plans (historical)](docs/adr/0012-podman-state-reconciliation-plans.md)
-- [ADR 0013: durable Linux lease store](docs/adr/0013-durable-linux-lease-store.md)
-- [Roadmap](docs/ROADMAP.md)
 - [Agent instructions](AGENTS.md)
-
-## Project status
-
-SmolRunner is in live systems acceptance, with a substantial part of the disposable-worker controller already composed and repeatedly exercised on the operator Mac. Physical work has validated the prepared Lima/VZ lifecycle, controller-death behavior, exact service installation/supervision pieces, and multiple real GitHub/Quarry assignment paths; those runs have produced the current recovery and integration queue.
-
-The immediate goal is a dependable installed-service journey from GitHub demand through one disposable VM/JIT runner and back to proven runner/VM absence and zero reserved capacity. From there the emphasis moves into broader crash/reboot/sleep/outage recovery, hostile-CI network isolation, and measured performance/agent-fleet behavior. The live programme issue is the authoritative status record; older host-preparation and Podman material remains useful foundation and historical context rather than the current product frontier.
 
 ## License
 
