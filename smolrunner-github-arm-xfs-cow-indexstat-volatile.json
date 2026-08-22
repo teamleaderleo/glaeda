@@ -1,0 +1,382 @@
+{
+  "counts": {
+    "1": {
+      "baseline": {
+        "cleanup_wall_ms": 8.837,
+        "materialize_wall_ms": 27.456,
+        "metadata_wall_ms": 3.954,
+        "successes": 1,
+        "used_delta": 8372224,
+        "verify_wall_ms": 45.955,
+        "work_wall_ms": 77.365
+      },
+      "cow_volatile_indexstat": {
+        "cleanup_wall_ms": 9.217,
+        "indexstat_records": [
+          {
+            "elapsed_ms": 8.094,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0
+          }
+        ],
+        "indexstat_successes": 1,
+        "indexstat_wall_ms": 8.322,
+        "metadata_wall_ms": 2.607,
+        "populate_successes": 1,
+        "populate_wall_ms": 12.676,
+        "read_tree_successes": 1,
+        "read_tree_wall_ms": 8.271,
+        "successes": 1,
+        "used_delta": 278528,
+        "verify_wall_ms": 54.782,
+        "work_wall_ms": 86.658
+      }
+    },
+    "32": {
+      "baseline": {
+        "cleanup_wall_ms": 352.618,
+        "materialize_wall_ms": 449.253,
+        "metadata_wall_ms": 32.695,
+        "successes": 32,
+        "used_delta": 267718656,
+        "verify_wall_ms": 392.417,
+        "work_wall_ms": 874.365
+      },
+      "cow_volatile_indexstat": {
+        "cleanup_wall_ms": 335.635,
+        "indexstat_records": [
+          {
+            "elapsed_ms": 404.876,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0
+          },
+          {
+            "elapsed_ms": 447.646,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0
+          },
+          {
+            "elapsed_ms": 467.671,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0
+          },
+          {
+            "elapsed_ms": 510.762,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0
+          },
+          {
+            "elapsed_ms": 393.993,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0
+          },
+          {
+            "elapsed_ms": 488.787,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0
+          },
+          {
+            "elapsed_ms": 487.626,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0
+          },
+          {
+            "elapsed_ms": 477.98,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0
+          },
+          {
+            "elapsed_ms": 464.05,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0
+          },
+          {
+            "elapsed_ms": 429.457,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0
+          },
+          {
+            "elapsed_ms": 509.478,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0
+          },
+          {
+            "elapsed_ms": 505.332,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0
+          },
+          {
+            "elapsed_ms": 428.421,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0
+          },
+          {
+            "elapsed_ms": 437.957,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0
+          },
+          {
+            "elapsed_ms": 504.628,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0
+          },
+          {
+            "elapsed_ms": 486.232,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0
+          },
+          {
+            "elapsed_ms": 501.34,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0
+          },
+          {
+            "elapsed_ms": 500.921,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0
+          },
+          {
+            "elapsed_ms": 440.753,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0
+          },
+          {
+            "elapsed_ms": 445.552,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0
+          },
+          {
+            "elapsed_ms": 492.134,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0
+          },
+          {
+            "elapsed_ms": 486.827,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0
+          },
+          {
+            "elapsed_ms": 488.89,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0
+          },
+          {
+            "elapsed_ms": 406.845,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0
+          },
+          {
+            "elapsed_ms": 481.05,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0
+          },
+          {
+            "elapsed_ms": 477.615,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0
+          },
+          {
+            "elapsed_ms": 466.79,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0
+          },
+          {
+            "elapsed_ms": 474.851,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0
+          },
+          {
+            "elapsed_ms": 463.954,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0
+          },
+          {
+            "elapsed_ms": 430.916,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0
+          },
+          {
+            "elapsed_ms": 458.561,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0
+          },
+          {
+            "elapsed_ms": 459.918,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0
+          }
+        ],
+        "indexstat_successes": 32,
+        "indexstat_wall_ms": 516.493,
+        "metadata_wall_ms": 32.464,
+        "populate_successes": 32,
+        "populate_wall_ms": 480.552,
+        "read_tree_successes": 32,
+        "read_tree_wall_ms": 27.809,
+        "successes": 32,
+        "used_delta": 8753152,
+        "verify_wall_ms": 46.925,
+        "work_wall_ms": 1104.243
+      }
+    },
+    "8": {
+      "baseline": {
+        "cleanup_wall_ms": 61.047,
+        "materialize_wall_ms": 96.362,
+        "metadata_wall_ms": 8.423,
+        "successes": 8,
+        "used_delta": 66912256,
+        "verify_wall_ms": 97.748,
+        "work_wall_ms": 202.533
+      },
+      "cow_volatile_indexstat": {
+        "cleanup_wall_ms": 65.739,
+        "indexstat_records": [
+          {
+            "elapsed_ms": 137.73,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0
+          },
+          {
+            "elapsed_ms": 137.536,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0
+          },
+          {
+            "elapsed_ms": 132.193,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0
+          },
+          {
+            "elapsed_ms": 133.414,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0
+          },
+          {
+            "elapsed_ms": 136.625,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0
+          },
+          {
+            "elapsed_ms": 136.223,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0
+          },
+          {
+            "elapsed_ms": 132.024,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0
+          },
+          {
+            "elapsed_ms": 134.352,
+            "entries": 390,
+            "extension_bytes": 1924,
+            "patched": 390,
+            "returncode": 0
+          }
+        ],
+        "indexstat_successes": 8,
+        "indexstat_wall_ms": 138.257,
+        "metadata_wall_ms": 7.477,
+        "populate_successes": 8,
+        "populate_wall_ms": 108.048,
+        "read_tree_successes": 8,
+        "read_tree_wall_ms": 8.024,
+        "successes": 8,
+        "used_delta": 2162688,
+        "verify_wall_ms": 12.157,
+        "work_wall_ms": 273.963
+      }
+    }
+  },
+  "schema_version": 1,
+  "source": {
+    "logical_bytes": 7256871,
+    "proof": {
+      "diff_files_ms": 22.721,
+      "diff_index_ms": 22.7,
+      "returncode": 0
+    },
+    "regular_entries": 390
+  }
+}
