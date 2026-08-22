@@ -1,0 +1,121 @@
+{
+  "base": {
+    "argv": [
+      "git",
+      "worktree",
+      "add",
+      "--detach",
+      "/home/runner/work/_temp/smolrunner-cow-wt-v2-tg9zwx49/xfs/base",
+      "HEAD"
+    ],
+    "elapsed_ms": 30.378,
+    "returncode": 0,
+    "stderr": "Preparing worktree (detached HEAD ee722cb)",
+    "stdout": "HEAD is now at ee722cb research: test CoW worktree without forced reset"
+  },
+  "baseline": {
+    "materialize": {
+      "argv": [
+        "git",
+        "reset",
+        "--hard",
+        "HEAD"
+      ],
+      "elapsed_ms": 26.672,
+      "returncode": 0,
+      "stderr": "",
+      "stdout": "HEAD is now at ee722cb research: test CoW worktree without forced reset"
+    },
+    "metadata": {
+      "argv": [
+        "git",
+        "worktree",
+        "add",
+        "--detach",
+        "--no-checkout",
+        "/home/runner/work/_temp/smolrunner-cow-wt-v2-tg9zwx49/xfs/baseline",
+        "HEAD"
+      ],
+      "elapsed_ms": 2.399,
+      "returncode": 0,
+      "stderr": "Preparing worktree (detached HEAD ee722cb)",
+      "stdout": ""
+    },
+    "used_delta": 8368128
+  },
+  "cow": {
+    "diff_files": {
+      "argv": [
+        "git",
+        "diff-files",
+        "--quiet"
+      ],
+      "elapsed_ms": 1.395,
+      "returncode": 0,
+      "stderr": "",
+      "stdout": ""
+    },
+    "diff_index": {
+      "argv": [
+        "git",
+        "diff-index",
+        "--quiet",
+        "HEAD",
+        "--"
+      ],
+      "elapsed_ms": 1.416,
+      "returncode": 1,
+      "stderr": "",
+      "stdout": ""
+    },
+    "metadata": {
+      "argv": [
+        "git",
+        "worktree",
+        "add",
+        "--detach",
+        "--no-checkout",
+        "/home/runner/work/_temp/smolrunner-cow-wt-v2-tg9zwx49/xfs/cow",
+        "HEAD"
+      ],
+      "elapsed_ms": 2.422,
+      "returncode": 0,
+      "stderr": "Preparing worktree (detached HEAD ee722cb)",
+      "stdout": ""
+    },
+    "metadata_used_delta": 4096,
+    "populate": {
+      "cloned_files": 390,
+      "cloned_logical_bytes": 7253691,
+      "elapsed_ms": 44.666,
+      "skipped": []
+    },
+    "populate_used_delta": 274432,
+    "refresh": {
+      "argv": [
+        "git",
+        "update-index",
+        "--refresh"
+      ],
+      "elapsed_ms": 1.793,
+      "returncode": 0,
+      "stderr": "",
+      "stdout": ""
+    },
+    "refresh_used_delta": 0,
+    "status": {
+      "argv": [
+        "git",
+        "status",
+        "--porcelain=v2",
+        "--untracked-files=no"
+      ],
+      "elapsed_ms": 2.691,
+      "returncode": 0,
+      "stderr": "",
+      "stdout": "1 D. N... 100644 000000 000000 2977ea454b863813af4ff60495d1d1446c2b4c9e 0000000000000000000000000000000000000000 .coderabbit.yaml\n1 D. N... 100644 000000 000000 beb76a02a3ddb472949e97fe84558c6d36533ffa 0000000000000000000000000000000000000000 .github/workflows/bootstrap-compatibility.yml\n1 D. N... 100644 000000 000000 7b394cb3429684854133557447bf8df80d1e00dc 0000000000000000000000000000000000000000 .github/workflows/ci.yml\n1 D. N... 100644 000000 000000 26cc0ed3055bc3188eae7c132db2929f150a25c9 0000000000000000000000000000000000000000 .github/workflows/linux-acceptance.yml\n1 D. N... 100644 000000 000000 a9c096a02476402a329d5e2c4c93d5e2aa758065 0000000000000000000000000000000000000000 .github/workflows/podman-closure-probe.yml\n1 D. N... 100644 000000 000000 24e06d86228bc981ad9c1c526260a7b7effa30b7 0000000000000000000000000000000000000000 .github/workflows/podman-container-closure-probe.yml\n1 D. N... 100644 000000 000000 10e6c05ca6692b86e71584514cba9952c475a21f 0000000000000000000000000000000000000000 .github/workflows/research-github-arm-xfs-cow-worktree-v2.yml\n1 D. N... 100644 000000 000000 0be940c61352290b3403c4b85f974df5476f478c 0000000000000000000000000000000000000000 .gitignore\n1 D. N... 100644 000000 000000 eff0388fcfc5acebe4bd8b441240f0fb8f9600c8 0000000000000000000000000000000000000000 AGENTS.md\n1 D. N... 100644 000000 000000 0dac051a0cfca9c77ff3ed24aae53b5fbec82415 0000000000000000000000000000000000000000 Cargo.lock\n1 D. N... 100644 000000 000000 d3be29f15d14065c51fcd5337b7f3a842fa3362e 0000000000000000000000000000000000000000 Cargo.toml\n1 D. N... 100644 000000 000000 b09cd7856d58590578ee1a4f3ad45d1310a97f87 0000000000000000000000000000000000000000 LICENSE\n1 D. N... 100644 000000 000000 ef758e86e9b208051827bace6b4d74dc4a698424 0000000000000000000000000000000000000000 Makefile\n1 D. N... 100644 000000 000000 0db3a25ddd1a9abb4c2b738b11ce2abc40f1d020 0000000000000000000000000000000000000000 README.md\n1 D. N... 100644 000000 000000 2de97fd2fe3d071d8defb3b3fea7e7a18732eae4 0000000000000000000000000000000000000000 docs/AGENT_COORDINATION.md\n1 D. N... 100644 000000 000000 c153c87b5ce5a2b3ff0a936abb5694fd11741a86 0000000000000000000000000000000000000000 docs/BLAZINGLY_HOT.md\n1 D. N... 100644 000000 000000 698adbcfdf107da39b65f68187a6805ad16d7e87 0000000000000000000000000000000000000000 docs/DESCRIPTOR_BOUND_LINUX_LAUNCHER.md\n1 D. N... 100644 000000 000000 faeea806953ff179ace2f591b2107fbcd5a9b99b 0000000000000000000000000000000000000000 docs/DISPOSABLE_AUTOSCALING_CI.md\n1 D. N... 100644 000000 000000 8c431a1ac1488b8782d1cdf2a09c3d2485716078 0000000000000000000000000000000000000000 docs/DISPOSABLE_DEPENDENCY_BOUNDARY.md\n1 D. N... 100644 000000 000000 c906c57bc21d5093c4728455ef3591136297ba2d 0000000000000000000000000000000000000000 docs/DISPOSABLE_INSTALLED_SERVICE_ACCEPTANCE.md\n1 D. N... 100644 000000 000000 eb6f66dad2eafc48072c2c2a830eda5aa1813dd9 0000000000000000000000000000000000000000 docs/DISPOSABLE_VZ_NETWORK_SELECTOR_ACCEPTANCE.md\n1 D. N... 100644 000000 000000 978a123b153d051c46f16380e7ee198790522a1d 0000000000000000000000000000000000000000 docs/EXECUTION_ADMISSION.md\n1 D. N... 100644 000000 000000 8b529de6e729031107585fb45f2834fda72e40d0 0000000000000000000000000000000000000000 docs/EXECUTION_RECEIPTS.md\n1 D. N... 100644 000000 000000 2f57ba11f817c536b2907f6e52da3ac4b56ee2ec 0000000000000000000000000000000000000000 docs/EXECUTION_RECEIPT_STORAGE.md\n1 D. N... 100644 000000 000000 53d231d59b48d9d22e7a77bc3709f77df00b7d30 0000000000000000000000000000000000000000 docs/HOST_PREPARATION_RECEIPT_BINDING.md\n1 D. N... 100644 000000 000000 5fb8a916c7ea3132e84c1440679ca3612a623c5d 0000000000000000000000000000000000000000 docs/HOST_PREPARATION_RECEIPT_MAPPING.md\n1 D. N... 100644 000000 000000 a17ae0e058b396ba70fcde404115949314bed64d 0000000000000000000000000000000000000000 docs/HOST_RECONCILIATION.md\n1 D. N... 100644 000000 000000 5dfd8230f38f9a09cc984f3bed240d0b06df6f90 0000000000000000000000000000000000000000 docs/IMPLEMENTATION_MAP.md\n1 D. N... 100644 000000 000000 f381ecb2d7ab9ea9db340fde3e8f6c3672e9ecf5 0000000000000000000"
+    },
+    "total_candidate_ms": 48.881
+  },
+  "schema_version": 2
+}
