@@ -1,0 +1,222 @@
+name: Research GitHub ARM XFS CoW refresh fanout
+
+on:
+  push:
+    branches:
+      - research/github-arm-xfs-cow-refresh-fanout
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  fanout:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Measure CoW index refresh handoff
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import concurrent.futures, json, os, shutil, stat, subprocess, tempfile, time
+          from pathlib import Path
+
+          repo = Path(os.environ['GITHUB_WORKSPACE']).resolve()
+          root = Path(tempfile.mkdtemp(prefix='smolrunner-xfs-refresh-', dir=os.environ['RUNNER_TEMP']))
+          image = root / 'xfs.img'
+          mount = root / 'xfs'
+          mount.mkdir()
+          result_path = repo / 'smolrunner-github-arm-xfs-cow-refresh-fanout.json'
+          worktrees = []
+          mounted = False
+
+          def command(argv, cwd=None):
+              start = time.monotonic_ns()
+              proc = subprocess.run(argv, cwd=cwd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+              return {
+                  'returncode': proc.returncode,
+                  'elapsed_ms': round((time.monotonic_ns() - start) / 1_000_000, 3),
+                  'stdout': proc.stdout.strip()[:512],
+                  'stderr': proc.stderr.strip()[:512],
+              }
+
+          def phase(items, function):
+              start = time.monotonic_ns()
+              with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(items))) as pool:
+                  records = list(pool.map(function, items))
+              return round((time.monotonic_ns() - start) / 1_000_000, 3), records
+
+          def quiet_used(path):
+              subprocess.run(['sync', '-f', str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+              time.sleep(0.05)
+              fs = os.statvfs(path)
+              return (fs.f_blocks - fs.f_bfree) * fs.f_frsize
+
+          def broad_verify(path):
+              status = command(['git', 'status', '--porcelain=v2', '--untracked-files=no'], cwd=path)
+              diff_files = command(['git', 'diff-files', '--quiet'], cwd=path)
+              diff_index = command(['git', 'diff-index', '--quiet', 'HEAD', '--'], cwd=path)
+              clean = status['returncode'] == 0 and not status['stdout'] and diff_files['returncode'] == 0 and diff_index['returncode'] == 0
+              return {
+                  'returncode': 0 if clean else 1,
+                  'status_ms': status['elapsed_ms'],
+                  'diff_files_ms': diff_files['elapsed_ms'],
+                  'diff_index_ms': diff_index['elapsed_ms'],
+              }
+
+          def narrow_verify(path):
+              diff_files = command(['git', 'diff-files', '--quiet'], cwd=path)
+              diff_index = command(['git', 'diff-index', '--quiet', 'HEAD', '--'], cwd=path)
+              return {
+                  'returncode': 0 if diff_files['returncode'] == 0 and diff_index['returncode'] == 0 else 1,
+                  'diff_files_ms': diff_files['elapsed_ms'],
+                  'diff_index_ms': diff_index['elapsed_ms'],
+              }
+
+          def remove_paths(paths):
+              wall, records = phase(paths, lambda path: command(['git', 'worktree', 'remove', '--force', str(path)], cwd=repo))
+              subprocess.run(['git', 'worktree', 'prune'], cwd=repo, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+              for path in paths:
+                  if path in worktrees:
+                      worktrees.remove(path)
+              return wall, records
+
+          def tracked_regular(base):
+              proc = subprocess.run(['git', 'ls-files', '--stage', '-z'], cwd=base, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+              if proc.returncode:
+                  raise RuntimeError('git ls-files failed')
+              paths = []
+              for raw in proc.stdout.split(b'\0'):
+                  if not raw:
+                      continue
+                  head, raw_path = raw.split(b'\t', 1)
+                  mode, _, _ = head.decode().split(' ')
+                  relative = Path(os.fsdecode(raw_path))
+                  source = base / relative
+                  if mode in ('100644', '100755') and source.is_file() and not source.is_symlink():
+                      paths.append(str(relative))
+              return paths
+
+          result = {'schema_version': 1, 'counts': {}}
+          try:
+              command(['truncate', '-s', '2G', str(image)])
+              if command(['sudo', 'mkfs.xfs', '-f', '-q', '-m', 'reflink=1', str(image)])['returncode']:
+                  raise RuntimeError('mkfs.xfs failed')
+              if command(['sudo', 'mount', '-o', 'loop', str(image), str(mount)])['returncode']:
+                  raise RuntimeError('mount failed')
+              mounted = True
+              command(['sudo', 'chown', f'{os.getuid()}:{os.getgid()}', str(mount)])
+
+              base = mount / 'base'
+              base_add = command(['git', 'worktree', 'add', '--detach', str(base), 'HEAD'], cwd=repo)
+              if base_add['returncode']:
+                  raise RuntimeError('base add failed')
+              worktrees.append(base)
+              tracked = tracked_regular(base)
+              result['source'] = {'regular_entries': len(tracked), 'add': base_add}
+
+              def bulk_clone(path):
+                  return command([
+                      'cp', '-p', '--parents', '--reflink=always', f'--target-directory={path}', '--', *tracked
+                  ], cwd=base)
+
+              for count in (8, 32):
+                  count_result = {}
+
+                  def prepare_group(label):
+                      group_root = mount / f'{label}-{count}'
+                      group_root.mkdir()
+                      paths = [group_root / f'task-{index:02d}' for index in range(count)]
+                      before = quiet_used(mount)
+                      metadata_wall, metadata = phase(paths, lambda path: command(['git', 'worktree', 'add', '--detach', '--no-checkout', str(path), 'HEAD'], cwd=repo))
+                      ok = [path for path, record in zip(paths, metadata) if record['returncode'] == 0]
+                      worktrees.extend(ok)
+                      read_tree_wall, read_tree = phase(ok, lambda path: command(['git', 'read-tree', 'HEAD'], cwd=path))
+                      populate_wall, populate = phase(ok, bulk_clone)
+                      return group_root, ok, before, metadata_wall, metadata, read_tree_wall, read_tree, populate_wall, populate
+
+                  # No refresh: replicate the previous broad proof on a fresh task set.
+                  group_root, ok, before, metadata_wall, metadata, read_tree_wall, read_tree, populate_wall, populate = prepare_group('no-refresh')
+                  verify_wall, verification = phase(ok, broad_verify)
+                  after = quiet_used(mount)
+                  cleanup_wall, _ = remove_paths(ok)
+                  shutil.rmtree(group_root, ignore_errors=True)
+                  quiet_used(mount)
+                  count_result['no_refresh_broad'] = {
+                      'metadata_wall_ms': metadata_wall,
+                      'read_tree_wall_ms': read_tree_wall,
+                      'populate_wall_ms': populate_wall,
+                      'verify_wall_ms': verify_wall,
+                      'work_wall_ms': round(metadata_wall + read_tree_wall + populate_wall + verify_wall, 3),
+                      'successes': sum(record['returncode'] == 0 for record in verification),
+                      'used_delta': after - before,
+                      'cleanup_wall_ms': cleanup_wall,
+                  }
+
+                  # Refresh target stat data, then perform the same broad proof.
+                  group_root, ok, before, metadata_wall, metadata, read_tree_wall, read_tree, populate_wall, populate = prepare_group('refresh-broad')
+                  refresh_wall, refresh = phase(ok, lambda path: command(['git', 'update-index', '--refresh'], cwd=path))
+                  verify_wall, verification = phase(ok, broad_verify)
+                  after = quiet_used(mount)
+                  cleanup_wall, _ = remove_paths(ok)
+                  shutil.rmtree(group_root, ignore_errors=True)
+                  quiet_used(mount)
+                  count_result['refresh_broad'] = {
+                      'metadata_wall_ms': metadata_wall,
+                      'read_tree_wall_ms': read_tree_wall,
+                      'populate_wall_ms': populate_wall,
+                      'refresh_wall_ms': refresh_wall,
+                      'verify_wall_ms': verify_wall,
+                      'work_wall_ms': round(metadata_wall + read_tree_wall + populate_wall + refresh_wall + verify_wall, 3),
+                      'refresh_successes': sum(record['returncode'] == 0 for record in refresh),
+                      'successes': sum(record['returncode'] == 0 for record in verification),
+                      'used_delta': after - before,
+                      'cleanup_wall_ms': cleanup_wall,
+                  }
+
+                  # Refresh and use the narrow fresh-materialization proof on a separate task set.
+                  group_root, ok, before, metadata_wall, metadata, read_tree_wall, read_tree, populate_wall, populate = prepare_group('refresh-narrow')
+                  refresh_wall, refresh = phase(ok, lambda path: command(['git', 'update-index', '--refresh'], cwd=path))
+                  verify_wall, verification = phase(ok, narrow_verify)
+                  after = quiet_used(mount)
+                  cleanup_wall, _ = remove_paths(ok)
+                  shutil.rmtree(group_root, ignore_errors=True)
+                  quiet_used(mount)
+                  count_result['refresh_narrow'] = {
+                      'metadata_wall_ms': metadata_wall,
+                      'read_tree_wall_ms': read_tree_wall,
+                      'populate_wall_ms': populate_wall,
+                      'refresh_wall_ms': refresh_wall,
+                      'verify_wall_ms': verify_wall,
+                      'work_wall_ms': round(metadata_wall + read_tree_wall + populate_wall + refresh_wall + verify_wall, 3),
+                      'refresh_successes': sum(record['returncode'] == 0 for record in refresh),
+                      'successes': sum(record['returncode'] == 0 for record in verification),
+                      'used_delta': after - before,
+                      'cleanup_wall_ms': cleanup_wall,
+                  }
+
+                  result['counts'][str(count)] = count_result
+
+              result_path.write_text(json.dumps(result, indent=2, sort_keys=True) + '\n')
+              print(json.dumps(result, indent=2, sort_keys=True))
+          finally:
+              for worktree in list(worktrees):
+                  command(['git', 'worktree', 'remove', '--force', str(worktree)], cwd=repo)
+              if mounted:
+                  command(['sudo', 'umount', str(mount)])
+              shutil.rmtree(root, ignore_errors=True)
+          PY
+
+      - name: Persist result
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -C research/results-smolrunner-github-arm-xfs-cow-refresh-fanout
+          git add -- smolrunner-github-arm-xfs-cow-refresh-fanout.json
+          git commit -m 'research: record XFS CoW refresh fanout'
+          git push --force origin HEAD:refs/heads/research/results-smolrunner-github-arm-xfs-cow-refresh-fanout
