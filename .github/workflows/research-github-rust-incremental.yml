@@ -1,0 +1,116 @@
+name: Research GitHub Rust incremental
+
+on:
+  push:
+    branches:
+      - research/github-rust-incremental
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  incremental:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: arm64
+            runner: ubuntu-24.04-arm
+          - name: x64
+            runner: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Benchmark generated dependency-free Rust crate
+        env:
+          BENCH_ARCH: ${{ matrix.name }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, platform, shutil, subprocess, tempfile, time
+          from pathlib import Path
+
+          workspace = Path(os.environ['GITHUB_WORKSPACE']).resolve()
+          root = Path(tempfile.mkdtemp(prefix='smolrunner-rust-', dir=os.environ['RUNNER_TEMP']))
+          crate = root / 'crate'; src = crate / 'src'; src.mkdir(parents=True)
+          target = root / 'target'
+          result_path = workspace / f"smolrunner-rust-incremental-{os.environ['BENCH_ARCH']}.json"
+
+          (crate / 'Cargo.toml').write_text('[package]\nname="hotbench"\nversion="0.1.0"\nedition="2024"\n\n[profile.dev]\nincremental=true\n', encoding='utf-8')
+          modules = 480
+          lines = []
+          for i in range(modules):
+              name = f'm{i:03d}'
+              lines.append(f'mod {name};')
+              body = [f'pub fn value(seed: u64) -> u64 {{']
+              body.append(f'    let mut x = seed.wrapping_add({i});')
+              for j in range(24):
+                  body.append(f'    x = x.rotate_left({(j % 31) + 1}).wrapping_mul({(i + j + 3) | 1}).wrapping_add({j});')
+              body.append('    x\n}')
+              (src / f'{name}.rs').write_text('\n'.join(body)+'\n', encoding='utf-8')
+          lines.append('pub fn aggregate(seed: u64) -> u64 {')
+          lines.append('    let mut x = seed;')
+          for i in range(modules):
+              lines.append(f'    x ^= m{i:03d}::value(x);')
+          lines.append('    x\n}')
+          lines.append('#[cfg(test)]\nmod tests { use super::*; #[test] fn aggregate_runs() { assert_ne!(aggregate(7), 0); } }')
+          (src / 'lib.rs').write_text('\n'.join(lines)+'\n', encoding='utf-8')
+
+          env = os.environ.copy(); env['CARGO_TARGET_DIR'] = str(target); env['CARGO_INCREMENTAL'] = '1'; env['CARGO_NET_OFFLINE'] = 'true'
+          def command(label):
+              start = time.monotonic_ns()
+              p = subprocess.run(['cargo','test','--offline','--lib','--quiet'], cwd=crate, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+              return {'label': label, 'returncode': p.returncode, 'elapsed_ms': round((time.monotonic_ns()-start)/1_000_000,3), 'stdout': p.stdout.strip()[:4096], 'stderr': p.stderr.strip()[:4096]}
+
+          def size(path):
+              p = subprocess.run(['du','-s','-B1',str(path)], text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False)
+              return int(p.stdout.split()[0]) if p.returncode == 0 and p.stdout.split() else None
+
+          try:
+              report = {
+                  'schema_version': 1,
+                  'arch': os.environ['BENCH_ARCH'],
+                  'runner': {'machine': platform.machine(), 'kernel': platform.release(), 'cpu_count': os.cpu_count()},
+                  'rustc': subprocess.run(['rustc','--version'],text=True,stdout=subprocess.PIPE).stdout.strip(),
+                  'cargo': subprocess.run(['cargo','--version'],text=True,stdout=subprocess.PIPE).stdout.strip(),
+                  'modules': modules,
+                  'generated_source_files': modules + 1,
+                  'runs': [],
+              }
+              report['runs'].append(command('cold'))
+              report['target_bytes_after_cold'] = size(target)
+              report['runs'].append(command('warm_no_edit'))
+
+              one = src / 'm000.rs'
+              one.write_text(one.read_text(encoding='utf-8').replace('wrapping_add(0)', 'wrapping_add(1000000)', 1), encoding='utf-8')
+              report['runs'].append(command('one_module_edit'))
+
+              for i in range(50):
+                  path = src / f'm{i:03d}.rs'
+                  text = path.read_text(encoding='utf-8')
+                  path.write_text(text.replace('let mut x = seed.', f'let mut x = seed.wrapping_add({10000+i}).', 1), encoding='utf-8')
+              report['runs'].append(command('fifty_module_edit'))
+              report['target_bytes_final'] = size(target)
+              result_path.write_text(json.dumps(report,indent=2,sort_keys=True)+'\n',encoding='utf-8')
+              print(json.dumps(report,indent=2,sort_keys=True))
+          finally:
+              shutil.rmtree(root, ignore_errors=True)
+          PY
+
+      - name: Persist result
+        env:
+          BENCH_ARCH: ${{ matrix.name }}
+        run: |
+          set -euo pipefail
+          result="smolrunner-rust-incremental-${BENCH_ARCH}.json"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -C "research/results-smolrunner-rust-${BENCH_ARCH}"
+          git add -- "$result"
+          git commit -m "research: record offline Rust incremental ${BENCH_ARCH}"
+          git push --force origin "HEAD:refs/heads/research/results-smolrunner-rust-${BENCH_ARCH}"
