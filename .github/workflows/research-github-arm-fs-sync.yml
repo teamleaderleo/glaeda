@@ -1,0 +1,161 @@
+name: Research GitHub ARM synced filesystem matrix
+
+on:
+  push:
+    branches:
+      - research/github-arm-fs-sync
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Measure ext4 and XFS with sync boundaries
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, platform, shutil, subprocess, tempfile, time
+          from pathlib import Path
+
+          workspace = Path(os.environ['GITHUB_WORKSPACE']).resolve()
+          root = Path(tempfile.mkdtemp(prefix='smolrunner-fs-sync-', dir=os.environ['RUNNER_TEMP']))
+          result_path = workspace / 'smolrunner-github-arm-fs-sync.json'
+          mounts = []
+          worktrees = []
+
+          def run(argv, cwd=None):
+              start = time.monotonic_ns()
+              p = subprocess.run(argv, cwd=cwd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+              return {'argv': argv, 'returncode': p.returncode, 'elapsed_ms': round((time.monotonic_ns()-start)/1_000_000, 3), 'stdout': p.stdout.strip()[:4096], 'stderr': p.stderr.strip()[:4096]}
+
+          def quiet_used(path):
+              run(['sync', '-f', str(path)])
+              time.sleep(0.10)
+              s = os.statvfs(path)
+              return (s.f_blocks - s.f_bfree) * s.f_frsize
+
+          def remove_worktree(path):
+              if path in worktrees:
+                  run(['git','worktree','remove','--force',str(path)], cwd=workspace)
+                  worktrees.remove(path)
+                  run(['sync','-f',str(path.parent)])
+
+          def bench(name, mnt):
+              out = {'findmnt': run(['findmnt','-T',str(mnt),'-n','-o','SOURCE,FSTYPE,OPTIONS'])}
+              if name == 'xfs':
+                  out['xfs_info'] = run(['xfs_info', str(mnt)])
+
+              source = mnt / 'source.bin'
+              block = os.urandom(1024 * 1024)
+              start = time.monotonic_ns(); source.write_bytes(block * 64); run(['sync','-f',str(mnt)])
+              out['source_create_64m_ms'] = round((time.monotonic_ns()-start)/1_000_000, 3)
+
+              before = quiet_used(mnt)
+              clone = mnt / 'clone.bin'
+              rr = run(['cp','--reflink=always',str(source),str(clone)])
+              after = quiet_used(mnt)
+              out['reflink_64m'] = {'copy': rr, 'used_delta': after-before}
+              if rr['returncode'] == 0:
+                  out['reflink_64m']['source_filefrag'] = run(['filefrag','-v',str(source)])
+                  out['reflink_64m']['clone_filefrag'] = run(['filefrag','-v',str(clone)])
+                  before = quiet_used(mnt)
+                  start = time.monotonic_ns()
+                  with clone.open('r+b', buffering=0) as f:
+                      f.write(os.urandom(1024*1024)); f.flush(); os.fsync(f.fileno())
+                  after = quiet_used(mnt)
+                  out['reflink_64m']['first_1m_write_ms'] = round((time.monotonic_ns()-start)/1_000_000, 3)
+                  out['reflink_64m']['cow_used_delta'] = after-before
+
+              before = quiet_used(mnt)
+              copy = mnt / 'copy.bin'
+              cr = run(['cp','--reflink=never',str(source),str(copy)])
+              after = quiet_used(mnt)
+              out['copy_64m'] = {'copy': cr, 'used_delta': after-before}
+
+              base = mnt / 'base'
+              br = run(['git','worktree','add','--detach',str(base),'HEAD'], cwd=workspace)
+              if br['returncode'] == 0: worktrees.append(base)
+              out['base_add'] = br
+              quiet_used(mnt)
+
+              plain = mnt / 'plain'
+              before = quiet_used(mnt)
+              pa = run(['git','worktree','add','--detach',str(plain),'HEAD'], cwd=workspace)
+              if pa['returncode'] == 0: worktrees.append(plain)
+              after = quiet_used(mnt)
+              out['plain_worktree'] = {'add': pa, 'used_delta': after-before}
+              remove_worktree(plain)
+              quiet_used(mnt)
+
+              split = mnt / 'split'
+              before = quiet_used(mnt)
+              sa = run(['git','worktree','add','--detach','--no-checkout',str(split),'HEAD'], cwd=workspace)
+              if sa['returncode'] == 0: worktrees.append(split)
+              after_meta = quiet_used(mnt)
+              mat = run(['git','reset','--hard','HEAD'], cwd=split) if sa['returncode'] == 0 else None
+              after_mat = quiet_used(mnt)
+              out['split_worktree'] = {'metadata': sa, 'metadata_used_delta': after_meta-before, 'materialize': mat, 'materialize_used_delta': after_mat-after_meta}
+              remove_worktree(split)
+              quiet_used(mnt)
+
+              if br['returncode'] == 0:
+                  cow = mnt / 'cow-tree'; cow.mkdir()
+                  before = quiet_used(mnt)
+                  cowr = run(['cp','-a','--reflink=always',str(base)+'/.',str(cow)+'/'])
+                  after = quiet_used(mnt)
+                  out['resident_reflink_tree'] = {'copy': cowr, 'used_delta': after-before}
+                  shutil.rmtree(cow); quiet_used(mnt)
+
+                  normal = mnt / 'normal-tree'; normal.mkdir()
+                  before = quiet_used(mnt)
+                  nr = run(['cp','-a','--reflink=never',str(base)+'/.',str(normal)+'/'])
+                  after = quiet_used(mnt)
+                  out['resident_copy_tree'] = {'copy': nr, 'used_delta': after-before}
+                  shutil.rmtree(normal); quiet_used(mnt)
+
+              remove_worktree(base)
+              return out
+
+          result = {'schema_version': 2, 'runner': {'arch': os.environ.get('RUNNER_ARCH'), 'machine': platform.machine(), 'kernel': platform.release(), 'cpu_count': os.cpu_count()}, 'volumes': {}}
+          try:
+              for name, mkfs in [
+                  ('ext4', ['sudo','mkfs.ext4','-F','-q']),
+                  ('xfs', ['sudo','mkfs.xfs','-f','-q','-m','reflink=1']),
+              ]:
+                  image = root / f'{name}.img'; mnt = root / f'mnt-{name}'; mnt.mkdir()
+                  run(['truncate','-s','2G',str(image)])
+                  fr = run(mkfs + [str(image)])
+                  if fr['returncode'] != 0:
+                      result['volumes'][name] = {'available': False, 'format': fr}; continue
+                  mr = run(['sudo','mount','-o','loop',str(image),str(mnt)])
+                  if mr['returncode'] != 0:
+                      result['volumes'][name] = {'available': False, 'mount': mr}; continue
+                  mounts.append(mnt)
+                  run(['sudo','chown',f'{os.getuid()}:{os.getgid()}',str(mnt)])
+                  result['volumes'][name] = {'available': True, 'format': fr, 'mount': mr, **bench(name,mnt)}
+                  run(['sudo','umount',str(mnt)]); mounts.remove(mnt)
+              result_path.write_text(json.dumps(result, indent=2, sort_keys=True)+'\n')
+              print(json.dumps(result, indent=2, sort_keys=True))
+          finally:
+              for wt in list(worktrees): run(['git','worktree','remove','--force',str(wt)], cwd=workspace)
+              for mnt in reversed(mounts): run(['sudo','umount',str(mnt)])
+              shutil.rmtree(root, ignore_errors=True)
+          PY
+
+      - name: Persist result
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -C research/results-smolrunner-github-arm-fs-sync
+          git add -- smolrunner-github-arm-fs-sync.json
+          git commit -m 'research: record synced ARM filesystem matrix'
+          git push --force origin HEAD:refs/heads/research/results-smolrunner-github-arm-fs-sync
