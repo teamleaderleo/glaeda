@@ -1,0 +1,77 @@
+{
+  "dmsetup_targets": {
+    "argv": [
+      "sudo",
+      "dmsetup",
+      "targets"
+    ],
+    "elapsed_ms": 7.695,
+    "returncode": 0,
+    "stderr": "",
+    "stdout": "multipath        v1.15.0\nstriped          v1.7.0\nlinear           v1.5.0\nerror            v1.7.0"
+  },
+  "lsmod": {
+    "argv": [
+      "bash",
+      "-lc",
+      "lsmod | grep -E \"(^|_)vdo|dm_vdo\" || true"
+    ],
+    "elapsed_ms": 164.479,
+    "returncode": 0,
+    "stderr": "",
+    "stdout": ""
+  },
+  "lvm_version": {
+    "argv": [
+      "lvm",
+      "version"
+    ],
+    "elapsed_ms": 2.218,
+    "returncode": 0,
+    "stderr": "/dev/mapper/control: open failed: Permission denied\nFailure to communicate with kernel device-mapper driver.\nIncompatible libdevmapper 1.02.185 (2022-05-18) and kernel driver (unknown version).",
+    "stdout": "LVM version:     2.03.16(2) (2022-05-18)\n  Library version: 1.02.185 (2022-05-18)\n  Configuration:   ./configure --build=aarch64-linux-gnu --prefix=/usr --includedir=${prefix}/include --mandir=${prefix}/share/man --infodir=${prefix}/share/info --sysconfdir=/etc --localstatedir=/var --disable-option-checking --disable-silent-rules --libdir=${prefix}/lib/aarch64-linux-gnu --runstatedir=/run --disable-maintainer-mode --disable-dependency-tracking --prefix=/usr --exec-prefix=/usr --with-usrlibdir=/usr/lib/aarch64-linux-gnu --with-optimisation=-O2 --with-cache=internal --with-device-uid=0 --with-device-gid=6 --with-device-mode=0660 --with-default-pid-dir=/run --with-default-run-dir=/run/lvm --with-default-locking-dir=/run/lock/lvm --with-thin=internal --with-thin-check=/usr/sbin/thin_check --with-thin-dump=/usr/sbin/thin_dump --with-thin-repair=/usr/sbin/thin_repair --enable-applib --enable-blkid_wiping --enable-cmdlib --enable-dmeventd --enable-editline --enable-lvmlockd-dlm --enable-lvmlockd-sanlock --enable-lvmpolld --enable-notify-dbus --enable-pkgconfig --enable-udev_rules --enable-udev_sync --disable-readline"
+  },
+  "modprobe_n": {
+    "argv": [
+      "sudo",
+      "modprobe",
+      "-n",
+      "-v",
+      "dm_vdo"
+    ],
+    "elapsed_ms": 7.787,
+    "returncode": 0,
+    "stderr": "",
+    "stdout": "insmod /lib/modules/6.17.0-1022-azure/kernel/lib/lz4/lz4_compress.ko.zst \ninsmod /lib/modules/6.17.0-1022-azure/kernel/drivers/md/dm-bufio.ko.zst \ninsmod /lib/modules/6.17.0-1022-azure/kernel/drivers/md/dm-vdo/dm-vdo.ko.zst"
+  },
+  "runner": {
+    "arch": "ARM64",
+    "kernel": "6.17.0-1022-azure",
+    "machine": "aarch64"
+  },
+  "schema_version": 1,
+  "sudo": {
+    "argv": [
+      "sudo",
+      "-n",
+      "true"
+    ],
+    "elapsed_ms": 6.013,
+    "returncode": 0,
+    "stderr": "",
+    "stdout": ""
+  },
+  "sys_module_dm_vdo": false,
+  "sys_module_kvdo": false,
+  "tools": {
+    "dmsetup": "/usr/sbin/dmsetup",
+    "lvcreate": "/usr/sbin/lvcreate",
+    "lvm": "/usr/sbin/lvm",
+    "modprobe": "/usr/sbin/modprobe",
+    "pvcreate": "/usr/sbin/pvcreate",
+    "vdo": null,
+    "vdostats": null,
+    "vgcreate": "/usr/sbin/vgcreate"
+  },
+  "vdo_version": null
+}
