@@ -1,0 +1,103 @@
+{
+  "arch": "aarch64",
+  "cycles": [
+    {
+      "cycle": 1,
+      "error": "",
+      "mount_ms": 5.873,
+      "mount_rc": 0,
+      "unmount_ms": 1802.923,
+      "unmount_rc": 0
+    },
+    {
+      "cycle": 2,
+      "error": "",
+      "mount_ms": 6.991,
+      "mount_rc": 0,
+      "unmount_ms": 15.878,
+      "unmount_rc": 0
+    },
+    {
+      "cycle": 3,
+      "error": "",
+      "mount_ms": 6.38,
+      "mount_rc": 0,
+      "unmount_ms": 13.2,
+      "unmount_rc": 0
+    },
+    {
+      "cycle": 4,
+      "error": "",
+      "mount_ms": 5.362,
+      "mount_rc": 0,
+      "unmount_ms": 10.137,
+      "unmount_rc": 0
+    },
+    {
+      "cycle": 5,
+      "error": "",
+      "mount_ms": 5.122,
+      "mount_rc": 0,
+      "unmount_ms": 10.866,
+      "unmount_rc": 0
+    },
+    {
+      "cycle": 6,
+      "error": "",
+      "mount_ms": 5.125,
+      "mount_rc": 0,
+      "unmount_ms": 10.269,
+      "unmount_rc": 0
+    },
+    {
+      "cycle": 7,
+      "error": "",
+      "mount_ms": 5.076,
+      "mount_rc": 0,
+      "unmount_ms": 9.808,
+      "unmount_rc": 0
+    },
+    {
+      "cycle": 8,
+      "error": "",
+      "mount_ms": 4.841,
+      "mount_rc": 0,
+      "unmount_ms": 10.011,
+      "unmount_rc": 0
+    },
+    {
+      "cycle": 9,
+      "error": "",
+      "mount_ms": 5.026,
+      "mount_rc": 0,
+      "unmount_ms": 10.745,
+      "unmount_rc": 0
+    },
+    {
+      "cycle": 10,
+      "error": "",
+      "mount_ms": 5.058,
+      "mount_rc": 0,
+      "unmount_ms": 10.267,
+      "unmount_rc": 0
+    },
+    {
+      "cycle": 11,
+      "error": "",
+      "mount_ms": 4.843,
+      "mount_rc": 0,
+      "unmount_ms": 10.204,
+      "unmount_rc": 0
+    },
+    {
+      "cycle": 12,
+      "error": "",
+      "mount_ms": 4.964,
+      "mount_rc": 0,
+      "unmount_ms": 9.665,
+      "unmount_rc": 0
+    }
+  ],
+  "kernel": "6.17.0-1022-azure",
+  "schema_version": 1
+}
