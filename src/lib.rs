@@ -57,6 +57,8 @@ pub mod durable_lane_execution;
 pub mod execution_admission;
 pub mod execution_receipt;
 pub mod execution_receipt_store;
+/// Pure Git index-v2 stat-cache patching for CoW task materialization.
+pub mod git_index_stat_patch;
 /// Private-process adapter for the pinned official Runner Scale Set bridge.
 #[cfg(unix)]
 pub(crate) mod github_scale_set_bridge;
