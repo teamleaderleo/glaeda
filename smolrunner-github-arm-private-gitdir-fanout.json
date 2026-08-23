@@ -1,0 +1,61 @@
+{
+  "arch": "aarch64",
+  "counts": {
+    "1": {
+      "linked": {
+        "metadata_wall_ms": 4.425,
+        "mount_wall_ms": 7.587,
+        "proof_successes": 1,
+        "proof_wall_ms": 48.974
+      },
+      "private": {
+        "alternates_exact": 1,
+        "metadata_wall_ms": 8.028,
+        "mount_wall_ms": 6.137,
+        "private_object_write": true,
+        "proof_successes": 1,
+        "proof_wall_ms": 4.544,
+        "source_branch_absent": true
+      }
+    },
+    "32": {
+      "linked": {
+        "metadata_wall_ms": 66.313,
+        "mount_wall_ms": 56.987,
+        "proof_successes": 32,
+        "proof_wall_ms": 44.538
+      },
+      "private": {
+        "alternates_exact": 32,
+        "metadata_wall_ms": 86.667,
+        "mount_wall_ms": 62.537,
+        "private_object_write": true,
+        "proof_successes": 32,
+        "proof_wall_ms": 46.364,
+        "source_branch_absent": true
+      }
+    },
+    "8": {
+      "linked": {
+        "metadata_wall_ms": 14.24,
+        "mount_wall_ms": 19.07,
+        "proof_successes": 8,
+        "proof_wall_ms": 14.829
+      },
+      "private": {
+        "alternates_exact": 8,
+        "metadata_wall_ms": 25.355,
+        "mount_wall_ms": 17.86,
+        "private_object_write": true,
+        "proof_successes": 8,
+        "proof_wall_ms": 11.42,
+        "source_branch_absent": true
+      }
+    }
+  },
+  "head": "3674256d9c3aa778031ee8e6f36b26c8eb579fd7",
+  "kernel": "6.17.0-1022-azure",
+  "schema_version": 1,
+  "source_git_metadata_stable": true,
+  "source_object_pool_read_only": true
+}
