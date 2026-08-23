@@ -1,0 +1,129 @@
+name: Research ARM OverlayFS Git mutation semantics
+
+on:
+  push:
+    branches:
+      - research/github-arm-overlay-git-semantics
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  semantics:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+      - name: Exercise tracked and untracked task mutations
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, shutil, stat, subprocess, tempfile, time
+          from pathlib import Path
+
+          repo=Path(os.environ['GITHUB_WORKSPACE']).resolve()
+          root=Path(tempfile.mkdtemp(prefix='smolrunner-overlay-semantics-',dir=Path(os.environ['RUNNER_TEMP'])))
+          image=root/'ext4.img'; volume=root/'ext4'; volume.mkdir(); out=repo/'smolrunner-github-arm-overlay-git-semantics.json'
+          mounted=False; base_registered=False; target_registered=False
+          def run(argv,cwd=None):
+              start=time.monotonic_ns(); p=subprocess.run(argv,cwd=cwd,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=False)
+              return {'argv':argv,'returncode':p.returncode,'elapsed_ms':round((time.monotonic_ns()-start)/1_000_000,3),'stdout':p.stdout.strip()[:8192],'stderr':p.stderr.strip()[:8192]}
+          def idx(cwd):
+              r=run(['git','rev-parse','--git-path','index'],cwd); assert r['returncode']==0,r
+              p=Path(r['stdout']); return (p if p.is_absolute() else cwd/p).resolve()
+          def status(cwd): return run(['git','--no-optional-locks','status','--porcelain=v2','-z','--untracked-files=all','--ignore-submodules=all'],cwd)
+          result={'schema_version':1,'steps':{}}
+          try:
+              assert run(['sudo','-n','true'])['returncode']==0
+              assert run(['truncate','-s','1G',str(image)])['returncode']==0
+              assert run(['sudo','mkfs.ext4','-F','-q',str(image)])['returncode']==0
+              assert run(['sudo','mount','-o','loop',str(image),str(volume)])['returncode']==0
+              run(['sudo','chown',f'{os.getuid()}:{os.getgid()}',str(volume)])
+              base=volume/'base'; upper=volume/'upper'; work=volume/'work'; target=volume/'target'; upper.mkdir(); work.mkdir()
+              b=run(['git','worktree','add','--detach',str(base),'HEAD'],repo); assert b['returncode']==0,b; base_registered=True
+              refresh=run(['git','update-index','--refresh'],base); assert refresh['returncode']==0,refresh
+              source_index=idx(base).read_bytes()
+              # Add anchor-only untracked fixtures before mount.
+              (base/'anchor-cache').mkdir(); (base/'anchor-cache'/'immutable.txt').write_text('anchor\n',encoding='utf-8')
+              (base/'anchor-symlink-target.txt').write_text('target\n',encoding='utf-8')
+              os.symlink('anchor-symlink-target.txt',base/'anchor-untracked-link')
+              source_cargo=(base/'Cargo.toml').read_bytes(); source_readme=(base/'README.md').read_bytes(); source_license=(base/'LICENSE').read_bytes()
+              source_cache=(base/'anchor-cache'/'immutable.txt').read_bytes()
+
+              a=run(['git','worktree','add','--detach','--no-checkout',str(target),'HEAD'],repo); assert a['returncode']==0,a; target_registered=True
+              shutil.copy2(target/'.git',upper/'.git')
+              m=run(['sudo','mount','-t','overlay','overlay','-o',f'lowerdir={base},upperdir={upper},workdir={work}',str(target)]); assert m['returncode']==0,m; mounted=True
+              dest=idx(target); tmp=dest.with_name(dest.name+'.smolrunner-tmp'); tmp.write_bytes(source_index); os.replace(tmp,dest)
+              initial=status(target); result['steps']['initial_status']=initial
+
+              # Modify a tracked file.
+              with (target/'Cargo.toml').open('ab') as h: h.write(b'\n# semantics-modify\n')
+              result['steps']['modify_status']=status(target)
+
+              # Delete a tracked file (whiteout expected).
+              (target/'LICENSE').unlink()
+              result['steps']['delete_status']=status(target)
+
+              # Rename a tracked file through the overlay.
+              (target/'README.md').rename(target/'README.task.md')
+              result['steps']['rename_status']=status(target)
+
+              # Change executable bit on tracked regular file.
+              mode=(target/'Makefile').stat().st_mode
+              os.chmod(target/'Makefile',mode | stat.S_IXUSR)
+              result['steps']['mode_status']=status(target)
+
+              # Create an untracked regular file and symlink.
+              (target/'task-untracked.txt').write_text('task\n',encoding='utf-8')
+              os.symlink('task-untracked.txt',target/'task-untracked-link')
+              result['steps']['untracked_status']=status(target)
+
+              # Remove lower-only untracked entries; this must stay task-local via whiteouts.
+              shutil.rmtree(target/'anchor-cache')
+              (target/'anchor-untracked-link').unlink()
+              result['steps']['lower_untracked_removed']= {
+                  'cache_visible': (target/'anchor-cache').exists(),
+                  'link_visible': os.path.lexists(target/'anchor-untracked-link'),
+              }
+
+              # git clean must remove task-created untracked entries without harming lower anchor bytes.
+              clean=run(['git','clean','-ffd'],target); result['steps']['git_clean']=clean
+              result['steps']['post_clean_status']=status(target)
+              result['steps']['post_clean_visibility']={
+                  'task_untracked_exists':(target/'task-untracked.txt').exists(),
+                  'task_link_exists':os.path.lexists(target/'task-untracked-link'),
+                  'lower_cache_visible':(target/'anchor-cache').exists(),
+              }
+
+              # Revert tracked changes using Git and prove the merged tree clean again.
+              reset=run(['git','reset','--hard','HEAD'],target); result['steps']['reset']=reset
+              final=status(target); result['steps']['final_status']=final
+              result['source_unchanged']={
+                  'cargo':(base/'Cargo.toml').read_bytes()==source_cargo,
+                  'readme':(base/'README.md').read_bytes()==source_readme,
+                  'license':(base/'LICENSE').read_bytes()==source_license,
+                  'anchor_cache':(base/'anchor-cache'/'immutable.txt').read_bytes()==source_cache,
+                  'anchor_link_exists':os.path.islink(base/'anchor-untracked-link'),
+              }
+              result['upper_entries']=sorted(str(p.relative_to(upper)) for p in upper.rglob('*'))[:256]
+              out.write_text(json.dumps(result,indent=2,sort_keys=True)+'\n',encoding='utf-8'); print(json.dumps(result,indent=2,sort_keys=True))
+          finally:
+              if mounted: run(['sudo','umount',str(volume/'target')])
+              if target_registered: run(['git','worktree','remove','--force',str(volume/'target')],repo)
+              if base_registered: run(['git','worktree','remove','--force',str(volume/'base')],repo)
+              run(['sudo','umount',str(volume)]); shutil.rmtree(root,ignore_errors=True)
+          PY
+      - name: Persist result
+        if: always()
+        run: |
+          set -euo pipefail
+          test -f smolrunner-github-arm-overlay-git-semantics.json
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -C research/results-smolrunner-github-arm-overlay-git-semantics
+          git add -- smolrunner-github-arm-overlay-git-semantics.json
+          git commit -m 'research: record OverlayFS Git semantics'
+          git push --force origin HEAD:refs/heads/research/results-smolrunner-github-arm-overlay-git-semantics
