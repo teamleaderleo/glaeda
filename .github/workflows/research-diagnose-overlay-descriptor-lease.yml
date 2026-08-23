@@ -1,0 +1,63 @@
+name: Research diagnose OverlayFS descriptor lease
+
+on:
+  push:
+    branches:
+      - research/arm-build-overlay-descriptor-lease
+
+permissions:
+  contents: write
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: true
+          show-progress: false
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt --no-self-update
+      - name: Reuse candidate patch block
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          src=Path('.github/workflows/research-arm-build-overlay-descriptor-lease.yml').read_text().splitlines()
+          start=next(i for i,line in enumerate(src) if "python3 - <<'PY'" in line)+1
+          end=next(i for i in range(start,len(src)) if src[i].strip()=='PY')
+          lines=src[start:end]
+          indent=min(len(line)-len(line.lstrip()) for line in lines if line.strip())
+          Path('/tmp/patch.py').write_text('\n'.join(line[indent:] for line in lines)+'\n')
+          PY
+          python3 /tmp/patch.py
+          cargo fmt --all
+          cp src/trusted_overlay_mount_plan.rs /tmp/trusted_overlay_mount_plan.rs
+      - name: Run diagnostics
+        shell: bash
+        run: |
+          set +e
+          cargo test --locked trusted_overlay_mount_plan > /tmp/test.log 2>&1
+          TEST_RC=$?
+          cargo clippy --locked --all-targets --all-features -- -D warnings > /tmp/clippy.log 2>&1
+          CLIPPY_RC=$?
+          printf '{"test_rc":%s,"clippy_rc":%s}\n' "$TEST_RC" "$CLIPPY_RC" > /tmp/status.json
+          exit 0
+      - name: Publish diagnostic
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name teamleaderleo
+          git config user.email cheerleaderleo@outlook.com
+          OUT=research/results-overlay-descriptor-lease-diagnostic
+          git checkout --orphan "$OUT"
+          git rm -rf . >/dev/null 2>&1 || true
+          cp /tmp/trusted_overlay_mount_plan.rs ./trusted_overlay_mount_plan.rs
+          cp /tmp/status.json ./status.json
+          cp /tmp/test.log ./test.log
+          cp /tmp/clippy.log ./clippy.log
+          git add trusted_overlay_mount_plan.rs status.json test.log clippy.log
+          git commit -m 'Publish OverlayFS descriptor-lease diagnostics'
+          git push --force origin HEAD:"$OUT"
