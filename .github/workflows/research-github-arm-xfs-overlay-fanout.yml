@@ -1,0 +1,240 @@
+name: Research ARM XFS OverlayFS fanout
+
+on:
+  push:
+    branches:
+      - research/github-arm-xfs-overlay-fanout
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  overlay-fanout:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Compare ordinary and OverlayFS task views on XFS
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import concurrent.futures
+          import json
+          import os
+          import platform
+          import shutil
+          import subprocess
+          import tempfile
+          import time
+          from pathlib import Path
+
+          workspace = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          temp = Path(os.environ["RUNNER_TEMP"]).resolve()
+          root = Path(tempfile.mkdtemp(prefix="smolrunner-overlay-", dir=temp))
+          image = root / "xfs.img"
+          volume = root / "xfs"
+          volume.mkdir()
+          result_path = workspace / "smolrunner-github-arm-xfs-overlay-fanout.json"
+          mounted_overlay = []
+          worktrees = []
+
+          def run(argv, cwd=None):
+              start = time.monotonic_ns()
+              proc = subprocess.run(argv, cwd=cwd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+              return {
+                  "argv": argv,
+                  "returncode": proc.returncode,
+                  "elapsed_ms": round((time.monotonic_ns() - start) / 1_000_000, 3),
+                  "stdout": proc.stdout.strip()[:4096],
+                  "stderr": proc.stderr.strip()[:4096],
+              }
+
+          def sync_used(path):
+              subprocess.run(["sync", "-f", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+              st = os.statvfs(path)
+              return (st.f_blocks - st.f_bfree) * st.f_frsize
+
+          def parallel(items, fn):
+              start = time.monotonic_ns()
+              with concurrent.futures.ThreadPoolExecutor(max_workers=len(items)) as pool:
+                  records = list(pool.map(fn, items))
+              return round((time.monotonic_ns() - start) / 1_000_000, 3), records
+
+          def git_proof(path):
+              a = run(["git", "--no-optional-locks", "diff-files", "--quiet"], cwd=path)
+              b = run(["git", "--no-optional-locks", "diff-index", "--quiet", "HEAD", "--"], cwd=path)
+              return {
+                  "returncode": 0 if a["returncode"] == 0 and b["returncode"] == 0 else 1,
+                  "diff_files_ms": a["elapsed_ms"],
+                  "diff_files_rc": a["returncode"],
+                  "diff_index_ms": b["elapsed_ms"],
+                  "diff_index_rc": b["returncode"],
+              }
+
+          def register_no_checkout(path):
+              rec = run(["git", "worktree", "add", "--detach", "--no-checkout", str(path), "HEAD"], cwd=workspace)
+              if rec["returncode"] == 0:
+                  worktrees.append(path)
+              return rec
+
+          def remove_registered(path):
+              rec = run(["git", "worktree", "remove", "--force", str(path)], cwd=workspace)
+              if path in worktrees:
+                  worktrees.remove(path)
+              return rec
+
+          def baseline(count):
+              batch = volume / f"baseline-{count}"
+              batch.mkdir()
+              paths = [batch / f"task-{i:02d}" for i in range(count)]
+              before = sync_used(volume)
+              metadata_wall, metadata = parallel(paths, register_no_checkout)
+              materialize_wall, materialize = parallel(paths, lambda p: run(["git", "reset", "--hard", "HEAD"], cwd=p))
+              verify_wall, proof = parallel(paths, git_proof)
+              after = sync_used(volume)
+              cleanup_wall, cleanup = parallel(paths, remove_registered)
+              shutil.rmtree(batch, ignore_errors=True)
+              return {
+                  "metadata_wall_ms": metadata_wall,
+                  "materialize_wall_ms": materialize_wall,
+                  "verify_wall_ms": verify_wall,
+                  "work_wall_ms": round(metadata_wall + materialize_wall + verify_wall, 3),
+                  "successes": sum(1 for m, r, p in zip(metadata, materialize, proof) if m["returncode"] == 0 and r["returncode"] == 0 and p["returncode"] == 0),
+                  "used_delta": after - before,
+                  "cleanup_wall_ms": cleanup_wall,
+              }
+
+          def overlay(count, base):
+              batch = volume / f"overlay-{count}"
+              batch.mkdir()
+              entries = []
+              for i in range(count):
+                  target = batch / f"task-{i:02d}"
+                  upper = batch / f"upper-{i:02d}"
+                  work = batch / f"work-{i:02d}"
+                  upper.mkdir()
+                  work.mkdir()
+                  entries.append((target, upper, work))
+
+              before = sync_used(volume)
+              metadata_wall, metadata = parallel([e[0] for e in entries], register_no_checkout)
+
+              def mount_one(entry):
+                  target, upper, work = entry
+                  dotgit = target / ".git"
+                  if not dotgit.is_file():
+                      return {"returncode": 1, "elapsed_ms": 0, "stderr": "target .git file missing", "stdout": ""}
+                  shutil.move(str(dotgit), str(upper / ".git"))
+                  options = f"lowerdir={base},upperdir={upper},workdir={work}"
+                  rec = run(["sudo", "mount", "-t", "overlay", "overlay", "-o", options, str(target)])
+                  if rec["returncode"] == 0:
+                      mounted_overlay.append(target)
+                  return rec
+
+              mount_wall, mounts = parallel(entries, mount_one)
+              read_tree_wall, read_tree = parallel([e[0] for e in entries], lambda p: run(["git", "read-tree", "HEAD"], cwd=p))
+              refresh_wall, refresh = parallel([e[0] for e in entries], lambda p: run(["git", "update-index", "--refresh"], cwd=p))
+              verify_wall, proof = parallel([e[0] for e in entries], git_proof)
+              after_ready = sync_used(volume)
+
+              # Mutate one tracked file in every task and prove copy-up does not change the lower tree.
+              tracked = "Cargo.toml"
+              source_before = (base / tracked).read_bytes()
+              def mutate(entry):
+                  target, _, _ = entry
+                  start = time.monotonic_ns()
+                  with (target / tracked).open("ab") as handle:
+                      handle.write(b"\n# overlay-probe\n")
+                  return {"returncode": 0, "elapsed_ms": round((time.monotonic_ns() - start) / 1_000_000, 3)}
+              mutate_wall, mutations = parallel(entries, mutate)
+              after_mutation = sync_used(volume)
+              source_unchanged = (base / tracked).read_bytes() == source_before
+
+              def unmount_one(entry):
+                  target, _, _ = entry
+                  rec = run(["sudo", "umount", str(target)])
+                  if target in mounted_overlay:
+                      mounted_overlay.remove(target)
+                  return rec
+              unmount_wall, unmounts = parallel(entries, unmount_one)
+              cleanup_wall, cleanup = parallel([e[0] for e in entries], remove_registered)
+              shutil.rmtree(batch, ignore_errors=True)
+
+              return {
+                  "metadata_wall_ms": metadata_wall,
+                  "mount_wall_ms": mount_wall,
+                  "read_tree_wall_ms": read_tree_wall,
+                  "refresh_wall_ms": refresh_wall,
+                  "verify_wall_ms": verify_wall,
+                  "work_wall_ms": round(metadata_wall + mount_wall + read_tree_wall + refresh_wall + verify_wall, 3),
+                  "successes": sum(1 for m, mt, rt, rf, p in zip(metadata, mounts, read_tree, refresh, proof) if m["returncode"] == 0 and mt["returncode"] == 0 and rt["returncode"] == 0 and rf["returncode"] == 0 and p["returncode"] == 0),
+                  "ready_used_delta": after_ready - before,
+                  "mutation_wall_ms": mutate_wall,
+                  "mutation_used_delta": after_mutation - after_ready,
+                  "mutation_successes": sum(1 for r in mutations if r["returncode"] == 0),
+                  "source_unchanged": source_unchanged,
+                  "unmount_wall_ms": unmount_wall,
+                  "cleanup_wall_ms": cleanup_wall,
+              }
+
+          result = {
+              "schema_version": 1,
+              "runner": {
+                  "arch": os.environ.get("RUNNER_ARCH"),
+                  "machine": platform.machine(),
+                  "kernel": platform.release(),
+                  "cpu_count": os.cpu_count(),
+              },
+              "counts": {},
+          }
+
+          try:
+              assert run(["sudo", "-n", "true"])["returncode"] == 0
+              assert run(["truncate", "-s", "2G", str(image)])["returncode"] == 0
+              assert run(["sudo", "mkfs.xfs", "-f", "-q", "-m", "reflink=1", str(image)])["returncode"] == 0
+              assert run(["sudo", "mount", "-o", "loop", str(image), str(volume)])["returncode"] == 0
+              run(["sudo", "chown", f"{os.getuid()}:{os.getgid()}", str(volume)])
+
+              base = volume / "base"
+              base_add = run(["git", "worktree", "add", "--detach", str(base), "HEAD"], cwd=workspace)
+              assert base_add["returncode"] == 0, base_add
+              worktrees.append(base)
+              source_proof = git_proof(base)
+              assert source_proof["returncode"] == 0, source_proof
+              result["source"] = {
+                  "add": base_add,
+                  "proof": source_proof,
+                  "findmnt": run(["findmnt", "-T", str(base), "-n", "-o", "SOURCE,FSTYPE,OPTIONS"]),
+              }
+
+              for count in (1, 8, 32):
+                  result["counts"][str(count)] = {
+                      "baseline": baseline(count),
+                      "overlay": overlay(count, base),
+                  }
+
+              result_path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+              print(json.dumps(result, indent=2, sort_keys=True))
+          finally:
+              for target in reversed(list(mounted_overlay)):
+                  run(["sudo", "umount", str(target)])
+              for path in reversed(list(worktrees)):
+                  run(["git", "worktree", "remove", "--force", str(path)], cwd=workspace)
+              run(["sudo", "umount", str(volume)])
+              shutil.rmtree(root, ignore_errors=True)
+          PY
+
+      - name: Persist result
+        run: |
+          set -euo pipefail
+          test -f smolrunner-github-arm-xfs-overlay-fanout.json
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -C research/results-smolrunner-github-arm-xfs-overlay-fanout
+          git add -- smolrunner-github-arm-xfs-overlay-fanout.json
+          git commit -m 'research: record ARM XFS OverlayFS fanout'
+          git push --force origin HEAD:refs/heads/research/results-smolrunner-github-arm-xfs-overlay-fanout
