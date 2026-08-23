@@ -1,0 +1,85 @@
+name: Research root-owned immutable Git seed
+
+on:
+  push:
+    branches:
+      - research/github-arm-root-owned-git-seed
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: true
+          show-progress: false
+      - name: Probe root-owned seed isolation
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/smolrunner-root-owned-seed"
+          rm -rf "$ROOT"
+          mkdir -p "$ROOT"
+          git clone --bare --local . "$ROOT/seed.git" >/tmp/seed-clone.out 2>/tmp/seed-clone.err
+          sudo chown -R root:root "$ROOT/seed.git"
+          sudo find "$ROOT/seed.git" -type d -exec chmod 0555 {} +
+          sudo find "$ROOT/seed.git" -type f -exec chmod 0444 {} +
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, stat, subprocess
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'smolrunner-root-owned-seed'
+          seed=root/'seed.git'
+          def digest_tree(p):
+              h=hashlib.sha256()
+              for x in sorted(p.rglob('*')):
+                  rel=x.relative_to(p).as_posix().encode(); st=x.lstat()
+                  h.update(len(rel).to_bytes(4,'big')); h.update(rel)
+                  h.update((st.st_mode & 0o7777).to_bytes(4,'big'))
+                  h.update(st.st_uid.to_bytes(4,'big')); h.update(st.st_gid.to_bytes(4,'big'))
+                  if x.is_file():
+                      b=x.read_bytes(); h.update(len(b).to_bytes(8,'big')); h.update(b)
+              return h.hexdigest()
+          before=digest_tree(seed)
+          task=root/'task'
+          c=subprocess.run(['git','clone','--shared','--no-checkout',str(seed),str(task)],text=True,capture_output=True)
+          fetch=subprocess.run(['git','-C',str(task),'fetch','origin'],text=True,capture_output=True)
+          subprocess.run(['git','-C',str(task),'config','user.name','task'],check=True)
+          subprocess.run(['git','-C',str(task),'config','user.email','task@example.invalid'],check=True)
+          subprocess.run(['git','-C',str(task),'checkout','-f','HEAD'],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+          (task/'task-private.txt').write_text('private\n')
+          subprocess.run(['git','-C',str(task),'add','task-private.txt'],check=True)
+          subprocess.run(['git','-C',str(task),'commit','-m','private'],check=True,stdout=subprocess.DEVNULL)
+          private_head=subprocess.check_output(['git','-C',str(task),'rev-parse','HEAD'],text=True).strip()
+          chmod=subprocess.run(['chmod','u+w',str(seed/'objects')],text=True,capture_output=True)
+          touch=subprocess.run(['touch',str(seed/'refs'/'task-write')],text=True,capture_output=True)
+          push=subprocess.run(['git','-C',str(task),'push','origin','HEAD:refs/heads/task-write'],text=True,capture_output=True)
+          fsck=subprocess.run(['git','--git-dir',str(seed),'fsck','--full'],text=True,capture_output=True)
+          after=digest_tree(seed)
+          alt=(task/'.git'/'objects'/'info'/'alternates').read_text().strip()
+          out={
+              'schema_version':1,'arch':os.uname().machine,'kernel':os.uname().release,
+              'seed_owner_uid':seed.stat().st_uid,'seed_mode':oct(seed.stat().st_mode & 0o7777),
+              'clone_rc':c.returncode,'fetch_rc':fetch.returncode,'private_head':private_head,
+              'alternates_points_to_seed_objects': pathlib.Path(alt).resolve()==(seed/'objects').resolve(),
+              'chmod_seed_objects_rc':chmod.returncode,'touch_seed_refs_rc':touch.returncode,
+              'push_into_seed_rc':push.returncode,'seed_fsck_rc':fsck.returncode,
+              'seed_digest_before':before,'seed_digest_after':after,'seed_unchanged':before==after,
+          }
+          pathlib.Path('/tmp/result.json').write_text(json.dumps(out,indent=2,sort_keys=True)+'\n')
+          print(json.dumps(out,indent=2,sort_keys=True))
+          PY
+      - name: Publish owned result
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name teamleaderleo
+          git config user.email cheerleaderleo@outlook.com
+          OUT=research/results-smolrunner-github-arm-root-owned-git-seed
+          git checkout --orphan "$OUT"
+          git rm -rf . >/dev/null 2>&1 || true
+          cp /tmp/result.json ./smolrunner-github-arm-root-owned-git-seed.json
+          git add smolrunner-github-arm-root-owned-git-seed.json
+          git commit -m 'Record root-owned immutable Git seed probe'
+          git push --force origin HEAD:"$OUT"
