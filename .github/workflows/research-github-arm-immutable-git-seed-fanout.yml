@@ -1,0 +1,115 @@
+name: Research GitHub ARM immutable Git seed fanout
+
+on:
+  push:
+    branches:
+      - research/github-arm-immutable-git-seed-fanout
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: true
+          show-progress: false
+          fetch-depth: 0
+      - name: Benchmark immutable bare seed plus private task Git dirs
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/allfd.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <errno.h>
+          #include <fcntl.h>
+          #include <linux/mount.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <sys/mount.h>
+          #include <sys/syscall.h>
+          #include <unistd.h>
+          static int fsopenx(const char*n,unsigned f){return syscall(SYS_fsopen,n,f);} static int cfg(int fd,unsigned c,const char*k,const void*v,int a){return syscall(SYS_fsconfig,fd,c,k,v,a);} static int fsmountx(int fd,unsigned f,unsigned a){return syscall(SYS_fsmount,fd,f,a);} static int movex(int fd,const char*f,int td,const char*t,unsigned fl){return syscall(SYS_move_mount,fd,f,td,t,fl);} static void die(const char*s){fprintf(stderr,"%s errno=%d %s\n",s,errno,strerror(errno));exit(2);}
+          int main(int ac,char**av){if(ac!=5)return 64;int l=open(av[1],O_PATH|O_DIRECTORY|O_CLOEXEC);int u=open(av[2],O_PATH|O_DIRECTORY|O_CLOEXEC);int w=open(av[3],O_PATH|O_DIRECTORY|O_CLOEXEC);int t=open(av[4],O_PATH|O_DIRECTORY|O_CLOEXEC);if(l<0||u<0||w<0||t<0)die("open");int f=fsopenx("overlay",FSOPEN_CLOEXEC);if(f<0)die("fsopen");if(cfg(f,FSCONFIG_SET_FD,"lowerdir+",NULL,l)<0)die("lowerdir+");if(cfg(f,FSCONFIG_SET_FD,"upperdir",NULL,u)<0)die("upperdir");if(cfg(f,FSCONFIG_SET_FD,"workdir",NULL,w)<0)die("workdir");if(cfg(f,FSCONFIG_CMD_CREATE,NULL,NULL,0)<0)die("create");int m=fsmountx(f,FSMOUNT_CLOEXEC,MS_NODEV|MS_NOSUID);if(m<0)die("fsmount");if(movex(m,"",t,"",MOVE_MOUNT_F_EMPTY_PATH|MOVE_MOUNT_T_EMPTY_PATH)<0)die("move_mount");close(m);close(f);close(l);close(u);close(w);close(t);return 0;}
+          EOF
+          gcc -O2 -Wall -Wextra -Werror /tmp/allfd.c -o /tmp/allfd
+          python3 - <<'PY'
+          import concurrent.futures, hashlib, json, os, pathlib, shutil, stat, subprocess, time
+          src=pathlib.Path(os.environ['GITHUB_WORKSPACE']).resolve(); root=pathlib.Path(os.environ['RUNNER_TEMP'])/'smolrunner-immutable-seed';shutil.rmtree(root,ignore_errors=True);root.mkdir()
+          head=subprocess.check_output(['git','-C',str(src),'rev-parse','HEAD'],text=True).strip();src_index=pathlib.Path(subprocess.check_output(['git','-C',str(src),'rev-parse','--git-path','index'],text=True).strip());src_index=src_index if src_index.is_absolute() else (src/src_index).resolve();index_bytes=src_index.read_bytes()
+          seed=root/'seed.git'; t=time.perf_counter();p=subprocess.run(['git','clone','--bare','--no-hardlinks',str(src),str(seed)],text=True,capture_output=True);seed_ms=(time.perf_counter()-t)*1000
+          if p.returncode: raise SystemExit(p.stderr)
+          seed_head=subprocess.check_output(['git','--git-dir',str(seed),'rev-parse','HEAD'],text=True).strip();seed_bytes=int(subprocess.check_output(['du','-sk',str(seed)],text=True).split()[0])*1024
+          def tree_digest(path):
+              h=hashlib.sha256()
+              for base,dirs,files in os.walk(path):
+                  for n in sorted(dirs+files):
+                      q=pathlib.Path(base)/n; rel=str(q.relative_to(path)).encode();h.update(len(rel).to_bytes(4,'big'));h.update(rel)
+                      try:s=q.lstat();h.update(stat.S_IMODE(s.st_mode).to_bytes(4,'big'));h.update(s.st_size.to_bytes(8,'big'))
+                      except FileNotFoundError:pass
+                      if q.is_file() and q.stat().st_size<=1_048_576:h.update(q.read_bytes())
+              return h.hexdigest()
+          seed_digest_before=tree_digest(seed)
+          # Freeze every object and parent directory inside the seed.
+          changed=[]
+          for base,dirs,files in os.walk(seed):
+              for n in dirs+files:
+                  q=pathlib.Path(base)/n
+                  try:m=stat.S_IMODE(q.lstat().st_mode);changed.append((q,m));os.chmod(q,m&~0o222)
+                  except FileNotFoundError:pass
+          m=stat.S_IMODE(seed.lstat().st_mode);changed.append((seed,m));os.chmod(seed,m&~0o222)
+          def run(a):
+              r=subprocess.run(a,text=True,capture_output=True)
+              if r.returncode:raise RuntimeError(f'{a[:3]} rc={r.returncode} {r.stderr[-300:]}')
+              return r
+          def mount(u,w,t):run(['sudo','/tmp/allfd',str(src),str(u),str(w),str(t)])
+          def proof(p):
+              base=['git','--no-optional-locks','-c','core.hooksPath=/dev/null','-c','core.fsmonitor=false','-c','credential.helper=','-C',str(p)]
+              return subprocess.run(base+['diff-files','--quiet']).returncode==0 and subprocess.run(base+['diff-index','--quiet','HEAD','--']).returncode==0
+          results={}
+          try:
+              for count in (1,8,32):
+                  b=root/f'tasks-{count}';b.mkdir()
+                  def create(i):
+                      merged=b/f't{i}';gitdir=b/f'g{i}';upper=b/f'u{i}';work=b/f'w{i}'
+                      run(['git','-c','core.hooksPath=/dev/null','clone','--shared','--no-checkout','--separate-git-dir',str(gitdir),str(seed),str(merged)]);upper.mkdir();work.mkdir();shutil.copy2(merged/'.git',upper/'.git');(gitdir/'index').write_bytes(index_bytes)
+                      alt=(gitdir/'objects/info/alternates').read_text().strip();return merged,gitdir,upper,work,alt
+                  t=time.perf_counter()
+                  with concurrent.futures.ThreadPoolExecutor(max_workers=count) as ex:tasks=list(ex.map(create,range(count)))
+                  meta=(time.perf_counter()-t)*1000
+                  t=time.perf_counter()
+                  with concurrent.futures.ThreadPoolExecutor(max_workers=count) as ex:list(ex.map(lambda x:mount(x[2],x[3],x[0]),tasks))
+                  mount_ms=(time.perf_counter()-t)*1000
+                  t=time.perf_counter()
+                  with concurrent.futures.ThreadPoolExecutor(max_workers=count) as ex:proofs=list(ex.map(lambda x:proof(x[0]),tasks))
+                  proof_ms=(time.perf_counter()-t)*1000
+                  merged,gitdir,_,_,_=tasks[0];branch=f'seed-private-{count}';run(['git','-C',str(merged),'branch',branch,'HEAD']);run(['git','-C',str(merged),'config','smolrunner.seedprobe','private'])
+                  with (merged/'README.md').open('ab') as f:f.write(f'\nseed-private-{count}\n'.encode())
+                  run(['git','-C',str(merged),'add','README.md']);run(['git','-C',str(merged),'-c','user.name=Probe','-c','user.email=probe@example.invalid','commit','-qm','private commit']);private_commit=subprocess.check_output(['git','-C',str(merged),'rev-parse','HEAD'],text=True).strip();private_object=subprocess.run(['git','--git-dir',str(gitdir),'cat-file','-e',private_commit]).returncode==0
+                  fetch_rc=subprocess.run(['git','-C',str(merged),'fetch','origin'],text=True,capture_output=True).returncode
+                  push=subprocess.run(['git','-C',str(merged),'push','origin',f'HEAD:refs/heads/should-not-write-{count}'],text=True,capture_output=True)
+                  with concurrent.futures.ThreadPoolExecutor(max_workers=count) as ex:list(ex.map(lambda x:subprocess.run(['sudo','umount',str(x[0])],check=True),tasks))
+                  results[str(count)]={'metadata_wall_ms':round(meta,3),'mount_wall_ms':round(mount_ms,3),'proof_wall_ms':round(proof_ms,3),'proof_successes':sum(proofs),'alternates_exact':sum(x[4]==str((seed/'objects').resolve()) for x in tasks),'private_commit_object':private_object,'fetch_origin_rc':fetch_rc,'push_into_read_only_origin_rc':push.returncode}
+              seed_digest_after=tree_digest(seed)
+          finally:
+              for q,m in reversed(changed):
+                  try:os.chmod(q,m)
+                  except FileNotFoundError:pass
+          out={'schema_version':1,'arch':os.uname().machine,'kernel':os.uname().release,'head':head,'seed':{'cold_create_ms':round(seed_ms,3),'bytes':seed_bytes,'head':seed_head,'read_only_during_tasks':True,'digest_unchanged':seed_digest_before==seed_digest_after},'counts':results};pathlib.Path('/tmp/result.json').write_text(json.dumps(out,indent=2,sort_keys=True)+'\n');print(json.dumps(out,indent=2,sort_keys=True))
+          PY
+      - name: Publish owned result
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name teamleaderleo
+          git config user.email cheerleaderleo@outlook.com
+          OUT=research/results-smolrunner-github-arm-immutable-git-seed-fanout
+          git checkout --orphan "$OUT"
+          git rm -rf . >/dev/null 2>&1 || true
+          cp /tmp/result.json ./smolrunner-github-arm-immutable-git-seed-fanout.json
+          git add smolrunner-github-arm-immutable-git-seed-fanout.json
+          git commit -m 'Record hosted ARM immutable Git seed fanout'
+          git push --force origin HEAD:"$OUT"
