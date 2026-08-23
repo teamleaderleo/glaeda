@@ -1,0 +1,51 @@
+{
+  "anchor": {
+    "cold_ms": 6767.19,
+    "warm_no_edit_ms": 52.877
+  },
+  "edits": [
+    {
+      "elapsed_ms": 546.383,
+      "module": 0,
+      "returncode": 0,
+      "step": 1,
+      "used_delta_from_setup": 14004224
+    },
+    {
+      "elapsed_ms": 310.34,
+      "module": 1,
+      "returncode": 0,
+      "step": 2,
+      "used_delta_from_setup": 16982016
+    },
+    {
+      "elapsed_ms": 302.185,
+      "module": 2,
+      "returncode": 0,
+      "step": 3,
+      "used_delta_from_setup": 17022976
+    },
+    {
+      "elapsed_ms": 299.392,
+      "module": 3,
+      "returncode": 0,
+      "step": 4,
+      "used_delta_from_setup": 17027072
+    },
+    {
+      "elapsed_ms": 302.23,
+      "module": 4,
+      "returncode": 0,
+      "step": 5,
+      "used_delta_from_setup": 17031168
+    }
+  ],
+  "final_no_edit_ms": 55.246,
+  "final_no_edit_returncode": 0,
+  "schema_version": 1,
+  "setup": {
+    "mount_ms": 8.36,
+    "target_clone_ms": 44.337,
+    "worktree_ms": 2.247
+  }
+}
