@@ -1,0 +1,63 @@
+name: Research verify OverlayFS descriptor lease v2
+
+on:
+  push:
+    branches:
+      - research/arm-build-overlay-descriptor-lease-v2
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: true
+          show-progress: false
+          fetch-depth: 0
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt --no-self-update
+      - name: Rebuild descriptor candidate and verify
+        shell: bash
+        run: |
+          set -u
+          git fetch origin research/results-overlay-descriptor-lease-diagnostic
+          git show origin/research/results-overlay-descriptor-lease-diagnostic:trusted_overlay_mount_plan.rs > src/trusted_overlay_mount_plan.rs
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/trusted_overlay_mount_plan.rs')
+          s=p.read_text()
+          old='''        mtime_nsec: stat.st_mtime_nsec,\n        ctime: stat.st_ctime,\n        ctime_nsec: stat.st_ctime_nsec,'''
+          new='''        mtime_nsec: i64::try_from(stat.st_mtime_nsec).map_err(|_| unsafe_filesystem())?,\n        ctime: stat.st_ctime,\n        ctime_nsec: i64::try_from(stat.st_ctime_nsec).map_err(|_| unsafe_filesystem())?,'''
+          if old not in s:
+              raise SystemExit('nanosecond conversion point missing')
+          p.write_text(s.replace(old,new,1))
+          PY
+          cargo fmt --all
+          set +e
+          cargo test --locked trusted_overlay_mount_plan > /tmp/test.log 2>&1
+          test_rc=$?
+          cargo clippy --locked --all-targets --all-features -- -D warnings > /tmp/clippy.log 2>&1
+          clippy_rc=$?
+          set -e
+          cp src/trusted_overlay_mount_plan.rs /tmp/trusted_overlay_mount_plan.rs
+          printf '{"test_rc":%s,"clippy_rc":%s}\n' "$test_rc" "$clippy_rc" > /tmp/status.json
+      - name: Publish diagnostic
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name teamleaderleo
+          git config user.email cheerleaderleo@outlook.com
+          OUT=research/results-overlay-descriptor-lease-v2
+          git checkout --orphan "$OUT"
+          git rm -rf . >/dev/null 2>&1 || true
+          cp /tmp/status.json ./status.json
+          cp /tmp/test.log ./test.log
+          cp /tmp/clippy.log ./clippy.log
+          cp /tmp/trusted_overlay_mount_plan.rs ./trusted_overlay_mount_plan.rs
+          git add status.json test.log clippy.log trusted_overlay_mount_plan.rs
+          git commit -m 'Publish OverlayFS descriptor lease v2 diagnostic'
+          git push --force origin HEAD:"$OUT"
