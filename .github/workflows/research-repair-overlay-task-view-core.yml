@@ -1,0 +1,103 @@
+name: Research repair overlay task-view core
+
+on:
+  push:
+    branches:
+      - research/repair-overlay-task-view-core
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: codex/trusted-overlay-task-view-core
+          fetch-depth: 0
+      - name: Refine revisions, export, format, and verify
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          module=Path('src/trusted_overlay_task_view.rs')
+          text=module.read_text(encoding='utf-8')
+          typo='fn quarantined_and_retired_states_are mutation_terminal()'
+          if typo in text:
+              text=text.replace(typo,'fn quarantined_and_retired_states_are_mutation_terminal()')
+
+          needle='''positive_generation_type!(
+    OverlaySourceAnchorGeneration,
+    "invalid_overlay_source_anchor_generation",
+    "overlay source-anchor generation must be greater than zero"
+);
+'''
+          addition=needle+'''positive_generation_type!(
+    OverlaySourceAnchorRevision,
+    "invalid_overlay_source_anchor_revision",
+    "overlay source-anchor revision must be greater than zero"
+);
+'''
+          if 'OverlaySourceAnchorRevision' not in text:
+              if text.count(needle)!=1: raise SystemExit('anchor generation marker mismatch')
+              text=text.replace(needle,addition)
+              marker='''impl OverlayTaskViewRevision {
+    fn next(self) -> Result<Self, TrustedOverlayTaskViewError> {
+        Self::new(self.0.checked_add(1).ok_or_else(generation_exhausted)?)
+    }
+}
+'''
+              anchor_impl='''impl OverlaySourceAnchorRevision {
+    fn next(self) -> Result<Self, TrustedOverlayTaskViewError> {
+        Self::new(self.0.checked_add(1).ok_or_else(generation_exhausted)?)
+    }
+}
+
+'''
+              if text.count(marker)!=1: raise SystemExit('task revision impl marker mismatch')
+              text=text.replace(marker,anchor_impl+marker)
+              text=text.replace('''pub struct OverlaySourceAnchorRecord {
+    schema_version: u8,
+    revision: OverlayTaskViewRevision,
+''','''pub struct OverlaySourceAnchorRecord {
+    schema_version: u8,
+    revision: OverlaySourceAnchorRevision,
+''',1)
+              text=text.replace('''            revision: OverlayTaskViewRevision(1),
+            binding,
+''','''            revision: OverlaySourceAnchorRevision(1),
+            binding,
+''',1)
+              text=text.replace('''    pub const fn revision(&self) -> OverlayTaskViewRevision {
+        self.revision
+    }
+
+    #[must_use]
+    pub const fn binding''','''    pub const fn revision(&self) -> OverlaySourceAnchorRevision {
+        self.revision
+    }
+
+    #[must_use]
+    pub const fn binding''',1)
+          module.write_text(text,encoding='utf-8')
+
+          lib=Path('src/lib.rs'); text=lib.read_text(encoding='utf-8')
+          addition='/// Pure authority and lifecycle core for trusted resident OverlayFS task views.\npub mod trusted_overlay_task_view;\n'
+          marker='/// Descriptor-relative trusted producer for runner workspace and cache identity receipts.\n'
+          if addition not in text:
+              if text.count(marker)!=1: raise SystemExit('lib insertion marker mismatch')
+              text=text.replace(marker,addition+marker)
+              lib.write_text(text,encoding='utf-8')
+          PY
+          cargo fmt --all
+          cargo test --locked trusted_overlay_task_view
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/trusted_overlay_task_view.rs src/lib.rs
+          git commit -m 'M6: add pure trusted OverlayFS task-view core'
+          git push origin HEAD:codex/trusted-overlay-task-view-core
