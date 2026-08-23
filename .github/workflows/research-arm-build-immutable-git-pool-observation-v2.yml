@@ -1,0 +1,66 @@
+name: Research verify immutable Git pool observation v2
+
+on:
+  push:
+    branches:
+      - research/arm-build-immutable-git-pool-observation-v2
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: true
+          show-progress: false
+          fetch-depth: 0
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt --no-self-update
+      - name: Rebuild observer candidate and verify
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin research/results-immutable-git-pool-observation-diagnostic
+          git show origin/research/results-immutable-git-pool-observation-diagnostic:immutable_git_object_pool_observation.rs > src/immutable_git_object_pool_observation.rs
+          git show origin/research/results-immutable-git-pool-observation-diagnostic:lib.rs > src/lib.rs
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/immutable_git_object_pool_observation.rs');s=p.read_text()
+          s=s.replace('use rustix::io::Errno;', 'use rustix::io::{Errno, fcntl_dupfd_cloexec};', 1)
+          s=s.replace('rustix_fs::fcntl_dupfd_cloexec(base, 0)', 'fcntl_dupfd_cloexec(base, 0)', 1)
+
+          old='''        let source = fixture.pool.join(OBJECTS_NAME).join("pack-a");\n        let alias = fixture.pool.join(OBJECTS_NAME).join("pack-b");\n        fs::hard_link(&source, &alias).unwrap();\n        fs::set_permissions(&alias, fs::Permissions::from_mode(FILE_MODE)).unwrap();'''
+          new='''        let objects = fixture.pool.join(OBJECTS_NAME);\n        let source = objects.join("pack-a");\n        let alias = objects.join("pack-b");\n        fs::set_permissions(&objects, fs::Permissions::from_mode(0o755)).unwrap();\n        fs::hard_link(&source, &alias).unwrap();\n        fs::set_permissions(&alias, fs::Permissions::from_mode(FILE_MODE)).unwrap();\n        fs::set_permissions(&objects, fs::Permissions::from_mode(0o555)).unwrap();'''
+          if old not in s: raise SystemExit('hardlink fixture point missing')
+          s=s.replace(old,new,1)
+
+          old='''        let symlink_path = fixture.pool.join("symlink");\n        symlink("HEAD", &symlink_path).unwrap();'''
+          new='''        let symlink_path = fixture.pool.join("symlink");\n        fs::set_permissions(&fixture.pool, fs::Permissions::from_mode(0o755)).unwrap();\n        symlink("HEAD", &symlink_path).unwrap();\n        fs::set_permissions(&fixture.pool, fs::Permissions::from_mode(0o555)).unwrap();'''
+          if old not in s: raise SystemExit('symlink fixture point missing')
+          s=s.replace(old,new,1)
+          old='''        fs::remove_file(&symlink_path).unwrap();\n\n        let alternates = fixture.pool.join(OBJECTS_NAME).join("info").join("alternates");\n        fs::write(&alternates, b"/other/objects\\n").unwrap();\n        fs::set_permissions(&alternates, fs::Permissions::from_mode(FILE_MODE)).unwrap();'''
+          new='''        fs::set_permissions(&fixture.pool, fs::Permissions::from_mode(0o755)).unwrap();\n        fs::remove_file(&symlink_path).unwrap();\n        fs::set_permissions(&fixture.pool, fs::Permissions::from_mode(0o555)).unwrap();\n\n        let info = fixture.pool.join(OBJECTS_NAME).join("info");\n        let alternates = info.join("alternates");\n        fs::set_permissions(&info, fs::Permissions::from_mode(0o755)).unwrap();\n        fs::write(&alternates, b"/other/objects\\n").unwrap();\n        fs::set_permissions(&alternates, fs::Permissions::from_mode(FILE_MODE)).unwrap();\n        fs::set_permissions(&info, fs::Permissions::from_mode(0o555)).unwrap();'''
+          if old not in s: raise SystemExit('alternate fixture point missing')
+          s=s.replace(old,new,1)
+          p.write_text(s)
+          PY
+          cargo fmt --all
+          cargo test --locked immutable_git_object_pool_observation
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cp src/immutable_git_object_pool_observation.rs /tmp/immutable_git_object_pool_observation.rs
+          cp src/lib.rs /tmp/lib.rs
+      - name: Publish verified source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name teamleaderleo; git config user.email cheerleaderleo@outlook.com
+          OUT=research/results-immutable-git-pool-observation-source
+          git checkout --orphan "$OUT"; git rm -rf . >/dev/null 2>&1 || true
+          cp /tmp/immutable_git_object_pool_observation.rs ./immutable_git_object_pool_observation.rs
+          cp /tmp/lib.rs ./lib.rs
+          git add immutable_git_object_pool_observation.rs lib.rs
+          git commit -m 'Publish verified immutable Git pool observation source'
+          git push --force origin HEAD:"$OUT"
