@@ -4,8 +4,9 @@ pub use smolrunner::artifact;
 pub use smolrunner::descriptor_bound_launcher;
 pub use smolrunner::trusted_overlay_task_view;
 
-#[path = "../src/trusted_overlay_mount_plan.rs"]
-mod trusted_overlay_mount_plan;
+mod trusted_overlay_mount_plan {
+    include!("../src/trusted_overlay_mount_plan.rs");
+}
 
 #[test]
 fn trusted_overlay_mount_plan_compiles_in_linux_test_crate() {
