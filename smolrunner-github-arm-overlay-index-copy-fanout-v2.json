@@ -1,0 +1,80 @@
+{
+  "counts": {
+    "1": {
+      "baseline": {
+        "cleanup_wall_ms": 8.246,
+        "materialize_wall_ms": 26.812,
+        "metadata_wall_ms": 3.355,
+        "successes": 1,
+        "used_delta": 8441856,
+        "verify_wall_ms": 46.07,
+        "work_wall_ms": 76.237
+      },
+      "overlay_index_copy": {
+        "cleanup_wall_ms": 1.368,
+        "index_copy_wall_ms": 1.588,
+        "metadata_wall_ms": 2.164,
+        "mount_wall_ms": 7.673,
+        "successes": 1,
+        "unmount_wall_ms": 7.944,
+        "used_delta": 4096,
+        "verify_wall_ms": 4.476,
+        "work_wall_ms": 15.901
+      }
+    },
+    "32": {
+      "baseline": {
+        "cleanup_wall_ms": 350.904,
+        "materialize_wall_ms": 429.678,
+        "metadata_wall_ms": 30.578,
+        "successes": 32,
+        "used_delta": 269848576,
+        "verify_wall_ms": 235.374,
+        "work_wall_ms": 695.63
+      },
+      "overlay_index_copy": {
+        "cleanup_wall_ms": 27.927,
+        "index_copy_wall_ms": 28.375,
+        "metadata_wall_ms": 26.565,
+        "mount_wall_ms": 65.687,
+        "successes": 32,
+        "unmount_wall_ms": 66.174,
+        "used_delta": 163840,
+        "verify_wall_ms": 54.595,
+        "work_wall_ms": 175.222
+      }
+    },
+    "8": {
+      "baseline": {
+        "cleanup_wall_ms": 74.658,
+        "materialize_wall_ms": 106.805,
+        "metadata_wall_ms": 8.383,
+        "successes": 8,
+        "used_delta": 67465216,
+        "verify_wall_ms": 109.155,
+        "work_wall_ms": 224.343
+      },
+      "overlay_index_copy": {
+        "cleanup_wall_ms": 5.447,
+        "index_copy_wall_ms": 9.583,
+        "metadata_wall_ms": 7.925,
+        "mount_wall_ms": 21.7,
+        "successes": 8,
+        "unmount_wall_ms": 17.859,
+        "used_delta": 32768,
+        "verify_wall_ms": 13.188,
+        "work_wall_ms": 52.396
+      }
+    }
+  },
+  "schema_version": 1,
+  "source": {
+    "index_bytes": 42092,
+    "proof": {
+      "diff_files_ms": 22.545,
+      "diff_index_ms": 22.787,
+      "returncode": 0
+    },
+    "refresh_ms": 23.454
+  }
+}
