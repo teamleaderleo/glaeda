@@ -1,0 +1,47 @@
+name: Research hosted ARM LVM VDO probe
+
+on:
+  push:
+    branches:
+      - research/github-arm-vdo-lvm-probe
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+      - name: Load dm-vdo and inspect LVM support
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, subprocess, time
+          from pathlib import Path
+          def run(argv):
+              start=time.monotonic_ns(); p=subprocess.run(argv,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=False)
+              return {'argv':argv,'returncode':p.returncode,'elapsed_ms':round((time.monotonic_ns()-start)/1_000_000,3),'stdout':p.stdout.strip()[:20000],'stderr':p.stderr.strip()[:12000]}
+          result={'schema_version':1}
+          result['modprobe']=run(['sudo','modprobe','dm_vdo'])
+          result['dmsetup_targets_after']=run(['sudo','dmsetup','targets'])
+          result['lvm_version_sudo']=run(['sudo','lvm','version'])
+          result['segtypes']=run(['sudo','lvm','segtypes'])
+          result['lvcreate_vdo_help']=run(['sudo','lvcreate','--type','vdo','--help'])
+          result['lvcreate_vdopool_help']=run(['sudo','lvcreate','--type','vdo-pool','--help'])
+          Path('smolrunner-github-arm-vdo-lvm-probe.json').write_text(json.dumps(result,indent=2,sort_keys=True)+'\n',encoding='utf-8')
+          print(json.dumps(result,indent=2,sort_keys=True))
+          PY
+      - name: Persist result
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -C research/results-smolrunner-github-arm-vdo-lvm-probe
+          git add -- smolrunner-github-arm-vdo-lvm-probe.json
+          git commit -m 'research: record LVM VDO probe'
+          git push --force origin HEAD:refs/heads/research/results-smolrunner-github-arm-vdo-lvm-probe
