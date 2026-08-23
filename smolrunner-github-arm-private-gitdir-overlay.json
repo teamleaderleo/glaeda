@@ -1,0 +1,41 @@
+{
+  "arch": "aarch64",
+  "head": "400440440a93deb6a72c96c9b0287c61c553abc2",
+  "kernel": "6.17.0-1022-azure",
+  "linked_worktree": {
+    "index_copy_ms": 0.089,
+    "metadata_err": "Preparing worktree (detached HEAD 4004404)",
+    "metadata_ms": 1.79,
+    "metadata_rc": 0,
+    "mount_ms": 7.215,
+    "proof": {
+      "diff_files": 0,
+      "diff_index": 0
+    }
+  },
+  "private_shared_clone": {
+    "alternates_points_to_source_objects": true,
+    "alternates_present": true,
+    "head": "400440440a93deb6a72c96c9b0287c61c553abc2",
+    "index_copy_ms": 0.064,
+    "metadata_err": "Cloning into '/home/runner/work/_temp/smolrunner-private-gitdir/private'...\ndone.",
+    "metadata_ms": 6.333,
+    "metadata_rc": 0,
+    "mount_ms": 6.826,
+    "new_blob": "b118c690bd07565bd4aa15b087f760e7891642da",
+    "private_branch_exists": true,
+    "private_config_set": true,
+    "private_has_new_blob": true,
+    "proof": {
+      "diff_files": 0,
+      "diff_index": 0
+    },
+    "source_branch_absent": true,
+    "source_config_unchanged": true,
+    "source_config_unchanged_after_private_config": true,
+    "source_refs_unchanged": true
+  },
+  "schema_version": 1,
+  "source_index_bytes": 42372,
+  "source_index_sha256": "3e4da5711875fb2688c63a79aada992330977b79a16985e9c3d052a9f5254b03"
+}
