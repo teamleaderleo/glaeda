@@ -1,0 +1,57 @@
+{
+  "counts": {
+    "1": {
+      "cleanup_wall_ms": 1.582,
+      "index_copy_wall_ms": 1.692,
+      "metadata_wall_ms": 3.684,
+      "mount_wall_ms": 6.665,
+      "mutation_successes": 1,
+      "mutation_used_delta": 4096,
+      "mutation_wall_ms": 3.448,
+      "ready_used_delta": 12288,
+      "successes": 1,
+      "unmount_wall_ms": 7.719,
+      "verify_wall_ms": 48.399,
+      "work_wall_ms": 60.44
+    },
+    "32": {
+      "cleanup_wall_ms": 28.902,
+      "index_copy_wall_ms": 34.071,
+      "metadata_wall_ms": 30.755,
+      "mount_wall_ms": 69.024,
+      "mutation_successes": 32,
+      "mutation_used_delta": 131072,
+      "mutation_wall_ms": 29.545,
+      "ready_used_delta": 393216,
+      "successes": 32,
+      "unmount_wall_ms": 69.892,
+      "verify_wall_ms": 61.643,
+      "work_wall_ms": 195.493
+    },
+    "8": {
+      "cleanup_wall_ms": 7.183,
+      "index_copy_wall_ms": 6.888,
+      "metadata_wall_ms": 7.46,
+      "mount_wall_ms": 21.166,
+      "mutation_successes": 8,
+      "mutation_used_delta": 32768,
+      "mutation_wall_ms": 8.864,
+      "ready_used_delta": 98304,
+      "successes": 8,
+      "unmount_wall_ms": 21.764,
+      "verify_wall_ms": 102.666,
+      "work_wall_ms": 138.18
+    }
+  },
+  "filesystem": "ext4",
+  "schema_version": 1,
+  "source": {
+    "index_bytes": 42084,
+    "proof": {
+      "diff_files_ms": 23.3,
+      "diff_index_ms": 23.42,
+      "returncode": 0
+    },
+    "refresh_ms": 23.707
+  }
+}
