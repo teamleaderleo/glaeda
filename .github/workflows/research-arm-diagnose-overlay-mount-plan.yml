@@ -1,0 +1,62 @@
+name: Research ARM diagnose OverlayFS mount plan
+
+on:
+  push:
+    branches:
+      - research/arm-diagnose-overlay-mount-plan
+
+permissions:
+  contents: write
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: codex/trusted-overlay-mount-plan
+          persist-credentials: true
+          show-progress: false
+      - name: Export module ephemerally
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('src/lib.rs')
+          s = p.read_text()
+          needle = '/// Pure authority and lifecycle core for trusted resident OverlayFS task views.\npub mod trusted_overlay_task_view;'
+          repl = '#[cfg(target_os = "linux")]\npub mod trusted_overlay_mount_plan;\n' + needle
+          if repl not in s:
+              if needle not in s:
+                  raise SystemExit('export insertion point missing')
+              p.write_text(s.replace(needle, repl, 1))
+          PY
+      - name: Run diagnostics
+        shell: bash
+        run: |
+          set +e
+          cargo fmt --all -- --check > /tmp/fmt.log 2>&1; FMT=$?
+          cargo test --locked trusted_overlay_mount_plan > /tmp/test.log 2>&1; TEST=$?
+          cargo clippy --locked --all-targets --all-features -- -D warnings > /tmp/clippy.log 2>&1; CLIPPY=$?
+          python3 - <<PY
+          import json
+          json.dump({'fmt': $FMT, 'test': $TEST, 'clippy': $CLIPPY}, open('/tmp/status.json','w'), indent=2)
+          PY
+          exit 0
+      - name: Publish diagnostic
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name teamleaderleo
+          git config user.email cheerleaderleo@outlook.com
+          OUT=research/results-arm-overlay-mount-plan-diagnostic
+          git checkout --orphan "$OUT"
+          git rm -rf . >/dev/null 2>&1 || true
+          mkdir -p logs
+          cp /tmp/status.json status.json
+          cp /tmp/fmt.log logs/fmt.log
+          cp /tmp/test.log logs/test.log
+          cp /tmp/clippy.log logs/clippy.log
+          git add status.json logs
+          git commit -m 'Record ARM OverlayFS mount plan diagnostics'
+          git push --force origin HEAD:"$OUT"
