@@ -1,0 +1,70 @@
+name: Research OverlayFS parent-fd reopen
+
+on:
+  push:
+    branches:
+      - research/github-arm-overlay-parent-reopen
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: true
+          show-progress: false
+      - name: Probe parent-fd visible mount reopen
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat >/tmp/parent-reopen.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <errno.h>
+          #include <fcntl.h>
+          #include <linux/mount.h>
+          #include <linux/stat.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <sys/syscall.h>
+          #include <unistd.h>
+          #ifndef STATX_MNT_ID_UNIQUE
+          #define STATX_MNT_ID_UNIQUE 0x00004000U
+          #endif
+          static int fsopenx(const char*n,unsigned f){return syscall(SYS_fsopen,n,f);} static int cfg(int fd,unsigned c,const char*k,const void*v,int a){return syscall(SYS_fsconfig,fd,c,k,v,a);} static int fsmountx(int fd,unsigned f,unsigned a){return syscall(SYS_fsmount,fd,f,a);} static int movex(int fd,const char*f,int td,const char*t,unsigned fl){return syscall(SYS_move_mount,fd,f,td,t,fl);} static unsigned long long mid(int fd){struct statx st={0};if(syscall(SYS_statx,fd,"",AT_EMPTY_PATH|AT_STATX_SYNC_AS_STAT,STATX_MNT_ID_UNIQUE,&st)<0)return 0;return st.stx_mnt_id;} static void die(const char*s){fprintf(stderr,"%s errno=%d %s\n",s,errno,strerror(errno));exit(2);}
+          int main(int ac,char**av){if(ac!=6)return 64;int l=open(av[1],O_PATH|O_DIRECTORY|O_CLOEXEC),u=open(av[2],O_PATH|O_DIRECTORY|O_CLOEXEC),w=open(av[3],O_PATH|O_DIRECTORY|O_CLOEXEC),p=open(av[4],O_PATH|O_DIRECTORY|O_CLOEXEC);if(l<0||u<0||w<0||p<0)die("open roles");int t=openat(p,av[5],O_PATH|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);if(t<0)die("open target");unsigned long long under=mid(t);int f=fsopenx("overlay",FSOPEN_CLOEXEC);if(f<0)die("fsopen");if(cfg(f,FSCONFIG_SET_FD,"lowerdir+",NULL,l)<0)die("lower");if(cfg(f,FSCONFIG_SET_FD,"upperdir",NULL,u)<0)die("upper");if(cfg(f,FSCONFIG_SET_FD,"workdir",NULL,w)<0)die("work");if(cfg(f,FSCONFIG_CMD_CREATE,NULL,NULL,0)<0)die("create");int m=fsmountx(f,FSMOUNT_CLOEXEC,MS_NODEV|MS_NOSUID);if(m<0)die("fsmount");unsigned long long mountid=mid(m);if(movex(m,"",t,"",MOVE_MOUNT_F_EMPTY_PATH|MOVE_MOUNT_T_EMPTY_PATH)<0)die("move_mount");int v=openat(p,av[5],O_PATH|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);if(v<0)die("reopen visible");unsigned long long visible=mid(v);int base=openat(v,"base.txt",O_RDONLY|O_CLOEXEC);int base_errno=errno;char buf[16]={0};ssize_t n=base>=0?read(base,buf,sizeof(buf)-1):-1;printf("under=%llu\nmount=%llu\nvisible=%llu\nbase_rc=%d\nbase_errno=%d\nbase_read=%zd\nbase_value=%s\n",under,mountid,visible,base,base_errno,n,n>0?buf:"");return 0;}
+          EOF
+          gcc -O2 -Wall -Wextra -Werror /tmp/parent-reopen.c -o /tmp/parent-reopen
+          ROOT="$RUNNER_TEMP/smolrunner-parent-reopen"; rm -rf "$ROOT"; mkdir -p "$ROOT/lower" "$ROOT/upper" "$ROOT/work" "$ROOT/targets/merged"; printf 'base\n' > "$ROOT/lower/base.txt"
+          sudo /tmp/parent-reopen "$ROOT/lower" "$ROOT/upper" "$ROOT/work" "$ROOT/targets" merged >/tmp/probe.txt
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess
+          vals={}
+          for line in pathlib.Path('/tmp/probe.txt').read_text().splitlines(): k,v=line.split('=',1);vals[k]=v
+          out={'schema_version':1,'arch':os.uname().machine,'kernel':os.uname().release}
+          for k in ['under','mount','visible','base_rc','base_errno','base_read']: out[k]=int(vals[k])
+          out['base_value']=vals.get('base_value','')
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'smolrunner-parent-reopen'
+          out['findmnt']=subprocess.run(['findmnt','-T',str(root/'targets'/'merged'),'-n','-o','ID,FSTYPE,OPTIONS'],text=True,capture_output=True).stdout.strip()
+          out['visible_matches_mount']=out['visible']==out['mount'] and out['visible']!=0
+          out['under_differs']=out['under']!=out['mount']
+          subprocess.run(['sudo','umount',str(root/'targets'/'merged')],check=True)
+          pathlib.Path('/tmp/result.json').write_text(json.dumps(out,indent=2,sort_keys=True)+'\n')
+          print(json.dumps(out,indent=2,sort_keys=True))
+          PY
+      - name: Publish owned result
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name teamleaderleo
+          git config user.email cheerleaderleo@outlook.com
+          OUT=research/results-smolrunner-github-arm-overlay-parent-reopen
+          git checkout --orphan "$OUT"
+          git rm -rf . >/dev/null 2>&1 || true
+          cp /tmp/result.json ./smolrunner-github-arm-overlay-parent-reopen.json
+          git add smolrunner-github-arm-overlay-parent-reopen.json
+          git commit -m 'Record OverlayFS parent-fd reopen probe'
+          git push --force origin HEAD:"$OUT"
