@@ -104,6 +104,8 @@ pub mod host_readiness_verdict;
 pub mod host_rootless_podman;
 /// Pure bounded observation-only receipts for blazingly hot execution measurements.
 pub mod hot_execution_performance;
+/// Pure path-class policy for selecting reviewed hot-state sharing mechanisms.
+pub mod hot_state_path_policy;
 #[cfg(target_os = "linux")]
 pub mod installation_id;
 pub mod journal;
