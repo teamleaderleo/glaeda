@@ -1,0 +1,101 @@
+name: Research diagnose trusted OverlayFS mount plan
+
+on:
+  push:
+    branches:
+      - research/diagnose-overlay-mount-plan
+
+permissions:
+  contents: write
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: codex/trusted-overlay-mount-plan
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt --no-self-update
+      - name: Apply reviewed edits
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          lib = Path('src/lib.rs')
+          text = lib.read_text()
+          needle = '/// Pure authority and lifecycle core for trusted resident OverlayFS task views.\npub mod trusted_overlay_task_view;'
+          replacement = '#[cfg(target_os = "linux")]\n/// Read-only exact prerequisite observation and sealed intent for trusted OverlayFS mounts.\npub mod trusted_overlay_mount_plan;\n/// Pure authority and lifecycle core for trusted resident OverlayFS task views.\npub mod trusted_overlay_task_view;'
+          if replacement not in text:
+              text = text.replace(needle, replacement, 1)
+          lib.write_text(text)
+
+          path = Path('src/trusted_overlay_mount_plan.rs')
+          text = path.read_text().replace('SingleLowerV1', 'SingleLowerNodevNosuidV1')
+          if 'pub const fn mount_namespace_device' not in text:
+              text = text.replace(
+                  '    #[must_use]\n    pub const fn mount_namespace_inode(&self) -> u64 {\n        self.mount_namespace_inode\n    }',
+                  '    #[must_use]\n    pub const fn mount_namespace_device(&self) -> u64 {\n        self.mount_namespace_device\n    }\n\n    #[must_use]\n    pub const fn mount_namespace_inode(&self) -> u64 {\n        self.mount_namespace_inode\n    }',
+                  1,
+              )
+          if 'left.starts_with(right.as_path())' not in text:
+              text = text.replace(
+                  '        for (index, left) in paths.iter().enumerate() {\n            if paths.iter().skip(index + 1).any(|right| *left == *right) {\n                return Err(role_conflict());\n            }\n        }',
+                  '        for (index, left) in paths.iter().enumerate() {\n            for right in paths.iter().skip(index + 1) {\n                if *left == *right\n                    || left.starts_with(right.as_path())\n                    || right.starts_with(left.as_path())\n                {\n                    return Err(role_conflict());\n                }\n            }\n        }',
+                  1,
+              )
+          text = text.replace('lexically distinct from every other role.', 'lexically disjoint from every other role; no role may contain another.', 1)
+          if 'directory_role_count' not in text:
+              text = text.replace(
+                  'impl fmt::Debug for TrustedOverlayMountPlan {\n    fn fmt(&self, formatter: &mut fmt::Formatter<\'_>) -> fmt::Result {\n        formatter\n            .debug_struct("TrustedOverlayMountPlan")\n            .field("summary", &self.summary)\n            .field("source_anchor", &self.source_anchor)\n            .field("task_lease", &self.task_lease)\n            .field("kernel", &self.kernel)\n            .field("directories", &"<private exact overlay directories>")\n            .finish()\n    }\n}',
+                  'impl fmt::Debug for TrustedOverlayMountPlan {\n    fn fmt(&self, formatter: &mut fmt::Formatter<\'_>) -> fmt::Result {\n        let private_roles = [&self.lower, &self.upper, &self.work, &self.merged];\n        formatter\n            .debug_struct("TrustedOverlayMountPlan")\n            .field("summary", &self.summary)\n            .field("source_anchor", &self.source_anchor)\n            .field("task_lease", &self.task_lease)\n            .field("kernel", &self.kernel)\n            .field("directory_role_count", &private_roles.len())\n            .field("directories", &"<private exact overlay directories>")\n            .finish()\n    }\n}',
+                  1,
+              )
+          if 'let filesystems_after =' not in text:
+              old = '''pub fn observe_trusted_overlay_mount_plan(\n    source_anchor: OverlaySourceAnchorBinding,\n    task_lease: OverlayTaskViewLease,\n    paths: TrustedOverlayMountPaths,\n) -> Result<TrustedOverlayMountPlan, TrustedOverlayMountPlanError> {\n    let filesystems = read_bounded(Path::new("/proc/filesystems"), MAX_PROC_FILESYSTEMS_BYTES)?;\n    let mountinfo = read_bounded(Path::new("/proc/self/mountinfo"), MAX_PROC_MOUNTINFO_BYTES)?;\n    let mount_namespace = fs::metadata("/proc/self/ns/mnt").map_err(|_| io_error())?;\n    observe_with_evidence(\n        source_anchor,\n        task_lease,\n        paths,\n        &filesystems,\n        &mountinfo,\n        (mount_namespace.dev(), mount_namespace.ino()),\n        || {},\n    )\n}'''
+              new = '''pub fn observe_trusted_overlay_mount_plan(\n    source_anchor: OverlaySourceAnchorBinding,\n    task_lease: OverlayTaskViewLease,\n    paths: TrustedOverlayMountPaths,\n) -> Result<TrustedOverlayMountPlan, TrustedOverlayMountPlanError> {\n    let filesystems = read_bounded(Path::new("/proc/filesystems"), MAX_PROC_FILESYSTEMS_BYTES)?;\n    let mountinfo = read_bounded(Path::new("/proc/self/mountinfo"), MAX_PROC_MOUNTINFO_BYTES)?;\n    let mount_namespace = fs::metadata("/proc/self/ns/mnt").map_err(|_| io_error())?;\n    let mount_namespace_identity = (mount_namespace.dev(), mount_namespace.ino());\n    let merged_path = paths.merged.clone();\n    let plan = observe_with_evidence(\n        source_anchor,\n        task_lease,\n        paths,\n        &filesystems,\n        &mountinfo,\n        mount_namespace_identity,\n        || {},\n    )?;\n    let filesystems_after = read_bounded(Path::new("/proc/filesystems"), MAX_PROC_FILESYSTEMS_BYTES)?;\n    let mountinfo_after = read_bounded(Path::new("/proc/self/mountinfo"), MAX_PROC_MOUNTINFO_BYTES)?;\n    let mount_namespace_after = fs::metadata("/proc/self/ns/mnt").map_err(|_| io_error())?;\n    if filesystems_after != filesystems\n        || mountinfo_has_mountpoint(&mountinfo_after, &merged_path)?\n        || (mount_namespace_after.dev(), mount_namespace_after.ino()) != mount_namespace_identity\n    {\n        return Err(changed_during_observation());\n    }\n    Ok(plan)\n}'''
+              text = text.replace(old, new, 1)
+          if 'current_identity != directory.identity' not in text:
+              old = 'fn revalidate_directory(directory: &TrustedOverlayDirectory) -> Result<(), TrustedOverlayMountPlanError> {\n    let current = snapshot_directory(&directory.path)?;\n    if current != directory.snapshot {\n        return Err(changed_during_observation());\n    }\n    Ok(())\n}'
+              new = 'fn revalidate_directory(\n    directory: &TrustedOverlayDirectory,\n) -> Result<(), TrustedOverlayMountPlanError> {\n    let current = snapshot_directory(&directory.path)?;\n    let current_identity = ReviewedFilesystemIdentity::new(\n        current.device,\n        current.inode,\n        current.uid,\n        current.gid,\n        current.mode & 0o7777,\n    )\n    .map_err(|_| unsafe_filesystem())?;\n    if current != directory.snapshot || current_identity != directory.identity {\n        return Err(changed_during_observation());\n    }\n    Ok(())\n}'
+              text = text.replace(old, new, 1)
+          path.write_text(text)
+          PY
+      - name: Run diagnostics
+        id: diag
+        shell: bash
+        run: |
+          set +e
+          cargo fmt --all -- --check > /tmp/fmt.log 2>&1
+          FMT=$?
+          cargo test --locked trusted_overlay_mount_plan > /tmp/test.log 2>&1
+          TEST=$?
+          cargo clippy --locked --all-targets --all-features -- -D warnings > /tmp/clippy.log 2>&1
+          CLIPPY=$?
+          printf '{"fmt":%s,"test":%s,"clippy":%s}\n' "$FMT" "$TEST" "$CLIPPY" > /tmp/status.json
+          cargo fmt --all >/tmp/fmt-apply.log 2>&1
+          exit 0
+      - name: Publish diagnostics and patched source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name teamleaderleo
+          git config user.email cheerleaderleo@outlook.com
+          OUT=research/results-overlay-mount-plan-diagnostic
+          git checkout --orphan "$OUT"
+          git rm -rf . >/dev/null 2>&1 || true
+          mkdir -p src logs
+          cp /tmp/status.json status.json
+          cp /tmp/fmt.log logs/fmt.log
+          cp /tmp/test.log logs/test.log
+          cp /tmp/clippy.log logs/clippy.log
+          git show codex/trusted-overlay-mount-plan:src/trusted_overlay_mount_plan.rs >/tmp/original.rs
+          cp /tmp/original.rs logs/original.rs
+          cp "$GITHUB_WORKSPACE/src/lib.rs" src/lib.rs
+          cp "$GITHUB_WORKSPACE/src/trusted_overlay_mount_plan.rs" src/trusted_overlay_mount_plan.rs
+          git add status.json logs src
+          git commit -m 'Record OverlayFS mount plan diagnostics'
+          git push --force origin HEAD:"$OUT"
