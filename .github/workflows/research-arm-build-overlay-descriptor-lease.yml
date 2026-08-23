@@ -1,0 +1,68 @@
+name: Research build OverlayFS descriptor lease
+
+on:
+  push:
+    branches:
+      - research/arm-build-overlay-descriptor-lease
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: true
+          show-progress: false
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt --no-self-update
+      - name: Patch descriptor lease and verify
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/trusted_overlay_mount_plan.rs'); s=p.read_text()
+          s=s.replace('use std::os::fd::AsFd as _;', 'use std::os::fd::{AsFd as _, OwnedFd};', 1)
+          s=s.replace('use rustix::fs::{self as rustix_fs, Mode, OFlags};', 'use rustix::fs::{self as rustix_fs, FileType, Mode, OFlags};\nuse rustix::io::Errno;', 1)
+
+          marker='''impl fmt::Debug for TrustedOverlayMountPlan {'''
+          addition='''#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]\npub struct TrustedOverlayMountDescriptorLeaseSummary {\n    schema_version: u8,\n    role_count: u8,\n    single_filesystem_device: bool,\n}\n\nimpl TrustedOverlayMountDescriptorLeaseSummary {\n    #[must_use]\n    pub const fn schema_version(self) -> u8 {\n        self.schema_version\n    }\n\n    #[must_use]\n    pub const fn role_count(self) -> u8 {\n        self.role_count\n    }\n\n    #[must_use]\n    pub const fn single_filesystem_device(self) -> bool {\n        self.single_filesystem_device\n    }\n}\n\npub struct TrustedOverlayMountDescriptorLease {\n    summary: TrustedOverlayMountDescriptorLeaseSummary,\n    source_anchor: OverlaySourceAnchorBinding,\n    task_lease: OverlayTaskViewLease,\n    lower: OwnedFd,\n    upper: OwnedFd,\n    work: OwnedFd,\n    merged: OwnedFd,\n}\n\nimpl TrustedOverlayMountDescriptorLease {\n    #[must_use]\n    pub const fn summary(&self) -> TrustedOverlayMountDescriptorLeaseSummary {\n        self.summary\n    }\n\n    /// Reconfirm the held role descriptors against this exact sealed plan and current task authority.\n    ///\n    /// # Errors\n    ///\n    /// Returns a bounded path-private error when the supplied plan is for another logical task,\n    /// current plan evidence fails, or any held descriptor no longer matches its sealed role.\n    pub fn confirm(\n        &self,\n        plan: &TrustedOverlayMountPlan,\n        source_anchor: &OverlaySourceAnchorRecord,\n        task_view: &OverlayTaskViewRecord,\n    ) -> Result<(), TrustedOverlayMountPlanError> {\n        if plan.source_anchor != self.source_anchor || plan.task_lease != self.task_lease {\n            return Err(plan_authority_mismatch());\n        }\n        plan.confirm(source_anchor, task_view)?;\n        require_held_directory(&self.lower, &plan.lower)?;\n        require_held_directory(&self.upper, &plan.upper)?;\n        require_held_directory(&self.work, &plan.work)?;\n        require_held_directory(&self.merged, &plan.merged)?;\n        validate_held_roles([&self.lower, &self.upper, &self.work, &self.merged])?;\n        Ok(())\n    }\n}\n\nimpl fmt::Debug for TrustedOverlayMountDescriptorLease {\n    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {\n        let _ = (&self.lower, &self.upper, &self.work, &self.merged);\n        formatter\n            .debug_struct("TrustedOverlayMountDescriptorLease")\n            .field("summary", &self.summary)\n            .field("source_anchor", &self.source_anchor)\n            .field("task_lease", &self.task_lease)\n            .field("descriptors", &"<private exact overlay role descriptors>")\n            .finish()\n    }\n}\n\n'''
+          if marker not in s: raise SystemExit('descriptor type insertion point missing')
+          s=s.replace(marker,addition+marker,1)
+
+          marker='''    /// Reconfirm this sealed plan against current authority and read-only host evidence.'''
+          method='''    /// Reopen and retain every private directory role through no-follow descriptor traversal.\n    ///\n    /// The plan is confirmed before acquisition and again after all four descriptors are held, so\n    /// concurrent path replacement prevents publication while already-opened descriptors remain\n    /// private diagnostic objects. This function performs no mount or filesystem mutation.\n    ///\n    /// # Errors\n    ///\n    /// Returns a bounded path-private error when current plan authority/evidence fails, a path\n    /// contains an alias/non-directory component, or a held descriptor differs from its sealed role.\n    pub fn open_descriptor_lease(\n        &self,\n        source_anchor: &OverlaySourceAnchorRecord,\n        task_view: &OverlayTaskViewRecord,\n    ) -> Result<TrustedOverlayMountDescriptorLease, TrustedOverlayMountPlanError> {\n        self.confirm(source_anchor, task_view)?;\n        let lower = open_held_directory(&self.lower)?;\n        let upper = open_held_directory(&self.upper)?;\n        let work = open_held_directory(&self.work)?;\n        let merged = open_held_directory(&self.merged)?;\n        let lease = TrustedOverlayMountDescriptorLease {\n            summary: TrustedOverlayMountDescriptorLeaseSummary {\n                schema_version: TRUSTED_OVERLAY_MOUNT_PLAN_SCHEMA_VERSION,\n                role_count: 4,\n                single_filesystem_device: true,\n            },\n            source_anchor: self.source_anchor.clone(),\n            task_lease: self.task_lease.clone(),\n            lower,\n            upper,\n            work,\n            merged,\n        };\n        lease.confirm(self, source_anchor, task_view)?;\n        Ok(lease)\n    }\n\n'''
+          if marker not in s: raise SystemExit('plan method insertion point missing')
+          s=s.replace(marker,method+marker,1)
+
+          marker='''fn revalidate_directory(\n    directory: &TrustedOverlayDirectory,\n) -> Result<(), TrustedOverlayMountPlanError> {'''
+          helpers='''fn open_held_directory(\n    directory: &TrustedOverlayDirectory,\n) -> Result<OwnedFd, TrustedOverlayMountPlanError> {\n    let mut current = rustix_fs::open(Path::new("/"), PROC_DIRECTORY_FLAGS, Mode::empty())\n        .map_err(|_| io_error())?;\n    for component in directory.path.components() {\n        match component {\n            Component::RootDir => {}\n            Component::Normal(name) => {\n                current = rustix_fs::openat(\n                    current.as_fd(),\n                    name,\n                    PROC_DIRECTORY_FLAGS,\n                    Mode::empty(),\n                )\n                .map_err(|cause| match cause {\n                    Errno::LOOP | Errno::NOTDIR => unsafe_filesystem(),\n                    _ => io_error(),\n                })?;\n            }\n            _ => return Err(invalid_path()),\n        }\n    }\n    require_held_directory(&current, directory)?;\n    Ok(current)\n}\n\nfn snapshot_held_directory(\n    descriptor: &OwnedFd,\n) -> Result<DirectorySnapshot, TrustedOverlayMountPlanError> {\n    let stat = rustix_fs::fstat(descriptor).map_err(|_| io_error())?;\n    if !FileType::from_raw_mode(stat.st_mode).is_dir() {\n        return Err(unsafe_filesystem());\n    }\n    Ok(DirectorySnapshot {\n        device: stat.st_dev,\n        inode: stat.st_ino,\n        uid: stat.st_uid,\n        gid: stat.st_gid,\n        mode: stat.st_mode,\n        mtime: stat.st_mtime,\n        mtime_nsec: stat.st_mtime_nsec,\n        ctime: stat.st_ctime,\n        ctime_nsec: stat.st_ctime_nsec,\n    })\n}\n\nfn require_held_directory(\n    descriptor: &OwnedFd,\n    planned: &TrustedOverlayDirectory,\n) -> Result<(), TrustedOverlayMountPlanError> {\n    if snapshot_held_directory(descriptor)? != planned.snapshot {\n        return Err(changed_during_observation());\n    }\n    Ok(())\n}\n\nfn validate_held_roles(\n    descriptors: [&OwnedFd; 4],\n) -> Result<(), TrustedOverlayMountPlanError> {\n    let snapshots = descriptors\n        .iter()\n        .map(|descriptor| snapshot_held_directory(descriptor))\n        .collect::<Result<Vec<_>, _>>()?;\n    let identities = snapshots\n        .iter()\n        .map(|snapshot| (snapshot.device, snapshot.inode))\n        .collect::<BTreeSet<_>>();\n    if identities.len() != 4 {\n        return Err(role_conflict());\n    }\n    let expected_device = snapshots[0].device;\n    if snapshots\n        .iter()\n        .any(|snapshot| snapshot.device != expected_device)\n    {\n        return Err(filesystem_mismatch());\n    }\n    Ok(())\n}\n\n'''
+          if marker not in s: raise SystemExit('descriptor helper insertion point missing')
+          s=s.replace(marker,helpers+marker,1)
+
+          marker='''    #[test]\n    fn sealed_plan_reconfirms_exact_child_lease_across_anchor_revision() {'''
+          tests='''    #[test]\n    fn descriptor_lease_reopens_all_exact_roles_without_exposing_paths() {\n        let fixture = Fixture::new();\n        let (anchor, task) = registered_authority();\n        let plan = super::observe_trusted_overlay_mount_plan(\n            &anchor,\n            &task,\n            fixture.paths.clone(),\n        )\n        .unwrap();\n        let lease = plan.open_descriptor_lease(&anchor, &task).unwrap();\n        assert_eq!(lease.summary().schema_version(), 1);\n        assert_eq!(lease.summary().role_count(), 4);\n        assert!(lease.summary().single_filesystem_device());\n        lease.confirm(&plan, &anchor, &task).unwrap();\n        assert!(!format!("{lease:?}").contains(fixture.root.to_str().unwrap()));\n    }\n\n    #[test]\n    fn descriptor_lease_retains_old_object_while_path_replacement_fails_confirmation() {\n        let fixture = Fixture::new();\n        let (anchor, task) = registered_authority();\n        let plan = super::observe_trusted_overlay_mount_plan(\n            &anchor,\n            &task,\n            fixture.paths.clone(),\n        )\n        .unwrap();\n        let lease = plan.open_descriptor_lease(&anchor, &task).unwrap();\n        let held_before = super::snapshot_held_directory(&lease.upper).unwrap();\n        fs::rename(fixture.root.join("upper"), fixture.root.join("upper-old")).unwrap();\n        fs::create_dir(fixture.root.join("upper")).unwrap();\n        assert_eq!(\n            super::snapshot_held_directory(&lease.upper).unwrap(),\n            held_before\n        );\n        assert!(matches!(\n            lease.confirm(&plan, &anchor, &task).unwrap_err().kind(),\n            TrustedOverlayMountPlanErrorKind::ChangedDuringObservation\n                | TrustedOverlayMountPlanErrorKind::Io\n        ));\n    }\n\n    #[test]\n    fn descriptor_acquisition_refuses_intermediate_alias_after_plan_sealing() {\n        let fixture = Fixture::new();\n        let (anchor, task) = registered_authority();\n        let plan = super::observe_trusted_overlay_mount_plan(\n            &anchor,\n            &task,\n            fixture.paths.clone(),\n        )\n        .unwrap();\n        let parent = fixture.root.parent().unwrap().to_path_buf();\n        let original_name = fixture.root.file_name().unwrap().to_owned();\n        let moved = parent.join(format!("{}-moved", original_name.to_string_lossy()));\n        fs::rename(&fixture.root, &moved).unwrap();\n        symlink(&moved, &fixture.root).unwrap();\n        assert!(matches!(\n            plan.open_descriptor_lease(&anchor, &task).unwrap_err().kind(),\n            TrustedOverlayMountPlanErrorKind::UnsafeFilesystem\n                | TrustedOverlayMountPlanErrorKind::ChangedDuringObservation\n                | TrustedOverlayMountPlanErrorKind::Io\n        ));\n        fs::remove_file(&fixture.root).unwrap();\n        fs::rename(&moved, &fixture.root).unwrap();\n    }\n\n'''
+          if marker not in s: raise SystemExit('descriptor tests insertion point missing')
+          s=s.replace(marker,tests+marker,1)
+          p.write_text(s)
+          PY
+          cargo fmt --all
+          cargo test --locked trusted_overlay_mount_plan
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cp src/trusted_overlay_mount_plan.rs /tmp/trusted_overlay_mount_plan.rs
+      - name: Publish verified source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name teamleaderleo
+          git config user.email cheerleaderleo@outlook.com
+          OUT=research/results-overlay-descriptor-lease-source
+          git checkout --orphan "$OUT"
+          git rm -rf . >/dev/null 2>&1 || true
+          cp /tmp/trusted_overlay_mount_plan.rs ./trusted_overlay_mount_plan.rs
+          git add trusted_overlay_mount_plan.rs
+          git commit -m 'Publish verified OverlayFS descriptor lease source'
+          git push --force origin HEAD:"$OUT"
