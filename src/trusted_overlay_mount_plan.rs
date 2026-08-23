@@ -14,7 +14,10 @@ use sha2::{Digest as _, Sha256};
 
 use crate::artifact::Sha256Digest;
 use crate::descriptor_bound_launcher::ReviewedFilesystemIdentity;
-use crate::trusted_overlay_task_view::{OverlaySourceAnchorBinding, OverlayTaskViewLease};
+use crate::trusted_overlay_task_view::{
+    OverlaySourceAnchorBinding, OverlaySourceAnchorRecord, OverlayTaskViewLease,
+    OverlayTaskViewRecord, OverlayTaskViewState,
+};
 
 pub const TRUSTED_OVERLAY_MOUNT_PLAN_SCHEMA_VERSION: u8 = 1;
 const MAX_PROC_FILESYSTEMS_BYTES: usize = 65_536;
@@ -39,7 +42,7 @@ pub struct TrustedOverlayMountPlanSummary {
     schema_version: u8,
     option_policy: TrustedOverlayMountOptionPolicy,
     role_count: u8,
-    single_project_device: bool,
+    single_filesystem_device: bool,
 }
 
 impl TrustedOverlayMountPlanSummary {
@@ -59,8 +62,8 @@ impl TrustedOverlayMountPlanSummary {
     }
 
     #[must_use]
-    pub const fn single_project_device(&self) -> bool {
-        self.single_project_device
+    pub const fn single_filesystem_device(&self) -> bool {
+        self.single_filesystem_device
     }
 }
 
@@ -225,6 +228,7 @@ pub enum TrustedOverlayMountPlanErrorKind {
     AlreadyMounted,
     ChangedDuringObservation,
     InvalidProcEvidence,
+    AuthorityMismatch,
     Io,
 }
 
@@ -269,7 +273,7 @@ impl std::error::Error for TrustedOverlayMountPlanError {}
 /// Observe and seal one task-specific OverlayFS mount plan without mutating host state.
 ///
 /// The observer requires exact real-directory identities for the immutable lower source, upper,
-/// work, and merged target. All four roles must live on one project-volume device in v1, work must
+/// work, and merged target. All four roles must live on one exact filesystem device in v1, work must
 /// be empty, the merged target must be absent from the current mount table, and the current kernel
 /// filesystem list must expose OverlayFS. Every directory and capability input is revalidated before
 /// the plan is returned.
@@ -279,10 +283,11 @@ impl std::error::Error for TrustedOverlayMountPlanError {}
 /// Returns a bounded path-private error for aliasing, identity drift, filesystem mismatch, a dirty
 /// workdir, unavailable OverlayFS, an already-mounted target, malformed proc evidence, or I/O failure.
 pub fn observe_trusted_overlay_mount_plan(
-    source_anchor: OverlaySourceAnchorBinding,
-    task_lease: OverlayTaskViewLease,
+    source_anchor: &OverlaySourceAnchorRecord,
+    task_view: &OverlayTaskViewRecord,
     paths: TrustedOverlayMountPaths,
 ) -> Result<TrustedOverlayMountPlan, TrustedOverlayMountPlanError> {
+    require_mount_authority(source_anchor, task_view)?;
     require_procfs()?;
     let filesystems = read_bounded(Path::new("/proc/filesystems"), MAX_PROC_FILESYSTEMS_BYTES)?;
     let mountinfo = read_bounded(Path::new("/proc/self/mountinfo"), MAX_PROC_MOUNTINFO_BYTES)?;
@@ -290,8 +295,8 @@ pub fn observe_trusted_overlay_mount_plan(
     let mount_namespace_identity = (mount_namespace.dev(), mount_namespace.ino());
     let merged_path = paths.merged.clone();
     let plan = observe_with_evidence(
-        source_anchor,
-        task_lease,
+        source_anchor.binding().clone(),
+        task_view.lease().clone(),
         paths,
         &filesystems,
         &mountinfo,
@@ -312,6 +317,21 @@ pub fn observe_trusted_overlay_mount_plan(
         return Err(changed_during_observation());
     }
     Ok(plan)
+}
+
+fn require_mount_authority(
+    source_anchor: &OverlaySourceAnchorRecord,
+    task_view: &OverlayTaskViewRecord,
+) -> Result<(), TrustedOverlayMountPlanError> {
+    if task_view.state() != OverlayTaskViewState::WorktreeRegistered {
+        return Err(task_state_invalid());
+    }
+    if task_view.source_anchor() != source_anchor.binding()
+        || !source_anchor.active_tasks().contains(task_view.lease())
+    {
+        return Err(anchor_task_unproven());
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -368,7 +388,7 @@ where
             schema_version: TRUSTED_OVERLAY_MOUNT_PLAN_SCHEMA_VERSION,
             option_policy: TrustedOverlayMountOptionPolicy::SingleLowerNodevNosuidV1,
             role_count: 4,
-            single_project_device: true,
+            single_filesystem_device: true,
         },
         source_anchor,
         task_lease,
@@ -520,8 +540,7 @@ fn filesystems_expose_overlay(bytes: &[u8]) -> Result<bool, TrustedOverlayMountP
     }
     Ok(bytes.lines().any(|line| {
         line.split(|byte| byte.is_ascii_whitespace())
-            .filter(|field| !field.is_empty())
-            .next_back()
+            .rfind(|field| !field.is_empty())
             == Some(OVERLAY_FILESYSTEM_NAME)
     }))
 }
@@ -592,7 +611,11 @@ fn decode_mountinfo_field(field: &[u8]) -> Result<Vec<u8>, TrustedOverlayMountPl
         let value = u16::from(octal[0] - b'0') * 64
             + u16::from(octal[1] - b'0') * 8
             + u16::from(octal[2] - b'0');
-        result.push(u8::try_from(value).map_err(|_| invalid_proc_evidence())?);
+        let decoded = u8::try_from(value).map_err(|_| invalid_proc_evidence())?;
+        if !matches!(decoded, b'\t' | b'\n' | b' ' | b'\\') {
+            return Err(invalid_proc_evidence());
+        }
+        result.push(decoded);
         index += 4;
     }
     Ok(result)
@@ -662,7 +685,7 @@ const fn filesystem_mismatch() -> TrustedOverlayMountPlanError {
     error(
         TrustedOverlayMountPlanErrorKind::FilesystemMismatch,
         "overlay_mount_filesystem_mismatch",
-        "trusted overlay mount roles must share the accepted project filesystem",
+        "trusted overlay mount roles must share one exact filesystem device in v1",
     )
 }
 
@@ -706,6 +729,22 @@ const fn invalid_proc_evidence() -> TrustedOverlayMountPlanError {
     )
 }
 
+const fn task_state_invalid() -> TrustedOverlayMountPlanError {
+    error(
+        TrustedOverlayMountPlanErrorKind::AuthorityMismatch,
+        "overlay_mount_task_state_invalid",
+        "trusted overlay mount planning requires registered-worktree task state",
+    )
+}
+
+const fn anchor_task_unproven() -> TrustedOverlayMountPlanError {
+    error(
+        TrustedOverlayMountPlanErrorKind::AuthorityMismatch,
+        "overlay_mount_anchor_task_unproven",
+        "trusted overlay task lease is not active on the exact source anchor",
+    )
+}
+
 const fn io_error() -> TrustedOverlayMountPlanError {
     error(
         TrustedOverlayMountPlanErrorKind::Io,
@@ -733,8 +772,10 @@ mod tests {
         ProjectDiskGeneration, ProjectDiskId, ResidentSandboxGeneration, ResidentSandboxId,
     };
     use crate::trusted_overlay_task_view::{
-        OverlaySourceAnchorBinding, OverlaySourceAnchorGeneration, OverlaySourceAnchorId,
-        OverlayTaskViewGeneration, OverlayTaskViewId, OverlayTaskViewLease,
+        OverlayLinkedWorktreeObservation, OverlayMountObservation, OverlaySourceAnchorBinding,
+        OverlaySourceAnchorGeneration, OverlaySourceAnchorId, OverlaySourceAnchorRecord,
+        OverlayTaskProcessObservation, OverlayTaskViewGeneration, OverlayTaskViewId,
+        OverlayTaskViewLease, OverlayTaskViewObservation, OverlayTaskViewRecord,
     };
 
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
@@ -797,12 +838,51 @@ mod tests {
         )
     }
 
+    fn registered_authority() -> (OverlaySourceAnchorRecord, OverlayTaskViewRecord) {
+        let task_lease = lease();
+        let anchor = OverlaySourceAnchorRecord::new_ready(binding())
+            .acquire_task(task_lease.clone())
+            .unwrap();
+        let task = OverlayTaskViewRecord::new_planned(task_lease, binding())
+            .record_worktree_registered(OverlayTaskViewObservation::new(
+                OverlayLinkedWorktreeObservation::Exact,
+                OverlayMountObservation::Absent,
+                super::OverlayIndexObservation::Absent,
+                super::OverlayGitProofObservation::NotRun,
+                OverlayTaskProcessObservation::Absent,
+            ))
+            .unwrap();
+        (anchor, task)
+    }
+
     fn filesystems() -> &'static [u8] {
         b"nodev\tsysfs\nnodev\tproc\nnodev\toverlay\n\text4\n\txfs\n"
     }
 
     fn mountinfo() -> &'static [u8] {
         b"36 25 0:32 / / rw,relatime - ext4 /dev/root rw\n"
+    }
+
+    #[test]
+    fn mount_authority_requires_registered_task_held_by_exact_anchor() {
+        let (anchor, task) = registered_authority();
+        super::require_mount_authority(&anchor, &task).unwrap();
+
+        let planned = OverlayTaskViewRecord::new_planned(lease(), binding());
+        assert_eq!(
+            super::require_mount_authority(&anchor, &planned)
+                .unwrap_err()
+                .kind(),
+            TrustedOverlayMountPlanErrorKind::AuthorityMismatch
+        );
+
+        let other_anchor = OverlaySourceAnchorRecord::new_ready(binding());
+        assert_eq!(
+            super::require_mount_authority(&other_anchor, &task)
+                .unwrap_err()
+                .code(),
+            "overlay_mount_anchor_task_unproven"
+        );
     }
 
     #[test]
@@ -823,7 +903,7 @@ mod tests {
             TrustedOverlayMountOptionPolicy::SingleLowerNodevNosuidV1
         );
         assert_eq!(plan.summary().role_count(), 4);
-        assert!(plan.summary().single_project_device());
+        assert!(plan.summary().single_filesystem_device());
         assert_eq!(plan.source_anchor(), &binding());
         assert_eq!(plan.task_lease(), &lease());
         assert_eq!(plan.kernel().mount_namespace_inode(), 9);
@@ -1006,5 +1086,6 @@ mod tests {
         );
         assert!(!mountinfo_has_mountpoint(mountinfo(), Path::new("/private/target")).unwrap());
         assert!(super::decode_mountinfo_field(b"\\777").is_err());
+        assert!(super::decode_mountinfo_field(b"\\041").is_err());
     }
 }
