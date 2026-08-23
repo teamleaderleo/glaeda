@@ -1,0 +1,93 @@
+name: Research OverlayFS exact mount id
+
+on:
+  push:
+    branches:
+      - research/github-arm-overlay-mount-id
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: true
+      - name: Probe mount identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import ctypes, json, os, platform, subprocess, tempfile, time
+          from pathlib import Path
+
+          libc = ctypes.CDLL(None, use_errno=True)
+          c_long = ctypes.c_long
+          SYS_fsopen=430; SYS_fsconfig=431; SYS_fsmount=432; SYS_move_mount=429
+          FSOPEN_CLOEXEC=1; FSCONFIG_SET_FD=5; FSCONFIG_CMD_CREATE=6
+          FSMOUNT_CLOEXEC=1; MS_NODEV=4; MS_NOSUID=2
+          MOVE_MOUNT_F_EMPTY_PATH=0x4; MOVE_MOUNT_T_EMPTY_PATH=0x40
+          AT_EMPTY_PATH=0x1000; STATX_MNT_ID=0x1000; STATX_MNT_ID_UNIQUE=0x4000
+          O_PATH=getattr(os,'O_PATH',0o10000000); O_DIRECTORY=os.O_DIRECTORY; O_CLOEXEC=os.O_CLOEXEC
+
+          class StatxTimestamp(ctypes.Structure):
+              _fields_=[('tv_sec',ctypes.c_longlong),('tv_nsec',ctypes.c_uint),('__reserved',ctypes.c_int)]
+          class Statx(ctypes.Structure):
+              _fields_=[
+                  ('stx_mask',ctypes.c_uint),('stx_blksize',ctypes.c_uint),('stx_attributes',ctypes.c_ulonglong),
+                  ('stx_nlink',ctypes.c_uint),('stx_uid',ctypes.c_uint),('stx_gid',ctypes.c_uint),('stx_mode',ctypes.c_ushort),('__spare0',ctypes.c_ushort*1),
+                  ('stx_ino',ctypes.c_ulonglong),('stx_size',ctypes.c_ulonglong),('stx_blocks',ctypes.c_ulonglong),('stx_attributes_mask',ctypes.c_ulonglong),
+                  ('stx_atime',StatxTimestamp),('stx_btime',StatxTimestamp),('stx_ctime',StatxTimestamp),('stx_mtime',StatxTimestamp),
+                  ('stx_rdev_major',ctypes.c_uint),('stx_rdev_minor',ctypes.c_uint),('stx_dev_major',ctypes.c_uint),('stx_dev_minor',ctypes.c_uint),
+                  ('stx_mnt_id',ctypes.c_ulonglong),('stx_dio_mem_align',ctypes.c_uint),('stx_dio_offset_align',ctypes.c_uint),
+                  ('stx_subvol',ctypes.c_ulonglong),('__spare3',ctypes.c_ulonglong*11)
+              ]
+
+          libc.statx.argtypes=[ctypes.c_int,ctypes.c_char_p,ctypes.c_int,ctypes.c_uint,ctypes.POINTER(Statx)]
+          libc.statx.restype=ctypes.c_int
+          def statx_fd(fd, mask):
+              st=Statx(); rc=libc.statx(fd,b'',AT_EMPTY_PATH,mask,ctypes.byref(st)); err=ctypes.get_errno()
+              return {'rc':rc,'errno':err if rc else 0,'mask':st.stx_mask,'mnt_id':st.stx_mnt_id}
+          def syscall(n,*args):
+              ctypes.set_errno(0); rc=libc.syscall(c_long(n),*args)
+              if rc < 0: raise OSError(ctypes.get_errno(),os.strerror(ctypes.get_errno()))
+              return rc
+
+          root=Path(tempfile.mkdtemp(prefix='smolrunner-mntid-',dir=os.environ['RUNNER_TEMP']))
+          lower=root/'lower';upper=root/'upper';work=root/'work';merged=root/'merged'
+          for p in [lower,upper,work,merged]: p.mkdir()
+          (lower/'hello').write_text('lower')
+          fds=[]; fsfd=mfd=None
+          result={'schema_version':1,'arch':platform.machine(),'kernel':platform.release()}
+          try:
+              lowerfd=os.open(lower,O_PATH|O_DIRECTORY|O_CLOEXEC);upperfd=os.open(upper,O_PATH|O_DIRECTORY|O_CLOEXEC);workfd=os.open(work,O_PATH|O_DIRECTORY|O_CLOEXEC);mergedfd=os.open(merged,O_PATH|O_DIRECTORY|O_CLOEXEC);fds=[lowerfd,upperfd,workfd,mergedfd]
+              result['merged_before']=statx_fd(mergedfd,STATX_MNT_ID|STATX_MNT_ID_UNIQUE)
+              fsfd=syscall(SYS_fsopen,ctypes.c_char_p(b'overlay'),ctypes.c_uint(FSOPEN_CLOEXEC))
+              for key,fd in [(b'lowerdir+',lowerfd),(b'upperdir',upperfd),(b'workdir',workfd)]: syscall(SYS_fsconfig,fsfd,ctypes.c_uint(FSCONFIG_SET_FD),ctypes.c_char_p(key),ctypes.c_void_p(),fd)
+              syscall(SYS_fsconfig,fsfd,ctypes.c_uint(FSCONFIG_CMD_CREATE),ctypes.c_void_p(),ctypes.c_void_p(),0)
+              mfd=syscall(SYS_fsmount,fsfd,ctypes.c_uint(FSMOUNT_CLOEXEC),ctypes.c_uint(MS_NODEV|MS_NOSUID))
+              result['mount_fd_before_attach']=statx_fd(mfd,STATX_MNT_ID|STATX_MNT_ID_UNIQUE)
+              syscall(SYS_move_mount,mfd,ctypes.c_char_p(b''),mergedfd,ctypes.c_char_p(b''),ctypes.c_uint(MOVE_MOUNT_F_EMPTY_PATH|MOVE_MOUNT_T_EMPTY_PATH))
+              result['mount_fd_after_attach']=statx_fd(mfd,STATX_MNT_ID|STATX_MNT_ID_UNIQUE)
+              result['old_merged_fd_after_attach']=statx_fd(mergedfd,STATX_MNT_ID|STATX_MNT_ID_UNIQUE)
+              visiblefd=os.open(merged,O_PATH|O_DIRECTORY|O_CLOEXEC);fds.append(visiblefd)
+              result['new_merged_fd_after_attach']=statx_fd(visiblefd,STATX_MNT_ID|STATX_MNT_ID_UNIQUE)
+              result['findmnt']=subprocess.run(['findmnt','-T',str(merged),'-n','-o','ID,UNIQ-ID,FSTYPE,OPTIONS'],text=True,capture_output=True).stdout.strip()
+              subprocess.run(['sudo','umount',str(merged)],check=True)
+          finally:
+              for fd in ([mfd,fsfd]+fds):
+                  if fd is not None:
+                      try: os.close(fd)
+                      except OSError: pass
+          out=Path('smolrunner-github-arm-overlay-mount-id.json');out.write_text(json.dumps(result,indent=2,sort_keys=True)+'\n')
+          PY
+          git switch --orphan research/results-smolrunner-github-arm-overlay-mount-id
+          git rm -rf . >/dev/null 2>&1 || true
+          cp "$GITHUB_WORKSPACE/smolrunner-github-arm-overlay-mount-id.json" .
+          git add smolrunner-github-arm-overlay-mount-id.json
+          git config user.name teamleaderleo
+          git config user.email cheerleaderleo@outlook.com
+          git commit -m 'Record hosted ARM OverlayFS mount identity'
+          git push -f origin HEAD:research/results-smolrunner-github-arm-overlay-mount-id
