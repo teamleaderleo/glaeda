@@ -1,0 +1,123 @@
+{
+  "schema_version": 1,
+  "source": {
+    "add": {
+      "argv": [
+        "git",
+        "worktree",
+        "add",
+        "--detach",
+        "/home/runner/work/_temp/smolrunner-overlay-copy-smoke-0q_ci3ky/xfs/base",
+        "HEAD"
+      ],
+      "elapsed_ms": 28.834,
+      "returncode": 0,
+      "stderr": "Preparing worktree (detached HEAD bae1c45)",
+      "stdout": "HEAD is now at bae1c45 research: smoke OverlayFS source-index copy"
+    },
+    "index_bytes": 41996,
+    "proof": {
+      "diff_files": {
+        "argv": [
+          "git",
+          "--no-optional-locks",
+          "diff-files",
+          "--quiet"
+        ],
+        "elapsed_ms": 22.581,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": ""
+      },
+      "diff_index": {
+        "argv": [
+          "git",
+          "--no-optional-locks",
+          "diff-index",
+          "--quiet",
+          "HEAD",
+          "--"
+        ],
+        "elapsed_ms": 22.785,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": ""
+      },
+      "returncode": 0
+    },
+    "refresh": {
+      "argv": [
+        "git",
+        "update-index",
+        "--refresh"
+      ],
+      "elapsed_ms": 23.106,
+      "returncode": 0,
+      "stderr": "",
+      "stdout": ""
+    }
+  },
+  "target": {
+    "add": {
+      "argv": [
+        "git",
+        "worktree",
+        "add",
+        "--detach",
+        "--no-checkout",
+        "/home/runner/work/_temp/smolrunner-overlay-copy-smoke-0q_ci3ky/xfs/target",
+        "HEAD"
+      ],
+      "elapsed_ms": 1.884,
+      "returncode": 0,
+      "stderr": "Preparing worktree (detached HEAD bae1c45)",
+      "stdout": ""
+    },
+    "index_copy_ms": 0.106,
+    "mount": {
+      "argv": [
+        "sudo",
+        "mount",
+        "-t",
+        "overlay",
+        "overlay",
+        "-o",
+        "lowerdir=/home/runner/work/_temp/smolrunner-overlay-copy-smoke-0q_ci3ky/xfs/base,upperdir=/home/runner/work/_temp/smolrunner-overlay-copy-smoke-0q_ci3ky/xfs/upper,workdir=/home/runner/work/_temp/smolrunner-overlay-copy-smoke-0q_ci3ky/xfs/work",
+        "/home/runner/work/_temp/smolrunner-overlay-copy-smoke-0q_ci3ky/xfs/target"
+      ],
+      "elapsed_ms": 7.132,
+      "returncode": 0,
+      "stderr": "",
+      "stdout": ""
+    },
+    "proof": {
+      "diff_files": {
+        "argv": [
+          "git",
+          "--no-optional-locks",
+          "diff-files",
+          "--quiet"
+        ],
+        "elapsed_ms": 24.079,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": ""
+      },
+      "diff_index": {
+        "argv": [
+          "git",
+          "--no-optional-locks",
+          "diff-index",
+          "--quiet",
+          "HEAD",
+          "--"
+        ],
+        "elapsed_ms": 23.735,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": ""
+      },
+      "returncode": 0
+    }
+  }
+}
