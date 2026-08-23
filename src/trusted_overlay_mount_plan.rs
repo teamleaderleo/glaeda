@@ -1,0 +1,914 @@
+use std::collections::BTreeSet;
+use std::ffi::OsStr;
+use std::fmt;
+use std::fs::{self, File};
+use std::io::{Read as _, Take};
+use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::fs::MetadataExt as _;
+use std::path::{Component, Path, PathBuf};
+
+use serde::Serialize;
+use sha2::{Digest as _, Sha256};
+
+use crate::artifact::Sha256Digest;
+use crate::descriptor_bound_launcher::ReviewedFilesystemIdentity;
+use crate::trusted_overlay_task_view::{OverlaySourceAnchorBinding, OverlayTaskViewLease};
+
+pub const TRUSTED_OVERLAY_MOUNT_PLAN_SCHEMA_VERSION: u8 = 1;
+const MAX_PROC_FILESYSTEMS_BYTES: usize = 65_536;
+const MAX_PROC_MOUNTINFO_BYTES: usize = 1_048_576;
+const OVERLAY_FILESYSTEM_NAME: &[u8] = b"overlay";
+const SHA256_PREFIX: &str = "sha256:";
+const HEX: &[u8; 16] = b"0123456789abcdef";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustedOverlayMountOptionPolicy {
+    SingleLowerV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TrustedOverlayMountPlanSummary {
+    schema_version: u8,
+    option_policy: TrustedOverlayMountOptionPolicy,
+    role_count: u8,
+    single_project_device: bool,
+}
+
+impl TrustedOverlayMountPlanSummary {
+    #[must_use]
+    pub const fn schema_version(&self) -> u8 {
+        self.schema_version
+    }
+
+    #[must_use]
+    pub const fn option_policy(&self) -> TrustedOverlayMountOptionPolicy {
+        self.option_policy
+    }
+
+    #[must_use]
+    pub const fn role_count(&self) -> u8 {
+        self.role_count
+    }
+
+    #[must_use]
+    pub const fn single_project_device(&self) -> bool {
+        self.single_project_device
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct TrustedOverlayMountPaths {
+    lower: PathBuf,
+    upper: PathBuf,
+    work: PathBuf,
+    merged: PathBuf,
+}
+
+impl TrustedOverlayMountPaths {
+    /// Bind the four private path roles used by one future OverlayFS mount.
+    ///
+    /// This constructor performs no filesystem I/O.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded error unless every path is normalized, absolute, UTF-8, non-root, and
+    /// lexically distinct from every other role.
+    pub fn new(
+        lower: impl Into<PathBuf>,
+        upper: impl Into<PathBuf>,
+        work: impl Into<PathBuf>,
+        merged: impl Into<PathBuf>,
+    ) -> Result<Self, TrustedOverlayMountPlanError> {
+        let lower = validate_absolute_path(lower.into())?;
+        let upper = validate_absolute_path(upper.into())?;
+        let work = validate_absolute_path(work.into())?;
+        let merged = validate_absolute_path(merged.into())?;
+        let paths = [&lower, &upper, &work, &merged];
+        for (index, left) in paths.iter().enumerate() {
+            if paths.iter().skip(index + 1).any(|right| *left == *right) {
+                return Err(role_conflict());
+            }
+        }
+        Ok(Self {
+            lower,
+            upper,
+            work,
+            merged,
+        })
+    }
+}
+
+impl fmt::Debug for TrustedOverlayMountPaths {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("<private trusted overlay mount paths>")
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct TrustedOverlayDirectory {
+    path: PathBuf,
+    identity: ReviewedFilesystemIdentity,
+    snapshot: DirectorySnapshot,
+}
+
+impl fmt::Debug for TrustedOverlayDirectory {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("<private exact overlay directory>")
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct TrustedOverlayKernelCapability {
+    mount_namespace_device: u64,
+    mount_namespace_inode: u64,
+    filesystems_digest: Sha256Digest,
+}
+
+impl TrustedOverlayKernelCapability {
+    #[must_use]
+    pub const fn mount_namespace_inode(&self) -> u64 {
+        self.mount_namespace_inode
+    }
+
+    #[must_use]
+    pub const fn filesystems_digest(&self) -> &Sha256Digest {
+        &self.filesystems_digest
+    }
+}
+
+impl fmt::Debug for TrustedOverlayKernelCapability {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TrustedOverlayKernelCapability")
+            .field("mount_namespace", &"<private exact mount namespace>")
+            .field("filesystems_digest", &self.filesystems_digest)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct TrustedOverlayMountPlan {
+    summary: TrustedOverlayMountPlanSummary,
+    source_anchor: OverlaySourceAnchorBinding,
+    task_lease: OverlayTaskViewLease,
+    kernel: TrustedOverlayKernelCapability,
+    lower: TrustedOverlayDirectory,
+    upper: TrustedOverlayDirectory,
+    work: TrustedOverlayDirectory,
+    merged: TrustedOverlayDirectory,
+}
+
+impl TrustedOverlayMountPlan {
+    #[must_use]
+    pub const fn summary(&self) -> &TrustedOverlayMountPlanSummary {
+        &self.summary
+    }
+
+    #[must_use]
+    pub const fn source_anchor(&self) -> &OverlaySourceAnchorBinding {
+        &self.source_anchor
+    }
+
+    #[must_use]
+    pub const fn task_lease(&self) -> &OverlayTaskViewLease {
+        &self.task_lease
+    }
+
+    #[must_use]
+    pub const fn kernel(&self) -> &TrustedOverlayKernelCapability {
+        &self.kernel
+    }
+}
+
+impl fmt::Debug for TrustedOverlayMountPlan {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TrustedOverlayMountPlan")
+            .field("summary", &self.summary)
+            .field("source_anchor", &self.source_anchor)
+            .field("task_lease", &self.task_lease)
+            .field("kernel", &self.kernel)
+            .field("directories", &"<private exact overlay directories>")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustedOverlayMountPlanErrorKind {
+    InvalidPath,
+    UnsafeFilesystem,
+    IdentityConflict,
+    FilesystemMismatch,
+    WorkdirNotEmpty,
+    OverlayUnavailable,
+    AlreadyMounted,
+    ChangedDuringObservation,
+    InvalidProcEvidence,
+    Io,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize)]
+pub struct TrustedOverlayMountPlanError {
+    kind: TrustedOverlayMountPlanErrorKind,
+    code: &'static str,
+    message: &'static str,
+}
+
+impl TrustedOverlayMountPlanError {
+    #[must_use]
+    pub const fn kind(&self) -> TrustedOverlayMountPlanErrorKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        self.code
+    }
+}
+
+impl fmt::Debug for TrustedOverlayMountPlanError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TrustedOverlayMountPlanError")
+            .field("kind", &self.kind)
+            .field("code", &self.code)
+            .field("message", &self.message)
+            .finish()
+    }
+}
+
+impl fmt::Display for TrustedOverlayMountPlanError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.message)
+    }
+}
+
+impl std::error::Error for TrustedOverlayMountPlanError {}
+
+/// Observe and seal one task-specific OverlayFS mount plan without mutating host state.
+///
+/// The observer requires exact real-directory identities for the immutable lower source, upper,
+/// work, and merged target. All four roles must live on one project-volume device in v1, work must
+/// be empty, the merged target must be absent from the current mount table, and the current kernel
+/// filesystem list must expose OverlayFS. Every directory and capability input is revalidated before
+/// the plan is returned.
+///
+/// # Errors
+///
+/// Returns a bounded path-private error for aliasing, identity drift, filesystem mismatch, a dirty
+/// workdir, unavailable OverlayFS, an already-mounted target, malformed proc evidence, or I/O failure.
+pub fn observe_trusted_overlay_mount_plan(
+    source_anchor: OverlaySourceAnchorBinding,
+    task_lease: OverlayTaskViewLease,
+    paths: TrustedOverlayMountPaths,
+) -> Result<TrustedOverlayMountPlan, TrustedOverlayMountPlanError> {
+    let filesystems = read_bounded(Path::new("/proc/filesystems"), MAX_PROC_FILESYSTEMS_BYTES)?;
+    let mountinfo = read_bounded(Path::new("/proc/self/mountinfo"), MAX_PROC_MOUNTINFO_BYTES)?;
+    let mount_namespace = fs::metadata("/proc/self/ns/mnt").map_err(|_| io_error())?;
+    observe_with_evidence(
+        source_anchor,
+        task_lease,
+        paths,
+        &filesystems,
+        &mountinfo,
+        (mount_namespace.dev(), mount_namespace.ino()),
+        || {},
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn observe_with_evidence<F>(
+    source_anchor: OverlaySourceAnchorBinding,
+    task_lease: OverlayTaskViewLease,
+    paths: TrustedOverlayMountPaths,
+    filesystems: &[u8],
+    mountinfo: &[u8],
+    mount_namespace: (u64, u64),
+    before_revalidation: F,
+) -> Result<TrustedOverlayMountPlan, TrustedOverlayMountPlanError>
+where
+    F: FnOnce(),
+{
+    if !filesystems_expose_overlay(filesystems)? {
+        return Err(overlay_unavailable());
+    }
+    if mountinfo_has_mountpoint(mountinfo, &paths.merged)? {
+        return Err(already_mounted());
+    }
+    if mount_namespace.1 == 0 {
+        return Err(invalid_proc_evidence());
+    }
+
+    let lower = observe_directory(paths.lower.clone())?;
+    let upper = observe_directory(paths.upper.clone())?;
+    let work = observe_directory(paths.work.clone())?;
+    let merged = observe_directory(paths.merged.clone())?;
+    validate_directory_roles([&lower, &upper, &work, &merged])?;
+    require_empty_directory(&work.path)?;
+
+    let capability = TrustedOverlayKernelCapability {
+        mount_namespace_device: mount_namespace.0,
+        mount_namespace_inode: mount_namespace.1,
+        filesystems_digest: sha256_digest(filesystems)?,
+    };
+
+    before_revalidation();
+
+    for directory in [&lower, &upper, &work, &merged] {
+        revalidate_directory(directory)?;
+    }
+    require_empty_directory(&work.path)?;
+    if !filesystems_expose_overlay(filesystems)? {
+        return Err(changed_during_observation());
+    }
+    if mountinfo_has_mountpoint(mountinfo, &merged.path)? {
+        return Err(changed_during_observation());
+    }
+
+    Ok(TrustedOverlayMountPlan {
+        summary: TrustedOverlayMountPlanSummary {
+            schema_version: TRUSTED_OVERLAY_MOUNT_PLAN_SCHEMA_VERSION,
+            option_policy: TrustedOverlayMountOptionPolicy::SingleLowerV1,
+            role_count: 4,
+            single_project_device: true,
+        },
+        source_anchor,
+        task_lease,
+        kernel: capability,
+        lower,
+        upper,
+        work,
+        merged,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct DirectorySnapshot {
+    device: u64,
+    inode: u64,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+    mtime: i64,
+    mtime_nsec: i64,
+    ctime: i64,
+    ctime_nsec: i64,
+}
+
+fn observe_directory(path: PathBuf) -> Result<TrustedOverlayDirectory, TrustedOverlayMountPlanError> {
+    let snapshot = snapshot_directory(&path)?;
+    let identity = ReviewedFilesystemIdentity::new(
+        snapshot.device,
+        snapshot.inode,
+        snapshot.uid,
+        snapshot.gid,
+        snapshot.mode & 0o7777,
+    )
+    .map_err(|_| unsafe_filesystem())?;
+    Ok(TrustedOverlayDirectory {
+        path,
+        identity,
+        snapshot,
+    })
+}
+
+fn snapshot_directory(path: &Path) -> Result<DirectorySnapshot, TrustedOverlayMountPlanError> {
+    let symlink_metadata = fs::symlink_metadata(path).map_err(|_| io_error())?;
+    if symlink_metadata.file_type().is_symlink() || !symlink_metadata.is_dir() {
+        return Err(unsafe_filesystem());
+    }
+    let canonical = fs::canonicalize(path).map_err(|_| io_error())?;
+    if canonical.as_path() != path {
+        return Err(unsafe_filesystem());
+    }
+    let metadata = fs::metadata(path).map_err(|_| io_error())?;
+    if !metadata.is_dir() {
+        return Err(unsafe_filesystem());
+    }
+    Ok(DirectorySnapshot {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+        mode: metadata.mode(),
+        mtime: metadata.mtime(),
+        mtime_nsec: metadata.mtime_nsec(),
+        ctime: metadata.ctime(),
+        ctime_nsec: metadata.ctime_nsec(),
+    })
+}
+
+fn revalidate_directory(directory: &TrustedOverlayDirectory) -> Result<(), TrustedOverlayMountPlanError> {
+    let current = snapshot_directory(&directory.path)?;
+    if current != directory.snapshot {
+        return Err(changed_during_observation());
+    }
+    Ok(())
+}
+
+fn validate_directory_roles(
+    directories: [&TrustedOverlayDirectory; 4],
+) -> Result<(), TrustedOverlayMountPlanError> {
+    let identities = directories
+        .iter()
+        .map(|directory| (directory.snapshot.device, directory.snapshot.inode))
+        .collect::<BTreeSet<_>>();
+    if identities.len() != directories.len() {
+        return Err(role_conflict());
+    }
+    let expected_device = directories[0].snapshot.device;
+    if directories
+        .iter()
+        .any(|directory| directory.snapshot.device != expected_device)
+    {
+        return Err(filesystem_mismatch());
+    }
+    Ok(())
+}
+
+fn require_empty_directory(path: &Path) -> Result<(), TrustedOverlayMountPlanError> {
+    let mut entries = fs::read_dir(path).map_err(|_| io_error())?;
+    if entries.next().transpose().map_err(|_| io_error())?.is_some() {
+        return Err(workdir_not_empty());
+    }
+    Ok(())
+}
+
+fn read_bounded(path: &Path, max_bytes: usize) -> Result<Vec<u8>, TrustedOverlayMountPlanError> {
+    let file = File::open(path).map_err(|_| io_error())?;
+    let limit = u64::try_from(max_bytes)
+        .ok()
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(invalid_proc_evidence)?;
+    let mut reader: Take<File> = file.take(limit);
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).map_err(|_| io_error())?;
+    if bytes.len() > max_bytes {
+        return Err(invalid_proc_evidence());
+    }
+    Ok(bytes)
+}
+
+fn filesystems_expose_overlay(bytes: &[u8]) -> Result<bool, TrustedOverlayMountPlanError> {
+    if bytes.contains(&0) || !bytes.is_ascii() {
+        return Err(invalid_proc_evidence());
+    }
+    Ok(bytes.lines().any(|line| {
+        line.split(|byte| byte.is_ascii_whitespace())
+            .filter(|field| !field.is_empty())
+            .next_back()
+            == Some(OVERLAY_FILESYSTEM_NAME)
+    }))
+}
+
+trait ByteLines {
+    fn lines(&self) -> std::slice::Split<'_, u8, fn(&u8) -> bool>;
+}
+
+impl ByteLines for [u8] {
+    fn lines(&self) -> std::slice::Split<'_, u8, fn(&u8) -> bool> {
+        fn newline(byte: &u8) -> bool {
+            *byte == b'\n'
+        }
+        self.split(newline)
+    }
+}
+
+fn mountinfo_has_mountpoint(
+    bytes: &[u8],
+    mountpoint: &Path,
+) -> Result<bool, TrustedOverlayMountPlanError> {
+    if bytes.contains(&0) {
+        return Err(invalid_proc_evidence());
+    }
+    let expected = mountpoint.as_os_str().as_bytes();
+    for line in bytes.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let mut fields = line.split(|byte| *byte == b' ');
+        let Some(_mount_id) = fields.next() else {
+            return Err(invalid_proc_evidence());
+        };
+        let Some(_parent_id) = fields.next() else {
+            return Err(invalid_proc_evidence());
+        };
+        let Some(_device) = fields.next() else {
+            return Err(invalid_proc_evidence());
+        };
+        let Some(_root) = fields.next() else {
+            return Err(invalid_proc_evidence());
+        };
+        let Some(raw_mountpoint) = fields.next() else {
+            return Err(invalid_proc_evidence());
+        };
+        if decode_mountinfo_field(raw_mountpoint)? == expected {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn decode_mountinfo_field(field: &[u8]) -> Result<Vec<u8>, TrustedOverlayMountPlanError> {
+    let mut result = Vec::with_capacity(field.len());
+    let mut index = 0;
+    while index < field.len() {
+        if field[index] != b'\\' {
+            result.push(field[index]);
+            index += 1;
+            continue;
+        }
+        let Some(octal) = field.get(index + 1..index + 4) else {
+            return Err(invalid_proc_evidence());
+        };
+        if !octal.iter().all(u8::is_ascii_digit) || octal.iter().any(|byte| *byte > b'7') {
+            return Err(invalid_proc_evidence());
+        }
+        let value = (octal[0] - b'0') * 64 + (octal[1] - b'0') * 8 + (octal[2] - b'0');
+        result.push(value);
+        index += 4;
+    }
+    Ok(result)
+}
+
+fn validate_absolute_path(path: PathBuf) -> Result<PathBuf, TrustedOverlayMountPlanError> {
+    if path.to_str().is_none() || path.parent().is_none() || path.as_os_str() == OsStr::new("/") {
+        return Err(invalid_path());
+    }
+    let mut components = path.components();
+    if components.next() != Some(Component::RootDir)
+        || components.any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(invalid_path());
+    }
+    Ok(path)
+}
+
+fn sha256_digest(bytes: &[u8]) -> Result<Sha256Digest, TrustedOverlayMountPlanError> {
+    let digest = Sha256::digest(bytes);
+    let mut value = String::with_capacity(SHA256_PREFIX.len() + digest.len() * 2);
+    value.push_str(SHA256_PREFIX);
+    for byte in digest {
+        value.push(char::from(HEX[usize::from(byte >> 4)]));
+        value.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    Sha256Digest::parse(&value).map_err(|_| invalid_proc_evidence())
+}
+
+const fn error(
+    kind: TrustedOverlayMountPlanErrorKind,
+    code: &'static str,
+    message: &'static str,
+) -> TrustedOverlayMountPlanError {
+    TrustedOverlayMountPlanError {
+        kind,
+        code,
+        message,
+    }
+}
+
+const fn invalid_path() -> TrustedOverlayMountPlanError {
+    error(
+        TrustedOverlayMountPlanErrorKind::InvalidPath,
+        "overlay_mount_path_invalid",
+        "trusted overlay mount path is outside the reviewed contract",
+    )
+}
+
+const fn unsafe_filesystem() -> TrustedOverlayMountPlanError {
+    error(
+        TrustedOverlayMountPlanErrorKind::UnsafeFilesystem,
+        "overlay_mount_filesystem_unsafe",
+        "trusted overlay mount directory is not an exact reviewed real directory",
+    )
+}
+
+const fn role_conflict() -> TrustedOverlayMountPlanError {
+    error(
+        TrustedOverlayMountPlanErrorKind::IdentityConflict,
+        "overlay_mount_role_conflict",
+        "trusted overlay mount roles must resolve to distinct directory identities",
+    )
+}
+
+const fn filesystem_mismatch() -> TrustedOverlayMountPlanError {
+    error(
+        TrustedOverlayMountPlanErrorKind::FilesystemMismatch,
+        "overlay_mount_filesystem_mismatch",
+        "trusted overlay mount roles must share the accepted project filesystem",
+    )
+}
+
+const fn workdir_not_empty() -> TrustedOverlayMountPlanError {
+    error(
+        TrustedOverlayMountPlanErrorKind::WorkdirNotEmpty,
+        "overlay_mount_workdir_not_empty",
+        "trusted overlay work directory must be empty before mount",
+    )
+}
+
+const fn overlay_unavailable() -> TrustedOverlayMountPlanError {
+    error(
+        TrustedOverlayMountPlanErrorKind::OverlayUnavailable,
+        "overlay_mount_kernel_unavailable",
+        "running kernel does not expose the reviewed OverlayFS capability",
+    )
+}
+
+const fn already_mounted() -> TrustedOverlayMountPlanError {
+    error(
+        TrustedOverlayMountPlanErrorKind::AlreadyMounted,
+        "overlay_mount_target_already_mounted",
+        "trusted overlay merged target is already a mountpoint",
+    )
+}
+
+const fn changed_during_observation() -> TrustedOverlayMountPlanError {
+    error(
+        TrustedOverlayMountPlanErrorKind::ChangedDuringObservation,
+        "overlay_mount_observation_changed",
+        "trusted overlay mount evidence changed during observation",
+    )
+}
+
+const fn invalid_proc_evidence() -> TrustedOverlayMountPlanError {
+    error(
+        TrustedOverlayMountPlanErrorKind::InvalidProcEvidence,
+        "overlay_mount_proc_evidence_invalid",
+        "trusted overlay kernel evidence is malformed or outside the reviewed bound",
+    )
+}
+
+const fn io_error() -> TrustedOverlayMountPlanError {
+    error(
+        TrustedOverlayMountPlanErrorKind::Io,
+        "overlay_mount_observation_io",
+        "trusted overlay mount evidence is unavailable",
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::os::unix::fs::symlink;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::{
+        DirectorySnapshot, TrustedOverlayMountOptionPolicy, TrustedOverlayMountPaths,
+        TrustedOverlayMountPlanErrorKind, filesystems_expose_overlay, mountinfo_has_mountpoint,
+        observe_with_evidence, validate_directory_roles,
+    };
+    use crate::artifact::{CommitId, GitTreeId, Sha256Digest};
+    use crate::descriptor_bound_launcher::ReviewedFilesystemIdentity;
+    use crate::project_catalog::ProjectIdentity;
+    use crate::project_disk_lease::{
+        ProjectDiskGeneration, ProjectDiskId, ResidentSandboxGeneration, ResidentSandboxId,
+    };
+    use crate::trusted_overlay_task_view::{
+        OverlaySourceAnchorBinding, OverlaySourceAnchorGeneration, OverlaySourceAnchorId,
+        OverlayTaskViewGeneration, OverlayTaskViewId, OverlayTaskViewLease,
+    };
+
+    static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
+
+    struct Fixture {
+        root: PathBuf,
+        paths: TrustedOverlayMountPaths,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let unique = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!(
+                "smolrunner-overlay-plan-{}-{unique}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&root).unwrap();
+            for name in ["lower", "upper", "work", "merged"] {
+                fs::create_dir(root.join(name)).unwrap();
+            }
+            let paths = TrustedOverlayMountPaths::new(
+                root.join("lower"),
+                root.join("upper"),
+                root.join("work"),
+                root.join("merged"),
+            )
+            .unwrap();
+            Self { root, paths }
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn binding() -> OverlaySourceAnchorBinding {
+        OverlaySourceAnchorBinding::new(
+            ProjectIdentity::parse("github.com/teamleaderleo/smolrunner").unwrap(),
+            ProjectDiskId::parse("project-disk").unwrap(),
+            ProjectDiskGeneration::new(1).unwrap(),
+            ResidentSandboxId::parse("sandbox-a").unwrap(),
+            ResidentSandboxGeneration::new(1).unwrap(),
+            OverlaySourceAnchorId::parse("anchor-a").unwrap(),
+            OverlaySourceAnchorGeneration::new(1).unwrap(),
+            CommitId::parse("1111111111111111111111111111111111111111").unwrap(),
+            GitTreeId::parse("2222222222222222222222222222222222222222").unwrap(),
+            Sha256Digest::parse(
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .unwrap(),
+        )
+    }
+
+    fn lease() -> OverlayTaskViewLease {
+        OverlayTaskViewLease::new(
+            OverlayTaskViewId::parse("task-a").unwrap(),
+            OverlayTaskViewGeneration::new(1).unwrap(),
+        )
+    }
+
+    fn filesystems() -> &'static [u8] {
+        b"nodev\tsysfs\nnodev\tproc\nnodev\toverlay\n\text4\n\txfs\n"
+    }
+
+    fn mountinfo() -> &'static [u8] {
+        b"36 25 0:32 / / rw,relatime - ext4 /dev/root rw\n"
+    }
+
+    #[test]
+    fn seals_exact_mount_plan_from_read_only_observation() {
+        let fixture = Fixture::new();
+        let plan = observe_with_evidence(
+            binding(),
+            lease(),
+            fixture.paths.clone(),
+            filesystems(),
+            mountinfo(),
+            (4, 9),
+            || {},
+        )
+        .unwrap();
+        assert_eq!(
+            plan.summary().option_policy(),
+            TrustedOverlayMountOptionPolicy::SingleLowerV1
+        );
+        assert_eq!(plan.summary().role_count(), 4);
+        assert!(plan.summary().single_project_device());
+        assert_eq!(plan.source_anchor(), &binding());
+        assert_eq!(plan.task_lease(), &lease());
+        assert_eq!(plan.kernel().mount_namespace_inode(), 9);
+        assert!(!format!("{plan:?}").contains(fixture.root.to_str().unwrap()));
+    }
+
+    #[test]
+    fn refuses_nonempty_workdir_and_aliases() {
+        let fixture = Fixture::new();
+        fs::write(fixture.root.join("work/occupied"), b"x").unwrap();
+        let error = observe_with_evidence(
+            binding(),
+            lease(),
+            fixture.paths.clone(),
+            filesystems(),
+            mountinfo(),
+            (4, 9),
+            || {},
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), TrustedOverlayMountPlanErrorKind::WorkdirNotEmpty);
+
+        let alias = fixture.root.join("lower-alias");
+        symlink(fixture.root.join("lower"), &alias).unwrap();
+        let alias_paths = TrustedOverlayMountPaths::new(
+            alias,
+            fixture.root.join("upper"),
+            fixture.root.join("work"),
+            fixture.root.join("merged"),
+        )
+        .unwrap();
+        let error = observe_with_evidence(
+            binding(),
+            lease(),
+            alias_paths,
+            filesystems(),
+            mountinfo(),
+            (4, 9),
+            || {},
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), TrustedOverlayMountPlanErrorKind::UnsafeFilesystem);
+    }
+
+    #[test]
+    fn refuses_kernel_without_overlay_and_existing_mountpoint() {
+        let fixture = Fixture::new();
+        let error = observe_with_evidence(
+            binding(),
+            lease(),
+            fixture.paths.clone(),
+            b"nodev\tproc\n\text4\n",
+            mountinfo(),
+            (4, 9),
+            || {},
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), TrustedOverlayMountPlanErrorKind::OverlayUnavailable);
+
+        let merged = fixture.root.join("merged");
+        let mounted = format!(
+            "36 25 0:32 / {} rw,relatime - overlay overlay rw\n",
+            merged.display()
+        );
+        let error = observe_with_evidence(
+            binding(),
+            lease(),
+            fixture.paths.clone(),
+            filesystems(),
+            mounted.as_bytes(),
+            (4, 9),
+            || {},
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), TrustedOverlayMountPlanErrorKind::AlreadyMounted);
+    }
+
+    #[test]
+    fn detects_directory_drift_before_plan_publication() {
+        let fixture = Fixture::new();
+        let root = fixture.root.clone();
+        let error = observe_with_evidence(
+            binding(),
+            lease(),
+            fixture.paths.clone(),
+            filesystems(),
+            mountinfo(),
+            (4, 9),
+            move || {
+                fs::rename(root.join("lower"), root.join("lower-old")).unwrap();
+                fs::create_dir(root.join("lower")).unwrap();
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            TrustedOverlayMountPlanErrorKind::ChangedDuringObservation
+                | TrustedOverlayMountPlanErrorKind::Io
+        ));
+    }
+
+    #[test]
+    fn pure_role_validation_refuses_cross_device_and_duplicate_identity() {
+        fn directory(device: u64, inode: u64) -> super::TrustedOverlayDirectory {
+            let snapshot = DirectorySnapshot {
+                device,
+                inode,
+                uid: 1000,
+                gid: 1000,
+                mode: 0o40700,
+                mtime: 1,
+                mtime_nsec: 0,
+                ctime: 1,
+                ctime_nsec: 0,
+            };
+            super::TrustedOverlayDirectory {
+                path: PathBuf::from(format!("/private/{device}-{inode}")),
+                identity: ReviewedFilesystemIdentity::new(device, inode, 1000, 1000, 0o700)
+                    .unwrap(),
+                snapshot,
+            }
+        }
+
+        let a = directory(1, 1);
+        let b = directory(1, 2);
+        let c = directory(1, 3);
+        let d = directory(2, 4);
+        assert_eq!(
+            validate_directory_roles([&a, &b, &c, &d])
+                .unwrap_err()
+                .kind(),
+            TrustedOverlayMountPlanErrorKind::FilesystemMismatch
+        );
+        assert_eq!(
+            validate_directory_roles([&a, &a, &b, &c])
+                .unwrap_err()
+                .kind(),
+            TrustedOverlayMountPlanErrorKind::IdentityConflict
+        );
+    }
+
+    #[test]
+    fn proc_parsers_handle_overlay_and_mountinfo_escapes() {
+        assert!(filesystems_expose_overlay(filesystems()).unwrap());
+        assert!(!filesystems_expose_overlay(b"nodev\tproc\n\text4\n").unwrap());
+        assert!(mountinfo_has_mountpoint(
+            b"1 0 0:1 / /tmp/a\\040b rw - overlay overlay rw\n",
+            Path::new("/tmp/a b")
+        )
+        .unwrap());
+        assert!(!mountinfo_has_mountpoint(mountinfo(), Path::new("/private/target")).unwrap());
+    }
+}
