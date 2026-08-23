@@ -1,0 +1,87 @@
+name: Research GitHub ARM OverlayFS mount flags
+
+on:
+  push:
+    branches:
+      - research/github-arm-overlay-mount-flags
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: true
+          show-progress: false
+      - name: Probe hardened OverlayFS task mounts
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/smolrunner-overlay-flags"
+          rm -rf "$ROOT"
+          mkdir -p "$ROOT/lower/src"
+          cat > "$ROOT/lower/Cargo.toml" <<'EOF'
+          [package]
+          name = "overlay-flags-probe"
+          version = "0.0.0"
+          edition = "2024"
+          EOF
+          cat > "$ROOT/lower/src/lib.rs" <<'EOF'
+          pub fn answer() -> u64 { 42 }
+          #[cfg(test)] mod tests { #[test] fn works() { assert_eq!(super::answer(), 42); } }
+          EOF
+          (cd "$ROOT/lower" && cargo test --offline --quiet)
+
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess, time
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'smolrunner-overlay-flags'
+          results = {'schema_version': 1, 'variants': {}}
+          for name, extra in [('default', []), ('nodev_nosuid', ['nodev','nosuid'])]:
+              upper = root / f'upper-{name}'
+              work = root / f'work-{name}'
+              merged = root / f'merged-{name}'
+              for p in [upper, work, merged]: p.mkdir()
+              opts = [f'lowerdir={root / "lower"}', f'upperdir={upper}', f'workdir={work}', *extra]
+              t0 = time.perf_counter()
+              mount = subprocess.run(['sudo','mount','-t','overlay','overlay','-o',','.join(opts),str(merged)], text=True, capture_output=True)
+              mount_ms = (time.perf_counter()-t0)*1000
+              entry = {'mount_ms': round(mount_ms,3), 'mount_rc': mount.returncode, 'mount_stderr': mount.stderr}
+              if mount.returncode == 0:
+                  findmnt = subprocess.run(['findmnt','-T',str(merged),'-n','-o','FSTYPE,OPTIONS'], text=True, capture_output=True)
+                  t1 = time.perf_counter()
+                  cargo = subprocess.run(['cargo','test','--offline','--quiet'], cwd=merged, text=True, capture_output=True)
+                  cargo_ms = (time.perf_counter()-t1)*1000
+                  script = merged / 'run-me.sh'
+                  script.write_text('#!/bin/sh\nexit 0\n')
+                  script.chmod(0o755)
+                  exec_probe = subprocess.run([str(script)], text=True, capture_output=True)
+                  entry.update({
+                      'findmnt': findmnt.stdout.strip(),
+                      'cargo_ms': round(cargo_ms,3),
+                      'cargo_rc': cargo.returncode,
+                      'exec_rc': exec_probe.returncode,
+                  })
+                  subprocess.run(['sudo','umount',str(merged)], check=True)
+              results['variants'][name] = entry
+          out = pathlib.Path('/tmp/smolrunner-overlay-flags.json')
+          out.write_text(json.dumps(results, indent=2, sort_keys=True) + '\n')
+          print(out.read_text())
+          PY
+      - name: Publish owned result
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name teamleaderleo
+          git config user.email cheerleaderleo@outlook.com
+          RESULT_BRANCH=research/results-smolrunner-github-arm-overlay-mount-flags
+          git checkout --orphan "$RESULT_BRANCH"
+          git rm -rf . >/dev/null 2>&1 || true
+          cp /tmp/smolrunner-overlay-flags.json ./smolrunner-github-arm-overlay-mount-flags.json
+          git add smolrunner-github-arm-overlay-mount-flags.json
+          git commit -m 'Record hosted ARM OverlayFS mount flag probe'
+          git push --force origin HEAD:"$RESULT_BRANCH"
