@@ -1,0 +1,105 @@
+name: Research GitHub ARM OverlayFS new mount API fanout
+
+on:
+  push:
+    branches:
+      - research/github-arm-overlay-new-mount-fanout
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: true
+          show-progress: false
+      - name: Build mount helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/overlay-new-mount.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <errno.h>
+          #include <fcntl.h>
+          #include <linux/mount.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <sys/mount.h>
+          #include <sys/syscall.h>
+          #include <unistd.h>
+          static int xfsopen(const char *n,unsigned int f){return syscall(SYS_fsopen,n,f);}
+          static int xfsconfig(int fd,unsigned int c,const char*k,const void*v,int a){return syscall(SYS_fsconfig,fd,c,k,v,a);}
+          static int xfsmount(int fd,unsigned int f,unsigned int a){return syscall(SYS_fsmount,fd,f,a);}
+          static int xmove_mount(int fd,const char*f,int td,const char*t,unsigned int fl){return syscall(SYS_move_mount,fd,f,td,t,fl);}
+          static void die(const char*s){fprintf(stderr,"%s errno=%d %s\n",s,errno,strerror(errno));exit(2);}
+          int main(int ac,char**av){
+            if(ac!=5)return 64;
+            int fsfd=xfsopen("overlay",FSOPEN_CLOEXEC); if(fsfd<0)die("fsopen");
+            if(xfsconfig(fsfd,FSCONFIG_SET_STRING,"lowerdir",av[1],0)<0)die("lowerdir");
+            if(xfsconfig(fsfd,FSCONFIG_SET_STRING,"upperdir",av[2],0)<0)die("upperdir");
+            if(xfsconfig(fsfd,FSCONFIG_SET_STRING,"workdir",av[3],0)<0)die("workdir");
+            if(xfsconfig(fsfd,FSCONFIG_CMD_CREATE,NULL,NULL,0)<0)die("create");
+            int mfd=xfsmount(fsfd,FSMOUNT_CLOEXEC,MS_NODEV|MS_NOSUID); if(mfd<0)die("fsmount");
+            if(xmove_mount(mfd,"",AT_FDCWD,av[4],MOVE_MOUNT_F_EMPTY_PATH)<0)die("move_mount");
+            close(mfd);close(fsfd);return 0;
+          }
+          EOF
+          gcc -O2 -Wall -Wextra -Werror /tmp/overlay-new-mount.c -o /tmp/overlay-new-mount
+      - name: Benchmark fanout
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import concurrent.futures, json, os, pathlib, subprocess, time
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'smolrunner-new-mount-fanout'
+          if root.exists(): subprocess.run(['sudo','rm','-rf',str(root)],check=True)
+          root.mkdir(); lower=root/'lower'; lower.mkdir(); (lower/'base.txt').write_text('base\n')
+          data={'schema_version':1,'arch':os.uname().machine,'kernel':os.uname().release,'counts':{}}
+          def mount_one(i, base):
+              upper=base/f'upper-{i}'; work=base/f'work-{i}'; merged=base/f'merged-{i}'
+              upper.mkdir(); work.mkdir(); merged.mkdir()
+              p=subprocess.run(['sudo','/tmp/overlay-new-mount',str(lower),str(upper),str(work),str(merged)],text=True,capture_output=True)
+              return i,p.returncode,p.stderr,upper,merged
+          def unmount_one(merged):
+              t=time.perf_counter(); p=subprocess.run(['sudo','umount',str(merged)],text=True,capture_output=True)
+              return (time.perf_counter()-t)*1000,p.returncode,p.stderr
+          for count in [1,8,32]:
+              base=root/f'c{count}'; base.mkdir()
+              t0=time.perf_counter()
+              with concurrent.futures.ThreadPoolExecutor(max_workers=count) as ex:
+                  rows=list(ex.map(lambda i: mount_one(i,base), range(count)))
+              mount_wall=(time.perf_counter()-t0)*1000
+              successes=sum(rc==0 for _,rc,_,_,_ in rows)
+              visible=sum((merged/'base.txt').read_text()=='base\n' for _,rc,_,_,merged in rows if rc==0)
+              for i,rc,err,upper,merged in rows:
+                  if rc==0: (merged/'write.txt').write_text(f'{i}\n')
+              copyups=sum((upper/'write.txt').exists() for _,rc,_,upper,_ in rows if rc==0)
+              t1=time.perf_counter()
+              with concurrent.futures.ThreadPoolExecutor(max_workers=count) as ex:
+                  unmounts=list(ex.map(lambda row: unmount_one(row[4]), [r for r in rows if r[1]==0]))
+              unmount_wall=(time.perf_counter()-t1)*1000
+              data['counts'][str(count)]={
+                  'mount_wall_ms':round(mount_wall,3),'successes':successes,'visible':visible,'copyups':copyups,
+                  'unmount_wall_ms':round(unmount_wall,3),'unmount_successes':sum(rc==0 for _,rc,_ in unmounts),
+                  'unmount_individual_ms':[round(ms,3) for ms,_,_ in unmounts],
+                  'errors':[err for _,rc,err,_,_ in rows if rc!=0]+[err for _,rc,err in unmounts if rc!=0],
+              }
+          out=pathlib.Path('/tmp/smolrunner-new-mount-fanout.json');out.write_text(json.dumps(data,indent=2,sort_keys=True)+'\n');print(out.read_text())
+          PY
+      - name: Publish owned result
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name teamleaderleo
+          git config user.email cheerleaderleo@outlook.com
+          OUT=research/results-smolrunner-github-arm-overlay-new-mount-fanout
+          git checkout --orphan "$OUT"
+          git rm -rf . >/dev/null 2>&1 || true
+          cp /tmp/smolrunner-new-mount-fanout.json ./smolrunner-github-arm-overlay-new-mount-fanout.json
+          git add smolrunner-github-arm-overlay-new-mount-fanout.json
+          git commit -m 'Record hosted ARM OverlayFS new mount fanout'
+          git push --force origin HEAD:"$OUT"
