@@ -772,10 +772,11 @@ mod tests {
         ProjectDiskGeneration, ProjectDiskId, ResidentSandboxGeneration, ResidentSandboxId,
     };
     use crate::trusted_overlay_task_view::{
-        OverlayLinkedWorktreeObservation, OverlayMountObservation, OverlaySourceAnchorBinding,
-        OverlaySourceAnchorGeneration, OverlaySourceAnchorId, OverlaySourceAnchorRecord,
-        OverlayTaskProcessObservation, OverlayTaskViewGeneration, OverlayTaskViewId,
-        OverlayTaskViewLease, OverlayTaskViewObservation, OverlayTaskViewRecord,
+        OverlayGitProofObservation, OverlayIndexObservation, OverlayLinkedWorktreeObservation,
+        OverlayMountObservation, OverlaySourceAnchorBinding, OverlaySourceAnchorGeneration,
+        OverlaySourceAnchorId, OverlaySourceAnchorRecord, OverlayTaskProcessObservation,
+        OverlayTaskViewGeneration, OverlayTaskViewId, OverlayTaskViewLease,
+        OverlayTaskViewObservation, OverlayTaskViewRecord,
     };
 
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
@@ -847,8 +848,8 @@ mod tests {
             .record_worktree_registered(OverlayTaskViewObservation::new(
                 OverlayLinkedWorktreeObservation::Exact,
                 OverlayMountObservation::Absent,
-                super::OverlayIndexObservation::Absent,
-                super::OverlayGitProofObservation::NotRun,
+                OverlayIndexObservation::Absent,
+                OverlayGitProofObservation::NotRun,
                 OverlayTaskProcessObservation::Absent,
             ))
             .unwrap();
