@@ -1,0 +1,127 @@
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded anstyle v1.0.14
+  Downloaded anstream v1.0.0
+  Downloaded anstyle-query v1.1.5
+  Downloaded anstyle-parse v1.0.0
+  Downloaded bitflags v2.13.1
+  Downloaded block-buffer v0.10.4
+  Downloaded utf8parse v0.2.2
+  Downloaded heck v0.5.0
+  Downloaded sha2 v0.10.9
+  Downloaded errno v0.3.14
+  Downloaded cfg-if v1.0.4
+  Downloaded cpufeatures v0.2.17
+  Downloaded version_check v0.9.5
+  Downloaded equivalent v1.0.2
+  Downloaded is_terminal_polyfill v1.70.2
+  Downloaded itoa v1.0.18
+  Downloaded clap_lex v1.1.0
+  Downloaded generic-array v0.14.7
+  Downloaded strsim v0.11.1
+  Downloaded colorchoice v1.0.5
+  Downloaded crypto-common v0.1.7
+  Downloaded zeroize v1.9.0
+  Downloaded quote v1.0.47
+  Downloaded zmij v1.0.23
+  Downloaded digest v0.10.7
+  Downloaded clap_derive v4.6.4
+  Downloaded unsafe-libyaml-norway v0.2.15
+  Downloaded ryu v1.0.23
+  Downloaded serde_derive v1.0.229
+  Downloaded clap v4.6.4
+  Downloaded proc-macro2 v1.0.107
+  Downloaded unicode-ident v1.0.24
+  Downloaded serde v1.0.229
+  Downloaded serde_core v1.0.229
+  Downloaded serde_norway v0.9.42
+  Downloaded memchr v2.8.3
+  Downloaded indexmap v2.14.0
+  Downloaded typenum v1.20.1
+  Downloaded serde_json v1.0.151
+  Downloaded hashbrown v0.17.1
+  Downloaded clap_builder v4.6.2
+  Downloaded syn v3.0.3
+  Downloaded rustix v1.1.4
+  Downloaded libc v0.2.189
+  Downloaded linux-raw-sys v0.12.1
+   Compiling proc-macro2 v1.0.107
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.47
+   Compiling version_check v0.9.5
+   Compiling typenum v1.20.1
+   Compiling generic-array v0.14.7
+   Compiling serde_core v1.0.229
+   Compiling utf8parse v0.2.2
+   Compiling libc v0.2.189
+   Compiling anstyle-parse v1.0.0
+   Compiling syn v3.0.3
+   Compiling anstyle v1.0.14
+   Compiling colorchoice v1.0.5
+   Compiling serde v1.0.229
+   Compiling anstyle-query v1.1.5
+   Compiling is_terminal_polyfill v1.70.2
+   Compiling zmij v1.0.23
+   Compiling anstream v1.0.0
+   Compiling crypto-common v0.1.7
+   Compiling block-buffer v0.10.4
+   Compiling hashbrown v0.17.1
+   Compiling itoa v1.0.18
+   Compiling clap_lex v1.1.0
+   Compiling serde_json v1.0.151
+   Compiling heck v0.5.0
+   Compiling rustix v1.1.4
+   Compiling equivalent v1.0.2
+   Compiling strsim v0.11.1
+   Compiling indexmap v2.14.0
+   Compiling clap_builder v4.6.2
+   Compiling cpufeatures v0.2.17
+   Compiling digest v0.10.7
+   Compiling ryu v1.0.23
+   Compiling cfg-if v1.0.4
+   Compiling unsafe-libyaml-norway v0.2.15
+   Compiling linux-raw-sys v0.12.1
+   Compiling bitflags v2.13.1
+   Compiling memchr v2.8.3
+   Compiling serde_derive v1.0.229
+   Compiling clap_derive v4.6.4
+   Compiling clap v4.6.4
+   Compiling sha2 v0.10.9
+   Compiling zeroize v1.9.0
+   Compiling serde_norway v0.9.42
+   Compiling smolrunner v0.1.0 (/home/runner/work/smolrunner/smolrunner)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 01s
+     Running unittests src/lib.rs (target/debug/deps/smolrunner-25f41b11fe16c1c5)
+
+running 13 tests
+test trusted_overlay_mount_plan::tests::detects_directory_drift_before_plan_publication ... ok
+test trusted_overlay_mount_plan::tests::mount_authority_requires_registered_task_held_by_exact_anchor ... ok
+test trusted_overlay_mount_plan::tests::descriptor_acquisition_refuses_intermediate_alias_after_plan_sealing ... ok
+test trusted_overlay_mount_plan::tests::path_roles_must_be_lexically_disjoint ... ok
+test trusted_overlay_mount_plan::tests::proc_parsers_handle_overlay_and_mountinfo_escapes ... ok
+test trusted_overlay_mount_plan::tests::descriptor_lease_retains_old_object_while_path_replacement_fails_confirmation ... FAILED
+test trusted_overlay_mount_plan::tests::descriptor_lease_reopens_all_exact_roles_without_exposing_paths ... ok
+test trusted_overlay_mount_plan::tests::pure_role_validation_refuses_cross_device_and_duplicate_identity ... ok
+test trusted_overlay_mount_plan::tests::refuses_kernel_without_overlay_and_existing_mountpoint ... ok
+test trusted_overlay_mount_plan::tests::refuses_nonempty_workdir_and_aliases ... ok
+test trusted_overlay_mount_plan::tests::seals_exact_mount_plan_from_read_only_observation ... ok
+test trusted_overlay_mount_plan::tests::sealed_plan_confirmation_detects_late_workdir_and_directory_drift ... ok
+test trusted_overlay_mount_plan::tests::sealed_plan_reconfirms_exact_child_lease_across_anchor_revision ... ok
+
+failures:
+
+---- trusted_overlay_mount_plan::tests::descriptor_lease_retains_old_object_while_path_replacement_fails_confirmation stdout ----
+
+thread 'trusted_overlay_mount_plan::tests::descriptor_lease_retains_old_object_while_path_replacement_fails_confirmation' (7206) panicked at src/trusted_overlay_mount_plan.rs:1158:9:
+assertion `left == right` failed
+  left: DirectorySnapshot { device: 2049, inode: 6291508, uid: 1001, gid: 1001, mode: 16877, mtime: 1787520317, mtime_nsec: 692500254, ctime: 1787520317, ctime_nsec: 694596474 }
+ right: DirectorySnapshot { device: 2049, inode: 6291508, uid: 1001, gid: 1001, mode: 16877, mtime: 1787520317, mtime_nsec: 692500254, ctime: 1787520317, ctime_nsec: 692500254 }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    trusted_overlay_mount_plan::tests::descriptor_lease_retains_old_object_while_path_replacement_fails_confirmation
+
+test result: FAILED. 12 passed; 1 failed; 0 ignored; 0 measured; 987 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--lib`
