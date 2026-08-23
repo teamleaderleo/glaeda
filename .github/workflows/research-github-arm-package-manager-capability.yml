@@ -1,0 +1,47 @@
+name: Research GitHub ARM package-manager capability
+
+on:
+  push:
+    branches:
+      - research/github-arm-package-manager-capability
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: true
+          show-progress: false
+      - name: Record preinstalled package-manager tools only
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, pathlib, shutil, subprocess
+          tools={}
+          for name in ['node','npm','pnpm','bun','corepack','yarn']:
+              path=shutil.which(name); entry={'path':path}
+              if path:
+                  p=subprocess.run([name,'--version'],text=True,capture_output=True,timeout=15)
+                  entry.update({'rc':p.returncode,'stdout':p.stdout.strip(),'stderr':p.stderr.strip()})
+              tools[name]=entry
+          out={'schema_version':1,'arch':os.uname().machine,'kernel':os.uname().release,'tools':tools}
+          pathlib.Path('/tmp/result.json').write_text(json.dumps(out,indent=2,sort_keys=True)+'\n');print(json.dumps(out,indent=2,sort_keys=True))
+          PY
+      - name: Publish owned result
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name teamleaderleo
+          git config user.email cheerleaderleo@outlook.com
+          OUT=research/results-smolrunner-github-arm-package-manager-capability
+          git checkout --orphan "$OUT"
+          git rm -rf . >/dev/null 2>&1 || true
+          cp /tmp/result.json ./smolrunner-github-arm-package-manager-capability.json
+          git add smolrunner-github-arm-package-manager-capability.json
+          git commit -m 'Record hosted ARM package-manager capability'
+          git push --force origin HEAD:"$OUT"
