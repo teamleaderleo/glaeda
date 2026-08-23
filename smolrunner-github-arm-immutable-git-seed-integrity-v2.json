@@ -1,0 +1,65 @@
+{
+  "all_fetch_succeeded": true,
+  "all_private_gc_succeeded": true,
+  "all_pushes_refused": true,
+  "arch": "aarch64",
+  "kernel": "6.17.0-1022-azure",
+  "schema_version": 1,
+  "seed_config_unchanged": true,
+  "seed_digest_after": "27cea5745e74b8c4a2a5fe3c37110abcd9ac0942b38da799d416271339180329",
+  "seed_digest_before": "27cea5745e74b8c4a2a5fe3c37110abcd9ac0942b38da799d416271339180329",
+  "seed_exact_bytes_modes_unchanged": true,
+  "seed_fsck_rc": 0,
+  "seed_head": "4b1b073efb7f3d7c89655c9a566394745113c738",
+  "seed_refs_unchanged": true,
+  "task_activity": [
+    {
+      "fetch_rc": 0,
+      "gc_rc": 0,
+      "private_head": "5cfd04b6ad667f936276630d8594de597314fcb9",
+      "push_rc": 1
+    },
+    {
+      "fetch_rc": 0,
+      "gc_rc": 0,
+      "private_head": "29759f7b451066a279a16500fa8c8ddd66bc47cd",
+      "push_rc": 1
+    },
+    {
+      "fetch_rc": 0,
+      "gc_rc": 0,
+      "private_head": "c966a91dfe20e7d1448ee466f3531eadbf193240",
+      "push_rc": 1
+    },
+    {
+      "fetch_rc": 0,
+      "gc_rc": 0,
+      "private_head": "ef0cc4b47dbff859abe5ea3d8b7bb2a5ae0bb8ca",
+      "push_rc": 1
+    },
+    {
+      "fetch_rc": 0,
+      "gc_rc": 0,
+      "private_head": "729097c84f36e698ac0358c4dc973f5272b7a019",
+      "push_rc": 1
+    },
+    {
+      "fetch_rc": 0,
+      "gc_rc": 0,
+      "private_head": "bbad9477e9843d7e730fa48b7b8d3609fe59d866",
+      "push_rc": 1
+    },
+    {
+      "fetch_rc": 0,
+      "gc_rc": 0,
+      "private_head": "7b33707114ee08c71e6273a9691bb9841d3684dc",
+      "push_rc": 1
+    },
+    {
+      "fetch_rc": 0,
+      "gc_rc": 0,
+      "private_head": "bbf15642bd1e1b558e15e618f46d21c4c904e8ba",
+      "push_rc": 1
+    }
+  ]
+}
