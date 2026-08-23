@@ -42,7 +42,7 @@ identifier_type!(HotStatePathClassId);
 identifier_type!(HotStateGenerationId);
 identifier_type!(HotStateCapabilityGenerationId);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct HotStateReuseIdentity {
     source: HotStateGenerationId,
     toolchain: HotStateGenerationId,
@@ -105,6 +105,12 @@ impl HotStateReuseIdentity {
     }
 }
 
+impl fmt::Debug for HotStateReuseIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("<opaque-hot-state-reuse-identity>")
+    }
+}
+
 impl Serialize for HotStateReuseIdentity {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -137,7 +143,7 @@ pub enum HotStatePublisherRole {
     PublisherEnabled,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct HotStateCapabilityObservation {
     generation: HotStateCapabilityGenerationId,
     overlay_available: bool,
@@ -172,7 +178,7 @@ impl HotStateCapabilityObservation {
         &self.generation
     }
 
-    fn supports(self: &Self, mode: HotStateSharingMode, role: HotStatePublisherRole) -> bool {
+    fn supports(&self, mode: HotStateSharingMode, role: HotStatePublisherRole) -> bool {
         match mode {
             HotStateSharingMode::ImmutableOverlay => self.overlay_available,
             HotStateSharingMode::PrivateCow => self.private_cow_available,
