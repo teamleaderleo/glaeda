@@ -1,0 +1,103 @@
+name: Research GitHub ARM OverlayFS new mount API
+
+on:
+  push:
+    branches:
+      - research/github-arm-overlay-new-mount-api
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: true
+          show-progress: false
+      - name: Build and run syscall probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/overlay-new-mount.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <errno.h>
+          #include <fcntl.h>
+          #include <linux/mount.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <sys/mount.h>
+          #include <sys/stat.h>
+          #include <sys/syscall.h>
+          #include <unistd.h>
+
+          static int xfsopen(const char *name, unsigned int flags) {
+              return syscall(SYS_fsopen, name, flags);
+          }
+          static int xfsconfig(int fd, unsigned int cmd, const char *key, const void *value, int aux) {
+              return syscall(SYS_fsconfig, fd, cmd, key, value, aux);
+          }
+          static int xfsmount(int fd, unsigned int flags, unsigned int attrs) {
+              return syscall(SYS_fsmount, fd, flags, attrs);
+          }
+          static int xmove_mount(int from_dfd, const char *from, int to_dfd, const char *to, unsigned int flags) {
+              return syscall(SYS_move_mount, from_dfd, from, to_dfd, to, flags);
+          }
+          static void die(const char *stage) {
+              fprintf(stderr, "%s: errno=%d %s\n", stage, errno, strerror(errno));
+              exit(2);
+          }
+          int main(int argc, char **argv) {
+              if (argc != 5) return 64;
+              int fsfd = xfsopen("overlay", FSOPEN_CLOEXEC);
+              if (fsfd < 0) die("fsopen");
+              if (xfsconfig(fsfd, FSCONFIG_SET_STRING, "lowerdir", argv[1], 0) < 0) die("lowerdir");
+              if (xfsconfig(fsfd, FSCONFIG_SET_STRING, "upperdir", argv[2], 0) < 0) die("upperdir");
+              if (xfsconfig(fsfd, FSCONFIG_SET_STRING, "workdir", argv[3], 0) < 0) die("workdir");
+              if (xfsconfig(fsfd, FSCONFIG_CMD_CREATE, NULL, NULL, 0) < 0) die("create");
+              int mfd = xfsmount(fsfd, FSMOUNT_CLOEXEC, MS_NODEV | MS_NOSUID);
+              if (mfd < 0) die("fsmount");
+              if (xmove_mount(mfd, "", AT_FDCWD, argv[4], MOVE_MOUNT_F_EMPTY_PATH) < 0) die("move_mount");
+              close(mfd);
+              close(fsfd);
+              return 0;
+          }
+          EOF
+          gcc -O2 -Wall -Wextra -Werror /tmp/overlay-new-mount.c -o /tmp/overlay-new-mount
+
+          ROOT="$RUNNER_TEMP/smolrunner-new-mount"
+          rm -rf "$ROOT"
+          mkdir -p "$ROOT/lower" "$ROOT/upper" "$ROOT/work" "$ROOT/merged"
+          printf 'hello\n' > "$ROOT/lower/hello.txt"
+
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess, time
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'smolrunner-new-mount'
+          cmd = ['sudo','/tmp/overlay-new-mount',str(root/'lower'),str(root/'upper'),str(root/'work'),str(root/'merged')]
+          t0=time.perf_counter(); p=subprocess.run(cmd,text=True,capture_output=True); elapsed=(time.perf_counter()-t0)*1000
+          result={'schema_version':1,'arch':os.uname().machine,'kernel':os.uname().release,
+                  'mount':{'elapsed_ms':round(elapsed,3),'returncode':p.returncode,'stdout':p.stdout,'stderr':p.stderr}}
+          if p.returncode == 0:
+              findmnt=subprocess.run(['findmnt','-T',str(root/'merged'),'-n','-o','FSTYPE,OPTIONS'],text=True,capture_output=True)
+              visible=(root/'merged'/'hello.txt').read_text()
+              (root/'merged'/'task.txt').write_text('task\n')
+              lower_unchanged=not (root/'lower'/'task.txt').exists()
+              result.update({'findmnt':findmnt.stdout.strip(),'lower_visible':visible=='hello\n','upper_copyup':(root/'upper'/'task.txt').exists(),'lower_unchanged':lower_unchanged})
+              t1=time.perf_counter(); u=subprocess.run(['sudo','umount',str(root/'merged')],text=True,capture_output=True); result['unmount']={'elapsed_ms':round((time.perf_counter()-t1)*1000,3),'returncode':u.returncode,'stderr':u.stderr}
+          out=pathlib.Path('/tmp/smolrunner-new-mount.json'); out.write_text(json.dumps(result,indent=2,sort_keys=True)+'\n'); print(out.read_text())
+          PY
+      - name: Publish owned result
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name teamleaderleo
+          git config user.email cheerleaderleo@outlook.com
+          OUT=research/results-smolrunner-github-arm-overlay-new-mount-api
+          git checkout --orphan "$OUT"
+          git rm -rf . >/dev/null 2>&1 || true
+          cp /tmp/smolrunner-new-mount.json ./smolrunner-github-arm-overlay-new-mount-api.json
+          git add smolrunner-github-arm-overlay-new-mount-api.json
+          git commit -m 'Record hosted ARM OverlayFS new mount API probe'
+          git push --force origin HEAD:"$OUT"
