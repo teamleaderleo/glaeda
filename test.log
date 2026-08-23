@@ -1,0 +1,137 @@
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded anstyle-query v1.1.5
+  Downloaded anstream v1.0.0
+  Downloaded bitflags v2.13.1
+  Downloaded generic-array v0.14.7
+  Downloaded zeroize v1.9.0
+  Downloaded anstyle v1.0.14
+  Downloaded anstyle-parse v1.0.0
+  Downloaded serde_norway v0.9.42
+  Downloaded cpufeatures v0.2.17
+  Downloaded rustix v1.1.4
+  Downloaded errno v0.3.14
+  Downloaded heck v0.5.0
+  Downloaded is_terminal_polyfill v1.70.2
+  Downloaded block-buffer v0.10.4
+  Downloaded equivalent v1.0.2
+  Downloaded utf8parse v0.2.2
+  Downloaded version_check v0.9.5
+  Downloaded colorchoice v1.0.5
+  Downloaded crypto-common v0.1.7
+  Downloaded digest v0.10.7
+  Downloaded zmij v1.0.23
+  Downloaded clap_lex v1.1.0
+  Downloaded quote v1.0.47
+  Downloaded sha2 v0.10.9
+  Downloaded strsim v0.11.1
+  Downloaded cfg-if v1.0.4
+  Downloaded clap_derive v4.6.4
+  Downloaded clap v4.6.4
+  Downloaded hashbrown v0.17.1
+  Downloaded itoa v1.0.18
+  Downloaded unicode-ident v1.0.24
+  Downloaded unsafe-libyaml-norway v0.2.15
+  Downloaded proc-macro2 v1.0.107
+  Downloaded serde_derive v1.0.229
+  Downloaded clap_builder v4.6.2
+  Downloaded indexmap v2.14.0
+  Downloaded memchr v2.8.3
+  Downloaded ryu v1.0.23
+  Downloaded serde_core v1.0.229
+  Downloaded serde v1.0.229
+  Downloaded serde_json v1.0.151
+  Downloaded typenum v1.20.1
+  Downloaded syn v3.0.3
+  Downloaded libc v0.2.189
+  Downloaded linux-raw-sys v0.12.1
+   Compiling proc-macro2 v1.0.107
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.47
+   Compiling version_check v0.9.5
+   Compiling serde_core v1.0.229
+   Compiling generic-array v0.14.7
+   Compiling typenum v1.20.1
+   Compiling utf8parse v0.2.2
+   Compiling libc v0.2.189
+   Compiling anstyle-parse v1.0.0
+   Compiling zmij v1.0.23
+   Compiling anstyle v1.0.14
+   Compiling syn v3.0.3
+   Compiling is_terminal_polyfill v1.70.2
+   Compiling anstyle-query v1.1.5
+   Compiling colorchoice v1.0.5
+   Compiling serde v1.0.229
+   Compiling crypto-common v0.1.7
+   Compiling block-buffer v0.10.4
+   Compiling anstream v1.0.0
+   Compiling strsim v0.11.1
+   Compiling serde_json v1.0.151
+   Compiling clap_lex v1.1.0
+   Compiling equivalent v1.0.2
+   Compiling itoa v1.0.18
+   Compiling rustix v1.1.4
+   Compiling hashbrown v0.17.1
+   Compiling heck v0.5.0
+   Compiling cpufeatures v0.2.17
+   Compiling clap_builder v4.6.2
+   Compiling indexmap v2.14.0
+   Compiling digest v0.10.7
+   Compiling memchr v2.8.3
+   Compiling linux-raw-sys v0.12.1
+   Compiling ryu v1.0.23
+   Compiling cfg-if v1.0.4
+   Compiling bitflags v2.13.1
+   Compiling unsafe-libyaml-norway v0.2.15
+   Compiling serde_derive v1.0.229
+   Compiling clap_derive v4.6.4
+   Compiling clap v4.6.4
+   Compiling sha2 v0.10.9
+   Compiling zeroize v1.9.0
+   Compiling serde_norway v0.9.42
+   Compiling smolrunner v0.1.0 (/home/runner/work/smolrunner/smolrunner)
+error[E0618]: expected function, found `GitObjectPoolBinding`
+    --> src/immutable_git_object_pool_marker.rs:500:21
+     |
+ 313 | /     fn binding(
+ 314 | |         project: &str,
+ 315 | |         pool: &str,
+ 316 | |         generation: u64,
+...    |
+ 321 | |         trust: &str,
+ 322 | |     ) -> GitObjectPoolBinding {
+     | |_____________________________- this function of the same name is available here, but it's shadowed by the local binding
+...
+ 493 |           let binding = base_binding();
+     |               ------- `binding` has type `GitObjectPoolBinding`
+...
+ 500 |           let other = binding(
+     |                       -^^^^^^- help: consider using a semicolon here to finish the statement: `;`
+     |  _____________________|
+     | |
+ 501 | |             "github.com/teamleaderleo/smolrunner",
+ 502 | |             "pool-a",
+ 503 | |             2,
+...    |
+ 508 | |             "trust-a",
+ 509 | |         );
+     | |_________- call expression requires function
+     |
+    ::: src/immutable_git_object_pool.rs:540:5
+     |
+ 540 |       fn binding() -> GitObjectPoolBinding {
+     |       ------------------------------------ this function of the same name is available here, but it's shadowed by the local binding
+     |
+    ::: src/trusted_overlay_mount_plan.rs:1062:5
+     |
+1062 |       fn binding() -> OverlaySourceAnchorBinding {
+     |       ------------------------------------------ this function of the same name is available here, but it's shadowed by the local binding
+     |
+    ::: src/trusted_overlay_task_view.rs:945:5
+     |
+ 945 |       fn binding() -> OverlaySourceAnchorBinding {
+     |       ------------------------------------------ this function of the same name is available here, but it's shadowed by the local binding
+
+For more information about this error, try `rustc --explain E0618`.
+error: could not compile `smolrunner` (lib test) due to 1 previous error
+warning: build failed, waiting for other jobs to finish...

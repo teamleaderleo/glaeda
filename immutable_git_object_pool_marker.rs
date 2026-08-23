@@ -1,0 +1,534 @@
+use std::fmt;
+
+use serde::Serialize;
+use sha2::{Digest as _, Sha256};
+
+use crate::artifact::Sha256Digest;
+use crate::immutable_git_object_pool::{GitObjectFormat, GitObjectPoolBinding};
+
+pub const IMMUTABLE_GIT_OBJECT_POOL_MARKER_SCHEMA_VERSION: u8 = 1;
+pub const IMMUTABLE_GIT_OBJECT_POOL_MARKER_BYTES: usize = 64;
+const MARKER_MAGIC: &[u8; 8] = b"SMOLGOP1";
+const RESERVED_START: usize = 9;
+const DIGEST_START: usize = 16;
+const NONCE_START: usize = 48;
+const BINDING_DIGEST_DOMAIN: &[u8] = b"smolrunner-immutable-git-object-pool-binding-v1\0";
+const SHA256_PREFIX: &str = "sha256:";
+const HEX: &[u8; 16] = b"0123456789abcdef";
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct GitObjectPoolMarkerNonce([u8; 16]);
+
+impl GitObjectPoolMarkerNonce {
+    /// Construct one non-reusable marker nonce supplied by a later publication transaction.
+    ///
+    /// This pure constructor does not generate randomness.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded error when the supplied nonce is all zero bytes.
+    pub fn new(bytes: [u8; 16]) -> Result<Self, ImmutableGitObjectPoolMarkerError> {
+        if bytes == [0; 16] {
+            return Err(invalid_nonce());
+        }
+        Ok(Self(bytes))
+    }
+}
+
+impl fmt::Debug for GitObjectPoolMarkerNonce {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("<opaque-git-object-pool-marker-nonce>")
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ImmutableGitObjectPoolMarker {
+    binding_digest: Sha256Digest,
+    nonce: GitObjectPoolMarkerNonce,
+}
+
+impl ImmutableGitObjectPoolMarker {
+    /// Build one exact marker for a reviewed immutable Git object-pool binding.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded error only when the canonical binding digest cannot be represented.
+    pub fn new(
+        binding: &GitObjectPoolBinding,
+        nonce: GitObjectPoolMarkerNonce,
+    ) -> Result<Self, ImmutableGitObjectPoolMarkerError> {
+        Ok(Self {
+            binding_digest: git_object_pool_binding_digest(binding)?,
+            nonce,
+        })
+    }
+
+    #[must_use]
+    pub const fn binding_digest(&self) -> &Sha256Digest {
+        &self.binding_digest
+    }
+
+    /// Encode the strict 64-byte v1 marker document.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded error if the stored canonical digest cannot be decoded to 32 raw bytes.
+    pub fn encode(
+        &self,
+    ) -> Result<[u8; IMMUTABLE_GIT_OBJECT_POOL_MARKER_BYTES], ImmutableGitObjectPoolMarkerError>
+    {
+        let mut bytes = [0_u8; IMMUTABLE_GIT_OBJECT_POOL_MARKER_BYTES];
+        bytes[..8].copy_from_slice(MARKER_MAGIC);
+        bytes[8] = IMMUTABLE_GIT_OBJECT_POOL_MARKER_SCHEMA_VERSION;
+        bytes[DIGEST_START..NONCE_START].copy_from_slice(&digest_to_raw(&self.binding_digest)?);
+        bytes[NONCE_START..].copy_from_slice(&self.nonce.0);
+        Ok(bytes)
+    }
+
+    /// Decode and verify one strict v1 marker against the exact expected logical binding.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded error for wrong length/magic/version/reserved bytes, zero nonce, malformed
+    /// digest material, or a marker belonging to another logical binding.
+    pub fn decode_and_verify(
+        bytes: &[u8],
+        binding: &GitObjectPoolBinding,
+    ) -> Result<Self, ImmutableGitObjectPoolMarkerError> {
+        if bytes.len() != IMMUTABLE_GIT_OBJECT_POOL_MARKER_BYTES {
+            return Err(invalid_marker());
+        }
+        if &bytes[..8] != MARKER_MAGIC
+            || bytes[8] != IMMUTABLE_GIT_OBJECT_POOL_MARKER_SCHEMA_VERSION
+            || bytes[RESERVED_START..DIGEST_START] != [0; DIGEST_START - RESERVED_START]
+        {
+            return Err(invalid_marker());
+        }
+
+        let mut raw_digest = [0_u8; 32];
+        raw_digest.copy_from_slice(&bytes[DIGEST_START..NONCE_START]);
+        let binding_digest = raw_to_digest(&raw_digest)?;
+        if binding_digest != git_object_pool_binding_digest(binding)? {
+            return Err(binding_mismatch());
+        }
+
+        let mut raw_nonce = [0_u8; 16];
+        raw_nonce.copy_from_slice(&bytes[NONCE_START..]);
+        let nonce = GitObjectPoolMarkerNonce::new(raw_nonce)?;
+        Ok(Self {
+            binding_digest,
+            nonce,
+        })
+    }
+}
+
+impl fmt::Debug for ImmutableGitObjectPoolMarker {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ImmutableGitObjectPoolMarker")
+            .field("binding_digest", &self.binding_digest)
+            .field("nonce", &"<opaque-nonzero-generation-nonce>")
+            .finish()
+    }
+}
+
+/// Compute the canonical domain-separated digest for one exact #583 object-pool binding.
+///
+/// # Errors
+///
+/// Returns a bounded error only if a canonical token length or SHA-256 digest cannot be represented.
+pub fn git_object_pool_binding_digest(
+    binding: &GitObjectPoolBinding,
+) -> Result<Sha256Digest, ImmutableGitObjectPoolMarkerError> {
+    let mut hasher = Sha256::new();
+    hasher.update(BINDING_DIGEST_DOMAIN);
+    hasher.update([IMMUTABLE_GIT_OBJECT_POOL_MARKER_SCHEMA_VERSION]);
+    hash_token(&mut hasher, binding.project().as_str())?;
+    hash_token(&mut hasher, binding.pool_id().as_str())?;
+    hasher.update(binding.generation().get().to_be_bytes());
+    hash_token(&mut hasher, binding.project_disk_id().as_str())?;
+    hasher.update(binding.project_disk_generation().get().to_be_bytes());
+    hasher.update([match binding.object_format() {
+        GitObjectFormat::Sha1 => 1,
+        GitObjectFormat::Sha256 => 2,
+    }]);
+    hash_token(&mut hasher, binding.producer_generation().as_str())?;
+    hash_token(&mut hasher, binding.trust_generation().as_str())?;
+    raw_to_digest(hasher.finalize().as_slice())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImmutableGitObjectPoolMarkerErrorKind {
+    InvalidNonce,
+    InvalidMarker,
+    BindingMismatch,
+    InvalidDigest,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize)]
+pub struct ImmutableGitObjectPoolMarkerError {
+    kind: ImmutableGitObjectPoolMarkerErrorKind,
+    code: &'static str,
+    message: &'static str,
+}
+
+impl ImmutableGitObjectPoolMarkerError {
+    #[must_use]
+    pub const fn kind(&self) -> ImmutableGitObjectPoolMarkerErrorKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        self.code
+    }
+}
+
+impl fmt::Debug for ImmutableGitObjectPoolMarkerError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ImmutableGitObjectPoolMarkerError")
+            .field("kind", &self.kind)
+            .field("code", &self.code)
+            .field("message", &self.message)
+            .finish()
+    }
+}
+
+impl fmt::Display for ImmutableGitObjectPoolMarkerError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.message)
+    }
+}
+
+impl std::error::Error for ImmutableGitObjectPoolMarkerError {}
+
+fn hash_token(hasher: &mut Sha256, value: &str) -> Result<(), ImmutableGitObjectPoolMarkerError> {
+    let bytes = value.as_bytes();
+    let length = u32::try_from(bytes.len()).map_err(|_| invalid_digest())?;
+    hasher.update(length.to_be_bytes());
+    hasher.update(bytes);
+    Ok(())
+}
+
+fn digest_to_raw(digest: &Sha256Digest) -> Result<[u8; 32], ImmutableGitObjectPoolMarkerError> {
+    let hex = digest
+        .as_str()
+        .strip_prefix(SHA256_PREFIX)
+        .ok_or_else(invalid_digest)?;
+    if hex.len() != 64 {
+        return Err(invalid_digest());
+    }
+    let mut raw = [0_u8; 32];
+    for (index, byte) in raw.iter_mut().enumerate() {
+        let high = decode_hex(hex.as_bytes()[index * 2]).ok_or_else(invalid_digest)?;
+        let low = decode_hex(hex.as_bytes()[index * 2 + 1]).ok_or_else(invalid_digest)?;
+        *byte = (high << 4) | low;
+    }
+    Ok(raw)
+}
+
+fn raw_to_digest(raw: &[u8]) -> Result<Sha256Digest, ImmutableGitObjectPoolMarkerError> {
+    if raw.len() != 32 {
+        return Err(invalid_digest());
+    }
+    let mut value = String::with_capacity(SHA256_PREFIX.len() + 64);
+    value.push_str(SHA256_PREFIX);
+    for byte in raw {
+        value.push(char::from(HEX[usize::from(byte >> 4)]));
+        value.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    Sha256Digest::parse(&value).map_err(|_| invalid_digest())
+}
+
+const fn decode_hex(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
+}
+
+const fn error(
+    kind: ImmutableGitObjectPoolMarkerErrorKind,
+    code: &'static str,
+    message: &'static str,
+) -> ImmutableGitObjectPoolMarkerError {
+    ImmutableGitObjectPoolMarkerError {
+        kind,
+        code,
+        message,
+    }
+}
+
+const fn invalid_nonce() -> ImmutableGitObjectPoolMarkerError {
+    error(
+        ImmutableGitObjectPoolMarkerErrorKind::InvalidNonce,
+        "git_object_pool_marker_nonce_invalid",
+        "Git object-pool marker nonce must be nonzero",
+    )
+}
+
+const fn invalid_marker() -> ImmutableGitObjectPoolMarkerError {
+    error(
+        ImmutableGitObjectPoolMarkerErrorKind::InvalidMarker,
+        "git_object_pool_marker_invalid",
+        "Git object-pool marker document is invalid",
+    )
+}
+
+const fn binding_mismatch() -> ImmutableGitObjectPoolMarkerError {
+    error(
+        ImmutableGitObjectPoolMarkerErrorKind::BindingMismatch,
+        "git_object_pool_marker_binding_mismatch",
+        "Git object-pool marker does not match the expected binding",
+    )
+}
+
+const fn invalid_digest() -> ImmutableGitObjectPoolMarkerError {
+    error(
+        ImmutableGitObjectPoolMarkerErrorKind::InvalidDigest,
+        "git_object_pool_marker_digest_invalid",
+        "Git object-pool marker digest is invalid",
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::immutable_git_object_pool::{
+        GitObjectFormat, GitObjectPoolBinding, GitObjectPoolGeneration, GitObjectPoolId,
+        GitObjectPoolProducerGenerationId, GitObjectPoolTrustGenerationId,
+    };
+    use crate::project_catalog::ProjectIdentity;
+    use crate::project_disk_lease::{ProjectDiskGeneration, ProjectDiskId};
+
+    use super::{
+        GitObjectPoolMarkerNonce, IMMUTABLE_GIT_OBJECT_POOL_MARKER_BYTES,
+        ImmutableGitObjectPoolMarker, ImmutableGitObjectPoolMarkerErrorKind,
+        git_object_pool_binding_digest,
+    };
+
+    #[allow(clippy::too_many_arguments)]
+    fn binding(
+        project: &str,
+        pool: &str,
+        generation: u64,
+        disk: &str,
+        disk_generation: u64,
+        object_format: GitObjectFormat,
+        producer: &str,
+        trust: &str,
+    ) -> GitObjectPoolBinding {
+        GitObjectPoolBinding::new(
+            ProjectIdentity::parse(project).unwrap(),
+            GitObjectPoolId::parse(pool).unwrap(),
+            GitObjectPoolGeneration::new(generation).unwrap(),
+            ProjectDiskId::parse(disk).unwrap(),
+            ProjectDiskGeneration::new(disk_generation).unwrap(),
+            object_format,
+            GitObjectPoolProducerGenerationId::parse(producer).unwrap(),
+            GitObjectPoolTrustGenerationId::parse(trust).unwrap(),
+        )
+    }
+
+    fn base_binding() -> GitObjectPoolBinding {
+        binding(
+            "github.com/teamleaderleo/smolrunner",
+            "pool-a",
+            1,
+            "disk-a",
+            1,
+            GitObjectFormat::Sha1,
+            "producer-a",
+            "trust-a",
+        )
+    }
+
+    #[test]
+    fn binding_digest_changes_for_every_identity_dimension() {
+        let base = git_object_pool_binding_digest(&base_binding()).unwrap();
+        let variants = [
+            binding(
+                "github.com/teamleaderleo/fex",
+                "pool-a",
+                1,
+                "disk-a",
+                1,
+                GitObjectFormat::Sha1,
+                "producer-a",
+                "trust-a",
+            ),
+            binding(
+                "github.com/teamleaderleo/smolrunner",
+                "pool-b",
+                1,
+                "disk-a",
+                1,
+                GitObjectFormat::Sha1,
+                "producer-a",
+                "trust-a",
+            ),
+            binding(
+                "github.com/teamleaderleo/smolrunner",
+                "pool-a",
+                2,
+                "disk-a",
+                1,
+                GitObjectFormat::Sha1,
+                "producer-a",
+                "trust-a",
+            ),
+            binding(
+                "github.com/teamleaderleo/smolrunner",
+                "pool-a",
+                1,
+                "disk-b",
+                1,
+                GitObjectFormat::Sha1,
+                "producer-a",
+                "trust-a",
+            ),
+            binding(
+                "github.com/teamleaderleo/smolrunner",
+                "pool-a",
+                1,
+                "disk-a",
+                2,
+                GitObjectFormat::Sha1,
+                "producer-a",
+                "trust-a",
+            ),
+            binding(
+                "github.com/teamleaderleo/smolrunner",
+                "pool-a",
+                1,
+                "disk-a",
+                1,
+                GitObjectFormat::Sha256,
+                "producer-a",
+                "trust-a",
+            ),
+            binding(
+                "github.com/teamleaderleo/smolrunner",
+                "pool-a",
+                1,
+                "disk-a",
+                1,
+                GitObjectFormat::Sha1,
+                "producer-b",
+                "trust-a",
+            ),
+            binding(
+                "github.com/teamleaderleo/smolrunner",
+                "pool-a",
+                1,
+                "disk-a",
+                1,
+                GitObjectFormat::Sha1,
+                "producer-a",
+                "trust-b",
+            ),
+        ];
+        for variant in variants {
+            assert_ne!(base, git_object_pool_binding_digest(&variant).unwrap());
+        }
+    }
+
+    #[test]
+    fn marker_round_trip_is_fixed_and_deterministic() {
+        let binding = base_binding();
+        let marker = ImmutableGitObjectPoolMarker::new(
+            &binding,
+            GitObjectPoolMarkerNonce::new([7; 16]).unwrap(),
+        )
+        .unwrap();
+        let first = marker.encode().unwrap();
+        let second = marker.encode().unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.len(), IMMUTABLE_GIT_OBJECT_POOL_MARKER_BYTES);
+        assert_eq!(&first[..8], b"SMOLGOP1");
+        assert_eq!(first[8], 1);
+        assert_eq!(&first[9..16], &[0; 7]);
+        let decoded = ImmutableGitObjectPoolMarker::decode_and_verify(&first, &binding).unwrap();
+        assert_eq!(decoded.binding_digest(), marker.binding_digest());
+    }
+
+    #[test]
+    fn strict_marker_header_and_length_fail_closed() {
+        let binding = base_binding();
+        let marker = ImmutableGitObjectPoolMarker::new(
+            &binding,
+            GitObjectPoolMarkerNonce::new([1; 16]).unwrap(),
+        )
+        .unwrap();
+        let valid = marker.encode().unwrap();
+
+        assert_eq!(
+            ImmutableGitObjectPoolMarker::decode_and_verify(&valid[..63], &binding)
+                .unwrap_err()
+                .kind(),
+            ImmutableGitObjectPoolMarkerErrorKind::InvalidMarker
+        );
+
+        for index in [0_usize, 8, 9] {
+            let mut changed = valid;
+            changed[index] ^= 1;
+            assert_eq!(
+                ImmutableGitObjectPoolMarker::decode_and_verify(&changed, &binding)
+                    .unwrap_err()
+                    .kind(),
+                ImmutableGitObjectPoolMarkerErrorKind::InvalidMarker
+            );
+        }
+    }
+
+    #[test]
+    fn zero_nonce_and_wrong_binding_are_refused() {
+        assert_eq!(
+            GitObjectPoolMarkerNonce::new([0; 16]).unwrap_err().kind(),
+            ImmutableGitObjectPoolMarkerErrorKind::InvalidNonce
+        );
+
+        let binding = base_binding();
+        let marker = ImmutableGitObjectPoolMarker::new(
+            &binding,
+            GitObjectPoolMarkerNonce::new([9; 16]).unwrap(),
+        )
+        .unwrap();
+        let encoded = marker.encode().unwrap();
+        let other = binding(
+            "github.com/teamleaderleo/smolrunner",
+            "pool-a",
+            2,
+            "disk-a",
+            1,
+            GitObjectFormat::Sha1,
+            "producer-a",
+            "trust-a",
+        );
+        assert_eq!(
+            ImmutableGitObjectPoolMarker::decode_and_verify(&encoded, &other)
+                .unwrap_err()
+                .kind(),
+            ImmutableGitObjectPoolMarkerErrorKind::BindingMismatch
+        );
+    }
+
+    #[test]
+    fn marker_debug_does_not_expose_raw_binding_or_nonce() {
+        let binding = base_binding();
+        let marker = ImmutableGitObjectPoolMarker::new(
+            &binding,
+            GitObjectPoolMarkerNonce::new([0xab; 16]).unwrap(),
+        )
+        .unwrap();
+        let debug = format!("{marker:?}");
+        assert!(!debug.contains("pool-a"));
+        assert!(!debug.contains("disk-a"));
+        assert!(!debug.contains("producer-a"));
+        assert!(!debug.contains("trust-a"));
+        assert!(!debug.contains("abab"));
+        assert!(debug.contains("sha256:"));
+    }
+}
