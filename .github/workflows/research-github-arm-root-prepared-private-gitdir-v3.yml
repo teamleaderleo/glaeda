@@ -1,0 +1,121 @@
+name: Research secure root-prepared private Git dir v3
+
+on:
+  push:
+    branches:
+      - research/github-arm-root-prepared-private-gitdir-v3
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: true
+          show-progress: false
+      - name: Probe independent root-owned seed and private task Git dir
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/smolrunner-root-prepared-gitdir-v3"
+          rm -rf "$ROOT"; mkdir -p "$ROOT"
+          runner_uid="$(id -u)"; runner_gid="$(id -g)"
+
+          # Create an inode-independent local generation. Never hardlink pool files back into the
+          # mutable producer object store.
+          git clone --bare --local --no-hardlinks "$GITHUB_WORKSPACE" "$ROOT/seed.git" >/tmp/seed-clone.out 2>/tmp/seed-clone.err
+
+          python3 - <<'PY'
+          import json, os, pathlib
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'smolrunner-root-prepared-gitdir-v3'
+          source=pathlib.Path(os.environ['GITHUB_WORKSPACE'])/'.git'/'objects'
+          seed=root/'seed.git'/'objects'
+          def regular_identities(p):
+              out={}
+              for x in p.rglob('*'):
+                  try: st=x.stat(follow_symlinks=False)
+                  except FileNotFoundError: continue
+                  if x.is_file() and not x.is_symlink(): out[(st.st_dev,st.st_ino)]=x.relative_to(p).as_posix()
+              return out
+          src=regular_identities(source); dst=regular_identities(seed)
+          shared=sorted(set(src)&set(dst))
+          pathlib.Path('/tmp/alias.json').write_text(json.dumps({'source_regular_files':len(src),'seed_regular_files':len(dst),'shared_inode_count':len(shared)},sort_keys=True)+'\n')
+          if shared: raise SystemExit(f'pool aliases {len(shared)} source inodes')
+          PY
+
+          sudo chown -R root:root "$ROOT/seed.git"
+          sudo find "$ROOT/seed.git" -type d -exec chmod 0555 {} +
+          sudo find "$ROOT/seed.git" -type f -exec chmod 0444 {} +
+
+          # Trusted helper prepares task Git metadata while it still has authority to read the
+          # root-owned seed as a repository. The workload receives only the private clone.
+          sudo git clone --shared --no-checkout "$ROOT/seed.git" "$ROOT/task" >/tmp/task-clone.out 2>/tmp/task-clone.err
+          sudo git -C "$ROOT/task" remote remove origin
+          sudo chown -R "$runner_uid:$runner_gid" "$ROOT/task"
+
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, subprocess
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'smolrunner-root-prepared-gitdir-v3'
+          seed=root/'seed.git'; task=root/'task'
+          alias=json.loads(pathlib.Path('/tmp/alias.json').read_text())
+          def digest(p):
+              h=hashlib.sha256()
+              for x in sorted(p.rglob('*')):
+                  rel=x.relative_to(p).as_posix().encode(); st=x.lstat()
+                  h.update(len(rel).to_bytes(4,'big'));h.update(rel)
+                  h.update((st.st_mode&0o7777).to_bytes(4,'big'));h.update(st.st_uid.to_bytes(8,'big'));h.update(st.st_gid.to_bytes(8,'big'))
+                  if x.is_symlink():
+                      b=os.readlink(x).encode();h.update(len(b).to_bytes(8,'big'));h.update(b)
+                  elif x.is_file():
+                      b=x.read_bytes();h.update(len(b).to_bytes(8,'big'));h.update(b)
+              return h.hexdigest()
+          before=digest(seed)
+          head=subprocess.check_output(['sudo','git','--git-dir',str(seed),'rev-parse','HEAD'],text=True).strip()
+          alternates=(task/'.git'/'objects'/'info'/'alternates').read_text().strip()
+          remotes=subprocess.check_output(['git','-C',str(task),'remote'],text=True).split()
+          cat=subprocess.run(['git','-C',str(task),'cat-file','-e',f'{head}^{{commit}}'],text=True,capture_output=True)
+          checkout=subprocess.run(['git','-C',str(task),'checkout','--detach','-f',head],text=True,capture_output=True)
+          status=subprocess.run(['git','-C',str(task),'status','--porcelain=v1'],text=True,capture_output=True)
+          subprocess.run(['git','-C',str(task),'config','user.name','task'],check=True)
+          subprocess.run(['git','-C',str(task),'config','user.email','task@example.invalid'],check=True)
+          (task/'task-private.txt').write_text('private\n')
+          subprocess.run(['git','-C',str(task),'add','task-private.txt'],check=True)
+          commit=subprocess.run(['git','-C',str(task),'commit','-m','private'],text=True,capture_output=True)
+          private_head=subprocess.check_output(['git','-C',str(task),'rev-parse','HEAD'],text=True).strip() if commit.returncode==0 else ''
+          gc=subprocess.run(['git','-C',str(task),'gc'],text=True,capture_output=True)
+          hostile={
+              'chmod_objects': subprocess.run(['chmod','u+w',str(seed/'objects')],text=True,capture_output=True).returncode,
+              'chmod_head': subprocess.run(['chmod','u+w',str(seed/'HEAD')],text=True,capture_output=True).returncode,
+              'touch_ref': subprocess.run(['touch',str(seed/'refs'/'task-write')],text=True,capture_output=True).returncode,
+              'overwrite_head': subprocess.run(['sh','-c',f"printf evil > '{seed/'HEAD'}'"],text=True,capture_output=True).returncode,
+              'mkdir_object': subprocess.run(['mkdir',str(seed/'objects'/'aa')],text=True,capture_output=True).returncode,
+          }
+          after=digest(seed)
+          fsck=subprocess.run(['sudo','git','--git-dir',str(seed),'fsck','--full'],text=True,capture_output=True)
+          head_after=subprocess.check_output(['sudo','git','--git-dir',str(seed),'rev-parse','HEAD'],text=True).strip()
+          out={
+              'schema_version':1,'arch':os.uname().machine,'kernel':os.uname().release,
+              'publication':alias,
+              'seed':{'uid':seed.stat().st_uid,'gid':seed.stat().st_gid,'mode':oct(seed.stat().st_mode&0o7777),'head':head,'head_unchanged':head_after==head,'digest_before':before,'digest_after':after,'unchanged':before==after,'fsck_rc':fsck.returncode},
+              'task':{'uid':task.stat().st_uid,'gid':task.stat().st_gid,'alternates_exact':pathlib.Path(alternates).resolve()==(seed/'objects').resolve(),'remotes':remotes,'cat_file_rc':cat.returncode,'checkout_rc':checkout.returncode,'clean_after_checkout':status.returncode==0 and status.stdout=='','commit_rc':commit.returncode,'private_head':private_head,'gc_rc':gc.returncode},
+              'hostile_attempt_rc':hostile,
+              'all_hostile_seed_mutations_refused':all(v!=0 for v in hostile.values()),
+          }
+          out['accepted']=alias['shared_inode_count']==0 and out['seed']['uid']==0 and out['seed']['unchanged'] and out['seed']['fsck_rc']==0 and out['task']['alternates_exact'] and out['task']['remotes']==[] and out['task']['cat_file_rc']==0 and out['task']['checkout_rc']==0 and out['task']['clean_after_checkout'] and out['task']['commit_rc']==0 and out['task']['gc_rc']==0 and out['all_hostile_seed_mutations_refused']
+          pathlib.Path('/tmp/result.json').write_text(json.dumps(out,indent=2,sort_keys=True)+'\n')
+          print(json.dumps(out,indent=2,sort_keys=True))
+          if not out['accepted']: raise SystemExit('secure private-Git-dir probe did not satisfy acceptance')
+          PY
+      - name: Publish result
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name teamleaderleo; git config user.email cheerleaderleo@outlook.com
+          OUT=research/results-smolrunner-github-arm-root-prepared-private-gitdir-v3
+          git checkout --orphan "$OUT"; git rm -rf . >/dev/null 2>&1 || true
+          cp /tmp/result.json ./result.json
+          git add result.json; git commit -m 'Record secure root-prepared private Git-dir probe'
+          git push --force origin HEAD:"$OUT"
