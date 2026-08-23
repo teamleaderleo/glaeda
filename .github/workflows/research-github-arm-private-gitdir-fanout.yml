@@ -1,0 +1,151 @@
+name: Research GitHub ARM private Git-dir fanout
+
+on:
+  push:
+    branches:
+      - research/github-arm-private-gitdir-fanout
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: true
+          show-progress: false
+          fetch-depth: 0
+      - name: Benchmark linked versus private Git metadata at 1/8/32
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/allfd.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <errno.h>
+          #include <fcntl.h>
+          #include <linux/mount.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <sys/mount.h>
+          #include <sys/syscall.h>
+          #include <unistd.h>
+          static int fsopenx(const char*n,unsigned f){return syscall(SYS_fsopen,n,f);} static int cfg(int fd,unsigned c,const char*k,const void*v,int a){return syscall(SYS_fsconfig,fd,c,k,v,a);} static int fsmountx(int fd,unsigned f,unsigned a){return syscall(SYS_fsmount,fd,f,a);} static int movex(int fd,const char*f,int td,const char*t,unsigned fl){return syscall(SYS_move_mount,fd,f,td,t,fl);} static void die(const char*s){fprintf(stderr,"%s errno=%d %s\n",s,errno,strerror(errno));exit(2);}
+          int main(int ac,char**av){if(ac!=5)return 64;int l=open(av[1],O_PATH|O_DIRECTORY|O_CLOEXEC);int u=open(av[2],O_PATH|O_DIRECTORY|O_CLOEXEC);int w=open(av[3],O_PATH|O_DIRECTORY|O_CLOEXEC);int t=open(av[4],O_PATH|O_DIRECTORY|O_CLOEXEC);if(l<0||u<0||w<0||t<0)die("open");int f=fsopenx("overlay",FSOPEN_CLOEXEC);if(f<0)die("fsopen");if(cfg(f,FSCONFIG_SET_FD,"lowerdir+",NULL,l)<0)die("lowerdir+");if(cfg(f,FSCONFIG_SET_FD,"upperdir",NULL,u)<0)die("upperdir");if(cfg(f,FSCONFIG_SET_FD,"workdir",NULL,w)<0)die("workdir");if(cfg(f,FSCONFIG_CMD_CREATE,NULL,NULL,0)<0)die("create");int m=fsmountx(f,FSMOUNT_CLOEXEC,MS_NODEV|MS_NOSUID);if(m<0)die("fsmount");if(movex(m,"",t,"",MOVE_MOUNT_F_EMPTY_PATH|MOVE_MOUNT_T_EMPTY_PATH)<0)die("move_mount");close(m);close(f);close(l);close(u);close(w);close(t);return 0;}
+          EOF
+          gcc -O2 -Wall -Wextra -Werror /tmp/allfd.c -o /tmp/allfd
+          python3 - <<'PY'
+          import concurrent.futures, hashlib, json, os, pathlib, shutil, stat, subprocess, time
+
+          src=pathlib.Path(os.environ['GITHUB_WORKSPACE']).resolve()
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'smolrunner-private-fanout'
+          shutil.rmtree(root,ignore_errors=True);root.mkdir()
+          head=subprocess.check_output(['git','-C',str(src),'rev-parse','HEAD'],text=True).strip()
+          src_gitdir=pathlib.Path(subprocess.check_output(['git','-C',str(src),'rev-parse','--absolute-git-dir'],text=True).strip())
+          src_objects=(src_gitdir/'objects').resolve()
+          src_index=pathlib.Path(subprocess.check_output(['git','-C',str(src),'rev-parse','--git-path','index'],text=True).strip())
+          if not src_index.is_absolute(): src_index=(src/src_index).resolve()
+          index_bytes=src_index.read_bytes()
+          refs_before=subprocess.check_output(['git','-C',str(src),'for-each-ref','--format=%(refname) %(objectname)'],text=True)
+          config_before=(src_gitdir/'config').read_bytes()
+
+          # Make the resident base object pool read-only for the entire benchmark.
+          changed_modes=[]
+          for base,dirs,files in os.walk(src_objects):
+              for name in dirs+files:
+                  p=pathlib.Path(base)/name
+                  try:
+                      mode=stat.S_IMODE(p.lstat().st_mode)
+                      if mode & 0o222:
+                          changed_modes.append((p,mode)); os.chmod(p,mode & ~0o222)
+                  except FileNotFoundError: pass
+          mode=stat.S_IMODE(src_objects.lstat().st_mode); changed_modes.append((src_objects,mode)); os.chmod(src_objects,mode & ~0o222)
+
+          def run(argv):
+              p=subprocess.run(argv,text=True,capture_output=True)
+              if p.returncode: raise RuntimeError(f'{argv[:3]} rc={p.returncode} {p.stderr[-300:]}')
+              return p
+          def proof(path):
+              base=['git','--no-optional-locks','-c','core.hooksPath=/dev/null','-c','core.fsmonitor=false','-c','credential.helper=','-C',str(path)]
+              return subprocess.run(base+['diff-files','--quiet']).returncode==0 and subprocess.run(base+['diff-index','--quiet','HEAD','--']).returncode==0
+          def mount(upper,work,merged): run(['sudo','/tmp/allfd',str(src),str(upper),str(work),str(merged)])
+          def unmount(path): subprocess.run(['sudo','umount',str(path)],check=True)
+
+          results={}
+          try:
+              for count in (1,8,32):
+                  # Linked worktrees.
+                  linked_base=root/f'linked-{count}'; linked_base.mkdir()
+                  linked=[]
+                  def make_linked(i):
+                      merged=linked_base/f't{i}'; upper=linked_base/f'u{i}'; work=linked_base/f'w{i}'
+                      run(['git','-C',str(src),'worktree','add','--detach','--no-checkout',str(merged),head]); upper.mkdir(); work.mkdir(); shutil.copy2(merged/'.git',upper/'.git')
+                      idx=pathlib.Path(subprocess.check_output(['git','-C',str(merged),'rev-parse','--git-path','index'],text=True).strip()); idx=idx if idx.is_absolute() else (merged/idx).resolve(); idx.write_bytes(index_bytes)
+                      return merged,upper,work
+                  t=time.perf_counter()
+                  with concurrent.futures.ThreadPoolExecutor(max_workers=count) as ex: linked=list(ex.map(make_linked,range(count)))
+                  linked_meta=(time.perf_counter()-t)*1000
+                  t=time.perf_counter()
+                  with concurrent.futures.ThreadPoolExecutor(max_workers=count) as ex: list(ex.map(lambda x: mount(x[1],x[2],x[0]),linked))
+                  linked_mount=(time.perf_counter()-t)*1000
+                  t=time.perf_counter()
+                  with concurrent.futures.ThreadPoolExecutor(max_workers=count) as ex: linked_proofs=list(ex.map(lambda x: proof(x[0]),linked))
+                  linked_proof=(time.perf_counter()-t)*1000
+                  with concurrent.futures.ThreadPoolExecutor(max_workers=count) as ex: list(ex.map(lambda x: unmount(x[0]),linked))
+                  for merged,_,_ in linked: run(['git','-C',str(src),'worktree','remove','--force',str(merged)])
+
+                  # Private shared clones.
+                  private_base=root/f'private-{count}'; private_base.mkdir()
+                  private=[]
+                  def make_private(i):
+                      merged=private_base/f't{i}'; gitdir=private_base/f'g{i}'; upper=private_base/f'u{i}'; work=private_base/f'w{i}'
+                      run(['git','clone','--shared','--no-checkout','--separate-git-dir',str(gitdir),str(src),str(merged)]); upper.mkdir();work.mkdir();shutil.copy2(merged/'.git',upper/'.git');(gitdir/'index').write_bytes(index_bytes)
+                      alt=(gitdir/'objects/info/alternates').read_text().strip()
+                      return merged,gitdir,upper,work,(alt==str(src_objects))
+                  t=time.perf_counter()
+                  with concurrent.futures.ThreadPoolExecutor(max_workers=count) as ex: private=list(ex.map(make_private,range(count)))
+                  private_meta=(time.perf_counter()-t)*1000
+                  t=time.perf_counter()
+                  with concurrent.futures.ThreadPoolExecutor(max_workers=count) as ex: list(ex.map(lambda x: mount(x[2],x[3],x[0]),private))
+                  private_mount=(time.perf_counter()-t)*1000
+                  t=time.perf_counter()
+                  with concurrent.futures.ThreadPoolExecutor(max_workers=count) as ex: private_proofs=list(ex.map(lambda x: proof(x[0]),private))
+                  private_proof=(time.perf_counter()-t)*1000
+
+                  # Exercise one private task's own refs/config/new objects while base objects are read-only.
+                  probe=private[0]; merged,gitdir,_,_,_=probe; branch=f'private-fanout-{count}'
+                  run(['git','-C',str(merged),'branch',branch,'HEAD']); run(['git','-C',str(merged),'config','smolrunner.fanout','private'])
+                  with (merged/'README.md').open('ab') as f:f.write(f'\nprivate-fanout-{count}\n'.encode())
+                  run(['git','-C',str(merged),'add','README.md']); blob=subprocess.check_output(['git','-C',str(merged),'hash-object','README.md'],text=True).strip()
+                  object_private=subprocess.run(['git','--git-dir',str(gitdir),'cat-file','-e',blob]).returncode==0
+                  source_branch_absent=subprocess.run(['git','-C',str(src),'show-ref','--verify','--quiet',f'refs/heads/{branch}']).returncode!=0
+
+                  with concurrent.futures.ThreadPoolExecutor(max_workers=count) as ex: list(ex.map(lambda x: unmount(x[0]),private))
+                  results[str(count)]={
+                      'linked':{'metadata_wall_ms':round(linked_meta,3),'mount_wall_ms':round(linked_mount,3),'proof_wall_ms':round(linked_proof,3),'proof_successes':sum(linked_proofs)},
+                      'private':{'metadata_wall_ms':round(private_meta,3),'mount_wall_ms':round(private_mount,3),'proof_wall_ms':round(private_proof,3),'proof_successes':sum(private_proofs),'alternates_exact':sum(x[4] for x in private),'private_object_write':object_private,'source_branch_absent':source_branch_absent}
+                  }
+              source_stable=(subprocess.check_output(['git','-C',str(src),'for-each-ref','--format=%(refname) %(objectname)'],text=True)==refs_before and (src_gitdir/'config').read_bytes()==config_before)
+          finally:
+              for p,mode in reversed(changed_modes):
+                  try: os.chmod(p,mode)
+                  except FileNotFoundError: pass
+
+          out={'schema_version':1,'arch':os.uname().machine,'kernel':os.uname().release,'head':head,'source_object_pool_read_only':True,'source_git_metadata_stable':source_stable,'counts':results}
+          pathlib.Path('/tmp/result.json').write_text(json.dumps(out,indent=2,sort_keys=True)+'\n');print(json.dumps(out,indent=2,sort_keys=True))
+          PY
+      - name: Publish owned result
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name teamleaderleo
+          git config user.email cheerleaderleo@outlook.com
+          OUT=research/results-smolrunner-github-arm-private-gitdir-fanout
+          git checkout --orphan "$OUT"
+          git rm -rf . >/dev/null 2>&1 || true
+          cp /tmp/result.json ./smolrunner-github-arm-private-gitdir-fanout.json
+          git add smolrunner-github-arm-private-gitdir-fanout.json
+          git commit -m 'Record hosted ARM private Git-dir fanout'
+          git push --force origin HEAD:"$OUT"
