@@ -2,6 +2,8 @@
 
 pub use smolrunner::artifact;
 pub use smolrunner::descriptor_bound_launcher;
+pub use smolrunner::project_catalog;
+pub use smolrunner::project_disk_lease;
 pub use smolrunner::trusted_overlay_task_view;
 
 mod trusted_overlay_mount_plan {
