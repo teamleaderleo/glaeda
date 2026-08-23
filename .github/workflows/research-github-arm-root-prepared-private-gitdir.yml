@@ -1,0 +1,126 @@
+name: Research root-prepared private Git dir
+
+on:
+  push:
+    branches:
+      - research/github-arm-root-prepared-private-gitdir
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: true
+          show-progress: false
+      - name: Probe root-prepared private Git directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/smolrunner-root-prepared-gitdir"
+          rm -rf "$ROOT"
+          mkdir -p "$ROOT"
+          runner_uid="$(id -u)"
+          runner_gid="$(id -g)"
+
+          # Root creates and freezes the immutable bare seed generation.
+          sudo git clone --bare --local "$GITHUB_WORKSPACE" "$ROOT/seed.git" >/tmp/seed-clone.out 2>/tmp/seed-clone.err
+          sudo chown -R root:root "$ROOT/seed.git"
+          sudo find "$ROOT/seed.git" -type d -exec chmod 0555 {} +
+          sudo find "$ROOT/seed.git" -type f -exec chmod 0444 {} +
+
+          # Root prepares one private task repository from the frozen seed. Remove the local origin
+          # before handing the task directory to the workload UID; alternates remains the only
+          # relationship to the immutable seed.
+          sudo git clone --shared --no-checkout "$ROOT/seed.git" "$ROOT/task" >/tmp/task-clone.out 2>/tmp/task-clone.err
+          sudo git -C "$ROOT/task" remote remove origin
+          sudo chown -R "$runner_uid:$runner_gid" "$ROOT/task"
+
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, subprocess
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'smolrunner-root-prepared-gitdir'
+          seed=root/'seed.git'; task=root/'task'
+
+          def tree_digest(p):
+              h=hashlib.sha256()
+              for x in sorted(p.rglob('*')):
+                  rel=x.relative_to(p).as_posix().encode(); st=x.lstat()
+                  h.update(len(rel).to_bytes(4,'big')); h.update(rel)
+                  h.update((st.st_mode & 0o7777).to_bytes(4,'big'))
+                  h.update(st.st_uid.to_bytes(8,'big')); h.update(st.st_gid.to_bytes(8,'big'))
+                  if x.is_symlink():
+                      v=os.readlink(x).encode(); h.update(len(v).to_bytes(8,'big')); h.update(v)
+                  elif x.is_file():
+                      b=x.read_bytes(); h.update(len(b).to_bytes(8,'big')); h.update(b)
+              return h.hexdigest()
+
+          before=tree_digest(seed)
+          head=subprocess.check_output(['git','--git-dir',str(seed),'rev-parse','HEAD'],text=True).strip()
+          alt=(task/'.git'/'objects'/'info'/'alternates').read_text().strip()
+          alt_exact=pathlib.Path(alt).resolve()==(seed/'objects').resolve()
+          remotes=subprocess.check_output(['git','-C',str(task),'remote'],text=True).split()
+
+          cat=subprocess.run(['git','-C',str(task),'cat-file','-e',f'{head}^{{commit}}'],text=True,capture_output=True)
+          checkout=subprocess.run(['git','-C',str(task),'checkout','--detach','-f',head],text=True,capture_output=True)
+          status_before=subprocess.run(['git','-C',str(task),'status','--porcelain=v1'],text=True,capture_output=True)
+          subprocess.run(['git','-C',str(task),'config','user.name','task'],check=True)
+          subprocess.run(['git','-C',str(task),'config','user.email','task@example.invalid'],check=True)
+          (task/'task-private.txt').write_text('private\n')
+          subprocess.run(['git','-C',str(task),'add','task-private.txt'],check=True)
+          commit=subprocess.run(['git','-C',str(task),'commit','-m','private'],text=True,capture_output=True)
+          private_head=subprocess.check_output(['git','-C',str(task),'rev-parse','HEAD'],text=True).strip() if commit.returncode==0 else ''
+          gc=subprocess.run(['git','-C',str(task),'gc'],text=True,capture_output=True)
+
+          # Deliberate hostile attempts from the task UID against the root-owned generation.
+          chmod_objects=subprocess.run(['chmod','u+w',str(seed/'objects')],text=True,capture_output=True)
+          chmod_head=subprocess.run(['chmod','u+w',str(seed/'HEAD')],text=True,capture_output=True)
+          touch_ref=subprocess.run(['touch',str(seed/'refs'/'task-write')],text=True,capture_output=True)
+          overwrite_head=subprocess.run(['sh','-c',f"printf evil > '{seed/'HEAD'}'"],text=True,capture_output=True)
+          mkdir_object=subprocess.run(['mkdir',str(seed/'objects'/'aa')],text=True,capture_output=True)
+
+          after=tree_digest(seed)
+          fsck=subprocess.run(['sudo','git','--git-dir',str(seed),'fsck','--full'],text=True,capture_output=True)
+          seed_head_after=subprocess.check_output(['sudo','git','--git-dir',str(seed),'rev-parse','HEAD'],text=True).strip()
+
+          out={
+              'schema_version':1,'arch':os.uname().machine,'kernel':os.uname().release,
+              'seed':{
+                  'owner_uid':seed.stat().st_uid,'owner_gid':seed.stat().st_gid,
+                  'mode':oct(seed.stat().st_mode & 0o7777),'head':head,
+                  'digest_before':before,'digest_after':after,'unchanged':before==after,
+                  'head_unchanged':seed_head_after==head,'fsck_rc':fsck.returncode,
+              },
+              'task':{
+                  'owner_uid':task.stat().st_uid,'owner_gid':task.stat().st_gid,
+                  'alternates_exact':alt_exact,'remotes':remotes,
+                  'cat_file_rc':cat.returncode,'checkout_rc':checkout.returncode,
+                  'status_before':status_before.stdout,'commit_rc':commit.returncode,
+                  'private_head':private_head,'gc_rc':gc.returncode,
+              },
+              'hostile_attempts':{
+                  'chmod_objects_rc':chmod_objects.returncode,
+                  'chmod_head_rc':chmod_head.returncode,
+                  'touch_ref_rc':touch_ref.returncode,
+                  'overwrite_head_rc':overwrite_head.returncode,
+                  'mkdir_object_rc':mkdir_object.returncode,
+              },
+          }
+          pathlib.Path('/tmp/result.json').write_text(json.dumps(out,indent=2,sort_keys=True)+'\n')
+          print(json.dumps(out,indent=2,sort_keys=True))
+          PY
+      - name: Publish owned result
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name teamleaderleo
+          git config user.email cheerleaderleo@outlook.com
+          OUT=research/results-smolrunner-github-arm-root-prepared-private-gitdir
+          git checkout --orphan "$OUT"
+          git rm -rf . >/dev/null 2>&1 || true
+          cp /tmp/result.json ./smolrunner-github-arm-root-prepared-private-gitdir.json
+          git add smolrunner-github-arm-root-prepared-private-gitdir.json
+          git commit -m 'Record root-prepared private Git-dir probe'
+          git push --force origin HEAD:"$OUT"
