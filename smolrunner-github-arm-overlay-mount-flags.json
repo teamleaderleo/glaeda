@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "variants": {
+    "default": {
+      "cargo_ms": 32.172,
+      "cargo_rc": 0,
+      "exec_rc": 0,
+      "findmnt": "overlay rw,relatime,lowerdir=/home/runner/work/_temp/smolrunner-overlay-flags/lower,upperdir=/home/runner/work/_temp/smolrunner-overlay-flags/upper-default,workdir=/home/runner/work/_temp/smolrunner-overlay-flags/work-default,uuid=on,nouserxattr",
+      "mount_ms": 6.839,
+      "mount_rc": 0,
+      "mount_stderr": ""
+    },
+    "nodev_nosuid": {
+      "cargo_ms": 31.907,
+      "cargo_rc": 0,
+      "exec_rc": 0,
+      "findmnt": "overlay rw,nosuid,nodev,relatime,lowerdir=/home/runner/work/_temp/smolrunner-overlay-flags/lower,upperdir=/home/runner/work/_temp/smolrunner-overlay-flags/upper-nodev_nosuid,workdir=/home/runner/work/_temp/smolrunner-overlay-flags/work-nodev_nosuid,uuid=on,nouserxattr",
+      "mount_ms": 6.829,
+      "mount_rc": 0,
+      "mount_stderr": ""
+    }
+  }
+}
