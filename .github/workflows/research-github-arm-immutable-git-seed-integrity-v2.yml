@@ -1,0 +1,76 @@
+name: Research GitHub ARM immutable Git seed integrity v2
+
+on:
+  push:
+    branches:
+      - research/github-arm-immutable-git-seed-integrity-v2
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: true
+          show-progress: false
+          fetch-depth: 0
+      - name: Prove frozen seed integrity under private task Git activity
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import concurrent.futures, hashlib, json, os, pathlib, shutil, stat, subprocess
+          src=pathlib.Path(os.environ['GITHUB_WORKSPACE']).resolve();root=pathlib.Path(os.environ['RUNNER_TEMP'])/'smolrunner-seed-integrity';shutil.rmtree(root,ignore_errors=True);root.mkdir();seed=root/'seed.git'
+          subprocess.run(['git','clone','--bare','--no-hardlinks',str(src),str(seed)],check=True,capture_output=True,text=True)
+          changed=[]
+          for base,dirs,files in os.walk(seed):
+              for n in dirs+files:
+                  p=pathlib.Path(base)/n;m=stat.S_IMODE(p.lstat().st_mode);changed.append((p,m));os.chmod(p,m&~0o222)
+          m=stat.S_IMODE(seed.lstat().st_mode);changed.append((seed,m));os.chmod(seed,m&~0o222)
+          def digest_tree(path):
+              h=hashlib.sha256()
+              for base,dirs,files in os.walk(path):
+                  for n in sorted(dirs+files):
+                      p=pathlib.Path(base)/n; rel=str(p.relative_to(path)).encode(); s=p.lstat(); h.update(len(rel).to_bytes(4,'big'));h.update(rel);h.update(stat.S_IMODE(s.st_mode).to_bytes(4,'big'));h.update(s.st_size.to_bytes(8,'big'))
+                      if p.is_file():
+                          with p.open('rb') as f:
+                              while True:
+                                  b=f.read(1024*1024)
+                                  if not b:break
+                                  h.update(b)
+              return h.hexdigest()
+          before=digest_tree(seed);head=subprocess.check_output(['git','--git-dir',str(seed),'rev-parse','HEAD'],text=True).strip();refs_before=subprocess.check_output(['git','--git-dir',str(seed),'for-each-ref','--format=%(refname) %(objectname)'],text=True);config_before=(seed/'config').read_bytes()
+          tasks=[]
+          try:
+              for i in range(8):
+                  wt=root/f't{i}';gd=root/f'g{i}'
+                  p=subprocess.run(['git','clone','--shared','--no-checkout','--separate-git-dir',str(gd),str(seed),str(wt)],text=True,capture_output=True)
+                  if p.returncode:raise RuntimeError(p.stderr)
+                  tasks.append((wt,gd))
+              def mutate(pair):
+                  wt,gd=pair; i=int(wt.name[1:]); subprocess.run(['git','-C',str(wt),'branch',f'task-{i}','HEAD'],check=True); subprocess.run(['git','-C',str(wt),'config','smolrunner.task',str(i)],check=True); (wt/'README.md').write_text((src/'README.md').read_text()+f'\nseed-integrity-{i}\n'); subprocess.run(['git','-C',str(wt),'add','README.md'],check=True); subprocess.run(['git','-C',str(wt),'-c','user.name=Probe','-c','user.email=probe@example.invalid','commit','-qm',f'task {i}'],check=True); fetch=subprocess.run(['git','-C',str(wt),'fetch','origin'],capture_output=True,text=True); push=subprocess.run(['git','-C',str(wt),'push','origin',f'HEAD:refs/heads/should-fail-{i}'],capture_output=True,text=True); gc=subprocess.run(['git','-C',str(wt),'gc'],capture_output=True,text=True); return {'fetch_rc':fetch.returncode,'push_rc':push.returncode,'gc_rc':gc.returncode,'private_head':subprocess.check_output(['git','-C',str(wt),'rev-parse','HEAD'],text=True).strip()}
+              with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:activity=list(ex.map(mutate,tasks))
+              after=digest_tree(seed);refs_after=subprocess.check_output(['git','--git-dir',str(seed),'for-each-ref','--format=%(refname) %(objectname)'],text=True);config_after=(seed/'config').read_bytes();fsck=subprocess.run(['git','--git-dir',str(seed),'fsck','--full','--no-progress'],capture_output=True,text=True)
+              out={'schema_version':1,'arch':os.uname().machine,'kernel':os.uname().release,'seed_head':head,'seed_digest_before':before,'seed_digest_after':after,'seed_exact_bytes_modes_unchanged':before==after,'seed_refs_unchanged':refs_before==refs_after,'seed_config_unchanged':config_before==config_after,'seed_fsck_rc':fsck.returncode,'task_activity':activity,'all_fetch_succeeded':all(x['fetch_rc']==0 for x in activity),'all_pushes_refused':all(x['push_rc']!=0 for x in activity),'all_private_gc_succeeded':all(x['gc_rc']==0 for x in activity)}
+          finally:
+              for p,m in reversed(changed):
+                  try:os.chmod(p,m)
+                  except FileNotFoundError:pass
+          pathlib.Path('/tmp/result.json').write_text(json.dumps(out,indent=2,sort_keys=True)+'\n');print(json.dumps(out,indent=2,sort_keys=True))
+          PY
+      - name: Publish owned result
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name teamleaderleo
+          git config user.email cheerleaderleo@outlook.com
+          OUT=research/results-smolrunner-github-arm-immutable-git-seed-integrity-v2
+          git checkout --orphan "$OUT"
+          git rm -rf . >/dev/null 2>&1 || true
+          cp /tmp/result.json ./smolrunner-github-arm-immutable-git-seed-integrity-v2.json
+          git add smolrunner-github-arm-immutable-git-seed-integrity-v2.json
+          git commit -m 'Record immutable Git seed integrity v2'
+          git push --force origin HEAD:"$OUT"
