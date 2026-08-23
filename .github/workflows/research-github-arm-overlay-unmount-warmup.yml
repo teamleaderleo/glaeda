@@ -1,0 +1,67 @@
+name: Research GitHub ARM OverlayFS unmount warmup
+
+on:
+  push:
+    branches:
+      - research/github-arm-overlay-unmount-warmup
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: true
+          show-progress: false
+      - name: Build new-mount helper
+        shell: bash
+        run: |
+          cat > /tmp/overlay-new-mount.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <errno.h>
+          #include <fcntl.h>
+          #include <linux/mount.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <sys/mount.h>
+          #include <sys/syscall.h>
+          #include <unistd.h>
+          static int a(const char*n,unsigned f){return syscall(SYS_fsopen,n,f);} static int b(int fd,unsigned c,const char*k,const void*v,int x){return syscall(SYS_fsconfig,fd,c,k,v,x);} static int c(int fd,unsigned f,unsigned x){return syscall(SYS_fsmount,fd,f,x);} static int d(int fd,const char*f,int td,const char*t,unsigned fl){return syscall(SYS_move_mount,fd,f,td,t,fl);} static void e(const char*s){fprintf(stderr,"%s errno=%d %s\n",s,errno,strerror(errno));exit(2);} int main(int ac,char**av){if(ac!=5)return 64;int f=a("overlay",FSOPEN_CLOEXEC);if(f<0)e("fsopen");if(b(f,FSCONFIG_SET_STRING,"lowerdir",av[1],0)<0)e("lower");if(b(f,FSCONFIG_SET_STRING,"upperdir",av[2],0)<0)e("upper");if(b(f,FSCONFIG_SET_STRING,"workdir",av[3],0)<0)e("work");if(b(f,FSCONFIG_CMD_CREATE,NULL,NULL,0)<0)e("create");int m=c(f,FSMOUNT_CLOEXEC,MS_NODEV|MS_NOSUID);if(m<0)e("fsmount");if(d(m,"",AT_FDCWD,av[4],MOVE_MOUNT_F_EMPTY_PATH)<0)e("move");close(m);close(f);return 0;}
+          EOF
+          gcc -O2 -Wall -Wextra -Werror /tmp/overlay-new-mount.c -o /tmp/overlay-new-mount
+      - name: Run repeated single-task cycles
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess, time
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'smolrunner-overlay-unmount-warmup'; root.mkdir()
+          lower=root/'lower'; lower.mkdir(); (lower/'base').write_text('x\n')
+          rows=[]
+          for i in range(12):
+              upper=root/f'u{i}';work=root/f'w{i}';merged=root/f'm{i}';upper.mkdir();work.mkdir();merged.mkdir()
+              t=time.perf_counter(); p=subprocess.run(['sudo','/tmp/overlay-new-mount',str(lower),str(upper),str(work),str(merged)],text=True,capture_output=True); mount_ms=(time.perf_counter()-t)*1000
+              if p.returncode==0: (merged/'write').write_text('task\n')
+              t=time.perf_counter(); u=subprocess.run(['sudo','umount',str(merged)],text=True,capture_output=True) if p.returncode==0 else None; unmount_ms=(time.perf_counter()-t)*1000 if u else None
+              rows.append({'cycle':i+1,'mount_ms':round(mount_ms,3),'mount_rc':p.returncode,'unmount_ms':round(unmount_ms,3) if unmount_ms is not None else None,'unmount_rc':u.returncode if u else None,'error':p.stderr+(u.stderr if u else '')})
+          out={'schema_version':1,'arch':os.uname().machine,'kernel':os.uname().release,'cycles':rows}
+          pathlib.Path('/tmp/result.json').write_text(json.dumps(out,indent=2,sort_keys=True)+'\n')
+          print(json.dumps(out,indent=2))
+          PY
+      - name: Publish owned result
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name teamleaderleo
+          git config user.email cheerleaderleo@outlook.com
+          OUT=research/results-smolrunner-github-arm-overlay-unmount-warmup
+          git checkout --orphan "$OUT"
+          git rm -rf . >/dev/null 2>&1 || true
+          cp /tmp/result.json ./smolrunner-github-arm-overlay-unmount-warmup.json
+          git add smolrunner-github-arm-overlay-unmount-warmup.json
+          git commit -m 'Record hosted ARM OverlayFS unmount warmup'
+          git push --force origin HEAD:"$OUT"
