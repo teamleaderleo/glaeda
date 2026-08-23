@@ -1,0 +1,68 @@
+name: Research ARM verify OverlayFS plan confirmation v2
+
+on:
+  push:
+    branches:
+      - research/arm-verify-overlay-plan-confirm-v2
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: main
+          persist-credentials: true
+          show-progress: false
+      - name: Patch current-evidence confirmation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('src/trusted_overlay_mount_plan.rs')
+          s = p.read_text()
+
+          old = '''    #[must_use]\n    pub const fn kernel(&self) -> &TrustedOverlayKernelCapability {\n        &self.kernel\n    }\n}'''
+          new = '''    #[must_use]\n    pub const fn kernel(&self) -> &TrustedOverlayKernelCapability {\n        &self.kernel\n    }\n\n    /// Reconfirm this sealed plan against current authority and read-only host evidence.\n    ///\n    /// The source-anchor record revision may advance while sibling task leases change. This check\n    /// binds the exact child lease and task lifecycle state instead of requiring an old anchor\n    /// revision. It performs no filesystem mutation.\n    ///\n    /// # Errors\n    ///\n    /// Returns a bounded path-private error when current task/anchor authority, directory identity,\n    /// workdir emptiness, mount namespace, OverlayFS capability, or merged-target absence no longer\n    /// matches the sealed plan.\n    pub(crate) fn confirm(\n        &self,\n        source_anchor: &OverlaySourceAnchorRecord,\n        task_view: &OverlayTaskViewRecord,\n    ) -> Result<(), TrustedOverlayMountPlanError> {\n        require_mount_authority(source_anchor, task_view)?;\n        if source_anchor.binding() != &self.source_anchor || task_view.lease() != &self.task_lease {\n            return Err(plan_authority_mismatch());\n        }\n\n        require_procfs()?;\n        let filesystems =\n            read_bounded(Path::new("/proc/filesystems"), MAX_PROC_FILESYSTEMS_BYTES)?;\n        if sha256_digest(&filesystems)? != self.kernel.filesystems_digest {\n            return Err(changed_during_observation());\n        }\n        let mount_namespace = fs::metadata("/proc/self/ns/mnt").map_err(|_| io_error())?;\n        if (mount_namespace.dev(), mount_namespace.ino())\n            != (\n                self.kernel.mount_namespace_device,\n                self.kernel.mount_namespace_inode,\n            )\n        {\n            return Err(changed_during_observation());\n        }\n\n        require_empty_directory(&self.work.path)?;\n        for directory in [&self.lower, &self.upper, &self.work, &self.merged] {\n            revalidate_directory(directory)?;\n        }\n        validate_directory_roles([&self.lower, &self.upper, &self.work, &self.merged])?;\n        let mountinfo =\n            read_bounded(Path::new("/proc/self/mountinfo"), MAX_PROC_MOUNTINFO_BYTES)?;\n        if mountinfo_has_mountpoint(&mountinfo, &self.merged.path)? {\n            return Err(already_mounted());\n        }\n\n        Ok(())\n    }\n}'''
+          if old not in s:
+              raise SystemExit('plan impl insertion point missing')
+          s = s.replace(old, new, 1)
+
+          marker = '''const fn task_state_invalid() -> TrustedOverlayMountPlanError {'''
+          helper = '''const fn plan_authority_mismatch() -> TrustedOverlayMountPlanError {\n    error(\n        TrustedOverlayMountPlanErrorKind::AuthorityMismatch,\n        "overlay_mount_plan_authority_mismatch",\n        "current trusted overlay authority does not match the sealed mount plan",\n    )\n}\n\n'''
+          if marker not in s:
+              raise SystemExit('error insertion point missing')
+          s = s.replace(marker, helper + marker, 1)
+
+          marker = '''    #[test]\n    fn seals_exact_mount_plan_from_read_only_observation() {'''
+          tests = '''    #[test]\n    fn sealed_plan_reconfirms_current_child_lease_without_freezing_anchor_revision() {\n        let fixture = Fixture::new();\n        let (anchor, task) = registered_authority();\n        let plan = super::observe_trusted_overlay_mount_plan(\n            &anchor,\n            &task,\n            fixture.paths.clone(),\n        )\n        .unwrap();\n        plan.confirm(&anchor, &task).unwrap();\n\n        let draining = anchor.request_draining().unwrap();\n        plan.confirm(&draining, &task)\n            .expect("exact leased child survives anchor draining");\n\n        let released = draining.release_task(task.lease()).unwrap();\n        assert_eq!(\n            plan.confirm(&released, &task).unwrap_err().code(),\n            "overlay_mount_anchor_task_unproven"\n        );\n    }\n\n    #[test]\n    fn sealed_plan_confirmation_detects_workdir_and_directory_drift() {\n        let fixture = Fixture::new();\n        let (anchor, task) = registered_authority();\n        let plan = super::observe_trusted_overlay_mount_plan(\n            &anchor,\n            &task,\n            fixture.paths.clone(),\n        )\n        .unwrap();\n\n        fs::write(fixture.root.join("work/late"), b"x").unwrap();\n        assert_eq!(\n            plan.confirm(&anchor, &task).unwrap_err().kind(),\n            TrustedOverlayMountPlanErrorKind::WorkdirNotEmpty\n        );\n        fs::remove_file(fixture.root.join("work/late")).unwrap();\n\n        fs::rename(fixture.root.join("upper"), fixture.root.join("upper-old")).unwrap();\n        fs::create_dir(fixture.root.join("upper")).unwrap();\n        assert!(matches!(\n            plan.confirm(&anchor, &task).unwrap_err().kind(),\n            TrustedOverlayMountPlanErrorKind::ChangedDuringObservation\n                | TrustedOverlayMountPlanErrorKind::Io\n        ));\n    }\n\n'''
+          if marker not in s:
+              raise SystemExit('test insertion point missing')
+          s = s.replace(marker, tests + marker, 1)
+          p.write_text(s)
+          PY
+          cargo fmt --all
+      - name: Verify candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked trusted_overlay_mount_plan
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Publish verified source blob
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name teamleaderleo
+          git config user.email cheerleaderleo@outlook.com
+          OUT=research/results-arm-overlay-plan-confirm-v2
+          git checkout --orphan "$OUT"
+          git rm -rf . >/dev/null 2>&1 || true
+          mkdir -p src
+          cp "$GITHUB_WORKSPACE/src/trusted_overlay_mount_plan.rs" src/trusted_overlay_mount_plan.rs
+          git add src/trusted_overlay_mount_plan.rs
+          git commit -m 'Record verified OverlayFS plan confirmation source v2'
+          git push --force origin HEAD:"$OUT"
