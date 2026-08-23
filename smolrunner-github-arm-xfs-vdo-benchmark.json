@@ -1,0 +1,173 @@
+{
+  "benchmarks": {
+    "plain_xfs": {
+      "backing_allocated_after_duplicates": 335896576,
+      "backing_allocated_after_trees": 663543808,
+      "backing_allocated_before": 67461120,
+      "backing_allocated_delta_duplicates": 268435456,
+      "backing_allocated_delta_trees": 327647232,
+      "duplicate_256x1m_ms": 37.289,
+      "findmnt": {
+        "argv": [
+          "findmnt",
+          "-T",
+          "/home/runner/work/_temp/smolrunner-vdo-y9t6sdz2/plain",
+          "-n",
+          "-o",
+          "SOURCE,FSTYPE,OPTIONS"
+        ],
+        "elapsed_ms": 1.954,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "/dev/loop0 xfs    rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,noquota"
+      },
+      "logical_used_delta_duplicates": 268578816,
+      "logical_used_delta_trees": 337563648,
+      "name": "plain_xfs",
+      "repo_source_copy": {
+        "argv": [
+          "cp",
+          "-a",
+          "--reflink=never",
+          "/home/runner/work/smolrunner/smolrunner/.",
+          "/home/runner/work/_temp/smolrunner-vdo-y9t6sdz2/plain/trees/source-tree/"
+        ],
+        "elapsed_ms": 18.987,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": ""
+      },
+      "repo_tree_32_copy_ms": 588.901,
+      "repo_tree_successes": 32
+    }
+  },
+  "schema_version": 1,
+  "setup": {
+    "losetup": {
+      "argv": [
+        "sudo",
+        "losetup",
+        "--find",
+        "--show",
+        "/home/runner/work/_temp/smolrunner-vdo-y9t6sdz2/vdo-pv.img"
+      ],
+      "elapsed_ms": 60.988,
+      "returncode": 0,
+      "stderr": "",
+      "stdout": "/dev/loop1"
+    },
+    "lvcreate_vdo": {
+      "argv": [
+        "sudo",
+        "lvcreate",
+        "--type",
+        "vdo",
+        "-n",
+        "data",
+        "-L",
+        "6G",
+        "-V",
+        "24G",
+        "--compression",
+        "y",
+        "--deduplication",
+        "y",
+        "-y",
+        "smolvdo"
+      ],
+      "elapsed_ms": 103.03,
+      "returncode": 5,
+      "stderr": "/usr/bin/vdoformat: execvp failed: No such file or directory\n  Command /usr/bin/vdoformat failed.\n  Cannot format VDO pool volume smolvdo/vpool0.",
+      "stdout": ""
+    },
+    "mkfs_plain": {
+      "argv": [
+        "sudo",
+        "mkfs.xfs",
+        "-f",
+        "-q",
+        "-m",
+        "reflink=1",
+        "/home/runner/work/_temp/smolrunner-vdo-y9t6sdz2/plain.img"
+      ],
+      "elapsed_ms": 66.708,
+      "returncode": 0,
+      "stderr": "",
+      "stdout": ""
+    },
+    "modprobe": {
+      "argv": [
+        "sudo",
+        "modprobe",
+        "dm_vdo"
+      ],
+      "elapsed_ms": 32.12,
+      "returncode": 0,
+      "stderr": "",
+      "stdout": ""
+    },
+    "mount_plain": {
+      "argv": [
+        "sudo",
+        "mount",
+        "-o",
+        "loop",
+        "/home/runner/work/_temp/smolrunner-vdo-y9t6sdz2/plain.img",
+        "/home/runner/work/_temp/smolrunner-vdo-y9t6sdz2/plain"
+      ],
+      "elapsed_ms": 81.712,
+      "returncode": 0,
+      "stderr": "",
+      "stdout": ""
+    },
+    "pvcreate": {
+      "argv": [
+        "sudo",
+        "pvcreate",
+        "-ff",
+        "-y",
+        "/dev/loop1"
+      ],
+      "elapsed_ms": 29.896,
+      "returncode": 0,
+      "stderr": "",
+      "stdout": "Physical volume \"/dev/loop1\" successfully created."
+    },
+    "truncate_plain": {
+      "argv": [
+        "truncate",
+        "-s",
+        "4G",
+        "/home/runner/work/_temp/smolrunner-vdo-y9t6sdz2/plain.img"
+      ],
+      "elapsed_ms": 3.491,
+      "returncode": 0,
+      "stderr": "",
+      "stdout": ""
+    },
+    "truncate_vdo": {
+      "argv": [
+        "truncate",
+        "-s",
+        "8G",
+        "/home/runner/work/_temp/smolrunner-vdo-y9t6sdz2/vdo-pv.img"
+      ],
+      "elapsed_ms": 1.024,
+      "returncode": 0,
+      "stderr": "",
+      "stdout": ""
+    },
+    "vgcreate": {
+      "argv": [
+        "sudo",
+        "vgcreate",
+        "smolvdo",
+        "/dev/loop1"
+      ],
+      "elapsed_ms": 45.983,
+      "returncode": 0,
+      "stderr": "",
+      "stdout": "Volume group \"smolvdo\" successfully created"
+    }
+  }
+}
