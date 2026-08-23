@@ -1,0 +1,52 @@
+{
+  "arch": "aarch64",
+  "counts": {
+    "1": {
+      "init_private": {
+        "metadata_wall_ms": 8.805,
+        "private_object_write": true,
+        "proof_successes": 1,
+        "ready_after_metadata_wall_ms": 11.846,
+        "source_branch_absent": true
+      },
+      "shared_clone": {
+        "metadata_wall_ms": 7.52,
+        "proof_successes": 1,
+        "ready_after_metadata_wall_ms": 11.761
+      }
+    },
+    "32": {
+      "init_private": {
+        "metadata_wall_ms": 114.698,
+        "private_object_write": true,
+        "proof_successes": 32,
+        "ready_after_metadata_wall_ms": 116.048,
+        "source_branch_absent": true
+      },
+      "shared_clone": {
+        "metadata_wall_ms": 69.489,
+        "proof_successes": 32,
+        "ready_after_metadata_wall_ms": 115.193
+      }
+    },
+    "8": {
+      "init_private": {
+        "metadata_wall_ms": 25.622,
+        "private_object_write": true,
+        "proof_successes": 8,
+        "ready_after_metadata_wall_ms": 35.159,
+        "source_branch_absent": true
+      },
+      "shared_clone": {
+        "metadata_wall_ms": 17.187,
+        "proof_successes": 8,
+        "ready_after_metadata_wall_ms": 29.44
+      }
+    }
+  },
+  "head": "d7e8d98ab42cc85ab19ab456c66338e8f6ac188f",
+  "kernel": "6.17.0-1022-azure",
+  "schema_version": 1,
+  "source_git_metadata_stable": true,
+  "source_object_pool_read_only": true
+}
