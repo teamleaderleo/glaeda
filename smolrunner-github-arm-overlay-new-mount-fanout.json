@@ -1,0 +1,81 @@
+{
+  "arch": "aarch64",
+  "counts": {
+    "1": {
+      "copyups": 1,
+      "errors": [],
+      "mount_wall_ms": 7.677,
+      "successes": 1,
+      "unmount_individual_ms": [
+        1925.235
+      ],
+      "unmount_successes": 1,
+      "unmount_wall_ms": 1925.582,
+      "visible": 1
+    },
+    "32": {
+      "copyups": 32,
+      "errors": [],
+      "mount_wall_ms": 62.03,
+      "successes": 32,
+      "unmount_individual_ms": [
+        30.391,
+        30.672,
+        49.96,
+        30.323,
+        53.417,
+        50.324,
+        50.473,
+        43.215,
+        48.113,
+        41.373,
+        50.765,
+        39.186,
+        39.242,
+        43.394,
+        52.416,
+        50.866,
+        41.477,
+        37.124,
+        44.287,
+        44.556,
+        41.305,
+        35.364,
+        37.828,
+        37.896,
+        38.569,
+        34.295,
+        33.21,
+        32.654,
+        29.423,
+        29.378,
+        27.42,
+        27.054
+      ],
+      "unmount_successes": 32,
+      "unmount_wall_ms": 75.064,
+      "visible": 32
+    },
+    "8": {
+      "copyups": 8,
+      "errors": [],
+      "mount_wall_ms": 22.981,
+      "successes": 8,
+      "unmount_individual_ms": [
+        22.745,
+        22.445,
+        22.593,
+        20.497,
+        19.073,
+        17.205,
+        18.277,
+        14.42
+      ],
+      "unmount_successes": 8,
+      "unmount_wall_ms": 23.373,
+      "visible": 8
+    }
+  },
+  "kernel": "6.17.0-1022-azure",
+  "schema_version": 1
+}
