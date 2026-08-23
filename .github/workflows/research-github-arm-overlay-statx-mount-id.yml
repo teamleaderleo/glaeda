@@ -1,0 +1,69 @@
+name: Research GitHub ARM OverlayFS statx mount id
+
+on:
+  push:
+    branches:
+      - research/github-arm-overlay-statx-mount-id
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: true
+          show-progress: false
+      - name: Build and run mount-id probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/mntid.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <errno.h>
+          #include <fcntl.h>
+          #include <linux/mount.h>
+          #include <linux/stat.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <sys/mount.h>
+          #include <sys/stat.h>
+          #include <sys/syscall.h>
+          #include <unistd.h>
+          #ifndef STATX_MNT_ID_UNIQUE
+          #define STATX_MNT_ID_UNIQUE 0x00004000U
+          #endif
+          static int fsopenx(const char*n,unsigned f){return syscall(SYS_fsopen,n,f);} static int cfg(int fd,unsigned c,const char*k,const void*v,int a){return syscall(SYS_fsconfig,fd,c,k,v,a);} static int fsmountx(int fd,unsigned f,unsigned a){return syscall(SYS_fsmount,fd,f,a);} static int movex(int fd,const char*f,int td,const char*t,unsigned fl){return syscall(SYS_move_mount,fd,f,td,t,fl);} static void die(const char*s){fprintf(stderr,"%s errno=%d %s\n",s,errno,strerror(errno));exit(2);} static void pstat(const char*name,int fd){struct statx s;memset(&s,0,sizeof(s));errno=0;int r=statx(fd,"",AT_EMPTY_PATH,STATX_MNT_ID|STATX_MNT_ID_UNIQUE,&s);printf("%s rc=%d errno=%d mask=%u mnt_id=%llu\n",name,r,r<0?errno:0,s.stx_mask,(unsigned long long)s.stx_mnt_id);}
+          int main(int ac,char**av){if(ac!=5)return 64;int l=open(av[1],O_PATH|O_DIRECTORY|O_CLOEXEC);int u=open(av[2],O_PATH|O_DIRECTORY|O_CLOEXEC);int w=open(av[3],O_PATH|O_DIRECTORY|O_CLOEXEC);int t=open(av[4],O_PATH|O_DIRECTORY|O_CLOEXEC);if(l<0||u<0||w<0||t<0)die("open");pstat("target_underlay_before",t);int f=fsopenx("overlay",FSOPEN_CLOEXEC);if(f<0)die("fsopen");if(cfg(f,FSCONFIG_SET_FD,"lowerdir+",NULL,l)<0)die("lowerdir+");if(cfg(f,FSCONFIG_SET_FD,"upperdir",NULL,u)<0)die("upperdir");if(cfg(f,FSCONFIG_SET_FD,"workdir",NULL,w)<0)die("workdir");if(cfg(f,FSCONFIG_CMD_CREATE,NULL,NULL,0)<0)die("create");int m=fsmountx(f,FSMOUNT_CLOEXEC,MS_NODEV|MS_NOSUID);if(m<0)die("fsmount");pstat("mount_fd_before",m);if(movex(m,"",t,"",MOVE_MOUNT_F_EMPTY_PATH|MOVE_MOUNT_T_EMPTY_PATH)<0)die("move_mount");pstat("mount_fd_after",m);pstat("target_underlay_after",t);int v=open(av[4],O_PATH|O_DIRECTORY|O_CLOEXEC);if(v<0)die("open_visible");pstat("visible_target",v);close(v);close(m);close(f);close(l);close(u);close(w);close(t);return 0;}
+          EOF
+          gcc -O2 -Wall -Wextra -Werror /tmp/mntid.c -o /tmp/mntid
+          ROOT="$RUNNER_TEMP/smolrunner-mntid"; rm -rf "$ROOT"; mkdir -p "$ROOT/lower" "$ROOT/upper" "$ROOT/work" "$ROOT/merged"; printf 'base\n' > "$ROOT/lower/base.txt"
+          sudo /tmp/mntid "$ROOT/lower" "$ROOT/upper" "$ROOT/work" "$ROOT/merged" | tee /tmp/mntid.out
+          findmnt -T "$ROOT/merged" -n -o ID,FSTYPE,OPTIONS > /tmp/findmnt.out
+          sudo umount "$ROOT/merged"
+          python3 - <<'PY'
+          import json, os, pathlib, re
+          rows={}
+          for line in pathlib.Path('/tmp/mntid.out').read_text().splitlines():
+              m=re.match(r'(\S+) rc=(-?\d+) errno=(\d+) mask=(\d+) mnt_id=(\d+)',line)
+              if m: rows[m.group(1)]={'rc':int(m.group(2)),'errno':int(m.group(3)),'mask':int(m.group(4)),'mnt_id':int(m.group(5))}
+          out={'schema_version':1,'arch':os.uname().machine,'kernel':os.uname().release,'statx':rows,'findmnt':pathlib.Path('/tmp/findmnt.out').read_text().strip()}
+          pathlib.Path('/tmp/result.json').write_text(json.dumps(out,indent=2,sort_keys=True)+'\n')
+          print(json.dumps(out,indent=2))
+          PY
+      - name: Publish owned result
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name teamleaderleo
+          git config user.email cheerleaderleo@outlook.com
+          OUT=research/results-smolrunner-github-arm-overlay-statx-mount-id
+          git checkout --orphan "$OUT"
+          git rm -rf . >/dev/null 2>&1 || true
+          cp /tmp/result.json ./smolrunner-github-arm-overlay-statx-mount-id.json
+          git add smolrunner-github-arm-overlay-statx-mount-id.json
+          git commit -m 'Record hosted ARM OverlayFS statx mount id'
+          git push --force origin HEAD:"$OUT"
