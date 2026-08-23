@@ -1,0 +1,68 @@
+name: Research verify overlay task-view core
+
+on:
+  push:
+    branches:
+      - research/verify-overlay-task-view-core
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: codex/trusted-overlay-task-view-core
+          fetch-depth: 1
+      - name: Verify proposed pure core
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          module=Path('src/trusted_overlay_task_view.rs')
+          text=module.read_text(encoding='utf-8')
+          text=text.replace('fn quarantined_and_retired_states_are mutation_terminal()','fn quarantined_and_retired_states_are_mutation_terminal()')
+          module.write_text(text,encoding='utf-8')
+          lib=Path('src/lib.rs'); text=lib.read_text(encoding='utf-8')
+          addition='/// Pure authority and lifecycle core for trusted resident OverlayFS task views.\npub mod trusted_overlay_task_view;\n'
+          marker='/// Descriptor-relative trusted producer for runner workspace and cache identity receipts.\n'
+          if addition not in text:
+              text=text.replace(marker,addition+marker)
+          lib.write_text(text,encoding='utf-8')
+          PY
+          cargo fmt --all
+          set +e
+          cargo test --locked trusted_overlay_task_view > /tmp/overlay-core-test.log 2>&1
+          test_rc=$?
+          cargo clippy --locked --all-targets --all-features -- -D warnings > /tmp/overlay-core-clippy.log 2>&1
+          clippy_rc=$?
+          set -e
+          TEST_RC="$test_rc" CLIPPY_RC="$clippy_rc" python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          def tail(path):
+              lines=Path(path).read_text(encoding='utf-8',errors='replace').splitlines()
+              return '\n'.join(lines[-120:])
+          result={
+              'schema_version':1,
+              'test_returncode':int(os.environ['TEST_RC']),
+              'clippy_returncode':int(os.environ['CLIPPY_RC']),
+              'test_tail':tail('/tmp/overlay-core-test.log'),
+              'clippy_tail':tail('/tmp/overlay-core-clippy.log'),
+          }
+          Path('smolrunner-overlay-task-view-core-verification.json').write_text(json.dumps(result,indent=2,sort_keys=True)+'\n',encoding='utf-8')
+          print(json.dumps(result,indent=2,sort_keys=True))
+          PY
+      - name: Persist result
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -C research/results-overlay-task-view-core-verification
+          git add -- smolrunner-overlay-task-view-core-verification.json
+          git commit -m 'research: record overlay task-view core verification'
+          git push --force origin HEAD:refs/heads/research/results-overlay-task-view-core-verification
