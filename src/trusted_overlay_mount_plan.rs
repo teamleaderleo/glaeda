@@ -3,12 +3,13 @@ use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{Read as _, Take};
-use std::os::fd::AsFd as _;
+use std::os::fd::{AsFd as _, OwnedFd};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Component, Path, PathBuf};
 
-use rustix::fs::{self as rustix_fs, Mode, OFlags};
+use rustix::fs::{self as rustix_fs, FileType, Mode, OFlags};
+use rustix::io::Errno;
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
@@ -200,6 +201,43 @@ impl TrustedOverlayMountPlan {
         &self.kernel
     }
 
+    /// Reopen and retain every private directory role through no-follow descriptor traversal.
+    ///
+    /// The plan is confirmed before acquisition and again after all four descriptors are held, so
+    /// concurrent path replacement prevents publication while already-opened descriptors remain
+    /// private diagnostic objects. This function performs no mount or filesystem mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded path-private error when current plan authority/evidence fails, a path
+    /// contains an alias/non-directory component, or a held descriptor differs from its sealed role.
+    pub fn open_descriptor_lease(
+        &self,
+        source_anchor: &OverlaySourceAnchorRecord,
+        task_view: &OverlayTaskViewRecord,
+    ) -> Result<TrustedOverlayMountDescriptorLease, TrustedOverlayMountPlanError> {
+        self.confirm(source_anchor, task_view)?;
+        let lower = open_held_directory(&self.lower)?;
+        let upper = open_held_directory(&self.upper)?;
+        let work = open_held_directory(&self.work)?;
+        let merged = open_held_directory(&self.merged)?;
+        let lease = TrustedOverlayMountDescriptorLease {
+            summary: TrustedOverlayMountDescriptorLeaseSummary {
+                schema_version: TRUSTED_OVERLAY_MOUNT_PLAN_SCHEMA_VERSION,
+                role_count: 4,
+                single_filesystem_device: true,
+            },
+            source_anchor: self.source_anchor.clone(),
+            task_lease: self.task_lease.clone(),
+            lower,
+            upper,
+            work,
+            merged,
+        };
+        lease.confirm(self, source_anchor, task_view)?;
+        Ok(lease)
+    }
+
     /// Reconfirm this sealed plan against current authority and read-only host evidence.
     ///
     /// The source-anchor record revision may advance while sibling leases change. Exact child
@@ -244,6 +282,84 @@ impl TrustedOverlayMountPlan {
             return Err(already_mounted());
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct TrustedOverlayMountDescriptorLeaseSummary {
+    schema_version: u8,
+    role_count: u8,
+    single_filesystem_device: bool,
+}
+
+impl TrustedOverlayMountDescriptorLeaseSummary {
+    #[must_use]
+    pub const fn schema_version(self) -> u8 {
+        self.schema_version
+    }
+
+    #[must_use]
+    pub const fn role_count(self) -> u8 {
+        self.role_count
+    }
+
+    #[must_use]
+    pub const fn single_filesystem_device(self) -> bool {
+        self.single_filesystem_device
+    }
+}
+
+pub struct TrustedOverlayMountDescriptorLease {
+    summary: TrustedOverlayMountDescriptorLeaseSummary,
+    source_anchor: OverlaySourceAnchorBinding,
+    task_lease: OverlayTaskViewLease,
+    lower: OwnedFd,
+    upper: OwnedFd,
+    work: OwnedFd,
+    merged: OwnedFd,
+}
+
+impl TrustedOverlayMountDescriptorLease {
+    #[must_use]
+    pub const fn summary(&self) -> TrustedOverlayMountDescriptorLeaseSummary {
+        self.summary
+    }
+
+    /// Reconfirm the held role descriptors against this exact sealed plan and current task authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded path-private error when the supplied plan is for another logical task,
+    /// current plan evidence fails, or any held descriptor no longer matches its sealed role.
+    pub fn confirm(
+        &self,
+        plan: &TrustedOverlayMountPlan,
+        source_anchor: &OverlaySourceAnchorRecord,
+        task_view: &OverlayTaskViewRecord,
+    ) -> Result<(), TrustedOverlayMountPlanError> {
+        if plan.source_anchor != self.source_anchor || plan.task_lease != self.task_lease {
+            return Err(plan_authority_mismatch());
+        }
+        plan.confirm(source_anchor, task_view)?;
+        require_held_directory(&self.lower, &plan.lower)?;
+        require_held_directory(&self.upper, &plan.upper)?;
+        require_held_directory(&self.work, &plan.work)?;
+        require_held_directory(&self.merged, &plan.merged)?;
+        validate_held_roles([&self.lower, &self.upper, &self.work, &self.merged])?;
+        Ok(())
+    }
+}
+
+impl fmt::Debug for TrustedOverlayMountDescriptorLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let _ = (&self.lower, &self.upper, &self.work, &self.merged);
+        formatter
+            .debug_struct("TrustedOverlayMountDescriptorLease")
+            .field("summary", &self.summary)
+            .field("source_anchor", &self.source_anchor)
+            .field("task_lease", &self.task_lease)
+            .field("descriptors", &"<private exact overlay role descriptors>")
+            .finish()
     }
 }
 
@@ -502,6 +618,81 @@ fn snapshot_directory(path: &Path) -> Result<DirectorySnapshot, TrustedOverlayMo
         ctime: metadata.ctime(),
         ctime_nsec: metadata.ctime_nsec(),
     })
+}
+
+fn open_held_directory(
+    directory: &TrustedOverlayDirectory,
+) -> Result<OwnedFd, TrustedOverlayMountPlanError> {
+    let mut current = rustix_fs::open(Path::new("/"), PROC_DIRECTORY_FLAGS, Mode::empty())
+        .map_err(|_| io_error())?;
+    for component in directory.path.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(name) => {
+                current =
+                    rustix_fs::openat(current.as_fd(), name, PROC_DIRECTORY_FLAGS, Mode::empty())
+                        .map_err(|cause| match cause {
+                        Errno::LOOP | Errno::NOTDIR => unsafe_filesystem(),
+                        _ => io_error(),
+                    })?;
+            }
+            _ => return Err(invalid_path()),
+        }
+    }
+    require_held_directory(&current, directory)?;
+    Ok(current)
+}
+
+fn snapshot_held_directory(
+    descriptor: &OwnedFd,
+) -> Result<DirectorySnapshot, TrustedOverlayMountPlanError> {
+    let stat = rustix_fs::fstat(descriptor).map_err(|_| io_error())?;
+    if !FileType::from_raw_mode(stat.st_mode).is_dir() {
+        return Err(unsafe_filesystem());
+    }
+    Ok(DirectorySnapshot {
+        device: stat.st_dev,
+        inode: stat.st_ino,
+        uid: stat.st_uid,
+        gid: stat.st_gid,
+        mode: stat.st_mode,
+        mtime: stat.st_mtime,
+        mtime_nsec: i64::try_from(stat.st_mtime_nsec).map_err(|_| unsafe_filesystem())?,
+        ctime: stat.st_ctime,
+        ctime_nsec: i64::try_from(stat.st_ctime_nsec).map_err(|_| unsafe_filesystem())?,
+    })
+}
+
+fn require_held_directory(
+    descriptor: &OwnedFd,
+    planned: &TrustedOverlayDirectory,
+) -> Result<(), TrustedOverlayMountPlanError> {
+    if snapshot_held_directory(descriptor)? != planned.snapshot {
+        return Err(changed_during_observation());
+    }
+    Ok(())
+}
+
+fn validate_held_roles(descriptors: [&OwnedFd; 4]) -> Result<(), TrustedOverlayMountPlanError> {
+    let snapshots = descriptors
+        .iter()
+        .map(|descriptor| snapshot_held_directory(descriptor))
+        .collect::<Result<Vec<_>, _>>()?;
+    let identities = snapshots
+        .iter()
+        .map(|snapshot| (snapshot.device, snapshot.inode))
+        .collect::<BTreeSet<_>>();
+    if identities.len() != 4 {
+        return Err(role_conflict());
+    }
+    let expected_device = snapshots[0].device;
+    if snapshots
+        .iter()
+        .any(|snapshot| snapshot.device != expected_device)
+    {
+        return Err(filesystem_mismatch());
+    }
+    Ok(())
 }
 
 fn revalidate_directory(
@@ -938,6 +1129,65 @@ mod tests {
                 .code(),
             "overlay_mount_anchor_task_unproven"
         );
+    }
+
+    #[test]
+    fn descriptor_lease_reopens_all_exact_roles_without_exposing_paths() {
+        let fixture = Fixture::new();
+        let (anchor, task) = registered_authority();
+        let plan = super::observe_trusted_overlay_mount_plan(&anchor, &task, fixture.paths.clone())
+            .unwrap();
+        let lease = plan.open_descriptor_lease(&anchor, &task).unwrap();
+        assert_eq!(lease.summary().schema_version(), 1);
+        assert_eq!(lease.summary().role_count(), 4);
+        assert!(lease.summary().single_filesystem_device());
+        lease.confirm(&plan, &anchor, &task).unwrap();
+        assert!(!format!("{lease:?}").contains(fixture.root.to_str().unwrap()));
+    }
+
+    #[test]
+    fn descriptor_lease_retains_old_object_while_path_replacement_fails_confirmation() {
+        let fixture = Fixture::new();
+        let (anchor, task) = registered_authority();
+        let plan = super::observe_trusted_overlay_mount_plan(&anchor, &task, fixture.paths.clone())
+            .unwrap();
+        let lease = plan.open_descriptor_lease(&anchor, &task).unwrap();
+        let held_before = super::snapshot_held_directory(&lease.upper).unwrap();
+        fs::rename(fixture.root.join("upper"), fixture.root.join("upper-old")).unwrap();
+        fs::create_dir(fixture.root.join("upper")).unwrap();
+        let held_after = super::snapshot_held_directory(&lease.upper).unwrap();
+        assert_eq!(
+            (held_after.device, held_after.inode),
+            (held_before.device, held_before.inode)
+        );
+        assert!(matches!(
+            lease.confirm(&plan, &anchor, &task).unwrap_err().kind(),
+            TrustedOverlayMountPlanErrorKind::ChangedDuringObservation
+                | TrustedOverlayMountPlanErrorKind::Io
+        ));
+    }
+
+    #[test]
+    fn descriptor_acquisition_refuses_intermediate_alias_after_plan_sealing() {
+        let fixture = Fixture::new();
+        let (anchor, task) = registered_authority();
+        let plan = super::observe_trusted_overlay_mount_plan(&anchor, &task, fixture.paths.clone())
+            .unwrap();
+        let parent = fixture.root.parent().unwrap().to_path_buf();
+        let original_name = fixture.root.file_name().unwrap().to_owned();
+        let moved = parent.join(format!("{}-moved", original_name.to_string_lossy()));
+        fs::rename(&fixture.root, &moved).unwrap();
+        symlink(&moved, &fixture.root).unwrap();
+        assert!(matches!(
+            plan.open_descriptor_lease(&anchor, &task)
+                .unwrap_err()
+                .kind(),
+            TrustedOverlayMountPlanErrorKind::UnsafeFilesystem
+                | TrustedOverlayMountPlanErrorKind::ChangedDuringObservation
+                | TrustedOverlayMountPlanErrorKind::Io
+        ));
+        fs::remove_file(&fixture.root).unwrap();
+        fs::rename(&moved, &fixture.root).unwrap();
     }
 
     #[test]
