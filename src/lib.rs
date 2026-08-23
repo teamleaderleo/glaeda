@@ -108,6 +108,8 @@ pub mod hot_execution_performance;
 pub mod hot_state_path_policy;
 /// Pure immutable resident Git object-pool generation and consumer-lease core.
 pub mod immutable_git_object_pool;
+/// Pure fixed marker codec for immutable Git object-pool generations.
+pub mod immutable_git_object_pool_marker;
 #[cfg(target_os = "linux")]
 pub mod installation_id;
 pub mod journal;
