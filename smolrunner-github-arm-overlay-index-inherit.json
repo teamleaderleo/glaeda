@@ -1,0 +1,510 @@
+{
+  "inherit": {
+    "elapsed_ms": 1.651,
+    "entries": 391,
+    "flag_mismatches": 0,
+    "oid_mismatches": 0,
+    "source_extensions_bytes": 1924,
+    "target_extensions_bytes": 1924
+  },
+  "proof_after_inherit": {
+    "diff_files": {
+      "argv": [
+        "git",
+        "--no-optional-locks",
+        "diff-files",
+        "--quiet"
+      ],
+      "elapsed_ms": 23.598,
+      "returncode": 0,
+      "stderr": "",
+      "stdout": ""
+    },
+    "diff_index": {
+      "argv": [
+        "git",
+        "--no-optional-locks",
+        "diff-index",
+        "--quiet",
+        "HEAD",
+        "--"
+      ],
+      "elapsed_ms": 23.862,
+      "returncode": 0,
+      "stderr": "",
+      "stdout": ""
+    },
+    "diff_names": [],
+    "returncode": 0
+  },
+  "proof_after_refresh": {
+    "diff_files": {
+      "argv": [
+        "git",
+        "--no-optional-locks",
+        "diff-files",
+        "--quiet"
+      ],
+      "elapsed_ms": 23.591,
+      "returncode": 0,
+      "stderr": "",
+      "stdout": ""
+    },
+    "diff_index": {
+      "argv": [
+        "git",
+        "--no-optional-locks",
+        "diff-index",
+        "--quiet",
+        "HEAD",
+        "--"
+      ],
+      "elapsed_ms": 23.754,
+      "returncode": 0,
+      "stderr": "",
+      "stdout": ""
+    },
+    "diff_names": [],
+    "returncode": 0
+  },
+  "proof_before_inherit": {
+    "diff_files": {
+      "argv": [
+        "git",
+        "--no-optional-locks",
+        "diff-files",
+        "--quiet"
+      ],
+      "elapsed_ms": 1.623,
+      "returncode": 1,
+      "stderr": "",
+      "stdout": ""
+    },
+    "diff_index": {
+      "argv": [
+        "git",
+        "--no-optional-locks",
+        "diff-index",
+        "--quiet",
+        "HEAD",
+        "--"
+      ],
+      "elapsed_ms": 1.62,
+      "returncode": 1,
+      "stderr": "",
+      "stdout": ""
+    },
+    "diff_names": [
+      ".coderabbit.yaml",
+      ".github/workflows/bootstrap-compatibility.yml",
+      ".github/workflows/ci.yml",
+      ".github/workflows/linux-acceptance.yml",
+      ".github/workflows/podman-closure-probe.yml",
+      ".github/workflows/podman-container-closure-probe.yml",
+      ".github/workflows/research-github-arm-overlay-index-inherit.yml",
+      ".gitignore",
+      "AGENTS.md",
+      "Cargo.lock",
+      "Cargo.toml",
+      "LICENSE",
+      "Makefile",
+      "README.md",
+      "docs/AGENT_COORDINATION.md",
+      "docs/BLAZINGLY_HOT.md",
+      "docs/DESCRIPTOR_BOUND_LINUX_LAUNCHER.md",
+      "docs/DISPOSABLE_AUTOSCALING_CI.md",
+      "docs/DISPOSABLE_DEPENDENCY_BOUNDARY.md",
+      "docs/DISPOSABLE_INSTALLED_SERVICE_ACCEPTANCE.md",
+      "docs/DISPOSABLE_VZ_NETWORK_SELECTOR_ACCEPTANCE.md",
+      "docs/EXECUTION_ADMISSION.md",
+      "docs/EXECUTION_RECEIPTS.md",
+      "docs/EXECUTION_RECEIPT_STORAGE.md",
+      "docs/HOST_PREPARATION_RECEIPT_BINDING.md",
+      "docs/HOST_PREPARATION_RECEIPT_MAPPING.md",
+      "docs/HOST_RECONCILIATION.md",
+      "docs/IMPLEMENTATION_MAP.md",
+      "docs/LEASED_EXECUTION.md",
+      "docs/LIMA_DEVELOPMENT.md",
+      "docs/LINUX-ACCEPTANCE.md",
+      "docs/MACBOOK-RUNNER-BOOTSTRAP.md",
+      "docs/MACBOOK-RUNNER-QUICKSTART.md",
+      "docs/MACBOOK-RUNNER.md",
+      "docs/MACOS_RESOURCE_OBSERVATION.md",
+      "docs/MANIFEST.md",
+      "docs/OPERATING_MODEL.md",
+      "docs/PERSONAL_WORKER_ACCEPTANCE.md",
+      "docs/PERSONAL_WORKER_ALPHA.md",
+      "docs/PERSONAL_WORKER_STORE_WRITER_CONTRACT.md",
+      "docs/PODMAN_CONTAINER_CLOSURE_EVIDENCE.md",
+      "docs/PODMAN_EXECUTION_CLOSURE.md",
+      "docs/PODMAN_EXECUTION_CLOSURE_EVIDENCE.md",
+      "docs/PRODUCT_EVOLUTION.md",
+      "docs/PROJECT_WORKSPACES.md",
+      "docs/RENDERPROVE_ARTIFACT_BINDING.md",
+      "docs/RENDERPROVE_VISION_PROFILE.md",
+      "docs/ROADMAP.md",
+      "docs/THREAT_MODEL.md",
+      "docs/TRUSTED_WORKSPACE_CACHE_RECEIPT.md",
+      "docs/WORKSPACE_BOOTSTRAP.md",
+      "docs/WORKSPACE_BOOTSTRAP_PROFILE_COMPATIBILITY.md",
+      "docs/adr/0001-privilege-adoption-and-rollback.md",
+      "docs/adr/0002-durable-ownership-state.md",
+      "docs/adr/0003-canonical-resource-evidence.md",
+      "docs/adr/0004-lease-lifecycle-core.md",
+      "docs/adr/0005-lease-store-and-artifact-identity.md",
+      "docs/adr/0006-preview-slot-coalescing.md",
+      "docs/adr/0007-rootless-podman-preview-command-planning.md",
+      "docs/adr/0008-podman-preview-inspection-authorization.md",
+      "docs/adr/0009-bounded-subprocess-output.md",
+      "docs/adr/0010-podman-inspect-execution-receipts.md",
+      "docs/adr/0011-podman-state-aware-mutation-authorization.md",
+      "docs/adr/0012-podman-state-reconciliation-plans.md"
+    ],
+    "returncode": 1
+  },
+  "refresh_control": {
+    "argv": [
+      "git",
+      "update-index",
+      "--refresh"
+    ],
+    "elapsed_ms": 24.107,
+    "returncode": 0,
+    "stderr": "",
+    "stdout": ""
+  },
+  "schema_version": 1,
+  "source": {
+    "add": {
+      "argv": [
+        "git",
+        "worktree",
+        "add",
+        "--detach",
+        "/home/runner/work/_temp/smolrunner-overlay-index-m9gg6jzh/xfs/base",
+        "HEAD"
+      ],
+      "elapsed_ms": 29.644,
+      "returncode": 0,
+      "stderr": "Preparing worktree (detached HEAD fac093f)",
+      "stdout": "HEAD is now at fac093f research: probe OverlayFS source-index inheritance"
+    },
+    "proof": {
+      "diff_files": {
+        "argv": [
+          "git",
+          "--no-optional-locks",
+          "diff-files",
+          "--quiet"
+        ],
+        "elapsed_ms": 22.905,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": ""
+      },
+      "diff_index": {
+        "argv": [
+          "git",
+          "--no-optional-locks",
+          "diff-index",
+          "--quiet",
+          "HEAD",
+          "--"
+        ],
+        "elapsed_ms": 23.054,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": ""
+      },
+      "diff_names": [],
+      "returncode": 0
+    },
+    "refresh": {
+      "argv": [
+        "git",
+        "update-index",
+        "--refresh"
+      ],
+      "elapsed_ms": 23.492,
+      "returncode": 0,
+      "stderr": "",
+      "stdout": ""
+    }
+  },
+  "stat_compare_ms": 8.376,
+  "stat_matches": {
+    "ctime_ns": 391,
+    "dev": 0,
+    "gid": 391,
+    "ino": 391,
+    "mode": 391,
+    "mtime_ns": 391,
+    "size": 391,
+    "uid": 391
+  },
+  "stat_mismatch_examples": [
+    {
+      "changed_fields": [
+        "dev"
+      ],
+      "overlay": {
+        "ctime_ns": 1787454182174532468,
+        "dev": 50,
+        "gid": 1001,
+        "ino": 133,
+        "mode": 33188,
+        "mtime_ns": 1787454182174532468,
+        "size": 3662,
+        "uid": 1001
+      },
+      "path": ".coderabbit.yaml",
+      "source": {
+        "ctime_ns": 1787454182174532468,
+        "dev": 1792,
+        "gid": 1001,
+        "ino": 133,
+        "mode": 33188,
+        "mtime_ns": 1787454182174532468,
+        "size": 3662,
+        "uid": 1001
+      }
+    },
+    {
+      "changed_fields": [
+        "dev"
+      ],
+      "overlay": {
+        "ctime_ns": 1787454182175310083,
+        "dev": 50,
+        "gid": 1001,
+        "ino": 1179777,
+        "mode": 33188,
+        "mtime_ns": 1787454182175310083,
+        "size": 1443,
+        "uid": 1001
+      },
+      "path": ".github/workflows/bootstrap-compatibility.yml",
+      "source": {
+        "ctime_ns": 1787454182175310083,
+        "dev": 1792,
+        "gid": 1001,
+        "ino": 1179777,
+        "mode": 33188,
+        "mtime_ns": 1787454182175310083,
+        "size": 1443,
+        "uid": 1001
+      }
+    },
+    {
+      "changed_fields": [
+        "dev"
+      ],
+      "overlay": {
+        "ctime_ns": 1787454182175377189,
+        "dev": 50,
+        "gid": 1001,
+        "ino": 1179778,
+        "mode": 33188,
+        "mtime_ns": 1787454182175377189,
+        "size": 8794,
+        "uid": 1001
+      },
+      "path": ".github/workflows/ci.yml",
+      "source": {
+        "ctime_ns": 1787454182175377189,
+        "dev": 1792,
+        "gid": 1001,
+        "ino": 1179778,
+        "mode": 33188,
+        "mtime_ns": 1787454182175377189,
+        "size": 8794,
+        "uid": 1001
+      }
+    },
+    {
+      "changed_fields": [
+        "dev"
+      ],
+      "overlay": {
+        "ctime_ns": 1787454182175377189,
+        "dev": 50,
+        "gid": 1001,
+        "ino": 1179779,
+        "mode": 33188,
+        "mtime_ns": 1787454182175377189,
+        "size": 1065,
+        "uid": 1001
+      },
+      "path": ".github/workflows/linux-acceptance.yml",
+      "source": {
+        "ctime_ns": 1787454182175377189,
+        "dev": 1792,
+        "gid": 1001,
+        "ino": 1179779,
+        "mode": 33188,
+        "mtime_ns": 1787454182175377189,
+        "size": 1065,
+        "uid": 1001
+      }
+    },
+    {
+      "changed_fields": [
+        "dev"
+      ],
+      "overlay": {
+        "ctime_ns": 1787454182175377189,
+        "dev": 50,
+        "gid": 1001,
+        "ino": 1179780,
+        "mode": 33188,
+        "mtime_ns": 1787454182175377189,
+        "size": 5443,
+        "uid": 1001
+      },
+      "path": ".github/workflows/podman-closure-probe.yml",
+      "source": {
+        "ctime_ns": 1787454182175377189,
+        "dev": 1792,
+        "gid": 1001,
+        "ino": 1179780,
+        "mode": 33188,
+        "mtime_ns": 1787454182175377189,
+        "size": 5443,
+        "uid": 1001
+      }
+    },
+    {
+      "changed_fields": [
+        "dev"
+      ],
+      "overlay": {
+        "ctime_ns": 1787454182175377189,
+        "dev": 50,
+        "gid": 1001,
+        "ino": 1179781,
+        "mode": 33188,
+        "mtime_ns": 1787454182175377189,
+        "size": 1837,
+        "uid": 1001
+      },
+      "path": ".github/workflows/podman-container-closure-probe.yml",
+      "source": {
+        "ctime_ns": 1787454182175377189,
+        "dev": 1792,
+        "gid": 1001,
+        "ino": 1179781,
+        "mode": 33188,
+        "mtime_ns": 1787454182175377189,
+        "size": 1837,
+        "uid": 1001
+      }
+    },
+    {
+      "changed_fields": [
+        "dev"
+      ],
+      "overlay": {
+        "ctime_ns": 1787454182175377189,
+        "dev": 50,
+        "gid": 1001,
+        "ino": 1179782,
+        "mode": 33188,
+        "mtime_ns": 1787454182175377189,
+        "size": 11553,
+        "uid": 1001
+      },
+      "path": ".github/workflows/research-github-arm-overlay-index-inherit.yml",
+      "source": {
+        "ctime_ns": 1787454182175377189,
+        "dev": 1792,
+        "gid": 1001,
+        "ino": 1179782,
+        "mode": 33188,
+        "mtime_ns": 1787454182175377189,
+        "size": 11553,
+        "uid": 1001
+      }
+    },
+    {
+      "changed_fields": [
+        "dev"
+      ],
+      "overlay": {
+        "ctime_ns": 1787454182175377189,
+        "dev": 50,
+        "gid": 1001,
+        "ino": 134,
+        "mode": 33188,
+        "mtime_ns": 1787454182175377189,
+        "size": 34,
+        "uid": 1001
+      },
+      "path": ".gitignore",
+      "source": {
+        "ctime_ns": 1787454182175377189,
+        "dev": 1792,
+        "gid": 1001,
+        "ino": 134,
+        "mode": 33188,
+        "mtime_ns": 1787454182175377189,
+        "size": 34,
+        "uid": 1001
+      }
+    }
+  ],
+  "stat_mismatches": {
+    "ctime_ns": 0,
+    "dev": 391,
+    "gid": 0,
+    "ino": 0,
+    "mode": 0,
+    "mtime_ns": 0,
+    "size": 0,
+    "uid": 0
+  },
+  "target": {
+    "add": {
+      "argv": [
+        "git",
+        "worktree",
+        "add",
+        "--detach",
+        "--no-checkout",
+        "/home/runner/work/_temp/smolrunner-overlay-index-m9gg6jzh/xfs/target",
+        "HEAD"
+      ],
+      "elapsed_ms": 2.048,
+      "returncode": 0,
+      "stderr": "Preparing worktree (detached HEAD fac093f)",
+      "stdout": ""
+    },
+    "mount": {
+      "argv": [
+        "sudo",
+        "mount",
+        "-t",
+        "overlay",
+        "overlay",
+        "-o",
+        "lowerdir=/home/runner/work/_temp/smolrunner-overlay-index-m9gg6jzh/xfs/base,upperdir=/home/runner/work/_temp/smolrunner-overlay-index-m9gg6jzh/xfs/upper,workdir=/home/runner/work/_temp/smolrunner-overlay-index-m9gg6jzh/xfs/work",
+        "/home/runner/work/_temp/smolrunner-overlay-index-m9gg6jzh/xfs/target"
+      ],
+      "elapsed_ms": 8.157,
+      "returncode": 0,
+      "stderr": "",
+      "stdout": ""
+    },
+    "read_tree": {
+      "argv": [
+        "git",
+        "read-tree",
+        "HEAD"
+      ],
+      "elapsed_ms": 7.389,
+      "returncode": 0,
+      "stderr": "",
+      "stdout": ""
+    }
+  },
+  "tracked_regular_files": 391
+}
