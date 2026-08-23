@@ -1,0 +1,129 @@
+{
+  "counts": {
+    "1": {
+      "baseline": {
+        "cleanup_wall_ms": 8.741,
+        "materialize_wall_ms": 26.778,
+        "metadata_wall_ms": 3.82,
+        "successes": 1,
+        "used_delta": 8417280,
+        "verify_wall_ms": 47.071,
+        "work_wall_ms": 77.669
+      },
+      "overlay": {
+        "cleanup_wall_ms": 1.578,
+        "metadata_wall_ms": 2.364,
+        "mount_wall_ms": 6.647,
+        "mutation_successes": 1,
+        "mutation_used_delta": 4096,
+        "mutation_wall_ms": 1.869,
+        "read_tree_wall_ms": 7.22,
+        "ready_used_delta": 4096,
+        "refresh_wall_ms": 25.311,
+        "source_unchanged": true,
+        "successes": 1,
+        "unmount_wall_ms": 7.396,
+        "verify_wall_ms": 47.834,
+        "work_wall_ms": 89.376
+      }
+    },
+    "32": {
+      "baseline": {
+        "cleanup_wall_ms": 364.021,
+        "materialize_wall_ms": 439.981,
+        "metadata_wall_ms": 28.943,
+        "successes": 32,
+        "used_delta": 269160448,
+        "verify_wall_ms": 217.483,
+        "work_wall_ms": 686.407
+      },
+      "overlay": {
+        "cleanup_wall_ms": 28.119,
+        "metadata_wall_ms": 28.566,
+        "mount_wall_ms": 71.262,
+        "mutation_successes": 32,
+        "mutation_used_delta": 131072,
+        "mutation_wall_ms": 10.804,
+        "read_tree_wall_ms": 24.757,
+        "ready_used_delta": 163840,
+        "refresh_wall_ms": 287.547,
+        "source_unchanged": true,
+        "successes": 32,
+        "unmount_wall_ms": 64.717,
+        "verify_wall_ms": 47.412,
+        "work_wall_ms": 459.544
+      }
+    },
+    "8": {
+      "baseline": {
+        "cleanup_wall_ms": 60.211,
+        "materialize_wall_ms": 115.88,
+        "metadata_wall_ms": 7.599,
+        "successes": 8,
+        "used_delta": 67231744,
+        "verify_wall_ms": 128.556,
+        "work_wall_ms": 252.035
+      },
+      "overlay": {
+        "cleanup_wall_ms": 7.572,
+        "metadata_wall_ms": 6.227,
+        "mount_wall_ms": 18.541,
+        "mutation_successes": 8,
+        "mutation_used_delta": 32768,
+        "mutation_wall_ms": 4.734,
+        "read_tree_wall_ms": 7.264,
+        "ready_used_delta": 32768,
+        "refresh_wall_ms": 60.425,
+        "source_unchanged": true,
+        "successes": 8,
+        "unmount_wall_ms": 20.032,
+        "verify_wall_ms": 13.889,
+        "work_wall_ms": 106.346
+      }
+    }
+  },
+  "runner": {
+    "arch": "ARM64",
+    "cpu_count": 4,
+    "kernel": "6.17.0-1022-azure",
+    "machine": "aarch64"
+  },
+  "schema_version": 1,
+  "source": {
+    "add": {
+      "argv": [
+        "git",
+        "worktree",
+        "add",
+        "--detach",
+        "/home/runner/work/_temp/smolrunner-overlay-wj7j795l/xfs/base",
+        "HEAD"
+      ],
+      "elapsed_ms": 29.858,
+      "returncode": 0,
+      "stderr": "Preparing worktree (detached HEAD 0950fff)",
+      "stdout": "HEAD is now at 0950fff research: benchmark XFS OverlayFS task fanout"
+    },
+    "findmnt": {
+      "argv": [
+        "findmnt",
+        "-T",
+        "/home/runner/work/_temp/smolrunner-overlay-wj7j795l/xfs/base",
+        "-n",
+        "-o",
+        "SOURCE,FSTYPE,OPTIONS"
+      ],
+      "elapsed_ms": 1.744,
+      "returncode": 0,
+      "stderr": "",
+      "stdout": "/dev/loop0 xfs    rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,noquota"
+    },
+    "proof": {
+      "diff_files_ms": 23.439,
+      "diff_files_rc": 0,
+      "diff_index_ms": 23.281,
+      "diff_index_rc": 0,
+      "returncode": 0
+    }
+  }
+}
