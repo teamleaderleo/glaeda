@@ -1,0 +1,108 @@
+info: syncing channel updates for 1.97.1-aarch64-unknown-linux-gnu
+info: latest update on 2026-07-16 for version 1.97.1 (8bab26f4f 2026-07-14)
+info: downloading 5 components
+Diff in /home/runner/work/smolrunner/smolrunner/src/trusted_overlay_mount_plan.rs:357:
+     ctime_nsec: i64,
+ }
+ 
+-fn observe_directory(path: PathBuf) -> Result<TrustedOverlayDirectory, TrustedOverlayMountPlanError> {
++fn observe_directory(
++    path: PathBuf,
++) -> Result<TrustedOverlayDirectory, TrustedOverlayMountPlanError> {
+     let snapshot = snapshot_directory(&path)?;
+     let identity = ReviewedFilesystemIdentity::new(
+         snapshot.device,
+Diff in /home/runner/work/smolrunner/smolrunner/src/trusted_overlay_mount_plan.rs:400:
+     })
+ }
+ 
+-fn revalidate_directory(directory: &TrustedOverlayDirectory) -> Result<(), TrustedOverlayMountPlanError> {
++fn revalidate_directory(
++    directory: &TrustedOverlayDirectory,
++) -> Result<(), TrustedOverlayMountPlanError> {
+     let current = snapshot_directory(&directory.path)?;
+     if current != directory.snapshot {
+         return Err(changed_during_observation());
+Diff in /home/runner/work/smolrunner/smolrunner/src/trusted_overlay_mount_plan.rs:430:
+ 
+ fn require_empty_directory(path: &Path) -> Result<(), TrustedOverlayMountPlanError> {
+     let mut entries = fs::read_dir(path).map_err(|_| io_error())?;
+-    if entries.next().transpose().map_err(|_| io_error())?.is_some() {
++    if entries
++        .next()
++        .transpose()
++        .map_err(|_| io_error())?
++        .is_some()
++    {
+         return Err(workdir_not_empty());
+     }
+     Ok(())
+Diff in /home/runner/work/smolrunner/smolrunner/src/trusted_overlay_mount_plan.rs:779:
+             || {},
+         )
+         .unwrap_err();
+-        assert_eq!(error.kind(), TrustedOverlayMountPlanErrorKind::WorkdirNotEmpty);
++        assert_eq!(
++            error.kind(),
++            TrustedOverlayMountPlanErrorKind::WorkdirNotEmpty
++        );
+ 
+         let alias = fixture.root.join("lower-alias");
+         symlink(fixture.root.join("lower"), &alias).unwrap();
+Diff in /home/runner/work/smolrunner/smolrunner/src/trusted_overlay_mount_plan.rs:800:
+             || {},
+         )
+         .unwrap_err();
+-        assert_eq!(error.kind(), TrustedOverlayMountPlanErrorKind::UnsafeFilesystem);
++        assert_eq!(
++            error.kind(),
++            TrustedOverlayMountPlanErrorKind::UnsafeFilesystem
++        );
+     }
+ 
+     #[test]
+Diff in /home/runner/work/smolrunner/smolrunner/src/trusted_overlay_mount_plan.rs:816:
+             || {},
+         )
+         .unwrap_err();
+-        assert_eq!(error.kind(), TrustedOverlayMountPlanErrorKind::OverlayUnavailable);
++        assert_eq!(
++            error.kind(),
++            TrustedOverlayMountPlanErrorKind::OverlayUnavailable
++        );
+ 
+         let merged = fixture.root.join("merged");
+         let mounted = format!(
+Diff in /home/runner/work/smolrunner/smolrunner/src/trusted_overlay_mount_plan.rs:833:
+             || {},
+         )
+         .unwrap_err();
+-        assert_eq!(error.kind(), TrustedOverlayMountPlanErrorKind::AlreadyMounted);
++        assert_eq!(
++            error.kind(),
++            TrustedOverlayMountPlanErrorKind::AlreadyMounted
++        );
+     }
+ 
+     #[test]
+Diff in /home/runner/work/smolrunner/smolrunner/src/trusted_overlay_mount_plan.rs:904:
+     fn proc_parsers_handle_overlay_and_mountinfo_escapes() {
+         assert!(filesystems_expose_overlay(filesystems()).unwrap());
+         assert!(!filesystems_expose_overlay(b"nodev\tproc\n\text4\n").unwrap());
+-        assert!(mountinfo_has_mountpoint(
+-            b"1 0 0:1 / /tmp/a\\040b rw - overlay overlay rw\n",
+-            Path::new("/tmp/a b")
+-        )
+-        .unwrap());
++        assert!(
++            mountinfo_has_mountpoint(
++                b"1 0 0:1 / /tmp/a\\040b rw - overlay overlay rw\n",
++                Path::new("/tmp/a b")
++            )
++            .unwrap()
++        );
+         assert!(!mountinfo_has_mountpoint(mountinfo(), Path::new("/private/target")).unwrap());
+     }
+ }
+Diff in /home/runner/work/smolrunner/smolrunner/src/trusted_overlay_mount_plan.rs:915:
++

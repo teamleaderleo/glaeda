@@ -1,0 +1,417 @@
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded anstream v1.0.0
+  Downloaded anstyle-query v1.1.5
+  Downloaded anstyle v1.0.14
+  Downloaded bitflags v2.13.1
+  Downloaded anstyle-parse v1.0.0
+  Downloaded unicode-ident v1.0.24
+  Downloaded colorchoice v1.0.5
+  Downloaded generic-array v0.14.7
+  Downloaded clap v4.6.4
+  Downloaded block-buffer v0.10.4
+  Downloaded equivalent v1.0.2
+  Downloaded version_check v0.9.5
+  Downloaded crypto-common v0.1.7
+  Downloaded errno v0.3.14
+  Downloaded cpufeatures v0.2.17
+  Downloaded itoa v1.0.18
+  Downloaded clap_lex v1.1.0
+  Downloaded strsim v0.11.1
+  Downloaded digest v0.10.7
+  Downloaded is_terminal_polyfill v1.70.2
+  Downloaded utf8parse v0.2.2
+  Downloaded cfg-if v1.0.4
+  Downloaded heck v0.5.0
+  Downloaded zmij v1.0.23
+  Downloaded sha2 v0.10.9
+  Downloaded quote v1.0.47
+  Downloaded zeroize v1.9.0
+  Downloaded clap_derive v4.6.4
+  Downloaded ryu v1.0.23
+  Downloaded serde_derive v1.0.229
+  Downloaded serde_core v1.0.229
+  Downloaded unsafe-libyaml-norway v0.2.15
+  Downloaded serde_norway v0.9.42
+  Downloaded proc-macro2 v1.0.107
+  Downloaded memchr v2.8.3
+  Downloaded indexmap v2.14.0
+  Downloaded serde v1.0.229
+  Downloaded typenum v1.20.1
+  Downloaded serde_json v1.0.151
+  Downloaded hashbrown v0.17.1
+  Downloaded clap_builder v4.6.2
+  Downloaded syn v3.0.3
+  Downloaded rustix v1.1.4
+  Downloaded libc v0.2.189
+  Downloaded linux-raw-sys v0.12.1
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.24
+   Compiling version_check v0.9.5
+   Compiling typenum v1.20.1
+   Compiling generic-array v0.14.7
+   Compiling serde_core v1.0.229
+   Compiling libc v0.2.189
+   Compiling utf8parse v0.2.2
+   Compiling anstyle-parse v1.0.0
+   Compiling syn v3.0.3
+   Compiling zmij v1.0.23
+   Compiling colorchoice v1.0.5
+   Compiling anstyle v1.0.14
+   Compiling serde v1.0.229
+   Compiling anstyle-query v1.1.5
+   Compiling is_terminal_polyfill v1.70.2
+   Compiling anstream v1.0.0
+   Compiling crypto-common v0.1.7
+   Compiling block-buffer v0.10.4
+   Compiling serde_json v1.0.151
+   Compiling itoa v1.0.18
+   Compiling equivalent v1.0.2
+   Compiling clap_lex v1.1.0
+   Compiling hashbrown v0.17.1
+   Compiling rustix v1.1.4
+   Compiling heck v0.5.0
+   Compiling strsim v0.11.1
+   Compiling clap_builder v4.6.2
+   Compiling indexmap v2.14.0
+   Compiling cpufeatures v0.2.17
+   Compiling digest v0.10.7
+   Compiling memchr v2.8.3
+   Compiling ryu v1.0.23
+   Compiling linux-raw-sys v0.12.1
+   Compiling bitflags v2.13.1
+   Compiling cfg-if v1.0.4
+   Compiling unsafe-libyaml-norway v0.2.15
+   Compiling serde_derive v1.0.229
+   Compiling clap_derive v4.6.4
+   Compiling clap v4.6.4
+   Compiling sha2 v0.10.9
+   Compiling zeroize v1.9.0
+   Compiling serde_norway v0.9.42
+   Compiling smolrunner v0.1.0 (/home/runner/work/smolrunner/smolrunner)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 06s
+     Running unittests src/lib.rs (target/debug/deps/smolrunner-25f41b11fe16c1c5)
+
+running 6 tests
+test trusted_overlay_mount_plan::tests::proc_parsers_handle_overlay_and_mountinfo_escapes ... ok
+test trusted_overlay_mount_plan::tests::refuses_kernel_without_overlay_and_existing_mountpoint ... ok
+test trusted_overlay_mount_plan::tests::pure_role_validation_refuses_cross_device_and_duplicate_identity ... ok
+test trusted_overlay_mount_plan::tests::refuses_nonempty_workdir_and_aliases ... ok
+test trusted_overlay_mount_plan::tests::detects_directory_drift_before_plan_publication ... ok
+test trusted_overlay_mount_plan::tests::seals_exact_mount_plan_from_read_only_observation ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 974 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/smolrunner-a4514fcf3269b361)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 13 filtered out; finished in 0.00s
+
+     Running tests/disposable_attempt_catalog_codec_contract.rs (target/debug/deps/disposable_attempt_catalog_codec_contract-0c7af07fb156e0b5)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+
+     Running tests/disposable_attempt_catalog_contract.rs (target/debug/deps/disposable_attempt_catalog_contract-7139ce7123d82836)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 0.00s
+
+     Running tests/disposable_attempt_state_contract.rs (target/debug/deps/disposable_attempt_state_contract-094474404ce446b3)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s
+
+     Running tests/disposable_controller_death_physical.rs (target/debug/deps/disposable_controller_death_physical-f2d825f7cb9889a4)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/disposable_installed_service_preflight.rs (target/debug/deps/disposable_installed_service_preflight-28d5ee9880487639)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/disposable_jit_launcher_contract.rs (target/debug/deps/disposable_jit_launcher_contract-2a6b1416ca9ac5b9)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/disposable_launchd_execution_ownership_physical.rs (target/debug/deps/disposable_launchd_execution_ownership_physical-6978c6470bc9e3f3)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/disposable_launchd_service_plan_regression.rs (target/debug/deps/disposable_launchd_service_plan_regression-de92bdd2fc724006)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/disposable_network_baseline_contract.rs (target/debug/deps/disposable_network_baseline_contract-bdabacab2ec94eb3)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/disposable_worker_durable_reconciliation.rs (target/debug/deps/disposable_worker_durable_reconciliation-969408c5233be7b0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/disposable_worker_reconciler_contract.rs (target/debug/deps/disposable_worker_reconciler_contract-68a6885f7782aad5)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 0.00s
+
+     Running tests/durable_journal_recovery.rs (target/debug/deps/durable_journal_recovery-691a441211008a7d)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/execution_receipt_contract.rs (target/debug/deps/execution_receipt_contract-70344fd9e36d8d15)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+
+     Running tests/execution_receipt_schema_privacy.rs (target/debug/deps/execution_receipt_schema_privacy-09893bcea9720077)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/execution_receipt_state_store.rs (target/debug/deps/execution_receipt_state_store-6212edd1ba70c7fb)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+
+     Running tests/github_scale_set_protocol_contract.rs (target/debug/deps/github_scale_set_protocol_contract-02dae8a56a3fb29d)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+     Running tests/host_preparation_receipt_binding.rs (target/debug/deps/host_preparation_receipt_binding-b1fa447b65cf62f6)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+
+     Running tests/host_preparation_receipt_binding_limits.rs (target/debug/deps/host_preparation_receipt_binding_limits-53ffb3955ee5bb53)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/host_preparation_receipt_mapping.rs (target/debug/deps/host_preparation_receipt_mapping-cfb1d5c6fe21a2f9)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+     Running tests/host_prepare_acceptance.rs (target/debug/deps/host_prepare_acceptance-9897966a7e661f53)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/linux_acceptance.rs (target/debug/deps/linux_acceptance-a76d50951137e98a)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+
+     Running tests/local_install_source_preflight.rs (target/debug/deps/local_install_source_preflight-e2756abf49777f01)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/operator_config_contract.rs (target/debug/deps/operator_config_contract-36ccafbcedc8599b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s
+
+     Running tests/operator_config_store_contract.rs (target/debug/deps/operator_config_store_contract-be6f1b848e951d83)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.00s
+
+     Running tests/operator_error_contract.rs (target/debug/deps/operator_error_contract-68ff85bb60e0c7ec)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+     Running tests/operator_status_contract.rs (target/debug/deps/operator_status_contract-9b2606bb2aa78f8c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 28 filtered out; finished in 0.00s
+
+     Running tests/operator_status_service_contract.rs (target/debug/deps/operator_status_service_contract-ccd7297fa4606b14)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s
+
+     Running tests/personal_worker_cancel_cli.rs (target/debug/deps/personal_worker_cancel_cli-8ee87ac62f097f70)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+
+     Running tests/personal_worker_initialization_contract.rs (target/debug/deps/personal_worker_initialization_contract-03db16f256cd5748)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+
+     Running tests/personal_worker_lima_adapter_contract.rs (target/debug/deps/personal_worker_lima_adapter_contract-0834d61027195386)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 0.00s
+
+     Running tests/personal_worker_lima_authority_contract.rs (target/debug/deps/personal_worker_lima_authority_contract-aa9d574aefd2c2c0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 0.00s
+
+     Running tests/personal_worker_mac_observation_contract.rs (target/debug/deps/personal_worker_mac_observation_contract-447e8c8a5819b3d3)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 13 filtered out; finished in 0.00s
+
+     Running tests/personal_worker_operator_mutation_contract.rs (target/debug/deps/personal_worker_operator_mutation_contract-49e25712b60139f4)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+     Running tests/personal_worker_operator_read_contract.rs (target/debug/deps/personal_worker_operator_read_contract-a3d79bfb21502375)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+
+     Running tests/personal_worker_operator_store_contract.rs (target/debug/deps/personal_worker_operator_store_contract-e1b64951d9830d35)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+
+     Running tests/personal_worker_queue_contract.rs (target/debug/deps/personal_worker_queue_contract-095cdd3668a3ff08)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 19 filtered out; finished in 0.00s
+
+     Running tests/personal_worker_read_cli.rs (target/debug/deps/personal_worker_read_cli-507bf08d15333747)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+
+     Running tests/personal_worker_read_model.rs (target/debug/deps/personal_worker_read_model-ecdba7fc0c164b3e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+     Running tests/personal_worker_runner_readiness_contract.rs (target/debug/deps/personal_worker_runner_readiness_contract-4be24b9f0ba9df45)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 13 filtered out; finished in 0.00s
+
+     Running tests/personal_worker_store_contract.rs (target/debug/deps/personal_worker_store_contract-732fbd35b07b6aa8)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+
+     Running tests/personal_worker_store_lock_contract.rs (target/debug/deps/personal_worker_store_lock_contract-0992e7b847a2ae73)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/personal_worker_store_transaction.rs (target/debug/deps/personal_worker_store_transaction-a9134688fa90f6e7)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+
+     Running tests/personal_worker_submit_capacity_cli.rs (target/debug/deps/personal_worker_submit_capacity_cli-f6e5065376868e4c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/personal_worker_submit_cli.rs (target/debug/deps/personal_worker_submit_cli-f2805e9cf7df3916)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/personal_worker_terminal_replay.rs (target/debug/deps/personal_worker_terminal_replay-f5ac2854936825d3)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+
+     Running tests/personal_worker_tick_contract.rs (target/debug/deps/personal_worker_tick_contract-bdf7c6f3c1925716)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.00s
+
+     Running tests/personal_worker_verification_plan_contract.rs (target/debug/deps/personal_worker_verification_plan_contract-af723bfcfcab37c6)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/renderprove_vision_profile.rs (target/debug/deps/renderprove_vision_profile-51b8759a4dea6f5c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s
+
+     Running tests/renderprove_vision_result.rs (target/debug/deps/renderprove_vision_result-f769ff6149845d2b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/repository_source_observation_contract.rs (target/debug/deps/repository_source_observation_contract-6b7fd99f5af2fda9)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s
+
+     Running tests/state_store_contract.rs (target/debug/deps/state_store_contract-113976a42b0fc253)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
