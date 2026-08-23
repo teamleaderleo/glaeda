@@ -1,0 +1,62 @@
+name: Research verify immutable Git pool marker v2
+
+on:
+  push:
+    branches:
+      - research/arm-build-immutable-git-pool-marker-v2
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: true
+          show-progress: false
+          fetch-depth: 0
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt --no-self-update
+      - name: Rebuild marker candidate and verify
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin research/results-immutable-git-pool-marker-diagnostic
+          git show origin/research/results-immutable-git-pool-marker-diagnostic:immutable_git_object_pool_marker.rs > src/immutable_git_object_pool_marker.rs
+          git show origin/research/results-immutable-git-pool-marker-diagnostic:lib.rs > src/lib.rs
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/immutable_git_object_pool_marker.rs'); s=p.read_text()
+          old='''        let binding = base_binding();\n        let marker = ImmutableGitObjectPoolMarker::new(\n            &binding,'''
+          new='''        let expected = base_binding();\n        let marker = ImmutableGitObjectPoolMarker::new(\n            &expected,'''
+          if old not in s: raise SystemExit('expected binding test point missing')
+          s=s.replace(old,new,1)
+          old='''        let encoded = marker.encode().unwrap();\n        let other = binding('''
+          new='''        let encoded = marker.encode().unwrap();\n        let other = binding('''
+          if old not in s: raise SystemExit('other binding point missing')
+          # no textual change needed here; keep helper call now that local variable is renamed
+          old='''            ImmutableGitObjectPoolMarker::decode_and_verify(&encoded, &other)'''
+          if old not in s: raise SystemExit('decode mismatch test point missing')
+          p.write_text(s)
+          PY
+          cargo fmt --all
+          cargo test --locked immutable_git_object_pool_marker
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cp src/immutable_git_object_pool_marker.rs /tmp/immutable_git_object_pool_marker.rs
+          cp src/lib.rs /tmp/lib.rs
+      - name: Publish verified source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name teamleaderleo
+          git config user.email cheerleaderleo@outlook.com
+          OUT=research/results-immutable-git-pool-marker-source
+          git checkout --orphan "$OUT"
+          git rm -rf . >/dev/null 2>&1 || true
+          cp /tmp/immutable_git_object_pool_marker.rs ./immutable_git_object_pool_marker.rs
+          cp /tmp/lib.rs ./lib.rs
+          git add immutable_git_object_pool_marker.rs lib.rs
+          git commit -m 'Publish verified immutable Git pool marker source'
+          git push --force origin HEAD:"$OUT"
