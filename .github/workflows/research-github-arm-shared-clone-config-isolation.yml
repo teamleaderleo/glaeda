@@ -1,0 +1,76 @@
+name: Research GitHub ARM shared clone config isolation
+
+on:
+  push:
+    branches:
+      - research/github-arm-shared-clone-config-isolation
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: true
+          show-progress: false
+      - name: Probe source config inheritance
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, pathlib, shutil, subprocess, tempfile
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'smolrunner-clone-config';shutil.rmtree(root,ignore_errors=True);root.mkdir()
+          source=root/'source';clone=root/'clone';gitdir=root/'clone.git';template=root/'empty-template';template.mkdir()
+          subprocess.run(['git','init','-q',str(source)],check=True)
+          subprocess.run(['git','-C',str(source),'config','user.name','Probe'],check=True)
+          subprocess.run(['git','-C',str(source),'config','user.email','probe@example.invalid'],check=True)
+          (source/'a.txt').write_text('a\n')
+          subprocess.run(['git','-C',str(source),'add','a.txt'],check=True)
+          subprocess.run(['git','-C',str(source),'commit','-qm','base'],check=True)
+          # Add repository-local keys that would be dangerous or surprising if copied into a task Git dir.
+          dangerous={
+            'filter.smol.clean':'/bin/echo clean-ran',
+            'filter.smol.process':'/bin/echo process-ran',
+            'core.hooksPath':str(root/'hooks'),
+            'credential.helper':'!echo credential-ran',
+            'diff.smol.command':'/bin/echo diff-ran',
+            'merge.smol.driver':'/bin/echo merge-ran %O %A %B',
+            'alias.smol':'!echo alias-ran',
+            'core.fsmonitor':'/bin/echo monitor-ran',
+            'smolrunner.custom':'source-value',
+          }
+          for k,v in dangerous.items(): subprocess.run(['git','-C',str(source),'config',k,v],check=True)
+          env=os.environ.copy();env['HOME']=str(root/'empty-home');pathlib.Path(env['HOME']).mkdir();env['GIT_CONFIG_NOSYSTEM']='1';env['GIT_CONFIG_GLOBAL']='/dev/null'
+          p=subprocess.run(['git','-c','core.hooksPath=/dev/null','clone','--shared','--no-checkout','--template',str(template),'--separate-git-dir',str(gitdir),str(source),str(clone)],env=env,text=True,capture_output=True)
+          out={'schema_version':1,'arch':os.uname().machine,'kernel':os.uname().release,'clone_rc':p.returncode,'clone_stderr':p.stderr.strip(),'source_dangerous':dangerous}
+          if p.returncode==0:
+            raw=subprocess.check_output(['git','--git-dir',str(gitdir),'config','--local','--null','--list'],env=env)
+            items=[x.decode() for x in raw.split(b'\0') if x]
+            cfg={}
+            for item in items:
+              if '\n' in item:k,v=item.split('\n',1)
+              elif '=' in item:k,v=item.split('=',1)
+              else:k,v=item,''
+              cfg[k]=v
+            out['clone_config']=cfg
+            out['dangerous_keys_copied']={k:cfg.get(k) for k in dangerous if k in cfg}
+            out['alternates']=(gitdir/'objects/info/alternates').read_text().strip() if (gitdir/'objects/info/alternates').exists() else None
+            out['head']=subprocess.check_output(['git','--git-dir',str(gitdir),'rev-parse','HEAD'],env=env,text=True).strip()
+          pathlib.Path('/tmp/result.json').write_text(json.dumps(out,indent=2,sort_keys=True)+'\n');print(json.dumps(out,indent=2,sort_keys=True))
+          PY
+      - name: Publish owned result
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name teamleaderleo
+          git config user.email cheerleaderleo@outlook.com
+          OUT=research/results-smolrunner-github-arm-shared-clone-config-isolation
+          git checkout --orphan "$OUT"
+          git rm -rf . >/dev/null 2>&1 || true
+          cp /tmp/result.json ./smolrunner-github-arm-shared-clone-config-isolation.json
+          git add smolrunner-github-arm-shared-clone-config-isolation.json
+          git commit -m 'Record hosted ARM shared clone config isolation'
+          git push --force origin HEAD:"$OUT"
