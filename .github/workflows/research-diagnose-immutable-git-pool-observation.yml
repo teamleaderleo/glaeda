@@ -1,0 +1,62 @@
+name: Research diagnose immutable Git pool observation
+
+on:
+  push:
+    branches:
+      - codex/immutable-git-pool-observation
+
+permissions:
+  contents: write
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: codex/immutable-git-pool-observation
+          persist-credentials: true
+          show-progress: false
+          fetch-depth: 0
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt --no-self-update
+      - name: Export observer and diagnose
+        shell: bash
+        run: |
+          set -u
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/lib.rs');s=p.read_text()
+          needle='''/// Pure fixed marker codec for immutable Git object-pool generations.\npub mod immutable_git_object_pool_marker;'''
+          repl=needle+'''\n#[cfg(target_os = "linux")]\n/// Read-only physical observation of one frozen immutable Git object-pool generation.\npub mod immutable_git_object_pool_observation;'''
+          if needle not in s: raise SystemExit('lib insertion point missing')
+          p.write_text(s.replace(needle,repl,1))
+          PY
+          cargo fmt --all
+          set +e
+          cargo test --locked immutable_git_object_pool_observation > /tmp/test.log 2>&1
+          test_rc=$?
+          cargo clippy --locked --all-targets --all-features -- -D warnings > /tmp/clippy.log 2>&1
+          clippy_rc=$?
+          set -e
+          cp src/immutable_git_object_pool_observation.rs /tmp/immutable_git_object_pool_observation.rs
+          cp src/lib.rs /tmp/lib.rs
+          printf '{"test_rc":%s,"clippy_rc":%s}\n' "$test_rc" "$clippy_rc" > /tmp/status.json
+      - name: Publish diagnostic
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name teamleaderleo
+          git config user.email cheerleaderleo@outlook.com
+          OUT=research/results-immutable-git-pool-observation-diagnostic
+          git checkout --orphan "$OUT"
+          git rm -rf . >/dev/null 2>&1 || true
+          cp /tmp/status.json ./status.json
+          cp /tmp/test.log ./test.log
+          cp /tmp/clippy.log ./clippy.log
+          cp /tmp/immutable_git_object_pool_observation.rs ./immutable_git_object_pool_observation.rs
+          cp /tmp/lib.rs ./lib.rs
+          git add status.json test.log clippy.log immutable_git_object_pool_observation.rs lib.rs
+          git commit -m 'Publish immutable Git pool observation diagnostic'
+          git push --force origin HEAD:"$OUT"
