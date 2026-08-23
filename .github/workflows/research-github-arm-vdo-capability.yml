@@ -1,0 +1,51 @@
+name: Research hosted ARM VDO capability
+
+on:
+  push:
+    branches:
+      - research/github-arm-vdo-capability
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+      - name: Probe preinstalled VDO/LVM support
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, platform, shutil, subprocess, time
+          from pathlib import Path
+
+          out=Path('smolrunner-github-arm-vdo-capability.json')
+          def run(argv):
+              start=time.monotonic_ns(); p=subprocess.run(argv,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=False)
+              return {'argv':argv,'returncode':p.returncode,'elapsed_ms':round((time.monotonic_ns()-start)/1_000_000,3),'stdout':p.stdout.strip()[:8192],'stderr':p.stderr.strip()[:8192]}
+          names=['dmsetup','lvm','pvcreate','vgcreate','lvcreate','vdo','vdostats','modprobe']
+          result={'schema_version':1,'runner':{'arch':os.environ.get('RUNNER_ARCH'),'machine':platform.machine(),'kernel':platform.release()},'tools':{n:shutil.which(n) for n in names}}
+          result['sudo']=run(['sudo','-n','true'])
+          result['dmsetup_targets']=run(['sudo','dmsetup','targets']) if shutil.which('dmsetup') else None
+          result['lsmod']=run(['bash','-lc','lsmod | grep -E "(^|_)vdo|dm_vdo" || true'])
+          result['modprobe_n']=run(['sudo','modprobe','-n','-v','dm_vdo']) if shutil.which('modprobe') else None
+          result['sys_module_dm_vdo']=Path('/sys/module/dm_vdo').exists()
+          result['sys_module_kvdo']=Path('/sys/module/kvdo').exists()
+          result['lvm_version']=run(['lvm','version']) if shutil.which('lvm') else None
+          result['vdo_version']=run(['vdo','--version']) if shutil.which('vdo') else None
+          out.write_text(json.dumps(result,indent=2,sort_keys=True)+'\n',encoding='utf-8'); print(json.dumps(result,indent=2,sort_keys=True))
+          PY
+      - name: Persist result
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -C research/results-smolrunner-github-arm-vdo-capability
+          git add -- smolrunner-github-arm-vdo-capability.json
+          git commit -m 'research: record hosted ARM VDO capability'
+          git push --force origin HEAD:refs/heads/research/results-smolrunner-github-arm-vdo-capability
