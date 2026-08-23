@@ -1,0 +1,191 @@
+{
+  "anchor": {
+    "cold_ms": 6212.41,
+    "target_logical_bytes": 13240421,
+    "warm_no_edit_ms": 54.717
+  },
+  "counts": {
+    "1": {
+      "hybrid_reflink_target": {
+        "after_test_used_delta": 14467072,
+        "cleanup_wall_ms": 2.026,
+        "clone_successes": 1,
+        "index_copy_wall_ms": 1.969,
+        "metadata_wall_ms": 4.072,
+        "mount_wall_ms": 8.146,
+        "ready_used_delta": 344064,
+        "setup_wall_ms": 30.2,
+        "successes": 1,
+        "target_clone_wall_ms": 16.013,
+        "test_records": [
+          {
+            "elapsed_ms": 550.255,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "running 1 test\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+          }
+        ],
+        "test_wall_ms": 550.685,
+        "total_wall_ms": 580.885,
+        "unmount_wall_ms": 8.543
+      },
+      "pure_overlay": {
+        "after_test_used_delta": 17068032,
+        "cleanup_wall_ms": 2.09,
+        "clone_successes": null,
+        "index_copy_wall_ms": 1.903,
+        "metadata_wall_ms": 2.557,
+        "mount_wall_ms": 8.201,
+        "ready_used_delta": 12288,
+        "setup_wall_ms": 12.661,
+        "successes": 1,
+        "target_clone_wall_ms": 0.0,
+        "test_records": [
+          {
+            "elapsed_ms": 875.143,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "running 1 test\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+          }
+        ],
+        "test_wall_ms": 875.509,
+        "total_wall_ms": 888.17,
+        "unmount_wall_ms": 8.637
+      }
+    },
+    "8": {
+      "hybrid_reflink_target": {
+        "after_test_used_delta": 115376128,
+        "cleanup_wall_ms": 8.519,
+        "clone_successes": 8,
+        "index_copy_wall_ms": 8.596,
+        "metadata_wall_ms": 7.682,
+        "mount_wall_ms": 25.735,
+        "ready_used_delta": 2654208,
+        "setup_wall_ms": 208.076,
+        "successes": 8,
+        "target_clone_wall_ms": 166.063,
+        "test_records": [
+          {
+            "elapsed_ms": 2493.495,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "running 1 test\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+          },
+          {
+            "elapsed_ms": 2505.791,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "running 1 test\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+          },
+          {
+            "elapsed_ms": 2563.239,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "running 1 test\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+          },
+          {
+            "elapsed_ms": 2517.882,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "running 1 test\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+          },
+          {
+            "elapsed_ms": 2477.799,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "running 1 test\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+          },
+          {
+            "elapsed_ms": 2477.333,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "running 1 test\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+          },
+          {
+            "elapsed_ms": 2475.608,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "running 1 test\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+          },
+          {
+            "elapsed_ms": 2373.501,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "running 1 test\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+          }
+        ],
+        "test_wall_ms": 2564.89,
+        "total_wall_ms": 2772.966,
+        "unmount_wall_ms": 25.12
+      },
+      "pure_overlay": {
+        "after_test_used_delta": 136224768,
+        "cleanup_wall_ms": 9.095,
+        "clone_successes": null,
+        "index_copy_wall_ms": 6.875,
+        "metadata_wall_ms": 9.286,
+        "mount_wall_ms": 21.236,
+        "ready_used_delta": 98304,
+        "setup_wall_ms": 37.397,
+        "successes": 8,
+        "target_clone_wall_ms": 0.0,
+        "test_records": [
+          {
+            "elapsed_ms": 5597.954,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "running 1 test\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+          },
+          {
+            "elapsed_ms": 5480.44,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "running 1 test\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+          },
+          {
+            "elapsed_ms": 5615.631,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "running 1 test\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+          },
+          {
+            "elapsed_ms": 5297.545,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "running 1 test\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+          },
+          {
+            "elapsed_ms": 5638.517,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "running 1 test\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+          },
+          {
+            "elapsed_ms": 5411.029,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "running 1 test\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+          },
+          {
+            "elapsed_ms": 5661.222,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "running 1 test\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+          },
+          {
+            "elapsed_ms": 5577.439,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "running 1 test\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+          }
+        ],
+        "test_wall_ms": 5664.667,
+        "total_wall_ms": 5702.064,
+        "unmount_wall_ms": 27.018
+      }
+    }
+  },
+  "modules": 240,
+  "schema_version": 1
+}
