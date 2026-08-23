@@ -1,0 +1,50 @@
+name: Research repair hot-state path policy
+
+on:
+  push:
+    branches:
+      - research/hot-state-policy-ci
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: research/hot-state-policy-ci
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt --no-self-update
+      - name: Repair and verify
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/hot_state_path_policy.rs'); s=p.read_text()
+          old='#[derive(Debug, Clone, PartialEq, Eq)]\npub struct HotStateReuseIdentity {'
+          if old in s:
+              s=s.replace(old,'#[derive(Clone, PartialEq, Eq)]\npub struct HotStateReuseIdentity {',1)
+          marker='impl Serialize for HotStateReuseIdentity {'
+          debug='''impl fmt::Debug for HotStateReuseIdentity {\n    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {\n        formatter.write_str("<opaque-hot-state-reuse-identity>")\n    }\n}\n\n'''
+          if debug not in s:
+              if marker not in s: raise SystemExit('reuse identity marker missing')
+              s=s.replace(marker,debug+marker,1)
+          s=s.replace('#[derive(Debug, Clone, PartialEq, Eq)]\npub struct HotStateCapabilityObservation {','#[derive(Clone, PartialEq, Eq)]\npub struct HotStateCapabilityObservation {',1)
+          s=s.replace('fn supports(self: &Self, mode: HotStateSharingMode, role: HotStatePublisherRole) -> bool {','fn supports(&self, mode: HotStateSharingMode, role: HotStatePublisherRole) -> bool {',1)
+          p.write_text(s)
+          PY
+          cargo fmt --all
+          cargo test --locked --test hot_state_path_policy_compile
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          git rm .github/workflows/research-repair-hot-state-policy.yml
+          git add src/hot_state_path_policy.rs
+          git config user.name teamleaderleo
+          git config user.email cheerleaderleo@outlook.com
+          git commit -m 'Repair hot-state path policy model'
+          git push origin HEAD:research/hot-state-policy-ci
