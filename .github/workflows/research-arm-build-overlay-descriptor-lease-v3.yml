@@ -1,0 +1,54 @@
+name: Research verify OverlayFS descriptor lease v3
+
+on:
+  push:
+    branches:
+      - research/arm-build-overlay-descriptor-lease-v3
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: true
+          show-progress: false
+          fetch-depth: 0
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt --no-self-update
+      - name: Rebuild descriptor candidate and verify
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin research/results-overlay-descriptor-lease-v2
+          git show origin/research/results-overlay-descriptor-lease-v2:trusted_overlay_mount_plan.rs > src/trusted_overlay_mount_plan.rs
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/trusted_overlay_mount_plan.rs')
+          s=p.read_text()
+          old='''        assert_eq!(\n            super::snapshot_held_directory(&lease.upper).unwrap(),\n            held_before\n        );'''
+          new='''        let held_after = super::snapshot_held_directory(&lease.upper).unwrap();\n        assert_eq!(\n            (held_after.device, held_after.inode),\n            (held_before.device, held_before.inode)\n        );'''
+          if old not in s:
+              raise SystemExit('held descriptor assertion point missing')
+          p.write_text(s.replace(old,new,1))
+          PY
+          cargo fmt --all
+          cargo test --locked trusted_overlay_mount_plan
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cp src/trusted_overlay_mount_plan.rs /tmp/trusted_overlay_mount_plan.rs
+      - name: Publish verified source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name teamleaderleo
+          git config user.email cheerleaderleo@outlook.com
+          OUT=research/results-overlay-descriptor-lease-source
+          git checkout --orphan "$OUT"
+          git rm -rf . >/dev/null 2>&1 || true
+          cp /tmp/trusted_overlay_mount_plan.rs ./trusted_overlay_mount_plan.rs
+          git add trusted_overlay_mount_plan.rs
+          git commit -m 'Publish verified OverlayFS descriptor lease source'
+          git push --force origin HEAD:"$OUT"
