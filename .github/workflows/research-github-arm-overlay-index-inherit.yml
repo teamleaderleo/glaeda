@@ -1,0 +1,257 @@
+name: Research ARM OverlayFS index inheritance
+
+on:
+  push:
+    branches:
+      - research/github-arm-overlay-index-inherit
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Probe source-index inheritance through OverlayFS
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import shutil
+          import stat
+          import struct
+          import subprocess
+          import tempfile
+          import time
+          from pathlib import Path
+
+          workspace = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          root = Path(tempfile.mkdtemp(prefix="smolrunner-overlay-index-", dir=Path(os.environ["RUNNER_TEMP"])))
+          image = root / "xfs.img"
+          volume = root / "xfs"
+          volume.mkdir()
+          result_path = workspace / "smolrunner-github-arm-overlay-index-inherit.json"
+          worktrees = []
+          overlay_mounted = False
+
+          def run(argv, cwd=None):
+              start = time.monotonic_ns()
+              proc = subprocess.run(argv, cwd=cwd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+              return {
+                  "argv": argv,
+                  "returncode": proc.returncode,
+                  "elapsed_ms": round((time.monotonic_ns() - start) / 1_000_000, 3),
+                  "stdout": proc.stdout.strip()[:8192],
+                  "stderr": proc.stderr.strip()[:8192],
+              }
+
+          def git_index_path(cwd):
+              rec = run(["git", "rev-parse", "--git-path", "index"], cwd=cwd)
+              if rec["returncode"] != 0:
+                  raise RuntimeError(rec)
+              path = Path(rec["stdout"])
+              if not path.is_absolute():
+                  path = cwd / path
+              return path.resolve()
+
+          def parse_index(data):
+              if len(data) < 32 or data[:4] != b"DIRC":
+                  raise ValueError("bad index header")
+              version, count = struct.unpack(">II", data[4:12])
+              if version != 2:
+                  raise ValueError(f"index version {version}")
+              if hashlib.sha1(data[:-20]).digest() != data[-20:]:
+                  raise ValueError("bad index checksum")
+              offset = 12
+              entries = {}
+              for _ in range(count):
+                  start = offset
+                  if offset + 62 > len(data) - 20:
+                      raise ValueError("truncated entry")
+                  flags = struct.unpack(">H", data[offset + 60:offset + 62])[0]
+                  offset += 62
+                  end = data.find(b"\x00", offset, len(data) - 20)
+                  if end < 0:
+                      raise ValueError("unterminated path")
+                  path = data[offset:end].decode("utf-8", "surrogateescape")
+                  entry_len = end + 1 - start
+                  padded = (entry_len + 7) & ~7
+                  offset = start + padded
+                  entries[path] = {
+                      "start": start,
+                      "stat": bytes(data[start:start + 40]),
+                      "oid": bytes(data[start + 40:start + 60]),
+                      "flags": flags,
+                  }
+              return version, count, offset, entries
+
+          def inherit_source_stats(source_index, target_index):
+              start = time.monotonic_ns()
+              source = source_index.read_bytes()
+              target = bytearray(target_index.read_bytes())
+              sv, sc, so, se = parse_index(source)
+              tv, tc, to, te = parse_index(target)
+              if (sv, sc) != (tv, tc) or set(se) != set(te):
+                  raise ValueError("source/target index entry sets differ")
+              oid_mismatches = 0
+              flag_mismatches = 0
+              for path, src in se.items():
+                  dst = te[path]
+                  if src["oid"] != dst["oid"]:
+                      oid_mismatches += 1
+                  if src["flags"] != dst["flags"]:
+                      flag_mismatches += 1
+                  target[dst["start"]:dst["start"] + 40] = src["stat"]
+              target[-20:] = hashlib.sha1(target[:-20]).digest()
+              target_index.write_bytes(target)
+              return {
+                  "elapsed_ms": round((time.monotonic_ns() - start) / 1_000_000, 3),
+                  "entries": sc,
+                  "oid_mismatches": oid_mismatches,
+                  "flag_mismatches": flag_mismatches,
+                  "source_extensions_bytes": len(source) - 20 - so,
+                  "target_extensions_bytes": len(target) - 20 - to,
+              }
+
+          def proof(cwd):
+              a = run(["git", "--no-optional-locks", "diff-files", "--quiet"], cwd=cwd)
+              b = run(["git", "--no-optional-locks", "diff-index", "--quiet", "HEAD", "--"], cwd=cwd)
+              names = run(["git", "--no-optional-locks", "diff-files", "--name-only"], cwd=cwd)
+              return {
+                  "returncode": 0 if a["returncode"] == 0 and b["returncode"] == 0 else 1,
+                  "diff_files": a,
+                  "diff_index": b,
+                  "diff_names": names["stdout"].splitlines()[:64],
+              }
+
+          def tracked_regular(cwd):
+              proc = subprocess.run(["git", "ls-files", "-z"], cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+              out = []
+              for raw in proc.stdout.split(b"\x00"):
+                  if not raw:
+                      continue
+                  p = raw.decode("utf-8", "surrogateescape")
+                  try:
+                      st = os.lstat(cwd / p)
+                  except FileNotFoundError:
+                      continue
+                  if stat.S_ISREG(st.st_mode):
+                      out.append(p)
+              return out
+
+          def stat_tuple(path):
+              st = os.stat(path, follow_symlinks=False)
+              return {
+                  "dev": st.st_dev,
+                  "ino": st.st_ino,
+                  "mode": st.st_mode,
+                  "uid": st.st_uid,
+                  "gid": st.st_gid,
+                  "size": st.st_size,
+                  "mtime_ns": st.st_mtime_ns,
+                  "ctime_ns": st.st_ctime_ns,
+              }
+
+          result = {"schema_version": 1}
+          try:
+              assert run(["sudo", "-n", "true"])["returncode"] == 0
+              assert run(["truncate", "-s", "1G", str(image)])["returncode"] == 0
+              assert run(["sudo", "mkfs.xfs", "-f", "-q", "-m", "reflink=1", str(image)])["returncode"] == 0
+              assert run(["sudo", "mount", "-o", "loop", str(image), str(volume)])["returncode"] == 0
+              run(["sudo", "chown", f"{os.getuid()}:{os.getgid()}", str(volume)])
+
+              base = volume / "base"
+              base_add = run(["git", "worktree", "add", "--detach", str(base), "HEAD"], cwd=workspace)
+              assert base_add["returncode"] == 0, base_add
+              worktrees.append(base)
+              base_refresh = run(["git", "update-index", "--refresh"], cwd=base)
+              assert base_refresh["returncode"] == 0, base_refresh
+              base_proof = proof(base)
+              assert base_proof["returncode"] == 0, base_proof
+              source_index = git_index_path(base)
+
+              target = volume / "target"
+              upper = volume / "upper"
+              work = volume / "work"
+              upper.mkdir()
+              work.mkdir()
+              target_add = run(["git", "worktree", "add", "--detach", "--no-checkout", str(target), "HEAD"], cwd=workspace)
+              assert target_add["returncode"] == 0, target_add
+              worktrees.append(target)
+              shutil.move(str(target / ".git"), str(upper / ".git"))
+              mount = run(["sudo", "mount", "-t", "overlay", "overlay", "-o", f"lowerdir={base},upperdir={upper},workdir={work}", str(target)])
+              assert mount["returncode"] == 0, mount
+              overlay_mounted = True
+              read_tree = run(["git", "read-tree", "HEAD"], cwd=target)
+              assert read_tree["returncode"] == 0, read_tree
+              target_index = git_index_path(target)
+
+              paths = tracked_regular(base)
+              fields = ["dev", "ino", "mode", "uid", "gid", "size", "mtime_ns", "ctime_ns"]
+              matches = {field: 0 for field in fields}
+              mismatches = {field: 0 for field in fields}
+              examples = []
+              start = time.monotonic_ns()
+              for path in paths:
+                  a = stat_tuple(base / path)
+                  b = stat_tuple(target / path)
+                  changed = []
+                  for field in fields:
+                      if a[field] == b[field]:
+                          matches[field] += 1
+                      else:
+                          mismatches[field] += 1
+                          changed.append(field)
+                  if changed and len(examples) < 8:
+                      examples.append({"path": path, "changed_fields": changed, "source": a, "overlay": b})
+              stat_compare_ms = round((time.monotonic_ns() - start) / 1_000_000, 3)
+
+              before_inherit = proof(target)
+              inherit = inherit_source_stats(source_index, target_index)
+              after_inherit = proof(target)
+              refresh = run(["git", "update-index", "--refresh"], cwd=target)
+              after_refresh = proof(target)
+
+              result.update({
+                  "source": {"add": base_add, "refresh": base_refresh, "proof": base_proof},
+                  "target": {"add": target_add, "mount": mount, "read_tree": read_tree},
+                  "tracked_regular_files": len(paths),
+                  "stat_compare_ms": stat_compare_ms,
+                  "stat_matches": matches,
+                  "stat_mismatches": mismatches,
+                  "stat_mismatch_examples": examples,
+                  "proof_before_inherit": before_inherit,
+                  "inherit": inherit,
+                  "proof_after_inherit": after_inherit,
+                  "refresh_control": refresh,
+                  "proof_after_refresh": after_refresh,
+              })
+              result_path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+              print(json.dumps(result, indent=2, sort_keys=True))
+          finally:
+              if overlay_mounted:
+                  run(["sudo", "umount", str(volume / "target")])
+              for path in reversed(worktrees):
+                  run(["git", "worktree", "remove", "--force", str(path)], cwd=workspace)
+              run(["sudo", "umount", str(volume)])
+              shutil.rmtree(root, ignore_errors=True)
+          PY
+
+      - name: Persist result
+        run: |
+          set -euo pipefail
+          test -f smolrunner-github-arm-overlay-index-inherit.json
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -C research/results-smolrunner-github-arm-overlay-index-inherit
+          git add -- smolrunner-github-arm-overlay-index-inherit.json
+          git commit -m 'research: record OverlayFS index inheritance probe'
+          git push --force origin HEAD:refs/heads/research/results-smolrunner-github-arm-overlay-index-inherit
