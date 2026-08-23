@@ -285,6 +285,8 @@ pub mod state_document;
 pub mod state_store;
 #[cfg(target_os = "linux")]
 pub mod subordinate_id;
+/// Pure authority and lifecycle core for trusted resident OverlayFS task views.
+pub mod trusted_overlay_task_view;
 /// Descriptor-relative trusted producer for runner workspace and cache identity receipts.
 #[cfg(target_os = "linux")]
 pub mod trusted_workspace_receipt;
