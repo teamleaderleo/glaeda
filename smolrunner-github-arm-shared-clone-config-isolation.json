@@ -1,0 +1,31 @@
+{
+  "alternates": "/home/runner/work/_temp/smolrunner-clone-config/source/.git/objects",
+  "arch": "aarch64",
+  "clone_config": {
+    "branch.master.merge": "refs/heads/master",
+    "branch.master.remote": "origin",
+    "core.bare": "false",
+    "core.filemode": "true",
+    "core.logallrefupdates": "true",
+    "core.repositoryformatversion": "0",
+    "remote.origin.fetch": "+refs/heads/*:refs/remotes/origin/*",
+    "remote.origin.url": "/home/runner/work/_temp/smolrunner-clone-config/source"
+  },
+  "clone_rc": 0,
+  "clone_stderr": "Cloning into '/home/runner/work/_temp/smolrunner-clone-config/clone'...\ndone.",
+  "dangerous_keys_copied": {},
+  "head": "b947c2c2cb12a99978599b4327916d2aef931bf4",
+  "kernel": "6.17.0-1022-azure",
+  "schema_version": 1,
+  "source_dangerous": {
+    "alias.smol": "!echo alias-ran",
+    "core.fsmonitor": "/bin/echo monitor-ran",
+    "core.hooksPath": "/home/runner/work/_temp/smolrunner-clone-config/hooks",
+    "credential.helper": "!echo credential-ran",
+    "diff.smol.command": "/bin/echo diff-ran",
+    "filter.smol.clean": "/bin/echo clean-ran",
+    "filter.smol.process": "/bin/echo process-ran",
+    "merge.smol.driver": "/bin/echo merge-ran %O %A %B",
+    "smolrunner.custom": "source-value"
+  }
+}
