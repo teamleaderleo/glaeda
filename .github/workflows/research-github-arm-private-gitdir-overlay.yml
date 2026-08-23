@@ -1,0 +1,131 @@
+name: Research GitHub ARM private Git-dir OverlayFS task
+
+on:
+  push:
+    branches:
+      - research/github-arm-private-gitdir-overlay
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: true
+          show-progress: false
+          fetch-depth: 0
+      - name: Compare linked-worktree and private-shared-clone task metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/allfd.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <errno.h>
+          #include <fcntl.h>
+          #include <linux/mount.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <sys/mount.h>
+          #include <sys/syscall.h>
+          #include <unistd.h>
+          static int fsopenx(const char*n,unsigned f){return syscall(SYS_fsopen,n,f);} static int cfg(int fd,unsigned c,const char*k,const void*v,int a){return syscall(SYS_fsconfig,fd,c,k,v,a);} static int fsmountx(int fd,unsigned f,unsigned a){return syscall(SYS_fsmount,fd,f,a);} static int movex(int fd,const char*f,int td,const char*t,unsigned fl){return syscall(SYS_move_mount,fd,f,td,t,fl);} static void die(const char*s){fprintf(stderr,"%s errno=%d %s\n",s,errno,strerror(errno));exit(2);}
+          int main(int ac,char**av){if(ac!=5)return 64;int l=open(av[1],O_PATH|O_DIRECTORY|O_CLOEXEC);int u=open(av[2],O_PATH|O_DIRECTORY|O_CLOEXEC);int w=open(av[3],O_PATH|O_DIRECTORY|O_CLOEXEC);int t=open(av[4],O_PATH|O_DIRECTORY|O_CLOEXEC);if(l<0||u<0||w<0||t<0)die("open");int f=fsopenx("overlay",FSOPEN_CLOEXEC);if(f<0)die("fsopen");if(cfg(f,FSCONFIG_SET_FD,"lowerdir+",NULL,l)<0)die("lowerdir+");if(cfg(f,FSCONFIG_SET_FD,"upperdir",NULL,u)<0)die("upperdir");if(cfg(f,FSCONFIG_SET_FD,"workdir",NULL,w)<0)die("workdir");if(cfg(f,FSCONFIG_CMD_CREATE,NULL,NULL,0)<0)die("create");int m=fsmountx(f,FSMOUNT_CLOEXEC,MS_NODEV|MS_NOSUID);if(m<0)die("fsmount");if(movex(m,"",t,"",MOVE_MOUNT_F_EMPTY_PATH|MOVE_MOUNT_T_EMPTY_PATH)<0)die("move_mount");close(m);close(f);close(l);close(u);close(w);close(t);return 0;}
+          EOF
+          gcc -O2 -Wall -Wextra -Werror /tmp/allfd.c -o /tmp/allfd
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, shutil, subprocess, time
+
+          src=pathlib.Path(os.environ['GITHUB_WORKSPACE']).resolve()
+          temp=pathlib.Path(os.environ['RUNNER_TEMP'])/'smolrunner-private-gitdir'
+          shutil.rmtree(temp,ignore_errors=True);temp.mkdir()
+          head=subprocess.check_output(['git','-C',str(src),'rev-parse','HEAD'],text=True).strip()
+          src_gitdir=pathlib.Path(subprocess.check_output(['git','-C',str(src),'rev-parse','--absolute-git-dir'],text=True).strip())
+          src_index=pathlib.Path(subprocess.check_output(['git','-C',str(src),'rev-parse','--git-path','index'],text=True).strip())
+          if not src_index.is_absolute(): src_index=(src/src_index).resolve()
+          source_index_bytes=src_index.read_bytes()
+          source_index_sha=hashlib.sha256(source_index_bytes).hexdigest()
+          refs_before=subprocess.check_output(['git','-C',str(src),'for-each-ref','--format=%(refname) %(objectname)'],text=True)
+          config_before=(src_gitdir/'config').read_bytes()
+
+          def run(argv,cwd=None):
+              t=time.perf_counter();p=subprocess.run(argv,cwd=cwd,text=True,capture_output=True);return p,(time.perf_counter()-t)*1000
+          def proof(path):
+              base=['git','--no-optional-locks','-c','core.hooksPath=/dev/null','-c','core.fsmonitor=false','-c','credential.helper=','-C',str(path)]
+              a=subprocess.run(base+['diff-files','--quiet'],capture_output=True)
+              b=subprocess.run(base+['diff-index','--quiet','HEAD','--'],capture_output=True)
+              return {'diff_files':a.returncode,'diff_index':b.returncode}
+          def mount(lower,upper,work,merged):
+              return run(['sudo','/tmp/allfd',str(lower),str(upper),str(work),str(merged)])[1]
+
+          out={'schema_version':1,'arch':os.uname().machine,'kernel':os.uname().release,'head':head,'source_index_bytes':len(source_index_bytes),'source_index_sha256':source_index_sha}
+
+          # Linked-worktree reference candidate.
+          linked=temp/'linked'; linked_upper=temp/'linked-upper'; linked_work=temp/'linked-work'
+          p,meta_ms=run(['git','-C',str(src),'worktree','add','--detach','--no-checkout',str(linked),head])
+          linked_result={'metadata_ms':round(meta_ms,3),'metadata_rc':p.returncode,'metadata_err':p.stderr.strip()}
+          if p.returncode==0:
+              linked_upper.mkdir();linked_work.mkdir()
+              shutil.copy2(linked/'.git',linked_upper/'.git')
+              target_index=pathlib.Path(subprocess.check_output(['git','-C',str(linked),'rev-parse','--git-path','index'],text=True).strip())
+              if not target_index.is_absolute(): target_index=(linked/target_index).resolve()
+              t=time.perf_counter();target_index.write_bytes(source_index_bytes);linked_result['index_copy_ms']=round((time.perf_counter()-t)*1000,3)
+              linked_result['mount_ms']=round(mount(src,linked_upper,linked_work,linked),3)
+              linked_result['proof']=proof(linked)
+              subprocess.run(['sudo','umount',str(linked)],check=True)
+              subprocess.run(['git','-C',str(src),'worktree','remove','--force',str(linked)],check=True)
+          out['linked_worktree']=linked_result
+
+          # Private local clone whose objects use the source only as a read-only alternate.
+          private=temp/'private'; private_git=temp/'private.git'; private_upper=temp/'private-upper'; private_work=temp/'private-work'
+          p,clone_ms=run(['git','clone','--shared','--no-checkout','--separate-git-dir',str(private_git),str(src),str(private)])
+          private_result={'metadata_ms':round(clone_ms,3),'metadata_rc':p.returncode,'metadata_err':p.stderr.strip()}
+          if p.returncode==0:
+              private_result['head']=subprocess.check_output(['git','-C',str(private),'rev-parse','HEAD'],text=True).strip()
+              alternates=(private_git/'objects/info/alternates').read_text().strip() if (private_git/'objects/info/alternates').exists() else None
+              private_result['alternates_present']=alternates is not None
+              private_result['alternates_points_to_source_objects']=alternates == str((src_gitdir/'objects').resolve())
+              private_upper.mkdir();private_work.mkdir()
+              shutil.copy2(private/'.git',private_upper/'.git')
+              t=time.perf_counter();(private_git/'index').write_bytes(source_index_bytes);private_result['index_copy_ms']=round((time.perf_counter()-t)*1000,3)
+              private_result['mount_ms']=round(mount(src,private_upper,private_work,private),3)
+              private_result['proof']=proof(private)
+
+              # Prove task-local refs/config/object writes do not mutate the source Git metadata.
+              branch_name='smolrunner-private-isolation-test'
+              subprocess.run(['git','-C',str(private),'branch',branch_name,'HEAD'],check=True)
+              private_result['private_branch_exists']=subprocess.run(['git','-C',str(private),'show-ref','--verify','--quiet',f'refs/heads/{branch_name}']).returncode==0
+              private_result['source_branch_absent']=subprocess.run(['git','-C',str(src),'show-ref','--verify','--quiet',f'refs/heads/{branch_name}']).returncode!=0
+              subprocess.run(['git','-C',str(private),'config','smolrunner.probe','private'],check=True)
+              private_result['private_config_set']=subprocess.run(['git','-C',str(private),'config','--get','smolrunner.probe'],capture_output=True,text=True).stdout.strip()=='private'
+              private_result['source_config_unchanged_after_private_config']=(src_gitdir/'config').read_bytes()==config_before
+              with (private/'README.md').open('ab') as f:f.write(b'\nprivate-task-object-probe\n')
+              subprocess.run(['git','-C',str(private),'add','README.md'],check=True)
+              blob=subprocess.check_output(['git','-C',str(private),'hash-object','README.md'],text=True).strip()
+              private_result['new_blob']=blob
+              private_result['private_has_new_blob']=subprocess.run(['git','--git-dir',str(private_git),'cat-file','-e',blob]).returncode==0
+              # Restore overlay task worktree before unmount, without touching the source.
+              subprocess.run(['git','-C',str(private),'checkout','--','README.md'],check=True)
+              private_result['source_refs_unchanged']=subprocess.check_output(['git','-C',str(src),'for-each-ref','--format=%(refname) %(objectname)'],text=True)==refs_before
+              private_result['source_config_unchanged']=(src_gitdir/'config').read_bytes()==config_before
+              subprocess.run(['sudo','umount',str(private)],check=True)
+          out['private_shared_clone']=private_result
+          pathlib.Path('/tmp/result.json').write_text(json.dumps(out,indent=2,sort_keys=True)+'\n')
+          print(json.dumps(out,indent=2,sort_keys=True))
+          PY
+      - name: Publish owned result
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name teamleaderleo
+          git config user.email cheerleaderleo@outlook.com
+          OUT=research/results-smolrunner-github-arm-private-gitdir-overlay
+          git checkout --orphan "$OUT"
+          git rm -rf . >/dev/null 2>&1 || true
+          cp /tmp/result.json ./smolrunner-github-arm-private-gitdir-overlay.json
+          git add smolrunner-github-arm-private-gitdir-overlay.json
+          git commit -m 'Record hosted ARM private Git-dir OverlayFS probe'
+          git push --force origin HEAD:"$OUT"
