@@ -1,0 +1,49 @@
+name: Research hosted macOS Lima disk capability
+
+on:
+  push:
+    branches:
+      - research/github-macos-lima-disk-capability
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: true
+          show-progress: false
+      - name: Probe preinstalled Lima only
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, platform, shutil, subprocess, pathlib
+          def run(argv):
+              p=subprocess.run(argv,text=True,capture_output=True)
+              return {'argv':argv,'returncode':p.returncode,'stdout':p.stdout,'stderr':p.stderr}
+          limactl=shutil.which('limactl')
+          data={'schema_version':1,'machine':platform.machine(),'macos':platform.mac_ver()[0],'limactl':limactl}
+          if limactl:
+              data['version']=run([limactl,'--version'])
+              data['disk_help']=run([limactl,'disk','--help'])
+          out=pathlib.Path('/tmp/smolrunner-macos-lima-capability.json')
+          out.write_text(json.dumps(data,indent=2,sort_keys=True)+'\n')
+          print(out.read_text())
+          PY
+      - name: Publish owned result
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name teamleaderleo
+          git config user.email cheerleaderleo@outlook.com
+          OUT=research/results-smolrunner-github-macos-lima-disk-capability
+          git checkout --orphan "$OUT"
+          git rm -rf . >/dev/null 2>&1 || true
+          cp /tmp/smolrunner-macos-lima-capability.json ./smolrunner-github-macos-lima-disk-capability.json
+          git add smolrunner-github-macos-lima-disk-capability.json
+          git commit -m 'Record hosted macOS Lima capability'
+          git push --force origin HEAD:"$OUT"
