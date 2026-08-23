@@ -1,0 +1,174 @@
+{
+  "schema_version": 1,
+  "source_unchanged": {
+    "anchor_cache": true,
+    "anchor_link_exists": true,
+    "cargo": true,
+    "license": true,
+    "readme": true
+  },
+  "steps": {
+    "delete_status": {
+      "argv": [
+        "git",
+        "--no-optional-locks",
+        "status",
+        "--porcelain=v2",
+        "-z",
+        "--untracked-files=all",
+        "--ignore-submodules=all"
+      ],
+      "elapsed_ms": 23.633,
+      "returncode": 0,
+      "stderr": "",
+      "stdout": "1 .M N... 100644 100644 100644 d3be29f15d14065c51fcd5337b7f3a842fa3362e d3be29f15d14065c51fcd5337b7f3a842fa3362e Cargo.toml\u00001 .D N... 100644 100644 000000 b09cd7856d58590578ee1a4f3ad45d1310a97f87 b09cd7856d58590578ee1a4f3ad45d1310a97f87 LICENSE\u0000? anchor-cache/immutable.txt\u0000? anchor-symlink-target.txt\u0000? anchor-untracked-link\u0000"
+    },
+    "final_status": {
+      "argv": [
+        "git",
+        "--no-optional-locks",
+        "status",
+        "--porcelain=v2",
+        "-z",
+        "--untracked-files=all",
+        "--ignore-submodules=all"
+      ],
+      "elapsed_ms": 23.85,
+      "returncode": 0,
+      "stderr": "",
+      "stdout": ""
+    },
+    "git_clean": {
+      "argv": [
+        "git",
+        "clean",
+        "-ffd"
+      ],
+      "elapsed_ms": 1.871,
+      "returncode": 0,
+      "stderr": "",
+      "stdout": "Removing README.task.md\nRemoving anchor-symlink-target.txt\nRemoving task-untracked-link\nRemoving task-untracked.txt"
+    },
+    "initial_status": {
+      "argv": [
+        "git",
+        "--no-optional-locks",
+        "status",
+        "--porcelain=v2",
+        "-z",
+        "--untracked-files=all",
+        "--ignore-submodules=all"
+      ],
+      "elapsed_ms": 24.337,
+      "returncode": 0,
+      "stderr": "",
+      "stdout": "? anchor-cache/immutable.txt\u0000? anchor-symlink-target.txt\u0000? anchor-untracked-link\u0000"
+    },
+    "lower_untracked_removed": {
+      "cache_visible": false,
+      "link_visible": false
+    },
+    "mode_status": {
+      "argv": [
+        "git",
+        "--no-optional-locks",
+        "status",
+        "--porcelain=v2",
+        "-z",
+        "--untracked-files=all",
+        "--ignore-submodules=all"
+      ],
+      "elapsed_ms": 23.778,
+      "returncode": 0,
+      "stderr": "",
+      "stdout": "1 .M N... 100644 100644 100644 d3be29f15d14065c51fcd5337b7f3a842fa3362e d3be29f15d14065c51fcd5337b7f3a842fa3362e Cargo.toml\u00001 .D N... 100644 100644 000000 b09cd7856d58590578ee1a4f3ad45d1310a97f87 b09cd7856d58590578ee1a4f3ad45d1310a97f87 LICENSE\u00001 .M N... 100644 100644 100755 ef758e86e9b208051827bace6b4d74dc4a698424 ef758e86e9b208051827bace6b4d74dc4a698424 Makefile\u00001 .D N... 100644 100644 000000 0db3a25ddd1a9abb4c2b738b11ce2abc40f1d020 0db3a25ddd1a9abb4c2b738b11ce2abc40f1d020 README.md\u0000? README.task.md\u0000? anchor-cache/immutable.txt\u0000? anchor-symlink-target.txt\u0000? anchor-untracked-link\u0000"
+    },
+    "modify_status": {
+      "argv": [
+        "git",
+        "--no-optional-locks",
+        "status",
+        "--porcelain=v2",
+        "-z",
+        "--untracked-files=all",
+        "--ignore-submodules=all"
+      ],
+      "elapsed_ms": 23.675,
+      "returncode": 0,
+      "stderr": "",
+      "stdout": "1 .M N... 100644 100644 100644 d3be29f15d14065c51fcd5337b7f3a842fa3362e d3be29f15d14065c51fcd5337b7f3a842fa3362e Cargo.toml\u0000? anchor-cache/immutable.txt\u0000? anchor-symlink-target.txt\u0000? anchor-untracked-link\u0000"
+    },
+    "post_clean_status": {
+      "argv": [
+        "git",
+        "--no-optional-locks",
+        "status",
+        "--porcelain=v2",
+        "-z",
+        "--untracked-files=all",
+        "--ignore-submodules=all"
+      ],
+      "elapsed_ms": 23.672,
+      "returncode": 0,
+      "stderr": "",
+      "stdout": "1 .M N... 100644 100644 100644 d3be29f15d14065c51fcd5337b7f3a842fa3362e d3be29f15d14065c51fcd5337b7f3a842fa3362e Cargo.toml\u00001 .D N... 100644 100644 000000 b09cd7856d58590578ee1a4f3ad45d1310a97f87 b09cd7856d58590578ee1a4f3ad45d1310a97f87 LICENSE\u00001 .M N... 100644 100644 100755 ef758e86e9b208051827bace6b4d74dc4a698424 ef758e86e9b208051827bace6b4d74dc4a698424 Makefile\u00001 .D N... 100644 100644 000000 0db3a25ddd1a9abb4c2b738b11ce2abc40f1d020 0db3a25ddd1a9abb4c2b738b11ce2abc40f1d020 README.md\u0000"
+    },
+    "post_clean_visibility": {
+      "lower_cache_visible": false,
+      "task_link_exists": false,
+      "task_untracked_exists": false
+    },
+    "rename_status": {
+      "argv": [
+        "git",
+        "--no-optional-locks",
+        "status",
+        "--porcelain=v2",
+        "-z",
+        "--untracked-files=all",
+        "--ignore-submodules=all"
+      ],
+      "elapsed_ms": 23.791,
+      "returncode": 0,
+      "stderr": "",
+      "stdout": "1 .M N... 100644 100644 100644 d3be29f15d14065c51fcd5337b7f3a842fa3362e d3be29f15d14065c51fcd5337b7f3a842fa3362e Cargo.toml\u00001 .D N... 100644 100644 000000 b09cd7856d58590578ee1a4f3ad45d1310a97f87 b09cd7856d58590578ee1a4f3ad45d1310a97f87 LICENSE\u00001 .D N... 100644 100644 000000 0db3a25ddd1a9abb4c2b738b11ce2abc40f1d020 0db3a25ddd1a9abb4c2b738b11ce2abc40f1d020 README.md\u0000? README.task.md\u0000? anchor-cache/immutable.txt\u0000? anchor-symlink-target.txt\u0000? anchor-untracked-link\u0000"
+    },
+    "reset": {
+      "argv": [
+        "git",
+        "reset",
+        "--hard",
+        "HEAD"
+      ],
+      "elapsed_ms": 45.826,
+      "returncode": 0,
+      "stderr": "",
+      "stdout": "HEAD is now at 1ed298d research: exercise OverlayFS Git mutation semantics"
+    },
+    "untracked_status": {
+      "argv": [
+        "git",
+        "--no-optional-locks",
+        "status",
+        "--porcelain=v2",
+        "-z",
+        "--untracked-files=all",
+        "--ignore-submodules=all"
+      ],
+      "elapsed_ms": 23.63,
+      "returncode": 0,
+      "stderr": "",
+      "stdout": "1 .M N... 100644 100644 100644 d3be29f15d14065c51fcd5337b7f3a842fa3362e d3be29f15d14065c51fcd5337b7f3a842fa3362e Cargo.toml\u00001 .D N... 100644 100644 000000 b09cd7856d58590578ee1a4f3ad45d1310a97f87 b09cd7856d58590578ee1a4f3ad45d1310a97f87 LICENSE\u00001 .M N... 100644 100644 100755 ef758e86e9b208051827bace6b4d74dc4a698424 ef758e86e9b208051827bace6b4d74dc4a698424 Makefile\u00001 .D N... 100644 100644 000000 0db3a25ddd1a9abb4c2b738b11ce2abc40f1d020 0db3a25ddd1a9abb4c2b738b11ce2abc40f1d020 README.md\u0000? README.task.md\u0000? anchor-cache/immutable.txt\u0000? anchor-symlink-target.txt\u0000? anchor-untracked-link\u0000? task-untracked-link\u0000? task-untracked.txt\u0000"
+    }
+  },
+  "upper_entries": [
+    ".git",
+    "Cargo.toml",
+    "LICENSE",
+    "Makefile",
+    "README.md",
+    "anchor-cache",
+    "anchor-symlink-target.txt",
+    "anchor-untracked-link"
+  ]
+}
