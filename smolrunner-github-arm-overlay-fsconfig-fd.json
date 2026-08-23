@@ -1,0 +1,31 @@
+{
+  "arch": "aarch64",
+  "cases": [
+    {
+      "case": "lowerdir_fd",
+      "errno": 22,
+      "message": "Invalid argument",
+      "returncode": -1
+    },
+    {
+      "case": "lowerdir_plus_fd",
+      "errno": 0,
+      "message": "ok",
+      "returncode": 0
+    },
+    {
+      "case": "upperdir_fd",
+      "errno": 0,
+      "message": "ok",
+      "returncode": 0
+    },
+    {
+      "case": "workdir_fd",
+      "errno": 0,
+      "message": "ok",
+      "returncode": 0
+    }
+  ],
+  "kernel": "6.17.0-1022-azure",
+  "schema_version": 1
+}
