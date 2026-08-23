@@ -1,0 +1,37 @@
+{
+  "arch": "aarch64",
+  "kernel": "6.17.0-1022-azure",
+  "schema_version": 1,
+  "tools": {
+    "bun": {
+      "path": null
+    },
+    "corepack": {
+      "path": "/usr/local/bin/corepack",
+      "rc": 0,
+      "stderr": "",
+      "stdout": "0.34.6"
+    },
+    "node": {
+      "path": "/usr/local/bin/node",
+      "rc": 0,
+      "stderr": "",
+      "stdout": "v22.23.2"
+    },
+    "npm": {
+      "path": "/usr/local/bin/npm",
+      "rc": 0,
+      "stderr": "",
+      "stdout": "10.9.8"
+    },
+    "pnpm": {
+      "path": null
+    },
+    "yarn": {
+      "path": "/usr/local/bin/yarn",
+      "rc": 0,
+      "stderr": "",
+      "stdout": "1.22.22"
+    }
+  }
+}
