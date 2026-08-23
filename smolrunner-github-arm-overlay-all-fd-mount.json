@@ -1,0 +1,16 @@
+{
+  "arch": "aarch64",
+  "findmnt": "overlay rw,nosuid,nodev,relatime,lowerdir+=/home/runner/work/_temp/smolrunner-allfd/lower,upperdir=/home/runner/work/_temp/smolrunner-allfd/upper,workdir=/home/runner/work/_temp/smolrunner-allfd/work,uuid=on,nouserxattr",
+  "kernel": "6.17.0-1022-azure",
+  "lower_unchanged": true,
+  "lower_visible": true,
+  "mount": {
+    "elapsed_ms": 6.107,
+    "returncode": 0,
+    "stderr": ""
+  },
+  "schema_version": 1,
+  "unmount_rc": 0,
+  "unmount_stderr": "",
+  "upper_copyup": true
+}
