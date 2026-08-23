@@ -199,6 +199,52 @@ impl TrustedOverlayMountPlan {
     pub const fn kernel(&self) -> &TrustedOverlayKernelCapability {
         &self.kernel
     }
+
+    /// Reconfirm this sealed plan against current authority and read-only host evidence.
+    ///
+    /// The source-anchor record revision may advance while sibling leases change. Exact child
+    /// lease membership and task lifecycle state are rechecked instead of freezing an old anchor
+    /// revision. This function performs no filesystem mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded path-private error when current task/anchor authority, directory identity,
+    /// workdir emptiness, mount namespace, OverlayFS capability, or merged-target absence no longer
+    /// matches the sealed plan.
+    pub fn confirm(
+        &self,
+        source_anchor: &OverlaySourceAnchorRecord,
+        task_view: &OverlayTaskViewRecord,
+    ) -> Result<(), TrustedOverlayMountPlanError> {
+        require_mount_authority(source_anchor, task_view)?;
+        if source_anchor.binding() != &self.source_anchor || task_view.lease() != &self.task_lease {
+            return Err(plan_authority_mismatch());
+        }
+        require_procfs()?;
+        let filesystems = read_bounded(Path::new("/proc/filesystems"), MAX_PROC_FILESYSTEMS_BYTES)?;
+        if sha256_digest(&filesystems)? != self.kernel.filesystems_digest {
+            return Err(changed_during_observation());
+        }
+        let mount_namespace = fs::metadata("/proc/self/ns/mnt").map_err(|_| io_error())?;
+        if (mount_namespace.dev(), mount_namespace.ino())
+            != (
+                self.kernel.mount_namespace_device,
+                self.kernel.mount_namespace_inode,
+            )
+        {
+            return Err(changed_during_observation());
+        }
+        require_empty_directory(&self.work.path)?;
+        for directory in [&self.lower, &self.upper, &self.work, &self.merged] {
+            revalidate_directory(directory)?;
+        }
+        validate_directory_roles([&self.lower, &self.upper, &self.work, &self.merged])?;
+        let mountinfo = read_bounded(Path::new("/proc/self/mountinfo"), MAX_PROC_MOUNTINFO_BYTES)?;
+        if mountinfo_has_mountpoint(&mountinfo, &self.merged.path)? {
+            return Err(already_mounted());
+        }
+        Ok(())
+    }
 }
 
 impl fmt::Debug for TrustedOverlayMountPlan {
@@ -729,6 +775,14 @@ const fn invalid_proc_evidence() -> TrustedOverlayMountPlanError {
     )
 }
 
+const fn plan_authority_mismatch() -> TrustedOverlayMountPlanError {
+    error(
+        TrustedOverlayMountPlanErrorKind::AuthorityMismatch,
+        "overlay_mount_plan_authority_mismatch",
+        "current trusted overlay authority does not match the sealed mount plan",
+    )
+}
+
 const fn task_state_invalid() -> TrustedOverlayMountPlanError {
     error(
         TrustedOverlayMountPlanErrorKind::AuthorityMismatch,
@@ -884,6 +938,44 @@ mod tests {
                 .code(),
             "overlay_mount_anchor_task_unproven"
         );
+    }
+
+    #[test]
+    fn sealed_plan_reconfirms_exact_child_lease_across_anchor_revision() {
+        let fixture = Fixture::new();
+        let (anchor, task) = registered_authority();
+        let plan = super::observe_trusted_overlay_mount_plan(&anchor, &task, fixture.paths.clone())
+            .unwrap();
+        plan.confirm(&anchor, &task).unwrap();
+        let draining = anchor.request_draining().unwrap();
+        plan.confirm(&draining, &task)
+            .expect("an already-leased child remains authorized while its anchor drains");
+        let released = draining.release_task(task.lease()).unwrap();
+        assert_eq!(
+            plan.confirm(&released, &task).unwrap_err().code(),
+            "overlay_mount_anchor_task_unproven"
+        );
+    }
+
+    #[test]
+    fn sealed_plan_confirmation_detects_late_workdir_and_directory_drift() {
+        let fixture = Fixture::new();
+        let (anchor, task) = registered_authority();
+        let plan = super::observe_trusted_overlay_mount_plan(&anchor, &task, fixture.paths.clone())
+            .unwrap();
+        fs::write(fixture.root.join("work/late"), b"x").unwrap();
+        assert_eq!(
+            plan.confirm(&anchor, &task).unwrap_err().kind(),
+            TrustedOverlayMountPlanErrorKind::WorkdirNotEmpty
+        );
+        fs::remove_file(fixture.root.join("work/late")).unwrap();
+        fs::rename(fixture.root.join("upper"), fixture.root.join("upper-old")).unwrap();
+        fs::create_dir(fixture.root.join("upper")).unwrap();
+        assert!(matches!(
+            plan.confirm(&anchor, &task).unwrap_err().kind(),
+            TrustedOverlayMountPlanErrorKind::ChangedDuringObservation
+                | TrustedOverlayMountPlanErrorKind::Io
+        ));
     }
 
     #[test]
