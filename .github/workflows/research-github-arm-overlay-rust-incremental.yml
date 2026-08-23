@@ -1,0 +1,134 @@
+name: Research ARM OverlayFS Rust incremental state
+
+on:
+  push:
+    branches:
+      - research/github-arm-overlay-rust-incremental
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+      - name: Measure warmed Rust target reuse through task overlays
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import concurrent.futures, json, os, shutil, subprocess, tempfile, time
+          from pathlib import Path
+
+          repo=Path(os.environ['GITHUB_WORKSPACE']).resolve()
+          root=Path(tempfile.mkdtemp(prefix='smolrunner-overlay-rust-',dir=Path(os.environ['RUNNER_TEMP'])))
+          image=root/'ext4.img'; volume=root/'ext4'; volume.mkdir(); out=repo/'smolrunner-github-arm-overlay-rust-incremental.json'
+          cargo_home=root/'cargo-home'; cargo_home.mkdir()
+          worktrees=[]; mounts=[]
+          def run(argv,cwd=None,env=None):
+              full=os.environ.copy(); full['CARGO_HOME']=str(cargo_home); full['CARGO_NET_OFFLINE']='true'
+              if env: full.update(env)
+              start=time.monotonic_ns(); p=subprocess.run(argv,cwd=cwd,env=full,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=False)
+              return {'returncode':p.returncode,'elapsed_ms':round((time.monotonic_ns()-start)/1_000_000,3),'stdout':p.stdout.strip()[-4096:],'stderr':p.stderr.strip()[-4096:]}
+          def par(items,fn):
+              start=time.monotonic_ns()
+              with concurrent.futures.ThreadPoolExecutor(max_workers=len(items)) as pool: records=list(pool.map(fn,items))
+              return round((time.monotonic_ns()-start)/1_000_000,3),records
+          def idx(cwd):
+              p=subprocess.run(['git','rev-parse','--git-path','index'],cwd=cwd,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=True).stdout.strip(); path=Path(p); return (path if path.is_absolute() else cwd/path).resolve()
+          def proof(cwd):
+              a=run(['git','--no-optional-locks','diff-files','--quiet'],cwd); b=run(['git','--no-optional-locks','diff-index','--quiet','HEAD','--'],cwd)
+              return a['returncode']==0 and b['returncode']==0
+          def used():
+              subprocess.run(['sync','-f',str(volume)],check=False,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+              s=os.statvfs(volume); return (s.f_blocks-s.f_bfree)*s.f_frsize
+          def add(path):
+              r=run(['git','worktree','add','--detach','--no-checkout',str(path),'HEAD'],repo)
+              if r['returncode']==0: worktrees.append(path)
+              return r
+          def remove(path):
+              r=run(['git','worktree','remove','--force',str(path)],repo)
+              if path in worktrees: worktrees.remove(path)
+              return r
+          def make_crate(root_path, modules=240):
+              crate=root_path/'bench-rust'; src=crate/'src'; src.mkdir(parents=True)
+              (crate/'Cargo.toml').write_text('[package]\nname="overlay-rust-probe"\nversion="0.1.0"\nedition="2024"\n\n[lib]\npath="src/lib.rs"\n',encoding='utf-8')
+              lines=[]
+              for i in range(modules):
+                  name=f'm{i:03d}'; lines.append(f'mod {name};'); (src/f'{name}.rs').write_text(f'pub fn value() -> u64 {{ {i} }}\n',encoding='utf-8')
+              expr=' + '.join(f'm{i:03d}::value()' for i in range(modules))
+              expected=sum(range(modules))
+              lines += [f'pub fn total() -> u64 {{ {expr} }}','#[cfg(test)]','mod tests {','    use super::total;',f'    #[test] fn total_is_stable() {{ assert_eq!(total(), {expected}); }}','}']
+              (src/'lib.rs').write_text('\n'.join(lines)+'\n',encoding='utf-8')
+              return crate
+          result={'schema_version':1,'modules':240,'counts':{}}
+          try:
+              assert run(['sudo','-n','true'])['returncode']==0
+              assert run(['truncate','-s','3G',str(image)])['returncode']==0
+              assert run(['sudo','mkfs.ext4','-F','-q',str(image)])['returncode']==0
+              assert run(['sudo','mount','-o','loop',str(image),str(volume)])['returncode']==0
+              run(['sudo','chown',f'{os.getuid()}:{os.getgid()}',str(volume)])
+              base=volume/'base'; b=run(['git','worktree','add','--detach',str(base),'HEAD'],repo); assert b['returncode']==0,b; worktrees.append(base)
+              refresh=run(['git','update-index','--refresh'],base); assert refresh['returncode']==0 and proof(base)
+              source_index=idx(base).read_bytes(); crate=make_crate(base)
+              cold=run(['cargo','test','--offline','--quiet'],crate); assert cold['returncode']==0,cold
+              warm=run(['cargo','test','--offline','--quiet'],crate); assert warm['returncode']==0,warm
+              target_bytes=sum(p.stat().st_size for p in (crate/'target').rglob('*') if p.is_file())
+              result['anchor']={'cold_ms':cold['elapsed_ms'],'warm_no_edit_ms':warm['elapsed_ms'],'target_logical_bytes':target_bytes,'source_index_bytes':len(source_index)}
+
+              for count in (1,8):
+                  # Copy baseline: one private physical copy of the warmed untracked crate per task.
+                  copy_root=volume/f'copy-{count}'; copy_root.mkdir(); copies=[copy_root/f'task-{i:02d}' for i in range(count)]
+                  before=used()
+                  copy_wall, copy_records=par(copies,lambda p: run(['cp','-a','--reflink=never',str(crate),str(p)]))
+                  for i,p in enumerate(copies): (p/'src'/'m000.rs').write_text(f'pub fn value() -> u64 {{ 0 }} // copy-task-{i}\n',encoding='utf-8')
+                  test_wall, tests=par(copies,lambda p: run(['cargo','test','--offline','--quiet'],p))
+                  after=used(); shutil.rmtree(copy_root,ignore_errors=True); used()
+                  copy_result={'copy_wall_ms':copy_wall,'test_wall_ms':test_wall,'total_wall_ms':round(copy_wall+test_wall,3),'successes':sum(1 for r in tests if r['returncode']==0),'used_delta':after-before,'test_records':tests}
+
+                  # Overlay task views inherit source and warmed target without copying either.
+                  od=volume/f'overlay-{count}'; od.mkdir(); entries=[]
+                  for i in range(count):
+                      target=od/f'task-{i:02d}'; upper=od/f'upper-{i:02d}'; work=od/f'work-{i:02d}'; upper.mkdir(); work.mkdir(); entries.append((target,upper,work))
+                  before=used(); meta_wall, meta=par([e[0] for e in entries],add)
+                  def mount_one(e):
+                      target,upper,work=e; shutil.copy2(target/'.git',upper/'.git')
+                      r=run(['sudo','mount','-t','overlay','overlay','-o',f'lowerdir={base},upperdir={upper},workdir={work}',str(target)])
+                      if r['returncode']==0: mounts.append(target)
+                      return r
+                  mount_wall,mounted=par(entries,mount_one)
+                  def index_one(target):
+                      start=time.monotonic_ns(); dest=idx(target); tmp=dest.with_name(dest.name+'.smolrunner-tmp'); tmp.write_bytes(source_index); os.replace(tmp,dest); return {'returncode':0,'elapsed_ms':round((time.monotonic_ns()-start)/1_000_000,3)}
+                  index_wall,indexed=par([e[0] for e in entries],index_one)
+                  for i,e in enumerate(entries): (e[0]/'bench-rust'/'src'/'m000.rs').write_text(f'pub fn value() -> u64 {{ 0 }} // overlay-task-{i}\n',encoding='utf-8')
+                  ready_after_edit=used()
+                  test_wall,tests=par(entries,lambda e: run(['cargo','test','--offline','--quiet'],e[0]/'bench-rust'))
+                  after=used()
+                  def um(e):
+                      t=e[0]; r=run(['sudo','umount',str(t)])
+                      if t in mounts: mounts.remove(t)
+                      return r
+                  unmount_wall,_=par(entries,um); cleanup_wall,_=par([e[0] for e in entries],remove); shutil.rmtree(od,ignore_errors=True); used()
+                  overlay_result={'metadata_wall_ms':meta_wall,'mount_wall_ms':mount_wall,'index_copy_wall_ms':index_wall,'setup_wall_ms':round(meta_wall+mount_wall+index_wall,3),'test_wall_ms':test_wall,'total_wall_ms':round(meta_wall+mount_wall+index_wall+test_wall,3),'successes':sum(1 for r in tests if r['returncode']==0),'setup_and_edit_used_delta':ready_after_edit-before,'after_test_used_delta':after-before,'unmount_wall_ms':unmount_wall,'cleanup_wall_ms':cleanup_wall,'test_records':tests}
+                  result['counts'][str(count)]={'private_copy':copy_result,'overlay':overlay_result}
+              out.write_text(json.dumps(result,indent=2,sort_keys=True)+'\n',encoding='utf-8'); print(json.dumps(result,indent=2,sort_keys=True))
+          finally:
+              for m in reversed(list(mounts)): run(['sudo','umount',str(m)])
+              for w in reversed(list(worktrees)): run(['git','worktree','remove','--force',str(w)],repo)
+              run(['sudo','umount',str(volume)]); shutil.rmtree(root,ignore_errors=True)
+          PY
+      - name: Persist result
+        if: always()
+        run: |
+          set -euo pipefail
+          test -f smolrunner-github-arm-overlay-rust-incremental.json
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -C research/results-smolrunner-github-arm-overlay-rust-incremental
+          git add -- smolrunner-github-arm-overlay-rust-incremental.json
+          git commit -m 'research: record OverlayFS Rust incremental probe'
+          git push --force origin HEAD:refs/heads/research/results-smolrunner-github-arm-overlay-rust-incremental
