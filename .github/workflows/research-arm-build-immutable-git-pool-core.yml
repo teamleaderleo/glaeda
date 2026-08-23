@@ -1,0 +1,54 @@
+name: Research build immutable Git pool core
+
+on:
+  push:
+    branches:
+      - research/arm-build-immutable-git-pool-core
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: codex/immutable-git-object-pool-core
+          persist-credentials: true
+          show-progress: false
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt --no-self-update
+      - name: Export and verify
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/lib.rs');s=p.read_text()
+          needle='''/// Pure bounded observation-only receipts for blazingly hot execution measurements.\npub mod hot_execution_performance;'''
+          repl='''/// Pure bounded observation-only receipts for blazingly hot execution measurements.\npub mod hot_execution_performance;\n/// Pure immutable resident Git object-pool generation and consumer-lease core.\npub mod immutable_git_object_pool;'''
+          if 'pub mod immutable_git_object_pool;' not in s:
+              if needle not in s: raise SystemExit('lib insertion point missing')
+              s=s.replace(needle,repl,1)
+          p.write_text(s)
+          PY
+          cargo fmt --all
+          cargo test --locked immutable_git_object_pool
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cp src/immutable_git_object_pool.rs /tmp/immutable_git_object_pool.rs
+          cp src/lib.rs /tmp/lib.rs
+      - name: Publish verified blobs
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name teamleaderleo
+          git config user.email cheerleaderleo@outlook.com
+          OUT=research/results-immutable-git-pool-core-source
+          git checkout --orphan "$OUT"
+          git rm -rf . >/dev/null 2>&1 || true
+          cp /tmp/immutable_git_object_pool.rs ./immutable_git_object_pool.rs
+          cp /tmp/lib.rs ./lib.rs
+          git add immutable_git_object_pool.rs lib.rs
+          git commit -m 'Publish verified immutable Git pool core blobs'
+          git push --force origin HEAD:"$OUT"
