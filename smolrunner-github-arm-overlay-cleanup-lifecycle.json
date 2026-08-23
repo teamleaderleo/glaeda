@@ -1,0 +1,153 @@
+{
+  "base": {
+    "add": {
+      "argv": [
+        "git",
+        "worktree",
+        "add",
+        "--detach",
+        "/home/runner/work/_temp/smolrunner-overlay-cleanup-95kybrn0/ext4/base",
+        "HEAD"
+      ],
+      "elapsed_ms": 28.827,
+      "returncode": 0,
+      "stderr": "Preparing worktree (detached HEAD 4282082)",
+      "stdout": "HEAD is now at 4282082 research: prove OverlayFS linked-worktree cleanup"
+    },
+    "proof": {
+      "diff_files": {
+        "argv": [
+          "git",
+          "--no-optional-locks",
+          "diff-files",
+          "--quiet"
+        ],
+        "elapsed_ms": 22.897,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": ""
+      },
+      "diff_index": {
+        "argv": [
+          "git",
+          "--no-optional-locks",
+          "diff-index",
+          "--quiet",
+          "HEAD",
+          "--"
+        ],
+        "elapsed_ms": 23.318,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": ""
+      },
+      "returncode": 0
+    },
+    "refresh": {
+      "argv": [
+        "git",
+        "update-index",
+        "--refresh"
+      ],
+      "elapsed_ms": 23.769,
+      "returncode": 0,
+      "stderr": "",
+      "stdout": ""
+    }
+  },
+  "schema_version": 1,
+  "target": {
+    "add": {
+      "argv": [
+        "git",
+        "worktree",
+        "add",
+        "--detach",
+        "--no-checkout",
+        "/home/runner/work/_temp/smolrunner-overlay-cleanup-95kybrn0/ext4/target",
+        "HEAD"
+      ],
+      "elapsed_ms": 2.186,
+      "returncode": 0,
+      "stderr": "Preparing worktree (detached HEAD 4282082)",
+      "stdout": ""
+    },
+    "dirty_diff_files_returncode": 1,
+    "hidden_dotgit_preserved_before_mount": true,
+    "merged_dotgit_matches": true,
+    "mount": {
+      "argv": [
+        "sudo",
+        "mount",
+        "-t",
+        "overlay",
+        "overlay",
+        "-o",
+        "lowerdir=/home/runner/work/_temp/smolrunner-overlay-cleanup-95kybrn0/ext4/base,upperdir=/home/runner/work/_temp/smolrunner-overlay-cleanup-95kybrn0/ext4/upper,workdir=/home/runner/work/_temp/smolrunner-overlay-cleanup-95kybrn0/ext4/work",
+        "/home/runner/work/_temp/smolrunner-overlay-cleanup-95kybrn0/ext4/target"
+      ],
+      "elapsed_ms": 7.34,
+      "returncode": 0,
+      "stderr": "",
+      "stdout": ""
+    },
+    "ready_proof": {
+      "diff_files": {
+        "argv": [
+          "git",
+          "--no-optional-locks",
+          "diff-files",
+          "--quiet"
+        ],
+        "elapsed_ms": 24.202,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": ""
+      },
+      "diff_index": {
+        "argv": [
+          "git",
+          "--no-optional-locks",
+          "diff-index",
+          "--quiet",
+          "HEAD",
+          "--"
+        ],
+        "elapsed_ms": 23.953,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": ""
+      },
+      "returncode": 0
+    },
+    "registration_absent": true,
+    "remove": {
+      "argv": [
+        "git",
+        "worktree",
+        "remove",
+        "--force",
+        "/home/runner/work/_temp/smolrunner-overlay-cleanup-95kybrn0/ext4/target"
+      ],
+      "elapsed_ms": 1.483,
+      "returncode": 0,
+      "stderr": "",
+      "stdout": ""
+    },
+    "revealed_dotgit_matches": true,
+    "target_absent": true,
+    "unmount": {
+      "argv": [
+        "sudo",
+        "umount",
+        "/home/runner/work/_temp/smolrunner-overlay-cleanup-95kybrn0/ext4/target"
+      ],
+      "elapsed_ms": 35.594,
+      "returncode": 0,
+      "stderr": "",
+      "stdout": ""
+    },
+    "worktree_list_after_remove": "worktree /home/runner/work/smolrunner/smolrunner\nHEAD 428208232c72cbfcc729daff205a0ccdc0a37c41\nbranch refs/heads/research/github-arm-overlay-cleanup-lifecycle\n\nworktree /home/runner/work/_temp/smolrunner-overlay-cleanup-95kybrn0/ext4/base\nHEAD 428208232c72cbfcc729daff205a0ccdc0a37c41\ndetached",
+    "worktree_list_before_remove": "worktree /home/runner/work/smolrunner/smolrunner\nHEAD 428208232c72cbfcc729daff205a0ccdc0a37c41\nbranch refs/heads/research/github-arm-overlay-cleanup-lifecycle\n\nworktree /home/runner/work/_temp/smolrunner-overlay-cleanup-95kybrn0/ext4/base\nHEAD 428208232c72cbfcc729daff205a0ccdc0a37c41\ndetached\n\nworktree /home/runner/work/_temp/smolrunner-overlay-cleanup-95kybrn0/ext4/target\nHEAD 428208232c72cbfcc729daff205a0ccdc0a37c41\ndetached"
+  }
+}
