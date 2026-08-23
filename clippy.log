@@ -1,0 +1,53 @@
+    Checking typenum v1.20.1
+    Checking utf8parse v0.2.2
+    Checking serde_core v1.0.229
+    Checking anstyle-query v1.1.5
+    Checking is_terminal_polyfill v1.70.2
+    Checking anstyle-parse v1.0.0
+    Checking colorchoice v1.0.5
+    Checking anstyle v1.0.14
+    Checking libc v0.2.189
+    Checking anstream v1.0.0
+    Checking strsim v0.11.1
+    Checking hashbrown v0.17.1
+    Checking generic-array v0.14.7
+    Checking clap_lex v1.1.0
+    Checking itoa v1.0.18
+    Checking equivalent v1.0.2
+    Checking clap_builder v4.6.2
+    Checking indexmap v2.14.0
+    Checking block-buffer v0.10.4
+    Checking crypto-common v0.1.7
+    Checking digest v0.10.7
+    Checking cpufeatures v0.2.17
+    Checking zmij v1.0.23
+    Checking ryu v1.0.23
+    Checking memchr v2.8.3
+    Checking bitflags v2.13.1
+    Checking cfg-if v1.0.4
+    Checking unsafe-libyaml-norway v0.2.15
+    Checking serde v1.0.229
+    Checking linux-raw-sys v0.12.1
+    Checking serde_json v1.0.151
+    Checking rustix v1.1.4
+    Checking serde_norway v0.9.42
+    Checking clap v4.6.4
+    Checking sha2 v0.10.9
+    Checking zeroize v1.9.0
+    Checking smolrunner v0.1.0 (/home/runner/work/smolrunner/smolrunner)
+error[E0308]: mismatched types
+   --> src/trusted_overlay_mount_plan.rs:660:21
+    |
+660 |         mtime_nsec: stat.st_mtime_nsec,
+    |                     ^^^^^^^^^^^^^^^^^^ expected `i64`, found `u64`
+
+error[E0308]: mismatched types
+   --> src/trusted_overlay_mount_plan.rs:662:21
+    |
+662 |         ctime_nsec: stat.st_ctime_nsec,
+    |                     ^^^^^^^^^^^^^^^^^^ expected `i64`, found `u64`
+
+For more information about this error, try `rustc --explain E0308`.
+error: could not compile `smolrunner` (lib) due to 2 previous errors
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `smolrunner` (lib test) due to 2 previous errors
