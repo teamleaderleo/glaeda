@@ -1,0 +1,86 @@
+name: Research ARM OverlayFS cleanup lifecycle
+
+on:
+  push:
+    branches:
+      - research/github-arm-overlay-cleanup-lifecycle
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  lifecycle:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+      - name: Prove copied-dotgit overlay lifecycle
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, shutil, subprocess, tempfile, time
+          from pathlib import Path
+
+          repo=Path(os.environ['GITHUB_WORKSPACE']).resolve()
+          root=Path(tempfile.mkdtemp(prefix='smolrunner-overlay-cleanup-',dir=Path(os.environ['RUNNER_TEMP'])))
+          image=root/'ext4.img'; volume=root/'ext4'; volume.mkdir(); out=repo/'smolrunner-github-arm-overlay-cleanup-lifecycle.json'
+          mounted=False; base_registered=False; target_registered=False
+          def run(argv,cwd=None):
+              start=time.monotonic_ns(); p=subprocess.run(argv,cwd=cwd,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=False)
+              return {'argv':argv,'returncode':p.returncode,'elapsed_ms':round((time.monotonic_ns()-start)/1_000_000,3),'stdout':p.stdout.strip()[:8192],'stderr':p.stderr.strip()[:8192]}
+          def idx(cwd):
+              r=run(['git','rev-parse','--git-path','index'],cwd); assert r['returncode']==0,r
+              p=Path(r['stdout']); return (p if p.is_absolute() else cwd/p).resolve()
+          def proof(cwd):
+              a=run(['git','--no-optional-locks','diff-files','--quiet'],cwd); b=run(['git','--no-optional-locks','diff-index','--quiet','HEAD','--'],cwd)
+              return {'returncode':0 if a['returncode']==0 and b['returncode']==0 else 1,'diff_files':a,'diff_index':b}
+          result={'schema_version':1}
+          try:
+              assert run(['sudo','-n','true'])['returncode']==0
+              assert run(['truncate','-s','1G',str(image)])['returncode']==0
+              assert run(['sudo','mkfs.ext4','-F','-q',str(image)])['returncode']==0
+              assert run(['sudo','mount','-o','loop',str(image),str(volume)])['returncode']==0
+              run(['sudo','chown',f'{os.getuid()}:{os.getgid()}',str(volume)])
+              base=volume/'base'; upper=volume/'upper'; work=volume/'work'; target=volume/'target'; upper.mkdir(); work.mkdir()
+              base_add=run(['git','worktree','add','--detach',str(base),'HEAD'],repo); assert base_add['returncode']==0,base_add; base_registered=True
+              refresh=run(['git','update-index','--refresh'],base); assert refresh['returncode']==0,refresh
+              source_index=idx(base).read_bytes(); source_proof=proof(base); assert source_proof['returncode']==0,source_proof
+              target_add=run(['git','worktree','add','--detach','--no-checkout',str(target),'HEAD'],repo); assert target_add['returncode']==0,target_add; target_registered=True
+              hidden_dotgit=(target/'.git').read_bytes(); (upper/'.git').write_bytes(hidden_dotgit)
+              hidden_still_present=(target/'.git').read_bytes()==hidden_dotgit
+              mount=run(['sudo','mount','-t','overlay','overlay','-o',f'lowerdir={base},upperdir={upper},workdir={work}',str(target)]); assert mount['returncode']==0,mount; mounted=True
+              merged_dotgit_matches=(target/'.git').read_bytes()==hidden_dotgit
+              dest=idx(target); tmp=dest.with_name(dest.name+'.smolrunner-tmp'); tmp.write_bytes(source_index); os.replace(tmp,dest)
+              ready_proof=proof(target)
+              with (target/'Cargo.toml').open('ab') as h: h.write(b'\n# overlay-cleanup-lifecycle\n')
+              dirty=run(['git','--no-optional-locks','diff-files','--quiet'],target)
+              unmount=run(['sudo','umount',str(target)]); assert unmount['returncode']==0,unmount; mounted=False
+              revealed_dotgit_matches=(target/'.git').read_bytes()==hidden_dotgit
+              target_admin_before_remove=run(['git','worktree','list','--porcelain'],repo)
+              remove=run(['git','worktree','remove','--force',str(target)],repo)
+              if remove['returncode']==0: target_registered=False
+              target_admin_after_remove=run(['git','worktree','list','--porcelain'],repo)
+              target_absent=not target.exists()
+              target_registration_absent=str(target) not in target_admin_after_remove['stdout']
+              result.update({'base':{'add':base_add,'refresh':refresh,'proof':source_proof},'target':{'add':target_add,'hidden_dotgit_preserved_before_mount':hidden_still_present,'mount':mount,'merged_dotgit_matches':merged_dotgit_matches,'ready_proof':ready_proof,'dirty_diff_files_returncode':dirty['returncode'],'unmount':unmount,'revealed_dotgit_matches':revealed_dotgit_matches,'remove':remove,'target_absent':target_absent,'registration_absent':target_registration_absent,'worktree_list_before_remove':target_admin_before_remove['stdout'],'worktree_list_after_remove':target_admin_after_remove['stdout']}})
+              out.write_text(json.dumps(result,indent=2,sort_keys=True)+'\n',encoding='utf-8'); print(json.dumps(result,indent=2,sort_keys=True))
+          finally:
+              if mounted: run(['sudo','umount',str(volume/'target')])
+              if target_registered: run(['git','worktree','remove','--force',str(volume/'target')],repo)
+              if base_registered: run(['git','worktree','remove','--force',str(volume/'base')],repo)
+              run(['sudo','umount',str(volume)]); shutil.rmtree(root,ignore_errors=True)
+          PY
+      - name: Persist result
+        if: always()
+        run: |
+          set -euo pipefail
+          test -f smolrunner-github-arm-overlay-cleanup-lifecycle.json
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -C research/results-smolrunner-github-arm-overlay-cleanup-lifecycle
+          git add -- smolrunner-github-arm-overlay-cleanup-lifecycle.json
+          git commit -m 'research: record OverlayFS cleanup lifecycle'
+          git push --force origin HEAD:refs/heads/research/results-smolrunner-github-arm-overlay-cleanup-lifecycle
