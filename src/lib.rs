@@ -285,6 +285,9 @@ pub mod state_document;
 pub mod state_store;
 #[cfg(target_os = "linux")]
 pub mod subordinate_id;
+#[cfg(target_os = "linux")]
+/// Read-only exact prerequisite observation and sealed intent for trusted OverlayFS mounts.
+pub mod trusted_overlay_mount_plan;
 /// Pure authority and lifecycle core for trusted resident OverlayFS task views.
 pub mod trusted_overlay_task_view;
 /// Descriptor-relative trusted producer for runner workspace and cache identity receipts.
