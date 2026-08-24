@@ -1,0 +1,74 @@
+name: Research compile exact rustix OverlayFS new-mount API
+
+on:
+  push:
+    branches:
+      - research/rustix-overlay-mount-compile
+
+permissions:
+  contents: write
+
+jobs:
+  compile:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: true
+          show-progress: false
+      - name: Compile exact API usage
+        shell: bash
+        run: |
+          set -u
+          cat >tests/rustix_overlay_mount_api_compile.rs <<'RS'
+          #![cfg(target_os = "linux")]
+          #![allow(dead_code)]
+
+          use std::os::fd::BorrowedFd;
+          use rustix::mount::{
+              FsMountFlags, FsOpenFlags, MountAttrFlags, MoveMountFlags, fsconfig_create,
+              fsconfig_set_fd, fsmount, fsopen, move_mount,
+          };
+
+          fn compile_overlay_transaction(
+              lower: BorrowedFd<'_>,
+              upper: BorrowedFd<'_>,
+              work: BorrowedFd<'_>,
+              merged: BorrowedFd<'_>,
+          ) -> rustix::io::Result<()> {
+              let fs = fsopen("overlay", FsOpenFlags::CLOEXEC)?;
+              fsconfig_set_fd(&fs, "lowerdir+", lower)?;
+              fsconfig_set_fd(&fs, "upperdir", upper)?;
+              fsconfig_set_fd(&fs, "workdir", work)?;
+              fsconfig_create(&fs)?;
+              let mount = fsmount(
+                  &fs,
+                  FsMountFlags::CLOEXEC,
+                  MountAttrFlags::NODEV | MountAttrFlags::NOSUID,
+              )?;
+              move_mount(
+                  &mount,
+                  "",
+                  merged,
+                  "",
+                  MoveMountFlags::F_EMPTY_PATH | MoveMountFlags::T_EMPTY_PATH,
+              )?;
+              Ok(())
+          }
+          RS
+          cargo check --locked --test rustix_overlay_mount_api_compile >/tmp/check.out 2>/tmp/check.err; rc=$?
+          printf '{"check_rc":%s}\n' "$rc" >/tmp/status.json
+          exit 0
+      - name: Publish result
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name teamleaderleo; git config user.email cheerleaderleo@outlook.com
+          OUT=research/results-rustix-overlay-mount-compile
+          git checkout --orphan "$OUT"; git rm -rf . >/dev/null 2>&1 || true
+          cp /tmp/status.json ./status.json
+          cp /tmp/check.out ./check.out
+          cp /tmp/check.err ./check.err
+          cp tests/rustix_overlay_mount_api_compile.rs ./probe.rs
+          git add .; git commit -m 'Record exact rustix OverlayFS mount API compile result'
+          git push --force origin HEAD:"$OUT"
