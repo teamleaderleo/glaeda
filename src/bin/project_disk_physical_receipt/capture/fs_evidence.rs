@@ -43,15 +43,25 @@ impl HeldDiskDirectory {
         for held in &mut self.entries {
             entries.push(held.finish(&self.directory)?);
         }
-        entries.sort_by(|left, right| left.name_hex.cmp(&right.name_hex));
-        let after = snapshot(&fs::fstat(&self.directory).map_err(|_| filesystem_error())?)?;
-        if !same_entry_binding(&self.before, &after) {
+
+        let after_names = read_directory_entry_names(&self.directory)?;
+        if !after_names
+            .iter()
+            .map(Vec::as_slice)
+            .eq(self.entries.iter().map(|entry| entry.name.as_slice()))
+        {
             return Err(changed());
         }
+        let after = snapshot(&fs::fstat(&self.directory).map_err(|_| filesystem_error())?)?;
+        if self.before != after {
+            return Err(changed());
+        }
+
         Ok(ProjectDiskDirectoryEvidenceDocument {
             path: String::new(),
             before: self.before,
             entries,
+            after_entry_names_hex: after_names.iter().map(|name| encode_hex(name)).collect(),
             after,
         })
     }
@@ -75,12 +85,12 @@ impl HeldEntry {
         let after_stat = fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW)
             .map_err(|_| filesystem_error())?;
         let after = snapshot(&after_stat)?;
-        if !same_entry_binding(&self.before, &after) {
+        if !stable_entry_observation(self.kind, &self.before, &after) {
             return Err(changed());
         }
         if let Some(descriptor) = &self.descriptor {
             let held_after = snapshot(&fs::fstat(descriptor).map_err(|_| filesystem_error())?)?;
-            if !same_entry_binding(&self.before, &held_after) {
+            if !stable_entry_observation(self.kind, &self.before, &held_after) {
                 return Err(changed());
             }
         }
@@ -126,21 +136,11 @@ pub(super) fn capture_held_disk_directory(
     {
         return Err(filesystem_error());
     }
-    let mut stream = Dir::read_from(&directory).map_err(|_| filesystem_error())?;
-    let mut entries = Vec::new();
-    for entry in &mut stream {
-        let entry = entry.map_err(|_| filesystem_error())?;
-        let name = entry.file_name().to_bytes();
-        if name == b"." || name == b".." {
-            continue;
-        }
-        if entries.len() >= MAX_PROJECT_DISK_RECEIPT_ENTRY_COUNT {
-            return Err(filesystem_error());
-        }
-        entries.push(capture_held_entry(&directory, name)?);
-    }
-    if entries.is_empty() {
-        return Err(filesystem_error());
+
+    let names = read_directory_entry_names(&directory)?;
+    let mut entries = Vec::with_capacity(names.len());
+    for name in names {
+        entries.push(capture_held_entry(&directory, &name)?);
     }
     Ok(HeldDiskDirectory {
         directory,
@@ -149,13 +149,41 @@ pub(super) fn capture_held_disk_directory(
     })
 }
 
+fn read_directory_entry_names(
+    directory: &OwnedFd,
+) -> Result<Vec<Vec<u8>>, ProjectDiskPhysicalCaptureError> {
+    let mut stream = Dir::read_from(directory).map_err(|_| filesystem_error())?;
+    let mut names = Vec::new();
+    for entry in &mut stream {
+        let entry = entry.map_err(|_| filesystem_error())?;
+        let name = entry.file_name().to_bytes();
+        if name == b"." || name == b".." {
+            continue;
+        }
+        if names.len() >= MAX_PROJECT_DISK_RECEIPT_ENTRY_COUNT
+            || name.is_empty()
+            || name.len() > 255
+            || name.contains(&0)
+            || name.contains(&b'/')
+        {
+            return Err(filesystem_error());
+        }
+        names.push(name.to_vec());
+    }
+    if names.is_empty() {
+        return Err(filesystem_error());
+    }
+    names.sort();
+    if names.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(filesystem_error());
+    }
+    Ok(names)
+}
+
 fn capture_held_entry(
     directory: &OwnedFd,
     name: &[u8],
 ) -> Result<HeldEntry, ProjectDiskPhysicalCaptureError> {
-    if name.is_empty() || name.len() > 255 || name.contains(&0) || name.contains(&b'/') {
-        return Err(filesystem_error());
-    }
     let name_os = OsStr::from_bytes(name);
     let before_stat = fs::statat(directory, name_os, AtFlags::SYMLINK_NOFOLLOW)
         .map_err(|_| filesystem_error())?;
@@ -167,7 +195,7 @@ fn capture_held_entry(
             let descriptor = fs::openat(directory, name_os, REGULAR_FILE_FLAGS, Mode::empty())
                 .map_err(|_| filesystem_error())?;
             let held = snapshot(&fs::fstat(&descriptor).map_err(|_| filesystem_error())?)?;
-            if !same_entry_binding(&before, &held) {
+            if !stable_entry_observation(ReceiptDirectoryEntryKind::Regular, &before, &held) {
                 return Err(changed());
             }
             let small_regular_file = if before.logical_bytes
@@ -191,7 +219,7 @@ fn capture_held_entry(
             let descriptor = fs::openat(directory, name_os, DIRECTORY_FLAGS, Mode::empty())
                 .map_err(|_| filesystem_error())?;
             let held = snapshot(&fs::fstat(&descriptor).map_err(|_| filesystem_error())?)?;
-            if !same_entry_binding(&before, &held) {
+            if !stable_entry_observation(ReceiptDirectoryEntryKind::Directory, &before, &held) {
                 return Err(changed());
             }
             Ok(HeldEntry {
@@ -217,6 +245,17 @@ fn capture_held_entry(
             {
                 return Err(filesystem_error());
             }
+            let after_readlink = snapshot(
+                &fs::statat(directory, name_os, AtFlags::SYMLINK_NOFOLLOW)
+                    .map_err(|_| filesystem_error())?,
+            )?;
+            if !stable_entry_observation(
+                ReceiptDirectoryEntryKind::Symlink,
+                &before,
+                &after_readlink,
+            ) {
+                return Err(changed());
+            }
             Ok(HeldEntry {
                 name: name.to_vec(),
                 kind: ReceiptDirectoryEntryKind::Symlink,
@@ -226,14 +265,18 @@ fn capture_held_entry(
                 descriptor: None,
             })
         }
-        _ => Ok(HeldEntry {
-            name: name.to_vec(),
-            kind: ReceiptDirectoryEntryKind::Other,
-            before,
-            symlink_target: None,
-            small_regular_file: None,
-            descriptor: None,
-        }),
+        _ => Err(filesystem_error()),
+    }
+}
+
+fn stable_entry_observation(
+    kind: ReceiptDirectoryEntryKind,
+    before: &ReceiptFilesystemSnapshot,
+    after: &ReceiptFilesystemSnapshot,
+) -> bool {
+    match kind {
+        ReceiptDirectoryEntryKind::Regular => same_entry_binding(before, after),
+        ReceiptDirectoryEntryKind::Directory | ReceiptDirectoryEntryKind::Symlink => before == after,
     }
 }
 
