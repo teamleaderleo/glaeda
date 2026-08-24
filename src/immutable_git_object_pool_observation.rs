@@ -26,8 +26,7 @@ use crate::immutable_git_object_pool_marker::{
 };
 
 pub const IMMUTABLE_GIT_OBJECT_POOL_OBSERVATION_SCHEMA_VERSION: u8 = 1;
-pub const IMMUTABLE_GIT_OBJECT_POOL_MARKER_FILE_NAME: &str =
-    ".smolrunner-git-object-pool-marker";
+pub const IMMUTABLE_GIT_OBJECT_POOL_MARKER_FILE_NAME: &str = ".smolrunner-git-object-pool-marker";
 
 const ROOT_OWNER: (u32, u32) = (0, 0);
 const DIRECTORY_FLAGS: OFlags = OFlags::PATH
@@ -425,8 +424,7 @@ impl BoundMarker {
         {
             return Err(changed());
         }
-        ImmutableGitObjectPoolMarker::decode_and_verify(&first, binding)
-            .map_err(|_| changed())?;
+        ImmutableGitObjectPoolMarker::decode_and_verify(&first, binding).map_err(|_| changed())?;
         Ok(())
     }
 }
@@ -463,8 +461,8 @@ fn split_generation_path(
 }
 
 fn open_directory_path(path: &Path) -> Result<OwnedFd, ImmutableGitObjectPoolObservationError> {
-    let mut current = rustix_fs::open(Path::new("/"), DIRECTORY_FLAGS, Mode::empty())
-        .map_err(map_open)?;
+    let mut current =
+        rustix_fs::open(Path::new("/"), DIRECTORY_FLAGS, Mode::empty()).map_err(map_open)?;
     for component in path.components() {
         match component {
             Component::RootDir => {}
@@ -597,8 +595,8 @@ fn revalidate_optional_info(
     match expected {
         Some(expected) => {
             expected.revalidate_frozen(owner)?;
-            let current = BoundDirectory::open_child(objects, OsStr::new("info"))
-                .map_err(|_| changed())?;
+            let current =
+                BoundDirectory::open_child(objects, OsStr::new("info")).map_err(|_| changed())?;
             if current.snapshot != expected.snapshot {
                 return Err(changed());
             }
@@ -622,11 +620,7 @@ fn require_nested_alternates_absent(
     let Some(info) = info else {
         return Ok(());
     };
-    match rustix_fs::statat(
-        info.fd.as_fd(),
-        "alternates",
-        AtFlags::SYMLINK_NOFOLLOW,
-    ) {
+    match rustix_fs::statat(info.fd.as_fd(), "alternates", AtFlags::SYMLINK_NOFOLLOW) {
         Err(Errno::NOENT) => Ok(()),
         Ok(_) => Err(nested_alternates()),
         Err(_) => Err(io_error()),
@@ -772,8 +766,8 @@ mod tests {
     use crate::project_disk_lease::{ProjectDiskGeneration, ProjectDiskId};
 
     use super::{
-        IMMUTABLE_GIT_OBJECT_POOL_MARKER_FILE_NAME, ImmutableGitObjectPoolObservationErrorKind,
-        ImmutableGitObjectPoolObservationDisposition, observe_with_owner,
+        IMMUTABLE_GIT_OBJECT_POOL_MARKER_FILE_NAME, ImmutableGitObjectPoolObservationDisposition,
+        ImmutableGitObjectPoolObservationErrorKind, observe_with_owner,
     };
 
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
@@ -846,7 +840,9 @@ mod tests {
 
         fn thaw_known_paths(&self) {
             for directory in [
-                self.pool.with_file_name("generation-old").join("objects/info"),
+                self.pool
+                    .with_file_name("generation-old")
+                    .join("objects/info"),
                 self.pool.with_file_name("generation-old").join("objects"),
                 self.pool.with_file_name("generation-old"),
                 self.info.clone(),
