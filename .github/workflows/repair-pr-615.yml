@@ -1,0 +1,52 @@
+name: Repair dormant PR 615 seams
+
+on:
+  pull_request:
+    branches: [tmp/615-dormant-seam-repair-base]
+    types: [opened, reopened, synchronize, edited]
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    if: github.event.pull_request.head.ref == 'caterpillar/588-guest-control-invocation-plan'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out PR head
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: caterpillar/588-guest-control-invocation-plan
+          persist-credentials: true
+          fetch-depth: 0
+      - name: Mark only deferred private seams as intentionally dormant
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('src/trusted_guest_control_invocation_plan.rs')
+          text = path.read_text()
+          replacements = [
+              ('const MAX_PRIVATE_PATH_BYTES: usize = 1_024;', '#[allow(dead_code)]\nconst MAX_PRIVATE_PATH_BYTES: usize = 1_024;'),
+              ('    #[allow(clippy::too_many_arguments)]\n    pub(crate) fn from_verified(', '    #[allow(dead_code, clippy::too_many_arguments)]\n    pub(crate) fn from_verified('),
+              ('    command: CommandSpec,\n    stdin: Vec<u8>,', '    #[allow(dead_code)]\n    command: CommandSpec,\n    #[allow(dead_code)]\n    stdin: Vec<u8>,'),
+              ('    #[must_use]\n    pub(crate) const fn command(&self) -> &CommandSpec {', '    #[must_use]\n    #[allow(dead_code)]\n    pub(crate) const fn command(&self) -> &CommandSpec {'),
+              ('    #[must_use]\n    pub(crate) fn stdin(&self) -> &[u8] {', '    #[must_use]\n    #[allow(dead_code)]\n    pub(crate) fn stdin(&self) -> &[u8] {'),
+              ('fn validate_private_absolute_path(', '#[allow(dead_code)]\nfn validate_private_absolute_path('),
+              ('const fn invalid_target() -> TrustedGuestControlInvocationPlanError {', '#[allow(dead_code)]\nconst fn invalid_target() -> TrustedGuestControlInvocationPlanError {'),
+          ]
+          for old, new in replacements:
+              if text.count(old) != 1:
+                  raise SystemExit(f'unexpected dormant-seam match count for {old!r}: {text.count(old)}')
+              text = text.replace(old, new, 1)
+          path.write_text(text)
+          PY
+          rustup toolchain install 1.97.1 --profile minimal --component rustfmt,clippy --no-self-update
+          cargo +1.97.1 fmt --all
+          cargo +1.97.1 clippy --locked --all-targets --all-features -- -D warnings
+          git diff --check
+          git config user.name 'caterpillar-repair'
+          git config user.email 'actions@users.noreply.github.com'
+          git add src/trusted_guest_control_invocation_plan.rs
+          git commit -m 'Mark deferred guest invocation seams dormant'
+          git push origin HEAD:caterpillar/588-guest-control-invocation-plan
