@@ -5,6 +5,8 @@
 //! single-link candidate files, source/candidate object-inode disjointness, bounded logical bytes,
 //! and absence of nested Git alternates. It deliberately does not sum `st_blocks` or claim unique
 //! physical allocation on reflink-capable filesystems.
+//! The caller must keep the producer process group quiescent and keep the candidate outside
+//! producer/task traversal authority for the entire audit and every later privileged publication step.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -19,7 +21,7 @@ pub const IMMUTABLE_GIT_OBJECT_POOL_GENERATION_AUDIT_SCHEMA_VERSION: u8 = 1;
 pub const MAX_IMMUTABLE_GIT_OBJECT_POOL_AUDIT_ENTRIES: u64 = 2_000_000;
 pub const MAX_IMMUTABLE_GIT_OBJECT_POOL_AUDIT_DEPTH: u16 = 64;
 
-const DIRECTORY_FLAGS: OFlags = OFlags::PATH
+const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::DIRECTORY)
     .union(OFlags::NOFOLLOW)
     .union(OFlags::CLOEXEC);
@@ -169,6 +171,8 @@ impl std::error::Error for ImmutableGitObjectPoolGenerationAuditError {}
 /// semantics, rejects symlinks and special entries, and revalidates directory/file identities while
 /// walking. The candidate must have an `objects/` directory, every candidate regular file must have
 /// one link, and no candidate object inode may equal a producer object inode.
+/// The caller must already have ended the producer process group and revoked producer/task path
+/// traversal to the candidate; that quiescence must remain in force through root ownership/freeze.
 ///
 /// # Errors
 ///
