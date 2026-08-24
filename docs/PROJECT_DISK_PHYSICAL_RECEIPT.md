@@ -1,6 +1,6 @@
 # Project-disk physical observation receipt
 
-Status: read-only acceptance prerequisite for #565 P2  
+Status: read-only acceptance prerequisite for #565 P2
 Receipt schema: `smolrunner-project-disk-physical-observation` v1
 
 ## Purpose
