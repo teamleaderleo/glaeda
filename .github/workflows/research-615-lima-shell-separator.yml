@@ -21,6 +21,7 @@ jobs:
       - name: Harden and verify fixed guest command boundary
         shell: bash
         run: |
+          # Research-only proof; the product branch receives only the verified Rust blob.
           set -euo pipefail
           python3 - <<'PY'
           from pathlib import Path
