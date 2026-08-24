@@ -130,6 +130,7 @@ pub enum TrustedProjectFilesystemGuestObservationErrorKind {
     InvalidInput,
     MountinfoMalformed,
     MountpointAmbiguous,
+    MountRootMismatch,
     DeviceMismatch,
     FilesystemMismatch,
     MountPolicyMismatch,
@@ -176,15 +177,17 @@ impl std::error::Error for TrustedProjectFilesystemGuestObservationError {}
 /// Correlate one held project-root descriptor observation with one exact mountinfo row.
 ///
 /// The Linux `dev_t` split and reviewed mountinfo escape handling intentionally match the #618
-/// physical receipt validator. Exactly one row must name `expected_mountpoint`; its major/minor must
-/// equal the supplied descriptor's `st_dev`, its filesystem type must match `filesystem`, and the
-/// visible project filesystem must be writable. The nonzero project-root inode is retained privately
-/// so a later reopen can prove the exact `(st_dev, st_ino)` root identity again.
+/// physical receipt validator. Exactly one row must name `expected_mountpoint`; its mountinfo root
+/// must be `/`, its major/minor must equal the supplied descriptor's `st_dev`, its filesystem type
+/// must match `filesystem`, and the visible project filesystem must be writable. The nonzero
+/// project-root inode is retained privately so a later reopen can prove the exact `(st_dev, st_ino)`
+/// root identity again.
 ///
 /// # Errors
 ///
-/// Returns a bounded refusal for invalid root identity, malformed/ambiguous mountinfo, device drift,
-/// filesystem-kind drift, read-only mount policy, or an unsafe mountpoint locator.
+/// Returns a bounded refusal for invalid root identity, malformed/ambiguous mountinfo, a non-root
+/// bind/subtree mount, device drift, filesystem-kind drift, read-only mount policy, or an unsafe
+/// mountpoint locator.
 pub fn observe_trusted_project_filesystem_guest(
     filesystem: &ProjectDiskFilesystemBinding,
     observed_filesystem_device: u64,
@@ -225,6 +228,10 @@ pub fn observe_trusted_project_filesystem_guest(
         }
         if matched_mount_id.is_some() {
             return Err(mountpoint_ambiguous());
+        }
+        let mount_root = decode_mountinfo_field(left_fields[3])?;
+        if mount_root != b"/" {
+            return Err(mount_root_mismatch());
         }
 
         let mount_id = parse_decimal(left_fields[0]).ok_or_else(mountinfo_malformed)?;
@@ -390,6 +397,14 @@ const fn mountpoint_ambiguous() -> TrustedProjectFilesystemGuestObservationError
     )
 }
 
+const fn mount_root_mismatch() -> TrustedProjectFilesystemGuestObservationError {
+    error(
+        TrustedProjectFilesystemGuestObservationErrorKind::MountRootMismatch,
+        "project_filesystem_guest_mount_root_mismatch",
+        "project filesystem mountpoint does not expose the accepted filesystem root",
+    )
+}
+
 const fn device_mismatch() -> TrustedProjectFilesystemGuestObservationError {
     error(
         TrustedProjectFilesystemGuestObservationErrorKind::DeviceMismatch,
@@ -460,8 +475,20 @@ mod tests {
             | ((minor & 0xffff_ff00) << 12)
     }
 
+    fn mountinfo_with_root(
+        major: u64,
+        minor: u64,
+        root: &str,
+        mountpoint: &str,
+        options: &str,
+        fs: &str,
+    ) -> Vec<u8> {
+        format!("73 29 {major}:{minor} {root} {mountpoint} {options} - {fs} /dev/vdb rw\n")
+            .into_bytes()
+    }
+
     fn mountinfo(major: u64, minor: u64, mountpoint: &str, options: &str, fs: &str) -> Vec<u8> {
-        format!("73 29 {major}:{minor} / {mountpoint} {options} - {fs} /dev/vdb rw\n").into_bytes()
+        mountinfo_with_root(major, minor, "/", mountpoint, options, fs)
     }
 
     #[test]
@@ -486,6 +513,31 @@ mod tests {
         assert!(!observation.matches_mount_root_identity(device + 1, 44));
         assert!(observation.matches_filesystem_device(device));
         assert!(!observation.matches_filesystem_device(device + 1));
+    }
+
+    #[test]
+    fn same_filesystem_subtree_bind_mount_is_refused() {
+        let device = make_linux_device(8, 17);
+        let info = mountinfo_with_root(
+            8,
+            17,
+            "/nested",
+            "/srv/quarry",
+            "rw,nodev,nosuid",
+            "ext4",
+        );
+        let error = observe_trusted_project_filesystem_guest(
+            &filesystem(ProjectDiskFilesystemKind::Ext4),
+            device,
+            44,
+            b"/srv/quarry",
+            &info,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            TrustedProjectFilesystemGuestObservationErrorKind::MountRootMismatch
+        );
     }
 
     #[test]
