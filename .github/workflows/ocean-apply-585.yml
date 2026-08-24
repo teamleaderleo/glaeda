@@ -1,0 +1,50 @@
+name: Ocean apply 585
+
+on:
+  push:
+    branches:
+      - ocean/immutable-git-pool-observer
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Wire observer module
+        shell: python
+        run: |
+          from pathlib import Path
+          path = Path("src/lib.rs")
+          text = path.read_text()
+          anchor = """/// Pure fixed marker codec for immutable Git object-pool generations.
+          pub mod immutable_git_object_pool_marker;
+          """
+          replacement = anchor + """/// Read-only descriptor-bound ownership observation of immutable Git object-pool generations.
+          #[cfg(target_os = \"linux\")]
+          pub mod immutable_git_object_pool_observation;
+          """
+          if text.count(anchor) != 1:
+              raise SystemExit("immutable Git pool lib.rs anchor changed")
+          path.write_text(text.replace(anchor, replacement, 1))
+      - name: Format and focused test
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all
+          cargo test --locked immutable_git_object_pool_observation
+      - name: Remove one-shot helper and commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm .github/workflows/ocean-apply-585.yml
+          git config user.name "ocean-smolrunner"
+          git config user.email "ocean-smolrunner@users.noreply.github.com"
+          git add src/lib.rs src/immutable_git_object_pool_observation.rs .github/workflows/ocean-apply-585.yml
+          git diff --cached --check
+          git commit -m "Observe immutable Git pool ownership envelope"
+          git push origin HEAD:${GITHUB_REF_NAME}
