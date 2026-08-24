@@ -1,0 +1,38 @@
+name: Research exact locked rustix fsopen API
+
+on:
+  push:
+    branches:
+      - research/rustix-fsopen-api-excerpt
+
+permissions:
+  contents: write
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: true
+          show-progress: false
+      - run: cargo metadata --locked --format-version 1 >/dev/null
+      - name: Capture exact public API
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$(find "${CARGO_HOME:-$HOME/.cargo}/registry/src" -maxdepth 2 -type d -name 'rustix-1.1.4' -print -quit)"
+          test -n "$root"
+          sed -n '1,270p' "$root/src/mount/fsopen.rs" >/tmp/fsopen.rs.txt
+          grep -R -n -E 'pub struct (FsOpenFlags|FsMountFlags|MountAttrFlags|MoveMountFlags)|bitflags!|EMPTY_PATH|NODEV|NOSUID' "$root/src/mount" | head -160 >/tmp/types.txt || true
+      - name: Publish owned excerpt
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name teamleaderleo; git config user.email cheerleaderleo@outlook.com
+          OUT=research/results-rustix-fsopen-api-excerpt
+          git checkout --orphan "$OUT"; git rm -rf . >/dev/null 2>&1 || true
+          cp /tmp/fsopen.rs.txt ./fsopen.rs.txt
+          cp /tmp/types.txt ./types.txt
+          git add .; git commit -m 'Record exact locked rustix fsopen API'
+          git push --force origin HEAD:"$OUT"
