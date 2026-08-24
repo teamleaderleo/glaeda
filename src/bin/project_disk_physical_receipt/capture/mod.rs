@@ -6,19 +6,20 @@ use rustix::fs;
 use serde::Serialize;
 
 use crate::receipt::{
-    DeclaredProjectDiskBindingDocument, ProjectDiskDirectoryEvidenceDocument,
-    ProjectDiskGuestEvidenceDocument, ProjectDiskLimaEvidenceDocument, ProjectDiskPhysicalReceipt,
-    ProjectDiskPhysicalReceiptDocument, ReceiptCommandEvidence,
-    PROJECT_DISK_PHYSICAL_RECEIPT_SCHEMA_VERSION, same_entry_binding, validate_absolute_path,
-    validate_locator, valid_git_commit,
+    DeclaredProjectDiskBindingDocument, PROJECT_DISK_PHYSICAL_RECEIPT_SCHEMA_VERSION,
+    ProjectDiskDirectoryEvidenceDocument, ProjectDiskGuestEvidenceDocument,
+    ProjectDiskLimaEvidenceDocument, ProjectDiskPhysicalReceipt,
+    ProjectDiskPhysicalReceiptDocument, ReceiptCommandEvidence, same_entry_binding,
+    valid_git_commit, validate_absolute_path, validate_locator,
 };
 use smolrunner::lima_host_identity::LimaHostIdentityAdapter;
 use smolrunner::lima_observation::{
     LimaArchitecture, LimaInstanceName, LimaObservationRequest, LimaVmType,
 };
 use smolrunner::process::{CommandSpec, ExecutionRecord, TimedCommandExecutor};
+use smolrunner::project_catalog::ProjectIdentity;
 use smolrunner::project_disk_lease::{
-    ProjectDiskAttachmentGeneration, ProjectDiskGeneration, ProjectDiskId,
+    ProjectDiskAttachmentGeneration, ProjectDiskGeneration, ProjectDiskId, ProjectDiskRevision,
     ResidentSandboxGeneration, ResidentSandboxId,
 };
 
@@ -41,8 +42,10 @@ pub struct ProjectDiskPhysicalCaptureRequest {
     guest_project_mount: PathBuf,
     guest_cache_path: PathBuf,
     limactl_program: PathBuf,
+    project_identity: ProjectIdentity,
     project_disk_id: ProjectDiskId,
     project_disk_generation: ProjectDiskGeneration,
+    project_disk_revision: ProjectDiskRevision,
     attachment_generation: ProjectDiskAttachmentGeneration,
     resident_sandbox_id: ResidentSandboxId,
     resident_sandbox_generation: ResidentSandboxGeneration,
@@ -68,8 +71,10 @@ impl ProjectDiskPhysicalCaptureRequest {
         guest_project_mount: impl Into<PathBuf>,
         guest_cache_path: impl Into<PathBuf>,
         limactl_program: impl Into<PathBuf>,
+        project_identity: impl AsRef<str>,
         project_disk_id: impl AsRef<str>,
         project_disk_generation: u64,
+        project_disk_revision: u64,
         attachment_generation: u64,
         resident_sandbox_id: impl AsRef<str>,
         resident_sandbox_generation: u64,
@@ -93,14 +98,18 @@ impl ProjectDiskPhysicalCaptureRequest {
         validate_locator(&disk_name, "disk_name").map_err(|_| invalid_request())?;
         let resident_sandbox_instance = LimaInstanceName::parse(resident_sandbox_instance.as_ref())
             .map_err(|_| invalid_request())?;
+        let project_identity =
+            ProjectIdentity::parse(project_identity.as_ref()).map_err(|_| invalid_request())?;
         let project_disk_id =
             ProjectDiskId::parse(project_disk_id.as_ref()).map_err(|_| invalid_request())?;
         let project_disk_generation =
             ProjectDiskGeneration::new(project_disk_generation).map_err(|_| invalid_request())?;
+        let project_disk_revision =
+            ProjectDiskRevision::new(project_disk_revision).map_err(|_| invalid_request())?;
         let attachment_generation = ProjectDiskAttachmentGeneration::new(attachment_generation)
             .map_err(|_| invalid_request())?;
-        let resident_sandbox_id =
-            ResidentSandboxId::parse(resident_sandbox_id.as_ref()).map_err(|_| invalid_request())?;
+        let resident_sandbox_id = ResidentSandboxId::parse(resident_sandbox_id.as_ref())
+            .map_err(|_| invalid_request())?;
         let resident_sandbox_generation =
             ResidentSandboxGeneration::new(resident_sandbox_generation)
                 .map_err(|_| invalid_request())?;
@@ -117,8 +126,10 @@ impl ProjectDiskPhysicalCaptureRequest {
             guest_project_mount,
             guest_cache_path,
             limactl_program,
+            project_identity,
             project_disk_id,
             project_disk_generation,
+            project_disk_revision,
             attachment_generation,
             resident_sandbox_id,
             resident_sandbox_generation,
@@ -134,8 +145,10 @@ impl fmt::Debug for ProjectDiskPhysicalCaptureRequest {
             .field("repo_commit", &self.repo_commit)
             .field("disk_name", &self.disk_name)
             .field("resident_sandbox_instance", &self.resident_sandbox_instance)
+            .field("project_identity", &self.project_identity)
             .field("project_disk_id", &self.project_disk_id)
             .field("project_disk_generation", &self.project_disk_generation)
+            .field("project_disk_revision", &self.project_disk_revision)
             .field("attachment_generation", &self.attachment_generation)
             .field("resident_sandbox_id", &self.resident_sandbox_id)
             .field(
@@ -312,8 +325,10 @@ pub fn capture_project_disk_physical_receipt(
         repo_commit: request.repo_commit.clone(),
         captured_at_unix_millis,
         declared_binding: DeclaredProjectDiskBindingDocument {
+            project_identity: request.project_identity.as_str().to_owned(),
             project_disk_id: request.project_disk_id.as_str().to_owned(),
             project_disk_generation: request.project_disk_generation.get(),
+            project_disk_revision: request.project_disk_revision.get(),
             attachment_generation: request.attachment_generation.get(),
             resident_sandbox_id: request.resident_sandbox_id.as_str().to_owned(),
             resident_sandbox_generation: request.resident_sandbox_generation.get(),
