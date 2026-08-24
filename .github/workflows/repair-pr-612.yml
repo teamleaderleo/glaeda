@@ -1,4 +1,4 @@
-name: Repair PR 612
+name: Format PR 612
 
 on:
   pull_request:
@@ -10,7 +10,7 @@ permissions:
   contents: write
 
 jobs:
-  repair:
+  format:
     if: github.event.pull_request.head.ref == 'caterpillar/588-guest-control-protocol'
     runs-on: ubuntu-24.04
     steps:
@@ -19,29 +19,17 @@ jobs:
         with:
           ref: caterpillar/588-guest-control-protocol
           persist-credentials: true
-          fetch-depth: 0
-      - name: Apply localized protocol lint exception and clean temporary head files
+      - name: Format exact product bytes
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-          path = Path('src/trusted_guest_control_protocol.rs')
-          text = path.read_text()
-          public = '''#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]\n#[serde(rename_all = "snake_case")]\npub enum TrustedGuestControlRecoveryDebt {'''
-          public_replacement = '''#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]\n#[allow(clippy::enum_variant_names)]\n#[serde(rename_all = "snake_case")]\npub enum TrustedGuestControlRecoveryDebt {'''
-          private = '''#[derive(Debug, Clone, Copy, Serialize, Deserialize)]\n#[serde(rename_all = "snake_case")]\nenum RecoveryDebtWire {'''
-          private_replacement = '''#[derive(Debug, Clone, Copy, Serialize, Deserialize)]\n#[allow(clippy::enum_variant_names)]\n#[serde(rename_all = "snake_case")]\nenum RecoveryDebtWire {'''
-          if text.count(public) != 1 or text.count(private) != 1:
-              raise SystemExit('unexpected recovery debt enum layout')
-          text = text.replace(public, public_replacement, 1).replace(private, private_replacement, 1)
-          path.write_text(text)
-          PY
-          rm -f .github/workflows/tmp-clippy-612.yml .tmp-clippy-trigger-612
           rustup toolchain install 1.97.1 --profile minimal --component rustfmt --no-self-update
           cargo +1.97.1 fmt --all
           git diff --check
-          git config user.name 'caterpillar-repair'
+          if git diff --quiet --exit-code; then
+            exit 0
+          fi
+          git config user.name 'caterpillar-format'
           git config user.email 'actions@users.noreply.github.com'
-          git add -A
-          git commit -m 'Keep guest recovery debt vocabulary explicit'
+          git add src/trusted_guest_control_protocol.rs src/lib.rs
+          git commit -m 'Format trusted guest-control protocol'
           git push origin HEAD:caterpillar/588-guest-control-protocol
