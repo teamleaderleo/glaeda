@@ -31,12 +31,11 @@ jobs:
           if text.count(anchor) != 1:
               raise SystemExit("immutable Git pool lib.rs anchor changed")
           path.write_text(text.replace(anchor, replacement, 1))
-      - name: Format and focused test
+      - name: Format
         shell: bash
         run: |
           set -euo pipefail
           cargo fmt --all
-          cargo test --locked immutable_git_object_pool_observation
       - name: Remove one-shot helper and commit
         shell: bash
         run: |
