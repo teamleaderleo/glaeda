@@ -1,0 +1,71 @@
+name: Retain complete filesystem identity in format receipt
+
+on:
+  push:
+    branches:
+      - chatgpt/645-format-receipt-complete-identity
+
+permissions:
+  contents: write
+
+jobs:
+  bind:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: chatgpt/645-format-receipt-complete-identity
+          fetch-depth: 0
+          show-progress: false
+      - name: Carry UUID, features, and bytes into durable format receipt
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('src/project_disk_filesystem/format_state.rs')
+          text = path.read_text()
+
+          old = '''pub struct ProjectDiskFormatReceipt {\n    transaction_generation: ProjectDiskFormatTransactionGeneration,\n    filesystem: ProjectDiskFilesystemBinding,\n    format_plan_digest: Sha256Digest,'''
+          new = '''pub struct ProjectDiskFormatReceipt {\n    transaction_generation: ProjectDiskFormatTransactionGeneration,\n    filesystem: ProjectDiskFilesystemBinding,\n    filesystem_uuid: ProjectDiskFilesystemUuid,\n    feature_policy_digest: Sha256Digest,\n    expected_logical_bytes: u64,\n    format_plan_digest: Sha256Digest,'''
+          if old in text:
+              text = text.replace(old, new, 1)
+
+          getter_anchor = '''    #[must_use]\n    pub const fn format_plan_digest(&self) -> &Sha256Digest {'''
+          getters = '''    #[must_use]\n    pub const fn filesystem_uuid(&self) -> &ProjectDiskFilesystemUuid {\n        &self.filesystem_uuid\n    }\n\n    #[must_use]\n    pub const fn feature_policy_digest(&self) -> &Sha256Digest {\n        &self.feature_policy_digest\n    }\n\n    #[must_use]\n    pub const fn expected_logical_bytes(&self) -> u64 {\n        self.expected_logical_bytes\n    }\n\n    #[must_use]\n    pub const fn physical_identity_digest(&self) -> &Sha256Digest {\n        &self.physical_identity_digest\n    }\n\n    #[must_use]\n    pub const fn backing_identity_digest(&self) -> &Sha256Digest {\n        &self.backing_identity_digest\n    }\n\n'''
+          if getters not in text:
+              if getter_anchor not in text:
+                  raise SystemExit('format receipt getter anchor missing')
+              text = text.replace(getter_anchor, getters + getter_anchor, 1)
+
+          old_init = '''        let receipt = ProjectDiskFormatReceipt {\n            transaction_generation: checkpoint.transaction_generation,\n            filesystem: checkpoint.plan.filesystem().clone(),\n            format_plan_digest: checkpoint.plan.plan_digest().clone(),'''
+          new_init = '''        let receipt = ProjectDiskFormatReceipt {\n            transaction_generation: checkpoint.transaction_generation,\n            filesystem: checkpoint.plan.filesystem().clone(),\n            filesystem_uuid: checkpoint.plan.filesystem_uuid().clone(),\n            feature_policy_digest: checkpoint.plan.feature_policy_digest().clone(),\n            expected_logical_bytes: checkpoint.plan.expected_logical_bytes(),\n            format_plan_digest: checkpoint.plan.plan_digest().clone(),'''
+          if old_init in text:
+              text = text.replace(old_init, new_init, 1)
+
+          test_anchor = '''        assert_eq!(receipt.filesystem().filesystem_generation().get(), 7);\n        assert_eq!(receipt.transaction_generation().get(), 1);'''
+          test_new = '''        assert_eq!(receipt.filesystem().filesystem_generation().get(), 7);\n        assert_eq!(\n            receipt.filesystem_uuid().as_str(),\n            "01234567-89ab-cdef-0123-456789abcdef"\n        );\n        assert_eq!(receipt.feature_policy_digest(), &digest('c'));\n        assert_eq!(receipt.expected_logical_bytes(), 1_073_741_824);\n        assert_eq!(receipt.physical_identity_digest(), &digest('a'));\n        assert_eq!(receipt.backing_identity_digest(), &digest('b'));\n        assert_eq!(receipt.transaction_generation().get(), 1);'''
+          if test_anchor in text:
+              text = text.replace(test_anchor, test_new, 1)
+
+          path.write_text(text)
+          PY
+      - name: Format and focused tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.97.1 --profile minimal --component rustfmt --no-self-update
+          cargo fmt --all
+          cargo test --locked project_disk_filesystem::format_state
+      - name: Remove helper and publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm .github/workflows/bind-645-format-receipt-identity.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "#645 retain complete filesystem identity in format receipt"
+          git push origin HEAD:chatgpt/645-format-receipt-complete-identity
