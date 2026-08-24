@@ -1,0 +1,62 @@
+name: Seal raw P4 attach authority constructor
+
+on:
+  push:
+    branches:
+      - chatgpt/645-attach-state-model
+
+permissions:
+  contents: write
+
+jobs:
+  seal:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: chatgpt/645-attach-state-model
+          fetch-depth: 0
+          show-progress: false
+      - name: Remove production raw formatted-detached constructor
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('src/project_disk_attachment_state.rs')
+          text = path.read_text()
+          old = '''    #[allow(dead_code)]\n    pub(crate) fn from_verified('''
+          new = '''    #[cfg(test)]\n    fn for_test('''
+          if text.count(old) != 1:
+              raise SystemExit('unexpected formatted-detached constructor')
+          text = text.replace(old, new, 1)
+          if text.count('ProjectDiskFormattedDetachedAuthority::from_verified(') != 1:
+              raise SystemExit('unexpected formatted-detached test call count')
+          text = text.replace(
+              'ProjectDiskFormattedDetachedAuthority::from_verified(',
+              'ProjectDiskFormattedDetachedAuthority::for_test(',
+              1,
+          )
+          path.write_text(text)
+          PY
+      - name: Format and focused tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.97.1 --profile minimal --component rustfmt --no-self-update
+          cargo fmt --all
+          cargo test --locked project_disk_attachment_state
+      - name: Remove helpers and publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f .github/workflows/wire-645-attach-state.yml
+          rm -f .github/workflows/wire-645-attach-state-v2.yml
+          rm .github/workflows/seal-645-attach-authority.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "#645 seal raw project-disk attach authority"
+          git push origin HEAD:chatgpt/645-attach-state-model
