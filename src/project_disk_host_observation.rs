@@ -7,6 +7,11 @@
 //! is the first layer allowed to bind these observed identities to a SmolRunner project-disk
 //! generation.
 
+// The private child temporarily retains the pre-repair P1 projection implementation so the proven
+// descriptor/parser code can land without a simultaneous 1,800-line rewrite. It is unreachable to
+// sibling/product modules through this facade and will be deleted once P3 owns the replacement
+// provenance seam.
+#[allow(dead_code)]
 mod raw;
 
 use std::fmt;
