@@ -1,0 +1,84 @@
+name: Ocean refresh M6 handoff
+
+on:
+  push:
+    branches:
+      - ocean/m6-hot-runtime-handoff-refresh
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+      - name: Refresh settled M6 findings
+        shell: python
+        run: |
+          from pathlib import Path
+          p = Path("docs/M6_HOT_RUNTIME_HANDOFF.md")
+          s = p.read_text()
+
+          replacements = [
+              (
+                  "- **Git task identity:** private task Git metadata backed by an immutable resident object generation, once the secure alternates handoff is fully proven;",
+                  "- **Git task identity:** private task Git metadata backed by an immutable resident object generation through one exact reviewed alternate;",
+              ),
+              (
+                  "At this snapshot, current `main` is `1934b4c5f5e15151c68ed9429770fa56bdcc3357`, merge of PR #594.",
+                  "At this snapshot, current `main` is `92b187b7b403f53a3a97b3ae92e744f5d6a2b5a7`, merge of PR #601.",
+              ),
+              (
+                  "| merged-parent descriptor + basename | #593 / #594 | descriptor-relative post-attach reopen of the visible mount target |",
+                  "| merged-parent descriptor + basename | #593 / #594 | descriptor-relative post-attach reopen of the visible mount target |\n| generic OverlayFS Git-worktree observation vocabulary | #591 / #601 | `OverlayGitWorktreeObservation` is primary; compatibility alias retained; lifecycle semantics unchanged |",
+              ),
+              (
+                  "Issue #591 exists to rename the lifecycle observation vocabulary from `OverlayLinkedWorktreeObservation` to generic `OverlayGitWorktreeObservation` while retaining a compatibility alias. This is naming only; it must not change lifecycle semantics.",
+                  "PR #601 completed #591: `OverlayGitWorktreeObservation` is now the primary lifecycle vocabulary, the old linked-worktree name remains a public compatibility alias, the serialized variants are unchanged, and lifecycle semantics are unchanged.",
+              ),
+              (
+                  "### Still-open Git question\n\nThe security-correct cross-owner task clone experiment proved that the task could checkout, add, commit, GC, and could not mutate the root-owned seed. The seed remained byte/mode/ownership identical and `git fsck --full` passed.\n\nHowever, the first cross-owner `git clone --shared` attempt did not leave the expected task alternates file. Therefore **do not claim the secure private task path is sharing immutable object bytes yet**. A scrubbed `--shared` versus `--reference` probe is still needed to decide whether mature Git creates the desired alternates relationship under the accepted ownership/config boundary or whether #580 should publish a reviewed alternates file explicitly.",
+                  "### Cross-owner private Git alternates are proven\n\nOwned ARM run `32748702131` / job `97500255676` rebuilt the experiment with a non-shallow source, a root-owned frozen bare seed produced with `git clone --bare --local --no-hardlinks`, and fully scrubbed admin/runner environments.\n\n`git clone --shared --no-checkout` took about 13.5 ms and `git clone --reference <seed> --no-local --no-checkout <seed>` took about 15.9 ms in this sample. Both wrote one exact `objects/info/alternates` entry pointing at the accepted seed `objects` directory and left only the tiny private alternates metadata in the task object directory.\n\nBoth forms also worked with `--separate-git-dir`. After handoff to the task account, checkout, edit, add, commit, `git gc --prune=now`, and object lookup succeeded; the exact alternate survived GC and the root seed digest/ownership/frozen modes remained unchanged.\n\nV1 task-private Git preparation should prefer `--reference <accepted-generation> --no-local`: the shared-object dependency is explicit in argv and local hardlink optimization is disabled. `--shared` remains a viable measured comparator.",
+              ),
+              (
+                  "### Physical probe #597 failed in the harness\n\nDraft research PR #597's first workdir-timing C probe failed compilation because `system()`'s return value was ignored under `-Werror`. The safe-rustix and Git-alternates probes in later steps were skipped.\n\nThis is a harness defect, not an OverlayFS result. Fix/re-run or supersede it; never cite that run as evidence about workdir mutation timing.",
+                  "### Physical probe #597 exposed and then corrected harness/fixture failures\n\nThe first workdir-timing C probe failed compilation because `system()`'s return value was ignored under `-Werror`. A corrected probe checked that return and then showed the OverlayFS work directory remained unchanged through all three `FSCONFIG_SET_FD` calls and first changed at `FSCONFIG_CMD_CREATE`.\n\nA combined Git probe later used the shallow Actions checkout as its source. `git clone --reference` correctly refused that shallow reference repository, so the result was a fixture limitation. A dedicated non-shallow follow-up run (`32748702131` / `97500255676`) settled the cross-owner alternates behavior described above.\n\nPR #597 was research-only and closed without merge after harvesting the evidence.",
+              ),
+              (
+                  "### 1. Exactly when does OverlayFS first mutate `workdir`?\n\n`TrustedOverlayMountPlan::confirm()` currently requires the sealed workdir to remain empty/exact. The executor wants a second confirmation as late as possible before mount publication.\n\nThe likely safe boundary is after `fsconfig_set_fd` and before `FSCONFIG_CMD_CREATE`, but the owned timing probe must confirm when the kernel first changes workdir metadata/content. #597 attempted this but its C harness failed before running.\n\nDo not freeze the executor's second-confirmation stage until this is physically observed.\n\n### 2. Can the accepted cross-owner private task Git dir use mature Git alternates directly?\n\nNeed a scrubbed, ownership-safe comparison of at least:\n\n```text\ngit clone --shared\ngit clone --reference <frozen seed>\n```\n\nunder the accepted root/admin/runner account split and fixed environment.\n\nRecord whether the task actually uses an alternates file, task-local object bytes, creation latency/space, and whether the frozen seed remains unchanged.\n\n### 3. What is the exact Lima standalone-disk layout on the operator Mac?",
+                  "### 1. Resolved: OverlayFS first mutates `workdir` at create\n\nOwned #597 evidence shows no workdir child after lower/upper/work `FSCONFIG_SET_FD`; the kernel-created workdir child appears immediately after `FSCONFIG_CMD_CREATE` and remains through `fsmount`/`move_mount`. The executor's second exact confirmation belongs after the SET_FD calls and before CREATE.\n\n### 2. Resolved: mature Git alternates work across the accepted account split\n\nThe dedicated scrubbed non-shallow probe established exact alternates for both `--shared` and `--reference <seed> --no-local`, including separate private Git directories and task checkout/add/commit/GC. Prefer the explicit reference form for V1 task admission and require the one exact alternate as a postcondition.\n\n### 3. What is the exact Lima standalone-disk layout on the operator Mac?",
+              ),
+              (
+                  "- **#591** — generic Git-worktree observation vocabulary;",
+                  "- **#591 / #601** — generic Git-worktree observation vocabulary; completed/merged;",
+              ),
+              (
+                  "At this snapshot, open PRs #597 and #598 are **research drafts only** and must not be merged as product changes.",
+                  "At this snapshot, #597 is closed research evidence. PR #598 remains a **research draft only** and must not be merged as a product change.",
+              ),
+              (
+                  "1. **Land the minimal #585 ownership observer.** Descriptor-bound exact marker/root/objects ownership generation; no recursive O(N) audit in P1.\n2. **Finish #591** so task lifecycle vocabulary no longer implies a shared linked-worktree implementation.\n3. **Finish #589 executor composition** behind an unmintable production correlation proof; close research #598 and rebuild one clean exact-head PR.\n4. **Re-run/supersede #597** to settle workdir mutation timing and the cross-owner Git alternates question.\n5. **Implement #592 publication** only after #585's read-only acceptance contract is stable.\n6. **Obtain the operator-Mac #565 P2 Lima disk receipt** and implement descriptor-bound physical project-disk observation.\n7. **Mint the first real correlation proof** only from #565 P2 accepted evidence.",
+                  "1. **Land the minimal #585 ownership observer.** PR #602 is the active descriptor-bound marker/root/objects observer; keep recursive O(N) audit outside P1 and require independent exact-head acceptance because ownership evidence is security-sensitive.\n2. **Finish #589 executor composition** behind an unmintable production correlation proof; close research #598 and rebuild one clean exact-head PR. The #597 workdir evidence fixes the second-confirmation boundary before `FSCONFIG_CMD_CREATE`.\n3. **Progress #592 publication** after #585's read-only contract is accepted: root-owned staging envelope -> scrubbed `smolrunner-admin` `--no-hardlinks` producer -> descriptor-relative inode-independence/content audit -> root marker/freeze -> no-replace publication -> final #585 observation.\n4. **Implement #580 private task Git metadata** against the accepted pool with `--reference <accepted-generation> --no-local`, exact alternates validation, private index publication, and final non-mutating Git/source proof.\n5. **Obtain the operator-Mac #565 P2 Lima disk receipt** and implement descriptor-bound physical project-disk observation.\n6. **Mint the first real correlation proof** only from #565 P2 accepted evidence.",
+              ),
+          ]
+          for before, after in replacements:
+              count = s.count(before)
+              if count != 1:
+                  raise SystemExit(f"expected one occurrence, got {count}: {before[:100]!r}")
+              s = s.replace(before, after, 1)
+          p.write_text(s)
+      - name: Validate and publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm .github/workflows/ocean-refresh-m6-handoff.yml
+          git diff --check
+          git config user.name "ocean-smolrunner"
+          git config user.email "ocean-smolrunner@users.noreply.github.com"
+          git add docs/M6_HOT_RUNTIME_HANDOFF.md .github/workflows/ocean-refresh-m6-handoff.yml
+          git diff --cached --check
+          git commit -m "Refresh M6 hot-runtime handoff"
+          git push origin HEAD:${GITHUB_REF_NAME}
