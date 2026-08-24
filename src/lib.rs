@@ -256,6 +256,8 @@ pub mod project_checkout_observation;
 /// Read-only, bounded immediate-child discovery beneath one explicit project root.
 #[cfg(unix)]
 pub mod project_discovery;
+/// Pure identity vocabulary for one formatted project-disk filesystem generation.
+pub mod project_disk_filesystem;
 /// Pure crash-safe single-writer lease planning for resident trusted project disks.
 pub mod project_disk_lease;
 pub mod renderprove_artifact_binding;
