@@ -294,6 +294,8 @@ pub mod state_document;
 pub mod state_store;
 #[cfg(target_os = "linux")]
 pub mod subordinate_id;
+/// Pure canonical one-shot protocol envelope for resident Linux guest-control transactions.
+pub mod trusted_guest_control_protocol;
 #[cfg(target_os = "linux")]
 /// Sealed all-FD trusted OverlayFS mount transaction behind exact correlation evidence.
 pub mod trusted_overlay_mount_execution;
