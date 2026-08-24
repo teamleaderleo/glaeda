@@ -1,0 +1,98 @@
+name: Ocean apply 591
+
+on:
+  push:
+    branches:
+      - ocean/overlay-git-worktree-observation
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply exact vocabulary edit
+        shell: python
+        run: |
+          from pathlib import Path
+
+          path = Path("src/trusted_overlay_task_view.rs")
+          text = path.read_text()
+          old = "OverlayLinkedWorktreeObservation"
+          count = text.count(old)
+          if count < 10:
+              raise SystemExit(f"unexpected old vocabulary count: {count}")
+          text = text.replace(old, "OverlayGitWorktreeObservation")
+
+          enum_tail = """pub enum OverlayGitWorktreeObservation {
+              Absent,
+              Exact,
+              Other,
+              Unknown,
+          }
+          """
+          alias_tail = enum_tail + """
+          /// Compatibility alias for the original linked-worktree-specific M6 vocabulary.
+          pub type OverlayLinkedWorktreeObservation = OverlayGitWorktreeObservation;
+          """
+          if text.count(enum_tail) != 1:
+              raise SystemExit("generic worktree enum insertion point changed")
+          text = text.replace(enum_tail, alias_tail, 1)
+
+          replacements = {
+              "exact linked-worktree registration is not proven":
+                  "exact Git-worktree registration is not proven",
+              "foreign overlay mount or linked-worktree evidence blocks cleanup":
+                  "foreign overlay mount or Git-worktree evidence blocks cleanup",
+              "overlay mount must be absent before linked-worktree removal":
+                  "overlay mount must be absent before Git-worktree removal",
+              "linked-worktree removal postcondition is not proven":
+                  "Git-worktree removal postcondition is not proven",
+          }
+          for before, after in replacements.items():
+              if text.count(before) != 1:
+                  raise SystemExit(f"expected one message occurrence: {before}")
+              text = text.replace(before, after)
+
+          import_anchor = """        OverlayCleanupAction, OverlayGitProofObservation, OverlayIndexObservation,
+                  OverlayGitWorktreeObservation, OverlayMountObservation, OverlaySourceAnchorBinding,
+          """
+          import_replacement = """        OverlayCleanupAction, OverlayGitProofObservation, OverlayIndexObservation,
+                  OverlayGitWorktreeObservation, OverlayLinkedWorktreeObservation, OverlayMountObservation,
+                  OverlaySourceAnchorBinding,
+          """
+          if text.count(import_anchor) != 1:
+              raise SystemExit("test import anchor changed")
+          text = text.replace(import_anchor, import_replacement, 1)
+
+          test_anchor = """    #[test]
+              fn identifiers_are_bounded_lowercase_tokens() {
+          """
+          alias_test = """    #[test]
+              fn linked_worktree_observation_alias_preserves_generic_vocabulary() {
+                  let legacy: OverlayLinkedWorktreeObservation = OverlayGitWorktreeObservation::Exact;
+                  assert_eq!(legacy, OverlayGitWorktreeObservation::Exact);
+                  assert_eq!(serde_json::to_string(&legacy).unwrap(), "\\\"exact\\\"");
+              }
+          
+          """ + test_anchor
+          if text.count(test_anchor) != 1:
+              raise SystemExit("test insertion anchor changed")
+          text = text.replace(test_anchor, alias_test, 1)
+
+          path.write_text(text)
+      - name: Remove one-shot helper and commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm .github/workflows/ocean-apply-591.yml
+          git config user.name "ocean-smolrunner"
+          git config user.email "ocean-smolrunner@users.noreply.github.com"
+          git add src/trusted_overlay_task_view.rs .github/workflows/ocean-apply-591.yml
+          git diff --cached --check
+          git commit -m "Generalize OverlayFS Git worktree observation"
+          git push origin HEAD:${GITHUB_REF_NAME}
