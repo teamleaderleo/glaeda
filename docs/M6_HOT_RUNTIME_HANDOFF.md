@@ -45,7 +45,7 @@ Hot state is acceleration. Durable execution state and fresh exact observation r
 
 ## Current `main`
 
-At this snapshot, `main` is `d4a5853955a54ccf5e2795d8560203cb0d0063de`, merge of PR #612.
+At this snapshot, `main` is `47c4586f2a68acd1e101d0fa80bdc5b7996fc632`, merge of PR #626.
 
 Important M6 capabilities already landed:
 
@@ -66,6 +66,8 @@ Important M6 capabilities already landed:
 | sealed all-FD OverlayFS transaction | #589 / #607 | safe-rustix FD-only mount execution; production correlation proof remains sealed |
 | immutable Git-pool ownership observer | #585 / #609 | root-owned frozen generation, exact marker, retained `objects/`, race-safe nested-alternates absence |
 | one-shot guest-control protocol envelope | #588 / #612 | exact attachment/sandbox/binary binding, closed operations/debt, canonical digests; pure protocol |
+| sealed one-shot Lima invocation plan | #588 / #615 + #623 | fixed exact instance/root guest argv; host `shell <instance> -- ...` and guest `sudo -- ...` boundaries; execution adapter pending |
+| immutable-pool publication guest operation | #592 / #626 | distinct closed protocol tag for pool publication; no handler or mutation authority |
 
 #607 contains physical mount mechanics, while normal product code still cannot mint the required project-filesystem correlation proof. Physical activation waits for accepted #565 P2 evidence.
 
@@ -277,13 +279,13 @@ V1 requirements include:
 
 PR #612 landed the pure canonical one-shot request/receipt envelope. It binds exact project-disk revision/generation, attachment generation, resident sandbox generation, guest-control binary generation/digest, one closed operation tag, and canonical payload/request digests.
 
-PR #615 currently owns the pure Mac invocation-plan slice. The later adapter will use one exact Lima instance and root-owned guest binary with a fixed non-interactive escalation path and scrubbed environment.
+#615 landed the pure sealed Mac invocation plan. #623 then hardened the host CLI boundary so the exact plan is `limactl --tty=false shell <instance> -- <guest-command...>` while retaining the guest `sudo -- /usr/bin/env -i ...` separator and scrubbed environment.
 
-Immutable-pool publication deserves its own closed guest-control operation. Pool-generation mutation should not be hidden under `PrepareTrustedTaskView`.
+#626 landed a distinct closed `PublishImmutableGitPoolGeneration` protocol operation. Pool publication therefore has its own canonical one-shot tag instead of being hidden under `PrepareTrustedTaskView`. The execution adapter is still pending and should consume the bounded plain-stdin process mode only after #619 receives its required independent concurrency acceptance.
 
 ## #565 physical blocker
 
-The main production physical blocker remains #565 P2: exact operator-Mac evidence tying the standalone Lima disk generation/attachment to the guest filesystem identity. PR #618 is the current observation-only receipt lane. It deliberately leaves physical ownership unresolved and adds no writable #589 proof constructor.
+The main production physical blocker remains #565 P2: exact operator-Mac evidence tying the standalone Lima disk generation/attachment to the guest filesystem identity. #618 is the current observation-only receipt lane on hardened head `a0bdf00fdcf98e7fd3484d8d8630904a1db37f64`; exact Verify `32760003780` is green. The collector now opens the supplied disk-directory path component-by-component with no-follow semantics and requires decoded Linux guest `st_dev` major/minor to equal the single exact project `mountinfo` row. It still leaves physical ownership unresolved and adds no writable #589 proof constructor. Because the final repair is ownership-adjacent, #618 remains gated on implementation-independent exact-head acceptance.
 
 #607 stays sealed until accepted #565 P2 evidence can mint the project-filesystem correlation proof.
 
@@ -367,9 +369,10 @@ Several result branches failed to carry evidence cleanly or queued long enough t
 
 - #580 — task-private Git metadata/index/Git-source proof and ready composition;
 - #581 — immutable pool generation lifecycle and private task Git direction;
-- #588 — one-shot guest-control execution path; #612 landed, #615 active;
-- #592 — root/admin immutable-pool publication; #614 candidate audit ready for independent acceptance;
-- #565 P2 — operator-Mac project-disk physical evidence; #618 active;
+- #588 — one-shot guest-control execution path; #612/#615/#623/#626 landed; the process adapter waits on #619 independent concurrency acceptance;
+- #592 — root/admin immutable-pool publication; #614 candidate audit still waits on implementation-independent exact-head acceptance;
+- #565 P2 — operator-Mac project-disk physical evidence; #618 hardened head is Verify-green and waits on implementation-independent exact-head acceptance;
+- #619 / #617 — bounded non-secret stdin process primitive is Verify/Linux-green on `9907b0a5df525170606937a653e23e02826f3cf2` and waits on implementation-independent concurrency acceptance;
 - #566 — owned performance/research receipts.
 
 Completed adjacent slices: #585/#609, #589/#607 mechanics, #591/#601, #593/#594.
@@ -379,7 +382,7 @@ Completed adjacent slices: #585/#609, #589/#607 mechanics, #591/#601, #593/#594.
 1. Accept #614 independently on its exact head; keep the O(N) walk outside hot task admission.
 2. Build #592's root-owned staging envelope and narrow admin-producer execution boundary around fixed absolute Git + cleared environment.
 3. Compose producer absence, #614 audit, content/reachability proof, root freeze/marker, no-replace promotion, and final #609 observation.
-4. Add a distinct immutable-pool publication operation to the #612 guest-control vocabulary after #615's invocation plan settles.
+4. Accept #619 independently on its exact concurrency/process-lifecycle head, then build the one-shot execution adapter from the merged #612/#626 protocol plus #615/#623 invocation plan instead of reconstructing Lima argv.
 5. Implement #580 task-private Git creation using `--reference <accepted-generation> --no-local`, exact alternate validation, origin removal, exact index publication, and final non-mutating Git/source proof.
 6. Finish #565 P2 real operator-Mac evidence through #618 and mint #607's first production correlation proof only from accepted evidence.
 7. Compose the one-shot resident task transaction: current authority -> descriptors -> correlation -> #607 mount -> #580 Git/index proof -> bounded receipt -> Mac publishes ready.
