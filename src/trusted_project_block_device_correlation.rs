@@ -278,7 +278,9 @@ mod tests {
         )
     }
 
-    fn mounted() -> crate::trusted_project_filesystem_guest_observation::TrustedProjectFilesystemGuestObservation {
+    fn mounted()
+    -> crate::trusted_project_filesystem_guest_observation::TrustedProjectFilesystemGuestObservation
+    {
         observe_trusted_project_filesystem_guest(
             &filesystem(),
             2049,
@@ -305,8 +307,8 @@ mod tests {
 
     #[test]
     fn block_rdev_must_equal_mounted_filesystem_device() {
-        let error = correlate_trusted_project_block_device(&mounted(), 2050, 77, true, true)
-            .unwrap_err();
+        let error =
+            correlate_trusted_project_block_device(&mounted(), 2050, 77, true, true).unwrap_err();
         assert_eq!(
             error.kind(),
             TrustedProjectBlockDeviceCorrelationErrorKind::DeviceMismatch

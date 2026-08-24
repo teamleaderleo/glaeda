@@ -319,6 +319,8 @@ pub mod trusted_overlay_mount_execution;
 pub mod trusted_overlay_mount_plan;
 /// Pure authority and lifecycle core for trusted resident OverlayFS task views.
 pub mod trusted_overlay_task_view;
+/// Guest correlation of one exact whole block device with the mounted project filesystem.
+pub mod trusted_project_block_device_correlation;
 /// Opaque project-disk/filesystem correlation gate for trusted resident Linux mutation.
 pub mod trusted_project_filesystem_correlation;
 /// Read-only guest correlation of one held project-filesystem device with exact mountinfo evidence.
