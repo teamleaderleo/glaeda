@@ -1,0 +1,61 @@
+name: Research diagnose generic OverlayFS Git worktree vocabulary v3
+
+on:
+  push:
+    branches:
+      - research/arm-diagnose-overlay-git-worktree-vocabulary-v3
+
+permissions:
+  contents: write
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: true
+          show-progress: false
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt --no-self-update
+      - name: Patch and diagnose
+        shell: bash
+        run: |
+          set -u
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/trusted_overlay_task_view.rs'); s=p.read_text()
+          marker='''#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]\n#[serde(rename_all = "snake_case")]\npub enum OverlayLinkedWorktreeObservation {'''
+          if marker not in s: raise SystemExit('linked worktree enum missing')
+          start=s.index(marker)
+          end=s.index('''#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]\n#[serde(rename_all = "snake_case")]\npub enum OverlayMountObservation {''', start)
+          replacement='''/// Current physical observation of one task's exact Git worktree identity.\n///\n/// The worktree may use a task-private Git dir, a linked-worktree fallback, or another reviewed\n/// implementation. This vocabulary carries no requirement to share a common Git directory.\n#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]\n#[serde(rename_all = "snake_case")]\npub enum OverlayGitWorktreeObservation {\n    Absent,\n    Exact,\n    Other,\n    Unknown,\n}\n\n/// Compatibility name retained while M6 callers migrate to the generic Git-worktree vocabulary.\npub type OverlayLinkedWorktreeObservation = OverlayGitWorktreeObservation;\n\n'''
+          s=s[:start]+replacement+s[end:]
+          s=s.replace('worktree: OverlayLinkedWorktreeObservation', 'worktree: OverlayGitWorktreeObservation')
+          s=s.replace(') -> OverlayLinkedWorktreeObservation {', ') -> OverlayGitWorktreeObservation {')
+          s=s.replace('OverlayLinkedWorktreeObservation::', 'OverlayGitWorktreeObservation::')
+          p.write_text(s)
+          PY
+          cargo fmt --all >/tmp/fmt.log 2>&1; fmt_rc=$?
+          cargo test --locked trusted_overlay >/tmp/test.log 2>&1; test_rc=$?
+          cargo clippy --locked --all-targets --all-features -- -D warnings >/tmp/clippy.log 2>&1; clippy_rc=$?
+          printf '{"fmt_rc":%s,"test_rc":%s,"clippy_rc":%s}\n' "$fmt_rc" "$test_rc" "$clippy_rc" >/tmp/status.json
+          cp src/trusted_overlay_task_view.rs /tmp/trusted_overlay_task_view.rs
+          exit 0
+      - name: Publish diagnostics
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name teamleaderleo
+          git config user.email cheerleaderleo@outlook.com
+          OUT=research/results-overlay-git-worktree-vocabulary-v3
+          git checkout --orphan "$OUT"
+          git rm -rf . >/dev/null 2>&1 || true
+          cp /tmp/status.json ./status.json
+          cp /tmp/fmt.log ./fmt.log
+          cp /tmp/test.log ./test.log
+          cp /tmp/clippy.log ./clippy.log
+          cp /tmp/trusted_overlay_task_view.rs ./trusted_overlay_task_view.rs
+          git add .
+          git commit -m 'Publish OverlayFS Git worktree vocabulary diagnostics v3'
+          git push --force origin HEAD:"$OUT"
