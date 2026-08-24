@@ -442,10 +442,7 @@ fn decode_mountinfo_field(field: &[u8]) -> Result<Vec<u8>, ProjectDiskPhysicalRe
 }
 
 const fn mountinfo_invalid() -> ProjectDiskPhysicalReceiptError {
-    malformed(
-        "guest.mountinfo",
-        "project_disk_receipt_mountinfo_invalid",
-    )
+    malformed("guest.mountinfo", "project_disk_receipt_mountinfo_invalid")
 }
 
 pub(crate) fn validate_absolute_path(
