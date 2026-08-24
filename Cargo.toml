@@ -8,11 +8,11 @@ license = "Apache-2.0"
 keywords = ["github-actions", "self-hosted", "runner", "podman", "devops"]
 categories = ["command-line-utilities", "development-tools"]
 publish = false
+default-run = "smolrunner"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["raw_value"] }
+serde = { version = "1", features = ["raw_value"] }
 serde_yaml = { package = "serde_norway", version = "0.9.42" }
 sha2 = "0.10"
 
