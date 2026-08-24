@@ -48,10 +48,5 @@ jobs:
               raise SystemExit(f'v3 failed insertion call count={script.count(old)}')
           script = script.replace(old, new, 1)
           Path('/tmp/build-overlay-product-repaired.sh').write_text(script)
-
-          old = '''            BackendStage::Attach if recovery_required => (
-          compatibility sentinel consumed by the registered v2 diagnostic runner
-          '''
-          text = text.replace(old, new, 1)
           PY
           bash /tmp/build-overlay-product-repaired.sh
