@@ -1,0 +1,94 @@
+name: Add pending-attachment P2 correlation
+
+on:
+  push:
+    branches:
+      - chatgpt/640-p2-pending-attachment-observation
+
+permissions:
+  contents: write
+
+jobs:
+  wire:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: chatgpt/640-p2-pending-attachment-observation
+          fetch-depth: 0
+          show-progress: false
+      - name: Add pure P1 plan confirmation if absent
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('src/project_disk_lease.rs')
+          text = path.read_text()
+          method = '''    /// Reconfirm that one previously planned attachment still belongs to this exact detached\n    /// project-disk lease revision without publishing an attached successor.\n    pub fn confirm_attach_plan(\n        &self,\n        plan: &ProjectDiskAttachPlan,\n    ) -> Result<(), ProjectDiskLeaseError> {\n        self.require_nonterminal()?;\n        self.require_plan_identity(&plan.identity)?;\n        if !matches!(self.state, ProjectDiskLeaseState::Detached) {\n            return Err(invalid_state(\n                "project_disk_attach_requires_detached",\n                "project disk attach requires detached state",\n            ));\n        }\n        if plan.attachment.generation != self.next_attachment_generation()? {\n            return Err(plan_mismatch());\n        }\n        Ok(())\n    }\n\n'''
+          if method not in text:
+              anchor = '''    /// Accept the durable successor after the planned attachment is freshly observed.\n    pub fn record_attach_success('''
+              if text.count(anchor) != 1:
+                  raise SystemExit('unexpected record_attach_success anchor')
+              text = text.replace(anchor, method + anchor, 1)
+          path.write_text(text)
+          PY
+      - name: Add pending resident binding and P2 projection
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('src/project_disk_host_observation.rs')
+          text = path.read_text()
+
+          # Add ProjectDiskAttachPlan to the existing project_disk_lease import.
+          old = '''    ProjectDiskAttachmentGeneration, ProjectDiskAttachmentLease, ProjectDiskGeneration,\n    ProjectDiskId, ProjectDiskLeaseRecord, ProjectDiskLeaseState, ProjectDiskLockObservation,'''
+          new = '''    ProjectDiskAttachPlan, ProjectDiskAttachmentGeneration, ProjectDiskAttachmentLease,\n    ProjectDiskGeneration, ProjectDiskId, ProjectDiskLeaseRecord, ProjectDiskLeaseState,\n    ProjectDiskLockObservation,'''
+          if old in text:
+              text = text.replace(old, new, 1)
+
+          existing_marker = '/// Exact P1 current-attachment mapping to a descriptor-bound Lima VZ host observation.\npub struct ProjectDiskResidentSandboxBinding {'
+          pending_type = '''/// Exact pending P1 attachment-plan mapping to one descriptor-bound Lima VZ host observation.\n///\n/// This breaks the P1/P2 post-attach cycle without fabricating an already-`Attached` lease record:\n/// P1 remains `Detached`, the exact `ProjectDiskAttachPlan` names the next attachment generation,\n/// and P2 may prove that exact planned resident physically holds the expected disk before P1\n/// publishes the attached successor.\npub struct ProjectDiskPendingResidentSandboxBinding {\n    attachment: ProjectDiskAttachmentLease,\n    expected_revision: crate::project_disk_lease::ProjectDiskRevision,\n    request: LimaObservationRequest,\n    host: Option<LimaHostIdentityObservation>,\n    canonical_source: LimaObservationSourceIdentity,\n}\n\nimpl ProjectDiskPendingResidentSandboxBinding {\n    /// Bind one exact current detached lease + P1 attach plan to a validated Lima request and held\n    /// resident VZ identity.\n    ///\n    /// # Errors\n    ///\n    /// Fails unless the plan still belongs to the exact current detached lease revision and the\n    /// held host observation reconfirms the supplied resident Lima request.\n    pub fn new(\n        record: &ProjectDiskLeaseRecord,\n        plan: &ProjectDiskAttachPlan,\n        request: LimaObservationRequest,\n        host: LimaHostIdentityObservation,\n    ) -> Result<Self, ProjectDiskHostObservationError> {\n        record\n            .confirm_attach_plan(plan)\n            .map_err(|_| binding_mismatch())?;\n        host.confirm(&request).map_err(|_| resident_mismatch())?;\n        let canonical_home = AcceptedPath::new(request.lima_home().to_owned())?;\n        let canonical_source = LimaObservationSourceIdentity::from_validated(\n            request.instance().clone(),\n            canonical_home.physical,\n        );\n        Ok(Self {\n            attachment: plan.attachment().clone(),\n            expected_revision: record.revision(),\n            request,\n            host: Some(host),\n            canonical_source,\n        })\n    }\n\n    #[cfg(test)]\n    fn for_test(\n        record: &ProjectDiskLeaseRecord,\n        plan: &ProjectDiskAttachPlan,\n        request: LimaObservationRequest,\n    ) -> Result<Self, ProjectDiskHostObservationError> {\n        record\n            .confirm_attach_plan(plan)\n            .map_err(|_| binding_mismatch())?;\n        let canonical_home = AcceptedPath::new(request.lima_home().to_owned())?;\n        let canonical_source = LimaObservationSourceIdentity::from_validated(\n            request.instance().clone(),\n            canonical_home.physical,\n        );\n        Ok(Self {\n            attachment: plan.attachment().clone(),\n            expected_revision: record.revision(),\n            request,\n            host: None,\n            canonical_source,\n        })\n    }\n\n    fn confirm(\n        &self,\n        record: &ProjectDiskLeaseRecord,\n        plan: &ProjectDiskAttachPlan,\n    ) -> Result<\n        (LimaObservationSourceIdentity, &ProjectDiskAttachmentLease),\n        ProjectDiskHostObservationError,\n    > {\n        record\n            .confirm_attach_plan(plan)\n            .map_err(|_| binding_mismatch())?;\n        if record.revision() != self.expected_revision || plan.attachment() != &self.attachment {\n            return Err(binding_mismatch());\n        }\n        if let Some(host) = &self.host {\n            host.confirm(&self.request)\n                .map_err(|_| resident_mismatch())?;\n        }\n        Ok((self.canonical_source.clone(), &self.attachment))\n    }\n}\n\nimpl fmt::Debug for ProjectDiskPendingResidentSandboxBinding {\n    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {\n        formatter\n            .debug_struct("ProjectDiskPendingResidentSandboxBinding")\n            .field("attachment", &self.attachment)\n            .field("expected_revision", &self.expected_revision)\n            .field("private_host_evidence", &"<redacted>")\n            .finish()\n    }\n}\n\n'''
+          if pending_type not in text:
+              if text.count(existing_marker) != 1:
+                  raise SystemExit('unexpected resident binding anchor')
+              text = text.replace(existing_marker, pending_type + existing_marker, 1)
+
+          method_anchor = '''    fn report(\n        &self,\n        record: &ProjectDiskLeaseRecord,'''
+          pending_method = '''    /// Project the physically attached disk into P1's closed post-attach vocabulary while P1 still\n    /// remains detached and the exact attach plan names the pending successor generation.\n    ///\n    /// A successful result is deliberately short-lived evidence for `record_attach_success`; it is\n    /// not an attached lease record and grants no mutation on its own.\n    pub fn bind_pending_attachment_to_project_disk(\n        &mut self,\n        record: &ProjectDiskLeaseRecord,\n        plan: &ProjectDiskAttachPlan,\n        physical_binding: &ProjectDiskPhysicalBinding,\n        resident_binding: &ProjectDiskPendingResidentSandboxBinding,\n        fresh_inventory_json_lines: &[u8],\n    ) -> Result<ProjectDiskHostObservationReport, ProjectDiskHostObservationError> {\n        self.confirm(fresh_inventory_json_lines)?;\n        record\n            .confirm_attach_plan(plan)\n            .map_err(|_| binding_mismatch())?;\n        let expected_binding = binding_summary(record, None);\n        if physical_binding.binding != expected_binding\n            || physical_binding.physical_identity != self.summary.physical_identity\n            || self.summary.disposition != LimaStandaloneDiskDisposition::Attached\n        {\n            return Err(binding_mismatch());\n        }\n        let (source, attachment) = resident_binding.confirm(record, plan)?;\n        if attachment != plan.attachment() || self.attached_source.as_ref() != Some(&source) {\n            return Err(resident_mismatch());\n        }\n        let report = self.report(\n            record,\n            Some(attachment),\n            ProjectDiskPhysicalObservation::Exact,\n            ProjectDiskUseObservation::CurrentAttachment,\n            ProjectDiskLockObservation::CurrentAttachment,\n            true,\n        );\n        self.confirm(fresh_inventory_json_lines)?;\n        Ok(report)\n    }\n\n'''
+          if pending_method not in text:
+              if text.count(method_anchor) != 1:
+                  raise SystemExit('unexpected report method anchor')
+              text = text.replace(method_anchor, pending_method + method_anchor, 1)
+
+          # Add one focused synthetic regression test near existing attached binding tests.
+          test_anchor = '''#[test]\nfn attached_schema_without_exact_resident_binding_is_other() {'''
+          test = '''#[test]\nfn pending_attachment_binds_exact_plan_before_p1_attached_publication() {\n    let fixture = Fixture::new();\n    fixture.attach();\n    let inventory = fixture.attached_inventory();\n    let mut observed = observe_lima_standalone_disk(fixture.request(), &inventory).unwrap();\n\n    let record = detached_record();\n    let binding =\n        ProjectDiskPhysicalBinding::new(&record, observed.summary().physical_identity().clone());\n    let plan = record\n        .plan_attach(\n            ResidentSandboxId::parse("sandbox-a").unwrap(),\n            ResidentSandboxGeneration::new(11).unwrap(),\n            ProjectDiskObservation::new(\n                ProjectDiskPhysicalObservation::Exact,\n                ProjectDiskUseObservation::Unused,\n                ProjectDiskLockObservation::Unlocked,\n                ProjectDiskRecoverability::Unknown,\n            ),\n        )\n        .unwrap();\n    let resident = ProjectDiskPendingResidentSandboxBinding::for_test(\n        &record,\n        &plan,\n        fixture.lima_request(),\n    )\n    .unwrap();\n    let report = observed\n        .bind_pending_attachment_to_project_disk(\n            &record,\n            &plan,\n            &binding,\n            &resident,\n            &inventory,\n        )\n        .unwrap();\n    assert_eq!(\n        report.observation().use_state(),\n        ProjectDiskUseObservation::CurrentAttachment\n    );\n    assert_eq!(\n        report.observation().lock_state(),\n        ProjectDiskLockObservation::CurrentAttachment\n    );\n    assert_eq!(\n        report.binding().attachment_generation(),\n        Some(plan.attachment().generation())\n    );\n    assert!(matches!(record.state(), ProjectDiskLeaseState::Detached));\n\n    let changed = record.require_revalidation().unwrap();\n    assert!(\n        observed\n            .bind_pending_attachment_to_project_disk(\n                &changed,\n                &plan,\n                &binding,\n                &resident,\n                &inventory,\n            )\n            .is_err()\n    );\n}\n\n'''
+          if test not in text:
+              if text.count(test_anchor) != 1:
+                  raise SystemExit('unexpected attached schema test anchor')
+              text = text.replace(test_anchor, test + test_anchor, 1)
+
+          path.write_text(text)
+          PY
+      - name: Format and focused tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.97.1 --profile minimal --component rustfmt --no-self-update
+          cargo fmt --all
+          cargo test --locked project_disk_host_observation
+          cargo test --locked project_disk_lease
+      - name: Remove helper and publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm .github/workflows/wire-640-p2-pending-attachment.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "#640 add pending-attachment P2 correlation"
+          git push origin HEAD:chatgpt/640-p2-pending-attachment-observation
