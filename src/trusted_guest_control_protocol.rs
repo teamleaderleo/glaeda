@@ -583,7 +583,9 @@ enum OperationWire {
 impl From<TrustedGuestControlOperation> for OperationWire {
     fn from(operation: TrustedGuestControlOperation) -> Self {
         match operation {
-            TrustedGuestControlOperation::ObserveProjectFilesystem => Self::ObserveProjectFilesystem,
+            TrustedGuestControlOperation::ObserveProjectFilesystem => {
+                Self::ObserveProjectFilesystem
+            }
             TrustedGuestControlOperation::ObserveImmutableGitPool => Self::ObserveImmutableGitPool,
             TrustedGuestControlOperation::PrepareTrustedTaskView => Self::PrepareTrustedTaskView,
             TrustedGuestControlOperation::ObserveTrustedTaskView => Self::ObserveTrustedTaskView,
@@ -618,13 +620,12 @@ fn request_from_wire(
         },
     )?;
     let authority = TrustedGuestControlAuthority {
-        project: ProjectIdentity::parse(&wire.authority.project).map_err(|_| invalid_authority())?,
+        project: ProjectIdentity::parse(&wire.authority.project)
+            .map_err(|_| invalid_authority())?,
         project_disk_id: ProjectDiskId::parse(&wire.authority.project_disk_id)
             .map_err(|_| invalid_authority())?,
-        project_disk_generation: ProjectDiskGeneration::new(
-            wire.authority.project_disk_generation,
-        )
-        .map_err(|_| invalid_authority())?,
+        project_disk_generation: ProjectDiskGeneration::new(wire.authority.project_disk_generation)
+            .map_err(|_| invalid_authority())?,
         project_disk_revision: ProjectDiskRevision::new(wire.authority.project_disk_revision)
             .map_err(|_| invalid_authority())?,
         attachment_generation: ProjectDiskAttachmentGeneration::new(
@@ -765,7 +766,8 @@ fn receipt_from_wire(
         }
     };
     Ok(TrustedGuestControlReceipt {
-        request_id: TrustedGuestControlRequestId::parse(&wire.request_id).map_err(|_| malformed())?,
+        request_id: TrustedGuestControlRequestId::parse(&wire.request_id)
+            .map_err(|_| malformed())?,
         binary,
         request_digest: Sha256Digest::parse(&wire.request_digest).map_err(|_| malformed())?,
         operation: wire.operation.into(),
@@ -938,7 +940,10 @@ mod tests {
     fn canonical_request_round_trips_without_command_or_path_surface() {
         let request = request();
         let bytes = encode_trusted_guest_control_request(&request).unwrap();
-        assert_eq!(decode_trusted_guest_control_request(&bytes).unwrap(), request);
+        assert_eq!(
+            decode_trusted_guest_control_request(&bytes).unwrap(),
+            request
+        );
         let text = std::str::from_utf8(&bytes).unwrap();
         assert!(!text.contains("\"argv\""));
         assert!(!text.contains("\"environment\""));
@@ -998,13 +1003,12 @@ mod tests {
         );
 
         let mut binary = request();
-        binary.binary =
-            TrustedGuestControlBinaryBinding::new(
-                8,
-                digest('a'),
-                TrustedGuestControlArchitecture::LinuxAarch64,
-            )
-            .unwrap();
+        binary.binary = TrustedGuestControlBinaryBinding::new(
+            8,
+            digest('a'),
+            TrustedGuestControlArchitecture::LinuxAarch64,
+        )
+        .unwrap();
         assert_ne!(
             original_digest,
             trusted_guest_control_request_digest(&binary).unwrap()
