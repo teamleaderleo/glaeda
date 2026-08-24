@@ -327,11 +327,13 @@ pub fn validate_project_filesystem_correlation_receipt_json(
         return Err(invalid_receipt());
     }
 
-    let physical_provenance_matches = raw.p3_physical_identity_digest == raw.p2_physical_identity_digest
+    let physical_provenance_matches = raw.p3_physical_identity_digest
+        == raw.p2_physical_identity_digest
         && raw.p3_backing_identity_digest == raw.p2_backing_identity_digest;
     let durable_tuple_stable = raw.before == raw.after;
     let guest_authority_matches = raw.before == raw.guest_transaction.authority;
-    let filesystem_metadata_matches = raw.before.filesystem_kind == raw.guest_filesystem.filesystem_kind
+    let filesystem_metadata_matches = raw.before.filesystem_kind
+        == raw.guest_filesystem.filesystem_kind
         && raw.filesystem.filesystem_uuid == raw.guest_filesystem.filesystem_uuid
         && raw.filesystem.feature_policy_digest == raw.guest_filesystem.feature_policy_digest
         && raw.filesystem.logical_bytes == raw.guest_filesystem.logical_bytes;
@@ -401,7 +403,8 @@ fn parse_tuple(
         disk_id: ProjectDiskId::parse(&raw.disk_id).map_err(|_| invalid_receipt())?,
         disk_generation: ProjectDiskGeneration::new(raw.disk_generation)
             .map_err(|_| invalid_receipt())?,
-        disk_revision: ProjectDiskRevision::new(raw.disk_revision).map_err(|_| invalid_receipt())?,
+        disk_revision: ProjectDiskRevision::new(raw.disk_revision)
+            .map_err(|_| invalid_receipt())?,
         attachment_generation: ProjectDiskAttachmentGeneration::new(raw.attachment_generation)
             .map_err(|_| invalid_receipt())?,
         sandbox_id: ResidentSandboxId::parse(&raw.sandbox_id).map_err(|_| invalid_receipt())?,
@@ -418,7 +421,11 @@ fn parse_tuple(
 }
 
 fn validate_commit(value: &str) -> Result<(), ProjectFilesystemCorrelationReceiptError> {
-    if value.len() != MAX_COMMIT_BYTES || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if value.len() != MAX_COMMIT_BYTES
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
         return Err(invalid_receipt());
     }
     Ok(())
@@ -453,8 +460,7 @@ fn validate_uuid(value: &str) -> Result<(), ProjectFilesystemCorrelationReceiptE
 
 fn validate_digest(value: &str) -> Result<(), ProjectFilesystemCorrelationReceiptError> {
     let parsed = Sha256Digest::parse(value).map_err(|_| invalid_receipt())?;
-    if parsed.as_str()
-        == "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    if parsed.as_str() == "sha256:0000000000000000000000000000000000000000000000000000000000000000"
     {
         return Err(invalid_receipt());
     }
@@ -463,10 +469,8 @@ fn validate_digest(value: &str) -> Result<(), ProjectFilesystemCorrelationReceip
 
 /// Decode Linux `dev_t` using the kernel/glibc major/minor layout.
 fn linux_decode_dev(device: u64) -> (u64, u64) {
-    let major = ((device & 0x0000_0000_000f_ff00) >> 8)
-        | ((device & 0xffff_f000_0000_0000) >> 32);
-    let minor = (device & 0x0000_0000_0000_00ff)
-        | ((device & 0x0000_0fff_fff0_0000) >> 12);
+    let major = ((device & 0x0000_0000_000f_ff00) >> 8) | ((device & 0xffff_f000_0000_0000) >> 32);
+    let minor = (device & 0x0000_0000_0000_00ff) | ((device & 0x0000_0fff_fff0_0000) >> 12);
     (major, minor)
 }
 
@@ -651,11 +655,17 @@ mod tests {
     fn physical_or_device_identity_mismatch_is_no() {
         let mut receipt = exact_receipt();
         receipt["p2_physical_identity_digest"] = json!(digest('9'));
-        assert_eq!(validate(receipt).verdict(), ProjectFilesystemCorrelationVerdict::No);
+        assert_eq!(
+            validate(receipt).verdict(),
+            ProjectFilesystemCorrelationVerdict::No
+        );
 
         let mut receipt = exact_receipt();
         receipt["role_filesystem_device"] = json!(2050_u64);
-        assert_eq!(validate(receipt).verdict(), ProjectFilesystemCorrelationVerdict::No);
+        assert_eq!(
+            validate(receipt).verdict(),
+            ProjectFilesystemCorrelationVerdict::No
+        );
     }
 
     #[test]
@@ -679,7 +689,10 @@ mod tests {
     fn wrong_guest_transaction_authority_is_no() {
         let mut receipt = exact_receipt();
         receipt["guest_transaction"]["authority"]["attachment_generation"] = json!(3_u64);
-        assert_eq!(validate(receipt).verdict(), ProjectFilesystemCorrelationVerdict::No);
+        assert_eq!(
+            validate(receipt).verdict(),
+            ProjectFilesystemCorrelationVerdict::No
+        );
     }
 
     #[test]
@@ -708,17 +721,20 @@ mod tests {
     fn unknown_fields_and_noncanonical_uuid_are_rejected() {
         let mut receipt = exact_receipt();
         receipt["unexpected"] = json!(true);
-        assert!(validate_project_filesystem_correlation_receipt_json(
-            &serde_json::to_vec(&receipt).unwrap()
-        )
-        .is_err());
+        assert!(
+            validate_project_filesystem_correlation_receipt_json(
+                &serde_json::to_vec(&receipt).unwrap()
+            )
+            .is_err()
+        );
 
         let mut receipt = exact_receipt();
-        receipt["filesystem"]["filesystem_uuid"] =
-            json!("01234567-89AB-cdef-0123-456789abcdef");
-        assert!(validate_project_filesystem_correlation_receipt_json(
-            &serde_json::to_vec(&receipt).unwrap()
-        )
-        .is_err());
+        receipt["filesystem"]["filesystem_uuid"] = json!("01234567-89AB-cdef-0123-456789abcdef");
+        assert!(
+            validate_project_filesystem_correlation_receipt_json(
+                &serde_json::to_vec(&receipt).unwrap()
+            )
+            .is_err()
+        );
     }
 }
