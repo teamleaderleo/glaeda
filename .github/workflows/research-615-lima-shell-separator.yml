@@ -1,0 +1,50 @@
+name: Research verify Lima shell separator hardening
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/research-615-lima-shell-separator.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: research/615-lima-shell-separator
+          fetch-depth: 0
+          show-progress: false
+      - name: Harden and verify fixed guest command boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('src/trusted_guest_control_invocation_plan.rs')
+          s = p.read_text()
+          old = '''        .argument("shell")\n        .argument(target.instance.as_str())\n        .argument(SUDO)\n'''
+          new = '''        .argument("shell")\n        .argument(target.instance.as_str())\n        .argument("--")\n        .argument(SUDO)\n'''
+          if s.count(old) != 1:
+              raise SystemExit('command insertion point changed')
+          s = s.replace(old, new, 1)
+          old = '''                "shell",\n                "resident-a",\n                SUDO,\n'''
+          new = '''                "shell",\n                "resident-a",\n                "--",\n                SUDO,\n'''
+          if s.count(old) != 1:
+              raise SystemExit('test insertion point changed')
+          p.write_text(s.replace(old, new, 1))
+          PY
+          rm .github/workflows/research-615-lima-shell-separator.yml
+          cargo fmt --all
+          cargo fmt --all -- --check
+          cargo test --locked trusted_guest_control_invocation_plan
+          cargo clippy --locked --all-targets -- -D warnings
+          git diff --check
+          git config user.name "smolrunner-research-repair"
+          git config user.email "actions@users.noreply.github.com"
+          git add src/trusted_guest_control_invocation_plan.rs .github/workflows/research-615-lima-shell-separator.yml
+          git commit -m "Harden Lima shell guest-command separator"
+          git push origin HEAD:research/615-lima-shell-separator
