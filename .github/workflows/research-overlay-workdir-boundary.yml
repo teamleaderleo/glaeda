@@ -1,0 +1,88 @@
+name: Research OverlayFS workdir boundary
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/research-overlay-workdir-boundary.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          show-progress: false
+      - name: Probe workdir mutation boundary with safe rustix
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p src/bin
+          cat >src/bin/research_overlay_workdir_boundary.rs <<'RS'
+          #![forbid(unsafe_code)]
+          use std::env;
+          use std::fs;
+          use std::path::Path;
+          use rustix::fs::{self as rfs, Mode, OFlags};
+          use rustix::mount::{FsMountFlags, FsOpenFlags, MountAttrFlags, MoveMountFlags, fsconfig_create, fsconfig_set_fd, fsmount, fsopen, move_mount};
+
+          fn observe(stage: &str, work: &Path) -> Result<(), Box<dyn std::error::Error>> {
+              let mut names = fs::read_dir(work)?
+                  .map(|entry| entry.map(|entry| entry.file_name()))
+                  .collect::<Result<Vec<_>, _>>()?;
+              names.sort();
+              if names.len() > 32 { return Err("unexpectedly large workdir".into()); }
+              println!("stage={stage} entries={} names={names:?}", names.len());
+              Ok(())
+          }
+
+          fn main() -> Result<(), Box<dyn std::error::Error>> {
+              let args: Vec<_> = env::args_os().collect();
+              if args.len() != 5 { return Err("expected lower upper work merged".into()); }
+              let lower = Path::new(&args[1]);
+              let upper = Path::new(&args[2]);
+              let work = Path::new(&args[3]);
+              let merged = Path::new(&args[4]);
+              let flags = OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+              let lower_fd = rfs::open(lower, flags, Mode::empty())?;
+              let upper_fd = rfs::open(upper, flags, Mode::empty())?;
+              let work_fd = rfs::open(work, flags, Mode::empty())?;
+              let merged_fd = rfs::open(merged, flags, Mode::empty())?;
+
+              observe("initial", work)?;
+              let context = fsopen("overlay", FsOpenFlags::FSOPEN_CLOEXEC)?;
+              fsconfig_set_fd(&context, "lowerdir+", &lower_fd)?;
+              fsconfig_set_fd(&context, "upperdir", &upper_fd)?;
+              fsconfig_set_fd(&context, "workdir", &work_fd)?;
+              observe("after_set_fd", work)?;
+              fsconfig_create(&context)?;
+              observe("after_create", work)?;
+              let mount = fsmount(
+                  &context,
+                  FsMountFlags::FSMOUNT_CLOEXEC,
+                  MountAttrFlags::MOUNT_ATTR_NODEV | MountAttrFlags::MOUNT_ATTR_NOSUID,
+              )?;
+              observe("after_fsmount", work)?;
+              move_mount(
+                  &mount,
+                  "",
+                  &merged_fd,
+                  "",
+                  MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH | MoveMountFlags::MOVE_MOUNT_T_EMPTY_PATH,
+              )?;
+              observe("after_move_mount", work)?;
+              Ok(())
+          }
+          RS
+          cargo build --locked --bin research_overlay_workdir_boundary
+          ROOT="$RUNNER_TEMP/overlay-workdir-boundary"
+          rm -rf "$ROOT"
+          mkdir -p "$ROOT/lower" "$ROOT/upper" "$ROOT/work" "$ROOT/merged"
+          printf 'base\n' >"$ROOT/lower/base.txt"
+          sudo ./target/debug/research_overlay_workdir_boundary "$ROOT/lower" "$ROOT/upper" "$ROOT/work" "$ROOT/merged"
+          findmnt -T "$ROOT/merged" -n -o FSTYPE,OPTIONS
+          sudo umount "$ROOT/merged"
+          rm -f src/bin/research_overlay_workdir_boundary.rs
