@@ -1,0 +1,135 @@
+name: Research secure admin-prepared private Git handoff v4
+
+on:
+  push:
+    branches:
+      - research/github-arm-root-prepared-private-gitdir-v4
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: true
+          show-progress: false
+      - name: Probe independent root-owned seed and admin-to-task handoff
+        shell: bash
+        run: |
+          set -u
+          LAB=/var/tmp/smolrunner-git-pool-v4
+          sudo rm -rf "$LAB"
+          sudo mkdir -p "$LAB"
+          runner_uid="$(id -u)"; runner_gid="$(id -g)"
+          sudo chown "$runner_uid:$runner_gid" "$LAB"
+          sudo useradd --system --create-home --home-dir /var/lib/smol-admin-lab --shell /bin/bash smol-admin-lab >/tmp/useradd-admin.out 2>/tmp/useradd-admin.err || true
+          sudo useradd --system --create-home --home-dir /var/lib/smol-task-lab --shell /bin/bash smol-task-lab >/tmp/useradd-task.out 2>/tmp/useradd-task.err || true
+          admin_uid="$(id -u smol-admin-lab)"; admin_gid="$(id -g smol-admin-lab)"
+          task_uid="$(id -u smol-task-lab)"; task_gid="$(id -g smol-task-lab)"
+
+          git clone --bare --local --no-hardlinks "$GITHUB_WORKSPACE" "$LAB/seed.git" >/tmp/seed.out 2>/tmp/seed.err; seed_rc=$?
+          python3 - <<'PY' >/tmp/alias.json 2>/tmp/alias.err
+          import json, os, pathlib
+          lab=pathlib.Path('/var/tmp/smolrunner-git-pool-v4')
+          source=pathlib.Path(os.environ['GITHUB_WORKSPACE'])/'.git'/'objects'; seed=lab/'seed.git'/'objects'
+          def ids(p):
+            out={}
+            if not p.exists(): return out
+            for x in p.rglob('*'):
+              try: st=x.lstat()
+              except FileNotFoundError: continue
+              if x.is_file() and not x.is_symlink(): out[(st.st_dev,st.st_ino)]=x.relative_to(p).as_posix()
+            return out
+          a=ids(source); b=ids(seed); shared=set(a)&set(b)
+          print(json.dumps({'source_regular_files':len(a),'seed_regular_files':len(b),'shared_inode_count':len(shared)},sort_keys=True))
+          PY
+          alias_rc=$?
+
+          if [ "$seed_rc" -eq 0 ]; then
+            sudo chown -R root:root "$LAB/seed.git"
+            sudo find "$LAB/seed.git" -type d -exec chmod 0555 {} +
+            sudo find "$LAB/seed.git" -type f -exec chmod 0444 {} +
+          fi
+          sudo chown root:root "$LAB"; sudo chmod 0755 "$LAB"
+          sudo mkdir -p "$LAB/admin"; sudo chown "$admin_uid:$admin_gid" "$LAB/admin"; sudo chmod 0700 "$LAB/admin"
+
+          sudo -u smol-admin-lab -H /usr/bin/git clone --shared --no-checkout "$LAB/seed.git" "$LAB/admin/task" >/tmp/admin-clone-plain.out 2>/tmp/admin-clone-plain.err; admin_plain_rc=$?
+          if [ "$admin_plain_rc" -ne 0 ]; then
+            sudo -u smol-admin-lab -H /usr/bin/git -c "safe.directory=$LAB/seed.git" clone --shared --no-checkout "$LAB/seed.git" "$LAB/admin/task" >/tmp/admin-clone-safe.out 2>/tmp/admin-clone-safe.err; admin_safe_rc=$?
+          else
+            : >/tmp/admin-clone-safe.out; : >/tmp/admin-clone-safe.err; admin_safe_rc=0
+          fi
+          admin_clone_rc=$admin_safe_rc
+          if [ "$admin_clone_rc" -eq 0 ]; then sudo -u smol-admin-lab -H /usr/bin/git -C "$LAB/admin/task" remote remove origin >/tmp/remove-origin.out 2>/tmp/remove-origin.err; remove_origin_rc=$?; else remove_origin_rc=99; : >/tmp/remove-origin.out; : >/tmp/remove-origin.err; fi
+          if [ "$admin_clone_rc" -eq 0 ]; then sudo chown -R "$task_uid:$task_gid" "$LAB/admin/task"; fi
+          sudo chmod 0755 "$LAB/admin" 2>/dev/null || true
+
+          python3 - <<'PY' >/tmp/task-eval.json 2>/tmp/task-eval.err
+          import hashlib,json,os,pathlib,subprocess
+          lab=pathlib.Path('/var/tmp/smolrunner-git-pool-v4'); seed=lab/'seed.git'; task=lab/'admin'/'task'
+          def digest(p):
+            h=hashlib.sha256()
+            if not p.exists(): return ''
+            for x in sorted(p.rglob('*')):
+              rel=x.relative_to(p).as_posix().encode(); st=x.lstat(); h.update(len(rel).to_bytes(4,'big'));h.update(rel);h.update((st.st_mode&0o7777).to_bytes(4,'big'));h.update(st.st_uid.to_bytes(8,'big'));h.update(st.st_gid.to_bytes(8,'big'));h.update(st.st_nlink.to_bytes(8,'big'))
+              if x.is_file() and not x.is_symlink():
+                b=x.read_bytes();h.update(len(b).to_bytes(8,'big'));h.update(b)
+            return h.hexdigest()
+          out={'seed_exists':seed.exists(),'task_exists':task.exists()}
+          if seed.exists():
+            out['seed_digest_before']=digest(seed); out['seed_uid']=seed.stat().st_uid; out['seed_mode']=oct(seed.stat().st_mode&0o7777)
+            out['seed_head']=subprocess.run(['sudo','git','--git-dir',str(seed),'rev-parse','HEAD'],text=True,capture_output=True).stdout.strip()
+          if task.exists() and (task/'.git').exists():
+            alt=(task/'.git'/'objects'/'info'/'alternates')
+            out['alternates']=alt.read_text().strip() if alt.exists() else ''
+            out['remotes']=subprocess.run(['sudo','-u','smol-task-lab','-H','git','-C',str(task),'remote'],text=True,capture_output=True).stdout.split()
+            head=out.get('seed_head','')
+            commands={}
+            commands['cat_file']=subprocess.run(['sudo','-u','smol-task-lab','-H','git','-C',str(task),'cat-file','-e',f'{head}^{{commit}}'],text=True,capture_output=True).returncode
+            commands['checkout']=subprocess.run(['sudo','-u','smol-task-lab','-H','git','-C',str(task),'checkout','--detach','-f',head],text=True,capture_output=True).returncode
+            subprocess.run(['sudo','-u','smol-task-lab','-H','git','-C',str(task),'config','user.name','task'],check=False)
+            subprocess.run(['sudo','-u','smol-task-lab','-H','git','-C',str(task),'config','user.email','task@example.invalid'],check=False)
+            subprocess.run(['sudo','-u','smol-task-lab','-H','sh','-c',f"printf private\\n > '{task/'private.txt'}'"],check=False)
+            commands['add']=subprocess.run(['sudo','-u','smol-task-lab','-H','git','-C',str(task),'add','private.txt'],text=True,capture_output=True).returncode
+            commands['commit']=subprocess.run(['sudo','-u','smol-task-lab','-H','git','-C',str(task),'commit','-m','private'],text=True,capture_output=True).returncode
+            commands['gc']=subprocess.run(['sudo','-u','smol-task-lab','-H','git','-C',str(task),'gc'],text=True,capture_output=True).returncode
+            out['task_commands']=commands
+          hostile={}
+          if seed.exists():
+            hostile['chmod_objects']=subprocess.run(['sudo','-u','smol-task-lab','-H','chmod','u+w',str(seed/'objects')],text=True,capture_output=True).returncode
+            hostile['touch_ref']=subprocess.run(['sudo','-u','smol-task-lab','-H','touch',str(seed/'refs'/'task-write')],text=True,capture_output=True).returncode
+            hostile['overwrite_head']=subprocess.run(['sudo','-u','smol-task-lab','-H','sh','-c',f"printf evil > '{seed/'HEAD'}'"],text=True,capture_output=True).returncode
+            out['seed_digest_after']=digest(seed); out['seed_unchanged']=out.get('seed_digest_before')==out.get('seed_digest_after')
+            out['seed_fsck_rc']=subprocess.run(['sudo','git','--git-dir',str(seed),'fsck','--full'],text=True,capture_output=True).returncode
+          out['hostile_attempt_rc']=hostile; out['all_hostile_refused']=bool(hostile) and all(v!=0 for v in hostile.values())
+          print(json.dumps(out,sort_keys=True))
+          PY
+          task_eval_rc=$?
+          printf '{"seed_rc":%s,"alias_rc":%s,"admin_plain_rc":%s,"admin_safe_rc":%s,"admin_clone_rc":%s,"remove_origin_rc":%s,"task_eval_rc":%s}\n' "$seed_rc" "$alias_rc" "$admin_plain_rc" "$admin_safe_rc" "$admin_clone_rc" "$remove_origin_rc" "$task_eval_rc" >/tmp/status.json
+          exit 0
+      - name: Publish diagnostics
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json,pathlib
+          out={'status':json.loads(pathlib.Path('/tmp/status.json').read_text())}
+          for p,key in [('/tmp/alias.json','alias'),('/tmp/task-eval.json','task')]:
+            try: out[key]=json.loads(pathlib.Path(p).read_text())
+            except Exception as e: out[key]={'parse_error':str(e)}
+          pathlib.Path('/tmp/result.json').write_text(json.dumps(out,indent=2,sort_keys=True)+'\n')
+          PY
+          git config user.name teamleaderleo; git config user.email cheerleaderleo@outlook.com
+          OUT=research/results-smolrunner-github-arm-root-prepared-private-gitdir-v4
+          git checkout --orphan "$OUT"; git rm -rf . >/dev/null 2>&1 || true
+          cp /tmp/result.json ./result.json
+          cp /tmp/seed.err ./seed.err
+          cp /tmp/alias.err ./alias.err
+          cp /tmp/admin-clone-plain.err ./admin-clone-plain.err
+          cp /tmp/admin-clone-safe.err ./admin-clone-safe.err
+          cp /tmp/task-eval.err ./task-eval.err
+          git add .; git commit -m 'Record secure Git handoff diagnostics v4'
+          git push --force origin HEAD:"$OUT"
