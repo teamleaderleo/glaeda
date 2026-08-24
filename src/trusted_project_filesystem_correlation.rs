@@ -207,7 +207,12 @@ impl TrustedProjectFilesystemCorrelationProof {
         Ok(())
     }
 
+    /// Legacy anchor-only constructor retained solely for the linux-gated `#589` executor tests.
+    ///
+    /// Their module is not compiled on other hosts, so the function is intentionally unreachable
+    /// there and the portability-scoped allowance keeps non-Linux lint runs honest.
     #[cfg(test)]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn for_test(
         anchor: &OverlaySourceAnchorBinding,
         _legacy_attachment_generation: ProjectDiskAttachmentGeneration,
@@ -363,10 +368,10 @@ mod tests {
         ProjectDiskFilesystemGeneration, ProjectDiskFilesystemKind,
     };
     use crate::project_disk_lease::{
-        ProjectDiskAttachmentGeneration, ProjectDiskGeneration, ProjectDiskId,
-        ProjectDiskLeaseRecord, ProjectDiskLockObservation, ProjectDiskObservation,
-        ProjectDiskPhysicalObservation, ProjectDiskRecoverability, ProjectDiskUseObservation,
-        ResidentSandboxGeneration, ResidentSandboxId,
+        ProjectDiskGeneration, ProjectDiskId, ProjectDiskLeaseRecord, ProjectDiskLeaseState,
+        ProjectDiskLockObservation, ProjectDiskObservation, ProjectDiskPhysicalObservation,
+        ProjectDiskRecoverability, ProjectDiskUseObservation, ResidentSandboxGeneration,
+        ResidentSandboxId,
     };
     use crate::trusted_overlay_task_view::{
         OverlaySourceAnchorBinding, OverlaySourceAnchorGeneration, OverlaySourceAnchorId,
@@ -403,7 +408,9 @@ mod tests {
                 detached_exact(),
             )
             .unwrap();
-        detached.record_attach_success(&plan, attached_exact()).unwrap()
+        detached
+            .record_attach_success(&plan, attached_exact())
+            .unwrap()
     }
 
     fn anchor_for(record: &ProjectDiskLeaseRecord) -> OverlaySourceAnchorBinding {
@@ -535,9 +542,36 @@ mod tests {
         let revalidate = current.require_revalidation().unwrap();
         assert!(
             proof
+                .confirm_current_attachment_and_filesystem(&anchor, &revalidate, &fs, 0xfeed_beef,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn current_confirmation_state_guard_rejects_same_revision_non_attached() {
+        let current = attached_record();
+        let anchor = anchor_for(&current);
+        let fs = filesystem(&current, 7, 2, ProjectDiskFilesystemKind::Xfs);
+        let proof = TrustedProjectFilesystemCorrelationProof::for_test_current(
+            &anchor,
+            &current,
+            &fs,
+            TrustedProjectFilesystemCorrelationGeneration::new(13).unwrap(),
+            0xfeed_beef,
+        )
+        .unwrap();
+        let sibling_detached_start = ProjectDiskLeaseRecord::new_detached(
+            current.project().clone(),
+            current.disk_id().clone(),
+            current.disk_generation(),
+        );
+        let revalidate_required = sibling_detached_start.require_revalidation().unwrap();
+        assert_eq!(revalidate_required.revision(), current.revision());
+        assert!(
+            proof
                 .confirm_current_attachment_and_filesystem(
                     &anchor,
-                    &revalidate,
+                    &revalidate_required,
                     &fs,
                     0xfeed_beef,
                 )
@@ -590,16 +624,14 @@ mod tests {
         )
         .unwrap();
         proof
-            .confirm_current_attachment_and_filesystem(
-                &anchor,
-                &current,
-                &fs,
-                0xfeed_beef,
-            )
+            .confirm_current_attachment_and_filesystem(&anchor, &current, &fs, 0xfeed_beef)
             .unwrap();
         assert_eq!(proof.summary().filesystem_generation().get(), 7);
         assert_eq!(proof.summary().format_profile_generation().get(), 2);
-        assert_eq!(proof.summary().filesystem_kind(), ProjectDiskFilesystemKind::Xfs);
+        assert_eq!(
+            proof.summary().filesystem_kind(),
+            ProjectDiskFilesystemKind::Xfs
+        );
     }
 
     #[test]
