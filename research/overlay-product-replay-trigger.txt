@@ -1,0 +1,1 @@
+Diagnostic trigger for the safe-Rust exact-head OverlayFS product replay. This file lives only on the research branch.
