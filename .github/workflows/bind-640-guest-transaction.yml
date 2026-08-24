@@ -1,0 +1,100 @@
+name: Bind full correlation to exact guest transaction
+
+on:
+  push:
+    branches:
+      - chatgpt/640-verified-full-correlation
+
+permissions:
+  contents: write
+
+jobs:
+  bind:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: chatgpt/640-verified-full-correlation
+          fetch-depth: 0
+          show-progress: false
+      - name: Export and require exact guest transaction
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          lib = Path('src/lib.rs')
+          text = lib.read_text()
+          export = '/// Sealed binding of full guest filesystem evidence to one exact #588 transaction.\npub mod trusted_project_filesystem_guest_transaction;\n'
+          if export not in text:
+              anchor = '/// Opaque composition of exact guest filesystem + whole-block-device evidence.\npub mod trusted_project_filesystem_full_guest_correlation;\n'
+              if text.count(anchor) != 1:
+                  raise SystemExit('unexpected full guest export anchor')
+              text = text.replace(anchor, anchor + export)
+          lib.write_text(text)
+
+          path = Path('src/trusted_project_filesystem_full_correlation.rs')
+          text = path.read_text()
+          import_anchor = 'use crate::trusted_project_filesystem_full_guest_correlation::TrustedProjectFilesystemFullGuestCorrelation;\n'
+          import_line = 'use crate::trusted_project_filesystem_guest_transaction::TrustedProjectFilesystemGuestTransaction;\n'
+          if import_line not in text:
+              if text.count(import_anchor) != 1:
+                  raise SystemExit('unexpected full guest import anchor')
+              text = text.replace(import_anchor, import_anchor + import_line)
+
+          old_sig = '''    host: &TrustedProjectDiskHostAttachmentEvidence,\n    guest: &TrustedProjectFilesystemFullGuestCorrelation,\n    observed_role_filesystem_device: u64,'''
+          new_sig = '''    host: &TrustedProjectDiskHostAttachmentEvidence,\n    guest_transaction: &TrustedProjectFilesystemGuestTransaction,\n    guest: &TrustedProjectFilesystemFullGuestCorrelation,\n    observed_role_filesystem_device: u64,'''
+          if old_sig in text:
+              text = text.replace(old_sig, new_sig, 1)
+
+          guest_anchor = '''    let guest_summary = guest.summary();\n    if guest_summary.filesystem_generation() != filesystem.filesystem_generation()'''
+          guest_replacement = '''    guest_transaction\n        .confirm(current, filesystem, guest)\n        .map_err(|_| guest_correlation_mismatch())?;\n    let guest_summary = guest.summary();\n    if guest_summary.filesystem_generation() != filesystem.filesystem_generation()'''
+          if guest_anchor in text and guest_replacement not in text:
+              text = text.replace(guest_anchor, guest_replacement, 1)
+
+          test_import_anchor = '    use crate::trusted_project_filesystem_full_guest_correlation::correlate_trusted_project_filesystem_guest;\n'
+          test_import = '    use crate::trusted_project_filesystem_guest_transaction::TrustedProjectFilesystemGuestTransaction;\n'
+          if test_import not in text:
+              if text.count(test_import_anchor) != 1:
+                  raise SystemExit('unexpected test guest import anchor')
+              text = text.replace(test_import_anchor, test_import_anchor + test_import)
+
+          helper_anchor = '''    fn create(current: &ProjectDiskLeaseRecord) -> TrustedProjectDiskCreateProvenanceEvidence {'''
+          helper = '''    fn guest_transaction(\n        current: &ProjectDiskLeaseRecord,\n        filesystem: &ProjectDiskFilesystemBinding,\n    ) -> TrustedProjectFilesystemGuestTransaction {\n        TrustedProjectFilesystemGuestTransaction::for_test(\n            current,\n            filesystem,\n            4,\n            digest('4'),\n            5,\n            digest('5'),\n            digest('6'),\n            digest('7'),\n        )\n        .unwrap()\n    }\n\n'''
+          if helper not in text:
+              if text.count(helper_anchor) != 1:
+                  raise SystemExit('unexpected create helper anchor')
+              text = text.replace(helper_anchor, helper + helper_anchor, 1)
+
+          # Insert exact guest transaction immediately before every full guest argument in test calls.
+          replacements = [
+              ('            &host(&current),\n            &guest(&fs),', '            &host(&current),\n            &guest_transaction(&current, &fs),\n            &guest(&fs),'),
+              ('            &wrong,\n            &guest(&fs),', '            &wrong,\n            &guest_transaction(&current, &fs),\n            &guest(&fs),'),
+              ('            &host(&current),\n            &guest(&wrong_guest_fs),', '            &host(&current),\n            &guest_transaction(&current, &accepted),\n            &guest(&wrong_guest_fs),'),
+          ]
+          for old, new in replacements:
+              text = text.replace(old, new)
+
+          path.write_text(text)
+          PY
+      - name: Format and focused tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.97.1 --profile minimal --component rustfmt --no-self-update
+          cargo fmt --all
+          cargo test --locked trusted_project_filesystem_guest_transaction
+          cargo test --locked trusted_project_filesystem_full_correlation
+      - name: Remove helper and publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f .github/workflows/bind-640-guest-transaction.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "#640 bind full correlation to exact guest transaction"
+          git push origin HEAD:chatgpt/640-verified-full-correlation
