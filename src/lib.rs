@@ -258,6 +258,8 @@ pub mod project_checkout_observation;
 pub mod project_discovery;
 /// Pure crash-safe single-writer lease planning for resident trusted project disks.
 pub mod project_disk_lease;
+/// Pure short-lived witness for one exact planned project-disk attachment.
+pub(crate) mod project_disk_pending_attachment;
 pub mod renderprove_artifact_binding;
 pub mod renderprove_execution;
 #[cfg(target_os = "linux")]
