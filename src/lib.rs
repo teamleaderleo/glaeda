@@ -111,6 +111,9 @@ pub mod immutable_git_object_pool;
 /// Pure sealed non-task Git producer planning for immutable pool publication.
 #[cfg(target_os = "linux")]
 pub mod immutable_git_object_pool_admin_producer_plan;
+/// Publication-time descriptor-bound audit of staged immutable Git pool candidates.
+#[cfg(target_os = "linux")]
+pub mod immutable_git_object_pool_generation_audit;
 /// Pure fixed marker codec for immutable Git object-pool generations.
 pub mod immutable_git_object_pool_marker;
 /// Read-only descriptor-bound ownership observation of immutable Git object-pool generations.
