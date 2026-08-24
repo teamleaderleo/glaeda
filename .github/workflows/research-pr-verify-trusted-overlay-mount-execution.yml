@@ -1,0 +1,54 @@
+name: Research verify sealed OverlayFS execution
+
+on:
+  pull_request:
+    paths:
+      - "src/trusted_overlay_mount_execution.rs"
+      - "src/trusted_project_filesystem_correlation.rs"
+      - ".github/workflows/research-pr-verify-trusted-overlay-mount-execution.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  verify-executor:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          show-progress: false
+      - run: rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt --no-self-update
+      - name: Patch internal seams in ephemeral checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/trusted_overlay_mount_plan.rs'); s=p.read_text()
+          s=s.replace('use std::os::fd::{AsFd as _, OwnedFd};', 'use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};', 1)
+          marker='''impl TrustedOverlayMountDescriptorLease {\n    #[must_use]\n    pub const fn summary(&self) -> TrustedOverlayMountDescriptorLeaseSummary {\n        self.summary\n    }\n'''
+          addition='''impl TrustedOverlayMountDescriptorLease {\n    #[must_use]\n    pub const fn summary(&self) -> TrustedOverlayMountDescriptorLeaseSummary {\n        self.summary\n    }\n\n    pub(crate) fn execution_descriptors(&self) -> TrustedOverlayMountExecutionDescriptors<'_> {\n        TrustedOverlayMountExecutionDescriptors {\n            lower: self.lower.as_fd(),\n            upper: self.upper.as_fd(),\n            work: self.work.as_fd(),\n            merged: self.merged.as_fd(),\n            merged_parent: self.merged_parent.as_fd(),\n            merged_name: &self.merged_name,\n        }\n    }\n'''
+          if marker not in s: raise SystemExit('descriptor impl insertion point missing')
+          s=s.replace(marker,addition,1)
+          marker='''impl fmt::Debug for TrustedOverlayMountDescriptorLease {'''
+          bundle='''pub(crate) struct TrustedOverlayMountExecutionDescriptors<'a> {\n    pub(crate) lower: BorrowedFd<'a>,\n    pub(crate) upper: BorrowedFd<'a>,\n    pub(crate) work: BorrowedFd<'a>,\n    pub(crate) merged: BorrowedFd<'a>,\n    pub(crate) merged_parent: BorrowedFd<'a>,\n    pub(crate) merged_name: &'a OsStr,\n}\n\n'''
+          if marker not in s: raise SystemExit('bundle insertion point missing')
+          s=s.replace(marker,bundle+marker,1)
+          p.write_text(s)
+          p=Path('src/lib.rs'); s=p.read_text()
+          marker='''#[cfg(target_os = "linux")]\npub mod trusted_overlay_mount_plan;\n'''
+          if marker not in s: raise SystemExit('lib insertion point missing')
+          addition='''/// Opaque project-disk/filesystem correlation gate for trusted resident Linux mutation.\npub mod trusted_project_filesystem_correlation;\n/// Sealed all-FD trusted OverlayFS mount transaction.\n#[cfg(target_os = "linux")]\npub mod trusted_overlay_mount_execution;\n'''
+          if 'pub mod trusted_project_filesystem_correlation;' not in s:
+              s=s.replace(marker,marker+addition,1)
+          p.write_text(s)
+          PY
+      - name: Verify executor composition
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          cargo test --locked trusted_project_filesystem_correlation
+          cargo test --locked trusted_overlay_mount_execution
+          cargo test --locked trusted_overlay_mount_plan
+          cargo clippy --locked --all-targets --all-features -- -D warnings
