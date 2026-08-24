@@ -12,7 +12,7 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::File;
 use std::io::{Read as _, Seek as _, SeekFrom};
-use std::os::fd::{AsFd as _, OwnedFd};
+use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 use std::path::{Component, Path};
 
 use rustix::fs::{self as rustix_fs, AtFlags, FileType, Mode, OFlags};
@@ -150,6 +150,14 @@ impl ImmutableGitObjectPoolObservation {
         &self.binding
     }
 
+    /// Borrow the exact retained `objects/` descriptor for crate-internal publication audit.
+    ///
+    /// The descriptor remains owned by this observation. No path, device, inode, or mutation
+    /// authority is exposed. Callers must reconfirm this observation after their audit.
+    pub(crate) fn retained_objects_descriptor(&self) -> BorrowedFd<'_> {
+        self.objects.fd.as_fd()
+    }
+
     /// Reconfirm the exact held ownership envelope against the same logical #583 binding.
     ///
     /// # Errors
@@ -245,6 +253,15 @@ pub fn observe_immutable_git_object_pool_generation(
     binding: &GitObjectPoolBinding,
 ) -> Result<ImmutableGitObjectPoolObservation, ImmutableGitObjectPoolObservationError> {
     observe_with_owner(generation_path, binding, ROOT_OWNER, || {})
+}
+
+#[cfg(test)]
+pub(crate) fn observe_immutable_git_object_pool_generation_for_test(
+    generation_path: &Path,
+    binding: &GitObjectPoolBinding,
+    authority_owner: (u32, u32),
+) -> Result<ImmutableGitObjectPoolObservation, ImmutableGitObjectPoolObservationError> {
+    observe_with_owner(generation_path, binding, authority_owner, || {})
 }
 
 fn observe_with_owner<F>(
