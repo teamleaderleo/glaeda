@@ -173,14 +173,14 @@ pub fn execute_trusted_overlay_mount(
     descriptor_lease: &TrustedOverlayMountDescriptorLease,
     source_anchor: &OverlaySourceAnchorRecord,
     task_view: &OverlayTaskViewRecord,
-    correlation: &TrustedProjectFilesystemCorrelationProof,
+    correlation: TrustedProjectFilesystemCorrelationProof,
 ) -> Result<TrustedOverlayMountExecutionReceipt, TrustedOverlayMountExecutionError> {
     execute_with_backend(
         plan,
         descriptor_lease,
         source_anchor,
         task_view,
-        correlation,
+        &correlation,
         &mut RustixOverlayMountBackend,
     )
 }
