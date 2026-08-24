@@ -258,6 +258,21 @@ def _path_from_json(value: Any, label: str) -> Path:
     return _validate_exact_absolute_path(Path(value), label)
 
 
+def _open_absolute_directory(path: Path, label: str) -> int:
+    path = _validate_exact_absolute_path(path, label)
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    current = os.open("/", flags)
+    try:
+        for component in path.parts[1:]:
+            next_fd = os.open(component, flags, dir_fd=current)
+            os.close(current)
+            current = next_fd
+        return current
+    except BaseException:
+        os.close(current)
+        raise
+
+
 def _directory_snapshot_from_fd(directory_fd: int) -> dict[str, Any]:
     observed = os.fstat(directory_fd)
     if not stat.S_ISDIR(observed.st_mode):
@@ -313,8 +328,7 @@ def _read_explicit_small_file(
 
 def _capture_directory(disk_directory: Path, explicit_small_reads: set[str]) -> dict[str, Any]:
     disk_directory = _validate_exact_absolute_path(disk_directory, "disk directory")
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    directory_fd = os.open(disk_directory, flags)
+    directory_fd = _open_absolute_directory(disk_directory, "disk directory")
     try:
         before_directory = _directory_snapshot_from_fd(directory_fd)
         names = os.listdir(directory_fd)
@@ -364,7 +378,7 @@ def _capture_directory(disk_directory: Path, explicit_small_reads: set[str]) -> 
             )
 
         after_directory = _directory_snapshot_from_fd(directory_fd)
-        rebound_fd = os.open(disk_directory, flags)
+        rebound_fd = _open_absolute_directory(disk_directory, "disk directory")
         try:
             rebound_directory = _directory_snapshot_from_fd(rebound_fd)
         finally:
@@ -403,6 +417,14 @@ def _parse_host_identity(path: Path, expected_instance: str) -> dict[str, Any]:
     return value
 
 
+def _linux_device_numbers(device: int) -> tuple[int, int]:
+    if device < 0 or device > (1 << 64) - 1:
+        raise ReceiptError("guest project stat contains an invalid Linux device number")
+    major = ((device & 0x00000000000FFF00) >> 8) | ((device & 0xFFFFF00000000000) >> 32)
+    minor = (device & 0x00000000000000FF) | ((device & 0x00000FFFFFF00000) >> 12)
+    return major, minor
+
+
 def _parse_guest_stat(path: Path) -> dict[str, int]:
     data = _read_bounded(path, 256, "guest project stat")
     try:
@@ -415,7 +437,13 @@ def _parse_guest_stat(path: Path) -> dict[str, int]:
     device, inode = (int(field) for field in fields)
     if device < 0 or inode <= 0:
         raise ReceiptError("guest project stat contains an invalid device/inode")
-    return {"device": device, "inode": inode}
+    device_major, device_minor = _linux_device_numbers(device)
+    return {
+        "device": device,
+        "device_major": device_major,
+        "device_minor": device_minor,
+        "inode": inode,
+    }
 
 
 def _decode_mountinfo_field(field: bytes) -> bytes:
@@ -776,7 +804,9 @@ def validate_receipt(receipt: Any) -> dict[str, Any]:
         correlation["guest_project_filesystem"], {"mountpoint", "stat", "mountinfo"}, "guest"
     )
     guest_path = _path_from_json(guest["mountpoint"], "guest project mountpoint")
-    guest_stat = _require_exact_keys(guest["stat"], {"device", "inode"}, "guest stat")
+    guest_stat = _require_exact_keys(
+        guest["stat"], {"device", "device_major", "device_minor", "inode"}, "guest stat"
+    )
     if (
         isinstance(guest_stat["device"], bool)
         or not isinstance(guest_stat["device"], int)
@@ -784,9 +814,26 @@ def validate_receipt(receipt: Any) -> dict[str, Any]:
         or isinstance(guest_stat["inode"], bool)
         or not isinstance(guest_stat["inode"], int)
         or guest_stat["inode"] <= 0
+        or isinstance(guest_stat["device_major"], bool)
+        or not isinstance(guest_stat["device_major"], int)
+        or guest_stat["device_major"] < 0
+        or isinstance(guest_stat["device_minor"], bool)
+        or not isinstance(guest_stat["device_minor"], int)
+        or guest_stat["device_minor"] < 0
     ):
         raise ReceiptError("guest stat device/inode is invalid")
+    decoded_major, decoded_minor = _linux_device_numbers(guest_stat["device"])
+    if (decoded_major, decoded_minor) != (
+        guest_stat["device_major"],
+        guest_stat["device_minor"],
+    ):
+        raise ReceiptError("guest stat Linux device decode is inconsistent")
     _validate_mountinfo(guest["mountinfo"])
+    if (guest_stat["device_major"], guest_stat["device_minor"]) != (
+        guest["mountinfo"]["device_major"],
+        guest["mountinfo"]["device_minor"],
+    ):
+        raise ReceiptError("guest stat and exact mountinfo row name different filesystems")
     observed_mountpoint = _validate_bytes_view(guest["mountinfo"]["mountpoint"], "guest mountpoint row")
     if observed_mountpoint != os.fsencode(os.fspath(guest_path)):
         raise ReceiptError("guest mountinfo row disagrees with declared exact project mountpoint")
