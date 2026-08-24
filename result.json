@@ -1,0 +1,18 @@
+{
+  "arch": "aarch64",
+  "base_errno": 0,
+  "base_rc": 11,
+  "base_read": 5,
+  "base_value": "base",
+  "compile_rc": null,
+  "findmnt": "303 overlay rw,nosuid,nodev,relatime,lowerdir+=/home/runner/work/_temp/smolrunner-parent-reopen-v2/lower,upperdir=/home/runner/work/_temp/smolrunner-parent-reopen-v2/upper,workdir=/home/runner/work/_temp/smolrunner-parent-reopen-v2/work,uuid=on,nouserxattr",
+  "findmnt_err": "",
+  "findmnt_rc": 0,
+  "kernel": "6.17.0-1022-azure",
+  "mount": 2147484900,
+  "schema_version": 2,
+  "under": 2147483678,
+  "under_differs": true,
+  "visible": 2147484900,
+  "visible_matches_mount": true
+}
