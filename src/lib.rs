@@ -108,9 +108,9 @@ pub mod hot_execution_performance;
 pub mod hot_state_path_policy;
 /// Pure immutable resident Git object-pool generation and consumer-lease core.
 pub mod immutable_git_object_pool;
-/// Publication-time descriptor-bound audit of staged immutable Git pool candidates.
+/// Pure sealed non-task Git producer planning for immutable pool publication.
 #[cfg(target_os = "linux")]
-pub mod immutable_git_object_pool_generation_audit;
+pub mod immutable_git_object_pool_admin_producer_plan;
 /// Pure fixed marker codec for immutable Git object-pool generations.
 pub mod immutable_git_object_pool_marker;
 /// Read-only descriptor-bound ownership observation of immutable Git object-pool generations.
