@@ -70,6 +70,7 @@ jobs:
           print(f"renamed_occurrences={total}")
           PY
           rm .github/workflows/research-591-rename-generator.yml
+          cargo fmt --all
           cargo fmt --all -- --check
           git diff --check
           git config user.name "smolrunner-research-generator"
