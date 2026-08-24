@@ -77,6 +77,36 @@ pub struct ProjectDiskFilesystemBinding {
 }
 
 impl ProjectDiskFilesystemBinding {
+    /// Construct one filesystem identity directly from the pre-format logical project-disk
+    /// generation.
+    ///
+    /// This is the P3 -> P4 constructor. It deliberately does not require a
+    /// [`ProjectDiskLeaseRecord`], because P1 models an already-formatted disk and therefore cannot
+    /// legitimately exist until P4 has completed format and post-format observation.
+    #[must_use]
+    pub fn new_for_project_disk(
+        project: ProjectIdentity,
+        disk_id: ProjectDiskId,
+        disk_generation: ProjectDiskGeneration,
+        filesystem_generation: ProjectDiskFilesystemGeneration,
+        format_profile_generation: ProjectDiskFilesystemFormatProfileGeneration,
+        kind: ProjectDiskFilesystemKind,
+    ) -> Self {
+        Self {
+            schema_version: PROJECT_DISK_FILESYSTEM_SCHEMA_VERSION,
+            project,
+            disk_id,
+            disk_generation,
+            filesystem_generation,
+            format_profile_generation,
+            kind,
+        }
+    }
+
+    /// Convenience constructor for an already-formatted disk that already has a valid P1 lease.
+    ///
+    /// New P4 format flows must use [`Self::new_for_project_disk`] before `mkfs`; this constructor is
+    /// retained for compatibility with existing read-only consumers and tests.
     #[must_use]
     pub fn new(
         record: &ProjectDiskLeaseRecord,
@@ -84,15 +114,14 @@ impl ProjectDiskFilesystemBinding {
         format_profile_generation: ProjectDiskFilesystemFormatProfileGeneration,
         kind: ProjectDiskFilesystemKind,
     ) -> Self {
-        Self {
-            schema_version: PROJECT_DISK_FILESYSTEM_SCHEMA_VERSION,
-            project: record.project().clone(),
-            disk_id: record.disk_id().clone(),
-            disk_generation: record.disk_generation(),
+        Self::new_for_project_disk(
+            record.project().clone(),
+            record.disk_id().clone(),
+            record.disk_generation(),
             filesystem_generation,
             format_profile_generation,
             kind,
-        }
+        )
     }
 
     #[must_use]
@@ -130,15 +159,30 @@ impl ProjectDiskFilesystemBinding {
         self.kind
     }
 
+    /// Return whether this declaration names an exact logical project-disk generation.
+    #[must_use]
+    pub fn matches_project_disk_identity(
+        &self,
+        project: &ProjectIdentity,
+        disk_id: &ProjectDiskId,
+        disk_generation: ProjectDiskGeneration,
+    ) -> bool {
+        project == &self.project
+            && disk_id == &self.disk_id
+            && disk_generation == self.disk_generation
+    }
+
     /// Return whether this declaration still names the same logical project-disk generation.
     ///
     /// Lease revision and attachment state are deliberately excluded: those are separately current
     /// authority and can change while the same formatted filesystem generation remains resident.
     #[must_use]
     pub fn matches_project_disk(&self, record: &ProjectDiskLeaseRecord) -> bool {
-        record.project() == &self.project
-            && record.disk_id() == &self.disk_id
-            && record.disk_generation() == self.disk_generation
+        self.matches_project_disk_identity(
+            record.project(),
+            record.disk_id(),
+            record.disk_generation(),
+        )
     }
 }
 
@@ -172,9 +216,13 @@ mod tests {
     use crate::project_catalog::ProjectIdentity;
     use crate::project_disk_lease::{ProjectDiskGeneration, ProjectDiskId, ProjectDiskLeaseRecord};
 
+    fn project() -> ProjectIdentity {
+        ProjectIdentity::parse("github.com/teamleaderleo/smolrunner").unwrap()
+    }
+
     fn record(disk: &str, generation: u64) -> ProjectDiskLeaseRecord {
         ProjectDiskLeaseRecord::new_detached(
-            ProjectIdentity::parse("github.com/teamleaderleo/smolrunner").unwrap(),
+            project(),
             ProjectDiskId::parse(disk).unwrap(),
             ProjectDiskGeneration::new(generation).unwrap(),
         )
@@ -185,6 +233,24 @@ mod tests {
         assert!(ProjectDiskFilesystemGeneration::new(0).is_err());
         assert!(ProjectDiskFilesystemFormatProfileGeneration::new(0).is_err());
         assert_eq!(ProjectDiskFilesystemGeneration::new(2).unwrap().get(), 2);
+    }
+
+    #[test]
+    fn preformat_binding_needs_no_p1_lease() {
+        let disk_id = ProjectDiskId::parse("disk-a").unwrap();
+        let disk_generation = ProjectDiskGeneration::new(3).unwrap();
+        let binding = ProjectDiskFilesystemBinding::new_for_project_disk(
+            project(),
+            disk_id.clone(),
+            disk_generation,
+            ProjectDiskFilesystemGeneration::new(7).unwrap(),
+            ProjectDiskFilesystemFormatProfileGeneration::new(2).unwrap(),
+            ProjectDiskFilesystemKind::Xfs,
+        );
+        assert!(binding.matches_project_disk_identity(&project(), &disk_id, disk_generation));
+        assert_eq!(binding.filesystem_generation().get(), 7);
+        assert_eq!(binding.format_profile_generation().get(), 2);
+        assert_eq!(binding.kind(), ProjectDiskFilesystemKind::Xfs);
     }
 
     #[test]
