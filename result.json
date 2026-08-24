@@ -1,0 +1,42 @@
+{
+  "alias": {
+    "seed_regular_files": 3,
+    "shared_inode_count": 0,
+    "source_regular_files": 3
+  },
+  "status": {
+    "admin_clone_rc": 0,
+    "admin_plain_rc": 0,
+    "admin_safe_rc": 0,
+    "alias_rc": 0,
+    "remove_origin_rc": 0,
+    "seed_rc": 0,
+    "task_eval_rc": 0
+  },
+  "task": {
+    "all_hostile_refused": true,
+    "alternates": "",
+    "hostile_attempt_rc": {
+      "chmod_objects": 1,
+      "overwrite_head": 2,
+      "touch_ref": 1
+    },
+    "remotes": [],
+    "seed_digest_after": "c42a8d041dc91138127abead5d53240e8bf7f788faafde6bce5acd62d6b1ce71",
+    "seed_digest_before": "c42a8d041dc91138127abead5d53240e8bf7f788faafde6bce5acd62d6b1ce71",
+    "seed_exists": true,
+    "seed_fsck_rc": 0,
+    "seed_head": "86403049d91daa7c8dd82571503ebc65aa79621d",
+    "seed_mode": "0o555",
+    "seed_uid": 0,
+    "seed_unchanged": true,
+    "task_commands": {
+      "add": 0,
+      "cat_file": 0,
+      "checkout": 0,
+      "commit": 0,
+      "gc": 0
+    },
+    "task_exists": true
+  }
+}
