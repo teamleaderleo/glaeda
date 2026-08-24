@@ -21,14 +21,8 @@ jobs:
           from pathlib import Path
           p = Path("src/lib.rs")
           s = p.read_text()
-          anchor = '''/// Read-only descriptor-bound ownership observation of immutable Git object-pool generations.
-          #[cfg(target_os = "linux")]
-          pub mod immutable_git_object_pool_observation;
-          '''
-          replacement = anchor + '''/// Descriptor-relative publication audit for immutable Git object-pool candidate generations.
-          #[cfg(target_os = "linux")]
-          pub mod immutable_git_object_pool_generation_audit;
-          '''
+          anchor = "/// Read-only descriptor-bound ownership observation of immutable Git object-pool generations.\n#[cfg(target_os = \"linux\")]\npub mod immutable_git_object_pool_observation;\n"
+          replacement = anchor + "/// Descriptor-relative publication audit for immutable Git object-pool candidate generations.\n#[cfg(target_os = \"linux\")]\npub mod immutable_git_object_pool_generation_audit;\n"
           if s.count(anchor) != 1:
               raise SystemExit("immutable pool observation module anchor changed")
           p.write_text(s.replace(anchor, replacement, 1))
