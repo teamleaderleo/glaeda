@@ -1,0 +1,35 @@
+name: Format project-disk state model
+
+on:
+  push:
+    branches:
+      - chatgpt/645-format-state-model
+
+permissions:
+  contents: write
+
+jobs:
+  format:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: chatgpt/645-format-state-model
+          fetch-depth: 0
+          show-progress: false
+      - name: Install pinned Rust formatter
+        shell: bash
+        run: rustup toolchain install 1.97.1 --profile minimal --component rustfmt --no-self-update
+      - name: Format and remove helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all
+          rm .github/workflows/format-661.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "#645 format project-disk state model"
+          git push origin HEAD:chatgpt/645-format-state-model
