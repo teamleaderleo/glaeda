@@ -3,7 +3,7 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{Read as _, Take};
-use std::os::fd::{AsFd as _, OwnedFd};
+use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Component, Path, PathBuf};
@@ -330,6 +330,17 @@ impl TrustedOverlayMountDescriptorLease {
         self.summary
     }
 
+    pub(crate) fn execution_descriptors(&self) -> TrustedOverlayMountExecutionDescriptors<'_> {
+        TrustedOverlayMountExecutionDescriptors {
+            lower: self.lower.as_fd(),
+            upper: self.upper.as_fd(),
+            work: self.work.as_fd(),
+            merged: self.merged.as_fd(),
+            merged_parent: self.merged_parent.as_fd(),
+            merged_name: &self.merged_name,
+        }
+    }
+
     /// Reconfirm the held role descriptors against this exact sealed plan and current task authority.
     ///
     /// # Errors
@@ -354,6 +365,15 @@ impl TrustedOverlayMountDescriptorLease {
         validate_held_roles([&self.lower, &self.upper, &self.work, &self.merged])?;
         Ok(())
     }
+}
+
+pub(crate) struct TrustedOverlayMountExecutionDescriptors<'a> {
+    pub(crate) lower: BorrowedFd<'a>,
+    pub(crate) upper: BorrowedFd<'a>,
+    pub(crate) work: BorrowedFd<'a>,
+    pub(crate) merged: BorrowedFd<'a>,
+    pub(crate) merged_parent: BorrowedFd<'a>,
+    pub(crate) merged_name: &'a OsStr,
 }
 
 impl fmt::Debug for TrustedOverlayMountDescriptorLease {
