@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - research/hot-linux-physical-pr
+  pull_request:
+    paths:
+      - ".github/workflows/research-git-object-alternates.yml"
 
 permissions:
   contents: read
