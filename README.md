@@ -28,12 +28,15 @@ The strict disposable path already includes a substantial durable controller: pr
 
 Recent work has also established the first trusted persistent runner lane, warm pause/resume, auto-idle behavior, and the new top-level product direction: **make SmolRunner blazingly hot**.
 
+Current M6 main now carries the first concrete hot-state substrate rather than only a roadmap: bounded hot-execution performance receipts, a pure path-class policy for deciding which state may be shared, crash-safe single-writer project-disk leases, trusted OverlayFS task-view and mount-plan cores, descriptor-bound mount prerequisites, immutable Git object-pool generations with consumer leases and fixed markers, and Git index stat patching for copy-on-write task materialization. These are landed reusable primitives; the end-to-end routing and benchmarked task loop is still being composed around them.
+
 The immediate production work remains:
 
 - finish the installed-service one-job disposable journey;
 - close restart-safe ownership for in-flight Lima mutations;
 - extend sleep/reboot/outage/teardown recovery;
-- prove and implement the hostile-worker network boundary.
+- prove and implement the hostile-worker network boundary;
+- compose the landed M6 OverlayFS, Git-pool, lease, and performance primitives into measured trusted task loops.
 
 Hot trusted execution progresses in parallel where it preserves those guarantees. See the [roadmap](docs/ROADMAP.md), [#557](https://github.com/teamleaderleo/smolrunner/issues/557), and the strict disposable programme [#365](https://github.com/teamleaderleo/smolrunner/issues/365).
 
