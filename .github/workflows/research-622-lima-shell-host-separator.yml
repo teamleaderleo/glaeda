@@ -1,0 +1,50 @@
+name: Research verify host-side Lima shell separator
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/research-622-lima-shell-host-separator.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: research/622-lima-shell-host-separator
+          fetch-depth: 0
+          show-progress: false
+      - name: Insert exact host guest-command separator and verify
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('src/trusted_guest_control_invocation_plan.rs')
+          s = p.read_text()
+          old = '''        .argument("shell")\n        .argument(target.instance.as_str())\n        .argument(SUDO)\n'''
+          new = '''        .argument("shell")\n        .argument(target.instance.as_str())\n        .argument("--")\n        .argument(SUDO)\n'''
+          if s.count(old) != 1:
+              raise SystemExit('host shell separator insertion point changed')
+          s = s.replace(old, new, 1)
+          old = '''                "shell",\n                "resident-a",\n                SUDO,\n'''
+          new = '''                "shell",\n                "resident-a",\n                "--",\n                SUDO,\n'''
+          if s.count(old) != 1:
+              raise SystemExit('expected argv insertion point changed')
+          p.write_text(s.replace(old, new, 1))
+          PY
+          rm .github/workflows/research-622-lima-shell-host-separator.yml
+          cargo fmt --all
+          cargo fmt --all -- --check
+          cargo test --locked trusted_guest_control_invocation_plan
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          git diff --check
+          git config user.name "smolrunner-research-repair"
+          git config user.email "actions@users.noreply.github.com"
+          git add src/trusted_guest_control_invocation_plan.rs .github/workflows/research-622-lima-shell-host-separator.yml
+          git commit -m "Harden host-side Lima shell separator"
+          git push origin HEAD:research/622-lima-shell-host-separator
