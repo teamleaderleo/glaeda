@@ -17,6 +17,7 @@ const REDACTED: &str = "[REDACTED]";
 const CAPTURE_BUFFER_BYTES: usize = 8_192;
 const CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 pub const MAX_CAPTURED_STREAM_BYTES: usize = 1_048_576;
+pub const MAX_CAPTURED_STDIN_BYTES: usize = 4 * 1024;
 pub const MAX_COMMAND_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Clone, PartialEq, Eq)]
@@ -195,6 +196,26 @@ pub trait TimedCommandExecutor: CommandExecutor {
     ) -> io::Result<ExecutionRecord>;
 }
 
+pub trait TimedInputCommandExecutor: TimedCommandExecutor {
+    /// Execute one explicit program with a reviewed timeout and one bounded non-secret stdin body.
+    ///
+    /// Input bytes are written exactly once with no implicit terminator. The executor never inserts
+    /// them into argv, environment, or an `ExecutionRecord` field; child-controlled stdout/stderr
+    /// remains ordinary captured output and may independently echo those bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidInput` for an invalid timeout or input larger than the fixed stdin limit.
+    /// Writer setup/write failure, output capture failure, timeout, and output exhaustion retain the
+    /// existing process-group termination and reaping contract.
+    fn execute_with_input(
+        &self,
+        spec: &CommandSpec,
+        input: &[u8],
+        timeout: Duration,
+    ) -> io::Result<ExecutionRecord>;
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ProcessExecutor;
 
@@ -210,14 +231,42 @@ impl TimedCommandExecutor for ProcessExecutor {
         spec: &CommandSpec,
         timeout: Duration,
     ) -> io::Result<ExecutionRecord> {
-        if timeout.is_zero() || timeout > MAX_COMMAND_TIMEOUT {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "command timeout must be within the bounded positive range",
-            ));
-        }
+        validate_timeout(timeout)?;
         execute_process(spec, Some(timeout))
     }
+}
+
+impl TimedInputCommandExecutor for ProcessExecutor {
+    fn execute_with_input(
+        &self,
+        spec: &CommandSpec,
+        input: &[u8],
+        timeout: Duration,
+    ) -> io::Result<ExecutionRecord> {
+        validate_timeout(timeout)?;
+        validate_plain_stdin(input)?;
+        execute_process_with_input_spawner(spec, Some(timeout), Some(input), &ThreadCaptureSpawner)
+    }
+}
+
+fn validate_timeout(timeout: Duration) -> io::Result<()> {
+    if timeout.is_zero() || timeout > MAX_COMMAND_TIMEOUT {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "command timeout must be within the bounded positive range",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_plain_stdin(input: &[u8]) -> io::Result<()> {
+    if input.len() > MAX_CAPTURED_STDIN_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "command stdin exceeds the fixed bounded input limit",
+        ));
+    }
+    Ok(())
 }
 
 fn execute_process(spec: &CommandSpec, timeout: Option<Duration>) -> io::Result<ExecutionRecord> {
@@ -229,7 +278,31 @@ fn execute_process_with_spawner<S: CaptureThreadSpawner>(
     timeout: Option<Duration>,
     spawner: &S,
 ) -> io::Result<ExecutionRecord> {
+    execute_process_with_input_spawner(spec, timeout, None, spawner)
+}
+
+fn execute_process_with_input_spawner<S: CaptureThreadSpawner>(
+    spec: &CommandSpec,
+    timeout: Option<Duration>,
+    input: Option<&[u8]>,
+    spawner: &S,
+) -> io::Result<ExecutionRecord> {
     ensure_absolute_program(&spec.program)?;
+    if let Some(input) = input {
+        validate_plain_stdin(input)?;
+        if spec.secret_stdin.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "plain and secret standard input cannot be combined",
+            ));
+        }
+        if timeout.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "plain-input commands require a reviewed wall-clock timeout",
+            ));
+        }
+    }
     let deadline = timeout
         .map(|duration| {
             Instant::now().checked_add(duration).ok_or_else(|| {
@@ -247,7 +320,11 @@ fn execute_process_with_spawner<S: CaptureThreadSpawner>(
     let mut command = Command::new(&spec.program);
     command
         .env_clear()
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
@@ -257,6 +334,20 @@ fn execute_process_with_spawner<S: CaptureThreadSpawner>(
     }
 
     let mut child = command.spawn()?;
+    let input_pipe = if let Some(input) = input {
+        let stdin = match child.stdin.take() {
+            Some(stdin) => stdin,
+            None => {
+                abort_spawned_child(&mut child)?;
+                return Err(io::Error::other(
+                    "child stdin was not available after requesting a pipe",
+                ));
+            }
+        };
+        Some((stdin, input.to_vec()))
+    } else {
+        None
+    };
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
         None => {
@@ -284,21 +375,36 @@ fn execute_process_with_spawner<S: CaptureThreadSpawner>(
             return Err(error);
         }
     };
-    let stderr_reader = match spawner.spawn(stderr, CapturedStream::Stderr, sender) {
+    let stderr_reader = match spawner.spawn(stderr, CapturedStream::Stderr, sender.clone()) {
         Ok(reader) => reader,
         Err(error) => {
             cleanup_capture_setup_failure(&mut child, vec![stdout_reader])?;
             return Err(error);
         }
     };
+    let mut input_writer = if let Some((stdin, input)) = input_pipe {
+        match spawner.spawn_input_writer(stdin, input, sender.clone()) {
+            Ok(writer) => Some(writer),
+            Err(error) => {
+                cleanup_capture_setup_failure(&mut child, vec![stdout_reader, stderr_reader])?;
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
+    drop(sender);
     let mut stdout_bytes = None;
     let mut stderr_bytes = None;
+    let mut input_complete = input_writer.is_none();
     let mut exceeded = BTreeSet::new();
     let mut capture_error = None;
+    let mut input_error = None;
     let mut timed_out = false;
 
-    while stdout_bytes.is_none() || stderr_bytes.is_none() {
-        let abort_in_progress = timed_out || capture_error.is_some() || !exceeded.is_empty();
+    while stdout_bytes.is_none() || stderr_bytes.is_none() || !input_complete {
+        let abort_in_progress =
+            timed_out || capture_error.is_some() || input_error.is_some() || !exceeded.is_empty();
         let event = if abort_in_progress {
             match receiver.recv() {
                 Ok(event) => event,
@@ -306,11 +412,13 @@ fn execute_process_with_spawner<S: CaptureThreadSpawner>(
                     let wait_result = child.wait();
                     let stdout_join_result = join_capture_reader(stdout_reader);
                     let stderr_join_result = join_capture_reader(stderr_reader);
+                    let input_join_result = join_optional_input_writer(input_writer.take());
                     wait_result?;
                     stdout_join_result?;
                     stderr_join_result?;
+                    input_join_result?;
                     return Err(io::Error::other(
-                        "output capture workers stopped before reporting completion",
+                        "process I/O workers stopped before reporting completion",
                     ));
                 }
             }
@@ -332,12 +440,14 @@ fn execute_process_with_spawner<S: CaptureThreadSpawner>(
                     let wait_result = child.wait();
                     let stdout_join_result = join_capture_reader(stdout_reader);
                     let stderr_join_result = join_capture_reader(stderr_reader);
+                    let input_join_result = join_optional_input_writer(input_writer.take());
                     termination_result?;
                     wait_result?;
                     stdout_join_result?;
                     stderr_join_result?;
+                    input_join_result?;
                     return Err(io::Error::other(
-                        "output capture workers stopped before reporting completion",
+                        "process I/O workers stopped before reporting completion",
                     ));
                 }
             }
@@ -349,12 +459,14 @@ fn execute_process_with_spawner<S: CaptureThreadSpawner>(
                     let wait_result = child.wait();
                     let stdout_join_result = join_capture_reader(stdout_reader);
                     let stderr_join_result = join_capture_reader(stderr_reader);
+                    let input_join_result = join_optional_input_writer(input_writer.take());
                     termination_result?;
                     wait_result?;
                     stdout_join_result?;
                     stderr_join_result?;
+                    input_join_result?;
                     return Err(io::Error::other(
-                        "output capture workers stopped before reporting completion",
+                        "process I/O workers stopped before reporting completion",
                     ));
                 }
             }
@@ -380,16 +492,26 @@ fn execute_process_with_spawner<S: CaptureThreadSpawner>(
                     CapturedStream::Stderr => stderr_bytes = Some(bytes),
                 }
             }
+            CaptureEvent::InputCompleted(result) => {
+                input_complete = true;
+                if let Err(error) = result {
+                    if input_error.is_none() {
+                        input_error = Some(error);
+                    }
+                    terminate_process_group(&mut child)?;
+                }
+            }
         }
     }
 
-    let status = if capture_error.is_some() || !exceeded.is_empty() {
+    let status = if capture_error.is_some() || input_error.is_some() || !exceeded.is_empty() {
         child.wait()?
     } else {
         wait_for_child(&mut child, deadline, &mut timed_out)?
     };
     join_capture_reader(stdout_reader)?;
     join_capture_reader(stderr_reader)?;
+    join_optional_input_writer(input_writer.take())?;
     if timed_out {
         return Err(io::Error::new(
             io::ErrorKind::TimedOut,
@@ -409,6 +531,9 @@ fn execute_process_with_spawner<S: CaptureThreadSpawner>(
             io::ErrorKind::InvalidData,
             format!("child {streams} exceeded the {MAX_CAPTURED_STREAM_BYTES}-byte capture limit"),
         ));
+    }
+    if let Some(error) = input_error {
+        return Err(error);
     }
     let stdout_bytes = stdout_bytes.expect("stdout completion recorded");
     let stderr_bytes = stderr_bytes.expect("stderr completion recorded");
@@ -545,6 +670,7 @@ impl CapturedStream {
 enum CaptureEvent {
     LimitExceeded(CapturedStream),
     Completed(CapturedStream, io::Result<Vec<u8>>),
+    InputCompleted(io::Result<()>),
 }
 
 trait CaptureThreadSpawner {
@@ -552,6 +678,13 @@ trait CaptureThreadSpawner {
         &self,
         reader: R,
         stream: CapturedStream,
+        sender: Sender<CaptureEvent>,
+    ) -> io::Result<JoinHandle<()>>;
+
+    fn spawn_input_writer<W: Write + Send + 'static>(
+        &self,
+        writer: W,
+        input: Vec<u8>,
         sender: Sender<CaptureEvent>,
     ) -> io::Result<JoinHandle<()>>;
 
@@ -574,6 +707,18 @@ impl CaptureThreadSpawner for ThreadCaptureSpawner {
         thread::Builder::new().spawn(move || {
             let result = capture_stream(reader, stream, &sender);
             let _ = sender.send(CaptureEvent::Completed(stream, result));
+        })
+    }
+
+    fn spawn_input_writer<W: Write + Send + 'static>(
+        &self,
+        mut writer: W,
+        input: Vec<u8>,
+        sender: Sender<CaptureEvent>,
+    ) -> io::Result<JoinHandle<()>> {
+        thread::Builder::new().spawn(move || {
+            let result = writer.write_all(&input).and_then(|()| writer.flush());
+            let _ = sender.send(CaptureEvent::InputCompleted(result));
         })
     }
 
@@ -692,6 +837,19 @@ fn join_capture_reader(handle: JoinHandle<()>) -> io::Result<()> {
         .map_err(|_| io::Error::other("output capture worker panicked"))
 }
 
+fn join_input_writer(handle: JoinHandle<()>) -> io::Result<()> {
+    handle
+        .join()
+        .map_err(|_| io::Error::other("plain-input worker panicked"))
+}
+
+fn join_optional_input_writer(handle: Option<JoinHandle<()>>) -> io::Result<()> {
+    match handle {
+        Some(handle) => join_input_writer(handle),
+        None => Ok(()),
+    }
+}
+
 fn join_secret_writer(handle: JoinHandle<io::Result<()>>) -> io::Result<()> {
     handle
         .join()
@@ -731,8 +889,9 @@ mod tests {
 
     use super::{
         CaptureEvent, CaptureThreadSpawner, CapturedStream, CommandExecutor, CommandSpec,
-        MAX_CAPTURED_STREAM_BYTES, MAX_COMMAND_TIMEOUT, ProcessExecutor, REDACTED,
-        ThreadCaptureSpawner, TimedCommandExecutor, Zeroizing, execute_process_with_spawner,
+        MAX_CAPTURED_STDIN_BYTES, MAX_CAPTURED_STREAM_BYTES, MAX_COMMAND_TIMEOUT, ProcessExecutor,
+        REDACTED, ThreadCaptureSpawner, TimedCommandExecutor, TimedInputCommandExecutor, Zeroizing,
+        execute_process_with_input_spawner, execute_process_with_spawner,
     };
 
     struct FailingCaptureSpawner {
@@ -763,6 +922,19 @@ mod tests {
             ThreadCaptureSpawner.spawn(reader, stream, sender)
         }
 
+        fn spawn_input_writer<W: Write + Send + 'static>(
+            &self,
+            writer: W,
+            input: Vec<u8>,
+            sender: Sender<CaptureEvent>,
+        ) -> io::Result<JoinHandle<()>> {
+            let call = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
+            if call == self.fail_on_call {
+                return Err(io::Error::other("injected plain-input thread failure"));
+            }
+            ThreadCaptureSpawner.spawn_input_writer(writer, input, sender)
+        }
+
         fn spawn_secret_writer<W: Write + Send + 'static>(
             &self,
             writer: W,
@@ -772,6 +944,41 @@ mod tests {
             if call == self.fail_on_call {
                 return Err(io::Error::other("injected secret-input thread failure"));
             }
+            ThreadCaptureSpawner.spawn_secret_writer(writer, secret)
+        }
+    }
+
+    struct FailingInputWriteSpawner;
+
+    impl CaptureThreadSpawner for FailingInputWriteSpawner {
+        fn spawn<R: Read + Send + 'static>(
+            &self,
+            reader: R,
+            stream: CapturedStream,
+            sender: Sender<CaptureEvent>,
+        ) -> io::Result<JoinHandle<()>> {
+            ThreadCaptureSpawner.spawn(reader, stream, sender)
+        }
+
+        fn spawn_input_writer<W: Write + Send + 'static>(
+            &self,
+            _writer: W,
+            _input: Vec<u8>,
+            sender: Sender<CaptureEvent>,
+        ) -> io::Result<JoinHandle<()>> {
+            thread::Builder::new().spawn(move || {
+                let _ = sender.send(CaptureEvent::InputCompleted(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "injected plain-input write failure",
+                ))));
+            })
+        }
+
+        fn spawn_secret_writer<W: Write + Send + 'static>(
+            &self,
+            writer: W,
+            secret: Zeroizing<Vec<u8>>,
+        ) -> io::Result<JoinHandle<io::Result<()>>> {
             ThreadCaptureSpawner.spawn_secret_writer(writer, secret)
         }
     }
@@ -1074,6 +1281,181 @@ mod tests {
             "spawned process survived writer setup failure"
         );
         fs::remove_dir(&fixture)?;
+        Ok(())
+    }
+
+    #[test]
+    fn plain_standard_input_is_exact_and_output_is_captured() -> io::Result<()> {
+        let cat = Path::new("/bin/cat");
+        if !cat.is_file() {
+            return Ok(());
+        }
+        let sentinel = b"guest-request-without-implicit-newline";
+        let record = ProcessExecutor.execute_with_input(
+            &CommandSpec::new(cat),
+            sentinel,
+            Duration::from_secs(1),
+        )?;
+        assert!(record.success);
+        assert_eq!(record.stdout.as_bytes(), sentinel);
+        assert!(record.stderr.is_empty());
+        assert!(
+            !record
+                .argv
+                .join(" ")
+                .contains("guest-request-without-implicit-newline")
+        );
+        assert!(record.environment_keys.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn plain_standard_input_accepts_empty_and_maximum_documents() -> io::Result<()> {
+        let cat = Path::new("/bin/cat");
+        if !cat.is_file() {
+            return Ok(());
+        }
+        for input in [Vec::new(), vec![b'x'; MAX_CAPTURED_STDIN_BYTES]] {
+            let record = ProcessExecutor.execute_with_input(
+                &CommandSpec::new(cat),
+                &input,
+                Duration::from_secs(1),
+            )?;
+            assert!(record.success);
+            assert_eq!(record.stdout.as_bytes(), input.as_slice());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn plain_standard_input_is_not_added_to_record_surfaces() -> io::Result<()> {
+        let python = Path::new("/usr/bin/python3");
+        if !python.is_file() {
+            return Ok(());
+        }
+        let sentinel = b"request-body-sentinel";
+        let record = ProcessExecutor.execute_with_input(
+            &CommandSpec::new(python)
+                .argument("-c")
+                .argument("import sys; sys.stdin.buffer.read(); sys.stdout.write('ok')"),
+            sentinel,
+            Duration::from_secs(1),
+        )?;
+        assert!(record.success);
+        assert_eq!(record.stdout, "ok");
+        let debug = format!("{record:?}");
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(!debug.contains("request-body-sentinel"));
+        assert!(!json.contains("request-body-sentinel"));
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_plain_standard_input_fails_before_spawn() {
+        let missing = CommandSpec::new("/absolute/program/that/must/not/exist");
+        let input = vec![b'x'; MAX_CAPTURED_STDIN_BYTES + 1];
+        let error = ProcessExecutor
+            .execute_with_input(&missing, &input, Duration::from_secs(1))
+            .expect_err("oversized stdin must fail before spawn");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn unread_plain_standard_input_cannot_bypass_timeout() -> io::Result<()> {
+        let python = Path::new("/usr/bin/python3");
+        if !python.is_file() {
+            return Ok(());
+        }
+        let error = ProcessExecutor
+            .execute_with_input(
+                &CommandSpec::new(python)
+                    .argument("-c")
+                    .argument("import time; time.sleep(10)"),
+                &vec![b'x'; MAX_CAPTURED_STDIN_BYTES],
+                Duration::from_millis(100),
+            )
+            .expect_err("unread stdin must remain inside the reviewed deadline");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        Ok(())
+    }
+
+    #[test]
+    fn plain_input_writer_setup_failure_aborts_spawned_group() -> io::Result<()> {
+        let python = Path::new("/usr/bin/python3");
+        if !python.is_file() {
+            return Ok(());
+        }
+        let fixture = timeout_fixture_directory()?;
+        let marker = fixture.join("process-survived-input-writer-setup-failure");
+        let script = "import pathlib,sys,time; time.sleep(0.6); pathlib.Path(sys.argv[1]).write_text('survived'); time.sleep(10)";
+        let spec = CommandSpec::new(python)
+            .argument("-c")
+            .argument(script)
+            .argument(marker.to_string_lossy());
+        let error = execute_process_with_input_spawner(
+            &spec,
+            Some(Duration::from_secs(2)),
+            Some(b"input"),
+            &FailingCaptureSpawner::new(3),
+        )
+        .expect_err("input writer setup failure must abort the spawned process group");
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(error.to_string(), "injected plain-input thread failure");
+        thread::sleep(Duration::from_millis(800));
+        assert!(
+            !marker.exists(),
+            "spawned process survived writer setup failure"
+        );
+        fs::remove_dir(&fixture)?;
+        Ok(())
+    }
+
+    #[test]
+    fn plain_input_write_failure_aborts_spawned_group() -> io::Result<()> {
+        let python = Path::new("/usr/bin/python3");
+        if !python.is_file() {
+            return Ok(());
+        }
+        let fixture = timeout_fixture_directory()?;
+        let marker = fixture.join("process-survived-input-write-failure");
+        let script = "import pathlib,sys,time; time.sleep(0.6); pathlib.Path(sys.argv[1]).write_text('survived'); time.sleep(10)";
+        let spec = CommandSpec::new(python)
+            .argument("-c")
+            .argument(script)
+            .argument(marker.to_string_lossy());
+        let error = execute_process_with_input_spawner(
+            &spec,
+            Some(Duration::from_secs(2)),
+            Some(b"input"),
+            &FailingInputWriteSpawner,
+        )
+        .expect_err("input write failure must abort the spawned process group");
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(error.to_string(), "injected plain-input write failure");
+        thread::sleep(Duration::from_millis(800));
+        assert!(
+            !marker.exists(),
+            "spawned process survived input write failure"
+        );
+        fs::remove_dir(&fixture)?;
+        Ok(())
+    }
+
+    #[test]
+    fn output_exhaustion_precedes_plain_input_side_effects() -> io::Result<()> {
+        let yes = Path::new("/usr/bin/yes");
+        if !yes.is_file() {
+            return Ok(());
+        }
+        let error = ProcessExecutor
+            .execute_with_input(
+                &CommandSpec::new(yes).argument("x"),
+                b"input",
+                Duration::from_secs(10),
+            )
+            .expect_err("output exhaustion must remain the terminal classification");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("stdout"));
         Ok(())
     }
 
