@@ -1,0 +1,463 @@
+name: Research corrected immutable Git pool observer
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/research-585-observer-fix.yml"
+      - "src/immutable_git_object_pool_observation.rs"
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: research/585-observer-fix
+          show-progress: false
+          fetch-depth: 0
+      - name: Apply accepted #585 corrections, verify, and self-clean
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("src/immutable_git_object_pool_observation.rs")
+          s = p.read_text()
+
+          def replace_once(old: str, new: str, label: str) -> None:
+              global s
+              count = s.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected one match, saw {count}")
+              s = s.replace(old, new, 1)
+
+          replace_once(
+              "use rustix::io::{Errno, fcntl_dupfd_cloexec};",
+              "use rustix::io::Errno;",
+              "unused rustix import",
+          )
+
+          old_confirm = '''    pub fn confirm(&self) -> Result<(), ImmutableGitObjectPoolObservationError> {
+              require_parent_identity(
+                  &self.parent,
+                  self.expected_owner_uid,
+                  self.expected_owner_gid,
+                  &self.parent_identity,
+              )?;
+              let reopened = rustix_fs::openat(
+                  self.parent.as_fd(),
+                  &self.generation_name,
+                  DIRECTORY_FLAGS,
+                  Mode::empty(),
+              )
+              .map_err(map_open)?;
+              require_directory_snapshot(
+                  &reopened,
+                  self.expected_owner_uid,
+                  self.expected_owner_gid,
+                  GENERATION_MODE,
+                  &self.root_snapshot,
+              )?;
+              require_directory_snapshot(
+                  &self.root,
+                  self.expected_owner_uid,
+                  self.expected_owner_gid,
+                  GENERATION_MODE,
+                  &self.root_snapshot,
+              )?;
+              require_directory_snapshot(
+                  &self.objects,
+                  self.expected_owner_uid,
+                  self.expected_owner_gid,
+                  GENERATION_MODE,
+                  &self.objects_snapshot,
+              )?;
+              verify_marker(
+                  &self.root,
+                  &self.binding,
+                  self.expected_owner_uid,
+                  self.expected_owner_gid,
+              )?;
+              require_no_nested_alternates(
+                  &self.root,
+                  self.expected_owner_uid,
+                  self.expected_owner_gid,
+              )?;
+              Ok(())
+          }
+          '''
+          new_confirm = '''    pub fn confirm(&self) -> Result<(), ImmutableGitObjectPoolObservationError> {
+              require_parent_identity(
+                  &self.parent,
+                  self.expected_owner_uid,
+                  self.expected_owner_gid,
+                  &self.parent_identity,
+              )?;
+              require_current_directory_entry(
+                  &self.parent,
+                  self.generation_name.as_os_str(),
+                  self.expected_owner_uid,
+                  self.expected_owner_gid,
+                  GENERATION_MODE,
+                  &self.root_snapshot,
+              )?;
+              require_directory_snapshot(
+                  &self.root,
+                  self.expected_owner_uid,
+                  self.expected_owner_gid,
+                  GENERATION_MODE,
+                  &self.root_snapshot,
+              )?;
+              require_current_directory_entry(
+                  &self.root,
+                  OsStr::new(OBJECTS_NAME),
+                  self.expected_owner_uid,
+                  self.expected_owner_gid,
+                  GENERATION_MODE,
+                  &self.objects_snapshot,
+              )?;
+              require_directory_snapshot(
+                  &self.objects,
+                  self.expected_owner_uid,
+                  self.expected_owner_gid,
+                  GENERATION_MODE,
+                  &self.objects_snapshot,
+              )?;
+              verify_marker(
+                  &self.root,
+                  &self.binding,
+                  self.expected_owner_uid,
+                  self.expected_owner_gid,
+              )?;
+              require_no_nested_alternates(
+                  &self.objects,
+                  &self.objects_snapshot,
+                  self.expected_owner_uid,
+                  self.expected_owner_gid,
+              )?;
+              require_directory_snapshot(
+                  &self.objects,
+                  self.expected_owner_uid,
+                  self.expected_owner_gid,
+                  GENERATION_MODE,
+                  &self.objects_snapshot,
+              )?;
+              require_current_directory_entry(
+                  &self.root,
+                  OsStr::new(OBJECTS_NAME),
+                  self.expected_owner_uid,
+                  self.expected_owner_gid,
+                  GENERATION_MODE,
+                  &self.objects_snapshot,
+              )?;
+              require_directory_snapshot(
+                  &self.root,
+                  self.expected_owner_uid,
+                  self.expected_owner_gid,
+                  GENERATION_MODE,
+                  &self.root_snapshot,
+              )?;
+              require_current_directory_entry(
+                  &self.parent,
+                  self.generation_name.as_os_str(),
+                  self.expected_owner_uid,
+                  self.expected_owner_gid,
+                  GENERATION_MODE,
+                  &self.root_snapshot,
+              )?;
+              require_parent_identity(
+                  &self.parent,
+                  self.expected_owner_uid,
+                  self.expected_owner_gid,
+                  &self.parent_identity,
+              )?;
+              Ok(())
+          }
+          '''
+          replace_once(old_confirm, new_confirm, "confirm")
+
+          old_precheck = '''    verify_marker(
+              &root,
+              binding,
+              expected_owner_uid,
+              expected_owner_gid,
+          )?;
+          require_no_nested_alternates(&root, expected_owner_uid, expected_owner_gid)?;
+          let binding_digest = git_object_pool_binding_digest(binding).map_err(|_| marker_mismatch())?;
+          '''
+          new_precheck = '''    let binding_digest = git_object_pool_binding_digest(binding).map_err(|_| marker_mismatch())?;
+          '''
+          replace_once(old_precheck, new_precheck, "duplicate observation checks")
+
+          helper_anchor = '''fn verify_marker(
+          '''
+          helper = '''fn require_current_directory_entry(
+              parent: &OwnedFd,
+              name: &OsStr,
+              expected_uid: u32,
+              expected_gid: u32,
+              expected_mode: u32,
+              expected: &DirectorySnapshot,
+          ) -> Result<(), ImmutableGitObjectPoolObservationError> {
+              let current = rustix_fs::openat(parent.as_fd(), name, DIRECTORY_FLAGS, Mode::empty())
+                  .map_err(map_open)?;
+              require_directory_snapshot(
+                  &current,
+                  expected_uid,
+                  expected_gid,
+                  expected_mode,
+                  expected,
+              )
+          }
+
+          fn verify_marker(
+          '''
+          replace_once(helper_anchor, helper, "directory-entry rebind helper")
+
+          old_alternates = '''fn require_no_nested_alternates(
+              root: &OwnedFd,
+              expected_uid: u32,
+              expected_gid: u32,
+          ) -> Result<(), ImmutableGitObjectPoolObservationError> {
+              let objects = rustix_fs::openat(root.as_fd(), OBJECTS_NAME, DIRECTORY_FLAGS, Mode::empty())
+                  .map_err(map_open)?;
+              let objects_snapshot = snapshot_directory(&objects)?;
+              require_frozen_directory(
+                  &objects_snapshot,
+                  expected_uid,
+                  expected_gid,
+                  GENERATION_MODE,
+              )?;
+              let info = match rustix_fs::openat(objects.as_fd(), INFO_NAME, DIRECTORY_FLAGS, Mode::empty()) {
+                  Ok(info) => info,
+                  Err(Errno::NOENT) => return Ok(()),
+                  Err(error) => return Err(map_open(error)),
+              };
+              let info_snapshot = snapshot_directory(&info)?;
+              require_frozen_directory(
+                  &info_snapshot,
+                  expected_uid,
+                  expected_gid,
+                  GENERATION_MODE,
+              )?;
+              match rustix_fs::openat(info.as_fd(), ALTERNATES_NAME, FILE_FLAGS, Mode::empty()) {
+                  Ok(_) => Err(nested_alternate()),
+                  Err(Errno::NOENT) => Ok(()),
+                  Err(error) => Err(map_open(error)),
+              }
+          }
+          '''
+          new_alternates = '''fn require_no_nested_alternates(
+              objects: &OwnedFd,
+              objects_snapshot: &DirectorySnapshot,
+              expected_uid: u32,
+              expected_gid: u32,
+          ) -> Result<(), ImmutableGitObjectPoolObservationError> {
+              require_directory_snapshot(
+                  objects,
+                  expected_uid,
+                  expected_gid,
+                  GENERATION_MODE,
+                  objects_snapshot,
+              )?;
+              let info = match rustix_fs::openat(objects.as_fd(), INFO_NAME, DIRECTORY_FLAGS, Mode::empty()) {
+                  Ok(info) => info,
+                  Err(Errno::NOENT) => {
+                      require_directory_snapshot(
+                          objects,
+                          expected_uid,
+                          expected_gid,
+                          GENERATION_MODE,
+                          objects_snapshot,
+                      )?;
+                      return Ok(());
+                  }
+                  Err(error) => return Err(map_open(error)),
+              };
+              let info_snapshot = snapshot_directory(&info)?;
+              require_frozen_directory(
+                  &info_snapshot,
+                  expected_uid,
+                  expected_gid,
+                  GENERATION_MODE,
+              )?;
+              match rustix_fs::openat(info.as_fd(), ALTERNATES_NAME, FILE_FLAGS, Mode::empty()) {
+                  Ok(_) => return Err(nested_alternate()),
+                  Err(Errno::NOENT) => {}
+                  Err(error) => return Err(map_open(error)),
+              }
+              require_directory_snapshot(
+                  &info,
+                  expected_uid,
+                  expected_gid,
+                  GENERATION_MODE,
+                  &info_snapshot,
+              )?;
+              require_current_directory_entry(
+                  objects,
+                  OsStr::new(INFO_NAME),
+                  expected_uid,
+                  expected_gid,
+                  GENERATION_MODE,
+                  &info_snapshot,
+              )?;
+              require_directory_snapshot(
+                  objects,
+                  expected_uid,
+                  expected_gid,
+                  GENERATION_MODE,
+                  objects_snapshot,
+              )?;
+              Ok(())
+          }
+          '''
+          replace_once(old_alternates, new_alternates, "alternates check")
+
+          old_file_identity = '''fn file_identity(metadata: &std::fs::Metadata) -> (u64, u64, u32, u32, u32, u64, i64, i64) {
+              (
+                  metadata.dev(),
+                  metadata.ino(),
+                  metadata.uid(),
+                  metadata.gid(),
+                  metadata.mode(),
+                  metadata.len(),
+                  metadata.mtime(),
+                  metadata.ctime(),
+              )
+          }
+          '''
+          new_file_identity = '''fn file_identity(
+              metadata: &std::fs::Metadata,
+          ) -> (u64, u64, u32, u32, u32, u64, u64, i64, i64, i64, i64) {
+              (
+                  metadata.dev(),
+                  metadata.ino(),
+                  metadata.uid(),
+                  metadata.gid(),
+                  metadata.mode(),
+                  metadata.nlink(),
+                  metadata.len(),
+                  metadata.mtime(),
+                  metadata.mtime_nsec(),
+                  metadata.ctime(),
+                  metadata.ctime_nsec(),
+              )
+          }
+          '''
+          replace_once(old_file_identity, new_file_identity, "marker metadata identity")
+
+          replace_once(
+              "    use std::fs;\n",
+              "    use std::ffi::OsStr;\n    use std::fs;\n",
+              "test OsStr import",
+          )
+          replace_once(
+              '''        ImmutableGitObjectPoolLocation, ImmutableGitObjectPoolObservationErrorKind, MARKER_NAME,
+                  OBJECTS_NAME, PARENT_MODE, observe_with_owner,
+              };
+              ''',
+              '''        ImmutableGitObjectPoolLocation, ImmutableGitObjectPoolObservationErrorKind, MARKER_NAME,
+                  OBJECTS_NAME, PARENT_MODE, observe_with_owner, require_current_directory_entry,
+              };
+              ''',
+              "test helper import",
+          )
+
+          test_anchor = '''    #[test]
+              fn location_debug_never_exposes_private_path() {
+          '''
+          tests = '''    #[test]
+              fn absent_objects_info_is_accepted_when_generation_is_already_frozen() {
+                  let binding = binding(1);
+                  let fixture = Fixture::new(&binding);
+                  let objects = fixture.pool.join(OBJECTS_NAME);
+                  let info = objects.join(INFO_NAME);
+                  fs::set_permissions(&objects, fs::Permissions::from_mode(0o755)).unwrap();
+                  fs::remove_dir(&info).unwrap();
+                  fs::set_permissions(&objects, fs::Permissions::from_mode(GENERATION_MODE)).unwrap();
+                  fixture.observe(&binding).unwrap().confirm().unwrap();
+              }
+
+              #[test]
+              fn retained_objects_entry_rebind_detects_same_name_replacement() {
+                  let binding = binding(1);
+                  let fixture = Fixture::new(&binding);
+                  let observation = fixture.observe(&binding).unwrap();
+                  let objects = fixture.pool.join(OBJECTS_NAME);
+                  let old_objects = fixture.pool.join("objects-old");
+                  fs::set_permissions(&fixture.pool, fs::Permissions::from_mode(0o755)).unwrap();
+                  fs::rename(&objects, &old_objects).unwrap();
+                  fs::create_dir(&objects).unwrap();
+                  fs::set_permissions(&objects, fs::Permissions::from_mode(GENERATION_MODE)).unwrap();
+                  fs::set_permissions(&fixture.pool, fs::Permissions::from_mode(GENERATION_MODE)).unwrap();
+                  assert_eq!(
+                      require_current_directory_entry(
+                          &observation.root,
+                          OsStr::new(OBJECTS_NAME),
+                          observation.expected_owner_uid,
+                          observation.expected_owner_gid,
+                          GENERATION_MODE,
+                          &observation.objects_snapshot,
+                      )
+                      .unwrap_err()
+                      .kind(),
+                      ImmutableGitObjectPoolObservationErrorKind::Changed
+                  );
+              }
+
+              #[test]
+              fn objects_info_change_after_observation_invalidates_confirmation() {
+                  let binding = binding(1);
+                  let fixture = Fixture::new(&binding);
+                  let observation = fixture.observe(&binding).unwrap();
+                  let objects = fixture.pool.join(OBJECTS_NAME);
+                  let info = objects.join(INFO_NAME);
+                  fs::set_permissions(&objects, fs::Permissions::from_mode(0o755)).unwrap();
+                  fs::remove_dir(&info).unwrap();
+                  fs::set_permissions(&objects, fs::Permissions::from_mode(GENERATION_MODE)).unwrap();
+                  assert_eq!(
+                      observation.confirm().unwrap_err().kind(),
+                      ImmutableGitObjectPoolObservationErrorKind::Changed
+                  );
+              }
+
+              #[test]
+              fn location_debug_never_exposes_private_path() {
+          '''
+          replace_once(test_anchor, tests, "race/rebind tests")
+
+          p.write_text(s)
+
+          lib = Path("src/lib.rs")
+          ls = lib.read_text()
+          marker = '''/// Pure fixed marker codec for immutable Git object-pool generations.
+          pub mod immutable_git_object_pool_marker;
+          '''
+          addition = '''/// Pure fixed marker codec for immutable Git object-pool generations.
+          pub mod immutable_git_object_pool_marker;
+          /// Read-only descriptor-bound observation of frozen immutable Git object-pool generations.
+          #[cfg(target_os = "linux")]
+          pub mod immutable_git_object_pool_observation;
+          '''
+          if ls.count(marker) != 1:
+              raise SystemExit("lib export point changed")
+          lib.write_text(ls.replace(marker, addition, 1))
+          PY
+
+          cargo fmt --all
+          cargo fmt --all -- --check
+          cargo test --locked immutable_git_object_pool_observation
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          git diff --check
+
+          git rm .github/workflows/research-585-observer-fix.yml
+          git config user.name "smolrunner-research-generator"
+          git config user.email "actions@users.noreply.github.com"
+          git add src/immutable_git_object_pool_observation.rs src/lib.rs
+          git commit -m "Observe immutable Git pool generations without mutation"
+          git push origin HEAD:research/585-observer-fix
