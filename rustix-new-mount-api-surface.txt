@@ -1,0 +1,58 @@
+rustix_root=/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4
+
+=== fsopen ===
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/mount/fsopen.rs:9:/// `fsopen(fs_name, flags)`
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/mount/fsopen.rs:16:pub fn fsopen<Fs: path::Arg>(fs_name: Fs, flags: FsOpenFlags) -> io::Result<OwnedFd> {
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/mount/fsopen.rs:17:    fs_name.into_with_c_str(|fs_name| backend::mount::syscalls::fsopen(fs_name, flags))
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/backend/libc/mount/syscalls.rs:33:pub(crate) fn fsopen(fs_name: &CStr, flags: super::types::FsOpenFlags) -> io::Result<OwnedFd> {
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/backend/libc/mount/syscalls.rs:35:        fn fsopen(
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/backend/libc/mount/syscalls.rs:40:    unsafe { ret_owned_fd(fsopen(c_str(fs_name), flags.bits())) }
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/backend/linux_raw/mount/syscalls.rs:40:pub(crate) fn fsopen(fs_name: &CStr, flags: super::types::FsOpenFlags) -> io::Result<OwnedFd> {
+
+=== fsconfig ===
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/mount/fsopen.rs:100:/// `fsconfig(fs_fd, FSCONFIG_SET_FLAG, key, NULL, 0)`
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/mount/fsopen.rs:113:/// `fsconfig(fs_fd, FSCONFIG_SET_STRING, key, value, 0)`
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/mount/fsopen.rs:134:/// `fsconfig(fs_fd, FSCONFIG_SET_BINARY, key, value, value.len())`
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/mount/fsopen.rs:151:/// `fsconfig(fs_fd, FSCONFIG_SET_PATH, key, path, fd)`
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/mount/fsopen.rs:174:/// `fsconfig(fs_fd, FSCONFIG_SET_PATH_EMPTY, key, "", fd)`
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/mount/fsopen.rs:192:/// `fsconfig(fs_fd, FSCONFIG_SET_FD, key, NULL, fd)`
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/mount/fsopen.rs:210:/// `fsconfig(fs_fd, FSCONFIG_CMD_CREATE, key, NULL, 0)`
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/mount/fsopen.rs:222:/// `fsconfig(fs_fd, FSCONFIG_CMD_RECONFIGURE, key, NULL, 0)`
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/mount/fsopen.rs:234:/// `fsconfig(fs_fd, FSCONFIG_CMD_CREATE_EXCL, key, NULL, 0)`
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/backend/libc/mount/syscalls.rs:123:    fn fsconfig(
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/backend/libc/mount/syscalls.rs:135:        ret(fsconfig(
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/backend/libc/mount/syscalls.rs:152:        ret(fsconfig(
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/backend/libc/mount/syscalls.rs:169:        ret(fsconfig(
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/backend/libc/mount/syscalls.rs:186:        ret(fsconfig(
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/backend/libc/mount/syscalls.rs:204:        ret(fsconfig(
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/backend/libc/mount/syscalls.rs:221:        ret(fsconfig(
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/backend/libc/mount/syscalls.rs:234:        ret(fsconfig(
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/backend/libc/mount/syscalls.rs:247:        ret(fsconfig(
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/backend/libc/mount/syscalls.rs:260:        ret(fsconfig(
+
+=== fsmount ===
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/mount/fsopen.rs:20:/// `fsmount(fs_fd, flags, attr_flags)`
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/mount/fsopen.rs:27:pub fn fsmount<Fd: AsFd>(
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/mount/fsopen.rs:32:    backend::mount::syscalls::fsmount(fs_fd.as_fd(), flags, attr_flags)
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/backend/libc/mount/syscalls.rs:44:pub(crate) fn fsmount(
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/backend/libc/mount/syscalls.rs:50:        fn fsmount(
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/backend/libc/mount/syscalls.rs:56:    unsafe { ret_owned_fd(fsmount(borrowed_fd(fs_fd), flags.bits(), attr_flags.bits())) }
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/backend/linux_raw/mount/syscalls.rs:45:pub(crate) fn fsmount(
+
+=== move_mount ===
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/mount/fsopen.rs:35:/// `move_mount(from_dfd, from_pathname, to_dfd, to_pathname, flags)`
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/mount/fsopen.rs:46:pub fn move_mount<From: path::Arg, To: path::Arg, FromFd: AsFd, ToFd: AsFd>(
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/mount/fsopen.rs:57:            backend::mount::syscalls::move_mount(
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/backend/libc/mount/syscalls.rs:60:pub(crate) fn move_mount(
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/backend/libc/mount/syscalls.rs:68:        fn move_mount(
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/backend/libc/mount/syscalls.rs:77:        ret(move_mount(
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/backend/linux_raw/mount/syscalls.rs:54:pub(crate) fn move_mount(
+
+=== open_tree ===
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/mount/fsopen.rs:68:/// `open_tree(dfd, filename, flags)`
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/mount/fsopen.rs:75:pub fn open_tree<Path: path::Arg, Fd: AsFd>(
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/mount/fsopen.rs:81:    filename.into_with_c_str(|filename| backend::mount::syscalls::open_tree(dfd, filename, flags))
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/backend/libc/mount/syscalls.rs:88:pub(crate) fn open_tree(
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/backend/libc/mount/syscalls.rs:94:        fn open_tree(
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/backend/libc/mount/syscalls.rs:101:    unsafe { ret_owned_fd(open_tree(borrowed_fd(dfd), c_str(filename), flags.bits())) }
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/backend/linux_raw/mount/syscalls.rs:74:pub(crate) fn open_tree(
