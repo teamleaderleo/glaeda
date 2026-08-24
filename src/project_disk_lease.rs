@@ -309,12 +309,18 @@ impl ProjectDiskLeaseRecord {
         })
     }
 
-    /// Accept the durable successor after the planned attachment is freshly observed.
-    pub fn record_attach_success(
+    /// Reconfirm that one previously planned attachment still belongs to this exact detached
+    /// project-disk lease revision without publishing an attached successor.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same bounded plan/state refusals used by `record_attach_success` when project,
+    /// disk generation, expected revision, current state, or next attachment generation drifted.
+    pub fn confirm_attach_plan(
         &self,
         plan: &ProjectDiskAttachPlan,
-        post: ProjectDiskObservation,
-    ) -> Result<Self, ProjectDiskLeaseError> {
+    ) -> Result<(), ProjectDiskLeaseError> {
+        self.require_nonterminal()?;
         self.require_plan_identity(&plan.identity)?;
         if !matches!(self.state, ProjectDiskLeaseState::Detached) {
             return Err(invalid_state(
@@ -325,6 +331,16 @@ impl ProjectDiskLeaseRecord {
         if plan.attachment.generation != self.next_attachment_generation()? {
             return Err(plan_mismatch());
         }
+        Ok(())
+    }
+
+    /// Accept the durable successor after the planned attachment is freshly observed.
+    pub fn record_attach_success(
+        &self,
+        plan: &ProjectDiskAttachPlan,
+        post: ProjectDiskObservation,
+    ) -> Result<Self, ProjectDiskLeaseError> {
+        self.confirm_attach_plan(plan)?;
         require_exact_current_attachment(post)?;
         self.successor(
             ProjectDiskLeaseState::Attached {
@@ -1023,6 +1039,53 @@ mod tests {
             )
             .expect("second attach plans");
         assert_eq!(second.attachment().generation().get(), 2);
+    }
+
+    #[test]
+    fn pending_attach_plan_confirmation_rejects_drift_and_old_generation() {
+        let initial = record();
+        let first = initial
+            .plan_attach(
+                ResidentSandboxId::parse("sandbox-a").unwrap(),
+                ResidentSandboxGeneration::new(1).unwrap(),
+                exact_unused_unlocked(),
+            )
+            .unwrap();
+        initial.confirm_attach_plan(&first).unwrap();
+
+        let revalidating = initial.require_revalidation().unwrap();
+        assert_eq!(
+            revalidating.confirm_attach_plan(&first).unwrap_err().code(),
+            "stale_project_disk_plan"
+        );
+
+        let other = ProjectDiskLeaseRecord::new_detached(
+            project(),
+            ProjectDiskId::parse("other-project-disk").unwrap(),
+            ProjectDiskGeneration::new(1).unwrap(),
+        );
+        assert_eq!(
+            other.confirm_attach_plan(&first).unwrap_err().code(),
+            "project_disk_plan_mismatch"
+        );
+
+        let attached = initial
+            .record_attach_success(&first, exact_current_attachment())
+            .unwrap();
+        let detach = attached.plan_detach(exact_current_attachment()).unwrap();
+        let detached = attached
+            .record_detach_success(&detach, exact_unused_unlocked())
+            .unwrap();
+        let second = detached
+            .plan_attach(
+                ResidentSandboxId::parse("sandbox-b").unwrap(),
+                ResidentSandboxGeneration::new(2).unwrap(),
+                exact_unused_unlocked(),
+            )
+            .unwrap();
+        assert_eq!(second.attachment().generation().get(), 2);
+        assert!(detached.confirm_attach_plan(&first).is_err());
+        detached.confirm_attach_plan(&second).unwrap();
     }
 
     #[test]
