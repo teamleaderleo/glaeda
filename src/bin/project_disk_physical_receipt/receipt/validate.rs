@@ -103,10 +103,7 @@ fn validate_directory(
 
     let mut names = BTreeSet::new();
     for entry in &directory.entries {
-        let name = decode_entry_name(
-            &entry.name_hex,
-            "disk_directory.entries.name_hex",
-        )?;
+        let name = decode_entry_name(&entry.name_hex, "disk_directory.entries.name_hex")?;
         if !names.insert(name.clone()) {
             return Err(duplicate_entry("disk_directory.entries.name_hex"));
         }
@@ -122,10 +119,7 @@ fn validate_directory(
 
     let mut after_names = BTreeSet::new();
     for name_hex in &directory.after_entry_names_hex {
-        let name = decode_entry_name(
-            name_hex,
-            "disk_directory.after_entry_names_hex",
-        )?;
+        let name = decode_entry_name(name_hex, "disk_directory.after_entry_names_hex")?;
         if !after_names.insert(name) {
             return Err(duplicate_entry("disk_directory.after_entry_names_hex"));
         }
@@ -141,11 +135,7 @@ fn decode_entry_name(
     field: &'static str,
 ) -> Result<Vec<u8>, ProjectDiskPhysicalReceiptError> {
     let name = decode_hex(value, MAX_ENTRY_NAME_BYTES).ok_or_else(|| invalid_field(field))?;
-    if name.is_empty()
-        || name == b"."
-        || name == b".."
-        || name.contains(&b'/')
-        || name.contains(&0)
+    if name.is_empty() || name == b"." || name == b".." || name.contains(&b'/') || name.contains(&0)
     {
         return Err(invalid_field(field));
     }
