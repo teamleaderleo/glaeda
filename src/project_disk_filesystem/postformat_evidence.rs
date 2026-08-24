@@ -19,8 +19,7 @@ use crate::project_catalog::ProjectIdentity;
 use crate::project_disk_lease::{ProjectDiskGeneration, ProjectDiskId};
 
 pub const PROJECT_DISK_POSTFORMAT_EVIDENCE_SCHEMA_VERSION: u8 = 1;
-const ZERO_DIGEST: &str =
-    "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+const ZERO_DIGEST: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 const REDACTED_BLOCK_DEVICE: &str = "<private-postformat-block-device>";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -188,6 +187,7 @@ impl ProjectDiskPostFormatEvidence {
     }
 
     #[must_use]
+    #[allow(dead_code)]
     pub(crate) const fn observation_digest(&self) -> &Sha256Digest {
         &self.observation_digest
     }
@@ -295,7 +295,7 @@ const fn evidence_mismatch() -> ProjectDiskPostFormatEvidenceError {
 
 #[cfg(test)]
 mod tests {
-    use super::ProjectDiskPostFormatEvidence;
+    use super::{ProjectDiskPostFormatEvidence, REDACTED_BLOCK_DEVICE};
     use crate::artifact::Sha256Digest;
     use crate::project_catalog::ProjectIdentity;
     use crate::project_disk_filesystem::format_plan::{
@@ -343,7 +343,8 @@ mod tests {
     #[test]
     fn exact_postformat_observation_confirms_requested_filesystem() {
         let plan = plan(7);
-        let evidence = ProjectDiskPostFormatEvidence::for_test(&plan, 2049, 77, digest('f')).unwrap();
+        let evidence =
+            ProjectDiskPostFormatEvidence::for_test(&plan, 2049, 77, digest('f')).unwrap();
         evidence.confirm_plan(&plan).unwrap();
         assert_eq!(evidence.summary().filesystem_generation().get(), 7);
         assert_eq!(
@@ -359,14 +360,16 @@ mod tests {
     fn another_generation_or_plan_is_rejected() {
         let first = plan(7);
         let second = plan(8);
-        let evidence = ProjectDiskPostFormatEvidence::for_test(&first, 2049, 77, digest('f')).unwrap();
+        let evidence =
+            ProjectDiskPostFormatEvidence::for_test(&first, 2049, 77, digest('f')).unwrap();
         assert!(evidence.confirm_plan(&second).is_err());
     }
 
     #[test]
     fn block_node_replacement_is_detected() {
         let plan = plan(7);
-        let evidence = ProjectDiskPostFormatEvidence::for_test(&plan, 2049, 77, digest('f')).unwrap();
+        let evidence =
+            ProjectDiskPostFormatEvidence::for_test(&plan, 2049, 77, digest('f')).unwrap();
         assert!(!evidence.matches_block_device_identity(2049, 78));
         assert!(!evidence.matches_block_device_identity(2050, 77));
     }
@@ -374,7 +377,8 @@ mod tests {
     #[test]
     fn debug_keeps_block_and_digests_private() {
         let plan = plan(7);
-        let evidence = ProjectDiskPostFormatEvidence::for_test(&plan, 2049, 77, digest('f')).unwrap();
+        let evidence =
+            ProjectDiskPostFormatEvidence::for_test(&plan, 2049, 77, digest('f')).unwrap();
         let debug = format!("{evidence:?}");
         assert!(debug.contains(REDACTED_BLOCK_DEVICE));
         assert!(!debug.contains("2049"));

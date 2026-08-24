@@ -9,6 +9,7 @@
 // lints scoped to this child module instead of weakening crate-wide warnings.
 #[allow(clippy::too_many_arguments, unused_imports)]
 pub mod format_plan;
+pub mod postformat_evidence;
 
 use serde::Serialize;
 
