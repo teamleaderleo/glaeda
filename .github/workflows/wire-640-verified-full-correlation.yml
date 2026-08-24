@@ -1,0 +1,78 @@
+name: Wire verified full project-filesystem correlation
+
+on:
+  push:
+    branches:
+      - chatgpt/640-verified-full-correlation
+
+permissions:
+  contents: write
+
+jobs:
+  wire:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: chatgpt/640-verified-full-correlation
+          fetch-depth: 0
+          show-progress: false
+      - name: Export sealed correlation modules and tighten test imports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          lib = Path('src/lib.rs')
+          text = lib.read_text()
+
+          guest_export = '/// Opaque composition of exact guest filesystem + whole-block-device evidence.\npub mod trusted_project_filesystem_full_guest_correlation;\n'
+          if guest_export not in text:
+              anchor = '/// Read-only guest correlation of one held project-filesystem device with exact mountinfo evidence.\npub mod trusted_project_filesystem_guest_observation;\n'
+              if text.count(anchor) != 1:
+                  raise SystemExit('unexpected guest observation export anchor')
+              text = text.replace(anchor, anchor + guest_export)
+
+          full_export = '/// Sealed composition of durable, host, and exact guest project-filesystem evidence.\npub mod trusted_project_filesystem_full_correlation;\n'
+          if full_export not in text:
+              anchor = guest_export
+              if text.count(anchor) != 1:
+                  raise SystemExit('unexpected full guest export anchor')
+              text = text.replace(anchor, anchor + full_export)
+          lib.write_text(text)
+
+          path = Path('src/trusted_project_filesystem_full_correlation.rs')
+          text = path.read_text()
+          old = '''    #[must_use]\n    pub(crate) const fn filesystem_device(&self) -> u64 {'''
+          new = '''    #[must_use]\n    #[allow(dead_code)]\n    pub(crate) const fn filesystem_device(&self) -> u64 {'''
+          if old in text:
+              text = text.replace(old, new, 1)
+
+          old_import = '''        ProjectDiskGeneration, ProjectDiskId, ProjectDiskLeaseRecord, ProjectDiskLockObservation,\n        ProjectDiskObservation, ProjectDiskPhysicalObservation, ProjectDiskRecoverability,\n        ProjectDiskUseObservation, ResidentSandboxGeneration, ResidentSandboxId,\n'''
+          new_import = '''        ProjectDiskGeneration, ProjectDiskId, ProjectDiskLeaseRecord, ProjectDiskLeaseState,\n        ProjectDiskLockObservation, ProjectDiskObservation, ProjectDiskPhysicalObservation,\n        ProjectDiskRecoverability, ProjectDiskUseObservation, ResidentSandboxGeneration,\n        ResidentSandboxId,\n'''
+          if old_import in text:
+              text = text.replace(old_import, new_import, 1)
+          path.write_text(text)
+          PY
+      - name: Format and focused tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.97.1 --profile minimal --component rustfmt --no-self-update
+          cargo fmt --all
+          cargo test --locked trusted_project_filesystem_full_guest_correlation
+          cargo test --locked trusted_project_filesystem_full_correlation
+      - name: Remove helper and publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f .github/workflows/wire-640-full-guest.yml
+          rm .github/workflows/wire-640-verified-full-correlation.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "#640 wire verified full project-filesystem correlation"
+          git push origin HEAD:chatgpt/640-verified-full-correlation
