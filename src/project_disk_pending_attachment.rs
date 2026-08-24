@@ -5,6 +5,10 @@
 //! physical attach attempt without fabricating an already-`Attached` lease record merely to let a
 //! later observer correlate the result.
 
+// Staged #640 integration seam. #639/P4 will consume this type once the descriptor observer is
+// composed with the pending attachment path; until then it intentionally has no production caller.
+#![allow(dead_code)]
+
 use crate::project_catalog::ProjectIdentity;
 use crate::project_disk_lease::{
     ProjectDiskAttachPlan, ProjectDiskAttachmentLease, ProjectDiskGeneration, ProjectDiskId,
