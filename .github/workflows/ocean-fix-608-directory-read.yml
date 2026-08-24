@@ -1,0 +1,57 @@
+name: Ocean fix 608 directory read
+
+on:
+  push:
+    branches:
+      - ocean/immutable-git-pool-generation-audit
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+      - name: Fix enumeration descriptor and quiescence contract
+        shell: python
+        run: |
+          from pathlib import Path
+          p = Path("src/immutable_git_object_pool_generation_audit.rs")
+          s = p.read_text()
+          old = "const DIRECTORY_FLAGS: OFlags = OFlags::PATH\n    .union(OFlags::DIRECTORY)"
+          new = "const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY\n    .union(OFlags::DIRECTORY)"
+          if s.count(old) != 1:
+              raise SystemExit(f"directory flag anchor changed: {s.count(old)}")
+          s = s.replace(old, new, 1)
+          old = "//! physical allocation on reflink-capable filesystems.\n"
+          new = old + "//! The caller must keep the producer process group quiescent and keep the candidate outside\n//! producer/task traversal authority for the entire audit and every later privileged publication step.\n"
+          if s.count(old) != 1:
+              raise SystemExit("module docs anchor changed")
+          s = s.replace(old, new, 1)
+          old = "/// walking. The candidate must have an `objects/` directory, every candidate regular file must have\n/// one link, and no candidate object inode may equal a producer object inode.\n"
+          new = old + "/// The caller must already have ended the producer process group and revoked producer/task path\n/// traversal to the candidate; that quiescence must remain in force through root ownership/freeze.\n"
+          if s.count(old) != 1:
+              raise SystemExit("function docs anchor changed")
+          s = s.replace(old, new, 1)
+          p.write_text(s)
+      - name: Verify focused slice
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cargo test --locked immutable_git_object_pool_generation_audit
+      - name: Remove helper and publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm .github/workflows/ocean-fix-608-directory-read.yml
+          git config user.name "ocean-smolrunner"
+          git config user.email "ocean-smolrunner@users.noreply.github.com"
+          git add src/immutable_git_object_pool_generation_audit.rs .github/workflows/ocean-fix-608-directory-read.yml
+          git diff --cached --check
+          git commit -m "Fix immutable pool audit directory traversal"
+          git push origin HEAD:${GITHUB_REF_NAME}
