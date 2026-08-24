@@ -86,7 +86,7 @@ pub(super) fn validate_document(
 fn validate_directory(
     directory: &ProjectDiskDirectoryEvidenceDocument,
 ) -> Result<(), ProjectDiskPhysicalReceiptError> {
-    if !same_entry_binding(&directory.before, &directory.after) {
+    if directory.before != directory.after {
         return Err(changed("disk_directory"));
     }
     if directory.before.mode & 0o170000 != 0o040000 {
@@ -96,42 +96,69 @@ fn validate_directory(
     validate_snapshot(&directory.after, "disk_directory")?;
     if directory.entries.is_empty()
         || directory.entries.len() > MAX_PROJECT_DISK_RECEIPT_ENTRY_COUNT
+        || directory.after_entry_names_hex.len() != directory.entries.len()
     {
         return Err(invalid_field("disk_directory.entries"));
     }
+
     let mut names = BTreeSet::new();
     for entry in &directory.entries {
-        let name = decode_hex(&entry.name_hex, MAX_ENTRY_NAME_BYTES)
-            .ok_or_else(|| invalid_field("disk_directory.entries.name_hex"))?;
-        if name.is_empty()
-            || name == b"."
-            || name == b".."
-            || name.contains(&b'/')
-            || name.contains(&0)
-        {
-            return Err(invalid_field("disk_directory.entries.name_hex"));
-        }
+        let name = decode_entry_name(
+            &entry.name_hex,
+            "disk_directory.entries.name_hex",
+        )?;
         if !names.insert(name.clone()) {
-            return Err(error(
-                ProjectDiskPhysicalReceiptErrorKind::DuplicateEntry,
-                "disk_directory.entries.name_hex",
-                "project_disk_receipt_duplicate_entry",
-                "project disk physical receipt contains a duplicate directory entry",
-            ));
+            return Err(duplicate_entry("disk_directory.entries.name_hex"));
         }
         match (std::str::from_utf8(&name), entry.name_utf8.as_deref()) {
             (Ok(expected), Some(observed)) if expected == observed => {}
             (Err(_), None) => {}
             _ => return Err(invalid_field("disk_directory.entries.name_utf8")),
         }
-        if !same_entry_binding(&entry.before, &entry.after) {
-            return Err(changed("disk_directory.entries"));
-        }
         validate_snapshot(&entry.before, "disk_directory.entries")?;
         validate_snapshot(&entry.after, "disk_directory.entries")?;
         validate_entry_kind(entry)?;
     }
+
+    let mut after_names = BTreeSet::new();
+    for name_hex in &directory.after_entry_names_hex {
+        let name = decode_entry_name(
+            name_hex,
+            "disk_directory.after_entry_names_hex",
+        )?;
+        if !after_names.insert(name) {
+            return Err(duplicate_entry("disk_directory.after_entry_names_hex"));
+        }
+    }
+    if names != after_names {
+        return Err(changed("disk_directory.entries"));
+    }
     Ok(())
+}
+
+fn decode_entry_name(
+    value: &str,
+    field: &'static str,
+) -> Result<Vec<u8>, ProjectDiskPhysicalReceiptError> {
+    let name = decode_hex(value, MAX_ENTRY_NAME_BYTES).ok_or_else(|| invalid_field(field))?;
+    if name.is_empty()
+        || name == b"."
+        || name == b".."
+        || name.contains(&b'/')
+        || name.contains(&0)
+    {
+        return Err(invalid_field(field));
+    }
+    Ok(name)
+}
+
+const fn duplicate_entry(field: &'static str) -> ProjectDiskPhysicalReceiptError {
+    error(
+        ProjectDiskPhysicalReceiptErrorKind::DuplicateEntry,
+        field,
+        "project_disk_receipt_duplicate_entry",
+        "project disk physical receipt contains a duplicate directory entry",
+    )
 }
 
 fn validate_entry_kind(
@@ -140,6 +167,9 @@ fn validate_entry_kind(
     let mode_type = entry.before.mode & 0o170000;
     match entry.kind {
         ReceiptDirectoryEntryKind::Regular => {
+            if !same_entry_binding(&entry.before, &entry.after) {
+                return Err(changed("disk_directory.entries"));
+            }
             if mode_type != 0o100000 || entry.symlink_target_hex.is_some() {
                 return Err(invalid_field("disk_directory.entries.kind"));
             }
@@ -163,6 +193,9 @@ fn validate_entry_kind(
             }
         }
         ReceiptDirectoryEntryKind::Directory => {
+            if entry.before != entry.after {
+                return Err(changed("disk_directory.entries"));
+            }
             if mode_type != 0o040000
                 || entry.symlink_target_hex.is_some()
                 || entry.small_regular_file_hex.is_some()
@@ -171,6 +204,9 @@ fn validate_entry_kind(
             }
         }
         ReceiptDirectoryEntryKind::Symlink => {
+            if entry.before != entry.after {
+                return Err(changed("disk_directory.entries"));
+            }
             if mode_type != 0o120000 || entry.small_regular_file_hex.is_some() {
                 return Err(invalid_field("disk_directory.entries.kind"));
             }
@@ -181,14 +217,6 @@ fn validate_entry_kind(
                 .ok_or_else(|| invalid_field("disk_directory.entries.symlink_target_hex"))?;
             if target.is_empty() || target.len() as u64 != entry.before.logical_bytes {
                 return Err(invalid_field("disk_directory.entries.symlink_target_hex"));
-            }
-        }
-        ReceiptDirectoryEntryKind::Other => {
-            if matches!(mode_type, 0o100000 | 0o040000 | 0o120000)
-                || entry.symlink_target_hex.is_some()
-                || entry.small_regular_file_hex.is_some()
-            {
-                return Err(invalid_field("disk_directory.entries.kind"));
             }
         }
     }
