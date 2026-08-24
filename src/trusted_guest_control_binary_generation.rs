@@ -17,9 +17,6 @@ use crate::trusted_guest_control_protocol::{
 pub const TRUSTED_GUEST_CONTROL_BINARY_GENERATION_SCHEMA_VERSION: u8 = 1;
 pub const MAX_TRUSTED_GUEST_CONTROL_BINARY_BYTES: u64 = 64 * 1024 * 1024;
 
-pub(crate) const TRUSTED_GUEST_CONTROL_INSTALL_PARENT: &str = "usr/local/libexec/smolrunner";
-pub(crate) const TRUSTED_GUEST_CONTROL_INSTALL_NAME: &str = "guest-control";
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TrustedGuestControlInstallSlot {
@@ -73,7 +70,8 @@ impl TrustedGuestControlBinaryGeneration {
     /// Declare one exact reviewed Linux/aarch64 guest-control executable generation.
     ///
     /// The artifact digest is used directly by the canonical protocol binary binding. The fixed
-    /// v1 install slot is identity-bearing while its concrete guest path remains crate-private.
+    /// v1 install slot is identity-bearing; a later publication/observer slice owns the concrete
+    /// protected guest path for that slot.
     ///
     /// # Errors
     ///
@@ -265,10 +263,11 @@ mod tests {
     }
 
     #[test]
-    fn serialized_declaration_exposes_slot_without_physical_path() {
+    fn serialized_declaration_exposes_slot_without_path_fields() {
         let encoded = serde_json::to_string(&generation()).unwrap();
         assert!(encoded.contains("protected_libexec_v1"));
-        assert!(!encoded.contains(TRUSTED_GUEST_CONTROL_INSTALL_PARENT));
-        assert!(!encoded.contains(TRUSTED_GUEST_CONTROL_INSTALL_NAME));
+        assert!(!encoded.contains("\"path\""));
+        assert!(!encoded.contains("install_parent"));
+        assert!(!encoded.contains("install_name"));
     }
 }
