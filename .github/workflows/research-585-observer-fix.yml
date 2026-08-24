@@ -37,9 +37,10 @@ jobs:
                   raise SystemExit(f"{label}: expected one match, saw {count}")
               s = s2
 
-          if s.count("use rustix::io::{Errno, fcntl_dupfd_cloexec};") != 1:
+          old_import = "use rustix::io::{Errno, fcntl_dupfd_cloexec};"
+          if s.count(old_import) != 1:
               raise SystemExit("unexpected rustix import seam")
-          s = s.replace("use rustix::io::{Errno, fcntl_dupfd_cloexec};", "use rustix::io::Errno;", 1)
+          s = s.replace(old_import, "use rustix::io::Errno;", 1)
 
           new_confirm = '''    pub fn confirm(&self) -> Result<(), ImmutableGitObjectPoolObservationError> {
               require_parent_identity(
@@ -261,21 +262,6 @@ jobs:
               "marker metadata identity",
           )
 
-          if s.count("    use std::fs;\n") != 1:
-              raise SystemExit("test import seam changed")
-          s = s.replace("    use std::fs;\n", "    use std::ffi::OsStr;\n    use std::fs;\n", 1)
-          old_import = '''        ImmutableGitObjectPoolLocation, ImmutableGitObjectPoolObservationErrorKind, MARKER_NAME,
-              OBJECTS_NAME, PARENT_MODE, observe_with_owner,
-          };
-          '''
-          new_import = '''        ImmutableGitObjectPoolLocation, ImmutableGitObjectPoolObservationErrorKind, MARKER_NAME,
-              OBJECTS_NAME, PARENT_MODE, observe_with_owner, require_current_directory_entry,
-          };
-          '''
-          if s.count(old_import) != 1:
-              raise SystemExit("test helper import seam changed")
-          s = s.replace(old_import, new_import, 1)
-
           extra_tests = '''    #[test]
               fn absent_objects_info_is_accepted_when_generation_is_already_frozen() {
                   let binding = binding(1);
@@ -301,9 +287,9 @@ jobs:
                   fs::set_permissions(&objects, fs::Permissions::from_mode(GENERATION_MODE)).unwrap();
                   fs::set_permissions(&fixture.pool, fs::Permissions::from_mode(GENERATION_MODE)).unwrap();
                   assert_eq!(
-                      require_current_directory_entry(
+                      super::require_current_directory_entry(
                           &observation.root,
-                          OsStr::new(OBJECTS_NAME),
+                          std::ffi::OsStr::new(OBJECTS_NAME),
                           observation.expected_owner_uid,
                           observation.expected_owner_gid,
                           GENERATION_MODE,
