@@ -32,10 +32,8 @@ jobs:
           state = Path("src/project_disk_filesystem/format_state.rs")
           text = state.read_text()
 
-          old_ctor = """    #[allow(dead_code)]
-              pub(crate) fn from_verified("""
-          new_ctor = """    #[cfg(test)]
-              fn for_test("""
+          old_ctor = "    #[allow(dead_code)]\n    pub(crate) fn from_verified("
+          new_ctor = "    #[cfg(test)]\n    fn for_test("
           if text.count(old_ctor) != 1:
               raise SystemExit("unexpected raw ownership constructor")
           text = text.replace(old_ctor, new_ctor, 1)
@@ -47,64 +45,65 @@ jobs:
               1,
           )
 
-          struct_anchor = """    format_plan_digest: Sha256Digest,
-              filesystem_uuid: ProjectDiskFilesystemUuid,
-          """
-          struct_replacement = """    format_plan_digest: Sha256Digest,
-              physical_identity_digest: Sha256Digest,
-              backing_identity_digest: Sha256Digest,
-              filesystem_uuid: ProjectDiskFilesystemUuid,
-          """
+          struct_anchor = "    format_plan_digest: Sha256Digest,\n    filesystem_uuid: ProjectDiskFilesystemUuid,\n"
+          struct_replacement = (
+              "    format_plan_digest: Sha256Digest,\n"
+              "    physical_identity_digest: Sha256Digest,\n"
+              "    backing_identity_digest: Sha256Digest,\n"
+              "    filesystem_uuid: ProjectDiskFilesystemUuid,\n"
+          )
           if text.count(struct_anchor) != 1:
               raise SystemExit("unexpected post-format struct anchor")
           text = text.replace(struct_anchor, struct_replacement, 1)
 
-          confirm_anchor = """            || self.format_plan_digest != *plan.plan_digest()
-              || self.filesystem_uuid != *plan.filesystem_uuid()
-          """
-          confirm_replacement = """            || self.format_plan_digest != *plan.plan_digest()
-              || self.physical_identity_digest != record.ownership.physical_identity_digest
-              || self.backing_identity_digest != record.ownership.backing_identity_digest
-              || self.filesystem_uuid != *plan.filesystem_uuid()
-          """
+          confirm_anchor = (
+              "            || self.format_plan_digest != *plan.plan_digest()\n"
+              "            || self.filesystem_uuid != *plan.filesystem_uuid()\n"
+          )
+          confirm_replacement = (
+              "            || self.format_plan_digest != *plan.plan_digest()\n"
+              "            || self.physical_identity_digest != record.ownership.physical_identity_digest\n"
+              "            || self.backing_identity_digest != record.ownership.backing_identity_digest\n"
+              "            || self.filesystem_uuid != *plan.filesystem_uuid()\n"
+          )
           if text.count(confirm_anchor) != 1:
               raise SystemExit("unexpected post-format confirm anchor")
           text = text.replace(confirm_anchor, confirm_replacement, 1)
 
-          test_ctor_anchor = """            format_plan_digest: plan.plan_digest().clone(),
-                  filesystem_uuid: plan.filesystem_uuid().clone(),
-          """
-          test_ctor_replacement = """            format_plan_digest: plan.plan_digest().clone(),
-                  physical_identity_digest: record.ownership.physical_identity_digest.clone(),
-                  backing_identity_digest: record.ownership.backing_identity_digest.clone(),
-                  filesystem_uuid: plan.filesystem_uuid().clone(),
-          """
+          test_ctor_anchor = (
+              "            format_plan_digest: plan.plan_digest().clone(),\n"
+              "            filesystem_uuid: plan.filesystem_uuid().clone(),\n"
+          )
+          test_ctor_replacement = (
+              "            format_plan_digest: plan.plan_digest().clone(),\n"
+              "            physical_identity_digest: record.ownership.physical_identity_digest.clone(),\n"
+              "            backing_identity_digest: record.ownership.backing_identity_digest.clone(),\n"
+              "            filesystem_uuid: plan.filesystem_uuid().clone(),\n"
+          )
           if text.count(test_ctor_anchor) != 1:
               raise SystemExit("unexpected post-format test constructor anchor")
           text = text.replace(test_ctor_anchor, test_ctor_replacement, 1)
 
-          test_marker = """    #[test]
-              fn formatted_detached_requires_exact_post_format_and_p2_detach_evidence() {
-          """
+          test_marker = "    #[test]\n    fn formatted_detached_requires_exact_post_format_and_p2_detach_evidence() {\n"
           adversarial = '''    #[test]
-              fn post_format_evidence_from_another_physical_disk_is_refused() {
-                  let issued = mkfs_issued();
-                  let mut post = ProjectDiskPostFormatProof::for_test(
-                      &issued,
-                      checkpoint(&issued),
-                      digest('f'),
-                  );
-                  post.physical_identity_digest = digest('9');
-                  assert!(issued.record_exact_filesystem_observed(&post).is_err());
+          fn post_format_evidence_from_another_physical_disk_is_refused() {
+              let issued = mkfs_issued();
+              let mut post = ProjectDiskPostFormatProof::for_test(
+                  &issued,
+                  checkpoint(&issued),
+                  digest('f'),
+              );
+              post.physical_identity_digest = digest('9');
+              assert!(issued.record_exact_filesystem_observed(&post).is_err());
 
-                  let mut post = ProjectDiskPostFormatProof::for_test(
-                      &issued,
-                      checkpoint(&issued),
-                      digest('f'),
-                  );
-                  post.backing_identity_digest = digest('8');
-                  assert!(issued.record_exact_filesystem_observed(&post).is_err());
-              }
+              let mut post = ProjectDiskPostFormatProof::for_test(
+                  &issued,
+                  checkpoint(&issued),
+                  digest('f'),
+              );
+              post.backing_identity_digest = digest('8');
+              assert!(issued.record_exact_filesystem_observed(&post).is_err());
+          }
 
           '''
           if text.count(test_marker) != 1:
