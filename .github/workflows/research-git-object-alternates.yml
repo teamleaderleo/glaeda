@@ -24,6 +24,7 @@ jobs:
           SRC="$LAB/source"
           SEED="$LAB/seed.git"
           ADMIN_HOME=/var/lib/smol-admin-alt
+          RUNNER_HOME=/var/lib/smol-runner-alt
           sudo rm -rf "$LAB"
           sudo mkdir -p "$LAB"
           sudo chown "$(id -u):$(id -g)" "$LAB"
@@ -52,8 +53,11 @@ jobs:
           sudo chown root:root "$LAB"
           sudo chmod 0755 "$LAB"
           sudo useradd --system --create-home --home-dir "$ADMIN_HOME" --shell /bin/bash smol-admin-alt 2>/dev/null || true
+          sudo useradd --system --create-home --home-dir "$RUNNER_HOME" --shell /bin/bash smol-runner-alt 2>/dev/null || true
           au="$(id -u smol-admin-alt)"
           ag="$(id -g smol-admin-alt)"
+          ru="$(id -u smol-runner-alt)"
+          rg="$(id -g smol-runner-alt)"
 
           seed_digest() {
             sudo find "$SEED/objects" -type f -print0 \
@@ -67,10 +71,10 @@ jobs:
           printf 'seed_object_bytes=%s\n' "$(sudo du -sb "$SEED/objects" | cut -f1)"
           printf 'seed_owner=%s:%s mode=%s\n' \
             "$(sudo stat -c %u "$SEED")" "$(sudo stat -c %g "$SEED")" "$(sudo stat -c %a "$SEED")"
-          printf 'lab_owner=%s:%s mode=%s\n' \
-            "$(sudo stat -c %u "$LAB")" "$(sudo stat -c %g "$LAB")" "$(sudo stat -c %a "$LAB")"
 
           admin=(sudo -u smol-admin-alt /usr/bin/env -i HOME="$ADMIN_HOME" PATH=/usr/bin:/bin GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null XDG_CONFIG_HOME="$ADMIN_HOME/.config")
+          runner=(sudo -u smol-runner-alt /usr/bin/env -i HOME="$RUNNER_HOME" PATH=/usr/bin:/bin GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null XDG_CONFIG_HOME="$RUNNER_HOME/.config")
+
           for kind in shared reference; do
             parent="$LAB/$kind"
             sudo mkdir "$parent"
@@ -84,15 +88,42 @@ jobs:
             fi
             stop="$(date +%s%N)"
             printf '%s_clone_ns=%s\n' "$kind" "$((stop-start))"
-
             "${admin[@]}" /usr/bin/git -C "$parent/task" cat-file -e 'HEAD^{tree}'
             alt="$parent/task/.git/objects/info/alternates"
-            sudo test -f "$alt"
+            sudo test "$(sudo cat "$alt")" = "$SEED/objects"
             printf '%s_alternates=%s\n' "$kind" "$(sudo cat "$alt")"
             printf '%s_object_files=%s\n' "$kind" "$(sudo find "$parent/task/.git/objects" -type f | wc -l | tr -d ' ')"
             printf '%s_object_bytes=%s\n' "$kind" "$(sudo du -sb "$parent/task/.git/objects" | cut -f1)"
-            printf '%s_gitdir_owner=%s:%s\n' "$kind" \
-              "$(sudo stat -c %u "$parent/task/.git")" "$(sudo stat -c %g "$parent/task/.git")"
+          done
+
+          for kind in shared reference; do
+            parent="$LAB/${kind}-private"
+            gitdir="$parent/gitdir"
+            task="$parent/task"
+            sudo mkdir "$parent"
+            sudo chown "$au:$ag" "$parent"
+            sudo chmod 0700 "$parent"
+            if [ "$kind" = shared ]; then
+              "${admin[@]}" /usr/bin/git clone --shared --no-checkout --separate-git-dir "$gitdir" "$SEED" "$task"
+            else
+              "${admin[@]}" /usr/bin/git clone --reference "$SEED" --no-local --no-checkout --separate-git-dir "$gitdir" "$SEED" "$task"
+            fi
+            alt="$gitdir/objects/info/alternates"
+            sudo test "$(sudo cat "$alt")" = "$SEED/objects"
+            printf '%s_private_alternates=%s\n' "$kind" "$(sudo cat "$alt")"
+            sudo chown -R "$ru:$rg" "$parent"
+            sudo chmod 0700 "$parent" "$gitdir" "$task"
+
+            "${runner[@]}" /usr/bin/git -C "$task" checkout -q -f HEAD
+            printf 'task-%s\n' "$kind" | sudo -u smol-runner-alt tee -a "$task/file-1.txt" >/dev/null
+            "${runner[@]}" /usr/bin/git -C "$task" add file-1.txt
+            "${runner[@]}" /usr/bin/git -C "$task" -c user.name=task -c user.email=task@example.invalid commit -q -m task
+            "${runner[@]}" /usr/bin/git -C "$task" gc --prune=now
+            "${runner[@]}" /usr/bin/git -C "$task" cat-file -e 'HEAD^{tree}'
+            sudo test "$(sudo cat "$alt")" = "$SEED/objects"
+            printf '%s_private_post_gc_alternates=%s\n' "$kind" "$(sudo cat "$alt")"
+            printf '%s_private_gitdir_owner=%s:%s expected=%s:%s\n' "$kind" \
+              "$(sudo stat -c %u "$gitdir")" "$(sudo stat -c %g "$gitdir")" "$ru" "$rg"
           done
 
           after="$(seed_digest)"
