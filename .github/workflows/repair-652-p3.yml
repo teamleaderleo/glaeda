@@ -1,0 +1,94 @@
+name: Repair P3 create provenance model
+
+on:
+  push:
+    branches:
+      - chatgpt/565-p3-create-provenance-model
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: chatgpt/565-p3-create-provenance-model
+          fetch-depth: 0
+          show-progress: false
+      - name: Tighten exact create plan
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('src/project_disk_create_state.rs')
+          text = path.read_text()
+
+          replacements = [
+              (
+                  '''        Ok(ProjectDiskCreateStartPlan {\n            identity: self.plan_identity(),\n            attempt_generation,\n        })''',
+                  '''        Ok(ProjectDiskCreateStartPlan {\n            identity: self.plan_identity(),\n            attempt_generation,\n            requested_logical_bytes: self.requested_logical_bytes,\n        })''',
+              ),
+              (
+                  '''        if attempt_generation != plan.attempt_generation {\n            return Err(plan_mismatch());\n        }\n        self.require_plan_identity(&plan.identity)?;''',
+                  '''        if attempt_generation != plan.attempt_generation\n            || plan.requested_logical_bytes != self.requested_logical_bytes\n        {\n            return Err(plan_mismatch());\n        }\n        self.require_plan_identity(&plan.identity)?;''',
+              ),
+              (
+                  '''        if attempt_generation != start.attempt_generation {\n            return Err(plan_mismatch());\n        }\n        self.require_started_plan_identity(&start.identity)?;''',
+                  '''        if attempt_generation != start.attempt_generation\n            || start.requested_logical_bytes != self.requested_logical_bytes\n        {\n            return Err(plan_mismatch());\n        }\n        self.require_started_plan_identity(&start.identity)?;''',
+              ),
+              (
+                  '''        if identity.expected_revision >= self.revision {\n            return Err(stale_plan());\n        }''',
+                  '''        if identity.expected_revision.get().checked_add(1) != Some(self.revision.get()) {\n            return Err(stale_plan());\n        }''',
+              ),
+              (
+                  '''pub struct ProjectDiskCreateStartPlan {\n    identity: ProjectDiskCreatePlanIdentity,\n    attempt_generation: ProjectDiskCreateAttemptGeneration,\n}''',
+                  '''pub struct ProjectDiskCreateStartPlan {\n    identity: ProjectDiskCreatePlanIdentity,\n    attempt_generation: ProjectDiskCreateAttemptGeneration,\n    requested_logical_bytes: u64,\n}''',
+              ),
+              (
+                  '''    pub const fn requested_logical_bytes(&self) -> u64 {\n        // The executor obtains size from the current record while holding the same writer lock.\n        // This plan intentionally carries only immutable attempt identity plus locator.\n        0\n    }''',
+                  '''    pub const fn requested_logical_bytes(&self) -> u64 {\n        self.requested_logical_bytes\n    }''',
+              ),
+              (
+                  '''    attempt_generation: ProjectDiskCreateAttemptGeneration,\n}\n\nimpl ProjectDiskCreateExecutionReceipt {''',
+                  '''    attempt_generation: ProjectDiskCreateAttemptGeneration,\n    requested_logical_bytes: u64,\n}\n\nimpl ProjectDiskCreateExecutionReceipt {''',
+              ),
+              (
+                  '''            || self.disk_name != record.disk_name\n            || self.attempt_generation != attempt_generation\n        {''',
+                  '''            || self.disk_name != record.disk_name\n            || self.attempt_generation != attempt_generation\n            || self.requested_logical_bytes != record.requested_logical_bytes\n        {''',
+              ),
+              (
+                  '''            disk_name: record.disk_name.clone(),\n            attempt_generation,\n        }\n    }\n}\n\n/// Sealed fresh P2 post-create evidence''',
+                  '''            disk_name: record.disk_name.clone(),\n            attempt_generation,\n            requested_logical_bytes: record.requested_logical_bytes,\n        }\n    }\n}\n\n/// Sealed fresh P2 post-create evidence''',
+              ),
+              (
+                  '''    let mut hasher = Sha256::new();\n    hasher.update(PROJECT_DISK_LOCATOR_DOMAIN);\n    for field in [\n        project.as_str().as_bytes(),\n        disk_id.as_str().as_bytes(),\n        &disk_generation.get().to_be_bytes(),\n        source_identity.digest().as_str().as_bytes(),\n    ] {''',
+                  '''    let mut hasher = Sha256::new();\n    hasher.update(PROJECT_DISK_LOCATOR_DOMAIN);\n    let disk_generation_bytes = disk_generation.get().to_be_bytes();\n    for field in [\n        project.as_str().as_bytes(),\n        disk_id.as_str().as_bytes(),\n        disk_generation_bytes.as_slice(),\n        source_identity.digest().as_str().as_bytes(),\n    ] {''',
+              ),
+          ]
+
+          for old, new in replacements:
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'expected exactly one replacement, found {count}: {old[:80]!r}')
+              text = text.replace(old, new)
+
+          path.write_text(text)
+          PY
+      - name: Format and remove helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.97.1 --profile minimal --component rustfmt --no-self-update
+          cargo fmt --all
+          rm .github/workflows/repair-652-p3.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "#565 P3 tighten no-replay create plan"
+          git push origin HEAD:chatgpt/565-p3-create-provenance-model
