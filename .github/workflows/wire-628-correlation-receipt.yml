@@ -1,0 +1,63 @@
+name: Wire full #628 correlation receipt validator
+
+on:
+  push:
+    branches:
+      - chatgpt/628-full-correlation-receipt-validator
+
+permissions:
+  contents: write
+
+jobs:
+  wire:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: chatgpt/628-full-correlation-receipt-validator
+          fetch-depth: 0
+          show-progress: false
+      - name: Export validator and tighten canonical commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          lib = Path('src/lib.rs')
+          text = lib.read_text()
+          export = '/// Pure bounded validator for the final #628 full project-filesystem correlation receipt.\npub mod project_filesystem_correlation_receipt;\n'
+          if export not in text:
+              anchor = '/// Pure identity vocabulary for one formatted project-disk filesystem generation.\npub mod project_disk_filesystem;\n'
+              if text.count(anchor) != 1:
+                  raise SystemExit('unexpected project-disk filesystem export anchor')
+              text = text.replace(anchor, anchor + export)
+          lib.write_text(text)
+
+          path = Path('src/project_filesystem_correlation_receipt.rs')
+          text = path.read_text()
+          old = '''    if value.len() != MAX_COMMIT_BYTES || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {'''
+          new = '''    if value.len() != MAX_COMMIT_BYTES\n        || !value\n            .bytes()\n            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))\n    {'''
+          if old in text:
+              text = text.replace(old, new, 1)
+          path.write_text(text)
+          PY
+      - name: Format and focused tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.97.1 --profile minimal --component rustfmt --no-self-update
+          cargo fmt --all
+          cargo test --locked project_filesystem_correlation_receipt
+      - name: Remove helper and publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm .github/workflows/wire-628-correlation-receipt.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "#628 wire full project-filesystem correlation validator"
+          git push origin HEAD:chatgpt/628-full-correlation-receipt-validator
