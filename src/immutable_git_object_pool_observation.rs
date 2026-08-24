@@ -19,10 +19,13 @@ use rustix::fs::{self as rustix_fs, AtFlags, FileType, Mode, OFlags};
 use rustix::io::Errno;
 use serde::Serialize;
 
-use crate::immutable_git_object_pool::GitObjectPoolBinding;
+use crate::artifact::Sha256Digest;
+use crate::immutable_git_object_pool::{
+    GitObjectFormat, GitObjectPoolBinding, GitObjectPoolGeneration,
+};
 use crate::immutable_git_object_pool_marker::{
     IMMUTABLE_GIT_OBJECT_POOL_MARKER_BYTES, IMMUTABLE_GIT_OBJECT_POOL_MARKER_SCHEMA_VERSION,
-    ImmutableGitObjectPoolMarker,
+    ImmutableGitObjectPoolMarker, git_object_pool_binding_digest,
 };
 
 pub const IMMUTABLE_GIT_OBJECT_POOL_OBSERVATION_SCHEMA_VERSION: u8 = 1;
@@ -42,15 +45,20 @@ const REDACTED: &str = "<private-immutable-git-object-pool-descriptors>";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ImmutableGitObjectPoolObservationDisposition {
-    OwnershipEnvelopeObserved,
+    RootOwnedFrozen,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ImmutableGitObjectPoolObservationSummary {
     schema_version: u8,
     disposition: ImmutableGitObjectPoolObservationDisposition,
+    generation: GitObjectPoolGeneration,
+    object_format: GitObjectFormat,
+    binding_digest: Sha256Digest,
     marker_schema_version: u8,
+    marker_matched: bool,
     retained_directory_descriptors: u8,
+    retained_objects_descriptor: bool,
     retained_marker_descriptor: bool,
     same_filesystem_device: bool,
     nested_alternates_absent: bool,
@@ -58,37 +66,62 @@ pub struct ImmutableGitObjectPoolObservationSummary {
 
 impl ImmutableGitObjectPoolObservationSummary {
     #[must_use]
-    pub const fn schema_version(self) -> u8 {
+    pub const fn schema_version(&self) -> u8 {
         self.schema_version
     }
 
     #[must_use]
-    pub const fn disposition(self) -> ImmutableGitObjectPoolObservationDisposition {
+    pub const fn disposition(&self) -> ImmutableGitObjectPoolObservationDisposition {
         self.disposition
     }
 
     #[must_use]
-    pub const fn marker_schema_version(self) -> u8 {
+    pub const fn generation(&self) -> GitObjectPoolGeneration {
+        self.generation
+    }
+
+    #[must_use]
+    pub const fn object_format(&self) -> GitObjectFormat {
+        self.object_format
+    }
+
+    #[must_use]
+    pub const fn binding_digest(&self) -> &Sha256Digest {
+        &self.binding_digest
+    }
+
+    #[must_use]
+    pub const fn marker_schema_version(&self) -> u8 {
         self.marker_schema_version
     }
 
     #[must_use]
-    pub const fn retained_directory_descriptors(self) -> u8 {
+    pub const fn marker_matched(&self) -> bool {
+        self.marker_matched
+    }
+
+    #[must_use]
+    pub const fn retained_directory_descriptors(&self) -> u8 {
         self.retained_directory_descriptors
     }
 
     #[must_use]
-    pub const fn retained_marker_descriptor(self) -> bool {
+    pub const fn retained_objects_descriptor(&self) -> bool {
+        self.retained_objects_descriptor
+    }
+
+    #[must_use]
+    pub const fn retained_marker_descriptor(&self) -> bool {
         self.retained_marker_descriptor
     }
 
     #[must_use]
-    pub const fn same_filesystem_device(self) -> bool {
+    pub const fn same_filesystem_device(&self) -> bool {
         self.same_filesystem_device
     }
 
     #[must_use]
-    pub const fn nested_alternates_absent(self) -> bool {
+    pub const fn nested_alternates_absent(&self) -> bool {
         self.nested_alternates_absent
     }
 }
@@ -108,8 +141,8 @@ pub struct ImmutableGitObjectPoolObservation {
 
 impl ImmutableGitObjectPoolObservation {
     #[must_use]
-    pub const fn summary(&self) -> ImmutableGitObjectPoolObservationSummary {
-        self.summary
+    pub const fn summary(&self) -> &ImmutableGitObjectPoolObservationSummary {
+        &self.summary
     }
 
     #[must_use]
@@ -236,16 +269,22 @@ where
     }
 
     let info = open_optional_frozen_directory(&objects.fd, OsStr::new("info"), authority_owner)?;
-    require_nested_alternates_absent(info.as_ref())?;
+    require_nested_alternates_absent(&objects, info.as_ref(), authority_owner)?;
     let marker = BoundMarker::open(&root.fd, authority_owner, binding)?;
+    let binding_digest = git_object_pool_binding_digest(binding).map_err(|_| marker_mismatch())?;
 
     let retained_directory_descriptors = if info.is_some() { 4 } else { 3 };
     let mut observation = ImmutableGitObjectPoolObservation {
         summary: ImmutableGitObjectPoolObservationSummary {
             schema_version: IMMUTABLE_GIT_OBJECT_POOL_OBSERVATION_SCHEMA_VERSION,
-            disposition: ImmutableGitObjectPoolObservationDisposition::OwnershipEnvelopeObserved,
+            disposition: ImmutableGitObjectPoolObservationDisposition::RootOwnedFrozen,
+            generation: binding.generation(),
+            object_format: binding.object_format(),
+            binding_digest,
             marker_schema_version: IMMUTABLE_GIT_OBJECT_POOL_MARKER_SCHEMA_VERSION,
+            marker_matched: true,
             retained_directory_descriptors,
+            retained_objects_descriptor: true,
             retained_marker_descriptor: true,
             same_filesystem_device: true,
             nested_alternates_absent: true,
@@ -265,6 +304,18 @@ where
     Ok(observation)
 }
 
+fn require_same_directory_entry(
+    parent: &OwnedFd,
+    name: &OsStr,
+    expected: &BoundDirectory,
+) -> Result<(), ImmutableGitObjectPoolObservationError> {
+    let current = BoundDirectory::open_child(parent, name).map_err(|_| changed())?;
+    if current.snapshot != expected.snapshot {
+        return Err(changed());
+    }
+    Ok(())
+}
+
 fn revalidate_observation(
     observation: &mut ImmutableGitObjectPoolObservation,
     binding: &GitObjectPoolBinding,
@@ -273,34 +324,44 @@ fn revalidate_observation(
     observation.parent.revalidate_control(authority_owner)?;
     observation.root.revalidate_frozen(authority_owner)?;
     observation.objects.revalidate_frozen(authority_owner)?;
-
-    let reopened_root =
-        BoundDirectory::open_child(&observation.parent.fd, &observation.generation_name)
-            .map_err(|_| changed())?;
-    if reopened_root.snapshot != observation.root.snapshot {
-        return Err(changed());
-    }
-    let reopened_objects = BoundDirectory::open_child(&observation.root.fd, OsStr::new("objects"))
-        .map_err(|_| changed())?;
-    if reopened_objects.snapshot != observation.objects.snapshot {
-        return Err(changed());
-    }
+    require_same_directory_entry(
+        &observation.parent.fd,
+        &observation.generation_name,
+        &observation.root,
+    )?;
+    require_same_directory_entry(
+        &observation.root.fd,
+        OsStr::new("objects"),
+        &observation.objects,
+    )?;
     if observation.root.snapshot.device != observation.objects.snapshot.device {
         return Err(changed());
     }
 
-    revalidate_optional_info(
-        &observation.objects.fd,
+    require_nested_alternates_absent(
+        &observation.objects,
         observation.info.as_ref(),
         authority_owner,
     )?;
-    require_nested_alternates_absent(observation.info.as_ref())?;
     observation
         .marker
         .revalidate(&observation.root.fd, authority_owner, binding)?;
+
+    observation.objects.revalidate_frozen(authority_owner)?;
+    require_same_directory_entry(
+        &observation.root.fd,
+        OsStr::new("objects"),
+        &observation.objects,
+    )?;
+    observation.root.revalidate_frozen(authority_owner)?;
+    require_same_directory_entry(
+        &observation.parent.fd,
+        &observation.generation_name,
+        &observation.root,
+    )?;
+    observation.parent.revalidate_control(authority_owner)?;
     Ok(())
 }
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DirectorySnapshot {
     device: u64,
@@ -587,22 +648,26 @@ fn open_optional_frozen_directory(
     }
 }
 
-fn revalidate_optional_info(
-    objects: &OwnedFd,
-    expected: Option<&BoundDirectory>,
+fn require_nested_alternates_absent(
+    objects: &BoundDirectory,
+    info: Option<&BoundDirectory>,
     owner: (u32, u32),
 ) -> Result<(), ImmutableGitObjectPoolObservationError> {
-    match expected {
-        Some(expected) => {
-            expected.revalidate_frozen(owner)?;
-            let current =
-                BoundDirectory::open_child(objects, OsStr::new("info")).map_err(|_| changed())?;
-            if current.snapshot != expected.snapshot {
-                return Err(changed());
+    objects.revalidate_frozen(owner)?;
+    match info {
+        Some(info) => {
+            info.revalidate_frozen(owner)?;
+            require_same_directory_entry(&objects.fd, OsStr::new("info"), info)?;
+            match rustix_fs::statat(info.fd.as_fd(), "alternates", AtFlags::SYMLINK_NOFOLLOW) {
+                Err(Errno::NOENT) => {}
+                Ok(_) => return Err(nested_alternates()),
+                Err(_) => return Err(io_error()),
             }
+            info.revalidate_frozen(owner)?;
+            require_same_directory_entry(&objects.fd, OsStr::new("info"), info)?;
         }
         None => match rustix_fs::openat(
-            objects.as_fd(),
+            objects.fd.as_fd(),
             OsStr::new("info"),
             DIRECTORY_FLAGS,
             Mode::empty(),
@@ -611,20 +676,8 @@ fn revalidate_optional_info(
             _ => return Err(changed()),
         },
     }
+    objects.revalidate_frozen(owner)?;
     Ok(())
-}
-
-fn require_nested_alternates_absent(
-    info: Option<&BoundDirectory>,
-) -> Result<(), ImmutableGitObjectPoolObservationError> {
-    let Some(info) = info else {
-        return Ok(());
-    };
-    match rustix_fs::statat(info.fd.as_fd(), "alternates", AtFlags::SYMLINK_NOFOLLOW) {
-        Err(Errno::NOENT) => Ok(()),
-        Ok(_) => Err(nested_alternates()),
-        Err(_) => Err(io_error()),
-    }
 }
 
 fn read_marker(
@@ -760,7 +813,7 @@ mod tests {
         GitObjectPoolProducerGenerationId, GitObjectPoolTrustGenerationId,
     };
     use crate::immutable_git_object_pool_marker::{
-        GitObjectPoolMarkerNonce, ImmutableGitObjectPoolMarker,
+        GitObjectPoolMarkerNonce, ImmutableGitObjectPoolMarker, git_object_pool_binding_digest,
     };
     use crate::project_catalog::ProjectIdentity;
     use crate::project_disk_lease::{ProjectDiskGeneration, ProjectDiskId};
@@ -882,9 +935,20 @@ mod tests {
             observe_with_owner(&fixture.pool, &expected, fixture.owner, || {}).unwrap();
         assert_eq!(
             observation.summary().disposition(),
-            ImmutableGitObjectPoolObservationDisposition::OwnershipEnvelopeObserved
+            ImmutableGitObjectPoolObservationDisposition::RootOwnedFrozen
         );
+        assert_eq!(observation.summary().generation(), expected.generation());
+        assert_eq!(
+            observation.summary().object_format(),
+            expected.object_format()
+        );
+        assert_eq!(
+            observation.summary().binding_digest(),
+            &git_object_pool_binding_digest(&expected).unwrap()
+        );
+        assert!(observation.summary().marker_matched());
         assert_eq!(observation.summary().retained_directory_descriptors(), 4);
+        assert!(observation.summary().retained_objects_descriptor());
         assert!(observation.summary().retained_marker_descriptor());
         assert!(observation.summary().same_filesystem_device());
         assert!(observation.summary().nested_alternates_absent());
@@ -933,6 +997,48 @@ mod tests {
                 .kind(),
             ImmutableGitObjectPoolObservationErrorKind::NestedAlternates
         );
+    }
+
+    #[test]
+    fn absent_info_is_accepted_and_creation_invalidates_confirmation() {
+        let expected = binding(1);
+        let fixture = Fixture::new(&expected, false);
+        fs::set_permissions(&fixture.objects, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::remove_dir(&fixture.info).unwrap();
+        fs::set_permissions(&fixture.objects, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let mut observation =
+            observe_with_owner(&fixture.pool, &expected, fixture.owner, || {}).unwrap();
+        fs::set_permissions(&fixture.objects, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::create_dir(&fixture.info).unwrap();
+        fs::set_permissions(&fixture.info, fs::Permissions::from_mode(0o555)).unwrap();
+        fs::set_permissions(&fixture.objects, fs::Permissions::from_mode(0o555)).unwrap();
+
+        assert_eq!(
+            observation.confirm(&expected).unwrap_err().kind(),
+            ImmutableGitObjectPoolObservationErrorKind::ChangedDuringObservation
+        );
+    }
+
+    #[test]
+    fn retained_info_replacement_invalidates_confirmation() {
+        let expected = binding(1);
+        let fixture = Fixture::new(&expected, false);
+        let mut observation =
+            observe_with_owner(&fixture.pool, &expected, fixture.owner, || {}).unwrap();
+        let old_info = fixture.objects.join("info-old");
+        fs::set_permissions(&fixture.objects, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::rename(&fixture.info, &old_info).unwrap();
+        fs::create_dir(&fixture.info).unwrap();
+        fs::set_permissions(&fixture.info, fs::Permissions::from_mode(0o555)).unwrap();
+        fs::set_permissions(&fixture.objects, fs::Permissions::from_mode(0o555)).unwrap();
+
+        assert_eq!(
+            observation.confirm(&expected).unwrap_err().kind(),
+            ImmutableGitObjectPoolObservationErrorKind::ChangedDuringObservation
+        );
+        let _ = fs::set_permissions(&old_info, fs::Permissions::from_mode(0o755));
+        let _ = fs::remove_dir(&old_info);
     }
 
     #[test]
