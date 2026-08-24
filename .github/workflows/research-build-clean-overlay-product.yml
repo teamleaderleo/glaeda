@@ -79,7 +79,8 @@ jobs:
           path.write_text(text)
           """
 
-          needle = 'cargo fmt --all\n'''
+          needle = 'cargo fmt --all\n'
+          '''
           source = source.replace(phase_end, phase_end_repaired, 1)
           marker = '        run: |\n'
           if source.count(marker) != 1:
