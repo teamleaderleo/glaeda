@@ -1,0 +1,131 @@
+name: Bind filesystem UUID and feature policy
+
+on:
+  push:
+    branches:
+      - chatgpt/640-verified-full-correlation
+
+permissions:
+  contents: write
+
+jobs:
+  bind:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: chatgpt/640-verified-full-correlation
+          fetch-depth: 0
+          show-progress: false
+      - name: Bind P4 and guest filesystem metadata identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          # Guest transaction: carry exact observed UUID + feature policy under the sealed
+          # request/result/invocation target evidence.
+          path = Path('src/trusted_project_filesystem_guest_transaction.rs')
+          text = path.read_text()
+          import_anchor = '''use crate::project_disk_filesystem::{\n    ProjectDiskFilesystemBinding, ProjectDiskFilesystemFormatProfileGeneration,\n    ProjectDiskFilesystemGeneration, ProjectDiskFilesystemKind,\n};\n'''
+          import_new = '''use crate::project_disk_filesystem::format_plan::ProjectDiskFilesystemUuid;\nuse crate::project_disk_filesystem::{\n    ProjectDiskFilesystemBinding, ProjectDiskFilesystemFormatProfileGeneration,\n    ProjectDiskFilesystemGeneration, ProjectDiskFilesystemKind,\n};\n'''
+          if import_anchor in text:
+              text = text.replace(import_anchor, import_new, 1)
+
+          old = '''    filesystem_kind: ProjectDiskFilesystemKind,\n    limactl_generation: u64,'''
+          new = '''    filesystem_kind: ProjectDiskFilesystemKind,\n    filesystem_uuid: ProjectDiskFilesystemUuid,\n    feature_policy_digest: Sha256Digest,\n    filesystem_metadata_bound: bool,\n    limactl_generation: u64,'''
+          if old in text:
+              text = text.replace(old, new, 1)
+
+          getter_anchor = '''    #[must_use]\n    pub const fn limactl_generation(&self) -> u64 {'''
+          getters = '''    #[must_use]\n    pub const fn filesystem_uuid(&self) -> &ProjectDiskFilesystemUuid {\n        &self.filesystem_uuid\n    }\n\n    #[must_use]\n    pub const fn feature_policy_digest(&self) -> &Sha256Digest {\n        &self.feature_policy_digest\n    }\n\n    #[must_use]\n    pub const fn filesystem_metadata_bound(&self) -> bool {\n        self.filesystem_metadata_bound\n    }\n\n'''
+          if getters not in text and getter_anchor in text:
+              text = text.replace(getter_anchor, getters + getter_anchor, 1)
+
+          old_sig = '''        filesystem: &ProjectDiskFilesystemBinding,\n        limactl_generation: u64,'''
+          new_sig = '''        filesystem: &ProjectDiskFilesystemBinding,\n        filesystem_uuid: ProjectDiskFilesystemUuid,\n        feature_policy_digest: Sha256Digest,\n        limactl_generation: u64,'''
+          if old_sig in text:
+              text = text.replace(old_sig, new_sig, 1)
+
+          old_init = '''                filesystem_kind: filesystem.kind(),\n                limactl_generation,'''
+          new_init = '''                filesystem_kind: filesystem.kind(),\n                filesystem_uuid,\n                feature_policy_digest,\n                filesystem_metadata_bound: true,\n                limactl_generation,'''
+          if old_init in text:
+              text = text.replace(old_init, new_init, 1)
+
+          old_confirm = '''            || filesystem.kind() != self.summary.filesystem_kind\n            || guest_summary.filesystem_generation() != self.summary.filesystem_generation'''
+          new_confirm = '''            || filesystem.kind() != self.summary.filesystem_kind\n            || !self.summary.filesystem_metadata_bound\n            || self.summary.feature_policy_digest.as_str() == ZERO_DIGEST\n            || guest_summary.filesystem_generation() != self.summary.filesystem_generation'''
+          if old_confirm in text:
+              text = text.replace(old_confirm, new_confirm, 1)
+
+          # Tests need the UUID type and exact metadata inputs.
+          test_import_anchor = '''    use crate::project_disk_filesystem::{\n        ProjectDiskFilesystemBinding, ProjectDiskFilesystemFormatProfileGeneration,'''
+          test_import_new = '''    use crate::project_disk_filesystem::format_plan::ProjectDiskFilesystemUuid;\n    use crate::project_disk_filesystem::{\n        ProjectDiskFilesystemBinding, ProjectDiskFilesystemFormatProfileGeneration,'''
+          idx = text.find(test_import_anchor, text.find('#[cfg(test)]'))
+          if idx != -1:
+              text = text[:idx] + text[idx:].replace(test_import_anchor, test_import_new, 1)
+
+          call_old = '''            filesystem,\n            4,\n            digest('a'),'''
+          call_new = '''            filesystem,\n            ProjectDiskFilesystemUuid::parse("01234567-89ab-cdef-0123-456789abcdef").unwrap(),\n            digest('8'),\n            4,\n            digest('a'),'''
+          if call_old in text:
+              text = text.replace(call_old, call_new, 1)
+
+          path.write_text(text)
+
+          # Full correlation: P4 format provenance carries the same immutable UUID/features and
+          # final composition requires exact equality with the accepted guest transaction.
+          path = Path('src/trusted_project_filesystem_full_correlation.rs')
+          text = path.read_text()
+          import_anchor = '''use crate::project_disk_filesystem::{\n    ProjectDiskFilesystemBinding, ProjectDiskFilesystemFormatProfileGeneration,'''
+          import_new = '''use crate::project_disk_filesystem::format_plan::ProjectDiskFilesystemUuid;\nuse crate::project_disk_filesystem::{\n    ProjectDiskFilesystemBinding, ProjectDiskFilesystemFormatProfileGeneration,'''
+          if import_anchor in text:
+              text = text.replace(import_anchor, import_new, 1)
+
+          old = '''    filesystem_kind: ProjectDiskFilesystemKind,\n    physical_identity_digest: Sha256Digest,'''
+          new = '''    filesystem_kind: ProjectDiskFilesystemKind,\n    filesystem_uuid: ProjectDiskFilesystemUuid,\n    feature_policy_digest: Sha256Digest,\n    physical_identity_digest: Sha256Digest,'''
+          if old in text:
+              text = text.replace(old, new, 1)
+
+          debug_anchor = '''            .field("filesystem_kind", &self.filesystem_kind)\n            .field("physical_identity", &"<redacted>")'''
+          debug_new = '''            .field("filesystem_kind", &self.filesystem_kind)\n            .field("filesystem_uuid", &"<redacted>")\n            .field("feature_policy", &"<redacted>")\n            .field("physical_identity", &"<redacted>")'''
+          if debug_anchor in text:
+              text = text.replace(debug_anchor, debug_new, 1)
+
+          old_check = '''        || format.filesystem_kind != filesystem.kind()\n        || create.physical_identity_digest != format.physical_identity_digest'''
+          new_check = '''        || format.filesystem_kind != filesystem.kind()\n        || format.filesystem_uuid != *guest_transaction.summary().filesystem_uuid()\n        || format.feature_policy_digest != *guest_transaction.summary().feature_policy_digest()\n        || !guest_transaction.summary().filesystem_metadata_bound()\n        || create.physical_identity_digest != format.physical_identity_digest'''
+          if old_check in text:
+              text = text.replace(old_check, new_check, 1)
+
+          helper_old = '''            filesystem_kind: filesystem.kind(),\n            physical_identity_digest: digest('b'),'''
+          helper_new = '''            filesystem_kind: filesystem.kind(),\n            filesystem_uuid: ProjectDiskFilesystemUuid::parse(\n                "01234567-89ab-cdef-0123-456789abcdef",\n            )\n            .unwrap(),\n            feature_policy_digest: digest('8'),\n            physical_identity_digest: digest('b'),'''
+          if helper_old in text:
+              text = text.replace(helper_old, helper_new, 1)
+
+          # Full-correlation guest-transaction helper receives the same metadata inputs.
+          tx_call_old = '''            filesystem,\n            4,\n            digest('4'),'''
+          tx_call_new = '''            filesystem,\n            ProjectDiskFilesystemUuid::parse("01234567-89ab-cdef-0123-456789abcdef").unwrap(),\n            digest('8'),\n            4,\n            digest('4'),'''
+          if tx_call_old in text:
+              text = text.replace(tx_call_old, tx_call_new, 1)
+
+          path.write_text(text)
+          PY
+      - name: Format and focused tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.97.1 --profile minimal --component rustfmt --no-self-update
+          cargo fmt --all
+          cargo test --locked trusted_project_filesystem_guest_transaction
+          cargo test --locked trusted_project_filesystem_full_correlation
+      - name: Remove helper and publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm .github/workflows/bind-640-filesystem-metadata.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "#640 bind filesystem UUID and feature policy"
+          git push origin HEAD:chatgpt/640-verified-full-correlation
