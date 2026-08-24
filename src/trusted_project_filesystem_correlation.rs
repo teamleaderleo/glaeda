@@ -4,12 +4,12 @@ use serde::Serialize;
 
 use crate::project_catalog::ProjectIdentity;
 use crate::project_disk_lease::{
-    ProjectDiskAttachmentGeneration, ProjectDiskGeneration, ProjectDiskId,
-    ResidentSandboxGeneration, ResidentSandboxId,
+    ProjectDiskAttachmentGeneration, ProjectDiskGeneration, ProjectDiskId, ProjectDiskLeaseRecord,
+    ProjectDiskLeaseState, ProjectDiskRevision, ResidentSandboxGeneration, ResidentSandboxId,
 };
 use crate::trusted_overlay_task_view::OverlaySourceAnchorBinding;
 
-pub const TRUSTED_PROJECT_FILESYSTEM_CORRELATION_SCHEMA_VERSION: u8 = 1;
+pub const TRUSTED_PROJECT_FILESYSTEM_CORRELATION_SCHEMA_VERSION: u8 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
@@ -40,6 +40,7 @@ pub struct TrustedProjectFilesystemCorrelationSummary {
     project: ProjectIdentity,
     disk_id: ProjectDiskId,
     disk_generation: ProjectDiskGeneration,
+    disk_revision: ProjectDiskRevision,
     attachment_generation: ProjectDiskAttachmentGeneration,
     sandbox_id: ResidentSandboxId,
     sandbox_generation: ResidentSandboxGeneration,
@@ -66,6 +67,11 @@ impl TrustedProjectFilesystemCorrelationSummary {
     #[must_use]
     pub const fn disk_generation(&self) -> ProjectDiskGeneration {
         self.disk_generation
+    }
+
+    #[must_use]
+    pub const fn disk_revision(&self) -> ProjectDiskRevision {
+        self.disk_revision
     }
 
     #[must_use]
@@ -132,6 +138,40 @@ impl TrustedProjectFilesystemCorrelationProof {
         Ok(())
     }
 
+    /// Reconfirm the proof against the exact current attached project-disk lease as well as the
+    /// source anchor and observed filesystem device.
+    ///
+    /// This is the production-facing confirmation seam for #640. The current #589 executor still
+    /// calls the older anchor-only confirmation until the P3/P4 integration can supply a freshly
+    /// re-read attached lease at both pre-mutation confirmation points. Keeping this method sealed
+    /// now lets that later composition reject stale lease revisions and detach/reattach generation
+    /// reuse without exposing any proof constructor.
+    pub(crate) fn confirm_current_attachment(
+        &self,
+        anchor: &OverlaySourceAnchorBinding,
+        current: &ProjectDiskLeaseRecord,
+        observed_filesystem_device: u64,
+    ) -> Result<(), TrustedProjectFilesystemCorrelationError> {
+        self.confirm_overlay_anchor(anchor, observed_filesystem_device)?;
+        if current.project() != &self.summary.project
+            || current.disk_id() != &self.summary.disk_id
+            || current.disk_generation() != self.summary.disk_generation
+            || current.revision() != self.summary.disk_revision
+        {
+            return Err(correlation_mismatch());
+        }
+        let ProjectDiskLeaseState::Attached { attachment } = current.state() else {
+            return Err(correlation_mismatch());
+        };
+        if attachment.generation() != self.summary.attachment_generation
+            || attachment.sandbox_id() != &self.summary.sandbox_id
+            || attachment.sandbox_generation() != self.summary.sandbox_generation
+        {
+            return Err(correlation_mismatch());
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(
         anchor: &OverlaySourceAnchorBinding,
@@ -145,6 +185,7 @@ impl TrustedProjectFilesystemCorrelationProof {
                 project: anchor.project().clone(),
                 disk_id: anchor.disk_id().clone(),
                 disk_generation: anchor.disk_generation(),
+                disk_revision: ProjectDiskRevision::new(1).expect("test revision is positive"),
                 attachment_generation,
                 sandbox_id: anchor.resident_sandbox_id().clone(),
                 sandbox_generation: anchor.resident_sandbox_generation(),
@@ -153,6 +194,41 @@ impl TrustedProjectFilesystemCorrelationProof {
             },
             filesystem_device,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_current(
+        anchor: &OverlaySourceAnchorBinding,
+        current: &ProjectDiskLeaseRecord,
+        correlation_generation: TrustedProjectFilesystemCorrelationGeneration,
+        filesystem_device: u64,
+    ) -> Result<Self, TrustedProjectFilesystemCorrelationError> {
+        let ProjectDiskLeaseState::Attached { attachment } = current.state() else {
+            return Err(correlation_mismatch());
+        };
+        if current.project() != anchor.project()
+            || current.disk_id() != anchor.disk_id()
+            || current.disk_generation() != anchor.disk_generation()
+            || attachment.sandbox_id() != anchor.resident_sandbox_id()
+            || attachment.sandbox_generation() != anchor.resident_sandbox_generation()
+        {
+            return Err(correlation_mismatch());
+        }
+        Ok(Self {
+            summary: TrustedProjectFilesystemCorrelationSummary {
+                schema_version: TRUSTED_PROJECT_FILESYSTEM_CORRELATION_SCHEMA_VERSION,
+                project: current.project().clone(),
+                disk_id: current.disk_id().clone(),
+                disk_generation: current.disk_generation(),
+                disk_revision: current.revision(),
+                attachment_generation: attachment.generation(),
+                sandbox_id: attachment.sandbox_id().clone(),
+                sandbox_generation: attachment.sandbox_generation(),
+                correlation_generation,
+                filesystem_device_bound: true,
+            },
+            filesystem_device,
+        })
     }
 }
 
@@ -237,6 +313,8 @@ mod tests {
     use crate::project_catalog::ProjectIdentity;
     use crate::project_disk_lease::{
         ProjectDiskAttachmentGeneration, ProjectDiskGeneration, ProjectDiskId,
+        ProjectDiskLeaseRecord, ProjectDiskLockObservation, ProjectDiskObservation,
+        ProjectDiskPhysicalObservation, ProjectDiskRecoverability, ProjectDiskUseObservation,
         ResidentSandboxGeneration, ResidentSandboxId,
     };
     use crate::trusted_overlay_task_view::{
@@ -259,6 +337,37 @@ mod tests {
             )
             .unwrap(),
         )
+    }
+
+    fn attached_record() -> ProjectDiskLeaseRecord {
+        let detached = ProjectDiskLeaseRecord::new_detached(
+            ProjectIdentity::parse("github.com/teamleaderleo/smolrunner").unwrap(),
+            ProjectDiskId::parse("disk-a").unwrap(),
+            ProjectDiskGeneration::new(3).unwrap(),
+        );
+        let plan = detached
+            .plan_attach(
+                ResidentSandboxId::parse("sandbox-a").unwrap(),
+                ResidentSandboxGeneration::new(11).unwrap(),
+                ProjectDiskObservation::new(
+                    ProjectDiskPhysicalObservation::Exact,
+                    ProjectDiskUseObservation::Unused,
+                    ProjectDiskLockObservation::Unlocked,
+                    ProjectDiskRecoverability::Unknown,
+                ),
+            )
+            .unwrap();
+        detached
+            .record_attach_success(
+                &plan,
+                ProjectDiskObservation::new(
+                    ProjectDiskPhysicalObservation::Exact,
+                    ProjectDiskUseObservation::CurrentAttachment,
+                    ProjectDiskLockObservation::CurrentAttachment,
+                    ProjectDiskRecoverability::Unknown,
+                ),
+            )
+            .unwrap()
     }
 
     #[test]
@@ -284,6 +393,93 @@ mod tests {
         proof.confirm_overlay_anchor(&anchor, 0xfeed_beef).unwrap();
         assert!(proof.confirm_overlay_anchor(&anchor, 0xfeed_beee).is_err());
         assert_eq!(proof.summary().attachment_generation().get(), 7);
+        assert_eq!(proof.summary().disk_revision().get(), 1);
+    }
+
+    #[test]
+    fn current_attachment_confirmation_rejects_stale_detach_reattach_generation() {
+        let anchor = anchor();
+        let current = attached_record();
+        let proof = TrustedProjectFilesystemCorrelationProof::for_test_current(
+            &anchor,
+            &current,
+            TrustedProjectFilesystemCorrelationGeneration::new(13).unwrap(),
+            0xfeed_beef,
+        )
+        .unwrap();
+        proof
+            .confirm_current_attachment(&anchor, &current, 0xfeed_beef)
+            .unwrap();
+
+        let detach = current
+            .plan_detach(ProjectDiskObservation::new(
+                ProjectDiskPhysicalObservation::Exact,
+                ProjectDiskUseObservation::CurrentAttachment,
+                ProjectDiskLockObservation::CurrentAttachment,
+                ProjectDiskRecoverability::Unknown,
+            ))
+            .unwrap();
+        let detached = current
+            .record_detach_success(
+                &detach,
+                ProjectDiskObservation::new(
+                    ProjectDiskPhysicalObservation::Exact,
+                    ProjectDiskUseObservation::Unused,
+                    ProjectDiskLockObservation::Unlocked,
+                    ProjectDiskRecoverability::Unknown,
+                ),
+            )
+            .unwrap();
+        let reattach = detached
+            .plan_attach(
+                ResidentSandboxId::parse("sandbox-a").unwrap(),
+                ResidentSandboxGeneration::new(11).unwrap(),
+                ProjectDiskObservation::new(
+                    ProjectDiskPhysicalObservation::Exact,
+                    ProjectDiskUseObservation::Unused,
+                    ProjectDiskLockObservation::Unlocked,
+                    ProjectDiskRecoverability::Unknown,
+                ),
+            )
+            .unwrap();
+        let reattached = detached
+            .record_attach_success(
+                &reattach,
+                ProjectDiskObservation::new(
+                    ProjectDiskPhysicalObservation::Exact,
+                    ProjectDiskUseObservation::CurrentAttachment,
+                    ProjectDiskLockObservation::CurrentAttachment,
+                    ProjectDiskRecoverability::Unknown,
+                ),
+            )
+            .unwrap();
+
+        assert_eq!(proof.summary().attachment_generation().get(), 1);
+        assert_eq!(reattached.last_attachment_generation().unwrap().get(), 2);
+        assert!(
+            proof
+                .confirm_current_attachment(&anchor, &reattached, 0xfeed_beef)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn current_attachment_confirmation_rejects_non_attached_state() {
+        let anchor = anchor();
+        let current = attached_record();
+        let proof = TrustedProjectFilesystemCorrelationProof::for_test_current(
+            &anchor,
+            &current,
+            TrustedProjectFilesystemCorrelationGeneration::new(13).unwrap(),
+            0xfeed_beef,
+        )
+        .unwrap();
+        let revalidate = current.require_revalidation().unwrap();
+        assert!(
+            proof
+                .confirm_current_attachment(&anchor, &revalidate, 0xfeed_beef)
+                .is_err()
+        );
     }
 
     #[test]
