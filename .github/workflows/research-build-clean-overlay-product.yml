@@ -37,16 +37,21 @@ jobs:
           script = '\n'.join(lines) + '\n'
           old = "text = replace_once(text, test_marker, extra_tests + test_marker, 'failure/race test insertion')"
           new = '''text, insert_count = re.subn(
-    r"(?m)^    #\\[test\\]\\n    fn visible_mount_id_mismatch_returns_recovery_debt\\(\\) \\{",
-    lambda match: extra_tests + match.group(0),
-    text,
-    count=1,
-)
-if insert_count != 1:
-    raise SystemExit(f'failure/race test insertion: expected one regex match, got {insert_count}')'''
+              r"(?m)^    #\\[test\\]\\n    fn visible_mount_id_mismatch_returns_recovery_debt\\(\\) \\{",
+              lambda match: extra_tests + match.group(0),
+              text,
+              count=1,
+          )
+          if insert_count != 1:
+              raise SystemExit(f'failure/race test insertion: expected one regex match, got {insert_count}')'''
           if script.count(old) != 1:
               raise SystemExit(f'v3 failed insertion call count={script.count(old)}')
           script = script.replace(old, new, 1)
           Path('/tmp/build-overlay-product-repaired.sh').write_text(script)
+
+          old = '''            BackendStage::Attach if recovery_required => (
+          compatibility sentinel consumed by the registered v2 diagnostic runner
+          '''
+          text = text.replace(old, new, 1)
           PY
           bash /tmp/build-overlay-product-repaired.sh
