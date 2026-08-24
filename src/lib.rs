@@ -258,6 +258,9 @@ pub mod project_checkout_observation;
 pub mod project_discovery;
 /// Pure identity vocabulary for one formatted project-disk filesystem generation.
 pub mod project_disk_filesystem;
+/// Descriptor-bound read-only observation of Lima standalone project disks.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod project_disk_host_observation;
 /// Pure crash-safe single-writer lease planning for resident trusted project disks.
 pub mod project_disk_lease;
 pub mod renderprove_artifact_binding;
