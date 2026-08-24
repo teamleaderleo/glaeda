@@ -61,6 +61,37 @@ jobs:
               raise SystemExit(f'run block count={source.count(marker)}')
           block = source.split(marker, 1)[1]
           lines = [line[10:] if line.startswith('          ') else line for line in block.splitlines()]
-          Path('/tmp/replay.sh').write_text('\n'.join(lines) + '\n')
+          script = '\n'.join(lines) + '\n'
+          needle = "PHASEPATCH\n\ncargo fmt --all\n"
+          if script.count(needle) != 1:
+              raise SystemExit(f'post-phase insertion count={script.count(needle)}')
+          repair = """PHASEPATCH
+
+python3 - <<'SHADOWPATCH'
+from pathlib import Path
+
+path = Path('src/trusted_overlay_mount_execution.rs')
+text = path.read_text()
+start = text.index('fn map_backend(')
+end = text.index('\nfn map_workdir_backend(', start)
+chunk = text[start:end]
+old = '    error: BackendError,'
+if chunk.count(old) != 1:
+    raise SystemExit(f'map_backend parameter count={chunk.count(old)}')
+chunk = chunk.replace(old, '    backend_error: BackendError,', 1)
+if chunk.count('match error.class') != 1:
+    raise SystemExit(f'map_backend class reference count={chunk.count("match error.class")}')
+chunk = chunk.replace('match error.class', 'match backend_error.class', 1)
+if chunk.count('match error.stage') != 1:
+    raise SystemExit(f'map_backend stage reference count={chunk.count("match error.stage")}')
+chunk = chunk.replace('match error.stage', 'match backend_error.stage', 1)
+text = text[:start] + chunk + text[end:]
+path.write_text(text)
+SHADOWPATCH
+
+cargo fmt --all
+"""
+          script = script.replace(needle, repair, 1)
+          Path('/tmp/replay.sh').write_text(script)
           PY
           bash /tmp/replay.sh
