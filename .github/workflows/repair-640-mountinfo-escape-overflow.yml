@@ -1,0 +1,112 @@
+name: Repair mountinfo escape overflow
+
+on:
+  push:
+    branches:
+      - fix/640-mountinfo-escape-overflow
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: fix/640-mountinfo-escape-overflow
+          fetch-depth: 0
+          show-progress: false
+      - name: Replace overflow-prone mountinfo escape arithmetic
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('src/trusted_project_filesystem_guest_observation.rs')
+          text = path.read_text()
+
+          old = r'''        let octal = &field[index + 1..index + 4];
+          if !octal.iter().all(u8::is_ascii_digit) || octal.iter().any(|byte| *byte > b'7') {
+              return Err(mountinfo_malformed());
+          }
+          let decoded = (octal[0] - b'0') * 64 + (octal[1] - b'0') * 8 + (octal[2] - b'0');
+          if !matches!(decoded, 9 | 10 | 32 | 92) {
+              return Err(mountinfo_malformed());
+          }
+          result.push(decoded);
+          '''
+          new = r'''        let octal = &field[index + 1..index + 4];
+          let decoded = match octal {
+              b"011" => b'\t',
+              b"012" => b'\n',
+              b"040" => b' ',
+              b"134" => b'\\',
+              _ => return Err(mountinfo_malformed()),
+          };
+          result.push(decoded);
+          '''
+          if old not in text:
+              raise SystemExit('mountinfo decoder block changed')
+          text = text.replace(old, new, 1)
+
+          old_test = r'''        let unreviewed = b"73 29 8:17 / /srv/quarry\\141data rw - ext4 /dev/vdb rw\n";
+          assert_eq!(
+              observe_trusted_project_filesystem_guest(
+                  &filesystem(ProjectDiskFilesystemKind::Ext4),
+                  device,
+                  1,
+                  b"/srv/quarryadata",
+                  unreviewed,
+              )
+              .unwrap_err()
+              .kind(),
+              TrustedProjectFilesystemGuestObservationErrorKind::MountinfoMalformed
+          );
+          '''
+          new_test = r'''        let unreviewed = b"73 29 8:17 / /srv/quarry\\141data rw - ext4 /dev/vdb rw\n";
+          assert_eq!(
+              observe_trusted_project_filesystem_guest(
+                  &filesystem(ProjectDiskFilesystemKind::Ext4),
+                  device,
+                  1,
+                  b"/srv/quarryadata",
+                  unreviewed,
+              )
+              .unwrap_err()
+              .kind(),
+              TrustedProjectFilesystemGuestObservationErrorKind::MountinfoMalformed
+          );
+
+          let overflowing = b"73 29 8:17 / /srv/quarry\\777data rw - ext4 /dev/vdb rw\n";
+          assert_eq!(
+              observe_trusted_project_filesystem_guest(
+                  &filesystem(ProjectDiskFilesystemKind::Ext4),
+                  device,
+                  1,
+                  b"/srv/quarrydata",
+                  overflowing,
+              )
+              .unwrap_err()
+              .kind(),
+              TrustedProjectFilesystemGuestObservationErrorKind::MountinfoMalformed
+          );
+          '''
+          if old_test not in text:
+              raise SystemExit('mountinfo escape test block changed')
+          path.write_text(text.replace(old_test, new_test, 1))
+          PY
+
+          rm .github/workflows/repair-640-mountinfo-escape-overflow.yml
+          cargo fmt --all
+          cargo fmt --all -- --check
+          cargo test --locked trusted_project_filesystem_guest_observation
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          git diff --check
+          git config user.name "smolrunner-mountinfo-repair"
+          git config user.email "actions@users.noreply.github.com"
+          git add src/trusted_project_filesystem_guest_observation.rs .github/workflows/repair-640-mountinfo-escape-overflow.yml
+          git commit -m "Fix mountinfo escape overflow"
+          git push origin HEAD:fix/640-mountinfo-escape-overflow
