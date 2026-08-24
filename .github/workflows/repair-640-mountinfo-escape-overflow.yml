@@ -35,7 +35,7 @@ jobs:
           text = text.replace(old_arithmetic, new_arithmetic, 1)
 
           old_push = "result.push(decoded);"
-          new_push = "result.push(decoded as u8);"
+          new_push = "result.push(u8::try_from(decoded).map_err(|_| mountinfo_malformed())?);"
           if text.count(old_push) != 1:
               raise SystemExit('mountinfo decoded push changed')
           text = text.replace(old_push, new_push, 1)
@@ -45,26 +45,25 @@ jobs:
               closing = text.rfind("\n}\n")
               if closing < 0:
                   raise SystemExit('test module close missing')
-              regression = r'''
-
-#[test]
-fn overflowing_mountinfo_escape_is_bounded_malformed() {
-let device = make_linux_device(8, 17);
-let overflowing = b"73 29 8:17 / /srv/quarry\\777data rw - ext4 /dev/vdb rw\n";
-assert_eq!(
-observe_trusted_project_filesystem_guest(
-&filesystem(ProjectDiskFilesystemKind::Ext4),
-device,
-1,
-b"/srv/quarrydata",
-overflowing,
-)
-.unwrap_err()
-.kind(),
-TrustedProjectFilesystemGuestObservationErrorKind::MountinfoMalformed
-);
-}
-'''
+              regression = (
+                  "\n\n#[test]\n"
+                  "fn overflowing_mountinfo_escape_is_bounded_malformed() {\n"
+                  "let device = make_linux_device(8, 17);\n"
+                  "let overflowing = b\"73 29 8:17 / /srv/quarry\\\\777data rw - ext4 /dev/vdb rw\\n\";\n"
+                  "assert_eq!(\n"
+                  "observe_trusted_project_filesystem_guest(\n"
+                  "&filesystem(ProjectDiskFilesystemKind::Ext4),\n"
+                  "device,\n"
+                  "1,\n"
+                  "b\"/srv/quarrydata\",\n"
+                  "overflowing,\n"
+                  ")\n"
+                  ".unwrap_err()\n"
+                  ".kind(),\n"
+                  "TrustedProjectFilesystemGuestObservationErrorKind::MountinfoMalformed\n"
+                  ");\n"
+                  "}\n"
+              )
               text = text[:closing] + regression + text[closing:]
 
           path.write_text(text)
