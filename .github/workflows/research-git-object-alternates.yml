@@ -20,11 +20,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          LAB="$RUNNER_TEMP/smolrunner-git-alternates"
+          LAB=/var/tmp/smolrunner-git-alternates
           SRC="$LAB/source"
           SEED="$LAB/seed.git"
           ADMIN_HOME=/var/lib/smol-admin-alt
-          rm -rf "$LAB"
+          sudo rm -rf "$LAB"
+          sudo mkdir -p "$LAB"
+          sudo chown "$(id -u):$(id -g)" "$LAB"
+          sudo chmod 0755 "$LAB"
           mkdir -p "$SRC"
 
           /usr/bin/git -C "$SRC" init -q
@@ -46,6 +49,8 @@ jobs:
           sudo chown -R root:root "$SEED"
           sudo find "$SEED" -type d -exec chmod 0555 {} +
           sudo find "$SEED" -type f -exec chmod 0444 {} +
+          sudo chown root:root "$LAB"
+          sudo chmod 0755 "$LAB"
           sudo useradd --system --create-home --home-dir "$ADMIN_HOME" --shell /bin/bash smol-admin-alt 2>/dev/null || true
           au="$(id -u smol-admin-alt)"
           ag="$(id -g smol-admin-alt)"
@@ -62,6 +67,8 @@ jobs:
           printf 'seed_object_bytes=%s\n' "$(sudo du -sb "$SEED/objects" | cut -f1)"
           printf 'seed_owner=%s:%s mode=%s\n' \
             "$(sudo stat -c %u "$SEED")" "$(sudo stat -c %g "$SEED")" "$(sudo stat -c %a "$SEED")"
+          printf 'lab_owner=%s:%s mode=%s\n' \
+            "$(sudo stat -c %u "$LAB")" "$(sudo stat -c %g "$LAB")" "$(sudo stat -c %a "$LAB")"
 
           admin=(sudo -u smol-admin-alt /usr/bin/env -i HOME="$ADMIN_HOME" PATH=/usr/bin:/bin GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null XDG_CONFIG_HOME="$ADMIN_HOME/.config")
           for kind in shared reference; do
