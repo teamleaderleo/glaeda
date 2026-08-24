@@ -1,0 +1,38 @@
+name: Ocean force wire 592 audit
+
+on:
+  push:
+    branches:
+      - ocean/immutable-git-pool-generation-audit
+
+permissions:
+  contents: write
+
+jobs:
+  wire:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+      - shell: python
+        run: |
+          from pathlib import Path
+          p = Path("src/lib.rs")
+          s = p.read_text()
+          old = "pub mod immutable_git_object_pool_observation;\n"
+          new = old + "/// Descriptor-relative publication audit for immutable Git object-pool candidate generations.\n#[cfg(target_os = \"linux\")]\npub mod immutable_git_object_pool_generation_audit;\n"
+          if s.count(old) != 1:
+              raise SystemExit(f"observation module occurrence changed: {s.count(old)}")
+          p.write_text(s.replace(old, new, 1))
+      - shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all
+          rm -f .github/workflows/ocean-wire-592-audit.yml .github/workflows/ocean-force-wire-592-audit.yml
+          git config user.name "ocean-smolrunner"
+          git config user.email "ocean-smolrunner@users.noreply.github.com"
+          git add src/lib.rs src/immutable_git_object_pool_generation_audit.rs .github/workflows/ocean-wire-592-audit.yml .github/workflows/ocean-force-wire-592-audit.yml
+          git diff --cached --check
+          git commit -m "Audit immutable Git pool generation candidates"
+          git push origin HEAD:${GITHUB_REF_NAME}
