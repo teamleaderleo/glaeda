@@ -1,8 +1,8 @@
 //! Pure identity vocabulary for one formatted project-disk filesystem generation.
 //!
 //! This module performs no persistence, formatter execution, filesystem probing, mount operation,
-//! or proof minting. P4 will use these values to distinguish one accepted filesystem generation
-//! from another even when the surrounding project-disk generation remains unchanged.
+//! or proof minting. P4 chooses these values before formatting so one accepted filesystem
+//! generation remains distinct from every later reformat on the same project-disk generation.
 
 use serde::Serialize;
 
@@ -60,11 +60,14 @@ pub enum ProjectDiskFilesystemKind {
     Xfs,
 }
 
-/// Declared identity for one accepted formatted filesystem generation on one project-disk
-/// generation.
+/// Declared identity for one accepted filesystem generation on one project-disk generation.
 ///
-/// This value is declaration data only. P4 must establish it through durable pre-format authority
-/// plus fresh post-format guest observation before any later correlation treats it as current.
+/// P4 constructs this declaration from the logical project/disk generation before `mkfs` crosses
+/// its destructive boundary. A later successful format plus fresh physical observation may then
+/// create the already-formatted P1 detached lease and compare it with this declaration.
+///
+/// This value is declaration data only. It carries zero formatter, attachment, mount, ownership,
+/// or proof-minting authority by itself.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ProjectDiskFilesystemBinding {
     schema_version: u8,
@@ -79,16 +82,18 @@ pub struct ProjectDiskFilesystemBinding {
 impl ProjectDiskFilesystemBinding {
     #[must_use]
     pub fn new(
-        record: &ProjectDiskLeaseRecord,
+        project: ProjectIdentity,
+        disk_id: ProjectDiskId,
+        disk_generation: ProjectDiskGeneration,
         filesystem_generation: ProjectDiskFilesystemGeneration,
         format_profile_generation: ProjectDiskFilesystemFormatProfileGeneration,
         kind: ProjectDiskFilesystemKind,
     ) -> Self {
         Self {
             schema_version: PROJECT_DISK_FILESYSTEM_SCHEMA_VERSION,
-            project: record.project().clone(),
-            disk_id: record.disk_id().clone(),
-            disk_generation: record.disk_generation(),
+            project,
+            disk_id,
+            disk_generation,
             filesystem_generation,
             format_profile_generation,
             kind,
@@ -130,10 +135,11 @@ impl ProjectDiskFilesystemBinding {
         self.kind
     }
 
-    /// Return whether this declaration still names the same logical project-disk generation.
+    /// Return whether a later P1 lease names the same logical project-disk generation.
     ///
-    /// Lease revision and attachment state are deliberately excluded: those are separately current
-    /// authority and can change while the same formatted filesystem generation remains resident.
+    /// This check is intentionally post-declaration. Lease revision and attachment state remain
+    /// separate current authority and can change while one accepted formatted filesystem
+    /// generation remains resident.
     #[must_use]
     pub fn matches_project_disk(&self, record: &ProjectDiskLeaseRecord) -> bool {
         record.project() == &self.project
@@ -172,11 +178,36 @@ mod tests {
     use crate::project_catalog::ProjectIdentity;
     use crate::project_disk_lease::{ProjectDiskGeneration, ProjectDiskId, ProjectDiskLeaseRecord};
 
+    fn project() -> ProjectIdentity {
+        ProjectIdentity::parse("github.com/teamleaderleo/smolrunner").unwrap()
+    }
+
+    fn disk_id(value: &str) -> ProjectDiskId {
+        ProjectDiskId::parse(value).unwrap()
+    }
+
     fn record(disk: &str, generation: u64) -> ProjectDiskLeaseRecord {
         ProjectDiskLeaseRecord::new_detached(
-            ProjectIdentity::parse("github.com/teamleaderleo/smolrunner").unwrap(),
-            ProjectDiskId::parse(disk).unwrap(),
+            project(),
+            disk_id(disk),
             ProjectDiskGeneration::new(generation).unwrap(),
+        )
+    }
+
+    fn binding(
+        disk: &str,
+        disk_generation: u64,
+        filesystem_generation: u64,
+        profile_generation: u64,
+        kind: ProjectDiskFilesystemKind,
+    ) -> ProjectDiskFilesystemBinding {
+        ProjectDiskFilesystemBinding::new(
+            project(),
+            disk_id(disk),
+            ProjectDiskGeneration::new(disk_generation).unwrap(),
+            ProjectDiskFilesystemGeneration::new(filesystem_generation).unwrap(),
+            ProjectDiskFilesystemFormatProfileGeneration::new(profile_generation).unwrap(),
+            kind,
         )
     }
 
@@ -188,57 +219,33 @@ mod tests {
     }
 
     #[test]
-    fn binding_names_exact_project_disk_and_filesystem_generation() {
-        let disk = record("disk-a", 3);
-        let binding = ProjectDiskFilesystemBinding::new(
-            &disk,
-            ProjectDiskFilesystemGeneration::new(7).unwrap(),
-            ProjectDiskFilesystemFormatProfileGeneration::new(2).unwrap(),
-            ProjectDiskFilesystemKind::Xfs,
-        );
-        assert!(binding.matches_project_disk(&disk));
+    fn binding_is_declarable_before_p1_detached_lease_exists() {
+        let binding = binding("disk-a", 3, 7, 2, ProjectDiskFilesystemKind::Xfs);
+        assert_eq!(binding.disk_id().as_str(), "disk-a");
+        assert_eq!(binding.disk_generation().get(), 3);
         assert_eq!(binding.filesystem_generation().get(), 7);
         assert_eq!(binding.format_profile_generation().get(), 2);
         assert_eq!(binding.kind(), ProjectDiskFilesystemKind::Xfs);
+
+        let later_formatted_lease = record("disk-a", 3);
+        assert!(binding.matches_project_disk(&later_formatted_lease));
         assert!(!binding.matches_project_disk(&record("disk-b", 3)));
         assert!(!binding.matches_project_disk(&record("disk-a", 4)));
     }
 
     #[test]
     fn reformat_generation_is_distinct_even_on_same_disk_generation() {
-        let disk = record("disk-a", 3);
-        let first = ProjectDiskFilesystemBinding::new(
-            &disk,
-            ProjectDiskFilesystemGeneration::new(1).unwrap(),
-            ProjectDiskFilesystemFormatProfileGeneration::new(1).unwrap(),
-            ProjectDiskFilesystemKind::Ext4,
-        );
-        let reformatted = ProjectDiskFilesystemBinding::new(
-            &disk,
-            ProjectDiskFilesystemGeneration::new(2).unwrap(),
-            ProjectDiskFilesystemFormatProfileGeneration::new(1).unwrap(),
-            ProjectDiskFilesystemKind::Ext4,
-        );
+        let first = binding("disk-a", 3, 1, 1, ProjectDiskFilesystemKind::Ext4);
+        let reformatted = binding("disk-a", 3, 2, 1, ProjectDiskFilesystemKind::Ext4);
         assert_ne!(first, reformatted);
-        assert!(first.matches_project_disk(&disk));
-        assert!(reformatted.matches_project_disk(&disk));
+        assert!(first.matches_project_disk(&record("disk-a", 3)));
+        assert!(reformatted.matches_project_disk(&record("disk-a", 3)));
     }
 
     #[test]
     fn format_profile_change_is_part_of_identity() {
-        let disk = record("disk-a", 3);
-        let first = ProjectDiskFilesystemBinding::new(
-            &disk,
-            ProjectDiskFilesystemGeneration::new(1).unwrap(),
-            ProjectDiskFilesystemFormatProfileGeneration::new(1).unwrap(),
-            ProjectDiskFilesystemKind::Xfs,
-        );
-        let changed_profile = ProjectDiskFilesystemBinding::new(
-            &disk,
-            ProjectDiskFilesystemGeneration::new(1).unwrap(),
-            ProjectDiskFilesystemFormatProfileGeneration::new(2).unwrap(),
-            ProjectDiskFilesystemKind::Xfs,
-        );
+        let first = binding("disk-a", 3, 1, 1, ProjectDiskFilesystemKind::Xfs);
+        let changed_profile = binding("disk-a", 3, 1, 2, ProjectDiskFilesystemKind::Xfs);
         assert_ne!(first, changed_profile);
     }
 }
