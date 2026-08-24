@@ -276,7 +276,9 @@ fn stable_entry_observation(
 ) -> bool {
     match kind {
         ReceiptDirectoryEntryKind::Regular => same_entry_binding(before, after),
-        ReceiptDirectoryEntryKind::Directory | ReceiptDirectoryEntryKind::Symlink => before == after,
+        ReceiptDirectoryEntryKind::Directory | ReceiptDirectoryEntryKind::Symlink => {
+            before == after
+        }
     }
 }
 
