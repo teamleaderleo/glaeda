@@ -1,0 +1,147 @@
+name: Bind exact filesystem logical size
+
+on:
+  push:
+    branches:
+      - chatgpt/640-full-correlation-binds-filesystem-size
+
+permissions:
+  contents: write
+
+jobs:
+  bind:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: chatgpt/640-full-correlation-binds-filesystem-size
+          fetch-depth: 0
+          show-progress: false
+      - name: Bind exact formatted/mounted logical size
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          tx = Path('src/trusted_project_filesystem_guest_transaction.rs')
+          text = tx.read_text()
+          old = '    filesystem_kind: ProjectDiskFilesystemKind,\n'
+          new = '    filesystem_kind: ProjectDiskFilesystemKind,\n    filesystem_logical_bytes: u64,\n'
+          if 'filesystem_logical_bytes: u64' not in text:
+              if text.count(old) < 1:
+                  raise SystemExit('guest tx filesystem_kind field missing')
+              text = text.replace(old, new, 1)
+
+          getter_anchor = '''    #[must_use]\n    pub const fn limactl_generation(&self) -> u64 {'''
+          getter = '''    #[must_use]\n    pub const fn filesystem_logical_bytes(&self) -> u64 {\n        self.filesystem_logical_bytes\n    }\n\n'''
+          if getter not in text:
+              # Prefer placing before metadata getter if metadata patch already landed.
+              metadata_anchor = '''    #[must_use]\n    pub const fn filesystem_uuid(&self)'''
+              if metadata_anchor in text:
+                  text = text.replace(metadata_anchor, getter + metadata_anchor, 1)
+              elif getter_anchor in text:
+                  text = text.replace(getter_anchor, getter + getter_anchor, 1)
+              else:
+                  raise SystemExit('guest tx getter anchor missing')
+
+          sig_old = '        filesystem: &ProjectDiskFilesystemBinding,\n'
+          sig_new = '        filesystem: &ProjectDiskFilesystemBinding,\n        filesystem_logical_bytes: u64,\n'
+          # Change only the test constructor signature, identified after `for_test`.
+          pos = text.find('    pub(crate) fn for_test(')
+          if pos == -1:
+              raise SystemExit('guest tx test constructor missing')
+          tail = text[pos:]
+          if 'filesystem_logical_bytes: u64' not in tail.split(') -> Result',1)[0]:
+              if sig_old not in tail:
+                  raise SystemExit('guest tx test constructor filesystem arg missing')
+              tail = tail.replace(sig_old, sig_new, 1)
+              text = text[:pos] + tail
+
+          init_old = '                filesystem_kind: filesystem.kind(),\n'
+          init_new = '                filesystem_kind: filesystem.kind(),\n                filesystem_logical_bytes,\n'
+          if 'filesystem_logical_bytes,' not in text[text.find('schema_version: TRUSTED_PROJECT_FILESYSTEM_GUEST_TRANSACTION_SCHEMA_VERSION'):]:
+              if init_old not in text:
+                  raise SystemExit('guest tx summary init missing')
+              text = text.replace(init_old, init_new, 1)
+
+          check_anchor = '            || filesystem.kind() != self.summary.filesystem_kind\n'
+          check_new = '            || filesystem.kind() != self.summary.filesystem_kind\n            || self.summary.filesystem_logical_bytes == 0\n'
+          if 'self.summary.filesystem_logical_bytes == 0' not in text:
+              if check_anchor not in text:
+                  raise SystemExit('guest tx confirm anchor missing')
+              text = text.replace(check_anchor, check_new, 1)
+
+          # Test helper calls: insert 1 GiB immediately after filesystem arg.
+          test_pos = text.find('#[cfg(test)]')
+          test_tail = text[test_pos:]
+          call_old = '            filesystem,\n'
+          call_new = '            filesystem,\n            1_073_741_824,\n'
+          if '            1_073_741_824,\n' not in test_tail:
+              test_tail = test_tail.replace(call_old, call_new, 1)
+              text = text[:test_pos] + test_tail
+          tx.write_text(text)
+
+          full = Path('src/trusted_project_filesystem_full_correlation.rs')
+          text = full.read_text()
+          old = '    filesystem_kind: ProjectDiskFilesystemKind,\n'
+          new = '    filesystem_kind: ProjectDiskFilesystemKind,\n    filesystem_logical_bytes: u64,\n'
+          # Target the P4 format provenance block only.
+          marker = 'pub struct TrustedProjectDiskFormatProvenanceEvidence {'
+          pos = text.find(marker)
+          if pos != -1:
+              end = text.find('}\n', pos)
+              block = text[pos:end]
+              if 'filesystem_logical_bytes' not in block:
+                  block2 = block.replace(old, new, 1)
+                  text = text[:pos] + block2 + text[end:]
+
+          compare_anchor = '        || format.filesystem_kind != filesystem.kind()\n'
+          compare_new = '        || format.filesystem_kind != filesystem.kind()\n        || format.filesystem_logical_bytes != guest_transaction.summary().filesystem_logical_bytes()\n        || format.filesystem_logical_bytes == 0\n'
+          if 'format.filesystem_logical_bytes != guest_transaction.summary().filesystem_logical_bytes()' not in text:
+              if compare_anchor not in text:
+                  raise SystemExit('full correlation format compare anchor missing')
+              text = text.replace(compare_anchor, compare_new, 1)
+
+          helper_anchor = '            filesystem_kind: filesystem.kind(),\n'
+          helper_new = '            filesystem_kind: filesystem.kind(),\n            filesystem_logical_bytes: 1_073_741_824,\n'
+          # First test helper occurrence within format provenance constructor.
+          test_pos = text.find('fn format(')
+          if test_pos != -1:
+              tail = text[test_pos:]
+              if 'filesystem_logical_bytes: 1_073_741_824' not in tail.split('fn host',1)[0]:
+                  tail = tail.replace(helper_anchor, helper_new, 1)
+                  text = text[:test_pos] + tail
+
+          # Full-correlation guest-transaction helper gets same expected bytes after filesystem arg.
+          tx_helper = text.find('fn guest_transaction(')
+          if tx_helper != -1:
+              tail = text[tx_helper:]
+              call_old = '            filesystem,\n'
+              call_new = '            filesystem,\n            1_073_741_824,\n'
+              if '            1_073_741_824,\n' not in tail.split('fn create',1)[0]:
+                  tail = tail.replace(call_old, call_new, 1)
+                  text = text[:tx_helper] + tail
+
+          full.write_text(text)
+          PY
+      - name: Format and focused tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.97.1 --profile minimal --component rustfmt --no-self-update
+          cargo fmt --all
+          cargo test --locked trusted_project_filesystem_guest_transaction
+          cargo test --locked trusted_project_filesystem_full_correlation
+      - name: Remove helper and publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm .github/workflows/bind-640-filesystem-size.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "#640 bind exact filesystem logical size"
+          git push origin HEAD:chatgpt/640-full-correlation-binds-filesystem-size
