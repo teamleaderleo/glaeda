@@ -1,0 +1,49 @@
+name: Research build clean OverlayFS product branch v4
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/research-build-clean-overlay-product-v4.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  build-product:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: true
+          show-progress: false
+          fetch-depth: 0
+      - name: Run repaired exact-head product replay
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          source = Path('.github/workflows/research-build-clean-overlay-product-v3.yml').read_text()
+          marker = '        run: |\n'
+          if marker not in source:
+              raise SystemExit('v3 builder run block missing')
+          block = source.split(marker, 1)[1]
+          lines = [line[10:] if line.startswith('          ') else line for line in block.splitlines()]
+          script = '\n'.join(lines) + '\n'
+          old = "text = replace_once(text, test_marker, extra_tests + test_marker, 'failure/race test insertion')"
+          new = '''text, insert_count = re.subn(
+    r"(?m)^    #\\[test\\]\\n    fn visible_mount_id_mismatch_returns_recovery_debt\\(\\) \\{",
+    lambda match: extra_tests + match.group(0),
+    text,
+    count=1,
+)
+if insert_count != 1:
+    raise SystemExit(f'failure/race test insertion: expected one regex match, got {insert_count}')'''
+          if script.count(old) != 1:
+              raise SystemExit(f'v3 failed insertion call count={script.count(old)}')
+          script = script.replace(old, new, 1)
+          Path('/tmp/build-overlay-product-v4.sh').write_text(script)
+          PY
+          bash /tmp/build-overlay-product-v4.sh
