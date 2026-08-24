@@ -1062,7 +1062,7 @@ mod tests {
         ProjectDiskGeneration, ProjectDiskId, ResidentSandboxGeneration, ResidentSandboxId,
     };
     use crate::trusted_overlay_task_view::{
-        OverlayGitProofObservation, OverlayIndexObservation, OverlayLinkedWorktreeObservation,
+        OverlayGitProofObservation, OverlayGitWorktreeObservation, OverlayIndexObservation,
         OverlayMountObservation, OverlaySourceAnchorBinding, OverlaySourceAnchorGeneration,
         OverlaySourceAnchorId, OverlaySourceAnchorRecord, OverlayTaskProcessObservation,
         OverlayTaskViewGeneration, OverlayTaskViewId, OverlayTaskViewLease,
@@ -1136,7 +1136,7 @@ mod tests {
             .unwrap();
         let task = OverlayTaskViewRecord::new_planned(task_lease, binding())
             .record_worktree_registered(OverlayTaskViewObservation::new(
-                OverlayLinkedWorktreeObservation::Exact,
+                OverlayGitWorktreeObservation::Exact,
                 OverlayMountObservation::Absent,
                 OverlayIndexObservation::Absent,
                 OverlayGitProofObservation::NotRun,
