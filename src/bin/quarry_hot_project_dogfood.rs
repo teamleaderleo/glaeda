@@ -339,9 +339,9 @@ fn build_plan(args: PlanArgs) -> Result<Plan, Box<dyn Error>> {
 }
 
 fn build_sample(args: SampleArgs) -> Result<Sample, Box<dyn Error>> {
-    validate_coordinates(args.sample_class, args.ordinal, args.fanout)?;
+    validate_coordinates(args.arm, args.sample_class, args.ordinal, args.fanout)?;
     let mode: HotExecutionMode = args.execution_mode.into();
-    validate_arm_mode(args.arm, mode)?;
+    validate_mode(args.arm, args.sample_class, mode)?;
     let quarry_commit = CommitId::parse(&args.quarry_commit)?;
     let edit = edit_observation(args.edit_complete_millis, args.focused_pytest_result_millis)?;
     if edit
@@ -375,7 +375,7 @@ fn build_sample(args: SampleArgs) -> Result<Sample, Box<dyn Error>> {
         mode,
         args.total_elapsed_millis,
         milestones,
-        heat(args.arm, mode),
+        heat(mode),
         storage,
         resources,
         args.result.into(),
@@ -455,12 +455,18 @@ fn resource_observation(
 }
 
 fn validate_coordinates(
+    arm: Arm,
     class: SampleClass,
     ordinal: u16,
     fanout: Option<u8>,
 ) -> Result<(), DogfoodError> {
     if ordinal == 0 {
         return Err(DogfoodError("dogfood_ordinal_must_be_positive"));
+    }
+    if matches!(class, SampleClass::Restart | SampleClass::Fallback) && arm != Arm::HotProject {
+        return Err(DogfoodError(
+            "dogfood_restart_and_fallback_belong_to_hot_project_arm",
+        ));
     }
     match class {
         SampleClass::Fanout if !matches!(fanout, Some(1 | 8 | 32)) => {
@@ -478,51 +484,61 @@ fn validate_coordinates(
     }
 }
 
-fn validate_arm_mode(arm: Arm, mode: HotExecutionMode) -> Result<(), DogfoodError> {
-    let valid = match arm {
-        Arm::Control => matches!(
-            mode,
-            HotExecutionMode::ColdDisposable | HotExecutionMode::PreparedDisposable
-        ),
-        Arm::HotProject => matches!(
-            mode,
-            HotExecutionMode::ResidentAfterIdle
-                | HotExecutionMode::ResidentImmediate
-                | HotExecutionMode::ResidentTaskLoop
-        ),
+fn validate_mode(arm: Arm, class: SampleClass, mode: HotExecutionMode) -> Result<(), DogfoodError> {
+    let cold_or_prepared = matches!(
+        mode,
+        HotExecutionMode::ColdDisposable | HotExecutionMode::PreparedDisposable
+    );
+    let resident = matches!(
+        mode,
+        HotExecutionMode::ResidentAfterIdle
+            | HotExecutionMode::ResidentImmediate
+            | HotExecutionMode::ResidentTaskLoop
+    );
+    let valid = match (arm, class) {
+        (Arm::Control, _) => cold_or_prepared,
+        (Arm::HotProject, SampleClass::Fallback) => cold_or_prepared,
+        (Arm::HotProject, SampleClass::Restart) => mode == HotExecutionMode::ResidentAfterIdle,
+        (Arm::HotProject, _) => resident,
     };
     valid
         .then_some(())
-        .ok_or(DogfoodError("dogfood_arm_mode_mismatch"))
+        .ok_or(DogfoodError("dogfood_arm_sample_mode_mismatch"))
 }
 
-fn heat(arm: Arm, mode: HotExecutionMode) -> HotExecutionHeat {
-    match arm {
-        Arm::Control if mode == HotExecutionMode::ColdDisposable => HotExecutionHeat::new(
+fn heat(mode: HotExecutionMode) -> HotExecutionHeat {
+    match mode {
+        HotExecutionMode::ColdDisposable => HotExecutionHeat::new(
             HotSandboxState::Cold,
             HotRepositoryState::Cold,
             HotDependencyState::Cold,
             HotBuildState::Cold,
             HotIndexServiceState::Unavailable,
         ),
-        Arm::Control => HotExecutionHeat::new(
+        HotExecutionMode::PreparedDisposable => HotExecutionHeat::new(
             HotSandboxState::Prepared,
             HotRepositoryState::CheckoutHit,
             HotDependencyState::EnvironmentHit,
             HotBuildState::Cold,
             HotIndexServiceState::Unavailable,
         ),
-        Arm::HotProject => HotExecutionHeat::new(
-            if mode == HotExecutionMode::ResidentAfterIdle {
-                HotSandboxState::Resumed
-            } else {
-                HotSandboxState::ResidentHit
-            },
+        HotExecutionMode::ResidentAfterIdle => HotExecutionHeat::new(
+            HotSandboxState::Resumed,
             HotRepositoryState::TaskFork,
             HotDependencyState::EnvironmentHit,
             HotBuildState::Cold,
             HotIndexServiceState::Unavailable,
         ),
+        HotExecutionMode::ResidentImmediate | HotExecutionMode::ResidentTaskLoop => {
+            HotExecutionHeat::new(
+                HotSandboxState::ResidentHit,
+                HotRepositoryState::TaskFork,
+                HotDependencyState::EnvironmentHit,
+                HotBuildState::Cold,
+                HotIndexServiceState::Unavailable,
+            )
+        }
+        _ => unreachable!("Quarry dogfood CLI excludes other execution modes"),
     }
 }
 
@@ -565,16 +581,58 @@ mod tests {
     }
 
     #[test]
-    fn experiment_coordinates_are_bounded() {
-        assert!(validate_coordinates(SampleClass::Fanout, 1, Some(1)).is_ok());
-        assert!(validate_coordinates(SampleClass::Fanout, 1, Some(8)).is_ok());
-        assert!(validate_coordinates(SampleClass::Fanout, 1, Some(32)).is_ok());
-        assert!(validate_coordinates(SampleClass::Fanout, 1, Some(4)).is_err());
-        assert!(validate_coordinates(SampleClass::Sequential, 11, None).is_err());
-        assert!(validate_coordinates(SampleClass::Restart, 4, None).is_err());
-        assert!(validate_arm_mode(Arm::Control, HotExecutionMode::ResidentTaskLoop).is_err());
+    fn experiment_coordinates_and_actual_modes_are_bounded() {
+        assert!(validate_coordinates(Arm::Control, SampleClass::Fanout, 1, Some(1)).is_ok());
+        assert!(validate_coordinates(Arm::Control, SampleClass::Fanout, 1, Some(8)).is_ok());
+        assert!(validate_coordinates(Arm::Control, SampleClass::Fanout, 1, Some(32)).is_ok());
+        assert!(validate_coordinates(Arm::Control, SampleClass::Fanout, 1, Some(4)).is_err());
+        assert!(validate_coordinates(Arm::Control, SampleClass::Sequential, 11, None).is_err());
+        assert!(validate_coordinates(Arm::HotProject, SampleClass::Restart, 4, None).is_err());
+        assert!(validate_coordinates(Arm::Control, SampleClass::Restart, 1, None).is_err());
+        assert!(validate_coordinates(Arm::Control, SampleClass::Fallback, 1, None).is_err());
+
+        assert!(
+            validate_mode(
+                Arm::Control,
+                SampleClass::Singleton,
+                HotExecutionMode::PreparedDisposable
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_mode(
+                Arm::HotProject,
+                SampleClass::Singleton,
+                HotExecutionMode::ResidentImmediate
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_mode(
+                Arm::HotProject,
+                SampleClass::Restart,
+                HotExecutionMode::ResidentAfterIdle
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_mode(
+                Arm::HotProject,
+                SampleClass::Fallback,
+                HotExecutionMode::ColdDisposable
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_mode(
+                Arm::HotProject,
+                SampleClass::Fallback,
+                HotExecutionMode::ResidentTaskLoop
+            )
+            .is_err()
+        );
         assert_eq!(
-            heat(Arm::Control, HotExecutionMode::ColdDisposable).sandbox(),
+            heat(HotExecutionMode::ColdDisposable).sandbox(),
             HotSandboxState::Cold
         );
     }
