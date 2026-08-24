@@ -16,8 +16,7 @@ use crate::project_catalog::ProjectIdentity;
 use crate::project_disk_lease::{ProjectDiskGeneration, ProjectDiskId};
 
 pub const PROJECT_DISK_PREFORMAT_EVIDENCE_SCHEMA_VERSION: u8 = 1;
-const ZERO_DIGEST: &str =
-    "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+const ZERO_DIGEST: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ProjectDiskPreFormatEvidenceSummary {
