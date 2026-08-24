@@ -764,10 +764,7 @@ fn require_nonforeign_cleanup_observation(
     observation: OverlayTaskViewObservation,
 ) -> Result<(), TrustedOverlayTaskViewError> {
     if matches!(observation.mount, OverlayMountObservation::Other)
-        || matches!(
-            observation.worktree,
-            OverlayGitWorktreeObservation::Other
-        )
+        || matches!(observation.worktree, OverlayGitWorktreeObservation::Other)
     {
         return Err(cleanup_identity_conflict());
     }
@@ -932,13 +929,12 @@ const fn task_terminal() -> TrustedOverlayTaskViewError {
 #[cfg(test)]
 mod tests {
     use super::{
-        OverlayCleanupAction, OverlayGitProofObservation, OverlayIndexObservation,
-        OverlayGitWorktreeObservation, OverlayLinkedWorktreeObservation, OverlayMountObservation,
-        OverlaySourceAnchorBinding,
-        OverlaySourceAnchorGeneration, OverlaySourceAnchorId, OverlaySourceAnchorRecord,
-        OverlaySourceAnchorState, OverlayTaskProcessObservation, OverlayTaskViewGeneration,
-        OverlayTaskViewId, OverlayTaskViewLease, OverlayTaskViewObservation, OverlayTaskViewRecord,
-        OverlayTaskViewState,
+        OverlayCleanupAction, OverlayGitProofObservation, OverlayGitWorktreeObservation,
+        OverlayIndexObservation, OverlayLinkedWorktreeObservation, OverlayMountObservation,
+        OverlaySourceAnchorBinding, OverlaySourceAnchorGeneration, OverlaySourceAnchorId,
+        OverlaySourceAnchorRecord, OverlaySourceAnchorState, OverlayTaskProcessObservation,
+        OverlayTaskViewGeneration, OverlayTaskViewId, OverlayTaskViewLease,
+        OverlayTaskViewObservation, OverlayTaskViewRecord, OverlayTaskViewState,
     };
     use crate::artifact::{CommitId, GitTreeId, Sha256Digest};
     use crate::project_catalog::ProjectIdentity;
