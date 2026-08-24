@@ -1,0 +1,45 @@
+name: Finalize immutable Git pool ownership observation
+
+on:
+  push:
+    branches:
+      - codex/immutable-git-pool-ownership-observation
+
+permissions:
+  contents: write
+
+jobs:
+  finalize:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: true
+          show-progress: false
+          fetch-depth: 0
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt --no-self-update
+      - name: Export, verify, and self-remove
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/lib.rs'); s=p.read_text()
+          marker='''/// Pure fixed marker codec for immutable Git object-pool generations.\npub mod immutable_git_object_pool_marker;\n'''
+          addition='''/// Read-only descriptor-bound ownership observation of frozen immutable Git pool generations.\n#[cfg(target_os = "linux")]\npub mod immutable_git_object_pool_observation;\n'''
+          if addition not in s:
+              if marker not in s: raise SystemExit('lib export point missing')
+              s=s.replace(marker,marker+addition,1)
+          p.write_text(s)
+          PY
+          cargo fmt --all
+          cargo test --locked immutable_git_object_pool_observation
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          git rm .github/workflows/research-finalize-immutable-git-pool-ownership-observation.yml
+          git add src/immutable_git_object_pool_observation.rs src/lib.rs
+          git config user.name teamleaderleo
+          git config user.email cheerleaderleo@outlook.com
+          git commit -m 'Observe immutable Git pool ownership generations'
+          git push origin HEAD:codex/immutable-git-pool-ownership-observation
