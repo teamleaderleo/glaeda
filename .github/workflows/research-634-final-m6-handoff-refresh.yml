@@ -1,0 +1,40 @@
+name: Research refresh final M6 hot-runtime handoff
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/research-634-final-m6-handoff-refresh.yml"
+      - "scripts/refresh_m6_hot_runtime_handoff.py"
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: research/634-final-m6-handoff-refresh
+          fetch-depth: 0
+          show-progress: false
+      - name: Refresh and self-clean
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/refresh_m6_hot_runtime_handoff.py
+          rm scripts/refresh_m6_hot_runtime_handoff.py
+          rm .github/workflows/research-634-final-m6-handoff-refresh.yml
+          git diff --check
+          grep -Fq '43450cf76c6cd5f388f3d79fe112ae536697f534' docs/M6_HOT_RUNTIME_HANDOFF.md
+          grep -Fq '#614 / #592 publication candidate audit landed' docs/M6_HOT_RUNTIME_HANDOFF.md
+          grep -Fq '#633 / #592 pure admin producer plan landed' docs/M6_HOT_RUNTIME_HANDOFF.md
+          grep -Fq '#628' docs/M6_HOT_RUNTIME_HANDOFF.md
+          grep -Fq '#629' docs/M6_HOT_RUNTIME_HANDOFF.md
+          grep -Fq '#631' docs/M6_HOT_RUNTIME_HANDOFF.md
+          git config user.name "smolrunner-research-docs"
+          git config user.email "actions@users.noreply.github.com"
+          git add docs/M6_HOT_RUNTIME_HANDOFF.md scripts/refresh_m6_hot_runtime_handoff.py .github/workflows/research-634-final-m6-handoff-refresh.yml
+          git commit -m "Refresh M6 hot-runtime handoff after publication planning"
+          git push origin HEAD:research/634-final-m6-handoff-refresh
