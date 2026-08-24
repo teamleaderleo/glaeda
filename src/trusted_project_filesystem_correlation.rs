@@ -146,6 +146,7 @@ impl TrustedProjectFilesystemCorrelationProof {
     /// re-read attached lease at both pre-mutation confirmation points. Keeping this method sealed
     /// now lets that later composition reject stale lease revisions and detach/reattach generation
     /// reuse without exposing any proof constructor.
+    #[allow(dead_code)]
     pub(crate) fn confirm_current_attachment(
         &self,
         anchor: &OverlaySourceAnchorBinding,
