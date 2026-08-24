@@ -1,0 +1,138 @@
+name: Rebuild 661 format state on current main
+
+on:
+  push:
+    branches:
+      - chatgpt/645-format-state-model
+
+permissions:
+  contents: write
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: chatgpt/645-format-state-model
+          fetch-depth: 0
+          show-progress: false
+      - name: Rebuild corrected state model
+        shell: bash
+        run: |
+          set -euo pipefail
+          git show HEAD:src/project_disk_filesystem/format_state.rs > /tmp/format_state.rs
+          git fetch origin main
+          git reset --hard origin/main
+          cp /tmp/format_state.rs src/project_disk_filesystem/format_state.rs
+          python3 - <<'PY'
+          from pathlib import Path
+
+          state = Path("src/project_disk_filesystem/format_state.rs")
+          text = state.read_text()
+
+          old_ctor = """    #[allow(dead_code)]
+              pub(crate) fn from_verified("""
+          new_ctor = """    #[cfg(test)]
+              fn for_test("""
+          if text.count(old_ctor) != 1:
+              raise SystemExit("unexpected raw ownership constructor")
+          text = text.replace(old_ctor, new_ctor, 1)
+          if text.count("ProjectDiskRawOwnershipBinding::from_verified(") != 1:
+              raise SystemExit("unexpected raw ownership test call count")
+          text = text.replace(
+              "ProjectDiskRawOwnershipBinding::from_verified(",
+              "ProjectDiskRawOwnershipBinding::for_test(",
+              1,
+          )
+
+          struct_anchor = """    format_plan_digest: Sha256Digest,
+              filesystem_uuid: ProjectDiskFilesystemUuid,
+          """
+          struct_replacement = """    format_plan_digest: Sha256Digest,
+              physical_identity_digest: Sha256Digest,
+              backing_identity_digest: Sha256Digest,
+              filesystem_uuid: ProjectDiskFilesystemUuid,
+          """
+          if text.count(struct_anchor) != 1:
+              raise SystemExit("unexpected post-format struct anchor")
+          text = text.replace(struct_anchor, struct_replacement, 1)
+
+          confirm_anchor = """            || self.format_plan_digest != *plan.plan_digest()
+              || self.filesystem_uuid != *plan.filesystem_uuid()
+          """
+          confirm_replacement = """            || self.format_plan_digest != *plan.plan_digest()
+              || self.physical_identity_digest != record.ownership.physical_identity_digest
+              || self.backing_identity_digest != record.ownership.backing_identity_digest
+              || self.filesystem_uuid != *plan.filesystem_uuid()
+          """
+          if text.count(confirm_anchor) != 1:
+              raise SystemExit("unexpected post-format confirm anchor")
+          text = text.replace(confirm_anchor, confirm_replacement, 1)
+
+          test_ctor_anchor = """            format_plan_digest: plan.plan_digest().clone(),
+                  filesystem_uuid: plan.filesystem_uuid().clone(),
+          """
+          test_ctor_replacement = """            format_plan_digest: plan.plan_digest().clone(),
+                  physical_identity_digest: record.ownership.physical_identity_digest.clone(),
+                  backing_identity_digest: record.ownership.backing_identity_digest.clone(),
+                  filesystem_uuid: plan.filesystem_uuid().clone(),
+          """
+          if text.count(test_ctor_anchor) != 1:
+              raise SystemExit("unexpected post-format test constructor anchor")
+          text = text.replace(test_ctor_anchor, test_ctor_replacement, 1)
+
+          test_marker = """    #[test]
+              fn formatted_detached_requires_exact_post_format_and_p2_detach_evidence() {
+          """
+          adversarial = '''    #[test]
+              fn post_format_evidence_from_another_physical_disk_is_refused() {
+                  let issued = mkfs_issued();
+                  let mut post = ProjectDiskPostFormatProof::for_test(
+                      &issued,
+                      checkpoint(&issued),
+                      digest('f'),
+                  );
+                  post.physical_identity_digest = digest('9');
+                  assert!(issued.record_exact_filesystem_observed(&post).is_err());
+
+                  let mut post = ProjectDiskPostFormatProof::for_test(
+                      &issued,
+                      checkpoint(&issued),
+                      digest('f'),
+                  );
+                  post.backing_identity_digest = digest('8');
+                  assert!(issued.record_exact_filesystem_observed(&post).is_err());
+              }
+
+          '''
+          if text.count(test_marker) != 1:
+              raise SystemExit("unexpected adversarial test marker")
+          text = text.replace(test_marker, adversarial + test_marker, 1)
+          state.write_text(text)
+
+          module = Path("src/project_disk_filesystem.rs")
+          module_text = module.read_text()
+          anchor = "pub mod format_plan;\n"
+          if module_text.count(anchor) != 1:
+              raise SystemExit("unexpected format_plan module anchor")
+          if "pub mod format_state;" in module_text:
+              raise SystemExit("format_state unexpectedly already present")
+          module.write_text(module_text.replace(anchor, anchor + "pub mod format_state;\n", 1))
+          PY
+          cargo fmt --all
+          cargo test --locked project_disk_filesystem::format_state
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          git diff --check
+      - name: Publish clean product head
+        shell: bash
+        run: |
+          set -euo pipefail
+          test ! -e .github/workflows/rebuild-661.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/project_disk_filesystem.rs src/project_disk_filesystem/format_state.rs
+          git diff --cached --check
+          git commit -m "#645 add no-replay project-disk format state model"
+          git push --force-with-lease origin HEAD:chatgpt/645-format-state-model
