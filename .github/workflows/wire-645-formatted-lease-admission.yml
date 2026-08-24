@@ -1,0 +1,68 @@
+name: Wire formatted project-disk P1 admission
+
+on:
+  push:
+    branches:
+      - chatgpt/645-formatted-lease-admission
+
+permissions:
+  contents: write
+
+jobs:
+  wire:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: chatgpt/645-formatted-lease-admission
+          fetch-depth: 0
+          show-progress: false
+      - name: Export admission module and tighten exact identity checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          lib = Path('src/lib.rs')
+          text = lib.read_text()
+          export = '/// Sealed admission of accepted formatted-detached project disks into the P1 lease model.\npub mod project_disk_formatted_lease_admission;\n'
+          if export not in text:
+              anchor = '/// Pure crash-safe single-writer lease planning for resident trusted project disks.\npub mod project_disk_lease;\n'
+              if text.count(anchor) != 1:
+                  raise SystemExit('unexpected project_disk_lease export anchor')
+              text = text.replace(anchor, anchor + export)
+          lib.write_text(text)
+
+          path = Path('src/project_disk_formatted_lease_admission.rs')
+          text = path.read_text()
+          old = '''        || !proof.filesystem.matches_project_disk_identity(\n            &proof.summary.project,\n            &proof.summary.disk_id,\n            proof.summary.disk_generation,\n        )\n'''
+          new = '''        || proof.filesystem.project() != &proof.summary.project\n        || proof.filesystem.disk_id() != &proof.summary.disk_id\n        || proof.filesystem.disk_generation() != proof.summary.disk_generation\n'''
+          if old in text:
+              text = text.replace(old, new, 1)
+
+          old_import = '    use super::{ProjectDiskFormattedLeaseAdmissionProof, admit_formatted_project_disk};\n'
+          new_import = '    use super::{ZERO_DIGEST, ProjectDiskFormattedLeaseAdmissionProof, admit_formatted_project_disk};\n'
+          if old_import in text:
+              text = text.replace(old_import, new_import, 1)
+          path.write_text(text)
+          PY
+      - name: Format and focused tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.97.1 --profile minimal --component rustfmt --no-self-update
+          cargo fmt --all
+          cargo test --locked project_disk_formatted_lease_admission
+      - name: Remove helper and publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm .github/workflows/wire-645-formatted-lease-admission.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "#645 wire sealed formatted project-disk admission"
+          git push origin HEAD:chatgpt/645-formatted-lease-admission
