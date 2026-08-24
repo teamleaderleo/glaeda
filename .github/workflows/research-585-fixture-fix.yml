@@ -43,21 +43,27 @@ jobs:
 
           fixture_patch = r'''python3 - <<'FIXTURE'
           from pathlib import Path
+          import re
           p = Path("src/immutable_git_object_pool_observation.rs")
           s = p.read_text()
-          old = ''' + "'''" + r'''            let marker_path = pool.join(MARKER_NAME);
-              fs::write(&marker_path, marker).unwrap();
-              fs::set_permissions(&marker_path, fs::Permissions::from_mode(FILE_MODE)).unwrap();
-          ''' + "'''" + r'''
-          new = ''' + "'''" + r'''            let marker_path = pool.join(MARKER_NAME);
-              fs::set_permissions(&pool, fs::Permissions::from_mode(0o755)).unwrap();
-              fs::write(&marker_path, marker).unwrap();
-              fs::set_permissions(&marker_path, fs::Permissions::from_mode(FILE_MODE)).unwrap();
-              fs::set_permissions(&pool, fs::Permissions::from_mode(GENERATION_MODE)).unwrap();
-          ''' + "'''" + r'''
-          if s.count(old) != 1:
-              raise SystemExit(f"fixture marker seam count={s.count(old)}")
-          p.write_text(s.replace(old, new, 1))
+          pattern = re.compile(
+              r'(?m)^(?P<i>[ \t]*)let marker_path = pool\.join\(MARKER_NAME\);\n'
+              r'(?P=i)fs::write\(&marker_path, marker\)\.unwrap\(\);\n'
+              r'(?P=i)fs::set_permissions\(&marker_path, fs::Permissions::from_mode\(FILE_MODE\)\)\.unwrap\(\);\n'
+          )
+          def replacement(match):
+              i = match.group('i')
+              return (
+                  f'{i}let marker_path = pool.join(MARKER_NAME);\n'
+                  f'{i}fs::set_permissions(&pool, fs::Permissions::from_mode(0o755)).unwrap();\n'
+                  f'{i}fs::write(&marker_path, marker).unwrap();\n'
+                  f'{i}fs::set_permissions(&marker_path, fs::Permissions::from_mode(FILE_MODE)).unwrap();\n'
+                  f'{i}fs::set_permissions(&pool, fs::Permissions::from_mode(GENERATION_MODE)).unwrap();\n'
+              )
+          s2, count = pattern.subn(replacement, s, count=1)
+          if count != 1:
+              raise SystemExit(f"fixture marker seam count={count}")
+          p.write_text(s2)
           FIXTURE
           '''
           needle = 'cargo fmt --all\n'
