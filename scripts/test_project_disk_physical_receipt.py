@@ -3,9 +3,12 @@
 import argparse
 import json
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+
+sys.dont_write_bytecode = True
 
 import project_disk_physical_receipt as receipt
 
