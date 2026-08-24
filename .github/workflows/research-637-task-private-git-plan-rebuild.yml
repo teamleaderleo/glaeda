@@ -1,0 +1,48 @@
+name: Research rebuild task-private Git clone plan
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/research-637-task-private-git-plan-rebuild.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: research/637-task-private-git-plan-rebuild
+          fetch-depth: 0
+          show-progress: false
+      - name: Rebuild and verify pure task-private Git plan
+        shell: bash
+        run: |
+          set -euo pipefail
+          git show 254992a535e0845a5bfd26d1eafda230d40bbac2:src/task_private_git_clone_plan.rs > src/task_private_git_clone_plan.rs
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('src/lib.rs')
+          s = p.read_text()
+          needle = '''/// Pure trusted overlay task/anchor lifecycle and cleanup planning.\npub mod trusted_overlay_task_view;\n'''
+          addition = needle + '''/// Pure sealed task-private Git clone planning from exact hot-path leases.\n#[cfg(target_os = "linux")]\npub mod task_private_git_clone_plan;\n'''
+          if 'pub mod task_private_git_clone_plan;' not in s:
+              if needle not in s:
+                  raise SystemExit('lib export seam changed')
+              s = s.replace(needle, addition, 1)
+          p.write_text(s)
+          PY
+          rm .github/workflows/research-637-task-private-git-plan-rebuild.yml
+          cargo fmt --all
+          cargo fmt --all -- --check
+          cargo test --locked task_private_git_clone_plan
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          git diff --check
+          git config user.name "smolrunner-research-rebuild"
+          git config user.email "actions@users.noreply.github.com"
+          git add src/task_private_git_clone_plan.rs src/lib.rs .github/workflows/research-637-task-private-git-plan-rebuild.yml
+          git commit -m "Seal task-private Git clone plan"
+          git push origin HEAD:research/637-task-private-git-plan-rebuild
