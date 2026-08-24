@@ -518,14 +518,7 @@ mod tests {
     #[test]
     fn same_filesystem_subtree_bind_mount_is_refused() {
         let device = make_linux_device(8, 17);
-        let info = mountinfo_with_root(
-            8,
-            17,
-            "/nested",
-            "/srv/quarry",
-            "rw,nodev,nosuid",
-            "ext4",
-        );
+        let info = mountinfo_with_root(8, 17, "/nested", "/srv/quarry", "rw,nodev,nosuid", "ext4");
         let error = observe_trusted_project_filesystem_guest(
             &filesystem(ProjectDiskFilesystemKind::Ext4),
             device,
