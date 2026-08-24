@@ -1,0 +1,128 @@
+name: Require host-disk to guest-block bridge
+
+on:
+  push:
+    branches:
+      - chatgpt/640-verified-full-correlation
+
+permissions:
+  contents: write
+
+jobs:
+  bind:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: chatgpt/640-verified-full-correlation
+          fetch-depth: 0
+          show-progress: false
+      - name: Export and require exact Lima-to-guest block bridge
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          lib = Path('src/lib.rs')
+          text = lib.read_text()
+          export = '/// Sealed bridge from exact host/Lima project-disk attachment to one guest whole block node.\npub mod trusted_project_disk_guest_block_attachment;\n'
+          if export not in text:
+              anchor = '/// Opaque composition of exact guest filesystem + whole-block-device evidence.\npub mod trusted_project_filesystem_full_guest_correlation;\n'
+              if text.count(anchor) != 1:
+                  raise SystemExit('unexpected full guest export anchor')
+              text = text.replace(anchor, export + anchor)
+          lib.write_text(text)
+
+          path = Path('src/trusted_project_filesystem_full_correlation.rs')
+          text = path.read_text()
+          import_anchor = 'use crate::trusted_project_filesystem_full_guest_correlation::TrustedProjectFilesystemFullGuestCorrelation;\n'
+          import_line = 'use crate::trusted_project_disk_guest_block_attachment::TrustedProjectDiskGuestBlockAttachment;\n'
+          if import_line not in text:
+              if text.count(import_anchor) != 1:
+                  raise SystemExit('unexpected full guest import anchor')
+              text = text.replace(import_anchor, import_line + import_anchor)
+
+          old_sig = '''    host: &TrustedProjectDiskHostAttachmentEvidence,\n    guest_transaction: &TrustedProjectFilesystemGuestTransaction,\n    guest: &TrustedProjectFilesystemFullGuestCorrelation,'''
+          if old_sig not in text:
+              # Parent may not yet contain the guest-transaction patch; handle the earlier shape.
+              old_sig = '''    host: &TrustedProjectDiskHostAttachmentEvidence,\n    guest: &TrustedProjectFilesystemFullGuestCorrelation,'''
+              new_sig = '''    host: &TrustedProjectDiskHostAttachmentEvidence,\n    guest_block_attachment: &TrustedProjectDiskGuestBlockAttachment,\n    guest: &TrustedProjectFilesystemFullGuestCorrelation,'''
+          else:
+              new_sig = '''    host: &TrustedProjectDiskHostAttachmentEvidence,\n    guest_block_attachment: &TrustedProjectDiskGuestBlockAttachment,\n    guest_transaction: &TrustedProjectFilesystemGuestTransaction,\n    guest: &TrustedProjectFilesystemFullGuestCorrelation,'''
+          if old_sig in text:
+              text = text.replace(old_sig, new_sig, 1)
+
+          host_check_anchor = '''    if host.disk_revision != current.revision()\n        || host.attachment_generation != attachment.generation()'''
+          bridge_check = '''    guest_block_attachment\n        .confirm(current, guest)\n        .map_err(|_| guest_correlation_mismatch())?;\n    if !guest_block_attachment.matches_host_physical_identity(\n        &host.physical_identity_digest,\n        &host.backing_identity_digest,\n    ) {\n        return Err(physical_provenance_mismatch());\n    }\n'''
+          if bridge_check not in text:
+              pos = text.find(host_check_anchor)
+              if pos == -1:
+                  raise SystemExit('host check anchor missing')
+              # Insert after the resident-host block, just before filesystem binding check.
+              fs_anchor = '    if !filesystem.matches_project_disk(current) {'
+              fs_pos = text.find(fs_anchor, pos)
+              if fs_pos == -1:
+                  raise SystemExit('filesystem check anchor missing')
+              text = text[:fs_pos] + bridge_check + text[fs_pos:]
+
+          # Tests import bridge and create exact bridge helper.
+          test_import_anchor = '    use crate::trusted_project_block_device_correlation::correlate_trusted_project_block_device;\n'
+          test_import = '    use crate::trusted_project_disk_guest_block_attachment::TrustedProjectDiskGuestBlockAttachment;\n'
+          if test_import not in text:
+              idx = text.find(test_import_anchor, text.find('#[cfg(test)]'))
+              if idx == -1:
+                  raise SystemExit('test block import anchor missing')
+              text = text[:idx] + test_import + text[idx:]
+
+          helper_anchor = '''    fn create(current: &ProjectDiskLeaseRecord) -> TrustedProjectDiskCreateProvenanceEvidence {'''
+          helper = '''    fn guest_block_attachment(\n        current: &ProjectDiskLeaseRecord,\n    ) -> TrustedProjectDiskGuestBlockAttachment {\n        TrustedProjectDiskGuestBlockAttachment::for_test(\n            current,\n            digest('b'),\n            digest('c'),\n            2049,\n            77,\n        )\n        .unwrap()\n    }\n\n'''
+          if helper not in text:
+              if text.count(helper_anchor) != 1:
+                  raise SystemExit('test create helper anchor missing')
+              text = text.replace(helper_anchor, helper + helper_anchor, 1)
+
+          # Insert bridge after host evidence in all test calls.
+          text = text.replace(
+              '''            &host(&current),\n            &guest_transaction(&current, &fs),''',
+              '''            &host(&current),\n            &guest_block_attachment(&current),\n            &guest_transaction(&current, &fs),''',
+          )
+          text = text.replace(
+              '''            &host(&current),\n            &guest(&fs),''',
+              '''            &host(&current),\n            &guest_block_attachment(&current),\n            &guest(&fs),''',
+          )
+          text = text.replace(
+              '''            &wrong,\n            &guest_transaction(&current, &fs),''',
+              '''            &wrong,\n            &guest_block_attachment(&current),\n            &guest_transaction(&current, &fs),''',
+          )
+          text = text.replace(
+              '''            &wrong,\n            &guest(&fs),''',
+              '''            &wrong,\n            &guest_block_attachment(&current),\n            &guest(&fs),''',
+          )
+          text = text.replace(
+              '''            &host(&current),\n            &guest_transaction(&current, &accepted),''',
+              '''            &host(&current),\n            &guest_block_attachment(&current),\n            &guest_transaction(&current, &accepted),''',
+          )
+
+          path.write_text(text)
+          PY
+      - name: Format and focused tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.97.1 --profile minimal --component rustfmt --no-self-update
+          cargo fmt --all
+          cargo test --locked trusted_project_disk_guest_block_attachment
+          cargo test --locked trusted_project_filesystem_full_correlation
+      - name: Remove helper and publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm .github/workflows/bind-640-host-guest-block-bridge.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "#640 require exact host-disk to guest-block bridge"
+          git push origin HEAD:chatgpt/640-verified-full-correlation
