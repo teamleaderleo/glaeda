@@ -24,32 +24,37 @@ jobs:
           # Research-only rebuild; merge candidates receive only the verified Rust blobs.
           set -euo pipefail
           git fetch origin ocean/592-admin-producer-plan
-          git show origin/ocean/592-admin-producer-plan:src/immutable_git_object_pool_admin_producer_plan.rs > src/immutable_git_object_pool_admin_producer_plan.rs
+          git show 4988799be3b0f84d6c8e8c57fb70bace35bdb913:src/immutable_git_object_pool_admin_producer_plan.rs > src/immutable_git_object_pool_admin_producer_plan.rs
           python3 - <<'PY'
           from pathlib import Path
 
           plan = Path('src/immutable_git_object_pool_admin_producer_plan.rs')
           text = plan.read_text()
-          text = text.replace(
-              '    pub(crate) const fn uid(self) -> u32 {\n',
-              '    #[allow(dead_code)] // Consumed by the later #592 executor slice.\n    pub(crate) const fn uid(self) -> u32 {\n',
-              1,
-          )
-          text = text.replace(
-              '    pub(crate) const fn gid(self) -> u32 {\n',
-              '    #[allow(dead_code)] // Consumed by the later #592 executor slice.\n    pub(crate) const fn gid(self) -> u32 {\n',
-              1,
-          )
-          text = text.replace(
-              '    use crate::project_disk_lease::{ProjectDiskGeneration, ProjectDiskId};\n',
-              '    use crate::process::CommandValue;\n    use crate::project_disk_lease::{ProjectDiskGeneration, ProjectDiskId};\n',
-              1,
-          )
-          text = text.replace(
-              '        assert_eq!(plan.command().environment["PATH"].displayed(), SAFE_PATH);\n',
-              '        match &plan.command().environment["PATH"] {\n            CommandValue::Plain(value) => assert_eq!(value, SAFE_PATH),\n            CommandValue::Secret(_) => panic!("PATH must be plain"),\n        }\n',
-              1,
-          )
+          if '#[allow(dead_code)] // Consumed by the later #592 executor slice.\n    pub(crate) const fn uid' not in text:
+              text = text.replace(
+                  '    pub(crate) const fn uid(self) -> u32 {\n',
+                  '    #[allow(dead_code)] // Consumed by the later #592 executor slice.\n    pub(crate) const fn uid(self) -> u32 {\n',
+                  1,
+              )
+          if '#[allow(dead_code)] // Consumed by the later #592 executor slice.\n    pub(crate) const fn gid' not in text:
+              text = text.replace(
+                  '    pub(crate) const fn gid(self) -> u32 {\n',
+                  '    #[allow(dead_code)] // Consumed by the later #592 executor slice.\n    pub(crate) const fn gid(self) -> u32 {\n',
+                  1,
+              )
+          if '    use crate::process::CommandValue;\n' not in text:
+              text = text.replace(
+                  '    use crate::project_disk_lease::{ProjectDiskGeneration, ProjectDiskId};\n',
+                  '    use crate::process::CommandValue;\n    use crate::project_disk_lease::{ProjectDiskGeneration, ProjectDiskId};\n',
+                  1,
+              )
+          old = '        assert_eq!(plan.command().environment["PATH"].displayed(), SAFE_PATH);\n'
+          if old in text:
+              text = text.replace(
+                  old,
+                  '        match &plan.command().environment["PATH"] {\n            CommandValue::Plain(value) => assert_eq!(value, SAFE_PATH),\n            CommandValue::Secret(_) => panic!("PATH must be plain"),\n        }\n',
+                  1,
+              )
           plan.write_text(text)
 
           lib = Path('src/lib.rs')
