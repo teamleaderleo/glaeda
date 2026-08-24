@@ -1,0 +1,76 @@
+name: Research generate M6 #591 vocabulary diff
+
+on:
+  push:
+    branches:
+      - research/591-rename-generator
+
+permissions:
+  contents: write
+
+jobs:
+  generate:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: research/591-rename-generator
+          show-progress: false
+          fetch-depth: 0
+      - name: Apply generic Git-worktree vocabulary and self-clean
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          paths = [
+              Path("src/trusted_overlay_task_view.rs"),
+              Path("src/trusted_overlay_mount_plan.rs"),
+          ]
+          total = 0
+          for path in paths:
+              text = path.read_text()
+              count = text.count("OverlayLinkedWorktreeObservation")
+              if count == 0:
+                  raise SystemExit(f"expected old vocabulary in {path}")
+              total += count
+              path.write_text(text.replace("OverlayLinkedWorktreeObservation", "OverlayGitWorktreeObservation"))
+
+          task = paths[0]
+          text = task.read_text()
+          enum_block = '''pub enum OverlayGitWorktreeObservation {
+              Absent,
+              Exact,
+              Other,
+              Unknown,
+          }
+          '''
+          alias = '''pub enum OverlayGitWorktreeObservation {
+              Absent,
+              Exact,
+              Other,
+              Unknown,
+          }
+
+          /// Compatibility alias retained during the M6 development window.
+          pub type OverlayLinkedWorktreeObservation = OverlayGitWorktreeObservation;
+          '''
+          if text.count(enum_block) != 1:
+              raise SystemExit("generic enum insertion point changed")
+          task.write_text(text.replace(enum_block, alias, 1))
+
+          remaining = sum(path.read_text().count("OverlayLinkedWorktreeObservation") for path in paths)
+          if remaining != 1:
+              raise SystemExit(f"expected only the compatibility alias to retain old name, saw {remaining}")
+          print(f"renamed_occurrences={total}")
+          PY
+          rm .github/workflows/research-591-rename-generator.yml
+          cargo fmt --all -- --check
+          git diff --check
+          git config user.name "smolrunner-research-generator"
+          git config user.email "actions@users.noreply.github.com"
+          git add src/trusted_overlay_task_view.rs src/trusted_overlay_mount_plan.rs .github/workflows/research-591-rename-generator.yml
+          git commit -m "Generalize OverlayFS Git worktree observation vocabulary"
+          git push origin HEAD:research/591-rename-generator
