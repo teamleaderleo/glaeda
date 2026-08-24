@@ -6,18 +6,16 @@ use serde::Serialize;
 use smolrunner::artifact::{CommitId, GitTreeId, Sha256Digest};
 use smolrunner::hot_execution_performance::{
     HotBuildState, HotDependencyState, HotExecutionHeat, HotExecutionMilestones, HotExecutionMode,
-    HotExecutionPerformanceIdentity, HotExecutionPerformanceReceipt, HotExecutionResourceObservation,
-    HotExecutionResultClass, HotExecutionStorageObservation, HotIndexServiceState, HotRepositoryState,
-    HotSandboxState,
+    HotExecutionPerformanceIdentity, HotExecutionPerformanceReceipt,
+    HotExecutionResourceObservation, HotExecutionResultClass, HotExecutionStorageObservation,
+    HotIndexServiceState, HotRepositoryState, HotSandboxState,
 };
 
-const PLAN_SCHEMA_VERSION: u8 = 1;
-const SAMPLE_SCHEMA_VERSION: u8 = 1;
 const WORKLOAD_ID: &str = "quarry-agent-brief-edit-test-v1";
 const PROJECT_ID: &str = "quarry";
-const CONTROL_CANDIDATE_ID: &str = "trusted-mac-current";
-const HOT_CANDIDATE_ID: &str = "project-disk-ext4-overlay";
 const BACKEND_ID: &str = "lima-vz";
+const CONTROL_ID: &str = "trusted-mac-current";
+const HOT_ID: &str = "project-disk-ext4-overlay";
 
 #[derive(Debug, Parser)]
 #[command(about = "Plan and record the first Quarry resident-project dogfood experiment")]
@@ -36,9 +34,9 @@ enum OutputFormat {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Emit the frozen software-side experiment contract. Performs no host or guest mutation.
+    /// Emit the frozen experiment contract. Performs no host or guest mutation.
     Plan(PlanArgs),
-    /// Emit one bounded observation receipt from already-owned benchmark timestamps.
+    /// Wrap already-owned benchmark observations in a bounded receipt.
     Sample(SampleArgs),
 }
 
@@ -61,15 +59,15 @@ struct SampleArgs {
     #[arg(long)]
     smolrunner_commit: String,
     #[arg(long, value_enum)]
-    arm: DogfoodArm,
+    arm: Arm,
     #[arg(long, value_enum)]
-    sample_class: DogfoodSampleClass,
+    sample_class: SampleClass,
     #[arg(long)]
     ordinal: u16,
     #[arg(long)]
     fanout: Option<u8>,
     #[arg(long, value_enum)]
-    execution_mode: DogfoodExecutionMode,
+    execution_mode: ExecutionMode,
     #[arg(long)]
     host_class: String,
     #[arg(long)]
@@ -110,41 +108,29 @@ struct SampleArgs {
     host_memory_delta_bytes: Option<i64>,
     #[arg(long)]
     cpu_time_millis: Option<u64>,
-    #[arg(long, value_enum, default_value_t = DogfoodResult::Succeeded)]
-    result: DogfoodResult,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum DogfoodAuthority {
-    ObservationOnly,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum PhysicalMutationPolicy {
-    SealedUntilSeparatelyAuthorized,
+    #[arg(long, value_enum, default_value_t = ResultClass::Succeeded)]
+    result: ResultClass,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
-enum DogfoodArm {
+enum Arm {
     Control,
     HotProject,
 }
 
-impl DogfoodArm {
+impl Arm {
     const fn candidate_id(self) -> &'static str {
         match self {
-            Self::Control => CONTROL_CANDIDATE_ID,
-            Self::HotProject => HOT_CANDIDATE_ID,
+            Self::Control => CONTROL_ID,
+            Self::HotProject => HOT_ID,
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
-enum DogfoodSampleClass {
+enum SampleClass {
     Singleton,
     Sequential,
     Fanout,
@@ -153,7 +139,7 @@ enum DogfoodSampleClass {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum DogfoodExecutionMode {
+enum ExecutionMode {
     ColdDisposable,
     PreparedDisposable,
     ResidentAfterIdle,
@@ -161,20 +147,20 @@ enum DogfoodExecutionMode {
     ResidentTaskLoop,
 }
 
-impl From<DogfoodExecutionMode> for HotExecutionMode {
-    fn from(value: DogfoodExecutionMode) -> Self {
+impl From<ExecutionMode> for HotExecutionMode {
+    fn from(value: ExecutionMode) -> Self {
         match value {
-            DogfoodExecutionMode::ColdDisposable => Self::ColdDisposable,
-            DogfoodExecutionMode::PreparedDisposable => Self::PreparedDisposable,
-            DogfoodExecutionMode::ResidentAfterIdle => Self::ResidentAfterIdle,
-            DogfoodExecutionMode::ResidentImmediate => Self::ResidentImmediate,
-            DogfoodExecutionMode::ResidentTaskLoop => Self::ResidentTaskLoop,
+            ExecutionMode::ColdDisposable => Self::ColdDisposable,
+            ExecutionMode::PreparedDisposable => Self::PreparedDisposable,
+            ExecutionMode::ResidentAfterIdle => Self::ResidentAfterIdle,
+            ExecutionMode::ResidentImmediate => Self::ResidentImmediate,
+            ExecutionMode::ResidentTaskLoop => Self::ResidentTaskLoop,
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum DogfoodResult {
+enum ResultClass {
     Succeeded,
     Failed,
     Canceled,
@@ -182,117 +168,86 @@ enum DogfoodResult {
     Unknown,
 }
 
-impl From<DogfoodResult> for HotExecutionResultClass {
-    fn from(value: DogfoodResult) -> Self {
+impl From<ResultClass> for HotExecutionResultClass {
+    fn from(value: ResultClass) -> Self {
         match value {
-            DogfoodResult::Succeeded => Self::Succeeded,
-            DogfoodResult::Failed => Self::Failed,
-            DogfoodResult::Canceled => Self::Canceled,
-            DogfoodResult::ResetRequired => Self::ResetRequired,
-            DogfoodResult::Unknown => Self::Unknown,
+            ResultClass::Succeeded => Self::Succeeded,
+            ResultClass::Failed => Self::Failed,
+            ResultClass::Canceled => Self::Canceled,
+            ResultClass::ResetRequired => Self::ResetRequired,
+            ResultClass::Unknown => Self::Unknown,
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
-struct StatePlacement {
-    state_class: &'static str,
-    placement: &'static str,
-    lifetime: &'static str,
-    authority: &'static str,
-    invalidation: &'static str,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct FrozenWorkload {
-    orientation_command: Vec<&'static str>,
-    edit_target: &'static str,
-    edit_semantics: &'static str,
-    focused_test_command: Vec<&'static str>,
-    sequential_fresh_tasks: u8,
-    fanout_widths: [u8; 3],
-    restart_cycles: u8,
-    cold_fallback_required: bool,
-    final_cold_oracle: Vec<&'static str>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct AcceptanceThresholds {
-    singleton_first_command_p50_max_control_basis_points: u16,
-    singleton_first_command_p90_max_control_basis_points: u16,
-    edit_to_focused_pytest_p50_max_control_basis_points: u16,
-    fanout_batch_min_speedup_milli: u16,
-    required_restart_successes: u8,
-    max_break_even_tasks: u8,
-    exact_source_and_output_match_required: bool,
-    unexplained_growth_per_second_cycle_allowed: bool,
-    cold_oracle_pass_required: bool,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct QuarryDogfoodPlan {
+#[derive(Debug, Serialize)]
+struct Plan {
     schema_version: u8,
-    authority: DogfoodAuthority,
-    physical_mutation: PhysicalMutationPolicy,
+    authority: &'static str,
+    physical_mutation: &'static str,
     quarry_commit: CommitId,
     quarry_tree: GitTreeId,
     smolrunner_commit: CommitId,
     workload_id: &'static str,
     control_candidate_id: &'static str,
     hot_candidate_id: &'static str,
-    backend_id: &'static str,
-    state_placement: Vec<StatePlacement>,
-    workload: FrozenWorkload,
-    acceptance: AcceptanceThresholds,
+    persistent_disk_state: [&'static str; 7],
+    deliberately_outside_disk: [&'static str; 5],
+    orientation_command: &'static str,
+    edit_target: &'static str,
+    focused_test_command: &'static str,
+    cold_oracle_command: &'static str,
+    sequential_tasks: u8,
+    fanout_widths: [u8; 3],
+    restart_cycles: u8,
+    acceptance: Acceptance,
 }
 
-#[derive(Debug, Clone, Serialize)]
-struct EditTestObservation {
+#[derive(Debug, Serialize)]
+struct Acceptance {
+    first_command_p50_max_control_basis_points: u16,
+    first_command_p90_max_control_basis_points: u16,
+    edit_to_pytest_p50_max_control_basis_points: u16,
+    fanout_min_speedup_milli: u16,
+    max_break_even_tasks: u8,
+    exact_equivalence_required: bool,
+    unexplained_second_cycle_growth_allowed: bool,
+    cold_oracle_required: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct EditObservation {
     edit_complete_millis: u64,
     focused_pytest_result_millis: u64,
     edit_to_focused_pytest_millis: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
-struct SampleCoordinates {
-    class: DogfoodSampleClass,
+#[derive(Debug, Serialize)]
+struct Sample {
+    schema_version: u8,
+    authority: &'static str,
+    physical_mutation: &'static str,
+    arm: Arm,
+    sample_class: SampleClass,
     ordinal: u16,
     #[serde(skip_serializing_if = "Option::is_none")]
     fanout: Option<u8>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct QuarryDogfoodSample {
-    schema_version: u8,
-    authority: DogfoodAuthority,
-    physical_mutation: PhysicalMutationPolicy,
-    arm: DogfoodArm,
-    coordinates: SampleCoordinates,
     quarry_commit: CommitId,
     quarry_tree: GitTreeId,
     smolrunner_commit: CommitId,
     #[serde(skip_serializing_if = "Option::is_none")]
     agent_brief_digest: Option<Sha256Digest>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    edit_test: Option<EditTestObservation>,
+    edit: Option<EditObservation>,
     performance: HotExecutionPerformanceReceipt,
 }
 
 #[derive(Debug)]
-struct DogfoodError {
-    code: &'static str,
-    message: &'static str,
-}
-
-impl DogfoodError {
-    const fn new(code: &'static str, message: &'static str) -> Self {
-        Self { code, message }
-    }
-}
+struct DogfoodError(&'static str);
 
 impl fmt::Display for DogfoodError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}: {}", self.code, self.message)
+        formatter.write_str(self.0)
     }
 }
 
@@ -301,196 +256,94 @@ impl Error for DogfoodError {}
 fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Plan(args) => {
-            let plan = build_plan(&args)?;
-            match cli.output {
-                OutputFormat::Human => print_plan_human(&plan),
-                OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&plan)?),
-            }
-        }
+        Command::Plan(args) => render(&build_plan(args)?, cli.output)?,
         Command::Sample(args) => {
-            let sample = build_sample(&args)?;
+            let sample = build_sample(args)?;
             match cli.output {
-                OutputFormat::Human => print_sample_human(&sample),
                 OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&sample)?),
+                OutputFormat::Human => {
+                    if let Some(edit) = &sample.edit {
+                        println!(
+                            "edit -> focused pytest: {} ms",
+                            edit.edit_to_focused_pytest_millis
+                        );
+                    }
+                    print!("{}", sample.performance.render_human());
+                }
             }
         }
     }
     Ok(())
 }
 
-fn build_plan(args: &PlanArgs) -> Result<QuarryDogfoodPlan, Box<dyn Error>> {
-    Ok(QuarryDogfoodPlan {
-        schema_version: PLAN_SCHEMA_VERSION,
-        authority: DogfoodAuthority::ObservationOnly,
-        physical_mutation: PhysicalMutationPolicy::SealedUntilSeparatelyAuthorized,
+fn render(plan: &Plan, output: OutputFormat) -> Result<(), Box<dyn Error>> {
+    match output {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(plan)?),
+        OutputFormat::Human => {
+            println!("Quarry hot-project dogfood v{}", plan.schema_version);
+            println!("Quarry commit: {}", plan.quarry_commit.as_str());
+            println!("Quarry tree: {}", plan.quarry_tree.as_str());
+            println!("SmolRunner commit: {}", plan.smolrunner_commit.as_str());
+            println!("fanout: 1/8/32; restart cycles: {}", plan.restart_cycles);
+            println!("physical mutation: {}", plan.physical_mutation);
+        }
+    }
+    Ok(())
+}
+
+fn build_plan(args: PlanArgs) -> Result<Plan, Box<dyn Error>> {
+    Ok(Plan {
+        schema_version: 1,
+        authority: "observation_only",
+        physical_mutation: "sealed_until_separately_authorized",
         quarry_commit: CommitId::parse(&args.quarry_commit)?,
         quarry_tree: GitTreeId::parse(&args.quarry_tree)?,
         smolrunner_commit: CommitId::parse(&args.smolrunner_commit)?,
         workload_id: WORKLOAD_ID,
-        control_candidate_id: CONTROL_CANDIDATE_ID,
-        hot_candidate_id: HOT_CANDIDATE_ID,
-        backend_id: BACKEND_ID,
-        state_placement: state_placement(),
-        workload: FrozenWorkload {
-            orientation_command: vec![
-                "python",
-                "-m",
-                "quarry.agent_brief",
-                "--format",
-                "json",
-            ],
-            edit_target: "src/quarry/agent_brief.py",
-            edit_semantics: "fixed_comment_only_patch_with_identical_program_behavior",
-            focused_test_command: vec![
-                "python",
-                "-m",
-                "pytest",
-                "-q",
-                "tests/test_agent_brief.py",
-                "--disable-warnings",
-            ],
-            sequential_fresh_tasks: 10,
-            fanout_widths: [1, 8, 32],
-            restart_cycles: 3,
-            cold_fallback_required: true,
-            final_cold_oracle: vec![
-                "python",
-                "scripts/run_local_tests.py",
-                "exact-head",
-                "--base",
-                "origin/main",
-            ],
-        },
-        acceptance: AcceptanceThresholds {
-            singleton_first_command_p50_max_control_basis_points: 5_000,
-            singleton_first_command_p90_max_control_basis_points: 6_500,
-            edit_to_focused_pytest_p50_max_control_basis_points: 11_000,
-            fanout_batch_min_speedup_milli: 2_000,
-            required_restart_successes: 3,
+        control_candidate_id: CONTROL_ID,
+        hot_candidate_id: HOT_ID,
+        persistent_disk_state: [
+            "immutable_git_object_pool",
+            "resident_clean_source_anchor",
+            "python_dependency_environment",
+            "dependency_cache",
+            "exact_parented_derived_indexes",
+            "task_private_git_metadata",
+            "task_overlay_upper_work",
+        ],
+        deliberately_outside_disk: [
+            "disk_lease_attachment_and_correlation_authority",
+            "source_and_verification_authority",
+            "credentials_and_jit_material",
+            "performance_receipts",
+            "canonical_cold_reconstruction_inputs",
+        ],
+        orientation_command: "python -m quarry.agent_brief --format json",
+        edit_target: "src/quarry/agent_brief.py",
+        focused_test_command: "python -m pytest -q tests/test_agent_brief.py --disable-warnings",
+        cold_oracle_command: "python scripts/run_local_tests.py exact-head --base origin/main",
+        sequential_tasks: 10,
+        fanout_widths: [1, 8, 32],
+        restart_cycles: 3,
+        acceptance: Acceptance {
+            first_command_p50_max_control_basis_points: 5_000,
+            first_command_p90_max_control_basis_points: 6_500,
+            edit_to_pytest_p50_max_control_basis_points: 11_000,
+            fanout_min_speedup_milli: 2_000,
             max_break_even_tasks: 10,
-            exact_source_and_output_match_required: true,
-            unexplained_growth_per_second_cycle_allowed: false,
-            cold_oracle_pass_required: true,
+            exact_equivalence_required: true,
+            unexplained_second_cycle_growth_allowed: false,
+            cold_oracle_required: true,
         },
     })
 }
 
-fn state_placement() -> Vec<StatePlacement> {
-    vec![
-        StatePlacement {
-            state_class: "git_object_pool",
-            placement: "persistent_project_disk",
-            lifetime: "immutable_generation",
-            authority: "acceleration_only",
-            invalidation: "exact_pool_generation_or_source_parent_mismatch",
-        },
-        StatePlacement {
-            state_class: "resident_source_anchor",
-            placement: "persistent_project_disk",
-            lifetime: "immutable_while_leased",
-            authority: "working_state_only",
-            invalidation: "commit_tree_index_or_cleanliness_mismatch",
-        },
-        StatePlacement {
-            state_class: "python_environment",
-            placement: "persistent_project_disk",
-            lifetime: "project_generation",
-            authority: "dependency_acceleration_only",
-            invalidation: "python_toolchain_or_dependency_generation_mismatch",
-        },
-        StatePlacement {
-            state_class: "dependency_cache",
-            placement: "persistent_project_disk",
-            lifetime: "evictable_project_cache",
-            authority: "acceleration_only",
-            invalidation: "cache_identity_mismatch_or_corruption",
-        },
-        StatePlacement {
-            state_class: "derived_indexes",
-            placement: "persistent_project_disk_when_exact_parented",
-            lifetime: "rebuildable_generation",
-            authority: "observation_or_acceleration_only",
-            invalidation: "semantic_parent_or_tool_generation_mismatch",
-        },
-        StatePlacement {
-            state_class: "task_private_git_metadata",
-            placement: "persistent_project_disk_task_area",
-            lifetime: "task_generation",
-            authority: "task_working_state_only",
-            invalidation: "task_pool_source_or_private_git_proof_mismatch",
-        },
-        StatePlacement {
-            state_class: "overlay_upper_work",
-            placement: "persistent_project_disk_task_area",
-            lifetime: "task_generation",
-            authority: "task_working_state_only",
-            invalidation: "task_generation_or_mount_revalidation_mismatch",
-        },
-        StatePlacement {
-            state_class: "pytest_cache",
-            placement: "task_private_upper",
-            lifetime: "task_generation",
-            authority: "acceleration_only",
-            invalidation: "task_settlement",
-        },
-        StatePlacement {
-            state_class: "python_bytecode_cache",
-            placement: "task_private_upper_in_phase_one",
-            lifetime: "task_generation",
-            authority: "acceleration_only",
-            invalidation: "task_settlement",
-        },
-        StatePlacement {
-            state_class: "overlay_merged_mount",
-            placement: "guest_kernel_mount_state",
-            lifetime: "task_generation",
-            authority: "transaction_continuity_only",
-            invalidation: "mount_or_task_lifecycle_mismatch",
-        },
-        StatePlacement {
-            state_class: "disk_lease_and_attachment_authority",
-            placement: "outside_project_disk",
-            lifetime: "durable_controller_state",
-            authority: "lifecycle_authority",
-            invalidation: "fresh_external_observation_disagrees",
-        },
-        StatePlacement {
-            state_class: "verification_and_source_authority",
-            placement: "outside_project_disk",
-            lifetime: "canonical_external_or_durable_evidence",
-            authority: "source_and_verification_authority",
-            invalidation: "fresh_proof_required",
-        },
-        StatePlacement {
-            state_class: "credentials_and_jit_material",
-            placement: "outside_project_disk",
-            lifetime: "existing_bounded_capability_lifecycle",
-            authority: "capability_specific",
-            invalidation: "capability_generation_or_expiry",
-        },
-        StatePlacement {
-            state_class: "performance_receipts",
-            placement: "outside_project_disk",
-            lifetime: "bounded_observation_history",
-            authority: "observation_only",
-            invalidation: "never_used_as_execution_authority",
-        },
-    ]
-}
-
-fn build_sample(args: &SampleArgs) -> Result<QuarryDogfoodSample, Box<dyn Error>> {
+fn build_sample(args: SampleArgs) -> Result<Sample, Box<dyn Error>> {
     validate_coordinates(args.sample_class, args.ordinal, args.fanout)?;
+    let mode: HotExecutionMode = args.execution_mode.into();
+    validate_arm_mode(args.arm, mode)?;
     let quarry_commit = CommitId::parse(&args.quarry_commit)?;
-    let quarry_tree = GitTreeId::parse(&args.quarry_tree)?;
-    let smolrunner_commit = CommitId::parse(&args.smolrunner_commit)?;
-    let execution_mode: HotExecutionMode = args.execution_mode.into();
-    validate_mode_for_arm(args.arm, execution_mode)?;
-
-    let edit_test = build_edit_observation(
-        args.edit_complete_millis,
-        args.focused_pytest_result_millis,
-    )?;
+    let edit = edit_observation(args.edit_complete_millis, args.focused_pytest_result_millis)?;
     let milestones = HotExecutionMilestones::new(
         args.sandbox_ready_millis,
         args.repository_ready_millis,
@@ -500,8 +353,8 @@ fn build_sample(args: &SampleArgs) -> Result<QuarryDogfoodSample, Box<dyn Error>
         args.final_relevant_result_millis,
         args.residency_transition_millis,
     )?;
-    let storage = build_storage(args)?;
-    let resources = build_resources(args)?;
+    let storage = storage_observation(&args)?;
+    let resources = resource_observation(&args)?;
     let source_id = format!("git:{}", quarry_commit.as_str());
     let performance = HotExecutionPerformanceReceipt::new(
         HotExecutionPerformanceIdentity::new(
@@ -513,71 +366,61 @@ fn build_sample(args: &SampleArgs) -> Result<QuarryDogfoodSample, Box<dyn Error>
             &args.host_class,
             &args.resource_profile,
         )?,
-        execution_mode,
+        mode,
         args.total_elapsed_millis,
         milestones,
-        heat_for(args.arm, execution_mode),
+        heat(args.arm, mode),
         storage,
         resources,
         args.result.into(),
     )?;
 
-    Ok(QuarryDogfoodSample {
-        schema_version: SAMPLE_SCHEMA_VERSION,
-        authority: DogfoodAuthority::ObservationOnly,
-        physical_mutation: PhysicalMutationPolicy::SealedUntilSeparatelyAuthorized,
+    Ok(Sample {
+        schema_version: 1,
+        authority: "observation_only",
+        physical_mutation: "sealed_until_separately_authorized",
         arm: args.arm,
-        coordinates: SampleCoordinates {
-            class: args.sample_class,
-            ordinal: args.ordinal,
-            fanout: args.fanout,
-        },
+        sample_class: args.sample_class,
+        ordinal: args.ordinal,
+        fanout: args.fanout,
         quarry_commit,
-        quarry_tree,
-        smolrunner_commit,
+        quarry_tree: GitTreeId::parse(&args.quarry_tree)?,
+        smolrunner_commit: CommitId::parse(&args.smolrunner_commit)?,
         agent_brief_digest: args
             .agent_brief_digest
             .as_deref()
             .map(Sha256Digest::parse)
             .transpose()?,
-        edit_test,
+        edit,
         performance,
     })
 }
 
-fn build_edit_observation(
-    edit_complete_millis: Option<u64>,
-    focused_pytest_result_millis: Option<u64>,
-) -> Result<Option<EditTestObservation>, DogfoodError> {
-    match (edit_complete_millis, focused_pytest_result_millis) {
-        (Some(edit), Some(result)) if result >= edit => Ok(Some(EditTestObservation {
+fn edit_observation(
+    edit_millis: Option<u64>,
+    pytest_millis: Option<u64>,
+) -> Result<Option<EditObservation>, DogfoodError> {
+    match (edit_millis, pytest_millis) {
+        (None, None) => Ok(None),
+        (Some(edit), Some(result)) if result >= edit => Ok(Some(EditObservation {
             edit_complete_millis: edit,
             focused_pytest_result_millis: result,
             edit_to_focused_pytest_millis: result - edit,
         })),
-        (None, None) => Ok(None),
-        (Some(_), Some(_)) => Err(DogfoodError::new(
-            "dogfood_result_before_edit",
-            "focused pytest result must not precede edit completion",
-        )),
-        _ => Err(DogfoodError::new(
-            "dogfood_incomplete_edit_measurement",
-            "edit completion and focused pytest result must be recorded together",
-        )),
+        (Some(_), Some(_)) => Err(DogfoodError("dogfood_result_before_edit")),
+        _ => Err(DogfoodError("dogfood_incomplete_edit_measurement")),
     }
 }
 
-fn build_storage(
+fn storage_observation(
     args: &SampleArgs,
 ) -> Result<Option<HotExecutionStorageObservation>, Box<dyn Error>> {
-    let values = [
-        args.guest_logical_bytes,
-        args.guest_filesystem_used_bytes,
-        args.host_backing_logical_bytes,
-        args.host_backing_allocated_bytes,
-        args.task_filesystem_used_delta_bytes,
-    ];
-    if values.iter().all(Option::is_none) {
+    if args.guest_logical_bytes.is_none()
+        && args.guest_filesystem_used_bytes.is_none()
+        && args.host_backing_logical_bytes.is_none()
+        && args.host_backing_allocated_bytes.is_none()
+        && args.task_filesystem_used_delta_bytes.is_none()
+    {
         return Ok(None);
     }
     Ok(Some(HotExecutionStorageObservation::new(
@@ -589,7 +432,7 @@ fn build_storage(
     )?))
 }
 
-fn build_resources(
+fn resource_observation(
     args: &SampleArgs,
 ) -> Result<Option<HotExecutionResourceObservation>, Box<dyn Error>> {
     if args.peak_guest_memory_bytes.is_none()
@@ -606,71 +449,57 @@ fn build_resources(
 }
 
 fn validate_coordinates(
-    class: DogfoodSampleClass,
+    class: SampleClass,
     ordinal: u16,
     fanout: Option<u8>,
 ) -> Result<(), DogfoodError> {
     if ordinal == 0 {
-        return Err(DogfoodError::new(
-            "invalid_dogfood_ordinal",
-            "dogfood sample ordinal must be greater than zero",
-        ));
+        return Err(DogfoodError("dogfood_ordinal_must_be_positive"));
     }
     match class {
-        DogfoodSampleClass::Fanout if !matches!(fanout, Some(1 | 8 | 32)) => {
-            Err(DogfoodError::new(
-                "invalid_dogfood_fanout",
-                "fanout samples are frozen to widths 1, 8, or 32",
-            ))
+        SampleClass::Fanout if !matches!(fanout, Some(1 | 8 | 32)) => {
+            Err(DogfoodError("dogfood_fanout_must_be_1_8_or_32"))
         }
-        DogfoodSampleClass::Sequential if ordinal > 10 => Err(DogfoodError::new(
-            "invalid_dogfood_ordinal",
-            "sequential dogfood samples are frozen to ten tasks",
-        )),
-        DogfoodSampleClass::Restart if ordinal > 3 => Err(DogfoodError::new(
-            "invalid_dogfood_ordinal",
-            "restart dogfood samples are frozen to three cycles",
-        )),
-        DogfoodSampleClass::Fanout => Ok(()),
-        _ if fanout.is_some() => Err(DogfoodError::new(
-            "unexpected_dogfood_fanout",
-            "fanout width is valid only for fanout samples",
-        )),
+        SampleClass::Sequential if ordinal > 10 => {
+            Err(DogfoodError("dogfood_sequential_ordinal_exceeds_10"))
+        }
+        SampleClass::Restart if ordinal > 3 => {
+            Err(DogfoodError("dogfood_restart_ordinal_exceeds_3"))
+        }
+        SampleClass::Fanout => Ok(()),
+        _ if fanout.is_some() => Err(DogfoodError("dogfood_unexpected_fanout")),
         _ => Ok(()),
     }
 }
 
-fn validate_mode_for_arm(arm: DogfoodArm, mode: HotExecutionMode) -> Result<(), DogfoodError> {
+fn validate_arm_mode(arm: Arm, mode: HotExecutionMode) -> Result<(), DogfoodError> {
     let valid = match arm {
-        DogfoodArm::Control => matches!(
+        Arm::Control => matches!(
             mode,
             HotExecutionMode::ColdDisposable | HotExecutionMode::PreparedDisposable
         ),
-        DogfoodArm::HotProject => matches!(
+        Arm::HotProject => matches!(
             mode,
             HotExecutionMode::ResidentAfterIdle
                 | HotExecutionMode::ResidentImmediate
                 | HotExecutionMode::ResidentTaskLoop
         ),
     };
-    valid.then_some(()).ok_or_else(|| {
-        DogfoodError::new(
-            "dogfood_arm_mode_mismatch",
-            "execution mode is incompatible with the selected dogfood arm",
-        )
-    })
+    valid
+        .then_some(())
+        .ok_or(DogfoodError("dogfood_arm_mode_mismatch"))
 }
 
-fn heat_for(arm: DogfoodArm, mode: HotExecutionMode) -> HotExecutionHeat {
+fn heat(arm: Arm, mode: HotExecutionMode) -> HotExecutionHeat {
     match arm {
-        DogfoodArm::Control => HotExecutionHeat::new(
+        Arm::Control => HotExecutionHeat::new(
             HotSandboxState::Prepared,
             HotRepositoryState::CheckoutHit,
             HotDependencyState::EnvironmentHit,
             HotBuildState::Cold,
             HotIndexServiceState::Unavailable,
         ),
-        DogfoodArm::HotProject => HotExecutionHeat::new(
+        Arm::HotProject => HotExecutionHeat::new(
             if mode == HotExecutionMode::ResidentAfterIdle {
                 HotSandboxState::Resumed
             } else {
@@ -684,150 +513,52 @@ fn heat_for(arm: DogfoodArm, mode: HotExecutionMode) -> HotExecutionHeat {
     }
 }
 
-fn print_plan_human(plan: &QuarryDogfoodPlan) {
-    println!("Quarry hot-project dogfood v{}", plan.schema_version);
-    println!("Quarry commit: {}", plan.quarry_commit.as_str());
-    println!("Quarry tree: {}", plan.quarry_tree.as_str());
-    println!("SmolRunner commit: {}", plan.smolrunner_commit.as_str());
-    println!("control: {}", plan.control_candidate_id);
-    println!("treatment: {}", plan.hot_candidate_id);
-    println!("sequential tasks: {}", plan.workload.sequential_fresh_tasks);
-    println!("fanout: 1/8/32");
-    println!("restart cycles: {}", plan.workload.restart_cycles);
-    println!("physical mutation: sealed until separately authorized");
-}
-
-fn print_sample_human(sample: &QuarryDogfoodSample) {
-    println!("Quarry dogfood sample");
-    println!("arm: {:?}", sample.arm);
-    println!("class: {:?}", sample.coordinates.class);
-    println!("ordinal: {}", sample.coordinates.ordinal);
-    if let Some(fanout) = sample.coordinates.fanout {
-        println!("fanout: {fanout}");
-    }
-    if let Some(edit) = &sample.edit_test {
-        println!(
-            "edit -> focused pytest: {} ms",
-            edit.edit_to_focused_pytest_millis
-        );
-    }
-    print!("{}", sample.performance.render_human());
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
     const TREE: &str = "89abcdef0123456789abcdef0123456789abcdef";
-    const DIGEST: &str =
-        "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-
-    fn valid_sample_args() -> SampleArgs {
-        SampleArgs {
-            quarry_commit: COMMIT.to_owned(),
-            quarry_tree: TREE.to_owned(),
-            smolrunner_commit: COMMIT.to_owned(),
-            arm: DogfoodArm::HotProject,
-            sample_class: DogfoodSampleClass::Sequential,
-            ordinal: 1,
-            fanout: None,
-            execution_mode: DogfoodExecutionMode::ResidentTaskLoop,
-            host_class: "apple-silicon".to_owned(),
-            resource_profile: "medium-4c-8g".to_owned(),
-            total_elapsed_millis: 3_000,
-            sandbox_ready_millis: Some(1),
-            repository_ready_millis: Some(8),
-            dependency_ready_millis: Some(12),
-            first_useful_command_millis: 20,
-            edit_complete_millis: Some(100),
-            focused_pytest_result_millis: Some(2_500),
-            final_relevant_result_millis: Some(2_800),
-            residency_transition_millis: Some(3_000),
-            agent_brief_digest: Some(DIGEST.to_owned()),
-            guest_logical_bytes: None,
-            guest_filesystem_used_bytes: None,
-            host_backing_logical_bytes: None,
-            host_backing_allocated_bytes: None,
-            task_filesystem_used_delta_bytes: None,
-            peak_guest_memory_bytes: None,
-            host_memory_delta_bytes: None,
-            cpu_time_millis: None,
-            result: DogfoodResult::Succeeded,
-        }
-    }
 
     #[test]
-    fn plan_freezes_first_quarry_workload_and_keeps_physical_mutation_sealed() {
-        let plan = build_plan(&PlanArgs {
+    fn plan_keeps_physical_work_sealed_and_freezes_required_matrix() {
+        let plan = build_plan(PlanArgs {
             quarry_commit: COMMIT.to_owned(),
             quarry_tree: TREE.to_owned(),
             smolrunner_commit: COMMIT.to_owned(),
         })
         .expect("plan is valid");
-
-        assert_eq!(plan.schema_version, 1);
-        assert_eq!(plan.workload.sequential_fresh_tasks, 10);
-        assert_eq!(plan.workload.fanout_widths, [1, 8, 32]);
-        assert_eq!(plan.workload.restart_cycles, 3);
-        assert!(plan.workload.cold_fallback_required);
+        assert_eq!(plan.physical_mutation, "sealed_until_separately_authorized");
+        assert_eq!(plan.fanout_widths, [1, 8, 32]);
+        assert_eq!(plan.restart_cycles, 3);
         assert_eq!(
-            plan.workload.final_cold_oracle,
-            [
-                "python",
-                "scripts/run_local_tests.py",
-                "exact-head",
-                "--base",
-                "origin/main"
-            ]
-        );
-        assert_eq!(
-            plan.physical_mutation,
-            PhysicalMutationPolicy::SealedUntilSeparatelyAuthorized
+            plan.cold_oracle_command,
+            "python scripts/run_local_tests.py exact-head --base origin/main"
         );
         assert!(
-            plan.state_placement.iter().any(|item| {
-                item.state_class == "disk_lease_and_attachment_authority"
-                    && item.placement == "outside_project_disk"
-            })
+            plan.deliberately_outside_disk
+                .contains(&"disk_lease_attachment_and_correlation_authority")
         );
     }
 
     #[test]
-    fn sample_records_owned_edit_to_focused_pytest_delta() {
-        let sample = build_sample(&valid_sample_args()).expect("sample is valid");
-        let edit = sample.edit_test.expect("edit observation exists");
+    fn edit_delta_is_direct_and_reversed_timing_is_refused() {
+        let edit = edit_observation(Some(100), Some(2_500))
+            .expect("valid edit observation")
+            .expect("edit observation exists");
         assert_eq!(edit.edit_to_focused_pytest_millis, 2_400);
-        assert_eq!(
-            sample.performance.milestones().first_relevant_result_millis(),
-            Some(2_500)
-        );
+        assert!(edit_observation(Some(100), Some(99)).is_err());
+        assert!(edit_observation(Some(100), None).is_err());
     }
 
     #[test]
-    fn sample_refuses_partial_or_reversed_edit_measurement() {
-        let mut partial = valid_sample_args();
-        partial.focused_pytest_result_millis = None;
-        let partial_error = build_sample(&partial).expect_err("partial edit timing is refused");
-        assert!(partial_error.to_string().contains("dogfood_incomplete_edit_measurement"));
-
-        let mut reversed = valid_sample_args();
-        reversed.focused_pytest_result_millis = Some(90);
-        let reversed_error = build_sample(&reversed).expect_err("reversed edit timing is refused");
-        assert!(reversed_error.to_string().contains("dogfood_result_before_edit"));
-    }
-
-    #[test]
-    fn sample_refuses_unplanned_fanout_and_arm_mode_mismatch() {
-        let fanout_error = validate_coordinates(DogfoodSampleClass::Fanout, 1, Some(4))
-            .expect_err("unplanned fanout is refused");
-        assert_eq!(fanout_error.code, "invalid_dogfood_fanout");
-
-        let mode_error = validate_mode_for_arm(
-            DogfoodArm::Control,
-            HotExecutionMode::ResidentTaskLoop,
-        )
-        .expect_err("control cannot claim resident treatment mode");
-        assert_eq!(mode_error.code, "dogfood_arm_mode_mismatch");
+    fn experiment_coordinates_are_bounded() {
+        assert!(validate_coordinates(SampleClass::Fanout, 1, Some(1)).is_ok());
+        assert!(validate_coordinates(SampleClass::Fanout, 1, Some(8)).is_ok());
+        assert!(validate_coordinates(SampleClass::Fanout, 1, Some(32)).is_ok());
+        assert!(validate_coordinates(SampleClass::Fanout, 1, Some(4)).is_err());
+        assert!(validate_coordinates(SampleClass::Sequential, 11, None).is_err());
+        assert!(validate_coordinates(SampleClass::Restart, 4, None).is_err());
+        assert!(validate_arm_mode(Arm::Control, HotExecutionMode::ResidentTaskLoop).is_err());
     }
 }
