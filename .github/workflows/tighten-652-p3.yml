@@ -1,0 +1,109 @@
+name: Tighten P3 exact create handoff
+
+on:
+  push:
+    branches:
+      - chatgpt/565-p3-create-provenance-model
+
+permissions:
+  contents: write
+
+jobs:
+  tighten:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: chatgpt/565-p3-create-provenance-model
+          fetch-depth: 0
+          show-progress: false
+      - name: Tighten create-start identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path('src/project_disk_create_state.rs')
+          text = path.read_text()
+
+          def sub_once(pattern: str, replacement: str, flags=0) -> None:
+              global text
+              text2, count = re.subn(pattern, replacement, text, count=1, flags=flags)
+              if count != 1:
+                  raise SystemExit(f'expected one replacement for {pattern!r}, found {count}')
+              text = text2
+
+          sub_once(
+              r'(Ok\(ProjectDiskCreateStartPlan \{\s*identity: self\.plan_identity\(\),\s*attempt_generation,)(\s*\}\))',
+              r'\1\n            requested_logical_bytes: self.requested_logical_bytes,\2',
+              re.S,
+          )
+          sub_once(
+              r'if attempt_generation != plan\.attempt_generation \{\s*return Err\(plan_mismatch\(\)\);\s*\}',
+              'if attempt_generation != plan.attempt_generation\n            || plan.requested_logical_bytes != self.requested_logical_bytes\n        {\n            return Err(plan_mismatch());\n        }',
+              re.S,
+          )
+          sub_once(
+              r'if attempt_generation != start\.attempt_generation \{\s*return Err\(plan_mismatch\(\)\);\s*\}',
+              'if attempt_generation != start.attempt_generation\n            || start.requested_logical_bytes != self.requested_logical_bytes\n        {\n            return Err(plan_mismatch());\n        }',
+              re.S,
+          )
+          sub_once(
+              r'if identity\.expected_revision >= self\.revision \{\s*return Err\(stale_plan\(\)\);\s*\}',
+              'if identity.expected_revision.get().checked_add(1) != Some(self.revision.get()) {\n            return Err(stale_plan());\n        }',
+              re.S,
+          )
+          sub_once(
+              r'(pub struct ProjectDiskCreateStartPlan \{\s*identity: ProjectDiskCreatePlanIdentity,\s*attempt_generation: ProjectDiskCreateAttemptGeneration,)(\s*\})',
+              r'\1\n    requested_logical_bytes: u64,\2',
+              re.S,
+          )
+          sub_once(
+              r'pub const fn requested_logical_bytes\(&self\) -> u64 \{.*?\n    \}',
+              'pub const fn requested_logical_bytes(&self) -> u64 {\n        self.requested_logical_bytes\n    }',
+              re.S,
+          )
+          sub_once(
+              r'(pub struct ProjectDiskCreateExecutionReceipt \{.*?attempt_generation: ProjectDiskCreateAttemptGeneration,)(\s*\})',
+              r'\1\n    requested_logical_bytes: u64,\2',
+              re.S,
+          )
+          sub_once(
+              r'(\|\| self\.attempt_generation != attempt_generation)(\s*\{\s*return Err\(evidence_mismatch\(\)\);)',
+              r'\1\n            || self.requested_logical_bytes != record.requested_logical_bytes\2',
+              re.S,
+          )
+          sub_once(
+              r'(ProjectDiskCreateExecutionReceipt \{\s*project: record\.project\.clone\(\),\s*disk_id: record\.disk_id\.clone\(\),\s*disk_generation: record\.disk_generation,\s*source_identity: record\.source_identity\.clone\(\),\s*disk_name: record\.disk_name\.clone\(\),\s*attempt_generation,)(\s*\})',
+              r'\1\n            requested_logical_bytes: record.requested_logical_bytes,\2',
+              re.S,
+          )
+          sub_once(
+              r'(let mut hasher = Sha256::new\(\);\s*hasher\.update\(PROJECT_DISK_LOCATOR_DOMAIN\);)(\s*for field in \[\s*project\.as_str\(\)\.as_bytes\(\),\s*disk_id\.as_str\(\)\.as_bytes\(\),\s*)&disk_generation\.get\(\)\.to_be_bytes\(\),',
+              r'\1\n    let disk_generation_bytes = disk_generation.get().to_be_bytes();\2disk_generation_bytes.as_slice(),',
+              re.S,
+          )
+
+          path.write_text(text)
+          PY
+      - name: Format and focused test
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.97.1 --profile minimal --component rustfmt --no-self-update
+          cargo fmt --all
+          cargo test --locked project_disk_create_state
+      - name: Remove helper and publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm .github/workflows/tighten-652-p3.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "#565 P3 bind exact create start inputs"
+          git push origin HEAD:chatgpt/565-p3-create-provenance-model
