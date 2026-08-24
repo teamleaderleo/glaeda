@@ -1,9 +1,9 @@
 name: Research repair project-disk receipt
 
 on:
-  push:
-    branches:
-      - bean/565-p2-physical-receipt
+  pull_request:
+    paths:
+      - ".github/workflows/research-repair-project-disk-receipt.yml"
 
 permissions:
   contents: write
@@ -11,7 +11,7 @@ permissions:
 jobs:
   repair:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -20,30 +20,190 @@ jobs:
           show-progress: false
       - name: Install pinned Rust
         run: rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt --no-self-update
-      - name: Repair lifecycle and output bounds
+      - name: Repair executable, runtime, and output evidence boundaries
         shell: bash
         run: |
           set -euo pipefail
+
+          cat >src/bin/project_disk_physical_receipt/capture/executable.rs <<'RS'
+          use std::ffi::OsString;
+          use std::fs::File;
+          use std::os::fd::OwnedFd;
+          use std::os::unix::fs::FileExt as _;
+          use std::path::{Path, PathBuf};
+
+          use rustix::fs::{self, AtFlags, Mode, OFlags};
+          use sha2::{Digest as _, Sha256};
+
+          use crate::receipt::{ReceiptExecutableEvidence, ReceiptFilesystemSnapshot};
+
+          use super::fs_evidence::{open_absolute_directory, snapshot};
+          use super::{
+              ProjectDiskPhysicalCaptureError, changed, encode_hex, filesystem_error, invalid_request,
+          };
+
+          const MAX_LIMACTL_EXECUTABLE_BYTES: u64 = 256 * 1024 * 1024;
+          const REGULAR_FILE_FLAGS: OFlags = OFlags::RDONLY
+              .union(OFlags::NOFOLLOW)
+              .union(OFlags::NONBLOCK)
+              .union(OFlags::CLOEXEC);
+          const HASH_CHUNK_BYTES: usize = 64 * 1024;
+
+          pub(super) struct HeldExecutable {
+              path: PathBuf,
+              parent_path: PathBuf,
+              name: OsString,
+              descriptor: OwnedFd,
+              before: ReceiptFilesystemSnapshot,
+              digest: String,
+          }
+
+          impl HeldExecutable {
+              pub(super) fn revalidate(&self) -> Result<(), ProjectDiskPhysicalCaptureError> {
+                  let held = snapshot(&fs::fstat(&self.descriptor).map_err(|_| filesystem_error())?)?;
+                  if held != self.before || hash_file(&self.descriptor, self.before.logical_bytes)? != self.digest {
+                      return Err(changed());
+                  }
+
+                  let parent = open_absolute_directory(&self.parent_path)?;
+                  let path_stat = fs::statat(&parent, &self.name, AtFlags::SYMLINK_NOFOLLOW)
+                      .map_err(|_| filesystem_error())?;
+                  let path_snapshot = snapshot(&path_stat)?;
+                  if path_snapshot != self.before {
+                      return Err(changed());
+                  }
+                  let reopened = fs::openat(&parent, &self.name, REGULAR_FILE_FLAGS, Mode::empty())
+                      .map_err(|_| filesystem_error())?;
+                  let reopened_snapshot =
+                      snapshot(&fs::fstat(&reopened).map_err(|_| filesystem_error())?)?;
+                  if reopened_snapshot != self.before
+                      || hash_file(&reopened, self.before.logical_bytes)? != self.digest
+                  {
+                      return Err(changed());
+                  }
+                  Ok(())
+              }
+
+              pub(super) fn finish(
+                  &self,
+              ) -> Result<ReceiptExecutableEvidence, ProjectDiskPhysicalCaptureError> {
+                  self.revalidate()?;
+                  let after = snapshot(&fs::fstat(&self.descriptor).map_err(|_| filesystem_error())?)?;
+                  Ok(ReceiptExecutableEvidence {
+                      path: self
+                          .path
+                          .to_str()
+                          .ok_or_else(invalid_request)?
+                          .to_owned(),
+                      sha256: self.digest.clone(),
+                      before: self.before,
+                      after,
+                  })
+              }
+          }
+
+          pub(super) fn capture_held_executable(
+              path: &Path,
+          ) -> Result<HeldExecutable, ProjectDiskPhysicalCaptureError> {
+              let parent_path = path.parent().ok_or_else(invalid_request)?.to_path_buf();
+              let name = path.file_name().ok_or_else(invalid_request)?.to_os_string();
+              let parent = open_absolute_directory(&parent_path)?;
+              let path_stat = fs::statat(&parent, &name, AtFlags::SYMLINK_NOFOLLOW)
+                  .map_err(|_| filesystem_error())?;
+              let before = snapshot(&path_stat)?;
+              validate_executable_snapshot(&before)?;
+              let descriptor = fs::openat(&parent, &name, REGULAR_FILE_FLAGS, Mode::empty())
+                  .map_err(|_| filesystem_error())?;
+              let held = snapshot(&fs::fstat(&descriptor).map_err(|_| filesystem_error())?)?;
+              if held != before {
+                  return Err(changed());
+              }
+              let digest = hash_file(&descriptor, before.logical_bytes)?;
+              let result = HeldExecutable {
+                  path: path.to_path_buf(),
+                  parent_path,
+                  name,
+                  descriptor,
+                  before,
+                  digest,
+              };
+              result.revalidate()?;
+              Ok(result)
+          }
+
+          fn validate_executable_snapshot(
+              snapshot: &ReceiptFilesystemSnapshot,
+          ) -> Result<(), ProjectDiskPhysicalCaptureError> {
+              if snapshot.mode & 0o170000 != 0o100000
+                  || snapshot.mode & 0o111 == 0
+                  || snapshot.mode & 0o022 != 0
+                  || snapshot.links != 1
+                  || snapshot.logical_bytes == 0
+                  || snapshot.logical_bytes > MAX_LIMACTL_EXECUTABLE_BYTES
+              {
+                  return Err(filesystem_error());
+              }
+              Ok(())
+          }
+
+          fn hash_file(
+              descriptor: &OwnedFd,
+              logical_bytes: u64,
+          ) -> Result<String, ProjectDiskPhysicalCaptureError> {
+              if logical_bytes == 0 || logical_bytes > MAX_LIMACTL_EXECUTABLE_BYTES {
+                  return Err(filesystem_error());
+              }
+              let file = File::from(rustix::io::dup(descriptor).map_err(|_| filesystem_error())?);
+              let mut hasher = Sha256::new();
+              let mut offset = 0_u64;
+              let mut buffer = [0_u8; HASH_CHUNK_BYTES];
+              while offset < logical_bytes {
+                  let remaining = usize::try_from((logical_bytes - offset).min(HASH_CHUNK_BYTES as u64))
+                      .map_err(|_| filesystem_error())?;
+                  let read = file
+                      .read_at(&mut buffer[..remaining], offset)
+                      .map_err(|_| filesystem_error())?;
+                  if read == 0 {
+                      return Err(changed());
+                  }
+                  hasher.update(&buffer[..read]);
+                  offset = offset
+                      .checked_add(u64::try_from(read).map_err(|_| filesystem_error())?)
+                      .ok_or_else(filesystem_error)?;
+              }
+              let digest = hasher.finalize();
+              Ok(format!("sha256:{}", encode_hex(digest.as_slice())))
+          }
+          RS
+
           python3 - <<'PY'
           from pathlib import Path
 
           capture = Path('src/bin/project_disk_physical_receipt/capture/mod.rs')
           s = capture.read_text()
-          old = '''    ProjectDiskPhysicalReceiptDocument, ReceiptCommandEvidence, same_entry_binding,\n    valid_git_commit, validate_absolute_path, validate_locator,\n'''
-          new = '''    ProjectDiskPhysicalReceiptDocument, ReceiptCommandEvidence, same_entry_binding,\n    valid_git_commit, validate_absolute_path, validate_locator, validate_running_instance_json,\n'''
-          if old not in s: raise SystemExit('capture import marker missing')
+          s = s.replace('''    ProjectDiskPhysicalReceiptDocument, ReceiptCommandEvidence, same_entry_binding,\n    valid_git_commit, validate_absolute_path, validate_locator,\n''', '''    ProjectDiskPhysicalReceiptDocument, ReceiptCommandEvidence, same_entry_binding,\n    valid_git_commit, validate_absolute_path, validate_locator, validate_running_instance_json,\n''', 1)
+          s = s.replace('''mod fs_evidence;\n\nuse fs_evidence::{\n''', '''mod executable;\nmod fs_evidence;\n\nuse executable::{HeldExecutable, capture_held_executable};\nuse fs_evidence::{\n''', 1)
+          marker = '''    let captured_at_unix_millis = SystemTime::now()\n'''
+          if marker not in s: raise SystemExit('capture start marker missing')
+          s = s.replace(marker, '''    let limactl_executable = capture_held_executable(&request.limactl_program)?;\n\n''' + marker, 1)
+          old = '''    let limactl_version = execute(\n        executor,\n        limactl_command(request).argument("--version"),\n        request.command_timeout,\n    )?;\n    let disk_list_json = execute(\n        executor,\n        limactl_command(request)\n            .argument("disk")\n            .argument("list")\n            .argument("--json"),\n        request.command_timeout,\n    )?;\n    let instance_list_json = execute(\n        executor,\n        limactl_command(request)\n            .argument("--tty=false")\n            .argument("list")\n            .argument("--format=json")\n            .argument("--all-fields")\n            .argument(request.resident_sandbox_instance.as_str()),\n        request.command_timeout,\n    )?;\n    let mountinfo = execute(\n        executor,\n        guest_command(request)\n            .argument("/usr/bin/cat")\n            .argument("/proc/self/mountinfo"),\n        request.command_timeout,\n    )?;\n    let block_devices_json = execute(\n        executor,\n        guest_command(request)\n            .argument("/usr/bin/lsblk")\n            .argument("--json")\n            .argument("--bytes")\n            .argument("--output")\n            .argument("NAME,KNAME,MAJ:MIN,TYPE,SIZE,MOUNTPOINTS"),\n        request.command_timeout,\n    )?;\n\n'''
+          new = '''    let limactl_version = execute_bound(\n        executor,\n        &limactl_executable,\n        limactl_command(request).argument("--version"),\n        request.command_timeout,\n    )?;\n    let disk_list_json = execute_bound(\n        executor,\n        &limactl_executable,\n        limactl_command(request)\n            .argument("disk")\n            .argument("list")\n            .argument("--json"),\n        request.command_timeout,\n    )?;\n    let instance_list_json = execute_bound(\n        executor,\n        &limactl_executable,\n        instance_list_command(request),\n        request.command_timeout,\n    )?;\n    validate_running_instance_json(\n        &instance_list_json.stdout,\n        request.resident_sandbox_instance.as_str(),\n        path_string(&request.lima_home)?,\n    )\n    .map_err(|_| capture_error(ProjectDiskPhysicalCaptureErrorKind::Receipt))?;\n\n    let mountinfo = execute_bound(\n        executor,\n        &limactl_executable,\n        guest_command(request)\n            .argument("/usr/bin/cat")\n            .argument("/proc/self/mountinfo"),\n        request.command_timeout,\n    )?;\n    let block_devices_json = execute_bound(\n        executor,\n        &limactl_executable,\n        guest_command(request)\n            .argument("/usr/bin/lsblk")\n            .argument("--json")\n            .argument("--bytes")\n            .argument("--output")\n            .argument("NAME,KNAME,MAJ:MIN,TYPE,SIZE,MOUNTPOINTS"),\n        request.command_timeout,\n    )?;\n    let final_instance_list_json = execute_bound(\n        executor,\n        &limactl_executable,\n        instance_list_command(request),\n        request.command_timeout,\n    )?;\n    validate_running_instance_json(\n        &final_instance_list_json.stdout,\n        request.resident_sandbox_instance.as_str(),\n        path_string(&request.lima_home)?,\n    )\n    .map_err(|_| capture_error(ProjectDiskPhysicalCaptureErrorKind::Receipt))?;\n    if final_instance_list_json.stdout != instance_list_json.stdout {\n        return Err(changed());\n    }\n\n'''
+          if old not in s: raise SystemExit('command observation block missing')
           s = s.replace(old, new, 1)
-          old = '''    let instance_list_json = execute(\n        executor,\n        limactl_command(request)\n            .argument("--tty=false")\n            .argument("list")\n            .argument("--format=json")\n            .argument("--all-fields")\n            .argument(request.resident_sandbox_instance.as_str()),\n        request.command_timeout,\n    )?;\n    let mountinfo = execute(\n'''
-          new = '''    let instance_list_json = execute(\n        executor,\n        instance_list_command(request),\n        request.command_timeout,\n    )?;\n    validate_running_instance_json(\n        &instance_list_json.stdout,\n        request.resident_sandbox_instance.as_str(),\n    )\n    .map_err(|_| capture_error(ProjectDiskPhysicalCaptureErrorKind::Receipt))?;\n    let mountinfo = execute(\n'''
-          if old not in s: raise SystemExit('initial instance block missing')
+          marker = '''    let document = ProjectDiskPhysicalReceiptDocument {\n'''
+          if marker not in s: raise SystemExit('document marker missing')
+          s = s.replace(marker, '''    let limactl_executable_evidence = limactl_executable.finish()?;\n\n''' + marker, 1)
+          old = '''            host_identity_digest: host_identity_after.identity().digest().as_str().to_owned(),\n            limactl_version: command_evidence(limactl_version),\n'''
+          new = '''            host_identity_digest: host_identity_after.identity().digest().as_str().to_owned(),\n            limactl_executable: limactl_executable_evidence,\n            limactl_version: command_evidence(limactl_version),\n'''
+          if old not in s: raise SystemExit('document executable marker missing')
           s = s.replace(old, new, 1)
-          marker = '''    let host_identity_after = LimaHostIdentityAdapter\n'''
-          addition = '''    let final_instance_list_json = execute(\n        executor,\n        instance_list_command(request),\n        request.command_timeout,\n    )?;\n    validate_running_instance_json(\n        &final_instance_list_json.stdout,\n        request.resident_sandbox_instance.as_str(),\n    )\n    .map_err(|_| capture_error(ProjectDiskPhysicalCaptureErrorKind::Receipt))?;\n    if final_instance_list_json.stdout != instance_list_json.stdout {\n        return Err(changed());\n    }\n\n'''
-          if marker not in s: raise SystemExit('host identity after marker missing')
-          s = s.replace(marker, addition + marker, 1)
           marker = '''fn limactl_command(request: &ProjectDiskPhysicalCaptureRequest) -> CommandSpec {\n'''
           helper = '''fn instance_list_command(request: &ProjectDiskPhysicalCaptureRequest) -> CommandSpec {\n    limactl_command(request)\n        .argument("--tty=false")\n        .argument("list")\n        .argument("--format=json")\n        .argument("--all-fields")\n        .argument(request.resident_sandbox_instance.as_str())\n}\n\n'''
           if marker not in s: raise SystemExit('limactl helper marker missing')
+          s = s.replace(marker, helper + marker, 1)
+          marker = '''fn execute(\n'''
+          helper = '''fn execute_bound(\n    executor: &impl TimedCommandExecutor,\n    executable: &HeldExecutable,\n    command: CommandSpec,\n    timeout: Duration,\n) -> Result<ExecutionRecord, ProjectDiskPhysicalCaptureError> {\n    executable.revalidate()?;\n    let record = execute(executor, command, timeout)?;\n    executable.revalidate()?;\n    Ok(record)\n}\n\n'''
+          if marker not in s: raise SystemExit('execute marker missing')
           s = s.replace(marker, helper + marker, 1)
           capture.write_text(s)
 
@@ -53,6 +213,14 @@ jobs:
           new = '''    same_entry_binding, valid_git_commit, validate_absolute_path, validate_locator,\n    validate_running_instance_json,\n};\n'''
           if old not in s: raise SystemExit('receipt reexport marker missing')
           s = s.replace(old, new, 1)
+          old = '''    pub(crate) host_identity_digest: String,\n    pub(crate) limactl_version: ReceiptCommandEvidence,\n'''
+          new = '''    pub(crate) host_identity_digest: String,\n    pub(crate) limactl_executable: ReceiptExecutableEvidence,\n    pub(crate) limactl_version: ReceiptCommandEvidence,\n'''
+          if old not in s: raise SystemExit('lima executable field marker missing')
+          s = s.replace(old, new, 1)
+          marker = '''#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]\n#[serde(deny_unknown_fields)]\npub struct ProjectDiskDirectoryEvidenceDocument {\n'''
+          struct = '''#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]\n#[serde(deny_unknown_fields)]\npub struct ReceiptExecutableEvidence {\n    pub(crate) path: String,\n    pub(crate) sha256: String,\n    pub(crate) before: ReceiptFilesystemSnapshot,\n    pub(crate) after: ReceiptFilesystemSnapshot,\n}\n\n'''
+          if marker not in s: raise SystemExit('executable struct insertion marker missing')
+          s = s.replace(marker, struct + marker, 1)
           old = '''    pub fn encode_private_json_pretty(&self) -> Result<Vec<u8>, ProjectDiskPhysicalReceiptError> {\n        serde_json::to_vec_pretty(&self.document)\n            .map_err(|_| malformed("document", "project_disk_receipt_encode_failed"))\n    }\n'''
           new = '''    pub fn encode_private_json_pretty(&self) -> Result<Vec<u8>, ProjectDiskPhysicalReceiptError> {\n        let bytes = serde_json::to_vec_pretty(&self.document)\n            .map_err(|_| malformed("document", "project_disk_receipt_encode_failed"))?;\n        if bytes.len() > MAX_PROJECT_DISK_PHYSICAL_RECEIPT_BYTES {\n            return Err(error(\n                ProjectDiskPhysicalReceiptErrorKind::TooLarge,\n                "document",\n                "project_disk_receipt_too_large",\n                "project disk physical receipt exceeds the bounded size",\n            ));\n        }\n        Ok(bytes)\n    }\n'''
           if old not in s: raise SystemExit('pretty encoder marker missing')
@@ -60,24 +228,39 @@ jobs:
 
           validate = Path('src/bin/project_disk_physical_receipt/receipt/validate.rs')
           s = validate.read_text()
-          old = '''use serde_json::Value;\n'''
-          new = '''use serde::Deserialize;\nuse serde_json::Value;\n'''
-          if old not in s: raise SystemExit('validate import marker missing')
+          s = s.replace('use serde_json::Value;\n', 'use serde::Deserialize;\nuse serde_json::Value;\n', 1)
+          old = '''    Sha256Digest::parse(&document.lima.host_identity_digest)\n        .map_err(|_| invalid_field("lima.host_identity_digest"))?;\n\n    validate_command'''
+          new = '''    Sha256Digest::parse(&document.lima.host_identity_digest)\n        .map_err(|_| invalid_field("lima.host_identity_digest"))?;\n    validate_executable(&document.lima.limactl_executable)?;\n\n    validate_command'''
+          if old not in s: raise SystemExit('validate executable call marker missing')
           s = s.replace(old, new, 1)
           old = '''    validate_json_stdout(&document.lima.instance_list_json, "lima.instance_list_json")?;\n'''
-          new = '''    validate_json_stdout(&document.lima.instance_list_json, "lima.instance_list_json")?;\n    validate_running_instance_json(\n        &document.lima.instance_list_json.stdout,\n        &document.lima.resident_sandbox_instance,\n    )?;\n'''
-          if old not in s: raise SystemExit('instance validation marker missing')
+          new = '''    validate_json_stdout(&document.lima.instance_list_json, "lima.instance_list_json")?;\n    validate_running_instance_json(\n        &document.lima.instance_list_json.stdout,\n        &document.lima.resident_sandbox_instance,\n        &document.lima.lima_home,\n    )?;\n'''
+          if old not in s: raise SystemExit('running instance validation marker missing')
+          s = s.replace(old, new, 1)
+          marker = '''fn validate_directory(\n'''
+          helper = '''fn validate_executable(\n    executable: &ReceiptExecutableEvidence,\n) -> Result<(), ProjectDiskPhysicalReceiptError> {\n    validate_absolute_path(&executable.path, "lima.limactl_executable.path")?;\n    Sha256Digest::parse(&executable.sha256)\n        .map_err(|_| invalid_field("lima.limactl_executable.sha256"))?;\n    validate_snapshot(&executable.before, "lima.limactl_executable")?;\n    validate_snapshot(&executable.after, "lima.limactl_executable")?;\n    if executable.before != executable.after {\n        return Err(changed("lima.limactl_executable"));\n    }\n    if executable.before.mode & 0o170000 != 0o100000\n        || executable.before.mode & 0o111 == 0\n        || executable.before.mode & 0o022 != 0\n        || executable.before.links != 1\n        || executable.before.logical_bytes == 0\n    {\n        return Err(invalid_field("lima.limactl_executable"));\n    }\n    Ok(())\n}\n\n'''
+          if marker not in s: raise SystemExit('validate executable helper marker missing')
+          s = s.replace(marker, helper + marker, 1)
+          old = '''    let program = document\n        .lima\n        .limactl_version\n        .argv\n        .first()\n        .ok_or_else(|| invalid_field("lima.limactl_version"))?;\n    validate_absolute_path(program, "lima.limactl_version")?;\n'''
+          new = '''    let program = document.lima.limactl_executable.path.as_str();\n    validate_absolute_path(program, "lima.limactl_executable.path")?;\n'''
+          if old not in s: raise SystemExit('command program marker missing')
           s = s.replace(old, new, 1)
           marker = '''const fn invalid_json_evidence(field: &'static str) -> ProjectDiskPhysicalReceiptError {\n'''
-          helper = '''#[derive(Deserialize)]\nstruct RuntimeInstanceEvidence {\n    name: String,\n    status: String,\n    #[serde(default)]\n    errors: Vec<String>,\n}\n\npub(crate) fn validate_running_instance_json(\n    stdout: &str,\n    expected_instance: &str,\n) -> Result<(), ProjectDiskPhysicalReceiptError> {\n    let mut deserializer = serde_json::Deserializer::from_str(stdout);\n    let evidence = RuntimeInstanceEvidence::deserialize(&mut deserializer)\n        .map_err(|_| invalid_json_evidence("lima.instance_list_json"))?;\n    deserializer\n        .end()\n        .map_err(|_| invalid_json_evidence("lima.instance_list_json"))?;\n    if evidence.name != expected_instance || evidence.status != "Running" || !evidence.errors.is_empty() {\n        return Err(invalid_json_evidence("lima.instance_list_json"));\n    }\n    Ok(())\n}\n\n'''
-          if marker not in s: raise SystemExit('json helper marker missing')
-          validate.write_text(s.replace(marker, helper + marker, 1))
+          helper = '''#[derive(Deserialize)]\nstruct RuntimeInstanceEvidence {\n    name: String,\n    status: String,\n    #[serde(rename = "dir")]\n    directory: String,\n    #[serde(rename = "vmType")]\n    vm_type: String,\n    arch: String,\n    cpus: u64,\n    memory: u64,\n    disk: u64,\n    #[serde(default)]\n    errors: Vec<String>,\n}\n\npub(crate) fn validate_running_instance_json(\n    stdout: &str,\n    expected_instance: &str,\n    lima_home: &str,\n) -> Result<(), ProjectDiskPhysicalReceiptError> {\n    let Some(line) = stdout.strip_suffix('\\n') else {\n        return Err(invalid_json_evidence("lima.instance_list_json"));\n    };\n    if line.is_empty() || line.contains('\\n') || line.contains('\\r') {\n        return Err(invalid_json_evidence("lima.instance_list_json"));\n    }\n    let mut deserializer = serde_json::Deserializer::from_str(line);\n    let evidence = RuntimeInstanceEvidence::deserialize(&mut deserializer)\n        .map_err(|_| invalid_json_evidence("lima.instance_list_json"))?;\n    deserializer\n        .end()\n        .map_err(|_| invalid_json_evidence("lima.instance_list_json"))?;\n    let expected_directory = Path::new(lima_home).join(expected_instance);\n    if evidence.name != expected_instance\n        || evidence.status != "Running"\n        || Path::new(&evidence.directory) != expected_directory\n        || evidence.vm_type != "vz"\n        || evidence.arch != "aarch64"\n        || evidence.cpus == 0\n        || evidence.memory == 0\n        || evidence.disk == 0\n        || !evidence.errors.is_empty()\n    {\n        return Err(invalid_json_evidence("lima.instance_list_json"));\n    }\n    Ok(())\n}\n\n'''
+          if marker not in s: raise SystemExit('running helper marker missing')
+          s = s.replace(marker, helper + marker, 1)
+          validate.write_text(s)
 
           tests = Path('src/bin/project_disk_physical_receipt/receipt/tests.rs')
           s = tests.read_text()
-          old = '''            "instance_list_json": command(&["/opt/homebrew/bin/limactl", "--tty=false", "list", "--format=json", "--all-fields", "smolrunner"], "[{\\"name\\":\\"smolrunner\\"}]\\n")\n'''
-          new = '''            "instance_list_json": command(&["/opt/homebrew/bin/limactl", "--tty=false", "list", "--format=json", "--all-fields", "smolrunner"], "{\\"name\\":\\"smolrunner\\",\\"status\\":\\"Running\\",\\"errors\\":[]}\\n")\n'''
-          if old not in s: raise SystemExit('fixture instance marker missing')
+          old = '''            "host_identity_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",\n            "limactl_version": command'''
+          new = '''            "host_identity_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",\n            "limactl_executable": {\n                "path": "/opt/homebrew/Cellar/lima/1/bin/limactl",\n                "sha256": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",\n                "before": snapshot(0o100755, 9, 1024, 4096),\n                "after": snapshot(0o100755, 9, 1024, 4096)\n            },\n            "limactl_version": command'''
+          if old not in s: raise SystemExit('fixture executable marker missing')
+          s = s.replace(old, new, 1)
+          s = s.replace('/opt/homebrew/bin/limactl', '/opt/homebrew/Cellar/lima/1/bin/limactl')
+          old = '''"[{\\"name\\":\\"smolrunner\\"}]\\n"'''
+          new = '''"{\\"name\\":\\"smolrunner\\",\\"status\\":\\"Running\\",\\"dir\\":\\"/Users/operator/.lima/smolrunner\\",\\"vmType\\":\\"vz\\",\\"arch\\":\\"aarch64\\",\\"cpus\\":4,\\"memory\\":8589934592,\\"disk\\":107374182400,\\"errors\\":[]}\\n"'''
+          if old not in s: raise SystemExit('fixture instance JSON marker missing')
           s = s.replace(old, new, 1)
           addition = r'''
 
@@ -85,13 +268,20 @@ jobs:
 fn refuses_non_running_or_mismatched_exact_instance_evidence() {
     for (field, value) in [("status", "Stopped"), ("name", "other-instance")] {
         let mut document = fixture();
-        let mut instance = serde_json::Map::new();
-        instance.insert("name".to_owned(), json!("smolrunner"));
-        instance.insert("status".to_owned(), json!("Running"));
-        instance.insert("errors".to_owned(), json!([]));
-        instance.insert(field.to_owned(), json!(value));
+        let mut instance = json!({
+            "name": "smolrunner",
+            "status": "Running",
+            "dir": "/Users/operator/.lima/smolrunner",
+            "vmType": "vz",
+            "arch": "aarch64",
+            "cpus": 4,
+            "memory": 8589934592_u64,
+            "disk": 107374182400_u64,
+            "errors": []
+        });
+        instance[field] = json!(value);
         document["lima"]["instance_list_json"]["stdout"] =
-            json!(format!("{}\n", Value::Object(instance)));
+            json!(format!("{}\n", instance));
         assert_eq!(
             decode(&document)
                 .expect_err("non-running or mismatched instance must fail")
@@ -99,6 +289,37 @@ fn refuses_non_running_or_mismatched_exact_instance_evidence() {
             ProjectDiskPhysicalReceiptErrorKind::InvalidJsonEvidence
         );
     }
+}
+
+#[test]
+fn refuses_unbound_or_changed_limactl_executable_evidence() {
+    let mut changed = fixture();
+    changed["lima"]["limactl_executable"]["after"]["inode"] = json!(999);
+    assert_eq!(
+        decode(&changed)
+            .expect_err("changed executable identity must fail")
+            .kind(),
+        ProjectDiskPhysicalReceiptErrorKind::ChangedDuringObservation
+    );
+
+    let mut writable = fixture();
+    writable["lima"]["limactl_executable"]["before"]["mode"] = json!(0o100777);
+    writable["lima"]["limactl_executable"]["after"]["mode"] = json!(0o100777);
+    assert_eq!(
+        decode(&writable)
+            .expect_err("group/other writable executable must fail")
+            .kind(),
+        ProjectDiskPhysicalReceiptErrorKind::InvalidField
+    );
+
+    let mut substituted = fixture();
+    substituted["lima"]["disk_list_json"]["argv"][0] = json!("/tmp/fake-limactl");
+    assert_eq!(
+        decode(&substituted)
+            .expect_err("command program must equal bound executable")
+            .kind(),
+        ProjectDiskPhysicalReceiptErrorKind::InvalidField
+    );
 }
 
 #[test]
@@ -116,6 +337,13 @@ fn pretty_encoding_enforces_the_private_receipt_size_limit() {
 }
 '''
           tests.write_text(s + addition)
+
+          docs = Path('docs/PROJECT_DISK_PHYSICAL_RECEIPT.md')
+          s = docs.read_text()
+          note = '''\n## Capture boundary hardening\n\nThe `--limactl` argument must name the resolved regular executable itself, not a symlink locator. The collector opens that exact file with no-follow semantics, requires a single-link executable that is not group/other writable, records its SHA-256 plus descriptor snapshot, and revalidates the same bytes/path binding before and after every Lima command. The receipt remains evidence only; the observed digest gains no authority until reviewed/accepted by the owning #565 generation.\n\nGuest reads run only after the exact-instance `limactl list --format=json --all-fields` document proves the requested VZ/aarch64 instance is `Running` with complete non-error evidence. The collector repeats the same exact instance query after guest reads and requires byte-for-byte equality before accepting the receipt. A stopped, transitioning, broken, substituted, or drifting instance blocks capture.\n\nThe bytes actually written are subject to the same 2 MiB ceiling as the strict decoder.\n'''
+          if '## Capture boundary hardening' not in s:
+              s += note
+          docs.write_text(s)
           PY
 
           rm .github/workflows/research-repair-project-disk-receipt.yml
@@ -128,6 +356,6 @@ fn pretty_encoding_enforces_the_private_receipt_size_limit() {
           git diff --check
           git config user.name "smolrunner-research-repair"
           git config user.email "actions@users.noreply.github.com"
-          git add src/bin/project_disk_physical_receipt .github/workflows/research-repair-project-disk-receipt.yml
-          git commit -m "Repair project-disk receipt observation boundary"
+          git add src/bin/project_disk_physical_receipt docs/PROJECT_DISK_PHYSICAL_RECEIPT.md .github/workflows/research-repair-project-disk-receipt.yml
+          git commit -m "Repair project-disk physical receipt evidence boundary"
           git push origin HEAD:bean/565-p2-physical-receipt
