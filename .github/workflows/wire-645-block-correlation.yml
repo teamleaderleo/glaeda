@@ -1,0 +1,47 @@
+name: Wire project block-device correlation
+
+on:
+  push:
+    branches:
+      - chatgpt/645-block-device-correlation
+
+permissions:
+  contents: write
+
+jobs:
+  wire:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: chatgpt/645-block-device-correlation
+          fetch-depth: 0
+          show-progress: false
+      - name: Export module
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('src/lib.rs')
+          text = path.read_text()
+          anchor = '/// Opaque project-disk/filesystem correlation gate for trusted resident Linux mutation.\npub mod trusted_project_filesystem_correlation;\n'
+          replacement = '/// Guest correlation of one exact whole block device with the mounted project filesystem.\npub mod trusted_project_block_device_correlation;\n' + anchor
+          if text.count(anchor) != 1:
+              raise SystemExit('unexpected correlation export anchor')
+          path.write_text(text.replace(anchor, replacement))
+          PY
+      - name: Format and remove helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.97.1 --profile minimal --component rustfmt --no-self-update
+          cargo fmt --all
+          rm .github/workflows/wire-645-block-correlation.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "#645 wire project block-device correlation"
+          git push origin HEAD:chatgpt/645-block-device-correlation
