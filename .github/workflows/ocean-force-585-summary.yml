@@ -1,0 +1,111 @@
+name: Ocean force 585 summary
+
+on:
+  push:
+    branches:
+      - ocean/immutable-git-pool-observer
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+      - name: Apply bounded receipt edit
+        shell: python
+        run: |
+          from pathlib import Path
+          p = Path("src/immutable_git_object_pool_observation.rs")
+          s = p.read_text()
+
+          def one(before, after):
+              global s
+              if s.count(before) != 1:
+                  raise SystemExit(f"unexpected match count for {before[:80]!r}: {s.count(before)}")
+              s = s.replace(before, after, 1)
+
+          one("use crate::immutable_git_object_pool::GitObjectPoolBinding;\n",
+              "use crate::artifact::Sha256Digest;\nuse crate::immutable_git_object_pool::{GitObjectFormat, GitObjectPoolBinding, GitObjectPoolGeneration};\n")
+          one("    ImmutableGitObjectPoolMarker,\n",
+              "    ImmutableGitObjectPoolMarker, git_object_pool_binding_digest,\n")
+
+          start = s.index("#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]\n#[serde(rename_all = \"snake_case\")]\npub enum ImmutableGitObjectPoolObservationDisposition")
+          end = s.index("\n\n/// Opaque descriptor lease", start)
+          replacement = r'''#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImmutableGitObjectPoolObservationDisposition {
+    RootOwnedFrozen,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ImmutableGitObjectPoolObservationSummary {
+    schema_version: u8,
+    disposition: ImmutableGitObjectPoolObservationDisposition,
+    generation: GitObjectPoolGeneration,
+    object_format: GitObjectFormat,
+    binding_digest: Sha256Digest,
+    marker_schema_version: u8,
+    marker_matched: bool,
+    retained_directory_descriptors: u8,
+    retained_objects_descriptor: bool,
+    retained_marker_descriptor: bool,
+    same_filesystem_device: bool,
+    nested_alternates_absent: bool,
+}
+
+impl ImmutableGitObjectPoolObservationSummary {
+    #[must_use]
+    pub const fn schema_version(&self) -> u8 { self.schema_version }
+    #[must_use]
+    pub const fn disposition(&self) -> ImmutableGitObjectPoolObservationDisposition { self.disposition }
+    #[must_use]
+    pub const fn generation(&self) -> GitObjectPoolGeneration { self.generation }
+    #[must_use]
+    pub const fn object_format(&self) -> GitObjectFormat { self.object_format }
+    #[must_use]
+    pub const fn binding_digest(&self) -> &Sha256Digest { &self.binding_digest }
+    #[must_use]
+    pub const fn marker_schema_version(&self) -> u8 { self.marker_schema_version }
+    #[must_use]
+    pub const fn marker_matched(&self) -> bool { self.marker_matched }
+    #[must_use]
+    pub const fn retained_directory_descriptors(&self) -> u8 { self.retained_directory_descriptors }
+    #[must_use]
+    pub const fn retained_objects_descriptor(&self) -> bool { self.retained_objects_descriptor }
+    #[must_use]
+    pub const fn retained_marker_descriptor(&self) -> bool { self.retained_marker_descriptor }
+    #[must_use]
+    pub const fn same_filesystem_device(&self) -> bool { self.same_filesystem_device }
+    #[must_use]
+    pub const fn nested_alternates_absent(&self) -> bool { self.nested_alternates_absent }
+}'''
+          s = s[:start] + replacement + s[end:]
+
+          one("    pub const fn summary(&self) -> ImmutableGitObjectPoolObservationSummary {\n        self.summary\n    }\n",
+              "    pub const fn summary(&self) -> &ImmutableGitObjectPoolObservationSummary {\n        &self.summary\n    }\n")
+          one("    let marker = BoundMarker::open(&root.fd, authority_owner, binding)?;\n\n    let retained_directory_descriptors",
+              "    let marker = BoundMarker::open(&root.fd, authority_owner, binding)?;\n    let binding_digest = git_object_pool_binding_digest(binding).map_err(|_| marker_mismatch())?;\n\n    let retained_directory_descriptors")
+          one("            disposition: ImmutableGitObjectPoolObservationDisposition::OwnershipEnvelopeObserved,\n            marker_schema_version: IMMUTABLE_GIT_OBJECT_POOL_MARKER_SCHEMA_VERSION,\n            retained_directory_descriptors,\n            retained_marker_descriptor: true,",
+              "            disposition: ImmutableGitObjectPoolObservationDisposition::RootOwnedFrozen,\n            generation: binding.generation(),\n            object_format: binding.object_format(),\n            binding_digest,\n            marker_schema_version: IMMUTABLE_GIT_OBJECT_POOL_MARKER_SCHEMA_VERSION,\n            marker_matched: true,\n            retained_directory_descriptors,\n            retained_objects_descriptor: true,\n            retained_marker_descriptor: true,")
+          one("    use crate::immutable_git_object_pool_marker::{\n        GitObjectPoolMarkerNonce, ImmutableGitObjectPoolMarker,\n    };",
+              "    use crate::immutable_git_object_pool_marker::{\n        GitObjectPoolMarkerNonce, ImmutableGitObjectPoolMarker, git_object_pool_binding_digest,\n    };")
+          one("            ImmutableGitObjectPoolObservationDisposition::OwnershipEnvelopeObserved\n        );\n        assert_eq!(observation.summary().retained_directory_descriptors(), 4);\n        assert!(observation.summary().retained_marker_descriptor());",
+              "            ImmutableGitObjectPoolObservationDisposition::RootOwnedFrozen\n        );\n        assert_eq!(observation.summary().generation(), expected.generation());\n        assert_eq!(observation.summary().object_format(), expected.object_format());\n        assert_eq!(observation.summary().binding_digest(), &git_object_pool_binding_digest(&expected).unwrap());\n        assert!(observation.summary().marker_matched());\n        assert_eq!(observation.summary().retained_directory_descriptors(), 4);\n        assert!(observation.summary().retained_objects_descriptor());\n        assert!(observation.summary().retained_marker_descriptor());")
+          p.write_text(s)
+      - name: Format, remove helpers, and publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all
+          rm -f .github/workflows/ocean-tighten-585-summary.yml
+          rm -f .github/workflows/ocean-force-585-summary.yml
+          git config user.name "ocean-smolrunner"
+          git config user.email "ocean-smolrunner@users.noreply.github.com"
+          git add src/immutable_git_object_pool_observation.rs .github/workflows/ocean-tighten-585-summary.yml .github/workflows/ocean-force-585-summary.yml
+          git diff --cached --check
+          git commit -m "Complete immutable pool observation receipt"
+          git push origin HEAD:${GITHUB_REF_NAME}
