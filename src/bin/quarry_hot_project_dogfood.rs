@@ -37,7 +37,7 @@ enum Command {
     /// Emit the frozen experiment contract. Performs no host or guest mutation.
     Plan(PlanArgs),
     /// Wrap already-owned benchmark observations in a bounded receipt.
-    Sample(SampleArgs),
+    Sample(Box<SampleArgs>),
 }
 
 #[derive(Debug, Args)]
@@ -258,7 +258,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     match cli.command {
         Command::Plan(args) => render(&build_plan(args)?, cli.output)?,
         Command::Sample(args) => {
-            let sample = build_sample(args)?;
+            let sample = build_sample(*args)?;
             match cli.output {
                 OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&sample)?),
                 OutputFormat::Human => {
