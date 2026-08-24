@@ -6,7 +6,8 @@ use serde::Serialize;
 use crate::artifact::{CommitId, GitTreeId, Sha256Digest};
 use crate::project_catalog::ProjectIdentity;
 use crate::project_disk_lease::{
-    ProjectDiskGeneration, ProjectDiskId, ResidentSandboxGeneration, ResidentSandboxId,
+    ProjectDiskAttachmentGeneration, ProjectDiskGeneration, ProjectDiskId, ProjectDiskRevision,
+    ResidentSandboxGeneration, ResidentSandboxId,
 };
 
 pub const TRUSTED_OVERLAY_TASK_VIEW_SCHEMA_VERSION: u8 = 1;
@@ -85,8 +86,10 @@ pub struct OverlaySourceAnchorBinding {
     project: ProjectIdentity,
     disk_id: ProjectDiskId,
     disk_generation: ProjectDiskGeneration,
+    disk_revision: ProjectDiskRevision,
     resident_sandbox_id: ResidentSandboxId,
     resident_sandbox_generation: ResidentSandboxGeneration,
+    attachment_generation: ProjectDiskAttachmentGeneration,
     anchor_id: OverlaySourceAnchorId,
     anchor_generation: OverlaySourceAnchorGeneration,
     commit: CommitId,
@@ -101,8 +104,10 @@ impl OverlaySourceAnchorBinding {
         project: ProjectIdentity,
         disk_id: ProjectDiskId,
         disk_generation: ProjectDiskGeneration,
+        disk_revision: ProjectDiskRevision,
         resident_sandbox_id: ResidentSandboxId,
         resident_sandbox_generation: ResidentSandboxGeneration,
+        attachment_generation: ProjectDiskAttachmentGeneration,
         anchor_id: OverlaySourceAnchorId,
         anchor_generation: OverlaySourceAnchorGeneration,
         commit: CommitId,
@@ -113,8 +118,10 @@ impl OverlaySourceAnchorBinding {
             project,
             disk_id,
             disk_generation,
+            disk_revision,
             resident_sandbox_id,
             resident_sandbox_generation,
+            attachment_generation,
             anchor_id,
             anchor_generation,
             commit,
@@ -138,6 +145,16 @@ impl OverlaySourceAnchorBinding {
         self.disk_generation
     }
 
+    /// Exact project-disk lease revision this anchor was prepared against.
+    ///
+    /// A detach/reattach cycle or any other single-writer transition moves the revision, so a
+    /// binding pinned to a stale revision can never compare equal to one prepared against the
+    /// successor record (#640 finding 1).
+    #[must_use]
+    pub const fn disk_revision(&self) -> ProjectDiskRevision {
+        self.disk_revision
+    }
+
     #[must_use]
     pub const fn resident_sandbox_id(&self) -> &ResidentSandboxId {
         &self.resident_sandbox_id
@@ -146,6 +163,16 @@ impl OverlaySourceAnchorBinding {
     #[must_use]
     pub const fn resident_sandbox_generation(&self) -> ResidentSandboxGeneration {
         self.resident_sandbox_generation
+    }
+
+    /// Exact project-disk attachment generation this anchor was prepared against.
+    ///
+    /// Detaching and reattaching the same disk to the same sandbox mints a new monotonic
+    /// attachment generation, so anchors from different attachments stay distinguishable and
+    /// stale-attachment reuse fails closed on structural equality (#640 finding 1).
+    #[must_use]
+    pub const fn attachment_generation(&self) -> ProjectDiskAttachmentGeneration {
+        self.attachment_generation
     }
 
     #[must_use]
@@ -939,7 +966,8 @@ mod tests {
     use crate::artifact::{CommitId, GitTreeId, Sha256Digest};
     use crate::project_catalog::ProjectIdentity;
     use crate::project_disk_lease::{
-        ProjectDiskGeneration, ProjectDiskId, ResidentSandboxGeneration, ResidentSandboxId,
+        ProjectDiskAttachmentGeneration, ProjectDiskGeneration, ProjectDiskId, ProjectDiskRevision,
+        ResidentSandboxGeneration, ResidentSandboxId,
     };
 
     fn binding() -> OverlaySourceAnchorBinding {
@@ -947,8 +975,10 @@ mod tests {
             ProjectIdentity::parse("github.com/teamleaderleo/smolrunner").unwrap(),
             ProjectDiskId::parse("smolrunner-project-disk").unwrap(),
             ProjectDiskGeneration::new(1).unwrap(),
+            ProjectDiskRevision::new(2).unwrap(),
             ResidentSandboxId::parse("resident-a").unwrap(),
             ResidentSandboxGeneration::new(1).unwrap(),
+            ProjectDiskAttachmentGeneration::new(7).unwrap(),
             OverlaySourceAnchorId::parse("anchor-a").unwrap(),
             OverlaySourceAnchorGeneration::new(1).unwrap(),
             CommitId::parse("1111111111111111111111111111111111111111").unwrap(),
@@ -965,6 +995,50 @@ mod tests {
             OverlayTaskViewId::parse(name).unwrap(),
             OverlayTaskViewGeneration::new(generation).unwrap(),
         )
+    }
+
+    #[test]
+    fn source_anchor_bindings_distinguish_detach_reattach_attachments() {
+        let base = binding();
+        assert_eq!(base.disk_revision().get(), 2);
+        assert_eq!(base.attachment_generation().get(), 7);
+
+        let reattached = OverlaySourceAnchorBinding::new(
+            base.project().clone(),
+            base.disk_id().clone(),
+            base.disk_generation(),
+            base.disk_revision(),
+            base.resident_sandbox_id().clone(),
+            base.resident_sandbox_generation(),
+            ProjectDiskAttachmentGeneration::new(base.attachment_generation().get() + 1).unwrap(),
+            base.anchor_id().clone(),
+            base.anchor_generation(),
+            base.commit().clone(),
+            base.tree().clone(),
+            base.source_index_digest().clone(),
+        );
+        assert_ne!(base, reattached);
+        assert_eq!(reattached.attachment_generation().get(), 8);
+    }
+
+    #[test]
+    fn source_anchor_bindings_distinguish_stale_disk_revision() {
+        let base = binding();
+        let stale = OverlaySourceAnchorBinding::new(
+            base.project().clone(),
+            base.disk_id().clone(),
+            base.disk_generation(),
+            ProjectDiskRevision::new(1).unwrap(),
+            base.resident_sandbox_id().clone(),
+            base.resident_sandbox_generation(),
+            base.attachment_generation(),
+            base.anchor_id().clone(),
+            base.anchor_generation(),
+            base.commit().clone(),
+            base.tree().clone(),
+            base.source_index_digest().clone(),
+        );
+        assert_ne!(base, stale);
     }
 
     fn observation(
