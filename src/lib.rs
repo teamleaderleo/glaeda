@@ -256,6 +256,8 @@ pub mod project_checkout_observation;
 /// Read-only, bounded immediate-child discovery beneath one explicit project root.
 #[cfg(unix)]
 pub mod project_discovery;
+/// Pure identity vocabulary for one formatted project-disk filesystem generation.
+pub mod project_disk_filesystem;
 /// Pure crash-safe single-writer lease planning for resident trusted project disks.
 pub mod project_disk_lease;
 pub mod renderprove_artifact_binding;
@@ -300,6 +302,11 @@ pub mod state_document;
 pub mod state_store;
 #[cfg(target_os = "linux")]
 pub mod subordinate_id;
+/// Pure sealed task-private Git clone planning from exact hot-path leases.
+#[cfg(target_os = "linux")]
+pub mod task_private_git_clone_plan;
+/// Pure reviewed identity for one resident Linux guest-control executable generation.
+pub mod trusted_guest_control_binary_generation;
 /// Pure sealed one-shot invocation plan for resident Linux guest-control transactions.
 pub mod trusted_guest_control_invocation_plan;
 /// Pure canonical one-shot protocol envelope for resident Linux guest-control transactions.
@@ -314,6 +321,8 @@ pub mod trusted_overlay_mount_plan;
 pub mod trusted_overlay_task_view;
 /// Opaque project-disk/filesystem correlation gate for trusted resident Linux mutation.
 pub mod trusted_project_filesystem_correlation;
+/// Read-only guest correlation of one held project-filesystem device with exact mountinfo evidence.
+pub mod trusted_project_filesystem_guest_observation;
 /// Descriptor-relative trusted producer for runner workspace and cache identity receipts.
 #[cfg(target_os = "linux")]
 pub mod trusted_workspace_receipt;

@@ -1079,7 +1079,8 @@ mod tests {
     use crate::descriptor_bound_launcher::ReviewedFilesystemIdentity;
     use crate::project_catalog::ProjectIdentity;
     use crate::project_disk_lease::{
-        ProjectDiskGeneration, ProjectDiskId, ResidentSandboxGeneration, ResidentSandboxId,
+        ProjectDiskAttachmentGeneration, ProjectDiskGeneration, ProjectDiskId, ProjectDiskRevision,
+        ResidentSandboxGeneration, ResidentSandboxId,
     };
     use crate::trusted_overlay_task_view::{
         OverlayGitProofObservation, OverlayGitWorktreeObservation, OverlayIndexObservation,
@@ -1129,8 +1130,10 @@ mod tests {
             ProjectIdentity::parse("github.com/teamleaderleo/smolrunner").unwrap(),
             ProjectDiskId::parse("project-disk").unwrap(),
             ProjectDiskGeneration::new(1).unwrap(),
+            ProjectDiskRevision::new(2).unwrap(),
             ResidentSandboxId::parse("sandbox-a").unwrap(),
             ResidentSandboxGeneration::new(1).unwrap(),
+            ProjectDiskAttachmentGeneration::new(4).unwrap(),
             OverlaySourceAnchorId::parse("anchor-a").unwrap(),
             OverlaySourceAnchorGeneration::new(1).unwrap(),
             CommitId::parse("1111111111111111111111111111111111111111").unwrap(),

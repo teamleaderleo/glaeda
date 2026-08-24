@@ -8,6 +8,7 @@ license = "Apache-2.0"
 keywords = ["github-actions", "self-hosted", "runner", "podman", "devops"]
 categories = ["command-line-utilities", "development-tools"]
 publish = false
+default-run = "smolrunner"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

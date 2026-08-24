@@ -680,7 +680,7 @@ mod tests {
     use crate::artifact::{CommitId, GitTreeId, Sha256Digest};
     use crate::project_catalog::ProjectIdentity;
     use crate::project_disk_lease::{
-        ProjectDiskAttachmentGeneration, ProjectDiskGeneration, ProjectDiskId,
+        ProjectDiskAttachmentGeneration, ProjectDiskGeneration, ProjectDiskId, ProjectDiskRevision,
         ResidentSandboxGeneration, ResidentSandboxId,
     };
     use crate::trusted_overlay_mount_plan::{
@@ -743,8 +743,10 @@ mod tests {
             ProjectIdentity::parse("github.com/teamleaderleo/smolrunner").unwrap(),
             ProjectDiskId::parse("disk-a").unwrap(),
             ProjectDiskGeneration::new(3).unwrap(),
+            ProjectDiskRevision::new(4).unwrap(),
             ResidentSandboxId::parse("sandbox-a").unwrap(),
             ResidentSandboxGeneration::new(11).unwrap(),
+            ProjectDiskAttachmentGeneration::new(7).unwrap(),
             OverlaySourceAnchorId::parse("anchor-a").unwrap(),
             OverlaySourceAnchorGeneration::new(5).unwrap(),
             CommitId::parse("0123456789abcdef0123456789abcdef01234567").unwrap(),
@@ -783,7 +785,6 @@ mod tests {
     ) -> TrustedProjectFilesystemCorrelationProof {
         TrustedProjectFilesystemCorrelationProof::for_test(
             anchor.binding(),
-            ProjectDiskAttachmentGeneration::new(9).unwrap(),
             TrustedProjectFilesystemCorrelationGeneration::new(13).unwrap(),
             device,
         )
