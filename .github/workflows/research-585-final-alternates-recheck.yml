@@ -24,16 +24,18 @@ jobs:
           set -euo pipefail
           python3 - <<'PY'
           from pathlib import Path
+          import re
 
           p = Path('src/immutable_git_object_pool_observation.rs')
           s = p.read_text()
-          old = '''    observation
-              .marker
-              .revalidate(&observation.root.fd, authority_owner, binding)?;
-
-              observation.objects.revalidate_frozen(authority_owner)?;
-          '''
-          new = '''    observation
+          pattern = re.compile(
+              r'(?m)^    observation\n'
+              r'        \.marker\n'
+              r'        \.revalidate\(&observation\.root\.fd, authority_owner, binding\)\?;\n'
+              r'\n'
+              r'    observation\.objects\.revalidate_frozen\(authority_owner\)\?;\n'
+          )
+          replacement = '''    observation
               .marker
               .revalidate(&observation.root.fd, authority_owner, binding)?;
               require_nested_alternates_absent(
@@ -44,9 +46,10 @@ jobs:
 
               observation.objects.revalidate_frozen(authority_owner)?;
           '''
-          if s.count(old) != 1:
-              raise SystemExit(f'final alternates seam count={s.count(old)}')
-          p.write_text(s.replace(old, new, 1))
+          s2, count = pattern.subn(replacement, s, count=1)
+          if count != 1:
+              raise SystemExit(f'final alternates seam count={count}')
+          p.write_text(s2)
           PY
           cargo fmt --all
           cargo fmt --all -- --check
