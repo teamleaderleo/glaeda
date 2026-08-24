@@ -199,11 +199,11 @@ pub fn audit_immutable_git_object_pool_generation_candidate(
     }
     candidate_root.revalidate()?;
 
-    if source
-        .regular_file_inodes
-        .iter()
-        .any(|identity| candidate_objects_audit.regular_file_inodes.contains(identity))
-    {
+    if source.regular_file_inodes.iter().any(|identity| {
+        candidate_objects_audit
+            .regular_file_inodes
+            .contains(identity)
+    }) {
         return Err(shared_inode());
     }
     if candidate.has_multiple_links || candidate_objects_audit.has_multiple_links {
@@ -467,12 +467,7 @@ fn require_nested_alternates_absent(
     objects: &BoundDirectory,
 ) -> Result<(), ImmutableGitObjectPoolGenerationAuditError> {
     let before = snapshot_directory(&objects.fd)?;
-    let info = match rustix_fs::openat(
-        objects.fd.as_fd(),
-        "info",
-        DIRECTORY_FLAGS,
-        Mode::empty(),
-    ) {
+    let info = match rustix_fs::openat(objects.fd.as_fd(), "info", DIRECTORY_FLAGS, Mode::empty()) {
         Ok(fd) => Some(BoundDirectory {
             snapshot: snapshot_directory(&fd)?,
             fd,
@@ -507,9 +502,9 @@ fn open_absolute_directory(
     path: &Path,
 ) -> Result<OwnedFd, ImmutableGitObjectPoolGenerationAuditError> {
     if !path.is_absolute()
-        || path.components().any(|component| {
-            !matches!(component, Component::RootDir | Component::Normal(_))
-        })
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::RootDir | Component::Normal(_)))
     {
         return Err(invalid_path());
     }
