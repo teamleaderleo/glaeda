@@ -346,6 +346,11 @@ fn revalidate_observation(
     observation
         .marker
         .revalidate(&observation.root.fd, authority_owner, binding)?;
+    require_nested_alternates_absent(
+        &observation.objects,
+        observation.info.as_ref(),
+        authority_owner,
+    )?;
 
     observation.objects.revalidate_frozen(authority_owner)?;
     require_same_directory_entry(
