@@ -1,0 +1,100 @@
+name: Finalize immutable Git pool observation v2
+
+on:
+  push:
+    branches:
+      - codex/immutable-git-pool-observation-v2
+
+permissions:
+  contents: write
+
+jobs:
+  finalize:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: true
+          show-progress: false
+          fetch-depth: 0
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt --no-self-update
+      - name: Build reviewed observer, verify, and self-remove
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin codex/immutable-git-pool-observation
+          git show origin/codex/immutable-git-pool-observation:src/immutable_git_object_pool_observation.rs > src/immutable_git_object_pool_observation.rs
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/immutable_git_object_pool_observation.rs'); s=p.read_text()
+          s=s.replace('use rustix::io::Errno;', 'use rustix::io::{Errno, fcntl_dupfd_cloexec};', 1)
+          s=s.replace('rustix_fs::fcntl_dupfd_cloexec(base, 0)', 'fcntl_dupfd_cloexec(base, 0)', 1)
+          s=s.replace('allocated_bytes', 'accounted_blocks_bytes')
+          s=s.replace(
+              '/// generation boundary, not a per-command hot-path operation.',
+              '/// generation boundary, not a per-command hot-path operation. `accounted_blocks_bytes` is\n    /// the sum of per-entry `st_blocks * 512`; it is not unique physical-space accounting and may\n    /// double-count shared reflink extents. Physical volume deltas belong in #563 performance receipts.'
+          )
+
+          old='''    let objects_snapshot = snapshot_directory_fd(&objects)?;\n    require_frozen_directory(&objects_snapshot, expected_owner_uid, DIRECTORY_MODE)?;\n    require_no_nested_alternates(&root, expected_owner_uid)?;\n\n    let inventory = scan_stable_inventory(path, expected_owner_uid)?;'''
+          new='''    let objects_snapshot = snapshot_directory_fd(&objects)?;\n    require_frozen_directory(&objects_snapshot, expected_owner_uid, DIRECTORY_MODE)?;\n    if objects_snapshot.device != root_snapshot.device {\n        return Err(unsafe_filesystem());\n    }\n    require_no_nested_alternates(&root, expected_owner_uid)?;\n\n    let inventory = scan_stable_inventory(path, expected_owner_uid, root_snapshot.device)?;'''
+          if old not in s: raise SystemExit('objects/inventory point missing')
+          s=s.replace(old,new,1)
+
+          old='''        let inventory = scan_stable_inventory(&self.pool_path, 0)?;'''
+          new='''        let inventory = scan_stable_inventory(&self.pool_path, 0, self.root_snapshot.device)?;'''
+          if old not in s: raise SystemExit('confirmation inventory point missing')
+          s=s.replace(old,new,1)
+
+          old='''fn scan_stable_inventory(\n    pool: &Path,\n    expected_owner_uid: u32,\n) -> Result<InventoryObservation, ImmutableGitObjectPoolObservationError> {\n    let first = scan_inventory(pool, expected_owner_uid)?;\n    let second = scan_inventory(pool, expected_owner_uid)?;'''
+          new='''fn scan_stable_inventory(\n    pool: &Path,\n    expected_owner_uid: u32,\n    expected_device: u64,\n) -> Result<InventoryObservation, ImmutableGitObjectPoolObservationError> {\n    let first = scan_inventory(pool, expected_owner_uid, expected_device)?;\n    let second = scan_inventory(pool, expected_owner_uid, expected_device)?;'''
+          if old not in s: raise SystemExit('stable inventory signature missing')
+          s=s.replace(old,new,1)
+          old='''fn scan_inventory(\n    pool: &Path,\n    expected_owner_uid: u32,\n) -> Result<InventoryObservation, ImmutableGitObjectPoolObservationError> {'''
+          new='''fn scan_inventory(\n    pool: &Path,\n    expected_owner_uid: u32,\n    expected_device: u64,\n) -> Result<InventoryObservation, ImmutableGitObjectPoolObservationError> {'''
+          if old not in s: raise SystemExit('inventory signature missing')
+          s=s.replace(old,new,1)
+          s=s.replace('scan_entry(pool, pool, expected_owner_uid, 0, &mut state)?;', 'scan_entry(pool, pool, expected_owner_uid, expected_device, 0, &mut state)?;', 1)
+          old='''fn scan_entry(\n    pool: &Path,\n    path: &Path,\n    expected_owner_uid: u32,\n    depth: usize,'''
+          new='''fn scan_entry(\n    pool: &Path,\n    path: &Path,\n    expected_owner_uid: u32,\n    expected_device: u64,\n    depth: usize,'''
+          if old not in s: raise SystemExit('scan entry signature missing')
+          s=s.replace(old,new,1)
+          old='''    if metadata.uid() != expected_owner_uid {\n        return Err(unsafe_filesystem());\n    }'''
+          new='''    if metadata.uid() != expected_owner_uid || metadata.dev() != expected_device {\n        return Err(unsafe_filesystem());\n    }'''
+          if old not in s: raise SystemExit('entry ownership check missing')
+          s=s.replace(old,new,1)
+          s=s.replace('scan_entry(pool, &child.path(), expected_owner_uid, depth + 1, state)?;', 'scan_entry(\n                pool,\n                &child.path(),\n                expected_owner_uid,\n                expected_device,\n                depth + 1,\n                state,\n            )?;', 1)
+
+          old='''        let source = fixture.pool.join(OBJECTS_NAME).join("pack-a");\n        let alias = fixture.pool.join(OBJECTS_NAME).join("pack-b");\n        fs::hard_link(&source, &alias).unwrap();\n        fs::set_permissions(&alias, fs::Permissions::from_mode(FILE_MODE)).unwrap();'''
+          new='''        let objects = fixture.pool.join(OBJECTS_NAME);\n        let source = objects.join("pack-a");\n        let alias = objects.join("pack-b");\n        fs::set_permissions(&objects, fs::Permissions::from_mode(0o755)).unwrap();\n        fs::hard_link(&source, &alias).unwrap();\n        fs::set_permissions(&alias, fs::Permissions::from_mode(FILE_MODE)).unwrap();\n        fs::set_permissions(&objects, fs::Permissions::from_mode(0o555)).unwrap();'''
+          if old not in s: raise SystemExit('hardlink fixture point missing')
+          s=s.replace(old,new,1)
+
+          old='''        let symlink_path = fixture.pool.join("symlink");\n        symlink("HEAD", &symlink_path).unwrap();'''
+          new='''        let symlink_path = fixture.pool.join("symlink");\n        fs::set_permissions(&fixture.pool, fs::Permissions::from_mode(0o755)).unwrap();\n        symlink("HEAD", &symlink_path).unwrap();\n        fs::set_permissions(&fixture.pool, fs::Permissions::from_mode(0o555)).unwrap();'''
+          if old not in s: raise SystemExit('symlink fixture point missing')
+          s=s.replace(old,new,1)
+          old='''        fs::remove_file(&symlink_path).unwrap();\n\n        let alternates = fixture.pool.join(OBJECTS_NAME).join("info").join("alternates");\n        fs::write(&alternates, b"/other/objects\\n").unwrap();\n        fs::set_permissions(&alternates, fs::Permissions::from_mode(FILE_MODE)).unwrap();'''
+          new='''        fs::set_permissions(&fixture.pool, fs::Permissions::from_mode(0o755)).unwrap();\n        fs::remove_file(&symlink_path).unwrap();\n        fs::set_permissions(&fixture.pool, fs::Permissions::from_mode(0o555)).unwrap();\n\n        let info = fixture.pool.join(OBJECTS_NAME).join("info");\n        let alternates = info.join("alternates");\n        fs::set_permissions(&info, fs::Permissions::from_mode(0o755)).unwrap();\n        fs::write(&alternates, b"/other/objects\\n").unwrap();\n        fs::set_permissions(&alternates, fs::Permissions::from_mode(FILE_MODE)).unwrap();\n        fs::set_permissions(&info, fs::Permissions::from_mode(0o555)).unwrap();'''
+          if old not in s: raise SystemExit('alternates fixture point missing')
+          s=s.replace(old,new,1)
+          p.write_text(s)
+
+          lib=Path('src/lib.rs'); t=lib.read_text()
+          marker='''/// Pure fixed marker codec for immutable Git object-pool generations.\npub mod immutable_git_object_pool_marker;\n'''
+          addition='''/// Read-only descriptor-bound observation of frozen immutable Git object-pool generations.\n#[cfg(target_os = "linux")]\npub mod immutable_git_object_pool_observation;\n'''
+          if addition not in t:
+              if marker not in t: raise SystemExit('lib export point missing')
+              t=t.replace(marker,marker+addition,1)
+          lib.write_text(t)
+          PY
+          cargo fmt --all
+          cargo test --locked immutable_git_object_pool_observation
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          git rm .github/workflows/research-finalize-immutable-git-pool-observation-v2.yml
+          git add src/immutable_git_object_pool_observation.rs src/lib.rs
+          git config user.name teamleaderleo
+          git config user.email cheerleaderleo@outlook.com
+          git commit -m 'Observe frozen immutable Git object-pool generations'
+          git push origin HEAD:codex/immutable-git-pool-observation-v2
