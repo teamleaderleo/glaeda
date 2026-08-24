@@ -1264,7 +1264,12 @@ mod tests {
         assert!(record.success);
         assert_eq!(record.stdout.as_bytes(), sentinel);
         assert!(record.stderr.is_empty());
-        assert!(!record.argv.join(" ").contains("guest-request-without-implicit-newline"));
+        assert!(
+            !record
+                .argv
+                .join(" ")
+                .contains("guest-request-without-implicit-newline")
+        );
         assert!(record.environment_keys.is_empty());
         Ok(())
     }
@@ -1362,7 +1367,10 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::Other);
         assert_eq!(error.to_string(), "injected plain-input thread failure");
         thread::sleep(Duration::from_millis(800));
-        assert!(!marker.exists(), "spawned process survived writer setup failure");
+        assert!(
+            !marker.exists(),
+            "spawned process survived writer setup failure"
+        );
         fs::remove_dir(&fixture)?;
         Ok(())
     }
