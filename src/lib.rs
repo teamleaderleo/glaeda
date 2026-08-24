@@ -256,6 +256,9 @@ pub mod project_checkout_observation;
 /// Read-only, bounded immediate-child discovery beneath one explicit project root.
 #[cfg(unix)]
 pub mod project_discovery;
+/// Pure crash/replay authority checkpoints for exact project-disk creation.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod project_disk_create_state;
 /// Descriptor-bound read-only observation of Lima standalone project disks.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod project_disk_host_observation;
