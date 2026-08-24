@@ -18,8 +18,8 @@ use crate::artifact::Sha256Digest;
 pub use raw::{
     LimaStandaloneDiskAbsenceObservation, LimaStandaloneDiskAbsenceSummary,
     LimaStandaloneDiskDisposition, LimaStandaloneDiskName, LimaStandaloneDiskObservationRequest,
-    ProjectDiskHostObservationError, ProjectDiskHostObservationErrorKind,
-    ProjectDiskPhysicalIdentity, PROJECT_DISK_HOST_OBSERVATION_SCHEMA_VERSION,
+    PROJECT_DISK_HOST_OBSERVATION_SCHEMA_VERSION, ProjectDiskHostObservationError,
+    ProjectDiskHostObservationErrorKind, ProjectDiskPhysicalIdentity,
     observe_lima_standalone_disk_absence,
 };
 
@@ -83,10 +83,9 @@ pub struct LimaStandaloneDiskObservationSummary {
 
 impl LimaStandaloneDiskObservationSummary {
     fn from_raw(value: &raw::LimaStandaloneDiskObservationSummary) -> Self {
-        let backing_identity = ProjectDiskBackingIdentity::parse(
-            value.backing_identity().digest().as_str(),
-        )
-        .expect("raw P2 backing identity is already canonical SHA-256");
+        let backing_identity =
+            ProjectDiskBackingIdentity::parse(value.backing_identity().digest().as_str())
+                .expect("raw P2 backing identity is already canonical SHA-256");
         Self {
             schema_version: value.schema_version(),
             disposition: value.disposition(),
