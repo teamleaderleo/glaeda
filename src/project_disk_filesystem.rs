@@ -5,6 +5,7 @@
 //! from another even when the surrounding project-disk generation remains unchanged.
 
 pub mod format_plan;
+pub mod format_state;
 
 use serde::Serialize;
 
