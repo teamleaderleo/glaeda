@@ -513,7 +513,7 @@ fn snapshot_file_stat(
         uid: stat.st_uid,
         gid: stat.st_gid,
         mode: stat.st_mode,
-        nlink: stat.st_nlink,
+        nlink: u64::from(stat.st_nlink),
         size: stat.st_size,
         mtime: stat.st_mtime,
         mtime_nsec: i64::try_from(stat.st_mtime_nsec).map_err(|_| unsafe_filesystem())?,
