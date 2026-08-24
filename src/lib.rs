@@ -305,6 +305,8 @@ pub mod subordinate_id;
 /// Pure sealed task-private Git clone planning from exact hot-path leases.
 #[cfg(target_os = "linux")]
 pub mod task_private_git_clone_plan;
+/// Pure reviewed identity for one resident Linux guest-control executable generation.
+pub mod trusted_guest_control_binary_generation;
 /// Pure sealed one-shot invocation plan for resident Linux guest-control transactions.
 pub mod trusted_guest_control_invocation_plan;
 /// Pure canonical one-shot protocol envelope for resident Linux guest-control transactions.
