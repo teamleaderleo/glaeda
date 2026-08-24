@@ -4,10 +4,10 @@ use serde::{Deserialize, Serialize};
 
 mod validate;
 
-pub(crate) use validate::{
-    same_entry_binding, validate_absolute_path, validate_locator, valid_git_commit,
-};
 use validate::validate_document;
+pub(crate) use validate::{
+    same_entry_binding, valid_git_commit, validate_absolute_path, validate_locator,
+};
 pub const PROJECT_DISK_PHYSICAL_RECEIPT_SCHEMA_VERSION: u8 = 1;
 pub const MAX_PROJECT_DISK_PHYSICAL_RECEIPT_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_PROJECT_DISK_RECEIPT_ENTRY_COUNT: usize = 64;
@@ -31,8 +31,10 @@ pub struct ProjectDiskPhysicalReceiptDocument {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeclaredProjectDiskBindingDocument {
+    pub(crate) project_identity: String,
     pub(crate) project_disk_id: String,
     pub(crate) project_disk_generation: u64,
+    pub(crate) project_disk_revision: u64,
     pub(crate) attachment_generation: u64,
     pub(crate) resident_sandbox_id: String,
     pub(crate) resident_sandbox_generation: u64,
