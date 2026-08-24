@@ -59,6 +59,7 @@ pub struct ProjectDiskDirectoryEvidenceDocument {
     pub(crate) path: String,
     pub(crate) before: ReceiptFilesystemSnapshot,
     pub(crate) entries: Vec<ReceiptDirectoryEntryEvidence>,
+    pub(crate) after_entry_names_hex: Vec<String>,
     pub(crate) after: ReceiptFilesystemSnapshot,
 }
 
@@ -83,7 +84,6 @@ pub enum ReceiptDirectoryEntryKind {
     Regular,
     Directory,
     Symlink,
-    Other,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
