@@ -59,7 +59,7 @@ jobs:
           phase_end = "          path.write_text(text)\n          \"\"\"\n\n          needle = 'cargo fmt --all\\n'"
           if source.count(phase_end) != 1:
               raise SystemExit(f'phase end count={source.count(phase_end)}')
-          phase_end_repaired = '''          map_start = text.index("fn map_backend(")
+          phase_end_repaired = r'''          map_start = text.index("fn map_backend(")
           map_end = text.index("\nfn map_workdir_backend(", map_start)
           map_chunk = text[map_start:map_end]
           if map_chunk.count("    error: BackendError,") != 1:
