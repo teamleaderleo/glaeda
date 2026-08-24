@@ -1,0 +1,93 @@
+name: Research hot Linux physical probes
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/research-hot-linux-physical-pr.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          show-progress: false
+
+      - name: Probe OverlayFS workdir mutation timing
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat >/tmp/workdir-stage.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <fcntl.h>
+          #include <linux/mount.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <sys/syscall.h>
+          #include <unistd.h>
+          static int fsopenx(const char*n,unsigned f){return syscall(SYS_fsopen,n,f);} static int cfg(int fd,unsigned c,const char*k,const void*v,int a){return syscall(SYS_fsconfig,fd,c,k,v,a);} static int fsmountx(int fd,unsigned f,unsigned a){return syscall(SYS_fsmount,fd,f,a);} static int movex(int fd,const char*f,int td,const char*t,unsigned fl){return syscall(SYS_move_mount,fd,f,td,t,fl);} static void list(const char*stage,const char*work){char cmd[4096];snprintf(cmd,sizeof(cmd),"printf '%s\\n' '--- %s ---'; stat -c 'stat=%%d:%%i:%%Y:%%Z' '%s'; find '%s' -mindepth 1 -maxdepth 3 -printf 'entry=%%P type=%%y inode=%%i\\n' | sort",stage,stage,work,work);system(cmd);} static void die(const char*s){perror(s);exit(2);} int main(int ac,char**av){if(ac!=5)return 64;int l=open(av[1],O_PATH|O_DIRECTORY|O_CLOEXEC),u=open(av[2],O_PATH|O_DIRECTORY|O_CLOEXEC),w=open(av[3],O_PATH|O_DIRECTORY|O_CLOEXEC),t=open(av[4],O_PATH|O_DIRECTORY|O_CLOEXEC);if(l<0||u<0||w<0||t<0)die("open");list("initial",av[3]);int f=fsopenx("overlay",FSOPEN_CLOEXEC);if(f<0)die("fsopen");if(cfg(f,FSCONFIG_SET_FD,"lowerdir+",NULL,l)<0)die("lower");if(cfg(f,FSCONFIG_SET_FD,"upperdir",NULL,u)<0)die("upper");if(cfg(f,FSCONFIG_SET_FD,"workdir",NULL,w)<0)die("work");list("after_set_fd",av[3]);if(cfg(f,FSCONFIG_CMD_CREATE,NULL,NULL,0)<0)die("create");list("after_create",av[3]);int m=fsmountx(f,FSMOUNT_CLOEXEC,MS_NODEV|MS_NOSUID);if(m<0)die("fsmount");list("after_fsmount",av[3]);if(movex(m,"",t,"",MOVE_MOUNT_F_EMPTY_PATH|MOVE_MOUNT_T_EMPTY_PATH)<0)die("move");list("after_move_mount",av[3]);return 0;}
+          EOF
+          gcc -O2 -Wall -Wextra -Werror /tmp/workdir-stage.c -o /tmp/workdir-stage
+          ROOT="$RUNNER_TEMP/workdir-stage"; rm -rf "$ROOT"; mkdir -p "$ROOT/lower" "$ROOT/upper" "$ROOT/work" "$ROOT/merged"; printf base >"$ROOT/lower/base"
+          sudo /tmp/workdir-stage "$ROOT/lower" "$ROOT/upper" "$ROOT/work" "$ROOT/merged"
+          sudo umount "$ROOT/merged"
+
+      - name: Probe exact safe-rustix mount transaction
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p src/bin
+          cat >src/bin/research_rustix_safe_overlay.rs <<'RS'
+          #![forbid(unsafe_code)]
+          use std::env;
+          use std::fs::File;
+          use std::io::Read as _;
+          use std::os::fd::AsFd as _;
+          use std::path::Path;
+          use rustix::fs::{self, AtFlags, Mode, OFlags, StatxFlags, statx};
+          use rustix::mount::{FsMountFlags,FsOpenFlags,MountAttrFlags,MoveMountFlags,fsconfig_create,fsconfig_set_fd,fsmount,fsopen,move_mount};
+          fn mid(fd: impl std::os::fd::AsFd)->rustix::io::Result<u64>{Ok(statx(fd,"",AtFlags::EMPTY_PATH,StatxFlags::MNT_ID)?.stx_mnt_id)}
+          fn main()->Result<(),Box<dyn std::error::Error>>{let a:Vec<_>=env::args_os().collect();if a.len()!=6{return Err("expected lower upper work parent basename".into())}let flags=OFlags::PATH|OFlags::DIRECTORY|OFlags::NOFOLLOW|OFlags::CLOEXEC;let l=fs::open(Path::new(&a[1]),flags,Mode::empty())?;let u=fs::open(Path::new(&a[2]),flags,Mode::empty())?;let w=fs::open(Path::new(&a[3]),flags,Mode::empty())?;let p=fs::open(Path::new(&a[4]),flags,Mode::empty())?;let t=fs::openat(p.as_fd(),Path::new(&a[5]),flags,Mode::empty())?;let under=mid(&t)?;let c=fsopen("overlay",FsOpenFlags::FSOPEN_CLOEXEC)?;fsconfig_set_fd(&c,"lowerdir+",&l)?;fsconfig_set_fd(&c,"upperdir",&u)?;fsconfig_set_fd(&c,"workdir",&w)?;fsconfig_create(&c)?;let m=fsmount(&c,FsMountFlags::FSMOUNT_CLOEXEC,MountAttrFlags::MOUNT_ATTR_NODEV|MountAttrFlags::MOUNT_ATTR_NOSUID)?;let before=mid(&m)?;move_mount(&m,"",&t,"",MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH|MoveMountFlags::MOVE_MOUNT_T_EMPTY_PATH)?;let v=fs::openat(p.as_fd(),Path::new(&a[5]),flags,Mode::empty())?;let visible=mid(&v)?;let b=fs::openat(v.as_fd(),"base.txt",OFlags::RDONLY|OFlags::CLOEXEC,Mode::empty())?;let mut text=String::new();File::from(b).read_to_string(&mut text)?;println!("under_id={under}\nmount_id={before}\nvisible_id={visible}\nbase={}",text.trim_end());Ok(())}
+          RS
+          cargo build --locked --bin research_rustix_safe_overlay
+          ROOT="$RUNNER_TEMP/safe-rustix"; rm -rf "$ROOT"; mkdir -p "$ROOT/lower" "$ROOT/upper" "$ROOT/work" "$ROOT/targets/merged"; printf 'base\n' >"$ROOT/lower/base.txt"
+          sudo ./target/debug/research_rustix_safe_overlay "$ROOT/lower" "$ROOT/upper" "$ROOT/work" "$ROOT/targets" merged
+          findmnt -T "$ROOT/targets/merged" -n -o ID,FSTYPE,OPTIONS
+          sudo umount "$ROOT/targets/merged"
+          rm -f src/bin/research_rustix_safe_overlay.rs
+
+      - name: Probe scrubbed cross-owner Git alternates
+        shell: bash
+        run: |
+          set -euo pipefail
+          LAB=/var/tmp/smolrunner-alternates-pr
+          sudo rm -rf "$LAB"; sudo mkdir -p "$LAB"; sudo chown "$(id -u):$(id -g)" "$LAB"
+          sudo useradd --system --create-home --home-dir /var/lib/smol-admin-alt-pr --shell /bin/bash smol-admin-alt-pr 2>/dev/null || true
+          au="$(id -u smol-admin-alt-pr)"; ag="$(id -g smol-admin-alt-pr)"
+          git clone --bare --local --no-hardlinks "$GITHUB_WORKSPACE" "$LAB/seed.git"
+          sudo chown -R root:root "$LAB/seed.git"; sudo find "$LAB/seed.git" -type d -exec chmod 0555 {} +; sudo find "$LAB/seed.git" -type f -exec chmod 0444 {} +; sudo chown root:root "$LAB"; sudo chmod 0755 "$LAB"
+          admin=(sudo -u smol-admin-alt-pr /usr/bin/env -i HOME=/var/lib/smol-admin-alt-pr PATH=/usr/bin:/bin GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null XDG_CONFIG_HOME=/var/lib/smol-admin-alt-pr/.config)
+          for kind in shared reference; do
+            for mode in plain safe; do
+              parent="$LAB/${kind}-${mode}"; sudo mkdir "$parent"; sudo chown "$au:$ag" "$parent"; sudo chmod 0700 "$parent"
+              if [ "$kind" = shared ]; then extra=(--shared); else extra=(--reference "$LAB/seed.git"); fi
+              if [ "$mode" = safe ]; then prefix=(-c "safe.directory=$LAB/seed.git"); else prefix=(); fi
+              set +e
+              "${admin[@]}" /usr/bin/git "${prefix[@]}" clone "${extra[@]}" --no-checkout "$LAB/seed.git" "$parent/task" >"/tmp/${kind}-${mode}.out" 2>"/tmp/${kind}-${mode}.err"
+              rc=$?
+              set -e
+              printf '%s_%s_rc=%s\n' "$kind" "$mode" "$rc"
+              cat "/tmp/${kind}-${mode}.err"
+              if [ -d "$parent/task/.git/objects" ]; then
+                alt="$parent/task/.git/objects/info/alternates"
+                printf '%s_%s_alternates_exists=%s\n' "$kind" "$mode" "$(test -f "$alt" && echo true || echo false)"
+                if [ -f "$alt" ]; then printf '%s_%s_alternates=%s\n' "$kind" "$mode" "$(cat "$alt")"; fi
+                printf '%s_%s_object_files=%s\n' "$kind" "$mode" "$(find "$parent/task/.git/objects" -type f | wc -l | tr -d ' ')"
+                du -sb "$parent/task/.git/objects"
+              fi
+            done
+          done
