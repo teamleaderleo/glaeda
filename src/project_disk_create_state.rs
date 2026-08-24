@@ -316,7 +316,9 @@ impl ProjectDiskCreateRecord {
     }
 
     /// Produce the exact no-replay start intent for the currently authorized attempt.
-    pub fn plan_create_start(&self) -> Result<ProjectDiskCreateStartPlan, ProjectDiskCreateStateError> {
+    pub fn plan_create_start(
+        &self,
+    ) -> Result<ProjectDiskCreateStartPlan, ProjectDiskCreateStateError> {
         let ProjectDiskCreateState::CreateAuthorized { attempt_generation } = self.state else {
             return Err(invalid_state(
                 "project_disk_create_start_requires_authorized",
@@ -404,9 +406,11 @@ impl ProjectDiskCreateRecord {
             ));
         };
         absence.confirm(self)?;
-        Ok(ProjectDiskCreateRecoveryAssessment::BlockedPriorAttemptMayCommit {
-            attempt_generation,
-        })
+        Ok(
+            ProjectDiskCreateRecoveryAssessment::BlockedPriorAttemptMayCommit {
+                attempt_generation,
+            },
+        )
     }
 
     /// Quarantine a started attempt when any physical disk is observed at the claimed locator after
@@ -465,7 +469,10 @@ impl ProjectDiskCreateRecord {
         };
         quiescent.confirm(self, attempt_generation)?;
         absence.confirm(self)?;
-        self.successor(ProjectDiskCreateState::Accepted, self.last_attempt_generation)
+        self.successor(
+            ProjectDiskCreateState::Accepted,
+            self.last_attempt_generation,
+        )
     }
 
     fn next_attempt_generation(
@@ -690,7 +697,10 @@ impl ProjectDiskCreateExecutionReceipt {
     }
 
     #[cfg(test)]
-    fn for_test(record: &ProjectDiskCreateRecord, attempt_generation: ProjectDiskCreateAttemptGeneration) -> Self {
+    fn for_test(
+        record: &ProjectDiskCreateRecord,
+        attempt_generation: ProjectDiskCreateAttemptGeneration,
+    ) -> Self {
         Self {
             project: record.project.clone(),
             disk_id: record.disk_id.clone(),
@@ -727,7 +737,8 @@ impl ProjectDiskCreatePhysicalProof {
             || self.source_identity != record.source_identity
             || self.disk_name != record.disk_name
             || self.attempt_generation != attempt_generation
-            || self.backing_identity_digest.as_str() == "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+            || self.backing_identity_digest.as_str()
+                == "sha256:0000000000000000000000000000000000000000000000000000000000000000"
             || self.backing_logical_bytes != record.requested_logical_bytes
         {
             return Err(evidence_mismatch());
@@ -785,7 +796,10 @@ impl ProjectDiskCreatePriorAttemptQuiescentProof {
     }
 
     #[cfg(test)]
-    fn for_test(record: &ProjectDiskCreateRecord, attempt_generation: ProjectDiskCreateAttemptGeneration) -> Self {
+    fn for_test(
+        record: &ProjectDiskCreateRecord,
+        attempt_generation: ProjectDiskCreateAttemptGeneration,
+    ) -> Self {
         Self {
             project: record.project.clone(),
             disk_id: record.disk_id.clone(),
@@ -936,8 +950,9 @@ mod tests {
     use super::{
         ProjectDiskCreateAbsenceProof, ProjectDiskCreateExecutionReceipt,
         ProjectDiskCreatePhysicalProof, ProjectDiskCreatePriorAttemptQuiescentProof,
-        ProjectDiskCreateQuarantineReason, ProjectDiskCreateRecord, ProjectDiskCreateRecoveryAssessment,
-        ProjectDiskCreateSourceIdentity, ProjectDiskCreateState, ProjectDiskCreateStateErrorKind,
+        ProjectDiskCreateQuarantineReason, ProjectDiskCreateRecord,
+        ProjectDiskCreateRecoveryAssessment, ProjectDiskCreateSourceIdentity,
+        ProjectDiskCreateState, ProjectDiskCreateStateErrorKind,
     };
     use crate::artifact::Sha256Digest;
     use crate::project_catalog::ProjectIdentity;
@@ -952,11 +967,7 @@ mod tests {
         ProjectDiskCreateSourceIdentity::from_digest(digest(byte))
     }
 
-    fn record(
-        disk_id: &str,
-        disk_generation: u64,
-        source_byte: char,
-    ) -> ProjectDiskCreateRecord {
+    fn record(disk_id: &str, disk_generation: u64, source_byte: char) -> ProjectDiskCreateRecord {
         ProjectDiskCreateRecord::new_accepted(
             ProjectIdentity::parse("github.com/teamleaderleo/smolrunner").unwrap(),
             ProjectDiskId::parse(disk_id).unwrap(),
@@ -967,7 +978,9 @@ mod tests {
         .unwrap()
     }
 
-    fn started(record: &ProjectDiskCreateRecord) -> (ProjectDiskCreateRecord, super::ProjectDiskCreateStartPlan) {
+    fn started(
+        record: &ProjectDiskCreateRecord,
+    ) -> (ProjectDiskCreateRecord, super::ProjectDiskCreateStartPlan) {
         let authorization = record
             .plan_create_authorization(&ProjectDiskCreateAbsenceProof::for_test(record))
             .unwrap();
@@ -1015,17 +1028,24 @@ mod tests {
             .plan_create_authorization(&ProjectDiskCreateAbsenceProof::for_test(&accepted))
             .unwrap();
         let authorized = accepted.record_create_authorized(&authorization).unwrap();
-        assert!(matches!(authorized.state(), ProjectDiskCreateState::CreateAuthorized { .. }));
+        assert!(matches!(
+            authorized.state(),
+            ProjectDiskCreateState::CreateAuthorized { .. }
+        ));
         let start = authorized.plan_create_start().unwrap();
         let started = authorized.record_create_started(&start).unwrap();
-        assert!(matches!(started.state(), ProjectDiskCreateState::CreateStarted { .. }));
+        assert!(matches!(
+            started.state(),
+            ProjectDiskCreateState::CreateStarted { .. }
+        ));
     }
 
     #[test]
     fn uninterrupted_success_requires_executor_and_physical_proof() {
         let accepted = record("disk-a", 3, 'a');
         let (started, start) = started(&accepted);
-        let execution = ProjectDiskCreateExecutionReceipt::for_test(&started, start.attempt_generation());
+        let execution =
+            ProjectDiskCreateExecutionReceipt::for_test(&started, start.attempt_generation());
         let physical = ProjectDiskCreatePhysicalProof::for_test(
             &started,
             start.attempt_generation(),
@@ -1064,7 +1084,10 @@ mod tests {
                 .plan_create_authorization(&ProjectDiskCreateAbsenceProof::for_test(&started))
                 .is_err()
         );
-        assert!(matches!(started.state(), ProjectDiskCreateState::CreateStarted { .. }));
+        assert!(matches!(
+            started.state(),
+            ProjectDiskCreateState::CreateStarted { .. }
+        ));
     }
 
     #[test]
@@ -1091,7 +1114,10 @@ mod tests {
         let recovered = started
             .record_prior_attempt_quiescent_absent(&quiescent, &absence)
             .unwrap();
-        assert!(matches!(recovered.state(), ProjectDiskCreateState::Accepted));
+        assert!(matches!(
+            recovered.state(),
+            ProjectDiskCreateState::Accepted
+        ));
         let second = recovered
             .plan_create_authorization(&ProjectDiskCreateAbsenceProof::for_test(&recovered))
             .unwrap();
