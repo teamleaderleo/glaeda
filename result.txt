@@ -1,0 +1,34 @@
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/fs/statx.rs:40:    pub stx_mnt_id: u64,
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/fs/statx.rs:73:    pub struct StatxFlags: u32 {
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/fs/statx.rs:113:        /// `STATX_MNT_ID` (since Linux 5.8)
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/fs/statx.rs:114:        const MNT_ID = c::STATX_MNT_ID;
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/fs/statx.rs:179:/// # use rustix::fs::{AtFlags, StatxFlags};
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/fs/statx.rs:185:///     use rustix::fs::{AtFlags, StatxAttributes, StatxFlags};
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/fs/statx.rs:191:///         StatxFlags::empty(),
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/fs/statx.rs:205:pub fn statx<P: path::Arg, Fd: AsFd>(
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/fs/statx.rs:209:    mask: StatxFlags,
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/fs/statx.rs:218:    use crate::fs::{AtFlags, Statx, StatxFlags};
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/fs/statx.rs:232:    pub fn statx(
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/fs/statx.rs:236:        mask: StatxFlags,
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/fs/statx.rs:250:        mask: StatxFlags,
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/fs/constants.rs:338:            check_renamed_struct_field!(Statx, statx, stx_mnt_id);
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/backend/libc/fs/syscalls.rs:94:    crate::fs::{ResolveFlags, Statx, StatxFlags, CWD},
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/backend/libc/fs/syscalls.rs:656:        match crate::fs::statx(CWD, path, AtFlags::empty(), StatxFlags::BASIC_STATS) {
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/backend/libc/fs/syscalls.rs:701:            StatxFlags::BASIC_STATS,
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/backend/libc/fs/syscalls.rs:744:        match crate::fs::statx(dirfd, path, flags, StatxFlags::BASIC_STATS) {
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/backend/libc/fs/syscalls.rs:1547:        match crate::fs::statx(fd, cstr!(""), AtFlags::EMPTY_PATH, StatxFlags::BASIC_STATS) {
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/backend/libc/fs/syscalls.rs:2059:    mask: StatxFlags,
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/backend/libc/fs/syscalls.rs:2062:    // passing flags unknown to rustix in `StatxFlags`, we could end up
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/backend/libc/fs/syscalls.rs:2081:    let mask = mask & StatxFlags::all();
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/backend/libc/c.rs:491:        STATX_DIOALIGN, STATX_GID, STATX_INO, STATX_MNT_ID, STATX_MODE, STATX_MTIME, STATX_NLINK,
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/backend/linux_raw/fs/syscalls.rs:36:    StatVfs, StatVfsMountFlags, Statx, StatxFlags, Timestamps, Uid, XattrFlags,
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/backend/linux_raw/fs/syscalls.rs:501:        match crate::fs::statx(fd, cstr!(""), AtFlags::EMPTY_PATH, StatxFlags::BASIC_STATS) {
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/backend/linux_raw/fs/syscalls.rs:558:            StatxFlags::BASIC_STATS,
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/backend/linux_raw/fs/syscalls.rs:626:        match crate::fs::statx(dirfd, path, flags, StatxFlags::BASIC_STATS) {
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/backend/linux_raw/fs/syscalls.rs:675:            StatxFlags::BASIC_STATS,
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/backend/linux_raw/fs/syscalls.rs:822:    mask: StatxFlags,
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/backend/linux_raw/fs/syscalls.rs:825:    // passing flags unknown to rustix in `StatxFlags`, we could end up
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/backend/linux_raw/fs/syscalls.rs:840:    let mask = mask & StatxFlags::all();
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/backend/linux_raw/conv.rs:371:    impl<'a, Num: ArgNumber> From<crate::fs::StatxFlags> for ArgReg<'a, Num> {
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/backend/linux_raw/conv.rs:373:        fn from(flags: crate::fs::StatxFlags) -> Self {
+/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.4/src/backend/linux_raw/c.rs:376:        STATX_DIOALIGN, STATX_GID, STATX_INO, STATX_MNT_ID, STATX_MODE, STATX_MTIME, STATX_NLINK,
