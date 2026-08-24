@@ -1,0 +1,133 @@
+name: Research repair project-disk receipt
+
+on:
+  push:
+    branches:
+      - bean/565-p2-physical-receipt
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: bean/565-p2-physical-receipt
+          fetch-depth: 0
+          show-progress: false
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt --no-self-update
+      - name: Repair lifecycle and output bounds
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          capture = Path('src/bin/project_disk_physical_receipt/capture/mod.rs')
+          s = capture.read_text()
+          old = '''    ProjectDiskPhysicalReceiptDocument, ReceiptCommandEvidence, same_entry_binding,\n    valid_git_commit, validate_absolute_path, validate_locator,\n'''
+          new = '''    ProjectDiskPhysicalReceiptDocument, ReceiptCommandEvidence, same_entry_binding,\n    valid_git_commit, validate_absolute_path, validate_locator, validate_running_instance_json,\n'''
+          if old not in s: raise SystemExit('capture import marker missing')
+          s = s.replace(old, new, 1)
+          old = '''    let instance_list_json = execute(\n        executor,\n        limactl_command(request)\n            .argument("--tty=false")\n            .argument("list")\n            .argument("--format=json")\n            .argument("--all-fields")\n            .argument(request.resident_sandbox_instance.as_str()),\n        request.command_timeout,\n    )?;\n    let mountinfo = execute(\n'''
+          new = '''    let instance_list_json = execute(\n        executor,\n        instance_list_command(request),\n        request.command_timeout,\n    )?;\n    validate_running_instance_json(\n        &instance_list_json.stdout,\n        request.resident_sandbox_instance.as_str(),\n    )\n    .map_err(|_| capture_error(ProjectDiskPhysicalCaptureErrorKind::Receipt))?;\n    let mountinfo = execute(\n'''
+          if old not in s: raise SystemExit('initial instance block missing')
+          s = s.replace(old, new, 1)
+          marker = '''    let host_identity_after = LimaHostIdentityAdapter\n'''
+          addition = '''    let final_instance_list_json = execute(\n        executor,\n        instance_list_command(request),\n        request.command_timeout,\n    )?;\n    validate_running_instance_json(\n        &final_instance_list_json.stdout,\n        request.resident_sandbox_instance.as_str(),\n    )\n    .map_err(|_| capture_error(ProjectDiskPhysicalCaptureErrorKind::Receipt))?;\n    if final_instance_list_json.stdout != instance_list_json.stdout {\n        return Err(changed());\n    }\n\n'''
+          if marker not in s: raise SystemExit('host identity after marker missing')
+          s = s.replace(marker, addition + marker, 1)
+          marker = '''fn limactl_command(request: &ProjectDiskPhysicalCaptureRequest) -> CommandSpec {\n'''
+          helper = '''fn instance_list_command(request: &ProjectDiskPhysicalCaptureRequest) -> CommandSpec {\n    limactl_command(request)\n        .argument("--tty=false")\n        .argument("list")\n        .argument("--format=json")\n        .argument("--all-fields")\n        .argument(request.resident_sandbox_instance.as_str())\n}\n\n'''
+          if marker not in s: raise SystemExit('limactl helper marker missing')
+          s = s.replace(marker, helper + marker, 1)
+          capture.write_text(s)
+
+          receipt = Path('src/bin/project_disk_physical_receipt/receipt/mod.rs')
+          s = receipt.read_text()
+          old = '''    same_entry_binding, valid_git_commit, validate_absolute_path, validate_locator,\n};\n'''
+          new = '''    same_entry_binding, valid_git_commit, validate_absolute_path, validate_locator,\n    validate_running_instance_json,\n};\n'''
+          if old not in s: raise SystemExit('receipt reexport marker missing')
+          s = s.replace(old, new, 1)
+          old = '''    pub fn encode_private_json_pretty(&self) -> Result<Vec<u8>, ProjectDiskPhysicalReceiptError> {\n        serde_json::to_vec_pretty(&self.document)\n            .map_err(|_| malformed("document", "project_disk_receipt_encode_failed"))\n    }\n'''
+          new = '''    pub fn encode_private_json_pretty(&self) -> Result<Vec<u8>, ProjectDiskPhysicalReceiptError> {\n        let bytes = serde_json::to_vec_pretty(&self.document)\n            .map_err(|_| malformed("document", "project_disk_receipt_encode_failed"))?;\n        if bytes.len() > MAX_PROJECT_DISK_PHYSICAL_RECEIPT_BYTES {\n            return Err(error(\n                ProjectDiskPhysicalReceiptErrorKind::TooLarge,\n                "document",\n                "project_disk_receipt_too_large",\n                "project disk physical receipt exceeds the bounded size",\n            ));\n        }\n        Ok(bytes)\n    }\n'''
+          if old not in s: raise SystemExit('pretty encoder marker missing')
+          receipt.write_text(s.replace(old, new, 1))
+
+          validate = Path('src/bin/project_disk_physical_receipt/receipt/validate.rs')
+          s = validate.read_text()
+          old = '''use serde_json::Value;\n'''
+          new = '''use serde::Deserialize;\nuse serde_json::Value;\n'''
+          if old not in s: raise SystemExit('validate import marker missing')
+          s = s.replace(old, new, 1)
+          old = '''    validate_json_stdout(&document.lima.instance_list_json, "lima.instance_list_json")?;\n'''
+          new = '''    validate_json_stdout(&document.lima.instance_list_json, "lima.instance_list_json")?;\n    validate_running_instance_json(\n        &document.lima.instance_list_json.stdout,\n        &document.lima.resident_sandbox_instance,\n    )?;\n'''
+          if old not in s: raise SystemExit('instance validation marker missing')
+          s = s.replace(old, new, 1)
+          marker = '''const fn invalid_json_evidence(field: &'static str) -> ProjectDiskPhysicalReceiptError {\n'''
+          helper = '''#[derive(Deserialize)]\nstruct RuntimeInstanceEvidence {\n    name: String,\n    status: String,\n    #[serde(default)]\n    errors: Vec<String>,\n}\n\npub(crate) fn validate_running_instance_json(\n    stdout: &str,\n    expected_instance: &str,\n) -> Result<(), ProjectDiskPhysicalReceiptError> {\n    let mut deserializer = serde_json::Deserializer::from_str(stdout);\n    let evidence = RuntimeInstanceEvidence::deserialize(&mut deserializer)\n        .map_err(|_| invalid_json_evidence("lima.instance_list_json"))?;\n    deserializer\n        .end()\n        .map_err(|_| invalid_json_evidence("lima.instance_list_json"))?;\n    if evidence.name != expected_instance || evidence.status != "Running" || !evidence.errors.is_empty() {\n        return Err(invalid_json_evidence("lima.instance_list_json"));\n    }\n    Ok(())\n}\n\n'''
+          if marker not in s: raise SystemExit('json helper marker missing')
+          validate.write_text(s.replace(marker, helper + marker, 1))
+
+          tests = Path('src/bin/project_disk_physical_receipt/receipt/tests.rs')
+          s = tests.read_text()
+          old = '''            "instance_list_json": command(&["/opt/homebrew/bin/limactl", "--tty=false", "list", "--format=json", "--all-fields", "smolrunner"], "[{\\"name\\":\\"smolrunner\\"}]\\n")\n'''
+          new = '''            "instance_list_json": command(&["/opt/homebrew/bin/limactl", "--tty=false", "list", "--format=json", "--all-fields", "smolrunner"], "{\\"name\\":\\"smolrunner\\",\\"status\\":\\"Running\\",\\"errors\\":[]}\\n")\n'''
+          if old not in s: raise SystemExit('fixture instance marker missing')
+          s = s.replace(old, new, 1)
+          addition = r'''
+
+#[test]
+fn refuses_non_running_or_mismatched_exact_instance_evidence() {
+    for (field, value) in [("status", "Stopped"), ("name", "other-instance")] {
+        let mut document = fixture();
+        let mut instance = serde_json::Map::new();
+        instance.insert("name".to_owned(), json!("smolrunner"));
+        instance.insert("status".to_owned(), json!("Running"));
+        instance.insert("errors".to_owned(), json!([]));
+        instance.insert(field.to_owned(), json!(value));
+        document["lima"]["instance_list_json"]["stdout"] =
+            json!(format!("{}\n", Value::Object(instance)));
+        assert_eq!(
+            decode(&document)
+                .expect_err("non-running or mismatched instance must fail")
+                .kind(),
+            ProjectDiskPhysicalReceiptErrorKind::InvalidJsonEvidence
+        );
+    }
+}
+
+#[test]
+fn pretty_encoding_enforces_the_private_receipt_size_limit() {
+    let mut receipt = decode(&fixture()).expect("valid physical receipt");
+    receipt.document.lima.disk_list_json.stdout =
+        "x".repeat(MAX_PROJECT_DISK_PHYSICAL_RECEIPT_BYTES);
+    assert_eq!(
+        receipt
+            .encode_private_json_pretty()
+            .expect_err("oversized pretty output must fail")
+            .kind(),
+        ProjectDiskPhysicalReceiptErrorKind::TooLarge
+    );
+}
+'''
+          tests.write_text(s + addition)
+          PY
+
+          rm .github/workflows/research-repair-project-disk-receipt.yml
+          cargo fmt --all
+          cargo fmt --all -- --check
+          cargo test --locked --bin project_disk_physical_receipt
+          cargo clippy --locked --bin project_disk_physical_receipt --all-targets -- -D warnings
+          rustup target add aarch64-apple-darwin --toolchain 1.97.1
+          cargo check --locked --bin project_disk_physical_receipt --target aarch64-apple-darwin
+          git diff --check
+          git config user.name "smolrunner-research-repair"
+          git config user.email "actions@users.noreply.github.com"
+          git add src/bin/project_disk_physical_receipt .github/workflows/research-repair-project-disk-receipt.yml
+          git commit -m "Repair project-disk receipt observation boundary"
+          git push origin HEAD:bean/565-p2-physical-receipt
