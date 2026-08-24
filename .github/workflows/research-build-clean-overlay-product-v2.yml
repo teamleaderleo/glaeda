@@ -1,0 +1,50 @@
+name: Research build clean OverlayFS product branch v2
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/research-build-clean-overlay-product-v2.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  build-product:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: true
+          show-progress: false
+          fetch-depth: 0
+      - name: Run repaired clean builder
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          source = Path('.github/workflows/research-build-clean-overlay-product.yml').read_text()
+          marker = '        run: |\n'
+          if marker not in source:
+              raise SystemExit('builder run block missing')
+          block = source.split(marker, 1)[1]
+          lines = []
+          for line in block.splitlines():
+              if line.startswith('          '):
+                  lines.append(line[10:])
+              else:
+                  lines.append(line)
+          script = '\n'.join(lines) + '\n'
+          pattern = re.compile(
+              r"\nold = '''            BackendStage::Attach if recovery_required => \(.*?text = text\.replace\(old, new, 1\)\n",
+              re.S,
+          )
+          script, count = pattern.subn('\n', script, count=1)
+          if count != 1:
+              raise SystemExit('old attach-recovery patch block missing')
+          Path('/tmp/build-overlay-product.sh').write_text(script)
+          PY
+          bash /tmp/build-overlay-product.sh
