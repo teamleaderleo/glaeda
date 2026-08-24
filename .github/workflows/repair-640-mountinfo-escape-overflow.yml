@@ -18,7 +18,7 @@ jobs:
           ref: fix/640-mountinfo-escape-overflow
           fetch-depth: 0
           show-progress: false
-      - name: Replace overflow-prone mountinfo escape arithmetic
+      - name: Widen octal arithmetic and add overflow regression
         shell: bash
         run: |
           set -euo pipefail
@@ -28,75 +28,46 @@ jobs:
           path = Path('src/trusted_project_filesystem_guest_observation.rs')
           text = path.read_text()
 
-          old = r'''        let octal = &field[index + 1..index + 4];
-          if !octal.iter().all(u8::is_ascii_digit) || octal.iter().any(|byte| *byte > b'7') {
-              return Err(mountinfo_malformed());
-          }
-          let decoded = (octal[0] - b'0') * 64 + (octal[1] - b'0') * 8 + (octal[2] - b'0');
-          if !matches!(decoded, 9 | 10 | 32 | 92) {
-              return Err(mountinfo_malformed());
-          }
-          result.push(decoded);
-          '''
-          new = r'''        let octal = &field[index + 1..index + 4];
-          let decoded = match octal {
-              b"011" => b'\t',
-              b"012" => b'\n',
-              b"040" => b' ',
-              b"134" => b'\\',
-              _ => return Err(mountinfo_malformed()),
-          };
-          result.push(decoded);
-          '''
-          if old not in text:
-              raise SystemExit('mountinfo decoder block changed')
-          text = text.replace(old, new, 1)
+          old_arithmetic = "let decoded = (octal[0] - b'0') * 64 + (octal[1] - b'0') * 8 + (octal[2] - b'0');"
+          new_arithmetic = "let decoded = u16::from(octal[0] - b'0') * 64 + u16::from(octal[1] - b'0') * 8 + u16::from(octal[2] - b'0');"
+          if text.count(old_arithmetic) != 1:
+              raise SystemExit('mountinfo arithmetic changed')
+          text = text.replace(old_arithmetic, new_arithmetic, 1)
 
-          old_test = r'''        let unreviewed = b"73 29 8:17 / /srv/quarry\\141data rw - ext4 /dev/vdb rw\n";
-          assert_eq!(
-              observe_trusted_project_filesystem_guest(
-                  &filesystem(ProjectDiskFilesystemKind::Ext4),
-                  device,
-                  1,
-                  b"/srv/quarryadata",
-                  unreviewed,
-              )
-              .unwrap_err()
-              .kind(),
-              TrustedProjectFilesystemGuestObservationErrorKind::MountinfoMalformed
-          );
-          '''
-          new_test = r'''        let unreviewed = b"73 29 8:17 / /srv/quarry\\141data rw - ext4 /dev/vdb rw\n";
-          assert_eq!(
-              observe_trusted_project_filesystem_guest(
-                  &filesystem(ProjectDiskFilesystemKind::Ext4),
-                  device,
-                  1,
-                  b"/srv/quarryadata",
-                  unreviewed,
-              )
-              .unwrap_err()
-              .kind(),
-              TrustedProjectFilesystemGuestObservationErrorKind::MountinfoMalformed
-          );
+          old_push = "result.push(decoded);"
+          new_push = "result.push(decoded as u8);"
+          if text.count(old_push) != 1:
+              raise SystemExit('mountinfo decoded push changed')
+          text = text.replace(old_push, new_push, 1)
 
-          let overflowing = b"73 29 8:17 / /srv/quarry\\777data rw - ext4 /dev/vdb rw\n";
-          assert_eq!(
-              observe_trusted_project_filesystem_guest(
-                  &filesystem(ProjectDiskFilesystemKind::Ext4),
-                  device,
-                  1,
-                  b"/srv/quarrydata",
-                  overflowing,
-              )
-              .unwrap_err()
-              .kind(),
-              TrustedProjectFilesystemGuestObservationErrorKind::MountinfoMalformed
-          );
-          '''
-          if old_test not in text:
-              raise SystemExit('mountinfo escape test block changed')
-          path.write_text(text.replace(old_test, new_test, 1))
+          test_name = "overflowing_mountinfo_escape_is_bounded_malformed"
+          if test_name not in text:
+              closing = text.rfind("\n}\n")
+              if closing < 0:
+                  raise SystemExit('test module close missing')
+              regression = r'''
+
+#[test]
+fn overflowing_mountinfo_escape_is_bounded_malformed() {
+let device = make_linux_device(8, 17);
+let overflowing = b"73 29 8:17 / /srv/quarry\\777data rw - ext4 /dev/vdb rw\n";
+assert_eq!(
+observe_trusted_project_filesystem_guest(
+&filesystem(ProjectDiskFilesystemKind::Ext4),
+device,
+1,
+b"/srv/quarrydata",
+overflowing,
+)
+.unwrap_err()
+.kind(),
+TrustedProjectFilesystemGuestObservationErrorKind::MountinfoMalformed
+);
+}
+'''
+              text = text[:closing] + regression + text[closing:]
+
+          path.write_text(text)
           PY
 
           rm .github/workflows/repair-640-mountinfo-escape-overflow.yml
