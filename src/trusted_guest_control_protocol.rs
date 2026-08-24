@@ -611,9 +611,15 @@ fn request_from_wire(
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum OutcomeWire {
-    Succeeded { result_digest: String },
-    Refused { reason: TrustedGuestControlRefusal },
-    RecoveryRequired { debt: TrustedGuestControlRecoveryDebt },
+    Succeeded {
+        result_digest: String,
+    },
+    Refused {
+        reason: TrustedGuestControlRefusal,
+    },
+    RecoveryRequired {
+        debt: TrustedGuestControlRecoveryDebt,
+    },
 }
 
 impl From<&TrustedGuestControlOutcome> for OutcomeWire {
@@ -836,7 +842,10 @@ mod tests {
     fn canonical_request_round_trips_without_command_or_path_surface() {
         let request = request();
         let bytes = encode_trusted_guest_control_request(&request).unwrap();
-        assert_eq!(decode_trusted_guest_control_request(&bytes).unwrap(), request);
+        assert_eq!(
+            decode_trusted_guest_control_request(&bytes).unwrap(),
+            request
+        );
         let text = std::str::from_utf8(&bytes).unwrap();
         assert!(!text.contains("\"argv\""));
         assert!(!text.contains("\"environment\""));
@@ -970,9 +979,7 @@ mod tests {
         let request = request();
         for (outcome, marker) in [
             (
-                TrustedGuestControlOutcome::Refused(
-                    TrustedGuestControlRefusal::AuthorityChanged,
-                ),
+                TrustedGuestControlOutcome::Refused(TrustedGuestControlRefusal::AuthorityChanged),
                 "authority_changed",
             ),
             (
