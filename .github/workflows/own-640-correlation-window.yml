@@ -1,0 +1,102 @@
+name: Make verified correlation own exclusive window
+
+on:
+  push:
+    branches:
+      - chatgpt/640-full-correlation-owns-window
+
+permissions:
+  contents: write
+
+jobs:
+  own:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: chatgpt/640-full-correlation-owns-window
+          fetch-depth: 0
+          show-progress: false
+      - name: Carry correlation window capability forward
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('src/trusted_project_filesystem_full_correlation.rs')
+          text = path.read_text()
+
+          # Summary records the exact exclusive-window generation.
+          old = '''    filesystem_kind: ProjectDiskFilesystemKind,\n    p3_physical_provenance_bound: bool,'''
+          new = '''    filesystem_kind: ProjectDiskFilesystemKind,\n    correlation_window_generation: crate::project_disk_correlation_window::ProjectDiskCorrelationWindowGeneration,\n    p3_physical_provenance_bound: bool,'''
+          if old in text:
+              text = text.replace(old, new, 1)
+
+          getter_anchor = '''    #[must_use]\n    pub const fn role_filesystem_device_bound(&self) -> bool {'''
+          getter = '''    #[must_use]\n    pub const fn correlation_window_generation(\n        &self,\n    ) -> crate::project_disk_correlation_window::ProjectDiskCorrelationWindowGeneration {\n        self.correlation_window_generation\n    }\n\n'''
+          if getter not in text and getter_anchor in text:
+              text = text.replace(getter_anchor, getter + getter_anchor, 1)
+
+          # Verified value owns the non-cloneable window token.
+          old = '''pub struct VerifiedProjectFilesystemCorrelation {\n    summary: VerifiedProjectFilesystemCorrelationSummary,\n    filesystem_device: u64,\n}'''
+          new = '''pub struct VerifiedProjectFilesystemCorrelation {\n    summary: VerifiedProjectFilesystemCorrelationSummary,\n    window: ProjectDiskCorrelationWindow,\n    filesystem_device: u64,\n}'''
+          if old in text:
+              text = text.replace(old, new, 1)
+
+          debug_anchor = '''            .field("summary", &self.summary)\n            .field("filesystem_device", &REDACTED_DEVICE)'''
+          debug_new = '''            .field("summary", &self.summary)\n            .field("correlation_window", &"<exclusive-project-disk-guard>")\n            .field("filesystem_device", &REDACTED_DEVICE)'''
+          if debug_anchor in text:
+              text = text.replace(debug_anchor, debug_new, 1)
+
+          # Consume the window instead of borrowing it.
+          old_sig = '''pub fn verify_project_filesystem_correlation(\n    window: &ProjectDiskCorrelationWindow,'''
+          new_sig = '''pub fn verify_project_filesystem_correlation(\n    window: ProjectDiskCorrelationWindow,'''
+          if old_sig in text:
+              text = text.replace(old_sig, new_sig, 1)
+
+          # Exact window generation is captured before the token moves into the result.
+          call = '''    window\n        .confirm(current, filesystem)\n        .map_err(|_| durable_authority_mismatch())?;'''
+          replacement = '''    window\n        .confirm(current, filesystem)\n        .map_err(|_| durable_authority_mismatch())?;\n    let correlation_window_generation = window.summary().generation();'''
+          if call in text and replacement not in text:
+              text = text.replace(call, replacement, 1)
+
+          summary_anchor = '''            filesystem_kind: filesystem.kind(),\n            p3_physical_provenance_bound: true,'''
+          summary_new = '''            filesystem_kind: filesystem.kind(),\n            correlation_window_generation,\n            p3_physical_provenance_bound: true,'''
+          if summary_anchor in text:
+              text = text.replace(summary_anchor, summary_new, 1)
+
+          result_anchor = '''        },\n        filesystem_device: observed_role_filesystem_device,\n    })'''
+          result_new = '''        },\n        window,\n        filesystem_device: observed_role_filesystem_device,\n    })'''
+          if result_anchor in text:
+              text = text.replace(result_anchor, result_new, 1)
+
+          # Tests pass the owned window instead of borrowing it.
+          text = text.replace('&window(&current, &fs),', 'window(&current, &fs),')
+          text = text.replace('&window(&current, &accepted),', 'window(&current, &accepted),')
+
+          exact_assert = '''        assert_eq!(verified.summary().filesystem_generation().get(), 7);\n        assert!(verified.summary().role_filesystem_device_bound());'''
+          exact_new = '''        assert_eq!(verified.summary().filesystem_generation().get(), 7);\n        assert_eq!(verified.summary().correlation_window_generation().get(), 9);\n        assert!(verified.summary().role_filesystem_device_bound());'''
+          if exact_assert in text:
+              text = text.replace(exact_assert, exact_new, 1)
+
+          path.write_text(text)
+          PY
+      - name: Format and focused tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.97.1 --profile minimal --component rustfmt --no-self-update
+          cargo fmt --all
+          cargo test --locked trusted_project_filesystem_full_correlation
+      - name: Remove helper and publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm .github/workflows/own-640-correlation-window.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "#640 carry exclusive correlation window into verified value"
+          git push origin HEAD:chatgpt/640-full-correlation-owns-window
