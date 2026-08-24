@@ -37,8 +37,10 @@ fn fixture() -> Value {
         "repo_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "captured_at_unix_millis": 1_700_000_000_000_u64,
         "declared_binding": {
+            "project_identity": "github.com/example/project",
             "project_disk_id": "disk-a",
             "project_disk_generation": 3,
+            "project_disk_revision": 5,
             "attachment_generation": 7,
             "resident_sandbox_id": "sandbox-a",
             "resident_sandbox_generation": 11
@@ -91,6 +93,11 @@ fn decode(value: &Value) -> Result<ProjectDiskPhysicalReceipt, ProjectDiskPhysic
 #[test]
 fn parses_opaque_entries_and_exact_guest_device_without_assigning_roles() {
     let receipt = decode(&fixture()).expect("valid physical receipt");
+    assert_eq!(
+        receipt.document.declared_binding.project_identity,
+        "github.com/example/project"
+    );
+    assert_eq!(receipt.document.declared_binding.project_disk_revision, 5);
     assert_eq!(receipt.document.disk_directory.entries.len(), 2);
     assert_eq!(receipt.guest_filesystem_device.major, 8);
     assert_eq!(receipt.guest_filesystem_device.minor, 1);
