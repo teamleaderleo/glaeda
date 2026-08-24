@@ -1,0 +1,44 @@
+name: Research locked rustix new-mount API surface
+
+on:
+  push:
+    branches:
+      - research/rustix-new-mount-api-surface
+
+permissions:
+  contents: write
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: true
+          show-progress: false
+      - name: Materialize exact locked dependency source
+        run: cargo metadata --locked --format-version 1 >/dev/null
+      - name: Inspect rustix 1.1.4 mount API
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$(find "${CARGO_HOME:-$HOME/.cargo}/registry/src" -maxdepth 2 -type d -name 'rustix-1.1.4' -print -quit)"
+          test -n "$root"
+          {
+            printf 'rustix_root=%s\n' "$root"
+            for symbol in fsopen fsconfig fsmount move_mount open_tree; do
+              printf '\n=== %s ===\n' "$symbol"
+              grep -R -n -E "(pub( unsafe)? fn|pub.*struct|pub.*enum|fn) ${symbol}\b|\b${symbol}\(" "$root/src" | head -80 || true
+            done
+          } >/tmp/result.txt
+          cat /tmp/result.txt
+      - name: Publish owned result
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name teamleaderleo; git config user.email cheerleaderleo@outlook.com
+          OUT=research/results-rustix-new-mount-api-surface
+          git checkout --orphan "$OUT"; git rm -rf . >/dev/null 2>&1 || true
+          cp /tmp/result.txt ./rustix-new-mount-api-surface.txt
+          git add .; git commit -m 'Record locked rustix new-mount API surface'
+          git push --force origin HEAD:"$OUT"
