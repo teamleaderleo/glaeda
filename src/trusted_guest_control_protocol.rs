@@ -438,7 +438,7 @@ pub fn encode_trusted_guest_control_receipt(
         request_digest: trusted_guest_control_request_digest(request)?
             .as_str()
             .to_owned(),
-        operation: request.operation,
+        operation: request.operation.into(),
         outcome: OutcomeWire::from(outcome),
     };
     canonical_json(&wire, MAX_TRUSTED_GUEST_CONTROL_RECEIPT_BYTES)
