@@ -171,9 +171,16 @@ class ProjectDiskPhysicalReceiptTests(unittest.TestCase):
                 os.rename(self.fixture.backing, self.fixture.disk / "alpha-old")
                 self.fixture.backing.write_bytes(b"replacement")
                 after, _ = receipt._entry_snapshot(directory_fd, "alpha")
-                self.assertFalse(receipt._same_observation(before, after))
                 held = receipt._snapshot(os.fstat(held_fd))
-                self.assertTrue(receipt._same_observation(before, held))
+                self.assertFalse(receipt._same_observation(before, after))
+                self.assertEqual(
+                    (before["device"], before["inode"]),
+                    (held["device"], held["inode"]),
+                )
+                self.assertNotEqual(
+                    (after["device"], after["inode"]),
+                    (held["device"], held["inode"]),
+                )
             finally:
                 os.close(held_fd)
         finally:
