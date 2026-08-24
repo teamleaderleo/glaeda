@@ -307,6 +307,7 @@ pub fn plan_trusted_guest_control_invocation(
         .environment("PATH", LIMACTL_SAFE_PATH)
         .argument("shell")
         .argument(target.instance.as_str())
+        .argument("--")
         .argument(SUDO)
         .argument("--non-interactive")
         .argument("--")
@@ -511,6 +512,7 @@ mod tests {
                 "--tty=false",
                 "shell",
                 "resident-a",
+                "--",
                 SUDO,
                 "--non-interactive",
                 "--",
