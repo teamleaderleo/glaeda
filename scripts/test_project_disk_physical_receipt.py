@@ -221,6 +221,27 @@ class ProjectDiskPhysicalReceiptTests(unittest.TestCase):
         with self.assertRaises(OSError):
             receipt._capture_directory(link / "disk", set())
 
+    @unittest.skipUnless(sys.platform == "darwin", "requires the macOS /var root alias")
+    def test_macos_var_alias_and_direct_private_tmp_are_both_descriptor_bound(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="smolrunner-project-disk-var-alias-", dir="/private/var/tmp"
+        ) as physical_root:
+            physical_disk = Path(physical_root) / "disk"
+            physical_disk.mkdir()
+            alias_disk = Path("/var/tmp") / Path(physical_root).name / "disk"
+            through_alias = receipt._capture_directory(alias_disk, set())
+            direct = receipt._capture_directory(physical_disk, set())
+            self.assertTrue(
+                receipt._same_observation(through_alias["metadata"], direct["metadata"])
+            )
+
+        with tempfile.TemporaryDirectory(
+            prefix="smolrunner-project-disk-private-tmp-", dir="/private/tmp"
+        ) as direct_root:
+            direct_disk = Path(direct_root) / "disk"
+            direct_disk.mkdir()
+            receipt._capture_directory(direct_disk, set())
+
     def test_mountinfo_exact_mountpoint_decodes_reviewed_escapes(self) -> None:
         escaped = self.fixture.root / "escaped-mountinfo.txt"
         escaped.write_bytes(

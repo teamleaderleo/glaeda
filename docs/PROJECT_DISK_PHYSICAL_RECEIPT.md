@@ -269,3 +269,9 @@ receipt is reviewed and #565 P2 becomes its sole production minting path.
 ## Exact guest filesystem correlation
 
 The captured guest `%d:%i` stat evidence is decoded with the Linux `dev_t` encoding. Its derived major/minor pair must equal the major/minor pair on the single exact project-mount row from `/proc/self/mountinfo`. A stat from one filesystem and a mount row from another is refused. The operator-supplied standalone-disk directory is opened component-by-component with no-follow semantics and rebound after observation; symlinked path components do not become physical evidence.
+
+On macOS, Python temporary directories may be reported beneath the root `/var` compatibility alias.
+The collector accepts that one platform alias only after proving it is the root-owned system symlink
+to `/private/var`, opens the physical target component-by-component with no-follow semantics, and
+rechecks both the alias and final held directory identity. Direct `/private/tmp` paths follow the
+ordinary strict path. Other intermediate symlinks remain refused.

@@ -29,6 +29,8 @@ MAX_ENTRY_NAME_BYTES = 255
 MAX_EXPLICIT_SMALL_FILE_BYTES = 4_096
 MAX_LABEL_BYTES = 256
 ALLOCATED_BLOCK_BYTES = 512
+DARWIN_VAR_ALIAS = Path("/var")
+DARWIN_VAR_TARGET = Path("/private/var")
 
 SNAPSHOT_KEYS = {
     "device",
@@ -258,15 +260,53 @@ def _path_from_json(value: Any, label: str) -> Path:
     return _validate_exact_absolute_path(Path(value), label)
 
 
+def _darwin_var_alias_observation(path: Path, label: str) -> tuple[Path, dict[str, Any] | None]:
+    if sys.platform != "darwin" or path.parts[1:2] != ("var",):
+        return path, None
+
+    alias_stat = os.lstat(DARWIN_VAR_ALIAS)
+    alias_snapshot = _snapshot(alias_stat)
+    if not stat.S_ISLNK(alias_stat.st_mode) or alias_stat.st_uid != 0:
+        raise ReceiptError(f"{label} uses an untrusted macOS /var alias")
+
+    target = os.readlink(DARWIN_VAR_ALIAS)
+    target_path = Path(target)
+    if not target_path.is_absolute():
+        target_path = DARWIN_VAR_ALIAS.parent / target_path
+    target_path = Path(os.path.normpath(os.fspath(target_path)))
+    if target_path != DARWIN_VAR_TARGET:
+        raise ReceiptError(f"{label} uses an unexpected macOS /var alias target")
+
+    physical = DARWIN_VAR_TARGET.joinpath(*path.parts[2:])
+    return physical, {
+        "metadata": alias_snapshot,
+        "target": _os_bytes(target),
+    }
+
+
 def _open_absolute_directory(path: Path, label: str) -> int:
     path = _validate_exact_absolute_path(path, label)
+    physical_path, alias_before = _darwin_var_alias_observation(path, label)
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     current = os.open("/", flags)
     try:
-        for component in path.parts[1:]:
+        for component in physical_path.parts[1:]:
             next_fd = os.open(component, flags, dir_fd=current)
             os.close(current)
             current = next_fd
+        if alias_before is not None:
+            rebound_path, alias_after = _darwin_var_alias_observation(path, label)
+            if (
+                rebound_path != physical_path
+                or alias_after is None
+                or alias_after["target"] != alias_before["target"]
+                or not _same_observation(alias_before["metadata"], alias_after["metadata"])
+            ):
+                raise ReceiptError(f"{label} macOS /var alias changed during observation")
+            supplied_snapshot = _snapshot(os.stat(path, follow_symlinks=True))
+            held_snapshot = _snapshot(os.fstat(current))
+            if not _same_observation(supplied_snapshot, held_snapshot):
+                raise ReceiptError(f"{label} macOS /var alias rebound during observation")
         return current
     except BaseException:
         os.close(current)
