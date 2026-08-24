@@ -36,6 +36,7 @@ const GUEST_HOME: &str = "/root";
 const GUEST_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 const GUEST_CONTROL_MODE: &str = "guest-control";
 const GUEST_CONTROL_STDIO: &str = "--stdio";
+#[allow(dead_code)]
 const MAX_PRIVATE_PATH_BYTES: usize = 1_024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -134,7 +135,7 @@ pub struct TrustedGuestControlInvocationTarget {
 }
 
 impl TrustedGuestControlInvocationTarget {
-    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code, clippy::too_many_arguments)]
     pub(crate) fn from_verified(
         limactl_program: PathBuf,
         lima_home: PathBuf,
@@ -182,7 +183,9 @@ impl fmt::Debug for TrustedGuestControlInvocationTarget {
 
 pub struct TrustedGuestControlInvocationPlan {
     summary: TrustedGuestControlInvocationSummary,
+    #[allow(dead_code)]
     command: CommandSpec,
+    #[allow(dead_code)]
     stdin: Vec<u8>,
 }
 
@@ -193,11 +196,13 @@ impl TrustedGuestControlInvocationPlan {
     }
 
     #[must_use]
+    #[allow(dead_code)]
     pub(crate) const fn command(&self) -> &CommandSpec {
         &self.command
     }
 
     #[must_use]
+    #[allow(dead_code)]
     pub(crate) fn stdin(&self) -> &[u8] {
         &self.stdin
     }
@@ -338,6 +343,7 @@ pub fn plan_trusted_guest_control_invocation(
     })
 }
 
+#[allow(dead_code)]
 fn validate_private_absolute_path(
     path: PathBuf,
 ) -> Result<PathBuf, TrustedGuestControlInvocationPlanError> {
@@ -368,6 +374,7 @@ const fn plan_error(
     }
 }
 
+#[allow(dead_code)]
 const fn invalid_target() -> TrustedGuestControlInvocationPlanError {
     plan_error(
         TrustedGuestControlInvocationPlanErrorKind::InvalidTarget,
