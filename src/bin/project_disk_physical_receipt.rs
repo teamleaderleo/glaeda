@@ -1,8 +1,8 @@
-#[path = "project_disk_physical_receipt/receipt.rs"]
+#[path = "project_disk_physical_receipt/receipt/mod.rs"]
 mod receipt;
 
 #[cfg(target_os = "macos")]
-#[path = "project_disk_physical_receipt/capture.rs"]
+#[path = "project_disk_physical_receipt/capture/mod.rs"]
 mod capture;
 
 #[cfg(not(target_os = "macos"))]
