@@ -4,6 +4,12 @@
 //! or proof minting. P4 will use these values to distinguish one accepted filesystem generation
 //! from another even when the surrounding project-disk generation remains unchanged.
 
+// The format-plan constructor and canonical digest intentionally enumerate the complete fixed
+// pre-mkfs identity. Test-only identity imports also live beside that declaration. Keep these two
+// lints scoped to this child module instead of weakening crate-wide warnings.
+#[allow(clippy::too_many_arguments, unused_imports)]
+pub mod format_plan;
+
 use serde::Serialize;
 
 use crate::project_catalog::ProjectIdentity;
