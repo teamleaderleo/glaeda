@@ -1,0 +1,35 @@
+name: Materialize PR 619 product diff
+
+on:
+  pull_request:
+    branches: [tmp/619-builder-base]
+    types: [opened, reopened, synchronize, edited]
+
+permissions:
+  contents: write
+
+jobs:
+  build-product:
+    if: github.event.pull_request.head.ref == 'caterpillar/588-bounded-plain-stdin'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out PR head
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: caterpillar/588-bounded-plain-stdin
+          persist-credentials: true
+          fetch-depth: 0
+      - name: Execute the reviewed branch-local builder body
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          source = Path('.github/workflows/tmp-build-617.yml').read_text()
+          marker = '        run: |\n'
+          if source.count(marker) != 1:
+              raise SystemExit(f'unexpected builder run block count: {source.count(marker)}')
+          block = source.split(marker, 1)[1]
+          lines = [line[10:] if line.startswith('          ') else line for line in block.splitlines()]
+          Path('/tmp/build-617.sh').write_text('\n'.join(lines) + '\n')
+          PY
+          bash /tmp/build-617.sh
