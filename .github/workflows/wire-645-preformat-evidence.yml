@@ -1,0 +1,54 @@
+name: Wire sealed pre-format evidence
+
+on:
+  push:
+    branches:
+      - chatgpt/645-preformat-blank-evidence
+
+permissions:
+  contents: write
+
+jobs:
+  wire:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: chatgpt/645-preformat-blank-evidence
+          fetch-depth: 0
+          show-progress: false
+      - name: Export pre-format evidence module
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('src/project_disk_filesystem.rs')
+          text = path.read_text()
+          export = 'pub mod preformat_evidence;\n'
+          if export not in text:
+              anchor = 'pub mod format_plan;\n'
+              if text.count(anchor) != 1:
+                  raise SystemExit('unexpected format_plan export anchor')
+              text = text.replace(anchor, anchor + export)
+          path.write_text(text)
+          PY
+      - name: Format and focused tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.97.1 --profile minimal --component rustfmt --no-self-update
+          cargo fmt --all
+          cargo test --locked project_disk_filesystem::preformat_evidence
+      - name: Remove helper and publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm .github/workflows/wire-645-preformat-evidence.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "#645 wire sealed pre-format blank-device evidence"
+          git push origin HEAD:chatgpt/645-preformat-blank-evidence
