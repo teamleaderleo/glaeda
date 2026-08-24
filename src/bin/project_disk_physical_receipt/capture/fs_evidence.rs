@@ -96,7 +96,8 @@ impl HeldEntry {
             }
         }
         if self.kind == ReceiptDirectoryEntryKind::Regular {
-            if let (Some(expected), Some(descriptor)) = (&self.small_regular_file, &self.descriptor) {
+            if let (Some(expected), Some(descriptor)) = (&self.small_regular_file, &self.descriptor)
+            {
                 let actual = read_small_regular_file(descriptor, self.before.logical_bytes)?;
                 if &actual != expected {
                     return Err(changed());
@@ -254,8 +255,8 @@ fn read_small_regular_file(
 pub(super) fn open_absolute_directory(
     path: &Path,
 ) -> Result<OwnedFd, ProjectDiskPhysicalCaptureError> {
-    let mut current = fs::open(Path::new("/"), DIRECTORY_FLAGS, Mode::empty())
-        .map_err(|_| filesystem_error())?;
+    let mut current =
+        fs::open(Path::new("/"), DIRECTORY_FLAGS, Mode::empty()).map_err(|_| filesystem_error())?;
     let mut components = path.components();
     if components.next() != Some(Component::RootDir) {
         return Err(invalid_request());
