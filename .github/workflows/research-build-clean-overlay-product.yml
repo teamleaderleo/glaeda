@@ -42,7 +42,7 @@ jobs:
               1,
           )
           pattern_old = 'r"    struct FakeBackend \\{.*?\\n    \\}\\n\\n    fn inputs\\("'
-          pattern_new = 'r"    struct FakeBackend \\{.*?(?=\\n    fn inputs\\()"'
+          pattern_new = 'r"struct FakeBackend \\{.*?(?=\\n    fn inputs\\()"'
           if source.count(pattern_old) != 1:
               raise SystemExit(f'fake backend regex count={source.count(pattern_old)}')
           source = source.replace(pattern_old, pattern_new, 1)
@@ -51,6 +51,11 @@ jobs:
           if source.count(expression_old) != 1:
               raise SystemExit(f'fake backend replacement count={source.count(expression_old)}')
           source = source.replace(expression_old, expression_new, 1)
+          tests_old = 'r"    #\\[test\\]\\n    fn fake_backend_accepts_exact_descriptor_bound_transaction\\(\\).*?\\n\\}\\s*$"'
+          tests_new = 'r"#\\[test\\]\\n\\s*fn fake_backend_accepts_exact_descriptor_bound_transaction\\(\\).*?\\n\\}\\s*$"'
+          if source.count(tests_old) != 1:
+              raise SystemExit(f'final tests regex count={source.count(tests_old)}')
+          source = source.replace(tests_old, tests_new, 1)
           marker = '        run: |\n'
           if source.count(marker) != 1:
               raise SystemExit(f'run block count={source.count(marker)}')
