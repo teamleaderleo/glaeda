@@ -2,7 +2,7 @@
 
 This runbook is the read-only acceptance slice required before issue #565 P2 can become production authority.
 
-The receipt answers an evidence question only: what exact host-side standalone-disk directory and direct entries were present while one exact resident Lima VM exposed one exact Linux filesystem device at the declared project mount? The declared SmolRunner project-disk, attachment, and resident-sandbox generations are labels carried into the receipt for later correlation review. They gain no authority from the receipt by themselves.
+The receipt answers an evidence question only: what exact host-side standalone-disk directory and direct entries were present while one exact resident Lima VM exposed one exact Linux filesystem device at the declared project mount? The declared SmolRunner project identity, project-disk ID/generation/revision, attachment generation, and resident-sandbox ID/generation are labels carried into the receipt for later correlation review. They gain no authority from the receipt by themselves.
 
 ## Boundary
 
@@ -41,7 +41,7 @@ uname -a
 
 Set the inputs from the current controlled disk/attachment experiment. In particular, set `PROJECT_DISK_DIRECTORY` from direct observation of the installed Lima state. If the exact directory itself is still unknown, capture `limactl disk list --json` separately and stop there; do not manufacture a path from remembered Lima layout.
 
-The generation values must be the exact currently declared #565 P1 values for this controlled disk attachment:
+The declared identity values must come from the exact current #565 P1 lease state for this controlled disk attachment. `PROJECT_DISK_REVISION` is the current lease revision whose attachment is being observed:
 
 ```sh
 export LIMA_HOME='... exact current Lima home ...'
@@ -50,8 +50,10 @@ export PROJECT_DISK_NAME='... current Lima disk locator ...'
 export LIMA_INSTANCE='... exact resident sandbox instance ...'
 export GUEST_PROJECT_MOUNT='... exact mounted project path in the guest ...'
 export GUEST_CACHE_PATH='... exact guest cache path used by the existing Lima host-identity request ...'
+export PROJECT_IDENTITY='github.com/owner/repository'
 export PROJECT_DISK_ID='... exact SmolRunner project-disk ID ...'
 export PROJECT_DISK_GENERATION='...'
+export PROJECT_DISK_REVISION='... exact current lease revision ...'
 export ATTACHMENT_GENERATION='...'
 export RESIDENT_SANDBOX_ID='... exact SmolRunner resident-sandbox ID ...'
 export RESIDENT_SANDBOX_GENERATION='...'
@@ -72,8 +74,10 @@ cargo run --locked --bin project_disk_physical_receipt -- \
   --guest-project-mount "$GUEST_PROJECT_MOUNT" \
   --guest-cache-path "$GUEST_CACHE_PATH" \
   --limactl "$(command -v limactl)" \
+  --project-identity "$PROJECT_IDENTITY" \
   --project-disk-id "$PROJECT_DISK_ID" \
   --project-disk-generation "$PROJECT_DISK_GENERATION" \
+  --project-disk-revision "$PROJECT_DISK_REVISION" \
   --attachment-generation "$ATTACHMENT_GENERATION" \
   --resident-sandbox-id "$RESIDENT_SANDBOX_ID" \
   --resident-sandbox-generation "$RESIDENT_SANDBOX_GENERATION" \
@@ -92,7 +96,7 @@ The first accepted receipt must establish the current installed schema before #5
 4. Exact current `in_use_by` representation from the observed entry type/bytes or symlink target, plus its relationship to the resident sandbox observation.
 5. `limactl disk list --json` and exact instance JSON as external Lima observations only.
 6. Guest mountinfo's one exact `major:minor`, filesystem type, and source at `GUEST_PROJECT_MOUNT`, with raw `lsblk` JSON retained for current block-device correlation.
-7. The declared SmolRunner project-disk generation, attachment generation, resident-sandbox ID, and resident-sandbox generation that the operator intended to observe.
+7. The declared canonical project identity, project-disk ID/generation/revision, attachment generation, resident-sandbox ID, and resident-sandbox generation from the exact P1 lease state the operator intended to observe.
 
 A disk name match or Lima lock match never becomes SmolRunner ownership by itself. A later production observer must bind host-controlled physical identity to the durable SmolRunner generations and detect same-name replacement through descriptor rebind evidence.
 
