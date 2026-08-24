@@ -1,0 +1,47 @@
+name: Consume sealed project-filesystem proof
+
+on:
+  push:
+    branches:
+      - chatgpt/640-consume-correlation-proof
+
+permissions:
+  contents: write
+
+jobs:
+  wire:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: chatgpt/640-consume-correlation-proof
+          fetch-depth: 0
+          show-progress: false
+      - name: Make production executor consume proof
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('src/trusted_overlay_mount_execution.rs')
+          text = path.read_text()
+          old = '''pub fn execute_trusted_overlay_mount(\n    plan: &TrustedOverlayMountPlan,\n    descriptor_lease: &TrustedOverlayMountDescriptorLease,\n    source_anchor: &OverlaySourceAnchorRecord,\n    task_view: &OverlayTaskViewRecord,\n    correlation: &TrustedProjectFilesystemCorrelationProof,\n) -> Result<TrustedOverlayMountExecutionReceipt, TrustedOverlayMountExecutionError> {\n    execute_with_backend(\n        plan,\n        descriptor_lease,\n        source_anchor,\n        task_view,\n        correlation,\n        &mut RustixOverlayMountBackend,\n    )\n}'''
+          new = '''pub fn execute_trusted_overlay_mount(\n    plan: &TrustedOverlayMountPlan,\n    descriptor_lease: &TrustedOverlayMountDescriptorLease,\n    source_anchor: &OverlaySourceAnchorRecord,\n    task_view: &OverlayTaskViewRecord,\n    correlation: TrustedProjectFilesystemCorrelationProof,\n) -> Result<TrustedOverlayMountExecutionReceipt, TrustedOverlayMountExecutionError> {\n    execute_with_backend(\n        plan,\n        descriptor_lease,\n        source_anchor,\n        task_view,\n        &correlation,\n        &mut RustixOverlayMountBackend,\n    )\n}'''
+          if text.count(old) != 1:
+              raise SystemExit('unexpected #589 public executor shape')
+          path.write_text(text.replace(old, new))
+          PY
+      - name: Format and remove helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.97.1 --profile minimal --component rustfmt --no-self-update
+          cargo fmt --all
+          rm .github/workflows/wire-640-consume-proof.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "#640 consume project-filesystem proof in #589"
+          git push origin HEAD:chatgpt/640-consume-correlation-proof
