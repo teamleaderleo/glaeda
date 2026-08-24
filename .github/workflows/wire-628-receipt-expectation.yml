@@ -1,0 +1,65 @@
+name: Bind #628 receipt to exact rerun expectation
+
+on:
+  push:
+    branches:
+      - chatgpt/628-correlation-receipt-expectation
+
+permissions:
+  contents: write
+
+jobs:
+  wire:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: chatgpt/628-correlation-receipt-expectation
+          fetch-depth: 0
+          show-progress: false
+      - name: Make expectation-bound API canonical
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          base = Path('src/project_filesystem_correlation_receipt.rs')
+          text = base.read_text()
+          old = 'pub fn validate_project_filesystem_correlation_receipt_json(\n'
+          new = 'pub(crate) fn validate_project_filesystem_correlation_receipt_json(\n'
+          if old in text:
+              text = text.replace(old, new, 1)
+          base.write_text(text)
+
+          lib = Path('src/lib.rs')
+          text = lib.read_text()
+          export = '/// Exact-current acceptance wrapper for the private #628 full-correlation receipt.\npub mod project_filesystem_correlation_receipt_expectation;\n'
+          if export not in text:
+              anchor = '/// Pure bounded validator for the final #628 full project-filesystem correlation receipt.\npub mod project_filesystem_correlation_receipt;\n'
+              if text.count(anchor) != 1:
+                  raise SystemExit('unexpected receipt validator export anchor')
+              text = text.replace(anchor, anchor + export)
+          lib.write_text(text)
+          PY
+      - name: Format and focused tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.97.1 --profile minimal --component rustfmt --no-self-update
+          cargo fmt --all
+          cargo test --locked project_filesystem_correlation_receipt
+          cargo test --locked project_filesystem_correlation_receipt_expectation
+      - name: Remove helpers and publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f .github/workflows/wire-628-correlation-receipt.yml
+          rm .github/workflows/wire-628-receipt-expectation.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "#628 require exact current rerun expectation"
+          git push origin HEAD:chatgpt/628-correlation-receipt-expectation
