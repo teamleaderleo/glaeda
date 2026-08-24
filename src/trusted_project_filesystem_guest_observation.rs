@@ -356,11 +356,13 @@ fn decode_mountinfo_field(
         if !octal.iter().all(u8::is_ascii_digit) || octal.iter().any(|byte| *byte > b'7') {
             return Err(mountinfo_malformed());
         }
-        let decoded = (octal[0] - b'0') * 64 + (octal[1] - b'0') * 8 + (octal[2] - b'0');
+        let decoded = u16::from(octal[0] - b'0') * 64
+            + u16::from(octal[1] - b'0') * 8
+            + u16::from(octal[2] - b'0');
         if !matches!(decoded, 9 | 10 | 32 | 92) {
             return Err(mountinfo_malformed());
         }
-        result.push(decoded);
+        result.push(u8::try_from(decoded).map_err(|_| mountinfo_malformed())?);
         index += 4;
     }
     Ok(result)
@@ -688,6 +690,24 @@ mod tests {
                 1,
                 b"/srv/quarryadata",
                 unreviewed,
+            )
+            .unwrap_err()
+            .kind(),
+            TrustedProjectFilesystemGuestObservationErrorKind::MountinfoMalformed
+        );
+    }
+
+    #[test]
+    fn overflowing_mountinfo_escape_is_bounded_malformed() {
+        let device = make_linux_device(8, 17);
+        let overflowing = b"73 29 8:17 / /srv/quarry\\777data rw - ext4 /dev/vdb rw\n";
+        assert_eq!(
+            observe_trusted_project_filesystem_guest(
+                &filesystem(ProjectDiskFilesystemKind::Ext4),
+                device,
+                1,
+                b"/srv/quarrydata",
+                overflowing,
             )
             .unwrap_err()
             .kind(),
