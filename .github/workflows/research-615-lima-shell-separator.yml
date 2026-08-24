@@ -1,9 +1,9 @@
 name: Research verify Lima shell separator hardening
 
 on:
-  pull_request:
-    paths:
-      - ".github/workflows/research-615-lima-shell-separator.yml"
+  push:
+    branches:
+      - research/615-lima-shell-separator
 
 permissions:
   contents: write
