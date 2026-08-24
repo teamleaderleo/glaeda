@@ -1,0 +1,93 @@
+name: Research cross-owner Git alternates
+
+on:
+  push:
+    branches:
+      - research/hot-linux-physical-pr
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    steps:
+      - name: Probe root-owned immutable seed with private admin Git metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          LAB="$RUNNER_TEMP/smolrunner-git-alternates"
+          SRC="$LAB/source"
+          SEED="$LAB/seed.git"
+          ADMIN_HOME=/var/lib/smol-admin-alt
+          rm -rf "$LAB"
+          mkdir -p "$SRC"
+
+          /usr/bin/git -C "$SRC" init -q
+          /usr/bin/git -C "$SRC" config user.name research
+          /usr/bin/git -C "$SRC" config user.email research@example.invalid
+          for i in $(seq 1 256); do
+            printf 'object-%04d-%01024d\n' "$i" "$i" >"$SRC/file-$i.txt"
+          done
+          /usr/bin/git -C "$SRC" add .
+          /usr/bin/git -C "$SRC" commit -q -m one
+          for i in $(seq 1 64); do
+            printf 'second-%04d-%01024d\n' "$i" "$i" >>"$SRC/file-$i.txt"
+          done
+          /usr/bin/git -C "$SRC" add .
+          /usr/bin/git -C "$SRC" commit -q -m two
+          /usr/bin/git -C "$SRC" gc --prune=now
+
+          /usr/bin/git clone --bare --local --no-hardlinks "$SRC" "$SEED"
+          sudo chown -R root:root "$SEED"
+          sudo find "$SEED" -type d -exec chmod 0555 {} +
+          sudo find "$SEED" -type f -exec chmod 0444 {} +
+          sudo useradd --system --create-home --home-dir "$ADMIN_HOME" --shell /bin/bash smol-admin-alt 2>/dev/null || true
+          au="$(id -u smol-admin-alt)"
+          ag="$(id -g smol-admin-alt)"
+
+          seed_digest() {
+            sudo find "$SEED/objects" -type f -print0 \
+              | sudo sort -z \
+              | sudo xargs -0 sha256sum \
+              | sha256sum \
+              | cut -d' ' -f1
+          }
+          before="$(seed_digest)"
+          printf 'seed_before=%s\n' "$before"
+          printf 'seed_object_bytes=%s\n' "$(sudo du -sb "$SEED/objects" | cut -f1)"
+          printf 'seed_owner=%s:%s mode=%s\n' \
+            "$(sudo stat -c %u "$SEED")" "$(sudo stat -c %g "$SEED")" "$(sudo stat -c %a "$SEED")"
+
+          admin=(sudo -u smol-admin-alt /usr/bin/env -i HOME="$ADMIN_HOME" PATH=/usr/bin:/bin GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null XDG_CONFIG_HOME="$ADMIN_HOME/.config")
+          for kind in shared reference; do
+            parent="$LAB/$kind"
+            sudo mkdir "$parent"
+            sudo chown "$au:$ag" "$parent"
+            sudo chmod 0700 "$parent"
+            start="$(date +%s%N)"
+            if [ "$kind" = shared ]; then
+              "${admin[@]}" /usr/bin/git clone --shared --no-checkout "$SEED" "$parent/task"
+            else
+              "${admin[@]}" /usr/bin/git clone --reference "$SEED" --no-local --no-checkout "$SEED" "$parent/task"
+            fi
+            stop="$(date +%s%N)"
+            printf '%s_clone_ns=%s\n' "$kind" "$((stop-start))"
+
+            "${admin[@]}" /usr/bin/git -C "$parent/task" cat-file -e 'HEAD^{tree}'
+            alt="$parent/task/.git/objects/info/alternates"
+            sudo test -f "$alt"
+            printf '%s_alternates=%s\n' "$kind" "$(sudo cat "$alt")"
+            printf '%s_object_files=%s\n' "$kind" "$(sudo find "$parent/task/.git/objects" -type f | wc -l | tr -d ' ')"
+            printf '%s_object_bytes=%s\n' "$kind" "$(sudo du -sb "$parent/task/.git/objects" | cut -f1)"
+            printf '%s_gitdir_owner=%s:%s\n' "$kind" \
+              "$(sudo stat -c %u "$parent/task/.git")" "$(sudo stat -c %g "$parent/task/.git")"
+          done
+
+          after="$(seed_digest)"
+          printf 'seed_after=%s\n' "$after"
+          test "$before" = "$after"
+          test "$(sudo stat -c %u "$SEED")" = 0
+          test "$(sudo stat -c %g "$SEED")" = 0
+          test -z "$(sudo find "$SEED" -perm /022 -print -quit)"
