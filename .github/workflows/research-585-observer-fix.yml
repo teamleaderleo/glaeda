@@ -25,72 +25,22 @@ jobs:
           set -euo pipefail
           python3 - <<'PY'
           from pathlib import Path
+          import re
 
           p = Path("src/immutable_git_object_pool_observation.rs")
           s = p.read_text()
 
-          def replace_once(old: str, new: str, label: str) -> None:
+          def sub_once(pattern: str, replacement: str, label: str) -> None:
               global s
-              count = s.count(old)
+              s2, count = re.subn(pattern, replacement, s, count=1, flags=re.MULTILINE | re.DOTALL)
               if count != 1:
                   raise SystemExit(f"{label}: expected one match, saw {count}")
-              s = s.replace(old, new, 1)
+              s = s2
 
-          replace_once(
-              "use rustix::io::{Errno, fcntl_dupfd_cloexec};",
-              "use rustix::io::Errno;",
-              "unused rustix import",
-          )
+          if s.count("use rustix::io::{Errno, fcntl_dupfd_cloexec};") != 1:
+              raise SystemExit("unexpected rustix import seam")
+          s = s.replace("use rustix::io::{Errno, fcntl_dupfd_cloexec};", "use rustix::io::Errno;", 1)
 
-          old_confirm = '''    pub fn confirm(&self) -> Result<(), ImmutableGitObjectPoolObservationError> {
-              require_parent_identity(
-                  &self.parent,
-                  self.expected_owner_uid,
-                  self.expected_owner_gid,
-                  &self.parent_identity,
-              )?;
-              let reopened = rustix_fs::openat(
-                  self.parent.as_fd(),
-                  &self.generation_name,
-                  DIRECTORY_FLAGS,
-                  Mode::empty(),
-              )
-              .map_err(map_open)?;
-              require_directory_snapshot(
-                  &reopened,
-                  self.expected_owner_uid,
-                  self.expected_owner_gid,
-                  GENERATION_MODE,
-                  &self.root_snapshot,
-              )?;
-              require_directory_snapshot(
-                  &self.root,
-                  self.expected_owner_uid,
-                  self.expected_owner_gid,
-                  GENERATION_MODE,
-                  &self.root_snapshot,
-              )?;
-              require_directory_snapshot(
-                  &self.objects,
-                  self.expected_owner_uid,
-                  self.expected_owner_gid,
-                  GENERATION_MODE,
-                  &self.objects_snapshot,
-              )?;
-              verify_marker(
-                  &self.root,
-                  &self.binding,
-                  self.expected_owner_uid,
-                  self.expected_owner_gid,
-              )?;
-              require_no_nested_alternates(
-                  &self.root,
-                  self.expected_owner_uid,
-                  self.expected_owner_gid,
-              )?;
-              Ok(())
-          }
-          '''
           new_confirm = '''    pub fn confirm(&self) -> Result<(), ImmutableGitObjectPoolObservationError> {
               require_parent_identity(
                   &self.parent,
@@ -179,23 +129,18 @@ jobs:
               Ok(())
           }
           '''
-          replace_once(old_confirm, new_confirm, "confirm")
+          sub_once(
+              r"    pub fn confirm\(&self\) -> Result<\(\), ImmutableGitObjectPoolObservationError> \{.*?^    \}\n(?=\}\n\nimpl fmt::Debug)",
+              new_confirm,
+              "confirm",
+          )
 
-          old_precheck = '''    verify_marker(
-              &root,
-              binding,
-              expected_owner_uid,
-              expected_owner_gid,
-          )?;
-          require_no_nested_alternates(&root, expected_owner_uid, expected_owner_gid)?;
-          let binding_digest = git_object_pool_binding_digest(binding).map_err(|_| marker_mismatch())?;
-          '''
-          new_precheck = '''    let binding_digest = git_object_pool_binding_digest(binding).map_err(|_| marker_mismatch())?;
-          '''
-          replace_once(old_precheck, new_precheck, "duplicate observation checks")
+          sub_once(
+              r"    verify_marker\(\s*&root,\s*binding,\s*expected_owner_uid,\s*expected_owner_gid,\s*\)\?;\s*require_no_nested_alternates\(&root, expected_owner_uid, expected_owner_gid\)\?;\s*",
+              "",
+              "duplicate observation checks",
+          )
 
-          helper_anchor = '''fn verify_marker(
-          '''
           helper = '''fn require_current_directory_entry(
               parent: &OwnedFd,
               name: &OsStr,
@@ -215,43 +160,11 @@ jobs:
               )
           }
 
-          fn verify_marker(
           '''
-          replace_once(helper_anchor, helper, "directory-entry rebind helper")
+          if s.count("fn verify_marker(") != 1:
+              raise SystemExit("verify marker seam changed")
+          s = s.replace("fn verify_marker(", helper + "fn verify_marker(", 1)
 
-          old_alternates = '''fn require_no_nested_alternates(
-              root: &OwnedFd,
-              expected_uid: u32,
-              expected_gid: u32,
-          ) -> Result<(), ImmutableGitObjectPoolObservationError> {
-              let objects = rustix_fs::openat(root.as_fd(), OBJECTS_NAME, DIRECTORY_FLAGS, Mode::empty())
-                  .map_err(map_open)?;
-              let objects_snapshot = snapshot_directory(&objects)?;
-              require_frozen_directory(
-                  &objects_snapshot,
-                  expected_uid,
-                  expected_gid,
-                  GENERATION_MODE,
-              )?;
-              let info = match rustix_fs::openat(objects.as_fd(), INFO_NAME, DIRECTORY_FLAGS, Mode::empty()) {
-                  Ok(info) => info,
-                  Err(Errno::NOENT) => return Ok(()),
-                  Err(error) => return Err(map_open(error)),
-              };
-              let info_snapshot = snapshot_directory(&info)?;
-              require_frozen_directory(
-                  &info_snapshot,
-                  expected_uid,
-                  expected_gid,
-                  GENERATION_MODE,
-              )?;
-              match rustix_fs::openat(info.as_fd(), ALTERNATES_NAME, FILE_FLAGS, Mode::empty()) {
-                  Ok(_) => Err(nested_alternate()),
-                  Err(Errno::NOENT) => Ok(()),
-                  Err(error) => Err(map_open(error)),
-              }
-          }
-          '''
           new_alternates = '''fn require_no_nested_alternates(
               objects: &OwnedFd,
               objects_snapshot: &DirectorySnapshot,
@@ -315,22 +228,14 @@ jobs:
               )?;
               Ok(())
           }
-          '''
-          replace_once(old_alternates, new_alternates, "alternates check")
 
-          old_file_identity = '''fn file_identity(metadata: &std::fs::Metadata) -> (u64, u64, u32, u32, u32, u64, i64, i64) {
-              (
-                  metadata.dev(),
-                  metadata.ino(),
-                  metadata.uid(),
-                  metadata.gid(),
-                  metadata.mode(),
-                  metadata.len(),
-                  metadata.mtime(),
-                  metadata.ctime(),
-              )
-          }
           '''
+          sub_once(
+              r"fn require_no_nested_alternates\(.*?^\}\n\n(?=fn file_identity)",
+              new_alternates,
+              "alternates check",
+          )
+
           new_file_identity = '''fn file_identity(
               metadata: &std::fs::Metadata,
           ) -> (u64, u64, u32, u32, u32, u64, u64, i64, i64, i64, i64) {
@@ -348,30 +253,30 @@ jobs:
                   metadata.ctime_nsec(),
               )
           }
-          '''
-          replace_once(old_file_identity, new_file_identity, "marker metadata identity")
 
-          replace_once(
-              "    use std::fs;\n",
-              "    use std::ffi::OsStr;\n    use std::fs;\n",
-              "test OsStr import",
-          )
-          replace_once(
-              '''        ImmutableGitObjectPoolLocation, ImmutableGitObjectPoolObservationErrorKind, MARKER_NAME,
-                  OBJECTS_NAME, PARENT_MODE, observe_with_owner,
-              };
-              ''',
-              '''        ImmutableGitObjectPoolLocation, ImmutableGitObjectPoolObservationErrorKind, MARKER_NAME,
-                  OBJECTS_NAME, PARENT_MODE, observe_with_owner, require_current_directory_entry,
-              };
-              ''',
-              "test helper import",
+          '''
+          sub_once(
+              r"fn file_identity\(.*?^\}\n\n(?=fn validate_absolute_path)",
+              new_file_identity,
+              "marker metadata identity",
           )
 
-          test_anchor = '''    #[test]
-              fn location_debug_never_exposes_private_path() {
+          if s.count("    use std::fs;\n") != 1:
+              raise SystemExit("test import seam changed")
+          s = s.replace("    use std::fs;\n", "    use std::ffi::OsStr;\n    use std::fs;\n", 1)
+          old_import = '''        ImmutableGitObjectPoolLocation, ImmutableGitObjectPoolObservationErrorKind, MARKER_NAME,
+              OBJECTS_NAME, PARENT_MODE, observe_with_owner,
+          };
           '''
-          tests = '''    #[test]
+          new_import = '''        ImmutableGitObjectPoolLocation, ImmutableGitObjectPoolObservationErrorKind, MARKER_NAME,
+              OBJECTS_NAME, PARENT_MODE, observe_with_owner, require_current_directory_entry,
+          };
+          '''
+          if s.count(old_import) != 1:
+              raise SystemExit("test helper import seam changed")
+          s = s.replace(old_import, new_import, 1)
+
+          extra_tests = '''    #[test]
               fn absent_objects_info_is_accepted_when_generation_is_already_frozen() {
                   let binding = binding(1);
                   let fixture = Fixture::new(&binding);
@@ -426,24 +331,17 @@ jobs:
                   );
               }
 
-              #[test]
-              fn location_debug_never_exposes_private_path() {
           '''
-          replace_once(test_anchor, tests, "race/rebind tests")
-
+          marker = "    #[test]\n    fn location_debug_never_exposes_private_path() {\n"
+          if s.count(marker) != 1:
+              raise SystemExit("test insertion seam changed")
+          s = s.replace(marker, extra_tests + marker, 1)
           p.write_text(s)
 
           lib = Path("src/lib.rs")
           ls = lib.read_text()
-          marker = '''/// Pure fixed marker codec for immutable Git object-pool generations.
-          pub mod immutable_git_object_pool_marker;
-          '''
-          addition = '''/// Pure fixed marker codec for immutable Git object-pool generations.
-          pub mod immutable_git_object_pool_marker;
-          /// Read-only descriptor-bound observation of frozen immutable Git object-pool generations.
-          #[cfg(target_os = "linux")]
-          pub mod immutable_git_object_pool_observation;
-          '''
+          marker = "/// Pure fixed marker codec for immutable Git object-pool generations.\npub mod immutable_git_object_pool_marker;\n"
+          addition = marker + "/// Read-only descriptor-bound observation of frozen immutable Git object-pool generations.\n#[cfg(target_os = \"linux\")]\npub mod immutable_git_object_pool_observation;\n"
           if ls.count(marker) != 1:
               raise SystemExit("lib export point changed")
           lib.write_text(ls.replace(marker, addition, 1))
@@ -455,7 +353,7 @@ jobs:
           cargo clippy --locked --all-targets --all-features -- -D warnings
           git diff --check
 
-          git rm .github/workflows/research-585-observer-fix.yml
+          git rm .github/workflows/research-585-observer-fix.yml .github/research-585-trigger
           git config user.name "smolrunner-research-generator"
           git config user.email "actions@users.noreply.github.com"
           git add src/immutable_git_object_pool_observation.rs src/lib.rs
