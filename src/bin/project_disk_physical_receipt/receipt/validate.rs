@@ -3,8 +3,9 @@ use std::path::{Component, Path};
 
 use serde_json::Value;
 use smolrunner::artifact::Sha256Digest;
+use smolrunner::project_catalog::ProjectIdentity;
 use smolrunner::project_disk_lease::{
-    ProjectDiskAttachmentGeneration, ProjectDiskGeneration, ProjectDiskId,
+    ProjectDiskAttachmentGeneration, ProjectDiskGeneration, ProjectDiskId, ProjectDiskRevision,
     ResidentSandboxGeneration, ResidentSandboxId,
 };
 
@@ -33,10 +34,14 @@ pub(super) fn validate_document(
         return Err(invalid_field("disk_directory.path"));
     }
 
+    ProjectIdentity::parse(&document.declared_binding.project_identity)
+        .map_err(|_| invalid_field("declared_binding.project_identity"))?;
     ProjectDiskId::parse(&document.declared_binding.project_disk_id)
         .map_err(|_| invalid_field("declared_binding.project_disk_id"))?;
     ProjectDiskGeneration::new(document.declared_binding.project_disk_generation)
         .map_err(|_| invalid_field("declared_binding.project_disk_generation"))?;
+    ProjectDiskRevision::new(document.declared_binding.project_disk_revision)
+        .map_err(|_| invalid_field("declared_binding.project_disk_revision"))?;
     ProjectDiskAttachmentGeneration::new(document.declared_binding.attachment_generation)
         .map_err(|_| invalid_field("declared_binding.attachment_generation"))?;
     ResidentSandboxId::parse(&document.declared_binding.resident_sandbox_id)
@@ -53,10 +58,7 @@ pub(super) fn validate_document(
 
     validate_command(&document.lima.limactl_version, "lima.limactl_version")?;
     validate_command(&document.lima.disk_list_json, "lima.disk_list_json")?;
-    validate_command(
-        &document.lima.instance_list_json,
-        "lima.instance_list_json",
-    )?;
+    validate_command(&document.lima.instance_list_json, "lima.instance_list_json")?;
     validate_command(&document.guest.mountinfo, "guest.mountinfo")?;
     validate_command(
         &document.guest.block_devices_json,
@@ -64,10 +66,7 @@ pub(super) fn validate_document(
     )?;
     validate_command_contract(&document)?;
     validate_json_stdout(&document.lima.disk_list_json, "lima.disk_list_json")?;
-    validate_json_stdout(
-        &document.lima.instance_list_json,
-        "lima.instance_list_json",
-    )?;
+    validate_json_stdout(&document.lima.instance_list_json, "lima.instance_list_json")?;
     validate_json_stdout(
         &document.guest.block_devices_json,
         "guest.block_devices_json",
@@ -94,6 +93,7 @@ fn validate_directory(
         return Err(invalid_field("disk_directory"));
     }
     validate_snapshot(&directory.before, "disk_directory")?;
+    validate_snapshot(&directory.after, "disk_directory")?;
     if directory.entries.is_empty()
         || directory.entries.len() > MAX_PROJECT_DISK_RECEIPT_ENTRY_COUNT
     {
@@ -128,6 +128,7 @@ fn validate_directory(
             return Err(changed("disk_directory.entries"));
         }
         validate_snapshot(&entry.before, "disk_directory.entries")?;
+        validate_snapshot(&entry.after, "disk_directory.entries")?;
         validate_entry_kind(entry)?;
     }
     Ok(())
@@ -146,10 +147,10 @@ fn validate_entry_kind(
                 let bytes = entry
                     .small_regular_file_hex
                     .as_deref()
-                    .and_then(|value| {
-                        decode_hex(value, MAX_PROJECT_DISK_RECEIPT_SMALL_FILE_BYTES)
-                    })
-                    .ok_or_else(|| invalid_field("disk_directory.entries.small_regular_file_hex"))?;
+                    .and_then(|value| decode_hex(value, MAX_PROJECT_DISK_RECEIPT_SMALL_FILE_BYTES))
+                    .ok_or_else(|| {
+                        invalid_field("disk_directory.entries.small_regular_file_hex")
+                    })?;
                 if bytes.len() as u64 != entry.before.logical_bytes {
                     return Err(invalid_field(
                         "disk_directory.entries.small_regular_file_hex",
@@ -179,9 +180,7 @@ fn validate_entry_kind(
                 .and_then(|value| decode_hex(value, MAX_PATH_BYTES))
                 .ok_or_else(|| invalid_field("disk_directory.entries.symlink_target_hex"))?;
             if target.is_empty() || target.len() as u64 != entry.before.logical_bytes {
-                return Err(invalid_field(
-                    "disk_directory.entries.symlink_target_hex",
-                ));
+                return Err(invalid_field("disk_directory.entries.symlink_target_hex"));
             }
         }
         ReceiptDirectoryEntryKind::Other => {
@@ -372,10 +371,7 @@ fn parse_guest_mount(
         }
         let fields = line.split(|byte| *byte == b' ').collect::<Vec<_>>();
         if fields.len() < 10 {
-            return Err(malformed(
-                "guest.mountinfo",
-                "project_disk_receipt_mountinfo_invalid",
-            ));
+            return Err(mountinfo_invalid());
         }
         if decode_mountinfo_field(fields[4])? != expected {
             continue;
@@ -383,46 +379,19 @@ fn parse_guest_mount(
         let separator = fields
             .iter()
             .position(|field| *field == b"-")
-            .ok_or_else(|| {
-                malformed(
-                    "guest.mountinfo",
-                    "project_disk_receipt_mountinfo_invalid",
-                )
-            })?;
+            .ok_or_else(mountinfo_invalid)?;
         if separator + 3 >= fields.len() || separator < 6 {
-            return Err(malformed(
-                "guest.mountinfo",
-                "project_disk_receipt_mountinfo_invalid",
-            ));
+            return Err(mountinfo_invalid());
         }
-        let device = std::str::from_utf8(fields[2])
-            .ok()
-            .and_then(|value| value.split_once(':'))
-            .and_then(|(major, minor)| Some((major.parse().ok()?, minor.parse().ok()?)))
-            .ok_or_else(|| {
-                malformed(
-                    "guest.mountinfo",
-                    "project_disk_receipt_mountinfo_invalid",
-                )
-            })?;
+        let (major, minor) = parse_device_number(fields[2]).ok_or_else(mountinfo_invalid)?;
         let filesystem_type = std::str::from_utf8(fields[separator + 1])
-            .map_err(|_| {
-                malformed(
-                    "guest.mountinfo",
-                    "project_disk_receipt_mountinfo_invalid",
-                )
-            })?
+            .map_err(|_| mountinfo_invalid())?
             .to_owned();
         let source = String::from_utf8(decode_mountinfo_field(fields[separator + 2])?)
-            .map_err(|_| {
-                malformed(
-                    "guest.mountinfo",
-                    "project_disk_receipt_mountinfo_invalid",
-                )
-            })?;
+            .map_err(|_| mountinfo_invalid())?;
         matches.push(GuestFilesystemDeviceObservation {
-            major: device.0,
-            minor: device.1,
+            major,
+            minor,
             filesystem_type,
             source,
         });
@@ -435,7 +404,13 @@ fn parse_guest_mount(
             "project disk physical receipt does not identify one exact guest filesystem mount",
         ));
     }
-    Ok(matches.remove(0))
+    Ok(matches.pop().expect("guest mount match count checked"))
+}
+
+fn parse_device_number(field: &[u8]) -> Option<(u32, u32)> {
+    let value = std::str::from_utf8(field).ok()?;
+    let (major, minor) = value.split_once(':')?;
+    Some((major.parse().ok()?, minor.parse().ok()?))
 }
 
 fn decode_mountinfo_field(field: &[u8]) -> Result<Vec<u8>, ProjectDiskPhysicalReceiptError> {
@@ -448,36 +423,29 @@ fn decode_mountinfo_field(field: &[u8]) -> Result<Vec<u8>, ProjectDiskPhysicalRe
             continue;
         }
         let Some(octal) = field.get(index + 1..index + 4) else {
-            return Err(malformed(
-                "guest.mountinfo",
-                "project_disk_receipt_mountinfo_invalid",
-            ));
+            return Err(mountinfo_invalid());
         };
         if octal.iter().any(|byte| !(b'0'..=b'7').contains(byte)) {
-            return Err(malformed(
-                "guest.mountinfo",
-                "project_disk_receipt_mountinfo_invalid",
-            ));
+            return Err(mountinfo_invalid());
         }
         let value = u16::from(octal[0] - b'0') * 64
             + u16::from(octal[1] - b'0') * 8
             + u16::from(octal[2] - b'0');
-        let decoded = u8::try_from(value).map_err(|_| {
-            malformed(
-                "guest.mountinfo",
-                "project_disk_receipt_mountinfo_invalid",
-            )
-        })?;
+        let decoded = u8::try_from(value).map_err(|_| mountinfo_invalid())?;
         if !matches!(decoded, b'\t' | b'\n' | b' ' | b'\\') {
-            return Err(malformed(
-                "guest.mountinfo",
-                "project_disk_receipt_mountinfo_invalid",
-            ));
+            return Err(mountinfo_invalid());
         }
         result.push(decoded);
         index += 4;
     }
     Ok(result)
+}
+
+const fn mountinfo_invalid() -> ProjectDiskPhysicalReceiptError {
+    malformed(
+        "guest.mountinfo",
+        "project_disk_receipt_mountinfo_invalid",
+    )
 }
 
 pub(crate) fn validate_absolute_path(
@@ -523,7 +491,7 @@ pub(crate) fn valid_git_commit(value: &str) -> bool {
     value.len() == 40
         && value
             .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 fn decode_hex(value: &str, max_bytes: usize) -> Option<Vec<u8>> {
