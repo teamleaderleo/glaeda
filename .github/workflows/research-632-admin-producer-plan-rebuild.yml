@@ -21,6 +21,7 @@ jobs:
       - name: Rebuild and verify pure producer plan
         shell: bash
         run: |
+          # Research-only rebuild; merge candidates receive only the verified Rust blobs.
           set -euo pipefail
           git fetch origin ocean/592-admin-producer-plan
           git show origin/ocean/592-admin-producer-plan:src/immutable_git_object_pool_admin_producer_plan.rs > src/immutable_git_object_pool_admin_producer_plan.rs
