@@ -74,6 +74,7 @@ fn fixture() -> Value {
                     "after": snapshot(0o120777, 21, 9, 0)
                 }
             ],
+            "after_entry_names_hex": ["6f70617175652d61", "6f70617175652d62"],
             "after": directory
         },
         "guest": {
@@ -110,6 +111,28 @@ fn refuses_same_name_replacement_visible_in_descriptor_snapshots() {
     let mut value = fixture();
     value["disk_directory"]["entries"][0]["after"]["inode"] = json!(999);
     let failure = decode(&value).expect_err("entry drift must fail");
+    assert_eq!(
+        failure.kind(),
+        ProjectDiskPhysicalReceiptErrorKind::ChangedDuringObservation
+    );
+}
+
+#[test]
+fn refuses_symlink_replacement_even_when_device_inode_and_target_match() {
+    let mut value = fixture();
+    value["disk_directory"]["entries"][1]["after"]["ctime_nanoseconds"] = json!(3);
+    let failure = decode(&value).expect_err("symlink metadata drift must fail");
+    assert_eq!(
+        failure.kind(),
+        ProjectDiskPhysicalReceiptErrorKind::ChangedDuringObservation
+    );
+}
+
+#[test]
+fn refuses_changed_second_directory_entry_set() {
+    let mut value = fixture();
+    value["disk_directory"]["after_entry_names_hex"][1] = json!("6f70617175652d63");
+    let failure = decode(&value).expect_err("entry set drift must fail");
     assert_eq!(
         failure.kind(),
         ProjectDiskPhysicalReceiptErrorKind::ChangedDuringObservation
