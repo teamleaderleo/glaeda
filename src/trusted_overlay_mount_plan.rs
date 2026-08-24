@@ -1,5 +1,5 @@
 use std::collections::BTreeSet;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{Read as _, Take};
@@ -221,6 +221,7 @@ impl TrustedOverlayMountPlan {
         let upper = open_held_directory(&self.upper)?;
         let work = open_held_directory(&self.work)?;
         let merged = open_held_directory(&self.merged)?;
+        let (merged_parent, merged_name) = open_held_parent(&self.merged)?;
         let lease = TrustedOverlayMountDescriptorLease {
             summary: TrustedOverlayMountDescriptorLeaseSummary {
                 schema_version: TRUSTED_OVERLAY_MOUNT_PLAN_SCHEMA_VERSION,
@@ -233,6 +234,8 @@ impl TrustedOverlayMountPlan {
             upper,
             work,
             merged,
+            merged_parent,
+            merged_name,
         };
         lease.confirm(self, source_anchor, task_view)?;
         Ok(lease)
@@ -317,6 +320,8 @@ pub struct TrustedOverlayMountDescriptorLease {
     upper: OwnedFd,
     work: OwnedFd,
     merged: OwnedFd,
+    merged_parent: OwnedFd,
+    merged_name: OsString,
 }
 
 impl TrustedOverlayMountDescriptorLease {
@@ -345,6 +350,7 @@ impl TrustedOverlayMountDescriptorLease {
         require_held_directory(&self.upper, &plan.upper)?;
         require_held_directory(&self.work, &plan.work)?;
         require_held_directory(&self.merged, &plan.merged)?;
+        require_merged_parent_binding(&self.merged_parent, &self.merged_name, &plan.merged)?;
         validate_held_roles([&self.lower, &self.upper, &self.work, &self.merged])?;
         Ok(())
     }
@@ -352,7 +358,14 @@ impl TrustedOverlayMountDescriptorLease {
 
 impl fmt::Debug for TrustedOverlayMountDescriptorLease {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let _ = (&self.lower, &self.upper, &self.work, &self.merged);
+        let _ = (
+            &self.lower,
+            &self.upper,
+            &self.work,
+            &self.merged,
+            &self.merged_parent,
+            &self.merged_name,
+        );
         formatter
             .debug_struct("TrustedOverlayMountDescriptorLease")
             .field("summary", &self.summary)
@@ -620,12 +633,10 @@ fn snapshot_directory(path: &Path) -> Result<DirectorySnapshot, TrustedOverlayMo
     })
 }
 
-fn open_held_directory(
-    directory: &TrustedOverlayDirectory,
-) -> Result<OwnedFd, TrustedOverlayMountPlanError> {
+fn open_directory_path(path: &Path) -> Result<OwnedFd, TrustedOverlayMountPlanError> {
     let mut current = rustix_fs::open(Path::new("/"), PROC_DIRECTORY_FLAGS, Mode::empty())
         .map_err(|_| io_error())?;
-    for component in directory.path.components() {
+    for component in path.components() {
         match component {
             Component::RootDir => {}
             Component::Normal(name) => {
@@ -639,8 +650,42 @@ fn open_held_directory(
             _ => return Err(invalid_path()),
         }
     }
+    Ok(current)
+}
+
+fn open_held_directory(
+    directory: &TrustedOverlayDirectory,
+) -> Result<OwnedFd, TrustedOverlayMountPlanError> {
+    let current = open_directory_path(&directory.path)?;
     require_held_directory(&current, directory)?;
     Ok(current)
+}
+
+fn open_held_parent(
+    merged: &TrustedOverlayDirectory,
+) -> Result<(OwnedFd, OsString), TrustedOverlayMountPlanError> {
+    let parent_path = merged.path.parent().ok_or_else(invalid_path)?;
+    let name = merged
+        .path
+        .file_name()
+        .ok_or_else(invalid_path)?
+        .to_os_string();
+    let parent = open_directory_path(parent_path)?;
+    require_merged_parent_binding(&parent, &name, merged)?;
+    Ok((parent, name))
+}
+
+fn require_merged_parent_binding(
+    parent: &OwnedFd,
+    name: &OsStr,
+    merged: &TrustedOverlayDirectory,
+) -> Result<(), TrustedOverlayMountPlanError> {
+    let reopened = rustix_fs::openat(parent.as_fd(), name, PROC_DIRECTORY_FLAGS, Mode::empty())
+        .map_err(|cause| match cause {
+            Errno::LOOP | Errno::NOTDIR => unsafe_filesystem(),
+            _ => io_error(),
+        })?;
+    require_held_directory(&reopened, merged)
 }
 
 fn snapshot_held_directory(
@@ -1143,6 +1188,24 @@ mod tests {
         assert!(lease.summary().single_filesystem_device());
         lease.confirm(&plan, &anchor, &task).unwrap();
         assert!(!format!("{lease:?}").contains(fixture.root.to_str().unwrap()));
+    }
+
+    #[test]
+    fn descriptor_lease_retains_exact_merged_parent_and_private_basename() {
+        let fixture = Fixture::new();
+        let (anchor, task) = registered_authority();
+        let plan = super::observe_trusted_overlay_mount_plan(&anchor, &task, fixture.paths.clone())
+            .unwrap();
+        let lease = plan.open_descriptor_lease(&anchor, &task).unwrap();
+        super::require_merged_parent_binding(
+            &lease.merged_parent,
+            &lease.merged_name,
+            &plan.merged,
+        )
+        .unwrap();
+        let debug = format!("{lease:?}");
+        assert!(!debug.contains(fixture.root.to_str().unwrap()));
+        assert!(!debug.contains("merged"));
     }
 
     #[test]
