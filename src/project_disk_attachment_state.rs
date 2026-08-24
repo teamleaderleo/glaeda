@@ -88,8 +88,8 @@ pub struct ProjectDiskFormattedDetachedAuthority {
 }
 
 impl ProjectDiskFormattedDetachedAuthority {
-    #[allow(dead_code)]
-    pub(crate) fn from_verified(
+    #[cfg(test)]
+    fn for_test(
         filesystem: ProjectDiskFilesystemBinding,
         format_outcome_digest: Sha256Digest,
     ) -> Result<Self, ProjectDiskAttachmentStateError> {
@@ -1107,7 +1107,7 @@ mod tests {
             ProjectDiskFilesystemKind::Ext4,
         );
         ProjectDiskAttachmentRecord::from_formatted_detached(
-            ProjectDiskFormattedDetachedAuthority::from_verified(fs, digest('a')).unwrap(),
+            ProjectDiskFormattedDetachedAuthority::for_test(fs, digest('a')).unwrap(),
         )
     }
 
