@@ -1,0 +1,69 @@
+name: Research scrubbed cross-owner Git alternates behavior v2
+
+on:
+  push:
+    branches:
+      - research/github-arm-git-alternates-cross-owner-v2
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: true
+          show-progress: false
+      - name: Probe shared/reference with exact safe-directory variants
+        shell: bash
+        run: |
+          set -u
+          LAB=/var/tmp/smolrunner-alternates-v2
+          sudo rm -rf "$LAB"; sudo mkdir -p "$LAB"; sudo chown "$(id -u):$(id -g)" "$LAB"
+          sudo useradd --system --create-home --home-dir /var/lib/smol-admin-alt2 --shell /bin/bash smol-admin-alt2 2>/dev/null || true
+          admin_uid="$(id -u smol-admin-alt2)"; admin_gid="$(id -g smol-admin-alt2)"
+          git clone --bare --local --no-hardlinks "$GITHUB_WORKSPACE" "$LAB/seed.git" >/tmp/seed.out 2>/tmp/seed.err; seed_rc=$?
+          if [ "$seed_rc" -eq 0 ]; then sudo chown -R root:root "$LAB/seed.git"; sudo find "$LAB/seed.git" -type d -exec chmod 0555 {} +; sudo find "$LAB/seed.git" -type f -exec chmod 0444 {} +; fi
+          sudo chown root:root "$LAB"; sudo chmod 0755 "$LAB"
+          admin_env=(sudo -u smol-admin-alt2 /usr/bin/env -i HOME=/var/lib/smol-admin-alt2 PATH=/usr/bin:/bin GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null XDG_CONFIG_HOME=/var/lib/smol-admin-alt2/.config)
+          for kind in shared reference; do
+            for mode in plain safe; do
+              parent="$LAB/${kind}-${mode}-parent"; sudo mkdir -p "$parent"; sudo chown "$admin_uid:$admin_gid" "$parent"; sudo chmod 0700 "$parent"
+              if [ "$kind" = shared ]; then extra=(--shared); else extra=(--reference "$LAB/seed.git"); fi
+              if [ "$mode" = safe ]; then prefix=(-c "safe.directory=$LAB/seed.git"); else prefix=(); fi
+              "${admin_env[@]}" /usr/bin/git "${prefix[@]}" clone "${extra[@]}" --no-checkout "$LAB/seed.git" "$parent/task" >"/tmp/${kind}-${mode}.out" 2>"/tmp/${kind}-${mode}.err"; rc=$?
+              printf '%s\n' "$rc" >"/tmp/${kind}-${mode}.rc"
+            done
+          done
+          python3 - <<'PY'
+          import json,os,pathlib
+          lab=pathlib.Path('/var/tmp/smolrunner-alternates-v2'); seed=lab/'seed.git'/'objects'
+          def ids(p):
+            out={}
+            if not p.exists(): return out
+            for x in p.rglob('*'):
+              try: st=x.lstat()
+              except FileNotFoundError: continue
+              if x.is_file() and not x.is_symlink(): out[(st.st_dev,st.st_ino)]=x.relative_to(p).as_posix()
+            return out
+          seed_ids=ids(seed); out={'schema_version':2,'arch':os.uname().machine,'kernel':os.uname().release,'variants':{}}
+          for kind in ['shared','reference']:
+            for mode in ['plain','safe']:
+              key=f'{kind}_{mode}'; rc=int(pathlib.Path(f'/tmp/{kind}-{mode}.rc').read_text()); task=lab/f'{kind}-{mode}-parent'/'task'; gitdir=task/'.git'; objects=gitdir/'objects'; alt=objects/'info'/'alternates'; tids=ids(objects)
+              out['variants'][key]={'rc':rc,'task_exists':task.exists(),'alternates_exists':alt.exists(),'alternates':alt.read_text().strip() if alt.exists() else '', 'task_regular_object_files':len(tids),'shared_inode_count_with_seed':len(set(tids)&set(seed_ids)),'task_object_logical_bytes':sum(x.stat().st_size for x in objects.rglob('*') if x.is_file() and not x.is_symlink()) if objects.exists() else 0}
+          pathlib.Path('/tmp/result.json').write_text(json.dumps(out,indent=2,sort_keys=True)+'\n')
+          PY
+          exit 0
+      - name: Publish diagnostics
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name teamleaderleo; git config user.email cheerleaderleo@outlook.com
+          OUT=research/results-smolrunner-github-arm-git-alternates-cross-owner-v2
+          git checkout --orphan "$OUT"; git rm -rf . >/dev/null 2>&1 || true
+          cp /tmp/result.json ./result.json
+          for kind in shared reference; do for mode in plain safe; do cp "/tmp/${kind}-${mode}.err" "./${kind}-${mode}.err"; done; done
+          git add .; git commit -m 'Record scrubbed cross-owner Git alternates behavior v2'
+          git push --force origin HEAD:"$OUT"
