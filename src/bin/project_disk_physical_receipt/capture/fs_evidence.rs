@@ -121,7 +121,9 @@ pub(super) fn capture_held_disk_directory(
     directory: OwnedFd,
 ) -> Result<HeldDiskDirectory, ProjectDiskPhysicalCaptureError> {
     let before = snapshot(&fs::fstat(&directory).map_err(|_| filesystem_error())?)?;
-    if FileType::from_raw_mode(before.mode) != FileType::Directory {
+    if FileType::from_raw_mode(before.mode.try_into().map_err(|_| filesystem_error())?)
+        != FileType::Directory
+    {
         return Err(filesystem_error());
     }
     let mut stream = Dir::read_from(&directory).map_err(|_| filesystem_error())?;
@@ -158,7 +160,8 @@ fn capture_held_entry(
     let before_stat = fs::statat(directory, name_os, AtFlags::SYMLINK_NOFOLLOW)
         .map_err(|_| filesystem_error())?;
     let before = snapshot(&before_stat)?;
-    let file_type = FileType::from_raw_mode(before.mode);
+    let file_type =
+        FileType::from_raw_mode(before.mode.try_into().map_err(|_| filesystem_error())?);
     match file_type {
         FileType::RegularFile => {
             let descriptor = fs::openat(directory, name_os, REGULAR_FILE_FLAGS, Mode::empty())
