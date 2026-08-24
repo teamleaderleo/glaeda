@@ -314,8 +314,7 @@ mod tests {
     fn component_filesystem_generation_mismatch_is_rejected() {
         let first = mounted(7);
         let second = mounted(8);
-        let block =
-            correlate_trusted_project_block_device(&second, 2049, 77, true, true).unwrap();
+        let block = correlate_trusted_project_block_device(&second, 2049, 77, true, true).unwrap();
         let error = correlate_trusted_project_filesystem_guest(first, block).unwrap_err();
         assert_eq!(
             error.kind(),
