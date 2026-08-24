@@ -28,7 +28,9 @@ mod macos {
 
     use clap::Parser;
 
-    use crate::capture::{ProjectDiskPhysicalCaptureRequest, capture_project_disk_physical_receipt};
+    use crate::capture::{
+        ProjectDiskPhysicalCaptureRequest, capture_project_disk_physical_receipt,
+    };
     use smolrunner::process::ProcessExecutor;
 
     #[derive(Debug, Parser)]
@@ -51,9 +53,13 @@ mod macos {
         #[arg(long)]
         limactl: PathBuf,
         #[arg(long)]
+        project_identity: String,
+        #[arg(long)]
         project_disk_id: String,
         #[arg(long)]
         project_disk_generation: u64,
+        #[arg(long)]
+        project_disk_revision: u64,
         #[arg(long)]
         attachment_generation: u64,
         #[arg(long)]
@@ -77,8 +83,10 @@ mod macos {
             args.guest_project_mount,
             args.guest_cache_path,
             args.limactl,
+            args.project_identity,
             args.project_disk_id,
             args.project_disk_generation,
+            args.project_disk_revision,
             args.attachment_generation,
             args.resident_sandbox_id,
             args.resident_sandbox_generation,
