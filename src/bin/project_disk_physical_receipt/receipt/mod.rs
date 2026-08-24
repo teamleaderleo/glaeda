@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 mod validate;
 
 use validate::validate_document;
+#[cfg(target_os = "macos")]
 pub(crate) use validate::{
     same_entry_binding, valid_git_commit, validate_absolute_path, validate_locator,
 };
