@@ -292,10 +292,15 @@ pub mod state_store;
 #[cfg(target_os = "linux")]
 pub mod subordinate_id;
 #[cfg(target_os = "linux")]
+/// Sealed all-FD trusted OverlayFS mount transaction behind exact correlation evidence.
+pub mod trusted_overlay_mount_execution;
+#[cfg(target_os = "linux")]
 /// Read-only exact prerequisite observation and sealed intent for trusted OverlayFS mounts.
 pub mod trusted_overlay_mount_plan;
 /// Pure authority and lifecycle core for trusted resident OverlayFS task views.
 pub mod trusted_overlay_task_view;
+/// Opaque project-disk/filesystem correlation gate for trusted resident Linux mutation.
+pub mod trusted_project_filesystem_correlation;
 /// Descriptor-relative trusted producer for runner workspace and cache identity receipts.
 #[cfg(target_os = "linux")]
 pub mod trusted_workspace_receipt;
