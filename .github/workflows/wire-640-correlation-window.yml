@@ -1,0 +1,116 @@
+name: Bind verified correlation to exclusive window
+
+on:
+  push:
+    branches:
+      - chatgpt/640-verified-full-correlation
+
+permissions:
+  contents: write
+
+jobs:
+  wire:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: chatgpt/640-verified-full-correlation
+          fetch-depth: 0
+          show-progress: false
+      - name: Export window and require it in full correlation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          lib = Path('src/lib.rs')
+          text = lib.read_text()
+          export = '/// Sealed same-writer-lock window for final project-filesystem correlation.\npub mod project_disk_correlation_window;\n'
+          if export not in text:
+              anchor = '/// Pure identity vocabulary for one formatted project-disk filesystem generation.\npub mod project_disk_filesystem;\n'
+              if text.count(anchor) != 1:
+                  raise SystemExit('unexpected project-disk filesystem export anchor')
+              text = text.replace(anchor, export + anchor)
+          lib.write_text(text)
+
+          path = Path('src/trusted_project_filesystem_full_correlation.rs')
+          text = path.read_text()
+          import_anchor = 'use crate::project_catalog::ProjectIdentity;\n'
+          import_line = 'use crate::project_disk_correlation_window::ProjectDiskCorrelationWindow;\n'
+          if import_line not in text:
+              if text.count(import_anchor) != 1:
+                  raise SystemExit('unexpected project catalog import anchor')
+              text = text.replace(import_anchor, import_anchor + import_line)
+
+          old_sig = '''pub fn verify_project_filesystem_correlation(\n    current: &ProjectDiskLeaseRecord,\n    filesystem: &ProjectDiskFilesystemBinding,\n    anchor: &OverlaySourceAnchorBinding,'''
+          new_sig = '''pub fn verify_project_filesystem_correlation(\n    window: &ProjectDiskCorrelationWindow,\n    current: &ProjectDiskLeaseRecord,\n    filesystem: &ProjectDiskFilesystemBinding,\n    anchor: &OverlaySourceAnchorBinding,'''
+          if old_sig in text:
+              text = text.replace(old_sig, new_sig, 1)
+
+          body_anchor = '''    let ProjectDiskLeaseState::Attached { attachment } = current.state() else {\n        return Err(durable_authority_mismatch());\n    };'''
+          replacement = '''    window\n        .confirm(current, filesystem)\n        .map_err(|_| durable_authority_mismatch())?;\n    let ProjectDiskLeaseState::Attached { attachment } = current.state() else {\n        return Err(durable_authority_mismatch());\n    };'''
+          if body_anchor in text and replacement not in text:
+              text = text.replace(body_anchor, replacement, 1)
+
+          test_import_anchor = '    use crate::project_catalog::ProjectIdentity;\n'
+          test_import = '    use crate::project_disk_correlation_window::{ProjectDiskCorrelationWindow, ProjectDiskCorrelationWindowGeneration};\n'
+          if test_import not in text:
+              pos = text.find(test_import_anchor, text.find('#[cfg(test)]'))
+              if pos == -1:
+                  raise SystemExit('unexpected test import anchor')
+              pos_end = pos + len(test_import_anchor)
+              text = text[:pos_end] + test_import + text[pos_end:]
+
+          helper_anchor = '''    fn create(current: &ProjectDiskLeaseRecord) -> TrustedProjectDiskCreateProvenanceEvidence {'''
+          window_helper = '''    fn window(\n        current: &ProjectDiskLeaseRecord,\n        filesystem: &ProjectDiskFilesystemBinding,\n    ) -> ProjectDiskCorrelationWindow {\n        ProjectDiskCorrelationWindow::for_test(\n            ProjectDiskCorrelationWindowGeneration::new(9).unwrap(),\n            current,\n            filesystem,\n        )\n        .unwrap()\n    }\n\n'''
+          if window_helper not in text:
+              if text.count(helper_anchor) != 1:
+                  raise SystemExit('unexpected test helper anchor')
+              text = text.replace(helper_anchor, window_helper + helper_anchor, 1)
+
+          # Add the window argument to every test invocation. The first two args currently start
+          # with &current, &fs/accepted; insert &window(...) immediately before them.
+          replacements = {
+              '''        let verified = verify_project_filesystem_correlation(\n            &current,\n            &fs,''': '''        let verified = verify_project_filesystem_correlation(\n            &window(&current, &fs),\n            &current,\n            &fs,''',
+              '''        let error = verify_project_filesystem_correlation(\n            &revalidate,\n            &fs,''': '''        let error = verify_project_filesystem_correlation(\n            &window(&current, &fs),\n            &revalidate,\n            &fs,''',
+              '''        let error = verify_project_filesystem_correlation(\n            &current,\n            &fs,\n            &anchor(&current),\n            &create(&current),\n            &wrong,''': '''        let error = verify_project_filesystem_correlation(\n            &window(&current, &fs),\n            &current,\n            &fs,\n            &anchor(&current),\n            &create(&current),\n            &wrong,''',
+              '''        let error = verify_project_filesystem_correlation(\n            &current,\n            &accepted,''': '''        let error = verify_project_filesystem_correlation(\n            &window(&current, &accepted),\n            &current,\n            &accepted,''',
+          }
+          for old, new in replacements.items():
+              if old in text:
+                  text = text.replace(old, new, 1)
+
+          # The wrong-role-device test uses current/fs and wasn't consumed by the physical-identity replacement if ordering changed.
+          marker = '''        let error = verify_project_filesystem_correlation(\n            &current,\n            &fs,'''
+          if marker in text:
+              text = text.replace(
+                  marker,
+                  '''        let error = verify_project_filesystem_correlation(\n            &window(&current, &fs),\n            &current,\n            &fs,''',
+                  1,
+              )
+
+          path.write_text(text)
+          PY
+      - name: Format and focused tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.97.1 --profile minimal --component rustfmt --no-self-update
+          cargo fmt --all
+          cargo test --locked project_disk_correlation_window
+          cargo test --locked trusted_project_filesystem_full_correlation
+      - name: Remove helpers and publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f .github/workflows/wire-640-full-guest.yml
+          rm -f .github/workflows/wire-640-verified-full-correlation.yml
+          rm .github/workflows/wire-640-correlation-window.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "#640 require exclusive project-disk correlation window"
+          git push origin HEAD:chatgpt/640-verified-full-correlation
