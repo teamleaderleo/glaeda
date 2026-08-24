@@ -1,0 +1,76 @@
+name: Research scrubbed cross-owner Git alternates behavior
+
+on:
+  push:
+    branches:
+      - research/github-arm-git-alternates-cross-owner
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: true
+          show-progress: false
+      - name: Probe shared/reference alternates under scrubbed admin environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          LAB=/var/tmp/smolrunner-alternates-cross-owner
+          sudo rm -rf "$LAB"; sudo mkdir -p "$LAB"; sudo chown "$(id -u):$(id -g)" "$LAB"
+          sudo useradd --system --create-home --home-dir /var/lib/smol-admin-alt --shell /bin/bash smol-admin-alt 2>/dev/null || true
+          admin_uid="$(id -u smol-admin-alt)"; admin_gid="$(id -g smol-admin-alt)"
+          git clone --bare --local --no-hardlinks "$GITHUB_WORKSPACE" "$LAB/seed.git" >/tmp/seed.out 2>/tmp/seed.err
+          sudo chown -R root:root "$LAB/seed.git"
+          sudo find "$LAB/seed.git" -type d -exec chmod 0555 {} +
+          sudo find "$LAB/seed.git" -type f -exec chmod 0444 {} +
+          sudo chown root:root "$LAB"; sudo chmod 0755 "$LAB"
+          for name in shared reference; do sudo mkdir -p "$LAB/$name-parent"; sudo chown "$admin_uid:$admin_gid" "$LAB/$name-parent"; sudo chmod 0700 "$LAB/$name-parent"; done
+          admin_env=(sudo -u smol-admin-alt /usr/bin/env -i HOME=/var/lib/smol-admin-alt PATH=/usr/bin:/bin GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null XDG_CONFIG_HOME=/var/lib/smol-admin-alt/.config)
+          "${admin_env[@]}" /usr/bin/git clone --shared --no-checkout "$LAB/seed.git" "$LAB/shared-parent/task" >/tmp/shared.out 2>/tmp/shared.err; shared_rc=$?
+          "${admin_env[@]}" /usr/bin/git clone --reference "$LAB/seed.git" --no-checkout "$LAB/seed.git" "$LAB/reference-parent/task" >/tmp/reference.out 2>/tmp/reference.err; reference_rc=$?
+          python3 - <<'PY'
+          import json, os, pathlib
+          lab=pathlib.Path('/var/tmp/smolrunner-alternates-cross-owner'); seed=lab/'seed.git'/'objects'
+          def ids(p):
+            out={}
+            if not p.exists(): return out
+            for x in p.rglob('*'):
+              try: st=x.lstat()
+              except FileNotFoundError: continue
+              if x.is_file() and not x.is_symlink(): out[(st.st_dev,st.st_ino)]=x.relative_to(p).as_posix()
+            return out
+          seed_ids=ids(seed)
+          result={'schema_version':1,'arch':os.uname().machine,'kernel':os.uname().release}
+          for name in ['shared','reference']:
+            gitdir=lab/f'{name}-parent'/'task'/'.git'; objects=gitdir/'objects'; alt=objects/'info'/'alternates'
+            task_ids=ids(objects)
+            result[name]={
+              'gitdir_exists':gitdir.exists(),
+              'alternates_exists':alt.exists(),
+              'alternates':alt.read_text().strip() if alt.exists() else '',
+              'task_regular_object_files':len(task_ids),
+              'shared_inode_count_with_seed':len(set(task_ids)&set(seed_ids)),
+              'task_object_logical_bytes':sum(x.stat().st_size for x in objects.rglob('*') if x.is_file() and not x.is_symlink()) if objects.exists() else 0,
+            }
+          pathlib.Path('/tmp/result.json').write_text(json.dumps(result,indent=2,sort_keys=True)+'\n')
+          print(json.dumps(result,indent=2,sort_keys=True))
+          PY
+          printf '{"shared_rc":%s,"reference_rc":%s}\n' "$shared_rc" "$reference_rc" >/tmp/status.json
+      - name: Publish result
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name teamleaderleo; git config user.email cheerleaderleo@outlook.com
+          OUT=research/results-smolrunner-github-arm-git-alternates-cross-owner
+          git checkout --orphan "$OUT"; git rm -rf . >/dev/null 2>&1 || true
+          cp /tmp/result.json ./result.json
+          cp /tmp/status.json ./status.json
+          cp /tmp/shared.err ./shared.err
+          cp /tmp/reference.err ./reference.err
+          git add .; git commit -m 'Record scrubbed cross-owner Git alternates behavior'
+          git push --force origin HEAD:"$OUT"
