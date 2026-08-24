@@ -20,8 +20,7 @@ use crate::project_disk_lease::{
 };
 
 pub const PROJECT_DISK_FORMATTED_LEASE_ADMISSION_SCHEMA_VERSION: u8 = 1;
-const ZERO_DIGEST: &str =
-    "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+const ZERO_DIGEST: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ProjectDiskFormattedLeaseAdmissionSummary {
@@ -232,11 +231,9 @@ pub fn admit_formatted_project_disk(
         || is_zero_digest(&proof.physical_identity_digest)
         || is_zero_digest(&proof.backing_identity_digest)
         || is_zero_digest(&proof.format_outcome_digest)
-        || !proof.filesystem.matches_project_disk_identity(
-            &proof.summary.project,
-            &proof.summary.disk_id,
-            proof.summary.disk_generation,
-        )
+        || proof.filesystem.project() != &proof.summary.project
+        || proof.filesystem.disk_id() != &proof.summary.disk_id
+        || proof.filesystem.disk_generation() != proof.summary.disk_generation
         || proof.filesystem.filesystem_generation() != proof.summary.filesystem_generation
         || proof.filesystem.format_profile_generation() != proof.summary.format_profile_generation
         || proof.filesystem.kind() != proof.summary.filesystem_kind
@@ -271,16 +268,16 @@ const fn invalid_evidence() -> ProjectDiskFormattedLeaseAdmissionError {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProjectDiskFormattedLeaseAdmissionProof, admit_formatted_project_disk};
+    use super::{
+        ProjectDiskFormattedLeaseAdmissionProof, ZERO_DIGEST, admit_formatted_project_disk,
+    };
     use crate::artifact::Sha256Digest;
     use crate::project_catalog::ProjectIdentity;
     use crate::project_disk_filesystem::{
         ProjectDiskFilesystemBinding, ProjectDiskFilesystemFormatProfileGeneration,
         ProjectDiskFilesystemGeneration, ProjectDiskFilesystemKind,
     };
-    use crate::project_disk_lease::{
-        ProjectDiskGeneration, ProjectDiskId, ProjectDiskLeaseState,
-    };
+    use crate::project_disk_lease::{ProjectDiskGeneration, ProjectDiskId, ProjectDiskLeaseState};
 
     fn digest(byte: char) -> Sha256Digest {
         Sha256Digest::parse(&format!("sha256:{}", byte.to_string().repeat(64))).unwrap()
@@ -313,7 +310,11 @@ mod tests {
         ));
         assert_eq!(admission.lease().revision().get(), 1);
         assert_eq!(admission.filesystem().filesystem_generation().get(), 7);
-        assert!(admission.filesystem().matches_project_disk(admission.lease()));
+        assert!(
+            admission
+                .filesystem()
+                .matches_project_disk(admission.lease())
+        );
     }
 
     #[test]

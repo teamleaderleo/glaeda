@@ -258,6 +258,8 @@ pub mod project_checkout_observation;
 pub mod project_discovery;
 /// Pure identity vocabulary for one formatted project-disk filesystem generation.
 pub mod project_disk_filesystem;
+/// Sealed admission of accepted formatted-detached project disks into the P1 lease model.
+pub mod project_disk_formatted_lease_admission;
 /// Pure crash-safe single-writer lease planning for resident trusted project disks.
 pub mod project_disk_lease;
 pub mod renderprove_artifact_binding;
