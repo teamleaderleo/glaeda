@@ -1,0 +1,92 @@
+name: Bind P4 format provenance into full correlation
+
+on:
+  push:
+    branches:
+      - chatgpt/640-verified-full-correlation
+
+permissions:
+  contents: write
+
+jobs:
+  bind:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: chatgpt/640-verified-full-correlation
+          fetch-depth: 0
+          show-progress: false
+      - name: Add sealed P4 format provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('src/trusted_project_filesystem_full_correlation.rs')
+          text = path.read_text()
+
+          anchor = '''/// Sealed fresh host observation that the exact P3 physical/backing identity is currently attached\n/// under the exact P1 attachment/sandbox generation and descriptor-bound resident host identity.\npub struct TrustedProjectDiskHostAttachmentEvidence {'''
+          insert = '''/// Sealed P4 evidence that one exact filesystem generation was formatted on the same P3 physical\n/// and backing identities later observed during attachment.\n///\n/// Production construction remains absent until the no-replay P4 format lifecycle can convert its\n/// exact `FormattedDetached` receipt directly.\npub struct TrustedProjectDiskFormatProvenanceEvidence {\n    project: ProjectIdentity,\n    disk_id: ProjectDiskId,\n    disk_generation: ProjectDiskGeneration,\n    filesystem_generation: ProjectDiskFilesystemGeneration,\n    format_profile_generation: ProjectDiskFilesystemFormatProfileGeneration,\n    filesystem_kind: ProjectDiskFilesystemKind,\n    physical_identity_digest: Sha256Digest,\n    backing_identity_digest: Sha256Digest,\n    format_outcome_digest: Sha256Digest,\n}\n\nimpl fmt::Debug for TrustedProjectDiskFormatProvenanceEvidence {\n    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {\n        formatter\n            .debug_struct("TrustedProjectDiskFormatProvenanceEvidence")\n            .field("project", &self.project)\n            .field("disk_id", &self.disk_id)\n            .field("disk_generation", &self.disk_generation)\n            .field("filesystem_generation", &self.filesystem_generation)\n            .field("format_profile_generation", &self.format_profile_generation)\n            .field("filesystem_kind", &self.filesystem_kind)\n            .field("physical_identity", &"<redacted>")\n            .field("backing_identity", &"<redacted>")\n            .field("format_outcome", &"<redacted>")\n            .finish()\n    }\n}\n\n'''
+          if insert not in text:
+              if text.count(anchor) != 1:
+                  raise SystemExit('unexpected host evidence anchor')
+              text = text.replace(anchor, insert + anchor, 1)
+
+          old_sig = '''    anchor: &OverlaySourceAnchorBinding,\n    create: &TrustedProjectDiskCreateProvenanceEvidence,\n    host: &TrustedProjectDiskHostAttachmentEvidence,'''
+          new_sig = '''    anchor: &OverlaySourceAnchorBinding,\n    create: &TrustedProjectDiskCreateProvenanceEvidence,\n    format: &TrustedProjectDiskFormatProvenanceEvidence,\n    host: &TrustedProjectDiskHostAttachmentEvidence,'''
+          if old_sig in text:
+              text = text.replace(old_sig, new_sig, 1)
+
+          old_physical = '''    if create.physical_identity_digest != host.physical_identity_digest\n        || create.backing_identity_digest != host.backing_identity_digest\n        || create.physical_identity_digest.as_str() == ZERO_DIGEST\n        || create.backing_identity_digest.as_str() == ZERO_DIGEST\n    {\n        return Err(physical_provenance_mismatch());\n    }'''
+          new_physical = '''    if format.project != *current.project()\n        || format.disk_id != *current.disk_id()\n        || format.disk_generation != current.disk_generation()\n        || format.filesystem_generation != filesystem.filesystem_generation()\n        || format.format_profile_generation != filesystem.format_profile_generation()\n        || format.filesystem_kind != filesystem.kind()\n        || create.physical_identity_digest != format.physical_identity_digest\n        || create.backing_identity_digest != format.backing_identity_digest\n        || format.physical_identity_digest != host.physical_identity_digest\n        || format.backing_identity_digest != host.backing_identity_digest\n        || create.physical_identity_digest.as_str() == ZERO_DIGEST\n        || create.backing_identity_digest.as_str() == ZERO_DIGEST\n        || format.format_outcome_digest.as_str() == ZERO_DIGEST\n    {\n        return Err(physical_provenance_mismatch());\n    }'''
+          if old_physical in text:
+              text = text.replace(old_physical, new_physical, 1)
+
+          test_import = '''        TrustedProjectDiskCreateProvenanceEvidence, TrustedProjectDiskHostAttachmentEvidence,\n        VerifiedProjectFilesystemCorrelationErrorKind, verify_project_filesystem_correlation,\n'''
+          test_import_new = '''        TrustedProjectDiskCreateProvenanceEvidence, TrustedProjectDiskFormatProvenanceEvidence,\n        TrustedProjectDiskHostAttachmentEvidence, VerifiedProjectFilesystemCorrelationErrorKind,\n        verify_project_filesystem_correlation,\n'''
+          if test_import in text:
+              text = text.replace(test_import, test_import_new, 1)
+
+          host_helper = '''    fn host(current: &ProjectDiskLeaseRecord) -> TrustedProjectDiskHostAttachmentEvidence {'''
+          format_helper = '''    fn format(\n        current: &ProjectDiskLeaseRecord,\n        filesystem: &ProjectDiskFilesystemBinding,\n    ) -> TrustedProjectDiskFormatProvenanceEvidence {\n        TrustedProjectDiskFormatProvenanceEvidence {\n            project: current.project().clone(),\n            disk_id: current.disk_id().clone(),\n            disk_generation: current.disk_generation(),\n            filesystem_generation: filesystem.filesystem_generation(),\n            format_profile_generation: filesystem.format_profile_generation(),\n            filesystem_kind: filesystem.kind(),\n            physical_identity_digest: digest('b'),\n            backing_identity_digest: digest('c'),\n            format_outcome_digest: digest('e'),\n        }\n    }\n\n'''
+          if format_helper not in text:
+              if text.count(host_helper) != 1:
+                  raise SystemExit('unexpected host test helper anchor')
+              text = text.replace(host_helper, format_helper + host_helper, 1)
+
+          # Every test call places create immediately before host. Insert format between them.
+          text = text.replace(
+              '''            &create(&current),\n            &host(&current),''',
+              '''            &create(&current),\n            &format(&current, &fs),\n            &host(&current),''',
+          )
+          text = text.replace(
+              '''            &create(&current),\n            &wrong,''',
+              '''            &create(&current),\n            &format(&current, &fs),\n            &wrong,''',
+          )
+          text = text.replace(
+              '''            &create(&current),\n            &host(&current),\n            &guest(&wrong_guest_fs),''',
+              '''            &create(&current),\n            &format(&current, &accepted),\n            &host(&current),\n            &guest(&wrong_guest_fs),''',
+          )
+
+          path.write_text(text)
+          PY
+      - name: Format and focused tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.97.1 --profile minimal --component rustfmt --no-self-update
+          cargo fmt --all
+          cargo test --locked trusted_project_filesystem_full_correlation
+      - name: Remove helper and publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f .github/workflows/bind-640-format-provenance.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "#640 bind P4 format provenance into full correlation"
+          git push origin HEAD:chatgpt/640-verified-full-correlation
