@@ -114,6 +114,7 @@ impl TrustedProjectFilesystemCorrelationProof {
         &self.summary
     }
 
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn confirm_overlay_anchor(
         &self,
         anchor: &OverlaySourceAnchorBinding,
@@ -220,6 +221,7 @@ const fn invalid_generation() -> TrustedProjectFilesystemCorrelationError {
     }
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const fn correlation_mismatch() -> TrustedProjectFilesystemCorrelationError {
     TrustedProjectFilesystemCorrelationError {
         kind: TrustedProjectFilesystemCorrelationErrorKind::Mismatch,
