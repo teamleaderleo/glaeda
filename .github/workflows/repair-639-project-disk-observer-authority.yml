@@ -1,9 +1,9 @@
 name: Repair project-disk observer authority boundary
 
 on:
-  pull_request:
-    paths:
-      - ".github/workflows/repair-639-project-disk-observer-authority.yml"
+  push:
+    branches:
+      - codex/565-p2-physical-observer
 
 permissions:
   contents: write
