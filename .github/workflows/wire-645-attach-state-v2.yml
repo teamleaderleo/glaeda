@@ -1,0 +1,102 @@
+name: Wire P4 attach state model v2
+
+on:
+  push:
+    branches:
+      - chatgpt/645-attach-state-model
+
+permissions:
+  contents: write
+
+jobs:
+  wire:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: chatgpt/645-attach-state-model
+          fetch-depth: 0
+          show-progress: false
+      - name: Bind exact P4 transaction generation and export module
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('src/project_disk_attachment_state.rs')
+          text = path.read_text()
+
+          def replace_once(old: str, new: str) -> None:
+              global text
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'expected one replacement, found {count}: {old[:100]!r}')
+              text = text.replace(old, new)
+
+          replace_once(
+              '''pub struct ProjectDiskAttachmentSuccessProof {\n    project: ProjectIdentity,\n    disk_id: ProjectDiskId,\n    disk_generation: ProjectDiskGeneration,\n    disk_revision: ProjectDiskRevision,\n    attachment: ProjectDiskAttachmentLease,''',
+              '''pub struct ProjectDiskAttachmentSuccessProof {\n    project: ProjectIdentity,\n    disk_id: ProjectDiskId,\n    disk_generation: ProjectDiskGeneration,\n    disk_revision: ProjectDiskRevision,\n    transaction_generation: ProjectDiskAttachTransactionGeneration,\n    attachment: ProjectDiskAttachmentLease,''',
+          )
+          replace_once(
+              '''        _transaction_generation: ProjectDiskAttachTransactionGeneration,\n        expected_disk_revision: ProjectDiskRevision,\n        attachment: &ProjectDiskAttachmentLease,\n    ) -> Result<(), ProjectDiskAttachmentStateError> {\n        if self.project != record.project\n            || self.disk_id != record.disk_id\n            || self.disk_generation != record.disk_generation\n            || self.disk_revision != expected_disk_revision\n            || &self.attachment != attachment\n            || self.filesystem_generation''',
+              '''        transaction_generation: ProjectDiskAttachTransactionGeneration,\n        expected_disk_revision: ProjectDiskRevision,\n        attachment: &ProjectDiskAttachmentLease,\n    ) -> Result<(), ProjectDiskAttachmentStateError> {\n        if self.project != record.project\n            || self.disk_id != record.disk_id\n            || self.disk_generation != record.disk_generation\n            || self.disk_revision != expected_disk_revision\n            || self.transaction_generation != transaction_generation\n            || &self.attachment != attachment\n            || self.filesystem_generation''',
+          )
+          replace_once(
+              '''            disk_generation: record.disk_generation,\n            disk_revision: current.revision(),\n            attachment: plan.attachment().clone(),\n            filesystem_generation: record.filesystem.filesystem_generation(),''',
+              '''            disk_generation: record.disk_generation,\n            disk_revision: current.revision(),\n            transaction_generation: active_transaction_generation(record),\n            attachment: plan.attachment().clone(),\n            filesystem_generation: record.filesystem.filesystem_generation(),''',
+          )
+
+          replace_once(
+              '''pub struct ProjectDiskAttachDetachedProof {\n    project: ProjectIdentity,\n    disk_id: ProjectDiskId,\n    disk_generation: ProjectDiskGeneration,\n    disk_revision: ProjectDiskRevision,\n    attachment: ProjectDiskAttachmentLease,\n    exact_detached_unused: bool,''',
+              '''pub struct ProjectDiskAttachDetachedProof {\n    project: ProjectIdentity,\n    disk_id: ProjectDiskId,\n    disk_generation: ProjectDiskGeneration,\n    disk_revision: ProjectDiskRevision,\n    transaction_generation: ProjectDiskAttachTransactionGeneration,\n    attachment: ProjectDiskAttachmentLease,\n    exact_detached_unused: bool,''',
+          )
+          replace_once(
+              '''        _transaction_generation: ProjectDiskAttachTransactionGeneration,\n        expected_disk_revision: ProjectDiskRevision,\n        attachment: &ProjectDiskAttachmentLease,\n    ) -> Result<(), ProjectDiskAttachmentStateError> {\n        if self.project != record.project\n            || self.disk_id != record.disk_id\n            || self.disk_generation != record.disk_generation\n            || self.disk_revision != expected_disk_revision\n            || &self.attachment != attachment\n            || !self.exact_detached_unused''',
+              '''        transaction_generation: ProjectDiskAttachTransactionGeneration,\n        expected_disk_revision: ProjectDiskRevision,\n        attachment: &ProjectDiskAttachmentLease,\n    ) -> Result<(), ProjectDiskAttachmentStateError> {\n        if self.project != record.project\n            || self.disk_id != record.disk_id\n            || self.disk_generation != record.disk_generation\n            || self.disk_revision != expected_disk_revision\n            || self.transaction_generation != transaction_generation\n            || &self.attachment != attachment\n            || !self.exact_detached_unused''',
+          )
+          replace_once(
+              '''            disk_generation: record.disk_generation,\n            disk_revision: current.revision(),\n            attachment: plan.attachment().clone(),\n            exact_detached_unused: true,''',
+              '''            disk_generation: record.disk_generation,\n            disk_revision: current.revision(),\n            transaction_generation: active_transaction_generation(record),\n            attachment: plan.attachment().clone(),\n            exact_detached_unused: true,''',
+          )
+
+          replace_once(
+              '''pub struct ProjectDiskPriorAttachQuiescentProof {\n    project: ProjectIdentity,\n    disk_id: ProjectDiskId,\n    disk_generation: ProjectDiskGeneration,\n    attachment: ProjectDiskAttachmentLease,\n}''',
+              '''pub struct ProjectDiskPriorAttachQuiescentProof {\n    project: ProjectIdentity,\n    disk_id: ProjectDiskId,\n    disk_generation: ProjectDiskGeneration,\n    transaction_generation: ProjectDiskAttachTransactionGeneration,\n    attachment: ProjectDiskAttachmentLease,\n}''',
+          )
+          replace_once(
+              '''        _transaction_generation: ProjectDiskAttachTransactionGeneration,\n        attachment: &ProjectDiskAttachmentLease,\n    ) -> Result<(), ProjectDiskAttachmentStateError> {\n        if self.project != record.project\n            || self.disk_id != record.disk_id\n            || self.disk_generation != record.disk_generation\n            || &self.attachment != attachment''',
+              '''        transaction_generation: ProjectDiskAttachTransactionGeneration,\n        attachment: &ProjectDiskAttachmentLease,\n    ) -> Result<(), ProjectDiskAttachmentStateError> {\n        if self.project != record.project\n            || self.disk_id != record.disk_id\n            || self.disk_generation != record.disk_generation\n            || self.transaction_generation != transaction_generation\n            || &self.attachment != attachment''',
+          )
+          replace_once(
+              '''            project: record.project.clone(),\n            disk_id: record.disk_id.clone(),\n            disk_generation: record.disk_generation,\n            attachment: plan.attachment().clone(),\n        }\n    }\n}\n\n#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]\n#[serde(rename_all = "snake_case")]\npub enum ProjectDiskAttachmentStateErrorKind''',
+              '''            project: record.project.clone(),\n            disk_id: record.disk_id.clone(),\n            disk_generation: record.disk_generation,\n            transaction_generation: active_transaction_generation(record),\n            attachment: plan.attachment().clone(),\n        }\n    }\n}\n\nfn active_transaction_generation(\n    record: &ProjectDiskAttachmentRecord,\n) -> ProjectDiskAttachTransactionGeneration {\n    match record.state() {\n        ProjectDiskAttachmentState::AttachAuthorized { transaction_generation, .. }\n        | ProjectDiskAttachmentState::AttachStarted { transaction_generation, .. }\n        | ProjectDiskAttachmentState::AttachRecoveryRequired { transaction_generation, .. } => {\n            *transaction_generation\n        }\n        ProjectDiskAttachmentState::AttachmentObserved { receipt } => {\n            receipt.transaction_generation()\n        }\n        ProjectDiskAttachmentState::FormattedDetached\n        | ProjectDiskAttachmentState::Quarantined { .. } => record\n            .last_transaction_generation\n            .expect("test proof requires an attachment transaction"),\n    }\n}\n\n#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]\n#[serde(rename_all = "snake_case")]\npub enum ProjectDiskAttachmentStateErrorKind''',
+          )
+
+          path.write_text(text)
+
+          lib = Path('src/lib.rs')
+          lib_text = lib.read_text()
+          anchor = '/// Pure identity vocabulary for one formatted project-disk filesystem generation.\npub mod project_disk_filesystem;\n'
+          export = '/// Pure no-replay lifecycle for one exact formatted project-disk attachment.\npub mod project_disk_attachment_state;\n'
+          if export not in lib_text:
+              if lib_text.count(anchor) != 1:
+                  raise SystemExit('unexpected project_disk_filesystem export anchor')
+              lib_text = lib_text.replace(anchor, export + anchor)
+          lib.write_text(lib_text)
+          PY
+      - name: Format and remove helpers
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.97.1 --profile minimal --component rustfmt --no-self-update
+          cargo fmt --all
+          rm -f .github/workflows/wire-645-attach-state.yml
+          rm .github/workflows/wire-645-attach-state-v2.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "#645 bind and wire no-replay attach state"
+          git push origin HEAD:chatgpt/645-attach-state-model
