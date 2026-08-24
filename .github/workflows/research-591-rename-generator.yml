@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - research/591-rename-generator
+  pull_request:
+    paths:
+      - ".github/workflows/research-591-rename-generator.yml"
 
 permissions:
   contents: write
