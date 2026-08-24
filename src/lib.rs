@@ -149,6 +149,36 @@ pub mod linux_dynamic_loader_config;
 /// Pure bounded ELF64 dependency parsing for the Linux runtime closure.
 #[cfg(target_os = "linux")]
 pub mod linux_elf_runtime_dependency;
+#[cfg(target_os = "linux")]
+pub mod installation_id;
+pub mod journal;
+pub mod journal_document;
+pub mod lane_command;
+#[cfg(target_os = "linux")]
+pub mod lane_executable;
+#[cfg(target_os = "linux")]
+pub mod lane_executor;
+pub mod lease;
+pub mod lease_catalog;
+pub mod lease_document;
+/// Descriptor-bound host identity for one reviewed Lima VZ instance and raw root disk.
+#[cfg(unix)]
+pub mod lima_host_identity;
+/// Pure Lima policy: work while active, interactive after 10 idle minutes, stopped after 30.
+pub mod lima_lifecycle;
+/// Fixed direct executor for accepted personal-worker Lima lifecycle actions.
+pub mod lima_lifecycle_executor;
+/// Read-only, bounded exact observation of one Lima instance and running guest.
+pub mod lima_observation;
+/// Pure bounded parsing of the admitted glibc dynamic-loader cache.
+#[cfg(target_os = "linux")]
+pub mod linux_dynamic_loader_cache;
+/// Pure bounded parsing of the admitted Linux dynamic-loader configuration.
+#[cfg(target_os = "linux")]
+pub mod linux_dynamic_loader_config;
+/// Pure bounded ELF64 dependency parsing for the Linux runtime closure.
+#[cfg(target_os = "linux")]
+pub mod linux_elf_runtime_dependency;
 /// Read-only, fail-closed lookup of persisted project installations.
 #[cfg(target_os = "linux")]
 pub mod linux_installation_catalog;
@@ -227,201 +257,93 @@ pub mod personal_worker_mac_observation;
 /// Config-bound ergonomic submission and queued cancellation.
 pub mod personal_worker_operator_mutation;
 /// Config-bound, current-snapshot status, queue, and job reads.
-pub mod personal_worker_operator_read;
-/// Config-bound read-only discovery and explicit first initialization of durable worker state.
-pub mod personal_worker_operator_store;
-pub mod personal_worker_queue;
-/// Pure bounded projection of durable personal-worker status, queue pages, and job state.
 pub mod personal_worker_read_model;
-/// Read-only official-runner readiness composed with exact personal-worker evidence.
-pub mod personal_worker_runner_readiness;
-/// Pure sealed authority for the exact personal-worker Linux verification-runtime closure.
-pub mod personal_worker_runtime_contract;
-/// Strict canonical declaration of one installed personal-worker runtime closure.
-pub mod personal_worker_runtime_manifest;
-pub mod personal_worker_store;
-pub mod personal_worker_store_transaction;
-/// Pure, one-action personal-worker planning over accepted queue and host evidence.
-pub mod personal_worker_tick;
-/// Pure immutable verification authorization planning from sealed personal-worker evidence.
+/// Durable, lock-protected personal-worker request queue.
+pub mod personal_worker_request_queue;
+/// Pure durable status snapshot plus secret-free human/JSON rendering.
+pub mod personal_worker_status;
+/// Typed macOS bootstrap checklist for the personal worker.
+pub mod personal_worker_workstation_checklist;
+/// Pure bounded persistent worker identity plus canonical state path layout.
+pub mod personal_worker_workspace;
 #[cfg(target_os = "linux")]
-pub mod personal_worker_verification_plan;
-pub mod plan;
-pub mod process;
-/// Pure, strict logical project catalog identities and alias resolution.
+pub mod podman_diagnostic;
+#[cfg(target_os = "linux")]
+pub mod podman_execution;
+#[cfg(target_os = "linux")]
+pub mod podman_network;
+#[cfg(target_os = "linux")]
+pub mod podman_network_gate;
+#[cfg(target_os = "linux")]
+pub mod podman_network_gate_activation;
+#[cfg(target_os = "linux")]
+pub mod podman_network_gate_execution;
+#[cfg(target_os = "linux")]
+pub mod podman_network_gate_observation;
+#[cfg(target_os = "linux")]
+pub mod podman_network_gate_receipt;
+#[cfg(target_os = "linux")]
+pub mod podman_network_join;
+#[cfg(target_os = "linux")]
+pub mod podman_plan;
+#[cfg(target_os = "linux")]
+pub mod podman_rootfs;
+#[cfg(target_os = "linux")]
+pub mod podman_runtime;
+#[cfg(target_os = "linux")]
+pub mod podman_storage;
 pub mod project_catalog;
-/// Read-only, credentialless observation of one developer Git checkout on Unix hosts.
-#[cfg(unix)]
+/// Canonical path-to-source policy for active project worktrees.
+pub mod project_checkout;
+/// Read-only project state observation.
+#[cfg(target_os = "linux")]
 pub mod project_checkout_observation;
-/// Read-only, bounded immediate-child discovery beneath one explicit project root.
 #[cfg(unix)]
-pub mod project_discovery;
-/// Pure crash-safe single-writer lease planning for resident trusted project disks.
+pub(crate) mod project_checkout_observation_git;
+#[cfg(unix)]
+pub(crate) mod project_checkout_observation_path;
+/// Pure exact planning for single-writer persistent project disks.
 pub mod project_disk_lease;
-pub mod renderprove_artifact_binding;
-pub mod renderprove_execution;
-#[cfg(target_os = "linux")]
-pub mod renderprove_native_probe;
-/// Descriptor-bound protected project/evidence mount lease for native Renderprove probes.
-#[cfg(target_os = "linux")]
-pub mod renderprove_protected_mount;
-pub mod renderprove_verification;
-pub mod renderprove_vision_profile;
-pub mod renderprove_vision_result;
-/// Credentialless, bounded observation of one immutable reviewed repository source.
-pub mod repository_source_observation;
-pub mod resource;
-#[cfg(target_os = "linux")]
-pub mod rootless_podman_config;
-/// Strict, bounded, nonblocking, descriptor-relative, identity-bound observation of reviewed Podman sources.
-#[cfg(target_os = "linux")]
-pub mod rootless_podman_config_observation;
-/// Pure, bounded, fail-closed precedence resolution and static-preflight assessment of Podman config.
-#[cfg(target_os = "linux")]
-pub mod rootless_podman_config_resolution;
-#[cfg(target_os = "linux")]
-pub mod rootless_podman_preflight;
-#[cfg(target_os = "linux")]
-pub mod runner_account_observation;
-#[cfg(target_os = "linux")]
-pub mod runner_account_plan;
-#[cfg(target_os = "linux")]
-pub mod runner_user;
-#[cfg(target_os = "linux")]
-pub mod runner_user_observation;
-/// Pure classification of trusted bounded Rust memory-pressure observations.
-pub mod rust_memory_diagnostic;
-/// Pure repository-declared Rust build-scope and bounded resource-envelope contracts.
-pub mod rust_verification_envelope;
-/// Canonical digest binding for reviewed Rust verification envelopes.
-pub mod rust_verification_envelope_digest;
-pub mod state;
-pub mod state_document;
-pub mod state_store;
-#[cfg(target_os = "linux")]
-pub mod subordinate_id;
-/// Pure sealed one-shot invocation plan for resident Linux guest-control transactions.
-pub mod trusted_guest_control_invocation_plan;
-/// Pure canonical one-shot protocol envelope for resident Linux guest-control transactions.
-pub mod trusted_guest_control_protocol;
-#[cfg(target_os = "linux")]
-/// Sealed all-FD trusted OverlayFS mount transaction behind exact correlation evidence.
-pub mod trusted_overlay_mount_execution;
-#[cfg(target_os = "linux")]
-/// Read-only exact prerequisite observation and sealed intent for trusted OverlayFS mounts.
-pub mod trusted_overlay_mount_plan;
-/// Pure authority and lifecycle core for trusted resident OverlayFS task views.
-pub mod trusted_overlay_task_view;
-/// Opaque project-disk/filesystem correlation gate for trusted resident Linux mutation.
-pub mod trusted_project_filesystem_correlation;
-/// Descriptor-relative trusted producer for runner workspace and cache identity receipts.
-#[cfg(target_os = "linux")]
-pub mod trusted_workspace_receipt;
 #[cfg(unix)]
-pub mod unix_personal_worker_store;
-pub mod verification_profile;
-pub mod verification_profile_preflight_adapter;
-pub mod verification_profile_registry;
-
-use serde::Serialize;
-
-pub const REPORT_SCHEMA_VERSION: u8 = 1;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CheckStatus {
-    Pass,
-    Warn,
-    Fail,
-}
-
-impl CheckStatus {
-    #[must_use]
-    pub const fn rank(self) -> u8 {
-        match self {
-            Self::Pass => 0,
-            Self::Warn => 1,
-            Self::Fail => 2,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct Check {
-    pub id: String,
-    pub status: CheckStatus,
-    pub summary: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub detail: Option<String>,
-}
-
-impl Check {
-    #[must_use]
-    pub fn new(
-        id: impl Into<String>,
-        status: CheckStatus,
-        summary: impl Into<String>,
-        detail: Option<String>,
-    ) -> Self {
-        Self {
-            id: id.into(),
-            status,
-            summary: summary.into(),
-            detail,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct DoctorReport {
-    pub schema_version: u8,
-    pub overall: CheckStatus,
-    pub checks: Vec<Check>,
-}
-
-impl DoctorReport {
-    #[must_use]
-    pub fn from_checks(checks: Vec<Check>) -> Self {
-        let overall = checks
-            .iter()
-            .map(|check| check.status)
-            .max_by_key(|status| status.rank())
-            .unwrap_or(CheckStatus::Pass);
-
-        Self {
-            schema_version: REPORT_SCHEMA_VERSION,
-            overall,
-            checks,
-        }
-    }
-
-    #[must_use]
-    pub fn has_failures(&self) -> bool {
-        self.overall == CheckStatus::Fail
-    }
-
-    #[must_use]
-    pub fn has_warnings(&self) -> bool {
-        self.checks
-            .iter()
-            .any(|check| check.status == CheckStatus::Warn)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{Check, CheckStatus, DoctorReport};
-
-    #[test]
-    fn report_uses_most_severe_status() {
-        let report = DoctorReport::from_checks(vec![
-            Check::new("ok", CheckStatus::Pass, "ok", None),
-            Check::new("warning", CheckStatus::Warn, "warning", None),
-            Check::new("failure", CheckStatus::Fail, "failure", None),
-        ]);
-
-        assert_eq!(report.overall, CheckStatus::Fail);
-        assert!(report.has_failures());
-        assert!(report.has_warnings());
-    }
-}
+pub mod project_reconciliation;
+pub mod protocol;
+pub mod queue;
+pub mod queue_command;
+pub mod queue_document;
+pub mod queue_store;
+pub mod runner_account;
+pub mod runner_account_plan;
+pub mod runner_account_reconciliation;
+pub mod runner_config;
+pub mod runner_config_generation;
+pub mod runner_config_recovery;
+pub mod runner_egress_readiness;
+pub mod runner_identity;
+pub mod runner_profile;
+pub mod runner_user;
+pub mod service_account;
+pub mod service_account_apply;
+pub mod service_account_plan;
+pub mod service_account_status;
+pub mod source_plan;
+pub mod state_store;
+/// Pure planning for trusted OverlayFS mount authority.
+#[cfg(target_os = "linux")]
+pub mod trusted_overlay_mount_plan;
+/// Sealed all-FD trusted OverlayFS mount transaction behind exact physical correlation proof.
+#[cfg(target_os = "linux")]
+pub mod trusted_overlay_mount_execution;
+/// Pure trusted overlay task/anchor lifecycle and cleanup planning.
+pub mod trusted_overlay_task_view;
+/// Canonical one-shot resident guest-control protocol envelope.
+pub mod trusted_guest_control_protocol;
+/// Pure sealed Mac-side invocation planning for one canonical guest-control request.
+#[cfg(unix)]
+pub mod trusted_guest_control_invocation_plan;
+/// Pure sealed task-private Git clone planning from exact hot-path leases.
+#[cfg(target_os = "linux")]
+pub mod task_private_git_clone_plan;
+#[cfg(unix)]
+pub mod verification;
+pub mod verification_envelope;
+pub mod workflow_artifact;
