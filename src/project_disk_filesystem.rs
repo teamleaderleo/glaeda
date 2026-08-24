@@ -4,6 +4,8 @@
 //! or proof minting. P4 will use these values to distinguish one accepted filesystem generation
 //! from another even when the surrounding project-disk generation remains unchanged.
 
+pub mod format_plan;
+
 use serde::Serialize;
 
 use crate::project_catalog::ProjectIdentity;
