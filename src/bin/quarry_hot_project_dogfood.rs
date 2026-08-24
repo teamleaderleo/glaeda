@@ -344,6 +344,12 @@ fn build_sample(args: SampleArgs) -> Result<Sample, Box<dyn Error>> {
     validate_arm_mode(args.arm, mode)?;
     let quarry_commit = CommitId::parse(&args.quarry_commit)?;
     let edit = edit_observation(args.edit_complete_millis, args.focused_pytest_result_millis)?;
+    if edit
+        .as_ref()
+        .is_some_and(|value| value.edit_complete_millis < args.first_useful_command_millis)
+    {
+        return Err(Box::new(DogfoodError("dogfood_edit_before_first_command")));
+    }
     let milestones = HotExecutionMilestones::new(
         args.sandbox_ready_millis,
         args.repository_ready_millis,
@@ -492,6 +498,13 @@ fn validate_arm_mode(arm: Arm, mode: HotExecutionMode) -> Result<(), DogfoodErro
 
 fn heat(arm: Arm, mode: HotExecutionMode) -> HotExecutionHeat {
     match arm {
+        Arm::Control if mode == HotExecutionMode::ColdDisposable => HotExecutionHeat::new(
+            HotSandboxState::Cold,
+            HotRepositoryState::Cold,
+            HotDependencyState::Cold,
+            HotBuildState::Cold,
+            HotIndexServiceState::Unavailable,
+        ),
         Arm::Control => HotExecutionHeat::new(
             HotSandboxState::Prepared,
             HotRepositoryState::CheckoutHit,
@@ -560,5 +573,9 @@ mod tests {
         assert!(validate_coordinates(SampleClass::Sequential, 11, None).is_err());
         assert!(validate_coordinates(SampleClass::Restart, 4, None).is_err());
         assert!(validate_arm_mode(Arm::Control, HotExecutionMode::ResidentTaskLoop).is_err());
+        assert_eq!(
+            heat(Arm::Control, HotExecutionMode::ColdDisposable).sandbox(),
+            HotSandboxState::Cold
+        );
     }
 }
