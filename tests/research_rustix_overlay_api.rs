@@ -14,22 +14,22 @@ fn compile_overlay_transaction(
     work: BorrowedFd<'_>,
     merged: BorrowedFd<'_>,
 ) -> rustix::io::Result<()> {
-    let fs = fsopen("overlay", FsOpenFlags::CLOEXEC)?;
+    let fs = fsopen("overlay", FsOpenFlags::FSOPEN_CLOEXEC)?;
     fsconfig_set_fd(&fs, "lowerdir+", lower)?;
     fsconfig_set_fd(&fs, "upperdir", upper)?;
     fsconfig_set_fd(&fs, "workdir", work)?;
     fsconfig_create(&fs)?;
     let mount = fsmount(
         &fs,
-        FsMountFlags::CLOEXEC,
-        MountAttrFlags::NODEV | MountAttrFlags::NOSUID,
+        FsMountFlags::FSMOUNT_CLOEXEC,
+        MountAttrFlags::MOUNT_ATTR_NODEV | MountAttrFlags::MOUNT_ATTR_NOSUID,
     )?;
     move_mount(
         &mount,
         "",
         merged,
         "",
-        MoveMountFlags::F_EMPTY_PATH | MoveMountFlags::T_EMPTY_PATH,
+        MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH | MoveMountFlags::MOVE_MOUNT_T_EMPTY_PATH,
     )?;
     Ok(())
 }
