@@ -1,0 +1,190 @@
+name: Bind exact physical identity through P4 attach
+
+on:
+  push:
+    branches:
+      - chatgpt/645-attach-binds-physical-identity
+
+permissions:
+  contents: write
+
+jobs:
+  bind:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: chatgpt/645-attach-binds-physical-identity
+          fetch-depth: 0
+          show-progress: false
+      - name: Carry exact physical/backing identity through attach lifecycle
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('src/project_disk_attachment_state.rs')
+          text = path.read_text()
+
+          # Formatted-detached authority and durable P4 record retain exact P3/P4 identities.
+          old = '''pub struct ProjectDiskFormattedDetachedAuthority {\n    filesystem: ProjectDiskFilesystemBinding,\n    format_outcome_digest: Sha256Digest,\n}'''
+          new = '''pub struct ProjectDiskFormattedDetachedAuthority {\n    filesystem: ProjectDiskFilesystemBinding,\n    physical_identity_digest: Sha256Digest,\n    backing_identity_digest: Sha256Digest,\n    format_outcome_digest: Sha256Digest,\n}'''
+          if old in text:
+              text = text.replace(old, new, 1)
+
+          # Test-only constructor signature may already be `for_test` after the parent sealing helper.
+          for name in ['for_test', 'from_verified']:
+              old_sig = f'''    fn {name}(\n        filesystem: ProjectDiskFilesystemBinding,\n        format_outcome_digest: Sha256Digest,'''
+              new_sig = f'''    fn {name}(\n        filesystem: ProjectDiskFilesystemBinding,\n        physical_identity_digest: Sha256Digest,\n        backing_identity_digest: Sha256Digest,\n        format_outcome_digest: Sha256Digest,'''
+              if old_sig in text:
+                  text = text.replace(old_sig, new_sig, 1)
+                  break
+
+          old_guard = '''        if format_outcome_digest.as_str() == ZERO_DIGEST {'''
+          new_guard = '''        if physical_identity_digest.as_str() == ZERO_DIGEST\n            || backing_identity_digest.as_str() == ZERO_DIGEST\n            || format_outcome_digest.as_str() == ZERO_DIGEST\n        {'''
+          if old_guard in text:
+              text = text.replace(old_guard, new_guard, 1)
+
+          old_init = '''        Ok(Self {\n            filesystem,\n            format_outcome_digest,\n        })'''
+          new_init = '''        Ok(Self {\n            filesystem,\n            physical_identity_digest,\n            backing_identity_digest,\n            format_outcome_digest,\n        })'''
+          if old_init in text:
+              text = text.replace(old_init, new_init, 1)
+
+          old_record = '''    filesystem: ProjectDiskFilesystemBinding,\n    format_outcome_digest: Sha256Digest,\n    revision: ProjectDiskAttachmentRevision,'''
+          new_record = '''    filesystem: ProjectDiskFilesystemBinding,\n    physical_identity_digest: Sha256Digest,\n    backing_identity_digest: Sha256Digest,\n    format_outcome_digest: Sha256Digest,\n    revision: ProjectDiskAttachmentRevision,'''
+          if old_record in text:
+              text = text.replace(old_record, new_record, 1)
+
+          old_from = '''            filesystem,\n            format_outcome_digest: authority.format_outcome_digest,\n            revision: ProjectDiskAttachmentRevision(1),'''
+          new_from = '''            filesystem,\n            physical_identity_digest: authority.physical_identity_digest,\n            backing_identity_digest: authority.backing_identity_digest,\n            format_outcome_digest: authority.format_outcome_digest,\n            revision: ProjectDiskAttachmentRevision(1),'''
+          if old_from in text:
+              text = text.replace(old_from, new_from, 1)
+
+          old_successor = '''            filesystem: self.filesystem.clone(),\n            format_outcome_digest: self.format_outcome_digest.clone(),\n            revision: self.revision.next()?,'''
+          new_successor = '''            filesystem: self.filesystem.clone(),\n            physical_identity_digest: self.physical_identity_digest.clone(),\n            backing_identity_digest: self.backing_identity_digest.clone(),\n            format_outcome_digest: self.format_outcome_digest.clone(),\n            revision: self.revision.next()?,'''
+          if old_successor in text:
+              text = text.replace(old_successor, new_successor, 1)
+
+          # Every sealed host-facing proof carries and checks the exact identities.
+          proof_structs = [
+              'ProjectDiskAttachPreconditionProof',
+              'ProjectDiskAttachmentSuccessProof',
+              'ProjectDiskAttachDetachedProof',
+          ]
+          for struct in proof_structs:
+              marker = f'pub struct {struct} {{'
+              pos = text.find(marker)
+              if pos == -1:
+                  continue
+              end = text.find('}\n', pos)
+              block = text[pos:end]
+              if 'physical_identity_digest' not in block:
+                  insert_after = '    disk_generation: ProjectDiskGeneration,\n'
+                  block2 = block.replace(
+                      insert_after,
+                      insert_after
+                      + '    physical_identity_digest: Sha256Digest,\n'
+                      + '    backing_identity_digest: Sha256Digest,\n',
+                      1,
+                  )
+                  text = text[:pos] + block2 + text[end:]
+
+          # Confirm blocks all compare the exact P4 record identities.
+          targets = [
+              'impl ProjectDiskAttachPreconditionProof {',
+              'impl ProjectDiskAttachmentSuccessProof {',
+              'impl ProjectDiskAttachDetachedProof {',
+          ]
+          for marker in targets:
+              pos = text.find(marker)
+              if pos == -1:
+                  continue
+              next_impl = text.find('\nimpl ', pos + len(marker))
+              if next_impl == -1:
+                  next_impl = len(text)
+              block = text[pos:next_impl]
+              anchor = '            || self.disk_generation != record.disk_generation\n'
+              addition = (
+                  anchor
+                  + '            || self.physical_identity_digest != record.physical_identity_digest\n'
+                  + '            || self.backing_identity_digest != record.backing_identity_digest\n'
+              )
+              if 'self.physical_identity_digest != record.physical_identity_digest' not in block:
+                  block = block.replace(anchor, addition, 1)
+                  text = text[:pos] + block + text[next_impl:]
+
+          # Test constructors copy the exact identities from the P4 record.
+          test_markers = [
+              'ProjectDiskAttachPreconditionProof {',
+              'ProjectDiskAttachmentSuccessProof {',
+              'ProjectDiskAttachDetachedProof {',
+          ]
+          test_pos = text.find('#[cfg(test)]')
+          for marker in test_markers:
+              pos = text.find(marker, test_pos)
+              while pos != -1:
+                  end = text.find('}', pos)
+                  block = text[pos:end]
+                  if 'physical_identity_digest:' not in block:
+                      anchor = '            disk_generation: record.disk_generation,\n'
+                      block2 = block.replace(
+                          anchor,
+                          anchor
+                          + '            physical_identity_digest: record.physical_identity_digest.clone(),\n'
+                          + '            backing_identity_digest: record.backing_identity_digest.clone(),\n',
+                          1,
+                      )
+                      text = text[:pos] + block2 + text[end:]
+                      break
+                  pos = text.find(marker, end)
+
+          # Attachment receipt retains the exact physical/backing identity privately through the accepted outcome.
+          old_receipt = '''    filesystem_kind: ProjectDiskFilesystemKind,\n    correlation_digest: Sha256Digest,'''
+          new_receipt = '''    filesystem_kind: ProjectDiskFilesystemKind,\n    physical_identity_digest: Sha256Digest,\n    backing_identity_digest: Sha256Digest,\n    correlation_digest: Sha256Digest,'''
+          if old_receipt in text:
+              text = text.replace(old_receipt, new_receipt, 1)
+
+          old_receipt_init = '''            filesystem_kind: self.filesystem.kind(),\n            correlation_digest: proof.correlation_digest.clone(),'''
+          new_receipt_init = '''            filesystem_kind: self.filesystem.kind(),\n            physical_identity_digest: self.physical_identity_digest.clone(),\n            backing_identity_digest: self.backing_identity_digest.clone(),\n            correlation_digest: proof.correlation_digest.clone(),'''
+          if old_receipt_init in text:
+              text = text.replace(old_receipt_init, new_receipt_init, 1)
+
+          # Test formatted-detached authority receives nonzero exact physical/backing digests.
+          for call in [
+              'ProjectDiskFormattedDetachedAuthority::for_test(fs, digest(\'a\'))',
+              'ProjectDiskFormattedDetachedAuthority::from_verified(fs, digest(\'a\'))',
+          ]:
+              if call in text:
+                  text = text.replace(
+                      call,
+                      call.split('(fs,')[0] + "(fs, digest('b'), digest('c'), digest('a'))",
+                      1,
+                  )
+
+          # Add one adversarial test that same logical identity with substituted physical digest cannot pass.
+          test_anchor = '''    #[test]\n    fn stale_p1_revision_rejects_attach_intent() {'''
+          new_test = '''    #[test]\n    fn substituted_physical_identity_rejects_attachment_success() {\n        let current = detached();\n        let plan = attach_plan(&current);\n        let started = started(&record(), &current, &plan);\n        let mut proof = ProjectDiskAttachmentSuccessProof::for_test(\n            &started,\n            &current,\n            &plan,\n            digest('d'),\n        );\n        proof.physical_identity_digest = digest('9');\n        assert!(started.record_attachment_observed(&proof).is_err());\n    }\n\n'''
+          if new_test not in text and test_anchor in text:
+              text = text.replace(test_anchor, new_test + test_anchor, 1)
+
+          path.write_text(text)
+          PY
+      - name: Format and focused tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.97.1 --profile minimal --component rustfmt --no-self-update
+          cargo fmt --all
+          cargo test --locked project_disk_attachment_state
+      - name: Remove helper and publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm .github/workflows/bind-645-attach-physical.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "#645 bind exact physical identity through attachment"
+          git push origin HEAD:chatgpt/645-attach-binds-physical-identity
