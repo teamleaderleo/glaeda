@@ -356,12 +356,15 @@ impl OverlayTaskViewState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum OverlayLinkedWorktreeObservation {
+pub enum OverlayGitWorktreeObservation {
     Absent,
     Exact,
     Other,
     Unknown,
 }
+
+/// Compatibility alias retained during the M6 development window.
+pub type OverlayLinkedWorktreeObservation = OverlayGitWorktreeObservation;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -401,7 +404,7 @@ pub enum OverlayTaskProcessObservation {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct OverlayTaskViewObservation {
-    worktree: OverlayLinkedWorktreeObservation,
+    worktree: OverlayGitWorktreeObservation,
     mount: OverlayMountObservation,
     index: OverlayIndexObservation,
     git_proof: OverlayGitProofObservation,
@@ -411,7 +414,7 @@ pub struct OverlayTaskViewObservation {
 impl OverlayTaskViewObservation {
     #[must_use]
     pub const fn new(
-        worktree: OverlayLinkedWorktreeObservation,
+        worktree: OverlayGitWorktreeObservation,
         mount: OverlayMountObservation,
         index: OverlayIndexObservation,
         git_proof: OverlayGitProofObservation,
@@ -427,7 +430,7 @@ impl OverlayTaskViewObservation {
     }
 
     #[must_use]
-    pub const fn worktree(self) -> OverlayLinkedWorktreeObservation {
+    pub const fn worktree(self) -> OverlayGitWorktreeObservation {
         self.worktree
     }
 
@@ -519,7 +522,7 @@ impl OverlayTaskViewRecord {
             "overlay worktree registration requires planned state",
         )?;
         require_process_absent(observation)?;
-        if observation.worktree != OverlayLinkedWorktreeObservation::Exact
+        if observation.worktree != OverlayGitWorktreeObservation::Exact
             || observation.mount != OverlayMountObservation::Absent
         {
             return Err(worktree_registration_unproven());
@@ -537,7 +540,7 @@ impl OverlayTaskViewRecord {
             "overlay mount acceptance requires registered-worktree state",
         )?;
         require_process_absent(observation)?;
-        if observation.worktree != OverlayLinkedWorktreeObservation::Exact
+        if observation.worktree != OverlayGitWorktreeObservation::Exact
             || observation.mount != OverlayMountObservation::Exact
         {
             return Err(mount_unproven());
@@ -555,7 +558,7 @@ impl OverlayTaskViewRecord {
             "overlay readiness requires mounted state",
         )?;
         require_process_absent(observation)?;
-        if observation.worktree != OverlayLinkedWorktreeObservation::Exact
+        if observation.worktree != OverlayGitWorktreeObservation::Exact
             || observation.mount != OverlayMountObservation::Exact
             || observation.index != OverlayIndexObservation::ExactSource
             || observation.git_proof != OverlayGitProofObservation::ExactClean
@@ -574,7 +577,7 @@ impl OverlayTaskViewRecord {
             "overlay_running_requires_ready",
             "overlay task start requires ready state",
         )?;
-        if observation.worktree != OverlayLinkedWorktreeObservation::Exact
+        if observation.worktree != OverlayGitWorktreeObservation::Exact
             || observation.mount != OverlayMountObservation::Exact
             || observation.process != OverlayTaskProcessObservation::ExactRunning
         {
@@ -610,16 +613,16 @@ impl OverlayTaskViewRecord {
         match self.state {
             OverlayTaskViewState::CleanupUnmountRequired => {
                 match (observation.mount, observation.worktree) {
-                    (OverlayMountObservation::Exact, OverlayLinkedWorktreeObservation::Exact) => {
+                    (OverlayMountObservation::Exact, OverlayGitWorktreeObservation::Exact) => {
                         Ok(OverlayCleanupAction::UnmountExact)
                     }
-                    (OverlayMountObservation::Absent, OverlayLinkedWorktreeObservation::Exact) => {
+                    (OverlayMountObservation::Absent, OverlayGitWorktreeObservation::Exact) => {
                         Ok(OverlayCleanupAction::RemoveExactWorktree)
                     }
-                    (OverlayMountObservation::Absent, OverlayLinkedWorktreeObservation::Absent) => {
+                    (OverlayMountObservation::Absent, OverlayGitWorktreeObservation::Absent) => {
                         Ok(OverlayCleanupAction::CompleteAbsent)
                     }
-                    (OverlayMountObservation::Exact, OverlayLinkedWorktreeObservation::Absent) => {
+                    (OverlayMountObservation::Exact, OverlayGitWorktreeObservation::Absent) => {
                         Err(cleanup_identity_conflict())
                     }
                     _ => Err(cleanup_inconclusive()),
@@ -627,10 +630,10 @@ impl OverlayTaskViewRecord {
             }
             OverlayTaskViewState::CleanupWorktreeRemoveRequired => {
                 match (observation.mount, observation.worktree) {
-                    (OverlayMountObservation::Absent, OverlayLinkedWorktreeObservation::Exact) => {
+                    (OverlayMountObservation::Absent, OverlayGitWorktreeObservation::Exact) => {
                         Ok(OverlayCleanupAction::RemoveExactWorktree)
                     }
-                    (OverlayMountObservation::Absent, OverlayLinkedWorktreeObservation::Absent) => {
+                    (OverlayMountObservation::Absent, OverlayGitWorktreeObservation::Absent) => {
                         Ok(OverlayCleanupAction::CompleteAbsent)
                     }
                     (OverlayMountObservation::Exact, _) => Err(cleanup_mount_still_present()),
@@ -652,7 +655,7 @@ impl OverlayTaskViewRecord {
         )?;
         require_process_absent(observation)?;
         if observation.mount != OverlayMountObservation::Absent
-            || observation.worktree != OverlayLinkedWorktreeObservation::Exact
+            || observation.worktree != OverlayGitWorktreeObservation::Exact
         {
             return Err(unmount_postcondition_unproven());
         }
@@ -672,7 +675,7 @@ impl OverlayTaskViewRecord {
         }
         require_process_absent(observation)?;
         if observation.mount != OverlayMountObservation::Absent
-            || observation.worktree != OverlayLinkedWorktreeObservation::Absent
+            || observation.worktree != OverlayGitWorktreeObservation::Absent
         {
             return Err(worktree_remove_postcondition_unproven());
         }
@@ -761,10 +764,7 @@ fn require_nonforeign_cleanup_observation(
     observation: OverlayTaskViewObservation,
 ) -> Result<(), TrustedOverlayTaskViewError> {
     if matches!(observation.mount, OverlayMountObservation::Other)
-        || matches!(
-            observation.worktree,
-            OverlayLinkedWorktreeObservation::Other
-        )
+        || matches!(observation.worktree, OverlayGitWorktreeObservation::Other)
     {
         return Err(cleanup_identity_conflict());
     }
@@ -929,8 +929,8 @@ const fn task_terminal() -> TrustedOverlayTaskViewError {
 #[cfg(test)]
 mod tests {
     use super::{
-        OverlayCleanupAction, OverlayGitProofObservation, OverlayIndexObservation,
-        OverlayLinkedWorktreeObservation, OverlayMountObservation, OverlaySourceAnchorBinding,
+        OverlayCleanupAction, OverlayGitProofObservation, OverlayGitWorktreeObservation,
+        OverlayIndexObservation, OverlayMountObservation, OverlaySourceAnchorBinding,
         OverlaySourceAnchorGeneration, OverlaySourceAnchorId, OverlaySourceAnchorRecord,
         OverlaySourceAnchorState, OverlayTaskProcessObservation, OverlayTaskViewGeneration,
         OverlayTaskViewId, OverlayTaskViewLease, OverlayTaskViewObservation, OverlayTaskViewRecord,
@@ -968,7 +968,7 @@ mod tests {
     }
 
     fn observation(
-        worktree: OverlayLinkedWorktreeObservation,
+        worktree: OverlayGitWorktreeObservation,
         mount: OverlayMountObservation,
         index: OverlayIndexObservation,
         proof: OverlayGitProofObservation,
@@ -979,7 +979,7 @@ mod tests {
 
     fn registered() -> OverlayTaskViewObservation {
         observation(
-            OverlayLinkedWorktreeObservation::Exact,
+            OverlayGitWorktreeObservation::Exact,
             OverlayMountObservation::Absent,
             OverlayIndexObservation::Absent,
             OverlayGitProofObservation::NotRun,
@@ -989,7 +989,7 @@ mod tests {
 
     fn mounted() -> OverlayTaskViewObservation {
         observation(
-            OverlayLinkedWorktreeObservation::Exact,
+            OverlayGitWorktreeObservation::Exact,
             OverlayMountObservation::Exact,
             OverlayIndexObservation::Absent,
             OverlayGitProofObservation::NotRun,
@@ -999,7 +999,7 @@ mod tests {
 
     fn ready() -> OverlayTaskViewObservation {
         observation(
-            OverlayLinkedWorktreeObservation::Exact,
+            OverlayGitWorktreeObservation::Exact,
             OverlayMountObservation::Exact,
             OverlayIndexObservation::ExactSource,
             OverlayGitProofObservation::ExactClean,
@@ -1009,7 +1009,7 @@ mod tests {
 
     fn running() -> OverlayTaskViewObservation {
         observation(
-            OverlayLinkedWorktreeObservation::Exact,
+            OverlayGitWorktreeObservation::Exact,
             OverlayMountObservation::Exact,
             OverlayIndexObservation::Other,
             OverlayGitProofObservation::Mismatch,
@@ -1019,7 +1019,7 @@ mod tests {
 
     fn cleanup_mounted() -> OverlayTaskViewObservation {
         observation(
-            OverlayLinkedWorktreeObservation::Exact,
+            OverlayGitWorktreeObservation::Exact,
             OverlayMountObservation::Exact,
             OverlayIndexObservation::Other,
             OverlayGitProofObservation::Mismatch,
@@ -1029,7 +1029,7 @@ mod tests {
 
     fn cleanup_unmounted() -> OverlayTaskViewObservation {
         observation(
-            OverlayLinkedWorktreeObservation::Exact,
+            OverlayGitWorktreeObservation::Exact,
             OverlayMountObservation::Absent,
             OverlayIndexObservation::Other,
             OverlayGitProofObservation::Mismatch,
@@ -1039,7 +1039,7 @@ mod tests {
 
     fn cleanup_absent() -> OverlayTaskViewObservation {
         observation(
-            OverlayLinkedWorktreeObservation::Absent,
+            OverlayGitWorktreeObservation::Absent,
             OverlayMountObservation::Absent,
             OverlayIndexObservation::Absent,
             OverlayGitProofObservation::NotRun,
@@ -1132,7 +1132,7 @@ mod tests {
             ),
         ] {
             let observed = observation(
-                OverlayLinkedWorktreeObservation::Exact,
+                OverlayGitWorktreeObservation::Exact,
                 OverlayMountObservation::Exact,
                 index,
                 proof,
@@ -1216,7 +1216,7 @@ mod tests {
             .unwrap();
 
         let foreign = observation(
-            OverlayLinkedWorktreeObservation::Other,
+            OverlayGitWorktreeObservation::Other,
             OverlayMountObservation::Absent,
             OverlayIndexObservation::Other,
             OverlayGitProofObservation::Unknown,
@@ -1231,7 +1231,7 @@ mod tests {
         );
 
         let unknown = observation(
-            OverlayLinkedWorktreeObservation::Unknown,
+            OverlayGitWorktreeObservation::Unknown,
             OverlayMountObservation::Unknown,
             OverlayIndexObservation::Unknown,
             OverlayGitProofObservation::Unknown,
