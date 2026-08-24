@@ -42,6 +42,20 @@ jobs:
               raise SystemExit("unexpected rustix import seam")
           s = s.replace(old_import, "use rustix::io::Errno;", 1)
 
+          if s.count("root_snapshot.device") != 2 or s.count("objects_snapshot.device") != 1:
+              raise SystemExit("stale directory snapshot field seam changed")
+          s = s.replace("root_snapshot.device", "root_snapshot.identity.device")
+          s = s.replace("objects_snapshot.device", "objects_snapshot.identity.device")
+
+          old_test_import = "use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};"
+          if s.count(old_test_import) != 1:
+              raise SystemExit("test metadata import seam changed")
+          s = s.replace(
+              old_test_import,
+              "use std::os::unix::fs::{PermissionsExt as _, symlink};",
+              1,
+          )
+
           new_confirm = '''    pub fn confirm(&self) -> Result<(), ImmutableGitObjectPoolObservationError> {
               require_parent_identity(
                   &self.parent,
