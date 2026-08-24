@@ -1,0 +1,130 @@
+name: Research safe-rustix OverlayFS physical transaction
+
+on:
+  push:
+    branches:
+      - research/rustix-safe-overlay-physical
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: true
+          show-progress: false
+      - name: Build safe Rust probe
+        shell: bash
+        run: |
+          set -u
+          mkdir -p src/bin
+          cat >src/bin/research_rustix_safe_overlay.rs <<'RS'
+          #![forbid(unsafe_code)]
+          use std::env;
+          use std::fs::File;
+          use std::io::Read as _;
+          use std::os::fd::AsFd as _;
+          use std::path::Path;
+
+          use rustix::fs::{self, AtFlags, Mode, OFlags, StatxFlags, statx};
+          use rustix::mount::{
+              FsMountFlags, FsOpenFlags, MountAttrFlags, MoveMountFlags, fsconfig_create,
+              fsconfig_set_fd, fsmount, fsopen, move_mount,
+          };
+
+          fn mount_id(fd: impl std::os::fd::AsFd) -> rustix::io::Result<u64> {
+              Ok(statx(fd, "", AtFlags::EMPTY_PATH, StatxFlags::MNT_ID)?.stx_mnt_id)
+          }
+
+          fn main() -> Result<(), Box<dyn std::error::Error>> {
+              let args: Vec<_> = env::args_os().collect();
+              if args.len() != 6 { return Err("expected lower upper work parent basename".into()); }
+              let flags = OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+              let lower = fs::open(Path::new(&args[1]), flags, Mode::empty())?;
+              let upper = fs::open(Path::new(&args[2]), flags, Mode::empty())?;
+              let work = fs::open(Path::new(&args[3]), flags, Mode::empty())?;
+              let parent = fs::open(Path::new(&args[4]), flags, Mode::empty())?;
+              let merged = fs::openat(parent.as_fd(), Path::new(&args[5]), flags, Mode::empty())?;
+              let under_id = mount_id(&merged)?;
+
+              let context = fsopen("overlay", FsOpenFlags::CLOEXEC)?;
+              fsconfig_set_fd(&context, "lowerdir+", &lower)?;
+              fsconfig_set_fd(&context, "upperdir", &upper)?;
+              fsconfig_set_fd(&context, "workdir", &work)?;
+              fsconfig_create(&context)?;
+              let mount = fsmount(
+                  &context,
+                  FsMountFlags::CLOEXEC,
+                  MountAttrFlags::NODEV | MountAttrFlags::NOSUID,
+              )?;
+              let mount_id_before = mount_id(&mount)?;
+              move_mount(
+                  &mount,
+                  "",
+                  &merged,
+                  "",
+                  MoveMountFlags::F_EMPTY_PATH | MoveMountFlags::T_EMPTY_PATH,
+              )?;
+              let visible = fs::openat(parent.as_fd(), Path::new(&args[5]), flags, Mode::empty())?;
+              let visible_id = mount_id(&visible)?;
+              let base = fs::openat(visible.as_fd(), "base.txt", OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())?;
+              let mut text = String::new();
+              File::from(base).read_to_string(&mut text)?;
+              println!("under_id={under_id}");
+              println!("mount_id={mount_id_before}");
+              println!("visible_id={visible_id}");
+              println!("base={}", text.trim_end());
+              Ok(())
+          }
+          RS
+          cargo build --locked --bin research_rustix_safe_overlay >/tmp/build.out 2>/tmp/build.err; build_rc=$?
+          printf '{"build_rc":%s}\n' "$build_rc" >/tmp/build-status.json
+          exit 0
+      - name: Run physical probe when build succeeded
+        shell: bash
+        run: |
+          set -u
+          build_rc="$(python3 -c 'import json;print(json.load(open("/tmp/build-status.json"))["build_rc"])')"
+          ROOT="$RUNNER_TEMP/smolrunner-safe-rustix-overlay"; rm -rf "$ROOT"; mkdir -p "$ROOT/lower" "$ROOT/upper" "$ROOT/work" "$ROOT/targets/merged"; printf 'base\n' > "$ROOT/lower/base.txt"
+          if [ "$build_rc" -eq 0 ]; then
+            sudo ./target/debug/research_rustix_safe_overlay "$ROOT/lower" "$ROOT/upper" "$ROOT/work" "$ROOT/targets" merged >/tmp/run.out 2>/tmp/run.err; run_rc=$?
+          else
+            run_rc=99; : >/tmp/run.out; : >/tmp/run.err
+          fi
+          findmnt -T "$ROOT/targets/merged" -n -o ID,FSTYPE,OPTIONS >/tmp/findmnt.out 2>/tmp/findmnt.err || true
+          sudo umount "$ROOT/targets/merged" >/tmp/umount.out 2>/tmp/umount.err || true
+          printf '{"run_rc":%s}\n' "$run_rc" >/tmp/run-status.json
+          exit 0
+      - name: Publish diagnostics
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json,pathlib
+          out={}
+          out.update(json.load(open('/tmp/build-status.json')))
+          out.update(json.load(open('/tmp/run-status.json')))
+          vals={}
+          for line in pathlib.Path('/tmp/run.out').read_text().splitlines():
+            if '=' in line:
+              k,v=line.split('=',1); vals[k]=v
+          for k in ['under_id','mount_id','visible_id']:
+            if k in vals: out[k]=int(vals[k])
+          out['base']=vals.get('base','')
+          out['findmnt']=pathlib.Path('/tmp/findmnt.out').read_text().strip()
+          out['mount_id_matches_visible']=out.get('mount_id')==out.get('visible_id') and out.get('mount_id',0)!=0
+          out['under_differs']=out.get('under_id')!=out.get('mount_id')
+          pathlib.Path('/tmp/result.json').write_text(json.dumps(out,indent=2,sort_keys=True)+'\n')
+          PY
+          git config user.name teamleaderleo; git config user.email cheerleaderleo@outlook.com
+          OUT=research/results-rustix-safe-overlay-physical
+          git checkout --orphan "$OUT"; git rm -rf . >/dev/null 2>&1 || true
+          cp /tmp/result.json ./result.json
+          cp /tmp/build.err ./build.err
+          cp /tmp/run.err ./run.err
+          cp src/bin/research_rustix_safe_overlay.rs ./probe.rs
+          git add .; git commit -m 'Record safe-rustix OverlayFS physical transaction'
+          git push --force origin HEAD:"$OUT"
