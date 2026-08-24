@@ -27,8 +27,8 @@ jobs:
           from pathlib import Path
           p = Path('src/lib.rs')
           s = p.read_text()
-          needle = '''/// Pure trusted overlay task/anchor lifecycle and cleanup planning.\npub mod trusted_overlay_task_view;\n'''
-          addition = needle + '''/// Pure sealed task-private Git clone planning from exact hot-path leases.\n#[cfg(target_os = "linux")]\npub mod task_private_git_clone_plan;\n'''
+          needle = '''#[cfg(target_os = "linux")]\n/// Read-only exact prerequisite observation and sealed intent for trusted OverlayFS mounts.\npub mod trusted_overlay_mount_plan;\n'''
+          addition = '''/// Pure sealed task-private Git clone planning from exact hot-path leases.\n#[cfg(target_os = "linux")]\npub mod task_private_git_clone_plan;\n''' + needle
           if 'pub mod task_private_git_clone_plan;' not in s:
               if needle not in s:
                   raise SystemExit('lib export seam changed')
