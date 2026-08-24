@@ -140,6 +140,22 @@ fn refuses_malformed_lima_json_without_interpreting_its_schema() {
 }
 
 #[test]
+fn refuses_mutation_command_substitution() {
+    let mut value = fixture();
+    value["lima"]["disk_list_json"]["argv"] = json!([
+        "/opt/homebrew/bin/limactl",
+        "disk",
+        "unlock",
+        "candidate"
+    ]);
+    let failure = decode(&value).expect_err("mutation argv must fail");
+    assert_eq!(
+        failure.kind(),
+        ProjectDiskPhysicalReceiptErrorKind::InvalidField
+    );
+}
+
+#[test]
 fn refuses_ambiguous_guest_mount_device() {
     let mut value = fixture();
     value["guest"]["mountinfo"]["stdout"] = json!(concat!(
