@@ -41,6 +41,13 @@ jobs:
               "          \"\"\"\n\n          needle = 'cargo fmt --all\\n'",
               1,
           )
+          old = '''              r"    struct FakeBackend \\{.*?\\n    \\}\\n\\n    fn inputs\\(",
+              fake + "\\n\\n    fn inputs(",'''
+          new = '''              r"    struct FakeBackend \\{.*?(?=\\n    fn inputs\\()",
+              fake + "\\n\\n",'''
+          if source.count(old) != 1:
+              raise SystemExit(f'fake backend matcher patch count={source.count(old)}')
+          source = source.replace(old, new, 1)
           marker = '        run: |\n'
           if source.count(marker) != 1:
               raise SystemExit(f'run block count={source.count(marker)}')
