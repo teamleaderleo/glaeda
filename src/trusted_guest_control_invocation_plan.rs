@@ -134,6 +134,7 @@ pub struct TrustedGuestControlInvocationTarget {
 }
 
 impl TrustedGuestControlInvocationTarget {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_verified(
         limactl_program: PathBuf,
         lima_home: PathBuf,
@@ -192,12 +193,12 @@ impl TrustedGuestControlInvocationPlan {
     }
 
     #[must_use]
-    pub const fn command(&self) -> &CommandSpec {
+    pub(crate) const fn command(&self) -> &CommandSpec {
         &self.command
     }
 
     #[must_use]
-    pub fn stdin(&self) -> &[u8] {
+    pub(crate) fn stdin(&self) -> &[u8] {
         &self.stdin
     }
 }
@@ -284,7 +285,8 @@ pub fn plan_trusted_guest_control_invocation(
     }
 
     let stdin = encode_trusted_guest_control_request(request).map_err(|_| protocol_error())?;
-    let request_digest = trusted_guest_control_request_digest(request).map_err(|_| protocol_error())?;
+    let request_digest =
+        trusted_guest_control_request_digest(request).map_err(|_| protocol_error())?;
     let command = CommandSpec::new(&target.limactl_program)
         .argument("--tty=false")
         .environment("HOME", LIMACTL_SAFE_HOME)
@@ -411,8 +413,7 @@ mod tests {
         ResidentSandboxGeneration, ResidentSandboxId,
     };
     use crate::trusted_guest_control_protocol::{
-        TrustedGuestControlArchitecture, TrustedGuestControlAuthority,
-        TrustedGuestControlRequestId,
+        TrustedGuestControlArchitecture, TrustedGuestControlAuthority, TrustedGuestControlRequestId,
     };
 
     fn digest(byte: char) -> Sha256Digest {
@@ -493,7 +494,10 @@ mod tests {
         let request = request();
         let target = target(&request);
         let plan = plan_trusted_guest_control_invocation(&request, &target).unwrap();
-        assert_eq!(plan.command.program, PathBuf::from("/opt/homebrew/bin/limactl"));
+        assert_eq!(
+            plan.command.program,
+            PathBuf::from("/opt/homebrew/bin/limactl")
+        );
         assert_eq!(
             plain_arguments(&plan.command),
             vec![
@@ -513,7 +517,11 @@ mod tests {
             ]
         );
         assert_eq!(
-            plan.command.environment.keys().cloned().collect::<BTreeSet<_>>(),
+            plan.command
+                .environment
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
             BTreeSet::from([
                 "HOME".to_owned(),
                 "LANG".to_owned(),
@@ -531,14 +539,29 @@ mod tests {
     fn canonical_request_is_stdin_only_and_binds_summary_digest() {
         let request = request();
         let plan = plan_trusted_guest_control_invocation(&request, &target(&request)).unwrap();
-        assert_eq!(plan.stdin(), encode_trusted_guest_control_request(&request).unwrap());
+        assert_eq!(
+            plan.stdin(),
+            encode_trusted_guest_control_request(&request).unwrap()
+        );
         assert_eq!(
             plan.summary.request_digest(),
             &trusted_guest_control_request_digest(&request).unwrap()
         );
         let request_text = std::str::from_utf8(plan.stdin()).unwrap();
-        assert!(!plan.command.displayed_argv().iter().any(|value| request_text.contains(value)));
-        assert!(!plan.command.displayed_argv().join(" ").contains("request-1"));
+        assert!(
+            !plan
+                .command
+                .displayed_argv()
+                .iter()
+                .any(|value| request_text.contains(value))
+        );
+        assert!(
+            !plan
+                .command
+                .displayed_argv()
+                .join(" ")
+                .contains("request-1")
+        );
     }
 
     #[test]
