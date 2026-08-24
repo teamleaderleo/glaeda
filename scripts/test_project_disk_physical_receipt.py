@@ -211,9 +211,6 @@ class ProjectDiskPhysicalReceiptTests(unittest.TestCase):
         with self.assertRaises(receipt.ReceiptError):
             receipt.capture(self.fixture.args())
 
-        captured = receipt.capture(self.fixture.args()) if False else None
-        self.assertIsNone(captured)
-
     def test_intermediate_symlink_in_disk_directory_path_is_refused(self) -> None:
         redirected_parent = self.fixture.root / "redirected"
         redirected_parent.mkdir()
