@@ -195,6 +195,7 @@ impl TrustedGuestControlAuthority {
 pub enum TrustedGuestControlOperation {
     ObserveProjectFilesystem,
     ObserveImmutableGitPool,
+    PublishImmutableGitPoolGeneration,
     PrepareTrustedTaskView,
     ObserveTrustedTaskView,
     CleanupTrustedTaskView,
@@ -896,6 +897,19 @@ mod tests {
                 .unwrap_err()
                 .kind(),
             TrustedGuestControlProtocolErrorKind::NonCanonical
+        );
+    }
+
+    #[test]
+    fn immutable_pool_publication_operation_has_exact_closed_wire_value() {
+        let mut publication = request();
+        publication.operation = TrustedGuestControlOperation::PublishImmutableGitPoolGeneration;
+        let bytes = encode_trusted_guest_control_request(&publication).unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(text.contains("\"operation\":\"publish_immutable_git_pool_generation\""));
+        assert_eq!(
+            decode_trusted_guest_control_request(&bytes).unwrap(),
+            publication
         );
     }
 
