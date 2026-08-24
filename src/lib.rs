@@ -321,6 +321,8 @@ pub mod trusted_overlay_mount_plan;
 pub mod trusted_overlay_task_view;
 /// Opaque project-disk/filesystem correlation gate for trusted resident Linux mutation.
 pub mod trusted_project_filesystem_correlation;
+/// Read-only guest correlation of one held project-filesystem device with exact mountinfo evidence.
+pub mod trusted_project_filesystem_guest_observation;
 /// Descriptor-relative trusted producer for runner workspace and cache identity receipts.
 #[cfg(target_os = "linux")]
 pub mod trusted_workspace_receipt;
