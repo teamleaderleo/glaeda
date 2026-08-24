@@ -1,0 +1,256 @@
+name: Repair project-disk observer authority boundary
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/repair-639-project-disk-observer-authority.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: codex/565-p2-physical-observer
+          fetch-depth: 0
+          show-progress: false
+      - name: Remove P1 authority projection from P2
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('src/project_disk_host_observation.rs')
+          s = p.read_text()
+
+          old_docs = '''//! This module executes no process and exposes no attach, detach, unlock, format, resize, delete,
+//! repair, mount, or proof-minting authority. A bound P1 observation additionally requires an
+//! expected physical identity, the exact current lease revision, and descriptor-bound resident VZ
+//! host evidence for a `current_attachment` classification.
+'''
+          new_docs = '''//! This module executes no process and exposes no attach, detach, unlock, format, resize, delete,
+//! repair, mount, P1 lease-transition, or proof-minting authority. It returns only unbound physical
+//! evidence. A later durable P3 create transaction is the first layer allowed to bind one observed
+//! physical/backing identity to a SmolRunner project-disk generation.
+'''
+          if old_docs not in s:
+              raise SystemExit('module authority docs changed')
+          s = s.replace(old_docs, new_docs, 1)
+
+          old_imports = '''use crate::artifact::Sha256Digest;
+use crate::lima_host_identity::LimaHostIdentityObservation;
+use crate::lima_observation::{
+    LimaInstanceName, LimaObservationRequest, LimaObservationSourceIdentity,
+};
+use crate::project_catalog::ProjectIdentity;
+use crate::project_disk_lease::{
+    ProjectDiskAttachmentGeneration, ProjectDiskAttachmentLease, ProjectDiskGeneration,
+    ProjectDiskId, ProjectDiskLeaseRecord, ProjectDiskLeaseState, ProjectDiskLockObservation,
+    ProjectDiskObservation, ProjectDiskPhysicalObservation, ProjectDiskRecoverability,
+    ProjectDiskRevision, ProjectDiskUseObservation, ResidentSandboxGeneration, ResidentSandboxId,
+};
+'''
+          new_imports = '''use crate::artifact::Sha256Digest;
+use crate::lima_observation::{LimaInstanceName, LimaObservationSourceIdentity};
+'''
+          if old_imports not in s:
+              raise SystemExit('authority imports changed')
+          s = s.replace(old_imports, new_imports, 1)
+
+          backing_impl = '''impl ProjectDiskBackingIdentity {
+    #[must_use]
+    pub const fn digest(&self) -> &Sha256Digest {
+        &self.0
+    }
+}
+'''
+          backing_replacement = '''impl ProjectDiskBackingIdentity {
+    /// Parse one persisted opaque backing identity digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns a path-free refusal unless the value is canonical SHA-256.
+    pub fn parse(value: &str) -> Result<Self, ProjectDiskHostObservationError> {
+        Sha256Digest::parse(value)
+            .map(Self)
+            .map_err(|_| invalid_input())
+    }
+
+    #[must_use]
+    pub const fn digest(&self) -> &Sha256Digest {
+        &self.0
+    }
+}
+'''
+          if backing_impl not in s:
+              raise SystemExit('backing identity impl changed')
+          s = s.replace(backing_impl, backing_replacement, 1)
+
+          start = s.index('#[derive(Debug, Clone, PartialEq, Eq, Serialize)]\npub struct ProjectDiskLeaseObservationBindingSummary')
+          end = s.index('pub struct LimaStandaloneDiskObservation {', start)
+          s = s[:start] + s[end:]
+
+          impl_start = s.index('impl LimaStandaloneDiskObservation {')
+          impl_end = s.index('impl fmt::Debug for LimaStandaloneDiskObservation {', impl_start)
+          minimal_impl = '''impl LimaStandaloneDiskObservation {
+    #[must_use]
+    pub const fn summary(&self) -> &LimaStandaloneDiskObservationSummary {
+        &self.summary
+    }
+
+    /// Reconfirm every held descriptor, opaque entry role, path binding, and a fresh inventory
+    /// observation without mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns `changed_during_observation` for any same-name replacement or rebind.
+    pub fn confirm(
+        &mut self,
+        inventory_json_lines: &[u8],
+    ) -> Result<(), ProjectDiskHostObservationError> {
+        revalidate_observation(self, inventory_json_lines)
+    }
+}
+
+'''
+          s = s[:impl_start] + minimal_impl + s[impl_end:]
+
+          s = s.replace('    BindingMismatch,\n    ResidentMismatch,\n', '')
+
+          binding_start = s.index('fn binding_summary(')
+          binding_end = s.index('const fn error(', binding_start)
+          s = s[:binding_start] + s[binding_end:]
+
+          for marker, next_marker in [
+              ('const fn binding_mismatch()', 'const fn resident_mismatch()'),
+              ('const fn resident_mismatch()', 'const fn changed()'),
+          ]:
+              start = s.index(marker)
+              end = s.index(next_marker, start)
+              s = s[:start] + s[end:]
+
+          p.write_text(s)
+
+          t = Path('src/project_disk_host_observation/tests.rs')
+          ts = t.read_text()
+          ts = ts.replace('use crate::lima_observation::{LimaArchitecture, LimaVmType};\n', '')
+
+          lima_request_start = ts.index('    fn lima_request(&self) -> LimaObservationRequest {')
+          lima_request_end = ts.index('\n    }\n}', lima_request_start) + len('\n    }')
+          ts = ts[:lima_request_start] + ts[lima_request_end:]
+
+          helper_start = ts.index('fn project() -> ProjectIdentity {')
+          first_test = ts.index('#[test]\nfn detached_schema_binds_exact_backing_identity_and_distinct_byte_counts()', helper_start)
+          ts = ts[:helper_start] + ts[first_test:]
+
+          tests_start = ts.index('#[test]\nfn detached_schema_binds_exact_backing_identity_and_distinct_byte_counts()')
+          tests_end = ts.index('#[test]\nfn planned_name_absence_is_descriptor_bound_and_detects_appearance()', tests_start)
+          replacement_tests = '''#[test]
+fn detached_schema_reports_unbound_exact_backing_identity_and_distinct_byte_counts() {
+    let fixture = Fixture::new();
+    let inventory = fixture.detached_inventory();
+    let mut observed = observe_lima_standalone_disk(fixture.request(), &inventory).unwrap();
+    assert_eq!(
+        observed.summary().disposition(),
+        LimaStandaloneDiskDisposition::Detached
+    );
+    assert_eq!(observed.summary().backing_logical_bytes(), DISK_BYTES);
+    assert!(observed.summary().backing_allocated_bytes() <= DISK_BYTES);
+    assert_eq!(observed.summary().inventory_logical_bytes(), DISK_BYTES);
+    assert!(observed.summary().inventory_format_raw());
+    observed.confirm(&inventory).unwrap();
+
+    let physical = ProjectDiskPhysicalIdentity::parse(
+        observed.summary().physical_identity().digest().as_str(),
+    )
+    .unwrap();
+    let backing = ProjectDiskBackingIdentity::parse(
+        observed.summary().backing_identity().digest().as_str(),
+    )
+    .unwrap();
+    assert_eq!(&physical, observed.summary().physical_identity());
+    assert_eq!(&backing, observed.summary().backing_identity());
+}
+
+#[test]
+fn attached_schema_remains_external_correlation_only() {
+    let fixture = Fixture::new();
+    fixture.attach();
+    let inventory = fixture.attached_inventory();
+    let mut observed = observe_lima_standalone_disk(fixture.request(), &inventory).unwrap();
+    assert_eq!(
+        observed.summary().disposition(),
+        LimaStandaloneDiskDisposition::Attached
+    );
+    observed.confirm(&inventory).unwrap();
+}
+
+#[test]
+fn distinct_physical_disks_have_distinct_unbound_identities() {
+    let first = Fixture::new();
+    let second = Fixture::new();
+    let first_observed =
+        observe_lima_standalone_disk(first.request(), &first.detached_inventory()).unwrap();
+    let second_observed =
+        observe_lima_standalone_disk(second.request(), &second.detached_inventory()).unwrap();
+    assert_ne!(
+        first_observed.summary().physical_identity(),
+        second_observed.summary().physical_identity()
+    );
+    assert_ne!(
+        first_observed.summary().backing_identity(),
+        second_observed.summary().backing_identity()
+    );
+}
+
+'''
+          ts = ts[:tests_start] + replacement_tests + ts[tests_end:]
+          t.write_text(ts)
+
+          d = Path('docs/PROJECT_DISK_HOST_OBSERVATION.md')
+          ds = d.read_text()
+          section_start = ds.index('## P1 binding')
+          section_end = ds.index('## Excluded authority', section_start)
+          authority_section = '''## P3 handoff and authority boundary
+
+An unbound `LimaStandaloneDiskObservation` is safe for fixture and P3 post-create inspection. It is
+never projected into P1 lease-transition vocabulary and carries zero mutation authority. Its opaque
+physical/backing identities are observation data until a separately reviewed durable P3 create
+transaction binds the uninterrupted post-create observation to the already-accepted project-disk
+generation.
+
+P3 pre-create checks may use `LimaStandaloneDiskAbsenceObservation`. It retains the already-existing
+private Lima home and directly observed disk-collection descriptors, requires the planned basename
+to be absent relative to that collection, requires strict inventory to contain no matching record,
+and repeats both checks around parent rebind validation. This proves bounded absence only; the
+planned name still grants no ownership or create authority.
+
+The P2 API deliberately exposes no constructor that combines an arbitrary P1 record with an observed
+physical digest, no resident-sandbox-to-Lima binding, and no copyable `Exact`/`CurrentAttachment`
+lease observation. P4 attachment reconciliation must later compose durable P3 provenance with fresh
+held P2 revalidation and an exact resident-sandbox-generation mapping inside one short-lived
+transaction boundary.
+
+'''
+          ds = ds[:section_start] + authority_section + ds[section_end:]
+          d.write_text(ds)
+          PY
+
+          rm .github/workflows/repair-639-project-disk-observer-authority.yml
+          cargo fmt --all
+          cargo fmt --all -- --check
+          cargo test --locked project_disk_host_observation
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cargo check --locked --target aarch64-unknown-linux-gnu
+          cargo check --locked --all-targets --all-features --target aarch64-apple-darwin
+          git diff --check
+          git config user.name "smolrunner-p2-authority-repair"
+          git config user.email "actions@users.noreply.github.com"
+          git add src/project_disk_host_observation.rs src/project_disk_host_observation/tests.rs docs/PROJECT_DISK_HOST_OBSERVATION.md .github/workflows/repair-639-project-disk-observer-authority.yml
+          git commit -m "Fix project-disk observer authority boundary"
+          git push origin HEAD:codex/565-p2-physical-observer
