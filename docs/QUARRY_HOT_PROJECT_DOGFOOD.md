@@ -1,6 +1,6 @@
 # Quarry hot-project dogfood experiment
 
-Status: software-side experiment contract. Physical project-disk mutation remains sealed until the existing #565/#628/#589 authority chain permits the real hot path.
+Status: software-side experiment contract. Physical project-disk mutation remains sealed behind the #565 P2/P3/P4 lifecycle, the #628 full-correlation rerun, and the later sealed #589 activation path.
 
 This document owns the first Quarry dogfood workload for #560. It keeps the control path, treatment path, state placement, measurement boundaries, fallback, and promotion bar fixed before the persistent project disk is exercised.
 
@@ -28,12 +28,15 @@ XFS/reflink is a later experiment. It enters only when the ext4 treatment leaves
 
 ## Physical prerequisite
 
-The treatment becomes runnable only after current reviewed SmolRunner authority can compose:
+The treatment becomes runnable only after current reviewed SmolRunner authority can compose the full current chain:
 
 ```text
-#628 physical observation
--> accepted #565 P2 project-disk/filesystem correlation
--> #589 sealed all-FD OverlayFS transaction
+#639 / #565 P2 descriptor-bound host observation
+-> #644 / #565 P3 durable create provenance + exact physical/backing binding
+-> #645 / #565 P4 accepted filesystem generation + exact current attachment
+-> #628 observation-only full-correlation rerun succeeds on that genuine disk
+-> #640 sole sealed production project-filesystem correlation path
+-> #589 all-FD OverlayFS transaction
 -> #580 exact private Git/source proof
 -> task ready
 ```
