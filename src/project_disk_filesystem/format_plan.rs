@@ -292,7 +292,9 @@ impl ProjectDiskFilesystemFormatPlan {
     }
 
     #[must_use]
-    pub const fn durability_policy_generation(&self) -> ProjectDiskFormatDurabilityPolicyGeneration {
+    pub const fn durability_policy_generation(
+        &self,
+    ) -> ProjectDiskFormatDurabilityPolicyGeneration {
         self.durability_policy_generation
     }
 
@@ -348,9 +350,7 @@ fn derive_plan_digest(
     digest_to_sha256(&hasher.finalize())
 }
 
-fn digest_to_sha256(
-    bytes: &[u8],
-) -> Result<Sha256Digest, ProjectDiskFilesystemFormatPlanError> {
+fn digest_to_sha256(bytes: &[u8]) -> Result<Sha256Digest, ProjectDiskFilesystemFormatPlanError> {
     let mut value = String::with_capacity(SHA256_PREFIX.len() + bytes.len() * 2);
     value.push_str(SHA256_PREFIX);
     for byte in bytes {
