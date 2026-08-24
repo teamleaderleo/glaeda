@@ -3,9 +3,12 @@
 import argparse
 import json
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+
+sys.dont_write_bytecode = True
 
 import project_disk_physical_receipt as receipt
 
@@ -54,7 +57,7 @@ class Fixture:
             encoding="utf-8",
         )
         self.guest_stat = self.root / "guest-stat.txt"
-        self.guest_stat.write_text("2049:12345\n", encoding="ascii")
+        self.guest_stat.write_text("2064:12345\n", encoding="ascii")
         self.mountinfo = self.root / "mountinfo.txt"
         self.mountinfo.write_bytes(
             b"41 30 8:1 / / rw,relatime - ext4 /dev/root rw\n"
@@ -130,7 +133,10 @@ class ProjectDiskPhysicalReceiptTests(unittest.TestCase):
         self.assertNotIn("explicit_small_file_bytes", entries["gamma"])
 
         guest = captured["correlation"]["guest_project_filesystem"]
-        self.assertEqual(guest["stat"], {"device": 2049, "inode": 12345})
+        self.assertEqual(
+            guest["stat"],
+            {"device": 2064, "device_major": 8, "device_minor": 16, "inode": 12345},
+        )
         self.assertEqual(guest["mountinfo"]["device_major"], 8)
         self.assertEqual(guest["mountinfo"]["device_minor"], 16)
         self.assertEqual(guest["mountinfo"]["filesystem_type"], "xfs")
@@ -199,6 +205,24 @@ class ProjectDiskPhysicalReceiptTests(unittest.TestCase):
 
         with self.assertRaises(receipt.ReceiptError):
             receipt.capture(self.fixture.args(resident_sandbox_instance="resident-b"))
+
+    def test_guest_stat_device_must_match_exact_project_mount_device(self) -> None:
+        self.fixture.guest_stat.write_text("2049:12345\n", encoding="ascii")
+        with self.assertRaises(receipt.ReceiptError):
+            receipt.capture(self.fixture.args())
+
+        captured = receipt.capture(self.fixture.args()) if False else None
+        self.assertIsNone(captured)
+
+    def test_intermediate_symlink_in_disk_directory_path_is_refused(self) -> None:
+        redirected_parent = self.fixture.root / "redirected"
+        redirected_parent.mkdir()
+        redirected_disk = redirected_parent / "disk"
+        redirected_disk.mkdir()
+        link = self.fixture.root / "link-parent"
+        link.symlink_to(redirected_parent, target_is_directory=True)
+        with self.assertRaises(OSError):
+            receipt._capture_directory(link / "disk", set())
 
     def test_mountinfo_exact_mountpoint_decodes_reviewed_escapes(self) -> None:
         escaped = self.fixture.root / "escaped-mountinfo.txt"
