@@ -20,12 +20,12 @@ jobs:
           persist-credentials: true
           show-progress: false
           fetch-depth: 0
-      - name: Run repaired exact-head product replay
+      - name: Rebuild exact-head product and verify
         shell: bash
         run: |
           set -euo pipefail
           git show "acd89d88893058f6c162d20ec01e888de4d01903:.github/workflows/research-build-clean-overlay-product-v3.yml" > /tmp/v3-source.yml
-          python3 - <<'PY'
+          python3 - <<'OUTER'
           from pathlib import Path
 
           source = Path('/tmp/v3-source.yml').read_text()
@@ -35,6 +35,7 @@ jobs:
           block = source.split(marker, 1)[1]
           lines = [line[10:] if line.startswith('          ') else line for line in block.splitlines()]
           script = '\n'.join(lines) + '\n'
+
           old = "text = replace_once(text, test_marker, extra_tests + test_marker, 'failure/race test insertion')"
           new = '''text, insert_count = re.subn(
               r"(?m)^    #\\[test\\]\\n    fn visible_mount_id_mismatch_returns_recovery_debt\\(\\) \\{",
@@ -47,6 +48,555 @@ jobs:
           if script.count(old) != 1:
               raise SystemExit(f'v3 failed insertion call count={script.count(old)}')
           script = script.replace(old, new, 1)
-          Path('/tmp/build-overlay-product-repaired.sh').write_text(script)
-          PY
-          bash /tmp/build-overlay-product-repaired.sh
+
+          bootstrap = './scripts/bootstrap --output json\n'
+          if script.count(bootstrap) != 1:
+              raise SystemExit(f'expected one bootstrap call, got {script.count(bootstrap)}')
+          script = script.replace(bootstrap, '', 1)
+          switch = 'git switch -C caterpillar/trusted-overlay-mount-transaction\n'
+          if script.count(switch) != 1:
+              raise SystemExit(f'expected one clean-branch switch, got {script.count(switch)}')
+          script = script.replace(switch, switch + bootstrap, 1)
+          script = script.replace(
+              'git push origin HEAD:caterpillar/trusted-overlay-mount-transaction',
+              'git push --force origin HEAD:caterpillar/trusted-overlay-mount-transaction',
+              1,
+          )
+
+          phase_patch = r'''from pathlib import Path
+          import re
+          import textwrap
+
+          path = Path("src/trusted_overlay_mount_execution.rs")
+          text = path.read_text()
+
+          def dedent(value: str) -> str:
+              return textwrap.dedent(value).lstrip("\n")
+
+          def replace_once(old: str, new: str, label: str) -> None:
+              global text
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected one exact match, got {count}")
+              text = text.replace(old, new, 1)
+
+          def sub_once(pattern: str, new: str, label: str) -> None:
+              global text
+              text, count = re.subn(pattern, new, text, count=1, flags=re.S)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected one regex match, got {count}")
+
+          replace_once(
+              "    Observation,\n    RecoveryRequired,\n",
+              "    Observation,\n    WorkdirResetRequired,\n    RecoveryRequired,\n",
+              "workdir debt error kind",
+          )
+          text = text.replace(
+              "OverlayLinkedWorktreeObservation",
+              "OverlayGitWorktreeObservation",
+          )
+          text = text.replace(
+              "A post-attach\n/// failure carries `recovery_required = true` and an opaque mount identity when one was available.",
+              "Failures at the CREATE mutation boundary or later carry explicit recovery debt. Attach-attempt\n/// and post-attach debt carries an opaque mount identity when one was available.",
+              1,
+          )
+          text = text.replace(
+              "accepted authority immediately before CREATE/FSMOUNT may initialize OverlayFS work state.",
+              "accepted authority immediately before CREATE enters the observed OverlayFS work-state mutation boundary.",
+              1,
+          )
+
+          sub_once(
+              r"trait OverlayMountBackend \{.*?\n\}\n\nfn execute_with_backend",
+              dedent('''
+                  trait OverlayMountBackend {
+                      type Prepared;
+                      type Created;
+                      type UnattachedMount;
+
+                      fn prepare(
+                          &mut self,
+                          descriptors: &TrustedOverlayMountExecutionDescriptors<'_>,
+                      ) -> Result<Self::Prepared, BackendError>;
+
+                      fn create(&mut self, prepared: Self::Prepared) -> Result<Self::Created, BackendError>;
+
+                      fn mount(
+                          &mut self,
+                          created: Self::Created,
+                      ) -> Result<(Self::UnattachedMount, u64), BackendError>;
+
+                      fn attach(
+                          &mut self,
+                          mount: &Self::UnattachedMount,
+                          descriptors: &TrustedOverlayMountExecutionDescriptors<'_>,
+                      ) -> Result<(), BackendError>;
+
+                      fn visible_mount_observation(
+                          &mut self,
+                          descriptors: &TrustedOverlayMountExecutionDescriptors<'_>,
+                      ) -> Result<VisibleMountObservation, BackendError>;
+                  }
+
+                  fn execute_with_backend
+              ''').rstrip(),
+              "phase-split backend trait",
+          )
+
+          sub_once(
+              r"    let \(mount, mount_id\) = backend\n        \.create_unattached\(prepared\)\n        \.map_err\(\|error\| map_backend\(error, false, None\)\)\?;\n    if mount_id == 0 \{\n        return Err\(observation_error\(false, None\)\);\n    \}\n    let mount_identity = mount_identity\(plan, correlation, mount_id\)\?;",
+              dedent('''
+                      let created = backend
+                          .create(prepared)
+                          .map_err(|error| map_workdir_backend(error, None))?;
+                      let (mount, mount_id) = backend
+                          .mount(created)
+                          .map_err(|error| map_workdir_backend(error, None))?;
+                      if mount_id == 0 {
+                          return Err(workdir_reset_error(None));
+                      }
+                      let mount_identity = mount_identity(plan, correlation, mount_id)
+                          .map_err(|_| workdir_reset_error(None))?;
+              ''').rstrip(),
+              "phase-split execution",
+          )
+
+          replace_once(
+              "    type Prepared = OwnedFd;\n    type UnattachedMount = OwnedFd;",
+              "    type Prepared = OwnedFd;\n    type Created = OwnedFd;\n    type UnattachedMount = OwnedFd;",
+              "rustix created type",
+          )
+          sub_once(
+              r"    fn create_unattached\(\n        &mut self,\n        prepared: Self::Prepared,\n    \) -> Result<\(Self::UnattachedMount, u64\), BackendError> \{.*?\n    \}\n\n    fn attach\(",
+              dedent('''
+                      fn create(
+                          &mut self,
+                          prepared: Self::Prepared,
+                      ) -> Result<Self::Created, BackendError> {
+                          fsconfig_create(&prepared)
+                              .map_err(|error| backend_error(error, BackendStage::Create))?;
+                          Ok(prepared)
+                      }
+
+                      fn mount(
+                          &mut self,
+                          created: Self::Created,
+                      ) -> Result<(Self::UnattachedMount, u64), BackendError> {
+                          let mount = fsmount(
+                              &created,
+                              FsMountFlags::FSMOUNT_CLOEXEC,
+                              MountAttrFlags::MOUNT_ATTR_NODEV | MountAttrFlags::MOUNT_ATTR_NOSUID,
+                          )
+                          .map_err(|error| backend_error(error, BackendStage::Mount))?;
+                          let mount_id = mount_id(&mount)
+                              .map_err(|error| backend_error(error, BackendStage::Observe))?;
+                          Ok((mount, mount_id))
+                      }
+
+                      fn attach(
+              ''').rstrip(),
+              "rustix phase split",
+          )
+          replace_once(
+              "    Prepare,\n    Create,\n    Attach,\n    Observe,\n",
+              "    Prepare,\n    Create,\n    Mount,\n    Attach,\n    Observe,\n",
+              "mount backend stage",
+          )
+          text = text.replace(
+              "BackendStage::Prepare | BackendStage::Create | BackendStage::Attach => (",
+              "BackendStage::Prepare | BackendStage::Create | BackendStage::Mount | BackendStage::Attach => (",
+              1,
+          )
+
+          marker = "fn authority_error() -> TrustedOverlayMountExecutionError {"
+          helpers = dedent('''
+              fn map_workdir_backend(
+                  _error: BackendError,
+                  mount_identity: Option<Sha256Digest>,
+              ) -> TrustedOverlayMountExecutionError {
+                  workdir_reset_error(mount_identity)
+              }
+
+              fn workdir_reset_error(
+                  mount_identity: Option<Sha256Digest>,
+              ) -> TrustedOverlayMountExecutionError {
+                  error(
+                      TrustedOverlayMountExecutionErrorKind::WorkdirResetRequired,
+                      "overlay_workdir_revalidation_required",
+                      "OverlayFS work state requires exact reset and revalidation before retry",
+                      true,
+                      mount_identity,
+                  )
+              }
+
+          ''')
+          replace_once(marker, helpers + marker, "workdir debt helpers")
+
+          fake = dedent('''
+                  struct FakeBackend {
+                      mount_id: u64,
+                      visible_id: u64,
+                      visible_overlay: bool,
+                      visible_read_write: bool,
+                      visible_read_only: bool,
+                      visible_nodev: bool,
+                      visible_nosuid: bool,
+                      visible_noexec: bool,
+                      mutate_during_prepare: Option<PathBuf>,
+                      prepared: bool,
+                      create_attempted: bool,
+                      mount_attempted: bool,
+                      attached: bool,
+                      fail_prepare: bool,
+                      fail_create: bool,
+                      fail_mount: bool,
+                      fail_attach: bool,
+                      fail_visible: bool,
+                  }
+
+                  impl FakeBackend {
+                      fn successful() -> Self {
+                          Self {
+                              mount_id: 41,
+                              visible_id: 41,
+                              visible_overlay: true,
+                              visible_read_write: true,
+                              visible_read_only: false,
+                              visible_nodev: true,
+                              visible_nosuid: true,
+                              visible_noexec: false,
+                              mutate_during_prepare: None,
+                              prepared: false,
+                              create_attempted: false,
+                              mount_attempted: false,
+                              attached: false,
+                              fail_prepare: false,
+                              fail_create: false,
+                              fail_mount: false,
+                              fail_attach: false,
+                              fail_visible: false,
+                          }
+                      }
+                  }
+
+                  impl OverlayMountBackend for FakeBackend {
+                      type Prepared = ();
+                      type Created = ();
+                      type UnattachedMount = ();
+
+                      fn prepare(
+                          &mut self,
+                          _descriptors: &TrustedOverlayMountExecutionDescriptors<'_>,
+                      ) -> Result<Self::Prepared, BackendError> {
+                          if self.fail_prepare {
+                              return Err(BackendError {
+                                  stage: BackendStage::Prepare,
+                                  class: BackendErrorClass::Other,
+                              });
+                          }
+                          self.prepared = true;
+                          if let Some(path) = self.mutate_during_prepare.as_ref() {
+                              fs::write(path.join("late"), b"x").unwrap();
+                          }
+                          Ok(())
+                      }
+
+                      fn create(&mut self, _prepared: Self::Prepared) -> Result<Self::Created, BackendError> {
+                          self.create_attempted = true;
+                          if self.fail_create {
+                              return Err(BackendError {
+                                  stage: BackendStage::Create,
+                                  class: BackendErrorClass::Other,
+                              });
+                          }
+                          Ok(())
+                      }
+
+                      fn mount(
+                          &mut self,
+                          _created: Self::Created,
+                      ) -> Result<(Self::UnattachedMount, u64), BackendError> {
+                          self.mount_attempted = true;
+                          if self.fail_mount {
+                              return Err(BackendError {
+                                  stage: BackendStage::Mount,
+                                  class: BackendErrorClass::Other,
+                              });
+                          }
+                          Ok(((), self.mount_id))
+                      }
+
+                      fn attach(
+                          &mut self,
+                          _mount: &Self::UnattachedMount,
+                          _descriptors: &TrustedOverlayMountExecutionDescriptors<'_>,
+                      ) -> Result<(), BackendError> {
+                          if self.fail_attach {
+                              return Err(BackendError {
+                                  stage: BackendStage::Attach,
+                                  class: BackendErrorClass::Other,
+                              });
+                          }
+                          self.attached = true;
+                          Ok(())
+                      }
+
+                      fn visible_mount_observation(
+                          &mut self,
+                          _descriptors: &TrustedOverlayMountExecutionDescriptors<'_>,
+                      ) -> Result<VisibleMountObservation, BackendError> {
+                          if self.fail_visible {
+                              return Err(BackendError {
+                                  stage: BackendStage::Observe,
+                                  class: BackendErrorClass::Other,
+                              });
+                          }
+                          Ok(VisibleMountObservation {
+                              mount_id: self.visible_id,
+                              overlay: self.visible_overlay,
+                              read_write: self.visible_read_write,
+                              read_only: self.visible_read_only,
+                              nodev: self.visible_nodev,
+                              nosuid: self.visible_nosuid,
+                              noexec: self.visible_noexec,
+                          })
+                      }
+                  }
+          ''')
+          sub_once(
+              r"    struct FakeBackend \{.*?\n    \}\n\n    fn inputs\(",
+              fake + "\n\n    fn inputs(",
+              "phase-split fake backend",
+          )
+
+          tests = dedent('''
+                  #[test]
+                  fn fake_backend_accepts_exact_descriptor_bound_transaction() {
+                      let fixture = Fixture::new();
+                      let (anchor, task, plan, lease, proof) = inputs(&fixture);
+                      let mut backend = FakeBackend::successful();
+                      let receipt = execute_with_backend(&plan, &lease, &anchor, &task, &proof, &mut backend)
+                          .unwrap();
+                      assert!(backend.prepared);
+                      assert!(backend.create_attempted);
+                      assert!(backend.mount_attempted);
+                      assert!(backend.attached);
+                      assert_eq!(receipt.task_lease(), task.lease());
+                      assert_eq!(receipt.correlation_generation().get(), 13);
+                      assert!(receipt.mount_identity().as_str().starts_with("sha256:"));
+                  }
+
+                  #[test]
+                  fn second_confirmation_blocks_drift_before_create_boundary() {
+                      let fixture = Fixture::new();
+                      let (anchor, task, plan, lease, proof) = inputs(&fixture);
+                      let mut backend = FakeBackend::successful();
+                      backend.mutate_during_prepare = Some(fixture.work.clone());
+                      let error = execute_with_backend(&plan, &lease, &anchor, &task, &proof, &mut backend)
+                          .unwrap_err();
+                      assert_eq!(error.kind(), TrustedOverlayMountExecutionErrorKind::Authority);
+                      assert!(!error.recovery_required());
+                      assert!(backend.prepared);
+                      assert!(!backend.create_attempted);
+                      assert!(!backend.mount_attempted);
+                      assert!(!backend.attached);
+                  }
+
+                  #[test]
+                  fn correlation_mismatch_blocks_backend_before_prepare() {
+                      let fixture = Fixture::new();
+                      let (anchor, task, plan, lease, _) = inputs(&fixture);
+                      let proof = correlation(&anchor, u64::MAX);
+                      let mut backend = FakeBackend::successful();
+                      let error = execute_with_backend(&plan, &lease, &anchor, &task, &proof, &mut backend)
+                          .unwrap_err();
+                      assert_eq!(error.kind(), TrustedOverlayMountExecutionErrorKind::Correlation);
+                      assert!(!error.recovery_required());
+                      assert!(!backend.prepared);
+                  }
+
+                  #[test]
+                  fn prepare_failure_has_no_recovery_debt() {
+                      let fixture = Fixture::new();
+                      let (anchor, task, plan, lease, proof) = inputs(&fixture);
+                      let mut backend = FakeBackend::successful();
+                      backend.fail_prepare = true;
+                      let error = execute_with_backend(&plan, &lease, &anchor, &task, &proof, &mut backend)
+                          .unwrap_err();
+                      assert_eq!(
+                          error.kind(),
+                          TrustedOverlayMountExecutionErrorKind::MountConfiguration
+                      );
+                      assert!(!error.recovery_required());
+                      assert!(error.mount_identity().is_none());
+                      assert!(!backend.create_attempted);
+                  }
+
+                  #[test]
+                  fn create_failure_requires_workdir_revalidation() {
+                      let fixture = Fixture::new();
+                      let (anchor, task, plan, lease, proof) = inputs(&fixture);
+                      let mut backend = FakeBackend::successful();
+                      backend.fail_create = true;
+                      let error = execute_with_backend(&plan, &lease, &anchor, &task, &proof, &mut backend)
+                          .unwrap_err();
+                      assert_eq!(
+                          error.kind(),
+                          TrustedOverlayMountExecutionErrorKind::WorkdirResetRequired
+                      );
+                      assert!(error.recovery_required());
+                      assert!(error.mount_identity().is_none());
+                      assert!(backend.create_attempted);
+                      assert!(!backend.mount_attempted);
+                      assert!(!backend.attached);
+                  }
+
+                  #[test]
+                  fn mount_failure_after_create_requires_workdir_revalidation() {
+                      let fixture = Fixture::new();
+                      let (anchor, task, plan, lease, proof) = inputs(&fixture);
+                      let mut backend = FakeBackend::successful();
+                      backend.fail_mount = true;
+                      let error = execute_with_backend(&plan, &lease, &anchor, &task, &proof, &mut backend)
+                          .unwrap_err();
+                      assert_eq!(
+                          error.kind(),
+                          TrustedOverlayMountExecutionErrorKind::WorkdirResetRequired
+                      );
+                      assert!(error.recovery_required());
+                      assert!(backend.create_attempted);
+                      assert!(backend.mount_attempted);
+                      assert!(!backend.attached);
+                  }
+
+                  #[test]
+                  fn missing_unattached_mount_id_requires_workdir_revalidation() {
+                      let fixture = Fixture::new();
+                      let (anchor, task, plan, lease, proof) = inputs(&fixture);
+                      let mut backend = FakeBackend::successful();
+                      backend.mount_id = 0;
+                      let error = execute_with_backend(&plan, &lease, &anchor, &task, &proof, &mut backend)
+                          .unwrap_err();
+                      assert_eq!(
+                          error.kind(),
+                          TrustedOverlayMountExecutionErrorKind::WorkdirResetRequired
+                      );
+                      assert!(error.recovery_required());
+                      assert!(error.mount_identity().is_none());
+                      assert!(!backend.attached);
+                  }
+
+                  #[test]
+                  fn attach_failure_is_mount_recovery_debt_with_identity() {
+                      let fixture = Fixture::new();
+                      let (anchor, task, plan, lease, proof) = inputs(&fixture);
+                      let mut backend = FakeBackend::successful();
+                      backend.fail_attach = true;
+                      let error = execute_with_backend(&plan, &lease, &anchor, &task, &proof, &mut backend)
+                          .unwrap_err();
+                      assert_eq!(
+                          error.kind(),
+                          TrustedOverlayMountExecutionErrorKind::RecoveryRequired
+                      );
+                      assert!(error.recovery_required());
+                      assert!(error.mount_identity().is_some());
+                  }
+
+                  #[test]
+                  fn visible_observation_failure_is_mount_recovery_debt() {
+                      let fixture = Fixture::new();
+                      let (anchor, task, plan, lease, proof) = inputs(&fixture);
+                      let mut backend = FakeBackend::successful();
+                      backend.fail_visible = true;
+                      let error = execute_with_backend(&plan, &lease, &anchor, &task, &proof, &mut backend)
+                          .unwrap_err();
+                      assert_eq!(
+                          error.kind(),
+                          TrustedOverlayMountExecutionErrorKind::RecoveryRequired
+                      );
+                      assert!(error.recovery_required());
+                      assert!(error.mount_identity().is_some());
+                      assert!(backend.attached);
+                  }
+
+                  #[test]
+                  fn visible_mount_id_mismatch_is_mount_recovery_debt() {
+                      let fixture = Fixture::new();
+                      let (anchor, task, plan, lease, proof) = inputs(&fixture);
+                      let mut backend = FakeBackend::successful();
+                      backend.visible_id = 42;
+                      let error = execute_with_backend(&plan, &lease, &anchor, &task, &proof, &mut backend)
+                          .unwrap_err();
+                      assert_eq!(
+                          error.kind(),
+                          TrustedOverlayMountExecutionErrorKind::RecoveryRequired
+                      );
+                      assert!(error.recovery_required());
+                      assert!(backend.attached);
+                  }
+
+                  #[test]
+                  fn visible_non_overlay_mount_is_mount_recovery_debt() {
+                      let fixture = Fixture::new();
+                      let (anchor, task, plan, lease, proof) = inputs(&fixture);
+                      let mut backend = FakeBackend::successful();
+                      backend.visible_overlay = false;
+                      let error = execute_with_backend(&plan, &lease, &anchor, &task, &proof, &mut backend)
+                          .unwrap_err();
+                      assert_eq!(
+                          error.kind(),
+                          TrustedOverlayMountExecutionErrorKind::RecoveryRequired
+                      );
+                      assert!(error.recovery_required());
+                  }
+
+                  #[test]
+                  fn visible_policy_drift_is_mount_recovery_debt() {
+                      for case in 0..5 {
+                          let fixture = Fixture::new();
+                          let (anchor, task, plan, lease, proof) = inputs(&fixture);
+                          let mut backend = FakeBackend::successful();
+                          match case {
+                              0 => backend.visible_read_write = false,
+                              1 => backend.visible_read_only = true,
+                              2 => backend.visible_nodev = false,
+                              3 => backend.visible_nosuid = false,
+                              4 => backend.visible_noexec = true,
+                              _ => unreachable!(),
+                          }
+                          let error = execute_with_backend(
+                              &plan,
+                              &lease,
+                              &anchor,
+                              &task,
+                              &proof,
+                              &mut backend,
+                          )
+                          .unwrap_err();
+                          assert_eq!(
+                              error.kind(),
+                              TrustedOverlayMountExecutionErrorKind::RecoveryRequired
+                          );
+                          assert!(error.recovery_required());
+                          assert!(backend.attached);
+                      }
+                  }
+              }
+          ''')
+          sub_once(
+              r"    #\[test\]\n    fn fake_backend_accepts_exact_descriptor_bound_transaction\(\).*?\n\}\s*$",
+              tests.rstrip(),
+              "final fake backend tests",
+          )
+
+          path.write_text(text)
+          '''
+
+          needle = 'cargo fmt --all\n'
+          if script.count(needle) != 1:
+              raise SystemExit(f'expected one cargo fmt mutation call, got {script.count(needle)}')
+          injected = "python3 - <<'PHASEPATCH'\n" + phase_patch + "\nPHASEPATCH\n\n" + needle
+          script = script.replace(needle, injected, 1)
+          Path('/tmp/build-overlay-product-final.sh').write_text(script)
+          OUTER
+          bash /tmp/build-overlay-product-final.sh
