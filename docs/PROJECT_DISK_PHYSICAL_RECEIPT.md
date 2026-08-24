@@ -265,3 +265,7 @@ explicit mutation classes. Parser fixtures grant zero mutation authority.
 
 #589's normal project-filesystem correlation-proof constructor stays absent until this physical
 receipt is reviewed and #565 P2 becomes its sole production minting path.
+
+## Exact guest filesystem correlation
+
+The captured guest `%d:%i` stat evidence is decoded with the Linux `dev_t` encoding. Its derived major/minor pair must equal the major/minor pair on the single exact project-mount row from `/proc/self/mountinfo`. A stat from one filesystem and a mount row from another is refused. The operator-supplied standalone-disk directory is opened component-by-component with no-follow semantics and rebound after observation; symlinked path components do not become physical evidence.
