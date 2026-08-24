@@ -6,7 +6,7 @@ use std::os::unix::fs::{FileExt as _, MetadataExt as _};
 use std::path::{Component, Path, PathBuf};
 
 use rustix::fs::{self as rustix_fs, FileType, Mode, OFlags};
-use rustix::io::{Errno, fcntl_dupfd_cloexec};
+use rustix::io::Errno;
 use serde::Serialize;
 
 use crate::artifact::Sha256Digest;
@@ -167,15 +167,9 @@ impl ImmutableGitObjectPoolObservation {
             self.expected_owner_gid,
             &self.parent_identity,
         )?;
-        let reopened = rustix_fs::openat(
-            self.parent.as_fd(),
-            &self.generation_name,
-            DIRECTORY_FLAGS,
-            Mode::empty(),
-        )
-        .map_err(map_open)?;
-        require_directory_snapshot(
-            &reopened,
+        require_current_directory_entry(
+            &self.parent,
+            self.generation_name.as_os_str(),
             self.expected_owner_uid,
             self.expected_owner_gid,
             GENERATION_MODE,
@@ -187,6 +181,14 @@ impl ImmutableGitObjectPoolObservation {
             self.expected_owner_gid,
             GENERATION_MODE,
             &self.root_snapshot,
+        )?;
+        require_current_directory_entry(
+            &self.root,
+            OsStr::new(OBJECTS_NAME),
+            self.expected_owner_uid,
+            self.expected_owner_gid,
+            GENERATION_MODE,
+            &self.objects_snapshot,
         )?;
         require_directory_snapshot(
             &self.objects,
@@ -202,9 +204,46 @@ impl ImmutableGitObjectPoolObservation {
             self.expected_owner_gid,
         )?;
         require_no_nested_alternates(
+            &self.objects,
+            &self.objects_snapshot,
+            self.expected_owner_uid,
+            self.expected_owner_gid,
+        )?;
+        require_directory_snapshot(
+            &self.objects,
+            self.expected_owner_uid,
+            self.expected_owner_gid,
+            GENERATION_MODE,
+            &self.objects_snapshot,
+        )?;
+        require_current_directory_entry(
+            &self.root,
+            OsStr::new(OBJECTS_NAME),
+            self.expected_owner_uid,
+            self.expected_owner_gid,
+            GENERATION_MODE,
+            &self.objects_snapshot,
+        )?;
+        require_directory_snapshot(
             &self.root,
             self.expected_owner_uid,
             self.expected_owner_gid,
+            GENERATION_MODE,
+            &self.root_snapshot,
+        )?;
+        require_current_directory_entry(
+            &self.parent,
+            self.generation_name.as_os_str(),
+            self.expected_owner_uid,
+            self.expected_owner_gid,
+            GENERATION_MODE,
+            &self.root_snapshot,
+        )?;
+        require_parent_identity(
+            &self.parent,
+            self.expected_owner_uid,
+            self.expected_owner_gid,
+            &self.parent_identity,
         )?;
         Ok(())
     }
@@ -224,7 +263,10 @@ impl fmt::Debug for ImmutableGitObjectPoolObservation {
         formatter
             .debug_struct("ImmutableGitObjectPoolObservation")
             .field("summary", &self.summary)
-            .field("private_filesystem_evidence", &"<descriptor-bound frozen Git pool>")
+            .field(
+                "private_filesystem_evidence",
+                &"<descriptor-bound frozen Git pool>",
+            )
             .finish()
     }
 }
@@ -320,7 +362,7 @@ fn observe_with_owner(
         expected_owner_gid,
         GENERATION_MODE,
     )?;
-    if root_snapshot.device != parent_identity.device {
+    if root_snapshot.identity.device != parent_identity.device {
         return Err(unsafe_filesystem());
     }
     let objects = rustix_fs::openat(root.as_fd(), OBJECTS_NAME, DIRECTORY_FLAGS, Mode::empty())
@@ -332,16 +374,9 @@ fn observe_with_owner(
         expected_owner_gid,
         GENERATION_MODE,
     )?;
-    if objects_snapshot.device != root_snapshot.device {
+    if objects_snapshot.identity.device != root_snapshot.identity.device {
         return Err(unsafe_filesystem());
     }
-    verify_marker(
-        &root,
-        binding,
-        expected_owner_uid,
-        expected_owner_gid,
-    )?;
-    require_no_nested_alternates(&root, expected_owner_uid, expected_owner_gid)?;
     let binding_digest = git_object_pool_binding_digest(binding).map_err(|_| marker_mismatch())?;
 
     let observation = ImmutableGitObjectPoolObservation {
@@ -388,12 +423,10 @@ struct DirectorySnapshot {
     ctime_nsec: i64,
 }
 
-fn open_absolute_directory(
-    path: &Path,
-) -> Result<OwnedFd, ImmutableGitObjectPoolObservationError> {
+fn open_absolute_directory(path: &Path) -> Result<OwnedFd, ImmutableGitObjectPoolObservationError> {
     validate_absolute_path(path)?;
-    let mut current = rustix_fs::open(Path::new("/"), DIRECTORY_FLAGS, Mode::empty())
-        .map_err(|_| io())?;
+    let mut current =
+        rustix_fs::open(Path::new("/"), DIRECTORY_FLAGS, Mode::empty()).map_err(|_| io())?;
     for component in path.components() {
         match component {
             Component::RootDir => {}
@@ -480,7 +513,12 @@ fn require_frozen_directory(
     expected_gid: u32,
     expected_mode: u32,
 ) -> Result<(), ImmutableGitObjectPoolObservationError> {
-    require_parent(&snapshot.identity, expected_uid, expected_gid, expected_mode)
+    require_parent(
+        &snapshot.identity,
+        expected_uid,
+        expected_gid,
+        expected_mode,
+    )
 }
 
 fn require_directory_snapshot(
@@ -498,13 +536,33 @@ fn require_directory_snapshot(
     Ok(())
 }
 
+fn require_current_directory_entry(
+    parent: &OwnedFd,
+    name: &OsStr,
+    expected_uid: u32,
+    expected_gid: u32,
+    expected_mode: u32,
+    expected: &DirectorySnapshot,
+) -> Result<(), ImmutableGitObjectPoolObservationError> {
+    let current = rustix_fs::openat(parent.as_fd(), name, DIRECTORY_FLAGS, Mode::empty())
+        .map_err(map_open)?;
+    require_directory_snapshot(
+        &current,
+        expected_uid,
+        expected_gid,
+        expected_mode,
+        expected,
+    )
+}
+
 fn verify_marker(
     root: &OwnedFd,
     binding: &GitObjectPoolBinding,
     expected_uid: u32,
     expected_gid: u32,
 ) -> Result<(), ImmutableGitObjectPoolObservationError> {
-    let fd = rustix_fs::openat(root.as_fd(), MARKER_NAME, FILE_FLAGS, Mode::empty()).map_err(map_open)?;
+    let fd = rustix_fs::openat(root.as_fd(), MARKER_NAME, FILE_FLAGS, Mode::empty())
+        .map_err(map_open)?;
     let file = File::from(fd);
     let before = file.metadata().map_err(|_| io())?;
     if !before.file_type().is_file()
@@ -528,48 +586,79 @@ fn verify_marker(
 }
 
 fn require_no_nested_alternates(
-    root: &OwnedFd,
+    objects: &OwnedFd,
+    objects_snapshot: &DirectorySnapshot,
     expected_uid: u32,
     expected_gid: u32,
 ) -> Result<(), ImmutableGitObjectPoolObservationError> {
-    let objects = rustix_fs::openat(root.as_fd(), OBJECTS_NAME, DIRECTORY_FLAGS, Mode::empty())
-        .map_err(map_open)?;
-    let objects_snapshot = snapshot_directory(&objects)?;
-    require_frozen_directory(
-        &objects_snapshot,
+    require_directory_snapshot(
+        objects,
         expected_uid,
         expected_gid,
         GENERATION_MODE,
+        objects_snapshot,
     )?;
     let info = match rustix_fs::openat(objects.as_fd(), INFO_NAME, DIRECTORY_FLAGS, Mode::empty()) {
         Ok(info) => info,
-        Err(Errno::NOENT) => return Ok(()),
+        Err(Errno::NOENT) => {
+            require_directory_snapshot(
+                objects,
+                expected_uid,
+                expected_gid,
+                GENERATION_MODE,
+                objects_snapshot,
+            )?;
+            return Ok(());
+        }
         Err(error) => return Err(map_open(error)),
     };
     let info_snapshot = snapshot_directory(&info)?;
-    require_frozen_directory(
-        &info_snapshot,
+    require_frozen_directory(&info_snapshot, expected_uid, expected_gid, GENERATION_MODE)?;
+    match rustix_fs::openat(info.as_fd(), ALTERNATES_NAME, FILE_FLAGS, Mode::empty()) {
+        Ok(_) => return Err(nested_alternate()),
+        Err(Errno::NOENT) => {}
+        Err(error) => return Err(map_open(error)),
+    }
+    require_directory_snapshot(
+        &info,
         expected_uid,
         expected_gid,
         GENERATION_MODE,
+        &info_snapshot,
     )?;
-    match rustix_fs::openat(info.as_fd(), ALTERNATES_NAME, FILE_FLAGS, Mode::empty()) {
-        Ok(_) => Err(nested_alternate()),
-        Err(Errno::NOENT) => Ok(()),
-        Err(error) => Err(map_open(error)),
-    }
+    require_current_directory_entry(
+        objects,
+        OsStr::new(INFO_NAME),
+        expected_uid,
+        expected_gid,
+        GENERATION_MODE,
+        &info_snapshot,
+    )?;
+    require_directory_snapshot(
+        objects,
+        expected_uid,
+        expected_gid,
+        GENERATION_MODE,
+        objects_snapshot,
+    )?;
+    Ok(())
 }
 
-fn file_identity(metadata: &std::fs::Metadata) -> (u64, u64, u32, u32, u32, u64, i64, i64) {
+fn file_identity(
+    metadata: &std::fs::Metadata,
+) -> (u64, u64, u32, u32, u32, u64, u64, i64, i64, i64, i64) {
     (
         metadata.dev(),
         metadata.ino(),
         metadata.uid(),
         metadata.gid(),
         metadata.mode(),
+        metadata.nlink(),
         metadata.len(),
         metadata.mtime(),
+        metadata.mtime_nsec(),
         metadata.ctime(),
+        metadata.ctime_nsec(),
     )
 }
 
@@ -670,16 +759,16 @@ const fn error(
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use rustix::process::{getegid, geteuid};
 
     use super::{
-        ALTERNATES_NAME, FILE_MODE, GENERATION_MODE, INFO_NAME,
-        ImmutableGitObjectPoolLocation, ImmutableGitObjectPoolObservationErrorKind, MARKER_NAME,
-        OBJECTS_NAME, PARENT_MODE, observe_with_owner,
+        ALTERNATES_NAME, FILE_MODE, GENERATION_MODE, INFO_NAME, ImmutableGitObjectPoolLocation,
+        ImmutableGitObjectPoolObservationErrorKind, MARKER_NAME, OBJECTS_NAME, PARENT_MODE,
+        observe_with_owner,
     };
     use crate::immutable_git_object_pool::{
         GitObjectFormat, GitObjectPoolBinding, GitObjectPoolGeneration, GitObjectPoolId,
@@ -739,8 +828,10 @@ mod tests {
             .encode()
             .unwrap();
             let marker_path = pool.join(MARKER_NAME);
+            fs::set_permissions(&pool, fs::Permissions::from_mode(0o755)).unwrap();
             fs::write(&marker_path, marker).unwrap();
             fs::set_permissions(&marker_path, fs::Permissions::from_mode(FILE_MODE)).unwrap();
+            fs::set_permissions(&pool, fs::Permissions::from_mode(GENERATION_MODE)).unwrap();
             Self {
                 parent,
                 pool,
@@ -752,8 +843,10 @@ mod tests {
         fn observe(
             &self,
             pool_binding: &GitObjectPoolBinding,
-        ) -> Result<super::ImmutableGitObjectPoolObservation, super::ImmutableGitObjectPoolObservationError>
-        {
+        ) -> Result<
+            super::ImmutableGitObjectPoolObservation,
+            super::ImmutableGitObjectPoolObservationError,
+        > {
             observe_with_owner(
                 pool_binding,
                 ImmutableGitObjectPoolLocation::new(self.pool.clone()).unwrap(),
@@ -842,6 +935,61 @@ mod tests {
         fs::rename(&fixture.pool, &moved).unwrap();
         fs::create_dir(&fixture.pool).unwrap();
         fs::set_permissions(&fixture.pool, fs::Permissions::from_mode(GENERATION_MODE)).unwrap();
+        assert_eq!(
+            observation.confirm().unwrap_err().kind(),
+            ImmutableGitObjectPoolObservationErrorKind::Changed
+        );
+    }
+
+    #[test]
+    fn absent_objects_info_is_accepted_when_generation_is_already_frozen() {
+        let binding = binding(1);
+        let fixture = Fixture::new(&binding);
+        let objects = fixture.pool.join(OBJECTS_NAME);
+        let info = objects.join(INFO_NAME);
+        fs::set_permissions(&objects, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::remove_dir(&info).unwrap();
+        fs::set_permissions(&objects, fs::Permissions::from_mode(GENERATION_MODE)).unwrap();
+        fixture.observe(&binding).unwrap().confirm().unwrap();
+    }
+
+    #[test]
+    fn retained_objects_entry_rebind_detects_same_name_replacement() {
+        let binding = binding(1);
+        let fixture = Fixture::new(&binding);
+        let observation = fixture.observe(&binding).unwrap();
+        let objects = fixture.pool.join(OBJECTS_NAME);
+        let old_objects = fixture.pool.join("objects-old");
+        fs::set_permissions(&fixture.pool, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::rename(&objects, &old_objects).unwrap();
+        fs::create_dir(&objects).unwrap();
+        fs::set_permissions(&objects, fs::Permissions::from_mode(GENERATION_MODE)).unwrap();
+        fs::set_permissions(&fixture.pool, fs::Permissions::from_mode(GENERATION_MODE)).unwrap();
+        assert_eq!(
+            super::require_current_directory_entry(
+                &observation.root,
+                std::ffi::OsStr::new(OBJECTS_NAME),
+                observation.expected_owner_uid,
+                observation.expected_owner_gid,
+                GENERATION_MODE,
+                &observation.objects_snapshot,
+            )
+            .unwrap_err()
+            .kind(),
+            ImmutableGitObjectPoolObservationErrorKind::Changed
+        );
+    }
+
+    #[test]
+    fn objects_info_change_after_observation_invalidates_confirmation() {
+        let binding = binding(1);
+        let fixture = Fixture::new(&binding);
+        let observation = fixture.observe(&binding).unwrap();
+        let objects = fixture.pool.join(OBJECTS_NAME);
+        let info = objects.join(INFO_NAME);
+        fs::set_permissions(&objects, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::remove_dir(&info).unwrap();
+        fs::set_permissions(&objects, fs::Permissions::from_mode(GENERATION_MODE)).unwrap();
         assert_eq!(
             observation.confirm().unwrap_err().kind(),
             ImmutableGitObjectPoolObservationErrorKind::Changed

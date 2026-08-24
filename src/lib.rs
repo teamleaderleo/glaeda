@@ -110,6 +110,9 @@ pub mod hot_state_path_policy;
 pub mod immutable_git_object_pool;
 /// Pure fixed marker codec for immutable Git object-pool generations.
 pub mod immutable_git_object_pool_marker;
+/// Read-only descriptor-bound observation of frozen immutable Git object-pool generations.
+#[cfg(target_os = "linux")]
+pub mod immutable_git_object_pool_observation;
 #[cfg(target_os = "linux")]
 pub mod installation_id;
 pub mod journal;
