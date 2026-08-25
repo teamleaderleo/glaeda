@@ -28,9 +28,9 @@ pub use raw::{
     ProjectDiskHostObservationErrorKind, ProjectDiskPhysicalIdentity,
 };
 pub use source::{
-    LimaStandaloneDiskFixtureObservationRequest, LimaStandaloneDiskObservationRequest,
-    ProjectDiskLimaSourceError, ProjectDiskLimaSourceIdentity,
-    ProjectDiskLimaSourceIdentityParseError, ValidatedProjectDiskLimaSource,
+    ConfiguredProjectDiskLimaSource, LimaStandaloneDiskFixtureObservationRequest,
+    LimaStandaloneDiskObservationRequest, ProjectDiskLimaSourceError,
+    ProjectDiskLimaSourceIdentity, ProjectDiskLimaSourceIdentityParseError,
 };
 
 /// Persistable opaque identity for the exact backing entry observed by P2.
