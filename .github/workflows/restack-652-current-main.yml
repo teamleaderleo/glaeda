@@ -1,0 +1,62 @@
+name: Verify P3 current-main restack
+
+on:
+  push:
+    branches:
+      - chatgpt/565-p3-create-provenance-model
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: chatgpt/565-p3-create-provenance-model
+          fetch-depth: 0
+          show-progress: false
+      - name: Export P3 model
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('src/lib.rs')
+          s = p.read_text()
+          marker = 'pub mod project_discovery;\n'
+          addition = (
+              'pub mod project_discovery;\n'
+              '/// Pure crash/replay authority checkpoints for exact project-disk creation.\n'
+              '#[cfg(any(target_os = "linux", target_os = "macos"))]\n'
+              'pub mod project_disk_create_state;\n'
+          )
+          if 'pub mod project_disk_create_state;' not in s:
+              if s.count(marker) != 1:
+                  raise SystemExit(f'project discovery export anchor changed: {s.count(marker)}')
+              s = s.replace(marker, addition, 1)
+          p.write_text(s)
+          PY
+      - name: Verify exact P3 model
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt --no-self-update
+          cargo fmt --all
+          cargo fmt --all -- --check
+          cargo test --locked project_disk_create_state
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          git diff --check
+      - name: Remove helper and publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm .github/workflows/restack-652-current-main.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "#565 P3 export create provenance model"
+          git push origin HEAD:chatgpt/565-p3-create-provenance-model
