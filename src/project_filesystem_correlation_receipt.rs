@@ -17,6 +17,11 @@ use crate::project_disk_lease::{
     ProjectDiskAttachmentGeneration, ProjectDiskGeneration, ProjectDiskId, ProjectDiskRevision,
     ResidentSandboxGeneration, ResidentSandboxId,
 };
+use crate::trusted_guest_control_invocation_plan::TrustedGuestControlInvocationSummary;
+use crate::trusted_guest_control_protocol::{
+    TRUSTED_GUEST_CONTROL_PROTOCOL_SCHEMA_VERSION, TrustedGuestControlOutcome,
+    TrustedGuestControlReceipt,
+};
 
 pub const PROJECT_FILESYSTEM_CORRELATION_RECEIPT_SCHEMA_VERSION: u8 = 1;
 pub const PROJECT_FILESYSTEM_CORRELATION_RECEIPT_TYPE: &str =
@@ -25,6 +30,87 @@ const MAX_RECEIPT_BYTES: usize = 128 * 1024;
 const MAX_VERSION_BYTES: usize = 64;
 const MAX_COMMIT_BYTES: usize = 40;
 const MAX_UUID_BYTES: usize = 36;
+
+/// Independently accepted #588 guest invocation identity compared against the receipt.
+///
+/// The expected identity is derived outside the raw receipt under validation, from the sealed
+/// invocation summary and typed guest-control receipt. A correlation receipt whose
+/// transaction-scoped generation/digest fields differ in any component can never validate `YES`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectFilesystemCorrelationExpectedInvocation {
+    limactl_generation: u64,
+    limactl_digest: Sha256Digest,
+    guest_binary_generation: u64,
+    guest_binary_digest: Sha256Digest,
+    protocol_generation: u64,
+    request_digest: Sha256Digest,
+    result_digest: Sha256Digest,
+}
+
+impl ProjectFilesystemCorrelationExpectedInvocation {
+    /// Bind one exact accepted invocation identity component-wise.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded refusal for zero generations or zero digests.
+    pub fn new(
+        limactl_generation: u64,
+        limactl_digest: Sha256Digest,
+        guest_binary_generation: u64,
+        guest_binary_digest: Sha256Digest,
+        protocol_generation: u64,
+        request_digest: Sha256Digest,
+        result_digest: Sha256Digest,
+    ) -> Result<Self, ProjectFilesystemCorrelationReceiptError> {
+        if limactl_generation == 0
+            || guest_binary_generation == 0
+            || protocol_generation == 0
+            || is_zero_digest(limactl_digest.as_str())
+            || is_zero_digest(guest_binary_digest.as_str())
+            || is_zero_digest(request_digest.as_str())
+            || is_zero_digest(result_digest.as_str())
+        {
+            return Err(invalid_receipt());
+        }
+        Ok(Self {
+            limactl_generation,
+            limactl_digest,
+            guest_binary_generation,
+            guest_binary_digest,
+            protocol_generation,
+            request_digest,
+            result_digest,
+        })
+    }
+
+    /// Derive the expected identity from the sealed #588 invocation summary and typed result
+    /// receipt instead of from any serialized correlation receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded refusal when the outcome did not succeed or when the summary and receipt
+    /// disagree on the request digest.
+    pub fn from_guest_control(
+        summary: &TrustedGuestControlInvocationSummary,
+        receipt: &TrustedGuestControlReceipt,
+    ) -> Result<Self, ProjectFilesystemCorrelationReceiptError> {
+        let TrustedGuestControlOutcome::Succeeded { result_digest } = receipt.outcome() else {
+            return Err(invalid_receipt());
+        };
+        if summary.request_digest() != receipt.request_digest() {
+            return Err(invalid_receipt());
+        }
+        Self::new(
+            summary.limactl_generation(),
+            summary.limactl_digest().clone(),
+            summary.guest_binary_generation(),
+            summary.guest_binary_digest().clone(),
+            u64::from(TRUSTED_GUEST_CONTROL_PROTOCOL_SCHEMA_VERSION),
+            receipt.request_digest().clone(),
+            result_digest.clone(),
+        )
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -107,6 +193,7 @@ pub struct ProjectFilesystemCorrelationChecks {
     descriptor_rebind_passed: bool,
     resident_attachment_bound: bool,
     filesystem_metadata_matches: bool,
+    invocation_identity_matches: bool,
     guest_transaction_bound: bool,
     whole_block_device_matches: bool,
     role_filesystem_device_matches: bool,
@@ -136,6 +223,11 @@ impl ProjectFilesystemCorrelationChecks {
     #[must_use]
     pub const fn filesystem_metadata_matches(self) -> bool {
         self.filesystem_metadata_matches
+    }
+
+    #[must_use]
+    pub const fn invocation_identity_matches(self) -> bool {
+        self.invocation_identity_matches
     }
 
     #[must_use]
@@ -285,6 +377,7 @@ struct RawGuestBlockDevice {
 /// or exceeds the accepted bound.
 pub fn validate_project_filesystem_correlation_receipt_json(
     bytes: &[u8],
+    expected_invocation: &ProjectFilesystemCorrelationExpectedInvocation,
 ) -> Result<ProjectFilesystemCorrelationReceiptReport, ProjectFilesystemCorrelationReceiptError> {
     if bytes.is_empty() || bytes.len() > MAX_RECEIPT_BYTES {
         return Err(invalid_receipt());
@@ -351,7 +444,18 @@ pub fn validate_project_filesystem_correlation_receipt_json(
     let resident_attachment_bound = raw.resident_host_identity_bound
         && raw.lima_attachment_agrees
         && raw.host_guest_block_bridge_bound;
+    let invocation_identity_matches = raw.guest_transaction.limactl_generation
+        == expected_invocation.limactl_generation
+        && raw.guest_transaction.limactl_digest == expected_invocation.limactl_digest.as_str()
+        && raw.guest_transaction.guest_binary_generation
+            == expected_invocation.guest_binary_generation
+        && raw.guest_transaction.guest_binary_digest
+            == expected_invocation.guest_binary_digest.as_str()
+        && raw.guest_transaction.protocol_generation == expected_invocation.protocol_generation
+        && raw.guest_transaction.request_digest == expected_invocation.request_digest.as_str()
+        && raw.guest_transaction.result_digest == expected_invocation.result_digest.as_str();
     let guest_transaction_bound = raw.guest_transaction.exact_invocation_target_bound
+        && invocation_identity_matches
         && guest_authority_matches
         && raw.guest_filesystem.mount_root_identity_bound
         && raw.guest_filesystem.read_write;
@@ -362,6 +466,7 @@ pub fn validate_project_filesystem_correlation_receipt_json(
         descriptor_rebind_passed: raw.descriptor_rebind_passed,
         resident_attachment_bound,
         filesystem_metadata_matches,
+        invocation_identity_matches,
         guest_transaction_bound,
         whole_block_device_matches,
         role_filesystem_device_matches,
@@ -369,6 +474,7 @@ pub fn validate_project_filesystem_correlation_receipt_json(
 
     let conclusive_mismatch = !physical_provenance_matches
         || !guest_authority_matches
+        || !invocation_identity_matches
         || !filesystem_metadata_matches
         || !whole_block_device_matches
         || !role_filesystem_device_matches;
@@ -460,11 +566,16 @@ fn validate_uuid(value: &str) -> Result<(), ProjectFilesystemCorrelationReceiptE
 
 fn validate_digest(value: &str) -> Result<(), ProjectFilesystemCorrelationReceiptError> {
     let parsed = Sha256Digest::parse(value).map_err(|_| invalid_receipt())?;
-    if parsed.as_str() == "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-    {
+    if is_zero_digest(parsed.as_str()) {
         return Err(invalid_receipt());
     }
     Ok(())
+}
+
+const ZERO_DIGEST: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
+fn is_zero_digest(value: &str) -> bool {
+    value == ZERO_DIGEST
 }
 
 /// Decode Linux `dev_t` using the kernel/glibc major/minor layout.
@@ -559,13 +670,32 @@ const fn invalid_receipt() -> ProjectFilesystemCorrelationReceiptError {
 #[cfg(test)]
 mod tests {
     use super::{
-        PROJECT_FILESYSTEM_CORRELATION_RECEIPT_TYPE, ProjectFilesystemCorrelationVerdict,
+        PROJECT_FILESYSTEM_CORRELATION_RECEIPT_TYPE,
+        ProjectFilesystemCorrelationExpectedInvocation, ProjectFilesystemCorrelationVerdict,
         linux_decode_dev, validate_project_filesystem_correlation_receipt_json,
     };
+    use crate::artifact::Sha256Digest;
     use serde_json::json;
 
     fn digest(byte: char) -> String {
         format!("sha256:{}", byte.to_string().repeat(64))
+    }
+
+    fn sha_digest(byte: char) -> Sha256Digest {
+        Sha256Digest::parse(&digest(byte)).unwrap()
+    }
+
+    fn exact_expected_invocation() -> ProjectFilesystemCorrelationExpectedInvocation {
+        ProjectFilesystemCorrelationExpectedInvocation::new(
+            4,
+            sha_digest('d'),
+            5,
+            sha_digest('e'),
+            1,
+            sha_digest('f'),
+            sha_digest('1'),
+        )
+        .unwrap()
     }
 
     fn tuple() -> serde_json::Value {
@@ -636,8 +766,11 @@ mod tests {
     }
 
     fn validate(value: serde_json::Value) -> super::ProjectFilesystemCorrelationReceiptReport {
-        validate_project_filesystem_correlation_receipt_json(&serde_json::to_vec(&value).unwrap())
-            .unwrap()
+        validate_project_filesystem_correlation_receipt_json(
+            &serde_json::to_vec(&value).unwrap(),
+            &exact_expected_invocation(),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -723,7 +856,8 @@ mod tests {
         receipt["unexpected"] = json!(true);
         assert!(
             validate_project_filesystem_correlation_receipt_json(
-                &serde_json::to_vec(&receipt).unwrap()
+                &serde_json::to_vec(&receipt).unwrap(),
+                &exact_expected_invocation(),
             )
             .is_err()
         );
@@ -732,9 +866,82 @@ mod tests {
         receipt["filesystem"]["filesystem_uuid"] = json!("01234567-89AB-cdef-0123-456789abcdef");
         assert!(
             validate_project_filesystem_correlation_receipt_json(
-                &serde_json::to_vec(&receipt).unwrap()
+                &serde_json::to_vec(&receipt).unwrap(),
+                &exact_expected_invocation(),
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn any_substituted_invocation_identity_field_is_no() {
+        let substitutions: [(&str, serde_json::Value); 7] = [
+            ("limactl_generation", json!(9_u64)),
+            ("limactl_digest", json!(digest('9'))),
+            ("guest_binary_generation", json!(10_u64)),
+            ("guest_binary_digest", json!(digest('8'))),
+            ("protocol_generation", json!(2_u64)),
+            ("request_digest", json!(digest('7'))),
+            ("result_digest", json!(digest('6'))),
+        ];
+        for (field, value) in substitutions {
+            let mut receipt = exact_receipt();
+            receipt["guest_transaction"][field] = value;
+            let report = validate(receipt);
+            assert_eq!(
+                report.verdict(),
+                ProjectFilesystemCorrelationVerdict::No,
+                "field {field} must flip the verdict"
+            );
+            assert!(!report.checks().invocation_identity_matches());
+        }
+    }
+
+    #[test]
+    fn expected_identity_constructor_rejects_zero_components() {
+        assert!(
+            ProjectFilesystemCorrelationExpectedInvocation::new(
+                0,
+                sha_digest('d'),
+                5,
+                sha_digest('e'),
+                1,
+                sha_digest('f'),
+                sha_digest('1'),
+            )
+            .is_err()
+        );
+        assert!(
+            ProjectFilesystemCorrelationExpectedInvocation::new(
+                4,
+                Sha256Digest::parse(super::ZERO_DIGEST).unwrap(),
+                5,
+                sha_digest('e'),
+                1,
+                sha_digest('f'),
+                sha_digest('1'),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn mismatched_expected_identity_is_no_even_with_canonical_receipt() {
+        let expected = ProjectFilesystemCorrelationExpectedInvocation::new(
+            4,
+            sha_digest('d'),
+            5,
+            sha_digest('e'),
+            1,
+            sha_digest('f'),
+            sha_digest('2'),
+        )
+        .unwrap();
+        let report = validate_project_filesystem_correlation_receipt_json(
+            &serde_json::to_vec(&exact_receipt()).unwrap(),
+            &expected,
+        )
+        .unwrap();
+        assert_eq!(report.verdict(), ProjectFilesystemCorrelationVerdict::No);
     }
 }
