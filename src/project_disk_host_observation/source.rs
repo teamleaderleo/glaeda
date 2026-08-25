@@ -1,3 +1,4 @@
+#[cfg(target_os = "macos")]
 use std::ffi::OsStr;
 use std::fmt::{self, Write as _};
 use std::os::unix::ffi::OsStrExt as _;
@@ -82,9 +83,8 @@ impl ValidatedProjectDiskLimaSource {
     pub fn new(
         lima_home: impl Into<PathBuf>,
     ) -> Result<Self, ProjectDiskLimaSourceError> {
-        let supplied = lima_home.into();
-        validate_source_path(&supplied)?;
-        let canonical_lima_home = accepted_source_path(&supplied)?;
+        let normalized = normalize_source_path(&lima_home.into())?;
+        let canonical_lima_home = accepted_source_path(&normalized)?;
         let identity = derive_source_identity(&canonical_lima_home);
         Ok(Self {
             canonical_lima_home,
@@ -230,16 +230,27 @@ impl fmt::Debug for LimaStandaloneDiskFixtureObservationRequest {
     }
 }
 
-fn validate_source_path(path: &Path) -> Result<(), ProjectDiskLimaSourceError> {
-    if !path.is_absolute()
-        || path.as_os_str().as_bytes().len() > MAX_LIMA_HOME_BYTES
-        || path
-            .components()
-            .any(|component| !matches!(component, Component::RootDir | Component::Normal(_)))
-    {
+fn normalize_source_path(path: &Path) -> Result<PathBuf, ProjectDiskLimaSourceError> {
+    if !path.is_absolute() || path.as_os_str().as_bytes().len() > MAX_LIMA_HOME_BYTES {
         return Err(invalid_source());
     }
-    Ok(())
+
+    let mut normalized = PathBuf::from("/");
+    let mut saw_normal = false;
+    for component in path.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(value) => {
+                saw_normal = true;
+                normalized.push(value);
+            }
+            _ => return Err(invalid_source()),
+        }
+    }
+    if !saw_normal || normalized.as_os_str().as_bytes().len() > MAX_LIMA_HOME_BYTES {
+        return Err(invalid_source());
+    }
+    Ok(normalized)
 }
 
 #[cfg(target_os = "macos")]
@@ -333,8 +344,16 @@ mod tests {
     }
 
     #[test]
-    fn source_rejects_relative_parent_and_current_components() {
-        for invalid in ["relative", "/tmp/../escape", "/tmp/./alias"] {
+    fn source_identity_normalizes_equivalent_path_spellings() {
+        let canonical = ValidatedProjectDiskLimaSource::new("/tmp/smolrunner-source-a").unwrap();
+        let normalized =
+            ValidatedProjectDiskLimaSource::new("/tmp//smolrunner-source-a/./").unwrap();
+        assert_eq!(canonical.identity(), normalized.identity());
+    }
+
+    #[test]
+    fn source_rejects_relative_parent_and_root_paths() {
+        for invalid in ["relative", "/tmp/../escape", "/"] {
             assert!(ValidatedProjectDiskLimaSource::new(invalid).is_err());
         }
     }
