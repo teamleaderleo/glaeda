@@ -61,6 +61,8 @@ jobs:
               Path("smolrunner"),
               Path("scripts/bootstrap"),
               Path("scripts/test-front-door.py"),
+              Path("scripts/project_disk_physical_receipt.py"),
+              Path("scripts/test_project_disk_physical_receipt.py"),
               *Path("scripts/workspace_bootstrap").glob("*.py"),
           ]
           for path in paths:
@@ -137,6 +139,7 @@ jobs:
 
       - name: Validate Mac helper scripts
         run: |
+          python3 scripts/test_project_disk_physical_receipt.py
           bash -n \
             scripts/macbook-runner-bootstrap.sh \
             scripts/macbook-runner-observe.sh \
