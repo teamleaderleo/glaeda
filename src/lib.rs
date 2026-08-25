@@ -256,6 +256,8 @@ pub mod project_checkout_observation;
 /// Read-only, bounded immediate-child discovery beneath one explicit project root.
 #[cfg(unix)]
 pub mod project_discovery;
+/// Pure no-replay lifecycle for one exact formatted project-disk attachment.
+pub mod project_disk_attachment_state;
 /// Pure identity vocabulary for one formatted project-disk filesystem generation.
 pub mod project_disk_filesystem;
 /// Pure crash-safe single-writer lease planning for resident trusted project disks.
