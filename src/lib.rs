@@ -320,6 +320,8 @@ pub mod trusted_guest_control_invocation_plan;
 pub mod trusted_guest_control_probe_protocol;
 /// Pure canonical one-shot protocol envelope for purpose-typed Linux guest-control transactions.
 pub mod trusted_guest_control_protocol;
+/// Pure canonical request+payload and receipt+result guest-control transport frames.
+pub mod trusted_guest_control_transaction;
 #[cfg(target_os = "linux")]
 /// Sealed all-FD trusted OverlayFS mount transaction behind exact correlation evidence.
 pub mod trusted_overlay_mount_execution;

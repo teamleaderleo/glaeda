@@ -17,7 +17,11 @@ const REDACTED: &str = "[REDACTED]";
 const CAPTURE_BUFFER_BYTES: usize = 8_192;
 const CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 pub const MAX_CAPTURED_STREAM_BYTES: usize = 1_048_576;
-pub const MAX_CAPTURED_STDIN_BYTES: usize = 4 * 1024;
+/// Maximum exact plain stdin accepted by the one-shot process boundary.
+///
+/// The 16 KiB ceiling is shared with the reviewed guest-control protocol-v2 request transaction;
+/// no current product caller uses a larger or arbitrary input surface.
+pub const MAX_CAPTURED_STDIN_BYTES: usize = 16 * 1024;
 pub const MAX_COMMAND_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Clone, PartialEq, Eq)]
