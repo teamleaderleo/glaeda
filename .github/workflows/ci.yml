@@ -169,7 +169,8 @@ jobs:
           cmp examples/lima/smolrunner-prepared-template.yaml examples/lima/glaeda-prepared-template.yaml
           cmp examples/lima/smolrunner-runner-integrity examples/lima/glaeda-runner-integrity
           cmp examples/lima/smolrunner-work.yaml examples/lima/glaeda-work.yaml
-          bash -n examples/lima/glaeda-jit-launcher examples/lima/glaeda-runner-integrity
+          bash -n examples/lima/glaeda-jit-launcher
+          bash -n examples/lima/glaeda-runner-integrity
 
       - name: Validate repository verification wrappers
         run: bash -n examples/renderprove/run-renderprove-review.sh
