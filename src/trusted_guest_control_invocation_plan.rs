@@ -1,10 +1,11 @@
-//! Pure sealed invocation planning for one resident Linux guest-control transaction.
+//! Pure sealed invocation planning for one purpose-typed Linux guest-control transaction.
 //!
-//! The protocol request is already canonical and authority-free. This module adds one second seal:
-//! a verified Mac-side target binding that names the exact resident sandbox, reviewed `limactl`
-//! generation, private Lima home, and exact installed guest binary. Product callers cannot construct
-//! that target binding in this slice; a later read-only prerequisite observer will mint it only from
-//! fresh descriptor/executable evidence.
+//! The protocol request is canonical claim data, not an authority capability. This module adds one
+//! second seal: a verified Mac-side target binding that names the exact resident or formatter
+//! lineage, reviewed `limactl` generation, private Lima home, and exact installed guest binary.
+//! Product callers cannot construct that target binding in this slice; the owning read-only
+//! prerequisite observers mint resident and formatter targets separately from fresh
+//! descriptor/executable evidence.
 //!
 //! Planning performs no process execution, filesystem I/O, Lima observation, privilege escalation,
 //! guest mutation, or durable-state mutation.
@@ -18,14 +19,18 @@ use serde::Serialize;
 use crate::artifact::Sha256Digest;
 use crate::lima_observation::{LIMACTL_SAFE_HOME, LIMACTL_SAFE_PATH, LimaInstanceName};
 use crate::process::CommandSpec;
-use crate::project_disk_lease::{ResidentSandboxGeneration, ResidentSandboxId};
+use crate::project_catalog::ProjectIdentity;
+use crate::project_disk_lease::{
+    ProjectDiskGeneration, ProjectDiskId, ResidentSandboxGeneration, ResidentSandboxId,
+};
 use crate::trusted_guest_control_protocol::{
     MAX_TRUSTED_GUEST_CONTROL_RECEIPT_BYTES, TrustedGuestControlBinaryBinding,
-    TrustedGuestControlOperation, TrustedGuestControlRequest, encode_trusted_guest_control_request,
-    trusted_guest_control_request_digest,
+    TrustedGuestControlFormatTransactionGeneration, TrustedGuestControlFormatterCarrierGeneration,
+    TrustedGuestControlOperation, TrustedGuestControlRequest, TrustedGuestControlTargetIdentity,
+    encode_trusted_guest_control_request, trusted_guest_control_request_digest,
 };
 
-pub const TRUSTED_GUEST_CONTROL_INVOCATION_PLAN_SCHEMA_VERSION: u8 = 1;
+pub const TRUSTED_GUEST_CONTROL_INVOCATION_PLAN_SCHEMA_VERSION: u8 = 2;
 pub const TRUSTED_GUEST_CONTROL_INVOCATION_TIMEOUT: Duration = Duration::from_secs(120);
 pub const MAX_TRUSTED_GUEST_CONTROL_STDOUT_BYTES: usize = MAX_TRUSTED_GUEST_CONTROL_RECEIPT_BYTES;
 pub const MAX_TRUSTED_GUEST_CONTROL_STDERR_BYTES: usize = 64 * 1024;
@@ -42,8 +47,7 @@ const MAX_PRIVATE_PATH_BYTES: usize = 1_024;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TrustedGuestControlInvocationSummary {
     schema_version: u8,
-    sandbox_id: ResidentSandboxId,
-    sandbox_generation: ResidentSandboxGeneration,
+    target_identity: TrustedGuestControlTargetIdentity,
     limactl_generation: u64,
     limactl_digest: Sha256Digest,
     guest_binary_generation: u64,
@@ -62,13 +66,8 @@ impl TrustedGuestControlInvocationSummary {
     }
 
     #[must_use]
-    pub const fn sandbox_id(&self) -> &ResidentSandboxId {
-        &self.sandbox_id
-    }
-
-    #[must_use]
-    pub const fn sandbox_generation(&self) -> ResidentSandboxGeneration {
-        self.sandbox_generation
+    pub const fn target_identity(&self) -> &TrustedGuestControlTargetIdentity {
+        &self.target_identity
     }
 
     #[must_use]
@@ -120,14 +119,14 @@ impl TrustedGuestControlInvocationSummary {
 /// Exact verified host/guest target for one later invocation.
 ///
 /// There is intentionally no public constructor. The later P3 observer/adapter must verify these
-/// private paths and executable identities, prove that `instance` is the named resident sandbox
-/// generation, and only then call the crate-private constructor immediately before planning.
+/// private paths and executable identities, prove that `instance` is the named resident or
+/// formatter generation, and only then call the corresponding crate-private constructor
+/// immediately before planning.
 pub struct TrustedGuestControlInvocationTarget {
     limactl_program: PathBuf,
     lima_home: PathBuf,
     instance: LimaInstanceName,
-    sandbox_id: ResidentSandboxId,
-    sandbox_generation: ResidentSandboxGeneration,
+    target_identity: TrustedGuestControlTargetIdentity,
     limactl_generation: u64,
     limactl_digest: Sha256Digest,
     guest_binary_path: PathBuf,
@@ -136,12 +135,69 @@ pub struct TrustedGuestControlInvocationTarget {
 
 impl TrustedGuestControlInvocationTarget {
     #[allow(dead_code, clippy::too_many_arguments)]
-    pub(crate) fn from_verified(
+    pub(crate) fn from_verified_resident(
         limactl_program: PathBuf,
         lima_home: PathBuf,
         instance: LimaInstanceName,
+        project: ProjectIdentity,
         sandbox_id: ResidentSandboxId,
         sandbox_generation: ResidentSandboxGeneration,
+        limactl_generation: u64,
+        limactl_digest: Sha256Digest,
+        guest_binary_path: PathBuf,
+        guest_binary: TrustedGuestControlBinaryBinding,
+    ) -> Result<Self, TrustedGuestControlInvocationPlanError> {
+        Self::from_verified(
+            limactl_program,
+            lima_home,
+            instance,
+            TrustedGuestControlTargetIdentity::resident(project, sandbox_id, sandbox_generation),
+            limactl_generation,
+            limactl_digest,
+            guest_binary_path,
+            guest_binary,
+        )
+    }
+
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub(crate) fn from_verified_formatter(
+        limactl_program: PathBuf,
+        lima_home: PathBuf,
+        instance: LimaInstanceName,
+        project: ProjectIdentity,
+        project_disk_id: ProjectDiskId,
+        project_disk_generation: ProjectDiskGeneration,
+        format_transaction_generation: TrustedGuestControlFormatTransactionGeneration,
+        formatter_carrier_generation: TrustedGuestControlFormatterCarrierGeneration,
+        limactl_generation: u64,
+        limactl_digest: Sha256Digest,
+        guest_binary_path: PathBuf,
+        guest_binary: TrustedGuestControlBinaryBinding,
+    ) -> Result<Self, TrustedGuestControlInvocationPlanError> {
+        Self::from_verified(
+            limactl_program,
+            lima_home,
+            instance,
+            TrustedGuestControlTargetIdentity::formatter(
+                project,
+                project_disk_id,
+                project_disk_generation,
+                format_transaction_generation,
+                formatter_carrier_generation,
+            ),
+            limactl_generation,
+            limactl_digest,
+            guest_binary_path,
+            guest_binary,
+        )
+    }
+
+    #[allow(dead_code, clippy::too_many_arguments)]
+    fn from_verified(
+        limactl_program: PathBuf,
+        lima_home: PathBuf,
+        instance: LimaInstanceName,
+        target_identity: TrustedGuestControlTargetIdentity,
         limactl_generation: u64,
         limactl_digest: Sha256Digest,
         guest_binary_path: PathBuf,
@@ -154,8 +210,7 @@ impl TrustedGuestControlInvocationTarget {
             limactl_program: validate_private_absolute_path(limactl_program)?,
             lima_home: validate_private_absolute_path(lima_home)?,
             instance,
-            sandbox_id,
-            sandbox_generation,
+            target_identity,
             limactl_generation,
             limactl_digest,
             guest_binary_path: validate_private_absolute_path(guest_binary_path)?,
@@ -168,8 +223,7 @@ impl fmt::Debug for TrustedGuestControlInvocationTarget {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("TrustedGuestControlInvocationTarget")
-            .field("sandbox_id", &self.sandbox_id)
-            .field("sandbox_generation", &self.sandbox_generation)
+            .field("target_identity", &self.target_identity)
             .field("limactl_generation", &self.limactl_generation)
             .field("limactl_digest", &self.limactl_digest)
             .field("guest_binary", &self.guest_binary)
@@ -269,19 +323,21 @@ impl std::error::Error for TrustedGuestControlInvocationPlanError {}
 /// Seal one exact one-shot command plus canonical request bytes.
 ///
 /// The returned [`CommandSpec`] is still data. This function never executes it. The later Mac
-/// adapter must freshly reconfirm the durable attachment, verified target, request digest, and
+/// adapter must freshly reconfirm the owning durable state, verified target, request digest, and
 /// executable identities immediately before using a bounded stdin/stdout/stderr process boundary.
 ///
 /// # Errors
 ///
-/// Returns a bounded error when the verified target names another sandbox generation or guest
+/// Returns a bounded error when the verified target names another purpose-typed generation or guest
 /// binary, or when the canonical protocol request cannot be encoded.
 pub fn plan_trusted_guest_control_invocation(
     request: &TrustedGuestControlRequest,
     target: &TrustedGuestControlInvocationTarget,
 ) -> Result<TrustedGuestControlInvocationPlan, TrustedGuestControlInvocationPlanError> {
-    if request.authority().resident_sandbox_id() != &target.sandbox_id
-        || request.authority().resident_sandbox_generation() != target.sandbox_generation
+    if request.authority().target_identity() != &target.target_identity
+        || !request
+            .operation()
+            .accepts_authority_kind(request.authority().kind())
     {
         return Err(authority_mismatch());
     }
@@ -327,8 +383,7 @@ pub fn plan_trusted_guest_control_invocation(
     Ok(TrustedGuestControlInvocationPlan {
         summary: TrustedGuestControlInvocationSummary {
             schema_version: TRUSTED_GUEST_CONTROL_INVOCATION_PLAN_SCHEMA_VERSION,
-            sandbox_id: target.sandbox_id.clone(),
-            sandbox_generation: target.sandbox_generation,
+            target_identity: target.target_identity.clone(),
             limactl_generation: target.limactl_generation,
             limactl_digest: target.limactl_digest.clone(),
             guest_binary_generation: target.guest_binary.generation(),
@@ -388,7 +443,7 @@ const fn authority_mismatch() -> TrustedGuestControlInvocationPlanError {
     plan_error(
         TrustedGuestControlInvocationPlanErrorKind::AuthorityMismatch,
         "trusted_guest_control_invocation_authority_mismatch",
-        "trusted guest-control request does not match the verified resident sandbox",
+        "trusted guest-control request does not match the verified purpose-typed target",
     )
 }
 
@@ -421,7 +476,10 @@ mod tests {
         ResidentSandboxGeneration, ResidentSandboxId,
     };
     use crate::trusted_guest_control_protocol::{
-        TrustedGuestControlArchitecture, TrustedGuestControlAuthority, TrustedGuestControlRequestId,
+        TrustedGuestControlArchitecture, TrustedGuestControlAuthority,
+        TrustedGuestControlCreatedProvenanceClaim, TrustedGuestControlFormatAuthorityClaim,
+        TrustedGuestControlFormatterConfigClaim, TrustedGuestControlFormatterConfigGeneration,
+        TrustedGuestControlRequestId,
     };
 
     fn digest(byte: char) -> Sha256Digest {
@@ -469,15 +527,77 @@ mod tests {
             TrustedGuestControlOperation::PrepareTrustedTaskView,
             digest('b'),
         )
+        .unwrap()
     }
 
     fn target(request: &TrustedGuestControlRequest) -> TrustedGuestControlInvocationTarget {
-        TrustedGuestControlInvocationTarget::from_verified(
+        TrustedGuestControlInvocationTarget::from_verified_resident(
             PathBuf::from("/opt/homebrew/bin/limactl"),
             PathBuf::from("/private/var/smolrunner/lima"),
             LimaInstanceName::parse("resident-a").unwrap(),
-            request.authority().resident_sandbox_id().clone(),
-            request.authority().resident_sandbox_generation(),
+            request.authority().project().clone(),
+            request.authority().resident_sandbox_id().unwrap().clone(),
+            request.authority().resident_sandbox_generation().unwrap(),
+            5,
+            digest('c'),
+            PathBuf::from("/opt/smolrunner/bin/smolrunner"),
+            request.binary().clone(),
+        )
+        .unwrap()
+    }
+
+    fn formatter_request() -> TrustedGuestControlRequest {
+        let authority = TrustedGuestControlAuthority::formatter_project_disk(
+            TrustedGuestControlTargetIdentity::formatter(
+                ProjectIdentity::parse("github.com/teamleaderleo/smolrunner").unwrap(),
+                ProjectDiskId::parse("disk-a").unwrap(),
+                ProjectDiskGeneration::new(3).unwrap(),
+                TrustedGuestControlFormatTransactionGeneration::new(5).unwrap(),
+                TrustedGuestControlFormatterCarrierGeneration::new(7).unwrap(),
+            ),
+            TrustedGuestControlCreatedProvenanceClaim::new(digest('d')),
+            TrustedGuestControlFormatAuthorityClaim::new(digest('e')),
+            TrustedGuestControlFormatterConfigGeneration::new(9).unwrap(),
+            TrustedGuestControlFormatterConfigClaim::new(digest('f')),
+        )
+        .unwrap();
+        TrustedGuestControlRequest::new(
+            TrustedGuestControlRequestId::parse("format-1").unwrap(),
+            TrustedGuestControlBinaryBinding::new(
+                7,
+                digest('a'),
+                TrustedGuestControlArchitecture::LinuxAarch64,
+            )
+            .unwrap(),
+            authority,
+            TrustedGuestControlOperation::FormatProjectFilesystem,
+            digest('b'),
+        )
+        .unwrap()
+    }
+
+    fn formatter_target(
+        request: &TrustedGuestControlRequest,
+    ) -> TrustedGuestControlInvocationTarget {
+        let TrustedGuestControlTargetIdentity::Formatter {
+            project,
+            project_disk_id,
+            project_disk_generation,
+            format_transaction_generation,
+            formatter_carrier_generation,
+        } = request.authority().target_identity()
+        else {
+            panic!("formatter fixture must carry formatter target");
+        };
+        TrustedGuestControlInvocationTarget::from_verified_formatter(
+            PathBuf::from("/opt/homebrew/bin/limactl"),
+            PathBuf::from("/private/var/smolrunner/lima"),
+            LimaInstanceName::parse("formatter-a").unwrap(),
+            project.clone(),
+            project_disk_id.clone(),
+            *project_disk_generation,
+            *format_transaction_generation,
+            *formatter_carrier_generation,
             5,
             digest('c'),
             PathBuf::from("/opt/smolrunner/bin/smolrunner"),
@@ -577,7 +697,11 @@ mod tests {
     fn sandbox_and_binary_mismatch_fail_before_command_publication() {
         let request = request();
         let mut wrong_sandbox = target(&request);
-        wrong_sandbox.sandbox_generation = ResidentSandboxGeneration::new(12).unwrap();
+        wrong_sandbox.target_identity = TrustedGuestControlTargetIdentity::resident(
+            request.authority().project().clone(),
+            request.authority().resident_sandbox_id().unwrap().clone(),
+            ResidentSandboxGeneration::new(12).unwrap(),
+        );
         assert_eq!(
             plan_trusted_guest_control_invocation(&request, &wrong_sandbox)
                 .unwrap_err()
@@ -597,6 +721,47 @@ mod tests {
                 .unwrap_err()
                 .kind(),
             TrustedGuestControlInvocationPlanErrorKind::BinaryMismatch
+        );
+    }
+
+    #[test]
+    fn resident_and_formatter_targets_are_not_interchangeable() {
+        let resident = request();
+        let formatter = formatter_request();
+        assert_eq!(
+            plan_trusted_guest_control_invocation(&formatter, &target(&resident))
+                .unwrap_err()
+                .kind(),
+            TrustedGuestControlInvocationPlanErrorKind::AuthorityMismatch
+        );
+        assert_eq!(
+            plan_trusted_guest_control_invocation(&resident, &formatter_target(&formatter))
+                .unwrap_err()
+                .kind(),
+            TrustedGuestControlInvocationPlanErrorKind::AuthorityMismatch
+        );
+        let plan = plan_trusted_guest_control_invocation(&formatter, &formatter_target(&formatter))
+            .unwrap();
+        assert_eq!(
+            plan.summary().target_identity(),
+            formatter.authority().target_identity()
+        );
+    }
+
+    #[test]
+    fn same_sandbox_id_and_generation_in_another_project_is_rejected() {
+        let request = request();
+        let mut wrong_project = target(&request);
+        wrong_project.target_identity = TrustedGuestControlTargetIdentity::resident(
+            ProjectIdentity::parse("github.com/teamleaderleo/quarry").unwrap(),
+            request.authority().resident_sandbox_id().unwrap().clone(),
+            request.authority().resident_sandbox_generation().unwrap(),
+        );
+        assert_eq!(
+            plan_trusted_guest_control_invocation(&request, &wrong_project)
+                .unwrap_err()
+                .kind(),
+            TrustedGuestControlInvocationPlanErrorKind::AuthorityMismatch
         );
     }
 
@@ -626,12 +791,13 @@ mod tests {
             PathBuf::from("/opt/../tmp/limactl"),
         ] {
             assert_eq!(
-                TrustedGuestControlInvocationTarget::from_verified(
+                TrustedGuestControlInvocationTarget::from_verified_resident(
                     path,
                     PathBuf::from("/private/var/smolrunner/lima"),
                     LimaInstanceName::parse("resident-a").unwrap(),
-                    request.authority().resident_sandbox_id().clone(),
-                    request.authority().resident_sandbox_generation(),
+                    request.authority().project().clone(),
+                    request.authority().resident_sandbox_id().unwrap().clone(),
+                    request.authority().resident_sandbox_generation().unwrap(),
                     5,
                     digest('c'),
                     PathBuf::from("/opt/smolrunner/bin/smolrunner"),
@@ -644,12 +810,13 @@ mod tests {
         }
 
         assert_eq!(
-            TrustedGuestControlInvocationTarget::from_verified(
+            TrustedGuestControlInvocationTarget::from_verified_resident(
                 PathBuf::from("/opt/homebrew/bin/limactl"),
                 PathBuf::from("/private/var/smolrunner/lima"),
                 LimaInstanceName::parse("resident-a").unwrap(),
-                request.authority().resident_sandbox_id().clone(),
-                request.authority().resident_sandbox_generation(),
+                request.authority().project().clone(),
+                request.authority().resident_sandbox_id().unwrap().clone(),
+                request.authority().resident_sandbox_generation().unwrap(),
                 0,
                 digest('c'),
                 PathBuf::from("/opt/smolrunner/bin/smolrunner"),
