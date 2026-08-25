@@ -83,6 +83,8 @@ impl ProjectDiskAttachTransactionGeneration {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ProjectDiskFormattedDetachedAuthority {
     filesystem: ProjectDiskFilesystemBinding,
+    physical_identity_digest: Sha256Digest,
+    backing_identity_digest: Sha256Digest,
     format_outcome_digest: Sha256Digest,
 }
 
@@ -90,13 +92,20 @@ impl ProjectDiskFormattedDetachedAuthority {
     #[cfg(test)]
     fn for_test(
         filesystem: ProjectDiskFilesystemBinding,
+        physical_identity_digest: Sha256Digest,
+        backing_identity_digest: Sha256Digest,
         format_outcome_digest: Sha256Digest,
     ) -> Result<Self, ProjectDiskAttachmentStateError> {
-        if format_outcome_digest.as_str() == ZERO_DIGEST {
+        if physical_identity_digest.as_str() == ZERO_DIGEST
+            || backing_identity_digest.as_str() == ZERO_DIGEST
+            || format_outcome_digest.as_str() == ZERO_DIGEST
+        {
             return Err(invalid_input());
         }
         Ok(Self {
             filesystem,
+            physical_identity_digest,
+            backing_identity_digest,
             format_outcome_digest,
         })
     }
@@ -137,6 +146,8 @@ pub struct ProjectDiskAttachmentReceipt {
     filesystem_generation: ProjectDiskFilesystemGeneration,
     format_profile_generation: ProjectDiskFilesystemFormatProfileGeneration,
     filesystem_kind: ProjectDiskFilesystemKind,
+    physical_identity_digest: Sha256Digest,
+    backing_identity_digest: Sha256Digest,
     correlation_digest: Sha256Digest,
 }
 
@@ -169,6 +180,16 @@ impl ProjectDiskAttachmentReceipt {
     #[must_use]
     pub const fn filesystem_generation(&self) -> ProjectDiskFilesystemGeneration {
         self.filesystem_generation
+    }
+
+    #[must_use]
+    pub const fn physical_identity_digest(&self) -> &Sha256Digest {
+        &self.physical_identity_digest
+    }
+
+    #[must_use]
+    pub const fn backing_identity_digest(&self) -> &Sha256Digest {
+        &self.backing_identity_digest
     }
 
     #[must_use]
@@ -213,6 +234,8 @@ pub struct ProjectDiskAttachmentRecord {
     disk_id: ProjectDiskId,
     disk_generation: ProjectDiskGeneration,
     filesystem: ProjectDiskFilesystemBinding,
+    physical_identity_digest: Sha256Digest,
+    backing_identity_digest: Sha256Digest,
     format_outcome_digest: Sha256Digest,
     revision: ProjectDiskAttachmentRevision,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -231,6 +254,8 @@ impl ProjectDiskAttachmentRecord {
             disk_id: filesystem.disk_id().clone(),
             disk_generation: filesystem.disk_generation(),
             filesystem,
+            physical_identity_digest: authority.physical_identity_digest,
+            backing_identity_digest: authority.backing_identity_digest,
             format_outcome_digest: authority.format_outcome_digest,
             revision: ProjectDiskAttachmentRevision(1),
             last_transaction_generation: None,
@@ -441,6 +466,8 @@ impl ProjectDiskAttachmentRecord {
             filesystem_generation: self.filesystem.filesystem_generation(),
             format_profile_generation: self.filesystem.format_profile_generation(),
             filesystem_kind: self.filesystem.kind(),
+            physical_identity_digest: self.physical_identity_digest.clone(),
+            backing_identity_digest: self.backing_identity_digest.clone(),
             correlation_digest: proof.correlation_digest.clone(),
         };
         self.successor(
@@ -611,6 +638,8 @@ impl ProjectDiskAttachmentRecord {
             disk_id: self.disk_id.clone(),
             disk_generation: self.disk_generation,
             filesystem: self.filesystem.clone(),
+            physical_identity_digest: self.physical_identity_digest.clone(),
+            backing_identity_digest: self.backing_identity_digest.clone(),
             format_outcome_digest: self.format_outcome_digest.clone(),
             revision: self.revision.next()?,
             last_transaction_generation,
@@ -722,6 +751,8 @@ pub struct ProjectDiskAttachPreconditionProof {
     project: ProjectIdentity,
     disk_id: ProjectDiskId,
     disk_generation: ProjectDiskGeneration,
+    physical_identity_digest: Sha256Digest,
+    backing_identity_digest: Sha256Digest,
     disk_revision: ProjectDiskRevision,
     attachment: ProjectDiskAttachmentLease,
     filesystem_generation: ProjectDiskFilesystemGeneration,
@@ -741,6 +772,8 @@ impl ProjectDiskAttachPreconditionProof {
         if self.project != record.project
             || self.disk_id != record.disk_id
             || self.disk_generation != record.disk_generation
+            || self.physical_identity_digest != record.physical_identity_digest
+            || self.backing_identity_digest != record.backing_identity_digest
             || self.disk_revision != current.revision()
             || self.attachment != *plan.attachment()
             || self.filesystem_generation != record.filesystem.filesystem_generation()
@@ -764,6 +797,8 @@ impl ProjectDiskAttachPreconditionProof {
             project: record.project.clone(),
             disk_id: record.disk_id.clone(),
             disk_generation: record.disk_generation,
+            physical_identity_digest: record.physical_identity_digest.clone(),
+            backing_identity_digest: record.backing_identity_digest.clone(),
             disk_revision: current.revision(),
             attachment: plan.attachment().clone(),
             filesystem_generation: record.filesystem.filesystem_generation(),
@@ -785,6 +820,8 @@ pub struct ProjectDiskAttachmentSuccessProof {
     disk_id: ProjectDiskId,
     disk_generation: ProjectDiskGeneration,
     transaction_generation: ProjectDiskAttachTransactionGeneration,
+    physical_identity_digest: Sha256Digest,
+    backing_identity_digest: Sha256Digest,
     disk_revision: ProjectDiskRevision,
     attachment: ProjectDiskAttachmentLease,
     filesystem_generation: ProjectDiskFilesystemGeneration,
@@ -809,6 +846,8 @@ impl ProjectDiskAttachmentSuccessProof {
             || self.disk_id != record.disk_id
             || self.disk_generation != record.disk_generation
             || self.transaction_generation != transaction_generation
+            || self.physical_identity_digest != record.physical_identity_digest
+            || self.backing_identity_digest != record.backing_identity_digest
             || self.disk_revision != expected_disk_revision
             || &self.attachment != attachment
             || self.filesystem_generation != record.filesystem.filesystem_generation()
@@ -846,6 +885,8 @@ impl ProjectDiskAttachmentSuccessProof {
             disk_id: record.disk_id.clone(),
             disk_generation: record.disk_generation,
             transaction_generation: active_transaction_generation(record),
+            physical_identity_digest: record.physical_identity_digest.clone(),
+            backing_identity_digest: record.backing_identity_digest.clone(),
             disk_revision: current.revision(),
             attachment: plan.attachment().clone(),
             filesystem_generation: record.filesystem.filesystem_generation(),
@@ -866,6 +907,8 @@ pub struct ProjectDiskAttachDetachedProof {
     disk_id: ProjectDiskId,
     disk_generation: ProjectDiskGeneration,
     transaction_generation: ProjectDiskAttachTransactionGeneration,
+    physical_identity_digest: Sha256Digest,
+    backing_identity_digest: Sha256Digest,
     disk_revision: ProjectDiskRevision,
     attachment: ProjectDiskAttachmentLease,
     exact_detached_unused: bool,
@@ -883,6 +926,8 @@ impl ProjectDiskAttachDetachedProof {
             || self.disk_id != record.disk_id
             || self.disk_generation != record.disk_generation
             || self.transaction_generation != transaction_generation
+            || self.physical_identity_digest != record.physical_identity_digest
+            || self.backing_identity_digest != record.backing_identity_digest
             || self.disk_revision != expected_disk_revision
             || &self.attachment != attachment
             || !self.exact_detached_unused
@@ -903,6 +948,8 @@ impl ProjectDiskAttachDetachedProof {
             disk_id: record.disk_id.clone(),
             disk_generation: record.disk_generation,
             transaction_generation: active_transaction_generation(record),
+            physical_identity_digest: record.physical_identity_digest.clone(),
+            backing_identity_digest: record.backing_identity_digest.clone(),
             disk_revision: current.revision(),
             attachment: plan.attachment().clone(),
             exact_detached_unused: true,
@@ -916,6 +963,8 @@ pub struct ProjectDiskPriorAttachQuiescentProof {
     disk_id: ProjectDiskId,
     disk_generation: ProjectDiskGeneration,
     transaction_generation: ProjectDiskAttachTransactionGeneration,
+    physical_identity_digest: Sha256Digest,
+    backing_identity_digest: Sha256Digest,
     attachment: ProjectDiskAttachmentLease,
 }
 
@@ -930,6 +979,8 @@ impl ProjectDiskPriorAttachQuiescentProof {
             || self.disk_id != record.disk_id
             || self.disk_generation != record.disk_generation
             || self.transaction_generation != transaction_generation
+            || self.physical_identity_digest != record.physical_identity_digest
+            || self.backing_identity_digest != record.backing_identity_digest
             || &self.attachment != attachment
         {
             return Err(evidence_mismatch());
@@ -944,6 +995,8 @@ impl ProjectDiskPriorAttachQuiescentProof {
             disk_id: record.disk_id.clone(),
             disk_generation: record.disk_generation,
             transaction_generation: active_transaction_generation(record),
+            physical_identity_digest: record.physical_identity_digest.clone(),
+            backing_identity_digest: record.backing_identity_digest.clone(),
             attachment: plan.attachment().clone(),
         }
     }
@@ -1130,7 +1183,13 @@ mod tests {
             ProjectDiskFilesystemKind::Ext4,
         );
         ProjectDiskAttachmentRecord::from_formatted_detached(
-            ProjectDiskFormattedDetachedAuthority::for_test(fs, digest('a')).unwrap(),
+            ProjectDiskFormattedDetachedAuthority::for_test(
+                fs,
+                digest('b'),
+                digest('c'),
+                digest('a'),
+            )
+            .unwrap(),
         )
     }
 
@@ -1297,6 +1356,218 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn substituted_physical_identity_rejects_attachment_success() {
+        let current = detached();
+        let plan = attach_plan(&current);
+        let started = started(&record(), &current, &plan);
+        let mut proof =
+            ProjectDiskAttachmentSuccessProof::for_test(&started, &current, &plan, digest('d'));
+        proof.physical_identity_digest = digest('9');
+        assert!(started.record_attachment_observed(&proof).is_err());
+    }
+
+    #[test]
+    fn substituted_backing_identity_rejects_attachment_success() {
+        let current = detached();
+        let plan = attach_plan(&current);
+        let started = started(&record(), &current, &plan);
+        let mut proof =
+            ProjectDiskAttachmentSuccessProof::for_test(&started, &current, &plan, digest('d'));
+        proof.backing_identity_digest = digest('9');
+        assert_eq!(
+            started
+                .record_attachment_observed(&proof)
+                .unwrap_err()
+                .kind(),
+            ProjectDiskAttachmentStateErrorKind::EvidenceMismatch
+        );
+    }
+
+    #[test]
+    fn substituted_physical_identity_rejects_attach_precondition() {
+        let current = detached();
+        let plan = attach_plan(&current);
+        let record = record();
+        let mut precondition =
+            ProjectDiskAttachPreconditionProof::for_test(&record, &current, &plan);
+        precondition.physical_identity_digest = digest('9');
+        assert_eq!(
+            record
+                .plan_attach(&current, &plan, &precondition)
+                .unwrap_err()
+                .kind(),
+            ProjectDiskAttachmentStateErrorKind::EvidenceMismatch
+        );
+    }
+
+    #[test]
+    fn same_logical_disk_with_substituted_physical_identity_rejects_foreign_evidence() {
+        let current = detached();
+        let plan = attach_plan(&current);
+        let substituted = {
+            let fs = ProjectDiskFilesystemBinding::new(
+                &current,
+                ProjectDiskFilesystemGeneration::new(7).unwrap(),
+                ProjectDiskFilesystemFormatProfileGeneration::new(2).unwrap(),
+                ProjectDiskFilesystemKind::Ext4,
+            );
+            ProjectDiskAttachmentRecord::from_formatted_detached(
+                ProjectDiskFormattedDetachedAuthority::for_test(
+                    fs,
+                    digest('e'),
+                    digest('f'),
+                    digest('a'),
+                )
+                .unwrap(),
+            )
+        };
+        assert_eq!(substituted.project(), record().project());
+        assert_eq!(substituted.disk_id(), record().disk_id());
+        assert_eq!(substituted.disk_generation(), record().disk_generation());
+        let foreign_precondition =
+            ProjectDiskAttachPreconditionProof::for_test(&substituted, &current, &plan);
+        assert_eq!(
+            record()
+                .plan_attach(&current, &plan, &foreign_precondition)
+                .unwrap_err()
+                .kind(),
+            ProjectDiskAttachmentStateErrorKind::EvidenceMismatch
+        );
+        let foreign_started = started(&substituted, &current, &plan);
+        let foreign_success = ProjectDiskAttachmentSuccessProof::for_test(
+            &foreign_started,
+            &current,
+            &plan,
+            digest('d'),
+        );
+        assert_eq!(
+            started(&record(), &current, &plan)
+                .record_attachment_observed(&foreign_success)
+                .unwrap_err()
+                .kind(),
+            ProjectDiskAttachmentStateErrorKind::EvidenceMismatch
+        );
+        let foreign_quiescent =
+            ProjectDiskPriorAttachQuiescentProof::for_test(&foreign_started, &plan);
+        let foreign_detached =
+            ProjectDiskAttachDetachedProof::for_test(&foreign_started, &current, &plan);
+        let own_recovery = started(&record(), &current, &plan)
+            .require_attach_recovery()
+            .unwrap();
+        assert_eq!(
+            own_recovery
+                .record_prior_attach_quiescent_detached(&foreign_quiescent, &foreign_detached)
+                .unwrap_err()
+                .kind(),
+            ProjectDiskAttachmentStateErrorKind::EvidenceMismatch
+        );
+    }
+
+    #[test]
+    fn substituted_identity_cannot_bypass_quiescent_reopen_recovery() {
+        let current = detached();
+        let plan = attach_plan(&current);
+        let first_started = started(&record(), &current, &plan);
+        let recovered = first_started.require_attach_recovery().unwrap();
+        let mut wrong_physical_quiescent =
+            ProjectDiskPriorAttachQuiescentProof::for_test(&first_started, &plan);
+        wrong_physical_quiescent.physical_identity_digest = digest('9');
+        let mut wrong_backing_detached =
+            ProjectDiskAttachDetachedProof::for_test(&first_started, &current, &plan);
+        wrong_backing_detached.backing_identity_digest = digest('9');
+        assert!(
+            recovered
+                .record_prior_attach_quiescent_detached(
+                    &wrong_physical_quiescent,
+                    &ProjectDiskAttachDetachedProof::for_test(&first_started, &current, &plan),
+                )
+                .is_err()
+        );
+        assert!(
+            recovered
+                .record_prior_attach_quiescent_detached(
+                    &ProjectDiskPriorAttachQuiescentProof::for_test(&first_started, &plan),
+                    &wrong_backing_detached,
+                )
+                .is_err()
+        );
+        assert!(
+            recovered
+                .record_prior_attach_quiescent_detached(
+                    &wrong_physical_quiescent,
+                    &wrong_backing_detached,
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn quiescent_reopen_retains_exact_identity_binding_for_next_generation() {
+        let current = detached();
+        let plan = attach_plan(&current);
+        let first_started = started(&record(), &current, &plan);
+        let recovered = first_started.require_attach_recovery().unwrap();
+        let reopened = recovered
+            .record_prior_attach_quiescent_detached(
+                &ProjectDiskPriorAttachQuiescentProof::for_test(&first_started, &plan),
+                &ProjectDiskAttachDetachedProof::for_test(&first_started, &current, &plan),
+            )
+            .unwrap();
+        let second_plan = attach_plan(&current);
+        let mut forged =
+            ProjectDiskAttachPreconditionProof::for_test(&reopened, &current, &second_plan);
+        forged.backing_identity_digest = digest('9');
+        assert!(
+            reopened
+                .plan_attach(&current, &second_plan, &forged)
+                .is_err()
+        );
+        let intent = reopened
+            .plan_attach(
+                &current,
+                &second_plan,
+                &ProjectDiskAttachPreconditionProof::for_test(&reopened, &current, &second_plan),
+            )
+            .unwrap();
+        assert_eq!(intent.transaction_generation().get(), 2);
+        let second_started = started(&reopened, &current, &second_plan);
+        let stale_success_from_first = ProjectDiskAttachmentSuccessProof::for_test(
+            &first_started,
+            &current,
+            &plan,
+            digest('d'),
+        );
+        assert_eq!(
+            second_started
+                .record_attachment_observed(&stale_success_from_first)
+                .unwrap_err()
+                .kind(),
+            ProjectDiskAttachmentStateErrorKind::EvidenceMismatch
+        );
+    }
+
+    #[test]
+    fn accepted_receipt_carries_exact_physical_and_backing_identities() {
+        let current = detached();
+        let plan = attach_plan(&current);
+        let first_started = started(&record(), &current, &plan);
+        let observed = first_started
+            .record_attachment_observed(&ProjectDiskAttachmentSuccessProof::for_test(
+                &first_started,
+                &current,
+                &plan,
+                digest('b'),
+            ))
+            .unwrap();
+        let ProjectDiskAttachmentState::AttachmentObserved { receipt } = observed.state() else {
+            panic!("expected observed attachment");
+        };
+        assert_eq!(receipt.transaction_generation().get(), 1);
+        assert_eq!(receipt.physical_identity_digest(), &digest('b'));
+        assert_eq!(receipt.backing_identity_digest(), &digest('c'));
     }
 
     #[test]
