@@ -25,8 +25,7 @@ use crate::project_disk_lease::{
 };
 
 pub const PROJECT_DISK_ATTACHMENT_STATE_SCHEMA_VERSION: u8 = 1;
-const ZERO_DIGEST: &str =
-    "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+const ZERO_DIGEST: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
 macro_rules! positive_generation_type {
     ($name:ident, $code:literal, $message:literal) => {
@@ -370,7 +369,12 @@ impl ProjectDiskAttachmentRecord {
                 "project disk attach start requires an authorized transaction",
             ));
         };
-        start.confirm(self, *transaction_generation, *expected_disk_revision, attachment)?;
+        start.confirm(
+            self,
+            *transaction_generation,
+            *expected_disk_revision,
+            attachment,
+        )?;
         self.successor(
             ProjectDiskAttachmentState::AttachStarted {
                 transaction_generation: *transaction_generation,
@@ -419,11 +423,7 @@ impl ProjectDiskAttachmentRecord {
                 transaction_generation,
                 expected_disk_revision,
                 attachment,
-            } => (
-                *transaction_generation,
-                *expected_disk_revision,
-                attachment,
-            ),
+            } => (*transaction_generation, *expected_disk_revision, attachment),
             _ => return Err(started_required()),
         };
         proof.confirm(
@@ -501,11 +501,7 @@ impl ProjectDiskAttachmentRecord {
                 transaction_generation,
                 expected_disk_revision,
                 attachment,
-            } => (
-                *transaction_generation,
-                *expected_disk_revision,
-                attachment,
-            ),
+            } => (*transaction_generation, *expected_disk_revision, attachment),
             _ => return Err(started_required()),
         };
         detached.confirm(
@@ -514,9 +510,11 @@ impl ProjectDiskAttachmentRecord {
             expected_disk_revision,
             attachment,
         )?;
-        Ok(ProjectDiskAttachRecoveryAssessment::BlockedPriorAttachMayCommit {
-            transaction_generation,
-        })
+        Ok(
+            ProjectDiskAttachRecoveryAssessment::BlockedPriorAttachMayCommit {
+                transaction_generation,
+            },
+        )
     }
 
     /// Reopen formatted-detached state only after a separate proof says the prior process cannot
@@ -536,11 +534,7 @@ impl ProjectDiskAttachmentRecord {
                 transaction_generation,
                 expected_disk_revision,
                 attachment,
-            } => (
-                *transaction_generation,
-                *expected_disk_revision,
-                attachment,
-            ),
+            } => (*transaction_generation, *expected_disk_revision, attachment),
             _ => return Err(started_required()),
         };
         quiescent.confirm(self, transaction_generation, attachment)?;
@@ -790,6 +784,7 @@ pub struct ProjectDiskAttachmentSuccessProof {
     project: ProjectIdentity,
     disk_id: ProjectDiskId,
     disk_generation: ProjectDiskGeneration,
+    transaction_generation: ProjectDiskAttachTransactionGeneration,
     disk_revision: ProjectDiskRevision,
     attachment: ProjectDiskAttachmentLease,
     filesystem_generation: ProjectDiskFilesystemGeneration,
@@ -806,13 +801,14 @@ impl ProjectDiskAttachmentSuccessProof {
     fn confirm(
         &self,
         record: &ProjectDiskAttachmentRecord,
-        _transaction_generation: ProjectDiskAttachTransactionGeneration,
+        transaction_generation: ProjectDiskAttachTransactionGeneration,
         expected_disk_revision: ProjectDiskRevision,
         attachment: &ProjectDiskAttachmentLease,
     ) -> Result<(), ProjectDiskAttachmentStateError> {
         if self.project != record.project
             || self.disk_id != record.disk_id
             || self.disk_generation != record.disk_generation
+            || self.transaction_generation != transaction_generation
             || self.disk_revision != expected_disk_revision
             || &self.attachment != attachment
             || self.filesystem_generation != record.filesystem.filesystem_generation()
@@ -849,6 +845,7 @@ impl ProjectDiskAttachmentSuccessProof {
             project: record.project.clone(),
             disk_id: record.disk_id.clone(),
             disk_generation: record.disk_generation,
+            transaction_generation: active_transaction_generation(record),
             disk_revision: current.revision(),
             attachment: plan.attachment().clone(),
             filesystem_generation: record.filesystem.filesystem_generation(),
@@ -868,6 +865,7 @@ pub struct ProjectDiskAttachDetachedProof {
     project: ProjectIdentity,
     disk_id: ProjectDiskId,
     disk_generation: ProjectDiskGeneration,
+    transaction_generation: ProjectDiskAttachTransactionGeneration,
     disk_revision: ProjectDiskRevision,
     attachment: ProjectDiskAttachmentLease,
     exact_detached_unused: bool,
@@ -877,13 +875,14 @@ impl ProjectDiskAttachDetachedProof {
     fn confirm(
         &self,
         record: &ProjectDiskAttachmentRecord,
-        _transaction_generation: ProjectDiskAttachTransactionGeneration,
+        transaction_generation: ProjectDiskAttachTransactionGeneration,
         expected_disk_revision: ProjectDiskRevision,
         attachment: &ProjectDiskAttachmentLease,
     ) -> Result<(), ProjectDiskAttachmentStateError> {
         if self.project != record.project
             || self.disk_id != record.disk_id
             || self.disk_generation != record.disk_generation
+            || self.transaction_generation != transaction_generation
             || self.disk_revision != expected_disk_revision
             || &self.attachment != attachment
             || !self.exact_detached_unused
@@ -903,6 +902,7 @@ impl ProjectDiskAttachDetachedProof {
             project: record.project.clone(),
             disk_id: record.disk_id.clone(),
             disk_generation: record.disk_generation,
+            transaction_generation: active_transaction_generation(record),
             disk_revision: current.revision(),
             attachment: plan.attachment().clone(),
             exact_detached_unused: true,
@@ -915,6 +915,7 @@ pub struct ProjectDiskPriorAttachQuiescentProof {
     project: ProjectIdentity,
     disk_id: ProjectDiskId,
     disk_generation: ProjectDiskGeneration,
+    transaction_generation: ProjectDiskAttachTransactionGeneration,
     attachment: ProjectDiskAttachmentLease,
 }
 
@@ -922,12 +923,13 @@ impl ProjectDiskPriorAttachQuiescentProof {
     fn confirm(
         &self,
         record: &ProjectDiskAttachmentRecord,
-        _transaction_generation: ProjectDiskAttachTransactionGeneration,
+        transaction_generation: ProjectDiskAttachTransactionGeneration,
         attachment: &ProjectDiskAttachmentLease,
     ) -> Result<(), ProjectDiskAttachmentStateError> {
         if self.project != record.project
             || self.disk_id != record.disk_id
             || self.disk_generation != record.disk_generation
+            || self.transaction_generation != transaction_generation
             || &self.attachment != attachment
         {
             return Err(evidence_mismatch());
@@ -936,16 +938,31 @@ impl ProjectDiskPriorAttachQuiescentProof {
     }
 
     #[cfg(test)]
-    fn for_test(
-        record: &ProjectDiskAttachmentRecord,
-        plan: &ProjectDiskAttachPlan,
-    ) -> Self {
+    fn for_test(record: &ProjectDiskAttachmentRecord, plan: &ProjectDiskAttachPlan) -> Self {
         Self {
             project: record.project.clone(),
             disk_id: record.disk_id.clone(),
             disk_generation: record.disk_generation,
+            transaction_generation: active_transaction_generation(record),
             attachment: plan.attachment().clone(),
         }
+    }
+}
+
+#[cfg(test)]
+fn active_transaction_generation(
+    record: &ProjectDiskAttachmentRecord,
+) -> ProjectDiskAttachTransactionGeneration {
+    match &record.state {
+        ProjectDiskAttachmentState::AttachStarted {
+            transaction_generation,
+            ..
+        }
+        | ProjectDiskAttachmentState::AttachRecoveryRequired {
+            transaction_generation,
+            ..
+        } => *transaction_generation,
+        _ => panic!("test proofs require an active attach transaction"),
     }
 }
 
@@ -1011,6 +1028,7 @@ const fn error(
     }
 }
 
+#[cfg(test)]
 const fn invalid_input() -> ProjectDiskAttachmentStateError {
     error(
         ProjectDiskAttachmentStateErrorKind::InvalidInput,
@@ -1023,7 +1041,11 @@ const fn invalid_state(
     code: &'static str,
     message: &'static str,
 ) -> ProjectDiskAttachmentStateError {
-    error(ProjectDiskAttachmentStateErrorKind::InvalidState, code, message)
+    error(
+        ProjectDiskAttachmentStateErrorKind::InvalidState,
+        code,
+        message,
+    )
 }
 
 const fn plan_mismatch() -> ProjectDiskAttachmentStateError {
@@ -1071,8 +1093,8 @@ mod tests {
         ProjectDiskAttachDetachedProof, ProjectDiskAttachPreconditionProof,
         ProjectDiskAttachQuarantineReason, ProjectDiskAttachRecoveryAssessment,
         ProjectDiskAttachmentRecord, ProjectDiskAttachmentState,
-        ProjectDiskAttachmentSuccessProof, ProjectDiskFormattedDetachedAuthority,
-        ProjectDiskPriorAttachQuiescentProof,
+        ProjectDiskAttachmentStateErrorKind, ProjectDiskAttachmentSuccessProof,
+        ProjectDiskFormattedDetachedAuthority, ProjectDiskPriorAttachQuiescentProof,
     };
     use crate::artifact::Sha256Digest;
     use crate::project_catalog::ProjectIdentity;
@@ -1081,9 +1103,10 @@ mod tests {
         ProjectDiskFilesystemGeneration, ProjectDiskFilesystemKind,
     };
     use crate::project_disk_lease::{
-        ProjectDiskGeneration, ProjectDiskId, ProjectDiskLeaseRecord, ProjectDiskLockObservation,
-        ProjectDiskObservation, ProjectDiskPhysicalObservation, ProjectDiskRecoverability,
-        ProjectDiskUseObservation, ResidentSandboxGeneration, ResidentSandboxId,
+        ProjectDiskGeneration, ProjectDiskId, ProjectDiskLeaseRecord, ProjectDiskLeaseState,
+        ProjectDiskLockObservation, ProjectDiskObservation, ProjectDiskPhysicalObservation,
+        ProjectDiskRecoverability, ProjectDiskUseObservation, ResidentSandboxGeneration,
+        ResidentSandboxId,
     };
 
     fn digest(byte: char) -> Sha256Digest {
@@ -1120,7 +1143,9 @@ mod tests {
         )
     }
 
-    fn attach_plan(current: &ProjectDiskLeaseRecord) -> crate::project_disk_lease::ProjectDiskAttachPlan {
+    fn attach_plan(
+        current: &ProjectDiskLeaseRecord,
+    ) -> crate::project_disk_lease::ProjectDiskAttachPlan {
         current
             .plan_attach(
                 ResidentSandboxId::parse("sandbox-a").unwrap(),
@@ -1194,18 +1219,17 @@ mod tests {
         let plan = attach_plan(&current);
         let started = started(&record(), &current, &plan);
         let recovery = started.require_attach_recovery().unwrap();
-        let proof = ProjectDiskAttachmentSuccessProof::for_test(
-            &recovery,
-            &current,
-            &plan,
-            digest('b'),
-        );
+        let proof =
+            ProjectDiskAttachmentSuccessProof::for_test(&recovery, &current, &plan, digest('b'));
         let observed = recovery.record_attachment_observed(&proof).unwrap();
         let ProjectDiskAttachmentState::AttachmentObserved { receipt } = observed.state() else {
             panic!("expected observed attachment");
         };
         assert_eq!(receipt.transaction_generation().get(), 1);
-        assert_eq!(receipt.attachment_generation(), plan.attachment().generation());
+        assert_eq!(
+            receipt.attachment_generation(),
+            plan.attachment().generation()
+        );
     }
 
     #[test]
@@ -1213,12 +1237,8 @@ mod tests {
         let current = detached();
         let plan = attach_plan(&current);
         let started = started(&record(), &current, &plan);
-        let proof = ProjectDiskAttachmentSuccessProof::for_test(
-            &started,
-            &current,
-            &plan,
-            digest('b'),
-        );
+        let proof =
+            ProjectDiskAttachmentSuccessProof::for_test(&started, &current, &plan, digest('b'));
         let observed = started.record_attachment_observed(&proof).unwrap();
         let attached = observed
             .accept_p1_attach_success(&current, &plan, &proof)
@@ -1256,11 +1276,7 @@ mod tests {
             .plan_attach(
                 &current,
                 &next_plan,
-                &ProjectDiskAttachPreconditionProof::for_test(
-                    &recovered,
-                    &current,
-                    &next_plan,
-                ),
+                &ProjectDiskAttachPreconditionProof::for_test(&recovered, &current, &next_plan),
             )
             .unwrap();
         assert_eq!(next_intent.transaction_generation().get(), 2);
@@ -1297,6 +1313,90 @@ mod tests {
                     &ProjectDiskAttachPreconditionProof::for_test(&record, &current, &plan),
                 )
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn stale_transaction_generation_rejects_replayed_success_proof() {
+        let current = detached();
+        let plan = attach_plan(&current);
+        let first_started = started(&record(), &current, &plan);
+        let stale_success = ProjectDiskAttachmentSuccessProof::for_test(
+            &first_started,
+            &current,
+            &plan,
+            digest('b'),
+        );
+        let recovered = first_started.require_attach_recovery().unwrap();
+        let reopened = recovered
+            .record_prior_attach_quiescent_detached(
+                &ProjectDiskPriorAttachQuiescentProof::for_test(&first_started, &plan),
+                &ProjectDiskAttachDetachedProof::for_test(&first_started, &current, &plan),
+            )
+            .unwrap();
+        let second_plan = attach_plan(&current);
+        let second_started = started(&reopened, &current, &second_plan);
+        assert_eq!(
+            second_started
+                .record_attachment_observed(&stale_success)
+                .unwrap_err()
+                .kind(),
+            ProjectDiskAttachmentStateErrorKind::EvidenceMismatch
+        );
+    }
+
+    #[test]
+    fn stale_transaction_generation_rejects_replayed_detached_proof() {
+        let current = detached();
+        let plan = attach_plan(&current);
+        let first_started = started(&record(), &current, &plan);
+        let stale_detached =
+            ProjectDiskAttachDetachedProof::for_test(&first_started, &current, &plan);
+        let recovered = first_started.require_attach_recovery().unwrap();
+        let reopened = recovered
+            .record_prior_attach_quiescent_detached(
+                &ProjectDiskPriorAttachQuiescentProof::for_test(&first_started, &plan),
+                &stale_detached,
+            )
+            .unwrap();
+        let second_started = started(&reopened, &current, &attach_plan(&current));
+        assert_eq!(
+            second_started
+                .assess_started_detached(&stale_detached)
+                .unwrap_err()
+                .kind(),
+            ProjectDiskAttachmentStateErrorKind::EvidenceMismatch
+        );
+    }
+
+    #[test]
+    fn stale_transaction_generation_rejects_replayed_quiescent_proof() {
+        let current = detached();
+        let plan = attach_plan(&current);
+        let first_started = started(&record(), &current, &plan);
+        let stale_quiescent = ProjectDiskPriorAttachQuiescentProof::for_test(&first_started, &plan);
+        let recovered = first_started.require_attach_recovery().unwrap();
+        let reopened = recovered
+            .record_prior_attach_quiescent_detached(
+                &ProjectDiskPriorAttachQuiescentProof::for_test(&first_started, &plan),
+                &ProjectDiskAttachDetachedProof::for_test(&first_started, &current, &plan),
+            )
+            .unwrap();
+        let second_started = started(&reopened, &current, &attach_plan(&current));
+        let second_recovery = second_started.require_attach_recovery().unwrap();
+        assert_eq!(
+            second_recovery
+                .record_prior_attach_quiescent_detached(
+                    &stale_quiescent,
+                    &ProjectDiskAttachDetachedProof::for_test(
+                        &second_recovery,
+                        &current,
+                        &attach_plan(&current),
+                    ),
+                )
+                .unwrap_err()
+                .kind(),
+            ProjectDiskAttachmentStateErrorKind::EvidenceMismatch
         );
     }
 }
