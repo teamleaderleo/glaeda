@@ -10,12 +10,11 @@ use sha2::{Digest as _, Sha256};
 use crate::artifact::Sha256Digest;
 
 use super::raw::{
-    LimaStandaloneDiskName, LimaStandaloneDiskObservationRequest as RawObservationRequest,
-    ProjectDiskHostObservationError,
+    HeldLimaSource as RawHeldLimaSource, LimaStandaloneDiskName,
+    LimaStandaloneDiskObservationRequest as RawObservationRequest, ProjectDiskHostObservationError,
 };
 
 const MAX_LIMA_HOME_BYTES: usize = 1_024;
-const STANDALONE_DISK_COLLECTION: &str = "_disks";
 const SOURCE_IDENTITY_DOMAIN: &[u8] = b"smolrunner-project-disk-lima-source-v1";
 
 /// Persistable equality identity for one configured private Lima namespace.
@@ -67,9 +66,8 @@ impl std::error::Error for ProjectDiskLimaSourceIdentityParseError {}
 ///
 /// This value deliberately carries no live physical-source authority. It validates only the
 /// configured pathname spelling and the one physically established macOS `/var -> /private/var`
-/// compatibility alias. The P2 observer opens and binds the source/collection descriptors when an
-/// observation is actually made; #699 owns stronger durable physical source identity across
-/// restart/replacement.
+/// compatibility alias. `hold` opens and binds the source descriptor before inventory capture;
+/// #699 owns stronger durable physical source identity across restart/replacement.
 pub struct ConfiguredProjectDiskLimaSource {
     canonical_lima_home: PathBuf,
     identity: ProjectDiskLimaSourceIdentity,
@@ -97,8 +95,52 @@ impl ConfiguredProjectDiskLimaSource {
         &self.identity
     }
 
-    fn canonical_lima_home(&self) -> &Path {
-        &self.canonical_lima_home
+    /// Open and seal the exact configured source before inventory is captured.
+    pub fn hold(&self) -> Result<HeldProjectDiskLimaSource, ProjectDiskHostObservationError> {
+        let inner = RawHeldLimaSource::open(self.canonical_lima_home.clone())?;
+        Ok(HeldProjectDiskLimaSource {
+            identity: self.identity.clone(),
+            inner,
+        })
+    }
+}
+
+/// Short-lived, non-cloneable binding to one current physical Lima source.
+///
+/// This is process-local authority only, is intentionally not serializable, and makes no durable
+/// across-restart identity claim.
+pub struct HeldProjectDiskLimaSource {
+    identity: ProjectDiskLimaSourceIdentity,
+    inner: RawHeldLimaSource,
+}
+
+impl HeldProjectDiskLimaSource {
+    #[must_use]
+    pub const fn identity(&self) -> &ProjectDiskLimaSourceIdentity {
+        &self.identity
+    }
+
+    /// Borrow the private LIMA_HOME only for one exact inventory capture window.
+    ///
+    /// The retained descriptor/path binding is confirmed immediately before and after the
+    /// callback. This is crate-private so product callers cannot obtain a generic path accessor;
+    /// #696 may use it only while constructing and executing its reviewed inventory capture.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn with_inventory_capture_path<T>(
+        &self,
+        capture: impl FnOnce(&Path) -> T,
+    ) -> Result<T, ProjectDiskHostObservationError> {
+        self.inner.with_inventory_capture_path(capture)
+    }
+}
+
+impl fmt::Debug for HeldProjectDiskLimaSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HeldProjectDiskLimaSource")
+            .field("identity", &self.identity)
+            .field("physical_binding", &"<private-source-binding>")
+            .finish()
     }
 }
 
@@ -150,22 +192,16 @@ impl LimaStandaloneDiskObservationRequest {
     /// Returns the existing bounded P2 refusal if the derived request cannot satisfy the raw
     /// descriptor engine's exact path contract.
     pub fn for_planned_disk(
-        source: &ConfiguredProjectDiskLimaSource,
+        source: HeldProjectDiskLimaSource,
         disk_name: LimaStandaloneDiskName,
     ) -> Result<Self, ProjectDiskHostObservationError> {
-        let disk_directory = source
-            .canonical_lima_home()
-            .join(STANDALONE_DISK_COLLECTION)
-            .join(disk_name.as_str());
-        let inner = RawObservationRequest::new(
-            disk_name.clone(),
-            source.canonical_lima_home().to_owned(),
-            disk_directory,
-        )?
-        .with_planned_source_identity(source.identity().clone());
+        let identity = source.identity.clone();
+        let inner = source
+            .inner
+            .into_planned_request(disk_name.clone(), identity.clone())?;
         Ok(Self {
             inner,
-            source_identity: source.identity().clone(),
+            source_identity: identity,
             disk_name,
         })
     }
@@ -322,16 +358,27 @@ mod tests {
 
     #[test]
     fn planned_request_derives_reviewed_collection_and_hides_paths() {
-        let source = ConfiguredProjectDiskLimaSource::new("/tmp/smolrunner-p2-source").unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let path =
+            std::env::temp_dir().join(format!("smolrunner-p2-source-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let source = ConfiguredProjectDiskLimaSource::new(&path).unwrap();
         let disk_name = LimaStandaloneDiskName::parse("srpd1-test").unwrap();
-        let request =
-            LimaStandaloneDiskObservationRequest::for_planned_disk(&source, disk_name).unwrap();
+        let request = LimaStandaloneDiskObservationRequest::for_planned_disk(
+            source.hold().unwrap(),
+            disk_name,
+        )
+        .unwrap();
 
         assert_eq!(request.disk_name().as_str(), "srpd1-test");
         assert_eq!(request.source_identity(), source.identity());
         let debug = format!("{request:?}");
-        assert!(!debug.contains("/tmp/smolrunner-p2-source"));
+        assert!(!debug.contains(path.to_str().unwrap()));
         assert!(debug.contains("source_identity"));
+        std::fs::remove_dir(&path).unwrap();
     }
 
     #[test]

@@ -35,9 +35,10 @@ pub use raw::{
     ProjectDiskHostObservationErrorKind, ProjectDiskPhysicalIdentity,
 };
 pub use source::{
-    ConfiguredProjectDiskLimaSource, LimaStandaloneDiskFixtureObservationRequest,
-    LimaStandaloneDiskObservationRequest, ProjectDiskLimaSourceError,
-    ProjectDiskLimaSourceIdentity, ProjectDiskLimaSourceIdentityParseError,
+    ConfiguredProjectDiskLimaSource, HeldProjectDiskLimaSource,
+    LimaStandaloneDiskFixtureObservationRequest, LimaStandaloneDiskObservationRequest,
+    ProjectDiskLimaSourceError, ProjectDiskLimaSourceIdentity,
+    ProjectDiskLimaSourceIdentityParseError,
 };
 
 /// Persistable opaque identity for the exact backing entry observed by P2.
@@ -343,7 +344,7 @@ mod tests {
         fs::remove_dir_all(&fixture.disk_directory).unwrap();
         let source = ConfiguredProjectDiskLimaSource::new(&fixture.lima_home).unwrap();
         let request = LimaStandaloneDiskObservationRequest::for_planned_disk(
-            &source,
+            source.hold().unwrap(),
             fixture.disk_name.clone(),
         )
         .unwrap();
@@ -401,7 +402,7 @@ mod tests {
         let source = ConfiguredProjectDiskLimaSource::new(&fixture.lima_home).unwrap();
         let planned_request = || {
             LimaStandaloneDiskObservationRequest::for_planned_disk(
-                &source,
+                source.hold().unwrap(),
                 fixture.disk_name.clone(),
             )
             .unwrap()
@@ -443,7 +444,7 @@ mod tests {
         fs::remove_dir_all(&collection).unwrap();
         let source = ConfiguredProjectDiskLimaSource::new(&fixture.lima_home).unwrap();
         let request = LimaStandaloneDiskObservationRequest::for_planned_disk(
-            &source,
+            source.hold().unwrap(),
             fixture.disk_name.clone(),
         )
         .unwrap();
@@ -465,5 +466,58 @@ mod tests {
             created.summary().disposition(),
             LimaStandaloneDiskDisposition::Detached
         );
+    }
+
+    #[test]
+    fn held_source_detects_path_replacement_while_configured_identity_stays_equal() {
+        let fixture = FacadeFixture::new();
+        let source = ConfiguredProjectDiskLimaSource::new(&fixture.lima_home).unwrap();
+        let configured_identity = source.identity().clone();
+        let held = source.hold().unwrap();
+        let old_home = fixture.root.join("old-lima");
+        fs::rename(&fixture.lima_home, &old_home).unwrap();
+        fs::create_dir(&fixture.lima_home).unwrap();
+        fs::set_permissions(&fixture.lima_home, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(source.identity(), &configured_identity);
+        let error = held.with_inventory_capture_path(|_| ()).unwrap_err();
+        assert_eq!(error.code(), "project_disk_observation_changed");
+        let debug = format!("{held:?}");
+        assert!(!debug.contains(fixture.root.to_str().unwrap()));
+        assert!(debug.contains("private-source-binding"));
+    }
+
+    #[test]
+    fn inventory_capture_borrow_confirms_the_same_held_source_before_and_after() {
+        let fixture = FacadeFixture::new();
+        let source = ConfiguredProjectDiskLimaSource::new(&fixture.lima_home).unwrap();
+        let held = source.hold().unwrap();
+        let canonical_lima_home = fs::canonicalize(&fixture.lima_home).unwrap();
+        let old_home = fixture.root.join("captured-old-lima");
+        let error = held
+            .with_inventory_capture_path(|private_path| {
+                assert_eq!(private_path, canonical_lima_home);
+                fs::rename(&fixture.lima_home, &old_home).unwrap();
+                fs::create_dir(&fixture.lima_home).unwrap();
+                fs::set_permissions(&fixture.lima_home, fs::Permissions::from_mode(0o700)).unwrap();
+            })
+            .unwrap_err();
+        assert_eq!(error.code(), "project_disk_observation_changed");
+    }
+
+    #[test]
+    fn held_source_refuses_unsafe_mode_and_symlink() {
+        let fixture = FacadeFixture::new();
+        fs::set_permissions(&fixture.lima_home, fs::Permissions::from_mode(0o755)).unwrap();
+        let source = ConfiguredProjectDiskLimaSource::new(&fixture.lima_home).unwrap();
+        assert_eq!(
+            source.hold().unwrap_err().code(),
+            "project_disk_observation_unsafe_filesystem"
+        );
+
+        fs::remove_dir_all(&fixture.lima_home).unwrap();
+        std::os::unix::fs::symlink(&fixture.root, &fixture.lima_home).unwrap();
+        let source = ConfiguredProjectDiskLimaSource::new(&fixture.lima_home).unwrap();
+        assert!(source.hold().is_err());
     }
 }
