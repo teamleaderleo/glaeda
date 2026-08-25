@@ -351,6 +351,9 @@ pub mod trusted_project_filesystem_guest_protocol;
 pub mod trusted_workspace_receipt;
 #[cfg(unix)]
 pub mod unix_personal_worker_store;
+/// Descriptor-bound private persistence for the resident-sandbox catalog.
+#[cfg(unix)]
+pub mod unix_resident_sandbox_store;
 pub mod verification_profile;
 pub mod verification_profile_preflight_adapter;
 pub mod verification_profile_registry;
