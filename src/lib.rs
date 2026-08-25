@@ -262,6 +262,8 @@ pub mod project_disk_attachment_state;
 pub mod project_disk_filesystem;
 /// Pure crash-safe single-writer lease planning for resident trusted project disks.
 pub mod project_disk_lease;
+/// Pure bounded validator for the final #628 full project-filesystem correlation receipt.
+pub mod project_filesystem_correlation_receipt;
 pub mod renderprove_artifact_binding;
 pub mod renderprove_execution;
 #[cfg(target_os = "linux")]
