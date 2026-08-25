@@ -1,4 +1,4 @@
-"""Bounded, read-only observations for the SmolRunner workspace receipt."""
+"""Bounded, read-only observations for the Glaeda workspace receipt."""
 
 from __future__ import annotations
 
