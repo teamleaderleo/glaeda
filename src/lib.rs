@@ -314,9 +314,11 @@ pub mod subordinate_id;
 pub mod task_private_git_clone_plan;
 /// Pure reviewed identity for one resident Linux guest-control executable generation.
 pub mod trusted_guest_control_binary_generation;
-/// Pure sealed one-shot invocation plan for resident Linux guest-control transactions.
+/// Pure sealed one-shot invocation plan for purpose-typed Linux guest-control transactions.
 pub mod trusted_guest_control_invocation_plan;
-/// Pure canonical one-shot protocol envelope for resident Linux guest-control transactions.
+/// Mutation-free resident guest-control transport probe protocol.
+pub mod trusted_guest_control_probe_protocol;
+/// Pure canonical one-shot protocol envelope for purpose-typed Linux guest-control transactions.
 pub mod trusted_guest_control_protocol;
 #[cfg(target_os = "linux")]
 /// Sealed all-FD trusted OverlayFS mount transaction behind exact correlation evidence.

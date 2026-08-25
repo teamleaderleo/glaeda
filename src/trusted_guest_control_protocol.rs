@@ -1,14 +1,14 @@
-//! Canonical common envelope for one-shot resident Linux guest-control transactions.
+//! Canonical common envelope for one-shot Linux guest-control transactions.
 //!
 //! This module is pure protocol vocabulary. It performs no process execution, filesystem I/O,
 //! privilege escalation, mount operation, Git operation, durable-state mutation, or guest
 //! observation.
 //!
-//! Requests carry exact durable identities plus one closed operation tag and an opaque digest of a
-//! later operation-specific payload. Decoded fields are claims. The Mac invocation adapter must
-//! freshly re-confirm the attached project disk, resident sandbox, and installed guest binary
-//! immediately before spawn, and the Linux handler must prove operation-specific authority before
-//! doing any work.
+//! Requests carry one purpose-typed target/authority claim, one closed operation tag, and an opaque
+//! digest of a later operation-specific payload. Decoded fields are claims, never ownership
+//! capabilities. The Mac invocation adapter must freshly re-confirm the owning resident or
+//! formatter state and installed guest binary immediately before spawn, and the Linux handler must
+//! prove operation-specific authority before doing any work.
 
 use std::fmt;
 
@@ -22,11 +22,12 @@ use crate::project_disk_lease::{
     ProjectDiskLeaseState, ProjectDiskRevision, ResidentSandboxGeneration, ResidentSandboxId,
 };
 
-pub const TRUSTED_GUEST_CONTROL_PROTOCOL_SCHEMA_VERSION: u8 = 1;
+pub const TRUSTED_GUEST_CONTROL_PROTOCOL_SCHEMA_VERSION: u8 = 2;
 pub const MAX_TRUSTED_GUEST_CONTROL_REQUEST_BYTES: usize = 4 * 1024;
 pub const MAX_TRUSTED_GUEST_CONTROL_RECEIPT_BYTES: usize = 2 * 1024;
 
-const REQUEST_DIGEST_DOMAIN: &[u8] = b"smolrunner-trusted-guest-control-request-v1\0";
+const REQUEST_DIGEST_DOMAIN: &[u8] = b"smolrunner-trusted-guest-control-request-v2\0";
+const AUTHORITY_DIGEST_DOMAIN: &[u8] = b"smolrunner-trusted-guest-control-authority-v2\0";
 const MAX_REQUEST_ID_BYTES: usize = 64;
 const SHA256_PREFIX: &str = "sha256:";
 const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -116,49 +117,148 @@ impl TrustedGuestControlRequestId {
     }
 }
 
-/// Exact durable attachment identity carried by one guest-control request.
-///
-/// This is request data, not an authority token. A decoded value can only be trusted after the Mac
-/// adapter compares every field with the live durable lease immediately before invocation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct TrustedGuestControlAuthority {
-    project: ProjectIdentity,
-    project_disk_id: ProjectDiskId,
-    project_disk_generation: ProjectDiskGeneration,
-    project_disk_revision: ProjectDiskRevision,
-    attachment_generation: ProjectDiskAttachmentGeneration,
-    resident_sandbox_id: ResidentSandboxId,
-    resident_sandbox_generation: ResidentSandboxGeneration,
+macro_rules! positive_generation {
+    ($name:ident) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+        #[serde(transparent)]
+        pub struct $name(u64);
+
+        impl $name {
+            /// Construct one positive protocol-local generation claim.
+            ///
+            /// # Errors
+            ///
+            /// Returns a bounded error when `value` is zero.
+            pub fn new(value: u64) -> Result<Self, TrustedGuestControlProtocolError> {
+                if value == 0 {
+                    return Err(invalid_identity());
+                }
+                Ok(Self(value))
+            }
+
+            #[must_use]
+            pub const fn get(self) -> u64 {
+                self.0
+            }
+        }
+    };
 }
 
-impl TrustedGuestControlAuthority {
-    /// Derive request identity from one currently attached project-disk lease.
-    ///
-    /// # Errors
-    ///
-    /// Returns a bounded error unless the record is currently attached.
-    pub fn from_attached_project_disk(
-        record: &ProjectDiskLeaseRecord,
-    ) -> Result<Self, TrustedGuestControlProtocolError> {
-        let ProjectDiskLeaseState::Attached { attachment } = record.state() else {
-            return Err(invalid_authority());
-        };
-        Ok(Self {
-            project: record.project().clone(),
-            project_disk_id: record.disk_id().clone(),
-            project_disk_generation: record.disk_generation(),
-            project_disk_revision: record.revision(),
-            attachment_generation: attachment.generation(),
-            resident_sandbox_id: attachment.sandbox_id().clone(),
-            resident_sandbox_generation: attachment.sandbox_generation(),
-        })
+positive_generation!(TrustedGuestControlResidentConfigGeneration);
+positive_generation!(TrustedGuestControlResidentAuthorityGeneration);
+positive_generation!(TrustedGuestControlFormatTransactionGeneration);
+positive_generation!(TrustedGuestControlFormatterCarrierGeneration);
+positive_generation!(TrustedGuestControlFormatterConfigGeneration);
+positive_generation!(TrustedGuestControlAttachTransactionGeneration);
+
+macro_rules! digest_claim {
+    ($name:ident) => {
+        #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+        #[serde(transparent)]
+        pub struct $name(Sha256Digest);
+
+        impl $name {
+            /// Construct one typed serialized claim from a canonical SHA-256 digest.
+            ///
+            /// This never constructs or recovers the owner-side capability whose identity the
+            /// digest claims.
+            #[must_use]
+            pub const fn new(digest: Sha256Digest) -> Self {
+                Self(digest)
+            }
+
+            #[must_use]
+            pub const fn digest(&self) -> &Sha256Digest {
+                &self.0
+            }
+        }
+    };
+}
+
+digest_claim!(TrustedGuestControlResidentConfigClaim);
+digest_claim!(TrustedGuestControlFormatAuthorityClaim);
+digest_claim!(TrustedGuestControlCreatedProvenanceClaim);
+digest_claim!(TrustedGuestControlFormatterConfigClaim);
+digest_claim!(TrustedGuestControlAttachAuthorityClaim);
+
+/// Closed logical identity of the guest target selected by a sealed invocation capability.
+///
+/// This remains serialized claim data. Constructing or decoding it cannot create the private
+/// invocation target, resident capability, formatter capability, or any Lima authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TrustedGuestControlTargetIdentity {
+    Resident {
+        project: ProjectIdentity,
+        sandbox_id: ResidentSandboxId,
+        sandbox_generation: ResidentSandboxGeneration,
+    },
+    Formatter {
+        project: ProjectIdentity,
+        project_disk_id: ProjectDiskId,
+        project_disk_generation: ProjectDiskGeneration,
+        format_transaction_generation: TrustedGuestControlFormatTransactionGeneration,
+        formatter_carrier_generation: TrustedGuestControlFormatterCarrierGeneration,
+    },
+}
+
+impl TrustedGuestControlTargetIdentity {
+    #[must_use]
+    pub fn resident(
+        project: ProjectIdentity,
+        sandbox_id: ResidentSandboxId,
+        sandbox_generation: ResidentSandboxGeneration,
+    ) -> Self {
+        Self::Resident {
+            project,
+            sandbox_id,
+            sandbox_generation,
+        }
+    }
+
+    #[must_use]
+    pub fn formatter(
+        project: ProjectIdentity,
+        project_disk_id: ProjectDiskId,
+        project_disk_generation: ProjectDiskGeneration,
+        format_transaction_generation: TrustedGuestControlFormatTransactionGeneration,
+        formatter_carrier_generation: TrustedGuestControlFormatterCarrierGeneration,
+    ) -> Self {
+        Self::Formatter {
+            project,
+            project_disk_id,
+            project_disk_generation,
+            format_transaction_generation,
+            formatter_carrier_generation,
+        }
     }
 
     #[must_use]
     pub const fn project(&self) -> &ProjectIdentity {
-        &self.project
+        match self {
+            Self::Resident { project, .. } | Self::Formatter { project, .. } => project,
+        }
     }
+}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustedGuestControlAuthorityKind {
+    ResidentSandbox,
+    ResidentPendingProjectDiskAttachment,
+    ResidentAttachedProjectDisk,
+    FormatterProjectDisk,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustedGuestControlResidentAttachedProjectDiskAuthority {
+    project_disk_id: ProjectDiskId,
+    project_disk_generation: ProjectDiskGeneration,
+    project_disk_revision: ProjectDiskRevision,
+    attachment_generation: ProjectDiskAttachmentGeneration,
+}
+
+impl TrustedGuestControlResidentAttachedProjectDiskAuthority {
     #[must_use]
     pub const fn project_disk_id(&self) -> &ProjectDiskId {
         &self.project_disk_id
@@ -178,27 +278,262 @@ impl TrustedGuestControlAuthority {
     pub const fn attachment_generation(&self) -> ProjectDiskAttachmentGeneration {
         self.attachment_generation
     }
+}
 
+/// Purpose-typed authority claim carried by one protocol-v2 request.
+///
+/// The private variant data cannot be constructed by decoding a digest into an owner-side
+/// capability. Every constructor below only creates serialized request claims; the owning Mac
+/// state machine must revalidate the exact live lineage before invoking the sealed target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustedGuestControlAuthority {
+    target: TrustedGuestControlTargetIdentity,
+    variant: TrustedGuestControlAuthorityVariant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TrustedGuestControlAuthorityVariant {
+    ResidentSandbox {
+        config_generation: TrustedGuestControlResidentConfigGeneration,
+        config_identity: TrustedGuestControlResidentConfigClaim,
+        authority_generation: TrustedGuestControlResidentAuthorityGeneration,
+    },
+    ResidentPendingProjectDiskAttachment {
+        project_disk_id: ProjectDiskId,
+        project_disk_generation: ProjectDiskGeneration,
+        starting_project_disk_revision: ProjectDiskRevision,
+        reserved_attachment_generation: ProjectDiskAttachmentGeneration,
+        attach_transaction_generation: TrustedGuestControlAttachTransactionGeneration,
+        attach_authority_identity: TrustedGuestControlAttachAuthorityClaim,
+    },
+    ResidentAttachedProjectDisk(TrustedGuestControlResidentAttachedProjectDiskAuthority),
+    FormatterProjectDisk {
+        created_provenance_identity: TrustedGuestControlCreatedProvenanceClaim,
+        format_authority_identity: TrustedGuestControlFormatAuthorityClaim,
+        formatter_config_generation: TrustedGuestControlFormatterConfigGeneration,
+        formatter_config_identity: TrustedGuestControlFormatterConfigClaim,
+    },
+}
+
+impl TrustedGuestControlAuthority {
     #[must_use]
-    pub const fn resident_sandbox_id(&self) -> &ResidentSandboxId {
-        &self.resident_sandbox_id
+    pub fn resident_sandbox(
+        project: ProjectIdentity,
+        sandbox_id: ResidentSandboxId,
+        sandbox_generation: ResidentSandboxGeneration,
+        config_generation: TrustedGuestControlResidentConfigGeneration,
+        config_identity: TrustedGuestControlResidentConfigClaim,
+        authority_generation: TrustedGuestControlResidentAuthorityGeneration,
+    ) -> Self {
+        Self {
+            target: TrustedGuestControlTargetIdentity::resident(
+                project,
+                sandbox_id,
+                sandbox_generation,
+            ),
+            variant: TrustedGuestControlAuthorityVariant::ResidentSandbox {
+                config_generation,
+                config_identity,
+                authority_generation,
+            },
+        }
+    }
+
+    /// Derive request identity from one currently attached project-disk lease.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded error unless the record is currently attached.
+    pub fn from_attached_project_disk(
+        record: &ProjectDiskLeaseRecord,
+    ) -> Result<Self, TrustedGuestControlProtocolError> {
+        let ProjectDiskLeaseState::Attached { attachment } = record.state() else {
+            return Err(invalid_authority());
+        };
+        Ok(Self {
+            target: TrustedGuestControlTargetIdentity::resident(
+                record.project().clone(),
+                attachment.sandbox_id().clone(),
+                attachment.sandbox_generation(),
+            ),
+            variant: TrustedGuestControlAuthorityVariant::ResidentAttachedProjectDisk(
+                TrustedGuestControlResidentAttachedProjectDiskAuthority {
+                    project_disk_id: record.disk_id().clone(),
+                    project_disk_generation: record.disk_generation(),
+                    project_disk_revision: record.revision(),
+                    attachment_generation: attachment.generation(),
+                },
+            ),
+        })
     }
 
     #[must_use]
-    pub const fn resident_sandbox_generation(&self) -> ResidentSandboxGeneration {
-        self.resident_sandbox_generation
+    pub const fn project(&self) -> &ProjectIdentity {
+        self.target.project()
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> TrustedGuestControlAuthorityKind {
+        match &self.variant {
+            TrustedGuestControlAuthorityVariant::ResidentSandbox { .. } => {
+                TrustedGuestControlAuthorityKind::ResidentSandbox
+            }
+            TrustedGuestControlAuthorityVariant::ResidentPendingProjectDiskAttachment {
+                ..
+            } => TrustedGuestControlAuthorityKind::ResidentPendingProjectDiskAttachment,
+            TrustedGuestControlAuthorityVariant::ResidentAttachedProjectDisk(_) => {
+                TrustedGuestControlAuthorityKind::ResidentAttachedProjectDisk
+            }
+            TrustedGuestControlAuthorityVariant::FormatterProjectDisk { .. } => {
+                TrustedGuestControlAuthorityKind::FormatterProjectDisk
+            }
+        }
+    }
+
+    #[must_use]
+    pub const fn target_identity(&self) -> &TrustedGuestControlTargetIdentity {
+        &self.target
+    }
+
+    #[must_use]
+    pub const fn resident_attached_project_disk(
+        &self,
+    ) -> Option<&TrustedGuestControlResidentAttachedProjectDiskAuthority> {
+        match &self.variant {
+            TrustedGuestControlAuthorityVariant::ResidentAttachedProjectDisk(authority) => {
+                Some(authority)
+            }
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn resident_sandbox_id(&self) -> Option<&ResidentSandboxId> {
+        match &self.target {
+            TrustedGuestControlTargetIdentity::Resident { sandbox_id, .. } => Some(sandbox_id),
+            TrustedGuestControlTargetIdentity::Formatter { .. } => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn resident_sandbox_generation(&self) -> Option<ResidentSandboxGeneration> {
+        match &self.target {
+            TrustedGuestControlTargetIdentity::Resident {
+                sandbox_generation, ..
+            } => Some(*sandbox_generation),
+            TrustedGuestControlTargetIdentity::Formatter { .. } => None,
+        }
+    }
+
+    pub fn formatter_project_disk(
+        target: TrustedGuestControlTargetIdentity,
+        created_provenance_identity: TrustedGuestControlCreatedProvenanceClaim,
+        format_authority_identity: TrustedGuestControlFormatAuthorityClaim,
+        formatter_config_generation: TrustedGuestControlFormatterConfigGeneration,
+        formatter_config_identity: TrustedGuestControlFormatterConfigClaim,
+    ) -> Result<Self, TrustedGuestControlProtocolError> {
+        if !matches!(&target, TrustedGuestControlTargetIdentity::Formatter { .. }) {
+            return Err(invalid_authority());
+        }
+        Ok(Self {
+            target,
+            variant: TrustedGuestControlAuthorityVariant::FormatterProjectDisk {
+                created_provenance_identity,
+                format_authority_identity,
+                formatter_config_generation,
+                formatter_config_identity,
+            },
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn resident_pending_project_disk_attachment(
+        target: TrustedGuestControlTargetIdentity,
+        project_disk_id: ProjectDiskId,
+        project_disk_generation: ProjectDiskGeneration,
+        starting_project_disk_revision: ProjectDiskRevision,
+        reserved_attachment_generation: ProjectDiskAttachmentGeneration,
+        attach_transaction_generation: TrustedGuestControlAttachTransactionGeneration,
+        attach_authority_identity: TrustedGuestControlAttachAuthorityClaim,
+    ) -> Result<Self, TrustedGuestControlProtocolError> {
+        if !matches!(target, TrustedGuestControlTargetIdentity::Resident { .. }) {
+            return Err(invalid_authority());
+        }
+        Ok(Self {
+            target,
+            variant: TrustedGuestControlAuthorityVariant::ResidentPendingProjectDiskAttachment {
+                project_disk_id,
+                project_disk_generation,
+                starting_project_disk_revision,
+                reserved_attachment_generation,
+                attach_transaction_generation,
+                attach_authority_identity,
+            },
+        })
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TrustedGuestControlOperation {
+    ProbeGuestControl,
+    ObservePendingProjectDiskAttachment,
     ObserveProjectFilesystem,
+    MountProjectFilesystem,
+    ObserveProjectBlockDeviceForFormat,
+    FormatProjectFilesystem,
+    ObserveFormattedProjectFilesystem,
     ObserveImmutableGitPool,
     PublishImmutableGitPoolGeneration,
     PrepareTrustedTaskView,
     ObserveTrustedTaskView,
     CleanupTrustedTaskView,
+}
+
+impl TrustedGuestControlOperation {
+    #[must_use]
+    pub const fn authority_kind(self) -> TrustedGuestControlAuthorityKind {
+        match self {
+            Self::ProbeGuestControl => TrustedGuestControlAuthorityKind::ResidentSandbox,
+            Self::ObservePendingProjectDiskAttachment => {
+                TrustedGuestControlAuthorityKind::ResidentPendingProjectDiskAttachment
+            }
+            Self::ObserveProjectBlockDeviceForFormat
+            | Self::FormatProjectFilesystem
+            | Self::ObserveFormattedProjectFilesystem => {
+                TrustedGuestControlAuthorityKind::FormatterProjectDisk
+            }
+            Self::ObserveProjectFilesystem
+            | Self::MountProjectFilesystem
+            | Self::ObserveImmutableGitPool
+            | Self::PublishImmutableGitPoolGeneration
+            | Self::PrepareTrustedTaskView
+            | Self::ObserveTrustedTaskView
+            | Self::CleanupTrustedTaskView => {
+                TrustedGuestControlAuthorityKind::ResidentAttachedProjectDisk
+            }
+        }
+    }
+
+    #[must_use]
+    pub const fn accepts_authority_kind(self, kind: TrustedGuestControlAuthorityKind) -> bool {
+        matches!(
+            (self.authority_kind(), kind),
+            (
+                TrustedGuestControlAuthorityKind::ResidentSandbox,
+                TrustedGuestControlAuthorityKind::ResidentSandbox
+            ) | (
+                TrustedGuestControlAuthorityKind::ResidentPendingProjectDiskAttachment,
+                TrustedGuestControlAuthorityKind::ResidentPendingProjectDiskAttachment
+            ) | (
+                TrustedGuestControlAuthorityKind::ResidentAttachedProjectDisk,
+                TrustedGuestControlAuthorityKind::ResidentAttachedProjectDisk
+            ) | (
+                TrustedGuestControlAuthorityKind::FormatterProjectDisk,
+                TrustedGuestControlAuthorityKind::FormatterProjectDisk
+            )
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -211,21 +546,28 @@ pub struct TrustedGuestControlRequest {
 }
 
 impl TrustedGuestControlRequest {
-    #[must_use]
-    pub const fn new(
+    /// Construct one request only when the closed operation accepts the supplied authority kind.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded refusal for an operation/authority mismatch.
+    pub fn new(
         request_id: TrustedGuestControlRequestId,
         binary: TrustedGuestControlBinaryBinding,
         authority: TrustedGuestControlAuthority,
         operation: TrustedGuestControlOperation,
         payload_digest: Sha256Digest,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, TrustedGuestControlProtocolError> {
+        if !operation.accepts_authority_kind(authority.kind()) {
+            return Err(invalid_authority());
+        }
+        Ok(Self {
             request_id,
             binary,
             authority,
             operation,
             payload_digest,
-        }
+        })
     }
 
     #[must_use]
@@ -374,6 +716,12 @@ impl std::error::Error for TrustedGuestControlProtocolError {}
 pub fn encode_trusted_guest_control_request(
     request: &TrustedGuestControlRequest,
 ) -> Result<Vec<u8>, TrustedGuestControlProtocolError> {
+    if !request
+        .operation
+        .accepts_authority_kind(request.authority.kind())
+    {
+        return Err(invalid_authority());
+    }
     canonical_json(
         &RequestWire::from(request),
         MAX_TRUSTED_GUEST_CONTROL_REQUEST_BYTES,
@@ -409,6 +757,25 @@ pub fn trusted_guest_control_request_digest(
     let mut hasher = Sha256::new();
     hasher.update(REQUEST_DIGEST_DOMAIN);
     hasher.update(encode_trusted_guest_control_request(request)?);
+    raw_digest(&hasher.finalize())
+}
+
+/// Derive the exact domain-separated identity of one complete serialized authority claim.
+///
+/// Operation payloads may carry this digest to bind the complete common authority without
+/// repeating every long textual field. The digest remains claim data and cannot recover an
+/// owner-side capability.
+///
+/// # Errors
+///
+/// Returns a bounded error if the authority cannot be canonically serialized.
+pub fn trusted_guest_control_authority_digest(
+    authority: &TrustedGuestControlAuthority,
+) -> Result<Sha256Digest, TrustedGuestControlProtocolError> {
+    let bytes = serde_json::to_vec(&AuthorityWire::from(authority)).map_err(|_| malformed())?;
+    let mut hasher = Sha256::new();
+    hasher.update(AUTHORITY_DIGEST_DOMAIN);
+    hasher.update(bytes);
     raw_digest(&hasher.finalize())
 }
 
@@ -523,27 +890,142 @@ fn binary_from_wire(
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AuthorityWire {
-    project: String,
-    project_disk_id: String,
-    project_disk_generation: u64,
-    project_disk_revision: u64,
-    attachment_generation: u64,
-    resident_sandbox_id: String,
-    resident_sandbox_generation: u64,
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum AuthorityWire {
+    ResidentSandbox {
+        project: String,
+        resident_sandbox_id: String,
+        resident_sandbox_generation: u64,
+        resident_config_generation: u64,
+        resident_config_identity: String,
+        resident_authority_generation: u64,
+    },
+    ResidentPendingProjectDiskAttachment {
+        project: String,
+        resident_sandbox_id: String,
+        resident_sandbox_generation: u64,
+        project_disk_id: String,
+        project_disk_generation: u64,
+        starting_project_disk_revision: u64,
+        reserved_attachment_generation: u64,
+        attach_transaction_generation: u64,
+        attach_authority_identity: String,
+    },
+    ResidentAttachedProjectDisk {
+        project: String,
+        project_disk_id: String,
+        project_disk_generation: u64,
+        project_disk_revision: u64,
+        attachment_generation: u64,
+        resident_sandbox_id: String,
+        resident_sandbox_generation: u64,
+    },
+    FormatterProjectDisk {
+        project: String,
+        project_disk_id: String,
+        project_disk_generation: u64,
+        format_transaction_generation: u64,
+        formatter_carrier_generation: u64,
+        created_provenance_identity: String,
+        format_authority_identity: String,
+        formatter_config_generation: u64,
+        formatter_config_identity: String,
+    },
 }
 
 impl From<&TrustedGuestControlAuthority> for AuthorityWire {
     fn from(value: &TrustedGuestControlAuthority) -> Self {
-        Self {
-            project: value.project.as_str().to_owned(),
-            project_disk_id: value.project_disk_id.as_str().to_owned(),
-            project_disk_generation: value.project_disk_generation.get(),
-            project_disk_revision: value.project_disk_revision.get(),
-            attachment_generation: value.attachment_generation.get(),
-            resident_sandbox_id: value.resident_sandbox_id.as_str().to_owned(),
-            resident_sandbox_generation: value.resident_sandbox_generation.get(),
+        match (&value.target, &value.variant) {
+            (
+                TrustedGuestControlTargetIdentity::Resident {
+                    project,
+                    sandbox_id,
+                    sandbox_generation,
+                },
+                TrustedGuestControlAuthorityVariant::ResidentSandbox {
+                    config_generation,
+                    config_identity,
+                    authority_generation,
+                },
+            ) => Self::ResidentSandbox {
+                project: project.as_str().to_owned(),
+                resident_sandbox_id: sandbox_id.as_str().to_owned(),
+                resident_sandbox_generation: sandbox_generation.get(),
+                resident_config_generation: config_generation.get(),
+                resident_config_identity: config_identity.digest().as_str().to_owned(),
+                resident_authority_generation: authority_generation.get(),
+            },
+            (
+                TrustedGuestControlTargetIdentity::Resident {
+                    project,
+                    sandbox_id,
+                    sandbox_generation,
+                },
+                TrustedGuestControlAuthorityVariant::ResidentPendingProjectDiskAttachment {
+                    project_disk_id,
+                    project_disk_generation,
+                    starting_project_disk_revision,
+                    reserved_attachment_generation,
+                    attach_transaction_generation,
+                    attach_authority_identity,
+                },
+            ) => Self::ResidentPendingProjectDiskAttachment {
+                project: project.as_str().to_owned(),
+                resident_sandbox_id: sandbox_id.as_str().to_owned(),
+                resident_sandbox_generation: sandbox_generation.get(),
+                project_disk_id: project_disk_id.as_str().to_owned(),
+                project_disk_generation: project_disk_generation.get(),
+                starting_project_disk_revision: starting_project_disk_revision.get(),
+                reserved_attachment_generation: reserved_attachment_generation.get(),
+                attach_transaction_generation: attach_transaction_generation.get(),
+                attach_authority_identity: attach_authority_identity.digest().as_str().to_owned(),
+            },
+            (
+                TrustedGuestControlTargetIdentity::Resident {
+                    project,
+                    sandbox_id,
+                    sandbox_generation,
+                },
+                TrustedGuestControlAuthorityVariant::ResidentAttachedProjectDisk(authority),
+            ) => Self::ResidentAttachedProjectDisk {
+                project: project.as_str().to_owned(),
+                project_disk_id: authority.project_disk_id.as_str().to_owned(),
+                project_disk_generation: authority.project_disk_generation.get(),
+                project_disk_revision: authority.project_disk_revision.get(),
+                attachment_generation: authority.attachment_generation.get(),
+                resident_sandbox_id: sandbox_id.as_str().to_owned(),
+                resident_sandbox_generation: sandbox_generation.get(),
+            },
+            (
+                TrustedGuestControlTargetIdentity::Formatter {
+                    project,
+                    project_disk_id,
+                    project_disk_generation,
+                    format_transaction_generation,
+                    formatter_carrier_generation,
+                },
+                TrustedGuestControlAuthorityVariant::FormatterProjectDisk {
+                    created_provenance_identity,
+                    format_authority_identity,
+                    formatter_config_generation,
+                    formatter_config_identity,
+                    ..
+                },
+            ) => Self::FormatterProjectDisk {
+                project: project.as_str().to_owned(),
+                project_disk_id: project_disk_id.as_str().to_owned(),
+                project_disk_generation: project_disk_generation.get(),
+                format_transaction_generation: format_transaction_generation.get(),
+                formatter_carrier_generation: formatter_carrier_generation.get(),
+                created_provenance_identity: created_provenance_identity
+                    .digest()
+                    .as_str()
+                    .to_owned(),
+                format_authority_identity: format_authority_identity.digest().as_str().to_owned(),
+                formatter_config_generation: formatter_config_generation.get(),
+                formatter_config_identity: formatter_config_identity.digest().as_str().to_owned(),
+            },
+            _ => unreachable!("private authority constructor preserves target/variant kind"),
         }
     }
 }
@@ -551,23 +1033,134 @@ impl From<&TrustedGuestControlAuthority> for AuthorityWire {
 fn authority_from_wire(
     wire: AuthorityWire,
 ) -> Result<TrustedGuestControlAuthority, TrustedGuestControlProtocolError> {
-    Ok(TrustedGuestControlAuthority {
-        project: ProjectIdentity::parse(&wire.project).map_err(|_| invalid_authority())?,
-        project_disk_id: ProjectDiskId::parse(&wire.project_disk_id)
-            .map_err(|_| invalid_authority())?,
-        project_disk_generation: ProjectDiskGeneration::new(wire.project_disk_generation)
-            .map_err(|_| invalid_authority())?,
-        project_disk_revision: ProjectDiskRevision::new(wire.project_disk_revision)
-            .map_err(|_| invalid_authority())?,
-        attachment_generation: ProjectDiskAttachmentGeneration::new(wire.attachment_generation)
-            .map_err(|_| invalid_authority())?,
-        resident_sandbox_id: ResidentSandboxId::parse(&wire.resident_sandbox_id)
-            .map_err(|_| invalid_authority())?,
-        resident_sandbox_generation: ResidentSandboxGeneration::new(
-            wire.resident_sandbox_generation,
-        )
-        .map_err(|_| invalid_authority())?,
-    })
+    match wire {
+        AuthorityWire::ResidentSandbox {
+            project,
+            resident_sandbox_id,
+            resident_sandbox_generation,
+            resident_config_generation,
+            resident_config_identity,
+            resident_authority_generation,
+        } => Ok(TrustedGuestControlAuthority::resident_sandbox(
+            parse_project(&project)?,
+            parse_sandbox_id(&resident_sandbox_id)?,
+            parse_sandbox_generation(resident_sandbox_generation)?,
+            TrustedGuestControlResidentConfigGeneration::new(resident_config_generation)?,
+            TrustedGuestControlResidentConfigClaim::new(parse_claim(&resident_config_identity)?),
+            TrustedGuestControlResidentAuthorityGeneration::new(resident_authority_generation)?,
+        )),
+        AuthorityWire::ResidentPendingProjectDiskAttachment {
+            project,
+            resident_sandbox_id,
+            resident_sandbox_generation,
+            project_disk_id,
+            project_disk_generation,
+            starting_project_disk_revision,
+            reserved_attachment_generation,
+            attach_transaction_generation,
+            attach_authority_identity,
+        } => TrustedGuestControlAuthority::resident_pending_project_disk_attachment(
+            TrustedGuestControlTargetIdentity::resident(
+                parse_project(&project)?,
+                parse_sandbox_id(&resident_sandbox_id)?,
+                parse_sandbox_generation(resident_sandbox_generation)?,
+            ),
+            parse_disk_id(&project_disk_id)?,
+            parse_disk_generation(project_disk_generation)?,
+            parse_disk_revision(starting_project_disk_revision)?,
+            parse_attachment_generation(reserved_attachment_generation)?,
+            TrustedGuestControlAttachTransactionGeneration::new(attach_transaction_generation)?,
+            TrustedGuestControlAttachAuthorityClaim::new(parse_claim(&attach_authority_identity)?),
+        ),
+        AuthorityWire::ResidentAttachedProjectDisk {
+            project,
+            project_disk_id,
+            project_disk_generation,
+            project_disk_revision,
+            attachment_generation,
+            resident_sandbox_id,
+            resident_sandbox_generation,
+        } => Ok(TrustedGuestControlAuthority {
+            target: TrustedGuestControlTargetIdentity::resident(
+                parse_project(&project)?,
+                parse_sandbox_id(&resident_sandbox_id)?,
+                parse_sandbox_generation(resident_sandbox_generation)?,
+            ),
+            variant: TrustedGuestControlAuthorityVariant::ResidentAttachedProjectDisk(
+                TrustedGuestControlResidentAttachedProjectDiskAuthority {
+                    project_disk_id: parse_disk_id(&project_disk_id)?,
+                    project_disk_generation: parse_disk_generation(project_disk_generation)?,
+                    project_disk_revision: parse_disk_revision(project_disk_revision)?,
+                    attachment_generation: parse_attachment_generation(attachment_generation)?,
+                },
+            ),
+        }),
+        AuthorityWire::FormatterProjectDisk {
+            project,
+            project_disk_id,
+            project_disk_generation,
+            format_transaction_generation,
+            formatter_carrier_generation,
+            created_provenance_identity,
+            format_authority_identity,
+            formatter_config_generation,
+            formatter_config_identity,
+        } => TrustedGuestControlAuthority::formatter_project_disk(
+            TrustedGuestControlTargetIdentity::formatter(
+                parse_project(&project)?,
+                parse_disk_id(&project_disk_id)?,
+                parse_disk_generation(project_disk_generation)?,
+                TrustedGuestControlFormatTransactionGeneration::new(format_transaction_generation)?,
+                TrustedGuestControlFormatterCarrierGeneration::new(formatter_carrier_generation)?,
+            ),
+            TrustedGuestControlCreatedProvenanceClaim::new(parse_claim(
+                &created_provenance_identity,
+            )?),
+            TrustedGuestControlFormatAuthorityClaim::new(parse_claim(&format_authority_identity)?),
+            TrustedGuestControlFormatterConfigGeneration::new(formatter_config_generation)?,
+            TrustedGuestControlFormatterConfigClaim::new(parse_claim(&formatter_config_identity)?),
+        ),
+    }
+}
+
+fn parse_project(value: &str) -> Result<ProjectIdentity, TrustedGuestControlProtocolError> {
+    ProjectIdentity::parse(value).map_err(|_| invalid_authority())
+}
+
+fn parse_disk_id(value: &str) -> Result<ProjectDiskId, TrustedGuestControlProtocolError> {
+    ProjectDiskId::parse(value).map_err(|_| invalid_authority())
+}
+
+fn parse_disk_generation(
+    value: u64,
+) -> Result<ProjectDiskGeneration, TrustedGuestControlProtocolError> {
+    ProjectDiskGeneration::new(value).map_err(|_| invalid_authority())
+}
+
+fn parse_disk_revision(
+    value: u64,
+) -> Result<ProjectDiskRevision, TrustedGuestControlProtocolError> {
+    ProjectDiskRevision::new(value).map_err(|_| invalid_authority())
+}
+
+fn parse_attachment_generation(
+    value: u64,
+) -> Result<ProjectDiskAttachmentGeneration, TrustedGuestControlProtocolError> {
+    ProjectDiskAttachmentGeneration::new(value).map_err(|_| invalid_authority())
+}
+
+fn parse_sandbox_id(value: &str) -> Result<ResidentSandboxId, TrustedGuestControlProtocolError> {
+    ResidentSandboxId::parse(value).map_err(|_| invalid_authority())
+}
+
+fn parse_sandbox_generation(
+    value: u64,
+) -> Result<ResidentSandboxGeneration, TrustedGuestControlProtocolError> {
+    ResidentSandboxGeneration::new(value).map_err(|_| invalid_authority())
+}
+
+fn parse_claim(value: &str) -> Result<Sha256Digest, TrustedGuestControlProtocolError> {
+    Sha256Digest::parse(value).map_err(|_| invalid_authority())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -600,13 +1193,13 @@ fn request_from_wire(
     if wire.schema_version != TRUSTED_GUEST_CONTROL_PROTOCOL_SCHEMA_VERSION {
         return Err(version_incompatible());
     }
-    Ok(TrustedGuestControlRequest::new(
+    TrustedGuestControlRequest::new(
         TrustedGuestControlRequestId::parse(&wire.request_id)?,
         binary_from_wire(wire.binary)?,
         authority_from_wire(wire.authority)?,
         wire.operation,
         Sha256Digest::parse(&wire.payload_digest).map_err(|_| malformed())?,
-    ))
+    )
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -712,7 +1305,7 @@ const fn invalid_authority() -> TrustedGuestControlProtocolError {
     protocol_error(
         TrustedGuestControlProtocolErrorKind::InvalidAuthority,
         "trusted_guest_control_authority_invalid",
-        "trusted guest-control attachment authority is invalid",
+        "trusted guest-control authority is invalid",
     )
 }
 
@@ -813,15 +1406,62 @@ mod tests {
             TrustedGuestControlOperation::PrepareTrustedTaskView,
             digest('b'),
         )
+        .unwrap()
+    }
+
+    fn resident_sandbox_authority(project: &str) -> TrustedGuestControlAuthority {
+        TrustedGuestControlAuthority::resident_sandbox(
+            ProjectIdentity::parse(project).unwrap(),
+            ResidentSandboxId::parse("sandbox-a").unwrap(),
+            ResidentSandboxGeneration::new(11).unwrap(),
+            TrustedGuestControlResidentConfigGeneration::new(3).unwrap(),
+            TrustedGuestControlResidentConfigClaim::new(digest('c')),
+            TrustedGuestControlResidentAuthorityGeneration::new(4).unwrap(),
+        )
+    }
+
+    fn formatter_authority() -> TrustedGuestControlAuthority {
+        TrustedGuestControlAuthority::formatter_project_disk(
+            TrustedGuestControlTargetIdentity::formatter(
+                ProjectIdentity::parse("github.com/teamleaderleo/smolrunner").unwrap(),
+                ProjectDiskId::parse("disk-a").unwrap(),
+                ProjectDiskGeneration::new(3).unwrap(),
+                TrustedGuestControlFormatTransactionGeneration::new(5).unwrap(),
+                TrustedGuestControlFormatterCarrierGeneration::new(7).unwrap(),
+            ),
+            TrustedGuestControlCreatedProvenanceClaim::new(digest('d')),
+            TrustedGuestControlFormatAuthorityClaim::new(digest('e')),
+            TrustedGuestControlFormatterConfigGeneration::new(9).unwrap(),
+            TrustedGuestControlFormatterConfigClaim::new(digest('f')),
+        )
+        .unwrap()
+    }
+
+    fn pending_authority() -> TrustedGuestControlAuthority {
+        TrustedGuestControlAuthority::resident_pending_project_disk_attachment(
+            TrustedGuestControlTargetIdentity::resident(
+                ProjectIdentity::parse("github.com/teamleaderleo/smolrunner").unwrap(),
+                ResidentSandboxId::parse("sandbox-a").unwrap(),
+                ResidentSandboxGeneration::new(11).unwrap(),
+            ),
+            ProjectDiskId::parse("disk-a").unwrap(),
+            ProjectDiskGeneration::new(3).unwrap(),
+            ProjectDiskRevision::new(2).unwrap(),
+            ProjectDiskAttachmentGeneration::new(1).unwrap(),
+            TrustedGuestControlAttachTransactionGeneration::new(6).unwrap(),
+            TrustedGuestControlAttachAuthorityClaim::new(digest('a')),
+        )
+        .unwrap()
     }
 
     #[test]
     fn attached_authority_binds_current_revision_and_attachment_generation() {
         let authority =
             TrustedGuestControlAuthority::from_attached_project_disk(&attached_record()).unwrap();
-        assert_eq!(authority.project_disk_revision().get(), 2);
-        assert_eq!(authority.attachment_generation().get(), 1);
-        assert_eq!(authority.resident_sandbox_generation().get(), 11);
+        let attached = authority.resident_attached_project_disk().unwrap();
+        assert_eq!(attached.project_disk_revision().get(), 2);
+        assert_eq!(attached.attachment_generation().get(), 1);
+        assert_eq!(authority.resident_sandbox_generation().unwrap().get(), 11);
     }
 
     #[test]
@@ -836,6 +1476,121 @@ mod tests {
                 .unwrap_err()
                 .kind(),
             TrustedGuestControlProtocolErrorKind::InvalidAuthority
+        );
+    }
+
+    #[test]
+    fn every_purpose_typed_authority_round_trips_only_with_its_closed_operation() {
+        for (authority, operation, marker) in [
+            (
+                resident_sandbox_authority("github.com/teamleaderleo/smolrunner"),
+                TrustedGuestControlOperation::ProbeGuestControl,
+                "resident_sandbox",
+            ),
+            (
+                pending_authority(),
+                TrustedGuestControlOperation::ObservePendingProjectDiskAttachment,
+                "resident_pending_project_disk_attachment",
+            ),
+            (
+                TrustedGuestControlAuthority::from_attached_project_disk(&attached_record())
+                    .unwrap(),
+                TrustedGuestControlOperation::ObserveProjectFilesystem,
+                "resident_attached_project_disk",
+            ),
+            (
+                formatter_authority(),
+                TrustedGuestControlOperation::FormatProjectFilesystem,
+                "formatter_project_disk",
+            ),
+        ] {
+            let request = TrustedGuestControlRequest::new(
+                TrustedGuestControlRequestId::parse("request-purpose").unwrap(),
+                TrustedGuestControlBinaryBinding::new(
+                    7,
+                    digest('b'),
+                    TrustedGuestControlArchitecture::LinuxAarch64,
+                )
+                .unwrap(),
+                authority,
+                operation,
+                digest('c'),
+            )
+            .unwrap();
+            let bytes = encode_trusted_guest_control_request(&request).unwrap();
+            assert!(std::str::from_utf8(&bytes).unwrap().contains(marker));
+            assert_eq!(
+                decode_trusted_guest_control_request(&bytes).unwrap(),
+                request
+            );
+        }
+
+        assert_eq!(
+            TrustedGuestControlRequest::new(
+                TrustedGuestControlRequestId::parse("request-purpose").unwrap(),
+                TrustedGuestControlBinaryBinding::new(
+                    7,
+                    digest('b'),
+                    TrustedGuestControlArchitecture::LinuxAarch64,
+                )
+                .unwrap(),
+                formatter_authority(),
+                TrustedGuestControlOperation::ObserveProjectFilesystem,
+                digest('c'),
+            )
+            .unwrap_err()
+            .kind(),
+            TrustedGuestControlProtocolErrorKind::InvalidAuthority
+        );
+    }
+
+    #[test]
+    fn project_scope_and_authority_variant_change_request_identity() {
+        let binary = TrustedGuestControlBinaryBinding::new(
+            7,
+            digest('a'),
+            TrustedGuestControlArchitecture::LinuxAarch64,
+        )
+        .unwrap();
+        let first = TrustedGuestControlRequest::new(
+            TrustedGuestControlRequestId::parse("probe-1").unwrap(),
+            binary.clone(),
+            resident_sandbox_authority("github.com/teamleaderleo/smolrunner"),
+            TrustedGuestControlOperation::ProbeGuestControl,
+            digest('b'),
+        )
+        .unwrap();
+        let other_project = TrustedGuestControlRequest::new(
+            TrustedGuestControlRequestId::parse("probe-1").unwrap(),
+            binary,
+            resident_sandbox_authority("github.com/teamleaderleo/quarry"),
+            TrustedGuestControlOperation::ProbeGuestControl,
+            digest('b'),
+        )
+        .unwrap();
+        assert_ne!(
+            trusted_guest_control_request_digest(&first).unwrap(),
+            trusted_guest_control_request_digest(&other_project).unwrap()
+        );
+        assert_ne!(
+            first.authority().target_identity(),
+            other_project.authority().target_identity()
+        );
+    }
+
+    #[test]
+    fn protocol_v1_request_is_rejected_by_v2_decoder() {
+        let bytes = encode_trusted_guest_control_request(&request()).unwrap();
+        let v1 = std::str::from_utf8(&bytes).unwrap().replacen(
+            "\"schema_version\":2",
+            "\"schema_version\":1",
+            1,
+        );
+        assert_eq!(
+            decode_trusted_guest_control_request(v1.as_bytes())
+                .unwrap_err()
+                .kind(),
+            TrustedGuestControlProtocolErrorKind::VersionIncompatible
         );
     }
 
@@ -860,8 +1615,8 @@ mod tests {
         let text = std::str::from_utf8(&bytes).unwrap();
 
         let unknown = text.replacen(
-            "\"schema_version\":1",
-            "\"schema_version\":1,\"extra\":true",
+            "\"schema_version\":2",
+            "\"schema_version\":2,\"extra\":true",
             1,
         );
         assert_eq!(
@@ -871,7 +1626,7 @@ mod tests {
             TrustedGuestControlProtocolErrorKind::Malformed
         );
 
-        let future = text.replacen("\"schema_version\":1", "\"schema_version\":2", 1);
+        let future = text.replacen("\"schema_version\":2", "\"schema_version\":3", 1);
         assert_eq!(
             decode_trusted_guest_control_request(future.as_bytes())
                 .unwrap_err()
@@ -930,8 +1685,12 @@ mod tests {
         let original_digest = trusted_guest_control_request_digest(&original).unwrap();
 
         let mut attachment = request();
-        attachment.authority.attachment_generation =
-            ProjectDiskAttachmentGeneration::new(2).unwrap();
+        let TrustedGuestControlAuthorityVariant::ResidentAttachedProjectDisk(authority) =
+            &mut attachment.authority.variant
+        else {
+            panic!("fixture authority must be resident attached");
+        };
+        authority.attachment_generation = ProjectDiskAttachmentGeneration::new(2).unwrap();
         assert_ne!(
             original_digest,
             trusted_guest_control_request_digest(&attachment).unwrap()

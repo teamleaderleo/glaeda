@@ -71,20 +71,29 @@ impl TrustedProjectFilesystemObservationPayload {
         authority: &TrustedGuestControlAuthority,
         filesystem: &ProjectDiskFilesystemBinding,
     ) -> Result<Self, TrustedProjectFilesystemGuestProtocolError> {
+        let Some(attachment) = authority.resident_attached_project_disk() else {
+            return Err(authority_mismatch());
+        };
+        let (Some(sandbox_id), Some(sandbox_generation)) = (
+            authority.resident_sandbox_id(),
+            authority.resident_sandbox_generation(),
+        ) else {
+            return Err(authority_mismatch());
+        };
         if authority.project() != filesystem.project()
-            || authority.project_disk_id() != filesystem.disk_id()
-            || authority.project_disk_generation() != filesystem.disk_generation()
+            || attachment.project_disk_id() != filesystem.disk_id()
+            || attachment.project_disk_generation() != filesystem.disk_generation()
         {
             return Err(authority_mismatch());
         }
         Ok(Self {
             project: authority.project().clone(),
-            disk_id: authority.project_disk_id().clone(),
-            disk_generation: authority.project_disk_generation(),
-            disk_revision: authority.project_disk_revision(),
-            attachment_generation: authority.attachment_generation(),
-            sandbox_id: authority.resident_sandbox_id().clone(),
-            sandbox_generation: authority.resident_sandbox_generation(),
+            disk_id: attachment.project_disk_id().clone(),
+            disk_generation: attachment.project_disk_generation(),
+            disk_revision: attachment.project_disk_revision(),
+            attachment_generation: attachment.attachment_generation(),
+            sandbox_id: sandbox_id.clone(),
+            sandbox_generation,
             filesystem_generation: filesystem.filesystem_generation(),
             format_profile_generation: filesystem.format_profile_generation(),
             filesystem_kind: filesystem.kind(),
@@ -157,13 +166,16 @@ impl TrustedProjectFilesystemObservationPayload {
             return Err(operation_mismatch());
         }
         let authority = request.authority();
+        let Some(attachment) = authority.resident_attached_project_disk() else {
+            return Err(authority_mismatch());
+        };
         if authority.project() != &self.project
-            || authority.project_disk_id() != &self.disk_id
-            || authority.project_disk_generation() != self.disk_generation
-            || authority.project_disk_revision() != self.disk_revision
-            || authority.attachment_generation() != self.attachment_generation
-            || authority.resident_sandbox_id() != &self.sandbox_id
-            || authority.resident_sandbox_generation() != self.sandbox_generation
+            || attachment.project_disk_id() != &self.disk_id
+            || attachment.project_disk_generation() != self.disk_generation
+            || attachment.project_disk_revision() != self.disk_revision
+            || attachment.attachment_generation() != self.attachment_generation
+            || authority.resident_sandbox_id() != Some(&self.sandbox_id)
+            || authority.resident_sandbox_generation() != Some(self.sandbox_generation)
         {
             return Err(authority_mismatch());
         }
@@ -837,6 +849,7 @@ mod tests {
             operation,
             digest,
         )
+        .unwrap()
     }
 
     #[test]
