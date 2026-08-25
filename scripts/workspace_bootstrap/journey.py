@@ -34,7 +34,7 @@ class SafeArgumentParser(argparse.ArgumentParser):
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = SafeArgumentParser(
-        prog="./smolrunner",
+        prog="./glaeda",
         description="Evaluate the checkout and host through one Glaeda readiness journey.",
     )
     parser.add_argument("command", nargs="?", choices=["doctor"])
@@ -336,7 +336,7 @@ def render_human(report: dict[str, object]) -> str:
     if report["next_action"] == "none":
         lines.append("Next: ready for Glaeda work.")
     else:
-        lines.append("Next: resolve the blocker above, then rerun ./smolrunner.")
+        lines.append("Next: resolve the blocker above, then rerun ./glaeda.")
     return "\n".join(lines) + "\n"
 
 
