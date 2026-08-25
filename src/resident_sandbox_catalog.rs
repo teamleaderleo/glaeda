@@ -1480,6 +1480,65 @@ impl ResidentSandboxCatalog {
         Ok(next)
     }
 
+    /// Build a canonical bound-state fixture for sibling persistence tests. This constructor is
+    /// absent from production builds because first host binding requires later fresh observation.
+    #[cfg(test)]
+    pub(crate) fn test_with_bound_physical_state(
+        &self,
+        key: &ResidentSandboxKey,
+        running: bool,
+    ) -> Result<Self, ResidentSandboxCatalogError> {
+        let mut next = self.clone();
+        let entry = next
+            .entries
+            .iter_mut()
+            .find(|entry| entry.key() == *key)
+            .ok_or_else(|| {
+                error(
+                    ResidentSandboxCatalogErrorKind::Missing,
+                    "resident sandbox generation is not catalogued",
+                )
+            })?;
+        if entry.physical != ResidentSandboxPhysicalState::Unmaterialized
+            || entry.active_operation != ResidentSandboxActiveOperation::None
+            || entry.last_operation_generation.is_some()
+        {
+            return Err(error(
+                ResidentSandboxCatalogErrorKind::Conflict,
+                "resident sandbox test fixture is already lifecycle-bound",
+            ));
+        }
+        entry.revision = ResidentSandboxRecordRevision::new(
+            entry.revision.get().checked_add(1).ok_or_else(|| {
+                error(
+                    ResidentSandboxCatalogErrorKind::Conflict,
+                    "resident record revision cannot advance",
+                )
+            })?,
+        )?;
+        let host = ResidentSandboxHostBinding::new(
+            Sha256Digest::parse(&format!("sha256:{}", "e".repeat(64)))
+                .expect("fixed test host digest"),
+            entry.config_digest.clone(),
+        )?;
+        entry.physical = if running {
+            ResidentSandboxPhysicalState::RunningBound { host }
+        } else {
+            ResidentSandboxPhysicalState::StoppedBound { host }
+        };
+        next.revision = ResidentSandboxCatalogRevision::new(
+            next.revision.get().checked_add(1).ok_or_else(|| {
+                error(
+                    ResidentSandboxCatalogErrorKind::Conflict,
+                    "resident catalog revision cannot advance",
+                )
+            })?,
+        )?;
+        next.validate()?;
+        encode_resident_sandbox_catalog(&next)?;
+        Ok(next)
+    }
+
     /// Validate a canonical one-step catalog successor.  This is suitable for a later atomic
     /// persistence boundary but performs no persistence itself.
     pub fn validate_successor_of(&self, current: &Self) -> Result<(), ResidentSandboxCatalogError> {
