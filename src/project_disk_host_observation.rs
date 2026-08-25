@@ -27,12 +27,18 @@ use serde::Serialize;
 
 use crate::artifact::Sha256Digest;
 
-pub(crate) use raw::ProjectDiskCreateDurabilityTarget;
 pub use raw::{
     LimaStandaloneDiskAbsenceObservation, LimaStandaloneDiskAbsenceSummary,
     LimaStandaloneDiskDisposition, LimaStandaloneDiskName,
     PROJECT_DISK_HOST_OBSERVATION_SCHEMA_VERSION, ProjectDiskHostObservationError,
     ProjectDiskHostObservationErrorKind, ProjectDiskPhysicalIdentity,
+};
+pub(crate) use raw::{
+    LimaStandaloneDiskObservation as HeldLimaStandaloneDiskObservation,
+    PROJECT_DISK_CREATE_DURABILITY_POLICY_UNAVAILABLE_CODE,
+    PROJECT_DISK_CREATE_DURABILITY_SUBMISSION_SEQUENCE, ProjectDiskCreateDurabilitySubmission,
+    ProjectDiskCreateDurabilitySubmitter, ProjectDiskCreateDurabilityTarget,
+    genuine_project_disk_create_durability_submitter,
 };
 pub use source::{
     ConfiguredProjectDiskLimaSource, LimaStandaloneDiskFixtureObservationRequest,

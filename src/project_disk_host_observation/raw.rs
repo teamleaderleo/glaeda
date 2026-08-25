@@ -866,11 +866,12 @@ impl LimaStandaloneDiskObservation {
     /// must be present as well. An ordinary later observation of an existing disk — even from a
     /// planned request naming the same locator — can never mint this target, so a post-restart or
     /// same-name rediscovery stays unbound physical evidence. Minting revalidates every held
-    /// descriptor, path binding, and the supplied fresh inventory first, then binds a duplicated
-    /// read-only held backing descriptor to the exact configured source identity, disk locator,
-    /// physical identity, backing identity, and logical bytes. Explicit fixture requests are
-    /// permanently ineligible. This performs no durability mutation itself and exposes no generic
-    /// path/fd/write/sync authority; #700 owns the single reviewed barrier operation.
+    /// descriptor, path binding, and the supplied fresh inventory first, then binds duplicated
+    /// read-only held descriptors for the exact accepted chain (backing file, disk directory,
+    /// standalone-disk collection, LIMA_HOME source) to the exact configured source identity, disk
+    /// locator, physical identity, backing identity, and logical bytes. Explicit fixture requests
+    /// are permanently ineligible. This performs no durability mutation itself and exposes no
+    /// generic path/fd/write/sync authority; #700 owns the single reviewed barrier operation.
     ///
     /// # Errors
     ///
@@ -892,6 +893,9 @@ impl LimaStandaloneDiskObservation {
         if snapshot_file(&backing).map_err(|_| changed())? != self.backing.snapshot {
             return Err(changed());
         }
+        let disk_directory = self.disk_directory.fd.try_clone().map_err(|_| io_error())?;
+        let collection = self.collection.fd.try_clone().map_err(|_| io_error())?;
+        let lima_home = self.lima_home.fd.try_clone().map_err(|_| io_error())?;
         Ok(ProjectDiskCreateDurabilityTarget {
             source_identity,
             disk_name: self.request.disk_name.clone(),
@@ -899,6 +903,9 @@ impl LimaStandaloneDiskObservation {
             backing_identity: self.summary.backing_identity.clone(),
             backing_logical_bytes: self.summary.backing_logical_bytes,
             backing,
+            disk_directory,
+            collection,
+            lima_home,
         })
     }
 }
@@ -908,11 +915,13 @@ impl LimaStandaloneDiskObservation {
 /// Non-cloneable, non-copyable, and non-serializable. It is mintable only from an uninterrupted
 /// held-absence -> created-child observation (`observe_created` success) whose full held
 /// revalidation passed, and it binds the exact configured source identity, disk locator, physical
-/// identity, backing identity, logical bytes, and one duplicated read-only held backing
-/// descriptor. An ordinary later observation of an existing disk — even from a planned request
-/// with the same name — can never mint it. It carries zero ownership, adoption, or mutation
-/// authority and no generic path/fd/write/sync surface outside the narrow #700 barrier. No
-/// attempt identity is carried here; cross-attempt fencing belongs to #700's non-cloneable proof.
+/// identity, backing identity, logical bytes, and one duplicated read-only descriptor for each
+/// exact member of the accepted chain: backing file, disk directory, standalone-disk collection,
+/// and LIMA_HOME source. An ordinary later observation of an existing disk — even from a planned
+/// request with the same name — can never mint it. It carries zero ownership, adoption, or
+/// mutation authority and no generic path/fd/write/sync surface outside the narrow #700 barrier.
+/// No attempt identity is carried here; cross-attempt fencing belongs to #700's non-cloneable
+/// proof.
 pub struct ProjectDiskCreateDurabilityTarget {
     source_identity: ProjectDiskLimaSourceIdentity,
     disk_name: LimaStandaloneDiskName,
@@ -920,6 +929,9 @@ pub struct ProjectDiskCreateDurabilityTarget {
     backing_identity: ProjectDiskBackingIdentity,
     backing_logical_bytes: u64,
     backing: OwnedFd,
+    disk_directory: OwnedFd,
+    collection: OwnedFd,
+    lima_home: OwnedFd,
 }
 
 impl ProjectDiskCreateDurabilityTarget {
@@ -951,10 +963,10 @@ impl ProjectDiskCreateDurabilityTarget {
     /// Test-only borrowed view of the exact held backing descriptor.
     ///
     /// This is deliberately unavailable to production crate callers: #700 must not receive a
-    /// reusable generic fd capability. The reviewed #700 barrier has to consume the target behind
-    /// a module-owned operation or closure defined in this module instead, and it must align the
-    /// descriptor kind it requires (the #700 `fsync_volume_np` design names the held
-    /// source/filesystem fd; this seam currently holds the backing fd of the same flush volume).
+    /// reusable generic fd capability. The reviewed #700 barrier consumes the target only through
+    /// the module-owned [`GenuineProjectDiskDurabilitySubmitter`] and the crate-private submitter
+    /// trait defined beside it; test spies substitute for that submitter without ever observing a
+    /// descriptor.
     #[cfg(test)]
     fn held_backing_descriptor(&self) -> BorrowedFd<'_> {
         self.backing.as_fd()
@@ -970,8 +982,152 @@ impl fmt::Debug for ProjectDiskCreateDurabilityTarget {
             .field("physical_identity", &self.physical_identity)
             .field("backing_identity", &self.backing_identity)
             .field("backing_logical_bytes", &self.backing_logical_bytes)
-            .field("private_backing_descriptor", &"<redacted>")
+            .field("private_held_chain_descriptors", &"<redacted>")
             .finish()
+    }
+}
+
+/// One fixed submission in the reviewed #700 create-durability sequence.
+///
+/// The variants are named for the exact held chain member and the persistence class submitted,
+/// never for caller-selectable flags or paths. The reviewed macOS v1 order is exactly
+/// [`PROJECT_DISK_CREATE_DURABILITY_SUBMISSION_SEQUENCE`]: leaf data first, then each namespace
+/// ancestor, then exactly one final hardware-cache full sync on the exact backing file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectDiskCreateDurabilitySubmission {
+    /// `fsync(exact backing)` — submits the created backing file data/size metadata.
+    BackingData,
+    /// `fsync(exact disk directory)` — submits the backing directory entry.
+    DiskDirectoryEntry,
+    /// `fsync(exact collection)` — submits the new disk-directory entry, including first-disk
+    /// `_disks` creation.
+    CollectionEntry,
+    /// `fsync(exact LIMA_HOME)` — submits the collection entry at the source root.
+    LimaHomeEntry,
+    /// Apple `fcntl(F_FULLFSYNC)` on the exact backing file — the single final hardware-cache
+    /// barrier after every earlier submission completed.
+    BackingHardwareCacheBarrier,
+}
+
+/// The fixed reviewed leaf->root submission order for one created-disk durability barrier.
+pub const PROJECT_DISK_CREATE_DURABILITY_SUBMISSION_SEQUENCE:
+    [ProjectDiskCreateDurabilitySubmission; 5] = [
+    ProjectDiskCreateDurabilitySubmission::BackingData,
+    ProjectDiskCreateDurabilitySubmission::DiskDirectoryEntry,
+    ProjectDiskCreateDurabilitySubmission::CollectionEntry,
+    ProjectDiskCreateDurabilitySubmission::LimaHomeEntry,
+    ProjectDiskCreateDurabilitySubmission::BackingHardwareCacheBarrier,
+];
+
+impl ProjectDiskCreateDurabilitySubmission {
+    /// Bounded public classifier name; never a raw errno or syscall detail.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::BackingData => "create_durability_submission_backing_data",
+            Self::DiskDirectoryEntry => "create_durability_submission_disk_directory_entry",
+            Self::CollectionEntry => "create_durability_submission_collection_entry",
+            Self::LimaHomeEntry => "create_durability_submission_lima_home_entry",
+            Self::BackingHardwareCacheBarrier => {
+                "create_durability_submission_backing_hardware_cache_barrier"
+            }
+        }
+    }
+}
+
+/// Executor of exactly one fixed durability submission against the exact held chain.
+///
+/// Implementations are restricted to this module's genuine submitter (macOS) and test-only spies;
+/// product callers can neither implement nor construct one around arbitrary descriptors. The
+/// executor chooses no descriptor, path, flag, order, or strength: it receives only the abstract
+/// fixed submission and maps it to the exact held member internally.
+pub trait ProjectDiskCreateDurabilitySubmitter {
+    /// Submit one step of the fixed sequence. Any failure must be reported exactly once and stop
+    /// the walk; no implementation may retry or weaken a submission.
+    ///
+    /// # Errors
+    ///
+    /// Returns the bounded P2 refusal class for the failed submission; raw errno values stay
+    /// private.
+    fn submit(
+        &mut self,
+        submission: ProjectDiskCreateDurabilitySubmission,
+    ) -> Result<(), ProjectDiskHostObservationError>;
+}
+
+/// The single genuine #700 submitter: duplicates the target's exact held chain once at
+/// construction and binds each fixed submission to its duplicated member through safe rustix.
+///
+/// macOS v1 policy only. Every other platform refuses genuine construction with a bounded
+/// policy-unavailable error; no synthetic submitter exists outside tests. This type exposes no
+/// constructor, accessor, or trait method that accepts a caller-chosen descriptor, path, flag,
+/// order, or strength.
+#[cfg(target_os = "macos")]
+pub struct GenuineProjectDiskDurabilitySubmitter {
+    backing: OwnedFd,
+    disk_directory: OwnedFd,
+    collection: OwnedFd,
+    lima_home: OwnedFd,
+}
+
+#[cfg(target_os = "macos")]
+impl GenuineProjectDiskDurabilitySubmitter {
+    fn duplicate(
+        target: &ProjectDiskCreateDurabilityTarget,
+    ) -> Result<Self, ProjectDiskHostObservationError> {
+        Ok(Self {
+            backing: target.backing.try_clone().map_err(|_| io_error())?,
+            disk_directory: target.disk_directory.try_clone().map_err(|_| io_error())?,
+            collection: target.collection.try_clone().map_err(|_| io_error())?,
+            lima_home: target.lima_home.try_clone().map_err(|_| io_error())?,
+        })
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl ProjectDiskCreateDurabilitySubmitter for GenuineProjectDiskDurabilitySubmitter {
+    fn submit(
+        &mut self,
+        submission: ProjectDiskCreateDurabilitySubmission,
+    ) -> Result<(), ProjectDiskHostObservationError> {
+        let outcome = match submission {
+            ProjectDiskCreateDurabilitySubmission::BackingData => rustix_fs::fsync(&self.backing),
+            ProjectDiskCreateDurabilitySubmission::DiskDirectoryEntry => {
+                rustix_fs::fsync(&self.disk_directory)
+            }
+            ProjectDiskCreateDurabilitySubmission::CollectionEntry => {
+                rustix_fs::fsync(&self.collection)
+            }
+            ProjectDiskCreateDurabilitySubmission::LimaHomeEntry => {
+                rustix_fs::fsync(&self.lima_home)
+            }
+            ProjectDiskCreateDurabilitySubmission::BackingHardwareCacheBarrier => {
+                rustix_fs::fcntl_fullfsync(&self.backing)
+            }
+        };
+        outcome.map_err(|_| io_error())
+    }
+}
+
+/// Construct the genuine #700 submitter for one minted target.
+///
+/// On non-macOS hosts the reviewed v1 policy is genuinely unavailable: this returns the bounded
+/// `project_disk_create_durability_policy_unavailable_on_host` refusal and performs nothing. There
+/// is no weaker fallback and no synthetic production path.
+pub fn genuine_project_disk_create_durability_submitter(
+    target: &ProjectDiskCreateDurabilityTarget,
+) -> Result<Box<dyn ProjectDiskCreateDurabilitySubmitter>, ProjectDiskHostObservationError> {
+    #[cfg(target_os = "macos")]
+    {
+        Ok(Box::new(GenuineProjectDiskDurabilitySubmitter::duplicate(
+            target,
+        )?))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = target;
+        Err(policy_unavailable_on_host())
     }
 }
 
@@ -2236,6 +2392,18 @@ const fn durability_target_unavailable() -> ProjectDiskHostObservationError {
         ProjectDiskHostObservationErrorKind::InvalidInput,
         "project_disk_create_durability_target_unavailable",
         "create durability target requires an uninterrupted planned create observation",
+    )
+}
+
+/// Bounded code reported when the reviewed create-durability policy is unavailable on this host.
+pub const PROJECT_DISK_CREATE_DURABILITY_POLICY_UNAVAILABLE_CODE: &str =
+    "project_disk_create_durability_policy_unavailable_on_host";
+
+const fn policy_unavailable_on_host() -> ProjectDiskHostObservationError {
+    error(
+        ProjectDiskHostObservationErrorKind::UnsupportedSchema,
+        PROJECT_DISK_CREATE_DURABILITY_POLICY_UNAVAILABLE_CODE,
+        "the reviewed project disk create durability policy is unavailable on this host",
     )
 }
 
