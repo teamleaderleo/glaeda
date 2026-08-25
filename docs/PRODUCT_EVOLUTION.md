@@ -1,12 +1,12 @@
 # Product evolution and scope discipline
 
-SmolRunner began with a small practical irritation: use the operator's own Mac for expensive build and test work instead of waiting on hosted GitHub Actions runners.
+Glaeda began with a small practical irritation: use the operator's own Mac for expensive build and test work instead of waiting on hosted GitHub Actions runners.
 
 The project has grown far beyond a shell wrapper around Lima. That growth is deliberate. Each major expansion answers a problem exposed by making the previous capability dependable enough to use.
 
 The product center is now sharper:
 
-> **SmolRunner should be blazingly hot. Disposable is a capability. Trust decides residency.**
+> **Glaeda should be blazingly hot. Disposable is a capability. Trust decides residency.**
 
 The optimization target is agent wall-clock latency: work becomes known, a useful execution environment is already available or materializes quickly, reusable state is ready, and the first useful command starts with as little repeated work as possible.
 
@@ -29,7 +29,7 @@ This sequence is the rationale behind the roadmap. The early milestones establis
 
 ## Trust-tiered residency
 
-SmolRunner has three useful execution classes.
+Glaeda has three useful execution classes.
 
 ### Hostile / unknown
 
@@ -71,7 +71,7 @@ A resident sandbox is working state. Canonical source identity, durable executio
 
 The core correctness property is **destroyability**.
 
-SmolRunner should be able to discard a VM, workspace, project sandbox, cache, index, prepared materialization, or compiler tree and still know what happened, what remains owned, and how to reconstruct the next safe action.
+Glaeda should be able to discard a VM, workspace, project sandbox, cache, index, prepared materialization, or compiler tree and still know what happened, what remains owned, and how to reconstruct the next safe action.
 
 That property makes persistence powerful. Valuable trusted state can stay resident for hours or days because losing it costs latency and compute instead of execution truth.
 
@@ -93,7 +93,7 @@ A proposed addition belongs on the main product path when it satisfies most of t
 - it reduces measured queue/edit-to-useful-result latency;
 - it preserves or improves fleet throughput under concurrent agent work;
 - it makes exact reusable work available earlier through residency, precomputation, caching, or overlapping preparation;
-- it reuses mature components and keeps SmolRunner focused on admission, identity, policy, recovery, hot-state lifecycle, and Mac-specific coordination;
+- it reuses mature components and keeps Glaeda focused on admission, identity, policy, recovery, hot-state lifecycle, and Mac-specific coordination;
 - it can be expressed as a bounded capability with explicit evidence and acceptance criteria.
 
 Adjacent ideas remain useful when they can succeed independently of the current execution loop or introduce broad product surface before measurements justify it.
@@ -111,7 +111,7 @@ For a representative trusted workload, prefer optimizations in this order unless
 7. optimize hot kernels and storage behavior;
 8. add more hardware or paid burst capacity.
 
-This keeps SmolRunner focused on deleting latency before buying around it.
+This keeps Glaeda focused on deleting latency before buying around it.
 
 ## The product center
 
@@ -119,4 +119,4 @@ The project should keep returning to the same promise:
 
 > **Agent work should arrive to a Linux execution environment that feels ready before the task asks for it. Hostile work gets fresh disposable isolation. Trusted work gets aggressive residency, incremental state, and reuse. Durable execution truth survives either choice.**
 
-The Mac is the control plane and owned compute source. Linux is the execution environment. GitHub remains the ordinary workflow surface. SmolRunner makes the path between them hot, recoverable, inspectable, and increasingly anticipatory.
+The Mac is the control plane and owned compute source. Linux is the execution environment. GitHub remains the ordinary workflow surface. Glaeda makes the path between them hot, recoverable, inspectable, and increasingly anticipatory.
