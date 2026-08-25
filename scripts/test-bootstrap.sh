@@ -13,7 +13,7 @@ chmod +x "$fixture/scripts/bootstrap"
 
 cat > "$fixture/Cargo.toml" <<'TOML'
 [package]
-name = "smolrunner"
+name = "glaeda"
 version = "0.1.0"
 edition = "2024"
 TOML
