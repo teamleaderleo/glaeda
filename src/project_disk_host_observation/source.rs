@@ -63,18 +63,20 @@ impl fmt::Display for ProjectDiskLimaSourceIdentityParseError {
 
 impl std::error::Error for ProjectDiskLimaSourceIdentityParseError {}
 
-/// Validated configured Lima namespace shared by P2 request construction and later P3 adapters.
+/// Canonical configured Lima namespace used to derive P2 planned requests.
 ///
-/// The path stays private. On macOS the one physically established `/var -> /private/var` root
-/// alias is canonicalized here after checking that exact root-owned symlink. Other path aliases are
-/// left to the descriptor-bound P2 observer to reject when fresh physical evidence is acquired.
-pub struct ValidatedProjectDiskLimaSource {
+/// This value deliberately carries no live physical-source authority. It validates only the
+/// configured pathname spelling and the one physically established macOS `/var -> /private/var`
+/// compatibility alias. The P2 observer opens and binds the source/collection descriptors when an
+/// observation is actually made; #699 owns stronger durable physical source identity across
+/// restart/replacement.
+pub struct ConfiguredProjectDiskLimaSource {
     canonical_lima_home: PathBuf,
     identity: ProjectDiskLimaSourceIdentity,
 }
 
-impl ValidatedProjectDiskLimaSource {
-    /// Validate one configured private Lima home and derive its stable namespace identity.
+impl ConfiguredProjectDiskLimaSource {
+    /// Canonicalize one configured private Lima home and derive its namespace identity.
     ///
     /// # Errors
     ///
@@ -100,10 +102,10 @@ impl ValidatedProjectDiskLimaSource {
     }
 }
 
-impl fmt::Debug for ValidatedProjectDiskLimaSource {
+impl fmt::Debug for ConfiguredProjectDiskLimaSource {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("ValidatedProjectDiskLimaSource")
+            .debug_struct("ConfiguredProjectDiskLimaSource")
             .field("identity", &self.identity)
             .field("private_lima_home", &"<redacted>")
             .finish()
@@ -131,8 +133,9 @@ impl fmt::Display for ProjectDiskLimaSourceError {
 
 impl std::error::Error for ProjectDiskLimaSourceError {}
 
-/// Production P2 request derived only from one validated Lima source and controller-selected disk
-/// locator. Product callers cannot supply the `_disks/<locator>` directory independently.
+/// Production P2 request derived only from one configured Lima source and controller-selected disk
+/// locator. Product callers cannot supply the `_disks/<locator>` directory independently. The
+/// resulting observation still performs fresh physical source/collection validation.
 pub struct LimaStandaloneDiskObservationRequest {
     inner: RawObservationRequest,
     source_identity: ProjectDiskLimaSourceIdentity,
@@ -147,7 +150,7 @@ impl LimaStandaloneDiskObservationRequest {
     /// Returns the existing bounded P2 refusal if the derived request cannot satisfy the raw
     /// descriptor engine's exact path contract.
     pub fn for_planned_disk(
-        source: &ValidatedProjectDiskLimaSource,
+        source: &ConfiguredProjectDiskLimaSource,
         disk_name: LimaStandaloneDiskName,
     ) -> Result<Self, ProjectDiskHostObservationError> {
         let disk_directory = source
@@ -318,7 +321,7 @@ mod tests {
 
     #[test]
     fn planned_request_derives_reviewed_collection_and_hides_paths() {
-        let source = ValidatedProjectDiskLimaSource::new("/tmp/smolrunner-p2-source").unwrap();
+        let source = ConfiguredProjectDiskLimaSource::new("/tmp/smolrunner-p2-source").unwrap();
         let disk_name = LimaStandaloneDiskName::parse("srpd1-test").unwrap();
         let request =
             LimaStandaloneDiskObservationRequest::for_planned_disk(&source, disk_name).unwrap();
@@ -332,8 +335,8 @@ mod tests {
 
     #[test]
     fn source_identity_is_path_private_and_distinguishes_namespaces() {
-        let first = ValidatedProjectDiskLimaSource::new("/tmp/smolrunner-source-a").unwrap();
-        let second = ValidatedProjectDiskLimaSource::new("/tmp/smolrunner-source-b").unwrap();
+        let first = ConfiguredProjectDiskLimaSource::new("/tmp/smolrunner-source-a").unwrap();
+        let second = ConfiguredProjectDiskLimaSource::new("/tmp/smolrunner-source-b").unwrap();
 
         assert_ne!(first.identity(), second.identity());
         assert!(ProjectDiskLimaSourceIdentity::parse(first.identity().digest().as_str()).is_ok());
@@ -344,16 +347,16 @@ mod tests {
 
     #[test]
     fn source_identity_normalizes_equivalent_path_spellings() {
-        let canonical = ValidatedProjectDiskLimaSource::new("/tmp/smolrunner-source-a").unwrap();
+        let canonical = ConfiguredProjectDiskLimaSource::new("/tmp/smolrunner-source-a").unwrap();
         let normalized =
-            ValidatedProjectDiskLimaSource::new("/tmp//smolrunner-source-a/./").unwrap();
+            ConfiguredProjectDiskLimaSource::new("/tmp//smolrunner-source-a/./").unwrap();
         assert_eq!(canonical.identity(), normalized.identity());
     }
 
     #[test]
     fn source_rejects_relative_parent_and_root_paths() {
         for invalid in ["relative", "/tmp/../escape", "/"] {
-            assert!(ValidatedProjectDiskLimaSource::new(invalid).is_err());
+            assert!(ConfiguredProjectDiskLimaSource::new(invalid).is_err());
         }
     }
 }
