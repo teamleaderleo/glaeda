@@ -2,7 +2,7 @@
 
 Glaeda preserves the exact **SmolRunner execution receipt v1** identity for the existing content-minimised JSON contract for one durable execution. It lets a coordinator, evidence index, or operator record what Glaeda attempted and whether the work completed, failed, or stopped for fresh observation without receiving host mutation authority or private execution detail.
 
-The v1 producer and receipt identity remain legacy SmolRunner evidence during the rename; successor receipt identities require a separately reviewed versioned migration.
+The v1 producer, schema, and receipt identity remain legacy SmolRunner evidence during the rename; successor receipt identities require a separately reviewed versioned migration.
 
 The implementation lives in `src/execution_receipt.rs`.
 
