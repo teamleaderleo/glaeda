@@ -1,57 +1,53 @@
 # Project-disk physical observation receipt
 
-Status: read-only acceptance prerequisite for #565 P2
+Status: accepted read-only diagnostic/evidence tool for the #565 project-disk programme
 Receipt schema: `smolrunner-project-disk-physical-observation` v1
 
 ## Purpose
 
-This runbook captures the physical evidence needed before #565 P2 can mint project-disk ownership
-proof. The target claim is:
+This runbook captures bounded physical evidence from the operator Mac and one Linux guest without granting SmolRunner ownership or mutation authority.
 
-> This exact Linux filesystem device belongs to this exact SmolRunner project-disk generation
-> attached to this exact resident sandbox generation.
+The collector was used by #634 to establish the Lima 2.2.0 detached/attached physical schema. Current consumers include:
 
-The first slice grants zero attach, detach, stale-lock unlock, format, resize, delete, cleanup,
-OverlayFS mount, or SmolRunner ownership authority. It records observations for review.
+- #699, which evaluates durable host-object identity and same-path replacement discrimination;
+- #706/#628, which need independent physical evidence for the P4 and full-correlation acceptance lanes;
+- #639/#691 and their successors, which may compare the observed Lima layout with the production P2 observer.
 
-The repository carries no baked-in standalone-disk backing filename, `_disks/<name>` derivation,
-lock filename, lock meaning, or disk-inventory JSON command. The operator supplies the exact disk
-directory and pre-captured JSON from the installed Lima version.
+The receipt is research/acceptance evidence. Runtime ownership, current capabilities, and mutation authority come only from their owning durable state plus fresh live observation.
+
+## Authority boundary
+
+The collector performs no Lima mutation and grants no authority to:
+
+- create, attach, detach, unlock, format, resize, delete, repair, or clean up a disk;
+- start or stop a resident sandbox;
+- mount a project filesystem or OverlayFS task view;
+- bind a physical object to a SmolRunner project-disk generation;
+- construct a `TrustedProjectFilesystemCorrelationProof` or another runtime capability.
+
+Disk names, paths, entry names, symlink targets, inventory fields, device numbers, and this receipt are observations only.
 
 ## Existing discipline reused
 
-`tests/project_disk_physical_receipt_host_identity.rs` calls the existing
-`LimaHostIdentityAdapter`. That adapter already supplies the VZ/aarch64 restriction,
-descriptor-relative private Lima-home traversal, no-follow opens, held-entry rebinding checks, and
-bounded VZ identifier/root-disk identity. The physical harness emits only an opaque host identity
-digest plus the request digest.
+`tests/project_disk_physical_receipt_host_identity.rs` calls the existing `LimaHostIdentityAdapter`. That path provides the reviewed VZ/aarch64 restriction, descriptor-relative private Lima-home traversal, no-follow opens, held-entry rebinding checks, and bounded host identity output.
 
-The resident-instance observation reuses the fixed command form already present in
-`LimaObservationAdapter`:
-
-```text
-limactl --tty=false list --format=json --all-fields INSTANCE
-```
-
-Disk names and Lima lock observations remain correlation inputs. SmolRunner ownership comes from the
-later #565 P2 binding to durable project-disk and resident-sandbox generations.
+The collector itself deliberately carries no baked-in standalone-disk backing filename, lock filename, lock meaning, `_disks/<name>` derivation, or Lima disk-list command. The operator supplies the exact observed disk directory and pre-captured Lima JSON.
 
 ## Private evidence boundary
 
-Keep the complete physical receipt private. It contains the exact standalone-disk directory, direct
-entry names, symlink targets, exact guest project mountpoint, and selected Lima JSON.
+Keep the complete receipt private. It can contain:
 
-The collector reads no project filesystem contents or project filesystem superblock. First-pass host
-inspection reads metadata for every direct standalone-disk-directory entry and symlink targets.
-Regular-file bytes are read only when an exact direct entry is supplied with `--read-small-entry`,
-with a 4096-byte limit. This second-pass option exists for a small Lima metadata entry after the
-physical first pass reveals its exact representation. Never supply the backing entry to
-`--read-small-entry`.
+- exact `LIMA_HOME`, disk-directory and mountpoint paths;
+- direct entry names and symlink targets;
+- raw selected Lima JSON;
+- host device/inode and timestamp metadata;
+- guest mountinfo/device evidence.
+
+The collector does not read project filesystem contents or a project filesystem superblock. Direct-entry inspection is metadata-only by default. A regular file is read only when the operator explicitly supplies `--read-small-entry`; the file must be at most 4096 bytes. Never use that option for the backing entry.
 
 ## Preconditions
 
-Use a clean checkout at the exact commit under review. Select these values from current accepted
-state and direct physical observation:
+Use a clean checkout at the exact candidate under review and select values from current accepted state plus direct physical observation:
 
 ```bash
 export LIMA_HOME='... exact private Lima home ...'
@@ -61,18 +57,17 @@ export PROJECT_MOUNT='... exact project filesystem mountpoint in the guest ...'
 export DISK_DIRECTORY='... exact absolute standalone-disk directory observed on this Mac ...'
 
 export PROJECT_IDENTITY='... exact canonical project identity ...'
-export PROJECT_DISK_ID='... exact P1 project-disk ID ...'
-export PROJECT_DISK_GENERATION='... exact P1 disk generation ...'
+export PROJECT_DISK_ID='... exact project-disk ID ...'
+export PROJECT_DISK_GENERATION='... exact disk generation ...'
 export PROJECT_DISK_REVISION='... exact P1 lease revision ...'
 export ATTACHMENT_GENERATION='... exact P1 attachment generation ...'
-export RESIDENT_SANDBOX_ID='... exact P1 resident-sandbox ID ...'
-export RESIDENT_SANDBOX_GENERATION='... exact P1 resident-sandbox generation ...'
+export RESIDENT_SANDBOX_ID='... exact resident-sandbox ID ...'
+export RESIDENT_SANDBOX_GENERATION='... exact resident-sandbox generation ...'
 ```
 
-The P1 values above are declared correlation labels. The receipt explicitly records physical
-ownership as unresolved until #565 P2 validates the accepted physical schema.
+The logical IDs above are correlation labels in this receipt. Their presence does not prove that the observed physical disk belongs to them.
 
-Create a private scratch location:
+Create a private scratch directory:
 
 ```bash
 umask 077
@@ -83,7 +78,7 @@ git rev-parse HEAD > "$PRIVATE_RECEIPT_DIR/smolrunner-commit.txt"
 "$LIMACTL" --version > "$PRIVATE_RECEIPT_DIR/lima-version.txt"
 ```
 
-## 1. Capture installed Lima disk JSON without encoding a CLI guess
+## 1. Capture installed Lima disk JSON
 
 Record the installed command surface first:
 
@@ -92,20 +87,17 @@ Record the installed command surface first:
 "$LIMACTL" disk --help > "$PRIVATE_RECEIPT_DIR/limactl-disk-help.txt"
 ```
 
-Use those exact help files to choose the installed version's read-only JSON disk-inventory command.
-Run that command manually and save the selected disk evidence as:
+Use those exact help files to choose the installed version's read-only JSON disk-inventory command. Save the selected result as:
 
 ```text
 $PRIVATE_RECEIPT_DIR/lima-disk.json
 ```
 
-Preserve the exact command in a private adjacent note. The repository parser intentionally accepts
-JSON evidence as an opaque object/array and carries no disk-list flag or field-name assumption.
+Keep the exact command in a private adjacent note. The repository collector accepts the JSON as opaque evidence and does not encode a disk-list flag or field-name guess.
 
-Use the same direct observation to determine `DISK_DIRECTORY`. Supply the exact absolute directory
-you observed. The collector never derives it from a disk name.
+Use the same direct inspection to select `DISK_DIRECTORY`. The collector never derives the directory from a disk name.
 
-## 2. Capture the exact resident-instance JSON
+## 2. Capture the resident instance
 
 ```bash
 HOME=/var/empty \
@@ -117,9 +109,7 @@ PATH=/usr/bin:/bin:/usr/sbin:/sbin \
   > "$PRIVATE_RECEIPT_DIR/resident-instance.json"
 ```
 
-## 3. Capture the exact guest filesystem-device evidence
-
-Use the GNU `stat` form already used by the repository's Lima observation code:
+## 3. Capture guest filesystem-device evidence
 
 ```bash
 HOME=/var/empty \
@@ -130,11 +120,7 @@ PATH=/usr/bin:/bin:/usr/sbin:/sbin \
 "$LIMACTL" --tty=false shell "$INSTANCE" -- \
   /usr/bin/stat -Lc '%d:%i' -- "$PROJECT_MOUNT" \
   > "$PRIVATE_RECEIPT_DIR/guest-project-stat.txt"
-```
 
-Capture the kernel mount table independently:
-
-```bash
 HOME=/var/empty \
 LIMA_HOME="$LIMA_HOME" \
 LANG=C \
@@ -145,11 +131,9 @@ PATH=/usr/bin:/bin:/usr/sbin:/sbin \
   > "$PRIVATE_RECEIPT_DIR/guest-mountinfo.txt"
 ```
 
-The parser requires exactly one decoded mountinfo row for `PROJECT_MOUNT` and records mount ID,
-parent ID, kernel major/minor device, filesystem type, source, and options. These values remain
-observation tokens.
+The parser requires exactly one decoded mountinfo row for `PROJECT_MOUNT`. The Linux `%d` device is decoded to major/minor and must equal the selected mountinfo row's major/minor.
 
-## 4. Capture the descriptor-bound Lima host identity
+## 4. Capture descriptor-bound Lima host identity
 
 ```bash
 SMOLRUNNER_TEST_LIMA_HOME="$LIMA_HOME" \
@@ -163,13 +147,11 @@ cargo test --locked --test project_disk_physical_receipt_host_identity \
 test "$(wc -l < "$PRIVATE_RECEIPT_DIR/lima-host-identity.json" | tr -d ' ')" = 1
 ```
 
-This step performs the repository's existing descriptor-bound host identity observation. The emitted
-JSON contains schema/type, exact resident instance locator, opaque host identity digest, and opaque
-observation-request digest.
+The emitted JSON contains bounded identity fields only. It is still observation evidence, not resident or project-disk authority.
 
-## 5. First-pass standalone-disk directory capture
+## 5. Capture the standalone-disk directory
 
-Choose a fresh output path; the collector creates it mode `0600` and refuses overwrite.
+Choose a fresh output path. The collector creates it mode `0600` and refuses overwrite.
 
 ```bash
 python3 scripts/project_disk_physical_receipt.py capture \
@@ -195,83 +177,57 @@ python3 scripts/project_disk_physical_receipt.py validate \
   > /dev/null
 ```
 
-The first pass records every direct entry as opaque evidence:
+The first pass records every bounded direct entry as opaque evidence, including file kind, exact name bytes, device/inode, owner/mode/link count, logical and allocated bytes, timestamps, and platform birthtime/generation fields when available. Symlink targets are retained exactly.
 
-- exact entry-name bytes and UTF-8 view when available;
-- exact file kind;
-- device/inode, owner, mode, link count, logical bytes, allocated bytes (`st_blocks * 512`),
-  mtime/ctime, plus platform birthtime/generation fields when exposed;
-- exact symlink target bytes;
-- zero inferred backing or lock role.
+The directory is opened component-by-component with no-follow semantics. The collector holds and rechecks the directory and direct entries before publication. On macOS, `/var/...` is accepted only after proving the root-owned `/var -> /private/var` compatibility alias; other intermediate symlinks are refused.
 
-The collector holds the directory descriptor while entries are inspected, rechecks every direct
-entry after inspection, then reopens and rebinds the exact directory before publication. A changed
-or same-name-replaced entry/directory refuses the receipt.
+## 6. Optional bounded metadata read
 
-## 6. Capture a small regular lock representation when the first pass requires it
-
-A symlink candidate already includes its exact target. When the physical first pass instead shows a
-small regular metadata entry whose bytes are required to understand the observed lock, rerun with:
+If the first pass shows a small regular metadata entry whose bytes are needed to understand the observed layout, rerun with:
 
 ```text
 --read-small-entry EXACT_OBSERVED_METADATA_ENTRY
 ```
 
-The entry must be a captured direct regular file no larger than 4096 bytes. The collector holds the
-file descriptor and verifies exact metadata before and after the bounded read.
+The file must be a captured direct regular entry no larger than 4096 bytes. The held file descriptor is checked before and after the read.
 
-## 7. Add explicit physical role labels after inspection
+## 7. Add explicit observed roles
 
-After the first pass establishes the installed layout, rerun with both exact direct names selected
-from that receipt:
+After the first pass establishes the installed layout, rerun with exact direct names selected from that receipt:
 
 ```text
 --observed-backing-entry EXACT_OBSERVED_BACKING_ENTRY
 --observed-lock-entry EXACT_OBSERVED_LOCK_ENTRY
 ```
 
-These labels carry `source: explicit_operator_observation`. The parser requires both names to exist
-in the captured direct-entry set and requires distinct entries. It applies zero filename, file-kind,
-or lock-semantics convention.
+These are operator observation labels only. The collector applies no filename convention and does not turn the labels into ownership.
 
-## Evidence required before #565 P2 implementation
+## Evidence this collector can supply
 
-One reviewed physical receipt must establish this coherent observation set:
+A reviewed receipt can establish:
 
-1. exact descriptor-bound resident VZ host identity and request identity;
-2. exact standalone-disk directory and complete bounded direct-entry set;
-3. exact observed backing entry with logical and allocated bytes;
-4. exact observed lock entry, kind, and target/content representation;
-5. exact installed Lima disk JSON showing the selected disk/attachment observation;
-6. exact resident-instance JSON for the selected resident sandbox;
-7. exact guest project mountpoint `stat` device token plus mountinfo major/minor/filesystem row;
-8. exact P1 project-disk generation/revision and attachment/resident-sandbox generations carried as
-   declared correlation labels;
-9. same-name replacement detection through entry/directory descriptor identity changes.
+1. exact descriptor-bound resident VZ host observation identity;
+2. exact standalone-disk directory and bounded direct-entry set;
+3. observed backing logical/allocated-byte metadata;
+4. observed lock representation and target/content when explicitly selected;
+5. installed Lima disk JSON and resident-instance JSON;
+6. guest project-mount stat plus mountinfo device correlation;
+7. logical project/disk/attachment/sandbox IDs as declared comparison labels;
+8. same-name entry/directory replacement detection during the held observation window;
+9. Darwin birthtime/generation observations needed by #699's physical-identity evaluation.
 
-The physical receipt remains research evidence. #565 P2 must encode the accepted installed schema
-descriptor-relatively and bind host-controlled physical identity to the exact durable SmolRunner
-project-disk and attachment/resident-sandbox generations. Lima names and lock observations remain
-locators/correlation evidence.
+## Current interpretation
+
+The current M6 programme deliberately keeps three facts separate:
+
+- `ProjectDiskLimaSourceIdentity` from #691/#713 identifies the configured canonical Lima namespace and does not prove physical continuity;
+- #699 owns the stronger durable physical-source/disk/backing identity policy needed across restart and inode reuse;
+- this receipt is independent evidence for review/physical acceptance and is never fed into a runtime authority constructor.
+
+#706/#628 may use the collector to inspect the final physical chain, while the production #640/#589 path must mint its runtime proof from current durable authority plus fresh guest evidence inside the reviewed live transaction.
 
 ## Stop rules
 
-Keep #565 P2 blocked when any expected entry role remains ambiguous, any observed object drifts,
-disk/instance evidence disagrees, the guest mountpoint has zero or multiple exact mountinfo rows, or
-same-name replacement cannot be distinguished.
+Stop and report ambiguity when an expected entry role is unknown, an observed object changes, disk/instance evidence disagrees, the guest mountpoint has zero or multiple exact mountinfo rows, or the current physical-identity policy cannot distinguish the replacement class under test.
 
-Keep stale-lock unlock, format, resize, delete, and OverlayFS mount application in their separate
-explicit mutation classes. Parser fixtures grant zero mutation authority.
-
-#589's normal project-filesystem correlation-proof constructor stays absent until this physical
-receipt is reviewed and #565 P2 becomes its sole production minting path.
-
-## Exact guest filesystem correlation
-
-The captured guest `%d:%i` stat evidence is decoded with the Linux `dev_t` encoding. Its derived major/minor pair must equal the major/minor pair on the single exact project-mount row from `/proc/self/mountinfo`. A stat from one filesystem and a mount row from another is refused. The operator-supplied standalone-disk directory is opened component-by-component with no-follow semantics and rebound after observation; symlinked path components do not become physical evidence.
-
-On macOS, Python temporary directories may be reported beneath the root `/var` compatibility alias.
-The collector accepts that one platform alias only after proving it is the root-owned system symlink
-to `/private/var`, opens the physical target component-by-component with no-follow semantics, and
-rechecks both the alias and final held directory identity. Direct `/private/tmp` paths follow the
-ordinary strict path. Other intermediate symlinks remain refused.
+Do not unlock, format, attach, detach, mount, delete, or broadly clean up an object because this diagnostic receipt exists.
