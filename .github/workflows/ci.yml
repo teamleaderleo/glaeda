@@ -39,11 +39,11 @@ jobs:
         working-directory: tools/scaleset-bridge
         run: |
           go mod verify
-          gofmt -d -e . | tee /tmp/smolrunner-scaleset-gofmt.diff
-          test ! -s /tmp/smolrunner-scaleset-gofmt.diff
+          gofmt -d -e . | tee /tmp/glaeda-scaleset-gofmt.diff
+          test ! -s /tmp/glaeda-scaleset-gofmt.diff
           go vet ./...
           go test ./...
-          go build -trimpath -o /tmp/smolrunner-scaleset-bridge .
+          go build -trimpath -o /tmp/glaeda-scaleset-bridge .
 
       - name: Install pinned Rust toolchain
         run: >-
@@ -161,6 +161,16 @@ jobs:
             exit 1
           fi
 
+      - name: Validate Glaeda Lima example aliases
+        run: |
+          cmp examples/lima/smolrunner-interactive.yaml examples/lima/glaeda-interactive.yaml
+          cmp examples/lima/smolrunner-jit-launcher examples/lima/glaeda-jit-launcher
+          cmp examples/lima/smolrunner-prepared-template.json examples/lima/glaeda-prepared-template.json
+          cmp examples/lima/smolrunner-prepared-template.yaml examples/lima/glaeda-prepared-template.yaml
+          cmp examples/lima/smolrunner-runner-integrity examples/lima/glaeda-runner-integrity
+          cmp examples/lima/smolrunner-work.yaml examples/lima/glaeda-work.yaml
+          bash -n examples/lima/glaeda-jit-launcher examples/lima/glaeda-runner-integrity
+
       - name: Validate repository verification wrappers
         run: bash -n examples/renderprove/run-renderprove-review.sh
 
@@ -187,7 +197,7 @@ jobs:
       - name: Run tests
         run: cargo test --locked --all-targets --all-features
 
-      - name: Exercise root SmolRunner front door
+      - name: Exercise root Glaeda front door
         run: |
           ./smolrunner --output json | jq -e '
             .schema_version == 1 and
