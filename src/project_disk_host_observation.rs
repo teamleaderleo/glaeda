@@ -4,11 +4,14 @@
 //! child module. Product callers receive only unbound physical observation/absence evidence. The
 //! held absence lease supports exactly one live consume-once `observe_created` transition for the
 //! uninterrupted external create transaction; controller death destroys that lease, and a fresh
-//! same-name observation can never recreate it. A crate-private create-durability target seam is
-//! reserved for #700's reviewed barrier. P2 deliberately exposes no API that can combine an
-//! arbitrary P1 lease with a physical digest or manufacture `Exact`/`CurrentAttachment` lease
-//! transition evidence. Durable P3 create provenance is the first layer allowed to bind these
-//! observed identities to a SmolRunner project-disk generation.
+//! same-name observation can never recreate it. The crate-private create-durability target seam
+//! reserved for #700's reviewed barrier is mintable only from that uninterrupted held-absence ->
+//! created lineage; an ordinary later observation of an existing disk — even from a planned
+//! request naming the same locator — never mints it, carries no attempt identity, and leaves
+//! cross-attempt fencing to #700's non-cloneable proof. P2 deliberately exposes no API that can
+//! combine an arbitrary P1 lease with a physical digest or manufacture `Exact`/
+//! `CurrentAttachment` lease transition evidence. Durable P3 create provenance is the first layer
+//! allowed to bind these observed identities to a SmolRunner project-disk generation.
 
 // The private child temporarily retains the pre-repair P1 projection implementation so the proven
 // descriptor/parser code can land without a simultaneous 1,800-line rewrite. It is unreachable to
@@ -180,12 +183,16 @@ impl LimaStandaloneDiskObservation {
     /// Mint the crate-private #700 create-durability target from this held observation.
     ///
     /// Crate-private by design: only in-crate P3 durability code can name or consume the target,
-    /// and minting revalidates every held descriptor and path binding first. Fixture-origin
-    /// observations are permanently ineligible.
+    /// and minting revalidates every held descriptor and path binding first. Minting is fenced to
+    /// the uninterrupted held-absence -> created lineage produced by `observe_created`; an
+    /// ordinary later observation of an existing disk — even from a planned request with the same
+    /// name — is permanently ineligible, as are fixture-origin observations. No attempt identity
+    /// is carried; cross-attempt fencing belongs to #700's non-cloneable proof.
     ///
     /// # Errors
     ///
-    /// Returns the bounded P2 refusal for fixture-origin observations or drifted held evidence.
+    /// Returns the bounded P2 refusal for observations outside the uninterrupted created lineage,
+    /// fixture-origin observations, or drifted held evidence.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn project_disk_create_durability_target(
         &mut self,
@@ -331,23 +338,35 @@ mod tests {
     }
 
     #[test]
-    fn planned_facade_observation_mints_durability_target_with_configured_identity() {
+    fn facade_created_lineage_mints_durability_target_with_configured_identity() {
         let fixture = FacadeFixture::new();
+        fs::remove_dir_all(&fixture.disk_directory).unwrap();
         let source = ConfiguredProjectDiskLimaSource::new(&fixture.lima_home).unwrap();
         let request = LimaStandaloneDiskObservationRequest::for_planned_disk(
             &source,
             fixture.disk_name.clone(),
         )
         .unwrap();
+        let absent = observe_lima_standalone_disk_absence(request, &[]).unwrap();
+        assert!(!absent.summary().proven_collection_absent());
+
+        fs::create_dir(&fixture.disk_directory).unwrap();
+        fs::set_permissions(&fixture.disk_directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let backing = fixture.disk_directory.join("opaque-regular-entry");
+        let file = File::create(&backing).unwrap();
+        file.set_len(DISK_BYTES).unwrap();
+        drop(file);
+        fs::set_permissions(&backing, fs::Permissions::from_mode(0o600)).unwrap();
+
         let inventory = fixture.inventory();
-        let mut observed = observe_lima_standalone_disk(request, &inventory).unwrap();
-        let target = observed
+        let mut created = absent.observe_created(&inventory).unwrap();
+        let target = created
             .project_disk_create_durability_target(&inventory)
             .unwrap();
         assert_eq!(target.source_identity(), source.identity());
         assert_eq!(
             target.physical_identity(),
-            observed.summary().physical_identity()
+            created.summary().physical_identity()
         );
         assert_eq!(target.backing_logical_bytes(), DISK_BYTES);
         let debug = format!("{target:?}");
@@ -367,6 +386,48 @@ mod tests {
         let inventory = fixture.inventory();
         let mut observed = observe_lima_standalone_disk_fixture(request, &inventory).unwrap();
         let error = observed
+            .project_disk_create_durability_target(&inventory)
+            .unwrap_err();
+        assert_eq!(
+            error.code(),
+            "project_disk_create_durability_target_unavailable"
+        );
+    }
+
+    #[test]
+    fn ordinary_post_restart_same_name_facade_observation_cannot_mint() {
+        let fixture = FacadeFixture::new();
+        fs::remove_dir_all(&fixture.disk_directory).unwrap();
+        let source = ConfiguredProjectDiskLimaSource::new(&fixture.lima_home).unwrap();
+        let planned_request = || {
+            LimaStandaloneDiskObservationRequest::for_planned_disk(
+                &source,
+                fixture.disk_name.clone(),
+            )
+            .unwrap()
+        };
+        let inventory = fixture.inventory();
+
+        // The uninterrupted lineage mints while it is live.
+        let absent = observe_lima_standalone_disk_absence(planned_request(), &[]).unwrap();
+        fs::create_dir(&fixture.disk_directory).unwrap();
+        fs::set_permissions(&fixture.disk_directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let backing = fixture.disk_directory.join("opaque-regular-entry");
+        let file = File::create(&backing).unwrap();
+        file.set_len(DISK_BYTES).unwrap();
+        drop(file);
+        fs::set_permissions(&backing, fs::Permissions::from_mode(0o600)).unwrap();
+        let mut created = absent.observe_created(&inventory).unwrap();
+        created
+            .project_disk_create_durability_target(&inventory)
+            .unwrap();
+
+        // Controller "restart": every live object is dropped. A fresh ordinary observation of
+        // the now-existing disk from an identical planned request remains unbound physical
+        // evidence and can never mint the target retroactively.
+        drop(created);
+        let mut restarted = observe_lima_standalone_disk(planned_request(), &inventory).unwrap();
+        let error = restarted
             .project_disk_create_durability_target(&inventory)
             .unwrap_err();
         assert_eq!(

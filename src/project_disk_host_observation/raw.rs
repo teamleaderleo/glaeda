@@ -12,7 +12,9 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
+use std::os::fd::OwnedFd;
+#[cfg(test)]
+use std::os::fd::{AsFd as _, BorrowedFd};
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::path::{Component, Path, PathBuf};
 
@@ -533,7 +535,18 @@ pub struct LimaStandaloneDiskObservation {
     lock: Option<BoundSymlink>,
     instance_directory: Option<BoundDirectory>,
     attached_source: Option<LimaObservationSourceIdentity>,
+    created_lineage: Option<CreatedLineage>,
+    collection_retained_from_before_creation: bool,
 }
+
+/// Private zero-sized proof that one observation was produced by consuming an uninterrupted
+/// held-absence -> created-child transition inside one live controller transaction.
+///
+/// It is deliberately unconstructible outside [`establish_created_lineage`]'s success path and is
+/// neither `Clone`, `Copy`, nor serializable. It is not a project/disk generation, lease revision,
+/// persisted marker, or attempt identity; controller death destroys it together with the held
+/// absence lease, and a later ordinary same-name observation can never obtain it.
+struct CreatedLineage(());
 
 /// Held lineage of one absence proof: either the trusted collection descriptor itself, or exact
 /// proof that the collection child was absent beneath the held Lima home (first-disk bootstrap).
@@ -605,11 +618,14 @@ impl LimaStandaloneDiskAbsenceObservation {
     /// group, and mode; the create transaction itself legitimately mutates parent timestamps and
     /// directory link counts, so those stay reserved for the strict quiet-window confirmation at
     /// the end. A proven-absent collection must now exist as an exact private directory opened
-    /// relative to the same held home. Fresh strict inventory must report exactly the planned
-    /// locator, the child opens descriptor-relatively from the retained lineage, and every
-    /// ordinary existing-disk check plus a final full reconfirmation runs before returning.
-    /// Controller death destroys the lease; a fresh same-name observation can never recreate this
-    /// live transition.
+    /// relative to the same held home. When a trusted collection descriptor was retained before
+    /// creation, that exact retained descriptor is what traverses to the newly appeared child; it
+    /// is never substituted with a freshly reopened equivalent pathname handle. Fresh strict
+    /// inventory must report exactly the planned locator, every ordinary existing-disk check runs
+    /// against that child, and a final confirmation re-proves the held lineage with stable-field
+    /// discipline for parents held across the mutating create window before returning. Controller
+    /// death destroys the lease; a fresh same-name observation can never recreate this live
+    /// transition or the create-durability eligibility it grants.
     ///
     /// # Errors
     ///
@@ -655,14 +671,16 @@ where
     if !same_stable_directory_identity(&fresh_home.snapshot, &lima_home.snapshot) {
         return Err(changed());
     }
+    let collection_retained = matches!(collection, HeldAbsenceCollection::Bound(_));
     let collection = match collection {
         HeldAbsenceCollection::Bound(bound) => {
+            // #691 step 4: the created child is opened relative to the exact retained collection
+            // descriptor, never a freshly reopened equivalent pathname handle. The create
+            // transaction legitimately mutates the held collection's volatile metadata, so only
+            // stable identity is reconfirmed on the retained descriptor here and the strict
+            // quiet-window confirmation applies stable-field discipline to this parent.
             bound.revalidate_stable_identity()?;
-            let current = BoundDirectory::open_child(&lima_home.fd, &request.collection_name)?;
-            if !same_stable_directory_identity(&current.snapshot, &bound.snapshot) {
-                return Err(changed());
-            }
-            current
+            bound
         }
         HeldAbsenceCollection::ProvenAbsent => {
             let created = BoundDirectory::open_child(&lima_home.fd, &request.collection_name)?;
@@ -677,6 +695,8 @@ where
         collection,
         fresh_inventory_json_lines,
         before_final_confirmation,
+        Some(CreatedLineage(())),
+        collection_retained,
     )
 }
 
@@ -837,24 +857,33 @@ impl LimaStandaloneDiskObservation {
 }
 
 impl LimaStandaloneDiskObservation {
-    /// Mint the crate-private #700 create-durability target from one uninterrupted planned
-    /// created observation.
+    /// Mint the crate-private #700 create-durability target from one uninterrupted created
+    /// observation.
     ///
-    /// Minting first revalidates every held descriptor, path binding, and the supplied fresh
-    /// inventory, then binds a duplicated read-only held backing descriptor to the exact
-    /// configured source identity, disk locator, physical identity, backing identity, and logical
-    /// bytes. Explicit fixture requests are permanently ineligible. This performs no durability
-    /// mutation itself and exposes no generic path/fd/write/sync authority; #700 owns the single
-    /// reviewed barrier operation.
+    /// Minting is fenced to the uninterrupted held-absence -> created-child lineage: only an
+    /// observation returned by a successful [`LimaStandaloneDiskAbsenceObservation::observe_created`]
+    /// carries the private created-lineage eligibility, and the planned configured source identity
+    /// must be present as well. An ordinary later observation of an existing disk — even from a
+    /// planned request naming the same locator — can never mint this target, so a post-restart or
+    /// same-name rediscovery stays unbound physical evidence. Minting revalidates every held
+    /// descriptor, path binding, and the supplied fresh inventory first, then binds a duplicated
+    /// read-only held backing descriptor to the exact configured source identity, disk locator,
+    /// physical identity, backing identity, and logical bytes. Explicit fixture requests are
+    /// permanently ineligible. This performs no durability mutation itself and exposes no generic
+    /// path/fd/write/sync authority; #700 owns the single reviewed barrier operation.
     ///
     /// # Errors
     ///
-    /// Returns a bounded refusal for fixture-origin observations and the ordinary P2 changed
-    /// refusal when any held evidence no longer matches.
+    /// Returns a bounded refusal for observations outside the uninterrupted created lineage,
+    /// fixture-origin observations, and the ordinary P2 changed refusal when any held evidence no
+    /// longer matches.
     pub(crate) fn project_disk_create_durability_target(
         &mut self,
         fresh_inventory_json_lines: &[u8],
     ) -> Result<ProjectDiskCreateDurabilityTarget, ProjectDiskHostObservationError> {
+        if self.created_lineage.is_none() {
+            return Err(durability_target_unavailable());
+        }
         let Some(source_identity) = self.request.planned_source_identity.clone() else {
             return Err(durability_target_unavailable());
         };
@@ -876,11 +905,14 @@ impl LimaStandaloneDiskObservation {
 
 /// Crate-private opaque create-durability seam target required by #700.
 ///
-/// Non-cloneable, non-copyable, and non-serializable. It is mintable only from a currently held
-/// planned created observation whose full held revalidation passed, and it binds the exact
-/// configured source identity, disk locator, physical identity, backing identity, logical bytes,
-/// and one duplicated read-only held backing descriptor. It carries zero ownership, adoption, or
-/// mutation authority and no generic path/fd/write/sync surface outside the narrow #700 barrier.
+/// Non-cloneable, non-copyable, and non-serializable. It is mintable only from an uninterrupted
+/// held-absence -> created-child observation (`observe_created` success) whose full held
+/// revalidation passed, and it binds the exact configured source identity, disk locator, physical
+/// identity, backing identity, logical bytes, and one duplicated read-only held backing
+/// descriptor. An ordinary later observation of an existing disk — even from a planned request
+/// with the same name — can never mint it. It carries zero ownership, adoption, or mutation
+/// authority and no generic path/fd/write/sync surface outside the narrow #700 barrier. No
+/// attempt identity is carried here; cross-attempt fencing belongs to #700's non-cloneable proof.
 pub struct ProjectDiskCreateDurabilityTarget {
     source_identity: ProjectDiskLimaSourceIdentity,
     disk_name: LimaStandaloneDiskName,
@@ -916,10 +948,15 @@ impl ProjectDiskCreateDurabilityTarget {
         self.backing_logical_bytes
     }
 
-    /// Borrowed read-only view of the exact held backing descriptor for the single reviewed #700
-    /// create-durability barrier implementation. This deliberately grants no generic fd authority.
-    #[must_use]
-    pub(crate) fn held_backing_descriptor(&self) -> BorrowedFd<'_> {
+    /// Test-only borrowed view of the exact held backing descriptor.
+    ///
+    /// This is deliberately unavailable to production crate callers: #700 must not receive a
+    /// reusable generic fd capability. The reviewed #700 barrier has to consume the target behind
+    /// a module-owned operation or closure defined in this module instead, and it must align the
+    /// descriptor kind it requires (the #700 `fsync_volume_np` design names the held
+    /// source/filesystem fd; this seam currently holds the backing fd of the same flush volume).
+    #[cfg(test)]
+    fn held_backing_descriptor(&self) -> BorrowedFd<'_> {
         self.backing.as_fd()
     }
 }
@@ -1107,6 +1144,8 @@ where
         collection,
         inventory_json_lines,
         before_revalidation,
+        None,
+        false,
     )
 }
 
@@ -1116,6 +1155,8 @@ fn observe_existing_from_bound_parents<F>(
     collection: BoundDirectory,
     inventory_json_lines: &[u8],
     before_revalidation: F,
+    created_lineage: Option<CreatedLineage>,
+    collection_retained_from_before_creation: bool,
 ) -> Result<LimaStandaloneDiskObservation, ProjectDiskHostObservationError>
 where
     F: FnOnce(),
@@ -1178,6 +1219,8 @@ where
         lock,
         instance_directory,
         attached_source,
+        created_lineage,
+        collection_retained_from_before_creation,
     };
     before_revalidation();
     let inventory_confirmation = inventory_json_lines.to_vec();
@@ -1685,15 +1728,24 @@ fn revalidate_observation(
     observation: &mut LimaStandaloneDiskObservation,
     inventory_json_lines: &[u8],
 ) -> Result<(), ProjectDiskHostObservationError> {
+    let collection_held_from_before_creation = observation.collection_retained_from_before_creation;
     observation.lima_home.revalidate()?;
-    observation.collection.revalidate()?;
+    if collection_held_from_before_creation {
+        // The retained collection descriptor was held across the mutating create window, so its
+        // volatile metadata legitimately differs from the pre-creation snapshot; stable identity
+        // plus descriptor-relative entry binding remains the exact-object proof.
+        observation.collection.revalidate_stable_identity()?;
+    } else {
+        observation.collection.revalidate()?;
+    }
     observation.disk_directory.revalidate()?;
     observation.backing.revalidate()?;
 
-    require_same_directory_entry(
+    require_same_directory_entry_discipline(
         &observation.lima_home.fd,
         &observation.request.collection_name,
         &observation.collection,
+        collection_held_from_before_creation,
     )?;
     require_same_directory_entry(
         &observation.collection.fd,
@@ -1750,7 +1802,11 @@ fn revalidate_observation(
         return Err(changed());
     }
     observation.lima_home.revalidate()?;
-    observation.collection.revalidate()?;
+    if collection_held_from_before_creation {
+        observation.collection.revalidate_stable_identity()?;
+    } else {
+        observation.collection.revalidate()?;
+    }
     observation.disk_directory.revalidate()?;
     observation.backing.revalidate()?;
     Ok(())
@@ -1830,8 +1886,27 @@ fn require_same_directory_entry(
     name: &OsStr,
     expected: &BoundDirectory,
 ) -> Result<(), ProjectDiskHostObservationError> {
+    require_same_directory_entry_discipline(parent, name, expected, false)
+}
+
+/// Re-prove that `name` directly beneath `parent` is still exactly `expected`.
+///
+/// With `stable_only` the comparison proves device, inode, owner, group, and mode; this is the
+/// correct discipline for a collection descriptor retained across the mutating create window,
+/// whose timestamps and link count legitimately changed. Otherwise the full snapshot must match.
+fn require_same_directory_entry_discipline(
+    parent: &OwnedFd,
+    name: &OsStr,
+    expected: &BoundDirectory,
+    stable_only: bool,
+) -> Result<(), ProjectDiskHostObservationError> {
     let current = BoundDirectory::open_child(parent, name).map_err(|_| changed())?;
-    if current.snapshot != expected.snapshot {
+    let matches = if stable_only {
+        same_stable_directory_identity(&current.snapshot, &expected.snapshot)
+    } else {
+        current.snapshot == expected.snapshot
+    };
+    if !matches {
         return Err(changed());
     }
     Ok(())

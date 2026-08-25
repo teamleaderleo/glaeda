@@ -83,6 +83,10 @@ impl Fixture {
         self.recreate_backing();
     }
 
+    fn remove_disk_child(&self) {
+        fs::remove_dir_all(&self.disk).unwrap();
+    }
+
     fn recreate_backing(&self) {
         let file = File::create(&self.backing).unwrap();
         file.set_len(DISK_BYTES).unwrap();
@@ -171,6 +175,26 @@ fn absence_for(
             fixture.collection.join(planned_name.as_str()),
         )
         .unwrap(),
+        inventory,
+    )
+    .unwrap()
+}
+
+/// Planned-origin absence lease whose created observation carries the configured source identity
+/// required for durability-target minting.
+fn planned_absence_for(
+    fixture: &Fixture,
+    planned_name: &LimaStandaloneDiskName,
+    inventory: &[u8],
+) -> LimaStandaloneDiskAbsenceObservation {
+    observe_lima_standalone_disk_absence(
+        LimaStandaloneDiskObservationRequest::new(
+            planned_name.clone(),
+            fixture.lima_home.clone(),
+            fixture.collection.join(planned_name.as_str()),
+        )
+        .unwrap()
+        .with_planned_source_identity(test_source_identity()),
         inventory,
     )
     .unwrap()
@@ -721,6 +745,43 @@ fn child_and_backing_replacement_during_created_observation_fails() {
 }
 
 #[test]
+fn created_child_traverses_retained_collection_descriptor_not_a_fresh_reopen() {
+    let fixture = Fixture::new();
+    fixture.remove_disk_child();
+    let inventory = fixture.detached_inventory();
+    let absent = absence_for(&fixture, &fixture.disk_name, &[]);
+
+    // Replace the entire collection at the same pathname with a fully valid equivalent that
+    // already contains the created disk. A freshly reopened equivalent descriptor would observe
+    // the child; the retained collection descriptor must not see the new directory at all.
+    let replacement = fixture.root.join("replacement-collection");
+    fs::create_dir(&replacement).unwrap();
+    set_mode(&replacement, 0o700);
+    let replacement_disk = replacement.join(fixture.disk_name.as_str());
+    fs::create_dir(&replacement_disk).unwrap();
+    set_mode(&replacement_disk, 0o700);
+    let replacement_backing = replacement_disk.join("opaque-regular-entry");
+    let file = File::create(&replacement_backing).unwrap();
+    file.set_len(DISK_BYTES).unwrap();
+    drop(file);
+    set_mode(&replacement_backing, 0o600);
+    let moved = fixture.root.join("moved-original-collection");
+    fs::rename(&fixture.collection, &moved).unwrap();
+    fs::rename(&replacement, &fixture.collection).unwrap();
+
+    let error = absent.observe_created(&inventory).unwrap_err();
+    assert_eq!(error.kind(), ProjectDiskHostObservationErrorKind::Missing);
+
+    // The replacement layout is fully valid for an ordinary observation, so the failure above is
+    // attributable solely to traversal through the retained descriptor.
+    let ordinary = observe_lima_standalone_disk(fixture.request(), &inventory).unwrap();
+    assert_eq!(
+        ordinary.summary().disposition(),
+        LimaStandaloneDiskDisposition::Detached
+    );
+}
+
+#[test]
 fn confirm_source_path_binding_detects_rebind_and_holds_stable() {
     let fixture = Fixture::new_clean_home();
     let absent = absence_for(&fixture, &fixture.disk_name, &[]);
@@ -864,10 +925,13 @@ fn darwin_alias_revalidation_refuses_drifted_alias_evidence() {
 }
 
 #[test]
-fn durability_target_requires_planned_origin_and_current_evidence() {
+fn durability_target_requires_uninterrupted_created_lineage_and_current_evidence() {
+    // An ordinary observation of an existing disk — even from a planned request with the same
+    // name — can never mint: only the uninterrupted absence -> created lineage carries the
+    // private created-lineage eligibility.
     let fixture = Fixture::new();
     let inventory = fixture.detached_inventory();
-    let mut observed = observe_lima_standalone_disk(fixture.request(), &inventory).unwrap();
+    let mut observed = observe_lima_standalone_disk(fixture.planned_request(), &inventory).unwrap();
     let error = observed
         .project_disk_create_durability_target(&inventory)
         .unwrap_err();
@@ -876,15 +940,30 @@ fn durability_target_requires_planned_origin_and_current_evidence() {
         "project_disk_create_durability_target_unavailable"
     );
 
-    let mut planned = observe_lima_standalone_disk(fixture.planned_request(), &inventory).unwrap();
-    let target = planned
+    // Fixture-origin observations stay permanently ineligible.
+    let mut fixture_origin = observe_lima_standalone_disk(fixture.request(), &inventory).unwrap();
+    let error = fixture_origin
+        .project_disk_create_durability_target(&inventory)
+        .unwrap_err();
+    assert_eq!(
+        error.code(),
+        "project_disk_create_durability_target_unavailable"
+    );
+
+    // The uninterrupted planned lineage mints, but drifted held evidence refuses.
+    let fixture = Fixture::new_clean_home();
+    let inventory = fixture.detached_inventory();
+    let absent = planned_absence_for(&fixture, &fixture.disk_name, &[]);
+    fixture.external_first_create();
+    let mut created = absent.observe_created(&inventory).unwrap();
+    let target = created
         .project_disk_create_durability_target(&inventory)
         .unwrap();
     assert_eq!(target.source_identity(), &test_source_identity());
 
     fs::remove_file(&fixture.backing).unwrap();
     fixture.recreate_backing();
-    let error = planned
+    let error = created
         .project_disk_create_durability_target(&inventory)
         .unwrap_err();
     assert_eq!(
@@ -894,21 +973,64 @@ fn durability_target_requires_planned_origin_and_current_evidence() {
 }
 
 #[test]
-fn durability_targets_bind_exact_distinct_disks_and_attempts() {
+fn created_lineage_minting_does_not_survive_restart_or_same_name_rediscovery() {
+    let fixture = Fixture::new_clean_home();
+    let inventory = fixture.detached_inventory();
+
+    // The legitimate uninterrupted lineage mints exactly once while it is live.
+    let absent = planned_absence_for(&fixture, &fixture.disk_name, &[]);
+    fixture.external_first_create();
+    let mut created = absent.observe_created(&inventory).unwrap();
+    created
+        .project_disk_create_durability_target(&inventory)
+        .unwrap();
+
+    // Controller "restart": every live object is dropped. A fresh ordinary observation of the
+    // now-existing disk from an identical planned request remains unbound physical evidence and
+    // can never invoke the live transition or mint the target retroactively.
+    drop(created);
+    let mut rediscovered =
+        observe_lima_standalone_disk(fixture.planned_request(), &inventory).unwrap();
+    let error = rediscovered
+        .project_disk_create_durability_target(&inventory)
+        .unwrap_err();
+    assert_eq!(
+        error.code(),
+        "project_disk_create_durability_target_unavailable"
+    );
+
+    // Even a fresh planned absence cannot be consumed against an already-present child, so no
+    // same-name path reconstructs the lineage either.
+    let error = observe_lima_standalone_disk_absence(fixture.planned_request(), &[]).unwrap_err();
+    assert_eq!(error.kind(), ProjectDiskHostObservationErrorKind::Present);
+}
+
+#[test]
+fn durability_targets_bind_exact_distinct_disks() {
     use std::os::unix::fs::MetadataExt as _;
 
+    // Cross-disk distinctness only: two mints from two independent disks produce distinct
+    // identities. No attempt identity exists at this P2 transition; cross-attempt fencing on one
+    // disk belongs to #700's non-cloneable proof.
     let first = Fixture::new();
+    first.remove_disk_child();
     let second = Fixture::new();
-    let mut first_observed =
-        observe_lima_standalone_disk(first.planned_request(), &first.detached_inventory()).unwrap();
-    let mut second_observed =
-        observe_lima_standalone_disk(second.planned_request(), &second.detached_inventory())
-            .unwrap();
+    second.remove_disk_child();
+
+    let first_absent = planned_absence_for(&first, &first.disk_name, &[]);
+    first.create_disk_child();
+    let second_absent = planned_absence_for(&second, &second.disk_name, &[]);
+    second.create_disk_child();
+
+    let first_inventory = first.detached_inventory();
+    let second_inventory = second.detached_inventory();
+    let mut first_observed = first_absent.observe_created(&first_inventory).unwrap();
+    let mut second_observed = second_absent.observe_created(&second_inventory).unwrap();
     let first_target = first_observed
-        .project_disk_create_durability_target(&first.detached_inventory())
+        .project_disk_create_durability_target(&first_inventory)
         .unwrap();
     let second_target = second_observed
-        .project_disk_create_durability_target(&second.detached_inventory())
+        .project_disk_create_durability_target(&second_inventory)
         .unwrap();
     assert_ne!(
         first_target.physical_identity(),
