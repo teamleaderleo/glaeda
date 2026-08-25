@@ -282,6 +282,8 @@ pub mod repository_source_observation;
 /// Pure, authority-free resident-sandbox generation/config/locator catalog and strict codec.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod resident_sandbox_catalog;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod resident_sandbox_host_observation;
 pub mod resource;
 #[cfg(target_os = "linux")]
 pub mod rootless_podman_config;
