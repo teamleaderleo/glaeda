@@ -1,11 +1,17 @@
 //! Public fail-closed facade for descriptor-bound Lima standalone-disk observation.
 //!
 //! The physically established Lima 2.2.0 parser and descriptor engine live in the private `raw`
-//! child module. Product callers receive only unbound physical observation/absence evidence. P2
-//! deliberately exposes no API that can combine an arbitrary P1 lease with a physical digest or
-//! manufacture `Exact`/`CurrentAttachment` lease-transition evidence. Durable P3 create provenance
-//! is the first layer allowed to bind these observed identities to a SmolRunner project-disk
-//! generation.
+//! child module. Product callers receive only unbound physical observation/absence evidence. The
+//! held absence lease supports exactly one live consume-once `observe_created` transition for the
+//! uninterrupted external create transaction; controller death destroys that lease, and a fresh
+//! same-name observation can never recreate it. The crate-private create-durability target seam
+//! reserved for #700's reviewed barrier is mintable only from that uninterrupted held-absence ->
+//! created lineage; an ordinary later observation of an existing disk — even from a planned
+//! request naming the same locator — never mints it, carries no attempt identity, and leaves
+//! cross-attempt fencing to #700's non-cloneable proof. P2 deliberately exposes no API that can
+//! combine an arbitrary P1 lease with a physical digest or manufacture `Exact`/
+//! `CurrentAttachment` lease transition evidence. Durable P3 create provenance is the first layer
+//! allowed to bind these observed identities to a SmolRunner project-disk generation.
 
 // The private child temporarily retains the pre-repair P1 projection implementation so the proven
 // descriptor/parser code can land without a simultaneous 1,800-line rewrite. It is unreachable to
@@ -21,6 +27,7 @@ use serde::Serialize;
 
 use crate::artifact::Sha256Digest;
 
+pub(crate) use raw::ProjectDiskCreateDurabilityTarget;
 pub use raw::{
     LimaStandaloneDiskAbsenceObservation, LimaStandaloneDiskAbsenceSummary,
     LimaStandaloneDiskDisposition, LimaStandaloneDiskName,
@@ -172,6 +179,28 @@ impl LimaStandaloneDiskObservation {
     ) -> Result<(), ProjectDiskHostObservationError> {
         self.inner.confirm(inventory_json_lines)
     }
+
+    /// Mint the crate-private #700 create-durability target from this held observation.
+    ///
+    /// Crate-private by design: only in-crate P3 durability code can name or consume the target,
+    /// and minting revalidates every held descriptor and path binding first. Minting is fenced to
+    /// the uninterrupted held-absence -> created lineage produced by `observe_created`; an
+    /// ordinary later observation of an existing disk — even from a planned request with the same
+    /// name — is permanently ineligible, as are fixture-origin observations. No attempt identity
+    /// is carried; cross-attempt fencing belongs to #700's non-cloneable proof.
+    ///
+    /// # Errors
+    ///
+    /// Returns the bounded P2 refusal for observations outside the uninterrupted created lineage,
+    /// fixture-origin observations, or drifted held evidence.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn project_disk_create_durability_target(
+        &mut self,
+        fresh_inventory_json_lines: &[u8],
+    ) -> Result<ProjectDiskCreateDurabilityTarget, ProjectDiskHostObservationError> {
+        self.inner
+            .project_disk_create_durability_target(fresh_inventory_json_lines)
+    }
 }
 
 impl fmt::Debug for LimaStandaloneDiskObservation {
@@ -238,4 +267,203 @@ fn observe_raw_lima_standalone_disk(
     let inner = raw::observe_lima_standalone_disk(request, inventory_json_lines)?;
     let summary = LimaStandaloneDiskObservationSummary::from_raw(inner.summary());
     Ok(LimaStandaloneDiskObservation { inner, summary })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::{self, File};
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+
+    static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
+    const DISK_BYTES: u64 = 1024 * 1024;
+    const COLLECTION: &str = "_disks";
+
+    struct FacadeFixture {
+        root: PathBuf,
+        lima_home: PathBuf,
+        disk_directory: PathBuf,
+        disk_name: LimaStandaloneDiskName,
+    }
+
+    impl FacadeFixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "smolrunner-project-disk-facade-{}-{}",
+                std::process::id(),
+                NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&root).unwrap();
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+            let lima_home = root.join("lima");
+            let disk_name = LimaStandaloneDiskName::parse("facade-disk").unwrap();
+            let collection = lima_home.join(COLLECTION);
+            let disk_directory = collection.join(disk_name.as_str());
+            fs::create_dir(&lima_home).unwrap();
+            fs::create_dir(&collection).unwrap();
+            fs::create_dir(&disk_directory).unwrap();
+            for directory in [&lima_home, &collection, &disk_directory] {
+                fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let backing = disk_directory.join("opaque-regular-entry");
+            let file = File::create(&backing).unwrap();
+            file.set_len(DISK_BYTES).unwrap();
+            drop(file);
+            fs::set_permissions(&backing, fs::Permissions::from_mode(0o600)).unwrap();
+            Self {
+                root,
+                lima_home,
+                disk_directory,
+                disk_name,
+            }
+        }
+
+        fn inventory(&self) -> Vec<u8> {
+            format!(
+                "{{\"name\":\"{}\",\"size\":{DISK_BYTES},\"format\":\"raw\",\"dir\":\"{}\",\"instance\":\"\",\"instanceDir\":\"\",\"mountPoint\":\"/mnt/facade\"}}\n",
+                self.disk_name.as_str(),
+                self.disk_directory.display()
+            )
+            .into_bytes()
+        }
+    }
+
+    impl Drop for FacadeFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn facade_created_lineage_mints_durability_target_with_configured_identity() {
+        let fixture = FacadeFixture::new();
+        fs::remove_dir_all(&fixture.disk_directory).unwrap();
+        let source = ConfiguredProjectDiskLimaSource::new(&fixture.lima_home).unwrap();
+        let request = LimaStandaloneDiskObservationRequest::for_planned_disk(
+            &source,
+            fixture.disk_name.clone(),
+        )
+        .unwrap();
+        let absent = observe_lima_standalone_disk_absence(request, &[]).unwrap();
+        assert!(!absent.summary().proven_collection_absent());
+
+        fs::create_dir(&fixture.disk_directory).unwrap();
+        fs::set_permissions(&fixture.disk_directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let backing = fixture.disk_directory.join("opaque-regular-entry");
+        let file = File::create(&backing).unwrap();
+        file.set_len(DISK_BYTES).unwrap();
+        drop(file);
+        fs::set_permissions(&backing, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let inventory = fixture.inventory();
+        let mut created = absent.observe_created(&inventory).unwrap();
+        let target = created
+            .project_disk_create_durability_target(&inventory)
+            .unwrap();
+        assert_eq!(target.source_identity(), source.identity());
+        assert_eq!(
+            target.physical_identity(),
+            created.summary().physical_identity()
+        );
+        assert_eq!(target.backing_logical_bytes(), DISK_BYTES);
+        let debug = format!("{target:?}");
+        assert!(!debug.contains(fixture.root.to_str().unwrap()));
+        assert!(!debug.contains("opaque-regular-entry"));
+    }
+
+    #[test]
+    fn fixture_facade_observation_cannot_mint_durability_target() {
+        let fixture = FacadeFixture::new();
+        let request = LimaStandaloneDiskFixtureObservationRequest::new(
+            fixture.disk_name.clone(),
+            fixture.lima_home.clone(),
+            fixture.disk_directory.clone(),
+        )
+        .unwrap();
+        let inventory = fixture.inventory();
+        let mut observed = observe_lima_standalone_disk_fixture(request, &inventory).unwrap();
+        let error = observed
+            .project_disk_create_durability_target(&inventory)
+            .unwrap_err();
+        assert_eq!(
+            error.code(),
+            "project_disk_create_durability_target_unavailable"
+        );
+    }
+
+    #[test]
+    fn ordinary_post_restart_same_name_facade_observation_cannot_mint() {
+        let fixture = FacadeFixture::new();
+        fs::remove_dir_all(&fixture.disk_directory).unwrap();
+        let source = ConfiguredProjectDiskLimaSource::new(&fixture.lima_home).unwrap();
+        let planned_request = || {
+            LimaStandaloneDiskObservationRequest::for_planned_disk(
+                &source,
+                fixture.disk_name.clone(),
+            )
+            .unwrap()
+        };
+        let inventory = fixture.inventory();
+
+        // The uninterrupted lineage mints while it is live.
+        let absent = observe_lima_standalone_disk_absence(planned_request(), &[]).unwrap();
+        fs::create_dir(&fixture.disk_directory).unwrap();
+        fs::set_permissions(&fixture.disk_directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let backing = fixture.disk_directory.join("opaque-regular-entry");
+        let file = File::create(&backing).unwrap();
+        file.set_len(DISK_BYTES).unwrap();
+        drop(file);
+        fs::set_permissions(&backing, fs::Permissions::from_mode(0o600)).unwrap();
+        let mut created = absent.observe_created(&inventory).unwrap();
+        created
+            .project_disk_create_durability_target(&inventory)
+            .unwrap();
+
+        // Controller "restart": every live object is dropped. A fresh ordinary observation of
+        // the now-existing disk from an identical planned request remains unbound physical
+        // evidence and can never mint the target retroactively.
+        drop(created);
+        let mut restarted = observe_lima_standalone_disk(planned_request(), &inventory).unwrap();
+        let error = restarted
+            .project_disk_create_durability_target(&inventory)
+            .unwrap_err();
+        assert_eq!(
+            error.code(),
+            "project_disk_create_durability_target_unavailable"
+        );
+    }
+
+    #[test]
+    fn planned_facade_absence_supports_first_disk_bootstrap() {
+        let fixture = FacadeFixture::new();
+        let collection = fixture.lima_home.join(COLLECTION);
+        fs::remove_dir_all(&collection).unwrap();
+        let source = ConfiguredProjectDiskLimaSource::new(&fixture.lima_home).unwrap();
+        let request = LimaStandaloneDiskObservationRequest::for_planned_disk(
+            &source,
+            fixture.disk_name.clone(),
+        )
+        .unwrap();
+        let absent = observe_lima_standalone_disk_absence(request, &[]).unwrap();
+        assert!(absent.summary().proven_collection_absent());
+
+        fs::create_dir(&collection).unwrap();
+        fs::set_permissions(&collection, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::create_dir(&fixture.disk_directory).unwrap();
+        fs::set_permissions(&fixture.disk_directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let backing = fixture.disk_directory.join("opaque-regular-entry");
+        let file = File::create(&backing).unwrap();
+        file.set_len(DISK_BYTES).unwrap();
+        drop(file);
+        fs::set_permissions(&backing, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let created = absent.observe_created(&fixture.inventory()).unwrap();
+        assert_eq!(
+            created.summary().disposition(),
+            LimaStandaloneDiskDisposition::Detached
+        );
+    }
 }
