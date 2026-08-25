@@ -314,6 +314,9 @@ pub mod subordinate_id;
 pub mod task_private_git_clone_plan;
 /// Pure reviewed identity for one resident Linux guest-control executable generation.
 pub mod trusted_guest_control_binary_generation;
+/// Root-only, closed, one-transaction Linux guest-control dispatcher.
+#[cfg(unix)]
+pub mod trusted_guest_control_dispatcher;
 /// Pure sealed one-shot invocation plan for purpose-typed Linux guest-control transactions.
 pub mod trusted_guest_control_invocation_plan;
 /// Mutation-free resident guest-control transport probe protocol.

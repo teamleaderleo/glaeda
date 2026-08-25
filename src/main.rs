@@ -2,6 +2,9 @@ mod personal_worker_cancel_command;
 mod personal_worker_read_command;
 mod personal_worker_submit_command;
 
+#[cfg(target_os = "linux")]
+use std::ffi::OsStr;
+use std::ffi::OsString;
 #[cfg(target_os = "macos")]
 use std::path::Component;
 use std::path::{Path, PathBuf};
@@ -92,6 +95,8 @@ use smolrunner::process::ProcessExecutor;
 use smolrunner::runner_user_observation::observe_verified_runner_user;
 #[cfg(target_os = "linux")]
 use smolrunner::state::JournalId;
+#[cfg(target_os = "linux")]
+use smolrunner::trusted_guest_control_dispatcher::serve_trusted_guest_control_stdio;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -424,8 +429,43 @@ struct ServiceStatusErrorReport<'a> {
     message: &'static str,
 }
 
+enum Invocation {
+    #[cfg(target_os = "linux")]
+    GuestControlStdio,
+    Cli(Cli),
+}
+
+fn try_parse_invocation_from<I, T>(arguments: I) -> Result<Invocation, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString>,
+{
+    let arguments = arguments.into_iter().map(Into::into).collect::<Vec<_>>();
+    #[cfg(target_os = "linux")]
+    if arguments.len() == 3
+        && arguments
+            .get(1)
+            .is_some_and(|value| value == OsStr::new("guest-control"))
+        && arguments
+            .get(2)
+            .is_some_and(|value| value == OsStr::new("--stdio"))
+    {
+        return Ok(Invocation::GuestControlStdio);
+    }
+    Cli::try_parse_from(arguments).map(Invocation::Cli)
+}
+
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let invocation =
+        try_parse_invocation_from(std::env::args_os()).unwrap_or_else(|error| error.exit());
+    #[cfg(target_os = "linux")]
+    let cli = match invocation {
+        #[cfg(target_os = "linux")]
+        Invocation::GuestControlStdio => return run_trusted_guest_control_stdio(),
+        Invocation::Cli(cli) => cli,
+    };
+    #[cfg(not(target_os = "linux"))]
+    let Invocation::Cli(cli) = invocation;
 
     match cli.command {
         Command::Doctor { strict } => run_doctor(cli.output, strict),
@@ -558,6 +598,17 @@ fn main() -> ExitCode {
                 &request_id,
             ),
         },
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_trusted_guest_control_stdio() -> ExitCode {
+    match serve_trusted_guest_control_stdio() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("guest-control transport failure: {}", error.code());
+            ExitCode::from(2)
+        }
     }
 }
 
@@ -1736,7 +1787,9 @@ mod tests {
         WorkerCommand,
     };
     #[cfg(target_os = "linux")]
-    use super::{HostPreparePhaseKind, classify_host_prepare_actions};
+    use super::{
+        HostPreparePhaseKind, Invocation, classify_host_prepare_actions, try_parse_invocation_from,
+    };
     #[cfg(target_os = "macos")]
     use super::{approved_enrollment_bytes, read_private_disposable_worker_enrollment};
 
@@ -1772,6 +1825,45 @@ mod tests {
         assert_eq!(file, PathBuf::from("project.yml"));
         assert_eq!(account_file, Some(PathBuf::from("runner.account.yml")));
         assert_eq!(confirm.as_deref(), Some("host-preparation-v1.00"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn guest_control_cli_accepts_only_the_exact_hidden_stdio_fence() {
+        let invocation = try_parse_invocation_from(["smolrunner", "guest-control", "--stdio"])
+            .expect("parse exact guest-control stdio fence");
+        assert!(matches!(invocation, Invocation::GuestControlStdio));
+        assert!(try_parse_invocation_from(["smolrunner", "guest-control"]).is_err());
+        assert!(
+            try_parse_invocation_from([
+                "smolrunner",
+                "--output",
+                "json",
+                "guest-control",
+                "--stdio",
+            ])
+            .is_err()
+        );
+        assert!(
+            try_parse_invocation_from([
+                "smolrunner",
+                "guest-control",
+                "--stdio",
+                "--output",
+                "json",
+            ])
+            .is_err()
+        );
+        assert!(
+            try_parse_invocation_from([
+                "smolrunner",
+                "guest-control",
+                "--stdio",
+                "--operation",
+                "probe_guest_control",
+            ])
+            .is_err()
+        );
     }
 
     #[test]
