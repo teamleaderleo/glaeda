@@ -340,16 +340,6 @@ impl HeldLimaSource {
         self.directory.revalidate_stable_identity()
     }
 
-    pub(super) fn with_inventory_capture_path<T>(
-        &self,
-        capture: impl FnOnce(&Path) -> T,
-    ) -> Result<T, ProjectDiskHostObservationError> {
-        self.confirm_path_binding()?;
-        let result = capture(&self.path.physical);
-        self.confirm_path_binding()?;
-        Ok(result)
-    }
-
     pub(super) fn into_planned_request(
         self,
         disk_name: LimaStandaloneDiskName,

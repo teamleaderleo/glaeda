@@ -120,17 +120,14 @@ impl HeldProjectDiskLimaSource {
         &self.identity
     }
 
-    /// Borrow the private LIMA_HOME only for one exact inventory capture window.
+    /// Reconfirm that the configured path still resolves to this exact held source.
     ///
-    /// The retained descriptor/path binding is confirmed immediately before and after the
-    /// callback. This is crate-private so product callers cannot obtain a generic path accessor;
-    /// #696 may use it only while constructing and executing its reviewed inventory capture.
+    /// This exposes no path, descriptor, process hook, or callback. The concrete #696 inventory
+    /// operation will remain inside this owning module and bracket its fixed child invocation with
+    /// this confirmation while borrowing the otherwise-private held state.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn with_inventory_capture_path<T>(
-        &self,
-        capture: impl FnOnce(&Path) -> T,
-    ) -> Result<T, ProjectDiskHostObservationError> {
-        self.inner.with_inventory_capture_path(capture)
+    pub(super) fn confirm_path_binding(&self) -> Result<(), ProjectDiskHostObservationError> {
+        self.inner.confirm_path_binding()
     }
 }
 

@@ -480,7 +480,7 @@ mod tests {
         fs::set_permissions(&fixture.lima_home, fs::Permissions::from_mode(0o700)).unwrap();
 
         assert_eq!(source.identity(), &configured_identity);
-        let error = held.with_inventory_capture_path(|_| ()).unwrap_err();
+        let error = held.confirm_path_binding().unwrap_err();
         assert_eq!(error.code(), "project_disk_observation_changed");
         let debug = format!("{held:?}");
         assert!(!debug.contains(fixture.root.to_str().unwrap()));
@@ -488,20 +488,16 @@ mod tests {
     }
 
     #[test]
-    fn inventory_capture_borrow_confirms_the_same_held_source_before_and_after() {
+    fn held_source_confirmation_can_bracket_future_capture_without_exposing_a_path() {
         let fixture = FacadeFixture::new();
         let source = ConfiguredProjectDiskLimaSource::new(&fixture.lima_home).unwrap();
         let held = source.hold().unwrap();
-        let canonical_lima_home = fs::canonicalize(&fixture.lima_home).unwrap();
+        held.confirm_path_binding().unwrap();
         let old_home = fixture.root.join("captured-old-lima");
-        let error = held
-            .with_inventory_capture_path(|private_path| {
-                assert_eq!(private_path, canonical_lima_home);
-                fs::rename(&fixture.lima_home, &old_home).unwrap();
-                fs::create_dir(&fixture.lima_home).unwrap();
-                fs::set_permissions(&fixture.lima_home, fs::Permissions::from_mode(0o700)).unwrap();
-            })
-            .unwrap_err();
+        fs::rename(&fixture.lima_home, &old_home).unwrap();
+        fs::create_dir(&fixture.lima_home).unwrap();
+        fs::set_permissions(&fixture.lima_home, fs::Permissions::from_mode(0o700)).unwrap();
+        let error = held.confirm_path_binding().unwrap_err();
         assert_eq!(error.code(), "project_disk_observation_changed");
     }
 
