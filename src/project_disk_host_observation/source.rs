@@ -304,6 +304,7 @@ const fn invalid_source() -> ProjectDiskLimaSourceError {
     }
 }
 
+#[cfg(target_os = "macos")]
 const fn unsafe_source() -> ProjectDiskLimaSourceError {
     ProjectDiskLimaSourceError {
         code: "project_disk_lima_source_unsafe",
