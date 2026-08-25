@@ -13,6 +13,7 @@
 // provenance seam.
 #[allow(dead_code)]
 mod raw;
+mod source;
 
 use std::fmt;
 
@@ -22,10 +23,14 @@ use crate::artifact::Sha256Digest;
 
 pub use raw::{
     LimaStandaloneDiskAbsenceObservation, LimaStandaloneDiskAbsenceSummary,
-    LimaStandaloneDiskDisposition, LimaStandaloneDiskName, LimaStandaloneDiskObservationRequest,
+    LimaStandaloneDiskDisposition, LimaStandaloneDiskName,
     PROJECT_DISK_HOST_OBSERVATION_SCHEMA_VERSION, ProjectDiskHostObservationError,
     ProjectDiskHostObservationErrorKind, ProjectDiskPhysicalIdentity,
-    observe_lima_standalone_disk_absence,
+};
+pub use source::{
+    ConfiguredProjectDiskLimaSource, LimaStandaloneDiskFixtureObservationRequest,
+    LimaStandaloneDiskObservationRequest, ProjectDiskLimaSourceError,
+    ProjectDiskLimaSourceIdentity, ProjectDiskLimaSourceIdentityParseError,
 };
 
 /// Persistable opaque identity for the exact backing entry observed by P2.
@@ -179,6 +184,19 @@ impl fmt::Debug for LimaStandaloneDiskObservation {
     }
 }
 
+/// Observe one planned locator as absent using a production request derived by P2.
+///
+/// # Errors
+///
+/// Fails closed if the derived child exists, inventory reports it, or the retained source/collection
+/// evidence cannot satisfy the existing raw descriptor contract.
+pub fn observe_lima_standalone_disk_absence(
+    request: LimaStandaloneDiskObservationRequest,
+    inventory_json_lines: &[u8],
+) -> Result<LimaStandaloneDiskAbsenceObservation, ProjectDiskHostObservationError> {
+    raw::observe_lima_standalone_disk_absence(request.into_raw(), inventory_json_lines)
+}
+
 /// Observe one existing standalone disk as unbound physical evidence.
 ///
 /// The private raw observer performs the physically accepted descriptor/no-follow/inventory checks.
@@ -192,6 +210,29 @@ impl fmt::Debug for LimaStandaloneDiskObservation {
 /// rebind/drift during the observation window.
 pub fn observe_lima_standalone_disk(
     request: LimaStandaloneDiskObservationRequest,
+    inventory_json_lines: &[u8],
+) -> Result<LimaStandaloneDiskObservation, ProjectDiskHostObservationError> {
+    observe_raw_lima_standalone_disk(request.into_raw(), inventory_json_lines)
+}
+
+/// Observe one explicitly supplied retained fixture as unbound diagnostic evidence.
+///
+/// This entrypoint is deliberately request-type-distinct from the production source+locator path.
+/// It is useful for the retained #634 research fixture and grants no path into the live P3
+/// absence->create->created transition, which consumes a held production absence lease instead.
+///
+/// # Errors
+///
+/// Returns the same bounded raw P2 refusal as the ordinary observation path.
+pub fn observe_lima_standalone_disk_fixture(
+    request: LimaStandaloneDiskFixtureObservationRequest,
+    inventory_json_lines: &[u8],
+) -> Result<LimaStandaloneDiskObservation, ProjectDiskHostObservationError> {
+    observe_raw_lima_standalone_disk(request.into_raw(), inventory_json_lines)
+}
+
+fn observe_raw_lima_standalone_disk(
+    request: raw::LimaStandaloneDiskObservationRequest,
     inventory_json_lines: &[u8],
 ) -> Result<LimaStandaloneDiskObservation, ProjectDiskHostObservationError> {
     let inner = raw::observe_lima_standalone_disk(request, inventory_json_lines)?;
