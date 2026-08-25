@@ -6,21 +6,21 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
-use smolrunner::debian_package_probe::DpkgQueryProbe;
-use smolrunner::host::Presence;
-use smolrunner::journal::{ExecutionLane, PlannedMutation, Preconditions, RollbackClass};
-use smolrunner::lane_command::{LaneCommand, LinuxAccountName, PackageName, RunnerUserContext};
-use smolrunner::lane_executable::verify_executable;
-use smolrunner::lane_executor::{RootLaneExecutor, RunnerUserLaneExecutor};
-use smolrunner::process::{CommandExecutor, CommandSpec, ProcessExecutor};
-use smolrunner::runner_account_observation::{
+use glaeda::debian_package_probe::DpkgQueryProbe;
+use glaeda::host::Presence;
+use glaeda::journal::{ExecutionLane, PlannedMutation, Preconditions, RollbackClass};
+use glaeda::lane_command::{LaneCommand, LinuxAccountName, PackageName, RunnerUserContext};
+use glaeda::lane_executable::verify_executable;
+use glaeda::lane_executor::{RootLaneExecutor, RunnerUserLaneExecutor};
+use glaeda::process::{CommandExecutor, CommandSpec, ProcessExecutor};
+use glaeda::runner_account_observation::{
     RunnerAccountObservationPaths, getent_command, observe_runner_account,
 };
-use smolrunner::runner_account_plan::{
+use glaeda::runner_account_plan::{
     DesiredRunnerAccount, PlannedSubordinateRange, PreparationObservationState,
     RunnerAccountPlanDisposition, RunnerAccountResourceKind, build_runner_account_plan,
 };
-use smolrunner::runner_user::{
+use glaeda::runner_user::{
     inspect_runtime_directory, parse_passwd_record, parse_subordinate_ranges, verify_runner_user,
 };
 

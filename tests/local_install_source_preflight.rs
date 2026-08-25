@@ -8,16 +8,16 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use sha2::{Digest as _, Sha256};
-use smolrunner::artifact::{CommitId, GitTreeId, Sha256Digest};
-use smolrunner::local_install_plan::{LocalInstallSourceIdentity, LocalInstallToolchainIdentity};
-use smolrunner::local_install_source_preflight::{
+use glaeda::artifact::{CommitId, GitTreeId, Sha256Digest};
+use glaeda::local_install_plan::{LocalInstallSourceIdentity, LocalInstallToolchainIdentity};
+use glaeda::local_install_source_preflight::{
     LocalInstallSourceBlockingCode, observe_local_install_source_preflight,
 };
-use smolrunner::process::{CommandExecutor, CommandSpec, ExecutionRecord, TimedCommandExecutor};
-use smolrunner::project_checkout_observation::{
+use glaeda::process::{CommandExecutor, CommandSpec, ExecutionRecord, TimedCommandExecutor};
+use glaeda::project_checkout_observation::{
     PROJECT_CHECKOUT_COMMAND_TIMEOUT, ProjectCheckoutObserver,
 };
+use sha2::{Digest as _, Sha256};
 
 const COMMIT: &str = "1111111111111111111111111111111111111111";
 const TREE: &str = "2222222222222222222222222222222222222222";

@@ -1011,7 +1011,7 @@ mod tests {
         let human = report.render_human();
         assert!(human.contains("current=unobserved"));
         assert!(human.contains("worker activity: never"));
-        assert!(human.contains("next: smolrunner worker run-once"));
+        assert!(human.contains("next: glaeda worker run-once"));
     }
 
     #[test]
