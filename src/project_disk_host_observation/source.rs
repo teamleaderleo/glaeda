@@ -161,7 +161,8 @@ impl LimaStandaloneDiskObservationRequest {
             disk_name.clone(),
             source.canonical_lima_home().to_owned(),
             disk_directory,
-        )?;
+        )?
+        .with_planned_source_identity(source.identity().clone());
         Ok(Self {
             inner,
             source_identity: source.identity().clone(),

@@ -12,7 +12,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::path::{Component, Path, PathBuf};
 
@@ -28,6 +28,8 @@ use crate::lima_observation::{
     LimaInstanceName, LimaObservationRequest, LimaObservationSourceIdentity,
 };
 use crate::project_catalog::ProjectIdentity;
+
+use super::source::ProjectDiskLimaSourceIdentity;
 use crate::project_disk_lease::{
     ProjectDiskAttachmentGeneration, ProjectDiskAttachmentLease, ProjectDiskGeneration,
     ProjectDiskId, ProjectDiskLeaseRecord, ProjectDiskLeaseState, ProjectDiskLockObservation,
@@ -148,6 +150,7 @@ pub struct LimaStandaloneDiskAbsenceSummary {
     schema_version: u8,
     disk_directory_absent: bool,
     inventory_record_absent: bool,
+    proven_collection_absent: bool,
     retained_lima_home_descriptor: bool,
     retained_collection_descriptor: bool,
 }
@@ -166,6 +169,25 @@ impl LimaStandaloneDiskAbsenceSummary {
     #[must_use]
     pub const fn inventory_record_absent(&self) -> bool {
         self.inventory_record_absent
+    }
+
+    /// Whether the whole standalone-disk collection itself was proven absent.
+    ///
+    /// True means first-disk bootstrap held only the Lima-home descriptor while proving the exact
+    /// collection child absent beneath it; the collection descriptor is then not retained.
+    #[must_use]
+    pub const fn proven_collection_absent(&self) -> bool {
+        self.proven_collection_absent
+    }
+
+    #[must_use]
+    pub const fn retained_lima_home_descriptor(&self) -> bool {
+        self.retained_lima_home_descriptor
+    }
+
+    #[must_use]
+    pub const fn retained_collection_descriptor(&self) -> bool {
+        self.retained_collection_descriptor
     }
 }
 
@@ -217,6 +239,7 @@ pub struct LimaStandaloneDiskObservationRequest {
     lima_home: AcceptedPath,
     disk_directory: AcceptedPath,
     collection_name: OsString,
+    planned_source_identity: Option<ProjectDiskLimaSourceIdentity>,
 }
 
 impl LimaStandaloneDiskObservationRequest {
@@ -255,7 +278,20 @@ impl LimaStandaloneDiskObservationRequest {
             lima_home,
             disk_directory,
             collection_name,
+            planned_source_identity: None,
         })
+    }
+
+    /// Mark this request as derived from one configured planned source identity.
+    ///
+    /// Only planned production requests may later mint a #700 create-durability target; explicit
+    /// fixture requests stay permanently ineligible.
+    pub(super) fn with_planned_source_identity(
+        mut self,
+        identity: ProjectDiskLimaSourceIdentity,
+    ) -> Self {
+        self.planned_source_identity = Some(identity);
+        self
     }
 
     #[must_use]
@@ -499,13 +535,20 @@ pub struct LimaStandaloneDiskObservation {
     attached_source: Option<LimaObservationSourceIdentity>,
 }
 
+/// Held lineage of one absence proof: either the trusted collection descriptor itself, or exact
+/// proof that the collection child was absent beneath the held Lima home (first-disk bootstrap).
+enum HeldAbsenceCollection {
+    Bound(BoundDirectory),
+    ProvenAbsent,
+}
+
 /// Opaque held proof that one planned locator is absent from a trusted private disk collection and
 /// from the supplied strict Lima inventory observation.
 pub struct LimaStandaloneDiskAbsenceObservation {
     summary: LimaStandaloneDiskAbsenceSummary,
     request: LimaStandaloneDiskObservationRequest,
     lima_home: BoundDirectory,
-    collection: BoundDirectory,
+    collection: HeldAbsenceCollection,
 }
 
 impl LimaStandaloneDiskAbsenceObservation {
@@ -519,18 +562,127 @@ impl LimaStandaloneDiskAbsenceObservation {
     /// # Errors
     ///
     /// Returns a bounded changed refusal if an entry or inventory record appears or either held
-    /// parent is rebound.
+    /// parent is rebound. When the collection itself was proven absent, any later collection
+    /// appearance also refuses: a foreign collection appearing before create confirmation grants
+    /// zero create authority.
     pub fn confirm(
         &mut self,
         inventory_json_lines: &[u8],
     ) -> Result<(), ProjectDiskHostObservationError> {
         revalidate_absence(self, inventory_json_lines)
     }
+
+    /// Exact pre/post pathname binding check for the accepted private source around a future
+    /// external `limactl` handoff.
+    ///
+    /// Reopens the accepted source pathname under the same reviewed alias discipline and requires
+    /// it to still resolve to the exact physical filesystem object held by this lease — device,
+    /// inode, owner, group, and mode. The uninterrupted create transaction legitimately mutates
+    /// parent timestamps and link counts, so those volatile fields stay reserved for the strict
+    /// quiet-window confirmation. This executes no process and exposes no path; it proves only
+    /// that the pathname the child would receive still binds to the held evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded changed refusal when the pathname is deleted, rebound, aliased, or no
+    /// longer names the held physical home object.
+    pub fn confirm_source_path_binding(&self) -> Result<(), ProjectDiskHostObservationError> {
+        let rebound = BoundDirectory::open_path(&self.request.lima_home).map_err(|_| changed())?;
+        let bound = same_stable_directory_identity(&rebound.snapshot, &self.lima_home.snapshot);
+        drop(rebound);
+        if !bound {
+            return Err(changed());
+        }
+        self.lima_home.revalidate_stable_identity()
+    }
+
+    /// Consume this held absence lease and observe the externally created disk as ordinary unbound
+    /// P2 evidence, preserving continuous ancestry at the strongest parent held before creation.
+    ///
+    /// The lease is consumed by value, so one absence proof can feed exactly one created
+    /// observation regardless of outcome. The held home (and collection when present) descriptors
+    /// are revalidated to the exact same stable filesystem object first — device, inode, owner,
+    /// group, and mode; the create transaction itself legitimately mutates parent timestamps and
+    /// directory link counts, so those stay reserved for the strict quiet-window confirmation at
+    /// the end. A proven-absent collection must now exist as an exact private directory opened
+    /// relative to the same held home. Fresh strict inventory must report exactly the planned
+    /// locator, the child opens descriptor-relatively from the retained lineage, and every
+    /// ordinary existing-disk check plus a final full reconfirmation runs before returning.
+    /// Controller death destroys the lease; a fresh same-name observation can never recreate this
+    /// live transition.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed when the source/collection rebinds, the collection or child is still absent,
+    /// the new collection/child is unsafe, inventory is absent/duplicate/malformed/unsupported, or
+    /// any state changes during the window.
+    pub fn observe_created(
+        self,
+        fresh_inventory_json_lines: &[u8],
+    ) -> Result<LimaStandaloneDiskObservation, ProjectDiskHostObservationError> {
+        establish_created_lineage(self, fresh_inventory_json_lines, || {})
+    }
+
+    #[cfg(test)]
+    fn observe_created_with_hook<F>(
+        self,
+        fresh_inventory_json_lines: &[u8],
+        before_final_confirmation: F,
+    ) -> Result<LimaStandaloneDiskObservation, ProjectDiskHostObservationError>
+    where
+        F: FnOnce(),
+    {
+        establish_created_lineage(self, fresh_inventory_json_lines, before_final_confirmation)
+    }
+}
+
+fn establish_created_lineage<F>(
+    lease: LimaStandaloneDiskAbsenceObservation,
+    fresh_inventory_json_lines: &[u8],
+    before_final_confirmation: F,
+) -> Result<LimaStandaloneDiskObservation, ProjectDiskHostObservationError>
+where
+    F: FnOnce(),
+{
+    let LimaStandaloneDiskAbsenceObservation {
+        summary: _,
+        request,
+        lima_home,
+        collection,
+    } = lease;
+    lima_home.revalidate_stable_identity()?;
+    let fresh_home = BoundDirectory::open_path(&request.lima_home).map_err(|_| changed())?;
+    if !same_stable_directory_identity(&fresh_home.snapshot, &lima_home.snapshot) {
+        return Err(changed());
+    }
+    let collection = match collection {
+        HeldAbsenceCollection::Bound(bound) => {
+            bound.revalidate_stable_identity()?;
+            let current = BoundDirectory::open_child(&lima_home.fd, &request.collection_name)?;
+            if !same_stable_directory_identity(&current.snapshot, &bound.snapshot) {
+                return Err(changed());
+            }
+            current
+        }
+        HeldAbsenceCollection::ProvenAbsent => {
+            let created = BoundDirectory::open_child(&lima_home.fd, &request.collection_name)?;
+            validate_private_directory(&created.snapshot)?;
+            created
+        }
+    };
+    drop(lima_home);
+    observe_existing_from_bound_parents(
+        request,
+        fresh_home,
+        collection,
+        fresh_inventory_json_lines,
+        before_final_confirmation,
+    )
 }
 
 impl fmt::Debug for LimaStandaloneDiskAbsenceObservation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let _ = (&self.lima_home.fd, &self.collection.fd);
+        let _ = &self.lima_home.fd;
         formatter
             .debug_struct("LimaStandaloneDiskAbsenceObservation")
             .field("summary", &self.summary)
@@ -684,6 +836,108 @@ impl LimaStandaloneDiskObservation {
     }
 }
 
+impl LimaStandaloneDiskObservation {
+    /// Mint the crate-private #700 create-durability target from one uninterrupted planned
+    /// created observation.
+    ///
+    /// Minting first revalidates every held descriptor, path binding, and the supplied fresh
+    /// inventory, then binds a duplicated read-only held backing descriptor to the exact
+    /// configured source identity, disk locator, physical identity, backing identity, and logical
+    /// bytes. Explicit fixture requests are permanently ineligible. This performs no durability
+    /// mutation itself and exposes no generic path/fd/write/sync authority; #700 owns the single
+    /// reviewed barrier operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded refusal for fixture-origin observations and the ordinary P2 changed
+    /// refusal when any held evidence no longer matches.
+    pub(crate) fn project_disk_create_durability_target(
+        &mut self,
+        fresh_inventory_json_lines: &[u8],
+    ) -> Result<ProjectDiskCreateDurabilityTarget, ProjectDiskHostObservationError> {
+        let Some(source_identity) = self.request.planned_source_identity.clone() else {
+            return Err(durability_target_unavailable());
+        };
+        self.confirm(fresh_inventory_json_lines)?;
+        let backing = self.backing.fd.try_clone().map_err(|_| io_error())?;
+        if snapshot_file(&backing).map_err(|_| changed())? != self.backing.snapshot {
+            return Err(changed());
+        }
+        Ok(ProjectDiskCreateDurabilityTarget {
+            source_identity,
+            disk_name: self.request.disk_name.clone(),
+            physical_identity: self.summary.physical_identity.clone(),
+            backing_identity: self.summary.backing_identity.clone(),
+            backing_logical_bytes: self.summary.backing_logical_bytes,
+            backing,
+        })
+    }
+}
+
+/// Crate-private opaque create-durability seam target required by #700.
+///
+/// Non-cloneable, non-copyable, and non-serializable. It is mintable only from a currently held
+/// planned created observation whose full held revalidation passed, and it binds the exact
+/// configured source identity, disk locator, physical identity, backing identity, logical bytes,
+/// and one duplicated read-only held backing descriptor. It carries zero ownership, adoption, or
+/// mutation authority and no generic path/fd/write/sync surface outside the narrow #700 barrier.
+pub struct ProjectDiskCreateDurabilityTarget {
+    source_identity: ProjectDiskLimaSourceIdentity,
+    disk_name: LimaStandaloneDiskName,
+    physical_identity: ProjectDiskPhysicalIdentity,
+    backing_identity: ProjectDiskBackingIdentity,
+    backing_logical_bytes: u64,
+    backing: OwnedFd,
+}
+
+impl ProjectDiskCreateDurabilityTarget {
+    #[must_use]
+    pub const fn source_identity(&self) -> &ProjectDiskLimaSourceIdentity {
+        &self.source_identity
+    }
+
+    #[must_use]
+    pub const fn disk_name(&self) -> &LimaStandaloneDiskName {
+        &self.disk_name
+    }
+
+    #[must_use]
+    pub const fn physical_identity(&self) -> &ProjectDiskPhysicalIdentity {
+        &self.physical_identity
+    }
+
+    #[must_use]
+    pub const fn backing_identity(&self) -> &ProjectDiskBackingIdentity {
+        &self.backing_identity
+    }
+
+    #[must_use]
+    pub const fn backing_logical_bytes(&self) -> u64 {
+        self.backing_logical_bytes
+    }
+
+    /// Borrowed read-only view of the exact held backing descriptor for the single reviewed #700
+    /// create-durability barrier implementation. This deliberately grants no generic fd authority.
+    #[must_use]
+    pub(crate) fn held_backing_descriptor(&self) -> BorrowedFd<'_> {
+        self.backing.as_fd()
+    }
+}
+
+impl fmt::Debug for ProjectDiskCreateDurabilityTarget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProjectDiskCreateDurabilityTarget")
+            .field("source_identity", &self.source_identity)
+            .field("disk_name", &self.disk_name)
+            .field("physical_identity", &self.physical_identity)
+            .field("backing_identity", &self.backing_identity)
+            .field("backing_logical_bytes", &self.backing_logical_bytes)
+            .field("private_backing_descriptor", &"<redacted>")
+            .finish()
+    }
+}
+
 impl fmt::Debug for LimaStandaloneDiskObservation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let _ = (
@@ -774,9 +1028,11 @@ pub fn observe_lima_standalone_disk(
 
 /// Prove one planned standalone-disk locator absent without creating or adopting it.
 ///
-/// The private Lima home and its directly observed disk collection must already exist. Both are
-/// retained and rebound, the planned basename must be absent relative to the held collection, and
-/// the strict external inventory must contain no record with that locator.
+/// The private Lima home must exist and is always retained. When its directly observed disk
+/// collection exists it is validated and retained with exact planned-child absence; when the
+/// collection itself is absent, first-disk bootstrap instead proves the exact collection child
+/// absent beneath the held home. Both states additionally require the strict external inventory
+/// to contain no record with that locator.
 ///
 /// # Errors
 ///
@@ -802,17 +1058,27 @@ where
     }
     let lima_home = BoundDirectory::open_path(&request.lima_home)?;
     validate_private_directory(&lima_home.snapshot)?;
-    let collection = BoundDirectory::open_child(&lima_home.fd, &request.collection_name)?;
-    validate_private_directory(&collection.snapshot)?;
-    require_entry_absent(&collection.fd, OsStr::new(request.disk_name.as_str()))?;
-
+    let collection = match BoundDirectory::open_child(&lima_home.fd, &request.collection_name) {
+        Ok(collection) => {
+            validate_private_directory(&collection.snapshot)?;
+            require_entry_absent(&collection.fd, OsStr::new(request.disk_name.as_str()))?;
+            HeldAbsenceCollection::Bound(collection)
+        }
+        Err(err) if err.kind() == ProjectDiskHostObservationErrorKind::Missing => {
+            require_entry_absent(&lima_home.fd, &request.collection_name)?;
+            HeldAbsenceCollection::ProvenAbsent
+        }
+        Err(err) => return Err(err),
+    };
+    let proven_collection_absent = matches!(collection, HeldAbsenceCollection::ProvenAbsent);
     let mut observation = LimaStandaloneDiskAbsenceObservation {
         summary: LimaStandaloneDiskAbsenceSummary {
             schema_version: PROJECT_DISK_HOST_OBSERVATION_SCHEMA_VERSION,
             disk_directory_absent: true,
             inventory_record_absent: true,
+            proven_collection_absent,
             retained_lima_home_descriptor: true,
-            retained_collection_descriptor: true,
+            retained_collection_descriptor: !proven_collection_absent,
         },
         request,
         lima_home,
@@ -831,11 +1097,30 @@ fn observe_with_hook<F>(
 where
     F: FnOnce(),
 {
-    let inventory = select_inventory(&request, inventory_json_lines)?;
     let lima_home = BoundDirectory::open_path(&request.lima_home)?;
     validate_private_directory(&lima_home.snapshot)?;
     let collection = BoundDirectory::open_child(&lima_home.fd, &request.collection_name)?;
     validate_private_directory(&collection.snapshot)?;
+    observe_existing_from_bound_parents(
+        request,
+        lima_home,
+        collection,
+        inventory_json_lines,
+        before_revalidation,
+    )
+}
+
+fn observe_existing_from_bound_parents<F>(
+    request: LimaStandaloneDiskObservationRequest,
+    lima_home: BoundDirectory,
+    collection: BoundDirectory,
+    inventory_json_lines: &[u8],
+    before_revalidation: F,
+) -> Result<LimaStandaloneDiskObservation, ProjectDiskHostObservationError>
+where
+    F: FnOnce(),
+{
+    let inventory = select_inventory(&request, inventory_json_lines)?;
     let disk_directory =
         BoundDirectory::open_child(&collection.fd, OsStr::new(request.disk_name.as_str()))?;
     validate_private_directory(&disk_directory.snapshot)?;
@@ -1206,6 +1491,29 @@ impl BoundDirectory {
         }
         Ok(())
     }
+
+    /// Reconfirm only the stable physical identity of the held directory.
+    ///
+    /// The uninterrupted create transaction legitimately mutates the held home/collection
+    /// directories (new child entries change their mutable timestamps and directory link count),
+    /// so the live absence-to-created lineage proves the exact same filesystem object through
+    /// device, inode, owner, group, and mode alone. Volatile fields stay reserved for the strict
+    /// quiet-window confirmation.
+    fn revalidate_stable_identity(&self) -> Result<(), ProjectDiskHostObservationError> {
+        let current = snapshot_directory(&self.fd).map_err(|_| changed())?;
+        if !same_stable_directory_identity(&current, &self.snapshot) {
+            return Err(changed());
+        }
+        Ok(())
+    }
+}
+
+fn same_stable_directory_identity(current: &DirectorySnapshot, held: &DirectorySnapshot) -> bool {
+    current.device == held.device
+        && current.inode == held.inode
+        && current.uid == held.uid
+        && current.gid == held.gid
+        && current.mode == held.mode
 }
 
 struct BoundFile {
@@ -1453,16 +1761,30 @@ fn revalidate_absence(
     inventory_json_lines: &[u8],
 ) -> Result<(), ProjectDiskHostObservationError> {
     observation.lima_home.revalidate()?;
-    observation.collection.revalidate()?;
-    require_same_directory_entry(
-        &observation.lima_home.fd,
-        &observation.request.collection_name,
-        &observation.collection,
-    )?;
-    require_entry_absent(
-        &observation.collection.fd,
-        OsStr::new(observation.request.disk_name.as_str()),
-    )?;
+    match &observation.collection {
+        HeldAbsenceCollection::Bound(collection) => {
+            collection.revalidate()?;
+            require_same_directory_entry(
+                &observation.lima_home.fd,
+                &observation.request.collection_name,
+                collection,
+            )?;
+            require_entry_absent(
+                &collection.fd,
+                OsStr::new(observation.request.disk_name.as_str()),
+            )?;
+        }
+        HeldAbsenceCollection::ProvenAbsent => {
+            require_entry_absent(
+                &observation.lima_home.fd,
+                &observation.request.collection_name,
+            )
+            .map_err(|err| match err.kind() {
+                ProjectDiskHostObservationErrorKind::Present => changed(),
+                _ => err,
+            })?;
+        }
+    }
     if select_inventory_optional(&observation.request, inventory_json_lines)
         .map_err(|_| changed())?
         .is_some()
@@ -1474,12 +1796,20 @@ fn revalidate_absence(
     if rebound_home.snapshot != observation.lima_home.snapshot {
         return Err(changed());
     }
+    drop(rebound_home);
     observation.lima_home.revalidate()?;
-    observation.collection.revalidate()?;
-    require_entry_absent(
-        &observation.collection.fd,
-        OsStr::new(observation.request.disk_name.as_str()),
-    )?;
+    if let HeldAbsenceCollection::Bound(collection) = &observation.collection {
+        collection.revalidate()?;
+        require_entry_absent(
+            &collection.fd,
+            OsStr::new(observation.request.disk_name.as_str()),
+        )?;
+    } else {
+        require_entry_absent(
+            &observation.lima_home.fd,
+            &observation.request.collection_name,
+        )?;
+    }
     Ok(())
 }
 
@@ -1823,6 +2153,14 @@ const fn changed() -> ProjectDiskHostObservationError {
         ProjectDiskHostObservationErrorKind::ChangedDuringObservation,
         "project_disk_observation_changed",
         "project disk evidence changed or was rebound during observation",
+    )
+}
+
+const fn durability_target_unavailable() -> ProjectDiskHostObservationError {
+    error(
+        ProjectDiskHostObservationErrorKind::InvalidInput,
+        "project_disk_create_durability_target_unavailable",
+        "create durability target requires an uninterrupted planned create observation",
     )
 }
 
