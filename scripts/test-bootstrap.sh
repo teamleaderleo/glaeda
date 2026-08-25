@@ -5,7 +5,7 @@ repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 temporary_root=$(mktemp -d)
 trap 'rm -rf "$temporary_root"' EXIT
 
-fixture="$temporary_root/smolrunner"
+fixture="$temporary_root/glaeda"
 mkdir -p "$fixture/scripts" "$temporary_root/bin" "$temporary_root/home"
 cp "$repo_root/scripts/bootstrap" "$fixture/scripts/bootstrap"
 cp -R "$repo_root/scripts/workspace_bootstrap" "$fixture/scripts/workspace_bootstrap"
@@ -50,7 +50,7 @@ write_unavailable_tool podman
 (
   cd "$fixture"
   git init -q
-  git config user.name 'SmolRunner Bootstrap Test'
+  git config user.name 'Glaeda Bootstrap Test'
   git config user.email 'bootstrap-test@example.invalid'
   git remote add origin https://github.com/teamleaderleo/smolrunner.git
   git add Cargo.toml Cargo.lock .gitignore scripts/bootstrap scripts/workspace_bootstrap
