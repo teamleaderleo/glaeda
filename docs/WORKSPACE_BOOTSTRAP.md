@@ -2,9 +2,9 @@
 
 ## Purpose
 
-SmolRunner repositories expose one repository-owned command that evaluates whether a checkout is ready for a named verification profile. The first implementation is read-only: it reports workspace capabilities and refuses installation, source mutation, Git mutation, credential use, and publication.
+Glaeda repositories expose one repository-owned command that evaluates whether a checkout is ready for a named verification profile. The first implementation is read-only: it reports workspace capabilities and refuses installation, source mutation, Git mutation, credential use, and publication.
 
-This boundary remains separate from SmolRunner host preparation and issue #148's runner-owned verification-profile execution.
+This boundary remains separate from Glaeda host preparation and issue #148's runner-owned verification-profile execution.
 
 ## Canonical command
 
@@ -19,7 +19,9 @@ The canonical path is `./scripts/bootstrap`. Each adopting repository owns that 
 
 ## Required working directory
 
-The current working directory must equal the resolved Git worktree root. Invocation from a parent directory, subdirectory, or unrelated worktree ends in `blocked`. The SmolRunner root must contain a `[package]` entry named `smolrunner` in `Cargo.toml` and a committed `Cargo.lock`.
+The current working directory must equal the resolved Git worktree root. Invocation from a parent directory, subdirectory, or unrelated worktree ends in `blocked`. The repository root must contain a `[package]` entry named `smolrunner` in `Cargo.toml` and a committed `Cargo.lock`.
+
+The package marker, receipt type, repository slug, and verification-profile names shown below are exact v1/transition identities. Preserve those `smolrunner` literals until their owning migration lanes introduce and classify successors.
 
 ## Accepted inputs
 

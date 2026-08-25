@@ -1,18 +1,18 @@
-# SmolRunner
+# Glaeda
 
 **Blazingly hot Linux execution for coding agents and GitHub Actions on the Mac you already own.**
 
-SmolRunner turns operator-owned Apple-silicon compute into a trust-tiered Linux execution layer. It keeps GitHub as the ordinary workflow surface, uses Lima/VZ for Linux execution, persists the minimum durable truth required for recovery, and chooses worker residency from trust and measured value.
+Glaeda turns operator-owned Apple-silicon compute into a trust-tiered Linux execution layer. It keeps GitHub as the ordinary workflow surface, uses Lima/VZ for Linux execution, persists the minimum durable truth required for recovery, and chooses worker residency from trust and measured value.
 
 > **Disposable is a capability. Trust decides residency.**
 
-For hostile or unknown repository work, SmolRunner targets one fresh isolated worker, one bounded job, exact teardown, and proven absence. For trusted CI, it can reuse prepared workers, repository seeds, reviewed cache generations, and warm pools. For ultra-trusted agent work, it can keep project sandboxes, worktrees, compiler state, package state, indexes, and selected services resident across edit/test/build loops.
+For hostile or unknown repository work, Glaeda targets one fresh isolated worker, one bounded job, exact teardown, and proven absence. For trusted CI, it can reuse prepared workers, repository seeds, reviewed cache generations, and warm pools. For ultra-trusted agent work, it can keep project sandboxes, worktrees, compiler state, package state, indexes, and selected services resident across edit/test/build loops.
 
 The target experience is simple:
 
 ```text
 agent work appears
--> SmolRunner selects the hottest valid execution path
+-> Glaeda selects the hottest valid execution path
 -> Linux environment is ready
 -> repo / dependencies / build state are already warm where trust permits
 -> useful command starts
@@ -22,11 +22,11 @@ agent work appears
 
 ## Status
 
-SmolRunner is pre-alpha and in live systems acceptance on Apple silicon.
+Glaeda is pre-alpha and in live systems acceptance on Apple silicon.
 
 The strict disposable path already includes a substantial durable controller: prepared Lima/VZ generations, official GitHub Runner Scale Set integration, Keychain credential acquisition, durable assignment and no-replay handling, clone/JIT/teardown composition, LaunchAgent supervision, controller-death evidence, exact worker ownership, and repeated physical Quarry pilots.
 
-Recent work has also established the first trusted persistent runner lane, warm pause/resume, auto-idle behavior, and the new top-level product direction: **make SmolRunner blazingly hot**.
+Recent work has also established the first trusted persistent runner lane, warm pause/resume, auto-idle behavior, and the new top-level product direction: **make Glaeda blazingly hot**.
 
 Current M6 main now carries the first concrete hot-state substrate rather than only a roadmap: bounded hot-execution performance receipts, a pure path-class policy for deciding which state may be shared, crash-safe single-writer project-disk leases, trusted OverlayFS task-view and mount-plan cores, descriptor-bound mount prerequisites, immutable Git object-pool generations with consumer leases and fixed markers, and Git index stat patching for copy-on-write task materialization. These are landed reusable primitives; the end-to-end routing and benchmarked task loop is still being composed around them.
 
@@ -40,7 +40,7 @@ The immediate production work remains:
 
 Hot trusted execution progresses in parallel where it preserves those guarantees. See the [roadmap](docs/ROADMAP.md), [#557](https://github.com/teamleaderleo/smolrunner/issues/557), and the strict disposable programme [#365](https://github.com/teamleaderleo/smolrunner/issues/365).
 
-## What SmolRunner is optimizing
+## What Glaeda is optimizing
 
 The headline metric is **agent wall-clock latency**.
 
@@ -127,7 +127,7 @@ Resident state remains working state. Durable execution truth, source identity, 
 
 Agentic development creates intense filesystem churn: Git worktrees, package stores, `node_modules`, compiler trees, indexes, test outputs, caches, and large cleanup operations.
 
-SmolRunner keeps those repository filesystem operations inside Linux. macOS remains the trusted control plane while the guest handles the small-file-heavy developer workload using Linux filesystem semantics.
+Glaeda keeps those repository filesystem operations inside Linux. macOS remains the trusted control plane while the guest handles the small-file-heavy developer workload using Linux filesystem semantics.
 
 The current prepared worker uses:
 
@@ -143,11 +143,11 @@ The current prepared worker uses:
 
 M6 makes the Linux storage layer itself a benchmark target: XFS/reflink and other credible Linux storage choices, project volumes, cheap task-local forks, package-manager behavior, compiler-tree reuse, and host backing-file growth.
 
-## Why SmolRunner instead of a few Lima commands?
+## Why Glaeda instead of a few Lima commands?
 
-Lima supplies excellent VM primitives. SmolRunner supplies the durable execution runtime around them.
+Lima supplies excellent VM primitives. Glaeda supplies the durable execution runtime around them.
 
-| Capability | Direct Lima | SmolRunner |
+| Capability | Direct Lima | Glaeda |
 |---|---|---|
 | Create/start/stop/delete Linux VMs | ✅ | ✅ |
 | Clone a prepared VM | ✅ | ✅ |
@@ -166,7 +166,7 @@ Lima supplies excellent VM primitives. SmolRunner supplies the durable execution
 | Adaptive cache/verification/routing decisions | DIY | Planned #21/#546/#547 |
 | Agent-readable diagnosis and recovery hints | DIY | Planned #548 |
 
-The distinction becomes clearest around crashes and ambiguity. SmolRunner persists exact authority before external mutations, freshly observes external state during recovery, and preserves debt when ownership or completion remains ambiguous.
+The distinction becomes clearest around crashes and ambiguity. Glaeda persists exact authority before external mutations, freshly observes external state during recovery, and preserves debt when ownership or completion remains ambiguous.
 
 ## Hot execution programme
 
@@ -215,7 +215,7 @@ For ultra-trusted projects, keep expensive dev services resident when their life
 
 ## Durable execution truth
 
-SmolRunner persists the minimum facts required to decide the next safe action after restart. Physical execution state stays replaceable.
+Glaeda persists the minimum facts required to decide the next safe action after restart. Physical execution state stays replaceable.
 
 Useful durable facts include:
 
@@ -246,15 +246,15 @@ For the legacy Linux host-preparation lane, build unprivileged and elevate only 
 
 ```bash
 cargo build --locked
-sudo ./target/debug/smolrunner host prepare --file examples/quarry.yml
-sudo ./target/debug/smolrunner host prepare --file examples/quarry.yml --confirm EXACT_CONFIRMATION
+sudo ./target/debug/glaeda host prepare --file examples/quarry.yml
+sudo ./target/debug/glaeda host prepare --file examples/quarry.yml --confirm EXACT_CONFIRMATION
 ```
 
-Cargo can execute build-time code. Give elevation to the already-built reviewed SmolRunner binary.
+Cargo can execute build-time code. Give elevation to the already-built reviewed Glaeda binary.
 
 ## Manifest boundary
 
-A SmolRunner manifest describes host and execution policy while repositories continue to own build/test semantics and GitHub workflow YAML.
+A Glaeda manifest describes host and execution policy while repositories continue to own build/test semantics and GitHub workflow YAML.
 
 ```yaml
 version: 1
@@ -298,7 +298,7 @@ See the [manifest reference](docs/MANIFEST.md) and example [Quarry](examples/qua
 - **Linux executes; Mac controls.** Repository filesystem churn lives in Linux while secrets and durable control stay outside the worker.
 - **Measure complete loops.** Optimize queue/edit-to-useful-result and fleet throughput.
 - **Explain reuse.** Reports should say what stayed resident, what hit, what reset, and why.
-- **Stay smol.** Prefer mature components and a compact explicit control surface.
+- **Stay lean.** Prefer mature components and a compact explicit control surface.
 
 ## Development
 
@@ -330,4 +330,4 @@ cargo run --locked --quiet -- --output json host plan --file examples/quarry.yml
 
 ## License
 
-SmolRunner is licensed under the [Apache License, Version 2.0](LICENSE).
+Glaeda is licensed under the [Apache License, Version 2.0](LICENSE).
