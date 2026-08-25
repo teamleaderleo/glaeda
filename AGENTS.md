@@ -1,10 +1,10 @@
-# SmolRunner agent instructions
+# Glaeda agent instructions
 
-SmolRunner is pronounced “small runner.” Treat “SmallRunner” and “small runner” as references to this project when context points here.
+Use **Glaeda** / `glaeda` for current product and command surfaces. Historical sources may still say **SmolRunner**; preserve that name when it is part of truthful old evidence, an exact v1 identity, or an explicit migration note.
 
 ## Product boundary
 
-SmolRunner is a Rust execution runtime for **blazingly hot, trust-tiered Linux work on compute the operator controls**.
+Glaeda is a Rust execution runtime for **blazingly hot, trust-tiered Linux work on compute the operator controls**.
 
 The product has three intentional execution classes:
 
@@ -16,17 +16,17 @@ Disposable execution is a capability. Trust decides residency.
 
 All three classes share one durable correctness kernel: exact execution/ownership identity, bounded authority, fresh external observation, crash recovery, and physical state that can be destroyed without losing the ability to decide the next safe action.
 
-GitHub Actions remains the ordinary scheduler and workflow language for GitHub jobs. SmolRunner owns local admission, execution policy, durable identity, worker/project lifecycle, recovery, hot-state lifecycle, and measured execution decisions around that interface.
+GitHub Actions remains the ordinary scheduler and workflow language for GitHub jobs. Glaeda owns local admission, execution policy, durable identity, worker/project lifecycle, recovery, hot-state lifecycle, and measured execution decisions around that interface.
 
 The first hostile-workload boundary is a disposable Lima/VZ virtual machine with no host integration, a one-job just-in-time official runner, controlled network egress, and hard host-wide resource limits. The first hot trusted lane is Linux project residency on the operator Mac, with Lima/VZ as the current baseline and alternative mature backends selected from measurement.
 
-Do not turn SmolRunner into a new pipeline language, runner protocol, Kubernetes controller, public multi-tenant platform, custom hypervisor/container runtime, generic cloud scheduler, or automatic production deployment system.
+Do not turn Glaeda into a new pipeline language, runner protocol, Kubernetes controller, public multi-tenant platform, custom hypervisor/container runtime, generic cloud scheduler, or automatic production deployment system.
 
 ## Current priorities
 
 1. **Finish the strict disposable lifecycle.** Complete the end-to-end installed-service GitHub job path in `docs/DISPOSABLE_AUTOSCALING_CI.md` / #365 so hostile work has a dependable fresh-worker capability.
 2. **Close the hostile boundary.** Preserve the threat-model invariants in `docs/THREAT_MODEL.md`: hostile jobs stay inside a disposable VM, receive no host integrations or unrelated secrets, have controlled network access and hard resource ceilings, and leave no useful hostile writable persistence after destruction.
-3. **Make SmolRunner blazingly hot.** Follow #557/#556 and `docs/BLAZINGLY_HOT.md`. Optimize agent wall-clock latency and choose residency from trust, workload, validity, and measured value.
+3. **Make Glaeda blazingly hot.** Follow #557/#556 and `docs/BLAZINGLY_HOT.md`. Optimize agent wall-clock latency and choose residency from trust, workload, validity, and measured value.
 4. **Measure before promoting optimizations.** #563 owns the bounded common performance receipt. #560 owns resident project storage. #562 owns cheap task/worktree materialization. #561 owns resident backend comparison. Use comparable receipts before selecting defaults.
 5. **Keep valuable trusted state resident.** Ultra-trusted projects may intentionally retain project-local mutable checkout, dependency, build, index, and service state when exact lease/validity/reset rules exist.
 6. **Keep hostile reuse separately reviewed.** Cross-job state consumed by hostile/unknown work must use explicit immutable/read-only or separately reviewed cache-generation contracts. Consumer authority and publisher authority remain distinct.
@@ -115,7 +115,7 @@ Physical hot-execution benchmarks mutate local test/project state and require ex
 
 Before one experiment:
 
-1. record exact SmolRunner head, macOS/hardware identity class, backend version, guest/kernel/filesystem identity, project/revision, toolchain/package-manager versions, resource profile, and experiment candidate;
+1. record exact Glaeda head, macOS/hardware identity class, backend version, guest/kernel/filesystem identity, project/revision, toolchain/package-manager versions, resource profile, and experiment candidate;
 2. keep one semantic workload constant while changing one optimization dimension;
 3. record cold and warm/reuse paths separately;
 4. record physical allocated bytes and host backing growth separately from logical file sizes;

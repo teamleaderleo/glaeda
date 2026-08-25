@@ -1,6 +1,6 @@
 # Blazingly hot execution
 
-SmolRunner should feel like an execution runtime that anticipated the next agent action.
+Glaeda should feel like an execution runtime that anticipated the next agent action.
 
 > **Disposable is a capability. Trust decides residency.**
 
@@ -93,22 +93,22 @@ resident task loop
 
 Repeat under concurrent agent load.
 
-Use Quarry first for Python/project residency and SmolRunner itself for Rust incremental build state.
+Use Quarry first for Python/project residency and Glaeda itself for Rust incremental build state.
 
 ## Linux storage programme
 
-SmolRunner already places repository filesystem churn inside Linux. The host Mac sees Lima/VZ backing storage while Git, package managers, compilers, indexes, and cleanup operate in the guest.
+Glaeda already places repository filesystem churn inside Linux. The host Mac sees Lima/VZ backing storage while Git, package managers, compilers, indexes, and cleanup operate in the guest.
 
 Make that Linux storage path a deliberate benchmark target.
 
 ### Useful primitives already available
 
-Current mature components already expose several pieces SmolRunner can compose and measure:
+Current mature components already expose several pieces Glaeda can compose and measure:
 
 - Lima supports [standalone additional disks](https://lima-vm.io/docs/config/disk/) that can persist independently of a VM instance, giving a resident project disk its own lifecycle;
 - Linux/XFS supports reflink/CoW file cloning, giving task materialization a cheap unchanged-file primitive;
 - pnpm supports [`packageImportMethod=clone`](https://pnpm.io/settings#packageimportmethod), allowing a reflink-capable filesystem to CoW-import package files from the content-addressable store;
-- Git supports `worktree add --no-checkout`, giving SmolRunner a clean point to pre-populate exact unchanged bytes before ordinary checkout completes and verifies the task tree.
+- Git supports `worktree add --no-checkout`, giving Glaeda a clean point to pre-populate exact unchanged bytes before ordinary checkout completes and verifies the task tree.
 
 Treat each primitive as a benchmark candidate. Compose them only after the individual value is visible.
 
@@ -309,7 +309,7 @@ Measure:
 - task/worktree fan-out on the selected project storage;
 - Lima versus Apple container-machine residency after the storage workload is held constant.
 
-### SmolRunner
+### Glaeda
 
 Measure:
 
@@ -339,4 +339,4 @@ reset/invalidation behavior
 fallback path
 ```
 
-SmolRunner should explain why a run was hot, cold, reset, or resident in ordinary language and typed JSON.
+Glaeda should explain why a run was hot, cold, reset, or resident in ordinary language and typed JSON.
