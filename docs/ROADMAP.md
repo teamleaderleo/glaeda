@@ -1,12 +1,12 @@
 # Roadmap
 
-SmolRunner's product goal is a **blazingly hot Linux execution substrate for coding agents and GitHub Actions on compute the operator controls**.
+Glaeda's product goal is a **blazingly hot Linux execution substrate for coding agents and GitHub Actions on compute the operator controls**.
 
 The core rule is:
 
 > **Disposable is a capability, not a mandate. Trust decides residency.**
 
-SmolRunner should do every reusable, trustworthy piece of work before the next task asks for it. Hostile work receives a fresh isolated worker and exact teardown. Trusted CI can use prepared workers, repository seeds, reviewed caches, and warm pools. Ultra-trusted agent work can keep project sandboxes, incremental compiler state, package state, indexes, and selected services resident across edit/test/build loops.
+Glaeda should do every reusable, trustworthy piece of work before the next task asks for it. Hostile work receives a fresh isolated worker and exact teardown. Trusted CI can use prepared workers, repository seeds, reviewed caches, and warm pools. Ultra-trusted agent work can keep project sandboxes, incremental compiler state, package state, indexes, and selected services resident across edit/test/build loops.
 
 The shared correctness requirement across all of those modes is durable execution truth: destroying physical state must preserve enough exact evidence to recover safely, and retaining physical state must never make correctness depend on that state surviving.
 
@@ -21,7 +21,7 @@ The strict hostile-work lifecycle remains governed by [Disposable autoscaling CI
 
 ## Product boundary
 
-GitHub Actions remains the ordinary workflow scheduler, check/status surface, and canonical hosted job-log surface for GitHub jobs. SmolRunner owns execution admission, trust policy, durable identity, local lifecycle, recovery, hot-state lifecycle, and measured execution decisions around that interface.
+GitHub Actions remains the ordinary workflow scheduler, check/status surface, and canonical hosted job-log surface for GitHub jobs. Glaeda owns execution admission, trust policy, durable identity, local lifecycle, recovery, hot-state lifecycle, and measured execution decisions around that interface.
 
 The first production host/backend remains an operator-owned Apple-silicon Mac running Lima with Apple Virtualization Framework and pinned ARM64 Linux guests. Linux carries the repository filesystem workload; macOS remains the trusted control plane.
 
@@ -43,7 +43,7 @@ ultra-trusted agent work
 
 Trusted CI sits between those poles and may combine prepared disposable workers with reviewed reusable generations, repository seeds, warm pools, compiler caches, and derived verification artifacts.
 
-Prefer mature components for GitHub protocol semantics, VM isolation, guest OS, networking enforcement, filesystems, compiler/dependency caching, container builds, and macOS service supervision. SmolRunner should own the policy and recovery layer that joins them.
+Prefer mature components for GitHub protocol semantics, VM isolation, guest OS, networking enforcement, filesystems, compiler/dependency caching, container builds, and macOS service supervision. Glaeda should own the policy and recovery layer that joins them.
 
 ## Durable execution kernel
 
@@ -288,7 +288,7 @@ Turn the hot execution substrate into a system that improves from repeated work.
 - [ ] Explain every decision through stable human/JSON reports: residency, source validity, cache hits, reset reasons, expected first-test latency, and selected target.
 - [ ] Preserve ordinary GitHub workflows as the default interface while allowing explicit trusted agent dispatch to consume routing/planning recommendations.
 
-**M7 acceptance:** SmolRunner behaves like an execution runtime that gets quicker and easier to operate as it sees the same projects repeatedly, while every optimization remains inspectable, reversible, and bounded by trust.
+**M7 acceptance:** Glaeda behaves like an execution runtime that gets quicker and easier to operate as it sees the same projects repeatedly, while every optimization remains inspectable, reversible, and bounded by trust.
 
 ## Hotness hierarchy
 
