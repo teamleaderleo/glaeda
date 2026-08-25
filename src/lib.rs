@@ -258,6 +258,9 @@ pub mod project_checkout_observation;
 pub mod project_discovery;
 /// Pure no-replay lifecycle for one exact formatted project-disk attachment.
 pub mod project_disk_attachment_state;
+/// Pure crash/replay authority checkpoints for exact project-disk creation.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod project_disk_create_state;
 /// Pure identity vocabulary for one formatted project-disk filesystem generation.
 pub mod project_disk_filesystem;
 /// Descriptor-bound read-only observation of Lima standalone project disks.
