@@ -7,7 +7,6 @@
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 
 use crate::artifact::Sha256Digest;
 use crate::project_catalog::ProjectIdentity;
@@ -18,15 +17,13 @@ use crate::trusted_guest_control_protocol::{
     TrustedGuestControlBinaryBinding, TrustedGuestControlOperation, TrustedGuestControlRequest,
     TrustedGuestControlTargetIdentity, trusted_guest_control_authority_digest,
 };
+use crate::trusted_guest_control_transaction::{
+    trusted_guest_control_payload_body_digest, trusted_guest_control_result_body_digest,
+};
 
 pub const TRUSTED_GUEST_CONTROL_PROBE_SCHEMA_VERSION: u8 = 1;
 pub const MAX_TRUSTED_GUEST_CONTROL_PROBE_PAYLOAD_BYTES: usize = 1_024;
 pub const MAX_TRUSTED_GUEST_CONTROL_PROBE_RESULT_BYTES: usize = 1_024;
-
-const PAYLOAD_DIGEST_DOMAIN: &[u8] = b"smolrunner-trusted-guest-control-probe-payload-v1\0";
-const RESULT_DIGEST_DOMAIN: &[u8] = b"smolrunner-trusted-guest-control-probe-result-v1\0";
-const SHA256_PREFIX: &str = "sha256:";
-const HEX: &[u8; 16] = b"0123456789abcdef";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrustedGuestControlProbePayload {
@@ -265,9 +262,17 @@ impl std::error::Error for TrustedGuestControlProbeProtocolError {}
 pub fn encode_trusted_guest_control_probe_payload(
     payload: &TrustedGuestControlProbePayload,
 ) -> Result<Vec<u8>, TrustedGuestControlProbeProtocolError> {
-    canonical_json(
+    let mut bytes = encode_trusted_guest_control_probe_payload_body(payload)?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+pub fn encode_trusted_guest_control_probe_payload_body(
+    payload: &TrustedGuestControlProbePayload,
+) -> Result<Vec<u8>, TrustedGuestControlProbeProtocolError> {
+    canonical_json_body(
         &ProbePayloadWire::from(payload),
-        MAX_TRUSTED_GUEST_CONTROL_PROBE_PAYLOAD_BYTES,
+        MAX_TRUSTED_GUEST_CONTROL_PROBE_PAYLOAD_BYTES - 1,
     )
 }
 
@@ -275,9 +280,19 @@ pub fn decode_trusted_guest_control_probe_payload(
     bytes: &[u8],
 ) -> Result<TrustedGuestControlProbePayload, TrustedGuestControlProbeProtocolError> {
     require_size(bytes, MAX_TRUSTED_GUEST_CONTROL_PROBE_PAYLOAD_BYTES)?;
+    let Some(body) = bytes.strip_suffix(b"\n") else {
+        return Err(noncanonical());
+    };
+    decode_trusted_guest_control_probe_payload_body(body)
+}
+
+pub fn decode_trusted_guest_control_probe_payload_body(
+    bytes: &[u8],
+) -> Result<TrustedGuestControlProbePayload, TrustedGuestControlProbeProtocolError> {
+    require_size(bytes, MAX_TRUSTED_GUEST_CONTROL_PROBE_PAYLOAD_BYTES - 1)?;
     let wire: ProbePayloadWire = serde_json::from_slice(bytes).map_err(|_| malformed())?;
     let payload = payload_from_wire(wire)?;
-    if encode_trusted_guest_control_probe_payload(&payload)? != bytes {
+    if encode_trusted_guest_control_probe_payload_body(&payload)? != bytes {
         return Err(noncanonical());
     }
     Ok(payload)
@@ -286,18 +301,27 @@ pub fn decode_trusted_guest_control_probe_payload(
 pub fn trusted_guest_control_probe_payload_digest(
     payload: &TrustedGuestControlProbePayload,
 ) -> Result<Sha256Digest, TrustedGuestControlProbeProtocolError> {
-    digest(
-        PAYLOAD_DIGEST_DOMAIN,
-        &encode_trusted_guest_control_probe_payload(payload)?,
+    trusted_guest_control_payload_body_digest(
+        TrustedGuestControlOperation::ProbeGuestControl,
+        &encode_trusted_guest_control_probe_payload_body(payload)?,
     )
+    .map_err(|_| malformed())
 }
 
 pub fn encode_trusted_guest_control_probe_result(
     result: &TrustedGuestControlProbeResult,
 ) -> Result<Vec<u8>, TrustedGuestControlProbeProtocolError> {
-    canonical_json(
+    let mut bytes = encode_trusted_guest_control_probe_result_body(result)?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+pub fn encode_trusted_guest_control_probe_result_body(
+    result: &TrustedGuestControlProbeResult,
+) -> Result<Vec<u8>, TrustedGuestControlProbeProtocolError> {
+    canonical_json_body(
         &ProbeResultWire::from(result),
-        MAX_TRUSTED_GUEST_CONTROL_PROBE_RESULT_BYTES,
+        MAX_TRUSTED_GUEST_CONTROL_PROBE_RESULT_BYTES - 1,
     )
 }
 
@@ -305,9 +329,19 @@ pub fn decode_trusted_guest_control_probe_result(
     bytes: &[u8],
 ) -> Result<TrustedGuestControlProbeResult, TrustedGuestControlProbeProtocolError> {
     require_size(bytes, MAX_TRUSTED_GUEST_CONTROL_PROBE_RESULT_BYTES)?;
+    let Some(body) = bytes.strip_suffix(b"\n") else {
+        return Err(noncanonical());
+    };
+    decode_trusted_guest_control_probe_result_body(body)
+}
+
+pub fn decode_trusted_guest_control_probe_result_body(
+    bytes: &[u8],
+) -> Result<TrustedGuestControlProbeResult, TrustedGuestControlProbeProtocolError> {
+    require_size(bytes, MAX_TRUSTED_GUEST_CONTROL_PROBE_RESULT_BYTES - 1)?;
     let wire: ProbeResultWire = serde_json::from_slice(bytes).map_err(|_| malformed())?;
     let result = result_from_wire(wire)?;
-    if encode_trusted_guest_control_probe_result(&result)? != bytes {
+    if encode_trusted_guest_control_probe_result_body(&result)? != bytes {
         return Err(noncanonical());
     }
     Ok(result)
@@ -316,10 +350,11 @@ pub fn decode_trusted_guest_control_probe_result(
 pub fn trusted_guest_control_probe_result_digest(
     result: &TrustedGuestControlProbeResult,
 ) -> Result<Sha256Digest, TrustedGuestControlProbeProtocolError> {
-    digest(
-        RESULT_DIGEST_DOMAIN,
-        &encode_trusted_guest_control_probe_result(result)?,
+    trusted_guest_control_result_body_digest(
+        TrustedGuestControlOperation::ProbeGuestControl,
+        &encode_trusted_guest_control_probe_result_body(result)?,
     )
+    .map_err(|_| malformed())
 }
 
 #[derive(Serialize, Deserialize)]
@@ -417,12 +452,11 @@ fn result_from_wire(
     })
 }
 
-fn canonical_json(
+fn canonical_json_body(
     value: &impl Serialize,
     limit: usize,
 ) -> Result<Vec<u8>, TrustedGuestControlProbeProtocolError> {
-    let mut bytes = serde_json::to_vec(value).map_err(|_| malformed())?;
-    bytes.push(b'\n');
+    let bytes = serde_json::to_vec(value).map_err(|_| malformed())?;
     require_size(&bytes, limit)?;
     Ok(bytes)
 }
@@ -432,23 +466,6 @@ fn require_size(bytes: &[u8], limit: usize) -> Result<(), TrustedGuestControlPro
         return Err(too_large());
     }
     Ok(())
-}
-
-fn digest(
-    domain: &[u8],
-    bytes: &[u8],
-) -> Result<Sha256Digest, TrustedGuestControlProbeProtocolError> {
-    let mut hasher = Sha256::new();
-    hasher.update(domain);
-    hasher.update(bytes);
-    let value = hasher.finalize();
-    let mut encoded = String::with_capacity(SHA256_PREFIX.len() + value.len() * 2);
-    encoded.push_str(SHA256_PREFIX);
-    for byte in value {
-        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
-        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    Sha256Digest::parse(&encoded).map_err(|_| malformed())
 }
 
 const fn error(

@@ -716,15 +716,30 @@ impl std::error::Error for TrustedGuestControlProtocolError {}
 pub fn encode_trusted_guest_control_request(
     request: &TrustedGuestControlRequest,
 ) -> Result<Vec<u8>, TrustedGuestControlProtocolError> {
+    let mut bytes = encode_trusted_guest_control_request_body(request)?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+/// Encode the canonical request JSON body without a transport newline.
+///
+/// This is the exact nested object representation used by the protocol-v2 transaction frame.
+///
+/// # Errors
+///
+/// Returns a bounded error if serialization fails or the framed request would exceed its limit.
+pub fn encode_trusted_guest_control_request_body(
+    request: &TrustedGuestControlRequest,
+) -> Result<Vec<u8>, TrustedGuestControlProtocolError> {
     if !request
         .operation
         .accepts_authority_kind(request.authority.kind())
     {
         return Err(invalid_authority());
     }
-    canonical_json(
+    canonical_json_body(
         &RequestWire::from(request),
-        MAX_TRUSTED_GUEST_CONTROL_REQUEST_BYTES,
+        MAX_TRUSTED_GUEST_CONTROL_REQUEST_BYTES - 1,
     )
 }
 
@@ -737,10 +752,25 @@ pub fn decode_trusted_guest_control_request(
     bytes: &[u8],
 ) -> Result<TrustedGuestControlRequest, TrustedGuestControlProtocolError> {
     require_size(bytes, MAX_TRUSTED_GUEST_CONTROL_REQUEST_BYTES)?;
+    let Some(body) = bytes.strip_suffix(b"\n") else {
+        return Err(noncanonical());
+    };
+    decode_trusted_guest_control_request_body(body)
+}
+
+/// Decode one canonical request JSON body without granting execution authority.
+///
+/// # Errors
+///
+/// Returns a bounded error for oversized, malformed, unsupported, invalid, or noncanonical bytes.
+pub fn decode_trusted_guest_control_request_body(
+    bytes: &[u8],
+) -> Result<TrustedGuestControlRequest, TrustedGuestControlProtocolError> {
+    require_size(bytes, MAX_TRUSTED_GUEST_CONTROL_REQUEST_BYTES - 1)?;
     require_version(bytes)?;
     let wire: RequestWire = serde_json::from_slice(bytes).map_err(|_| malformed())?;
     let request = request_from_wire(wire)?;
-    if encode_trusted_guest_control_request(&request)? != bytes {
+    if encode_trusted_guest_control_request_body(&request)? != bytes {
         return Err(noncanonical());
     }
     Ok(request)
@@ -791,6 +821,20 @@ pub fn encode_trusted_guest_control_receipt(
     request: &TrustedGuestControlRequest,
     outcome: &TrustedGuestControlOutcome,
 ) -> Result<Vec<u8>, TrustedGuestControlProtocolError> {
+    let mut bytes = encode_trusted_guest_control_receipt_body(request, outcome)?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+/// Encode the canonical common receipt JSON body without a transport newline.
+///
+/// # Errors
+///
+/// Returns a bounded error if serialization fails or the framed receipt would exceed its limit.
+pub fn encode_trusted_guest_control_receipt_body(
+    request: &TrustedGuestControlRequest,
+    outcome: &TrustedGuestControlOutcome,
+) -> Result<Vec<u8>, TrustedGuestControlProtocolError> {
     let wire = ReceiptWire {
         schema_version: TRUSTED_GUEST_CONTROL_PROTOCOL_SCHEMA_VERSION,
         request_id: request.request_id.as_str().to_owned(),
@@ -801,7 +845,7 @@ pub fn encode_trusted_guest_control_receipt(
         operation: request.operation,
         outcome: OutcomeWire::from(outcome),
     };
-    canonical_json(&wire, MAX_TRUSTED_GUEST_CONTROL_RECEIPT_BYTES)
+    canonical_json_body(&wire, MAX_TRUSTED_GUEST_CONTROL_RECEIPT_BYTES - 1)
 }
 
 /// Decode a terminal receipt only against the exact request that caused the guest transaction.
@@ -815,6 +859,23 @@ pub fn decode_trusted_guest_control_receipt(
     expected_request: &TrustedGuestControlRequest,
 ) -> Result<TrustedGuestControlReceipt, TrustedGuestControlProtocolError> {
     require_size(bytes, MAX_TRUSTED_GUEST_CONTROL_RECEIPT_BYTES)?;
+    let Some(body) = bytes.strip_suffix(b"\n") else {
+        return Err(noncanonical());
+    };
+    decode_trusted_guest_control_receipt_body(body, expected_request)
+}
+
+/// Decode a canonical common receipt JSON body against the exact originating request.
+///
+/// # Errors
+///
+/// Returns a bounded error for malformed/noncanonical bytes or any request, binary, operation, or
+/// request-digest mismatch.
+pub fn decode_trusted_guest_control_receipt_body(
+    bytes: &[u8],
+    expected_request: &TrustedGuestControlRequest,
+) -> Result<TrustedGuestControlReceipt, TrustedGuestControlProtocolError> {
+    require_size(bytes, MAX_TRUSTED_GUEST_CONTROL_RECEIPT_BYTES - 1)?;
     require_version(bytes)?;
     let wire: ReceiptWire = serde_json::from_slice(bytes).map_err(|_| malformed())?;
     let receipt = receipt_from_wire(wire)?;
@@ -825,7 +886,7 @@ pub fn decode_trusted_guest_control_receipt(
     {
         return Err(receipt_mismatch());
     }
-    if encode_trusted_guest_control_receipt(expected_request, &receipt.outcome)? != bytes {
+    if encode_trusted_guest_control_receipt_body(expected_request, &receipt.outcome)? != bytes {
         return Err(noncanonical());
     }
     Ok(receipt)
@@ -846,12 +907,11 @@ fn require_version(bytes: &[u8]) -> Result<(), TrustedGuestControlProtocolError>
     Ok(())
 }
 
-fn canonical_json(
+fn canonical_json_body(
     value: &impl Serialize,
     limit: usize,
 ) -> Result<Vec<u8>, TrustedGuestControlProtocolError> {
-    let mut bytes = serde_json::to_vec(value).map_err(|_| malformed())?;
-    bytes.push(b'\n');
+    let bytes = serde_json::to_vec(value).map_err(|_| malformed())?;
     require_size(&bytes, limit)?;
     Ok(bytes)
 }

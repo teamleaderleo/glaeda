@@ -8,7 +8,6 @@
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 
 use crate::artifact::Sha256Digest;
 use crate::project_catalog::ProjectIdentity;
@@ -23,16 +22,14 @@ use crate::project_disk_lease::{
 use crate::trusted_guest_control_protocol::{
     TrustedGuestControlAuthority, TrustedGuestControlOperation, TrustedGuestControlRequest,
 };
+use crate::trusted_guest_control_transaction::{
+    trusted_guest_control_payload_body_digest, trusted_guest_control_result_body_digest,
+};
 use crate::trusted_project_filesystem_guest_observation::TrustedProjectFilesystemGuestObservation;
 
 pub const TRUSTED_PROJECT_FILESYSTEM_GUEST_PROTOCOL_SCHEMA_VERSION: u8 = 1;
 pub const MAX_TRUSTED_PROJECT_FILESYSTEM_PAYLOAD_BYTES: usize = 1_024;
 pub const MAX_TRUSTED_PROJECT_FILESYSTEM_RESULT_BYTES: usize = 1_024;
-
-const PAYLOAD_DIGEST_DOMAIN: &[u8] = b"smolrunner-project-filesystem-guest-payload-v1\0";
-const RESULT_DIGEST_DOMAIN: &[u8] = b"smolrunner-project-filesystem-guest-result-v1\0";
-const SHA256_PREFIX: &str = "sha256:";
-const HEX: &[u8; 16] = b"0123456789abcdef";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -382,9 +379,17 @@ impl std::error::Error for TrustedProjectFilesystemGuestProtocolError {}
 pub fn encode_trusted_project_filesystem_payload(
     payload: &TrustedProjectFilesystemObservationPayload,
 ) -> Result<Vec<u8>, TrustedProjectFilesystemGuestProtocolError> {
-    canonical_json(
+    let mut bytes = encode_trusted_project_filesystem_payload_body(payload)?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+pub fn encode_trusted_project_filesystem_payload_body(
+    payload: &TrustedProjectFilesystemObservationPayload,
+) -> Result<Vec<u8>, TrustedProjectFilesystemGuestProtocolError> {
+    canonical_json_body(
         &PayloadWire::from(payload),
-        MAX_TRUSTED_PROJECT_FILESYSTEM_PAYLOAD_BYTES,
+        MAX_TRUSTED_PROJECT_FILESYSTEM_PAYLOAD_BYTES - 1,
     )
 }
 
@@ -395,12 +400,23 @@ pub fn decode_trusted_project_filesystem_payload(
 ) -> Result<TrustedProjectFilesystemObservationPayload, TrustedProjectFilesystemGuestProtocolError>
 {
     require_size(bytes, MAX_TRUSTED_PROJECT_FILESYSTEM_PAYLOAD_BYTES)?;
+    let Some(body) = bytes.strip_suffix(b"\n") else {
+        return Err(noncanonical());
+    };
+    decode_trusted_project_filesystem_payload_body(body)
+}
+
+pub fn decode_trusted_project_filesystem_payload_body(
+    bytes: &[u8],
+) -> Result<TrustedProjectFilesystemObservationPayload, TrustedProjectFilesystemGuestProtocolError>
+{
+    require_size(bytes, MAX_TRUSTED_PROJECT_FILESYSTEM_PAYLOAD_BYTES - 1)?;
     let wire: PayloadWire = serde_json::from_slice(bytes).map_err(|_| malformed())?;
     if wire.schema_version != TRUSTED_PROJECT_FILESYSTEM_GUEST_PROTOCOL_SCHEMA_VERSION {
         return Err(version_incompatible());
     }
     let payload = payload_from_wire(wire)?;
-    if encode_trusted_project_filesystem_payload(&payload)? != bytes {
+    if encode_trusted_project_filesystem_payload_body(&payload)? != bytes {
         return Err(noncanonical());
     }
     Ok(payload)
@@ -410,19 +426,28 @@ pub fn decode_trusted_project_filesystem_payload(
 pub fn trusted_project_filesystem_payload_digest(
     payload: &TrustedProjectFilesystemObservationPayload,
 ) -> Result<Sha256Digest, TrustedProjectFilesystemGuestProtocolError> {
-    domain_digest(
-        PAYLOAD_DIGEST_DOMAIN,
-        &encode_trusted_project_filesystem_payload(payload)?,
+    trusted_guest_control_payload_body_digest(
+        TrustedGuestControlOperation::ObserveProjectFilesystem,
+        &encode_trusted_project_filesystem_payload_body(payload)?,
     )
+    .map_err(|_| malformed())
 }
 
 /// Encode one path-free typed result followed by one newline.
 pub fn encode_trusted_project_filesystem_result(
     result: &TrustedProjectFilesystemObservationResult,
 ) -> Result<Vec<u8>, TrustedProjectFilesystemGuestProtocolError> {
-    canonical_json(
+    let mut bytes = encode_trusted_project_filesystem_result_body(result)?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+pub fn encode_trusted_project_filesystem_result_body(
+    result: &TrustedProjectFilesystemObservationResult,
+) -> Result<Vec<u8>, TrustedProjectFilesystemGuestProtocolError> {
+    canonical_json_body(
         &ResultWire::from(result),
-        MAX_TRUSTED_PROJECT_FILESYSTEM_RESULT_BYTES,
+        MAX_TRUSTED_PROJECT_FILESYSTEM_RESULT_BYTES - 1,
     )
 }
 
@@ -432,12 +457,22 @@ pub fn decode_trusted_project_filesystem_result(
     bytes: &[u8],
 ) -> Result<TrustedProjectFilesystemObservationResult, TrustedProjectFilesystemGuestProtocolError> {
     require_size(bytes, MAX_TRUSTED_PROJECT_FILESYSTEM_RESULT_BYTES)?;
+    let Some(body) = bytes.strip_suffix(b"\n") else {
+        return Err(noncanonical());
+    };
+    decode_trusted_project_filesystem_result_body(body)
+}
+
+pub fn decode_trusted_project_filesystem_result_body(
+    bytes: &[u8],
+) -> Result<TrustedProjectFilesystemObservationResult, TrustedProjectFilesystemGuestProtocolError> {
+    require_size(bytes, MAX_TRUSTED_PROJECT_FILESYSTEM_RESULT_BYTES - 1)?;
     let wire: ResultWire = serde_json::from_slice(bytes).map_err(|_| malformed())?;
     if wire.schema_version != TRUSTED_PROJECT_FILESYSTEM_GUEST_PROTOCOL_SCHEMA_VERSION {
         return Err(version_incompatible());
     }
     let result = result_from_wire(wire)?;
-    if encode_trusted_project_filesystem_result(&result)? != bytes {
+    if encode_trusted_project_filesystem_result_body(&result)? != bytes {
         return Err(noncanonical());
     }
     Ok(result)
@@ -447,10 +482,11 @@ pub fn decode_trusted_project_filesystem_result(
 pub fn trusted_project_filesystem_result_digest(
     result: &TrustedProjectFilesystemObservationResult,
 ) -> Result<Sha256Digest, TrustedProjectFilesystemGuestProtocolError> {
-    domain_digest(
-        RESULT_DIGEST_DOMAIN,
-        &encode_trusted_project_filesystem_result(result)?,
+    trusted_guest_control_result_body_digest(
+        TrustedGuestControlOperation::ObserveProjectFilesystem,
+        &encode_trusted_project_filesystem_result_body(result)?,
     )
+    .map_err(|_| malformed())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -631,12 +667,11 @@ fn result_from_wire(
     })
 }
 
-fn canonical_json<T: Serialize>(
+fn canonical_json_body<T: Serialize>(
     value: &T,
     maximum: usize,
 ) -> Result<Vec<u8>, TrustedProjectFilesystemGuestProtocolError> {
-    let mut bytes = serde_json::to_vec(value).map_err(|_| malformed())?;
-    bytes.push(b'\n');
+    let bytes = serde_json::to_vec(value).map_err(|_| malformed())?;
     if bytes.len() > maximum {
         return Err(too_large());
     }
@@ -651,28 +686,6 @@ fn require_size(
         return Err(too_large());
     }
     Ok(())
-}
-
-fn domain_digest(
-    domain: &[u8],
-    bytes: &[u8],
-) -> Result<Sha256Digest, TrustedProjectFilesystemGuestProtocolError> {
-    let mut hasher = Sha256::new();
-    hasher.update(domain);
-    hasher.update(bytes);
-    digest_to_sha256(&hasher.finalize())
-}
-
-fn digest_to_sha256(
-    bytes: &[u8],
-) -> Result<Sha256Digest, TrustedProjectFilesystemGuestProtocolError> {
-    let mut value = String::with_capacity(SHA256_PREFIX.len() + bytes.len() * 2);
-    value.push_str(SHA256_PREFIX);
-    for byte in bytes {
-        value.push(char::from(HEX[usize::from(byte >> 4)]));
-        value.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    Sha256Digest::parse(&value).map_err(|_| malformed())
 }
 
 const fn error(

@@ -24,15 +24,20 @@ use crate::project_disk_lease::{
     ProjectDiskGeneration, ProjectDiskId, ResidentSandboxGeneration, ResidentSandboxId,
 };
 use crate::trusted_guest_control_protocol::{
-    MAX_TRUSTED_GUEST_CONTROL_RECEIPT_BYTES, TrustedGuestControlBinaryBinding,
-    TrustedGuestControlFormatTransactionGeneration, TrustedGuestControlFormatterCarrierGeneration,
-    TrustedGuestControlOperation, TrustedGuestControlRequest, TrustedGuestControlTargetIdentity,
-    encode_trusted_guest_control_request, trusted_guest_control_request_digest,
+    TrustedGuestControlBinaryBinding, TrustedGuestControlFormatTransactionGeneration,
+    TrustedGuestControlFormatterCarrierGeneration, TrustedGuestControlOperation,
+    TrustedGuestControlTargetIdentity, trusted_guest_control_request_digest,
+};
+use crate::trusted_guest_control_transaction::{
+    MAX_TRUSTED_GUEST_CONTROL_TRANSACTION_RECEIPT_BYTES,
+    TRUSTED_GUEST_CONTROL_TRANSACTION_SCHEMA_VERSION, TrustedGuestControlTransaction,
+    encode_trusted_guest_control_transaction, trusted_guest_control_transaction_digest,
 };
 
-pub const TRUSTED_GUEST_CONTROL_INVOCATION_PLAN_SCHEMA_VERSION: u8 = 2;
+pub const TRUSTED_GUEST_CONTROL_INVOCATION_PLAN_SCHEMA_VERSION: u8 = 3;
 pub const TRUSTED_GUEST_CONTROL_INVOCATION_TIMEOUT: Duration = Duration::from_secs(120);
-pub const MAX_TRUSTED_GUEST_CONTROL_STDOUT_BYTES: usize = MAX_TRUSTED_GUEST_CONTROL_RECEIPT_BYTES;
+pub const MAX_TRUSTED_GUEST_CONTROL_STDOUT_BYTES: usize =
+    MAX_TRUSTED_GUEST_CONTROL_TRANSACTION_RECEIPT_BYTES;
 pub const MAX_TRUSTED_GUEST_CONTROL_STDERR_BYTES: usize = 64 * 1024;
 
 const SUDO: &str = "/usr/bin/sudo";
@@ -54,6 +59,10 @@ pub struct TrustedGuestControlInvocationSummary {
     guest_binary_digest: Sha256Digest,
     operation: TrustedGuestControlOperation,
     request_digest: Sha256Digest,
+    payload_digest: Sha256Digest,
+    transaction_schema_version: u8,
+    transaction_digest: Sha256Digest,
+    stdin_bytes: usize,
     timeout_seconds: u64,
     stdout_limit_bytes: usize,
     stderr_limit_bytes: usize,
@@ -98,6 +107,26 @@ impl TrustedGuestControlInvocationSummary {
     #[must_use]
     pub const fn request_digest(&self) -> &Sha256Digest {
         &self.request_digest
+    }
+
+    #[must_use]
+    pub const fn payload_digest(&self) -> &Sha256Digest {
+        &self.payload_digest
+    }
+
+    #[must_use]
+    pub const fn transaction_schema_version(&self) -> u8 {
+        self.transaction_schema_version
+    }
+
+    #[must_use]
+    pub const fn transaction_digest(&self) -> &Sha256Digest {
+        &self.transaction_digest
+    }
+
+    #[must_use]
+    pub const fn stdin_bytes(&self) -> usize {
+        self.stdin_bytes
     }
 
     #[must_use]
@@ -320,7 +349,7 @@ impl fmt::Display for TrustedGuestControlInvocationPlanError {
 
 impl std::error::Error for TrustedGuestControlInvocationPlanError {}
 
-/// Seal one exact one-shot command plus canonical request bytes.
+/// Seal one exact one-shot command plus canonical request-transaction bytes.
 ///
 /// The returned [`CommandSpec`] is still data. This function never executes it. The later Mac
 /// adapter must freshly reconfirm the owning durable state, verified target, request digest, and
@@ -329,11 +358,12 @@ impl std::error::Error for TrustedGuestControlInvocationPlanError {}
 /// # Errors
 ///
 /// Returns a bounded error when the verified target names another purpose-typed generation or guest
-/// binary, or when the canonical protocol request cannot be encoded.
+/// binary, or when the canonical request transaction cannot be encoded.
 pub fn plan_trusted_guest_control_invocation(
-    request: &TrustedGuestControlRequest,
+    transaction: &TrustedGuestControlTransaction,
     target: &TrustedGuestControlInvocationTarget,
 ) -> Result<TrustedGuestControlInvocationPlan, TrustedGuestControlInvocationPlanError> {
+    let request = transaction.request();
     if request.authority().target_identity() != &target.target_identity
         || !request
             .operation()
@@ -345,9 +375,12 @@ pub fn plan_trusted_guest_control_invocation(
         return Err(binary_mismatch());
     }
 
-    let stdin = encode_trusted_guest_control_request(request).map_err(|_| protocol_error())?;
+    let stdin =
+        encode_trusted_guest_control_transaction(transaction).map_err(|_| protocol_error())?;
     let request_digest =
         trusted_guest_control_request_digest(request).map_err(|_| protocol_error())?;
+    let transaction_digest =
+        trusted_guest_control_transaction_digest(transaction).map_err(|_| protocol_error())?;
     let command = CommandSpec::new(&target.limactl_program)
         .argument("--tty=false")
         .environment("HOME", LIMACTL_SAFE_HOME)
@@ -390,6 +423,10 @@ pub fn plan_trusted_guest_control_invocation(
             guest_binary_digest: target.guest_binary.digest().clone(),
             operation: request.operation(),
             request_digest,
+            payload_digest: request.payload_digest().clone(),
+            transaction_schema_version: TRUSTED_GUEST_CONTROL_TRANSACTION_SCHEMA_VERSION,
+            transaction_digest,
+            stdin_bytes: stdin.len(),
             timeout_seconds: TRUSTED_GUEST_CONTROL_INVOCATION_TIMEOUT.as_secs(),
             stdout_limit_bytes: MAX_TRUSTED_GUEST_CONTROL_STDOUT_BYTES,
             stderr_limit_bytes: MAX_TRUSTED_GUEST_CONTROL_STDERR_BYTES,
@@ -459,7 +496,7 @@ const fn protocol_error() -> TrustedGuestControlInvocationPlanError {
     plan_error(
         TrustedGuestControlInvocationPlanErrorKind::Protocol,
         "trusted_guest_control_invocation_protocol_invalid",
-        "trusted guest-control request cannot be encoded for invocation",
+        "trusted guest-control request transaction cannot be encoded for invocation",
     )
 }
 
@@ -479,8 +516,9 @@ mod tests {
         TrustedGuestControlArchitecture, TrustedGuestControlAuthority,
         TrustedGuestControlCreatedProvenanceClaim, TrustedGuestControlFormatAuthorityClaim,
         TrustedGuestControlFormatterConfigClaim, TrustedGuestControlFormatterConfigGeneration,
-        TrustedGuestControlRequestId,
+        TrustedGuestControlRequest, TrustedGuestControlRequestId,
     };
+    use crate::trusted_guest_control_transaction::trusted_guest_control_payload_body_digest;
 
     fn digest(byte: char) -> Sha256Digest {
         Sha256Digest::parse(&format!("sha256:{}", byte.to_string().repeat(64))).unwrap()
@@ -525,9 +563,21 @@ mod tests {
             .unwrap(),
             TrustedGuestControlAuthority::from_attached_project_disk(&attached).unwrap(),
             TrustedGuestControlOperation::PrepareTrustedTaskView,
-            digest('b'),
+            trusted_guest_control_payload_body_digest(
+                TrustedGuestControlOperation::PrepareTrustedTaskView,
+                &payload_body(),
+            )
+            .unwrap(),
         )
         .unwrap()
+    }
+
+    fn payload_body() -> Vec<u8> {
+        br#"{"schema_version":1}"#.to_vec()
+    }
+
+    fn transaction(request: TrustedGuestControlRequest) -> TrustedGuestControlTransaction {
+        TrustedGuestControlTransaction::new(request, payload_body()).unwrap()
     }
 
     fn target(request: &TrustedGuestControlRequest) -> TrustedGuestControlInvocationTarget {
@@ -571,7 +621,11 @@ mod tests {
             .unwrap(),
             authority,
             TrustedGuestControlOperation::FormatProjectFilesystem,
-            digest('b'),
+            trusted_guest_control_payload_body_digest(
+                TrustedGuestControlOperation::FormatProjectFilesystem,
+                &payload_body(),
+            )
+            .unwrap(),
         )
         .unwrap()
     }
@@ -621,7 +675,7 @@ mod tests {
     fn exact_plan_uses_one_closed_lima_sudo_env_command() {
         let request = request();
         let target = target(&request);
-        let plan = plan_trusted_guest_control_invocation(&request, &target).unwrap();
+        let plan = plan_trusted_guest_control_invocation(&transaction(request), &target).unwrap();
         assert_eq!(
             plan.command.program,
             PathBuf::from("/opt/homebrew/bin/limactl")
@@ -659,22 +713,36 @@ mod tests {
                 "PATH".to_owned(),
             ])
         );
+        assert_eq!(
+            plan.summary.schema_version(),
+            TRUSTED_GUEST_CONTROL_INVOCATION_PLAN_SCHEMA_VERSION
+        );
         assert_eq!(plan.summary.timeout(), Duration::from_secs(120));
-        assert_eq!(plan.summary.stdout_limit_bytes(), 2 * 1024);
+        assert_eq!(plan.summary.stdout_limit_bytes(), 8 * 1024);
         assert_eq!(plan.summary.stderr_limit_bytes(), 64 * 1024);
     }
 
     #[test]
-    fn canonical_request_is_stdin_only_and_binds_summary_digest() {
+    fn canonical_transaction_is_stdin_only_and_binds_summary_digests() {
         let request = request();
-        let plan = plan_trusted_guest_control_invocation(&request, &target(&request)).unwrap();
+        let transaction = transaction(request.clone());
+        let plan = plan_trusted_guest_control_invocation(&transaction, &target(&request)).unwrap();
         assert_eq!(
             plan.stdin(),
-            encode_trusted_guest_control_request(&request).unwrap()
+            encode_trusted_guest_control_transaction(&transaction).unwrap()
         );
         assert_eq!(
             plan.summary.request_digest(),
             &trusted_guest_control_request_digest(&request).unwrap()
+        );
+        assert_eq!(
+            plan.summary.transaction_digest(),
+            &trusted_guest_control_transaction_digest(&transaction).unwrap()
+        );
+        assert_eq!(plan.summary.stdin_bytes(), plan.stdin().len());
+        assert_eq!(
+            plan.summary.transaction_schema_version(),
+            TRUSTED_GUEST_CONTROL_TRANSACTION_SCHEMA_VERSION
         );
         let request_text = std::str::from_utf8(plan.stdin()).unwrap();
         assert!(
@@ -703,7 +771,7 @@ mod tests {
             ResidentSandboxGeneration::new(12).unwrap(),
         );
         assert_eq!(
-            plan_trusted_guest_control_invocation(&request, &wrong_sandbox)
+            plan_trusted_guest_control_invocation(&transaction(request.clone()), &wrong_sandbox)
                 .unwrap_err()
                 .kind(),
             TrustedGuestControlInvocationPlanErrorKind::AuthorityMismatch
@@ -717,7 +785,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            plan_trusted_guest_control_invocation(&request, &wrong_binary)
+            plan_trusted_guest_control_invocation(&transaction(request), &wrong_binary)
                 .unwrap_err()
                 .kind(),
             TrustedGuestControlInvocationPlanErrorKind::BinaryMismatch
@@ -729,19 +797,28 @@ mod tests {
         let resident = request();
         let formatter = formatter_request();
         assert_eq!(
-            plan_trusted_guest_control_invocation(&formatter, &target(&resident))
-                .unwrap_err()
-                .kind(),
+            plan_trusted_guest_control_invocation(
+                &transaction(formatter.clone()),
+                &target(&resident),
+            )
+            .unwrap_err()
+            .kind(),
             TrustedGuestControlInvocationPlanErrorKind::AuthorityMismatch
         );
         assert_eq!(
-            plan_trusted_guest_control_invocation(&resident, &formatter_target(&formatter))
-                .unwrap_err()
-                .kind(),
+            plan_trusted_guest_control_invocation(
+                &transaction(resident.clone()),
+                &formatter_target(&formatter),
+            )
+            .unwrap_err()
+            .kind(),
             TrustedGuestControlInvocationPlanErrorKind::AuthorityMismatch
         );
-        let plan = plan_trusted_guest_control_invocation(&formatter, &formatter_target(&formatter))
-            .unwrap();
+        let plan = plan_trusted_guest_control_invocation(
+            &transaction(formatter.clone()),
+            &formatter_target(&formatter),
+        )
+        .unwrap();
         assert_eq!(
             plan.summary().target_identity(),
             formatter.authority().target_identity()
@@ -758,7 +835,7 @@ mod tests {
             request.authority().resident_sandbox_generation().unwrap(),
         );
         assert_eq!(
-            plan_trusted_guest_control_invocation(&request, &wrong_project)
+            plan_trusted_guest_control_invocation(&transaction(request), &wrong_project)
                 .unwrap_err()
                 .kind(),
             TrustedGuestControlInvocationPlanErrorKind::AuthorityMismatch
@@ -774,7 +851,7 @@ mod tests {
         assert!(!debug.contains("/private/var/smolrunner/lima"));
         assert!(!debug.contains("/opt/smolrunner/bin/smolrunner"));
 
-        let plan = plan_trusted_guest_control_invocation(&request, &target).unwrap();
+        let plan = plan_trusted_guest_control_invocation(&transaction(request), &target).unwrap();
         let summary = serde_json::to_string(plan.summary()).unwrap();
         assert!(!summary.contains("/opt/homebrew"));
         assert!(!summary.contains("/private/var"));
