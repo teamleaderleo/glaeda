@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Focused fixtures for the one-command SmolRunner readiness journey."""
+"""Focused fixtures for the one-command Glaeda readiness journey."""
 
 from __future__ import annotations
 
@@ -81,7 +81,7 @@ def main() -> int:
     for marker in ["/Users/", "/home/runner/", "secret.txt", "remote.origin.url", "GIT_ASKPASS", "HOME="]:
         assert marker not in public
 
-    print("front-door readiness tests passed")
+    print("Glaeda front-door readiness tests passed")
     return 0
 
 
