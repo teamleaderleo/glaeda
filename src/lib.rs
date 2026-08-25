@@ -323,6 +323,8 @@ pub mod trusted_overlay_task_view;
 pub mod trusted_project_block_device_correlation;
 /// Opaque project-disk/filesystem correlation gate for trusted resident Linux mutation.
 pub mod trusted_project_filesystem_correlation;
+/// Opaque composition of exact guest filesystem + whole-block-device evidence.
+pub mod trusted_project_filesystem_full_guest_correlation;
 /// Read-only guest correlation of one held project-filesystem device with exact mountinfo evidence.
 pub mod trusted_project_filesystem_guest_observation;
 /// Canonical path-free payload/result for the guest project-filesystem observation operation.
