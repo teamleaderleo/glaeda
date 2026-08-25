@@ -1,4 +1,4 @@
-"""Capability receipt construction for the SmolRunner workspace preflight."""
+"""Capability receipt construction for the Glaeda workspace preflight."""
 
 from __future__ import annotations
 
@@ -92,7 +92,7 @@ def build_receipt(operation: str) -> dict[str, object]:
         blocking.append(
             public_issue(
                 "repository_marker_mismatch",
-                "Cargo.toml does not identify the SmolRunner package",
+                "Cargo.toml does not identify the expected package",
             )
         )
     if not lockfile_present:
@@ -115,7 +115,7 @@ def build_receipt(operation: str) -> dict[str, object]:
         deviations.append(
             public_issue(
                 "repository_remote_differs",
-                "origin identifies a SmolRunner fork or alternate repository",
+                "origin identifies a Glaeda fork or alternate repository",
             )
         )
 
