@@ -34,6 +34,62 @@ jobs:
               s = s.replace(marker, addition, 1)
           p.write_text(s)
           PY
+      - name: Repair active pre-start attempt confirmation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('src/resident_sandbox_generation.rs')
+          s = p.read_text()
+          old = (
+              '        self.confirm_plan(plan)?;\n'
+              '        if attempt_generation != plan.attempt_generation {\n'
+              '            return Err(plan_mismatch());\n'
+              '        }\n'
+          )
+          new = '        self.confirm_authorized_plan(plan, attempt_generation)?;\n'
+          if s.count(old) != 1:
+              raise SystemExit(f'prestart plan block changed: {s.count(old)}')
+          s = s.replace(old, new, 1)
+          anchor = (
+              '    fn confirm_plan_identity(\n'
+              '        &self,\n'
+              '        identity: &ResidentSandboxPlanIdentity,\n'
+              '    ) -> Result<(), ResidentSandboxGenerationError> {\n'
+          )
+          helper = (
+              '    fn confirm_authorized_plan(\n'
+              '        &self,\n'
+              '        plan: &ResidentSandboxMaterializePlan,\n'
+              '        attempt_generation: ResidentSandboxMaterializeAttemptGeneration,\n'
+              '    ) -> Result<(), ResidentSandboxGenerationError> {\n'
+              '        if plan.identity.project != self.project\n'
+              '            || plan.identity.sandbox_id != self.sandbox_id\n'
+              '            || plan.identity.sandbox_generation != self.sandbox_generation\n'
+              '            || plan.attempt_generation != attempt_generation\n'
+              '            || plan.lima_locator != self.lima_locator\n'
+              '            || plan.lima_request_digest != self.lima_request_digest\n'
+              '        {\n'
+              '            return Err(plan_mismatch());\n'
+              '        }\n'
+              '        if plan.identity.expected_revision.get().checked_add(1)\n'
+              '            != Some(self.revision.get())\n'
+              '        {\n'
+              '            return Err(error(\n'
+              '                "resident_sandbox_plan_stale",\n'
+              '                "resident sandbox plan revision is stale",\n'
+              '            ));\n'
+              '        }\n'
+              '        Ok(())\n'
+              '    }\n\n'
+          )
+          if helper not in s:
+              if s.count(anchor) != 1:
+                  raise SystemExit(f'plan-identity anchor changed: {s.count(anchor)}')
+              s = s.replace(anchor, helper + anchor, 1)
+          p.write_text(s)
+          PY
       - name: Verify model
         shell: bash
         run: |
