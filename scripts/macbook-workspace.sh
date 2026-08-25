@@ -163,7 +163,7 @@ notify_doctor() {
 
   [ -n "${CMUX_WORKSPACE_ID:-}" ] || return 0
   cmux_cli="$(find_cmux_cli)" || return 0
-  "${cmux_cli}" notify --title 'SmolRunner doctor' --body "${body}" >/dev/null
+  "${cmux_cli}" notify --title 'Glaeda doctor' --body "${body}" >/dev/null
 }
 
 launch_tmux() {
