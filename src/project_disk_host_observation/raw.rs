@@ -235,13 +235,13 @@ impl LimaStandaloneDiskObservationSummary {
     }
 }
 
-#[derive(Clone, PartialEq, Eq)]
 pub struct LimaStandaloneDiskObservationRequest {
     disk_name: LimaStandaloneDiskName,
     lima_home: AcceptedPath,
     disk_directory: AcceptedPath,
     collection_name: OsString,
     planned_source_identity: Option<ProjectDiskLimaSourceIdentity>,
+    held_lima_home: Option<HeldLimaSource>,
 }
 
 impl LimaStandaloneDiskObservationRequest {
@@ -281,6 +281,7 @@ impl LimaStandaloneDiskObservationRequest {
             disk_directory,
             collection_name,
             planned_source_identity: None,
+            held_lima_home: None,
         })
     }
 
@@ -296,9 +297,72 @@ impl LimaStandaloneDiskObservationRequest {
         self
     }
 
+    pub(super) fn with_held_lima_source(mut self, held: HeldLimaSource) -> Self {
+        self.held_lima_home = Some(held);
+        self
+    }
+
+    fn take_lima_home(&mut self) -> Result<BoundDirectory, ProjectDiskHostObservationError> {
+        match self.held_lima_home.take() {
+            Some(held) => {
+                held.confirm_path_binding()?;
+                Ok(held.directory)
+            }
+            None => BoundDirectory::open_path(&self.lima_home),
+        }
+    }
+
     #[must_use]
     pub const fn disk_name(&self) -> &LimaStandaloneDiskName {
         &self.disk_name
+    }
+}
+
+/// Crate-contained live binding for the configured Lima home.
+pub(super) struct HeldLimaSource {
+    path: AcceptedPath,
+    directory: BoundDirectory,
+}
+
+impl HeldLimaSource {
+    pub(super) fn open(path: PathBuf) -> Result<Self, ProjectDiskHostObservationError> {
+        let path = AcceptedPath::new(path)?;
+        let directory = BoundDirectory::open_path(&path)?;
+        validate_private_directory(&directory.snapshot)?;
+        Ok(Self { path, directory })
+    }
+
+    pub(super) fn confirm_path_binding(&self) -> Result<(), ProjectDiskHostObservationError> {
+        let rebound = BoundDirectory::open_path(&self.path).map_err(|_| changed())?;
+        if !same_stable_directory_identity(&rebound.snapshot, &self.directory.snapshot) {
+            return Err(changed());
+        }
+        self.directory.revalidate_stable_identity()
+    }
+
+    pub(super) fn into_planned_request(
+        self,
+        disk_name: LimaStandaloneDiskName,
+        source_identity: ProjectDiskLimaSourceIdentity,
+    ) -> Result<LimaStandaloneDiskObservationRequest, ProjectDiskHostObservationError> {
+        self.confirm_path_binding()?;
+        let disk_directory = self.path.physical.join("_disks").join(disk_name.as_str());
+        LimaStandaloneDiskObservationRequest::new(
+            disk_name,
+            self.path.physical.clone(),
+            disk_directory,
+        )
+        .map(|request| {
+            request
+                .with_planned_source_identity(source_identity)
+                .with_held_lima_source(self)
+        })
+    }
+}
+
+impl fmt::Debug for HeldLimaSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("HeldLimaSource(<private-source-binding>)")
     }
 }
 
@@ -1083,7 +1147,7 @@ pub fn observe_lima_standalone_disk_absence(
 }
 
 fn observe_absence_with_hook<F>(
-    request: LimaStandaloneDiskObservationRequest,
+    mut request: LimaStandaloneDiskObservationRequest,
     inventory_json_lines: &[u8],
     before_revalidation: F,
 ) -> Result<LimaStandaloneDiskAbsenceObservation, ProjectDiskHostObservationError>
@@ -1093,7 +1157,7 @@ where
     if select_inventory_optional(&request, inventory_json_lines)?.is_some() {
         return Err(present());
     }
-    let lima_home = BoundDirectory::open_path(&request.lima_home)?;
+    let lima_home = request.take_lima_home()?;
     validate_private_directory(&lima_home.snapshot)?;
     let collection = match BoundDirectory::open_child(&lima_home.fd, &request.collection_name) {
         Ok(collection) => {
@@ -1127,14 +1191,14 @@ where
 }
 
 fn observe_with_hook<F>(
-    request: LimaStandaloneDiskObservationRequest,
+    mut request: LimaStandaloneDiskObservationRequest,
     inventory_json_lines: &[u8],
     before_revalidation: F,
 ) -> Result<LimaStandaloneDiskObservation, ProjectDiskHostObservationError>
 where
     F: FnOnce(),
 {
-    let lima_home = BoundDirectory::open_path(&request.lima_home)?;
+    let lima_home = request.take_lima_home()?;
     validate_private_directory(&lima_home.snapshot)?;
     let collection = BoundDirectory::open_child(&lima_home.fd, &request.collection_name)?;
     validate_private_directory(&collection.snapshot)?;
