@@ -1,4 +1,4 @@
-"""One-command, read-only SmolRunner checkout readiness journey."""
+"""One-command, read-only Glaeda checkout readiness journey."""
 
 from __future__ import annotations
 
@@ -29,13 +29,13 @@ VALID_DOCTOR_STATUSES = {"pass", "warn", "fail"}
 class SafeArgumentParser(argparse.ArgumentParser):
     def error(self, _message: str) -> None:
         self.print_usage(sys.stderr)
-        self.exit(2, "smolrunner arguments are invalid\n")
+        self.exit(2, "glaeda arguments are invalid\n")
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = SafeArgumentParser(
         prog="./smolrunner",
-        description="Evaluate the checkout and host through one SmolRunner readiness journey.",
+        description="Evaluate the checkout and host through one Glaeda readiness journey.",
     )
     parser.add_argument("command", nargs="?", choices=["doctor"])
     parser.add_argument("--output", choices=["human", "json"], default="human")
@@ -321,7 +321,7 @@ def render_human(report: dict[str, object]) -> str:
     assert isinstance(doctor, dict)
     assert isinstance(bootstrap, dict)
     lines = [
-        f"SmolRunner: {verdict}",
+        f"Glaeda: {verdict}",
         f"Bootstrap: {bootstrap['state']}",
         f"Doctor: {doctor['overall'] if doctor['evaluated'] else 'not evaluated'}",
     ]
@@ -334,7 +334,7 @@ def render_human(report: dict[str, object]) -> str:
     if blockers:
         lines.append("Blockers: " + ", ".join(str(item) for item in blockers))
     if report["next_action"] == "none":
-        lines.append("Next: ready for SmolRunner work.")
+        lines.append("Next: ready for Glaeda work.")
     else:
         lines.append("Next: resolve the blocker above, then rerun ./smolrunner.")
     return "\n".join(lines) + "\n"
