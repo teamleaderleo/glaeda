@@ -149,7 +149,7 @@ impl LimaStandaloneDiskObservationSummary {
     }
 }
 
-/// Held descriptor-bound P2 observation with no P1 projection surface.
+/// Held descriptor-bound P2 observation produced only from the production source+locator request.
 pub struct LimaStandaloneDiskObservation {
     inner: raw::LimaStandaloneDiskObservation,
     summary: LimaStandaloneDiskObservationSummary,
@@ -184,6 +184,45 @@ impl fmt::Debug for LimaStandaloneDiskObservation {
     }
 }
 
+/// Held descriptor-bound observation produced only through the explicit research/fixture request.
+///
+/// This type intentionally never converts into `LimaStandaloneDiskObservation`. A later #644 API
+/// can therefore accept the production observation type without admitting operator-selected fixture
+/// paths accidentally.
+pub struct LimaStandaloneDiskFixtureObservation {
+    inner: raw::LimaStandaloneDiskObservation,
+    summary: LimaStandaloneDiskObservationSummary,
+}
+
+impl LimaStandaloneDiskFixtureObservation {
+    #[must_use]
+    pub const fn summary(&self) -> &LimaStandaloneDiskObservationSummary {
+        &self.summary
+    }
+
+    /// Reconfirm the retained fixture's held descriptor/inventory evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same bounded raw P2 refusal if the diagnostic object drifts.
+    pub fn confirm(
+        &mut self,
+        inventory_json_lines: &[u8],
+    ) -> Result<(), ProjectDiskHostObservationError> {
+        self.inner.confirm(inventory_json_lines)
+    }
+}
+
+impl fmt::Debug for LimaStandaloneDiskFixtureObservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LimaStandaloneDiskFixtureObservation")
+            .field("summary", &self.summary)
+            .field("private_descriptors", &"<private-project-disk-fixture-descriptors>")
+            .finish()
+    }
+}
+
 /// Observe one planned locator as absent using a production request derived by P2.
 ///
 /// # Errors
@@ -197,7 +236,7 @@ pub fn observe_lima_standalone_disk_absence(
     raw::observe_lima_standalone_disk_absence(request.into_raw(), inventory_json_lines)
 }
 
-/// Observe one existing standalone disk as unbound physical evidence.
+/// Observe one existing standalone disk as unbound production physical evidence.
 ///
 /// The private raw observer performs the physically accepted descriptor/no-follow/inventory checks.
 /// This facade copies only the sanitized observation identity/byte summary and retains the raw
@@ -212,14 +251,16 @@ pub fn observe_lima_standalone_disk(
     request: LimaStandaloneDiskObservationRequest,
     inventory_json_lines: &[u8],
 ) -> Result<LimaStandaloneDiskObservation, ProjectDiskHostObservationError> {
-    observe_raw_lima_standalone_disk(request.into_raw(), inventory_json_lines)
+    let inner = raw::observe_lima_standalone_disk(request.into_raw(), inventory_json_lines)?;
+    let summary = LimaStandaloneDiskObservationSummary::from_raw(inner.summary());
+    Ok(LimaStandaloneDiskObservation { inner, summary })
 }
 
 /// Observe one explicitly supplied retained fixture as unbound diagnostic evidence.
 ///
-/// This entrypoint is deliberately type-distinct from the production source+locator request. It is
-/// useful for the retained #634 research fixture and can never be passed to a #644-facing product
-/// API that requires `LimaStandaloneDiskObservationRequest`.
+/// Both the request and returned observation remain type-distinct from the production source+locator
+/// path. The retained #634 fixture can therefore exercise the same private parser without creating
+/// a value a later #644 product boundary accepts.
 ///
 /// # Errors
 ///
@@ -227,15 +268,8 @@ pub fn observe_lima_standalone_disk(
 pub fn observe_lima_standalone_disk_fixture(
     request: LimaStandaloneDiskFixtureObservationRequest,
     inventory_json_lines: &[u8],
-) -> Result<LimaStandaloneDiskObservation, ProjectDiskHostObservationError> {
-    observe_raw_lima_standalone_disk(request.into_raw(), inventory_json_lines)
-}
-
-fn observe_raw_lima_standalone_disk(
-    request: raw::LimaStandaloneDiskObservationRequest,
-    inventory_json_lines: &[u8],
-) -> Result<LimaStandaloneDiskObservation, ProjectDiskHostObservationError> {
-    let inner = raw::observe_lima_standalone_disk(request, inventory_json_lines)?;
+) -> Result<LimaStandaloneDiskFixtureObservation, ProjectDiskHostObservationError> {
+    let inner = raw::observe_lima_standalone_disk(request.into_raw(), inventory_json_lines)?;
     let summary = LimaStandaloneDiskObservationSummary::from_raw(inner.summary());
-    Ok(LimaStandaloneDiskObservation { inner, summary })
+    Ok(LimaStandaloneDiskFixtureObservation { inner, summary })
 }
