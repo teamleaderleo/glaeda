@@ -80,9 +80,7 @@ impl ValidatedProjectDiskLimaSource {
     ///
     /// Returns a bounded path-free refusal for a non-absolute/non-canonical source or an invalid
     /// macOS `/var` compatibility alias.
-    pub fn new(
-        lima_home: impl Into<PathBuf>,
-    ) -> Result<Self, ProjectDiskLimaSourceError> {
+    pub fn new(lima_home: impl Into<PathBuf>) -> Result<Self, ProjectDiskLimaSourceError> {
         let normalized = normalize_source_path(&lima_home.into())?;
         let canonical_lima_home = accepted_source_path(&normalized)?;
         let identity = derive_source_identity(&canonical_lima_home);
