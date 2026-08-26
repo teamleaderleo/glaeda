@@ -1,8 +1,8 @@
 # Glaeda
 
-**Blazingly hot, trust-tiered compute execution on the machines and fleets you control.**
+**Blazingly hot, trust-tiered execution for compute workloads — from one machine to a fleet.**
 
-Glaeda turns operator-controlled compute into a general execution runtime. It finds the quickest trustworthy path from declared work to useful compute results, keeps valuable state hot when policy permits, and preserves the exact durable truth needed to recover when physical execution state disappears or becomes ambiguous.
+Glaeda turns eligible compute into a general execution runtime. It finds the quickest trustworthy path from declared work to useful compute results, keeps valuable state hot when policy permits, and preserves the exact durable truth needed to recover when physical execution state disappears or becomes ambiguous.
 
 Coding agents and GitHub Actions are major current proving workloads. The first production backend is operator-owned Apple-silicon compute running Linux through Lima/VZ, with GitHub as an important workflow integration. The execution, capacity, hot-state, recovery, and placement model is intended to serve broader compute workloads too.
 
@@ -308,6 +308,7 @@ See the [manifest reference](docs/MANIFEST.md) and example [Quarry](examples/qua
 - **Destroyability preserves freedom.** Physical state can disappear without losing execution truth.
 - **Execution authority and result authority stay separate.** A process, backend, cache hit, benchmark, dataset, model output, render, or verification receipt carries only the authority its owning contract grants.
 - **Backends are mechanisms.** Adopt better execution primitives without redefining workload semantics or recovery.
+- **GitHub integration stays native.** Use the official runner and Scale Set client for GitHub workloads.
 - **Plan before mutation.** External side effects follow exact reviewed authority.
 - **Prove ownership.** Names, PIDs, labels, and directory presence carry zero cleanup authority by themselves.
 - **Linux executes; Mac controls today.** Linux is the current workload execution environment while secrets and durable control stay outside workers.
