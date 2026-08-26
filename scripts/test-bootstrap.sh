@@ -47,21 +47,44 @@ write_tool rustfmt 'rustfmt 1.8.0-stable (fixture)'
 write_unavailable_tool just
 write_unavailable_tool podman
 
-(
-  cd "$fixture"
-  git init -q
-  git config user.name 'Glaeda Bootstrap Test'
-  git config user.email 'bootstrap-test@example.invalid'
-  git remote add origin https://github.com/teamleaderleo/smolrunner.git
-  git add Cargo.toml Cargo.lock .gitignore scripts/bootstrap scripts/workspace_bootstrap
-  git commit -qm fixture
-)
+ambient_git_config="$temporary_root/ambient-gitconfig"
+git config --file "$ambient_git_config" commit.gpgSign true
+git config --file "$ambient_git_config" init.defaultBranch hostile
+export GIT_CONFIG_GLOBAL="$ambient_git_config"
+
+fixture_git() {
+  env -i \
+    PATH=/usr/bin:/bin \
+    HOME="$temporary_root/home" \
+    GIT_CONFIG_GLOBAL=/dev/null \
+    GIT_CONFIG_NOSYSTEM=1 \
+    LANG=C \
+    LC_ALL=C \
+    git -C "$fixture" "$@"
+}
+
+fixture_git init -q -b main
+fixture_git config user.name 'Glaeda Bootstrap Test'
+fixture_git config user.email 'bootstrap-test@example.invalid'
+fixture_git remote add origin https://github.com/teamleaderleo/smolrunner.git
+fixture_git add Cargo.toml Cargo.lock .gitignore scripts/bootstrap scripts/workspace_bootstrap
+fixture_git commit -qm fixture
 
 export PATH="$temporary_root/bin:/usr/bin:/bin"
 export HOME="$temporary_root/home"
 unset CARGO_HOME RUSTUP_HOME CARGO_TARGET_DIR
 
-lock_before=$(sha256sum "$fixture/Cargo.lock" | awk '{print $1}')
+sha256_file() {
+  python3 - "$1" <<'PY'
+import hashlib
+import pathlib
+import sys
+
+print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())
+PY
+}
+
+lock_before=$(sha256_file "$fixture/Cargo.lock")
 
 # Unset defaults remain missing, owned by nobody, and safe to repeat.
 (
@@ -331,5 +354,5 @@ PY
 rmdir "$fixture/nested"
 
 [[ -z $(git -C "$fixture" status --porcelain=v1 --untracked-files=all) ]]
-[[ "$lock_before" == "$(sha256sum "$fixture/Cargo.lock" | awk '{print $1}')" ]]
+[[ "$lock_before" == "$(sha256_file "$fixture/Cargo.lock")" ]]
 printf 'workspace bootstrap tests passed\n'
