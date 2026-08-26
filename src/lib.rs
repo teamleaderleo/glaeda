@@ -57,6 +57,8 @@ pub mod durable_journal;
 pub mod durable_lane_execution;
 #[cfg_attr(test, allow(clippy::too_many_arguments))]
 pub mod execution_admission;
+/// Pure product-neutral resource ownership and fail-closed capacity arithmetic.
+pub mod execution_capacity;
 pub mod execution_receipt;
 pub mod execution_receipt_store;
 /// Pure Git index-v2 stat-cache patching for CoW task materialization.
