@@ -200,7 +200,7 @@ jobs:
 
       - name: Exercise root Glaeda front door
         run: |
-          ./smolrunner --output json | jq -e '
+          ./glaeda --output json | jq -e '
             .schema_version == 1 and
             .receipt_type == "smolrunner-front-door-readiness-receipt" and
             .verdict == "ready" and
