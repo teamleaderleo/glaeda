@@ -354,6 +354,8 @@ pub mod unix_personal_worker_store;
 /// Descriptor-bound private persistence for the resident-sandbox catalog.
 #[cfg(unix)]
 pub mod unix_resident_sandbox_store;
+/// Pure sealed cross-attempt verification-isolation compatibility.
+pub mod verification_isolation_referee;
 pub mod verification_profile;
 pub mod verification_profile_preflight_adapter;
 pub mod verification_profile_registry;
