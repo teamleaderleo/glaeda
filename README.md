@@ -1,23 +1,27 @@
 # Glaeda
 
-**Blazingly hot Linux execution for coding agents and GitHub Actions on the Mac you already own.**
+**Blazingly hot, trust-tiered execution for compute workloads — from one machine to a fleet.**
 
-Glaeda turns operator-owned Apple-silicon compute into a trust-tiered Linux execution layer. It keeps GitHub as the ordinary workflow surface, uses Lima/VZ for Linux execution, persists the minimum durable truth required for recovery, and chooses worker residency from trust and measured value.
+Glaeda turns eligible compute into a general execution runtime. It finds the quickest trustworthy path from declared work to useful compute results, keeps valuable state hot when policy permits, and preserves the exact durable truth needed to recover when physical execution state disappears or becomes ambiguous.
+
+Coding agents and GitHub Actions are major current proving workloads. The first production backend is operator-owned Apple-silicon compute running Linux through Lima/VZ, with GitHub as an important workflow integration. The execution, capacity, hot-state, recovery, and placement model is intended to serve broader compute workloads too.
 
 > **Disposable is a capability. Trust decides residency.**
 
-For hostile or unknown repository work, Glaeda targets one fresh isolated worker, one bounded job, exact teardown, and proven absence. For trusted CI, it can reuse prepared workers, repository seeds, reviewed cache generations, and warm pools. For ultra-trusted agent work, it can keep project sandboxes, worktrees, compiler state, package state, indexes, and selected services resident across edit/test/build loops.
+Hostile or unknown work can receive fresh isolated execution state, one bounded capability set, exact teardown, and proven absence. Trusted repeatable work can reuse prepared environments, immutable inputs, reviewed cache generations, and warm pools. Ultra-trusted work can keep long-lived compute contexts, mutable working state, indexes, accelerators, and selected services resident when exact validity and ownership rules permit it.
 
 The target experience is simple:
 
 ```text
-agent work appears
--> Glaeda selects the hottest valid execution path
--> Linux environment is ready
--> repo / dependencies / build state are already warm where trust permits
--> useful command starts
--> useful result returns
--> state is retained, reset, or destroyed according to trust + validity + value
+work appears
+-> Glaeda identifies exact workload intent, trust, inputs, and required capabilities
+-> Glaeda selects eligible compute and the hottest valid reusable state
+-> capacity is admitted
+-> only the state that must change is materialized
+-> useful compute begins
+-> useful outputs and evidence return
+-> state is retained, reset, migrated, quarantined, or destroyed by policy
+-> interruption converges through exact durable recovery
 ```
 
 ## Status
@@ -38,77 +42,80 @@ The immediate production work remains:
 - prove and implement the hostile-worker network boundary;
 - compose the landed M6 OverlayFS, Git-pool, lease, and performance primitives into measured trusted task loops.
 
-Hot trusted execution progresses in parallel where it preserves those guarantees. See the [roadmap](docs/ROADMAP.md), [#557](https://github.com/teamleaderleo/smolrunner/issues/557), and the strict disposable programme [#365](https://github.com/teamleaderleo/smolrunner/issues/365).
+Hot trusted execution progresses in parallel where it preserves those guarantees. See the [general compute runtime](docs/COMPUTE_RUNTIME.md), [roadmap](docs/ROADMAP.md), [#770](https://github.com/teamleaderleo/smolrunner/issues/770), [#557](https://github.com/teamleaderleo/smolrunner/issues/557), and the strict disposable programme [#365](https://github.com/teamleaderleo/smolrunner/issues/365).
 
 ## What Glaeda is optimizing
 
-The headline metric is **agent wall-clock latency**.
+The universal objective is **time to a useful accepted compute result, plus throughput and resource cost under exact trust and correctness constraints**.
 
 Measure the whole path:
 
 ```text
 work becomes known
--> target / resident sandbox selected
+-> workload / trust / input identity resolved
+-> target and reusable state selected
 -> capacity admitted
 -> environment ready
--> repo/revision usable
--> dependency/build state usable
--> first useful command
--> first useful test/build result
--> final trustworthy result
+-> required inputs and state usable
+-> first useful compute
+-> first useful output
+-> final accepted result
 -> teardown or residency transition
 ```
 
 Useful product metrics include:
 
-- queue-to-first-useful-command;
-- edit-to-first-test-result;
-- edit-to-final-relevant-verification;
-- task completion wall time;
-- fleet throughput under concurrent agents;
-- disk/RAM/CPU residency cost;
-- hot-state hit/miss/reset behavior.
+- request-to-first-useful-compute;
+- request-to-first-useful-output;
+- request-to-final-accepted-result;
+- queueing and contention cost;
+- workload completion wall time;
+- fleet throughput under concurrent workloads;
+- CPU/RAM/storage/network/accelerator occupancy where relevant;
+- warm-state hit/miss/reset benefit;
+- recovery time after interruption.
+
+Workload families can add stronger domain metrics. Current coding-agent and CI proving workloads care deeply about edit-to-first-test, edit-to-build, verification completion, and multi-agent throughput. Data, rendering, model, service, and batch workloads can define their own useful-result metrics without adopting agent or repository semantics.
 
 ## Trust-tiered execution
 
 ### Hostile / unknown
 
 ```text
-fresh prepared Linux worker
--> one bounded job
--> terminal result
--> runner removal
--> VM teardown
+fresh prepared execution state
+-> one bounded workload
+-> terminal output/evidence
+-> exact teardown
 -> prove absence
 ```
 
-This lane carries the strongest isolation and cleanup contract. Job-specific writable state dies with the worker. Reusable inputs come from separately reviewed immutable/read-only generations where policy permits.
+This lane carries the strongest isolation and cleanup contract. Workload-specific writable state dies with the execution environment. Reusable inputs come from separately reviewed immutable/read-only generations where policy permits.
 
-### Trusted CI
+The current hostile proving workload is arbitrary repository/CI code inside a fresh Linux worker.
+
+### Trusted repeatable compute
 
 ```text
-job arrives
--> prepared worker / warm pool
--> exact repo seed or already-present Git objects
--> eligible dependency/compiler/artifact generations
+work arrives
+-> prepared environment / warm pool
+-> exact reusable inputs and eligible hot state
 -> execute
--> destroy or retire according to policy
+-> destroy, reset, or retain according to policy
 ```
 
-The job can remain disposable while expensive preparation stays hot around it.
+The physical execution can remain disposable while expensive preparation stays hot around it. Current examples include trusted CI, repository seeds, dependency/compiler caches, immutable derived artifacts, and prepared workers. The same pattern can serve data transforms, rendering inputs, model assets, or other repeatable compute families with their own exact validity contracts.
 
-### Ultra-trusted agent/project work
+### Ultra-trusted resident compute
 
 ```text
-resident project sandbox
--> revalidate project/source/toolchain lease
--> edit
--> test
--> inspect
--> build
--> test
--> keep valuable incremental state resident
+resident compute context
+-> revalidate exact owner / inputs / runtime / capability generations
+-> perform useful work
+-> retain valuable mutable state and services
+-> reset, migrate, stop, or evict when policy changes
 ```
+
+Current agent/project work is one strong example: a resident project sandbox can retain worktrees, compiler state, package state, indexes, and selected services across edit/test/build loops.
 
 Useful resident state may include:
 
@@ -119,15 +126,18 @@ Useful resident state may include:
 - Maven/Gradle state;
 - language-server and code-search indexes;
 - container/build caches;
-- test daemons/watchers and selected development services.
+- immutable datasets and derived representations;
+- model weights and preprocessed shards;
+- renderer caches and compiled assets;
+- test daemons/watchers and selected workload services.
 
-Resident state remains working state. Durable execution truth, source identity, trust class, project lease, toolchain generation, credential/network capability generation, and reset policy remain authoritative.
+Resident state remains working state. Durable execution truth, workload/input identity, trust class, ownership/lease generations, runtime/toolchain identity, credential/network capability generations, and reset policy remain authoritative.
 
 ## Why Linux on a Mac?
 
-Agentic development creates intense filesystem churn: Git worktrees, package stores, `node_modules`, compiler trees, indexes, test outputs, caches, and large cleanup operations.
+The current proving workloads create intense filesystem churn: Git worktrees, package stores, `node_modules`, compiler trees, indexes, test outputs, caches, data preparation, and large cleanup operations.
 
-Glaeda keeps those repository filesystem operations inside Linux. macOS remains the trusted control plane while the guest handles the small-file-heavy developer workload using Linux filesystem semantics.
+Glaeda keeps those Linux-native workload operations inside Linux. macOS remains the trusted control plane while the guest handles the small-file-heavy and Linux-specific execution path using Linux filesystem semantics.
 
 The current prepared worker uses:
 
@@ -141,7 +151,7 @@ The current prepared worker uses:
 - a separate workload account;
 - exact pinned runner/template identities.
 
-M6 makes the Linux storage layer itself a benchmark target: XFS/reflink and other credible Linux storage choices, project volumes, cheap task-local forks, package-manager behavior, compiler-tree reuse, and host backing-file growth.
+M6 makes the Linux storage layer itself a benchmark target: XFS/reflink and other credible Linux storage choices, project volumes, cheap task-local forks, package-manager behavior, compiler-tree reuse, data representations, and host backing-file growth.
 
 ## Why Glaeda instead of a few Lima commands?
 
@@ -168,6 +178,8 @@ Lima supplies excellent VM primitives. Glaeda supplies the durable execution run
 
 The distinction becomes clearest around crashes and ambiguity. Glaeda persists exact authority before external mutations, freshly observes external state during recovery, and preserves debt when ownership or completion remains ambiguous.
 
+The same runtime boundary can sit above additional backends over time: Apple container / Containerization, native Linux hosts, operator-owned fleet nodes, accelerator-equipped hosts, and selected remote or burst compute where policy permits.
+
 ## Hot execution programme
 
 The roadmap now treats hot execution as a primary programme.
@@ -180,38 +192,39 @@ Compare:
 cold disposable
 prepared disposable
 warm-pool disposable
-resident project after idle
-resident project immediate reuse
-resident task loop
+resident context after idle
+resident immediate reuse
+resident repeated-work loop
 ```
 
 ### Hot repository state
 
-Explore local Git object seeds, resident trusted checkouts, cheap task-local worktrees, read-only shared bases, and repository hydration overlapped with admission.
+For the current development/CI workload family, explore local Git object seeds, resident trusted checkouts, cheap task-local worktrees, read-only shared bases, and repository hydration overlapped with admission.
 
 ### Hot Linux storage
 
-Benchmark real agent workloads across credible Linux filesystem/storage choices:
+Benchmark real compute workloads, beginning with current agent/dev loops, across credible Linux filesystem/storage choices:
 
 - Git worktree add/remove;
 - pnpm/npm/Bun install from warm state;
 - hardlink/reflink behavior;
 - Cargo incremental builds;
 - Maven/Gradle trees;
+- dataset preparation and derived-representation reuse;
 - large small-file creation/deletion;
 - compiler/index state reuse;
-- many concurrent agent task forks;
+- many concurrent task forks;
 - guest logical bytes versus Mac-side Lima disk growth.
 
-The product question is simple: **which storage path gives the quickest repeated agent loop at an acceptable CPU/disk cost?**
+The product question is simple: **which storage path gets repeated useful computation to its next accepted output soonest at an acceptable resource cost?**
 
 ### Hot build and dependency state
 
-Treat package state, compiler caches, build outputs, container layers, prepared dependency environments, indexes, and derived verification artifacts as typed state with explicit validity and utility accounting.
+Treat package state, compiler caches, build outputs, container layers, prepared dependency environments, indexes, datasets, model assets, renderer artifacts, and derived verification outputs as typed state with explicit validity and utility accounting.
 
 ### Hot services
 
-For ultra-trusted projects, keep expensive dev services resident when their lifecycle is explicit: language servers, test watchers, compiler servers, local fixtures, builders, and repository-specific daemons.
+For ultra-trusted workloads, keep expensive services resident when their lifecycle is explicit: language servers, test watchers, compiler servers, local fixtures, builders, databases, model servers, render helpers, and workload-specific daemons.
 
 ## Durable execution truth
 
@@ -219,16 +232,16 @@ Glaeda persists the minimum facts required to decide the next safe action after 
 
 Useful durable facts include:
 
-- job / attempt / execution identity;
+- workload / attempt / execution identity;
 - capacity and ownership generations;
 - exact mutation intent and restart-safe execution ownership;
-- template/toolchain/input generation identities;
-- GitHub delivery/acquisition/runner identities;
-- VM/sandbox/project-lease bindings needed for reconciliation;
+- template/runtime/toolchain/input generation identities;
+- external delivery/acquisition identities where integrations require them;
+- VM/sandbox/resident-context bindings needed for reconciliation;
 - terminal outcome and teardown receipts;
 - explicit recovery debt.
 
-VMs, workspaces, caches, indexes, compiler trees, and resident services can be destroyed and reconstructed from canonical inputs. That destroyability is what makes aggressive trusted residency safe.
+VMs, workspaces, caches, indexes, compiler trees, datasets, model state, and resident services can be destroyed and reconstructed from canonical inputs when their family contract says they are rebuildable. That destroyability is what makes aggressive trusted residency safe.
 
 ## Current commands
 
@@ -254,7 +267,7 @@ Cargo can execute build-time code. Give elevation to the already-built reviewed 
 
 ## Manifest boundary
 
-A Glaeda manifest describes host and execution policy while repositories continue to own build/test semantics and GitHub workflow YAML.
+The current Glaeda repository manifest describes host and repository-execution policy while repositories continue to own build/test semantics and GitHub workflow YAML. Broader compute workload adapters can carry their own exact typed input and output contracts instead of being forced through repository configuration.
 
 ```yaml
 version: 1
@@ -290,13 +303,16 @@ See the [manifest reference](docs/MANIFEST.md) and example [Quarry](examples/qua
 ## Design principles
 
 - **Blazingly hot.** Remove repeated work until the useful operation dominates wall time.
-- **Trust decides residency.** Hostile work evaporates; trusted projects may stay warm.
+- **Compute is the product domain.** Current workload families are proving grounds, not ceilings.
+- **Trust decides residency.** Hostile work evaporates; trusted compute may stay warm.
 - **Destroyability preserves freedom.** Physical state can disappear without losing execution truth.
-- **Official GitHub protocol.** Use the official runner and Scale Set client.
+- **Execution authority and result authority stay separate.** A process, backend, cache hit, benchmark, dataset, model output, render, or verification receipt carries only the authority its owning contract grants.
+- **Backends are mechanisms.** Adopt better execution primitives without redefining workload semantics or recovery.
+- **GitHub integration stays native.** Use the official runner and Scale Set client for GitHub workloads.
 - **Plan before mutation.** External side effects follow exact reviewed authority.
 - **Prove ownership.** Names, PIDs, labels, and directory presence carry zero cleanup authority by themselves.
-- **Linux executes; Mac controls.** Repository filesystem churn lives in Linux while secrets and durable control stay outside the worker.
-- **Measure complete loops.** Optimize queue/edit-to-useful-result and fleet throughput.
+- **Linux executes; Mac controls today.** Linux is the current workload execution environment while secrets and durable control stay outside workers.
+- **Measure complete loops.** Optimize request-to-useful-result, throughput, and resource cost.
 - **Explain reuse.** Reports should say what stayed resident, what hit, what reset, and why.
 - **Stay lean.** Prefer mature components and a compact explicit control surface.
 
@@ -316,6 +332,7 @@ cargo run --locked --quiet -- --output json host plan --file examples/quarry.yml
 
 ## Project documents
 
+- [General compute runtime](docs/COMPUTE_RUNTIME.md)
 - [Roadmap](docs/ROADMAP.md)
 - [Product evolution](docs/PRODUCT_EVOLUTION.md)
 - [Blazingly hot execution](docs/BLAZINGLY_HOT.md)
