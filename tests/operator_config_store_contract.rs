@@ -1,7 +1,7 @@
 #![cfg(unix)]
 #![allow(dead_code)]
 
-pub use smolrunner::{operator_config, operator_error};
+pub use glaeda::{operator_config, operator_error};
 
 #[path = "../src/operator_config_store.rs"]
 mod operator_config_store;
@@ -17,19 +17,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 
+use glaeda::lima_observation::LimaInstanceName;
+use glaeda::mac_availability::AvailabilityRequest;
+use glaeda::operator_config::{
+    GuestWorkspacePath, OperatorConfig, OperatorIdlePolicy, OperatorOutputPreference,
+    OperatorRemediationPreference, PersonalWorkerStateRoot,
+};
+use glaeda::operator_error::OperatorErrorCode;
+use glaeda::verification_profile::VerificationProfileId;
 use operator_config_store::{
     OperatorConfigCreateDisposition, OperatorConfigDiscoveryContext,
     OperatorConfigDiscoveryRequest, OperatorConfigSource, OperatorConfigStore,
     OperatorConfigStoreErrorKind,
 };
-use smolrunner::lima_observation::LimaInstanceName;
-use smolrunner::mac_availability::AvailabilityRequest;
-use smolrunner::operator_config::{
-    GuestWorkspacePath, OperatorConfig, OperatorIdlePolicy, OperatorOutputPreference,
-    OperatorRemediationPreference, PersonalWorkerStateRoot,
-};
-use smolrunner::operator_error::OperatorErrorCode;
-use smolrunner::verification_profile::VerificationProfileId;
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
 

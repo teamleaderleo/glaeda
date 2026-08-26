@@ -16,6 +16,66 @@ use std::{
 };
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+#[cfg(target_os = "macos")]
+use glaeda::artifact::Sha256Digest;
+use glaeda::disposable_launchd_service::DisposableLaunchdServiceDesiredState;
+#[cfg(target_os = "macos")]
+use glaeda::disposable_launchd_service::{
+    DISPOSABLE_LAUNCHD_SERVICE_LABEL, DisposableLaunchdServicePlan,
+    apply_disposable_launchd_service, plan_disposable_launchd_service,
+};
+#[cfg(target_os = "macos")]
+use glaeda::disposable_launchd_service_status::{
+    DisposableLaunchdServiceObservedState, DisposableLaunchdServiceRemediation,
+    DisposableLaunchdServiceStatusErrorKind, inspect_disposable_launchd_service_status,
+};
+#[cfg(target_os = "macos")]
+use glaeda::disposable_worker_enrollment::{
+    MAX_DISPOSABLE_WORKER_ENROLLMENT_BYTES, decode_disposable_worker_enrollment,
+};
+#[cfg(target_os = "macos")]
+use glaeda::disposable_worker_service::serve_disposable_worker;
+use glaeda::doctor::{inspect_host, render_human as render_doctor};
+#[cfg(target_os = "linux")]
+use glaeda::durable_journal::StateStoreJournalCheckpoint;
+#[cfg(target_os = "linux")]
+use glaeda::durable_lane_execution::SystemLaneCommandRunner;
+#[cfg(target_os = "linux")]
+use glaeda::host_preparation_command::{
+    HostPreparationCommandDecision, HostPreparationCommandDisposition, decide_host_preparation,
+    render_human as render_host_prepare_decision,
+};
+#[cfg(target_os = "linux")]
+use glaeda::host_preparation_execution::{
+    HostPreparationExecutionDisposition, HostPreparationExecutionError,
+    execute_confirmed_host_preparation, render_human as render_host_prepare_execution,
+};
+#[cfg(target_os = "linux")]
+use glaeda::host_preparation_plan::{ExecutableHostPreparationAction, plan_host_preparation};
+#[cfg(target_os = "linux")]
+use glaeda::host_readiness::{RunnerAccountReadiness, inspect_host_readiness};
+#[cfg(target_os = "linux")]
+use glaeda::host_readiness_verdict::{assess, render_human as render_host_plan};
+#[cfg(target_os = "linux")]
+use glaeda::journal::ExecutionLane;
+#[cfg(target_os = "linux")]
+use glaeda::lane_command::LaneCommandKind;
+#[cfg(target_os = "linux")]
+use glaeda::linux_installation_catalog::{InstallationLookup, find_default_installation};
+#[cfg(target_os = "linux")]
+use glaeda::linux_state::LinuxStateRoot;
+use glaeda::manifest::{ManifestError, load};
+#[cfg(target_os = "linux")]
+use glaeda::ownership::ProjectIdentity;
+use glaeda::plan::{build, render_human as render_plan};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use glaeda::process::ProcessExecutor;
+#[cfg(target_os = "linux")]
+use glaeda::runner_user_observation::observe_verified_runner_user;
+#[cfg(target_os = "linux")]
+use glaeda::state::JournalId;
+#[cfg(target_os = "linux")]
+use glaeda::trusted_guest_control_dispatcher::serve_trusted_guest_control_stdio;
 use personal_worker_cancel_command::{
     PersonalWorkerCancelCommandError, cancel_queued_job, render_cancel_receipt_human,
 };
@@ -37,70 +97,10 @@ use rustix::{
 use serde::Serialize;
 #[cfg(target_os = "macos")]
 use sha2::{Digest as _, Sha256};
-#[cfg(target_os = "macos")]
-use smolrunner::artifact::Sha256Digest;
-use smolrunner::disposable_launchd_service::DisposableLaunchdServiceDesiredState;
-#[cfg(target_os = "macos")]
-use smolrunner::disposable_launchd_service::{
-    DISPOSABLE_LAUNCHD_SERVICE_LABEL, DisposableLaunchdServicePlan,
-    apply_disposable_launchd_service, plan_disposable_launchd_service,
-};
-#[cfg(target_os = "macos")]
-use smolrunner::disposable_launchd_service_status::{
-    DisposableLaunchdServiceObservedState, DisposableLaunchdServiceRemediation,
-    DisposableLaunchdServiceStatusErrorKind, inspect_disposable_launchd_service_status,
-};
-#[cfg(target_os = "macos")]
-use smolrunner::disposable_worker_enrollment::{
-    MAX_DISPOSABLE_WORKER_ENROLLMENT_BYTES, decode_disposable_worker_enrollment,
-};
-#[cfg(target_os = "macos")]
-use smolrunner::disposable_worker_service::serve_disposable_worker;
-use smolrunner::doctor::{inspect_host, render_human as render_doctor};
-#[cfg(target_os = "linux")]
-use smolrunner::durable_journal::StateStoreJournalCheckpoint;
-#[cfg(target_os = "linux")]
-use smolrunner::durable_lane_execution::SystemLaneCommandRunner;
-#[cfg(target_os = "linux")]
-use smolrunner::host_preparation_command::{
-    HostPreparationCommandDecision, HostPreparationCommandDisposition, decide_host_preparation,
-    render_human as render_host_prepare_decision,
-};
-#[cfg(target_os = "linux")]
-use smolrunner::host_preparation_execution::{
-    HostPreparationExecutionDisposition, HostPreparationExecutionError,
-    execute_confirmed_host_preparation, render_human as render_host_prepare_execution,
-};
-#[cfg(target_os = "linux")]
-use smolrunner::host_preparation_plan::{ExecutableHostPreparationAction, plan_host_preparation};
-#[cfg(target_os = "linux")]
-use smolrunner::host_readiness::{RunnerAccountReadiness, inspect_host_readiness};
-#[cfg(target_os = "linux")]
-use smolrunner::host_readiness_verdict::{assess, render_human as render_host_plan};
-#[cfg(target_os = "linux")]
-use smolrunner::journal::ExecutionLane;
-#[cfg(target_os = "linux")]
-use smolrunner::lane_command::LaneCommandKind;
-#[cfg(target_os = "linux")]
-use smolrunner::linux_installation_catalog::{InstallationLookup, find_default_installation};
-#[cfg(target_os = "linux")]
-use smolrunner::linux_state::LinuxStateRoot;
-use smolrunner::manifest::{ManifestError, load};
-#[cfg(target_os = "linux")]
-use smolrunner::ownership::ProjectIdentity;
-use smolrunner::plan::{build, render_human as render_plan};
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use smolrunner::process::ProcessExecutor;
-#[cfg(target_os = "linux")]
-use smolrunner::runner_user_observation::observe_verified_runner_user;
-#[cfg(target_os = "linux")]
-use smolrunner::state::JournalId;
-#[cfg(target_os = "linux")]
-use smolrunner::trusted_guest_control_dispatcher::serve_trusted_guest_control_stdio;
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "smolrunner",
+    name = "glaeda",
     version,
     about = "Tend a small fleet of self-hosted GitHub Actions runners"
 )]
@@ -120,16 +120,16 @@ enum OutputFormat {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Inspect whether the current host is ready for SmolRunner.
+    /// Inspect whether the current host is ready for Glaeda.
     Doctor {
         /// Treat warnings as a non-zero result.
         #[arg(long)]
         strict: bool,
     },
-    /// Validate desired state and show the changes SmolRunner would eventually make.
+    /// Validate desired state and show the changes Glaeda would eventually make.
     Plan {
         /// Manifest to validate and plan.
-        #[arg(long, default_value = "smolrunner.yml")]
+        #[arg(long, default_value = "glaeda.yml")]
         file: PathBuf,
     },
     /// Inspect, plan, or explicitly prepare host-level state.
@@ -169,10 +169,10 @@ enum ServiceCommand {
         /// Explicit absolute normalized operator home directory.
         #[arg(long)]
         operator_home: PathBuf,
-        /// Exact absolute normalized SmolRunner executable path.
+        /// Exact absolute normalized Glaeda executable path.
         #[arg(long)]
         program: PathBuf,
-        /// Exact reviewed SmolRunner executable content digest.
+        /// Exact reviewed Glaeda executable content digest.
         #[arg(long)]
         program_digest: String,
         /// Exact absolute normalized canonical enrollment document.
@@ -187,10 +187,10 @@ enum ServiceCommand {
         /// Explicit absolute normalized operator home directory.
         #[arg(long)]
         operator_home: PathBuf,
-        /// Exact absolute normalized SmolRunner executable path.
+        /// Exact absolute normalized Glaeda executable path.
         #[arg(long)]
         program: PathBuf,
-        /// Exact reviewed SmolRunner executable content digest.
+        /// Exact reviewed Glaeda executable content digest.
         #[arg(long)]
         program_digest: String,
         /// Exact absolute normalized canonical enrollment document.
@@ -208,10 +208,10 @@ enum ServiceCommand {
         /// Explicit absolute normalized operator home directory.
         #[arg(long)]
         operator_home: PathBuf,
-        /// Exact absolute normalized SmolRunner executable path.
+        /// Exact absolute normalized Glaeda executable path.
         #[arg(long)]
         program: PathBuf,
-        /// Exact reviewed SmolRunner executable content digest.
+        /// Exact reviewed Glaeda executable content digest.
         #[arg(long)]
         program_digest: String,
         /// Exact absolute normalized canonical enrollment document.
@@ -246,7 +246,7 @@ enum HostCommand {
     /// Compare bounded host observations with a project manifest.
     Plan {
         /// Manifest to inspect against the current host.
-        #[arg(long, default_value = "smolrunner.yml")]
+        #[arg(long, default_value = "glaeda.yml")]
         file: PathBuf,
         /// Explicit runner account policy. Defaults to MANIFEST.account.yml when present.
         #[arg(long)]
@@ -255,7 +255,7 @@ enum HostCommand {
     /// Execute one exactly confirmed reviewed host-preparation phase.
     Prepare {
         /// Manifest to inspect and prepare against the current host.
-        #[arg(long, default_value = "smolrunner.yml")]
+        #[arg(long, default_value = "glaeda.yml")]
         file: PathBuf,
         /// Explicit runner account policy. Defaults to MANIFEST.account.yml when present.
         #[arg(long)]
@@ -1507,7 +1507,7 @@ fn run_host_prepare(
             return emit_runtime_error(
                 output,
                 "installation_missing",
-                "no enrolled SmolRunner installation matches the manifest project; host preparation does not bootstrap state or enroll projects"
+                "no enrolled Glaeda installation matches the manifest project; host preparation does not bootstrap state or enroll projects"
                     .to_owned(),
             );
         }
@@ -1730,7 +1730,7 @@ fn emit_runtime_error(output: OutputFormat, kind: &'static str, message: String)
 fn load_manifest(
     output: OutputFormat,
     file: &Path,
-) -> Result<smolrunner::manifest::Manifest, ExitCode> {
+) -> Result<glaeda::manifest::Manifest, ExitCode> {
     load(file).map_err(|error| {
         match output {
             OutputFormat::Human => eprint!("{error}"),
@@ -1776,11 +1776,11 @@ mod tests {
     use sha2::{Digest as _, Sha256};
 
     #[cfg(target_os = "linux")]
-    use smolrunner::host_preparation_plan::ExecutableHostPreparationAction;
+    use glaeda::host_preparation_plan::ExecutableHostPreparationAction;
     #[cfg(target_os = "linux")]
-    use smolrunner::journal::{ExecutionLane, RollbackClass};
+    use glaeda::journal::{ExecutionLane, RollbackClass};
     #[cfg(target_os = "linux")]
-    use smolrunner::lane_command::LaneCommandKind;
+    use glaeda::lane_command::LaneCommandKind;
 
     use super::{
         Cli, Command, HostCommand, JobCommand, QueueCommand, ServiceCommand, ServiceDesiredState,
@@ -1799,7 +1799,7 @@ mod tests {
     #[test]
     fn host_prepare_accepts_explicit_confirmation_and_account_policy() {
         let cli = Cli::try_parse_from([
-            "smolrunner",
+            "glaeda",
             "host",
             "prepare",
             "--file",
@@ -1869,7 +1869,7 @@ mod tests {
     #[test]
     fn personal_worker_read_commands_parse_exact_snapshot_arguments() {
         let status = Cli::try_parse_from([
-            "smolrunner",
+            "glaeda",
             "worker",
             "status",
             "--store-root",
@@ -1885,7 +1885,7 @@ mod tests {
         assert_eq!(store_root, PathBuf::from("/tmp/worker-state"));
 
         let queue = Cli::try_parse_from([
-            "smolrunner",
+            "glaeda",
             "queue",
             "list",
             "--store-root",
@@ -1920,7 +1920,7 @@ mod tests {
         assert_eq!(limit, 5);
 
         let job = Cli::try_parse_from([
-            "smolrunner",
+            "glaeda",
             "job",
             "show",
             "--store-root",
@@ -1950,7 +1950,7 @@ mod tests {
         assert_eq!(request_id, "job-one");
 
         let cancel = Cli::try_parse_from([
-            "smolrunner",
+            "glaeda",
             "job",
             "cancel",
             "--store-root",
@@ -1987,7 +1987,7 @@ mod tests {
     #[test]
     fn worker_serve_requires_one_explicit_enrollment_identity() {
         let cli = Cli::try_parse_from([
-            "smolrunner",
+            "glaeda",
             "worker",
             "serve",
             "--program-digest",
@@ -2026,7 +2026,7 @@ mod tests {
     #[test]
     fn launchd_service_plan_parses_exact_private_inputs() {
         let cli = Cli::try_parse_from([
-            "smolrunner",
+            "glaeda",
             "service",
             "plan",
             "--desired",
@@ -2077,7 +2077,7 @@ mod tests {
     #[test]
     fn launchd_service_status_parses_exact_private_inputs() {
         let cli = Cli::try_parse_from([
-            "smolrunner",
+            "glaeda",
             "service",
             "status",
             "--operator-home",
@@ -2125,7 +2125,7 @@ mod tests {
     fn launchd_service_apply_requires_exact_plan_approval() {
         assert!(
             Cli::try_parse_from([
-                "smolrunner",
+                "glaeda",
                 "service",
                 "apply",
                 "--desired",
@@ -2144,7 +2144,7 @@ mod tests {
             .is_err()
         );
         let cli = Cli::try_parse_from([
-            "smolrunner",
+            "glaeda",
             "service",
             "apply",
             "--desired",
