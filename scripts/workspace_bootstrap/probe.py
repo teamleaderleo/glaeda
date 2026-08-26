@@ -1,4 +1,4 @@
-"""Bounded, read-only observations for the SmolRunner workspace receipt."""
+"""Bounded, read-only observations for the Glaeda workspace receipt."""
 
 from __future__ import annotations
 
@@ -157,7 +157,9 @@ def package_marker_matches(root: Path) -> bool:
     package = re.search(r"(?ms)^\[package\]\s*(.*?)(?=^\[|\Z)", text)
     return bool(
         package
-        and re.search(r'(?m)^\s*name\s*=\s*"smolrunner"\s*$', package.group(1))
+        and re.search(
+            r'(?m)^\s*name\s*=\s*"(?:glaeda|smolrunner)"\s*$', package.group(1)
+        )
     )
 
 

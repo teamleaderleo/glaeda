@@ -40,7 +40,7 @@ jobs:
       - name: Install Ubuntu closure packages
         run: |
           while IFS= read -r source; do
-            sudo mv -- "$source" "$source.smolrunner-disabled"
+            sudo mv -- "$source" "$source.glaeda-disabled"
           done < <(sudo grep -rl 'ppa.launchpadcontent.net/git-core/ppa' /etc/apt/sources.list.d || true)
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends \

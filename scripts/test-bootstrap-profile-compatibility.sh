@@ -190,7 +190,7 @@ assert str(installation) not in public
 ids = [item["capability"] for item in observation["capabilities"]]
 assert len(ids) == len(set(ids))
 
-# Provenance refusal matrix. These are typed facts a future SmolRunner-owned
+# Provenance refusal matrix. These are typed facts a future Glaeda-owned
 # producer must derive while holding protected descriptors.
 refusals: list[tuple[str, ValidatedRunnerContext, str]] = [
     (
