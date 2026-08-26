@@ -1,6 +1,8 @@
 /// Read-only observation of one configured official Actions runner.
 pub mod actions_runner_readiness;
 pub mod artifact;
+/// Pure workload-family-neutral identity for declared compute semantics.
+pub mod compute_workload;
 #[cfg(target_os = "linux")]
 pub mod debian_package_plan;
 #[cfg(target_os = "linux")]
