@@ -293,14 +293,38 @@ mod tests {
         let report = compare_hot_fleet_abba_with_latency([&a1, &b1, &b2, &a2]).unwrap();
 
         assert_eq!(report.baseline_latency.final_result_p50.observed_windows, 2);
-        assert_eq!(report.baseline_latency.final_result_p50.lower_millis, Some(710));
-        assert_eq!(report.baseline_latency.final_result_p50.upper_millis, Some(810));
-        assert_eq!(report.baseline_latency.final_result_p90.lower_millis, Some(730));
-        assert_eq!(report.baseline_latency.final_result_p90.upper_millis, Some(830));
-        assert_eq!(report.candidate_latency.final_result_p50.lower_millis, Some(410));
-        assert_eq!(report.candidate_latency.final_result_p50.upper_millis, Some(510));
-        assert_eq!(report.candidate_latency.final_result_p90.lower_millis, Some(430));
-        assert_eq!(report.candidate_latency.final_result_p90.upper_millis, Some(530));
+        assert_eq!(
+            report.baseline_latency.final_result_p50.lower_millis,
+            Some(710)
+        );
+        assert_eq!(
+            report.baseline_latency.final_result_p50.upper_millis,
+            Some(810)
+        );
+        assert_eq!(
+            report.baseline_latency.final_result_p90.lower_millis,
+            Some(730)
+        );
+        assert_eq!(
+            report.baseline_latency.final_result_p90.upper_millis,
+            Some(830)
+        );
+        assert_eq!(
+            report.candidate_latency.final_result_p50.lower_millis,
+            Some(410)
+        );
+        assert_eq!(
+            report.candidate_latency.final_result_p50.upper_millis,
+            Some(510)
+        );
+        assert_eq!(
+            report.candidate_latency.final_result_p90.lower_millis,
+            Some(430)
+        );
+        assert_eq!(
+            report.candidate_latency.final_result_p90.upper_millis,
+            Some(530)
+        );
     }
 
     #[test]
@@ -312,9 +336,40 @@ mod tests {
 
         let report = compare_hot_fleet_abba_with_latency([&a1, &b1, &b2, &a2]).unwrap();
 
-        assert_eq!(report.candidate_latency.final_result_p90.observed_windows, 1);
-        assert_eq!(report.candidate_latency.final_result_p90.lower_millis, Some(430));
-        assert_eq!(report.candidate_latency.final_result_p90.upper_millis, Some(430));
+        assert_eq!(
+            report.candidate_latency.final_result_p90.observed_windows,
+            1
+        );
+        assert_eq!(
+            report.candidate_latency.final_result_p90.lower_millis,
+            Some(430)
+        );
+        assert_eq!(
+            report.candidate_latency.final_result_p90.upper_millis,
+            Some(430)
+        );
+    }
+
+    #[test]
+    fn missing_latency_in_both_windows_remains_unknown() {
+        let a1 = window(HotFleetArm::Baseline, "a1", "linked", 4, 700);
+        let b1 = window(HotFleetArm::Candidate, "b1", "overlay", 0, 400);
+        let b2 = window(HotFleetArm::Candidate, "b2", "overlay", 0, 500);
+        let a2 = window(HotFleetArm::Baseline, "a2", "linked", 4, 800);
+
+        let report = compare_hot_fleet_abba_with_latency([&a1, &b1, &b2, &a2]).unwrap();
+
+        assert_eq!(
+            report.candidate_latency.final_result_p90,
+            HotFleetObservedLatencyRange {
+                observed_windows: 0,
+                lower_millis: None,
+                upper_millis: None,
+            }
+        );
+        assert!(report
+            .render_human()
+            .contains("candidate final-result p90 range: unknown (0/2 windows)"));
     }
 
     #[test]
