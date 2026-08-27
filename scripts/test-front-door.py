@@ -21,6 +21,7 @@ from workspace_bootstrap.journey import (
 from workspace_bootstrap.receipt import (
     RECEIPT_TYPE as WORKSPACE_RECEIPT_TYPE,
     SCHEMA_VERSION as WORKSPACE_SCHEMA_VERSION,
+    capability_fingerprint,
 )
 
 
@@ -41,6 +42,33 @@ def bootstrap(state: str = "ready", *, commit: str = "1" * 40) -> dict[str, obje
     }
 
 
+def fingerprint_fixture(schema_version: int, receipt_type: str) -> dict[str, object]:
+    return {
+        "schema_version": schema_version,
+        "receipt_type": receipt_type,
+        "state": "ready",
+        "operation": "verify",
+        "repository_root": {"kind": "git-worktree"},
+        "required_tools": [],
+        "optional_tools": [],
+        "verification_backends": [],
+        "formatter_capabilities": [],
+        "declared_cache_paths": [],
+        "git_identity": {"evaluated": False},
+        "publication_readiness": {"evaluated": False},
+        "next_verification_profiles": [],
+        "deviations": [],
+        "blocking_reasons": [],
+        "source": {
+            "commit": "1" * 40,
+            "tree": "2" * 40,
+            "clean_before": True,
+            "clean_after": True,
+        },
+        "resources": {"recommended_concurrency": 1},
+    }
+
+
 def doctor(overall: str = "pass") -> dict[str, object]:
     return {
         "schema_version": 1,
@@ -54,6 +82,16 @@ def main() -> int:
     assert WORKSPACE_RECEIPT_TYPE == "glaeda-workspace-capability-receipt"
     assert SCHEMA_VERSION == 2
     assert RECEIPT_TYPE == "glaeda-front-door-readiness-receipt"
+
+    legacy_fingerprint = capability_fingerprint(
+        fingerprint_fixture(1, "smolrunner-workspace-capability-receipt")
+    )
+    successor_fingerprint = capability_fingerprint(
+        fingerprint_fixture(WORKSPACE_SCHEMA_VERSION, WORKSPACE_RECEIPT_TYPE)
+    )
+    assert legacy_fingerprint == "sha256:36c2241c321de864851150fc6aeed7b8163bd9ce0583501bd9585c0eb4492e58"
+    assert successor_fingerprint == "sha256:fbd1d3c06c7660323464bca65cd5f023f3da4f05b05a41cc284f2dc35514cc15"
+    assert successor_fingerprint != legacy_fingerprint
 
     ready = build_journey_report(bootstrap(), doctor(), None, bootstrap())
     assert ready["schema_version"] == 2
