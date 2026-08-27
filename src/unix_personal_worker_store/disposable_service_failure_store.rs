@@ -520,7 +520,7 @@ mod tests {
             100,
             100 + generation,
             generation,
-            generation % 2 == 0,
+            generation.is_multiple_of(2),
         )
         .unwrap()
     }
