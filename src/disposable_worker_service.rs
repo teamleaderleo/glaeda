@@ -16,6 +16,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::disposable_attempt_catalog::DisposableAttemptCatalog;
 use crate::disposable_clone_runtime::CloneRuntimeClock;
+use crate::disposable_service_failure_receipt::{
+    DisposableServiceFailureCode, DisposableServiceFailureKind, DisposableServiceFailureReceipt,
+    DisposableServiceFailureReceiptError,
+};
 use crate::disposable_worker_coordinator::{
     DisposableWorkerCoordinator, DisposableWorkerCoordinatorDisposition,
 };
@@ -72,6 +76,45 @@ impl fmt::Display for DisposableWorkerServiceError {
 }
 
 impl std::error::Error for DisposableWorkerServiceError {}
+
+/// Map one already-bounded service failure into the accepted v1 diagnostic receipt.
+///
+/// This pure adapter grants no persistence, retry, cleanup, runtime-health, or capacity authority.
+/// The caller remains responsible for supplying the exact accepted installation identities and
+/// explicit timing/generation evidence that a later #515 persistence slice will own.
+///
+/// # Errors
+///
+/// Returns the receipt contract's fixed public error when a service machine code falls outside the
+/// closed v1 grammar or when the supplied failure time predates process start.
+#[allow(clippy::too_many_arguments)]
+pub fn build_disposable_worker_service_failure_receipt(
+    error: DisposableWorkerServiceError,
+    program_digest: crate::artifact::Sha256Digest,
+    enrollment_digest: crate::artifact::Sha256Digest,
+    service_plan_identity: crate::artifact::Sha256Digest,
+    process_started_at_epoch_ms: u64,
+    failed_at_epoch_ms: u64,
+    restart_generation: u64,
+    durable_recovery_present: bool,
+) -> Result<DisposableServiceFailureReceipt, DisposableServiceFailureReceiptError> {
+    let failure_kind = match error.kind() {
+        DisposableWorkerServiceErrorKind::DurableState => DisposableServiceFailureKind::DurableState,
+        DisposableWorkerServiceErrorKind::Supervisor => DisposableServiceFailureKind::Supervisor,
+    };
+    let failure_code = DisposableServiceFailureCode::from_static(error.code())?;
+    DisposableServiceFailureReceipt::new(
+        program_digest,
+        enrollment_digest,
+        service_plan_identity,
+        failure_kind,
+        failure_code,
+        process_started_at_epoch_ms,
+        failed_at_epoch_ms,
+        restart_generation,
+        durable_recovery_present,
+    )
+}
 
 pub(crate) struct DisposableWorkerServiceDriver {
     _service_lock: DisposableWorkerServiceLock,
@@ -457,6 +500,77 @@ mod tests {
             DIGEST = DIGEST,
         );
         decode_disposable_worker_enrollment(document.as_bytes()).unwrap()
+    }
+
+    fn service_failure_receipt(
+        error: DisposableWorkerServiceError,
+        process_started_at_epoch_ms: u64,
+        failed_at_epoch_ms: u64,
+    ) -> Result<DisposableServiceFailureReceipt, DisposableServiceFailureReceiptError> {
+        let digest = || Sha256Digest::parse(DIGEST).unwrap();
+        build_disposable_worker_service_failure_receipt(
+            error,
+            digest(),
+            digest(),
+            digest(),
+            process_started_at_epoch_ms,
+            failed_at_epoch_ms,
+            7,
+            true,
+        )
+    }
+
+    #[test]
+    fn bounded_durable_failure_maps_into_v1_receipt() {
+        let receipt = service_failure_receipt(
+            durable_error("disposable_worker_recovery_required"),
+            1_725_000_000_000,
+            1_725_000_001_234,
+        )
+        .unwrap();
+
+        assert_eq!(receipt.failure_kind(), DisposableServiceFailureKind::DurableState);
+        assert_eq!(receipt.failure_code().as_str(), "disposable_worker_recovery_required");
+        assert_eq!(receipt.restart_generation(), 7);
+        assert!(receipt.durable_recovery_present());
+
+        let json = String::from_utf8(receipt.canonical_json()).unwrap();
+        assert!(json.contains("\"failure_kind\":\"durable_state\""));
+        assert!(json.contains("\"failure_code\":\"disposable_worker_recovery_required\""));
+        for forbidden in ["path", "argv", "environment", "stdout", "stderr", "credential", "token"] {
+            assert!(!json.contains(forbidden), "forbidden receipt field fragment: {forbidden}");
+        }
+    }
+
+    #[test]
+    fn bounded_supervisor_failure_maps_into_v1_receipt() {
+        let receipt = service_failure_receipt(
+            supervisor_error("disposable_worker_signal_control_unavailable"),
+            10,
+            11,
+        )
+        .unwrap();
+
+        assert_eq!(receipt.failure_kind(), DisposableServiceFailureKind::Supervisor);
+        assert_eq!(
+            receipt.failure_code().as_str(),
+            "disposable_worker_signal_control_unavailable"
+        );
+    }
+
+    #[test]
+    fn receipt_mapping_delegates_timeline_validation() {
+        let error = service_failure_receipt(
+            supervisor_error("disposable_worker_signal_control_unavailable"),
+            11,
+            10,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.kind(),
+            crate::disposable_service_failure_receipt::DisposableServiceFailureReceiptErrorKind::InvalidTimeline
+        );
     }
 
     #[test]
