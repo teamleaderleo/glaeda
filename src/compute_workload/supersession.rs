@@ -395,10 +395,8 @@ pub fn plan_work_supersession(
             by: successor_generation,
         },
     };
-    let successor = WorkSemanticRecord::current(
-        current.lineage_id.clone(),
-        request.successor.clone(),
-    );
+    let successor =
+        WorkSemanticRecord::current(current.lineage_id.clone(), request.successor.clone());
     let binding = WorkSupersessionBinding {
         schema_version: WORK_SUPERSESSION_SCHEMA_VERSION,
         request_id: request.request_id.clone(),
@@ -506,11 +504,7 @@ mod tests {
     }
 
     fn lineage(hex: char) -> WorkLineageId {
-        WorkLineageId::parse(&format!(
-            "work-lineage-v1-{}",
-            hex.to_string().repeat(64)
-        ))
-        .unwrap()
+        WorkLineageId::parse(&format!("work-lineage-v1-{}", hex.to_string().repeat(64))).unwrap()
     }
 
     fn request_id(hex: char) -> WorkSupersessionRequestId {
@@ -557,12 +551,7 @@ mod tests {
         let generation_one = workload("repository_verification.v1", 1, '1', '2');
         let generation_two = workload("repository_verification.v1", 2, '3', '2');
         let current = WorkSemanticRecord::current(line.clone(), generation_one.clone());
-        let predecessor_attempt = attempt(
-            &line,
-            &generation_one,
-            1,
-            WorkAttemptSettlement::Live,
-        );
+        let predecessor_attempt = attempt(&line, &generation_one, 1, WorkAttemptSettlement::Live);
         let request = WorkSupersessionRequest::new(
             request_id('1'),
             line.clone(),
@@ -586,7 +575,10 @@ mod tests {
             }
         );
         assert_eq!(successor.workload(), &generation_two);
-        assert_eq!(predecessor_attempt.settlement(), WorkAttemptSettlement::Live);
+        assert_eq!(
+            predecessor_attempt.settlement(),
+            WorkAttemptSettlement::Live
+        );
         assert_eq!(
             classify_attempt_result(&successor, &predecessor_attempt),
             WorkEvidenceDisposition::HistoricalOnly
@@ -629,9 +621,7 @@ mod tests {
         );
         let applied = plan_work_supersession(&current, &request, None).unwrap();
         let WorkSupersessionDecision::Apply {
-            binding,
-            successor,
-            ..
+            binding, successor, ..
         } = applied
         else {
             panic!("first request must apply");
@@ -717,23 +707,14 @@ mod tests {
         let second = workload("repository_verification.v1", 21, '3', '2');
         let current = WorkSemanticRecord::current(line.clone(), first.clone());
         let old_attempt = attempt(&line, &first, 1, WorkAttemptSettlement::Terminal);
-        let request = WorkSupersessionRequest::new(
-            request_id('6'),
-            line.clone(),
-            first,
-            second.clone(),
-        );
+        let request =
+            WorkSupersessionRequest::new(request_id('6'), line.clone(), first, second.clone());
         let WorkSupersessionDecision::Apply { successor, .. } =
             plan_work_supersession(&current, &request, None).unwrap()
         else {
             panic!("supersession must apply");
         };
-        let failed_successor = attempt(
-            &line,
-            &second,
-            1,
-            WorkAttemptSettlement::CancelledTerminal,
-        );
+        let failed_successor = attempt(&line, &second, 1, WorkAttemptSettlement::CancelledTerminal);
 
         assert_eq!(
             classify_attempt_result(&successor, &failed_successor),
@@ -749,12 +730,7 @@ mod tests {
     fn foreign_lineage_attempt_is_always_historical() {
         let semantic = workload("dataset_transform.v1", 1, '4', '5');
         let current = WorkSemanticRecord::current(lineage('1'), semantic.clone());
-        let foreign = attempt(
-            &lineage('2'),
-            &semantic,
-            1,
-            WorkAttemptSettlement::Terminal,
-        );
+        let foreign = attempt(&lineage('2'), &semantic, 1, WorkAttemptSettlement::Terminal);
         assert_eq!(
             classify_attempt_result(&current, &foreign),
             WorkEvidenceDisposition::HistoricalOnly
@@ -793,10 +769,9 @@ mod tests {
         let second = workload("dataset_transform.v1", 2, '8', '7');
         let current = WorkSemanticRecord::current(line.clone(), first.clone());
         let request = WorkSupersessionRequest::new(request_id('7'), line, first, second);
-        let json = serde_json::to_string(
-            &plan_work_supersession(&current, &request, None).unwrap(),
-        )
-        .unwrap();
+        let json =
+            serde_json::to_string(&plan_work_supersession(&current, &request, None).unwrap())
+                .unwrap();
 
         for forbidden in [
             "/private/",
@@ -814,7 +789,10 @@ mod tests {
             "backend",
             "limactl",
         ] {
-            assert!(!json.contains(forbidden), "unexpected public surface: {forbidden}");
+            assert!(
+                !json.contains(forbidden),
+                "unexpected public surface: {forbidden}"
+            );
         }
     }
 }
