@@ -600,12 +600,7 @@ impl HotFleetWindowReceiptV1 {
         }
 
         let offered = members.len() as u8;
-        let settled = validated
-            + mismatches
-            + unvalidated
-            + failures
-            + resets
-            + unknown_results;
+        let settled = validated + mismatches + unvalidated + failures + resets + unknown_results;
         let unfinished = offered.checked_sub(settled).ok_or_else(|| {
             error(
                 "counts",
