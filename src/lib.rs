@@ -63,6 +63,8 @@ pub mod execution_admission;
 pub mod execution_capacity;
 pub mod execution_receipt;
 pub mod execution_receipt_store;
+/// Pure model-derived frontier-inference workload vocabulary and synthetic sensitivity fixtures.
+pub mod frontier_inference_workload;
 /// Pure Git index-v2 stat-cache patching for CoW task materialization.
 pub mod git_index_stat_patch;
 /// Private-process adapter for the pinned official Runner Scale Set bridge.
@@ -110,6 +112,8 @@ pub mod host_readiness_verdict;
 pub mod host_rootless_podman;
 /// Pure bounded observation-only receipts for blazingly hot execution measurements.
 pub mod hot_execution_performance;
+/// Pure bounded contended fleet-window receipts and exact A-B-B-A comparison evidence.
+pub mod hot_fleet_window;
 /// Pure path-class policy for selecting reviewed hot-state sharing mechanisms.
 pub mod hot_state_path_policy;
 /// Pure immutable resident Git object-pool generation and consumer-lease core.
