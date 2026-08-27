@@ -63,6 +63,8 @@ pub mod execution_admission;
 pub mod execution_capacity;
 pub mod execution_receipt;
 pub mod execution_receipt_store;
+/// Pure model-derived frontier-inference workload vocabulary and synthetic sensitivity fixtures.
+pub mod frontier_inference_workload;
 /// Pure Git index-v2 stat-cache patching for CoW task materialization.
 pub mod git_index_stat_patch;
 /// Private-process adapter for the pinned official Runner Scale Set bridge.
