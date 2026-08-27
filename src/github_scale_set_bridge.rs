@@ -40,7 +40,7 @@ const MAX_EVENTS: usize = 50;
 const MAX_ACQUIRE_REQUESTS: usize = 50;
 const MAX_LABELS: usize = 32;
 const MAX_BRIDGE_PROGRAM_BYTES: u64 = 64 * 1024 * 1024;
-const BRIDGE_PROGRAM: &str = "/opt/smolrunner/bin/scaleset-bridge";
+const BRIDGE_PROGRAM: &str = "/opt/glaeda/bin/scaleset-bridge";
 const DEFAULT_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(75);
 
@@ -320,7 +320,7 @@ fn verify_protected_bridge_path(path: &Path) -> Result<(), ScaleSetBridgeError> 
     if path != Path::new(BRIDGE_PROGRAM) {
         return Err(ScaleSetBridgeError::new("invalid_bridge_program"));
     }
-    for component in ["/", "/opt", "/opt/smolrunner", "/opt/smolrunner/bin"] {
+    for component in ["/", "/opt", "/opt/glaeda", "/opt/glaeda/bin"] {
         let metadata = std::fs::symlink_metadata(component)
             .map_err(|_| ScaleSetBridgeError::new("bridge_program_unavailable"))?;
         if !metadata.file_type().is_dir()
@@ -503,8 +503,6 @@ struct BoundedSecretBuffer {
 
 impl BoundedSecretBuffer {
     fn new(capacity: usize) -> Self {
-        // Allocate the entire protocol bound before any credential or JIT byte enters the buffer.
-        // Growing a Vec after that point could leave an unwiped allocator copy behind.
         Self {
             bytes: Zeroizing::new(vec![0_u8; capacity].into_boxed_slice()),
             len: 0,
@@ -591,9 +589,6 @@ impl ChildBridgeTransport {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
-        // Keep the bridge in the controller's process group. launchd kills every remaining
-        // member of a job's process group when the controller dies, including SIGKILL paths that
-        // cannot run Rust Drop. Explicit per-child termination below remains the normal path.
         let mut child = command
             .spawn()
             .map_err(|_| ScaleSetBridgeError::new("bridge_spawn_failed"))?;
@@ -863,11 +858,6 @@ impl ScaleSetBridgeClient {
         self.finish_response(result)
     }
 
-    /// Restore a fresh bridge process to one exact durable acknowledged-message cursor.
-    ///
-    /// The bridge accepts this only before its first poll. A caller may first perform the standalone
-    /// acquisition recovery, then restore the cursor and poll with capacity zero to observe later
-    /// lifecycle evidence without admitting another job.
     pub(crate) fn resume_after(
         &mut self,
         last_acked_message_id: u32,
@@ -1370,8 +1360,6 @@ struct SecretString(Zeroizing<Vec<u8>>);
 
 impl SecretString {
     fn from_raw_json(raw: &RawValue) -> Result<Self, ScaleSetBridgeError> {
-        // Borrow the exact JSON token from the zeroizing transport buffer. Escapes are rejected so
-        // serde_json never needs a separately allocated unescape buffer for the one-time secret.
         let raw = raw.get().as_bytes();
         if raw.len() < 2 || raw.first() != Some(&b'"') || raw.last() != Some(&b'"') {
             return Err(ScaleSetBridgeError::new("invalid_bridge_response"));
@@ -1744,22 +1732,22 @@ mod tests {
 
     fn config() -> ScaleSetBridgeConfig {
         ScaleSetBridgeConfig::new(
-            Path::new("/opt/smolrunner/bin/scaleset-bridge"),
+            Path::new("/opt/glaeda/bin/scaleset-bridge"),
             Sha256Digest::parse(&format!("sha256:{}", "ab".repeat(32))).unwrap(),
             GitHubAppKeychainConfig::new(
                 "https://github.com/example/project",
                 "Iv1.example",
                 17,
-                "dev.smolrunner.github-app",
+                "dev.glaeda.github-app",
                 "example-project",
             )
             .unwrap(),
             ScaleSetBridgeTarget::new(
                 23,
-                "smolrunner",
+                "glaeda",
                 1,
-                &["smolrunner".to_owned()],
-                "smolrunner-host",
+                &["glaeda".to_owned()],
+                "glaeda-host",
                 1,
             )
             .unwrap(),
@@ -1795,10 +1783,10 @@ mod tests {
         assert!(
             ScaleSetBridgeTarget::new(
                 23,
-                "smolrunner",
+                "glaeda",
                 1,
-                &["smolrunner".to_owned()],
-                "smolrunner-host",
+                &["glaeda".to_owned()],
+                "glaeda-host",
                 0,
             )
             .is_err()
@@ -1806,10 +1794,10 @@ mod tests {
         assert!(
             ScaleSetBridgeTarget::new(
                 23,
-                "smolrunner",
+                "glaeda",
                 1,
-                &["smolrunner".to_owned()],
-                "smolrunner-host",
+                &["glaeda".to_owned()],
+                "glaeda-host",
                 2,
             )
             .is_err()
@@ -1822,7 +1810,7 @@ mod tests {
     fn session_maps_demand_events_and_exact_ack() {
         let transport = ScriptedTransport::new(&[
             r#"{"version":2,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
-            r#"{"version":2,"type":"message","message_id":7,"statistics":{"available_jobs":1,"acquired_jobs":0,"assigned_jobs":1,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0},"events":[{"kind":"available","runner_request_id":41,"repository":"project","owner":"example","job_id":"job-1","workflow_run_id":99,"request_labels":["smolrunner"]}]}"#,
+            r#"{"version":2,"type":"message","message_id":7,"statistics":{"available_jobs":1,"acquired_jobs":0,"assigned_jobs":1,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0},"events":[{"kind":"available","runner_request_id":41,"repository":"project","owner":"example","job_id":"job-1","workflow_run_id":99,"request_labels":["glaeda"]}]}"#,
             r#"{"version":2,"type":"acked","message_id":7,"acquired_requests":[41]}"#,
         ]);
         let mut client = ScaleSetBridgeClient::connect_with_transport(
@@ -1859,7 +1847,7 @@ mod tests {
         let transport = ScriptedTransport::new(&[
             r#"{"version":2,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
             r#"{"version":2,"type":"restored","message_id":7}"#,
-            r#"{"version":2,"type":"message","message_id":8,"statistics":{"available_jobs":0,"acquired_jobs":1,"assigned_jobs":1,"running_jobs":1,"registered_runners":1,"busy_runners":1,"idle_runners":0},"events":[{"kind":"started","runner_request_id":41,"repository":"project","owner":"example","job_id":"job-1","workflow_run_id":99,"request_labels":["smolrunner"],"runner_id":81,"runner_name":"smolrunner-job-1"}]}"#,
+            r#"{"version":2,"type":"message","message_id":8,"statistics":{"available_jobs":0,"acquired_jobs":1,"assigned_jobs":1,"running_jobs":1,"registered_runners":1,"busy_runners":1,"idle_runners":0},"events":[{"kind":"started","runner_request_id":41,"repository":"project","owner":"example","job_id":"job-1","workflow_run_id":99,"request_labels":["glaeda"],"runner_id":81,"runner_name":"glaeda-job-1"}]}"#,
         ]);
         let mut client = ScaleSetBridgeClient::connect_with_transport(
             config(),
@@ -1891,7 +1879,7 @@ mod tests {
         let transport = ScriptedTransport::new(&[
             r#"{"version":2,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
             r#"{"version":2,"type":"runner_absent"}"#,
-            r#"{"version":2,"type":"runner","runner":{"id":81,"name":"smolrunner-job-1","scale_set_id":23}}"#,
+            r#"{"version":2,"type":"runner","runner":{"id":81,"name":"glaeda-job-1","scale_set_id":23}}"#,
         ]);
         let mut client = ScaleSetBridgeClient::connect_with_transport(
             config(),
@@ -1899,7 +1887,7 @@ mod tests {
             Box::new(transport),
         )
         .unwrap();
-        let name = ScaleSetRunnerName::parse("smolrunner-job-1").unwrap();
+        let name = ScaleSetRunnerName::parse("glaeda-job-1").unwrap();
 
         assert_eq!(
             client.observe_runner(&name).unwrap(),
@@ -1916,7 +1904,7 @@ mod tests {
     fn malformed_absence_response_poisons_the_bridge() {
         let (transport, poisoned) = ScriptedTransport::with_poison_probe(&[
             r#"{"version":2,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
-            r#"{"version":2,"type":"runner_absent","runner":{"id":81,"name":"smolrunner-job-1","scale_set_id":23}}"#,
+            r#"{"version":2,"type":"runner_absent","runner":{"id":81,"name":"glaeda-job-1","scale_set_id":23}}"#,
         ]);
         let mut client = ScaleSetBridgeClient::connect_with_transport(
             config(),
@@ -1924,7 +1912,7 @@ mod tests {
             Box::new(transport),
         )
         .unwrap();
-        let name = ScaleSetRunnerName::parse("smolrunner-job-1").unwrap();
+        let name = ScaleSetRunnerName::parse("glaeda-job-1").unwrap();
 
         assert_eq!(
             client.observe_runner(&name).unwrap_err().code(),
@@ -1937,7 +1925,7 @@ mod tests {
     fn zero_capacity_poll_rejects_available_work_and_poisons_the_session() {
         let (transport, poisoned) = ScriptedTransport::with_poison_probe(&[
             r#"{"version":2,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
-            r#"{"version":2,"type":"message","message_id":8,"statistics":{"available_jobs":1,"acquired_jobs":0,"assigned_jobs":1,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0},"events":[{"kind":"available","runner_request_id":41,"repository":"project","owner":"example","job_id":"job-1","workflow_run_id":99,"request_labels":["smolrunner"]}]}"#,
+            r#"{"version":2,"type":"message","message_id":8,"statistics":{"available_jobs":1,"acquired_jobs":0,"assigned_jobs":1,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0},"events":[{"kind":"available","runner_request_id":41,"repository":"project","owner":"example","job_id":"job-1","workflow_run_id":99,"request_labels":["glaeda"]}]}"#,
         ]);
         let mut client = ScaleSetBridgeClient::connect_with_transport(
             config(),
@@ -2058,7 +2046,7 @@ mod tests {
     fn jit_secret_is_redacted_and_runner_is_exact() {
         let transport = ScriptedTransport::new(&[
             r#"{"version":2,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
-            r#"{"version":2,"type":"jit","runner":{"id":81,"name":"smolrunner-job-1","scale_set_id":23},"encoded_jit_config":"one-time-secret"}"#,
+            r#"{"version":2,"type":"jit","runner":{"id":81,"name":"glaeda-job-1","scale_set_id":23},"encoded_jit_config":"one-time-secret"}"#,
         ]);
         let mut client = ScaleSetBridgeClient::connect_with_transport(
             config(),
@@ -2067,7 +2055,7 @@ mod tests {
         )
         .unwrap();
         let receipt = client
-            .generate_jit(&ScaleSetRunnerName::parse("smolrunner-job-1").unwrap())
+            .generate_jit(&ScaleSetRunnerName::parse("glaeda-job-1").unwrap())
             .unwrap();
         assert_eq!(receipt.runner.id.get(), 81);
         assert_eq!(format!("{:?}", receipt.config), "[REDACTED]");
@@ -2075,7 +2063,7 @@ mod tests {
 
         let (transport, poisoned) = ScriptedTransport::with_poison_probe(&[
             r#"{"version":2,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
-            r#"{"version":2,"type":"jit","runner":{"id":81,"name":"smolrunner-job-1","scale_set_id":23},"encoded_jit_config":"escaped\u002dsecret"}"#,
+            r#"{"version":2,"type":"jit","runner":{"id":81,"name":"glaeda-job-1","scale_set_id":23},"encoded_jit_config":"escaped\u002dsecret"}"#,
         ]);
         let mut client = ScaleSetBridgeClient::connect_with_transport(
             config(),
@@ -2083,11 +2071,10 @@ mod tests {
             Box::new(transport),
         )
         .unwrap();
-        let error =
-            match client.generate_jit(&ScaleSetRunnerName::parse("smolrunner-job-1").unwrap()) {
-                Ok(_) => panic!("escaped JIT secret was accepted"),
-                Err(error) => error,
-            };
+        let error = match client.generate_jit(&ScaleSetRunnerName::parse("glaeda-job-1").unwrap()) {
+            Ok(_) => panic!("escaped JIT secret was accepted"),
+            Err(error) => error,
+        };
         assert_eq!(error.code(), "invalid_bridge_response");
         assert!(poisoned.get());
     }
@@ -2123,7 +2110,7 @@ mod tests {
         assert!(poisoned.get());
 
         let mut response = decode_response(
-            br#"{"version":2,"type":"message","message_id":7,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0},"events":[{"kind":"completed","runner_request_id":41,"repository":"project","owner":"example","job_id":"job-1","workflow_run_id":99,"request_labels":["smolrunner"],"result":"failed"}]}"#,
+            br#"{"version":2,"type":"message","message_id":7,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0},"events":[{"kind":"completed","runner_request_id":41,"repository":"project","owner":"example","job_id":"job-1","workflow_run_id":99,"request_labels":["glaeda"],"result":"failed"}]}"#,
         )
         .unwrap();
         assert_eq!(
@@ -2141,7 +2128,7 @@ mod tests {
 
         let (transport, poisoned) = ScriptedTransport::with_poison_probe(&[
             r#"{"version":2,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
-            r#"{"version":2,"type":"message","message_id":8,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0},"events":[{"kind":"completed","runner_request_id":41,"repository":"project","owner":"example","job_id":"job-1","workflow_run_id":99,"request_labels":["smolrunner"],"result":"failed"}]}"#,
+            r#"{"version":2,"type":"message","message_id":8,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0},"events":[{"kind":"completed","runner_request_id":41,"repository":"project","owner":"example","job_id":"job-1","workflow_run_id":99,"request_labels":["glaeda"],"result":"failed"}]}"#,
         ]);
         let mut client = ScaleSetBridgeClient::connect_with_transport(
             config(),
