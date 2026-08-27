@@ -5,6 +5,9 @@
 //! or result-acceptance authority. Workload-family adapters own semantic input derivation and the
 //! evidence rules for their output contracts.
 
+/// Pure semantic currentness and result precedence, independent from physical settlement.
+pub mod supersession;
+
 use std::fmt;
 
 use serde::Serialize;

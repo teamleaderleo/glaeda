@@ -63,6 +63,8 @@ pub mod execution_admission;
 pub mod execution_capacity;
 pub mod execution_receipt;
 pub mod execution_receipt_store;
+/// Pure model-derived frontier-inference workload vocabulary and synthetic sensitivity fixtures.
+pub mod frontier_inference_workload;
 /// Pure Git index-v2 stat-cache patching for CoW task materialization.
 pub mod git_index_stat_patch;
 /// Private-process adapter for the pinned official Runner Scale Set bridge.
@@ -362,6 +364,8 @@ pub mod unix_personal_worker_store;
 /// Descriptor-bound private persistence for the resident-sandbox catalog.
 #[cfg(unix)]
 pub mod unix_resident_sandbox_store;
+/// Pure fixed repository verification command meanings for identity derivation and later execution.
+pub mod verification_command_semantics;
 /// Pure sealed cross-attempt verification-isolation compatibility.
 pub mod verification_isolation_referee;
 pub mod verification_profile;
