@@ -395,8 +395,13 @@ mod tests {
 
     #[test]
     fn failure_code_is_bounded_machine_vocabulary() {
+        let empty_error = DisposableServiceFailureCode::parse_document("").unwrap_err();
+        assert_eq!(
+            empty_error.kind(),
+            DisposableServiceFailureReceiptErrorKind::InvalidFailureCode
+        );
+
         for invalid in [
-            "",
             "1starts_with_digit",
             "UPPERCASE",
             "contains-dash",
