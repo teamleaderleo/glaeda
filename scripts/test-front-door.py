@@ -11,18 +11,24 @@ SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 
 from workspace_bootstrap.journey import (
+    RECEIPT_TYPE,
+    SCHEMA_VERSION,
     _valid_bootstrap_receipt,
     _valid_doctor_receipt,
     build_journey_report,
     render_human,
+)
+from workspace_bootstrap.receipt import (
+    RECEIPT_TYPE as WORKSPACE_RECEIPT_TYPE,
+    SCHEMA_VERSION as WORKSPACE_SCHEMA_VERSION,
 )
 
 
 def bootstrap(state: str = "ready", *, commit: str = "1" * 40) -> dict[str, object]:
     blockers = [] if state != "blocked" else [{"code": "required_tool_git_unavailable"}]
     return {
-        "schema_version": 1,
-        "receipt_type": "smolrunner-workspace-capability-receipt",
+        "schema_version": WORKSPACE_SCHEMA_VERSION,
+        "receipt_type": WORKSPACE_RECEIPT_TYPE,
         "state": state,
         "source": {
             "commit": commit,
@@ -44,7 +50,14 @@ def doctor(overall: str = "pass") -> dict[str, object]:
 
 
 def main() -> int:
+    assert WORKSPACE_SCHEMA_VERSION == 2
+    assert WORKSPACE_RECEIPT_TYPE == "glaeda-workspace-capability-receipt"
+    assert SCHEMA_VERSION == 2
+    assert RECEIPT_TYPE == "glaeda-front-door-readiness-receipt"
+
     ready = build_journey_report(bootstrap(), doctor(), None, bootstrap())
+    assert ready["schema_version"] == 2
+    assert ready["receipt_type"] == "glaeda-front-door-readiness-receipt"
     assert ready["verdict"] == "ready"
     assert ready["next_action"] == "none"
     assert ready["doctor"] == {"evaluated": True, "overall": "pass"}
@@ -69,8 +82,12 @@ def main() -> int:
     assert "checkout_changed_during_journey" in changed["blocking_codes"]
 
     assert _valid_bootstrap_receipt(bootstrap())
+    legacy_bootstrap = bootstrap()
+    legacy_bootstrap["schema_version"] = 1
+    legacy_bootstrap["receipt_type"] = "smolrunner-workspace-capability-receipt"
+    assert not _valid_bootstrap_receipt(legacy_bootstrap)
     future_bootstrap = bootstrap()
-    future_bootstrap["schema_version"] = 2
+    future_bootstrap["schema_version"] = 3
     assert not _valid_bootstrap_receipt(future_bootstrap)
     assert _valid_doctor_receipt(doctor())
     future_doctor = doctor()
