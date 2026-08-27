@@ -18,7 +18,7 @@ from .probe import public_issue
 IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9._-]{1,96}$")
 REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
-TRUSTED_SOURCE_KIND = "smolrunner-protected-state-v1"
+TRUSTED_SOURCE_KIND = "glaeda-protected-state-v2"
 
 CAPABILITY_ID_BY_TOOL = {
     "python3": "python3",

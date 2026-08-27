@@ -88,8 +88,8 @@ jobs:
             ./scripts/bootstrap --output json > "$second_receipt"
 
           jq -e '
-            .schema_version == 1 and
-            .receipt_type == "smolrunner-workspace-capability-receipt" and
+            .schema_version == 2 and
+            .receipt_type == "glaeda-workspace-capability-receipt" and
             (.state == "ready" or .state == "ready_with_declared_deviations") and
             .source.clean_before == true and
             .source.clean_after == true and
@@ -201,8 +201,8 @@ jobs:
       - name: Exercise root Glaeda front door
         run: |
           ./glaeda --output json | jq -e '
-            .schema_version == 1 and
-            .receipt_type == "smolrunner-front-door-readiness-receipt" and
+            .schema_version == 2 and
+            .receipt_type == "glaeda-front-door-readiness-receipt" and
             .verdict == "ready" and
             .doctor.evaluated == true and
             (.doctor.overall == "pass" or .doctor.overall == "warn") and

@@ -35,6 +35,8 @@ pub mod disposable_prepared_template;
 /// Private, secret-safe command binding for one durably registered disposable guest runner.
 #[cfg(unix)]
 pub(crate) mod disposable_runner_runtime;
+/// Pure bounded diagnostic document for one controller-service failure.
+pub mod disposable_service_failure_receipt;
 pub mod disposable_template_generation;
 /// Same-lock bounded Lima supervisor for the disposable source-template lifecycle.
 #[cfg(unix)]
