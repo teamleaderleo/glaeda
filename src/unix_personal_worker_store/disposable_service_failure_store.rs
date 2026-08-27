@@ -1,14 +1,15 @@
 use std::fs::File;
 use std::io::{Read as _, Seek as _};
+use std::os::fd::OwnedFd;
 
 use super::*;
 use crate::disposable_service_failure_receipt::{
     DisposableServiceFailureReceipt, DisposableServiceFailureReceiptErrorKind,
+    MAX_RECEIPT_DOCUMENT_BYTES,
 };
 
 pub(super) const FAILURE_RECEIPT_DOCUMENT: &str = "disposable-service-failure.json";
 pub(super) const STAGED_FAILURE_RECEIPT_DOCUMENT: &str = ".disposable-service-failure.next.json";
-const MAX_STORED_FAILURE_RECEIPT_BYTES: usize = 4 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DisposableServiceFailureStoreRecoveryReason {
@@ -198,7 +199,7 @@ impl UnixPersonalWorkerStore {
             DisposableServiceFailureStoreWriteDisposition::Created
         };
         let encoded = receipt.canonical_json();
-        if encoded.len() > MAX_STORED_FAILURE_RECEIPT_BYTES {
+        if encoded.len() > MAX_RECEIPT_DOCUMENT_BYTES {
             return Err(corrupt_store());
         }
         let mut staged = self.stage_named_bytes(STAGED_FAILURE_RECEIPT_DOCUMENT, &encoded)?;
@@ -310,10 +311,10 @@ impl UnixPersonalWorkerStore {
         let mut file = File::from(file);
         let mut bytes = Vec::new();
         std::io::Read::by_ref(&mut file)
-            .take((MAX_STORED_FAILURE_RECEIPT_BYTES + 1) as u64)
+            .take((MAX_RECEIPT_DOCUMENT_BYTES + 1) as u64)
             .read_to_end(&mut bytes)
             .map_err(|_| io_store("could not read the disposable service failure receipt"))?;
-        if bytes.len() > MAX_STORED_FAILURE_RECEIPT_BYTES {
+        if bytes.len() > MAX_RECEIPT_DOCUMENT_BYTES {
             return Ok(RetainedReceipt::Invalid(slot.corrupt_reason()));
         }
         let receipt = match DisposableServiceFailureReceipt::from_json(&bytes) {
@@ -364,10 +365,10 @@ impl UnixPersonalWorkerStore {
             .map_err(|_| io_store("could not seek the disposable service failure receipt"))?;
         let mut bytes = Vec::new();
         std::io::Read::by_ref(&mut exact.file)
-            .take((MAX_STORED_FAILURE_RECEIPT_BYTES + 1) as u64)
+            .take((MAX_RECEIPT_DOCUMENT_BYTES + 1) as u64)
             .read_to_end(&mut bytes)
             .map_err(|_| io_store("could not reread the disposable service failure receipt"))?;
-        if bytes.len() > MAX_STORED_FAILURE_RECEIPT_BYTES
+        if bytes.len() > MAX_RECEIPT_DOCUMENT_BYTES
             || exact.receipt.canonical_json() != bytes
             || DisposableServiceFailureReceipt::from_json(&bytes).as_ref() != Ok(&exact.receipt)
         {
@@ -403,11 +404,60 @@ impl UnixPersonalWorkerStore {
         Ok(())
     }
 
+    fn rebind_exact_failure_receipt_for_unlink(
+        &self,
+        exact: &ExactReceiptFile,
+    ) -> Result<OwnedFd, PersonalWorkerStoreError> {
+        let rebound = match fs::openat(
+            &self.directory,
+            exact.slot.name(),
+            EXISTING_FILE_FLAGS,
+            Mode::empty(),
+        ) {
+            Ok(file) => file,
+            Err(Errno::NOENT) => {
+                return Err(conflict_store(
+                    "disposable service failure receipt path changed before cleanup",
+                ));
+            }
+            Err(error) => return Err(map_document_open_error(error)),
+        };
+        inspect_private_file(&rebound, self.owner, exact.slot.subject(), None)?;
+        let rebound_snapshot = ReceiptFileSnapshot::from_stat(&fs::fstat(&rebound).map_err(|_| {
+            io_store("could not rebind the disposable service failure receipt before cleanup")
+        })?);
+        if rebound_snapshot != exact.snapshot {
+            return Err(conflict_store(
+                "disposable service failure receipt identity changed before cleanup",
+            ));
+        }
+        let path_stat = match fs::statat(
+            &self.directory,
+            exact.slot.name(),
+            AtFlags::SYMLINK_NOFOLLOW,
+        ) {
+            Ok(stat) => stat,
+            Err(Errno::NOENT) => {
+                return Err(conflict_store(
+                    "disposable service failure receipt path changed before cleanup",
+                ));
+            }
+            Err(error) => return Err(map_document_open_error(error)),
+        };
+        if ReceiptFileSnapshot::from_stat(&path_stat) != exact.snapshot {
+            return Err(conflict_store(
+                "disposable service failure receipt path changed before cleanup",
+            ));
+        }
+        Ok(rebound)
+    }
+
     fn remove_exact_failure_receipt(
         &self,
         mut exact: ExactReceiptFile,
     ) -> Result<(), PersonalWorkerStoreError> {
         self.confirm_exact_failure_receipt(&mut exact)?;
+        let _rebound = self.rebind_exact_failure_receipt_for_unlink(&exact)?;
         fs::unlinkat(&self.directory, exact.slot.name(), AtFlags::empty())
             .map_err(|_| io_store("could not remove the disposable service failure receipt"))?;
         synchronize_failure_receipt_directory(self)
@@ -753,7 +803,7 @@ mod tests {
             }),
             (
                 "oversized",
-                vec![b'x'; MAX_STORED_FAILURE_RECEIPT_BYTES + 1],
+                vec![b'x'; MAX_RECEIPT_DOCUMENT_BYTES + 1],
             ),
         ] {
             let root = TempRoot::new(label);
@@ -786,6 +836,38 @@ mod tests {
         assert_eq!(error.kind(), PersonalWorkerStoreErrorKind::UnsafeFilesystem);
         assert!(target.exists());
         assert!(root.store_path(FAILURE_RECEIPT_DOCUMENT).is_symlink());
+    }
+
+    #[test]
+    fn non_regular_receipt_path_is_refused_without_cleanup() {
+        let root = TempRoot::new("non-regular");
+        let store = open_store(&root);
+        let path = root.store_path(FAILURE_RECEIPT_DOCUMENT);
+        fs::create_dir(&path).unwrap();
+        let error = store
+            .inspect_disposable_service_failure_store()
+            .expect_err("directory-shaped receipt must be refused");
+        assert_eq!(error.kind(), PersonalWorkerStoreErrorKind::UnsafeFilesystem);
+        assert!(path.is_dir());
+    }
+
+    #[test]
+    fn owner_gate_rejects_mismatched_identity_without_cleanup() {
+        let root = TempRoot::new("owner");
+        let _store = open_store(&root);
+        write_slot(
+            &root,
+            ReceiptSlot::Current,
+            &receipt(1, "failure").canonical_json(),
+        );
+        let path = root.store_path(FAILURE_RECEIPT_DOCUMENT);
+        let file = File::open(&path).unwrap();
+        let stat = rustix::fs::fstat(&file).unwrap();
+        let wrong_owner = (stat.st_uid.wrapping_add(1), stat.st_gid);
+        let error = inspect_private_file(&file, wrong_owner, "test failure receipt", None)
+            .expect_err("mismatched owner must be refused");
+        assert_eq!(error.kind(), PersonalWorkerStoreErrorKind::UnsafeFilesystem);
+        assert!(path.is_file());
     }
 
     #[test]
