@@ -28,8 +28,8 @@ from .probe import (
     tool_observation,
 )
 
-SCHEMA_VERSION = 1
-RECEIPT_TYPE = "smolrunner-workspace-capability-receipt"
+SCHEMA_VERSION = 2
+RECEIPT_TYPE = "glaeda-workspace-capability-receipt"
 
 
 def capability_fingerprint(receipt: dict[str, object]) -> str:
