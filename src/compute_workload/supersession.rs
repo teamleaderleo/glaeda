@@ -295,8 +295,8 @@ impl WorkSupersessionBinding {
 pub enum WorkSupersessionDecision {
     Apply {
         binding: WorkSupersessionBinding,
-        predecessor: WorkSemanticRecord,
-        successor: WorkSemanticRecord,
+        predecessor: Box<WorkSemanticRecord>,
+        successor: Box<WorkSemanticRecord>,
     },
     Duplicate {
         binding: WorkSupersessionBinding,
@@ -407,8 +407,8 @@ pub fn plan_work_supersession(
 
     Ok(WorkSupersessionDecision::Apply {
         binding,
-        predecessor,
-        successor,
+        predecessor: Box::new(predecessor),
+        successor: Box::new(successor),
     })
 }
 
