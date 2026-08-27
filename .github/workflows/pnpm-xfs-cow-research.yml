@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - chatgpt/566-pnpm-xfs-cow-probe
+  pull_request:
+    branches:
+      - main
 
 permissions:
   contents: read
