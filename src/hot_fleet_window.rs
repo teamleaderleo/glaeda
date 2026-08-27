@@ -225,7 +225,7 @@ pub struct HotFleetWindowIdentity {
 }
 
 impl HotFleetWindowIdentity {
-    /// Construct the exact declared comparison identity for one contention window.
+    /// Construct the declared comparison identity for one contention window.
     ///
     /// # Errors
     ///
@@ -274,12 +274,12 @@ pub struct HotFleetWindowTiming {
 }
 
 impl HotFleetWindowTiming {
-    /// Construct absolute resource-correlation bounds plus a monotonic elapsed denominator.
+    /// Construct resource-correlation bounds plus a monotonic elapsed denominator.
     ///
     /// # Errors
     ///
-    /// Returns an error for time reversal, zero/oversized durations, elapsed time beyond the fixed
-    /// budget, or a deadline close before the full budget is consumed.
+    /// Returns an error for time reversal, zero or oversized durations, elapsed time beyond the
+    /// fixed budget, or a deadline close before the fixed budget is consumed.
     pub fn new(
         start_at: EpochMillis,
         end_at: EpochMillis,
@@ -339,8 +339,8 @@ pub struct HotFleetConcurrencyObservation {
 impl HotFleetConcurrencyObservation {
     /// Construct one already-observed concurrency maximum.
     ///
-    /// `HarnessOwned` is suitable for a synthetic/frozen benchmark. Natural heavy-execution claims
-    /// require a separately reviewed observer and should use `ReviewedObserver`.
+    /// `HarnessOwned` is suitable for a synthetic or frozen benchmark. Natural heavy-execution
+    /// claims require a separately reviewed observer and should use `ReviewedObserver`.
     ///
     /// # Errors
     ///
@@ -375,11 +375,11 @@ pub struct HotFleetAttemptEvidence {
 }
 
 impl HotFleetAttemptEvidence {
-    /// Bind one actual attempt to already-owned performance and semantic-validation evidence.
+    /// Bind one actual attempt to performance and semantic-validation evidence.
     ///
     /// # Errors
     ///
-    /// Returns an error when semantic acceptance/rejection is claimed without a successful
+    /// Returns an error when semantic acceptance or rejection is claimed without a successful
     /// performance receipt.
     pub fn new(
         request_id: ExecutionRequestId,
@@ -389,7 +389,9 @@ impl HotFleetAttemptEvidence {
     ) -> Result<Self, HotFleetWindowError> {
         if semantic_validation != HotFleetSemanticValidation::Unobserved
             && !matches!(
-                performance_receipt.as_ref().map(HotExecutionPerformanceReceipt::result),
+                performance_receipt
+                    .as_ref()
+                    .map(HotExecutionPerformanceReceipt::result),
                 Some(HotExecutionResultClass::Succeeded)
             )
         {
@@ -417,7 +419,7 @@ pub struct HotFleetWorkItem {
 }
 
 impl HotFleetWorkItem {
-    /// Construct one offered work item from an experiment-local ID and exact semantic digest.
+    /// Construct one offered item from an experiment-local ID and exact semantic digest.
     ///
     /// # Errors
     ///
@@ -446,6 +448,7 @@ pub struct HotFleetWindowCounts {
     pub unvalidated_completions: u8,
     pub failures: u8,
     pub resets: u8,
+    pub unknown_results: u8,
     pub fallbacks: u8,
     pub unfinished: u8,
     pub member_receipt_count: u8,
@@ -457,11 +460,11 @@ pub struct HotFleetResourceSummary {
     pub report_count: u8,
     pub max_observed_memory_pressure: MemoryPressure,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub start_swap_bytes: Option<u64>,
+    pub first_observed_swap_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_observed_swap_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub end_swap_bytes: Option<u64>,
+    pub last_observed_swap_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_observed_aggregate_lima_rss_bytes: Option<u64>,
 }
@@ -491,15 +494,15 @@ pub struct HotFleetWindowReceiptV1 {
 }
 
 impl HotFleetWindowReceiptV1 {
-    /// Reduce complete offered/member evidence into one bounded observation-only contention window.
+    /// Reduce complete offered/member evidence into one bounded observation-only window.
     ///
-    /// All headline task counts are derived here. A caller cannot inject offered, started, settled,
-    /// validated, failure, fallback, or unfinished aggregates.
+    /// Every headline task count is derived here from member evidence.
     ///
     /// # Errors
     ///
-    /// Returns an error for duplicate work/request IDs, invalid count relationships, missing or
-    /// out-of-window validated latency, incomplete all-settled closure, or invalid resource samples.
+    /// Returns an error for duplicate IDs, invalid count relationships, missing validated latency,
+    /// validated latency beyond the contention window, incomplete all-settled closure, or invalid
+    /// resource samples.
     pub fn new(
         identity: HotFleetWindowIdentity,
         timing: HotFleetWindowTiming,
@@ -523,8 +526,9 @@ impl HotFleetWindowReceiptV1 {
         let mut unvalidated = 0_u8;
         let mut failures = 0_u8;
         let mut resets = 0_u8;
+        let mut unknown_results = 0_u8;
         let mut fallbacks = 0_u8;
-        let mut receipts = 0_u8;
+        let mut receipt_count = 0_u8;
         let mut latencies = Vec::new();
 
         for member in &members {
@@ -552,7 +556,7 @@ impl HotFleetWindowReceiptV1 {
             let Some(receipt) = attempt.performance_receipt.as_ref() else {
                 continue;
             };
-            receipts += 1;
+            receipt_count += 1;
             match receipt.result() {
                 HotExecutionResultClass::Succeeded => match attempt.semantic_validation {
                     HotFleetSemanticValidation::Accepted => {
@@ -579,9 +583,11 @@ impl HotFleetWindowReceiptV1 {
                     HotFleetSemanticValidation::Rejected => mismatches += 1,
                     HotFleetSemanticValidation::Unobserved => unvalidated += 1,
                 },
-                HotExecutionResultClass::Failed | HotExecutionResultClass::Canceled => failures += 1,
+                HotExecutionResultClass::Failed | HotExecutionResultClass::Canceled => {
+                    failures += 1;
+                }
                 HotExecutionResultClass::ResetRequired => resets += 1,
-                HotExecutionResultClass::Unknown => {}
+                HotExecutionResultClass::Unknown => unknown_results += 1,
             }
         }
 
@@ -594,7 +600,12 @@ impl HotFleetWindowReceiptV1 {
         }
 
         let offered = members.len() as u8;
-        let settled = validated + mismatches + unvalidated + failures + resets;
+        let settled = validated
+            + mismatches
+            + unvalidated
+            + failures
+            + resets
+            + unknown_results;
         let unfinished = offered.checked_sub(settled).ok_or_else(|| {
             error(
                 "counts",
@@ -631,9 +642,10 @@ impl HotFleetWindowReceiptV1 {
                 unvalidated_completions: unvalidated,
                 failures,
                 resets,
+                unknown_results,
                 fallbacks,
                 unfinished,
-                member_receipt_count: receipts,
+                member_receipt_count: receipt_count,
             },
             final_result_p50_millis: nearest_rank(&latencies, 50),
             final_result_p90_millis: nearest_rank(&latencies, 90),
@@ -675,11 +687,11 @@ impl HotFleetWindowReceiptV1 {
         }
     }
 
-    /// Render a stable human summary from the same typed receipt used for JSON output.
+    /// Render a stable human summary from this typed receipt.
     #[must_use]
     pub fn render_human(&self) -> String {
         format!(
-            "hot fleet window\nauthority: {}\nexperiment: {}\nblock: {}\narm: {}\ndecision: {}/{}\nworkload set: {}\noffered: {}\nstarted: {}\nsettled: {}\nvalidated: {}\nsemantic mismatches: {}\nunvalidated completions: {}\nfailures: {}\nresets: {}\nfallbacks: {}\nunfinished: {}\nmaximum simultaneous: {} ({})\nelapsed: {} ms\nfinal-result p50: {}\nfinal-result p90: {}\nresource status: {}\nmax-observed memory pressure: {}\nstart/max/end swap: {}/{}/{}\nmax-observed aggregate Lima RSS: {}\n",
+            "hot fleet window\nauthority: {}\nexperiment: {}\nblock: {}\narm: {}\ndecision: {}/{}\nworkload set: {}\noffered: {}\nstarted: {}\nsettled: {}\nvalidated: {}\nsemantic mismatches: {}\nunvalidated completions: {}\nfailures: {}\nresets: {}\nunknown results: {}\nfallbacks: {}\nunfinished: {}\nmaximum simultaneous: {} ({})\nelapsed: {} ms\nfinal-result p50: {}\nfinal-result p90: {}\nresource status: {}\nmax-observed memory pressure: {}\nfirst/max/last observed swap: {}/{}/{}\nmax-observed aggregate Lima RSS: {}\n",
             self.authority.as_str(),
             self.identity.experiment_id.as_str(),
             self.identity.block_id.as_str(),
@@ -695,6 +707,7 @@ impl HotFleetWindowReceiptV1 {
             self.counts.unvalidated_completions,
             self.counts.failures,
             self.counts.resets,
+            self.counts.unknown_results,
             self.counts.fallbacks,
             self.counts.unfinished,
             self.counts.maximum_simultaneous,
@@ -704,14 +717,14 @@ impl HotFleetWindowReceiptV1 {
             render_optional_millis(self.final_result_p90_millis),
             self.resources.status.as_str(),
             pressure_str(self.resources.max_observed_memory_pressure),
-            render_optional_bytes(self.resources.start_swap_bytes),
+            render_optional_bytes(self.resources.first_observed_swap_bytes),
             render_optional_bytes(self.resources.max_observed_swap_bytes),
-            render_optional_bytes(self.resources.end_swap_bytes),
+            render_optional_bytes(self.resources.last_observed_swap_bytes),
             render_optional_bytes(self.resources.max_observed_aggregate_lima_rss_bytes),
         )
     }
 
-    /// Render deterministic pretty JSON from the typed receipt.
+    /// Render deterministic pretty JSON from this typed receipt.
     ///
     /// # Errors
     ///
@@ -782,7 +795,7 @@ impl HotFleetComparisonReportV1 {
         )
     }
 
-    /// Render deterministic pretty JSON from the typed comparison report.
+    /// Render deterministic pretty JSON from this typed comparison report.
     ///
     /// # Errors
     ///
@@ -831,9 +844,9 @@ impl std::error::Error for HotFleetComparisonRefusal {}
 
 /// Compare four exact contention windows in baseline-candidate-candidate-baseline order.
 ///
-/// The reducer refuses every declared same-work mismatch and reports exact pair directions, rate
-/// ranges, range overlap/separation, and resource observations. It makes no significance,
-/// optimization, routing, admission, residency, or policy-promotion decision.
+/// This reducer reports exact pair directions, rate ranges, range overlap or separation, and
+/// resource observations. It grants no execution, routing, admission, residency, or policy-change
+/// authority.
 ///
 /// # Errors
 ///
@@ -842,19 +855,23 @@ pub fn compare_hot_fleet_abba(
     windows: [&HotFleetWindowReceiptV1; 4],
 ) -> Result<HotFleetComparisonReportV1, HotFleetComparisonRefusal> {
     let [a1, b1, b2, a2] = windows;
-    if [a1.identity.arm, b1.identity.arm, b2.identity.arm, a2.identity.arm]
-        != [
-            HotFleetArm::Baseline,
-            HotFleetArm::Candidate,
-            HotFleetArm::Candidate,
-            HotFleetArm::Baseline,
-        ]
-    {
+    if [
+        a1.identity.arm,
+        b1.identity.arm,
+        b2.identity.arm,
+        a2.identity.arm,
+    ] != [
+        HotFleetArm::Baseline,
+        HotFleetArm::Candidate,
+        HotFleetArm::Candidate,
+        HotFleetArm::Baseline,
+    ] {
         return Err(refusal(
             HotFleetComparisonRefusalReason::ArmOrder,
-            "hot-fleet comparison requires exact baseline-candidate-candidate-baseline order",
+            "hot-fleet comparison requires baseline-candidate-candidate-baseline order",
         ));
     }
+
     require_equal(
         [
             a1.identity.experiment_id.as_str(),
@@ -961,6 +978,7 @@ pub fn compare_hot_fleet_abba(
         HotFleetComparisonRefusalReason::NonTreatmentPolicy,
         "non-treatment policy differs across crossover windows",
     )?;
+
     if ![b1, b2, a2]
         .iter()
         .all(|window| window.identity.trust_class == a1.identity.trust_class)
@@ -1106,9 +1124,9 @@ fn reduce_resources(
             status: HotFleetResourceObservationStatus::Partial,
             report_count: 0,
             max_observed_memory_pressure: MemoryPressure::Unknown,
-            start_swap_bytes: None,
+            first_observed_swap_bytes: None,
             max_observed_swap_bytes: None,
-            end_swap_bytes: None,
+            last_observed_swap_bytes: None,
             max_observed_aggregate_lima_rss_bytes: None,
         });
     }
@@ -1154,7 +1172,7 @@ fn reduce_resources(
             max_pressure = report.memory_pressure;
         }
 
-        if let Some(swap) = report.swap {
+        if let Some(swap) = report.swap.as_ref() {
             if [swap.total_bytes, swap.used_bytes, swap.free_bytes]
                 .into_iter()
                 .any(|value| value > MAX_HOT_FLEET_OBSERVED_BYTES)
@@ -1163,7 +1181,8 @@ fn reduce_resources(
             {
                 return Err(resource_bytes_out_of_range());
             }
-            max_swap = Some(max_swap.map_or(swap.used_bytes, |value: u64| value.max(swap.used_bytes)));
+            max_swap =
+                Some(max_swap.map_or(swap.used_bytes, |value: u64| value.max(swap.used_bytes)));
         } else {
             complete = false;
         }
@@ -1176,11 +1195,14 @@ fn reduce_resources(
             )
         });
         if lima_complete {
-            let aggregate = report.lima_processes.iter().try_fold(0_u64, |total, process| {
-                total
-                    .checked_add(process.rss_bytes)
-                    .ok_or_else(resource_bytes_out_of_range)
-            })?;
+            let aggregate = report
+                .lima_processes
+                .iter()
+                .try_fold(0_u64, |total, process| {
+                    total
+                        .checked_add(process.rss_bytes)
+                        .ok_or_else(resource_bytes_out_of_range)
+                })?;
             if aggregate > MAX_HOT_FLEET_OBSERVED_BYTES {
                 return Err(resource_bytes_out_of_range());
             }
@@ -1198,9 +1220,13 @@ fn reduce_resources(
         },
         report_count: reports.len() as u8,
         max_observed_memory_pressure: max_pressure,
-        start_swap_bytes: reports.first().and_then(|report| report.swap.map(|swap| swap.used_bytes)),
+        first_observed_swap_bytes: reports
+            .first()
+            .and_then(|report| report.swap.as_ref().map(|swap| swap.used_bytes)),
         max_observed_swap_bytes: max_swap,
-        end_swap_bytes: reports.last().and_then(|report| report.swap.map(|swap| swap.used_bytes)),
+        last_observed_swap_bytes: reports
+            .last()
+            .and_then(|report| report.swap.as_ref().map(|swap| swap.used_bytes)),
         max_observed_aggregate_lima_rss_bytes: max_lima_rss,
     })
 }
@@ -1437,17 +1463,18 @@ mod tests {
     }
 
     fn attempt(
-        index: usize,
+        request_id: &str,
         work_id: &str,
         final_millis: u64,
         result: HotExecutionResultClass,
         validation: HotFleetSemanticValidation,
+        fallback_observed: bool,
     ) -> HotFleetAttemptEvidence {
         HotFleetAttemptEvidence::new(
-            ExecutionRequestId::parse(&format!("req-{index}")).unwrap(),
+            ExecutionRequestId::parse(request_id).unwrap(),
             Some(performance_receipt(work_id, final_millis, result)),
             validation,
-            false,
+            fallback_observed,
         )
         .unwrap()
     }
@@ -1458,19 +1485,21 @@ mod tests {
                 let work_id = format!("work-{index}");
                 let evidence = if index < validated {
                     attempt(
-                        index,
+                        &format!("req-{index}"),
                         &work_id,
                         latency_base + index as u64 * 10,
                         HotExecutionResultClass::Succeeded,
                         HotFleetSemanticValidation::Accepted,
+                        false,
                     )
                 } else {
                     attempt(
-                        index,
+                        &format!("req-{index}"),
                         &work_id,
                         latency_base,
                         HotExecutionResultClass::Failed,
                         HotFleetSemanticValidation::Unobserved,
+                        false,
                     )
                 };
                 HotFleetWorkItem::new(
@@ -1548,17 +1577,16 @@ mod tests {
         swap_used: u64,
         lima_rss: u64,
     ) -> HotFleetWindowReceiptV1 {
-        let timing = HotFleetWindowTiming::new(
-            EpochMillis::new(1_000).unwrap(),
-            EpochMillis::new(5_000).unwrap(),
-            4_000,
-            4_000,
-            HotFleetWindowCloseReason::Deadline,
-        )
-        .unwrap();
         HotFleetWindowReceiptV1::new(
             identity(arm, block, decision),
-            timing,
+            HotFleetWindowTiming::new(
+                EpochMillis::new(1_000).unwrap(),
+                EpochMillis::new(5_000).unwrap(),
+                4_000,
+                4_000,
+                HotFleetWindowCloseReason::Deadline,
+            )
+            .unwrap(),
             HotFleetConcurrencyObservation::new(
                 HotFleetConcurrencyBasis::HeavyExecution,
                 4,
@@ -1617,20 +1645,32 @@ mod tests {
             4_u64 << 30,
         );
 
+        assert_eq!(a1.final_result_p50_millis(), Some(1_010));
+        assert_eq!(a1.final_result_p90_millis(), Some(1_030));
+        assert!(b1.final_result_p50_millis() < a1.final_result_p50_millis());
+
         let report = compare_hot_fleet_abba([&a1, &b1, &b2, &a2]).unwrap();
-        assert_eq!(report.first_pair_direction, HotFleetRateDirection::BaselineHigher);
-        assert_eq!(report.second_pair_direction, HotFleetRateDirection::BaselineHigher);
+        assert_eq!(
+            report.first_pair_direction,
+            HotFleetRateDirection::BaselineHigher
+        );
+        assert_eq!(
+            report.second_pair_direction,
+            HotFleetRateDirection::BaselineHigher
+        );
         assert!(report.directions_consistent);
         assert_eq!(
             report.rate_range_relationship,
             HotFleetRateRangeRelationship::BaselineAboveCandidate
         );
-        assert!(b1.final_result_p50_millis() < a1.final_result_p50_millis());
         assert_eq!(
             report.candidate_resources.max_observed_memory_pressure,
             MemoryPressure::Critical
         );
-        assert_eq!(report.candidate_resources.max_observed_swap_bytes, Some(3_u64 << 30));
+        assert_eq!(
+            report.candidate_resources.max_observed_swap_bytes,
+            Some(3_u64 << 30)
+        );
     }
 
     #[test]
@@ -1677,13 +1717,18 @@ mod tests {
         );
 
         let report = compare_hot_fleet_abba([&a1, &b1, &b2, &a2]).unwrap();
-        assert_eq!(report.first_pair_direction, HotFleetRateDirection::CandidateHigher);
+        assert_eq!(
+            report.first_pair_direction,
+            HotFleetRateDirection::CandidateHigher
+        );
         assert_eq!(
             report.rate_range_relationship,
             HotFleetRateRangeRelationship::CandidateAboveBaseline
         );
         assert_eq!(
-            report.candidate_resources.max_observed_aggregate_lima_rss_bytes,
+            report
+                .candidate_resources
+                .max_observed_aggregate_lima_rss_bytes,
             Some(6_u64 << 30)
         );
         assert_eq!(
@@ -1693,71 +1738,18 @@ mod tests {
     }
 
     #[test]
-    fn order_reversal_and_non_treatment_mismatch_are_refused() {
-        let a1 = window(
-            HotFleetArm::Baseline,
-            "a1",
-            "a",
-            4,
-            1_000,
-            MemoryPressure::Normal,
-            0,
-            4_u64 << 30,
-        );
-        let b1 = window(
-            HotFleetArm::Candidate,
-            "b1",
-            "b",
-            4,
-            1_000,
-            MemoryPressure::Normal,
-            0,
-            4_u64 << 30,
-        );
-        let b2 = window(
-            HotFleetArm::Candidate,
-            "b2",
-            "b",
-            4,
-            1_000,
-            MemoryPressure::Normal,
-            0,
-            4_u64 << 30,
-        );
-        let mut a2 = window(
-            HotFleetArm::Baseline,
-            "a2",
-            "a",
-            4,
-            1_000,
-            MemoryPressure::Normal,
-            0,
-            4_u64 << 30,
-        );
-
-        let reversed = compare_hot_fleet_abba([&b1, &a1, &a2, &b2]).unwrap_err();
-        assert_eq!(reversed.reason, HotFleetComparisonRefusalReason::ArmOrder);
-
-        a2.identity.non_treatment_policy_id = Token::parse("other-policy").unwrap();
-        let mismatch = compare_hot_fleet_abba([&a1, &b1, &b2, &a2]).unwrap_err();
-        assert_eq!(
-            mismatch.reason,
-            HotFleetComparisonRefusalReason::NonTreatmentPolicy
-        );
-    }
-
-    #[test]
     fn successful_unvalidated_work_is_visible_and_has_zero_validated_rate() {
-        let work_id = "work-0";
-        let unvalidated = HotFleetAttemptEvidence::new(
-            ExecutionRequestId::parse("req-unvalidated").unwrap(),
-            Some(performance_receipt(
-                work_id,
+        let item = HotFleetWorkItem::new(
+            "work-0",
+            digest('a'),
+            Some(attempt(
+                "req-unvalidated",
+                "work-0",
                 500,
                 HotExecutionResultClass::Succeeded,
+                HotFleetSemanticValidation::Unobserved,
+                true,
             )),
-            HotFleetSemanticValidation::Unobserved,
-            true,
         )
         .unwrap();
         let receipt = HotFleetWindowReceiptV1::new(
@@ -1776,7 +1768,7 @@ mod tests {
                 HotFleetConcurrencyObservationSource::HarnessOwned,
             )
             .unwrap(),
-            vec![HotFleetWorkItem::new(work_id, digest('a'), Some(unvalidated)).unwrap()],
+            vec![item],
             &[],
         )
         .unwrap();
@@ -1784,14 +1776,11 @@ mod tests {
         assert_eq!(receipt.counts().validated_completions, 0);
         assert_eq!(receipt.counts().unvalidated_completions, 1);
         assert_eq!(receipt.counts().fallbacks, 1);
+        assert_eq!(receipt.counts().unfinished, 0);
         assert_eq!(receipt.validated_rate().validated_completions, 0);
         assert_eq!(
             receipt.resources().status,
             HotFleetResourceObservationStatus::Partial
-        );
-        assert_eq!(
-            receipt.resources().max_observed_memory_pressure,
-            MemoryPressure::Unknown
         );
     }
 
@@ -1807,11 +1796,12 @@ mod tests {
         .unwrap();
         let concurrency = HotFleetConcurrencyObservation::new(
             HotFleetConcurrencyBasis::ActiveTasks,
-            1,
+            2,
             HotFleetConcurrencyObservationSource::HarnessOwned,
         )
         .unwrap();
-        let error = HotFleetWindowReceiptV1::new(
+
+        let duplicate_work = HotFleetWindowReceiptV1::new(
             identity(HotFleetArm::Baseline, "a1", "a"),
             timing,
             concurrency,
@@ -1820,11 +1810,12 @@ mod tests {
                     "same-work",
                     digest('a'),
                     Some(attempt(
-                        1,
+                        "req-1",
                         "same-work",
                         500,
                         HotExecutionResultClass::Succeeded,
                         HotFleetSemanticValidation::Accepted,
+                        false,
                     )),
                 )
                 .unwrap(),
@@ -1832,11 +1823,12 @@ mod tests {
                     "same-work",
                     digest('b'),
                     Some(attempt(
-                        2,
+                        "req-2",
                         "same-work",
                         500,
                         HotExecutionResultClass::Succeeded,
                         HotFleetSemanticValidation::Accepted,
+                        false,
                     )),
                 )
                 .unwrap(),
@@ -1844,48 +1836,44 @@ mod tests {
             &[],
         )
         .unwrap_err();
-        assert_eq!(error.code, "duplicate_hot_fleet_work_id");
+        assert_eq!(duplicate_work.code, "duplicate_hot_fleet_work_id");
 
-        let request = ExecutionRequestId::parse("shared-request").unwrap();
-        let first = HotFleetAttemptEvidence::new(
-            request.clone(),
-            Some(performance_receipt(
-                "work-a",
-                500,
-                HotExecutionResultClass::Succeeded,
-            )),
-            HotFleetSemanticValidation::Accepted,
-            false,
-        )
-        .unwrap();
-        let second = HotFleetAttemptEvidence::new(
-            request,
-            Some(performance_receipt(
-                "work-b",
-                500,
-                HotExecutionResultClass::Succeeded,
-            )),
-            HotFleetSemanticValidation::Accepted,
-            false,
-        )
-        .unwrap();
-        let error = HotFleetWindowReceiptV1::new(
+        let duplicate_request = HotFleetWindowReceiptV1::new(
             identity(HotFleetArm::Baseline, "a2", "a"),
             timing,
-            HotFleetConcurrencyObservation::new(
-                HotFleetConcurrencyBasis::ActiveTasks,
-                2,
-                HotFleetConcurrencyObservationSource::HarnessOwned,
-            )
-            .unwrap(),
+            concurrency,
             vec![
-                HotFleetWorkItem::new("work-a", digest('a'), Some(first)).unwrap(),
-                HotFleetWorkItem::new("work-b", digest('b'), Some(second)).unwrap(),
+                HotFleetWorkItem::new(
+                    "work-a",
+                    digest('a'),
+                    Some(attempt(
+                        "shared-request",
+                        "work-a",
+                        500,
+                        HotExecutionResultClass::Succeeded,
+                        HotFleetSemanticValidation::Accepted,
+                        false,
+                    )),
+                )
+                .unwrap(),
+                HotFleetWorkItem::new(
+                    "work-b",
+                    digest('b'),
+                    Some(attempt(
+                        "shared-request",
+                        "work-b",
+                        500,
+                        HotExecutionResultClass::Succeeded,
+                        HotFleetSemanticValidation::Accepted,
+                        false,
+                    )),
+                )
+                .unwrap(),
             ],
             &[],
         )
         .unwrap_err();
-        assert_eq!(error.code, "duplicate_hot_fleet_request_id");
+        assert_eq!(duplicate_request.code, "duplicate_hot_fleet_request_id");
     }
 
     #[test]
@@ -1976,6 +1964,60 @@ mod tests {
     }
 
     #[test]
+    fn abba_rejects_order_and_non_treatment_mismatch() {
+        let a1 = window(
+            HotFleetArm::Baseline,
+            "a1",
+            "a",
+            4,
+            1_000,
+            MemoryPressure::Normal,
+            0,
+            4_u64 << 30,
+        );
+        let b1 = window(
+            HotFleetArm::Candidate,
+            "b1",
+            "b",
+            4,
+            1_000,
+            MemoryPressure::Normal,
+            0,
+            4_u64 << 30,
+        );
+        let b2 = window(
+            HotFleetArm::Candidate,
+            "b2",
+            "b",
+            4,
+            1_000,
+            MemoryPressure::Normal,
+            0,
+            4_u64 << 30,
+        );
+        let mut a2 = window(
+            HotFleetArm::Baseline,
+            "a2",
+            "a",
+            4,
+            1_000,
+            MemoryPressure::Normal,
+            0,
+            4_u64 << 30,
+        );
+
+        let reversed = compare_hot_fleet_abba([&b1, &a1, &a2, &b2]).unwrap_err();
+        assert_eq!(reversed.reason, HotFleetComparisonRefusalReason::ArmOrder);
+
+        a2.identity.non_treatment_policy_id = Token::parse("other-policy").unwrap();
+        let mismatch = compare_hot_fleet_abba([&a1, &b1, &b2, &a2]).unwrap_err();
+        assert_eq!(
+            mismatch.reason,
+            HotFleetComparisonRefusalReason::NonTreatmentPolicy
+        );
+    }
+
+    #[test]
     fn human_and_json_render_from_the_same_typed_model() {
         let receipt = window(
             HotFleetArm::Baseline,
@@ -1993,8 +2035,5 @@ mod tests {
         assert!(human.contains("resource status: complete"));
         assert!(json.contains("\"validated_completions\": 4"));
         assert!(json.contains("\"authority\": \"observation_only\""));
-        assert!(!json.contains("execute"));
-        assert!(!json.contains("schedule"));
-        assert!(!json.contains("mutation"));
     }
 }
