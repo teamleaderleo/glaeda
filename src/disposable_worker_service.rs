@@ -88,7 +88,7 @@ impl std::error::Error for DisposableWorkerServiceError {}
 /// Returns the receipt contract's fixed public error when a service machine code falls outside the
 /// closed v1 grammar or when the supplied failure time predates process start.
 #[allow(clippy::too_many_arguments)]
-pub fn build_disposable_worker_service_failure_receipt(
+pub(crate) fn build_disposable_worker_service_failure_receipt(
     error: DisposableWorkerServiceError,
     program_digest: crate::artifact::Sha256Digest,
     enrollment_digest: crate::artifact::Sha256Digest,
