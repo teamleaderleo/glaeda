@@ -99,7 +99,9 @@ pub fn build_disposable_worker_service_failure_receipt(
     durable_recovery_present: bool,
 ) -> Result<DisposableServiceFailureReceipt, DisposableServiceFailureReceiptError> {
     let failure_kind = match error.kind() {
-        DisposableWorkerServiceErrorKind::DurableState => DisposableServiceFailureKind::DurableState,
+        DisposableWorkerServiceErrorKind::DurableState => {
+            DisposableServiceFailureKind::DurableState
+        }
         DisposableWorkerServiceErrorKind::Supervisor => DisposableServiceFailureKind::Supervisor,
     };
     let failure_code = DisposableServiceFailureCode::from_static(error.code())?;
@@ -425,6 +427,7 @@ mod tests {
     use super::*;
     use crate::artifact::Sha256Digest;
     use crate::disposable_prepared_template::current_disposable_prepared_template;
+    use crate::disposable_service_failure_receipt::DisposableServiceFailureReceiptErrorKind;
     use crate::disposable_template_generation::{
         DisposableTemplateGenerationDocument, DisposableTemplateGenerationId,
         DisposableTemplateSourceIdentity, encode_disposable_template_generation,
@@ -502,12 +505,15 @@ mod tests {
         decode_disposable_worker_enrollment(document.as_bytes()).unwrap()
     }
 
+    fn digest() -> Sha256Digest {
+        Sha256Digest::parse(DIGEST).unwrap()
+    }
+
     fn service_failure_receipt(
         error: DisposableWorkerServiceError,
         process_started_at_epoch_ms: u64,
         failed_at_epoch_ms: u64,
     ) -> Result<DisposableServiceFailureReceipt, DisposableServiceFailureReceiptError> {
-        let digest = || Sha256Digest::parse(DIGEST).unwrap();
         build_disposable_worker_service_failure_receipt(
             error,
             digest(),
@@ -529,16 +535,33 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(receipt.failure_kind(), DisposableServiceFailureKind::DurableState);
-        assert_eq!(receipt.failure_code().as_str(), "disposable_worker_recovery_required");
+        assert_eq!(
+            receipt.failure_kind(),
+            DisposableServiceFailureKind::DurableState
+        );
+        assert_eq!(
+            receipt.failure_code().as_str(),
+            "disposable_worker_recovery_required"
+        );
         assert_eq!(receipt.restart_generation(), 7);
         assert!(receipt.durable_recovery_present());
 
         let json = String::from_utf8(receipt.canonical_json()).unwrap();
         assert!(json.contains("\"failure_kind\":\"durable_state\""));
         assert!(json.contains("\"failure_code\":\"disposable_worker_recovery_required\""));
-        for forbidden in ["path", "argv", "environment", "stdout", "stderr", "credential", "token"] {
-            assert!(!json.contains(forbidden), "forbidden receipt field fragment: {forbidden}");
+        for forbidden in [
+            "path",
+            "argv",
+            "environment",
+            "stdout",
+            "stderr",
+            "credential",
+            "token",
+        ] {
+            assert!(
+                !json.contains(forbidden),
+                "forbidden receipt field fragment: {forbidden}"
+            );
         }
     }
 
@@ -551,7 +574,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(receipt.failure_kind(), DisposableServiceFailureKind::Supervisor);
+        assert_eq!(
+            receipt.failure_kind(),
+            DisposableServiceFailureKind::Supervisor
+        );
         assert_eq!(
             receipt.failure_code().as_str(),
             "disposable_worker_signal_control_unavailable"
@@ -567,10 +593,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert_eq!(
-            error.kind(),
-            crate::disposable_service_failure_receipt::DisposableServiceFailureReceiptErrorKind::InvalidTimeline
-        );
+        assert_eq!(error.kind(), DisposableServiceFailureReceiptErrorKind::InvalidTimeline);
     }
 
     #[test]
