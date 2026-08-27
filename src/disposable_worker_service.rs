@@ -535,8 +535,14 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(receipt.failure_kind(), DisposableServiceFailureKind::DurableState);
-        assert_eq!(receipt.failure_code().as_str(), "disposable_worker_recovery_required");
+        assert_eq!(
+            receipt.failure_kind(),
+            DisposableServiceFailureKind::DurableState
+        );
+        assert_eq!(
+            receipt.failure_code().as_str(),
+            "disposable_worker_recovery_required"
+        );
         assert_eq!(receipt.restart_generation(), 7);
         assert!(receipt.durable_recovery_present());
 
@@ -568,8 +574,14 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(receipt.failure_kind(), DisposableServiceFailureKind::Supervisor);
-        assert_eq!(receipt.failure_code().as_str(), "disposable_worker_signal_control_unavailable");
+        assert_eq!(
+            receipt.failure_kind(),
+            DisposableServiceFailureKind::Supervisor
+        );
+        assert_eq!(
+            receipt.failure_code().as_str(),
+            "disposable_worker_signal_control_unavailable"
+        );
     }
 
     #[test]
@@ -581,7 +593,10 @@ mod tests {
         )
         .unwrap_err();
 
-        assert_eq!(error.kind(), DisposableServiceFailureReceiptErrorKind::InvalidTimeline);
+        assert_eq!(
+            error.kind(),
+            DisposableServiceFailureReceiptErrorKind::InvalidTimeline
+        );
     }
 
     #[test]
