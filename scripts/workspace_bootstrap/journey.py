@@ -16,10 +16,14 @@ from pathlib import Path
 
 from .cli import blocked_internal_receipt
 from .probe import child_environment
-from .receipt import build_receipt
+from .receipt import (
+    RECEIPT_TYPE as WORKSPACE_RECEIPT_TYPE,
+    SCHEMA_VERSION as WORKSPACE_SCHEMA_VERSION,
+    build_receipt,
+)
 
-SCHEMA_VERSION = 1
-RECEIPT_TYPE = "smolrunner-front-door-readiness-receipt"
+SCHEMA_VERSION = 2
+RECEIPT_TYPE = "glaeda-front-door-readiness-receipt"
 MAX_CHILD_OUTPUT_BYTES = 1024 * 1024
 DOCTOR_TIMEOUT_SECONDS = 180
 VALID_BOOTSTRAP_STATES = {"ready", "ready_with_declared_deviations", "blocked"}
@@ -158,9 +162,9 @@ def _bootstrap_receipt() -> dict[str, object]:
 def _valid_bootstrap_receipt(receipt: object) -> bool:
     if not isinstance(receipt, dict):
         return False
-    if receipt.get("schema_version") != 1:
+    if receipt.get("schema_version") != WORKSPACE_SCHEMA_VERSION:
         return False
-    if receipt.get("receipt_type") != "smolrunner-workspace-capability-receipt":
+    if receipt.get("receipt_type") != WORKSPACE_RECEIPT_TYPE:
         return False
     if receipt.get("state") not in VALID_BOOTSTRAP_STATES:
         return False
