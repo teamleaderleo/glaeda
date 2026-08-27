@@ -2,8 +2,8 @@
 name = "glaeda"
 version = "0.1.0"
 edition = "2024"
-description = "Glaeda tends small fleets of self-hosted GitHub Actions runners on ordinary Linux servers"
-repository = "https://github.com/teamleaderleo/smolrunner"
+description = "Glaeda is a local-first runtime for hot, trust-tiered Linux compute on operator-controlled machines"
+repository = "https://github.com/teamleaderleo/glaeda"
 license = "Apache-2.0"
 keywords = ["github-actions", "self-hosted", "runner", "podman", "devops"]
 categories = ["command-line-utilities", "development-tools"]
