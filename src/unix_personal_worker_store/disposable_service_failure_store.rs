@@ -82,9 +82,7 @@ impl ReceiptSlot {
             Self::Current => {
                 DisposableServiceFailureStoreRecoveryReason::VersionIncompatibleCurrent
             }
-            Self::Staged => {
-                DisposableServiceFailureStoreRecoveryReason::VersionIncompatibleStaged
-            }
+            Self::Staged => DisposableServiceFailureStoreRecoveryReason::VersionIncompatibleStaged,
         }
     }
 }
@@ -151,14 +149,14 @@ impl UnixPersonalWorkerStore {
         let _lock = self.acquire_read_lock()?;
         match self.failure_receipt_recovery_plan()? {
             RecoveryPlan::CleanMissing => Ok(DisposableServiceFailureStoreInspection::Missing),
-            RecoveryPlan::CleanCurrent(current) => {
-                Ok(DisposableServiceFailureStoreInspection::Current(current.receipt))
-            }
-            RecoveryPlan::RemoveDuplicateStaged { .. } => Ok(
-                DisposableServiceFailureStoreInspection::RecoveryRequired {
-                    reason: DisposableServiceFailureStoreRecoveryReason::DuplicateStage,
-                },
+            RecoveryPlan::CleanCurrent(current) => Ok(
+                DisposableServiceFailureStoreInspection::Current(current.receipt),
             ),
+            RecoveryPlan::RemoveDuplicateStaged { .. } => {
+                Ok(DisposableServiceFailureStoreInspection::RecoveryRequired {
+                    reason: DisposableServiceFailureStoreRecoveryReason::DuplicateStage,
+                })
+            }
             RecoveryPlan::RecoveryRequired(reason) => {
                 Ok(DisposableServiceFailureStoreInspection::RecoveryRequired { reason })
             }
@@ -259,9 +257,7 @@ impl UnixPersonalWorkerStore {
         }
     }
 
-    fn recover_failure_receipt_locked(
-        &self,
-    ) -> Result<RecoveredState, PersonalWorkerStoreError> {
+    fn recover_failure_receipt_locked(&self) -> Result<RecoveredState, PersonalWorkerStoreError> {
         match self.failure_receipt_recovery_plan()? {
             RecoveryPlan::CleanMissing => Ok(RecoveredState {
                 disposition: DisposableServiceFailureStoreRecoveryDisposition::Clean,
@@ -300,7 +296,12 @@ impl UnixPersonalWorkerStore {
             "personal worker store directory",
             Some(self.owner),
         )?;
-        let file = match fs::openat(&self.directory, slot.name(), EXISTING_FILE_FLAGS, Mode::empty()) {
+        let file = match fs::openat(
+            &self.directory,
+            slot.name(),
+            EXISTING_FILE_FLAGS,
+            Mode::empty(),
+        ) {
             Ok(file) => file,
             Err(Errno::NOENT) => return Ok(RetainedReceipt::Missing),
             Err(error) => return Err(map_document_open_error(error)),
@@ -318,8 +319,7 @@ impl UnixPersonalWorkerStore {
         let receipt = match DisposableServiceFailureReceipt::from_json(&bytes) {
             Ok(receipt) => receipt,
             Err(error)
-                if error.kind()
-                    == DisposableServiceFailureReceiptErrorKind::UnsupportedSchema =>
+                if error.kind() == DisposableServiceFailureReceiptErrorKind::UnsupportedSchema =>
             {
                 return Ok(RetainedReceipt::Invalid(slot.version_reason()));
             }
@@ -328,10 +328,10 @@ impl UnixPersonalWorkerStore {
         if receipt.canonical_json() != bytes {
             return Ok(RetainedReceipt::Invalid(slot.corrupt_reason()));
         }
-        let snapshot = ReceiptFileSnapshot::from_stat(
-            &fs::fstat(file.as_fd())
-                .map_err(|_| io_store("could not inspect the disposable service failure receipt"))?,
-        );
+        let snapshot =
+            ReceiptFileSnapshot::from_stat(&fs::fstat(file.as_fd()).map_err(|_| {
+                io_store("could not inspect the disposable service failure receipt")
+            })?);
         let path_stat = match fs::statat(&self.directory, slot.name(), AtFlags::SYMLINK_NOFOLLOW) {
             Ok(stat) => stat,
             Err(Errno::NOENT) => {
@@ -373,10 +373,10 @@ impl UnixPersonalWorkerStore {
         {
             return Err(corrupt_store());
         }
-        let descriptor_snapshot = ReceiptFileSnapshot::from_stat(
-            &fs::fstat(exact.file.as_fd())
-                .map_err(|_| io_store("could not inspect the disposable service failure receipt"))?,
-        );
+        let descriptor_snapshot =
+            ReceiptFileSnapshot::from_stat(&fs::fstat(exact.file.as_fd()).map_err(|_| {
+                io_store("could not inspect the disposable service failure receipt")
+            })?);
         if descriptor_snapshot != exact.snapshot {
             return Err(conflict_store(
                 "disposable service failure receipt changed after validation",
@@ -422,9 +422,7 @@ fn synchronize_failure_receipt_directory(
     synchronize_directory(&store.directory, "personal worker store directory")
 }
 
-fn recovery_error(
-    reason: DisposableServiceFailureStoreRecoveryReason,
-) -> PersonalWorkerStoreError {
+fn recovery_error(reason: DisposableServiceFailureStoreRecoveryReason) -> PersonalWorkerStoreError {
     match reason {
         DisposableServiceFailureStoreRecoveryReason::VersionIncompatibleCurrent
         | DisposableServiceFailureStoreRecoveryReason::VersionIncompatibleStaged => store_error(
@@ -433,12 +431,12 @@ fn recovery_error(
         ),
         DisposableServiceFailureStoreRecoveryReason::CorruptCurrent
         | DisposableServiceFailureStoreRecoveryReason::CorruptStaged => corrupt_store(),
-        DisposableServiceFailureStoreRecoveryReason::StagedCandidate => conflict_store(
-            "staged disposable service failure receipt requires explicit recovery",
-        ),
-        DisposableServiceFailureStoreRecoveryReason::AmbiguousReplacement => conflict_store(
-            "disposable service failure receipt replacement is ambiguous",
-        ),
+        DisposableServiceFailureStoreRecoveryReason::StagedCandidate => {
+            conflict_store("staged disposable service failure receipt requires explicit recovery")
+        }
+        DisposableServiceFailureStoreRecoveryReason::AmbiguousReplacement => {
+            conflict_store("disposable service failure receipt replacement is ambiguous")
+        }
         DisposableServiceFailureStoreRecoveryReason::DuplicateStage => conflict_store(
             "duplicate disposable service failure receipt stage changed during recovery",
         ),
@@ -580,17 +578,23 @@ mod tests {
         let mut store = open_store(&root);
         let first = receipt(1, "bridge_unavailable");
         assert_eq!(
-            store.replace_disposable_service_failure_receipt(&first).unwrap(),
+            store
+                .replace_disposable_service_failure_receipt(&first)
+                .unwrap(),
             DisposableServiceFailureStoreWriteDisposition::Created
         );
         assert_eq!(
-            store.replace_disposable_service_failure_receipt(&first).unwrap(),
+            store
+                .replace_disposable_service_failure_receipt(&first)
+                .unwrap(),
             DisposableServiceFailureStoreWriteDisposition::Duplicate
         );
         for generation in 2..=32 {
             let next = receipt(generation, "bridge_unavailable");
             assert_eq!(
-                store.replace_disposable_service_failure_receipt(&next).unwrap(),
+                store
+                    .replace_disposable_service_failure_receipt(&next)
+                    .unwrap(),
                 DisposableServiceFailureStoreWriteDisposition::Replaced
             );
         }
@@ -638,7 +642,9 @@ mod tests {
         let root = TempRoot::new("stage-replace");
         let mut store = open_store(&root);
         let first = receipt(1, "first_failure");
-        store.replace_disposable_service_failure_receipt(&first).unwrap();
+        store
+            .replace_disposable_service_failure_receipt(&first)
+            .unwrap();
         let second = receipt(2, "second_failure");
         let staged_bytes = second.canonical_json();
         write_slot(&root, ReceiptSlot::Staged, &staged_bytes);
@@ -740,14 +746,11 @@ mod tests {
     #[test]
     fn noncanonical_and_oversized_documents_are_preserved_as_corrupt() {
         for (label, bytes) in [
-            (
-                "noncanonical",
-                {
-                    let mut bytes = receipt(1, "failure").canonical_json();
-                    bytes.push(b'\n');
-                    bytes
-                },
-            ),
+            ("noncanonical", {
+                let mut bytes = receipt(1, "failure").canonical_json();
+                bytes.push(b'\n');
+                bytes
+            }),
             (
                 "oversized",
                 vec![b'x'; MAX_STORED_FAILURE_RECEIPT_BYTES + 1],
@@ -826,7 +829,9 @@ mod tests {
             let root = TempRoot::new("pre-rename-fault");
             let mut store = open_store(&root);
             let first = receipt(1, "first_failure");
-            store.replace_disposable_service_failure_receipt(&first).unwrap();
+            store
+                .replace_disposable_service_failure_receipt(&first)
+                .unwrap();
             let _fault = inject_publication_fault(point);
             let error = store
                 .replace_disposable_service_failure_receipt(&receipt(2, "second_failure"))
@@ -844,7 +849,9 @@ mod tests {
         let root = TempRoot::new("post-rename-fault");
         let mut store = open_store(&root);
         let first = receipt(1, "first_failure");
-        store.replace_disposable_service_failure_receipt(&first).unwrap();
+        store
+            .replace_disposable_service_failure_receipt(&first)
+            .unwrap();
         let second = receipt(2, "second_failure");
         let _fault = inject_publication_fault(PublicationFaultPoint::PublicationDirectorySync);
         let error = store
@@ -856,7 +863,9 @@ mod tests {
             DisposableServiceFailureStoreRecoveryDisposition::Clean
         );
         assert_eq!(
-            store.replace_disposable_service_failure_receipt(&second).unwrap(),
+            store
+                .replace_disposable_service_failure_receipt(&second)
+                .unwrap(),
             DisposableServiceFailureStoreWriteDisposition::Duplicate
         );
         assert_eq!(
