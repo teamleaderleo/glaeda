@@ -1,0 +1,203 @@
+name: pnpm XFS CoW research
+
+on:
+  push:
+    branches:
+      - chatgpt/566-pnpm-xfs-cow-probe
+
+permissions:
+  contents: read
+
+jobs:
+  pnpm-xfs-cow:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    steps:
+      - name: Record runner and pnpm capability
+        id: capability
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "kernel=$(uname -srmo)"
+          echo "arch=$(uname -m)"
+          echo "cpu_model=$(awk -F: '/^Model name/ {sub(/^ /, "", $2); print $2; exit}' /proc/cpuinfo)"
+          echo "logical_cpus=$(nproc)"
+          echo "node=$(node --version 2>/dev/null || echo unavailable)"
+          echo "npm=$(npm --version 2>/dev/null || echo unavailable)"
+          if command -v pnpm >/dev/null 2>&1; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+            echo "pnpm_available=true"
+            echo "pnpm=$(pnpm --version)"
+            echo "pnpm_path=$(command -v pnpm)"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "pnpm_available=false"
+            echo "result=tool_unavailable_no_install_per_research_contract"
+          fi
+
+      - name: Build isolated XFS reflink fixture
+        if: steps.capability.outputs.available == 'true'
+        id: xfs
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="$RUNNER_TEMP/pnpm-xfs-cow.img"
+          mountpoint="$RUNNER_TEMP/pnpm-xfs-cow"
+          truncate -s 4G "$image"
+          loop=$(sudo losetup --find --show "$image")
+          sudo mkfs.xfs -f "$loop" >/dev/null
+          sudo mkdir -p "$mountpoint"
+          sudo mount "$loop" "$mountpoint"
+          sudo chown "$(id -u):$(id -g)" "$mountpoint"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "loop=$loop" >> "$GITHUB_OUTPUT"
+          echo "mountpoint=$mountpoint" >> "$GITHUB_OUTPUT"
+          echo "xfs_info_begin"
+          xfs_info "$mountpoint"
+          echo "xfs_info_end"
+          test "$(stat -f -c %T "$mountpoint")" = xfs
+          xfs_info "$mountpoint" | grep -q 'reflink=1'
+
+      - name: Create network-free package fixture and warm pnpm store
+        if: steps.capability.outputs.available == 'true'
+        id: fixture
+        shell: bash
+        env:
+          MOUNTPOINT: ${{ steps.xfs.outputs.mountpoint }}
+        run: |
+          set -euo pipefail
+          root="$MOUNTPOINT/lab"
+          dep="$root/fixture-dep"
+          app="$root/app"
+          store="$root/store"
+          mkdir -p "$dep/payload" "$app" "$store"
+          cat > "$dep/package.json" <<'JSON'
+          {
+            "name": "fixture-dep",
+            "version": "1.0.0",
+            "files": ["payload"]
+          }
+          JSON
+          python3 - "$dep/payload" <<'PY'
+          import hashlib
+          import pathlib
+          import sys
+
+          root = pathlib.Path(sys.argv[1])
+          for i in range(256):
+              seed = hashlib.sha256(f"pnpm-xfs-cow-{i}".encode()).digest()
+              (root / f"file-{i:03d}.bin").write_bytes(seed * 2048)
+          PY
+          (
+            cd "$dep"
+            npm pack --silent --pack-destination "$root" >/dev/null
+          )
+          tarball=$(find "$root" -maxdepth 1 -name 'fixture-dep-*.tgz' -print -quit)
+          test -n "$tarball"
+          cat > "$app/package.json" <<JSON
+          {
+            "name": "pnpm-xfs-cow-app",
+            "version": "1.0.0",
+            "private": true,
+            "dependencies": {
+              "fixture-dep": "file:$tarball"
+            }
+          }
+          JSON
+          (
+            cd "$app"
+            pnpm install --offline --ignore-scripts --package-import-method=copy --store-dir "$store" --frozen-lockfile=false
+          )
+          rm -rf "$app/node_modules"
+          sync -f "$MOUNTPOINT"
+          echo "app=$app" >> "$GITHUB_OUTPUT"
+          echo "store=$store" >> "$GITHUB_OUTPUT"
+          echo "fixture_logical_bytes=$(du -sb "$dep" | awk '{print $1}')"
+          echo "store_logical_bytes=$(du -sb "$store" | awk '{print $1}')"
+
+      - name: Compare auto and clone imports from the same warm store
+        if: steps.capability.outputs.available == 'true'
+        shell: bash
+        env:
+          MOUNTPOINT: ${{ steps.xfs.outputs.mountpoint }}
+          APP: ${{ steps.fixture.outputs.app }}
+          STORE: ${{ steps.fixture.outputs.store }}
+        run: |
+          set -euo pipefail
+
+          used_bytes() {
+            sync -f "$MOUNTPOINT"
+            df --output=used -B1 "$MOUNTPOINT" | tail -n 1 | tr -d ' '
+          }
+
+          analyze_pair() {
+            method="$1"
+            installed=$(find "$APP/node_modules" -type f -name 'file-000.bin' -print -quit)
+            test -n "$installed"
+            target_sha=$(sha256sum "$installed" | awk '{print $1}')
+            target_size=$(stat -c %s "$installed")
+            store_file=""
+            while IFS= read -r -d '' candidate; do
+              if [ "$(sha256sum "$candidate" | awk '{print $1}')" = "$target_sha" ]; then
+                store_file="$candidate"
+                break
+              fi
+            done < <(find "$STORE" -type f -size "${target_size}c" -print0)
+            test -n "$store_file"
+            echo "${method}_installed_stat=$(stat -c 'dev=%d ino=%i links=%h blocks=%b size=%s' "$installed")"
+            echo "${method}_store_stat=$(stat -c 'dev=%d ino=%i links=%h blocks=%b size=%s' "$store_file")"
+            installed_ino=$(stat -c %i "$installed")
+            store_ino=$(stat -c %i "$store_file")
+            if [ "$installed_ino" = "$store_ino" ]; then
+              echo "${method}_sharing=hardlink_same_inode"
+            else
+              flags=$(filefrag -v "$installed" 2>/dev/null | tail -n +4 | grep -o 'shared' | head -n 1 || true)
+              store_flags=$(filefrag -v "$store_file" 2>/dev/null | tail -n +4 | grep -o 'shared' | head -n 1 || true)
+              if [ "$flags" = shared ] && [ "$store_flags" = shared ]; then
+                echo "${method}_sharing=reflink_shared_extents"
+              else
+                echo "${method}_sharing=distinct_unproven"
+              fi
+            fi
+            echo "${method}_filefrag_installed_begin"
+            filefrag -v "$installed" || true
+            echo "${method}_filefrag_installed_end"
+            echo "${method}_filefrag_store_begin"
+            filefrag -v "$store_file" || true
+            echo "${method}_filefrag_store_end"
+          }
+
+          for method in auto clone; do
+            rm -rf "$APP/node_modules"
+            before=$(used_bytes)
+            start=$(date +%s%N)
+            (
+              cd "$APP"
+              pnpm install --offline --ignore-scripts --frozen-lockfile --store-dir "$STORE" --package-import-method="$method"
+            )
+            finish=$(date +%s%N)
+            after=$(used_bytes)
+            elapsed_ns=$((finish - start))
+            delta=$((after - before))
+            logical=$(du -sb "$APP/node_modules" | awk '{print $1}')
+            allocated=$(du -s -B1 "$APP/node_modules" | awk '{print $1}')
+            echo "${method}_elapsed_ns=$elapsed_ns"
+            echo "${method}_filesystem_used_delta_bytes=$delta"
+            echo "${method}_node_modules_logical_bytes=$logical"
+            echo "${method}_node_modules_allocated_bytes=$allocated"
+            analyze_pair "$method"
+          done
+
+      - name: Cleanup research volume
+        if: always() && steps.capability.outputs.available == 'true'
+        shell: bash
+        env:
+          LOOP: ${{ steps.xfs.outputs.loop }}
+          MOUNTPOINT: ${{ steps.xfs.outputs.mountpoint }}
+          IMAGE: ${{ steps.xfs.outputs.image }}
+        run: |
+          set -euo pipefail
+          sync || true
+          sudo umount "$MOUNTPOINT"
+          sudo losetup -d "$LOOP"
+          rm -f "$IMAGE"
