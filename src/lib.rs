@@ -35,6 +35,8 @@ pub mod disposable_prepared_template;
 /// Private, secret-safe command binding for one durably registered disposable guest runner.
 #[cfg(unix)]
 pub(crate) mod disposable_runner_runtime;
+/// Pure bounded diagnostic document for one controller-service failure.
+pub mod disposable_service_failure_receipt;
 pub mod disposable_template_generation;
 /// Same-lock bounded Lima supervisor for the disposable source-template lifecycle.
 #[cfg(unix)]
@@ -358,6 +360,8 @@ pub mod unix_personal_worker_store;
 /// Descriptor-bound private persistence for the resident-sandbox catalog.
 #[cfg(unix)]
 pub mod unix_resident_sandbox_store;
+/// Pure fixed repository verification command meanings for identity derivation and later execution.
+pub mod verification_command_semantics;
 /// Pure sealed cross-attempt verification-isolation compatibility.
 pub mod verification_isolation_referee;
 pub mod verification_profile;
