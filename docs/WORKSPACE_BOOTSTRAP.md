@@ -21,11 +21,11 @@ The canonical path is `./scripts/bootstrap`. Each adopting repository owns that 
 
 The current working directory must equal the resolved Git worktree root. Invocation from a parent directory, subdirectory, or unrelated worktree ends in `blocked`. The repository root must contain a `[package]` entry named `smolrunner` in `Cargo.toml` and a committed `Cargo.lock`.
 
-The package marker, receipt type, repository slug, and verification-profile names shown below are exact v1/transition identities. Preserve those `smolrunner` literals until their owning migration lanes introduce and classify successors.
+The workspace capability receipt is a Glaeda schema v2 identity. The package marker, repository slug, and verification-profile names shown below remain transition identities owned by separate migration lanes. Retained SmolRunner schema v1 receipt fixtures remain historical evidence.
 
 ## Accepted inputs
 
-Schema version 1 accepts only:
+Workspace receipt schema version 2 accepts only:
 
 - `--output human|json`, defaulting to `human`;
 - `--operation verify|commit|publish`, defaulting to `verify`.
@@ -119,12 +119,12 @@ The top-level `state` is exactly one of:
 
 ## Capability receipt schema
 
-Schema version 1 is a bounded object. The cache portion has this form:
+Schema version 2 is a bounded object. The cache portion has this form:
 
 ```json
 {
-  "schema_version": 1,
-  "receipt_type": "smolrunner-workspace-capability-receipt",
+  "schema_version": 2,
+  "receipt_type": "glaeda-workspace-capability-receipt",
   "state": "ready_with_declared_deviations",
   "operation": "verify",
   "repository_root": {
@@ -200,7 +200,7 @@ The field names `required_tools`, `optional_tools`, `verification_backends`, `fo
 
 ## Verification profile names
 
-Schema version 1 emits:
+Workspace receipt schema version 2 currently emits these transition profile identities:
 
 - `smolrunner.required` — the complete required suite in `AGENTS.md`;
 - `smolrunner.doctor` — the machine-readable doctor check;
