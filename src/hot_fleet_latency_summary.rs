@@ -367,9 +367,11 @@ mod tests {
                 upper_millis: None,
             }
         );
-        assert!(report
-            .render_human()
-            .contains("candidate final-result p90 range: unknown (0/2 windows)"));
+        assert!(
+            report
+                .render_human()
+                .contains("candidate final-result p90 range: unknown (0/2 windows)")
+        );
     }
 
     #[test]
