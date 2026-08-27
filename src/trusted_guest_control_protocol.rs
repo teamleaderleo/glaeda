@@ -9,6 +9,10 @@
 //! capabilities. The Mac invocation adapter must freshly re-confirm the owning resident or
 //! formatter state and installed guest binary immediately before spawn, and the Linux handler must
 //! prove operation-specific authority before doing any work.
+//!
+//! Protocol v3 is the Glaeda generation used for every fresh request. The explicit legacy v2
+//! decoder returns a separate inspection-only type so old SmolRunner traffic can be interpreted
+//! without becoming eligible for current encoding or execution.
 
 use std::fmt;
 
@@ -22,12 +26,17 @@ use crate::project_disk_lease::{
     ProjectDiskLeaseState, ProjectDiskRevision, ResidentSandboxGeneration, ResidentSandboxId,
 };
 
-pub const TRUSTED_GUEST_CONTROL_PROTOCOL_SCHEMA_VERSION: u8 = 2;
+pub const TRUSTED_GUEST_CONTROL_PROTOCOL_SCHEMA_VERSION: u8 = 3;
+pub const LEGACY_SMOLRUNNER_TRUSTED_GUEST_CONTROL_PROTOCOL_SCHEMA_VERSION: u8 = 2;
 pub const MAX_TRUSTED_GUEST_CONTROL_REQUEST_BYTES: usize = 4 * 1024;
 pub const MAX_TRUSTED_GUEST_CONTROL_RECEIPT_BYTES: usize = 2 * 1024;
 
-const REQUEST_DIGEST_DOMAIN: &[u8] = b"smolrunner-trusted-guest-control-request-v2\0";
-const AUTHORITY_DIGEST_DOMAIN: &[u8] = b"smolrunner-trusted-guest-control-authority-v2\0";
+const REQUEST_DIGEST_DOMAIN: &[u8] = b"glaeda-trusted-guest-control-request-v3\0";
+const AUTHORITY_DIGEST_DOMAIN: &[u8] = b"glaeda-trusted-guest-control-authority-v3\0";
+const LEGACY_SMOLRUNNER_REQUEST_DIGEST_DOMAIN: &[u8] =
+    b"smolrunner-trusted-guest-control-request-v2\0";
+const LEGACY_SMOLRUNNER_AUTHORITY_DIGEST_DOMAIN: &[u8] =
+    b"smolrunner-trusted-guest-control-authority-v2\0";
 const MAX_REQUEST_ID_BYTES: usize = 64;
 const SHA256_PREFIX: &str = "sha256:";
 const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -182,9 +191,6 @@ digest_claim!(TrustedGuestControlFormatterConfigClaim);
 digest_claim!(TrustedGuestControlAttachAuthorityClaim);
 
 /// Closed logical identity of the guest target selected by a sealed invocation capability.
-///
-/// This remains serialized claim data. Constructing or decoding it cannot create the private
-/// invocation target, resident capability, formatter capability, or any Lima authority.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TrustedGuestControlTargetIdentity {
@@ -280,11 +286,7 @@ impl TrustedGuestControlResidentAttachedProjectDiskAuthority {
     }
 }
 
-/// Purpose-typed authority claim carried by one protocol-v2 request.
-///
-/// The private variant data cannot be constructed by decoding a digest into an owner-side
-/// capability. Every constructor below only creates serialized request claims; the owning Mac
-/// state machine must revalidate the exact live lineage before invoking the sealed target.
+/// Purpose-typed authority claim carried by one trusted guest-control request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrustedGuestControlAuthority {
     target: TrustedGuestControlTargetIdentity,
@@ -378,9 +380,9 @@ impl TrustedGuestControlAuthority {
             TrustedGuestControlAuthorityVariant::ResidentSandbox { .. } => {
                 TrustedGuestControlAuthorityKind::ResidentSandbox
             }
-            TrustedGuestControlAuthorityVariant::ResidentPendingProjectDiskAttachment {
-                ..
-            } => TrustedGuestControlAuthorityKind::ResidentPendingProjectDiskAttachment,
+            TrustedGuestControlAuthorityVariant::ResidentPendingProjectDiskAttachment { .. } => {
+                TrustedGuestControlAuthorityKind::ResidentPendingProjectDiskAttachment
+            }
             TrustedGuestControlAuthorityVariant::ResidentAttachedProjectDisk(_) => {
                 TrustedGuestControlAuthorityKind::ResidentAttachedProjectDisk
             }
@@ -546,7 +548,8 @@ pub struct TrustedGuestControlRequest {
 }
 
 impl TrustedGuestControlRequest {
-    /// Construct one request only when the closed operation accepts the supplied authority kind.
+    /// Construct one current-generation request only when the closed operation accepts the supplied
+    /// authority kind.
     ///
     /// # Errors
     ///
@@ -593,6 +596,25 @@ impl TrustedGuestControlRequest {
     #[must_use]
     pub const fn payload_digest(&self) -> &Sha256Digest {
         &self.payload_digest
+    }
+}
+
+/// Canonically decoded SmolRunner protocol-v2 request retained only for old-generation inspection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacySmolRunnerTrustedGuestControlRequestV2 {
+    request: TrustedGuestControlRequest,
+    canonical: Vec<u8>,
+}
+
+impl LegacySmolRunnerTrustedGuestControlRequestV2 {
+    #[must_use]
+    pub const fn request(&self) -> &TrustedGuestControlRequest {
+        &self.request
+    }
+
+    #[must_use]
+    pub fn canonical_bytes(&self) -> &[u8] {
+        &self.canonical
     }
 }
 
@@ -658,6 +680,19 @@ impl TrustedGuestControlReceipt {
     }
 }
 
+/// Canonically decoded SmolRunner protocol-v2 receipt retained only for old-generation inspection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacySmolRunnerTrustedGuestControlReceiptV2 {
+    receipt: TrustedGuestControlReceipt,
+}
+
+impl LegacySmolRunnerTrustedGuestControlReceiptV2 {
+    #[must_use]
+    pub const fn receipt(&self) -> &TrustedGuestControlReceipt {
+        &self.receipt
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TrustedGuestControlProtocolErrorKind {
@@ -708,11 +743,7 @@ impl fmt::Display for TrustedGuestControlProtocolError {
 
 impl std::error::Error for TrustedGuestControlProtocolError {}
 
-/// Encode one strict compact request followed by a single newline.
-///
-/// # Errors
-///
-/// Returns a bounded error if serialization fails or the request exceeds its fixed byte limit.
+/// Encode one strict compact current-generation request followed by a single newline.
 pub fn encode_trusted_guest_control_request(
     request: &TrustedGuestControlRequest,
 ) -> Result<Vec<u8>, TrustedGuestControlProtocolError> {
@@ -721,13 +752,7 @@ pub fn encode_trusted_guest_control_request(
     Ok(bytes)
 }
 
-/// Encode the canonical request JSON body without a transport newline.
-///
-/// This is the exact nested object representation used by the protocol-v2 transaction frame.
-///
-/// # Errors
-///
-/// Returns a bounded error if serialization fails or the framed request would exceed its limit.
+/// Encode the canonical current-generation request JSON body without a transport newline.
 pub fn encode_trusted_guest_control_request_body(
     request: &TrustedGuestControlRequest,
 ) -> Result<Vec<u8>, TrustedGuestControlProtocolError> {
@@ -743,11 +768,7 @@ pub fn encode_trusted_guest_control_request_body(
     )
 }
 
-/// Decode one bounded canonical request without granting any execution authority.
-///
-/// # Errors
-///
-/// Returns a bounded error for oversized, malformed, unsupported, invalid, or noncanonical bytes.
+/// Decode one bounded canonical current-generation request without granting execution authority.
 pub fn decode_trusted_guest_control_request(
     bytes: &[u8],
 ) -> Result<TrustedGuestControlRequest, TrustedGuestControlProtocolError> {
@@ -758,16 +779,12 @@ pub fn decode_trusted_guest_control_request(
     decode_trusted_guest_control_request_body(body)
 }
 
-/// Decode one canonical request JSON body without granting execution authority.
-///
-/// # Errors
-///
-/// Returns a bounded error for oversized, malformed, unsupported, invalid, or noncanonical bytes.
+/// Decode one canonical current-generation request JSON body without granting execution authority.
 pub fn decode_trusted_guest_control_request_body(
     bytes: &[u8],
 ) -> Result<TrustedGuestControlRequest, TrustedGuestControlProtocolError> {
     require_size(bytes, MAX_TRUSTED_GUEST_CONTROL_REQUEST_BYTES - 1)?;
-    require_version(bytes)?;
+    require_version(bytes, TRUSTED_GUEST_CONTROL_PROTOCOL_SCHEMA_VERSION)?;
     let wire: RequestWire = serde_json::from_slice(bytes).map_err(|_| malformed())?;
     let request = request_from_wire(wire)?;
     if encode_trusted_guest_control_request_body(&request)? != bytes {
@@ -776,47 +793,82 @@ pub fn decode_trusted_guest_control_request_body(
     Ok(request)
 }
 
-/// Derive the domain-separated digest every terminal receipt must bind.
-///
-/// # Errors
-///
-/// Returns a bounded error if the request cannot be canonically encoded.
+/// Decode one exact canonical SmolRunner protocol-v2 request into an inspection-only value.
+pub fn decode_legacy_smolrunner_trusted_guest_control_request_v2(
+    bytes: &[u8],
+) -> Result<LegacySmolRunnerTrustedGuestControlRequestV2, TrustedGuestControlProtocolError> {
+    require_size(bytes, MAX_TRUSTED_GUEST_CONTROL_REQUEST_BYTES)?;
+    let Some(body) = bytes.strip_suffix(b"\n") else {
+        return Err(noncanonical());
+    };
+    require_version(
+        body,
+        LEGACY_SMOLRUNNER_TRUSTED_GUEST_CONTROL_PROTOCOL_SCHEMA_VERSION,
+    )?;
+    let wire: RequestWire = serde_json::from_slice(body).map_err(|_| malformed())?;
+    if canonical_json_body(&wire, MAX_TRUSTED_GUEST_CONTROL_REQUEST_BYTES - 1)? != body {
+        return Err(noncanonical());
+    }
+    let request = request_from_wire_for_schema(
+        wire,
+        LEGACY_SMOLRUNNER_TRUSTED_GUEST_CONTROL_PROTOCOL_SCHEMA_VERSION,
+    )?;
+    Ok(LegacySmolRunnerTrustedGuestControlRequestV2 {
+        request,
+        canonical: bytes.to_vec(),
+    })
+}
+
+/// Derive the Glaeda-v3 request digest every current terminal receipt must bind.
 pub fn trusted_guest_control_request_digest(
     request: &TrustedGuestControlRequest,
 ) -> Result<Sha256Digest, TrustedGuestControlProtocolError> {
-    let mut hasher = Sha256::new();
-    hasher.update(REQUEST_DIGEST_DOMAIN);
-    hasher.update(encode_trusted_guest_control_request(request)?);
-    raw_digest(&hasher.finalize())
+    digest_with_domain(
+        REQUEST_DIGEST_DOMAIN,
+        &encode_trusted_guest_control_request(request)?,
+    )
 }
 
-/// Derive the exact domain-separated identity of one complete serialized authority claim.
-///
-/// Operation payloads may carry this digest to bind the complete common authority without
-/// repeating every long textual field. The digest remains claim data and cannot recover an
-/// owner-side capability.
-///
-/// # Errors
-///
-/// Returns a bounded error if the authority cannot be canonically serialized.
+/// Recompute the exact historical SmolRunner-v2 digest of an explicitly decoded legacy request.
+pub fn legacy_smolrunner_trusted_guest_control_request_v2_digest(
+    request: &LegacySmolRunnerTrustedGuestControlRequestV2,
+) -> Result<Sha256Digest, TrustedGuestControlProtocolError> {
+    digest_with_domain(LEGACY_SMOLRUNNER_REQUEST_DIGEST_DOMAIN, &request.canonical)
+}
+
+/// Derive the exact Glaeda-v3 identity of one complete serialized authority claim.
 pub fn trusted_guest_control_authority_digest(
     authority: &TrustedGuestControlAuthority,
 ) -> Result<Sha256Digest, TrustedGuestControlProtocolError> {
+    authority_digest_with_domain(authority, AUTHORITY_DIGEST_DOMAIN)
+}
+
+/// Recompute the historical SmolRunner-v2 authority identity for old-generation inspection.
+pub fn legacy_smolrunner_trusted_guest_control_authority_v2_digest(
+    authority: &TrustedGuestControlAuthority,
+) -> Result<Sha256Digest, TrustedGuestControlProtocolError> {
+    authority_digest_with_domain(authority, LEGACY_SMOLRUNNER_AUTHORITY_DIGEST_DOMAIN)
+}
+
+fn authority_digest_with_domain(
+    authority: &TrustedGuestControlAuthority,
+    domain: &[u8],
+) -> Result<Sha256Digest, TrustedGuestControlProtocolError> {
     let bytes = serde_json::to_vec(&AuthorityWire::from(authority)).map_err(|_| malformed())?;
+    digest_with_domain(domain, &bytes)
+}
+
+fn digest_with_domain(
+    domain: &[u8],
+    bytes: &[u8],
+) -> Result<Sha256Digest, TrustedGuestControlProtocolError> {
     let mut hasher = Sha256::new();
-    hasher.update(AUTHORITY_DIGEST_DOMAIN);
+    hasher.update(domain);
     hasher.update(bytes);
     raw_digest(&hasher.finalize())
 }
 
-/// Encode one terminal outcome for an exact request.
-///
-/// Receipt bytes remain observation data until the later one-shot process adapter binds them to the
-/// verified spawned executable and performs fresh durable reconciliation.
-///
-/// # Errors
-///
-/// Returns a bounded error if serialization fails or the receipt exceeds its fixed byte limit.
+/// Encode one current-generation terminal outcome for an exact request.
 pub fn encode_trusted_guest_control_receipt(
     request: &TrustedGuestControlRequest,
     outcome: &TrustedGuestControlOutcome,
@@ -826,11 +878,7 @@ pub fn encode_trusted_guest_control_receipt(
     Ok(bytes)
 }
 
-/// Encode the canonical common receipt JSON body without a transport newline.
-///
-/// # Errors
-///
-/// Returns a bounded error if serialization fails or the framed receipt would exceed its limit.
+/// Encode the canonical current common receipt JSON body without a transport newline.
 pub fn encode_trusted_guest_control_receipt_body(
     request: &TrustedGuestControlRequest,
     outcome: &TrustedGuestControlOutcome,
@@ -848,12 +896,7 @@ pub fn encode_trusted_guest_control_receipt_body(
     canonical_json_body(&wire, MAX_TRUSTED_GUEST_CONTROL_RECEIPT_BYTES - 1)
 }
 
-/// Decode a terminal receipt only against the exact request that caused the guest transaction.
-///
-/// # Errors
-///
-/// Returns a bounded error for malformed/noncanonical bytes or any request, binary, operation, or
-/// request-digest mismatch.
+/// Decode a current terminal receipt only against the exact request that caused the transaction.
 pub fn decode_trusted_guest_control_receipt(
     bytes: &[u8],
     expected_request: &TrustedGuestControlRequest,
@@ -865,20 +908,15 @@ pub fn decode_trusted_guest_control_receipt(
     decode_trusted_guest_control_receipt_body(body, expected_request)
 }
 
-/// Decode a canonical common receipt JSON body against the exact originating request.
-///
-/// # Errors
-///
-/// Returns a bounded error for malformed/noncanonical bytes or any request, binary, operation, or
-/// request-digest mismatch.
+/// Decode a canonical current common receipt JSON body against the exact originating request.
 pub fn decode_trusted_guest_control_receipt_body(
     bytes: &[u8],
     expected_request: &TrustedGuestControlRequest,
 ) -> Result<TrustedGuestControlReceipt, TrustedGuestControlProtocolError> {
     require_size(bytes, MAX_TRUSTED_GUEST_CONTROL_RECEIPT_BYTES - 1)?;
-    require_version(bytes)?;
+    require_version(bytes, TRUSTED_GUEST_CONTROL_PROTOCOL_SCHEMA_VERSION)?;
     let wire: ReceiptWire = serde_json::from_slice(bytes).map_err(|_| malformed())?;
-    let receipt = receipt_from_wire(wire)?;
+    let receipt = receipt_from_wire_for_schema(wire, TRUSTED_GUEST_CONTROL_PROTOCOL_SCHEMA_VERSION)?;
     if receipt.request_id != expected_request.request_id
         || receipt.binary != expected_request.binary
         || receipt.operation != expected_request.operation
@@ -892,6 +930,39 @@ pub fn decode_trusted_guest_control_receipt_body(
     Ok(receipt)
 }
 
+/// Decode one exact SmolRunner protocol-v2 receipt against an explicitly decoded legacy request.
+pub fn decode_legacy_smolrunner_trusted_guest_control_receipt_v2(
+    bytes: &[u8],
+    expected_request: &LegacySmolRunnerTrustedGuestControlRequestV2,
+) -> Result<LegacySmolRunnerTrustedGuestControlReceiptV2, TrustedGuestControlProtocolError> {
+    require_size(bytes, MAX_TRUSTED_GUEST_CONTROL_RECEIPT_BYTES)?;
+    let Some(body) = bytes.strip_suffix(b"\n") else {
+        return Err(noncanonical());
+    };
+    require_version(
+        body,
+        LEGACY_SMOLRUNNER_TRUSTED_GUEST_CONTROL_PROTOCOL_SCHEMA_VERSION,
+    )?;
+    let wire: ReceiptWire = serde_json::from_slice(body).map_err(|_| malformed())?;
+    if canonical_json_body(&wire, MAX_TRUSTED_GUEST_CONTROL_RECEIPT_BYTES - 1)? != body {
+        return Err(noncanonical());
+    }
+    let receipt = receipt_from_wire_for_schema(
+        wire,
+        LEGACY_SMOLRUNNER_TRUSTED_GUEST_CONTROL_PROTOCOL_SCHEMA_VERSION,
+    )?;
+    let expected = expected_request.request();
+    if receipt.request_id != expected.request_id
+        || receipt.binary != expected.binary
+        || receipt.operation != expected.operation
+        || receipt.request_digest
+            != legacy_smolrunner_trusted_guest_control_request_v2_digest(expected_request)?
+    {
+        return Err(receipt_mismatch());
+    }
+    Ok(LegacySmolRunnerTrustedGuestControlReceiptV2 { receipt })
+}
+
 fn require_size(bytes: &[u8], limit: usize) -> Result<(), TrustedGuestControlProtocolError> {
     if bytes.len() > limit {
         return Err(too_large());
@@ -899,9 +970,12 @@ fn require_size(bytes: &[u8], limit: usize) -> Result<(), TrustedGuestControlPro
     Ok(())
 }
 
-fn require_version(bytes: &[u8]) -> Result<(), TrustedGuestControlProtocolError> {
+fn require_version(
+    bytes: &[u8],
+    expected: u8,
+) -> Result<(), TrustedGuestControlProtocolError> {
     let version: VersionWire = serde_json::from_slice(bytes).map_err(|_| malformed())?;
-    if version.schema_version != TRUSTED_GUEST_CONTROL_PROTOCOL_SCHEMA_VERSION {
+    if version.schema_version != expected {
         return Err(version_incompatible());
     }
     Ok(())
@@ -1250,7 +1324,14 @@ impl From<&TrustedGuestControlRequest> for RequestWire {
 fn request_from_wire(
     wire: RequestWire,
 ) -> Result<TrustedGuestControlRequest, TrustedGuestControlProtocolError> {
-    if wire.schema_version != TRUSTED_GUEST_CONTROL_PROTOCOL_SCHEMA_VERSION {
+    request_from_wire_for_schema(wire, TRUSTED_GUEST_CONTROL_PROTOCOL_SCHEMA_VERSION)
+}
+
+fn request_from_wire_for_schema(
+    wire: RequestWire,
+    expected_schema_version: u8,
+) -> Result<TrustedGuestControlRequest, TrustedGuestControlProtocolError> {
+    if wire.schema_version != expected_schema_version {
         return Err(version_incompatible());
     }
     TrustedGuestControlRequest::new(
@@ -1265,15 +1346,9 @@ fn request_from_wire(
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum OutcomeWire {
-    Succeeded {
-        result_digest: String,
-    },
-    Refused {
-        reason: TrustedGuestControlRefusal,
-    },
-    RecoveryRequired {
-        debt: TrustedGuestControlRecoveryDebt,
-    },
+    Succeeded { result_digest: String },
+    Refused { reason: TrustedGuestControlRefusal },
+    RecoveryRequired { debt: TrustedGuestControlRecoveryDebt },
 }
 
 impl From<&TrustedGuestControlOutcome> for OutcomeWire {
@@ -1315,10 +1390,11 @@ struct ReceiptWire {
     outcome: OutcomeWire,
 }
 
-fn receipt_from_wire(
+fn receipt_from_wire_for_schema(
     wire: ReceiptWire,
+    expected_schema_version: u8,
 ) -> Result<TrustedGuestControlReceipt, TrustedGuestControlProtocolError> {
-    if wire.schema_version != TRUSTED_GUEST_CONTROL_PROTOCOL_SCHEMA_VERSION {
+    if wire.schema_version != expected_schema_version {
         return Err(version_incompatible());
     }
     Ok(TrustedGuestControlReceipt {
@@ -1639,15 +1715,52 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v1_request_is_rejected_by_v2_decoder() {
+    fn current_v3_and_legacy_v2_are_separate_generation_surfaces() {
+        let current = encode_trusted_guest_control_request(&request()).unwrap();
+        let legacy = std::str::from_utf8(&current).unwrap().replacen(
+            "\"schema_version\":3",
+            "\"schema_version\":2",
+            1,
+        );
+        assert_eq!(
+            decode_trusted_guest_control_request(legacy.as_bytes())
+                .unwrap_err()
+                .kind(),
+            TrustedGuestControlProtocolErrorKind::VersionIncompatible
+        );
+        let decoded = decode_legacy_smolrunner_trusted_guest_control_request_v2(legacy.as_bytes())
+            .unwrap();
+        assert_eq!(decoded.request(), &request());
+        assert_eq!(decoded.canonical_bytes(), legacy.as_bytes());
+        assert_ne!(
+            legacy_smolrunner_trusted_guest_control_request_v2_digest(&decoded).unwrap(),
+            trusted_guest_control_request_digest(decoded.request()).unwrap()
+        );
+        assert_ne!(
+            legacy_smolrunner_trusted_guest_control_authority_v2_digest(
+                decoded.request().authority()
+            )
+            .unwrap(),
+            trusted_guest_control_authority_digest(decoded.request().authority()).unwrap()
+        );
+    }
+
+    #[test]
+    fn protocol_v1_request_is_rejected_by_current_and_legacy_decoders() {
         let bytes = encode_trusted_guest_control_request(&request()).unwrap();
         let v1 = std::str::from_utf8(&bytes).unwrap().replacen(
-            "\"schema_version\":2",
+            "\"schema_version\":3",
             "\"schema_version\":1",
             1,
         );
         assert_eq!(
             decode_trusted_guest_control_request(v1.as_bytes())
+                .unwrap_err()
+                .kind(),
+            TrustedGuestControlProtocolErrorKind::VersionIncompatible
+        );
+        assert_eq!(
+            decode_legacy_smolrunner_trusted_guest_control_request_v2(v1.as_bytes())
                 .unwrap_err()
                 .kind(),
             TrustedGuestControlProtocolErrorKind::VersionIncompatible
@@ -1675,8 +1788,8 @@ mod tests {
         let text = std::str::from_utf8(&bytes).unwrap();
 
         let unknown = text.replacen(
-            "\"schema_version\":2",
-            "\"schema_version\":2,\"extra\":true",
+            "\"schema_version\":3",
+            "\"schema_version\":3,\"extra\":true",
             1,
         );
         assert_eq!(
@@ -1686,7 +1799,7 @@ mod tests {
             TrustedGuestControlProtocolErrorKind::Malformed
         );
 
-        let future = text.replacen("\"schema_version\":2", "\"schema_version\":3", 1);
+        let future = text.replacen("\"schema_version\":3", "\"schema_version\":4", 1);
         assert_eq!(
             decode_trusted_guest_control_request(future.as_bytes())
                 .unwrap_err()
@@ -1804,6 +1917,46 @@ mod tests {
                 .unwrap_err()
                 .kind(),
             TrustedGuestControlProtocolErrorKind::ReceiptMismatch
+        );
+    }
+
+    #[test]
+    fn legacy_v2_receipt_requires_the_exact_legacy_request_digest() {
+        let current_request = request();
+        let current_request_bytes = encode_trusted_guest_control_request(&current_request).unwrap();
+        let legacy_request_bytes = std::str::from_utf8(&current_request_bytes)
+            .unwrap()
+            .replacen("\"schema_version\":3", "\"schema_version\":2", 1);
+        let legacy_request =
+            decode_legacy_smolrunner_trusted_guest_control_request_v2(legacy_request_bytes.as_bytes())
+                .unwrap();
+        let outcome = TrustedGuestControlOutcome::Succeeded {
+            result_digest: digest('d'),
+        };
+        let legacy_digest =
+            legacy_smolrunner_trusted_guest_control_request_v2_digest(&legacy_request).unwrap();
+        let wire = ReceiptWire {
+            schema_version: 2,
+            request_id: current_request.request_id().as_str().to_owned(),
+            binary: BinaryWire::from(current_request.binary()),
+            request_digest: legacy_digest.as_str().to_owned(),
+            operation: current_request.operation(),
+            outcome: OutcomeWire::from(&outcome),
+        };
+        let mut bytes = serde_json::to_vec(&wire).unwrap();
+        bytes.push(b'\n');
+        assert_eq!(
+            decode_legacy_smolrunner_trusted_guest_control_receipt_v2(&bytes, &legacy_request)
+                .unwrap()
+                .receipt()
+                .outcome(),
+            &outcome
+        );
+        assert_eq!(
+            decode_trusted_guest_control_receipt(&bytes, &current_request)
+                .unwrap_err()
+                .kind(),
+            TrustedGuestControlProtocolErrorKind::VersionIncompatible
         );
     }
 
