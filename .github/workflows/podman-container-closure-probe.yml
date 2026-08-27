@@ -60,6 +60,25 @@ jobs:
               provider-admission.err
           done
 
+          for mode in --image-install-probe --user-probe; do
+            for assignment in \
+              GLAEDA_PROBE_PROVIDER=github-hosted-ubuntu \
+              SMOLRUNNER_DISPOSABLE_PROBE=github-hosted-ubuntu; do
+              if sudo /usr/bin/env -i \
+                PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+                LC_ALL=C \
+                "$assignment" \
+                /usr/bin/bash scripts/test-podman-container-closure.sh "$mode" \
+                >submode-admission.out 2>submode-admission.err; then
+                printf 'error: provider identity unexpectedly admitted container submode: %s\n' "$mode" >&2
+                exit 1
+              fi
+              grep -Fx \
+                'error: disposable container probe requires the explicit dangerous integration gate' \
+                submode-admission.err
+            done
+          done
+
       - name: Install Ubuntu closure packages
         run: |
           while IFS= read -r source; do
