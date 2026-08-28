@@ -365,6 +365,7 @@ pub struct ResidentBackendComparisonSample {
     arm: ResidentBackendTreatmentArm,
     sample_class: ResidentBackendSampleClass,
     ordinal: u32,
+    treatment: ResidentBackendTreatmentIdentity,
     semantic_validation: ResidentBackendSemanticValidation,
     performance: HotExecutionPerformanceReceipt,
 }
@@ -377,6 +378,7 @@ impl ResidentBackendComparisonSample {
         position: ResidentBackendComparisonPosition,
         sample_class: ResidentBackendSampleClass,
         ordinal: u32,
+        observed_treatment: ResidentBackendTreatmentIdentity,
         semantic_validation: ResidentBackendSemanticValidation,
         performance: HotExecutionPerformanceReceipt,
     ) -> Result<Self, ResidentBackendComparisonError> {
@@ -384,6 +386,7 @@ impl ResidentBackendComparisonSample {
             return Err(invalid_sample_ordinal());
         }
         let arm = plan.scheduled_arm(block, position)?;
+        validate_treatment_binding(plan, arm, &observed_treatment)?;
         validate_performance_binding(plan, arm, &performance)?;
         validate_semantic_validation(sample_class, &semantic_validation, &performance)?;
         Ok(Self {
@@ -396,6 +399,7 @@ impl ResidentBackendComparisonSample {
             arm,
             sample_class,
             ordinal,
+            treatment: observed_treatment,
             semantic_validation,
             performance,
         })
@@ -439,6 +443,11 @@ impl ResidentBackendComparisonSample {
     #[must_use]
     pub const fn ordinal(&self) -> u32 {
         self.ordinal
+    }
+
+    #[must_use]
+    pub const fn treatment(&self) -> &ResidentBackendTreatmentIdentity {
+        &self.treatment
     }
 
     #[must_use]
@@ -516,6 +525,17 @@ fn validate_blocks(
         } else if block.first == block.second {
             return Err(invalid_crossover_schedule());
         }
+    }
+    Ok(())
+}
+
+fn validate_treatment_binding(
+    plan: &ResidentBackendComparisonPlan,
+    arm: ResidentBackendTreatmentArm,
+    observed: &ResidentBackendTreatmentIdentity,
+) -> Result<(), ResidentBackendComparisonError> {
+    if observed != plan.treatment(arm) {
+        return Err(treatment_identity_mismatch());
     }
     Ok(())
 }
@@ -635,6 +655,13 @@ const fn invalid_sample_ordinal() -> ResidentBackendComparisonError {
     error(
         "invalid_backend_sample_ordinal",
         "backend comparison sample ordinal is outside the bounded positive range",
+    )
+}
+
+const fn treatment_identity_mismatch() -> ResidentBackendComparisonError {
+    error(
+        "backend_sample_treatment_mismatch",
+        "observed backend treatment identity does not match the preregistered treatment",
     )
 }
 
@@ -891,6 +918,7 @@ mod tests {
             ResidentBackendComparisonPosition::Second,
             ResidentBackendSampleClass::ResidentTask,
             1,
+            plan.treatment_b().clone(),
             ResidentBackendSemanticValidation::Passed {
                 evidence_digest: validation_digest(),
             },
@@ -900,10 +928,40 @@ mod tests {
         assert_eq!(sample.arm(), ResidentBackendTreatmentArm::B);
         assert_eq!(sample.block(), 5);
         assert_eq!(sample.position(), ResidentBackendComparisonPosition::Second);
+        assert_eq!(sample.treatment(), plan.treatment_b());
         assert_eq!(
             sample.performance().identity().backend_id(),
             "apple-container-machine"
         );
+    }
+
+    #[test]
+    fn sample_refuses_generation_drift_even_when_coarse_receipt_identity_matches() {
+        let plan = plan();
+        let changed_generation = ResidentBackendTreatmentIdentity::new(
+            plan.treatment_b().candidate_id(),
+            plan.treatment_b().backend_id(),
+            "container-1.4.0",
+            plan.treatment_b().guest_image_generation(),
+            plan.treatment_b().kernel_generation(),
+            plan.treatment_b().host_class(),
+            plan.treatment_b().resource_profile(),
+            plan.treatment_b().storage_policy_generation(),
+            plan.treatment_b().network_policy_generation(),
+        )
+        .unwrap();
+        let error = ResidentBackendComparisonSample::new(
+            &plan,
+            5,
+            ResidentBackendComparisonPosition::Second,
+            ResidentBackendSampleClass::ResidentTask,
+            1,
+            changed_generation,
+            ResidentBackendSemanticValidation::Failed,
+            performance(plan.treatment_b()),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "backend_sample_treatment_mismatch");
     }
 
     #[test]
@@ -915,6 +973,7 @@ mod tests {
             ResidentBackendComparisonPosition::Second,
             ResidentBackendSampleClass::ResidentTask,
             1,
+            plan.treatment_b().clone(),
             ResidentBackendSemanticValidation::Failed,
             performance(plan.treatment_a()),
         )
@@ -931,6 +990,7 @@ mod tests {
             ResidentBackendComparisonPosition::First,
             ResidentBackendSampleClass::ResidentCanary,
             1,
+            plan.treatment_a().clone(),
             ResidentBackendSemanticValidation::Passed {
                 evidence_digest: validation_digest(),
             },
@@ -945,6 +1005,7 @@ mod tests {
             ResidentBackendComparisonPosition::First,
             ResidentBackendSampleClass::ResidentTask,
             2,
+            plan.treatment_a().clone(),
             ResidentBackendSemanticValidation::NotApplicable,
             performance(plan.treatment_a()),
         )
@@ -978,6 +1039,7 @@ mod tests {
             ResidentBackendComparisonPosition::First,
             ResidentBackendSampleClass::ResidentTask,
             9,
+            plan.treatment_b().clone(),
             ResidentBackendSemanticValidation::Passed {
                 evidence_digest: validation_digest(),
             },
@@ -999,5 +1061,6 @@ mod tests {
         }
         assert!(first.contains("\"authority\": \"observation_only\""));
         assert!(first.contains("\"sample_class\": \"resident_task\""));
+        assert!(first.contains("\"backend_generation\": \"container-1.3.0\""));
     }
 }
