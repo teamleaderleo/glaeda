@@ -10,7 +10,7 @@ The top-level product test is:
 
 ## The common execution loop
 
-A workload arrives with typed identity, trust, inputs, capability requirements, resource requirements, and an output/evidence contract.
+A workload arrives with typed semantic identity, trust, exact inputs, declarative capability requirements, and an output/evidence contract. A physical execution request separately supplies the resource requirements needed for one attempt.
 
 ```text
 work becomes known
@@ -58,7 +58,7 @@ The common runtime should consume exact typed facts from those adapters without 
 
 ## Generic workload seam
 
-The first generic seam should stay small and bounded. A conceptual model is:
+The first generic seam should stay small and bounded. The merged `ComputeWorkloadIdentity` contract and the separate physical-attempt direction use this split:
 
 ```text
 ComputeWorkloadIdentity
@@ -66,12 +66,12 @@ ComputeWorkloadIdentity
   semantic generation / intent generation
   exact input identity
   trust class
-  capability requirements
-  resource envelope
+  declarative semantic capability requirements
   output/evidence contract
 
 ExecutionAttempt
   request / attempt generation
+  requested / admitted resource envelope
   capacity claim
   selected host/backend
   admitted reusable-state capabilities
@@ -79,12 +79,14 @@ ExecutionAttempt
   lifecycle / settlement state
 ```
 
-The exact Rust names can evolve. The semantic split is the important part:
+The exact physical-attempt Rust names can evolve. The semantic split is the important part:
 
 - workload identity describes **what useful computation is requested**;
 - execution attempt describes **one physical attempt to perform it**;
 - result authority comes from the workload contract;
 - physical execution authority comes from runtime admission and ownership.
+
+Concrete resource sizing is therefore not part of `ComputeWorkloadIdentity` by default. The same semantic workload may run in separate attempts with different reviewed CPU, RAM, storage, or concurrency envelopes without becoming different requested work. A workload-family adapter should include a hardware/runtime capability in semantic identity only when that capability changes the requested or accepted result rather than merely how the runtime executes it.
 
 A successful process exit alone carries only the meaning granted by its workload adapter. Verification evidence, rendered artifacts, datasets, model outputs, benchmarks, and service state each have their own acceptance rules.
 
@@ -140,7 +142,9 @@ Each family owns its own validity proof. Glaeda supplies the common admission, l
 
 ## Compute resources
 
-CPU, memory, storage, PIDs, network, accelerators, and backend-specific capabilities belong in the resource/capability model as the implementation grows.
+Concrete CPU, memory, storage, PID, network, accelerator, and backend sizing belongs to physical request/admission and resource ownership. It can vary across attempts while the semantic workload identity remains unchanged.
+
+`ComputeWorkloadIdentity.required_capabilities` is narrower: it carries bounded declarative equality keys that the workload family says are required for the requested semantics. For example, a family may require a particular accelerator/runtime capability when it changes acceptable computation, while an ordinary choice between 4 and 8 CPUs remains an execution-envelope decision.
 
 A workload can request only what its adapter and policy allow. The runtime admits work against exact current capacity and preserves resource ownership until the responsible lifecycle owner proves release.
 
@@ -189,12 +193,12 @@ A better backend should improve Glaeda without redefining the workload, trust, o
 
 ## Current coupling audit
 
-Two existing seams deserve early attention before broader implementation:
+The first generic workload seam has now landed, while two composition seams still deserve attention before broader refactoring:
 
-1. `ExecutionAdmissionIdentity` is broadly named while currently embedding `VerificationProfileId` and `RunnerProfileId`. Reservation, capacity, queueing, draining, and lifecycle semantics are substantially more general than verification.
-2. hot-state admission has reusable family/binding/lease/capability concepts while `HotStateAdmissionTarget` currently embeds `ProjectIdentity` and its semantic inputs assume source/toolchain/profile/validator language.
+1. `ComputeWorkloadIdentity` is workload-family-neutral and deliberately separate from physical attempt/capacity state. Existing `ExecutionAdmissionIdentity` still embeds `VerificationProfileId` and `RunnerProfileId`, so repository verification has not yet been adapted onto the generic semantic identity at that admission boundary.
+2. hot-state admission has reusable family/binding/lease/capability concepts while `HotStateAdmissionTarget` still embeds `ProjectIdentity` and repository-oriented source/toolchain/profile/validator semantics.
 
-The preferred direction is a narrow generic workload/owner identity above those kernels, with repository verification mapped through an adapter. Durable/versioned identities stay unchanged until their owning migration explicitly introduces a successor.
+The preferred direction remains a narrow generic workload/owner identity above those kernels, with repository verification mapped through an adapter. Durable/versioned identities stay unchanged until their owning migration explicitly introduces a successor.
 
 ## First implementation proof
 
@@ -213,7 +217,7 @@ family: dataset_transform
 input generation: exact dataset digest
 transform generation: exact reviewed transform identity
 runtime generation: exact tool/runtime identity
-resources: bounded CPU/RAM/storage
+attempt resources: bounded CPU/RAM/storage
 result: immutable output digest + workload-specific validation evidence
 ```
 
@@ -232,8 +236,9 @@ Work under #770 should:
 1. update root/current product prose so compute is the outer domain;
 2. retain agent- and GitHub-specific metrics in the workload sections where they belong;
 3. audit general execution/admission/capacity/isolation/hot-state/lifecycle types for accidental repository or verification coupling;
-4. specify one bounded workload identity/intent seam before broad type renames;
-5. prove repository verification plus one non-repository workload through that seam;
+4. keep semantic workload identity separate from concrete execution resource sizing and physical-attempt identity;
+5. prove repository verification plus one non-repository workload through the generic seam;
 6. preserve exact old schema, digest, receipt, runtime, and recovery identities until explicit successor work owns them.
 
 Related direction: #750, #764, #765, #761, #762, #769, #547, #548.
+
