@@ -8,9 +8,7 @@ use std::fmt;
 use serde::Serialize;
 
 use crate::artifact::Sha256Digest;
-use crate::hot_execution_performance::{
-    HotExecutionPerformanceReceipt, HotExecutionResultClass,
-};
+use crate::hot_execution_performance::{HotExecutionPerformanceReceipt, HotExecutionResultClass};
 
 pub const RESIDENT_BACKEND_COMPARISON_SCHEMA_VERSION: u8 = 1;
 pub const REQUIRED_AA_NOISE_BLOCKS: usize = 4;
@@ -119,9 +117,7 @@ impl ResidentBackendTreatmentIdentity {
             candidate_id: ResidentBackendComparisonToken::parse(candidate_id)?,
             backend_id: ResidentBackendComparisonToken::parse(backend_id)?,
             backend_generation: ResidentBackendComparisonToken::parse(backend_generation)?,
-            guest_image_generation: ResidentBackendComparisonToken::parse(
-                guest_image_generation,
-            )?,
+            guest_image_generation: ResidentBackendComparisonToken::parse(guest_image_generation)?,
             kernel_generation: ResidentBackendComparisonToken::parse(kernel_generation)?,
             host_class: ResidentBackendComparisonToken::parse(host_class)?,
             resource_profile: ResidentBackendComparisonToken::parse(resource_profile)?,
@@ -216,7 +212,10 @@ impl ResidentBackendComparisonBlock {
         self.second
     }
 
-    const fn arm_at(self, position: ResidentBackendComparisonPosition) -> ResidentBackendTreatmentArm {
+    const fn arm_at(
+        self,
+        position: ResidentBackendComparisonPosition,
+    ) -> ResidentBackendTreatmentArm {
         match position {
             ResidentBackendComparisonPosition::First => self.first,
             ResidentBackendComparisonPosition::Second => self.second,
@@ -548,13 +547,11 @@ fn validate_semantic_validation(
 ) -> Result<(), ResidentBackendComparisonError> {
     match (sample_class, validation) {
         (
-            ResidentBackendSampleClass::StoppedCanary
-            | ResidentBackendSampleClass::ResidentCanary,
+            ResidentBackendSampleClass::StoppedCanary | ResidentBackendSampleClass::ResidentCanary,
             ResidentBackendSemanticValidation::NotApplicable,
         ) => Ok(()),
         (
-            ResidentBackendSampleClass::StoppedCanary
-            | ResidentBackendSampleClass::ResidentCanary,
+            ResidentBackendSampleClass::StoppedCanary | ResidentBackendSampleClass::ResidentCanary,
             _,
         ) => Err(canary_validation_mismatch()),
         (
@@ -566,7 +563,10 @@ fn validate_semantic_validation(
             ResidentBackendSemanticValidation::Passed { .. },
         ) => {
             if performance.result() != HotExecutionResultClass::Succeeded
-                || performance.milestones().final_relevant_result_millis().is_none()
+                || performance
+                    .milestones()
+                    .final_relevant_result_millis()
+                    .is_none()
             {
                 return Err(task_validation_result_mismatch());
             }
@@ -578,10 +578,7 @@ fn validate_semantic_validation(
     }
 }
 
-const fn error(
-    code: &'static str,
-    message: &'static str,
-) -> ResidentBackendComparisonError {
+const fn error(code: &'static str, message: &'static str) -> ResidentBackendComparisonError {
     ResidentBackendComparisonError { code, message }
 }
 
@@ -759,9 +756,7 @@ mod tests {
         .unwrap()
     }
 
-    fn performance(
-        treatment: &ResidentBackendTreatmentIdentity,
-    ) -> HotExecutionPerformanceReceipt {
+    fn performance(treatment: &ResidentBackendTreatmentIdentity) -> HotExecutionPerformanceReceipt {
         let identity = HotExecutionPerformanceIdentity::new(
             "quarry-pr-check",
             "quarry",
@@ -905,7 +900,10 @@ mod tests {
         assert_eq!(sample.arm(), ResidentBackendTreatmentArm::B);
         assert_eq!(sample.block(), 5);
         assert_eq!(sample.position(), ResidentBackendComparisonPosition::Second);
-        assert_eq!(sample.performance().identity().backend_id(), "apple-container-machine");
+        assert_eq!(
+            sample.performance().identity().backend_id(),
+            "apple-container-machine"
+        );
     }
 
     #[test]
