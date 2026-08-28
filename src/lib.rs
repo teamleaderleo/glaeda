@@ -291,10 +291,10 @@ pub mod renderprove_protected_mount;
 pub mod renderprove_verification;
 pub mod renderprove_vision_profile;
 pub mod renderprove_vision_result;
-/// Pure repository-verification adapter into generic compute workload semantics.
-pub mod repository_verification_compute_workload;
 /// Credentialless, bounded observation of one immutable reviewed repository source.
 pub mod repository_source_observation;
+/// Pure repository-verification adapter into generic compute workload semantics.
+pub mod repository_verification_compute_workload;
 /// Pure, authority-free resident-sandbox generation/config/locator catalog and strict codec.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod resident_sandbox_catalog;
