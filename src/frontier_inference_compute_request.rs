@@ -10,7 +10,7 @@ use serde::Serialize;
 
 use crate::compute_execution_request::ComputeExecutionRequest;
 use crate::execution_admission::ExecutionRequestId;
-use crate::execution_capacity::{CapacityAmounts, CapacityDimension};
+use crate::execution_capacity::CapacityAmounts;
 use crate::frontier_inference_workload::{
     FrontierHostToolPhase, FrontierInferenceWorkloadReceiptV1,
 };
@@ -76,7 +76,8 @@ pub fn frontier_inference_compute_execution_request(
     request_id: ExecutionRequestId,
     receipt: &FrontierInferenceWorkloadReceiptV1,
 ) -> Result<ComputeExecutionRequest, FrontierInferenceComputeRequestError> {
-    let requested_resources = frontier_inference_host_resource_envelope(receipt.host_tool_phases())?;
+    let requested_resources =
+        frontier_inference_host_resource_envelope(receipt.host_tool_phases())?;
     Ok(ComputeExecutionRequest::new(
         request_id,
         receipt.workload().clone(),
@@ -117,15 +118,19 @@ impl std::error::Error for FrontierInferenceComputeRequestError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::execution_capacity::CapacityDimension;
     use crate::frontier_inference_workload::{
-        frontier_inference_synthetic_sensitivity_fixtures, FrontierHostToolPhaseKind,
+        FrontierHostToolPhaseKind, frontier_inference_synthetic_sensitivity_fixtures,
     };
 
     fn demand(entries: &[(CapacityDimension, u64)]) -> CapacityAmounts {
         CapacityAmounts::new(entries).unwrap()
     }
 
-    fn phase(kind: FrontierHostToolPhaseKind, entries: &[(CapacityDimension, u64)]) -> FrontierHostToolPhase {
+    fn phase(
+        kind: FrontierHostToolPhaseKind,
+        entries: &[(CapacityDimension, u64)],
+    ) -> FrontierHostToolPhase {
         FrontierHostToolPhase::new(kind, 1_000, demand(entries)).unwrap()
     }
 
