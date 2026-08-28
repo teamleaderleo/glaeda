@@ -138,11 +138,8 @@ mod tests {
         let command_a = RepositoryCommandId::parse("glaeda-rust-test-v1").unwrap();
         let command_b = RepositoryCommandId::parse("glaeda-rust-test-v2").unwrap();
 
-        let base = repository_verification_compute_input_identity(
-            &source_a,
-            &profile_a,
-            &command_a,
-        );
+        let base =
+            repository_verification_compute_input_identity(&source_a, &profile_a, &command_a);
         assert_ne!(
             base,
             repository_verification_compute_input_identity(&source_b, &profile_a, &command_a)
