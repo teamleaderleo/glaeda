@@ -142,11 +142,13 @@ mod tests {
         assert!(ComputeCapabilityId::parse("TOKEN=secret").is_err());
 
         assert!(CapacityAmounts::new(&[]).is_err());
-        assert!(CapacityAmounts::new(&[
-            (CapacityDimension::CpuMillis, 1),
-            (CapacityDimension::CpuMillis, 2),
-        ])
-        .is_err());
+        assert!(
+            CapacityAmounts::new(&[
+                (CapacityDimension::CpuMillis, 1),
+                (CapacityDimension::CpuMillis, 2),
+            ])
+            .is_err()
+        );
     }
 
     #[test]
@@ -253,11 +255,7 @@ mod tests {
         let object = value.as_object().unwrap();
         assert_eq!(
             object.keys().map(String::as_str).collect::<Vec<_>>(),
-            vec![
-                "request_id",
-                "runner_profile_id",
-                "verification_profile_id"
-            ]
+            vec!["request_id", "runner_profile_id", "verification_profile_id"]
         );
         assert!(!object.contains_key("workload"));
         assert!(!object.contains_key("requested_resources"));
