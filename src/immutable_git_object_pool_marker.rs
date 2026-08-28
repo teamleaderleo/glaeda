@@ -16,8 +16,7 @@ const DIGEST_START: usize = 16;
 const NONCE_START: usize = 48;
 const SMOLRUNNER_V1_BINDING_DIGEST_DOMAIN: &[u8] =
     b"smolrunner-immutable-git-object-pool-binding-v1\0";
-const GLAEDA_V2_BINDING_DIGEST_DOMAIN: &[u8] =
-    b"glaeda-immutable-git-object-pool-binding-v2\0";
+const GLAEDA_V2_BINDING_DIGEST_DOMAIN: &[u8] = b"glaeda-immutable-git-object-pool-binding-v2\0";
 const SMOLRUNNER_V1_PHYSICAL_AUDIT_IDENTITY_DOMAIN: &[u8] =
     b"smolrunner-immutable-git-pool-audit-physical-v1\0";
 const GLAEDA_V2_PHYSICAL_AUDIT_IDENTITY_DOMAIN: &[u8] =
@@ -654,17 +653,19 @@ mod tests {
     fn exact_smolrunner_v1_marker_fixture_round_trips_byte_for_byte() {
         let binding = base_binding();
         let expected = [
-            83, 77, 79, 76, 71, 79, 80, 49, 1, 0, 0, 0, 0, 0, 0, 0, 118, 236, 235, 75, 164,
-            229, 107, 243, 50, 192, 164, 239, 119, 99, 31, 166, 30, 163, 29, 188, 206, 21, 145,
-            102, 169, 207, 203, 27, 163, 85, 109, 27, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
-            7, 7, 7,
+            83, 77, 79, 76, 71, 79, 80, 49, 1, 0, 0, 0, 0, 0, 0, 0, 118, 236, 235, 75, 164, 229,
+            107, 243, 50, 192, 164, 239, 119, 99, 31, 166, 30, 163, 29, 188, 206, 21, 145, 102,
+            169, 207, 203, 27, 163, 85, 109, 27, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
         ];
         let marker = ImmutableGitObjectPoolMarker::new(
             &binding,
             GitObjectPoolMarkerNonce::new([7; 16]).unwrap(),
         )
         .unwrap();
-        assert_eq!(marker.generation(), ImmutableGitObjectPoolIdentityGeneration::SmolrunnerV1);
+        assert_eq!(
+            marker.generation(),
+            ImmutableGitObjectPoolIdentityGeneration::SmolrunnerV1
+        );
         assert_eq!(marker.encode().unwrap(), expected);
 
         let decoded = ImmutableGitObjectPoolMarker::decode_and_verify(&expected, &binding).unwrap();
