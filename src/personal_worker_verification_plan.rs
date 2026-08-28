@@ -665,11 +665,9 @@ fn verification_cache_generation(
             SMOLRUNNER_V1_REPOSITORY,
             SMOLRUNNER_V1_DOCTOR_COMMAND_ID,
         )
-        | (
-            SMOLRUNNER_PLAN_PROFILE_ID,
-            SMOLRUNNER_V1_REPOSITORY,
-            SMOLRUNNER_V1_PLAN_COMMAND_ID,
-        ) => Ok(VerificationCacheGeneration::SmolrunnerV1),
+        | (SMOLRUNNER_PLAN_PROFILE_ID, SMOLRUNNER_V1_REPOSITORY, SMOLRUNNER_V1_PLAN_COMMAND_ID) => {
+            Ok(VerificationCacheGeneration::SmolrunnerV1)
+        }
         _ => Err(profile_mismatch()),
     }
 }
@@ -1167,9 +1165,18 @@ mod tests {
     fn checked_in_profiles_select_exact_cache_generation_and_refuse_cross_commands() {
         let registry = smolrunner_profile_registry().expect("registry");
         for (profile_id, expected) in [
-            (GLAEDA_REQUIRED_PROFILE_ID, VerificationCacheGeneration::GlaedaV2),
-            (GLAEDA_DOCTOR_PROFILE_ID, VerificationCacheGeneration::GlaedaV2),
-            (GLAEDA_PLAN_PROFILE_ID, VerificationCacheGeneration::GlaedaV2),
+            (
+                GLAEDA_REQUIRED_PROFILE_ID,
+                VerificationCacheGeneration::GlaedaV2,
+            ),
+            (
+                GLAEDA_DOCTOR_PROFILE_ID,
+                VerificationCacheGeneration::GlaedaV2,
+            ),
+            (
+                GLAEDA_PLAN_PROFILE_ID,
+                VerificationCacheGeneration::GlaedaV2,
+            ),
             (
                 SMOLRUNNER_REQUIRED_PROFILE_ID,
                 VerificationCacheGeneration::SmolrunnerV1,
@@ -1233,7 +1240,13 @@ mod tests {
 
     #[test]
     fn cache_subnamespace_generations_are_pinned_deterministic_and_field_framed() {
-        let fields = &[b"parent".as_slice(), b"repo", b"commit", b"tree", b"command"];
+        let fields = &[
+            b"parent".as_slice(),
+            b"repo",
+            b"commit",
+            b"tree",
+            b"command",
+        ];
         let old_source = digest_namespace_fields(
             VerificationCacheGeneration::SmolrunnerV1.source_command_domain(),
             fields,
@@ -1269,10 +1282,10 @@ mod tests {
             &[b"parent", b"repo", b"commit", b"tree", b"different-command"],
         )
         .expect("changed command digest");
-        let left = digest_namespace_fields(b"test-cache-domain-v1", &[b"ab", b"c"])
-            .expect("left digest");
-        let right = digest_namespace_fields(b"test-cache-domain-v1", &[b"a", b"bc"])
-            .expect("right digest");
+        let left =
+            digest_namespace_fields(b"test-cache-domain-v1", &[b"ab", b"c"]).expect("left digest");
+        let right =
+            digest_namespace_fields(b"test-cache-domain-v1", &[b"a", b"bc"]).expect("right digest");
         assert_eq!(new_source, replay);
         assert_ne!(new_source, changed_tree);
         assert_ne!(new_source, changed_command);
