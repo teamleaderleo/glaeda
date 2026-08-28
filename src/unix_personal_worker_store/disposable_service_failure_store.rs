@@ -10,6 +10,13 @@ use crate::disposable_service_failure_receipt::{
 
 pub(super) const FAILURE_RECEIPT_DOCUMENT: &str = "disposable-service-failure.json";
 pub(super) const STAGED_FAILURE_RECEIPT_DOCUMENT: &str = ".disposable-service-failure.next.json";
+#[cfg(test)]
+const CLEANUP_REPLACEMENT_STAGE_DOCUMENT: &str = ".disposable-service-failure.cleanup-race.json";
+
+#[cfg(test)]
+std::thread_local! {
+    static REPLACE_BEFORE_CLEANUP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DisposableServiceFailureStoreRecoveryReason {
@@ -404,10 +411,27 @@ impl UnixPersonalWorkerStore {
         Ok(())
     }
 
+    #[cfg(test)]
+    fn maybe_replace_cleanup_target(
+        &self,
+        exact: &ExactReceiptFile,
+    ) -> Result<(), PersonalWorkerStoreError> {
+        let replace = REPLACE_BEFORE_CLEANUP.with(|flag| flag.replace(false));
+        if !replace {
+            return Ok(());
+        }
+        let encoded = exact.receipt.canonical_json();
+        let mut replacement =
+            self.stage_named_bytes(CLEANUP_REPLACEMENT_STAGE_DOCUMENT, &encoded)?;
+        self.publish_named_staged(&mut replacement, exact.slot.name(), false)
+    }
+
     fn rebind_exact_failure_receipt_for_unlink(
         &self,
         exact: &ExactReceiptFile,
     ) -> Result<OwnedFd, PersonalWorkerStoreError> {
+        #[cfg(test)]
+        self.maybe_replace_cleanup_target(exact)?;
         let rebound = match fs::openat(
             &self.directory,
             exact.slot.name(),
@@ -462,6 +486,24 @@ impl UnixPersonalWorkerStore {
         fs::unlinkat(&self.directory, exact.slot.name(), AtFlags::empty())
             .map_err(|_| io_store("could not remove the disposable service failure receipt"))?;
         synchronize_failure_receipt_directory(self)
+    }
+}
+
+#[cfg(test)]
+struct CleanupReplacementFaultGuard;
+
+#[cfg(test)]
+fn inject_cleanup_replacement() -> CleanupReplacementFaultGuard {
+    REPLACE_BEFORE_CLEANUP.with(|flag| {
+        assert!(!flag.replace(true), "cleanup replacement fault already injected");
+    });
+    CleanupReplacementFaultGuard
+}
+
+#[cfg(test)]
+impl Drop for CleanupReplacementFaultGuard {
+    fn drop(&mut self) {
+        REPLACE_BEFORE_CLEANUP.with(|flag| flag.set(false));
     }
 }
 
@@ -594,6 +636,11 @@ mod tests {
             .expect("open store directory")
             .sync_all()
             .expect("sync store directory");
+    }
+
+    fn inode(path: &Path) -> u64 {
+        let file = File::open(path).expect("open retained receipt for identity");
+        rustix::fs::fstat(&file).expect("inspect retained receipt identity").st_ino
     }
 
     fn version_two_bytes() -> Vec<u8> {
@@ -973,6 +1020,52 @@ mod tests {
             store.inspect_disposable_service_failure_store().unwrap(),
             DisposableServiceFailureStoreInspection::Missing
         );
+    }
+
+    #[test]
+    fn replacement_drift_before_clear_is_refused_and_substitute_is_preserved() {
+        let root = TempRoot::new("clear-replacement-drift");
+        let mut store = open_store(&root);
+        let current = receipt(1, "failure");
+        let bytes = current.canonical_json();
+        store
+            .replace_disposable_service_failure_receipt(&current)
+            .unwrap();
+        let path = root.store_path(FAILURE_RECEIPT_DOCUMENT);
+        let original_inode = inode(&path);
+
+        let _fault = inject_cleanup_replacement();
+        let error = store
+            .clear_disposable_service_failure_receipt()
+            .expect_err("same-content replacement before cleanup must be refused");
+        assert_eq!(error.kind(), PersonalWorkerStoreErrorKind::RevisionConflict);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_ne!(inode(&path), original_inode);
+        assert!(!root.store_path(CLEANUP_REPLACEMENT_STAGE_DOCUMENT).exists());
+    }
+
+    #[test]
+    fn replacement_drift_before_duplicate_stage_cleanup_is_refused_and_preserved() {
+        let root = TempRoot::new("duplicate-replacement-drift");
+        let mut store = open_store(&root);
+        let current = receipt(2, "failure");
+        store
+            .replace_disposable_service_failure_receipt(&current)
+            .unwrap();
+        let bytes = current.canonical_json();
+        write_slot(&root, ReceiptSlot::Staged, &bytes);
+        let stage_path = root.store_path(STAGED_FAILURE_RECEIPT_DOCUMENT);
+        let original_inode = inode(&stage_path);
+
+        let _fault = inject_cleanup_replacement();
+        let error = store
+            .recover_disposable_service_failure_store()
+            .expect_err("same-content staged replacement before cleanup must be refused");
+        assert_eq!(error.kind(), PersonalWorkerStoreErrorKind::RevisionConflict);
+        assert_eq!(fs::read(&stage_path).unwrap(), bytes);
+        assert_ne!(inode(&stage_path), original_inode);
+        assert!(root.store_path(FAILURE_RECEIPT_DOCUMENT).is_file());
+        assert!(!root.store_path(CLEANUP_REPLACEMENT_STAGE_DOCUMENT).exists());
     }
 
     #[test]
