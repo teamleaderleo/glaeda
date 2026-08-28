@@ -14,16 +14,45 @@ use crate::personal_worker_queue::{
 };
 use crate::verification_profile::VerificationProfileId;
 
-pub const OPERATOR_CONFIG_SCHEMA_VERSION: u8 = 1;
+pub const SMOLRUNNER_OPERATOR_CONFIG_SCHEMA_VERSION: u8 = 1;
+pub const GLAEDA_OPERATOR_CONFIG_SCHEMA_VERSION: u8 = 2;
+/// Transitional schema used by the existing `OperatorConfig::new` constructor and current durable
+/// personal-worker consumers until the fresh Glaeda config/runtime cutover composes v2.
+pub const OPERATOR_CONFIG_SCHEMA_VERSION: u8 = SMOLRUNNER_OPERATOR_CONFIG_SCHEMA_VERSION;
 pub const MAX_OPERATOR_CONFIG_PATH_BYTES: usize = 1_024;
 pub const MAX_OPERATOR_CONFIG_DOCUMENT_BYTES: usize = 16_384;
 pub const MAX_OPERATOR_IDLE_MILLIS: u64 = 7 * 24 * 60 * 60 * 1_000;
 
-const OPERATOR_CONFIG_IDENTITY_DOCUMENT_TYPE: &str = "smolrunner_operator_config";
+const SMOLRUNNER_OPERATOR_CONFIG_IDENTITY_DOCUMENT_TYPE: &str = "smolrunner_operator_config";
+const GLAEDA_OPERATOR_CONFIG_IDENTITY_DOCUMENT_TYPE: &str = "glaeda_operator_config";
 const SHA256_PREFIX: &str = "sha256:";
 const HEX: &[u8; 16] = b"0123456789abcdef";
 const REDACTED_STATE_ROOT: &str = "<private-personal-worker-state-root>";
 const REDACTED_GUEST_WORKSPACE: &str = "<private-guest-workspace-path>";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorConfigGeneration {
+    SmolrunnerV1,
+    GlaedaV2,
+}
+
+impl OperatorConfigGeneration {
+    #[must_use]
+    pub const fn schema_version(self) -> u8 {
+        match self {
+            Self::SmolrunnerV1 => SMOLRUNNER_OPERATOR_CONFIG_SCHEMA_VERSION,
+            Self::GlaedaV2 => GLAEDA_OPERATOR_CONFIG_SCHEMA_VERSION,
+        }
+    }
+
+    const fn identity_document_type(self) -> &'static str {
+        match self {
+            Self::SmolrunnerV1 => SMOLRUNNER_OPERATOR_CONFIG_IDENTITY_DOCUMENT_TYPE,
+            Self::GlaedaV2 => GLAEDA_OPERATOR_CONFIG_IDENTITY_DOCUMENT_TYPE,
+        }
+    }
+}
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct PersonalWorkerStateRoot(PathBuf);
@@ -169,11 +198,18 @@ impl OperatorIdlePolicy {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct OperatorConfigIdentity {
+    #[serde(skip)]
+    generation: OperatorConfigGeneration,
     schema_version: u8,
     digest: Sha256Digest,
 }
 
 impl OperatorConfigIdentity {
+    #[must_use]
+    pub const fn generation(&self) -> OperatorConfigGeneration {
+        self.generation
+    }
+
     #[must_use]
     pub const fn schema_version(&self) -> u8 {
         self.schema_version
@@ -187,6 +223,7 @@ impl OperatorConfigIdentity {
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct OperatorConfig {
+    generation: OperatorConfigGeneration,
     schema_version: u8,
     state_root: PersonalWorkerStateRoot,
     lima_instance: LimaInstanceName,
@@ -216,8 +253,44 @@ impl OperatorConfig {
         output_preference: OperatorOutputPreference,
         remediation_preference: OperatorRemediationPreference,
     ) -> Result<Self, OperatorConfigError> {
+        Self::new_for_generation(
+            OperatorConfigGeneration::SmolrunnerV1,
+            state_root,
+            lima_instance,
+            guest_workspace,
+            default_verification_profile,
+            availability,
+            idle_policy,
+            output_preference,
+            remediation_preference,
+        )
+    }
+
+    /// Construct one exact operator configuration under an explicit identity generation.
+    ///
+    /// `SmolrunnerV1` reproduces the retained v1 bytes and identity. `GlaedaV2` is the explicit
+    /// successor available to the later fresh-config cutover once its Glaeda runtime/path inputs
+    /// are accepted. This constructor performs no discovery, migration, or I/O.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded error when the canonical configuration identity cannot be encoded.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_for_generation(
+        generation: OperatorConfigGeneration,
+        state_root: PersonalWorkerStateRoot,
+        lima_instance: LimaInstanceName,
+        guest_workspace: GuestWorkspacePath,
+        default_verification_profile: VerificationProfileId,
+        availability: AvailabilityRequest,
+        idle_policy: OperatorIdlePolicy,
+        output_preference: OperatorOutputPreference,
+        remediation_preference: OperatorRemediationPreference,
+    ) -> Result<Self, OperatorConfigError> {
+        let schema_version = generation.schema_version();
         let mut config = Self {
-            schema_version: OPERATOR_CONFIG_SCHEMA_VERSION,
+            generation,
+            schema_version,
             state_root,
             lima_instance,
             guest_workspace,
@@ -227,7 +300,8 @@ impl OperatorConfig {
             output_preference,
             remediation_preference,
             identity: OperatorConfigIdentity {
-                schema_version: OPERATOR_CONFIG_SCHEMA_VERSION,
+                generation,
+                schema_version,
                 digest: placeholder_digest()?,
             },
         };
@@ -250,14 +324,9 @@ impl OperatorConfig {
             ));
         }
         let document: OperatorConfigDocument = decode_json(bytes)?;
-        if document.schema_version != OPERATOR_CONFIG_SCHEMA_VERSION {
-            return Err(OperatorConfigError::new(
-                "schema_version",
-                "unsupported_schema_version",
-                "operator configuration schema version is unsupported",
-            ));
-        }
-        Self::new(
+        let (generation, document) = document.into_generation_and_fields()?;
+        Self::new_for_generation(
+            generation,
             PersonalWorkerStateRoot::parse(document.state_root)?,
             LimaInstanceName::parse(&document.lima_instance).map_err(|_| {
                 OperatorConfigError::new(
@@ -303,6 +372,11 @@ impl OperatorConfig {
             ));
         }
         Ok(bytes)
+    }
+
+    #[must_use]
+    pub const fn generation(&self) -> OperatorConfigGeneration {
+        self.generation
     }
 
     #[must_use]
@@ -374,6 +448,7 @@ impl fmt::Debug for OperatorConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("OperatorConfig")
+            .field("generation", &self.generation)
             .field("schema_version", &self.schema_version)
             .field("state_root", &REDACTED_STATE_ROOT)
             .field("lima_instance", &self.lima_instance)
@@ -516,8 +591,15 @@ struct OperatorIdlePolicyDocument {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum OperatorConfigDocument {
+    SmolrunnerV1(SmolrunnerV1OperatorConfigDocument),
+    GlaedaV2(GlaedaV2OperatorConfigDocument),
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct OperatorConfigDocument {
+struct SmolrunnerV1OperatorConfigDocument {
     schema_version: u8,
     state_root: String,
     lima_instance: String,
@@ -529,9 +611,91 @@ struct OperatorConfigDocument {
     remediation_preference: OperatorRemediationPreference,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GlaedaV2OperatorConfigDocument {
+    schema_version: u8,
+    identity_generation: OperatorConfigGeneration,
+    state_root: String,
+    lima_instance: String,
+    guest_workspace: String,
+    default_verification_profile: String,
+    availability: PersistedAvailabilityRequest,
+    idle_policy: OperatorIdlePolicyDocument,
+    output_preference: OperatorOutputPreference,
+    remediation_preference: OperatorRemediationPreference,
+}
+
+struct DecodedOperatorConfigDocument {
+    state_root: String,
+    lima_instance: String,
+    guest_workspace: String,
+    default_verification_profile: String,
+    availability: PersistedAvailabilityRequest,
+    idle_policy: OperatorIdlePolicyDocument,
+    output_preference: OperatorOutputPreference,
+    remediation_preference: OperatorRemediationPreference,
+}
+
+impl OperatorConfigDocument {
+    fn into_generation_and_fields(
+        self,
+    ) -> Result<(OperatorConfigGeneration, DecodedOperatorConfigDocument), OperatorConfigError>
+    {
+        match self {
+            Self::SmolrunnerV1(document) => {
+                if document.schema_version == GLAEDA_OPERATOR_CONFIG_SCHEMA_VERSION {
+                    return Err(generation_pair_error());
+                }
+                if document.schema_version != SMOLRUNNER_OPERATOR_CONFIG_SCHEMA_VERSION {
+                    return Err(unsupported_schema_version_error());
+                }
+                Ok((
+                    OperatorConfigGeneration::SmolrunnerV1,
+                    DecodedOperatorConfigDocument {
+                        state_root: document.state_root,
+                        lima_instance: document.lima_instance,
+                        guest_workspace: document.guest_workspace,
+                        default_verification_profile: document.default_verification_profile,
+                        availability: document.availability,
+                        idle_policy: document.idle_policy,
+                        output_preference: document.output_preference,
+                        remediation_preference: document.remediation_preference,
+                    },
+                ))
+            }
+            Self::GlaedaV2(document) => {
+                if document.schema_version == SMOLRUNNER_OPERATOR_CONFIG_SCHEMA_VERSION
+                    || document.identity_generation != OperatorConfigGeneration::GlaedaV2
+                {
+                    return Err(generation_pair_error());
+                }
+                if document.schema_version != GLAEDA_OPERATOR_CONFIG_SCHEMA_VERSION {
+                    return Err(unsupported_schema_version_error());
+                }
+                Ok((
+                    OperatorConfigGeneration::GlaedaV2,
+                    DecodedOperatorConfigDocument {
+                        state_root: document.state_root,
+                        lima_instance: document.lima_instance,
+                        guest_workspace: document.guest_workspace,
+                        default_verification_profile: document.default_verification_profile,
+                        availability: document.availability,
+                        idle_policy: document.idle_policy,
+                        output_preference: document.output_preference,
+                        remediation_preference: document.remediation_preference,
+                    },
+                ))
+            }
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct PersistedOperatorConfigDocument<'a> {
     schema_version: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    identity_generation: Option<OperatorConfigGeneration>,
     state_root: &'a str,
     lima_instance: &'a str,
     guest_workspace: &'a str,
@@ -546,6 +710,10 @@ impl<'a> PersistedOperatorConfigDocument<'a> {
     fn from_config(config: &'a OperatorConfig) -> Self {
         Self {
             schema_version: config.schema_version,
+            identity_generation: match config.generation {
+                OperatorConfigGeneration::SmolrunnerV1 => None,
+                OperatorConfigGeneration::GlaedaV2 => Some(OperatorConfigGeneration::GlaedaV2),
+            },
             state_root: config.state_root.as_str(),
             lima_instance: config.lima_instance.as_str(),
             guest_workspace: config.guest_workspace.as_str(),
@@ -621,9 +789,12 @@ fn decode_json<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, OperatorConfigErr
 fn digest_operator_config(
     config: &OperatorConfig,
 ) -> Result<OperatorConfigIdentity, OperatorConfigError> {
+    if config.schema_version != config.generation.schema_version() {
+        return Err(generation_pair_error());
+    }
     let document = OperatorConfigIdentityDocument {
-        document_type: OPERATOR_CONFIG_IDENTITY_DOCUMENT_TYPE,
-        schema_version: OPERATOR_CONFIG_SCHEMA_VERSION,
+        document_type: config.generation.identity_document_type(),
+        schema_version: config.schema_version,
         config: PersistedOperatorConfigDocument::from_config(config),
     };
     let mut writer = BoundedDigestWriter::new();
@@ -647,9 +818,26 @@ fn digest_operator_config(
     }
     let digest = Sha256Digest::parse(&value).map_err(|_| encoding_error())?;
     Ok(OperatorConfigIdentity {
-        schema_version: OPERATOR_CONFIG_SCHEMA_VERSION,
+        generation: config.generation,
+        schema_version: config.schema_version,
         digest,
     })
+}
+
+const fn unsupported_schema_version_error() -> OperatorConfigError {
+    OperatorConfigError::new(
+        "schema_version",
+        "unsupported_schema_version",
+        "operator configuration schema version is unsupported",
+    )
+}
+
+const fn generation_pair_error() -> OperatorConfigError {
+    OperatorConfigError::new(
+        "identity_generation",
+        "generation_schema_mismatch",
+        "operator configuration schema and identity generation do not match",
+    )
 }
 
 fn placeholder_digest() -> Result<Sha256Digest, OperatorConfigError> {
@@ -737,7 +925,8 @@ mod tests {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn config_with(
+    fn config_with_generation(
+        generation: OperatorConfigGeneration,
         state_root_value: &str,
         instance_value: &str,
         workspace_value: &str,
@@ -747,7 +936,8 @@ mod tests {
         output: OperatorOutputPreference,
         remediation: OperatorRemediationPreference,
     ) -> OperatorConfig {
-        OperatorConfig::new(
+        OperatorConfig::new_for_generation(
+            generation,
             state_root(state_root_value),
             instance(instance_value),
             workspace(workspace_value),
@@ -758,6 +948,30 @@ mod tests {
             remediation,
         )
         .expect("config")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn config_with(
+        state_root_value: &str,
+        instance_value: &str,
+        workspace_value: &str,
+        profile_value: &str,
+        availability: AvailabilityRequest,
+        idle_policy: OperatorIdlePolicy,
+        output: OperatorOutputPreference,
+        remediation: OperatorRemediationPreference,
+    ) -> OperatorConfig {
+        config_with_generation(
+            OperatorConfigGeneration::SmolrunnerV1,
+            state_root_value,
+            instance_value,
+            workspace_value,
+            profile_value,
+            availability,
+            idle_policy,
+            output,
+            remediation,
+        )
     }
 
     fn config() -> OperatorConfig {
@@ -771,6 +985,141 @@ mod tests {
             OperatorOutputPreference::Human,
             OperatorRemediationPreference::IncludeSuggestions,
         )
+    }
+
+    #[test]
+    fn smolrunner_v1_golden_bytes_and_identity_remain_exact() {
+        let config = config();
+        assert_eq!(config.generation(), OperatorConfigGeneration::SmolrunnerV1);
+        assert_eq!(
+            config.schema_version(),
+            SMOLRUNNER_OPERATOR_CONFIG_SCHEMA_VERSION
+        );
+        assert_eq!(
+            config.identity().generation(),
+            OperatorConfigGeneration::SmolrunnerV1
+        );
+        assert_eq!(
+            config.identity().digest().as_str(),
+            "sha256:30d72dad2563fe9fec9499b9f9e09e9785dc0668695f7454f645d98c9b8373fd"
+        );
+        assert_eq!(
+            String::from_utf8(config.encode_persisted_json().expect("v1 bytes")).expect("UTF-8"),
+            r#"{"schema_version":1,"state_root":"/Users/private-user/Library/Application Support/smolrunner","lima_instance":"smolrunner","guest_workspace":"/home/lima/smolrunner","default_verification_profile":"smolrunner.required","availability":"active","idle_policy":{"interactive_after_millis":600000,"stopped_after_millis":1800000},"output_preference":"human","remediation_preference":"include_suggestions"}"#,
+        );
+    }
+
+    #[test]
+    fn glaeda_v2_same_semantics_is_distinct_deterministic_and_canonical() {
+        let first = config_with_generation(
+            OperatorConfigGeneration::GlaedaV2,
+            "/Users/private-user/Library/Application Support/smolrunner",
+            "smolrunner",
+            "/home/lima/smolrunner",
+            "smolrunner.required",
+            AvailabilityRequest::Active,
+            alpha_idle_policy(),
+            OperatorOutputPreference::Human,
+            OperatorRemediationPreference::IncludeSuggestions,
+        );
+        let second = config_with_generation(
+            OperatorConfigGeneration::GlaedaV2,
+            "/Users/private-user/Library/Application Support/smolrunner",
+            "smolrunner",
+            "/home/lima/smolrunner",
+            "smolrunner.required",
+            AvailabilityRequest::Active,
+            alpha_idle_policy(),
+            OperatorOutputPreference::Human,
+            OperatorRemediationPreference::IncludeSuggestions,
+        );
+        assert_eq!(first, second);
+        assert_eq!(first.generation(), OperatorConfigGeneration::GlaedaV2);
+        assert_eq!(
+            first.schema_version(),
+            GLAEDA_OPERATOR_CONFIG_SCHEMA_VERSION
+        );
+        assert_eq!(
+            first.identity().generation(),
+            OperatorConfigGeneration::GlaedaV2
+        );
+        assert_eq!(
+            first.identity().digest().as_str(),
+            "sha256:cc3c6a7938755114268b3e7ef62f2f1ebcb11ab04b2f385b30672139f7802970"
+        );
+        assert_ne!(first.identity(), config().identity());
+        let encoded = first.encode_persisted_json().expect("v2 bytes");
+        assert_eq!(
+            String::from_utf8(encoded.clone()).expect("UTF-8"),
+            r#"{"schema_version":2,"identity_generation":"glaeda_v2","state_root":"/Users/private-user/Library/Application Support/smolrunner","lima_instance":"smolrunner","guest_workspace":"/home/lima/smolrunner","default_verification_profile":"smolrunner.required","availability":"active","idle_policy":{"interactive_after_millis":600000,"stopped_after_millis":1800000},"output_preference":"human","remediation_preference":"include_suggestions"}"#,
+        );
+        let decoded = OperatorConfig::decode_persisted_json(&encoded).expect("v2 decode");
+        assert_eq!(decoded, first);
+        assert_eq!(
+            decoded.encode_persisted_json().expect("v2 re-encode"),
+            encoded
+        );
+    }
+
+    #[test]
+    fn mixed_and_unsupported_generation_documents_fail_closed() {
+        let v1 = config().encode_persisted_json().expect("v1 bytes");
+        let v2 = config_with_generation(
+            OperatorConfigGeneration::GlaedaV2,
+            "/Users/private-user/Library/Application Support/smolrunner",
+            "smolrunner",
+            "/home/lima/smolrunner",
+            "smolrunner.required",
+            AvailabilityRequest::Active,
+            alpha_idle_policy(),
+            OperatorOutputPreference::Human,
+            OperatorRemediationPreference::IncludeSuggestions,
+        )
+        .encode_persisted_json()
+        .expect("v2 bytes");
+
+        let mut value: serde_json::Value = serde_json::from_slice(&v1).expect("v1 document");
+        value["identity_generation"] = serde_json::json!("smolrunner_v1");
+        let error = OperatorConfig::decode_persisted_json(
+            &serde_json::to_vec(&value).expect("marked v1 document"),
+        )
+        .expect_err("v1 marker is forbidden");
+        assert_eq!(error.code, "generation_schema_mismatch");
+
+        let mut value: serde_json::Value = serde_json::from_slice(&v2).expect("v2 document");
+        value["schema_version"] = serde_json::json!(1);
+        let error = OperatorConfig::decode_persisted_json(
+            &serde_json::to_vec(&value).expect("v2 with v1 schema"),
+        )
+        .expect_err("mixed version");
+        assert_eq!(error.code, "generation_schema_mismatch");
+
+        let mut value: serde_json::Value = serde_json::from_slice(&v2).expect("v2 document");
+        value["identity_generation"] = serde_json::json!("smolrunner_v1");
+        let error = OperatorConfig::decode_persisted_json(
+            &serde_json::to_vec(&value).expect("v2 with v1 generation"),
+        )
+        .expect_err("mixed generation");
+        assert_eq!(error.code, "generation_schema_mismatch");
+
+        let mut value: serde_json::Value = serde_json::from_slice(&v2).expect("v2 document");
+        value
+            .as_object_mut()
+            .expect("object")
+            .remove("identity_generation");
+        let error = OperatorConfig::decode_persisted_json(
+            &serde_json::to_vec(&value).expect("v2 without marker"),
+        )
+        .expect_err("missing v2 marker");
+        assert_eq!(error.code, "generation_schema_mismatch");
+
+        let mut value: serde_json::Value = serde_json::from_slice(&v1).expect("v1 document");
+        value["schema_version"] = serde_json::json!(3);
+        let error = OperatorConfig::decode_persisted_json(
+            &serde_json::to_vec(&value).expect("unsupported version"),
+        )
+        .expect_err("unsupported version");
+        assert_eq!(error.code, "unsupported_schema_version");
     }
 
     #[test]
@@ -796,7 +1145,7 @@ mod tests {
         assert_eq!(error.code, "invalid_document");
 
         value.as_object_mut().expect("object").remove("unknown");
-        value["schema_version"] = serde_json::json!(2);
+        value["schema_version"] = serde_json::json!(3);
         let error = OperatorConfig::decode_persisted_json(
             &serde_json::to_vec(&value).expect("unknown version document"),
         )
