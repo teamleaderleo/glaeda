@@ -101,7 +101,7 @@ jobs:
               .path_class == "external-private" and
               .ownership == "current-user" and
               .path_exposed == false)) and
-            (.next_verification_profiles == ["smolrunner.required", "smolrunner.doctor", "smolrunner.plan"])
+            (.next_verification_profiles == ["glaeda.required", "glaeda.doctor", "glaeda.plan"])
           ' "$first_receipt"
           jq -S 'del(
             .capability_fingerprint,
