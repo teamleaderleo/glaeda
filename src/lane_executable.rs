@@ -8,6 +8,9 @@ use serde::Serialize;
 
 use crate::lane_command::LaneCommand;
 
+const CLASSIC_ENV_PATH: &str = "/usr/bin/env";
+const UBUNTU_RUST_COREUTILS_ENV_PATH: &str = "/usr/lib/cargo/bin/coreutils/env";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutableVerificationErrorKind {
@@ -76,6 +79,69 @@ impl VerifiedExecutable {
     pub fn mode(&self) -> u32 {
         self.mode
     }
+}
+
+/// One purpose-bound, verified `env` executable selected from the closed supported layouts.
+///
+/// The selected path always names a real regular executable. The `/usr/bin/env` compatibility
+/// alias is never followed after it is observed as a symlink.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedEnvironmentExecutable(VerifiedExecutable);
+
+impl VerifiedEnvironmentExecutable {
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        self.0.path()
+    }
+}
+
+pub(crate) fn is_supported_environment_executable_path(path: &Path) -> bool {
+    path == Path::new(CLASSIC_ENV_PATH) || path == Path::new(UBUNTU_RUST_COREUTILS_ENV_PATH)
+}
+
+/// Bounded, path-free failure to select a supported reviewed `env` executable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnvironmentExecutableResolutionError;
+
+impl fmt::Display for EnvironmentExecutableResolutionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("no supported reviewed environment executable is available")
+    }
+}
+
+impl std::error::Error for EnvironmentExecutableResolutionError {}
+
+/// Select a verified regular `env` executable from the closed supported system layouts.
+///
+/// Classic distributions provide a regular `/usr/bin/env`. Ubuntu 26 may instead expose that path
+/// as a symlink while providing the real Rust-coreutils applet at the second fixed path. Selection
+/// verifies and returns the real leaf; it never follows or later executes the compatibility alias.
+///
+/// # Errors
+///
+/// Returns a path-free error unless one supported candidate is a root-owned, protected, executable
+/// regular file. Unsafe metadata on the classic path fails closed rather than selecting around it.
+pub fn resolve_reviewed_environment_executable()
+-> Result<VerifiedEnvironmentExecutable, EnvironmentExecutableResolutionError> {
+    resolve_reviewed_environment_executable_with(&verify_executable)
+}
+
+fn resolve_reviewed_environment_executable_with(
+    verify: &impl Fn(&Path) -> Result<VerifiedExecutable, ExecutableVerificationError>,
+) -> Result<VerifiedEnvironmentExecutable, EnvironmentExecutableResolutionError> {
+    match verify(Path::new(CLASSIC_ENV_PATH)) {
+        Ok(executable) => return Ok(VerifiedEnvironmentExecutable(executable)),
+        Err(error)
+            if matches!(
+                error.kind(),
+                ExecutableVerificationErrorKind::Missing | ExecutableVerificationErrorKind::Symlink
+            ) => {}
+        Err(_) => return Err(EnvironmentExecutableResolutionError),
+    }
+
+    verify(Path::new(UBUNTU_RUST_COREUTILS_ENV_PATH))
+        .map(VerifiedEnvironmentExecutable)
+        .map_err(|_| EnvironmentExecutableResolutionError)
 }
 
 /// Verify every executable required by one typed lane command.
@@ -205,14 +271,17 @@ fn verify_observation(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::path::Path;
 
     use crate::journal::{ExecutionLane, PlannedMutation, Preconditions, RollbackClass};
     use crate::lane_command::{LaneCommand, LinuxAccountName, RunnerUserContext};
 
     use super::{
-        ExecutableVerificationErrorKind, ObservedObjectKind, verify_lane_command,
-        verify_observation,
+        CLASSIC_ENV_PATH, EnvironmentExecutableResolutionError, ExecutableVerificationErrorKind,
+        ObservedObjectKind, UBUNTU_RUST_COREUTILS_ENV_PATH,
+        resolve_reviewed_environment_executable, resolve_reviewed_environment_executable_with,
+        verify_lane_command, verify_observation,
     };
 
     fn action() -> PlannedMutation {
@@ -223,6 +292,16 @@ mod tests {
             RollbackClass::Reversible,
             Preconditions::new(["runner user inspected"]),
         )
+    }
+
+    fn runner() -> RunnerUserContext {
+        RunnerUserContext::new(
+            LinuxAccountName::parse("project-runner").expect("runner name"),
+            1001,
+            1001,
+            "/srv/runner",
+        )
+        .expect("runner context")
     }
 
     #[test]
@@ -276,22 +355,102 @@ mod tests {
     }
 
     #[test]
+    fn environment_selection_prefers_a_regular_classic_leaf() {
+        let observed = RefCell::new(Vec::new());
+        let selected = resolve_reviewed_environment_executable_with(&|path| {
+            observed.borrow_mut().push(path.to_path_buf());
+            verify_observation(path, ObservedObjectKind::RegularFile, 0, 0o755)
+        })
+        .expect("classic env selection");
+
+        assert_eq!(selected.path(), Path::new(CLASSIC_ENV_PATH));
+        let command = LaneCommand::runner_git_version_with_environment_program(
+            &action(),
+            &runner(),
+            selected,
+        );
+        assert_eq!(command.spec().displayed_argv()[4], CLASSIC_ENV_PATH);
+        assert_eq!(observed.into_inner(), [Path::new(CLASSIC_ENV_PATH)]);
+    }
+
+    #[test]
+    fn environment_selection_uses_the_real_ubuntu_rust_coreutils_leaf() {
+        let observed = RefCell::new(Vec::new());
+        let selected = resolve_reviewed_environment_executable_with(&|path| {
+            observed.borrow_mut().push(path.to_path_buf());
+            let kind = if path == Path::new(CLASSIC_ENV_PATH) {
+                ObservedObjectKind::Symlink
+            } else {
+                ObservedObjectKind::RegularFile
+            };
+            verify_observation(path, kind, 0, 0o755)
+        })
+        .expect("Rust-coreutils env selection");
+
+        assert_eq!(selected.path(), Path::new(UBUNTU_RUST_COREUTILS_ENV_PATH));
+        let command = LaneCommand::runner_git_version_with_environment_program(
+            &action(),
+            &runner(),
+            selected,
+        );
+        assert_eq!(
+            command.spec().displayed_argv()[4],
+            UBUNTU_RUST_COREUTILS_ENV_PATH
+        );
+        assert_eq!(
+            observed.into_inner(),
+            [
+                Path::new(CLASSIC_ENV_PATH),
+                Path::new(UBUNTU_RUST_COREUTILS_ENV_PATH),
+            ]
+        );
+    }
+
+    #[test]
+    fn environment_selection_does_not_bypass_unsafe_classic_metadata() {
+        let observed = RefCell::new(Vec::new());
+        let error = resolve_reviewed_environment_executable_with(&|path| {
+            observed.borrow_mut().push(path.to_path_buf());
+            verify_observation(path, ObservedObjectKind::RegularFile, 1000, 0o755)
+        })
+        .expect_err("unsafe classic env must fail closed");
+
+        assert_eq!(error, EnvironmentExecutableResolutionError);
+        assert_eq!(observed.into_inner(), [Path::new(CLASSIC_ENV_PATH)]);
+        assert!(!error.to_string().contains('/'));
+    }
+
+    #[test]
+    fn environment_selection_rejects_an_unsafe_rust_coreutils_leaf() {
+        let error = resolve_reviewed_environment_executable_with(&|path| {
+            if path == Path::new(CLASSIC_ENV_PATH) {
+                verify_observation(path, ObservedObjectKind::Symlink, 0, 0o777)
+            } else {
+                verify_observation(path, ObservedObjectKind::RegularFile, 1000, 0o755)
+            }
+        })
+        .expect_err("unsafe Rust-coreutils env must fail closed");
+
+        assert_eq!(error, EnvironmentExecutableResolutionError);
+        assert!(!error.to_string().contains('/'));
+    }
+
+    #[test]
     fn runner_git_command_verifies_outer_and_inner_reviewed_programs_when_present() {
         if !Path::new("/usr/sbin/runuser").exists() || !Path::new("/usr/bin/git").exists() {
             return;
         }
-        let runner = RunnerUserContext::new(
-            LinuxAccountName::parse("project-runner").expect("runner name"),
-            1001,
-            1001,
-            "/srv/runner",
-        )
-        .expect("runner context");
+        let runner = runner();
         let command = LaneCommand::runner_git_version(&action(), &runner).expect("git command");
         let verified = verify_lane_command(&command).expect("verify reviewed programs");
         assert_eq!(verified.len(), 3);
         assert_eq!(verified[0].path(), Path::new("/usr/sbin/runuser"));
-        assert_eq!(verified[1].path(), Path::new("/usr/bin/env"));
+        assert_eq!(
+            verified[1].path(),
+            resolve_reviewed_environment_executable()
+                .expect("reviewed env")
+                .path()
+        );
         assert_eq!(verified[2].path(), Path::new("/usr/bin/git"));
     }
 }
