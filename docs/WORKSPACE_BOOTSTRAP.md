@@ -21,7 +21,7 @@ The canonical path is `./scripts/bootstrap`. Each adopting repository owns that 
 
 The current working directory must equal the resolved Git worktree root. Invocation from a parent directory, subdirectory, or unrelated worktree ends in `blocked`. The repository root must contain a `[package]` entry named `smolrunner` in `Cargo.toml` and a committed `Cargo.lock`.
 
-The workspace capability receipt is a Glaeda schema v2 identity. The package marker, repository slug, and verification-profile names shown below remain transition identities owned by separate migration lanes. Retained SmolRunner schema v1 receipt fixtures remain historical evidence.
+The workspace capability receipt is a Glaeda schema v2 identity. The package marker and repository slug shown below remain transition identities owned by separate migration lanes. Verification-profile names now use the explicit Glaeda successor identities from issue #754. Retained SmolRunner schema v1 receipt/profile fixtures remain historical evidence.
 
 ## Accepted inputs
 
@@ -186,9 +186,9 @@ Schema version 2 is a bounded object. The cache portion has this form:
     "authorization": "not-requested"
   },
   "next_verification_profiles": [
-    "smolrunner.required",
-    "smolrunner.doctor",
-    "smolrunner.plan"
+    "glaeda.required",
+    "glaeda.doctor",
+    "glaeda.plan"
   ],
   "deviations": [],
   "blocking_reasons": [],
@@ -200,11 +200,13 @@ The field names `required_tools`, `optional_tools`, `verification_backends`, `fo
 
 ## Verification profile names
 
-Workspace receipt schema version 2 currently emits these transition profile identities:
+Workspace receipt schema version 2 emits the current Glaeda successor profile identities:
 
-- `smolrunner.required` — the complete required suite in `AGENTS.md`;
-- `smolrunner.doctor` — the machine-readable doctor check;
-- `smolrunner.plan` — the reference plan and host-plan smoke checks.
+- `glaeda.required` — exactly the eight required checks listed in `AGENTS.md`;
+- `glaeda.doctor` — the machine-readable doctor check;
+- `glaeda.plan` — the reference plan and host-plan smoke checks.
+
+`glaeda.required` names the repository-required AGENTS suite. It does not claim parity with the larger GitHub Actions `Verify` closure, which also runs additional bridge, helper, shell, cross-target, and reference assertions.
 
 This slice identifies names only. It does not select, expand, or run profiles.
 
