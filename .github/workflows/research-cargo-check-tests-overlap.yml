@@ -1,0 +1,227 @@
+name: Research Cargo check/tests overlap
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/research-cargo-check-tests-overlap.yml
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal --no-self-update
+          rustc +1.97.1 --version --verbose
+          cargo +1.97.1 --version
+
+      - name: Compare check and exact-test target graphs
+        env:
+          CARGO_BUILD_JOBS: "1"
+          CARGO_INCREMENTAL: "0"
+        run: |
+          set -euo pipefail
+
+          root="$RUNNER_TEMP/glaeda-cargo-check-tests-overlap"
+          fixture="$root/fixture"
+          results="$root/results"
+          mkdir -p "$fixture/src" "$fixture/tests" "$results"
+
+          cat > "$fixture/Cargo.toml" <<'EOF'
+          [package]
+          name = "fixture"
+          version = "0.0.0"
+          edition = "2024"
+          publish = false
+          EOF
+
+          python3 - "$fixture/src/lib.rs" <<'PY'
+          from pathlib import Path
+          import sys
+
+          path = Path(sys.argv[1])
+          lines = [
+              "#![forbid(unsafe_code)]",
+              "",
+              "pub fn seed() -> u64 { 7 }",
+              "",
+          ]
+          for index in range(1200):
+              lines.extend([
+                  "#[inline(never)]",
+                  f"pub fn generated_{index}(value: u64) -> u64 {{",
+                  f"    value.wrapping_mul({index + 3}).rotate_left({index % 63 + 1}).wrapping_add({index * 17 + 11})",
+                  "}",
+                  "",
+              ])
+          lines.extend([
+              "#[cfg(test)]",
+              "mod tests {",
+              "    #[test]",
+              "    fn library_marker() {",
+              "        assert_eq!(super::seed(), 7);",
+              "    }",
+              "}",
+          ])
+          path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+          PY
+
+          cat > "$fixture/tests/alpha.rs" <<'EOF'
+          #[test]
+          fn alpha_marker() {
+              let mut value = fixture::seed();
+              for index in 0..1200_u64 {
+                  value = value.wrapping_add(index);
+              }
+              assert_ne!(value, 0);
+          }
+          EOF
+
+          cat > "$fixture/tests/beta.rs" <<'EOF'
+          #[test]
+          fn beta_marker() {
+              assert_eq!(fixture::generated_1199(3), fixture::generated_1199(3));
+          }
+          EOF
+
+          cd "$fixture"
+          cargo +1.97.1 generate-lockfile --offline
+
+          printf 'rustc=' > "$results/machine.txt"
+          rustc +1.97.1 --version >> "$results/machine.txt"
+          printf 'cargo=' >> "$results/machine.txt"
+          cargo +1.97.1 --version >> "$results/machine.txt"
+          printf 'uname=' >> "$results/machine.txt"
+          uname -a >> "$results/machine.txt"
+          printf 'cpus=' >> "$results/machine.txt"
+          getconf _NPROCESSORS_ONLN >> "$results/machine.txt"
+          grep -E '^(MemTotal|MemAvailable|SwapTotal|SwapFree):' /proc/meminfo >> "$results/machine.txt"
+
+          run_timed() {
+            label="$1"
+            target="$2"
+            shift 2
+            start_ns="$(date +%s%N)"
+            env CARGO_TARGET_DIR="$target" "$@" > "$results/$label.json" 2> "$results/$label.stderr"
+            end_ns="$(date +%s%N)"
+            printf '%s\n' "$(((end_ns - start_ns) / 1000000))" > "$results/$label.ms"
+          }
+
+          for iteration in 1 2 3 4 5; do
+            control="$root/target-control-$iteration"
+            broad="$root/target-broad-$iteration"
+            narrow="$root/target-narrow-$iteration"
+
+            if (( iteration % 2 == 1 )); then
+              run_timed "control-$iteration" "$control" \
+                cargo +1.97.1 test --locked --offline -p fixture --test alpha --no-run --message-format=json
+
+              run_timed "broad-check-$iteration" "$broad" \
+                cargo +1.97.1 check --locked --offline -p fixture --tests --message-format=json
+              run_timed "broad-test-$iteration" "$broad" \
+                cargo +1.97.1 test --locked --offline -p fixture --test alpha --no-run --message-format=json
+
+              run_timed "narrow-check-$iteration" "$narrow" \
+                cargo +1.97.1 check --locked --offline -p fixture --test alpha --message-format=json
+              run_timed "narrow-test-$iteration" "$narrow" \
+                cargo +1.97.1 test --locked --offline -p fixture --test alpha --no-run --message-format=json
+            else
+              run_timed "narrow-check-$iteration" "$narrow" \
+                cargo +1.97.1 check --locked --offline -p fixture --test alpha --message-format=json
+              run_timed "narrow-test-$iteration" "$narrow" \
+                cargo +1.97.1 test --locked --offline -p fixture --test alpha --no-run --message-format=json
+
+              run_timed "broad-check-$iteration" "$broad" \
+                cargo +1.97.1 check --locked --offline -p fixture --tests --message-format=json
+              run_timed "broad-test-$iteration" "$broad" \
+                cargo +1.97.1 test --locked --offline -p fixture --test alpha --no-run --message-format=json
+
+              run_timed "control-$iteration" "$control" \
+                cargo +1.97.1 test --locked --offline -p fixture --test alpha --no-run --message-format=json
+            fi
+          done
+
+          python3 - "$results" <<'PY'
+          import json
+          import statistics
+          import sys
+          from pathlib import Path
+
+          root = Path(sys.argv[1])
+
+          def milliseconds(label):
+              return int((root / f"{label}.ms").read_text().strip())
+
+          def artifacts(label):
+              rows = []
+              for line in (root / f"{label}.json").read_text().splitlines():
+                  try:
+                      message = json.loads(line)
+                  except json.JSONDecodeError:
+                      continue
+                  if message.get("reason") != "compiler-artifact":
+                      continue
+                  target = message["target"]
+                  rows.append({
+                      "name": target["name"],
+                      "kind": target["kind"],
+                      "profile_test": message["profile"].get("test"),
+                      "fresh": message.get("fresh"),
+                      "executable": message.get("executable") is not None,
+                  })
+              return rows
+
+          iterations = range(1, 6)
+          control = [milliseconds(f"control-{i}") for i in iterations]
+          broad_check = [milliseconds(f"broad-check-{i}") for i in iterations]
+          broad_test = [milliseconds(f"broad-test-{i}") for i in iterations]
+          narrow_check = [milliseconds(f"narrow-check-{i}") for i in iterations]
+          narrow_test = [milliseconds(f"narrow-test-{i}") for i in iterations]
+          broad_total = [a + b for a, b in zip(broad_check, broad_test)]
+          narrow_total = [a + b for a, b in zip(narrow_check, narrow_test)]
+
+          def stats(values):
+              ordered = sorted(values)
+              return {
+                  "samples_ms": values,
+                  "median_ms": int(statistics.median(values)),
+                  "min_ms": ordered[0],
+                  "max_ms": ordered[-1],
+              }
+
+          summary = {
+              "question": "Does cargo check --tests usefully precompile one exact integration test?",
+              "iterations": 5,
+              "control_exact_test": stats(control),
+              "broad_check": stats(broad_check),
+              "broad_followup_exact_test": stats(broad_test),
+              "broad_check_plus_test": stats(broad_total),
+              "narrow_check": stats(narrow_check),
+              "narrow_followup_exact_test": stats(narrow_test),
+              "narrow_check_plus_test": stats(narrow_total),
+              "first_iteration_artifacts": {
+                  "control_exact_test": artifacts("control-1"),
+                  "broad_check": artifacts("broad-check-1"),
+                  "broad_followup_exact_test": artifacts("broad-test-1"),
+                  "narrow_check": artifacts("narrow-check-1"),
+                  "narrow_followup_exact_test": artifacts("narrow-test-1"),
+              },
+              "machine": (root / "machine.txt").read_text().splitlines(),
+          }
+
+          encoded = json.dumps(summary, sort_keys=True)
+          print("RESEARCH_SUMMARY_JSON=" + encoded)
+          print(json.dumps(summary, indent=2, sort_keys=True))
+
+          step_summary = Path(__import__("os").environ["GITHUB_STEP_SUMMARY"])
+          step_summary.write_text(
+              "# Cargo check/tests overlap probe\n\n```json\n"
+              + json.dumps(summary, indent=2, sort_keys=True)
+              + "\n```\n",
+              encoding="utf-8",
+          )
+          PY
