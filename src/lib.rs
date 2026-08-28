@@ -116,6 +116,8 @@ pub mod host_readiness_verdict;
 pub mod host_rootless_podman;
 /// Pure bounded observation-only receipts for blazingly hot execution measurements.
 pub mod hot_execution_performance;
+/// Pure descriptive p50/p90 summaries around exact hot-fleet A-B-B-A comparisons.
+pub mod hot_fleet_latency_summary;
 /// Pure bounded contended fleet-window receipts and exact A-B-B-A comparison evidence.
 pub mod hot_fleet_window;
 /// Pure path-class policy for selecting reviewed hot-state sharing mechanisms.
