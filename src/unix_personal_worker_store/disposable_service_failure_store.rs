@@ -495,7 +495,10 @@ struct CleanupReplacementFaultGuard;
 #[cfg(test)]
 fn inject_cleanup_replacement() -> CleanupReplacementFaultGuard {
     REPLACE_BEFORE_CLEANUP.with(|flag| {
-        assert!(!flag.replace(true), "cleanup replacement fault already injected");
+        assert!(
+            !flag.replace(true),
+            "cleanup replacement fault already injected"
+        );
     });
     CleanupReplacementFaultGuard
 }
@@ -640,7 +643,9 @@ mod tests {
 
     fn inode(path: &Path) -> u64 {
         let file = File::open(path).expect("open retained receipt for identity");
-        rustix::fs::fstat(&file).expect("inspect retained receipt identity").st_ino
+        rustix::fs::fstat(&file)
+            .expect("inspect retained receipt identity")
+            .st_ino
     }
 
     fn version_two_bytes() -> Vec<u8> {
