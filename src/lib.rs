@@ -1,6 +1,8 @@
 /// Read-only observation of one configured official Actions runner.
 pub mod actions_runner_readiness;
 pub mod artifact;
+/// Pure workload-neutral pre-admission compute request intent.
+pub mod compute_execution_request;
 /// Pure workload-family-neutral identity for declared compute semantics.
 pub mod compute_workload;
 #[cfg(target_os = "linux")]
@@ -63,6 +65,8 @@ pub mod execution_admission;
 pub mod execution_capacity;
 pub mod execution_receipt;
 pub mod execution_receipt_store;
+/// Pure frontier-inference adapter into generic pre-admission compute request intent.
+pub mod frontier_inference_compute_request;
 /// Pure model-derived frontier-inference workload vocabulary and synthetic sensitivity fixtures.
 pub mod frontier_inference_workload;
 /// Pure Git index-v2 stat-cache patching for CoW task materialization.
@@ -287,6 +291,8 @@ pub mod renderprove_protected_mount;
 pub mod renderprove_verification;
 pub mod renderprove_vision_profile;
 pub mod renderprove_vision_result;
+/// Pure repository-verification adapter into generic compute workload semantics.
+pub mod repository_verification_compute_workload;
 /// Credentialless, bounded observation of one immutable reviewed repository source.
 pub mod repository_source_observation;
 /// Pure, authority-free resident-sandbox generation/config/locator catalog and strict codec.
