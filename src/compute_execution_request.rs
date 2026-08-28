@@ -77,6 +77,8 @@ mod tests {
     use crate::execution_capacity::CapacityDimension;
     use crate::verification_profile::VerificationProfileId;
 
+    const MAX_RENDERED_REQUEST_BYTES: usize = 4 * 1024;
+
     fn digest(hex: char) -> Sha256Digest {
         Sha256Digest::parse(&format!("sha256:{}", hex.to_string().repeat(64))).unwrap()
     }
@@ -194,6 +196,8 @@ mod tests {
         let json = serde_json::to_string(&request).unwrap();
         let debug = format!("{request:?}").to_ascii_lowercase();
 
+        assert!(json.len() <= MAX_RENDERED_REQUEST_BYTES);
+        assert!(debug.len() <= MAX_RENDERED_REQUEST_BYTES);
         for forbidden in [
             "/private/",
             "cargo test",
