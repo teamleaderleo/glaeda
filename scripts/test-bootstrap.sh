@@ -66,7 +66,7 @@ fixture_git() {
 fixture_git init -q -b main
 fixture_git config user.name 'Glaeda Bootstrap Test'
 fixture_git config user.email 'bootstrap-test@example.invalid'
-fixture_git remote add origin https://github.com/teamleaderleo/smolrunner.git
+fixture_git remote add origin https://github.com/teamleaderleo/glaeda.git
 fixture_git add Cargo.toml Cargo.lock .gitignore scripts/bootstrap scripts/workspace_bootstrap
 fixture_git commit -qm fixture
 
@@ -101,6 +101,9 @@ first = json.loads((root / "first.json").read_text())
 second = json.loads((root / "second.json").read_text())
 commit = json.loads((root / "commit.json").read_text())
 assert first["state"] == "ready_with_declared_deviations"
+assert first["repository_root"]["repository"] == "teamleaderleo/glaeda"
+assert first["repository_root"]["expected_repository"] == "teamleaderleo/glaeda"
+assert "repository_remote_differs" not in {item["code"] for item in first["deviations"]}
 assert first["source"]["clean_before"] is True
 assert first["source"]["clean_after"] is True
 assert first["source"]["cleanliness_unchanged"] is True
@@ -151,6 +154,49 @@ caches = {item["name"]: item for item in receipt["declared_cache_paths"]}
 assert caches["cargo-target"]["path_class"] == "repository-local"
 assert caches["cargo-home"]["path_class"] == "external-private"
 assert all(item["ownership"] == "current-user" for item in caches.values())
+PY
+
+# Current Glaeda identity stays distinct from historical and foreign remotes.
+fixture_git remote set-url origin https://github.com/teamleaderleo/smolrunner.git
+(
+  cd "$fixture"
+  ./scripts/bootstrap --output json > "$temporary_root/legacy-repository.json"
+)
+python3 - "$temporary_root/legacy-repository.json" <<'PY'
+import json, pathlib, sys
+receipt = json.loads(pathlib.Path(sys.argv[1]).read_text())
+assert receipt["state"] == "ready_with_declared_deviations"
+assert receipt["repository_root"]["repository"] == "teamleaderleo/smolrunner"
+assert receipt["repository_root"]["expected_repository"] == "teamleaderleo/glaeda"
+assert {item["code"] for item in receipt["deviations"]} == {"repository_remote_differs"}
+PY
+
+fixture_git remote set-url origin https://github.com/alternate-owner/glaeda.git
+(
+  cd "$fixture"
+  ./scripts/bootstrap --output json > "$temporary_root/alternate-repository.json"
+)
+python3 - "$temporary_root/alternate-repository.json" <<'PY'
+import json, pathlib, sys
+receipt = json.loads(pathlib.Path(sys.argv[1]).read_text())
+assert receipt["state"] == "ready_with_declared_deviations"
+assert receipt["repository_root"]["repository"] == "alternate-owner/glaeda"
+assert receipt["repository_root"]["expected_repository"] == "teamleaderleo/glaeda"
+assert {item["code"] for item in receipt["deviations"]} == {"repository_remote_differs"}
+PY
+
+fixture_git remote set-url origin https://github.com/teamleaderleo/glaeda.git
+(
+  cd "$fixture"
+  ./scripts/bootstrap --output json > "$temporary_root/restored-repository.json"
+)
+python3 - "$temporary_root/restored-repository.json" <<'PY'
+import json, pathlib, sys
+receipt = json.loads(pathlib.Path(sys.argv[1]).read_text())
+assert receipt["state"] == "ready"
+assert receipt["repository_root"]["repository"] == "teamleaderleo/glaeda"
+assert receipt["repository_root"]["expected_repository"] == "teamleaderleo/glaeda"
+assert receipt["deviations"] == []
 PY
 
 # Relative configured paths resolve against the repository root.

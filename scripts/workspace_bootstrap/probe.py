@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 from urllib.parse import urlparse
 
-EXPECTED_REPOSITORY = "teamleaderleo/smolrunner"
+EXPECTED_REPOSITORY = "teamleaderleo/glaeda"
 PROFILE_NAMES = ["glaeda.required", "glaeda.doctor", "glaeda.plan"]
 VERSION_RE = re.compile(r"\b\d+\.\d+(?:\.\d+)?(?:[-+][A-Za-z0-9.-]+)?\b")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
