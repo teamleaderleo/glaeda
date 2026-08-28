@@ -18,7 +18,10 @@ fn current_pid_policy_reserves_control_and_cleanup_headroom() {
         PERSONAL_WORKER_PID_CAPACITY_POLICY_SCHEMA_VERSION
     );
     assert_eq!(policy.total_pid_capacity(), 4_096);
-    assert_eq!(policy.total_pid_capacity(), PERSONAL_WORKER_TOTAL_PID_CAPACITY);
+    assert_eq!(
+        policy.total_pid_capacity(),
+        PERSONAL_WORKER_TOTAL_PID_CAPACITY
+    );
     assert_eq!(policy.reserved_runtime_pids(), 1_024);
     assert_eq!(
         policy.reserved_runtime_pids(),
