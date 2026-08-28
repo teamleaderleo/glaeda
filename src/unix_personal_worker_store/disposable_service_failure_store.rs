@@ -423,9 +423,10 @@ impl UnixPersonalWorkerStore {
             Err(error) => return Err(map_document_open_error(error)),
         };
         inspect_private_file(&rebound, self.owner, exact.slot.subject(), None)?;
-        let rebound_snapshot = ReceiptFileSnapshot::from_stat(&fs::fstat(&rebound).map_err(|_| {
-            io_store("could not rebind the disposable service failure receipt before cleanup")
-        })?);
+        let rebound_snapshot =
+            ReceiptFileSnapshot::from_stat(&fs::fstat(&rebound).map_err(|_| {
+                io_store("could not rebind the disposable service failure receipt before cleanup")
+            })?);
         if rebound_snapshot != exact.snapshot {
             return Err(conflict_store(
                 "disposable service failure receipt identity changed before cleanup",
@@ -801,10 +802,7 @@ mod tests {
                 bytes.push(b'\n');
                 bytes
             }),
-            (
-                "oversized",
-                vec![b'x'; MAX_RECEIPT_DOCUMENT_BYTES + 1],
-            ),
+            ("oversized", vec![b'x'; MAX_RECEIPT_DOCUMENT_BYTES + 1]),
         ] {
             let root = TempRoot::new(label);
             let store = open_store(&root);
