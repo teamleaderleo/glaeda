@@ -347,7 +347,7 @@ def parse_cache_specs(values: list[str]) -> tuple[CacheSpec, ...]:
 
 def default_cache_specs(resident: Path) -> tuple[CacheSpec, ...]:
     target = resident / "target"
-    return (CacheSpec(Path("target"), "overlay"),) if target.is_dir() else ()
+    return (CacheSpec(Path("target"), "private-copy"),) if target.is_dir() else ()
 
 
 def default_state_root(
@@ -1201,7 +1201,7 @@ def main() -> int:
         help=(
             "select one resident-relative state path; native records direct "
             "same-worktree mutation, while cross-worktree execution defaults to "
-            "target:overlay when present"
+            "target:private-copy when present"
         ),
     )
     parser.add_argument("--verbose", action="store_true")

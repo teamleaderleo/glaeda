@@ -72,6 +72,14 @@ class HotStateFanoutTests(unittest.TestCase):
         repeat = build_plan("ordinary-native", 4, 16)
         overlay = build_plan("overlay", 4, 16)
         wider = build_plan("ordinary-native", 8, 16)
+        cold_overlay = build_plan(
+            "overlay",
+            4,
+            16,
+            page_cache_treatment=NAMESPACE[
+                "PAGE_CACHE_RESIDENT_TARGET_DONTNEED"
+            ],
+        )
         self.assertEqual(
             comparison_key(first, True), comparison_key(repeat, True)
         )
@@ -80,6 +88,13 @@ class HotStateFanoutTests(unittest.TestCase):
         )
         self.assertNotEqual(
             comparison_key(first, True), comparison_key(wider, True)
+        )
+        self.assertNotEqual(
+            comparison_key(overlay, True), comparison_key(cold_overlay, True)
+        )
+        self.assertEqual(
+            cold_overlay.to_json()["environment"]["page_cache_treatment"],
+            "resident_target_fsync_fadvise_dontneed",
         )
         programs = comparison_basis(first, True)["producer_programs"]
         self.assertEqual(
@@ -112,6 +127,19 @@ class HotStateFanoutTests(unittest.TestCase):
         ):
             with self.assertRaises(ExperimentError):
                 build_plan(*arguments)
+        with self.assertRaises(ExperimentError):
+            build_plan(
+                "ordinary-native",
+                4,
+                16,
+                page_cache_treatment=NAMESPACE[
+                    "PAGE_CACHE_RESIDENT_TARGET_DONTNEED"
+                ],
+            )
+        with self.assertRaises(ExperimentError):
+            build_plan(
+                "overlay", 4, 16, page_cache_treatment="global_drop_caches"
+            )
 
     def test_plan_cli_is_read_only_and_path_free(self) -> None:
         result = subprocess.run(
@@ -141,6 +169,29 @@ class HotStateFanoutTests(unittest.TestCase):
             self.assertEqual(observation["entries"], 5)
             self.assertGreaterEqual(observation["logical_file_bytes"], 4097)
             self.assertGreater(observation["allocated_file_blocks_bytes"], 0)
+
+    def test_resident_target_cold_advice_is_bounded_and_skips_symlinks(
+        self,
+    ) -> None:
+        advise = NAMESPACE["advise_resident_target_dontneed"]
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            target = fixture / "target"
+            target.mkdir()
+            (target / "payload").write_bytes(b"x" * 4097)
+            (target / "nested").mkdir()
+            (target / "nested" / "small").write_bytes(b"y")
+            external = fixture / "external"
+            external.write_bytes(b"external")
+            (target / "external-link").symlink_to(external)
+            result = advise(target)
+        self.assertEqual(result["disposition"], "advised")
+        self.assertEqual(result["writeback"], "per_file_fsync")
+        self.assertEqual(result["advice"], "POSIX_FADV_DONTNEED")
+        self.assertEqual(result["directories"], 2)
+        self.assertEqual(result["regular_files"], 2)
+        self.assertEqual(result["symlinks_skipped"], 1)
+        self.assertEqual(result["logical_file_bytes"], 4098)
 
     def test_filesystem_observation_binds_mount_and_device(self) -> None:
         filesystem_observation = NAMESPACE["filesystem_observation"]

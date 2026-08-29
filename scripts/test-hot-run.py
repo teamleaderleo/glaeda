@@ -196,6 +196,18 @@ class HotRunTests(unittest.TestCase):
         )
         self.assertNotIn("node-22", runtime_state_root(first, node_22).name)
 
+    def test_default_target_cache_uses_private_copy(self) -> None:
+        namespace = runpy.run_path(str(HOT_RUN), run_name="hot_run_test")
+        default_cache_specs = namespace["default_cache_specs"]
+        with tempfile.TemporaryDirectory() as directory:
+            resident = Path(directory)
+            self.assertEqual(default_cache_specs(resident), ())
+            (resident / "target").mkdir()
+            specs = default_cache_specs(resident)
+        self.assertEqual(len(specs), 1)
+        self.assertEqual(specs[0].path, Path("target"))
+        self.assertEqual(specs[0].mode, "private-copy")
+
     @unittest.skipUnless(shutil.which("bwrap"), "bubblewrap is unavailable")
     def test_task_sees_stable_path_and_target_writes_stay_private(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -545,6 +557,7 @@ class HotRunTests(unittest.TestCase):
         for values in (["../target"], ["target:shared"], ["target", "target:ro"]):
             with self.assertRaises(RuntimeError):
                 parse_cache_specs(values)
+        self.assertEqual(parse_cache_specs(["target"])[0].mode, "overlay")
         self.assertEqual(parse_cache_specs(["target:private"])[0].mode, "private")
         self.assertEqual(
             parse_cache_specs(["target:private-copy"])[0].mode, "private-copy"
