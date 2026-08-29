@@ -8,7 +8,14 @@ The frozen local evidence used Rust source commit `b9fa23462420c13a465d635d9694f
 
 The edit fixture adds one documentation line to `src/lib.rs` without changing behavior. Its tracked-workload diff digest is `sha256:bfdd60e73e8b106c0129d1052310495ae2dbe1ff70bb52b35a9f9ef4911927eb`.
 
-`scripts/benchmark-developer-loop` runs the same locked lib/bin test command in every arm. The profile executes 1,343 tests and leaves one existing ignored test ignored. It excludes exactly 16 host-fact tests that currently observe different `/usr/bin/env` ownership and parent-directory safety inside `hot-run`'s cross-worktree user/mount namespace. The script names every exclusion and emits a path-free JSON receipt even when the workload fails.
+`scripts/benchmark-developer-loop` runs the same locked lib/bin test command in every arm. Receipt
+schema v2 derives selected, executed, passed, failed, ignored, measured, and filtered counts from
+every Rust test-harness terminal summary; a successful command without a consistent observed
+inventory is rejected instead of emitting a stale checked-in count. It excludes exactly 16
+host-fact tests that currently observe different `/usr/bin/env` ownership and parent-directory
+safety inside `hot-run`'s cross-worktree user/mount namespace. The script names every exclusion
+and emits a path-free JSON receipt even when the workload fails. Historical measurements below
+retain the exact 1,343-test corpus they observed at those earlier source revisions.
 
 This profile is a resident-eligible developer-loop result, not a replacement for full host verification. The full suite remains a required distinct verifier.
 

@@ -19,6 +19,7 @@ NAMESPACE = runpy.run_path(str(SCRIPT), run_name="hot_state_fanout_test")
 
 def valid_benchmark_receipt(jobs: int = 4) -> dict[str, object]:
     return {
+        "schema_version": 2,
         "document_type": "glaeda-developer-loop-benchmark",
         "benchmark_id": "resident-eligible-rust-edit-v1",
         "source": {
@@ -33,8 +34,19 @@ def valid_benchmark_receipt(jobs: int = 4) -> dict[str, object]:
         },
         "resources": {"cargo_build_jobs": str(jobs)},
         "workload": {
-            "expected_executed_test_count": 1343,
             "excluded_host_fact_test_count": 16,
+            "test_inventory": {
+                "disposition": "observed",
+                "source": "rust_test_terminal_summaries_v1",
+                "summary_count": 2,
+                "selected_test_count": 6,
+                "executed_test_count": 5,
+                "passed_test_count": 5,
+                "failed_test_count": 0,
+                "ignored_test_count": 1,
+                "measured_test_count": 0,
+                "filtered_out_test_count": 16,
+            },
         },
         "result": {"exit_code": 0},
     }
@@ -55,7 +67,11 @@ class HotStateFanoutTests(unittest.TestCase):
                 for cpu in cpu_set
             ]
             self.assertEqual(len(flattened), len(set(flattened)))
-            self.assertEqual(value["workload"]["expected_executed_test_count"], 1343)
+            self.assertEqual(value["workload"]["benchmark_receipt_schema"], 2)
+            self.assertEqual(
+                value["workload"]["test_inventory_source"],
+                "rust_test_terminal_summaries_v1",
+            )
             self.assertRegex(
                 value["comparison"]["edit_key"], r"^sha256:[0-9a-f]{64}$"
             )
