@@ -73,18 +73,20 @@ try_direct() {
   git_physical=$(CDPATH='' cd -- "$git_root" 2>/dev/null && pwd -P) || return 125
   [ "$task_physical" = "$git_physical" ] || return 125
 
-  cd -- "$task_physical" || return 125
   requested=$1
   shift
   case "$requested" in
     /*) program=$requested ;;
     */*) return 125 ;;
     *)
-      program=$(command -v -- "$requested") || return 125
+      program=$(
+        CDPATH='' cd -- "$task_physical" 2>/dev/null && command -v -- "$requested"
+      ) || return 125
       case "$program" in /*) ;; *) return 125 ;; esac
       ;;
   esac
   [ -f "$program" ] && [ -x "$program" ] || return 125
+  cd -- "$task_physical" || return 125
   "$program" "$@"
   exit $?
 }
@@ -100,7 +102,29 @@ case "$0" in
     }
     ;;
 esac
-script_directory=$(CDPATH='' cd -- "${script_path%/*}" 2>/dev/null && pwd -P) || {
+readlink_program=$(command -v readlink) || {
+  printf '%s\n' 'hot-run error: required capability readlink is unavailable' >&2
+  exit 2
+}
+case "$readlink_program" in
+  /*) ;;
+  *)
+    printf '%s\n' 'hot-run error: required capability readlink is not absolute' >&2
+    exit 2
+    ;;
+esac
+resolved_script_path=$("$readlink_program" -f -- "$script_path" 2>/dev/null) || {
+  printf '%s\n' 'hot-run error: cannot resolve its implementation path' >&2
+  exit 2
+}
+case "$resolved_script_path" in
+  /*) ;;
+  *)
+    printf '%s\n' 'hot-run error: resolved implementation path is not absolute' >&2
+    exit 2
+    ;;
+esac
+script_directory=$(CDPATH='' cd -- "${resolved_script_path%/*}" 2>/dev/null && pwd -P) || {
   printf '%s\n' 'hot-run error: cannot resolve its implementation directory' >&2
   exit 2
 }
