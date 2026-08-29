@@ -187,6 +187,7 @@ def prepare_private_copy(
         )
         if result.returncode != 0:
             raise RuntimeError("private-copy preparation failed")
+        ensure_private_directory(candidate)
         os.replace(candidate, destination)
     finally:
         if candidate.exists():

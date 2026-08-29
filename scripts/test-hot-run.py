@@ -265,6 +265,7 @@ class HotRunTests(unittest.TestCase):
             (resident / "target" / "parent").write_text(
                 "exact warm parent\n", encoding="utf-8"
             )
+            (resident / "target").chmod(0o555)
             subprocess.run(["git", "add", "payload"], cwd=resident, check=True)
             subprocess.run(
                 [
@@ -338,6 +339,7 @@ class HotRunTests(unittest.TestCase):
             private_directories = list(state.glob("private-*"))
             self.assertEqual(len(private_directories), 1)
             private = private_directories[0]
+            self.assertEqual(private.stat().st_mode & 0o777, 0o700)
             self.assertEqual(
                 (private / "parent").read_text(encoding="utf-8"),
                 "exact warm parent\n",
