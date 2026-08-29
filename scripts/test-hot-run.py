@@ -558,14 +558,59 @@ class HotRunTests(unittest.TestCase):
             self.assertIn("does not match declared digest", refused.stderr)
             self.assertNotIn(os.fspath(program), refused.stderr)
 
-    def test_runtime_contract_rejects_partial_and_noncanonical_values(self) -> None:
+    def test_runtime_id_alone_observes_exact_executable_and_records_it(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            program = fixture / "runtime"
+            output = fixture / "output"
+            measurement = fixture / "measurement.json"
+            program.write_text(
+                '#!/bin/sh\nprintf observed > "$1"\n', encoding="utf-8"
+            )
+            program.chmod(0o700)
+            digest = hashlib.sha256(program.read_bytes()).hexdigest()
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    os.fspath(HOT_RUN),
+                    "--resident",
+                    os.fspath(ROOT),
+                    "--task",
+                    os.fspath(ROOT),
+                    "--runtime-id",
+                    "test-runtime-current",
+                    "--measurement",
+                    os.fspath(measurement),
+                    "--",
+                    os.fspath(program),
+                    os.fspath(output),
+                ],
+                stdin=subprocess.DEVNULL,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(output.read_text(encoding="utf-8"), "observed")
+            report = json.loads(measurement.read_text(encoding="utf-8"))
+            self.assertEqual(
+                report["runtime"],
+                {
+                    "id": "test-runtime-current",
+                    "program_sha256": f"sha256:{digest}",
+                },
+            )
+            self.assertNotIn(os.fspath(fixture), measurement.read_text(encoding="utf-8"))
+
+    def test_runtime_contract_rejects_digest_without_id_and_noncanonical_values(
+        self,
+    ) -> None:
         parse_runtime_contract = runpy.run_path(
             str(HOT_RUN), run_name="hot_run_test"
         )["parse_runtime_contract"]
         for runtime_id, digest in (
-            ("node-22", None),
             (None, f"sha256:{'1' * 64}"),
             ("../node", f"sha256:{'1' * 64}"),
+            ("../node", None),
             ("node-22", "1" * 64),
             ("node-22", f"sha256:{'A' * 64}"),
         ):
