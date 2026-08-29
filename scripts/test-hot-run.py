@@ -114,6 +114,7 @@ class HotRunTests(unittest.TestCase):
             report = json.loads(measurement.read_text(encoding="utf-8"))
             self.assertEqual(report["authority"], "developer_observation_only")
             self.assertEqual(report["exit_code"], 0)
+            self.assertIsNone(report["resource_profile"])
             self.assertTrue(report["cross_worktree"])
             self.assertGreaterEqual(report["elapsed_seconds"], 0)
             self.assertGreater(report["max_rss_kib"], 0)
@@ -164,6 +165,35 @@ class HotRunTests(unittest.TestCase):
             self.assertEqual(report["exit_code"], 17)
             self.assertFalse(report["cross_worktree"])
             self.assertEqual(report["cache_views"], [])
+            self.assertIsNone(report["resource_profile"])
+
+    @unittest.skipUnless(shutil.which("systemd-run"), "systemd-run is unavailable")
+    def test_heavy_profile_preserves_status_and_is_recorded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            measurement = Path(directory) / "measurement.json"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    os.fspath(HOT_RUN),
+                    "--resident",
+                    os.fspath(ROOT),
+                    "--task",
+                    os.fspath(ROOT),
+                    "--resource-profile",
+                    "big-red-heavy",
+                    "--measurement",
+                    os.fspath(measurement),
+                    "--",
+                    "/bin/true",
+                ],
+                stdin=subprocess.DEVNULL,
+                check=False,
+            )
+            if result.returncode == 2 and not measurement.exists():
+                self.skipTest("user systemd scopes are unavailable")
+            self.assertEqual(result.returncode, 0)
+            report = json.loads(measurement.read_text(encoding="utf-8"))
+            self.assertEqual(report["resource_profile"], "big-red-heavy")
 
 
 if __name__ == "__main__":

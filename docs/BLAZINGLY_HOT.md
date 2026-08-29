@@ -188,6 +188,13 @@ time, user/system CPU time, peak RSS, exit/signal, cross-worktree mode, and rela
 It contains no command, output, environment, repository identity, or private path and grants no
 verification or result-reuse authority.
 
+Heavy local work on the measured machine may opt into `--resource-profile big-red-heavy`. It uses
+one collected user systemd scope with a 1,200% CPU quota, 8 GiB memory-high threshold, 12 GiB hard
+memory ceiling, and 1,024-task ceiling. The explicitly machine-specific profile reflects big-red's
+12-way build point, which was within about 0.4% of 16-way Cargo while leaving interactive and
+multi-agent headroom. The profile is never applied to ordinary commands implicitly; an unscoped
+no-op avoided even the roughly 0.01-second scope cost.
+
 The task and resident must be worktrees of the same Git repository. The resident worktree remains
 the stable compiler pathname, while task source changes remain in the ordinary task worktree and
 write-heavy cache writes land in a task-private state directory. Cache paths must be relative,

@@ -25,6 +25,12 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent.parent
+HEAVY_SCOPE_PROPERTIES = (
+    "CPUQuota=1200%",
+    "MemoryHigh=8G",
+    "MemoryMax=12G",
+    "TasksMax=1024",
+)
 
 
 @dataclass(frozen=True)
@@ -167,6 +173,7 @@ def write_measurement(
     returncode: int,
     cache_specs: tuple[CacheSpec, ...],
     cross_worktree: bool,
+    resource_profile: str | None,
 ) -> None:
     destination = Path(os.path.abspath(destination))
     destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -176,6 +183,7 @@ def write_measurement(
         "document_type": "glaeda-hot-run-measurement",
         "authority": "developer_observation_only",
         "cross_worktree": cross_worktree,
+        "resource_profile": resource_profile,
         "cache_views": [
             {"path": os.fspath(spec.path), "mode": spec.mode} for spec in cache_specs
         ],
@@ -219,7 +227,25 @@ def execute(
     measurement: Path | None,
     cache_specs: tuple[CacheSpec, ...],
     cross_worktree: bool,
+    resource_profile: str | None,
 ) -> int:
+    if resource_profile is not None:
+        systemd_run = shutil.which("systemd-run")
+        if systemd_run is None:
+            raise RuntimeError("required capability systemd-run is unavailable")
+        arguments = [
+            os.path.abspath(systemd_run),
+            "--user",
+            "--scope",
+            "--quiet",
+            "--collect",
+            *[
+                item
+                for property_value in HEAVY_SCOPE_PROPERTIES
+                for item in ("--property", property_value)
+            ],
+            *arguments,
+        ]
     usage_before = resource.getrusage(resource.RUSAGE_CHILDREN)
     started = time.monotonic()
     result = subprocess.run(arguments, cwd=cwd, env=environment, check=False)
@@ -234,6 +260,7 @@ def execute(
             result.returncode,
             cache_specs,
             cross_worktree,
+            resource_profile,
         )
     return result.returncode if result.returncode >= 0 else 128 - result.returncode
 
@@ -244,6 +271,7 @@ def run(
     state_argument: Path | None,
     cache_arguments: list[str],
     measurement: Path | None,
+    resource_profile: str | None,
     command: list[str],
     verbose: bool,
 ) -> int:
@@ -273,6 +301,7 @@ def run(
             measurement,
             (),
             cross_worktree=False,
+            resource_profile=resource_profile,
         )
 
     bubblewrap = shutil.which("bwrap")
@@ -360,6 +389,7 @@ def run(
             measurement,
             cache_specs,
             cross_worktree=True,
+            resource_profile=resource_profile,
         )
     finally:
         if lock_fd is not None:
@@ -375,6 +405,11 @@ def main() -> int:
         "--measurement",
         type=Path,
         help="atomically write one bounded developer-observation JSON measurement",
+    )
+    parser.add_argument(
+        "--resource-profile",
+        choices=("big-red-heavy",),
+        help="run in the measured 12-CPU/8G-high/12G-max/1024-task user scope",
     )
     parser.add_argument(
         "--cache",
@@ -398,6 +433,7 @@ def main() -> int:
             arguments.state,
             arguments.cache,
             arguments.measurement,
+            arguments.resource_profile,
             command,
             arguments.verbose,
         )
