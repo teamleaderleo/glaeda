@@ -149,6 +149,12 @@ memory reservation; per-task memory remains host-default and is reported from th
 The harness cannot accept an arbitrary command, repository, commit, fixture, cache path, or
 validator.
 
+After an unprivileged OverlayFS mount is gone, the kernel may leave its internal work directory at
+mode `000`. Cleanup restores owner traversal only on owned, non-symlink directories inside the
+exact disposable experiment tree, then removes that tree. It does not follow links or alter an
+external target. Any ownership mismatch or remaining removal error still retains the tree as
+`recovery_required` evidence.
+
 Inspect the exact plan without mutation:
 
 ```bash
