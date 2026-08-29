@@ -86,6 +86,7 @@ excluded_json=$(printf '%s\n' "${excluded_tests[@]}" | jq -R . | jq -s .)
 
 scratch=$(mktemp -d)
 timing_file="$scratch/timing"
+command_output="$scratch/command-output"
 receipt_tmp="${output}.tmp.$$"
 cleanup() {
   rm -f "$receipt_tmp"
@@ -94,14 +95,69 @@ cleanup() {
 trap cleanup EXIT
 
 set +e
-/usr/bin/time --quiet -f '%e\t%U\t%S\t%M\t%x' -o "$timing_file" "${command[@]}"
+/usr/bin/time --quiet -f '%e\t%U\t%S\t%M\t%x' -o "$timing_file" "${command[@]}" \
+  >"$command_output" 2>&1
 exit_code=$?
 set -e
+command cat "$command_output"
 IFS=$'\t' read -r elapsed_seconds user_seconds system_seconds max_rss_kib timed_exit_code < "$timing_file"
 test "$exit_code" = "$timed_exit_code" || {
   printf 'error: command/time exit-code mismatch\n' >&2
   exit 2
 }
+
+IFS=$'\t' read -r summary_count passed_count failed_count ignored_count measured_count filtered_count < <(
+  awk '
+    BEGIN { OFS = "\t" }
+    /^test result: (ok|FAILED)\. [0-9]+ passed; [0-9]+ failed; [0-9]+ ignored; [0-9]+ measured; [0-9]+ filtered out;/ {
+      summaries += 1
+      passed += $4
+      failed += $6
+      ignored += $8
+      measured += $10
+      filtered += $12
+    }
+    END { print summaries + 0, passed + 0, failed + 0, ignored + 0, measured + 0, filtered + 0 }
+  ' "$command_output"
+)
+inventory_disposition=observed
+inventory_error=false
+if ((summary_count == 0)); then
+  inventory_disposition=unavailable
+  summary_count_json=null
+  selected_count_json=null
+  executed_count_json=null
+  passed_count_json=null
+  failed_count_json=null
+  ignored_count_json=null
+  measured_count_json=null
+  filtered_count_json=null
+  if ((exit_code == 0)); then
+    inventory_error=true
+  fi
+else
+  summary_count_json=$summary_count
+  selected_count_json=$((passed_count + failed_count + ignored_count + measured_count))
+  executed_count_json=$((passed_count + failed_count + measured_count))
+  passed_count_json=$passed_count
+  failed_count_json=$failed_count
+  ignored_count_json=$ignored_count
+  measured_count_json=$measured_count
+  filtered_count_json=$filtered_count
+  if ((
+    exit_code == 0
+    && (
+      selected_count_json == 0
+      || failed_count != 0
+      || measured_count != 0
+      || passed_count != executed_count_json
+      || selected_count_json != executed_count_json + ignored_count
+      || filtered_count != ${#excluded_tests[@]}
+    )
+  )); then
+    inventory_error=true
+  fi
+fi
 
 jq -n \
   --arg document_type glaeda-developer-loop-benchmark \
@@ -110,6 +166,7 @@ jq -n \
   --arg source_tree "$source_tree" \
   --arg source_diff_digest "sha256:$source_diff_digest" \
   --argjson source_dirty "$source_dirty" \
+  --arg inventory_disposition "$inventory_disposition" \
   --arg rustc_version "$rustc_version" \
   --arg cargo_version "$cargo_version" \
   --arg build_jobs "$build_jobs" \
@@ -121,8 +178,16 @@ jq -n \
   --argjson system_seconds "$system_seconds" \
   --argjson max_rss_kib "$max_rss_kib" \
   --argjson exit_code "$exit_code" \
+  --argjson summary_count "$summary_count_json" \
+  --argjson selected_count "$selected_count_json" \
+  --argjson executed_count "$executed_count_json" \
+  --argjson passed_count "$passed_count_json" \
+  --argjson failed_count "$failed_count_json" \
+  --argjson ignored_count "$ignored_count_json" \
+  --argjson measured_count "$measured_count_json" \
+  --argjson filtered_count "$filtered_count_json" \
   '{
-    schema_version: 1,
+    schema_version: 2,
     document_type: $document_type,
     benchmark_id: $benchmark_id,
     authority: "performance_observation_only",
@@ -142,9 +207,20 @@ jq -n \
     },
     workload: {
       command_digest: $command_digest,
-      expected_executed_test_count: 1343,
       excluded_host_fact_test_count: ($excluded_tests | length),
-      excluded_host_fact_tests: $excluded_tests
+      excluded_host_fact_tests: $excluded_tests,
+      test_inventory: {
+        disposition: $inventory_disposition,
+        source: "rust_test_terminal_summaries_v1",
+        summary_count: $summary_count,
+        selected_test_count: $selected_count,
+        executed_test_count: $executed_count,
+        passed_test_count: $passed_count,
+        failed_test_count: $failed_count,
+        ignored_test_count: $ignored_count,
+        measured_test_count: $measured_count,
+        filtered_out_test_count: $filtered_count
+      }
     },
     result: {
       elapsed_seconds: $elapsed_seconds,
@@ -156,4 +232,8 @@ jq -n \
     }
   }' > "$receipt_tmp"
 mv "$receipt_tmp" "$output"
+if $inventory_error; then
+  printf 'error: successful workload did not produce a consistent test inventory\n' >&2
+  exit 2
+fi
 exit "$exit_code"

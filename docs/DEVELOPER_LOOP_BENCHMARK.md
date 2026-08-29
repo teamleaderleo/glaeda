@@ -8,7 +8,14 @@ The frozen local evidence used Rust source commit `b9fa23462420c13a465d635d9694f
 
 The edit fixture adds one documentation line to `src/lib.rs` without changing behavior. Its tracked-workload diff digest is `sha256:bfdd60e73e8b106c0129d1052310495ae2dbe1ff70bb52b35a9f9ef4911927eb`.
 
-`scripts/benchmark-developer-loop` runs the same locked lib/bin test command in every arm. The profile executes 1,343 tests and leaves one existing ignored test ignored. It excludes exactly 16 host-fact tests that currently observe different `/usr/bin/env` ownership and parent-directory safety inside `hot-run`'s cross-worktree user/mount namespace. The script names every exclusion and emits a path-free JSON receipt even when the workload fails.
+`scripts/benchmark-developer-loop` runs the same locked lib/bin test command in every arm. Receipt
+schema v2 derives selected, executed, passed, failed, ignored, measured, and filtered counts from
+every Rust test-harness terminal summary; a successful command without a consistent observed
+inventory is rejected instead of emitting a stale checked-in count. It excludes exactly 16
+host-fact tests that currently observe different `/usr/bin/env` ownership and parent-directory
+safety inside `hot-run`'s cross-worktree user/mount namespace. The script names every exclusion
+and emits a path-free JSON receipt even when the workload fails. Historical measurements below
+retain the exact 1,343-test corpus they observed at those earlier source revisions.
 
 This profile is a resident-eligible developer-loop result, not a replacement for full host verification. The full suite remains a required distinct verifier.
 
@@ -413,3 +420,53 @@ worktrees, and the scratch root ended empty. Receipt SHA-256 digests:
 - seven-window Overlay B1: `5cec1b6b0f6c8693701bbd47f724be7209d7f53226bd6f5b1d3d70c11542b6b1`
 - seven-window Overlay B2: `4dcdefef81329972aefbef8b90accfc6e0cea3010a2dcb73687908a24ef44c05`
 - seven-window private-copy A2: `55d4b0b155cda1468c971ecec907e352297604fe8904cf4d90dcb10f966420dc`
+
+## Current-source inventory and native/private-copy controls — 2026-08-30
+
+Exact clean physical candidate `067328cf2d2f883113fd90fb109104b69cd1bfe8` / tree
+`549f4bb70f39e8cb9e402a73e4a584a04661d1bc` was exercised on big-red's native ext4 filesystem
+with Rust/Cargo 1.97.1, 16 logical CPUs, and four Cargo jobs. All twelve benchmark receipts derived
+the same current-source inventory from three Rust terminal summaries: 1,360 selected, 1,359
+executed and passed, one ignored, 16 filtered, and zero failed or measured tests. The exact command,
+source, exclusions, and test-inventory source are receipt-bound. “Private-empty” below means an
+empty Cargo target with the host's already resident source/toolchain/dependency state; it is not a
+cold machine or cold package-cache claim.
+
+| Control/treatment | Samples (s) | Median (s) | Median peak RSS | Relative to private-empty |
+| --- | ---: | ---: | ---: | ---: |
+| native private-empty target | 46.43, 46.90 | 46.665 | 2,425,398 KiB | control |
+| native immediate target reuse | 2.63, 2.61 | 2.620 | 41,146 KiB | 17.81x faster |
+| isolated private-copy first use, outer | 10.24, 10.92 | 10.580 | 1,591,572 KiB | 4.41x faster |
+| isolated private-copy retained reuse, outer | 2.87, 2.86 | 2.865 | 79,320 KiB | 16.29x faster |
+
+The private-copy first-use treatment split into 0.641756 and 1.222349 seconds of seeding (median
+0.932053) plus 9.499932 and 9.604233 seconds in `hot-run` (median 9.552083). Its inner workload
+median was 9.400 seconds. Retained reuse performed exactly zero preparation, with a 2.782687-second
+`hot-run` median and 2.650-second inner workload median. The retained isolated inner workload was
+only 0.030 seconds / 1.15% above native warm; including the wrapper, retained isolation was 0.245
+seconds / 9.35% above native warm.
+
+The resident target occupied 2,017,067,008 allocated bytes. Reconciled task-private states occupied
+2,741,698,560 and 2,741,686,272 bytes: median overhead 724,625,408 bytes / 35.92% on ext4. Every
+timed child tree exited zero and reported zero swaps. The resident target had been compiled at the
+native worktree path, while private tasks executed through `hot-run`'s stable task mount. Because
+ordinary-copy preparation was under one second but first execution remained about 9.55 seconds,
+the evidence identifies Cargo path-context reconciliation—not copying—as the dominant first-use
+cost in this control. XFS reflink should reduce seed latency and physical allocation, but cannot by
+itself remove path-sensitive compiler invalidation.
+
+The selected policy remains: native warm is the fastest no-isolation same-worktree path;
+private-copy provides near-native retained performance for cross-worktree isolation; and the next
+bounded experiment should build the resident compiler state through the same stable `hot-run`
+project path (or an explicitly remapped equivalent) before comparing first use. Do not promote a
+path-remapping mechanism until its semantic validator, rebuild behavior, and debug/source paths
+match the native control.
+
+Raw receipt SHA-256 digests:
+
+- native private-empty A/B: `fc8acb4b670745d836b04aaf05c9a6fc6c426b0577b22a15289b8de05b1c89f7`, `90daf53040212f29f5c667b1e3cfdec5473d477e74f1ce7e1003ef5e35e0130b`
+- native warm A/B: `e9dcc2f9175f775141cd75b9d641b5440c7293e32bffa78ac04019bb6625a1f6`, `e59ca9c1882033c77c3525867ab68493c5b7fd6f0723cd41a1ba05f507877b75`
+- private first-use benchmark A/B: `c87846f5ec6b6aa4398f77b63f27b30c706363d99acdbd1e29c4c0a0ec88d173`, `7248bdab82415bff5b846cd3bcea0ef3310979dfd2ab21735d66315e7b00d761`
+- private first-use `hot-run` A/B: `848aa1f073aba131951c9d43e8b6c9d7907468bd860f5405f4cc4968f86873ac`, `ee59516c9f2171ddb8835d1df1893e25ab8a0482b6bf26ec8b2243365c64fe1b`
+- private retained benchmark A/B: `2b47cdd37c717a1a1eba3716f9037785bb5103f7e9999ac9cf1aaf615aa0654c`, `33c73747b2a75348edf743411d7646c30d77e4af1b41885219bf06bed4f5e3bb`
+- private retained `hot-run` A/B: `e8cf2c687cebba48e756083696f9874e70eed5f465932213d98ccfb047fe8a6c`, `659b1e229c31fbb5c272187b3f125f896963e4066228ebd9ac1938262af1e4cc`

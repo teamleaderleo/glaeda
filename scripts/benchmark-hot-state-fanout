@@ -154,7 +154,8 @@ def workload_identity() -> dict[str, Any]:
         "source_tree": SOURCE_TREE,
         "fixture_diff_digest": FIXTURE_DIGEST,
         "fixture_file_digest": FIXTURE_FILE_DIGEST,
-        "expected_executed_test_count": 1343,
+        "benchmark_receipt_schema": 2,
+        "test_inventory_source": "rust_test_terminal_summaries_v1",
         "excluded_host_fact_test_count": 16,
     }
 
@@ -699,8 +700,29 @@ def validate_benchmark_receipt(
     receipt: dict[str, Any], edited: bool, expected_cargo_jobs: int
 ) -> None:
     expected_digest = FIXTURE_DIGEST if edited else EMPTY_DIFF_DIGEST
+    inventory = receipt.get("workload", {}).get("test_inventory")
+    inventory_counts: tuple[Any, ...] = ()
+    if isinstance(inventory, dict):
+        inventory_counts = tuple(
+            inventory.get(field)
+            for field in (
+                "summary_count",
+                "selected_test_count",
+                "executed_test_count",
+                "passed_test_count",
+                "failed_test_count",
+                "ignored_test_count",
+                "measured_test_count",
+                "filtered_out_test_count",
+            )
+        )
+    valid_counts = all(
+        isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        for value in inventory_counts
+    )
     if (
-        receipt.get("document_type") != "glaeda-developer-loop-benchmark"
+        receipt.get("schema_version") != 2
+        or receipt.get("document_type") != "glaeda-developer-loop-benchmark"
         or receipt.get("benchmark_id") != "resident-eligible-rust-edit-v1"
         or receipt.get("source", {}).get("commit") != SOURCE_COMMIT
         or receipt.get("source", {}).get("tree") != SOURCE_TREE
@@ -712,8 +734,20 @@ def validate_benchmark_receipt(
         != str(expected_cargo_jobs)
         or receipt.get("toolchain", {}).get("rustc") != RUSTC_VERSION
         or receipt.get("toolchain", {}).get("cargo") != CARGO_VERSION
-        or receipt.get("workload", {}).get("expected_executed_test_count") != 1343
         or receipt.get("workload", {}).get("excluded_host_fact_test_count") != 16
+        or not isinstance(inventory, dict)
+        or inventory.get("disposition") != "observed"
+        or inventory.get("source") != "rust_test_terminal_summaries_v1"
+        or len(inventory_counts) != 8
+        or not valid_counts
+        or inventory_counts[0] == 0
+        or inventory_counts[1] == 0
+        or inventory_counts[2] == 0
+        or inventory_counts[3] != inventory_counts[2]
+        or inventory_counts[4] != 0
+        or inventory_counts[6] != 0
+        or inventory_counts[7] != 16
+        or inventory_counts[1] != inventory_counts[2] + inventory_counts[5]
     ):
         raise ExperimentError("task semantic receipt does not match the frozen workload")
 
@@ -1001,6 +1035,27 @@ def run_cohort(
             elapsed,
             [aggregate_failed_task(task, plan, edited) for task in processes],
             str(error),
+            maximum_running,
+        )
+    inventory_shapes = {
+        tuple(
+            task["benchmark"]["workload"]["test_inventory"][field]
+            for field in (
+                "summary_count",
+                "selected_test_count",
+                "executed_test_count",
+                "passed_test_count",
+                "ignored_test_count",
+                "filtered_out_test_count",
+            )
+        )
+        for task in accepted
+    }
+    if len(inventory_shapes) != 1:
+        return (
+            elapsed,
+            accepted,
+            "fan-out task test inventories diverged",
             maximum_running,
         )
     return (
