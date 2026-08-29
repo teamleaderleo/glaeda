@@ -28,13 +28,17 @@ class HotRunTests(unittest.TestCase):
         self.assertEqual(resolve_program(["cargo"], ROOT)[0], os.path.abspath(cargo))
 
     def test_default_state_is_stable_and_separates_tasks(self) -> None:
-        default_state_root = runpy.run_path(str(HOT_RUN), run_name="hot_run_test")[
-            "default_state_root"
-        ]
+        namespace = runpy.run_path(str(HOT_RUN), run_name="hot_run_test")
+        default_state_root = namespace["default_state_root"]
         resident = Path("/tmp/resident")
-        first = default_state_root(resident, Path("/tmp/task-a"))
-        self.assertEqual(first, default_state_root(resident, Path("/tmp/task-a")))
-        self.assertNotEqual(first, default_state_root(resident, Path("/tmp/task-b")))
+        caches = namespace["parse_cache_specs"](["target:overlay"])
+        first = default_state_root(resident, Path("/tmp/task-a"), caches)
+        self.assertEqual(
+            first, default_state_root(resident, Path("/tmp/task-a"), caches)
+        )
+        self.assertNotEqual(
+            first, default_state_root(resident, Path("/tmp/task-b"), caches)
+        )
         self.assertNotIn("resident", first.name)
         self.assertNotIn("task-a", first.name)
 
@@ -49,6 +53,10 @@ class HotRunTests(unittest.TestCase):
             subprocess.run(["git", "init", "--quiet"], cwd=resident, check=True)
             (resident / "payload").write_text("resident\n", encoding="utf-8")
             (resident / "target").mkdir()
+            (resident / ".venv").mkdir()
+            (resident / ".venv" / "dependency").write_text(
+                "resident dependency\n", encoding="utf-8"
+            )
             subprocess.run(["git", "add", "payload"], cwd=resident, check=True)
             subprocess.run(
                 [
@@ -81,17 +89,34 @@ class HotRunTests(unittest.TestCase):
                 os.fspath(task),
                 "--state",
                 os.fspath(state),
+                "--cache",
+                "target:overlay",
+                "--cache",
+                ".venv:ro",
                 "--",
                 "/bin/sh",
                 "-c",
                 f'test "$PWD" = "{resident}" && test "$(cat payload)" = task '
+                '&& test "$(cat .venv/dependency)" = "resident dependency" '
                 "&& printf private > target/task-output",
             ]
             result = subprocess.run(command, stdin=subprocess.DEVNULL, check=False)
             self.assertEqual(result.returncode, 0)
             self.assertFalse((resident / "target" / "task-output").exists())
             self.assertFalse((task / "target" / "task-output").exists())
-            self.assertTrue((state / "target-upper" / "task-output").is_file())
+            uppers = list(state.glob("upper-*"))
+            self.assertEqual(len(uppers), 1)
+            self.assertTrue((uppers[0] / "task-output").is_file())
+
+    def test_cache_specs_reject_escape_overlap_and_unknown_modes(self) -> None:
+        parse_cache_specs = runpy.run_path(str(HOT_RUN), run_name="hot_run_test")[
+            "parse_cache_specs"
+        ]
+        for values in (["../target"], ["target:shared"], ["target", "target:ro"]):
+            with self.assertRaises(RuntimeError):
+                parse_cache_specs(values)
+        with self.assertRaises(RuntimeError):
+            parse_cache_specs(["build", "build/generated"])
 
     def test_direct_resident_execution_preserves_failure_status(self) -> None:
         result = subprocess.run(

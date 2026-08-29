@@ -162,21 +162,35 @@ Do not promote a filesystem primitive because its microbenchmark is attractive. 
 ### Ultra-trusted local hot-run prototype
 
 `scripts/hot-run` is a deliberately small Linux developer-loop prototype. It binds a task Git
-worktree onto the pathname of a warmed resident worktree and gives the task a persistent private
-OverlayFS upper over the resident Cargo target:
+worktree onto the pathname of a warmed resident worktree. Explicit cache-path policies can expose
+resident dependencies read-only or give the task a persistent private OverlayFS upper over a
+write-heavy build tree:
 
 ```bash
 /path/to/resident/scripts/hot-run \
   --task /path/to/task-worktree \
+  --cache target:overlay \
   -- cargo test --locked --lib --bins
+```
+
+When a resident `target` exists, `target:overlay` is the zero-configuration default. Python and Node
+projects can explicitly reuse immutable prepared dependencies while keeping build output private:
+
+```bash
+scripts/hot-run --resident /path/to/python-resident --task /path/to/task \
+  --cache .venv:ro -- python -m pytest
+scripts/hot-run --resident /path/to/node-resident --task /path/to/task \
+  --cache node_modules:ro --cache .next:overlay -- pnpm build
 ```
 
 The task and resident must be worktrees of the same Git repository. The resident worktree remains
 the stable compiler pathname, while task source changes remain in the ordinary task worktree and
-compiler writes land in a task-private state directory. One non-blocking lock prevents concurrent
-mounts of the same upper/work pair. The command receives the caller's terminal, environment, host
-filesystem, devices, processes, and network and returns the child's status. This is explicitly an
-ultra-trusted performance tool, not a security boundary or result-authority mechanism.
+write-heavy cache writes land in a task-private state directory. Cache paths must be relative,
+unique, non-overlapping directories. One non-blocking lock prevents concurrent mounts of the same
+mutable upper/work pair; read-only reuse needs no state or lock. The command receives the caller's
+terminal, environment, host filesystem, devices, processes, and network and returns the child's
+status. This is explicitly an ultra-trusted performance tool, not a security boundary or
+result-authority mechanism.
 
 Unprivileged bubblewrap maps host identities outside the caller's user namespace to the overflow
 identity. Commands that deliberately validate host ownership, mount identity, or other physical
