@@ -1339,8 +1339,11 @@ fn validate_request(
 }
 
 fn is_normalized_absolute(path: &Path) -> bool {
+    let bytes = path.as_os_str().as_bytes();
     path.is_absolute()
-        && path.as_os_str().as_bytes().len() <= MAX_PATH_BYTES
+        && bytes.len() <= MAX_PATH_BYTES
+        && !bytes.contains(&b'\n')
+        && !bytes.contains(&b'\r')
         && path
             .components()
             .all(|component| matches!(component, Component::RootDir | Component::Normal(_)))
@@ -1777,5 +1780,15 @@ mod tests {
         .expect_err("invalid request");
         assert_eq!(error.code(), "reflink_task_request_invalid");
         assert!(!error.to_string().contains("private"));
+
+        let error = ReflinkTaskMaterializationRequest::new(
+            "/usr/bin/git",
+            "/private/source\nsecond-record",
+            "/private/task",
+            "1111111111111111111111111111111111111111",
+            ReflinkTaskMaterializationMode::Ordinary,
+        )
+        .expect_err("line-delimited control paths are outside the boundary");
+        assert_eq!(error.code(), "reflink_task_request_invalid");
     }
 }
