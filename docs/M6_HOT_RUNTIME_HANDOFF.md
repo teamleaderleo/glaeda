@@ -346,6 +346,79 @@ The main production physical blocker remains #565 P2: exact operator-Mac evidenc
 
 #607 stays sealed until accepted #565 P2 evidence can mint the project-filesystem correlation proof.
 
+## #568 native same-HEAD XFS task materialization
+
+The bounded P2/P3 research spike now has a native Linux implementation. It is deliberately one
+materialization primitive rather than another pipeline or lifecycle controller:
+
+```text
+exact clean held-stable source at one commit/tree
+-> detached no-checkout linked worktree + read-tree
+-> FICLONE exact tracked regular files
+-> publish only target index-v2 stat-cache fields through the existing pure patcher
+-> exact detached HEAD + non-mutating diff-files + diff-index proof
+-> ready research receipt, or complete ordinary Git fallback
+```
+
+The CLI accepts one to 32 distinct targets. A fan-out shares one tree inventory and the opening and
+closing source-clean observations. Four bounded file workers each open a disjoint source-file range
+once and clone it across all eligible targets. Per-target failures remain independent and reset
+through ordinary Git. The target `.git` control file, linked-worktree backlink, and detached `HEAD`
+are read as bounded regular files with no-follow opens; Git subprocesses use the fixed absolute Git
+path, a cleared allowlisted environment, and optional locks disabled. Symlinks, gitlinks,
+unsupported index variants, dirty/moved source evidence, filesystem mismatch, and unavailable
+reflink support all fail to ordinary materialization. Returned reports contain identities, bounded
+counts, phase durations, dispositions, and fixed fallback classes but no paths or output.
+
+This code grants no resident-source lease, filesystem-generation lease, task adoption, execution,
+cache, cleanup, or reusable-checkout authority. The caller must still hold those lifecycle facts.
+Interrupted targets are discardable acceleration and directory presence never proves readiness.
+
+### Exact big-red control
+
+The implementation benchmark head was `fd3cf120555d3e74d103d269804681c16939162c`, tree
+`629f268274eabd3e8c5ebf4bf35e76e4df0c6af6`, release-binary SHA-256
+`2fa2f81fdb55b3938c4a2daffafd062df5a274e2bcc1efaebd7456db1ffbd872`. The source stayed clean at
+that exact head before and after every arm. The host used kernel `7.0.0-30-generic`; the disposable
+4 GiB XFS filesystem reported `reflink=1`, `crc=1`, `bigtime=1`, 4 KiB blocks, and `noatime`.
+
+Each count used three A-B-B-A brackets, giving six ordinary and six reflink samples. Both arms ran
+through the same release binary, source, commit, task count, final Git validator, resident and
+otherwise uncontrolled page cache, and sequential `git worktree remove --force` cleanup. Parent
+monotonic wall time includes binary startup. Child CPU/RSS came from GNU `time`. Physical deltas are
+mount-level `statvfs` used bytes sampled only after `sync -f`, outside the timed materialization
+window; this avoids treating summed file `st_blocks` as unique usage for shared extents.
+
+| Tasks | Ordinary median | Reflink median | Latency delta | Ordinary new bytes | Reflink new bytes | Byte reduction |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 64.592 ms | 65.088 ms | +0.8% | 11,538,432 | 438,272 | 96.2% |
+| 8 | 104.990 ms | 100.468 ms | -4.3% | 92,168,192 | 3,383,296 | 96.3% |
+| 32 | 221.916 ms | 249.258 ms | +12.3% | 368,549,888 | 13,344,768 | 96.4% |
+
+All 36 timed task sets completed with the requested disposition, exact commit/tree, zero candidate
+fallbacks, and the final proof. Reflink child RSS maxima were 6.58, 6.65, and 13.75 MiB at 1/8/32;
+ordinary maxima were 12.58, 12.64, and 11.83 MiB. Median cleanup was effectively tied at 1/8 and
+was 316.741 ms reflink versus 324.917 ms ordinary at 32.
+
+An exact-head physical follow-up reflinked all 501 regular files / 10,017,803 logical bytes. For
+`src/linux_reflink_task_materialization.rs`, `xfs_bmap -v` reported the same
+`6306328..6306455` physical block range and shared-extent flag `100000` in source and target. The
+target SHA-256 also matched before cleanup.
+
+### Scaling decision
+
+The first native fan-out opened the same 501 source files independently in every task thread and
+made the 32-way reflink median 958.850 ms. Entry-major traversal reduced redundant source opens;
+four disjoint file workers produced the accepted result above. Eight file workers were rejected
+after a 32-way smoke raised preparation to 471.373 ms and total wall time to 542.277 ms. XFS
+metadata concurrency has a measured knee on this host; more threads are not automatically faster.
+
+The spike therefore passes the narrow research decision: one and eight tasks are latency
+competitive while allocating roughly 26-27 times fewer new bytes; 32 tasks preserves the same
+space result for a measured 12.3% latency premium. It is suitable for integration behind exact
+resident-source and filesystem-generation evidence, ordinary fallback, and the existing outer
+admission/resource controller. It is not a generic XFS speed claim or a product-default grant.
+
 ## Failed experiments and corrected assumptions
 
 Keep these visible so the lane does not repeat them.
