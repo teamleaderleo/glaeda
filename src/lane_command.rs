@@ -4,11 +4,14 @@ use std::path::{Component, Path};
 use serde::Serialize;
 
 use crate::journal::{ExecutionLane, PlannedMutation};
+#[cfg(target_os = "linux")]
 use crate::lane_executable::{
     VerifiedEnvironmentExecutable, is_supported_environment_executable_path,
     resolve_reviewed_environment_executable,
 };
-use crate::process::{CommandSpec, CommandValue};
+use crate::process::CommandSpec;
+#[cfg(target_os = "linux")]
+use crate::process::CommandValue;
 
 const APT_GET: &str = "/usr/bin/apt-get";
 const GROUPADD: &str = "/usr/sbin/groupadd";
@@ -350,6 +353,7 @@ impl LaneCommand {
     ///
     /// Returns an error when the action is not assigned to the runner-user lane or no supported
     /// reviewed environment executable is available.
+    #[cfg(target_os = "linux")]
     pub fn runner_podman_info(
         action: &PlannedMutation,
         runner: &RunnerUserContext,
@@ -371,6 +375,7 @@ impl LaneCommand {
     ///
     /// Returns an error when the action is not assigned to the runner-user lane or no supported
     /// reviewed environment executable is available.
+    #[cfg(target_os = "linux")]
     pub fn runner_podman_migrate(
         action: &PlannedMutation,
         runner: &RunnerUserContext,
@@ -396,6 +401,7 @@ impl LaneCommand {
     ///
     /// Returns an error when the action is not assigned to the runner-user lane or no supported
     /// reviewed environment executable is available.
+    #[cfg(target_os = "linux")]
     pub fn runner_git_version(
         action: &PlannedMutation,
         runner: &RunnerUserContext,
@@ -409,6 +415,7 @@ impl LaneCommand {
         ))
     }
 
+    #[cfg(target_os = "linux")]
     pub(crate) fn runner_git_version_with_environment_program(
         action: &PlannedMutation,
         runner: &RunnerUserContext,
@@ -439,6 +446,7 @@ impl LaneCommand {
     }
 
     #[must_use]
+    #[cfg(target_os = "linux")]
     pub(crate) fn runner_environment_program(&self) -> Option<&Path> {
         match self.spec.arguments.get(3) {
             Some(CommandValue::Plain(path))
@@ -451,6 +459,7 @@ impl LaneCommand {
     }
 
     #[must_use]
+    #[cfg(target_os = "linux")]
     pub fn required_programs(&self) -> Vec<&Path> {
         let outer = self.spec.program.as_path();
         match self.kind {
@@ -528,6 +537,7 @@ fn subordinate_range_argument(start: u32, count: u32) -> Result<String, LaneComm
     Ok(format!("{start}-{end}"))
 }
 
+#[cfg(target_os = "linux")]
 fn runner_user_spec(
     runner: &RunnerUserContext,
     environment_program: &Path,
@@ -555,6 +565,7 @@ fn runner_user_spec(
     spec
 }
 
+#[cfg(target_os = "linux")]
 fn reviewed_environment_program() -> Result<VerifiedEnvironmentExecutable, LaneCommandError> {
     resolve_reviewed_environment_executable().map_err(|_| {
         LaneCommandError::single("no supported reviewed environment executable is available")
@@ -600,6 +611,7 @@ mod tests {
     use std::path::Path;
 
     use crate::journal::{ExecutionLane, PlannedMutation, Preconditions, RollbackClass};
+    #[cfg(target_os = "linux")]
     use crate::process::CommandValue;
 
     use super::{
@@ -731,6 +743,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn system_user_command_requires_useradd_and_nologin_verification() {
         let root = action(ExecutionLane::Root);
         let account = account("project-runner");
@@ -744,6 +757,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn runner_user_commands_have_exact_runuser_boundary_and_environment() {
         let runner = RunnerUserContext::new(account("project-runner"), 1001, 1001, "/srv/runner")
             .expect("runner context");
