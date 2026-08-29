@@ -287,6 +287,8 @@ pub mod project_disk_lease;
 pub mod project_filesystem_correlation_receipt;
 /// Pure path-free catalog-wide authority vocabulary for protected cache generations.
 pub mod protected_cache_generation_catalog;
+/// Strict path-free replacement-equivalence receipt vocabulary for protected cache generations.
+pub mod protected_cache_replacement_equivalence;
 pub mod renderprove_artifact_binding;
 pub mod renderprove_execution;
 #[cfg(target_os = "linux")]
