@@ -159,6 +159,45 @@ shared mutable cache
 
 Do not promote a filesystem primitive because its microbenchmark is attractive. Promote it for the state family where complete useful-result measurements show it wins.
 
+### Ultra-trusted local hot-run prototype
+
+`scripts/hot-run` is a deliberately small Linux developer-loop prototype. It binds a task Git
+worktree onto the pathname of a warmed resident worktree and gives the task a persistent private
+OverlayFS upper over the resident Cargo target:
+
+```bash
+/path/to/resident/scripts/hot-run \
+  --task /path/to/task-worktree \
+  -- cargo test --locked --lib --bins
+```
+
+The task and resident must be worktrees of the same Git repository. The resident worktree remains
+the stable compiler pathname, while task source changes remain in the ordinary task worktree and
+compiler writes land in a task-private state directory. One non-blocking lock prevents concurrent
+mounts of the same upper/work pair. The command receives the caller's terminal, environment, host
+filesystem, devices, processes, and network and returns the child's status. This is explicitly an
+ultra-trusted performance tool, not a security boundary or result-authority mechanism.
+
+Unprivileged bubblewrap maps host identities outside the caller's user namespace to the overflow
+identity. Commands that deliberately validate host ownership, mount identity, or other physical
+namespace facts must use the ordinary host path and final verifier. The hot path is for compilation,
+language tools, repository scripts, and tests whose semantics do not depend on those host facts.
+
+On Ubuntu 26.04.1, Linux 7.0, ext4, Rust 1.97.1, and Glaeda `7f40597`, one bounded G0 probe used the
+same `cargo test --locked --lib --bins --no-run` command at four Cargo jobs. A fresh ordinary
+worktree/path took about 39–42 seconds to compile. An exact task over a resident target started in
+0.03 seconds; after a one-line task edit, the private target upper completed in 9.21 seconds. A
+direct unmodified full library/binary test execution was 2.63 seconds. These observations promote
+the stable-path/private-upper experiment, not OverlayFS as the final write-heavy storage default.
+The resulting script measured 0.05 seconds for no-op Bash and Python commands, 0.13 seconds for an
+exact Rust no-run check, and 10.06 seconds after the same one-line edit versus a 37.56-second
+path-cold rebuild.
+
+The default task state is an opaque path under the user's cache directory. It is expendable:
+discarding it or selecting a new empty `--state` path produces a private cold upper and a normal
+compiler rebuild. Bubblewrap and kernel OverlayFS are required for cross-worktree mode; running
+directly in the resident worktree does not require either.
+
 ## Linux mount path
 
 The privileged OverlayFS mount machinery is also concrete.
