@@ -1,8 +1,11 @@
 //! Research-only same-HEAD task materialization on Linux reflink filesystems.
 //!
-//! This adapter mutates only one caller-selected absent target worktree. It deliberately carries
+//! This adapter creates caller-selected absent target worktrees and necessarily lets Git register
+//! them beneath the source repository's common administration directory. It deliberately carries
 //! no project lease, source authority, task adoption, cache, execution, cleanup, or product-default
-//! authority. Ordinary Git materialization remains the complete fallback.
+//! authority. It also has no local deadline or cancellation protocol: the outer runtime must own
+//! the Git child process group and prove that child is gone before cleaning or reconstructing an
+//! interrupted target. Ordinary Git materialization remains the complete fallback.
 
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
@@ -12,13 +15,15 @@ use std::io::{Read as _, Write as _};
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::time::Instant;
 
 use rustix::fs::ioctl_ficlone;
 use serde::Serialize;
 
-use crate::git_index_stat_patch::{GitIndexStat, GitIndexStatUpdate, patch_git_index_v2_stats};
+use crate::git_index_stat_patch::{
+    GitIndexStat, GitIndexStatUpdate, patch_git_index_v2_stats, sha1,
+};
 
 pub const REFLINK_TASK_MATERIALIZATION_SCHEMA_VERSION: u8 = 1;
 const MAX_GIT_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
@@ -249,6 +254,7 @@ impl std::error::Error for ReflinkTaskMaterializationError {}
 struct TreeEntry {
     path: Vec<u8>,
     mode: u32,
+    oid: [u8; 20],
 }
 
 #[derive(Debug, Clone)]
@@ -282,8 +288,9 @@ struct PhaseTimings {
 /// # Errors
 ///
 /// Returns a path-free error when request validation, ordinary Git fallback, final Git proof, or
-/// bounded report construction fails. A returned error may leave the exact requested target as
-/// discardable recovery state; directory presence alone never grants task readiness.
+/// bounded report construction fails. A returned error may leave the exact requested target and
+/// its source-repository linked-worktree registration as discardable cleanup debt; directory
+/// presence alone never grants task readiness.
 pub fn materialize_reflink_task(
     request: &ReflinkTaskMaterializationRequest,
 ) -> Result<ReflinkTaskMaterializationReport, ReflinkTaskMaterializationError> {
@@ -293,6 +300,7 @@ pub fn materialize_reflink_task(
     let mut worktree_created = false;
     let mut fallback_reason = None;
 
+    let common_git_directory = source_common_git_directory(request)?;
     let inventory = list_tree(request)?;
     let expected_tree = commit_tree(request)?;
 
@@ -300,17 +308,25 @@ pub fn materialize_reflink_task(
         ReflinkTaskMaterializationMode::Ordinary => {
             let worktree_started = Instant::now();
             add_worktree(request, false).map_err(|_| ordinary_materialization_failed())?;
+            target_git_directory(request, &common_git_directory)
+                .map_err(|_| ordinary_materialization_failed())?;
             timings.worktree_microseconds = elapsed_microseconds(worktree_started);
             worktree_created = true;
             ReflinkTaskMaterializationDisposition::Ordinary
         }
         ReflinkTaskMaterializationMode::ReflinkWithFallback => {
-            match materialize_candidate(request, &inventory, &mut timings, &mut worktree_created) {
+            match materialize_candidate(
+                request,
+                &inventory,
+                &common_git_directory,
+                &mut timings,
+                &mut worktree_created,
+            ) {
                 Ok(()) => ReflinkTaskMaterializationDisposition::Reflinked,
                 Err(failure) => {
                     fallback_reason = Some(failure.code);
                     let fallback_started = Instant::now();
-                    ordinary_fallback(request, worktree_created)
+                    ordinary_fallback(request, worktree_created, &common_git_directory)
                         .map_err(|_| ordinary_fallback_failed())?;
                     timings.fallback_microseconds = elapsed_microseconds(fallback_started);
                     worktree_created = true;
@@ -322,15 +338,16 @@ pub fn materialize_reflink_task(
 
     debug_assert!(worktree_created);
     let proof_started = Instant::now();
-    let tree = match final_git_proof(request, &expected_tree) {
+    let tree = match final_git_proof(request, &expected_tree, &common_git_directory) {
         Ok(tree) => tree,
         Err(_) if disposition == ReflinkTaskMaterializationDisposition::Reflinked => {
             fallback_reason = Some("candidate_final_git_proof_failed");
             let fallback_started = Instant::now();
-            ordinary_fallback(request, true).map_err(|_| ordinary_fallback_failed())?;
+            ordinary_fallback(request, true, &common_git_directory)
+                .map_err(|_| ordinary_fallback_failed())?;
             timings.fallback_microseconds = elapsed_microseconds(fallback_started);
             disposition = ReflinkTaskMaterializationDisposition::OrdinaryFallback;
-            final_git_proof(request, &expected_tree)?
+            final_git_proof(request, &expected_tree, &common_git_directory)?
         }
         Err(error) => return Err(error),
     };
@@ -392,19 +409,23 @@ pub fn render_reflink_task_materialization_human(
 /// # Errors
 ///
 /// Returns a path-free error if any ordinary fallback or final Git proof fails. A returned error
-/// may leave only the exact requested targets as discardable recovery state.
+/// may leave the exact requested targets and their source-repository linked-worktree registrations
+/// as discardable cleanup debt.
 pub fn materialize_reflink_task_fanout(
     request: &ReflinkTaskFanoutRequest,
 ) -> Result<ReflinkTaskFanoutReport, ReflinkTaskMaterializationError> {
     let started = Instant::now();
     let first = request.tasks.first().ok_or_else(request_invalid)?;
+    let common_git_directory = source_common_git_directory(first)?;
     let inventory = list_tree(first)?;
     let expected_tree = commit_tree(first)?;
     let mut source_proof_microseconds = 0_u64;
 
     let preparation_started = Instant::now();
     let mut preparations = match first.mode {
-        ReflinkTaskMaterializationMode::Ordinary => parallel_ordinary_add(&request.tasks)?,
+        ReflinkTaskMaterializationMode::Ordinary => {
+            parallel_ordinary_add(&request.tasks, &common_git_directory)?
+        }
         ReflinkTaskMaterializationMode::ReflinkWithFallback => {
             let source_proof_started = Instant::now();
             let initial_source = observe_exact_clean_source(first);
@@ -423,7 +444,11 @@ pub fn materialize_reflink_task_fanout(
                     .map(|_| PreparedTask::failed(false, candidate("tree_inventory_unsupported")))
                     .collect()
             } else {
-                parallel_reflink_prepare(&request.tasks, &inventory.regular_entries)?
+                parallel_reflink_prepare(
+                    &request.tasks,
+                    &inventory.regular_entries,
+                    &common_git_directory,
+                )?
             }
         }
     };
@@ -446,7 +471,12 @@ pub fn materialize_reflink_task_fanout(
     }
 
     let finalization_started = Instant::now();
-    let finalized = parallel_finalize(&request.tasks, preparations, &expected_tree)?;
+    let finalized = parallel_finalize(
+        &request.tasks,
+        preparations,
+        &expected_tree,
+        &common_git_directory,
+    )?;
     let parallel_finalization_microseconds = elapsed_microseconds(finalization_started);
     let tree = common_final_tree(&finalized)?;
     let logical_bytes = logical_bytes(&first.target, &inventory.regular_entries)
@@ -546,6 +576,7 @@ struct FinalizedTask {
 
 fn parallel_ordinary_add(
     tasks: &[ReflinkTaskMaterializationRequest],
+    common_git_directory: &Path,
 ) -> Result<Vec<PreparedTask>, ReflinkTaskMaterializationError> {
     std::thread::scope(|scope| {
         let handles = tasks
@@ -553,6 +584,8 @@ fn parallel_ordinary_add(
             .map(|task| {
                 scope.spawn(move || {
                     add_worktree(task, false)?;
+                    target_git_directory(task, common_git_directory)
+                        .map_err(|_| ordinary_materialization_failed())?;
                     Ok(PreparedTask {
                         worktree_created: true,
                         result: Ok(None),
@@ -570,11 +603,16 @@ fn parallel_ordinary_add(
 fn parallel_reflink_prepare(
     tasks: &[ReflinkTaskMaterializationRequest],
     entries: &[TreeEntry],
+    common_git_directory: &Path,
 ) -> Result<Vec<PreparedTask>, ReflinkTaskMaterializationError> {
     let mut preparations = std::thread::scope(|scope| {
         let handles = tasks
             .iter()
-            .map(|task| scope.spawn(move || prepare_reflink_worktree(task, entries.len())))
+            .map(|task| {
+                scope.spawn(move || {
+                    prepare_reflink_worktree(task, entries.len(), common_git_directory)
+                })
+            })
             .collect::<Vec<_>>();
         handles
             .into_iter()
@@ -588,12 +626,14 @@ fn parallel_reflink_prepare(
 fn prepare_reflink_worktree(
     request: &ReflinkTaskMaterializationRequest,
     entry_count: usize,
+    common_git_directory: &Path,
 ) -> PreparedTask {
     let mut worktree_created = false;
     let result = (|| {
         same_filesystem(&request.source, &request.target)?;
         add_worktree(request, true).map_err(|_| candidate("candidate_worktree_failed"))?;
         worktree_created = true;
+        target_git_directory(request, common_git_directory)?;
         run_git(
             request,
             &request.target,
@@ -704,7 +744,7 @@ fn reflink_entry_chunk(
         .collect::<Vec<_>>();
     for entry in entries {
         let relative = PathBuf::from(OsString::from_vec(entry.path.clone()));
-        let source = OpenOptions::new()
+        let mut source = OpenOptions::new()
             .read(true)
             .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
             .open(first.source.join(&relative))
@@ -718,6 +758,7 @@ fn reflink_entry_chunk(
         {
             return Err(candidate("candidate_source_mismatch"));
         }
+        verify_source_blob(&mut source, &source_metadata, entry.oid)?;
 
         for (task, result) in tasks.iter().zip(results.iter_mut()) {
             let Ok(updates) = result else {
@@ -775,6 +816,7 @@ fn parallel_finalize(
     tasks: &[ReflinkTaskMaterializationRequest],
     preparations: Vec<PreparedTask>,
     expected_tree: &str,
+    common_git_directory: &Path,
 ) -> Result<Vec<FinalizedTask>, ReflinkTaskMaterializationError> {
     if tasks.len() != preparations.len() {
         return Err(fanout_failed());
@@ -784,7 +826,9 @@ fn parallel_finalize(
             .iter()
             .zip(preparations)
             .map(|(task, preparation)| {
-                scope.spawn(move || finalize_task(task, preparation, expected_tree))
+                scope.spawn(move || {
+                    finalize_task(task, preparation, expected_tree, common_git_directory)
+                })
             })
             .collect::<Vec<_>>();
         handles
@@ -798,16 +842,17 @@ fn finalize_task(
     request: &ReflinkTaskMaterializationRequest,
     preparation: PreparedTask,
     expected_tree: &str,
+    common_git_directory: &Path,
 ) -> Result<FinalizedTask, ReflinkTaskMaterializationError> {
     match preparation.result {
         Ok(None) => Ok(FinalizedTask {
             disposition: ReflinkTaskMaterializationDisposition::Ordinary,
             fallback_reason: None,
-            tree: final_git_proof(request, expected_tree)?,
+            tree: final_git_proof(request, expected_tree, common_git_directory)?,
         }),
         Ok(Some(updates)) => {
-            if patch_target_index(request, &updates).is_ok()
-                && let Ok(tree) = final_git_proof(request, expected_tree)
+            if patch_target_index(request, &updates, common_git_directory).is_ok()
+                && let Ok(tree) = final_git_proof(request, expected_tree, common_git_directory)
             {
                 return Ok(FinalizedTask {
                     disposition: ReflinkTaskMaterializationDisposition::Reflinked,
@@ -815,20 +860,21 @@ fn finalize_task(
                     tree,
                 });
             }
-            ordinary_fallback(request, true).map_err(|_| ordinary_fallback_failed())?;
+            ordinary_fallback(request, true, common_git_directory)
+                .map_err(|_| ordinary_fallback_failed())?;
             Ok(FinalizedTask {
                 disposition: ReflinkTaskMaterializationDisposition::OrdinaryFallback,
                 fallback_reason: Some("candidate_finalization_failed"),
-                tree: final_git_proof(request, expected_tree)?,
+                tree: final_git_proof(request, expected_tree, common_git_directory)?,
             })
         }
         Err(failure) => {
-            ordinary_fallback(request, preparation.worktree_created)
+            ordinary_fallback(request, preparation.worktree_created, common_git_directory)
                 .map_err(|_| ordinary_fallback_failed())?;
             Ok(FinalizedTask {
                 disposition: ReflinkTaskMaterializationDisposition::OrdinaryFallback,
                 fallback_reason: Some(failure.code),
-                tree: final_git_proof(request, expected_tree)?,
+                tree: final_git_proof(request, expected_tree, common_git_directory)?,
             })
         }
     }
@@ -846,6 +892,7 @@ fn common_final_tree(tasks: &[FinalizedTask]) -> Result<String, ReflinkTaskMater
 fn materialize_candidate(
     request: &ReflinkTaskMaterializationRequest,
     inventory: &TreeInventory,
+    common_git_directory: &Path,
     timings: &mut PhaseTimings,
     worktree_created: &mut bool,
 ) -> Result<(), CandidateFailure> {
@@ -858,6 +905,7 @@ fn materialize_candidate(
     let worktree_started = Instant::now();
     add_worktree(request, true).map_err(|_| candidate("candidate_worktree_failed"))?;
     *worktree_created = true;
+    target_git_directory(request, common_git_directory)?;
     run_git(
         request,
         &request.target,
@@ -873,7 +921,7 @@ fn materialize_candidate(
     observe_exact_clean_source(request)?;
 
     let index_started = Instant::now();
-    patch_target_index(request, &updates)?;
+    patch_target_index(request, &updates, common_git_directory)?;
     timings.index_patch_microseconds = elapsed_microseconds(index_started);
     Ok(())
 }
@@ -881,9 +929,11 @@ fn materialize_candidate(
 fn ordinary_fallback(
     request: &ReflinkTaskMaterializationRequest,
     worktree_created: bool,
+    common_git_directory: &Path,
 ) -> Result<(), ReflinkTaskMaterializationError> {
     if worktree_created {
-        remove_index_lock(request);
+        target_git_directory(request, common_git_directory)
+            .map_err(|_| ordinary_fallback_failed())?;
         run_git(
             request,
             &request.target,
@@ -896,6 +946,8 @@ fn ordinary_fallback(
         )?;
     } else {
         add_worktree(request, false)?;
+        target_git_directory(request, common_git_directory)
+            .map_err(|_| ordinary_fallback_failed())?;
     }
     Ok(())
 }
@@ -1028,11 +1080,12 @@ fn parse_tree_entries(output: &[u8]) -> Result<TreeInventory, ReflinkTaskMateria
             return Err(tree_inventory_invalid());
         }
         let parsed_mode = u32::from_str_radix(mode, 8).map_err(|_| tree_inventory_invalid())?;
-        parse_sha1(oid.as_bytes())?;
+        let oid = parse_sha1(oid.as_bytes())?;
         if matches!(mode, "100644" | "100755") && kind == "blob" {
             entries.push(TreeEntry {
                 path,
                 mode: parsed_mode,
+                oid,
             });
         } else if matches!((mode, kind), ("120000", "blob") | ("160000", "commit")) {
             candidate_supported = false;
@@ -1063,7 +1116,7 @@ fn reflink_entries(
             fs::create_dir_all(parent).map_err(|_| candidate("candidate_target_create_failed"))?;
         }
 
-        let source = OpenOptions::new()
+        let mut source = OpenOptions::new()
             .read(true)
             .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
             .open(&source_path)
@@ -1077,6 +1130,7 @@ fn reflink_entries(
         {
             return Err(candidate("candidate_source_mismatch"));
         }
+        verify_source_blob(&mut source, &source_metadata, entry.oid)?;
 
         let target = OpenOptions::new()
             .write(true)
@@ -1124,6 +1178,28 @@ fn git_index_stat(metadata: &fs::Metadata) -> Result<GitIndexStat, CandidateFail
     ))
 }
 
+fn verify_source_blob(
+    source: &mut fs::File,
+    metadata: &fs::Metadata,
+    expected_oid: [u8; 20],
+) -> Result<(), CandidateFailure> {
+    let length =
+        usize::try_from(metadata.len()).map_err(|_| candidate("candidate_source_mismatch"))?;
+    let mut document = Vec::with_capacity(length.saturating_add(32));
+    document.extend_from_slice(b"blob ");
+    document.extend_from_slice(metadata.len().to_string().as_bytes());
+    document.push(0);
+    let header_length = document.len();
+    std::io::Read::by_ref(source)
+        .take(metadata.len().saturating_add(1))
+        .read_to_end(&mut document)
+        .map_err(|_| candidate("candidate_source_read_failed"))?;
+    if document.len().saturating_sub(header_length) != length || sha1(&document) != expected_oid {
+        return Err(candidate("candidate_source_oid_mismatch"));
+    }
+    Ok(())
+}
+
 fn same_file_snapshot(left: &fs::Metadata, right: &fs::Metadata) -> bool {
     left.dev() == right.dev()
         && left.ino() == right.ino()
@@ -1140,8 +1216,9 @@ fn same_file_snapshot(left: &fs::Metadata, right: &fs::Metadata) -> bool {
 fn patch_target_index(
     request: &ReflinkTaskMaterializationRequest,
     updates: &[GitIndexStatUpdate],
+    common_git_directory: &Path,
 ) -> Result<(), CandidateFailure> {
-    let index = target_index_path(request)?;
+    let index = target_index_path(request, common_git_directory)?;
     let bytes = fs::read(&index).map_err(|_| candidate("candidate_index_read_failed"))?;
     let patch = patch_git_index_v2_stats(&bytes, updates)
         .map_err(|_| candidate("candidate_index_patch_refused"))?;
@@ -1165,12 +1242,38 @@ fn patch_target_index(
 
 fn target_index_path(
     request: &ReflinkTaskMaterializationRequest,
+    common_git_directory: &Path,
 ) -> Result<PathBuf, CandidateFailure> {
-    Ok(target_git_directory(request)?.join("index"))
+    Ok(target_git_directory(request, common_git_directory)?.join("index"))
+}
+
+fn source_common_git_directory(
+    request: &ReflinkTaskMaterializationRequest,
+) -> Result<PathBuf, ReflinkTaskMaterializationError> {
+    let output = git_stdout(
+        request,
+        &request.source,
+        &[
+            OsStr::new("rev-parse"),
+            OsStr::new("--path-format=absolute"),
+            OsStr::new("--git-common-dir"),
+        ],
+    )?;
+    let directory = PathBuf::from(OsString::from_vec(trim_one_newline(output)));
+    if !is_normalized_absolute(&directory)
+        || fs::canonicalize(&directory).map_err(|_| git_output_invalid())? != directory
+        || !fs::metadata(&directory)
+            .map_err(|_| git_output_invalid())?
+            .is_dir()
+    {
+        return Err(git_output_invalid());
+    }
+    Ok(directory)
 }
 
 fn target_git_directory(
     request: &ReflinkTaskMaterializationRequest,
+    common_git_directory: &Path,
 ) -> Result<PathBuf, CandidateFailure> {
     let dot_git = request.target.join(".git");
     let document = read_bounded_regular_nofollow(&dot_git, MAX_GITDIR_FILE_BYTES)
@@ -1194,6 +1297,10 @@ fn target_git_directory(
             .map_err(|_| candidate("candidate_index_path_failed"))?
             .is_dir()
     {
+        return Err(candidate("candidate_index_path_failed"));
+    }
+    let expected_parent = common_git_directory.join("worktrees");
+    if git_directory.parent() != Some(expected_parent.as_path()) {
         return Err(candidate("candidate_index_path_failed"));
     }
     let backlink =
@@ -1224,17 +1331,13 @@ fn read_bounded_regular_nofollow(path: &Path, limit: u64) -> std::io::Result<Vec
     Ok(document)
 }
 
-fn remove_index_lock(request: &ReflinkTaskMaterializationRequest) {
-    if let Ok(index) = target_index_path(request) {
-        let _ = fs::remove_file(index.with_extension("lock"));
-    }
-}
-
 fn final_git_proof(
     request: &ReflinkTaskMaterializationRequest,
     expected_tree: &str,
+    common_git_directory: &Path,
 ) -> Result<String, ReflinkTaskMaterializationError> {
-    let git_directory = target_git_directory(request).map_err(|_| final_git_proof_failed())?;
+    let git_directory = target_git_directory(request, common_git_directory)
+        .map_err(|_| final_git_proof_failed())?;
     let head = trim_one_newline(
         read_bounded_regular_nofollow(&git_directory.join("HEAD"), 64)
             .map_err(|_| final_git_proof_failed())?,
@@ -1245,11 +1348,13 @@ fn final_git_proof(
     for arguments in [
         vec![
             OsStr::new("diff-files"),
+            OsStr::new("--no-ext-diff"),
             OsStr::new("--quiet"),
             OsStr::new("--"),
         ],
         vec![
             OsStr::new("diff-index"),
+            OsStr::new("--no-ext-diff"),
             OsStr::new("--cached"),
             OsStr::new("--quiet"),
             OsStr::new(&request.commit),
@@ -1266,14 +1371,16 @@ fn final_git_proof(
 fn commit_tree(
     request: &ReflinkTaskMaterializationRequest,
 ) -> Result<String, ReflinkTaskMaterializationError> {
-    git_text_line(
+    let tree = git_text_line(
         request,
         &request.source,
         &[
             OsStr::new("rev-parse"),
             OsStr::new(&format!("{}^{{tree}}", request.commit)),
         ],
-    )
+    )?;
+    parse_sha1(tree.as_bytes()).map_err(|_| git_output_invalid())?;
+    Ok(tree)
 }
 
 fn logical_bytes(source: &Path, entries: &[TreeEntry]) -> Result<u64, CandidateFailure> {
@@ -1325,8 +1432,12 @@ fn validate_request(
         return Err(request_invalid());
     }
     let parent = request.target.parent().ok_or_else(request_invalid)?;
+    let target_absent = matches!(
+        fs::symlink_metadata(&request.target),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    );
     if fs::canonicalize(parent).map_err(|_| request_invalid())? != parent
-        || request.target.exists()
+        || !target_absent
         || request.commit.len() != GIT_OID_HEX_BYTES
         || !request
             .commit
@@ -1415,9 +1526,7 @@ fn run_git(
     cwd: &Path,
     arguments: &[&OsStr],
 ) -> Result<Output, ReflinkTaskMaterializationError> {
-    let output = git_command(request, cwd, arguments)
-        .output()
-        .map_err(|_| git_execution_failed())?;
+    let output = bounded_git_output(git_command(request, cwd, arguments))?;
     if !output.status.success() {
         return Err(git_execution_failed());
     }
@@ -1429,13 +1538,48 @@ fn run_git_status(
     cwd: &Path,
     arguments: &[&OsStr],
 ) -> Result<i32, ReflinkTaskMaterializationError> {
-    let output = git_command(request, cwd, arguments)
-        .output()
+    let output = bounded_git_output(git_command(request, cwd, arguments))?;
+    output.status.code().ok_or_else(git_execution_failed)
+}
+
+fn bounded_git_output(mut command: Command) -> Result<Output, ReflinkTaskMaterializationError> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|_| git_execution_failed())?;
-    if output.stdout.len() > MAX_GIT_OUTPUT_BYTES || output.stderr.len() > MAX_GIT_OUTPUT_BYTES {
+    let stdout = child.stdout.take().ok_or_else(git_execution_failed)?;
+    let stderr = child.stderr.take().ok_or_else(git_execution_failed)?;
+    let (stdout, stderr, status) = std::thread::scope(|scope| {
+        let stdout = scope.spawn(move || read_bounded_git_stream(stdout));
+        let stderr = scope.spawn(move || read_bounded_git_stream(stderr));
+        let status = child.wait().map_err(|_| git_execution_failed());
+        (stdout.join(), stderr.join(), status)
+    });
+    Ok(Output {
+        status: status?,
+        stdout: stdout.map_err(|_| git_execution_failed())??,
+        stderr: stderr.map_err(|_| git_execution_failed())??,
+    })
+}
+
+fn read_bounded_git_stream(
+    mut stream: impl std::io::Read,
+) -> Result<Vec<u8>, ReflinkTaskMaterializationError> {
+    let mut output = Vec::new();
+    std::io::Read::by_ref(&mut stream)
+        .take(
+            u64::try_from(MAX_GIT_OUTPUT_BYTES)
+                .unwrap_or(u64::MAX)
+                .saturating_add(1),
+        )
+        .read_to_end(&mut output)
+        .map_err(|_| git_execution_failed())?;
+    if output.len() > MAX_GIT_OUTPUT_BYTES {
         return Err(git_output_invalid());
     }
-    output.status.code().ok_or_else(git_execution_failed)
+    Ok(output)
 }
 
 fn git_command(
@@ -1448,10 +1592,22 @@ fn git_command(
         .env_clear()
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_ALLOW_PROTOCOL", "")
+        .env("GIT_PROTOCOL_FROM_USER", "0")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", "/bin/false")
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("LC_ALL", "C")
+        .env("LANG", "C")
         .current_dir(cwd)
         .arg("--no-optional-locks")
+        .args(["-c", "credential.helper="])
+        .args(["-c", "core.fsmonitor=false"])
+        .args(["-c", "core.hooksPath=/dev/null"])
+        .args(["-c", "diff.external="])
+        .args(["-c", "worktree.useRelativePaths=false"])
         .arg("-C")
         .arg(cwd)
         .args(arguments);
@@ -1583,6 +1739,7 @@ mod tests {
         assert!(inventory.candidate_supported);
         assert_eq!(inventory.regular_entries.len(), 2);
         assert_eq!(inventory.regular_entries[0].path, b"a.txt");
+        assert_eq!(inventory.regular_entries[0].oid, [0x11; 20]);
         assert_eq!(inventory.regular_entries[1].mode, 0o100755);
 
         let unsupported = b"120000 blob 1111111111111111111111111111111111111111\tlink\0";
@@ -1617,6 +1774,7 @@ mod tests {
             ],
         );
         let commit = git(&source, &["rev-parse", "HEAD"]);
+        git(&source, &["config", "worktree.useRelativePaths", "true"]);
         let request = ReflinkTaskMaterializationRequest::new(
             "/usr/bin/git",
             source.clone(),
@@ -1633,15 +1791,19 @@ mod tests {
             fs::read(target.join("file.txt")).expect("target"),
             b"payload\n"
         );
-        let index = super::target_index_path(&request).expect("linked index");
+        let common_git_directory =
+            super::source_common_git_directory(&request).expect("common Git directory");
+        let index =
+            super::target_index_path(&request, &common_git_directory).expect("linked index");
         assert!(index.is_file());
         let git_directory = index.parent().expect("Git directory").to_owned();
         let dot_git = target.join(".git");
         let dot_git_document = fs::read(&dot_git).expect("dot Git document");
+        assert!(dot_git_document.starts_with(b"gitdir: /"));
         fs::remove_file(&dot_git).expect("remove dot Git document");
         symlink("/dev/null", &dot_git).expect("replace dot Git with symlink");
         assert_eq!(
-            super::target_index_path(&request)
+            super::target_index_path(&request, &common_git_directory)
                 .expect_err("symlink must fail")
                 .code,
             "candidate_index_path_failed"
@@ -1649,11 +1811,32 @@ mod tests {
         fs::remove_file(&dot_git).expect("remove symlink");
         fs::write(&dot_git, dot_git_document).expect("restore dot Git document");
 
+        let foreign_git_directory = root.join("foreign-git-directory");
+        fs::create_dir(&foreign_git_directory).expect("foreign Git directory");
+        fs::write(
+            foreign_git_directory.join("gitdir"),
+            format!("{}\n", dot_git.display()),
+        )
+        .expect("foreign backlink");
+        let accepted_dot_git_document = fs::read(&dot_git).expect("accepted dot Git document");
+        fs::write(
+            &dot_git,
+            format!("gitdir: {}\n", foreign_git_directory.display()),
+        )
+        .expect("foreign dot Git document");
+        assert_eq!(
+            super::target_index_path(&request, &common_git_directory)
+                .expect_err("foreign Git directory must fail")
+                .code,
+            "candidate_index_path_failed"
+        );
+        fs::write(&dot_git, accepted_dot_git_document).expect("restore accepted dot Git document");
+
         let backlink = git_directory.join("gitdir");
         let backlink_document = fs::read(&backlink).expect("backlink");
         fs::write(&backlink, b"/not/the/requested/task/.git\n").expect("replace backlink");
         assert_eq!(
-            super::target_index_path(&request)
+            super::target_index_path(&request, &common_git_directory)
                 .expect_err("wrong backlink must fail")
                 .code,
             "candidate_index_path_failed"
@@ -1662,6 +1845,28 @@ mod tests {
         git(
             &source,
             &["worktree", "remove", "--force", target.to_str().unwrap()],
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn source_blob_oid_binds_exact_open_file_bytes() {
+        let root = fixture();
+        let source = root.join("source");
+        fs::write(&source, b"payload\n").expect("source");
+        let mut file = fs::File::open(&source).expect("open source");
+        let metadata = file.metadata().expect("source metadata");
+        let expected = super::sha1(b"blob 8\0payload\n");
+        super::verify_source_blob(&mut file, &metadata, expected).expect("exact blob");
+
+        fs::write(&source, b"tampered").expect("same-length wrong source");
+        let mut file = fs::File::open(&source).expect("open wrong source");
+        let metadata = file.metadata().expect("wrong source metadata");
+        assert_eq!(
+            super::verify_source_blob(&mut file, &metadata, expected)
+                .expect_err("wrong blob must fail")
+                .code,
+            "candidate_source_oid_mismatch"
         );
         fs::remove_dir_all(root).expect("cleanup");
     }
@@ -1790,5 +1995,23 @@ mod tests {
         )
         .expect_err("line-delimited control paths are outside the boundary");
         assert_eq!(error.code(), "reflink_task_request_invalid");
+
+        let root = fixture();
+        let source = root.join("source");
+        let tasks = root.join("tasks");
+        fs::create_dir(&source).expect("source");
+        fs::create_dir(&tasks).expect("tasks");
+        let target = tasks.join("dangling");
+        symlink(tasks.join("absent-target"), &target).expect("dangling target symlink");
+        let error = ReflinkTaskMaterializationRequest::new(
+            "/usr/bin/git",
+            source,
+            target,
+            "1111111111111111111111111111111111111111",
+            ReflinkTaskMaterializationMode::Ordinary,
+        )
+        .expect_err("dangling symlink is not absent");
+        assert_eq!(error.code(), "reflink_task_request_invalid");
+        fs::remove_dir_all(root).expect("cleanup");
     }
 }

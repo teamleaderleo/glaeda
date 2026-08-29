@@ -371,8 +371,12 @@ reflink support all fail to ordinary materialization. Returned reports contain i
 counts, phase durations, dispositions, and fixed fallback classes but no paths or output.
 
 This code grants no resident-source lease, filesystem-generation lease, task adoption, execution,
-cache, cleanup, or reusable-checkout authority. The caller must still hold those lifecycle facts.
-Interrupted targets are discardable acceleration and directory presence never proves readiness.
+cache, cleanup, or reusable-checkout authority. The caller must still hold those lifecycle facts
+and authorize Git's required linked-worktree registration under the source common administration
+directory. Interrupted targets and their linked-worktree registrations are discardable cleanup
+debt; directory presence never proves readiness. The research adapter has no local deadline or
+cancellation protocol. Its outer Glaeda runtime must own the Git child process group and prove that
+child is gone before it cleans or reconstructs an interrupted target or linked registration.
 
 ### Exact big-red control
 
