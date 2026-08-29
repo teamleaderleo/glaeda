@@ -292,3 +292,48 @@ run order:
 - Overlay B1: `9f8ed0484a2311c57d24a83c95783564ea8b7bf67683653c03e352d94e8da2b4`
 - Overlay B2: `cbf8ee5adb63d42670b5fc78fa933fe778ac7891e23254be64c87a9f259c2db6`
 - private-copy A2: `dcf52a4e16de43bbf3e8714eebcea703933eb6fa4252dd13d23df4a4c2d7de1c`
+
+### Immediate retained-reuse discriminator
+
+Candidate `8fb5232fe38e7dc8d7fe5103c7c28b75b4aed0ad` / tree
+`98a60e35cfa651a6d5797ccf97399c561fc926a2` added and physically exercised the distinct
+retained-reuse window on big-red. Six runs used ext4 mount 44, fan-out 4, four disjoint four-CPU
+sets, 16 total Cargo jobs, resident/uncontrolled page cache, and the same edited source plus complete
+1,343-test validator in both measured windows. The two-sample controls were native, private-copy,
+and Overlay; run order was native, private-copy A1, Overlay B1/B2, private-copy A2, native.
+
+| Arm | First-use samples (s) | First median (s) | Retained-reuse samples (s) | Reuse median (s) | Reduction from first median |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| ordinary native | 25.872505, 27.227278 | 26.549892 | 17.996679, 17.846947 | 17.921813 | 32.50% |
+| private-copy | 28.038855, 26.975499 | 27.507177 | 18.452164, 20.805015 | 19.628590 | 28.64% |
+| Overlay | 29.582546, 29.279602 | 29.431074 | 18.199325, 17.942500 | 18.070913 | 38.60% |
+
+First use reproduced the prior direction: private-copy reached all four results 1.923897 seconds /
+6.54% sooner than Overlay. The immediate-reuse samples reversed that ordering: Overlay's median was
+1.557677 seconds / 7.94% sooner than private-copy. Ordinary native remained the no-isolation
+control; its reuse median was only 0.149100 seconds below Overlay, which this experiment cannot
+resolve as a meaningful difference. Two samples do not justify changing the path selector. They do
+show that expected lineage lifetime belongs in the next selector experiment rather than assuming
+the first-use winner is also the steady-state winner.
+
+Every private-copy first window proved `seeded` preparation in 0.863135–1.033674 seconds; every
+reuse window proved `reused` with exactly zero preparation time. Observed allocated file blocks
+grew between first and second windows by 16–20 KiB native, 64 KiB private-copy, and zero in both
+Overlay samples. All 48 measured task validators were accepted, all windows observed four
+simultaneous tasks, all six cleanups removed five of five worktrees, and the scratch root ended
+empty.
+
+Host aggregate CPU PSI `some` fractions were 1.24–1.99% during first use and 0.46–0.95% during
+reuse. I/O PSI `some` was much larger and variable: 8.67–16.32% first use and 13.08–21.45% reuse.
+The receipts therefore support the large within-lineage reuse reduction, but not fine-grained
+sub-second ordering. A longer retained sequence with more repetitions should decide whether
+Overlay's apparent steady-state advantage survives quieter I/O and later commands.
+
+Receipt SHA-256 digests:
+
+- native A1: `026bd905d9ccb128a244c003a8bbd463ea75cddc224f355476896c6b2c3fa6c9`
+- private-copy A1: `8570318d2a946d3da11750b1aecd0e25d27d4b932ccc898bd007409fa8040dc5`
+- Overlay B1: `e1bc3b0f50e8ca577a2ce2a6a38af1746fc3c5f8af8492dd82d48b9bc5b57b16`
+- Overlay B2: `df4d3130a4a994d6e86333dd2469c6a3a5d887f5042e3a7ff25087f4dee525ec`
+- private-copy A2: `2fa4216756108b90c1b35f6bbbd50092cf8e2517a618ee470e8a49a05600ceeb`
+- native A2: `ea08811d6e93ef595ab94479457f6f6765bc54abedabdad053a0a3d67484696e`

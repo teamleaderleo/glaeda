@@ -212,6 +212,13 @@ distinct state phase, so first materialization and repeated command execution ca
 one pressure treatment. This measures the repeated developer loop Glaeda is intended to improve;
 it does not skip tests or grant cached-result authority.
 
+The first fan-out-4 use of that window measured two samples per arm. Complete first-use medians
+were 26.55 seconds native, 27.51 seconds private-copy, and 29.43 seconds Overlay. Immediate reuse
+fell to 17.92, 19.63, and 18.07 seconds respectively while every task reran and accepted the same
+1,343-test validator. Private-copy retained its first-use advantage over Overlay; Overlay had the
+lower reuse median in this small, I/O-pressured sample. Keep the current first-use default and run a
+longer stable-lineage sequence before making expected reuse lifetime part of automatic selection.
+
 Python and Node projects can explicitly reuse immutable prepared dependencies while keeping build
 output private:
 
