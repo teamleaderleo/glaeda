@@ -338,9 +338,18 @@ elapsed time, user/system CPU time, peak RSS, exit/signal, completion reason, co
 cross-worktree mode, relative cache policies, and the optional public runtime contract plus its
 path-free descendant-bin binding when selected. A
 `private-copy` observation also records whether the lineage was seeded or reused, its copy wall
-time, and command-plus-copy wall time. Copy CPU/RSS are not included in the command resource fields.
-The receipt contains no command, output, environment, repository identity, or private path and
-grants no verification or result-reuse authority.
+time, and command-plus-preparation wall time. With `--seed-source-mtimes`, when a task-private
+`target` is first seeded, Glaeda compares tracked regular files through beneath-root, no-follow
+descriptors and gives only byte-identical, executable-mode-compatible, singly linked task files the
+resident file's mtime. This
+preserves Cargo freshness
+for an ordinary worktree created after its exact warm parent without backdating an edited file.
+The caller must already own exact warm-parent proof; the flag creates none. The matching pass is
+recorded with bounded counts and time. It never runs on retained state: a
+file reverted after a prior task build must remain newer so Cargo can rebuild it. Copy/matching
+CPU and RSS are not included in the command resource fields. The receipt contains no command,
+output, environment, repository identity, file name, or private path and grants no verification
+or result-reuse authority.
 
 The same receipt includes aggregate Linux machine observations immediately before process start and
 after process settlement. Fixed kernel interfaces supply online/allowed CPU counts, load averages,
@@ -359,13 +368,15 @@ is very slightly wider than child elapsed, so tiny-command fractions are contami
 not an admission threshold.
 
 This derived machine-observation shape entered hot-run measurement schema version 3. Schema version
-4 adds one optional caller-owned `comparison_key`: a canonical opaque SHA-256 digest covering the
-exact workload/source/toolchain/cache/fan-out basis that the caller already owns. It is accepted
-only with `--measurement`, records no command or private input, and grants no semantic, result,
-cache, scheduling, or admission authority. Existing version 1 through 3 receipts remain historical
-observations; no producer silently relabels them as comparable.
+4 added one optional caller-owned `comparison_key`: a canonical opaque SHA-256 digest covering the
+exact workload/source/toolchain/cache/fan-out basis that the caller already owns. Schema version 5
+adds the path-free seed-only source-metadata preparation above and includes its time in total
+preparation. The comparison key is accepted only with `--measurement`, records no command or
+private input, and grants no semantic, result, cache, scheduling, or admission authority. Existing
+version 1 through 4 receipts remain historical observations; no producer silently relabels them as
+comparable.
 
-Two or more successful schema-v4 receipts carrying the exact same key can be reduced without a
+Two or more successful schema-v5 receipts carrying the exact same key can be reduced without a
 persistent history service:
 
 ```bash

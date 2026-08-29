@@ -37,6 +37,8 @@ HEAVY_SCOPE_PROPERTIES = (
 )
 TERMINATION_GRACE_SECONDS = 2.0
 MAX_PROC_OBSERVATION_BYTES = 64 * 1024
+MAX_TRACKED_PATH_BYTES = 32 * 1024 * 1024
+FILE_COMPARE_CHUNK_BYTES = 1024 * 1024
 PRESSURE_KINDS = ("cpu", "memory", "io")
 SHA256_PREFIX = "sha256:"
 
@@ -52,6 +54,17 @@ class CachePreparation:
     path: Path
     mode: str
     disposition: str
+    elapsed_seconds: float
+
+
+@dataclass(frozen=True)
+class SourcePreparation:
+    mode: str
+    disposition: str
+    tracked_path_count: int
+    normalized_regular_file_count: int
+    differing_regular_file_count: int
+    skipped_path_count: int
     elapsed_seconds: float
 
 
@@ -435,6 +448,167 @@ def prepare_private_copy(
     )
 
 
+def tracked_paths(root: Path) -> tuple[Path, ...]:
+    git = shutil.which("git")
+    if git is None:
+        raise RuntimeError("required capability git is unavailable")
+    result = subprocess.run(
+        [os.path.abspath(git), "ls-files", "-z", "--cached", "--"],
+        cwd=root,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        timeout=30,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError("tracked source inventory is unavailable")
+    if len(result.stdout) > MAX_TRACKED_PATH_BYTES:
+        raise RuntimeError("tracked source inventory exceeds the bounded input size")
+    if result.stdout and not result.stdout.endswith(b"\0"):
+        raise RuntimeError("tracked source inventory is malformed")
+    paths: list[Path] = []
+    for encoded in result.stdout.split(b"\0"):
+        if not encoded:
+            continue
+        path = Path(os.fsdecode(encoded))
+        if path.is_absolute() or path in (Path("."), Path("..")) or ".." in path.parts:
+            raise RuntimeError("tracked source inventory contains an invalid path")
+        paths.append(path)
+    return tuple(paths)
+
+
+def open_beneath(root: Path, path: Path) -> int:
+    root_fd = os.open(
+        root,
+        os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+    )
+    parent_fd = root_fd
+    try:
+        for component in path.parts[:-1]:
+            next_fd = os.open(
+                component,
+                os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=parent_fd,
+            )
+            if parent_fd != root_fd:
+                os.close(parent_fd)
+            parent_fd = next_fd
+        return os.open(
+            path.parts[-1],
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=parent_fd,
+        )
+    finally:
+        if parent_fd != root_fd:
+            os.close(parent_fd)
+        os.close(root_fd)
+
+
+def normalize_matching_regular_file_mtime(
+    resident_root: Path, task_root: Path, path: Path
+) -> str:
+    resident_fd: int | None = None
+    task_fd: int | None = None
+    try:
+        try:
+            resident_fd = open_beneath(resident_root, path)
+            task_fd = open_beneath(task_root, path)
+        except OSError:
+            return "skipped"
+        resident_before = os.fstat(resident_fd)
+        task_before = os.fstat(task_fd)
+        if not stat.S_ISREG(resident_before.st_mode) or not stat.S_ISREG(task_before.st_mode):
+            return "skipped"
+        if task_before.st_nlink != 1:
+            return "skipped"
+        if (
+            resident_before.st_size != task_before.st_size
+            or bool(resident_before.st_mode & 0o111) != bool(task_before.st_mode & 0o111)
+        ):
+            return "different"
+        while True:
+            resident_chunk = os.read(resident_fd, FILE_COMPARE_CHUNK_BYTES)
+            task_chunk = os.read(task_fd, FILE_COMPARE_CHUNK_BYTES)
+            if resident_chunk != task_chunk:
+                return "different"
+            if not resident_chunk:
+                break
+        resident_after = os.fstat(resident_fd)
+        task_after = os.fstat(task_fd)
+        for before, after in (
+            (resident_before, resident_after),
+            (task_before, task_after),
+        ):
+            if (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+            ) != (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            ):
+                return "skipped"
+        os.utime(
+            task_fd,
+            ns=(task_after.st_atime_ns, resident_after.st_mtime_ns),
+        )
+        return "normalized"
+    finally:
+        if task_fd is not None:
+            os.close(task_fd)
+        if resident_fd is not None:
+            os.close(resident_fd)
+
+
+def prepare_seed_source_metadata(
+    resident: Path,
+    task: Path,
+    cache_preparations: tuple[CachePreparation, ...],
+) -> SourcePreparation | None:
+    target_preparation = next(
+        (
+            item
+            for item in cache_preparations
+            if item.path == Path("target") and item.mode == "private-copy"
+        ),
+        None,
+    )
+    if target_preparation is None:
+        return None
+    mode = "resident_mtime_for_identical_tracked_regular_files_v1"
+    if target_preparation.disposition == "reused":
+        return SourcePreparation(mode, "retained_state_unchanged", 0, 0, 0, 0, 0.0)
+
+    started = time.monotonic()
+    paths = tracked_paths(task)
+    normalized = 0
+    different = 0
+    skipped = 0
+    for path in paths:
+        result = normalize_matching_regular_file_mtime(resident, task, path)
+        if result == "normalized":
+            normalized += 1
+        elif result == "different":
+            different += 1
+        else:
+            skipped += 1
+    return SourcePreparation(
+        mode,
+        "normalized_on_seed",
+        len(paths),
+        normalized,
+        different,
+        skipped,
+        time.monotonic() - started,
+    )
+
+
 def resolve_program(
     command: list[str], task: Path, search_path: str | None = None
 ) -> list[str]:
@@ -637,6 +811,7 @@ def write_measurement(
     timeout_seconds: float | None,
     cache_specs: tuple[CacheSpec, ...],
     cache_preparations: tuple[CachePreparation, ...],
+    source_preparation: SourcePreparation | None,
     runtime_contract: RuntimeContract | None,
     cross_worktree: bool,
     resource_profile: str | None,
@@ -646,9 +821,11 @@ def write_measurement(
 ) -> None:
     destination = Path(os.path.abspath(destination))
     destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    preparation_elapsed = sum(item.elapsed_seconds for item in cache_preparations)
+    preparation_elapsed = sum(item.elapsed_seconds for item in cache_preparations) + (
+        source_preparation.elapsed_seconds if source_preparation is not None else 0.0
+    )
     report = {
-        "schema_version": 4,
+        "schema_version": 5,
         "document_type": "glaeda-hot-run-measurement",
         "authority": "developer_observation_only",
         "comparison_key": comparison_key,
@@ -675,6 +852,23 @@ def write_measurement(
             }
             for item in cache_preparations
         ],
+        "source_preparation": (
+            {
+                "mode": source_preparation.mode,
+                "disposition": source_preparation.disposition,
+                "tracked_path_count": source_preparation.tracked_path_count,
+                "normalized_regular_file_count": (
+                    source_preparation.normalized_regular_file_count
+                ),
+                "differing_regular_file_count": (
+                    source_preparation.differing_regular_file_count
+                ),
+                "skipped_path_count": source_preparation.skipped_path_count,
+                "elapsed_seconds": round(source_preparation.elapsed_seconds, 6),
+            }
+            if source_preparation is not None
+            else None
+        ),
         "runtime": (
             {
                 "id": runtime_contract.runtime_id,
@@ -773,6 +967,7 @@ def execute(
     measurement: Path | None,
     cache_specs: tuple[CacheSpec, ...],
     cache_preparations: tuple[CachePreparation, ...],
+    source_preparation: SourcePreparation | None,
     runtime_contract: RuntimeContract | None,
     cross_worktree: bool,
     resource_profile: str | None,
@@ -920,6 +1115,7 @@ def execute(
             timeout_seconds,
             cache_specs,
             cache_preparations,
+            source_preparation,
             runtime_contract,
             cross_worktree,
             resource_profile,
@@ -935,6 +1131,7 @@ def run(
     task_argument: Path,
     state_argument: Path | None,
     cache_arguments: list[str],
+    seed_source_mtimes: bool,
     runtime_id: str | None,
     runtime_sha256: str | None,
     runtime_bin_argument: Path | None,
@@ -983,6 +1180,14 @@ def run(
     )
     cache_specs = explicit_cache_specs or default_cache_specs(resident)
 
+    if seed_source_mtimes and not any(
+        spec.path == Path("target") and spec.mode == "private-copy"
+        for spec in cache_specs
+    ):
+        raise RuntimeError(
+            "seed source mtimes require a task-private target copy"
+        )
+
     if resident == task:
         direct_cache_specs = explicit_cache_specs or ()
         if any(spec.mode != "native" for spec in direct_cache_specs):
@@ -996,6 +1201,7 @@ def run(
             measurement,
             direct_cache_specs,
             (),
+            None,
             runtime_contract,
             cross_worktree=False,
             resource_profile=resource_profile,
@@ -1080,6 +1286,11 @@ def run(
             prepare_private_copy(spec, resident_cache, private)
             for spec, resident_cache, private in private_copy_candidates
         )
+        source_preparation = (
+            prepare_seed_source_metadata(resident, task, cache_preparations)
+            if seed_source_mtimes
+            else None
+        )
 
         git_view = tempfile.TemporaryDirectory(prefix=".git-view-", dir=state_root)
         git_view_root = Path(git_view.name)
@@ -1126,6 +1337,7 @@ def run(
             measurement,
             cache_specs,
             cache_preparations,
+            source_preparation,
             runtime_contract,
             cross_worktree=True,
             resource_profile=resource_profile,
@@ -1204,6 +1416,14 @@ def main() -> int:
             "target:private-copy when present"
         ),
     )
+    parser.add_argument(
+        "--seed-source-mtimes",
+        action="store_true",
+        help=(
+            "on first target:private-copy seed only, give byte-identical tracked "
+            "regular task files resident mtimes; requires caller-owned exact warm-parent proof"
+        ),
+    )
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     arguments = parser.parse_args()
@@ -1220,6 +1440,7 @@ def main() -> int:
             arguments.task,
             arguments.state,
             arguments.cache,
+            arguments.seed_source_mtimes,
             arguments.runtime_id,
             arguments.runtime_sha256,
             arguments.runtime_bin,
