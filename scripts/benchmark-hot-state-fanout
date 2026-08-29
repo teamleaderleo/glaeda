@@ -26,7 +26,8 @@ from pathlib import Path
 from typing import Any
 
 
-ROOT = Path(__file__).resolve().parent.parent
+SCRIPT = Path(__file__).resolve()
+ROOT = SCRIPT.parent.parent
 HOT_RUN = ROOT / "scripts" / "hot-run"
 BENCHMARK = ROOT / "scripts" / "benchmark-developer-loop"
 FIXTURE = ROOT / "benchmarks" / "developer-loop-doc-edit.patch"
@@ -39,8 +40,11 @@ SOURCE_TREE = "edd0b7bb9d3e59305c21c69b721b5278d8aff6da"
 FIXTURE_DIGEST = "sha256:bfdd60e73e8b106c0129d1052310495ae2dbe1ff70bb52b35a9f9ef4911927eb"
 FIXTURE_FILE_DIGEST = "sha256:c51d467376a86adfeafa7a2b161d216ca6d6e2eb9d48ac08fe6585edcd1cec0d"
 EMPTY_DIFF_DIGEST = f"sha256:{hashlib.sha256(b'').hexdigest()}"
-RUSTC_VERSION_PREFIX = "rustc 1.97.1 "
-CARGO_VERSION_PREFIX = "cargo 1.97.1 "
+RUSTC_VERSION = "rustc 1.97.1 (8bab26f4f 2026-07-14)"
+CARGO_VERSION = "cargo 1.97.1 (c980f4866 2026-06-30)"
+RUSTC_SHA256 = "d3a664c970a9fd8361b64194861bebc1ae37b9054e5ee3400dc1c9e691797eea"
+CARGO_SHA256 = "828980723df339d62434390e9fb8ef8831036583343ae2316b7ab5646b5c1953"
+COMPARISON_BASIS_VERSION = 1
 ARMS = ("ordinary-native", "private", "overlay", "private-copy")
 FANOUTS = (1, 4, 8)
 DEFAULT_DEADLINE_SECONDS = 900
@@ -88,6 +92,11 @@ class ExperimentPlan:
                 "page_cache_treatment": "resident_uncontrolled_warm",
             },
             "workload": workload_identity(),
+            "comparison": {
+                "basis_schema_version": COMPARISON_BASIS_VERSION,
+                "prime_key": comparison_key(self, edited=False),
+                "edit_key": comparison_key(self, edited=True),
+            },
         }
 
 
@@ -109,6 +118,57 @@ def workload_identity() -> dict[str, Any]:
         "expected_executed_test_count": 1343,
         "excluded_host_fact_test_count": 16,
     }
+
+
+def comparison_basis(plan: ExperimentPlan, edited: bool) -> dict[str, Any]:
+    """Return the path-free, exact-work basis owned by this closed harness."""
+    return {
+        "schema_version": COMPARISON_BASIS_VERSION,
+        "document_type": "glaeda-hot-state-fanout-comparison-basis",
+        "workload": {
+            **workload_identity(),
+            "tracked_workload_dirty": edited,
+            "tracked_workload_diff_digest": (
+                FIXTURE_DIGEST if edited else EMPTY_DIFF_DIGEST
+            ),
+        },
+        "toolchain": {
+            "rustc": RUSTC_VERSION,
+            "rustc_program_sha256": f"sha256:{RUSTC_SHA256}",
+            "cargo": CARGO_VERSION,
+            "cargo_program_sha256": f"sha256:{CARGO_SHA256}",
+        },
+        "producer_programs": {
+            "fanout_harness_sha256": f"sha256:{file_sha256(SCRIPT)}",
+            "hot_run_sha256": f"sha256:{file_sha256(HOT_RUN)}",
+            "semantic_benchmark_sha256": f"sha256:{file_sha256(BENCHMARK)}",
+        },
+        "treatment": {
+            "arm": plan.arm,
+            "fanout": plan.fanout,
+            "cargo_build_jobs_per_task": plan.cargo_jobs_per_task,
+            "configured_total_cargo_jobs": (
+                plan.fanout * plan.cargo_jobs_per_task
+            ),
+            "available_cpu_ids": list(plan.available_cpu_ids),
+            "task_cpu_sets": [list(cpu_set) for cpu_set in plan.task_cpu_sets],
+            "cpu_enforcement": "linux_sched_affinity",
+            "memory_enforcement": "host_default_unbounded",
+            "cargo_incremental": True,
+            "cargo_network": "offline",
+            "page_cache_treatment": "resident_uncontrolled_warm",
+            "child_filesystem_creation_umask": f"{CHILD_UMASK:04o}",
+        },
+    }
+
+
+def comparison_key(plan: ExperimentPlan, edited: bool) -> str:
+    encoded = json.dumps(
+        comparison_basis(plan, edited),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
 
 
 def build_plan(
@@ -177,6 +237,63 @@ def git_output(arguments: list[str], *, cwd: Path) -> str:
     return result.stdout.strip()
 
 
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def validate_toolchain_contract() -> None:
+    home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    cargo_bin = home / ".cargo" / "bin"
+    rustup = cargo_bin / "rustup"
+    environment = {
+        "HOME": os.fspath(home),
+        "PATH": f"{os.fspath(cargo_bin)}:/usr/bin:/bin",
+        "CARGO_HOME": os.fspath(home / ".cargo"),
+        "RUSTUP_HOME": os.fspath(home / ".rustup"),
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+    }
+    observed: dict[str, tuple[str, str]] = {}
+    for name in ("rustc", "cargo"):
+        which = subprocess.run(
+            [os.fspath(rustup), "which", name],
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if which.returncode != 0:
+            raise ExperimentError("pinned Rust toolchain is unavailable")
+        program = Path(which.stdout.strip())
+        if not program.is_file() or not os.access(program, os.X_OK):
+            raise ExperimentError("pinned Rust toolchain program is unavailable")
+        version = subprocess.run(
+            [os.fspath(program), "--version"],
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if version.returncode != 0:
+            raise ExperimentError("pinned Rust toolchain version is unavailable")
+        observed[name] = (version.stdout.strip(), file_sha256(program))
+    if observed != {
+        "rustc": (RUSTC_VERSION, RUSTC_SHA256),
+        "cargo": (CARGO_VERSION, CARGO_SHA256),
+    }:
+        raise ExperimentError("pinned Rust toolchain identity changed")
+
+
 def validate_static_contract(repository: Path) -> None:
     for capability in (GIT, FINDMNT, TASKSET, HOT_RUN, BENCHMARK, FIXTURE):
         if not capability.is_file():
@@ -186,6 +303,7 @@ def validate_static_contract(repository: Path) -> None:
     fixture_digest = f"sha256:{hashlib.sha256(FIXTURE.read_bytes()).hexdigest()}"
     if fixture_digest != FIXTURE_FILE_DIGEST:
         raise ExperimentError("frozen fixture identity changed")
+    validate_toolchain_contract()
     relevant_status = git_output(
         [
             "status",
@@ -321,27 +439,31 @@ def command_for_task(
     state: Path,
     benchmark_receipt: Path,
     hot_run_receipt: Path,
+    edited: bool,
 ) -> tuple[list[str], Path | None]:
     benchmark_command = [
         os.fspath(BENCHMARK),
         "--output",
         os.fspath(benchmark_receipt),
     ]
-    if plan.arm == "ordinary-native":
-        return benchmark_command, None
+    direct_native = plan.arm == "ordinary-native"
+    hot_resident = task if direct_native else resident
+    cache_mode = "native" if direct_native else plan.arm
     return (
         [
             os.fspath(HOT_RUN),
             "--resident",
-            os.fspath(resident),
+            os.fspath(hot_resident),
             "--task",
             os.fspath(task),
             "--state",
             os.fspath(state),
             "--cache",
-            f"target:{plan.arm}",
+            f"target:{cache_mode}",
             "--measurement",
             os.fspath(hot_run_receipt),
+            "--comparison-key",
+            comparison_key(plan, edited),
             "--",
             *benchmark_command,
         ],
@@ -480,12 +602,8 @@ def validate_benchmark_receipt(
         or receipt.get("result", {}).get("exit_code") != 0
         or receipt.get("resources", {}).get("cargo_build_jobs")
         != str(expected_cargo_jobs)
-        or not receipt.get("toolchain", {}).get("rustc", "").startswith(
-            RUSTC_VERSION_PREFIX
-        )
-        or not receipt.get("toolchain", {}).get("cargo", "").startswith(
-            CARGO_VERSION_PREFIX
-        )
+        or receipt.get("toolchain", {}).get("rustc") != RUSTC_VERSION
+        or receipt.get("toolchain", {}).get("cargo") != CARGO_VERSION
         or receipt.get("workload", {}).get("expected_executed_test_count") != 1343
         or receipt.get("workload", {}).get("excluded_host_fact_test_count") != 16
     ):
@@ -618,15 +736,18 @@ def aggregate_task(
     interval_values_are_valid = valid_machine_interval(
         interval, hot_run.get("elapsed_seconds") if hot_run is not None else None
     )
+    expected_cache_mode = "native" if plan.arm == "ordinary-native" else plan.arm
+    expected_cross_worktree = plan.arm != "ordinary-native"
     if hot_run is not None and (
         hot_run.get("schema_version") != 4
         or hot_run.get("document_type") != "glaeda-hot-run-measurement"
         or hot_run.get("exit_code") != 0
         or hot_run.get("completion_reason") != "exited"
-        or hot_run.get("cross_worktree") is not True
+        or hot_run.get("comparison_key") != comparison_key(plan, edited)
+        or hot_run.get("cross_worktree") is not expected_cross_worktree
         or hot_run.get("resource_profile") is not None
         or hot_run.get("cache_views")
-        != [{"path": "target", "mode": plan.arm}]
+        != [{"path": "target", "mode": expected_cache_mode}]
         or normalized_preparation != expected_preparation
         or observed_preparation is None
         or not all(isinstance(item, dict) for item in observed_preparation)
@@ -714,6 +835,7 @@ def run_cohort(
                 state_path,
                 benchmark_receipt,
                 hot_run_receipt,
+                edited,
             )
             processes.append(
                 start_task(

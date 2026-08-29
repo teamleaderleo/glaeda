@@ -181,6 +181,11 @@ This makes ordinary Git-aware build and verification commands work without rewri
 worktree. It is still linked-common metadata, not the product-grade task-private Git mechanism
 owned by #580, and grants no isolation from other trusted users of the same repository.
 
+`native` is an explicit observation-only declaration for a direct same-worktree command: it records
+that the named cache is mutated at its ordinary task path, creates no state, and adds no isolation.
+It refuses cross-worktree execution so it cannot silently turn a private-cache request into shared
+resident mutation.
+
 `private` starts with an empty directory and retains the task's later writes without OverlayFS
 copy-up. `private-copy` atomically seeds that directory once from the warm resident parent with GNU
 `cp --reflink=auto`, then reuses the private lineage on later invocations. The copy uses reflinks
@@ -370,9 +375,11 @@ memory ceiling, and 1,024-task ceiling. The explicitly machine-specific profile 
 multi-agent headroom. The profile is never applied to ordinary commands implicitly; an unscoped
 no-op avoided even the roughly 0.01-second scope cost.
 
-The task and resident must be worktrees of the same Git repository. The resident worktree remains
-the stable compiler pathname, while task source changes remain in the ordinary task worktree and
-write-heavy cache writes land in a task-private state directory. Cache paths must be relative,
+The task and resident must be worktrees of the same Git repository. Direct same-worktree execution
+may declare `native` cache observations; all other explicit modes require the cross-worktree path.
+The resident worktree remains the stable compiler pathname, while task source changes remain in the
+ordinary task worktree and write-heavy cache writes land in a task-private state directory. Cache
+paths must be relative,
 unique, non-overlapping directories. One non-blocking task-state lock prevents concurrent use of
 the same mutable lineage or linked Git view, including while a private parent is copied. The command
 receives the caller's terminal, environment, host filesystem, devices, processes, and network and

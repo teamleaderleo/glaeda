@@ -28,8 +28,8 @@ def valid_benchmark_receipt(jobs: int = 4) -> dict[str, object]:
             "tracked_workload_diff_digest": NAMESPACE["FIXTURE_DIGEST"],
         },
         "toolchain": {
-            "rustc": "rustc 1.97.1 (fixture)",
-            "cargo": "cargo 1.97.1 (fixture)",
+            "rustc": NAMESPACE["RUSTC_VERSION"],
+            "cargo": NAMESPACE["CARGO_VERSION"],
         },
         "resources": {"cargo_build_jobs": str(jobs)},
         "workload": {
@@ -56,6 +56,49 @@ class HotStateFanoutTests(unittest.TestCase):
             ]
             self.assertEqual(len(flattened), len(set(flattened)))
             self.assertEqual(value["workload"]["expected_executed_test_count"], 1343)
+            self.assertRegex(
+                value["comparison"]["edit_key"], r"^sha256:[0-9a-f]{64}$"
+            )
+            self.assertNotEqual(
+                value["comparison"]["prime_key"],
+                value["comparison"]["edit_key"],
+            )
+
+    def test_comparison_keys_bind_treatment_and_remain_path_free(self) -> None:
+        build_plan = NAMESPACE["build_plan"]
+        comparison_basis = NAMESPACE["comparison_basis"]
+        comparison_key = NAMESPACE["comparison_key"]
+        first = build_plan("ordinary-native", 4, 16)
+        repeat = build_plan("ordinary-native", 4, 16)
+        overlay = build_plan("overlay", 4, 16)
+        wider = build_plan("ordinary-native", 8, 16)
+        self.assertEqual(
+            comparison_key(first, True), comparison_key(repeat, True)
+        )
+        self.assertNotEqual(
+            comparison_key(first, True), comparison_key(overlay, True)
+        )
+        self.assertNotEqual(
+            comparison_key(first, True), comparison_key(wider, True)
+        )
+        programs = comparison_basis(first, True)["producer_programs"]
+        self.assertEqual(
+            set(programs),
+            {
+                "fanout_harness_sha256",
+                "hot_run_sha256",
+                "semantic_benchmark_sha256",
+            },
+        )
+        self.assertTrue(
+            all(
+                isinstance(value, str)
+                and value.startswith("sha256:")
+                and len(value) == 71
+                for value in programs.values()
+            )
+        )
+        self.assertNotIn(os.fspath(ROOT), json.dumps(first.to_json()))
 
     def test_unknown_arms_fanout_and_deadlines_refuse(self) -> None:
         build_plan = NAMESPACE["build_plan"]
@@ -186,9 +229,30 @@ class HotStateFanoutTests(unittest.TestCase):
             Path("/state"),
             Path("/benchmark.json"),
             Path("/hot-run.json"),
+            True,
         )
         self.assertNotIn("--resource-profile", command)
         self.assertEqual(command[command.index("--cache") + 1], "target:private-copy")
+        self.assertEqual(
+            command[command.index("--comparison-key") + 1],
+            NAMESPACE["comparison_key"](plan, True),
+        )
+        self.assertEqual(receipt, Path("/hot-run.json"))
+
+    def test_ordinary_control_uses_measured_same_worktree_native_mode(self) -> None:
+        plan = NAMESPACE["build_plan"]("ordinary-native", 4, 16)
+        command, receipt = NAMESPACE["command_for_task"](
+            plan,
+            Path("/unused-resident"),
+            Path("/task"),
+            Path("/unused-state"),
+            Path("/benchmark.json"),
+            Path("/hot-run.json"),
+            True,
+        )
+        self.assertEqual(command[command.index("--resident") + 1], "/task")
+        self.assertEqual(command[command.index("--task") + 1], "/task")
+        self.assertEqual(command[command.index("--cache") + 1], "target:native")
         self.assertEqual(receipt, Path("/hot-run.json"))
 
     def test_failed_member_cancels_a_running_sibling(self) -> None:
@@ -291,7 +355,7 @@ class HotStateFanoutTests(unittest.TestCase):
             )
             hot_run = {
                 "schema_version": 4,
-                "comparison_key": None,
+                "comparison_key": NAMESPACE["comparison_key"](plan, True),
                 "document_type": "glaeda-hot-run-measurement",
                 "exit_code": 0,
                 "completion_reason": "exited",

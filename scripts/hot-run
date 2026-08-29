@@ -332,7 +332,7 @@ def parse_cache_specs(values: list[str]) -> tuple[CacheSpec, ...]:
             or path.is_absolute()
             or path in (Path("."), Path(".."))
             or ".." in path.parts
-            or mode not in ("overlay", "private", "private-copy", "ro")
+            or mode not in ("native", "overlay", "private", "private-copy", "ro")
         ):
             raise RuntimeError(f"invalid cache specification: {value}")
         specs.append(CacheSpec(path, mode))
@@ -978,19 +978,23 @@ def run(
         Path(resolved_command[0]),
         runtime_bin,
     )
-    cache_specs = (
-        parse_cache_specs(cache_arguments)
-        if cache_arguments
-        else default_cache_specs(resident)
+    explicit_cache_specs = (
+        parse_cache_specs(cache_arguments) if cache_arguments else None
     )
+    cache_specs = explicit_cache_specs or default_cache_specs(resident)
 
     if resident == task:
+        direct_cache_specs = explicit_cache_specs or ()
+        if any(spec.mode != "native" for spec in direct_cache_specs):
+            raise RuntimeError(
+                "same-worktree cache observations require explicit native mode"
+            )
         return execute(
             resolved_command,
             task_cwd,
             bound_environment,
             measurement,
-            (),
+            direct_cache_specs,
             (),
             runtime_contract,
             cross_worktree=False,
@@ -998,6 +1002,9 @@ def run(
             comparison_key=comparison_key,
             timeout_seconds=timeout_seconds,
         )
+
+    if any(spec.mode == "native" for spec in cache_specs):
+        raise RuntimeError("native cache mode requires the same worktree")
 
     bubblewrap = shutil.which("bwrap")
     if bubblewrap is None:
@@ -1190,10 +1197,11 @@ def main() -> int:
         "--cache",
         action="append",
         default=[],
-        metavar="PATH[:overlay|private|private-copy|ro]",
+        metavar="PATH[:native|overlay|private|private-copy|ro]",
         help=(
-            "select one resident-relative state path; defaults to target:overlay "
-            "when present"
+            "select one resident-relative state path; native records direct "
+            "same-worktree mutation, while cross-worktree execution defaults to "
+            "target:overlay when present"
         ),
     )
     parser.add_argument("--verbose", action="store_true")
