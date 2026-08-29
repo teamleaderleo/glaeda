@@ -478,19 +478,49 @@ def tracked_paths(root: Path) -> tuple[Path, ...]:
     return tuple(paths)
 
 
-def normalize_matching_regular_file_mtime(resident: Path, task: Path) -> str:
-    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+def open_beneath(root: Path, path: Path) -> int:
+    root_fd = os.open(
+        root,
+        os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+    )
+    parent_fd = root_fd
+    try:
+        for component in path.parts[:-1]:
+            next_fd = os.open(
+                component,
+                os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=parent_fd,
+            )
+            if parent_fd != root_fd:
+                os.close(parent_fd)
+            parent_fd = next_fd
+        return os.open(
+            path.parts[-1],
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=parent_fd,
+        )
+    finally:
+        if parent_fd != root_fd:
+            os.close(parent_fd)
+        os.close(root_fd)
+
+
+def normalize_matching_regular_file_mtime(
+    resident_root: Path, task_root: Path, path: Path
+) -> str:
     resident_fd: int | None = None
     task_fd: int | None = None
     try:
         try:
-            resident_fd = os.open(resident, flags)
-            task_fd = os.open(task, flags)
+            resident_fd = open_beneath(resident_root, path)
+            task_fd = open_beneath(task_root, path)
         except OSError:
             return "skipped"
         resident_before = os.fstat(resident_fd)
         task_before = os.fstat(task_fd)
         if not stat.S_ISREG(resident_before.st_mode) or not stat.S_ISREG(task_before.st_mode):
+            return "skipped"
+        if task_before.st_nlink != 1:
             return "skipped"
         if (
             resident_before.st_size != task_before.st_size
@@ -561,7 +591,7 @@ def prepare_seed_source_metadata(
     different = 0
     skipped = 0
     for path in paths:
-        result = normalize_matching_regular_file_mtime(resident / path, task / path)
+        result = normalize_matching_regular_file_mtime(resident, task, path)
         if result == "normalized":
             normalized += 1
         elif result == "different":

@@ -227,8 +227,23 @@ class HotRunTests(unittest.TestCase):
             (task / "missing-resident").write_text("task only\n", encoding="utf-8")
             (resident / "link").symlink_to("matching")
             (task / "link").symlink_to("matching")
+            (resident / "nested").mkdir()
+            (resident / "nested" / "redirected").write_text("same\n", encoding="utf-8")
+            (task / "nested").mkdir()
+            (task / "nested" / "redirected").write_text("same\n", encoding="utf-8")
+            (resident / "hardlinked").write_text("same\n", encoding="utf-8")
+            (task / "hardlinked").write_text("same\n", encoding="utf-8")
             subprocess.run(
-                ["git", "add", "matching", "different", "missing-resident", "link"],
+                [
+                    "git",
+                    "add",
+                    "matching",
+                    "different",
+                    "missing-resident",
+                    "link",
+                    "nested/redirected",
+                    "hardlinked",
+                ],
                 cwd=task,
                 check=True,
             )
@@ -237,6 +252,18 @@ class HotRunTests(unittest.TestCase):
             os.utime(resident / "matching", ns=(resident_mtime, resident_mtime))
             os.utime(task / "matching", ns=(task_mtime, task_mtime))
             os.utime(task / "different", ns=(task_mtime, task_mtime))
+            outside = fixture / "outside"
+            outside.mkdir()
+            redirected = outside / "redirected"
+            redirected.write_text("same\n", encoding="utf-8")
+            os.utime(redirected, ns=(task_mtime, task_mtime))
+            shutil.rmtree(task / "nested")
+            (task / "nested").symlink_to(outside, target_is_directory=True)
+            external_hardlink = outside / "hardlinked"
+            external_hardlink.write_text("same\n", encoding="utf-8")
+            (task / "hardlinked").unlink()
+            os.link(external_hardlink, task / "hardlinked")
+            os.utime(external_hardlink, ns=(task_mtime, task_mtime))
 
             seeded = (
                 CachePreparation(Path("target"), "private-copy", "seeded", 0.25),
@@ -245,12 +272,14 @@ class HotRunTests(unittest.TestCase):
             self.assertIsNotNone(result)
             assert result is not None
             self.assertEqual(result.disposition, "normalized_on_seed")
-            self.assertEqual(result.tracked_path_count, 4)
+            self.assertEqual(result.tracked_path_count, 6)
             self.assertEqual(result.normalized_regular_file_count, 1)
             self.assertEqual(result.differing_regular_file_count, 1)
-            self.assertEqual(result.skipped_path_count, 2)
+            self.assertEqual(result.skipped_path_count, 4)
             self.assertEqual((task / "matching").stat().st_mtime_ns, resident_mtime)
             self.assertEqual((task / "different").stat().st_mtime_ns, task_mtime)
+            self.assertEqual(redirected.stat().st_mtime_ns, task_mtime)
+            self.assertEqual(external_hardlink.stat().st_mtime_ns, task_mtime)
 
             retained_mtime = resident_mtime + 10_000_000_000
             os.utime(task / "matching", ns=(retained_mtime, retained_mtime))

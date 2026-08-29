@@ -339,8 +339,9 @@ cross-worktree mode, relative cache policies, and the optional public runtime co
 path-free descendant-bin binding when selected. A
 `private-copy` observation also records whether the lineage was seeded or reused, its copy wall
 time, and command-plus-preparation wall time. With `--seed-source-mtimes`, when a task-private
-`target` is first seeded, Glaeda compares tracked regular files through no-follow descriptors and
-gives only byte-identical, executable-mode-compatible task files the resident file's mtime. This
+`target` is first seeded, Glaeda compares tracked regular files through beneath-root, no-follow
+descriptors and gives only byte-identical, executable-mode-compatible, singly linked task files the
+resident file's mtime. This
 preserves Cargo freshness
 for an ordinary worktree created after its exact warm parent without backdating an edited file.
 The caller must already own exact warm-parent proof; the flag creates none. The matching pass is

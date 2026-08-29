@@ -482,9 +482,10 @@ all three arms.
 
 Candidate `d0ae2c59b98a44a4a65a08d3b8a0f0b42b6d45dc` / tree
 `838c847b3f9232a515866a5361b4594f4774a351` implements that treatment only when a task-private
-`target` is first copied. It compares contents and executable mode through held no-follow
-descriptors, rejects files that move or change during comparison, changes only the task inode's
-mtime, and records path-free counts/time in hot-run schema v5. The final interface requires the
+`target` is first copied. It compares contents and executable mode through held, beneath-root
+no-follow descriptors, rejects multiply linked task files and files that move or change during
+comparison, changes only the task-private inode's mtime, and records path-free counts/time in
+hot-run schema v5. The final interface requires the
 explicit `--seed-source-mtimes` treatment after caller-owned exact warm-parent proof; the flag
 creates no proof or cache authority. A retained lineage performs no source normalization: a file
 reverted after a prior task build must remain newer than the retained output so Cargo rebuilds it.
