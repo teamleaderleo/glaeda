@@ -451,16 +451,14 @@ The resident target occupied 2,017,067,008 allocated bytes. Reconciled task-priv
 timed child tree exited zero and reported zero swaps. The resident target had been compiled at the
 native worktree path, while private tasks executed through `hot-run`'s stable task mount. Because
 ordinary-copy preparation was under one second but first execution remained about 9.55 seconds,
-the evidence identifies Cargo path-context reconciliation—not copying—as the dominant first-use
-cost in this control. XFS reflink should reduce seed latency and physical allocation, but cannot by
-itself remove path-sensitive compiler invalidation.
+the first interpretation attributed the gap to path-context reconciliation. The later causal
+discriminator below refutes that explanation: `hot-run` already presents the identical absolute
+project path, while ordinary post-build worktree mtimes alone reproduce the rebuild.
 
-The selected policy remains: native warm is the fastest no-isolation same-worktree path;
-private-copy provides near-native retained performance for cross-worktree isolation; and the next
-bounded experiment should build the resident compiler state through the same stable `hot-run`
-project path (or an explicitly remapped equivalent) before comparing first use. Do not promote a
-path-remapping mechanism until its semantic validator, rebuild behavior, and debug/source paths
-match the native control.
+The selected policy remains: native warm is the fastest no-isolation same-worktree path and
+private-copy provides near-native retained performance for cross-worktree isolation. Do not add
+path remapping from this superseded hypothesis; preserve freshness only through the seed-bound,
+exact-content treatment below.
 
 Raw receipt SHA-256 digests:
 
@@ -470,3 +468,83 @@ Raw receipt SHA-256 digests:
 - private first-use `hot-run` A/B: `848aa1f073aba131951c9d43e8b6c9d7907468bd860f5405f4cc4968f86873ac`, `ee59516c9f2171ddb8835d1df1893e25ab8a0482b6bf26ec8b2243365c64fe1b`
 - private retained benchmark A/B: `2b47cdd37c717a1a1eba3716f9037785bb5103f7e9999ac9cf1aaf615aa0654c`, `33c73747b2a75348edf743411d7646c30d77e4af1b41885219bf06bed4f5e3bb`
 - private retained `hot-run` A/B: `e8cf2c687cebba48e756083696f9874e70eed5f465932213d98ccfb047fe8a6c`, `659b1e229c31fbb5c272187b3f125f896963e4066228ebd9ac1938262af1e4cc`
+
+### Seed-only source freshness discriminator
+
+Exact workload source `b4ac5b64c7b390acd24006bd3fd90f18b74ac348` / tree
+`5a5f6c444e17a293a04a4ac24edd4da6fa0f9983` was primed on big-red ext4 after one task worktree
+already existed. That older task then reused a copied target in 2.878737 seconds with no dirty
+Cargo fingerprint. An otherwise identical task created after the prime took 9.453875 seconds.
+Cargo's own fingerprint log named newer task source mtimes than both copied dep-info references as
+the cause. Giving 493 byte-identical tracked regular files their resident mtimes restored a
+2.883836-second command and zero dirty fingerprints. The absolute project path was identical in
+all three arms.
+
+Candidate `d0ae2c59b98a44a4a65a08d3b8a0f0b42b6d45dc` / tree
+`838c847b3f9232a515866a5361b4594f4774a351` implements that treatment only when a task-private
+`target` is first copied. It compares contents and executable mode through held, beneath-root
+no-follow descriptors, rejects multiply linked task files and files that move or change during
+comparison, changes only the task-private inode's mtime, and records path-free counts/time in
+hot-run schema v5. The final interface requires the
+explicit `--seed-source-mtimes` treatment after caller-owned exact warm-parent proof; the flag
+creates no proof or cache authority. A retained lineage performs no source normalization: a file
+reverted after a prior task build must remain newer than the retained output so Cargo rebuilds it.
+
+The physical A-B-B-A bracket kept the exact workload source, resident target, Rust/Cargo 1.97.1,
+four Cargo jobs, stable project path, semantic validator, and fresh post-prime worktree timing
+constant. A used the landed schema-v4 producer without source preparation; B used the exact
+candidate above.
+
+| Arm | Command samples (s) | Command median (s) | Preparation median (s) | Seed-to-result median (s) | Median peak RSS |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| ordinary post-build worktree | 9.451920, 9.556124 | 9.504022 | 4.538835 | 14.042857 | 1,601,956 KiB |
+| seed-only exact-content mtime | 2.826547, 2.783282 | 2.804914 | 6.167517 | 8.972431 | 79,330 KiB |
+
+The candidate reduced command wall by 6.699107 seconds / 70.49% (3.39x) and seed-to-result wall by
+5.070426 seconds / 36.11%, despite unfavorable and variable ordinary-copy time in the candidate
+positions. Command peak RSS fell 95.05% because Cargo executed the tests without recompiling the
+crate. Both candidate samples normalized all 493 tracked paths in 0.107179 and 0.103555 seconds;
+both produced zero dirty fingerprints. Every arm derived the same three terminal summaries: 1,371
+selected, 1,370 executed/passed, one ignored, 16 filtered, and zero failed/measured tests. The
+same exact resident control took 35.16 seconds to reconstruct and 2.66 seconds on immediate native
+reuse.
+
+After composing the explicit gate with merged protected-cache store main, exact clean producer
+`e9b40406e17affd52f09622963021824ce81d6a3` ran one same-producer pair. Without the flag it
+reported four dirty units, an 8.698599-second command and 11.722752-second seed-to-result total.
+With the flag it normalized 493/493 files in 0.144376 seconds, reported no dirty unit, ran the
+command in 2.780546 seconds, and completed seed-to-result in 5.178758 seconds: 68.03% and 55.82%
+lower respectively. Exact retained reuse took 2.727571 seconds with zero preparation and
+`retained_state_unchanged`. All three results passed the identical 1,370-test validator.
+
+The semantic controls remained fail-open to real work but fail-closed to stale reuse:
+
+- a fresh task containing the frozen `src/lib.rs` edit normalized 492 files, classified one as
+  different, and rebuilt only from that changed source; its command took 10.601218 seconds and all
+  1,370 tests passed;
+- editing an already retained lineage took 11.013320 seconds with zero source preparation and
+  Cargo named `src/lib.rs` dirty;
+- reverting that file on the same retained lineage took 10.351173 seconds, again with zero source
+  preparation and `src/lib.rs` dirty, proving the prior edited output was not reused;
+- clean retained reuse took 2.772691 seconds with exact `retained_state_unchanged` evidence.
+
+The post-run resident target occupied 9,548,783,616 allocated bytes and the task states occupied
+roughly 9.11–9.55 GB each. Those are a capacity warning, not unique-byte accounting: ext4 ordinary
+copies remain the dominant complete preparation cost and stale artifacts were not separated in
+this run. XFS reflink composes directly with the freshness fix by making the same seed CoW-cheap;
+the separate protected-generation catalog/store and an eviction/reconstruction policy must decide
+which target generation is worth retaining or copying.
+
+Raw receipt SHA-256 digests:
+
+- ordinary A/B hot-run: `e7b43f67ec955ac46fbaee5ba33e178eeb74c075593458a113432d1d1e643545`, `edf7378bc82a24dfebe66549e3466bb13e6325f3d4469e06ed30a3bccedce382`
+- ordinary A/B benchmark: `5c0a38ff5596aea10586d9b8312922a88328da655b8ef59584f332e170e31f73`, `d2b8185b9eaf17a02d1c7af026f192d81a78a4a443f66976ef5c08d5e6cddf86`
+- candidate A/B hot-run: `184909e61bba9c1e2a8926ca08d8093a4d1d0341208ebe64ef8a9512ab5243b7`, `cf46d2b8154fee73d0de626ebd6d37506e91e2653d2a44ffbe07f44fed2e7687`
+- candidate A/B benchmark: `3936c59890cf3f705f9a1ac89a2251e9c37ea6698349daf8bb4e66de9590cbc4`, `3971514d8ce110a15033279c30cfbdcf52bbf6ea887a411b31322b2c8efbe6a4`
+- clean retained hot-run/benchmark: `4132b9fffcee562f8cf251a293d46ae96873586d0116e7ec64316f74f5907e49`, `9f9bbd82bf4e1f61ab2e16c522a27e5e0bb42d5b3e10346cd63bf521b184fe98`
+- retained edit hot-run/benchmark: `0619c614a80c7357244ac6ee93f5acf7d727a0be59f712dd5b8a3067a6c9df12`, `83491b09cada3eb0323d4b2239c14c53a06262212c4d196f324c880dd6d05ca6`
+- retained revert hot-run/benchmark: `33d807ac320a90747b14067a289edba2f2cf7518dd08ec86240adfa68442d42b`, `7b1ab215af81819b912d8e084a3ca17aa58a543795a0dbe68d3407ecde04ff74`
+- edited seed hot-run/benchmark: `d29459936348a0739814a9ff595072297af1b51cb1d160f0498c20d1ce4b4cf9`, `94dabe09bb2fface339ca3d8d7a786d0758998071d5f84c00f2bf7c7a7dc2302`
+- final same-producer control hot-run/benchmark: `5c56371de54b921acd81eeba9346e1ea29e834c5d6f0ff76e0b9add999e8c5ed`, `d38ba656c505338929a363775f9f90c7cb51479112aa01e8a019ea89a1077071`
+- final same-producer candidate hot-run/benchmark: `0266d7ff6ebbb3aa21eed1250017187c828ebc77be02ddecc8d6f5e1f7e6e15d`, `9cefe858dbe997d34677d3af57be4b0962b7909ee81bcca24f4110449a08fbae`
+- final retained candidate hot-run/benchmark: `4561f17b0f81ad04f8aec366db5f942ab05c87f66d9befeaf6e281609414b335`, `95a6e0aa78653e574bdbd5162e7dc12b36c4165ee6080cc2115e0cec89ada0ef`

@@ -556,6 +556,9 @@ def command_for_task(
     direct_native = plan.arm == "ordinary-native"
     hot_resident = task if direct_native else resident
     cache_mode = "native" if direct_native else plan.arm
+    source_preparation_arguments = (
+        ["--seed-source-mtimes"] if plan.arm == "private-copy" else []
+    )
     return (
         [
             os.fspath(HOT_RUN),
@@ -567,6 +570,7 @@ def command_for_task(
             os.fspath(state),
             "--cache",
             f"target:{cache_mode}",
+            *source_preparation_arguments,
             "--measurement",
             os.fspath(hot_run_receipt),
             "--comparison-key",
@@ -874,6 +878,49 @@ def aggregate_task(
         for item in observed_preparation or []
         if isinstance(item, dict)
     ]
+    source_preparation = (
+        hot_run.get("source_preparation") if hot_run is not None else None
+    )
+    source_counts: tuple[Any, ...] = ()
+    if isinstance(source_preparation, dict):
+        source_counts = tuple(
+            source_preparation.get(field)
+            for field in (
+                "tracked_path_count",
+                "normalized_regular_file_count",
+                "differing_regular_file_count",
+                "skipped_path_count",
+            )
+        )
+    valid_source_counts = all(
+        isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        for value in source_counts
+    )
+    if plan.arm == "private-copy":
+        expected_source_disposition = (
+            "retained_state_unchanged" if retained_reuse else "normalized_on_seed"
+        )
+        source_preparation_matches = (
+            isinstance(source_preparation, dict)
+            and source_preparation.get("mode")
+            == "resident_mtime_for_identical_tracked_regular_files_v1"
+            and source_preparation.get("disposition") == expected_source_disposition
+            and len(source_counts) == 4
+            and valid_source_counts
+            and isinstance(source_preparation.get("elapsed_seconds"), (int, float))
+            and not isinstance(source_preparation.get("elapsed_seconds"), bool)
+            and (
+                source_counts == (0, 0, 0, 0)
+                and source_preparation["elapsed_seconds"] == 0
+                if retained_reuse
+                else source_counts[0] > 0
+                and source_counts[1] > 0
+                and source_counts[0] == sum(source_counts[1:])
+                and source_preparation["elapsed_seconds"] >= 0
+            )
+        )
+    else:
+        source_preparation_matches = source_preparation is None
     interval = (
         machine_observation.get("interval")
         if isinstance(machine_observation, dict)
@@ -885,7 +932,7 @@ def aggregate_task(
     expected_cache_mode = "native" if plan.arm == "ordinary-native" else plan.arm
     expected_cross_worktree = plan.arm != "ordinary-native"
     if hot_run is not None and (
-        hot_run.get("schema_version") != 4
+        hot_run.get("schema_version") != 6
         or hot_run.get("document_type") != "glaeda-hot-run-measurement"
         or hot_run.get("exit_code") != 0
         or hot_run.get("completion_reason") != "exited"
@@ -900,6 +947,7 @@ def aggregate_task(
         or normalized_preparation != expected_preparation
         or observed_preparation is None
         or not all(isinstance(item, dict) for item in observed_preparation)
+        or not source_preparation_matches
         or not isinstance(machine_observation, dict)
         or machine_observation.get("scope") != "host_aggregate"
         or not all(

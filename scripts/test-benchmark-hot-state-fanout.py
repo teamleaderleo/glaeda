@@ -642,7 +642,7 @@ class HotStateFanoutTests(unittest.TestCase):
                 json.dumps(valid_benchmark_receipt()), encoding="utf-8"
             )
             hot_run = {
-                "schema_version": 4,
+                "schema_version": 6,
                 "comparison_key": NAMESPACE["comparison_key"](plan, True),
                 "document_type": "glaeda-hot-run-measurement",
                 "exit_code": 0,
@@ -682,12 +682,30 @@ class HotStateFanoutTests(unittest.TestCase):
                         "elapsed_seconds": 0.25,
                     }
                 ],
+                "source_preparation": {
+                    "mode": "resident_mtime_for_identical_tracked_regular_files_v1",
+                    "disposition": "normalized_on_seed",
+                    "tracked_path_count": 2,
+                    "normalized_regular_file_count": 1,
+                    "differing_regular_file_count": 1,
+                    "skipped_path_count": 0,
+                    "elapsed_seconds": 0.01,
+                },
             }
             hot_run_path.write_text(json.dumps(hot_run), encoding="utf-8")
             task = TaskProcess("task-01", None, benchmark_path, hot_run_path)
             aggregate_task(task, plan, True)
             hot_run["state_preparation"][0]["disposition"] = "reused"
             hot_run["state_preparation"][0]["elapsed_seconds"] = 0
+            hot_run["source_preparation"] = {
+                "mode": "resident_mtime_for_identical_tracked_regular_files_v1",
+                "disposition": "retained_state_unchanged",
+                "tracked_path_count": 0,
+                "normalized_regular_file_count": 0,
+                "differing_regular_file_count": 0,
+                "skipped_path_count": 0,
+                "elapsed_seconds": 0.0,
+            }
             hot_run["comparison_key"] = NAMESPACE["comparison_key"](
                 plan, True, retained_reuse=True
             )
