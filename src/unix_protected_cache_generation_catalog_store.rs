@@ -61,7 +61,11 @@ const NEW_FILE_FLAGS: OFlags = OFlags::WRONLY
 const NEW_LOCK_FLAGS: OFlags = EXISTING_LOCK_FLAGS
     .union(OFlags::CREATE)
     .union(OFlags::EXCL);
-const INSTALLATION_DIRECTORY_MODE: u32 = 0o750;
+const INSTALLATION_DIRECTORY_MODE: Mode = Mode::RUSR
+    .union(Mode::WUSR)
+    .union(Mode::XUSR)
+    .union(Mode::RGRP)
+    .union(Mode::XGRP);
 const STORE_DIRECTORY_MODE: Mode = Mode::RUSR.union(Mode::WUSR).union(Mode::XUSR);
 const PRIVATE_FILE_MODE: Mode = Mode::RUSR.union(Mode::WUSR);
 
@@ -399,20 +403,44 @@ impl UnixProtectedCacheGenerationCatalogStore {
     fn acquire_lock(
         &self,
         mode: StoreLockMode,
-    ) -> Result<StoreLock<'_>, ProtectedCacheCatalogStoreError> {
-        inspect_private_file(
+    ) -> Result<StoreLock, ProtectedCacheCatalogStoreError> {
+        let retained_stat = inspect_private_file(
             &self.lock,
             self.owner,
             "protected cache catalog lock",
             Some(0),
         )?;
+        // `flock` authority belongs to an open-file description. Open a fresh descriptor for
+        // every operation so concurrent calls through one shared store cannot convert or release
+        // each other's lock.
+        let current = fs::openat(
+            &self.directory,
+            LOCK_FILE,
+            EXISTING_LOCK_FLAGS,
+            Mode::empty(),
+        )
+        .map_err(map_lock_open_error)?;
+        let current_stat = inspect_private_file(
+            &current,
+            self.owner,
+            "protected cache catalog lock",
+            Some(0),
+        )?;
+        if retained_stat.st_dev != current_stat.st_dev
+            || retained_stat.st_ino != current_stat.st_ino
+        {
+            return Err(store_error(
+                ProtectedCacheCatalogStoreErrorKind::UnsafeFilesystem,
+                "protected cache catalog lock identity changed",
+            ));
+        }
         let operation = match mode {
             StoreLockMode::Shared => FlockOperation::NonBlockingLockShared,
             StoreLockMode::Exclusive => FlockOperation::NonBlockingLockExclusive,
         };
-        match fs::flock(&self.lock, operation) {
+        match fs::flock(&current, operation) {
             Ok(()) => {
-                let guard = StoreLock { lock: &self.lock };
+                let guard = StoreLock { lock: current };
                 self.verify_retained_store_path()?;
                 self.verify_retained_lock_path()?;
                 Ok(guard)
@@ -439,13 +467,13 @@ impl UnixProtectedCacheGenerationCatalogStore {
         let retained_stat = inspect_directory(
             self.directory.as_fd(),
             "protected cache catalog directory",
-            STORE_DIRECTORY_MODE.as_raw_mode(),
+            STORE_DIRECTORY_MODE,
             Some(self.owner),
         )?;
         let current_stat = inspect_directory(
             current.as_fd(),
             "protected cache catalog directory",
-            STORE_DIRECTORY_MODE.as_raw_mode(),
+            STORE_DIRECTORY_MODE,
             Some(self.owner),
         )?;
         if retained_stat.st_dev != current_stat.st_dev
@@ -501,7 +529,7 @@ impl UnixProtectedCacheGenerationCatalogStore {
         inspect_directory(
             self.directory.as_fd(),
             "protected cache catalog directory",
-            STORE_DIRECTORY_MODE.as_raw_mode(),
+            STORE_DIRECTORY_MODE,
             Some(self.owner),
         )?;
         let mut entries = Dir::read_from(&self.directory).map_err(|_| {
@@ -647,14 +675,14 @@ enum StoreLockMode {
 }
 
 #[derive(Debug)]
-struct StoreLock<'a> {
-    lock: &'a OwnedFd,
+struct StoreLock {
+    lock: OwnedFd,
 }
 
-impl Drop for StoreLock<'_> {
+impl Drop for StoreLock {
     fn drop(&mut self) {
         // Explicit unlock prevents a duplicate inherited across fork from retaining authority.
-        let _ = fs::flock(self.lock, FlockOperation::Unlock);
+        let _ = fs::flock(&self.lock, FlockOperation::Unlock);
     }
 }
 
@@ -896,7 +924,7 @@ fn ensure_store_directory(
             inspect_directory(
                 directory.as_fd(),
                 "protected cache catalog directory",
-                STORE_DIRECTORY_MODE.as_raw_mode(),
+                STORE_DIRECTORY_MODE,
                 Some(owner),
             )?;
             Ok(directory)
@@ -930,7 +958,7 @@ fn ensure_store_directory(
             inspect_directory(
                 directory.as_fd(),
                 "protected cache catalog directory",
-                STORE_DIRECTORY_MODE.as_raw_mode(),
+                STORE_DIRECTORY_MODE,
                 Some(owner),
             )?;
             if created {
@@ -977,7 +1005,7 @@ fn ensure_lock_file(
 fn inspect_directory(
     directory: BorrowedFd<'_>,
     subject: &str,
-    expected_mode: u32,
+    expected_mode: Mode,
     expected_owner: Option<(u32, u32)>,
 ) -> Result<rustix::fs::Stat, ProtectedCacheCatalogStoreError> {
     let stat = fs::fstat(directory).map_err(|_| {
@@ -992,7 +1020,7 @@ fn inspect_directory(
             format!("{subject} is not a directory"),
         ));
     }
-    if stat.st_mode & 0o7777 != expected_mode {
+    if Mode::from_raw_mode(stat.st_mode) != expected_mode {
         return Err(store_error(
             ProtectedCacheCatalogStoreErrorKind::UnsafeFilesystem,
             format!("{subject} has unsafe permissions"),
@@ -1314,6 +1342,7 @@ mod tests {
     use std::fs as stdfs;
     use std::os::unix::fs::{PermissionsExt as _, symlink};
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use rustix::fs::{self, AtFlags, Mode};
@@ -1578,6 +1607,23 @@ mod tests {
             second
                 .load()
                 .expect_err("second operation must be busy")
+                .kind(),
+            ProtectedCacheCatalogStoreErrorKind::Busy
+        );
+    }
+
+    #[test]
+    fn shared_store_instance_uses_independent_operation_locks() {
+        let root = TestInstallation::new("shared-busy");
+        let store = Arc::new(open(&root));
+        let _guard = store
+            .acquire_lock(StoreLockMode::Exclusive)
+            .expect("hold exclusive lock");
+        let shared = Arc::clone(&store);
+        assert_eq!(
+            shared
+                .load()
+                .expect_err("shared-instance operation must be busy")
                 .kind(),
             ProtectedCacheCatalogStoreErrorKind::Busy
         );
