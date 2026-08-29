@@ -15,6 +15,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -134,6 +135,12 @@ class HotRunTests(unittest.TestCase):
             self.assertTrue(report["cross_worktree"])
             self.assertGreaterEqual(report["elapsed_seconds"], 0)
             self.assertGreater(report["max_rss_kib"], 0)
+            self.assertEqual(report["state_preparation"], [])
+            self.assertEqual(report["preparation_elapsed_seconds"], 0.0)
+            self.assertEqual(
+                report["command_plus_preparation_elapsed_seconds"],
+                report["elapsed_seconds"],
+            )
             self.assertEqual(
                 report["cache_views"],
                 [
@@ -241,6 +248,135 @@ class HotRunTests(unittest.TestCase):
                 self.assertTrue(report["cross_worktree"])
             self.assertEqual(list(state.glob(".git-view-*")), [])
 
+    @unittest.skipUnless(shutil.which("bwrap"), "bubblewrap is unavailable")
+    def test_private_copy_seeds_once_then_reuses_the_lineage(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            resident = fixture / "resident"
+            task = fixture / "task"
+            state = fixture / "state"
+            first_measurement = fixture / "first.json"
+            second_measurement = fixture / "second.json"
+            resident.mkdir()
+            subprocess.run(["git", "init", "--quiet"], cwd=resident, check=True)
+            (resident / "payload").write_text("resident\n", encoding="utf-8")
+            (resident / "target").mkdir()
+            (resident / "target" / "parent").write_text(
+                "exact warm parent\n", encoding="utf-8"
+            )
+            subprocess.run(["git", "add", "payload"], cwd=resident, check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Glaeda test",
+                    "-c",
+                    "user.email=glaeda-test@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "fixture",
+                ],
+                cwd=resident,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "worktree", "add", "--quiet", "--detach", os.fspath(task)],
+                cwd=resident,
+                check=True,
+            )
+
+            base_command = [
+                sys.executable,
+                os.fspath(HOT_RUN),
+                "--resident",
+                os.fspath(resident),
+                "--task",
+                os.fspath(task),
+                "--state",
+                os.fspath(state),
+                "--cache",
+                "target:private-copy",
+            ]
+            first = subprocess.run(
+                [
+                    *base_command,
+                    "--measurement",
+                    os.fspath(first_measurement),
+                    "--",
+                    "/bin/sh",
+                    "-c",
+                    'test "$(cat target/parent)" = "exact warm parent" '
+                    "&& test ! -e target/generation "
+                    "&& printf 1 > target/generation",
+                ],
+                stdin=subprocess.DEVNULL,
+                check=False,
+            )
+            self.assertEqual(first.returncode, 0)
+            (resident / "target" / "parent").write_text(
+                "changed resident parent\n", encoding="utf-8"
+            )
+            second = subprocess.run(
+                [
+                    *base_command,
+                    "--measurement",
+                    os.fspath(second_measurement),
+                    "--",
+                    "/bin/sh",
+                    "-c",
+                    'test "$(cat target/parent)" = "exact warm parent" '
+                    '&& test "$(cat target/generation)" = 1 '
+                    "&& printf 2 > target/generation",
+                ],
+                stdin=subprocess.DEVNULL,
+                check=False,
+            )
+            self.assertEqual(second.returncode, 0)
+
+            private_directories = list(state.glob("private-*"))
+            self.assertEqual(len(private_directories), 1)
+            private = private_directories[0]
+            self.assertEqual(
+                (private / "parent").read_text(encoding="utf-8"),
+                "exact warm parent\n",
+            )
+            self.assertEqual(
+                (private / "generation").read_text(encoding="utf-8"), "2"
+            )
+            first_report = json.loads(first_measurement.read_text(encoding="utf-8"))
+            second_report = json.loads(
+                second_measurement.read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                first_report["cache_views"],
+                [{"mode": "private-copy", "path": "target"}],
+            )
+            self.assertEqual(
+                first_report["state_preparation"][0]["disposition"], "seeded"
+            )
+            self.assertGreater(
+                first_report["state_preparation"][0]["elapsed_seconds"], 0
+            )
+            self.assertGreaterEqual(
+                first_report["command_plus_preparation_elapsed_seconds"],
+                first_report["elapsed_seconds"],
+            )
+            self.assertEqual(
+                second_report["state_preparation"],
+                [
+                    {
+                        "disposition": "reused",
+                        "elapsed_seconds": 0.0,
+                        "mode": "private-copy",
+                        "path": "target",
+                    }
+                ],
+            )
+            self.assertEqual(second_report["preparation_elapsed_seconds"], 0.0)
+            self.assertEqual(list(state.glob(".private-*")), [])
+            self.assertEqual(list(state.glob(".git-view-*")), [])
+
     def test_cache_specs_reject_escape_overlap_and_unknown_modes(self) -> None:
         parse_cache_specs = runpy.run_path(str(HOT_RUN), run_name="hot_run_test")[
             "parse_cache_specs"
@@ -249,8 +385,38 @@ class HotRunTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 parse_cache_specs(values)
         self.assertEqual(parse_cache_specs(["target:private"])[0].mode, "private")
+        self.assertEqual(
+            parse_cache_specs(["target:private-copy"])[0].mode, "private-copy"
+        )
         with self.assertRaises(RuntimeError):
             parse_cache_specs(["build", "build/generated"])
+
+    def test_private_copy_failure_never_publishes_candidate(self) -> None:
+        namespace = runpy.run_path(str(HOT_RUN), run_name="hot_run_test")
+        prepare_private_copy = namespace["prepare_private_copy"]
+        CacheSpec = namespace["CacheSpec"]
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            resident = fixture / "resident"
+            state = fixture / "state"
+            destination = state / "private-target"
+            resident.mkdir()
+            state.mkdir()
+            (resident / "parent").write_text("warm\n", encoding="utf-8")
+            failed_copy = mock.Mock(returncode=1)
+            with mock.patch.object(
+                namespace["subprocess"], "run", return_value=failed_copy
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "private-copy preparation failed"
+                ):
+                    prepare_private_copy(
+                        CacheSpec(Path("target"), "private-copy"),
+                        resident,
+                        destination,
+                    )
+            self.assertFalse(destination.exists())
+            self.assertEqual(list(state.glob(".private-target.*")), [])
 
     def test_runtime_contract_verifies_before_execution_and_is_recorded(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

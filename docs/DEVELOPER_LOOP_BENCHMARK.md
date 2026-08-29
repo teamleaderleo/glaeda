@@ -82,6 +82,35 @@ and still needs concurrent fan-out and cold-page-cache controls. Reflink-capable
 the preferred cheap-seeding candidate. Source fan-out, Git metadata, dependencies, compiler output,
 and resident services remain separate mechanism decisions.
 
+### Executable `private-copy` candidate
+
+The first implementation dogfood repeated the same exact edited workload through the actual
+`target:private-copy` mode, with three new task/state lineages physically on ext4. The mode copied
+the exact warm parent into a hidden candidate, atomically published the private directory, mounted
+it at the stable resident pathname, ran the validator, and emitted one preparation-plus-command
+receipt:
+
+| Measurement | Samples (s) | Median (s) |
+| --- | ---: | ---: |
+| Atomic private-copy preparation | 0.434903, 0.407321, 0.418423 | 0.418423 |
+| `hot-run` command | 9.520338, 10.214857, 10.198427 | 10.198427 |
+| Receipt copy + command | 9.955241, 10.622178, 10.616850 | 10.616850 |
+| Inner workload | 9.42, 10.11, 10.10 | 10.10 |
+
+All three receipts reported `seeded`; all validators were green, with 1,630,948–1,632,464 KiB
+peak RSS for the workload. Final lineages each allocated 2,720,026,624 bytes. One immediate reuse
+reported `reused`, zero preparation time, 2.732046 seconds command time, and 2.79 seconds outside
+the whole process; its inner workload was 2.63 seconds. The receipt deliberately keeps copy CPU/RSS
+outside command resource accounting while exposing copy wall time and command-plus-copy wall time.
+The three task worktrees removed below 0.01 seconds each, the warmed resident worktree removed in
+0.12 seconds, all three private-copy states removed in 0.45 seconds, and receipt cleanup was below
+0.01 seconds. No process or mount survived.
+
+The executable candidate's 10.616850-second measured median is 1.323 seconds, or 11.1%, faster than
+the corrected 11.94-second ext4 Overlay median and 0.307 seconds, or 3.0%, slower than the earlier
+10.31-second ordinary-native median. This validates the mechanism and its observation surface; it
+does not yet settle concurrent fan-out, cold-page-cache copy behavior, or automatic selection.
+
 ## Correctness failure retained as evidence
 
 Running the full lib/bin command through the same Glaeda resident path took 11.50 seconds, used 1,631,808 KiB peak RSS, and exited 101 after 1,326 passed, 16 failed, and one ignored library test. Fifteen failures could not select a reviewed environment executable after namespace ownership remapping; one rootless-Podman observation saw an unsafe parent directory instead of a missing source.
@@ -101,7 +130,8 @@ The first hosted distributions should be appended here after repeated unchanged 
 
 ## Next decisions
 
-- Recover at least the measured 0.75-second resident overhead before claiming a warm Rust-loop win.
+- Close or explain the remaining 0.307-second seeded-private versus ordinary-native gap before
+  claiming a warm Rust-loop win.
 - Measure a leaf-function behavior edit and a public-type edit; the documentation edit mostly measures crate/test relink and namespace overhead.
 - Add Python and current-project Node fixtures with repository-owned validators instead of pinning the product direction to legacy Node versions.
 - Repeat each promoted arm enough times to publish p50 and p90, then add 1/4/8 concurrent-task fan-out with physical disk growth and cleanup latency.

@@ -170,7 +170,7 @@ loops:
 ```bash
 /path/to/resident/scripts/hot-run \
   --task /path/to/task-worktree \
-  --cache target:private \
+  --cache target:private-copy \
   -- cargo test --locked --lib --bins
 ```
 
@@ -182,11 +182,18 @@ worktree. It is still linked-common metadata, not the product-grade task-private
 owned by #580, and grants no isolation from other trusted users of the same repository.
 
 `private` starts with an empty directory and retains the task's later writes without OverlayFS
-copy-up. It is the big-red/ext4 candidate for long-lived, write-heavy compiler lineages. `overlay`
-starts from warmed resident bytes and retains writes in a task-private upper; it remains useful when
-warm-start value exceeds copy-up cost. `ro` exposes suitable immutable prepared state without write
-authority. When a resident `target` exists, `target:overlay` remains the zero-configuration default
-until complete repeated-loop measurements justify changing it.
+copy-up. `private-copy` atomically seeds that directory once from the warm resident parent with GNU
+`cp --reflink=auto`, then reuses the private lineage on later invocations. The copy uses reflinks
+where the backing filesystem supports them and ordinary allocated copies otherwise. A failed copy
+never publishes the candidate directory. `overlay` starts from warmed resident bytes and retains
+writes in a task-private upper; it remains useful when warm-start value exceeds copy-up cost. `ro`
+exposes suitable immutable prepared state without write authority.
+
+This prototype does not independently prove that the resident parent matches the task source or
+toolchain, or freeze a parent that another process is still mutating. Its ultra-trusted caller must
+supply the right quiesced resident generation and still run a real validator. When a resident
+`target` exists, `target:overlay` remains the zero-configuration default until complete concurrent
+and cold-page-cache measurements justify changing it.
 
 Python and Node projects can explicitly reuse immutable prepared dependencies while keeping build
 output private:
@@ -253,11 +260,13 @@ protocol or source semantics the process serves. Missing or drifting facts remai
 `absent`, `revalidate_required`, `drift`, or `ambiguous` observations for a later cold/reset/lease
 decision.
 
-`--measurement result.json` atomically writes one bounded developer observation containing elapsed
-time, user/system CPU time, peak RSS, exit/signal, completion reason, configured timeout,
-cross-worktree mode, relative cache policies, and the optional public runtime contract. It contains
-no command, output, environment, repository identity, or private path and grants no verification or
-result-reuse authority.
+`--measurement result.json` atomically writes one bounded developer observation containing command
+elapsed time, user/system CPU time, peak RSS, exit/signal, completion reason, configured timeout,
+cross-worktree mode, relative cache policies, and the optional public runtime contract. A
+`private-copy` observation also records whether the lineage was seeded or reused, its copy wall
+time, and command-plus-copy wall time. Copy CPU/RSS are not included in the command resource fields.
+The receipt contains no command, output, environment, repository identity, or private path and
+grants no verification or result-reuse authority.
 Unscoped commands use child `getrusage`; profiled commands place GNU `time` inside the scope so CPU
 and peak RSS describe the workload rather than the `systemd-run` launcher. Force termination can
 prevent descendants or the inner timer from reporting complete usage, so those three fields are
@@ -280,9 +289,10 @@ no-op avoided even the roughly 0.01-second scope cost.
 The task and resident must be worktrees of the same Git repository. The resident worktree remains
 the stable compiler pathname, while task source changes remain in the ordinary task worktree and
 write-heavy cache writes land in a task-private state directory. Cache paths must be relative,
-unique, non-overlapping directories. One non-blocking lock prevents concurrent mounts of the same
-mutable upper/work pair; read-only reuse needs no state or lock. The command receives the caller's
-terminal, environment, host filesystem, devices, processes, and network and returns the child's
+unique, non-overlapping directories. One non-blocking task-state lock prevents concurrent use of
+the same mutable lineage or linked Git view, including while a private parent is copied. The command
+receives the caller's terminal, environment, host filesystem, devices, processes, and network and
+returns the child's
 status. This is explicitly an ultra-trusted performance tool, not a security boundary or
 result-authority mechanism.
 

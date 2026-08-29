@@ -4,7 +4,7 @@
 This is a local development accelerator, not a security sandbox. It deliberately inherits the
 caller's environment, host filesystem, devices, processes, and network. Bubblewrap supplies only a
 stable project pathname plus explicit read-only, task-private directory, or task-private OverlayFS
-cache views.
+cache views. A task-private directory may start empty or copy one exact warm resident parent.
 """
 
 from __future__ import annotations
@@ -41,6 +41,14 @@ TERMINATION_GRACE_SECONDS = 2.0
 class CacheSpec:
     path: Path
     mode: str
+
+
+@dataclass(frozen=True)
+class CachePreparation:
+    path: Path
+    mode: str
+    disposition: str
+    elapsed_seconds: float
 
 
 @dataclass(frozen=True)
@@ -92,7 +100,7 @@ def parse_cache_specs(values: list[str]) -> tuple[CacheSpec, ...]:
             or path.is_absolute()
             or path in (Path("."), Path(".."))
             or ".." in path.parts
-            or mode not in ("overlay", "private", "ro")
+            or mode not in ("overlay", "private", "private-copy", "ro")
         ):
             raise RuntimeError(f"invalid cache specification: {value}")
         specs.append(CacheSpec(path, mode))
@@ -142,6 +150,50 @@ def ensure_private_directory(path: Path) -> None:
     if details.st_uid != os.getuid():
         raise RuntimeError(f"hot-run state is not owned by the current user: {path}")
     path.chmod(0o700)
+
+
+def prepare_private_copy(
+    spec: CacheSpec, resident_cache: Path, destination: Path
+) -> CachePreparation:
+    try:
+        destination.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        ensure_private_directory(destination)
+        return CachePreparation(spec.path, spec.mode, "reused", 0.0)
+
+    copy_program = Path("/usr/bin/cp")
+    if not copy_program.is_file() or not os.access(copy_program, os.X_OK):
+        raise RuntimeError("required capability GNU cp is unavailable")
+    started = time.monotonic()
+    candidate = Path(
+        tempfile.mkdtemp(prefix=f".{destination.name}.", dir=destination.parent)
+    )
+    try:
+        result = subprocess.run(
+            [
+                os.fspath(copy_program),
+                "-a",
+                "--reflink=auto",
+                "--",
+                f"{os.fspath(resident_cache)}/.",
+                os.fspath(candidate),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError("private-copy preparation failed")
+        os.replace(candidate, destination)
+    finally:
+        if candidate.exists():
+            shutil.rmtree(candidate)
+    return CachePreparation(
+        spec.path, spec.mode, "seeded", time.monotonic() - started
+    )
 
 
 def resolve_program(command: list[str], task: Path) -> list[str]:
@@ -254,12 +306,14 @@ def write_measurement(
     completion_reason: str,
     timeout_seconds: float | None,
     cache_specs: tuple[CacheSpec, ...],
+    cache_preparations: tuple[CachePreparation, ...],
     runtime_contract: RuntimeContract | None,
     cross_worktree: bool,
     resource_profile: str | None,
 ) -> None:
     destination = Path(os.path.abspath(destination))
     destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    preparation_elapsed = sum(item.elapsed_seconds for item in cache_preparations)
     report = {
         "schema_version": 1,
         "document_type": "glaeda-hot-run-measurement",
@@ -270,6 +324,15 @@ def write_measurement(
         "cache_views": [
             {"path": os.fspath(spec.path), "mode": spec.mode} for spec in cache_specs
         ],
+        "state_preparation": [
+            {
+                "path": os.fspath(item.path),
+                "mode": item.mode,
+                "disposition": item.disposition,
+                "elapsed_seconds": round(item.elapsed_seconds, 6),
+            }
+            for item in cache_preparations
+        ],
         "runtime": (
             {
                 "id": runtime_contract.runtime_id,
@@ -279,6 +342,10 @@ def write_measurement(
             else None
         ),
         "elapsed_seconds": round(elapsed_seconds, 6),
+        "preparation_elapsed_seconds": round(preparation_elapsed, 6),
+        "command_plus_preparation_elapsed_seconds": round(
+            elapsed_seconds + preparation_elapsed, 6
+        ),
         "user_cpu_seconds": (
             round(user_cpu_seconds, 6) if user_cpu_seconds is not None else None
         ),
@@ -353,6 +420,7 @@ def execute(
     environment: dict[str, str] | None,
     measurement: Path | None,
     cache_specs: tuple[CacheSpec, ...],
+    cache_preparations: tuple[CachePreparation, ...],
     runtime_contract: RuntimeContract | None,
     cross_worktree: bool,
     resource_profile: str | None,
@@ -495,6 +563,7 @@ def execute(
             completion_reason,
             timeout_seconds,
             cache_specs,
+            cache_preparations,
             runtime_contract,
             cross_worktree,
             resource_profile,
@@ -550,6 +619,7 @@ def run(
             None,
             measurement,
             (),
+            (),
             runtime_contract,
             cross_worktree=False,
             resource_profile=resource_profile,
@@ -560,7 +630,7 @@ def run(
     if bubblewrap is None:
         raise RuntimeError("required capability bwrap is unavailable")
     has_private_state = any(
-        spec.mode in ("overlay", "private") for spec in cache_specs
+        spec.mode in ("overlay", "private", "private-copy") for spec in cache_specs
     )
     state_base = Path(
         os.path.abspath(
@@ -571,6 +641,7 @@ def run(
     ensure_private_directory(state_root)
 
     cache_arguments_for_bwrap: list[str] = []
+    private_copy_candidates: list[tuple[CacheSpec, Path, Path]] = []
     for spec in cache_specs:
         resident_cache = resident / spec.path
         task_cache = task / spec.path
@@ -585,9 +656,13 @@ def run(
             )
             continue
         cache_identity = hashlib.sha256(os.fsencode(spec.path)).hexdigest()[:16]
-        if spec.mode == "private":
-            private = state_root / f"private-{cache_identity}"
-            ensure_private_directory(private)
+        if spec.mode in ("private", "private-copy"):
+            private_prefix = "private" if spec.mode == "private" else "private-copy"
+            private = state_root / f"{private_prefix}-{cache_identity}"
+            if spec.mode == "private":
+                ensure_private_directory(private)
+            else:
+                private_copy_candidates.append((spec, resident_cache, private))
             cache_arguments_for_bwrap.extend(
                 ["--bind", os.fspath(private), os.fspath(resident_cache)]
             )
@@ -620,6 +695,11 @@ def run(
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
             raise RuntimeError("this task's hot state is already in use") from error
+
+        cache_preparations = tuple(
+            prepare_private_copy(spec, resident_cache, private)
+            for spec, resident_cache, private in private_copy_candidates
+        )
 
         git_view = tempfile.TemporaryDirectory(prefix=".git-view-", dir=state_root)
         git_view_root = Path(git_view.name)
@@ -664,6 +744,7 @@ def run(
             environment,
             measurement,
             cache_specs,
+            cache_preparations,
             runtime_contract,
             cross_worktree=True,
             resource_profile=resource_profile,
@@ -710,7 +791,7 @@ def main() -> int:
         "--cache",
         action="append",
         default=[],
-        metavar="PATH[:overlay|private|ro]",
+        metavar="PATH[:overlay|private|private-copy|ro]",
         help=(
             "select one resident-relative state path; defaults to target:overlay "
             "when present"
