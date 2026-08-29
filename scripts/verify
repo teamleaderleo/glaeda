@@ -1,0 +1,346 @@
+#!/usr/bin/env python3
+"""Run Glaeda's fast developer loop or exact required verification sequence.
+
+This is a repository-local development helper, not the product verification executor. It streams
+child output directly, retains no logs, grants no result-reuse or publication authority, and leaves
+the existing checked-in `glaeda.required` command semantics unchanged.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+
+SCHEMA_VERSION = 1
+
+
+@dataclass(frozen=True)
+class Phase:
+    name: str
+    program_kind: str
+    program: str
+    arguments: tuple[str, ...]
+
+    def public_argv(self) -> list[str]:
+        return [self.program, *self.arguments]
+
+
+def required_phases() -> tuple[Phase, ...]:
+    return (
+        Phase("bootstrap", "repository", "scripts/bootstrap", ("--output", "json")),
+        Phase("format", "capability", "cargo", ("fmt", "--all", "--", "--check")),
+        Phase(
+            "clippy",
+            "capability",
+            "cargo",
+            (
+                "clippy",
+                "--locked",
+                "--all-targets",
+                "--all-features",
+                "--",
+                "-D",
+                "warnings",
+            ),
+        ),
+        Phase(
+            "test",
+            "capability",
+            "cargo",
+            ("test", "--locked", "--all-targets", "--all-features"),
+        ),
+        Phase(
+            "doctor",
+            "capability",
+            "cargo",
+            ("run", "--locked", "--quiet", "--", "--output", "json", "doctor"),
+        ),
+        Phase(
+            "plan-quarry",
+            "capability",
+            "cargo",
+            ("run", "--locked", "--quiet", "--", "plan", "--file", "examples/quarry.yml"),
+        ),
+        Phase(
+            "plan-glossless",
+            "capability",
+            "cargo",
+            (
+                "run",
+                "--locked",
+                "--quiet",
+                "--",
+                "--output",
+                "json",
+                "plan",
+                "--file",
+                "examples/glossless.yml",
+            ),
+        ),
+        Phase(
+            "host-plan-quarry",
+            "capability",
+            "cargo",
+            (
+                "run",
+                "--locked",
+                "--quiet",
+                "--",
+                "--output",
+                "json",
+                "host",
+                "plan",
+                "--file",
+                "examples/quarry.yml",
+            ),
+        ),
+    )
+
+
+def fast_phases() -> tuple[Phase, ...]:
+    return (
+        Phase(
+            "unit-and-binary-tests",
+            "capability",
+            "cargo",
+            ("test", "--locked", "--lib", "--bins"),
+        ),
+        Phase("format", "capability", "cargo", ("fmt", "--all", "--", "--check")),
+        Phase("build-cli", "capability", "cargo", ("build", "--locked", "--bin", "glaeda")),
+        Phase("doctor", "built-glaeda", "glaeda", ("--output", "json", "doctor")),
+        Phase(
+            "plan-quarry",
+            "built-glaeda",
+            "glaeda",
+            ("plan", "--file", "examples/quarry.yml"),
+        ),
+        Phase(
+            "plan-glossless",
+            "built-glaeda",
+            "glaeda",
+            ("--output", "json", "plan", "--file", "examples/glossless.yml"),
+        ),
+        Phase(
+            "host-plan-quarry",
+            "built-glaeda",
+            "glaeda",
+            ("--output", "json", "host", "plan", "--file", "examples/quarry.yml"),
+        ),
+    )
+
+
+def plan(profile: str) -> dict[str, object]:
+    phases = fast_phases() if profile == "fast" else required_phases()
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "document_type": "glaeda-local-verification-plan",
+        "profile": profile,
+        "authority": (
+            "developer_feedback_only" if profile == "fast" else "repository_required_checks"
+        ),
+        "source_must_remain_unchanged": True,
+        "retained_logs": False,
+        "phases": [
+            {"name": phase.name, "argv": phase.public_argv()} for phase in phases
+        ],
+    }
+
+
+def repository_root() -> Path:
+    root = Path(__file__).resolve().parent.parent
+    git = shutil.which("git")
+    if git is None:
+        raise RuntimeError("required capability git is unavailable")
+    result = subprocess.run(
+        [os.path.abspath(git), "rev-parse", "--show-toplevel"],
+        cwd=root,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    if result.returncode != 0 or Path(result.stdout.strip()).resolve() != root:
+        raise RuntimeError("scripts/verify must run from its canonical Glaeda worktree")
+    return root
+
+
+def source_state(root: Path) -> bytes:
+    git = shutil.which("git")
+    if git is None:
+        raise RuntimeError("required capability git is unavailable")
+    status = subprocess.run(
+        [
+            os.path.abspath(git),
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+        ],
+        cwd=root,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        timeout=30,
+        check=False,
+    )
+    if status.returncode != 0:
+        raise RuntimeError("Git could not observe the Glaeda worktree")
+    diff = subprocess.run(
+        [os.path.abspath(git), "diff", "--no-ext-diff", "--binary", "HEAD", "--"],
+        cwd=root,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        timeout=30,
+        check=False,
+    )
+    if diff.returncode != 0:
+        raise RuntimeError("Git could not inspect Glaeda source changes")
+    untracked = subprocess.run(
+        [
+            os.path.abspath(git),
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "-z",
+        ],
+        cwd=root,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        timeout=30,
+        check=False,
+    )
+    if untracked.returncode != 0:
+        raise RuntimeError("Git could not inspect untracked Glaeda source")
+
+    digest = hashlib.sha256()
+    digest.update(status.stdout)
+    digest.update(diff.stdout)
+    for encoded_path in filter(None, untracked.stdout.split(b"\0")):
+        path = root / os.fsdecode(encoded_path)
+        digest.update(encoded_path)
+        if path.is_symlink():
+            digest.update(b"symlink\0")
+            digest.update(os.fsencode(os.readlink(path)))
+        elif path.is_file():
+            digest.update(b"file\0")
+            with path.open("rb") as source:
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        else:
+            digest.update(b"other\0")
+    return digest.digest()
+
+
+def built_glaeda(root: Path) -> Path:
+    configured = os.environ.get("CARGO_TARGET_DIR")
+    target = Path(configured) if configured else root / "target"
+    if not target.is_absolute():
+        target = root / target
+    suffix = ".exe" if os.name == "nt" else ""
+    return Path(os.path.abspath(target)) / "debug" / f"glaeda{suffix}"
+
+
+def resolve_program(phase: Phase, root: Path) -> Path:
+    if phase.program_kind == "repository":
+        program = root / phase.program
+    elif phase.program_kind == "built-glaeda":
+        program = built_glaeda(root)
+    else:
+        found = shutil.which(phase.program)
+        if found is None:
+            raise RuntimeError(f"required capability {phase.program} is unavailable")
+        program = Path(found)
+    program = Path(os.path.abspath(program))
+    if not program.is_file() or not os.access(program, os.X_OK):
+        raise RuntimeError(f"phase {phase.name} executable is unavailable")
+    return program
+
+
+def run(profile: str) -> int:
+    root = repository_root()
+    phases = fast_phases() if profile == "fast" else required_phases()
+    before = source_state(root)
+    started = time.monotonic()
+    exit_code = 0
+
+    print(f"Glaeda local verification: {profile}", file=sys.stderr)
+    if profile == "fast":
+        print(
+            "authority: developer feedback only; final required verification is not claimed",
+            file=sys.stderr,
+        )
+    else:
+        print("authority: exact repository-required command sequence", file=sys.stderr)
+
+    try:
+        for index, phase in enumerate(phases, start=1):
+            program = resolve_program(phase, root)
+            phase_started = time.monotonic()
+            print(f"[{index}/{len(phases)}] {phase.name}: start", file=sys.stderr)
+            result = subprocess.run(
+                [os.fspath(program), *phase.arguments],
+                cwd=root,
+                stdin=subprocess.DEVNULL,
+                check=False,
+            )
+            elapsed = time.monotonic() - phase_started
+            print(
+                f"[{index}/{len(phases)}] {phase.name}: exit={result.returncode} elapsed={elapsed:.3f}s",
+                file=sys.stderr,
+            )
+            if result.returncode != 0:
+                exit_code = result.returncode or 1
+                break
+    except KeyboardInterrupt:
+        exit_code = 130
+    except (OSError, RuntimeError) as error:
+        print(f"verification error: {error}", file=sys.stderr)
+        exit_code = 2
+
+    try:
+        unchanged = source_state(root) == before
+    except RuntimeError as error:
+        print(f"verification error: {error}", file=sys.stderr)
+        unchanged = False
+    if not unchanged:
+        print("verification error: source state changed during the run", file=sys.stderr)
+        exit_code = exit_code or 2
+
+    print(
+        f"Glaeda local verification complete: exit={exit_code} "
+        f"elapsed={time.monotonic() - started:.3f}s source_unchanged={str(unchanged).lower()}",
+        file=sys.stderr,
+    )
+    return exit_code
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("profile", nargs="?", choices=("fast", "required"), default="fast")
+    parser.add_argument(
+        "--plan-json",
+        action="store_true",
+        help="emit the fixed path-free plan without executing commands",
+    )
+    args = parser.parse_args()
+    if args.plan_json:
+        print(json.dumps(plan(args.profile), indent=2, sort_keys=True))
+        return 0
+    return run(args.profile)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

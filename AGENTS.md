@@ -53,6 +53,19 @@ Run `./scripts/bootstrap` from the repository root before selecting a verificati
 
 ## Required checks
 
+For a quick non-authoritative edit/test loop, run:
+
+```bash
+./scripts/verify fast
+```
+
+This runs library/binary tests first, formatting, one CLI build, and the doctor/reference-plan smoke
+checks with per-phase timings. It deliberately skips Clippy and integration/acceptance targets, so
+it is developer feedback only and never replaces final verification.
+
+`./scripts/verify required` runs the exact eight commands below in order and streams their output
+without retaining a log. The explicit commands remain listed as the canonical contract.
+
 Before declaring a code change ready:
 
 ```bash
