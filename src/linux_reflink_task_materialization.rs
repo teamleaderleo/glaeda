@@ -18,7 +18,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::Instant;
 
-use rustix::fs::ioctl_ficlone;
+use rustix::fs::{Timespec, Timestamps, futimens, ioctl_ficlone};
 use serde::Serialize;
 use sha1::{Digest as _, Sha1};
 
@@ -763,7 +763,12 @@ fn reflink_entry_chunk(
             let Ok(updates) = result else {
                 continue;
             };
-            match reflink_one_target(&source, task.target.join(&relative), entry) {
+            match reflink_one_target(
+                &source,
+                &source_metadata,
+                task.target.join(&relative),
+                entry,
+            ) {
                 Ok(update) => updates.push(update),
                 Err(failure) => *result = Err(failure),
             }
@@ -781,6 +786,7 @@ fn reflink_entry_chunk(
 
 fn reflink_one_target(
     source: &fs::File,
+    source_metadata: &fs::Metadata,
     target_path: PathBuf,
     entry: &TreeEntry,
 ) -> Result<GitIndexStatUpdate, CandidateFailure> {
@@ -795,6 +801,7 @@ fn reflink_one_target(
     target
         .set_permissions(fs::Permissions::from_mode(entry.mode & 0o777))
         .map_err(|_| candidate("candidate_target_mode_failed"))?;
+    preserve_source_timestamps(&target, source_metadata)?;
     let metadata = target
         .metadata()
         .map_err(|_| candidate("candidate_target_stat_failed"))?;
@@ -1142,6 +1149,7 @@ fn reflink_entries(
         target
             .set_permissions(fs::Permissions::from_mode(entry.mode & 0o777))
             .map_err(|_| candidate("candidate_target_mode_failed"))?;
+        preserve_source_timestamps(&target, &source_metadata)?;
         let source_after = source
             .metadata()
             .map_err(|_| candidate("candidate_source_stat_failed"))?;
@@ -1175,6 +1183,23 @@ fn git_index_stat(metadata: &fs::Metadata) -> Result<GitIndexStat, CandidateFail
         metadata.gid(),
         u32::try_from(metadata.size()).map_err(|_| candidate("candidate_stat_out_of_range"))?,
     ))
+}
+
+fn preserve_source_timestamps(
+    target: &fs::File,
+    source: &fs::Metadata,
+) -> Result<(), CandidateFailure> {
+    let timestamps = Timestamps {
+        last_access: Timespec {
+            tv_sec: source.atime(),
+            tv_nsec: source.atime_nsec(),
+        },
+        last_modification: Timespec {
+            tv_sec: source.mtime(),
+            tv_nsec: source.mtime_nsec(),
+        },
+    };
+    futimens(target, &timestamps).map_err(|_| candidate("candidate_target_timestamp_failed"))
 }
 
 fn verify_source_blob(
