@@ -12,9 +12,11 @@ import argparse
 import fcntl
 import hashlib
 import json
+import math
 import os
 import resource
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -31,6 +33,7 @@ HEAVY_SCOPE_PROPERTIES = (
     "MemoryMax=12G",
     "TasksMax=1024",
 )
+TERMINATION_GRACE_SECONDS = 2.0
 
 
 @dataclass(frozen=True)
@@ -137,6 +140,16 @@ def resolve_program(command: list[str], task: Path) -> list[str]:
     return [os.fspath(program), *command[1:]]
 
 
+def positive_seconds(value: str) -> float:
+    try:
+        seconds = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be a positive number") from error
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise argparse.ArgumentTypeError("must be a positive finite number")
+    return seconds
+
+
 def rust_tool_environment(
     task: Path, command: list[str], environment: dict[str, str]
 ) -> None:
@@ -168,31 +181,42 @@ def rust_tool_environment(
 def write_measurement(
     destination: Path,
     elapsed_seconds: float,
-    usage_before: resource.struct_rusage,
-    usage_after: resource.struct_rusage,
-    returncode: int,
+    user_cpu_seconds: float | None,
+    system_cpu_seconds: float | None,
+    max_rss_kib: int | None,
+    resource_accounting: str,
+    exit_code: int,
+    terminating_signal: int | None,
+    completion_reason: str,
+    timeout_seconds: float | None,
     cache_specs: tuple[CacheSpec, ...],
     cross_worktree: bool,
     resource_profile: str | None,
 ) -> None:
     destination = Path(os.path.abspath(destination))
     destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    signal = -returncode if returncode < 0 else None
     report = {
         "schema_version": 1,
         "document_type": "glaeda-hot-run-measurement",
         "authority": "developer_observation_only",
         "cross_worktree": cross_worktree,
         "resource_profile": resource_profile,
+        "timeout_seconds": timeout_seconds,
         "cache_views": [
             {"path": os.fspath(spec.path), "mode": spec.mode} for spec in cache_specs
         ],
         "elapsed_seconds": round(elapsed_seconds, 6),
-        "user_cpu_seconds": round(usage_after.ru_utime - usage_before.ru_utime, 6),
-        "system_cpu_seconds": round(usage_after.ru_stime - usage_before.ru_stime, 6),
-        "max_rss_kib": usage_after.ru_maxrss,
-        "exit_code": returncode if returncode >= 0 else 128 + signal,
-        "signal": signal,
+        "user_cpu_seconds": (
+            round(user_cpu_seconds, 6) if user_cpu_seconds is not None else None
+        ),
+        "system_cpu_seconds": (
+            round(system_cpu_seconds, 6) if system_cpu_seconds is not None else None
+        ),
+        "max_rss_kib": max_rss_kib,
+        "resource_accounting": resource_accounting,
+        "exit_code": exit_code,
+        "signal": terminating_signal,
+        "completion_reason": completion_reason,
     }
     temporary_name: str | None = None
     try:
@@ -220,6 +244,36 @@ def write_measurement(
                 pass
 
 
+def terminate_process(
+    process: subprocess.Popen[bytes],
+    initial_signal: signal.Signals,
+    isolated_process_group: bool,
+) -> int:
+    """Stop one owned command, escalating after a short bounded grace period."""
+
+    signal_used = initial_signal
+    try:
+        if isolated_process_group:
+            os.killpg(process.pid, initial_signal)
+        elif process.poll() is None:
+            process.send_signal(initial_signal)
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=TERMINATION_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        signal_used = signal.SIGKILL
+        try:
+            if isolated_process_group:
+                os.killpg(process.pid, signal.SIGKILL)
+            else:
+                process.kill()
+        except ProcessLookupError:
+            pass
+        process.wait()
+    return int(signal_used)
+
+
 def execute(
     arguments: list[str],
     cwd: Path | None,
@@ -228,11 +282,28 @@ def execute(
     cache_specs: tuple[CacheSpec, ...],
     cross_worktree: bool,
     resource_profile: str | None,
+    timeout_seconds: float | None,
 ) -> int:
+    time_report: Path | None = None
     if resource_profile is not None:
         systemd_run = shutil.which("systemd-run")
         if systemd_run is None:
             raise RuntimeError("required capability systemd-run is unavailable")
+        gnu_time = shutil.which("time") if measurement is not None else None
+        if gnu_time is not None:
+            with tempfile.NamedTemporaryFile(
+                prefix=".glaeda-hot-run-time-", delete=False
+            ) as temporary:
+                time_report = Path(temporary.name)
+            arguments = [
+                os.path.abspath(gnu_time),
+                "--quiet",
+                "--format",
+                "%U\n%S\n%M",
+                "--output",
+                os.fspath(time_report),
+                *arguments,
+            ]
         arguments = [
             os.path.abspath(systemd_run),
             "--user",
@@ -248,21 +319,108 @@ def execute(
         ]
     usage_before = resource.getrusage(resource.RUSAGE_CHILDREN)
     started = time.monotonic()
-    result = subprocess.run(arguments, cwd=cwd, env=environment, check=False)
+    isolated_process_group = timeout_seconds is not None
+    try:
+        process = subprocess.Popen(
+            arguments,
+            cwd=cwd,
+            env=environment,
+            start_new_session=isolated_process_group,
+        )
+    except BaseException:
+        if time_report is not None:
+            try:
+                time_report.unlink()
+            except FileNotFoundError:
+                pass
+        raise
+    terminating_signal: int | None = None
+    try:
+        returncode = process.wait(timeout=timeout_seconds)
+        if returncode < 0:
+            terminating_signal = -returncode
+            exit_code = 128 + terminating_signal
+            completion_reason = "signaled"
+        else:
+            exit_code = returncode
+            completion_reason = "exited"
+    except subprocess.TimeoutExpired:
+        terminating_signal = terminate_process(
+            process, signal.SIGTERM, isolated_process_group=True
+        )
+        exit_code = 124
+        completion_reason = "deadline_exceeded"
+    except KeyboardInterrupt:
+        # Without an explicit timeout the terminal already delivered SIGINT to the
+        # child. Waiting first gives it the same opportunity to clean up as before.
+        if isolated_process_group:
+            terminating_signal = terminate_process(
+                process, signal.SIGINT, isolated_process_group=True
+            )
+        else:
+            try:
+                process.wait(timeout=TERMINATION_GRACE_SECONDS)
+                terminating_signal = signal.SIGINT
+            except subprocess.TimeoutExpired:
+                terminating_signal = terminate_process(
+                    process, signal.SIGTERM, isolated_process_group=False
+                )
+        exit_code = 130
+        completion_reason = "operator_interrupt"
     elapsed = time.monotonic() - started
     usage_after = resource.getrusage(resource.RUSAGE_CHILDREN)
+    user_cpu_seconds: float | None
+    system_cpu_seconds: float | None
+    max_rss_kib: int | None
+    if resource_profile is None:
+        user_cpu_seconds = usage_after.ru_utime - usage_before.ru_utime
+        system_cpu_seconds = usage_after.ru_stime - usage_before.ru_stime
+        max_rss_kib = usage_after.ru_maxrss
+        resource_accounting = "child_rusage"
+    else:
+        timed_usage: tuple[float, float, int] | None = None
+        if time_report is not None:
+            try:
+                lines = time_report.read_text(encoding="utf-8").splitlines()
+                if len(lines) == 3:
+                    timed_usage = (float(lines[0]), float(lines[1]), int(lines[2]))
+            except (OSError, ValueError):
+                pass
+            finally:
+                try:
+                    time_report.unlink()
+                except FileNotFoundError:
+                    pass
+        if timed_usage is None:
+            user_cpu_seconds = None
+            system_cpu_seconds = None
+            max_rss_kib = None
+            resource_accounting = "unavailable_after_scope_termination"
+        else:
+            user_cpu_seconds, system_cpu_seconds, max_rss_kib = timed_usage
+            resource_accounting = "gnu_time_inside_scope"
+    if completion_reason in ("deadline_exceeded", "operator_interrupt"):
+        user_cpu_seconds = None
+        system_cpu_seconds = None
+        max_rss_kib = None
+        resource_accounting = "unavailable_after_forced_termination"
     if measurement is not None:
         write_measurement(
             measurement,
             elapsed,
-            usage_before,
-            usage_after,
-            result.returncode,
+            user_cpu_seconds,
+            system_cpu_seconds,
+            max_rss_kib,
+            resource_accounting,
+            exit_code,
+            terminating_signal,
+            completion_reason,
+            timeout_seconds,
             cache_specs,
             cross_worktree,
             resource_profile,
         )
-    return result.returncode if result.returncode >= 0 else 128 - result.returncode
+    return exit_code
 
 
 def run(
@@ -272,6 +430,7 @@ def run(
     cache_arguments: list[str],
     measurement: Path | None,
     resource_profile: str | None,
+    timeout_seconds: float | None,
     command: list[str],
     verbose: bool,
 ) -> int:
@@ -302,6 +461,7 @@ def run(
             (),
             cross_worktree=False,
             resource_profile=resource_profile,
+            timeout_seconds=timeout_seconds,
         )
 
     bubblewrap = shutil.which("bwrap")
@@ -390,6 +550,7 @@ def run(
             cache_specs,
             cross_worktree=True,
             resource_profile=resource_profile,
+            timeout_seconds=timeout_seconds,
         )
     finally:
         if lock_fd is not None:
@@ -410,6 +571,12 @@ def main() -> int:
         "--resource-profile",
         choices=("big-red-heavy",),
         help="run in the measured 12-CPU/8G-high/12G-max/1024-task user scope",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=positive_seconds,
+        metavar="SECONDS",
+        help="terminate the owned command tree after this wall-clock deadline",
     )
     parser.add_argument(
         "--cache",
@@ -434,6 +601,7 @@ def main() -> int:
             arguments.cache,
             arguments.measurement,
             arguments.resource_profile,
+            arguments.timeout,
             command,
             arguments.verbose,
         )

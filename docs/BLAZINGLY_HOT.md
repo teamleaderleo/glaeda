@@ -184,9 +184,20 @@ scripts/hot-run --resident /path/to/node-resident --task /path/to/task \
 ```
 
 `--measurement result.json` atomically writes one bounded developer observation containing elapsed
-time, user/system CPU time, peak RSS, exit/signal, cross-worktree mode, and relative cache policies.
-It contains no command, output, environment, repository identity, or private path and grants no
-verification or result-reuse authority.
+time, user/system CPU time, peak RSS, exit/signal, completion reason, configured timeout,
+cross-worktree mode, and relative cache policies. It contains no command, output, environment,
+repository identity, or private path and grants no verification or result-reuse authority.
+Unscoped commands use child `getrusage`; profiled commands place GNU `time` inside the scope so CPU
+and peak RSS describe the workload rather than the `systemd-run` launcher. Force termination can
+prevent descendants or the inner timer from reporting complete usage, so those three fields are
+explicitly `null` instead of fabricated on deadlines and operator interrupts.
+
+Heavy commands should also use `--timeout SECONDS`. The wall-clock deadline owns the whole command
+process group, first requests termination, escalates after a two-second grace period, returns the
+conventional status 124, and writes the failure receipt. An operator interrupt similarly returns
+130 without a Python traceback and records `operator_interrupt`. A timeout deliberately creates a
+separate process group; use the unbounded mode for commands that require interactive terminal job
+control.
 
 Heavy local work on the measured machine may opt into `--resource-profile big-red-heavy`. It uses
 one collected user systemd scope with a 1,200% CPU quota, 8 GiB memory-high threshold, 12 GiB hard

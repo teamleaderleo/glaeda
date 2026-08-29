@@ -7,9 +7,11 @@ import json
 import os
 import runpy
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -114,6 +116,8 @@ class HotRunTests(unittest.TestCase):
             report = json.loads(measurement.read_text(encoding="utf-8"))
             self.assertEqual(report["authority"], "developer_observation_only")
             self.assertEqual(report["exit_code"], 0)
+            self.assertEqual(report["completion_reason"], "exited")
+            self.assertIsNone(report["timeout_seconds"])
             self.assertIsNone(report["resource_profile"])
             self.assertTrue(report["cross_worktree"])
             self.assertGreaterEqual(report["elapsed_seconds"], 0)
@@ -163,9 +167,85 @@ class HotRunTests(unittest.TestCase):
             self.assertEqual(result.returncode, 17)
             report = json.loads(measurement.read_text(encoding="utf-8"))
             self.assertEqual(report["exit_code"], 17)
+            self.assertEqual(report["completion_reason"], "exited")
             self.assertFalse(report["cross_worktree"])
             self.assertEqual(report["cache_views"], [])
             self.assertIsNone(report["resource_profile"])
+
+    def test_timeout_stops_owned_process_group_and_writes_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            measurement = fixture / "measurement.json"
+            child_pid = fixture / "child.pid"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    os.fspath(HOT_RUN),
+                    "--resident",
+                    os.fspath(ROOT),
+                    "--task",
+                    os.fspath(ROOT),
+                    "--timeout",
+                    "0.2",
+                    "--measurement",
+                    os.fspath(measurement),
+                    "--",
+                    "/bin/sh",
+                    "-c",
+                    f"sleep 60 & echo $! > {child_pid}; wait",
+                ],
+                stdin=subprocess.DEVNULL,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 124)
+            report = json.loads(measurement.read_text(encoding="utf-8"))
+            self.assertEqual(report["exit_code"], 124)
+            self.assertEqual(report["completion_reason"], "deadline_exceeded")
+            self.assertEqual(report["signal"], signal.SIGTERM)
+            self.assertEqual(report["timeout_seconds"], 0.2)
+            self.assertEqual(
+                report["resource_accounting"],
+                "unavailable_after_forced_termination",
+            )
+            self.assertIsNone(report["max_rss_kib"])
+            self.assertLess(report["elapsed_seconds"], 3)
+            pid = int(child_pid.read_text(encoding="utf-8"))
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+
+    def test_operator_interrupt_is_clean_and_writes_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            measurement = Path(directory) / "measurement.json"
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    os.fspath(HOT_RUN),
+                    "--resident",
+                    os.fspath(ROOT),
+                    "--task",
+                    os.fspath(ROOT),
+                    "--measurement",
+                    os.fspath(measurement),
+                    "--",
+                    "/bin/sleep",
+                    "60",
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+            time.sleep(0.1)
+            os.killpg(process.pid, signal.SIGINT)
+            _, stderr = process.communicate(timeout=3)
+            self.assertEqual(process.returncode, 130)
+            self.assertNotIn("Traceback", stderr)
+            report = json.loads(measurement.read_text(encoding="utf-8"))
+            self.assertEqual(report["exit_code"], 130)
+            self.assertEqual(report["completion_reason"], "operator_interrupt")
+            self.assertEqual(report["signal"], signal.SIGINT)
+            self.assertIsNone(report["user_cpu_seconds"])
 
     @unittest.skipUnless(shutil.which("systemd-run"), "systemd-run is unavailable")
     def test_heavy_profile_preserves_status_and_is_recorded(self) -> None:
@@ -194,6 +274,10 @@ class HotRunTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0)
             report = json.loads(measurement.read_text(encoding="utf-8"))
             self.assertEqual(report["resource_profile"], "big-red-heavy")
+            self.assertEqual(report["resource_accounting"], "gnu_time_inside_scope")
+            self.assertIsInstance(report["user_cpu_seconds"], float)
+            self.assertIsInstance(report["system_cpu_seconds"], float)
+            self.assertIsInstance(report["max_rss_kib"], int)
 
 
 if __name__ == "__main__":
