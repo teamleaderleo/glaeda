@@ -36,9 +36,9 @@ That sample is not a speed result. It establishes a routing/compatibility requir
 `.github/workflows/developer-loop-benchmark.yml` measures two GitHub-hosted Ubuntu 24.04 controls from the same edit fixture:
 
 1. a fresh runner applies the edit before any build;
-2. a separate runner restores an exact immutable target generation compiled from the unedited base, applies the edit, and runs the same workload.
+2. a cache-prepared runner restores an exact immutable target generation compiled from the unedited base, applies the edit, and runs the same workload.
 
-The base cache key binds runner OS/architecture, Rust 1.97.1, and the exact Actions source SHA. A cache miss materializes the base before the prepared arm is admitted. Receipts are uploaded for both workload results. Queue, checkout, toolchain installation, cache transfer, workload, and end-to-end job times remain separately observable in the Actions run.
+The base cache key binds runner OS/architecture, Rust 1.97.1, and the exact Actions source SHA. On a miss, the prepared job materializes and saves the unedited base before applying the fixture; later unchanged runs restore that immutable generation directly. Receipts are uploaded for both workload results. Queue, checkout, toolchain installation, cache transfer, workload, and end-to-end job times remain separately observable in the Actions run.
 
 The first hosted distributions should be appended here after repeated unchanged runs. Node 22/24 is not a benchmark dimension for this Rust workload; earlier Node 22 evidence only discriminated one Scrapbook environment incident.
 
