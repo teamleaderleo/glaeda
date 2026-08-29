@@ -36,6 +36,7 @@ TASKSET = Path("/usr/bin/taskset")
 SOURCE_COMMIT = "b9fa23462420c13a465d635d9694f0c827c1e685"
 SOURCE_TREE = "edd0b7bb9d3e59305c21c69b721b5278d8aff6da"
 FIXTURE_DIGEST = "sha256:bfdd60e73e8b106c0129d1052310495ae2dbe1ff70bb52b35a9f9ef4911927eb"
+FIXTURE_FILE_DIGEST = "sha256:c51d467376a86adfeafa7a2b161d216ca6d6e2eb9d48ac08fe6585edcd1cec0d"
 EMPTY_DIFF_DIGEST = f"sha256:{hashlib.sha256(b'').hexdigest()}"
 RUSTC_VERSION_PREFIX = "rustc 1.97.1 "
 CARGO_VERSION_PREFIX = "cargo 1.97.1 "
@@ -100,7 +101,8 @@ def workload_identity() -> dict[str, Any]:
         "benchmark_id": "resident-eligible-rust-edit-v1",
         "source_commit": SOURCE_COMMIT,
         "source_tree": SOURCE_TREE,
-        "fixture_digest": FIXTURE_DIGEST,
+        "fixture_diff_digest": FIXTURE_DIGEST,
+        "fixture_file_digest": FIXTURE_FILE_DIGEST,
         "expected_executed_test_count": 1343,
         "excluded_host_fact_test_count": 16,
     }
@@ -179,7 +181,7 @@ def validate_static_contract(repository: Path) -> None:
     if git_output(["rev-parse", f"{SOURCE_COMMIT}^{{tree}}"], cwd=repository) != SOURCE_TREE:
         raise ExperimentError("frozen source identity is unavailable")
     fixture_digest = f"sha256:{hashlib.sha256(FIXTURE.read_bytes()).hexdigest()}"
-    if fixture_digest != FIXTURE_DIGEST:
+    if fixture_digest != FIXTURE_FILE_DIGEST:
         raise ExperimentError("frozen fixture identity changed")
     relevant_status = git_output(
         [
