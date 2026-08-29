@@ -76,8 +76,10 @@ jobs:
               compile(path.read_text(encoding="utf-8"), str(path), "exec")
           PY
           test -x ./smolrunner
+          bash -n scripts/benchmark-developer-loop
           bash -n scripts/test-bootstrap.sh
           bash scripts/test-bootstrap.sh
+          python3 scripts/test-benchmark-developer-loop.py
           python3 scripts/test-hot-observe.py
           python3 scripts/test-hot-run.py
           python3 scripts/test-verify.py
