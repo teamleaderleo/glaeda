@@ -44,9 +44,10 @@ RUSTC_VERSION = "rustc 1.97.1 (8bab26f4f 2026-07-14)"
 CARGO_VERSION = "cargo 1.97.1 (c980f4866 2026-06-30)"
 RUSTC_SHA256 = "d3a664c970a9fd8361b64194861bebc1ae37b9054e5ee3400dc1c9e691797eea"
 CARGO_SHA256 = "828980723df339d62434390e9fb8ef8831036583343ae2316b7ab5646b5c1953"
-COMPARISON_BASIS_VERSION = 2
+COMPARISON_BASIS_VERSION = 3
 ARMS = ("ordinary-native", "private", "overlay", "private-copy")
 FANOUTS = (1, 4, 8)
+RETAINED_REUSE_WINDOW_COUNTS = (1, 3, 7)
 PAGE_CACHE_RESIDENT_WARM = "resident_uncontrolled_warm"
 PAGE_CACHE_RESIDENT_TARGET_DONTNEED = (
     "resident_target_fsync_fadvise_dontneed"
@@ -75,7 +76,11 @@ class ExperimentPlan:
     available_cpu_ids: tuple[int, ...]
     task_cpu_sets: tuple[tuple[int, ...], ...]
     page_cache_treatment: str
-    retained_reuse: bool
+    retained_reuse_windows: int
+
+    @property
+    def retained_reuse(self) -> bool:
+        return self.retained_reuse_windows > 0
 
     def to_json(self) -> dict[str, Any]:
         comparison = {
@@ -85,8 +90,23 @@ class ExperimentPlan:
         }
         if self.retained_reuse:
             comparison["retained_reuse_key"] = comparison_key(
-                self, edited=True, retained_reuse=True
+                self,
+                edited=True,
+                retained_reuse=True,
+                retained_reuse_ordinal=1,
             )
+            comparison["retained_reuse_keys"] = [
+                {
+                    "ordinal": ordinal,
+                    "key": comparison_key(
+                        self,
+                        edited=True,
+                        retained_reuse=True,
+                        retained_reuse_ordinal=ordinal,
+                    ),
+                }
+                for ordinal in range(1, self.retained_reuse_windows + 1)
+            ]
         return {
             "schema_version": 1,
             "document_type": "glaeda-hot-state-fanout-plan",
@@ -105,6 +125,7 @@ class ExperimentPlan:
             },
             "deadline_seconds": self.deadline_seconds,
             "retained_reuse_window": self.retained_reuse,
+            "retained_reuse_window_count": self.retained_reuse_windows,
             "environment": {
                 "policy": "closed_allowlist",
                 "child_filesystem_creation_umask": f"{CHILD_UMASK:04o}",
@@ -139,11 +160,29 @@ def workload_identity() -> dict[str, Any]:
 
 
 def comparison_basis(
-    plan: ExperimentPlan, edited: bool, retained_reuse: bool = False
+    plan: ExperimentPlan,
+    edited: bool,
+    retained_reuse: bool = False,
+    retained_reuse_ordinal: int | None = None,
 ) -> dict[str, Any]:
     """Return the path-free, exact-work basis owned by this closed harness."""
     if retained_reuse and not edited:
         raise ExperimentError("retained reuse requires the accepted edit state")
+    if retained_reuse:
+        ordinal = 1 if retained_reuse_ordinal is None else retained_reuse_ordinal
+        if (
+            not isinstance(ordinal, int)
+            or isinstance(ordinal, bool)
+            or ordinal < 1
+            or ordinal > max(RETAINED_REUSE_WINDOW_COUNTS)
+        ):
+            raise ExperimentError("retained-reuse ordinal is outside the bounded sequence")
+        if ordinal > plan.retained_reuse_windows:
+            raise ExperimentError("retained-reuse ordinal exceeds the declared plan")
+    elif retained_reuse_ordinal is not None:
+        raise ExperimentError("retained-reuse ordinal requires retained reuse")
+    else:
+        ordinal = None
     return {
         "schema_version": COMPARISON_BASIS_VERSION,
         "document_type": "glaeda-hot-state-fanout-comparison-basis",
@@ -185,15 +224,21 @@ def comparison_basis(
                 if retained_reuse
                 else STATE_PHASE_INITIAL
             ),
+            "retained_reuse_ordinal": ordinal,
         },
     }
 
 
 def comparison_key(
-    plan: ExperimentPlan, edited: bool, retained_reuse: bool = False
+    plan: ExperimentPlan,
+    edited: bool,
+    retained_reuse: bool = False,
+    retained_reuse_ordinal: int | None = None,
 ) -> str:
     encoded = json.dumps(
-        comparison_basis(plan, edited, retained_reuse),
+        comparison_basis(
+            plan, edited, retained_reuse, retained_reuse_ordinal
+        ),
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
@@ -208,6 +253,7 @@ def build_plan(
     available_cpu_ids: tuple[int, ...] | None = None,
     page_cache_treatment: str = PAGE_CACHE_RESIDENT_WARM,
     retained_reuse: bool = False,
+    retained_reuse_windows: int | None = None,
 ) -> ExperimentPlan:
     if arm not in ARMS:
         raise ExperimentError("unsupported hot-state arm")
@@ -221,6 +267,20 @@ def build_plan(
         raise ExperimentError("unsupported page-cache treatment")
     if not isinstance(retained_reuse, bool):
         raise ExperimentError("retained-reuse selection must be boolean")
+    if retained_reuse and retained_reuse_windows is not None:
+        raise ExperimentError(
+            "single retained reuse and retained-reuse sequence are mutually exclusive"
+        )
+    if retained_reuse_windows is None:
+        sequence_windows = 1 if retained_reuse else 0
+    else:
+        sequence_windows = retained_reuse_windows
+    if (
+        not isinstance(sequence_windows, int)
+        or isinstance(sequence_windows, bool)
+        or sequence_windows not in (0, *RETAINED_REUSE_WINDOW_COUNTS)
+    ):
+        raise ExperimentError("retained-reuse window count is unsupported")
     if (
         page_cache_treatment == PAGE_CACHE_RESIDENT_TARGET_DONTNEED
         and arm not in ("overlay", "private-copy")
@@ -249,7 +309,7 @@ def build_plan(
         available_cpu_ids=cpu_ids,
         task_cpu_sets=task_cpu_sets,
         page_cache_treatment=page_cache_treatment,
-        retained_reuse=retained_reuse,
+        retained_reuse_windows=sequence_windows,
     )
 
 
@@ -485,6 +545,7 @@ def command_for_task(
     hot_run_receipt: Path,
     edited: bool,
     retained_reuse: bool = False,
+    retained_reuse_ordinal: int | None = None,
 ) -> tuple[list[str], Path | None]:
     benchmark_command = [
         os.fspath(BENCHMARK),
@@ -508,7 +569,9 @@ def command_for_task(
             "--measurement",
             os.fspath(hot_run_receipt),
             "--comparison-key",
-            comparison_key(plan, edited, retained_reuse),
+            comparison_key(
+                plan, edited, retained_reuse, retained_reuse_ordinal
+            ),
             "--",
             *benchmark_command,
         ],
@@ -749,6 +812,7 @@ def aggregate_task(
     plan: ExperimentPlan,
     edited: bool,
     retained_reuse: bool = False,
+    retained_reuse_ordinal: int | None = None,
 ) -> dict[str, Any]:
     benchmark = read_json(task.benchmark_receipt)
     validate_benchmark_receipt(benchmark, edited, plan.cargo_jobs_per_task)
@@ -792,7 +856,9 @@ def aggregate_task(
         or hot_run.get("exit_code") != 0
         or hot_run.get("completion_reason") != "exited"
         or hot_run.get("comparison_key")
-        != comparison_key(plan, edited, retained_reuse)
+        != comparison_key(
+            plan, edited, retained_reuse, retained_reuse_ordinal
+        )
         or hot_run.get("cross_worktree") is not expected_cross_worktree
         or hot_run.get("resource_profile") is not None
         or hot_run.get("cache_views")
@@ -873,6 +939,7 @@ def run_cohort(
     phase: str,
     edited: bool,
     retained_reuse: bool = False,
+    retained_reuse_ordinal: int | None = None,
 ) -> tuple[float, list[dict[str, Any]], str | None, int]:
     processes: list[TaskProcess] = []
     started = time.monotonic()
@@ -891,6 +958,7 @@ def run_cohort(
                 hot_run_receipt,
                 edited,
                 retained_reuse,
+                retained_reuse_ordinal,
             )
             processes.append(
                 start_task(
@@ -919,7 +987,13 @@ def run_cohort(
         )
     try:
         accepted = [
-            aggregate_task(task, plan, edited, retained_reuse)
+            aggregate_task(
+                task,
+                plan,
+                edited,
+                retained_reuse,
+                retained_reuse_ordinal,
+            )
             for task in processes
         ]
     except ExperimentError as error:
@@ -1205,6 +1279,7 @@ def run_experiment(
     setup: dict[str, Any] = {}
     window: dict[str, Any] = {}
     retained_reuse_window: dict[str, Any] = {"disposition": "not_requested"}
+    retained_reuse_windows: list[dict[str, Any]] = []
     cleanup: dict[str, Any] = {"disposition": "not_started"}
     result = "failed"
     failure: str | None = None
@@ -1324,7 +1399,7 @@ def run_experiment(
             raise ExperimentError("scratch filesystem identity changed during the window")
         if window_failure is not None:
             raise ExperimentError(window_failure)
-        if plan.retained_reuse:
+        for ordinal in range(1, plan.retained_reuse_windows + 1):
             (
                 reuse_elapsed,
                 reuse_tasks,
@@ -1337,13 +1412,15 @@ def run_experiment(
                 states,
                 temporary_directories,
                 receipts,
-                "retained-reuse",
+                f"retained-reuse-{ordinal:02d}",
                 edited=True,
                 retained_reuse=True,
+                retained_reuse_ordinal=ordinal,
             )
             reuse_observation_started = time.monotonic()
-            retained_reuse_window = {
+            measured_reuse_window = {
                 "disposition": "measured",
+                "ordinal": ordinal,
                 "elapsed_seconds": round(reuse_elapsed, 6),
                 "maximum_simultaneous_observed": reuse_maximum,
                 "tasks": reuse_tasks,
@@ -1356,15 +1433,20 @@ def run_experiment(
                     ],
                 },
             }
-            retained_reuse_window["post_window_observation_seconds"] = round(
+            measured_reuse_window["post_window_observation_seconds"] = round(
                 time.monotonic() - reuse_observation_started, 6
             )
-            storage_filesystem["post_retained_reuse_window"] = (
-                filesystem_observation(scratch_root)
-            )
+            retained_reuse_windows.append(measured_reuse_window)
+            storage_key = f"post_retained_reuse_window_{ordinal:02d}"
+            storage_filesystem[storage_key] = filesystem_observation(scratch_root)
+            if ordinal == 1:
+                retained_reuse_window = measured_reuse_window
+                storage_filesystem["post_retained_reuse_window"] = (
+                    storage_filesystem[storage_key]
+                )
             if not same_filesystem_identity(
                 storage_filesystem["before"],
-                storage_filesystem["post_retained_reuse_window"],
+                storage_filesystem[storage_key],
             ):
                 raise ExperimentError(
                     "scratch filesystem identity changed during retained reuse"
@@ -1432,6 +1514,7 @@ def run_experiment(
         "setup": setup,
         "window": window,
         "retained_reuse_window": retained_reuse_window,
+        "retained_reuse_windows": retained_reuse_windows,
         "storage_filesystem": storage_filesystem,
         "cleanup": cleanup,
         "result": result,
@@ -1462,12 +1545,22 @@ def parse_arguments(arguments: list[str]) -> argparse.Namespace:
         action="store_true",
         help="print the closed experiment plan without creating physical state",
     )
-    parser.add_argument(
+    reuse_group = parser.add_mutually_exclusive_group()
+    reuse_group.add_argument(
         "--retained-reuse",
         action="store_true",
         help=(
             "run a second exact validation window against the accepted edit "
             "and retained task state"
+        ),
+    )
+    reuse_group.add_argument(
+        "--retained-reuse-windows",
+        choices=RETAINED_REUSE_WINDOW_COUNTS,
+        type=int,
+        help=(
+            "run a bounded ordinal-specific sequence of retained validation "
+            "windows against the accepted edit and evolving task state"
         ),
     )
     return parser.parse_args(arguments)
@@ -1493,6 +1586,7 @@ def main(arguments: list[str] | None = None) -> int:
             available_cpu_ids,
             PAGE_CACHE_CLI_TREATMENTS[parsed.page_cache_treatment],
             parsed.retained_reuse,
+            parsed.retained_reuse_windows,
         )
         if parsed.plan:
             json.dump(plan.to_json(), sys.stdout, indent=2, sort_keys=True)
