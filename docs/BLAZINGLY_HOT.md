@@ -205,7 +205,19 @@ scripts/hot-run --resident /path/to/node-resident --task /path/to/task \
   --cache node_modules:ro --cache .next:private -- pnpm build
 ```
 
-A repository wrapper may also bind the front-door runtime before any work begins:
+A repository wrapper may also bind the front-door runtime before any work begins. For an
+ultra-trusted current-runtime loop, the runtime ID alone makes `hot-run` hash the resolved command,
+record that exact digest, and keep mutable state in the resulting digest-specific namespace:
+
+```bash
+scripts/hot-run --resident /path/to/node-resident --task /path/to/task \
+  --cache node_modules:ro --cache .next:private \
+  --runtime-id node-current \
+  -- /path/to/node ./node_modules/.bin/next build
+```
+
+When a repository pins an independently declared generation, add its expected digest to refuse
+drift before user work:
 
 ```bash
 scripts/hot-run --resident /path/to/node-resident --task /path/to/task \
@@ -215,15 +227,18 @@ scripts/hot-run --resident /path/to/node-resident --task /path/to/task \
   -- /path/to/node ./node_modules/.bin/next build
 ```
 
-The two runtime arguments are optional but inseparable. When present, `hot-run` resolves the
-command executable, verifies its content digest before launch, records the declared public runtime
-identity and digest, and places mutable private/overlay state below a runtime-specific opaque
-namespace.
-This prevents two declared runtime generations from silently sharing one private build-state
-lineage. It intentionally binds the front-door executable only: it is not automatic language
-manifest discovery, a claim about descendant executables, or a hostile-code security boundary.
-The ultra-trusted caller remains responsible for declaring the right runtime and for preventing an
-in-place executable replacement between verification and execution.
+The runtime ID is optional. When present, `hot-run` resolves the command executable, hashes its
+content before launch, records the public ID plus exact observed digest, and places mutable
+private/overlay state below a digest-specific opaque namespace. An optional `--runtime-sha256`
+turns that observation into an expected-digest check and refuses drift. Supplying a digest without
+an ID is invalid.
+
+Both forms prevent changed front-door bytes from silently sharing one private build-state lineage.
+Only the explicit-digest form proves agreement with a separately declared generation. Both bind
+the front-door executable only: neither is automatic language-manifest discovery, a claim about
+descendant executables, or a hostile-code security boundary. The ultra-trusted caller remains
+responsible for declaring the right runtime and for preventing an in-place executable replacement
+between observation and execution.
 
 `scripts/hot-observe` is the read-only companion for state that may already be resident. A
 repository adapter supplies bounded public labels for canonical input files and prepared-state

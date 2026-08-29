@@ -57,6 +57,12 @@ class RuntimeContract:
     program_sha256: str
 
 
+@dataclass(frozen=True)
+class RuntimeDeclaration:
+    runtime_id: str
+    expected_program_sha256: str | None
+
+
 def git_path(root: Path, argument: str) -> Path:
     git = shutil.which("git")
     if git is None:
@@ -217,10 +223,10 @@ def resolve_program(command: list[str], task: Path) -> list[str]:
 
 def parse_runtime_contract(
     runtime_id: str | None, program_sha256: str | None
-) -> RuntimeContract | None:
-    if (runtime_id is None) != (program_sha256 is None):
-        raise RuntimeError("runtime ID and executable digest must be supplied together")
-    if runtime_id is None or program_sha256 is None:
+) -> RuntimeDeclaration | None:
+    if runtime_id is None and program_sha256 is not None:
+        raise RuntimeError("runtime executable digest requires a runtime ID")
+    if runtime_id is None:
         return None
     valid_id = (
         0 < len(runtime_id) <= 96
@@ -229,32 +235,36 @@ def parse_runtime_contract(
         and all(character.isalnum() or character in "._-" for character in runtime_id)
         and ".." not in runtime_id
     )
-    digest_value = program_sha256.removeprefix("sha256:")
-    valid_digest = (
-        program_sha256.startswith("sha256:")
-        and len(digest_value) == 64
-        and all(character in "0123456789abcdef" for character in digest_value)
-    )
     if not valid_id:
         raise RuntimeError("runtime ID must be bounded safe ASCII")
-    if not valid_digest:
-        raise RuntimeError("runtime executable digest must be canonical SHA-256")
-    return RuntimeContract(runtime_id, program_sha256)
+    if program_sha256 is not None:
+        digest_value = program_sha256.removeprefix("sha256:")
+        valid_digest = (
+            program_sha256.startswith("sha256:")
+            and len(digest_value) == 64
+            and all(character in "0123456789abcdef" for character in digest_value)
+        )
+        if not valid_digest:
+            raise RuntimeError("runtime executable digest must be canonical SHA-256")
+    return RuntimeDeclaration(runtime_id, program_sha256)
 
 
 def verify_runtime_contract(
-    contract: RuntimeContract | None, program: Path
+    declaration: RuntimeDeclaration | None, program: Path
 ) -> RuntimeContract | None:
-    if contract is None:
+    if declaration is None:
         return None
     digest = hashlib.sha256()
     with program.open("rb") as executable:
         while chunk := executable.read(1024 * 1024):
             digest.update(chunk)
     observed = f"sha256:{digest.hexdigest()}"
-    if observed != contract.program_sha256:
+    if (
+        declaration.expected_program_sha256 is not None
+        and observed != declaration.expected_program_sha256
+    ):
         raise RuntimeError("runtime executable content does not match declared digest")
-    return contract
+    return RuntimeContract(declaration.runtime_id, observed)
 
 
 def positive_seconds(value: str) -> float:
@@ -765,12 +775,18 @@ def main() -> int:
     parser.add_argument("--state", type=Path)
     parser.add_argument(
         "--runtime-id",
-        help="bounded public identity for the command's exact runtime generation",
+        help=(
+            "bounded public runtime identity; without --runtime-sha256, observe and "
+            "namespace by the resolved command's exact digest"
+        ),
     )
     parser.add_argument(
         "--runtime-sha256",
         metavar="sha256:HEX",
-        help="required SHA-256 of the resolved command executable",
+        help=(
+            "optional expected SHA-256 of the resolved command executable; requires "
+            "--runtime-id and refuses drift"
+        ),
     )
     parser.add_argument(
         "--measurement",
