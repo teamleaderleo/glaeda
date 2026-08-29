@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import runpy
 import subprocess
 import sys
@@ -166,6 +167,174 @@ class VerifyPlanTests(unittest.TestCase):
             first_untracked = source_state(root)
             untracked.write_text("second untracked value\n", encoding="utf-8")
             self.assertNotEqual(first_untracked, source_state(root))
+
+    def test_receipt_records_exact_plan_source_phase_and_resource_observations(self) -> None:
+        module = runpy.run_path(str(VERIFY), run_name="glaeda_verify_test")
+        child_resources = module["ChildResources"]
+        phase_observation = module["PhaseObservation"]
+        receipt = module["receipt_document"](
+            profile="fast",
+            source_commit="1" * 40,
+            source_tree="2" * 40,
+            source_before=b"\xaa" * 32,
+            source_after=b"\xaa" * 32,
+            environment={
+                "logical_cpu_count": 16,
+                "cargo_build_jobs": {"source": "configured", "value": 4},
+                "cargo_target": {
+                    "source": "configured",
+                    "identity_digest": f"sha256:{'3' * 64}",
+                },
+                "cargo_home": {
+                    "source": "user_default",
+                    "identity_digest": f"sha256:{'4' * 64}",
+                },
+            },
+            observations=[
+                phase_observation(
+                    name="format",
+                    argv=["cargo", "fmt", "--all", "--", "--check"],
+                    exit_code=0,
+                    elapsed_seconds=1.2345678,
+                    child_resources=child_resources(2.5, 0.75, 123_456),
+                )
+            ],
+            exit_code=0,
+            elapsed_seconds=2.3456789,
+            started_at_unix_millis=1_000,
+            completed_at_unix_millis=3_346,
+            resources=child_resources(3.0, 1.0, 234_567),
+        )
+
+        self.assertEqual(receipt["document_type"], "glaeda-local-verification-receipt")
+        self.assertEqual(receipt["authority"], "performance_observation_only")
+        self.assertTrue(receipt["source"]["unchanged"])
+        self.assertEqual(receipt["source"]["commit"], "1" * 40)
+        self.assertEqual(receipt["environment"]["cargo_build_jobs"]["value"], 4)
+        self.assertEqual(receipt["plan"]["executed_phase_count"], 1)
+        self.assertEqual(receipt["phases"][0]["elapsed_seconds"], 1.234568)
+        self.assertEqual(
+            receipt["phases"][0]["process_lifetime_child_max_rss_kib"],
+            123_456,
+        )
+        self.assertEqual(receipt["result"]["elapsed_seconds"], 2.345679)
+        self.assertEqual(receipt["result"]["exit_code"], 0)
+        self.assertEqual(
+            receipt["result"]["max_rss_semantics"],
+            "maximum_waited_child_not_concurrent_sum",
+        )
+        self.assertNotIn(str(ROOT), json.dumps(receipt, sort_keys=True))
+
+    def test_environment_records_cache_identity_without_exposing_paths(self) -> None:
+        execution_environment = runpy.run_path(
+            str(VERIFY), run_name="glaeda_verify_test"
+        )["execution_environment"]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            environment = os.environ.copy()
+            os.environ["CARGO_TARGET_DIR"] = str(root / "private-target")
+            os.environ["CARGO_HOME"] = str(root / "private-cargo-home")
+            os.environ["CARGO_BUILD_JOBS"] = "4"
+            try:
+                observation = execution_environment(ROOT)
+            finally:
+                os.environ.clear()
+                os.environ.update(environment)
+
+            encoded = json.dumps(observation, sort_keys=True)
+            self.assertEqual(observation["cargo_build_jobs"]["value"], 4)
+            self.assertEqual(observation["cargo_target"]["source"], "configured")
+            self.assertNotIn(directory, encoded)
+            self.assertRegex(
+                observation["cargo_target"]["identity_digest"],
+                r"^sha256:[0-9a-f]{64}$",
+            )
+
+    def test_receipt_writer_atomically_replaces_one_file_without_residue(self) -> None:
+        write_receipt = runpy.run_path(str(VERIFY), run_name="glaeda_verify_test")[
+            "write_receipt"
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "receipt.json"
+            output.write_text("old\n", encoding="utf-8")
+            write_receipt(output, {"schema_version": 1, "result": "passed"})
+
+            self.assertEqual(
+                json.loads(output.read_text(encoding="utf-8")),
+                {"schema_version": 1, "result": "passed"},
+            )
+            self.assertEqual(list(Path(directory).iterdir()), [output])
+
+    def test_receipt_destination_refuses_the_source_worktree(self) -> None:
+        receipt_destination = runpy.run_path(
+            str(VERIFY), run_name="glaeda_verify_test"
+        )["receipt_destination"]
+        with self.assertRaisesRegex(RuntimeError, "outside the source worktree"):
+            receipt_destination(ROOT, ROOT / "verification-receipt.json")
+        with tempfile.TemporaryDirectory() as directory:
+            expected = Path(directory) / "verification-receipt.json"
+            self.assertEqual(receipt_destination(ROOT, expected), expected)
+
+    def test_failed_phase_still_writes_a_terminal_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            fake_cargo = fixture / "cargo"
+            fake_cargo.write_text("#!/bin/sh\nexit 7\n", encoding="utf-8")
+            fake_cargo.chmod(0o755)
+            receipt_path = fixture / "failed.json"
+            environment = os.environ.copy()
+            environment["PATH"] = f"{fixture}:/usr/bin:/bin"
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(VERIFY),
+                    "fast",
+                    "--receipt",
+                    str(receipt_path),
+                ],
+                cwd=ROOT,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(result.returncode, 7)
+            self.assertEqual(receipt["result"]["exit_code"], 7)
+            self.assertEqual(receipt["plan"]["executed_phase_count"], 1)
+            self.assertEqual(receipt["phases"][0]["name"], "unit-and-binary-tests")
+            self.assertEqual(receipt["phases"][0]["exit_code"], 7)
+            self.assertTrue(receipt["source"]["unchanged"])
+
+    def test_plan_only_mode_rejects_a_receipt_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            receipt_path = Path(directory) / "receipt.json"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(VERIFY),
+                    "fast",
+                    "--plan-json",
+                    "--receipt",
+                    str(receipt_path),
+                ],
+                cwd=ROOT,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("cannot be combined", result.stderr)
+            self.assertFalse(receipt_path.exists())
 
 
 if __name__ == "__main__":

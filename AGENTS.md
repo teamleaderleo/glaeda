@@ -63,6 +63,14 @@ This runs library/binary tests first, formatting, one CLI build, and the doctor/
 checks with per-phase timings. It deliberately skips Clippy and integration/acceptance targets, so
 it is developer feedback only and never replaces final verification.
 
+Add `--receipt PATH` to either profile to atomically retain a path-free performance observation
+outside the source worktree. The receipt records the exact source and fixed plan identity, each
+executed phase's wall/child-CPU timing, the process-lifetime maximum waited-child RSS observation
+(not concurrent aggregate RSS), terminal exit status, and whether source remained unchanged. Opaque
+Cargo target/home identities and the build-job setting make cold/warm samples comparable without
+publishing private paths. It retains no command output and grants no result-reuse or publication
+authority.
+
 `./scripts/verify required` runs the exact eight commands below in order and streams their output
 without retaining a log. The explicit commands remain listed as the canonical contract.
 
