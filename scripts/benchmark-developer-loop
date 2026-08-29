@@ -94,7 +94,7 @@ cleanup() {
 trap cleanup EXIT
 
 set +e
-/usr/bin/time -f '%e\t%U\t%S\t%M\t%x' -o "$timing_file" "${command[@]}"
+/usr/bin/time --quiet -f '%e\t%U\t%S\t%M\t%x' -o "$timing_file" "${command[@]}"
 exit_code=$?
 set -e
 IFS=$'\t' read -r elapsed_seconds user_seconds system_seconds max_rss_kib timed_exit_code < "$timing_file"

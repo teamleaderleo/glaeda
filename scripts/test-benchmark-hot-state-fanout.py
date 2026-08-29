@@ -48,6 +48,7 @@ class HotStateFanoutTests(unittest.TestCase):
             self.assertEqual(plan.cargo_jobs_per_task, jobs)
             value = plan.to_json()
             self.assertEqual(value["resources"]["configured_total_cargo_jobs"], 16)
+            self.assertEqual(value["environment"]["child_filesystem_creation_umask"], "0022")
             flattened = [
                 cpu
                 for cpu_set in value["resources"]["task_cpu_sets"]
@@ -237,6 +238,32 @@ class HotStateFanoutTests(unittest.TestCase):
         self.assertIsNone(failure)
         self.assertEqual(task.process.returncode, 0)
         self.assertIn(maximum_running, (0, 1))
+
+    def test_started_task_uses_private_safe_creation_umask(self) -> None:
+        start_task = NAMESPACE["start_task"]
+        wait_for_tasks = NAMESPACE["wait_for_tasks"]
+        available = tuple(sorted(os.sched_getaffinity(0)))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            previous_umask = os.umask(0o002)
+            try:
+                task = start_task(
+                    "task-01",
+                    ["/usr/bin/mkdir", "created"],
+                    root,
+                    root / "unused.json",
+                    None,
+                    1,
+                    root / "tmp",
+                    (available[0],),
+                )
+            finally:
+                os.umask(previous_umask)
+            _, failure, _ = wait_for_tasks([task], 5)
+            created_mode = (root / "created").stat().st_mode & 0o777
+        self.assertIsNone(failure)
+        self.assertEqual(task.process.returncode, 0)
+        self.assertEqual(created_mode, 0o755)
 
     def test_receipt_validation_binds_source_edit_and_result(self) -> None:
         validate = NAMESPACE["validate_benchmark_receipt"]
