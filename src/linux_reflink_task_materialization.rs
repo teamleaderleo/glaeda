@@ -20,10 +20,9 @@ use std::time::Instant;
 
 use rustix::fs::ioctl_ficlone;
 use serde::Serialize;
+use sha1::{Digest as _, Sha1};
 
-use crate::git_index_stat_patch::{
-    GitIndexStat, GitIndexStatUpdate, patch_git_index_v2_stats, sha1,
-};
+use crate::git_index_stat_patch::{GitIndexStat, GitIndexStatUpdate, patch_git_index_v2_stats};
 
 pub const REFLINK_TASK_MATERIALIZATION_SCHEMA_VERSION: u8 = 1;
 const MAX_GIT_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
@@ -1183,18 +1182,31 @@ fn verify_source_blob(
     metadata: &fs::Metadata,
     expected_oid: [u8; 20],
 ) -> Result<(), CandidateFailure> {
-    let length =
-        usize::try_from(metadata.len()).map_err(|_| candidate("candidate_source_mismatch"))?;
-    let mut document = Vec::with_capacity(length.saturating_add(32));
-    document.extend_from_slice(b"blob ");
-    document.extend_from_slice(metadata.len().to_string().as_bytes());
-    document.push(0);
-    let header_length = document.len();
-    std::io::Read::by_ref(source)
-        .take(metadata.len().saturating_add(1))
-        .read_to_end(&mut document)
-        .map_err(|_| candidate("candidate_source_read_failed"))?;
-    if document.len().saturating_sub(header_length) != length || sha1(&document) != expected_oid {
+    let mut digest = Sha1::new();
+    digest.update(b"blob ");
+    digest.update(metadata.len().to_string().as_bytes());
+    digest.update([0]);
+    let mut remaining = metadata.len();
+    let mut buffer = [0_u8; 64 * 1024];
+    while remaining != 0 {
+        let wanted = usize::try_from(remaining.min(buffer.len() as u64))
+            .map_err(|_| candidate("candidate_source_read_failed"))?;
+        let read = source
+            .read(&mut buffer[..wanted])
+            .map_err(|_| candidate("candidate_source_read_failed"))?;
+        if read == 0 {
+            return Err(candidate("candidate_source_oid_mismatch"));
+        }
+        digest.update(&buffer[..read]);
+        remaining = remaining.saturating_sub(read as u64);
+    }
+    let mut excess = [0_u8; 1];
+    if source
+        .read(&mut excess)
+        .map_err(|_| candidate("candidate_source_read_failed"))?
+        != 0
+        || <[u8; 20]>::from(digest.finalize()) != expected_oid
+    {
         return Err(candidate("candidate_source_oid_mismatch"));
     }
     Ok(())
@@ -1695,6 +1707,7 @@ mod tests {
         ReflinkTaskMaterializationMode, ReflinkTaskMaterializationRequest, parse_sha1,
         parse_tree_entries, render_reflink_task_materialization_human,
     };
+    use sha1::{Digest as _, Sha1};
     use std::fs;
     use std::os::unix::fs::symlink;
     use std::path::Path;
@@ -1856,7 +1869,7 @@ mod tests {
         fs::write(&source, b"payload\n").expect("source");
         let mut file = fs::File::open(&source).expect("open source");
         let metadata = file.metadata().expect("source metadata");
-        let expected = super::sha1(b"blob 8\0payload\n");
+        let expected = <[u8; 20]>::from(Sha1::digest(b"blob 8\0payload\n"));
         super::verify_source_blob(&mut file, &metadata, expected).expect("exact blob");
 
         fs::write(&source, b"tampered").expect("same-length wrong source");
