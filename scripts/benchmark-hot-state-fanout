@@ -763,6 +763,38 @@ def remove_worktree(repository: Path, worktree: Path) -> None:
         raise ExperimentError("experiment worktree cleanup failed")
 
 
+def remove_owned_experiment_tree(experiment: Path) -> None:
+    """Remove one exact owned tree, including mode-000 OverlayFS work directories."""
+
+    root = experiment.lstat()
+    if (
+        stat.S_ISLNK(root.st_mode)
+        or not stat.S_ISDIR(root.st_mode)
+        or root.st_uid != os.getuid()
+    ):
+        raise ExperimentError("experiment state root is not an owned directory")
+
+    for directory, child_directories, _ in os.walk(
+        experiment, topdown=True, followlinks=False
+    ):
+        for child_name in child_directories:
+            child = Path(directory) / child_name
+            details = child.lstat()
+            if stat.S_ISLNK(details.st_mode):
+                continue
+            if not stat.S_ISDIR(details.st_mode) or details.st_uid != os.getuid():
+                raise ExperimentError("experiment state contains an unowned directory")
+            owner_access = stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR
+            if details.st_mode & owner_access != owner_access:
+                os.chmod(
+                    child,
+                    stat.S_IMODE(details.st_mode) | owner_access,
+                    follow_symlinks=False,
+                )
+
+    shutil.rmtree(experiment)
+
+
 def write_report(output: Path, report: dict[str, Any]) -> None:
     output = Path(os.path.abspath(output))
     output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -929,8 +961,8 @@ def run_experiment(
         else:
             if not cleanup_errors:
                 try:
-                    shutil.rmtree(experiment)
-                except OSError:
+                    remove_owned_experiment_tree(experiment)
+                except (ExperimentError, OSError):
                     cleanup_errors.append("experiment state cleanup failed")
             cleanup["disposition"] = (
                 "removed" if not cleanup_errors else "recovery_required"

@@ -111,6 +111,28 @@ class HotStateFanoutTests(unittest.TestCase):
             f"{first['device_major']}:{first['device_minor']}",
         )
 
+    def test_owned_cleanup_repairs_mode_zero_directories_without_following_links(
+        self,
+    ) -> None:
+        remove_owned_experiment_tree = NAMESPACE["remove_owned_experiment_tree"]
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            experiment = fixture / "experiment"
+            opaque = experiment / "state" / "work"
+            external = fixture / "external"
+            opaque.mkdir(parents=True)
+            external.mkdir()
+            (opaque / "payload").write_text("owned\n", encoding="utf-8")
+            (experiment / "external-link").symlink_to(external, target_is_directory=True)
+            opaque.chmod(0)
+            external.chmod(0)
+            try:
+                remove_owned_experiment_tree(experiment)
+                self.assertFalse(experiment.exists())
+                self.assertEqual(external.stat().st_mode & 0o777, 0)
+            finally:
+                external.chmod(0o700)
+
     def test_closed_environment_excludes_caller_build_injection(self) -> None:
         closed_environment = NAMESPACE["closed_environment"]
         with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
