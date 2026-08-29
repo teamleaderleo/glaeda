@@ -64,7 +64,7 @@ jobs:
               Path("scripts/benchmark-hot-state-fanout"),
               Path("scripts/hot-observe"),
               Path("scripts/hot-pressure-shadow"),
-              Path("scripts/hot-run"),
+              Path("scripts/hot-run-python"),
               Path("scripts/verify"),
               Path("scripts/test-hot-run.py"),
               Path("scripts/test-hot-pressure-shadow.py"),
@@ -80,6 +80,7 @@ jobs:
               compile(path.read_text(encoding="utf-8"), str(path), "exec")
           PY
           test -x ./smolrunner
+          sh -n scripts/hot-run
           bash -n scripts/benchmark-developer-loop
           bash -n scripts/test-bootstrap.sh
           bash scripts/test-bootstrap.sh
