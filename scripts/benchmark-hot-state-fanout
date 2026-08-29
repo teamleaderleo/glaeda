@@ -619,7 +619,7 @@ def aggregate_task(
         interval, hot_run.get("elapsed_seconds") if hot_run is not None else None
     )
     if hot_run is not None and (
-        hot_run.get("schema_version") != 3
+        hot_run.get("schema_version") != 4
         or hot_run.get("document_type") != "glaeda-hot-run-measurement"
         or hot_run.get("exit_code") != 0
         or hot_run.get("completion_reason") != "exited"

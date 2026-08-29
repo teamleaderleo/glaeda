@@ -38,6 +38,7 @@ HEAVY_SCOPE_PROPERTIES = (
 TERMINATION_GRACE_SECONDS = 2.0
 MAX_PROC_OBSERVATION_BYTES = 64 * 1024
 PRESSURE_KINDS = ("cpu", "memory", "io")
+SHA256_PREFIX = "sha256:"
 
 
 @dataclass(frozen=True)
@@ -467,6 +468,19 @@ def parse_runtime_contract(
     return RuntimeDeclaration(runtime_id, program_sha256)
 
 
+def canonical_comparison_key(value: str) -> str:
+    digest = value.removeprefix(SHA256_PREFIX)
+    if (
+        not value.startswith(SHA256_PREFIX)
+        or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+    ):
+        raise argparse.ArgumentTypeError(
+            "comparison key must be canonical SHA-256"
+        )
+    return value
+
+
 def verify_runtime_contract(
     declaration: RuntimeDeclaration | None, program: Path
 ) -> RuntimeContract | None:
@@ -539,6 +553,7 @@ def write_measurement(
     runtime_contract: RuntimeContract | None,
     cross_worktree: bool,
     resource_profile: str | None,
+    comparison_key: str | None,
     machine_before: dict[str, object],
     machine_after: dict[str, object],
 ) -> None:
@@ -546,9 +561,10 @@ def write_measurement(
     destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     preparation_elapsed = sum(item.elapsed_seconds for item in cache_preparations)
     report = {
-        "schema_version": 3,
+        "schema_version": 4,
         "document_type": "glaeda-hot-run-measurement",
         "authority": "developer_observation_only",
+        "comparison_key": comparison_key,
         "cross_worktree": cross_worktree,
         "resource_profile": resource_profile,
         "machine_observation": {
@@ -663,6 +679,7 @@ def execute(
     runtime_contract: RuntimeContract | None,
     cross_worktree: bool,
     resource_profile: str | None,
+    comparison_key: str | None,
     timeout_seconds: float | None,
 ) -> int:
     time_report: Path | None = None
@@ -809,6 +826,7 @@ def execute(
             runtime_contract,
             cross_worktree,
             resource_profile,
+            comparison_key,
             machine_before,
             machine_after,
         )
@@ -824,6 +842,7 @@ def run(
     runtime_sha256: str | None,
     measurement: Path | None,
     resource_profile: str | None,
+    comparison_key: str | None,
     timeout_seconds: float | None,
     command: list[str],
     verbose: bool,
@@ -867,6 +886,7 @@ def run(
             runtime_contract,
             cross_worktree=False,
             resource_profile=resource_profile,
+            comparison_key=comparison_key,
             timeout_seconds=timeout_seconds,
         )
 
@@ -992,6 +1012,7 @@ def run(
             runtime_contract,
             cross_worktree=True,
             resource_profile=resource_profile,
+            comparison_key=comparison_key,
             timeout_seconds=timeout_seconds,
         )
     finally:
@@ -1027,6 +1048,15 @@ def main() -> int:
         help="atomically write one bounded developer-observation JSON measurement",
     )
     parser.add_argument(
+        "--comparison-key",
+        type=canonical_comparison_key,
+        metavar="sha256:HEX",
+        help=(
+            "optional caller-owned exact-work comparison digest recorded only in "
+            "the observation receipt"
+        ),
+    )
+    parser.add_argument(
         "--resource-profile",
         choices=("big-red-heavy",),
         help="run in the measured 12-CPU/8G-high/12G-max/1024-task user scope",
@@ -1055,6 +1085,8 @@ def main() -> int:
         command = command[1:]
     if not command:
         parser.error("a command is required after --")
+    if arguments.comparison_key is not None and arguments.measurement is None:
+        parser.error("--comparison-key requires --measurement")
     try:
         return run(
             arguments.resident,
@@ -1065,6 +1097,7 @@ def main() -> int:
             arguments.runtime_sha256,
             arguments.measurement,
             arguments.resource_profile,
+            arguments.comparison_key,
             arguments.timeout,
             command,
             arguments.verbose,

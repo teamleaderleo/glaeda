@@ -40,6 +40,7 @@ class HotRunTests(unittest.TestCase):
                 False,
                 None,
                 None,
+                None,
             )
         self.assertEqual(result, 0)
         observer.assert_not_called()
@@ -266,8 +267,9 @@ class HotRunTests(unittest.TestCase):
             self.assertEqual(len(uppers), 1)
             self.assertTrue((uppers[0] / "task-output").is_file())
             report = json.loads(measurement.read_text(encoding="utf-8"))
-            self.assertEqual(report["schema_version"], 3)
+            self.assertEqual(report["schema_version"], 4)
             self.assertEqual(report["authority"], "developer_observation_only")
+            self.assertIsNone(report["comparison_key"])
             self.assertEqual(report["exit_code"], 0)
             self.assertEqual(report["completion_reason"], "exited")
             self.assertIsNone(report["timeout_seconds"])
@@ -772,6 +774,75 @@ class HotRunTests(unittest.TestCase):
         ):
             with self.assertRaises(RuntimeError):
                 parse_runtime_contract(runtime_id, digest)
+
+    def test_comparison_key_requires_measurement_and_is_recorded(self) -> None:
+        comparison_key = f"sha256:{'3' * 64}"
+        without_measurement = subprocess.run(
+            [
+                sys.executable,
+                os.fspath(HOT_RUN),
+                "--resident",
+                os.fspath(ROOT),
+                "--task",
+                os.fspath(ROOT),
+                "--comparison-key",
+                comparison_key,
+                "--",
+                "/bin/true",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(without_measurement.returncode, 2)
+        self.assertIn("--comparison-key requires --measurement", without_measurement.stderr)
+
+        with tempfile.TemporaryDirectory() as directory:
+            measurement = Path(directory) / "measurement.json"
+            measured = subprocess.run(
+                [
+                    sys.executable,
+                    os.fspath(HOT_RUN),
+                    "--resident",
+                    os.fspath(ROOT),
+                    "--task",
+                    os.fspath(ROOT),
+                    "--measurement",
+                    os.fspath(measurement),
+                    "--comparison-key",
+                    comparison_key,
+                    "--",
+                    "/bin/true",
+                ],
+                stdin=subprocess.DEVNULL,
+                check=False,
+            )
+            self.assertEqual(measured.returncode, 0)
+            report = json.loads(measurement.read_text(encoding="utf-8"))
+            self.assertEqual(report["schema_version"], 4)
+            self.assertEqual(report["comparison_key"], comparison_key)
+
+        invalid = subprocess.run(
+            [
+                sys.executable,
+                os.fspath(HOT_RUN),
+                "--comparison-key",
+                f"sha256:{'A' * 64}",
+                "--measurement",
+                "/tmp/unused-glaeda-measurement",
+                "--",
+                "/bin/true",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(invalid.returncode, 2)
+        self.assertIn("comparison key must be canonical SHA-256", invalid.stderr)
 
     def test_direct_resident_execution_preserves_failure_status(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -299,9 +299,32 @@ before/after endpoints; missing evidence or a counter reset remains `null`. The 
 is very slightly wider than child elapsed, so tiny-command fractions are contamination evidence,
 not an admission threshold.
 
-This derived machine-observation shape is hot-run measurement schema version 3. Existing version 1
-and 2 receipts remain historical observations; no producer silently relabels them as
-interval-aware.
+This derived machine-observation shape entered hot-run measurement schema version 3. Schema version
+4 adds one optional caller-owned `comparison_key`: a canonical opaque SHA-256 digest covering the
+exact workload/source/toolchain/cache/fan-out basis that the caller already owns. It is accepted
+only with `--measurement`, records no command or private input, and grants no semantic, result,
+cache, scheduling, or admission authority. Existing version 1 through 3 receipts remain historical
+observations; no producer silently relabels them as comparable.
+
+Two or more successful schema-v4 receipts carrying the exact same key can be reduced without a
+persistent history service:
+
+```bash
+scripts/hot-pressure-shadow --output json \
+  --current current.json \
+  --baseline earlier-a.json \
+  --baseline earlier-b.json
+```
+
+The reducer refuses mixed keys, failed/interrupted inputs, symlinks, oversized documents, and
+duplicate receipt content. Zero or one distinct baseline reports `insufficient_history`; two or
+more report descriptive observed min/max ranges for command-plus-state-preparation latency, command
+timing, CPU/RSS, memory/swap deltas, and CPU/memory/I/O PSI fractions. Missing pressure remains
+`unknown`.
+The shadow finding can describe a current sample as slower and/or higher-pressure than its own
+observed range, but it never waits, retries, schedules, admits, routes, cancels, mutates, or claims
+statistical confidence. Exact workload semantics and result validation remain with the caller that
+constructed the comparison key.
 
 Unscoped commands use child `getrusage`; profiled commands place GNU `time` inside the scope so CPU
 and peak RSS describe the workload rather than the `systemd-run` launcher. Force termination can
