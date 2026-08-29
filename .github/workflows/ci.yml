@@ -60,6 +60,8 @@ jobs:
           paths = [
               Path("smolrunner"),
               Path("scripts/bootstrap"),
+              Path("scripts/verify"),
+              Path("scripts/test-verify.py"),
               Path("scripts/test-front-door.py"),
               Path("scripts/project_disk_physical_receipt.py"),
               Path("scripts/test_project_disk_physical_receipt.py"),
@@ -71,6 +73,7 @@ jobs:
           test -x ./smolrunner
           bash -n scripts/test-bootstrap.sh
           bash scripts/test-bootstrap.sh
+          python3 scripts/test-verify.py
           python3 scripts/test-front-door.py
 
           first_receipt=$(mktemp)
