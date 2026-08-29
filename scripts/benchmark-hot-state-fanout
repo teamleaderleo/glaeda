@@ -932,7 +932,7 @@ def aggregate_task(
     expected_cache_mode = "native" if plan.arm == "ordinary-native" else plan.arm
     expected_cross_worktree = plan.arm != "ordinary-native"
     if hot_run is not None and (
-        hot_run.get("schema_version") != 5
+        hot_run.get("schema_version") != 6
         or hot_run.get("document_type") != "glaeda-hot-run-measurement"
         or hot_run.get("exit_code") != 0
         or hot_run.get("completion_reason") != "exited"

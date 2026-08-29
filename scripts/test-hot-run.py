@@ -7,6 +7,7 @@ import fcntl
 import hashlib
 import json
 import os
+import resource
 import runpy
 import shutil
 import signal
@@ -28,7 +29,11 @@ class HotRunTests(unittest.TestCase):
         namespace = runpy.run_path(str(HOT_RUN), run_name="hot_run_test")
         execute = namespace["execute"]
         observer = mock.Mock(side_effect=AssertionError("unexpected observation"))
-        with mock.patch.dict(execute.__globals__, {"observe_machine": observer}):
+        resolver = mock.Mock(side_effect=AssertionError("unexpected resolution"))
+        with (
+            mock.patch.dict(execute.__globals__, {"observe_machine": observer}),
+            mock.patch.object(execute.__globals__["shutil"], "which", resolver),
+        ):
             result = execute(
                 ["/bin/true"],
                 None,
@@ -45,6 +50,83 @@ class HotRunTests(unittest.TestCase):
             )
         self.assertEqual(result, 0)
         observer.assert_not_called()
+        resolver.assert_not_called()
+
+    def test_measured_command_rss_excludes_prior_children(self) -> None:
+        namespace = runpy.run_path(str(HOT_RUN), run_name="hot_run_test")
+        execute = namespace["execute"]
+        with tempfile.TemporaryDirectory() as directory:
+            measurement = Path(directory) / "measurement.json"
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "payload = bytearray(128 * 1024 * 1024); print(payload[-1])",
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                check=True,
+            )
+            prior_child_peak = resource.getrusage(
+                resource.RUSAGE_CHILDREN
+            ).ru_maxrss
+            result = execute(
+                ["/bin/true"],
+                None,
+                None,
+                measurement,
+                (),
+                (),
+                None,
+                None,
+                False,
+                None,
+                None,
+                None,
+            )
+
+            self.assertEqual(result, 0)
+            report = json.loads(measurement.read_text(encoding="utf-8"))
+            self.assertEqual(report["schema_version"], 6)
+            self.assertEqual(report["resource_accounting"], "gnu_time_command_tree")
+            self.assertGreater(prior_child_peak, 100 * 1024)
+            self.assertGreater(report["max_rss_kib"], 0)
+            self.assertLess(report["max_rss_kib"], prior_child_peak)
+
+    def test_measured_command_distinguishes_exit_143_from_sigterm(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            for name, command, completion_reason, terminating_signal in (
+                ("exit", "exit 143", "exited", None),
+                ("signal", "kill -TERM $$", "signaled", signal.SIGTERM),
+            ):
+                measurement = fixture / f"{name}.json"
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        os.fspath(HOT_RUN),
+                        "--resident",
+                        os.fspath(ROOT),
+                        "--task",
+                        os.fspath(ROOT),
+                        "--measurement",
+                        os.fspath(measurement),
+                        "--",
+                        "/bin/sh",
+                        "-c",
+                        command,
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 143)
+                report = json.loads(measurement.read_text(encoding="utf-8"))
+                self.assertEqual(report["exit_code"], 143)
+                self.assertEqual(report["completion_reason"], completion_reason)
+                self.assertEqual(report["signal"], terminating_signal)
+                self.assertEqual(
+                    report["resource_accounting"], "gnu_time_command_tree"
+                )
 
     def test_linux_machine_observation_parsers_are_strict(self) -> None:
         namespace = runpy.run_path(str(HOT_RUN), run_name="hot_run_test")
@@ -364,7 +446,7 @@ class HotRunTests(unittest.TestCase):
             self.assertEqual(len(uppers), 1)
             self.assertTrue((uppers[0] / "task-output").is_file())
             report = json.loads(measurement.read_text(encoding="utf-8"))
-            self.assertEqual(report["schema_version"], 5)
+            self.assertEqual(report["schema_version"], 6)
             self.assertEqual(report["authority"], "developer_observation_only")
             self.assertIsNone(report["comparison_key"])
             self.assertEqual(report["exit_code"], 0)
@@ -391,6 +473,7 @@ class HotRunTests(unittest.TestCase):
             self.assertTrue(report["cross_worktree"])
             self.assertGreaterEqual(report["elapsed_seconds"], 0)
             self.assertGreater(report["max_rss_kib"], 0)
+            self.assertEqual(report["resource_accounting"], "gnu_time_command_tree")
             self.assertEqual(report["state_preparation"], [])
             self.assertIsNone(report["source_preparation"])
             self.assertEqual(report["preparation_elapsed_seconds"], 0.0)
@@ -1145,7 +1228,7 @@ class HotRunTests(unittest.TestCase):
             )
             self.assertEqual(measured.returncode, 0)
             report = json.loads(measurement.read_text(encoding="utf-8"))
-            self.assertEqual(report["schema_version"], 5)
+            self.assertEqual(report["schema_version"], 6)
             self.assertEqual(report["comparison_key"], comparison_key)
 
         invalid = subprocess.run(
