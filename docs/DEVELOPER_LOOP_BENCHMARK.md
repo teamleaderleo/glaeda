@@ -171,6 +171,15 @@ scripts/benchmark-hot-state-fanout \
   --output /path/to/receipt.json
 ```
 
+Every arm now executes through a schema-v4 `hot-run` measurement. The ordinary-native control uses
+the task worktree directly with an explicit `target:native` observation; it receives no mount,
+copy, state, or isolation treatment. Prime and edited work get different caller-owned comparison
+keys. Each key deterministically binds the frozen source/tree/diff, the three producer-program
+content digests, exact Rust and Cargo versions and executable digests, arm, fan-out, Cargo
+concurrency, CPU-affinity sets, memory treatment, offline/incremental settings, page-cache
+declaration, and creation umask. This lets repeated same-treatment receipts feed
+`hot-pressure-shadow` while mixed work or treatment refuses.
+
 The aggregate observation binds the harness commit/tree, frozen source/tree/edit, arm, fan-out,
 exact CPU-affinity sets, per-task Cargo concurrency, setup and complete-window latency, every
 semantic and `hot-run` receipt, mount/device/filesystem identity, backing-filesystem free bytes,

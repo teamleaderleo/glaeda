@@ -1050,6 +1050,71 @@ class HotRunTests(unittest.TestCase):
             self.assertEqual(report["cache_views"], [])
             self.assertIsNone(report["resource_profile"])
 
+    def test_direct_native_cache_declaration_is_recorded_without_isolation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            measurement = Path(directory) / "measurement.json"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    os.fspath(HOT_RUN),
+                    "--resident",
+                    os.fspath(ROOT),
+                    "--task",
+                    os.fspath(ROOT),
+                    "--cache",
+                    "target:native",
+                    "--measurement",
+                    os.fspath(measurement),
+                    "--",
+                    "/bin/true",
+                ],
+                stdin=subprocess.DEVNULL,
+                check=False,
+            )
+            report = json.loads(measurement.read_text(encoding="utf-8"))
+        self.assertEqual(result.returncode, 0)
+        self.assertFalse(report["cross_worktree"])
+        self.assertEqual(
+            report["cache_views"], [{"mode": "native", "path": "target"}]
+        )
+        self.assertEqual(report["state_preparation"], [])
+
+    def test_native_cache_mode_refuses_cross_worktree_execution(self) -> None:
+        namespace = runpy.run_path(str(HOT_RUN), run_name="hot_run_test")
+        run = namespace["run"]
+        with mock.patch.dict(
+            run.__globals__,
+            {
+                "worktree_root": mock.Mock(
+                    side_effect=[Path("/resident"), Path("/task")]
+                ),
+                "common_git_directory": mock.Mock(return_value=Path("/common")),
+                "task_git_directory": mock.Mock(
+                    return_value=Path("/common/worktrees/task")
+                ),
+                "resolve_program": mock.Mock(return_value=["/bin/true"]),
+                "verify_runtime_contract": mock.Mock(return_value=None),
+            },
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "native cache mode requires the same worktree"
+            ):
+                run(
+                    Path("/resident"),
+                    Path("/task"),
+                    None,
+                    ["target:native"],
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    ["/bin/true"],
+                    False,
+                )
+
     def test_timeout_stops_owned_process_group_and_writes_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = Path(directory)
