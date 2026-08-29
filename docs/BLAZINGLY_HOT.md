@@ -159,6 +159,82 @@ shared mutable cache
 
 Do not promote a filesystem primitive because its microbenchmark is attractive. Promote it for the state family where complete useful-result measurements show it wins.
 
+### Ultra-trusted local hot-run prototype
+
+`scripts/hot-run` is a deliberately small Linux developer-loop prototype. It binds a task Git
+worktree onto the pathname of a warmed resident worktree. Explicit cache-path policies can expose
+resident dependencies read-only or give the task a persistent private OverlayFS upper over a
+write-heavy build tree:
+
+```bash
+/path/to/resident/scripts/hot-run \
+  --task /path/to/task-worktree \
+  --cache target:overlay \
+  -- cargo test --locked --lib --bins
+```
+
+When a resident `target` exists, `target:overlay` is the zero-configuration default. Python and Node
+projects can explicitly reuse immutable prepared dependencies while keeping build output private:
+
+```bash
+scripts/hot-run --resident /path/to/python-resident --task /path/to/task \
+  --cache .venv:ro -- python -m pytest
+scripts/hot-run --resident /path/to/node-resident --task /path/to/task \
+  --cache node_modules:ro --cache .next:overlay -- pnpm build
+```
+
+`--measurement result.json` atomically writes one bounded developer observation containing elapsed
+time, user/system CPU time, peak RSS, exit/signal, completion reason, configured timeout,
+cross-worktree mode, and relative cache policies. It contains no command, output, environment,
+repository identity, or private path and grants no verification or result-reuse authority.
+Unscoped commands use child `getrusage`; profiled commands place GNU `time` inside the scope so CPU
+and peak RSS describe the workload rather than the `systemd-run` launcher. Force termination can
+prevent descendants or the inner timer from reporting complete usage, so those three fields are
+explicitly `null` instead of fabricated on deadlines and operator interrupts.
+
+Heavy commands should also use `--timeout SECONDS`. The wall-clock deadline owns the whole command
+process group, first requests termination, escalates after a two-second grace period, returns the
+conventional status 124, and writes the failure receipt. An operator interrupt similarly returns
+130 without a Python traceback and records `operator_interrupt`. A timeout deliberately creates a
+separate process group; use the unbounded mode for commands that require interactive terminal job
+control.
+
+Heavy local work on the measured machine may opt into `--resource-profile big-red-heavy`. It uses
+one collected user systemd scope with a 1,200% CPU quota, 8 GiB memory-high threshold, 12 GiB hard
+memory ceiling, and 1,024-task ceiling. The explicitly machine-specific profile reflects big-red's
+12-way build point, which was within about 0.4% of 16-way Cargo while leaving interactive and
+multi-agent headroom. The profile is never applied to ordinary commands implicitly; an unscoped
+no-op avoided even the roughly 0.01-second scope cost.
+
+The task and resident must be worktrees of the same Git repository. The resident worktree remains
+the stable compiler pathname, while task source changes remain in the ordinary task worktree and
+write-heavy cache writes land in a task-private state directory. Cache paths must be relative,
+unique, non-overlapping directories. One non-blocking lock prevents concurrent mounts of the same
+mutable upper/work pair; read-only reuse needs no state or lock. The command receives the caller's
+terminal, environment, host filesystem, devices, processes, and network and returns the child's
+status. This is explicitly an ultra-trusted performance tool, not a security boundary or
+result-authority mechanism.
+
+Unprivileged bubblewrap maps host identities outside the caller's user namespace to the overflow
+identity. Commands that deliberately validate host ownership, mount identity, or other physical
+namespace facts must use the ordinary host path and final verifier. The hot path is for compilation,
+language tools, repository scripts, and tests whose semantics do not depend on those host facts.
+
+On Ubuntu 26.04.1, Linux 7.0, ext4, Rust 1.97.1, and Glaeda `7f40597`, one bounded G0 probe used the
+same `cargo test --locked --lib --bins --no-run` command at four Cargo jobs. A fresh ordinary
+worktree/path took about 39–42 seconds to compile. An exact task over a resident target started in
+0.03 seconds; after a one-line task edit, the private target upper completed in 9.21 seconds. A
+direct unmodified full library/binary test execution was 2.63 seconds. These observations promote
+the stable-path/private-upper experiment, not OverlayFS as the final write-heavy storage default.
+The resulting script measured 0.05 seconds for no-op Bash and Python commands, 0.13 seconds for an
+exact Rust no-run check, and 10.06 seconds after the same one-line edit versus a 37.56-second
+path-cold rebuild.
+
+The default task state is an opaque path under the user's cache directory. It is expendable:
+discarding it or selecting a new empty `--state` path produces a private cold upper and a normal
+compiler rebuild. Bubblewrap and kernel OverlayFS are required for cross-worktree mode; running
+directly in the resident worktree does not require either.
+
 ## Linux mount path
 
 The privileged OverlayFS mount machinery is also concrete.
