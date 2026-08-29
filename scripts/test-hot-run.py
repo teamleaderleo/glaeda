@@ -363,6 +363,7 @@ class HotRunTests(unittest.TestCase):
             self.assertGreaterEqual(report["elapsed_seconds"], 0)
             self.assertGreater(report["max_rss_kib"], 0)
             self.assertEqual(report["state_preparation"], [])
+            self.assertIsNone(report["source_preparation"])
             self.assertEqual(report["preparation_elapsed_seconds"], 0.0)
             self.assertEqual(
                 report["command_plus_preparation_elapsed_seconds"],
@@ -531,6 +532,7 @@ class HotRunTests(unittest.TestCase):
                 os.fspath(state),
                 "--cache",
                 "target:private-copy",
+                "--seed-source-mtimes",
             ]
             first = subprocess.run(
                 [
@@ -1220,6 +1222,7 @@ class HotRunTests(unittest.TestCase):
                     Path("/task"),
                     None,
                     ["target:native"],
+                    False,
                     None,
                     None,
                     None,
@@ -1230,6 +1233,30 @@ class HotRunTests(unittest.TestCase):
                     ["/bin/true"],
                     False,
                 )
+
+    def test_seed_source_mtimes_requires_a_private_target_copy(self) -> None:
+        result = subprocess.run(
+            [
+                sys.executable,
+                os.fspath(HOT_RUN),
+                "--resident",
+                os.fspath(ROOT),
+                "--task",
+                os.fspath(ROOT),
+                "--cache",
+                "target:native",
+                "--seed-source-mtimes",
+                "--",
+                "/bin/true",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("require a task-private target copy", result.stderr)
 
     def test_timeout_stops_owned_process_group_and_writes_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

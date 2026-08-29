@@ -338,11 +338,13 @@ elapsed time, user/system CPU time, peak RSS, exit/signal, completion reason, co
 cross-worktree mode, relative cache policies, and the optional public runtime contract plus its
 path-free descendant-bin binding when selected. A
 `private-copy` observation also records whether the lineage was seeded or reused, its copy wall
-time, and command-plus-preparation wall time. When a task-private `target` is first seeded, Glaeda
-compares tracked regular files through no-follow descriptors and gives only byte-identical,
-executable-mode-compatible task files the resident file's mtime. This preserves Cargo freshness
+time, and command-plus-preparation wall time. With `--seed-source-mtimes`, when a task-private
+`target` is first seeded, Glaeda compares tracked regular files through no-follow descriptors and
+gives only byte-identical, executable-mode-compatible task files the resident file's mtime. This
+preserves Cargo freshness
 for an ordinary worktree created after its exact warm parent without backdating an edited file.
-The matching pass is recorded with bounded counts and time. It never runs on retained state: a
+The caller must already own exact warm-parent proof; the flag creates none. The matching pass is
+recorded with bounded counts and time. It never runs on retained state: a
 file reverted after a prior task build must remain newer so Cargo can rebuild it. Copy/matching
 CPU and RSS are not included in the command resource fields. The receipt contains no command,
 output, environment, repository identity, file name, or private path and grants no verification

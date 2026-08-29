@@ -1101,6 +1101,7 @@ def run(
     task_argument: Path,
     state_argument: Path | None,
     cache_arguments: list[str],
+    seed_source_mtimes: bool,
     runtime_id: str | None,
     runtime_sha256: str | None,
     runtime_bin_argument: Path | None,
@@ -1148,6 +1149,14 @@ def run(
         parse_cache_specs(cache_arguments) if cache_arguments else None
     )
     cache_specs = explicit_cache_specs or default_cache_specs(resident)
+
+    if seed_source_mtimes and not any(
+        spec.path == Path("target") and spec.mode == "private-copy"
+        for spec in cache_specs
+    ):
+        raise RuntimeError(
+            "seed source mtimes require a task-private target copy"
+        )
 
     if resident == task:
         direct_cache_specs = explicit_cache_specs or ()
@@ -1247,8 +1256,10 @@ def run(
             prepare_private_copy(spec, resident_cache, private)
             for spec, resident_cache, private in private_copy_candidates
         )
-        source_preparation = prepare_seed_source_metadata(
-            resident, task, cache_preparations
+        source_preparation = (
+            prepare_seed_source_metadata(resident, task, cache_preparations)
+            if seed_source_mtimes
+            else None
         )
 
         git_view = tempfile.TemporaryDirectory(prefix=".git-view-", dir=state_root)
@@ -1375,6 +1386,14 @@ def main() -> int:
             "target:private-copy when present"
         ),
     )
+    parser.add_argument(
+        "--seed-source-mtimes",
+        action="store_true",
+        help=(
+            "on first target:private-copy seed only, give byte-identical tracked "
+            "regular task files resident mtimes; requires caller-owned exact warm-parent proof"
+        ),
+    )
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     arguments = parser.parse_args()
@@ -1391,6 +1410,7 @@ def main() -> int:
             arguments.task,
             arguments.state,
             arguments.cache,
+            arguments.seed_source_mtimes,
             arguments.runtime_id,
             arguments.runtime_sha256,
             arguments.runtime_bin,

@@ -556,6 +556,9 @@ def command_for_task(
     direct_native = plan.arm == "ordinary-native"
     hot_resident = task if direct_native else resident
     cache_mode = "native" if direct_native else plan.arm
+    source_preparation_arguments = (
+        ["--seed-source-mtimes"] if plan.arm == "private-copy" else []
+    )
     return (
         [
             os.fspath(HOT_RUN),
@@ -567,6 +570,7 @@ def command_for_task(
             os.fspath(state),
             "--cache",
             f"target:{cache_mode}",
+            *source_preparation_arguments,
             "--measurement",
             os.fspath(hot_run_receipt),
             "--comparison-key",
