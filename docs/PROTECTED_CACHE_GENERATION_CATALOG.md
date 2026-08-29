@@ -16,38 +16,40 @@ claim `current` while each record remains internally valid.
 - strict canonical JSON encoding and decoding;
 - revision-checked, read-only state correlation.
 
-The pure module deliberately creates only an empty revision-one document. Decoding bytes reports
-`supplied_document_only`: a JSON document cannot grant itself cache ownership.
+Decoding bytes reports `supplied_document_only`: a JSON document cannot grant itself cache
+ownership.
 
-On Unix, `unix_protected_cache_generation_catalog_store` can persist only that empty revision-one
-document. It retains no-follow-opened installation/store descriptors, binds a canonical private
-envelope to the exact installation ID, current state-root generation and namespace, validates
-`0750`/`0700`/`0600` ownership and modes, serializes operations with a persistent lock, synchronizes
-staged bytes, publishes with an atomic no-replace rename, and synchronizes the parent directory.
-One exact abandoned create may be recovered after its private canonical stage is re-synchronized;
-multiple, malformed, nonempty, mismatched or conflicting stages remain recovery-required.
+On Unix, `unix_protected_cache_generation_catalog_store` creates the empty revision-one document,
+then may build a crate-sealed current-generation successor from the exact clean stored revision.
+Every successor advances once, retires the former current generation, adds exactly one new current
+identity, and preserves all other entries. The store retains no-follow-opened installation/store
+descriptors, binds a canonical private envelope to the exact installation ID, current state-root
+generation and namespace, validates `0750`/`0700`/`0600` ownership and modes, serializes operations
+with a fresh descriptor on the persistent lock, synchronizes staged bytes, publishes with atomic
+no-replace creation or atomic replacement, and synchronizes the parent directory.
 
-The store exposes no caller-supplied publication or replacement API. A protected-store snapshot is
-only persistence provenance: it grants no physical cache ownership. There is still no path
-discovery, adoption, cache scan, generation transition, lease inference, reconstruction receipt,
-quarantine, restore, deletion, or CLI apply path.
+Recovery accepts only an exact abandoned empty create, an exact one-revision current successor, or
+one byte-identical duplicate stage. Missing predecessors, altered history, skipped revisions,
+multiple stages, and malformed, mismatched, or conflicting stages remain recovery-required.
+
+The public transition operation requires a sealed authorization type that has no production
+constructor. A separately reviewed replacement-equivalence producer must be the first code allowed
+to mint it. The store never accepts a caller-supplied catalog document for publication. A
+protected-store snapshot is only persistence provenance: it grants no physical cache ownership.
+There is still no path discovery, adoption, cache scan, public generation producer, lease inference,
+reconstruction receipt, quarantine, restore, deletion, or CLI apply path.
 
 ## Required next authority
 
-A physical producer remains blocked until one separately reviewed slice supplies all of the
-following:
+A physical producer remains blocked until separately reviewed slices supply all of the following:
 
-1. a separately reviewed typed generation-transition API around the protected store. It must
-   checkpoint recovery before changing currentness, advance the catalog revision exactly once,
-   preserve binding and locking, and must not accept decoded caller-supplied generations as
-   adoption authority;
-2. a replacement-equivalence success receipt binding canonical reconstruction inputs, the exact
+1. a replacement-equivalence success receipt binding canonical reconstruction inputs, the exact
    plan/validator/toolchain generations, a newly materialized output identity, and the declared
    family semantic digest;
-3. fresh personal-worker lease-store visibility. Until leases deliberately gain generation scope,
+2. fresh personal-worker lease-store visibility. Until leases deliberately gain generation scope,
    any active lease on the protected namespace vetoes every generation; unreadable, corrupt,
    partially observed, or revision-mismatched lease state remains unknown;
-4. a read-only adapter that joins the protected catalog, equivalence receipt, lease observation,
+3. a read-only adapter that joins the protected catalog, equivalence receipt, lease observation,
    and live lock/mount/open-file/process evidence into the existing pure cache inventory. Missing or
    conflicting evidence must remain `unknown`.
 

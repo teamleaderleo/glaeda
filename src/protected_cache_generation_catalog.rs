@@ -3,9 +3,9 @@
 //! This module defines one strict, bounded, path-free document for the first reviewed
 //! `cargo-target` generation family. It does not discover, adopt, write, quarantine, restore, or
 //! delete physical cache state. Decoding caller-supplied bytes carries observation authority only.
-//! A future protected store must add descriptor-bound persistence, locking, recovery, lease-store
-//! visibility, and replacement-equivalence receipts before any physical generation can be treated
-//! as managed.
+//! The protected store may build crate-sealed revision successors from an exact loaded snapshot,
+//! but no public producer can yet authorize a physical generation. Lease-store visibility and
+//! replacement-equivalence receipts remain required before any physical state can be managed.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -56,6 +56,21 @@ impl ProtectedCacheCatalogRevision {
     #[must_use]
     pub const fn get(self) -> u64 {
         self.0
+    }
+
+    fn next(self) -> Result<Self, ProtectedCacheCatalogError> {
+        let Some(next) = self.0.checked_add(1) else {
+            return Err(catalog_error(
+                ProtectedCacheCatalogErrorKind::RevisionConflict,
+                "protected cache catalog revision space is exhausted",
+            ));
+        };
+        Self::new(next).map_err(|_| {
+            catalog_error(
+                ProtectedCacheCatalogErrorKind::RevisionConflict,
+                "protected cache catalog revision space is exhausted",
+            )
+        })
     }
 }
 
@@ -240,6 +255,110 @@ impl ProtectedCacheGenerationCatalogDocument {
     #[must_use]
     pub const fn recovery(&self) -> &ProtectedCacheCatalogRecovery {
         &self.recovery
+    }
+
+    /// Build one crate-sealed current-generation successor from an exact clean revision.
+    ///
+    /// This only advances path-free catalog metadata. The protected store keeps the resulting
+    /// snapshot at `protected_store_snapshot_only`; no public producer can call this transition,
+    /// and it grants no physical ownership, adoption, reconstruction, lease, or cleanup authority.
+    pub(crate) fn prepare_current_transition(
+        &self,
+        expected_revision: ProtectedCacheCatalogRevision,
+        state_id: CacheStateId,
+        generation_identity: ProtectedCacheGenerationIdentity,
+    ) -> Result<Self, ProtectedCacheCatalogError> {
+        self.validate()?;
+        if self.revision != expected_revision {
+            return Err(catalog_error(
+                ProtectedCacheCatalogErrorKind::RevisionConflict,
+                "protected cache catalog revision changed",
+            ));
+        }
+        if self.recovery.is_required() {
+            return Err(catalog_error(
+                ProtectedCacheCatalogErrorKind::RecoveryRequired,
+                "protected cache catalog recovery is required",
+            ));
+        }
+        if self.generations.len() >= MAX_PROTECTED_CACHE_GENERATIONS {
+            return Err(corrupt(
+                "protected cache catalog generation limit is exhausted",
+            ));
+        }
+        if self.generations.iter().any(|entry| {
+            entry.state_id == state_id || entry.generation_identity == generation_identity
+        }) {
+            return Err(corrupt(
+                "protected cache catalog transition repeats an existing identity",
+            ));
+        }
+
+        let mut generations = self.generations.clone();
+        for entry in &mut generations {
+            if entry.lifecycle == ProtectedCacheGenerationLifecycle::Current {
+                entry.lifecycle = ProtectedCacheGenerationLifecycle::Retired;
+            }
+        }
+        generations.push(ProtectedCacheGenerationEntry {
+            state_id: state_id.clone(),
+            generation_identity,
+            lifecycle: ProtectedCacheGenerationLifecycle::Current,
+        });
+        generations.sort_by(|left, right| left.state_id.cmp(&right.state_id));
+        let successor = Self {
+            schema_version: self.schema_version,
+            family: self.family,
+            namespace_identity: self.namespace_identity.clone(),
+            revision: self.revision.next()?,
+            current_state_id: Some(state_id),
+            generations,
+            recovery: ProtectedCacheCatalogRecovery::Clean,
+        };
+        successor.validate()?;
+        Ok(successor)
+    }
+
+    /// Require `self` to be the one exact current-generation successor of `previous`.
+    pub(crate) fn require_exact_current_successor(
+        &self,
+        previous: &Self,
+    ) -> Result<(), ProtectedCacheCatalogError> {
+        self.validate()?;
+        previous.validate()?;
+        if self.schema_version != previous.schema_version
+            || self.family != previous.family
+            || self.namespace_identity != previous.namespace_identity
+            || self.generations.len() != previous.generations.len() + 1
+        {
+            return Err(corrupt(
+                "protected cache catalog is not an exact current-generation successor",
+            ));
+        }
+        let Some(current_state_id) = self.current_state_id.as_ref() else {
+            return Err(corrupt(
+                "protected cache catalog successor has no current generation",
+            ));
+        };
+        let current = self
+            .generations
+            .binary_search_by(|entry| entry.state_id.cmp(current_state_id))
+            .ok()
+            .and_then(|index| self.generations.get(index))
+            .ok_or_else(|| {
+                corrupt("protected cache catalog successor current generation is missing")
+            })?;
+        let expected = previous.prepare_current_transition(
+            previous.revision,
+            current.state_id.clone(),
+            current.generation_identity.clone(),
+        )?;
+        if self != &expected {
+            return Err(corrupt(
+                "protected cache catalog is not an exact current-generation successor",
+            ));
+        }
+        Ok(())
     }
 
     /// Correlate one path-free state identity only at the caller's exact catalog revision.
@@ -828,6 +947,168 @@ mod tests {
                 ProtectedCacheCatalogErrorKind::RecoveryRequired
             );
         }
+    }
+
+    #[test]
+    fn current_transition_advances_once_and_retires_the_previous_current() {
+        let empty = ProtectedCacheGenerationCatalogDocument::empty(
+            ProtectedCacheNamespaceIdentity::parse(&digest('a')).expect("namespace"),
+        );
+        let first = empty
+            .prepare_current_transition(
+                empty.revision(),
+                state("state-first"),
+                ProtectedCacheGenerationIdentity::parse(&digest('b')).expect("generation"),
+            )
+            .expect("prepare first current");
+        assert_eq!(first.revision().get(), 2);
+        assert_eq!(
+            first.observed_current_state_id(),
+            Some(&state("state-first"))
+        );
+        assert_eq!(
+            first.correlate(first.revision(), &state("state-first")),
+            Ok(ProtectedCacheCatalogCorrelation::Current)
+        );
+        first
+            .require_exact_current_successor(&empty)
+            .expect("first exact successor");
+
+        let second = first
+            .prepare_current_transition(
+                first.revision(),
+                state("state-second"),
+                ProtectedCacheGenerationIdentity::parse(&digest('c')).expect("generation"),
+            )
+            .expect("prepare second current");
+        assert_eq!(second.revision().get(), 3);
+        assert_eq!(
+            second.correlate(second.revision(), &state("state-first")),
+            Ok(ProtectedCacheCatalogCorrelation::Retired)
+        );
+        assert_eq!(
+            second.correlate(second.revision(), &state("state-second")),
+            Ok(ProtectedCacheCatalogCorrelation::Current)
+        );
+        second
+            .require_exact_current_successor(&first)
+            .expect("second exact successor");
+    }
+
+    #[test]
+    fn current_transition_refuses_stale_duplicate_recovery_limit_and_non_successor_state() {
+        let base = current_and_retired();
+        assert_eq!(
+            base.prepare_current_transition(
+                ProtectedCacheCatalogRevision::new(6).expect("stale revision"),
+                state("state-next"),
+                ProtectedCacheGenerationIdentity::parse(&digest('d')).expect("generation"),
+            )
+            .expect_err("stale revision")
+            .kind(),
+            ProtectedCacheCatalogErrorKind::RevisionConflict
+        );
+        for (state_id, generation_identity) in [
+            (state("state-current"), digest('d')),
+            (state("state-next"), digest('b')),
+        ] {
+            assert_eq!(
+                base.prepare_current_transition(
+                    base.revision(),
+                    state_id,
+                    ProtectedCacheGenerationIdentity::parse(&generation_identity)
+                        .expect("generation"),
+                )
+                .expect_err("duplicate identity")
+                .kind(),
+                ProtectedCacheCatalogErrorKind::CorruptState
+            );
+        }
+
+        let recovery = catalog(
+            8,
+            Some("state-current"),
+            base.generations.clone(),
+            ProtectedCacheCatalogRecovery::Required {
+                affected_state_ids: vec![state("state-current")],
+            },
+        );
+        assert_eq!(
+            recovery
+                .prepare_current_transition(
+                    recovery.revision(),
+                    state("state-next"),
+                    ProtectedCacheGenerationIdentity::parse(&digest('d')).expect("generation"),
+                )
+                .expect_err("recovery debt")
+                .kind(),
+            ProtectedCacheCatalogErrorKind::RecoveryRequired
+        );
+
+        let exhausted = catalog(
+            MAX_PROTECTED_CACHE_CATALOG_REVISION,
+            None,
+            Vec::new(),
+            ProtectedCacheCatalogRecovery::Clean,
+        );
+        assert_eq!(
+            exhausted
+                .prepare_current_transition(
+                    exhausted.revision(),
+                    state("state-next"),
+                    ProtectedCacheGenerationIdentity::parse(&digest('d')).expect("generation"),
+                )
+                .expect_err("revision exhaustion")
+                .kind(),
+            ProtectedCacheCatalogErrorKind::RevisionConflict
+        );
+
+        let full = catalog(
+            9,
+            None,
+            (0..MAX_PROTECTED_CACHE_GENERATIONS)
+                .map(|index| ProtectedCacheGenerationEntry {
+                    state_id: state(&format!("state-{index:03}")),
+                    generation_identity: ProtectedCacheGenerationIdentity::parse(&format!(
+                        "sha256:{index:064x}"
+                    ))
+                    .expect("generation"),
+                    lifecycle: ProtectedCacheGenerationLifecycle::Retired,
+                })
+                .collect(),
+            ProtectedCacheCatalogRecovery::Clean,
+        );
+        assert_eq!(
+            full.prepare_current_transition(
+                full.revision(),
+                state("state-next"),
+                ProtectedCacheGenerationIdentity::parse(&format!(
+                    "sha256:{:064x}",
+                    MAX_PROTECTED_CACHE_GENERATIONS
+                ))
+                .expect("generation"),
+            )
+            .expect_err("generation limit")
+            .kind(),
+            ProtectedCacheCatalogErrorKind::CorruptState
+        );
+
+        let mut altered = base
+            .prepare_current_transition(
+                base.revision(),
+                state("state-next"),
+                ProtectedCacheGenerationIdentity::parse(&digest('d')).expect("generation"),
+            )
+            .expect("candidate successor");
+        altered.generations[0].generation_identity =
+            ProtectedCacheGenerationIdentity::parse(&digest('e')).expect("altered generation");
+        assert_eq!(
+            altered
+                .require_exact_current_successor(&base)
+                .expect_err("altered prior entry")
+                .kind(),
+            ProtectedCacheCatalogErrorKind::CorruptState
+        );
     }
 
     #[test]
