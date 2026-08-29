@@ -27,44 +27,60 @@ The current Glaeda resident path is 3.95 times faster than fresh local at the me
 
 ## Big-red path-class follow-up
 
-The first path-class follow-up kept the same frozen commit, tree, fixture, toolchain, command,
-16-logical-CPU host, and default Cargo concurrency. Three independent task lineages each started
-with an empty `target:private` directory mounted at the resident project's stable pathname. Each
-lineage ran the complete unedited workload once, then received the exact fixture and ran the
-complete workload once more. This prevents later samples from becoming no-edit cache hits.
+### Superseded storage attribution
+
+The first private-lineage follow-up used an explicit state root below `/tmp`. On big-red `/tmp` is
+`tmpfs`, not the host's ext4 filesystem. Its `43.98, 41.98, 42.43`-second primes and
+`9.87, 10.50, 10.78`-second edits are valid tmpfs observations, but they do not support an ext4
+mechanism claim. The original state was removed in 0.49 seconds after recording its receipts. The
+storage attribution and any ext4 conclusion derived from those samples are superseded by the
+same-filesystem rerun below.
+
+### Physical ext4 rerun
+
+The correction kept the same frozen commit, tree, fixture, toolchain, command, 16-logical-CPU host,
+and default Cargo concurrency. The resident `target`, every Overlay upper/work directory, and every
+private lineage were freshly proven on the same ext4 filesystem. Three independent empty-private
+lineages each ran the complete unedited workload once, received the exact fixture, and ran the
+complete workload once more. Three separate edited tasks compared a warmed resident Overlay lower
+with a full ordinary-copy private seed from that exact lower.
 
 | Phase | Wall seconds | Median | User CPU seconds | System CPU seconds | Peak RSS KiB | Result |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| Private-lineage cold prime | 43.98, 41.98, 42.43 | 42.43 | 110.01, 106.96, 105.55 | 9.31, 9.51, 9.06 | 2,513,796, 2,534,772, 2,510,176 | green |
-| Private-lineage edit | 9.87, 10.50, 10.78 | 10.50 | 16.96, 17.97, 18.65 | 3.27, 3.21, 3.60 | 1,631,732, 1,633,072, 1,632,096 | green |
+| Empty-private cold prime | 41.76, 42.53, 43.67 | 42.53 | 104.76, 109.09, 109.05 | 9.43, 9.81, 9.78 | 2,512,408, 2,503,152, 2,502,760 | green |
+| Empty-private edit | 10.65, 10.38, 10.37 | 10.38 | 17.41, 16.88, 16.73 | 3.88, 3.91, 4.14 | 1,634,556, 1,635,252, 1,630,944 | green |
+| Warmed Overlay edit | 11.85, 11.94, 12.68 | 11.94 | 16.30, 16.51, 17.87 | 3.90, 4.32, 4.40 | 1,638,348, 1,638,040, 1,637,116 | green |
+| Ordinary-copy private seed | 0.43, 0.47, 0.59 | 0.47 | 0.00, 0.00, 0.00 | 0.42, 0.47, 0.58 | 2,380, 2,492, 2,512 | green |
+| Copy-seeded private edit | 10.04, 10.79, 10.32 | 10.32 | 16.69, 17.37, 17.58 | 3.79, 3.69, 3.71 | 1,622,412, 1,633,428, 1,632,676 | green |
 
-The outer `hot-run` edit measurements were 9.971136, 10.600774, and 10.898277 seconds. Every edit
-receipt carried the exact fixture digest and every run completed 1,343 executed tests with one
-existing ignored test.
+Every edit receipt carried the exact fixture digest and every run completed 1,343 executed tests
+with one existing ignored test. Outer `hot-run` medians were 10.470375 seconds for empty-private,
+12.074703 seconds for Overlay, and 10.450082 seconds for the already-seeded private command. Pairing
+each copy with its edit produced inner request-to-result samples of 10.47, 11.26, and 10.91 seconds
+(median 10.91); the corresponding outer totals were 10.603277, 11.357405, and 11.040082 seconds
+(median 11.040082).
 
-The `10.50`-second private-lineage median is `0.56` seconds, or about 5.1%, faster than the prior
-`11.06`-second private-Overlay median. It recovers about 75% of the measured `0.75`-second gap, but
-remains `0.19` seconds, or about 1.8%, behind the `10.31`-second ordinary-native median. One
-immediate no-edit repeat completed the inner workload in 3.20 seconds and the whole `hot-run`
-invocation in 3.374774 seconds; that is a warm-suite floor, not an edit result.
+The same-filesystem `cp --reflink=always` control refused in 0.01 seconds with `Operation not
+supported`. The ordinary copy therefore allocated the full exact parent: 1,960,813,503 logical
+bytes and 1,963,872,256–1,963,876,352 allocated bytes. After the edit, the copy-seeded private
+states occupied 2,716,748,969–2,716,749,002 logical and 2,720,026,624–2,720,038,912 allocated bytes.
+The empty-private final allocation was 2,720,018,432–2,720,022,528 bytes. Overlay state occupied
+2,537,993,803–2,537,993,825 logical and 2,539,700,224–2,539,720,704 allocated bytes, so it saved
+only about 172 MiB versus a complete private lineage for this real workload.
 
-For sample one, the private state occupied 1,960,765,984 logical bytes and 1,963,511,808 allocated
-bytes after the base prime. After the edit it occupied 2,716,690,227 logical bytes and
-2,719,531,008 allocated bytes, growth of 755,924,243 logical and 756,019,200 allocated bytes. All
-three final lineages had 2,716,690,227–2,716,690,270 logical bytes and exactly 2,719,531,008
-allocated bytes.
+After recording the receipts, the three task worktrees removed in 0.04, 0.00, and 0.00 seconds;
+the warmed resident worktree and its target removed in 0.12 seconds. The three copy-seeded,
+Overlay, and empty-private state families removed in 0.22, 0.11, and 0.33 seconds respectively;
+receipt cleanup was below 0.01 seconds. No benchmark process or mount survived.
 
-After recording the receipts, all three route-owned worktrees removed in less than 0.01 seconds
-each at the timer's precision. Removing the external state-and-receipt root, including about
-8,158,593,024 allocated bytes across the three final lineages, took 0.49 seconds of wall time,
-0.00 seconds user CPU, 0.48 seconds system CPU, and 2,004 KiB peak RSS. No mount survived cleanup.
-
-This settles the ext4 choice more narrowly than “private is faster.” An empty private lineage pays
-the full cold compile once and is appropriate only when a task/agent will retain it across enough
-useful edits. A short-lived task should inherit a warmed Overlay lower. Reflink-capable storage can
-change that break-even by seeding the private lineage cheaply; big-red's current ext4 filesystem
-cannot claim that result. Source fan-out, Git metadata, dependencies, and compiler output therefore
-remain separate mechanism decisions.
+On this ext4 host, an empty private lineage pays the full cold compile once. Copy-seeding avoids
+that prime: its 10.91-second preparation-plus-result median was 1.03 seconds, or 8.6%, faster than
+the 11.94-second Overlay result, while remaining 0.60 seconds behind the earlier 10.31-second
+ordinary-native median. That makes ordinary-copy seeding a measured retained-lineage candidate,
+not a universal default: it consumes the full parent allocation, depends on an exact warm parent,
+and still needs concurrent fan-out and cold-page-cache controls. Reflink-capable storage remains
+the preferred cheap-seeding candidate. Source fan-out, Git metadata, dependencies, compiler output,
+and resident services remain separate mechanism decisions.
 
 ## Correctness failure retained as evidence
 
