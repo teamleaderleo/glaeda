@@ -25,6 +25,47 @@ All three-sample rows report every sample and the median. Three samples are not 
 
 The current Glaeda resident path is 3.95 times faster than fresh local at the median, but ordinary Cargo incremental is 4.24 times faster than fresh local and beats Glaeda by 0.75 seconds, or 7.3%. For this edit shape, current stable-path isolation adds semantics and private writable cache state but does not yet improve latency over a normal warm worktree.
 
+## Big-red path-class follow-up
+
+The first path-class follow-up kept the same frozen commit, tree, fixture, toolchain, command,
+16-logical-CPU host, and default Cargo concurrency. Three independent task lineages each started
+with an empty `target:private` directory mounted at the resident project's stable pathname. Each
+lineage ran the complete unedited workload once, then received the exact fixture and ran the
+complete workload once more. This prevents later samples from becoming no-edit cache hits.
+
+| Phase | Wall seconds | Median | User CPU seconds | System CPU seconds | Peak RSS KiB | Result |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Private-lineage cold prime | 43.98, 41.98, 42.43 | 42.43 | 110.01, 106.96, 105.55 | 9.31, 9.51, 9.06 | 2,513,796, 2,534,772, 2,510,176 | green |
+| Private-lineage edit | 9.87, 10.50, 10.78 | 10.50 | 16.96, 17.97, 18.65 | 3.27, 3.21, 3.60 | 1,631,732, 1,633,072, 1,632,096 | green |
+
+The outer `hot-run` edit measurements were 9.971136, 10.600774, and 10.898277 seconds. Every edit
+receipt carried the exact fixture digest and every run completed 1,343 executed tests with one
+existing ignored test.
+
+The `10.50`-second private-lineage median is `0.56` seconds, or about 5.1%, faster than the prior
+`11.06`-second private-Overlay median. It recovers about 75% of the measured `0.75`-second gap, but
+remains `0.19` seconds, or about 1.8%, behind the `10.31`-second ordinary-native median. One
+immediate no-edit repeat completed the inner workload in 3.20 seconds and the whole `hot-run`
+invocation in 3.374774 seconds; that is a warm-suite floor, not an edit result.
+
+For sample one, the private state occupied 1,960,765,984 logical bytes and 1,963,511,808 allocated
+bytes after the base prime. After the edit it occupied 2,716,690,227 logical bytes and
+2,719,531,008 allocated bytes, growth of 755,924,243 logical and 756,019,200 allocated bytes. All
+three final lineages had 2,716,690,227–2,716,690,270 logical bytes and exactly 2,719,531,008
+allocated bytes.
+
+After recording the receipts, all three route-owned worktrees removed in less than 0.01 seconds
+each at the timer's precision. Removing the external state-and-receipt root, including about
+8,158,593,024 allocated bytes across the three final lineages, took 0.49 seconds of wall time,
+0.00 seconds user CPU, 0.48 seconds system CPU, and 2,004 KiB peak RSS. No mount survived cleanup.
+
+This settles the ext4 choice more narrowly than “private is faster.” An empty private lineage pays
+the full cold compile once and is appropriate only when a task/agent will retain it across enough
+useful edits. A short-lived task should inherit a warmed Overlay lower. Reflink-capable storage can
+change that break-even by seeding the private lineage cheaply; big-red's current ext4 filesystem
+cannot claim that result. Source fan-out, Git metadata, dependencies, and compiler output therefore
+remain separate mechanism decisions.
+
 ## Correctness failure retained as evidence
 
 Running the full lib/bin command through the same Glaeda resident path took 11.50 seconds, used 1,631,808 KiB peak RSS, and exited 101 after 1,326 passed, 16 failed, and one ignored library test. Fifteen failures could not select a reviewed environment executable after namespace ownership remapping; one rootless-Podman observation saw an unsafe parent directory instead of a missing source.
