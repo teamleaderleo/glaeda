@@ -186,6 +186,16 @@ that the named cache is mutated at its ordinary task path, creates no state, and
 It refuses cross-worktree execution so it cannot silently turn a private-cache request into shared
 resident mutation.
 
+An unmeasured invocation with explicit resident and task arguments, at most one native-cache
+declaration, and no other option first enters a small POSIX front door. It resolves both arguments
+to the same physical directory, uses one Git probe to require that directory to be the worktree
+root, resolves one absolute executable, changes to that root and waits for the command with the
+caller's terminal and environment. Measurement, runtime binding, timeout, resource profile, source
+seeding, state, Git environment overrides, cross-worktree execution and every non-native or
+ambiguous cache request fall through to the unchanged Python implementation. This is a latency
+optimization for work that was already direct; it grants no project identity, residency, cache,
+observation, isolation, or result authority.
+
 `private` starts with an empty directory and retains the task's later writes without OverlayFS
 copy-up. `private-copy` atomically seeds that directory once from the warm resident parent with GNU
 `cp --reflink=auto`, then reuses the private lineage on later invocations. The copy uses reflinks

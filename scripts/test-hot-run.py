@@ -22,11 +22,118 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 HOT_RUN = ROOT / "scripts" / "hot-run"
+HOT_RUN_IMPLEMENTATION = ROOT / "scripts" / "hot-run-python"
+
+
+def load_hot_run() -> dict[str, object]:
+    return runpy.run_path(str(HOT_RUN_IMPLEMENTATION), run_name="hot_run_test")
 
 
 class HotRunTests(unittest.TestCase):
+    def test_front_door_fast_path_avoids_python_and_preserves_context(self) -> None:
+        environment = os.environ.copy()
+        environment["PYTHONHOME"] = "/definitely-absent-glaeda-python-home"
+        environment["GLAEDA_FAST_PATH_TEST"] = "expected"
+        result = subprocess.run(
+            [
+                os.fspath(HOT_RUN),
+                "--resident",
+                os.fspath(ROOT),
+                "--task",
+                os.fspath(ROOT),
+                "--cache",
+                "target:native",
+                "--",
+                "/bin/sh",
+                "-c",
+                'test "$PWD" = "$1" && test "$GLAEDA_FAST_PATH_TEST" = expected && exit 17',
+                "glaeda-fast-path",
+                os.fspath(ROOT),
+            ],
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 17)
+
+    def test_front_door_falls_back_for_observed_work(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            fake_bin = fixture / "bin"
+            fake_bin.mkdir()
+            marker = fixture / "fallback"
+            fake_python = fake_bin / "python3"
+            fake_python.write_text(
+                '#!/bin/sh\nprintf fallback > "$GLAEDA_FALLBACK_MARKER"\nexit 23\n',
+                encoding="utf-8",
+            )
+            fake_python.chmod(0o700)
+            environment = os.environ.copy()
+            environment["PATH"] = os.pathsep.join(
+                (os.fspath(fake_bin), "/usr/bin", "/bin")
+            )
+            environment["GLAEDA_FALLBACK_MARKER"] = os.fspath(marker)
+            result = subprocess.run(
+                [
+                    os.fspath(HOT_RUN),
+                    "--resident",
+                    os.fspath(ROOT),
+                    "--task",
+                    os.fspath(ROOT),
+                    "--measurement",
+                    os.fspath(fixture / "measurement.json"),
+                    "--",
+                    "/bin/true",
+                ],
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 23)
+            self.assertEqual(marker.read_text(encoding="utf-8"), "fallback")
+
+            marker.unlink()
+            environment["GIT_DIR"] = "/definitely-foreign-git-directory"
+            result = subprocess.run(
+                [
+                    os.fspath(HOT_RUN),
+                    "--resident",
+                    os.fspath(ROOT),
+                    "--task",
+                    os.fspath(ROOT),
+                    "--",
+                    "/bin/true",
+                ],
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 23)
+            self.assertEqual(marker.read_text(encoding="utf-8"), "fallback")
+
+        invalid_cache = subprocess.run(
+            [
+                os.fspath(HOT_RUN),
+                "--resident",
+                os.fspath(ROOT),
+                "--task",
+                os.fspath(ROOT),
+                "--cache",
+                "target:overlay",
+                "--",
+                "/bin/true",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(invalid_cache.returncode, 2)
+        self.assertIn("same-worktree cache observations", invalid_cache.stderr)
+
     def test_unmeasured_command_does_not_observe_machine(self) -> None:
-        namespace = runpy.run_path(str(HOT_RUN), run_name="hot_run_test")
+        namespace = load_hot_run()
         execute = namespace["execute"]
         observer = mock.Mock(side_effect=AssertionError("unexpected observation"))
         resolver = mock.Mock(side_effect=AssertionError("unexpected resolution"))
@@ -53,7 +160,7 @@ class HotRunTests(unittest.TestCase):
         resolver.assert_not_called()
 
     def test_measured_command_rss_excludes_prior_children(self) -> None:
-        namespace = runpy.run_path(str(HOT_RUN), run_name="hot_run_test")
+        namespace = load_hot_run()
         execute = namespace["execute"]
         with tempfile.TemporaryDirectory() as directory:
             measurement = Path(directory) / "measurement.json"
@@ -103,7 +210,6 @@ class HotRunTests(unittest.TestCase):
                 measurement = fixture / f"{name}.json"
                 result = subprocess.run(
                     [
-                        sys.executable,
                         os.fspath(HOT_RUN),
                         "--resident",
                         os.fspath(ROOT),
@@ -129,7 +235,7 @@ class HotRunTests(unittest.TestCase):
                 )
 
     def test_linux_machine_observation_parsers_are_strict(self) -> None:
-        namespace = runpy.run_path(str(HOT_RUN), run_name="hot_run_test")
+        namespace = load_hot_run()
         parse_load_average = namespace["parse_load_average"]
         parse_meminfo = namespace["parse_meminfo"]
         parse_pressure = namespace["parse_pressure"]
@@ -189,7 +295,7 @@ class HotRunTests(unittest.TestCase):
                 parse_pressure(invalid)
 
     def test_machine_interval_derives_only_complete_monotonic_evidence(self) -> None:
-        namespace = runpy.run_path(str(HOT_RUN), run_name="hot_run_test")
+        namespace = load_hot_run()
         derive = namespace["pressure_observation_interval"]
         before = {
             "memory": {"available_bytes": 1_000, "swap_used_bytes": 200},
@@ -248,7 +354,7 @@ class HotRunTests(unittest.TestCase):
         )
 
     def test_program_resolution_preserves_dispatch_symlinks(self) -> None:
-        resolve_program = runpy.run_path(str(HOT_RUN), run_name="hot_run_test")[
+        resolve_program = load_hot_run()[
             "resolve_program"
         ]
         cargo = shutil.which("cargo")
@@ -257,7 +363,7 @@ class HotRunTests(unittest.TestCase):
         self.assertEqual(resolve_program(["cargo"], ROOT)[0], os.path.abspath(cargo))
 
     def test_default_state_is_stable_and_separates_tasks(self) -> None:
-        namespace = runpy.run_path(str(HOT_RUN), run_name="hot_run_test")
+        namespace = load_hot_run()
         default_state_root = namespace["default_state_root"]
         runtime_state_root = namespace["runtime_state_root"]
         RuntimeContract = namespace["RuntimeContract"]
@@ -280,7 +386,7 @@ class HotRunTests(unittest.TestCase):
         self.assertNotIn("node-22", runtime_state_root(first, node_22).name)
 
     def test_default_target_cache_uses_private_copy(self) -> None:
-        namespace = runpy.run_path(str(HOT_RUN), run_name="hot_run_test")
+        namespace = load_hot_run()
         default_cache_specs = namespace["default_cache_specs"]
         with tempfile.TemporaryDirectory() as directory:
             resident = Path(directory)
@@ -292,7 +398,7 @@ class HotRunTests(unittest.TestCase):
         self.assertEqual(specs[0].mode, "private-copy")
 
     def test_seed_source_metadata_normalizes_only_matching_regular_files(self) -> None:
-        namespace = runpy.run_path(str(HOT_RUN), run_name="hot_run_test")
+        namespace = load_hot_run()
         prepare = namespace["prepare_seed_source_metadata"]
         CachePreparation = namespace["CachePreparation"]
         with tempfile.TemporaryDirectory() as directory:
@@ -415,7 +521,6 @@ class HotRunTests(unittest.TestCase):
             (task / "payload").write_text("task\n", encoding="utf-8")
 
             command = [
-                sys.executable,
                 os.fspath(HOT_RUN),
                 "--resident",
                 os.fspath(resident),
@@ -529,7 +634,6 @@ class HotRunTests(unittest.TestCase):
             )
 
             base_command = [
-                sys.executable,
                 os.fspath(HOT_RUN),
                 "--resident",
                 os.fspath(resident),
@@ -634,7 +738,6 @@ class HotRunTests(unittest.TestCase):
             )
 
             base_command = [
-                sys.executable,
                 os.fspath(HOT_RUN),
                 "--resident",
                 os.fspath(resident),
@@ -768,7 +871,7 @@ class HotRunTests(unittest.TestCase):
             self.assertEqual(list(state.glob(".git-view-*")), [])
 
     def test_cache_specs_reject_escape_overlap_and_unknown_modes(self) -> None:
-        parse_cache_specs = runpy.run_path(str(HOT_RUN), run_name="hot_run_test")[
+        parse_cache_specs = load_hot_run()[
             "parse_cache_specs"
         ]
         for values in (["../target"], ["target:shared"], ["target", "target:ro"]):
@@ -783,7 +886,7 @@ class HotRunTests(unittest.TestCase):
             parse_cache_specs(["build", "build/generated"])
 
     def test_private_copy_failure_never_publishes_candidate(self) -> None:
-        namespace = runpy.run_path(str(HOT_RUN), run_name="hot_run_test")
+        namespace = load_hot_run()
         prepare_private_copy = namespace["prepare_private_copy"]
         CacheSpec = namespace["CacheSpec"]
         with tempfile.TemporaryDirectory() as directory:
@@ -851,7 +954,6 @@ class HotRunTests(unittest.TestCase):
                 fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 result = subprocess.run(
                     [
-                        sys.executable,
                         os.fspath(HOT_RUN),
                         "--resident",
                         os.fspath(resident),
@@ -892,7 +994,6 @@ class HotRunTests(unittest.TestCase):
             program.chmod(0o700)
             digest = hashlib.sha256(program.read_bytes()).hexdigest()
             base_command = [
-                sys.executable,
                 os.fspath(HOT_RUN),
                 "--resident",
                 os.fspath(ROOT),
@@ -960,7 +1061,6 @@ class HotRunTests(unittest.TestCase):
 
             result = subprocess.run(
                 [
-                    sys.executable,
                     os.fspath(HOT_RUN),
                     "--resident",
                     os.fspath(ROOT),
@@ -1021,7 +1121,6 @@ class HotRunTests(unittest.TestCase):
 
             bound = subprocess.run(
                 [
-                    sys.executable,
                     os.fspath(HOT_RUN),
                     "--resident",
                     os.fspath(ROOT),
@@ -1066,7 +1165,6 @@ class HotRunTests(unittest.TestCase):
             output.unlink()
             unbound = subprocess.run(
                 [
-                    sys.executable,
                     os.fspath(HOT_RUN),
                     "--resident",
                     os.fspath(ROOT),
@@ -1090,7 +1188,7 @@ class HotRunTests(unittest.TestCase):
             self.assertEqual(unbound.returncode, 0, unbound.stderr)
             self.assertEqual(output.read_text(encoding="utf-8"), "fallback")
 
-            namespace = runpy.run_path(str(HOT_RUN), run_name="hot_run_test")
+            namespace = load_hot_run()
             binding = namespace["observe_runtime_bin"](
                 runtime_bin, "test-runtime-bound"
             )
@@ -1111,7 +1209,7 @@ class HotRunTests(unittest.TestCase):
             )
 
     def test_runtime_bin_binding_refuses_invalid_or_changed_directories(self) -> None:
-        namespace = runpy.run_path(str(HOT_RUN), run_name="hot_run_test")
+        namespace = load_hot_run()
         observe = namespace["observe_runtime_bin"]
         revalidate = namespace["revalidate_runtime_bin"]
         with tempfile.TemporaryDirectory() as directory:
@@ -1137,7 +1235,6 @@ class HotRunTests(unittest.TestCase):
 
             outside = subprocess.run(
                 [
-                    sys.executable,
                     os.fspath(HOT_RUN),
                     "--resident",
                     os.fspath(ROOT),
@@ -1169,9 +1266,7 @@ class HotRunTests(unittest.TestCase):
     def test_runtime_contract_rejects_digest_without_id_and_noncanonical_values(
         self,
     ) -> None:
-        parse_runtime_contract = runpy.run_path(
-            str(HOT_RUN), run_name="hot_run_test"
-        )["parse_runtime_contract"]
+        parse_runtime_contract = load_hot_run()["parse_runtime_contract"]
         for runtime_id, digest in (
             (None, f"sha256:{'1' * 64}"),
             ("../node", f"sha256:{'1' * 64}"),
@@ -1186,7 +1281,6 @@ class HotRunTests(unittest.TestCase):
         comparison_key = f"sha256:{'3' * 64}"
         without_measurement = subprocess.run(
             [
-                sys.executable,
                 os.fspath(HOT_RUN),
                 "--resident",
                 os.fspath(ROOT),
@@ -1210,7 +1304,6 @@ class HotRunTests(unittest.TestCase):
             measurement = Path(directory) / "measurement.json"
             measured = subprocess.run(
                 [
-                    sys.executable,
                     os.fspath(HOT_RUN),
                     "--resident",
                     os.fspath(ROOT),
@@ -1233,7 +1326,6 @@ class HotRunTests(unittest.TestCase):
 
         invalid = subprocess.run(
             [
-                sys.executable,
                 os.fspath(HOT_RUN),
                 "--comparison-key",
                 f"sha256:{'A' * 64}",
@@ -1256,7 +1348,6 @@ class HotRunTests(unittest.TestCase):
             measurement = Path(directory) / "measurement.json"
             result = subprocess.run(
                 [
-                    sys.executable,
                     os.fspath(HOT_RUN),
                     "--resident",
                     os.fspath(ROOT),
@@ -1285,7 +1376,6 @@ class HotRunTests(unittest.TestCase):
             measurement = Path(directory) / "measurement.json"
             result = subprocess.run(
                 [
-                    sys.executable,
                     os.fspath(HOT_RUN),
                     "--resident",
                     os.fspath(ROOT),
@@ -1310,7 +1400,7 @@ class HotRunTests(unittest.TestCase):
         self.assertEqual(report["state_preparation"], [])
 
     def test_native_cache_mode_refuses_cross_worktree_execution(self) -> None:
-        namespace = runpy.run_path(str(HOT_RUN), run_name="hot_run_test")
+        namespace = load_hot_run()
         run = namespace["run"]
         with mock.patch.dict(
             run.__globals__,
@@ -1349,7 +1439,6 @@ class HotRunTests(unittest.TestCase):
     def test_seed_source_mtimes_requires_a_private_target_copy(self) -> None:
         result = subprocess.run(
             [
-                sys.executable,
                 os.fspath(HOT_RUN),
                 "--resident",
                 os.fspath(ROOT),
@@ -1377,7 +1466,6 @@ class HotRunTests(unittest.TestCase):
             child_pid = fixture / "child.pid"
             result = subprocess.run(
                 [
-                    sys.executable,
                     os.fspath(HOT_RUN),
                     "--resident",
                     os.fspath(ROOT),
@@ -1418,7 +1506,6 @@ class HotRunTests(unittest.TestCase):
             ready = fixture / "ready"
             process = subprocess.Popen(
                 [
-                    sys.executable,
                     os.fspath(HOT_RUN),
                     "--resident",
                     os.fspath(ROOT),
@@ -1457,7 +1544,6 @@ class HotRunTests(unittest.TestCase):
             measurement = Path(directory) / "measurement.json"
             result = subprocess.run(
                 [
-                    sys.executable,
                     os.fspath(HOT_RUN),
                     "--resident",
                     os.fspath(ROOT),
