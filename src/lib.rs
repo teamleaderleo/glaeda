@@ -299,6 +299,8 @@ pub mod renderprove_vision_profile;
 pub mod renderprove_vision_result;
 /// Credentialless, bounded observation of one immutable reviewed repository source.
 pub mod repository_source_observation;
+/// Pure frozen preregistration and sample binding for resident backend comparisons.
+pub mod resident_backend_comparison;
 /// Pure, authority-free resident-sandbox generation/config/locator catalog and strict codec.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod resident_sandbox_catalog;
