@@ -212,6 +212,12 @@ distinct state phase, so first materialization and repeated command execution ca
 one pressure treatment. This measures the repeated developer loop Glaeda is intended to improve;
 it does not skip tests or grant cached-result authority.
 
+For a short steady-state discriminator, `--retained-reuse-windows 3` or `7` keeps the exact
+worktrees and state while rerunning the complete validator. Each reuse ordinal has a distinct
+comparison key, so sequence position remains visible rather than being collapsed into one generic
+warm label. The original single-window flag and receipt field remain compatible views of ordinal
+one.
+
 The first fan-out-4 use of that window measured two samples per arm. Complete first-use medians
 were 26.55 seconds native, 27.51 seconds private-copy, and 29.43 seconds Overlay. Immediate reuse
 fell to 17.92, 19.63, and 18.07 seconds respectively while every task reran and accepted the same

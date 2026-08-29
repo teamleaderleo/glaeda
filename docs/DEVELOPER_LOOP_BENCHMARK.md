@@ -199,13 +199,17 @@ unrelated trees. The harness grants no policy, cache, result-reuse, cleanup, or 
 authority.
 
 `--retained-reuse` adds one immediate second validation window without recreating worktrees,
-reapplying the edit, or replacing task state. The first edit and retained-reuse windows have
-different comparison keys: the former binds `initial_for_source_state`, while the latter binds
-`retained_after_accepted_edit`. This prevents a pressure comparator from treating first-use and
-already-retained work as the same treatment. For `private-copy`, the first window must prove a
-positive-time `seeded` preparation and the second must prove zero-time `reused`; either mismatch
-rejects the observation. The second window still executes and validates the complete frozen
-1,343-test workload. It is therefore a command-reuse measurement, not result reuse.
+reapplying the edit, or replacing task state. `--retained-reuse-windows 3` or `7` extends that into
+a bounded stable-lineage sequence; the two options are mutually exclusive and the single-window
+flag remains the compatibility spelling for count one. The first edit and retained-reuse windows
+have different comparison keys. First use binds `initial_for_source_state`; reuse binds
+`retained_after_accepted_edit` plus its one-based ordinal. This prevents a pressure comparator from
+treating first-use, reuse one, and reuse three as the same treatment. For `private-copy`, the first
+window must prove a positive-time `seeded` preparation and every reuse must prove zero-time
+`reused`; either mismatch rejects the observation. Every window still executes and validates the
+complete frozen 1,343-test workload. It is therefore a command-reuse measurement, not result
+reuse. Results retain `retained_reuse_window` as the first-window compatibility view and add the
+complete ordered `retained_reuse_windows` sequence.
 
 ### First exact-head matched fan-out control
 

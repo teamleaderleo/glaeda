@@ -64,6 +64,7 @@ class HotStateFanoutTests(unittest.TestCase):
                 value["comparison"]["edit_key"],
             )
             self.assertFalse(value["retained_reuse_window"])
+            self.assertEqual(value["retained_reuse_window_count"], 0)
             self.assertNotIn("retained_reuse_key", value["comparison"])
 
     def test_retained_reuse_has_distinct_state_phase_and_key(self) -> None:
@@ -76,7 +77,12 @@ class HotStateFanoutTests(unittest.TestCase):
         initial_key = comparison_key(plan, True)
         reuse_key = comparison_key(plan, True, retained_reuse=True)
         self.assertTrue(value["retained_reuse_window"])
+        self.assertEqual(value["retained_reuse_window_count"], 1)
         self.assertEqual(value["comparison"]["retained_reuse_key"], reuse_key)
+        self.assertEqual(
+            value["comparison"]["retained_reuse_keys"],
+            [{"ordinal": 1, "key": reuse_key}],
+        )
         self.assertNotEqual(initial_key, reuse_key)
         self.assertEqual(
             comparison_basis(plan, True)["treatment"]["state_phase"],
@@ -88,8 +94,63 @@ class HotStateFanoutTests(unittest.TestCase):
             ],
             "retained_after_accepted_edit",
         )
+        self.assertEqual(
+            comparison_basis(plan, True, retained_reuse=True)["treatment"][
+                "retained_reuse_ordinal"
+            ],
+            1,
+        )
         with self.assertRaises(ExperimentError):
             comparison_basis(plan, False, retained_reuse=True)
+
+    def test_retained_reuse_sequence_binds_each_ordinal(self) -> None:
+        build_plan = NAMESPACE["build_plan"]
+        comparison_basis = NAMESPACE["comparison_basis"]
+        comparison_key = NAMESPACE["comparison_key"]
+        ExperimentError = NAMESPACE["ExperimentError"]
+        plan = build_plan(
+            "private-copy", 4, 16, retained_reuse_windows=3
+        )
+        value = plan.to_json()
+        keys = value["comparison"]["retained_reuse_keys"]
+        self.assertEqual(value["retained_reuse_window_count"], 3)
+        self.assertEqual([item["ordinal"] for item in keys], [1, 2, 3])
+        self.assertEqual(len({item["key"] for item in keys}), 3)
+        self.assertEqual(value["comparison"]["retained_reuse_key"], keys[0]["key"])
+        for ordinal, item in enumerate(keys, 1):
+            self.assertEqual(
+                item["key"],
+                comparison_key(
+                    plan,
+                    True,
+                    retained_reuse=True,
+                    retained_reuse_ordinal=ordinal,
+                ),
+            )
+            self.assertEqual(
+                comparison_basis(
+                    plan,
+                    True,
+                    retained_reuse=True,
+                    retained_reuse_ordinal=ordinal,
+                )["treatment"]["retained_reuse_ordinal"],
+                ordinal,
+            )
+        with self.assertRaises(ExperimentError):
+            comparison_basis(
+                plan, True, retained_reuse_ordinal=1
+            )
+        undeclared = build_plan("private-copy", 4, 16)
+        with self.assertRaises(ExperimentError):
+            comparison_basis(undeclared, True, retained_reuse=True)
+        for ordinal in (0, 8, True):
+            with self.assertRaises(ExperimentError):
+                comparison_basis(
+                    plan,
+                    True,
+                    retained_reuse=True,
+                    retained_reuse_ordinal=ordinal,
+                )
 
     def test_comparison_keys_bind_treatment_and_remain_path_free(self) -> None:
         build_plan = NAMESPACE["build_plan"]
@@ -167,6 +228,22 @@ class HotStateFanoutTests(unittest.TestCase):
             build_plan(
                 "overlay", 4, 16, page_cache_treatment="global_drop_caches"
             )
+        for count in (2, 8, True):
+            with self.assertRaises(ExperimentError):
+                build_plan(
+                    "private-copy",
+                    4,
+                    16,
+                    retained_reuse_windows=count,
+                )
+        with self.assertRaises(ExperimentError):
+            build_plan(
+                "private-copy",
+                4,
+                16,
+                retained_reuse=True,
+                retained_reuse_windows=3,
+            )
 
     def test_plan_cli_is_read_only_and_path_free(self) -> None:
         result = subprocess.run(
@@ -209,6 +286,56 @@ class HotStateFanoutTests(unittest.TestCase):
             plan["comparison"]["retained_reuse_key"],
             r"^sha256:[0-9a-f]{64}$",
         )
+
+    def test_retained_reuse_sequence_cli_declares_ordinals(self) -> None:
+        result = subprocess.run(
+            [
+                str(SCRIPT),
+                "--plan",
+                "--arm",
+                "overlay",
+                "--fanout",
+                "4",
+                "--retained-reuse-windows",
+                "3",
+            ],
+            cwd=ROOT,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plan = json.loads(result.stdout)
+        self.assertEqual(plan["retained_reuse_window_count"], 3)
+        self.assertEqual(
+            [
+                item["ordinal"]
+                for item in plan["comparison"]["retained_reuse_keys"]
+            ],
+            [1, 2, 3],
+        )
+        conflict = subprocess.run(
+            [
+                str(SCRIPT),
+                "--plan",
+                "--arm",
+                "overlay",
+                "--fanout",
+                "4",
+                "--retained-reuse",
+                "--retained-reuse-windows",
+                "3",
+            ],
+            cwd=ROOT,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(conflict.returncode, 2)
 
     def test_tree_bytes_observes_but_does_not_follow_symlinks(self) -> None:
         tree_bytes = NAMESPACE["tree_bytes"]
@@ -325,7 +452,9 @@ class HotStateFanoutTests(unittest.TestCase):
     def test_hot_run_command_uses_supported_unscoped_mode(self) -> None:
         build_plan = NAMESPACE["build_plan"]
         command_for_task = NAMESPACE["command_for_task"]
-        plan = build_plan("private-copy", 4, 16)
+        plan = build_plan(
+            "private-copy", 4, 16, retained_reuse_windows=3
+        )
         command, receipt = command_for_task(
             plan,
             Path("/resident"),
@@ -356,6 +485,28 @@ class HotStateFanoutTests(unittest.TestCase):
         self.assertEqual(
             reuse_command[reuse_command.index("--comparison-key") + 1],
             NAMESPACE["comparison_key"](plan, True, retained_reuse=True),
+        )
+        third_reuse_command, _ = command_for_task(
+            plan,
+            Path("/resident"),
+            Path("/task"),
+            Path("/state"),
+            Path("/benchmark.json"),
+            Path("/hot-run.json"),
+            True,
+            retained_reuse=True,
+            retained_reuse_ordinal=3,
+        )
+        self.assertEqual(
+            third_reuse_command[
+                third_reuse_command.index("--comparison-key") + 1
+            ],
+            NAMESPACE["comparison_key"](
+                plan,
+                True,
+                retained_reuse=True,
+                retained_reuse_ordinal=3,
+            ),
         )
 
     def test_ordinary_control_uses_measured_same_worktree_native_mode(self) -> None:
@@ -464,7 +615,9 @@ class HotStateFanoutTests(unittest.TestCase):
         aggregate_task = NAMESPACE["aggregate_task"]
         TaskProcess = NAMESPACE["TaskProcess"]
         ExperimentError = NAMESPACE["ExperimentError"]
-        plan = build_plan("private-copy", 4, 16)
+        plan = build_plan(
+            "private-copy", 4, 16, retained_reuse_windows=3
+        )
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             benchmark_path = root / "benchmark.json"
@@ -526,6 +679,22 @@ class HotStateFanoutTests(unittest.TestCase):
             with self.assertRaises(ExperimentError):
                 aggregate_task(task, plan, True)
             aggregate_task(task, plan, True, retained_reuse=True)
+            hot_run["comparison_key"] = NAMESPACE["comparison_key"](
+                plan,
+                True,
+                retained_reuse=True,
+                retained_reuse_ordinal=2,
+            )
+            hot_run_path.write_text(json.dumps(hot_run), encoding="utf-8")
+            with self.assertRaises(ExperimentError):
+                aggregate_task(task, plan, True, retained_reuse=True)
+            aggregate_task(
+                task,
+                plan,
+                True,
+                retained_reuse=True,
+                retained_reuse_ordinal=2,
+            )
             hot_run["state_preparation"][0]["disposition"] = "seeded"
             hot_run_path.write_text(json.dumps(hot_run), encoding="utf-8")
             with self.assertRaises(ExperimentError):
@@ -649,6 +818,93 @@ class HotStateFanoutTests(unittest.TestCase):
         self.assertEqual(report["cleanup"]["disposition"], "no_state_created")
         self.assertEqual(report["cleanup"]["worktrees_expected"], 0)
         self.assertEqual(report["cleanup"]["failure_count"], 0)
+
+    def test_retained_sequence_reuses_one_lineage_in_ordinal_order(self) -> None:
+        build_plan = NAMESPACE["build_plan"]
+        run_experiment = NAMESPACE["run_experiment"]
+        plan = build_plan(
+            "private-copy", 4, 16, retained_reuse_windows=3
+        )
+        filesystem = {
+            "mount_id": "1",
+            "device_major": 1,
+            "device_minor": 2,
+            "findmnt_device": "1:2",
+            "filesystem_type": "fixture",
+            "fragment_size_bytes": 4096,
+            "total_bytes": 4096,
+            "available_bytes": 4096,
+        }
+        observed: list[tuple[str, bool, int | None]] = []
+
+        def create_worktree(_repository: Path, destination: Path) -> None:
+            destination.mkdir()
+
+        def cohort(*args: object, **kwargs: object) -> tuple[float, list, None, int]:
+            phase = args[6]
+            assert isinstance(phase, str)
+            retained = kwargs.get("retained_reuse", False)
+            ordinal = kwargs.get("retained_reuse_ordinal")
+            assert isinstance(retained, bool)
+            assert ordinal is None or isinstance(ordinal, int)
+            observed.append((phase, retained, ordinal))
+            return float(len(observed)), [], None, 4
+
+        tree = {
+            "entries": 0,
+            "logical_file_bytes": 0,
+            "allocated_file_blocks_bytes": 0,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scratch = root / "scratch"
+            scratch.mkdir()
+            output = root / "result.json"
+            with mock.patch.dict(
+                run_experiment.__globals__,
+                {
+                    "validate_static_contract": mock.Mock(),
+                    "validate_scratch_root": mock.Mock(return_value=scratch),
+                    "validate_cargo_config_absence": mock.Mock(),
+                    "filesystem_observation": mock.Mock(
+                        side_effect=lambda _path: dict(filesystem)
+                    ),
+                    "add_worktree": create_worktree,
+                    "prime_resident": mock.Mock(
+                        return_value={"failure": None}
+                    ),
+                    "apply_fixture": mock.Mock(),
+                    "tree_bytes": mock.Mock(return_value=tree),
+                    "run_cohort": cohort,
+                    "remove_worktree": mock.Mock(),
+                    "git_output": mock.Mock(return_value="0" * 40),
+                },
+            ):
+                exit_code = run_experiment(ROOT, scratch, output, plan)
+            report = json.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            observed,
+            [
+                ("edit", False, None),
+                ("retained-reuse-01", True, 1),
+                ("retained-reuse-02", True, 2),
+                ("retained-reuse-03", True, 3),
+            ],
+        )
+        self.assertEqual(
+            [item["ordinal"] for item in report["retained_reuse_windows"]],
+            [1, 2, 3],
+        )
+        self.assertEqual(
+            report["retained_reuse_window"],
+            report["retained_reuse_windows"][0],
+        )
+        self.assertIn("post_retained_reuse_window", report["storage_filesystem"])
+        self.assertIn(
+            "post_retained_reuse_window_03", report["storage_filesystem"]
+        )
+        self.assertEqual(report["cleanup"]["worktrees_removed"], 5)
 
 
 if __name__ == "__main__":
