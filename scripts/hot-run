@@ -11,11 +11,15 @@ from __future__ import annotations
 import argparse
 import fcntl
 import hashlib
+import json
 import os
+import resource
 import shutil
 import stat
 import subprocess
 import sys
+import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -155,11 +159,91 @@ def rust_tool_environment(
             environment[variable] = os.path.abspath(result.stdout.strip())
 
 
+def write_measurement(
+    destination: Path,
+    elapsed_seconds: float,
+    usage_before: resource.struct_rusage,
+    usage_after: resource.struct_rusage,
+    returncode: int,
+    cache_specs: tuple[CacheSpec, ...],
+    cross_worktree: bool,
+) -> None:
+    destination = Path(os.path.abspath(destination))
+    destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    signal = -returncode if returncode < 0 else None
+    report = {
+        "schema_version": 1,
+        "document_type": "glaeda-hot-run-measurement",
+        "authority": "developer_observation_only",
+        "cross_worktree": cross_worktree,
+        "cache_views": [
+            {"path": os.fspath(spec.path), "mode": spec.mode} for spec in cache_specs
+        ],
+        "elapsed_seconds": round(elapsed_seconds, 6),
+        "user_cpu_seconds": round(usage_after.ru_utime - usage_before.ru_utime, 6),
+        "system_cpu_seconds": round(usage_after.ru_stime - usage_before.ru_stime, 6),
+        "max_rss_kib": usage_after.ru_maxrss,
+        "exit_code": returncode if returncode >= 0 else 128 + signal,
+        "signal": signal,
+    }
+    temporary_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=destination.parent,
+            prefix=f".{destination.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary_name = temporary.name
+            os.chmod(temporary_name, 0o600)
+            json.dump(report, temporary, indent=2, sort_keys=True)
+            temporary.write("\n")
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_name, destination)
+        temporary_name = None
+    finally:
+        if temporary_name is not None:
+            try:
+                os.unlink(temporary_name)
+            except FileNotFoundError:
+                pass
+
+
+def execute(
+    arguments: list[str],
+    cwd: Path | None,
+    environment: dict[str, str] | None,
+    measurement: Path | None,
+    cache_specs: tuple[CacheSpec, ...],
+    cross_worktree: bool,
+) -> int:
+    usage_before = resource.getrusage(resource.RUSAGE_CHILDREN)
+    started = time.monotonic()
+    result = subprocess.run(arguments, cwd=cwd, env=environment, check=False)
+    elapsed = time.monotonic() - started
+    usage_after = resource.getrusage(resource.RUSAGE_CHILDREN)
+    if measurement is not None:
+        write_measurement(
+            measurement,
+            elapsed,
+            usage_before,
+            usage_after,
+            result.returncode,
+            cache_specs,
+            cross_worktree,
+        )
+    return result.returncode if result.returncode >= 0 else 128 - result.returncode
+
+
 def run(
     resident_argument: Path,
     task_argument: Path,
     state_argument: Path | None,
     cache_arguments: list[str],
+    measurement: Path | None,
     command: list[str],
     verbose: bool,
 ) -> int:
@@ -182,8 +266,14 @@ def run(
     )
 
     if resident == task:
-        result = subprocess.run(resolved_command, cwd=task_cwd, check=False)
-        return result.returncode if result.returncode >= 0 else 128 - result.returncode
+        return execute(
+            resolved_command,
+            task_cwd,
+            None,
+            measurement,
+            (),
+            cross_worktree=False,
+        )
 
     bubblewrap = shutil.which("bwrap")
     if bubblewrap is None:
@@ -263,8 +353,14 @@ def run(
                 f"hot-run: trusted task={task.name} resident={resident.name} state={state_name}",
                 file=sys.stderr,
             )
-        result = subprocess.run(arguments, env=environment, check=False)
-        return result.returncode if result.returncode >= 0 else 128 - result.returncode
+        return execute(
+            arguments,
+            None,
+            environment,
+            measurement,
+            cache_specs,
+            cross_worktree=True,
+        )
     finally:
         if lock_fd is not None:
             os.close(lock_fd)
@@ -275,6 +371,11 @@ def main() -> int:
     parser.add_argument("--resident", type=Path, default=ROOT)
     parser.add_argument("--task", type=Path, default=Path.cwd())
     parser.add_argument("--state", type=Path)
+    parser.add_argument(
+        "--measurement",
+        type=Path,
+        help="atomically write one bounded developer-observation JSON measurement",
+    )
     parser.add_argument(
         "--cache",
         action="append",
@@ -296,6 +397,7 @@ def main() -> int:
             arguments.task,
             arguments.state,
             arguments.cache,
+            arguments.measurement,
             command,
             arguments.verbose,
         )

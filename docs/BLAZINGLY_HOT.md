@@ -183,6 +183,11 @@ scripts/hot-run --resident /path/to/node-resident --task /path/to/task \
   --cache node_modules:ro --cache .next:overlay -- pnpm build
 ```
 
+`--measurement result.json` atomically writes one bounded developer observation containing elapsed
+time, user/system CPU time, peak RSS, exit/signal, cross-worktree mode, and relative cache policies.
+It contains no command, output, environment, repository identity, or private path and grants no
+verification or result-reuse authority.
+
 The task and resident must be worktrees of the same Git repository. The resident worktree remains
 the stable compiler pathname, while task source changes remain in the ordinary task worktree and
 write-heavy cache writes land in a task-private state directory. Cache paths must be relative,
