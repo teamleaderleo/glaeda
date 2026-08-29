@@ -4,13 +4,17 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use rustix::process;
+
+use crate::artifact::Sha256Digest;
 
 use super::{
     DescriptorBoundLaunchError, DescriptorBoundLaunchErrorKind, DescriptorBoundTermination,
     LaunchHooks, ReviewedFilesystemIdentity, ReviewedLaunchCredentials, ReviewedLaunchValue,
-    ReviewedLinuxLaunchPlan, execute_reviewed_linux_launch, execute_with_hooks,
+    ReviewedLinuxLaunchPlan, execute_reviewed_linux_launch,
+    execute_reviewed_linux_launch_with_timeout, execute_with_hooks,
 };
 
 static FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -413,6 +417,74 @@ fn output_limit_terminates_the_child_process_group() {
 
     assert_eq!(error.kind(), DescriptorBoundLaunchErrorKind::OutputLimit);
     assert_eq!(error.stage(), "stdout");
+}
+
+#[test]
+fn held_executable_content_must_match_the_reviewed_digest() {
+    let fixture = Fixture::new("content-digest");
+    let working_directory = fixture.directory("cwd");
+    let executable = fixture.copy_binary("true", &["/usr/bin/true", "/bin/true"]);
+    let launch = plan(
+        "descriptor.content_digest",
+        &executable,
+        &working_directory,
+        Vec::new(),
+        BTreeMap::new(),
+    )
+    .with_executable_content_digest(
+        Sha256Digest::parse(&format!("sha256:{}", "0".repeat(64))).unwrap(),
+    );
+
+    let error = execute_reviewed_linux_launch(&launch).expect_err("wrong digest must fail");
+
+    assert_eq!(
+        error.kind(),
+        DescriptorBoundLaunchErrorKind::ExecutableContent
+    );
+    assert_eq!(error.stage(), "executable");
+}
+
+#[test]
+fn wall_clock_limit_terminates_a_silent_process_group() {
+    let fixture = Fixture::new("timeout");
+    let working_directory = fixture.directory("cwd");
+    let executable = fixture.copy_binary("sleep", &["/usr/bin/sleep", "/bin/sleep"]);
+    let launch = plan(
+        "descriptor.timeout",
+        &executable,
+        &working_directory,
+        vec![ReviewedLaunchValue::plain("30")],
+        BTreeMap::new(),
+    );
+    let started = Instant::now();
+
+    let error = execute_reviewed_linux_launch_with_timeout(&launch, Duration::from_millis(50))
+        .expect_err("silent child must time out");
+
+    assert_eq!(error.kind(), DescriptorBoundLaunchErrorKind::Timeout);
+    assert_eq!(error.stage(), "timeout");
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+#[test]
+fn invalid_wall_clock_limits_fail_before_spawn() {
+    let fixture = Fixture::new("timeout-plan");
+    let working_directory = fixture.directory("cwd");
+    let executable = fixture.copy_binary("true", &["/usr/bin/true", "/bin/true"]);
+    let launch = plan(
+        "descriptor.timeout_plan",
+        &executable,
+        &working_directory,
+        Vec::new(),
+        BTreeMap::new(),
+    );
+
+    for invalid in [Duration::ZERO, Duration::from_secs(24 * 60 * 60 + 1)] {
+        let error = execute_reviewed_linux_launch_with_timeout(&launch, invalid)
+            .expect_err("invalid timeout must fail");
+        assert_eq!(error.kind(), DescriptorBoundLaunchErrorKind::Plan);
+        assert_eq!(error.stage(), "timeout");
+    }
 }
 
 #[test]
