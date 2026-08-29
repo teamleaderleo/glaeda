@@ -717,10 +717,23 @@ def prime_resident(
             "failure": failure,
             "benchmark": benchmark,
         }
-    benchmark = read_json(receipt)
-    validate_benchmark_receipt(
-        benchmark, edited=False, expected_cargo_jobs=plan.logical_cpus
-    )
+    benchmark: dict[str, Any] | None = None
+    try:
+        benchmark = read_json(receipt)
+        validate_benchmark_receipt(
+            benchmark, edited=False, expected_cargo_jobs=plan.logical_cpus
+        )
+    except ExperimentError as error:
+        return {
+            "elapsed_seconds": round(elapsed, 6),
+            "maximum_simultaneous_observed": maximum_running,
+            "process_exit_code": task.process.returncode,
+            "semantic_validation": (
+                "rejected" if benchmark is not None else "unobserved"
+            ),
+            "failure": str(error),
+            "benchmark": benchmark,
+        }
     return {
         "elapsed_seconds": round(elapsed, 6),
         "maximum_simultaneous_observed": maximum_running,
@@ -913,15 +926,15 @@ def run_experiment(
                 cleanup_errors.append("experiment worktree cleanup failed")
         if experiment is None:
             cleanup["disposition"] = "no_state_created"
-        elif not cleanup_errors:
-            try:
-                shutil.rmtree(experiment)
-            except OSError:
-                cleanup_errors.append("experiment state cleanup failed")
-        if experiment is not None and not cleanup_errors:
-            cleanup["disposition"] = "removed"
         else:
-            cleanup["disposition"] = "recovery_required"
+            if not cleanup_errors:
+                try:
+                    shutil.rmtree(experiment)
+                except OSError:
+                    cleanup_errors.append("experiment state cleanup failed")
+            cleanup["disposition"] = (
+                "removed" if not cleanup_errors else "recovery_required"
+            )
         cleanup["worktrees_expected"] = len(created_worktrees)
         cleanup["worktrees_removed"] = removed_worktrees
         cleanup["failure_count"] = len(cleanup_errors)

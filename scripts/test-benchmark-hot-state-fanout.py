@@ -291,6 +291,80 @@ class HotStateFanoutTests(unittest.TestCase):
         self.assertEqual(result["failure"], "one or more fan-out tasks failed")
         self.assertIsNone(result["benchmark"])
 
+    def test_rejected_resident_prime_retains_parsed_receipt(self) -> None:
+        build_plan = NAMESPACE["build_plan"]
+        prime_resident = NAMESPACE["prime_resident"]
+        TaskProcess = NAMESPACE["TaskProcess"]
+        plan = build_plan("private-copy", 1, 16)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            receipt = root / "benchmark.json"
+            rejected = valid_benchmark_receipt(16)
+            source = rejected["source"]
+            assert isinstance(source, dict)
+            source["commit"] = "0" * 40
+            receipt.write_text(json.dumps(rejected), encoding="utf-8")
+            task = TaskProcess(
+                "resident", SimpleNamespace(returncode=0), receipt, None
+            )
+            with mock.patch.dict(
+                prime_resident.__globals__,
+                {
+                    "start_task": mock.Mock(return_value=task),
+                    "wait_for_tasks": mock.Mock(return_value=(0.25, None, 1)),
+                },
+            ):
+                result = prime_resident(
+                    plan, root, receipt, root / "tmp"
+                )
+        self.assertEqual(result["process_exit_code"], 0)
+        self.assertEqual(result["semantic_validation"], "rejected")
+        self.assertIsNotNone(result["benchmark"])
+        self.assertEqual(
+            result["failure"],
+            "task semantic receipt does not match the frozen workload",
+        )
+
+    def test_pre_creation_failure_reports_no_state_created(self) -> None:
+        build_plan = NAMESPACE["build_plan"]
+        run_experiment = NAMESPACE["run_experiment"]
+        plan = build_plan("private-copy", 1, 16)
+        filesystem = {
+            "mount_id": "1",
+            "device_major": 1,
+            "device_minor": 2,
+            "findmnt_device": "1:2",
+            "filesystem_type": "fixture",
+            "fragment_size_bytes": 4096,
+            "total_bytes": 4096,
+            "available_bytes": 4096,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scratch = root / "scratch"
+            scratch.mkdir()
+            output = root / "result.json"
+            with mock.patch.dict(
+                run_experiment.__globals__,
+                {
+                    "validate_static_contract": mock.Mock(),
+                    "validate_scratch_root": mock.Mock(return_value=scratch),
+                    "validate_cargo_config_absence": mock.Mock(),
+                    "filesystem_observation": mock.Mock(return_value=filesystem),
+                    "git_output": mock.Mock(return_value="0" * 40),
+                },
+            ), mock.patch.object(
+                run_experiment.__globals__["tempfile"],
+                "mkdtemp",
+                side_effect=OSError("fixture creation failure"),
+            ):
+                exit_code = run_experiment(ROOT, scratch, output, plan)
+            report = json.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(report["cleanup"]["disposition"], "no_state_created")
+        self.assertEqual(report["cleanup"]["worktrees_expected"], 0)
+        self.assertEqual(report["cleanup"]["failure_count"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()
