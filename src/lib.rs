@@ -249,6 +249,8 @@ pub mod personal_worker_operator_store;
 pub mod personal_worker_queue;
 /// Pure bounded projection of durable personal-worker status, queue pages, and job state.
 pub mod personal_worker_read_model;
+/// Pure binding of one repository-owned parallel verifier to one personal-worker attempt/result.
+pub mod personal_worker_repository_result;
 /// Read-only official-runner readiness composed with exact personal-worker evidence.
 pub mod personal_worker_runner_readiness;
 /// Pure sealed authority for the exact personal-worker Linux verification-runtime closure.
