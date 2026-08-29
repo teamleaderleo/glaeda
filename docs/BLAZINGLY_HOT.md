@@ -197,8 +197,11 @@ exposes suitable immutable prepared state without write authority.
 This prototype does not independently prove that the resident parent matches the task source or
 toolchain, or freeze a parent that another process is still mutating. Its ultra-trusted caller must
 supply the right quiesced resident generation and still run a real validator. When a resident
-`target` exists, `target:overlay` remains the zero-configuration default until complete concurrent
-and cold-page-cache measurements justify changing it.
+`target` exists, `target:overlay` remains the zero-configuration default until complete comparable
+measurements justify changing it. The closed fan-out harness can now run its missing bounded
+cold-read control with `--page-cache-treatment resident-target-dontneed`: it fsyncs and advises away
+only the owned resident target's regular-file pages before the measured window, records the exact
+scope, and makes no claim that the advisory operation creates a globally cold machine.
 
 Python and Node projects can explicitly reuse immutable prepared dependencies while keeping build
 output private:

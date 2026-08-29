@@ -189,9 +189,14 @@ filesystem-level observation keeps that distinction visible. A failed task cance
 process groups. The child environment is a closed allowlist: caller target overrides, compiler
 wrappers/flags, and toolchain overrides are excluded; the accepted Cargo home is offline and held
 constant. Setup and byte-observation time remain outside the primary request-to-all-results window
-and are reported separately. Page-cache state is explicitly uncontrolled/resident in this harness;
-the cold-read discriminator is a separate experiment. The harness grants no policy, cache,
-result-reuse, cleanup, or shared-mutation authority.
+and are reported separately. The default page-cache state remains uncontrolled/resident. For
+`overlay` and `private-copy`, `--page-cache-treatment resident-target-dontneed` adds the bounded
+cold-read discriminator: after the resident prime and byte observation, it fsyncs every exact owned
+regular file in resident `target` and issues `POSIX_FADV_DONTNEED` immediately before the edit
+window. The receipt records the file/byte scope and elapsed setup time, while naming this as advice
+rather than claiming a globally cold cache; it never writes `/proc/sys/vm/drop_caches` or touches
+unrelated trees. The harness grants no policy, cache, result-reuse, cleanup, or shared-mutation
+authority.
 
 ### First exact-head matched fan-out control
 

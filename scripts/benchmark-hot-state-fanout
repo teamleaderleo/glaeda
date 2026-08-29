@@ -47,6 +47,14 @@ CARGO_SHA256 = "828980723df339d62434390e9fb8ef8831036583343ae2316b7ab5646b5c1953
 COMPARISON_BASIS_VERSION = 1
 ARMS = ("ordinary-native", "private", "overlay", "private-copy")
 FANOUTS = (1, 4, 8)
+PAGE_CACHE_RESIDENT_WARM = "resident_uncontrolled_warm"
+PAGE_CACHE_RESIDENT_TARGET_DONTNEED = (
+    "resident_target_fsync_fadvise_dontneed"
+)
+PAGE_CACHE_CLI_TREATMENTS = {
+    "resident-uncontrolled-warm": PAGE_CACHE_RESIDENT_WARM,
+    "resident-target-dontneed": PAGE_CACHE_RESIDENT_TARGET_DONTNEED,
+}
 DEFAULT_DEADLINE_SECONDS = 900
 CHILD_UMASK = 0o022
 
@@ -64,6 +72,7 @@ class ExperimentPlan:
     deadline_seconds: int
     available_cpu_ids: tuple[int, ...]
     task_cpu_sets: tuple[tuple[int, ...], ...]
+    page_cache_treatment: str
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -89,7 +98,7 @@ class ExperimentPlan:
                 "cargo_network": "offline",
                 "dependency_cache": "existing_account_cargo_home",
                 "caller_build_flags_wrappers_and_target_dir": "excluded",
-                "page_cache_treatment": "resident_uncontrolled_warm",
+                "page_cache_treatment": self.page_cache_treatment,
             },
             "workload": workload_identity(),
             "comparison": {
@@ -156,7 +165,7 @@ def comparison_basis(plan: ExperimentPlan, edited: bool) -> dict[str, Any]:
             "memory_enforcement": "host_default_unbounded",
             "cargo_incremental": True,
             "cargo_network": "offline",
-            "page_cache_treatment": "resident_uncontrolled_warm",
+            "page_cache_treatment": plan.page_cache_treatment,
             "child_filesystem_creation_umask": f"{CHILD_UMASK:04o}",
         },
     }
@@ -177,6 +186,7 @@ def build_plan(
     logical_cpus: int,
     deadline_seconds: int = DEFAULT_DEADLINE_SECONDS,
     available_cpu_ids: tuple[int, ...] | None = None,
+    page_cache_treatment: str = PAGE_CACHE_RESIDENT_WARM,
 ) -> ExperimentPlan:
     if arm not in ARMS:
         raise ExperimentError("unsupported hot-state arm")
@@ -186,6 +196,15 @@ def build_plan(
         raise ExperimentError("fan-out exceeds the available logical CPU grant")
     if deadline_seconds < 1 or deadline_seconds > 3600:
         raise ExperimentError("deadline must be between 1 and 3600 seconds")
+    if page_cache_treatment not in PAGE_CACHE_CLI_TREATMENTS.values():
+        raise ExperimentError("unsupported page-cache treatment")
+    if (
+        page_cache_treatment == PAGE_CACHE_RESIDENT_TARGET_DONTNEED
+        and arm not in ("overlay", "private-copy")
+    ):
+        raise ExperimentError(
+            "resident-target cold advice requires overlay or private-copy"
+        )
     cpu_ids = (
         tuple(range(logical_cpus))
         if available_cpu_ids is None
@@ -206,6 +225,7 @@ def build_plan(
         deadline_seconds=deadline_seconds,
         available_cpu_ids=cpu_ids,
         task_cpu_sets=task_cpu_sets,
+        page_cache_treatment=page_cache_treatment,
     )
 
 
@@ -952,6 +972,112 @@ def prime_resident(
     }
 
 
+def advise_resident_target_dontneed(target: Path) -> dict[str, Any]:
+    """Flush and advise away file pages for one owned resident target tree.
+
+    POSIX_FADV_DONTNEED is advisory, so the treatment deliberately records what was
+    requested rather than claiming that it proved a globally cold page cache.
+    """
+    if not hasattr(os, "posix_fadvise") or not hasattr(
+        os, "POSIX_FADV_DONTNEED"
+    ):
+        raise ExperimentError("POSIX_FADV_DONTNEED is unavailable")
+    try:
+        root = target.lstat()
+    except FileNotFoundError as error:
+        raise ExperimentError("resident target is absent for cold advice") from error
+    if (
+        not stat.S_ISDIR(root.st_mode)
+        or stat.S_ISLNK(root.st_mode)
+        or root.st_uid != os.getuid()
+    ):
+        raise ExperimentError("resident target is not an owned directory")
+
+    started = time.monotonic()
+    directory_count = 0
+    regular_file_count = 0
+    symlink_count = 0
+    logical_file_bytes = 0
+    allocated_file_blocks_bytes = 0
+    open_flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        open_flags |= os.O_NOFOLLOW
+
+    for directory, child_directories, child_files in os.walk(
+        target, topdown=True, followlinks=False
+    ):
+        directory_path = Path(directory)
+        directory_details = directory_path.lstat()
+        if (
+            not stat.S_ISDIR(directory_details.st_mode)
+            or stat.S_ISLNK(directory_details.st_mode)
+            or directory_details.st_uid != os.getuid()
+        ):
+            raise ExperimentError("resident target contains an unsafe directory")
+        directory_count += 1
+
+        retained_directories: list[str] = []
+        for child_name in child_directories:
+            child = directory_path / child_name
+            child_details = child.lstat()
+            if stat.S_ISLNK(child_details.st_mode):
+                symlink_count += 1
+                continue
+            if (
+                not stat.S_ISDIR(child_details.st_mode)
+                or child_details.st_uid != os.getuid()
+            ):
+                raise ExperimentError("resident target contains an unsafe directory")
+            retained_directories.append(child_name)
+        child_directories[:] = retained_directories
+
+        for child_name in child_files:
+            child = directory_path / child_name
+            before = child.lstat()
+            if stat.S_ISLNK(before.st_mode):
+                symlink_count += 1
+                continue
+            if not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid():
+                raise ExperimentError("resident target contains an unsafe file")
+            descriptor = os.open(child, open_flags)
+            try:
+                held = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(held.st_mode)
+                    or held.st_uid != os.getuid()
+                    or (held.st_dev, held.st_ino, held.st_size)
+                    != (before.st_dev, before.st_ino, before.st_size)
+                ):
+                    raise ExperimentError(
+                        "resident target changed during cold advice"
+                    )
+                os.fsync(descriptor)
+                os.posix_fadvise(
+                    descriptor, 0, 0, os.POSIX_FADV_DONTNEED
+                )
+            finally:
+                os.close(descriptor)
+            regular_file_count += 1
+            logical_file_bytes += held.st_size
+            allocated_file_blocks_bytes += held.st_blocks * 512
+
+    if regular_file_count == 0:
+        raise ExperimentError("resident target has no regular files for cold advice")
+    return {
+        "treatment": PAGE_CACHE_RESIDENT_TARGET_DONTNEED,
+        "scope": "resident_target_regular_files",
+        "disposition": "advised",
+        "writeback": "per_file_fsync",
+        "advice": "POSIX_FADV_DONTNEED",
+        "directories": directory_count,
+        "regular_files": regular_file_count,
+        "symlinks_skipped": symlink_count,
+        "logical_file_bytes": logical_file_bytes,
+        "allocated_file_blocks_bytes": allocated_file_blocks_bytes,
+        "elapsed_seconds": round(time.monotonic() - started, 6),
+    }
+
+
 def remove_worktree(repository: Path, worktree: Path) -> None:
     result = subprocess.run(
         [
@@ -1117,6 +1243,16 @@ def run_experiment(
         setup["pre_window_observation_seconds"] = round(
             time.monotonic() - before_observation_started, 6
         )
+        if plan.page_cache_treatment == PAGE_CACHE_RESIDENT_TARGET_DONTNEED:
+            setup["page_cache_preparation"] = advise_resident_target_dontneed(
+                resident / "target"
+            )
+        else:
+            setup["page_cache_preparation"] = {
+                "treatment": PAGE_CACHE_RESIDENT_WARM,
+                "scope": "none",
+                "disposition": "not_requested",
+            }
         window_elapsed, window_tasks, window_failure, window_maximum = run_cohort(
             plan,
             resident,
@@ -1223,6 +1359,15 @@ def parse_arguments(arguments: list[str]) -> argparse.Namespace:
     parser.add_argument("--arm", choices=ARMS, required=True)
     parser.add_argument("--fanout", choices=FANOUTS, type=int, required=True)
     parser.add_argument("--deadline-seconds", type=int, default=DEFAULT_DEADLINE_SECONDS)
+    parser.add_argument(
+        "--page-cache-treatment",
+        choices=PAGE_CACHE_CLI_TREATMENTS,
+        default="resident-uncontrolled-warm",
+        help=(
+            "retain resident pages or fsync and issue POSIX_FADV_DONTNEED for "
+            "the resident target immediately before the edit window"
+        ),
+    )
     parser.add_argument("--scratch-root", type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument(
@@ -1251,6 +1396,7 @@ def main(arguments: list[str] | None = None) -> int:
             logical_cpus,
             parsed.deadline_seconds,
             available_cpu_ids,
+            PAGE_CACHE_CLI_TREATMENTS[parsed.page_cache_treatment],
         )
         if parsed.plan:
             json.dump(plan.to_json(), sys.stdout, indent=2, sort_keys=True)
