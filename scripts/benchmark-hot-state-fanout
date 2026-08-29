@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import json
 import os
+import pwd
 import shutil
 import signal
 import stat
@@ -29,6 +30,8 @@ HOT_RUN = ROOT / "scripts" / "hot-run"
 BENCHMARK = ROOT / "scripts" / "benchmark-developer-loop"
 FIXTURE = ROOT / "benchmarks" / "developer-loop-doc-edit.patch"
 GIT = Path("/usr/bin/git")
+FINDMNT = Path("/usr/bin/findmnt")
+TASKSET = Path("/usr/bin/taskset")
 
 SOURCE_COMMIT = "b9fa23462420c13a465d635d9694f0c827c1e685"
 SOURCE_TREE = "edd0b7bb9d3e59305c21c69b721b5278d8aff6da"
@@ -52,6 +55,8 @@ class ExperimentPlan:
     logical_cpus: int
     cargo_jobs_per_task: int
     deadline_seconds: int
+    available_cpu_ids: tuple[int, ...]
+    task_cpu_sets: tuple[tuple[int, ...], ...]
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -61,12 +66,23 @@ class ExperimentPlan:
             "arm": self.arm,
             "fanout": self.fanout,
             "resources": {
-                "logical_cpus": self.logical_cpus,
+                "available_logical_cpus": self.logical_cpus,
+                "available_cpu_ids": list(self.available_cpu_ids),
                 "cargo_jobs_per_task": self.cargo_jobs_per_task,
-                "total_declared_cargo_jobs": self.fanout
+                "configured_total_cargo_jobs": self.fanout
                 * self.cargo_jobs_per_task,
+                "task_cpu_sets": [list(cpu_set) for cpu_set in self.task_cpu_sets],
+                "cpu_enforcement": "linux_sched_affinity",
+                "memory_enforcement": "host_default_unbounded",
             },
             "deadline_seconds": self.deadline_seconds,
+            "environment": {
+                "policy": "closed_allowlist",
+                "cargo_network": "offline",
+                "dependency_cache": "existing_account_cargo_home",
+                "caller_build_flags_wrappers_and_target_dir": "excluded",
+                "page_cache_treatment": "resident_uncontrolled_warm",
+            },
             "workload": workload_identity(),
         }
 
@@ -95,6 +111,7 @@ def build_plan(
     fanout: int,
     logical_cpus: int,
     deadline_seconds: int = DEFAULT_DEADLINE_SECONDS,
+    available_cpu_ids: tuple[int, ...] | None = None,
 ) -> ExperimentPlan:
     if arm not in ARMS:
         raise ExperimentError("unsupported hot-state arm")
@@ -104,12 +121,26 @@ def build_plan(
         raise ExperimentError("fan-out exceeds the available logical CPU grant")
     if deadline_seconds < 1 or deadline_seconds > 3600:
         raise ExperimentError("deadline must be between 1 and 3600 seconds")
+    cpu_ids = (
+        tuple(range(logical_cpus))
+        if available_cpu_ids is None
+        else available_cpu_ids
+    )
+    if len(cpu_ids) != logical_cpus or len(set(cpu_ids)) != logical_cpus:
+        raise ExperimentError("available CPU identity is inconsistent")
+    jobs_per_task = max(1, logical_cpus // fanout)
+    task_cpu_sets = tuple(
+        tuple(cpu_ids[index * jobs_per_task : (index + 1) * jobs_per_task])
+        for index in range(fanout)
+    )
     return ExperimentPlan(
         arm=arm,
         fanout=fanout,
         logical_cpus=logical_cpus,
-        cargo_jobs_per_task=max(1, logical_cpus // fanout),
+        cargo_jobs_per_task=jobs_per_task,
         deadline_seconds=deadline_seconds,
+        available_cpu_ids=cpu_ids,
+        task_cpu_sets=task_cpu_sets,
     )
 
 
@@ -142,7 +173,7 @@ def git_output(arguments: list[str], *, cwd: Path) -> str:
 
 
 def validate_static_contract(repository: Path) -> None:
-    for capability in (GIT, HOT_RUN, BENCHMARK, FIXTURE):
+    for capability in (GIT, FINDMNT, TASKSET, HOT_RUN, BENCHMARK, FIXTURE):
         if not capability.is_file():
             raise ExperimentError("required experiment capability is unavailable")
     if git_output(["rev-parse", f"{SOURCE_COMMIT}^{{tree}}"], cwd=repository) != SOURCE_TREE:
@@ -181,6 +212,79 @@ def validate_scratch_root(path: Path, output: Path) -> Path:
     if output == path or path in output.parents:
         raise ExperimentError("output must remain outside the disposable scratch root")
     return path
+
+
+def validate_cargo_config_absence(repository: Path, scratch_root: Path) -> None:
+    source_configs = git_output(
+        [
+            "ls-tree",
+            "-r",
+            "--name-only",
+            SOURCE_COMMIT,
+            "--",
+            ".cargo/config",
+            ".cargo/config.toml",
+        ],
+        cwd=repository,
+    )
+    if source_configs:
+        raise ExperimentError("frozen source contains a Cargo configuration treatment")
+    home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    candidates = {home / ".cargo" / "config", home / ".cargo" / "config.toml"}
+    for ancestor in (scratch_root, *scratch_root.parents):
+        candidates.add(ancestor / ".cargo" / "config")
+        candidates.add(ancestor / ".cargo" / "config.toml")
+    if any(candidate.exists() or candidate.is_symlink() for candidate in candidates):
+        raise ExperimentError("ambient Cargo configuration would change the treatment")
+
+
+def filesystem_observation(path: Path) -> dict[str, Any]:
+    observed = path.stat()
+    filesystem = os.statvfs(path)
+    result = subprocess.run(
+        [
+            os.fspath(FINDMNT),
+            "-n",
+            "-o",
+            "ID,MAJ:MIN,FSTYPE",
+            "--target",
+            os.fspath(path),
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=False,
+    )
+    fields = result.stdout.split()
+    if result.returncode != 0 or len(fields) != 3:
+        raise ExperimentError("scratch filesystem identity is unavailable")
+    fragment_size = filesystem.f_frsize or filesystem.f_bsize
+    return {
+        "mount_id": fields[0],
+        "device_major": os.major(observed.st_dev),
+        "device_minor": os.minor(observed.st_dev),
+        "findmnt_device": fields[1],
+        "filesystem_type": fields[2],
+        "fragment_size_bytes": fragment_size,
+        "total_bytes": filesystem.f_blocks * fragment_size,
+        "available_bytes": filesystem.f_bavail * fragment_size,
+    }
+
+
+def same_filesystem_identity(
+    first: dict[str, Any], second: dict[str, Any]
+) -> bool:
+    fields = (
+        "mount_id",
+        "device_major",
+        "device_minor",
+        "findmnt_device",
+        "filesystem_type",
+        "fragment_size_bytes",
+        "total_bytes",
+    )
+    return all(first[field] == second[field] for field in fields)
 
 
 def add_worktree(repository: Path, destination: Path) -> None:
@@ -233,13 +337,35 @@ def command_for_task(
             f"target:{plan.arm}",
             "--measurement",
             os.fspath(hot_run_receipt),
-            "--resource-profile",
-            f"big-red-{plan.fanout}x{plan.cargo_jobs_per_task}",
             "--",
             *benchmark_command,
         ],
         hot_run_receipt,
     )
+
+
+def closed_environment(cargo_jobs: int, temporary_directory: Path) -> dict[str, str]:
+    home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    cargo_home = home / ".cargo"
+    rustup_home = home / ".rustup"
+    cargo_bin = cargo_home / "bin"
+    for program in (cargo_bin / "cargo", cargo_bin / "rustc", cargo_bin / "rustup"):
+        if not program.is_file() or not os.access(program, os.X_OK):
+            raise ExperimentError("pinned Rust toolchain front door is unavailable")
+    temporary_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return {
+        "HOME": os.fspath(home),
+        "PATH": f"{os.fspath(cargo_bin)}:/usr/bin:/bin",
+        "CARGO_HOME": os.fspath(cargo_home),
+        "RUSTUP_HOME": os.fspath(rustup_home),
+        "CARGO_BUILD_JOBS": str(cargo_jobs),
+        "CARGO_INCREMENTAL": "1",
+        "CARGO_NET_OFFLINE": "true",
+        "CARGO_TERM_COLOR": "never",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "TMPDIR": os.fspath(temporary_directory),
+    }
 
 
 def start_task(
@@ -249,13 +375,16 @@ def start_task(
     benchmark_receipt: Path,
     hot_run_receipt: Path | None,
     cargo_jobs: int,
+    temporary_directory: Path,
+    cpu_set: tuple[int, ...],
 ) -> TaskProcess:
-    environment = os.environ.copy()
-    environment["CARGO_BUILD_JOBS"] = str(cargo_jobs)
+    if not cpu_set:
+        raise ExperimentError("task CPU affinity set is empty")
+    affinity = ",".join(str(cpu) for cpu in cpu_set)
     process = subprocess.Popen(
-        command,
+        [os.fspath(TASKSET), "--cpu-list", affinity, *command],
         cwd=cwd,
-        env=environment,
+        env=closed_environment(cargo_jobs, temporary_directory),
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -359,7 +488,11 @@ def validate_benchmark_receipt(
 
 def tree_bytes(path: Path) -> dict[str, int]:
     if not path.exists():
-        return {"entries": 0, "logical": 0, "allocated": 0}
+        return {
+            "entries": 0,
+            "logical_file_bytes": 0,
+            "allocated_file_blocks_bytes": 0,
+        }
     root_observation = path.lstat()
     logical = root_observation.st_size
     allocated = root_observation.st_blocks * 512
@@ -374,7 +507,11 @@ def tree_bytes(path: Path) -> dict[str, int]:
             entries += 1
             logical += observed.st_size
             allocated += observed.st_blocks * 512
-    return {"entries": entries, "logical": logical, "allocated": allocated}
+    return {
+        "entries": entries,
+        "logical_file_bytes": logical,
+        "allocated_file_blocks_bytes": allocated,
+    }
 
 
 def aggregate_task(
@@ -383,12 +520,45 @@ def aggregate_task(
     benchmark = read_json(task.benchmark_receipt)
     validate_benchmark_receipt(benchmark, edited, plan.cargo_jobs_per_task)
     hot_run = read_json(task.hot_run_receipt) if task.hot_run_receipt else None
+    expected_preparation: list[dict[str, Any]] = []
+    if plan.arm == "private-copy":
+        expected_preparation = [
+            {
+                "path": "target",
+                "mode": "private-copy",
+                "disposition": "seeded",
+            }
+        ]
+    raw_preparation = [] if hot_run is None else hot_run.get("state_preparation")
+    observed_preparation = raw_preparation if isinstance(raw_preparation, list) else None
+    normalized_preparation = [
+        {
+            "path": item.get("path"),
+            "mode": item.get("mode"),
+            "disposition": item.get("disposition"),
+        }
+        for item in observed_preparation or []
+        if isinstance(item, dict)
+    ]
     if hot_run is not None and (
         hot_run.get("document_type") != "glaeda-hot-run-measurement"
         or hot_run.get("exit_code") != 0
         or hot_run.get("completion_reason") != "exited"
+        or hot_run.get("cross_worktree") is not True
+        or hot_run.get("resource_profile") is not None
         or hot_run.get("cache_views")
         != [{"path": "target", "mode": plan.arm}]
+        or normalized_preparation != expected_preparation
+        or observed_preparation is None
+        or not all(isinstance(item, dict) for item in observed_preparation)
+        or (
+            plan.arm == "private-copy"
+            and not all(
+                isinstance(item.get("elapsed_seconds"), (int, float))
+                and item["elapsed_seconds"] > 0
+                for item in observed_preparation
+            )
+        )
     ):
         raise ExperimentError("hot-run receipt does not match the declared arm")
     return {
@@ -436,6 +606,7 @@ def run_cohort(
     resident: Path,
     tasks: list[Path],
     states: list[Path],
+    temporary_directories: list[Path],
     receipts: Path,
     phase: str,
     edited: bool,
@@ -443,7 +614,8 @@ def run_cohort(
     processes: list[TaskProcess] = []
     started = time.monotonic()
     try:
-        for index, (task, state_path) in enumerate(zip(tasks, states, strict=True), 1):
+        cohort = zip(tasks, states, temporary_directories, strict=True)
+        for index, (task, state_path, temporary_directory) in enumerate(cohort, 1):
             task_id = f"task-{index:02d}"
             benchmark_receipt = receipts / f"{phase}-{task_id}-benchmark.json"
             hot_run_receipt = receipts / f"{phase}-{task_id}-hot-run.json"
@@ -463,6 +635,8 @@ def run_cohort(
                     benchmark_receipt,
                     hot_receipt,
                     plan.cargo_jobs_per_task,
+                    temporary_directory,
+                    plan.task_cpu_sets[index - 1],
                 )
             )
         elapsed, failure, maximum_running = wait_for_tasks(
@@ -478,37 +652,58 @@ def run_cohort(
             failure,
             maximum_running,
         )
+    try:
+        accepted = [aggregate_task(task, plan, edited) for task in processes]
+    except ExperimentError as error:
+        return (
+            elapsed,
+            [aggregate_failed_task(task, plan, edited) for task in processes],
+            str(error),
+            maximum_running,
+        )
     return (
         elapsed,
-        [aggregate_task(task, plan, edited) for task in processes],
+        accepted,
         None,
         maximum_running,
     )
 
 
 def prime_resident(
-    plan: ExperimentPlan, resident: Path, receipt: Path
+    plan: ExperimentPlan,
+    resident: Path,
+    receipt: Path,
+    temporary_directory: Path,
 ) -> dict[str, Any]:
-    environment = os.environ.copy()
-    environment["CARGO_BUILD_JOBS"] = str(plan.logical_cpus)
     started = time.monotonic()
-    result = subprocess.run(
+    task = start_task(
+        "resident",
         [os.fspath(BENCHMARK), "--output", os.fspath(receipt)],
-        cwd=resident,
-        env=environment,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=False,
+        resident,
+        receipt,
+        None,
+        plan.logical_cpus,
+        temporary_directory,
+        plan.available_cpu_ids,
     )
-    elapsed = time.monotonic() - started
-    if result.returncode != 0:
+    try:
+        elapsed, failure, maximum_running = wait_for_tasks(
+            [task], plan.deadline_seconds, started
+        )
+    except BaseException:
+        terminate_tasks([task])
+        raise
+    if failure is not None:
         raise ExperimentError("resident parent preparation failed")
     benchmark = read_json(receipt)
     validate_benchmark_receipt(
         benchmark, edited=False, expected_cargo_jobs=plan.logical_cpus
     )
-    return {"elapsed_seconds": round(elapsed, 6), "benchmark": benchmark}
+    return {
+        "elapsed_seconds": round(elapsed, 6),
+        "maximum_simultaneous_observed": maximum_running,
+        "benchmark": benchmark,
+    }
 
 
 def remove_worktree(repository: Path, worktree: Path) -> None:
@@ -559,6 +754,10 @@ def run_experiment(
 ) -> int:
     validate_static_contract(repository)
     scratch_root = validate_scratch_root(scratch_root, output)
+    validate_cargo_config_absence(repository, scratch_root)
+    storage_filesystem: dict[str, Any] = {
+        "before": filesystem_observation(scratch_root)
+    }
     experiment = Path(
         tempfile.mkdtemp(
             prefix=f"glaeda-hot-state-{plan.arm}-{plan.fanout}.", dir=scratch_root
@@ -568,11 +767,15 @@ def run_experiment(
     worktrees = experiment / "worktrees"
     states_root = experiment / "states"
     receipts = experiment / "receipts"
-    for directory in (worktrees, states_root, receipts):
+    temporary_root = experiment / "tmp"
+    for directory in (worktrees, states_root, receipts, temporary_root):
         directory.mkdir(mode=0o700)
     resident = worktrees / "resident"
     tasks = [worktrees / f"task-{index:02d}" for index in range(1, plan.fanout + 1)]
     states = [states_root / f"task-{index:02d}" for index in range(1, plan.fanout + 1)]
+    temporary_directories = [
+        temporary_root / f"task-{index:02d}" for index in range(1, plan.fanout + 1)
+    ]
     created_worktrees: list[Path] = []
     setup: dict[str, Any] = {}
     window: dict[str, Any] = {}
@@ -588,7 +791,10 @@ def run_experiment(
 
         if plan.arm in ("overlay", "private-copy"):
             setup["resident_prime"] = prime_resident(
-                plan, resident, receipts / "resident-prime.json"
+                plan,
+                resident,
+                receipts / "resident-prime.json",
+                temporary_root / "resident",
             )
         else:
             (resident / "target").mkdir(mode=0o700)
@@ -597,6 +803,7 @@ def run_experiment(
                 resident,
                 tasks,
                 states,
+                temporary_directories,
                 receipts,
                 "prime",
                 edited=False,
@@ -627,6 +834,7 @@ def run_experiment(
             resident,
             tasks,
             states,
+            temporary_directories,
             receipts,
             "edit",
             edited=True,
@@ -646,6 +854,11 @@ def run_experiment(
         window["post_window_observation_seconds"] = round(
             time.monotonic() - post_observation_started, 6
         )
+        storage_filesystem["post_window"] = filesystem_observation(scratch_root)
+        if not same_filesystem_identity(
+            storage_filesystem["before"], storage_filesystem["post_window"]
+        ):
+            raise ExperimentError("scratch filesystem identity changed during the window")
         if window_failure is not None:
             raise ExperimentError(window_failure)
         result = "succeeded"
@@ -663,10 +876,6 @@ def run_experiment(
                 removed_worktrees += 1
             except (ExperimentError, OSError):
                 cleanup_errors.append("experiment worktree cleanup failed")
-        try:
-            run_checked([os.fspath(GIT), "worktree", "prune"], cwd=repository)
-        except (ExperimentError, OSError):
-            cleanup_errors.append("experiment worktree prune failed")
         if not cleanup_errors:
             try:
                 shutil.rmtree(experiment)
@@ -680,6 +889,18 @@ def run_experiment(
         cleanup["worktrees_removed"] = removed_worktrees
         cleanup["failure_count"] = len(cleanup_errors)
         cleanup["elapsed_seconds"] = round(time.monotonic() - cleanup_started, 6)
+        try:
+            storage_filesystem["after_cleanup"] = filesystem_observation(scratch_root)
+            if not same_filesystem_identity(
+                storage_filesystem["before"], storage_filesystem["after_cleanup"]
+            ):
+                cleanup_errors.append("scratch filesystem identity changed during cleanup")
+                cleanup["disposition"] = "recovery_required"
+                cleanup["failure_count"] = len(cleanup_errors)
+        except (ExperimentError, OSError):
+            cleanup_errors.append("scratch filesystem cleanup observation failed")
+            cleanup["disposition"] = "recovery_required"
+            cleanup["failure_count"] = len(cleanup_errors)
         if cleanup_errors:
             result = "failed"
             cleanup_failure = "; ".join(cleanup_errors)
@@ -698,6 +919,7 @@ def run_experiment(
         },
         "setup": setup,
         "window": window,
+        "storage_filesystem": storage_filesystem,
         "cleanup": cleanup,
         "result": result,
         "failure": failure,
@@ -721,12 +943,24 @@ def parse_arguments(arguments: list[str]) -> argparse.Namespace:
     return parser.parse_args(arguments)
 
 
+def interrupt_experiment(_signal: int, _frame: object) -> None:
+    raise KeyboardInterrupt
+
+
 def main(arguments: list[str] | None = None) -> int:
     parsed = parse_arguments(sys.argv[1:] if arguments is None else arguments)
-    logical_cpus = os.cpu_count() or 1
+    if hasattr(os, "sched_getaffinity"):
+        available_cpu_ids = tuple(sorted(os.sched_getaffinity(0)))
+    else:
+        available_cpu_ids = tuple(range(os.cpu_count() or 1))
+    logical_cpus = len(available_cpu_ids)
     try:
         plan = build_plan(
-            parsed.arm, parsed.fanout, logical_cpus, parsed.deadline_seconds
+            parsed.arm,
+            parsed.fanout,
+            logical_cpus,
+            parsed.deadline_seconds,
+            available_cpu_ids,
         )
         if parsed.plan:
             json.dump(plan.to_json(), sys.stdout, indent=2, sort_keys=True)
@@ -734,7 +968,11 @@ def main(arguments: list[str] | None = None) -> int:
             return 0
         if parsed.scratch_root is None or parsed.output is None:
             raise ExperimentError("physical execution requires --scratch-root and --output")
-        return run_experiment(ROOT, parsed.scratch_root, parsed.output, plan)
+        previous_handler = signal.signal(signal.SIGTERM, interrupt_experiment)
+        try:
+            return run_experiment(ROOT, parsed.scratch_root, parsed.output, plan)
+        finally:
+            signal.signal(signal.SIGTERM, previous_handler)
     except ExperimentError as error:
         print(f"error: {error}", file=sys.stderr)
         return 2

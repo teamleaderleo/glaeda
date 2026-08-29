@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -15,14 +16,43 @@ SCRIPT = ROOT / "scripts" / "benchmark-hot-state-fanout"
 NAMESPACE = runpy.run_path(str(SCRIPT), run_name="hot_state_fanout_test")
 
 
+def valid_benchmark_receipt(jobs: int = 4) -> dict[str, object]:
+    return {
+        "document_type": "glaeda-developer-loop-benchmark",
+        "benchmark_id": "resident-eligible-rust-edit-v1",
+        "source": {
+            "commit": NAMESPACE["SOURCE_COMMIT"],
+            "tree": NAMESPACE["SOURCE_TREE"],
+            "tracked_workload_dirty": True,
+            "tracked_workload_diff_digest": NAMESPACE["FIXTURE_DIGEST"],
+        },
+        "toolchain": {
+            "rustc": "rustc 1.97.1 (fixture)",
+            "cargo": "cargo 1.97.1 (fixture)",
+        },
+        "resources": {"cargo_build_jobs": str(jobs)},
+        "workload": {
+            "expected_executed_test_count": 1343,
+            "excluded_host_fact_test_count": 16,
+        },
+        "result": {"exit_code": 0},
+    }
+
+
 class HotStateFanoutTests(unittest.TestCase):
-    def test_closed_plans_divide_the_host_grant(self) -> None:
+    def test_closed_plans_assign_disjoint_cpu_affinity(self) -> None:
         build_plan = NAMESPACE["build_plan"]
         for fanout, jobs in ((1, 16), (4, 4), (8, 2)):
             plan = build_plan("private-copy", fanout, 16)
             self.assertEqual(plan.cargo_jobs_per_task, jobs)
             value = plan.to_json()
-            self.assertEqual(value["resources"]["total_declared_cargo_jobs"], 16)
+            self.assertEqual(value["resources"]["configured_total_cargo_jobs"], 16)
+            flattened = [
+                cpu
+                for cpu_set in value["resources"]["task_cpu_sets"]
+                for cpu in cpu_set
+            ]
+            self.assertEqual(len(flattened), len(set(flattened)))
             self.assertEqual(value["workload"]["expected_executed_test_count"], 1343)
 
     def test_unknown_arms_fanout_and_deadlines_refuse(self) -> None:
@@ -64,8 +94,74 @@ class HotStateFanoutTests(unittest.TestCase):
             (root / "nested" / "small").write_bytes(b"x")
             observation = tree_bytes(root)
             self.assertEqual(observation["entries"], 5)
-            self.assertGreaterEqual(observation["logical"], 4097)
-            self.assertGreater(observation["allocated"], 0)
+            self.assertGreaterEqual(observation["logical_file_bytes"], 4097)
+            self.assertGreater(observation["allocated_file_blocks_bytes"], 0)
+
+    def test_filesystem_observation_binds_mount_and_device(self) -> None:
+        filesystem_observation = NAMESPACE["filesystem_observation"]
+        same_filesystem_identity = NAMESPACE["same_filesystem_identity"]
+        with tempfile.TemporaryDirectory() as directory:
+            first = filesystem_observation(Path(directory))
+            second = filesystem_observation(Path(directory))
+        self.assertTrue(same_filesystem_identity(first, second))
+        self.assertTrue(first["filesystem_type"])
+        self.assertEqual(
+            first["findmnt_device"],
+            f"{first['device_major']}:{first['device_minor']}",
+        )
+
+    def test_closed_environment_excludes_caller_build_injection(self) -> None:
+        closed_environment = NAMESPACE["closed_environment"]
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ,
+            {
+                "CARGO_TARGET_DIR": "/foreign-target",
+                "RUSTC_WRAPPER": "/foreign-wrapper",
+                "RUSTFLAGS": "--cfg foreign",
+                "RUSTUP_TOOLCHAIN": "foreign",
+            },
+        ):
+            environment = closed_environment(4, Path(directory) / "tmp")
+        for variable in (
+            "CARGO_TARGET_DIR",
+            "RUSTC_WRAPPER",
+            "RUSTFLAGS",
+            "RUSTUP_TOOLCHAIN",
+        ):
+            self.assertNotIn(variable, environment)
+        self.assertEqual(environment["CARGO_BUILD_JOBS"], "4")
+        self.assertEqual(environment["CARGO_INCREMENTAL"], "1")
+        self.assertEqual(environment["CARGO_NET_OFFLINE"], "true")
+
+    def test_ambient_cargo_configuration_refuses(self) -> None:
+        validate = NAMESPACE["validate_cargo_config_absence"]
+        ExperimentError = NAMESPACE["ExperimentError"]
+        with tempfile.TemporaryDirectory() as directory:
+            scratch = Path(directory)
+            validate(ROOT, scratch)
+            cargo = scratch / ".cargo"
+            cargo.mkdir()
+            (cargo / "config.toml").write_text(
+                '[build]\ntarget-dir = "/foreign"\n', encoding="utf-8"
+            )
+            with self.assertRaises(ExperimentError):
+                validate(ROOT, scratch)
+
+    def test_hot_run_command_uses_supported_unscoped_mode(self) -> None:
+        build_plan = NAMESPACE["build_plan"]
+        command_for_task = NAMESPACE["command_for_task"]
+        plan = build_plan("private-copy", 4, 16)
+        command, receipt = command_for_task(
+            plan,
+            Path("/resident"),
+            Path("/task"),
+            Path("/state"),
+            Path("/benchmark.json"),
+            Path("/hot-run.json"),
+        )
+        self.assertNotIn("--resource-profile", command)
+        self.assertEqual(command[command.index("--cache") + 1], "target:private-copy")
+        self.assertEqual(receipt, Path("/hot-run.json"))
 
     def test_failed_member_cancels_a_running_sibling(self) -> None:
         TaskProcess = NAMESPACE["TaskProcess"]
@@ -94,33 +190,74 @@ class HotStateFanoutTests(unittest.TestCase):
         self.assertGreaterEqual(maximum_running, 1)
         self.assertIsNotNone(sibling.returncode)
 
+    def test_started_task_runs_inside_declared_affinity(self) -> None:
+        start_task = NAMESPACE["start_task"]
+        wait_for_tasks = NAMESPACE["wait_for_tasks"]
+        available = tuple(sorted(os.sched_getaffinity(0)))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            task = start_task(
+                "task-01",
+                ["/usr/bin/true"],
+                root,
+                root / "unused.json",
+                None,
+                1,
+                root / "tmp",
+                (available[0],),
+            )
+            _, failure, maximum_running = wait_for_tasks([task], 5)
+        self.assertIsNone(failure)
+        self.assertEqual(task.process.returncode, 0)
+        self.assertIn(maximum_running, (0, 1))
+
     def test_receipt_validation_binds_source_edit_and_result(self) -> None:
         validate = NAMESPACE["validate_benchmark_receipt"]
         ExperimentError = NAMESPACE["ExperimentError"]
-        receipt = {
-            "document_type": "glaeda-developer-loop-benchmark",
-            "benchmark_id": "resident-eligible-rust-edit-v1",
-            "source": {
-                "commit": NAMESPACE["SOURCE_COMMIT"],
-                "tree": NAMESPACE["SOURCE_TREE"],
-                "tracked_workload_dirty": True,
-                "tracked_workload_diff_digest": NAMESPACE["FIXTURE_DIGEST"],
-            },
-            "toolchain": {
-                "rustc": "rustc 1.97.1 (fixture)",
-                "cargo": "cargo 1.97.1 (fixture)",
-            },
-            "resources": {"cargo_build_jobs": "4"},
-            "workload": {
-                "expected_executed_test_count": 1343,
-                "excluded_host_fact_test_count": 16,
-            },
-            "result": {"exit_code": 0},
-        }
+        receipt = valid_benchmark_receipt()
         validate(receipt, True, 4)
-        receipt["result"]["exit_code"] = 1
+        result = receipt["result"]
+        assert isinstance(result, dict)
+        result["exit_code"] = 1
         with self.assertRaises(ExperimentError):
             validate(receipt, True, 4)
+
+    def test_private_copy_acceptance_requires_first_use_seed(self) -> None:
+        build_plan = NAMESPACE["build_plan"]
+        aggregate_task = NAMESPACE["aggregate_task"]
+        TaskProcess = NAMESPACE["TaskProcess"]
+        ExperimentError = NAMESPACE["ExperimentError"]
+        plan = build_plan("private-copy", 4, 16)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            benchmark_path = root / "benchmark.json"
+            hot_run_path = root / "hot-run.json"
+            benchmark_path.write_text(
+                json.dumps(valid_benchmark_receipt()), encoding="utf-8"
+            )
+            hot_run = {
+                "document_type": "glaeda-hot-run-measurement",
+                "exit_code": 0,
+                "completion_reason": "exited",
+                "cross_worktree": True,
+                "resource_profile": None,
+                "cache_views": [{"path": "target", "mode": "private-copy"}],
+                "state_preparation": [
+                    {
+                        "path": "target",
+                        "mode": "private-copy",
+                        "disposition": "seeded",
+                        "elapsed_seconds": 0.25,
+                    }
+                ],
+            }
+            hot_run_path.write_text(json.dumps(hot_run), encoding="utf-8")
+            task = TaskProcess("task-01", None, benchmark_path, hot_run_path)
+            aggregate_task(task, plan, True)
+            hot_run["state_preparation"][0]["disposition"] = "reused"
+            hot_run_path.write_text(json.dumps(hot_run), encoding="utf-8")
+            with self.assertRaises(ExperimentError):
+                aggregate_task(task, plan, True)
 
 
 if __name__ == "__main__":

@@ -141,10 +141,13 @@ The first hosted distributions should be appended here after repeated unchanged 
 
 `scripts/benchmark-hot-state-fanout` runs one fixed physical window for the frozen Rust workload.
 It has four closed arms—`ordinary-native`, `private`, `overlay`, and `private-copy`—and accepts only
-fan-out widths 1, 4, or 8. It divides the host's logical CPU grant across simultaneous tasks, primes
-the state required by the selected treatment, applies the exact checked-in edit to every task,
-starts every validator in one bounded window, and always attempts to remove its worktrees and state.
-It cannot accept an arbitrary command, repository, commit, fixture, cache path, or validator.
+fan-out widths 1, 4, or 8. It assigns disjoint Linux CPU-affinity sets from the harness's current
+affinity, configures Cargo jobs to match each set, primes the state required by the selected
+treatment, applies the exact checked-in edit to every task, starts every validator in one bounded
+window, and always attempts to remove its exact worktrees and state. This is CPU enforcement, not a
+memory reservation; per-task memory remains host-default and is reported from the child receipts.
+The harness cannot accept an arbitrary command, repository, commit, fixture, cache path, or
+validator.
 
 Inspect the exact plan without mutation:
 
@@ -163,8 +166,14 @@ scripts/benchmark-hot-state-fanout \
 ```
 
 The aggregate observation binds the harness commit/tree, frozen source/tree/edit, arm, fan-out,
-per-task Cargo grant, setup and complete-window latency, every semantic and `hot-run` receipt,
-logical/allocated bytes before and after the window, and cleanup disposition. A failed task cancels
-the remaining process groups. Setup and byte-observation time remain outside the primary
-request-to-all-results window and are reported separately. The harness grants no policy, cache,
+exact CPU-affinity sets, per-task Cargo concurrency, setup and complete-window latency, every
+semantic and `hot-run` receipt, mount/device/filesystem identity, backing-filesystem free bytes,
+per-tree logical bytes and summed allocated file blocks before/after the window, and cleanup
+disposition. Summed `st_blocks` are not unique physical usage on reflink-capable filesystems; the
+filesystem-level observation keeps that distinction visible. A failed task cancels the remaining
+process groups. The child environment is a closed allowlist: caller target overrides, compiler
+wrappers/flags, and toolchain overrides are excluded; the accepted Cargo home is offline and held
+constant. Setup and byte-observation time remain outside the primary request-to-all-results window
+and are reported separately. Page-cache state is explicitly uncontrolled/resident in this harness;
+the cold-read discriminator is a separate experiment. The harness grants no policy, cache,
 result-reuse, cleanup, or shared-mutation authority.
