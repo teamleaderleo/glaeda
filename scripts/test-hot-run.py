@@ -56,6 +56,60 @@ class HotRunTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 17)
 
+    def test_front_door_symlink_fallback_resolves_implementation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            linked_front_door = fixture / "hot-run"
+            linked_front_door.symlink_to(HOT_RUN)
+            measurement = fixture / "measurement.json"
+
+            result = subprocess.run(
+                [
+                    os.fspath(linked_front_door),
+                    "--resident",
+                    os.fspath(ROOT),
+                    "--task",
+                    os.fspath(ROOT),
+                    "--measurement",
+                    os.fspath(measurement),
+                    "--",
+                    "/bin/true",
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            report = json.loads(measurement.read_text(encoding="utf-8"))
+            self.assertEqual(report["exit_code"], 0)
+            self.assertFalse(report["cross_worktree"])
+
+    def test_front_door_fallback_preserves_relative_option_context(self) -> None:
+        result = subprocess.run(
+            [
+                os.fspath(HOT_RUN),
+                "--resident",
+                "..",
+                "--task",
+                "..",
+                "--",
+                "./scripts/hot-run-python",
+                "--help",
+            ],
+            cwd=ROOT / "scripts",
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Run an ultra-trusted task worktree", result.stdout)
+
     def test_front_door_falls_back_for_observed_work(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = Path(directory)
