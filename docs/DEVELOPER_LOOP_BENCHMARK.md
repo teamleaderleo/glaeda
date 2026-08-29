@@ -54,6 +54,11 @@ bytes after the base prime. After the edit it occupied 2,716,690,227 logical byt
 three final lineages had 2,716,690,227–2,716,690,270 logical bytes and exactly 2,719,531,008
 allocated bytes.
 
+After recording the receipts, all three route-owned worktrees removed in less than 0.01 seconds
+each at the timer's precision. Removing the external state-and-receipt root, including about
+8,158,593,024 allocated bytes across the three final lineages, took 0.49 seconds of wall time,
+0.00 seconds user CPU, 0.48 seconds system CPU, and 2,004 KiB peak RSS. No mount survived cleanup.
+
 This settles the ext4 choice more narrowly than “private is faster.” An empty private lineage pays
 the full cold compile once and is appropriate only when a task/agent will retain it across enough
 useful edits. A short-lived task should inherit a warmed Overlay lower. Reflink-capable storage can
