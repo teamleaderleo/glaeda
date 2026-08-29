@@ -42,6 +42,12 @@ class CacheSpec:
     mode: str
 
 
+@dataclass(frozen=True)
+class RuntimeContract:
+    runtime_id: str
+    program_sha256: str
+
+
 def git_path(root: Path, argument: str) -> Path:
     git = shutil.which("git")
     if git is None:
@@ -112,6 +118,17 @@ def default_state_root(
     return cache_home / "glaeda" / "hot-run" / identity
 
 
+def runtime_state_root(base: Path, runtime: RuntimeContract | None) -> Path:
+    if runtime is None:
+        return base
+    identity = hashlib.sha256(
+        runtime.runtime_id.encode("ascii")
+        + b"\0"
+        + runtime.program_sha256.encode("ascii")
+    ).hexdigest()
+    return base / f"runtime-{identity}"
+
+
 def ensure_private_directory(path: Path) -> None:
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
     details = path.lstat()
@@ -138,6 +155,48 @@ def resolve_program(command: list[str], task: Path) -> list[str]:
     if not program.is_file() or not os.access(program, os.X_OK):
         raise RuntimeError(f"command is not executable: {requested}")
     return [os.fspath(program), *command[1:]]
+
+
+def parse_runtime_contract(
+    runtime_id: str | None, program_sha256: str | None
+) -> RuntimeContract | None:
+    if (runtime_id is None) != (program_sha256 is None):
+        raise RuntimeError("runtime ID and executable digest must be supplied together")
+    if runtime_id is None or program_sha256 is None:
+        return None
+    valid_id = (
+        0 < len(runtime_id) <= 96
+        and runtime_id.isascii()
+        and runtime_id[0].isalnum()
+        and all(character.isalnum() or character in "._-" for character in runtime_id)
+        and ".." not in runtime_id
+    )
+    digest_value = program_sha256.removeprefix("sha256:")
+    valid_digest = (
+        program_sha256.startswith("sha256:")
+        and len(digest_value) == 64
+        and all(character in "0123456789abcdef" for character in digest_value)
+    )
+    if not valid_id:
+        raise RuntimeError("runtime ID must be bounded safe ASCII")
+    if not valid_digest:
+        raise RuntimeError("runtime executable digest must be canonical SHA-256")
+    return RuntimeContract(runtime_id, program_sha256)
+
+
+def verify_runtime_contract(
+    contract: RuntimeContract | None, program: Path
+) -> RuntimeContract | None:
+    if contract is None:
+        return None
+    digest = hashlib.sha256()
+    with program.open("rb") as executable:
+        while chunk := executable.read(1024 * 1024):
+            digest.update(chunk)
+    observed = f"sha256:{digest.hexdigest()}"
+    if observed != contract.program_sha256:
+        raise RuntimeError("runtime executable content does not match declared digest")
+    return contract
 
 
 def positive_seconds(value: str) -> float:
@@ -190,6 +249,7 @@ def write_measurement(
     completion_reason: str,
     timeout_seconds: float | None,
     cache_specs: tuple[CacheSpec, ...],
+    runtime_contract: RuntimeContract | None,
     cross_worktree: bool,
     resource_profile: str | None,
 ) -> None:
@@ -205,6 +265,14 @@ def write_measurement(
         "cache_views": [
             {"path": os.fspath(spec.path), "mode": spec.mode} for spec in cache_specs
         ],
+        "runtime": (
+            {
+                "id": runtime_contract.runtime_id,
+                "program_sha256": runtime_contract.program_sha256,
+            }
+            if runtime_contract is not None
+            else None
+        ),
         "elapsed_seconds": round(elapsed_seconds, 6),
         "user_cpu_seconds": (
             round(user_cpu_seconds, 6) if user_cpu_seconds is not None else None
@@ -280,6 +348,7 @@ def execute(
     environment: dict[str, str] | None,
     measurement: Path | None,
     cache_specs: tuple[CacheSpec, ...],
+    runtime_contract: RuntimeContract | None,
     cross_worktree: bool,
     resource_profile: str | None,
     timeout_seconds: float | None,
@@ -421,6 +490,7 @@ def execute(
             completion_reason,
             timeout_seconds,
             cache_specs,
+            runtime_contract,
             cross_worktree,
             resource_profile,
         )
@@ -432,6 +502,8 @@ def run(
     task_argument: Path,
     state_argument: Path | None,
     cache_arguments: list[str],
+    runtime_id: str | None,
+    runtime_sha256: str | None,
     measurement: Path | None,
     resource_profile: str | None,
     timeout_seconds: float | None,
@@ -450,6 +522,10 @@ def run(
         raise RuntimeError("task working directory is outside its Git worktree") from error
     stable_cwd = resident / relative_cwd
     resolved_command = resolve_program(command, task_cwd)
+    runtime_contract = verify_runtime_contract(
+        parse_runtime_contract(runtime_id, runtime_sha256),
+        Path(resolved_command[0]),
+    )
     cache_specs = (
         parse_cache_specs(cache_arguments)
         if cache_arguments
@@ -463,6 +539,7 @@ def run(
             None,
             measurement,
             (),
+            runtime_contract,
             cross_worktree=False,
             resource_profile=resource_profile,
             timeout_seconds=timeout_seconds,
@@ -472,11 +549,12 @@ def run(
     if bubblewrap is None:
         raise RuntimeError("required capability bwrap is unavailable")
     has_overlay = any(spec.mode == "overlay" for spec in cache_specs)
-    state_root = Path(
+    state_base = Path(
         os.path.abspath(
             state_argument or default_state_root(resident, task, cache_specs)
         )
     )
+    state_root = runtime_state_root(state_base, runtime_contract)
     if has_overlay:
         ensure_private_directory(state_root)
 
@@ -552,6 +630,7 @@ def run(
             environment,
             measurement,
             cache_specs,
+            runtime_contract,
             cross_worktree=True,
             resource_profile=resource_profile,
             timeout_seconds=timeout_seconds,
@@ -566,6 +645,15 @@ def main() -> int:
     parser.add_argument("--resident", type=Path, default=ROOT)
     parser.add_argument("--task", type=Path, default=Path.cwd())
     parser.add_argument("--state", type=Path)
+    parser.add_argument(
+        "--runtime-id",
+        help="bounded public identity for the command's exact runtime generation",
+    )
+    parser.add_argument(
+        "--runtime-sha256",
+        metavar="sha256:HEX",
+        help="required SHA-256 of the resolved command executable",
+    )
     parser.add_argument(
         "--measurement",
         type=Path,
@@ -603,6 +691,8 @@ def main() -> int:
             arguments.task,
             arguments.state,
             arguments.cache,
+            arguments.runtime_id,
+            arguments.runtime_sha256,
             arguments.measurement,
             arguments.resource_profile,
             arguments.timeout,

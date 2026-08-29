@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import runpy
@@ -33,6 +34,8 @@ class HotRunTests(unittest.TestCase):
     def test_default_state_is_stable_and_separates_tasks(self) -> None:
         namespace = runpy.run_path(str(HOT_RUN), run_name="hot_run_test")
         default_state_root = namespace["default_state_root"]
+        runtime_state_root = namespace["runtime_state_root"]
+        RuntimeContract = namespace["RuntimeContract"]
         resident = Path("/tmp/resident")
         caches = namespace["parse_cache_specs"](["target:overlay"])
         first = default_state_root(resident, Path("/tmp/task-a"), caches)
@@ -44,6 +47,12 @@ class HotRunTests(unittest.TestCase):
         )
         self.assertNotIn("resident", first.name)
         self.assertNotIn("task-a", first.name)
+        node_22 = RuntimeContract("node-22", f"sha256:{'1' * 64}")
+        node_24 = RuntimeContract("node-24", f"sha256:{'2' * 64}")
+        self.assertNotEqual(
+            runtime_state_root(first, node_22), runtime_state_root(first, node_24)
+        )
+        self.assertNotIn("node-22", runtime_state_root(first, node_22).name)
 
     @unittest.skipUnless(shutil.which("bwrap"), "bubblewrap is unavailable")
     def test_task_sees_stable_path_and_target_writes_stay_private(self) -> None:
@@ -119,6 +128,7 @@ class HotRunTests(unittest.TestCase):
             self.assertEqual(report["completion_reason"], "exited")
             self.assertIsNone(report["timeout_seconds"])
             self.assertIsNone(report["resource_profile"])
+            self.assertIsNone(report["runtime"])
             self.assertTrue(report["cross_worktree"])
             self.assertGreaterEqual(report["elapsed_seconds"], 0)
             self.assertGreater(report["max_rss_kib"], 0)
@@ -142,6 +152,86 @@ class HotRunTests(unittest.TestCase):
                 parse_cache_specs(values)
         with self.assertRaises(RuntimeError):
             parse_cache_specs(["build", "build/generated"])
+
+    def test_runtime_contract_verifies_before_execution_and_is_recorded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            program = fixture / "runtime"
+            output = fixture / "output"
+            measurement = fixture / "measurement.json"
+            program.write_text(
+                '#!/bin/sh\nprintf verified > "$1"\n', encoding="utf-8"
+            )
+            program.chmod(0o700)
+            digest = hashlib.sha256(program.read_bytes()).hexdigest()
+            base_command = [
+                sys.executable,
+                os.fspath(HOT_RUN),
+                "--resident",
+                os.fspath(ROOT),
+                "--task",
+                os.fspath(ROOT),
+                "--runtime-id",
+                "test-runtime-v1",
+                "--runtime-sha256",
+            ]
+            accepted = subprocess.run(
+                [
+                    *base_command,
+                    f"sha256:{digest}",
+                    "--measurement",
+                    os.fspath(measurement),
+                    "--",
+                    os.fspath(program),
+                    os.fspath(output),
+                ],
+                stdin=subprocess.DEVNULL,
+                check=False,
+            )
+            self.assertEqual(accepted.returncode, 0)
+            self.assertEqual(output.read_text(encoding="utf-8"), "verified")
+            report = json.loads(measurement.read_text(encoding="utf-8"))
+            self.assertEqual(
+                report["runtime"],
+                {
+                    "id": "test-runtime-v1",
+                    "program_sha256": f"sha256:{digest}",
+                },
+            )
+            self.assertNotIn(os.fspath(fixture), measurement.read_text(encoding="utf-8"))
+
+            output.unlink()
+            refused = subprocess.run(
+                [
+                    *base_command,
+                    f"sha256:{'0' * 64}",
+                    "--",
+                    os.fspath(program),
+                    os.fspath(output),
+                ],
+                stdin=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(refused.returncode, 2)
+            self.assertFalse(output.exists())
+            self.assertIn("does not match declared digest", refused.stderr)
+            self.assertNotIn(os.fspath(program), refused.stderr)
+
+    def test_runtime_contract_rejects_partial_and_noncanonical_values(self) -> None:
+        parse_runtime_contract = runpy.run_path(
+            str(HOT_RUN), run_name="hot_run_test"
+        )["parse_runtime_contract"]
+        for runtime_id, digest in (
+            ("node-22", None),
+            (None, f"sha256:{'1' * 64}"),
+            ("../node", f"sha256:{'1' * 64}"),
+            ("node-22", "1" * 64),
+            ("node-22", f"sha256:{'A' * 64}"),
+        ):
+            with self.assertRaises(RuntimeError):
+                parse_runtime_contract(runtime_id, digest)
 
     def test_direct_resident_execution_preserves_failure_status(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -183,10 +183,30 @@ scripts/hot-run --resident /path/to/node-resident --task /path/to/task \
   --cache node_modules:ro --cache .next:overlay -- pnpm build
 ```
 
+A repository wrapper may also bind the front-door runtime before any work begins:
+
+```bash
+scripts/hot-run --resident /path/to/node-resident --task /path/to/task \
+  --cache node_modules:ro --cache .next:overlay \
+  --runtime-id node-v22.23.2-linux-x64 \
+  --runtime-sha256 sha256:<exact-executable-digest> \
+  -- /path/to/node ./node_modules/.bin/next build
+```
+
+The two runtime arguments are optional but inseparable. When present, `hot-run` resolves the
+command executable, verifies its content digest before launch, records the declared public runtime
+identity and digest, and places mutable overlay state below a runtime-specific opaque namespace.
+This prevents two declared runtime generations from silently sharing one private build-state
+lineage. It intentionally binds the front-door executable only: it is not automatic language
+manifest discovery, a claim about descendant executables, or a hostile-code security boundary.
+The ultra-trusted caller remains responsible for declaring the right runtime and for preventing an
+in-place executable replacement between verification and execution.
+
 `--measurement result.json` atomically writes one bounded developer observation containing elapsed
 time, user/system CPU time, peak RSS, exit/signal, completion reason, configured timeout,
-cross-worktree mode, and relative cache policies. It contains no command, output, environment,
-repository identity, or private path and grants no verification or result-reuse authority.
+cross-worktree mode, relative cache policies, and the optional public runtime contract. It contains
+no command, output, environment, repository identity, or private path and grants no verification or
+result-reuse authority.
 Unscoped commands use child `getrusage`; profiled commands place GNU `time` inside the scope so CPU
 and peak RSS describe the workload rather than the `systemd-run` launcher. Force termination can
 prevent descendants or the inner timer from reporting complete usage, so those three fields are
