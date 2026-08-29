@@ -196,6 +196,25 @@ ambiguous cache request fall through to the unchanged Python implementation. Thi
 optimization for work that was already direct; it grants no project identity, residency, cache,
 observation, isolation, or result authority.
 
+`glaeda-hot-run` is the compiled Linux front door for the equally common measured direct case:
+
+```bash
+glaeda-hot-run \
+  --resident /path/to/resident --task /path/to/resident \
+  --cache target:native --measurement /private/receipt.json \
+  -- cargo check --locked
+```
+
+It preserves the schema-v6 measurement shape, workload-scoped GNU-time CPU/RSS boundary, aggregate
+machine-pressure envelope, exit-versus-signal distinction, atomic receipt publication, caller
+environment and terminal, and optional comparison key without starting Python. The binary accepts
+only a task directory inside the named physical Git worktree and explicit `native` cache
+declarations. It does not yet implement a deadline, resource profile, runtime binding,
+cross-worktree stable-path view, state preparation, or source-mtime seeding; those requests remain
+on `scripts/hot-run` rather than being silently weakened. This is still an observation-only
+ultra-trusted execution path. It grants no lease, cache, residency, validation, publication, or
+cleanup authority.
+
 `private` starts with an empty directory and retains the task's later writes without OverlayFS
 copy-up. `private-copy` atomically seeds that directory once from the warm resident parent with GNU
 `cp --reflink=auto`, then reuses the private lineage on later invocations. The copy uses reflinks
