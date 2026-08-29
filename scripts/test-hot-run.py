@@ -24,6 +24,86 @@ HOT_RUN = ROOT / "scripts" / "hot-run"
 
 
 class HotRunTests(unittest.TestCase):
+    def test_unmeasured_command_does_not_observe_machine(self) -> None:
+        namespace = runpy.run_path(str(HOT_RUN), run_name="hot_run_test")
+        execute = namespace["execute"]
+        observer = mock.Mock(side_effect=AssertionError("unexpected observation"))
+        with mock.patch.dict(execute.__globals__, {"observe_machine": observer}):
+            result = execute(
+                ["/bin/true"],
+                None,
+                None,
+                None,
+                (),
+                (),
+                None,
+                False,
+                None,
+                None,
+            )
+        self.assertEqual(result, 0)
+        observer.assert_not_called()
+
+    def test_linux_machine_observation_parsers_are_strict(self) -> None:
+        namespace = runpy.run_path(str(HOT_RUN), run_name="hot_run_test")
+        parse_load_average = namespace["parse_load_average"]
+        parse_meminfo = namespace["parse_meminfo"]
+        parse_pressure = namespace["parse_pressure"]
+
+        self.assertEqual(
+            parse_load_average("1.25 2.50 3.75 2/100 42\n"),
+            {
+                "one_minute": 1.25,
+                "five_minutes": 2.5,
+                "fifteen_minutes": 3.75,
+            },
+        )
+        self.assertEqual(
+            parse_meminfo(
+                "MemAvailable: 1024 kB\n"
+                "SwapTotal: 512 kB\n"
+                "SwapFree: 128 kB\n"
+                "HugePages_Total: 0\n"
+            ),
+            {
+                "available_bytes": 1024 * 1024,
+                "swap_total_bytes": 512 * 1024,
+                "swap_used_bytes": 384 * 1024,
+            },
+        )
+        self.assertEqual(
+            parse_pressure(
+                "some avg10=0.25 avg60=1.50 avg300=2.75 total=12345\n"
+                "full avg10=0.00 avg60=0.10 avg300=0.20 total=678\n"
+            )["some"],
+            {
+                "avg10": 0.25,
+                "avg60": 1.5,
+                "avg300": 2.75,
+                "total_microseconds": 12345,
+            },
+        )
+
+        for invalid in ("", "nan 1 1", "-1 1 1"):
+            with self.assertRaises(ValueError):
+                parse_load_average(invalid)
+        for invalid in (
+            "MemAvailable: 1 kB\nSwapTotal: 1 kB\n",
+            "MemAvailable: 1 kB\nMemAvailable: 2 kB\nSwapTotal: 1 kB\nSwapFree: 1 kB\n",
+            "MemAvailable: 1 kB\nSwapTotal: 1 kB\nSwapFree: 2 kB\n",
+        ):
+            with self.assertRaises(ValueError):
+                parse_meminfo(invalid)
+        for invalid in (
+            "full avg10=0 avg60=0 avg300=0 total=0\n",
+            "some avg10=nan avg60=0 avg300=0 total=0\n",
+            "some avg10=0 avg60=0 avg300=0 total=-1\n",
+            "some avg10=0 avg60=0 avg300=0 total=0\n"
+            "some avg10=0 avg60=0 avg300=0 total=1\n",
+        ):
+            with self.assertRaises(ValueError):
+                parse_pressure(invalid)
+
     def test_program_resolution_preserves_dispatch_symlinks(self) -> None:
         resolve_program = runpy.run_path(str(HOT_RUN), run_name="hot_run_test")[
             "resolve_program"
@@ -127,12 +207,21 @@ class HotRunTests(unittest.TestCase):
             self.assertEqual(len(uppers), 1)
             self.assertTrue((uppers[0] / "task-output").is_file())
             report = json.loads(measurement.read_text(encoding="utf-8"))
+            self.assertEqual(report["schema_version"], 2)
             self.assertEqual(report["authority"], "developer_observation_only")
             self.assertEqual(report["exit_code"], 0)
             self.assertEqual(report["completion_reason"], "exited")
             self.assertIsNone(report["timeout_seconds"])
             self.assertIsNone(report["resource_profile"])
             self.assertIsNone(report["runtime"])
+            machine = report["machine_observation"]
+            self.assertEqual(machine["scope"], "host_aggregate")
+            self.assertIn(machine["before"]["status"], ("observed", "partial"))
+            self.assertIn(machine["after"]["status"], ("observed", "partial"))
+            self.assertGreater(machine["before"]["online_logical_cpus"], 0)
+            self.assertGreaterEqual(
+                machine["before"]["observation_elapsed_seconds"], 0
+            )
             self.assertTrue(report["cross_worktree"])
             self.assertGreaterEqual(report["elapsed_seconds"], 0)
             self.assertGreater(report["max_rss_kib"], 0)

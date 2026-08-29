@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -35,6 +36,8 @@ HEAVY_SCOPE_PROPERTIES = (
     "TasksMax=1024",
 )
 TERMINATION_GRACE_SECONDS = 2.0
+MAX_PROC_OBSERVATION_BYTES = 64 * 1024
+PRESSURE_KINDS = ("cpu", "memory", "io")
 
 
 @dataclass(frozen=True)
@@ -61,6 +64,143 @@ class RuntimeContract:
 class RuntimeDeclaration:
     runtime_id: str
     expected_program_sha256: str | None
+
+
+def nonnegative_finite(raw: str) -> float:
+    value = float(raw)
+    if not math.isfinite(value) or value < 0:
+        raise ValueError("machine observation value is not finite and nonnegative")
+    return value
+
+
+def parse_load_average(raw: str) -> dict[str, float]:
+    fields = raw.split()
+    if len(fields) < 3:
+        raise ValueError("load-average observation is incomplete")
+    return {
+        "one_minute": nonnegative_finite(fields[0]),
+        "five_minutes": nonnegative_finite(fields[1]),
+        "fifteen_minutes": nonnegative_finite(fields[2]),
+    }
+
+
+def parse_meminfo(raw: str) -> dict[str, int]:
+    values: dict[str, int] = {}
+    seen: set[str] = set()
+    for line in raw.splitlines():
+        key, separator, remainder = line.partition(":")
+        if not separator or key in seen:
+            raise ValueError("memory observation contains malformed or duplicate fields")
+        seen.add(key)
+        fields = remainder.split()
+        if len(fields) != 2 or fields[1] != "kB":
+            continue
+        if (
+            not fields[0].isdigit()
+            or len(fields[0]) > 20
+            or int(fields[0]) > (2**64 - 1) // 1024
+        ):
+            raise ValueError("memory observation value is out of range")
+        values[key] = int(fields[0]) * 1024
+    required = ("MemAvailable", "SwapTotal", "SwapFree")
+    if any(key not in values for key in required):
+        raise ValueError("memory observation is incomplete")
+    if values["SwapFree"] > values["SwapTotal"]:
+        raise ValueError("memory observation has inconsistent swap totals")
+    return {
+        "available_bytes": values["MemAvailable"],
+        "swap_total_bytes": values["SwapTotal"],
+        "swap_used_bytes": values["SwapTotal"] - values["SwapFree"],
+    }
+
+
+def parse_pressure(raw: str) -> dict[str, dict[str, float | int]]:
+    result: dict[str, dict[str, float | int]] = {}
+    for line in raw.splitlines():
+        fields = line.split()
+        if len(fields) != 5 or fields[0] not in ("some", "full"):
+            raise ValueError("pressure observation has an unsupported shape")
+        kind = fields[0]
+        if kind in result:
+            raise ValueError("pressure observation contains duplicate classes")
+        pairs: dict[str, str] = {}
+        for field in fields[1:]:
+            key, separator, value = field.partition("=")
+            if not separator or key in pairs:
+                raise ValueError("pressure observation contains malformed fields")
+            pairs[key] = value
+        if set(pairs) != {"avg10", "avg60", "avg300", "total"}:
+            raise ValueError("pressure observation is incomplete")
+        if (
+            not pairs["total"].isdigit()
+            or len(pairs["total"]) > 20
+            or int(pairs["total"]) > 2**64 - 1
+        ):
+            raise ValueError("pressure total is not a nonnegative integer")
+        result[kind] = {
+            "avg10": nonnegative_finite(pairs["avg10"]),
+            "avg60": nonnegative_finite(pairs["avg60"]),
+            "avg300": nonnegative_finite(pairs["avg300"]),
+            "total_microseconds": int(pairs["total"]),
+        }
+    if "some" not in result:
+        raise ValueError("pressure observation does not contain the some class")
+    return result
+
+
+def read_bounded(path: Path) -> str:
+    with path.open("r", encoding="ascii") as source:
+        raw = source.read(MAX_PROC_OBSERVATION_BYTES + 1)
+    if len(raw) > MAX_PROC_OBSERVATION_BYTES:
+        raise ValueError("machine observation exceeds the bounded input size")
+    return raw
+
+
+def optional_observation(
+    path: Path, parser: Callable[[str], object]
+) -> object | None:
+    try:
+        return parser(read_bounded(path))
+    except (OSError, UnicodeError, ValueError):
+        return None
+
+
+def observe_machine() -> dict[str, object]:
+    started = time.monotonic()
+    online_cpus = os.cpu_count()
+    try:
+        allowed_cpus = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        allowed_cpus = None
+    load_average = optional_observation(Path("/proc/loadavg"), parse_load_average)
+    memory = optional_observation(Path("/proc/meminfo"), parse_meminfo)
+    pressure = {
+        kind: optional_observation(Path(f"/proc/pressure/{kind}"), parse_pressure)
+        for kind in PRESSURE_KINDS
+    }
+    facts = (
+        online_cpus,
+        allowed_cpus,
+        load_average,
+        memory,
+        *pressure.values(),
+    )
+    present = sum(value is not None for value in facts)
+    if present == len(facts):
+        status = "observed"
+    elif present:
+        status = "partial"
+    else:
+        status = "unavailable"
+    return {
+        "status": status,
+        "observation_elapsed_seconds": round(time.monotonic() - started, 6),
+        "online_logical_cpus": online_cpus,
+        "allowed_logical_cpus": allowed_cpus,
+        "load_average": load_average,
+        "memory": memory,
+        "pressure": pressure,
+    }
 
 
 def git_path(root: Path, argument: str) -> Path:
@@ -321,16 +461,23 @@ def write_measurement(
     runtime_contract: RuntimeContract | None,
     cross_worktree: bool,
     resource_profile: str | None,
+    machine_before: dict[str, object],
+    machine_after: dict[str, object],
 ) -> None:
     destination = Path(os.path.abspath(destination))
     destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     preparation_elapsed = sum(item.elapsed_seconds for item in cache_preparations)
     report = {
-        "schema_version": 1,
+        "schema_version": 2,
         "document_type": "glaeda-hot-run-measurement",
         "authority": "developer_observation_only",
         "cross_worktree": cross_worktree,
         "resource_profile": resource_profile,
+        "machine_observation": {
+            "scope": "host_aggregate",
+            "before": machine_before,
+            "after": machine_after,
+        },
         "timeout_seconds": timeout_seconds,
         "cache_views": [
             {"path": os.fspath(spec.path), "mode": spec.mode} for spec in cache_specs
@@ -474,6 +621,7 @@ def execute(
             ],
             *arguments,
         ]
+    machine_before = observe_machine() if measurement is not None else None
     usage_before = resource.getrusage(resource.RUSAGE_CHILDREN)
     started = time.monotonic()
     isolated_process_group = timeout_seconds is not None
@@ -562,6 +710,8 @@ def execute(
         max_rss_kib = None
         resource_accounting = "unavailable_after_forced_termination"
     if measurement is not None:
+        machine_after = observe_machine()
+        assert machine_before is not None
         write_measurement(
             measurement,
             elapsed,
@@ -578,6 +728,8 @@ def execute(
             runtime_contract,
             cross_worktree,
             resource_profile,
+            machine_before,
+            machine_after,
         )
     return exit_code
 

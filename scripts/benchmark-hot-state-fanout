@@ -522,6 +522,9 @@ def aggregate_task(
     benchmark = read_json(task.benchmark_receipt)
     validate_benchmark_receipt(benchmark, edited, plan.cargo_jobs_per_task)
     hot_run = read_json(task.hot_run_receipt) if task.hot_run_receipt else None
+    machine_observation = (
+        hot_run.get("machine_observation") if hot_run is not None else None
+    )
     expected_preparation: list[dict[str, Any]] = []
     if plan.arm == "private-copy":
         expected_preparation = [
@@ -543,7 +546,8 @@ def aggregate_task(
         if isinstance(item, dict)
     ]
     if hot_run is not None and (
-        hot_run.get("document_type") != "glaeda-hot-run-measurement"
+        hot_run.get("schema_version") != 2
+        or hot_run.get("document_type") != "glaeda-hot-run-measurement"
         or hot_run.get("exit_code") != 0
         or hot_run.get("completion_reason") != "exited"
         or hot_run.get("cross_worktree") is not True
@@ -553,6 +557,14 @@ def aggregate_task(
         or normalized_preparation != expected_preparation
         or observed_preparation is None
         or not all(isinstance(item, dict) for item in observed_preparation)
+        or not isinstance(machine_observation, dict)
+        or machine_observation.get("scope") != "host_aggregate"
+        or not all(
+            isinstance(machine_observation.get(phase), dict)
+            and machine_observation[phase].get("status")
+            in ("observed", "partial", "unavailable")
+            for phase in ("before", "after")
+        )
         or (
             plan.arm == "private-copy"
             and not all(
