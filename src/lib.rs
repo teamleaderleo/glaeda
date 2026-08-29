@@ -201,6 +201,9 @@ pub mod linux_personal_worker_runtime_loader_state_prerequisite;
 /// Read-only, locked discovery of one protected recorded personal-worker runtime manifest.
 #[cfg(target_os = "linux")]
 pub mod linux_personal_worker_runtime_manifest;
+/// Native Linux research adapter for exact same-HEAD reflink task worktrees.
+#[cfg(target_os = "linux")]
+pub mod linux_reflink_task_materialization;
 #[cfg(target_os = "linux")]
 pub mod linux_state;
 #[cfg(target_os = "linux")]
