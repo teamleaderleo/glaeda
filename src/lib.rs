@@ -285,6 +285,8 @@ pub mod project_disk_host_observation;
 pub mod project_disk_lease;
 /// Pure bounded validator for the final #628 full project-filesystem correlation receipt.
 pub mod project_filesystem_correlation_receipt;
+/// Pure path-free catalog-wide authority vocabulary for protected cache generations.
+pub mod protected_cache_generation_catalog;
 pub mod renderprove_artifact_binding;
 pub mod renderprove_execution;
 #[cfg(target_os = "linux")]
