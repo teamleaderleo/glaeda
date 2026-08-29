@@ -207,13 +207,15 @@ glaeda-hot-run \
 
 It preserves the schema-v6 measurement shape, workload-scoped GNU-time CPU/RSS boundary, aggregate
 machine-pressure envelope, exit-versus-signal distinction, atomic receipt publication, caller
-environment and terminal, and optional comparison key without starting Python. The binary accepts
-only a task directory inside the named physical Git worktree and explicit `native` cache
-declarations. It does not yet implement a deadline, resource profile, runtime binding,
-cross-worktree stable-path view, state preparation, or source-mtime seeding; those requests remain
-on `scripts/hot-run` rather than being silently weakened. This is still an observation-only
-ultra-trusted execution path. It grants no lease, cache, residency, validation, publication, or
-cleanup authority.
+environment and terminal, optional comparison key, runtime executable digest, and optional
+descendant-bin binding without starting Python. The binary accepts only a task directory inside the
+named physical Git worktree and explicit `native` cache declarations. Its `--runtime-id`,
+`--runtime-sha256`, and `--runtime-bin` options preserve the contracts described below, including
+PATH-first descendant selection and preflight directory revalidation. It does not yet implement a
+deadline, resource profile, cross-worktree stable-path view, state preparation, or source-mtime
+seeding; those requests remain on `scripts/hot-run` rather than being silently weakened. This is
+still an observation-only ultra-trusted execution path. It grants no lease, cache, residency,
+validation, publication, or cleanup authority.
 
 `private` starts with an empty directory and retains the task's later writes without OverlayFS
 copy-up. `private-copy` atomically seeds that directory once from the warm resident parent with GNU
