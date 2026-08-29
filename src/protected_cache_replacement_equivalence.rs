@@ -174,7 +174,7 @@ pub struct ProtectedCacheReplacementEquivalenceReceipt {
 }
 
 impl ProtectedCacheReplacementEquivalenceReceipt {
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     pub(crate) fn from_physical_production(
         production: &crate::unix_protected_cache_replacement_equivalence_producer::ProtectedCacheReplacementProductionSeal,
     ) -> Self {

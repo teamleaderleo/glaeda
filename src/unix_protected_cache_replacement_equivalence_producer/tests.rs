@@ -419,6 +419,65 @@ fn complete_internal_hardlink_topology_is_accepted() {
 }
 
 #[test]
+fn materialized_identity_binds_which_names_share_a_hardlink_group() {
+    let fixture = Fixture::new("hardlink-topology-identity");
+    let first = fixture.materialization_root.join("first");
+    let second = fixture.materialization_root.join("second");
+    for directory in [&first, &second] {
+        fs::create_dir(directory).unwrap();
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    fs::write(first.join("a"), "same").unwrap();
+    fs::hard_link(first.join("a"), first.join("b")).unwrap();
+    fs::write(first.join("c"), "same").unwrap();
+    fs::hard_link(first.join("c"), first.join("d")).unwrap();
+
+    fs::write(second.join("a"), "same").unwrap();
+    fs::hard_link(second.join("a"), second.join("c")).unwrap();
+    fs::write(second.join("b"), "same").unwrap();
+    fs::hard_link(second.join("b"), second.join("d")).unwrap();
+
+    let owner = (process::geteuid().as_raw(), process::getegid().as_raw());
+    let first = open_absolute_directory(&first).unwrap();
+    let second = open_absolute_directory(&second).unwrap();
+    let first_identity = derive_tree_identity(&first, owner, Duration::from_secs(5)).unwrap();
+    let second_identity = derive_tree_identity(&second, owner, Duration::from_secs(5)).unwrap();
+
+    assert_ne!(
+        first_identity, second_identity,
+        "equal contents and link counts must not erase hard-link group membership"
+    );
+}
+
+#[test]
+fn materialized_identity_binds_directory_entry_boundaries() {
+    let fixture = Fixture::new("directory-boundary-identity");
+    let first = fixture.materialization_root.join("first");
+    let second = fixture.materialization_root.join("second");
+    for directory in [&first, &second, &first.join("a"), &second.join("a")] {
+        fs::create_dir(directory).unwrap();
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    fs::write(first.join("a/b"), "same").unwrap();
+    fs::write(first.join("c"), "same").unwrap();
+    fs::write(second.join("a/b"), "same").unwrap();
+    fs::write(second.join("a/c"), "same").unwrap();
+
+    let owner = (process::geteuid().as_raw(), process::getegid().as_raw());
+    let first = open_absolute_directory(&first).unwrap();
+    let second = open_absolute_directory(&second).unwrap();
+    let first_identity = derive_tree_identity(&first, owner, Duration::from_secs(5)).unwrap();
+    let second_identity = derive_tree_identity(&second, owner, Duration::from_secs(5)).unwrap();
+
+    assert_ne!(
+        first_identity, second_identity,
+        "preorder bytes must encode where each directory's entry list ends"
+    );
+}
+
+#[test]
 fn hardlink_to_state_outside_candidate_is_rejected() {
     let fixture = Fixture::new("external-hardlink");
     fs::write(fixture.materialization_root.join("external"), "outside").unwrap();

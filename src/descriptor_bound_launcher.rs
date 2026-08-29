@@ -16,9 +16,9 @@ pub(super) const CAPTURE_BUFFER_BYTES: usize = 8_192;
 const MAX_COMMAND_ID_BYTES: usize = 128;
 const MAX_ARGUMENTS: usize = 64;
 const MAX_ENVIRONMENT_ENTRIES: usize = 64;
-const MAX_VALUE_BYTES: usize = 8_192;
+pub(crate) const MAX_LAUNCH_VALUE_BYTES: usize = 8_192;
 const MAX_TOTAL_VALUE_BYTES: usize = 65_536;
-const MAX_PATH_BYTES: usize = 4_096;
+pub(crate) const MAX_LAUNCH_PATH_BYTES: usize = 4_096;
 const MAX_LAUNCH_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Clone, PartialEq, Eq)]
@@ -605,7 +605,7 @@ fn validate_absolute_path(
     };
     if value.is_empty()
         || value == "/"
-        || value.len() > MAX_PATH_BYTES
+        || value.len() > MAX_LAUNCH_PATH_BYTES
         || value.ends_with('/')
         || value.contains("//")
         || value.chars().any(char::is_control)
@@ -654,7 +654,7 @@ fn validate_values(
     let mut total = 0_usize;
     for value in values {
         let exposed = value.exposed();
-        if exposed.len() > MAX_VALUE_BYTES || exposed.as_bytes().contains(&0) {
+        if exposed.len() > MAX_LAUNCH_VALUE_BYTES || exposed.as_bytes().contains(&0) {
             return Err(DescriptorBoundLaunchError::plan(
                 stage,
                 format!("reviewed {stage} contain an invalid or oversized value"),

@@ -1,10 +1,12 @@
-//! Unix descriptor-bound producer for protected cache replacement-equivalence receipts.
+//! Draft Linux descriptor-bound producer for protected cache replacement-equivalence receipts.
 //!
 //! This boundary creates one absent caller-named candidate, executes exact reviewed materializer
 //! and validator programs with an empty environment and wall-clock limits, derives a bounded
 //! path-free identity from the retained output tree, and only then atomically publishes the strict
-//! receipt. It does not adopt existing cache paths, update the protected catalog, infer leases,
-//! quarantine, delete, reclaim, or clean a failed candidate.
+//! receipt. Its raw plan token has no production constructor because process/filesystem confinement
+//! and a frozen-generation handoff remain unimplemented architecture gates. It does not adopt
+//! existing cache paths, update the protected catalog, infer leases, quarantine, delete, reclaim,
+//! or clean a failed candidate.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -25,8 +27,9 @@ use sha2::{Digest, Sha256};
 use crate::artifact::Sha256Digest;
 use crate::cache_inventory::CacheStateId;
 use crate::descriptor_bound_launcher::{
-    DescriptorBoundLaunchError, ReviewedFilesystemIdentity, ReviewedLaunchCredentials,
-    ReviewedLaunchValue, ReviewedLinuxLaunchPlan, execute_reviewed_linux_launch_with_timeout,
+    DescriptorBoundLaunchError, MAX_LAUNCH_VALUE_BYTES, ReviewedFilesystemIdentity,
+    ReviewedLaunchCredentials, ReviewedLaunchValue, ReviewedLinuxLaunchPlan,
+    execute_reviewed_linux_launch_with_timeout,
 };
 use crate::protected_cache_generation_catalog::{
     ProtectedCacheGenerationFamily, ProtectedCacheGenerationIdentity,
@@ -195,6 +198,7 @@ impl ProtectedCacheReplacementProductionPlan {
         }
         let candidate_name = candidate_name.into();
         validate_component(&candidate_name)?;
+        validate_absolute_path(materialization_root.join(&candidate_name))?;
         validate_timeout(materialization_timeout)?;
         validate_timeout(validation_timeout)?;
         validate_timeout(identity_timeout)?;
@@ -580,6 +584,7 @@ fn derive_tree_identity(
 struct TreeBudget {
     entries: u64,
     bytes: u64,
+    next_hardlink_group: u64,
     hardlinks: BTreeMap<(u64, u64), HardlinkCount>,
 }
 
@@ -587,6 +592,7 @@ struct TreeBudget {
 struct HardlinkCount {
     observed: u64,
     reported: u64,
+    canonical_group: u64,
 }
 
 fn hash_directory(
@@ -623,6 +629,11 @@ fn hash_directory(
         entries.push(name.to_vec());
     }
     entries.sort();
+    hash_u64(
+        hasher,
+        u64::try_from(entries.len())
+            .map_err(|_| limit_error("replacement output entry count could not be encoded"))?,
+    );
     for name in entries {
         require_before_deadline(deadline)?;
         hash_bytes(hasher, &name);
@@ -658,10 +669,25 @@ fn hash_directory(
             if !same_identity(&path_snapshot, &file_before) {
                 return Err(unsafe_output("replacement output file was replaced"));
             }
+            let hardlink_key = (file_before.device, file_before.inode);
+            if !budget.hardlinks.contains_key(&hardlink_key) {
+                let canonical_group = budget.next_hardlink_group;
+                budget.next_hardlink_group = budget
+                    .next_hardlink_group
+                    .checked_add(1)
+                    .ok_or_else(|| limit_error("replacement hard-link group count overflowed"))?;
+                budget.hardlinks.insert(
+                    hardlink_key,
+                    HardlinkCount {
+                        canonical_group,
+                        ..HardlinkCount::default()
+                    },
+                );
+            }
             let hardlinks = budget
                 .hardlinks
-                .entry((file_before.device, file_before.inode))
-                .or_default();
+                .get_mut(&hardlink_key)
+                .expect("hard-link group was inserted");
             if hardlinks.reported != 0 && hardlinks.reported != file_before.links {
                 return Err(unsafe_output(
                     "replacement output hard-link count changed during inspection",
@@ -678,6 +704,9 @@ fn hash_directory(
                 ));
             }
             hash_u64(hasher, file_before.links);
+            if file_before.links > 1 {
+                hash_u64(hasher, hardlinks.canonical_group);
+            }
             budget.bytes = budget
                 .bytes
                 .checked_add(file_before.size)
@@ -744,16 +773,30 @@ fn persist_receipt(
         .map_err(|_| persistence_error("replacement receipt stage could not be written"))?;
     fs::fsync(&stage)
         .map_err(|_| persistence_error("replacement receipt stage could not be synchronized"))?;
+    let synchronized = inspect_regular_file(&stage, Some(owner), true)?;
+    verify_retained_receipt_path(root, &stage_name, &synchronized)?;
     fs::fsync(root)
         .map_err(|_| persistence_error("replacement receipt directory could not synchronize"))?;
+    verify_retained_receipt_path(root, &stage_name, &synchronized)?;
     match fs::renameat_with(root, &stage_name, root, &final_name, RenameFlags::NOREPLACE) {
-        Ok(()) => fs::fsync(root)
-            .map_err(|_| persistence_error("replacement receipt directory could not synchronize")),
+        Ok(()) => {
+            let published = read_optional_retained_receipt(root, &final_name, owner)?
+                .ok_or_else(|| persistence_error("published replacement receipt disappeared"))?;
+            if !same_identity(&synchronized, &published.snapshot) || bytes != published.bytes {
+                return Err(persistence_error(
+                    "published replacement receipt is not the retained synchronized stage",
+                ));
+            }
+            fs::fsync(root).map_err(|_| {
+                persistence_error("replacement receipt directory could not synchronize")
+            })
+        }
         Err(Errno::EXIST) => {
             let existing = read_optional_receipt(root, &final_name, owner)?.ok_or_else(|| {
                 persistence_error("replacement receipt changed during publication")
             })?;
             require_equal_receipt(&existing, &bytes)?;
+            verify_retained_receipt_path(root, &stage_name, &synchronized)?;
             fs::unlinkat(root, &stage_name, AtFlags::empty()).map_err(|_| {
                 persistence_error("duplicate replacement receipt stage could not be removed")
             })?;
@@ -773,22 +816,41 @@ fn recover_receipt_stage(
     owner: (u32, u32),
 ) -> Result<(), ProtectedCacheReplacementProductionError> {
     let stage_name = stage_name(state_id);
-    let Some(stage) = read_optional_receipt(root, &stage_name, owner)? else {
+    let Some(stage) = read_optional_retained_receipt(root, &stage_name, owner)? else {
         return Ok(());
     };
+    decode_protected_cache_replacement_equivalence_receipt(&stage.bytes)
+        .map_err(|_| persistence_error("replacement receipt stage is incomplete or corrupt"))?;
+    fs::fsync(&stage.file)
+        .map_err(|_| persistence_error("abandoned receipt stage could not be synchronized"))?;
+    let synchronized = inspect_regular_file(&stage.file, Some(owner), true)?;
+    if !same_snapshot(&stage.snapshot, &synchronized) {
+        return Err(persistence_error(
+            "abandoned receipt stage changed while being synchronized",
+        ));
+    }
+    verify_retained_receipt_path(root, &stage_name, &synchronized)?;
+
     let final_name = receipt_name(state_id);
     if let Some(final_bytes) = read_optional_receipt(root, &final_name, owner)? {
-        require_equal_receipt(&stage, &final_bytes)?;
+        require_equal_receipt(&stage.bytes, &final_bytes)?;
+        verify_retained_receipt_path(root, &stage_name, &synchronized)?;
         fs::unlinkat(root, &stage_name, AtFlags::empty())
             .map_err(|_| persistence_error("duplicate receipt stage could not be removed"))?;
         return fs::fsync(root)
             .map_err(|_| persistence_error("receipt directory could not synchronize"));
     }
-    decode_protected_cache_replacement_equivalence_receipt(&stage)
-        .map_err(|_| persistence_error("replacement receipt stage is incomplete or corrupt"))?;
     fs::fsync(root).map_err(|_| persistence_error("receipt directory could not synchronize"))?;
+    verify_retained_receipt_path(root, &stage_name, &synchronized)?;
     fs::renameat_with(root, &stage_name, root, &final_name, RenameFlags::NOREPLACE)
         .map_err(|_| persistence_error("abandoned replacement receipt could not be recovered"))?;
+    let published = read_optional_retained_receipt(root, &final_name, owner)?
+        .ok_or_else(|| persistence_error("recovered replacement receipt disappeared"))?;
+    if !same_identity(&synchronized, &published.snapshot) || stage.bytes != published.bytes {
+        return Err(persistence_error(
+            "recovered replacement receipt is not the retained synchronized stage",
+        ));
+    }
     fs::fsync(root).map_err(|_| persistence_error("receipt directory could not synchronize"))
 }
 
@@ -797,6 +859,24 @@ fn read_optional_receipt(
     name: &str,
     owner: (u32, u32),
 ) -> Result<Option<Vec<u8>>, ProtectedCacheReplacementProductionError> {
+    let Some(receipt) = read_optional_retained_receipt(root, name, owner)? else {
+        return Ok(None);
+    };
+    verify_retained_receipt_path(root, name, &receipt.snapshot)?;
+    Ok(Some(receipt.bytes))
+}
+
+struct RetainedReceipt {
+    file: OwnedFd,
+    snapshot: FileSnapshot,
+    bytes: Vec<u8>,
+}
+
+fn read_optional_retained_receipt(
+    root: &OwnedFd,
+    name: &str,
+    owner: (u32, u32),
+) -> Result<Option<RetainedReceipt>, ProtectedCacheReplacementProductionError> {
     let file = match fs::openat(root, name, FILE_FLAGS, Mode::empty()) {
         Ok(file) => file,
         Err(Errno::NOENT) => return Ok(None),
@@ -828,7 +908,28 @@ fn read_optional_receipt(
             "replacement receipt changed while being read",
         ));
     }
-    Ok(Some(bytes))
+    verify_retained_receipt_path(root, name, &after)?;
+    Ok(Some(RetainedReceipt {
+        file,
+        snapshot: after,
+        bytes,
+    }))
+}
+
+fn verify_retained_receipt_path(
+    root: &OwnedFd,
+    name: &str,
+    retained: &FileSnapshot,
+) -> Result<(), ProtectedCacheReplacementProductionError> {
+    let rebound = fs::statat(root, name, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|_| persistence_error("replacement receipt path could not be retained"))?;
+    let rebound = snapshot(&rebound)?;
+    if !same_snapshot(retained, &rebound) {
+        return Err(persistence_error(
+            "replacement receipt path no longer names the retained file",
+        ));
+    }
+    Ok(())
 }
 
 fn require_equal_receipt(
@@ -1158,8 +1259,10 @@ fn validate_arguments(
         return Err(plan_error("program argument count exceeds the limit"));
     }
     let total = arguments.iter().try_fold(0_usize, |total, argument| {
-        if argument.exposed().as_bytes().contains(&0) {
-            return Err(plan_error("program argument contains NUL"));
+        if argument.exposed().len() > MAX_LAUNCH_VALUE_BYTES
+            || argument.exposed().as_bytes().contains(&0)
+        {
+            return Err(plan_error("program argument is invalid or oversized"));
         }
         total
             .checked_add(argument.exposed().len())

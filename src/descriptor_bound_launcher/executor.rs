@@ -31,6 +31,7 @@ const DIRECTORY_FLAGS: OFlags = OFlags::PATH
 const EXECUTABLE_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::NOFOLLOW)
     .union(OFlags::CLOEXEC);
+const PROCESS_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Execute one already reviewed Linux launch plan through retained cwd and executable descriptors.
 ///
@@ -418,7 +419,12 @@ fn execute_bound_process(
     let mut child = command.spawn().map_err(|_| {
         DescriptorBoundLaunchError::spawn("descriptor-bound reviewed process could not be spawned")
     })?;
-    hooks.after_spawn()?;
+    let process_group = Pid::from_child(&child);
+    if let Err(error) = hooks.after_spawn() {
+        let _ = terminate_process_group(process_group, &mut child);
+        let _ = child.wait();
+        return Err(error);
+    }
 
     let stdout = child.stdout.take().ok_or_else(|| {
         DescriptorBoundLaunchError::output_capture(
@@ -441,25 +447,61 @@ fn execute_bound_process(
     let mut stderr_bytes = None;
     let mut exceeded = BTreeSet::new();
     let mut capture_error = None;
+    let mut status = None;
+    let mut lingering_process_group = false;
 
-    while stdout_bytes.is_none() || stderr_bytes.is_none() {
-        let received = match deadline {
-            Some(deadline) => {
-                receiver.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+    while status.is_none() || stdout_bytes.is_none() || stderr_bytes.is_none() {
+        if status.is_none() {
+            status = child.try_wait().map_err(|_| {
+                DescriptorBoundLaunchError::status(
+                    "descriptor-bound process status could not be inspected",
+                )
+            })?;
+            if status.is_some() {
+                match process::test_kill_process_group(process_group) {
+                    Ok(()) => {
+                        lingering_process_group = true;
+                        terminate_process_group(process_group, &mut child)?;
+                    }
+                    Err(Errno::SRCH) => {}
+                    Err(_) => {
+                        let _ = terminate_process_group(process_group, &mut child);
+                        let _ = join_capture_reader(stdout_reader);
+                        let _ = join_capture_reader(stderr_reader);
+                        return Err(DescriptorBoundLaunchError::status(
+                            "descriptor-bound process group could not be inspected",
+                        ));
+                    }
+                }
             }
-            None => receiver.recv().map_err(|_| RecvTimeoutError::Disconnected),
-        };
+        }
+        if status.is_some() && stdout_bytes.is_some() && stderr_bytes.is_some() {
+            break;
+        }
+
+        let now = Instant::now();
+        if deadline.is_some_and(|deadline| now >= deadline) {
+            let _ = terminate_process_group(process_group, &mut child);
+            let _ = child.wait();
+            let _ = join_capture_reader(stdout_reader);
+            let _ = join_capture_reader(stderr_reader);
+            return Err(DescriptorBoundLaunchError::timeout());
+        }
+        let wait = deadline
+            .map(|deadline| deadline.saturating_duration_since(now))
+            .unwrap_or(PROCESS_STATUS_POLL_INTERVAL)
+            .min(PROCESS_STATUS_POLL_INTERVAL);
+        if stdout_bytes.is_some() && stderr_bytes.is_some() {
+            thread::sleep(wait);
+            continue;
+        }
+
+        let received = receiver.recv_timeout(wait);
         let event = match received {
             Ok(event) => event,
-            Err(RecvTimeoutError::Timeout) => {
-                let _ = terminate_process_group(&mut child);
-                let _ = child.wait();
-                let _ = join_capture_reader(stdout_reader);
-                let _ = join_capture_reader(stderr_reader);
-                return Err(DescriptorBoundLaunchError::timeout());
-            }
+            Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => {
-                let _ = terminate_process_group(&mut child);
+                let _ = terminate_process_group(process_group, &mut child);
                 let _ = child.wait();
                 let _ = join_capture_reader(stdout_reader);
                 let _ = join_capture_reader(stderr_reader);
@@ -472,7 +514,7 @@ fn execute_bound_process(
         match event {
             CaptureEvent::LimitExceeded(stream) => {
                 exceeded.insert(stream);
-                terminate_process_group(&mut child)?;
+                terminate_process_group(process_group, &mut child)?;
             }
             CaptureEvent::Completed(stream, result) => {
                 let bytes = match result {
@@ -481,7 +523,7 @@ fn execute_bound_process(
                         if capture_error.is_none() {
                             capture_error = Some(stream);
                         }
-                        terminate_process_group(&mut child)?;
+                        terminate_process_group(process_group, &mut child)?;
                         Vec::new()
                     }
                 };
@@ -493,9 +535,7 @@ fn execute_bound_process(
         }
     }
 
-    let status = child.wait().map_err(|_| {
-        DescriptorBoundLaunchError::status("descriptor-bound process status could not be collected")
-    })?;
+    let status = status.expect("process status recorded");
     join_capture_reader(stdout_reader)?;
     join_capture_reader(stderr_reader)?;
 
@@ -507,6 +547,11 @@ fn execute_bound_process(
     }
     if let Some(stream) = exceeded.into_iter().next() {
         return Err(DescriptorBoundLaunchError::output_limit(stream.as_str()));
+    }
+    if lingering_process_group {
+        return Err(DescriptorBoundLaunchError::status(
+            "descriptor-bound process left a surviving process-group member",
+        ));
     }
 
     let termination = match (status.code(), status.signal()) {
@@ -601,17 +646,11 @@ fn capture_stream(
     Ok(captured)
 }
 
-fn terminate_process_group(child: &mut Child) -> Result<(), DescriptorBoundLaunchError> {
-    if child
-        .try_wait()
-        .map_err(|_| DescriptorBoundLaunchError::status("process status could not be inspected"))?
-        .is_some()
-    {
-        return Ok(());
-    }
-
-    let pid = Pid::from_child(child);
-    match process::kill_process_group(pid, Signal::KILL) {
+fn terminate_process_group(
+    process_group: Pid,
+    child: &mut Child,
+) -> Result<(), DescriptorBoundLaunchError> {
+    match process::kill_process_group(process_group, Signal::KILL) {
         Ok(()) | Err(Errno::SRCH) => Ok(()),
         Err(_) => child.kill().map_err(|_| {
             DescriptorBoundLaunchError::status(
