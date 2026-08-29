@@ -6,9 +6,12 @@
 use std::fmt;
 
 use serde::Serialize;
+use sha2::{Digest as _, Sha256};
 
 use crate::artifact::Sha256Digest;
-use crate::hot_execution_performance::{HotExecutionPerformanceReceipt, HotExecutionResultClass};
+use crate::hot_execution_performance::{
+    HotExecutionMode, HotExecutionPerformanceReceipt, HotExecutionResultClass, HotSandboxState,
+};
 
 pub const RESIDENT_BACKEND_COMPARISON_SCHEMA_VERSION: u8 = 1;
 pub const REQUIRED_AA_NOISE_BLOCKS: usize = 4;
@@ -16,6 +19,9 @@ pub const MAX_RESIDENT_BACKEND_COMPARISON_BLOCKS: usize = 32;
 pub const MAX_RESIDENT_BACKEND_SAMPLE_ORDINAL: u32 = 1_000_000;
 
 const MAX_TOKEN_BYTES: usize = 96;
+const PLAN_DIGEST_DOMAIN: &[u8] = b"glaeda.resident_backend_comparison.plan.v1\0";
+const SHA256_PREFIX: &str = "sha256:";
+const HEX: &[u8; 16] = b"0123456789abcdef";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -98,6 +104,8 @@ pub struct ResidentBackendTreatmentIdentity {
     resource_profile: ResidentBackendComparisonToken,
     storage_policy_generation: ResidentBackendComparisonToken,
     network_policy_generation: ResidentBackendComparisonToken,
+    cleanup_policy_generation: ResidentBackendComparisonToken,
+    reconstruction_policy_generation: ResidentBackendComparisonToken,
 }
 
 impl ResidentBackendTreatmentIdentity {
@@ -112,6 +120,8 @@ impl ResidentBackendTreatmentIdentity {
         resource_profile: &str,
         storage_policy_generation: &str,
         network_policy_generation: &str,
+        cleanup_policy_generation: &str,
+        reconstruction_policy_generation: &str,
     ) -> Result<Self, ResidentBackendComparisonError> {
         Ok(Self {
             candidate_id: ResidentBackendComparisonToken::parse(candidate_id)?,
@@ -126,6 +136,12 @@ impl ResidentBackendTreatmentIdentity {
             )?,
             network_policy_generation: ResidentBackendComparisonToken::parse(
                 network_policy_generation,
+            )?,
+            cleanup_policy_generation: ResidentBackendComparisonToken::parse(
+                cleanup_policy_generation,
+            )?,
+            reconstruction_policy_generation: ResidentBackendComparisonToken::parse(
+                reconstruction_policy_generation,
             )?,
         })
     }
@@ -173,6 +189,16 @@ impl ResidentBackendTreatmentIdentity {
     #[must_use]
     pub fn network_policy_generation(&self) -> &str {
         self.network_policy_generation.as_str()
+    }
+
+    #[must_use]
+    pub fn cleanup_policy_generation(&self) -> &str {
+        self.cleanup_policy_generation.as_str()
+    }
+
+    #[must_use]
+    pub fn reconstruction_policy_generation(&self) -> &str {
+        self.reconstruction_policy_generation.as_str()
     }
 }
 
@@ -238,6 +264,7 @@ pub struct ResidentBackendComparisonPlan {
     treatment_a: ResidentBackendTreatmentIdentity,
     treatment_b: ResidentBackendTreatmentIdentity,
     blocks: Vec<ResidentBackendComparisonBlock>,
+    plan_digest: Sha256Digest,
 }
 
 impl ResidentBackendComparisonPlan {
@@ -256,7 +283,7 @@ impl ResidentBackendComparisonPlan {
     ) -> Result<Self, ResidentBackendComparisonError> {
         validate_treatments(&treatment_a, &treatment_b)?;
         validate_blocks(&blocks)?;
-        Ok(Self {
+        let mut plan = Self {
             document_type: ResidentBackendComparisonDocumentType::Plan,
             schema_version: RESIDENT_BACKEND_COMPARISON_SCHEMA_VERSION,
             authority: ResidentBackendComparisonAuthority::ObservationOnly,
@@ -270,7 +297,10 @@ impl ResidentBackendComparisonPlan {
             treatment_a,
             treatment_b,
             blocks,
-        })
+            plan_digest: zero_digest()?,
+        };
+        plan.plan_digest = derive_plan_digest(&plan)?;
+        Ok(plan)
     }
 
     #[must_use]
@@ -333,6 +363,15 @@ impl ResidentBackendComparisonPlan {
         &self.blocks
     }
 
+    #[must_use]
+    pub const fn plan_digest(&self) -> &Sha256Digest {
+        &self.plan_digest
+    }
+
+    pub fn render_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
+    }
+
     fn treatment(&self, arm: ResidentBackendTreatmentArm) -> &ResidentBackendTreatmentIdentity {
         match arm {
             ResidentBackendTreatmentArm::A => &self.treatment_a,
@@ -365,6 +404,7 @@ pub struct ResidentBackendComparisonSample {
     arm: ResidentBackendTreatmentArm,
     sample_class: ResidentBackendSampleClass,
     ordinal: u32,
+    plan_digest: Sha256Digest,
     treatment: ResidentBackendTreatmentIdentity,
     semantic_validation: ResidentBackendSemanticValidation,
     performance: HotExecutionPerformanceReceipt,
@@ -388,6 +428,7 @@ impl ResidentBackendComparisonSample {
         let arm = plan.scheduled_arm(block, position)?;
         validate_treatment_binding(plan, arm, &observed_treatment)?;
         validate_performance_binding(plan, arm, &performance)?;
+        validate_sample_mode(sample_class, &performance)?;
         validate_semantic_validation(sample_class, &semantic_validation, &performance)?;
         Ok(Self {
             document_type: ResidentBackendComparisonDocumentType::Sample,
@@ -399,6 +440,7 @@ impl ResidentBackendComparisonSample {
             arm,
             sample_class,
             ordinal,
+            plan_digest: plan.plan_digest.clone(),
             treatment: observed_treatment,
             semantic_validation,
             performance,
@@ -443,6 +485,11 @@ impl ResidentBackendComparisonSample {
     #[must_use]
     pub const fn ordinal(&self) -> u32 {
         self.ordinal
+    }
+
+    #[must_use]
+    pub const fn plan_digest(&self) -> &Sha256Digest {
+        &self.plan_digest
     }
 
     #[must_use]
@@ -560,6 +607,104 @@ fn validate_performance_binding(
     Ok(())
 }
 
+fn validate_sample_mode(
+    sample_class: ResidentBackendSampleClass,
+    performance: &HotExecutionPerformanceReceipt,
+) -> Result<(), ResidentBackendComparisonError> {
+    let expected = match sample_class {
+        ResidentBackendSampleClass::StoppedCanary => (
+            HotExecutionMode::ResidentAfterIdle,
+            HotSandboxState::Resumed,
+        ),
+        ResidentBackendSampleClass::ResidentCanary => (
+            HotExecutionMode::ResidentImmediate,
+            HotSandboxState::ResidentHit,
+        ),
+        ResidentBackendSampleClass::ResidentTask => (
+            HotExecutionMode::ResidentTaskLoop,
+            HotSandboxState::ResidentHit,
+        ),
+    };
+    if performance.execution_mode() != expected.0 || performance.heat().sandbox() != expected.1 {
+        return Err(sample_mode_mismatch());
+    }
+    Ok(())
+}
+
+fn derive_plan_digest(
+    plan: &ResidentBackendComparisonPlan,
+) -> Result<Sha256Digest, ResidentBackendComparisonError> {
+    let mut hasher = Sha256::new();
+    hasher.update(PLAN_DIGEST_DOMAIN);
+    hasher.update([plan.schema_version]);
+    hasher.update([1]); // observation-only authority
+    for token in [
+        &plan.experiment_id,
+        &plan.glaeda_source_id,
+        &plan.workload_id,
+        &plan.project_id,
+        &plan.project_source_id,
+        &plan.validator_id,
+        &plan.toolchain_generation,
+    ] {
+        update_digest_token(&mut hasher, token);
+    }
+    update_digest_treatment(&mut hasher, &plan.treatment_a);
+    update_digest_treatment(&mut hasher, &plan.treatment_b);
+    hasher.update((plan.blocks.len() as u16).to_be_bytes());
+    for block in &plan.blocks {
+        hasher.update(block.block.to_be_bytes());
+        hasher.update([digest_arm(block.first), digest_arm(block.second)]);
+    }
+    digest_to_sha256(&hasher.finalize())
+}
+
+fn update_digest_treatment(hasher: &mut Sha256, treatment: &ResidentBackendTreatmentIdentity) {
+    for token in [
+        &treatment.candidate_id,
+        &treatment.backend_id,
+        &treatment.backend_generation,
+        &treatment.guest_image_generation,
+        &treatment.kernel_generation,
+        &treatment.host_class,
+        &treatment.resource_profile,
+        &treatment.storage_policy_generation,
+        &treatment.network_policy_generation,
+        &treatment.cleanup_policy_generation,
+        &treatment.reconstruction_policy_generation,
+    ] {
+        update_digest_token(hasher, token);
+    }
+}
+
+fn update_digest_token(hasher: &mut Sha256, token: &ResidentBackendComparisonToken) {
+    let bytes = token.as_str().as_bytes();
+    hasher.update((bytes.len() as u16).to_be_bytes());
+    hasher.update(bytes);
+}
+
+const fn digest_arm(arm: ResidentBackendTreatmentArm) -> u8 {
+    match arm {
+        ResidentBackendTreatmentArm::A => 1,
+        ResidentBackendTreatmentArm::B => 2,
+    }
+}
+
+fn digest_to_sha256(bytes: &[u8]) -> Result<Sha256Digest, ResidentBackendComparisonError> {
+    let mut value = String::with_capacity(SHA256_PREFIX.len() + bytes.len() * 2);
+    value.push_str(SHA256_PREFIX);
+    for byte in bytes {
+        value.push(char::from(HEX[usize::from(byte >> 4)]));
+        value.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    Sha256Digest::parse(&value).map_err(|_| plan_digest_encoding())
+}
+
+fn zero_digest() -> Result<Sha256Digest, ResidentBackendComparisonError> {
+    Sha256Digest::parse("sha256:0000000000000000000000000000000000000000000000000000000000000000")
+        .map_err(|_| plan_digest_encoding())
+}
+
 fn validate_semantic_validation(
     sample_class: ResidentBackendSampleClass,
     validation: &ResidentBackendSemanticValidation,
@@ -672,6 +817,20 @@ const fn performance_identity_mismatch() -> ResidentBackendComparisonError {
     )
 }
 
+const fn sample_mode_mismatch() -> ResidentBackendComparisonError {
+    error(
+        "backend_sample_mode_mismatch",
+        "backend comparison sample class does not match the observed execution mode and sandbox heat",
+    )
+}
+
+const fn plan_digest_encoding() -> ResidentBackendComparisonError {
+    error(
+        "backend_plan_digest_encoding_failed",
+        "backend comparison plan could not be represented by the canonical digest type",
+    )
+}
+
 const fn canary_validation_mismatch() -> ResidentBackendComparisonError {
     error(
         "backend_canary_validation_mismatch",
@@ -713,6 +872,8 @@ mod tests {
             "4cpu-8gib",
             "guest-local-v1",
             "controlled-network-v1",
+            "cleanup-v1",
+            "reconstruction-v1",
         )
         .unwrap()
     }
@@ -728,6 +889,8 @@ mod tests {
             "4cpu-8gib",
             "guest-local-v1",
             "controlled-network-v1",
+            "cleanup-v1",
+            "reconstruction-v1",
         )
         .unwrap()
     }
@@ -783,7 +946,11 @@ mod tests {
         .unwrap()
     }
 
-    fn performance(treatment: &ResidentBackendTreatmentIdentity) -> HotExecutionPerformanceReceipt {
+    fn performance_with_mode(
+        treatment: &ResidentBackendTreatmentIdentity,
+        mode: HotExecutionMode,
+        sandbox: HotSandboxState,
+    ) -> HotExecutionPerformanceReceipt {
         let identity = HotExecutionPerformanceIdentity::new(
             "quarry-pr-check",
             "quarry",
@@ -805,7 +972,7 @@ mod tests {
         )
         .unwrap();
         let heat = HotExecutionHeat::new(
-            HotSandboxState::ResidentHit,
+            sandbox,
             HotRepositoryState::ResidentHit,
             HotDependencyState::ResidentHit,
             HotBuildState::ResidentHit,
@@ -813,7 +980,7 @@ mod tests {
         );
         HotExecutionPerformanceReceipt::new(
             identity,
-            HotExecutionMode::ResidentTaskLoop,
+            mode,
             8,
             milestones,
             heat,
@@ -822,6 +989,14 @@ mod tests {
             HotExecutionResultClass::Succeeded,
         )
         .unwrap()
+    }
+
+    fn performance(treatment: &ResidentBackendTreatmentIdentity) -> HotExecutionPerformanceReceipt {
+        performance_with_mode(
+            treatment,
+            HotExecutionMode::ResidentTaskLoop,
+            HotSandboxState::ResidentHit,
+        )
     }
 
     fn validation_digest() -> Sha256Digest {
@@ -891,6 +1066,8 @@ mod tests {
             "4cpu-8gib",
             "guest-local-v1",
             "controlled-network-v1",
+            "cleanup-v1",
+            "reconstruction-v1",
         )
         .unwrap();
         let error = ResidentBackendComparisonPlan::new(
@@ -933,6 +1110,123 @@ mod tests {
             sample.performance().identity().backend_id(),
             "apple-container-machine"
         );
+        assert_eq!(sample.plan_digest(), plan.plan_digest());
+    }
+
+    #[test]
+    fn complete_plan_digest_changes_with_toolchain_schedule_and_lifecycle_policy() {
+        let original = plan();
+        let changed_toolchain = ResidentBackendComparisonPlan::new(
+            original.experiment_id(),
+            original.glaeda_source_id(),
+            original.workload_id(),
+            original.project_id(),
+            original.project_source_id(),
+            original.validator_id(),
+            "quarry-toolchain-v2",
+            original.treatment_a().clone(),
+            original.treatment_b().clone(),
+            original.blocks().to_vec(),
+        )
+        .unwrap();
+        let mut changed_schedule_blocks = original.blocks().to_vec();
+        changed_schedule_blocks[4] = ResidentBackendComparisonBlock::new(
+            5,
+            ResidentBackendTreatmentArm::B,
+            ResidentBackendTreatmentArm::A,
+        );
+        let changed_schedule = ResidentBackendComparisonPlan::new(
+            original.experiment_id(),
+            original.glaeda_source_id(),
+            original.workload_id(),
+            original.project_id(),
+            original.project_source_id(),
+            original.validator_id(),
+            original.toolchain_generation(),
+            original.treatment_a().clone(),
+            original.treatment_b().clone(),
+            changed_schedule_blocks,
+        )
+        .unwrap();
+        let changed_lifecycle = ResidentBackendTreatmentIdentity::new(
+            original.treatment_b().candidate_id(),
+            original.treatment_b().backend_id(),
+            original.treatment_b().backend_generation(),
+            original.treatment_b().guest_image_generation(),
+            original.treatment_b().kernel_generation(),
+            original.treatment_b().host_class(),
+            original.treatment_b().resource_profile(),
+            original.treatment_b().storage_policy_generation(),
+            original.treatment_b().network_policy_generation(),
+            "cleanup-v2",
+            original.treatment_b().reconstruction_policy_generation(),
+        )
+        .unwrap();
+        let changed_lifecycle = ResidentBackendComparisonPlan::new(
+            original.experiment_id(),
+            original.glaeda_source_id(),
+            original.workload_id(),
+            original.project_id(),
+            original.project_source_id(),
+            original.validator_id(),
+            original.toolchain_generation(),
+            original.treatment_a().clone(),
+            changed_lifecycle,
+            original.blocks().to_vec(),
+        )
+        .unwrap();
+
+        assert_ne!(original.plan_digest(), changed_toolchain.plan_digest());
+        assert_ne!(original.plan_digest(), changed_schedule.plan_digest());
+        assert_ne!(original.plan_digest(), changed_lifecycle.plan_digest());
+        assert_eq!(original.plan_digest(), plan().plan_digest());
+
+        let json = original.render_json().unwrap();
+        assert!(json.contains(original.plan_digest().as_str()));
+        assert!(json.contains("\"cleanup_policy_generation\": \"cleanup-v1\""));
+        assert!(json.contains("\"reconstruction_policy_generation\": \"reconstruction-v1\""));
+    }
+
+    #[test]
+    fn sample_class_requires_the_corresponding_execution_mode_and_sandbox_heat() {
+        let plan = plan();
+        let error = ResidentBackendComparisonSample::new(
+            &plan,
+            1,
+            ResidentBackendComparisonPosition::First,
+            ResidentBackendSampleClass::StoppedCanary,
+            1,
+            plan.treatment_a().clone(),
+            ResidentBackendSemanticValidation::NotApplicable,
+            performance(plan.treatment_a()),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "backend_sample_mode_mismatch");
+
+        for (sample_class, mode, sandbox) in [
+            (
+                ResidentBackendSampleClass::StoppedCanary,
+                HotExecutionMode::ResidentAfterIdle,
+                HotSandboxState::Resumed,
+            ),
+            (
+                ResidentBackendSampleClass::ResidentCanary,
+                HotExecutionMode::ResidentImmediate,
+                HotSandboxState::ResidentHit,
+            ),
+        ] {
+            ResidentBackendComparisonSample::new(
+                &plan,
+                1,
+                ResidentBackendComparisonPosition::First,
+                sample_class,
+                2,
+                plan.treatment_a().clone(),
+                ResidentBackendSemanticValidation::NotApplicable,
+                performance_with_mode(plan.treatment_a(), mode, sandbox),
+            )
+            .unwrap();
+        }
     }
 
     #[test]
@@ -948,6 +1242,8 @@ mod tests {
             plan.treatment_b().resource_profile(),
             plan.treatment_b().storage_policy_generation(),
             plan.treatment_b().network_policy_generation(),
+            plan.treatment_b().cleanup_policy_generation(),
+            plan.treatment_b().reconstruction_policy_generation(),
         )
         .unwrap();
         let error = ResidentBackendComparisonSample::new(
@@ -994,7 +1290,11 @@ mod tests {
             ResidentBackendSemanticValidation::Passed {
                 evidence_digest: validation_digest(),
             },
-            performance(plan.treatment_a()),
+            performance_with_mode(
+                plan.treatment_a(),
+                HotExecutionMode::ResidentImmediate,
+                HotSandboxState::ResidentHit,
+            ),
         )
         .unwrap_err();
         assert_eq!(canary_error.code(), "backend_canary_validation_mismatch");
@@ -1025,6 +1325,8 @@ mod tests {
             "resource",
             "storage",
             "network",
+            "cleanup",
+            "reconstruction",
         )
         .unwrap_err();
         assert_eq!(error.code(), "invalid_backend_comparison_token");
@@ -1062,5 +1364,6 @@ mod tests {
         assert!(first.contains("\"authority\": \"observation_only\""));
         assert!(first.contains("\"sample_class\": \"resident_task\""));
         assert!(first.contains("\"backend_generation\": \"container-1.3.0\""));
+        assert!(first.contains(plan.plan_digest().as_str()));
     }
 }
