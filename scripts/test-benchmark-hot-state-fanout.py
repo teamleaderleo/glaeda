@@ -290,7 +290,8 @@ class HotStateFanoutTests(unittest.TestCase):
                 json.dumps(valid_benchmark_receipt()), encoding="utf-8"
             )
             hot_run = {
-                "schema_version": 3,
+                "schema_version": 4,
+                "comparison_key": None,
                 "document_type": "glaeda-hot-run-measurement",
                 "exit_code": 0,
                 "completion_reason": "exited",
