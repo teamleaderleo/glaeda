@@ -61,10 +61,12 @@ jobs:
           paths = [
               Path("smolrunner"),
               Path("scripts/bootstrap"),
+              Path("scripts/benchmark-hot-state-fanout"),
               Path("scripts/hot-observe"),
               Path("scripts/hot-run"),
               Path("scripts/verify"),
               Path("scripts/test-hot-run.py"),
+              Path("scripts/test-benchmark-hot-state-fanout.py"),
               Path("scripts/test-hot-observe.py"),
               Path("scripts/test-verify.py"),
               Path("scripts/test-front-door.py"),
@@ -80,6 +82,7 @@ jobs:
           bash -n scripts/test-bootstrap.sh
           bash scripts/test-bootstrap.sh
           python3 scripts/test-benchmark-developer-loop.py
+          python3 scripts/test-benchmark-hot-state-fanout.py
           python3 scripts/test-hot-observe.py
           python3 scripts/test-hot-run.py
           python3 scripts/test-verify.py
