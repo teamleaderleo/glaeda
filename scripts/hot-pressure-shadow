@@ -20,7 +20,7 @@ from typing import Any
 
 
 SCHEMA_VERSION = 1
-HOT_RUN_SCHEMA_VERSION = 5
+HOT_RUN_SCHEMA_VERSION = 6
 MAX_RECEIPT_BYTES = 256 * 1024
 MAX_BASELINE_SAMPLES = 64
 MIN_RANGE_SAMPLES = 2
@@ -207,7 +207,7 @@ def read_sample(path: Path) -> Sample:
         or document.get("document_type") != "glaeda-hot-run-measurement"
         or document.get("authority") != "developer_observation_only"
     ):
-        raise RuntimeError("measurement input is not a schema-v5 hot-run observation")
+        raise RuntimeError("measurement input is not a schema-v6 hot-run observation")
     if document.get("exit_code") != 0 or document.get("completion_reason") != "exited":
         raise RuntimeError("failed or interrupted measurements cannot enter history")
     comparison_key = canonical_sha256(document.get("comparison_key"))

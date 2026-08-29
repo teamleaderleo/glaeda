@@ -347,9 +347,12 @@ for an ordinary worktree created after its exact warm parent without backdating 
 The caller must already own exact warm-parent proof; the flag creates none. The matching pass is
 recorded with bounded counts and time. It never runs on retained state: a
 file reverted after a prior task build must remain newer so Cargo can rebuild it. Copy/matching
-CPU and RSS are not included in the command resource fields. The receipt contains no command,
-output, environment, repository identity, file name, or private path and grants no verification
-or result-reuse authority.
+CPU and RSS are not included in the command resource fields. Measured commands put GNU `time`
+immediately around the workload, so CPU and peak RSS cover that command tree without inheriting the
+largest child previously used for Git, copying, runtime discovery, or other preparation. Profiled
+commands put the same observer inside the resource scope. Commands without `--measurement` remain
+unwrapped. The receipt contains no command, output, environment, repository identity, file name,
+or private path and grants no verification or result-reuse authority.
 
 The same receipt includes aggregate Linux machine observations immediately before process start and
 after process settlement. Fixed kernel interfaces supply online/allowed CPU counts, load averages,
@@ -371,12 +374,14 @@ This derived machine-observation shape entered hot-run measurement schema versio
 4 added one optional caller-owned `comparison_key`: a canonical opaque SHA-256 digest covering the
 exact workload/source/toolchain/cache/fan-out basis that the caller already owns. Schema version 5
 adds the path-free seed-only source-metadata preparation above and includes its time in total
-preparation. The comparison key is accepted only with `--measurement`, records no command or
-private input, and grants no semantic, result, cache, scheduling, or admission authority. Existing
-version 1 through 4 receipts remain historical observations; no producer silently relabels them as
-comparable.
+preparation. Schema version 6 replaces process-lifetime child peak RSS on unprofiled commands with
+workload-scoped GNU-time CPU/RSS. The reducer accepts only version 6 so historical version 5 RSS
+cannot silently enter the same observed range. The comparison key is accepted only with
+`--measurement`, records no command or private input, and grants no semantic, result, cache,
+scheduling, or admission authority. Existing version 1 through 5 receipts remain historical
+observations; no producer silently relabels them as comparable.
 
-Two or more successful schema-v5 receipts carrying the exact same key can be reduced without a
+Two or more successful schema-v6 receipts carrying the exact same key can be reduced without a
 persistent history service:
 
 ```bash
