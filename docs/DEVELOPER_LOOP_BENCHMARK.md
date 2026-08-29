@@ -68,6 +68,11 @@ The empty-private final allocation was 2,720,018,432–2,720,022,528 bytes. Over
 2,537,993,803–2,537,993,825 logical and 2,539,700,224–2,539,720,704 allocated bytes, so it saved
 only about 172 MiB versus a complete private lineage for this real workload.
 
+After recording the receipts, the three task worktrees removed in 0.04, 0.00, and 0.00 seconds;
+the warmed resident worktree and its target removed in 0.12 seconds. The three copy-seeded,
+Overlay, and empty-private state families removed in 0.22, 0.11, and 0.33 seconds respectively;
+receipt cleanup was below 0.01 seconds. No benchmark process or mount survived.
+
 On this ext4 host, an empty private lineage pays the full cold compile once. Copy-seeding avoids
 that prime: its 10.91-second preparation-plus-result median was 1.03 seconds, or 8.6%, faster than
 the 11.94-second Overlay result, while remaining 0.60 seconds behind the earlier 10.31-second
