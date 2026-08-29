@@ -263,11 +263,17 @@ class HotStateFanoutTests(unittest.TestCase):
                 json.dumps(valid_benchmark_receipt()), encoding="utf-8"
             )
             hot_run = {
+                "schema_version": 2,
                 "document_type": "glaeda-hot-run-measurement",
                 "exit_code": 0,
                 "completion_reason": "exited",
                 "cross_worktree": True,
                 "resource_profile": None,
+                "machine_observation": {
+                    "scope": "host_aggregate",
+                    "before": {"status": "observed"},
+                    "after": {"status": "observed"},
+                },
                 "cache_views": [{"path": "target", "mode": "private-copy"}],
                 "state_preparation": [
                     {

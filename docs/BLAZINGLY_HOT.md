@@ -282,6 +282,20 @@ cross-worktree mode, relative cache policies, and the optional public runtime co
 time, and command-plus-copy wall time. Copy CPU/RSS are not included in the command resource fields.
 The receipt contains no command, output, environment, repository identity, or private path and
 grants no verification or result-reuse authority.
+
+The same receipt includes aggregate Linux machine observations immediately before process start and
+after process settlement. Fixed kernel interfaces supply online/allowed CPU counts, load averages,
+available memory, used/total swap, and CPU/memory/I/O pressure-stall information. Missing,
+malformed, oversized, inconsistent, or unavailable facts remain `partial` or `unavailable`; they
+are never converted to zero pressure. Observation time stays outside command elapsed/CPU/RSS, and
+commands without `--measurement` perform no machine observation. These snapshots name no process,
+PID, command, environment, cgroup, repository, or path. They expose benchmark-contamination and
+placement evidence only and add no wait, refusal, signal, scheduling, service-control, cleanup,
+cache, or result-reuse authority.
+
+This additive machine-observation shape is hot-run measurement schema version 2. Existing version 1
+receipts remain historical observations; no producer silently relabels them as pressure-aware.
+
 Unscoped commands use child `getrusage`; profiled commands place GNU `time` inside the scope so CPU
 and peak RSS describe the workload rather than the `systemd-run` launcher. Force termination can
 prevent descendants or the inner timer from reporting complete usage, so those three fields are
