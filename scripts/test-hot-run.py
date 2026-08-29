@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -417,6 +418,77 @@ class HotRunTests(unittest.TestCase):
                     )
             self.assertFalse(destination.exists())
             self.assertEqual(list(state.glob(".private-target.*")), [])
+
+    @unittest.skipUnless(shutil.which("bwrap"), "bubblewrap is unavailable")
+    def test_private_copy_refuses_contention_before_seeding(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            resident = fixture / "resident"
+            task = fixture / "task"
+            state = fixture / "state"
+            executed = fixture / "executed"
+            resident.mkdir()
+            state.mkdir()
+            subprocess.run(["git", "init", "--quiet"], cwd=resident, check=True)
+            (resident / "payload").write_text("resident\n", encoding="utf-8")
+            (resident / "target").mkdir()
+            (resident / "target" / "parent").write_text(
+                "exact warm parent\n", encoding="utf-8"
+            )
+            subprocess.run(["git", "add", "payload"], cwd=resident, check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Glaeda test",
+                    "-c",
+                    "user.email=glaeda-test@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "fixture",
+                ],
+                cwd=resident,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "worktree", "add", "--quiet", "--detach", os.fspath(task)],
+                cwd=resident,
+                check=True,
+            )
+            lock_fd = os.open(state / "lock", os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        os.fspath(HOT_RUN),
+                        "--resident",
+                        os.fspath(resident),
+                        "--task",
+                        os.fspath(task),
+                        "--state",
+                        os.fspath(state),
+                        "--cache",
+                        "target:private-copy",
+                        "--",
+                        "/bin/sh",
+                        "-c",
+                        f"printf executed > {executed}",
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=False,
+                )
+            finally:
+                os.close(lock_fd)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("hot state is already in use", result.stderr)
+            self.assertFalse(executed.exists())
+            self.assertEqual(list(state.glob("private-copy-*")), [])
+            self.assertEqual(list(state.glob(".private-copy-*")), [])
 
     def test_runtime_contract_verifies_before_execution_and_is_recorded(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
