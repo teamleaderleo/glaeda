@@ -136,3 +136,35 @@ The first hosted distributions should be appended here after repeated unchanged 
 - Add Python and current-project Node fixtures with repository-owned validators instead of pinning the product direction to legacy Node versions.
 - Repeat each promoted arm enough times to publish p50 and p90, then add 1/4/8 concurrent-task fan-out with physical disk growth and cleanup latency.
 - Keep semantic test selection and exact reusable verification receipts separate from filesystem/cache residency; they can compose, but neither authorizes the other.
+
+## Controlled big-red fan-out harness
+
+`scripts/benchmark-hot-state-fanout` runs one fixed physical window for the frozen Rust workload.
+It has four closed arms—`ordinary-native`, `private`, `overlay`, and `private-copy`—and accepts only
+fan-out widths 1, 4, or 8. It divides the host's logical CPU grant across simultaneous tasks, primes
+the state required by the selected treatment, applies the exact checked-in edit to every task,
+starts every validator in one bounded window, and always attempts to remove its worktrees and state.
+It cannot accept an arbitrary command, repository, commit, fixture, cache path, or validator.
+
+Inspect the exact plan without mutation:
+
+```bash
+scripts/benchmark-hot-state-fanout --plan --arm private-copy --fanout 4
+```
+
+Run one physical ext4 window with the aggregate receipt outside the disposable scratch root:
+
+```bash
+scripts/benchmark-hot-state-fanout \
+  --arm private-copy \
+  --fanout 4 \
+  --scratch-root /path/to/owned/ext4-scratch \
+  --output /path/to/receipt.json
+```
+
+The aggregate observation binds the harness commit/tree, frozen source/tree/edit, arm, fan-out,
+per-task Cargo grant, setup and complete-window latency, every semantic and `hot-run` receipt,
+logical/allocated bytes before and after the window, and cleanup disposition. A failed task cancels
+the remaining process groups. Setup and byte-observation time remain outside the primary
+request-to-all-results window and are reported separately. The harness grants no policy, cache,
+result-reuse, cleanup, or shared-mutation authority.
