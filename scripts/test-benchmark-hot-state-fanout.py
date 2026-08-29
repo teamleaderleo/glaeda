@@ -290,7 +290,7 @@ class HotStateFanoutTests(unittest.TestCase):
                 json.dumps(valid_benchmark_receipt()), encoding="utf-8"
             )
             hot_run = {
-                "schema_version": 2,
+                "schema_version": 3,
                 "document_type": "glaeda-hot-run-measurement",
                 "exit_code": 0,
                 "completion_reason": "exited",
@@ -300,7 +300,26 @@ class HotStateFanoutTests(unittest.TestCase):
                     "scope": "host_aggregate",
                     "before": {"status": "observed"},
                     "after": {"status": "observed"},
+                    "interval": {
+                        "duration_basis": "command_elapsed",
+                        "elapsed_seconds": 1.0,
+                        "memory": {
+                            "available_bytes_delta": -1024,
+                            "swap_used_bytes_delta": 0,
+                        },
+                        "pressure": {
+                            kind: {
+                                pressure_class: {
+                                    "total_microseconds_delta": 0,
+                                    "stall_fraction_of_command_elapsed": 0.0,
+                                }
+                                for pressure_class in ("some", "full")
+                            }
+                            for kind in ("cpu", "memory", "io")
+                        },
+                    },
                 },
+                "elapsed_seconds": 1.0,
                 "cache_views": [{"path": "target", "mode": "private-copy"}],
                 "state_preparation": [
                     {
@@ -315,6 +334,13 @@ class HotStateFanoutTests(unittest.TestCase):
             task = TaskProcess("task-01", None, benchmark_path, hot_run_path)
             aggregate_task(task, plan, True)
             hot_run["state_preparation"][0]["disposition"] = "reused"
+            hot_run_path.write_text(json.dumps(hot_run), encoding="utf-8")
+            with self.assertRaises(ExperimentError):
+                aggregate_task(task, plan, True)
+            hot_run["state_preparation"][0]["disposition"] = "seeded"
+            hot_run["machine_observation"]["interval"]["pressure"]["cpu"][
+                "some"
+            ]["stall_fraction_of_command_elapsed"] = -0.1
             hot_run_path.write_text(json.dumps(hot_run), encoding="utf-8")
             with self.assertRaises(ExperimentError):
                 aggregate_task(task, plan, True)

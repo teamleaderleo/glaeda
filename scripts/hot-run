@@ -203,6 +203,84 @@ def observe_machine() -> dict[str, object]:
     }
 
 
+def nested_integer(observation: dict[str, object], *keys: str) -> int | None:
+    value: object = observation
+    for key in keys:
+        if not isinstance(value, dict):
+            return None
+        value = value.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def signed_observation_delta(
+    before: dict[str, object], after: dict[str, object], *keys: str
+) -> int | None:
+    before_value = nested_integer(before, *keys)
+    after_value = nested_integer(after, *keys)
+    if before_value is None or after_value is None:
+        return None
+    return after_value - before_value
+
+
+def pressure_observation_interval(
+    before: dict[str, object],
+    after: dict[str, object],
+    elapsed_seconds: float,
+) -> dict[str, object]:
+    pressure: dict[str, object] = {}
+    for kind in PRESSURE_KINDS:
+        classes: dict[str, object] = {}
+        for pressure_class in ("some", "full"):
+            before_total = nested_integer(
+                before,
+                "pressure",
+                kind,
+                pressure_class,
+                "total_microseconds",
+            )
+            after_total = nested_integer(
+                after,
+                "pressure",
+                kind,
+                pressure_class,
+                "total_microseconds",
+            )
+            delta = (
+                after_total - before_total
+                if before_total is not None
+                and after_total is not None
+                and after_total >= before_total
+                else None
+            )
+            stall_fraction = (
+                round(delta / (elapsed_seconds * 1_000_000), 9)
+                if delta is not None
+                and math.isfinite(elapsed_seconds)
+                and elapsed_seconds > 0
+                else None
+            )
+            classes[pressure_class] = {
+                "total_microseconds_delta": delta,
+                "stall_fraction_of_command_elapsed": stall_fraction,
+            }
+        pressure[kind] = classes
+    return {
+        "duration_basis": "command_elapsed",
+        "elapsed_seconds": round(elapsed_seconds, 6),
+        "memory": {
+            "available_bytes_delta": signed_observation_delta(
+                before, after, "memory", "available_bytes"
+            ),
+            "swap_used_bytes_delta": signed_observation_delta(
+                before, after, "memory", "swap_used_bytes"
+            ),
+        },
+        "pressure": pressure,
+    }
+
+
 def git_path(root: Path, argument: str) -> Path:
     git = shutil.which("git")
     if git is None:
@@ -468,7 +546,7 @@ def write_measurement(
     destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     preparation_elapsed = sum(item.elapsed_seconds for item in cache_preparations)
     report = {
-        "schema_version": 2,
+        "schema_version": 3,
         "document_type": "glaeda-hot-run-measurement",
         "authority": "developer_observation_only",
         "cross_worktree": cross_worktree,
@@ -477,6 +555,9 @@ def write_measurement(
             "scope": "host_aggregate",
             "before": machine_before,
             "after": machine_after,
+            "interval": pressure_observation_interval(
+                machine_before, machine_after, elapsed_seconds
+            ),
         },
         "timeout_seconds": timeout_seconds,
         "cache_views": [

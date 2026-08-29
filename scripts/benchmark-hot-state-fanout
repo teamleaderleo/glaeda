@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import pwd
 import shutil
@@ -519,6 +520,67 @@ def tree_bytes(path: Path) -> dict[str, int]:
     }
 
 
+def optional_integer(value: object, *, signed: bool) -> bool:
+    return value is None or (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and (signed or value >= 0)
+    )
+
+
+def optional_nonnegative_number(value: object) -> bool:
+    return value is None or (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and value >= 0
+    )
+
+
+def valid_machine_interval(interval: object, elapsed_seconds: object) -> bool:
+    if not isinstance(interval, dict) or set(interval) != {
+        "duration_basis",
+        "elapsed_seconds",
+        "memory",
+        "pressure",
+    }:
+        return False
+    if (
+        interval["duration_basis"] != "command_elapsed"
+        or interval["elapsed_seconds"] != elapsed_seconds
+        or not optional_nonnegative_number(interval["elapsed_seconds"])
+        or interval["elapsed_seconds"] is None
+    ):
+        return False
+    memory = interval["memory"]
+    if not isinstance(memory, dict) or set(memory) != {
+        "available_bytes_delta",
+        "swap_used_bytes_delta",
+    }:
+        return False
+    if not all(optional_integer(value, signed=True) for value in memory.values()):
+        return False
+    pressure = interval["pressure"]
+    if not isinstance(pressure, dict) or set(pressure) != {"cpu", "memory", "io"}:
+        return False
+    for kind in pressure.values():
+        if not isinstance(kind, dict) or set(kind) != {"some", "full"}:
+            return False
+        for pressure_class in kind.values():
+            if not isinstance(pressure_class, dict) or set(pressure_class) != {
+                "total_microseconds_delta",
+                "stall_fraction_of_command_elapsed",
+            }:
+                return False
+            if not optional_integer(
+                pressure_class["total_microseconds_delta"], signed=False
+            ) or not optional_nonnegative_number(
+                pressure_class["stall_fraction_of_command_elapsed"]
+            ):
+                return False
+    return True
+
+
 def aggregate_task(
     task: TaskProcess, plan: ExperimentPlan, edited: bool
 ) -> dict[str, Any]:
@@ -548,8 +610,16 @@ def aggregate_task(
         for item in observed_preparation or []
         if isinstance(item, dict)
     ]
+    interval = (
+        machine_observation.get("interval")
+        if isinstance(machine_observation, dict)
+        else None
+    )
+    interval_values_are_valid = valid_machine_interval(
+        interval, hot_run.get("elapsed_seconds") if hot_run is not None else None
+    )
     if hot_run is not None and (
-        hot_run.get("schema_version") != 2
+        hot_run.get("schema_version") != 3
         or hot_run.get("document_type") != "glaeda-hot-run-measurement"
         or hot_run.get("exit_code") != 0
         or hot_run.get("completion_reason") != "exited"
@@ -568,6 +638,7 @@ def aggregate_task(
             in ("observed", "partial", "unavailable")
             for phase in ("before", "after")
         )
+        or not interval_values_are_valid
         or (
             plan.arm == "private-copy"
             and not all(

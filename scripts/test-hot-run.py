@@ -104,6 +104,65 @@ class HotRunTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 parse_pressure(invalid)
 
+    def test_machine_interval_derives_only_complete_monotonic_evidence(self) -> None:
+        namespace = runpy.run_path(str(HOT_RUN), run_name="hot_run_test")
+        derive = namespace["pressure_observation_interval"]
+        before = {
+            "memory": {"available_bytes": 1_000, "swap_used_bytes": 200},
+            "pressure": {
+                "cpu": {
+                    "some": {"total_microseconds": 1_000_000},
+                    "full": {"total_microseconds": 0},
+                },
+                "memory": {"some": {"total_microseconds": 50}},
+                "io": {"some": {"total_microseconds": 500}},
+            },
+        }
+        after = {
+            "memory": {"available_bytes": 900, "swap_used_bytes": 230},
+            "pressure": {
+                "cpu": {
+                    "some": {"total_microseconds": 1_500_000},
+                    "full": {"total_microseconds": 0},
+                },
+                "memory": {"some": {"total_microseconds": 75}},
+                "io": {"some": {"total_microseconds": 400}},
+            },
+        }
+
+        interval = derive(before, after, 2.0)
+        self.assertEqual(interval["duration_basis"], "command_elapsed")
+        self.assertEqual(
+            interval["memory"],
+            {"available_bytes_delta": -100, "swap_used_bytes_delta": 30},
+        )
+        self.assertEqual(
+            interval["pressure"]["cpu"]["some"],
+            {
+                "total_microseconds_delta": 500_000,
+                "stall_fraction_of_command_elapsed": 0.25,
+            },
+        )
+        self.assertEqual(
+            interval["pressure"]["memory"]["some"]["total_microseconds_delta"],
+            25,
+        )
+        self.assertIsNone(
+            interval["pressure"]["io"]["some"]["total_microseconds_delta"]
+        )
+        self.assertIsNone(
+            interval["pressure"]["memory"]["full"]["total_microseconds_delta"]
+        )
+        zero_duration = derive(before, after, 0.0)
+        self.assertEqual(
+            zero_duration["pressure"]["cpu"]["some"]["total_microseconds_delta"],
+            500_000,
+        )
+        self.assertIsNone(
+            zero_duration["pressure"]["cpu"]["some"]
+            ["stall_fraction_of_command_elapsed"]
+        )
+
     def test_program_resolution_preserves_dispatch_symlinks(self) -> None:
         resolve_program = runpy.run_path(str(HOT_RUN), run_name="hot_run_test")[
             "resolve_program"
@@ -207,7 +266,7 @@ class HotRunTests(unittest.TestCase):
             self.assertEqual(len(uppers), 1)
             self.assertTrue((uppers[0] / "task-output").is_file())
             report = json.loads(measurement.read_text(encoding="utf-8"))
-            self.assertEqual(report["schema_version"], 2)
+            self.assertEqual(report["schema_version"], 3)
             self.assertEqual(report["authority"], "developer_observation_only")
             self.assertEqual(report["exit_code"], 0)
             self.assertEqual(report["completion_reason"], "exited")
@@ -221,6 +280,14 @@ class HotRunTests(unittest.TestCase):
             self.assertGreater(machine["before"]["online_logical_cpus"], 0)
             self.assertGreaterEqual(
                 machine["before"]["observation_elapsed_seconds"], 0
+            )
+            interval = machine["interval"]
+            self.assertEqual(interval["duration_basis"], "command_elapsed")
+            self.assertEqual(interval["elapsed_seconds"], report["elapsed_seconds"])
+            self.assertIsInstance(
+                interval["pressure"]["cpu"]["some"]
+                ["total_microseconds_delta"],
+                int,
             )
             self.assertTrue(report["cross_worktree"])
             self.assertGreaterEqual(report["elapsed_seconds"], 0)
