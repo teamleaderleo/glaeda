@@ -51,6 +51,7 @@ const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::CLOEXEC);
 const EXISTING_FILE_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::NOFOLLOW)
+    .union(OFlags::NONBLOCK)
     .union(OFlags::CLOEXEC);
 const EXISTING_LOCK_FLAGS: OFlags = OFlags::RDWR.union(OFlags::NOFOLLOW).union(OFlags::CLOEXEC);
 const NEW_FILE_FLAGS: OFlags = OFlags::WRONLY
@@ -1342,8 +1343,11 @@ mod tests {
     use std::fs as stdfs;
     use std::os::unix::fs::{PermissionsExt as _, symlink};
     use std::path::{Path, PathBuf};
-    use std::sync::Arc;
+    use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, mpsc};
+    use std::thread;
+    use std::time::Duration;
 
     use rustix::fs::{self, AtFlags, Mode};
 
@@ -1626,6 +1630,55 @@ mod tests {
                 .expect_err("shared-instance operation must be busy")
                 .kind(),
             ProtectedCacheCatalogStoreErrorKind::Busy
+        );
+    }
+
+    #[test]
+    fn catalog_and_stage_fifos_fail_without_blocking_for_a_writer() {
+        let root = TestInstallation::new("fifo");
+        let store = Arc::new(open(&root));
+        let catalog = root.store_path().join(CATALOG_FILE);
+        assert!(
+            Command::new("/usr/bin/mkfifo")
+                .arg(&catalog)
+                .status()
+                .expect("create catalog FIFO")
+                .success()
+        );
+        let (sender, receiver) = mpsc::channel();
+        let shared = Arc::clone(&store);
+        thread::spawn(move || {
+            let _ = sender.send(shared.load());
+        });
+        assert_eq!(
+            receiver
+                .recv_timeout(Duration::from_secs(2))
+                .expect("catalog FIFO load must not wait for a writer")
+                .expect_err("catalog FIFO must fail")
+                .kind(),
+            ProtectedCacheCatalogStoreErrorKind::UnsafeFilesystem
+        );
+        stdfs::remove_file(&catalog).expect("remove catalog FIFO");
+
+        let stage = root.store_path().join(".catalog-stage-1-1.json");
+        assert!(
+            Command::new("/usr/bin/mkfifo")
+                .arg(&stage)
+                .status()
+                .expect("create stage FIFO")
+                .success()
+        );
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = sender.send(store.recover_abandoned_create());
+        });
+        assert_eq!(
+            receiver
+                .recv_timeout(Duration::from_secs(2))
+                .expect("stage FIFO recovery must not wait for a writer")
+                .expect_err("stage FIFO must fail")
+                .kind(),
+            ProtectedCacheCatalogStoreErrorKind::UnsafeFilesystem
         );
     }
 
