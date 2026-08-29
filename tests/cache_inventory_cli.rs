@@ -102,6 +102,7 @@ fn status_and_reclaim_dry_run_share_the_safe_typed_report() {
         status.stderr
     );
     let status_json = json(&status);
+    assert_eq!(status_json["authority"], "supplied_observation_only");
     assert_eq!(status_json["operation"], "status");
     assert_eq!(status_json["mutation_performed"], false);
     assert_eq!(status_json["summary"]["state_count"], 2);

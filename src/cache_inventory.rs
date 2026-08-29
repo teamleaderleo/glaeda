@@ -245,6 +245,25 @@ impl CacheReportOperation {
     }
 }
 
+/// Authority carried by one cache classification report.
+///
+/// The current CLI classifies a caller-supplied observation document. This value explicitly
+/// prevents that classification from being promoted into family ownership or cleanup authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheInventoryAuthority {
+    SuppliedObservationOnly,
+}
+
+impl CacheInventoryAuthority {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SuppliedObservationOnly => "supplied_observation_only",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CacheStateClassification {
@@ -369,6 +388,7 @@ pub struct CacheInventorySummary {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CacheInventoryReport {
     schema_version: u8,
+    authority: CacheInventoryAuthority,
     operation: CacheReportOperation,
     mutation_performed: bool,
     summary: CacheInventorySummary,
@@ -376,6 +396,11 @@ pub struct CacheInventoryReport {
 }
 
 impl CacheInventoryReport {
+    #[must_use]
+    pub const fn authority(&self) -> CacheInventoryAuthority {
+        self.authority
+    }
+
     #[must_use]
     pub const fn operation(&self) -> CacheReportOperation {
         self.operation
@@ -426,6 +451,7 @@ pub fn build_cache_inventory_report(
     let summary = summarize(&states)?;
     Ok(CacheInventoryReport {
         schema_version: CACHE_INVENTORY_REPORT_SCHEMA_VERSION,
+        authority: CacheInventoryAuthority::SuppliedObservationOnly,
         operation,
         mutation_performed: false,
         summary,
@@ -623,8 +649,9 @@ fn checked_bytes(left: u64, right: u64) -> Result<u64, CacheInventoryError> {
 #[must_use]
 pub fn render_cache_inventory_human(report: &CacheInventoryReport) -> String {
     let mut output = format!(
-        "cache {}: states={}, reclaimable={}, reclaimable_allocated_bytes={}, mutation_performed=false\n",
+        "cache {}\nauthority: {}\nstates={}, reclaimable={}, reclaimable_allocated_bytes={}, mutation_performed=false\n",
         report.operation.as_str(),
+        report.authority.as_str(),
         report.summary.state_count,
         report.summary.reclaimable_count,
         report.summary.reclaimable_allocated_bytes,
@@ -708,8 +735,9 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        CacheInventoryErrorKind, CacheReportRequest, CacheStateClassification, CacheStateId,
-        CacheStateReason, build_cache_inventory_report, decode_cache_inventory,
+        CacheInventoryAuthority, CacheInventoryErrorKind, CacheReportRequest,
+        CacheStateClassification, CacheStateId, CacheStateReason, build_cache_inventory_report,
+        decode_cache_inventory, render_cache_inventory_human,
     };
 
     fn document(states: Vec<Value>) -> Vec<u8> {
@@ -749,6 +777,14 @@ mod tests {
             .expect("build report");
 
         assert_eq!(report.states().len(), 1);
+        assert_eq!(
+            report.authority(),
+            CacheInventoryAuthority::SuppliedObservationOnly
+        );
+        assert!(
+            render_cache_inventory_human(&report)
+                .contains("authority: supplied_observation_only\n")
+        );
         assert_eq!(
             report.states()[0].classification(),
             CacheStateClassification::Reclaimable
