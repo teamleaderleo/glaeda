@@ -696,7 +696,27 @@ def prime_resident(
         terminate_tasks([task])
         raise
     if failure is not None:
-        raise ExperimentError("resident parent preparation failed")
+        benchmark: dict[str, Any] | None = None
+        semantic_validation = "unobserved"
+        if receipt.is_file():
+            try:
+                benchmark = read_json(receipt)
+                validate_benchmark_receipt(
+                    benchmark,
+                    edited=False,
+                    expected_cargo_jobs=plan.logical_cpus,
+                )
+                semantic_validation = "accepted"
+            except ExperimentError:
+                semantic_validation = "rejected"
+        return {
+            "elapsed_seconds": round(elapsed, 6),
+            "maximum_simultaneous_observed": maximum_running,
+            "process_exit_code": task.process.returncode,
+            "semantic_validation": semantic_validation,
+            "failure": failure,
+            "benchmark": benchmark,
+        }
     benchmark = read_json(receipt)
     validate_benchmark_receipt(
         benchmark, edited=False, expected_cargo_jobs=plan.logical_cpus
@@ -704,6 +724,9 @@ def prime_resident(
     return {
         "elapsed_seconds": round(elapsed, 6),
         "maximum_simultaneous_observed": maximum_running,
+        "process_exit_code": task.process.returncode,
+        "semantic_validation": "accepted",
+        "failure": None,
         "benchmark": benchmark,
     }
 
@@ -760,24 +783,7 @@ def run_experiment(
     storage_filesystem: dict[str, Any] = {
         "before": filesystem_observation(scratch_root)
     }
-    experiment = Path(
-        tempfile.mkdtemp(
-            prefix=f"glaeda-hot-state-{plan.arm}-{plan.fanout}.", dir=scratch_root
-        )
-    )
-    experiment.chmod(0o700)
-    worktrees = experiment / "worktrees"
-    states_root = experiment / "states"
-    receipts = experiment / "receipts"
-    temporary_root = experiment / "tmp"
-    for directory in (worktrees, states_root, receipts, temporary_root):
-        directory.mkdir(mode=0o700)
-    resident = worktrees / "resident"
-    tasks = [worktrees / f"task-{index:02d}" for index in range(1, plan.fanout + 1)]
-    states = [states_root / f"task-{index:02d}" for index in range(1, plan.fanout + 1)]
-    temporary_directories = [
-        temporary_root / f"task-{index:02d}" for index in range(1, plan.fanout + 1)
-    ]
+    experiment: Path | None = None
     created_worktrees: list[Path] = []
     setup: dict[str, Any] = {}
     window: dict[str, Any] = {}
@@ -785,6 +791,30 @@ def run_experiment(
     result = "failed"
     failure: str | None = None
     try:
+        experiment = Path(
+            tempfile.mkdtemp(
+                prefix=f"glaeda-hot-state-{plan.arm}-{plan.fanout}.",
+                dir=scratch_root,
+            )
+        )
+        experiment.chmod(0o700)
+        worktrees = experiment / "worktrees"
+        states_root = experiment / "states"
+        receipts = experiment / "receipts"
+        temporary_root = experiment / "tmp"
+        for directory in (worktrees, states_root, receipts, temporary_root):
+            directory.mkdir(mode=0o700)
+        resident = worktrees / "resident"
+        tasks = [
+            worktrees / f"task-{index:02d}" for index in range(1, plan.fanout + 1)
+        ]
+        states = [
+            states_root / f"task-{index:02d}" for index in range(1, plan.fanout + 1)
+        ]
+        temporary_directories = [
+            temporary_root / f"task-{index:02d}"
+            for index in range(1, plan.fanout + 1)
+        ]
         add_worktree(repository, resident)
         created_worktrees.append(resident)
         for task in tasks:
@@ -792,12 +822,15 @@ def run_experiment(
             created_worktrees.append(task)
 
         if plan.arm in ("overlay", "private-copy"):
-            setup["resident_prime"] = prime_resident(
+            resident_prime = prime_resident(
                 plan,
                 resident,
                 receipts / "resident-prime.json",
                 temporary_root / "resident",
             )
+            setup["resident_prime"] = resident_prime
+            if resident_prime["failure"] is not None:
+                raise ExperimentError(str(resident_prime["failure"]))
         else:
             (resident / "target").mkdir(mode=0o700)
             prime_elapsed, prime_tasks, prime_failure, prime_maximum = run_cohort(
@@ -878,12 +911,14 @@ def run_experiment(
                 removed_worktrees += 1
             except (ExperimentError, OSError):
                 cleanup_errors.append("experiment worktree cleanup failed")
-        if not cleanup_errors:
+        if experiment is None:
+            cleanup["disposition"] = "no_state_created"
+        elif not cleanup_errors:
             try:
                 shutil.rmtree(experiment)
             except OSError:
                 cleanup_errors.append("experiment state cleanup failed")
-        if not cleanup_errors:
+        if experiment is not None and not cleanup_errors:
             cleanup["disposition"] = "removed"
         else:
             cleanup["disposition"] = "recovery_required"

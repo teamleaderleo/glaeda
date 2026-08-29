@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 
@@ -258,6 +259,37 @@ class HotStateFanoutTests(unittest.TestCase):
             hot_run_path.write_text(json.dumps(hot_run), encoding="utf-8")
             with self.assertRaises(ExperimentError):
                 aggregate_task(task, plan, True)
+
+    def test_failed_resident_prime_retains_bounded_attempt_evidence(self) -> None:
+        build_plan = NAMESPACE["build_plan"]
+        prime_resident = NAMESPACE["prime_resident"]
+        TaskProcess = NAMESPACE["TaskProcess"]
+        plan = build_plan("private-copy", 1, 16)
+        failed_task = TaskProcess(
+            "resident",
+            SimpleNamespace(returncode=7),
+            Path("missing-benchmark.json"),
+            None,
+        )
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            prime_resident.__globals__,
+            {
+                "start_task": mock.Mock(return_value=failed_task),
+                "wait_for_tasks": mock.Mock(
+                    return_value=(0.25, "one or more fan-out tasks failed", 1)
+                ),
+            },
+        ):
+            result = prime_resident(
+                plan,
+                Path(directory),
+                Path(directory) / "missing-benchmark.json",
+                Path(directory) / "tmp",
+            )
+        self.assertEqual(result["process_exit_code"], 7)
+        self.assertEqual(result["semantic_validation"], "unobserved")
+        self.assertEqual(result["failure"], "one or more fan-out tasks failed")
+        self.assertIsNone(result["benchmark"])
 
 
 if __name__ == "__main__":
