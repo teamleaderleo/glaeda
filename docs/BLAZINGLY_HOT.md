@@ -206,6 +206,12 @@ two-window medians beat Overlay by 6.19% warm and 11.76% cold. Explicit
 path policies remain unchanged, so source and suitable dependency paths can still select Overlay
 or read-only sharing while same-worktree execution remains explicit `native` observation.
 
+The same closed harness can add `--retained-reuse` to execute the complete validator a second time
+against the already-accepted edit and retained task state. Its comparison basis names this as a
+distinct state phase, so first materialization and repeated command execution cannot be mixed as
+one pressure treatment. This measures the repeated developer loop Glaeda is intended to improve;
+it does not skip tests or grant cached-result authority.
+
 Python and Node projects can explicitly reuse immutable prepared dependencies while keeping build
 output private:
 

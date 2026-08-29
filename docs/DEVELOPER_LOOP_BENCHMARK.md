@@ -198,6 +198,15 @@ rather than claiming a globally cold cache; it never writes `/proc/sys/vm/drop_c
 unrelated trees. The harness grants no policy, cache, result-reuse, cleanup, or shared-mutation
 authority.
 
+`--retained-reuse` adds one immediate second validation window without recreating worktrees,
+reapplying the edit, or replacing task state. The first edit and retained-reuse windows have
+different comparison keys: the former binds `initial_for_source_state`, while the latter binds
+`retained_after_accepted_edit`. This prevents a pressure comparator from treating first-use and
+already-retained work as the same treatment. For `private-copy`, the first window must prove a
+positive-time `seeded` preparation and the second must prove zero-time `reused`; either mismatch
+rejects the observation. The second window still executes and validates the complete frozen
+1,343-test workload. It is therefore a command-reuse measurement, not result reuse.
+
 ### First exact-head matched fan-out control
 
 The first physical use of the harness ran `A-B-B-A` at fan-out 1 on big-red, where `A` was
