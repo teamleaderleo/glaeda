@@ -293,8 +293,15 @@ PID, command, environment, cgroup, repository, or path. They expose benchmark-co
 placement evidence only and add no wait, refusal, signal, scheduling, service-control, cleanup,
 cache, or result-reuse authority.
 
-This additive machine-observation shape is hot-run measurement schema version 2. Existing version 1
-receipts remain historical observations; no producer silently relabels them as pressure-aware.
+The receipt also derives signed available-memory and swap-use deltas plus monotonic PSI cumulative
+counter deltas and stall fractions over command elapsed time. These values require complete
+before/after endpoints; missing evidence or a counter reset remains `null`. The snapshot envelope
+is very slightly wider than child elapsed, so tiny-command fractions are contamination evidence,
+not an admission threshold.
+
+This derived machine-observation shape is hot-run measurement schema version 3. Existing version 1
+and 2 receipts remain historical observations; no producer silently relabels them as
+interval-aware.
 
 Unscoped commands use child `getrusage`; profiled commands place GNU `time` inside the scope so CPU
 and peak RSS describe the workload rather than the `systemd-run` launcher. Force termination can
