@@ -1,6 +1,8 @@
 /// Read-only observation of one configured official Actions runner.
 pub mod actions_runner_readiness;
 pub mod artifact;
+/// Pure, path-free classification of explicit hot-state inventory observations.
+pub mod cache_inventory;
 /// Pure workload-neutral pre-admission compute request.
 pub mod compute_execution_request;
 /// Pure workload-family-neutral identity for declared compute semantics.
