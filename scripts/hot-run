@@ -59,12 +59,19 @@ class CachePreparation:
 class RuntimeContract:
     runtime_id: str
     program_sha256: str
+    runtime_bin_binding_sha256: str | None = None
 
 
 @dataclass(frozen=True)
 class RuntimeDeclaration:
     runtime_id: str
     expected_program_sha256: str | None
+
+
+@dataclass(frozen=True)
+class RuntimeBinBinding:
+    path: Path
+    identity_sha256: str
 
 
 def nonnegative_finite(raw: str) -> float:
@@ -359,11 +366,17 @@ def default_state_root(
 def runtime_state_root(base: Path, runtime: RuntimeContract | None) -> Path:
     if runtime is None:
         return base
-    identity = hashlib.sha256(
+    digest = hashlib.sha256(
         runtime.runtime_id.encode("ascii")
         + b"\0"
         + runtime.program_sha256.encode("ascii")
-    ).hexdigest()
+    )
+    if runtime.runtime_bin_binding_sha256 is not None:
+        digest.update(
+            b"\0runtime-bin-first-v1\0"
+            + runtime.runtime_bin_binding_sha256.encode("ascii")
+        )
+    identity = digest.hexdigest()
     return base / f"runtime-{identity}"
 
 
@@ -422,7 +435,9 @@ def prepare_private_copy(
     )
 
 
-def resolve_program(command: list[str], task: Path) -> list[str]:
+def resolve_program(
+    command: list[str], task: Path, search_path: str | None = None
+) -> list[str]:
     requested = command[0]
     if os.path.sep in requested:
         candidate = Path(requested)
@@ -430,7 +445,7 @@ def resolve_program(command: list[str], task: Path) -> list[str]:
             candidate = task / candidate
         program = Path(os.path.abspath(candidate))
     else:
-        found = shutil.which(requested)
+        found = shutil.which(requested, path=search_path)
         if found is None:
             raise RuntimeError(f"command is unavailable: {requested}")
         # Preserve dispatch symlinks such as rustup's `cargo` and multicall utilities.
@@ -438,6 +453,66 @@ def resolve_program(command: list[str], task: Path) -> list[str]:
     if not program.is_file() or not os.access(program, os.X_OK):
         raise RuntimeError(f"command is not executable: {requested}")
     return [os.fspath(program), *command[1:]]
+
+
+def runtime_bin_identity(path: Path, details: os.stat_result) -> str:
+    digest = hashlib.sha256(b"glaeda-hot-run-runtime-bin-v1")
+    digest.update(b"\0" + os.fsencode(path))
+    for value in (
+        details.st_dev,
+        details.st_ino,
+        details.st_uid,
+        details.st_gid,
+        stat.S_IMODE(details.st_mode),
+        details.st_nlink,
+        details.st_size,
+        details.st_mtime_ns,
+        details.st_ctime_ns,
+    ):
+        digest.update(b"\0" + str(value).encode("ascii"))
+    return f"sha256:{digest.hexdigest()}"
+
+
+def observe_runtime_bin(
+    runtime_bin: Path | None, runtime_id: str | None
+) -> RuntimeBinBinding | None:
+    if runtime_bin is None:
+        return None
+    if runtime_id is None:
+        raise RuntimeError("runtime bin binding requires a runtime ID")
+    if not runtime_bin.is_absolute():
+        raise RuntimeError("runtime bin binding must be an absolute canonical path")
+    path = Path(os.path.abspath(runtime_bin))
+    if path != runtime_bin:
+        raise RuntimeError("runtime bin binding must be an absolute canonical path")
+    try:
+        details = path.lstat()
+        resolved = path.resolve(strict=True)
+    except OSError as error:
+        raise RuntimeError("runtime bin binding is unavailable") from error
+    if stat.S_ISLNK(details.st_mode) or not stat.S_ISDIR(details.st_mode):
+        raise RuntimeError("runtime bin binding is not a plain directory")
+    if resolved != path:
+        raise RuntimeError("runtime bin binding contains a symbolic-link component")
+    return RuntimeBinBinding(path, runtime_bin_identity(path, details))
+
+
+def revalidate_runtime_bin(binding: RuntimeBinBinding) -> None:
+    current = observe_runtime_bin(binding.path, "revalidate")
+    assert current is not None
+    if current.identity_sha256 != binding.identity_sha256:
+        raise RuntimeError("runtime bin binding changed during preflight")
+
+
+def runtime_environment(binding: RuntimeBinBinding | None) -> dict[str, str] | None:
+    if binding is None:
+        return None
+    environment = os.environ.copy()
+    inherited = environment.get("PATH")
+    environment["PATH"] = os.fspath(binding.path) + (
+        os.pathsep + inherited if inherited else ""
+    )
+    return environment
 
 
 def parse_runtime_contract(
@@ -482,10 +557,16 @@ def canonical_comparison_key(value: str) -> str:
 
 
 def verify_runtime_contract(
-    declaration: RuntimeDeclaration | None, program: Path
+    declaration: RuntimeDeclaration | None,
+    program: Path,
+    runtime_bin: RuntimeBinBinding | None,
 ) -> RuntimeContract | None:
     if declaration is None:
         return None
+    if runtime_bin is not None:
+        if program.parent != runtime_bin.path:
+            raise RuntimeError("runtime executable is outside the bound runtime bin")
+        revalidate_runtime_bin(runtime_bin)
     digest = hashlib.sha256()
     with program.open("rb") as executable:
         while chunk := executable.read(1024 * 1024):
@@ -496,7 +577,13 @@ def verify_runtime_contract(
         and observed != declaration.expected_program_sha256
     ):
         raise RuntimeError("runtime executable content does not match declared digest")
-    return RuntimeContract(declaration.runtime_id, observed)
+    if runtime_bin is not None:
+        revalidate_runtime_bin(runtime_bin)
+    return RuntimeContract(
+        declaration.runtime_id,
+        observed,
+        runtime_bin.identity_sha256 if runtime_bin is not None else None,
+    )
 
 
 def positive_seconds(value: str) -> float:
@@ -592,6 +679,16 @@ def write_measurement(
             {
                 "id": runtime_contract.runtime_id,
                 "program_sha256": runtime_contract.program_sha256,
+                **(
+                    {
+                        "descendant_path": "runtime_bin_first",
+                        "runtime_bin_binding_sha256": (
+                            runtime_contract.runtime_bin_binding_sha256
+                        ),
+                    }
+                    if runtime_contract.runtime_bin_binding_sha256 is not None
+                    else {}
+                ),
             }
             if runtime_contract is not None
             else None
@@ -840,6 +937,7 @@ def run(
     cache_arguments: list[str],
     runtime_id: str | None,
     runtime_sha256: str | None,
+    runtime_bin_argument: Path | None,
     measurement: Path | None,
     resource_profile: str | None,
     comparison_key: str | None,
@@ -864,10 +962,21 @@ def run(
     except ValueError as error:
         raise RuntimeError("task working directory is outside its Git worktree") from error
     stable_cwd = resident / relative_cwd
-    resolved_command = resolve_program(command, task_cwd)
+    runtime_declaration = parse_runtime_contract(runtime_id, runtime_sha256)
+    runtime_bin = observe_runtime_bin(
+        runtime_bin_argument,
+        runtime_declaration.runtime_id if runtime_declaration is not None else None,
+    )
+    bound_environment = runtime_environment(runtime_bin)
+    resolved_command = resolve_program(
+        command,
+        task_cwd,
+        bound_environment.get("PATH") if bound_environment is not None else None,
+    )
     runtime_contract = verify_runtime_contract(
-        parse_runtime_contract(runtime_id, runtime_sha256),
+        runtime_declaration,
         Path(resolved_command[0]),
+        runtime_bin,
     )
     cache_specs = (
         parse_cache_specs(cache_arguments)
@@ -879,7 +988,7 @@ def run(
         return execute(
             resolved_command,
             task_cwd,
-            None,
+            bound_environment,
             measurement,
             (),
             (),
@@ -974,8 +1083,9 @@ def run(
         git_pointer.write_text(f"gitdir: {stable_task_git}\n", encoding="utf-8")
         git_pointer.chmod(0o600)
 
-        environment = os.environ.copy()
-        rust_tool_environment(task, resolved_command, environment)
+        environment = bound_environment or os.environ.copy()
+        if runtime_bin is None:
+            rust_tool_environment(task, resolved_command, environment)
         arguments = [
             os.path.abspath(bubblewrap),
             "--die-with-parent",
@@ -1043,6 +1153,15 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--runtime-bin",
+        type=Path,
+        help=(
+            "bind one canonical toolchain bin directory, resolve the launched "
+            "executable there, and place it first in descendant PATH; requires "
+            "--runtime-id"
+        ),
+    )
+    parser.add_argument(
         "--measurement",
         type=Path,
         help="atomically write one bounded developer-observation JSON measurement",
@@ -1095,6 +1214,7 @@ def main() -> int:
             arguments.cache,
             arguments.runtime_id,
             arguments.runtime_sha256,
+            arguments.runtime_bin,
             arguments.measurement,
             arguments.resource_profile,
             arguments.comparison_key,

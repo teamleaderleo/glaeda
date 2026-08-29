@@ -227,18 +227,42 @@ scripts/hot-run --resident /path/to/node-resident --task /path/to/task \
   -- /path/to/node ./node_modules/.bin/next build
 ```
 
+Commands that launch descendant shebangs through `PATH` can opt into one stronger local binding:
+
+```bash
+scripts/hot-run --resident /path/to/node-resident --task /path/to/task \
+  --cache node_modules:ro --cache .next:private \
+  --runtime-id node-v26.8.1-linux-x64 \
+  --runtime-sha256 sha256:<exact-node-digest> \
+  --runtime-bin /path/to/node-v26.8.1-linux-x64/bin \
+  -- node ./node_modules/.bin/next build
+```
+
+`--runtime-bin` requires a runtime ID, accepts only one absolute canonical plain directory, resolves
+the launched executable from that directory, and places the directory first in the inherited
+descendant `PATH`. The receipt records only `runtime_bin_first` plus an opaque binding digest; the
+private-state namespace also includes that digest, so bound and unbound executions or replaced
+directories cannot share mutable lineage. No private path is recorded.
+
+This closes the common `/usr/bin/env node` and package-script shebang path for an explicitly
+selected ultra-trusted toolchain. It does not hash the whole toolchain tree, intercept absolute
+descendant paths, override explicit language-specific executable variables, identify package
+manager semantics, or make mutable runtime bytes hostile-safe. A replaced directory is refused
+during preflight; in-place mutation remains the caller's quiescence/generation responsibility.
+
 The runtime ID is optional. When present, `hot-run` resolves the command executable, hashes its
 content before launch, records the public ID plus exact observed digest, and places mutable
 private/overlay state below a digest-specific opaque namespace. An optional `--runtime-sha256`
 turns that observation into an expected-digest check and refuses drift. Supplying a digest without
 an ID is invalid.
 
-Both forms prevent changed front-door bytes from silently sharing one private build-state lineage.
-Only the explicit-digest form proves agreement with a separately declared generation. Both bind
-the front-door executable only: neither is automatic language-manifest discovery, a claim about
-descendant executables, or a hostile-code security boundary. The ultra-trusted caller remains
-responsible for declaring the right runtime and for preventing an in-place executable replacement
-between observation and execution.
+The two front-door-only forms prevent changed launched bytes from silently sharing one private
+build-state lineage. Only the explicit-digest form proves agreement with a separately declared
+generation. Without `--runtime-bin`, neither is automatic language-manifest discovery, a claim
+about descendant executables, or a hostile-code security boundary. With `--runtime-bin`, only
+ordinary descendant `PATH` selection is added. The ultra-trusted caller remains responsible for
+declaring the right runtime and preventing in-place executable or toolchain replacement between
+observation and execution.
 
 `scripts/hot-observe` is the read-only companion for state that may already be resident. A
 repository adapter supplies bounded public labels for canonical input files and prepared-state
@@ -277,7 +301,8 @@ decision.
 
 `--measurement result.json` atomically writes one bounded developer observation containing command
 elapsed time, user/system CPU time, peak RSS, exit/signal, completion reason, configured timeout,
-cross-worktree mode, relative cache policies, and the optional public runtime contract. A
+cross-worktree mode, relative cache policies, and the optional public runtime contract plus its
+path-free descendant-bin binding when selected. A
 `private-copy` observation also records whether the lineage was seeded or reused, its copy wall
 time, and command-plus-copy wall time. Copy CPU/RSS are not included in the command resource fields.
 The receipt contains no command, output, environment, repository identity, or private path and

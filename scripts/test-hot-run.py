@@ -759,6 +759,183 @@ class HotRunTests(unittest.TestCase):
             )
             self.assertNotIn(os.fspath(fixture), measurement.read_text(encoding="utf-8"))
 
+    def test_runtime_bin_binding_closes_descendant_path_and_is_path_free(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            runtime_bin = fixture / "toolchain" / "bin"
+            fallback_bin = fixture / "fallback"
+            runtime_bin.mkdir(parents=True)
+            fallback_bin.mkdir()
+            runtime = runtime_bin / "runtime"
+            descendant = runtime_bin / "runtime-child"
+            fallback_descendant = fallback_bin / "runtime-child"
+            output = fixture / "output"
+            measurement = fixture / "measurement.json"
+            runtime.write_text(
+                '#!/bin/sh\nexec /usr/bin/env runtime-child "$1"\n',
+                encoding="utf-8",
+            )
+            descendant.write_text(
+                '#!/bin/sh\nprintf bound > "$1"\n', encoding="utf-8"
+            )
+            fallback_descendant.write_text(
+                '#!/bin/sh\nprintf fallback > "$1"\n', encoding="utf-8"
+            )
+            for program in (runtime, descendant, fallback_descendant):
+                program.chmod(0o700)
+            digest = hashlib.sha256(runtime.read_bytes()).hexdigest()
+            environment = os.environ.copy()
+            environment["PATH"] = os.pathsep.join(
+                (os.fspath(fallback_bin), "/usr/bin", "/bin")
+            )
+
+            bound = subprocess.run(
+                [
+                    sys.executable,
+                    os.fspath(HOT_RUN),
+                    "--resident",
+                    os.fspath(ROOT),
+                    "--task",
+                    os.fspath(ROOT),
+                    "--runtime-id",
+                    "test-runtime-bound",
+                    "--runtime-sha256",
+                    f"sha256:{digest}",
+                    "--runtime-bin",
+                    os.fspath(runtime_bin),
+                    "--measurement",
+                    os.fspath(measurement),
+                    "--",
+                    "runtime",
+                    os.fspath(output),
+                ],
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(bound.returncode, 0, bound.stderr)
+            self.assertEqual(output.read_text(encoding="utf-8"), "bound")
+            report_text = measurement.read_text(encoding="utf-8")
+            report = json.loads(report_text)
+            self.assertEqual(report["runtime"]["id"], "test-runtime-bound")
+            self.assertEqual(
+                report["runtime"]["program_sha256"], f"sha256:{digest}"
+            )
+            self.assertEqual(
+                report["runtime"]["descendant_path"], "runtime_bin_first"
+            )
+            self.assertRegex(
+                report["runtime"]["runtime_bin_binding_sha256"],
+                r"^sha256:[0-9a-f]{64}$",
+            )
+            self.assertNotIn(os.fspath(fixture), report_text)
+
+            output.unlink()
+            unbound = subprocess.run(
+                [
+                    sys.executable,
+                    os.fspath(HOT_RUN),
+                    "--resident",
+                    os.fspath(ROOT),
+                    "--task",
+                    os.fspath(ROOT),
+                    "--runtime-id",
+                    "test-runtime-bound",
+                    "--runtime-sha256",
+                    f"sha256:{digest}",
+                    "--",
+                    os.fspath(runtime),
+                    os.fspath(output),
+                ],
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(unbound.returncode, 0, unbound.stderr)
+            self.assertEqual(output.read_text(encoding="utf-8"), "fallback")
+
+            namespace = runpy.run_path(str(HOT_RUN), run_name="hot_run_test")
+            binding = namespace["observe_runtime_bin"](
+                runtime_bin, "test-runtime-bound"
+            )
+            self.assertIsNotNone(binding)
+            RuntimeContract = namespace["RuntimeContract"]
+            state = Path("/tmp/glaeda-runtime-state-test")
+            unbound_contract = RuntimeContract(
+                "test-runtime-bound", f"sha256:{digest}"
+            )
+            bound_contract = RuntimeContract(
+                "test-runtime-bound",
+                f"sha256:{digest}",
+                binding.identity_sha256,
+            )
+            self.assertNotEqual(
+                namespace["runtime_state_root"](state, unbound_contract),
+                namespace["runtime_state_root"](state, bound_contract),
+            )
+
+    def test_runtime_bin_binding_refuses_invalid_or_changed_directories(self) -> None:
+        namespace = runpy.run_path(str(HOT_RUN), run_name="hot_run_test")
+        observe = namespace["observe_runtime_bin"]
+        revalidate = namespace["revalidate_runtime_bin"]
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            runtime_bin = fixture / "bin"
+            runtime_bin.mkdir()
+            program = runtime_bin / "runtime"
+            program.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            program.chmod(0o700)
+
+            with self.assertRaisesRegex(RuntimeError, "requires a runtime ID"):
+                observe(runtime_bin, None)
+            with self.assertRaisesRegex(RuntimeError, "absolute canonical path"):
+                observe(Path("relative/bin"), "runtime")
+            regular_file = fixture / "not-a-directory"
+            regular_file.write_text("not a directory", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "not a plain directory"):
+                observe(regular_file, "runtime")
+            alias = fixture / "alias"
+            alias.symlink_to(runtime_bin, target_is_directory=True)
+            with self.assertRaisesRegex(RuntimeError, "not a plain directory"):
+                observe(alias, "runtime")
+
+            outside = subprocess.run(
+                [
+                    sys.executable,
+                    os.fspath(HOT_RUN),
+                    "--resident",
+                    os.fspath(ROOT),
+                    "--task",
+                    os.fspath(ROOT),
+                    "--runtime-id",
+                    "test-runtime-bound",
+                    "--runtime-bin",
+                    os.fspath(runtime_bin),
+                    "--",
+                    "/bin/true",
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(outside.returncode, 2)
+            self.assertIn("outside the bound runtime bin", outside.stderr)
+
+            binding = observe(runtime_bin, "runtime")
+            moved = fixture / "old-bin"
+            runtime_bin.rename(moved)
+            runtime_bin.mkdir()
+            with self.assertRaisesRegex(RuntimeError, "changed during preflight"):
+                revalidate(binding)
+
     def test_runtime_contract_rejects_digest_without_id_and_noncanonical_values(
         self,
     ) -> None:
