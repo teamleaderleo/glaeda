@@ -177,3 +177,49 @@ constant. Setup and byte-observation time remain outside the primary request-to-
 and are reported separately. Page-cache state is explicitly uncontrolled/resident in this harness;
 the cold-read discriminator is a separate experiment. The harness grants no policy, cache,
 result-reuse, cleanup, or shared-mutation authority.
+
+### First exact-head matched fan-out control
+
+The first physical use of the harness ran `A-B-B-A` at fan-out 1 on big-red, where `A` was
+`ordinary-native` and `B` was `private-copy`. All four observations bound exact clean harness commit
+`e911d69947ba62661f085b51235ef304f8d1d250`, ext4 mount ID 44, device 259:2, the frozen workload
+above, Rust/Cargo 1.97.1, and one 16-CPU affinity set. The harness held the child environment and
+Cargo concurrency constant. Page cache remained resident/uncontrolled and memory remained
+host-default unbounded as declared by the experiment. No competing build or test process was seen
+at the initial observation; initial host load averages were 0.71, 1.03, and 1.30.
+
+| Order | Arm | Complete edit window (s) | Inner workload (s) | Private-copy preparation (s) | Command after preparation (s) | Peak RSS KiB | Result |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| A1 | ordinary-native | 13.841862 | 13.74 | n/a | n/a | 1,637,572 | green |
+| B1 | private-copy | 12.933524 | 12.26 | 0.513091 | 12.362230 | 1,633,464 | green |
+| B2 | private-copy | 17.180191 | 14.79 | 1.403091 | 15.245866 | 1,633,792 | green |
+| A2 | ordinary-native | 13.992653 | 13.86 | n/a | n/a | 1,636,552 | green |
+
+The two-sample complete-window medians were 13.917258 seconds for ordinary native and 15.056858
+seconds for private-copy. Private-copy was therefore 1.139600 seconds, or 8.19%, slower in this
+small matched control. Its inner-workload median was 13.525 seconds versus 13.800 seconds native,
+but its median `hot-run` command time was 13.804048 seconds and median first-use preparation was
+0.958091 seconds. One candidate window beat the native median by 7.07%; the other missed it by
+23.45%. That spread is evidence against a default change from two samples, not evidence for picking
+the favorable sample.
+
+The native tasks grew from about 2.042 GB allocated after prime to about 3.247 GB after the edit.
+Each private-copy task kept the roughly 2.042 GB resident parent and allocated another roughly
+3.236 GB private state because same-filesystem ext4 reflinks are unavailable here. Summed file
+blocks are not a unique-filesystem accounting claim, but the result confirms that ordinary-copy
+seeding is neither a latency nor a space default on this host at fan-out 1. It remains a useful
+fallback mechanism, while reflink-capable private lineage, OverlayFS source views, read-only
+dependency state, private-empty state, and ordinary native worktrees remain distinct path-class
+choices.
+
+Every run reported semantic acceptance, 1,343 executed tests plus one existing ignored test, and
+cleanup disposition `removed` with two of two owned worktrees removed. The scratch root was empty
+after the sequence. Raw receipt SHA-256 digests, in run order, were:
+
+- A1: `302569edb2166941fb6da2f0ebdc8b58a2614c440a9a8b87692a97835d15d53d`
+- B1: `8ff52deaaa6303070fc7595f375bc2d7f69d5b824f4a382ad2d01c5dcdea9ad5`
+- B2: `318840c763dca386da533a3e32bf74759fd9257cf7189c47f479e8b24f2170c7`
+- A2: `291694d81fe49c7d2d5dac962724508567e093991990fed2239a6e4a8f1c78a7`
+
+This result closes only the single-task warm-page-cache discriminator. Fan-out 4/8, cold-read
+behavior, and composed Python/current-Node path policies remain separate experiments.
