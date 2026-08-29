@@ -201,7 +201,11 @@ supply the right quiesced resident generation and still run a real validator. Wh
 measurements justify changing it. The closed fan-out harness can now run its missing bounded
 cold-read control with `--page-cache-treatment resident-target-dontneed`: it fsyncs and advises away
 only the owned resident target's regular-file pages before the measured window, records the exact
-scope, and makes no claim that the advisory operation creates a globally cold machine.
+scope, and makes no claim that the advisory operation creates a globally cold machine. The
+fan-out-4 warm and cold-advised controls now select `private-copy` as the implicit cross-worktree
+`target` treatment: its two-window medians beat Overlay by 6.19% warm and 11.76% cold. Explicit
+path policies remain unchanged, so source and suitable dependency paths can still select Overlay
+or read-only sharing while same-worktree execution remains explicit `native` observation.
 
 Python and Node projects can explicitly reuse immutable prepared dependencies while keeping build
 output private:

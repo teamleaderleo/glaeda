@@ -243,3 +243,43 @@ after the sequence. Raw receipt SHA-256 digests, in run order, were:
 
 This result closes only the single-task warm-page-cache discriminator. Fan-out 4/8, cold-read
 behavior, and composed Python/current-Node path policies remain separate experiments.
+
+### Fan-out-4 warm and cold-read selection
+
+The next bounded big-red sequence closed the fan-out-4 write-heavy `target` choice. Every window
+used ext4 mount 44, four disjoint four-CPU sets, 16 total Cargo jobs, the same frozen edit and
+1,343-test validator, and complete cleanup. Warm receipts used accepted head `384388e`; the
+cold-read treatment itself used exact clean implementation commit `e6923237e0acbf24fc39a4e606a51a508f7c4d83`
+and tree `aa8369e4711bc1c79f84d41f9c6a07c32f60f674` in A-B-B-A order. The producer-program change and
+page-cache treatment intentionally give warm and cold receipts different comparison keys.
+
+| Treatment | Complete-window samples (s) | Median (s) | Median peak temporary growth |
+| --- | ---: | ---: | ---: |
+| ordinary native, resident/warm | 26.474802 | 26.474802 | 10,934,538,240 bytes |
+| private-copy, resident/warm | 27.928636, 28.288224 | 28.108430 | 12,890,456,064 bytes |
+| Overlay, resident/warm | 30.295675, 29.632275 | 29.963975 | 12,178,305,024 bytes |
+| private-copy, resident-target cold-advised | 28.340464, 27.281826 | 27.811145 | 13,028,327,424 bytes |
+| Overlay, resident-target cold-advised | 32.096016, 30.938088 | 31.517052 | 12,179,146,752 bytes |
+
+Each cold setup fsynced and advised away 1,119 exact resident-target files representing about
+2.028 GB logical / 2.031 GB allocated. Advice took 2.750–2.769 seconds outside the primary window.
+Private-copy first-use preparation rose from a 0.955072-second warm median to 1.681559 seconds
+cold-advised, evidence that the treatment removed a meaningful warm-read advantage. Its complete
+window remained within ordinary run variance, while Overlay's median grew 1.553077 seconds / 5.18%.
+
+Under cold advice, private-copy reached all four useful results 3.705907 seconds / 11.76% sooner
+than Overlay. Under warm pages it was 1.855545 seconds / 6.19% sooner. Overlay saved 849,180,672
+bytes / 6.52% of private-copy's cold peak temporary growth, but that capacity difference does not
+outweigh the latency result for the default write-heavy `target` path. Ordinary native remains the
+fastest same-worktree observation when isolation is unnecessary; source and suitable dependency
+paths remain separate Overlay/read-only decisions. The implicit cross-worktree `target` selector
+therefore moves to `private-copy`, which also becomes cheap CoW seeding on reflink-capable XFS.
+
+All four cold receipts succeeded, accepted all semantic validators, observed four simultaneous
+tasks, removed five of five worktrees, and left the scratch root empty. Receipt SHA-256 digests in
+run order:
+
+- private-copy A1: `b37e2f1223750c5aa9e81a7dc3ecbbafbdaf9b40093dbe0277d1697f6b028cf0`
+- Overlay B1: `9f8ed0484a2311c57d24a83c95783564ea8b7bf67683653c03e352d94e8da2b4`
+- Overlay B2: `cbf8ee5adb63d42670b5fc78fa933fe778ac7891e23254be64c87a9f259c2db6`
+- private-copy A2: `dcf52a4e16de43bbf3e8714eebcea703933eb6fa4252dd13d23df4a4c2d7de1c`
