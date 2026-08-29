@@ -290,6 +290,10 @@ def execute(
         if systemd_run is None:
             raise RuntimeError("required capability systemd-run is unavailable")
         gnu_time = shutil.which("time") if measurement is not None else None
+        if measurement is not None and gnu_time is None:
+            raise RuntimeError(
+                "required capability GNU time is unavailable for profiled measurement"
+            )
         if gnu_time is not None:
             with tempfile.NamedTemporaryFile(
                 prefix=".glaeda-hot-run-time-", delete=False
@@ -395,7 +399,7 @@ def execute(
             user_cpu_seconds = None
             system_cpu_seconds = None
             max_rss_kib = None
-            resource_accounting = "unavailable_after_scope_termination"
+            resource_accounting = "unavailable_for_profiled_command"
         else:
             user_cpu_seconds, system_cpu_seconds, max_rss_kib = timed_usage
             resource_accounting = "gnu_time_inside_scope"
@@ -608,6 +612,8 @@ def main() -> int:
     except (OSError, RuntimeError, subprocess.SubprocessError) as error:
         print(f"hot-run error: {error}", file=sys.stderr)
         return 2
+    except KeyboardInterrupt:
+        return 130
 
 
 if __name__ == "__main__":

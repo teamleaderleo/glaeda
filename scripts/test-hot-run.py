@@ -215,7 +215,9 @@ class HotRunTests(unittest.TestCase):
 
     def test_operator_interrupt_is_clean_and_writes_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            measurement = Path(directory) / "measurement.json"
+            fixture = Path(directory)
+            measurement = fixture / "measurement.json"
+            ready = fixture / "ready"
             process = subprocess.Popen(
                 [
                     sys.executable,
@@ -227,8 +229,9 @@ class HotRunTests(unittest.TestCase):
                     "--measurement",
                     os.fspath(measurement),
                     "--",
-                    "/bin/sleep",
-                    "60",
+                    "/bin/sh",
+                    "-c",
+                    f"printf ready > {ready}; exec /bin/sleep 60",
                 ],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
@@ -236,7 +239,10 @@ class HotRunTests(unittest.TestCase):
                 text=True,
                 start_new_session=True,
             )
-            time.sleep(0.1)
+            readiness_deadline = time.monotonic() + 3
+            while not ready.exists() and time.monotonic() < readiness_deadline:
+                time.sleep(0.01)
+            self.assertTrue(ready.exists(), "child command did not become ready")
             os.killpg(process.pid, signal.SIGINT)
             _, stderr = process.communicate(timeout=3)
             self.assertEqual(process.returncode, 130)
