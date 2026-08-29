@@ -33,16 +33,14 @@ use crate::rust_verification_envelope::{
 };
 use crate::rust_verification_envelope_digest::digest_rust_verification_envelope;
 use crate::trusted_workspace_receipt::TrustedWorkspaceCacheReceipt;
+use crate::verification_cache_generation::{
+    VerificationCacheIdentityGeneration, verification_cache_identity_generation,
+};
 use crate::verification_profile::{
     CacheId, ExactBuildScope, ExactVerificationScope, RepositoryCommandIdentity,
     VerificationProfileId,
 };
-use crate::verification_profile_registry::{
-    GLAEDA_DOCTOR_COMMAND_ID, GLAEDA_DOCTOR_PROFILE_ID, GLAEDA_PLAN_COMMAND_ID,
-    GLAEDA_PLAN_PROFILE_ID, GLAEDA_REQUIRED_COMMAND_ID, GLAEDA_REQUIRED_PROFILE_ID,
-    RegisteredVerificationProfile, SMOLRUNNER_DOCTOR_PROFILE_ID, SMOLRUNNER_PLAN_PROFILE_ID,
-    SMOLRUNNER_REQUIRED_PROFILE_ID, smolrunner_profile_registry,
-};
+use crate::verification_profile_registry::smolrunner_profile_registry;
 
 pub const PERSONAL_WORKER_VERIFICATION_PLAN_SCHEMA_VERSION: u8 = 1;
 pub const MAX_VERIFICATION_STDOUT_BYTES: u64 = 1_048_576;
@@ -50,11 +48,6 @@ pub const MAX_VERIFICATION_STDERR_BYTES: u64 = 1_048_576;
 
 const PERSONAL_LIMA_WORK_RUNNER_PROFILE: &str = "personal-lima-work";
 const REDACTED_PRIVATE_PLAN_EVIDENCE: &str = "<private-verification-plan-evidence>";
-const GLAEDA_REPOSITORY: &str = "teamleaderleo/glaeda";
-const SMOLRUNNER_V1_REPOSITORY: &str = "teamleaderleo/smolrunner";
-const SMOLRUNNER_V1_REQUIRED_COMMAND_ID: &str = "smolrunner.required.v1";
-const SMOLRUNNER_V1_DOCTOR_COMMAND_ID: &str = "smolrunner.doctor.v1";
-const SMOLRUNNER_V1_PLAN_COMMAND_ID: &str = "smolrunner.plan.v1";
 const SMOLRUNNER_SOURCE_COMMAND_CACHE_DOMAIN: &[u8] =
     b"smolrunner-verification-source-command-cache-v1";
 const SMOLRUNNER_ENVELOPE_CACHE_DOMAIN: &[u8] = b"smolrunner-verification-envelope-cache-v1";
@@ -71,29 +64,6 @@ pub enum VerificationWorkspaceMountPolicy {
 #[serde(rename_all = "snake_case")]
 pub enum VerificationCacheScopePolicy {
     ExactSourceCommandEnvelopeAndRuntime,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum VerificationCacheGeneration {
-    SmolrunnerV1,
-    GlaedaV2,
-}
-
-impl VerificationCacheGeneration {
-    const fn source_command_domain(self) -> &'static [u8] {
-        match self {
-            Self::SmolrunnerV1 => SMOLRUNNER_SOURCE_COMMAND_CACHE_DOMAIN,
-            Self::GlaedaV2 => GLAEDA_SOURCE_COMMAND_CACHE_DOMAIN,
-        }
-    }
-
-    const fn envelope_domain(self) -> &'static [u8] {
-        match self {
-            Self::SmolrunnerV1 => SMOLRUNNER_ENVELOPE_CACHE_DOMAIN,
-            Self::GlaedaV2 => GLAEDA_ENVELOPE_CACHE_DOMAIN,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -192,7 +162,7 @@ pub struct VerificationCommandBinding {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct VerificationCacheBinding {
-    pub generation: VerificationCacheGeneration,
+    pub generation: VerificationCacheIdentityGeneration,
     pub installation_id: crate::verification_profile::RunnerInstallationId,
     pub workspace_id: crate::verification_profile::RunnerWorkspaceId,
     pub cache_id: CacheId,
@@ -487,7 +457,8 @@ pub fn plan_personal_worker_verification(
     if profile.canonical_command().identity().repository() != &entry.repository {
         return Err(profile_mismatch());
     }
-    let cache_generation = verification_cache_generation(profile)?;
+    let cache_generation =
+        verification_cache_identity_generation(profile).map_err(|_| profile_mismatch())?;
     if entry.requested_cpu_millis != admission.requested_limits().cpu_millis
         || entry.requested_memory_bytes != admission.requested_limits().memory_bytes
     {
@@ -642,45 +613,31 @@ const fn effective_not_after(
     }
 }
 
-fn verification_cache_generation(
-    profile: &RegisteredVerificationProfile,
-) -> Result<VerificationCacheGeneration, PersonalWorkerVerificationPlanError> {
-    let profile_id = profile.profile_id().as_str();
-    let command = profile.canonical_command().identity();
-    let repository = command.repository().as_str();
-    let command_id = command.command_id().as_str();
-    match (profile_id, repository, command_id) {
-        (GLAEDA_REQUIRED_PROFILE_ID, GLAEDA_REPOSITORY, GLAEDA_REQUIRED_COMMAND_ID)
-        | (GLAEDA_DOCTOR_PROFILE_ID, GLAEDA_REPOSITORY, GLAEDA_DOCTOR_COMMAND_ID)
-        | (GLAEDA_PLAN_PROFILE_ID, GLAEDA_REPOSITORY, GLAEDA_PLAN_COMMAND_ID) => {
-            Ok(VerificationCacheGeneration::GlaedaV2)
-        }
-        (
-            SMOLRUNNER_REQUIRED_PROFILE_ID,
-            SMOLRUNNER_V1_REPOSITORY,
-            SMOLRUNNER_V1_REQUIRED_COMMAND_ID,
-        )
-        | (
-            SMOLRUNNER_DOCTOR_PROFILE_ID,
-            SMOLRUNNER_V1_REPOSITORY,
-            SMOLRUNNER_V1_DOCTOR_COMMAND_ID,
-        )
-        | (SMOLRUNNER_PLAN_PROFILE_ID, SMOLRUNNER_V1_REPOSITORY, SMOLRUNNER_V1_PLAN_COMMAND_ID) => {
-            Ok(VerificationCacheGeneration::SmolrunnerV1)
-        }
-        _ => Err(profile_mismatch()),
+const fn source_command_cache_domain(
+    generation: VerificationCacheIdentityGeneration,
+) -> &'static [u8] {
+    match generation {
+        VerificationCacheIdentityGeneration::SmolrunnerV1 => SMOLRUNNER_SOURCE_COMMAND_CACHE_DOMAIN,
+        VerificationCacheIdentityGeneration::GlaedaV2 => GLAEDA_SOURCE_COMMAND_CACHE_DOMAIN,
+    }
+}
+
+const fn envelope_cache_domain(generation: VerificationCacheIdentityGeneration) -> &'static [u8] {
+    match generation {
+        VerificationCacheIdentityGeneration::SmolrunnerV1 => SMOLRUNNER_ENVELOPE_CACHE_DOMAIN,
+        VerificationCacheIdentityGeneration::GlaedaV2 => GLAEDA_ENVELOPE_CACHE_DOMAIN,
     }
 }
 
 fn source_command_namespace_digest(
-    generation: VerificationCacheGeneration,
+    generation: VerificationCacheIdentityGeneration,
     protected_namespace: &Sha256Digest,
     source: &RepositorySourceObservation,
     command: &RepositoryCommandIdentity,
 ) -> Result<Sha256Digest, PersonalWorkerVerificationPlanError> {
     let command_identity = serde_json::to_vec(command).map_err(|_| cache_mismatch())?;
     digest_namespace_fields(
-        generation.source_command_domain(),
+        source_command_cache_domain(generation),
         &[
             protected_namespace.as_str().as_bytes(),
             source.source().repository.as_str().as_bytes(),
@@ -692,13 +649,13 @@ fn source_command_namespace_digest(
 }
 
 fn envelope_cache_namespace_digest(
-    generation: VerificationCacheGeneration,
+    generation: VerificationCacheIdentityGeneration,
     protected_namespace: &Sha256Digest,
     source_command_namespace: &Sha256Digest,
     rust_envelope_digest: &Sha256Digest,
 ) -> Result<Sha256Digest, PersonalWorkerVerificationPlanError> {
     digest_namespace_fields(
-        generation.envelope_domain(),
+        envelope_cache_domain(generation),
         &[
             protected_namespace.as_str().as_bytes(),
             source_command_namespace.as_str().as_bytes(),
@@ -831,6 +788,10 @@ mod tests {
     };
     use crate::repository_source_observation::RepositoryWorkspaceLocationIdentity;
     use crate::verification_profile::{RunnerInstallationId, RunnerWorkspaceId};
+    use crate::verification_profile_registry::{
+        GLAEDA_DOCTOR_PROFILE_ID, GLAEDA_PLAN_PROFILE_ID, GLAEDA_REQUIRED_PROFILE_ID,
+        SMOLRUNNER_DOCTOR_PROFILE_ID, SMOLRUNNER_PLAN_PROFILE_ID, SMOLRUNNER_REQUIRED_PROFILE_ID,
+    };
 
     const GIB: u64 = 1_024 * 1_024 * 1_024;
 
@@ -846,12 +807,12 @@ mod tests {
         Sha256Digest::parse(&format!("sha256:{}", hex.repeat(64))).expect("digest")
     }
 
-    fn config() -> OperatorConfig {
+    fn config(profile_id: &str) -> OperatorConfig {
         OperatorConfig::new(
             PersonalWorkerStateRoot::parse("/private/test-state").expect("state root"),
             LimaInstanceName::parse("smolrunner").expect("instance"),
             GuestWorkspacePath::parse("/home/runner/workspace").expect("workspace"),
-            VerificationProfileId::parse(SMOLRUNNER_REQUIRED_PROFILE_ID).expect("profile"),
+            VerificationProfileId::parse(profile_id).expect("profile"),
             AvailabilityRequest::Auto,
             OperatorIdlePolicy::new(600_000, 1_800_000).expect("idle policy"),
             OperatorOutputPreference::Json,
@@ -900,12 +861,27 @@ mod tests {
         job_observed_at: EpochMillis,
         applied: ExecutionResourceLimits,
     ) -> PlanningFixture {
-        let config = config();
-        let repository = RepositoryRef::parse("teamleaderleo/smolrunner").expect("repository");
+        planning_fixture_for(
+            receipt_inode,
+            job_observed_at,
+            applied,
+            "teamleaderleo/smolrunner",
+            SMOLRUNNER_REQUIRED_PROFILE_ID,
+        )
+    }
+
+    fn planning_fixture_for(
+        receipt_inode: u64,
+        job_observed_at: EpochMillis,
+        applied: ExecutionResourceLimits,
+        repository: &str,
+        profile_id: &str,
+    ) -> PlanningFixture {
+        let config = config(profile_id);
+        let repository = RepositoryRef::parse(repository).expect("repository");
         let commit = CommitId::parse(&"1".repeat(40)).expect("commit");
         let tree = GitTreeId::parse(&"2".repeat(40)).expect("tree");
-        let profile_id =
-            VerificationProfileId::parse(SMOLRUNNER_REQUIRED_PROFILE_ID).expect("profile");
+        let profile_id = VerificationProfileId::parse(profile_id).expect("profile");
         let request_id = ExecutionRequestId::parse("job-one").expect("request ID");
         let runner_profile_id =
             RunnerProfileId::parse(PERSONAL_LIMA_WORK_RUNNER_PROFILE).expect("runner profile");
@@ -1090,7 +1066,7 @@ mod tests {
         );
         assert_eq!(
             report.cache().generation,
-            VerificationCacheGeneration::SmolrunnerV1
+            VerificationCacheIdentityGeneration::SmolrunnerV1
         );
         assert_ne!(
             report.cache().source_command_envelope_namespace_digest,
@@ -1162,37 +1138,83 @@ mod tests {
     }
 
     #[test]
+    fn current_glaeda_plan_uses_successor_cache_generation() {
+        let legacy = planning_fixture(20)
+            .plan()
+            .expect("legacy verification plan");
+        let current = planning_fixture_for(
+            20,
+            time(1_000_000),
+            limits(4_000, 4 * GIB),
+            "teamleaderleo/glaeda",
+            GLAEDA_REQUIRED_PROFILE_ID,
+        )
+        .plan()
+        .expect("current Glaeda verification plan");
+
+        assert_eq!(
+            current.report().command().identity.repository().as_str(),
+            "teamleaderleo/glaeda"
+        );
+        assert_eq!(
+            current.report().cache().generation,
+            VerificationCacheIdentityGeneration::GlaedaV2
+        );
+        assert_ne!(
+            current
+                .report()
+                .cache()
+                .source_command_envelope_namespace_digest,
+            legacy
+                .report()
+                .cache()
+                .source_command_envelope_namespace_digest
+        );
+        assert_eq!(
+            current
+                .report()
+                .cache()
+                .source_command_envelope_namespace_digest
+                .as_str(),
+            "sha256:e228e51012fcee696df3cec29fbc7ad9b96043d359cde02104568d8791781d10"
+        );
+    }
+
+    #[test]
     fn checked_in_profiles_select_exact_cache_generation_and_refuse_cross_commands() {
         let registry = smolrunner_profile_registry().expect("registry");
         for (profile_id, expected) in [
             (
                 GLAEDA_REQUIRED_PROFILE_ID,
-                VerificationCacheGeneration::GlaedaV2,
+                VerificationCacheIdentityGeneration::GlaedaV2,
             ),
             (
                 GLAEDA_DOCTOR_PROFILE_ID,
-                VerificationCacheGeneration::GlaedaV2,
+                VerificationCacheIdentityGeneration::GlaedaV2,
             ),
             (
                 GLAEDA_PLAN_PROFILE_ID,
-                VerificationCacheGeneration::GlaedaV2,
+                VerificationCacheIdentityGeneration::GlaedaV2,
             ),
             (
                 SMOLRUNNER_REQUIRED_PROFILE_ID,
-                VerificationCacheGeneration::SmolrunnerV1,
+                VerificationCacheIdentityGeneration::SmolrunnerV1,
             ),
             (
                 SMOLRUNNER_DOCTOR_PROFILE_ID,
-                VerificationCacheGeneration::SmolrunnerV1,
+                VerificationCacheIdentityGeneration::SmolrunnerV1,
             ),
             (
                 SMOLRUNNER_PLAN_PROFILE_ID,
-                VerificationCacheGeneration::SmolrunnerV1,
+                VerificationCacheIdentityGeneration::SmolrunnerV1,
             ),
         ] {
             let id = VerificationProfileId::parse(profile_id).expect("profile ID");
             let profile = registry.lookup(&id).expect("registered profile");
-            assert_eq!(verification_cache_generation(profile).unwrap(), expected);
+            assert_eq!(
+                verification_cache_identity_generation(profile).unwrap(),
+                expected
+            );
         }
 
         let glaeda = registry
@@ -1248,12 +1270,12 @@ mod tests {
             b"command",
         ];
         let old_source = digest_namespace_fields(
-            VerificationCacheGeneration::SmolrunnerV1.source_command_domain(),
+            source_command_cache_domain(VerificationCacheIdentityGeneration::SmolrunnerV1),
             fields,
         )
         .expect("old source digest");
         let new_source = digest_namespace_fields(
-            VerificationCacheGeneration::GlaedaV2.source_command_domain(),
+            source_command_cache_domain(VerificationCacheIdentityGeneration::GlaedaV2),
             fields,
         )
         .expect("new source digest");
@@ -1268,17 +1290,17 @@ mod tests {
         assert_ne!(old_source, new_source);
 
         let replay = digest_namespace_fields(
-            VerificationCacheGeneration::GlaedaV2.source_command_domain(),
+            source_command_cache_domain(VerificationCacheIdentityGeneration::GlaedaV2),
             fields,
         )
         .expect("replay digest");
         let changed_tree = digest_namespace_fields(
-            VerificationCacheGeneration::GlaedaV2.source_command_domain(),
+            source_command_cache_domain(VerificationCacheIdentityGeneration::GlaedaV2),
             &[b"parent", b"repo", b"commit", b"different-tree", b"command"],
         )
         .expect("changed tree digest");
         let changed_command = digest_namespace_fields(
-            VerificationCacheGeneration::GlaedaV2.source_command_domain(),
+            source_command_cache_domain(VerificationCacheIdentityGeneration::GlaedaV2),
             &[b"parent", b"repo", b"commit", b"tree", b"different-command"],
         )
         .expect("changed command digest");
@@ -1295,21 +1317,21 @@ mod tests {
         let source_command = digest("b");
         let envelope = digest("c");
         let old_envelope = envelope_cache_namespace_digest(
-            VerificationCacheGeneration::SmolrunnerV1,
+            VerificationCacheIdentityGeneration::SmolrunnerV1,
             &protected,
             &source_command,
             &envelope,
         )
         .expect("old envelope digest");
         let new_envelope = envelope_cache_namespace_digest(
-            VerificationCacheGeneration::GlaedaV2,
+            VerificationCacheIdentityGeneration::GlaedaV2,
             &protected,
             &source_command,
             &envelope,
         )
         .expect("new envelope digest");
         let changed_envelope = envelope_cache_namespace_digest(
-            VerificationCacheGeneration::GlaedaV2,
+            VerificationCacheIdentityGeneration::GlaedaV2,
             &protected,
             &source_command,
             &digest("d"),
@@ -1331,8 +1353,8 @@ mod tests {
     #[test]
     fn cache_generation_is_identity_only_and_contains_no_path_or_mutation_surface() {
         for generation in [
-            VerificationCacheGeneration::SmolrunnerV1,
-            VerificationCacheGeneration::GlaedaV2,
+            VerificationCacheIdentityGeneration::SmolrunnerV1,
+            VerificationCacheIdentityGeneration::GlaedaV2,
         ] {
             let public = format!(
                 "{}\n{generation:?}",
