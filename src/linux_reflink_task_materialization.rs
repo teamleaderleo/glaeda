@@ -1734,7 +1734,7 @@ mod tests {
     };
     use sha1::{Digest as _, Sha1};
     use std::fs;
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{MetadataExt as _, symlink};
     use std::path::Path;
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1906,6 +1906,28 @@ mod tests {
                 .code,
             "candidate_source_oid_mismatch"
         );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn target_timestamp_publication_reuses_verified_source_times() {
+        let root = fixture();
+        let source = root.join("source");
+        let target = root.join("target");
+        fs::write(&source, b"source").expect("source");
+        fs::write(&target, b"target").expect("target");
+        let source_metadata = fs::metadata(&source).expect("source metadata");
+        let target_file = fs::OpenOptions::new()
+            .write(true)
+            .open(&target)
+            .expect("target open");
+        super::preserve_source_timestamps(&target_file, &source_metadata)
+            .expect("timestamp publication");
+        let target_metadata = target_file.metadata().expect("target metadata");
+        assert_eq!(target_metadata.atime(), source_metadata.atime());
+        assert_eq!(target_metadata.atime_nsec(), source_metadata.atime_nsec());
+        assert_eq!(target_metadata.mtime(), source_metadata.mtime());
+        assert_eq!(target_metadata.mtime_nsec(), source_metadata.mtime_nsec());
         fs::remove_dir_all(root).expect("cleanup");
     }
 
