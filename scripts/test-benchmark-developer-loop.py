@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import tempfile
 from pathlib import Path
 
 
@@ -40,6 +42,36 @@ def main() -> None:
     )
     fixture = FIXTURE.read_text(encoding="utf-8")
     assert fixture.count("Benchmark fixture: one source-only edit") == 1
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        fake_cargo = root / "cargo"
+        fake_cargo.write_text(
+            "#!/bin/sh\n"
+            'if [ "${1:-}" = "--version" ]; then\n'
+            '  printf "cargo 1.97.1 (fixture)\\n"\n'
+            "  exit 0\n"
+            "fi\n"
+            "exit 23\n",
+            encoding="utf-8",
+        )
+        fake_cargo.chmod(0o700)
+        output = root / "failure.json"
+        environment = os.environ.copy()
+        environment["PATH"] = f"{root}:{environment['PATH']}"
+        failed = subprocess.run(
+            [str(SCRIPT), "--output", str(output)],
+            cwd=ROOT,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        assert failed.returncode == 23, failed.stderr
+        receipt = json.loads(output.read_text(encoding="utf-8"))
+        assert receipt["result"]["exit_code"] == 23
+        assert "command/time exit-code mismatch" not in failed.stderr
     print("benchmark developer loop contract tests passed")
 
 

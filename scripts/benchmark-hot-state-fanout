@@ -43,6 +43,7 @@ CARGO_VERSION_PREFIX = "cargo 1.97.1 "
 ARMS = ("ordinary-native", "private", "overlay", "private-copy")
 FANOUTS = (1, 4, 8)
 DEFAULT_DEADLINE_SECONDS = 900
+CHILD_UMASK = 0o022
 
 
 class ExperimentError(RuntimeError):
@@ -79,6 +80,7 @@ class ExperimentPlan:
             "deadline_seconds": self.deadline_seconds,
             "environment": {
                 "policy": "closed_allowlist",
+                "child_filesystem_creation_umask": f"{CHILD_UMASK:04o}",
                 "cargo_network": "offline",
                 "dependency_cache": "existing_account_cargo_home",
                 "caller_build_flags_wrappers_and_target_dir": "excluded",
@@ -391,6 +393,7 @@ def start_task(
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
+        umask=CHILD_UMASK,
     )
     return TaskProcess(task_id, process, benchmark_receipt, hot_run_receipt)
 
