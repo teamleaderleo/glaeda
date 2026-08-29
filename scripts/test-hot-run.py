@@ -112,6 +112,8 @@ class HotRunTests(unittest.TestCase):
                 "/bin/sh",
                 "-c",
                 f'test "$PWD" = "{resident}" && test "$(cat payload)" = task '
+                f'&& test "$(git rev-parse --show-toplevel)" = "{resident}" '
+                "&& ! git diff --quiet -- payload "
                 '&& test "$(cat .venv/dependency)" = "resident dependency" '
                 "&& printf private > target/task-output",
             ]
@@ -142,6 +144,102 @@ class HotRunTests(unittest.TestCase):
             encoded = measurement.read_text(encoding="utf-8")
             self.assertNotIn(os.fspath(resident), encoded)
             self.assertNotIn(os.fspath(task), encoded)
+            self.assertEqual(list(state.glob(".git-view-*")), [])
+
+    @unittest.skipUnless(shutil.which("bwrap"), "bubblewrap is unavailable")
+    def test_private_cache_is_empty_then_persists_at_the_stable_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            resident = fixture / "resident"
+            task = fixture / "task"
+            state = fixture / "state"
+            first_measurement = fixture / "first.json"
+            second_measurement = fixture / "second.json"
+            resident.mkdir()
+            subprocess.run(["git", "init", "--quiet"], cwd=resident, check=True)
+            (resident / "payload").write_text("resident\n", encoding="utf-8")
+            (resident / "target").mkdir()
+            subprocess.run(["git", "add", "payload"], cwd=resident, check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Glaeda test",
+                    "-c",
+                    "user.email=glaeda-test@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "fixture",
+                ],
+                cwd=resident,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "worktree", "add", "--quiet", "--detach", os.fspath(task)],
+                cwd=resident,
+                check=True,
+            )
+
+            base_command = [
+                sys.executable,
+                os.fspath(HOT_RUN),
+                "--resident",
+                os.fspath(resident),
+                "--task",
+                os.fspath(task),
+                "--state",
+                os.fspath(state),
+                "--cache",
+                "target:private",
+            ]
+            first = subprocess.run(
+                [
+                    *base_command,
+                    "--measurement",
+                    os.fspath(first_measurement),
+                    "--",
+                    "/bin/sh",
+                    "-c",
+                    f'test "$PWD" = "{resident}" '
+                    "&& test ! -e target/generation "
+                    "&& printf 1 > target/generation",
+                ],
+                stdin=subprocess.DEVNULL,
+                check=False,
+            )
+            self.assertEqual(first.returncode, 0)
+            second = subprocess.run(
+                [
+                    *base_command,
+                    "--measurement",
+                    os.fspath(second_measurement),
+                    "--",
+                    "/bin/sh",
+                    "-c",
+                    'test "$(cat target/generation)" = 1 '
+                    "&& printf 2 > target/generation",
+                ],
+                stdin=subprocess.DEVNULL,
+                check=False,
+            )
+            self.assertEqual(second.returncode, 0)
+            self.assertFalse((resident / "target" / "generation").exists())
+            self.assertFalse((task / "target" / "generation").exists())
+            private_directories = list(state.glob("private-*"))
+            self.assertEqual(len(private_directories), 1)
+            self.assertEqual(
+                (private_directories[0] / "generation").read_text(encoding="utf-8"),
+                "2",
+            )
+            for measurement in (first_measurement, second_measurement):
+                report = json.loads(measurement.read_text(encoding="utf-8"))
+                self.assertEqual(
+                    report["cache_views"],
+                    [{"mode": "private", "path": "target"}],
+                )
+                self.assertTrue(report["cross_worktree"])
+            self.assertEqual(list(state.glob(".git-view-*")), [])
 
     def test_cache_specs_reject_escape_overlap_and_unknown_modes(self) -> None:
         parse_cache_specs = runpy.run_path(str(HOT_RUN), run_name="hot_run_test")[
@@ -150,6 +248,7 @@ class HotRunTests(unittest.TestCase):
         for values in (["../target"], ["target:shared"], ["target", "target:ro"]):
             with self.assertRaises(RuntimeError):
                 parse_cache_specs(values)
+        self.assertEqual(parse_cache_specs(["target:private"])[0].mode, "private")
         with self.assertRaises(RuntimeError):
             parse_cache_specs(["build", "build/generated"])
 

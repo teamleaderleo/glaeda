@@ -3,7 +3,8 @@
 
 This is a local development accelerator, not a security sandbox. It deliberately inherits the
 caller's environment, host filesystem, devices, processes, and network. Bubblewrap supplies only a
-stable project pathname plus explicit read-only or task-private OverlayFS cache views.
+stable project pathname plus explicit read-only, task-private directory, or task-private OverlayFS
+cache views.
 """
 
 from __future__ import annotations
@@ -75,6 +76,10 @@ def common_git_directory(root: Path) -> Path:
     return git_path(root, "--git-common-dir")
 
 
+def task_git_directory(root: Path) -> Path:
+    return git_path(root, "--git-dir")
+
+
 def parse_cache_specs(values: list[str]) -> tuple[CacheSpec, ...]:
     specs: list[CacheSpec] = []
     for value in values:
@@ -87,7 +92,7 @@ def parse_cache_specs(values: list[str]) -> tuple[CacheSpec, ...]:
             or path.is_absolute()
             or path in (Path("."), Path(".."))
             or ".." in path.parts
-            or mode not in ("overlay", "ro")
+            or mode not in ("overlay", "private", "ro")
         ):
             raise RuntimeError(f"invalid cache specification: {value}")
         specs.append(CacheSpec(path, mode))
@@ -512,8 +517,14 @@ def run(
 ) -> int:
     resident = worktree_root(resident_argument)
     task = worktree_root(task_argument)
-    if common_git_directory(resident) != common_git_directory(task):
+    common_git = common_git_directory(resident)
+    if common_git != common_git_directory(task):
         raise RuntimeError("resident and task must be worktrees of the same Git repository")
+    task_git = task_git_directory(task)
+    try:
+        task_git_relative = task_git.relative_to(common_git)
+    except ValueError as error:
+        raise RuntimeError("task Git metadata is outside the common Git directory") from error
 
     task_cwd = task_argument.resolve()
     try:
@@ -548,15 +559,16 @@ def run(
     bubblewrap = shutil.which("bwrap")
     if bubblewrap is None:
         raise RuntimeError("required capability bwrap is unavailable")
-    has_overlay = any(spec.mode == "overlay" for spec in cache_specs)
+    has_private_state = any(
+        spec.mode in ("overlay", "private") for spec in cache_specs
+    )
     state_base = Path(
         os.path.abspath(
             state_argument or default_state_root(resident, task, cache_specs)
         )
     )
     state_root = runtime_state_root(state_base, runtime_contract)
-    if has_overlay:
-        ensure_private_directory(state_root)
+    ensure_private_directory(state_root)
 
     cache_arguments_for_bwrap: list[str] = []
     for spec in cache_specs:
@@ -573,6 +585,13 @@ def run(
             )
             continue
         cache_identity = hashlib.sha256(os.fsencode(spec.path)).hexdigest()[:16]
+        if spec.mode == "private":
+            private = state_root / f"private-{cache_identity}"
+            ensure_private_directory(private)
+            cache_arguments_for_bwrap.extend(
+                ["--bind", os.fspath(private), os.fspath(resident_cache)]
+            )
+            continue
         upper = state_root / f"upper-{cache_identity}"
         work = state_root / f"work-{cache_identity}"
         ensure_private_directory(upper)
@@ -589,18 +608,27 @@ def run(
         )
 
     lock_fd: int | None = None
+    git_view: tempfile.TemporaryDirectory[str] | None = None
     try:
-        if has_overlay:
-            lock_path = state_root / "lock"
-            lock_fd = os.open(
-                lock_path,
-                os.O_CLOEXEC | os.O_CREAT | os.O_NOFOLLOW | os.O_RDWR,
-                0o600,
-            )
-            try:
-                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError as error:
-                raise RuntimeError("this task's hot cache is already in use") from error
+        lock_path = state_root / "lock"
+        lock_fd = os.open(
+            lock_path,
+            os.O_CLOEXEC | os.O_CREAT | os.O_NOFOLLOW | os.O_RDWR,
+            0o600,
+        )
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RuntimeError("this task's hot state is already in use") from error
+
+        git_view = tempfile.TemporaryDirectory(prefix=".git-view-", dir=state_root)
+        git_view_root = Path(git_view.name)
+        git_common_view = git_view_root / "common"
+        git_common_view.mkdir(mode=0o700)
+        stable_task_git = git_common_view / task_git_relative
+        git_pointer = git_view_root / "pointer"
+        git_pointer.write_text(f"gitdir: {stable_task_git}\n", encoding="utf-8")
+        git_pointer.chmod(0o600)
 
         environment = os.environ.copy()
         rust_tool_environment(task, resolved_command, environment)
@@ -611,15 +639,21 @@ def run(
             "/",
             "/",
             "--bind",
+            os.fspath(common_git),
+            os.fspath(git_common_view),
+            "--bind",
             os.fspath(task),
             os.fspath(resident),
+            "--ro-bind",
+            os.fspath(git_pointer),
+            os.fspath(resident / ".git"),
             *cache_arguments_for_bwrap,
             "--chdir",
             os.fspath(stable_cwd),
             *resolved_command,
         ]
         if verbose:
-            state_name = state_root.name if has_overlay else "none"
+            state_name = state_root.name if has_private_state else "none"
             print(
                 f"hot-run: trusted task={task.name} resident={resident.name} state={state_name}",
                 file=sys.stderr,
@@ -638,6 +672,8 @@ def run(
     finally:
         if lock_fd is not None:
             os.close(lock_fd)
+        if git_view is not None:
+            git_view.cleanup()
 
 
 def main() -> int:
@@ -674,8 +710,11 @@ def main() -> int:
         "--cache",
         action="append",
         default=[],
-        metavar="PATH[:overlay|ro]",
-        help="reuse one resident relative path; defaults to target:overlay when present",
+        metavar="PATH[:overlay|private|ro]",
+        help=(
+            "select one resident-relative state path; defaults to target:overlay "
+            "when present"
+        ),
     )
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("command", nargs=argparse.REMAINDER)

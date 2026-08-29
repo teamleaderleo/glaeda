@@ -162,32 +162,47 @@ Do not promote a filesystem primitive because its microbenchmark is attractive. 
 ### Ultra-trusted local hot-run prototype
 
 `scripts/hot-run` is a deliberately small Linux developer-loop prototype. It binds a task Git
-worktree onto the pathname of a warmed resident worktree. Explicit cache-path policies can expose
-resident dependencies read-only or give the task a persistent private OverlayFS upper over a
-write-heavy build tree:
+worktree onto the pathname of a warmed resident worktree. Explicit path-class policies can expose
+resident dependencies read-only, give a short-lived task a private OverlayFS upper over warmed
+bytes, or retain a task-private directory at the same in-sandbox pathname across repeated edit
+loops:
 
 ```bash
 /path/to/resident/scripts/hot-run \
   --task /path/to/task-worktree \
-  --cache target:overlay \
+  --cache target:private \
   -- cargo test --locked --lib --bins
 ```
 
-When a resident `target` exists, `target:overlay` is the zero-configuration default. Python and Node
-projects can explicitly reuse immutable prepared dependencies while keeping build output private:
+The stable-path bind would otherwise hide a linked worktree's common `.git` directory. For this
+ultra-trusted prototype, `hot-run` re-exposes that exact common directory through a private
+per-invocation mount location and places a read-only pointer over the rebound root's `.git` file.
+This makes ordinary Git-aware build and verification commands work without rewriting the task
+worktree. It is still linked-common metadata, not the product-grade task-private Git mechanism
+owned by #580, and grants no isolation from other trusted users of the same repository.
+
+`private` starts with an empty directory and retains the task's later writes without OverlayFS
+copy-up. It is the big-red/ext4 candidate for long-lived, write-heavy compiler lineages. `overlay`
+starts from warmed resident bytes and retains writes in a task-private upper; it remains useful when
+warm-start value exceeds copy-up cost. `ro` exposes suitable immutable prepared state without write
+authority. When a resident `target` exists, `target:overlay` remains the zero-configuration default
+until complete repeated-loop measurements justify changing it.
+
+Python and Node projects can explicitly reuse immutable prepared dependencies while keeping build
+output private:
 
 ```bash
 scripts/hot-run --resident /path/to/python-resident --task /path/to/task \
   --cache .venv:ro -- python -m pytest
 scripts/hot-run --resident /path/to/node-resident --task /path/to/task \
-  --cache node_modules:ro --cache .next:overlay -- pnpm build
+  --cache node_modules:ro --cache .next:private -- pnpm build
 ```
 
 A repository wrapper may also bind the front-door runtime before any work begins:
 
 ```bash
 scripts/hot-run --resident /path/to/node-resident --task /path/to/task \
-  --cache node_modules:ro --cache .next:overlay \
+  --cache node_modules:ro --cache .next:private \
   --runtime-id node-v22.23.2-linux-x64 \
   --runtime-sha256 sha256:<exact-executable-digest> \
   -- /path/to/node ./node_modules/.bin/next build
@@ -195,7 +210,8 @@ scripts/hot-run --resident /path/to/node-resident --task /path/to/task \
 
 The two runtime arguments are optional but inseparable. When present, `hot-run` resolves the
 command executable, verifies its content digest before launch, records the declared public runtime
-identity and digest, and places mutable overlay state below a runtime-specific opaque namespace.
+identity and digest, and places mutable private/overlay state below a runtime-specific opaque
+namespace.
 This prevents two declared runtime generations from silently sharing one private build-state
 lineage. It intentionally binds the front-door executable only: it is not automatic language
 manifest discovery, a claim about descendant executables, or a hostile-code security boundary.
