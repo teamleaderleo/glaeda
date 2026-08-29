@@ -341,3 +341,75 @@ Receipt SHA-256 digests:
 - Overlay B2: `df4d3130a4a994d6e86333dd2469c6a3a5d887f5042e3a7ff25087f4dee525ec`
 - private-copy A2: `2fa4216756108b90c1b35f6bbbd50092cf8e2517a618ee470e8a49a05600ceeb`
 - native A2: `ea08811d6e93ef595ab94479457f6f6765bc54abedabdad053a0a3d67484696e`
+
+### Stable-lineage retained sequence
+
+Exact clean candidate `e57c049fe22363393a2b228d6f0fa541bf173328` / tree
+`1d16068de71d74070bb24187aa0172f72b70aff6` extended the compatibility window into bounded one-,
+three-, or seven-reuse sequences. Every ordinal receives its own comparison key, while the legacy
+single-window result remains the exact ordinal-one view. The physical controls kept the same ext4
+host, source, edit, validator, fan-out 4, four disjoint four-CPU sets, 16 total Cargo jobs, and
+resident/uncontrolled page-cache declaration.
+
+The first A-B-B-A bracket ran three reuses for native, private-copy, and Overlay. Its two-sample
+medians were:
+
+| Arm | First use (s) | Reuse 1 (s) | Reuse 2 (s) | Reuse 3 (s) | All-reuse median (s) | Reuse range (s) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| ordinary native | 26.552257 | 18.222615 | 18.577368 | 17.875250 | 18.249267 | 17.700468–18.604845 |
+| private-copy | 28.284841 | 18.200026 | 18.152647 | 18.353079 | 18.200026 | 17.902273–18.755589 |
+| Overlay | 30.283737 | 18.001930 | 18.102296 | 17.796089 | 17.822915 | 17.748304–18.403516 |
+
+Private-copy reached first use 1.998897 seconds / 6.60% sooner than Overlay. Overlay's median was
+0.198096, 0.050352, and 0.556990 seconds lower at the three reuse ordinals, but the ranges overlapped
+and private-copy still completed the cumulative first-use-plus-three sequence 1.193459 seconds
+sooner. Ordinary native remained the fastest no-isolation first-use control and converged into the
+same roughly 18-second reuse band.
+
+Because that result predicted a possible later crossover, a second A-B-B-A bracket compared
+private-copy and Overlay through the supported seven-reuse bound. Each entry below is the median of
+two complete lineages; ordinal zero is the edited first use.
+
+| Completed through ordinal | Private window (s) | Overlay window (s) | Private cumulative (s) | Overlay cumulative (s) | Private cumulative lead (s) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 27.458494 | 29.609687 | 27.458494 | 29.609687 | 2.151193 |
+| 1 | 18.828968 | 18.150454 | 46.287462 | 47.760140 | 1.472679 |
+| 2 | 17.975798 | 18.497924 | 64.263260 | 66.258063 | 1.994804 |
+| 3 | 18.302575 | 18.223315 | 82.565834 | 84.481378 | 1.915544 |
+| 4 | 18.277601 | 18.777487 | 100.843435 | 103.258865 | 2.415430 |
+| 5 | 17.876091 | 18.521902 | 118.719526 | 121.780767 | 3.061241 |
+| 6 | 18.374546 | 18.274976 | 137.094071 | 140.055743 | 2.961671 |
+| 7 | 18.427896 | 18.052837 | 155.521968 | 158.108580 | 2.586612 |
+
+There was no measured crossover. Private-copy stayed cumulatively faster after every ordinal and
+finished the eight-command lineage 2.586612 seconds / 1.64% sooner. Its pooled 14-window reuse
+median was also slightly lower at 18.224005 versus 18.328246 seconds. Individual lineage totals
+overlapped—154.640634 and 156.403301 seconds private-copy versus 156.115406 and 160.101753 seconds
+Overlay—so this is a bounded ext4 selector result, not a generic filesystem speed claim.
+
+Overlay allocated a median 11.251150 GiB of task state versus 12.056736 GiB for private-copy, a
+0.805586 GiB / 6.68% saving. Overlay showed zero additional allocated state through ordinal seven;
+private-copy's median growth was 64 KiB. Host-aggregate I/O `full` PSI fractions remained large and
+overlapping: medians were 15.62% Overlay and 16.83% private-copy, with maxima 19.16% and 19.90%.
+CPU `some` PSI medians stayed below 0.7%. The cumulative ordering therefore decides only the tested
+path policy: retain private-copy as the write-heavy cross-worktree `target` default through the
+observed first use plus seven replays; do not introduce a speculative lifetime switch. Overlay
+remains preferred for mostly-read source/dependency views and when its measured space advantage is
+the controlling constraint.
+
+The three-window bracket accepted all 96 measured task validators; the seven-window bracket
+accepted all 128. Every validator executed the same 1,343-test workload, every window observed four
+simultaneous tasks, all private-copy first preparations were positive-time `seeded`, all 80
+private-copy reuse preparations were exact zero-time `reused`, every cleanup removed five of five
+worktrees, and the scratch root ended empty. Receipt SHA-256 digests:
+
+- three-window native A1: `1ce830ed290917674aa0a8e94e32dd411f32ba03358c9af2db17d5ab989ccf61`
+- three-window private-copy A1: `603d76244b41c5d68764e8cacd953638eb7efc0f2ccbb7051856483e0c88faa8`
+- three-window Overlay B1: `a9b8ea3b1038a9cafa52767157da3d9f617801e554575910e8b9640c74beb870`
+- three-window Overlay B2: `bcd4ab981447597a0abb22f73f9122381127ecc150d1e4e001d3720e0ab0b442`
+- three-window private-copy A2: `9033f0d9ce639fc4532f41937a789e408ef201fa5cf28f262a2b352424ee7d15`
+- three-window native A2: `9186e58df7359c893a7f34c35b17fbb2b7a7c5735016d29c7d30a2f1fd72d315`
+- seven-window private-copy A1: `368faf31cc9895268fdc2dc94d805d92db91d5dae8e616409c8537d4723b1b2e`
+- seven-window Overlay B1: `5cec1b6b0f6c8693701bbd47f724be7209d7f53226bd6f5b1d3d70c11542b6b1`
+- seven-window Overlay B2: `4dcdefef81329972aefbef8b90accfc6e0cea3010a2dcb73687908a24ef44c05`
+- seven-window private-copy A2: `55d4b0b155cda1468c971ecec907e352297604fe8904cf4d90dcb10f966420dc`

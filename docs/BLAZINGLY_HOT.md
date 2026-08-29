@@ -221,9 +221,13 @@ one.
 The first fan-out-4 use of that window measured two samples per arm. Complete first-use medians
 were 26.55 seconds native, 27.51 seconds private-copy, and 29.43 seconds Overlay. Immediate reuse
 fell to 17.92, 19.63, and 18.07 seconds respectively while every task reran and accepted the same
-1,343-test validator. Private-copy retained its first-use advantage over Overlay; Overlay had the
-lower reuse median in this small, I/O-pressured sample. Keep the current first-use default and run a
-longer stable-lineage sequence before making expected reuse lifetime part of automatic selection.
+1,343-test validator. Overlay's apparent immediate-reuse advantage did not survive the longer
+control. In a subsequent two-sample seven-reuse bracket, private-copy remained cumulatively faster
+after every ordinal and completed first use plus seven full replays in 155.52 seconds versus 158.11
+seconds for Overlay. Keep private lineage as the write-heavy cross-worktree `target` default through
+the tested eight-command lifetime. Overlay remains the mostly-read source/dependency view and saves
+about 0.806 GiB / 6.68% of allocated state in this ext4 workload; the evidence does not justify an
+automatic lifetime-based switch.
 
 Python and Node projects can explicitly reuse immutable prepared dependencies while keeping build
 output private:
