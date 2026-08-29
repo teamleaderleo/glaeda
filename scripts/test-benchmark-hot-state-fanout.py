@@ -139,14 +139,18 @@ class HotStateFanoutTests(unittest.TestCase):
         ExperimentError = NAMESPACE["ExperimentError"]
         with tempfile.TemporaryDirectory() as directory:
             scratch = Path(directory)
-            validate(ROOT, scratch)
-            cargo = scratch / ".cargo"
-            cargo.mkdir()
-            (cargo / "config.toml").write_text(
-                '[build]\ntarget-dir = "/foreign"\n', encoding="utf-8"
-            )
-            with self.assertRaises(ExperimentError):
+            with mock.patch.dict(
+                validate.__globals__,
+                {"git_output": mock.Mock(return_value="")},
+            ):
                 validate(ROOT, scratch)
+                cargo = scratch / ".cargo"
+                cargo.mkdir()
+                (cargo / "config.toml").write_text(
+                    '[build]\ntarget-dir = "/foreign"\n', encoding="utf-8"
+                )
+                with self.assertRaises(ExperimentError):
+                    validate(ROOT, scratch)
 
     def test_hot_run_command_uses_supported_unscoped_mode(self) -> None:
         build_plan = NAMESPACE["build_plan"]
