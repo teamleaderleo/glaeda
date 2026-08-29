@@ -484,9 +484,10 @@ Candidate `d0ae2c59b98a44a4a65a08d3b8a0f0b42b6d45dc` / tree
 `838c847b3f9232a515866a5361b4594f4774a351` implements that treatment only when a task-private
 `target` is first copied. It compares contents and executable mode through held no-follow
 descriptors, rejects files that move or change during comparison, changes only the task inode's
-mtime, and records path-free counts/time in hot-run schema v5. A retained lineage performs no
-source normalization: a file reverted after a prior task build must remain newer than the retained
-output so Cargo rebuilds it.
+mtime, and records path-free counts/time in hot-run schema v5. The final interface requires the
+explicit `--seed-source-mtimes` treatment after caller-owned exact warm-parent proof; the flag
+creates no proof or cache authority. A retained lineage performs no source normalization: a file
+reverted after a prior task build must remain newer than the retained output so Cargo rebuilds it.
 
 The physical A-B-B-A bracket kept the exact workload source, resident target, Rust/Cargo 1.97.1,
 four Cargo jobs, stable project path, semantic validator, and fresh post-prime worktree timing
@@ -506,6 +507,14 @@ both produced zero dirty fingerprints. Every arm derived the same three terminal
 selected, 1,370 executed/passed, one ignored, 16 filtered, and zero failed/measured tests. The
 same exact resident control took 35.16 seconds to reconstruct and 2.66 seconds on immediate native
 reuse.
+
+After composing the explicit gate with merged protected-cache store main, exact clean producer
+`e9b40406e17affd52f09622963021824ce81d6a3` ran one same-producer pair. Without the flag it
+reported four dirty units, an 8.698599-second command and 11.722752-second seed-to-result total.
+With the flag it normalized 493/493 files in 0.144376 seconds, reported no dirty unit, ran the
+command in 2.780546 seconds, and completed seed-to-result in 5.178758 seconds: 68.03% and 55.82%
+lower respectively. Exact retained reuse took 2.727571 seconds with zero preparation and
+`retained_state_unchanged`. All three results passed the identical 1,370-test validator.
 
 The semantic controls remained fail-open to real work but fail-closed to stale reuse:
 
@@ -535,3 +544,6 @@ Raw receipt SHA-256 digests:
 - retained edit hot-run/benchmark: `0619c614a80c7357244ac6ee93f5acf7d727a0be59f712dd5b8a3067a6c9df12`, `83491b09cada3eb0323d4b2239c14c53a06262212c4d196f324c880dd6d05ca6`
 - retained revert hot-run/benchmark: `33d807ac320a90747b14067a289edba2f2cf7518dd08ec86240adfa68442d42b`, `7b1ab215af81819b912d8e084a3ca17aa58a543795a0dbe68d3407ecde04ff74`
 - edited seed hot-run/benchmark: `d29459936348a0739814a9ff595072297af1b51cb1d160f0498c20d1ce4b4cf9`, `94dabe09bb2fface339ca3d8d7a786d0758998071d5f84c00f2bf7c7a7dc2302`
+- final same-producer control hot-run/benchmark: `5c56371de54b921acd81eeba9346e1ea29e834c5d6f0ff76e0b9add999e8c5ed`, `d38ba656c505338929a363775f9f90c7cb51479112aa01e8a019ea89a1077071`
+- final same-producer candidate hot-run/benchmark: `0266d7ff6ebbb3aa21eed1250017187c828ebc77be02ddecc8d6f5e1f7e6e15d`, `9cefe858dbe997d34677d3af57be4b0962b7909ee81bcca24f4110449a08fbae`
+- final retained candidate hot-run/benchmark: `4561f17b0f81ad04f8aec366db5f942ab05c87f66d9befeaf6e281609414b335`, `95a6e0aa78653e574bdbd5162e7dc12b36c4165ee6080cc2115e0cec89ada0ef`
