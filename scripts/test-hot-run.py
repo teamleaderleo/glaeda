@@ -37,6 +37,7 @@ class HotRunTests(unittest.TestCase):
                 (),
                 (),
                 None,
+                None,
                 False,
                 None,
                 None,
@@ -208,6 +209,61 @@ class HotRunTests(unittest.TestCase):
         self.assertEqual(specs[0].path, Path("target"))
         self.assertEqual(specs[0].mode, "private-copy")
 
+    def test_seed_source_metadata_normalizes_only_matching_regular_files(self) -> None:
+        namespace = runpy.run_path(str(HOT_RUN), run_name="hot_run_test")
+        prepare = namespace["prepare_seed_source_metadata"]
+        CachePreparation = namespace["CachePreparation"]
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            resident = fixture / "resident"
+            task = fixture / "task"
+            resident.mkdir()
+            task.mkdir()
+            subprocess.run(["git", "init", "--quiet"], cwd=task, check=True)
+            (resident / "matching").write_text("same\n", encoding="utf-8")
+            (task / "matching").write_text("same\n", encoding="utf-8")
+            (resident / "different").write_text("resident\n", encoding="utf-8")
+            (task / "different").write_text("task\n", encoding="utf-8")
+            (task / "missing-resident").write_text("task only\n", encoding="utf-8")
+            (resident / "link").symlink_to("matching")
+            (task / "link").symlink_to("matching")
+            subprocess.run(
+                ["git", "add", "matching", "different", "missing-resident", "link"],
+                cwd=task,
+                check=True,
+            )
+            resident_mtime = 1_700_000_000_000_000_000
+            task_mtime = resident_mtime + 5_000_000_000
+            os.utime(resident / "matching", ns=(resident_mtime, resident_mtime))
+            os.utime(task / "matching", ns=(task_mtime, task_mtime))
+            os.utime(task / "different", ns=(task_mtime, task_mtime))
+
+            seeded = (
+                CachePreparation(Path("target"), "private-copy", "seeded", 0.25),
+            )
+            result = prepare(resident, task, seeded)
+            self.assertIsNotNone(result)
+            assert result is not None
+            self.assertEqual(result.disposition, "normalized_on_seed")
+            self.assertEqual(result.tracked_path_count, 4)
+            self.assertEqual(result.normalized_regular_file_count, 1)
+            self.assertEqual(result.differing_regular_file_count, 1)
+            self.assertEqual(result.skipped_path_count, 2)
+            self.assertEqual((task / "matching").stat().st_mtime_ns, resident_mtime)
+            self.assertEqual((task / "different").stat().st_mtime_ns, task_mtime)
+
+            retained_mtime = resident_mtime + 10_000_000_000
+            os.utime(task / "matching", ns=(retained_mtime, retained_mtime))
+            reused = (
+                CachePreparation(Path("target"), "private-copy", "reused", 0.0),
+            )
+            retained = prepare(resident, task, reused)
+            self.assertIsNotNone(retained)
+            assert retained is not None
+            self.assertEqual(retained.disposition, "retained_state_unchanged")
+            self.assertEqual(retained.tracked_path_count, 0)
+            self.assertEqual((task / "matching").stat().st_mtime_ns, retained_mtime)
+
     @unittest.skipUnless(shutil.which("bwrap"), "bubblewrap is unavailable")
     def test_task_sees_stable_path_and_target_writes_stay_private(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -279,7 +335,7 @@ class HotRunTests(unittest.TestCase):
             self.assertEqual(len(uppers), 1)
             self.assertTrue((uppers[0] / "task-output").is_file())
             report = json.loads(measurement.read_text(encoding="utf-8"))
-            self.assertEqual(report["schema_version"], 4)
+            self.assertEqual(report["schema_version"], 5)
             self.assertEqual(report["authority"], "developer_observation_only")
             self.assertIsNone(report["comparison_key"])
             self.assertEqual(report["exit_code"], 0)
@@ -457,6 +513,12 @@ class HotRunTests(unittest.TestCase):
                 cwd=resident,
                 check=True,
             )
+            resident_payload_mtime = (resident / "payload").stat().st_mtime_ns
+            first_task_mtime = resident_payload_mtime + 5_000_000_000
+            os.utime(
+                task / "payload",
+                ns=((task / "payload").stat().st_atime_ns, first_task_mtime),
+            )
 
             base_command = [
                 sys.executable,
@@ -486,8 +548,14 @@ class HotRunTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(first.returncode, 0)
+            self.assertEqual((task / "payload").stat().st_mtime_ns, resident_payload_mtime)
             (resident / "target" / "parent").write_text(
                 "changed resident parent\n", encoding="utf-8"
+            )
+            retained_task_mtime = resident_payload_mtime + 10_000_000_000
+            os.utime(
+                task / "payload",
+                ns=((task / "payload").stat().st_atime_ns, retained_task_mtime),
             )
             second = subprocess.run(
                 [
@@ -505,6 +573,7 @@ class HotRunTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(second.returncode, 0)
+            self.assertEqual((task / "payload").stat().st_mtime_ns, retained_task_mtime)
 
             private_directories = list(state.glob("private-*"))
             self.assertEqual(len(private_directories), 1)
@@ -531,6 +600,28 @@ class HotRunTests(unittest.TestCase):
             self.assertGreater(
                 first_report["state_preparation"][0]["elapsed_seconds"], 0
             )
+            self.assertEqual(
+                first_report["source_preparation"]["mode"],
+                "resident_mtime_for_identical_tracked_regular_files_v1",
+            )
+            self.assertEqual(
+                first_report["source_preparation"]["disposition"],
+                "normalized_on_seed",
+            )
+            self.assertEqual(
+                first_report["source_preparation"]["tracked_path_count"], 1
+            )
+            self.assertEqual(
+                first_report["source_preparation"]["normalized_regular_file_count"],
+                1,
+            )
+            self.assertEqual(
+                first_report["source_preparation"]["differing_regular_file_count"], 0
+            )
+            self.assertEqual(first_report["source_preparation"]["skipped_path_count"], 0)
+            self.assertGreaterEqual(
+                first_report["source_preparation"]["elapsed_seconds"], 0
+            )
             self.assertGreaterEqual(
                 first_report["command_plus_preparation_elapsed_seconds"],
                 first_report["elapsed_seconds"],
@@ -545,6 +636,18 @@ class HotRunTests(unittest.TestCase):
                         "path": "target",
                     }
                 ],
+            )
+            self.assertEqual(
+                second_report["source_preparation"],
+                {
+                    "mode": "resident_mtime_for_identical_tracked_regular_files_v1",
+                    "disposition": "retained_state_unchanged",
+                    "tracked_path_count": 0,
+                    "normalized_regular_file_count": 0,
+                    "differing_regular_file_count": 0,
+                    "skipped_path_count": 0,
+                    "elapsed_seconds": 0.0,
+                },
             )
             self.assertEqual(second_report["preparation_elapsed_seconds"], 0.0)
             self.assertEqual(list(state.glob(".private-*")), [])
@@ -1011,7 +1114,7 @@ class HotRunTests(unittest.TestCase):
             )
             self.assertEqual(measured.returncode, 0)
             report = json.loads(measurement.read_text(encoding="utf-8"))
-            self.assertEqual(report["schema_version"], 4)
+            self.assertEqual(report["schema_version"], 5)
             self.assertEqual(report["comparison_key"], comparison_key)
 
         invalid = subprocess.run(

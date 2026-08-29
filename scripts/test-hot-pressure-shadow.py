@@ -46,7 +46,7 @@ def receipt(
         for kind in ("cpu", "memory", "io")
     }
     return {
-        "schema_version": 4,
+        "schema_version": 5,
         "document_type": "glaeda-hot-run-measurement",
         "authority": "developer_observation_only",
         "comparison_key": key,
@@ -249,7 +249,7 @@ class HotPressureShadowTests(unittest.TestCase):
             current = Path(directory) / "current.json"
             encoded = json.dumps(receipt(4.0, 0.01))
             current.write_text(
-                encoded[:-1] + ', "schema_version": 4}', encoding="utf-8"
+                encoded[:-1] + ', "schema_version": 5}', encoding="utf-8"
             )
 
             result = run_shadow(current, [])
