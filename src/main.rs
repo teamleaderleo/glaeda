@@ -5,6 +5,7 @@ mod personal_worker_submit_command;
 #[cfg(target_os = "linux")]
 use std::ffi::OsStr;
 use std::ffi::OsString;
+use std::io::Read as _;
 #[cfg(target_os = "macos")]
 use std::path::Component;
 use std::path::{Path, PathBuf};
@@ -12,12 +13,16 @@ use std::process::ExitCode;
 #[cfg(target_os = "macos")]
 use std::{
     fs::File,
-    io::{Read as _, Seek as _, SeekFrom},
+    io::{Seek as _, SeekFrom},
 };
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 #[cfg(target_os = "macos")]
 use glaeda::artifact::Sha256Digest;
+use glaeda::cache_inventory::{
+    CacheReportRequest, CacheStateId, MAX_CACHE_INVENTORY_DOCUMENT_BYTES,
+    build_cache_inventory_report, decode_cache_inventory, render_cache_inventory_human,
+};
 use glaeda::disposable_launchd_service::DisposableLaunchdServiceDesiredState;
 #[cfg(target_os = "macos")]
 use glaeda::disposable_launchd_service::{
@@ -156,6 +161,38 @@ enum Command {
     Job {
         #[command(subcommand)]
         command: JobCommand,
+    },
+    /// Classify an explicit path-free hot-state observation document without mutation.
+    Cache {
+        #[command(subcommand)]
+        command: CacheCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CacheCommand {
+    /// Classify every supplied state observation.
+    Status {
+        /// Explicit bounded path-free observation document.
+        #[arg(long)]
+        inventory: PathBuf,
+    },
+    /// Explain one exact opaque state identity.
+    Explain {
+        /// Exact opaque state identity from the observation document.
+        state_id: String,
+        /// Explicit bounded path-free observation document.
+        #[arg(long)]
+        inventory: PathBuf,
+    },
+    /// Show reclaim candidates without changing any host state.
+    Reclaim {
+        /// Mandatory proof that this command is observation-only.
+        #[arg(long, required = true, action = clap::ArgAction::SetTrue)]
+        dry_run: bool,
+        /// Explicit bounded path-free observation document.
+        #[arg(long)]
+        inventory: PathBuf,
     },
 }
 
@@ -598,6 +635,31 @@ fn main() -> ExitCode {
                 &request_id,
             ),
         },
+        Command::Cache { command } => match command {
+            CacheCommand::Status { inventory } => {
+                run_cache_inventory(cli.output, &inventory, CacheReportRequest::Status)
+            }
+            CacheCommand::Explain {
+                state_id,
+                inventory,
+            } => {
+                let state_id = match CacheStateId::parse(&state_id) {
+                    Ok(state_id) => state_id,
+                    Err(error) => {
+                        return emit_runtime_error(cli.output, error.code(), error.to_string());
+                    }
+                };
+                run_cache_inventory(
+                    cli.output,
+                    &inventory,
+                    CacheReportRequest::Explain(state_id),
+                )
+            }
+            CacheCommand::Reclaim { dry_run, inventory } => {
+                debug_assert!(dry_run, "clap requires --dry-run");
+                run_cache_inventory(cli.output, &inventory, CacheReportRequest::ReclaimDryRun)
+            }
+        },
     }
 }
 
@@ -629,6 +691,66 @@ fn run_doctor(output: OutputFormat, strict: bool) -> ExitCode {
     } else {
         ExitCode::SUCCESS
     }
+}
+
+fn run_cache_inventory(
+    output: OutputFormat,
+    inventory_path: &Path,
+    request: CacheReportRequest,
+) -> ExitCode {
+    let bytes = match read_bounded_cache_inventory(inventory_path) {
+        Ok(bytes) => bytes,
+        Err(message) => {
+            return emit_runtime_error(output, "cache_inventory_read_failed", message);
+        }
+    };
+    let inventory = match decode_cache_inventory(&bytes) {
+        Ok(inventory) => inventory,
+        Err(error) => {
+            return emit_runtime_error(output, error.code(), error.to_string());
+        }
+    };
+    let report = match build_cache_inventory_report(&inventory, &request) {
+        Ok(report) => report,
+        Err(error) => {
+            return emit_runtime_error(output, error.code(), error.to_string());
+        }
+    };
+    match output {
+        OutputFormat::Human => print!("{}", render_cache_inventory_human(&report)),
+        OutputFormat::Json => {
+            if print_json(&report).is_err() {
+                return ExitCode::from(2);
+            }
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+fn read_bounded_cache_inventory(path: &Path) -> Result<Vec<u8>, String> {
+    let file =
+        std::fs::File::open(path).map_err(|_| "cache inventory could not be opened".to_owned())?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| "cache inventory metadata could not be read".to_owned())?;
+    if !metadata.is_file() {
+        return Err("cache inventory is not a regular file".to_owned());
+    }
+    if metadata.len() > MAX_CACHE_INVENTORY_DOCUMENT_BYTES as u64 {
+        return Err("cache inventory exceeds the reviewed byte limit".to_owned());
+    }
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(metadata.len())
+            .unwrap_or(MAX_CACHE_INVENTORY_DOCUMENT_BYTES)
+            .min(MAX_CACHE_INVENTORY_DOCUMENT_BYTES),
+    );
+    file.take((MAX_CACHE_INVENTORY_DOCUMENT_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "cache inventory could not be read".to_owned())?;
+    if bytes.len() > MAX_CACHE_INVENTORY_DOCUMENT_BYTES {
+        return Err("cache inventory exceeds the reviewed byte limit".to_owned());
+    }
+    Ok(bytes)
 }
 
 fn run_plan(output: OutputFormat, file: &Path) -> ExitCode {
@@ -1783,8 +1905,8 @@ mod tests {
     use glaeda::lane_command::LaneCommandKind;
 
     use super::{
-        Cli, Command, HostCommand, JobCommand, QueueCommand, ServiceCommand, ServiceDesiredState,
-        WorkerCommand,
+        CacheCommand, Cli, Command, HostCommand, JobCommand, QueueCommand, ServiceCommand,
+        ServiceDesiredState, WorkerCommand,
     };
     #[cfg(target_os = "linux")]
     use super::{
@@ -1795,6 +1917,77 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     static NEXT_ENROLLMENT_ROOT: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn cache_commands_require_explicit_inventory_and_reclaim_dry_run() {
+        let status = Cli::try_parse_from([
+            "glaeda",
+            "--output",
+            "json",
+            "cache",
+            "status",
+            "--inventory",
+            "observations.json",
+        ])
+        .expect("parse cache status");
+        let Command::Cache {
+            command: CacheCommand::Status { inventory },
+        } = status.command
+        else {
+            panic!("expected cache status command");
+        };
+        assert_eq!(inventory, PathBuf::from("observations.json"));
+
+        let explain = Cli::try_parse_from([
+            "glaeda",
+            "cache",
+            "explain",
+            "state-one",
+            "--inventory",
+            "observations.json",
+        ])
+        .expect("parse cache explain");
+        let Command::Cache {
+            command:
+                CacheCommand::Explain {
+                    state_id,
+                    inventory,
+                },
+        } = explain.command
+        else {
+            panic!("expected cache explain command");
+        };
+        assert_eq!(state_id, "state-one");
+        assert_eq!(inventory, PathBuf::from("observations.json"));
+
+        assert!(
+            Cli::try_parse_from([
+                "glaeda",
+                "cache",
+                "reclaim",
+                "--inventory",
+                "observations.json",
+            ])
+            .is_err()
+        );
+        let reclaim = Cli::try_parse_from([
+            "glaeda",
+            "cache",
+            "reclaim",
+            "--dry-run",
+            "--inventory",
+            "observations.json",
+        ])
+        .expect("parse cache reclaim dry-run");
+        let Command::Cache {
+            command: CacheCommand::Reclaim { dry_run, inventory },
+        } = reclaim.command
+        else {
+            panic!("expected cache reclaim command");
+        };
+        assert!(dry_run);
+        assert_eq!(inventory, PathBuf::from("observations.json"));
+    }
 
     #[test]
     fn host_prepare_accepts_explicit_confirmation_and_account_policy() {
