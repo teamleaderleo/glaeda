@@ -358,21 +358,25 @@ impl UnixProtectedCacheGenerationCatalogStore {
             self.owner,
             "staged protected cache catalog",
         )?;
-        fs::renameat_with(
-            &self.directory,
-            staged.name(),
-            &self.directory,
-            CATALOG_FILE,
-            RenameFlags::empty(),
-        )
-        .map_err(|_| {
-            store_error(
-                ProtectedCacheCatalogStoreErrorKind::Io,
-                "could not atomically replace the protected cache catalog",
-            )
-        })?;
+        replace_between_directory_barriers(
+            || synchronize_directory(&self.directory, "protected cache catalog directory"),
+            || {
+                fs::renameat_with(
+                    &self.directory,
+                    staged.name(),
+                    &self.directory,
+                    CATALOG_FILE,
+                    RenameFlags::empty(),
+                )
+                .map_err(|_| {
+                    store_error(
+                        ProtectedCacheCatalogStoreErrorKind::Io,
+                        "could not atomically replace the protected cache catalog",
+                    )
+                })
+            },
+        )?;
         staged.disarm();
-        synchronize_directory(&self.directory, "protected cache catalog directory")?;
         let published = self.open_catalog_locked()?.snapshot;
         if published.document != successor {
             return Err(store_error(
@@ -586,20 +590,24 @@ impl UnixProtectedCacheGenerationCatalogStore {
                     "abandoned protected cache catalog is not an exact revision successor",
                 )
             })?;
-        fs::renameat_with(
-            &self.directory,
-            stage_name,
-            &self.directory,
-            CATALOG_FILE,
-            RenameFlags::empty(),
-        )
-        .map_err(|_| {
-            store_error(
-                ProtectedCacheCatalogStoreErrorKind::Io,
-                "could not publish the abandoned protected cache catalog transition",
-            )
-        })?;
-        synchronize_directory(&self.directory, "protected cache catalog directory")?;
+        replace_between_directory_barriers(
+            || synchronize_directory(&self.directory, "protected cache catalog directory"),
+            || {
+                fs::renameat_with(
+                    &self.directory,
+                    stage_name,
+                    &self.directory,
+                    CATALOG_FILE,
+                    RenameFlags::empty(),
+                )
+                .map_err(|_| {
+                    store_error(
+                        ProtectedCacheCatalogStoreErrorKind::Io,
+                        "could not publish the abandoned protected cache catalog transition",
+                    )
+                })
+            },
+        )?;
         Ok(ProtectedCacheCatalogRecoveryDisposition::PublishedAbandonedTransition)
     }
 
@@ -1443,6 +1451,15 @@ fn synchronize_directory(
     })
 }
 
+fn replace_between_directory_barriers<E>(
+    mut synchronize: impl FnMut() -> Result<(), E>,
+    replace: impl FnOnce() -> Result<(), E>,
+) -> Result<(), E> {
+    synchronize()?;
+    replace()?;
+    synchronize()
+}
+
 fn stage_file_name() -> String {
     let sequence = NEXT_STAGE.fetch_add(1, Ordering::Relaxed);
     let mut name = String::new();
@@ -1611,6 +1628,7 @@ fn store_error(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::{Cell, RefCell};
     use std::fs as stdfs;
     use std::os::unix::fs::{PermissionsExt as _, symlink};
     use std::path::{Path, PathBuf};
@@ -1628,7 +1646,8 @@ mod tests {
         ProtectedCacheCatalogStoreBinding, ProtectedCacheCatalogStoreErrorKind,
         ProtectedCacheCatalogStoreRead, ProtectedCacheCurrentTransitionAuthorization,
         STORE_DIRECTORY, StoreLockMode, UnixProtectedCacheGenerationCatalogStore,
-        encode_store_envelope, open_private_file, verify_retained_file_path,
+        encode_store_envelope, open_private_file, replace_between_directory_barriers,
+        verify_retained_file_path,
     };
     use crate::cache_inventory::CacheStateId;
     use crate::protected_cache_generation_catalog::{
@@ -1710,6 +1729,43 @@ mod tests {
             state_id: state(state_id),
             generation_identity: generation(generation_identity),
         }
+    }
+
+    #[test]
+    fn currentness_replacement_requires_pre_barrier_and_preserves_order() {
+        let events = RefCell::new(Vec::new());
+        let sync_count = Cell::new(0_u8);
+        replace_between_directory_barriers(
+            || {
+                sync_count.set(sync_count.get() + 1);
+                events.borrow_mut().push("barrier");
+                Ok::<(), &'static str>(())
+            },
+            || {
+                events.borrow_mut().push("replace");
+                Ok(())
+            },
+        )
+        .expect("barrier-replace-barrier sequence");
+        assert_eq!(sync_count.get(), 2);
+        assert_eq!(*events.borrow(), ["barrier", "replace", "barrier"]);
+
+        let replacement_attempted = Cell::new(false);
+        let barrier_calls = Cell::new(0_u8);
+        let error = replace_between_directory_barriers(
+            || {
+                barrier_calls.set(barrier_calls.get() + 1);
+                Err::<(), _>("pre-replacement barrier failed")
+            },
+            || {
+                replacement_attempted.set(true);
+                Ok(())
+            },
+        )
+        .expect_err("failed pre-replacement barrier must stop publication");
+        assert_eq!(error, "pre-replacement barrier failed");
+        assert_eq!(barrier_calls.get(), 1);
+        assert!(!replacement_attempted.get());
     }
 
     fn abandon_exact_stage(store: &UnixProtectedCacheGenerationCatalogStore) -> String {

@@ -25,8 +25,9 @@ Every successor advances once, retires the former current generation, adds exact
 identity, and preserves all other entries. The store retains no-follow-opened installation/store
 descriptors, binds a canonical private envelope to the exact installation ID, current state-root
 generation and namespace, validates `0750`/`0700`/`0600` ownership and modes, serializes operations
-with a fresh descriptor on the persistent lock, synchronizes staged bytes, publishes with atomic
-no-replace creation or atomic replacement, and synchronizes the parent directory.
+with a fresh descriptor on the persistent lock, synchronizes staged bytes, durably checkpoints the
+stage directory entry before currentness replacement, publishes with atomic no-replace creation or
+atomic replacement, and synchronizes the parent directory after publication.
 
 Recovery accepts only an exact abandoned empty create, an exact one-revision current successor, or
 one byte-identical duplicate stage. Missing predecessors, altered history, skipped revisions,
