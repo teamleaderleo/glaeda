@@ -978,13 +978,16 @@ fn inspect_regular_file(
 fn snapshot(
     stat: &rustix::fs::Stat,
 ) -> Result<FileSnapshot, ProtectedCacheReplacementProductionError> {
+    // Linux's `nlink_t` is `u64` on x86_64 but `u32` on aarch64.
+    #[allow(clippy::useless_conversion)]
+    let links = u64::from(stat.st_nlink);
     Ok(FileSnapshot {
         device: stat.st_dev,
         inode: stat.st_ino,
         uid: stat.st_uid,
         gid: stat.st_gid,
         mode: stat.st_mode,
-        links: stat.st_nlink,
+        links,
         size: u64::try_from(stat.st_size).map_err(|_| unsafe_filesystem("file size is invalid"))?,
         mtime_sec: stat.st_mtime,
         mtime_nsec: stat.st_mtime_nsec as i64,
