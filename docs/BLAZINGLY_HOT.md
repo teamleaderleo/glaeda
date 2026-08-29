@@ -202,6 +202,41 @@ manifest discovery, a claim about descendant executables, or a hostile-code secu
 The ultra-trusted caller remains responsible for declaring the right runtime and for preventing an
 in-place executable replacement between verification and execution.
 
+`scripts/hot-observe` is the read-only companion for state that may already be resident. A
+repository adapter supplies bounded public labels for canonical input files and prepared-state
+anchors; Glaeda hashes the no-follow regular files, verifies shared labels have identical content,
+and reports the dependency tree's current entry count plus logical and allocated bytes:
+
+```bash
+scripts/hot-observe --output json dependency \
+  --project-id example --dependency-root /private/prepared/dependencies \
+  --runtime-id node-v22.23.2-linux-x64 \
+  --runtime-sha256 sha256:<exact-executable-digest> \
+  --parent lock=/private/source/pnpm-lock.yaml \
+  --anchor lock=/private/prepared/dependencies/.pnpm/lock.yaml \
+  --anchor layout=/private/prepared/dependencies/.modules.yaml
+```
+
+The same tool can correlate one Linux TCP listener with the expected owner, workspace directory
+inode, executable content, runtime identity, and loopback/any exposure while recording bounded age,
+CPU, and RSS observations:
+
+```bash
+scripts/hot-observe --output json service \
+  --project-id example --service-id web-dev-v1 \
+  --workspace /private/task --port 3000 --exposure loopback \
+  --runtime-id node-v22.23.2-linux-x64 \
+  --runtime-sha256 sha256:<exact-executable-digest>
+```
+
+Both documents are path-free and observation-only. They contain no PID, argv, environment, file
+name, or command output and grant no adoption, lease, signal, cleanup, cache, or result authority.
+`anchor_aligned` proves only the repository-declared anchors, not every dependency byte or package
+manager semantic. `physical_match` proves the observed listener/process facts, not which application
+protocol or source semantics the process serves. Missing or drifting facts remain ordinary
+`absent`, `revalidate_required`, `drift`, or `ambiguous` observations for a later cold/reset/lease
+decision.
+
 `--measurement result.json` atomically writes one bounded developer observation containing elapsed
 time, user/system CPU time, peak RSS, exit/signal, completion reason, configured timeout,
 cross-worktree mode, relative cache policies, and the optional public runtime contract. It contains
