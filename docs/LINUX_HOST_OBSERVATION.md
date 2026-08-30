@@ -18,6 +18,8 @@ One typed human/JSON report contains:
 - logical CPU count plus 1/5/15-minute load and runnable/total entity counts from `/proc`;
 - total/available memory and total/used swap;
 - CPU, memory, and I/O PSI `some` averages and cumulative microseconds;
+- scheduler autogroup support/state plus stable sched_ext support/state, enable sequence, and active ops
+  name when enabled;
 - failed system and current-user systemd unit counts;
 - only the requested/default port numbers and whether each is listening.
 
@@ -39,6 +41,11 @@ a container or nested namespace.
 adopt or terminate processes, mutate services or listeners, select resources, clean state, or
 grant cache/result authority. Consumers must treat a dynamic snapshot as evidence observed over a
 short interval, not as an atomic machine transaction.
+
+The sched_ext fields are observation, not a scheduler selector. The observer rereads state and the
+monotonic enable sequence around the active-ops name and refuses a transition instead of emitting a
+mixed snapshot. An absent fixed sched_ext sysfs directory is reported as unsupported; malformed or
+partially available scheduler data fails the report.
 
 ## Performance evidence
 
