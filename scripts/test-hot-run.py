@@ -537,11 +537,11 @@ class HotRunTests(unittest.TestCase):
         self,
         namespace: dict[str, object],
         fixture: Path,
-        state_identity: str,
+        fixture_label: str,
     ) -> tuple[Path, Path, dict[str, object]]:
-        resident = fixture / f"resident-{state_identity[0]}"
-        task = fixture / f"task-{state_identity[0]}"
-        common_git = fixture / f"common-{state_identity[0]}"
+        resident = fixture / f"resident-{fixture_label[0]}"
+        task = fixture / f"task-{fixture_label[0]}"
+        common_git = fixture / f"common-{fixture_label[0]}"
         resident_git = common_git
         task_git = common_git / "worktrees" / "task"
         resident.mkdir()
@@ -558,6 +558,12 @@ class HotRunTests(unittest.TestCase):
             Path("."),
             Path("worktrees/task"),
         )
+        cache_specs = (
+            namespace["CacheSpec"](Path("target"), "private-copy"),
+        )
+        state_identity = namespace["default_state_root"](
+            resident, task, cache_specs, identity
+        ).name
         state = fixture / "hot-run" / state_identity
         document = namespace["producer_manifest_document"](
             state,
@@ -566,7 +572,7 @@ class HotRunTests(unittest.TestCase):
             common_git,
             resident_git,
             task_git,
-            (namespace["CacheSpec"](Path("target"), "private-copy"),),
+            cache_specs,
             identity,
         )
         return state, task, document
@@ -594,15 +600,103 @@ class HotRunTests(unittest.TestCase):
                 list(namespace_root.glob(".creating-v1-*")),
                 [],
             )
+            self.assertEqual(
+                list(state.glob(".producer-manifest.json.creating-*")),
+                [],
+            )
 
             conflicting = {**document, "cache_views": []}
             with self.assertRaisesRegex(RuntimeError, "manifest conflicts"):
                 publish(state, conflicting)
 
-            legacy = namespace_root / ("2" * 64)
+            _, _, legacy_document = self.make_hot_state_manifest_fixture(
+                namespace, fixture, "2" * 64
+            )
+            legacy = namespace_root / legacy_document["state_identity"]
             legacy.mkdir()
-            self.assertEqual(publish(legacy, {**document, "state_identity": "2" * 64}), "legacy")
+            with self.assertRaisesRegex(RuntimeError, "manifestless state"):
+                publish(legacy, legacy_document)
             self.assertFalse((legacy / "producer-manifest.json").exists())
+
+    def test_manifest_authentication_rejects_forged_generation_and_encoding(
+        self,
+    ) -> None:
+        namespace = load_hot_run()
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            namespace_root = fixture / "hot-run"
+            namespace_root.mkdir(mode=0o700)
+            state, task, document = self.make_hot_state_manifest_fixture(
+                namespace, fixture, "f" * 64
+            )
+            state.mkdir(mode=0o700)
+            manifest = state / "producer-manifest.json"
+            manifest.write_text(
+                json.dumps(document, indent=2) + "\n", encoding="utf-8"
+            )
+            manifest.chmod(0o600)
+            with self.assertRaisesRegex(RuntimeError, "not canonical"):
+                namespace["read_producer_manifest"](state, state.name)
+
+            manifest.unlink()
+            forged = json.loads(json.dumps(document))
+            forged["generation_objects"][1]["inode"] += 1
+            namespace["write_producer_manifest"](
+                state, namespace["canonical_manifest_bytes"](forged)
+            )
+            (state / "lock").touch(mode=0o600)
+            (state / "payload").write_text("preserve\n", encoding="utf-8")
+            (task / ".git").unlink()
+            with self.assertRaisesRegex(RuntimeError, "not authentic"):
+                namespace["read_producer_manifest"](state, state.name)
+            self.assertEqual(
+                namespace["collect_one_unreachable_state"](
+                    namespace_root, "0" * 64
+                ),
+                "nothing_eligible",
+            )
+            self.assertEqual(
+                (state / "payload").read_text(encoding="utf-8"), "preserve\n"
+            )
+
+    def test_discovery_bounds_refuse_large_namespace_and_runtime_inventory(
+        self,
+    ) -> None:
+        namespace = load_hot_run()
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            namespace_root = fixture / "bounded-namespace"
+            namespace_root.mkdir(mode=0o700)
+            for index in range(namespace["MAX_HOT_STATE_NAMESPACE_ENTRIES"] + 1):
+                (namespace_root / f"foreign-{index:04d}").touch(mode=0o600)
+            self.assertEqual(
+                namespace["collect_one_unreachable_state"](
+                    namespace_root, "0" * 64
+                ),
+                "namespace_bound_exceeded",
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            namespace_root = fixture / "hot-run"
+            namespace_root.mkdir(mode=0o700)
+            state, task, document = self.make_hot_state_manifest_fixture(
+                namespace, fixture, "r" * 64
+            )
+            namespace["publish_implicit_state_base"](state, document)
+            for index in range(namespace["MAX_HOT_STATE_RUNTIME_ENTRIES"] + 1):
+                runtime = state / f"runtime-{index:064x}"
+                runtime.mkdir(mode=0o700)
+                (runtime / "lock").touch(mode=0o600)
+            (task / ".git").unlink()
+            self.assertIsNone(namespace["acquire_retirement_locks"](state))
+            self.assertEqual(
+                namespace["collect_one_unreachable_state"](
+                    namespace_root, "0" * 64
+                ),
+                "nothing_eligible",
+            )
+            self.assertTrue(state.exists())
 
     def test_collector_requires_unreachable_generation_and_idle_exact_lock(
         self,
@@ -757,7 +851,7 @@ class HotRunTests(unittest.TestCase):
                     ),
                     "retired_unreachable",
                 )
-            retired = namespace_root / (".retired-v1-" + "6" * 64)
+            retired = namespace_root / (".retired-v1-" + state.name)
             self.assertTrue(retired.exists())
             self.assertTrue((retired / "producer-manifest.json").exists())
 
@@ -792,10 +886,10 @@ class HotRunTests(unittest.TestCase):
                     namespace_root, "9" * 64
                 )
 
-            retired_name = ".retired-v1-" + "8" * 64
+            retired_name = ".retired-v1-" + state.name
             retired = namespace_root / retired_name
             record_name = namespace["retirement_record_name"](
-                retired_name, "8" * 64
+                retired_name, state.name
             )
             self.assertTrue((namespace_root / record_name).exists())
             for child in retired.iterdir():
@@ -813,21 +907,22 @@ class HotRunTests(unittest.TestCase):
             self.assertFalse(retired.exists())
             self.assertFalse((namespace_root / record_name).exists())
 
-    def test_interrupted_unpublished_stage_is_reclaimed_by_exact_manifest(self) -> None:
+    def test_interrupted_unpublished_manifest_is_reclaimed_and_republished(self) -> None:
         namespace = load_hot_run()
         with tempfile.TemporaryDirectory() as directory:
             fixture = Path(directory)
             namespace_root = fixture / "hot-run"
             namespace_root.mkdir(mode=0o700)
-            _, _, document = self.make_hot_state_manifest_fixture(
+            state, _, document = self.make_hot_state_manifest_fixture(
                 namespace, fixture, "a" * 64
             )
-            staging = namespace_root / (".creating-v1-" + "a" * 64 + "-crash")
-            staging.mkdir(mode=0o700)
-            namespace["write_producer_manifest"](
-                staging, namespace["canonical_manifest_bytes"](document)
+            staging = namespace_root / (
+                ".creating-v1-" + state.name + "-crash"
             )
-            (staging / "partial").write_text("incomplete", encoding="utf-8")
+            staging.mkdir(mode=0o700)
+            manifest = staging / "producer-manifest.json"
+            manifest.write_text('{"schema_version":', encoding="utf-8")
+            manifest.chmod(0o600)
 
             self.assertEqual(
                 namespace["collect_one_unreachable_state"](
@@ -836,6 +931,11 @@ class HotRunTests(unittest.TestCase):
                 "creating_recovery",
             )
             self.assertFalse(staging.exists())
+            self.assertEqual(
+                namespace["publish_implicit_state_base"](state, document),
+                "created",
+            )
+            self.assertTrue((state / "producer-manifest.json").exists())
 
     def test_worktree_state_revalidation_rejects_generation_drift(self) -> None:
         namespace = load_hot_run()

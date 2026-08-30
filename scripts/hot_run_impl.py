@@ -46,12 +46,16 @@ SHA256_PREFIX = "sha256:"
 HOT_STATE_SCHEMA_VERSION = 1
 HOT_STATE_PRODUCER = "glaeda-hot-run-python-state-v1"
 HOT_STATE_MANIFEST = "producer-manifest.json"
+HOT_STATE_MANIFEST_STAGING_PREFIX = ".producer-manifest.json.creating-"
 HOT_STATE_NAMESPACE_LOCK = ".namespace-lock"
 HOT_STATE_CREATING_PREFIX = ".creating-v1-"
 HOT_STATE_RETIRED_PREFIX = ".retired-v1-"
 HOT_STATE_RETIREMENT_RECORD_PREFIX = ".retirement-v1-"
 HOT_STATE_RETIREMENT_RECORD_SUFFIX = ".json"
 MAX_HOT_STATE_MANIFEST_BYTES = 32 * 1024
+MAX_HOT_STATE_NAMESPACE_ENTRIES = 256
+MAX_HOT_STATE_RUNTIME_ENTRIES = 64
+MAX_HOT_STATE_CREATING_ENTRIES = 2
 MAX_HOT_STATE_DELETE_ENTRIES = 2048
 MAX_HOT_STATE_DELETE_DEPTH = 128
 RENAME_NOREPLACE = 1
@@ -656,6 +660,16 @@ def default_state_root(
     cache_home = Path(
         os.environ.get("XDG_CACHE_HOME", os.path.join(Path.home(), ".cache"))
     )
+    identity = default_state_identity(resident, task, cache_specs, worktree_identity)
+    return cache_home / "glaeda" / "hot-run" / identity
+
+
+def default_state_identity(
+    resident: Path,
+    task: Path,
+    cache_specs: tuple[CacheSpec, ...],
+    worktree_identity: WorktreeStateIdentity,
+) -> str:
     # v3 prevents older hot-run implementations, which do not participate in the
     # namespace protocol, from opening a producer-managed state concurrently.
     digest = hashlib.sha256(b"glaeda-hot-run-default-state-v3\0")
@@ -691,8 +705,7 @@ def default_state_root(
         digest.update(encoded_path)
         digest.update(len(encoded_mode).to_bytes(8, "big"))
         digest.update(encoded_mode)
-    identity = digest.hexdigest()
-    return cache_home / "glaeda" / "hot-run" / identity
+    return digest.hexdigest()
 
 
 def runtime_state_root(base: Path, runtime: RuntimeContract | None) -> Path:
@@ -753,7 +766,10 @@ def producer_manifest_document(
     cache_specs: tuple[CacheSpec, ...],
     worktree_identity: WorktreeStateIdentity,
 ) -> dict[str, object]:
-    if not state_identity_name(state_base.name):
+    expected_identity = default_state_identity(
+        resident, task, cache_specs, worktree_identity
+    )
+    if state_base.name != expected_identity:
         raise RuntimeError("implicit hot-state identity is invalid")
     objects = (
         directory_identity_document(
@@ -889,9 +905,67 @@ def validate_manifest_document(
             raise RuntimeError("hot-state producer manifest generation is invalid")
         for key in expected_keys - {"role", "kind", "path"}:
             value = item[key]
-            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+                or value > (1 << 64) - 1
+            ):
                 raise RuntimeError("hot-state producer manifest generation is invalid")
     return document
+
+
+def recompute_manifest_state_identity(document: dict[str, object]) -> str:
+    objects = document["generation_objects"]
+    cache_views = document["cache_views"]
+    assert isinstance(objects, list)
+    assert isinstance(cache_views, list)
+    by_role = {item["role"]: item for item in objects}
+    resident = Path(by_role["resident_root"]["path"])
+    task = Path(by_role["task_root"]["path"])
+    common_git = Path(by_role["common_git_directory"]["path"])
+    resident_git = Path(by_role["resident_git_directory"]["path"])
+    task_git = Path(by_role["task_git_directory"]["path"])
+    if (
+        Path(by_role["resident_git_pointer"]["path"]) != resident / ".git"
+        or Path(by_role["task_git_pointer"]["path"]) != task / ".git"
+    ):
+        raise RuntimeError(
+            "hot-state producer manifest Git relationships are invalid"
+        )
+    try:
+        resident_git_relative = resident_git.relative_to(common_git)
+        task_git_relative = task_git.relative_to(common_git)
+    except ValueError as error:
+        raise RuntimeError(
+            "hot-state producer manifest Git relationships are invalid"
+        ) from error
+
+    def directory(role: str) -> DirectoryObjectIdentity:
+        item = by_role[role]
+        return DirectoryObjectIdentity(item["device"], item["inode"])
+
+    def pointer(role: str) -> WorktreePointerIdentity:
+        item = by_role[role]
+        return WorktreePointerIdentity(
+            item["device"], item["inode"], item["creation_witness_ns"]
+        )
+
+    identity = WorktreeStateIdentity(
+        resident_root=directory("resident_root"),
+        task_root=directory("task_root"),
+        common_git_directory=directory("common_git_directory"),
+        resident_git_directory=directory("resident_git_directory"),
+        task_git_directory=directory("task_git_directory"),
+        resident_git_pointer=pointer("resident_git_pointer"),
+        task_git_pointer=pointer("task_git_pointer"),
+        resident_git_relative=resident_git_relative,
+        task_git_relative=task_git_relative,
+    )
+    cache_specs = tuple(
+        CacheSpec(Path(view["path"]), view["mode"]) for view in cache_views
+    )
+    return default_state_identity(resident, task, cache_specs, identity)
 
 
 def read_producer_manifest(
@@ -920,31 +994,52 @@ def read_producer_manifest(
             document = json.loads(encoded)
         except (UnicodeError, json.JSONDecodeError) as error:
             raise RuntimeError("hot-state producer manifest is malformed") from error
-        return validate_manifest_document(document, state_identity), encoded
+        manifest = validate_manifest_document(document, state_identity)
+        if canonical_manifest_bytes(manifest) != encoded:
+            raise RuntimeError("hot-state producer manifest is not canonical")
+        if recompute_manifest_state_identity(manifest) != state_identity:
+            raise RuntimeError("hot-state producer manifest generation is not authentic")
+        return manifest, encoded
     finally:
         os.close(descriptor)
 
 
 def write_producer_manifest(directory: Path, encoded: bytes) -> None:
-    descriptor = os.open(
-        directory / HOT_STATE_MANIFEST,
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
-        0o600,
-    )
+    staging: Path | None = None
+    descriptor: int | None = None
+    for attempt in range(32):
+        candidate = directory / (
+            f"{HOT_STATE_MANIFEST_STAGING_PREFIX}{os.getpid()}-"
+            f"{time.time_ns()}-{attempt}"
+        )
+        try:
+            descriptor = os.open(
+                candidate,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | os.O_CLOEXEC
+                | os.O_NOFOLLOW,
+                0o600,
+            )
+            staging = candidate
+            break
+        except FileExistsError:
+            continue
+    if descriptor is None or staging is None:
+        raise RuntimeError("could not allocate a hot-state manifest stage")
     try:
         written = 0
         while written < len(encoded):
-            written += os.write(descriptor, encoded[written:])
+            count = os.write(descriptor, encoded[written:])
+            if count <= 0:
+                raise OSError("hot-state producer manifest write made no progress")
+            written += count
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
-    directory_fd = os.open(
-        directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
-    )
-    try:
-        os.fsync(directory_fd)
-    finally:
-        os.close(directory_fd)
+    rename_noreplace(staging, directory / HOT_STATE_MANIFEST)
+    fsync_directory(directory)
 
 
 def rename_noreplace(source: Path, destination: Path) -> None:
@@ -998,7 +1093,9 @@ def publish_implicit_state_base(
         try:
             _, observed = read_producer_manifest(state_base, state_base.name)
         except FileNotFoundError:
-            return "legacy"
+            raise RuntimeError(
+                "implicit hot-state generation collides with manifestless state"
+            )
         if observed != encoded:
             raise RuntimeError("hot-state producer manifest conflicts with this generation")
         return "reused"
@@ -1031,6 +1128,18 @@ def ensure_private_directory(path: Path) -> None:
     if details.st_uid != os.getuid():
         raise RuntimeError(f"hot-run state is not owned by the current user: {path}")
     path.chmod(0o700)
+
+
+def scan_directory_bounded(
+    directory: Path | int, maximum_entries: int
+) -> list[os.DirEntry[str]] | None:
+    entries: list[os.DirEntry[str]] = []
+    with os.scandir(directory) as iterator:
+        for entry in iterator:
+            if len(entries) >= maximum_entries:
+                return None
+            entries.append(entry)
+    return entries
 
 
 def open_private_lock(path: Path, label: str) -> int:
@@ -1097,8 +1206,10 @@ def acquire_retirement_locks(state: Path) -> list[RetirementLock] | None:
     else:
         lock_paths.append(direct_lock)
     try:
-        entries = list(os.scandir(state))
+        entries = scan_directory_bounded(state, MAX_HOT_STATE_RUNTIME_ENTRIES)
     except OSError:
+        return None
+    if entries is None:
         return None
     for entry in entries:
         if not entry.name.startswith("runtime-"):
@@ -1497,6 +1608,70 @@ def delete_retired_state_bounded(
         os.close(root_descriptor)
 
 
+def delete_unpublished_stage_bounded(
+    namespace_root: Path, stage_name: str, state_identity: str
+) -> bool:
+    expected_prefix = f"{HOT_STATE_CREATING_PREFIX}{state_identity}-"
+    if not stage_name.startswith(expected_prefix):
+        return False
+    root_descriptor = os.open(
+        namespace_root,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+    )
+    stage_descriptor: int | None = None
+    try:
+        root_details = os.fstat(root_descriptor)
+        stage_descriptor = os.open(
+            stage_name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=root_descriptor,
+        )
+        stage_details = os.fstat(stage_descriptor)
+        if (
+            stage_details.st_uid != os.getuid()
+            or stage_details.st_dev != root_details.st_dev
+            or stat.S_IMODE(stage_details.st_mode) != 0o700
+        ):
+            return False
+        entries = scan_directory_bounded(
+            stage_descriptor, MAX_HOT_STATE_CREATING_ENTRIES
+        )
+        if entries is None:
+            return False
+        for entry in entries:
+            if not (
+                entry.name == HOT_STATE_MANIFEST
+                or entry.name.startswith(HOT_STATE_MANIFEST_STAGING_PREFIX)
+            ):
+                return False
+            details = os.stat(
+                entry.name, dir_fd=stage_descriptor, follow_symlinks=False
+            )
+            if (
+                not stat.S_ISREG(details.st_mode)
+                or details.st_uid != os.getuid()
+                or details.st_dev != stage_details.st_dev
+                or details.st_nlink != 1
+                or stat.S_IMODE(details.st_mode) != 0o600
+                or details.st_size > MAX_HOT_STATE_MANIFEST_BYTES
+            ):
+                return False
+        for entry in entries:
+            os.unlink(entry.name, dir_fd=stage_descriptor)
+        os.fsync(stage_descriptor)
+        os.close(stage_descriptor)
+        stage_descriptor = None
+        os.rmdir(stage_name, dir_fd=root_descriptor)
+        os.fsync(root_descriptor)
+        return True
+    except OSError:
+        return False
+    finally:
+        if stage_descriptor is not None:
+            os.close(stage_descriptor)
+        os.close(root_descriptor)
+
+
 def collect_one_unreachable_state(
     namespace_root: Path, current_state_identity: str
 ) -> str:
@@ -1508,9 +1683,13 @@ def collect_one_unreachable_state(
             or stat.S_IMODE(namespace_details.st_mode) != 0o700
         ):
             return "unavailable"
-        entries = list(os.scandir(namespace_root))
+        entries = scan_directory_bounded(
+            namespace_root, MAX_HOT_STATE_NAMESPACE_ENTRIES
+        )
     except OSError:
         return "unavailable"
+    if entries is None:
+        return "namespace_bound_exceeded"
 
     for entry in entries:
         if not (
@@ -1545,19 +1724,23 @@ def collect_one_unreachable_state(
         suffix = entry.name.removeprefix(HOT_STATE_CREATING_PREFIX)
         state_identity, separator, _ = suffix.partition("-")
         if separator and state_identity_name(state_identity):
-            delete_retired_state_bounded(
+            if delete_unpublished_stage_bounded(
                 namespace_root, entry.name, state_identity
-            )
-            return "creating_recovery"
+            ):
+                return "creating_recovery"
+            return "creating_recovery_deferred"
 
     for entry in entries:
         if not entry.name.startswith(HOT_STATE_RETIRED_PREFIX):
             continue
         state_identity = entry.name.removeprefix(HOT_STATE_RETIRED_PREFIX)
         if state_identity_name(state_identity):
-            delete_retired_state_bounded(
-                namespace_root, entry.name, state_identity
-            )
+            try:
+                delete_retired_state_bounded(
+                    namespace_root, entry.name, state_identity
+                )
+            except RuntimeError:
+                return "retired_recovery_deferred"
             return "retired_recovery"
 
     for entry in entries:

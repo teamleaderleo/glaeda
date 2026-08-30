@@ -612,13 +612,17 @@ consumption.
 
 An explicit `--state` remains caller-owned and can intentionally continue a lineage across
 worktree generations. New implicit generations are first staged with an owner-private producer
-manifest, then atomically published under a retained namespace lock. The manifest binds the exact
-state digest, reconstructible cache modes, and the same resident/task/Git object generation that
-selected the state; it carries no workflow-result or source-validity authority. Existing
-manifest-less directories, including default-key v1 and v2 state, are legacy and no longer selected
-by the v3 key. The collector never adopts or deletes them. The key transition also prevents an
-older hot-run implementation that does not participate in the namespace protocol from opening a
-new producer-managed state concurrently.
+manifest, then atomically published under a retained namespace lock. The manifest itself is first
+written and synced under a private temporary name, moved into place with `RENAME_NOREPLACE`, and
+followed by a directory sync; interruption can therefore leave an unpublished temporary file but
+never a partially published final manifest. The reader requires canonical bytes and independently
+recomputes the v3 state digest from all seven generation objects, Git-relative relationships and
+cache modes before any retirement. The manifest carries no workflow-result or source-validity
+authority. Existing default-key v1 and v2 directories remain disjoint legacy state. A manifestless
+directory at the exact computed v3 path is a collision and fails before any lock, runtime or cache
+state is created; it is never adopted. The collector does not delete arbitrary legacy or collision
+payload. The key transition also prevents an older hot-run implementation that does not
+participate in the namespace protocol from opening a new producer-managed state concurrently.
 
 Ordinary implicit hot-run activity performs one bounded opportunistic recovery/retirement pass
 when it can take the namespace lock exclusively without waiting. No age, timeout, PID, name,
@@ -631,9 +635,14 @@ syncs the namespace before allowing a new admission to cold-reconstruct the cano
 Deletion stays beneath held no-follow directory descriptors on the same filesystem, never follows
 symlinks, and removes at most 2,048 entries per invocation. A private retirement record closes the
 final manifest-unlink/directory-removal crash window; later normal activity resumes an interrupted
-publication, retirement, or bounded deletion. Explicit `--state`, legacy, malformed, mode-drifted,
-foreign-owned, active, and still-reachable state remains untouched. #910 tracks the separate
-watermark/value policy needed to evict still-reachable but low-value generations.
+publication, retirement, or bounded deletion. One pass refuses after observing more than 256
+namespace entries or more than 64 entries in a candidate generation, so ordinary launch never
+materializes an unbounded directory inventory. Unpublished creating-stage recovery removes only
+at most two private regular manifest/final-manifest-temporary files beneath the exact stage; any
+other payload is preserved as recovery debt. Explicit `--state`, legacy, malformed, forged,
+noncanonical, mode-drifted, foreign-owned, active, and still-reachable state remains untouched.
+#910 tracks unreachable-generation retirement; #926 separately tracks the watermark/value policy
+needed to evict still-reachable but low-value Cargo targets.
 
 All task state is expendable: discarding it or selecting a new empty `--state` path produces a
 private cold upper and a normal compiler rebuild. Bubblewrap and kernel OverlayFS are required for
