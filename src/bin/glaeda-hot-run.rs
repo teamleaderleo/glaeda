@@ -836,6 +836,7 @@ fn execute_command(
                 OsString::from("--scope"),
                 OsString::from("--quiet"),
                 OsString::from("--collect"),
+                OsString::from("--expand-environment=no"),
             ],
             HEAVY_SCOPE_PROPERTIES
                 .iter()
@@ -1494,6 +1495,7 @@ mod tests {
                 "--scope",
                 "--quiet",
                 "--collect",
+                "--expand-environment=no",
                 "--property",
                 "CPUQuota=1200%",
                 "--property",
@@ -1659,11 +1661,11 @@ mod tests {
         let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let shell = format!(
             "group=$(/usr/bin/awk -F: '$1 == \"0\" {{ print $3 }}' /proc/self/cgroup); \
-             /usr/bin/printf 'cpu=%s\\nhigh=%s\\nmax=%s\\npids=%s\\n' \
+             /usr/bin/printf 'cpu=%s\\nhigh=%s\\nmax=%s\\npids=%s\\nliteral=%s\\n' \
              \"$(/usr/bin/cat /sys/fs/cgroup$group/cpu.max)\" \
              \"$(/usr/bin/cat /sys/fs/cgroup$group/memory.high)\" \
              \"$(/usr/bin/cat /sys/fs/cgroup$group/memory.max)\" \
-             \"$(/usr/bin/cat /sys/fs/cgroup$group/pids.max)\" > {}; exit 17",
+             \"$(/usr/bin/cat /sys/fs/cgroup$group/pids.max)\" \"$1\" > {}; exit 17",
             observation.display()
         );
         let code = run(Cli {
@@ -1681,6 +1683,8 @@ mod tests {
                 OsString::from("/bin/sh"),
                 OsString::from("-c"),
                 OsString::from(shell),
+                OsString::from("glaeda-profile-test"),
+                OsString::from("${HOME}"),
             ],
         })
         .unwrap();
@@ -1695,6 +1699,7 @@ mod tests {
         assert_eq!(lines.next(), Some("high=8589934592"));
         assert_eq!(lines.next(), Some("max=12884901888"));
         assert_eq!(lines.next(), Some("pids=1024"));
+        assert_eq!(lines.next(), Some("literal=${HOME}"));
         assert_eq!(lines.next(), None);
 
         let report: Value = serde_json::from_reader(File::open(&measurement).unwrap()).unwrap();

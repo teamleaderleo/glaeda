@@ -68,6 +68,7 @@ fn heavy_user_scope_is_available() -> bool {
             "--scope",
             "--quiet",
             "--collect",
+            "--expand-environment=no",
             "--property",
             "CPUQuota=1200%",
             "--property",
