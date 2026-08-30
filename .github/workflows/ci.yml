@@ -66,11 +66,13 @@ jobs:
               Path("scripts/hot-pressure-shadow"),
               Path("scripts/hot-run-python"),
               Path("scripts/verify"),
+              Path("scripts/verify-changed-rustfmt"),
               Path("scripts/test-hot-run.py"),
               Path("scripts/test-hot-pressure-shadow.py"),
               Path("scripts/test-benchmark-hot-state-fanout.py"),
               Path("scripts/test-hot-observe.py"),
               Path("scripts/test-verify.py"),
+              Path("scripts/test-verify-changed-rustfmt.py"),
               Path("scripts/test-front-door.py"),
               Path("scripts/project_disk_physical_receipt.py"),
               Path("scripts/test_project_disk_physical_receipt.py"),
@@ -90,6 +92,7 @@ jobs:
           python3 scripts/test-hot-pressure-shadow.py
           python3 scripts/test-hot-run.py
           python3 scripts/test-verify.py
+          python3 scripts/test-verify-changed-rustfmt.py
           python3 scripts/test-front-door.py
 
           first_receipt=$(mktemp)

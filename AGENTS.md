@@ -59,9 +59,11 @@ For a quick non-authoritative edit/test loop, run:
 ./scripts/verify fast
 ```
 
-This runs library/binary tests first, formatting, one CLI build, and the doctor/reference-plan smoke
-checks with per-phase timings. It deliberately skips Clippy and integration/acceptance targets, so
-it is developer feedback only and never replaces final verification.
+This runs library/binary tests first, a fail-closed rustfmt check limited to changed/untracked Rust
+files, one CLI build, and the doctor/reference-plan smoke checks with per-phase timings. Exact HEAD
+is assumed to have passed repository verification; the full formatter remains in the required
+profile. Fast deliberately skips Clippy and integration/acceptance targets, so it is developer
+feedback only and never replaces final verification.
 
 Add `--receipt PATH` to either profile to atomically retain a path-free performance observation
 outside the source worktree. The receipt records the exact source and fixed plan identity, each
