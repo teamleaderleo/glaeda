@@ -306,6 +306,8 @@ pub mod protected_cache_generation_catalog;
 pub mod protected_cache_namespace_lease_visibility;
 /// Strict path-free replacement-equivalence receipt vocabulary for protected cache generations.
 pub mod protected_cache_replacement_equivalence;
+/// Strict supplied-receipt-only decoder for Quarry parallel verification receipt v2.
+pub mod quarry_parallel_verification_receipt;
 pub mod renderprove_artifact_binding;
 pub mod renderprove_execution;
 #[cfg(target_os = "linux")]
