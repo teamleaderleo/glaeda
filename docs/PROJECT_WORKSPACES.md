@@ -320,6 +320,22 @@ Adoption does not silently:
 - delete a fork;
 - rewrite remotes.
 
+The current read-only checkout evidence can be exercised directly on Unix hosts without catalog,
+adoption, residency, or mutation authority:
+
+```bash
+glaeda-project-observe --checkout /absolute/canonical/checkout --output json
+```
+
+This compiled front door runs the existing bounded offline checkout observer once and emits a
+path-private typed report. It requires an explicit canonical absolute checkout, disables Git
+credentials, hooks, lazy fetch, replacement objects, and ambient configuration; configured
+clean/process filters are refused. It requires two coherent snapshots. The report includes exact
+commit/tree, canonical GitHub source when one is provable, dirty/untracked/local-only recovery
+evidence, worktree/submodule topology, and one opaque physical materialization identity. It does
+not establish catalog adoption, a resident-project lease, cache validity, remote freshness,
+cleanup authority, or permission to execute inside the checkout.
+
 A separate migration operation may later stage a successor in the managed developer guest and switch accepted materialization only after the successor is proven.
 
 ## Lazy materialization
