@@ -65,7 +65,21 @@ is assumed to have passed repository verification; the full formatter remains in
 profile. Fast deliberately skips Clippy and integration/acceptance targets, so it is developer
 feedback only and never replaces final verification.
 
-Add `--receipt PATH` to either profile to atomically retain a path-free performance observation
+When `cargo-nextest` is available, run the complete Rust test inventory with faster per-test
+scheduling via:
+
+```bash
+./scripts/verify full-tests
+```
+
+This runs the same locked `--all-targets --all-features` scope as the required Cargo test phase,
+with retries disabled, user nextest configuration excluded, repository default filters ignored,
+all failures allowed to complete, and test concurrency set to the machine's logical CPU count. It
+is explicit developer feedback only:
+absence of `cargo-nextest` fails clearly, and `required` remains the publication contract and Cargo
+fallback.
+
+Add `--receipt PATH` to any profile to atomically retain a path-free performance observation
 outside the source worktree. The receipt records the exact source and fixed plan identity, each
 executed phase's wall/child-CPU timing, the process-lifetime maximum waited-child RSS observation
 (not concurrent aggregate RSS), terminal exit status, and whether source remained unchanged. Opaque

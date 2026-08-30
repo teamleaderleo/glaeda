@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run Glaeda's fast developer loop or exact required verification sequence.
+"""Run Glaeda's fast/full-test developer feedback or exact required verification sequence.
 
 This is a repository-local development helper, not the product verification executor. It streams
 child output directly, retains no logs, grants no result-reuse or publication authority, and leaves
@@ -157,14 +157,62 @@ def fast_phases() -> tuple[Phase, ...]:
     )
 
 
+def full_test_phases() -> tuple[Phase, ...]:
+    return (
+        Phase(
+            "full-tests",
+            "capability",
+            "cargo-nextest",
+            (
+                "--color",
+                "never",
+                "--no-pager",
+                "--user-config-file",
+                "none",
+                "nextest",
+                "run",
+                "--profile",
+                "default",
+                "--locked",
+                "--all-targets",
+                "--all-features",
+                "--ignore-default-filter",
+                "--test-threads",
+                "num-cpus",
+                "--retries",
+                "0",
+                "--no-fail-fast",
+                "--failure-output",
+                "immediate-final",
+                "--success-output",
+                "never",
+                "--status-level",
+                "fail",
+                "--final-status-level",
+                "fail",
+            ),
+        ),
+    )
+
+
+def phases_for(profile: str) -> tuple[Phase, ...]:
+    if profile == "fast":
+        return fast_phases()
+    if profile == "full-tests":
+        return full_test_phases()
+    return required_phases()
+
+
 def plan(profile: str) -> dict[str, object]:
-    phases = fast_phases() if profile == "fast" else required_phases()
+    phases = phases_for(profile)
     return {
         "schema_version": SCHEMA_VERSION,
         "document_type": "glaeda-local-verification-plan",
         "profile": profile,
         "authority": (
-            "developer_feedback_only" if profile == "fast" else "repository_required_checks"
+            "repository_required_checks"
+            if profile == "required"
+            else "developer_feedback_only"
         ),
         "source_must_remain_unchanged": True,
         "retained_logs": False,
@@ -484,7 +532,7 @@ def run(profile: str, receipt_path: Path | None = None) -> int:
     root = repository_root()
     if receipt_path is not None:
         receipt_path = receipt_destination(root, receipt_path)
-    phases = fast_phases() if profile == "fast" else required_phases()
+    phases = phases_for(profile)
     before = source_state(root)
     source_commit, source_tree = git_object_identity(root)
     environment = execution_environment(root)
@@ -495,7 +543,7 @@ def run(profile: str, receipt_path: Path | None = None) -> int:
     exit_code = 0
 
     print(f"Glaeda local verification: {profile}", file=sys.stderr)
-    if profile == "fast":
+    if profile != "required":
         print(
             "authority: developer feedback only; final required verification is not claimed",
             file=sys.stderr,
@@ -586,7 +634,12 @@ def run(profile: str, receipt_path: Path | None = None) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("profile", nargs="?", choices=("fast", "required"), default="fast")
+    parser.add_argument(
+        "profile",
+        nargs="?",
+        choices=("fast", "full-tests", "required"),
+        default="fast",
+    )
     parser.add_argument(
         "--plan-json",
         action="store_true",
