@@ -110,7 +110,14 @@ Documentation-only changes may use the repository's existing docs-only verificat
 - Foreign, conflicting, and unknown resources are protected from mutation.
 - A lease ID alone never proves ownership of a container, workspace, route, disk, cache, artifact, or resident project sandbox.
 - Lease transitions must follow `docs/adr/0004-lease-lifecycle-core.md`; accepted transitions advance their revision and terminal leases remain terminal.
-- Do not write durable state or authority-bearing markers until atomic persistence, permissions, symlink defense, locking, crash recovery, migrations, and installation/generation identity are concretely implemented for that state family.
+- Do not write durable decision state or authority-bearing markers until atomic persistence,
+  permissions, symlink defense, locking, crash recovery, migrations, and installation/generation
+  identity are concretely implemented for that state family.
+- Cheap performance hints may be retained without that full state-store machinery only when they
+  are explicitly non-authoritative, bounded, privacy-preserving, safe to ignore or lose, and never
+  used to establish ownership, adoption, currentness, validity, reclamation, deletion, or another
+  safe-action precondition. If a hint can change which mutation or reuse is considered safe, it is
+  durable decision state and the full rule above applies.
 - Do not add an apply path until durable ownership persistence, root elevation, runner-user execution, journal persistence, GitHub credential acquisition, and package-operation rollback classes are concretely implemented.
 - Generated subprocesses must use explicit absolute program paths and argument vectors; do not introduce `sh -c` or equivalent implicit shells.
 - Child-process environments must start empty and receive only explicit allowlisted values.
