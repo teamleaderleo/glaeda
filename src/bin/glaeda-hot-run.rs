@@ -12,18 +12,36 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{
     DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
 };
+#[cfg(target_os = "linux")]
+use std::os::unix::net::UnixStream;
+#[cfg(target_os = "linux")]
+use std::os::unix::process::CommandExt as _;
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Component, Path, PathBuf};
+#[cfg(target_os = "linux")]
+use std::process::{Child, ExitStatus};
 use std::process::{Command, ExitCode, Stdio};
+#[cfg(target_os = "linux")]
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 #[cfg(target_os = "linux")]
-use rustix::thread::sched_getaffinity;
+use rustix::{
+    event::{PollFd, PollFlags, Timespec, poll},
+    fd::OwnedFd,
+    io::Errno,
+    process::{Pid, PidfdFlags, Signal, kill_process_group, pidfd_open, test_kill_process_group},
+    thread::sched_getaffinity,
+};
 use serde_json::{Map, Value, json};
 use sha2::{Digest as _, Sha256};
 
 const MAX_OBSERVATION_BYTES: u64 = 64 * 1024;
+const TERMINATION_GRACE: Duration = Duration::from_secs(2);
 const SHA256_PREFIX: &str = "sha256:";
 const GIT_OVERRIDE_NAMES: &[&str] = &[
     "GIT_DIR",
@@ -64,6 +82,9 @@ struct Cli {
     /// Canonical toolchain bin directory placed first in descendant PATH.
     #[arg(long)]
     runtime_bin: Option<PathBuf>,
+    /// Positive finite wall-clock deadline for the complete command process group.
+    #[arg(long, value_name = "SECONDS")]
+    timeout: Option<f64>,
     /// Absolute executable or PATH-resolved command followed by its arguments.
     #[arg(last = true, required = true)]
     command: Vec<OsString>,
@@ -96,6 +117,7 @@ struct RuntimeContract {
 #[derive(Debug)]
 struct CommandResult {
     elapsed: Duration,
+    timeout_seconds: Option<f64>,
     user_cpu_seconds: Option<f64>,
     system_cpu_seconds: Option<f64>,
     max_rss_kib: Option<u64>,
@@ -103,6 +125,14 @@ struct CommandResult {
     exit_code: i32,
     signal: Option<i32>,
     completion_reason: &'static str,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeadlineWaitOutcome {
+    Exited,
+    Interrupted(i32),
+    Deadline,
 }
 
 fn main() -> ExitCode {
@@ -125,6 +155,8 @@ fn run(cli: Cli) -> Result<i32, String> {
     if let Some(key) = cli.comparison_key.as_deref() {
         validate_comparison_key(key)?;
     }
+    let timeout_seconds = cli.timeout;
+    let timeout = timeout_seconds.map(validate_timeout).transpose()?;
     let runtime_declaration =
         parse_runtime_contract(cli.runtime_id.as_deref(), cli.runtime_sha256.as_deref())?;
     let runtime_bin = observe_runtime_bin(
@@ -174,6 +206,8 @@ fn run(cli: Cli) -> Result<i32, String> {
         &command,
         &task_cwd,
         bound_path.as_deref(),
+        timeout,
+        timeout_seconds,
         cli.measurement.is_some(),
     )?;
     if let Some(destination) = cli.measurement.as_ref() {
@@ -189,6 +223,14 @@ fn run(cli: Cli) -> Result<i32, String> {
         )?;
     }
     Ok(result.exit_code)
+}
+
+fn validate_timeout(seconds: f64) -> Result<Duration, String> {
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return Err("timeout must be a positive finite number".into());
+    }
+    Duration::try_from_secs_f64(seconds)
+        .map_err(|_| "timeout exceeds the supported clock range".to_owned())
 }
 
 fn validate_comparison_key(value: &str) -> Result<(), String> {
@@ -500,10 +542,204 @@ fn observe_git_root(git: &Path, task: &Path) -> Result<PathBuf, String> {
         .map_err(|error| format!("Git worktree root is unavailable: {error}"))
 }
 
+#[cfg(target_os = "linux")]
+struct DeadlineSignalControl {
+    interrupted: Arc<AtomicBool>,
+    terminated: Arc<AtomicBool>,
+    wake_read: UnixStream,
+    signal_actions: Vec<signal_hook::SigId>,
+}
+
+#[cfg(target_os = "linux")]
+impl DeadlineSignalControl {
+    fn new() -> Result<Self, String> {
+        use signal_hook::consts::signal::{SIGINT, SIGTERM};
+
+        let (wake_read, wake_write) =
+            UnixStream::pair().map_err(|_| "deadline signal control is unavailable".to_owned())?;
+        wake_read
+            .set_nonblocking(true)
+            .map_err(|_| "deadline signal control is unavailable".to_owned())?;
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let terminated = Arc::new(AtomicBool::new(false));
+        let sigint_write = wake_write
+            .try_clone()
+            .map_err(|_| "deadline signal control is unavailable".to_owned())?;
+        let mut signal_actions = Vec::with_capacity(4);
+        let setup = (|| -> std::io::Result<()> {
+            signal_actions.push(signal_hook::flag::register(
+                SIGTERM,
+                Arc::clone(&terminated),
+            )?);
+            signal_actions.push(signal_hook::low_level::pipe::register(SIGTERM, wake_write)?);
+            signal_actions.push(signal_hook::flag::register(
+                SIGINT,
+                Arc::clone(&interrupted),
+            )?);
+            signal_actions.push(signal_hook::low_level::pipe::register(
+                SIGINT,
+                sigint_write,
+            )?);
+            Ok(())
+        })();
+        if setup.is_err() {
+            for action in signal_actions.drain(..) {
+                let _ = signal_hook::low_level::unregister(action);
+            }
+            return Err("deadline signal control is unavailable".into());
+        }
+        Ok(Self {
+            interrupted,
+            terminated,
+            wake_read,
+            signal_actions,
+        })
+    }
+
+    fn pending_signal(&self) -> Option<i32> {
+        if self.interrupted.swap(false, Ordering::SeqCst) {
+            Some(signal_hook::consts::signal::SIGINT)
+        } else if self.terminated.swap(false, Ordering::SeqCst) {
+            Some(signal_hook::consts::signal::SIGTERM)
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for DeadlineSignalControl {
+    fn drop(&mut self) {
+        for action in self.signal_actions.drain(..) {
+            let _ = signal_hook::low_level::unregister(action);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_deadline_event(
+    pidfd: &OwnedFd,
+    control: &mut DeadlineSignalControl,
+    deadline: Instant,
+) -> Result<DeadlineWaitOutcome, String> {
+    loop {
+        if let Some(signal) = control.pending_signal() {
+            return Ok(DeadlineWaitOutcome::Interrupted(signal));
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(DeadlineWaitOutcome::Deadline);
+        }
+        let timeout = Timespec::try_from(deadline.saturating_duration_since(now))
+            .map_err(|_| "deadline exceeds the supported clock range".to_owned())?;
+        let (process_events, signal_events) = {
+            let watched = PollFlags::IN | PollFlags::ERR | PollFlags::HUP;
+            let mut descriptors = [
+                PollFd::new(pidfd, watched),
+                PollFd::new(&control.wake_read, watched),
+            ];
+            match poll(&mut descriptors, Some(&timeout)) {
+                Ok(0) => continue,
+                Ok(_) => (descriptors[0].revents(), descriptors[1].revents()),
+                Err(Errno::INTR) => continue,
+                Err(_) => return Err("deadline process observation failed".into()),
+            }
+        };
+        if let Some(signal) = control.pending_signal() {
+            return Ok(DeadlineWaitOutcome::Interrupted(signal));
+        }
+        if process_events.intersects(PollFlags::IN | PollFlags::HUP) {
+            return Ok(DeadlineWaitOutcome::Exited);
+        }
+        if process_events.intersects(PollFlags::ERR) {
+            return Err("deadline process observation failed".into());
+        }
+        if signal_events.intersects(PollFlags::IN | PollFlags::HUP) {
+            let mut wake = [0_u8; 64];
+            match control.wake_read.read(&mut wake) {
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(_) => return Err("deadline signal observation failed".into()),
+            }
+        }
+        if signal_events.intersects(PollFlags::ERR) {
+            return Err("deadline signal observation failed".into());
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn send_process_group_signal(pid: Pid, signal: Signal) -> Result<(), String> {
+    match kill_process_group(pid, signal) {
+        Ok(()) | Err(Errno::SRCH) => Ok(()),
+        Err(_) => Err("owned command process group could not be terminated".into()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn process_group_is_live(pid: Pid) -> Result<bool, String> {
+    match test_kill_process_group(pid) {
+        Ok(()) => Ok(true),
+        Err(Errno::SRCH) => Ok(false),
+        Err(_) => Err("owned command process group could not be observed".into()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn terminate_process_group_with_grace(
+    child: &mut Child,
+    pid: Pid,
+    initial_signal: Signal,
+) -> Result<(ExitStatus, i32), String> {
+    send_process_group_signal(pid, initial_signal)?;
+    let grace_deadline = Instant::now()
+        .checked_add(TERMINATION_GRACE)
+        .ok_or_else(|| "termination grace exceeds the supported clock range".to_owned())?;
+    let mut leader_status = None;
+    loop {
+        if leader_status.is_none() {
+            leader_status = child
+                .try_wait()
+                .map_err(|_| "owned command could not be observed".to_owned())?;
+        }
+        if !process_group_is_live(pid)? {
+            let status = match leader_status {
+                Some(status) => status,
+                None => child
+                    .wait()
+                    .map_err(|_| "owned command could not be reaped".to_owned())?,
+            };
+            return Ok((status, initial_signal.as_raw()));
+        }
+        if Instant::now() >= grace_deadline {
+            send_process_group_signal(pid, Signal::KILL)?;
+            let status = match leader_status {
+                Some(status) => status,
+                None => child
+                    .wait()
+                    .map_err(|_| "owned command could not be reaped".to_owned())?,
+            };
+            return Ok((status, Signal::KILL.as_raw()));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn abort_timed_child(child: &mut Child, pid: Pid) {
+    if send_process_group_signal(pid, Signal::KILL).is_err() {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+}
+
+#[cfg(target_os = "linux")]
 fn execute_command(
     command: &[OsString],
     cwd: &Path,
     environment_path: Option<&OsStr>,
+    timeout: Option<Duration>,
+    timeout_seconds: Option<f64>,
     measured: bool,
 ) -> Result<CommandResult, String> {
     let mut time_report = None;
@@ -534,18 +770,85 @@ fn execute_command(
         command.to_vec()
     };
 
-    let started = Instant::now();
+    let mut signal_control = timeout.map(|_| DeadlineSignalControl::new()).transpose()?;
     let mut process = Command::new(&arguments[0]);
     process.args(&arguments[1..]).current_dir(cwd);
     if let Some(path) = environment_path {
         process.env("PATH", path);
     }
-    let status = process.status().map_err(|error| {
+    if timeout.is_some() {
+        process.process_group(0);
+    }
+    let started = Instant::now();
+    let deadline = timeout
+        .map(|duration| {
+            started
+                .checked_add(duration)
+                .ok_or_else(|| "timeout exceeds the supported clock range".to_owned())
+        })
+        .transpose()?;
+    let mut child = process.spawn().map_err(|error| {
         if let Some(path) = time_report.as_ref() {
             let _ = fs::remove_file(path);
         }
         format!("cannot launch command: {error}")
     })?;
+    let mut forced_completion = None;
+    let status = if let Some(deadline) = deadline {
+        let pid = Pid::from_child(&child);
+        let pidfd = match pidfd_open(pid, PidfdFlags::empty()) {
+            Ok(pidfd) => pidfd,
+            Err(_) => {
+                abort_timed_child(&mut child, pid);
+                if let Some(path) = time_report.as_ref() {
+                    let _ = fs::remove_file(path);
+                }
+                return Err("deadline process observation is unavailable".into());
+            }
+        };
+        let outcome = match wait_for_deadline_event(
+            &pidfd,
+            signal_control
+                .as_mut()
+                .expect("deadline signal control exists"),
+            deadline,
+        ) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                abort_timed_child(&mut child, pid);
+                if let Some(path) = time_report.as_ref() {
+                    let _ = fs::remove_file(path);
+                }
+                return Err(error);
+            }
+        };
+        match outcome {
+            DeadlineWaitOutcome::Exited => child
+                .wait()
+                .map_err(|_| "owned command could not be reaped".to_owned())?,
+            DeadlineWaitOutcome::Interrupted(signal) => {
+                let initial = if signal == signal_hook::consts::signal::SIGINT {
+                    Signal::INT
+                } else {
+                    Signal::TERM
+                };
+                let (status, signal_used) =
+                    terminate_process_group_with_grace(&mut child, pid, initial)?;
+                forced_completion = Some((128 + signal, signal_used, "operator_interrupt"));
+                status
+            }
+            DeadlineWaitOutcome::Deadline => {
+                let (status, signal_used) =
+                    terminate_process_group_with_grace(&mut child, pid, Signal::TERM)?;
+                forced_completion = Some((124, signal_used, "deadline_exceeded"));
+                status
+            }
+        }
+    } else {
+        child
+            .wait()
+            .map_err(|error| format!("cannot wait for command: {error}"))?
+    };
     let elapsed = started.elapsed();
 
     let timed_usage = time_report
@@ -554,30 +857,41 @@ fn execute_command(
     if let Some(path) = time_report.as_ref() {
         let _ = fs::remove_file(path);
     }
-    let raw_code = status
-        .code()
-        .unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
-    let time_exit = timed_usage.as_ref().map(|usage| usage.3);
-    let (exit_code, signal, completion_reason) = if let Some(signal) = status.signal() {
-        (128 + signal, Some(signal), "signaled")
-    } else if time_exit == Some(0)
-        && (128..=255).contains(&raw_code)
-        && valid_signal(raw_code - 128)
-    {
-        (raw_code, Some(raw_code - 128), "signaled")
-    } else {
-        (raw_code, None, "exited")
-    };
-    let (user_cpu_seconds, system_cpu_seconds, max_rss_kib, resource_accounting) = match timed_usage
-    {
-        Some((user, system, rss, _)) => {
-            (Some(user), Some(system), Some(rss), "gnu_time_command_tree")
-        }
-        None if measured => (None, None, None, "unavailable_for_measured_command"),
-        None => (None, None, None, "not_measured"),
-    };
+    let forced_termination = forced_completion.is_some();
+    let (exit_code, signal, completion_reason) =
+        if let Some((code, signal, reason)) = forced_completion {
+            (code, Some(signal), reason)
+        } else {
+            let raw_code = status
+                .code()
+                .unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
+            let time_exit = timed_usage.as_ref().map(|usage| usage.3);
+            if let Some(signal) = status.signal() {
+                (128 + signal, Some(signal), "signaled")
+            } else if time_exit == Some(0)
+                && (128..=255).contains(&raw_code)
+                && valid_signal(raw_code - 128)
+            {
+                (raw_code, Some(raw_code - 128), "signaled")
+            } else {
+                (raw_code, None, "exited")
+            }
+        };
+    let (user_cpu_seconds, system_cpu_seconds, max_rss_kib, resource_accounting) =
+        if forced_termination {
+            (None, None, None, "unavailable_after_forced_termination")
+        } else {
+            match timed_usage {
+                Some((user, system, rss, _)) => {
+                    (Some(user), Some(system), Some(rss), "gnu_time_command_tree")
+                }
+                None if measured => (None, None, None, "unavailable_for_measured_command"),
+                None => (None, None, None, "not_measured"),
+            }
+        };
     Ok(CommandResult {
         elapsed,
+        timeout_seconds,
         user_cpu_seconds,
         system_cpu_seconds,
         max_rss_kib,
@@ -586,6 +900,18 @@ fn execute_command(
         signal,
         completion_reason,
     })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn execute_command(
+    _command: &[OsString],
+    _cwd: &Path,
+    _environment_path: Option<&OsStr>,
+    _timeout: Option<Duration>,
+    _timeout_seconds: Option<f64>,
+    _measured: bool,
+) -> Result<CommandResult, String> {
+    Err("native hot-run execution currently requires Linux".into())
 }
 
 fn valid_signal(signal: i32) -> bool {
@@ -926,7 +1252,7 @@ fn write_measurement(
             "after": machine_after,
             "interval": pressure_interval(&machine_before, &machine_after, result.elapsed),
         },
-        "timeout_seconds": Value::Null,
+        "timeout_seconds": result.timeout_seconds,
         "cache_views": caches.iter().map(|cache| json!({"path": cache.path, "mode": "native"})).collect::<Vec<_>>(),
         "state_preparation": [],
         "source_preparation": Value::Null,
@@ -1031,6 +1357,9 @@ fn round_to(value: f64, places: i32) -> f64 {
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+    use std::thread;
+
+    use rustix::process::test_kill_process;
 
     fn test_directory(label: &str) -> PathBuf {
         let path = unique_temporary_path(label).unwrap();
@@ -1043,6 +1372,14 @@ mod tests {
         assert!(validate_comparison_key(&format!("sha256:{}", "a".repeat(64))).is_ok());
         assert!(validate_comparison_key(&format!("sha256:{}", "A".repeat(64))).is_err());
         assert!(validate_comparison_key("sha256:1234").is_err());
+    }
+
+    #[test]
+    fn timeout_values_are_positive_and_finite() {
+        assert_eq!(validate_timeout(0.125).unwrap(), Duration::from_millis(125));
+        for invalid in [0.0, -1.0, f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            assert!(validate_timeout(invalid).is_err());
+        }
     }
 
     #[test]
@@ -1137,6 +1474,7 @@ mod tests {
             runtime_id: None,
             runtime_sha256: None,
             runtime_bin: None,
+            timeout: Some(3.0),
             command: vec![
                 OsString::from("/bin/sh"),
                 OsString::from("-c"),
@@ -1152,6 +1490,7 @@ mod tests {
         assert_eq!(report["cross_worktree"], false);
         assert_eq!(report["cache_views"][0]["path"], "target");
         assert_eq!(report["resource_accounting"], "gnu_time_command_tree");
+        assert_eq!(report["timeout_seconds"], 3.0);
         assert_eq!(report["exit_code"], 17);
         assert_eq!(report["signal"], Value::Null);
         assert_eq!(report["completion_reason"], "exited");
@@ -1181,6 +1520,7 @@ mod tests {
                 runtime_id: None,
                 runtime_sha256: None,
                 runtime_bin: None,
+                timeout: None,
                 command: vec![
                     OsString::from("/bin/sh"),
                     OsString::from("-c"),
@@ -1194,6 +1534,70 @@ mod tests {
             assert_eq!(report["signal"], expected_signal);
             fs::remove_file(measurement).unwrap();
         }
+        fs::remove_dir(fixture).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn deadline_terminates_the_complete_process_group() {
+        let fixture = test_directory("glaeda-hot-run-deadline-test");
+        let child_pid_file = fixture.join("child.pid");
+        let measurement = fixture.join("measurement.json");
+        let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let shell = format!("sleep 60 & echo $! > {}; wait", child_pid_file.display());
+        let started = Instant::now();
+        let code = run(Cli {
+            resident: repository.clone(),
+            task: repository,
+            cache: Vec::new(),
+            measurement: Some(measurement.clone()),
+            comparison_key: None,
+            runtime_id: None,
+            runtime_sha256: None,
+            runtime_bin: None,
+            timeout: Some(0.5),
+            command: vec![
+                OsString::from("/bin/sh"),
+                OsString::from("-c"),
+                OsString::from(shell),
+            ],
+        })
+        .unwrap();
+        assert_eq!(code, 124);
+        assert!(started.elapsed() < Duration::from_secs(3));
+
+        let report: Value = serde_json::from_reader(File::open(&measurement).unwrap()).unwrap();
+        assert_eq!(report["timeout_seconds"], 0.5);
+        assert_eq!(report["exit_code"], 124);
+        assert_eq!(report["signal"], signal_hook::consts::signal::SIGTERM);
+        assert_eq!(report["completion_reason"], "deadline_exceeded");
+        assert_eq!(
+            report["resource_accounting"],
+            "unavailable_after_forced_termination"
+        );
+        assert_eq!(report["user_cpu_seconds"], Value::Null);
+        assert_eq!(report["system_cpu_seconds"], Value::Null);
+        assert_eq!(report["max_rss_kib"], Value::Null);
+
+        let child_pid = fs::read_to_string(&child_pid_file)
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+        let child_pid = Pid::from_raw(child_pid).unwrap();
+        let absent_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match test_kill_process(child_pid) {
+                Err(Errno::SRCH) => break,
+                Ok(()) if Instant::now() < absent_deadline => {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                result => panic!("deadline descendant remained live: {result:?}"),
+            }
+        }
+
+        fs::remove_file(measurement).unwrap();
+        fs::remove_file(child_pid_file).unwrap();
         fs::remove_dir(fixture).unwrap();
     }
 
@@ -1221,6 +1625,7 @@ mod tests {
             runtime_id: Some("fixture-runtime-v1".into()),
             runtime_sha256: Some(format!("sha256:{}", "0".repeat(64))),
             runtime_bin: Some(runtime_bin.clone()),
+            timeout: None,
             command: vec![OsString::from("runtime-tool")],
         })
         .unwrap_err();
@@ -1239,6 +1644,7 @@ mod tests {
             runtime_id: Some("fixture-runtime-v1".into()),
             runtime_sha256: Some(program_digest.clone()),
             runtime_bin: Some(runtime_bin.clone()),
+            timeout: None,
             command: vec![OsString::from("runtime-tool")],
         })
         .unwrap();
@@ -1264,6 +1670,7 @@ mod tests {
             runtime_id: Some("fixture-runtime-v1".into()),
             runtime_sha256: None,
             runtime_bin: Some(runtime_bin.clone()),
+            timeout: None,
             command: vec![OsString::from("/bin/true")],
         })
         .unwrap_err();
