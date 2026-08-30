@@ -156,6 +156,15 @@ memory reservation; per-task memory remains host-default and is reported from th
 The harness cannot accept an arbitrary command, repository, commit, fixture, cache path, or
 validator.
 
+Source creation is a separate closed treatment so it can be composed with one unchanged hot-state
+arm. `--source-materialization git-sequential` is the typical control: it creates each task with a
+separate sequential `git worktree add`. `glaeda-ordinary` invokes the Glaeda fan-out materializer
+once but requests ordinary Git worktrees, isolating orchestration from filesystem copy behavior.
+`glaeda-reflink` invokes the same program and requests exact same-HEAD reflink fan-out. The reflink
+treatment rejects any ordinary fallback, changed Git proof, task-count drift, or receipt-shape
+drift instead of silently changing the mechanism under test. Glaeda treatments bind the exact
+release-binary digest as well as its checked-in CLI and library source digests.
+
 After an unprivileged OverlayFS mount is gone, the kernel may leave its internal work directory at
 mode `000`. Cleanup restores owner traversal only on owned, non-symlink directories inside the
 exact disposable experiment tree, then removes that tree. It does not follow links or alter an
@@ -173,6 +182,7 @@ Run one physical ext4 window with the aggregate receipt outside the disposable s
 ```bash
 scripts/benchmark-hot-state-fanout \
   --arm private-copy \
+  --source-materialization git-sequential \
   --fanout 4 \
   --scratch-root /path/to/owned/ext4-scratch \
   --output /path/to/receipt.json
@@ -181,11 +191,11 @@ scripts/benchmark-hot-state-fanout \
 Every arm now executes through a schema-v4 `hot-run` measurement. The ordinary-native control uses
 the task worktree directly with an explicit `target:native` observation; it receives no mount,
 copy, state, or isolation treatment. Prime and edited work get different caller-owned comparison
-keys. Each key deterministically binds the frozen source/tree/diff, the three producer-program
-content digests, exact Rust and Cargo versions and executable digests, arm, fan-out, Cargo
-concurrency, CPU-affinity sets, memory treatment, offline/incremental settings, page-cache
-declaration, and creation umask. This lets repeated same-treatment receipts feed
-`hot-pressure-shadow` while mixed work or treatment refuses.
+keys. Each key deterministically binds the frozen source/tree/diff, exact producer-program and
+source content digests, exact Rust and Cargo versions and executable digests, arm, source
+materialization treatment, fan-out, Cargo concurrency, CPU-affinity sets, memory treatment,
+offline/incremental settings, page-cache declaration, and creation umask. This lets repeated
+same-treatment receipts feed `hot-pressure-shadow` while mixed work or treatment refuses.
 
 The aggregate observation binds the harness commit/tree, frozen source/tree/edit, arm, fan-out,
 exact CPU-affinity sets, per-task Cargo concurrency, setup and complete-window latency, every
@@ -195,8 +205,11 @@ disposition. Summed `st_blocks` are not unique physical usage on reflink-capable
 filesystem-level observation keeps that distinction visible. A failed task cancels the remaining
 process groups. The child environment is a closed allowlist: caller target overrides, compiler
 wrappers/flags, and toolchain overrides are excluded; the accepted Cargo home is offline and held
-constant. Setup and byte-observation time remain outside the primary request-to-all-results window
-and are reported separately. The default page-cache state remains uncontrolled/resident. For
+constant. Resident priming remains setup because the treatment assumes an already-hot project.
+The receipt separately reports resident-ready task-known to final trustworthy result as source
+materialization plus checked fixture application plus the complete edit/validation window.
+Byte-observation time remains outside that duration and is reported separately. The default
+page-cache state remains uncontrolled/resident. For
 `overlay` and `private-copy`, `--page-cache-treatment resident-target-dontneed` adds the bounded
 cold-read discriminator: after the resident prime and byte observation, it fsyncs every exact owned
 regular file in resident `target` and issues `POSIX_FADV_DONTNEED` immediately before the edit

@@ -15,6 +15,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "benchmark-hot-state-fanout"
 NAMESPACE = runpy.run_path(str(SCRIPT), run_name="hot_state_fanout_test")
+FAKE_PROGRAM_DIGEST = f"sha256:{'a' * 64}"
 
 
 def valid_benchmark_receipt(jobs: int = 4) -> dict[str, object]:
@@ -49,6 +50,43 @@ def valid_benchmark_receipt(jobs: int = 4) -> dict[str, object]:
             },
         },
         "result": {"exit_code": 0},
+    }
+
+
+def valid_source_materialization_report(
+    plan: object,
+) -> dict[str, object]:
+    source_materialization = getattr(plan, "source_materialization")
+    fanout = getattr(plan, "fanout")
+    return {
+        "schema_version": 1,
+        "document_type": "glaeda-reflink-task-fanout",
+        "authority": "research_materialization_only",
+        "requested_mode": (
+            "ordinary"
+            if source_materialization == "glaeda-ordinary"
+            else "reflink_with_fallback"
+        ),
+        "task_count": fanout,
+        "ordinary_tasks": (
+            fanout if source_materialization == "glaeda-ordinary" else 0
+        ),
+        "reflinked_tasks": (
+            fanout if source_materialization == "glaeda-reflink" else 0
+        ),
+        "ordinary_fallback_tasks": 0,
+        "fallback_reasons": {},
+        "commit": NAMESPACE["SOURCE_COMMIT"],
+        "tree": NAMESPACE["SOURCE_TREE"],
+        "tracked_regular_files_per_task": 12,
+        "logical_bytes_per_task": 4096,
+        "timings": {
+            "total_microseconds": 100,
+            "source_proof_microseconds": 10,
+            "parallel_preparation_microseconds": 60,
+            "parallel_finalization_microseconds": 30,
+        },
+        "final_git_proof": "head_tree_diff_files_diff_index_per_task",
     }
 
 
@@ -205,6 +243,7 @@ class HotStateFanoutTests(unittest.TestCase):
             set(programs),
             {
                 "fanout_harness_sha256",
+                "git_sha256",
                 "hot_run_sha256",
                 "semantic_benchmark_sha256",
             },
@@ -218,6 +257,232 @@ class HotStateFanoutTests(unittest.TestCase):
             )
         )
         self.assertNotIn(os.fspath(ROOT), json.dumps(first.to_json()))
+
+    def test_source_materialization_is_an_exact_comparison_dimension(self) -> None:
+        build_plan = NAMESPACE["build_plan"]
+        comparison_basis = NAMESPACE["comparison_basis"]
+        comparison_key = NAMESPACE["comparison_key"]
+        baseline = build_plan("private-copy", 4, 16)
+        ordinary = build_plan(
+            "private-copy",
+            4,
+            16,
+            source_materialization="glaeda-ordinary",
+            source_materializer_program_sha256=FAKE_PROGRAM_DIGEST,
+        )
+        reflink = build_plan(
+            "private-copy",
+            4,
+            16,
+            source_materialization="glaeda-reflink",
+            source_materializer_program_sha256=FAKE_PROGRAM_DIGEST,
+        )
+        keys = {
+            comparison_key(plan, True)
+            for plan in (baseline, ordinary, reflink)
+        }
+        self.assertEqual(len(keys), 3)
+        self.assertEqual(
+            baseline.to_json()["source_materialization"], "git-sequential"
+        )
+        programs = comparison_basis(ordinary, True)["producer_programs"]
+        self.assertEqual(
+            programs["source_materializer_program_sha256"],
+            FAKE_PROGRAM_DIGEST,
+        )
+        self.assertIn("reflink_task_cli_source_sha256", programs)
+        self.assertIn("reflink_task_library_source_sha256", programs)
+        self.assertNotIn(
+            "source_materializer_program_sha256",
+            comparison_basis(baseline, True)["producer_programs"],
+        )
+        for plan in (ordinary, reflink):
+            self.assertNotIn(os.fspath(ROOT), json.dumps(plan.to_json()))
+
+    def test_source_materialization_identity_refuses_invalid_pairings(self) -> None:
+        build_plan = NAMESPACE["build_plan"]
+        ExperimentError = NAMESPACE["ExperimentError"]
+        with self.assertRaises(ExperimentError):
+            build_plan(
+                "private-copy",
+                4,
+                16,
+                source_materialization="unknown",
+            )
+        with self.assertRaises(ExperimentError):
+            build_plan(
+                "private-copy",
+                4,
+                16,
+                source_materialization="glaeda-reflink",
+            )
+        with self.assertRaises(ExperimentError):
+            build_plan(
+                "private-copy",
+                4,
+                16,
+                source_materialization="glaeda-ordinary",
+                source_materializer_program_sha256="sha256:not-a-digest",
+            )
+        with self.assertRaises(ExperimentError):
+            build_plan(
+                "private-copy",
+                4,
+                16,
+                source_materializer_program_sha256=FAKE_PROGRAM_DIGEST,
+            )
+
+    def test_source_materialization_receipt_rejects_fallback_and_shape_drift(
+        self,
+    ) -> None:
+        build_plan = NAMESPACE["build_plan"]
+        validate = NAMESPACE["validate_source_materialization_report"]
+        ExperimentError = NAMESPACE["ExperimentError"]
+        for selector in ("glaeda-ordinary", "glaeda-reflink"):
+            plan = build_plan(
+                "private-copy",
+                4,
+                16,
+                source_materialization=selector,
+                source_materializer_program_sha256=FAKE_PROGRAM_DIGEST,
+            )
+            report = valid_source_materialization_report(plan)
+            validate(plan, report)
+            fallback = dict(report)
+            fallback["ordinary_fallback_tasks"] = 1
+            with self.assertRaises(ExperimentError):
+                validate(plan, fallback)
+            boolean_inventory = dict(report)
+            boolean_inventory["tracked_regular_files_per_task"] = True
+            with self.assertRaises(ExperimentError):
+                validate(plan, boolean_inventory)
+            changed_shape = dict(report)
+            changed_shape["unreviewed_field"] = "value"
+            with self.assertRaises(ExperimentError):
+                validate(plan, changed_shape)
+            changed_timing = dict(report)
+            changed_timing["timings"] = {
+                **report["timings"],
+                "unreviewed_phase_microseconds": 1,
+            }
+            with self.assertRaises(ExperimentError):
+                validate(plan, changed_timing)
+
+    def test_glaeda_materialization_uses_one_bounded_exact_program(self) -> None:
+        build_plan = NAMESPACE["build_plan"]
+        materialize = NAMESPACE["materialize_tasks"]
+        plan = build_plan(
+            "private-copy",
+            4,
+            16,
+            source_materialization="glaeda-reflink",
+            source_materializer_program_sha256=FAKE_PROGRAM_DIGEST,
+        )
+        report = valid_source_materialization_report(plan)
+        process = SimpleNamespace(
+            returncode=0,
+            communicate=mock.Mock(
+                return_value=(json.dumps(report).encode("utf-8"), b"")
+            ),
+        )
+        popen = mock.Mock(return_value=process)
+        with mock.patch.dict(
+            materialize.__globals__,
+            {
+                "file_sha256": mock.Mock(return_value="a" * 64),
+            },
+        ), mock.patch.object(
+            materialize.__globals__["subprocess"], "Popen", popen
+        ):
+            result = materialize(
+                plan,
+                Path("/repository"),
+                Path("/resident"),
+                [Path(f"/task-{index}") for index in range(1, 5)],
+            )
+        command = popen.call_args.args[0]
+        self.assertEqual(command[0], os.fspath(NAMESPACE["REFLINK_TASK"]))
+        self.assertIn("--fanout", command)
+        self.assertEqual(command.count("--target"), 4)
+        self.assertEqual(command[command.index("--mode") + 1], "reflink")
+        self.assertEqual(command[command.index("--commit") + 1], NAMESPACE["SOURCE_COMMIT"])
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+        self.assertEqual(
+            popen.call_args.kwargs["env"],
+            {"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"},
+        )
+        self.assertEqual(result["program_sha256"], FAKE_PROGRAM_DIGEST)
+        self.assertEqual(result["semantic_validation"], "accepted")
+
+    def test_glaeda_materialization_timeout_terminates_its_process_group(
+        self,
+    ) -> None:
+        build_plan = NAMESPACE["build_plan"]
+        materialize = NAMESPACE["materialize_tasks"]
+        ExperimentError = NAMESPACE["ExperimentError"]
+        plan = build_plan(
+            "private-copy",
+            1,
+            16,
+            deadline_seconds=1,
+            source_materialization="glaeda-ordinary",
+            source_materializer_program_sha256=FAKE_PROGRAM_DIGEST,
+        )
+        process = SimpleNamespace(
+            returncode=None,
+            communicate=mock.Mock(
+                side_effect=subprocess.TimeoutExpired("fixture", 1)
+            ),
+        )
+        terminate = mock.Mock()
+        with mock.patch.dict(
+            materialize.__globals__,
+            {
+                "file_sha256": mock.Mock(return_value="a" * 64),
+                "terminate_process_group": terminate,
+            },
+        ), mock.patch.object(
+            materialize.__globals__["subprocess"],
+            "Popen",
+            return_value=process,
+        ):
+            with self.assertRaises(ExperimentError):
+                materialize(
+                    plan,
+                    Path("/repository"),
+                    Path("/resident"),
+                    [Path("/task-1")],
+                )
+        terminate.assert_called_once_with(process)
+
+    def test_worktree_cleanup_accepts_only_an_exact_unregistered_target(
+        self,
+    ) -> None:
+        remove_worktree = NAMESPACE["remove_worktree"]
+        ExperimentError = NAMESPACE["ExperimentError"]
+        failed_remove = SimpleNamespace(returncode=128, stdout=b"")
+        absent_observation = SimpleNamespace(
+            returncode=0,
+            stdout=b"worktree /different\0HEAD 0000\0\0",
+        )
+        with mock.patch.object(
+            remove_worktree.__globals__["subprocess"],
+            "run",
+            side_effect=(failed_remove, absent_observation),
+        ):
+            remove_worktree(Path("/repository"), Path("/target"))
+
+        present_observation = SimpleNamespace(
+            returncode=0,
+            stdout=b"worktree /target\0HEAD 0000\0\0",
+        )
+        with mock.patch.object(
+            remove_worktree.__globals__["subprocess"],
+            "run",
+            side_effect=(failed_remove, present_observation),
+        ):
+            with self.assertRaises(ExperimentError):
+                remove_worktree(Path("/repository"), Path("/target"))
 
     def test_unknown_arms_fanout_and_deadlines_refuse(self) -> None:
         build_plan = NAMESPACE["build_plan"]
