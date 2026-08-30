@@ -821,3 +821,70 @@ semantic-control and final harness SHA-256 values were respectively
 `56a9b85a03cd2e57c5c16380a14ccedb8d05df0368eb0ea3bb609492e9fae66f`.
 No shared process-executor, hot-run, cache/generation/lifecycle, task-worktree, reflink/storage or
 Quarry code changed. The capture tail remains separate owner evidence, not scope for this command.
+
+## Bounded Linux machine observation — 2026-08-30
+
+Issue [#919](https://github.com/teamleaderleo/glaeda/issues/919) selected a recurring big-red
+handoff loop that agents previously assembled from separate `/proc`, `systemctl`, `ss`, and text
+processing commands. Exact measured code head
+`39fb05b777166e7b6ece0775b2bc983fab542b43` / tree
+`d42a50dfffc78f095ce7545c113ee9fb4b36917f` produced a 1,739,088-byte release
+`glaeda-host-observe`, SHA-256
+`46d5bf3990fe58e64561cc14e83925b2a2bab58f2e338f69bb0494b2d50521c4`.
+
+The command reads bounded fixed `/proc` CPU/load, memory, PSI, and TCP tables directly and starts
+only two fixed `/usr/bin/systemctl` children for failed system/current-user unit counts. Human and
+JSON forms come from the same typed report. Output contains no paths, addresses, unit names, PIDs,
+command lines, environment values, repository content, or arbitrary logs. Systemd unavailability
+is explicit without discarding valid kernel evidence. The report is scoped to the
+`current_execution_context`; it does not prove physical-host or namespace identity and grants no
+admission, ownership, process/service mutation, cleanup, scheduling, or cache authority.
+
+Three local complete-process arms observed the same current big-red execution context:
+
+1. an ordinary Bash composition using one Bash, five `awk` children, `date`, `ss`, and two
+   `systemctl` children;
+2. one Python 3.14 process reading `/proc` directly and starting only the same two systemd
+   observations;
+3. the compiled typed Glaeda candidate.
+
+One warmup per arm preceded 24 serial measurements per arm in six rotating order permutations.
+Every timed command ran under the same GNU `time` wrapper for max-RSS collection. The harness used
+its monotonic clock for complete wall time and waited-child resource deltas for CPU. All 72 reports
+passed shape/range validation; logical CPU count, memory/swap totals, failed-unit states, and the
+watched-port vector produced one exact stable signature, SHA-256
+`a6a0a45ce8e543420f0bd6276aceaba94e6b74625aa1dafb150b5f9c3bb52a8c`. Dynamic timestamps,
+load, available memory, and PSI were range-checked, and cumulative PSI totals never moved
+backwards within an arm. Their expected movement produced 24 distinct output digests per arm.
+
+| Complete process | n | Median | p95 | Maximum | Median child CPU | Max RSS |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| ordinary shell composition | 24 | 26.1697515 ms | 27.916760 ms | 31.911187 ms | 25.917000 ms | 9,244 KiB |
+| single-process Python | 24 | 25.603824 ms | 35.235668 ms | 38.723993 ms | 23.366500 ms | 13,064 KiB |
+| typed Glaeda candidate | 24 | 7.960407 ms | 9.466500 ms | 9.906237 ms | 6.223500 ms | 7,864 KiB |
+
+Against the ordinary shell composition, Glaeda reduced median wall by 18.2093445 ms / 69.5816%,
+p95 by 66.0903%, median child CPU by 75.9868%, and max RSS by 14.9286%. Against the direct Python
+control, it reduced median wall by 17.643417 ms / 68.9093%, p95 by 73.1338%, median child CPU by
+73.3657%, and max RSS by 39.8040%.
+
+Separate direct mode-0600 traces excluded the common timing wrapper. The shell arm executed 11
+process images including its `/usr/bin/env` wrapper; Python and Glaeda each executed four, namely
+the wrapper, their own process, and two `systemctl` children. No arm created an AF_INET/AF_INET6
+socket or connection. Each made exactly two successful AF_UNIX connections to the system and user
+systemd managers. Final trace SHA-256 values were
+`ad405a0094126199ac88ac3e6b6e833922b42b66a562199816c36797bb86139d`,
+`bc8b349cd7c16337c2648e4ee1664e47deed80c12a6a676bb08fa90f3df008b8`, and
+`5fa8900c8871c3591dfe7ea982634b257c9fa85867f0a73168eb95dd9c4b395a` for shell, Python, and
+Glaeda respectively.
+
+The complete bounded receipt SHA-256 was
+`0b25a542c769163c60f613c991f44072ded5c5fbedfe94aa113f85909d9ccda7`. Frozen shell, Python, and
+harness SHA-256 values were respectively
+`5719f26e0c149e3c39386a0101a29e488edbafe21228f654c445dc9ff9f3cbdd`,
+`4ad8f882bd0dcdea64913dbaa36108b9deaee92ab5fcee294cb7fa5fda920757`, and
+`51c20e0b4b2149bb5aa4702820f24253e6b409f92ea71e4a8679a496a12b2b69`.
+Free hosted GitHub Actions is not a comparable arm because it cannot observe operator-local
+machine state; a self-hosted Actions job would invoke this same local command. No hot-run, G0,
+resident/cache lifecycle, project/worktree/storage/reflink, protected-cache, or Quarry code
+changed.
