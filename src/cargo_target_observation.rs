@@ -509,13 +509,17 @@ impl ObjectSnapshot {
             gid: stat.st_gid,
             size: u64::try_from(stat.st_size).map_err(|_| unsafe_shape())?,
             blocks: u64::try_from(stat.st_blocks).map_err(|_| unsafe_shape())?,
-            link_count: stat.st_nlink,
+            link_count: widen_link_count(stat.st_nlink),
             modified: ObservedTimestamp::from_stat(stat)?,
             ctime_seconds: stat.st_ctime,
             ctime_nanoseconds: i64::try_from(stat.st_ctime_nsec).map_err(|_| unsafe_shape())?,
             file_type,
         })
     }
+}
+
+fn widen_link_count<T: Into<u64>>(value: T) -> u64 {
+    value.into()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
