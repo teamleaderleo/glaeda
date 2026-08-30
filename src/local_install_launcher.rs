@@ -608,7 +608,14 @@ fn directory_disposition(
     if stat.st_mode & 0o022 != 0 {
         LauncherDirectoryDisposition::Unsafe
     } else if stat.st_uid == context.owner.0 {
-        LauncherDirectoryDisposition::ReadyUserOwned
+        // A setgid directory deliberately assigns its group to new symlinks. Refuse only the case
+        // where that inherited group would disagree with the exact entry-ownership predicate;
+        // ordinary non-setgid directories create under the process effective group.
+        if stat.st_mode & 0o2000 != 0 && stat.st_gid != context.owner.1 {
+            LauncherDirectoryDisposition::Unsafe
+        } else {
+            LauncherDirectoryDisposition::ReadyUserOwned
+        }
     } else if candidate.system && stat.st_uid == 0 {
         LauncherDirectoryDisposition::NeedsElevation
     } else {
@@ -913,6 +920,20 @@ mod tests {
             .expect("test context")
         }
 
+        fn context_with_owner(
+            &self,
+            entries: &[&Path],
+            owner: (u32, u32),
+        ) -> LocalInstallLauncherContext {
+            LocalInstallLauncherContext::new(
+                LocalInstallPlatform::Linux,
+                self.home.clone(),
+                std::env::join_paths(entries).expect("join PATH"),
+                owner,
+            )
+            .expect("test context")
+        }
+
         fn binary(&self, label: &str, bytes: &[u8]) -> PathBuf {
             let path = self.root.join(format!("candidate-{label}"));
             let mut file = OpenOptions::new()
@@ -1136,6 +1157,57 @@ mod tests {
                 .kind(),
             LocalInstallLauncherErrorKind::UnsafeDirectory
         );
+    }
+
+    #[test]
+    fn mismatched_setgid_launcher_directory_is_refused_before_creation() {
+        let world = World::new("setgid-directory-group");
+        let generation = world.publish_generation(None, 'a');
+        let launcher = world.launcher_dir();
+        std_fs::set_permissions(&launcher, std_fs::Permissions::from_mode(0o2700))
+            .expect("set setgid launcher mode");
+        let actual_group = fs::fstat(
+            fs::open(&launcher, DIRECTORY_FLAGS, Mode::empty()).expect("open launcher directory"),
+        )
+        .expect("launcher directory stat")
+        .st_gid;
+        let captured_effective_group = actual_group ^ 1;
+        let context =
+            world.context_with_owner(&[&launcher], (geteuid().as_raw(), captured_effective_group));
+
+        let receipt = observe_local_install_launchers(&world.store, &context).expect("observe");
+        assert_eq!(
+            home(&receipt).directory,
+            LauncherDirectoryDisposition::Unsafe
+        );
+        assert_eq!(
+            publish_local_install_launcher(&world.store, &context, &plan(&generation))
+                .expect_err("group-mismatched setgid directory blocked")
+                .kind(),
+            LocalInstallLauncherErrorKind::UnsafeDirectory
+        );
+        assert!(!launcher.join(LAUNCHER_NAME).exists());
+    }
+
+    #[test]
+    fn non_setgid_launcher_directory_group_does_not_block_admissibility() {
+        let world = World::new("non-setgid-directory-group");
+        let launcher = world.launcher_dir();
+        let actual_group = fs::fstat(
+            fs::open(&launcher, DIRECTORY_FLAGS, Mode::empty()).expect("open launcher directory"),
+        )
+        .expect("launcher directory stat")
+        .st_gid;
+        let captured_effective_group = actual_group ^ 1;
+        let context =
+            world.context_with_owner(&[&launcher], (geteuid().as_raw(), captured_effective_group));
+
+        let receipt = observe_local_install_launchers(&world.store, &context).expect("observe");
+        assert_eq!(
+            home(&receipt).directory,
+            LauncherDirectoryDisposition::ReadyUserOwned
+        );
+        assert_eq!(home(&receipt).entry, LauncherEntryDisposition::Absent);
     }
 
     #[test]
