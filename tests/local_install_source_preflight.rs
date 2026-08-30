@@ -151,7 +151,7 @@ fn snapshot(commit: &str) -> Vec<Response> {
     vec![
         Response::success(format!("{commit}\n")),
         Response::success(format!("{TREE}\n")),
-        Response::success("remote.origin.url\nhttps://github.com/teamleaderleo/smolrunner.git\0"),
+        Response::success("remote.origin.url\nhttps://github.com/teamleaderleo/glaeda.git\0"),
         Response::failed(1, ""),
         Response::success(format!("# branch.oid {commit}\0# branch.head main\0")),
         Response::success("100644\n"),
