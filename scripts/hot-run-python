@@ -944,18 +944,38 @@ def terminate_process(
             process.send_signal(initial_signal)
     except ProcessLookupError:
         pass
-    try:
-        process.wait(timeout=TERMINATION_GRACE_SECONDS)
-    except subprocess.TimeoutExpired:
-        signal_used = signal.SIGKILL
+    grace_deadline = time.monotonic() + TERMINATION_GRACE_SECONDS
+    while True:
+        leader_exited = process.poll() is not None
+        group_exited = leader_exited
+        if isolated_process_group:
+            try:
+                os.killpg(process.pid, 0)
+                group_exited = False
+            except ProcessLookupError:
+                group_exited = True
+        if leader_exited and group_exited:
+            break
+        remaining = grace_deadline - time.monotonic()
+        if remaining <= 0:
+            signal_used = signal.SIGKILL
+            try:
+                if isolated_process_group:
+                    os.killpg(process.pid, signal.SIGKILL)
+                else:
+                    process.kill()
+            except ProcessLookupError:
+                pass
+            if not leader_exited:
+                process.wait()
+            break
+        if leader_exited:
+            time.sleep(min(0.01, remaining))
+            continue
         try:
-            if isolated_process_group:
-                os.killpg(process.pid, signal.SIGKILL)
-            else:
-                process.kill()
-        except ProcessLookupError:
+            process.wait(timeout=min(0.01, remaining))
+        except subprocess.TimeoutExpired:
             pass
-        process.wait()
     return int(signal_used)
 
 
