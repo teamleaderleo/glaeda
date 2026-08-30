@@ -749,3 +749,75 @@ checkout or runner provisioning. The raw receipt was 2,002 bytes with SHA-256
 `8efed1ecb293c622a5b5dd57783a8699e9b19ae94b7c569913e0eb21550f9620`; its private temporary paths
 were not retained. This correction grants no shared-cache selection, publication, adoption,
 reclamation, or deletion authority.
+
+## Read-only project checkout front door — 2026-08-30
+
+Issue [#912](https://github.com/teamleaderleo/glaeda/issues/912) measured one bounded Unix CLI
+invocation over the
+already-landed bounded `ProjectCheckoutObserver`. Exact measured code head
+`71c2d21d26ca0152936246bad559404002ae67d0` / tree
+`8f9b29affd22c7ff09be95083813a3d312d5a49e` produced a 1,786,864-byte release
+`glaeda-project-observe`, SHA-256
+`be59f243d3eb2cef55b82b48cf095a9090516204f707640b3390a87f41ab7d44`.
+
+The command accepts one explicit canonical absolute checkout and human or JSON output. It invokes
+the fixed `/usr/bin/git` through the existing sealed timed executor, requires two equal snapshots,
+and emits exact commit/tree, canonical GitHub source where provable, dirty/untracked/local-ahead
+recovery facts, worktree/submodule topology and one opaque physical materialization identity. It
+adds no catalog, adoption, residency, execution, remote-freshness, cache, cleanup or mutation
+authority.
+
+An independent Python semantic oracle issued the same two preflights and two seven-command
+snapshots, normalized every output fact separately, and produced the exact same 749-byte report.
+Canonical report SHA-256 was
+`1feea1e94f4ae97c020d8bf343692e2132b30b7a07c4bc821e4a33624919e716`.
+A mode-0600 process/network trace observed exactly the candidate plus 16 `/usr/bin/git` children,
+zero unexpected executables and zero network-class syscalls; trace SHA-256 was
+`a6c5b760a35c0c9f14e95466e8016e9194155463136845bba5e40633dbf83d87`.
+
+The first claimed matrix under #911 is invalid and grants no performance evidence. Its timed
+control also parsed the complete report in Python, so Python startup/parsing made it stronger and
+slower than the preregistered weak lower bound. The invalid 30-pair receipt remains identified by
+SHA-256 `a3da3c2233047b9190e476b6f663076c0d9bd117bac2d5fba36cc33400c546d5`.
+
+#912 froze the correction before new samples. The timed control was one env-clean Bash process
+issuing the same 16 fixed Git observations, validating statuses and discarding all output. Its
+trace observed `/usr/bin/env`, `/bin/bash`, exactly 16 Git children and no unexpected executable.
+Bash made two failed local AF_UNIX NSS connections to `/var/run/nscd/socket` before spawning Git;
+there were zero AF_INET/AF_INET6 calls and zero socket calls in every Git child. The 14,003-byte
+mode-0600 trace SHA-256 was
+`68e0ef50dccff421642c829f547d5a4543694cedcf7ee36f0332d87b9caa68e6`.
+
+Two warmup pairs preceded 30 measured serial A-B/B-A pairs on big-red, Python 3.14.4, Git 2.53.0,
+Linux 7.0.0-30-generic. The frozen clean checkout state covered 506 tracked/untracked entries and
+29 Git-state files; its content/metadata vector SHA-256
+`bef67482e5ef363b01175af6fdf31511f8ac30ab19e457d45e8de8b7735ec7d0` remained equal after every
+pair.
+
+| Complete process | n | Median | Mean | Stddev | Min | p95 | Max | Max RSS |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| weak Bash/16-Git lower bound | 30 | 18.579190 ms | 18.4686544333 ms | 0.730956627 ms | 16.115688 ms | 19.629664 ms | 19.657880 ms | 17,048 KiB |
+| typed Glaeda candidate | 30 | 15.6433895 ms | 18.5451014333 ms | 10.644055161 ms | 14.799264 ms | 41.307917 ms | 68.944897 ms | 16,920 KiB |
+
+The candidate median was 2.9358005 ms / 15.8015527049% lower, or 1.18767035750x. Its mean was
+0.076447 ms higher, p95 was 21.678253 ms higher and maximum was 49.287017 ms higher than the lower
+bound. That real tail is consistent with the existing 25 ms bounded-capture poll and is not hidden
+by the median. The candidate nevertheless passed the preregistered interactive limits: median no
+more than 25 ms above the weak control, p95 at most 50 ms and maximum at most 75 ms. Maximum RSS was
+128 KiB / 0.750821210699% lower than control, inside the 25% ceiling.
+
+Every measured process exited zero; candidate report hashes stayed exact; control stdout and all
+stderr remained empty; and every state vector remained unchanged. One pre-matrix wrapper attempt
+aborted on its first warmup control because it mistakenly tried to parse the deliberately empty
+control stdout as JSON. It produced no matrix or receipt. Including that setup error, the semantic
+pair, control smoke/trace, warmups and corrected matrix used 71 complete invocations against the
+cap of 72.
+
+The corrected mode-0600 raw receipt was 25,750 bytes with SHA-256
+`3c3ca2c73ee0a028b507160e7855ba119d95ce98236552647a4b597df33d6a0e`. Frozen lower-bound,
+semantic-control and final harness SHA-256 values were respectively
+`1a93fdeafeb16a01591941f9eb2d1341daa36120562de1a015eff2eec17a6b80`,
+`b911f4c5af9a9d2154c9df52cec058a925cba6edb7c731719ab37ca88b7f57fd`, and
+`56a9b85a03cd2e57c5c16380a14ccedb8d05df0368eb0ea3bb609492e9fae66f`.
+No shared process-executor, hot-run, cache/generation/lifecycle, task-worktree, reflink/storage or
+Quarry code changed. The capture tail remains separate owner evidence, not scope for this command.
