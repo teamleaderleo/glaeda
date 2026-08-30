@@ -888,3 +888,12 @@ Free hosted GitHub Actions is not a comparable arm because it cannot observe ope
 machine state; a self-hosted Actions job would invoke this same local command. No hot-run, G0,
 resident/cache lifecycle, project/worktree/storage/reflink, protected-cache, or Quarry code
 changed.
+
+Post-merge verification exposed one platform-packaging error outside the measured Linux path. The
+first binary used a non-Linux `compile_error!`, so repository-wide Apple Silicon `--all-targets`
+checking correctly failed after PR #920 merged. Exact fix
+`48ccb95c83809305f7e2d2bff2fc454093a0756c` replaces that compile-time rejection with a target-gated
+non-Linux stub that exits two with a static unsupported-platform message; all Linux implementation
+items remain Linux-gated. The exact
+`cargo check --locked --all-targets --all-features --target aarch64-apple-darwin` control then
+passed. This correction changes no Linux observation semantics, benchmark control, or authority.
