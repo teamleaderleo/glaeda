@@ -516,8 +516,8 @@ glaeda --output json cache observe-hot-run --root <explicit-hot-run-root>
 ```
 
 This is filesystem-metadata observation only. It follows no symlinks, reads no file contents,
-stays on the root filesystem, rejects more than 1,024 states, 2,000,000 objects per state, depth
-over 64, cross-state hardlinks, drift, and unreadable state. Logical bytes match GNU `du
+stays on the root filesystem, rejects more than 1,024 states, 2,000,000 objects in one observation,
+depth over 64, cross-state hardlinks, drift, and unreadable state. Logical bytes match GNU `du
 --apparent-size` semantics by excluding directory entry sizes; allocated bytes sum unique
 per-state `st_blocks * 512`, including directories. The namespace root itself is excluded from the
 per-state aggregate. As with `du`, `st_blocks` is inode-reported allocation rather than unique

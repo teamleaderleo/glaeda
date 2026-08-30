@@ -4,7 +4,7 @@
 //! mutation. A matching opaque name does not establish ownership: every produced lifecycle fact
 //! remains unknown and the downstream classifier therefore cannot authorize reclamation.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::os::fd::{AsFd as _, OwnedFd};
 use std::path::Path;
@@ -38,9 +38,10 @@ pub fn observe_hot_run_cache(
     let mut names = state_names(&root.fd)?;
     names.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
 
-    let mut global_objects = BTreeSet::new();
+    let mut global_objects = BTreeMap::new();
+    let mut entries_seen = 0_u64;
     let mut states = Vec::with_capacity(names.len());
-    for name in names {
+    for (state_ordinal, name) in names.into_iter().enumerate() {
         let path_stat =
             rustix_fs::statat(root.fd.as_fd(), name.as_c_str(), AtFlags::SYMLINK_NOFOLLOW)
                 .map_err(|_| unreadable())?;
@@ -54,13 +55,13 @@ pub fn observe_hot_run_cache(
             return Err(changed());
         }
         let mut totals = TreeTotals::default();
-        let mut state_objects = BTreeSet::new();
         observe_directory(
             &state,
             root.snapshot.device,
             0,
+            state_ordinal,
+            &mut entries_seen,
             &mut totals,
-            &mut state_objects,
             &mut global_objects,
         )?;
         state.revalidate()?;
@@ -110,16 +111,17 @@ fn observe_directory(
     directory: &BoundDirectory,
     root_device: u64,
     depth: u16,
+    state_ordinal: usize,
+    entries_seen: &mut u64,
     totals: &mut TreeTotals,
-    state_objects: &mut BTreeSet<PhysicalObjectIdentity>,
-    global_objects: &mut BTreeSet<PhysicalObjectIdentity>,
+    global_objects: &mut BTreeMap<PhysicalObjectIdentity, usize>,
 ) -> Result<(), HotRunCacheObservationError> {
     if depth > MAX_HOT_RUN_CACHE_OBSERVATION_DEPTH {
         return Err(too_large());
     }
     totals.add_directory(directory.snapshot.blocks)?;
-    totals.entries = totals.entries.checked_add(1).ok_or_else(too_large)?;
-    if totals.entries > MAX_HOT_RUN_CACHE_OBSERVATION_ENTRIES {
+    *entries_seen = entries_seen.checked_add(1).ok_or_else(too_large)?;
+    if *entries_seen > MAX_HOT_RUN_CACHE_OBSERVATION_ENTRIES {
         return Err(too_large());
     }
 
@@ -146,8 +148,9 @@ fn observe_directory(
                 &child,
                 root_device,
                 depth.checked_add(1).ok_or_else(too_large)?,
+                state_ordinal,
+                entries_seen,
                 totals,
-                state_objects,
                 global_objects,
             )?;
             child.revalidate()?;
@@ -164,19 +167,20 @@ fn observe_directory(
         if snapshot != ObjectSnapshot::from_stat(&second)? {
             return Err(changed());
         }
-        totals.entries = totals.entries.checked_add(1).ok_or_else(too_large)?;
-        if totals.entries > MAX_HOT_RUN_CACHE_OBSERVATION_ENTRIES {
+        *entries_seen = entries_seen.checked_add(1).ok_or_else(too_large)?;
+        if *entries_seen > MAX_HOT_RUN_CACHE_OBSERVATION_ENTRIES {
             return Err(too_large());
         }
         let identity = PhysicalObjectIdentity {
             device: snapshot.device,
             inode: snapshot.inode,
         };
-        if !state_objects.insert(identity) {
-            continue;
-        }
-        if !global_objects.insert(identity) {
-            return Err(ambiguous_hardlink());
+        match global_objects.get(&identity) {
+            Some(owner) if *owner == state_ordinal => continue,
+            Some(_) => return Err(ambiguous_hardlink()),
+            None => {
+                global_objects.insert(identity, state_ordinal);
+            }
         }
         totals.add_object(snapshot.size, snapshot.blocks)?;
     }
@@ -185,7 +189,6 @@ fn observe_directory(
 
 #[derive(Debug, Default)]
 struct TreeTotals {
-    entries: u64,
     logical_bytes: u64,
     allocated_bytes: u64,
 }
