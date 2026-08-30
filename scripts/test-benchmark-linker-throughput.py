@@ -6,9 +6,12 @@ from __future__ import annotations
 import json
 import os
 import runpy
+import signal
 import stat
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,15 +23,19 @@ MODULE = SimpleNamespace(**runpy.run_path(os.fspath(SCRIPT), run_name="linker_be
 
 
 class LinkerBenchmarkTests(unittest.TestCase):
-    def test_encoded_flags_are_fixed_and_gnu_is_empty(self) -> None:
-        self.assertIsNone(MODULE.encoded_rustflags("gnu"))
+    def test_encoded_flags_force_each_linker_arm(self) -> None:
+        clang = Path("/usr/bin/clang").resolve(strict=True)
+        self.assertEqual(
+            MODULE.encoded_rustflags("gnu"),
+            f"-Clinker={clang}\x1f-Clink-arg=-fuse-ld=bfd",
+        )
         self.assertEqual(
             MODULE.encoded_rustflags("lld"),
-            "-Clinker=clang\x1f-Clink-arg=-fuse-ld=lld",
+            f"-Clinker={clang}\x1f-Clink-arg=-fuse-ld=lld",
         )
         self.assertEqual(
             MODULE.encoded_rustflags("mold"),
-            "-Clinker=clang\x1f-Clink-arg=-fuse-ld=mold",
+            f"-Clinker={clang}\x1f-Clink-arg=-fuse-ld=mold",
         )
         with self.assertRaises(MODULE.BenchmarkError):
             MODULE.encoded_rustflags("other")
@@ -38,6 +45,18 @@ class LinkerBenchmarkTests(unittest.TestCase):
             MODULE.summarize([6.0, 1.0, 4.0, 2.0, 5.0, 3.0]),
             {"minimum": 1.0, "median": 3.5, "p90": 6.0, "maximum": 6.0},
         )
+
+    def test_default_nine_round_schedule_balances_every_arm_position(self) -> None:
+        arms = [(linker, width) for linker in MODULE.LINKERS for width in MODULE.WIDTHS]
+        self.assertEqual(len(arms), 9)
+        self.assertTrue(MODULE.schedule_is_position_balanced(arms, 9))
+        self.assertFalse(MODULE.schedule_is_position_balanced(arms, 6))
+        for arm in arms:
+            positions = [
+                MODULE.measured_order(arms, round_index).index(arm)
+                for round_index in range(9)
+            ]
+            self.assertEqual(sorted(positions), list(range(9)))
 
     def test_storage_preflight_uses_available_blocks(self) -> None:
         with mock.patch.object(
@@ -49,19 +68,158 @@ class LinkerBenchmarkTests(unittest.TestCase):
                 MODULE.require_experiment_storage(Path("/private"))
         self.assertEqual(raised.exception.code, "insufficient_storage")
 
-    def test_stop_workers_settles_exact_process_group(self) -> None:
-        process = subprocess.Popen(
-            ["/usr/bin/sleep", "60"],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
+    def test_worker_environment_is_closed_and_forces_linker_identity(self) -> None:
+        capabilities = MODULE.Capabilities(
+            paths={"clang": Path("/usr/bin/clang")},
+            versions={},
+            build_executables=frozenset(),
+            path_identity_sha256="sha256:" + "a" * 64,
         )
-        worker = MODULE.Worker(process, Path("receipt"), Path("log"), Path("target"))
-        self.assertTrue(MODULE.process_group_exists(process.pid))
-        MODULE.stop_workers([worker])
-        self.assertIsNotNone(process.returncode)
-        self.assertFalse(MODULE.process_group_exists(process.pid))
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            MODULE.pwd,
+            "getpwuid",
+            return_value=SimpleNamespace(pw_dir=temporary),
+        ), mock.patch.dict(
+            os.environ,
+            {
+                "REVIEW_FAKE_SECRET": "must-not-cross",
+                "CARGO_PROFILE_DEV_OPT_LEVEL": "3",
+                "RUSTC_WRAPPER": "/tmp/ambient-wrapper",
+            },
+            clear=False,
+        ):
+            environment = MODULE.worker_environment(
+                Path("/source"), Path("/target"), "gnu", capabilities
+            )
+        self.assertEqual(
+            set(environment),
+            {
+                "HOME",
+                "PATH",
+                "LANG",
+                "LC_ALL",
+                "CARGO_TERM_COLOR",
+                "CARGO_BUILD_JOBS",
+                "CARGO_TARGET_DIR",
+                "CARGO_ENCODED_RUSTFLAGS",
+            },
+        )
+        self.assertNotIn("REVIEW_FAKE_SECRET", environment)
+        self.assertNotIn("CARGO_PROFILE_DEV_OPT_LEVEL", environment)
+        self.assertNotIn("RUSTC_WRAPPER", environment)
+        self.assertIn("-fuse-ld=bfd", environment["CARGO_ENCODED_RUSTFLAGS"])
+
+    def test_worker_environment_rejects_ambient_cargo_config(self) -> None:
+        capabilities = MODULE.Capabilities(
+            paths={"clang": Path("/usr/bin/clang")},
+            versions={},
+            build_executables=frozenset(),
+            path_identity_sha256="sha256:" + "a" * 64,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            cargo_home = Path(temporary) / ".cargo"
+            cargo_home.mkdir()
+            (cargo_home / "config.toml").write_text("[build]\n", encoding="utf-8")
+            with mock.patch.object(
+                MODULE.pwd,
+                "getpwuid",
+                return_value=SimpleNamespace(pw_dir=temporary),
+            ), self.assertRaises(MODULE.BenchmarkError) as raised:
+                MODULE.worker_environment(
+                    Path("/source"), Path("/target"), "gnu", capabilities
+                )
+        self.assertEqual(raised.exception.code, "ambient_cargo_config")
+
+    def test_scope_command_has_crash_backstop_and_closed_control_environment(self) -> None:
+        process = mock.Mock(pid=123)
+        scope = MODULE.OwnedScope("unit.scope", -1, -1, -1, -1)
+        replacements = {
+            "unique_scope_unit": mock.Mock(return_value="unit.scope"),
+            "systemd_control_environment": mock.Mock(
+                return_value={"LANG": "C.UTF-8"}
+            ),
+            "admit_scope": mock.Mock(return_value=scope),
+        }
+        with mock.patch.dict(
+            MODULE.start_owned_scope.__globals__, replacements
+        ), mock.patch.object(
+            MODULE.subprocess, "Popen", return_value=process
+        ) as popen:
+            observed_process, observed_scope = MODULE.start_owned_scope(
+                ["/usr/bin/python3", "/private/entry"], 90.0, subprocess.DEVNULL
+            )
+        self.assertIs(observed_process, process)
+        self.assertIs(observed_scope, scope)
+        argv = popen.call_args.args[0]
+        self.assertIn("--property=KillMode=control-group", argv)
+        self.assertIn("--property=SendSIGKILL=yes", argv)
+        self.assertIn("--property=RuntimeMaxSec=95s", argv)
+        self.assertIn("--property=TimeoutStopSec=2s", argv)
+        self.assertEqual(popen.call_args.kwargs["env"], {"LANG": "C.UTF-8"})
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+
+    def test_scope_observation_and_kill_use_held_descriptors(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "cgroup.procs").write_text("123\n456\n", encoding="ascii")
+            (root / "cgroup.events").write_text("populated 1\nfrozen 0\n", encoding="ascii")
+            (root / "cgroup.kill").write_bytes(b"")
+            cgroup_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            kill_fd = os.open("cgroup.kill", os.O_WRONLY, dir_fd=cgroup_fd)
+            scope = MODULE.OwnedScope("unit.scope", cgroup_fd, kill_fd, -1, -1)
+            try:
+                self.assertEqual(MODULE.scope_processes(scope), {123, 456})
+                self.assertTrue(MODULE.scope_is_populated(scope))
+                MODULE.kill_scope(scope)
+                self.assertEqual((root / "cgroup.kill").read_bytes(), b"1")
+            finally:
+                scope.close()
+
+    def test_finish_workers_refuses_a_scope_that_never_empties(self) -> None:
+        scope = MODULE.OwnedScope("unit.scope", -1, -1, -1, -1)
+        worker = MODULE.Worker(
+            mock.Mock(), Path("receipt"), Path("log"), Path("target"), scope
+        )
+        with mock.patch.object(
+            MODULE, "scope_is_populated", return_value=True
+        ), mock.patch.object(MODULE, "kill_scope"), mock.patch.object(
+            MODULE, "wait_scope_empty", return_value=False
+        ), self.assertRaises(MODULE.BenchmarkError) as raised:
+            MODULE.finish_workers([worker])
+        self.assertEqual(raised.exception.code, "worker_cleanup_incomplete")
+
+    @unittest.skipUnless(
+        os.environ.get("GLAEDA_RUN_LINKER_SCOPE_PHYSICAL") == "1",
+        "explicit physical user-systemd scope test",
+    )
+    def test_physical_scope_kills_nested_session(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pids = root / "pids"
+            with (root / "scope.log").open("wb") as stream:
+                process, scope = MODULE.start_owned_scope(
+                    [
+                        sys.executable,
+                        SCRIPT,
+                        MODULE.INTERNAL_NESTED_FIXTURE,
+                        "--",
+                        pids,
+                    ],
+                    10.0,
+                    stream,
+                )
+            worker = MODULE.Worker(
+                process, Path("receipt"), Path("log"), Path("target"), scope
+            )
+            deadline = time.monotonic() + 2
+            while not pids.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            leader, nested = [int(value) for value in pids.read_text().split()]
+            self.assertNotEqual(os.getpgid(leader), os.getpgid(nested))
+            MODULE.stop_workers([worker])
+            for pid in (leader, nested):
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(pid, 0)
 
     def test_process_group_keeps_reparented_worker_owned(self) -> None:
         roots = {100}
@@ -75,18 +233,34 @@ class LinkerBenchmarkTests(unittest.TestCase):
         self.assertEqual(MODULE.descendant_rss_kib(roots, table), 4)
 
     def test_quiescence_waits_for_a_clean_observation(self) -> None:
-        with mock.patch.object(
-            MODULE, "foreign_build_count", side_effect=[1, 0]
+        replacement = mock.Mock(side_effect=[1, 0])
+        with mock.patch.dict(
+            MODULE.wait_for_foreign_build_quiescence.__globals__,
+            {"foreign_build_count": replacement},
         ), mock.patch.object(MODULE.time, "sleep"):
             MODULE.wait_for_foreign_build_quiescence(
                 quiet_seconds=0.0, wait_seconds=1.0
             )
+        self.assertEqual(replacement.call_count, 2)
+
+    def test_foreign_build_detection_covers_canonical_tool_names(self) -> None:
+        table = {
+            101: (1, 101, "x86_64-linux-gnu-gcc-15", 4096),
+            102: (1, 102, "x86_64-linux-gnu-ld.bfd", 4096),
+            103: (1, 103, "lld", 4096),
+            104: (1, 104, "go", 4096),
+        }
+        self.assertEqual(
+            MODULE.foreign_build_executables(set(), table),
+            ["go", "lld", "x86_64-linux-gnu-gcc-15", "x86_64-linux-gnu-ld.bfd"],
+        )
 
     def test_aggregate_rejects_an_overlapped_accepted_observation(self) -> None:
         with self.assertRaises(MODULE.BenchmarkError) as raised:
             MODULE.aggregate(
                 MODULE.SourceIdentity("a" * 40, "b" * 40),
                 {},
+                "sha256:" + "c" * 64,
                 1,
                 [{"phase": "measured", "foreign_build_overlap_observed": True}],
                 [],
