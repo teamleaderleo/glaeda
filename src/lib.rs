@@ -3,6 +3,9 @@ pub mod actions_runner_readiness;
 pub mod artifact;
 /// Pure, path-free classification of explicit hot-state inventory observations.
 pub mod cache_inventory;
+/// Positive-only Linux process and mount reference observation for one Cargo target.
+#[cfg(target_os = "linux")]
+pub mod cargo_target_holder_observation;
 /// Read-only, descriptor-bound observation of one Linux Cargo target tree.
 #[cfg(target_os = "linux")]
 pub mod cargo_target_observation;
