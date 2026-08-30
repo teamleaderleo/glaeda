@@ -359,6 +359,8 @@ pub mod rust_verification_envelope;
 pub mod rust_verification_envelope_digest;
 pub mod state;
 pub mod state_document;
+/// Closed current/legacy selection for Glaeda's fixed Linux durable-state roots.
+pub mod state_root_generation;
 pub mod state_store;
 #[cfg(target_os = "linux")]
 pub mod subordinate_id;
