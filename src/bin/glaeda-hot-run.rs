@@ -32,6 +32,16 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, ValueEnum};
 #[cfg(target_os = "linux")]
+use glaeda::cargo_target_observation::{
+    CargoTargetObservation, CargoTargetObservationError, observe_cargo_target,
+};
+#[cfg(target_os = "linux")]
+use glaeda::process::ProcessExecutor;
+#[cfg(target_os = "linux")]
+use glaeda::project_checkout_observation::{
+    ProjectCheckoutObservation, ProjectCheckoutObservationError, ProjectCheckoutObserver,
+};
+#[cfg(target_os = "linux")]
 use rustix::{
     event::{PollFd, PollFlags, Timespec, poll},
     fd::OwnedFd,
@@ -43,6 +53,8 @@ use rustix::{
     },
     thread::sched_getaffinity,
 };
+#[cfg(target_os = "linux")]
+use serde::Serialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest as _, Sha256};
 
@@ -161,6 +173,44 @@ struct CommandResult {
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Debug, Serialize)]
+struct NativeTargetSnapshot {
+    checkout: ProjectCheckoutObservation,
+    cargo_target: CargoTargetObservation,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum TerminalObservation<T, E> {
+    Observed { observation: T },
+    Unavailable { error: E },
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Serialize)]
+struct NativeTargetTerminalSnapshot {
+    checkout: TerminalObservation<ProjectCheckoutObservation, ProjectCheckoutObservationError>,
+    cargo_target: TerminalObservation<CargoTargetObservation, CargoTargetObservationError>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct NativeTargetMeasurementObservation {
+    before: NativeTargetSnapshot,
+    after: NativeTargetTerminalSnapshot,
+    before_elapsed: Duration,
+    after_elapsed: Duration,
+}
+
+#[derive(Debug)]
+struct MeasurementObservations {
+    machine_before: Value,
+    machine_after: Value,
+    native_target: Value,
+}
+
+#[cfg(target_os = "linux")]
 #[derive(Debug)]
 struct OwnedResourceScope {
     cgroup: OwnedFd,
@@ -276,6 +326,18 @@ fn run(cli: Cli) -> Result<i32, String> {
         runtime_bin.as_ref(),
     )?;
 
+    #[cfg(target_os = "linux")]
+    let native_target_before =
+        if cli.measurement.is_some() && caches.iter().any(|cache| cache.path == "target") {
+            let started = Instant::now();
+            let observer = ProjectCheckoutObserver::new(git.clone())
+                .map_err(|error| format!("cannot prepare checkout observation: {error}"))?;
+            let before = observe_native_target_before(&observer, &resident)?;
+            Some((observer, before, started.elapsed()))
+        } else {
+            None
+        };
+
     let machine_before = cli.measurement.as_ref().map(|_| observe_machine());
     let result = execute_command(
         &command,
@@ -288,17 +350,96 @@ fn run(cli: Cli) -> Result<i32, String> {
     )?;
     if let Some(destination) = cli.measurement.as_ref() {
         let machine_after = observe_machine();
+        #[cfg(target_os = "linux")]
+        let native_target_observation =
+            native_target_before.map(|(observer, before, before_elapsed)| {
+                let started = Instant::now();
+                let after = observe_native_target_after(&observer, &resident);
+                NativeTargetMeasurementObservation {
+                    before,
+                    after,
+                    before_elapsed,
+                    after_elapsed: started.elapsed(),
+                }
+            });
+        #[cfg(target_os = "linux")]
+        let native_target_observation = native_target_observation
+            .as_ref()
+            .map(|observation| native_target_report(observation, result.elapsed))
+            .unwrap_or(Value::Null);
+        #[cfg(not(target_os = "linux"))]
+        let native_target_observation = Value::Null;
         write_measurement(
             destination,
             &result,
             &caches,
             runtime_contract.as_ref(),
             cli.comparison_key.as_deref(),
-            machine_before.expect("measurement observation exists"),
-            machine_after,
+            MeasurementObservations {
+                machine_before: machine_before.expect("measurement observation exists"),
+                machine_after,
+                native_target: native_target_observation,
+            },
         )?;
     }
     Ok(result.exit_code)
+}
+
+#[cfg(target_os = "linux")]
+fn observe_native_target_before(
+    observer: &ProjectCheckoutObserver,
+    checkout: &Path,
+) -> Result<NativeTargetSnapshot, String> {
+    let checkout_observation = observer
+        .observe(checkout, &ProcessExecutor)
+        .map_err(|error| format!("cannot observe checkout before command: {error}"))?;
+    let cargo_target = observe_cargo_target(checkout)
+        .map_err(|error| format!("cannot observe Cargo target before command: {error}"))?;
+    Ok(NativeTargetSnapshot {
+        checkout: checkout_observation,
+        cargo_target,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn observe_native_target_after(
+    observer: &ProjectCheckoutObserver,
+    checkout: &Path,
+) -> NativeTargetTerminalSnapshot {
+    let checkout_observation = match observer.observe(checkout, &ProcessExecutor) {
+        Ok(observation) => TerminalObservation::Observed { observation },
+        Err(error) => TerminalObservation::Unavailable { error },
+    };
+    let cargo_target = match observe_cargo_target(checkout) {
+        Ok(observation) => TerminalObservation::Observed { observation },
+        Err(error) => TerminalObservation::Unavailable { error },
+    };
+    NativeTargetTerminalSnapshot {
+        checkout: checkout_observation,
+        cargo_target,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn native_target_report(
+    observation: &NativeTargetMeasurementObservation,
+    command_elapsed: Duration,
+) -> Value {
+    let observation_elapsed = observation
+        .before_elapsed
+        .saturating_add(observation.after_elapsed);
+    json!({
+        "authority": "performance_observation_only",
+        "atomic": false,
+        "before": observation.before,
+        "after": observation.after,
+        "before_elapsed_seconds": round_seconds(observation.before_elapsed),
+        "after_elapsed_seconds": round_seconds(observation.after_elapsed),
+        "observation_elapsed_seconds": round_seconds(observation_elapsed),
+        "command_plus_observation_elapsed_seconds": round_seconds(
+            command_elapsed.saturating_add(observation_elapsed)
+        ),
+    })
 }
 
 fn validate_timeout(seconds: f64) -> Result<Duration, String> {
@@ -1853,8 +1994,7 @@ fn write_measurement(
     caches: &[NativeCache],
     runtime: Option<&RuntimeContract>,
     comparison_key: Option<&str>,
-    machine_before: Value,
-    machine_after: Value,
+    observations: MeasurementObservations,
 ) -> Result<(), String> {
     let destination = absolute_path(destination)?;
     let parent = destination
@@ -1866,6 +2006,11 @@ fn write_measurement(
         .create(parent)
         .map_err(|error| format!("cannot create measurement parent: {error}"))?;
     let temporary = unique_sibling_path(&destination)?;
+    let machine_interval = pressure_interval(
+        &observations.machine_before,
+        &observations.machine_after,
+        result.elapsed,
+    );
     let report = json!({
         "schema_version": 6,
         "document_type": "glaeda-hot-run-measurement",
@@ -1875,14 +2020,15 @@ fn write_measurement(
         "resource_profile": result.resource_profile,
         "machine_observation": {
             "scope": "host_aggregate",
-            "before": machine_before,
-            "after": machine_after,
-            "interval": pressure_interval(&machine_before, &machine_after, result.elapsed),
+            "before": observations.machine_before,
+            "after": observations.machine_after,
+            "interval": machine_interval,
         },
         "timeout_seconds": result.timeout_seconds,
         "cache_views": caches.iter().map(|cache| json!({"path": cache.path, "mode": "native"})).collect::<Vec<_>>(),
         "state_preparation": [],
         "source_preparation": Value::Null,
+        "native_target_observation": observations.native_target,
         "runtime": runtime.map(runtime_report).unwrap_or(Value::Null),
         "elapsed_seconds": round_seconds(result.elapsed),
         "preparation_elapsed_seconds": 0.0,
@@ -1992,6 +2138,35 @@ mod tests {
         let path = unique_temporary_path(label).unwrap();
         fs::create_dir(&path).unwrap();
         path
+    }
+
+    fn initialize_test_repository(path: &Path) {
+        assert!(
+            Command::new("/usr/bin/git")
+                .args(["init", "--quiet"])
+                .current_dir(path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("/usr/bin/git")
+                .args([
+                    "-c",
+                    "user.name=Glaeda Test",
+                    "-c",
+                    "user.email=glaeda-test@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "--allow-empty",
+                    "-m",
+                    "fixture",
+                ])
+                .current_dir(path)
+                .status()
+                .unwrap()
+                .success()
+        );
     }
 
     #[test]
@@ -2146,6 +2321,23 @@ mod tests {
         assert_eq!(report["authority"], "developer_observation_only");
         assert_eq!(report["cross_worktree"], false);
         assert_eq!(report["cache_views"][0]["path"], "target");
+        let target = &report["native_target_observation"];
+        assert_eq!(target["authority"], "performance_observation_only");
+        assert_eq!(target["atomic"], false);
+        assert_eq!(
+            target["before"]["cargo_target"]["state"]["state"],
+            "present"
+        );
+        assert_eq!(target["after"]["checkout"]["state"], "observed");
+        assert_eq!(target["after"]["cargo_target"]["state"], "observed");
+        assert!(target["before_elapsed_seconds"].as_f64().unwrap() >= 0.0);
+        assert!(target["after_elapsed_seconds"].as_f64().unwrap() >= 0.0);
+        assert!(
+            target["command_plus_observation_elapsed_seconds"]
+                .as_f64()
+                .unwrap()
+                >= report["elapsed_seconds"].as_f64().unwrap()
+        );
         assert_eq!(report["resource_accounting"], "gnu_time_command_tree");
         assert_eq!(report["timeout_seconds"], 3.0);
         assert_eq!(report["exit_code"], 17);
@@ -2157,6 +2349,46 @@ mod tests {
         );
         fs::remove_file(measurement).unwrap();
         fs::remove_dir(fixture).unwrap();
+    }
+
+    #[test]
+    fn post_command_target_failure_is_receipted_without_erasing_command_result() {
+        let fixture = test_directory("glaeda-hot-run-post-observation-test");
+        initialize_test_repository(&fixture);
+        fs::create_dir(fixture.join("target")).unwrap();
+        let measurement = fixture.join("measurement.json");
+        let code = run(Cli {
+            resident: fixture.clone(),
+            task: fixture.clone(),
+            cache: vec!["target:native".into()],
+            measurement: Some(measurement.clone()),
+            comparison_key: Some(format!("sha256:{}", "b".repeat(64))),
+            runtime_id: None,
+            runtime_sha256: None,
+            runtime_bin: None,
+            timeout: Some(3.0),
+            resource_profile: None,
+            command: vec![
+                OsString::from("/bin/sh"),
+                OsString::from("-c"),
+                OsString::from("/bin/rm -rf -- target && /bin/ln -s -- /tmp target; exit 17"),
+            ],
+        })
+        .unwrap();
+        assert_eq!(code, 17);
+        let report: Value = serde_json::from_reader(File::open(&measurement).unwrap()).unwrap();
+        assert_eq!(report["exit_code"], 17);
+        assert_eq!(report["completion_reason"], "exited");
+        assert_eq!(
+            report["native_target_observation"]["after"]["checkout"]["state"],
+            "observed"
+        );
+        let target = &report["native_target_observation"]["after"]["cargo_target"];
+        assert_eq!(target["state"], "unavailable");
+        assert_eq!(target["error"]["code"], "cargo_target_unsafe_shape");
+        let encoded = serde_json::to_string(&report).unwrap();
+        assert!(!encoded.contains(fixture.to_str().unwrap()));
+        fs::remove_dir_all(fixture).unwrap();
     }
 
     #[test]
@@ -2190,6 +2422,7 @@ mod tests {
             let report: Value = serde_json::from_reader(File::open(&measurement).unwrap()).unwrap();
             assert_eq!(report["completion_reason"], reason);
             assert_eq!(report["signal"], expected_signal);
+            assert_eq!(report["native_target_observation"], Value::Null);
             fs::remove_file(measurement).unwrap();
         }
         fs::remove_dir(fixture).unwrap();
