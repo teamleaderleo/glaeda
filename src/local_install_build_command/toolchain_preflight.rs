@@ -266,8 +266,15 @@ impl ExecutableSnapshot {
             && self
                 .directories
                 .iter()
+                .enumerate()
                 .zip(&other.directories)
-                .all(|(left, right)| left.same_directory_component_as(right))
+                .all(|((index, left), right)| {
+                    if index + 1 == self.directories.len() {
+                        left.same_as(right)
+                    } else {
+                        left.same_path_component_as(right)
+                    }
+                })
             && self.file.same_as(&other.file)
     }
 }
@@ -318,18 +325,15 @@ impl PrivateMetadata {
             && self.changed_nanoseconds == other.changed_nanoseconds
     }
 
-    /// Root-owned path components are outside the caller's replacement authority. Their entry
-    /// identities and permission classes must remain exact, but their directory size, link count,
-    /// and timestamps legitimately change when unrelated users create siblings (for example in
-    /// `/tmp`). User-owned components retain the complete metadata comparison so moving the
-    /// private toolchain subtree away and back cannot pass as stable.
-    fn same_directory_component_as(&self, other: &Self) -> bool {
-        let stable_identity = self.device == other.device
+    /// Higher path components retain exact entry identity without treating unrelated sibling churn
+    /// as tool replacement. The direct executable parent is compared separately with the complete
+    /// metadata record.
+    fn same_path_component_as(&self, other: &Self) -> bool {
+        self.device == other.device
             && self.inode == other.inode
             && self.uid == other.uid
             && self.gid == other.gid
-            && self.mode == other.mode;
-        stable_identity && (self.uid == 0 || self.same_as(other))
+            && self.mode == other.mode
     }
 }
 
@@ -857,21 +861,18 @@ mod tests {
     }
 
     #[test]
-    fn root_owned_shared_ancestor_churn_is_not_private_toolchain_change() {
+    fn shared_ancestor_churn_is_not_private_toolchain_change() {
         let fixture = TempToolchain::new("shared-ancestor-metadata");
         let metadata = fs::metadata(&fixture.root).expect("fixture root metadata");
-        let mut before = PrivateMetadata::from_metadata(&metadata);
-        before.uid = 0;
+        let before = PrivateMetadata::from_metadata(&metadata);
         let mut after = before.clone();
         after.links = after.links.saturating_add(1);
         after.size = after.size.saturating_add(4096);
         after.modified_nanoseconds = after.modified_nanoseconds.saturating_add(1);
         after.changed_nanoseconds = after.changed_nanoseconds.saturating_add(1);
 
-        assert!(before.same_directory_component_as(&after));
-        before.uid = geteuid().as_raw().max(1);
-        after.uid = before.uid;
-        assert!(!before.same_directory_component_as(&after));
+        assert!(before.same_path_component_as(&after));
+        assert!(!before.same_as(&after));
     }
 
     #[test]
