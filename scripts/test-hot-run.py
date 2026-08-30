@@ -928,6 +928,11 @@ class HotRunTests(unittest.TestCase):
             manifest = staging / "producer-manifest.json"
             manifest.write_text('{"schema_version":', encoding="utf-8")
             manifest.chmod(0o600)
+            temporary_manifest = staging / (
+                ".producer-manifest.json.creating-crash"
+            )
+            temporary_manifest.write_text('{"producer":', encoding="utf-8")
+            temporary_manifest.chmod(0o600)
 
             self.assertEqual(
                 namespace["collect_one_unreachable_state"](
@@ -941,6 +946,23 @@ class HotRunTests(unittest.TestCase):
                 "created",
             )
             self.assertTrue((state / "producer-manifest.json").exists())
+
+            unknown_stage = namespace_root / (
+                ".creating-v1-" + state.name + "-unknown"
+            )
+            unknown_stage.mkdir(mode=0o700)
+            unknown_payload = unknown_stage / "partial-cache"
+            unknown_payload.write_text("preserve\n", encoding="utf-8")
+            unknown_payload.chmod(0o600)
+            self.assertEqual(
+                namespace["collect_one_unreachable_state"](
+                    namespace_root, state.name
+                ),
+                "creating_recovery_deferred",
+            )
+            self.assertEqual(
+                unknown_payload.read_text(encoding="utf-8"), "preserve\n"
+            )
 
     def test_worktree_state_revalidation_rejects_generation_drift(self) -> None:
         namespace = load_hot_run()
