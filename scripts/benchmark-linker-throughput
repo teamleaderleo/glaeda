@@ -30,6 +30,9 @@ from typing import Any
 SCHEMA_VERSION = 1
 BUILD_JOBS = 4
 MIN_EXPERIMENT_AVAILABLE_BYTES = 48 * 1024**3
+OVERLAP_QUIET_SECONDS = 1.0
+OVERLAP_WAIT_SECONDS = 30.0
+OVERLAP_RETRY_LIMIT = 3
 WIDTHS = (1, 2, 4)
 LINKERS = ("gnu", "lld", "mold")
 FAST_PHASES = (
@@ -265,6 +268,41 @@ def foreign_build_count(
     )
 
 
+def foreign_build_executables(
+    roots: set[int], table: dict[int, ProcessRecord] | None = None
+) -> list[str]:
+    table = process_table() if table is None else table
+    return sorted(
+        {
+            executable
+            for pid, (_, _, executable, _) in table.items()
+            if executable in BUILD_EXECUTABLES and not is_worker_owned(pid, roots, table)
+        }
+    )
+
+
+def wait_for_foreign_build_quiescence(
+    *,
+    quiet_seconds: float = OVERLAP_QUIET_SECONDS,
+    wait_seconds: float = OVERLAP_WAIT_SECONDS,
+) -> None:
+    deadline = time.monotonic() + wait_seconds
+    quiet_since: float | None = None
+    while True:
+        now = time.monotonic()
+        if foreign_build_count(set()) == 0:
+            quiet_since = now if quiet_since is None else quiet_since
+            if now - quiet_since >= quiet_seconds:
+                return
+        else:
+            quiet_since = None
+        if now >= deadline:
+            raise BenchmarkError(
+                "foreign_build_wait", "another build did not become quiescent"
+            )
+        time.sleep(0.05)
+
+
 def descendant_rss_kib(roots: set[int], table: dict[int, ProcessRecord]) -> int:
     return sum(
         resident_bytes
@@ -428,6 +466,7 @@ def run_batch(
     width: int,
     phase: str,
     index: int,
+    retry: int = 0,
 ) -> dict[str, Any]:
     if foreign_build_count(set()) != 0:
         raise BenchmarkError("foreign_build_overlap", "another build is already active")
@@ -437,8 +476,10 @@ def run_batch(
         for worker_index in range(width):
             target = experiment / "targets" / linker / f"worker-{worker_index}"
             target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            receipt = experiment / "receipts" / f"{phase}-{linker}-w{width}-{index}-{worker_index}.json"
-            log = experiment / "logs" / f"{phase}-{linker}-w{width}-{index}-{worker_index}.log"
+            retry_suffix = "" if retry == 0 else f"-retry-{retry}"
+            name = f"{phase}-{linker}-w{width}-{index}-{worker_index}{retry_suffix}"
+            receipt = experiment / "receipts" / f"{name}.json"
+            log = experiment / "logs" / f"{name}.log"
             with log.open("xb") as stream:
                 process = subprocess.Popen(
                     [root / "scripts/verify", "fast", "--receipt", receipt],
@@ -455,13 +496,16 @@ def run_batch(
         raise BenchmarkError("worker_spawn", "a verification worker could not start") from error
     roots = {worker.process.pid for worker in workers}
     overlap = False
+    overlap_executables: set[str] = set()
     sampled_descendant_rss_peak_kib = 0
     deadline = started + (180.0 if phase == "cold" else 90.0)
     try:
         while any(worker.process.poll() is None for worker in workers):
             table = process_table()
-            if foreign_build_count(roots, table) != 0:
+            foreign = foreign_build_executables(roots, table)
+            if foreign:
                 overlap = True
+                overlap_executables.update(foreign)
             sampled_descendant_rss_peak_kib = max(
                 sampled_descendant_rss_peak_kib, descendant_rss_kib(roots, table)
             )
@@ -478,8 +522,6 @@ def run_batch(
         raise BenchmarkError(
             "unsettled_worker_group", "a verification worker left descendants running"
         )
-    if overlap:
-        raise BenchmarkError("foreign_build_overlap", "another build overlapped the batch")
     if any(worker.process.returncode != 0 for worker in workers):
         raise BenchmarkError("worker_failed", "a verification worker failed")
 
@@ -509,6 +551,9 @@ def run_batch(
         "linker": linker,
         "width": width,
         "index": index,
+        "retry": retry,
+        "foreign_build_overlap_observed": overlap,
+        "foreign_build_executables": sorted(overlap_executables),
         "batch_wall_seconds": round(elapsed, 9),
         "completed_loops_per_second": round(width / elapsed, 9),
         "child_cpu_seconds_sum": round(
@@ -543,6 +588,7 @@ def aggregate(
     tools: dict[str, str],
     samples: int,
     observations: list[dict[str, Any]],
+    discarded_overlap_batches: list[dict[str, Any]],
     cold_targets: dict[str, list[dict[str, int]]],
     final_targets: dict[str, list[dict[str, int]]],
     machine_before: dict[str, int | str],
@@ -551,6 +597,10 @@ def aggregate(
     storage_after: int,
 ) -> dict[str, Any]:
     measured = [value for value in observations if value["phase"] == "measured"]
+    if any(value["foreign_build_overlap_observed"] for value in observations):
+        raise BenchmarkError(
+            "accepted_overlap", "an accepted observation contains foreign build overlap"
+        )
     if len({value["help_sha256"] for value in observations}) != 1:
         raise BenchmarkError("binary_validation", "CLI output differs across linker arms")
     summaries: dict[str, Any] = {}
@@ -598,6 +648,9 @@ def aggregate(
             "measured_batches_per_arm": samples,
             "forced_change": "mtime_only_same_tracked_rust_bytes",
             "primary_gate": "width-4 median throughput >= 10% over GNU with no worse p90 wall",
+            "overlap_quiet_seconds": OVERLAP_QUIET_SECONDS,
+            "overlap_wait_seconds": OVERLAP_WAIT_SECONDS,
+            "overlap_retry_limit_per_warm_batch": OVERLAP_RETRY_LIMIT,
         },
         "semantic_validator": {
             "exact_source_and_tree": True,
@@ -605,6 +658,7 @@ def aggregate(
             "source_unchanged": True,
             "cli_help_equal_across_all_arms": True,
             "foreign_build_overlap_observed": False,
+            "discarded_overlap_batch_count": len(discarded_overlap_batches),
         },
         "resource_semantics": {
             "waited_child_rss": "per-worker process-lifetime maximum; not concurrent aggregate",
@@ -621,6 +675,7 @@ def aggregate(
         "cold_targets": cold_targets,
         "final_targets": final_targets,
         "summaries": summaries,
+        "discarded_overlap_batches": discarded_overlap_batches,
         "observations": observations,
     }
 
@@ -665,54 +720,83 @@ def execute(experiment: Path, output: Path, samples: int) -> dict[str, Any]:
     original = source_file.stat()
     machine_before = machine_observation()
     observations: list[dict[str, Any]] = []
+    discarded_overlap_batches: list[dict[str, Any]] = []
     cold_targets: dict[str, list[dict[str, int]]] = {}
     last_ns = original.st_mtime_ns
     try:
         for index, linker in enumerate(LINKERS):
-            observations.append(
-                run_batch(
-                    root=root,
-                    experiment=experiment,
-                    source=source,
-                    linker=linker,
-                    width=4,
-                    phase="cold",
-                    index=index,
-                )
+            wait_for_foreign_build_quiescence()
+            observation = run_batch(
+                root=root,
+                experiment=experiment,
+                source=source,
+                linker=linker,
+                width=4,
+                phase="cold",
+                index=index,
             )
+            if observation["foreign_build_overlap_observed"]:
+                raise BenchmarkError(
+                    "cold_foreign_build_overlap", "another build overlapped a cold batch"
+                )
+            observations.append(observation)
             cold_targets[linker] = [
                 target_stats(experiment / "targets" / linker / f"worker-{worker}")
                 for worker in range(4)
             ]
 
         arms = [(linker, width) for linker in LINKERS for width in WIDTHS]
-        for index, (linker, width) in enumerate(arms):
-            last_ns = touch_source(source_file, original, last_ns)
-            observations.append(
-                run_batch(
+        def run_warm_batch(linker: str, width: int, phase: str, index: int) -> dict[str, Any]:
+            nonlocal last_ns
+            for retry in range(OVERLAP_RETRY_LIMIT + 1):
+                wait_for_foreign_build_quiescence()
+                last_ns = touch_source(source_file, original, last_ns)
+                observation = run_batch(
                     root=root,
                     experiment=experiment,
                     source=source,
                     linker=linker,
                     width=width,
-                    phase="warmup",
+                    phase=phase,
                     index=index,
+                    retry=retry,
                 )
+                if not observation["foreign_build_overlap_observed"]:
+                    return observation
+                discarded_overlap_batches.append(
+                    {
+                        "phase": phase,
+                        "linker": linker,
+                        "width": width,
+                        "index": index,
+                        "retry": retry,
+                        "batch_wall_seconds": observation["batch_wall_seconds"],
+                        "foreign_build_executables": observation[
+                            "foreign_build_executables"
+                        ],
+                        "receipt_sha256": [
+                            worker["receipt_sha256"]
+                            for worker in observation["workers"]
+                        ],
+                    }
+                )
+            raise BenchmarkError(
+                "foreign_build_retry_exhausted",
+                "another build repeatedly overlapped one warm batch",
             )
+
+        for index, (linker, width) in enumerate(arms):
+            observations.append(run_warm_batch(linker, width, "warmup", index))
         for round_index in range(samples):
             offset = round_index % len(arms)
             order = arms[offset:] + arms[:offset]
             for order_index, (linker, width) in enumerate(order):
-                last_ns = touch_source(source_file, original, last_ns)
                 observations.append(
-                    run_batch(
-                        root=root,
-                        experiment=experiment,
-                        source=source,
-                        linker=linker,
-                        width=width,
-                        phase="measured",
-                        index=round_index * len(arms) + order_index,
+                    run_warm_batch(
+                        linker,
+                        width,
+                        "measured",
+                        round_index * len(arms) + order_index,
                     )
                 )
     finally:
@@ -723,8 +807,6 @@ def execute(experiment: Path, output: Path, samples: int) -> dict[str, Any]:
         )
     if source_identity(root) != source:
         raise BenchmarkError("source_changed", "the exact source changed during the benchmark")
-    if foreign_build_count(set()) != 0:
-        raise BenchmarkError("foreign_build_overlap", "a build remained active after the matrix")
     final_targets = {
         linker: [
             target_stats(experiment / "targets" / linker / f"worker-{worker}")
@@ -737,6 +819,7 @@ def execute(experiment: Path, output: Path, samples: int) -> dict[str, Any]:
         tools,
         samples,
         observations,
+        discarded_overlap_batches,
         cold_targets,
         final_targets,
         machine_before,

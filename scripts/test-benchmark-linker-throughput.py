@@ -71,7 +71,33 @@ class LinkerBenchmarkTests(unittest.TestCase):
         }
         self.assertTrue(MODULE.is_worker_owned(101, roots, table))
         self.assertEqual(MODULE.foreign_build_count(roots, table), 1)
+        self.assertEqual(MODULE.foreign_build_executables(roots, table), ["cargo"])
         self.assertEqual(MODULE.descendant_rss_kib(roots, table), 4)
+
+    def test_quiescence_waits_for_a_clean_observation(self) -> None:
+        with mock.patch.object(
+            MODULE, "foreign_build_count", side_effect=[1, 0]
+        ), mock.patch.object(MODULE.time, "sleep"):
+            MODULE.wait_for_foreign_build_quiescence(
+                quiet_seconds=0.0, wait_seconds=1.0
+            )
+
+    def test_aggregate_rejects_an_overlapped_accepted_observation(self) -> None:
+        with self.assertRaises(MODULE.BenchmarkError) as raised:
+            MODULE.aggregate(
+                MODULE.SourceIdentity("a" * 40, "b" * 40),
+                {},
+                1,
+                [{"phase": "measured", "foreign_build_overlap_observed": True}],
+                [],
+                {},
+                {},
+                {},
+                {},
+                1,
+                1,
+            )
+        self.assertEqual(raised.exception.code, "accepted_overlap")
 
     def test_target_stats_rejects_symlink(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
