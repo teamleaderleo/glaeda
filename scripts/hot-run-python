@@ -86,6 +86,32 @@ class RuntimeBinBinding:
     identity_sha256: str
 
 
+@dataclass(frozen=True)
+class DirectoryObjectIdentity:
+    device: int
+    inode: int
+
+
+@dataclass(frozen=True)
+class WorktreePointerIdentity:
+    device: int
+    inode: int
+    creation_witness_ns: int
+
+
+@dataclass(frozen=True)
+class WorktreeStateIdentity:
+    resident_root: DirectoryObjectIdentity
+    task_root: DirectoryObjectIdentity
+    common_git_directory: DirectoryObjectIdentity
+    resident_git_directory: DirectoryObjectIdentity
+    task_git_directory: DirectoryObjectIdentity
+    resident_git_pointer: WorktreePointerIdentity
+    task_git_pointer: WorktreePointerIdentity
+    resident_git_relative: Path
+    task_git_relative: Path
+
+
 def nonnegative_finite(raw: str) -> float:
     value = float(raw)
     if not math.isfinite(value) or value < 0:
@@ -332,6 +358,95 @@ def task_git_directory(root: Path) -> Path:
     return git_path(root, "--git-dir")
 
 
+def observe_directory_object(path: Path, label: str) -> DirectoryObjectIdentity:
+    try:
+        details = path.lstat()
+    except OSError as error:
+        raise RuntimeError(f"{label} is unavailable") from error
+    if stat.S_ISLNK(details.st_mode) or not stat.S_ISDIR(details.st_mode):
+        raise RuntimeError(f"{label} is not a plain directory")
+    if details.st_uid != os.getuid():
+        raise RuntimeError(f"{label} is not owned by the current user")
+    return DirectoryObjectIdentity(details.st_dev, details.st_ino)
+
+
+def observe_worktree_pointer(root: Path, label: str) -> WorktreePointerIdentity:
+    pointer = root / ".git"
+    try:
+        details = pointer.lstat()
+    except OSError as error:
+        raise RuntimeError(f"{label} is unavailable") from error
+    if stat.S_ISLNK(details.st_mode) or not (
+        stat.S_ISREG(details.st_mode) or stat.S_ISDIR(details.st_mode)
+    ):
+        raise RuntimeError(f"{label} is not a plain file or directory")
+    if details.st_uid != os.getuid():
+        raise RuntimeError(f"{label} is not owned by the current user")
+    # Linked worktrees receive a regular .git pointer exactly once. Its ctime is
+    # stable for that worktree's lifetime and distinguishes a replacement even
+    # when the filesystem immediately recycles directory and file inodes. A main
+    # worktree has a mutable .git directory, so only its object identity is used.
+    creation_witness_ns = details.st_ctime_ns if stat.S_ISREG(details.st_mode) else 0
+    return WorktreePointerIdentity(
+        details.st_dev,
+        details.st_ino,
+        creation_witness_ns,
+    )
+
+
+def observe_worktree_state_identity(
+    resident: Path,
+    task: Path,
+    common_git: Path,
+    resident_git: Path,
+    task_git: Path,
+    resident_git_relative: Path,
+    task_git_relative: Path,
+) -> WorktreeStateIdentity:
+    return WorktreeStateIdentity(
+        resident_root=observe_directory_object(resident, "resident worktree root"),
+        task_root=observe_directory_object(task, "task worktree root"),
+        common_git_directory=observe_directory_object(
+            common_git, "common Git directory"
+        ),
+        resident_git_directory=observe_directory_object(
+            resident_git, "resident Git directory"
+        ),
+        task_git_directory=observe_directory_object(
+            task_git, "task Git directory"
+        ),
+        resident_git_pointer=observe_worktree_pointer(
+            resident, "resident worktree Git pointer"
+        ),
+        task_git_pointer=observe_worktree_pointer(task, "task worktree Git pointer"),
+        resident_git_relative=resident_git_relative,
+        task_git_relative=task_git_relative,
+    )
+
+
+def revalidate_worktree_state_identity(
+    expected: WorktreeStateIdentity,
+    resident: Path,
+    task: Path,
+    common_git: Path,
+    resident_git: Path,
+    task_git: Path,
+    resident_git_relative: Path,
+    task_git_relative: Path,
+) -> None:
+    observed = observe_worktree_state_identity(
+        resident,
+        task,
+        common_git,
+        resident_git,
+        task_git,
+        resident_git_relative,
+        task_git_relative,
+    )
+    if observed != expected:
+        raise RuntimeError("worktree generation changed during hot-state preflight")
+
+
 def parse_cache_specs(values: list[str]) -> tuple[CacheSpec, ...]:
     specs: list[CacheSpec] = []
     for value in values:
@@ -363,14 +478,47 @@ def default_cache_specs(resident: Path) -> tuple[CacheSpec, ...]:
 
 
 def default_state_root(
-    resident: Path, task: Path, cache_specs: tuple[CacheSpec, ...]
+    resident: Path,
+    task: Path,
+    cache_specs: tuple[CacheSpec, ...],
+    worktree_identity: WorktreeStateIdentity,
 ) -> Path:
     cache_home = Path(
         os.environ.get("XDG_CACHE_HOME", os.path.join(Path.home(), ".cache"))
     )
-    digest = hashlib.sha256(os.fsencode(resident) + b"\0" + os.fsencode(task))
+    digest = hashlib.sha256(b"glaeda-hot-run-default-state-v2\0")
+    for value in (
+        resident,
+        task,
+        worktree_identity.resident_git_relative,
+        worktree_identity.task_git_relative,
+    ):
+        encoded = os.fsencode(value)
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    for identity in (
+        worktree_identity.resident_root,
+        worktree_identity.task_root,
+        worktree_identity.common_git_directory,
+        worktree_identity.resident_git_directory,
+        worktree_identity.task_git_directory,
+    ):
+        digest.update(identity.device.to_bytes(8, "big", signed=False))
+        digest.update(identity.inode.to_bytes(8, "big", signed=False))
+    for identity in (
+        worktree_identity.resident_git_pointer,
+        worktree_identity.task_git_pointer,
+    ):
+        digest.update(identity.device.to_bytes(8, "big", signed=False))
+        digest.update(identity.inode.to_bytes(8, "big", signed=False))
+        digest.update(identity.creation_witness_ns.to_bytes(8, "big", signed=False))
     for spec in cache_specs:
-        digest.update(b"\0" + os.fsencode(spec.path) + b":" + spec.mode.encode("ascii"))
+        encoded_path = os.fsencode(spec.path)
+        encoded_mode = spec.mode.encode("ascii")
+        digest.update(len(encoded_path).to_bytes(8, "big"))
+        digest.update(encoded_path)
+        digest.update(len(encoded_mode).to_bytes(8, "big"))
+        digest.update(encoded_mode)
     identity = digest.hexdigest()
     return cache_home / "glaeda" / "hot-run" / identity
 
@@ -1188,11 +1336,13 @@ def run(
     common_git = common_git_directory(resident)
     if common_git != common_git_directory(task):
         raise RuntimeError("resident and task must be worktrees of the same Git repository")
+    resident_git = task_git_directory(resident)
     task_git = task_git_directory(task)
     try:
+        resident_git_relative = resident_git.relative_to(common_git)
         task_git_relative = task_git.relative_to(common_git)
     except ValueError as error:
-        raise RuntimeError("task Git metadata is outside the common Git directory") from error
+        raise RuntimeError("worktree Git metadata is outside the common Git directory") from error
 
     task_cwd = task_argument.resolve()
     try:
@@ -1259,11 +1409,30 @@ def run(
     has_private_state = any(
         spec.mode in ("overlay", "private", "private-copy") for spec in cache_specs
     )
-    state_base = Path(
-        os.path.abspath(
-            state_argument or default_state_root(resident, task, cache_specs)
+    implicit_worktree_identity: WorktreeStateIdentity | None = None
+    if state_argument is None:
+        implicit_worktree_identity = observe_worktree_state_identity(
+            resident,
+            task,
+            common_git,
+            resident_git,
+            task_git,
+            resident_git_relative,
+            task_git_relative,
         )
-    )
+        state_base = Path(
+            os.path.abspath(
+                default_state_root(
+                    resident,
+                    task,
+                    cache_specs,
+                    implicit_worktree_identity,
+                )
+            )
+        )
+        ensure_private_directory(state_base)
+    else:
+        state_base = Path(os.path.abspath(state_argument))
     state_root = runtime_state_root(state_base, runtime_contract)
     ensure_private_directory(state_root)
 
@@ -1323,6 +1492,18 @@ def run(
         except BlockingIOError as error:
             raise RuntimeError("this task's hot state is already in use") from error
 
+        if implicit_worktree_identity is not None:
+            revalidate_worktree_state_identity(
+                implicit_worktree_identity,
+                resident,
+                task,
+                common_git,
+                resident_git,
+                task_git,
+                resident_git_relative,
+                task_git_relative,
+            )
+
         cache_preparations = tuple(
             prepare_private_copy(spec, resident_cache, private)
             for spec, resident_cache, private in private_copy_candidates
@@ -1341,6 +1522,18 @@ def run(
         git_pointer = git_view_root / "pointer"
         git_pointer.write_text(f"gitdir: {stable_task_git}\n", encoding="utf-8")
         git_pointer.chmod(0o600)
+
+        if implicit_worktree_identity is not None:
+            revalidate_worktree_state_identity(
+                implicit_worktree_identity,
+                resident,
+                task,
+                common_git,
+                resident_git,
+                task_git,
+                resident_git_relative,
+                task_git_relative,
+            )
 
         environment = bound_environment or os.environ.copy()
         if runtime_bin is None:
