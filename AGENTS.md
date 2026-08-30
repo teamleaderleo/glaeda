@@ -46,6 +46,11 @@ Do not turn Glaeda into a new pipeline language, runner protocol, Kubernetes con
 - Compare complete agent loops: queue/task-known -> first useful command -> first relevant result -> final trustworthy result, plus fleet throughput and idle CPU/RAM/disk cost.
 - Separate optimization levers while benchmarking. Filesystem, VM backend, cache policy, test partitioning, and resource profile should change independently until evidence justifies composition.
 - Prefer hotness in this order unless measurements say otherwise: retain valuable trusted state; remove repeated semantic work; reuse exact completed work; overlap independent preparation; share immutable inputs; parallelize independent work; optimize storage/hot kernels; add hardware or paid burst capacity.
+- Treat the operating system as the default execution engine. Translate exact task intent into
+  mature kernel/filesystem/service-manager primitives, observe their effective state, and keep
+  Glaeda control code off the workload hot path where possible. Add a competing userspace
+  scheduler, cache, filesystem or lifecycle policy only when a complete-loop control demonstrates
+  a remaining gap under the stronger semantics it provides.
 
 ## Workspace bootstrap
 
