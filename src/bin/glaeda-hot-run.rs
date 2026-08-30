@@ -45,13 +45,16 @@ use glaeda::project_checkout_observation::{
 use rustix::{
     event::{PollFd, PollFlags, Timespec, poll},
     fd::OwnedFd,
-    fs::{Mode, OFlags, open as rustix_open, openat as rustix_openat},
+    fs::{
+        AtFlags, FileType, FlockOperation, Mode, OFlags, flock, fstat, mkdirat,
+        open as rustix_open, openat as rustix_openat, statat,
+    },
     io::{Errno, write as rustix_write},
     process::{
-        Pid, PidfdFlags, Signal, WaitOptions, getpgid, getpid, kill_process, kill_process_group,
-        pidfd_open, pidfd_send_signal, test_kill_process_group, waitpid,
+        Pid, PidfdFlags, Signal, WaitOptions, getgid, getpgid, getpid, getuid, kill_process,
+        kill_process_group, pidfd_open, pidfd_send_signal, test_kill_process_group, waitpid,
     },
-    thread::sched_getaffinity,
+    thread::{CpuSet, sched_getaffinity, sched_setaffinity},
 };
 #[cfg(target_os = "linux")]
 use serde::Serialize;
@@ -116,6 +119,9 @@ struct Cli {
     /// Place the command in one reviewed transient resource scope.
     #[arg(long, value_enum)]
     resource_profile: Option<ResourceProfile>,
+    /// Reserve and restrict one benchmark sample to this canonical CPU list.
+    #[arg(long, value_name = "LIST")]
+    cpu_set: Option<String>,
     /// Absolute executable or PATH-resolved command followed by its arguments.
     #[arg(last = true, required = true)]
     command: Vec<OsString>,
@@ -143,6 +149,182 @@ impl ResourceProfile {
             Self::BigRedBackground => BACKGROUND_SCOPE_PROPERTIES,
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn parse_cpu_set(value: &str, inherited: &CpuSet) -> Result<CpuSetRequest, String> {
+    if value.is_empty() || value.len() > 4096 {
+        return Err("CPU set must be a nonempty bounded canonical list".into());
+    }
+    let mut cpus = BTreeSet::new();
+    for component in value.split(',') {
+        if component.is_empty() {
+            return Err("CPU set is not a canonical list".into());
+        }
+        let fields = component.split('-').collect::<Vec<_>>();
+        let (first, last) = match fields.as_slice() {
+            [single] => {
+                let cpu = parse_cpu_id(single)?;
+                (cpu, cpu)
+            }
+            [first, last] => (parse_cpu_id(first)?, parse_cpu_id(last)?),
+            _ => return Err("CPU set is not a canonical list".into()),
+        };
+        if first > last {
+            return Err("CPU set range is descending".into());
+        }
+        for cpu in first..=last {
+            if !cpus.insert(cpu) {
+                return Err("CPU set contains duplicate or overlapping CPUs".into());
+            }
+        }
+    }
+    let cpus = cpus.into_iter().collect::<Vec<_>>();
+    let canonical = canonical_cpu_list(&cpus);
+    if value != canonical {
+        return Err(format!("CPU set is not canonical; use {canonical}"));
+    }
+    let mut mask = CpuSet::new();
+    for cpu in &cpus {
+        if !inherited.is_set(*cpu) {
+            return Err("CPU set includes a CPU outside the effective inherited affinity".into());
+        }
+        mask.set(*cpu);
+    }
+    Ok(CpuSetRequest {
+        cpus,
+        canonical,
+        mask,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn parse_cpu_id(value: &str) -> Result<usize, String> {
+    if value.is_empty()
+        || (value.len() > 1 && value.starts_with('0'))
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err("CPU set contains a noncanonical CPU identifier".into());
+    }
+    let cpu = value
+        .parse::<usize>()
+        .map_err(|_| "CPU set contains an invalid CPU identifier".to_owned())?;
+    if cpu >= CpuSet::MAX_CPU {
+        return Err("CPU set exceeds the supported kernel CPU mask".into());
+    }
+    Ok(cpu)
+}
+
+#[cfg(target_os = "linux")]
+fn canonical_cpu_list(cpus: &[usize]) -> String {
+    let mut ranges = Vec::new();
+    let mut index = 0;
+    while index < cpus.len() {
+        let first = cpus[index];
+        let mut last = first;
+        while index + 1 < cpus.len() && cpus[index + 1] == last + 1 {
+            index += 1;
+            last = cpus[index];
+        }
+        ranges.push(if first == last {
+            first.to_string()
+        } else {
+            format!("{first}-{last}")
+        });
+        index += 1;
+    }
+    ranges.join(",")
+}
+
+#[cfg(target_os = "linux")]
+fn acquire_cpu_grant(value: &str) -> Result<CpuGrant, String> {
+    let inherited =
+        sched_getaffinity(None).map_err(|_| "effective CPU affinity is unavailable".to_owned())?;
+    let request = parse_cpu_set(value, &inherited)?;
+    let runtime_path = env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| "XDG_RUNTIME_DIR is unavailable or not absolute".to_owned())?;
+    let runtime = rustix_open(
+        &runtime_path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|_| "XDG_RUNTIME_DIR cannot be opened safely".to_owned())?;
+    inspect_private_cpu_grant_directory(&runtime, "XDG_RUNTIME_DIR")?;
+    match mkdirat(&runtime, "glaeda-cpu-grants", Mode::from_raw_mode(0o700)) {
+        Ok(()) | Err(Errno::EXIST) => {}
+        Err(_) => return Err("CPU grant directory cannot be created".into()),
+    }
+    let directory = rustix_openat(
+        &runtime,
+        "glaeda-cpu-grants",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|_| "CPU grant directory cannot be opened safely".to_owned())?;
+    inspect_private_cpu_grant_directory(&directory, "CPU grant directory")?;
+    inspect_private_cpu_grant_directory(&runtime, "XDG_RUNTIME_DIR")?;
+
+    let mut locks = Vec::with_capacity(request.cpus.len());
+    for cpu in &request.cpus {
+        let name = format!("cpu-{cpu}.lock");
+        let lock = rustix_openat(
+            &directory,
+            name.as_str(),
+            OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+            Mode::from_raw_mode(0o600),
+        )
+        .map_err(|_| "CPU grant lock cannot be opened safely".to_owned())?;
+        inspect_private_cpu_grant_lock(&directory, &name, &lock)?;
+        match flock(&lock, FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => {}
+            Err(Errno::WOULDBLOCK) => return Err(format!("CPU {cpu} is already reserved")),
+            Err(_) => return Err("CPU grant lock cannot be acquired".into()),
+        }
+        inspect_private_cpu_grant_lock(&directory, &name, &lock)?;
+        locks.push(lock);
+    }
+    Ok(CpuGrant {
+        request,
+        _directory: directory,
+        _locks: locks,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn inspect_private_cpu_grant_directory(directory: &OwnedFd, subject: &str) -> Result<(), String> {
+    let stat = fstat(directory).map_err(|_| format!("{subject} cannot be inspected"))?;
+    if !FileType::from_raw_mode(stat.st_mode).is_dir()
+        || stat.st_uid != getuid().as_raw()
+        || stat.st_gid != getgid().as_raw()
+        || stat.st_mode & 0o7777 != 0o700
+    {
+        return Err(format!("{subject} is not a private current-user directory"));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn inspect_private_cpu_grant_lock(
+    directory: &OwnedFd,
+    name: &str,
+    lock: &OwnedFd,
+) -> Result<(), String> {
+    let held = fstat(lock).map_err(|_| "CPU grant lock cannot be inspected".to_owned())?;
+    let linked = statat(directory, name, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|_| "CPU grant lock cannot be rebound".to_owned())?;
+    if !FileType::from_raw_mode(held.st_mode).is_file()
+        || held.st_nlink != 1
+        || held.st_uid != getuid().as_raw()
+        || held.st_gid != getgid().as_raw()
+        || held.st_mode & 0o7777 != 0o600
+        || held.st_size != 0
+        || (held.st_dev, held.st_ino) != (linked.st_dev, linked.st_ino)
+    {
+        return Err("CPU grant lock is not one private stable empty file".into());
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -174,6 +356,7 @@ struct CommandResult {
     elapsed: Duration,
     timeout_seconds: Option<f64>,
     resource_profile: Option<&'static str>,
+    cpu_set: Option<String>,
     user_cpu_seconds: Option<f64>,
     system_cpu_seconds: Option<f64>,
     max_rss_kib: Option<u64>,
@@ -181,6 +364,35 @@ struct CommandResult {
     exit_code: i32,
     signal: Option<i32>,
     completion_reason: &'static str,
+}
+
+#[derive(Debug, Clone)]
+struct CpuSetRequest {
+    cpus: Vec<usize>,
+    canonical: String,
+    #[cfg(target_os = "linux")]
+    mask: CpuSet,
+}
+
+#[derive(Debug)]
+struct CommandExecution<'a> {
+    command: &'a [OsString],
+    cwd: &'a Path,
+    environment_path: Option<&'a OsStr>,
+    timeout: Option<Duration>,
+    timeout_seconds: Option<f64>,
+    resource_profile: Option<ResourceProfile>,
+    cpu_set: Option<&'a CpuSetRequest>,
+    cpu_lock_fds: &'a [i32],
+    measured: bool,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct CpuGrant {
+    request: CpuSetRequest,
+    _directory: OwnedFd,
+    _locks: Vec<OwnedFd>,
 }
 
 #[cfg(target_os = "linux")]
@@ -265,6 +477,35 @@ fn main() -> ExitCode {
 
 #[cfg(target_os = "linux")]
 fn run_resource_scope_entry(mut arguments: Vec<OsString>) -> Result<(), String> {
+    let cpu_set = if arguments.first().map(OsString::as_os_str) == Some(OsStr::new("--cpu-set")) {
+        if arguments.len() < 3 {
+            return Err("internal scope entry CPU set is missing".into());
+        }
+        arguments.remove(0);
+        let value = arguments.remove(0);
+        let value = value
+            .to_str()
+            .ok_or_else(|| "internal scope entry CPU set is invalid".to_owned())?;
+        let inherited = sched_getaffinity(None)
+            .map_err(|_| "internal scope entry affinity is unavailable".to_owned())?;
+        Some(parse_cpu_set(value, &inherited)?)
+    } else {
+        None
+    };
+    let mut cpu_lock_fds = Vec::new();
+    while arguments.first().map(OsString::as_os_str) == Some(OsStr::new("--cpu-lock-fd")) {
+        if arguments.len() < 3 {
+            return Err("internal scope entry CPU lock descriptor is missing".into());
+        }
+        arguments.remove(0);
+        let raw = arguments.remove(0);
+        let fd = raw
+            .to_str()
+            .and_then(|value| value.parse::<i32>().ok())
+            .filter(|fd| *fd > 2)
+            .ok_or_else(|| "internal scope entry CPU lock descriptor is invalid".to_owned())?;
+        cpu_lock_fds.push(fd);
+    }
     if arguments.first().map(OsString::as_os_str) != Some(OsStr::new("--")) {
         return Err("internal scope entry arguments are invalid".into());
     }
@@ -272,10 +513,40 @@ fn run_resource_scope_entry(mut arguments: Vec<OsString>) -> Result<(), String> 
     if arguments.is_empty() {
         return Err("internal scope entry command is missing".into());
     }
+    if let Some(cpu_set) = cpu_set.as_ref() {
+        if cpu_lock_fds.len() != cpu_set.cpus.len() {
+            return Err("internal scope entry CPU lock set is incomplete".into());
+        }
+        for (cpu, fd) in cpu_set.cpus.iter().zip(&cpu_lock_fds) {
+            inspect_inherited_cpu_grant_lock(*cpu, *fd)?;
+        }
+        sched_setaffinity(None, &cpu_set.mask)
+            .map_err(|_| "internal scope entry could not apply CPU affinity".to_owned())?;
+    }
     kill_process(getpid(), Signal::STOP)
         .map_err(|_| "internal scope entry could not stop before admission".to_owned())?;
     let error = Command::new(&arguments[0]).args(&arguments[1..]).exec();
     Err(format!("cannot enter admitted resource scope: {error}"))
+}
+
+#[cfg(target_os = "linux")]
+fn inspect_inherited_cpu_grant_lock(cpu: usize, fd: i32) -> Result<(), String> {
+    let descriptor = PathBuf::from(format!("/proc/self/fd/{fd}"));
+    let stat = fs::metadata(&descriptor)
+        .map_err(|_| "internal scope entry CPU lock descriptor is unavailable".to_owned())?;
+    let target = fs::read_link(&descriptor)
+        .map_err(|_| "internal scope entry CPU lock descriptor cannot be resolved".to_owned())?;
+    if !stat.file_type().is_file()
+        || stat.nlink() != 1
+        || stat.uid() != getuid().as_raw()
+        || stat.gid() != getgid().as_raw()
+        || stat.mode() & 0o7777 != 0o600
+        || stat.size() != 0
+        || target.file_name() != Some(OsStr::new(&format!("cpu-{cpu}.lock")))
+    {
+        return Err("internal scope entry CPU lock descriptor is unsafe".into());
+    }
+    Ok(())
 }
 
 fn run(cli: Cli) -> Result<i32, String> {
@@ -292,6 +563,9 @@ fn run(cli: Cli) -> Result<i32, String> {
     let timeout = timeout_seconds.map(validate_timeout).transpose()?;
     if cli.resource_profile.is_some() && timeout.is_none() {
         return Err("--resource-profile requires --timeout".into());
+    }
+    if cli.cpu_set.is_some() && cli.resource_profile.is_none() {
+        return Err("--cpu-set requires --resource-profile".into());
     }
     let runtime_declaration =
         parse_runtime_contract(cli.runtime_id.as_deref(), cli.runtime_sha256.as_deref())?;
@@ -338,6 +612,26 @@ fn run(cli: Cli) -> Result<i32, String> {
     )?;
 
     #[cfg(target_os = "linux")]
+    let cpu_grant = cli.cpu_set.as_deref().map(acquire_cpu_grant).transpose()?;
+    #[cfg(target_os = "linux")]
+    let cpu_set = cpu_grant.as_ref().map(|grant| &grant.request);
+    #[cfg(target_os = "linux")]
+    let cpu_lock_fds = cpu_grant
+        .as_ref()
+        .map(|grant| {
+            grant
+                ._locks
+                .iter()
+                .map(|lock| lock.as_raw_fd())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    #[cfg(not(target_os = "linux"))]
+    let cpu_set: Option<&CpuSetRequest> = None;
+    #[cfg(not(target_os = "linux"))]
+    let cpu_lock_fds = Vec::new();
+
+    #[cfg(target_os = "linux")]
     let native_target_before =
         if cli.measurement.is_some() && caches.iter().any(|cache| cache.path == "target") {
             let started = Instant::now();
@@ -350,15 +644,17 @@ fn run(cli: Cli) -> Result<i32, String> {
         };
 
     let machine_before = cli.measurement.as_ref().map(|_| observe_machine());
-    let result = execute_command(
-        &command,
-        &task_cwd,
-        bound_path.as_deref(),
+    let result = execute_command(CommandExecution {
+        command: &command,
+        cwd: &task_cwd,
+        environment_path: bound_path.as_deref(),
         timeout,
         timeout_seconds,
-        cli.resource_profile,
-        cli.measurement.is_some(),
-    )?;
+        resource_profile: cli.resource_profile,
+        cpu_set,
+        cpu_lock_fds: &cpu_lock_fds,
+        measured: cli.measurement.is_some(),
+    })?;
     if let Some(destination) = cli.measurement.as_ref() {
         let machine_after = observe_machine();
         #[cfg(target_os = "linux")]
@@ -1310,15 +1606,18 @@ fn abort_resource_scope_execution(
 }
 
 #[cfg(target_os = "linux")]
-fn execute_command(
-    command: &[OsString],
-    cwd: &Path,
-    environment_path: Option<&OsStr>,
-    timeout: Option<Duration>,
-    timeout_seconds: Option<f64>,
-    resource_profile: Option<ResourceProfile>,
-    measured: bool,
-) -> Result<CommandResult, String> {
+fn execute_command(execution: CommandExecution<'_>) -> Result<CommandResult, String> {
+    let CommandExecution {
+        command,
+        cwd,
+        environment_path,
+        timeout,
+        timeout_seconds,
+        resource_profile,
+        cpu_set,
+        cpu_lock_fds,
+        measured,
+    } = execution;
     let mut signal_control = timeout.map(|_| DeadlineSignalControl::new()).transpose()?;
     let systemd_run = resource_profile
         .map(|_| resolve_program(OsStr::new("/usr/bin/systemd-run"), cwd, None))
@@ -1357,17 +1656,31 @@ fn execute_command(
         command.to_vec()
     };
     if let Some(scope_entry) = resource_scope_entry.as_ref() {
-        arguments = [
-            vec![
-                scope_entry.proc_path().into_os_string(),
-                OsString::from(INTERNAL_SCOPE_ENTRY),
-                OsString::from("--"),
-            ],
-            arguments,
-        ]
-        .concat();
+        let mut entry = vec![
+            scope_entry.proc_path().into_os_string(),
+            OsString::from(INTERNAL_SCOPE_ENTRY),
+        ];
+        if let Some(cpu_set) = cpu_set {
+            entry.push(OsString::from("--cpu-set"));
+            entry.push(OsString::from(&cpu_set.canonical));
+        }
+        for fd in cpu_lock_fds {
+            entry.push(OsString::from("--cpu-lock-fd"));
+            entry.push(OsString::from(fd.to_string()));
+        }
+        entry.push(OsString::from("--"));
+        arguments = [entry, arguments].concat();
     }
     if let Some(systemd_run) = systemd_run {
+        let mut properties = resource_profile
+            .expect("profiled command has a resource profile")
+            .scope_properties()
+            .iter()
+            .map(|value| (*value).to_owned())
+            .collect::<Vec<_>>();
+        if let Some(cpu_set) = cpu_set {
+            properties.push(format!("AllowedCPUs={}", cpu_set.canonical));
+        }
         arguments = [
             vec![
                 systemd_run.into_os_string(),
@@ -1383,9 +1696,7 @@ fn execute_command(
                         .expect("profiled command has a resource scope unit"),
                 ),
             ],
-            resource_profile
-                .expect("profiled command has a resource profile")
-                .scope_properties()
+            properties
                 .iter()
                 .flat_map(|value| [OsString::from("--property"), OsString::from(value)])
                 .collect(),
@@ -1458,6 +1769,43 @@ fn execute_command(
         },
         None => None,
     };
+    if let Some(cpu_set) = cpu_set {
+        let observed = match sched_getaffinity(Some(child_pid)) {
+            Ok(observed) => observed,
+            Err(_) => {
+                if let Some(scope) = resource_scope.as_ref() {
+                    abort_resource_scope_execution(
+                        &mut child,
+                        child_pid,
+                        resource_scope_pidfd.as_ref(),
+                        scope,
+                    );
+                } else {
+                    abort_timed_child(&mut child, child_pid, resource_scope_pidfd.as_ref());
+                }
+                if let Some(path) = time_report.as_ref() {
+                    let _ = fs::remove_file(path);
+                }
+                return Err("admitted CPU affinity cannot be observed".into());
+            }
+        };
+        if observed != cpu_set.mask {
+            if let Some(scope) = resource_scope.as_ref() {
+                abort_resource_scope_execution(
+                    &mut child,
+                    child_pid,
+                    resource_scope_pidfd.as_ref(),
+                    scope,
+                );
+            } else {
+                abort_timed_child(&mut child, child_pid, resource_scope_pidfd.as_ref());
+            }
+            if let Some(path) = time_report.as_ref() {
+                let _ = fs::remove_file(path);
+            }
+            return Err("admitted CPU affinity does not match the reserved CPU set".into());
+        }
+    }
     if let Some(pidfd) = resource_scope_pidfd.as_ref()
         && let Err(error) = pidfd_send_signal(pidfd, Signal::CONT)
     {
@@ -1672,6 +2020,7 @@ fn execute_command(
         elapsed,
         timeout_seconds,
         resource_profile: resource_profile.map(ResourceProfile::as_str),
+        cpu_set: cpu_set.map(|request| request.canonical.clone()),
         user_cpu_seconds,
         system_cpu_seconds,
         max_rss_kib,
@@ -1683,15 +2032,7 @@ fn execute_command(
 }
 
 #[cfg(not(target_os = "linux"))]
-fn execute_command(
-    _command: &[OsString],
-    _cwd: &Path,
-    _environment_path: Option<&OsStr>,
-    _timeout: Option<Duration>,
-    _timeout_seconds: Option<f64>,
-    _resource_profile: Option<ResourceProfile>,
-    _measured: bool,
-) -> Result<CommandResult, String> {
+fn execute_command(_execution: CommandExecution<'_>) -> Result<CommandResult, String> {
     Err("native hot-run execution currently requires Linux".into())
 }
 
@@ -2031,6 +2372,7 @@ fn write_measurement(
         "comparison_key": comparison_key,
         "cross_worktree": false,
         "resource_profile": result.resource_profile,
+        "cpu_set": result.cpu_set,
         "machine_observation": {
             "scope": "host_aggregate",
             "before": observations.machine_before,
@@ -2215,11 +2557,53 @@ mod tests {
                 runtime_bin: None,
                 timeout: None,
                 resource_profile: Some(resource_profile),
+                cpu_set: None,
                 command: vec![OsString::from("/bin/true")],
             })
             .unwrap_err();
             assert_eq!(error, "--resource-profile requires --timeout");
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cpu_sets_require_a_resource_profile_before_host_observation() {
+        let error = run(Cli {
+            resident: PathBuf::from("/path/that/must/not/be/observed"),
+            task: PathBuf::from("/path/that/must/not/be/observed"),
+            cache: Vec::new(),
+            measurement: None,
+            comparison_key: None,
+            runtime_id: None,
+            runtime_sha256: None,
+            runtime_bin: None,
+            timeout: Some(1.0),
+            resource_profile: None,
+            cpu_set: Some("0".into()),
+            command: vec![OsString::from("/bin/true")],
+        })
+        .unwrap_err();
+        assert_eq!(error, "--cpu-set requires --resource-profile");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cpu_set_parser_binds_canonical_effective_cpus() {
+        let mut inherited = CpuSet::new();
+        for cpu in [0, 1, 2, 4, 7, 8] {
+            inherited.set(cpu);
+        }
+        let parsed = parse_cpu_set("0-2,4,7-8", &inherited).unwrap();
+        assert_eq!(parsed.cpus, [0, 1, 2, 4, 7, 8]);
+        assert_eq!(parsed.canonical, "0-2,4,7-8");
+        assert_eq!(parsed.mask.count(), 6);
+        for invalid in ["", "00", "0,0", "0-0", "2-1", "0-1,2", "0,,2"] {
+            assert!(
+                parse_cpu_set(invalid, &inherited).is_err(),
+                "accepted {invalid}"
+            );
+        }
+        assert!(parse_cpu_set("3", &inherited).is_err());
     }
 
     #[cfg(target_os = "linux")]
@@ -2327,6 +2711,7 @@ mod tests {
             runtime_bin: None,
             timeout: Some(3.0),
             resource_profile: None,
+            cpu_set: None,
             command: vec![
                 OsString::from("/bin/sh"),
                 OsString::from("-c"),
@@ -2359,6 +2744,7 @@ mod tests {
                 >= report["elapsed_seconds"].as_f64().unwrap()
         );
         assert_eq!(report["resource_accounting"], "gnu_time_command_tree");
+        assert_eq!(report["cpu_set"], Value::Null);
         assert_eq!(report["timeout_seconds"], 3.0);
         assert_eq!(report["exit_code"], 17);
         assert_eq!(report["signal"], Value::Null);
@@ -2387,6 +2773,7 @@ mod tests {
             runtime_bin: None,
             timeout: Some(3.0),
             resource_profile: None,
+            cpu_set: None,
             command: vec![
                 OsString::from("/bin/sh"),
                 OsString::from("-c"),
@@ -2430,6 +2817,7 @@ mod tests {
                 runtime_bin: None,
                 timeout: None,
                 resource_profile: None,
+                cpu_set: None,
                 command: vec![
                     OsString::from("/bin/sh"),
                     OsString::from("-c"),
@@ -2467,6 +2855,7 @@ mod tests {
             runtime_bin: None,
             timeout: Some(0.5),
             resource_profile: None,
+            cpu_set: None,
             command: vec![
                 OsString::from("/bin/sh"),
                 OsString::from("-c"),
@@ -2538,6 +2927,7 @@ mod tests {
             runtime_bin: Some(runtime_bin.clone()),
             timeout: None,
             resource_profile: None,
+            cpu_set: None,
             command: vec![OsString::from("runtime-tool")],
         })
         .unwrap_err();
@@ -2558,6 +2948,7 @@ mod tests {
             runtime_bin: Some(runtime_bin.clone()),
             timeout: None,
             resource_profile: None,
+            cpu_set: None,
             command: vec![OsString::from("runtime-tool")],
         })
         .unwrap();
@@ -2585,6 +2976,7 @@ mod tests {
             runtime_bin: Some(runtime_bin.clone()),
             timeout: None,
             resource_profile: None,
+            cpu_set: None,
             command: vec![OsString::from("/bin/true")],
         })
         .unwrap_err();

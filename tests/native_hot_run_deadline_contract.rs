@@ -1,6 +1,7 @@
 #![cfg(target_os = "linux")]
 
 use std::fs;
+use std::os::unix::process::ExitStatusExt as _;
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::thread;
@@ -8,6 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rustix::io::Errno;
 use rustix::process::{Pid, Signal, kill_process, kill_process_group, test_kill_process};
+use rustix::thread::{CpuSet, sched_getaffinity};
 use serde_json::Value;
 
 static HEAVY_SCOPE_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -247,6 +249,114 @@ fn background_profile_applies_exact_cpu_weight_and_receipt() {
     assert_eq!(report["exit_code"], 0);
     assert_eq!(report["completion_reason"], "exited");
 
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn cpu_grant_survives_launcher_crash_until_the_scoped_worker_exits() {
+    let _scope_guard = HEAVY_SCOPE_TEST_LOCK.lock().unwrap();
+    if !heavy_user_scope_is_available() {
+        return;
+    }
+    let inherited = sched_getaffinity(None).unwrap();
+    let cpu = (0..CpuSet::MAX_CPU)
+        .rev()
+        .find(|cpu| inherited.is_set(*cpu))
+        .expect("at least one effective CPU");
+    let cpu = cpu.to_string();
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "glaeda-native-hot-run-cpu-grant-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir(&directory).unwrap();
+    let worker_file = directory.join("worker.txt");
+    let python = format!(
+        "import os,time; open({:?},'w').write(str(os.getpid())+'\\n'+','.join(map(str,sorted(os.sched_getaffinity(0))))); time.sleep(1)",
+        worker_file.to_str().unwrap()
+    );
+    let repository = env!("CARGO_MANIFEST_DIR");
+    let mut wrapper = Command::new(env!("CARGO_BIN_EXE_glaeda-hot-run"))
+        .args([
+            "--resident",
+            repository,
+            "--task",
+            repository,
+            "--resource-profile",
+            "big-red-heavy",
+            "--cpu-set",
+            &cpu,
+            "--timeout",
+            "5",
+            "--",
+            "/usr/bin/python3",
+            "-c",
+            &python,
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_for_file(&worker_file, Duration::from_secs(3));
+    let worker = fs::read_to_string(&worker_file).unwrap();
+    let mut worker = worker.lines();
+    let worker_pid = worker.next().unwrap().parse::<i32>().unwrap();
+    assert_eq!(worker.next(), Some(cpu.as_str()));
+    assert_eq!(worker.next(), None);
+
+    wrapper.kill().unwrap();
+    let status = wrapper.wait().unwrap();
+    assert_eq!(status.signal(), Some(signal_hook::consts::signal::SIGKILL));
+
+    let overlap = Command::new(env!("CARGO_BIN_EXE_glaeda-hot-run"))
+        .args([
+            "--resident",
+            repository,
+            "--task",
+            repository,
+            "--resource-profile",
+            "big-red-heavy",
+            "--cpu-set",
+            &cpu,
+            "--timeout",
+            "3",
+            "--",
+            "/bin/true",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(overlap.status.code(), Some(2));
+    assert_eq!(
+        String::from_utf8(overlap.stderr).unwrap(),
+        format!("glaeda-hot-run error: CPU {cpu} is already reserved\n")
+    );
+
+    wait_for_process_absence(
+        Pid::from_raw(worker_pid).unwrap(),
+        Duration::from_secs(3),
+        "CPU-granted worker after launcher crash",
+    );
+    let reacquired = Command::new(env!("CARGO_BIN_EXE_glaeda-hot-run"))
+        .args([
+            "--resident",
+            repository,
+            "--task",
+            repository,
+            "--resource-profile",
+            "big-red-heavy",
+            "--cpu-set",
+            &cpu,
+            "--timeout",
+            "3",
+            "--",
+            "/bin/true",
+        ])
+        .status()
+        .unwrap();
+    assert!(reacquired.success());
     fs::remove_dir_all(directory).unwrap();
 }
 
