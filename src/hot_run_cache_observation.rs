@@ -277,6 +277,7 @@ pub fn observe_hot_run_cache(
 
     let mut global_objects = BTreeMap::new();
     let mut entries_seen = 0_u64;
+    let mut lock_discovery_entries_seen = 0_u64;
     let mut lock_candidates_seen = 0_usize;
     let mut states = Vec::with_capacity(names.len());
     for (state_ordinal, name) in names.iter().enumerate() {
@@ -311,12 +312,15 @@ pub fn observe_hot_run_cache(
         ) {
             return partial_or_error(&root, root_before, &names, error);
         }
-        let lock_candidates =
-            match expected_lock_identities(&state, root.snapshot.device, &mut lock_candidates_seen)
-            {
-                Ok(lock_candidates) => lock_candidates,
-                Err(error) => return partial_or_error(&root, root_before, &names, error),
-            };
+        let lock_candidates = match expected_lock_identities(
+            &state,
+            root.snapshot.device,
+            &mut lock_discovery_entries_seen,
+            &mut lock_candidates_seen,
+        ) {
+            Ok(lock_candidates) => lock_candidates,
+            Err(error) => return partial_or_error(&root, root_before, &names, error),
+        };
         state.revalidate()?;
         let rebound = match BoundDirectory::open_child(&root.fd, name.as_c_str()) {
             Ok(rebound) => rebound,
@@ -525,6 +529,7 @@ fn observe_directory(
 fn expected_lock_identities(
     state: &BoundDirectory,
     root_device: u64,
+    entries_seen: &mut u64,
     candidates_seen: &mut usize,
 ) -> Result<Vec<BoundLockFile>, HotRunCacheObservationError> {
     let mut identities = Vec::new();
@@ -538,7 +543,15 @@ fn expected_lock_identities(
     for entry in &mut entries {
         let entry = entry.map_err(read_error)?;
         let name = entry.file_name();
-        if !is_runtime_state_name(name.to_bytes()) {
+        let bytes = name.to_bytes();
+        if bytes == b"." || bytes == b".." {
+            continue;
+        }
+        *entries_seen = entries_seen.checked_add(1).ok_or_else(too_large)?;
+        if *entries_seen > MAX_HOT_RUN_CACHE_OBSERVATION_ENTRIES {
+            return Err(too_large());
+        }
+        if !is_runtime_state_name(bytes) {
             continue;
         }
         let first = rustix_fs::statat(state.fd.as_fd(), name, AtFlags::SYMLINK_NOFOLLOW)
@@ -1252,5 +1265,26 @@ mod tests {
 
         let error = observe_hot_run_cache(root.path()).expect_err("reject excess lock candidates");
         assert_eq!(error.kind(), HotRunCacheObservationErrorKind::TooLarge);
+    }
+
+    #[test]
+    fn secondary_lock_discovery_has_an_independent_entry_bound() {
+        let root = TempRoot::new();
+        let state_path = root.state('a');
+        fs::write(state_path.join("ordinary-entry"), b"").expect("create discovery fixture");
+        let state = super::BoundDirectory::open_root(&state_path).expect("bind state fixture");
+        let mut entries_seen = super::MAX_HOT_RUN_CACHE_OBSERVATION_ENTRIES;
+        let mut candidates_seen = 0;
+
+        let error = super::expected_lock_identities(
+            &state,
+            state.snapshot.device,
+            &mut entries_seen,
+            &mut candidates_seen,
+        )
+        .expect_err("reject excess secondary discovery work");
+
+        assert_eq!(error.kind(), HotRunCacheObservationErrorKind::TooLarge);
+        assert_eq!(candidates_seen, 0);
     }
 }

@@ -579,7 +579,8 @@ unsupported filesystem shapes. Logical bytes match GNU `du --apparent-size` sema
 directory entry sizes; allocated bytes sum unique per-state `st_blocks * 512`, including
 directories. The namespace root itself is excluded from the per-state aggregate. As with `du`,
 `st_blocks` is inode-reported allocation rather than unique backing usage when reflinks or
-block-level deduplication share extents.
+block-level deduplication share extents. The secondary runtime-lock discovery pass has its own
+2,000,000-entry work bound rather than relying on the first traversal's count.
 
 Protected OverlayFS work directories and nested special nodes produce a successful path-free
 schema-v2 `completeness: partial` observation after the top-level state set is revalidated. Its
