@@ -416,19 +416,111 @@ class HotRunTests(unittest.TestCase):
             self.skipTest("cargo is unavailable")
         self.assertEqual(resolve_program(["cargo"], ROOT)[0], os.path.abspath(cargo))
 
-    def test_default_state_is_stable_and_separates_tasks(self) -> None:
+    def test_default_state_binds_worktree_objects_cache_and_runtime(self) -> None:
         namespace = load_hot_run()
         default_state_root = namespace["default_state_root"]
         runtime_state_root = namespace["runtime_state_root"]
+        DirectoryObjectIdentity = namespace["DirectoryObjectIdentity"]
+        WorktreePointerIdentity = namespace["WorktreePointerIdentity"]
+        WorktreeStateIdentity = namespace["WorktreeStateIdentity"]
         RuntimeContract = namespace["RuntimeContract"]
         resident = Path("/tmp/resident")
         caches = namespace["parse_cache_specs"](["target:overlay"])
-        first = default_state_root(resident, Path("/tmp/task-a"), caches)
+        first_identity = WorktreeStateIdentity(
+            resident_root=DirectoryObjectIdentity(1, 10),
+            task_root=DirectoryObjectIdentity(1, 20),
+            common_git_directory=DirectoryObjectIdentity(1, 30),
+            resident_git_directory=DirectoryObjectIdentity(1, 40),
+            task_git_directory=DirectoryObjectIdentity(1, 50),
+            resident_git_pointer=WorktreePointerIdentity(1, 60, 0),
+            task_git_pointer=WorktreePointerIdentity(1, 70, 100),
+            resident_git_relative=Path("."),
+            task_git_relative=Path("worktrees/task-a"),
+        )
+        first = default_state_root(
+            resident,
+            Path("/tmp/task-a"),
+            caches,
+            first_identity,
+        )
         self.assertEqual(
-            first, default_state_root(resident, Path("/tmp/task-a"), caches)
+            first,
+            default_state_root(
+                resident,
+                Path("/tmp/task-a"),
+                caches,
+                first_identity,
+            ),
+        )
+        replacement_root = WorktreeStateIdentity(
+            **{
+                **first_identity.__dict__,
+                "task_root": DirectoryObjectIdentity(1, 21),
+            }
         )
         self.assertNotEqual(
-            first, default_state_root(resident, Path("/tmp/task-b"), caches)
+            first,
+            default_state_root(
+                resident,
+                Path("/tmp/task-a"),
+                caches,
+                replacement_root,
+            ),
+        )
+        replacement_git = WorktreeStateIdentity(
+            **{
+                **first_identity.__dict__,
+                "task_git_directory": DirectoryObjectIdentity(1, 51),
+            }
+        )
+        self.assertNotEqual(
+            first,
+            default_state_root(
+                resident,
+                Path("/tmp/task-a"),
+                caches,
+                replacement_git,
+            ),
+        )
+        replacement_resident_git = WorktreeStateIdentity(
+            **{
+                **first_identity.__dict__,
+                "resident_git_directory": DirectoryObjectIdentity(1, 41),
+            }
+        )
+        self.assertNotEqual(
+            first,
+            default_state_root(
+                resident,
+                Path("/tmp/task-a"),
+                caches,
+                replacement_resident_git,
+            ),
+        )
+        replacement_pointer = WorktreeStateIdentity(
+            **{
+                **first_identity.__dict__,
+                "task_git_pointer": WorktreePointerIdentity(1, 70, 101),
+            }
+        )
+        self.assertNotEqual(
+            first,
+            default_state_root(
+                resident,
+                Path("/tmp/task-a"),
+                caches,
+                replacement_pointer,
+            ),
+        )
+        other_cache = namespace["parse_cache_specs"](["target:private-copy"])
+        self.assertNotEqual(
+            first,
+            default_state_root(
+                resident,
+                Path("/tmp/task-a"),
+                other_cache,
+                first_identity,
+            ),
         )
         self.assertNotIn("resident", first.name)
         self.assertNotIn("task-a", first.name)
@@ -438,6 +530,113 @@ class HotRunTests(unittest.TestCase):
             runtime_state_root(first, node_22), runtime_state_root(first, node_24)
         )
         self.assertNotIn("node-22", runtime_state_root(first, node_22).name)
+
+    def test_worktree_state_revalidation_rejects_generation_drift(self) -> None:
+        namespace = load_hot_run()
+        observe = namespace["observe_worktree_state_identity"]
+        revalidate = namespace["revalidate_worktree_state_identity"]
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            resident = fixture / "resident"
+            task = fixture / "task"
+            common_git = fixture / "common-git"
+            task_git = common_git / "worktrees" / "task"
+            resident.mkdir()
+            task.mkdir()
+            common_git.mkdir()
+            task_git.mkdir(parents=True)
+            (resident / ".git").mkdir()
+            task_pointer = task / ".git"
+            task_pointer.write_text("gitdir: elsewhere\n", encoding="utf-8")
+            expected = observe(
+                resident,
+                task,
+                common_git,
+                common_git,
+                task_git,
+                Path("."),
+                Path("worktrees/task"),
+            )
+            task_pointer.unlink()
+            task_pointer.write_text("gitdir: elsewhere\n", encoding="utf-8")
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "worktree generation changed during hot-state preflight",
+            ):
+                revalidate(
+                    expected,
+                    resident,
+                    task,
+                    common_git,
+                    common_git,
+                    task_git,
+                    Path("."),
+                    Path("worktrees/task"),
+                )
+
+    @unittest.skipUnless(shutil.which("bwrap"), "bubblewrap is unavailable")
+    def test_bind_fd_pins_source_and_consumes_descriptor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            source = fixture / "source"
+            retired = fixture / "retired"
+            replacement = source
+            destination = fixture / "destination"
+            source.mkdir()
+            destination.mkdir()
+            (source / "generation").write_text("validated\n", encoding="utf-8")
+            descriptor = os.open(
+                source,
+                os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC,
+            )
+            try:
+                source.rename(retired)
+                replacement.mkdir()
+                (replacement / "generation").write_text(
+                    "replacement\n", encoding="utf-8"
+                )
+                result = subprocess.run(
+                    [
+                        os.path.abspath(shutil.which("bwrap") or "bwrap"),
+                        "--die-with-parent",
+                        "--dev-bind",
+                        "/",
+                        "/",
+                        "--ro-bind-fd",
+                        str(descriptor),
+                        os.fspath(destination),
+                        "--",
+                        "/usr/bin/python3",
+                        "-c",
+                        (
+                            "import pathlib, sys\n"
+                            "destination = pathlib.Path(sys.argv[1])\n"
+                            "descriptor_path = pathlib.Path(sys.argv[2])\n"
+                            "if destination.read_bytes() != b'validated\\n':\n"
+                            "    raise SystemExit(2)\n"
+                            "try:\n"
+                            "    descriptor_path.read_bytes()\n"
+                            "except OSError:\n"
+                            "    raise SystemExit(0)\n"
+                            "raise SystemExit(3)\n"
+                        ),
+                        os.fspath(destination / "generation"),
+                        f"/proc/self/fd/{descriptor}/generation",
+                    ],
+                    pass_fds=(descriptor,),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+            finally:
+                os.close(descriptor)
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+            self.assertEqual(result.stdout, b"")
+            self.assertEqual(
+                (replacement / "generation").read_text(encoding="utf-8"),
+                "replacement\n",
+            )
 
     def test_default_target_cache_uses_private_copy(self) -> None:
         namespace = load_hot_run()
@@ -534,6 +733,121 @@ class HotRunTests(unittest.TestCase):
             self.assertEqual(retained.disposition, "retained_state_unchanged")
             self.assertEqual(retained.tracked_path_count, 0)
             self.assertEqual((task / "matching").stat().st_mtime_ns, retained_mtime)
+
+    @unittest.skipUnless(shutil.which("bwrap"), "bubblewrap is unavailable")
+    def test_default_state_does_not_cross_same_path_worktree_generations(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            resident = fixture / "resident"
+            task = fixture / "task"
+            cache_home = fixture / "cache"
+            first_measurement = fixture / "first.json"
+            second_measurement = fixture / "second.json"
+            resident.mkdir()
+            subprocess.run(["git", "init", "--quiet"], cwd=resident, check=True)
+            (resident / "payload").write_text("resident\n", encoding="utf-8")
+            (resident / "examples").mkdir()
+            (resident / "examples" / "parent").write_text(
+                "resident parent\n", encoding="utf-8"
+            )
+            subprocess.run(
+                ["git", "add", "payload", "examples/parent"],
+                cwd=resident,
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Glaeda test",
+                    "-c",
+                    "user.email=glaeda-test@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "fixture",
+                ],
+                cwd=resident,
+                check=True,
+            )
+            environment = {**os.environ, "XDG_CACHE_HOME": os.fspath(cache_home)}
+
+            def add_task() -> None:
+                subprocess.run(
+                    [
+                        "git",
+                        "worktree",
+                        "add",
+                        "--quiet",
+                        "--detach",
+                        os.fspath(task),
+                    ],
+                    cwd=resident,
+                    check=True,
+                )
+
+            def run_task(
+                measurement: Path, command: str
+            ) -> subprocess.CompletedProcess[bytes]:
+                return subprocess.run(
+                    [
+                        os.fspath(HOT_RUN),
+                        "--resident",
+                        os.fspath(resident),
+                        "--task",
+                        os.fspath(task),
+                        "--cache",
+                        "examples:private-copy",
+                        "--measurement",
+                        os.fspath(measurement),
+                        "--",
+                        "/bin/sh",
+                        "-c",
+                        command,
+                    ],
+                    env=environment,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+
+            add_task()
+            first = run_task(
+                first_measurement,
+                "test ! -e examples/generation "
+                "&& printf first > examples/generation",
+            )
+            self.assertEqual(first.returncode, 0, first.stderr.decode())
+            subprocess.run(
+                ["git", "worktree", "remove", "--force", os.fspath(task)],
+                cwd=resident,
+                check=True,
+            )
+            add_task()
+            second = run_task(
+                second_measurement,
+                "test ! -e examples/generation",
+            )
+            self.assertEqual(second.returncode, 0, second.stderr.decode())
+
+            first_report = json.loads(first_measurement.read_text(encoding="utf-8"))
+            second_report = json.loads(
+                second_measurement.read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                first_report["state_preparation"][0]["disposition"], "seeded"
+            )
+            self.assertEqual(
+                second_report["state_preparation"][0]["disposition"], "seeded"
+            )
+            states = list((cache_home / "glaeda" / "hot-run").iterdir())
+            self.assertEqual(len(states), 2)
+            self.assertTrue(
+                all((state.stat().st_mode & 0o777) == 0o700 for state in states)
+            )
 
     @unittest.skipUnless(shutil.which("bwrap"), "bubblewrap is unavailable")
     def test_task_sees_stable_path_and_target_writes_stay_private(self) -> None:

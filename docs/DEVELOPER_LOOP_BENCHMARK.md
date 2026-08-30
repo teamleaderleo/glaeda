@@ -642,3 +642,33 @@ Raw aggregate JSON / GNU-time SHA-256 pairs:
 - fan-out 4 Glaeda ordinary B1/B2: `ef1c597c8f8076a87f5834296e4bd17ada8a8cb5a594ee1c935a65927cb8bb63` / `da455483cca1dc6ec9cb1403472d0bf7bd5f6df3f09fc995eacc940247588a0d`, `b6091157bf7e767bea4f2427300c8613e5c73cb9391ce206e387a9e0cd2ee82c` / `2d70f4abe45fdabc4cf4d64066a95dd853a8d46555015e0bc10f5694bf067772`;
 - fan-out 4 Glaeda reflink C1/C2: `e33adc1528fa40182e16d1c572912f63e5f4d54a6cccf623a3ab3b95853f3fdc` / `f5870a74f30b5727ec4ce903e2706d360ac27b45b988b16372c0a08a8416e3f1`, `bf0bad735baa4037ab3f9b8f51f2fe1e4ad3259cbaa922a3bad09a1c92afbda5` / `beb94e13c69ad79aeab398772c94b90beb694f9202f8c914322c393ae5ff4a7d`;
 - fan-out 8 sequential/Glaeda ordinary/Glaeda reflink: `c9b4f97e6c23c8037a89645eef02164617b3faf6e0cb1dd03ce0dfe6888ae116` / `52631d684e0bf6f36a5671b4a6be2dfe24ee96c850825f954574150abe15dc77`, `0556db8832354a6aa8b459fda382b005f4906e33b71e4963a8b2f09a7fd57973` / `a298dc61673c4d47f80016b9484041ac9e03211e9f02a88ab03f506bd598defd`, `ad977bfdaa04cb8f9402c6c970d44415c5fa3aae29803e6d17f39199b702af37` / `5de6dc03329b0f3bc68302db11e1b938782771dbd644987a7c15dc03c958ddcb`.
+
+## Default hot-state generation discriminator — 2026-08-30
+
+The same-path replacement control used a fixed linked-worktree pathname, the tiny
+`examples:private-copy` cache, a route-owned XDG cache, and one marker written only into generation
+A's private cache. Exact clean main `c31bf1066028df1ddccb2900ad041029e8becc6a` keyed default
+state only by paths and cache declarations. Generation A reported `seeded`; after removing it and
+recreating generation B at the identical pathname and commit, B printed `inherited`, reported
+`reused`, and performed zero preparation. Command-plus-preparation took 5.865 ms and 4.143 ms. This
+was stale cross-generation reuse, not a speed win.
+
+Exact clean candidate `f635771abaef36a2d932219d3611078eb09d2e1e` added physical
+worktree/Git-object identity and a stable linked-worktree pointer-file witness to the implicit
+lineage, then held the validated task, Git, and cache objects through bubblewrap's FD-bound mount
+interface. The backing filesystem immediately recycled the task `.git` file's device/inode
+(`66306:2884673`) across the two generations, while its ctime witness changed. Generation B printed
+`absent`; A and B both reported `seeded`, selected two distinct 0700 state roots, and took 5.243 ms
+and 5.388 ms command-plus-preparation. An immediate third B invocation printed B's `second` marker,
+reported `reused`, and took 5.727 ms with zero preparation. The discriminator therefore preserved
+same-generation reuse while replacing an invalid approximately 1.7 ms shortcut with a fresh
+private lineage. A deterministic bind-FD regression also atomically replaced the validated source
+pathname before bubblewrap consumed it and proved the held generation—not the replacement—was
+mounted, then proved the consumed descriptor was absent from the payload's `/proc/self/fd` view.
+Explicit `--state` remained outside lineage selection so callers can deliberately own a
+cross-generation lineage.
+
+Raw hot-run receipt SHA-256 digests:
+
+- exact-main control A/B: `84e8dcaaac372defc0b27a1c2a1d2c8145a09bdd44619c5447eee3a105226a27`, `aaa69dac28ba1bb4055a5f145e573b056ec58fb2f10863e388fed035dfbd1782`;
+- exact candidate A/B/B-reuse: `cc982bedb9a6b4b46a8f178a19b3171093b8bad337d764aba2fe67f2d882ae22`, `837d887235bff7cf125a4fc7c32ac01e1f9698157d5b3a127e8aec61e548337f`, `91de07cc575d42403a4f64bba926baddf89aacc671a41941e14df1617e6b5f2f`.
