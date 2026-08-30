@@ -212,14 +212,18 @@ descendant-bin binding without starting Python. The binary accepts only a task d
 named physical Git worktree and explicit `native` cache declarations. Its `--runtime-id`,
 `--runtime-sha256`, and `--runtime-bin` options preserve the contracts described below, including
 PATH-first descendant selection and preflight directory revalidation. On Linux, `--timeout`
-places the complete command tree in a private process group, observes its leader through a pidfd,
-and forwards operator SIGINT or SIGTERM to the group. A wall-clock deadline sends SIGTERM, allows a
-two-second exit grace, continues observing the group if its leader exits first, then escalates any
-remaining members to SIGKILL; the receipt records exit 124 and
-`deadline_exceeded`. It does not yet implement a resource profile, cross-worktree stable-path view,
-state preparation, or source-mtime seeding; those requests remain on `scripts/hot-run` rather than
-being silently weakened. This is still an observation-only ultra-trusted execution path. It grants
-no lease, cache, residency, validation, publication, or cleanup authority.
+places the command and ordinary descendants that remain in its private process group there, observes
+the leader through a pidfd, and forwards operator SIGINT or SIGTERM to the group. A wall-clock
+deadline sends SIGTERM, allows a two-second exit grace, continues observing the group if its leader
+exits first, then escalates any remaining members to SIGKILL; the receipt records exit 124 and
+`deadline_exceeded`.
+`--resource-profile big-red-heavy` places GNU time and the command inside the existing collected
+user-systemd scope with the exact 1,200% CPU, 8/12 GiB memory and 1,024-task limits described below.
+The profile and deadline compose without changing either contract. The binary does not yet
+implement a cross-worktree stable-path view, state preparation, or source-mtime seeding; those
+requests remain on `scripts/hot-run` rather than being silently weakened. This is still an
+observation-only ultra-trusted execution path. It grants no lease, cache, residency, validation,
+publication, or cleanup authority.
 
 `private` starts with an empty directory and retains the task's later writes without OverlayFS
 copy-up. `private-copy` atomically seeds that directory once from the warm resident parent with GNU
