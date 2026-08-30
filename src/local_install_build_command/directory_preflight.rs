@@ -189,7 +189,7 @@ impl RootEvidence {
                 .lineage
                 .iter()
                 .zip(&other.lineage)
-                .all(|(left, right)| left.same_as(right))
+                .all(|(left, right)| left.same_path_component_as(right))
             && self.root.same_as(&other.root)
     }
 }
@@ -265,6 +265,17 @@ impl PrivateMetadata {
             && self.changed_seconds == other.changed_seconds
             && self.changed_nanoseconds == other.changed_nanoseconds
     }
+
+    /// Directory contents and timestamps of lineage ancestors can change because unrelated jobs
+    /// create sibling entries. The entry identity, ownership, and permission class must remain
+    /// exact; the final build root is compared separately with the complete metadata record.
+    fn same_path_component_as(&self, other: &Self) -> bool {
+        self.device == other.device
+            && self.inode == other.inode
+            && self.uid == other.uid
+            && self.gid == other.gid
+            && self.mode == other.mode
+    }
 }
 
 fn snapshot(context: &LocalInstallBuildCommandContext) -> DirectorySnapshot {
@@ -313,11 +324,13 @@ fn open_build_root(path: &Path) -> Result<OpenBuildRoot, BuildRootObservation> {
         return Err(BuildRootObservation::Unsafe);
     }
 
-    let root = fs::open("/", DIRECTORY_FLAGS, Mode::empty())
-        .map_err(|_| BuildRootObservation::Unknown)?;
+    let root =
+        fs::open("/", DIRECTORY_FLAGS, Mode::empty()).map_err(|_| BuildRootObservation::Unknown)?;
     let mut current = File::from(root);
     let mut lineage = vec![PrivateMetadata::from_metadata(
-        &current.metadata().map_err(|_| BuildRootObservation::Unknown)?,
+        &current
+            .metadata()
+            .map_err(|_| BuildRootObservation::Unknown)?,
     )];
     for (index, component) in components.iter().enumerate() {
         let opened = match fs::openat(current.as_fd(), *component, DIRECTORY_FLAGS, Mode::empty()) {
@@ -577,7 +590,7 @@ mod tests {
         fn new(label: &str) -> Self {
             let sequence = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
             let container = std::env::temp_dir().join(format!(
-                "smolrunner-directory-preflight-{label}-{}-{sequence}",
+                "glaeda-directory-preflight-{label}-{}-{sequence}",
                 std::process::id()
             ));
             let build_root = container.join("build-root");
@@ -656,13 +669,22 @@ mod tests {
 
         assert!(!receipt.ready());
         assert!(receipt.repairable());
-        assert_eq!(receipt.work(), LocalInstallDerivedDirectoryDisposition::Missing);
-        assert_eq!(receipt.home(), LocalInstallDerivedDirectoryDisposition::Ready);
+        assert_eq!(
+            receipt.work(),
+            LocalInstallDerivedDirectoryDisposition::Missing
+        );
+        assert_eq!(
+            receipt.home(),
+            LocalInstallDerivedDirectoryDisposition::Ready
+        );
         assert_eq!(
             receipt.cargo_home(),
             LocalInstallDerivedDirectoryDisposition::Missing
         );
-        assert_eq!(receipt.target(), LocalInstallDerivedDirectoryDisposition::Ready);
+        assert_eq!(
+            receipt.target(),
+            LocalInstallDerivedDirectoryDisposition::Ready
+        );
         assert!(receipt.blocking_codes().is_empty());
         assert_eq!(
             receipt.repair_codes(),
@@ -691,7 +713,10 @@ mod tests {
                     .expect("widen work mode");
             }
             let receipt = observe_local_install_directory_preflight(&fixture.context());
-            assert_eq!(receipt.work(), LocalInstallDerivedDirectoryDisposition::Unsafe);
+            assert_eq!(
+                receipt.work(),
+                LocalInstallDerivedDirectoryDisposition::Unsafe
+            );
             assert_eq!(
                 receipt.blocking_codes(),
                 [LocalInstallDirectoryBlockingCode::WorkUnsafe]
@@ -740,7 +765,10 @@ mod tests {
             receipt.cargo_home(),
             receipt.target(),
         ] {
-            assert_eq!(disposition, LocalInstallDerivedDirectoryDisposition::Changed);
+            assert_eq!(
+                disposition,
+                LocalInstallDerivedDirectoryDisposition::Changed
+            );
         }
     }
 
@@ -752,6 +780,19 @@ mod tests {
         private.uid = geteuid().as_raw().saturating_add(1).max(1);
         assert_ne!(private.uid, geteuid().as_raw());
         assert!(!private_directory_is_ready(&private));
+    }
+
+    #[test]
+    fn unrelated_lineage_churn_does_not_change_the_exact_build_root() {
+        let fixture = TempBuildRoot::new("lineage-metadata");
+        let metadata = fs::metadata(&fixture.build_root).expect("build root metadata");
+        let before = PrivateMetadata::from_metadata(&metadata);
+        let mut after = before.clone();
+        after.links = after.links.saturating_add(1);
+        after.changed_nanoseconds = after.changed_nanoseconds.saturating_add(1);
+
+        assert!(before.same_path_component_as(&after));
+        assert!(!before.same_as(&after));
     }
 
     #[test]
