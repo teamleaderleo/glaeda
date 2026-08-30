@@ -765,7 +765,7 @@ fn inspect_open_directory(
                 && u64::from(mode) == u64::from(PRIVATE_DIRECTORY_MODE)
         }
         DirectoryExpectation::TrustedAncestor => {
-            trusted_ancestor_is_ready(stat.st_uid, stat.st_gid, mode, context)
+            trusted_ancestor_is_ready(stat.st_uid, stat.st_gid, u64::from(mode), context)
         }
     };
     if !metadata_ok {
@@ -846,7 +846,7 @@ fn trusted_owner(uid: u32, gid: u32, context: &LocalInstallCargoConfigPreflightC
 fn trusted_ancestor_is_ready(
     uid: u32,
     gid: u32,
-    mode: u32,
+    mode: u64,
     context: &LocalInstallCargoConfigPreflightContext,
 ) -> bool {
     trusted_owner(uid, gid, context)
