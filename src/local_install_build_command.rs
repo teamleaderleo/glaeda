@@ -7,19 +7,21 @@ use sha2::{Digest as _, Sha256};
 
 use crate::artifact::Sha256Digest;
 use crate::local_install_plan::{
-    LocalInstallBuildPlan, LocalInstallGenerationIdentity, LocalInstallPlatform,
+    LocalInstallBuildPlan, LocalInstallGenerationIdentity, LocalInstallIdentityGeneration,
+    LocalInstallPlatform,
 };
 use crate::process::CommandSpec;
 
-pub const LOCAL_INSTALL_BUILD_COMMAND_SCHEMA_VERSION: u8 = 2;
+pub const LOCAL_INSTALL_BUILD_COMMAND_SCHEMA_VERSION: u8 = 3;
 pub const LOCAL_INSTALL_BUILD_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 pub const MAX_LOCAL_INSTALL_BUILD_JOBS: u8 = 4;
 
-const COMMAND_IDENTITY_DOMAIN: &[u8] = b"smolrunner-local-install-build-command-v2\0";
+const SMOLRUNNER_COMMAND_IDENTITY_DOMAIN_V2: &[u8] = b"smolrunner-local-install-build-command-v2\0";
+const GLAEDA_COMMAND_IDENTITY_DOMAIN_V3: &[u8] = b"glaeda-local-install-build-command-v3\0";
 const CARGO_CONFIG_POLICY: &str = "isolated_cwd_and_cargo_home_config_free_v1";
 const MACOS_SYSTEM_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 const LINUX_SYSTEM_PATH: &str = "/usr/bin:/bin";
-const FIXED_ARGUMENT_POLICY: [&str; 9] = [
+const SMOLRUNNER_FIXED_ARGUMENT_POLICY_V2: [&str; 9] = [
     "build",
     "--manifest-path",
     "<private-source-manifest>",
@@ -28,6 +30,17 @@ const FIXED_ARGUMENT_POLICY: [&str; 9] = [
     "--release",
     "--bin",
     "smolrunner",
+    "--jobs",
+];
+const GLAEDA_FIXED_ARGUMENT_POLICY_V3: [&str; 9] = [
+    "build",
+    "--manifest-path",
+    "<private-source-manifest>",
+    "--locked",
+    "--offline",
+    "--release",
+    "--bin",
+    "glaeda",
     "--jobs",
 ];
 const ENVIRONMENT_KEYS: [&str; 11] = [
@@ -61,6 +74,7 @@ pub struct LocalInstallBuildCommandIdentity {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LocalInstallBuildCommandPolicy {
     pub schema_version: u8,
+    pub identity_generation: LocalInstallIdentityGeneration,
     pub identity: LocalInstallBuildCommandIdentity,
     pub source_digest: Sha256Digest,
     pub target_generation: u64,
@@ -78,7 +92,7 @@ pub struct LocalInstallBuildCommandPolicy {
 
 /// Private paths for one exact local self-build.
 ///
-/// Callers choose one exact source root, one SmolRunner-owned build root, and three exact toolchain
+/// Callers choose one exact source root, one Glaeda-owned build root, and three exact toolchain
 /// executables. The command derives `work`, `home`, `cargo-home`, and `target` below the build root.
 #[derive(Clone, PartialEq, Eq)]
 pub struct LocalInstallBuildCommandContext {
@@ -162,7 +176,7 @@ impl fmt::Debug for LocalInstallBuildCommandContext {
         formatter
             .debug_struct("LocalInstallBuildCommandContext")
             .field("source_root", &"<private exact source root>")
-            .field("build_root", &"<private SmolRunner build root>")
+            .field("build_root", &"<private Glaeda build root>")
             .field("cargo_program", &"<private reviewed toolchain executable>")
             .field("rustc_program", &"<private reviewed toolchain executable>")
             .field(
@@ -268,8 +282,13 @@ pub fn plan_local_install_build_command(
         ));
     }
 
+    let identity_generation = build.source.identity_generation();
     let system_path = system_path(platform);
     let policy = policy(build, platform, jobs, system_path)?;
+    let binary_name = match identity_generation {
+        LocalInstallIdentityGeneration::SmolrunnerV1 => "smolrunner",
+        LocalInstallIdentityGeneration::GlaedaV2 => "glaeda",
+    };
     let spec = CommandSpec::new(context.cargo_program.clone())
         .argument("build")
         .argument("--manifest-path")
@@ -278,7 +297,7 @@ pub fn plan_local_install_build_command(
         .argument("--offline")
         .argument("--release")
         .argument("--bin")
-        .argument("smolrunner")
+        .argument(binary_name)
         .argument("--jobs")
         .argument(jobs.to_string())
         .secret_environment("HOME", private_utf8(&context.isolated_home()))
@@ -311,8 +330,24 @@ fn policy(
     system_path: &'static str,
 ) -> Result<LocalInstallBuildCommandPolicy, LocalInstallBuildCommandError> {
     #[derive(Serialize)]
+    struct LegacyIdentityDocument<'a> {
+        schema_version: u8,
+        source_digest: &'a Sha256Digest,
+        target_generation: u64,
+        expected_predecessor: &'a Option<LocalInstallGenerationIdentity>,
+        platform: LocalInstallPlatform,
+        jobs: u8,
+        timeout_seconds: u64,
+        cargo_config_policy: &'static str,
+        system_path_policy: &'static str,
+        fixed_argument_policy: [&'static str; 9],
+        environment_keys: [&'static str; 11],
+        fixed_public_environment: [&'static str; 5],
+    }
+    #[derive(Serialize)]
     struct IdentityDocument<'a> {
         schema_version: u8,
+        identity_generation: LocalInstallIdentityGeneration,
         source_digest: &'a Sha256Digest,
         target_generation: u64,
         expected_predecessor: &'a Option<LocalInstallGenerationIdentity>,
@@ -327,25 +362,58 @@ fn policy(
     }
 
     let timeout_seconds = LOCAL_INSTALL_BUILD_TIMEOUT.as_secs();
-    let document = IdentityDocument {
-        schema_version: LOCAL_INSTALL_BUILD_COMMAND_SCHEMA_VERSION,
-        source_digest: build.source.digest(),
-        target_generation: build.target_generation,
-        expected_predecessor: &build.expected_predecessor,
-        platform,
-        jobs,
-        timeout_seconds,
-        cargo_config_policy: CARGO_CONFIG_POLICY,
-        system_path_policy: system_path,
-        fixed_argument_policy: FIXED_ARGUMENT_POLICY,
-        environment_keys: ENVIRONMENT_KEYS,
-        fixed_public_environment: FIXED_PUBLIC_ENVIRONMENT,
+    let identity_generation = build.source.identity_generation();
+    let (schema_version, fixed_argument_policy, digest) = match identity_generation {
+        LocalInstallIdentityGeneration::SmolrunnerV1 => {
+            let document = LegacyIdentityDocument {
+                schema_version: 2,
+                source_digest: build.source.digest(),
+                target_generation: build.target_generation,
+                expected_predecessor: &build.expected_predecessor,
+                platform,
+                jobs,
+                timeout_seconds,
+                cargo_config_policy: CARGO_CONFIG_POLICY,
+                system_path_policy: system_path,
+                fixed_argument_policy: SMOLRUNNER_FIXED_ARGUMENT_POLICY_V2,
+                environment_keys: ENVIRONMENT_KEYS,
+                fixed_public_environment: FIXED_PUBLIC_ENVIRONMENT,
+            };
+            let bytes = serde_json::to_vec(&document).map_err(|_| identity_encoding_failed())?;
+            (
+                2,
+                SMOLRUNNER_FIXED_ARGUMENT_POLICY_V2,
+                domain_digest(SMOLRUNNER_COMMAND_IDENTITY_DOMAIN_V2, &bytes)?,
+            )
+        }
+        LocalInstallIdentityGeneration::GlaedaV2 => {
+            let document = IdentityDocument {
+                schema_version: LOCAL_INSTALL_BUILD_COMMAND_SCHEMA_VERSION,
+                identity_generation,
+                source_digest: build.source.digest(),
+                target_generation: build.target_generation,
+                expected_predecessor: &build.expected_predecessor,
+                platform,
+                jobs,
+                timeout_seconds,
+                cargo_config_policy: CARGO_CONFIG_POLICY,
+                system_path_policy: system_path,
+                fixed_argument_policy: GLAEDA_FIXED_ARGUMENT_POLICY_V3,
+                environment_keys: ENVIRONMENT_KEYS,
+                fixed_public_environment: FIXED_PUBLIC_ENVIRONMENT,
+            };
+            let bytes = serde_json::to_vec(&document).map_err(|_| identity_encoding_failed())?;
+            (
+                LOCAL_INSTALL_BUILD_COMMAND_SCHEMA_VERSION,
+                GLAEDA_FIXED_ARGUMENT_POLICY_V3,
+                domain_digest(GLAEDA_COMMAND_IDENTITY_DOMAIN_V3, &bytes)?,
+            )
+        }
     };
-    let bytes = serde_json::to_vec(&document).map_err(|_| identity_encoding_failed())?;
-    let digest = domain_digest(&bytes)?;
 
     Ok(LocalInstallBuildCommandPolicy {
-        schema_version: LOCAL_INSTALL_BUILD_COMMAND_SCHEMA_VERSION,
+        schema_version,
+        identity_generation,
         identity: LocalInstallBuildCommandIdentity { digest },
         source_digest: build.source.digest().clone(),
         target_generation: build.target_generation,
@@ -355,7 +423,7 @@ fn policy(
         timeout_seconds,
         cargo_config_policy: CARGO_CONFIG_POLICY,
         system_path_policy: system_path,
-        fixed_argument_policy: FIXED_ARGUMENT_POLICY,
+        fixed_argument_policy,
         environment_keys: ENVIRONMENT_KEYS,
         fixed_public_environment: FIXED_PUBLIC_ENVIRONMENT,
     })
@@ -395,9 +463,12 @@ fn private_utf8(path: &Path) -> String {
         .to_owned()
 }
 
-fn domain_digest(bytes: &[u8]) -> Result<Sha256Digest, LocalInstallBuildCommandError> {
+fn domain_digest(
+    domain: &[u8],
+    bytes: &[u8],
+) -> Result<Sha256Digest, LocalInstallBuildCommandError> {
     let mut hasher = Sha256::new();
-    hasher.update(COMMAND_IDENTITY_DOMAIN);
+    hasher.update(domain);
     hasher.update(bytes);
     let digest = hasher.finalize();
     let mut value = String::with_capacity(SHA256_PREFIX.len() + digest.len() * 2);
@@ -457,6 +528,18 @@ mod tests {
         .expect("source")
     }
 
+    fn legacy_source(ch: char) -> LocalInstallSourceIdentity {
+        LocalInstallSourceIdentity::with_identity_generation(
+            LocalInstallIdentityGeneration::SmolrunnerV1,
+            CommitId::parse(&ch.to_string().repeat(40)).expect("commit"),
+            GitTreeId::parse(&ch.to_string().repeat(40)).expect("tree"),
+            digest(ch),
+            LocalInstallToolchainIdentity::parse("rust-1.97.1-aarch64-apple-darwin")
+                .expect("toolchain"),
+        )
+        .expect("legacy source")
+    }
+
     fn build(ch: char) -> LocalInstallBuildPlan {
         LocalInstallBuildPlan {
             target_generation: 2,
@@ -465,6 +548,17 @@ mod tests {
                 digest: digest('f'),
             }),
             source: source(ch),
+        }
+    }
+
+    fn legacy_build(ch: char) -> LocalInstallBuildPlan {
+        LocalInstallBuildPlan {
+            target_generation: 2,
+            expected_predecessor: Some(LocalInstallGenerationIdentity {
+                number: 1,
+                digest: digest('f'),
+            }),
+            source: legacy_source(ch),
         }
     }
 
@@ -497,7 +591,7 @@ mod tests {
                 "--offline".to_owned(),
                 "--release".to_owned(),
                 "--bin".to_owned(),
-                "smolrunner".to_owned(),
+                "glaeda".to_owned(),
                 "--jobs".to_owned(),
                 "3".to_owned(),
             ]
@@ -512,6 +606,50 @@ mod tests {
             command.spec().environment.get("CARGO_HOME"),
             Some(CommandValue::Secret(_))
         ));
+        assert_eq!(command.policy().schema_version, 3);
+        assert_eq!(
+            command.policy().identity_generation,
+            LocalInstallIdentityGeneration::GlaedaV2
+        );
+        assert_eq!(
+            command.policy().identity.digest.as_str(),
+            "sha256:d8d96eab451338dfe68deb20b32e97489cd9955ab3283a30bd01e64ef7bf57f0"
+        );
+        assert!(
+            !command
+                .spec()
+                .displayed_argv()
+                .iter()
+                .any(|value| value == "smolrunner")
+        );
+    }
+
+    #[test]
+    fn legacy_v2_command_vector_and_argv_remain_exact() {
+        let context = context("private-legacy");
+        let command = plan_local_install_build_command(
+            &legacy_build('a'),
+            LocalInstallPlatform::Macos,
+            &context,
+            3,
+        )
+        .expect("legacy command");
+
+        assert_eq!(command.policy().schema_version, 2);
+        assert_eq!(
+            command.policy().identity_generation,
+            LocalInstallIdentityGeneration::SmolrunnerV1
+        );
+        assert_eq!(
+            command.policy().identity.digest.as_str(),
+            "sha256:8c412bad61f7e435632b1ddfd93e09735c9c11585b1a805bb9de4b9837d51845"
+        );
+        assert_eq!(command.spec().displayed_argv()[8], "smolrunner");
+
+        let current =
+            plan_local_install_build_command(&build('a'), LocalInstallPlatform::Macos, &context, 3)
+                .expect("current command");
+        assert_ne!(command.policy().identity, current.policy().identity);
     }
 
     #[test]
