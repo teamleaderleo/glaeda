@@ -342,6 +342,7 @@ pub struct UnixLocalInstallGenerationStore {
 pub(crate) struct LocalInstallLauncherTarget {
     pub(crate) generation: InstalledLocalBinaryGeneration,
     pub(crate) path: PathBuf,
+    binary: OwnedFd,
 }
 
 /// Shared-lock target set retained across one launcher observation/publication operation.
@@ -372,6 +373,42 @@ impl fmt::Debug for LocalInstallLauncherTarget {
             .field("generation", &self.generation.identity)
             .field("path", &"<private-local-install-binary-path>")
             .finish()
+    }
+}
+
+impl LocalInstallLauncherTarget {
+    /// Prove that the absolute path embedded in a launcher still resolves to the retained,
+    /// fully verified generation binary. This deliberately repeats lexical resolution from the
+    /// filesystem root: retained store descriptors alone cannot prove what a later `execve` of
+    /// an absolute symlink target will reach after an ancestor namespace rebind.
+    pub(crate) fn verify_resolved_path(&self) -> Result<(), LocalInstallGenerationStoreError> {
+        let resolved = open_absolute_private_file(
+            &self.path,
+            (geteuid().as_raw(), getegid().as_raw()),
+            PRIVATE_BINARY_MODE,
+            "resolved launcher target",
+        )?;
+        let retained = inspect_private_file(
+            &self.binary,
+            (geteuid().as_raw(), getegid().as_raw()),
+            PRIVATE_BINARY_MODE,
+            None,
+            "retained launcher target",
+        )?;
+        let current = inspect_private_file(
+            &resolved,
+            (geteuid().as_raw(), getegid().as_raw()),
+            PRIVATE_BINARY_MODE,
+            None,
+            "resolved launcher target",
+        )?;
+        if !same_file_snapshot(&retained, &current) {
+            return Err(store_error(
+                LocalInstallGenerationStoreErrorKind::UnsafeFilesystem,
+                "the absolute launcher target no longer resolves to the verified generation",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -516,6 +553,7 @@ impl UnixLocalInstallGenerationStore {
     ) -> Result<LockedLocalInstallLauncherTargets, LocalInstallGenerationStoreError> {
         let guard = self.acquire_lock(StoreLockMode::Shared)?;
         self.verify_boundaries()?;
+        self.verify_absolute_launcher_root()?;
         if self.has_recovery_debt()? {
             return Err(store_error(
                 LocalInstallGenerationStoreErrorKind::RecoveryRequired,
@@ -541,16 +579,68 @@ impl UnixLocalInstallGenerationStore {
         generation: &InstalledLocalBinaryGeneration,
     ) -> Result<LocalInstallLauncherTarget, LocalInstallGenerationStoreError> {
         let name = generation_directory_name(&generation.identity)?;
-        // load_current_document_locked already reopened and fully verified every referenced
-        // generation. Build the fixed private target only after that proof has completed.
-        Ok(LocalInstallLauncherTarget {
+        let directory = fs::openat(&self.generations, &name, DIRECTORY_FLAGS, Mode::empty())
+            .map_err(|_| {
+                store_error(
+                    LocalInstallGenerationStoreErrorKind::RecoveryRequired,
+                    "a launcher generation could not be reopened safely",
+                )
+            })?;
+        inspect_directory(
+            &directory,
+            Some(self.owner),
+            true,
+            "launcher generation directory",
+        )?;
+        let (loaded, binary) =
+            self.open_complete_generation_directory(&directory, None, Some(&generation.identity))?;
+        verify_retained_directory(
+            &self.generations,
+            &name,
+            &directory,
+            self.owner,
+            "launcher generation directory",
+        )?;
+        if loaded.generation != *generation {
+            return Err(store_error(
+                LocalInstallGenerationStoreErrorKind::Conflict,
+                "the launcher generation changed after current-state verification",
+            ));
+        }
+        let target = LocalInstallLauncherTarget {
             generation: generation.clone(),
             path: self
                 .root_path
                 .join(GENERATIONS_DIRECTORY)
                 .join(name)
                 .join(BINARY_FILE),
-        })
+            binary,
+        };
+        target.verify_resolved_path()?;
+        Ok(target)
+    }
+
+    fn verify_absolute_launcher_root(&self) -> Result<(), LocalInstallGenerationStoreError> {
+        let current = open_absolute_directory(self.root_path.as_os_str())?;
+        let retained = inspect_directory(
+            &self.root,
+            Some(self.owner),
+            true,
+            "retained local-install store root",
+        )?;
+        let resolved = inspect_directory(
+            &current,
+            Some(self.owner),
+            true,
+            "resolved local-install store root",
+        )?;
+        if !same_object(&retained, &resolved) {
+            return Err(store_error(
+                LocalInstallGenerationStoreErrorKind::UnsafeFilesystem,
+                "the absolute local-install store path no longer reaches the retained root",
+            ));
+        }
+        Ok(())
     }
 
     /// Load only a clean, fully verified atomic current state.
@@ -1234,6 +1324,16 @@ impl UnixLocalInstallGenerationStore {
         expected_operation: Option<&LocalInstallStoreOperationId>,
         expected_identity: Option<&LocalInstallGenerationIdentity>,
     ) -> Result<LoadedGeneration, LocalInstallGenerationStoreError> {
+        self.open_complete_generation_directory(directory, expected_operation, expected_identity)
+            .map(|(loaded, _binary)| loaded)
+    }
+
+    fn open_complete_generation_directory(
+        &self,
+        directory: &OwnedFd,
+        expected_operation: Option<&LocalInstallStoreOperationId>,
+        expected_identity: Option<&LocalInstallGenerationIdentity>,
+    ) -> Result<(LoadedGeneration, OwnedFd), LocalInstallGenerationStoreError> {
         let entries = enumerate_names(
             directory,
             2,
@@ -1305,10 +1405,13 @@ impl UnixLocalInstallGenerationStore {
             PRIVATE_BINARY_MODE,
             "stored Glaeda binary",
         )?;
-        Ok(LoadedGeneration {
-            document_bytes,
-            ..loaded
-        })
+        Ok((
+            LoadedGeneration {
+                document_bytes,
+                ..loaded
+            },
+            binary,
+        ))
     }
 
     fn recover_locked(
@@ -2156,6 +2259,44 @@ fn open_absolute_directory(path: &OsStr) -> Result<OwnedFd, LocalInstallGenerati
         "local-install data path",
     )?;
     Ok(current)
+}
+
+fn open_absolute_private_file(
+    path: &Path,
+    owner: (u32, u32),
+    mode: Mode,
+    subject: &str,
+) -> Result<OwnedFd, LocalInstallGenerationStoreError> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::RootDir | Component::Normal(_)))
+    {
+        return Err(store_error(
+            LocalInstallGenerationStoreErrorKind::InvalidLocation,
+            format!("the {subject} path is invalid"),
+        ));
+    }
+    let parent = path.parent().ok_or_else(|| {
+        store_error(
+            LocalInstallGenerationStoreErrorKind::InvalidLocation,
+            format!("the {subject} parent is unavailable"),
+        )
+    })?;
+    let name = path.file_name().ok_or_else(|| {
+        store_error(
+            LocalInstallGenerationStoreErrorKind::InvalidLocation,
+            format!("the {subject} name is unavailable"),
+        )
+    })?;
+    if name != OsStr::new(BINARY_FILE) {
+        return Err(store_error(
+            LocalInstallGenerationStoreErrorKind::InvalidLocation,
+            format!("the {subject} name is invalid"),
+        ));
+    }
+    let directory = open_absolute_directory(parent.as_os_str())?;
+    open_existing_file(&directory, BINARY_FILE, owner, mode, subject)
 }
 
 fn open_or_create_store_root(

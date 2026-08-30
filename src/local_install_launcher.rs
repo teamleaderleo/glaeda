@@ -11,7 +11,7 @@ use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Component, Path, PathBuf};
 
-use rustix::fs::{self, AtFlags, FileType, FlockOperation, Mode, OFlags, RenameFlags};
+use rustix::fs::{self, AtFlags, FileType, FlockOperation, Mode, OFlags};
 use rustix::io::{Errno, fcntl_dupfd_cloexec};
 use rustix::process::{getegid, geteuid};
 use serde::Serialize;
@@ -153,7 +153,6 @@ impl LocalInstallLauncherObservationReceipt {
 pub enum LocalInstallLauncherPublishDisposition {
     Published,
     Replayed,
-    Recovered,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -258,9 +257,11 @@ pub fn observe_local_install_launchers(
 /// Publish or replay one exact planner-selected canonical launcher.
 ///
 /// The target must be an accepted or retained verified generation. The selected directory is
-/// re-observed under a nonblocking directory lock; publication uses same-directory no-replace or
-/// exchange rename. A leftover stage can be removed only when its target still maps to a verified
-/// generation.
+/// re-observed under a nonblocking directory lock. An absent launcher is created atomically with
+/// no-replace symlink semantics. Existing stages and stale launchers are recovery debt: POSIX has
+/// no compare-and-unlink or compare-and-exchange primitive that can prove a pathname still names
+/// the previously observed inode against a non-cooperating same-user writer, so this adapter never
+/// removes a stage or replaces an existing launcher.
 ///
 /// # Errors
 ///
@@ -351,68 +352,29 @@ fn publish_inner(
         ));
     }
     reject_protected(&locked)?;
-    let recovered = recover_stage(&directory, context.owner, targets.as_slice())?;
+    require_stage_absent(&directory)?;
     if owned_digest(&locked) == Some(&plan.target_generation.digest) {
+        // Replaying an exact launcher also closes the durability gap when a previous creator lost
+        // its receipt before the directory fsync completed.
+        sync_directory(&directory)?;
         return receipt(
             plan,
             rank,
             locked,
-            if recovered {
-                LocalInstallLauncherPublishDisposition::Recovered
-            } else {
-                LocalInstallLauncherPublishDisposition::Replayed
-            },
+            LocalInstallLauncherPublishDisposition::Replayed,
         );
     }
 
-    fs::symlinkat(&target.path, &directory, STAGED_LAUNCHER_NAME).map_err(|errno| {
-        if errno == Errno::EXIST {
-            error(
-                LocalInstallLauncherErrorKind::RecoveryRequired,
-                "a launcher stage appeared after recovery",
-            )
-        } else {
-            error(
-                LocalInstallLauncherErrorKind::Io,
-                "the launcher stage could not be created",
-            )
-        }
-    })?;
-    sync_directory(&directory)?;
-    maybe_fail(fault, FaultBoundary::StageSynchronized)?;
-    let staged = observe_entry(
-        &directory,
-        STAGED_LAUNCHER_NAME,
-        context.owner,
-        targets.as_slice(),
-    )?;
-    if owned_digest(&staged) != Some(&plan.target_generation.digest) {
-        return Err(error(
-            LocalInstallLauncherErrorKind::RecoveryRequired,
-            "the staged launcher does not name the requested generation",
-        ));
-    }
-    if observe_entry(&directory, LAUNCHER_NAME, context.owner, targets.as_slice())? != locked {
+    if matches!(locked, LauncherEntryDisposition::Owned { .. }) {
         return Err(error(
             LocalInstallLauncherErrorKind::Conflict,
-            "the launcher changed while publication was staged",
+            "a stale owned launcher requires explicit operator retirement",
         ));
     }
 
-    let replacing = matches!(locked, LauncherEntryDisposition::Owned { .. });
-    fs::renameat_with(
-        &directory,
-        STAGED_LAUNCHER_NAME,
-        &directory,
-        LAUNCHER_NAME,
-        if replacing {
-            RenameFlags::EXCHANGE
-        } else {
-            RenameFlags::NOREPLACE
-        },
-    )
-    .map_err(|errno| {
-        if matches!(errno, Errno::EXIST | Errno::NOENT) {
+    inject_foreign_launcher_before_create(&directory, fault)?;
+    fs::symlinkat(&target.path, &directory, LAUNCHER_NAME).map_err(|errno| {
+        if errno == Errno::EXIST {
             error(
                 LocalInstallLauncherErrorKind::Conflict,
                 "the launcher changed at the publication boundary",
@@ -420,7 +382,7 @@ fn publish_inner(
         } else {
             error(
                 LocalInstallLauncherErrorKind::Io,
-                "the launcher could not be switched atomically",
+                "the launcher could not be created atomically",
             )
         }
     })?;
@@ -433,23 +395,6 @@ fn publish_inner(
             "the published launcher does not name the requested generation",
         ));
     }
-    if replacing {
-        let predecessor = observe_entry(
-            &directory,
-            STAGED_LAUNCHER_NAME,
-            context.owner,
-            targets.as_slice(),
-        )?;
-        if predecessor != locked {
-            return Err(error(
-                LocalInstallLauncherErrorKind::RecoveryRequired,
-                "the exchanged predecessor launcher changed identity",
-            ));
-        }
-        unlink_owned_stage(&directory, &predecessor)?;
-        sync_directory(&directory)?;
-    }
-    maybe_fail(fault, FaultBoundary::CleanupFinished)?;
     receipt(
         plan,
         rank,
@@ -699,9 +644,31 @@ fn observe_entry(
     else {
         return Ok(LauncherEntryDisposition::Foreign);
     };
+    owned.verify_resolved_path().map_err(map_store_error)?;
+    let current = match fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(current) => current,
+        Err(_) => return Ok(LauncherEntryDisposition::Unknown),
+    };
+    if !same_entry_snapshot(&stat, &current) {
+        return Ok(LauncherEntryDisposition::Unknown);
+    }
     Ok(LauncherEntryDisposition::Owned {
         generation_digest: owned.generation.identity.digest.clone(),
     })
+}
+
+fn same_entry_snapshot(left: &rustix::fs::Stat, right: &rustix::fs::Stat) -> bool {
+    left.st_dev == right.st_dev
+        && left.st_ino == right.st_ino
+        && left.st_uid == right.st_uid
+        && left.st_gid == right.st_gid
+        && left.st_mode == right.st_mode
+        && left.st_nlink == right.st_nlink
+        && left.st_size == right.st_size
+        && left.st_mtime == right.st_mtime
+        && left.st_mtime_nsec == right.st_mtime_nsec
+        && left.st_ctime == right.st_ctime
+        && left.st_ctime_nsec == right.st_ctime_nsec
 }
 
 fn reject_protected(entry: &LauncherEntryDisposition) -> Result<(), LocalInstallLauncherError> {
@@ -726,42 +693,18 @@ fn owned_digest(entry: &LauncherEntryDisposition) -> Option<&Sha256Digest> {
     }
 }
 
-fn recover_stage(
-    directory: &OwnedFd,
-    owner: (u32, u32),
-    targets: &[LocalInstallLauncherTarget],
-) -> Result<bool, LocalInstallLauncherError> {
-    let stage = observe_entry(directory, STAGED_LAUNCHER_NAME, owner, targets)?;
-    match stage {
-        LauncherEntryDisposition::Absent => Ok(false),
-        LauncherEntryDisposition::Owned { .. } => {
-            unlink_owned_stage(directory, &stage)?;
-            sync_directory(directory)?;
-            Ok(true)
-        }
-        LauncherEntryDisposition::Foreign | LauncherEntryDisposition::Unknown => Err(error(
+fn require_stage_absent(directory: &OwnedFd) -> Result<(), LocalInstallLauncherError> {
+    match fs::statat(directory, STAGED_LAUNCHER_NAME, AtFlags::SYMLINK_NOFOLLOW) {
+        Err(Errno::NOENT) => Ok(()),
+        Ok(_) => Err(error(
             LocalInstallLauncherErrorKind::RecoveryRequired,
-            "the staged launcher is not bound to a verified generation",
+            "a staged launcher requires explicit operator recovery",
+        )),
+        Err(_) => Err(error(
+            LocalInstallLauncherErrorKind::RecoveryRequired,
+            "the staged launcher could not be classified without mutation",
         )),
     }
-}
-
-fn unlink_owned_stage(
-    directory: &OwnedFd,
-    stage: &LauncherEntryDisposition,
-) -> Result<(), LocalInstallLauncherError> {
-    if !matches!(stage, LauncherEntryDisposition::Owned { .. }) {
-        return Err(error(
-            LocalInstallLauncherErrorKind::RecoveryRequired,
-            "launcher cleanup lacks exact owned-stage evidence",
-        ));
-    }
-    fs::unlinkat(directory, STAGED_LAUNCHER_NAME, AtFlags::empty()).map_err(|_| {
-        error(
-            LocalInstallLauncherErrorKind::Io,
-            "the exact staged launcher could not be removed",
-        )
-    })
 }
 
 struct DirectoryLock(OwnedFd);
@@ -801,6 +744,31 @@ fn sync_directory(directory: impl AsFd) -> Result<(), LocalInstallLauncherError>
             "the launcher directory could not be synchronized",
         )
     })
+}
+
+fn inject_foreign_launcher_before_create(
+    _directory: &OwnedFd,
+    _fault: Option<FaultBoundary>,
+) -> Result<(), LocalInstallLauncherError> {
+    #[cfg(test)]
+    if _fault == Some(FaultBoundary::ForeignLauncherBeforeCreate) {
+        fs::openat(
+            _directory,
+            LAUNCHER_NAME,
+            OFlags::WRONLY
+                .union(OFlags::CREATE)
+                .union(OFlags::EXCL)
+                .union(OFlags::CLOEXEC),
+            Mode::RUSR.union(Mode::WUSR),
+        )
+        .map_err(|_| {
+            error(
+                LocalInstallLauncherErrorKind::InjectedFailure,
+                "the foreign-launcher race fixture could not be installed",
+            )
+        })?;
+    }
+    Ok(())
 }
 
 fn path_rank(path: &OsStr, candidate: &Path) -> Result<Option<u16>, LocalInstallLauncherError> {
@@ -861,9 +829,9 @@ const fn error(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FaultBoundary {
-    StageSynchronized,
     LauncherSynchronized,
-    CleanupFinished,
+    #[cfg(test)]
+    ForeignLauncherBeforeCreate,
 }
 
 fn maybe_fail(
@@ -1082,7 +1050,7 @@ mod tests {
     }
 
     #[test]
-    fn owned_stale_launcher_switches_to_verified_successor() {
+    fn stale_owned_launcher_is_never_replaced_by_basename() {
         let world = World::new("owned-stale");
         let first = world.publish_generation(None, 'a');
         let launcher = world.launcher_dir();
@@ -1091,15 +1059,21 @@ mod tests {
             .expect("publish first launcher");
         let old = std_fs::read_link(launcher.join(LAUNCHER_NAME)).expect("old target");
         let second = world.publish_generation(Some(first.identity.clone()), 'b');
-        publish_local_install_launcher(&world.store, &context, &plan(&second))
-            .expect("switch launcher");
-        let new = std_fs::read_link(launcher.join(LAUNCHER_NAME)).expect("new target");
-        assert_ne!(old, new);
+        assert_eq!(
+            publish_local_install_launcher(&world.store, &context, &plan(&second))
+                .expect_err("stale launcher blocked")
+                .kind(),
+            LocalInstallLauncherErrorKind::Conflict
+        );
+        assert_eq!(
+            std_fs::read_link(launcher.join(LAUNCHER_NAME)).expect("retained old target"),
+            old
+        );
         assert!(!launcher.join(STAGED_LAUNCHER_NAME).exists());
     }
 
     #[test]
-    fn foreign_entry_is_protected_before_staging() {
+    fn foreign_entry_is_protected_before_publication() {
         let world = World::new("foreign");
         let generation = world.publish_generation(None, 'a');
         let launcher = world.launcher_dir();
@@ -1230,8 +1204,8 @@ mod tests {
     }
 
     #[test]
-    fn stage_crash_recovers_only_verified_stage() {
-        let world = World::new("stage-crash");
+    fn receipt_crash_converges_by_exact_replay_without_a_stage() {
+        let world = World::new("receipt-crash");
         let generation = world.publish_generation(None, 'a');
         let launcher = world.launcher_dir();
         let context = world.context(&[&launcher]);
@@ -1240,45 +1214,43 @@ mod tests {
                 &world.store,
                 &context,
                 &plan(&generation),
-                Some(FaultBoundary::StageSynchronized),
-            )
-            .expect_err("injected failure")
-            .kind(),
-            LocalInstallLauncherErrorKind::InjectedFailure
-        );
-        assert!(launcher.join(STAGED_LAUNCHER_NAME).is_symlink());
-        publish_local_install_launcher(&world.store, &context, &plan(&generation))
-            .expect("recover and publish");
-        assert!(!launcher.join(STAGED_LAUNCHER_NAME).exists());
-    }
-
-    #[test]
-    fn exchange_crash_recovers_exact_predecessor_stage() {
-        let world = World::new("exchange-crash");
-        let first = world.publish_generation(None, 'a');
-        let launcher = world.launcher_dir();
-        let context = world.context(&[&launcher]);
-        publish_local_install_launcher(&world.store, &context, &plan(&first))
-            .expect("publish first");
-        let second = world.publish_generation(Some(first.identity.clone()), 'b');
-        assert_eq!(
-            publish_inner(
-                &world.store,
-                &context,
-                &plan(&second),
                 Some(FaultBoundary::LauncherSynchronized),
             )
             .expect_err("injected failure")
             .kind(),
             LocalInstallLauncherErrorKind::InjectedFailure
         );
-        assert!(launcher.join(STAGED_LAUNCHER_NAME).is_symlink());
+        assert!(launcher.join(LAUNCHER_NAME).is_symlink());
         assert_eq!(
-            publish_local_install_launcher(&world.store, &context, &plan(&second))
-                .expect("recover")
+            publish_local_install_launcher(&world.store, &context, &plan(&generation))
+                .expect("replay after lost receipt")
                 .disposition(),
-            LocalInstallLauncherPublishDisposition::Recovered
+            LocalInstallLauncherPublishDisposition::Replayed
         );
+        assert!(!launcher.join(STAGED_LAUNCHER_NAME).exists());
+    }
+
+    #[test]
+    fn final_create_race_never_replaces_foreign_launcher() {
+        let world = World::new("final-create-race");
+        let generation = world.publish_generation(None, 'a');
+        let launcher = world.launcher_dir();
+        let context = world.context(&[&launcher]);
+        assert_eq!(
+            publish_inner(
+                &world.store,
+                &context,
+                &plan(&generation),
+                Some(FaultBoundary::ForeignLauncherBeforeCreate),
+            )
+            .expect_err("foreign final-race winner blocked")
+            .kind(),
+            LocalInstallLauncherErrorKind::Conflict
+        );
+        let metadata = std_fs::symlink_metadata(launcher.join(LAUNCHER_NAME))
+            .expect("foreign launcher retained");
+        assert!(metadata.file_type().is_file());
+        assert_eq!(metadata.len(), 0);
         assert!(!launcher.join(STAGED_LAUNCHER_NAME).exists());
     }
 
@@ -1298,6 +1270,68 @@ mod tests {
         assert_eq!(
             std_fs::read_link(launcher.join(STAGED_LAUNCHER_NAME)).expect("stage retained"),
             PathBuf::from("/foreign/target")
+        );
+    }
+
+    #[test]
+    fn apparently_owned_stage_is_retained_for_explicit_recovery() {
+        let world = World::new("owned-stage");
+        let generation = world.publish_generation(None, 'a');
+        let launcher = world.launcher_dir();
+        let target = world
+            .store
+            .launcher_targets()
+            .expect("verified target")
+            .as_slice()[0]
+            .path
+            .clone();
+        symlink(&target, launcher.join(STAGED_LAUNCHER_NAME)).expect("owned-looking stage");
+        let context = world.context(&[&launcher]);
+        assert_eq!(
+            publish_local_install_launcher(&world.store, &context, &plan(&generation))
+                .expect_err("stage requires recovery")
+                .kind(),
+            LocalInstallLauncherErrorKind::RecoveryRequired
+        );
+        assert_eq!(
+            std_fs::read_link(launcher.join(STAGED_LAUNCHER_NAME)).expect("stage retained"),
+            target
+        );
+    }
+
+    #[test]
+    fn store_ancestor_rebind_cannot_publish_lexical_target() {
+        let world = World::new("store-ancestor-rebind");
+        let generation = world.publish_generation(None, 'a');
+        let launcher = world.launcher_dir();
+        let context = world.context(&[&launcher]);
+        publish_local_install_launcher(&world.store, &context, &plan(&generation))
+            .expect("publish before rebind");
+        let target = std_fs::read_link(launcher.join(LAUNCHER_NAME)).expect("original target");
+        let original = world.root.join("data-original");
+        std_fs::rename(world.root.join("data"), &original).expect("move retained data root");
+        std_fs::create_dir(world.root.join("data")).expect("replace data ancestor");
+        std_fs::set_permissions(
+            world.root.join("data"),
+            std_fs::Permissions::from_mode(0o700),
+        )
+        .expect("replacement mode");
+
+        assert_eq!(
+            observe_local_install_launchers(&world.store, &context)
+                .expect_err("rebound launcher is never reported owned")
+                .kind(),
+            LocalInstallLauncherErrorKind::GenerationStoreUnavailable
+        );
+        assert_eq!(
+            publish_local_install_launcher(&world.store, &context, &plan(&generation))
+                .expect_err("rebound absolute target blocked")
+                .kind(),
+            LocalInstallLauncherErrorKind::GenerationStoreUnavailable
+        );
+        assert_eq!(
+            std_fs::read_link(launcher.join(LAUNCHER_NAME)).expect("launcher left untouched"),
+            target
         );
     }
 
@@ -1435,7 +1469,7 @@ mod tests {
                 "authority": "performance_observation_only",
                 "samples_per_arm": SAMPLES,
                 "binary_bytes": BINARY_BYTES,
-                "semantic_validator": "every accepted launcher resolved to the exact descriptor-verified generation target; Glaeda also validated the store, approved PATH class, directory ownership/mode, symlink ownership and staged recovery shape",
+                "semantic_validator": "every accepted launcher resolved to the exact descriptor-verified generation target; Glaeda also validated the store, absolute target resolution, approved PATH class, directory ownership/mode, symlink ownership and no-replace publication shape",
                 "controls": {
                     "naive_direct_symlink_directory_fsync_validate": summary(naive),
                     "typical_stage_rename_directory_fsync_validate": summary(atomic),
