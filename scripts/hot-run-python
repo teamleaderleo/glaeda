@@ -1087,6 +1087,17 @@ def rust_tool_environment(
             environment[variable] = os.path.abspath(result.stdout.strip())
 
 
+def bind_cross_worktree_cache_environment(
+    resident: Path,
+    cache_specs: tuple[CacheSpec, ...],
+    environment: dict[str, str],
+) -> None:
+    """Keep nested Cargo executions inside the selected stable target view."""
+
+    if any(spec.path == Path("target") for spec in cache_specs):
+        environment["CARGO_TARGET_DIR"] = os.fspath(resident / "target")
+
+
 def write_measurement(
     destination: Path,
     elapsed_seconds: float,
@@ -1667,6 +1678,7 @@ def run(
         git_pointer.chmod(0o600)
 
         environment = bound_environment or os.environ.copy()
+        bind_cross_worktree_cache_environment(resident, cache_specs, environment)
         if runtime_bin is None:
             rust_tool_environment(task, resolved_command, environment)
 

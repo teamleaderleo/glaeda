@@ -233,6 +233,13 @@ never publishes the candidate directory. `overlay` starts from warmed resident b
 writes in a task-private upper; it remains useful when warm-start value exceeds copy-up cost. `ro`
 exposes suitable immutable prepared state without write authority.
 
+When a cross-worktree invocation selects the exact `target` cache path, `hot-run` also binds
+`CARGO_TARGET_DIR` to that stable in-view path. This includes Cargo launched indirectly by a shell,
+Makefile, or repository script and prevents an inherited caller override from bypassing the
+task-private view for an unrelated shared mutable target. Other cache-path names and same-worktree
+native execution retain the caller's environment; callers of a custom Cargo output path must bind
+that path explicitly.
+
 This prototype does not independently prove that the resident parent matches the task source or
 toolchain, or freeze a parent that another process is still mutating. Its ultra-trusted caller must
 supply the right quiesced resident generation and still run a real validator. The closed fan-out
