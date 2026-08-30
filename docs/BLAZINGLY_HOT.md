@@ -452,20 +452,29 @@ and peak RSS describe the workload rather than the `systemd-run` launcher. Force
 prevent descendants or the inner timer from reporting complete usage, so those three fields are
 explicitly `null` instead of fabricated on deadlines and operator interrupts.
 
-Heavy commands should also use `--timeout SECONDS`. The wall-clock deadline owns the whole command
-process group, first requests termination, escalates after a two-second grace period, returns the
-conventional status 124, and writes the failure receipt. It keeps observing the owned group when
-its leader exits before a descendant, so a signal-ignoring background child cannot escape the
-escalation. An operator interrupt similarly returns 130 without a Python traceback and records
-`operator_interrupt`. A timeout deliberately creates a separate process group; use the unbounded
-mode for commands that require interactive terminal job control.
+Heavy commands must also use `--timeout SECONDS`; the resource profile is rejected without that
+bounded settlement deadline. For an unprofiled command, the wall-clock
+deadline owns the whole command process group, first requests termination, escalates after a
+two-second grace period, returns the conventional status 124, and writes the failure receipt. It
+keeps observing the owned group when its leader exits before a descendant, so a signal-ignoring
+background child cannot escape the escalation. An operator interrupt similarly returns 130 without
+a Python traceback and records `operator_interrupt`. A timeout deliberately creates a separate
+process group; use the unbounded mode for commands that require interactive terminal job control.
 
 Heavy local work on the measured machine may opt into `--resource-profile big-red-heavy`. It uses
 one collected user systemd scope with a 1,200% CPU quota, 8 GiB memory-high threshold, 12 GiB hard
 memory ceiling, and 1,024-task ceiling. The explicitly machine-specific profile reflects big-red's
 12-way build point, which was within about 0.4% of 16-way Cargo while leaving interactive and
 multi-agent headroom. The profile is never applied to ordinary commands implicitly; an unscoped
-no-op avoided even the roughly 0.01-second scope cost.
+no-op avoided even the roughly 0.01-second scope cost. Glaeda generates the transient unit name and
+uses its exact currently running executable as an in-scope entry helper. The helper stops itself
+before executing the workload and is resumed through its pidfd only after Glaeda has opened the
+launched process's exact cgroup directory and `cgroup.kill` control by file descriptor. A deadline
+or interrupt first signals the ordinary process group; if escaped descendants remain after the
+two-second grace, Glaeda writes the held fd-bound kill control and waits for `cgroup.events` through
+the held directory before publishing the terminal result. Neither observation nor mutation reopens
+the generated unit name. A fast-exiting leader and a child that creates a new session therefore
+cannot skip or escape the resource-scope settlement check.
 
 The task and resident must be worktrees of the same Git repository. Direct same-worktree execution
 may declare `native` cache observations; all other explicit modes require the cross-worktree path.
