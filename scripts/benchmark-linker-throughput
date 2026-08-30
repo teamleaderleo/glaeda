@@ -1,0 +1,736 @@
+#!/usr/bin/env python3
+"""Measure exact Glaeda verification throughput across fixed linker/concurrency arms.
+
+This is an explicit local physical benchmark. It creates only one caller-selected private
+experiment root, writes one caller-selected path-free aggregate receipt, and never deletes either.
+It grants no verification reuse, linker selection, cache lifecycle, scheduling, or cleanup
+authority.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import platform
+import signal
+import shutil
+import stat
+import statistics
+import subprocess
+import sys
+import tempfile
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+
+SCHEMA_VERSION = 1
+BUILD_JOBS = 4
+WIDTHS = (1, 2, 4)
+LINKERS = ("gnu", "lld", "mold")
+FAST_PHASES = (
+    "unit-and-binary-tests",
+    "format",
+    "build-cli",
+    "doctor",
+    "plan-quarry",
+    "plan-glossless",
+    "host-plan-quarry",
+)
+BUILD_EXECUTABLES = {
+    "cargo",
+    "rustc",
+    "rustdoc",
+    "clang",
+    "clang-21",
+    "cc",
+    "ld",
+    "ld.lld",
+    "mold",
+}
+
+
+class BenchmarkError(RuntimeError):
+    """One bounded benchmark invariant failed."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+@dataclass(frozen=True)
+class SourceIdentity:
+    commit: str
+    tree: str
+
+
+@dataclass(frozen=True)
+class Worker:
+    process: subprocess.Popen[bytes]
+    receipt: Path
+    log: Path
+    target: Path
+
+
+def run_text(argv: list[str], *, cwd: Path, timeout: float = 10.0) -> str:
+    result = subprocess.run(
+        argv,
+        cwd=cwd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise BenchmarkError("capability_unavailable", "a required capability failed")
+    return result.stdout.strip()
+
+
+def repository_root() -> Path:
+    root = Path(__file__).resolve().parent.parent
+    observed = run_text(["/usr/bin/git", "rev-parse", "--show-toplevel"], cwd=root)
+    if Path(observed).resolve(strict=True) != root:
+        raise BenchmarkError("wrong_repository", "the benchmark is outside its repository root")
+    return root
+
+
+def source_identity(root: Path) -> SourceIdentity:
+    values = run_text(
+        ["/usr/bin/git", "rev-parse", "HEAD", "HEAD^{tree}"], cwd=root
+    ).splitlines()
+    if len(values) != 2 or any(len(value) != 40 for value in values):
+        raise BenchmarkError("source_identity", "the exact source identity is unavailable")
+    dirty = subprocess.run(
+        ["/usr/bin/git", "status", "--porcelain=v1", "--untracked-files=all"],
+        cwd=root,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if dirty.returncode != 0 or dirty.stdout:
+        raise BenchmarkError("dirty_source", "the benchmark source must be clean")
+    return SourceIdentity(*values)
+
+
+def first_line(argv: list[str], root: Path) -> str:
+    output = run_text(argv, cwd=root)
+    line = output.splitlines()[0] if output else ""
+    if not line or len(line.encode("utf-8")) > 256:
+        raise BenchmarkError("invalid_version", "a capability version is invalid")
+    return line
+
+
+def require_capabilities(root: Path) -> dict[str, str]:
+    expected = {
+        "git": "/usr/bin/git",
+        "python": sys.executable,
+        "cargo": shutil.which("cargo"),
+        "rustc": shutil.which("rustc"),
+        "clang": shutil.which("clang"),
+        "mold": shutil.which("mold"),
+        "gnu_ld": shutil.which("ld"),
+    }
+    if any(value is None or not Path(value).is_absolute() for value in expected.values()):
+        raise BenchmarkError("capability_unavailable", "a required capability is unavailable")
+    return {
+        "git": first_line([str(expected["git"]), "--version"], root),
+        "python": platform.python_version(),
+        "cargo": first_line([str(expected["cargo"]), "--version"], root),
+        "rustc": first_line([str(expected["rustc"]), "--version"], root),
+        "clang": first_line([str(expected["clang"]), "--version"], root),
+        "mold": first_line([str(expected["mold"]), "--version"], root),
+        "gnu_ld": first_line([str(expected["gnu_ld"]), "--version"], root),
+    }
+
+
+def ensure_external_new_path(root: Path, path: Path, label: str) -> Path:
+    absolute = path.absolute()
+    parent = absolute.parent.resolve(strict=True)
+    destination = parent / absolute.name
+    if destination.is_relative_to(root):
+        raise BenchmarkError("unsafe_path", f"{label} must be outside the source worktree")
+    if destination.exists() or destination.is_symlink():
+        raise BenchmarkError("path_exists", f"{label} already exists")
+    return destination
+
+
+def create_experiment_root(path: Path) -> None:
+    path.mkdir(mode=0o700)
+    for name in ("targets", "receipts", "logs"):
+        (path / name).mkdir(mode=0o700)
+
+
+def encoded_rustflags(linker: str) -> str | None:
+    if linker == "gnu":
+        return None
+    if linker not in {"lld", "mold"}:
+        raise BenchmarkError("invalid_linker", "the linker arm is invalid")
+    return "\x1f".join(("-Clinker=clang", f"-Clink-arg=-fuse-ld={linker}"))
+
+
+def worker_environment(target: Path, linker: str) -> dict[str, str]:
+    environment = os.environ.copy()
+    for name in (
+        "RUSTFLAGS",
+        "CARGO_ENCODED_RUSTFLAGS",
+        "RUSTC_WRAPPER",
+        "RUSTC_WORKSPACE_WRAPPER",
+        "CARGO_BUILD_RUSTC_WRAPPER",
+        "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+    ):
+        environment.pop(name, None)
+    environment["CARGO_BUILD_JOBS"] = str(BUILD_JOBS)
+    environment["CARGO_TARGET_DIR"] = os.fspath(target)
+    flags = encoded_rustflags(linker)
+    if flags is not None:
+        environment["CARGO_ENCODED_RUSTFLAGS"] = flags
+    return environment
+
+
+def process_table() -> dict[int, tuple[int, str, int]]:
+    observed: dict[int, tuple[int, str, int]] = {}
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            raw = (entry / "stat").read_text(encoding="utf-8")
+            fields = raw[raw.rfind(")") + 2 :].split()
+            parent = int(fields[1])
+            executable = (entry / "exe").resolve(strict=True).name
+            resident_pages = int((entry / "statm").read_text(encoding="ascii").split()[1])
+        except (FileNotFoundError, PermissionError, OSError, ValueError, IndexError):
+            continue
+        observed[int(entry.name)] = (parent, executable, resident_pages * page_size)
+    return observed
+
+
+def is_descendant(pid: int, roots: set[int], table: dict[int, tuple[int, str, int]]) -> bool:
+    seen: set[int] = set()
+    while pid > 1 and pid not in seen:
+        if pid in roots:
+            return True
+        seen.add(pid)
+        record = table.get(pid)
+        if record is None:
+            return False
+        pid = record[0]
+    return False
+
+
+def foreign_build_count(
+    roots: set[int], table: dict[int, tuple[int, str, int]] | None = None
+) -> int:
+    table = process_table() if table is None else table
+    return sum(
+        1
+        for pid, (_, executable, _) in table.items()
+        if executable in BUILD_EXECUTABLES and not is_descendant(pid, roots, table)
+    )
+
+
+def descendant_rss_kib(roots: set[int], table: dict[int, tuple[int, str, int]]) -> int:
+    return sum(
+        resident_bytes
+        for pid, (_, _, resident_bytes) in table.items()
+        if is_descendant(pid, roots, table)
+    ) // 1024
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return f"sha256:{digest.hexdigest()}"
+
+
+def load_receipt(
+    path: Path, source: SourceIdentity, expected_target: Path
+) -> dict[str, Any]:
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise BenchmarkError("invalid_receipt", "a worker receipt is unavailable") from error
+    if (
+        document.get("schema_version") != 1
+        or document.get("document_type") != "glaeda-local-verification-receipt"
+        or document.get("authority") != "performance_observation_only"
+        or document.get("profile") != "fast"
+    ):
+        raise BenchmarkError("invalid_receipt", "a worker receipt has the wrong contract")
+    source_doc = document.get("source")
+    result = document.get("result")
+    plan = document.get("plan")
+    environment = document.get("environment")
+    phases = document.get("phases")
+    if not all(isinstance(value, dict) for value in (source_doc, result, plan, environment)):
+        raise BenchmarkError("invalid_receipt", "a worker receipt is incomplete")
+    if (
+        source_doc.get("commit") != source.commit
+        or source_doc.get("tree") != source.tree
+        or source_doc.get("unchanged") is not True
+        or result.get("exit_code") != 0
+        or plan.get("declared_phase_count") != len(FAST_PHASES)
+        or plan.get("executed_phase_count") != len(FAST_PHASES)
+        or not isinstance(phases, list)
+        or tuple(value.get("name") for value in phases) != FAST_PHASES
+        or any(value.get("exit_code") != 0 for value in phases)
+    ):
+        raise BenchmarkError("invalid_receipt", "a worker receipt failed semantic validation")
+    cargo_jobs = environment.get("cargo_build_jobs")
+    cargo_target = environment.get("cargo_target")
+    if (
+        not isinstance(cargo_jobs, dict)
+        or cargo_jobs.get("source") != "configured"
+        or cargo_jobs.get("value") != BUILD_JOBS
+        or not isinstance(cargo_target, dict)
+        or cargo_target.get("source") != "configured"
+    ):
+        raise BenchmarkError("invalid_receipt", "a worker receipt lost its resource identity")
+    expected_identity = hashlib.sha256(b"glaeda-local-verification-path-v1\0")
+    expected_identity.update(os.fsencode(expected_target.resolve(strict=False)))
+    if cargo_target.get("identity_digest") != f"sha256:{expected_identity.hexdigest()}":
+        raise BenchmarkError("invalid_receipt", "a worker receipt names another target")
+    numeric = (
+        result.get("elapsed_seconds"),
+        result.get("child_user_cpu_seconds"),
+        result.get("child_system_cpu_seconds"),
+        result.get("process_lifetime_child_max_rss_kib"),
+    )
+    if any(not isinstance(value, (int, float)) or value < 0 for value in numeric):
+        raise BenchmarkError("invalid_receipt", "a worker receipt has invalid measurements")
+    return document
+
+
+def help_digest(target: Path, root: Path) -> str:
+    binary = target / "debug" / "glaeda"
+    result = subprocess.run(
+        [binary, "--help"],
+        cwd=root,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=10,
+        check=False,
+    )
+    if result.returncode != 0 or result.stderr or len(result.stdout) > 128 * 1024:
+        raise BenchmarkError("binary_validation", "a built CLI failed semantic validation")
+    return f"sha256:{hashlib.sha256(result.stdout).hexdigest()}"
+
+
+def target_stats(path: Path) -> dict[str, int]:
+    entries = 0
+    logical = 0
+    allocated = 0
+    for current, directories, files in os.walk(path, followlinks=False):
+        for name in [*directories, *files]:
+            candidate = Path(current) / name
+            metadata = candidate.lstat()
+            if stat.S_ISLNK(metadata.st_mode):
+                raise BenchmarkError("target_symlink", "a benchmark target contains a symlink")
+            entries += 1
+            logical += metadata.st_size
+            allocated += metadata.st_blocks * 512
+    return {"entries": entries, "logical_bytes": logical, "allocated_bytes": allocated}
+
+
+def summarize(values: list[float]) -> dict[str, float]:
+    ordered = sorted(values)
+    p90_index = max(0, (len(ordered) * 9 + 9) // 10 - 1)
+    return {
+        "minimum": ordered[0],
+        "median": statistics.median(ordered),
+        "p90": ordered[p90_index],
+        "maximum": ordered[-1],
+    }
+
+
+def stop_workers(workers: list[Worker]) -> None:
+    for worker in workers:
+        try:
+            os.killpg(worker.process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    deadline = time.monotonic() + 2.0
+    while any(worker.process.poll() is None for worker in workers) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    for worker in workers:
+        try:
+            os.killpg(worker.process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    for worker in workers:
+        try:
+            worker.process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def process_group_exists(group: int) -> bool:
+    try:
+        os.killpg(group, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def touch_source(path: Path, original: os.stat_result, last_ns: int) -> int:
+    now = max(time.time_ns(), last_ns + 1)
+    os.utime(path, ns=(original.st_atime_ns, now), follow_symlinks=False)
+    return now
+
+
+def run_batch(
+    *,
+    root: Path,
+    experiment: Path,
+    source: SourceIdentity,
+    linker: str,
+    width: int,
+    phase: str,
+    index: int,
+) -> dict[str, Any]:
+    if foreign_build_count(set()) != 0:
+        raise BenchmarkError("foreign_build_overlap", "another build is already active")
+    workers: list[Worker] = []
+    started = time.monotonic()
+    try:
+        for worker_index in range(width):
+            target = experiment / "targets" / linker / f"worker-{worker_index}"
+            target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            receipt = experiment / "receipts" / f"{phase}-{linker}-w{width}-{index}-{worker_index}.json"
+            log = experiment / "logs" / f"{phase}-{linker}-w{width}-{index}-{worker_index}.log"
+            with log.open("xb") as stream:
+                process = subprocess.Popen(
+                    [root / "scripts/verify", "fast", "--receipt", receipt],
+                    cwd=root,
+                    env=worker_environment(target, linker),
+                    stdin=subprocess.DEVNULL,
+                    stdout=stream,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+            workers.append(Worker(process, receipt, log, target))
+    except (OSError, subprocess.SubprocessError) as error:
+        stop_workers(workers)
+        raise BenchmarkError("worker_spawn", "a verification worker could not start") from error
+    roots = {worker.process.pid for worker in workers}
+    overlap = False
+    sampled_descendant_rss_peak_kib = 0
+    deadline = started + (180.0 if phase == "cold" else 90.0)
+    try:
+        while any(worker.process.poll() is None for worker in workers):
+            table = process_table()
+            if foreign_build_count(roots, table) != 0:
+                overlap = True
+            sampled_descendant_rss_peak_kib = max(
+                sampled_descendant_rss_peak_kib, descendant_rss_kib(roots, table)
+            )
+            if time.monotonic() >= deadline:
+                stop_workers(workers)
+                raise BenchmarkError("batch_timeout", "a verification batch exceeded its deadline")
+            time.sleep(0.05)
+    except BaseException:
+        stop_workers(workers)
+        raise
+    elapsed = time.monotonic() - started
+    if any(process_group_exists(worker.process.pid) for worker in workers):
+        stop_workers(workers)
+        raise BenchmarkError(
+            "unsettled_worker_group", "a verification worker left descendants running"
+        )
+    if overlap:
+        raise BenchmarkError("foreign_build_overlap", "another build overlapped the batch")
+    if any(worker.process.returncode != 0 for worker in workers):
+        raise BenchmarkError("worker_failed", "a verification worker failed")
+
+    observations = []
+    help_digests = []
+    for worker in workers:
+        receipt = load_receipt(worker.receipt, source, worker.target)
+        result = receipt["result"]
+        help_digests.append(help_digest(worker.target, root))
+        observations.append(
+            {
+                "receipt_sha256": sha256_file(worker.receipt),
+                "elapsed_seconds": result["elapsed_seconds"],
+                "child_cpu_seconds": round(
+                    result["child_user_cpu_seconds"] + result["child_system_cpu_seconds"], 6
+                ),
+                "waited_child_max_rss_kib": result["process_lifetime_child_max_rss_kib"],
+                "phase_seconds": {
+                    value["name"]: value["elapsed_seconds"] for value in receipt["phases"]
+                },
+            }
+        )
+    if len(set(help_digests)) != 1:
+        raise BenchmarkError("binary_validation", "worker CLI output differs within an arm")
+    return {
+        "phase": phase,
+        "linker": linker,
+        "width": width,
+        "index": index,
+        "batch_wall_seconds": round(elapsed, 9),
+        "completed_loops_per_second": round(width / elapsed, 9),
+        "child_cpu_seconds_sum": round(
+            sum(value["child_cpu_seconds"] for value in observations), 6
+        ),
+        "worst_waited_child_max_rss_kib": max(
+            value["waited_child_max_rss_kib"] for value in observations
+        ),
+        "sampled_descendant_rss_peak_kib": sampled_descendant_rss_peak_kib,
+        "help_sha256": help_digests[0],
+        "workers": observations,
+    }
+
+
+def machine_observation() -> dict[str, int | str]:
+    values: dict[str, int] = {}
+    for line in Path("/proc/meminfo").read_text(encoding="ascii").splitlines():
+        name, raw = line.split(":", 1)
+        if name in {"MemTotal", "MemAvailable", "SwapTotal", "SwapFree"}:
+            values[f"{name.lower()}_kib"] = int(raw.split()[0])
+    return {
+        "kernel": platform.release(),
+        "architecture": platform.machine(),
+        "logical_cpu_count": os.cpu_count() or 0,
+        "effective_cpu_count": len(os.sched_getaffinity(0)),
+        **values,
+    }
+
+
+def aggregate(
+    source: SourceIdentity,
+    tools: dict[str, str],
+    samples: int,
+    observations: list[dict[str, Any]],
+    cold_targets: dict[str, list[dict[str, int]]],
+    final_targets: dict[str, list[dict[str, int]]],
+    machine_before: dict[str, int | str],
+    machine_after: dict[str, int | str],
+) -> dict[str, Any]:
+    measured = [value for value in observations if value["phase"] == "measured"]
+    if len({value["help_sha256"] for value in observations}) != 1:
+        raise BenchmarkError("binary_validation", "CLI output differs across linker arms")
+    summaries: dict[str, Any] = {}
+    for linker in LINKERS:
+        for width in WIDTHS:
+            arm = [
+                value
+                for value in measured
+                if value["linker"] == linker and value["width"] == width
+            ]
+            if len(arm) != samples:
+                raise BenchmarkError("incomplete_matrix", "the measured matrix is incomplete")
+            summaries[f"{linker}_width_{width}"] = {
+                "batch_wall_seconds": summarize(
+                    [value["batch_wall_seconds"] for value in arm]
+                ),
+                "completed_loops_per_second": summarize(
+                    [value["completed_loops_per_second"] for value in arm]
+                ),
+                "child_cpu_seconds_sum": summarize(
+                    [value["child_cpu_seconds_sum"] for value in arm]
+                ),
+                "worst_waited_child_max_rss_kib": max(
+                    value["worst_waited_child_max_rss_kib"] for value in arm
+                ),
+                "sampled_descendant_rss_peak_kib": summarize(
+                    [value["sampled_descendant_rss_peak_kib"] for value in arm]
+                ),
+            }
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "document_type": "glaeda-linker-concurrency-benchmark-receipt",
+        "authority": "performance_observation_only",
+        "result": "succeeded",
+        "source": {"commit": source.commit, "tree": source.tree},
+        "plan": {
+            "issue": 951,
+            "profile": "fast",
+            "build_jobs_per_loop": BUILD_JOBS,
+            "widths": list(WIDTHS),
+            "linkers": list(LINKERS),
+            "cold_batches_per_linker": 1,
+            "warmups_per_arm": 1,
+            "measured_batches_per_arm": samples,
+            "forced_change": "mtime_only_same_tracked_rust_bytes",
+            "primary_gate": "width-4 median throughput >= 10% over GNU with no worse p90 wall",
+        },
+        "semantic_validator": {
+            "exact_source_and_tree": True,
+            "seven_green_fast_phases": True,
+            "source_unchanged": True,
+            "cli_help_equal_across_all_arms": True,
+            "foreign_build_overlap_observed": False,
+        },
+        "resource_semantics": {
+            "waited_child_rss": "per-worker process-lifetime maximum; not concurrent aggregate",
+            "sampled_descendant_rss": "50 ms /proc samples summed over harness-owned worker process trees; short-lived peaks may be missed",
+            "child_cpu": "sum of each worker receipt child user plus system CPU",
+        },
+        "tools": tools,
+        "machine_before": machine_before,
+        "machine_after": machine_after,
+        "cold_targets": cold_targets,
+        "final_targets": final_targets,
+        "summaries": summaries,
+        "observations": observations,
+    }
+
+
+def write_json(path: Path, document: dict[str, Any]) -> None:
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            delete=False,
+        ) as stream:
+            temporary = Path(stream.name)
+            os.fchmod(stream.fileno(), 0o600)
+            json.dump(document, stream, indent=2, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.link(temporary, path, follow_symlinks=False)
+        temporary.unlink()
+        temporary = None
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except OSError as error:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        raise BenchmarkError("receipt_write", "the aggregate receipt could not be written") from error
+
+
+def execute(experiment: Path, output: Path, samples: int) -> dict[str, Any]:
+    root = repository_root()
+    source = source_identity(root)
+    tools = require_capabilities(root)
+    create_experiment_root(experiment)
+    source_file = root / "src/lib.rs"
+    original = source_file.stat()
+    machine_before = machine_observation()
+    observations: list[dict[str, Any]] = []
+    cold_targets: dict[str, list[dict[str, int]]] = {}
+    last_ns = original.st_mtime_ns
+    try:
+        for index, linker in enumerate(LINKERS):
+            observations.append(
+                run_batch(
+                    root=root,
+                    experiment=experiment,
+                    source=source,
+                    linker=linker,
+                    width=4,
+                    phase="cold",
+                    index=index,
+                )
+            )
+            cold_targets[linker] = [
+                target_stats(experiment / "targets" / linker / f"worker-{worker}")
+                for worker in range(4)
+            ]
+
+        arms = [(linker, width) for linker in LINKERS for width in WIDTHS]
+        for index, (linker, width) in enumerate(arms):
+            last_ns = touch_source(source_file, original, last_ns)
+            observations.append(
+                run_batch(
+                    root=root,
+                    experiment=experiment,
+                    source=source,
+                    linker=linker,
+                    width=width,
+                    phase="warmup",
+                    index=index,
+                )
+            )
+        for round_index in range(samples):
+            offset = round_index % len(arms)
+            order = arms[offset:] + arms[:offset]
+            for order_index, (linker, width) in enumerate(order):
+                last_ns = touch_source(source_file, original, last_ns)
+                observations.append(
+                    run_batch(
+                        root=root,
+                        experiment=experiment,
+                        source=source,
+                        linker=linker,
+                        width=width,
+                        phase="measured",
+                        index=round_index * len(arms) + order_index,
+                    )
+                )
+    finally:
+        os.utime(
+            source_file,
+            ns=(original.st_atime_ns, original.st_mtime_ns),
+            follow_symlinks=False,
+        )
+    if source_identity(root) != source:
+        raise BenchmarkError("source_changed", "the exact source changed during the benchmark")
+    if foreign_build_count(set()) != 0:
+        raise BenchmarkError("foreign_build_overlap", "a build remained active after the matrix")
+    final_targets = {
+        linker: [
+            target_stats(experiment / "targets" / linker / f"worker-{worker}")
+            for worker in range(4)
+        ]
+        for linker in LINKERS
+    }
+    document = aggregate(
+        source,
+        tools,
+        samples,
+        observations,
+        cold_targets,
+        final_targets,
+        machine_before,
+        machine_observation(),
+    )
+    write_json(output, document)
+    return document
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--experiment-root", required=True, type=Path)
+    parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--samples", type=int, default=6)
+    arguments = parser.parse_args()
+    if not 1 <= arguments.samples <= 12:
+        parser.error("--samples must be between 1 and 12")
+    try:
+        root = repository_root()
+        experiment = ensure_external_new_path(
+            root, arguments.experiment_root, "experiment root"
+        )
+        output = ensure_external_new_path(root, arguments.output, "output")
+        if output.is_relative_to(experiment) or experiment.is_relative_to(output):
+            raise BenchmarkError("unsafe_path", "output and experiment root must be separate")
+        document = execute(experiment, output, arguments.samples)
+    except BenchmarkError as error:
+        print(f"linker benchmark error [{error.code}]: {error}", file=sys.stderr)
+        return 2
+    print(json.dumps(document["summaries"], indent=2, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
