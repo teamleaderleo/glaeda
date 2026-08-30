@@ -236,6 +236,32 @@ for before, after, their sum, and command-plus-observation wall time. The two sn
 atomic transaction. They are non-authoritative rebuild-value evidence only and grant no target
 currentness, compatibility, adoption, retention, cleanup or deletion authority.
 
+The first physical value experiment measured implementation `55ba51845b2d` / tree
+`08c66114c547` on 2026-08-30 with Rust/Cargo 1.97.1, 16 logical CPUs and four Cargo build jobs. Its
+fixed `resident-eligible-rust-edit-v1` workload ran 1,440 tests successfully, retained one ignored
+test, and excluded the same 16 host-fact tests on every accepted sample. Two genuinely absent-target
+cold runs and six retained-target warm runs per applicable arm used one command digest and one
+comparison key. Complete outer-wall medians were 45.295 seconds cold / 3.230 seconds warm for the
+direct local control, 3.225 seconds warm for exact-base `8d3bd6621608` `glaeda-hot-run`, and 43.985
+seconds cold / 3.355 seconds warm for value-aware Glaeda. The value-aware warm binding itself took
+119.697 milliseconds median (118.008--137.501 ms), making complete warm wall 130 milliseconds /
+4.03% above the exact-base wrapper; median CPU rose 140 milliseconds / 4.06%, while median outer
+RSS changed by -26 KiB. The retained target occupied about 1.895 GB allocated, and its Glaeda median
+cold-to-warm saving was 40.630 seconds / 92.37% / 13.11x. With only two cold observations per arm
+and overlapping ranges, the lower Glaeda cold median is not a cold-build speed claim.
+
+Both accepted Glaeda cold runs observed `target` absent before execution and a present generation
+afterward. Across the following six warm samples, every pre-command target ID exactly matched the
+preceding accepted post-command ID, while Cargo advanced the generation during each run. One prior
+Glaeda cold-plus-three-warm cycle was excluded from performance results after a separately owned
+full Cargo build was found to have overlapped it; its correctness evidence remained valid. The 58
+accepted raw receipt contents hash, in fixed experiment order, to
+`sha256:8095b442367f4f22fbdf2262a9d7cb7ef628b92f5b56874ffd89cc7be50be6ed`; the 12 excluded
+contents hash separately to `sha256:05ac245de86e2f2e70109605b49e02467a4ac84192fee22d9900fc3c459103ac`.
+The candidate/base binaries hash to `sha256:435f05167eae81a04c0c59aa939db61e7b1b6edc978acb38c4756fc22a2e9535`
+and `sha256:a3850298b071f311ba6bfe6c9bcf693874d5103f9ed69b9cc618f568eba2e2dd`; the semantic
+workload hashes to `sha256:0d886b3b1ec520168a8970939646d8a9ab117471521d13e2d7e5ef8f16cb09ff`.
+
 `private` starts with an empty directory and retains the task's later writes without OverlayFS
 copy-up. `private-copy` atomically seeds that directory once from the warm resident parent with GNU
 `cp --reflink=auto`, then reuses the private lineage on later invocations. The copy uses reflinks
