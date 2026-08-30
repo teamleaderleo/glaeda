@@ -232,6 +232,9 @@ pub mod local_install_cargo_config_preflight;
 /// Crash-safe private per-user publication of verified Glaeda binary generations.
 #[cfg(unix)]
 pub mod local_install_generation_store;
+/// Descriptor-bound observation and publication of the canonical local `glaeda` launcher.
+#[cfg(unix)]
+pub mod local_install_launcher;
 /// Pure exact-source local binary generation and stable launcher planning.
 pub mod local_install_plan;
 /// Read-only exact checkout and Cargo.lock proof for local self-builds.

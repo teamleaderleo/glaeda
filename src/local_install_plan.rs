@@ -579,7 +579,7 @@ pub fn complete_local_install_build(
     })
 }
 
-/// Plan only the stable `smol` launcher for one already-accepted or candidate generation.
+/// Plan only the stable canonical `glaeda` launcher for one accepted or candidate generation.
 ///
 /// The first existing launcher entry in PATH controls command resolution. A stale owned launcher at
 /// an earlier elevation-requiring location therefore produces an elevation barrier immediately;
@@ -604,14 +604,14 @@ pub fn plan_launcher_for_generation(
                 return Err(error(
                     LocalInstallPlanErrorKind::ForeignLauncher,
                     "foreign_launcher",
-                    "an earlier approved PATH location contains a foreign smol launcher",
+                    "an earlier approved PATH location contains a foreign glaeda launcher",
                 ));
             }
             LauncherEntryDisposition::Unknown => {
                 return Err(error(
                     LocalInstallPlanErrorKind::UnknownLauncher,
                     "unknown_launcher",
-                    "an earlier approved PATH location contains an unclassified smol launcher",
+                    "an earlier approved PATH location contains an unclassified glaeda launcher",
                 ));
             }
             LauncherEntryDisposition::Owned { generation_digest } => {

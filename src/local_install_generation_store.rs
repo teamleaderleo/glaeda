@@ -12,7 +12,7 @@ use std::io::{Read as _, Seek as _, Write as _};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::FileExt as _;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 use rustix::fs::{self, AtFlags, Dir, FileType, FlockOperation, Mode, OFlags, RenameFlags};
 use rustix::io::Errno;
@@ -333,8 +333,46 @@ pub struct UnixLocalInstallGenerationStore {
     generations: OwnedFd,
     staged: OwnedFd,
     lock: OwnedFd,
+    root_path: PathBuf,
     owner: (u32, u32),
     location: LocalInstallStoreLocationClass,
+}
+
+/// Crate-private descriptor-verified target for canonical launcher composition.
+pub(crate) struct LocalInstallLauncherTarget {
+    pub(crate) generation: InstalledLocalBinaryGeneration,
+    pub(crate) path: PathBuf,
+}
+
+/// Shared-lock target set retained across one launcher observation/publication operation.
+pub(crate) struct LockedLocalInstallLauncherTargets {
+    targets: Vec<LocalInstallLauncherTarget>,
+    _lock: StoreLock,
+}
+
+impl LockedLocalInstallLauncherTargets {
+    pub(crate) fn as_slice(&self) -> &[LocalInstallLauncherTarget] {
+        &self.targets
+    }
+}
+
+impl fmt::Debug for LockedLocalInstallLauncherTargets {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LockedLocalInstallLauncherTargets")
+            .field("targets", &self.targets)
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for LocalInstallLauncherTarget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LocalInstallLauncherTarget")
+            .field("generation", &self.generation.identity)
+            .field("path", &"<private-local-install-binary-path>")
+            .finish()
+    }
 }
 
 impl fmt::Debug for UnixLocalInstallGenerationStore {
@@ -349,11 +387,12 @@ impl fmt::Debug for UnixLocalInstallGenerationStore {
 
 impl UnixLocalInstallGenerationStore {
     #[cfg(test)]
-    fn open_for_test(parent: &Path) -> Result<Self, LocalInstallGenerationStoreError> {
+    pub(crate) fn open_for_test(parent: &Path) -> Result<Self, LocalInstallGenerationStoreError> {
         Self::open_beneath(
             open_absolute_directory(parent.as_os_str())?,
             &[LOCAL_INSTALL_DIRECTORY],
             LocalInstallStoreLocationClass::LinuxHomeDefault,
+            parent.join(LOCAL_INSTALL_DIRECTORY),
         )
     }
 
@@ -376,6 +415,9 @@ impl UnixLocalInstallGenerationStore {
                     base,
                     &[GLAEDA_DIRECTORY, LOCAL_INSTALL_DIRECTORY],
                     LocalInstallStoreLocationClass::LinuxXdgDataHome,
+                    PathBuf::from(xdg)
+                        .join(GLAEDA_DIRECTORY)
+                        .join(LOCAL_INSTALL_DIRECTORY),
                 );
             }
             let home = home.ok_or_else(|| {
@@ -389,6 +431,11 @@ impl UnixLocalInstallGenerationStore {
                 base,
                 &[".local", "share", GLAEDA_DIRECTORY, LOCAL_INSTALL_DIRECTORY],
                 LocalInstallStoreLocationClass::LinuxHomeDefault,
+                PathBuf::from(home)
+                    .join(".local")
+                    .join("share")
+                    .join(GLAEDA_DIRECTORY)
+                    .join(LOCAL_INSTALL_DIRECTORY),
             );
         }
         #[cfg(target_os = "macos")]
@@ -409,6 +456,11 @@ impl UnixLocalInstallGenerationStore {
                     LOCAL_INSTALL_DIRECTORY,
                 ],
                 LocalInstallStoreLocationClass::MacosApplicationSupport,
+                PathBuf::from(home)
+                    .join("Library")
+                    .join("Application Support")
+                    .join(GLAEDA_DIRECTORY)
+                    .join(LOCAL_INSTALL_DIRECTORY),
             );
         }
         #[allow(unreachable_code)]
@@ -422,6 +474,7 @@ impl UnixLocalInstallGenerationStore {
         mut parent: OwnedFd,
         components: &[&str],
         location: LocalInstallStoreLocationClass,
+        root_path: PathBuf,
     ) -> Result<Self, LocalInstallGenerationStoreError> {
         let owner = (geteuid().as_raw(), getegid().as_raw());
         let (root_name, parents) = components.split_last().ok_or_else(|| {
@@ -447,8 +500,56 @@ impl UnixLocalInstallGenerationStore {
             generations,
             staged,
             lock,
+            root_path,
             owner,
             location,
+        })
+    }
+
+    /// Return only the accepted and retained binary targets after a complete shared-lock load.
+    ///
+    /// The paths remain crate-private and are intended solely for the fixed launcher publisher.
+    /// The returned generations have already passed canonical document, ownership, mode, link,
+    /// byte-length and SHA-256 verification. Recovery debt fails before any target is returned.
+    pub(crate) fn launcher_targets(
+        &self,
+    ) -> Result<LockedLocalInstallLauncherTargets, LocalInstallGenerationStoreError> {
+        let guard = self.acquire_lock(StoreLockMode::Shared)?;
+        self.verify_boundaries()?;
+        if self.has_recovery_debt()? {
+            return Err(store_error(
+                LocalInstallGenerationStoreErrorKind::RecoveryRequired,
+                "the local-install generation store requires writer recovery",
+            ));
+        }
+        let current = self.load_current_document_locked()?;
+        let mut targets = Vec::with_capacity(2);
+        if let Some(accepted) = current.snapshot.state().accepted.as_ref() {
+            targets.push(self.launcher_target(accepted)?);
+        }
+        if let Some(retained) = current.snapshot.state().retained.first() {
+            targets.push(self.launcher_target(retained)?);
+        }
+        Ok(LockedLocalInstallLauncherTargets {
+            targets,
+            _lock: guard,
+        })
+    }
+
+    fn launcher_target(
+        &self,
+        generation: &InstalledLocalBinaryGeneration,
+    ) -> Result<LocalInstallLauncherTarget, LocalInstallGenerationStoreError> {
+        let name = generation_directory_name(&generation.identity)?;
+        // load_current_document_locked already reopened and fully verified every referenced
+        // generation. Build the fixed private target only after that proof has completed.
+        Ok(LocalInstallLauncherTarget {
+            generation: generation.clone(),
+            path: self
+                .root_path
+                .join(GENERATIONS_DIRECTORY)
+                .join(name)
+                .join(BINARY_FILE),
         })
     }
 
