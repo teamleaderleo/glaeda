@@ -9,8 +9,9 @@ use std::ffi::OsStr;
 use std::fmt;
 use std::fs::File;
 use std::io::{Read as _, Seek as _, Write as _};
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::fs::FileExt as _;
 use std::path::{Component, Path};
 
 use rustix::fs::{self, AtFlags, Dir, FileType, FlockOperation, Mode, OFlags, RenameFlags};
@@ -30,12 +31,18 @@ pub const LOCAL_INSTALL_GENERATION_STORE_SCHEMA_VERSION: u8 = 1;
 pub const MAX_LOCAL_INSTALL_GENERATION_DOCUMENT_BYTES: usize = 16 * 1024;
 pub const MAX_LOCAL_INSTALL_CURRENT_DOCUMENT_BYTES: usize = 4 * 1024;
 pub const MAX_LOCAL_INSTALL_BINARY_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_LOCAL_INSTALL_STORE_IDENTITY_BYTES: usize = 1024;
 
 #[cfg(target_os = "linux")]
 const GLAEDA_DIRECTORY: &str = "glaeda";
 #[cfg(target_os = "macos")]
 const GLAEDA_DIRECTORY: &str = "Glaeda";
 const LOCAL_INSTALL_DIRECTORY: &str = "local-install";
+const STORE_IDENTITY_FILE: &str = "store.identity.json";
+const INITIALIZATION_STAGE_PREFIX: &str = ".local-install.init-";
+const INITIALIZATION_RANDOM_BYTES: usize = 16;
+const INITIALIZATION_CREATE_ATTEMPTS: usize = 4;
+const SYSTEM_RANDOM_SOURCE: &str = "/dev/urandom";
 const LOCK_FILE: &str = "lock";
 const CURRENT_FILE: &str = "current";
 const CURRENT_NEXT_FILE: &str = "current.next";
@@ -79,7 +86,7 @@ pub enum LocalInstallStoreGeneration {
 }
 
 /// Public class of the automatically selected private user-data location.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LocalInstallStoreLocationClass {
     LinuxXdgDataHome,
@@ -322,6 +329,7 @@ impl std::error::Error for LocalInstallGenerationStoreError {}
 pub struct UnixLocalInstallGenerationStore {
     root_parent: OwnedFd,
     root: OwnedFd,
+    identity: OwnedFd,
     generations: OwnedFd,
     staged: OwnedFd,
     lock: OwnedFd,
@@ -427,7 +435,7 @@ impl UnixLocalInstallGenerationStore {
             parent = ensure_directory(&parent, component, owner, exact_private)?;
         }
         let root_parent = parent;
-        let root = ensure_directory(&root_parent, root_name, owner, true)?;
+        let (root, identity) = open_or_create_store_root(&root_parent, root_name, owner, location)?;
         let generations = ensure_directory(&root, GENERATIONS_DIRECTORY, owner, true)?;
         let staged = ensure_directory(&root, STAGED_DIRECTORY, owner, true)?;
         let lock = ensure_lock_file(&root, owner)?;
@@ -435,6 +443,7 @@ impl UnixLocalInstallGenerationStore {
         Ok(Self {
             root_parent,
             root,
+            identity,
             generations,
             staged,
             lock,
@@ -763,6 +772,15 @@ impl UnixLocalInstallGenerationStore {
             self.owner,
             "local-install store root",
         )?;
+        verify_retained_file(
+            &self.root,
+            STORE_IDENTITY_FILE,
+            &self.identity,
+            self.owner,
+            PRIVATE_FILE_MODE,
+            "local-install store identity",
+        )?;
+        verify_store_identity_document(&self.root, &self.identity, self.owner, self.location)?;
         verify_retained_directory(
             &self.root,
             GENERATIONS_DIRECTORY,
@@ -789,6 +807,7 @@ impl UnixLocalInstallGenerationStore {
             )
         })?;
         let mut lock = false;
+        let mut identity = false;
         let mut generations = false;
         let mut staged = false;
         let mut count = 0_usize;
@@ -804,13 +823,14 @@ impl UnixLocalInstallGenerationStore {
                 continue;
             }
             count += 1;
-            if count > 6 {
+            if count > 7 {
                 return Err(store_error(
                     LocalInstallGenerationStoreErrorKind::CorruptState,
                     "the local-install store root contains too many entries",
                 ));
             }
             match name {
+                b"store.identity.json" => identity = true,
                 b"lock" => lock = true,
                 b"current" | b"current.next" => {}
                 b"generations" => generations = true,
@@ -823,7 +843,7 @@ impl UnixLocalInstallGenerationStore {
                 }
             }
         }
-        if !lock || !generations || !staged {
+        if !identity || !lock || !generations || !staged {
             return Err(store_error(
                 LocalInstallGenerationStoreErrorKind::UnsafeFilesystem,
                 "a required local-install store entry disappeared",
@@ -1655,6 +1675,16 @@ enum StoreGenerationWire {
     GlaedaCurrentV1,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoreIdentityWire {
+    store_schema_version: u8,
+    store_generation: StoreGenerationWire,
+    location: LocalInstallStoreLocationClass,
+    root_device: u64,
+    root_inode: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum IdentityGenerationWire {
@@ -2025,6 +2055,300 @@ fn open_absolute_directory(path: &OsStr) -> Result<OwnedFd, LocalInstallGenerati
         "local-install data path",
     )?;
     Ok(current)
+}
+
+fn open_or_create_store_root(
+    parent: &OwnedFd,
+    name: &str,
+    owner: (u32, u32),
+    location: LocalInstallStoreLocationClass,
+) -> Result<(OwnedFd, OwnedFd), LocalInstallGenerationStoreError> {
+    match fs::openat(parent, name, DIRECTORY_FLAGS, Mode::empty()) {
+        Ok(root) => open_existing_store_root(root, owner, location),
+        Err(Errno::NOENT) => publish_new_store_root(parent, name, owner, location),
+        Err(Errno::LOOP | Errno::NOTDIR) => Err(store_error(
+            LocalInstallGenerationStoreErrorKind::UnsafeFilesystem,
+            "the local-install store root is symlinked or invalid",
+        )),
+        Err(_) => Err(store_error(
+            LocalInstallGenerationStoreErrorKind::Io,
+            "the local-install store root could not be opened",
+        )),
+    }
+}
+
+fn publish_new_store_root(
+    parent: &OwnedFd,
+    name: &str,
+    owner: (u32, u32),
+    location: LocalInstallStoreLocationClass,
+) -> Result<(OwnedFd, OwnedFd), LocalInstallGenerationStoreError> {
+    let (stage_name, root) = create_initialization_stage(parent, owner)?;
+    let root_stat = inspect_directory(&root, Some(owner), true, "local-install store root")?;
+    let mut staged = StagedStoreRoot {
+        parent: parent.as_fd(),
+        name: stage_name,
+        root_device: store_root_device(&root_stat)?,
+        root_inode: root_stat.st_ino,
+        identity: None,
+        armed: true,
+    };
+    let identity = create_store_identity(&root, owner, location)?;
+    staged.identity = Some(duplicate_fd(&identity, "local-install store identity")?);
+    inspect_initial_root_entries(&root)?;
+    synchronize_directory(parent, "local-install store parent")?;
+
+    match fs::renameat_with(
+        parent,
+        staged.name.as_str(),
+        parent,
+        name,
+        RenameFlags::NOREPLACE,
+    ) {
+        Ok(()) => {
+            staged.armed = false;
+            synchronize_directory(parent, "local-install store parent")?;
+            verify_retained_directory(parent, name, &root, owner, "local-install store root")?;
+            Ok((root, identity))
+        }
+        Err(Errno::EXIST) => {
+            drop(identity);
+            drop(root);
+            drop(staged);
+            let root = fs::openat(parent, name, DIRECTORY_FLAGS, Mode::empty()).map_err(|_| {
+                store_error(
+                    LocalInstallGenerationStoreErrorKind::UnsafeFilesystem,
+                    "the concurrently published local-install store root is unsafe",
+                )
+            })?;
+            open_existing_store_root(root, owner, location)
+        }
+        Err(_) => Err(store_error(
+            LocalInstallGenerationStoreErrorKind::Io,
+            "the local-install store root could not be published atomically",
+        )),
+    }
+}
+
+fn create_initialization_stage(
+    parent: &OwnedFd,
+    owner: (u32, u32),
+) -> Result<(String, OwnedFd), LocalInstallGenerationStoreError> {
+    for _ in 0..INITIALIZATION_CREATE_ATTEMPTS {
+        let name = create_initialization_stage_name()?;
+        match fs::mkdirat(parent, name.as_str(), PRIVATE_DIRECTORY_MODE) {
+            Ok(()) => {
+                let root = fs::openat(parent, name.as_str(), DIRECTORY_FLAGS, Mode::empty())
+                    .map_err(|_| {
+                        store_error(
+                            LocalInstallGenerationStoreErrorKind::Io,
+                            "the private local-install initialization root could not be opened",
+                        )
+                    })?;
+                fs::fchmod(&root, PRIVATE_DIRECTORY_MODE).map_err(|_| {
+                    store_error(
+                        LocalInstallGenerationStoreErrorKind::Io,
+                        "private local-install initialization permissions could not be set",
+                    )
+                })?;
+                inspect_directory(&root, Some(owner), true, "local-install store root")?;
+                return Ok((name, root));
+            }
+            Err(Errno::EXIST) => continue,
+            Err(_) => {
+                return Err(store_error(
+                    LocalInstallGenerationStoreErrorKind::Io,
+                    "a private local-install initialization root could not be created",
+                ));
+            }
+        }
+    }
+    Err(store_error(
+        LocalInstallGenerationStoreErrorKind::Conflict,
+        "a unique private local-install initialization root could not be created",
+    ))
+}
+
+fn create_initialization_stage_name() -> Result<String, LocalInstallGenerationStoreError> {
+    let mut random = [0_u8; INITIALIZATION_RANDOM_BYTES];
+    File::open(SYSTEM_RANDOM_SOURCE)
+        .and_then(|mut source| source.read_exact(&mut random))
+        .map_err(|_| {
+            store_error(
+                LocalInstallGenerationStoreErrorKind::Io,
+                "operating-system randomness for local-install initialization was unavailable",
+            )
+        })?;
+    let mut name = String::with_capacity(INITIALIZATION_STAGE_PREFIX.len() + random.len() * 2);
+    name.push_str(INITIALIZATION_STAGE_PREFIX);
+    for byte in random {
+        use std::fmt::Write as _;
+        write!(&mut name, "{byte:02x}").map_err(|_| {
+            store_error(
+                LocalInstallGenerationStoreErrorKind::Io,
+                "local-install initialization identity could not be represented",
+            )
+        })?;
+    }
+    Ok(name)
+}
+
+struct StagedStoreRoot<'a> {
+    parent: BorrowedFd<'a>,
+    name: String,
+    root_device: u64,
+    root_inode: u64,
+    identity: Option<OwnedFd>,
+    armed: bool,
+}
+
+impl Drop for StagedStoreRoot<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Ok(root) = fs::openat(
+            self.parent,
+            self.name.as_str(),
+            DIRECTORY_FLAGS,
+            Mode::empty(),
+        ) else {
+            return;
+        };
+        let Ok(root_stat) = fs::fstat(&root) else {
+            return;
+        };
+        if store_root_device(&root_stat).ok() != Some(self.root_device)
+            || root_stat.st_ino != self.root_inode
+        {
+            return;
+        }
+        if let Some(identity) = self.identity.as_ref()
+            && let Ok(current) = fs::openat(
+                &root,
+                STORE_IDENTITY_FILE,
+                EXISTING_FILE_FLAGS,
+                Mode::empty(),
+            )
+            && fs::fstat(identity)
+                .ok()
+                .zip(fs::fstat(&current).ok())
+                .is_some_and(|(left, right)| same_object(&left, &right))
+        {
+            let _ = fs::unlinkat(&root, STORE_IDENTITY_FILE, AtFlags::empty());
+        }
+        let _ = fs::unlinkat(self.parent, self.name.as_str(), AtFlags::REMOVEDIR);
+        let _ = fs::fsync(self.parent);
+    }
+}
+
+fn open_existing_store_root(
+    root: OwnedFd,
+    owner: (u32, u32),
+    location: LocalInstallStoreLocationClass,
+) -> Result<(OwnedFd, OwnedFd), LocalInstallGenerationStoreError> {
+    inspect_directory(&root, Some(owner), true, "local-install store root")?;
+    let identity = open_existing_file(
+        &root,
+        STORE_IDENTITY_FILE,
+        owner,
+        PRIVATE_FILE_MODE,
+        "local-install store identity",
+    )
+    .map_err(|error| {
+        if error.kind == LocalInstallGenerationStoreErrorKind::RecoveryRequired {
+            store_error(
+                LocalInstallGenerationStoreErrorKind::UnsafeFilesystem,
+                "a pre-existing local-install store root has no durable identity",
+            )
+        } else {
+            error
+        }
+    })?;
+    verify_store_identity_document(&root, &identity, owner, location)?;
+    inspect_initial_root_entries(&root)?;
+    Ok((root, identity))
+}
+
+fn create_store_identity(
+    root: &OwnedFd,
+    owner: (u32, u32),
+    location: LocalInstallStoreLocationClass,
+) -> Result<OwnedFd, LocalInstallGenerationStoreError> {
+    let root_stat = inspect_directory(root, Some(owner), true, "local-install store root")?;
+    let bytes = encode_store_identity(location, &root_stat)?;
+    let identity = create_private_file(
+        root,
+        STORE_IDENTITY_FILE,
+        PRIVATE_FILE_MODE,
+        owner,
+        "local-install store identity",
+    )?;
+    write_all_fd(&identity, &bytes, "local-install store identity")?;
+    fs::fsync(&identity).map_err(|_| {
+        store_error(
+            LocalInstallGenerationStoreErrorKind::Io,
+            "the local-install store identity could not be synchronized",
+        )
+    })?;
+    synchronize_directory(root, "local-install store root")?;
+    drop(identity);
+    let identity = open_existing_file(
+        root,
+        STORE_IDENTITY_FILE,
+        owner,
+        PRIVATE_FILE_MODE,
+        "local-install store identity",
+    )?;
+    verify_store_identity_document(root, &identity, owner, location)?;
+    Ok(identity)
+}
+
+fn inspect_initial_root_entries(root: &OwnedFd) -> Result<(), LocalInstallGenerationStoreError> {
+    let mut entries = Dir::read_from(root).map_err(|_| {
+        store_error(
+            LocalInstallGenerationStoreErrorKind::Io,
+            "the local-install store root could not be enumerated before initialization",
+        )
+    })?;
+    let mut identity = false;
+    let mut count = 0_usize;
+    for entry in &mut entries {
+        let entry = entry.map_err(|_| {
+            store_error(
+                LocalInstallGenerationStoreErrorKind::Io,
+                "a local-install store root entry could not be read before initialization",
+            )
+        })?;
+        let name = entry.file_name().to_bytes();
+        if matches!(name, b"." | b"..") {
+            continue;
+        }
+        count += 1;
+        if count > 7 {
+            return Err(store_error(
+                LocalInstallGenerationStoreErrorKind::CorruptState,
+                "the local-install store root contains too many entries",
+            ));
+        }
+        match name {
+            b"store.identity.json" => identity = true,
+            b"lock" | b"current" | b"current.next" | b"generations" | b"staged" => {}
+            _ => {
+                return Err(store_error(
+                    LocalInstallGenerationStoreErrorKind::CorruptState,
+                    "the local-install store root contains an unexpected entry",
+                ));
+            }
+        }
+    }
+    if !identity {
+        return Err(store_error(
+            LocalInstallGenerationStoreErrorKind::UnsafeFilesystem,
+            "the local-install store root has no durable identity",
+        ));
+    }
+    Ok(())
 }
 
 fn ensure_directory(
@@ -2416,17 +2740,23 @@ fn read_bounded_file(
             format!("{subject} exceeds its byte limit"),
         ));
     }
-    let duplicate = duplicate_fd(file, subject)?;
-    let mut bytes = Vec::new();
-    File::from(duplicate)
-        .take((limit + 1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|_| {
-            store_error(
-                LocalInstallGenerationStoreErrorKind::Io,
-                format!("{subject} could not be read"),
-            )
-        })?;
+    let reader = File::from(duplicate_fd(file, subject)?);
+    let mut bytes = vec![0_u8; limit + 1];
+    let mut offset = 0_usize;
+    while offset < bytes.len() {
+        match reader.read_at(&mut bytes[offset..], offset as u64) {
+            Ok(0) => break,
+            Ok(read) => offset += read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => {
+                return Err(store_error(
+                    LocalInstallGenerationStoreErrorKind::Io,
+                    format!("{subject} could not be read"),
+                ));
+            }
+        }
+    }
+    bytes.truncate(offset);
     if bytes.len() > limit {
         return Err(store_error(
             LocalInstallGenerationStoreErrorKind::CorruptState,
@@ -2740,6 +3070,86 @@ fn operation_id_from_directory_name(
         ));
     }
     Ok(operation)
+}
+
+fn encode_store_identity(
+    location: LocalInstallStoreLocationClass,
+    root_stat: &rustix::fs::Stat,
+) -> Result<Vec<u8>, LocalInstallGenerationStoreError> {
+    let bytes = serde_json::to_vec(&StoreIdentityWire {
+        store_schema_version: LOCAL_INSTALL_GENERATION_STORE_SCHEMA_VERSION,
+        store_generation: StoreGenerationWire::GlaedaCurrentV1,
+        location,
+        root_device: store_root_device(root_stat)?,
+        root_inode: root_stat.st_ino,
+    })
+    .map_err(|_| {
+        store_error(
+            LocalInstallGenerationStoreErrorKind::Io,
+            "the local-install store identity could not be encoded",
+        )
+    })?;
+    if bytes.len() > MAX_LOCAL_INSTALL_STORE_IDENTITY_BYTES {
+        return Err(store_error(
+            LocalInstallGenerationStoreErrorKind::Io,
+            "the local-install store identity exceeds its byte limit",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn verify_store_identity_document(
+    root: &OwnedFd,
+    identity: &OwnedFd,
+    owner: (u32, u32),
+    location: LocalInstallStoreLocationClass,
+) -> Result<(), LocalInstallGenerationStoreError> {
+    let bytes = read_bounded_file(
+        identity,
+        owner,
+        PRIVATE_FILE_MODE,
+        MAX_LOCAL_INSTALL_STORE_IDENTITY_BYTES,
+        "local-install store identity",
+    )?;
+    let wire: StoreIdentityWire = serde_json::from_slice(&bytes).map_err(|_| {
+        store_error(
+            LocalInstallGenerationStoreErrorKind::CorruptState,
+            "the local-install store identity is invalid",
+        )
+    })?;
+    let root_stat = inspect_directory(root, Some(owner), true, "local-install store root")?;
+    if wire.store_schema_version != LOCAL_INSTALL_GENERATION_STORE_SCHEMA_VERSION
+        || wire.store_generation != StoreGenerationWire::GlaedaCurrentV1
+        || wire.location != location
+        || wire.root_device != store_root_device(&root_stat)?
+        || wire.root_inode != root_stat.st_ino
+        || encode_store_identity(location, &root_stat)? != bytes
+    {
+        return Err(store_error(
+            LocalInstallGenerationStoreErrorKind::CorruptState,
+            "the local-install store identity does not match its root",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn store_root_device(
+    root_stat: &rustix::fs::Stat,
+) -> Result<u64, LocalInstallGenerationStoreError> {
+    Ok(root_stat.st_dev)
+}
+
+#[cfg(target_os = "macos")]
+fn store_root_device(
+    root_stat: &rustix::fs::Stat,
+) -> Result<u64, LocalInstallGenerationStoreError> {
+    u64::try_from(root_stat.st_dev).map_err(|_| {
+        store_error(
+            LocalInstallGenerationStoreErrorKind::CorruptState,
+            "the local-install store root has an invalid device identity",
+        )
+    })
 }
 
 fn encode_generation_document(
@@ -3111,32 +3521,57 @@ mod tests {
 
     static NEXT_TEST: AtomicU64 = AtomicU64::new(1);
 
+    struct TestParent {
+        path: PathBuf,
+    }
+
+    impl TestParent {
+        fn new(label: &str) -> Self {
+            let sequence = NEXT_TEST.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "glaeda-local-generation-store-{label}-{}-{sequence}",
+                std::process::id()
+            ));
+            std_fs::create_dir(&path).expect("create exact test parent");
+            std_fs::set_permissions(&path, std_fs::Permissions::from_mode(0o700))
+                .expect("set test parent mode");
+            Self { path }
+        }
+    }
+
+    impl std::ops::Deref for TestParent {
+        type Target = Path;
+
+        fn deref(&self) -> &Self::Target {
+            &self.path
+        }
+    }
+
+    impl Drop for TestParent {
+        fn drop(&mut self) {
+            std_fs::remove_dir_all(&self.path).expect("remove exact test parent");
+        }
+    }
+
     struct TestStore {
-        parent: PathBuf,
+        parent: TestParent,
         store: UnixLocalInstallGenerationStore,
     }
 
     impl TestStore {
         fn new(label: &str) -> Self {
-            let sequence = NEXT_TEST.fetch_add(1, Ordering::Relaxed);
-            let parent = std::env::temp_dir().join(format!(
-                "glaeda-local-generation-store-{label}-{}-{sequence}",
-                std::process::id()
-            ));
-            std_fs::create_dir(&parent).expect("create exact test parent");
-            std_fs::set_permissions(&parent, std_fs::Permissions::from_mode(0o700))
-                .expect("set test parent mode");
-            let store = UnixLocalInstallGenerationStore::open_for_test(&parent)
+            let parent = TestParent::new(label);
+            let store = UnixLocalInstallGenerationStore::open_for_test(&parent.path)
                 .expect("open test generation store");
             Self { parent, store }
         }
 
         fn root(&self) -> PathBuf {
-            self.parent.join(LOCAL_INSTALL_DIRECTORY)
+            self.parent.path.join(LOCAL_INSTALL_DIRECTORY)
         }
 
         fn binary(&self, label: &str, bytes: &[u8]) -> PathBuf {
-            let path = self.parent.join(format!("candidate-{label}"));
+            let path = self.parent.path.join(format!("candidate-{label}"));
             let mut file = OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -3148,12 +3583,6 @@ mod tests {
             std_fs::set_permissions(&path, std_fs::Permissions::from_mode(0o500))
                 .expect("set candidate mode");
             path
-        }
-    }
-
-    impl Drop for TestStore {
-        fn drop(&mut self) {
-            std_fs::remove_dir_all(&self.parent).expect("remove exact test store");
         }
     }
 
@@ -3786,10 +4215,12 @@ mod tests {
     fn fixed_layout_has_no_legacy_namespace_or_caller_controlled_basename() {
         assert_eq!(GLAEDA_DIRECTORY, "glaeda");
         assert_eq!(LOCAL_INSTALL_DIRECTORY, "local-install");
+        assert_eq!(STORE_IDENTITY_FILE, "store.identity.json");
         assert_eq!(BINARY_FILE, "glaeda");
         for fixed in [
             GLAEDA_DIRECTORY,
             LOCAL_INSTALL_DIRECTORY,
+            STORE_IDENTITY_FILE,
             GENERATIONS_DIRECTORY,
             STAGED_DIRECTORY,
             BINARY_FILE,
@@ -3877,6 +4308,143 @@ mod tests {
             LocalInstallGenerationStoreErrorKind::CorruptState
         );
         assert!(test.root().join("foreign").exists());
+    }
+
+    #[test]
+    fn preexisting_unmarked_foreign_root_is_never_changed() {
+        let parent = TestParent::new("unmarked-foreign-root");
+        let root = parent.path.join(LOCAL_INSTALL_DIRECTORY);
+        std_fs::create_dir(&root).expect("create unmarked root");
+        std_fs::set_permissions(&root, std_fs::Permissions::from_mode(0o700))
+            .expect("set unmarked root mode");
+        std_fs::write(root.join("foreign"), b"foreign bytes").expect("write foreign entry");
+
+        assert_eq!(
+            UnixLocalInstallGenerationStore::open_for_test(&parent.path)
+                .expect_err("unmarked foreign root must not be adopted")
+                .kind(),
+            LocalInstallGenerationStoreErrorKind::UnsafeFilesystem
+        );
+        let names = std_fs::read_dir(&root)
+            .expect("read unchanged foreign root")
+            .map(|entry| {
+                entry
+                    .expect("read foreign root entry")
+                    .file_name()
+                    .into_string()
+                    .expect("ASCII test entry")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["foreign"]);
+        assert_eq!(
+            std_fs::read(root.join("foreign")).expect("read unchanged foreign bytes"),
+            b"foreign bytes"
+        );
+    }
+
+    #[test]
+    fn preexisting_empty_unmarked_root_is_never_adopted() {
+        let parent = TestParent::new("unmarked-empty-root");
+        let root = parent.path.join(LOCAL_INSTALL_DIRECTORY);
+        std_fs::create_dir(&root).expect("create empty unmarked root");
+        std_fs::set_permissions(&root, std_fs::Permissions::from_mode(0o700))
+            .expect("set empty unmarked root mode");
+
+        assert_eq!(
+            UnixLocalInstallGenerationStore::open_for_test(&parent.path)
+                .expect_err("empty unmarked root must not be adopted")
+                .kind(),
+            LocalInstallGenerationStoreErrorKind::UnsafeFilesystem
+        );
+        assert_eq!(
+            std_fs::read_dir(&root)
+                .expect("read unchanged empty root")
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn interrupted_private_initialization_stages_never_block_restart() {
+        let parent = TestParent::new("interrupted-initialization-stages");
+        let parent_fd =
+            fs::open(&parent.path, DIRECTORY_FLAGS, Mode::empty()).expect("open exact test parent");
+        let owner = (geteuid().as_raw(), getegid().as_raw());
+
+        let (complete_name, complete) =
+            create_initialization_stage(&parent_fd, owner).expect("create complete stage");
+        create_store_identity(
+            &complete,
+            owner,
+            LocalInstallStoreLocationClass::LinuxHomeDefault,
+        )
+        .expect("create complete staged identity");
+        synchronize_directory(&complete, "test complete initialization stage")
+            .expect("sync complete stage");
+        drop(complete);
+
+        let (partial_name, partial) =
+            create_initialization_stage(&parent_fd, owner).expect("create partial stage");
+        let identity = create_private_file(
+            &partial,
+            STORE_IDENTITY_FILE,
+            PRIVATE_FILE_MODE,
+            owner,
+            "test partial store identity",
+        )
+        .expect("create partial identity");
+        write_all_fd(&identity, b"{", "test partial store identity")
+            .expect("write partial identity");
+        fs::fsync(&identity).expect("sync partial identity");
+        synchronize_directory(&partial, "test partial initialization stage")
+            .expect("sync partial stage");
+        drop(identity);
+        drop(partial);
+        synchronize_directory(&parent_fd, "test initialization parent")
+            .expect("sync initialization parent");
+
+        let store = UnixLocalInstallGenerationStore::open_for_test(&parent.path)
+            .expect("publish fresh store despite abandoned private stages");
+        store.verify_boundaries().expect("verify published store");
+        assert!(parent.path.join(complete_name).is_dir());
+        assert!(parent.path.join(partial_name).is_dir());
+        assert!(parent.path.join(LOCAL_INSTALL_DIRECTORY).is_dir());
+    }
+
+    #[test]
+    fn concurrent_first_initializers_publish_one_exact_store() {
+        use std::sync::{Arc, Barrier};
+
+        let parent = Arc::new(TestParent::new("concurrent-first-initializers"));
+        let barrier = Arc::new(Barrier::new(3));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let parent = Arc::clone(&parent);
+            let barrier = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                let store = UnixLocalInstallGenerationStore::open_for_test(&parent.path)
+                    .expect("concurrent initializer must open one published store");
+                store.verify_boundaries().expect("verify concurrent store");
+                let stat = fs::fstat(&store.root).expect("inspect concurrent store root");
+                (
+                    store_root_device(&stat).expect("canonical root device"),
+                    stat.st_ino,
+                )
+            }));
+        }
+        barrier.wait();
+        let identities = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("join concurrent initializer"))
+            .collect::<Vec<_>>();
+        assert_eq!(identities[0], identities[1]);
+
+        let names = std_fs::read_dir(&parent.path)
+            .expect("read initialization parent")
+            .map(|entry| entry.expect("read initialization entry").file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(names, [LOCAL_INSTALL_DIRECTORY]);
     }
 
     #[test]
