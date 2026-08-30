@@ -561,3 +561,84 @@ Raw receipt SHA-256 digests:
 - final same-producer control hot-run/benchmark: `5c56371de54b921acd81eeba9346e1ea29e834c5d6f0ff76e0b9add999e8c5ed`, `d38ba656c505338929a363775f9f90c7cb51479112aa01e8a019ea89a1077071`
 - final same-producer candidate hot-run/benchmark: `0266d7ff6ebbb3aa21eed1250017187c828ebc77be02ddecc8d6f5e1f7e6e15d`, `9cefe858dbe997d34677d3af57be4b0962b7909ee81bcca24f4110449a08fbae`
 - final retained candidate hot-run/benchmark: `4561f17b0f81ad04f8aec366db5f942ab05c87f66d9befeaf6e281609414b335`, `95a6e0aa78653e574bdbd5162e7dc12b36c4165ee6080cc2115e0cec89ada0ef`
+
+## Composed XFS source and compiler-state loop — 2026-08-30
+
+Exact clean producer `decd8ea38f3e6d8df5b91897df980175f7db99a9` / tree
+`7789bf78967d708c5fd0bbcc80c84c435bf998bd` composed task source materialization with the existing
+`private-copy` compiler-state arm. Its release `glaeda-reflink-task` was 1,799,784 bytes with
+SHA-256 `ff1b9081ab20eb00eac946bf160efc0e01caf49a17a530f39a0a0c6f40e7851c`.
+The physical backend was a route-owned 32 GiB loop image on big-red Ubuntu 26.04, kernel
+7.0.0-30-generic, XFS/xfsprogs 6.18, `reflink=1`, 4 KiB blocks, and `noatime`. The frozen source was
+`b9fa23462420c13a465d635d9694f0c827c1e685` / tree
+`edd0b7bb9d3e59305c21c69b721b5278d8aff6da`: 475 tracked regular files and 9,285,337 logical bytes
+per task source.
+
+The source controls changed one dimension while retaining the same resident prime, checked fixture,
+private-copy target lineage, pinned Rust/Cargo 1.97.1, disjoint 16-CPU grant, and complete semantic
+validator:
+
+- `git-sequential`: one ordinary `git worktree add` process per task, in sequence;
+- `glaeda-ordinary`: one bounded Glaeda fan-out invocation using ordinary Git worktrees;
+- `glaeda-reflink`: the same Glaeda invocation requesting reflink fan-out, with any fallback rejected.
+
+The fan-out-1 smoke demonstrated that reflink proof is not free. Source creation was 48.435 ms for
+sequential Git, 67.642 ms for Glaeda ordinary, and 99.607 ms for Glaeda reflink. Resident-ready
+task-known-to-result was 14.947136, 15.725905, and 15.353203 seconds respectively. Outer wall was
+61.30, 64.92, and 65.05 seconds; GNU-time outer maximum-RSS observations were 2,503,464, 2,447,652,
+and 2,494,540 KiB. The candidate should therefore not replace the simple width-one path for speed.
+
+The primary fan-out-4 bracket ran A-B-C-C-B-A, two samples per treatment:
+
+| Source treatment | Source samples (ms) | Source median (ms) | Edit-window median (s) | Task-known median (s) | Outer-wall median (s) | Outer max-RSS median (KiB) | Peak XFS growth median (bytes) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| sequential Git | 196.034, 176.616 | 186.325 | 26.660149 | 26.854811 | 74.885 | 2,501,790 | 7,263,135,744 |
+| Glaeda ordinary | 88.363, 110.860 | 99.612 | 25.782925 | 25.891474 | 73.625 | 2,509,122 | 7,263,141,888 |
+| Glaeda reflink | 81.510, 77.793 | 79.652 | 26.714207 | 26.801249 | 75.175 | 2,521,654 | 7,224,225,792 |
+
+At width four, bounded Glaeda orchestration alone reduced source setup 46.54% / 1.87x versus
+sequential Git. Reflink reduced it 57.25% / 2.34x versus sequential Git and another 20.04% / 1.25x
+versus Glaeda ordinary. The candidate used 38,909,952 bytes / 37.107 MiB / 0.536% less peak XFS
+growth than sequential Git, consistent with sharing four 9.285 MB source trees. The full
+task-known medians differed by only 53.563 ms / 0.20% between sequential Git and reflink because
+the 80–187 ms source step is small beside a 25–28 second compiler/test window. The differing
+edit-window and outer medians are ordinary run variance, not evidence that source reflinks change
+compiler semantics or performance.
+
+One exploratory fan-out-8 A-B-C scaling bracket produced:
+
+| Source treatment | Source (ms) | Task-known (s) | Outer wall (s) | Outer max RSS (KiB) | Peak XFS growth (bytes) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| sequential Git | 359.378 | 52.846806 | 102.35 | 2,506,268 | 12,551,753,728 |
+| Glaeda ordinary | 120.495 | 52.448307 | 103.53 | 2,514,088 | 12,551,704,576 |
+| Glaeda reflink | 100.159 | 49.869747 | 97.07 | 2,503,764 | 12,469,665,792 |
+
+Glaeda ordinary was 2.98x and Glaeda reflink 3.59x faster than sequential Git for source setup at
+width eight; reflink also used 82,087,936 bytes / 78.285 MiB less peak XFS growth. The candidate's
+2.977-second / 5.63% full-loop advantage is not promoted because this scaling bracket has one
+sample per treatment and no reverse-order repeat.
+
+All 12 physical runs succeeded. Every one of 51 task validators passed the same 1,343 executed
+tests with one ignored and zero failures; all 17 requested reflink tasks reported `reflinked`, zero
+ordinary fallback, the exact commit/tree, and the final per-task Git proof. Cleanup removed all 63
+registered worktrees, the XFS scratch root was empty after every run, and no benchmark worker or
+failed unit remained. The outer RSS observations above are process-lifetime GNU-time maxima, not
+concurrent aggregate memory.
+
+Logical cleanup did not reclaim sparse host backing by itself. After the runs, the empty mounted
+XFS image still had 16,189,345,792 allocated host bytes. One explicit `fstrim` reported the full
+32 GiB range trimmed and reduced host allocation to 4,094,177,280 bytes: 12,095,168,512 bytes /
+11.265 GiB / 74.71% reclaimed. The complete trim-and-reobserve command took 0.13 seconds. The loop
+device advertised 4 KiB discard granularity, 4 GiB maximum discard, and `DISC-ZERO=0`; XFS still
+reported 690,143,232 logical used bytes. This proves task/worktree deletion and host-backing
+reclamation are separate lifecycle phases. A persistent sparse project disk should record both,
+and should test bounded trim at idle/eviction watermarks rather than issuing it on every task. The
+remaining backing allocation is observed, not assumed reclaimable.
+
+Raw aggregate JSON / GNU-time SHA-256 pairs:
+
+- fan-out 1 sequential/Glaeda ordinary/Glaeda reflink: `25133022cf2bf9038f6d903fdacdc28a8b9533e5b88b12fa420464da30d1bf3d` / `8bc9ef53609e80586d330ad9398603b648ec265b6eb0a03fcd9104de3667d3bc`, `2df1c4c70e5a4141f2193de82d70aaa530245704de55b5da1f01fcf97914fe8d` / `9a1e4f62f6badfacd966373779953ef269f2c50001c1cc1e3eb5d3eb50b5bfd7`, `25e7a4e8a90cc54994617c5a30bf93e59bdc0c8d4fc1c82be3448820a27766fc` / `41bf1d830d8ff85415668eb7c1e52b7c43fe310666afb419f322bab6474f9004`;
+- fan-out 4 sequential A1/A2: `f2638f5ff83f6be3fc7e508a638692f59c023f14278c947fcfe6ec0786767bb8` / `772295ef12c227ec38a0211a864c47781bfa231879d754fdc8b1461e3bfa6f24`, `dad0f7459b9f43ffe063cf0e95c5e0eb851d050d31ea4aace9cdc47ab4ac8666` / `88f2f853cae5047c2ce0aeae6ff5ad8c4c0abe2befa4cac2aad807cad52c4e72`;
+- fan-out 4 Glaeda ordinary B1/B2: `ef1c597c8f8076a87f5834296e4bd17ada8a8cb5a594ee1c935a65927cb8bb63` / `da455483cca1dc6ec9cb1403472d0bf7bd5f6df3f09fc995eacc940247588a0d`, `b6091157bf7e767bea4f2427300c8613e5c73cb9391ce206e387a9e0cd2ee82c` / `2d70f4abe45fdabc4cf4d64066a95dd853a8d46555015e0bc10f5694bf067772`;
+- fan-out 4 Glaeda reflink C1/C2: `e33adc1528fa40182e16d1c572912f63e5f4d54a6cccf623a3ab3b95853f3fdc` / `f5870a74f30b5727ec4ce903e2706d360ac27b45b988b16372c0a08a8416e3f1`, `bf0bad735baa4037ab3f9b8f51f2fe1e4ad3259cbaa922a3bad09a1c92afbda5` / `beb94e13c69ad79aeab398772c94b90beb694f9202f8c914322c393ae5ff4a7d`;
+- fan-out 8 sequential/Glaeda ordinary/Glaeda reflink: `c9b4f97e6c23c8037a89645eef02164617b3faf6e0cb1dd03ce0dfe6888ae116` / `52631d684e0bf6f36a5671b4a6be2dfe24ee96c850825f954574150abe15dc77`, `0556db8832354a6aa8b459fda382b005f4906e33b71e4963a8b2f09a7fd57973` / `a298dc61673c4d47f80016b9484041ac9e03211e9f02a88ab03f506bd598defd`, `ad977bfdaa04cb8f9402c6c970d44415c5fa3aae29803e6d17f39199b702af37` / `5de6dc03329b0f3bc68302db11e1b938782771dbd644987a7c15dc03c958ddcb`.
