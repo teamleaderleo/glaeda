@@ -672,3 +672,40 @@ Raw hot-run receipt SHA-256 digests:
 
 - exact-main control A/B: `84e8dcaaac372defc0b27a1c2a1d2c8145a09bdd44619c5447eee3a105226a27`, `aaa69dac28ba1bb4055a5f145e573b056ec58fb2f10863e388fed035dfbd1782`;
 - exact candidate A/B/B-reuse: `cc982bedb9a6b4b46a8f178a19b3171093b8bad337d764aba2fe67f2d882ae22`, `837d887235bff7cf125a4fc7c32ac01e1f9698157d5b3a127e8aec61e548337f`, `91de07cc575d42403a4f64bba926baddf89aacc671a41941e14df1617e6b5f2f`.
+
+## Bounded hot-run cache observation — 2026-08-30
+
+Exact clean base `27081b365b8f867b96d994d0eddd6f6aff7cbcf9` could classify a hand-authored
+cache inventory but had no producer for physical `hot-run` state. Exact code candidate
+`e37b236c6c95f17f90af3836251b5aff337976c8` / tree
+`c96bf541fbe87a8fd62774513229d32a6f323989` added one explicit-root, descriptor-bound,
+metadata-only Linux observer. The physical fixture was big-red's unchanged ext4 hot-run namespace:
+four opaque legacy states, 1,090,037,078 logical bytes and 1,093,828,608 allocated state bytes. The
+namespace directory itself occupied another 4,096 bytes. One legacy Overlay state accounted for
+1,093,472,256 allocated bytes. None of the states had enough ownership or lifecycle evidence to be
+called reclaimable.
+
+The complete comparison used three warmups and 30 measured samples per arm in rotating/reversed
+four-arm order. All arms observed the same state. The primary metric was complete command wall
+time; secondary metrics were process maximum RSS, byte agreement, terminal status, path-free
+output, and mutation absence.
+
+| Treatment | Validity | Median (ms) | p90 (ms) | Max RSS (KiB) |
+| --- | --- | ---: | ---: | ---: |
+| ordinary-user GNU `du`, apparent + allocated passes | invalid: both passes returned 1 on inaccessible Overlay work internals | 10.294 | 11.976 | 9,136 |
+| privileged GNU `du`, apparent + allocated passes | complete metadata control | 20.701 | 24.107 | 9,136 |
+| existing supplied-inventory classifier | valid classification only; manually supplied bytes, no producer cost | 1.381 | 1.863 | 5,072 |
+| Glaeda explicit-root observer | complete one-pass observation plus classification | 8.091 | 10.307 | 6,684 |
+
+The candidate exactly matched the sum of GNU `du`'s four per-state logical and allocated totals,
+classified all four states `unknown`, reported zero reclaimable bytes, printed no private path or
+child name, and left root/state atime, mtime, and ctime unchanged in the contract test through
+`O_NOATIME`. It was 2.56 times faster than the complete two-pass GNU control while returning the
+typed classifier result rather than raw paths. The 1.381 ms supplied-inventory arm is intentionally
+not an end-to-end competitor: a human or separate producer had already paid for every observation.
+
+A free hosted GitHub Actions arm is inapplicable to this decision because a hosted runner cannot
+observe operator-local hot state without changing the storage and trust boundary. Reset is cold
+reconstruction or selecting a new state, not deletion by this command. The observer has no catalog,
+ownership, generation, non-use, reconstruction, retirement, or cleanup authority; later lifecycle
+work must supply those facts before bounded eviction can exist.
