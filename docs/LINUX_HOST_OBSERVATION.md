@@ -20,6 +20,10 @@ One typed human/JSON report contains:
 - CPU, memory, and I/O PSI `some` averages and cumulative microseconds;
 - scheduler autogroup support/state plus stable sched_ext support/state, enable sequence, and active ops
   name when enabled;
+- transition-consistent online CPU count, SMT support/state, online `nohz_full` and isolated CPU
+  counts, and bounded frequency-policy classes grouped by scaling driver, governor, optional energy
+  performance preference, hardware maximum, effective policy minimum/maximum kHz and logical CPU
+  count;
 - failed system and current-user systemd unit counts;
 - only the requested/default port numbers and whether each is listening.
 
@@ -46,6 +50,16 @@ The sched_ext fields are observation, not a scheduler selector. The observer rer
 monotonic enable sequence around the active-ops name and refuses a transition instead of emitting a
 mixed snapshot. An absent fixed sched_ext sysfs directory is reported as unsupported; malformed or
 partially available scheduler data fails the report.
+
+The CPU-policy fields likewise describe effective kernel state rather than desired policy. The
+observer brackets the per-CPU reads with the canonical online CPU list and refuses a transition.
+Offline configured CPUs do not contribute to the effective `nohz_full` or isolated counts. Empty
+`nohz_full` and isolated lists mean zero; malformed, duplicate,
+overlapping, reversed or out-of-range CPU lists fail closed. SMT and an entirely absent cpufreq
+interface are explicitly unsupported. Once any online CPU exposes cpufreq, every online CPU must
+provide a valid driver, governor, hardware maximum and effective policy bounds before the report
+emits grouped classes. Energy-performance preference is retained when the driver exposes it. The
+report exposes counts and classes, never CPU identifiers or sysfs paths.
 
 ## Performance evidence
 

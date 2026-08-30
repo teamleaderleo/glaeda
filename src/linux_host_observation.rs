@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::Read as _;
 use std::path::Path;
@@ -9,7 +9,7 @@ use serde::Serialize;
 
 use crate::process::{CommandSpec, TimedCommandExecutor};
 
-pub const LINUX_HOST_OBSERVATION_SCHEMA_VERSION: u8 = 2;
+pub const LINUX_HOST_OBSERVATION_SCHEMA_VERSION: u8 = 3;
 pub const DEFAULT_WATCHED_PORTS: &[u16] = &[
     3000, 3001, 4000, 4173, 4200, 5000, 5173, 5174, 8000, 8080, 8888,
 ];
@@ -22,6 +22,7 @@ const MAX_CPU_STAT_BYTES: usize = 1_048_576;
 const MAX_SOCKET_TABLE_BYTES: usize = 16 * 1_048_576;
 const MAX_FAILED_UNIT_OUTPUT_BYTES: usize = 65_536;
 const MAX_SCHEDULER_VALUE_BYTES: usize = 256;
+const MAX_CPU_LIST_BYTES: usize = 65_536;
 const MAX_LOGICAL_CPUS: u16 = 4_096;
 const MAX_FAILED_UNITS: u16 = 4_096;
 
@@ -114,6 +115,34 @@ pub struct PressureSample {
 pub struct SchedulerObservation {
     pub autogroup: SchedulerFeatureState,
     pub sched_ext: SchedExtObservation,
+    pub cpu_policy: CpuSchedulingPolicyObservation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CpuSchedulingPolicyObservation {
+    pub online_logical_cpus: u16,
+    pub smt: SchedulerFeatureState,
+    pub nohz_full_online_logical_cpus: u16,
+    pub isolated_online_logical_cpus: u16,
+    pub frequency: CpuFrequencyObservation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "support", rename_all = "snake_case")]
+pub enum CpuFrequencyObservation {
+    Unsupported,
+    Supported { classes: Vec<CpuFrequencyClass> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct CpuFrequencyClass {
+    pub driver: String,
+    pub governor: String,
+    pub energy_performance_preference: Option<String>,
+    pub hardware_max_frequency_khz: u64,
+    pub policy_min_frequency_khz: u64,
+    pub policy_max_frequency_khz: u64,
+    pub logical_cpus: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -295,9 +324,172 @@ fn observe_scheduler(
         Ok(metadata) if metadata.file_type().is_dir() => observe_sched_ext(&sched_ext_root)?,
         Ok(_) => return Err(invalid_kernel_data()),
     };
+    let cpu_policy = observe_cpu_policy(sys_root)?;
     Ok(SchedulerObservation {
         autogroup,
         sched_ext,
+        cpu_policy,
+    })
+}
+
+fn observe_cpu_policy(
+    sys_root: &Path,
+) -> Result<CpuSchedulingPolicyObservation, LinuxHostObservationError> {
+    let root = sys_root.join("devices/system/cpu");
+    let online_before = parse_cpu_list(
+        &read_bounded(&root.join("online"), MAX_CPU_LIST_BYTES)?,
+        false,
+    )?;
+    let online_logical_cpus =
+        u16::try_from(online_before.len()).map_err(|_| invalid_kernel_data())?;
+    let nohz_full_before = parse_cpu_list(
+        &read_bounded(&root.join("nohz_full"), MAX_CPU_LIST_BYTES)?,
+        true,
+    )?;
+    let isolated_before = parse_cpu_list(
+        &read_bounded(&root.join("isolated"), MAX_CPU_LIST_BYTES)?,
+        true,
+    )?;
+    let smt_before = observe_smt(&root)?;
+    let frequency_before = observe_cpu_frequency(&root, &online_before)?;
+    let nohz_full_after = parse_cpu_list(
+        &read_bounded(&root.join("nohz_full"), MAX_CPU_LIST_BYTES)?,
+        true,
+    )?;
+    let isolated_after = parse_cpu_list(
+        &read_bounded(&root.join("isolated"), MAX_CPU_LIST_BYTES)?,
+        true,
+    )?;
+    let smt_after = observe_smt(&root)?;
+    let frequency_after = observe_cpu_frequency(&root, &online_before)?;
+    let online_after = parse_cpu_list(
+        &read_bounded(&root.join("online"), MAX_CPU_LIST_BYTES)?,
+        false,
+    )?;
+    if online_before != online_after
+        || nohz_full_before != nohz_full_after
+        || isolated_before != isolated_after
+        || smt_before != smt_after
+        || frequency_before != frequency_after
+    {
+        return Err(observation_unavailable());
+    }
+    Ok(CpuSchedulingPolicyObservation {
+        online_logical_cpus,
+        smt: smt_after,
+        nohz_full_online_logical_cpus: u16::try_from(
+            nohz_full_after.intersection(&online_after).count(),
+        )
+        .map_err(|_| invalid_kernel_data())?,
+        isolated_online_logical_cpus: u16::try_from(
+            isolated_after.intersection(&online_after).count(),
+        )
+        .map_err(|_| invalid_kernel_data())?,
+        frequency: frequency_after,
+    })
+}
+
+fn observe_smt(cpu_root: &Path) -> Result<SchedulerFeatureState, LinuxHostObservationError> {
+    match read_optional_bounded(&cpu_root.join("smt/active"), MAX_SCHEDULER_VALUE_BYTES)? {
+        None => Ok(SchedulerFeatureState::Unsupported),
+        Some(value) => match value.trim() {
+            "0" => Ok(SchedulerFeatureState::Disabled),
+            "1" => Ok(SchedulerFeatureState::Enabled),
+            _ => Err(invalid_kernel_data()),
+        },
+    }
+}
+
+fn observe_cpu_frequency(
+    cpu_root: &Path,
+    online: &BTreeSet<u16>,
+) -> Result<CpuFrequencyObservation, LinuxHostObservationError> {
+    let mut saw_present = false;
+    let mut saw_absent = false;
+    let mut classes = BTreeMap::<(String, String, Option<String>, u64, u64, u64), u16>::new();
+    for cpu in online {
+        let root = cpu_root.join(format!("cpu{cpu}/cpufreq"));
+        let driver =
+            read_optional_bounded(&root.join("scaling_driver"), MAX_SCHEDULER_VALUE_BYTES)?;
+        let governor =
+            read_optional_bounded(&root.join("scaling_governor"), MAX_SCHEDULER_VALUE_BYTES)?;
+        let max_frequency =
+            read_optional_bounded(&root.join("cpuinfo_max_freq"), MAX_SCHEDULER_VALUE_BYTES)?;
+        let policy_min =
+            read_optional_bounded(&root.join("scaling_min_freq"), MAX_SCHEDULER_VALUE_BYTES)?;
+        let policy_max =
+            read_optional_bounded(&root.join("scaling_max_freq"), MAX_SCHEDULER_VALUE_BYTES)?;
+        let preference = read_optional_bounded(
+            &root.join("energy_performance_preference"),
+            MAX_SCHEDULER_VALUE_BYTES,
+        )?;
+        if driver.is_none()
+            && governor.is_none()
+            && max_frequency.is_none()
+            && policy_min.is_none()
+            && policy_max.is_none()
+            && preference.is_none()
+        {
+            saw_absent = true;
+            continue;
+        }
+        saw_present = true;
+        let hardware_max_frequency_khz =
+            parse_positive_u64(&max_frequency.ok_or_else(invalid_kernel_data)?)?;
+        let policy_min_frequency_khz =
+            parse_positive_u64(&policy_min.ok_or_else(invalid_kernel_data)?)?;
+        let policy_max_frequency_khz =
+            parse_positive_u64(&policy_max.ok_or_else(invalid_kernel_data)?)?;
+        if policy_min_frequency_khz > policy_max_frequency_khz
+            || policy_max_frequency_khz > hardware_max_frequency_khz
+        {
+            return Err(invalid_kernel_data());
+        }
+        let key = (
+            parse_kernel_identifier(&driver.ok_or_else(invalid_kernel_data)?)?,
+            parse_kernel_identifier(&governor.ok_or_else(invalid_kernel_data)?)?,
+            preference
+                .as_deref()
+                .map(parse_kernel_identifier)
+                .transpose()?,
+            hardware_max_frequency_khz,
+            policy_min_frequency_khz,
+            policy_max_frequency_khz,
+        );
+        let count = classes.entry(key).or_default();
+        *count = count.checked_add(1).ok_or_else(invalid_kernel_data)?;
+    }
+    if saw_present && saw_absent {
+        return Err(invalid_kernel_data());
+    }
+    if !saw_present {
+        return Ok(CpuFrequencyObservation::Unsupported);
+    }
+    Ok(CpuFrequencyObservation::Supported {
+        classes: classes
+            .into_iter()
+            .map(
+                |(
+                    (
+                        driver,
+                        governor,
+                        energy_performance_preference,
+                        hardware_max_frequency_khz,
+                        policy_min_frequency_khz,
+                        policy_max_frequency_khz,
+                    ),
+                    logical_cpus,
+                )| CpuFrequencyClass {
+                    driver,
+                    governor,
+                    energy_performance_preference,
+                    hardware_max_frequency_khz,
+                    policy_min_frequency_khz,
+                    policy_max_frequency_khz,
+                    logical_cpus,
+                },
+            )
+            .collect(),
     })
 }
 
@@ -362,6 +554,81 @@ fn parse_u64(value: &str) -> Result<u64, LinuxHostObservationError> {
         return Err(invalid_kernel_data());
     }
     value.parse().map_err(|_| invalid_kernel_data())
+}
+
+fn parse_positive_u64(value: &str) -> Result<u64, LinuxHostObservationError> {
+    let value = parse_u64(value)?;
+    if value == 0 {
+        Err(invalid_kernel_data())
+    } else {
+        Ok(value)
+    }
+}
+
+fn parse_kernel_identifier(value: &str) -> Result<String, LinuxHostObservationError> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > 63
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    {
+        return Err(invalid_kernel_data());
+    }
+    Ok(value.to_owned())
+}
+
+fn parse_cpu_list(
+    value: &str,
+    allow_empty: bool,
+) -> Result<BTreeSet<u16>, LinuxHostObservationError> {
+    let value = value.trim();
+    if value.is_empty() || (allow_empty && value == "(null)") {
+        return if allow_empty {
+            Ok(BTreeSet::new())
+        } else {
+            Err(invalid_kernel_data())
+        };
+    }
+    let mut cpus = BTreeSet::new();
+    for part in value.split(',') {
+        if part.is_empty() {
+            return Err(invalid_kernel_data());
+        }
+        let (start, end) = match part.split_once('-') {
+            None => {
+                let cpu = parse_cpu_id(part)?;
+                (cpu, cpu)
+            }
+            Some((start, end)) if !start.is_empty() && !end.is_empty() && !end.contains('-') => {
+                (parse_cpu_id(start)?, parse_cpu_id(end)?)
+            }
+            Some(_) => return Err(invalid_kernel_data()),
+        };
+        if start > end {
+            return Err(invalid_kernel_data());
+        }
+        for cpu in start..=end {
+            if !cpus.insert(cpu) {
+                return Err(invalid_kernel_data());
+            }
+        }
+    }
+    if cpus.len() > usize::from(MAX_LOGICAL_CPUS) {
+        return Err(invalid_kernel_data());
+    }
+    Ok(cpus)
+}
+
+fn parse_cpu_id(value: &str) -> Result<u16, LinuxHostObservationError> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(invalid_kernel_data());
+    }
+    let cpu = value.parse::<u16>().map_err(|_| invalid_kernel_data())?;
+    if cpu >= MAX_LOGICAL_CPUS {
+        return Err(invalid_kernel_data());
+    }
+    Ok(cpu)
 }
 
 fn normalize_ports(ports: &[u16]) -> Result<Vec<u16>, LinuxHostObservationError> {
@@ -689,9 +956,10 @@ mod tests {
     use crate::process::{CommandExecutor, CommandSpec, ExecutionRecord, TimedCommandExecutor};
 
     use super::{
-        LinuxHostObservation, LinuxHostObservationError, LinuxHostObservationErrorKind,
-        ObservedCount, SYSTEMCTL_TIMEOUT, SchedExtObservation, SchedExtState,
-        SchedulerFeatureState, observe_linux_host_at,
+        CpuFrequencyClass, CpuFrequencyObservation, LinuxHostObservation,
+        LinuxHostObservationError, LinuxHostObservationErrorKind, ObservedCount, SYSTEMCTL_TIMEOUT,
+        SchedExtObservation, SchedExtState, SchedulerFeatureState, observe_linux_host_at,
+        parse_cpu_list,
     };
 
     static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
@@ -709,6 +977,41 @@ mod tests {
             fs::create_dir_all(root.join("net")).expect("create network fixture");
             fs::create_dir_all(root.join("sys/kernel/sched_ext/root"))
                 .expect("create scheduler fixture");
+            fs::create_dir_all(root.join("sys/devices/system/cpu/smt"))
+                .expect("create SMT fixture");
+            for cpu in 0..2 {
+                let cpufreq = root.join(format!("sys/devices/system/cpu/cpu{cpu}/cpufreq"));
+                fs::create_dir_all(&cpufreq).expect("create CPU frequency fixture");
+                fs::write(cpufreq.join("scaling_driver"), "test_pstate\n")
+                    .expect("write scaling driver");
+                fs::write(cpufreq.join("scaling_governor"), "powersave\n")
+                    .expect("write scaling governor");
+                fs::write(
+                    cpufreq.join("cpuinfo_max_freq"),
+                    if cpu == 0 { "5000000\n" } else { "4000000\n" },
+                )
+                .expect("write maximum CPU frequency");
+                fs::write(cpufreq.join("scaling_min_freq"), "400000\n")
+                    .expect("write policy minimum CPU frequency");
+                fs::write(
+                    cpufreq.join("scaling_max_freq"),
+                    if cpu == 0 { "5000000\n" } else { "3500000\n" },
+                )
+                .expect("write policy maximum CPU frequency");
+                fs::write(
+                    cpufreq.join("energy_performance_preference"),
+                    "balance_performance\n",
+                )
+                .expect("write energy performance preference");
+            }
+            fs::write(root.join("sys/devices/system/cpu/online"), "0-1\n")
+                .expect("write online CPUs");
+            fs::write(root.join("sys/devices/system/cpu/nohz_full"), "\n")
+                .expect("write nohz_full CPUs");
+            fs::write(root.join("sys/devices/system/cpu/isolated"), "\n")
+                .expect("write isolated CPUs");
+            fs::write(root.join("sys/devices/system/cpu/smt/active"), "0\n")
+                .expect("write SMT state");
             fs::write(
                 root.join("stat"),
                 "cpu  1 2 3 4 5 6 7 8 9 10\ncpu0 1 2 3 4 5 6 7 8 9 10\ncpu1 1 2 3 4 5 6 7 8 9 10\nintr 1\n",
@@ -852,6 +1155,44 @@ mod tests {
                 state: SchedExtState::Disabled,
                 enable_sequence: 0,
                 active_ops: None,
+            }
+        );
+        assert_eq!(report.scheduler().cpu_policy.online_logical_cpus, 2);
+        assert_eq!(
+            report.scheduler().cpu_policy.smt,
+            SchedulerFeatureState::Disabled
+        );
+        assert_eq!(
+            report.scheduler().cpu_policy.nohz_full_online_logical_cpus,
+            0
+        );
+        assert_eq!(
+            report.scheduler().cpu_policy.isolated_online_logical_cpus,
+            0
+        );
+        assert_eq!(
+            report.scheduler().cpu_policy.frequency,
+            CpuFrequencyObservation::Supported {
+                classes: vec![
+                    CpuFrequencyClass {
+                        driver: "test_pstate".to_owned(),
+                        governor: "powersave".to_owned(),
+                        energy_performance_preference: Some("balance_performance".to_owned()),
+                        hardware_max_frequency_khz: 4_000_000,
+                        policy_min_frequency_khz: 400_000,
+                        policy_max_frequency_khz: 3_500_000,
+                        logical_cpus: 1,
+                    },
+                    CpuFrequencyClass {
+                        driver: "test_pstate".to_owned(),
+                        governor: "powersave".to_owned(),
+                        energy_performance_preference: Some("balance_performance".to_owned()),
+                        hardware_max_frequency_khz: 5_000_000,
+                        policy_min_frequency_khz: 400_000,
+                        policy_max_frequency_khz: 5_000_000,
+                        logical_cpus: 1,
+                    },
+                ],
             }
         );
         assert_eq!(report.services().system, ObservedCount::Known { count: 2 });
@@ -1013,5 +1354,108 @@ mod tests {
         let error = observe_fixture(&fixture, &[3000], 1000, &executor)
             .expect_err("malformed scheduler data");
         assert_eq!(error.kind, LinuxHostObservationErrorKind::InvalidKernelData);
+    }
+
+    #[test]
+    fn cpu_lists_are_canonical_bounded_sets() {
+        assert_eq!(
+            parse_cpu_list("0-2,7,9-10\n", false)
+                .expect("valid CPU list")
+                .into_iter()
+                .collect::<Vec<_>>(),
+            [0, 1, 2, 7, 9, 10]
+        );
+        assert!(
+            parse_cpu_list("\n", true)
+                .expect("empty optional list")
+                .is_empty()
+        );
+        assert!(
+            parse_cpu_list("(null)\n", true)
+                .expect("kernel null optional list")
+                .is_empty()
+        );
+        for malformed in ["", "0-1,1", "2-1", "0,,1", "0-1-2", "4096", "x"] {
+            assert!(
+                parse_cpu_list(malformed, false).is_err(),
+                "accepted {malformed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn absent_optional_cpu_policy_is_typed_but_partial_data_fails() {
+        let fixture = Fixture::new();
+        fs::remove_dir_all(fixture.path().join("sys/devices/system/cpu/smt"))
+            .expect("remove SMT fixture");
+        for cpu in 0..2 {
+            fs::remove_dir_all(
+                fixture
+                    .path()
+                    .join(format!("sys/devices/system/cpu/cpu{cpu}/cpufreq")),
+            )
+            .expect("remove CPU frequency fixture");
+        }
+        let executor = ScriptedExecutor::successful("", "");
+        let report = observe_fixture(&fixture, &[3000], 1000, &executor)
+            .expect("unsupported optional CPU policy");
+        assert_eq!(
+            report.scheduler().cpu_policy.smt,
+            SchedulerFeatureState::Unsupported
+        );
+        assert_eq!(
+            report.scheduler().cpu_policy.frequency,
+            CpuFrequencyObservation::Unsupported
+        );
+
+        let fixture = Fixture::new();
+        fs::remove_file(
+            fixture
+                .path()
+                .join("sys/devices/system/cpu/cpu1/cpufreq/scaling_governor"),
+        )
+        .expect("remove one governor");
+        let executor = ScriptedExecutor::successful("", "");
+        let error = observe_fixture(&fixture, &[3000], 1000, &executor)
+            .expect_err("partial CPU frequency policy");
+        assert_eq!(error.kind, LinuxHostObservationErrorKind::InvalidKernelData);
+    }
+
+    #[test]
+    fn cpu_policy_counts_only_online_members_and_rejects_invalid_frequency_bounds() {
+        let fixture = Fixture::new();
+        fs::write(
+            fixture.path().join("sys/devices/system/cpu/nohz_full"),
+            "2\n",
+        )
+        .expect("write offline nohz_full CPU");
+        let executor = ScriptedExecutor::successful("", "");
+        let report = observe_fixture(&fixture, &[3000], 1000, &executor)
+            .expect("offline configured nohz_full CPU");
+        assert_eq!(
+            report.scheduler().cpu_policy.nohz_full_online_logical_cpus,
+            0
+        );
+
+        let fixture = Fixture::new();
+        fs::write(
+            fixture
+                .path()
+                .join("sys/devices/system/cpu/cpu0/cpufreq/scaling_min_freq"),
+            "6000000\n",
+        )
+        .expect("write impossible policy bounds");
+        let executor = ScriptedExecutor::successful("", "");
+        let error = observe_fixture(&fixture, &[3000], 1000, &executor)
+            .expect_err("minimum frequency above maximum");
+        assert_eq!(error.kind, LinuxHostObservationErrorKind::InvalidKernelData);
+
+        let fixture = Fixture::new();
+        fs::write(fixture.path().join("sys/devices/system/cpu/online"), "0\n")
+            .expect("write one online CPU");
+        let executor = ScriptedExecutor::successful("", "");
+        let report =
+            observe_fixture(&fixture, &[3000], 1000, &executor).expect("one online CPU policy");
+        assert_eq!(report.scheduler().cpu_policy.online_logical_cpus, 1);
     }
 }

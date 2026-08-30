@@ -4,9 +4,9 @@ use std::process::ExitCode;
 use clap::{Parser, ValueEnum};
 #[cfg(target_os = "linux")]
 use glaeda::linux_host_observation::{
-    DEFAULT_WATCHED_PORTS, LinuxHostObservation, LinuxHostObservationError, MAX_WATCHED_PORTS,
-    ObservedCount, PressureSample, SchedExtObservation, SchedExtState, SchedulerFeatureState,
-    observe_linux_host,
+    CpuFrequencyObservation, DEFAULT_WATCHED_PORTS, LinuxHostObservation,
+    LinuxHostObservationError, MAX_WATCHED_PORTS, ObservedCount, PressureSample,
+    SchedExtObservation, SchedExtState, SchedulerFeatureState, observe_linux_host,
 };
 #[cfg(target_os = "linux")]
 use glaeda::process::ProcessExecutor;
@@ -142,6 +142,7 @@ fn render_human(report: &LinuxHostObservation) -> String {
             "memory: total={} available={} swap_used={} swap_total={} pressure={}\n",
             "io: pressure={}\n",
             "scheduler: autogroup={} sched_ext={}\n",
+            "cpu policy: online={} smt={} nohz_full={} isolated={} frequency={}\n",
             "failed units: system={} user={}\n",
             "watched ports: {}\n"
         ),
@@ -157,16 +158,52 @@ fn render_human(report: &LinuxHostObservation) -> String {
         memory.swap_total_bytes,
         render_pressure(pressure.memory),
         render_pressure(pressure.io),
-        match scheduler.autogroup {
-            SchedulerFeatureState::Unsupported => "unsupported",
-            SchedulerFeatureState::Disabled => "disabled",
-            SchedulerFeatureState::Enabled => "enabled",
-        },
+        render_feature_state(scheduler.autogroup),
         render_sched_ext(&scheduler.sched_ext),
+        scheduler.cpu_policy.online_logical_cpus,
+        render_feature_state(scheduler.cpu_policy.smt),
+        scheduler.cpu_policy.nohz_full_online_logical_cpus,
+        scheduler.cpu_policy.isolated_online_logical_cpus,
+        render_cpu_frequency(&scheduler.cpu_policy.frequency),
         render_count(services.system),
         render_count(services.user),
         ports,
     )
+}
+
+#[cfg(target_os = "linux")]
+const fn render_feature_state(state: SchedulerFeatureState) -> &'static str {
+    match state {
+        SchedulerFeatureState::Unsupported => "unsupported",
+        SchedulerFeatureState::Disabled => "disabled",
+        SchedulerFeatureState::Enabled => "enabled",
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn render_cpu_frequency(observation: &CpuFrequencyObservation) -> String {
+    match observation {
+        CpuFrequencyObservation::Unsupported => "unsupported".to_owned(),
+        CpuFrequencyObservation::Supported { classes } => classes
+            .iter()
+            .map(|class| {
+                format!(
+                    "{}/{}/epp={}/hardware_max={}khz/policy={}-{}khz:{}",
+                    class.driver,
+                    class.governor,
+                    class
+                        .energy_performance_preference
+                        .as_deref()
+                        .unwrap_or("none"),
+                    class.hardware_max_frequency_khz,
+                    class.policy_min_frequency_khz,
+                    class.policy_max_frequency_khz,
+                    class.logical_cpus
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(","),
+    }
 }
 
 #[cfg(target_os = "linux")]
