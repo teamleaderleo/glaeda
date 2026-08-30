@@ -653,16 +653,21 @@ recreating generation B at the identical pathname and commit, B printed `inherit
 `reused`, and performed zero preparation. Command-plus-preparation took 5.865 ms and 4.143 ms. This
 was stale cross-generation reuse, not a speed win.
 
-Exact clean candidate `2495562757cf089126e3e5eb7ac09fcc6f84c7f1` added physical
+Exact clean candidate `a5eb096f41cd8598b47c62bbfb23c06cf5bd0f70` added physical
 worktree/Git-object identity and a stable linked-worktree pointer-file witness to the implicit
-lineage. The backing filesystem immediately recycled the task `.git` file's device/inode
-(`66306:2772819`) across the two generations, while its ctime witness changed. Generation B printed
-`absent`; A and B both reported `seeded`, selected two distinct 0700 state roots, and took 5.521 ms
-and 5.108 ms command-plus-preparation. The discriminator therefore preserved same-generation reuse
-while replacing an invalid approximately 1.7 ms shortcut with a fresh private lineage. Explicit
-`--state` remained outside this policy so callers can deliberately own a cross-generation lineage.
+lineage, then held the validated task, Git, and cache objects through bubblewrap's FD-bound mount
+interface. The backing filesystem immediately recycled the task `.git` file's device/inode
+(`66306:2883962`) across the two generations, while its ctime witness changed. Generation B printed
+`absent`; A and B both reported `seeded`, selected two distinct 0700 state roots, and took 5.913 ms
+and 5.527 ms command-plus-preparation. An immediate third B invocation printed B's `second` marker,
+reported `reused`, and took 5.559 ms with zero preparation. The discriminator therefore preserved
+same-generation reuse while replacing an invalid approximately 1.7 ms shortcut with a fresh
+private lineage. A deterministic bind-FD regression also atomically replaced the validated source
+pathname before bubblewrap consumed it and proved the held generation—not the replacement—was
+mounted. Explicit `--state` remained outside lineage selection so callers can deliberately own a
+cross-generation lineage.
 
 Raw hot-run receipt SHA-256 digests:
 
 - exact-main control A/B: `84e8dcaaac372defc0b27a1c2a1d2c8145a09bdd44619c5447eee3a105226a27`, `aaa69dac28ba1bb4055a5f145e573b056ec58fb2f10863e388fed035dfbd1782`;
-- exact candidate A/B: `1c824289b513efb075435f1e19766332f17a47ad19ae485a6073b6199ffe6cb7`, `e2e036044fee790d289b6e397823433cf4c68e4f4f8713f384553ed2c266a1ea`.
+- exact candidate A/B/B-reuse: `14772750e1aabb4c080314b9d06249275e15da2f0078a0129393569aa83befab`, `ae2f87eac1f0335192a8e316c01d0416e08d29f9ef0a106c93a7b4e17215a650`, `31b6b953187775d0a8dda3d2fc9da733807d11c5132374a0ec583a054d1baf19`.
