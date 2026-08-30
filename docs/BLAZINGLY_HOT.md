@@ -644,6 +644,18 @@ noncanonical, mode-drifted, foreign-owned, active, and still-reachable state rem
 #910 tracks unreachable-generation retirement; #926 separately tracks the watermark/value policy
 needed to evict still-reachable but low-value Cargo targets.
 
+The bounded-discovery repair was measured at exact code `b3798eb39647c31576d7967e831e1ee30152d3f2`
+against rejected control `dbb3863c14d76880a8c7d155d84888926041c019`, Python 3.14.4 and Linux
+7.0.0-30-generic. Five hundred alternating calls over an empty namespace measured 2.170 microseconds
+control versus 2.205 microseconds candidate median: 34.5 nanoseconds / 1.59% added to the ordinary
+collector call. Thirty alternating calls over 10,000 foreign entries measured 1.961 milliseconds
+for the old complete scan versus 68.601 microseconds for the new typed bounded refusal: 96.50%
+lower / 28.59x. The large-directory results intentionally have different semantics; the candidate
+does not claim a complete inventory after its 256-entry ceiling. All 1,060 timed calls preserved
+both namespace state vectors. Harness and report SHA-256 values were
+`672ed7deae22b374fc394e90ffde9ea99afb034acedd7fb1e9bf4b1e4bf95b41` and
+`91515cb087951c0377c66923ca13f0251516fd0da59759c25c644ec3c8d3b47a`.
+
 All task state is expendable: discarding it or selecting a new empty `--state` path produces a
 private cold upper and a normal compiler rebuild. Bubblewrap and kernel OverlayFS are required for
 cross-worktree mode; running directly in the resident worktree does not require either.
