@@ -316,6 +316,60 @@ class LinkerBenchmarkTests(unittest.TestCase):
         self.assertIs(stopped[0].process, process)
         self.assertIs(stopped[0].scope, scope)
 
+    def test_post_fork_sigint_is_replayed_only_after_worker_registration(self) -> None:
+        capabilities = MODULE.Capabilities(
+            paths={"python": Path("/usr/bin/python3")},
+            versions={},
+            build_executables=frozenset(),
+            path_identity_sha256="sha256:" + "a" * 64,
+        )
+        process = mock.Mock(pid=123)
+        scope = MODULE.OwnedScope("unit.scope", -1, -1, -1, -1)
+
+        def interrupted_popen(*_arguments: object, **_keywords: object) -> mock.Mock:
+            os.kill(os.getpid(), signal.SIGINT)
+            return process
+
+        with tempfile.TemporaryDirectory() as temporary:
+            experiment = Path(temporary)
+            for name in ("targets", "receipts", "logs"):
+                (experiment / name).mkdir()
+            replacements = {
+                "foreign_build_count": mock.Mock(return_value=0),
+                "stop_workers": mock.Mock(),
+            }
+            scope_replacements = {
+                "unique_scope_unit": mock.Mock(return_value="unit.scope"),
+                "systemd_control_environment": mock.Mock(
+                    return_value={"LANG": "C.UTF-8"}
+                ),
+                "admit_scope": mock.Mock(return_value=scope),
+                "stop_transient_unit": mock.Mock(),
+            }
+            with mock.patch.dict(
+                MODULE.run_batch.__globals__, replacements
+            ), mock.patch.dict(
+                MODULE.start_owned_scope.__globals__, scope_replacements
+            ), mock.patch.object(
+                MODULE.subprocess, "Popen", side_effect=interrupted_popen
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    MODULE.run_batch(
+                        root=Path("/source"),
+                        experiment=experiment,
+                        source=MODULE.SourceIdentity("a" * 40, "b" * 40),
+                        capabilities=capabilities,
+                        linker="gnu",
+                        width=1,
+                        phase="cold",
+                        index=0,
+                    )
+        stopped = replacements["stop_workers"].call_args.args[0]
+        self.assertEqual(len(stopped), 1)
+        self.assertIs(stopped[0].process, process)
+        self.assertIs(stopped[0].scope, scope)
+        scope_replacements["stop_transient_unit"].assert_not_called()
+
     @unittest.skipUnless(
         os.environ.get("GLAEDA_RUN_LINKER_SCOPE_PHYSICAL") == "1",
         "explicit physical user-systemd scope test",

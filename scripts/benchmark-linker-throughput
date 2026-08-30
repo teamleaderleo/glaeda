@@ -127,6 +127,32 @@ class OwnedScope:
         self.cgroup_fd = -1
 
 
+class DeferredRegistrationInterrupt:
+    def __init__(self) -> None:
+        self.previous: Any = None
+        self.frame: Any = None
+        self.pending = False
+        self.installed = False
+
+    def defer(self, _signal_number: int, frame: Any) -> None:
+        self.pending = True
+        self.frame = frame
+
+    def __enter__(self) -> "DeferredRegistrationInterrupt":
+        self.previous = signal.getsignal(signal.SIGINT)
+        if callable(self.previous):
+            signal.signal(signal.SIGINT, self.defer)
+            self.installed = True
+        return self
+
+    def __exit__(self, _kind: Any, _value: Any, _traceback: Any) -> bool:
+        if self.installed:
+            signal.signal(signal.SIGINT, self.previous)
+        if self.pending:
+            self.previous(signal.SIGINT, self.frame)
+        return False
+
+
 def closed_child_environment() -> dict[str, str]:
     return {
         "LANG": "C.UTF-8",
@@ -1022,23 +1048,24 @@ def run_batch(
             scope: OwnedScope | None = None
             worker: Worker | None = None
             try:
-                process, scope = start_owned_scope(
-                    [
-                        sys.executable,
-                        Path(__file__).resolve(strict=True),
-                        INTERNAL_SCOPE_ENTRY,
-                        "--",
-                        root,
-                        target,
-                        linker,
-                        receipt,
-                        capability_search_path(capabilities),
-                    ],
-                    batch_timeout_seconds,
-                    stream,
-                )
-                worker = Worker(process, receipt, log, target, scope)
-                workers.append(worker)
+                with DeferredRegistrationInterrupt():
+                    process, scope = start_owned_scope(
+                        [
+                            sys.executable,
+                            Path(__file__).resolve(strict=True),
+                            INTERNAL_SCOPE_ENTRY,
+                            "--",
+                            root,
+                            target,
+                            linker,
+                            receipt,
+                            capability_search_path(capabilities),
+                        ],
+                        batch_timeout_seconds,
+                        stream,
+                    )
+                    worker = Worker(process, receipt, log, target, scope)
+                    workers.append(worker)
             except BaseException:
                 if worker is not None and all(
                     registered is not worker for registered in workers
