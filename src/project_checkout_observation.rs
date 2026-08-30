@@ -620,7 +620,7 @@ fn parse_status(value: &str) -> Result<ParsedStatus, ProjectCheckoutObservationE
         }
     }
     let branch = branch.ok_or_else(invalid_output)?;
-    if upstream_configured != local_commits_ahead.is_some() {
+    if !upstream_configured && local_commits_ahead.is_some() {
         return Err(invalid_output());
     }
     Ok(ParsedStatus {
@@ -1004,6 +1004,32 @@ mod tests {
         assert!(!json.contains("file.txt"));
         assert!(!json.contains("secret.txt"));
         assert!(!json.contains("/private/path"));
+    }
+
+    #[test]
+    fn configured_upstream_without_tracking_ref_has_unknown_ahead_count() {
+        let checkout = TempDirectory::new("missing-upstream-ref");
+        let status = format!(
+            "# branch.oid {COMMIT}\0# branch.head retained/topic\0# branch.upstream origin/removed-topic\0"
+        );
+        let executor = ScriptedExecutor::new(script(
+            checkout.path(),
+            "remote.origin.url\nhttps://github.com/example/project.git\0",
+            &status,
+            "100644\n",
+            "worktree /private/path\0HEAD 1111111111111111111111111111111111111111\0\0",
+        ));
+
+        let observation = observer()
+            .observe(checkout.path(), &executor)
+            .expect("configured upstream without a tracking ref remains observable");
+
+        assert!(observation.upstream_configured());
+        assert_eq!(observation.local_commits_ahead(), None);
+        assert!(matches!(
+            observation.branch(),
+            ProjectBranchState::Attached { name } if name == "retained/topic"
+        ));
     }
 
     #[test]

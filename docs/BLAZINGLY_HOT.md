@@ -546,6 +546,25 @@ lease, lock, mount, open-file, process, cleanup, and quarantine evidence unknown
 observation therefore reports disk occupancy but cannot make any state reclaimable. It creates no
 catalog, marker, adoption, retirement, or cleanup authority.
 
+An explicit checkout-local Cargo target has a separate Linux observation front door:
+
+```text
+glaeda-cargo-target-observe --checkout /canonical/checkout --output json
+```
+
+The command brackets one bounded descriptor-relative `target` metadata walk with two equal offline
+Git checkout observations. It reports an opaque target materialization identity, entry/directory/
+unique-object counts, logical bytes, visible `st_blocks * 512`, the latest observed object mtime,
+target/checkout and descendant-owner evidence, external-hardlink ambiguity, and metadata for the fixed `.rustc_info.json`
+marker when present. It follows no symlink, reads no target file content, uses `O_NOATIME`, remains
+on the checkout filesystem, and emits no checkout path or child name. Reflinks and shared extents
+mean visible blocks are not exclusive or necessarily reclaimable bytes.
+
+Activity, successful use, rebuild cost, retention value, ownership lifecycle, and deletion
+authority remain `unknown`. In particular, newest mtime is an observation, not proof of last
+successful use or idleness. Issue #926 owns later holder and cold-versus-warm value receipts before
+any target can become an eviction candidate.
+
 ## Linux mount path
 
 The privileged OverlayFS mount machinery is also concrete.

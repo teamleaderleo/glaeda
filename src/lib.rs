@@ -3,6 +3,9 @@ pub mod actions_runner_readiness;
 pub mod artifact;
 /// Pure, path-free classification of explicit hot-state inventory observations.
 pub mod cache_inventory;
+/// Read-only, descriptor-bound observation of one Linux Cargo target tree.
+#[cfg(target_os = "linux")]
+pub mod cargo_target_observation;
 /// Pure workload-neutral pre-admission compute request.
 pub mod compute_execution_request;
 /// Pure workload-family-neutral identity for declared compute semantics.

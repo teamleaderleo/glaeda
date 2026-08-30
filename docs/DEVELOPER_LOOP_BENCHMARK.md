@@ -897,3 +897,68 @@ non-Linux stub that exits two with a static unsupported-platform message; all Li
 items remain Linux-gated. The exact
 `cargo check --locked --all-targets --all-features --target aarch64-apple-darwin` control then
 passed. This correction changes no Linux observation semantics, benchmark control, or authority.
+
+## Checkout-local Cargo target cost observation — 2026-08-30
+
+Issue [#926](https://github.com/teamleaderleo/glaeda/issues/926) replaces path/age guesses with one
+bounded observation-only Cargo-target cost surface. Exact candidate
+`317491650fc682763ea199ac439d5a961de3466f` / tree
+`18325f1479473941d8f917a02206bf102244ac0e` produced a 1,809,080-byte release binary, SHA-256
+`467d2efb3d9f9c5e47a483a7e9347d70e0e4e2dfe8de17ef74d35f885e4d8dcc`.
+
+The command accepts one explicit canonical checkout. Two equal offline Git observations bind the
+commit, tree and physical worktree generation around one descriptor-relative `target` walk. The
+walk follows no symlink, reads no file content, uses `O_NOATIME`, remains on one filesystem, and
+rejects drift, unsupported objects, more than 2,000,000 entries or depth above 64. Its typed report
+contains no checkout path or child name. Visible `st_blocks * 512` is explicitly not exclusive or
+necessarily reclaimable when reflinks/shared extents exist. External hardlinks are reported rather
+than mislabeled as savings.
+
+The first all-worktree pass also found a legitimate existing Git shape: four configured branches
+had an upstream name but no `branch.ab` because their tracking refs were unavailable. The existing
+observer model already represents that state as `upstream_configured=true` and ahead count
+`unknown`, but its parser rejected it. The candidate now accepts that exact recovery fact while
+still refusing an ahead/behind record without any upstream; a focused regression covers the
+correction.
+
+The performance control used exact clean main
+`54cc3462220a520687f81e635cf6320d1c0ae664` / tree
+`1eaff79aa67b18796c264bc9b1fb5902d09a2201` and its unchanged retained Cargo target. One warmup
+per arm preceded 30 samples per arm in rotating six-permutation order. The incomplete lower bound
+was one GNU `du` allocated-byte pass; the normal complete control ran separate apparent and
+allocated passes; the candidate returned both totals plus Git, owner, hardlink, marker, count and
+mtime evidence.
+
+| Complete observation | n | Median wall | p95 wall | Median child CPU |
+| --- | ---: | ---: | ---: | ---: |
+| one allocated-only GNU `du` pass | 30 | 11.903998 ms | 14.274691 ms | 12.774000 ms |
+| apparent + allocated GNU `du` passes | 30 | 23.559662 ms | 28.240295 ms | 25.337500 ms |
+| typed Glaeda report | 30 | 41.140622 ms | 80.158346 ms | 45.757500 ms |
+
+Glaeda is not a faster raw directory walk: the additional identity and safety evidence cost
+17.580960 ms / 74.6231% at the median over the two-pass control. The absolute complete latency is
+still about 41 ms. Formal max-RSS is unavailable because the harness's `posix_spawn` child starts
+with the resident Python parent's prior RSS high-water mark; those equal inherited values were
+discarded rather than presented as command memory. Every candidate report and both `du` totals
+agreed on 5,327,636,580 logical and 5,341,753,344 allocated bytes across 6,948 entries. Source,
+target identity and the target/marker metadata vector remained unchanged. Matrix and harness
+SHA-256 values are respectively
+`0692b87d64365d0d9701d0fb803d73bd26842767f8f8127fe67b143c3490ce60` and
+`ef209fd3eb8475bcb95da64dc1c38ff9ac246ada3d4bd811c1f38909e1b7f20f`.
+
+The same exact binary observed all 13 registered Glaeda worktrees while no Cargo/rustc process was
+active. Eleven targets were present and two absent. The present targets contained 111,858 entries,
+95,312,350,828 logical bytes and 95,514,734,592 visible allocated bytes; per-target allocation
+ranged from 3,162,734,592 to 18,379,030,528 bytes. All eleven target/checkout and descendant-owner
+checks passed, all hardlink coverage was complete inside the observed trees, and every byte total
+matched the two GNU `du` controls. The 3,162,734,592-byte minimum is this candidate's disposable
+verification target; excluding it leaves 92,352,000,000 allocated bytes in ten pre-existing
+targets. Current activity, last successful use, rebuild cost, retention value and deletion
+authority remain unknown for every row. Inventory and inventory-harness SHA-256 values are
+`c4755a0a496f267ff1ba845da08d930ba8e959d2e72dd949d96013449711fe68` and
+`d72bc472fd29a3c601391bb785bda23bdd89b24d4fbb3faa52041b633895ba6d`.
+
+This slice performs no holder scan, benchmark-result reuse, cache adoption, worktree cleanup,
+retirement or deletion. The next #926 experiment must attach exact cold-versus-warm rebuild cost
+and direct holder evidence to these opaque target generations before proposing any retention
+policy.
