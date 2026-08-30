@@ -1553,6 +1553,44 @@ class HotRunTests(unittest.TestCase):
             with self.assertRaises(ProcessLookupError):
                 os.kill(pid, 0)
 
+    def test_timeout_escalates_when_the_leader_exits_before_its_group(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            measurement = fixture / "measurement.json"
+            child_pid = fixture / "child.pid"
+            result = subprocess.run(
+                [
+                    os.fspath(HOT_RUN),
+                    "--resident",
+                    os.fspath(ROOT),
+                    "--task",
+                    os.fspath(ROOT),
+                    "--timeout",
+                    "0.2",
+                    "--measurement",
+                    os.fspath(measurement),
+                    "--",
+                    "/bin/sh",
+                    "-c",
+                    (
+                        "trap 'exit 0' TERM; "
+                        f"/bin/sh -c 'trap \"\" TERM; exec sleep 60' & echo $! > {child_pid}; "
+                        "wait"
+                    ),
+                ],
+                stdin=subprocess.DEVNULL,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 124)
+            report = json.loads(measurement.read_text(encoding="utf-8"))
+            self.assertEqual(report["completion_reason"], "deadline_exceeded")
+            self.assertEqual(report["signal"], signal.SIGKILL)
+            self.assertGreaterEqual(report["elapsed_seconds"], 2.0)
+            self.assertLess(report["elapsed_seconds"], 3.0)
+            pid = int(child_pid.read_text(encoding="utf-8"))
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+
     def test_operator_interrupt_is_clean_and_writes_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = Path(directory)

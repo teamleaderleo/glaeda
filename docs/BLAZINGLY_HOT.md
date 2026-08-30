@@ -211,11 +211,15 @@ environment and terminal, optional comparison key, runtime executable digest, an
 descendant-bin binding without starting Python. The binary accepts only a task directory inside the
 named physical Git worktree and explicit `native` cache declarations. Its `--runtime-id`,
 `--runtime-sha256`, and `--runtime-bin` options preserve the contracts described below, including
-PATH-first descendant selection and preflight directory revalidation. It does not yet implement a
-deadline, resource profile, cross-worktree stable-path view, state preparation, or source-mtime
-seeding; those requests remain on `scripts/hot-run` rather than being silently weakened. This is
-still an observation-only ultra-trusted execution path. It grants no lease, cache, residency,
-validation, publication, or cleanup authority.
+PATH-first descendant selection and preflight directory revalidation. On Linux, `--timeout`
+places the complete command tree in a private process group, observes its leader through a pidfd,
+and forwards operator SIGINT or SIGTERM to the group. A wall-clock deadline sends SIGTERM, allows a
+two-second exit grace, continues observing the group if its leader exits first, then escalates any
+remaining members to SIGKILL; the receipt records exit 124 and
+`deadline_exceeded`. It does not yet implement a resource profile, cross-worktree stable-path view,
+state preparation, or source-mtime seeding; those requests remain on `scripts/hot-run` rather than
+being silently weakened. This is still an observation-only ultra-trusted execution path. It grants
+no lease, cache, residency, validation, publication, or cleanup authority.
 
 `private` starts with an empty directory and retains the task's later writes without OverlayFS
 copy-up. `private-copy` atomically seeds that directory once from the warm resident parent with GNU
@@ -439,10 +443,11 @@ explicitly `null` instead of fabricated on deadlines and operator interrupts.
 
 Heavy commands should also use `--timeout SECONDS`. The wall-clock deadline owns the whole command
 process group, first requests termination, escalates after a two-second grace period, returns the
-conventional status 124, and writes the failure receipt. An operator interrupt similarly returns
-130 without a Python traceback and records `operator_interrupt`. A timeout deliberately creates a
-separate process group; use the unbounded mode for commands that require interactive terminal job
-control.
+conventional status 124, and writes the failure receipt. It keeps observing the owned group when
+its leader exits before a descendant, so a signal-ignoring background child cannot escape the
+escalation. An operator interrupt similarly returns 130 without a Python traceback and records
+`operator_interrupt`. A timeout deliberately creates a separate process group; use the unbounded
+mode for commands that require interactive terminal job control.
 
 Heavy local work on the measured machine may opt into `--resource-profile big-red-heavy`. It uses
 one collected user systemd scope with a 1,200% CPU quota, 8 GiB memory-high threshold, 12 GiB hard
