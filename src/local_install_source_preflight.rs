@@ -17,12 +17,15 @@ use crate::process::TimedCommandExecutor;
 use crate::project_checkout_observation::{
     ProjectCheckoutObservation, ProjectCheckoutObservationErrorKind, ProjectCheckoutObserver,
 };
+use crate::project_workspace_identity::{
+    ProjectWorkspaceFilesystemIdentityKind, ProjectWorkspaceIdentityGeneration,
+    project_workspace_filesystem_identity,
+};
 
-pub const LOCAL_INSTALL_SOURCE_PREFLIGHT_SCHEMA_VERSION: u8 = 1;
+pub const LOCAL_INSTALL_SOURCE_PREFLIGHT_SCHEMA_VERSION: u8 = 2;
 pub const MAX_LOCAL_INSTALL_CARGO_LOCK_BYTES: usize = 4 * 1024 * 1024;
 
 const EXPECTED_PROJECT: &str = "github.com/teamleaderleo/smolrunner";
-const MATERIALIZATION_ID_DOMAIN: &[u8] = b"smolrunner-project-materialization-v1\0";
 const SHA256_PREFIX: &str = "sha256:";
 const HEX: &[u8; 16] = b"0123456789abcdef";
 const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
@@ -63,6 +66,7 @@ pub enum LocalInstallSourceBlockingCode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LocalInstallSourcePreflightReceipt {
     schema_version: u8,
+    identity_generation: ProjectWorkspaceIdentityGeneration,
     expected_source_digest: Sha256Digest,
     observed_project: LocalInstallSourceProjectDisposition,
     commit_match: bool,
@@ -78,6 +82,11 @@ impl LocalInstallSourcePreflightReceipt {
     #[must_use]
     pub const fn schema_version(&self) -> u8 {
         self.schema_version
+    }
+
+    #[must_use]
+    pub const fn identity_generation(&self) -> ProjectWorkspaceIdentityGeneration {
+        self.identity_generation
     }
 
     #[must_use]
@@ -139,16 +148,29 @@ pub fn observe_local_install_source_preflight(
     observer: &ProjectCheckoutObserver,
     executor: &impl TimedCommandExecutor,
 ) -> LocalInstallSourcePreflightReceipt {
-    let first_lock = match observe_lock_snapshot(checkout) {
+    let identity_generation = observer.identity_generation();
+    let first_lock = match observe_lock_snapshot(checkout, identity_generation) {
         Ok(snapshot) => snapshot,
         Err(LockSnapshotError::Unsafe) => {
-            return root_cause_receipt(expected, LocalInstallSourceBlockingCode::UnsafeSource);
+            return root_cause_receipt(
+                expected,
+                identity_generation,
+                LocalInstallSourceBlockingCode::UnsafeSource,
+            );
         }
         Err(LockSnapshotError::Unknown) => {
-            return root_cause_receipt(expected, LocalInstallSourceBlockingCode::UnknownSource);
+            return root_cause_receipt(
+                expected,
+                identity_generation,
+                LocalInstallSourceBlockingCode::UnknownSource,
+            );
         }
         Err(LockSnapshotError::Changed) => {
-            return root_cause_receipt(expected, LocalInstallSourceBlockingCode::SourceChanged);
+            return root_cause_receipt(
+                expected,
+                identity_generation,
+                LocalInstallSourceBlockingCode::SourceChanged,
+            );
         }
     };
 
@@ -169,31 +191,49 @@ pub fn observe_local_install_source_preflight(
                     LocalInstallSourceBlockingCode::UnknownSource
                 }
             };
-            return root_cause_receipt(expected, code);
+            return root_cause_receipt(expected, identity_generation, code);
         }
     };
 
-    let second_lock = match observe_lock_snapshot(checkout) {
+    let second_lock = match observe_lock_snapshot(checkout, identity_generation) {
         Ok(snapshot) => snapshot,
         Err(LockSnapshotError::Unsafe | LockSnapshotError::Changed) => {
-            return root_cause_receipt(expected, LocalInstallSourceBlockingCode::SourceChanged);
+            return root_cause_receipt(
+                expected,
+                identity_generation,
+                LocalInstallSourceBlockingCode::SourceChanged,
+            );
         }
         Err(LockSnapshotError::Unknown) => {
-            return root_cause_receipt(expected, LocalInstallSourceBlockingCode::UnknownSource);
+            return root_cause_receipt(
+                expected,
+                identity_generation,
+                LocalInstallSourceBlockingCode::UnknownSource,
+            );
         }
     };
 
     if !first_lock.same_as(&second_lock)
         || first_lock.materialization_id != *checkout_observation.materialization_id()
     {
-        return root_cause_receipt(expected, LocalInstallSourceBlockingCode::SourceChanged);
+        return root_cause_receipt(
+            expected,
+            identity_generation,
+            LocalInstallSourceBlockingCode::SourceChanged,
+        );
     }
 
-    stable_receipt(expected, &checkout_observation, &second_lock)
+    stable_receipt(
+        expected,
+        identity_generation,
+        &checkout_observation,
+        &second_lock,
+    )
 }
 
 fn stable_receipt(
     expected: &LocalInstallSourceIdentity,
+    identity_generation: ProjectWorkspaceIdentityGeneration,
     observation: &ProjectCheckoutObservation,
     lock: &LockSnapshot,
 ) -> LocalInstallSourcePreflightReceipt {
@@ -233,6 +273,7 @@ fn stable_receipt(
 
     LocalInstallSourcePreflightReceipt {
         schema_version: LOCAL_INSTALL_SOURCE_PREFLIGHT_SCHEMA_VERSION,
+        identity_generation,
         expected_source_digest: expected.digest().clone(),
         observed_project,
         commit_match,
@@ -247,10 +288,12 @@ fn stable_receipt(
 
 fn root_cause_receipt(
     expected: &LocalInstallSourceIdentity,
+    identity_generation: ProjectWorkspaceIdentityGeneration,
     code: LocalInstallSourceBlockingCode,
 ) -> LocalInstallSourcePreflightReceipt {
     LocalInstallSourcePreflightReceipt {
         schema_version: LOCAL_INSTALL_SOURCE_PREFLIGHT_SCHEMA_VERSION,
+        identity_generation,
         expected_source_digest: expected.digest().clone(),
         observed_project: LocalInstallSourceProjectDisposition::Unknown,
         commit_match: false,
@@ -334,7 +377,10 @@ enum LockSnapshotError {
     Changed,
 }
 
-fn observe_lock_snapshot(checkout: &Path) -> Result<LockSnapshot, LockSnapshotError> {
+fn observe_lock_snapshot(
+    checkout: &Path,
+    identity_generation: ProjectWorkspaceIdentityGeneration,
+) -> Result<LockSnapshot, LockSnapshotError> {
     if !valid_checkout_path(checkout) {
         return Err(LockSnapshotError::Unsafe);
     }
@@ -364,7 +410,7 @@ fn observe_lock_snapshot(checkout: &Path) -> Result<LockSnapshot, LockSnapshotEr
     }
 
     Ok(LockSnapshot {
-        materialization_id: materialization_id(&root_after),
+        materialization_id: materialization_id(&root_after, identity_generation),
         root: PrivateMetadata::from_metadata(&root_after),
         lock: PrivateMetadata::from_metadata(&lock_after),
         digest: sha256_digest(&bytes),
@@ -446,13 +492,18 @@ fn map_lock_open(error: Errno) -> LockSnapshotError {
     }
 }
 
-fn materialization_id(metadata: &std::fs::Metadata) -> Sha256Digest {
-    let mut hasher = Sha256::new();
-    hasher.update(MATERIALIZATION_ID_DOMAIN);
-    hasher.update(metadata.dev().to_be_bytes());
-    hasher.update(metadata.ino().to_be_bytes());
-    hasher.update(metadata.uid().to_be_bytes());
-    digest_from_hasher(hasher)
+fn materialization_id(
+    metadata: &std::fs::Metadata,
+    generation: ProjectWorkspaceIdentityGeneration,
+) -> Sha256Digest {
+    project_workspace_filesystem_identity(
+        generation,
+        ProjectWorkspaceFilesystemIdentityKind::Materialization,
+        metadata.dev(),
+        metadata.ino(),
+        metadata.uid(),
+    )
+    .expect("validated identity fields always produce canonical SHA-256")
 }
 
 fn sha256_digest(bytes: &[u8]) -> Sha256Digest {
@@ -670,14 +721,44 @@ mod tests {
         assert!(receipt.lockfile_digest_match());
         assert!(receipt.checkout_clean());
         assert_eq!(
+            receipt.identity_generation(),
+            ProjectWorkspaceIdentityGeneration::GlaedaV2
+        );
+        assert_eq!(
             receipt.observed_project(),
             LocalInstallSourceProjectDisposition::ExactSmolrunner
         );
         assert!(receipt.blocking_codes().is_empty());
         assert_eq!(executor.commands.borrow().len(), 16);
         let public = serde_json::to_string(&receipt).expect("receipt JSON");
+        assert!(public.contains("\"schema_version\":2"));
+        assert!(public.contains("\"identity_generation\":\"glaeda_v2\""));
         assert!(!public.contains(checkout.path().to_string_lossy().as_ref()));
         assert!(!public.contains("/private/path"));
+    }
+
+    #[test]
+    fn preflight_binds_lock_and_checkout_observation_to_one_explicit_generation() {
+        let checkout = TempCheckout::new("generation");
+        let legacy_observer = ProjectCheckoutObserver::with_identity_generation(
+            "/usr/bin/git",
+            ProjectWorkspaceIdentityGeneration::SmolrunnerV1,
+        )
+        .expect("legacy observer");
+        let receipt = observe_local_install_source_preflight(
+            &expected(LOCK_BYTES),
+            checkout.path(),
+            &legacy_observer,
+            &ScriptedExecutor::new(exact_script(checkout.path())),
+        );
+
+        assert!(receipt.ready());
+        assert_eq!(
+            receipt.identity_generation(),
+            ProjectWorkspaceIdentityGeneration::SmolrunnerV1
+        );
+        let public = serde_json::to_string(&receipt).expect("legacy receipt JSON");
+        assert!(public.contains("\"identity_generation\":\"smolrunner_v1\""));
     }
 
     #[test]
