@@ -34,7 +34,10 @@ use rustix::{
     event::{PollFd, PollFlags, Timespec, poll},
     fd::OwnedFd,
     io::Errno,
-    process::{Pid, PidfdFlags, Signal, kill_process_group, pidfd_open, test_kill_process_group},
+    process::{
+        Pid, PidfdFlags, Signal, getpgid, kill_process_group, pidfd_open, pidfd_send_signal,
+        test_kill_process_group,
+    },
     thread::sched_getaffinity,
 };
 use serde_json::{Map, Value, json};
@@ -677,6 +680,27 @@ fn send_process_group_signal(pid: Pid, signal: Signal) -> Result<(), String> {
 }
 
 #[cfg(target_os = "linux")]
+fn send_owned_signal(pid: Pid, pidfd: &OwnedFd, signal: Signal) -> Result<(), String> {
+    let group_missing = match kill_process_group(pid, signal) {
+        Ok(()) => false,
+        Err(Errno::SRCH) => true,
+        Err(_) => return Err("owned command process group could not be terminated".into()),
+    };
+    let leader_outside_group = match getpgid(Some(pid)) {
+        Ok(group) => group != pid,
+        Err(Errno::SRCH) => false,
+        Err(_) => return Err("owned command leader could not be observed".into()),
+    };
+    if group_missing || leader_outside_group {
+        match pidfd_send_signal(pidfd, signal) {
+            Ok(()) | Err(Errno::SRCH) => {}
+            Err(_) => return Err("owned command leader could not be terminated".into()),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 fn process_group_is_live(pid: Pid) -> Result<bool, String> {
     match test_kill_process_group(pid) {
         Ok(()) => Ok(true),
@@ -689,47 +713,52 @@ fn process_group_is_live(pid: Pid) -> Result<bool, String> {
 fn terminate_process_group_with_grace(
     child: &mut Child,
     pid: Pid,
+    pidfd: &OwnedFd,
     initial_signal: Signal,
 ) -> Result<(ExitStatus, i32), String> {
-    send_process_group_signal(pid, initial_signal)?;
-    let grace_deadline = Instant::now()
-        .checked_add(TERMINATION_GRACE)
-        .ok_or_else(|| "termination grace exceeds the supported clock range".to_owned())?;
-    let mut leader_status = None;
-    loop {
-        if leader_status.is_none() {
-            leader_status = child
-                .try_wait()
-                .map_err(|_| "owned command could not be observed".to_owned())?;
+    let result = (|| {
+        send_owned_signal(pid, pidfd, initial_signal)?;
+        let grace_deadline = Instant::now()
+            .checked_add(TERMINATION_GRACE)
+            .ok_or_else(|| "termination grace exceeds the supported clock range".to_owned())?;
+        let mut leader_status = None;
+        loop {
+            if leader_status.is_none() {
+                leader_status = child
+                    .try_wait()
+                    .map_err(|_| "owned command could not be observed".to_owned())?;
+            }
+            if !process_group_is_live(pid)?
+                && let Some(status) = leader_status
+            {
+                return Ok((status, initial_signal.as_raw()));
+            }
+            if Instant::now() >= grace_deadline {
+                send_owned_signal(pid, pidfd, Signal::KILL)?;
+                let status = match leader_status {
+                    Some(status) => status,
+                    None => child
+                        .wait()
+                        .map_err(|_| "owned command could not be reaped".to_owned())?,
+                };
+                return Ok((status, Signal::KILL.as_raw()));
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
-        if !process_group_is_live(pid)? {
-            let status = match leader_status {
-                Some(status) => status,
-                None => child
-                    .wait()
-                    .map_err(|_| "owned command could not be reaped".to_owned())?,
-            };
-            return Ok((status, initial_signal.as_raw()));
-        }
-        if Instant::now() >= grace_deadline {
-            send_process_group_signal(pid, Signal::KILL)?;
-            let status = match leader_status {
-                Some(status) => status,
-                None => child
-                    .wait()
-                    .map_err(|_| "owned command could not be reaped".to_owned())?,
-            };
-            return Ok((status, Signal::KILL.as_raw()));
-        }
-        std::thread::sleep(Duration::from_millis(10));
+    })();
+    if result.is_err() {
+        abort_timed_child(child, pid, Some(pidfd));
     }
+    result
 }
 
 #[cfg(target_os = "linux")]
-fn abort_timed_child(child: &mut Child, pid: Pid) {
-    if send_process_group_signal(pid, Signal::KILL).is_err() {
-        let _ = child.kill();
+fn abort_timed_child(child: &mut Child, pid: Pid, pidfd: Option<&OwnedFd>) {
+    let _ = send_process_group_signal(pid, Signal::KILL);
+    if let Some(pidfd) = pidfd {
+        let _ = pidfd_send_signal(pidfd, Signal::KILL);
     }
+    let _ = child.kill();
     let _ = child.wait();
 }
 
@@ -742,6 +771,7 @@ fn execute_command(
     timeout_seconds: Option<f64>,
     measured: bool,
 ) -> Result<CommandResult, String> {
+    let mut signal_control = timeout.map(|_| DeadlineSignalControl::new()).transpose()?;
     let mut time_report = None;
     let arguments = if measured {
         let gnu_time = resolve_program(OsStr::new("time"), cwd, None)?;
@@ -770,7 +800,6 @@ fn execute_command(
         command.to_vec()
     };
 
-    let mut signal_control = timeout.map(|_| DeadlineSignalControl::new()).transpose()?;
     let mut process = Command::new(&arguments[0]);
     process.args(&arguments[1..]).current_dir(cwd);
     if let Some(path) = environment_path {
@@ -780,13 +809,18 @@ fn execute_command(
         process.process_group(0);
     }
     let started = Instant::now();
-    let deadline = timeout
-        .map(|duration| {
-            started
-                .checked_add(duration)
-                .ok_or_else(|| "timeout exceeds the supported clock range".to_owned())
-        })
-        .transpose()?;
+    let deadline = match timeout {
+        Some(duration) => match started.checked_add(duration) {
+            Some(deadline) => Some(deadline),
+            None => {
+                if let Some(path) = time_report.as_ref() {
+                    let _ = fs::remove_file(path);
+                }
+                return Err("timeout exceeds the supported clock range".into());
+            }
+        },
+        None => None,
+    };
     let mut child = process.spawn().map_err(|error| {
         if let Some(path) = time_report.as_ref() {
             let _ = fs::remove_file(path);
@@ -799,7 +833,7 @@ fn execute_command(
         let pidfd = match pidfd_open(pid, PidfdFlags::empty()) {
             Ok(pidfd) => pidfd,
             Err(_) => {
-                abort_timed_child(&mut child, pid);
+                abort_timed_child(&mut child, pid, None);
                 if let Some(path) = time_report.as_ref() {
                     let _ = fs::remove_file(path);
                 }
@@ -815,7 +849,7 @@ fn execute_command(
         ) {
             Ok(outcome) => outcome,
             Err(error) => {
-                abort_timed_child(&mut child, pid);
+                abort_timed_child(&mut child, pid, Some(&pidfd));
                 if let Some(path) = time_report.as_ref() {
                     let _ = fs::remove_file(path);
                 }
@@ -823,9 +857,16 @@ fn execute_command(
             }
         };
         match outcome {
-            DeadlineWaitOutcome::Exited => child
-                .wait()
-                .map_err(|_| "owned command could not be reaped".to_owned())?,
+            DeadlineWaitOutcome::Exited => match child.wait() {
+                Ok(status) => status,
+                Err(_) => {
+                    abort_timed_child(&mut child, pid, Some(&pidfd));
+                    if let Some(path) = time_report.as_ref() {
+                        let _ = fs::remove_file(path);
+                    }
+                    return Err("owned command could not be reaped".into());
+                }
+            },
             DeadlineWaitOutcome::Interrupted(signal) => {
                 let initial = if signal == signal_hook::consts::signal::SIGINT {
                     Signal::INT
@@ -833,21 +874,46 @@ fn execute_command(
                     Signal::TERM
                 };
                 let (status, signal_used) =
-                    terminate_process_group_with_grace(&mut child, pid, initial)?;
+                    match terminate_process_group_with_grace(&mut child, pid, &pidfd, initial) {
+                        Ok(result) => result,
+                        Err(error) => {
+                            if let Some(path) = time_report.as_ref() {
+                                let _ = fs::remove_file(path);
+                            }
+                            return Err(error);
+                        }
+                    };
                 forced_completion = Some((128 + signal, signal_used, "operator_interrupt"));
                 status
             }
             DeadlineWaitOutcome::Deadline => {
                 let (status, signal_used) =
-                    terminate_process_group_with_grace(&mut child, pid, Signal::TERM)?;
+                    match terminate_process_group_with_grace(&mut child, pid, &pidfd, Signal::TERM)
+                    {
+                        Ok(result) => result,
+                        Err(error) => {
+                            if let Some(path) = time_report.as_ref() {
+                                let _ = fs::remove_file(path);
+                            }
+                            return Err(error);
+                        }
+                    };
                 forced_completion = Some((124, signal_used, "deadline_exceeded"));
                 status
             }
         }
     } else {
-        child
-            .wait()
-            .map_err(|error| format!("cannot wait for command: {error}"))?
+        match child.wait() {
+            Ok(status) => status,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                if let Some(path) = time_report.as_ref() {
+                    let _ = fs::remove_file(path);
+                }
+                return Err(format!("cannot wait for command: {error}"));
+            }
+        }
     };
     let elapsed = started.elapsed();
 
