@@ -586,18 +586,20 @@ def start_owned_scope(
         f"--property=TimeoutStopSec={math.ceil(SCOPE_TERMINATION_SECONDS)}s",
         *[os.fspath(value) for value in entry_argv],
     ]
-    process = subprocess.Popen(
-        command,
-        stdin=subprocess.DEVNULL,
-        stdout=stream,
-        stderr=subprocess.STDOUT,
-        env=systemd_control_environment(),
-        start_new_session=True,
-    )
+    process: subprocess.Popen[bytes] | None = None
     try:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=stream,
+            stderr=subprocess.STDOUT,
+            env=systemd_control_environment(),
+            start_new_session=True,
+        )
         scope = admit_scope(unit, process)
     except BaseException:
-        stop_transient_unit(unit, process)
+        if process is not None:
+            stop_transient_unit(unit, process)
         raise
     return process, scope
 
@@ -1015,7 +1017,11 @@ def run_batch(
             name = f"{phase}-{linker}-w{width}-{index}-{worker_index}{retry_suffix}"
             receipt = experiment / "receipts" / f"{name}.json"
             log = experiment / "logs" / f"{name}.log"
-            with log.open("xb") as stream:
+            stream = log.open("xb")
+            process: subprocess.Popen[bytes] | None = None
+            scope: OwnedScope | None = None
+            worker: Worker | None = None
+            try:
                 process, scope = start_owned_scope(
                     [
                         sys.executable,
@@ -1031,7 +1037,18 @@ def run_batch(
                     batch_timeout_seconds,
                     stream,
                 )
-            workers.append(Worker(process, receipt, log, target, scope))
+                worker = Worker(process, receipt, log, target, scope)
+                workers.append(worker)
+            except BaseException:
+                if worker is not None and all(
+                    registered is not worker for registered in workers
+                ):
+                    stop_workers([worker])
+                elif worker is None and process is not None and scope is not None:
+                    stop_workers([Worker(process, receipt, log, target, scope)])
+                raise
+            finally:
+                stream.close()
     except BaseException as error:
         try:
             stop_workers(workers)

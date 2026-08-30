@@ -182,6 +182,29 @@ class LinkerBenchmarkTests(unittest.TestCase):
         self.assertEqual(popen.call_args.kwargs["env"], {"LANG": "C.UTF-8"})
         self.assertTrue(popen.call_args.kwargs["start_new_session"])
 
+    def test_scope_launch_interrupt_after_popen_stops_the_transient_unit(self) -> None:
+        process = mock.Mock(pid=123)
+        replacements = {
+            "unique_scope_unit": mock.Mock(return_value="unit.scope"),
+            "systemd_control_environment": mock.Mock(
+                return_value={"LANG": "C.UTF-8"}
+            ),
+            "admit_scope": mock.Mock(side_effect=KeyboardInterrupt()),
+            "stop_transient_unit": mock.Mock(),
+        }
+        with mock.patch.dict(
+            MODULE.start_owned_scope.__globals__, replacements
+        ), mock.patch.object(MODULE.subprocess, "Popen", return_value=process):
+            with self.assertRaises(KeyboardInterrupt):
+                MODULE.start_owned_scope(
+                    ["/usr/bin/python3", "/private/entry"],
+                    90.0,
+                    subprocess.DEVNULL,
+                )
+        replacements["stop_transient_unit"].assert_called_once_with(
+            "unit.scope", process
+        )
+
     def test_scope_observation_and_kill_use_held_descriptors(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -248,6 +271,46 @@ class LinkerBenchmarkTests(unittest.TestCase):
                         index=0,
                     )
         self.assertIs(raised.exception, admission_error)
+        stopped = replacements["stop_workers"].call_args.args[0]
+        self.assertEqual(len(stopped), 1)
+        self.assertIs(stopped[0].process, process)
+        self.assertIs(stopped[0].scope, scope)
+
+    def test_post_admission_log_close_failure_stops_the_registered_worker(self) -> None:
+        capabilities = MODULE.Capabilities(
+            paths={"python": Path("/usr/bin/python3")},
+            versions={},
+            build_executables=frozenset(),
+            path_identity_sha256="sha256:" + "a" * 64,
+        )
+        process = mock.Mock(pid=123)
+        scope = MODULE.OwnedScope("unit.scope", -1, -1, -1, -1)
+        stream = mock.Mock()
+        stream.close.side_effect = OSError("validation-only close failure")
+        with tempfile.TemporaryDirectory() as temporary:
+            experiment = Path(temporary)
+            for name in ("targets", "receipts", "logs"):
+                (experiment / name).mkdir()
+            replacements = {
+                "foreign_build_count": mock.Mock(return_value=0),
+                "start_owned_scope": mock.Mock(return_value=(process, scope)),
+                "stop_workers": mock.Mock(),
+            }
+            with mock.patch.dict(
+                MODULE.run_batch.__globals__, replacements
+            ), mock.patch.object(MODULE.Path, "open", return_value=stream):
+                with self.assertRaises(MODULE.BenchmarkError) as raised:
+                    MODULE.run_batch(
+                        root=Path("/source"),
+                        experiment=experiment,
+                        source=MODULE.SourceIdentity("a" * 40, "b" * 40),
+                        capabilities=capabilities,
+                        linker="gnu",
+                        width=1,
+                        phase="cold",
+                        index=0,
+                    )
+        self.assertEqual(raised.exception.code, "worker_spawn")
         stopped = replacements["stop_workers"].call_args.args[0]
         self.assertEqual(len(stopped), 1)
         self.assertIs(stopped[0].process, process)
