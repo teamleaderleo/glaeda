@@ -458,11 +458,15 @@ one collected user systemd scope with a 1,200% CPU quota, 8 GiB memory-high thre
 memory ceiling, and 1,024-task ceiling. The explicitly machine-specific profile reflects big-red's
 12-way build point, which was within about 0.4% of 16-way Cargo while leaving interactive and
 multi-agent headroom. The profile is never applied to ordinary commands implicitly; an unscoped
-no-op avoided even the roughly 0.01-second scope cost. Glaeda generates the transient unit name,
-binds it to the launched `systemd-run` process's observed cgroup, signals the complete unit on a
-deadline or interrupt, and does not publish the terminal result until the kernel reports that exact
-cgroup empty. A child that creates a new session can escape the inner process group but not this
-resource-scope settlement check.
+no-op avoided even the roughly 0.01-second scope cost. Glaeda generates the transient unit name and
+uses its exact currently running executable as an in-scope entry helper. The helper stops itself
+before executing the workload and is resumed through its pidfd only after Glaeda has opened the
+launched process's exact cgroup directory and `cgroup.kill` control by file descriptor. A deadline
+or interrupt first signals the ordinary process group; if escaped descendants remain after the
+two-second grace, Glaeda writes the held fd-bound kill control and waits for `cgroup.events` through
+the held directory before publishing the terminal result. Neither observation nor mutation reopens
+the generated unit name. A fast-exiting leader and a child that creates a new session therefore
+cannot skip or escape the resource-scope settlement check.
 
 The task and resident must be worktrees of the same Git repository. Direct same-worktree execution
 may declare `native` cache observations; all other explicit modes require the cross-worktree path.

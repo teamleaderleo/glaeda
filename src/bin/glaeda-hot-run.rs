@@ -8,6 +8,8 @@ use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{Read as _, Write as _};
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd as _;
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{
     DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
@@ -33,10 +35,11 @@ use clap::{Parser, ValueEnum};
 use rustix::{
     event::{PollFd, PollFlags, Timespec, poll},
     fd::OwnedFd,
-    io::Errno,
+    fs::{Mode, OFlags, open as rustix_open, openat as rustix_openat},
+    io::{Errno, write as rustix_write},
     process::{
-        Pid, PidfdFlags, Signal, getpgid, kill_process_group, pidfd_open, pidfd_send_signal,
-        test_kill_process_group,
+        Pid, PidfdFlags, Signal, WaitOptions, getpgid, getpid, kill_process, kill_process_group,
+        pidfd_open, pidfd_send_signal, test_kill_process_group, waitpid,
     },
     thread::sched_getaffinity,
 };
@@ -46,7 +49,8 @@ use sha2::{Digest as _, Sha256};
 const MAX_OBSERVATION_BYTES: u64 = 64 * 1024;
 const TERMINATION_GRACE: Duration = Duration::from_secs(2);
 const RESOURCE_SCOPE_OBSERVATION_GRACE: Duration = Duration::from_secs(2);
-const RESOURCE_SCOPE_CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(target_os = "linux")]
+const INTERNAL_SCOPE_ENTRY: &str = "--glaeda-internal-scope-entry-v1";
 const HEAVY_SCOPE_PROPERTIES: &[&str] = &[
     "CPUQuota=1200%",
     "MemoryHigh=8G",
@@ -159,8 +163,14 @@ struct CommandResult {
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
 struct OwnedResourceScope {
-    unit: String,
-    cgroup: PathBuf,
+    cgroup: OwnedFd,
+    kill: OwnedFd,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct ResourceScopeEntryExecutable {
+    executable: File,
 }
 
 #[cfg(target_os = "linux")]
@@ -172,6 +182,17 @@ enum DeadlineWaitOutcome {
 }
 
 fn main() -> ExitCode {
+    #[cfg(target_os = "linux")]
+    if env::args_os().nth(1).as_deref() == Some(OsStr::new(INTERNAL_SCOPE_ENTRY)) {
+        let arguments = env::args_os().skip(2).collect::<Vec<_>>();
+        return match run_resource_scope_entry(arguments) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("glaeda-hot-run scope-entry error: {error}");
+                ExitCode::from(126)
+            }
+        };
+    }
     match run(Cli::parse()) {
         Ok(code) => ExitCode::from(u8::try_from(code).unwrap_or(255)),
         Err(error) => {
@@ -179,6 +200,21 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn run_resource_scope_entry(mut arguments: Vec<OsString>) -> Result<(), String> {
+    if arguments.first().map(OsString::as_os_str) != Some(OsStr::new("--")) {
+        return Err("internal scope entry arguments are invalid".into());
+    }
+    arguments.remove(0);
+    if arguments.is_empty() {
+        return Err("internal scope entry command is missing".into());
+    }
+    kill_process(getpid(), Signal::STOP)
+        .map_err(|_| "internal scope entry could not stop before admission".to_owned())?;
+    let error = Command::new(&arguments[0]).args(&arguments[1..]).exec();
+    Err(format!("cannot enter admitted resource scope: {error}"))
 }
 
 fn run(cli: Cli) -> Result<i32, String> {
@@ -706,6 +742,33 @@ fn wait_for_deadline_event(
 }
 
 #[cfg(target_os = "linux")]
+fn wait_for_resource_scope_deadline_event(
+    child: &mut Child,
+    scope: &OwnedResourceScope,
+    control: &mut DeadlineSignalControl,
+    deadline: Instant,
+) -> Result<(DeadlineWaitOutcome, Option<ExitStatus>), String> {
+    let mut leader_status = None;
+    loop {
+        if let Some(signal) = control.pending_signal() {
+            return Ok((DeadlineWaitOutcome::Interrupted(signal), leader_status));
+        }
+        if leader_status.is_none() {
+            leader_status = child
+                .try_wait()
+                .map_err(|_| "owned command could not be observed".to_owned())?;
+        }
+        if leader_status.is_some() && !resource_scope_is_populated(scope)? {
+            return Ok((DeadlineWaitOutcome::Exited, leader_status));
+        }
+        if Instant::now() >= deadline {
+            return Ok((DeadlineWaitOutcome::Deadline, leader_status));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn send_process_group_signal(pid: Pid, signal: Signal) -> Result<(), String> {
     match kill_process_group(pid, signal) {
         Ok(()) | Err(Errno::SRCH) => Ok(()),
@@ -809,6 +872,51 @@ fn unique_resource_scope_unit() -> Result<String, String> {
 }
 
 #[cfg(target_os = "linux")]
+impl ResourceScopeEntryExecutable {
+    fn prepare() -> Result<Self, String> {
+        let executable = File::open("/proc/self/exe")
+            .map_err(|_| "exact resource scope entry executable is unavailable".to_owned())?;
+        Ok(Self { executable })
+    }
+
+    fn proc_path(&self) -> PathBuf {
+        PathBuf::from(format!(
+            "/proc/{}/fd/{}",
+            std::process::id(),
+            self.executable.as_raw_fd()
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_resource_scope_entry_stop(
+    pid: Pid,
+    command_deadline: Option<Instant>,
+) -> Result<(), String> {
+    let observation_deadline = Instant::now()
+        .checked_add(RESOURCE_SCOPE_OBSERVATION_GRACE)
+        .ok_or_else(|| {
+            "resource scope entry observation exceeds the supported clock range".to_owned()
+        })?;
+    let deadline = command_deadline
+        .map(|deadline| deadline.min(observation_deadline))
+        .unwrap_or(observation_deadline);
+    loop {
+        match waitpid(Some(pid), WaitOptions::NOHANG | WaitOptions::UNTRACED) {
+            Ok(Some((_, status))) if status.stopping_signal() == Some(Signal::STOP.as_raw()) => {
+                return Ok(());
+            }
+            Ok(Some(_)) => return Err("resource scope entry exited before admission".into()),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) => return Err("resource scope entry could not be observed".into()),
+            Err(_) => return Err("resource scope entry could not be observed".into()),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn process_cgroup(pid: Pid) -> Result<Option<PathBuf>, String> {
     let path = PathBuf::from(format!("/proc/{}/cgroup", pid.as_raw_nonzero().get()));
     let raw = match fs::read_to_string(path) {
@@ -835,7 +943,7 @@ fn process_cgroup(pid: Pid) -> Result<Option<PathBuf>, String> {
 }
 
 #[cfg(target_os = "linux")]
-fn cgroup_filesystem_path(cgroup: &Path) -> Result<PathBuf, String> {
+fn open_cgroup_directory(cgroup: &Path) -> Result<OwnedFd, String> {
     let mut result = PathBuf::from("/sys/fs/cgroup");
     for component in cgroup.components() {
         match component {
@@ -844,7 +952,12 @@ fn cgroup_filesystem_path(cgroup: &Path) -> Result<PathBuf, String> {
             _ => return Err("resource scope membership is invalid".into()),
         }
     }
-    Ok(result)
+    rustix_open(
+        &result,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(|_| "owned resource scope could not be opened".to_owned())
 }
 
 #[cfg(target_os = "linux")]
@@ -852,7 +965,7 @@ fn observe_owned_resource_scope(
     pid: Pid,
     unit: &str,
     command_deadline: Option<Instant>,
-) -> Result<Option<OwnedResourceScope>, String> {
+) -> Result<OwnedResourceScope, String> {
     let observation_deadline = Instant::now()
         .checked_add(RESOURCE_SCOPE_OBSERVATION_GRACE)
         .ok_or_else(|| "resource scope observation exceeds the supported clock range".to_owned())?;
@@ -860,15 +973,18 @@ fn observe_owned_resource_scope(
         .map(|deadline| deadline.min(observation_deadline))
         .unwrap_or(observation_deadline);
     loop {
-        let Some(cgroup) = process_cgroup(pid)? else {
-            return Ok(None);
-        };
+        let cgroup = process_cgroup(pid)?
+            .ok_or_else(|| "resource scope ownership is unavailable".to_owned())?;
         if cgroup.file_name() == Some(OsStr::new(unit)) {
-            let cgroup = cgroup_filesystem_path(&cgroup)?;
-            return Ok(Some(OwnedResourceScope {
-                unit: unit.to_owned(),
-                cgroup,
-            }));
+            let cgroup = open_cgroup_directory(&cgroup)?;
+            let kill = rustix_openat(
+                &cgroup,
+                "cgroup.kill",
+                OFlags::WRONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::empty(),
+            )
+            .map_err(|_| "owned resource scope kill control is unavailable".to_owned())?;
+            return Ok(OwnedResourceScope { cgroup, kill });
         }
         if Instant::now() >= deadline {
             return Err("resource scope ownership could not be observed".into());
@@ -879,12 +995,26 @@ fn observe_owned_resource_scope(
 
 #[cfg(target_os = "linux")]
 fn resource_scope_is_populated(scope: &OwnedResourceScope) -> Result<bool, String> {
-    let events = match fs::read_to_string(scope.cgroup.join("cgroup.events")) {
+    let events = match rustix_openat(
+        &scope.cgroup,
+        "cgroup.events",
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    ) {
         Ok(events) => events,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(Errno::NOENT) => return Ok(false),
         Err(_) => return Err("owned resource scope could not be observed".into()),
     };
-    let mut populated = events
+    let events = File::from(events);
+    let mut raw = String::new();
+    events
+        .take(MAX_OBSERVATION_BYTES + 1)
+        .read_to_string(&mut raw)
+        .map_err(|_| "owned resource scope could not be observed".to_owned())?;
+    if raw.len() as u64 > MAX_OBSERVATION_BYTES {
+        return Err("owned resource scope observation is too large".into());
+    }
+    let mut populated = raw
         .lines()
         .filter_map(|line| line.strip_prefix("populated "));
     let Some(value) = populated.next() else {
@@ -920,55 +1050,13 @@ fn wait_for_resource_scope_empty(
 }
 
 #[cfg(target_os = "linux")]
-fn bounded_systemctl_signal(
-    systemctl: &Path,
-    scope: &OwnedResourceScope,
-    signal: Signal,
-) -> Result<(), String> {
-    let signal_name = match signal {
-        Signal::INT => "INT",
-        Signal::TERM => "TERM",
-        Signal::KILL => "KILL",
-        _ => return Err("unsupported resource scope signal".into()),
-    };
-    let mut command = Command::new(systemctl);
-    command
-        .args([
-            OsStr::new("--user"),
-            OsStr::new("kill"),
-            OsStr::new("--kill-whom=all"),
-            OsStr::new("--signal"),
-            OsStr::new(signal_name),
-            OsStr::new(&scope.unit),
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let mut child = command
-        .spawn()
-        .map_err(|_| "resource scope control could not be launched".to_owned())?;
-    let deadline = Instant::now()
-        .checked_add(RESOURCE_SCOPE_CONTROL_TIMEOUT)
-        .ok_or_else(|| "resource scope control exceeds the supported clock range".to_owned())?;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) if status.success() => return Ok(()),
-            Ok(Some(_)) if !resource_scope_is_populated(scope)? => return Ok(()),
-            Ok(Some(_)) => return Err("owned resource scope could not be terminated".into()),
-            Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err("resource scope control timed out".into());
-            }
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err("resource scope control could not be observed".into());
-            }
-        }
+fn kill_resource_scope(scope: &OwnedResourceScope) -> Result<(), String> {
+    if !resource_scope_is_populated(scope)? {
+        return Ok(());
+    }
+    match rustix_write(&scope.kill, b"1") {
+        Ok(1) => Ok(()),
+        _ => Err("owned resource scope could not be terminated".into()),
     }
 }
 
@@ -977,14 +1065,10 @@ fn terminate_resource_scope_with_grace(
     child: &mut Child,
     pid: Pid,
     pidfd: &OwnedFd,
-    systemctl: &Path,
     scope: &OwnedResourceScope,
     initial_signal: Signal,
 ) -> Result<(ExitStatus, i32), String> {
     let result = (|| {
-        if resource_scope_is_populated(scope)? {
-            bounded_systemctl_signal(systemctl, scope, initial_signal)?;
-        }
         send_owned_signal(pid, pidfd, initial_signal)?;
         let grace_deadline = Instant::now()
             .checked_add(TERMINATION_GRACE)
@@ -1007,10 +1091,7 @@ fn terminate_resource_scope_with_grace(
             std::thread::sleep(Duration::from_millis(10));
         }
 
-        if resource_scope_is_populated(scope)? {
-            bounded_systemctl_signal(systemctl, scope, Signal::KILL)?;
-        }
-        send_owned_signal(pid, pidfd, Signal::KILL)?;
+        kill_resource_scope(scope)?;
         let kill_deadline = Instant::now()
             .checked_add(TERMINATION_GRACE)
             .ok_or_else(|| "termination grace exceeds the supported clock range".to_owned())?;
@@ -1032,28 +1113,36 @@ fn terminate_resource_scope_with_grace(
         }
     })();
     if result.is_err() {
-        if resource_scope_is_populated(scope).unwrap_or(true) {
-            let _ = bounded_systemctl_signal(systemctl, scope, Signal::KILL);
-        }
+        let _ = kill_resource_scope(scope);
         abort_timed_child(child, pid, Some(pidfd));
+        let _ = wait_for_resource_scope_empty(scope, TERMINATION_GRACE);
     }
     result
 }
 
 #[cfg(target_os = "linux")]
-fn settle_finished_resource_scope(
-    systemctl: &Path,
-    scope: &OwnedResourceScope,
-) -> Result<(), String> {
+fn settle_finished_resource_scope(scope: &OwnedResourceScope) -> Result<(), String> {
     if wait_for_resource_scope_empty(scope, TERMINATION_GRACE)? {
         return Ok(());
     }
-    let _ = bounded_systemctl_signal(systemctl, scope, Signal::KILL);
+    kill_resource_scope(scope)?;
     if wait_for_resource_scope_empty(scope, TERMINATION_GRACE)? {
         Err("owned resource scope outlived its launcher".into())
     } else {
         Err("owned resource scope cleanup is incomplete".into())
     }
+}
+
+#[cfg(target_os = "linux")]
+fn abort_resource_scope_execution(
+    child: &mut Child,
+    pid: Pid,
+    pidfd: Option<&OwnedFd>,
+    scope: &OwnedResourceScope,
+) {
+    let _ = kill_resource_scope(scope);
+    abort_timed_child(child, pid, pidfd);
+    let _ = wait_for_resource_scope_empty(scope, TERMINATION_GRACE);
 }
 
 #[cfg(target_os = "linux")]
@@ -1070,11 +1159,11 @@ fn execute_command(
     let systemd_run = resource_profile
         .map(|_| resolve_program(OsStr::new("/usr/bin/systemd-run"), cwd, None))
         .transpose()?;
-    let systemctl = resource_profile
-        .map(|_| resolve_program(OsStr::new("/usr/bin/systemctl"), cwd, None))
-        .transpose()?;
     let resource_scope_unit = resource_profile
         .map(|_| unique_resource_scope_unit())
+        .transpose()?;
+    let resource_scope_entry = resource_profile
+        .map(|_| ResourceScopeEntryExecutable::prepare())
         .transpose()?;
     let mut time_report = None;
     let mut arguments = if measured {
@@ -1103,6 +1192,17 @@ fn execute_command(
     } else {
         command.to_vec()
     };
+    if let Some(scope_entry) = resource_scope_entry.as_ref() {
+        arguments = [
+            vec![
+                scope_entry.proc_path().into_os_string(),
+                OsString::from(INTERNAL_SCOPE_ENTRY),
+                OsString::from("--"),
+            ],
+            arguments,
+        ]
+        .concat();
+    }
     if let Some(systemd_run) = systemd_run {
         arguments = [
             vec![
@@ -1156,11 +1256,34 @@ fn execute_command(
         format!("cannot launch command: {error}")
     })?;
     let child_pid = Pid::from_child(&child);
+    let resource_scope_pidfd = if resource_profile.is_some() {
+        match pidfd_open(child_pid, PidfdFlags::empty()) {
+            Ok(pidfd) => Some(pidfd),
+            Err(_) => {
+                abort_timed_child(&mut child, child_pid, None);
+                if let Some(path) = time_report.as_ref() {
+                    let _ = fs::remove_file(path);
+                }
+                return Err("resource scope entry identity is unavailable".into());
+            }
+        }
+    } else {
+        None
+    };
+    if resource_profile.is_some()
+        && let Err(error) = wait_for_resource_scope_entry_stop(child_pid, deadline)
+    {
+        abort_timed_child(&mut child, child_pid, resource_scope_pidfd.as_ref());
+        if let Some(path) = time_report.as_ref() {
+            let _ = fs::remove_file(path);
+        }
+        return Err(error);
+    }
     let resource_scope = match resource_scope_unit.as_deref() {
         Some(unit) => match observe_owned_resource_scope(child_pid, unit, deadline) {
-            Ok(scope) => scope,
+            Ok(scope) => Some(scope),
             Err(error) => {
-                abort_timed_child(&mut child, child_pid, None);
+                abort_timed_child(&mut child, child_pid, resource_scope_pidfd.as_ref());
                 if let Some(path) = time_report.as_ref() {
                     let _ = fs::remove_file(path);
                 }
@@ -1169,29 +1292,68 @@ fn execute_command(
         },
         None => None,
     };
+    if let Some(pidfd) = resource_scope_pidfd.as_ref()
+        && let Err(error) = pidfd_send_signal(pidfd, Signal::CONT)
+    {
+        if let Some(scope) = resource_scope.as_ref() {
+            abort_resource_scope_execution(&mut child, child_pid, Some(pidfd), scope);
+        } else {
+            abort_timed_child(&mut child, child_pid, Some(pidfd));
+        }
+        if let Some(path) = time_report.as_ref() {
+            let _ = fs::remove_file(path);
+        }
+        return Err(format!(
+            "resource scope entry could not be admitted: {error}"
+        ));
+    }
+    drop(resource_scope_entry);
     let mut forced_completion = None;
     let status = if let Some(deadline) = deadline {
         let pid = child_pid;
-        let pidfd = match pidfd_open(pid, PidfdFlags::empty()) {
-            Ok(pidfd) => pidfd,
-            Err(_) => {
-                abort_timed_child(&mut child, pid, None);
-                if let Some(path) = time_report.as_ref() {
-                    let _ = fs::remove_file(path);
+        let pidfd = match resource_scope_pidfd {
+            Some(pidfd) => pidfd,
+            None => match pidfd_open(pid, PidfdFlags::empty()) {
+                Ok(pidfd) => pidfd,
+                Err(_) => {
+                    match resource_scope.as_ref() {
+                        Some(scope) => abort_resource_scope_execution(&mut child, pid, None, scope),
+                        None => abort_timed_child(&mut child, pid, None),
+                    }
+                    if let Some(path) = time_report.as_ref() {
+                        let _ = fs::remove_file(path);
+                    }
+                    return Err("deadline process observation is unavailable".into());
                 }
-                return Err("deadline process observation is unavailable".into());
-            }
+            },
         };
-        let outcome = match wait_for_deadline_event(
-            &pidfd,
-            signal_control
-                .as_mut()
-                .expect("deadline signal control exists"),
-            deadline,
-        ) {
+        let outcome = match resource_scope.as_ref() {
+            Some(scope) => wait_for_resource_scope_deadline_event(
+                &mut child,
+                scope,
+                signal_control
+                    .as_mut()
+                    .expect("deadline signal control exists"),
+                deadline,
+            ),
+            None => wait_for_deadline_event(
+                &pidfd,
+                signal_control
+                    .as_mut()
+                    .expect("deadline signal control exists"),
+                deadline,
+            )
+            .map(|outcome| (outcome, None)),
+        };
+        let (outcome, observed_status) = match outcome {
             Ok(outcome) => outcome,
             Err(error) => {
-                abort_timed_child(&mut child, pid, Some(&pidfd));
+                match resource_scope.as_ref() {
+                    Some(scope) => {
+                        abort_resource_scope_execution(&mut child, pid, Some(&pidfd), scope)
+                    }
+                    None => abort_timed_child(&mut child, pid, Some(&pidfd)),
+                }
                 if let Some(path) = time_report.as_ref() {
                     let _ = fs::remove_file(path);
                 }
@@ -1199,15 +1361,23 @@ fn execute_command(
             }
         };
         match outcome {
-            DeadlineWaitOutcome::Exited => match child.wait() {
-                Ok(status) => status,
-                Err(_) => {
-                    abort_timed_child(&mut child, pid, Some(&pidfd));
-                    if let Some(path) = time_report.as_ref() {
-                        let _ = fs::remove_file(path);
+            DeadlineWaitOutcome::Exited => match observed_status {
+                Some(status) => status,
+                None => match child.wait() {
+                    Ok(status) => status,
+                    Err(_) => {
+                        match resource_scope.as_ref() {
+                            Some(scope) => {
+                                abort_resource_scope_execution(&mut child, pid, Some(&pidfd), scope)
+                            }
+                            None => abort_timed_child(&mut child, pid, Some(&pidfd)),
+                        }
+                        if let Some(path) = time_report.as_ref() {
+                            let _ = fs::remove_file(path);
+                        }
+                        return Err("owned command could not be reaped".into());
                     }
-                    return Err("owned command could not be reaped".into());
-                }
+                },
             },
             DeadlineWaitOutcome::Interrupted(signal) => {
                 let initial = if signal == signal_hook::consts::signal::SIGINT {
@@ -1216,16 +1386,9 @@ fn execute_command(
                     Signal::TERM
                 };
                 let termination = match resource_scope.as_ref() {
-                    Some(scope) => terminate_resource_scope_with_grace(
-                        &mut child,
-                        pid,
-                        &pidfd,
-                        systemctl
-                            .as_deref()
-                            .expect("profiled command has systemctl"),
-                        scope,
-                        initial,
-                    ),
+                    Some(scope) => {
+                        terminate_resource_scope_with_grace(&mut child, pid, &pidfd, scope, initial)
+                    }
                     None => terminate_process_group_with_grace(&mut child, pid, &pidfd, initial),
                 };
                 let (status, signal_used) = match termination {
@@ -1246,9 +1409,6 @@ fn execute_command(
                         &mut child,
                         pid,
                         &pidfd,
-                        systemctl
-                            .as_deref()
-                            .expect("profiled command has systemctl"),
                         scope,
                         Signal::TERM,
                     ),
@@ -1273,8 +1433,15 @@ fn execute_command(
         match child.wait() {
             Ok(status) => status,
             Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                match resource_scope.as_ref() {
+                    Some(scope) => {
+                        abort_resource_scope_execution(&mut child, child_pid, None, scope)
+                    }
+                    None => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
+                }
                 if let Some(path) = time_report.as_ref() {
                     let _ = fs::remove_file(path);
                 }
@@ -1283,12 +1450,7 @@ fn execute_command(
         }
     };
     if let Some(scope) = resource_scope.as_ref()
-        && let Err(error) = settle_finished_resource_scope(
-            systemctl
-                .as_deref()
-                .expect("profiled command has systemctl"),
-            scope,
-        )
+        && let Err(error) = settle_finished_resource_scope(scope)
     {
         if let Some(path) = time_report.as_ref() {
             let _ = fs::remove_file(path);
@@ -1820,32 +1982,6 @@ mod tests {
         path
     }
 
-    #[cfg(target_os = "linux")]
-    fn heavy_user_scope_is_available() -> bool {
-        Command::new("/usr/bin/systemd-run")
-            .args([
-                "--user",
-                "--scope",
-                "--quiet",
-                "--collect",
-                "--expand-environment=no",
-                "--property",
-                "CPUQuota=1200%",
-                "--property",
-                "MemoryHigh=8G",
-                "--property",
-                "MemoryMax=12G",
-                "--property",
-                "TasksMax=1024",
-                "/bin/true",
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success())
-    }
-
     #[test]
     fn comparison_keys_are_canonical() {
         assert!(validate_comparison_key(&format!("sha256:{}", "a".repeat(64))).is_ok());
@@ -1979,72 +2115,6 @@ mod tests {
             0o600
         );
         fs::remove_file(measurement).unwrap();
-        fs::remove_dir(fixture).unwrap();
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn heavy_profile_applies_exact_cgroup_limits_and_receipt() {
-        if !heavy_user_scope_is_available() {
-            return;
-        }
-        let fixture = test_directory("glaeda-hot-run-profile-test");
-        let observation = fixture.join("cgroup.txt");
-        let measurement = fixture.join("measurement.json");
-        let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let shell = format!(
-            "group=$(/usr/bin/awk -F: '$1 == \"0\" {{ print $3 }}' /proc/self/cgroup); \
-             /usr/bin/printf 'cpu=%s\\nhigh=%s\\nmax=%s\\npids=%s\\nliteral=%s\\n' \
-             \"$(/usr/bin/cat /sys/fs/cgroup$group/cpu.max)\" \
-             \"$(/usr/bin/cat /sys/fs/cgroup$group/memory.high)\" \
-             \"$(/usr/bin/cat /sys/fs/cgroup$group/memory.max)\" \
-             \"$(/usr/bin/cat /sys/fs/cgroup$group/pids.max)\" \"$1\" > {}; exit 17",
-            observation.display()
-        );
-        let code = run(Cli {
-            resident: repository.clone(),
-            task: repository,
-            cache: Vec::new(),
-            measurement: Some(measurement.clone()),
-            comparison_key: None,
-            runtime_id: None,
-            runtime_sha256: None,
-            runtime_bin: None,
-            timeout: Some(3.0),
-            resource_profile: Some(ResourceProfile::BigRedHeavy),
-            command: vec![
-                OsString::from("/bin/sh"),
-                OsString::from("-c"),
-                OsString::from(shell),
-                OsString::from("glaeda-profile-test"),
-                OsString::from("${HOME}"),
-            ],
-        })
-        .unwrap();
-        assert_eq!(code, 17);
-        let cgroup = fs::read_to_string(&observation).unwrap();
-        let mut lines = cgroup.lines();
-        let cpu = lines.next().unwrap().strip_prefix("cpu=").unwrap();
-        let (quota, period) = cpu.split_once(' ').unwrap();
-        let quota = quota.parse::<u64>().unwrap();
-        let period = period.parse::<u64>().unwrap();
-        assert_eq!(quota, period * 12);
-        assert_eq!(lines.next(), Some("high=8589934592"));
-        assert_eq!(lines.next(), Some("max=12884901888"));
-        assert_eq!(lines.next(), Some("pids=1024"));
-        assert_eq!(lines.next(), Some("literal=${HOME}"));
-        assert_eq!(lines.next(), None);
-
-        let report: Value = serde_json::from_reader(File::open(&measurement).unwrap()).unwrap();
-        assert_eq!(report["timeout_seconds"], 3.0);
-        assert_eq!(report["resource_profile"], "big-red-heavy");
-        assert_eq!(report["resource_accounting"], "gnu_time_inside_scope");
-        assert_eq!(report["exit_code"], 17);
-        assert_eq!(report["signal"], Value::Null);
-        assert_eq!(report["completion_reason"], "exited");
-
-        fs::remove_file(measurement).unwrap();
-        fs::remove_file(observation).unwrap();
         fs::remove_dir(fixture).unwrap();
     }
 

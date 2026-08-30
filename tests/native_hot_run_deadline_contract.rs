@@ -2,12 +2,15 @@
 
 use std::fs;
 use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rustix::io::Errno;
 use rustix::process::{Pid, Signal, kill_process, kill_process_group, test_kill_process};
 use serde_json::Value;
+
+static HEAVY_SCOPE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 struct RunningFixture {
     directory: std::path::PathBuf,
@@ -94,6 +97,82 @@ fn heavy_user_scope_is_available() -> bool {
 }
 
 #[test]
+fn heavy_profile_applies_exact_cgroup_limits_and_receipt() {
+    let _scope_guard = HEAVY_SCOPE_TEST_LOCK.lock().unwrap();
+    if !heavy_user_scope_is_available() {
+        return;
+    }
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "glaeda-native-hot-run-profile-limits-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir(&directory).unwrap();
+    let observation = directory.join("cgroup.txt");
+    let measurement = directory.join("measurement.json");
+    let shell = format!(
+        "group=$(/usr/bin/awk -F: '$1 == \"0\" {{ print $3 }}' /proc/self/cgroup); \
+         /usr/bin/printf 'cpu=%s\\nhigh=%s\\nmax=%s\\npids=%s\\nliteral=%s\\n' \
+         \"$(/usr/bin/cat /sys/fs/cgroup$group/cpu.max)\" \
+         \"$(/usr/bin/cat /sys/fs/cgroup$group/memory.high)\" \
+         \"$(/usr/bin/cat /sys/fs/cgroup$group/memory.max)\" \
+         \"$(/usr/bin/cat /sys/fs/cgroup$group/pids.max)\" \"$1\" > {}; exit 17",
+        observation.display()
+    );
+    let repository = env!("CARGO_MANIFEST_DIR");
+    let status = Command::new(env!("CARGO_BIN_EXE_glaeda-hot-run"))
+        .args([
+            "--resident",
+            repository,
+            "--task",
+            repository,
+            "--resource-profile",
+            "big-red-heavy",
+            "--measurement",
+            measurement.to_str().unwrap(),
+            "--timeout",
+            "3",
+            "--",
+            "/bin/sh",
+            "-c",
+            &shell,
+            "glaeda-profile-test",
+            "${HOME}",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(17));
+
+    let cgroup = fs::read_to_string(&observation).unwrap();
+    let mut lines = cgroup.lines();
+    let cpu = lines.next().unwrap().strip_prefix("cpu=").unwrap();
+    let (quota, period) = cpu.split_once(' ').unwrap();
+    let quota = quota.parse::<u64>().unwrap();
+    let period = period.parse::<u64>().unwrap();
+    assert_eq!(quota, period * 12);
+    assert_eq!(lines.next(), Some("high=8589934592"));
+    assert_eq!(lines.next(), Some("max=12884901888"));
+    assert_eq!(lines.next(), Some("pids=1024"));
+    assert_eq!(lines.next(), Some("literal=${HOME}"));
+    assert_eq!(lines.next(), None);
+
+    let report: Value = serde_json::from_reader(fs::File::open(&measurement).unwrap()).unwrap();
+    assert_eq!(report["timeout_seconds"], 3.0);
+    assert_eq!(report["resource_profile"], "big-red-heavy");
+    assert_eq!(report["resource_accounting"], "gnu_time_inside_scope");
+    assert_eq!(report["exit_code"], 17);
+    assert_eq!(report["signal"], Value::Null);
+    assert_eq!(report["completion_reason"], "exited");
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn sigint_is_forwarded_to_the_owned_process_group_and_receipted() {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -171,6 +250,7 @@ fn sigint_is_forwarded_to_the_owned_process_group_and_receipted() {
 
 #[test]
 fn profiled_deadline_terminates_the_scoped_process_group_and_receipts_it() {
+    let _scope_guard = HEAVY_SCOPE_TEST_LOCK.lock().unwrap();
     if !heavy_user_scope_is_available() {
         return;
     }
@@ -208,7 +288,7 @@ fn profiled_deadline_terminates_the_scoped_process_group_and_receipts_it() {
             "--measurement",
             measurement.to_str().unwrap(),
             "--timeout",
-            "0.2",
+            "1",
             "--",
             "/bin/sh",
             "-c",
@@ -254,12 +334,90 @@ fn profiled_deadline_terminates_the_scoped_process_group_and_receipts_it() {
 
     let report: Value = serde_json::from_reader(fs::File::open(&measurement).unwrap()).unwrap();
     assert_eq!(report["resource_profile"], "big-red-heavy");
-    assert_eq!(report["timeout_seconds"], 0.2);
+    assert_eq!(report["timeout_seconds"], 1.0);
     assert_eq!(report["exit_code"], 124);
-    assert_eq!(report["signal"], signal_hook::consts::signal::SIGTERM);
+    assert_eq!(report["signal"], signal_hook::consts::signal::SIGKILL);
     assert_eq!(report["completion_reason"], "deadline_exceeded");
     assert_eq!(
         report["resource_accounting"],
         "unavailable_after_forced_termination"
     );
+}
+
+#[test]
+fn profiled_deadline_waits_for_scope_after_fast_leader_exit() {
+    let _scope_guard = HEAVY_SCOPE_TEST_LOCK.lock().unwrap();
+    if !heavy_user_scope_is_available() {
+        return;
+    }
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "glaeda-native-hot-run-fast-leader-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir(&directory).unwrap();
+    let leader_file = directory.join("leader.pid");
+    let descendant_file = directory.join("descendant.pid");
+    let measurement = directory.join("measurement.json");
+    let shell = format!(
+        "/usr/bin/awk '{{ print $5 }}' /proc/self/stat > {}; \
+         /usr/bin/setsid /bin/sh -c \
+         'echo $$ > {}; exec /bin/sleep 60' & exit 0",
+        leader_file.display(),
+        descendant_file.display()
+    );
+    let repository = env!("CARGO_MANIFEST_DIR");
+    let wrapper = Command::new(env!("CARGO_BIN_EXE_glaeda-hot-run"))
+        .args([
+            "--resident",
+            repository,
+            "--task",
+            repository,
+            "--resource-profile",
+            "big-red-heavy",
+            "--measurement",
+            measurement.to_str().unwrap(),
+            "--timeout",
+            "1",
+            "--",
+            "/bin/sh",
+            "-c",
+            &shell,
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut fixture = RunningFixture {
+        directory,
+        leader_file,
+        descendant_file: descendant_file.clone(),
+        wrapper: Some(wrapper),
+    };
+    wait_for_file(&descendant_file, Duration::from_secs(3));
+
+    let status = wait_for_exit(fixture.wrapper.as_mut().unwrap(), Duration::from_secs(5));
+    assert_eq!(status.code(), Some(124));
+    fixture.wrapper = None;
+
+    let descendant_pid = fs::read_to_string(&descendant_file)
+        .unwrap()
+        .trim()
+        .parse::<i32>()
+        .unwrap();
+    wait_for_process_absence(
+        Pid::from_raw(descendant_pid).unwrap(),
+        Duration::from_secs(2),
+        "fast-leader descendant",
+    );
+
+    let report: Value = serde_json::from_reader(fs::File::open(&measurement).unwrap()).unwrap();
+    assert_eq!(report["resource_profile"], "big-red-heavy");
+    assert_eq!(report["timeout_seconds"], 1.0);
+    assert_eq!(report["exit_code"], 124);
+    assert_eq!(report["signal"], signal_hook::consts::signal::SIGKILL);
+    assert_eq!(report["completion_reason"], "deadline_exceeded");
 }
