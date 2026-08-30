@@ -253,3 +253,37 @@ fn parent_directory_replacement_during_cargo_probe_is_changed() {
     );
     assert_path_private(&receipt, &fixture);
 }
+
+#[test]
+fn writable_toolchain_parent_is_unsafe_without_executing_a_probe() {
+    let fixture = TempToolchain::new("writable-parent");
+    fs::set_permissions(&fixture.bin, fs::Permissions::from_mode(0o777))
+        .expect("make toolchain parent world writable");
+    let context = fixture.context();
+    let executor = ScriptedExecutor::new(Vec::new());
+
+    let receipt = observe_local_install_toolchain_preflight(&expected(), &context, &executor);
+
+    assert_eq!(
+        receipt.cargo(),
+        LocalInstallToolchainExecutableDisposition::Unsafe
+    );
+    assert_eq!(
+        receipt.rustc(),
+        LocalInstallToolchainExecutableDisposition::Unsafe
+    );
+    assert_eq!(
+        receipt.rustdoc(),
+        LocalInstallToolchainExecutableDisposition::Unsafe
+    );
+    assert_eq!(
+        receipt.blocking_codes(),
+        [
+            LocalInstallToolchainBlockingCode::CargoUnsafe,
+            LocalInstallToolchainBlockingCode::RustcUnsafe,
+            LocalInstallToolchainBlockingCode::RustdocUnsafe,
+        ]
+    );
+    assert_eq!(executor.calls.get(), 0);
+    assert_path_private(&receipt, &fixture);
+}

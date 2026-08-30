@@ -107,6 +107,46 @@ jobs:
             echo "This check is advisory and does not run the noisier repository-wide scan."
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Detect changed workflow surface
+        id: workflow-scope
+        if: steps.base.outputs.available == 'true'
+        env:
+          CULTIST_BASE: ${{ steps.base.outputs.revision }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet "$CULTIST_BASE"...HEAD -- .github/workflows; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # This analyzer is useful only when the workflow surface changes. Keeping
+      # it scoped avoids repeating a correct but irrelevant negative on every
+      # ordinary Rust change.
+      - name: Inspect CI test-filter evidence
+        if: steps.workflow-scope.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          report="$RUNNER_TEMP/cultist-ci-tests.json"
+          cargo-cultist ci-tests --format json . > "$report"
+          jq -e '
+            .schema_version == 1 and
+            .analysis == "ci-test-filter-inventory" and
+            (.claims | type == "array") and
+            (.findings | type == "array")
+          ' "$report" >/dev/null
+          jq '{schema_version, analysis, claims, findings}' "$report"
+
+          {
+            echo
+            echo "## Cultist CI test-filter evidence"
+            echo
+            echo "- Claims: $(jq '.claims | length' "$report")"
+            echo "- Findings: $(jq '.findings | length' "$report")"
+            echo
+            echo "This advisory inventory ran because the workflow surface changed."
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Explain unavailable comparison base
         if: steps.base.outputs.available != 'true'
         run: |

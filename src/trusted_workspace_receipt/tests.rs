@@ -9,11 +9,15 @@ use crate::state::InstallationId;
 use crate::state_document::{
     ProjectStateDocument, ResourceStateDocument, StateDocument, encode_state_document,
 };
+use crate::state_root_generation::{
+    GLAEDA_CURRENT_STATE_ROOT, SMOLRUNNER_LEGACY_STATE_ROOT, StateRootSelection,
+};
 
 use super::{
     CACHE_RESOURCE_FILE, PROJECT_FILE, RESOURCES_DIRECTORY, TrustedWorkspaceReceiptErrorKind,
     WORKSPACE_RESOURCE_FILE, produce_trusted_workspace_cache_receipt,
     produce_trusted_workspace_cache_receipt_for_generation, produce_with_hook,
+    select_trusted_workspace_root,
 };
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
@@ -211,6 +215,31 @@ fn descriptor_relative_success_is_private_and_deterministic() {
         second.workspace_location_identity(),
         first.workspace_location_identity()
     );
+}
+
+#[test]
+fn fixed_root_selection_seals_the_matching_identity_generation() {
+    let current = select_trusted_workspace_root(StateRootSelection::Current);
+    let legacy = select_trusted_workspace_root(StateRootSelection::LegacySmolrunnerV1);
+
+    assert_eq!(
+        current.root.fixed_path(),
+        Path::new(GLAEDA_CURRENT_STATE_ROOT)
+    );
+    assert_eq!(
+        current.identity_generation,
+        ProjectWorkspaceIdentityGeneration::GlaedaV2
+    );
+    assert_eq!(
+        legacy.root.fixed_path(),
+        Path::new(SMOLRUNNER_LEGACY_STATE_ROOT)
+    );
+    assert_eq!(
+        legacy.identity_generation,
+        ProjectWorkspaceIdentityGeneration::SmolrunnerV1
+    );
+    assert_ne!(current.root.fixed_path(), legacy.root.fixed_path());
+    assert_ne!(current.identity_generation, legacy.identity_generation);
 }
 
 #[test]

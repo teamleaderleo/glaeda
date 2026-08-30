@@ -12,8 +12,11 @@ use crate::project_workspace_identity::{
     ProjectWorkspaceIdentityGeneration, TrustedWorkspaceIdentityKind, trusted_workspace_identity,
 };
 use crate::repository_source_observation::RepositoryWorkspaceLocationIdentity;
-use crate::state::{InstallationId, STATE_ROOT};
+use crate::state::InstallationId;
 use crate::state_document::{ProjectStateDocument, StateDocument, decode_state_document};
+use crate::state_root_generation::{
+    SelectedStateRoot, StateRootGeneration, StateRootSelection, select_state_root,
+};
 use crate::state_store::MAX_STATE_DOCUMENT_BYTES;
 use crate::verification_profile::{
     CacheId, CapabilityObservation, HostResourceObservation, RepositoryCommandIdentity,
@@ -276,6 +279,24 @@ pub struct TrustedRunnerPreflightEvidence {
     pub requested_authorities: BTreeSet<RequestedAuthority>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TrustedWorkspaceRootBinding {
+    root: SelectedStateRoot,
+    identity_generation: ProjectWorkspaceIdentityGeneration,
+}
+
+fn select_trusted_workspace_root(selection: StateRootSelection) -> TrustedWorkspaceRootBinding {
+    let root = select_state_root(selection);
+    let identity_generation = match root.generation() {
+        StateRootGeneration::SmolrunnerLegacyV1 => ProjectWorkspaceIdentityGeneration::SmolrunnerV1,
+        StateRootGeneration::GlaedaCurrentV1 => ProjectWorkspaceIdentityGeneration::GlaedaV2,
+    };
+    TrustedWorkspaceRootBinding {
+        root,
+        identity_generation,
+    }
+}
+
 /// Produce one trusted workspace/cache receipt from the canonical protected state root.
 ///
 /// The project identity is only a lookup key. Installation, workspace, cache, paths, ownership, and
@@ -291,9 +312,16 @@ pub struct TrustedRunnerPreflightEvidence {
 pub fn produce_default_trusted_workspace_cache_receipt(
     project: &ProjectIdentity,
 ) -> Result<TrustedWorkspaceCacheReceipt, TrustedWorkspaceReceiptError> {
-    produce_trusted_workspace_cache_receipt(Path::new(STATE_ROOT), project)
+    let binding = select_trusted_workspace_root(StateRootSelection::Current);
+    produce_with_hook_for_generation(
+        binding.root.fixed_path(),
+        project,
+        binding.identity_generation,
+        || {},
+    )
 }
 
+#[cfg(test)]
 fn produce_trusted_workspace_cache_receipt(
     root_path: &Path,
     project: &ProjectIdentity,
@@ -305,6 +333,7 @@ fn produce_trusted_workspace_cache_receipt(
     )
 }
 
+#[cfg(test)]
 fn produce_trusted_workspace_cache_receipt_for_generation(
     root_path: &Path,
     project: &ProjectIdentity,
