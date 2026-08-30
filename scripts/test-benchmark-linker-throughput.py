@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import runpy
@@ -23,6 +24,29 @@ MODULE = SimpleNamespace(**runpy.run_path(os.fspath(SCRIPT), run_name="linker_be
 
 
 class LinkerBenchmarkTests(unittest.TestCase):
+    def test_every_subprocess_call_has_an_explicit_environment(self) -> None:
+        tree = ast.parse(SCRIPT.read_text(encoding="utf-8"), filename=os.fspath(SCRIPT))
+        missing = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                continue
+            if (
+                isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "subprocess"
+                and node.func.attr in {"run", "Popen"}
+                and not any(keyword.arg == "env" for keyword in node.keywords)
+            ):
+                missing.append(node.lineno)
+        self.assertEqual(missing, [])
+
+    def test_closed_child_environment_excludes_ambient_secrets(self) -> None:
+        with mock.patch.dict(
+            os.environ, {"REVIEW_FAKE_SECRET": "must-not-cross"}, clear=False
+        ):
+            environment = MODULE.closed_child_environment()
+        self.assertEqual(environment, {"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"})
+        self.assertNotIn("REVIEW_FAKE_SECRET", environment)
+
     def test_encoded_flags_force_each_linker_arm(self) -> None:
         clang = Path("/usr/bin/clang").resolve(strict=True)
         self.assertEqual(
@@ -187,6 +211,47 @@ class LinkerBenchmarkTests(unittest.TestCase):
         ), self.assertRaises(MODULE.BenchmarkError) as raised:
             MODULE.finish_workers([worker])
         self.assertEqual(raised.exception.code, "worker_cleanup_incomplete")
+
+    def test_spawn_failure_stops_every_already_started_worker(self) -> None:
+        capabilities = MODULE.Capabilities(
+            paths={"python": Path("/usr/bin/python3")},
+            versions={},
+            build_executables=frozenset(),
+            path_identity_sha256="sha256:" + "a" * 64,
+        )
+        process = mock.Mock(pid=123)
+        scope = MODULE.OwnedScope("unit.scope", -1, -1, -1, -1)
+        admission_error = MODULE.BenchmarkError(
+            "scope_admission", "the second worker was not admitted"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            experiment = Path(temporary)
+            for name in ("targets", "receipts", "logs"):
+                (experiment / name).mkdir()
+            replacements = {
+                "foreign_build_count": mock.Mock(return_value=0),
+                "start_owned_scope": mock.Mock(
+                    side_effect=[(process, scope), admission_error]
+                ),
+                "stop_workers": mock.Mock(),
+            }
+            with mock.patch.dict(MODULE.run_batch.__globals__, replacements):
+                with self.assertRaises(MODULE.BenchmarkError) as raised:
+                    MODULE.run_batch(
+                        root=Path("/source"),
+                        experiment=experiment,
+                        source=MODULE.SourceIdentity("a" * 40, "b" * 40),
+                        capabilities=capabilities,
+                        linker="gnu",
+                        width=2,
+                        phase="cold",
+                        index=0,
+                    )
+        self.assertIs(raised.exception, admission_error)
+        stopped = replacements["stop_workers"].call_args.args[0]
+        self.assertEqual(len(stopped), 1)
+        self.assertIs(stopped[0].process, process)
+        self.assertIs(stopped[0].scope, scope)
 
     @unittest.skipUnless(
         os.environ.get("GLAEDA_RUN_LINKER_SCOPE_PHYSICAL") == "1",
