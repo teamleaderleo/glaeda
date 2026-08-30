@@ -119,7 +119,6 @@ fn present_target_reports_bounded_path_private_physical_cost() {
     fs::write(&artifact, vec![b'x'; 8192]).expect("write artifact");
     fs::hard_link(&artifact, nested.join("artifact-hardlink")).expect("link artifact");
     symlink("private-artifact-name", nested.join("artifact-symlink")).expect("symlink artifact");
-    let target_before = fs::metadata(&target).expect("target metadata before");
     let artifact_before = fs::metadata(&artifact).expect("artifact metadata before");
 
     let output = fixture.observe("json");
@@ -150,10 +149,9 @@ fn present_target_reports_bounded_path_private_physical_cost() {
     let encoded = String::from_utf8(output.stdout).expect("UTF-8 JSON");
     assert!(!encoded.contains(fixture.root.to_str().expect("UTF-8 root")));
     assert!(!encoded.contains("private-artifact-name"));
-    assert_eq!(
-        target_before.atime(),
-        fs::metadata(&target).unwrap().atime()
-    );
+    // The composed CLI observes the checkout with Git before the descriptor-bound target walk.
+    // Git may update the ignored target directory's atime under relatime, so only file-content
+    // atime is a stable assertion that the target observer did not read artifact bytes.
     assert_eq!(
         artifact_before.atime(),
         fs::metadata(&artifact).unwrap().atime()
