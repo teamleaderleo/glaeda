@@ -43,6 +43,7 @@ pub const LOCAL_INSTALL_BUILD_EXECUTION_SCHEMA_VERSION: u8 = 1;
 pub const LOCAL_INSTALL_ARTIFACT_VERSION_TIMEOUT: Duration = Duration::from_secs(10);
 pub const MAX_LOCAL_INSTALL_BINARY_BYTES: u64 = 512 * 1024 * 1024;
 pub const MAX_LOCAL_INSTALL_BINARY_VERSION_BYTES: usize = 128;
+pub const MAX_REVIEWED_CARGO_ARTIFACT_LINKS: u64 = 2;
 
 const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::DIRECTORY)
@@ -670,7 +671,10 @@ fn open_child_directory(parent: &File, name: &OsStr) -> Result<File, ArtifactObs
 fn reviewed_artifact(metadata: &std::fs::Metadata) -> bool {
     metadata.is_file()
         && metadata.uid() == geteuid().as_raw()
-        && metadata.nlink() == 1
+        // Cargo normally hard-links the selected release binary from `target/release/deps` into
+        // `target/release`. Both names remain under the exact private target root. More links are
+        // outside the reviewed Cargo publication shape.
+        && (1..=MAX_REVIEWED_CARGO_ARTIFACT_LINKS).contains(&metadata.nlink())
         && metadata.mode() & 0o022 == 0
         && metadata.mode() & 0o111 != 0
         && (4..=MAX_LOCAL_INSTALL_BINARY_BYTES).contains(&metadata.len())
@@ -1243,6 +1247,25 @@ mod tests {
         symlink("glaeda.real", &fixture.artifact).expect("artifact symlink");
         assert_eq!(
             artifact_snapshot(&fixture.build, &fixture.artifact).expect_err("symlink rejected"),
+            ArtifactObservationError::Unsafe
+        );
+    }
+
+    #[test]
+    fn artifact_snapshot_accepts_cargo_pair_but_rejects_extra_hard_links() {
+        let fixture = Fixture::new("artifact-links");
+        fs::create_dir_all(fixture.artifact.parent().expect("release parent"))
+            .expect("release directory");
+        write_fake_binary(&fixture.artifact);
+        let cargo_deps_link = fixture.artifact.with_extension("cargo-deps-link");
+        fs::hard_link(&fixture.artifact, &cargo_deps_link).expect("Cargo hard link");
+        artifact_snapshot(&fixture.build, &fixture.artifact).expect("Cargo link pair accepted");
+
+        let foreign_shape = fixture.artifact.with_extension("third-link");
+        fs::hard_link(&fixture.artifact, &foreign_shape).expect("third hard link");
+        assert_eq!(
+            artifact_snapshot(&fixture.build, &fixture.artifact)
+                .expect_err("extra hard link rejected"),
             ArtifactObservationError::Unsafe
         );
     }
