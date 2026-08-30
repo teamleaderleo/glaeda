@@ -641,8 +641,33 @@ materializes an unbounded directory inventory. Unpublished creating-stage recove
 at most two private regular manifest/final-manifest-temporary files beneath the exact stage; any
 other payload is preserved as recovery debt. Explicit `--state`, legacy, malformed, forged,
 noncanonical, mode-drifted, foreign-owned, active, and still-reachable state remains untouched.
-#910 tracks unreachable-generation retirement; #926 separately tracks the watermark/value policy
-needed to evict still-reachable but low-value Cargo targets.
+#910 tracks unreachable-generation retirement. The first #926 lifecycle slice extends only the
+same producer-managed implicit namespace; it does not adopt checkout-local Cargo targets or
+explicit `--state` directories. After each successful implicit command, while the exact state or
+runtime lock is still held, Glaeda advances one monotonic namespace use sequence in a canonical,
+private, atomically replaced catalog. Each record is bound to the immutable producer manifest's
+device, inode and creation witness. Failed, signaled and deadline-expired commands do not advance
+use. A stale record cannot attach to a cold reconstruction of the same state name because its new
+manifest object has a different witness.
+
+Normal exclusive namespace activity observes filesystem capacity with `statvfs`. At 90% used it
+atomically latches a pressure cycle; bounded later invocations continue through the hysteresis gap
+until use reaches 85% or less. At ordinary capacity the policy performs no retirement. Under
+pressure, it considers successful-use records in deterministic least-recently-used order and
+still requires an authentic reachable manifest, exact manifest-record identity, every direct and
+runtime lock acquired nonblocking, a second equal manifest and reachability observation, unchanged
+locks, and the same pinned state directory before rename. Missing, corrupt, stale, explicit,
+legacy, malformed, current, active and unknown-use state remains untouched. One invocation retires
+at most one state through the existing no-replace rename, namespace sync, external retirement
+record and descriptor-relative bounded deletion transaction.
+
+When a caller supplies a comparison key, the catalog can retain producer-observed reconstruction
+and reuse duration for later health reporting. Those caller-named comparison families never grant
+eligibility or influence retirement order. They remain performance evidence only; Glaeda's own
+successful-use sequence ranks states that the ownership and lock protocol has already made safe.
+`--verbose` reports the path-free lifecycle and success-record dispositions. #926 remains the home
+for health-view composition and for moving future ordinary Cargo targets into this managed
+producer contract; arbitrary historical worktree `target/` trees remain outside deletion authority.
 
 The bounded-discovery repair was measured at exact code `4436b3f63a7c20ae6d15bdce44a10ea6760cbfba`
 against rejected control `dbb3863c14d76880a8c7d155d84888926041c019`, Python 3.14.4 and Linux

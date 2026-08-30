@@ -52,12 +52,19 @@ HOT_STATE_CREATING_PREFIX = ".creating-v1-"
 HOT_STATE_RETIRED_PREFIX = ".retired-v1-"
 HOT_STATE_RETIREMENT_RECORD_PREFIX = ".retirement-v1-"
 HOT_STATE_RETIREMENT_RECORD_SUFFIX = ".json"
+HOT_STATE_VALUE_CATALOG = ".value-catalog-v1.json"
+HOT_STATE_VALUE_CATALOG_STAGING = ".value-catalog-v1.json.creating"
+HOT_STATE_VALUE_CATALOG_SCHEMA_VERSION = 1
+HOT_STATE_VALUE_CATALOG_PRODUCER = "glaeda-hot-run-value-catalog-v1"
 MAX_HOT_STATE_MANIFEST_BYTES = 32 * 1024
+MAX_HOT_STATE_VALUE_CATALOG_BYTES = 256 * 1024
 MAX_HOT_STATE_NAMESPACE_ENTRIES = 256
 MAX_HOT_STATE_RUNTIME_ENTRIES = 64
 MAX_HOT_STATE_CREATING_ENTRIES = 2
 MAX_HOT_STATE_DELETE_ENTRIES = 2048
 MAX_HOT_STATE_DELETE_DEPTH = 128
+HOT_STATE_RETIRE_START_USED_PERCENT = 90
+HOT_STATE_RETIRE_STOP_USED_PERCENT = 85
 RENAME_NOREPLACE = 1
 
 
@@ -84,6 +91,19 @@ class SourcePreparation:
     differing_regular_file_count: int
     skipped_path_count: int
     elapsed_seconds: float
+
+
+@dataclass(frozen=True)
+class ExecutionObservation:
+    elapsed_seconds: float
+    preparation_elapsed_seconds: float
+
+
+@dataclass(frozen=True)
+class ManifestObjectIdentity:
+    device: int
+    inode: int
+    creation_witness_ns: int
 
 
 @dataclass(frozen=True)
@@ -968,9 +988,9 @@ def recompute_manifest_state_identity(document: dict[str, object]) -> str:
     return default_state_identity(resident, task, cache_specs, identity)
 
 
-def read_producer_manifest(
+def read_producer_manifest_with_identity(
     directory: Path | int, state_identity: str
-) -> tuple[dict[str, object], bytes]:
+) -> tuple[dict[str, object], bytes, ManifestObjectIdentity]:
     descriptor = os.open(
         HOT_STATE_MANIFEST if isinstance(directory, int) else directory / HOT_STATE_MANIFEST,
         os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
@@ -999,9 +1019,26 @@ def read_producer_manifest(
             raise RuntimeError("hot-state producer manifest is not canonical")
         if recompute_manifest_state_identity(manifest) != state_identity:
             raise RuntimeError("hot-state producer manifest generation is not authentic")
-        return manifest, encoded
+        return (
+            manifest,
+            encoded,
+            ManifestObjectIdentity(
+                details.st_dev,
+                details.st_ino,
+                details.st_ctime_ns,
+            ),
+        )
     finally:
         os.close(descriptor)
+
+
+def read_producer_manifest(
+    directory: Path | int, state_identity: str
+) -> tuple[dict[str, object], bytes]:
+    manifest, encoded, _ = read_producer_manifest_with_identity(
+        directory, state_identity
+    )
+    return manifest, encoded
 
 
 def write_producer_manifest(directory: Path, encoded: bytes) -> None:
@@ -1437,7 +1474,11 @@ def validate_retirement_record(document: object) -> dict[str, object]:
     return document
 
 
-def read_private_json(path: Path, label: str) -> tuple[dict[str, object], bytes]:
+def read_private_json(
+    path: Path,
+    label: str,
+    maximum_bytes: int = MAX_HOT_STATE_MANIFEST_BYTES,
+) -> tuple[dict[str, object], bytes]:
     descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
     try:
         details = os.fstat(descriptor)
@@ -1446,12 +1487,12 @@ def read_private_json(path: Path, label: str) -> tuple[dict[str, object], bytes]
             or details.st_uid != os.getuid()
             or details.st_nlink != 1
             or stat.S_IMODE(details.st_mode) != 0o600
-            or details.st_size > MAX_HOT_STATE_MANIFEST_BYTES
+            or details.st_size > maximum_bytes
         ):
             raise RuntimeError(f"{label} is not a private regular file")
         with os.fdopen(os.dup(descriptor), "rb") as source:
-            encoded = source.read(MAX_HOT_STATE_MANIFEST_BYTES + 1)
-        if len(encoded) > MAX_HOT_STATE_MANIFEST_BYTES:
+            encoded = source.read(maximum_bytes + 1)
+        if len(encoded) > maximum_bytes:
             raise RuntimeError(f"{label} exceeds its size bound")
         try:
             document = json.loads(encoded)
@@ -1483,6 +1524,460 @@ def write_private_json_noreplace(path: Path, document: dict[str, object]) -> Non
         os.close(descriptor)
     rename_noreplace(staging, path)
     fsync_directory(path.parent)
+
+
+def empty_hot_state_value_catalog() -> dict[str, object]:
+    return {
+        "schema_version": HOT_STATE_VALUE_CATALOG_SCHEMA_VERSION,
+        "producer": HOT_STATE_VALUE_CATALOG_PRODUCER,
+        "pressure_active": False,
+        "retire_start_used_percent": HOT_STATE_RETIRE_START_USED_PERCENT,
+        "retire_stop_used_percent": HOT_STATE_RETIRE_STOP_USED_PERCENT,
+        "next_use_sequence": 0,
+        "states": {},
+    }
+
+
+def validate_hot_state_value_catalog(document: object) -> dict[str, object]:
+    if not isinstance(document, dict) or set(document) != {
+        "schema_version",
+        "producer",
+        "pressure_active",
+        "retire_start_used_percent",
+        "retire_stop_used_percent",
+        "next_use_sequence",
+        "states",
+    }:
+        raise RuntimeError("hot-state value catalog has an unsupported shape")
+    sequence = document["next_use_sequence"]
+    states = document["states"]
+    start_percent = document["retire_start_used_percent"]
+    stop_percent = document["retire_stop_used_percent"]
+    if (
+        isinstance(document["schema_version"], bool)
+        or not isinstance(document["schema_version"], int)
+        or document["schema_version"] != HOT_STATE_VALUE_CATALOG_SCHEMA_VERSION
+        or document["producer"] != HOT_STATE_VALUE_CATALOG_PRODUCER
+        or not isinstance(document["pressure_active"], bool)
+        or isinstance(start_percent, bool)
+        or not isinstance(start_percent, int)
+        or start_percent != HOT_STATE_RETIRE_START_USED_PERCENT
+        or isinstance(stop_percent, bool)
+        or not isinstance(stop_percent, int)
+        or stop_percent != HOT_STATE_RETIRE_STOP_USED_PERCENT
+        or isinstance(sequence, bool)
+        or not isinstance(sequence, int)
+        or sequence < 0
+        or sequence > (1 << 63) - 1
+        or not isinstance(states, dict)
+        or len(states) > MAX_HOT_STATE_NAMESPACE_ENTRIES
+    ):
+        raise RuntimeError("hot-state value catalog identity is not accepted")
+    record_keys = {
+        "manifest_device",
+        "manifest_inode",
+        "manifest_creation_witness_ns",
+        "last_successful_use_sequence",
+        "successful_use_count",
+        "value_identity",
+        "reconstruction_elapsed_ns",
+        "reuse_elapsed_ns",
+    }
+    integer_keys = record_keys - {
+        "value_identity",
+        "reconstruction_elapsed_ns",
+        "reuse_elapsed_ns",
+    }
+    for state_identity, record in states.items():
+        if (
+            not isinstance(state_identity, str)
+            or not state_identity_name(state_identity)
+            or not isinstance(record, dict)
+            or set(record) != record_keys
+        ):
+            raise RuntimeError("hot-state value catalog record is invalid")
+        for key in integer_keys:
+            value = record[key]
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+                or value > (1 << 63) - 1
+            ):
+                raise RuntimeError("hot-state value catalog record is invalid")
+        if (
+            record["last_successful_use_sequence"] == 0
+            or record["last_successful_use_sequence"] > sequence
+            or record["successful_use_count"] == 0
+        ):
+            raise RuntimeError("hot-state value catalog sequence is invalid")
+        value_identity = record["value_identity"]
+        if value_identity is not None and (
+            not isinstance(value_identity, str)
+            or not state_identity_name(value_identity)
+        ):
+            raise RuntimeError("hot-state value catalog value identity is invalid")
+        for key in ("reconstruction_elapsed_ns", "reuse_elapsed_ns"):
+            value = record[key]
+            if value is not None and (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value <= 0
+                or value > (1 << 63) - 1
+            ):
+                raise RuntimeError("hot-state value catalog timing is invalid")
+        if value_identity is None and (
+            record["reconstruction_elapsed_ns"] is not None
+            or record["reuse_elapsed_ns"] is not None
+        ):
+            raise RuntimeError("hot-state value catalog timing is unbound")
+    return document
+
+
+def canonical_hot_state_value_catalog_bytes(document: dict[str, object]) -> bytes:
+    validate_hot_state_value_catalog(document)
+    encoded = (
+        json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    if len(encoded) > MAX_HOT_STATE_VALUE_CATALOG_BYTES:
+        raise RuntimeError("hot-state value catalog exceeds its size bound")
+    return encoded
+
+
+def remove_stale_hot_state_value_catalog_stage(namespace_root: Path) -> bool:
+    staging = namespace_root / HOT_STATE_VALUE_CATALOG_STAGING
+    try:
+        details = staging.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    if (
+        not stat.S_ISREG(details.st_mode)
+        or details.st_uid != os.getuid()
+        or details.st_nlink != 1
+        or stat.S_IMODE(details.st_mode) != 0o600
+        or details.st_size > MAX_HOT_STATE_VALUE_CATALOG_BYTES
+    ):
+        raise RuntimeError("hot-state value catalog stage is not recoverable")
+    staging.unlink()
+    fsync_directory(namespace_root)
+    return True
+
+
+def read_hot_state_value_catalog(namespace_root: Path) -> dict[str, object]:
+    path = namespace_root / HOT_STATE_VALUE_CATALOG
+    try:
+        document, encoded = read_private_json(
+            path,
+            "hot-state value catalog",
+            MAX_HOT_STATE_VALUE_CATALOG_BYTES,
+        )
+    except FileNotFoundError:
+        return empty_hot_state_value_catalog()
+    catalog = validate_hot_state_value_catalog(document)
+    if canonical_hot_state_value_catalog_bytes(catalog) != encoded:
+        raise RuntimeError("hot-state value catalog is not canonical")
+    return catalog
+
+
+def write_hot_state_value_catalog(
+    namespace_root: Path, document: dict[str, object]
+) -> None:
+    encoded = canonical_hot_state_value_catalog_bytes(document)
+    remove_stale_hot_state_value_catalog_stage(namespace_root)
+    staging = namespace_root / HOT_STATE_VALUE_CATALOG_STAGING
+    descriptor = os.open(
+        staging,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o600,
+    )
+    try:
+        written = 0
+        while written < len(encoded):
+            count = os.write(descriptor, encoded[written:])
+            if count <= 0:
+                raise OSError("hot-state value catalog write made no progress")
+            written += count
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    os.replace(staging, namespace_root / HOT_STATE_VALUE_CATALOG)
+    fsync_directory(namespace_root)
+
+
+def hot_state_value_identity(
+    comparison_key: str,
+    runtime_contract: RuntimeContract | None,
+    resource_profile: str | None,
+) -> str:
+    digest = hashlib.sha256(b"glaeda-hot-state-value-v1\0")
+    for value in (
+        comparison_key,
+        runtime_contract.runtime_id if runtime_contract is not None else "",
+        runtime_contract.program_sha256 if runtime_contract is not None else "",
+        (
+            runtime_contract.runtime_bin_binding_sha256 or ""
+            if runtime_contract is not None
+            else ""
+        ),
+        resource_profile or "",
+    ):
+        encoded = value.encode("ascii")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    return digest.hexdigest()
+
+
+def elapsed_nanoseconds(seconds: float) -> int:
+    if not math.isfinite(seconds) or seconds < 0:
+        raise RuntimeError("hot-state successful-use duration is invalid")
+    return max(1, min(round(seconds * 1_000_000_000), (1 << 63) - 1))
+
+
+def record_successful_hot_state_use(
+    namespace_root: Path,
+    state_base: Path,
+    publication_disposition: str,
+    comparison_key: str | None,
+    runtime_contract: RuntimeContract | None,
+    resource_profile: str | None,
+    observation: ExecutionObservation,
+) -> str:
+    namespace_lock = open_private_lock(
+        namespace_root / HOT_STATE_NAMESPACE_LOCK,
+        "hot-state namespace lock",
+    )
+    try:
+        fcntl.flock(namespace_lock, fcntl.LOCK_EX)
+        namespace_details = namespace_root.stat(follow_symlinks=False)
+        state_details = state_base.stat(follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(namespace_details.st_mode)
+            or stat.S_ISLNK(namespace_details.st_mode)
+            or namespace_details.st_uid != os.getuid()
+            or stat.S_IMODE(namespace_details.st_mode) != 0o700
+            or not stat.S_ISDIR(state_details.st_mode)
+            or stat.S_ISLNK(state_details.st_mode)
+            or state_details.st_uid != os.getuid()
+            or stat.S_IMODE(state_details.st_mode) != 0o700
+            or state_details.st_dev != namespace_details.st_dev
+        ):
+            raise RuntimeError("hot-state successful use is not producer-owned")
+        manifest, _, manifest_identity = read_producer_manifest_with_identity(
+            state_base, state_base.name
+        )
+        if manifest_generation_reachable(manifest) is not True:
+            return "generation_not_current"
+        remove_stale_hot_state_value_catalog_stage(namespace_root)
+        catalog = read_hot_state_value_catalog(namespace_root)
+        sequence = catalog["next_use_sequence"]
+        states = catalog["states"]
+        assert isinstance(sequence, int)
+        assert isinstance(states, dict)
+        if sequence >= (1 << 63) - 1:
+            return "sequence_exhausted"
+        if (
+            state_base.name not in states
+            and len(states) >= MAX_HOT_STATE_NAMESPACE_ENTRIES
+        ):
+            retained_states: dict[str, object] = {}
+            for state_identity, record in states.items():
+                try:
+                    (namespace_root / state_identity).lstat()
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    pass
+                retained_states[state_identity] = record
+            states = retained_states
+            if len(states) >= MAX_HOT_STATE_NAMESPACE_ENTRIES:
+                return "catalog_bound_exceeded"
+        prior = states.get(state_base.name)
+        same_manifest = isinstance(prior, dict) and (
+            prior["manifest_device"] == manifest_identity.device
+            and prior["manifest_inode"] == manifest_identity.inode
+            and prior["manifest_creation_witness_ns"]
+            == manifest_identity.creation_witness_ns
+        )
+        next_sequence = sequence + 1
+        successful_use_count = (
+            min(prior["successful_use_count"] + 1, (1 << 63) - 1)
+            if same_manifest
+            else 1
+        )
+        value_identity: str | None = None
+        reconstruction_elapsed_ns: int | None = None
+        reuse_elapsed_ns: int | None = None
+        if same_manifest:
+            value_identity = prior["value_identity"]
+            reconstruction_elapsed_ns = prior["reconstruction_elapsed_ns"]
+            reuse_elapsed_ns = prior["reuse_elapsed_ns"]
+        if comparison_key is not None:
+            observed_value_identity = hot_state_value_identity(
+                comparison_key, runtime_contract, resource_profile
+            )
+            total_elapsed_ns = elapsed_nanoseconds(
+                observation.elapsed_seconds
+                + observation.preparation_elapsed_seconds
+            )
+            if publication_disposition == "created":
+                value_identity = observed_value_identity
+                reconstruction_elapsed_ns = total_elapsed_ns
+                reuse_elapsed_ns = None
+            elif value_identity == observed_value_identity:
+                reuse_elapsed_ns = total_elapsed_ns
+            else:
+                value_identity = observed_value_identity
+                reconstruction_elapsed_ns = None
+                reuse_elapsed_ns = total_elapsed_ns
+        updated_states = dict(states)
+        updated_states[state_base.name] = {
+            "manifest_device": manifest_identity.device,
+            "manifest_inode": manifest_identity.inode,
+            "manifest_creation_witness_ns": manifest_identity.creation_witness_ns,
+            "last_successful_use_sequence": next_sequence,
+            "successful_use_count": successful_use_count,
+            "value_identity": value_identity,
+            "reconstruction_elapsed_ns": reconstruction_elapsed_ns,
+            "reuse_elapsed_ns": reuse_elapsed_ns,
+        }
+        updated_catalog = {
+            **catalog,
+            "next_use_sequence": next_sequence,
+            "states": updated_states,
+        }
+        write_hot_state_value_catalog(namespace_root, updated_catalog)
+        return "recorded"
+    finally:
+        os.close(namespace_lock)
+
+
+def hot_state_filesystem_used_percent(namespace_root: Path) -> tuple[int, int]:
+    details = os.statvfs(namespace_root)
+    blocks = details.f_blocks
+    available = details.f_bavail
+    if blocks <= 0 or available < 0 or available > blocks:
+        raise RuntimeError("hot-state filesystem capacity is unavailable")
+    return blocks - available, blocks
+
+
+def retire_one_low_value_state(
+    namespace_root: Path, current_state_identity: str
+) -> str:
+    remove_stale_hot_state_value_catalog_stage(namespace_root)
+    catalog = read_hot_state_value_catalog(namespace_root)
+    used, total = hot_state_filesystem_used_percent(namespace_root)
+    pressure_active = catalog["pressure_active"]
+    assert isinstance(pressure_active, bool)
+    if pressure_active:
+        next_pressure_active = not (
+            used * 100 <= total * HOT_STATE_RETIRE_STOP_USED_PERCENT
+        )
+    else:
+        next_pressure_active = (
+            used * 100 >= total * HOT_STATE_RETIRE_START_USED_PERCENT
+        )
+    if next_pressure_active != pressure_active:
+        catalog = {**catalog, "pressure_active": next_pressure_active}
+        write_hot_state_value_catalog(namespace_root, catalog)
+    if not next_pressure_active:
+        return (
+            "pressure_relieved"
+            if pressure_active
+            else "ordinary_free_space"
+        )
+
+    states = catalog["states"]
+    assert isinstance(states, dict)
+    candidates: list[tuple[int, str, dict[str, object]]] = []
+    for state_identity, untyped_record in states.items():
+        assert isinstance(state_identity, str)
+        assert isinstance(untyped_record, dict)
+        if state_identity == current_state_identity:
+            continue
+        sequence = untyped_record["last_successful_use_sequence"]
+        assert isinstance(sequence, int)
+        candidates.append((sequence, state_identity, untyped_record))
+    candidates.sort(key=lambda item: (item[0], item[1]))
+
+    namespace_details = namespace_root.stat(follow_symlinks=False)
+    for _, state_identity, record in candidates:
+        state = namespace_root / state_identity
+        state_descriptor: int | None = None
+        locks: list[RetirementLock] | None = None
+        try:
+            details = state.stat(follow_symlinks=False)
+            if (
+                not stat.S_ISDIR(details.st_mode)
+                or stat.S_ISLNK(details.st_mode)
+                or details.st_uid != os.getuid()
+                or stat.S_IMODE(details.st_mode) != 0o700
+                or details.st_dev != namespace_details.st_dev
+            ):
+                continue
+            state_descriptor = os.open(
+                state,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+            pinned_state = os.fstat(state_descriptor)
+            manifest, encoded_before, manifest_identity = (
+                read_producer_manifest_with_identity(
+                    state_descriptor, state_identity
+                )
+            )
+            if (
+                manifest_generation_reachable(manifest) is not True
+                or record["manifest_device"] != manifest_identity.device
+                or record["manifest_inode"] != manifest_identity.inode
+                or record["manifest_creation_witness_ns"]
+                != manifest_identity.creation_witness_ns
+            ):
+                continue
+            locks = acquire_retirement_locks(state)
+            if not locks:
+                continue
+            manifest_after, encoded_after, identity_after = (
+                read_producer_manifest_with_identity(
+                    state_descriptor, state_identity
+                )
+            )
+            named_state = state.stat(follow_symlinks=False)
+            if (
+                encoded_after != encoded_before
+                or identity_after != manifest_identity
+                or manifest_generation_reachable(manifest_after) is not True
+                or not retirement_locks_unchanged(locks)
+                or named_state.st_dev != pinned_state.st_dev
+                or named_state.st_ino != pinned_state.st_ino
+            ):
+                continue
+            retired_name = f"{HOT_STATE_RETIRED_PREFIX}{state_identity}"
+            try:
+                rename_noreplace(state, namespace_root / retired_name)
+            except (FileExistsError, OSError):
+                continue
+            fsync_directory(namespace_root)
+            close_retirement_locks(locks)
+            locks = None
+            updated_states = dict(states)
+            del updated_states[state_identity]
+            try:
+                write_hot_state_value_catalog(
+                    namespace_root,
+                    {**catalog, "states": updated_states},
+                )
+            except (OSError, RuntimeError):
+                return "retired_low_value_catalog_deferred"
+            delete_retired_state_bounded(
+                namespace_root, retired_name, state_identity
+            )
+            return "retired_low_value"
+        except (OSError, RuntimeError):
+            continue
+        finally:
+            close_retirement_locks(locks)
+            if state_descriptor is not None:
+                os.close(state_descriptor)
+    return "pressure_no_eligible_state"
 
 
 def ensure_retirement_record(
@@ -2427,6 +2922,7 @@ def execute(
     comparison_key: str | None,
     timeout_seconds: float | None,
     pass_fds: tuple[int, ...] = (),
+    observation_consumer: Callable[[ExecutionObservation], None] | None = None,
 ) -> int:
     time_report: Path | None = None
     systemd_run: str | None = None
@@ -2600,6 +3096,20 @@ def execute(
             machine_before,
             machine_after,
         )
+    if observation_consumer is not None:
+        observation_consumer(
+            ExecutionObservation(
+                elapsed_seconds=elapsed,
+                preparation_elapsed_seconds=sum(
+                    item.elapsed_seconds for item in cache_preparations
+                )
+                + (
+                    source_preparation.elapsed_seconds
+                    if source_preparation is not None
+                    else 0.0
+                ),
+            )
+        )
     return exit_code
 
 
@@ -2724,6 +3234,10 @@ def run(
 
     lock_fd: int | None = None
     namespace_lock_fd: int | None = None
+    namespace_root: Path | None = None
+    publication_disposition: str | None = None
+    value_publication_disposition: str | None = None
+    lifecycle_disposition = "explicit_state"
     git_view: tempfile.TemporaryDirectory[str] | None = None
     pinned_worktree: PinnedWorktreeState | None = None
     cache_source_fds: list[int] = []
@@ -2739,11 +3253,22 @@ def run(
                 fcntl.flock(
                     namespace_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB
                 )
-                collect_one_unreachable_state(namespace_root, state_base.name)
+                collection = collect_one_unreachable_state(
+                    namespace_root, state_base.name
+                )
+                lifecycle_disposition = collection
+                if collection == "nothing_eligible":
+                    try:
+                        lifecycle_disposition = retire_one_low_value_state(
+                            namespace_root, state_base.name
+                        )
+                    except (OSError, RuntimeError):
+                        lifecycle_disposition = "value_catalog_unavailable"
                 has_exclusive_namespace = True
             except BlockingIOError:
                 fcntl.flock(namespace_lock_fd, fcntl.LOCK_SH)
                 has_exclusive_namespace = False
+                lifecycle_disposition = "concurrent_namespace"
 
             if not has_exclusive_namespace and not state_base.exists():
                 fcntl.flock(namespace_lock_fd, fcntl.LOCK_UN)
@@ -2760,13 +3285,25 @@ def run(
                 cache_specs,
                 implicit_worktree_identity,
             )
-            publish_implicit_state_base(state_base, expected_manifest)
+            publication_disposition = publish_implicit_state_base(
+                state_base, expected_manifest
+            )
             if has_exclusive_namespace:
                 fcntl.flock(namespace_lock_fd, fcntl.LOCK_SH)
         else:
             ensure_private_directory(state_base)
 
+        try:
+            state_root.lstat()
+            runtime_state_preexisting = True
+        except FileNotFoundError:
+            runtime_state_preexisting = False
         ensure_private_directory(state_root)
+        value_publication_disposition = (
+            publication_disposition
+            if state_root == state_base
+            else "reused" if runtime_state_preexisting else "created"
+        )
         lock_fd = open_private_lock(state_root / "lock", "hot-state lock")
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -2955,12 +3492,18 @@ def run(
             *resolved_command,
         ]
         if verbose:
-            state_name = state_root.name if has_private_state else "none"
+            state_name = (
+                state_root.name
+                if has_private_state or implicit_worktree_identity is not None
+                else "none"
+            )
             print(
-                f"hot-run: trusted task={task.name} resident={resident.name} state={state_name}",
+                f"hot-run: trusted task={task.name} resident={resident.name} "
+                f"state={state_name} lifecycle={lifecycle_disposition}",
                 file=sys.stderr,
             )
-        return execute(
+        execution_observations: list[ExecutionObservation] = []
+        exit_code = execute(
             arguments,
             None,
             environment,
@@ -2979,7 +3522,33 @@ def run(
                 pinned_worktree.task_root_fd,
                 *cache_source_fds,
             ),
+            observation_consumer=execution_observations.append,
         )
+        if (
+            exit_code == 0
+            and implicit_worktree_identity is not None
+            and namespace_root is not None
+            and value_publication_disposition is not None
+            and len(execution_observations) == 1
+        ):
+            try:
+                use_disposition = record_successful_hot_state_use(
+                    namespace_root,
+                    state_base,
+                    value_publication_disposition,
+                    comparison_key,
+                    runtime_contract,
+                    resource_profile,
+                    execution_observations[0],
+                )
+            except (OSError, RuntimeError):
+                use_disposition = "record_unavailable"
+            if verbose:
+                print(
+                    f"hot-run: lifecycle-success={use_disposition}",
+                    file=sys.stderr,
+                )
+        return exit_code
     finally:
         for descriptor in reversed(cache_source_fds):
             os.close(descriptor)

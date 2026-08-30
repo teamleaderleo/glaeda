@@ -964,6 +964,212 @@ class HotRunTests(unittest.TestCase):
                 unknown_payload.read_text(encoding="utf-8"), "preserve\n"
             )
 
+    def test_success_catalog_is_atomic_monotonic_and_manifest_bound(self) -> None:
+        namespace = load_hot_run()
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            namespace_root = fixture / "hot-run"
+            namespace_root.mkdir(mode=0o700)
+            state, _, document = self.make_hot_state_manifest_fixture(
+                namespace, fixture, "d" * 64
+            )
+            namespace["publish_implicit_state_base"](state, document)
+            (state / "lock").touch(mode=0o600)
+            comparison_key = "sha256:" + "1" * 64
+            observation = namespace["ExecutionObservation"](0.4, 0.1)
+
+            self.assertEqual(
+                namespace["record_successful_hot_state_use"](
+                    namespace_root,
+                    state,
+                    "created",
+                    comparison_key,
+                    None,
+                    None,
+                    observation,
+                ),
+                "recorded",
+            )
+            self.assertEqual(
+                namespace["record_successful_hot_state_use"](
+                    namespace_root,
+                    state,
+                    "reused",
+                    comparison_key,
+                    None,
+                    None,
+                    namespace["ExecutionObservation"](0.05, 0.0),
+                ),
+                "recorded",
+            )
+            catalog = namespace["read_hot_state_value_catalog"](namespace_root)
+            record = catalog["states"][state.name]
+            self.assertEqual(catalog["next_use_sequence"], 2)
+            self.assertEqual(record["last_successful_use_sequence"], 2)
+            self.assertEqual(record["successful_use_count"], 2)
+            self.assertEqual(record["reconstruction_elapsed_ns"], 500_000_000)
+            self.assertEqual(record["reuse_elapsed_ns"], 50_000_000)
+            self.assertEqual(
+                stat.S_IMODE(
+                    (namespace_root / ".value-catalog-v1.json").stat().st_mode
+                ),
+                0o600,
+            )
+            self.assertFalse(
+                (namespace_root / ".value-catalog-v1.json.creating").exists()
+            )
+
+            stale = namespace_root / ".value-catalog-v1.json.creating"
+            stale.write_text("partial", encoding="utf-8")
+            stale.chmod(0o600)
+            self.assertTrue(
+                namespace["remove_stale_hot_state_value_catalog_stage"](
+                    namespace_root
+                )
+            )
+            self.assertFalse(stale.exists())
+
+    def test_value_retirement_uses_deterministic_lru_and_hysteresis(self) -> None:
+        namespace = load_hot_run()
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            namespace_root = fixture / "hot-run"
+            namespace_root.mkdir(mode=0o700)
+            states = []
+            for label in ("a", "b", "c"):
+                state, _, document = self.make_hot_state_manifest_fixture(
+                    namespace, fixture, label * 64
+                )
+                namespace["publish_implicit_state_base"](state, document)
+                (state / "lock").touch(mode=0o600)
+                comparison_key = "sha256:" + label * 64
+                namespace["record_successful_hot_state_use"](
+                    namespace_root,
+                    state,
+                    "created",
+                    comparison_key,
+                    None,
+                    None,
+                    namespace["ExecutionObservation"](0.4, 0.1),
+                )
+                namespace["record_successful_hot_state_use"](
+                    namespace_root,
+                    state,
+                    "reused",
+                    comparison_key,
+                    None,
+                    None,
+                    namespace["ExecutionObservation"](0.05, 0.0),
+                )
+                states.append(state)
+
+            retire = namespace["retire_one_low_value_state"]
+            filesystem = retire.__globals__["os"]
+
+            def capacity(used_percent: int) -> os.statvfs_result:
+                return os.statvfs_result(
+                    (4096, 4096, 100, 100 - used_percent, 100 - used_percent,
+                     0, 0, 0, 0, 255)
+                )
+
+            with mock.patch.object(filesystem, "statvfs", return_value=capacity(89)):
+                self.assertEqual(
+                    retire(namespace_root, "f" * 64), "ordinary_free_space"
+                )
+            self.assertTrue(all(state.exists() for state in states))
+
+            with mock.patch.object(filesystem, "statvfs", return_value=capacity(90)):
+                self.assertEqual(
+                    retire(namespace_root, "f" * 64), "retired_low_value"
+                )
+            self.assertFalse(states[0].exists())
+            self.assertTrue(states[1].exists())
+            self.assertTrue(states[2].exists())
+
+            with mock.patch.object(filesystem, "statvfs", return_value=capacity(86)):
+                self.assertEqual(
+                    retire(namespace_root, "f" * 64), "retired_low_value"
+                )
+            self.assertFalse(states[1].exists())
+            self.assertTrue(states[2].exists())
+
+            with mock.patch.object(filesystem, "statvfs", return_value=capacity(85)):
+                self.assertEqual(
+                    retire(namespace_root, "f" * 64), "pressure_relieved"
+                )
+            self.assertTrue(states[2].exists())
+            catalog = namespace["read_hot_state_value_catalog"](namespace_root)
+            self.assertFalse(catalog["pressure_active"])
+
+    def test_value_retirement_preserves_current_active_unknown_and_recreated_state(
+        self,
+    ) -> None:
+        namespace = load_hot_run()
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            namespace_root = fixture / "hot-run"
+            namespace_root.mkdir(mode=0o700)
+            state, _, document = self.make_hot_state_manifest_fixture(
+                namespace, fixture, "e" * 64
+            )
+            namespace["publish_implicit_state_base"](state, document)
+            lock = state / "lock"
+            lock.touch(mode=0o600)
+            namespace["record_successful_hot_state_use"](
+                namespace_root,
+                state,
+                "created",
+                None,
+                None,
+                None,
+                namespace["ExecutionObservation"](0.1, 0.0),
+            )
+            retire = namespace["retire_one_low_value_state"]
+            filesystem = retire.__globals__["os"]
+            pressure = os.statvfs_result(
+                (4096, 4096, 100, 10, 10, 0, 0, 0, 0, 255)
+            )
+            with mock.patch.object(filesystem, "statvfs", return_value=pressure):
+                self.assertEqual(
+                    retire(namespace_root, state.name),
+                    "pressure_no_eligible_state",
+                )
+            self.assertTrue(state.exists())
+
+            active = os.open(lock, os.O_RDWR | os.O_NOFOLLOW)
+            fcntl.flock(active, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                with mock.patch.object(filesystem, "statvfs", return_value=pressure):
+                    self.assertEqual(
+                        retire(namespace_root, "f" * 64),
+                        "pressure_no_eligible_state",
+                    )
+            finally:
+                os.close(active)
+            self.assertTrue(state.exists())
+
+            old_state = namespace_root / ("old-" + state.name)
+            state.rename(old_state)
+            namespace["publish_implicit_state_base"](state, document)
+            (state / "lock").touch(mode=0o600)
+            with mock.patch.object(filesystem, "statvfs", return_value=pressure):
+                self.assertEqual(
+                    retire(namespace_root, "f" * 64),
+                    "pressure_no_eligible_state",
+                )
+            self.assertTrue(state.exists())
+
+            catalog_path = namespace_root / ".value-catalog-v1.json"
+            catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+            catalog_path.write_text(
+                json.dumps(catalog, indent=2) + "\n", encoding="utf-8"
+            )
+            catalog_path.chmod(0o600)
+            with mock.patch.object(filesystem, "statvfs", return_value=pressure):
+                with self.assertRaisesRegex(RuntimeError, "not canonical"):
+                    retire(namespace_root, "f" * 64)
+            self.assertTrue(state.exists())
+
     def test_worktree_state_revalidation_rejects_generation_drift(self) -> None:
         namespace = load_hot_run()
         observe = namespace["observe_worktree_state_identity"]
