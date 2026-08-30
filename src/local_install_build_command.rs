@@ -15,13 +15,17 @@ use crate::process::CommandSpec;
 #[cfg(unix)]
 pub mod toolchain_preflight;
 
-pub const LOCAL_INSTALL_BUILD_COMMAND_SCHEMA_VERSION: u8 = 3;
+pub const LOCAL_INSTALL_BUILD_COMMAND_SCHEMA_VERSION: u8 = 4;
 pub const LOCAL_INSTALL_BUILD_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 pub const MAX_LOCAL_INSTALL_BUILD_JOBS: u8 = 4;
 
 const SMOLRUNNER_COMMAND_IDENTITY_DOMAIN_V2: &[u8] = b"smolrunner-local-install-build-command-v2\0";
-const GLAEDA_COMMAND_IDENTITY_DOMAIN_V3: &[u8] = b"glaeda-local-install-build-command-v3\0";
+const GLAEDA_COMMAND_IDENTITY_DOMAIN_V4: &[u8] = b"glaeda-local-install-build-command-v4\0";
 const CARGO_CONFIG_POLICY: &str = "isolated_cwd_and_cargo_home_config_free_v1";
+const GLAEDA_PATH_REMAP_POLICY_V1: &str =
+    "rustc_private_source_and_build_roots_to_glaeda_context_v1";
+const GLAEDA_SYNTHETIC_CONTEXT: &str = "/glaeda-private-context";
+const RUSTFLAGS_SEPARATOR: char = '\u{1f}';
 const MACOS_SYSTEM_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 const LINUX_SYSTEM_PATH: &str = "/usr/bin:/bin";
 const SMOLRUNNER_FIXED_ARGUMENT_POLICY_V2: [&str; 9] = [
@@ -35,7 +39,7 @@ const SMOLRUNNER_FIXED_ARGUMENT_POLICY_V2: [&str; 9] = [
     "smolrunner",
     "--jobs",
 ];
-const GLAEDA_FIXED_ARGUMENT_POLICY_V3: [&str; 9] = [
+const GLAEDA_FIXED_ARGUMENT_POLICY_V4: [&str; 9] = [
     "build",
     "--manifest-path",
     "<private-source-manifest>",
@@ -46,7 +50,21 @@ const GLAEDA_FIXED_ARGUMENT_POLICY_V3: [&str; 9] = [
     "glaeda",
     "--jobs",
 ];
-const ENVIRONMENT_KEYS: [&str; 11] = [
+const SMOLRUNNER_ENVIRONMENT_KEYS_V2: [&str; 11] = [
+    "CARGO_HOME",
+    "CARGO_INCREMENTAL",
+    "CARGO_NET_OFFLINE",
+    "CARGO_TARGET_DIR",
+    "CARGO_TERM_COLOR",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "PATH",
+    "RUSTC",
+    "RUSTDOC",
+];
+const GLAEDA_ENVIRONMENT_KEYS_V4: [&str; 12] = [
+    "CARGO_ENCODED_RUSTFLAGS",
     "CARGO_HOME",
     "CARGO_INCREMENTAL",
     "CARGO_NET_OFFLINE",
@@ -87,9 +105,11 @@ pub struct LocalInstallBuildCommandPolicy {
     pub jobs: u8,
     pub timeout_seconds: u64,
     pub cargo_config_policy: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path_remap_policy: Option<&'static str>,
     pub system_path_policy: &'static str,
     pub fixed_argument_policy: [&'static str; 9],
-    pub environment_keys: [&'static str; 11],
+    pub environment_keys: Vec<&'static str>,
     pub fixed_public_environment: [&'static str; 5],
 }
 
@@ -112,7 +132,8 @@ impl LocalInstallBuildCommandContext {
     /// # Errors
     ///
     /// Returns an error unless all paths are absolute normalized non-root UTF-8 paths, source and
-    /// build roots are disjoint, and the toolchain executable paths are distinct.
+    /// build roots are disjoint, and the toolchain executable paths are distinct. Generation-
+    /// specific encoded-flag restrictions are checked when the command is planned.
     pub fn new(
         source_root: impl Into<PathBuf>,
         build_root: impl Into<PathBuf>,
@@ -282,11 +303,14 @@ impl std::error::Error for LocalInstallBuildCommandError {}
 ///
 /// Cargo runs from `<build-root>/work` and receives the exact source manifest through a redacted
 /// `--manifest-path` argument. A later preflight proves the build-root lineage and isolated Cargo
-/// home are config-free before this inert command may execute.
+/// home are config-free before this inert command may execute. Glaeda-v2 builds also receive one
+/// fixed, encoded, redacted Rust flag pair that remaps the private source/build roots to the
+/// versioned synthetic build context; legacy SmolRunner-v1 command identity remains unchanged.
 ///
 /// # Errors
 ///
-/// Returns an error for jobs outside 1..=4 or canonical policy identity encoding failure.
+/// Returns an error for jobs outside 1..=4, a Glaeda-v2 source/build root that contains Cargo's
+/// encoded-rustflags separator, or canonical policy identity encoding failure.
 pub fn plan_local_install_build_command(
     build: &LocalInstallBuildPlan,
     platform: LocalInstallPlatform,
@@ -302,6 +326,10 @@ pub fn plan_local_install_build_command(
     }
 
     let identity_generation = build.source.identity_generation();
+    if identity_generation == LocalInstallIdentityGeneration::GlaedaV2 {
+        validate_glaeda_path_remap_root(&context.source_root)?;
+        validate_glaeda_path_remap_root(&context.build_root)?;
+    }
     let system_path = system_path(platform);
     let policy = policy(build, platform, jobs, system_path)?;
     let binary_name = match identity_generation {
@@ -333,6 +361,12 @@ pub fn plan_local_install_build_command(
         .environment("CARGO_NET_OFFLINE", "true")
         .environment("CARGO_INCREMENTAL", "0")
         .environment("CARGO_TERM_COLOR", "never");
+    let spec = match identity_generation {
+        LocalInstallIdentityGeneration::SmolrunnerV1 => spec,
+        LocalInstallIdentityGeneration::GlaedaV2 => {
+            spec.secret_environment("CARGO_ENCODED_RUSTFLAGS", glaeda_encoded_rustflags(context))
+        }
+    };
 
     Ok(LocalInstallBuildCommand {
         policy,
@@ -375,9 +409,10 @@ fn policy(
         jobs: u8,
         timeout_seconds: u64,
         cargo_config_policy: &'static str,
+        path_remap_policy: &'static str,
         system_path_policy: &'static str,
         fixed_argument_policy: [&'static str; 9],
-        environment_keys: [&'static str; 11],
+        environment_keys: [&'static str; 12],
         fixed_public_environment: [&'static str; 5],
     }
 
@@ -396,7 +431,7 @@ fn policy(
                 cargo_config_policy: CARGO_CONFIG_POLICY,
                 system_path_policy: system_path,
                 fixed_argument_policy: SMOLRUNNER_FIXED_ARGUMENT_POLICY_V2,
-                environment_keys: ENVIRONMENT_KEYS,
+                environment_keys: SMOLRUNNER_ENVIRONMENT_KEYS_V2,
                 fixed_public_environment: FIXED_PUBLIC_ENVIRONMENT,
             };
             let bytes = serde_json::to_vec(&document).map_err(|_| identity_encoding_failed())?;
@@ -417,16 +452,17 @@ fn policy(
                 jobs,
                 timeout_seconds,
                 cargo_config_policy: CARGO_CONFIG_POLICY,
+                path_remap_policy: GLAEDA_PATH_REMAP_POLICY_V1,
                 system_path_policy: system_path,
-                fixed_argument_policy: GLAEDA_FIXED_ARGUMENT_POLICY_V3,
-                environment_keys: ENVIRONMENT_KEYS,
+                fixed_argument_policy: GLAEDA_FIXED_ARGUMENT_POLICY_V4,
+                environment_keys: GLAEDA_ENVIRONMENT_KEYS_V4,
                 fixed_public_environment: FIXED_PUBLIC_ENVIRONMENT,
             };
             let bytes = serde_json::to_vec(&document).map_err(|_| identity_encoding_failed())?;
             (
                 LOCAL_INSTALL_BUILD_COMMAND_SCHEMA_VERSION,
-                GLAEDA_FIXED_ARGUMENT_POLICY_V3,
-                domain_digest(GLAEDA_COMMAND_IDENTITY_DOMAIN_V3, &bytes)?,
+                GLAEDA_FIXED_ARGUMENT_POLICY_V4,
+                domain_digest(GLAEDA_COMMAND_IDENTITY_DOMAIN_V4, &bytes)?,
             )
         }
     };
@@ -442,9 +478,16 @@ fn policy(
         jobs,
         timeout_seconds,
         cargo_config_policy: CARGO_CONFIG_POLICY,
+        path_remap_policy: match identity_generation {
+            LocalInstallIdentityGeneration::SmolrunnerV1 => None,
+            LocalInstallIdentityGeneration::GlaedaV2 => Some(GLAEDA_PATH_REMAP_POLICY_V1),
+        },
         system_path_policy: system_path,
         fixed_argument_policy,
-        environment_keys: ENVIRONMENT_KEYS,
+        environment_keys: match identity_generation {
+            LocalInstallIdentityGeneration::SmolrunnerV1 => SMOLRUNNER_ENVIRONMENT_KEYS_V2.to_vec(),
+            LocalInstallIdentityGeneration::GlaedaV2 => GLAEDA_ENVIRONMENT_KEYS_V4.to_vec(),
+        },
         fixed_public_environment: FIXED_PUBLIC_ENVIRONMENT,
     })
 }
@@ -481,6 +524,29 @@ fn private_utf8(path: &Path) -> String {
     path.to_str()
         .expect("private paths are validated as UTF-8")
         .to_owned()
+}
+
+fn validate_glaeda_path_remap_root(path: &Path) -> Result<(), LocalInstallBuildCommandError> {
+    if path
+        .to_str()
+        .expect("private paths are validated as UTF-8")
+        .contains(RUSTFLAGS_SEPARATOR)
+    {
+        return Err(error(
+            LocalInstallBuildCommandErrorKind::UnsafePrivatePath,
+            "unsafe_path_remap_root",
+            "local self-build path remap root is unsafe for encoded Rust flags",
+        ));
+    }
+    Ok(())
+}
+
+fn glaeda_encoded_rustflags(context: &LocalInstallBuildCommandContext) -> String {
+    format!(
+        "--remap-path-prefix={}={GLAEDA_SYNTHETIC_CONTEXT}/source{RUSTFLAGS_SEPARATOR}--remap-path-prefix={}={GLAEDA_SYNTHETIC_CONTEXT}",
+        private_utf8(&context.source_root),
+        private_utf8(&context.build_root),
+    )
 }
 
 fn domain_digest(
@@ -626,14 +692,14 @@ mod tests {
             command.spec().environment.get("CARGO_HOME"),
             Some(CommandValue::Secret(_))
         ));
-        assert_eq!(command.policy().schema_version, 3);
+        assert_eq!(command.policy().schema_version, 4);
         assert_eq!(
             command.policy().identity_generation,
             LocalInstallIdentityGeneration::GlaedaV2
         );
         assert_eq!(
             command.policy().identity.digest.as_str(),
-            "sha256:d8d96eab451338dfe68deb20b32e97489cd9955ab3283a30bd01e64ef7bf57f0"
+            "sha256:d2052295ec1b2be7487a8d1ad3e574f162e5b2e83c1d8c229f9c2fe0a362bbad"
         );
         assert!(
             !command
@@ -665,6 +731,17 @@ mod tests {
             "sha256:8c412bad61f7e435632b1ddfd93e09735c9c11585b1a805bb9de4b9837d51845"
         );
         assert_eq!(command.spec().displayed_argv()[8], "smolrunner");
+        assert_eq!(command.policy().path_remap_policy, None);
+        assert_eq!(
+            command.policy().environment_keys,
+            SMOLRUNNER_ENVIRONMENT_KEYS_V2
+        );
+        assert!(
+            !command
+                .spec()
+                .environment
+                .contains_key("CARGO_ENCODED_RUSTFLAGS")
+        );
 
         let current =
             plan_local_install_build_command(&build('a'), LocalInstallPlatform::Macos, &context, 3)
@@ -684,8 +761,15 @@ mod tests {
             .keys()
             .map(String::as_str)
             .collect::<Vec<_>>();
-        assert_eq!(keys, ENVIRONMENT_KEYS);
-        for key in ["HOME", "CARGO_HOME", "CARGO_TARGET_DIR", "RUSTC", "RUSTDOC"] {
+        assert_eq!(keys, GLAEDA_ENVIRONMENT_KEYS_V4);
+        for key in [
+            "HOME",
+            "CARGO_HOME",
+            "CARGO_TARGET_DIR",
+            "RUSTC",
+            "RUSTDOC",
+            "CARGO_ENCODED_RUSTFLAGS",
+        ] {
             assert!(matches!(
                 command.spec().environment.get(key),
                 Some(CommandValue::Secret(_))
@@ -707,6 +791,56 @@ mod tests {
         assert!(!serialized.contains("private-b"));
         assert!(serialized.contains("[REDACTED]"));
         assert_eq!(command.policy().system_path_policy, "/usr/bin:/bin");
+        assert_eq!(
+            command.policy().path_remap_policy,
+            Some(GLAEDA_PATH_REMAP_POLICY_V1)
+        );
+        assert_eq!(
+            glaeda_encoded_rustflags(&context),
+            "--remap-path-prefix=/private-b/source=/glaeda-private-context/source\u{1f}--remap-path-prefix=/private-b-build=/glaeda-private-context"
+        );
+    }
+
+    #[test]
+    fn glaeda_path_remap_roots_reject_the_encoded_separator() {
+        for (source_root, build_root) in [
+            (
+                "/private-source\u{1f}-Clinker=/private-tool",
+                "/private-build",
+            ),
+            ("/private-source", "/private-build\u{1f}--cfg=unexpected"),
+        ] {
+            let context = LocalInstallBuildCommandContext::new(
+                source_root,
+                build_root,
+                "/reviewed-toolchain/cargo",
+                "/reviewed-toolchain/rustc",
+                "/reviewed-toolchain/rustdoc",
+            )
+            .expect("separator is valid in a lexical Unix path");
+
+            let error = plan_local_install_build_command(
+                &build('a'),
+                LocalInstallPlatform::Linux,
+                &context,
+                2,
+            )
+            .expect_err("Glaeda path remap must reject an encoded argument separator");
+            assert_eq!(
+                error.kind,
+                LocalInstallBuildCommandErrorKind::UnsafePrivatePath
+            );
+            assert_eq!(error.code, "unsafe_path_remap_root");
+            assert!(!format!("{error:?}").contains("private-"));
+
+            plan_local_install_build_command(
+                &legacy_build('a'),
+                LocalInstallPlatform::Linux,
+                &context,
+                2,
+            )
+            .expect("legacy command has no encoded path-remap environment");
+        }
     }
 
     #[test]
@@ -730,6 +864,10 @@ mod tests {
         assert_eq!(
             first.policy().cargo_config_policy,
             "isolated_cwd_and_cargo_home_config_free_v1"
+        );
+        assert_eq!(
+            first.policy().path_remap_policy,
+            Some("rustc_private_source_and_build_roots_to_glaeda_context_v1")
         );
         let public = serde_json::to_string(first.policy()).expect("policy");
         assert!(!public.contains("secret-one"));
