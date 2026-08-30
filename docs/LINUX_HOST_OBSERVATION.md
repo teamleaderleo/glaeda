@@ -49,7 +49,9 @@ short interval, not as an atomic machine transaction.
 The sched_ext fields are observation, not a scheduler selector. The observer rereads state and the
 monotonic enable sequence around the active-ops name and refuses a transition instead of emitting a
 mixed snapshot. An absent fixed sched_ext sysfs directory is reported as unsupported; malformed or
-partially available scheduler data fails the report.
+partially available scheduler data fails the report. Active ops names follow the kernel
+`sched_ext_ops` object-name contract: 1–127 ASCII alphanumeric, underscore, or period bytes. This
+retains versioned names emitted by current scx schedulers without admitting paths or control bytes.
 
 The CPU-policy fields likewise describe effective kernel state rather than desired policy. The
 observer brackets the per-CPU reads with the canonical online CPU list and refuses a transition.

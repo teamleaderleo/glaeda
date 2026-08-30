@@ -22,6 +22,8 @@ const MAX_CPU_STAT_BYTES: usize = 1_048_576;
 const MAX_SOCKET_TABLE_BYTES: usize = 16 * 1_048_576;
 const MAX_FAILED_UNIT_OUTPUT_BYTES: usize = 65_536;
 const MAX_SCHEDULER_VALUE_BYTES: usize = 256;
+// Linux SCX_OPS_NAME_LEN includes one trailing NUL in the kernel struct.
+const MAX_SCHED_EXT_OPS_NAME_BYTES: usize = 127;
 const MAX_CPU_LIST_BYTES: usize = 65_536;
 const MAX_LOGICAL_CPUS: u16 = 4_096;
 const MAX_FAILED_UNITS: u16 = 4_096;
@@ -536,12 +538,12 @@ fn parse_sched_ext_state(value: &str) -> Result<SchedExtState, LinuxHostObservat
 }
 
 fn parse_sched_ext_ops(value: &str) -> Result<String, LinuxHostObservationError> {
-    let value = value.trim();
+    let value = value.strip_suffix('\n').unwrap_or(value);
     if value.is_empty()
-        || value.len() > 15
+        || value.len() > MAX_SCHED_EXT_OPS_NAME_BYTES
         || !value
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.'))
     {
         return Err(invalid_kernel_data());
     }
@@ -957,9 +959,9 @@ mod tests {
 
     use super::{
         CpuFrequencyClass, CpuFrequencyObservation, LinuxHostObservation,
-        LinuxHostObservationError, LinuxHostObservationErrorKind, ObservedCount, SYSTEMCTL_TIMEOUT,
-        SchedExtObservation, SchedExtState, SchedulerFeatureState, observe_linux_host_at,
-        parse_cpu_list,
+        LinuxHostObservationError, LinuxHostObservationErrorKind, MAX_SCHED_EXT_OPS_NAME_BYTES,
+        ObservedCount, SYSTEMCTL_TIMEOUT, SchedExtObservation, SchedExtState,
+        SchedulerFeatureState, observe_linux_host_at, parse_cpu_list, parse_sched_ext_ops,
     };
 
     static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
@@ -1289,7 +1291,7 @@ mod tests {
         .expect("write sched_ext fixture sequence");
         fs::write(
             fixture.path().join("sys/kernel/sched_ext/root/ops"),
-            "scx_lavd\n",
+            "lavd_1.1.3_x86_64_unknown_linux_gnu\n",
         )
         .expect("write sched_ext fixture ops");
         let executor = ScriptedExecutor::successful("", "");
@@ -1300,7 +1302,7 @@ mod tests {
             SchedExtObservation::Supported {
                 state: SchedExtState::Enabled,
                 enable_sequence: 17,
-                active_ops: Some("scx_lavd".to_owned()),
+                active_ops: Some("lavd_1.1.3_x86_64_unknown_linux_gnu".to_owned()),
             }
         );
 
@@ -1313,6 +1315,42 @@ mod tests {
         let error = observe_fixture(&fixture, &[3000], 1000, &executor)
             .expect_err("malformed scheduler ops");
         assert_eq!(error.kind, LinuxHostObservationErrorKind::InvalidKernelData);
+    }
+
+    #[test]
+    fn sched_ext_ops_name_matches_the_kernel_object_name_contract() {
+        assert_eq!(
+            parse_sched_ext_ops("lavd_1.1.3_x86_64_unknown_linux_gnu\n")
+                .expect("versioned kernel ops name"),
+            "lavd_1.1.3_x86_64_unknown_linux_gnu"
+        );
+        assert_eq!(
+            parse_sched_ext_ops(&"a".repeat(MAX_SCHED_EXT_OPS_NAME_BYTES))
+                .expect("maximum kernel ops name"),
+            "a".repeat(MAX_SCHED_EXT_OPS_NAME_BYTES)
+        );
+        let oversized = "a".repeat(MAX_SCHED_EXT_OPS_NAME_BYTES + 1);
+        for invalid in [
+            "",
+            "bad-name",
+            "bad/name",
+            "bad\\name",
+            " lavd",
+            "lavd ",
+            "\tlavd",
+            "lavd\t",
+            "lavd\r\n",
+            "lavd\n\n",
+            "lavd\nother",
+            oversized.as_str(),
+        ] {
+            assert_eq!(
+                parse_sched_ext_ops(invalid)
+                    .expect_err("invalid ops name")
+                    .kind,
+                LinuxHostObservationErrorKind::InvalidKernelData
+            );
+        }
     }
 
     #[test]
