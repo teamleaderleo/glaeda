@@ -307,6 +307,8 @@ pub mod protected_cache_namespace_lease_visibility;
 /// Strict path-free replacement-equivalence receipt vocabulary for protected cache generations.
 pub mod protected_cache_replacement_equivalence;
 pub mod quarry_parallel_verification_adapter;
+/// Bounded exact-byte capture from one already-open Quarry verification receipt channel.
+pub mod quarry_parallel_verification_capture;
 /// Strict supplied-receipt-only decoder for Quarry parallel verification receipt v2.
 pub mod quarry_parallel_verification_receipt;
 pub mod renderprove_artifact_binding;
