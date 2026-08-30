@@ -233,6 +233,13 @@ ambiguous cache request fall through to the unchanged Python implementation. Thi
 optimization for work that was already direct; it grants no project identity, residency, cache,
 observation, isolation, or result authority.
 
+The Python fallback itself uses a tiny executable launcher and an importable implementation
+module. Ordinary CPython bytecode caching therefore pays source compilation once per changed
+implementation rather than reparsing the complete hot-run implementation on every command. The
+standard cache is ignored by Git, is invalidated by Python's source/cache-tag contract, and grants
+no state, execution, or result authority; deleting it merely makes the next fallback invocation
+compile the module again.
+
 `glaeda-hot-run` is the compiled Linux front door for the equally common measured direct case:
 
 ```bash
@@ -604,11 +611,54 @@ pathname replacement therefore cannot substitute a new object between validation
 consumption.
 
 An explicit `--state` remains caller-owned and can intentionally continue a lineage across
-worktree generations. Default-key v1 directories are inert after the v2 transition and are not
-adopted or deleted implicitly. All task state is expendable: discarding it or selecting a new empty
-`--state` path produces a private cold upper and a normal compiler rebuild. Bubblewrap and kernel
-OverlayFS are required for cross-worktree mode; running directly in the resident worktree does not
-require either.
+worktree generations. New implicit generations are first staged with an owner-private producer
+manifest, then atomically published under a retained namespace lock. The manifest itself is first
+written and synced under a private temporary name, moved into place with `RENAME_NOREPLACE`, and
+followed by a directory sync; interruption can therefore leave an unpublished temporary file but
+never a partially published final manifest. The reader requires canonical bytes and independently
+recomputes the v3 state digest from all seven generation objects, Git-relative relationships and
+cache modes before any retirement. The manifest carries no workflow-result or source-validity
+authority. Existing default-key v1 and v2 directories remain disjoint legacy state. A manifestless
+directory at the exact computed v3 path is a collision and fails before any lock, runtime or cache
+state is created; it is never adopted. The collector does not delete arbitrary legacy or collision
+payload. The key transition also prevents an older hot-run implementation that does not
+participate in the namespace protocol from opening a new producer-managed state concurrently.
+
+Ordinary implicit hot-run activity performs one bounded opportunistic recovery/retirement pass
+when it can take the namespace lock exclusively without waiting. No age, timeout, PID, name,
+occupancy total, or `/proc/locks` absence makes a live state eligible. A different manifested state
+is eligible only when at least one exact recorded worktree-generation object is now absent or has a
+different physical identity, every direct and runtime-subgeneration lock can be acquired
+nonblocking, the manifest is unchanged on a second read, and the generation is still unreachable
+on a second observation. The collector atomically renames that state with `RENAME_NOREPLACE` and
+syncs the namespace before allowing a new admission to cold-reconstruct the canonical path.
+Deletion stays beneath held no-follow directory descriptors on the same filesystem, never follows
+symlinks, and removes at most 2,048 entries per invocation. A private retirement record closes the
+final manifest-unlink/directory-removal crash window; later normal activity resumes an interrupted
+publication, retirement, or bounded deletion. One pass refuses after observing more than 256
+namespace entries or more than 64 entries in a candidate generation, so ordinary launch never
+materializes an unbounded directory inventory. Unpublished creating-stage recovery removes only
+at most two private regular manifest/final-manifest-temporary files beneath the exact stage; any
+other payload is preserved as recovery debt. Explicit `--state`, legacy, malformed, forged,
+noncanonical, mode-drifted, foreign-owned, active, and still-reachable state remains untouched.
+#910 tracks unreachable-generation retirement; #926 separately tracks the watermark/value policy
+needed to evict still-reachable but low-value Cargo targets.
+
+The bounded-discovery repair was measured at exact code `4436b3f63a7c20ae6d15bdce44a10ea6760cbfba`
+against rejected control `dbb3863c14d76880a8c7d155d84888926041c019`, Python 3.14.4 and Linux
+7.0.0-30-generic. Five hundred alternating calls over an empty namespace measured 4.480 microseconds
+control versus 4.565 microseconds candidate median: 85 nanoseconds / 1.90% added to the ordinary
+collector call. Thirty alternating calls over 10,000 foreign entries measured 3.999 milliseconds
+for the old complete scan versus 142.027 microseconds for the new typed bounded refusal: 96.45%
+lower / 28.16x. The large-directory results intentionally have different semantics; the candidate
+does not claim a complete inventory after its 256-entry ceiling. All 1,060 timed calls preserved
+both namespace state vectors. Harness and report SHA-256 values were
+`293d23280ca75429735a26cccaed0d6578df7718f7e4b58b0a0e95ce667c5f29` and
+`ac2872e76a6126892854ab2c6c8596ff9c34d70f7e1e0cd86e2191717da1bfd1`.
+
+All task state is expendable: discarding it or selecting a new empty `--state` path produces a
+private cold upper and a normal compiler rebuild. Bubblewrap and kernel OverlayFS are required for
+cross-worktree mode; running directly in the resident worktree does not require either.
 
 The Linux CLI can turn one explicit hot-run cache root into the existing bounded, path-free cache
 status report:

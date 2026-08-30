@@ -11,6 +11,7 @@ import resource
 import runpy
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -23,10 +24,11 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parent.parent
 HOT_RUN = ROOT / "scripts" / "hot-run"
 HOT_RUN_IMPLEMENTATION = ROOT / "scripts" / "hot-run-python"
+HOT_RUN_MODULE = ROOT / "scripts" / "hot_run_impl.py"
 
 
 def load_hot_run() -> dict[str, object]:
-    return runpy.run_path(str(HOT_RUN_IMPLEMENTATION), run_name="hot_run_test")
+    return runpy.run_path(str(HOT_RUN_MODULE), run_name="hot_run_test")
 
 
 class HotRunTests(unittest.TestCase):
@@ -531,6 +533,437 @@ class HotRunTests(unittest.TestCase):
         )
         self.assertNotIn("node-22", runtime_state_root(first, node_22).name)
 
+    def make_hot_state_manifest_fixture(
+        self,
+        namespace: dict[str, object],
+        fixture: Path,
+        fixture_label: str,
+    ) -> tuple[Path, Path, dict[str, object]]:
+        resident = fixture / f"resident-{fixture_label[0]}"
+        task = fixture / f"task-{fixture_label[0]}"
+        common_git = fixture / f"common-{fixture_label[0]}"
+        resident_git = common_git
+        task_git = common_git / "worktrees" / "task"
+        resident.mkdir()
+        task.mkdir()
+        task_git.mkdir(parents=True)
+        (resident / ".git").mkdir()
+        (task / ".git").write_text("gitdir: exact\n", encoding="utf-8")
+        identity = namespace["observe_worktree_state_identity"](
+            resident,
+            task,
+            common_git,
+            resident_git,
+            task_git,
+            Path("."),
+            Path("worktrees/task"),
+        )
+        cache_specs = (
+            namespace["CacheSpec"](Path("target"), "private-copy"),
+        )
+        state_identity = namespace["default_state_root"](
+            resident, task, cache_specs, identity
+        ).name
+        state = fixture / "hot-run" / state_identity
+        document = namespace["producer_manifest_document"](
+            state,
+            resident,
+            task,
+            common_git,
+            resident_git,
+            task_git,
+            cache_specs,
+            identity,
+        )
+        return state, task, document
+
+    def test_implicit_state_publication_is_atomic_exact_and_never_adopts_legacy(
+        self,
+    ) -> None:
+        namespace = load_hot_run()
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            namespace_root = fixture / "hot-run"
+            namespace_root.mkdir(mode=0o700)
+            state, _, document = self.make_hot_state_manifest_fixture(
+                namespace, fixture, "1" * 64
+            )
+            publish = namespace["publish_implicit_state_base"]
+
+            self.assertEqual(publish(state, document), "created")
+            self.assertEqual(publish(state, document), "reused")
+            self.assertEqual(
+                stat.S_IMODE((state / "producer-manifest.json").stat().st_mode),
+                0o600,
+            )
+            self.assertEqual(
+                list(namespace_root.glob(".creating-v1-*")),
+                [],
+            )
+            self.assertEqual(
+                list(state.glob(".producer-manifest.json.creating-*")),
+                [],
+            )
+
+            conflicting = {**document, "cache_views": []}
+            with self.assertRaisesRegex(RuntimeError, "manifest conflicts"):
+                publish(state, conflicting)
+
+            _, _, legacy_document = self.make_hot_state_manifest_fixture(
+                namespace, fixture, "2" * 64
+            )
+            legacy = namespace_root / legacy_document["state_identity"]
+            legacy.mkdir(mode=0o700)
+            with self.assertRaisesRegex(RuntimeError, "manifestless state"):
+                publish(legacy, legacy_document)
+            self.assertFalse((legacy / "producer-manifest.json").exists())
+
+            legacy.chmod(0o750)
+            with self.assertRaisesRegex(RuntimeError, "owner-private directory"):
+                publish(legacy, legacy_document)
+            self.assertEqual(stat.S_IMODE(legacy.stat().st_mode), 0o750)
+
+    def test_manifest_authentication_rejects_forged_generation_and_encoding(
+        self,
+    ) -> None:
+        namespace = load_hot_run()
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            namespace_root = fixture / "hot-run"
+            namespace_root.mkdir(mode=0o700)
+            state, task, document = self.make_hot_state_manifest_fixture(
+                namespace, fixture, "f" * 64
+            )
+            state.mkdir(mode=0o700)
+            manifest = state / "producer-manifest.json"
+            manifest.write_text(
+                json.dumps(document, indent=2) + "\n", encoding="utf-8"
+            )
+            manifest.chmod(0o600)
+            with self.assertRaisesRegex(RuntimeError, "not canonical"):
+                namespace["read_producer_manifest"](state, state.name)
+
+            manifest.unlink()
+            forged = json.loads(json.dumps(document))
+            forged["generation_objects"][1]["inode"] += 1
+            namespace["write_producer_manifest"](
+                state, namespace["canonical_manifest_bytes"](forged)
+            )
+            (state / "lock").touch(mode=0o600)
+            (state / "payload").write_text("preserve\n", encoding="utf-8")
+            (task / ".git").unlink()
+            with self.assertRaisesRegex(RuntimeError, "not authentic"):
+                namespace["read_producer_manifest"](state, state.name)
+            self.assertEqual(
+                namespace["collect_one_unreachable_state"](
+                    namespace_root, "0" * 64
+                ),
+                "nothing_eligible",
+            )
+            self.assertEqual(
+                (state / "payload").read_text(encoding="utf-8"), "preserve\n"
+            )
+
+    def test_discovery_bounds_refuse_large_namespace_and_runtime_inventory(
+        self,
+    ) -> None:
+        namespace = load_hot_run()
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            namespace_root = fixture / "bounded-namespace"
+            namespace_root.mkdir(mode=0o700)
+            for index in range(namespace["MAX_HOT_STATE_NAMESPACE_ENTRIES"] + 1):
+                (namespace_root / f"foreign-{index:04d}").touch(mode=0o600)
+            self.assertEqual(
+                namespace["collect_one_unreachable_state"](
+                    namespace_root, "0" * 64
+                ),
+                "namespace_bound_exceeded",
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            namespace_root = fixture / "hot-run"
+            namespace_root.mkdir(mode=0o700)
+            state, task, document = self.make_hot_state_manifest_fixture(
+                namespace, fixture, "r" * 64
+            )
+            namespace["publish_implicit_state_base"](state, document)
+            for index in range(namespace["MAX_HOT_STATE_RUNTIME_ENTRIES"] + 1):
+                runtime = state / f"runtime-{index:064x}"
+                runtime.mkdir(mode=0o700)
+                (runtime / "lock").touch(mode=0o600)
+            (task / ".git").unlink()
+            self.assertIsNone(namespace["acquire_retirement_locks"](state))
+            self.assertEqual(
+                namespace["collect_one_unreachable_state"](
+                    namespace_root, "0" * 64
+                ),
+                "nothing_eligible",
+            )
+            self.assertTrue(state.exists())
+
+    def test_collector_requires_unreachable_generation_and_idle_exact_lock(
+        self,
+    ) -> None:
+        namespace = load_hot_run()
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            namespace_root = fixture / "hot-run"
+            namespace_root.mkdir(mode=0o700)
+            state, task, document = self.make_hot_state_manifest_fixture(
+                namespace, fixture, "3" * 64
+            )
+            namespace["publish_implicit_state_base"](state, document)
+            lock = state / "lock"
+            lock.touch(mode=0o600)
+            payload = state / "cache" / "nested"
+            payload.mkdir(parents=True)
+            (payload / "artifact").write_text("reconstructible\n", encoding="utf-8")
+            outside = fixture / "outside"
+            outside.write_text("preserve\n", encoding="utf-8")
+            (payload / "outside-link").symlink_to(outside)
+
+            self.assertEqual(
+                namespace["collect_one_unreachable_state"](
+                    namespace_root, "4" * 64
+                ),
+                "nothing_eligible",
+            )
+            self.assertTrue(state.exists())
+
+            (task / ".git").write_text("replacement\n", encoding="utf-8")
+            lock_descriptor = os.open(lock, os.O_RDWR | os.O_NOFOLLOW)
+            fcntl.flock(lock_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                self.assertEqual(
+                    namespace["collect_one_unreachable_state"](
+                        namespace_root, "4" * 64
+                    ),
+                    "nothing_eligible",
+                )
+                self.assertTrue(state.exists())
+            finally:
+                os.close(lock_descriptor)
+
+            self.assertEqual(
+                namespace["collect_one_unreachable_state"](
+                    namespace_root, "4" * 64
+                ),
+                "retired_unreachable",
+            )
+            self.assertFalse(state.exists())
+            self.assertEqual(outside.read_text(encoding="utf-8"), "preserve\n")
+
+            legacy = namespace_root / ("5" * 64)
+            legacy.mkdir()
+            (legacy / "lock").touch(mode=0o600)
+            self.assertEqual(
+                namespace["collect_one_unreachable_state"](
+                    namespace_root, "4" * 64
+                ),
+                "nothing_eligible",
+            )
+            self.assertTrue(legacy.exists())
+
+    def test_collector_requires_private_manifest_and_all_runtime_locks(self) -> None:
+        namespace = load_hot_run()
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            namespace_root = fixture / "hot-run"
+            namespace_root.mkdir(mode=0o700)
+            state, task, document = self.make_hot_state_manifest_fixture(
+                namespace, fixture, "c" * 64
+            )
+            namespace["publish_implicit_state_base"](state, document)
+            runtimes = []
+            for identity in ("d" * 64, "e" * 64):
+                runtime = state / f"runtime-{identity}"
+                runtime.mkdir(mode=0o700)
+                (runtime / "lock").touch(mode=0o600)
+                runtimes.append(runtime)
+            (task / ".git").unlink()
+
+            manifest = state / "producer-manifest.json"
+            manifest.chmod(0o640)
+            self.assertEqual(
+                namespace["collect_one_unreachable_state"](
+                    namespace_root, "f" * 64
+                ),
+                "nothing_eligible",
+            )
+            manifest.chmod(0o600)
+
+            active = os.open(runtimes[1] / "lock", os.O_RDWR | os.O_NOFOLLOW)
+            fcntl.flock(active, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                self.assertEqual(
+                    namespace["collect_one_unreachable_state"](
+                        namespace_root, "f" * 64
+                    ),
+                    "nothing_eligible",
+                )
+            finally:
+                os.close(active)
+            self.assertTrue(state.exists())
+
+            locks = namespace["acquire_retirement_locks"](state)
+            self.assertIsNotNone(locks)
+            assert locks is not None
+            original_lock = runtimes[0] / "lock"
+            moved_lock = runtimes[0] / "old-lock"
+            original_lock.rename(moved_lock)
+            original_lock.touch(mode=0o600)
+            try:
+                self.assertFalse(namespace["retirement_locks_unchanged"](locks))
+            finally:
+                namespace["close_retirement_locks"](locks)
+                original_lock.unlink()
+                moved_lock.rename(original_lock)
+
+            self.assertEqual(
+                namespace["collect_one_unreachable_state"](
+                    namespace_root, "f" * 64
+                ),
+                "retired_unreachable",
+            )
+            self.assertFalse(state.exists())
+
+    def test_retired_deletion_is_bounded_and_resumes_on_later_activity(self) -> None:
+        namespace = load_hot_run()
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            namespace_root = fixture / "hot-run"
+            namespace_root.mkdir(mode=0o700)
+            state, task, document = self.make_hot_state_manifest_fixture(
+                namespace, fixture, "6" * 64
+            )
+            namespace["publish_implicit_state_base"](state, document)
+            (state / "lock").touch(mode=0o600)
+            for index in range(5):
+                (state / f"artifact-{index}").write_text("data", encoding="utf-8")
+            (task / ".git").unlink()
+
+            collector_globals = namespace[
+                "collect_one_unreachable_state"
+            ].__globals__
+            with mock.patch.dict(
+                collector_globals, {"MAX_HOT_STATE_DELETE_ENTRIES": 1}
+            ):
+                self.assertEqual(
+                    namespace["collect_one_unreachable_state"](
+                        namespace_root, "7" * 64
+                    ),
+                    "retired_unreachable",
+                )
+            retired = namespace_root / (".retired-v1-" + state.name)
+            self.assertTrue(retired.exists())
+            self.assertTrue((retired / "producer-manifest.json").exists())
+
+            self.assertEqual(
+                namespace["collect_one_unreachable_state"](
+                    namespace_root, "7" * 64
+                ),
+                "retirement_record_recovery",
+            )
+            self.assertFalse(retired.exists())
+
+    def test_retirement_record_closes_the_final_delete_crash_window(self) -> None:
+        namespace = load_hot_run()
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            namespace_root = fixture / "hot-run"
+            namespace_root.mkdir(mode=0o700)
+            state, task, document = self.make_hot_state_manifest_fixture(
+                namespace, fixture, "8" * 64
+            )
+            namespace["publish_implicit_state_base"](state, document)
+            (state / "lock").touch(mode=0o600)
+            (state / "artifact").write_text("data", encoding="utf-8")
+            (task / ".git").unlink()
+            collector_globals = namespace[
+                "collect_one_unreachable_state"
+            ].__globals__
+            with mock.patch.dict(
+                collector_globals, {"MAX_HOT_STATE_DELETE_ENTRIES": 1}
+            ):
+                namespace["collect_one_unreachable_state"](
+                    namespace_root, "9" * 64
+                )
+
+            retired_name = ".retired-v1-" + state.name
+            retired = namespace_root / retired_name
+            record_name = namespace["retirement_record_name"](
+                retired_name, state.name
+            )
+            self.assertTrue((namespace_root / record_name).exists())
+            for child in retired.iterdir():
+                if child.is_dir() and not child.is_symlink():
+                    shutil.rmtree(child)
+                else:
+                    child.unlink()
+
+            self.assertEqual(
+                namespace["collect_one_unreachable_state"](
+                    namespace_root, "9" * 64
+                ),
+                "retirement_record_recovery",
+            )
+            self.assertFalse(retired.exists())
+            self.assertFalse((namespace_root / record_name).exists())
+
+    def test_interrupted_unpublished_manifest_is_reclaimed_and_republished(self) -> None:
+        namespace = load_hot_run()
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            namespace_root = fixture / "hot-run"
+            namespace_root.mkdir(mode=0o700)
+            state, _, document = self.make_hot_state_manifest_fixture(
+                namespace, fixture, "a" * 64
+            )
+            staging = namespace_root / (
+                ".creating-v1-" + state.name + "-crash"
+            )
+            staging.mkdir(mode=0o700)
+            manifest = staging / "producer-manifest.json"
+            manifest.write_text('{"schema_version":', encoding="utf-8")
+            manifest.chmod(0o600)
+            temporary_manifest = staging / (
+                ".producer-manifest.json.creating-crash"
+            )
+            temporary_manifest.write_text('{"producer":', encoding="utf-8")
+            temporary_manifest.chmod(0o600)
+
+            self.assertEqual(
+                namespace["collect_one_unreachable_state"](
+                    namespace_root, "b" * 64
+                ),
+                "creating_recovery",
+            )
+            self.assertFalse(staging.exists())
+            self.assertEqual(
+                namespace["publish_implicit_state_base"](state, document),
+                "created",
+            )
+            self.assertTrue((state / "producer-manifest.json").exists())
+
+            unknown_stage = namespace_root / (
+                ".creating-v1-" + state.name + "-unknown"
+            )
+            unknown_stage.mkdir(mode=0o700)
+            unknown_payload = unknown_stage / "partial-cache"
+            unknown_payload.write_text("preserve\n", encoding="utf-8")
+            unknown_payload.chmod(0o600)
+            self.assertEqual(
+                namespace["collect_one_unreachable_state"](
+                    namespace_root, state.name
+                ),
+                "creating_recovery_deferred",
+            )
+            self.assertEqual(
+                unknown_payload.read_text(encoding="utf-8"), "preserve\n"
+            )
+
     def test_worktree_state_revalidation_rejects_generation_drift(self) -> None:
         namespace = load_hot_run()
         observe = namespace["observe_worktree_state_identity"]
@@ -843,11 +1276,16 @@ class HotRunTests(unittest.TestCase):
             self.assertEqual(
                 second_report["state_preparation"][0]["disposition"], "seeded"
             )
-            states = list((cache_home / "glaeda" / "hot-run").iterdir())
-            self.assertEqual(len(states), 2)
-            self.assertTrue(
-                all((state.stat().st_mode & 0o777) == 0o700 for state in states)
-            )
+            state_root = cache_home / "glaeda" / "hot-run"
+            states = [
+                state
+                for state in state_root.iterdir()
+                if len(state.name) == 64
+            ]
+            self.assertEqual(len(states), 1)
+            self.assertEqual(states[0].stat().st_mode & 0o777, 0o700)
+            namespace_lock = state_root / ".namespace-lock"
+            self.assertEqual(namespace_lock.stat().st_mode & 0o777, 0o600)
 
     @unittest.skipUnless(shutil.which("bwrap"), "bubblewrap is unavailable")
     def test_task_sees_stable_path_and_cargo_target_writes_stay_private(self) -> None:

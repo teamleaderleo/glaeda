@@ -66,6 +66,7 @@ jobs:
               Path("scripts/hot-observe"),
               Path("scripts/hot-pressure-shadow"),
               Path("scripts/hot-run-python"),
+              Path("scripts/hot_run_impl.py"),
               Path("scripts/verify"),
               Path("scripts/verify-changed-rustfmt"),
               Path("scripts/test-hot-run.py"),
