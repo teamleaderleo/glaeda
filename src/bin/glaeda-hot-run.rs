@@ -997,6 +997,11 @@ fn observe_owned_resource_scope(
 }
 
 #[cfg(target_os = "linux")]
+fn cgroup_events_read_means_removed(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(Errno::NODEV.raw_os_error())
+}
+
+#[cfg(target_os = "linux")]
 fn resource_scope_is_populated(scope: &OwnedResourceScope) -> Result<bool, String> {
     let events = match rustix_openat(
         &scope.cgroup,
@@ -1010,10 +1015,14 @@ fn resource_scope_is_populated(scope: &OwnedResourceScope) -> Result<bool, Strin
     };
     let events = File::from(events);
     let mut raw = String::new();
-    events
+    match events
         .take(MAX_OBSERVATION_BYTES + 1)
         .read_to_string(&mut raw)
-        .map_err(|_| "owned resource scope could not be observed".to_owned())?;
+    {
+        Ok(_) => {}
+        Err(error) if cgroup_events_read_means_removed(&error) => return Ok(false),
+        Err(_) => return Err("owned resource scope could not be observed".into()),
+    }
     if raw.len() as u64 > MAX_OBSERVATION_BYTES {
         return Err("owned resource scope observation is too large".into());
     }
@@ -2018,6 +2027,15 @@ mod tests {
         })
         .unwrap_err();
         assert_eq!(error, "--resource-profile requires --timeout");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn removed_cgroup_events_read_is_terminal_empty() {
+        let removed = std::io::Error::from_raw_os_error(Errno::NODEV.raw_os_error());
+        let unavailable = std::io::Error::from_raw_os_error(Errno::IO.raw_os_error());
+        assert!(cgroup_events_read_means_removed(&removed));
+        assert!(!cgroup_events_read_means_removed(&unavailable));
     }
 
     #[test]
