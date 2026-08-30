@@ -209,3 +209,92 @@ impl fmt::Display for ProjectWorkspaceIdentityError {
 }
 
 impl std::error::Error for ProjectWorkspaceIdentityError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filesystem_generations_have_pinned_distinct_vectors() {
+        let cases = [
+            (
+                ProjectWorkspaceIdentityGeneration::SmolrunnerV1,
+                ProjectWorkspaceFilesystemIdentityKind::Materialization,
+                "sha256:f10970c34ab915d6efe4c0d873315a5f5ab342779c86446908624abfd3512af0",
+            ),
+            (
+                ProjectWorkspaceIdentityGeneration::GlaedaV2,
+                ProjectWorkspaceFilesystemIdentityKind::Materialization,
+                "sha256:b346ce27b7ae2b9c25f1ef32fa97a6e4066128e5a1a0a053670c7cc9c2bc99a5",
+            ),
+            (
+                ProjectWorkspaceIdentityGeneration::SmolrunnerV1,
+                ProjectWorkspaceFilesystemIdentityKind::DiscoveryRoot,
+                "sha256:af0a45d9c94d6aaf81f9664157d2b54a1e1c3a91a8f050684473f881b81c4478",
+            ),
+            (
+                ProjectWorkspaceIdentityGeneration::GlaedaV2,
+                ProjectWorkspaceFilesystemIdentityKind::DiscoveryRoot,
+                "sha256:c3c5c8de19fffd26d694c800706d2642fc260d6ad906ecdbde80e0d01ea29c21",
+            ),
+            (
+                ProjectWorkspaceIdentityGeneration::SmolrunnerV1,
+                ProjectWorkspaceFilesystemIdentityKind::DiscoveryEntry,
+                "sha256:a4e6d36a91600b117838c39182dfe07d2e07b1722f3b46c23a6f5355372ffa14",
+            ),
+            (
+                ProjectWorkspaceIdentityGeneration::GlaedaV2,
+                ProjectWorkspaceFilesystemIdentityKind::DiscoveryEntry,
+                "sha256:7546cbb28f97ed65e92df6c1374ffab1d10e2734d79dc3452d618e5628e66ebf",
+            ),
+        ];
+
+        for (generation, kind, expected) in cases {
+            let actual = project_workspace_filesystem_identity(generation, kind, 7, 11, 1_000)
+                .expect("identity");
+            assert_eq!(actual.as_str(), expected);
+        }
+    }
+
+    #[test]
+    fn trusted_workspace_generations_have_pinned_distinct_vectors() {
+        let fields = [b"installation".as_slice(), b"workspace".as_slice()];
+        let cases = [
+            (
+                ProjectWorkspaceIdentityGeneration::SmolrunnerV1,
+                TrustedWorkspaceIdentityKind::WorkspaceId,
+                "sha256:93da9898e5ed3199d31cd4df522cbaae878f9be276dbe6ede84fbfffc6d04bf3",
+            ),
+            (
+                ProjectWorkspaceIdentityGeneration::GlaedaV2,
+                TrustedWorkspaceIdentityKind::WorkspaceId,
+                "sha256:6c1c8ff7f4a84d67d198f49df5c6a4114aae151c31e5f8c776be922af700f5aa",
+            ),
+            (
+                ProjectWorkspaceIdentityGeneration::SmolrunnerV1,
+                TrustedWorkspaceIdentityKind::CacheNamespace,
+                "sha256:7d123fadd24c99e594d6e1c3235877ec1a49f29b3f51b516e8630e587bea182a",
+            ),
+            (
+                ProjectWorkspaceIdentityGeneration::GlaedaV2,
+                TrustedWorkspaceIdentityKind::CacheNamespace,
+                "sha256:a8f900c3ab6fc3d939950631d1454fa00640a3d2912a506fcd79bf14a4fac6f1",
+            ),
+            (
+                ProjectWorkspaceIdentityGeneration::SmolrunnerV1,
+                TrustedWorkspaceIdentityKind::Evidence,
+                "sha256:5a07faa8a85423b12eb97c4ae28fc4a7f2018fe8b83e2108f46352383dd61282",
+            ),
+            (
+                ProjectWorkspaceIdentityGeneration::GlaedaV2,
+                TrustedWorkspaceIdentityKind::Evidence,
+                "sha256:d78ce94e6786b5a0c9da4885d93f4d15293ff7d1ca3fc48f80e8dd343c717932",
+            ),
+        ];
+
+        for (generation, kind, expected) in cases {
+            let actual = trusted_workspace_identity(generation, kind, fields).expect("identity");
+            assert_eq!(actual.as_str(), expected);
+        }
+    }
+}

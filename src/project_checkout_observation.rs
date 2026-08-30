@@ -4,23 +4,21 @@ use std::os::unix::fs::MetadataExt as _;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
-use serde::Serialize;
-use sha2::{Digest as _, Sha256};
-
 use crate::artifact::{CommitId, GitTreeId, Sha256Digest};
 use crate::process::{CommandSpec, ExecutionRecord, TimedCommandExecutor};
 use crate::project_catalog::{GitHubProjectSource, ProjectIdentity};
+use crate::project_workspace_identity::{
+    ProjectWorkspaceFilesystemIdentityKind, ProjectWorkspaceIdentityGeneration,
+    project_workspace_filesystem_identity,
+};
+use serde::Serialize;
 
-pub const PROJECT_CHECKOUT_OBSERVATION_SCHEMA_VERSION: u8 = 1;
+pub const PROJECT_CHECKOUT_OBSERVATION_SCHEMA_VERSION: u8 = 2;
 pub const PROJECT_CHECKOUT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 pub const MAX_PROJECT_CHECKOUT_OUTPUT_BYTES: usize = 65_536;
 pub const MAX_PROJECT_REMOTES: usize = 16;
 pub const MAX_REMOTE_NAME_BYTES: usize = 100;
 pub const MAX_BRANCH_NAME_BYTES: usize = 512;
-
-const MATERIALIZATION_ID_DOMAIN: &[u8] = b"smolrunner-project-materialization-v1\0";
-const SHA256_PREFIX: &str = "sha256:";
-const HEX: &[u8; 16] = b"0123456789abcdef";
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct ProjectCheckoutLocationIdentity {
@@ -45,20 +43,18 @@ impl ProjectCheckoutLocationIdentity {
             && metadata.uid() == self.owner
     }
 
-    fn materialization_id(&self) -> Result<Sha256Digest, ProjectCheckoutObservationError> {
-        let mut hasher = Sha256::new();
-        hasher.update(MATERIALIZATION_ID_DOMAIN);
-        hasher.update(self.device.to_be_bytes());
-        hasher.update(self.inode.to_be_bytes());
-        hasher.update(self.owner.to_be_bytes());
-        let digest = hasher.finalize();
-        let mut value = String::with_capacity(SHA256_PREFIX.len() + digest.len() * 2);
-        value.push_str(SHA256_PREFIX);
-        for byte in digest {
-            value.push(char::from(HEX[usize::from(byte >> 4)]));
-            value.push(char::from(HEX[usize::from(byte & 0x0f)]));
-        }
-        Sha256Digest::parse(&value).map_err(|_| invalid_output())
+    fn materialization_id(
+        &self,
+        generation: ProjectWorkspaceIdentityGeneration,
+    ) -> Result<Sha256Digest, ProjectCheckoutObservationError> {
+        project_workspace_filesystem_identity(
+            generation,
+            ProjectWorkspaceFilesystemIdentityKind::Materialization,
+            self.device,
+            self.inode,
+            self.owner,
+        )
+        .map_err(|_| invalid_output())
     }
 }
 
@@ -91,6 +87,7 @@ pub enum RemoteFreshness {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ProjectCheckoutObservation {
     schema_version: u8,
+    identity_generation: ProjectWorkspaceIdentityGeneration,
     materialization_id: Sha256Digest,
     #[serde(skip_serializing_if = "Option::is_none")]
     primary_project: Option<ProjectIdentity>,
@@ -113,6 +110,11 @@ pub struct ProjectCheckoutObservation {
 }
 
 impl ProjectCheckoutObservation {
+    #[must_use]
+    pub const fn identity_generation(&self) -> ProjectWorkspaceIdentityGeneration {
+        self.identity_generation
+    }
+
     #[must_use]
     pub const fn materialization_id(&self) -> &Sha256Digest {
         &self.materialization_id
@@ -218,6 +220,7 @@ impl std::error::Error for ProjectCheckoutObservationError {}
 #[derive(Clone, PartialEq, Eq)]
 pub struct ProjectCheckoutObserver {
     git_program: PathBuf,
+    identity_generation: ProjectWorkspaceIdentityGeneration,
 }
 
 impl fmt::Debug for ProjectCheckoutObserver {
@@ -225,6 +228,7 @@ impl fmt::Debug for ProjectCheckoutObserver {
         formatter
             .debug_struct("ProjectCheckoutObserver")
             .field("git_program", &"<reviewed-absolute-git-program>")
+            .field("identity_generation", &self.identity_generation)
             .finish()
     }
 }
@@ -236,11 +240,34 @@ impl ProjectCheckoutObserver {
     ///
     /// Returns a bounded error for a relative or aliased executable path.
     pub fn new(git_program: impl Into<PathBuf>) -> Result<Self, ProjectCheckoutObservationError> {
+        Self::with_identity_generation(git_program, ProjectWorkspaceIdentityGeneration::CURRENT)
+    }
+
+    /// Create one observer for an explicit retained identity generation.
+    ///
+    /// Fresh observations use [`Self::new`]. The legacy generation exists only to interpret or
+    /// reproduce exact historical evidence and grants no adoption or mutation authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded error for a relative or aliased executable path.
+    pub fn with_identity_generation(
+        git_program: impl Into<PathBuf>,
+        identity_generation: ProjectWorkspaceIdentityGeneration,
+    ) -> Result<Self, ProjectCheckoutObservationError> {
         let git_program = git_program.into();
         if !is_normalized_absolute_path(&git_program) {
             return Err(unsafe_path());
         }
-        Ok(Self { git_program })
+        Ok(Self {
+            git_program,
+            identity_generation,
+        })
+    }
+
+    #[must_use]
+    pub const fn identity_generation(&self) -> ProjectWorkspaceIdentityGeneration {
+        self.identity_generation
     }
 
     /// Observe one exact checkout without network access or repository mutation.
@@ -274,7 +301,7 @@ impl ProjectCheckoutObserver {
         let parent_metadata = std::fs::metadata(parent).map_err(|_| unavailable())?;
         let owner_matches_parent = metadata.uid() == parent_metadata.uid();
         let location_identity = ProjectCheckoutLocationIdentity::from_metadata(&metadata);
-        let materialization_id = location_identity.materialization_id()?;
+        let materialization_id = location_identity.materialization_id(self.identity_generation)?;
 
         let bare = self.git(&checkout, &["rev-parse", "--is-bare-repository"], executor)?;
         if !bare.success {
@@ -305,6 +332,7 @@ impl ProjectCheckoutObserver {
 
         Ok(ProjectCheckoutObservation {
             schema_version: PROJECT_CHECKOUT_OBSERVATION_SCHEMA_VERSION,
+            identity_generation: self.identity_generation,
             materialization_id,
             primary_project: second.primary_project,
             remotes: second.remotes,
@@ -780,6 +808,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use crate::process::{CommandExecutor, CommandSpec, ExecutionRecord, TimedCommandExecutor};
+    use crate::project_workspace_identity::ProjectWorkspaceIdentityGeneration;
 
     use super::{
         PROJECT_CHECKOUT_COMMAND_TIMEOUT, ProjectBranchState, ProjectCheckoutObservationErrorKind,
@@ -953,13 +982,50 @@ mod tests {
         assert!(!observation.tracked_changes_present());
         assert_eq!(observation.local_commits_ahead(), Some(0));
         assert_eq!(observation.linked_worktree_count(), 1);
+        assert_eq!(
+            observation.identity_generation(),
+            ProjectWorkspaceIdentityGeneration::GlaedaV2
+        );
         let json = serde_json::to_string(&observation).expect("public JSON");
+        assert!(json.contains("\"schema_version\":2"));
+        assert!(json.contains("\"identity_generation\":\"glaeda_v2\""));
         assert!(!json.contains(checkout.path().to_string_lossy().as_ref()));
         assert!(
             !format!("{:?}", observation.location_identity())
                 .contains(checkout.path().to_string_lossy().as_ref())
         );
         assert_eq!(executor.commands.borrow().len(), 16);
+    }
+
+    #[test]
+    fn explicit_legacy_generation_reproduces_a_distinct_materialization_identity() {
+        let checkout = TempDirectory::new("generation");
+        let status = format!("# branch.oid {COMMIT}\0# branch.head main\0");
+        let worktrees = format!("worktree {}\0HEAD {COMMIT}\0\0", checkout.path().display());
+        let responses = script(checkout.path(), "", &status, "100644\n", &worktrees);
+        let current = observer()
+            .observe(checkout.path(), &ScriptedExecutor::new(responses.clone()))
+            .expect("current observation");
+        let legacy_observer = ProjectCheckoutObserver::with_identity_generation(
+            "/usr/bin/git",
+            ProjectWorkspaceIdentityGeneration::SmolrunnerV1,
+        )
+        .expect("legacy observer");
+        let legacy = legacy_observer
+            .observe(checkout.path(), &ScriptedExecutor::new(responses))
+            .expect("legacy observation");
+
+        assert_eq!(
+            current.identity_generation(),
+            ProjectWorkspaceIdentityGeneration::GlaedaV2
+        );
+        assert_eq!(
+            legacy.identity_generation(),
+            ProjectWorkspaceIdentityGeneration::SmolrunnerV1
+        );
+        assert_ne!(current.materialization_id(), legacy.materialization_id());
+        let json = serde_json::to_string(&legacy).expect("legacy JSON");
+        assert!(json.contains("\"identity_generation\":\"smolrunner_v1\""));
     }
 
     #[test]
