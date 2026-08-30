@@ -233,6 +233,13 @@ ambiguous cache request fall through to the unchanged Python implementation. Thi
 optimization for work that was already direct; it grants no project identity, residency, cache,
 observation, isolation, or result authority.
 
+The Python fallback itself uses a tiny executable launcher and an importable implementation
+module. Ordinary CPython bytecode caching therefore pays source compilation once per changed
+implementation rather than reparsing the complete hot-run implementation on every command. The
+standard cache is ignored by Git, is invalidated by Python's source/cache-tag contract, and grants
+no state, execution, or result authority; deleting it merely makes the next fallback invocation
+compile the module again.
+
 `glaeda-hot-run` is the compiled Linux front door for the equally common measured direct case:
 
 ```bash
@@ -604,11 +611,33 @@ pathname replacement therefore cannot substitute a new object between validation
 consumption.
 
 An explicit `--state` remains caller-owned and can intentionally continue a lineage across
-worktree generations. Default-key v1 directories are inert after the v2 transition and are not
-adopted or deleted implicitly. All task state is expendable: discarding it or selecting a new empty
-`--state` path produces a private cold upper and a normal compiler rebuild. Bubblewrap and kernel
-OverlayFS are required for cross-worktree mode; running directly in the resident worktree does not
-require either.
+worktree generations. New implicit generations are first staged with an owner-private producer
+manifest, then atomically published under a retained namespace lock. The manifest binds the exact
+state digest, reconstructible cache modes, and the same resident/task/Git object generation that
+selected the state; it carries no workflow-result or source-validity authority. Existing
+manifest-less directories, including default-key v1 and v2 state, are legacy and no longer selected
+by the v3 key. The collector never adopts or deletes them. The key transition also prevents an
+older hot-run implementation that does not participate in the namespace protocol from opening a
+new producer-managed state concurrently.
+
+Ordinary implicit hot-run activity performs one bounded opportunistic recovery/retirement pass
+when it can take the namespace lock exclusively without waiting. No age, timeout, PID, name,
+occupancy total, or `/proc/locks` absence makes a live state eligible. A different manifested state
+is eligible only when at least one exact recorded worktree-generation object is now absent or has a
+different physical identity, every direct and runtime-subgeneration lock can be acquired
+nonblocking, the manifest is unchanged on a second read, and the generation is still unreachable
+on a second observation. The collector atomically renames that state with `RENAME_NOREPLACE` and
+syncs the namespace before allowing a new admission to cold-reconstruct the canonical path.
+Deletion stays beneath held no-follow directory descriptors on the same filesystem, never follows
+symlinks, and removes at most 2,048 entries per invocation. A private retirement record closes the
+final manifest-unlink/directory-removal crash window; later normal activity resumes an interrupted
+publication, retirement, or bounded deletion. Explicit `--state`, legacy, malformed, mode-drifted,
+foreign-owned, active, and still-reachable state remains untouched. #910 tracks the separate
+watermark/value policy needed to evict still-reachable but low-value generations.
+
+All task state is expendable: discarding it or selecting a new empty `--state` path produces a
+private cold upper and a normal compiler rebuild. Bubblewrap and kernel OverlayFS are required for
+cross-worktree mode; running directly in the resident worktree does not require either.
 
 The Linux CLI can turn one explicit hot-run cache root into the existing bounded, path-free cache
 status report:
