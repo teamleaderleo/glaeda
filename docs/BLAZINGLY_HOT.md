@@ -622,11 +622,30 @@ none; it never proves universal absence, idleness, quiescence or safe retirement
 does not authorize signaling a process, and either disposition grants no retention, cleanup or
 deletion authority.
 
-Last successful use, rebuild cost, retention value, ownership lifecycle, and deletion authority
-remain `unknown`. In particular, newest mtime is not proof of last successful use, and a zero
-holder count is not proof of idleness. Issue #926 owns the next cold-versus-warm value receipts and
-the later deterministic lease/retirement contract before any target can become an eviction
-candidate.
+An explicit set of successful schema-v6 native measurements can be joined to the current target:
+
+```text
+glaeda-cargo-target-value --checkout /canonical/checkout \
+  --cold /private/cold-a.json --cold /private/cold-b.json \
+  --warm /private/warm-a.json --warm /private/warm-b.json \
+  --output json
+```
+
+The value observer accepts at most 32 private regular files per arm. It rejects symlinks,
+non-private/foreign-owned files, duplicate physical receipt identities, files over 1 MiB, read
+drift, unsuccessful commands, mixed comparison keys/resource/runtime contracts, non-native cache
+views, source mismatch, cold samples that did not start absent, and warm samples that did not reuse
+the currently observed target directory. Equal checkout and complete target observations bracket
+the join so observable concurrent drift fails closed. It reports cold/warm median wall, CPU and RSS
+plus absolute/percentage/ratio wall savings and current visible allocation.
+
+The input receipts remain caller-supplied performance evidence, not authenticated execution truth.
+The report is path-private but intentionally includes the existing project/branch/source evidence.
+It is non-atomic and grants no cache compatibility, currentness beyond the bracketed snapshots,
+lease, retention, reclamation, cleanup or deletion authority. Schema v6 has no epoch timestamp, so
+last successful use remains explicitly unknown; newest mtime is still not a substitute. Issue #926
+owns durable producer lifecycle, last-use evidence and deterministic budget/retirement policy
+before any target can become an eviction candidate.
 
 ## Linux mount path
 

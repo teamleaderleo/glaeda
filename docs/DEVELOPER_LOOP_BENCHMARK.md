@@ -1036,3 +1036,65 @@ was not discriminating, so the entire receipt, SHA-256
 results. No benchmark process survived. This slice still adds no lock, lease, liveness proof,
 retention policy, reclamation or deletion path; cold-versus-warm rebuild value remains the next
 independent decision input.
+
+## Checkout-local Cargo target rebuild-value composition — 2026-08-30
+
+The next issue #926 slice consumes the schema-v6 measurements produced by `glaeda-hot-run` rather
+than copying benchmark numbers into policy by hand. Measured production and integration-test source
+SHA-256 values were respectively
+`da5f9dc9f93a8385be749fdd95b4dfbfbd1e81c58181ff8a783bd47615e53cda` and
+`38f17147b6112f0e62196615acfbcbd030fb8e8477f5a96981583b782fb4caca`.
+
+The typed command accepts 1-32 explicit private cold receipts and 1-32 warm receipts. It requires
+schema v6, one `target:native` cache view, a successful command, exact comparison/resource/runtime
+equality, the current checkout observation, absent-before cold samples and current-target-ID warm
+reuse. Descriptor-bound file reads reject symlinks, foreign ownership, group/other permission bits,
+more than 1 MiB, metadata drift and duplicate device/inode identities. Equal complete
+checkout/target snapshots bracket the join. The result remains non-atomic, labels caller-supplied
+receipt authenticity unproven, and grants no retention or mutation authority. It explicitly reports
+last successful use as unknown because schema v6 has no epoch timestamp.
+
+The physical workload was a dependency-free Rust 2024 library at exact commit
+`fb75586274c0178e4130d6165875fb4e997c5873`. Five cold `cargo test --locked --quiet` samples each
+started after removal of the route-owned fixture's `target`; twenty warm samples retained the final
+target. All 25 commands passed. The exact comparison key was
+`sha256:bc792d28c871d388676d3ae61597c8554a7b93dce40b80538065a052cea7317e`.
+
+| Workload result | n | Median wall | Median total CPU | Median max RSS |
+| --- | ---: | ---: | ---: | ---: |
+| cold rebuild | 5 | 118.094 ms | 200 ms | 196,544 KiB |
+| warm reuse | 20 | 24.564 ms | 20 ms | 160,098 KiB |
+
+The retained target occupied 8,130,560 visible allocated bytes. Warm reuse saved 93.530 ms /
+79.1996% at the median, a 4.8076x speedup, plus 180 ms median CPU; median max RSS was 36,446 KiB
+lower. These tiny-crate results prove the composition and reset discriminator, not Glaeda's
+full-suite economics. The separate full Glaeda workload above remains the representative result:
+43.985 seconds cold versus 3.355 seconds warm, saving 40.630 seconds / 92.37% / 13.11x while
+retaining about 1.895 GB.
+
+The value command itself was compared with two standalone Python 3.14.4 controls over the identical
+25-file corpus. `python_simple` parsed and calculated medians only. `python_checked` additionally
+validated the receipt/source/target relationships but did not freshly observe Git or the target
+filesystem. Glaeda performed the bounded descriptor checks plus two complete current checkout and
+target observations. One warmup preceded 30 rotating-order runs per arm; ten separately rotated GNU
+time runs measured RSS.
+
+| Complete process | n | Median wall | p95 wall | Median child CPU | Median / max RSS |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Python arithmetic-only lower bound | 30 | 31.748246 ms | 34.865142 ms | 31.567500 ms | 16,888 / 17,044 KiB |
+| Python receipt relationship checks | 30 | 32.275685 ms | 34.797623 ms | 32.103000 ms | 17,042 / 17,120 KiB |
+| typed Glaeda plus fresh physical binding | 30 | 43.621420 ms | 67.015977 ms | 50.267500 ms | 5,298 / 5,372 KiB |
+
+Glaeda's additional current-state binding cost 11.345736 ms / 35.15% median wall over the checked
+Python control and had a wider p95, while using 11,744 KiB / 68.91% less median RSS. All 90 timed
+processes returned exactly equal cold/warm/savings values. The result is a safety/evidence tradeoff,
+not a parser-speed claim.
+
+Final report, accepted-receipt-set, benchmark harness and independent control SHA-256 values were
+respectively `9d0c4e1845e6675a26f0e5967c03f3006902c95e5d1d455084ce699618174bfa`,
+`e08712d62e09656d29fc88e58c5d8a474471fc069a1d01dd3e9019acc18b6e92`,
+`1734c4340a02ee7de377c764149a0f12031e11dead92cf4402d6621c10142729`, and
+`41c22c69bb640a6d9bedf36e60a360f2651f2521641c32379b2fe0cc4acc8b07`. One earlier corpus was
+invalidated before timing because the fixture had not ignored `target/`, so the cold build changed
+its checkout observation. That corpus is excluded rather than averaged. No benchmark worker or
+listener survived; only the named route-owned evidence directory remained for publication.
