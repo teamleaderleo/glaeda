@@ -229,6 +229,9 @@ pub mod local_install_build_command;
 pub mod local_install_build_execution;
 /// Read-only, path-private proof that the isolated self-build Cargo lookup path is config-free.
 pub mod local_install_cargo_config_preflight;
+/// Crash-safe private per-user publication of verified Glaeda binary generations.
+#[cfg(unix)]
+pub mod local_install_generation_store;
 /// Pure exact-source local binary generation and stable launcher planning.
 pub mod local_install_plan;
 /// Read-only exact checkout and Cargo.lock proof for local self-builds.
