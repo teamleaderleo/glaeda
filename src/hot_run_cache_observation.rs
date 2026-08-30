@@ -252,7 +252,59 @@ pub fn render_hot_run_cache_observation_human(report: &HotRunCacheObservationRep
 pub fn observe_hot_run_cache(
     root: &Path,
 ) -> Result<HotRunCacheObservation, HotRunCacheObservationError> {
-    let root = BoundDirectory::open_root(root)?;
+    observe_hot_run_cache_with_policy(root, ObservationPolicy::Ordinary)
+}
+
+/// Observe one explicit hot-run cache root through a separately proven current-user capability.
+///
+/// Unlike [`observe_hot_run_cache`], this path requires the root and every traversed object to be
+/// owned by `required_uid`. Stable same-filesystem special inodes are metadata-accounted without
+/// opening them; this covers protected OverlayFS bookkeeping without teaching the ordinary
+/// observer to claim arbitrary special-node completeness.
+///
+/// # Errors
+///
+/// Retains the ordinary bounded, no-follow, no-content and drift-refusal contract and additionally
+/// refuses any ownership mismatch. This function proves no executable or Linux capability
+/// boundary by itself; the dedicated installed front door owns that precondition.
+pub fn observe_owned_hot_run_cache(
+    root: &Path,
+    required_uid: u32,
+) -> Result<HotRunCacheObservation, HotRunCacheObservationError> {
+    observe_hot_run_cache_with_policy(root, ObservationPolicy::Owned { required_uid })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObservationPolicy {
+    Ordinary,
+    Owned { required_uid: u32 },
+}
+
+impl ObservationPolicy {
+    fn require_owner(self, uid: u32) -> Result<(), HotRunCacheObservationError> {
+        match self {
+            Self::Ordinary => Ok(()),
+            Self::Owned { required_uid } if uid == required_uid => Ok(()),
+            Self::Owned { .. } => Err(foreign_owner()),
+        }
+    }
+
+    const fn accepts_special_nodes(self) -> bool {
+        matches!(self, Self::Owned { .. })
+    }
+}
+
+fn observe_hot_run_cache_with_policy(
+    root_path: &Path,
+    policy: ObservationPolicy,
+) -> Result<HotRunCacheObservation, HotRunCacheObservationError> {
+    let root_path_before =
+        DirectorySnapshot::from_stat(&rustix_fs::stat(root_path).map_err(|_| root_unavailable())?)?;
+    let root = BoundDirectory::open_root(root_path)?;
+    if root.snapshot != root_path_before {
+        return Err(changed());
+    }
+    policy.require_owner(root.snapshot.uid)?;
     let root_before = root.snapshot;
     let mut names = state_names(&root.fd)?;
     names.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
@@ -266,19 +318,26 @@ pub fn observe_hot_run_cache(
         {
             return Err(unsafe_shape());
         }
+        policy.require_owner(path_stat.st_uid)?;
         CacheStateId::parse(std::str::from_utf8(name.as_bytes()).map_err(|_| unsafe_shape())?)
             .map_err(|_| unsafe_shape())?;
     }
 
-    let mut global_objects = BTreeMap::new();
-    let mut entries_seen = 0_u64;
+    let mut traversal = Traversal::new(root.snapshot.device, policy);
     let mut states = Vec::with_capacity(names.len());
     for (state_ordinal, name) in names.iter().enumerate() {
         let path_stat =
             match rustix_fs::statat(root.fd.as_fd(), name.as_c_str(), AtFlags::SYMLINK_NOFOLLOW) {
                 Ok(path_stat) => path_stat,
                 Err(errno) => {
-                    return partial_or_error(&root, root_before, &names, read_error(errno));
+                    return partial_or_error(
+                        root_path,
+                        &root,
+                        root_path_before,
+                        root_before,
+                        &names,
+                        read_error(errno),
+                    );
                 }
             };
         if !FileType::from_raw_mode(path_stat.st_mode).is_dir()
@@ -286,29 +345,48 @@ pub fn observe_hot_run_cache(
         {
             return Err(unsafe_shape());
         }
+        policy.require_owner(path_stat.st_uid)?;
         let state = match BoundDirectory::open_child(&root.fd, name.as_c_str()) {
             Ok(state) => state,
-            Err(error) => return partial_or_error(&root, root_before, &names, error),
+            Err(error) => {
+                return partial_or_error(
+                    root_path,
+                    &root,
+                    root_path_before,
+                    root_before,
+                    &names,
+                    error,
+                );
+            }
         };
         if !same_directory_identity(&path_stat, &state.snapshot) {
             return Err(changed());
         }
+        policy.require_owner(state.snapshot.uid)?;
         let mut totals = TreeTotals::default();
-        if let Err(error) = observe_directory(
-            &state,
-            root.snapshot.device,
-            0,
-            state_ordinal,
-            &mut entries_seen,
-            &mut totals,
-            &mut global_objects,
-        ) {
-            return partial_or_error(&root, root_before, &names, error);
+        if let Err(error) = traversal.observe_directory(&state, 0, state_ordinal, &mut totals) {
+            return partial_or_error(
+                root_path,
+                &root,
+                root_path_before,
+                root_before,
+                &names,
+                error,
+            );
         }
         state.revalidate()?;
         let rebound = match BoundDirectory::open_child(&root.fd, name.as_c_str()) {
             Ok(rebound) => rebound,
-            Err(error) => return partial_or_error(&root, root_before, &names, error),
+            Err(error) => {
+                return partial_or_error(
+                    root_path,
+                    &root,
+                    root_path_before,
+                    root_before,
+                    &names,
+                    error,
+                );
+            }
         };
         if rebound.snapshot != state.snapshot {
             return Err(changed());
@@ -323,13 +401,16 @@ pub fn observe_hot_run_cache(
     if root.snapshot != root_before {
         return Err(changed());
     }
+    revalidate_root_path(root_path, root_path_before)?;
     let document =
         CacheInventoryDocument::from_unknown_hot_run_states(states).map_err(|_| unsafe_shape())?;
     Ok(HotRunCacheObservation::Complete(document))
 }
 
 fn partial_or_error(
+    root_path: &Path,
     root: &BoundDirectory,
+    root_path_before: DirectorySnapshot,
     root_before: DirectorySnapshot,
     expected_names: &[std::ffi::CString],
     error: HotRunCacheObservationError,
@@ -356,11 +437,25 @@ fn partial_or_error(
     if root.snapshot != root_before {
         return Err(changed());
     }
+    revalidate_root_path(root_path, root_path_before)?;
     let state_count = u32::try_from(expected_names.len()).map_err(|_| too_large())?;
     Ok(HotRunCacheObservation::Partial {
         state_count,
         problem,
     })
+}
+
+fn revalidate_root_path(
+    root_path: &Path,
+    expected: DirectorySnapshot,
+) -> Result<(), HotRunCacheObservationError> {
+    let observed =
+        DirectorySnapshot::from_stat(&rustix_fs::stat(root_path).map_err(|_| changed())?)
+            .map_err(|_| changed())?;
+    if observed != expected {
+        return Err(changed());
+    }
+    Ok(())
 }
 
 fn state_names(root: &OwnedFd) -> Result<Vec<std::ffi::CString>, HotRunCacheObservationError> {
@@ -388,94 +483,115 @@ fn state_names(root: &OwnedFd) -> Result<Vec<std::ffi::CString>, HotRunCacheObse
     Ok(names)
 }
 
-fn observe_directory(
-    directory: &BoundDirectory,
+struct Traversal {
     root_device: u64,
-    depth: u16,
-    state_ordinal: usize,
-    entries_seen: &mut u64,
-    totals: &mut TreeTotals,
-    global_objects: &mut BTreeMap<PhysicalObjectIdentity, usize>,
-) -> Result<(), HotRunCacheObservationError> {
-    if depth > MAX_HOT_RUN_CACHE_OBSERVATION_DEPTH {
-        return Err(too_large());
-    }
-    totals.add_directory(directory.snapshot.blocks)?;
-    *entries_seen = entries_seen.checked_add(1).ok_or_else(too_large)?;
-    if *entries_seen > MAX_HOT_RUN_CACHE_OBSERVATION_ENTRIES {
-        return Err(too_large());
+    policy: ObservationPolicy,
+    entries_seen: u64,
+    global_objects: BTreeMap<PhysicalObjectIdentity, usize>,
+}
+
+impl Traversal {
+    fn new(root_device: u64, policy: ObservationPolicy) -> Self {
+        Self {
+            root_device,
+            policy,
+            entries_seen: 0,
+            global_objects: BTreeMap::new(),
+        }
     }
 
-    let before = directory.snapshot;
-    let mut entries = Dir::read_from(&directory.fd).map_err(read_error)?;
-    for entry in &mut entries {
-        let entry = entry.map_err(read_error)?;
-        let name = entry.file_name();
-        let bytes = name.to_bytes();
-        if bytes == b"." || bytes == b".." {
-            continue;
+    fn count_entry(&mut self) -> Result<(), HotRunCacheObservationError> {
+        self.entries_seen = self.entries_seen.checked_add(1).ok_or_else(too_large)?;
+        if self.entries_seen > MAX_HOT_RUN_CACHE_OBSERVATION_ENTRIES {
+            return Err(too_large());
         }
-        let first = rustix_fs::statat(directory.fd.as_fd(), name, AtFlags::SYMLINK_NOFOLLOW)
-            .map_err(read_error)?;
-        if first.st_dev != root_device {
-            return Err(unsafe_shape());
-        }
-        if FileType::from_raw_mode(first.st_mode).is_dir() {
-            let child = BoundDirectory::open_child(&directory.fd, name)?;
-            if !same_directory_identity(&first, &child.snapshot) {
-                return Err(changed());
-            }
-            observe_directory(
-                &child,
-                root_device,
-                depth.checked_add(1).ok_or_else(too_large)?,
-                state_ordinal,
-                entries_seen,
-                totals,
-                global_objects,
-            )?;
-            child.revalidate()?;
-            let rebound = BoundDirectory::open_child(&directory.fd, name)?;
-            if rebound.snapshot != child.snapshot {
-                return Err(changed());
-            }
-            continue;
-        }
+        Ok(())
+    }
 
-        let file_type = FileType::from_raw_mode(first.st_mode);
-        if !file_type.is_file() && !file_type.is_symlink() {
-            return Err(unsupported_node());
+    fn observe_directory(
+        &mut self,
+        directory: &BoundDirectory,
+        depth: u16,
+        state_ordinal: usize,
+        totals: &mut TreeTotals,
+    ) -> Result<(), HotRunCacheObservationError> {
+        if depth > MAX_HOT_RUN_CACHE_OBSERVATION_DEPTH {
+            return Err(too_large());
         }
-        let snapshot = ObjectSnapshot::from_stat(&first)?;
-        let second = rustix_fs::statat(directory.fd.as_fd(), name, AtFlags::SYMLINK_NOFOLLOW)
-            .map_err(|errno| {
+        self.policy.require_owner(directory.snapshot.uid)?;
+        totals.add_directory(directory.snapshot.blocks)?;
+        self.count_entry()?;
+
+        let before = directory.snapshot;
+        let mut entries = Dir::read_from(&directory.fd).map_err(read_error)?;
+        for entry in &mut entries {
+            let entry = entry.map_err(read_error)?;
+            let name = entry.file_name();
+            let bytes = name.to_bytes();
+            if bytes == b"." || bytes == b".." {
+                continue;
+            }
+            let first = rustix_fs::statat(directory.fd.as_fd(), name, AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(read_error)?;
+            if first.st_dev != self.root_device {
+                return Err(unsafe_shape());
+            }
+            self.policy.require_owner(first.st_uid)?;
+            if FileType::from_raw_mode(first.st_mode).is_dir() {
+                let child = BoundDirectory::open_child(&directory.fd, name)?;
+                if !same_directory_identity(&first, &child.snapshot) {
+                    return Err(changed());
+                }
+                self.observe_directory(
+                    &child,
+                    depth.checked_add(1).ok_or_else(too_large)?,
+                    state_ordinal,
+                    totals,
+                )?;
+                child.revalidate()?;
+                let rebound = BoundDirectory::open_child(&directory.fd, name)?;
+                if rebound.snapshot != child.snapshot {
+                    return Err(changed());
+                }
+                continue;
+            }
+
+            let file_type = FileType::from_raw_mode(first.st_mode);
+            if !file_type.is_file()
+                && !file_type.is_symlink()
+                && !self.policy.accepts_special_nodes()
+            {
+                return Err(unsupported_node());
+            }
+            let snapshot = ObjectSnapshot::from_stat(&first)?;
+            self.policy.require_owner(snapshot.uid)?;
+            let second = rustix_fs::statat(directory.fd.as_fd(), name, AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(|errno| {
                 if matches!(errno, Errno::ACCESS | Errno::PERM) {
                     read_error(errno)
                 } else {
                     changed()
                 }
             })?;
-        if snapshot != ObjectSnapshot::from_stat(&second)? {
-            return Err(changed());
-        }
-        *entries_seen = entries_seen.checked_add(1).ok_or_else(too_large)?;
-        if *entries_seen > MAX_HOT_RUN_CACHE_OBSERVATION_ENTRIES {
-            return Err(too_large());
-        }
-        let identity = PhysicalObjectIdentity {
-            device: snapshot.device,
-            inode: snapshot.inode,
-        };
-        match global_objects.get(&identity) {
-            Some(owner) if *owner == state_ordinal => continue,
-            Some(_) => return Err(ambiguous_hardlink()),
-            None => {
-                global_objects.insert(identity, state_ordinal);
+            if snapshot != ObjectSnapshot::from_stat(&second)? {
+                return Err(changed());
             }
+            self.count_entry()?;
+            let identity = PhysicalObjectIdentity {
+                device: snapshot.device,
+                inode: snapshot.inode,
+            };
+            match self.global_objects.get(&identity) {
+                Some(owner) if *owner == state_ordinal => continue,
+                Some(_) => return Err(ambiguous_hardlink()),
+                None => {
+                    self.global_objects.insert(identity, state_ordinal);
+                }
+            }
+            totals.add_object(snapshot.size, snapshot.blocks)?;
         }
-        totals.add_object(snapshot.size, snapshot.blocks)?;
+        directory.revalidate_against(before)
     }
-    directory.revalidate_against(before)
 }
 
 #[derive(Debug, Default)]
@@ -558,6 +674,7 @@ struct DirectorySnapshot {
     mtime_nsec: i64,
     ctime: i64,
     ctime_nsec: i64,
+    rdev: u64,
 }
 
 impl DirectorySnapshot {
@@ -581,6 +698,7 @@ impl DirectorySnapshot {
             mtime_nsec: i64::try_from(stat.st_mtime_nsec).map_err(|_| unsafe_shape())?,
             ctime: stat.st_ctime,
             ctime_nsec: i64::try_from(stat.st_ctime_nsec).map_err(|_| unsafe_shape())?,
+            rdev: stat.st_rdev,
         })
     }
 }
@@ -613,6 +731,7 @@ struct ObjectSnapshot {
     mtime_nsec: i64,
     ctime: i64,
     ctime_nsec: i64,
+    rdev: u64,
 }
 
 impl ObjectSnapshot {
@@ -629,6 +748,7 @@ impl ObjectSnapshot {
             mtime_nsec: i64::try_from(stat.st_mtime_nsec).map_err(|_| unsafe_shape())?,
             ctime: stat.st_ctime,
             ctime_nsec: i64::try_from(stat.st_ctime_nsec).map_err(|_| unsafe_shape())?,
+            rdev: stat.st_rdev,
         })
     }
 }
@@ -644,6 +764,7 @@ pub enum HotRunCacheObservationErrorKind {
     Changed,
     TooLarge,
     ArithmeticOverflow,
+    ForeignOwner,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -681,6 +802,9 @@ impl HotRunCacheObservationError {
             HotRunCacheObservationErrorKind::TooLarge => "hot_run_cache_observation_too_large",
             HotRunCacheObservationErrorKind::ArithmeticOverflow => {
                 "hot_run_cache_observation_arithmetic_overflow"
+            }
+            HotRunCacheObservationErrorKind::ForeignOwner => {
+                "hot_run_cache_observation_foreign_owner"
             }
         }
     }
@@ -772,6 +896,13 @@ fn overflow() -> HotRunCacheObservationError {
     )
 }
 
+fn foreign_owner() -> HotRunCacheObservationError {
+    error(
+        HotRunCacheObservationErrorKind::ForeignOwner,
+        "hot-run cache observation found foreign ownership",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -783,7 +914,7 @@ mod tests {
     use super::{
         HotRunCacheObservationCompleteness, HotRunCacheObservationErrorKind,
         HotRunCacheObservationProblem, MAX_HOT_RUN_CACHE_OBSERVATION_DEPTH,
-        build_hot_run_cache_observation_report, observe_hot_run_cache,
+        build_hot_run_cache_observation_report, observe_hot_run_cache, observe_owned_hot_run_cache,
     };
 
     static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
@@ -885,6 +1016,51 @@ mod tests {
             &[HotRunCacheObservationProblem::UnsupportedNode]
         );
         assert!(!format!("{report:?}").contains(private_name));
+    }
+
+    #[test]
+    fn owner_bound_observation_accounts_stable_special_nodes_without_opening_them() {
+        let root = TempRoot::new();
+        let state = root.state('a');
+        let fifo = state.join("private-fifo-name-do-not-print");
+        let status = Command::new("/usr/bin/mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success(), "create fixture FIFO");
+
+        let (_, directory_allocated) = bytes(&fs::metadata(&state).unwrap());
+        let (fifo_logical, fifo_allocated) = bytes(&fs::symlink_metadata(&fifo).unwrap());
+        let observation =
+            observe_owned_hot_run_cache(root.path(), rustix::process::getuid().as_raw())
+                .expect("observe owner-bound fixture");
+        let report =
+            build_hot_run_cache_observation_report(observation).expect("build complete report");
+
+        assert_eq!(
+            report.completeness(),
+            HotRunCacheObservationCompleteness::Complete
+        );
+        assert_eq!(report.summary().logical_bytes(), Some(fifo_logical));
+        assert_eq!(
+            report.summary().allocated_bytes(),
+            Some(directory_allocated + fifo_allocated)
+        );
+        assert!(report.problems().is_empty());
+        assert!(!format!("{report:?}").contains("private-fifo-name-do-not-print"));
+    }
+
+    #[test]
+    fn owner_bound_observation_refuses_a_mismatched_required_uid() {
+        let root = TempRoot::new();
+        root.state('a');
+        let actual = rustix::process::getuid().as_raw();
+        let expected = if actual == u32::MAX { 1 } else { actual + 1 };
+
+        let error = observe_owned_hot_run_cache(root.path(), expected)
+            .expect_err("refuse foreign ownership");
+        assert_eq!(error.kind(), HotRunCacheObservationErrorKind::ForeignOwner);
+        assert!(!format!("{error:?}").contains(root.path().to_str().unwrap()));
     }
 
     #[test]
