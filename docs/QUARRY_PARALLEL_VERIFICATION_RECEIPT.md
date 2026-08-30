@@ -24,9 +24,30 @@ self-consistent under the reviewed v2 wire contract. It does not prove that:
 - Glaeda may publish, reuse, settle, cache, attest, or merge anything.
 
 The decoder performs no filesystem, process, network, queue, cache, signal, persistence, or
-publication operations. It intentionally does not map the inner Quarry receipt into
-`personal_worker_repository_result`; that requires a later design binding the exact attempt and
-outer observation independently of attacker-supplied inner bytes.
+publication operations.
+
+## Outer-attempt adapter
+
+`src/quarry_parallel_verification_adapter.rs` composes one already-bound Glaeda repository attempt,
+one independently observed outer terminal event, and one exact bounded channel capture. It checks
+the fixed Quarry v2 producer/schema/byte contract before classifying the capture, hashes captured
+bytes, uses the strict decoder above, and then independently requires the decoded source commit,
+tree, toolchain digest, and worker count to match the bound attempt. The generic
+`personal_worker_repository_result` kernel remains the single source of truth for request,
+attempt, reservation, channel, deadline, process-terminal, stop, resource, and cleanup
+correlation.
+
+One whole Quarry receipt maps to one repository aggregate receipt and one outer Glaeda attempt.
+Inner shard names never become Glaeda queue items, leases, reservations, or cleanup authority. The
+adapter retains only the receipt digest and a domain-separated digest of the complete decoded
+detail; it does not retain raw bytes. Its work-unit count describes outcomes that actually started,
+so a cancellation before the first shard starts remains representable with zero observed
+parallelism rather than inventing work.
+
+The adapter is also pure supplied-evidence composition. It cannot execute Quarry, open or read a
+channel, inspect the filesystem, persist or publish a completion, settle a queue item, signal a
+process, clean a workspace, or release a lease. Those effects remain future B06/B07 work behind
+their own authority and recovery contracts.
 
 ## Compatibility evidence
 
@@ -40,7 +61,10 @@ noncanonical framing, extra or duplicate fields, byte-limit violations, stale pl
 unsafe plan identities, invalid shard ordering and measurements, and contradictory terminal or
 cleanup claims.
 
-The rebased Glaeda candidate confirmed the schema constants and validation semantics against merged
-Quarry, passed all six focused decoder tests, and passed the repository's complete required profile.
+The rebased Glaeda decoder candidate confirmed the schema constants and validation semantics against
+merged Quarry, passed all six focused decoder tests, and passed the repository's complete required
+profile. The outer-attempt adapter adds focused coverage for valid failure and success, cancellation
+before any shard starts, missing/malformed/overflow capture, producer/source/toolchain/concurrency/
+channel drift, timeline and parallelism contradictions, cleanup failure, and raw-byte privacy.
 Future Quarry schema or validation drift requires a new fixture regeneration and compatibility
-review before this decoder can accept it.
+review before the decoder or adapter can accept it.
