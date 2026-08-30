@@ -124,8 +124,49 @@ class VerifyPlanTests(unittest.TestCase):
         )
         self.assertTrue(all("sh" not in phase["argv"][:1] for phase in phases))
 
+    def test_full_tests_profile_is_explicit_and_does_not_change_required_checks(self) -> None:
+        plan = read_plan("full-tests")
+        self.assertEqual(plan["authority"], "developer_feedback_only")
+        self.assertEqual(
+            plan["phases"],
+            [
+                {
+                    "name": "full-tests",
+                    "argv": [
+                        "cargo-nextest",
+                        "--color",
+                        "never",
+                        "--no-pager",
+                        "--user-config-file",
+                        "none",
+                        "nextest",
+                        "run",
+                        "--profile",
+                        "default",
+                        "--locked",
+                        "--all-targets",
+                        "--all-features",
+                        "--ignore-default-filter",
+                        "--test-threads",
+                        "num-cpus",
+                        "--retries",
+                        "0",
+                        "--no-fail-fast",
+                        "--failure-output",
+                        "immediate-final",
+                        "--success-output",
+                        "never",
+                        "--status-level",
+                        "fail",
+                        "--final-status-level",
+                        "fail",
+                    ],
+                }
+            ],
+        )
+
     def test_plans_are_path_free_and_retain_no_logs(self) -> None:
-        for profile in ("fast", "required"):
+        for profile in ("fast", "full-tests", "required"):
             plan = read_plan(profile)
             encoded = json.dumps(plan, sort_keys=True)
             self.assertNotIn(str(ROOT), encoded)
