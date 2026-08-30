@@ -120,6 +120,9 @@ pub mod hot_execution_performance;
 pub mod hot_fleet_latency_summary;
 /// Pure bounded contended fleet-window receipts and exact A-B-B-A comparison evidence.
 pub mod hot_fleet_window;
+/// Read-only, descriptor-bound observation of an explicit Linux hot-run cache root.
+#[cfg(target_os = "linux")]
+pub mod hot_run_cache_observation;
 /// Pure path-class policy for selecting reviewed hot-state sharing mechanisms.
 pub mod hot_state_path_policy;
 /// Pure immutable resident Git object-pool generation and consumer-lease core.
