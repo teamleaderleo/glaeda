@@ -12,6 +12,7 @@ use serde_json::Value;
 struct RunningFixture {
     directory: std::path::PathBuf,
     leader_file: std::path::PathBuf,
+    descendant_file: std::path::PathBuf,
     wrapper: Option<Child>,
 }
 
@@ -22,6 +23,12 @@ impl Drop for RunningFixture {
             && let Some(pid) = Pid::from_raw(raw)
         {
             let _ = kill_process_group(pid, Signal::KILL);
+        }
+        if let Ok(raw) = fs::read_to_string(&self.descendant_file)
+            && let Ok(raw) = raw.trim().parse::<i32>()
+            && let Some(pid) = Pid::from_raw(raw)
+        {
+            let _ = kill_process(pid, Signal::KILL);
         }
         if let Some(wrapper) = self.wrapper.as_mut() {
             let _ = wrapper.kill();
@@ -128,6 +135,7 @@ fn sigint_is_forwarded_to_the_owned_process_group_and_receipted() {
     let mut fixture = RunningFixture {
         directory,
         leader_file,
+        descendant_file: descendant_file.clone(),
         wrapper: Some(wrapper),
     };
     wait_for_file(&descendant_file, Duration::from_secs(3));
@@ -177,11 +185,15 @@ fn profiled_deadline_terminates_the_scoped_process_group_and_receipts_it() {
     fs::create_dir(&directory).unwrap();
     let group_file = directory.join("group.pid");
     let descendant_file = directory.join("descendant.pid");
+    let descendant_group_file = directory.join("descendant-group.pid");
     let measurement = directory.join("measurement.json");
     let shell = format!(
         "/usr/bin/awk '{{ print $5 }}' /proc/self/stat > {}; \
-         sleep 60 & echo $! > {}; wait",
+         /usr/bin/setsid /bin/sh -c \
+         '/usr/bin/awk \"{{ print \\$5 }}\" /proc/self/stat > {}; \
+          echo $$ > {}; exec /bin/sleep 60' & wait",
         group_file.display(),
+        descendant_group_file.display(),
         descendant_file.display()
     );
     let repository = env!("CARGO_MANIFEST_DIR");
@@ -209,9 +221,21 @@ fn profiled_deadline_terminates_the_scoped_process_group_and_receipts_it() {
     let mut fixture = RunningFixture {
         directory,
         leader_file: group_file,
+        descendant_file: descendant_file.clone(),
         wrapper: Some(wrapper),
     };
     wait_for_file(&descendant_file, Duration::from_secs(3));
+    let leader_group = fs::read_to_string(&fixture.leader_file)
+        .unwrap()
+        .trim()
+        .parse::<i32>()
+        .unwrap();
+    let descendant_group = fs::read_to_string(&descendant_group_file)
+        .unwrap()
+        .trim()
+        .parse::<i32>()
+        .unwrap();
+    assert_ne!(leader_group, descendant_group);
 
     let status = wait_for_exit(fixture.wrapper.as_mut().unwrap(), Duration::from_secs(5));
     assert_eq!(status.code(), Some(124));
