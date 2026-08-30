@@ -2027,6 +2027,49 @@ class HotRunTests(unittest.TestCase):
             self.assertIsInstance(report["system_cpu_seconds"], float)
             self.assertIsInstance(report["max_rss_kib"], int)
 
+    @unittest.skipUnless(shutil.which("systemd-run"), "systemd-run is unavailable")
+    def test_background_profile_applies_cpu_weight_and_is_recorded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            observation = root / "cpu-weight.txt"
+            measurement = root / "measurement.json"
+            shell = (
+                "group=$(/usr/bin/awk -F: '$1 == \"0\" { print $3 }' "
+                "/proc/self/cgroup); /usr/bin/cat "
+                f"/sys/fs/cgroup$group/cpu.weight > {observation}"
+            )
+            result = subprocess.run(
+                [
+                    os.fspath(HOT_RUN),
+                    "--resident",
+                    os.fspath(ROOT),
+                    "--task",
+                    os.fspath(ROOT),
+                    "--resource-profile",
+                    "big-red-background",
+                    "--measurement",
+                    os.fspath(measurement),
+                    "--timeout",
+                    "3",
+                    "--",
+                    "/bin/sh",
+                    "-c",
+                    shell,
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            if result.returncode == 2 and not measurement.exists():
+                self.skipTest("user systemd scopes are unavailable")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(observation.read_text(encoding="utf-8").strip(), "25")
+            report = json.loads(measurement.read_text(encoding="utf-8"))
+            self.assertEqual(report["resource_profile"], "big-red-background")
+            self.assertEqual(report["resource_accounting"], "gnu_time_inside_scope")
+
 
 if __name__ == "__main__":
     unittest.main()

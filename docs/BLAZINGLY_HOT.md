@@ -554,6 +554,14 @@ the held directory before publishing the terminal result. Neither observation no
 the generated unit name. A fast-exiting leader and a child that creates a new session therefore
 cannot skip or escape the resource-scope settlement check.
 
+Explicitly deferrable trusted work may instead use `--resource-profile big-red-background`. That
+profile asks the native cgroup-v2 scheduler for `CPUWeight=25` without pinning CPUs or imposing a
+CPU quota, so it remains work-conserving when the machine is otherwise idle and yields relative CPU
+share when foreground work competes. It has the same required deadline, stopped entry,
+descriptor-bound cgroup observation/kill, process settlement, and measurement behavior as the
+heavy profile. Glaeda never selects this profile implicitly; the caller owns the fact that useful
+work is deferrable, and the profile grants no admission or host-wide reservation authority.
+
 The task and resident must be worktrees of the same Git repository. Direct same-worktree execution
 may declare `native` cache observations; all other explicit modes require the cross-worktree path.
 The resident worktree remains the stable compiler pathname, while task source changes remain in the
