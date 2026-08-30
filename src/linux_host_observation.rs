@@ -1,5 +1,5 @@
 use std::collections::BTreeSet;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::Read as _;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -9,7 +9,7 @@ use serde::Serialize;
 
 use crate::process::{CommandSpec, TimedCommandExecutor};
 
-pub const LINUX_HOST_OBSERVATION_SCHEMA_VERSION: u8 = 1;
+pub const LINUX_HOST_OBSERVATION_SCHEMA_VERSION: u8 = 2;
 pub const DEFAULT_WATCHED_PORTS: &[u16] = &[
     3000, 3001, 4000, 4173, 4200, 5000, 5173, 5174, 8000, 8080, 8888,
 ];
@@ -21,6 +21,7 @@ const MAX_SMALL_PROC_BYTES: usize = 65_536;
 const MAX_CPU_STAT_BYTES: usize = 1_048_576;
 const MAX_SOCKET_TABLE_BYTES: usize = 16 * 1_048_576;
 const MAX_FAILED_UNIT_OUTPUT_BYTES: usize = 65_536;
+const MAX_SCHEDULER_VALUE_BYTES: usize = 256;
 const MAX_LOGICAL_CPUS: u16 = 4_096;
 const MAX_FAILED_UNITS: u16 = 4_096;
 
@@ -34,6 +35,7 @@ pub struct LinuxHostObservation {
     cpu: CpuObservation,
     memory: MemoryObservation,
     pressure: PressureObservation,
+    scheduler: SchedulerObservation,
     services: ServiceFailureObservation,
     watched_ports: Vec<WatchedPortObservation>,
 }
@@ -57,6 +59,11 @@ impl LinuxHostObservation {
     #[must_use]
     pub const fn pressure(&self) -> PressureObservation {
         self.pressure
+    }
+
+    #[must_use]
+    pub const fn scheduler(&self) -> &SchedulerObservation {
+        &self.scheduler
     }
 
     #[must_use]
@@ -101,6 +108,38 @@ pub struct PressureSample {
     pub avg60_micros: u32,
     pub avg300_micros: u32,
     pub total_micros: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SchedulerObservation {
+    pub autogroup: SchedulerFeatureState,
+    pub sched_ext: SchedExtObservation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SchedulerFeatureState {
+    Unsupported,
+    Disabled,
+    Enabled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "support", rename_all = "snake_case")]
+pub enum SchedExtObservation {
+    Unsupported,
+    Supported {
+        state: SchedExtState,
+        enable_sequence: u64,
+        active_ops: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SchedExtState {
+    Disabled,
+    Enabled,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -166,6 +205,7 @@ pub fn observe_linux_host(
     let observed_at = u64::try_from(observed_at).map_err(|_| observation_unavailable())?;
     observe_linux_host_at(
         Path::new("/proc"),
+        Path::new("/sys"),
         watched_ports,
         geteuid().as_raw(),
         observed_at,
@@ -175,6 +215,7 @@ pub fn observe_linux_host(
 
 fn observe_linux_host_at(
     proc_root: &Path,
+    sys_root: &Path,
     watched_ports: &[u16],
     uid: u32,
     observed_at_unix_millis: u64,
@@ -201,6 +242,7 @@ fn observe_linux_host_at(
         memory: parse_pressure(&memory_pressure)?,
         io: parse_pressure(&io_pressure)?,
     };
+    let scheduler = observe_scheduler(proc_root, sys_root)?;
     let listening = parse_listening_ports(&tcp, &tcp6)?;
     let watched_ports = watched_ports
         .into_iter()
@@ -223,9 +265,103 @@ fn observe_linux_host_at(
         cpu,
         memory,
         pressure,
+        scheduler,
         services,
         watched_ports,
     })
+}
+
+fn observe_scheduler(
+    proc_root: &Path,
+    sys_root: &Path,
+) -> Result<SchedulerObservation, LinuxHostObservationError> {
+    let autogroup = match read_optional_bounded(
+        &proc_root.join("sys/kernel/sched_autogroup_enabled"),
+        MAX_SCHEDULER_VALUE_BYTES,
+    )? {
+        None => SchedulerFeatureState::Unsupported,
+        Some(value) => match value.trim() {
+            "0" => SchedulerFeatureState::Disabled,
+            "1" => SchedulerFeatureState::Enabled,
+            _ => return Err(invalid_kernel_data()),
+        },
+    };
+    let sched_ext_root = sys_root.join("kernel/sched_ext");
+    let sched_ext = match fs::symlink_metadata(&sched_ext_root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            SchedExtObservation::Unsupported
+        }
+        Err(_) => return Err(observation_unavailable()),
+        Ok(metadata) if metadata.file_type().is_dir() => observe_sched_ext(&sched_ext_root)?,
+        Ok(_) => return Err(invalid_kernel_data()),
+    };
+    Ok(SchedulerObservation {
+        autogroup,
+        sched_ext,
+    })
+}
+
+fn observe_sched_ext(root: &Path) -> Result<SchedExtObservation, LinuxHostObservationError> {
+    let state_before = parse_sched_ext_state(&read_bounded(
+        &root.join("state"),
+        MAX_SCHEDULER_VALUE_BYTES,
+    )?)?;
+    let sequence_before = parse_u64(&read_bounded(
+        &root.join("enable_seq"),
+        MAX_SCHEDULER_VALUE_BYTES,
+    )?)?;
+    let active_ops = match state_before {
+        SchedExtState::Disabled => None,
+        SchedExtState::Enabled => Some(parse_sched_ext_ops(&read_bounded(
+            &root.join("root/ops"),
+            MAX_SCHEDULER_VALUE_BYTES,
+        )?)?),
+    };
+    let state_after = parse_sched_ext_state(&read_bounded(
+        &root.join("state"),
+        MAX_SCHEDULER_VALUE_BYTES,
+    )?)?;
+    let sequence_after = parse_u64(&read_bounded(
+        &root.join("enable_seq"),
+        MAX_SCHEDULER_VALUE_BYTES,
+    )?)?;
+    if state_before != state_after || sequence_before != sequence_after {
+        return Err(observation_unavailable());
+    }
+    Ok(SchedExtObservation::Supported {
+        state: state_after,
+        enable_sequence: sequence_after,
+        active_ops,
+    })
+}
+
+fn parse_sched_ext_state(value: &str) -> Result<SchedExtState, LinuxHostObservationError> {
+    match value.trim() {
+        "disabled" => Ok(SchedExtState::Disabled),
+        "enabled" => Ok(SchedExtState::Enabled),
+        _ => Err(invalid_kernel_data()),
+    }
+}
+
+fn parse_sched_ext_ops(value: &str) -> Result<String, LinuxHostObservationError> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > 15
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return Err(invalid_kernel_data());
+    }
+    Ok(value.to_owned())
+}
+
+fn parse_u64(value: &str) -> Result<u64, LinuxHostObservationError> {
+    let value = value.trim();
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(invalid_kernel_data());
+    }
+    value.parse().map_err(|_| invalid_kernel_data())
 }
 
 fn normalize_ports(ports: &[u16]) -> Result<Vec<u16>, LinuxHostObservationError> {
@@ -251,6 +387,27 @@ fn read_bounded(path: &Path, limit: usize) -> Result<String, LinuxHostObservatio
         return Err(invalid_kernel_data());
     }
     String::from_utf8(bytes).map_err(|_| invalid_kernel_data())
+}
+
+fn read_optional_bounded(
+    path: &Path,
+    limit: usize,
+) -> Result<Option<String>, LinuxHostObservationError> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(observation_unavailable()),
+    };
+    let mut bytes = Vec::with_capacity(limit.min(MAX_SMALL_PROC_BYTES));
+    file.take(u64::try_from(limit).map_err(|_| invalid_kernel_data())? + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| observation_unavailable())?;
+    if bytes.len() > limit {
+        return Err(invalid_kernel_data());
+    }
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| invalid_kernel_data())
 }
 
 fn parse_cpu(stat: &str, loadavg: &str) -> Result<CpuObservation, LinuxHostObservationError> {
@@ -532,7 +689,9 @@ mod tests {
     use crate::process::{CommandExecutor, CommandSpec, ExecutionRecord, TimedCommandExecutor};
 
     use super::{
-        LinuxHostObservationErrorKind, ObservedCount, SYSTEMCTL_TIMEOUT, observe_linux_host_at,
+        LinuxHostObservation, LinuxHostObservationError, LinuxHostObservationErrorKind,
+        ObservedCount, SYSTEMCTL_TIMEOUT, SchedExtObservation, SchedExtState,
+        SchedulerFeatureState, observe_linux_host_at,
     };
 
     static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
@@ -548,12 +707,20 @@ mod tests {
             ));
             fs::create_dir_all(root.join("pressure")).expect("create pressure fixture");
             fs::create_dir_all(root.join("net")).expect("create network fixture");
+            fs::create_dir_all(root.join("sys/kernel/sched_ext/root"))
+                .expect("create scheduler fixture");
             fs::write(
                 root.join("stat"),
                 "cpu  1 2 3 4 5 6 7 8 9 10\ncpu0 1 2 3 4 5 6 7 8 9 10\ncpu1 1 2 3 4 5 6 7 8 9 10\nintr 1\n",
             )
             .expect("write stat");
             fs::write(root.join("loadavg"), "1.25 2.50 3.75 2/100 123\n").expect("write loadavg");
+            fs::write(root.join("sys/kernel/sched_autogroup_enabled"), "1\n")
+                .expect("write autogroup");
+            fs::write(root.join("sys/kernel/sched_ext/state"), "disabled\n")
+                .expect("write sched_ext state");
+            fs::write(root.join("sys/kernel/sched_ext/enable_seq"), "0\n")
+                .expect("write sched_ext sequence");
             fs::write(
                 root.join("meminfo"),
                 "MemTotal:       1000000 kB\nMemFree:         250000 kB\nMemAvailable:    750000 kB\nSwapTotal:       200000 kB\nSwapFree:        125000 kB\n",
@@ -596,6 +763,22 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    fn observe_fixture(
+        fixture: &Fixture,
+        ports: &[u16],
+        uid: u32,
+        executor: &impl TimedCommandExecutor,
+    ) -> Result<LinuxHostObservation, LinuxHostObservationError> {
+        observe_linux_host_at(
+            fixture.path(),
+            &fixture.path().join("sys"),
+            ports,
+            uid,
+            1_000,
+            executor,
+        )
     }
 
     struct ScriptedExecutor {
@@ -655,19 +838,22 @@ mod tests {
             "failed-a.service loaded failed failed\nfailed-b.service loaded failed failed\n",
             "",
         );
-        let report = observe_linux_host_at(
-            fixture.path(),
-            &[8080, 3000, 3000, 5173],
-            1000,
-            1_000,
-            &executor,
-        )
-        .expect("observation");
+        let report = observe_fixture(&fixture, &[8080, 3000, 3000, 5173], 1000, &executor)
+            .expect("observation");
         assert_eq!(report.cpu().logical_cpus, 2);
         assert_eq!(report.cpu().load_1m_micros, 1_250_000);
         assert_eq!(report.memory().total_bytes, 1_024_000_000);
         assert_eq!(report.memory().swap_used_bytes, 76_800_000);
         assert_eq!(report.pressure().cpu.avg10_micros, 1_250_000);
+        assert_eq!(report.scheduler().autogroup, SchedulerFeatureState::Enabled);
+        assert_eq!(
+            report.scheduler().sched_ext,
+            SchedExtObservation::Supported {
+                state: SchedExtState::Disabled,
+                enable_sequence: 0,
+                active_ops: None,
+            }
+        );
         assert_eq!(report.services().system, ObservedCount::Known { count: 2 });
         assert_eq!(report.services().user, ObservedCount::Known { count: 0 });
         assert_eq!(
@@ -689,8 +875,8 @@ mod tests {
         let executor = ScriptedExecutor::successful("", "");
         executor.records.borrow_mut()[0] = record("", 1, "offline\n");
         executor.records.borrow_mut()[1] = record("", 1, "offline\n");
-        let report = observe_linux_host_at(fixture.path(), &[3000], 1000, 1_000, &executor)
-            .expect("partial observation");
+        let report =
+            observe_fixture(&fixture, &[3000], 1000, &executor).expect("partial observation");
         assert_eq!(report.services().system, ObservedCount::Unavailable);
         assert_eq!(report.services().user, ObservedCount::Unavailable);
     }
@@ -699,13 +885,13 @@ mod tests {
     fn requests_and_kernel_data_fail_closed() {
         let fixture = Fixture::new();
         let executor = ScriptedExecutor::successful("", "");
-        let error = observe_linux_host_at(fixture.path(), &[], 1000, 1_000, &executor)
-            .expect_err("empty watched ports");
+        let error =
+            observe_fixture(&fixture, &[], 1000, &executor).expect_err("empty watched ports");
         assert_eq!(error.kind, LinuxHostObservationErrorKind::InvalidRequest);
 
         fs::write(fixture.path().join("loadavg"), "not-loadavg\n").expect("corrupt loadavg");
-        let error = observe_linux_host_at(fixture.path(), &[3000], 1000, 1_000, &executor)
-            .expect_err("invalid kernel data");
+        let error =
+            observe_fixture(&fixture, &[3000], 1000, &executor).expect_err("invalid kernel data");
         assert_eq!(error.kind, LinuxHostObservationErrorKind::InvalidKernelData);
         assert!(
             !error
@@ -718,7 +904,7 @@ mod tests {
     fn systemctl_commands_are_fixed_and_environment_minimal() {
         let fixture = Fixture::new();
         let executor = ScriptedExecutor::successful("", "");
-        observe_linux_host_at(fixture.path(), &[3000], 42, 1_000, &executor).expect("observation");
+        observe_fixture(&fixture, &[3000], 42, &executor).expect("observation");
         let commands = executor.commands.borrow();
         assert_eq!(commands.len(), 2);
         assert_eq!(
@@ -745,5 +931,87 @@ mod tests {
         );
         assert_eq!(commands[0].environment.len(), 2);
         assert_eq!(commands[1].environment.len(), 4);
+    }
+
+    #[test]
+    fn sched_ext_support_and_active_ops_are_typed() {
+        let fixture = Fixture::new();
+        fs::write(
+            fixture.path().join("sys/kernel/sched_ext/state"),
+            "enabled\n",
+        )
+        .expect("enable sched_ext fixture");
+        fs::write(
+            fixture.path().join("sys/kernel/sched_ext/enable_seq"),
+            "17\n",
+        )
+        .expect("write sched_ext fixture sequence");
+        fs::write(
+            fixture.path().join("sys/kernel/sched_ext/root/ops"),
+            "scx_lavd\n",
+        )
+        .expect("write sched_ext fixture ops");
+        let executor = ScriptedExecutor::successful("", "");
+        let report = observe_fixture(&fixture, &[3000], 1000, &executor)
+            .expect("enabled scheduler observation");
+        assert_eq!(
+            report.scheduler().sched_ext,
+            SchedExtObservation::Supported {
+                state: SchedExtState::Enabled,
+                enable_sequence: 17,
+                active_ops: Some("scx_lavd".to_owned()),
+            }
+        );
+
+        fs::write(
+            fixture.path().join("sys/kernel/sched_ext/root/ops"),
+            "bad-name\n",
+        )
+        .expect("write malformed sched_ext ops");
+        let executor = ScriptedExecutor::successful("", "");
+        let error = observe_fixture(&fixture, &[3000], 1000, &executor)
+            .expect_err("malformed scheduler ops");
+        assert_eq!(error.kind, LinuxHostObservationErrorKind::InvalidKernelData);
+    }
+
+    #[test]
+    fn absent_sched_ext_is_unsupported_but_malformed_data_fails() {
+        let fixture = Fixture::new();
+        fs::remove_dir_all(fixture.path().join("sys/kernel/sched_ext"))
+            .expect("remove sched_ext fixture");
+        let executor = ScriptedExecutor::successful("", "");
+        let report = observe_fixture(&fixture, &[3000], 1000, &executor)
+            .expect("unsupported scheduler observation");
+        assert_eq!(
+            report.scheduler().sched_ext,
+            SchedExtObservation::Unsupported
+        );
+
+        fs::remove_file(fixture.path().join("sys/kernel/sched_autogroup_enabled"))
+            .expect("remove autogroup fixture");
+        let executor = ScriptedExecutor::successful("", "");
+        let report = observe_fixture(&fixture, &[3000], 1000, &executor)
+            .expect("unsupported autogroup observation");
+        assert_eq!(
+            report.scheduler().autogroup,
+            SchedulerFeatureState::Unsupported
+        );
+
+        fs::create_dir_all(fixture.path().join("sys/kernel/sched_ext"))
+            .expect("recreate sched_ext fixture");
+        fs::write(
+            fixture.path().join("sys/kernel/sched_ext/state"),
+            "unknown\n",
+        )
+        .expect("write invalid sched_ext state");
+        fs::write(
+            fixture.path().join("sys/kernel/sched_ext/enable_seq"),
+            "0\n",
+        )
+        .expect("write sched_ext sequence");
+        let executor = ScriptedExecutor::successful("", "");
+        let error = observe_fixture(&fixture, &[3000], 1000, &executor)
+            .expect_err("malformed scheduler data");
+        assert_eq!(error.kind, LinuxHostObservationErrorKind::InvalidKernelData);
     }
 }

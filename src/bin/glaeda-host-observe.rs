@@ -5,7 +5,8 @@ use clap::{Parser, ValueEnum};
 #[cfg(target_os = "linux")]
 use glaeda::linux_host_observation::{
     DEFAULT_WATCHED_PORTS, LinuxHostObservation, LinuxHostObservationError, MAX_WATCHED_PORTS,
-    ObservedCount, PressureSample, observe_linux_host,
+    ObservedCount, PressureSample, SchedExtObservation, SchedExtState, SchedulerFeatureState,
+    observe_linux_host,
 };
 #[cfg(target_os = "linux")]
 use glaeda::process::ProcessExecutor;
@@ -117,6 +118,7 @@ fn render_human(report: &LinuxHostObservation) -> String {
     let memory = report.memory();
     let pressure = report.pressure();
     let services = report.services();
+    let scheduler = report.scheduler();
     let ports = report
         .watched_ports()
         .iter()
@@ -139,6 +141,7 @@ fn render_human(report: &LinuxHostObservation) -> String {
             "cpu: logical={} load={} runnable={}/{} pressure={}\n",
             "memory: total={} available={} swap_used={} swap_total={} pressure={}\n",
             "io: pressure={}\n",
+            "scheduler: autogroup={} sched_ext={}\n",
             "failed units: system={} user={}\n",
             "watched ports: {}\n"
         ),
@@ -154,10 +157,36 @@ fn render_human(report: &LinuxHostObservation) -> String {
         memory.swap_total_bytes,
         render_pressure(pressure.memory),
         render_pressure(pressure.io),
+        match scheduler.autogroup {
+            SchedulerFeatureState::Unsupported => "unsupported",
+            SchedulerFeatureState::Disabled => "disabled",
+            SchedulerFeatureState::Enabled => "enabled",
+        },
+        render_sched_ext(&scheduler.sched_ext),
         render_count(services.system),
         render_count(services.user),
         ports,
     )
+}
+
+#[cfg(target_os = "linux")]
+fn render_sched_ext(observation: &SchedExtObservation) -> String {
+    match observation {
+        SchedExtObservation::Unsupported => "unsupported".to_owned(),
+        SchedExtObservation::Supported {
+            state,
+            enable_sequence,
+            active_ops,
+        } => format!(
+            "state={} enable_sequence={} active_ops={}",
+            match state {
+                SchedExtState::Disabled => "disabled",
+                SchedExtState::Enabled => "enabled",
+            },
+            enable_sequence,
+            active_ops.as_deref().unwrap_or("none")
+        ),
+    }
 }
 
 #[cfg(target_os = "linux")]

@@ -14,7 +14,7 @@ fn live_json_observation_is_typed_and_path_private() {
     assert!(output.stderr.is_empty());
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON report");
     assert_eq!(report["document_type"], "glaeda-linux-host-observation");
-    assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["schema_version"], 2);
     assert_eq!(report["authority"], "observation_only");
     assert_eq!(report["scope"], "current_execution_context");
     assert!(
@@ -27,6 +27,8 @@ fn live_json_observation_is_typed_and_path_private() {
             .as_u64()
             .is_some_and(|value| value > 0)
     );
+    assert!(report["scheduler"]["autogroup"].is_string());
+    assert!(report["scheduler"]["sched_ext"]["support"].is_string());
     assert_eq!(report["watched_ports"].as_array().expect("ports").len(), 2);
     let encoded = String::from_utf8(output.stdout).expect("UTF-8 output");
     for private_shape in ["/home/", "/proc/", "cmdline", "pid", "unit_name", "address"] {
@@ -45,6 +47,7 @@ fn human_output_is_derived_from_the_same_bounded_report() {
     let stdout = String::from_utf8(output.stdout).expect("UTF-8 output");
     assert!(stdout.contains("authority=observation_only"));
     assert!(stdout.contains("failed units: system="));
+    assert!(stdout.contains("scheduler: autogroup="));
     assert!(stdout.contains("watched ports: 3000="));
     assert!(!stdout.contains("/home/"));
 }
