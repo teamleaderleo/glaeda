@@ -12,6 +12,9 @@ use crate::local_install_plan::{
 };
 use crate::process::CommandSpec;
 
+#[cfg(unix)]
+pub mod toolchain_preflight;
+
 pub const LOCAL_INSTALL_BUILD_COMMAND_SCHEMA_VERSION: u8 = 3;
 pub const LOCAL_INSTALL_BUILD_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 pub const MAX_LOCAL_INSTALL_BUILD_JOBS: u8 = 4;
@@ -169,6 +172,14 @@ impl LocalInstallBuildCommandContext {
     fn target_directory(&self) -> PathBuf {
         self.build_root.join("target")
     }
+
+    pub(crate) fn source_root(&self) -> &Path {
+        &self.source_root
+    }
+
+    pub(crate) fn build_root(&self) -> &Path {
+        &self.build_root
+    }
 }
 
 impl fmt::Debug for LocalInstallBuildCommandContext {
@@ -192,6 +203,7 @@ pub struct LocalInstallBuildCommand {
     policy: LocalInstallBuildCommandPolicy,
     spec: CommandSpec,
     working_directory: PathBuf,
+    artifact_path: PathBuf,
     timeout: Duration,
 }
 
@@ -211,6 +223,12 @@ impl LocalInstallBuildCommand {
         &self.working_directory
     }
 
+    /// Exact private release artifact path derived from the reviewed generation and build root.
+    #[must_use]
+    pub fn artifact_path(&self) -> &Path {
+        &self.artifact_path
+    }
+
     #[must_use]
     pub const fn timeout(&self) -> Duration {
         self.timeout
@@ -228,6 +246,7 @@ impl fmt::Debug for LocalInstallBuildCommand {
                 "working_directory",
                 &"<private isolated command working directory>",
             )
+            .field("artifact_path", &"<private expected release artifact>")
             .field("environment", &"<fixed reviewed private environment>")
             .field("timeout", &self.timeout)
             .finish()
@@ -319,6 +338,7 @@ pub fn plan_local_install_build_command(
         policy,
         spec,
         working_directory: context.working_directory(),
+        artifact_path: context.target_directory().join("release").join(binary_name),
         timeout: LOCAL_INSTALL_BUILD_TIMEOUT,
     })
 }
@@ -807,3 +827,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(unix)]
+pub mod directory_preflight;
