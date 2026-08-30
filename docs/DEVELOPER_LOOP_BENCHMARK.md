@@ -709,3 +709,43 @@ observe operator-local hot state without changing the storage and trust boundary
 reconstruction or selecting a new state, not deletion by this command. The observer has no catalog,
 ownership, generation, non-use, reconstruction, retirement, or cleanup authority; later lifecycle
 work must supply those facts before bounded eviction can exist.
+
+## Cross-worktree Cargo target environment binding — 2026-08-30
+
+While building the lock-observer candidate, a deliberate shared-`CARGO_TARGET_DIR` control exposed
+a real stale-output failure. Base `b92a1a6e67d50ea606bfe2fc9f677a48338f284b` first populated the
+target. Different candidate source `89779b371595e5d0b795e3aac17dfad434090079` had older mtimes;
+Cargo exited successfully in 0.02 seconds and returned the byte-identical 5,083,248-byte base
+binary, SHA-256 `85f653e59b45cc083fc3a401116eab374b7982b37fc548de13a66031d8bee6b1`.
+An isolated candidate target instead took 58.10 seconds and produced the distinct correct
+5,059,856-byte binary, SHA-256
+`311e7d475d1ca569e9b032b55203f402ad7640dd1b395f2473077caba5042865`.
+The invalid output was rejected before any performance sample.
+
+Code inspection then found that cross-worktree `hot-run` mounted its selected `target` view but
+still inherited a caller `CARGO_TARGET_DIR`, allowing Cargo launched directly or through another
+tool to bypass the view. Exact candidate `e98ddabc5ce1f74b39fc475fb28e989899bd5ca5` / tree
+`9c33a18e5b0de9df72917e0c362fea1c09bfd10b` binds that environment variable to the stable in-view
+path whenever the exact `target` cache is selected. A physical temporary Git/Cargo fixture proved
+the semantic difference: current main exited zero while writing only to the ambient target and
+not the task-private state; the candidate exited zero while writing only to the task-private state
+and left the ambient target untouched.
+
+The complete-command performance control used Rust/Cargo 1.97.1, one Cargo job, three warmups per
+arm, and six rotating order permutations on big-red. Raw local, current cross-worktree `hot-run`,
+and candidate cross-worktree `hot-run` operated on the same tiny crate and independently warmed
+targets:
+
+| Workload | Samples/arm | Raw median / p90 | Current median / p90 | Candidate median / p90 | Current / candidate max RSS |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `/bin/true` | 30 | 1.064 / 1.166 ms | 70.094 / 76.830 ms | 68.713 / 76.131 ms | 25,216 / 25,096 KiB |
+| warm `cargo check --offline --quiet` | 20 | 12.296 / 12.652 ms | 81.234 / 88.679 ms | 82.809 / 89.411 ms | 25,056 / 25,164 KiB |
+
+The candidate changed the warm-Cargo median by +1.575 ms / +1.94% and the no-op median by
+-1.381 ms / -1.97%; overlapping distributions and unchanged RSS show no material wrapper cost.
+The raw arm remains the no-isolation latency floor. A hosted Actions arm is not comparable because
+the decision concerns an inherited operator-shell variable and a local mounted cache view, not
+checkout or runner provisioning. The raw receipt was 2,002 bytes with SHA-256
+`8efed1ecb293c622a5b5dd57783a8699e9b19ae94b7c569913e0eb21550f9620`; its private temporary paths
+were not retained. This correction grants no shared-cache selection, publication, adoption,
+reclamation, or deletion authority.
