@@ -229,6 +229,9 @@ fn run(cli: Cli) -> Result<i32, String> {
     }
     let timeout_seconds = cli.timeout;
     let timeout = timeout_seconds.map(validate_timeout).transpose()?;
+    if cli.resource_profile.is_some() && timeout.is_none() {
+        return Err("--resource-profile requires --timeout".into());
+    }
     let runtime_declaration =
         parse_runtime_contract(cli.runtime_id.as_deref(), cli.runtime_sha256.as_deref())?;
     let runtime_bin = observe_runtime_bin(
@@ -1995,6 +1998,26 @@ mod tests {
         for invalid in [0.0, -1.0, f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
             assert!(validate_timeout(invalid).is_err());
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resource_profiles_require_a_timeout_before_host_observation() {
+        let error = run(Cli {
+            resident: PathBuf::from("/path/that/must/not/be/observed"),
+            task: PathBuf::from("/path/that/must/not/be/observed"),
+            cache: Vec::new(),
+            measurement: None,
+            comparison_key: None,
+            runtime_id: None,
+            runtime_sha256: None,
+            runtime_bin: None,
+            timeout: None,
+            resource_profile: Some(ResourceProfile::BigRedHeavy),
+            command: vec![OsString::from("/bin/true")],
+        })
+        .unwrap_err();
+        assert_eq!(error, "--resource-profile requires --timeout");
     }
 
     #[test]

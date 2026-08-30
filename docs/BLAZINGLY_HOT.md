@@ -445,7 +445,8 @@ and peak RSS describe the workload rather than the `systemd-run` launcher. Force
 prevent descendants or the inner timer from reporting complete usage, so those three fields are
 explicitly `null` instead of fabricated on deadlines and operator interrupts.
 
-Heavy commands should also use `--timeout SECONDS`. For an unprofiled command, the wall-clock
+Heavy commands must also use `--timeout SECONDS`; the resource profile is rejected without that
+bounded settlement deadline. For an unprofiled command, the wall-clock
 deadline owns the whole command process group, first requests termination, escalates after a
 two-second grace period, returns the conventional status 124, and writes the failure receipt. It
 keeps observing the owned group when its leader exits before a descendant, so a signal-ignoring

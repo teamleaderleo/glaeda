@@ -97,6 +97,29 @@ fn heavy_user_scope_is_available() -> bool {
 }
 
 #[test]
+fn profile_without_timeout_is_refused_before_scope_creation() {
+    let repository = env!("CARGO_MANIFEST_DIR");
+    let output = Command::new(env!("CARGO_BIN_EXE_glaeda-hot-run"))
+        .args([
+            "--resident",
+            repository,
+            "--task",
+            repository,
+            "--resource-profile",
+            "big-red-heavy",
+            "--",
+            "/bin/true",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "glaeda-hot-run error: --resource-profile requires --timeout\n"
+    );
+}
+
+#[test]
 fn heavy_profile_applies_exact_cgroup_limits_and_receipt() {
     let _scope_guard = HEAVY_SCOPE_TEST_LOCK.lock().unwrap();
     if !heavy_user_scope_is_available() {
