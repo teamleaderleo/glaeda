@@ -8,14 +8,14 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use smolrunner::local_install_build_command::LocalInstallBuildCommandContext;
-use smolrunner::local_install_build_command::toolchain_preflight::{
-    LocalInstallToolchainBlockingCode, LocalInstallToolchainExecutableDisposition,
-    LocalInstallToolchainPreflightReceipt, LOCAL_INSTALL_TOOLCHAIN_PROBE_TIMEOUT,
+use glaeda::local_install_build_command::LocalInstallBuildCommandContext;
+use glaeda::local_install_build_command::toolchain_preflight::{
+    LOCAL_INSTALL_TOOLCHAIN_PROBE_TIMEOUT, LocalInstallToolchainBlockingCode,
+    LocalInstallToolchainExecutableDisposition, LocalInstallToolchainPreflightReceipt,
     MAX_LOCAL_INSTALL_TOOLCHAIN_VERSION_OUTPUT_BYTES, observe_local_install_toolchain_preflight,
 };
-use smolrunner::local_install_plan::LocalInstallToolchainIdentity;
-use smolrunner::process::{CommandExecutor, CommandSpec, ExecutionRecord, TimedCommandExecutor};
+use glaeda::local_install_plan::LocalInstallToolchainIdentity;
+use glaeda::process::{CommandExecutor, CommandSpec, ExecutionRecord, TimedCommandExecutor};
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
 
@@ -31,7 +31,7 @@ impl TempToolchain {
     fn new(label: &str) -> Self {
         let sequence = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
-            "smolrunner-toolchain-preflight-acceptance-{label}-{}-{sequence}",
+            "glaeda-toolchain-preflight-acceptance-{label}-{}-{sequence}",
             std::process::id()
         ));
         let bin = root.join("toolchain/bin");

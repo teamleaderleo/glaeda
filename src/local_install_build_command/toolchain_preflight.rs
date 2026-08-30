@@ -267,7 +267,7 @@ impl ExecutableSnapshot {
                 .directories
                 .iter()
                 .zip(&other.directories)
-                .all(|(left, right)| left.same_as(right))
+                .all(|(left, right)| left.same_directory_component_as(right))
             && self.file.same_as(&other.file)
     }
 }
@@ -316,6 +316,20 @@ impl PrivateMetadata {
             && self.modified_nanoseconds == other.modified_nanoseconds
             && self.changed_seconds == other.changed_seconds
             && self.changed_nanoseconds == other.changed_nanoseconds
+    }
+
+    /// Root-owned path components are outside the caller's replacement authority. Their entry
+    /// identities and permission classes must remain exact, but their directory size, link count,
+    /// and timestamps legitimately change when unrelated users create siblings (for example in
+    /// `/tmp`). User-owned components retain the complete metadata comparison so moving the
+    /// private toolchain subtree away and back cannot pass as stable.
+    fn same_directory_component_as(&self, other: &Self) -> bool {
+        let stable_identity = self.device == other.device
+            && self.inode == other.inode
+            && self.uid == other.uid
+            && self.gid == other.gid
+            && self.mode == other.mode;
+        stable_identity && (self.uid == 0 || self.same_as(other))
     }
 }
 
@@ -840,6 +854,24 @@ mod tests {
         assert_ne!(private.uid, 0);
         assert_ne!(private.uid, geteuid().as_raw());
         assert!(!owner_and_mode_are_reviewed(&private));
+    }
+
+    #[test]
+    fn root_owned_shared_ancestor_churn_is_not_private_toolchain_change() {
+        let fixture = TempToolchain::new("shared-ancestor-metadata");
+        let metadata = fs::metadata(&fixture.root).expect("fixture root metadata");
+        let mut before = PrivateMetadata::from_metadata(&metadata);
+        before.uid = 0;
+        let mut after = before.clone();
+        after.links = after.links.saturating_add(1);
+        after.size = after.size.saturating_add(4096);
+        after.modified_nanoseconds = after.modified_nanoseconds.saturating_add(1);
+        after.changed_nanoseconds = after.changed_nanoseconds.saturating_add(1);
+
+        assert!(before.same_directory_component_as(&after));
+        before.uid = geteuid().as_raw().max(1);
+        after.uid = before.uid;
+        assert!(!before.same_directory_component_as(&after));
     }
 
     #[test]

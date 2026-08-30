@@ -971,8 +971,8 @@ mod tests {
     use super::{
         CaptureEvent, CaptureThreadSpawner, CapturedStream, CommandExecutor, CommandSpec,
         MAX_CAPTURED_STDIN_BYTES, MAX_CAPTURED_STREAM_BYTES, MAX_COMMAND_TIMEOUT, ProcessExecutor,
-        REDACTED, ThreadCaptureSpawner, TimedCommandExecutor, TimedInputCommandExecutor, Zeroizing,
-        TimedWorkingDirectoryCommandExecutor, execute_process_with_input_spawner,
+        REDACTED, ThreadCaptureSpawner, TimedCommandExecutor, TimedInputCommandExecutor,
+        TimedWorkingDirectoryCommandExecutor, Zeroizing, execute_process_with_input_spawner,
         execute_process_with_spawner,
     };
 
@@ -1194,7 +1194,11 @@ mod tests {
         assert_eq!(record.stdout.trim_end(), fixture.to_string_lossy());
         assert!(!format!("{record:?}").contains("working_directory"));
 
-        for invalid in [Path::new("relative"), Path::new("/"), Path::new("/tmp/../tmp")] {
+        for invalid in [
+            Path::new("relative"),
+            Path::new("/"),
+            Path::new("/tmp/../tmp"),
+        ] {
             let error = ProcessExecutor
                 .execute_in_directory_with_timeout(
                     &CommandSpec::new("/absolute/program/that/must/not/exist"),
