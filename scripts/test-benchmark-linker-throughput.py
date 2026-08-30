@@ -12,6 +12,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 
 SCRIPT = Path(__file__).with_name("benchmark-linker-throughput")
@@ -37,6 +38,16 @@ class LinkerBenchmarkTests(unittest.TestCase):
             MODULE.summarize([6.0, 1.0, 4.0, 2.0, 5.0, 3.0]),
             {"minimum": 1.0, "median": 3.5, "p90": 6.0, "maximum": 6.0},
         )
+
+    def test_storage_preflight_uses_available_blocks(self) -> None:
+        with mock.patch.object(
+            MODULE.os,
+            "statvfs",
+            return_value=SimpleNamespace(f_bavail=1, f_frsize=4096),
+        ):
+            with self.assertRaises(MODULE.BenchmarkError) as raised:
+                MODULE.require_experiment_storage(Path("/private"))
+        self.assertEqual(raised.exception.code, "insufficient_storage")
 
     def test_stop_workers_settles_exact_process_group(self) -> None:
         process = subprocess.Popen(

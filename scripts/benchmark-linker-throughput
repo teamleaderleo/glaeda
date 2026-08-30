@@ -29,6 +29,7 @@ from typing import Any
 
 SCHEMA_VERSION = 1
 BUILD_JOBS = 4
+MIN_EXPERIMENT_AVAILABLE_BYTES = 48 * 1024**3
 WIDTHS = (1, 2, 4)
 LINKERS = ("gnu", "lld", "mold")
 FAST_PHASES = (
@@ -164,6 +165,21 @@ def create_experiment_root(path: Path) -> None:
     path.mkdir(mode=0o700)
     for name in ("targets", "receipts", "logs"):
         (path / name).mkdir(mode=0o700)
+
+
+def filesystem_available_bytes(path: Path) -> int:
+    observed = os.statvfs(path)
+    return observed.f_bavail * observed.f_frsize
+
+
+def require_experiment_storage(path: Path) -> int:
+    available = filesystem_available_bytes(path)
+    if available < MIN_EXPERIMENT_AVAILABLE_BYTES:
+        raise BenchmarkError(
+            "insufficient_storage",
+            "the experiment filesystem lacks the measured target-generation envelope",
+        )
+    return available
 
 
 def encoded_rustflags(linker: str) -> str | None:
@@ -517,6 +533,8 @@ def aggregate(
     final_targets: dict[str, list[dict[str, int]]],
     machine_before: dict[str, int | str],
     machine_after: dict[str, int | str],
+    storage_before: int,
+    storage_after: int,
 ) -> dict[str, Any]:
     measured = [value for value in observations if value["phase"] == "measured"]
     if len({value["help_sha256"] for value in observations}) != 1:
@@ -561,6 +579,7 @@ def aggregate(
             "widths": list(WIDTHS),
             "linkers": list(LINKERS),
             "cold_batches_per_linker": 1,
+            "minimum_experiment_available_bytes": MIN_EXPERIMENT_AVAILABLE_BYTES,
             "warmups_per_arm": 1,
             "measured_batches_per_arm": samples,
             "forced_change": "mtime_only_same_tracked_rust_bytes",
@@ -581,6 +600,10 @@ def aggregate(
         "tools": tools,
         "machine_before": machine_before,
         "machine_after": machine_after,
+        "experiment_filesystem": {
+            "available_bytes_before": storage_before,
+            "available_bytes_after": storage_after,
+        },
         "cold_targets": cold_targets,
         "final_targets": final_targets,
         "summaries": summaries,
@@ -622,6 +645,7 @@ def execute(experiment: Path, output: Path, samples: int) -> dict[str, Any]:
     root = repository_root()
     source = source_identity(root)
     tools = require_capabilities(root)
+    storage_before = require_experiment_storage(experiment.parent)
     create_experiment_root(experiment)
     source_file = root / "src/lib.rs"
     original = source_file.stat()
@@ -703,6 +727,8 @@ def execute(experiment: Path, output: Path, samples: int) -> dict[str, Any]:
         final_targets,
         machine_before,
         machine_observation(),
+        storage_before,
+        filesystem_available_bytes(experiment),
     )
     write_json(output, document)
     return document
