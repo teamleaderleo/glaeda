@@ -46,16 +46,18 @@ use rustix::{
     event::{PollFd, PollFlags, Timespec, poll},
     fd::OwnedFd,
     fs::{
-        AtFlags, FileType, FlockOperation, Mode, OFlags, flock, fstat, mkdirat,
-        open as rustix_open, openat as rustix_openat, statat,
+        AtFlags, FileType, FlockOperation, Mode, OFlags, fcntl_getfl, fcntl_setfl, flock, fstat,
+        mkdirat, open as rustix_open, openat as rustix_openat, statat,
     },
-    io::{Errno, write as rustix_write},
+    io::{Errno, FdFlags, fcntl_getfd, fcntl_setfd, write as rustix_write},
     process::{
         Pid, PidfdFlags, Signal, WaitOptions, getgid, getpgid, getpid, getuid, kill_process,
         kill_process_group, pidfd_open, pidfd_send_signal, test_kill_process_group, waitpid,
     },
     thread::{CpuSet, sched_getaffinity, sched_setaffinity},
 };
+#[cfg(target_os = "linux")]
+use seccompiler::{BpfProgram, SeccompAction, SeccompFilter};
 #[cfg(target_os = "linux")]
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -64,8 +66,11 @@ use sha2::{Digest as _, Sha256};
 const MAX_OBSERVATION_BYTES: u64 = 64 * 1024;
 const TERMINATION_GRACE: Duration = Duration::from_secs(2);
 const RESOURCE_SCOPE_OBSERVATION_GRACE: Duration = Duration::from_secs(2);
+const CPU_GRANT_RELEASE_GRACE: Duration = Duration::from_millis(250);
 #[cfg(target_os = "linux")]
 const INTERNAL_SCOPE_ENTRY: &str = "--glaeda-internal-scope-entry-v1";
+#[cfg(target_os = "linux")]
+const INTERNAL_CPU_GRANT_KEEPER: &str = "--glaeda-internal-cpu-grant-keeper-v1";
 const HEAVY_SCOPE_PROPERTIES: &[&str] = &[
     "CPUQuota=1200%",
     "MemoryHigh=8G",
@@ -272,15 +277,23 @@ fn acquire_cpu_grant(value: &str) -> Result<CpuGrant, String> {
         let lock = rustix_openat(
             &directory,
             name.as_str(),
-            OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+            OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
             Mode::from_raw_mode(0o600),
         )
         .map_err(|_| "CPU grant lock cannot be opened safely".to_owned())?;
         inspect_private_cpu_grant_lock(&directory, &name, &lock)?;
-        match flock(&lock, FlockOperation::NonBlockingLockExclusive) {
-            Ok(()) => {}
-            Err(Errno::WOULDBLOCK) => return Err(format!("CPU {cpu} is already reserved")),
-            Err(_) => return Err("CPU grant lock cannot be acquired".into()),
+        let deadline = Instant::now()
+            .checked_add(CPU_GRANT_RELEASE_GRACE)
+            .ok_or_else(|| "CPU grant release observation exceeds the clock range".to_owned())?;
+        loop {
+            match flock(&lock, FlockOperation::NonBlockingLockExclusive) {
+                Ok(()) => break,
+                Err(Errno::WOULDBLOCK) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(Errno::WOULDBLOCK) => return Err(format!("CPU {cpu} is already reserved")),
+                Err(_) => return Err("CPU grant lock cannot be acquired".into()),
+            }
         }
         inspect_private_cpu_grant_lock(&directory, &name, &lock)?;
         locks.push(lock);
@@ -383,7 +396,10 @@ struct CommandExecution<'a> {
     timeout_seconds: Option<f64>,
     resource_profile: Option<ResourceProfile>,
     cpu_set: Option<&'a CpuSetRequest>,
-    cpu_lock_fds: &'a [i32],
+    #[cfg(target_os = "linux")]
+    cpu_locks: &'a [OwnedFd],
+    #[cfg(not(target_os = "linux"))]
+    cpu_locks: &'a [()],
     measured: bool,
 }
 
@@ -442,6 +458,12 @@ struct OwnedResourceScope {
 
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
+struct CpuGrantKeeper {
+    child: Child,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
 struct ResourceScopeEntryExecutable {
     executable: File,
 }
@@ -462,6 +484,17 @@ fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("glaeda-hot-run scope-entry error: {error}");
+                ExitCode::from(126)
+            }
+        };
+    }
+    #[cfg(target_os = "linux")]
+    if env::args_os().nth(1).as_deref() == Some(OsStr::new(INTERNAL_CPU_GRANT_KEEPER)) {
+        let arguments = env::args_os().skip(2).collect::<Vec<_>>();
+        return match run_cpu_grant_keeper(arguments) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("glaeda-hot-run CPU grant keeper error: {error}");
                 ExitCode::from(126)
             }
         };
@@ -492,20 +525,6 @@ fn run_resource_scope_entry(mut arguments: Vec<OsString>) -> Result<(), String> 
     } else {
         None
     };
-    let mut cpu_lock_fds = Vec::new();
-    while arguments.first().map(OsString::as_os_str) == Some(OsStr::new("--cpu-lock-fd")) {
-        if arguments.len() < 3 {
-            return Err("internal scope entry CPU lock descriptor is missing".into());
-        }
-        arguments.remove(0);
-        let raw = arguments.remove(0);
-        let fd = raw
-            .to_str()
-            .and_then(|value| value.parse::<i32>().ok())
-            .filter(|fd| *fd > 2)
-            .ok_or_else(|| "internal scope entry CPU lock descriptor is invalid".to_owned())?;
-        cpu_lock_fds.push(fd);
-    }
     if arguments.first().map(OsString::as_os_str) != Some(OsStr::new("--")) {
         return Err("internal scope entry arguments are invalid".into());
     }
@@ -514,14 +533,11 @@ fn run_resource_scope_entry(mut arguments: Vec<OsString>) -> Result<(), String> 
         return Err("internal scope entry command is missing".into());
     }
     if let Some(cpu_set) = cpu_set.as_ref() {
-        if cpu_lock_fds.len() != cpu_set.cpus.len() {
-            return Err("internal scope entry CPU lock set is incomplete".into());
-        }
-        for (cpu, fd) in cpu_set.cpus.iter().zip(&cpu_lock_fds) {
-            inspect_inherited_cpu_grant_lock(*cpu, *fd)?;
-        }
         sched_setaffinity(None, &cpu_set.mask)
             .map_err(|_| "internal scope entry could not apply CPU affinity".to_owned())?;
+        seal_cpu_affinity().map_err(|error| {
+            format!("internal scope entry could not seal CPU affinity: {error}")
+        })?;
     }
     kill_process(getpid(), Signal::STOP)
         .map_err(|_| "internal scope entry could not stop before admission".to_owned())?;
@@ -547,6 +563,126 @@ fn inspect_inherited_cpu_grant_lock(cpu: usize, fd: i32) -> Result<(), String> {
         return Err("internal scope entry CPU lock descriptor is unsafe".into());
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn seal_cpu_affinity() -> Result<(), String> {
+    let architecture = std::env::consts::ARCH
+        .try_into()
+        .map_err(|_| "the host architecture is unsupported".to_owned())?;
+    let rules = BTreeMap::from([(libc::SYS_sched_setaffinity, Vec::new())]);
+    let filter = SeccompFilter::new(
+        rules,
+        SeccompAction::Allow,
+        SeccompAction::Errno(libc::EPERM as u32),
+        architecture,
+    )
+    .map_err(|error| format!("filter construction failed: {error}"))?;
+    let program: BpfProgram = filter
+        .try_into()
+        .map_err(|error| format!("filter compilation failed: {error}"))?;
+    seccompiler::apply_filter(&program)
+        .map_err(|error| format!("filter installation failed: {error}"))
+}
+
+#[cfg(target_os = "linux")]
+fn run_cpu_grant_keeper(mut arguments: Vec<OsString>) -> Result<(), String> {
+    if arguments.first().map(OsString::as_os_str) != Some(OsStr::new("--cgroup-fd"))
+        || arguments.len() < 4
+    {
+        return Err("internal CPU grant keeper cgroup descriptor is missing".into());
+    }
+    arguments.remove(0);
+    let cgroup_fd = parse_internal_fd(arguments.remove(0), "cgroup")?;
+    let mut locks = Vec::new();
+    while arguments.first().map(OsString::as_os_str) == Some(OsStr::new("--cpu-lock-fd")) {
+        if arguments.len() < 3 {
+            return Err("internal CPU grant keeper lock descriptor is missing".into());
+        }
+        arguments.remove(0);
+        let cpu = arguments
+            .remove(0)
+            .to_str()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|cpu| *cpu < CpuSet::MAX_CPU)
+            .ok_or_else(|| "internal CPU grant keeper CPU identifier is invalid".to_owned())?;
+        let fd = parse_internal_fd(arguments.remove(0), "lock")?;
+        inspect_inherited_cpu_grant_lock(cpu, fd)?;
+        locks.push(fd);
+    }
+    if !arguments.is_empty() || locks.is_empty() {
+        return Err("internal CPU grant keeper arguments are invalid".into());
+    }
+    if !cpu_grant_scope_is_populated(cgroup_fd)? {
+        return Err("internal CPU grant keeper scope is not populated".into());
+    }
+    std::io::stdout()
+        .write_all(b"1")
+        .and_then(|()| std::io::stdout().flush())
+        .map_err(|_| "internal CPU grant keeper acknowledgement failed".to_owned())?;
+    while cpu_grant_scope_is_populated(cgroup_fd)? {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn parse_internal_fd(value: OsString, subject: &str) -> Result<i32, String> {
+    value
+        .to_str()
+        .and_then(|value| value.parse::<i32>().ok())
+        .filter(|fd| *fd > 2)
+        .ok_or_else(|| format!("internal CPU grant keeper {subject} descriptor is invalid"))
+}
+
+#[cfg(target_os = "linux")]
+fn cpu_grant_scope_is_populated(cgroup_fd: i32) -> Result<bool, String> {
+    let descriptor = PathBuf::from(format!("/proc/self/fd/{cgroup_fd}"));
+    let metadata = match fs::metadata(&descriptor) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => return Err("internal CPU grant keeper scope is unavailable".into()),
+    };
+    let target = fs::read_link(&descriptor)
+        .map_err(|_| "internal CPU grant keeper scope cannot be resolved".to_owned())?;
+    if target.as_os_str().as_bytes().ends_with(b" (deleted)") {
+        return Ok(false);
+    }
+    if !metadata.file_type().is_dir()
+        || !target.starts_with("/sys/fs/cgroup")
+        || !target
+            .file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(|name| name.starts_with("glaeda-hot-run-") && name.ends_with(".scope"))
+    {
+        return Err("internal CPU grant keeper scope descriptor is unsafe".into());
+    }
+    let mut raw = String::new();
+    match File::open(descriptor.join("cgroup.events")).and_then(|events| {
+        events
+            .take(MAX_OBSERVATION_BYTES + 1)
+            .read_to_string(&mut raw)
+    }) {
+        Ok(_) => {}
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                || cgroup_events_read_means_removed(&error) =>
+        {
+            return Ok(false);
+        }
+        Err(_) => return Err("internal CPU grant keeper scope cannot be observed".into()),
+    }
+    if raw.len() as u64 > MAX_OBSERVATION_BYTES {
+        return Err("internal CPU grant keeper scope observation is too large".into());
+    }
+    let mut populated = raw
+        .lines()
+        .filter_map(|line| line.strip_prefix("populated "));
+    match (populated.next(), populated.next()) {
+        (Some("0"), None) => Ok(false),
+        (Some("1"), None) => Ok(true),
+        _ => Err("internal CPU grant keeper scope population is invalid".into()),
+    }
 }
 
 fn run(cli: Cli) -> Result<i32, String> {
@@ -616,20 +752,14 @@ fn run(cli: Cli) -> Result<i32, String> {
     #[cfg(target_os = "linux")]
     let cpu_set = cpu_grant.as_ref().map(|grant| &grant.request);
     #[cfg(target_os = "linux")]
-    let cpu_lock_fds = cpu_grant
+    let cpu_locks = cpu_grant
         .as_ref()
-        .map(|grant| {
-            grant
-                ._locks
-                .iter()
-                .map(|lock| lock.as_raw_fd())
-                .collect::<Vec<_>>()
-        })
+        .map(|grant| grant._locks.as_slice())
         .unwrap_or_default();
     #[cfg(not(target_os = "linux"))]
     let cpu_set: Option<&CpuSetRequest> = None;
     #[cfg(not(target_os = "linux"))]
-    let cpu_lock_fds = Vec::new();
+    let cpu_locks: &[()] = &[];
 
     #[cfg(target_os = "linux")]
     let native_target_before =
@@ -652,7 +782,7 @@ fn run(cli: Cli) -> Result<i32, String> {
         timeout_seconds,
         resource_profile: cli.resource_profile,
         cpu_set,
-        cpu_lock_fds: &cpu_lock_fds,
+        cpu_locks,
         measured: cli.measurement.is_some(),
     })?;
     if let Some(destination) = cli.measurement.as_ref() {
@@ -1606,6 +1736,130 @@ fn abort_resource_scope_execution(
 }
 
 #[cfg(target_os = "linux")]
+fn spawn_cpu_grant_keeper(
+    executable: &ResourceScopeEntryExecutable,
+    scope: &OwnedResourceScope,
+    cpu_set: &CpuSetRequest,
+    locks: &[OwnedFd],
+) -> Result<CpuGrantKeeper, String> {
+    if locks.len() != cpu_set.cpus.len() {
+        return Err("CPU grant keeper lock set is incomplete".into());
+    }
+    let descriptors = std::iter::once(&scope.cgroup)
+        .chain(locks.iter())
+        .collect::<Vec<_>>();
+    let original_flags = descriptors
+        .iter()
+        .map(|fd| fcntl_getfd(fd).map_err(|_| "CPU grant descriptor flags are unavailable"))
+        .collect::<Result<Vec<_>, _>>()?;
+    for (fd, flags) in descriptors.iter().zip(&original_flags) {
+        if fcntl_setfd(fd, *flags & !FdFlags::CLOEXEC).is_err() {
+            for (restore_fd, restore_flags) in descriptors.iter().zip(&original_flags) {
+                let _ = fcntl_setfd(restore_fd, *restore_flags);
+            }
+            return Err("CPU grant descriptors cannot be inherited safely".into());
+        }
+    }
+    let mut command = Command::new(executable.proc_path());
+    command
+        .arg(INTERNAL_CPU_GRANT_KEEPER)
+        .arg("--cgroup-fd")
+        .arg(scope.cgroup.as_raw_fd().to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .env_clear()
+        .process_group(0);
+    for (cpu, lock) in cpu_set.cpus.iter().zip(locks) {
+        command
+            .arg("--cpu-lock-fd")
+            .arg(cpu.to_string())
+            .arg(lock.as_raw_fd().to_string());
+    }
+    let child = command.spawn();
+    let mut restored = true;
+    for (fd, flags) in descriptors.iter().zip(&original_flags) {
+        if fcntl_setfd(fd, *flags).is_err() {
+            restored = false;
+        }
+    }
+    let mut child =
+        child.map_err(|error| format!("CPU grant keeper cannot be launched: {error}"))?;
+    if !restored {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err("CPU grant descriptor inheritance cannot be closed".into());
+    }
+    let mut acknowledgement = child
+        .stdout
+        .take()
+        .ok_or_else(|| "CPU grant keeper acknowledgement is unavailable".to_owned())?;
+    let status_flags = fcntl_getfl(&acknowledgement)
+        .map_err(|_| "CPU grant keeper acknowledgement cannot be observed".to_owned())?;
+    fcntl_setfl(&acknowledgement, status_flags | OFlags::NONBLOCK)
+        .map_err(|_| "CPU grant keeper acknowledgement cannot be observed".to_owned())?;
+    let deadline = Instant::now()
+        .checked_add(RESOURCE_SCOPE_OBSERVATION_GRACE)
+        .ok_or_else(|| "CPU grant keeper acknowledgement exceeds the clock range".to_owned())?;
+    let mut byte = [0_u8; 1];
+    loop {
+        match acknowledgement.read(&mut byte) {
+            Ok(1) if byte == *b"1" => return Ok(CpuGrantKeeper { child }),
+            Ok(0) => break,
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(_) => break,
+        }
+        if child.try_wait().ok().flatten().is_some() || Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    Err("CPU grant keeper did not acknowledge ownership".into())
+}
+
+#[cfg(target_os = "linux")]
+fn verify_cpu_affinity_sealed(pid: Pid) -> Result<(), String> {
+    let status = fs::read_to_string(format!("/proc/{}/status", pid.as_raw_nonzero().get()))
+        .map_err(|_| "admitted CPU affinity seal cannot be observed".to_owned())?;
+    let seccomp = status
+        .lines()
+        .filter_map(|line| line.strip_prefix("Seccomp:\t"))
+        .collect::<Vec<_>>();
+    let no_new_privs = status
+        .lines()
+        .filter_map(|line| line.strip_prefix("NoNewPrivs:\t"))
+        .collect::<Vec<_>>();
+    if seccomp.as_slice() != ["2"] || no_new_privs.as_slice() != ["1"] {
+        return Err("admitted CPU affinity is not sealed".into());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn settle_cpu_grant_keeper(keeper: &mut CpuGrantKeeper) -> Result<(), String> {
+    let deadline = Instant::now()
+        .checked_add(TERMINATION_GRACE)
+        .ok_or_else(|| "CPU grant keeper cleanup exceeds the clock range".to_owned())?;
+    loop {
+        match keeper.child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(_)) => return Err("CPU grant keeper exited unsuccessfully".into()),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) | Err(_) => {
+                let _ = keeper.child.kill();
+                let _ = keeper.child.wait();
+                return Err("CPU grant keeper cleanup is incomplete".into());
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn execute_command(execution: CommandExecution<'_>) -> Result<CommandResult, String> {
     let CommandExecution {
         command,
@@ -1615,7 +1869,7 @@ fn execute_command(execution: CommandExecution<'_>) -> Result<CommandResult, Str
         timeout_seconds,
         resource_profile,
         cpu_set,
-        cpu_lock_fds,
+        cpu_locks,
         measured,
     } = execution;
     let mut signal_control = timeout.map(|_| DeadlineSignalControl::new()).transpose()?;
@@ -1664,10 +1918,6 @@ fn execute_command(execution: CommandExecution<'_>) -> Result<CommandResult, Str
             entry.push(OsString::from("--cpu-set"));
             entry.push(OsString::from(&cpu_set.canonical));
         }
-        for fd in cpu_lock_fds {
-            entry.push(OsString::from("--cpu-lock-fd"));
-            entry.push(OsString::from(fd.to_string()));
-        }
         entry.push(OsString::from("--"));
         arguments = [entry, arguments].concat();
     }
@@ -1678,9 +1928,6 @@ fn execute_command(execution: CommandExecution<'_>) -> Result<CommandResult, Str
             .iter()
             .map(|value| (*value).to_owned())
             .collect::<Vec<_>>();
-        if let Some(cpu_set) = cpu_set {
-            properties.push(format!("AllowedCPUs={}", cpu_set.canonical));
-        }
         arguments = [
             vec![
                 systemd_run.into_os_string(),
@@ -1769,6 +2016,37 @@ fn execute_command(execution: CommandExecution<'_>) -> Result<CommandResult, Str
         },
         None => None,
     };
+    let mut cpu_grant_keeper = if let Some(cpu_set) = cpu_set {
+        let keeper = spawn_cpu_grant_keeper(
+            resource_scope_entry
+                .as_ref()
+                .expect("CPU-granted command has an exact scope entry executable"),
+            resource_scope
+                .as_ref()
+                .expect("CPU-granted command has an owned resource scope"),
+            cpu_set,
+            cpu_locks,
+        );
+        match keeper {
+            Ok(keeper) => Some(keeper),
+            Err(error) => {
+                abort_resource_scope_execution(
+                    &mut child,
+                    child_pid,
+                    resource_scope_pidfd.as_ref(),
+                    resource_scope
+                        .as_ref()
+                        .expect("CPU-granted command has an owned resource scope"),
+                );
+                if let Some(path) = time_report.as_ref() {
+                    let _ = fs::remove_file(path);
+                }
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
     if let Some(cpu_set) = cpu_set {
         let observed = match sched_getaffinity(Some(child_pid)) {
             Ok(observed) => observed,
@@ -1804,6 +2082,20 @@ fn execute_command(execution: CommandExecution<'_>) -> Result<CommandResult, Str
                 let _ = fs::remove_file(path);
             }
             return Err("admitted CPU affinity does not match the reserved CPU set".into());
+        }
+        if let Err(error) = verify_cpu_affinity_sealed(child_pid) {
+            abort_resource_scope_execution(
+                &mut child,
+                child_pid,
+                resource_scope_pidfd.as_ref(),
+                resource_scope
+                    .as_ref()
+                    .expect("CPU-granted command has an owned resource scope"),
+            );
+            if let Some(path) = time_report.as_ref() {
+                let _ = fs::remove_file(path);
+            }
+            return Err(error);
         }
     }
     if let Some(pidfd) = resource_scope_pidfd.as_ref()
@@ -1965,6 +2257,14 @@ fn execute_command(execution: CommandExecution<'_>) -> Result<CommandResult, Str
     };
     if let Some(scope) = resource_scope.as_ref()
         && let Err(error) = settle_finished_resource_scope(scope)
+    {
+        if let Some(path) = time_report.as_ref() {
+            let _ = fs::remove_file(path);
+        }
+        return Err(error);
+    }
+    if let Some(keeper) = cpu_grant_keeper.as_mut()
+        && let Err(error) = settle_cpu_grant_keeper(keeper)
     {
         if let Some(path) = time_report.as_ref() {
             let _ = fs::remove_file(path);

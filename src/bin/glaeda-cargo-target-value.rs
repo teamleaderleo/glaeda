@@ -575,7 +575,7 @@ mod linux {
         if value.is_empty() || value.len() > 4096 {
             return false;
         }
-        let mut previous = None;
+        let mut previous: Option<usize> = None;
         for component in value.split(',') {
             let fields = component.split('-').collect::<Vec<_>>();
             let (first, last) = match fields.as_slice() {
@@ -589,7 +589,7 @@ mod linux {
                 },
                 _ => return false,
             };
-            if previous.is_some_and(|previous| first <= previous + 1) {
+            if previous.is_some_and(|previous| first <= previous.saturating_add(1)) {
                 return false;
             }
             previous = Some(last);
@@ -839,6 +839,12 @@ mod linux {
             assert!(canonical_sha256(&format!("sha256:{}", "a".repeat(64))));
             assert!(!canonical_sha256(&format!("sha256:{}", "A".repeat(64))));
             assert!(!canonical_sha256(&format!("sha256:{}", "a".repeat(63))));
+        }
+
+        #[test]
+        fn cpu_set_identity_rejects_extreme_noncanonical_input_without_panicking() {
+            assert!(canonical_cpu_set_identity(&usize::MAX.to_string()));
+            assert!(!canonical_cpu_set_identity(&format!("{},1", usize::MAX)));
         }
     }
 }
