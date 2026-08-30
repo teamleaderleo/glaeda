@@ -63,6 +63,16 @@ class LinkerBenchmarkTests(unittest.TestCase):
         self.assertIsNotNone(process.returncode)
         self.assertFalse(MODULE.process_group_exists(process.pid))
 
+    def test_process_group_keeps_reparented_worker_owned(self) -> None:
+        roots = {100}
+        table = {
+            101: (1, 100, "rustc", 4096),
+            200: (1, 200, "cargo", 8192),
+        }
+        self.assertTrue(MODULE.is_worker_owned(101, roots, table))
+        self.assertEqual(MODULE.foreign_build_count(roots, table), 1)
+        self.assertEqual(MODULE.descendant_rss_kib(roots, table), 4)
+
     def test_target_stats_rejects_symlink(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -209,8 +209,11 @@ def worker_environment(target: Path, linker: str) -> dict[str, str]:
     return environment
 
 
-def process_table() -> dict[int, tuple[int, str, int]]:
-    observed: dict[int, tuple[int, str, int]] = {}
+ProcessRecord = tuple[int, int, str, int]
+
+
+def process_table() -> dict[int, ProcessRecord]:
+    observed: dict[int, ProcessRecord] = {}
     page_size = os.sysconf("SC_PAGE_SIZE")
     for entry in Path("/proc").iterdir():
         if not entry.name.isdigit():
@@ -219,15 +222,21 @@ def process_table() -> dict[int, tuple[int, str, int]]:
             raw = (entry / "stat").read_text(encoding="utf-8")
             fields = raw[raw.rfind(")") + 2 :].split()
             parent = int(fields[1])
+            process_group = int(fields[2])
             executable = (entry / "exe").resolve(strict=True).name
             resident_pages = int((entry / "statm").read_text(encoding="ascii").split()[1])
         except (FileNotFoundError, PermissionError, OSError, ValueError, IndexError):
             continue
-        observed[int(entry.name)] = (parent, executable, resident_pages * page_size)
+        observed[int(entry.name)] = (
+            parent,
+            process_group,
+            executable,
+            resident_pages * page_size,
+        )
     return observed
 
 
-def is_descendant(pid: int, roots: set[int], table: dict[int, tuple[int, str, int]]) -> bool:
+def is_descendant(pid: int, roots: set[int], table: dict[int, ProcessRecord]) -> bool:
     seen: set[int] = set()
     while pid > 1 and pid not in seen:
         if pid in roots:
@@ -240,22 +249,27 @@ def is_descendant(pid: int, roots: set[int], table: dict[int, tuple[int, str, in
     return False
 
 
+def is_worker_owned(pid: int, roots: set[int], table: dict[int, ProcessRecord]) -> bool:
+    record = table.get(pid)
+    return record is not None and (record[1] in roots or is_descendant(pid, roots, table))
+
+
 def foreign_build_count(
-    roots: set[int], table: dict[int, tuple[int, str, int]] | None = None
+    roots: set[int], table: dict[int, ProcessRecord] | None = None
 ) -> int:
     table = process_table() if table is None else table
     return sum(
         1
-        for pid, (_, executable, _) in table.items()
-        if executable in BUILD_EXECUTABLES and not is_descendant(pid, roots, table)
+        for pid, (_, _, executable, _) in table.items()
+        if executable in BUILD_EXECUTABLES and not is_worker_owned(pid, roots, table)
     )
 
 
-def descendant_rss_kib(roots: set[int], table: dict[int, tuple[int, str, int]]) -> int:
+def descendant_rss_kib(roots: set[int], table: dict[int, ProcessRecord]) -> int:
     return sum(
         resident_bytes
-        for pid, (_, _, resident_bytes) in table.items()
-        if is_descendant(pid, roots, table)
+        for pid, (_, _, _, resident_bytes) in table.items()
+        if is_worker_owned(pid, roots, table)
     ) // 1024
 
 
