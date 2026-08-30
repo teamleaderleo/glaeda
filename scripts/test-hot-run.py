@@ -850,14 +850,16 @@ class HotRunTests(unittest.TestCase):
             )
 
     @unittest.skipUnless(shutil.which("bwrap"), "bubblewrap is unavailable")
-    def test_task_sees_stable_path_and_target_writes_stay_private(self) -> None:
+    def test_task_sees_stable_path_and_cargo_target_writes_stay_private(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = Path(directory)
             resident = fixture / "resident"
             task = fixture / "task"
             state = fixture / "state"
+            ambient_target = fixture / "ambient-target"
             measurement = fixture / "measurement.json"
             resident.mkdir()
+            ambient_target.mkdir()
             subprocess.run(["git", "init", "--quiet"], cwd=resident, check=True)
             (resident / "payload").write_text("resident\n", encoding="utf-8")
             (resident / "target").mkdir()
@@ -909,10 +911,21 @@ class HotRunTests(unittest.TestCase):
                 f'&& test "$(git rev-parse --show-toplevel)" = "{resident}" '
                 "&& ! git diff --quiet -- payload "
                 '&& test "$(cat .venv/dependency)" = "resident dependency" '
-                "&& printf private > target/task-output",
+                f'&& test "$CARGO_TARGET_DIR" = "{resident / "target"}" '
+                '&& printf private > "$CARGO_TARGET_DIR/task-output"',
             ]
-            result = subprocess.run(command, stdin=subprocess.DEVNULL, check=False)
+            environment = {
+                **os.environ,
+                "CARGO_TARGET_DIR": os.fspath(ambient_target),
+            }
+            result = subprocess.run(
+                command,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                check=False,
+            )
             self.assertEqual(result.returncode, 0)
+            self.assertFalse((ambient_target / "task-output").exists())
             self.assertFalse((resident / "target" / "task-output").exists())
             self.assertFalse((task / "target" / "task-output").exists())
             uppers = list(state.glob("upper-*"))
@@ -1252,6 +1265,37 @@ class HotRunTests(unittest.TestCase):
         )
         with self.assertRaises(RuntimeError):
             parse_cache_specs(["build", "build/generated"])
+
+    def test_cross_worktree_target_view_overrides_only_cargo_target_dir(self) -> None:
+        namespace = load_hot_run()
+        bind_environment = namespace["bind_cross_worktree_cache_environment"]
+        CacheSpec = namespace["CacheSpec"]
+        resident = Path("/opaque/resident")
+        environment = {
+            "CARGO_TARGET_DIR": "/ambient/shared-target",
+            "CARGO_HOME": "/ambient/cargo-home",
+            "UNRELATED": "preserved",
+        }
+
+        bind_environment(
+            resident,
+            (CacheSpec(Path("target"), "private-copy"),),
+            environment,
+        )
+
+        self.assertEqual(environment["CARGO_TARGET_DIR"], "/opaque/resident/target")
+        self.assertEqual(environment["CARGO_HOME"], "/ambient/cargo-home")
+        self.assertEqual(environment["UNRELATED"], "preserved")
+
+        custom_environment = {"CARGO_TARGET_DIR": "/ambient/custom"}
+        bind_environment(
+            resident,
+            (CacheSpec(Path("build-output"), "private"),),
+            custom_environment,
+        )
+        self.assertEqual(
+            custom_environment["CARGO_TARGET_DIR"], "/ambient/custom"
+        )
 
     def test_private_copy_failure_never_publishes_candidate(self) -> None:
         namespace = load_hot_run()
