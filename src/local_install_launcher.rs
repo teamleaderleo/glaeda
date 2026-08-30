@@ -308,10 +308,10 @@ fn publish_inner(
             "the requested approved launcher location is not present in PATH",
         ));
     }
-    let directory = match open_directory(context, &candidate)? {
+    let (directory, directory_stat) = match open_directory(context, &candidate)? {
         DirectoryProbe::Ready { directory, stat } => {
             match directory_disposition(context, &candidate, &stat) {
-                LauncherDirectoryDisposition::ReadyUserOwned => directory,
+                LauncherDirectoryDisposition::ReadyUserOwned => (directory, stat),
                 LauncherDirectoryDisposition::NeedsElevation => {
                     return Err(error(
                         LocalInstallLauncherErrorKind::NeedsElevation,
@@ -341,10 +341,11 @@ fn publish_inner(
         }
     };
 
-    let before = observe_entry(&directory, LAUNCHER_NAME, context.owner, targets.as_slice())?;
+    let entry_owner = launcher_entry_owner(context, &directory_stat);
+    let before = observe_entry(&directory, LAUNCHER_NAME, entry_owner, targets.as_slice())?;
     reject_protected(&before)?;
     let _lock = DirectoryLock::acquire(&directory)?;
-    let locked = observe_entry(&directory, LAUNCHER_NAME, context.owner, targets.as_slice())?;
+    let locked = observe_entry(&directory, LAUNCHER_NAME, entry_owner, targets.as_slice())?;
     if locked != before {
         return Err(error(
             LocalInstallLauncherErrorKind::Conflict,
@@ -388,7 +389,7 @@ fn publish_inner(
     })?;
     sync_directory(&directory)?;
     maybe_fail(fault, FaultBoundary::LauncherSynchronized)?;
-    let published = observe_entry(&directory, LAUNCHER_NAME, context.owner, targets.as_slice())?;
+    let published = observe_entry(&directory, LAUNCHER_NAME, entry_owner, targets.as_slice())?;
     if owned_digest(&published) != Some(&plan.target_generation.digest) {
         return Err(error(
             LocalInstallLauncherErrorKind::RecoveryRequired,
@@ -497,10 +498,13 @@ fn observe_candidate(
             LauncherDirectoryDisposition::Unsafe,
             LauncherEntryDisposition::Unknown,
         ),
-        DirectoryProbe::Ready { directory, stat } => (
-            directory_disposition(context, candidate, &stat),
-            observe_entry(&directory, LAUNCHER_NAME, context.owner, targets)?,
-        ),
+        DirectoryProbe::Ready { directory, stat } => {
+            let entry_owner = launcher_entry_owner(context, &stat);
+            (
+                directory_disposition(context, candidate, &stat),
+                observe_entry(&directory, LAUNCHER_NAME, entry_owner, targets)?,
+            )
+        }
     };
     observation(candidate.class, rank, directory, entry)
 }
@@ -608,19 +612,26 @@ fn directory_disposition(
     if stat.st_mode & 0o022 != 0 {
         LauncherDirectoryDisposition::Unsafe
     } else if stat.st_uid == context.owner.0 {
-        // A setgid directory deliberately assigns its group to new symlinks. Refuse only the case
-        // where that inherited group would disagree with the exact entry-ownership predicate;
-        // ordinary non-setgid directories create under the process effective group.
-        if stat.st_mode & 0o2000 != 0 && stat.st_gid != context.owner.1 {
-            LauncherDirectoryDisposition::Unsafe
-        } else {
-            LauncherDirectoryDisposition::ReadyUserOwned
-        }
+        LauncherDirectoryDisposition::ReadyUserOwned
     } else if candidate.system && stat.st_uid == 0 {
         LauncherDirectoryDisposition::NeedsElevation
     } else {
         LauncherDirectoryDisposition::Unsafe
     }
+}
+
+fn launcher_entry_owner(
+    context: &LocalInstallLauncherContext,
+    directory: &rustix::fs::Stat,
+) -> (u32, u32) {
+    let group = match context.platform {
+        // Linux uses the effective group except when the containing directory requests setgid
+        // inheritance. macOS reports a symlink's owner/group attributes from its containing
+        // directory, so its exact ownership predicate must use that retained directory evidence.
+        LocalInstallPlatform::Linux if directory.st_mode & 0o2000 == 0 => context.owner.1,
+        LocalInstallPlatform::Linux | LocalInstallPlatform::Macos => directory.st_gid,
+    };
+    (context.owner.0, group)
 }
 
 fn observe_entry(
@@ -920,13 +931,14 @@ mod tests {
             .expect("test context")
         }
 
-        fn context_with_owner(
+        fn context_with_platform_owner(
             &self,
             entries: &[&Path],
+            platform: LocalInstallPlatform,
             owner: (u32, u32),
         ) -> LocalInstallLauncherContext {
             LocalInstallLauncherContext::new(
-                LocalInstallPlatform::Linux,
+                platform,
                 self.home.clone(),
                 std::env::join_paths(entries).expect("join PATH"),
                 owner,
@@ -1160,7 +1172,7 @@ mod tests {
     }
 
     #[test]
-    fn mismatched_setgid_launcher_directory_is_refused_before_creation() {
+    fn linux_setgid_directory_group_is_the_created_launcher_group() {
         let world = World::new("setgid-directory-group");
         let generation = world.publish_generation(None, 'a');
         let launcher = world.launcher_dir();
@@ -1172,26 +1184,61 @@ mod tests {
         .expect("launcher directory stat")
         .st_gid;
         let captured_effective_group = actual_group ^ 1;
-        let context =
-            world.context_with_owner(&[&launcher], (geteuid().as_raw(), captured_effective_group));
-
-        let receipt = observe_local_install_launchers(&world.store, &context).expect("observe");
-        assert_eq!(
-            home(&receipt).directory,
-            LauncherDirectoryDisposition::Unsafe
+        let context = world.context_with_platform_owner(
+            &[&launcher],
+            LocalInstallPlatform::Linux,
+            (geteuid().as_raw(), captured_effective_group),
         );
+
         assert_eq!(
             publish_local_install_launcher(&world.store, &context, &plan(&generation))
-                .expect_err("group-mismatched setgid directory blocked")
-                .kind(),
-            LocalInstallLauncherErrorKind::UnsafeDirectory
+                .expect("publish with Linux setgid inheritance")
+                .disposition(),
+            LocalInstallLauncherPublishDisposition::Published
         );
-        assert!(!launcher.join(LAUNCHER_NAME).exists());
+        let link = fs::statat(
+            fs::open(&launcher, DIRECTORY_FLAGS, Mode::empty()).expect("open launcher directory"),
+            LAUNCHER_NAME,
+            AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .expect("launcher stat");
+        assert_eq!(link.st_gid, actual_group);
+        let receipt = observe_local_install_launchers(&world.store, &context).expect("observe");
+        assert_eq!(
+            home(&receipt).entry,
+            LauncherEntryDisposition::Owned {
+                generation_digest: generation.identity.digest
+            }
+        );
     }
 
     #[test]
-    fn non_setgid_launcher_directory_group_does_not_block_admissibility() {
+    fn linux_non_setgid_directory_uses_the_effective_group() {
         let world = World::new("non-setgid-directory-group");
+        let launcher = world.launcher_dir();
+        let mut directory_stat = fs::fstat(
+            fs::open(&launcher, DIRECTORY_FLAGS, Mode::empty()).expect("open launcher directory"),
+        )
+        .expect("launcher directory stat");
+        assert_eq!(directory_stat.st_mode & 0o2000, 0);
+        directory_stat.st_gid ^= 1;
+        let effective_group = directory_stat.st_gid ^ 2;
+        let context = world.context_with_platform_owner(
+            &[&launcher],
+            LocalInstallPlatform::Linux,
+            (geteuid().as_raw(), effective_group),
+        );
+
+        assert_eq!(
+            launcher_entry_owner(&context, &directory_stat),
+            (geteuid().as_raw(), effective_group)
+        );
+    }
+
+    #[test]
+    fn macos_directory_group_is_the_created_launcher_group() {
+        let world = World::new("macos-directory-group");
+        let generation = world.publish_generation(None, 'a');
         let launcher = world.launcher_dir();
         let actual_group = fs::fstat(
             fs::open(&launcher, DIRECTORY_FLAGS, Mode::empty()).expect("open launcher directory"),
@@ -1199,15 +1246,25 @@ mod tests {
         .expect("launcher directory stat")
         .st_gid;
         let captured_effective_group = actual_group ^ 1;
-        let context =
-            world.context_with_owner(&[&launcher], (geteuid().as_raw(), captured_effective_group));
+        let context = world.context_with_platform_owner(
+            &[&launcher],
+            LocalInstallPlatform::Macos,
+            (geteuid().as_raw(), captured_effective_group),
+        );
 
+        assert_eq!(
+            publish_local_install_launcher(&world.store, &context, &plan(&generation))
+                .expect("publish with macOS directory-group ownership")
+                .disposition(),
+            LocalInstallLauncherPublishDisposition::Published
+        );
         let receipt = observe_local_install_launchers(&world.store, &context).expect("observe");
         assert_eq!(
-            home(&receipt).directory,
-            LauncherDirectoryDisposition::ReadyUserOwned
+            home(&receipt).entry,
+            LauncherEntryDisposition::Owned {
+                generation_digest: generation.identity.digest
+            }
         );
-        assert_eq!(home(&receipt).entry, LauncherEntryDisposition::Absent);
     }
 
     #[test]
