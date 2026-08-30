@@ -718,6 +718,12 @@ Use Glaeda itself to exercise:
 
 The generic workload seam under #770/#773 should also prove that hot admission, capacity, lifecycle, and placement are not repository-only. A bounded dataset transform, render, or similar non-repository workload can use the same execution kernel while its adapter owns result semantics.
 
+Operator-machine handoff is also a recurring workload. On Linux,
+[`glaeda-host-observe`](LINUX_HOST_OBSERVATION.md) replaces a loose collection of shell, `awk`,
+`ss`, and `systemctl` probes with one bounded path-private observation of the current execution
+context. It is evidence for an agent or later admission policy, never admission or cleanup
+authority by itself.
+
 ## Promotion rule
 
 A hot optimization becomes preferred only when controlled evidence shows a useful complete-loop improvement and its validity/reset contract is explicit.

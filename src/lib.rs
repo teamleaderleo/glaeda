@@ -168,6 +168,9 @@ pub mod linux_dynamic_loader_config;
 /// Pure bounded ELF64 dependency parsing for the Linux runtime closure.
 #[cfg(target_os = "linux")]
 pub mod linux_elf_runtime_dependency;
+/// Bounded path-private observation of one Linux operator machine.
+#[cfg(target_os = "linux")]
+pub mod linux_host_observation;
 /// Read-only, fail-closed lookup of persisted project installations.
 #[cfg(target_os = "linux")]
 pub mod linux_installation_catalog;
