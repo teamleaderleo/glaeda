@@ -1025,6 +1025,7 @@ def execute(
             "--scope",
             "--quiet",
             "--collect",
+            "--expand-environment=no",
             *[
                 item
                 for property_value in HEAVY_SCOPE_PROPERTIES

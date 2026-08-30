@@ -28,7 +28,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 #[cfg(target_os = "linux")]
 use rustix::{
     event::{PollFd, PollFlags, Timespec, poll},
@@ -45,6 +45,12 @@ use sha2::{Digest as _, Sha256};
 
 const MAX_OBSERVATION_BYTES: u64 = 64 * 1024;
 const TERMINATION_GRACE: Duration = Duration::from_secs(2);
+const HEAVY_SCOPE_PROPERTIES: &[&str] = &[
+    "CPUQuota=1200%",
+    "MemoryHigh=8G",
+    "MemoryMax=12G",
+    "TasksMax=1024",
+];
 const SHA256_PREFIX: &str = "sha256:";
 const GIT_OVERRIDE_NAMES: &[&str] = &[
     "GIT_DIR",
@@ -88,9 +94,26 @@ struct Cli {
     /// Positive finite wall-clock deadline for the complete command process group.
     #[arg(long, value_name = "SECONDS")]
     timeout: Option<f64>,
+    /// Place the command in one reviewed transient resource scope.
+    #[arg(long, value_enum)]
+    resource_profile: Option<ResourceProfile>,
     /// Absolute executable or PATH-resolved command followed by its arguments.
     #[arg(last = true, required = true)]
     command: Vec<OsString>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ResourceProfile {
+    #[value(name = "big-red-heavy")]
+    BigRedHeavy,
+}
+
+impl ResourceProfile {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::BigRedHeavy => "big-red-heavy",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -121,6 +144,7 @@ struct RuntimeContract {
 struct CommandResult {
     elapsed: Duration,
     timeout_seconds: Option<f64>,
+    resource_profile: Option<&'static str>,
     user_cpu_seconds: Option<f64>,
     system_cpu_seconds: Option<f64>,
     max_rss_kib: Option<u64>,
@@ -211,6 +235,7 @@ fn run(cli: Cli) -> Result<i32, String> {
         bound_path.as_deref(),
         timeout,
         timeout_seconds,
+        cli.resource_profile,
         cli.measurement.is_some(),
     )?;
     if let Some(destination) = cli.measurement.as_ref() {
@@ -769,11 +794,15 @@ fn execute_command(
     environment_path: Option<&OsStr>,
     timeout: Option<Duration>,
     timeout_seconds: Option<f64>,
+    resource_profile: Option<ResourceProfile>,
     measured: bool,
 ) -> Result<CommandResult, String> {
     let mut signal_control = timeout.map(|_| DeadlineSignalControl::new()).transpose()?;
+    let systemd_run = resource_profile
+        .map(|_| resolve_program(OsStr::new("/usr/bin/systemd-run"), cwd, None))
+        .transpose()?;
     let mut time_report = None;
-    let arguments = if measured {
+    let mut arguments = if measured {
         let gnu_time = resolve_program(OsStr::new("time"), cwd, None)?;
         let report = unique_temporary_path("glaeda-hot-run-time")?;
         OpenOptions::new()
@@ -799,6 +828,24 @@ fn execute_command(
     } else {
         command.to_vec()
     };
+    if let Some(systemd_run) = systemd_run {
+        arguments = [
+            vec![
+                systemd_run.into_os_string(),
+                OsString::from("--user"),
+                OsString::from("--scope"),
+                OsString::from("--quiet"),
+                OsString::from("--collect"),
+                OsString::from("--expand-environment=no"),
+            ],
+            HEAVY_SCOPE_PROPERTIES
+                .iter()
+                .flat_map(|value| [OsString::from("--property"), OsString::from(value)])
+                .collect(),
+            arguments,
+        ]
+        .concat();
+    }
 
     let mut process = Command::new(&arguments[0]);
     process.args(&arguments[1..]).current_dir(cwd);
@@ -949,7 +996,12 @@ fn execute_command(
         } else {
             match timed_usage {
                 Some((user, system, rss, _)) => {
-                    (Some(user), Some(system), Some(rss), "gnu_time_command_tree")
+                    let accounting = if resource_profile.is_some() {
+                        "gnu_time_inside_scope"
+                    } else {
+                        "gnu_time_command_tree"
+                    };
+                    (Some(user), Some(system), Some(rss), accounting)
                 }
                 None if measured => (None, None, None, "unavailable_for_measured_command"),
                 None => (None, None, None, "not_measured"),
@@ -958,6 +1010,7 @@ fn execute_command(
     Ok(CommandResult {
         elapsed,
         timeout_seconds,
+        resource_profile: resource_profile.map(ResourceProfile::as_str),
         user_cpu_seconds,
         system_cpu_seconds,
         max_rss_kib,
@@ -975,6 +1028,7 @@ fn execute_command(
     _environment_path: Option<&OsStr>,
     _timeout: Option<Duration>,
     _timeout_seconds: Option<f64>,
+    _resource_profile: Option<ResourceProfile>,
     _measured: bool,
 ) -> Result<CommandResult, String> {
     Err("native hot-run execution currently requires Linux".into())
@@ -1311,7 +1365,7 @@ fn write_measurement(
         "authority": "developer_observation_only",
         "comparison_key": comparison_key,
         "cross_worktree": false,
-        "resource_profile": Value::Null,
+        "resource_profile": result.resource_profile,
         "machine_observation": {
             "scope": "host_aggregate",
             "before": machine_before,
@@ -1433,6 +1487,32 @@ mod tests {
         path
     }
 
+    #[cfg(target_os = "linux")]
+    fn heavy_user_scope_is_available() -> bool {
+        Command::new("/usr/bin/systemd-run")
+            .args([
+                "--user",
+                "--scope",
+                "--quiet",
+                "--collect",
+                "--expand-environment=no",
+                "--property",
+                "CPUQuota=1200%",
+                "--property",
+                "MemoryHigh=8G",
+                "--property",
+                "MemoryMax=12G",
+                "--property",
+                "TasksMax=1024",
+                "/bin/true",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
     #[test]
     fn comparison_keys_are_canonical() {
         assert!(validate_comparison_key(&format!("sha256:{}", "a".repeat(64))).is_ok());
@@ -1541,6 +1621,7 @@ mod tests {
             runtime_sha256: None,
             runtime_bin: None,
             timeout: Some(3.0),
+            resource_profile: None,
             command: vec![
                 OsString::from("/bin/sh"),
                 OsString::from("-c"),
@@ -1568,6 +1649,72 @@ mod tests {
         fs::remove_dir(fixture).unwrap();
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn heavy_profile_applies_exact_cgroup_limits_and_receipt() {
+        if !heavy_user_scope_is_available() {
+            return;
+        }
+        let fixture = test_directory("glaeda-hot-run-profile-test");
+        let observation = fixture.join("cgroup.txt");
+        let measurement = fixture.join("measurement.json");
+        let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let shell = format!(
+            "group=$(/usr/bin/awk -F: '$1 == \"0\" {{ print $3 }}' /proc/self/cgroup); \
+             /usr/bin/printf 'cpu=%s\\nhigh=%s\\nmax=%s\\npids=%s\\nliteral=%s\\n' \
+             \"$(/usr/bin/cat /sys/fs/cgroup$group/cpu.max)\" \
+             \"$(/usr/bin/cat /sys/fs/cgroup$group/memory.high)\" \
+             \"$(/usr/bin/cat /sys/fs/cgroup$group/memory.max)\" \
+             \"$(/usr/bin/cat /sys/fs/cgroup$group/pids.max)\" \"$1\" > {}; exit 17",
+            observation.display()
+        );
+        let code = run(Cli {
+            resident: repository.clone(),
+            task: repository,
+            cache: Vec::new(),
+            measurement: Some(measurement.clone()),
+            comparison_key: None,
+            runtime_id: None,
+            runtime_sha256: None,
+            runtime_bin: None,
+            timeout: Some(3.0),
+            resource_profile: Some(ResourceProfile::BigRedHeavy),
+            command: vec![
+                OsString::from("/bin/sh"),
+                OsString::from("-c"),
+                OsString::from(shell),
+                OsString::from("glaeda-profile-test"),
+                OsString::from("${HOME}"),
+            ],
+        })
+        .unwrap();
+        assert_eq!(code, 17);
+        let cgroup = fs::read_to_string(&observation).unwrap();
+        let mut lines = cgroup.lines();
+        let cpu = lines.next().unwrap().strip_prefix("cpu=").unwrap();
+        let (quota, period) = cpu.split_once(' ').unwrap();
+        let quota = quota.parse::<u64>().unwrap();
+        let period = period.parse::<u64>().unwrap();
+        assert_eq!(quota, period * 12);
+        assert_eq!(lines.next(), Some("high=8589934592"));
+        assert_eq!(lines.next(), Some("max=12884901888"));
+        assert_eq!(lines.next(), Some("pids=1024"));
+        assert_eq!(lines.next(), Some("literal=${HOME}"));
+        assert_eq!(lines.next(), None);
+
+        let report: Value = serde_json::from_reader(File::open(&measurement).unwrap()).unwrap();
+        assert_eq!(report["timeout_seconds"], 3.0);
+        assert_eq!(report["resource_profile"], "big-red-heavy");
+        assert_eq!(report["resource_accounting"], "gnu_time_inside_scope");
+        assert_eq!(report["exit_code"], 17);
+        assert_eq!(report["signal"], Value::Null);
+        assert_eq!(report["completion_reason"], "exited");
+
+        fs::remove_file(measurement).unwrap();
+        fs::remove_file(observation).unwrap();
+        fs::remove_dir(fixture).unwrap();
+    }
+
     #[test]
     fn measured_signal_is_distinct_from_same_numeric_exit() {
         let fixture = test_directory("glaeda-hot-run-signal-test");
@@ -1587,6 +1734,7 @@ mod tests {
                 runtime_sha256: None,
                 runtime_bin: None,
                 timeout: None,
+                resource_profile: None,
                 command: vec![
                     OsString::from("/bin/sh"),
                     OsString::from("-c"),
@@ -1622,6 +1770,7 @@ mod tests {
             runtime_sha256: None,
             runtime_bin: None,
             timeout: Some(0.5),
+            resource_profile: None,
             command: vec![
                 OsString::from("/bin/sh"),
                 OsString::from("-c"),
@@ -1692,6 +1841,7 @@ mod tests {
             runtime_sha256: Some(format!("sha256:{}", "0".repeat(64))),
             runtime_bin: Some(runtime_bin.clone()),
             timeout: None,
+            resource_profile: None,
             command: vec![OsString::from("runtime-tool")],
         })
         .unwrap_err();
@@ -1711,6 +1861,7 @@ mod tests {
             runtime_sha256: Some(program_digest.clone()),
             runtime_bin: Some(runtime_bin.clone()),
             timeout: None,
+            resource_profile: None,
             command: vec![OsString::from("runtime-tool")],
         })
         .unwrap();
@@ -1737,6 +1888,7 @@ mod tests {
             runtime_sha256: None,
             runtime_bin: Some(runtime_bin.clone()),
             timeout: None,
+            resource_profile: None,
             command: vec![OsString::from("/bin/true")],
         })
         .unwrap_err();

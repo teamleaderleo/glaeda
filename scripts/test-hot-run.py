@@ -1646,14 +1646,22 @@ class HotRunTests(unittest.TestCase):
                     "--measurement",
                     os.fspath(measurement),
                     "--",
-                    "/bin/true",
+                    "/bin/sh",
+                    "-c",
+                    'printf "%s" "$1"',
+                    "glaeda-profile-test",
+                    "${HOME}",
                 ],
                 stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
                 check=False,
             )
             if result.returncode == 2 and not measurement.exists():
                 self.skipTest("user systemd scopes are unavailable")
             self.assertEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, "${HOME}")
             report = json.loads(measurement.read_text(encoding="utf-8"))
             self.assertEqual(report["resource_profile"], "big-red-heavy")
             self.assertEqual(report["resource_accounting"], "gnu_time_inside_scope")

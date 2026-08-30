@@ -50,6 +50,42 @@ fn wait_for_exit(child: &mut Child, timeout: Duration) -> std::process::ExitStat
     }
 }
 
+fn wait_for_process_absence(pid: Pid, timeout: Duration, label: &str) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match test_kill_process(pid) {
+            Err(Errno::SRCH) => return,
+            Ok(()) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
+            result => panic!("{label} remained live: {result:?}"),
+        }
+    }
+}
+
+fn heavy_user_scope_is_available() -> bool {
+    Command::new("/usr/bin/systemd-run")
+        .args([
+            "--user",
+            "--scope",
+            "--quiet",
+            "--collect",
+            "--expand-environment=no",
+            "--property",
+            "CPUQuota=1200%",
+            "--property",
+            "MemoryHigh=8G",
+            "--property",
+            "MemoryMax=12G",
+            "--property",
+            "TasksMax=1024",
+            "/bin/true",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 #[test]
 fn sigint_is_forwarded_to_the_owned_process_group_and_receipted() {
     let nonce = SystemTime::now()
@@ -108,22 +144,96 @@ fn sigint_is_forwarded_to_the_owned_process_group_and_receipted() {
         .parse::<i32>()
         .unwrap();
     let descendant_pid = Pid::from_raw(descendant_pid).unwrap();
-    let absent_deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        match test_kill_process(descendant_pid) {
-            Err(Errno::SRCH) => break,
-            Ok(()) if Instant::now() < absent_deadline => {
-                thread::sleep(Duration::from_millis(20));
-            }
-            result => panic!("interrupted descendant remained live: {result:?}"),
-        }
-    }
+    wait_for_process_absence(
+        descendant_pid,
+        Duration::from_secs(2),
+        "interrupted descendant",
+    );
 
     let report: Value = serde_json::from_reader(fs::File::open(&measurement).unwrap()).unwrap();
     assert_eq!(report["timeout_seconds"], 30.0);
     assert_eq!(report["exit_code"], 130);
     assert_eq!(report["signal"], signal_hook::consts::signal::SIGKILL);
     assert_eq!(report["completion_reason"], "operator_interrupt");
+    assert_eq!(
+        report["resource_accounting"],
+        "unavailable_after_forced_termination"
+    );
+}
+
+#[test]
+fn profiled_deadline_terminates_the_scoped_process_group_and_receipts_it() {
+    if !heavy_user_scope_is_available() {
+        return;
+    }
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "glaeda-native-hot-run-profile-deadline-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir(&directory).unwrap();
+    let group_file = directory.join("group.pid");
+    let descendant_file = directory.join("descendant.pid");
+    let measurement = directory.join("measurement.json");
+    let shell = format!(
+        "/usr/bin/awk '{{ print $5 }}' /proc/self/stat > {}; \
+         sleep 60 & echo $! > {}; wait",
+        group_file.display(),
+        descendant_file.display()
+    );
+    let repository = env!("CARGO_MANIFEST_DIR");
+    let wrapper = Command::new(env!("CARGO_BIN_EXE_glaeda-hot-run"))
+        .args([
+            "--resident",
+            repository,
+            "--task",
+            repository,
+            "--resource-profile",
+            "big-red-heavy",
+            "--measurement",
+            measurement.to_str().unwrap(),
+            "--timeout",
+            "0.2",
+            "--",
+            "/bin/sh",
+            "-c",
+            &shell,
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut fixture = RunningFixture {
+        directory,
+        leader_file: group_file,
+        wrapper: Some(wrapper),
+    };
+    wait_for_file(&descendant_file, Duration::from_secs(3));
+
+    let status = wait_for_exit(fixture.wrapper.as_mut().unwrap(), Duration::from_secs(5));
+    assert_eq!(status.code(), Some(124));
+    fixture.wrapper = None;
+
+    let descendant_pid = fs::read_to_string(&descendant_file)
+        .unwrap()
+        .trim()
+        .parse::<i32>()
+        .unwrap();
+    wait_for_process_absence(
+        Pid::from_raw(descendant_pid).unwrap(),
+        Duration::from_secs(2),
+        "profiled deadline descendant",
+    );
+
+    let report: Value = serde_json::from_reader(fs::File::open(&measurement).unwrap()).unwrap();
+    assert_eq!(report["resource_profile"], "big-red-heavy");
+    assert_eq!(report["timeout_seconds"], 0.2);
+    assert_eq!(report["exit_code"], 124);
+    assert_eq!(report["signal"], signal_hook::consts::signal::SIGTERM);
+    assert_eq!(report["completion_reason"], "deadline_exceeded");
     assert_eq!(
         report["resource_accounting"],
         "unavailable_after_forced_termination"
