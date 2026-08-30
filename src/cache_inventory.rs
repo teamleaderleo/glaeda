@@ -127,6 +127,50 @@ pub struct CacheInventoryDocument {
     states: Vec<CacheStateObservation>,
 }
 
+#[cfg(target_os = "linux")]
+impl CacheInventoryDocument {
+    pub(crate) fn from_unknown_hot_run_states(
+        states: Vec<(CacheStateId, u64, u64)>,
+    ) -> Result<Self, CacheInventoryError> {
+        if states.len() > MAX_CACHE_INVENTORY_STATES {
+            return Err(error(
+                CacheInventoryErrorKind::TooManyStates,
+                "cache inventory exceeds the reviewed state bound",
+            ));
+        }
+        let mut identities = BTreeSet::new();
+        let mut observations = Vec::with_capacity(states.len());
+        for (state_id, logical_bytes, allocated_bytes) in states {
+            if !identities.insert(state_id.clone()) {
+                return Err(error(
+                    CacheInventoryErrorKind::DuplicateState,
+                    "cache inventory contains a duplicate state identity",
+                ));
+            }
+            observations.push(CacheStateObservation {
+                state_id,
+                ownership: OwnershipObservation::Unknown,
+                generation: GenerationObservation::Unknown,
+                worktree: WorktreeObservation::Unknown,
+                reconstruction: ReconstructionObservation::Unknown,
+                logical_bytes,
+                allocated_bytes,
+                active_lease: None,
+                active_lock: None,
+                mounted: None,
+                open_file_count: None,
+                live_owned_process_count: None,
+                interrupted_cleanup: None,
+                quarantined: None,
+            });
+        }
+        observations.sort_by(|left, right| left.state_id.cmp(&right.state_id));
+        Ok(Self {
+            states: observations,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CacheStateObservation {
     state_id: CacheStateId,
@@ -253,6 +297,7 @@ impl CacheReportOperation {
 #[serde(rename_all = "snake_case")]
 pub enum CacheInventoryAuthority {
     SuppliedObservationOnly,
+    LocalHotRunFilesystemObservation,
 }
 
 impl CacheInventoryAuthority {
@@ -260,6 +305,7 @@ impl CacheInventoryAuthority {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::SuppliedObservationOnly => "supplied_observation_only",
+            Self::LocalHotRunFilesystemObservation => "local_hot_run_filesystem_observation",
         }
     }
 }
@@ -385,6 +431,23 @@ pub struct CacheInventorySummary {
     reclaimable_allocated_bytes: u64,
 }
 
+impl CacheInventorySummary {
+    #[must_use]
+    pub const fn state_count(&self) -> u32 {
+        self.state_count
+    }
+
+    #[must_use]
+    pub const fn logical_bytes(&self) -> u64 {
+        self.logical_bytes
+    }
+
+    #[must_use]
+    pub const fn allocated_bytes(&self) -> u64 {
+        self.allocated_bytes
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CacheInventoryReport {
     schema_version: u8,
@@ -427,6 +490,33 @@ pub fn build_cache_inventory_report(
     document: &CacheInventoryDocument,
     request: &CacheReportRequest,
 ) -> Result<CacheInventoryReport, CacheInventoryError> {
+    build_cache_inventory_report_with_authority(
+        document,
+        request,
+        CacheInventoryAuthority::SuppliedObservationOnly,
+    )
+}
+
+/// Build an observation-only report from the local hot-run filesystem producer.
+///
+/// This authority describes only where the byte observations came from. The producer leaves every
+/// ownership and lifecycle fact unknown, so this function cannot make a state reclaimable.
+#[cfg(target_os = "linux")]
+pub fn build_local_hot_run_cache_report(
+    document: &CacheInventoryDocument,
+) -> Result<CacheInventoryReport, CacheInventoryError> {
+    build_cache_inventory_report_with_authority(
+        document,
+        &CacheReportRequest::Status,
+        CacheInventoryAuthority::LocalHotRunFilesystemObservation,
+    )
+}
+
+fn build_cache_inventory_report_with_authority(
+    document: &CacheInventoryDocument,
+    request: &CacheReportRequest,
+    authority: CacheInventoryAuthority,
+) -> Result<CacheInventoryReport, CacheInventoryError> {
     let operation = match request {
         CacheReportRequest::Status => CacheReportOperation::Status,
         CacheReportRequest::Explain(_) => CacheReportOperation::Explain,
@@ -451,7 +541,7 @@ pub fn build_cache_inventory_report(
     let summary = summarize(&states)?;
     Ok(CacheInventoryReport {
         schema_version: CACHE_INVENTORY_REPORT_SCHEMA_VERSION,
-        authority: CacheInventoryAuthority::SuppliedObservationOnly,
+        authority,
         operation,
         mutation_performed: false,
         summary,

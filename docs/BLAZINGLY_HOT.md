@@ -508,6 +508,26 @@ adopted or deleted implicitly. All task state is expendable: discarding it or se
 OverlayFS are required for cross-worktree mode; running directly in the resident worktree does not
 require either.
 
+The Linux CLI can turn one explicit hot-run cache root into the existing bounded, path-free cache
+status report:
+
+```text
+glaeda --output json cache observe-hot-run --root <explicit-hot-run-root>
+```
+
+This is filesystem-metadata observation only. It follows no symlinks, reads no file contents,
+stays on the root filesystem, rejects more than 1,024 states, 2,000,000 objects per state, depth
+over 64, cross-state hardlinks, drift, and unreadable state. Logical bytes match GNU `du
+--apparent-size` semantics by excluding directory entry sizes; allocated bytes sum unique
+per-state `st_blocks * 512`, including directories. The namespace root itself is excluded from the
+per-state aggregate. OverlayFS work directories may require a privileged read-only invocation
+because the kernel makes their internals inaccessible to the creating user.
+
+Every observed state remains `ownership_unknown` with generation, worktree, reconstruction,
+lease, lock, mount, open-file, process, cleanup, and quarantine evidence unknown. A successful
+observation therefore reports disk occupancy but cannot make any state reclaimable. It creates no
+catalog, marker, adoption, retirement, or cleanup authority.
+
 ## Linux mount path
 
 The privileged OverlayFS mount machinery is also concrete.

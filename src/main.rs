@@ -19,6 +19,8 @@ use std::{
 use clap::{Args, Parser, Subcommand, ValueEnum};
 #[cfg(target_os = "macos")]
 use glaeda::artifact::Sha256Digest;
+#[cfg(target_os = "linux")]
+use glaeda::cache_inventory::build_local_hot_run_cache_report;
 use glaeda::cache_inventory::{
     CacheReportRequest, CacheStateId, MAX_CACHE_INVENTORY_DOCUMENT_BYTES,
     build_cache_inventory_report, decode_cache_inventory, render_cache_inventory_human,
@@ -61,6 +63,8 @@ use glaeda::host_preparation_plan::{ExecutableHostPreparationAction, plan_host_p
 use glaeda::host_readiness::{RunnerAccountReadiness, inspect_host_readiness};
 #[cfg(target_os = "linux")]
 use glaeda::host_readiness_verdict::{assess, render_human as render_host_plan};
+#[cfg(target_os = "linux")]
+use glaeda::hot_run_cache_observation::observe_hot_run_cache;
 #[cfg(target_os = "linux")]
 use glaeda::journal::ExecutionLane;
 #[cfg(target_os = "linux")]
@@ -171,6 +175,13 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum CacheCommand {
+    /// Observe one explicit Linux hot-run root without granting cleanup authority.
+    #[cfg(target_os = "linux")]
+    ObserveHotRun {
+        /// Exact hot-run cache root to traverse without following symlinks.
+        #[arg(long)]
+        root: PathBuf,
+    },
     /// Classify every supplied state observation.
     Status {
         /// Explicit bounded path-free observation document.
@@ -636,6 +647,10 @@ fn main() -> ExitCode {
             ),
         },
         Command::Cache { command } => match command {
+            #[cfg(target_os = "linux")]
+            CacheCommand::ObserveHotRun { root } => {
+                run_hot_run_cache_observation(cli.output, &root)
+            }
             CacheCommand::Status { inventory } => {
                 run_cache_inventory(cli.output, &inventory, CacheReportRequest::Status)
             }
@@ -711,6 +726,31 @@ fn run_cache_inventory(
         }
     };
     let report = match build_cache_inventory_report(&inventory, &request) {
+        Ok(report) => report,
+        Err(error) => {
+            return emit_runtime_error(output, error.code(), error.to_string());
+        }
+    };
+    match output {
+        OutputFormat::Human => print!("{}", render_cache_inventory_human(&report)),
+        OutputFormat::Json => {
+            if print_json(&report).is_err() {
+                return ExitCode::from(2);
+            }
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+#[cfg(target_os = "linux")]
+fn run_hot_run_cache_observation(output: OutputFormat, root: &Path) -> ExitCode {
+    let inventory = match observe_hot_run_cache(root) {
+        Ok(inventory) => inventory,
+        Err(error) => {
+            return emit_runtime_error(output, error.code(), error.to_string());
+        }
+    };
+    let report = match build_local_hot_run_cache_report(&inventory) {
         Ok(report) => report,
         Err(error) => {
             return emit_runtime_error(output, error.code(), error.to_string());
@@ -1920,6 +1960,27 @@ mod tests {
 
     #[test]
     fn cache_commands_require_explicit_inventory_and_reclaim_dry_run() {
+        #[cfg(target_os = "linux")]
+        {
+            let observe = Cli::try_parse_from([
+                "glaeda",
+                "--output",
+                "json",
+                "cache",
+                "observe-hot-run",
+                "--root",
+                "hot-state",
+            ])
+            .expect("parse hot-run cache observation");
+            let Command::Cache {
+                command: CacheCommand::ObserveHotRun { root },
+            } = observe.command
+            else {
+                panic!("expected hot-run cache observation command");
+            };
+            assert_eq!(root, PathBuf::from("hot-state"));
+        }
+
         let status = Cli::try_parse_from([
             "glaeda",
             "--output",
