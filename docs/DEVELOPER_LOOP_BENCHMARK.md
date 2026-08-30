@@ -962,3 +962,77 @@ This slice performs no holder scan, benchmark-result reuse, cache adoption, work
 retirement or deletion. The next #926 experiment must attach exact cold-versus-warm rebuild cost
 and direct holder evidence to these opaque target generations before proposing any retention
 policy.
+
+## Checkout-local Cargo target positive-holder observation — 2026-08-30
+
+The next issue #926 slice adds positive-only Linux reference evidence without turning a zero count
+into absence or cleanup authority. Exact measured code head
+`ab22d7b379865b74dc36e2818c3127e554d8832a` / tree
+`556b37c7b96a0c0c8ac4c474c395ecbd242efb61` produced a 1,830,392-byte release
+`glaeda-cargo-target-holders`, SHA-256
+`9698871c4c29bbd518b4d1900aca029893ebccc9a4df754a3b5c7ab2f64c0385`.
+
+The command brackets one bounded `/proc` scan with equal offline checkout observations and binds
+the result to the cost observer's exact physical target identity. It counts visible process CWD,
+root, open-FD, mapped-file and unique mount-namespace references. Output retains no PID, process
+name, command, path, file name, map row, mount row or environment value. Foreign/root processes
+whose evidence the caller cannot read are counted as incomplete. The scan is explicitly non-atomic,
+and `universal_absence_proven` is always false. Its only dispositions are `holders_observed` and
+`none_observed`; neither authorizes retention, signaling, cleanup or deletion.
+
+The no-holder matrix compared three complete processes on the same unchanged target:
+
+1. conventional recursive `lsof 4.99.4 +D`, which walks the named tree and emits raw file/process
+   fields;
+2. an independent Python 3.14.4 implementation of the same positive `/proc` categories and
+   bounds, without Glaeda's Git/target identity or typed error surface;
+3. the compiled Glaeda command, including two complete checkout observations and the typed holder
+   report.
+
+One warmup per arm preceded 30 measurements per arm in rotating six-permutation order. Wall and
+child CPU came from direct shell-free `posix_spawn`/`wait4` execution. Max RSS was measured in a
+separate ten-sample rotating matrix using GNU `time %M` around each exact command so timing did not
+include the measurement wrapper.
+
+| Complete observation | n | Median wall | p95 wall | Median child CPU | Median / max RSS |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| recursive `lsof +D` | 30 | 139.637090 ms | 156.596921 ms | 136.757500 ms | 5,934 / 6,284 KiB |
+| direct Python `/proc` | 30 | 80.8384935 ms | 86.404635 ms | 80.714500 ms | 14,736 / 14,744 KiB |
+| typed Glaeda report | 30 | 79.5290195 ms | 91.491790 ms | 85.210000 ms | 5,704 / 5,784 KiB |
+
+Against recursive `lsof`, Glaeda reduced median wall by 60.1080705 ms / 43.0459%, p95 by
+41.5750%, and median child CPU by 37.6926%; median RSS was 230 KiB / 3.8760% lower. Against the
+direct Python oracle, Glaeda reduced median wall by only 1.309474 ms / 1.6199%. It was not a
+uniform latency or CPU win: p95 was 5.087155 ms / 5.8876% higher and median child CPU was
+4.495500 ms / 5.5696% higher. Median RSS was 9,032 KiB / 61.2921% lower. The additional work buys
+typed checkout/target identity, fixed bounds, fail-closed drift handling and a stable path-private
+schema rather than a raw `/proc` speedup.
+
+Every timed arm produced `none_observed`; both typed implementations kept
+`universal_absence_proven=false`. Glaeda examined 433-435 process entries, completed 145-147 and
+marked 287-288 incomplete, examined 9,207-9,227 FDs, 386-388 readable maps and three mount
+namespaces, and read 5,126,473-5,139,299 pseudo-file bytes. The target identity remained exact.
+
+A separate physical positive oracle started one owned `/usr/bin/sleep` with its CWD at the target
+root and stdin open on one fixed regular target file. Python and Glaeda each reported exactly one
+holder, CWD process and open-FD process; Glaeda excluded itself and retained
+`universal_absence_proven=false`. `lsof +D` emitted a matching positive field record but still
+exited one on this recursive walk, proving that its exit status alone cannot distinguish no match
+from a positive incomplete traversal here. The harness sent SIGTERM only to its owned fresh process
+group, reaped it, and proved its `/proc` entry absent.
+
+Final no-holder matrix, Python control, matrix harness, positive harness and positive receipt
+SHA-256 values are respectively
+`afa1380face7cc075dccdd7981be96d527c9390ec536365ec1d677cc42c8b0cf`,
+`cfe0a98294be93dff335e31c684803dd1ba802008d8b88725db70a7e505ed704`,
+`9b4e2991bf15d5a5612a8fdf030b2e4c64625aaad87600fc2179584f2275db87`,
+`a1e04cf67c69ccf1a39c5601f7a3fbbd81e8476f632b93429fca202b4a868dcc`, and
+`b27e09e3a37afc2cebfd5d154d73c7e908b660503e6540bd48e4d1606ef74a53`.
+
+One earlier matrix used direct `wait4.ru_maxrss` and returned the identical 19,836 KiB launcher
+high-water mark for all three arms. Its latency results were semantically valid but its RSS column
+was not discriminating, so the entire receipt, SHA-256
+`8228bf9a23b03d65f52a5fed704c6088b6ed4df2fbc3af243118e01f4ae85fca`, is excluded from reported
+results. No benchmark process survived. This slice still adds no lock, lease, liveness proof,
+retention policy, reclamation or deletion path; cold-versus-warm rebuild value remains the next
+independent decision input.

@@ -550,6 +550,7 @@ An explicit checkout-local Cargo target has a separate Linux observation front d
 
 ```text
 glaeda-cargo-target-observe --checkout /canonical/checkout --output json
+glaeda-cargo-target-holders --checkout /canonical/checkout --output json
 ```
 
 The command brackets one bounded descriptor-relative `target` metadata walk with two equal offline
@@ -560,10 +561,24 @@ marker when present. It follows no symlink, reads no target file content, uses `
 on the checkout filesystem, and emits no checkout path or child name. Reflinks and shared extents
 mean visible blocks are not exclusive or necessarily reclaimable bytes.
 
-Activity, successful use, rebuild cost, retention value, ownership lifecycle, and deletion
-authority remain `unknown`. In particular, newest mtime is an observation, not proof of last
-successful use or idleness. Issue #926 owns later holder and cold-versus-warm value receipts before
-any target can become an eviction candidate.
+The holder command separately scans bounded Linux `/proc` evidence for visible process CWD, root,
+open-file, mapped-file and mount-namespace references to the exact same opaque target identity. It
+emits counts and coverage only: never a PID, process name, command, path, file name, map row, mount
+row or environment value. The observer itself is excluded. At most 131,072 processes, 2,000,000
+file descriptors, 16 MiB per pseudo-file and 256 MiB total pseudo-file content are accepted.
+Unreadable process evidence and process-table churn remain explicit.
+
+This is deliberately positive-only evidence. `holders_observed` proves that at least one visible
+reference existed during the non-atomic scan. `none_observed` means only that the bounded scan saw
+none; it never proves universal absence, idleness, quiescence or safe retirement. A positive report
+does not authorize signaling a process, and either disposition grants no retention, cleanup or
+deletion authority.
+
+Last successful use, rebuild cost, retention value, ownership lifecycle, and deletion authority
+remain `unknown`. In particular, newest mtime is not proof of last successful use, and a zero
+holder count is not proof of idleness. Issue #926 owns the next cold-versus-warm value receipts and
+the later deterministic lease/retirement contract before any target can become an eviction
+candidate.
 
 ## Linux mount path
 
