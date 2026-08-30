@@ -613,10 +613,15 @@ class HotRunTests(unittest.TestCase):
                 namespace, fixture, "2" * 64
             )
             legacy = namespace_root / legacy_document["state_identity"]
-            legacy.mkdir()
+            legacy.mkdir(mode=0o700)
             with self.assertRaisesRegex(RuntimeError, "manifestless state"):
                 publish(legacy, legacy_document)
             self.assertFalse((legacy / "producer-manifest.json").exists())
+
+            legacy.chmod(0o750)
+            with self.assertRaisesRegex(RuntimeError, "owner-private directory"):
+                publish(legacy, legacy_document)
+            self.assertEqual(stat.S_IMODE(legacy.stat().st_mode), 0o750)
 
     def test_manifest_authentication_rejects_forged_generation_and_encoding(
         self,

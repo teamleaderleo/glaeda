@@ -1089,7 +1089,15 @@ def publish_implicit_state_base(
     except FileNotFoundError:
         details = None
     if details is not None:
-        ensure_private_directory(state_base)
+        if (
+            stat.S_ISLNK(details.st_mode)
+            or not stat.S_ISDIR(details.st_mode)
+            or details.st_uid != os.getuid()
+            or stat.S_IMODE(details.st_mode) != 0o700
+        ):
+            raise RuntimeError(
+                "implicit hot-state generation is not an owner-private directory"
+            )
         try:
             _, observed = read_producer_manifest(state_base, state_base.name)
         except FileNotFoundError:
