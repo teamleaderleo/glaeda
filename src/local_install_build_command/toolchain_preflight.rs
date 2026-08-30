@@ -113,10 +113,11 @@ impl LocalInstallToolchainPreflightReceipt {
 /// Observe the exact Cargo, rustc, and rustdoc objects retained privately by the build command
 /// context and prove their fixed `--version` outputs against one expected toolchain identity.
 ///
-/// Every executable path is snapshotted before and after probing. The private snapshot retains the
-/// complete no-follow directory chain, including change-time evidence, so entry replacement and
-/// restore (ABA) anywhere on the path changes the proof. Raw paths, filesystem identities, and
-/// command output never enter the public receipt.
+/// Every executable path is snapshotted before and after probing. Every directory in the no-follow
+/// chain must be root- or runner-owned and not group/world writable, except for sticky directories
+/// whose root/runner-owned children cannot be replaced by another user. The private snapshot also
+/// retains change-time evidence, so entry replacement and restore (ABA) during the probe changes
+/// the proof. Raw paths, filesystem identities, and command output never enter the public receipt.
 #[must_use]
 pub fn observe_local_install_toolchain_preflight(
     expected: &LocalInstallToolchainIdentity,
@@ -355,13 +356,17 @@ fn executable_snapshot(path: &Path) -> Result<ExecutableSnapshot, ExecutableObse
     let root = fs::open("/", DIRECTORY_FLAGS, Mode::empty())
         .map_err(|_| ExecutableObservationError::Unknown)?;
     let mut current = File::from(root);
-    let mut directories = vec![PrivateMetadata::from_metadata(&metadata(&current)?)];
+    let root_metadata = metadata(&current)?;
+    if !valid_directory_metadata(&root_metadata) {
+        return Err(ExecutableObservationError::Unsafe);
+    }
+    let mut directories = vec![PrivateMetadata::from_metadata(&root_metadata)];
     for component in parent_components {
         let opened = fs::openat(current.as_fd(), *component, DIRECTORY_FLAGS, Mode::empty())
             .map_err(map_directory_open)?;
         let opened = File::from(opened);
         let observed = metadata(&opened)?;
-        if !observed.is_dir() {
+        if !valid_directory_metadata(&observed) {
             return Err(ExecutableObservationError::Unsafe);
         }
         directories.push(PrivateMetadata::from_metadata(&observed));
@@ -400,6 +405,16 @@ fn valid_executable_metadata(metadata: &std::fs::Metadata) -> bool {
         && metadata.nlink() == 1
         && owner_and_mode_are_reviewed(&private)
         && metadata.len() >= 4
+}
+
+fn valid_directory_metadata(metadata: &std::fs::Metadata) -> bool {
+    let private = PrivateMetadata::from_metadata(metadata);
+    metadata.is_dir() && directory_owner_and_mode_are_reviewed(&private)
+}
+
+fn directory_owner_and_mode_are_reviewed(metadata: &PrivateMetadata) -> bool {
+    (metadata.uid == 0 || metadata.uid == geteuid().as_raw())
+        && (metadata.mode & 0o022 == 0 || metadata.mode & 0o1000 != 0)
 }
 
 fn owner_and_mode_are_reviewed(metadata: &PrivateMetadata) -> bool {
@@ -858,6 +873,25 @@ mod tests {
         assert_ne!(private.uid, 0);
         assert_ne!(private.uid, geteuid().as_raw());
         assert!(!owner_and_mode_are_reviewed(&private));
+    }
+
+    #[test]
+    fn directory_policy_rejects_foreign_or_nonsticky_writable_ancestors() {
+        let fixture = TempToolchain::new("directory-policy");
+        let metadata = fs::metadata(&fixture.root).expect("fixture root metadata");
+        let mut private = PrivateMetadata::from_metadata(&metadata);
+
+        private.uid = geteuid().as_raw().saturating_add(1).max(1);
+        assert_ne!(private.uid, 0);
+        assert_ne!(private.uid, geteuid().as_raw());
+        assert!(!directory_owner_and_mode_are_reviewed(&private));
+
+        private.uid = geteuid().as_raw();
+        private.mode = (private.mode & !0o7777) | 0o0777;
+        assert!(!directory_owner_and_mode_are_reviewed(&private));
+
+        private.mode |= 0o1000;
+        assert!(directory_owner_and_mode_are_reviewed(&private));
     }
 
     #[test]
