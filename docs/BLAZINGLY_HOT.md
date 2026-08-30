@@ -41,6 +41,43 @@ work becomes known
 
 For hostile or unknown work, the quickest safe path may still be a fresh worker. For trusted repeated work, the quickest path may be a prepared environment or warm pool. For ultra-trusted work, the winning optimization is often to keep valuable state resident.
 
+## Native handoff principle
+
+Glaeda should be a thin semantic compiler into the operating system wherever mature primitives
+already provide the physical mechanism:
+
+```text
+exact workload intent + trust + reusable-state identity
+-> choose the cheapest trustworthy native mechanism
+-> hand runnable work to the operating system
+-> observe the effective kernel/filesystem state
+-> return a bounded durable receipt
+```
+
+The ordinary Linux scheduler, page cache, cgroups, process descriptors, filesystems, mount API,
+reflinks and service manager are the baseline implementation toolkit. Glaeda adds the semantic
+identity, authority boundary, composition, validation, recovery and evidence those mechanisms do
+not provide by themselves. It should not remain in the workload hot path merely to duplicate an
+operating-system decision.
+
+The default comparison is therefore native, not bespoke. A custom placement, cache, filesystem or
+lifecycle policy earns promotion only when a complete-loop experiment shows that native behavior
+leaves a material gap and the candidate preserves stronger semantics. If the native control wins,
+keep it.
+
+Big Red's bounded CPU concurrency controls illustrate the rule. At four simultaneous warm
+verification loops, ordinary unpinned Linux scheduling delivered 1.0882 loops/second, external
+`taskset` 1.0496 and Glaeda's opt-in crash-clean CPU-set prototype 1.0325. The explicit set still
+had value for reproducible, collision-free benchmark controls and reduced maximum worker RSS from
+42,278 to 39,246 KiB, but it did not justify a general scheduler. Ordinary work remains unpinned;
+reservations come and go only for experiments that require disjoint placement. Exact evidence and
+candidate scope are tracked in [#953](https://github.com/teamleaderleo/glaeda/issues/953) and
+[#955](https://github.com/teamleaderleo/glaeda/pull/955).
+
+This same rule explains the current storage direction: native OverlayFS for mostly-read task views,
+native CoW/reflink lineage for write-heavy private state where it wins, ordinary private state when
+sharing has no measured value, and native page-cache residency instead of a Glaeda byte cache.
+
 ## Current experiment owners
 
 Keep the implementation lanes separate enough that measurements remain interpretable:
