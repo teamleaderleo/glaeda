@@ -66,6 +66,9 @@ PAGE_CACHE_CLI_TREATMENTS = {
 }
 DEFAULT_DEADLINE_SECONDS = 900
 CHILD_UMASK = 0o022
+PROCESS_GROUP_TERM_GRACE_SECONDS = 2.0
+PROCESS_GROUP_KILL_GRACE_SECONDS = 2.0
+PROCESS_GROUP_POLL_SECONDS = 0.02
 STATE_PHASE_INITIAL = "initial_for_source_state"
 STATE_PHASE_RETAINED_REUSE = "retained_after_accepted_edit"
 
@@ -593,21 +596,65 @@ def add_worktree(repository: Path, destination: Path) -> None:
     )
 
 
+def process_group_exists(process_group_id: int) -> bool:
+    try:
+        os.killpg(process_group_id, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def signal_process_group(process_group_id: int, sent_signal: signal.Signals) -> None:
+    try:
+        os.killpg(process_group_id, sent_signal)
+    except ProcessLookupError:
+        pass
+
+
+def wait_for_process_group_absence(
+    process: subprocess.Popen[bytes],
+    process_group_id: int,
+    timeout_seconds: float,
+) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        process.poll()
+        if not process_group_exists(process_group_id):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(PROCESS_GROUP_POLL_SECONDS)
+
+
 def terminate_process_group(process: subprocess.Popen[bytes]) -> None:
-    if process.poll() is None:
+    process_group_id = process.pid
+    process.poll()
+    if process_group_exists(process_group_id):
+        signal_process_group(process_group_id, signal.SIGTERM)
+    if not wait_for_process_group_absence(
+        process,
+        process_group_id,
+        PROCESS_GROUP_TERM_GRACE_SECONDS,
+    ):
+        signal_process_group(process_group_id, signal.SIGKILL)
+        if not wait_for_process_group_absence(
+            process,
+            process_group_id,
+            PROCESS_GROUP_KILL_GRACE_SECONDS,
+        ):
+            raise ExperimentError("source materialization process group cleanup failed")
+    try:
+        process.wait(timeout=PROCESS_GROUP_KILL_GRACE_SECONDS)
+    except subprocess.TimeoutExpired as error:
         try:
-            os.killpg(process.pid, signal.SIGTERM)
+            process.kill()
         except ProcessLookupError:
             pass
-    deadline = time.monotonic() + 2.0
-    while process.poll() is None and time.monotonic() < deadline:
-        time.sleep(0.02)
-    if process.poll() is None:
         try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
+            process.wait(timeout=PROCESS_GROUP_KILL_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
             pass
-    process.wait()
+        raise ExperimentError("source materialization leader cleanup failed") from error
 
 
 def validate_source_materialization_report(

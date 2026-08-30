@@ -4,8 +4,11 @@ from __future__ import annotations
 import json
 import os
 import runpy
+import select
+import signal
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -454,6 +457,72 @@ class HotStateFanoutTests(unittest.TestCase):
                     [Path("/task-1")],
                 )
         terminate.assert_called_once_with(process)
+
+    def test_process_group_cleanup_escalates_after_leader_exits_first(
+        self,
+    ) -> None:
+        terminate_process_group = NAMESPACE["terminate_process_group"]
+        descendant_program = (
+            "import os,signal,time;"
+            "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
+            "print(os.getpid(),flush=True);"
+            "time.sleep(60)"
+        )
+        leader_program = (
+            "import signal,subprocess,sys,time;"
+            "signal.signal(signal.SIGTERM,lambda *_:sys.exit(0));"
+            "child=subprocess.Popen(["
+            "'/usr/bin/python3','-c',"
+            f"{descendant_program!r}],"
+            "stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,"
+            "stderr=subprocess.DEVNULL,text=True);"
+            "print(child.stdout.readline().strip(),flush=True);"
+            "time.sleep(60)"
+        )
+        leader = subprocess.Popen(
+            ["/usr/bin/python3", "-c", leader_program],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        descendant_pid: int | None = None
+        try:
+            assert leader.stdout is not None
+            ready, _, _ = select.select([leader.stdout], [], [], 2.0)
+            self.assertTrue(ready, "fixture descendant did not become ready")
+            descendant_pid = int(leader.stdout.readline().strip())
+            self.assertEqual(os.getpgid(descendant_pid), leader.pid)
+            started = time.monotonic()
+            with mock.patch.dict(
+                terminate_process_group.__globals__,
+                {
+                    "PROCESS_GROUP_TERM_GRACE_SECONDS": 0.1,
+                    "PROCESS_GROUP_KILL_GRACE_SECONDS": 1.0,
+                },
+            ):
+                terminate_process_group(leader)
+            self.assertLess(time.monotonic() - started, 2.0)
+            self.assertIsNotNone(leader.returncode)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(descendant_pid, 0)
+        finally:
+            try:
+                os.killpg(leader.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                leader.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                leader.kill()
+                leader.wait(timeout=2.0)
+            if leader.stdout is not None:
+                leader.stdout.close()
+            if descendant_pid is not None:
+                try:
+                    os.kill(descendant_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
     def test_worktree_cleanup_accepts_only_an_exact_unregistered_target(
         self,
