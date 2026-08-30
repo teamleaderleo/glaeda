@@ -1904,6 +1904,7 @@ def retire_one_low_value_state(
         state = namespace_root / state_identity
         state_descriptor: int | None = None
         locks: list[RetirementLock] | None = None
+        renamed = False
         try:
             details = state.stat(follow_symlinks=False)
             if (
@@ -1955,6 +1956,7 @@ def retire_one_low_value_state(
                 rename_noreplace(state, namespace_root / retired_name)
             except (FileExistsError, OSError):
                 continue
+            renamed = True
             fsync_directory(namespace_root)
             close_retirement_locks(locks)
             locks = None
@@ -1972,6 +1974,8 @@ def retire_one_low_value_state(
             )
             return "retired_low_value"
         except (OSError, RuntimeError):
+            if renamed:
+                return "retired_low_value_recovery_deferred"
             continue
         finally:
             close_retirement_locks(locks)

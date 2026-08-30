@@ -1101,6 +1101,72 @@ class HotRunTests(unittest.TestCase):
             catalog = namespace["read_hot_state_value_catalog"](namespace_root)
             self.assertFalse(catalog["pressure_active"])
 
+    def test_value_retirement_stops_after_rename_when_sync_fails(self) -> None:
+        namespace = load_hot_run()
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            namespace_root = fixture / "hot-run"
+            namespace_root.mkdir(mode=0o700)
+            states = []
+            for label in ("a", "b"):
+                state, _, document = self.make_hot_state_manifest_fixture(
+                    namespace, fixture, label * 64
+                )
+                namespace["publish_implicit_state_base"](state, document)
+                (state / "lock").touch(mode=0o600)
+                namespace["record_successful_hot_state_use"](
+                    namespace_root,
+                    state,
+                    "created",
+                    None,
+                    None,
+                    None,
+                    namespace["ExecutionObservation"](0.1, 0.0),
+                )
+                states.append(state)
+
+            catalog = namespace["read_hot_state_value_catalog"](namespace_root)
+            namespace["write_hot_state_value_catalog"](
+                namespace_root, {**catalog, "pressure_active": True}
+            )
+            pressure = os.statvfs_result(
+                (4096, 4096, 100, 10, 10, 0, 0, 0, 0, 255)
+            )
+            retire = namespace["retire_one_low_value_state"]
+            filesystem = retire.__globals__["os"]
+            with (
+                mock.patch.object(filesystem, "statvfs", return_value=pressure),
+                mock.patch.dict(
+                    retire.__globals__,
+                    {"fsync_directory": mock.Mock(side_effect=OSError("sync"))},
+                ),
+            ):
+                self.assertEqual(
+                    retire(namespace_root, "f" * 64),
+                    "retired_low_value_recovery_deferred",
+                )
+
+            retired = list(namespace_root.glob(".retired-v1-*"))
+            self.assertEqual(len(retired), 1)
+            self.assertFalse(states[0].exists())
+            self.assertTrue(states[1].exists())
+            retained_catalog = namespace["read_hot_state_value_catalog"](
+                namespace_root
+            )
+            self.assertEqual(
+                set(retained_catalog["states"]),
+                {state.name for state in states},
+            )
+
+            self.assertEqual(
+                namespace["collect_one_unreachable_state"](
+                    namespace_root, "f" * 64
+                ),
+                "retired_recovery",
+            )
+            self.assertEqual(list(namespace_root.glob(".retired-v1-*")), [])
+            self.assertTrue(states[1].exists())
+
     def test_value_retirement_preserves_current_active_unknown_and_recreated_state(
         self,
     ) -> None:
