@@ -28,12 +28,15 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent.parent
-HEAVY_SCOPE_PROPERTIES = (
-    "CPUQuota=1200%",
-    "MemoryHigh=8G",
-    "MemoryMax=12G",
-    "TasksMax=1024",
-)
+RESOURCE_PROFILE_PROPERTIES = {
+    "big-red-heavy": (
+        "CPUQuota=1200%",
+        "MemoryHigh=8G",
+        "MemoryMax=12G",
+        "TasksMax=1024",
+    ),
+    "big-red-background": ("CPUWeight=25",),
+}
 TERMINATION_GRACE_SECONDS = 2.0
 MAX_PROC_OBSERVATION_BYTES = 64 * 1024
 MAX_TRACKED_PATH_BYTES = 32 * 1024 * 1024
@@ -1330,7 +1333,7 @@ def execute(
             "--expand-environment=no",
             *[
                 item
-                for property_value in HEAVY_SCOPE_PROPERTIES
+                for property_value in RESOURCE_PROFILE_PROPERTIES[resource_profile]
                 for item in ("--property", property_value)
             ],
             *arguments,
@@ -1860,8 +1863,11 @@ def main() -> int:
     )
     parser.add_argument(
         "--resource-profile",
-        choices=("big-red-heavy",),
-        help="run in the measured 12-CPU/8G-high/12G-max/1024-task user scope",
+        choices=tuple(RESOURCE_PROFILE_PROPERTIES),
+        help=(
+            "run in the measured heavy scope or the work-conserving "
+            "CPUWeight=25 background scope"
+        ),
     )
     parser.add_argument(
         "--timeout",
@@ -1898,6 +1904,8 @@ def main() -> int:
         parser.error("a command is required after --")
     if arguments.comparison_key is not None and arguments.measurement is None:
         parser.error("--comparison-key requires --measurement")
+    if arguments.resource_profile is not None and arguments.timeout is None:
+        parser.error("--resource-profile requires --timeout")
     try:
         return run(
             arguments.resident,

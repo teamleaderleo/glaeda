@@ -196,6 +196,61 @@ fn heavy_profile_applies_exact_cgroup_limits_and_receipt() {
 }
 
 #[test]
+fn background_profile_applies_exact_cpu_weight_and_receipt() {
+    let _scope_guard = HEAVY_SCOPE_TEST_LOCK.lock().unwrap();
+    if !heavy_user_scope_is_available() {
+        return;
+    }
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "glaeda-native-hot-run-background-weight-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir(&directory).unwrap();
+    let observation = directory.join("cpu-weight.txt");
+    let measurement = directory.join("measurement.json");
+    let shell = format!(
+        "group=$(/usr/bin/awk -F: '$1 == \"0\" {{ print $3 }}' /proc/self/cgroup); \
+         /usr/bin/cat /sys/fs/cgroup$group/cpu.weight > {}",
+        observation.display()
+    );
+    let repository = env!("CARGO_MANIFEST_DIR");
+    let output = Command::new(env!("CARGO_BIN_EXE_glaeda-hot-run"))
+        .args([
+            "--resident",
+            repository,
+            "--task",
+            repository,
+            "--resource-profile",
+            "big-red-background",
+            "--measurement",
+            measurement.to_str().unwrap(),
+            "--timeout",
+            "3",
+            "--",
+            "/bin/sh",
+            "-c",
+            &shell,
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(fs::read_to_string(&observation).unwrap().trim(), "25");
+
+    let report: Value = serde_json::from_reader(fs::File::open(&measurement).unwrap()).unwrap();
+    assert_eq!(report["timeout_seconds"], 3.0);
+    assert_eq!(report["resource_profile"], "big-red-background");
+    assert_eq!(report["resource_accounting"], "gnu_time_inside_scope");
+    assert_eq!(report["exit_code"], 0);
+    assert_eq!(report["completion_reason"], "exited");
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn sigint_is_forwarded_to_the_owned_process_group_and_receipted() {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)

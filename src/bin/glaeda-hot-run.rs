@@ -69,6 +69,7 @@ const HEAVY_SCOPE_PROPERTIES: &[&str] = &[
     "MemoryMax=12G",
     "TasksMax=1024",
 ];
+const BACKGROUND_SCOPE_PROPERTIES: &[&str] = &["CPUWeight=25"];
 const SHA256_PREFIX: &str = "sha256:";
 const GIT_OVERRIDE_NAMES: &[&str] = &[
     "GIT_DIR",
@@ -124,12 +125,22 @@ struct Cli {
 enum ResourceProfile {
     #[value(name = "big-red-heavy")]
     BigRedHeavy,
+    #[value(name = "big-red-background")]
+    BigRedBackground,
 }
 
 impl ResourceProfile {
     fn as_str(self) -> &'static str {
         match self {
             Self::BigRedHeavy => "big-red-heavy",
+            Self::BigRedBackground => "big-red-background",
+        }
+    }
+
+    fn scope_properties(self) -> &'static [&'static str] {
+        match self {
+            Self::BigRedHeavy => HEAVY_SCOPE_PROPERTIES,
+            Self::BigRedBackground => BACKGROUND_SCOPE_PROPERTIES,
         }
     }
 }
@@ -1372,7 +1383,9 @@ fn execute_command(
                         .expect("profiled command has a resource scope unit"),
                 ),
             ],
-            HEAVY_SCOPE_PROPERTIES
+            resource_profile
+                .expect("profiled command has a resource profile")
+                .scope_properties()
                 .iter()
                 .flat_map(|value| [OsString::from("--property"), OsString::from(value)])
                 .collect(),
@@ -2187,21 +2200,26 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn resource_profiles_require_a_timeout_before_host_observation() {
-        let error = run(Cli {
-            resident: PathBuf::from("/path/that/must/not/be/observed"),
-            task: PathBuf::from("/path/that/must/not/be/observed"),
-            cache: Vec::new(),
-            measurement: None,
-            comparison_key: None,
-            runtime_id: None,
-            runtime_sha256: None,
-            runtime_bin: None,
-            timeout: None,
-            resource_profile: Some(ResourceProfile::BigRedHeavy),
-            command: vec![OsString::from("/bin/true")],
-        })
-        .unwrap_err();
-        assert_eq!(error, "--resource-profile requires --timeout");
+        for resource_profile in [
+            ResourceProfile::BigRedHeavy,
+            ResourceProfile::BigRedBackground,
+        ] {
+            let error = run(Cli {
+                resident: PathBuf::from("/path/that/must/not/be/observed"),
+                task: PathBuf::from("/path/that/must/not/be/observed"),
+                cache: Vec::new(),
+                measurement: None,
+                comparison_key: None,
+                runtime_id: None,
+                runtime_sha256: None,
+                runtime_bin: None,
+                timeout: None,
+                resource_profile: Some(resource_profile),
+                command: vec![OsString::from("/bin/true")],
+            })
+            .unwrap_err();
+            assert_eq!(error, "--resource-profile requires --timeout");
+        }
     }
 
     #[cfg(target_os = "linux")]
