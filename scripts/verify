@@ -133,7 +133,7 @@ def fast_phases() -> tuple[Phase, ...]:
             "cargo",
             ("test", "--locked", "--lib", "--bins"),
         ),
-        Phase("format", "capability", "cargo", ("fmt", "--all", "--", "--check")),
+        Phase("format", "repository", "scripts/verify-changed-rustfmt", ()),
         Phase("build-cli", "capability", "cargo", ("build", "--locked", "--bin", "glaeda")),
         Phase("doctor", "built-glaeda", "glaeda", ("--output", "json", "doctor")),
         Phase(

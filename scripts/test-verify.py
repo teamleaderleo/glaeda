@@ -118,6 +118,7 @@ class VerifyPlanTests(unittest.TestCase):
         self.assertEqual(
             phases[0]["argv"], ["cargo", "test", "--locked", "--lib", "--bins"]
         )
+        self.assertEqual(phases[1]["argv"], ["scripts/verify-changed-rustfmt"])
         self.assertEqual(
             sum(phase["argv"][:2] == ["cargo", "build"] for phase in phases), 1
         )
