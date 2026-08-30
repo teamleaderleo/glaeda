@@ -448,6 +448,12 @@ impl DirectorySnapshot {
     }
 }
 
+pub(crate) fn cargo_target_materialization_id(
+    stat: &Stat,
+) -> Result<Sha256Digest, CargoTargetObservationError> {
+    DirectorySnapshot::from_stat(stat)?.target_id()
+}
+
 fn same_directory_identity(stat: &Stat, snapshot: &DirectorySnapshot) -> bool {
     FileType::from_raw_mode(stat.st_mode).is_dir()
         && stat.st_dev == snapshot.device
