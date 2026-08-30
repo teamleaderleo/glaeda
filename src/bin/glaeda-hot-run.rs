@@ -2294,11 +2294,13 @@ mod tests {
     #[test]
     fn direct_measurement_preserves_exit_and_schema() {
         let fixture = test_directory("glaeda-hot-run-test");
+        initialize_test_repository(&fixture);
+        fs::create_dir(fixture.join("target")).unwrap();
+        fs::write(fixture.join("target/fixture"), b"stable target fixture\n").unwrap();
         let measurement = fixture.join("measurement.json");
-        let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let code = run(Cli {
-            resident: repository.clone(),
-            task: repository.clone(),
+            resident: fixture.clone(),
+            task: fixture.clone(),
             cache: vec!["target:native".into()],
             measurement: Some(measurement.clone()),
             comparison_key: Some(format!("sha256:{}", "a".repeat(64))),
@@ -2347,8 +2349,7 @@ mod tests {
             fs::metadata(&measurement).unwrap().permissions().mode() & 0o777,
             0o600
         );
-        fs::remove_file(measurement).unwrap();
-        fs::remove_dir(fixture).unwrap();
+        fs::remove_dir_all(fixture).unwrap();
     }
 
     #[test]
