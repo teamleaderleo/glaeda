@@ -494,9 +494,12 @@ pointer-file witness. Reusing the same physical worktrees retains their state; r
 recreating a worktree at the same pathname selects a fresh state even if the filesystem immediately
 recycles its inode. Cross-worktree launch holds the validated task, common-Git, task-Git, and cache
 objects with `O_PATH` descriptors and makes bubblewrap consume those objects through `--bind-fd`
-or an inherited `/proc/self/fd` path. The physical witnesses are revalidated after taking the state
-lock and after preparation; later pathname replacement therefore cannot substitute a new object
-between validation and bind consumption.
+or `--ro-bind-fd`. Overlay lowers first become route-owned read-only FD-bound mounts. Every
+descriptor inherited by bubblewrap is consumed by exactly one bind operation before the workload
+executes, so the command cannot reach around a private cache view through `/proc/self/fd`. The
+physical witnesses are revalidated after taking the state lock and after preparation; later
+pathname replacement therefore cannot substitute a new object between validation and bind
+consumption.
 
 An explicit `--state` remains caller-owned and can intentionally continue a lineage across
 worktree generations. Default-key v1 directories are inert after the v2 transition and are not
