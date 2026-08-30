@@ -62,6 +62,7 @@ jobs:
               Path("smolrunner"),
               Path("scripts/bootstrap"),
               Path("scripts/benchmark-hot-state-fanout"),
+              Path("scripts/benchmark-linker-throughput"),
               Path("scripts/hot-observe"),
               Path("scripts/hot-pressure-shadow"),
               Path("scripts/hot-run-python"),
@@ -70,6 +71,7 @@ jobs:
               Path("scripts/test-hot-run.py"),
               Path("scripts/test-hot-pressure-shadow.py"),
               Path("scripts/test-benchmark-hot-state-fanout.py"),
+              Path("scripts/test-benchmark-linker-throughput.py"),
               Path("scripts/test-hot-observe.py"),
               Path("scripts/test-verify.py"),
               Path("scripts/test-verify-changed-rustfmt.py"),
@@ -88,6 +90,7 @@ jobs:
           bash scripts/test-bootstrap.sh
           python3 scripts/test-benchmark-developer-loop.py
           python3 scripts/test-benchmark-hot-state-fanout.py
+          python3 scripts/test-benchmark-linker-throughput.py
           python3 scripts/test-hot-observe.py
           python3 scripts/test-hot-pressure-shadow.py
           python3 scripts/test-hot-run.py
