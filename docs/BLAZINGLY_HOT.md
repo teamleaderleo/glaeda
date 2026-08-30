@@ -520,8 +520,10 @@ stays on the root filesystem, rejects more than 1,024 states, 2,000,000 objects 
 over 64, cross-state hardlinks, drift, and unreadable state. Logical bytes match GNU `du
 --apparent-size` semantics by excluding directory entry sizes; allocated bytes sum unique
 per-state `st_blocks * 512`, including directories. The namespace root itself is excluded from the
-per-state aggregate. OverlayFS work directories may require a privileged read-only invocation
-because the kernel makes their internals inaccessible to the creating user.
+per-state aggregate. As with `du`, `st_blocks` is inode-reported allocation rather than unique
+backing usage when reflinks or block-level deduplication share extents. OverlayFS work directories
+may require a privileged read-only invocation because the kernel makes their internals inaccessible
+to the creating user.
 
 Every observed state remains `ownership_unknown` with generation, worktree, reconstruction,
 lease, lock, mount, open-file, process, cleanup, and quarantine evidence unknown. A successful
