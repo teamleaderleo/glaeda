@@ -1684,15 +1684,15 @@ def run(
         cache_arguments_for_bwrap: list[str] = []
         for spec in cache_specs:
             resident_cache = resident / spec.path
-            resident_cache_fd, _ = pin_plain_object(
-                spec.path,
-                "resident cache",
-                directory=True,
-                dir_fd=pinned_worktree.resident_root_fd,
-                require_current_user=False,
-            )
-            cache_source_fds.append(resident_cache_fd)
             if spec.mode == "ro":
+                resident_cache_fd, _ = pin_plain_object(
+                    spec.path,
+                    "resident cache",
+                    directory=True,
+                    dir_fd=pinned_worktree.resident_root_fd,
+                    require_current_user=False,
+                )
+                cache_source_fds.append(resident_cache_fd)
                 cache_arguments_for_bwrap.extend(
                     [
                         "--ro-bind-fd",
@@ -1717,12 +1717,25 @@ def run(
                     ["--bind-fd", str(private_fd), os.fspath(resident_cache)]
                 )
                 continue
+            resident_cache_fd, _ = pin_plain_object(
+                spec.path,
+                "resident cache",
+                directory=True,
+                dir_fd=pinned_worktree.resident_root_fd,
+                require_current_user=False,
+            )
+            cache_source_fds.append(resident_cache_fd)
+            lower = git_view_root / f"lower-{cache_identity}"
+            lower.mkdir(mode=0o700)
             upper = state_root / f"upper-{cache_identity}"
             work = state_root / f"work-{cache_identity}"
             cache_arguments_for_bwrap.extend(
                 [
+                    "--ro-bind-fd",
+                    str(resident_cache_fd),
+                    os.fspath(lower),
                     "--overlay-src",
-                    f"/proc/self/fd/{resident_cache_fd}",
+                    os.fspath(lower),
                     "--overlay",
                     os.fspath(upper),
                     os.fspath(work),

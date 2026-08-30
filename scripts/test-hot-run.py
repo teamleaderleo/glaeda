@@ -575,7 +575,7 @@ class HotRunTests(unittest.TestCase):
                 )
 
     @unittest.skipUnless(shutil.which("bwrap"), "bubblewrap is unavailable")
-    def test_bind_fd_keeps_validated_source_across_path_replacement(self) -> None:
+    def test_bind_fd_pins_source_and_consumes_descriptor(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = Path(directory)
             source = fixture / "source"
@@ -606,8 +606,22 @@ class HotRunTests(unittest.TestCase):
                         str(descriptor),
                         os.fspath(destination),
                         "--",
-                        "/bin/cat",
+                        "/usr/bin/python3",
+                        "-c",
+                        (
+                            "import pathlib, sys\n"
+                            "destination = pathlib.Path(sys.argv[1])\n"
+                            "descriptor_path = pathlib.Path(sys.argv[2])\n"
+                            "if destination.read_bytes() != b'validated\\n':\n"
+                            "    raise SystemExit(2)\n"
+                            "try:\n"
+                            "    descriptor_path.read_bytes()\n"
+                            "except OSError:\n"
+                            "    raise SystemExit(0)\n"
+                            "raise SystemExit(3)\n"
+                        ),
                         os.fspath(destination / "generation"),
+                        f"/proc/self/fd/{descriptor}/generation",
                     ],
                     pass_fds=(descriptor,),
                     stdin=subprocess.DEVNULL,
@@ -618,7 +632,7 @@ class HotRunTests(unittest.TestCase):
             finally:
                 os.close(descriptor)
             self.assertEqual(result.returncode, 0, result.stderr.decode())
-            self.assertEqual(result.stdout, b"validated\n")
+            self.assertEqual(result.stdout, b"")
             self.assertEqual(
                 (replacement / "generation").read_text(encoding="utf-8"),
                 "replacement\n",
