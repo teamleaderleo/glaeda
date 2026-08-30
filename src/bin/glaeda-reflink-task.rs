@@ -23,6 +23,11 @@ mod linux {
         source: PathBuf,
         #[arg(long)]
         target: Vec<PathBuf>,
+        #[arg(
+            long,
+            help = "emit the fan-out contract even when exactly one target is requested"
+        )]
+        fanout: bool,
         #[arg(long)]
         commit: String,
         #[arg(long, value_enum)]
@@ -49,7 +54,7 @@ mod linux {
             Mode::Ordinary => ReflinkTaskMaterializationMode::Ordinary,
             Mode::Reflink => ReflinkTaskMaterializationMode::ReflinkWithFallback,
         };
-        if cli.target.len() > 1 {
+        if cli.fanout || cli.target.len() > 1 {
             return run_fanout(cli, mode);
         }
         let target = match cli.target.into_iter().next() {
@@ -110,6 +115,53 @@ mod linux {
             },
         }
         ExitCode::SUCCESS
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::Cli;
+        use clap::Parser;
+
+        fn parse(arguments: &[&str]) -> Cli {
+            Cli::try_parse_from(arguments).expect("fixture CLI should parse")
+        }
+
+        #[test]
+        fn explicit_fanout_preserves_the_fanout_contract_for_one_target() {
+            let cli = parse(&[
+                "glaeda-reflink-task",
+                "--source",
+                "/source",
+                "--target",
+                "/task",
+                "--fanout",
+                "--commit",
+                "0123456789012345678901234567890123456789",
+                "--mode",
+                "ordinary",
+            ]);
+
+            assert!(cli.fanout);
+            assert_eq!(cli.target.len(), 1);
+        }
+
+        #[test]
+        fn legacy_single_target_selection_remains_distinct() {
+            let cli = parse(&[
+                "glaeda-reflink-task",
+                "--source",
+                "/source",
+                "--target",
+                "/task",
+                "--commit",
+                "0123456789012345678901234567890123456789",
+                "--mode",
+                "ordinary",
+            ]);
+
+            assert!(!cli.fanout);
+            assert_eq!(cli.target.len(), 1);
+        }
     }
 }
 
