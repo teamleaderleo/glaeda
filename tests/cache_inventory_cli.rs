@@ -234,8 +234,10 @@ fn hot_run_observation_is_path_free_unknown_and_non_mutating() {
         output.stderr
     );
     let report = json(&output);
+    assert_eq!(report["schema_version"], 2);
     assert_eq!(report["authority"], "local_hot_run_filesystem_observation");
     assert_eq!(report["mutation_performed"], false);
+    assert_eq!(report["completeness"], "complete");
     assert_eq!(report["summary"]["state_count"], 1);
     assert_eq!(report["summary"]["unknown_count"], 1);
     assert_eq!(report["summary"]["reclaimable_count"], 0);
@@ -263,4 +265,65 @@ fn hot_run_observation_is_path_free_unknown_and_non_mutating() {
     assert_eq!(before_state.atime(), after_state.atime());
     assert_eq!(before_state.mtime(), after_state.mtime());
     assert_eq!(before_state.ctime(), after_state.ctime());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn partial_hot_run_observation_keeps_bytes_and_classifier_unknown() {
+    let root = TempHotRunRoot::new();
+    let state = root.path().join("a".repeat(64));
+    fs::create_dir(&state).expect("create state");
+    let private_name = "private-socket-name-do-not-print";
+    let status = Command::new("/usr/bin/mkfifo")
+        .arg(state.join(private_name))
+        .status()
+        .expect("run mkfifo");
+    assert!(status.success(), "create fixture FIFO");
+
+    let output = run(&[
+        OsStr::new("--output"),
+        OsStr::new("json"),
+        OsStr::new("cache"),
+        OsStr::new("observe-hot-run"),
+        OsStr::new("--root"),
+        root.path().as_os_str(),
+    ]);
+    assert!(
+        output.status.success(),
+        "partial observation stderr: {:?}",
+        output.stderr
+    );
+    let report = json(&output);
+    assert_eq!(report["schema_version"], 2);
+    assert_eq!(report["authority"], "local_hot_run_filesystem_observation");
+    assert_eq!(report["mutation_performed"], false);
+    assert_eq!(report["completeness"], "partial");
+    assert_eq!(report["summary"]["state_count"], 1);
+    assert_eq!(report["summary"]["logical_bytes"], Value::Null);
+    assert_eq!(report["summary"]["allocated_bytes"], Value::Null);
+    assert_eq!(report["summary"]["reclaimable_count"], Value::Null);
+    assert_eq!(
+        report["summary"]["reclaimable_allocated_bytes"],
+        Value::Null
+    );
+    assert_eq!(report["states"], Value::Array(Vec::new()));
+    assert_eq!(report["problems"], serde_json::json!(["unsupported_node"]));
+
+    let rendered = String::from_utf8(output.stdout).expect("UTF-8 output");
+    assert!(!rendered.contains(root.path().to_string_lossy().as_ref()));
+    assert!(!rendered.contains(private_name));
+
+    let human = run(&[
+        OsStr::new("cache"),
+        OsStr::new("observe-hot-run"),
+        OsStr::new("--root"),
+        root.path().as_os_str(),
+    ]);
+    assert!(human.status.success(), "human partial observation");
+    let human = String::from_utf8(human.stdout).expect("UTF-8 human output");
+    assert!(human.contains("completeness: partial"));
+    assert!(human.contains("reclaimable=unknown"));
+    assert!(human.contains("problems: unsupported_node"));
+    assert!(!human.contains(root.path().to_string_lossy().as_ref()));
+    assert!(!human.contains(private_name));
 }
