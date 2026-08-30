@@ -1,16 +1,18 @@
-#[cfg(not(target_os = "linux"))]
-compile_error!("glaeda-host-observe requires Linux");
-
 use std::process::ExitCode;
 
+#[cfg(target_os = "linux")]
 use clap::{Parser, ValueEnum};
+#[cfg(target_os = "linux")]
 use glaeda::linux_host_observation::{
     DEFAULT_WATCHED_PORTS, LinuxHostObservation, LinuxHostObservationError, MAX_WATCHED_PORTS,
     ObservedCount, PressureSample, observe_linux_host,
 };
+#[cfg(target_os = "linux")]
 use glaeda::process::ProcessExecutor;
+#[cfg(target_os = "linux")]
 use serde::Serialize;
 
+#[cfg(target_os = "linux")]
 #[derive(Debug, Parser)]
 #[command(
     name = "glaeda-host-observe",
@@ -26,12 +28,14 @@ struct Cli {
     ports: Vec<u16>,
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum OutputFormat {
     Human,
     Json,
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Debug, Serialize)]
 struct LinuxHostObservationErrorReport<'a> {
     document_type: &'static str,
@@ -40,6 +44,7 @@ struct LinuxHostObservationErrorReport<'a> {
     error: &'a LinuxHostObservationError,
 }
 
+#[cfg(target_os = "linux")]
 impl<'a> LinuxHostObservationErrorReport<'a> {
     fn new(error: &'a LinuxHostObservationError) -> Self {
         Self {
@@ -51,6 +56,7 @@ impl<'a> LinuxHostObservationErrorReport<'a> {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let ports = if cli.ports.is_empty() {
@@ -74,6 +80,7 @@ fn main() -> ExitCode {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn emit_report(output: OutputFormat, report: &LinuxHostObservation) -> ExitCode {
     match output {
         OutputFormat::Human => print!("{}", render_human(report)),
@@ -88,6 +95,7 @@ fn emit_report(output: OutputFormat, report: &LinuxHostObservation) -> ExitCode 
     ExitCode::SUCCESS
 }
 
+#[cfg(target_os = "linux")]
 fn emit_error(output: OutputFormat, error: &LinuxHostObservationError) -> ExitCode {
     let report = LinuxHostObservationErrorReport::new(error);
     match output {
@@ -103,6 +111,7 @@ fn emit_error(output: OutputFormat, error: &LinuxHostObservationError) -> ExitCo
     ExitCode::from(2)
 }
 
+#[cfg(target_os = "linux")]
 fn render_human(report: &LinuxHostObservation) -> String {
     let cpu = report.cpu();
     let memory = report.memory();
@@ -151,6 +160,7 @@ fn render_human(report: &LinuxHostObservation) -> String {
     )
 }
 
+#[cfg(target_os = "linux")]
 fn render_pressure(sample: PressureSample) -> String {
     format!(
         "avg10:{} total:{}",
@@ -159,6 +169,7 @@ fn render_pressure(sample: PressureSample) -> String {
     )
 }
 
+#[cfg(target_os = "linux")]
 fn render_count(count: ObservedCount) -> String {
     match count {
         ObservedCount::Known { count } => count.to_string(),
@@ -166,6 +177,13 @@ fn render_count(count: ObservedCount) -> String {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn format_micros(value: u64) -> String {
     format!("{}.{:06}", value / 1_000_000, value % 1_000_000)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn main() -> ExitCode {
+    eprintln!("glaeda-host-observe is unavailable: Linux is required");
+    ExitCode::from(2)
 }
