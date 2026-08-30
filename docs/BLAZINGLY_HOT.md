@@ -261,6 +261,10 @@ contents hash separately to `sha256:05ac245de86e2f2e70109605b49e02467a4ac84192fe
 The candidate/base binaries hash to `sha256:435f05167eae81a04c0c59aa939db61e7b1b6edc978acb38c4756fc22a2e9535`
 and `sha256:a3850298b071f311ba6bfe6c9bcf693874d5103f9ed69b9cc618f568eba2e2dd`; the semantic
 workload hashes to `sha256:0d886b3b1ec520168a8970939646d8a9ab117471521d13e2d7e5ef8f16cb09ff`.
+The final publication candidate additionally compile-gates the Linux-only observer types and moves
+their JSON conversion into the Linux path after the first hosted Apple cross-target check exposed
+an unconditional import. The Linux observation sequence, report fields and timing boundaries are
+unchanged; the full performance matrix was not relabelled or rerun as final-source evidence.
 
 `private` starts with an empty directory and retains the task's later writes without OverlayFS
 copy-up. `private-copy` atomically seeds that directory once from the warm resident parent with GNU

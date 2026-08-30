@@ -31,10 +31,13 @@ use std::sync::{
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, ValueEnum};
+#[cfg(target_os = "linux")]
 use glaeda::cargo_target_observation::{
     CargoTargetObservation, CargoTargetObservationError, observe_cargo_target,
 };
+#[cfg(target_os = "linux")]
 use glaeda::process::ProcessExecutor;
+#[cfg(target_os = "linux")]
 use glaeda::project_checkout_observation::{
     ProjectCheckoutObservation, ProjectCheckoutObservationError, ProjectCheckoutObserver,
 };
@@ -50,6 +53,7 @@ use rustix::{
     },
     thread::sched_getaffinity,
 };
+#[cfg(target_os = "linux")]
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest as _, Sha256};
@@ -168,12 +172,14 @@ struct CommandResult {
     completion_reason: &'static str,
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Debug, Serialize)]
 struct NativeTargetSnapshot {
     checkout: ProjectCheckoutObservation,
     cargo_target: CargoTargetObservation,
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Debug, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 enum TerminalObservation<T, E> {
@@ -181,12 +187,14 @@ enum TerminalObservation<T, E> {
     Unavailable { error: E },
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Debug, Serialize)]
 struct NativeTargetTerminalSnapshot {
     checkout: TerminalObservation<ProjectCheckoutObservation, ProjectCheckoutObservationError>,
     cargo_target: TerminalObservation<CargoTargetObservation, CargoTargetObservationError>,
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Debug)]
 struct NativeTargetMeasurementObservation {
     before: NativeTargetSnapshot,
@@ -196,10 +204,10 @@ struct NativeTargetMeasurementObservation {
 }
 
 #[derive(Debug)]
-struct MeasurementObservations<'a> {
+struct MeasurementObservations {
     machine_before: Value,
     machine_after: Value,
-    native_target: Option<&'a NativeTargetMeasurementObservation>,
+    native_target: Value,
 }
 
 #[cfg(target_os = "linux")]
@@ -318,6 +326,7 @@ fn run(cli: Cli) -> Result<i32, String> {
         runtime_bin.as_ref(),
     )?;
 
+    #[cfg(target_os = "linux")]
     let native_target_before =
         if cli.measurement.is_some() && caches.iter().any(|cache| cache.path == "target") {
             let started = Instant::now();
@@ -341,6 +350,7 @@ fn run(cli: Cli) -> Result<i32, String> {
     )?;
     if let Some(destination) = cli.measurement.as_ref() {
         let machine_after = observe_machine();
+        #[cfg(target_os = "linux")]
         let native_target_observation =
             native_target_before.map(|(observer, before, before_elapsed)| {
                 let started = Instant::now();
@@ -352,6 +362,13 @@ fn run(cli: Cli) -> Result<i32, String> {
                     after_elapsed: started.elapsed(),
                 }
             });
+        #[cfg(target_os = "linux")]
+        let native_target_observation = native_target_observation
+            .as_ref()
+            .map(|observation| native_target_report(observation, result.elapsed))
+            .unwrap_or(Value::Null);
+        #[cfg(not(target_os = "linux"))]
+        let native_target_observation = Value::Null;
         write_measurement(
             destination,
             &result,
@@ -361,13 +378,14 @@ fn run(cli: Cli) -> Result<i32, String> {
             MeasurementObservations {
                 machine_before: machine_before.expect("measurement observation exists"),
                 machine_after,
-                native_target: native_target_observation.as_ref(),
+                native_target: native_target_observation,
             },
         )?;
     }
     Ok(result.exit_code)
 }
 
+#[cfg(target_os = "linux")]
 fn observe_native_target_before(
     observer: &ProjectCheckoutObserver,
     checkout: &Path,
@@ -383,6 +401,7 @@ fn observe_native_target_before(
     })
 }
 
+#[cfg(target_os = "linux")]
 fn observe_native_target_after(
     observer: &ProjectCheckoutObserver,
     checkout: &Path,
@@ -399,6 +418,28 @@ fn observe_native_target_after(
         checkout: checkout_observation,
         cargo_target,
     }
+}
+
+#[cfg(target_os = "linux")]
+fn native_target_report(
+    observation: &NativeTargetMeasurementObservation,
+    command_elapsed: Duration,
+) -> Value {
+    let observation_elapsed = observation
+        .before_elapsed
+        .saturating_add(observation.after_elapsed);
+    json!({
+        "authority": "performance_observation_only",
+        "atomic": false,
+        "before": observation.before,
+        "after": observation.after,
+        "before_elapsed_seconds": round_seconds(observation.before_elapsed),
+        "after_elapsed_seconds": round_seconds(observation.after_elapsed),
+        "observation_elapsed_seconds": round_seconds(observation_elapsed),
+        "command_plus_observation_elapsed_seconds": round_seconds(
+            command_elapsed.saturating_add(observation_elapsed)
+        ),
+    })
 }
 
 fn validate_timeout(seconds: f64) -> Result<Duration, String> {
@@ -1953,7 +1994,7 @@ fn write_measurement(
     caches: &[NativeCache],
     runtime: Option<&RuntimeContract>,
     comparison_key: Option<&str>,
-    observations: MeasurementObservations<'_>,
+    observations: MeasurementObservations,
 ) -> Result<(), String> {
     let destination = absolute_path(destination)?;
     let parent = destination
@@ -1965,26 +2006,6 @@ fn write_measurement(
         .create(parent)
         .map_err(|error| format!("cannot create measurement parent: {error}"))?;
     let temporary = unique_sibling_path(&destination)?;
-    let native_target_observation = observations
-        .native_target
-        .map(|observation| {
-            let observation_elapsed = observation
-                .before_elapsed
-                .saturating_add(observation.after_elapsed);
-            json!({
-                "authority": "performance_observation_only",
-                "atomic": false,
-                "before": observation.before,
-                "after": observation.after,
-                "before_elapsed_seconds": round_seconds(observation.before_elapsed),
-                "after_elapsed_seconds": round_seconds(observation.after_elapsed),
-                "observation_elapsed_seconds": round_seconds(observation_elapsed),
-                "command_plus_observation_elapsed_seconds": round_seconds(
-                    result.elapsed.saturating_add(observation_elapsed)
-                ),
-            })
-        })
-        .unwrap_or(Value::Null);
     let machine_interval = pressure_interval(
         &observations.machine_before,
         &observations.machine_after,
@@ -2007,7 +2028,7 @@ fn write_measurement(
         "cache_views": caches.iter().map(|cache| json!({"path": cache.path, "mode": "native"})).collect::<Vec<_>>(),
         "state_preparation": [],
         "source_preparation": Value::Null,
-        "native_target_observation": native_target_observation,
+        "native_target_observation": observations.native_target,
         "runtime": runtime.map(runtime_report).unwrap_or(Value::Null),
         "elapsed_seconds": round_seconds(result.elapsed),
         "preparation_elapsed_seconds": 0.0,
