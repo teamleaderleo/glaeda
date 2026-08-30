@@ -487,10 +487,20 @@ The resulting script measured 0.05 seconds for no-op Bash and Python commands, 0
 exact Rust no-run check, and 10.06 seconds after the same one-line edit versus a 37.56-second
 path-cold rebuild.
 
-The default task state is an opaque path under the user's cache directory. It is expendable:
-discarding it or selecting a new empty `--state` path produces a private cold upper and a normal
-compiler rebuild. Bubblewrap and kernel OverlayFS are required for cross-worktree mode; running
-directly in the resident worktree does not require either.
+The implicit default task state is an opaque path under the user's cache directory. Its lineage
+binds the resident and task paths, cache modes, runtime contract, physical resident/task/common-Git
+directory objects, Git administrative directories, and each linked worktree's stable `.git`
+pointer-file witness. Reusing the same physical worktrees retains their state; removing and
+recreating a worktree at the same pathname selects a fresh state even if the filesystem immediately
+recycles its inode. The physical witnesses are revalidated after taking the state lock and again
+immediately before launch, so replacement during preparation fails closed.
+
+An explicit `--state` remains caller-owned and can intentionally continue a lineage across
+worktree generations. Default-key v1 directories are inert after the v2 transition and are not
+adopted or deleted implicitly. All task state is expendable: discarding it or selecting a new empty
+`--state` path produces a private cold upper and a normal compiler rebuild. Bubblewrap and kernel
+OverlayFS are required for cross-worktree mode; running directly in the resident worktree does not
+require either.
 
 ## Linux mount path
 
