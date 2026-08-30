@@ -19,8 +19,6 @@ use std::{
 use clap::{Args, Parser, Subcommand, ValueEnum};
 #[cfg(target_os = "macos")]
 use glaeda::artifact::Sha256Digest;
-#[cfg(target_os = "linux")]
-use glaeda::cache_inventory::build_local_hot_run_cache_report;
 use glaeda::cache_inventory::{
     CacheReportRequest, CacheStateId, MAX_CACHE_INVENTORY_DOCUMENT_BYTES,
     build_cache_inventory_report, decode_cache_inventory, render_cache_inventory_human,
@@ -64,7 +62,10 @@ use glaeda::host_readiness::{RunnerAccountReadiness, inspect_host_readiness};
 #[cfg(target_os = "linux")]
 use glaeda::host_readiness_verdict::{assess, render_human as render_host_plan};
 #[cfg(target_os = "linux")]
-use glaeda::hot_run_cache_observation::observe_hot_run_cache;
+use glaeda::hot_run_cache_observation::{
+    build_hot_run_cache_observation_report, observe_hot_run_cache,
+    render_hot_run_cache_observation_human,
+};
 #[cfg(target_os = "linux")]
 use glaeda::journal::ExecutionLane;
 #[cfg(target_os = "linux")]
@@ -744,20 +745,20 @@ fn run_cache_inventory(
 
 #[cfg(target_os = "linux")]
 fn run_hot_run_cache_observation(output: OutputFormat, root: &Path) -> ExitCode {
-    let inventory = match observe_hot_run_cache(root) {
-        Ok(inventory) => inventory,
+    let observation = match observe_hot_run_cache(root) {
+        Ok(observation) => observation,
         Err(error) => {
             return emit_runtime_error(output, error.code(), error.to_string());
         }
     };
-    let report = match build_local_hot_run_cache_report(&inventory) {
+    let report = match build_hot_run_cache_observation_report(observation) {
         Ok(report) => report,
         Err(error) => {
             return emit_runtime_error(output, error.code(), error.to_string());
         }
     };
     match output {
-        OutputFormat::Human => print!("{}", render_cache_inventory_human(&report)),
+        OutputFormat::Human => print!("{}", render_hot_run_cache_observation_human(&report)),
         OutputFormat::Json => {
             if print_json(&report).is_err() {
                 return ExitCode::from(2);

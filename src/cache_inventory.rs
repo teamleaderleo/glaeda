@@ -416,6 +416,11 @@ impl CacheStateReport {
     pub fn reasons(&self) -> &[CacheStateReason] {
         &self.reasons
     }
+
+    #[must_use]
+    pub const fn allocated_bytes(&self) -> u64 {
+        self.allocated_bytes
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -438,6 +443,31 @@ impl CacheInventorySummary {
     }
 
     #[must_use]
+    pub const fn in_use_count(&self) -> u32 {
+        self.in_use_count
+    }
+
+    #[must_use]
+    pub const fn warm_count(&self) -> u32 {
+        self.warm_count
+    }
+
+    #[must_use]
+    pub const fn reclaimable_count(&self) -> u32 {
+        self.reclaimable_count
+    }
+
+    #[must_use]
+    pub const fn quarantined_count(&self) -> u32 {
+        self.quarantined_count
+    }
+
+    #[must_use]
+    pub const fn unknown_count(&self) -> u32 {
+        self.unknown_count
+    }
+
+    #[must_use]
     pub const fn logical_bytes(&self) -> u64 {
         self.logical_bytes
     }
@@ -445,6 +475,11 @@ impl CacheInventorySummary {
     #[must_use]
     pub const fn allocated_bytes(&self) -> u64 {
         self.allocated_bytes
+    }
+
+    #[must_use]
+    pub const fn reclaimable_allocated_bytes(&self) -> u64 {
+        self.reclaimable_allocated_bytes
     }
 }
 

@@ -10,11 +10,18 @@ use std::os::fd::{AsFd as _, OwnedFd};
 use std::path::Path;
 
 use rustix::fs::{self as rustix_fs, AtFlags, Dir, FileType, Mode, OFlags, Stat};
+use rustix::io::Errno;
+use serde::Serialize;
 
-use crate::cache_inventory::{CacheInventoryDocument, CacheStateId, MAX_CACHE_INVENTORY_STATES};
+use crate::cache_inventory::{
+    CacheInventoryAuthority, CacheInventoryDocument, CacheInventoryError, CacheInventoryReport,
+    CacheInventorySummary, CacheReportOperation, CacheStateId, CacheStateReport,
+    MAX_CACHE_INVENTORY_STATES, build_local_hot_run_cache_report,
+};
 
 pub const MAX_HOT_RUN_CACHE_OBSERVATION_ENTRIES: u64 = 2_000_000;
 pub const MAX_HOT_RUN_CACHE_OBSERVATION_DEPTH: u16 = 64;
+pub const HOT_RUN_CACHE_OBSERVATION_REPORT_SCHEMA_VERSION: u8 = 2;
 
 const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::DIRECTORY)
@@ -23,25 +30,234 @@ const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::CLOEXEC);
 const ALLOCATION_BLOCK_BYTES: u64 = 512;
 
-/// Observe state IDs and per-state byte totals below one explicit hot-run cache root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HotRunCacheObservationCompleteness {
+    Complete,
+    Partial,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HotRunCacheObservationProblem {
+    PermissionDenied,
+    UnsupportedNode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HotRunCacheObservation {
+    Complete(CacheInventoryDocument),
+    Partial {
+        state_count: u32,
+        problem: HotRunCacheObservationProblem,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HotRunCacheObservationSummary {
+    state_count: u32,
+    in_use_count: Option<u32>,
+    warm_count: Option<u32>,
+    reclaimable_count: Option<u32>,
+    quarantined_count: Option<u32>,
+    unknown_count: Option<u32>,
+    logical_bytes: Option<u64>,
+    allocated_bytes: Option<u64>,
+    reclaimable_allocated_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HotRunCacheObservationReport {
+    schema_version: u8,
+    authority: CacheInventoryAuthority,
+    operation: CacheReportOperation,
+    mutation_performed: bool,
+    completeness: HotRunCacheObservationCompleteness,
+    summary: HotRunCacheObservationSummary,
+    states: Vec<CacheStateReport>,
+    problems: Vec<HotRunCacheObservationProblem>,
+}
+
+impl HotRunCacheObservationReport {
+    #[must_use]
+    pub const fn completeness(&self) -> HotRunCacheObservationCompleteness {
+        self.completeness
+    }
+
+    #[must_use]
+    pub const fn summary(&self) -> &HotRunCacheObservationSummary {
+        &self.summary
+    }
+
+    #[must_use]
+    pub fn states(&self) -> &[CacheStateReport] {
+        &self.states
+    }
+
+    #[must_use]
+    pub fn problems(&self) -> &[HotRunCacheObservationProblem] {
+        &self.problems
+    }
+}
+
+impl HotRunCacheObservationSummary {
+    #[must_use]
+    pub const fn state_count(&self) -> u32 {
+        self.state_count
+    }
+
+    #[must_use]
+    pub const fn logical_bytes(&self) -> Option<u64> {
+        self.logical_bytes
+    }
+
+    #[must_use]
+    pub const fn allocated_bytes(&self) -> Option<u64> {
+        self.allocated_bytes
+    }
+}
+
+/// Convert one filesystem observation into the stable path-free command report.
 ///
 /// # Errors
 ///
-/// Refuses missing or unreadable roots, non-directory top-level entries, non-hex state names,
-/// followed or cross-filesystem directories, cross-state hardlinks, drift, limit excess, and
-/// arithmetic overflow. Errors never contain the supplied path or child names.
+/// Returns an error only when a complete observation cannot be aggregated by the cache
+/// classifier. Partial observations carry no byte or lifecycle evidence into that classifier.
+pub fn build_hot_run_cache_observation_report(
+    observation: HotRunCacheObservation,
+) -> Result<HotRunCacheObservationReport, CacheInventoryError> {
+    match observation {
+        HotRunCacheObservation::Complete(document) => {
+            let classified = build_local_hot_run_cache_report(&document)?;
+            Ok(complete_report(&classified))
+        }
+        HotRunCacheObservation::Partial {
+            state_count,
+            problem,
+        } => Ok(HotRunCacheObservationReport {
+            schema_version: HOT_RUN_CACHE_OBSERVATION_REPORT_SCHEMA_VERSION,
+            authority: CacheInventoryAuthority::LocalHotRunFilesystemObservation,
+            operation: CacheReportOperation::Status,
+            mutation_performed: false,
+            completeness: HotRunCacheObservationCompleteness::Partial,
+            summary: HotRunCacheObservationSummary {
+                state_count,
+                in_use_count: None,
+                warm_count: None,
+                reclaimable_count: None,
+                quarantined_count: None,
+                unknown_count: None,
+                logical_bytes: None,
+                allocated_bytes: None,
+                reclaimable_allocated_bytes: None,
+            },
+            states: Vec::new(),
+            problems: vec![problem],
+        }),
+    }
+}
+
+fn complete_report(classified: &CacheInventoryReport) -> HotRunCacheObservationReport {
+    let summary = classified.summary();
+    HotRunCacheObservationReport {
+        schema_version: HOT_RUN_CACHE_OBSERVATION_REPORT_SCHEMA_VERSION,
+        authority: classified.authority(),
+        operation: classified.operation(),
+        mutation_performed: false,
+        completeness: HotRunCacheObservationCompleteness::Complete,
+        summary: complete_summary(summary),
+        states: classified.states().to_vec(),
+        problems: Vec::new(),
+    }
+}
+
+fn complete_summary(summary: &CacheInventorySummary) -> HotRunCacheObservationSummary {
+    HotRunCacheObservationSummary {
+        state_count: summary.state_count(),
+        in_use_count: Some(summary.in_use_count()),
+        warm_count: Some(summary.warm_count()),
+        reclaimable_count: Some(summary.reclaimable_count()),
+        quarantined_count: Some(summary.quarantined_count()),
+        unknown_count: Some(summary.unknown_count()),
+        logical_bytes: Some(summary.logical_bytes()),
+        allocated_bytes: Some(summary.allocated_bytes()),
+        reclaimable_allocated_bytes: Some(summary.reclaimable_allocated_bytes()),
+    }
+}
+
+#[must_use]
+pub fn render_hot_run_cache_observation_human(report: &HotRunCacheObservationReport) -> String {
+    let reclaimable = report
+        .summary
+        .reclaimable_count
+        .map_or_else(|| "unknown".to_owned(), |value| value.to_string());
+    let reclaimable_bytes = report
+        .summary
+        .reclaimable_allocated_bytes
+        .map_or_else(|| "unknown".to_owned(), |value| value.to_string());
+    let mut output = format!(
+        "cache status\nauthority: {}\ncompleteness: {}\nstates={}, reclaimable={}, reclaimable_allocated_bytes={}, mutation_performed=false\n",
+        report.authority.as_str(),
+        match report.completeness {
+            HotRunCacheObservationCompleteness::Complete => "complete",
+            HotRunCacheObservationCompleteness::Partial => "partial",
+        },
+        report.summary.state_count,
+        reclaimable,
+        reclaimable_bytes,
+    );
+    for state in &report.states {
+        let reasons = if state.reasons().is_empty() {
+            "none".to_owned()
+        } else {
+            state
+                .reasons()
+                .iter()
+                .map(|reason| reason.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        output.push_str(&format!(
+            "{}: {} (allocated_bytes={}, reasons={})\n",
+            state.state_id().as_str(),
+            state.classification().as_str(),
+            state.allocated_bytes(),
+            reasons,
+        ));
+    }
+    if !report.problems.is_empty() {
+        let problems = report
+            .problems
+            .iter()
+            .map(|problem| match problem {
+                HotRunCacheObservationProblem::PermissionDenied => "permission_denied",
+                HotRunCacheObservationProblem::UnsupportedNode => "unsupported_node",
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        output.push_str(&format!("problems: {problems}\n"));
+    }
+    output
+}
+
+/// Observe one explicit hot-run cache root without reading file contents.
+///
+/// # Errors
+///
+/// A stable top-level state set with protected interiors or nested special nodes produces a
+/// partial observation with unknown bytes. Refuses missing or unreadable roots, non-directory
+/// top-level entries, non-hex state names, followed or cross-filesystem directories, cross-state
+/// hardlinks, drift, limit excess, and arithmetic overflow. Errors never contain the supplied path
+/// or child names.
 pub fn observe_hot_run_cache(
     root: &Path,
-) -> Result<CacheInventoryDocument, HotRunCacheObservationError> {
+) -> Result<HotRunCacheObservation, HotRunCacheObservationError> {
     let root = BoundDirectory::open_root(root)?;
     let root_before = root.snapshot;
     let mut names = state_names(&root.fd)?;
     names.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
 
-    let mut global_objects = BTreeMap::new();
-    let mut entries_seen = 0_u64;
-    let mut states = Vec::with_capacity(names.len());
-    for (state_ordinal, name) in names.into_iter().enumerate() {
+    for name in &names {
         let path_stat =
             rustix_fs::statat(root.fd.as_fd(), name.as_c_str(), AtFlags::SYMLINK_NOFOLLOW)
                 .map_err(|_| unreadable())?;
@@ -50,12 +266,35 @@ pub fn observe_hot_run_cache(
         {
             return Err(unsafe_shape());
         }
-        let state = BoundDirectory::open_child(&root.fd, name.as_c_str())?;
+        CacheStateId::parse(std::str::from_utf8(name.as_bytes()).map_err(|_| unsafe_shape())?)
+            .map_err(|_| unsafe_shape())?;
+    }
+
+    let mut global_objects = BTreeMap::new();
+    let mut entries_seen = 0_u64;
+    let mut states = Vec::with_capacity(names.len());
+    for (state_ordinal, name) in names.iter().enumerate() {
+        let path_stat =
+            match rustix_fs::statat(root.fd.as_fd(), name.as_c_str(), AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(path_stat) => path_stat,
+                Err(errno) => {
+                    return partial_or_error(&root, root_before, &names, read_error(errno));
+                }
+            };
+        if !FileType::from_raw_mode(path_stat.st_mode).is_dir()
+            || path_stat.st_dev != root.snapshot.device
+        {
+            return Err(unsafe_shape());
+        }
+        let state = match BoundDirectory::open_child(&root.fd, name.as_c_str()) {
+            Ok(state) => state,
+            Err(error) => return partial_or_error(&root, root_before, &names, error),
+        };
         if !same_directory_identity(&path_stat, &state.snapshot) {
             return Err(changed());
         }
         let mut totals = TreeTotals::default();
-        observe_directory(
+        if let Err(error) = observe_directory(
             &state,
             root.snapshot.device,
             0,
@@ -63,9 +302,14 @@ pub fn observe_hot_run_cache(
             &mut entries_seen,
             &mut totals,
             &mut global_objects,
-        )?;
+        ) {
+            return partial_or_error(&root, root_before, &names, error);
+        }
         state.revalidate()?;
-        let rebound = BoundDirectory::open_child(&root.fd, name.as_c_str())?;
+        let rebound = match BoundDirectory::open_child(&root.fd, name.as_c_str()) {
+            Ok(rebound) => rebound,
+            Err(error) => return partial_or_error(&root, root_before, &names, error),
+        };
         if rebound.snapshot != state.snapshot {
             return Err(changed());
         }
@@ -79,7 +323,44 @@ pub fn observe_hot_run_cache(
     if root.snapshot != root_before {
         return Err(changed());
     }
-    CacheInventoryDocument::from_unknown_hot_run_states(states).map_err(|_| unsafe_shape())
+    let document =
+        CacheInventoryDocument::from_unknown_hot_run_states(states).map_err(|_| unsafe_shape())?;
+    Ok(HotRunCacheObservation::Complete(document))
+}
+
+fn partial_or_error(
+    root: &BoundDirectory,
+    root_before: DirectorySnapshot,
+    expected_names: &[std::ffi::CString],
+    error: HotRunCacheObservationError,
+) -> Result<HotRunCacheObservation, HotRunCacheObservationError> {
+    let problem = match error.kind {
+        HotRunCacheObservationErrorKind::PermissionDenied => {
+            HotRunCacheObservationProblem::PermissionDenied
+        }
+        HotRunCacheObservationErrorKind::UnsupportedNode => {
+            HotRunCacheObservationProblem::UnsupportedNode
+        }
+        _ => return Err(error),
+    };
+    root.revalidate()?;
+    if root.snapshot != root_before {
+        return Err(changed());
+    }
+    let mut names_after = state_names(&root.fd)?;
+    names_after.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    if names_after != expected_names {
+        return Err(changed());
+    }
+    root.revalidate()?;
+    if root.snapshot != root_before {
+        return Err(changed());
+    }
+    let state_count = u32::try_from(expected_names.len()).map_err(|_| too_large())?;
+    Ok(HotRunCacheObservation::Partial {
+        state_count,
+        problem,
+    })
 }
 
 fn state_names(root: &OwnedFd) -> Result<Vec<std::ffi::CString>, HotRunCacheObservationError> {
@@ -126,16 +407,16 @@ fn observe_directory(
     }
 
     let before = directory.snapshot;
-    let mut entries = Dir::read_from(&directory.fd).map_err(|_| unreadable())?;
+    let mut entries = Dir::read_from(&directory.fd).map_err(read_error)?;
     for entry in &mut entries {
-        let entry = entry.map_err(|_| unreadable())?;
+        let entry = entry.map_err(read_error)?;
         let name = entry.file_name();
         let bytes = name.to_bytes();
         if bytes == b"." || bytes == b".." {
             continue;
         }
         let first = rustix_fs::statat(directory.fd.as_fd(), name, AtFlags::SYMLINK_NOFOLLOW)
-            .map_err(|_| unreadable())?;
+            .map_err(read_error)?;
         if first.st_dev != root_device {
             return Err(unsafe_shape());
         }
@@ -161,9 +442,19 @@ fn observe_directory(
             continue;
         }
 
+        let file_type = FileType::from_raw_mode(first.st_mode);
+        if !file_type.is_file() && !file_type.is_symlink() {
+            return Err(unsupported_node());
+        }
         let snapshot = ObjectSnapshot::from_stat(&first)?;
         let second = rustix_fs::statat(directory.fd.as_fd(), name, AtFlags::SYMLINK_NOFOLLOW)
-            .map_err(|_| changed())?;
+            .map_err(|errno| {
+                if matches!(errno, Errno::ACCESS | Errno::PERM) {
+                    read_error(errno)
+                } else {
+                    changed()
+                }
+            })?;
         if snapshot != ObjectSnapshot::from_stat(&second)? {
             return Err(changed());
         }
@@ -234,7 +525,7 @@ impl BoundDirectory {
         name: impl rustix::path::Arg,
     ) -> Result<Self, HotRunCacheObservationError> {
         let fd = rustix_fs::openat(parent.as_fd(), name, DIRECTORY_FLAGS, Mode::empty())
-            .map_err(|_| unreadable())?;
+            .map_err(read_error)?;
         let snapshot = DirectorySnapshot::from_fd(&fd)?;
         Ok(Self { fd, snapshot })
     }
@@ -346,6 +637,8 @@ impl ObjectSnapshot {
 pub enum HotRunCacheObservationErrorKind {
     RootUnavailable,
     Unreadable,
+    PermissionDenied,
+    UnsupportedNode,
     UnsafeShape,
     AmbiguousHardlink,
     Changed,
@@ -372,6 +665,12 @@ impl HotRunCacheObservationError {
                 "hot_run_cache_observation_root_unavailable"
             }
             HotRunCacheObservationErrorKind::Unreadable => "hot_run_cache_observation_unreadable",
+            HotRunCacheObservationErrorKind::PermissionDenied => {
+                "hot_run_cache_observation_permission_denied"
+            }
+            HotRunCacheObservationErrorKind::UnsupportedNode => {
+                "hot_run_cache_observation_unsupported_node"
+            }
             HotRunCacheObservationErrorKind::UnsafeShape => {
                 "hot_run_cache_observation_unsafe_shape"
             }
@@ -416,6 +715,28 @@ fn unreadable() -> HotRunCacheObservationError {
     )
 }
 
+fn permission_denied() -> HotRunCacheObservationError {
+    error(
+        HotRunCacheObservationErrorKind::PermissionDenied,
+        "hot-run cache observation found protected state",
+    )
+}
+
+fn unsupported_node() -> HotRunCacheObservationError {
+    error(
+        HotRunCacheObservationErrorKind::UnsupportedNode,
+        "hot-run cache observation found an unsupported node",
+    )
+}
+
+fn read_error(errno: Errno) -> HotRunCacheObservationError {
+    if matches!(errno, Errno::ACCESS | Errno::PERM) {
+        permission_denied()
+    } else {
+        unreadable()
+    }
+}
+
 fn unsafe_shape() -> HotRunCacheObservationError {
     error(
         HotRunCacheObservationErrorKind::UnsafeShape,
@@ -456,12 +777,13 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::{MetadataExt as _, symlink};
     use std::path::{Path, PathBuf};
+    use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use crate::cache_inventory::build_local_hot_run_cache_report;
-
     use super::{
-        HotRunCacheObservationErrorKind, MAX_HOT_RUN_CACHE_OBSERVATION_DEPTH, observe_hot_run_cache,
+        HotRunCacheObservationCompleteness, HotRunCacheObservationErrorKind,
+        HotRunCacheObservationProblem, MAX_HOT_RUN_CACHE_OBSERVATION_DEPTH,
+        build_hot_run_cache_observation_report, observe_hot_run_cache,
     };
 
     static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
@@ -516,19 +838,66 @@ mod tests {
         let (_, directory_allocated) = bytes(&fs::metadata(&state).unwrap());
         let (data_logical, data_allocated) = bytes(&fs::metadata(&data).unwrap());
         let (link_logical, link_allocated) = bytes(&fs::symlink_metadata(&link).unwrap());
-        let document = observe_hot_run_cache(root.path()).expect("observe fixture");
-        let report = build_local_hot_run_cache_report(&document).expect("classify fixture");
+        let observation = observe_hot_run_cache(root.path()).expect("observe fixture");
+        let report = build_hot_run_cache_observation_report(observation).expect("classify fixture");
 
+        assert_eq!(
+            report.completeness(),
+            HotRunCacheObservationCompleteness::Complete
+        );
         assert_eq!(report.summary().state_count(), 1);
         assert_eq!(
             report.summary().logical_bytes(),
-            data_logical + link_logical
+            Some(data_logical + link_logical)
         );
         assert_eq!(
             report.summary().allocated_bytes(),
-            directory_allocated + data_allocated + link_allocated
+            Some(directory_allocated + data_allocated + link_allocated)
         );
         assert_eq!(report.states()[0].classification().as_str(), "unknown");
+    }
+
+    #[test]
+    fn reports_nested_special_nodes_as_partial_without_byte_or_identity_evidence() {
+        let root = TempRoot::new();
+        let state = root.state('a');
+        let private_name = "private-socket-name-do-not-print";
+        let status = Command::new("/usr/bin/mkfifo")
+            .arg(state.join(private_name))
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success(), "create fixture FIFO");
+
+        let observation = observe_hot_run_cache(root.path()).expect("observe partial fixture");
+        let report =
+            build_hot_run_cache_observation_report(observation).expect("build partial report");
+
+        assert_eq!(
+            report.completeness(),
+            HotRunCacheObservationCompleteness::Partial
+        );
+        assert_eq!(report.summary().state_count(), 1);
+        assert_eq!(report.summary().logical_bytes(), None);
+        assert_eq!(report.summary().allocated_bytes(), None);
+        assert!(report.states().is_empty());
+        assert_eq!(
+            report.problems(),
+            &[HotRunCacheObservationProblem::UnsupportedNode]
+        );
+        assert!(!format!("{report:?}").contains(private_name));
+    }
+
+    #[test]
+    fn classifies_permission_errors_without_private_evidence() {
+        let error = super::read_error(rustix::io::Errno::ACCESS);
+        assert_eq!(
+            error.kind(),
+            HotRunCacheObservationErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            error.to_string(),
+            "hot-run cache observation found protected state"
+        );
     }
 
     #[test]
