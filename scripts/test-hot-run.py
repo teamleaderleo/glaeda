@@ -574,6 +574,56 @@ class HotRunTests(unittest.TestCase):
                     Path("worktrees/task"),
                 )
 
+    @unittest.skipUnless(shutil.which("bwrap"), "bubblewrap is unavailable")
+    def test_bind_fd_keeps_validated_source_across_path_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            source = fixture / "source"
+            retired = fixture / "retired"
+            replacement = source
+            destination = fixture / "destination"
+            source.mkdir()
+            destination.mkdir()
+            (source / "generation").write_text("validated\n", encoding="utf-8")
+            descriptor = os.open(
+                source,
+                os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC,
+            )
+            try:
+                source.rename(retired)
+                replacement.mkdir()
+                (replacement / "generation").write_text(
+                    "replacement\n", encoding="utf-8"
+                )
+                result = subprocess.run(
+                    [
+                        os.path.abspath(shutil.which("bwrap") or "bwrap"),
+                        "--die-with-parent",
+                        "--dev-bind",
+                        "/",
+                        "/",
+                        "--ro-bind-fd",
+                        str(descriptor),
+                        os.fspath(destination),
+                        "--",
+                        "/bin/cat",
+                        os.fspath(destination / "generation"),
+                    ],
+                    pass_fds=(descriptor,),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+            finally:
+                os.close(descriptor)
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+            self.assertEqual(result.stdout, b"validated\n")
+            self.assertEqual(
+                (replacement / "generation").read_text(encoding="utf-8"),
+                "replacement\n",
+            )
+
     def test_default_target_cache_uses_private_copy(self) -> None:
         namespace = load_hot_run()
         default_cache_specs = namespace["default_cache_specs"]

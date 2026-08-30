@@ -112,6 +112,29 @@ class WorktreeStateIdentity:
     task_git_relative: Path
 
 
+@dataclass(frozen=True)
+class PinnedWorktreeState:
+    identity: WorktreeStateIdentity
+    resident_root_fd: int
+    task_root_fd: int
+    common_git_directory_fd: int
+    resident_git_directory_fd: int
+    task_git_directory_fd: int
+    resident_git_pointer_fd: int
+    task_git_pointer_fd: int
+
+    def file_descriptors(self) -> tuple[int, ...]:
+        return (
+            self.resident_root_fd,
+            self.task_root_fd,
+            self.common_git_directory_fd,
+            self.resident_git_directory_fd,
+            self.task_git_directory_fd,
+            self.resident_git_pointer_fd,
+            self.task_git_pointer_fd,
+        )
+
+
 def nonnegative_finite(raw: str) -> float:
     value = float(raw)
     if not math.isfinite(value) or value < 0:
@@ -422,6 +445,125 @@ def observe_worktree_state_identity(
         resident_git_relative=resident_git_relative,
         task_git_relative=task_git_relative,
     )
+
+
+def pin_plain_object(
+    path: Path,
+    label: str,
+    *,
+    directory: bool,
+    dir_fd: int | None = None,
+    require_current_user: bool = True,
+) -> tuple[int, os.stat_result]:
+    flags = os.O_PATH | os.O_CLOEXEC | os.O_NOFOLLOW
+    if directory:
+        flags |= os.O_DIRECTORY
+    try:
+        descriptor = os.open(path, flags, dir_fd=dir_fd)
+    except OSError as error:
+        raise RuntimeError(f"{label} is unavailable") from error
+    try:
+        details = os.fstat(descriptor)
+        expected = stat.S_ISDIR(details.st_mode) if directory else (
+            stat.S_ISREG(details.st_mode) or stat.S_ISDIR(details.st_mode)
+        )
+        if stat.S_ISLNK(details.st_mode) or not expected:
+            raise RuntimeError(f"{label} is not a plain filesystem object")
+        if require_current_user and details.st_uid != os.getuid():
+            raise RuntimeError(f"{label} is not owned by the current user")
+        return descriptor, details
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def pin_worktree_state(
+    resident: Path,
+    task: Path,
+    common_git: Path,
+    resident_git: Path,
+    task_git: Path,
+    resident_git_relative: Path,
+    task_git_relative: Path,
+) -> PinnedWorktreeState:
+    opened: list[int] = []
+
+    def pin(path: Path, label: str, *, directory: bool) -> os.stat_result:
+        descriptor, details = pin_plain_object(
+            path,
+            label,
+            directory=directory,
+        )
+        opened.append(descriptor)
+        return details
+
+    try:
+        resident_details = pin(
+            resident, "resident worktree root", directory=True
+        )
+        task_details = pin(task, "task worktree root", directory=True)
+        common_git_details = pin(
+            common_git, "common Git directory", directory=True
+        )
+        resident_git_details = pin(
+            resident_git, "resident Git directory", directory=True
+        )
+        task_git_details = pin(task_git, "task Git directory", directory=True)
+        resident_pointer_details = pin(
+            resident / ".git",
+            "resident worktree Git pointer",
+            directory=False,
+        )
+        task_pointer_details = pin(
+            task / ".git",
+            "task worktree Git pointer",
+            directory=False,
+        )
+        identity = WorktreeStateIdentity(
+            resident_root=DirectoryObjectIdentity(
+                resident_details.st_dev, resident_details.st_ino
+            ),
+            task_root=DirectoryObjectIdentity(task_details.st_dev, task_details.st_ino),
+            common_git_directory=DirectoryObjectIdentity(
+                common_git_details.st_dev, common_git_details.st_ino
+            ),
+            resident_git_directory=DirectoryObjectIdentity(
+                resident_git_details.st_dev, resident_git_details.st_ino
+            ),
+            task_git_directory=DirectoryObjectIdentity(
+                task_git_details.st_dev, task_git_details.st_ino
+            ),
+            resident_git_pointer=WorktreePointerIdentity(
+                resident_pointer_details.st_dev,
+                resident_pointer_details.st_ino,
+                (
+                    resident_pointer_details.st_ctime_ns
+                    if stat.S_ISREG(resident_pointer_details.st_mode)
+                    else 0
+                ),
+            ),
+            task_git_pointer=WorktreePointerIdentity(
+                task_pointer_details.st_dev,
+                task_pointer_details.st_ino,
+                (
+                    task_pointer_details.st_ctime_ns
+                    if stat.S_ISREG(task_pointer_details.st_mode)
+                    else 0
+                ),
+            ),
+            resident_git_relative=resident_git_relative,
+            task_git_relative=task_git_relative,
+        )
+        return PinnedWorktreeState(identity, *opened)
+    except BaseException:
+        for descriptor in reversed(opened):
+            os.close(descriptor)
+        raise
+
+
+def close_pinned_worktree_state(pinned: PinnedWorktreeState) -> None:
+    for descriptor in reversed(pinned.file_descriptors()):
+        os.close(descriptor)
 
 
 def revalidate_worktree_state_identity(
@@ -1140,6 +1282,7 @@ def execute(
     resource_profile: str | None,
     comparison_key: str | None,
     timeout_seconds: float | None,
+    pass_fds: tuple[int, ...] = (),
 ) -> int:
     time_report: Path | None = None
     systemd_run: str | None = None
@@ -1190,6 +1333,7 @@ def execute(
             cwd=cwd,
             env=environment,
             start_new_session=isolated_process_group,
+            pass_fds=pass_fds,
         )
     except BaseException:
         if time_report is not None:
@@ -1436,7 +1580,6 @@ def run(
     state_root = runtime_state_root(state_base, runtime_contract)
     ensure_private_directory(state_root)
 
-    cache_arguments_for_bwrap: list[str] = []
     private_copy_candidates: list[tuple[CacheSpec, Path, Path]] = []
     for spec in cache_specs:
         resident_cache = resident / spec.path
@@ -1447,9 +1590,6 @@ def run(
             raise RuntimeError(f"task cache path is not a plain directory: {spec.path}")
         task_cache.mkdir(mode=0o700, parents=True, exist_ok=True)
         if spec.mode == "ro":
-            cache_arguments_for_bwrap.extend(
-                ["--ro-bind", os.fspath(resident_cache), os.fspath(resident_cache)]
-            )
             continue
         cache_identity = hashlib.sha256(os.fsencode(spec.path)).hexdigest()[:16]
         if spec.mode in ("private", "private-copy"):
@@ -1459,27 +1599,16 @@ def run(
                 ensure_private_directory(private)
             else:
                 private_copy_candidates.append((spec, resident_cache, private))
-            cache_arguments_for_bwrap.extend(
-                ["--bind", os.fspath(private), os.fspath(resident_cache)]
-            )
             continue
         upper = state_root / f"upper-{cache_identity}"
         work = state_root / f"work-{cache_identity}"
         ensure_private_directory(upper)
         ensure_private_directory(work)
-        cache_arguments_for_bwrap.extend(
-            [
-                "--overlay-src",
-                os.fspath(resident_cache),
-                "--overlay",
-                os.fspath(upper),
-                os.fspath(work),
-                os.fspath(resident_cache),
-            ]
-        )
 
     lock_fd: int | None = None
     git_view: tempfile.TemporaryDirectory[str] | None = None
+    pinned_worktree: PinnedWorktreeState | None = None
+    cache_source_fds: list[int] = []
     try:
         lock_path = state_root / "lock"
         lock_fd = os.open(
@@ -1492,9 +1621,23 @@ def run(
         except BlockingIOError as error:
             raise RuntimeError("this task's hot state is already in use") from error
 
+        pinned_worktree = pin_worktree_state(
+            resident,
+            task,
+            common_git,
+            resident_git,
+            task_git,
+            resident_git_relative,
+            task_git_relative,
+        )
+        if (
+            implicit_worktree_identity is not None
+            and pinned_worktree.identity != implicit_worktree_identity
+        ):
+            raise RuntimeError("worktree generation changed during hot-state preflight")
         if implicit_worktree_identity is not None:
             revalidate_worktree_state_identity(
-                implicit_worktree_identity,
+                pinned_worktree.identity,
                 resident,
                 task,
                 common_git,
@@ -1523,32 +1666,84 @@ def run(
         git_pointer.write_text(f"gitdir: {stable_task_git}\n", encoding="utf-8")
         git_pointer.chmod(0o600)
 
-        if implicit_worktree_identity is not None:
-            revalidate_worktree_state_identity(
-                implicit_worktree_identity,
-                resident,
-                task,
-                common_git,
-                resident_git,
-                task_git,
-                resident_git_relative,
-                task_git_relative,
-            )
-
         environment = bound_environment or os.environ.copy()
         if runtime_bin is None:
             rust_tool_environment(task, resolved_command, environment)
+
+        revalidate_worktree_state_identity(
+            pinned_worktree.identity,
+            resident,
+            task,
+            common_git,
+            resident_git,
+            task_git,
+            resident_git_relative,
+            task_git_relative,
+        )
+
+        cache_arguments_for_bwrap: list[str] = []
+        for spec in cache_specs:
+            resident_cache = resident / spec.path
+            resident_cache_fd, _ = pin_plain_object(
+                spec.path,
+                "resident cache",
+                directory=True,
+                dir_fd=pinned_worktree.resident_root_fd,
+                require_current_user=False,
+            )
+            cache_source_fds.append(resident_cache_fd)
+            if spec.mode == "ro":
+                cache_arguments_for_bwrap.extend(
+                    [
+                        "--ro-bind-fd",
+                        str(resident_cache_fd),
+                        os.fspath(resident_cache),
+                    ]
+                )
+                continue
+            cache_identity = hashlib.sha256(os.fsencode(spec.path)).hexdigest()[:16]
+            if spec.mode in ("private", "private-copy"):
+                private_prefix = (
+                    "private" if spec.mode == "private" else "private-copy"
+                )
+                private = state_root / f"{private_prefix}-{cache_identity}"
+                private_fd, _ = pin_plain_object(
+                    private,
+                    "private cache",
+                    directory=True,
+                )
+                cache_source_fds.append(private_fd)
+                cache_arguments_for_bwrap.extend(
+                    ["--bind-fd", str(private_fd), os.fspath(resident_cache)]
+                )
+                continue
+            upper = state_root / f"upper-{cache_identity}"
+            work = state_root / f"work-{cache_identity}"
+            cache_arguments_for_bwrap.extend(
+                [
+                    "--overlay-src",
+                    f"/proc/self/fd/{resident_cache_fd}",
+                    "--overlay",
+                    os.fspath(upper),
+                    os.fspath(work),
+                    os.fspath(resident_cache),
+                ]
+            )
+
         arguments = [
             os.path.abspath(bubblewrap),
             "--die-with-parent",
             "--dev-bind",
             "/",
             "/",
-            "--bind",
-            os.fspath(common_git),
+            "--bind-fd",
+            str(pinned_worktree.common_git_directory_fd),
             os.fspath(git_common_view),
-            "--bind",
-            os.fspath(task),
+            "--bind-fd",
+            str(pinned_worktree.task_git_directory_fd),
+            os.fspath(stable_task_git),
+            "--bind-fd",
+            str(pinned_worktree.task_root_fd),
             os.fspath(resident),
             "--ro-bind",
             os.fspath(git_pointer),
@@ -1577,8 +1772,18 @@ def run(
             resource_profile=resource_profile,
             comparison_key=comparison_key,
             timeout_seconds=timeout_seconds,
+            pass_fds=(
+                pinned_worktree.common_git_directory_fd,
+                pinned_worktree.task_git_directory_fd,
+                pinned_worktree.task_root_fd,
+                *cache_source_fds,
+            ),
         )
     finally:
+        for descriptor in reversed(cache_source_fds):
+            os.close(descriptor)
+        if pinned_worktree is not None:
+            close_pinned_worktree_state(pinned_worktree)
         if lock_fd is not None:
             os.close(lock_fd)
         if git_view is not None:
