@@ -1,0 +1,117 @@
+name: Cultist advisory
+
+on:
+  pull_request:
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+  push:
+    branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cultist-advisory-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  diff:
+    name: change-scoped evidence
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    continue-on-error: true
+    env:
+      CULTIST_REV: 3d5311e8f78ff95a8b112b36c92eb7d92bb290b3
+
+    steps:
+      - name: Check out repository history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          show-progress: false
+
+      - name: Install pinned Rust toolchain
+        run: >-
+          rustup toolchain install 1.97.1
+          --profile minimal
+          --no-self-update
+
+      - name: Install exact Cultist revision
+        run: |
+          set -euo pipefail
+          cargo install \
+            --git https://github.com/teamleaderleo/cultist \
+            --rev "$CULTIST_REV" \
+            --locked \
+            --root "$RUNNER_TEMP/cultist-install" \
+            cargo-cultist
+          echo "$RUNNER_TEMP/cultist-install/bin" >> "$GITHUB_PATH"
+
+      - name: Resolve comparison base
+        id: base
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BASE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            base="$PR_BASE"
+          else
+            base="$PUSH_BASE"
+          fi
+
+          if [[ -z "$base" || "$base" == "0000000000000000000000000000000000000000" ]]; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [[ ! "$base" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "comparison base is not an exact Git commit" >&2
+            exit 1
+          fi
+          git cat-file -e "$base^{commit}"
+          echo "available=true" >> "$GITHUB_OUTPUT"
+          echo "revision=$base" >> "$GITHUB_OUTPUT"
+
+      # Start with the measured quiet surface. A repository-wide scan currently
+      # raises deliberate naming partitions and would add noise rather than signal.
+      - name: Inspect change-scoped Rust evidence
+        if: steps.base.outputs.available == 'true'
+        env:
+          CULTIST_BASE: ${{ steps.base.outputs.revision }}
+        run: |
+          set -euo pipefail
+          report="$RUNNER_TEMP/cultist-diff.json"
+          cargo-cultist diff --base "$CULTIST_BASE" --format json . > "$report"
+          jq -e '
+            .schema_version == 1 and
+            .analysis == "diff-precedent" and
+            (.claims | type == "array") and
+            (.findings | type == "array")
+          ' "$report" >/dev/null
+          jq '{schema_version, analysis, claims, findings}' "$report"
+
+          {
+            echo "## Cultist change-scoped evidence"
+            echo
+            echo "- Cultist revision: \`$CULTIST_REV\`"
+            echo "- Comparison base: \`$CULTIST_BASE\`"
+            echo "- Claims: $(jq '.claims | length' "$report")"
+            echo "- Findings: $(jq '.findings | length' "$report")"
+            echo
+            echo "This check is advisory and does not run the noisier repository-wide scan."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Explain unavailable comparison base
+        if: steps.base.outputs.available != 'true'
+        run: |
+          {
+            echo "## Cultist change-scoped evidence"
+            echo
+            echo "No non-zero comparison commit was available for this event."
+          } >> "$GITHUB_STEP_SUMMARY"
