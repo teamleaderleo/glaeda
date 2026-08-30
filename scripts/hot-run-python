@@ -1904,6 +1904,8 @@ def main() -> int:
         parser.error("a command is required after --")
     if arguments.comparison_key is not None and arguments.measurement is None:
         parser.error("--comparison-key requires --measurement")
+    if arguments.resource_profile is not None and arguments.timeout is None:
+        parser.error("--resource-profile requires --timeout")
     try:
         return run(
             arguments.resident,

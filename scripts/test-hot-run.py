@@ -1988,6 +1988,37 @@ class HotRunTests(unittest.TestCase):
             self.assertEqual(report["signal"], signal.SIGINT)
             self.assertIsNone(report["user_cpu_seconds"])
 
+    def test_resource_profiles_require_timeout_before_observation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            missing_resident = root / "missing-resident"
+            missing_task = root / "missing-task"
+            for profile in ("big-red-heavy", "big-red-background"):
+                with self.subTest(profile=profile):
+                    result = subprocess.run(
+                        [
+                            os.fspath(HOT_RUN),
+                            "--resident",
+                            os.fspath(missing_resident),
+                            "--task",
+                            os.fspath(missing_task),
+                            "--resource-profile",
+                            profile,
+                            "--",
+                            "/bin/true",
+                        ],
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn("--resource-profile requires --timeout", result.stderr)
+                    self.assertNotIn("hot-run error:", result.stderr)
+                    self.assertFalse(missing_resident.exists())
+                    self.assertFalse(missing_task.exists())
+
     @unittest.skipUnless(shutil.which("systemd-run"), "systemd-run is unavailable")
     def test_heavy_profile_preserves_status_and_is_recorded(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2001,6 +2032,8 @@ class HotRunTests(unittest.TestCase):
                     os.fspath(ROOT),
                     "--resource-profile",
                     "big-red-heavy",
+                    "--timeout",
+                    "3",
                     "--measurement",
                     os.fspath(measurement),
                     "--",
