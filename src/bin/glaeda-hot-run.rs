@@ -570,7 +570,19 @@ fn seal_cpu_affinity() -> Result<(), String> {
     let architecture = std::env::consts::ARCH
         .try_into()
         .map_err(|_| "the host architecture is unsupported".to_owned())?;
-    let rules = BTreeMap::from([(libc::SYS_sched_setaffinity, Vec::new())]);
+    let mut rules = BTreeMap::new();
+    #[cfg(target_arch = "x86_64")]
+    {
+        // x32 shares AUDIT_ARCH_X86_64 with the native ABI but sets bit 30 in
+        // seccomp_data.nr. Seal both encodings even when libc already exposes
+        // the bit-set number from an x32 build.
+        const X32_SYSCALL_BIT: i64 = 0x4000_0000;
+        let native_number = libc::SYS_sched_setaffinity & !X32_SYSCALL_BIT;
+        rules.insert(native_number, Vec::new());
+        rules.insert(native_number | X32_SYSCALL_BIT, Vec::new());
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    rules.insert(libc::SYS_sched_setaffinity, Vec::new());
     let filter = SeccompFilter::new(
         rules,
         SeccompAction::Allow,
@@ -1922,7 +1934,7 @@ fn execute_command(execution: CommandExecution<'_>) -> Result<CommandResult, Str
         arguments = [entry, arguments].concat();
     }
     if let Some(systemd_run) = systemd_run {
-        let mut properties = resource_profile
+        let properties = resource_profile
             .expect("profiled command has a resource profile")
             .scope_properties()
             .iter()

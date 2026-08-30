@@ -385,6 +385,24 @@ fn cpu_granted_worker_cannot_widen_its_admitted_affinity() {
     ));
     fs::create_dir(&directory).unwrap();
     let result_file = directory.join("result.txt");
+    #[cfg(target_arch = "x86_64")]
+    let python = format!(
+        "import ctypes,os\n\
+         native_errno='none'\n\
+         try: os.sched_setaffinity(0,{{{reserved},{other}}})\n\
+         except OSError as error: native_errno=str(error.errno)\n\
+         word_bits=ctypes.sizeof(ctypes.c_ulong)*8\n\
+         mask_type=ctypes.c_ulong*((max({reserved},{other})//word_bits)+1)\n\
+         mask=mask_type()\n\
+         for cpu in ({reserved},{other}): mask[cpu//word_bits] |= 1 << (cpu%word_bits)\n\
+         libc=ctypes.CDLL(None,use_errno=True)\n\
+         ctypes.set_errno(0)\n\
+         result=libc.syscall(0x400000cb,0,ctypes.sizeof(mask),ctypes.byref(mask))\n\
+         alternate_errno='none' if result == 0 else str(ctypes.get_errno())\n\
+         open({:?},'w').write(native_errno+'\\n'+alternate_errno+'\\n'+','.join(map(str,sorted(os.sched_getaffinity(0)))))",
+        result_file.to_str().unwrap()
+    );
+    #[cfg(not(target_arch = "x86_64"))]
     let python = format!(
         "import os; errno='none';\ntry: os.sched_setaffinity(0,{{{reserved},{other}}})\nexcept OSError as error: errno=str(error.errno)\nopen({:?},'w').write(errno+'\\n'+','.join(map(str,sorted(os.sched_getaffinity(0)))))",
         result_file.to_str().unwrap()
@@ -410,6 +428,16 @@ fn cpu_granted_worker_cannot_widen_its_admitted_affinity() {
         .status()
         .unwrap();
     assert!(status.success());
+    #[cfg(target_arch = "x86_64")]
+    assert_eq!(
+        fs::read_to_string(&result_file).unwrap(),
+        format!(
+            "{}\n{}\n{reserved}",
+            rustix::io::Errno::PERM.raw_os_error(),
+            rustix::io::Errno::PERM.raw_os_error()
+        )
+    );
+    #[cfg(not(target_arch = "x86_64"))]
     assert_eq!(
         fs::read_to_string(&result_file).unwrap(),
         format!("{}\n{reserved}", rustix::io::Errno::PERM.raw_os_error())
