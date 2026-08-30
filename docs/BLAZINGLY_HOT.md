@@ -225,6 +225,17 @@ requests remain on `scripts/hot-run` rather than being silently weakened. This i
 observation-only ultra-trusted execution path. It grants no lease, cache, residency, validation,
 publication, or cleanup authority.
 
+When the compiled front door records an exact `target:native` declaration, its schema-v6 receipt
+also carries a path-private `native_target_observation`. Sequential pre-command observations bind
+the checkout commit/tree/materialization and checkout-local Cargo target generation; an
+unavailable pre-command observation refuses to run an unbound measurement. After the command,
+checkout and target observations are attempted independently. Either may be explicitly
+`unavailable` without erasing the command's exit, signal, CPU, RSS, pressure or timing result.
+Observation time remains outside command timing and resource accounting and is reported separately
+for before, after, their sum, and command-plus-observation wall time. The two snapshots are not an
+atomic transaction. They are non-authoritative rebuild-value evidence only and grant no target
+currentness, compatibility, adoption, retention, cleanup or deletion authority.
+
 `private` starts with an empty directory and retains the task's later writes without OverlayFS
 copy-up. `private-copy` atomically seeds that directory once from the warm resident parent with GNU
 `cp --reflink=auto`, then reuses the private lineage on later invocations. The copy uses reflinks
