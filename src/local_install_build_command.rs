@@ -132,7 +132,8 @@ impl LocalInstallBuildCommandContext {
     /// # Errors
     ///
     /// Returns an error unless all paths are absolute normalized non-root UTF-8 paths, source and
-    /// build roots are disjoint, and the toolchain executable paths are distinct.
+    /// build roots are disjoint, and the toolchain executable paths are distinct. Generation-
+    /// specific encoded-flag restrictions are checked when the command is planned.
     pub fn new(
         source_root: impl Into<PathBuf>,
         build_root: impl Into<PathBuf>,
@@ -308,7 +309,8 @@ impl std::error::Error for LocalInstallBuildCommandError {}
 ///
 /// # Errors
 ///
-/// Returns an error for jobs outside 1..=4 or canonical policy identity encoding failure.
+/// Returns an error for jobs outside 1..=4, a Glaeda-v2 source/build root that contains Cargo's
+/// encoded-rustflags separator, or canonical policy identity encoding failure.
 pub fn plan_local_install_build_command(
     build: &LocalInstallBuildPlan,
     platform: LocalInstallPlatform,
@@ -324,6 +326,10 @@ pub fn plan_local_install_build_command(
     }
 
     let identity_generation = build.source.identity_generation();
+    if identity_generation == LocalInstallIdentityGeneration::GlaedaV2 {
+        validate_glaeda_path_remap_root(&context.source_root)?;
+        validate_glaeda_path_remap_root(&context.build_root)?;
+    }
     let system_path = system_path(platform);
     let policy = policy(build, platform, jobs, system_path)?;
     let binary_name = match identity_generation {
@@ -518,6 +524,21 @@ fn private_utf8(path: &Path) -> String {
     path.to_str()
         .expect("private paths are validated as UTF-8")
         .to_owned()
+}
+
+fn validate_glaeda_path_remap_root(path: &Path) -> Result<(), LocalInstallBuildCommandError> {
+    if path
+        .to_str()
+        .expect("private paths are validated as UTF-8")
+        .contains(RUSTFLAGS_SEPARATOR)
+    {
+        return Err(error(
+            LocalInstallBuildCommandErrorKind::UnsafePrivatePath,
+            "unsafe_path_remap_root",
+            "local self-build path remap root is unsafe for encoded Rust flags",
+        ));
+    }
+    Ok(())
 }
 
 fn glaeda_encoded_rustflags(context: &LocalInstallBuildCommandContext) -> String {
@@ -778,6 +799,48 @@ mod tests {
             glaeda_encoded_rustflags(&context),
             "--remap-path-prefix=/private-b/source=/glaeda-private-context/source\u{1f}--remap-path-prefix=/private-b-build=/glaeda-private-context"
         );
+    }
+
+    #[test]
+    fn glaeda_path_remap_roots_reject_the_encoded_separator() {
+        for (source_root, build_root) in [
+            (
+                "/private-source\u{1f}-Clinker=/private-tool",
+                "/private-build",
+            ),
+            ("/private-source", "/private-build\u{1f}--cfg=unexpected"),
+        ] {
+            let context = LocalInstallBuildCommandContext::new(
+                source_root,
+                build_root,
+                "/reviewed-toolchain/cargo",
+                "/reviewed-toolchain/rustc",
+                "/reviewed-toolchain/rustdoc",
+            )
+            .expect("separator is valid in a lexical Unix path");
+
+            let error = plan_local_install_build_command(
+                &build('a'),
+                LocalInstallPlatform::Linux,
+                &context,
+                2,
+            )
+            .expect_err("Glaeda path remap must reject an encoded argument separator");
+            assert_eq!(
+                error.kind,
+                LocalInstallBuildCommandErrorKind::UnsafePrivatePath
+            );
+            assert_eq!(error.code, "unsafe_path_remap_root");
+            assert!(!format!("{error:?}").contains("private-"));
+
+            plan_local_install_build_command(
+                &legacy_build('a'),
+                LocalInstallPlatform::Linux,
+                &context,
+                2,
+            )
+            .expect("legacy command has no encoded path-remap environment");
+        }
     }
 
     #[test]
