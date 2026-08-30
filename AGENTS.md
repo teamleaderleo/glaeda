@@ -156,6 +156,15 @@ Do not run filesystem formatting, VDO creation, VM replacement, disk deletion, o
 ## Multi-agent coordination
 
 - Follow `docs/AGENT_COORDINATION.md` whenever work is delegated between agents.
+- On this operator-owned repository, an authenticated interactive agent may create ordinary
+  issues, branches, commits, pull requests, comments, reviews, and repository merges when the
+  current task calls for them and the action remains inside its granted scope. Do not pause for a
+  separate human approval merely to use the normal repository workflow.
+- Labels, assignees, and claim comments are optional descriptive signals, never prerequisites or
+  authority. A missing label must not block work, and agents must not invent coordination labels
+  merely to reserve a lane.
+- Restrictions on future unattended product-driven issue submission apply to Glaeda automation,
+  not to an authenticated interactive agent acting under the operator's current authorization.
 - Repository implementation must finish in the active work session with an observable artifact or an explicit blocked or failed result.
 - Do not create scheduled tasks, reminders, recurring checks, or condition watches to wake, poll, or coordinate implementation agents.
 - Define the exact base SHA, owned scope, deliverable, checks, completion signal, and recovery rule before delegation.
