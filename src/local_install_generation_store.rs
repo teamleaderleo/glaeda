@@ -938,7 +938,12 @@ impl UnixLocalInstallGenerationStore {
         match fs::flock(&lock, operation) {
             Ok(()) => {
                 // This is the single retained-boundary pass for every locked public operation.
-                self.verify_boundaries()?;
+                if let Err(error) = self.verify_boundaries() {
+                    // Make the failed-acquisition release visible before an immediate retry in
+                    // this process instead of relying only on descriptor destruction timing.
+                    let _ = fs::flock(&lock, FlockOperation::Unlock);
+                    return Err(error);
+                }
                 Ok(StoreLock { lock })
             }
             Err(Errno::AGAIN) => Err(store_error(
