@@ -1,0 +1,30 @@
+#[path = "../src/local_interference_admission.rs"]
+mod local_interference_admission;
+
+use local_interference_admission::{
+    ActiveInterferenceSummary, LocalInterferenceClass, LocalInterferenceObservation,
+    LocalInterferenceRequest, LocalPressureClass, NodeControlState, QuietCompatibility,
+    compile_local_interference_admission,
+};
+
+#[test]
+fn integration_surface_is_content_free_and_non_authorizing() {
+    let result = compile_local_interference_admission(
+        LocalInterferenceRequest {
+            interference_class: LocalInterferenceClass::QuietRequired,
+            quiet_compatibility: QuietCompatibility::Conflicting,
+        },
+        LocalInterferenceObservation {
+            observed_at_unix_millis: 1_000,
+            node_control: NodeControlState::Available,
+            pressure: LocalPressureClass::Low,
+            quiet_lease: None,
+            active: ActiveInterferenceSummary::default(),
+        },
+    );
+    let encoded = serde_json::to_string(&result).expect("serializable decision");
+    assert!(encoded.contains("\"requires_new_quiet_lease\":true"));
+    assert!(encoded.contains("\"grants_authority\":false"));
+    assert!(encoded.contains("\"authorizes_execution\":false"));
+    assert!(!encoded.contains('/'));
+}
