@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Execute Glaeda's fixed verify-focused/v1 profile without source credentials.
+"""Execute one fixed Glaeda verification profile without source credentials.
 
 The caller supplies identities, never a command, argv, environment, executable, remote URL, or
 mutable ref. Local workstation configuration supplies the exact resident repository, state,
@@ -12,6 +12,7 @@ import argparse
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import selectors
@@ -26,11 +27,7 @@ from typing import IO, NoReturn
 
 
 SCHEMA_VERSION = 1
-PROFILE_ID = "verify-focused/v1"
-PROFILE_CLASS = "verify_focused"
 EXECUTION_IDENTITY_CLASS = "credentialless_project"
-RESOURCE_CLASS = "big-red-focused"
-DEADLINE_SECONDS = 600
 RUST_TOOLCHAIN = "1.97.1-x86_64-unknown-linux-gnu"
 MAX_CONTROL_OUTPUT_BYTES = 64 * 1024
 MAX_RECEIPT_BYTES = 32 * 1024
@@ -45,37 +42,83 @@ PROJECT_HOME_TMPFS_BYTES = 64 * 1024 * 1024
 SHA256_PATTERN = re.compile(r"^sha256:[a-f0-9]{64}$")
 OID_PATTERN = re.compile(r"^[a-f0-9]{40}$")
 REPOSITORY_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
-PROFILE_SPEC = {
-    "schema_version": 1,
-    "profile_id": PROFILE_ID,
-    "profile_class": PROFILE_CLASS,
-    "execution_identity_class": EXECUTION_IDENTITY_CLASS,
-    "recipe": ["scripts/verify", "focused"],
-    "rust_toolchain": RUST_TOOLCHAIN,
-    "cargo_build_jobs": 4,
-    "cargo_network": "offline",
-    "git_optional_locks": False,
-    "source_network": "none",
-    "source_output": "controller_private_bounded_digest",
-    "source_output_bytes": MAX_SOURCE_OUTPUT_BYTES,
-    "source_state": "exact_read_only",
-    "materialized_source_bytes_max": MAX_MATERIALIZED_SOURCE_BYTES,
-    "build_state": "task_private_tmpfs",
-    "build_tmpfs_bytes": TARGET_TMPFS_BYTES,
-    "package_cache": "host_public_crates_io_read_only",
-    "resource_class": RESOURCE_CLASS,
-    "deadline_seconds": DEADLINE_SECONDS,
-    "systemd_properties": [
-        "CPUQuota=400%",
-        "MemoryHigh=6G",
-        "MemoryMax=8G",
-        "TasksMax=512",
-        "RuntimeMaxSec=600",
-        "KillMode=mixed",
-        "NoNewPrivileges=yes",
-        "RestrictSUIDSGID=yes",
-    ],
-}
+@dataclass(frozen=True)
+class Profile:
+    profile_id: str
+    profile_class: str
+    resource_class: str
+    deadline_seconds: int
+    recipe_name: str
+    document_slug: str
+
+
+def fixed_profile(
+    profile_id: str,
+    profile_class: str,
+    resource_class: str,
+    deadline_seconds: int,
+    recipe_name: str,
+    document_slug: str,
+) -> Profile:
+    return Profile(
+        profile_id,
+        profile_class,
+        resource_class,
+        deadline_seconds,
+        recipe_name,
+        document_slug,
+    )
+
+
+def profile_spec(profile: Profile) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "profile_id": profile.profile_id,
+        "profile_class": profile.profile_class,
+        "execution_identity_class": EXECUTION_IDENTITY_CLASS,
+        "recipe": ["scripts/verify", profile.recipe_name],
+        "rust_toolchain": RUST_TOOLCHAIN,
+        "cargo_build_jobs": 4,
+        "cargo_network": "offline",
+        "git_optional_locks": False,
+        "source_network": "none",
+        "source_output": "controller_private_bounded_digest",
+        "source_output_bytes": MAX_SOURCE_OUTPUT_BYTES,
+        "source_state": "exact_read_only",
+        "materialized_source_bytes_max": MAX_MATERIALIZED_SOURCE_BYTES,
+        "build_state": "task_private_tmpfs",
+        "build_tmpfs_bytes": TARGET_TMPFS_BYTES,
+        "package_cache": "host_public_crates_io_read_only",
+        "resource_class": profile.resource_class,
+        "deadline_seconds": profile.deadline_seconds,
+        "systemd_properties": [
+            "CPUQuota=400%",
+            "MemoryHigh=6G",
+            "MemoryMax=8G",
+            "TasksMax=512",
+            f"RuntimeMaxSec={profile.deadline_seconds}",
+            "KillMode=mixed",
+            "NoNewPrivileges=yes",
+            "RestrictSUIDSGID=yes",
+        ],
+    }
+
+
+FOCUSED_PROFILE = fixed_profile(
+    "verify-focused/v1", "verify_focused", "big-red-focused", 600, "focused", "verify-focused"
+)
+REQUIRED_PROFILE = fixed_profile(
+    "verify-required/v1", "verify_required", "big-red-required", 1200, "required", "verify-required"
+)
+
+# Compatibility aliases for the focused profile and its existing tests/consumers.
+PROFILE_ID = FOCUSED_PROFILE.profile_id
+PROFILE_CLASS = FOCUSED_PROFILE.profile_class
+RESOURCE_CLASS = FOCUSED_PROFILE.resource_class
+DEADLINE_SECONDS = FOCUSED_PROFILE.deadline_seconds
+PROFILE_SPEC = profile_spec(FOCUSED_PROFILE)
+REQUIRED_PROFILE_SPEC = profile_spec(REQUIRED_PROFILE)
+
 ISOLATION_SPEC = {
     "filesystem": "read_only_source_task_private_tmpfs",
     "network": "none",
@@ -128,6 +171,7 @@ class Request:
     tree: str
     profile_generation: str
     command_fingerprint: str
+    profile: Profile = FOCUSED_PROFILE
 
 
 class Refusal(RuntimeError):
@@ -146,8 +190,12 @@ def exact_keys(value: dict[str, object], expected: tuple[str, ...]) -> bool:
     return set(value) == set(expected)
 
 
-def profile_generation() -> str:
-    return sha256(canonical_bytes(PROFILE_SPEC))
+def reject_json_constant(value: str) -> NoReturn:
+    raise ValueError(f"non-finite JSON number: {value}")
+
+
+def profile_generation(profile: Profile = FOCUSED_PROFILE) -> str:
+    return sha256(canonical_bytes(profile_spec(profile)))
 
 
 def exact_directory(raw: str, label: str) -> Path:
@@ -186,7 +234,9 @@ def private_state_directory(raw: str) -> Path:
     return path
 
 
-def normalize_request(arguments: argparse.Namespace) -> Request:
+def normalize_request(
+    arguments: argparse.Namespace, profile: Profile = FOCUSED_PROFILE
+) -> Request:
     repository = arguments.repository
     commit = arguments.commit
     tree = arguments.tree
@@ -196,11 +246,11 @@ def normalize_request(arguments: argparse.Namespace) -> Request:
         raise Refusal("source repository identity is invalid")
     if not OID_PATTERN.fullmatch(commit) or not OID_PATTERN.fullmatch(tree):
         raise Refusal("source commit/tree identity is invalid")
-    if generation != profile_generation():
-        raise Refusal("profile generation does not match verify-focused/v1")
+    if generation != profile_generation(profile):
+        raise Refusal(f"profile generation does not match {profile.profile_id}")
     if not SHA256_PATTERN.fullmatch(fingerprint):
         raise Refusal("command fingerprint is invalid")
-    return Request(repository, commit, tree, generation, fingerprint)
+    return Request(repository, commit, tree, generation, fingerprint, profile)
 
 
 def closed_environment(extra: dict[str, str] | None = None) -> dict[str, str]:
@@ -291,7 +341,7 @@ def open_lock(directory: Path) -> IO[bytes]:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError as error:
         lock.close()
-        raise Refusal("the exact verify-focused command is already active") from error
+        raise Refusal("the exact verification command is already active") from error
     return lock
 
 
@@ -307,21 +357,21 @@ def read_document(path: Path) -> dict[str, object] | None:
         or stat.S_IMODE(metadata.st_mode) != 0o600
         or metadata.st_size > MAX_RECEIPT_BYTES
     ):
-        raise Refusal("verify-focused state contains an unsafe document")
+        raise Refusal("verification state contains an unsafe document")
     raw = path.read_bytes()
     try:
-        value = json.loads(raw)
-    except (UnicodeError, json.JSONDecodeError) as error:
-        raise Refusal("verify-focused state is corrupt") from error
+        value = json.loads(raw, parse_constant=reject_json_constant)
+    except (UnicodeError, ValueError) as error:
+        raise Refusal("verification state is corrupt") from error
     if not isinstance(value, dict) or canonical_bytes(value) + b"\n" != raw:
-        raise Refusal("verify-focused state is noncanonical")
+        raise Refusal("verification state is noncanonical")
     return value
 
 
 def publish_document(path: Path, value: dict[str, object], *, replace: bool) -> None:
     raw = canonical_bytes(value) + b"\n"
     if len(raw) > MAX_RECEIPT_BYTES:
-        raise Refusal("verify-focused document exceeds its fixed ceiling")
+        raise Refusal("verification document exceeds its fixed ceiling")
     temporary = path.parent / f".{path.name}.creating-{os.getpid()}"
     descriptor = os.open(
         temporary,
@@ -339,7 +389,7 @@ def publish_document(path: Path, value: dict[str, object], *, replace: bool) -> 
             try:
                 os.link(temporary, path, follow_symlinks=False)
             except FileExistsError as error:
-                raise Refusal("terminal verify-focused document already exists") from error
+                raise Refusal("terminal verification document already exists") from error
             temporary.unlink()
         directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
         try:
@@ -364,7 +414,7 @@ def matches_request(document: dict[str, object], request: Request) -> bool:
         and source.get("commit") == request.commit
         and source.get("tree") == request.tree
         and isinstance(profile, dict)
-        and profile.get("id") == PROFILE_ID
+        and profile.get("id") == request.profile.profile_id
         and profile.get("generation") == request.profile_generation
     )
 
@@ -381,7 +431,8 @@ def valid_terminal_receipt(document: dict[str, object], request: Request) -> boo
     return (
         exact_keys(document, RECEIPT_KEYS)
         and matches_request(document, request)
-        and document.get("document_type") == "glaeda-verify-focused-receipt"
+        and document.get("document_type")
+        == f"glaeda-{request.profile.document_slug}-receipt"
         and document.get("authority") == "physical_execution_observation"
         and document.get("execution_identity_class") == EXECUTION_IDENTITY_CLASS
         and document.get("contains_private_content") is False
@@ -397,19 +448,21 @@ def valid_terminal_receipt(document: dict[str, object], request: Request) -> boo
         }
         and profile
         == {
-            "id": PROFILE_ID,
-            "class": PROFILE_CLASS,
+            "id": request.profile.profile_id,
+            "class": request.profile.profile_class,
             "generation": request.profile_generation,
-            "resource_class": RESOURCE_CLASS,
-            "deadline_seconds": DEADLINE_SECONDS,
+            "resource_class": request.profile.resource_class,
+            "deadline_seconds": request.profile.deadline_seconds,
         }
         and isinstance(result, dict)
         and exact_keys(result, RESULT_KEYS)
         and terminal in {"succeeded", "failed", "timed_out", "cleanup_incomplete"}
         and isinstance(result.get("exit_code"), int)
         and not isinstance(result.get("exit_code"), bool)
+        and (terminal != "succeeded" or result["exit_code"] == 0)
         and isinstance(result.get("elapsed_seconds"), (int, float))
         and not isinstance(result.get("elapsed_seconds"), bool)
+        and math.isfinite(result["elapsed_seconds"])
         and result["elapsed_seconds"] >= 0
         and isinstance(result.get("started_at_unix_millis"), int)
         and not isinstance(result.get("started_at_unix_millis"), bool)
@@ -436,7 +489,8 @@ def valid_terminal_receipt(document: dict[str, object], request: Request) -> boo
 def valid_intent(document: dict[str, object], request: Request) -> bool:
     return (
         matches_request(document, request)
-        and document.get("document_type") == "glaeda-verify-focused-intent"
+        and document.get("document_type")
+        == f"glaeda-{request.profile.document_slug}-intent"
         and document.get("phase") in {"prepared", "executing"}
     )
 
@@ -536,10 +590,10 @@ def sandbox_command(
     cargo_root: Path,
     rustup_root: Path,
     unit_name: str,
+    profile: Profile = FOCUSED_PROFILE,
 ) -> list[str]:
-    systemd_properties = [
-        f"--property={value}" for value in PROFILE_SPEC["systemd_properties"]
-    ]
+    spec = profile_spec(profile)
+    systemd_properties = [f"--property={value}" for value in spec["systemd_properties"]]
     bubblewrap = [
         "/usr/bin/bwrap",
         "--unshare-all",
@@ -589,7 +643,7 @@ def sandbox_command(
         os.fspath(source),
         "/workspace/source",
         "--size",
-        str(TARGET_TMPFS_BYTES),
+        str(spec["build_tmpfs_bytes"]),
         "--tmpfs",
         "/workspace/target",
         "--size",
@@ -653,7 +707,7 @@ def sandbox_command(
             "0",
             "--",
             "/workspace/source/scripts/verify",
-            "focused",
+            profile.recipe_name,
         ]
     )
     return [
@@ -702,10 +756,11 @@ def execute_profile(
     rustup_root: Path,
     request: Request,
 ) -> tuple[str, int, float, bool, int, str]:
-    unit = f"glaeda-verify-focused-{request.command_fingerprint[7:39]}.service"
+    profile = request.profile
+    unit = f"glaeda-{profile.document_slug}-{request.command_fingerprint[7:39]}.service"
     started = time.monotonic()
     process = subprocess.Popen(
-        sandbox_command(source, task_root, cargo_root, rustup_root, unit),
+        sandbox_command(source, task_root, cargo_root, rustup_root, unit, profile),
         env=closed_environment({"XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}"}),
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
@@ -720,7 +775,7 @@ def execute_profile(
     tail = bytearray()
     output_exceeded = False
     forced_timeout = False
-    deadline = started + DEADLINE_SECONDS + 30
+    deadline = started + profile.deadline_seconds + 30
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -763,7 +818,7 @@ def execute_profile(
         stop_unit(unit)
         settled = unit_absent(unit)
     terminal = "succeeded" if returncode == 0 else "failed"
-    if forced_timeout or elapsed >= DEADLINE_SECONDS:
+    if forced_timeout or elapsed >= profile.deadline_seconds:
         terminal = "timed_out"
     if output_exceeded:
         terminal = "failed"
@@ -772,7 +827,7 @@ def execute_profile(
     if terminal != "succeeded" and tail:
         omitted = output_bytes - len(tail)
         print(
-            f"verify-focused failure output: tail_bytes={len(tail)} omitted_bytes={omitted}",
+            f"{profile.document_slug} failure output: tail_bytes={len(tail)} omitted_bytes={omitted}",
             file=sys.stderr,
         )
         sys.stderr.flush()
@@ -796,7 +851,7 @@ def receipt(
     settled_at_ms: int,
 ) -> dict[str, object]:
     return {
-        "document_type": "glaeda-verify-focused-receipt",
+        "document_type": f"glaeda-{request.profile.document_slug}-receipt",
         "schema_version": SCHEMA_VERSION,
         "authority": "physical_execution_observation",
         "command_fingerprint": request.command_fingerprint,
@@ -806,11 +861,11 @@ def receipt(
             "tree": request.tree,
         },
         "profile": {
-            "id": PROFILE_ID,
-            "class": PROFILE_CLASS,
+            "id": request.profile.profile_id,
+            "class": request.profile.profile_class,
             "generation": request.profile_generation,
-            "resource_class": RESOURCE_CLASS,
-            "deadline_seconds": DEADLINE_SECONDS,
+            "resource_class": request.profile.resource_class,
+            "deadline_seconds": request.profile.deadline_seconds,
         },
         "execution_identity_class": EXECUTION_IDENTITY_CLASS,
         "isolation": dict(ISOLATION_SPEC),
@@ -841,8 +896,8 @@ def emit(document: dict[str, object]) -> None:
     sys.stdout.buffer.write(canonical_bytes(document) + b"\n")
 
 
-def run(arguments: argparse.Namespace) -> int:
-    request = normalize_request(arguments)
+def run(arguments: argparse.Namespace, profile: Profile = FOCUSED_PROFILE) -> int:
+    request = normalize_request(arguments, profile)
     repository_root = exact_directory(arguments.repository_root, "resident repository")
     cargo_root = exact_directory(arguments.cargo_root, "Cargo root")
     rustup_root = exact_directory(arguments.rustup_root, "rustup root")
@@ -871,7 +926,7 @@ def run(arguments: argparse.Namespace) -> int:
         task_root.mkdir(mode=0o700)
         source = materialize(repository_root, task_root, request)
         base = {
-            "document_type": "glaeda-verify-focused-intent",
+            "document_type": f"glaeda-{profile.document_slug}-intent",
             "schema_version": SCHEMA_VERSION,
             "command_fingerprint": request.command_fingerprint,
             "source": {
@@ -879,7 +934,7 @@ def run(arguments: argparse.Namespace) -> int:
                 "commit": request.commit,
                 "tree": request.tree,
             },
-            "profile": {"id": PROFILE_ID, "generation": request.profile_generation},
+            "profile": {"id": profile.profile_id, "generation": request.profile_generation},
         }
         publish_document(intent_path, {**base, "phase": "prepared"}, replace=False)
         publish_document(intent_path, {**base, "phase": "executing"}, replace=True)
@@ -932,12 +987,12 @@ def parser() -> argparse.ArgumentParser:
     return root
 
 
-def refuse(error: BaseException) -> NoReturn:
-    message = str(error) if isinstance(error, Refusal) else "verify-focused execution failed"
+def refuse(error: BaseException, profile: Profile = FOCUSED_PROFILE) -> NoReturn:
+    message = str(error) if isinstance(error, Refusal) else f"{profile.document_slug} execution failed"
     print(
         json.dumps(
             {
-                "document_type": "glaeda-verify-focused-error",
+                "document_type": f"glaeda-{profile.document_slug}-error",
                 "schema_version": SCHEMA_VERSION,
                 "authority": "none",
                 "problem": message[:500],
@@ -950,12 +1005,12 @@ def refuse(error: BaseException) -> NoReturn:
     raise SystemExit(75)
 
 
-def main() -> int:
+def main(profile: Profile = FOCUSED_PROFILE) -> int:
     arguments = parser().parse_args()
     try:
         if arguments.command == "profile":
-            emit({**PROFILE_SPEC, "profile_generation": profile_generation()})
+            emit({**profile_spec(profile), "profile_generation": profile_generation(profile)})
             return 0
-        return run(arguments)
+        return run(arguments, profile)
     except (OSError, RuntimeError, subprocess.SubprocessError) as error:
-        refuse(error)
+        refuse(error, profile)

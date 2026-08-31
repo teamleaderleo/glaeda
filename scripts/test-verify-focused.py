@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic tests for verify-focused/v1."""
+"""Deterministic tests for the fixed credentialless verification profiles."""
 
 from __future__ import annotations
 
@@ -39,6 +39,26 @@ class VerifyFocusedTests(unittest.TestCase):
         self.assertEqual(profile["recipe"], ["scripts/verify", "focused"])
         self.assertEqual(profile["source_network"], "none")
         self.assertEqual(profile["profile_generation"], MODULE.profile_generation())
+        self.assertLess(len(completed.stdout), 2_000)
+
+    def test_required_profile_is_fixed_and_uses_repository_required_recipe(self) -> None:
+        completed = subprocess.run(
+            [sys.executable, ROOT / "scripts" / "verify-required", "profile"],
+            cwd=ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+        profile = json.loads(completed.stdout)
+        self.assertEqual(profile["profile_id"], "verify-required/v1")
+        self.assertEqual(profile["profile_class"], "verify_required")
+        self.assertEqual(profile["resource_class"], "big-red-required")
+        self.assertEqual(profile["deadline_seconds"], 1200)
+        self.assertEqual(profile["recipe"], ["scripts/verify", "required"])
+        self.assertEqual(
+            profile["profile_generation"],
+            MODULE.profile_generation(MODULE.REQUIRED_PROFILE),
+        )
         self.assertLess(len(completed.stdout), 2_000)
 
     def test_cli_has_no_remote_command_environment_or_url(self) -> None:
@@ -98,6 +118,41 @@ class VerifyFocusedTests(unittest.TestCase):
             ],
             MODULE.PROFILE_SPEC["systemd_properties"],
         )
+
+    def test_required_sandbox_selects_only_the_named_required_recipe(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in ("source", "cargo", "rustup"):
+                (root / name).mkdir()
+            (root / "cargo" / "bin").mkdir()
+            command = MODULE.sandbox_command(
+                root / "source",
+                root,
+                root / "cargo",
+                root / "rustup",
+                "exact.service",
+                MODULE.REQUIRED_PROFILE,
+            )
+        joined = "\0".join(command)
+        self.assertIn("/workspace/source/scripts/verify\0required", joined)
+        self.assertNotIn("/workspace/source/scripts/verify\0focused", joined)
+        self.assertIn("--property=RuntimeMaxSec=1200", command)
+
+    def test_required_receipt_has_distinct_profile_identity(self) -> None:
+        request = MODULE.Request(
+            "teamleaderleo/glaeda",
+            "a" * 40,
+            "b" * 40,
+            MODULE.profile_generation(MODULE.REQUIRED_PROFILE),
+            "sha256:" + "e" * 64,
+            MODULE.REQUIRED_PROFILE,
+        )
+        document = MODULE.receipt(
+            request, "succeeded", 0, 1.0, True, True, 0, MODULE.sha256(b""), 1, 2
+        )
+        self.assertEqual(document["document_type"], "glaeda-verify-required-receipt")
+        self.assertEqual(document["profile"]["id"], "verify-required/v1")
+        self.assertTrue(MODULE.valid_terminal_receipt(document, request))
 
     def test_exact_receipt_replays_without_execution(self) -> None:
         request = MODULE.Request(
@@ -167,6 +222,45 @@ class VerifyFocusedTests(unittest.TestCase):
         document = json.loads(json.dumps(original))
         document["unexpected"] = True
         self.assertFalse(MODULE.valid_terminal_receipt(document, request))
+
+    def test_required_replay_rejects_impossible_terminal_evidence(self) -> None:
+        request = MODULE.Request(
+            "teamleaderleo/glaeda",
+            "a" * 40,
+            "b" * 40,
+            MODULE.profile_generation(MODULE.REQUIRED_PROFILE),
+            "sha256:" + "f" * 64,
+            MODULE.REQUIRED_PROFILE,
+        )
+        original = MODULE.receipt(
+            request,
+            "succeeded",
+            0,
+            1.0,
+            True,
+            True,
+            0,
+            MODULE.sha256(b""),
+            1,
+            2,
+        )
+        for key, value in (
+            ("exit_code", 9),
+            ("elapsed_seconds", float("inf")),
+            ("elapsed_seconds", float("nan")),
+        ):
+            with self.subTest(key=key, value=value):
+                document = json.loads(json.dumps(original))
+                document["result"][key] = value
+                self.assertFalse(MODULE.valid_terminal_receipt(document, request))
+
+    def test_non_finite_json_state_is_corrupt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary).resolve(strict=True) / "receipt.json"
+            path.write_bytes(b'{"elapsed_seconds":Infinity}\n')
+            os.chmod(path, 0o600)
+            with self.assertRaisesRegex(MODULE.Refusal, "state is corrupt"):
+                MODULE.read_document(path)
 
     def test_reconcile_without_receipt_never_executes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

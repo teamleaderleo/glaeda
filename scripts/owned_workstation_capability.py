@@ -89,6 +89,7 @@ def build_snapshot(
     glaeda_runtime_sha256: str,
     python: dict[str, str],
     profile_generation: str,
+    verification_profile_generations: dict[str, str] | None = None,
     observed_at: dt.datetime,
     ttl_seconds: int,
 ) -> dict[str, Any]:
@@ -104,6 +105,19 @@ def build_snapshot(
         raise SnapshotError("Glaeda runtime digest is invalid")
     if not SHA256_RE.fullmatch(profile_generation):
         raise SnapshotError("Profile generation is invalid")
+    verification_profile_generations = verification_profile_generations or {}
+    profile_classes = {
+        "verify-focused/v1": "verify_focused",
+        "verify-required/v1": "verify_required",
+    }
+    if (
+        any(profile_id not in profile_classes for profile_id in verification_profile_generations)
+        or any(
+            not SHA256_RE.fullmatch(generation)
+            for generation in verification_profile_generations.values()
+        )
+    ):
+        raise SnapshotError("Verification profile generation is invalid")
     if not 30 <= ttl_seconds <= MAX_TTL_SECONDS:
         raise SnapshotError("Snapshot TTL must be between 30 and 300 seconds")
     if observed_at.tzinfo is None or observed_at.utcoffset() != dt.timedelta(0):
@@ -170,13 +184,22 @@ def build_snapshot(
             "class": "repo_query",
             "id": "repo-query/v1",
             "versionSha256": profile_generation,
-        }],
+        }, *[
+            {
+                "class": profile_classes[profile_id],
+                "id": profile_id,
+                "versionSha256": generation,
+            }
+            for profile_id, generation in sorted(verification_profile_generations.items())
+        ]],
         "projects": [{
             "heatClass": "resident_hot" if hot else "resident_cold",
             "repository": "teamleaderleo/glaeda",
             "source": {"commitOid": commit_oid, "treeOid": tree_oid},
             "sourceObjectClass": "exact_commit_and_tree_present",
-            "verificationProfiles": sorted(set(verification_profiles)),
+            "verificationProfiles": sorted(
+                set(verification_profiles) | set(verification_profile_generations)
+            ),
         }],
         "schema": SCHEMA,
     }
@@ -209,9 +232,13 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--node-generation", required=True, type=int)
     value.add_argument("--os-class", required=True, choices=("linux", "macos"))
     value.add_argument("--architecture", required=True, choices=("x86_64", "arm64"))
-    value.add_argument("--glaeda-runtime", required=True)
+    runtime = value.add_mutually_exclusive_group(required=True)
+    runtime.add_argument("--glaeda-runtime")
+    runtime.add_argument("--glaeda-runtime-sha256")
     value.add_argument("--python-interpreter", required=True)
     value.add_argument("--profile-generation", required=True)
+    value.add_argument("--verify-focused-generation")
+    value.add_argument("--verify-required-generation")
     value.add_argument("--ttl-seconds", type=int, default=180)
     return value
 
@@ -220,18 +247,30 @@ def main() -> int:
     try:
         args = parser().parse_args()
         root = Path(__file__).resolve().parent.parent
-        runtime = Path(args.glaeda_runtime).resolve(strict=True)
-        if not runtime.is_file():
-            raise SnapshotError("Glaeda runtime must resolve to a regular file")
+        if args.glaeda_runtime_sha256 is not None:
+            runtime_sha256 = sha256(args.glaeda_runtime_sha256, "Glaeda runtime")
+        else:
+            runtime = Path(args.glaeda_runtime).resolve(strict=True)
+            if not runtime.is_file():
+                raise SnapshotError("Glaeda runtime must resolve to a regular file")
+            runtime_sha256 = sha256_file(runtime)
         snapshot = build_snapshot(
             workspace_receipt(root),
             node_id=args.node_id,
             node_generation=args.node_generation,
             os_class=args.os_class,
             architecture_class=args.architecture,
-            glaeda_runtime_sha256=sha256_file(runtime),
+            glaeda_runtime_sha256=runtime_sha256,
             python=python_evidence(Path(args.python_interpreter)),
             profile_generation=args.profile_generation,
+            verification_profile_generations={
+                profile_id: generation
+                for profile_id, generation in (
+                    ("verify-focused/v1", args.verify_focused_generation),
+                    ("verify-required/v1", args.verify_required_generation),
+                )
+                if generation is not None
+            },
             observed_at=dt.datetime.now(dt.UTC),
             ttl_seconds=args.ttl_seconds,
         )

@@ -22,6 +22,29 @@ class OwnedWorkstationCapabilityTests(unittest.TestCase):
         self.assertEqual(snapshot["projects"][0]["heatClass"], "resident_hot")
         self.assertFalse(snapshot["authorizesDispatch"])
         self.assertFalse(snapshot["authorizesExecution"])
+        self.assertEqual(
+            snapshot["profiles"],
+            [
+                {
+                    "class": "repo_query",
+                    "id": "repo-query/v1",
+                    "versionSha256": "sha256:" + "c" * 64,
+                },
+                {
+                    "class": "verify_focused",
+                    "id": "verify-focused/v1",
+                    "versionSha256": "sha256:" + "e" * 64,
+                },
+                {
+                    "class": "verify_required",
+                    "id": "verify-required/v1",
+                    "versionSha256": "sha256:" + "f" * 64,
+                },
+            ],
+        )
+        self.assertIn(
+            "verify-required/v1", snapshot["projects"][0]["verificationProfiles"]
+        )
         self.assertLessEqual(len(MODULE.canonical_json(snapshot)), 4096)
 
     def test_refuses_stale_windows_unknown_nodes_and_non_314_python(self) -> None:
@@ -36,6 +59,20 @@ class OwnedWorkstationCapabilityTests(unittest.TestCase):
                 run.return_value.stderr = b""
                 MODULE.python_evidence(Path("/usr/bin/python3"))
 
+    def test_cli_accepts_an_exact_composed_runtime_digest_without_a_path(self) -> None:
+        arguments = MODULE.parser().parse_args([
+            "--node-id", "big-red",
+            "--node-generation", "1",
+            "--os-class", "linux",
+            "--architecture", "x86_64",
+            "--glaeda-runtime-sha256", "sha256:" + "a" * 64,
+            "--python-interpreter", "/usr/bin/python3.14",
+            "--profile-generation", "sha256:" + "b" * 64,
+            "--verify-required-generation", "sha256:" + "c" * 64,
+        ])
+        self.assertIsNone(arguments.glaeda_runtime)
+        self.assertEqual(arguments.glaeda_runtime_sha256, "sha256:" + "a" * 64)
+
 
 def build(**changes):
     values = {
@@ -47,6 +84,10 @@ def build(**changes):
         "glaeda_runtime_sha256": "sha256:" + "a" * 64,
         "python": {"executableSha256": "sha256:" + "b" * 64, "version": "3.14.6"},
         "profile_generation": "sha256:" + "c" * 64,
+        "verification_profile_generations": {
+            "verify-focused/v1": "sha256:" + "e" * 64,
+            "verify-required/v1": "sha256:" + "f" * 64,
+        },
         "observed_at": dt.datetime(2026, 8, 31, 5, 0, tzinfo=dt.UTC),
         "ttl_seconds": 180,
     }
