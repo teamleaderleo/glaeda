@@ -7,14 +7,17 @@
 //! grant.
 
 use std::fmt;
+use std::fs::File;
 use std::io::{self, Read as _};
+use std::os::fd::AsRawFd as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::Parser;
 use glaeda::artifact::{CommitId, GitTreeId, Sha256Digest};
 use glaeda::process::{
-    CommandSpec, MAX_CAPTURED_STDIN_BYTES, ProcessExecutor, TimedInputCommandExecutor,
+    CommandSpec, MAX_CAPTURED_STDIN_BYTES, ProcessExecutor,
+    TimedWorkingDirectoryInputCommandExecutor,
 };
 use glaeda::project_checkout_observation::{ProjectCheckoutObservation, ProjectCheckoutObserver};
 use serde::Serialize;
@@ -80,6 +83,11 @@ impl PatchCheckExpectation {
             bytes: args.bytes,
         })
     }
+}
+
+struct BoundCheckout {
+    _directory: File,
+    working_directory: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -207,11 +215,17 @@ fn evaluate_patch(
         .map_err(|_| checkout_unavailable())?;
     validate_base(&before, expectation)?;
 
-    let spec = applicability_command(repository)?;
+    let bound_checkout = bind_checkout(repository, &before)?;
+    let spec = applicability_command();
     let expected_argv = spec.displayed_argv();
     let expected_environment_keys = spec.environment.keys().cloned().collect::<Vec<_>>();
     let record = executor
-        .execute_with_input(&spec, patch, CHECK_TIMEOUT)
+        .execute_in_directory_with_input(
+            &spec,
+            &bound_checkout.working_directory,
+            patch,
+            CHECK_TIMEOUT,
+        )
         .map_err(|_| check_unavailable())?;
     if record.argv != expected_argv || record.environment_keys != expected_environment_keys {
         return Err(check_unavailable());
@@ -267,9 +281,27 @@ fn validate_base(
     Ok(())
 }
 
-fn applicability_command(repository: &Path) -> Result<CommandSpec, PatchCheckError> {
-    let repository = repository.to_str().ok_or_else(checkout_unavailable)?;
-    Ok(CommandSpec::new(GIT)
+fn bind_checkout(
+    repository: &Path,
+    observation: &ProjectCheckoutObservation,
+) -> Result<BoundCheckout, PatchCheckError> {
+    let directory = File::open(repository).map_err(|_| source_changed())?;
+    let metadata = directory.metadata().map_err(|_| source_changed())?;
+    if !observation.location_identity().matches_metadata(&metadata) {
+        return Err(source_changed());
+    }
+    let descriptor = directory.as_raw_fd();
+    if descriptor < 0 {
+        return Err(source_changed());
+    }
+    Ok(BoundCheckout {
+        _directory: directory,
+        working_directory: PathBuf::from(format!("/dev/fd/{descriptor}")),
+    })
+}
+
+fn applicability_command() -> CommandSpec {
+    CommandSpec::new(GIT)
         .argument("--no-optional-locks")
         .argument("-c")
         .argument("credential.helper=")
@@ -279,8 +311,6 @@ fn applicability_command(repository: &Path) -> Result<CommandSpec, PatchCheckErr
         .argument("core.hooksPath=/dev/null")
         .argument("-c")
         .argument("diff.external=")
-        .argument("-C")
-        .argument(repository)
         .argument("apply")
         .argument("--check")
         .argument("--index")
@@ -297,7 +327,7 @@ fn applicability_command(repository: &Path) -> Result<CommandSpec, PatchCheckErr
         .environment("GIT_PROTOCOL_FROM_USER", "0")
         .environment("GIT_TERMINAL_PROMPT", "0")
         .environment("LANG", "C")
-        .environment("LC_ALL", "C"))
+        .environment("LC_ALL", "C")
 }
 
 fn validate_patch_identity(
@@ -633,6 +663,92 @@ mod tests {
                 .expect_err("base refusal")
                 .kind,
             PatchCheckErrorKind::BaseMismatch
+        );
+    }
+
+    #[test]
+    fn replaced_checkout_is_refused_before_descriptor_binding() {
+        let replacement = fixture();
+        let fixture = fixture();
+        let observer = ProjectCheckoutObserver::new(GIT).expect("observer");
+        let before = observer
+            .observe(&fixture.root, &ProcessExecutor)
+            .expect("initial observation");
+        let parked = fixture.root.with_file_name(format!(
+            "{}-parked",
+            fixture
+                .root
+                .file_name()
+                .expect("fixture name")
+                .to_string_lossy()
+        ));
+
+        fs::rename(&fixture.root, &parked).expect("park original");
+        fs::rename(&replacement.root, &fixture.root).expect("install replacement");
+        let result = bind_checkout(&fixture.root, &before);
+        fs::rename(&fixture.root, &replacement.root).expect("restore replacement path");
+        fs::rename(&parked, &fixture.root).expect("restore original");
+
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("replacement must fail closed before applicability"),
+        };
+        assert_eq!(error.kind, PatchCheckErrorKind::SourceChanged);
+        assert_eq!(
+            observer
+                .observe(&fixture.root, &ProcessExecutor)
+                .expect("restored observation"),
+            before
+        );
+    }
+
+    #[test]
+    fn held_checkout_descriptor_survives_a_to_b_to_a_path_replacement() {
+        let replacement = fixture();
+        let fixture = fixture();
+        fs::write(replacement.root.join("example.txt"), "replacement\n")
+            .expect("dirty replacement");
+        let observer = ProjectCheckoutObserver::new(GIT).expect("observer");
+        let before = observer
+            .observe(&fixture.root, &ProcessExecutor)
+            .expect("initial observation");
+        let bound = bind_checkout(&fixture.root, &before).expect("bound checkout");
+        let parked = fixture.root.with_file_name(format!(
+            "{}-parked",
+            fixture
+                .root
+                .file_name()
+                .expect("fixture name")
+                .to_string_lossy()
+        ));
+
+        fs::rename(&fixture.root, &parked).expect("park original");
+        fs::rename(&replacement.root, &fixture.root).expect("install replacement");
+        assert!(!git_output(&fixture.root, &["status", "--porcelain=v1"]).is_empty());
+        let spec = applicability_command();
+        let result = ProcessExecutor.execute_in_directory_with_input(
+            &spec,
+            &bound.working_directory,
+            PATCH,
+            CHECK_TIMEOUT,
+        );
+        fs::rename(&fixture.root, &replacement.root).expect("restore replacement path");
+        fs::rename(&parked, &fixture.root).expect("restore original");
+
+        let record = result.expect("descriptor-bound applicability");
+        assert!(record.success);
+        assert_eq!(record.status, Some(0));
+        assert!(
+            !record
+                .argv
+                .join(" ")
+                .contains(fixture.root.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            observer
+                .observe(&fixture.root, &ProcessExecutor)
+                .expect("restored observation"),
+            before
         );
     }
 

@@ -240,6 +240,27 @@ pub trait TimedWorkingDirectoryCommandExecutor: TimedCommandExecutor {
     ) -> io::Result<ExecutionRecord>;
 }
 
+pub trait TimedWorkingDirectoryInputCommandExecutor: TimedCommandExecutor {
+    /// Execute one explicit program from one private working directory with bounded plain stdin.
+    ///
+    /// This composes the reviewed working-directory and plain-input boundaries: input bytes are
+    /// written exactly once, the working directory never enters the execution record, output stays
+    /// bounded, and timeout/process-group cleanup retains the ordinary timed-executor contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidInput` for an invalid working directory, timeout, or oversized input.
+    /// Spawn, input-write, capture, output-limit, and timeout failures retain the existing process
+    /// boundary.
+    fn execute_in_directory_with_input(
+        &self,
+        spec: &CommandSpec,
+        working_directory: &Path,
+        input: &[u8],
+        timeout: Duration,
+    ) -> io::Result<ExecutionRecord>;
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ProcessExecutor;
 
@@ -286,6 +307,27 @@ impl TimedWorkingDirectoryCommandExecutor for ProcessExecutor {
             spec,
             Some(timeout),
             None,
+            Some(working_directory),
+            &ThreadCaptureSpawner,
+        )
+    }
+}
+
+impl TimedWorkingDirectoryInputCommandExecutor for ProcessExecutor {
+    fn execute_in_directory_with_input(
+        &self,
+        spec: &CommandSpec,
+        working_directory: &Path,
+        input: &[u8],
+        timeout: Duration,
+    ) -> io::Result<ExecutionRecord> {
+        validate_timeout(timeout)?;
+        validate_plain_stdin(input)?;
+        validate_working_directory(working_directory)?;
+        execute_process_with_working_directory_input_spawner(
+            spec,
+            Some(timeout),
+            Some(input),
             Some(working_directory),
             &ThreadCaptureSpawner,
         )
@@ -972,8 +1014,8 @@ mod tests {
         CaptureEvent, CaptureThreadSpawner, CapturedStream, CommandExecutor, CommandSpec,
         MAX_CAPTURED_STDIN_BYTES, MAX_CAPTURED_STREAM_BYTES, MAX_COMMAND_TIMEOUT, ProcessExecutor,
         REDACTED, ThreadCaptureSpawner, TimedCommandExecutor, TimedInputCommandExecutor,
-        TimedWorkingDirectoryCommandExecutor, Zeroizing, execute_process_with_input_spawner,
-        execute_process_with_spawner,
+        TimedWorkingDirectoryCommandExecutor, TimedWorkingDirectoryInputCommandExecutor, Zeroizing,
+        execute_process_with_input_spawner, execute_process_with_spawner,
     };
 
     struct FailingCaptureSpawner {
@@ -1208,6 +1250,40 @@ mod tests {
                 .expect_err("invalid cwd must fail before spawn");
             assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         }
+        fs::remove_dir(fixture)?;
+        Ok(())
+    }
+
+    #[test]
+    fn timed_working_directory_input_combines_private_cwd_and_bounded_stdin() -> io::Result<()> {
+        let python = Path::new("/usr/bin/python3");
+        if !python.is_file() {
+            return Ok(());
+        }
+        let fixture = timeout_fixture_directory()?;
+        let script = "import os,sys; sys.stdout.buffer.write(os.getcwd().encode()+b'\\n'+sys.stdin.buffer.read())";
+        let record = ProcessExecutor.execute_in_directory_with_input(
+            &CommandSpec::new(python).argument("-c").argument(script),
+            &fixture,
+            b"bounded-input",
+            Duration::from_secs(1),
+        )?;
+        assert!(record.success);
+        assert_eq!(
+            record.stdout,
+            format!("{}\nbounded-input", fixture.to_string_lossy())
+        );
+
+        let oversized = vec![b'x'; MAX_CAPTURED_STDIN_BYTES + 1];
+        let error = ProcessExecutor
+            .execute_in_directory_with_input(
+                &CommandSpec::new("/absolute/program/that/must/not/exist"),
+                &fixture,
+                &oversized,
+                Duration::from_secs(1),
+            )
+            .expect_err("oversized input must fail before spawn");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         fs::remove_dir(fixture)?;
         Ok(())
     }
