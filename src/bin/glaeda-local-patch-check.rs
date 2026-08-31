@@ -371,6 +371,8 @@ fn read_tree_command(
 
 fn applicability_command(repository: &Path, index: &Path) -> Result<CommandSpec, PatchCheckError> {
     Ok(git_command(repository, index)?
+        .argument("-c")
+        .argument("apply.ignoreWhitespace=false")
         .argument("apply")
         .argument("--check")
         .argument("--cached")
