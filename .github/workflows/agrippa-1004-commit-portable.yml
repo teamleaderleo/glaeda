@@ -42,7 +42,7 @@ jobs:
 
       - name: Require focused source delta
         run: |
-          git diff --name-only | sort > /tmp/actual-paths
+          { git diff --name-only; git ls-files --others --exclude-standard; } | sort -u > /tmp/actual-paths
           cat > /tmp/expected-paths <<'EOF'
           src/bin/glaeda-local-patch-check.rs
           src/process.rs
