@@ -48,8 +48,8 @@ class OwnedWorkstationCapabilityTests(unittest.TestCase):
         self.assertLessEqual(len(MODULE.canonical_json(snapshot)), 4096)
 
     def test_refuses_stale_windows_unknown_nodes_and_non_314_python(self) -> None:
-        with self.assertRaisesRegex(MODULE.SnapshotError, "between 30 and 300"):
-            build(ttl_seconds=301)
+        with self.assertRaisesRegex(MODULE.SnapshotError, "between 30 and 1800"):
+            build(ttl_seconds=1801)
         with self.assertRaisesRegex(MODULE.SnapshotError, "Node ID"):
             build(node_id="Air Blue")
         with self.assertRaisesRegex(MODULE.SnapshotError, "Python 3.14"):

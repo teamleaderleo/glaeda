@@ -16,7 +16,7 @@ from typing import Any
 
 SCHEMA = "glaeda-owned-workstation-capability/v1"
 MAX_SNAPSHOT_BYTES = 4096
-MAX_TTL_SECONDS = 300
+MAX_TTL_SECONDS = 1800
 SHA256_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 OID_RE = re.compile(r"[0-9a-f]{40}\Z")
 NODE_RE = re.compile(r"[a-z0-9][a-z0-9-]{1,63}\Z")
@@ -119,7 +119,7 @@ def build_snapshot(
     ):
         raise SnapshotError("Verification profile generation is invalid")
     if not 30 <= ttl_seconds <= MAX_TTL_SECONDS:
-        raise SnapshotError("Snapshot TTL must be between 30 and 300 seconds")
+        raise SnapshotError("Snapshot TTL must be between 30 and 1800 seconds")
     if observed_at.tzinfo is None or observed_at.utcoffset() != dt.timedelta(0):
         raise SnapshotError("Observation time must be UTC")
 

@@ -54,7 +54,10 @@ class VerifyFocusedTests(unittest.TestCase):
         self.assertEqual(profile["profile_class"], "verify_required")
         self.assertEqual(profile["resource_class"], "big-red-required")
         self.assertEqual(profile["deadline_seconds"], 1200)
+        self.assertEqual(profile["build_tmpfs_bytes"], 8 * 1024 * 1024 * 1024)
         self.assertEqual(profile["recipe"], ["scripts/verify", "required"])
+        self.assertIn("MemoryHigh=10G", profile["systemd_properties"])
+        self.assertIn("MemoryMax=12G", profile["systemd_properties"])
         self.assertEqual(
             profile["profile_generation"],
             MODULE.profile_generation(MODULE.REQUIRED_PROFILE),
@@ -137,6 +140,9 @@ class VerifyFocusedTests(unittest.TestCase):
         self.assertIn("/workspace/source/scripts/verify\0required", joined)
         self.assertNotIn("/workspace/source/scripts/verify\0focused", joined)
         self.assertIn("--property=RuntimeMaxSec=1200", command)
+        self.assertIn("--property=MemoryHigh=10G", command)
+        self.assertIn("--property=MemoryMax=12G", command)
+        self.assertIn(str(MODULE.REQUIRED_TARGET_TMPFS_BYTES), command)
 
     def test_required_receipt_has_distinct_profile_identity(self) -> None:
         request = MODULE.Request(
