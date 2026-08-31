@@ -96,8 +96,8 @@ authority.
 byte/line/content-digest summary per phase, and retains no log. A failed phase also emits only its
 final 16 KiB as a diagnostic tail and declares the omitted byte count. Use `--output-mode stream`
 when live child output is useful; presentation does not change the phase argv or verification
-authority. `./scripts/verify required --plan-json` is the machine-readable exact command and
-execution-environment contract; do not copy that generated procedure into agent context.
+authority. `./scripts/verify required --plan-json` is the machine-readable exact phase-argv and
+declared child file-creation contract; do not copy that generated procedure into agent context.
 
 Before declaring a code change ready, run:
 

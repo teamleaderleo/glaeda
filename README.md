@@ -326,9 +326,9 @@ reference plans, and read-only host planning:
 ./scripts/verify required
 ```
 
-Use `./scripts/verify required --plan-json` when a tool needs the exact current phase argv and fixed
-execution environment. This avoids maintaining a second procedural command list in documentation
-or model context.
+Use `./scripts/verify required --plan-json` when a tool needs the exact current phase argv and
+declared child file-creation policy. This avoids maintaining a second procedural command list in
+documentation or model context.
 
 ## Project documents
 

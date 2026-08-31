@@ -18,7 +18,9 @@ The process boundary clears ambient Git configuration, credentials, hooks, lazy 
 objects, external diff/text conversion, pager, submodule recursion, and protocol access. It
 reobserves checkout, Git-directory, and origin identity before returning. It accepts no refs,
 arbitrary Git arguments, shell, network, fetch, checkout, mutation, publication, retention, or
-result-reuse authority. The complete response is capped at 128 KiB.
+result-reuse authority. The complete response is capped at 128 KiB. Any individual Git stream over
+the fixed 1 MiB capture boundary fails the query with a bounded error; very large patches therefore
+do not yet return a streaming digest or typed omission.
 
 ## Complete review-evidence loop
 
@@ -37,6 +39,8 @@ The landed path was about 114 times faster, removed four remote calls, and was 7
 the optimistic GitHub projection. Its five internal samples were 38.670, 38.962, 39.008, 50.207,
 and 64.603 ms; median maximum RSS was 8,268 KiB. The request used 28 bounded local Git processes
 and consumed 95,720 Git stdout bytes without exposing those intermediate results to the worker.
+CPU time and disk I/O were not retained for this run. The profile adds no cache or write path;
+missing objects, capture-bound overflow, or identity drift fail closed to another evidence source.
 
 Profile generation:
 `sha256:f575e0e3cd40e54ca4f868f99777e40386a2fe909cb91362f777e8881302ef65`.

@@ -127,7 +127,7 @@ pub fn glaeda_verification_command_semantics() -> [VerificationCommandSemantics;
     ]
 }
 
-/// Define `required` as the eight repository-required checks from current `AGENTS.md`.
+/// Define `required` as the eight repository-required checks emitted by the named profile.
 #[must_use]
 pub fn required_verification_command_semantics() -> VerificationCommandSemantics {
     semantics(
@@ -279,7 +279,7 @@ mod tests {
     }
 
     #[test]
-    fn required_steps_match_current_agents_commands_in_order() {
+    fn required_steps_match_named_profile_contract_in_order() {
         let required = required_verification_command_semantics();
         let steps = required.steps();
 
