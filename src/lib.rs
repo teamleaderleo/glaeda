@@ -335,6 +335,9 @@ pub mod renderprove_vision_result;
 pub mod repository_source_observation;
 /// Pure frozen preregistration and sample binding for resident backend comparisons.
 pub mod resident_backend_comparison;
+/// Bounded exact-OID repository evidence for resident trusted-agent work.
+#[cfg(unix)]
+pub mod resident_repo_query;
 /// Pure, authority-free resident-sandbox generation/config/locator catalog and strict codec.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod resident_sandbox_catalog;
