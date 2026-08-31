@@ -366,13 +366,23 @@ class VerifyPlanTests(unittest.TestCase):
             program.chmod(0o755)
             previous = os.umask(0o002)
             try:
-                returncode, summary = execute_phase(program, (), fixture, "summary")
+                for mode in ("summary", "stream"):
+                    phase_root = fixture / mode
+                    phase_root.mkdir()
+                    returncode, summary = execute_phase(program, (), phase_root, mode)
+                    self.assertEqual(returncode, 0)
+                    if mode == "summary":
+                        self.assertIsNotNone(summary)
+                    else:
+                        self.assertIsNone(summary)
+                    self.assertEqual(
+                        (phase_root / "created").stat().st_mode & 0o777, 0o755
+                    )
+                ambient_after = os.umask(0o002)
             finally:
                 os.umask(previous)
 
-            self.assertEqual(returncode, 0)
-            self.assertIsNotNone(summary)
-            self.assertEqual((fixture / "created").stat().st_mode & 0o777, 0o755)
+            self.assertEqual(ambient_after, 0o002)
 
     def test_failed_phase_still_writes_a_terminal_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
