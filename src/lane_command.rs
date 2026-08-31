@@ -4,10 +4,13 @@ use std::path::{Component, Path};
 use serde::Serialize;
 
 use crate::journal::{ExecutionLane, PlannedMutation};
+#[cfg(all(target_os = "linux", not(test)))]
+use crate::lane_executable::resolve_reviewed_environment_executable;
+#[cfg(all(test, target_os = "linux"))]
+use crate::lane_executable::test_environment_executable;
 #[cfg(target_os = "linux")]
 use crate::lane_executable::{
     VerifiedEnvironmentExecutable, is_supported_environment_executable_path,
-    resolve_reviewed_environment_executable,
 };
 use crate::process::CommandSpec;
 #[cfg(target_os = "linux")]
@@ -566,10 +569,16 @@ fn runner_user_spec(
 }
 
 #[cfg(target_os = "linux")]
+#[cfg(not(test))]
 fn reviewed_environment_program() -> Result<VerifiedEnvironmentExecutable, LaneCommandError> {
     resolve_reviewed_environment_executable().map_err(|_| {
         LaneCommandError::single("no supported reviewed environment executable is available")
     })
+}
+
+#[cfg(all(target_os = "linux", test))]
+fn reviewed_environment_program() -> Result<VerifiedEnvironmentExecutable, LaneCommandError> {
+    Ok(test_environment_executable())
 }
 
 fn require_lane(action: &PlannedMutation, expected: ExecutionLane) -> Result<(), LaneCommandError> {
