@@ -7,10 +7,14 @@ import argparse
 import datetime as dt
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
+import selectors
+import signal
 import subprocess
 import sys
+import time
 from typing import Any
 
 
@@ -83,6 +87,76 @@ def workspace_receipt(repository_root: Path) -> dict[str, Any]:
     return value
 
 
+def terminate_process_group(process: subprocess.Popen[bytes]) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except OSError:
+        if process.poll() is None:
+            process.kill()
+    try:
+        process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+
+
+def bounded_process_stdout(
+    argv: list[str],
+    *,
+    timeout: float,
+    max_stdout_bytes: int,
+    env: dict[str, str],
+) -> tuple[int, bytes]:
+    process = subprocess.Popen(
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        env=env,
+        start_new_session=True,
+    )
+    if process.stdout is None:
+        terminate_process_group(process)
+        raise SnapshotError("Bounded observer stdout is unavailable")
+    output = bytearray()
+    deadline = time.monotonic() + timeout
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ)
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(argv, timeout)
+            if not selector.select(remaining):
+                raise subprocess.TimeoutExpired(argv, timeout)
+            chunk = process.stdout.read1(
+                min(8192, max_stdout_bytes + 1 - len(output))
+            )
+            if not chunk:
+                break
+            output.extend(chunk)
+            if len(output) > max_stdout_bytes:
+                raise SnapshotError("Repo-query project observation exceeded output limit")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(argv, timeout)
+        return process.wait(timeout=remaining), bytes(output)
+    except (SnapshotError, subprocess.TimeoutExpired):
+        terminate_process_group(process)
+        raise
+    finally:
+        selector.close()
+        process.stdout.close()
+
+
+def canonical_repository(repository: str) -> str:
+    if not REPOSITORY_RE.fullmatch(repository):
+        raise SnapshotError("Repo-query capability repository is invalid")
+    return repository.casefold()
+
+
 def repo_query_project_observation(observer: Path, checkout: Path) -> dict[str, Any]:
     try:
         resolved_observer = observer.resolve(strict=True)
@@ -91,7 +165,7 @@ def repo_query_project_observation(observer: Path, checkout: Path) -> dict[str, 
         raise SnapshotError("Repo-query project observation input is unavailable") from error
     if not resolved_observer.is_file() or not resolved_checkout.is_dir():
         raise SnapshotError("Repo-query project observation input is invalid")
-    completed = subprocess.run(
+    returncode, stdout = bounded_process_stdout(
         [
             str(resolved_observer),
             "--checkout",
@@ -99,17 +173,14 @@ def repo_query_project_observation(observer: Path, checkout: Path) -> dict[str, 
             "--output",
             "json",
         ],
-        check=False,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
         timeout=15,
+        max_stdout_bytes=MAX_OBSERVATION_BYTES,
         env={"LC_ALL": "C", "PATH": "/usr/bin:/bin"},
     )
-    if completed.returncode != 0 or len(completed.stdout) > MAX_OBSERVATION_BYTES:
+    if returncode != 0:
         raise SnapshotError("Repo-query project observation failed")
     try:
-        report = json.loads(completed.stdout)
+        report = json.loads(stdout)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise SnapshotError("Repo-query project observation was not bounded JSON") from error
     return repo_query_project_from_report(report)
@@ -136,7 +207,7 @@ def repo_query_project_from_report(report: object) -> dict[str, Any]:
         raise SnapshotError("Repo-query project identity is not canonical")
     return {
         "heatClass": "resident_cold",
-        "repository": repository.removeprefix("github.com/"),
+        "repository": canonical_repository(repository.removeprefix("github.com/")),
         "source": {
             "commitOid": oid(observation.get("commit"), "project source commit"),
             "treeOid": oid(observation.get("tree"), "project source tree"),
@@ -169,7 +240,7 @@ def normalize_repo_query_project(value: object) -> dict[str, Any]:
         raise SnapshotError("Repo-query capability project is invalid")
     return {
         "heatClass": "resident_cold",
-        "repository": repository,
+        "repository": canonical_repository(repository),
         "source": {
             "commitOid": oid(source.get("commitOid"), "project source commit"),
             "treeOid": oid(source.get("treeOid"), "project source tree"),
@@ -273,10 +344,10 @@ def build_snapshot(
     }, *repo_query_projects]
     if len(projects) > MAX_PROJECTS:
         raise SnapshotError("Owned-workstation capability has too many projects")
-    repositories = [project.get("repository") for project in projects]
-    if len(repositories) != len(set(repositories)):
+    repository_keys = [str(project.get("repository")).casefold() for project in projects]
+    if len(repository_keys) != len(set(repository_keys)):
         raise SnapshotError("Owned-workstation capability has duplicate projects")
-    projects.sort(key=lambda project: str(project.get("repository")))
+    projects.sort(key=lambda project: str(project.get("repository")).casefold())
 
     snapshot = {
         "admission": {
