@@ -1,9 +1,9 @@
 //! Content-only admission for one sandbox-authored unified diff.
 //!
-//! This binary is deliberately smaller than a runner. A controller may fetch patch bytes through
-//! an authenticated provider transport, then pipe only those bytes here together with the exact
-//! identities already bound by Stensibly. This process performs no network or filesystem mutation
-//! and grants no source, execution, cleanup, or publication authority.
+//! A controller may fetch patch bytes through an authenticated provider transport, then pipe only
+//! those bytes here together with identities already bound by Stensibly. This process performs no
+//! network or filesystem mutation and grants no source, execution, cleanup, or publication
+//! authority.
 
 use std::fmt;
 use std::io::{self, Read as _};
@@ -22,7 +22,7 @@ const SHA256_HEX_BYTES: usize = 64;
 #[derive(Debug, Parser)]
 #[command(about = "Verify exact sandbox patch bytes without applying them")]
 struct Args {
-    /// Exact lowercase SHA-1 Git blob object ID expected from the provider transport.
+    /// Exact lowercase SHA-1 Git blob object ID expected from provider transport.
     #[arg(long)]
     git_blob_sha1: String,
 
@@ -30,7 +30,7 @@ struct Args {
     #[arg(long)]
     sha256: String,
 
-    /// Exact raw patch byte count expected from the transport metadata.
+    /// Exact raw patch byte count expected from transport metadata.
     #[arg(long)]
     bytes: usize,
 }
@@ -56,10 +56,7 @@ impl PatchExpectation {
         let Some(sha256_hex) = sha256.strip_prefix(SHA256_PREFIX) else {
             return Err(invalid_expectation());
         };
-        if !is_lower_hex(sha256_hex, SHA256_HEX_BYTES)
-            || bytes == 0
-            || bytes > MAX_PATCH_BYTES
-        {
+        if !is_lower_hex(sha256_hex, SHA256_HEX_BYTES) || bytes == 0 || bytes > MAX_PATCH_BYTES {
             return Err(invalid_expectation());
         }
         Ok(Self {
@@ -349,7 +346,15 @@ mod tests {
     const PATCH: &[u8] = b"diff --git a/example.txt b/example.txt\n--- a/example.txt\n+++ b/example.txt\n@@ -1 +1 @@\n-old\n+new\n";
 
     fn expectation(patch: &[u8]) -> PatchExpectation {
-        PatchExpectation::new(git_blob_sha1(patch), sha256(patch), patch.len()).expect("expectation")
+        PatchExpectation::new(git_blob_sha1(patch), sha256(patch), patch.len())
+            .expect("expectation")
+    }
+
+    fn assert_kind(
+        result: Result<PatchAdmissionReport, PatchAdmissionError>,
+        expected: PatchAdmissionErrorKind,
+    ) {
+        assert_eq!(result.expect_err("refusal").kind, expected);
     }
 
     #[test]
@@ -381,9 +386,9 @@ mod tests {
     fn refuses_changed_byte_count_and_content_digests() {
         let expected = expectation(PATCH);
         let shorter = &PATCH[..PATCH.len() - 1];
-        assert_eq!(
-            admit_patch(&expected, shorter).expect_err("byte count").kind,
-            PatchAdmissionErrorKind::ByteCountMismatch
+        assert_kind(
+            admit_patch(&expected, shorter),
+            PatchAdmissionErrorKind::ByteCountMismatch,
         );
 
         let wrong_sha = PatchExpectation::new(
@@ -392,51 +397,44 @@ mod tests {
             PATCH.len(),
         )
         .expect("expectation");
-        assert_eq!(
-            admit_patch(&wrong_sha, PATCH).expect_err("sha256").kind,
-            PatchAdmissionErrorKind::Sha256Mismatch
+        assert_kind(
+            admit_patch(&wrong_sha, PATCH),
+            PatchAdmissionErrorKind::Sha256Mismatch,
         );
 
-        let wrong_blob = PatchExpectation::new(
-            "0".repeat(40),
-            expected.sha256.clone(),
-            PATCH.len(),
-        )
-        .expect("expectation");
-        assert_eq!(
-            admit_patch(&wrong_blob, PATCH).expect_err("blob").kind,
-            PatchAdmissionErrorKind::GitBlobMismatch
+        let wrong_blob =
+            PatchExpectation::new("0".repeat(40), expected.sha256.clone(), PATCH.len())
+                .expect("expectation");
+        assert_kind(
+            admit_patch(&wrong_blob, PATCH),
+            PatchAdmissionErrorKind::GitBlobMismatch,
         );
     }
 
     #[test]
     fn refuses_oversized_invalid_utf8_nul_and_non_diff_input() {
         let oversized = vec![b'a'; MAX_PATCH_BYTES + 1];
-        let expected = expectation(PATCH);
-        assert_eq!(
-            admit_patch(&expected, &oversized).expect_err("oversized").kind,
-            PatchAdmissionErrorKind::InputTooLarge
+        assert_kind(
+            admit_patch(&expectation(PATCH), &oversized),
+            PatchAdmissionErrorKind::InputTooLarge,
         );
 
         let invalid_utf8 = [0xff_u8];
-        let expected = expectation(&invalid_utf8);
-        assert_eq!(
-            admit_patch(&expected, &invalid_utf8).expect_err("utf8").kind,
-            PatchAdmissionErrorKind::InvalidUtf8
+        assert_kind(
+            admit_patch(&expectation(&invalid_utf8), &invalid_utf8),
+            PatchAdmissionErrorKind::InvalidUtf8,
         );
 
         let nul_patch = b"--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\0\n+b\n";
-        let expected = expectation(nul_patch);
-        assert_eq!(
-            admit_patch(&expected, nul_patch).expect_err("nul").kind,
-            PatchAdmissionErrorKind::ContainsNul
+        assert_kind(
+            admit_patch(&expectation(nul_patch), nul_patch),
+            PatchAdmissionErrorKind::ContainsNul,
         );
 
         let text = b"not a diff\n";
-        let expected = expectation(text);
-        assert_eq!(
-            admit_patch(&expected, text).expect_err("diff").kind,
-            PatchAdmissionErrorKind::NotUnifiedDiff
+        assert_kind(
+            admit_patch(&expectation(text), text),
+            PatchAdmissionErrorKind::NotUnifiedDiff,
         );
     }
 
