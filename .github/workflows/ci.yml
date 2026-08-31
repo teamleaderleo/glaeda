@@ -69,6 +69,7 @@ jobs:
               Path("scripts/hot_run_impl.py"),
               Path("scripts/verify"),
               Path("scripts/verify-focused"),
+              Path("scripts/verify-required"),
               Path("scripts/verify_focused_impl.py"),
               Path("scripts/test-verify-focused.py"),
               Path("scripts/verify-changed-rustfmt"),
