@@ -1,0 +1,55 @@
+name: Agrippa 1004 descriptor test
+
+on:
+  push:
+    branches:
+      - agrippa/1004-bound-patch-check
+    paths:
+      - '.github/workflows/agrippa-1004-test.yml'
+      - 'tools/agrippa_1004_patch.py'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          show-progress: false
+
+      - name: Install pinned Rust toolchain
+        run: >-
+          rustup toolchain install 1.97.1
+          --profile minimal
+          --component rustfmt
+          --no-self-update
+
+      - name: Apply focused repair in runner
+        run: python3 tools/agrippa_1004_patch.py
+
+      - name: Format and test focused repair
+        run: |
+          cargo +1.97.1 fmt --all
+          cargo +1.97.1 test --locked --bin glaeda-local-patch-check
+          cargo +1.97.1 test --locked process::tests::timed_working_directory_input_combines_private_cwd_and_bounded_stdin
+          git diff --check
+
+      - name: Prepare tested source artifact
+        run: |
+          mkdir -p /tmp/agrippa-1004/src/bin
+          cp src/process.rs /tmp/agrippa-1004/src/process.rs
+          cp src/project_checkout_observation.rs /tmp/agrippa-1004/src/project_checkout_observation.rs
+          cp src/bin/glaeda-local-patch-check.rs /tmp/agrippa-1004/src/bin/glaeda-local-patch-check.rs
+          git diff --binary -- src/process.rs src/project_checkout_observation.rs src/bin/glaeda-local-patch-check.rs > /tmp/agrippa-1004/issue-1004.patch
+
+      - name: Upload tested source
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: agrippa-1004-tested-source
+          path: /tmp/agrippa-1004
+          if-no-files-found: error
