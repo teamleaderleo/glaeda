@@ -120,7 +120,7 @@ class VerifyFocusedTests(unittest.TestCase):
             2,
         )
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve(strict=True)
             os.chmod(root, 0o700)
             path = root / "receipt.json"
             MODULE.publish_document(path, document, replace=False)
@@ -128,9 +128,49 @@ class VerifyFocusedTests(unittest.TestCase):
             self.assertTrue(MODULE.matches_request(document, request))
             self.assertTrue(MODULE.valid_terminal_receipt(document, request))
 
+    def test_receipt_replay_rejects_incomplete_security_claims(self) -> None:
+        request = MODULE.Request(
+            "teamleaderleo/glaeda",
+            "a" * 40,
+            "b" * 40,
+            MODULE.profile_generation(),
+            "sha256:" + "c" * 64,
+        )
+        original = MODULE.receipt(
+            request,
+            "succeeded",
+            0,
+            1.0,
+            True,
+            True,
+            1,
+            MODULE.sha256(b"x"),
+            1,
+            2,
+        )
+        mutations = (
+            ("result", "task_cleanup_complete", False),
+            ("result", "output_sha256", "not-a-digest"),
+            ("result", "resource_accounting", "none"),
+            ("isolation", "filesystem", "host_writable"),
+            ("isolation", "ambient_environment", "inherited"),
+            ("isolation", "unrelated_writable_projects", "present"),
+            ("isolation", "build_state", "host_shared"),
+            ("isolation", "package_cache", "host_private_writable"),
+        )
+        for section, key, value in mutations:
+            with self.subTest(section=section, key=key):
+                document = json.loads(json.dumps(original))
+                document[section][key] = value
+                self.assertFalse(MODULE.valid_terminal_receipt(document, request))
+
+        document = json.loads(json.dumps(original))
+        document["unexpected"] = True
+        self.assertFalse(MODULE.valid_terminal_receipt(document, request))
+
     def test_reconcile_without_receipt_never_executes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve(strict=True)
             os.chmod(root, 0o700)
             for name in ("repository", "cargo", "rustup"):
                 (root / name).mkdir()
@@ -166,7 +206,7 @@ class VerifyFocusedTests(unittest.TestCase):
 
     def test_cleanup_oserror_publishes_terminal_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve(strict=True)
             os.chmod(root, 0o700)
             for name in ("repository", "cargo", "rustup"):
                 (root / name).mkdir()

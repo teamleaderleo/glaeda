@@ -337,7 +337,8 @@ class VerifyPlanTests(unittest.TestCase):
             receipt_destination(ROOT, ROOT / "verification-receipt.json")
         with tempfile.TemporaryDirectory() as directory:
             expected = Path(directory) / "verification-receipt.json"
-            self.assertEqual(receipt_destination(ROOT, expected), expected)
+            canonical = expected.parent.resolve(strict=True) / expected.name
+            self.assertEqual(receipt_destination(ROOT, expected), canonical)
 
     def test_summary_mode_counts_and_hashes_combined_phase_output(self) -> None:
         execute_phase = runpy.run_path(str(VERIFY), run_name="glaeda_verify_test")[

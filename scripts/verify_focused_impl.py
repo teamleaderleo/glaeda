@@ -76,6 +76,49 @@ PROFILE_SPEC = {
         "RestrictSUIDSGID=yes",
     ],
 }
+ISOLATION_SPEC = {
+    "filesystem": "read_only_source_task_private_tmpfs",
+    "network": "none",
+    "ambient_environment": "cleared",
+    "publisher_credentials": "absent",
+    "control_credentials": "absent",
+    "ssh_agent": "absent",
+    "sudo_admin": "absent",
+    "unrelated_writable_projects": "absent",
+    "build_state": "task_private_tmpfs",
+    "package_cache": "host_public_crates_io_read_only",
+}
+RECEIPT_KEYS = (
+    "document_type",
+    "schema_version",
+    "authority",
+    "command_fingerprint",
+    "source",
+    "profile",
+    "execution_identity_class",
+    "isolation",
+    "result",
+    "contains_private_content",
+    "contains_credentials",
+    "authorizes_work",
+    "authorizes_effects",
+    "authorizes_redispatch",
+)
+RESULT_KEYS = (
+    "terminal_class",
+    "exit_code",
+    "elapsed_seconds",
+    "started_at_unix_millis",
+    "settled_at_unix_millis",
+    "process_tree_settled",
+    "task_cleanup_complete",
+    "raw_output",
+    "output_bytes",
+    "output_sha256",
+    "cpu_seconds",
+    "max_rss_kib",
+    "resource_accounting",
+)
 
 
 @dataclass(frozen=True)
@@ -97,6 +140,10 @@ def canonical_bytes(value: object) -> bytes:
 
 def sha256(value: bytes) -> str:
     return f"sha256:{hashlib.sha256(value).hexdigest()}"
+
+
+def exact_keys(value: dict[str, object], expected: tuple[str, ...]) -> bool:
+    return set(value) == set(expected)
 
 
 def profile_generation() -> str:
@@ -323,10 +370,17 @@ def matches_request(document: dict[str, object], request: Request) -> bool:
 
 
 def valid_terminal_receipt(document: dict[str, object], request: Request) -> bool:
+    source = document.get("source")
+    profile = document.get("profile")
     result = document.get("result")
     isolation = document.get("isolation")
+    terminal = result.get("terminal_class") if isinstance(result, dict) else None
+    cleanup_complete = (
+        result.get("task_cleanup_complete") if isinstance(result, dict) else None
+    )
     return (
-        matches_request(document, request)
+        exact_keys(document, RECEIPT_KEYS)
+        and matches_request(document, request)
         and document.get("document_type") == "glaeda-verify-focused-receipt"
         and document.get("authority") == "physical_execution_observation"
         and document.get("execution_identity_class") == EXECUTION_IDENTITY_CLASS
@@ -335,16 +389,47 @@ def valid_terminal_receipt(document: dict[str, object], request: Request) -> boo
         and document.get("authorizes_work") is False
         and document.get("authorizes_effects") is False
         and document.get("authorizes_redispatch") is False
+        and source
+        == {
+            "repository": request.repository,
+            "commit": request.commit,
+            "tree": request.tree,
+        }
+        and profile
+        == {
+            "id": PROFILE_ID,
+            "class": PROFILE_CLASS,
+            "generation": request.profile_generation,
+            "resource_class": RESOURCE_CLASS,
+            "deadline_seconds": DEADLINE_SECONDS,
+        }
         and isinstance(result, dict)
-        and result.get("terminal_class")
-        in {"succeeded", "failed", "timed_out", "cleanup_incomplete"}
+        and exact_keys(result, RESULT_KEYS)
+        and terminal in {"succeeded", "failed", "timed_out", "cleanup_incomplete"}
+        and isinstance(result.get("exit_code"), int)
+        and not isinstance(result.get("exit_code"), bool)
+        and isinstance(result.get("elapsed_seconds"), (int, float))
+        and not isinstance(result.get("elapsed_seconds"), bool)
+        and result["elapsed_seconds"] >= 0
+        and isinstance(result.get("started_at_unix_millis"), int)
+        and not isinstance(result.get("started_at_unix_millis"), bool)
+        and isinstance(result.get("settled_at_unix_millis"), int)
+        and not isinstance(result.get("settled_at_unix_millis"), bool)
+        and result["settled_at_unix_millis"] >= result["started_at_unix_millis"] >= 0
         and result.get("process_tree_settled") is True
-        and isinstance(isolation, dict)
-        and isolation.get("network") == "none"
-        and isolation.get("control_credentials") == "absent"
-        and isolation.get("publisher_credentials") == "absent"
-        and isolation.get("ssh_agent") == "absent"
-        and isolation.get("sudo_admin") == "absent"
+        and isinstance(cleanup_complete, bool)
+        and (terminal == "cleanup_incomplete") == (cleanup_complete is False)
+        and result.get("raw_output") == "not_published"
+        and isinstance(result.get("output_bytes"), int)
+        and not isinstance(result.get("output_bytes"), bool)
+        and result["output_bytes"] >= 0
+        and isinstance(result.get("output_sha256"), str)
+        and SHA256_PATTERN.fullmatch(result["output_sha256"]) is not None
+        and result.get("cpu_seconds") is None
+        and result.get("max_rss_kib") is None
+        and result.get("resource_accounting")
+        == "cgroup_enforced_metrics_not_exported_v1"
+        and isolation == ISOLATION_SPEC
     )
 
 
@@ -728,18 +813,7 @@ def receipt(
             "deadline_seconds": DEADLINE_SECONDS,
         },
         "execution_identity_class": EXECUTION_IDENTITY_CLASS,
-        "isolation": {
-            "filesystem": "read_only_source_task_private_tmpfs",
-            "network": "none",
-            "ambient_environment": "cleared",
-            "publisher_credentials": "absent",
-            "control_credentials": "absent",
-            "ssh_agent": "absent",
-            "sudo_admin": "absent",
-            "unrelated_writable_projects": "absent",
-            "build_state": "task_private_tmpfs",
-            "package_cache": "host_public_crates_io_read_only",
-        },
+        "isolation": dict(ISOLATION_SPEC),
         "result": {
             "terminal_class": terminal,
             "exit_code": exit_code,
