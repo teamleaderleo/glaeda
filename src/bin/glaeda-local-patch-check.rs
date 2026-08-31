@@ -16,9 +16,7 @@ use glaeda::artifact::{CommitId, GitTreeId, Sha256Digest};
 use glaeda::process::{
     CommandSpec, MAX_CAPTURED_STDIN_BYTES, ProcessExecutor, TimedInputCommandExecutor,
 };
-use glaeda::project_checkout_observation::{
-    ProjectCheckoutObservation, ProjectCheckoutObserver,
-};
+use glaeda::project_checkout_observation::{ProjectCheckoutObservation, ProjectCheckoutObserver};
 use serde::Serialize;
 use sha1::{Digest as _, Sha1};
 use sha2::Sha256;
@@ -63,8 +61,10 @@ struct PatchCheckExpectation {
 
 impl PatchCheckExpectation {
     fn new(args: &Args) -> Result<Self, PatchCheckError> {
-        let expected_head = CommitId::parse(&args.expected_head).map_err(|_| invalid_expectation())?;
-        let expected_tree = GitTreeId::parse(&args.expected_tree).map_err(|_| invalid_expectation())?;
+        let expected_head =
+            CommitId::parse(&args.expected_head).map_err(|_| invalid_expectation())?;
+        let expected_tree =
+            GitTreeId::parse(&args.expected_tree).map_err(|_| invalid_expectation())?;
         if !is_lower_hex(&args.git_blob_sha1, SHA1_HEX_BYTES)
             || args.bytes == 0
             || args.bytes > MAX_CAPTURED_STDIN_BYTES
@@ -175,7 +175,8 @@ fn main() {
             };
             eprintln!(
                 "{}",
-                serde_json::to_string(&receipt).expect("patch applicability refusal is serializable")
+                serde_json::to_string(&receipt)
+                    .expect("patch applicability refusal is serializable")
             );
             std::process::exit(2);
         }
@@ -376,50 +377,110 @@ const fn err(
     code: &'static str,
     problem: &'static str,
 ) -> PatchCheckError {
-    PatchCheckError { kind, code, problem }
+    PatchCheckError {
+        kind,
+        code,
+        problem,
+    }
 }
 
 const fn invalid_expectation() -> PatchCheckError {
-    err(PatchCheckErrorKind::InvalidExpectation, "patch_check_expectation_invalid", "patch check expectation is outside the reviewed boundary")
+    err(
+        PatchCheckErrorKind::InvalidExpectation,
+        "patch_check_expectation_invalid",
+        "patch check expectation is outside the reviewed boundary",
+    )
 }
 const fn input_too_large() -> PatchCheckError {
-    err(PatchCheckErrorKind::InputTooLarge, "patch_check_input_too_large", "patch input exceeds the reviewed process-input limit")
+    err(
+        PatchCheckErrorKind::InputTooLarge,
+        "patch_check_input_too_large",
+        "patch input exceeds the reviewed process-input limit",
+    )
 }
 const fn byte_count_mismatch() -> PatchCheckError {
-    err(PatchCheckErrorKind::ByteCountMismatch, "patch_check_byte_count_mismatch", "patch byte count does not match the expected identity")
+    err(
+        PatchCheckErrorKind::ByteCountMismatch,
+        "patch_check_byte_count_mismatch",
+        "patch byte count does not match the expected identity",
+    )
 }
 const fn sha256_mismatch() -> PatchCheckError {
-    err(PatchCheckErrorKind::Sha256Mismatch, "patch_check_sha256_mismatch", "patch SHA-256 does not match the expected identity")
+    err(
+        PatchCheckErrorKind::Sha256Mismatch,
+        "patch_check_sha256_mismatch",
+        "patch SHA-256 does not match the expected identity",
+    )
 }
 const fn git_blob_mismatch() -> PatchCheckError {
-    err(PatchCheckErrorKind::GitBlobMismatch, "patch_check_git_blob_mismatch", "patch Git blob identity does not match the expected identity")
+    err(
+        PatchCheckErrorKind::GitBlobMismatch,
+        "patch_check_git_blob_mismatch",
+        "patch Git blob identity does not match the expected identity",
+    )
 }
 const fn invalid_utf8() -> PatchCheckError {
-    err(PatchCheckErrorKind::InvalidUtf8, "patch_check_utf8_invalid", "patch input is not valid UTF-8")
+    err(
+        PatchCheckErrorKind::InvalidUtf8,
+        "patch_check_utf8_invalid",
+        "patch input is not valid UTF-8",
+    )
 }
 const fn contains_nul() -> PatchCheckError {
-    err(PatchCheckErrorKind::ContainsNul, "patch_check_nul_forbidden", "patch input contains a NUL byte")
+    err(
+        PatchCheckErrorKind::ContainsNul,
+        "patch_check_nul_forbidden",
+        "patch input contains a NUL byte",
+    )
 }
 const fn not_unified_diff() -> PatchCheckError {
-    err(PatchCheckErrorKind::NotUnifiedDiff, "patch_check_unified_diff_invalid", "patch input is not an ordinary unified diff")
+    err(
+        PatchCheckErrorKind::NotUnifiedDiff,
+        "patch_check_unified_diff_invalid",
+        "patch input is not an ordinary unified diff",
+    )
 }
 const fn input_unavailable() -> PatchCheckError {
-    err(PatchCheckErrorKind::InputUnavailable, "patch_check_input_unavailable", "patch input could not be read")
+    err(
+        PatchCheckErrorKind::InputUnavailable,
+        "patch_check_input_unavailable",
+        "patch input could not be read",
+    )
 }
 const fn checkout_unavailable() -> PatchCheckError {
-    err(PatchCheckErrorKind::CheckoutUnavailable, "patch_check_checkout_unavailable", "exact checkout evidence is unavailable")
+    err(
+        PatchCheckErrorKind::CheckoutUnavailable,
+        "patch_check_checkout_unavailable",
+        "exact checkout evidence is unavailable",
+    )
 }
 const fn base_mismatch() -> PatchCheckError {
-    err(PatchCheckErrorKind::BaseMismatch, "patch_check_base_mismatch", "checkout commit or tree does not match the expected base")
+    err(
+        PatchCheckErrorKind::BaseMismatch,
+        "patch_check_base_mismatch",
+        "checkout commit or tree does not match the expected base",
+    )
 }
 const fn checkout_dirty() -> PatchCheckError {
-    err(PatchCheckErrorKind::CheckoutDirty, "patch_check_checkout_dirty", "checkout is not clean at the expected base")
+    err(
+        PatchCheckErrorKind::CheckoutDirty,
+        "patch_check_checkout_dirty",
+        "checkout is not clean at the expected base",
+    )
 }
 const fn check_unavailable() -> PatchCheckError {
-    err(PatchCheckErrorKind::CheckUnavailable, "patch_check_unavailable", "patch applicability could not be established")
+    err(
+        PatchCheckErrorKind::CheckUnavailable,
+        "patch_check_unavailable",
+        "patch applicability could not be established",
+    )
 }
 const fn source_changed() -> PatchCheckError {
-    err(PatchCheckErrorKind::SourceChanged, "patch_check_source_changed", "checkout changed during the applicability check")
+    err(
+        PatchCheckErrorKind::SourceChanged,
+        "patch_check_source_changed",
+        "checkout changed during the applicability check",
+    )
 }
 
 #[cfg(test)]
@@ -486,7 +547,10 @@ mod tests {
 
     fn git_output(root: &Path, args: &[&str]) -> String {
         let output = git(root, args).output().expect("git process");
-        assert!(output.status.success(), "git fixture command failed: {args:?}");
+        assert!(
+            output.status.success(),
+            "git fixture command failed: {args:?}"
+        );
         String::from_utf8(output.stdout)
             .expect("utf8")
             .trim()
@@ -507,16 +571,27 @@ mod tests {
     fn exact_applicable_patch_is_checked_without_mutating_source() {
         let fixture = fixture();
         let before_status = git_output(&fixture.root, &["status", "--porcelain=v1"]);
-        let report = evaluate_patch(&fixture.root, &expectation(&fixture, PATCH), PATCH, &ProcessExecutor)
-            .expect("applicability");
+        let report = evaluate_patch(
+            &fixture.root,
+            &expectation(&fixture, PATCH),
+            PATCH,
+            &ProcessExecutor,
+        )
+        .expect("applicability");
         assert!(report.applicable);
         assert!(report.source_unchanged);
         assert!(!report.contains_patch_content);
         assert!(!report.contains_private_path);
         assert!(!report.authorizes_source_mutation);
         assert!(!report.authorizes_execution);
-        assert_eq!(git_output(&fixture.root, &["rev-parse", "HEAD"]), fixture.head);
-        assert_eq!(git_output(&fixture.root, &["status", "--porcelain=v1"]), before_status);
+        assert_eq!(
+            git_output(&fixture.root, &["rev-parse", "HEAD"]),
+            fixture.head
+        );
+        assert_eq!(
+            git_output(&fixture.root, &["status", "--porcelain=v1"]),
+            before_status
+        );
     }
 
     #[test]
@@ -539,9 +614,14 @@ mod tests {
         let fixture = fixture();
         fs::write(fixture.root.join("untracked.txt"), "foreign\n").expect("untracked");
         assert_eq!(
-            evaluate_patch(&fixture.root, &expectation(&fixture, PATCH), PATCH, &ProcessExecutor)
-                .expect_err("dirty refusal")
-                .kind,
+            evaluate_patch(
+                &fixture.root,
+                &expectation(&fixture, PATCH),
+                PATCH,
+                &ProcessExecutor
+            )
+            .expect_err("dirty refusal")
+            .kind,
             PatchCheckErrorKind::CheckoutDirty
         );
         fs::remove_file(fixture.root.join("untracked.txt")).expect("remove untracked");
@@ -581,8 +661,13 @@ mod tests {
     #[test]
     fn report_and_refusal_are_content_and_path_free() {
         let fixture = fixture();
-        let report = evaluate_patch(&fixture.root, &expectation(&fixture, PATCH), PATCH, &ProcessExecutor)
-            .expect("applicability");
+        let report = evaluate_patch(
+            &fixture.root,
+            &expectation(&fixture, PATCH),
+            PATCH,
+            &ProcessExecutor,
+        )
+        .expect("applicability");
         let encoded = serde_json::to_string(&report).expect("json");
         assert!(!encoded.contains("example.txt"));
         assert!(!encoded.contains(fixture.root.to_string_lossy().as_ref()));
