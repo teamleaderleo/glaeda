@@ -1,0 +1,49 @@
+name: Agrippa 1004 commit tree-bound repair
+
+on:
+  push:
+    branches:
+      - agrippa/1004-tree-bound-patch-check
+    paths:
+      - '.github/workflows/agrippa-1004-tree-commit.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  commit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out repair branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: agrippa/1004-tree-bound-patch-check
+          fetch-depth: 0
+          persist-credentials: true
+          show-progress: false
+
+      - name: Install pinned Rust toolchain
+        run: >-
+          rustup toolchain install 1.97.1
+          --profile minimal
+          --component rustfmt
+          --no-self-update
+
+      - name: Recreate proven repair
+        run: |
+          python3 tools/agrippa_1004_tree_patch.py
+          python3 tools/agrippa_1004_tree_postfix.py
+          cargo +1.97.1 fmt --all
+          cargo +1.97.1 test --locked --bin glaeda-local-patch-check
+          git diff --check
+
+      - name: Commit only production repair
+        run: |
+          git config user.name 'Agrippa'
+          git config user.email 'agrippa@localhost'
+          git add src/bin/glaeda-local-patch-check.rs
+          git rm .github/workflows/agrippa-1004-tree-test.yml .github/workflows/agrippa-1004-tree-commit.yml tools/agrippa_1004_tree_patch.py tools/agrippa_1004_tree_postfix.py
+          git diff --cached --check
+          git commit -m 'Bind patch applicability to expected Git tree'
+          git push origin HEAD:agrippa/1004-tree-bound-patch-check
