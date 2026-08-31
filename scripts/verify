@@ -238,6 +238,25 @@ def fast_phases() -> tuple[Phase, ...]:
     )
 
 
+def focused_phases() -> tuple[Phase, ...]:
+    """Credentialless workstation feedback with no host-administration assumptions."""
+    return (
+        Phase(
+            "compile-all-targets",
+            "capability",
+            "cargo",
+            ("check", "--locked", "--all-targets", "--all-features"),
+        ),
+        Phase("format", "capability", "cargo", ("fmt", "--all", "--", "--check")),
+        Phase(
+            "repo-query-integration",
+            "capability",
+            "cargo",
+            ("test", "--locked", "--test", "repo_query_cli"),
+        ),
+    )
+
+
 def full_test_phases() -> tuple[Phase, ...]:
     return (
         Phase(
@@ -277,6 +296,8 @@ def full_test_phases() -> tuple[Phase, ...]:
 
 
 def phases_for(profile: str) -> tuple[Phase, ...]:
+    if profile == "focused":
+        return focused_phases()
     if profile == "fast":
         return fast_phases()
     if profile == "full-tests":
@@ -729,7 +750,7 @@ def main() -> int:
     parser.add_argument(
         "profile",
         nargs="?",
-        choices=("fast", "full-tests", "required"),
+        choices=("focused", "fast", "full-tests", "required"),
         default="fast",
     )
     parser.add_argument(

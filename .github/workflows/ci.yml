@@ -68,6 +68,9 @@ jobs:
               Path("scripts/hot-run-python"),
               Path("scripts/hot_run_impl.py"),
               Path("scripts/verify"),
+              Path("scripts/verify-focused"),
+              Path("scripts/verify_focused_impl.py"),
+              Path("scripts/test-verify-focused.py"),
               Path("scripts/verify-changed-rustfmt"),
               Path("scripts/test-hot-run.py"),
               Path("scripts/test-hot-pressure-shadow.py"),
@@ -95,6 +98,7 @@ jobs:
           python3 scripts/test-hot-observe.py
           python3 scripts/test-hot-pressure-shadow.py
           python3 scripts/test-hot-run.py
+          python3 scripts/test-verify-focused.py
           python3 scripts/test-verify.py
           python3 scripts/test-verify-changed-rustfmt.py
           python3 scripts/test-front-door.py
