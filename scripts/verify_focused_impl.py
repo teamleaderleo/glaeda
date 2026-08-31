@@ -36,6 +36,7 @@ FAILURE_TAIL_BYTES = 8 * 1024
 MAX_MATERIALIZED_SOURCE_BYTES = 512 * 1024 * 1024
 MAX_MATERIALIZED_SOURCE_ENTRIES = 100_000
 TARGET_TMPFS_BYTES = 6 * 1024 * 1024 * 1024
+REQUIRED_TARGET_TMPFS_BYTES = 8 * 1024 * 1024 * 1024
 CARGO_HOME_TMPFS_BYTES = 512 * 1024 * 1024
 TEMP_TMPFS_BYTES = 512 * 1024 * 1024
 PROJECT_HOME_TMPFS_BYTES = 64 * 1024 * 1024
@@ -50,6 +51,9 @@ class Profile:
     deadline_seconds: int
     recipe_name: str
     document_slug: str
+    build_tmpfs_bytes: int
+    memory_high: str
+    memory_max: str
 
 
 def fixed_profile(
@@ -59,6 +63,9 @@ def fixed_profile(
     deadline_seconds: int,
     recipe_name: str,
     document_slug: str,
+    build_tmpfs_bytes: int,
+    memory_high: str,
+    memory_max: str,
 ) -> Profile:
     return Profile(
         profile_id,
@@ -67,6 +74,9 @@ def fixed_profile(
         deadline_seconds,
         recipe_name,
         document_slug,
+        build_tmpfs_bytes,
+        memory_high,
+        memory_max,
     )
 
 
@@ -87,14 +97,14 @@ def profile_spec(profile: Profile) -> dict[str, object]:
         "source_state": "exact_read_only",
         "materialized_source_bytes_max": MAX_MATERIALIZED_SOURCE_BYTES,
         "build_state": "task_private_tmpfs",
-        "build_tmpfs_bytes": TARGET_TMPFS_BYTES,
+        "build_tmpfs_bytes": profile.build_tmpfs_bytes,
         "package_cache": "host_public_crates_io_read_only",
         "resource_class": profile.resource_class,
         "deadline_seconds": profile.deadline_seconds,
         "systemd_properties": [
             "CPUQuota=400%",
-            "MemoryHigh=6G",
-            "MemoryMax=8G",
+            f"MemoryHigh={profile.memory_high}",
+            f"MemoryMax={profile.memory_max}",
             "TasksMax=512",
             f"RuntimeMaxSec={profile.deadline_seconds}",
             "KillMode=mixed",
@@ -105,10 +115,26 @@ def profile_spec(profile: Profile) -> dict[str, object]:
 
 
 FOCUSED_PROFILE = fixed_profile(
-    "verify-focused/v1", "verify_focused", "big-red-focused", 600, "focused", "verify-focused"
+    "verify-focused/v1",
+    "verify_focused",
+    "big-red-focused",
+    600,
+    "focused",
+    "verify-focused",
+    TARGET_TMPFS_BYTES,
+    "6G",
+    "8G",
 )
 REQUIRED_PROFILE = fixed_profile(
-    "verify-required/v1", "verify_required", "big-red-required", 1200, "required", "verify-required"
+    "verify-required/v1",
+    "verify_required",
+    "big-red-required",
+    1200,
+    "required",
+    "verify-required",
+    REQUIRED_TARGET_TMPFS_BYTES,
+    "10G",
+    "12G",
 )
 
 # Compatibility aliases for the focused profile and its existing tests/consumers.
