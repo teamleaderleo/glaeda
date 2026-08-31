@@ -33,6 +33,22 @@ def read_plan(profile: str) -> dict[str, object]:
 
 
 class VerifyPlanTests(unittest.TestCase):
+    def test_focused_plan_is_fixed_and_credentialless_compatible(self) -> None:
+        plan = read_plan("focused")
+        self.assertEqual(plan["profile"], "focused")
+        self.assertEqual(
+            [phase["name"] for phase in plan["phases"]],
+            ["compile-all-targets", "format", "repo-query-integration"],
+        )
+        self.assertEqual(
+            plan["phases"][0]["argv"],
+            ["cargo", "check", "--locked", "--all-targets", "--all-features"],
+        )
+        self.assertEqual(
+            plan["phases"][2]["argv"],
+            ["cargo", "test", "--locked", "--test", "repo_query_cli"],
+        )
+
     def test_required_profile_is_the_exact_eight_step_agents_sequence(self) -> None:
         plan = read_plan("required")
         self.assertEqual(plan["authority"], "repository_required_checks")
