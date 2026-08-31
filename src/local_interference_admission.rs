@@ -300,12 +300,12 @@ mod tests {
 
         let mut draining = observation();
         draining.node_control = NodeControlState::Draining;
-        let decision = compile_local_interference_admission(
+        let result = compile_local_interference_admission(
             request(LocalInterferenceClass::Coexist),
             draining,
         );
-        assert_eq!(decision.disposition, LocalAdmissionDisposition::Wait);
-        assert_eq!(decision.reason, LocalAdmissionReason::NodeDraining);
+        assert_eq!(result.disposition, LocalAdmissionDisposition::Wait);
+        assert_eq!(result.reason, LocalAdmissionReason::NodeDraining);
     }
 
     #[test]
@@ -372,11 +372,8 @@ mod tests {
         let mut high = observation();
         high.pressure = LocalPressureClass::High;
         assert_eq!(
-            compile_local_interference_admission(
-                request(LocalInterferenceClass::Yieldable),
-                high,
-            )
-            .reason,
+            compile_local_interference_admission(request(LocalInterferenceClass::Yieldable), high,)
+                .reason,
             LocalAdmissionReason::PressureHigh
         );
 
