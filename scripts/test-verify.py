@@ -173,6 +173,9 @@ class VerifyPlanTests(unittest.TestCase):
             self.assertNotIn(str(ROOT), encoded)
             self.assertFalse(plan["retained_logs"])
             self.assertTrue(plan["source_must_remain_unchanged"])
+            self.assertEqual(
+                plan["execution_environment"]["file_creation_umask"], "0022"
+            )
 
     def test_source_state_detects_content_changes_with_the_same_git_status(self) -> None:
         source_state = runpy.run_path(str(VERIFY), run_name="glaeda_verify_test")[
@@ -286,6 +289,7 @@ class VerifyPlanTests(unittest.TestCase):
 
             encoded = json.dumps(observation, sort_keys=True)
             self.assertEqual(observation["cargo_build_jobs"]["value"], 4)
+            self.assertEqual(observation["file_creation_umask"], "0022")
             self.assertEqual(observation["cargo_target"]["source"], "configured")
             self.assertNotIn(directory, encoded)
             self.assertRegex(
@@ -345,6 +349,30 @@ class VerifyPlanTests(unittest.TestCase):
                 f"sha256:{hashlib.sha256(expected).hexdigest()}",
             )
             self.assertEqual(summary.tail, expected)
+
+    def test_phase_child_uses_profile_umask_instead_of_ambient_umask(self) -> None:
+        execute_phase = runpy.run_path(str(VERIFY), run_name="glaeda_verify_test")[
+            "execute_phase"
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            program = fixture / "producer"
+            program.write_text(
+                "#!/usr/bin/python3\n"
+                "from pathlib import Path\n"
+                "Path('created').mkdir()\n",
+                encoding="utf-8",
+            )
+            program.chmod(0o755)
+            previous = os.umask(0o002)
+            try:
+                returncode, summary = execute_phase(program, (), fixture, "summary")
+            finally:
+                os.umask(previous)
+
+            self.assertEqual(returncode, 0)
+            self.assertIsNotNone(summary)
+            self.assertEqual((fixture / "created").stat().st_mode & 0o777, 0o755)
 
     def test_failed_phase_still_writes_a_terminal_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
