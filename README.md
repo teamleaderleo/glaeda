@@ -318,17 +318,17 @@ See the [manifest reference](docs/MANIFEST.md) and example [Quarry](examples/qua
 
 ## Development
 
-Rust 2024 stable is used. The repository commits `Cargo.lock` and checks formatting, locked dependency resolution, Clippy, tests, doctor output, reference plans, and read-only host planning:
+Rust 2024 stable is used. The repository commits `Cargo.lock`. The repository-owned named profile
+checks bootstrap readiness, formatting, locked dependency resolution, Clippy, tests, doctor output,
+reference plans, and read-only host planning:
 
 ```bash
-cargo fmt --all -- --check
-cargo clippy --locked --all-targets --all-features -- -D warnings
-cargo test --locked --all-targets --all-features
-cargo run --locked --quiet -- --output json doctor
-cargo run --locked --quiet -- plan --file examples/quarry.yml
-cargo run --locked --quiet -- --output json plan --file examples/glossless.yml
-cargo run --locked --quiet -- --output json host plan --file examples/quarry.yml
+./scripts/verify required
 ```
+
+Use `./scripts/verify required --plan-json` when a tool needs the exact current phase argv and fixed
+execution environment. This avoids maintaining a second procedural command list in documentation
+or model context.
 
 ## Project documents
 
@@ -336,6 +336,7 @@ cargo run --locked --quiet -- --output json host plan --file examples/quarry.yml
 - [Roadmap](docs/ROADMAP.md)
 - [Product evolution](docs/PRODUCT_EVOLUTION.md)
 - [Blazingly hot execution](docs/BLAZINGLY_HOT.md)
+- [Resident repository query](docs/experiments/resident-repo-query-big-red-2026-08-31.md)
 - [Disposable autoscaling CI](docs/DISPOSABLE_AUTOSCALING_CI.md)
 - [Threat model](docs/THREAT_MODEL.md)
 - [Manifest reference](docs/MANIFEST.md)

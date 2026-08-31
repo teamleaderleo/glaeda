@@ -336,6 +336,23 @@ evidence, worktree/submodule topology, and one opaque physical materialization i
 not establish catalog adoption, a resident-project lease, cache validity, remote freshness,
 cleanup authority, or permission to execute inside the checkout.
 
+Once a canonical checkout and exact object IDs are already known, `repo-query/v1` collapses the
+common review-evidence sequence into one bounded local observation:
+
+```bash
+glaeda-repo-query \
+  --checkout /absolute/canonical/checkout \
+  --project github.com/owner/repository \
+  --base COMPLETE_BASE_OID \
+  --head COMPLETE_HEAD_OID \
+  --output json
+```
+
+It returns exact object and merge-base identity, ancestry, commit count, per-file numstat, a digest
+of the complete patch, and the patch itself only when it fits the caller's bounded ceiling. It does
+not accept refs or arbitrary Git arguments, fetch, mutate, publish, establish remote freshness, or
+grant reuse authority. See the [Big Red controlled result](experiments/resident-repo-query-big-red-2026-08-31.md).
+
 A separate migration operation may later stage a successor in the managed developer guest and switch accepted materialization only after the successor is proven.
 
 ## Lazy materialization
