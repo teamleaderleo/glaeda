@@ -1,14 +1,16 @@
 //! Read-only applicability check for one exact sandbox-authored patch.
 //!
 //! This front door stops before source mutation. It revalidates one exact clean checkout, verifies
-//! the supplied patch content identity, asks fixed `/usr/bin/git apply --check --index` whether the
-//! patch is applicable, and proves the checkout observation is unchanged afterward. It performs no
+//! the supplied patch content identity, loads the exact expected Git tree into a private alternate
+//! index, asks fixed `/usr/bin/git apply --check --cached` whether the patch is applicable, and
+//! proves the checkout observation is unchanged afterward. It performs no
 //! provider call, branch/commit creation, patch application, publication, cleanup, or authority
 //! grant.
 
 use std::fmt;
 use std::fs;
 use std::io::{self, Read as _};
+use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -104,7 +106,7 @@ impl TemporaryGitIndex {
                 "glaeda-local-patch-index-{}-{now}-{sequence}",
                 std::process::id()
             ));
-            match fs::create_dir(&directory) {
+            match fs::DirBuilder::new().mode(0o700).create(&directory) {
                 Ok(()) => {
                     let path = directory.join("index");
                     return Ok(Self { directory, path });
