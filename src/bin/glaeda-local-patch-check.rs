@@ -6,17 +6,28 @@
 //! provider call, branch/commit creation, patch application, publication, cleanup, or authority
 //! grant.
 
+use std::env;
+use std::ffi::OsStr;
 use std::fmt;
+use std::fs;
 use std::io::{self, Read as _};
+use std::os::unix::fs::MetadataExt as _;
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Duration;
 
 use clap::Parser;
 use glaeda::artifact::{CommitId, GitTreeId, Sha256Digest};
 use glaeda::process::{
-    CommandSpec, MAX_CAPTURED_STDIN_BYTES, ProcessExecutor, TimedInputCommandExecutor,
+    CommandSpec, MAX_CAPTURED_STDIN_BYTES, ProcessExecutor,
+    TimedWorkingDirectoryInputCommandExecutor,
 };
 use glaeda::project_checkout_observation::{ProjectCheckoutObservation, ProjectCheckoutObserver};
+use glaeda::project_workspace_identity::{
+    ProjectWorkspaceFilesystemIdentityKind, ProjectWorkspaceIdentityGeneration,
+    project_workspace_filesystem_identity,
+};
 use serde::Serialize;
 use sha1::{Digest as _, Sha1};
 use sha2::Sha256;
@@ -26,6 +37,38 @@ const GIT: &str = "/usr/bin/git";
 const CHECK_TIMEOUT: Duration = Duration::from_secs(15);
 const SHA1_HEX_BYTES: usize = 40;
 const SHA256_PREFIX: &str = "sha256:";
+const INTERNAL_BOUND_APPLY: &str = "--glaeda-internal-bound-patch-apply-v1";
+const INTERNAL_SOURCE_CHANGED_EXIT: i32 = 3;
+const GIT_APPLY_ARGUMENTS: &[&str] = &[
+    "--no-optional-locks",
+    "-c",
+    "credential.helper=",
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "diff.external=",
+    "apply",
+    "--check",
+    "--index",
+    "--whitespace=nowarn",
+    "-",
+];
+const GIT_ENVIRONMENT: &[(&str, &str)] = &[
+    ("GIT_ASKPASS", "/bin/false"),
+    ("GIT_ALLOW_PROTOCOL", ""),
+    ("GIT_ATTR_NOSYSTEM", "1"),
+    ("GIT_CONFIG_GLOBAL", "/dev/null"),
+    ("GIT_CONFIG_NOSYSTEM", "1"),
+    ("GIT_CONFIG_SYSTEM", "/dev/null"),
+    ("GIT_NO_LAZY_FETCH", "1"),
+    ("GIT_NO_REPLACE_OBJECTS", "1"),
+    ("GIT_PROTOCOL_FROM_USER", "0"),
+    ("GIT_TERMINAL_PROMPT", "0"),
+    ("LANG", "C"),
+    ("LC_ALL", "C"),
+];
 
 #[derive(Debug, Parser)]
 #[command(about = "Check one exact patch against an exact clean checkout without applying it")]
@@ -154,6 +197,18 @@ struct RefusalReceipt<'a> {
 }
 
 fn main() {
+    let mut process_args = env::args_os();
+    let _program = process_args.next();
+    if process_args.next().as_deref() == Some(OsStr::new(INTERNAL_BOUND_APPLY)) {
+        let expected = process_args.next();
+        let extra = process_args.next();
+        let exit = match (expected, extra) {
+            (Some(expected), None) => run_internal_bound_apply(expected.as_os_str()),
+            _ => 2,
+        };
+        std::process::exit(exit);
+    }
+
     let args = Args::parse();
     match run(args) {
         Ok(report) => println!(
@@ -193,11 +248,39 @@ fn run(args: Args) -> Result<PatchApplicabilityReport, PatchCheckError> {
     evaluate_patch(&args.repository, &expectation, &input, &ProcessExecutor)
 }
 
+#[cfg(not(test))]
 fn evaluate_patch(
     repository: &Path,
     expectation: &PatchCheckExpectation,
     patch: &[u8],
     executor: &ProcessExecutor,
+) -> Result<PatchApplicabilityReport, PatchCheckError> {
+    let helper_program = env::current_exe().map_err(|_| check_unavailable())?;
+    evaluate_patch_with_runner(
+        repository,
+        expectation,
+        patch,
+        executor,
+        Some(&helper_program),
+    )
+}
+
+#[cfg(test)]
+fn evaluate_patch(
+    repository: &Path,
+    expectation: &PatchCheckExpectation,
+    patch: &[u8],
+    executor: &ProcessExecutor,
+) -> Result<PatchApplicabilityReport, PatchCheckError> {
+    evaluate_patch_with_runner(repository, expectation, patch, executor, None)
+}
+
+fn evaluate_patch_with_runner(
+    repository: &Path,
+    expectation: &PatchCheckExpectation,
+    patch: &[u8],
+    executor: &ProcessExecutor,
+    helper_program: Option<&Path>,
 ) -> Result<PatchApplicabilityReport, PatchCheckError> {
     validate_patch_identity(expectation, patch)?;
 
@@ -207,11 +290,16 @@ fn evaluate_patch(
         .map_err(|_| checkout_unavailable())?;
     validate_base(&before, expectation)?;
 
-    let spec = applicability_command(repository)?;
+    let spec = match helper_program {
+        Some(helper_program) => {
+            internal_applicability_command(helper_program, before.materialization_id())
+        }
+        None => applicability_command(),
+    };
     let expected_argv = spec.displayed_argv();
     let expected_environment_keys = spec.environment.keys().cloned().collect::<Vec<_>>();
     let record = executor
-        .execute_with_input(&spec, patch, CHECK_TIMEOUT)
+        .execute_in_directory_with_input(&spec, repository, patch, CHECK_TIMEOUT)
         .map_err(|_| check_unavailable())?;
     if record.argv != expected_argv || record.environment_keys != expected_environment_keys {
         return Err(check_unavailable());
@@ -219,6 +307,9 @@ fn evaluate_patch(
     let applicable = match (record.success, record.status) {
         (true, Some(0)) => true,
         (false, Some(1)) => false,
+        (false, Some(INTERNAL_SOURCE_CHANGED_EXIT)) if helper_program.is_some() => {
+            return Err(source_changed());
+        }
         _ => return Err(check_unavailable()),
     };
 
@@ -267,37 +358,60 @@ fn validate_base(
     Ok(())
 }
 
-fn applicability_command(repository: &Path) -> Result<CommandSpec, PatchCheckError> {
-    let repository = repository.to_str().ok_or_else(checkout_unavailable)?;
-    Ok(CommandSpec::new(GIT)
-        .argument("--no-optional-locks")
-        .argument("-c")
-        .argument("credential.helper=")
-        .argument("-c")
-        .argument("core.fsmonitor=false")
-        .argument("-c")
-        .argument("core.hooksPath=/dev/null")
-        .argument("-c")
-        .argument("diff.external=")
-        .argument("-C")
-        .argument(repository)
-        .argument("apply")
-        .argument("--check")
-        .argument("--index")
-        .argument("--whitespace=nowarn")
-        .argument("-")
-        .environment("GIT_ASKPASS", "/bin/false")
-        .environment("GIT_ALLOW_PROTOCOL", "")
-        .environment("GIT_ATTR_NOSYSTEM", "1")
-        .environment("GIT_CONFIG_GLOBAL", "/dev/null")
-        .environment("GIT_CONFIG_NOSYSTEM", "1")
-        .environment("GIT_CONFIG_SYSTEM", "/dev/null")
-        .environment("GIT_NO_LAZY_FETCH", "1")
-        .environment("GIT_NO_REPLACE_OBJECTS", "1")
-        .environment("GIT_PROTOCOL_FROM_USER", "0")
-        .environment("GIT_TERMINAL_PROMPT", "0")
-        .environment("LANG", "C")
-        .environment("LC_ALL", "C"))
+fn run_internal_bound_apply(expected: &OsStr) -> i32 {
+    let Some(expected) = expected.to_str() else {
+        return 2;
+    };
+    let Ok(expected) = Sha256Digest::parse(expected) else {
+        return 2;
+    };
+    let Ok(metadata) = fs::metadata(".") else {
+        return 2;
+    };
+    if !metadata.is_dir() {
+        return 2;
+    }
+    let Ok(actual) = project_workspace_filesystem_identity(
+        ProjectWorkspaceIdentityGeneration::CURRENT,
+        ProjectWorkspaceFilesystemIdentityKind::Materialization,
+        metadata.dev(),
+        metadata.ino(),
+        metadata.uid(),
+    ) else {
+        return 2;
+    };
+    if actual != expected {
+        return INTERNAL_SOURCE_CHANGED_EXIT;
+    }
+
+    let mut command = Command::new(GIT);
+    command.env_clear().args(GIT_APPLY_ARGUMENTS);
+    for (key, value) in GIT_ENVIRONMENT {
+        command.env(key, value);
+    }
+    let error = command.exec();
+    eprintln!("glaeda-local-patch-check internal Git exec failed: {error}");
+    2
+}
+
+fn internal_applicability_command(
+    program: &Path,
+    materialization_id: &Sha256Digest,
+) -> CommandSpec {
+    CommandSpec::new(program)
+        .argument(INTERNAL_BOUND_APPLY)
+        .argument(materialization_id.as_str())
+}
+
+fn applicability_command() -> CommandSpec {
+    let mut spec = CommandSpec::new(GIT);
+    for argument in GIT_APPLY_ARGUMENTS {
+        spec = spec.argument(*argument);
+    }
+    for (key, value) in GIT_ENVIRONMENT {
+        spec = spec.environment(*key, *value);
+    }
+    spec
 }
 
 fn validate_patch_identity(
@@ -487,12 +601,14 @@ const fn source_changed() -> PatchCheckError {
 mod tests {
     use std::fs;
     use std::process::Command;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
 
     const PATCH: &[u8] = b"diff --git a/example.txt b/example.txt\n--- a/example.txt\n+++ b/example.txt\n@@ -1 +1 @@\n-before\n+after\n";
     const BAD_CONTEXT_PATCH: &[u8] = b"diff --git a/example.txt b/example.txt\n--- a/example.txt\n+++ b/example.txt\n@@ -1 +1 @@\n-missing\n+after\n";
+    static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     struct Fixture {
         root: PathBuf,
@@ -511,8 +627,10 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "glaeda-local-patch-check-{}-{nonce}",
+        let counter = FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temp_root = fs::canonicalize(std::env::temp_dir()).expect("canonical temp root");
+        let root = temp_root.join(format!(
+            "glaeda-local-patch-check-{}-{nonce}-{counter}",
             std::process::id()
         ));
         fs::create_dir(&root).expect("fixture root");
