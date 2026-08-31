@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use glaeda::resident_repo_query::MAX_RESPONSE_BYTES;
+
 const BINARY: &str = env!("CARGO_BIN_EXE_glaeda-repo-query");
 const GIT: &str = "/usr/bin/git";
 
@@ -13,6 +15,7 @@ struct Fixture {
     checkout: PathBuf,
     base: String,
     head: String,
+    tree: String,
 }
 
 impl Fixture {
@@ -46,11 +49,13 @@ impl Fixture {
         git(&checkout, &["add", "one.txt", "two.txt"]);
         commit(&checkout, "head");
         let head = git_stdout(&checkout, &["rev-parse", "HEAD"]);
+        let tree = git_stdout(&checkout, &["rev-parse", "HEAD^{tree}"]);
         Self {
             root,
             checkout,
             base,
             head,
+            tree,
         }
     }
 
@@ -65,6 +70,8 @@ impl Fixture {
                 &self.base,
                 "--head",
                 &self.head,
+                "--tree",
+                &self.tree,
             ])
             .args(extra)
             .output()
@@ -153,7 +160,8 @@ fn exact_bundle_is_compact_path_private_and_complete() {
     assert_eq!(report["diff_summary"]["insertions"], 2);
     assert_eq!(report["diff_summary"]["deletions"], 0);
     assert_eq!(report["patch"]["included"], true);
-    assert_eq!(report["metrics"]["git_processes"], 12);
+    assert_eq!(report["object_format"], "sha1");
+    assert_eq!(report["metrics"]["git_processes"], 13);
     let encoded = String::from_utf8(output.stdout).expect("UTF-8 report");
     assert!(!encoded.contains(fixture.root.to_str().expect("UTF-8 root")));
     assert!(!encoded.contains("/usr/bin/git"));
@@ -177,6 +185,99 @@ fn patch_limit_omits_content_without_losing_digest_or_counts() {
 }
 
 #[test]
+fn one_bundle_answers_tree_blob_history_and_object_questions() {
+    let fixture = Fixture::new();
+    let output = fixture.query(&[
+        "--grep-literal",
+        "two",
+        "--grep-path",
+        "one.txt",
+        "--blob",
+        "one.txt",
+        "--history",
+        "one.txt",
+        "--max-history-commits",
+        "1",
+        "--object",
+        &fixture.head,
+        "--object",
+        "ffffffffffffffffffffffffffffffffffffffff",
+    ]);
+    assert!(
+        output.status.success(),
+        "query failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON report");
+    assert_eq!(report["grep"]["status"], "complete");
+    assert_eq!(report["grep"]["matches"][0]["path"], "one.txt");
+    assert_eq!(report["grep"]["matches"][0]["line"], 2);
+    assert_eq!(report["blobs"][0]["status"], "complete");
+    assert_eq!(report["blobs"][0]["text"], "one\ntwo\n");
+    assert_eq!(report["path_history"][0]["status"], "truncated");
+    assert_eq!(
+        report["path_history"][0]["commits"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(report["objects"][0]["exists"], true);
+    assert_eq!(report["objects"][0]["object_type"], "commit");
+    assert_eq!(report["objects"][1]["status"], "complete");
+    assert_eq!(report["objects"][1]["exists"], false);
+}
+
+#[test]
+fn auxiliary_limits_and_unsafe_paths_are_explicit() {
+    let fixture = Fixture::new();
+    let output = fixture.query(&["--blob", "one.txt", "--max-blob-bytes", "3"]);
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON report");
+    assert_eq!(report["blobs"][0]["status"], "truncated");
+    assert_eq!(report["blobs"][0]["reason"], "blob_byte_limit");
+    assert!(report["blobs"][0].get("text").is_none());
+
+    let refused = fixture.query(&["--history", "../outside"]);
+    assert_eq!(refused.status.code(), Some(2));
+    let error = String::from_utf8(refused.stderr).expect("UTF-8 error");
+    assert!(error.contains("unsafe_input"));
+    assert!(!error.contains("../outside"));
+}
+
+#[test]
+fn aggregate_response_limit_drops_content_with_provenance() {
+    let mut fixture = Fixture::new();
+    let content = "x".repeat(16_000);
+    let paths = (0..8)
+        .map(|index| format!("large-{index}.txt"))
+        .collect::<Vec<_>>();
+    for path in &paths {
+        fs::write(fixture.checkout.join(path), &content).expect("write large blob");
+    }
+    let refs = paths.iter().map(String::as_str).collect::<Vec<_>>();
+    let mut add = vec!["add"];
+    add.extend(refs);
+    git(&fixture.checkout, &add);
+    commit(&fixture.checkout, "large response candidate");
+    fixture.head = git_stdout(&fixture.checkout, &["rev-parse", "HEAD"]);
+    fixture.tree = git_stdout(&fixture.checkout, &["rev-parse", "HEAD^{tree}"]);
+
+    let mut arguments = Vec::new();
+    for path in &paths {
+        arguments.push("--blob");
+        arguments.push(path);
+    }
+    let output = fixture.query(&arguments);
+    assert!(output.status.success());
+    assert!(output.stdout.len() <= MAX_RESPONSE_BYTES + 1);
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON report");
+    assert!(report["blobs"].as_array().unwrap().iter().any(|blob| {
+        blob["status"] == "truncated" && blob["reason"] == "aggregate_response_limit"
+    }));
+}
+
+#[test]
 fn project_mismatch_fails_without_echoing_checkout() {
     let fixture = Fixture::new();
     let output = Command::new(BINARY)
@@ -189,6 +290,8 @@ fn project_mismatch_fails_without_echoing_checkout() {
             &fixture.base,
             "--head",
             &fixture.head,
+            "--tree",
+            &fixture.tree,
         ])
         .output()
         .expect("run mismatch");
@@ -197,6 +300,34 @@ fn project_mismatch_fails_without_echoing_checkout() {
     let error = String::from_utf8(output.stderr).expect("UTF-8 error");
     assert!(error.contains("repository_mismatch"));
     assert!(!error.contains(fixture.root.to_str().expect("UTF-8 root")));
+}
+
+#[test]
+fn commit_tree_mismatch_is_refused_before_evidence() {
+    let fixture = Fixture::new();
+    let base_tree = git_stdout(
+        &fixture.checkout,
+        &["rev-parse", &format!("{}^{{tree}}", fixture.base)],
+    );
+    let output = Command::new(BINARY)
+        .args([
+            "--checkout",
+            fixture.checkout.to_str().expect("UTF-8 checkout"),
+            "--project",
+            "github.com/teamleaderleo/glaeda",
+            "--base",
+            &fixture.base,
+            "--head",
+            &fixture.head,
+            "--tree",
+            &base_tree,
+        ])
+        .output()
+        .expect("run mismatch");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let error = String::from_utf8(output.stderr).expect("UTF-8 error");
+    assert!(error.contains("source_mismatch"));
 }
 
 #[test]

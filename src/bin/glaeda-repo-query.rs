@@ -5,12 +5,12 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, ValueEnum};
-use glaeda::artifact::CommitId;
+use glaeda::artifact::{CommitId, GitTreeId};
 use glaeda::process::ProcessExecutor;
 use glaeda::project_catalog::ProjectIdentity;
 use glaeda::resident_repo_query::{
-    DEFAULT_PATCH_BYTES, ResidentRepoQueryError, ResidentRepoQueryObserver,
-    ResidentRepoQueryRequest,
+    DEFAULT_PATCH_BYTES, MAX_BLOB_BYTES, MAX_GREP_MATCHES, MAX_HISTORY_COMMITS,
+    ResidentRepoQueryError, ResidentRepoQueryObserver, ResidentRepoQueryRequest,
 };
 use serde::Serialize;
 
@@ -38,9 +38,45 @@ struct Cli {
     #[arg(long)]
     head: String,
 
+    /// Complete lowercase tree object ID expected for the candidate commit.
+    #[arg(long)]
+    tree: String,
+
     /// Include the complete patch only when it fits this byte ceiling.
     #[arg(long, default_value_t = DEFAULT_PATCH_BYTES)]
     max_patch_bytes: usize,
+
+    /// One literal string to search in the exact candidate tree.
+    #[arg(long)]
+    grep_literal: Option<String>,
+
+    /// Optional literal repository-relative scope for the exact-tree grep; repeatable.
+    #[arg(long = "grep-path", requires = "grep_literal")]
+    grep_paths: Vec<String>,
+
+    /// Maximum aggregate exact-tree grep matches returned.
+    #[arg(long, default_value_t = MAX_GREP_MATCHES)]
+    max_grep_matches: usize,
+
+    /// Literal exact-candidate-tree blob path to read; repeatable.
+    #[arg(long = "blob")]
+    blob_paths: Vec<String>,
+
+    /// Maximum bytes returned per requested blob.
+    #[arg(long, default_value_t = MAX_BLOB_BYTES)]
+    max_blob_bytes: usize,
+
+    /// Literal path whose exact-candidate history should be returned; repeatable.
+    #[arg(long = "history")]
+    history_paths: Vec<String>,
+
+    /// Maximum commits returned per requested history path.
+    #[arg(long, default_value_t = MAX_HISTORY_COMMITS)]
+    max_history_commits: usize,
+
+    /// Complete exact Git object ID whose existence, type, and size should be returned; repeatable.
+    #[arg(long = "object")]
+    object_oids: Vec<String>,
 
     /// Select compact JSON or human output.
     #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
@@ -82,7 +118,25 @@ fn run(
     let project = ProjectIdentity::parse(&cli.project).map_err(|_| cli_input_error())?;
     let base = CommitId::parse(&cli.base).map_err(|_| cli_input_error())?;
     let head = CommitId::parse(&cli.head).map_err(|_| cli_input_error())?;
-    let request = ResidentRepoQueryRequest::new(project, base, head, cli.max_patch_bytes)?;
+    let tree = GitTreeId::parse(&cli.tree).map_err(|_| cli_input_error())?;
+    let mut request =
+        ResidentRepoQueryRequest::new(project, base, head, tree, cli.max_patch_bytes)?;
+    if let Some(literal) = &cli.grep_literal {
+        request = request.with_exact_tree_grep(
+            literal.clone(),
+            cli.grep_paths.clone(),
+            cli.max_grep_matches,
+        )?;
+    }
+    if !cli.blob_paths.is_empty() {
+        request = request.with_blob_reads(cli.blob_paths.clone(), cli.max_blob_bytes)?;
+    }
+    if !cli.history_paths.is_empty() {
+        request = request.with_path_history(cli.history_paths.clone(), cli.max_history_commits)?;
+    }
+    if !cli.object_oids.is_empty() {
+        request = request.with_object_info(cli.object_oids.clone())?;
+    }
     let observer = ResidentRepoQueryObserver::new(GIT_PROGRAM)?;
     observer.observe(&cli.checkout, &request, &ProcessExecutor)
 }
