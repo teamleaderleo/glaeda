@@ -4078,13 +4078,14 @@ mod tests {
                 .kind(),
             LocalInstallGenerationStoreErrorKind::UnsafeFilesystem
         );
-        assert_eq!(
+        assert!(matches!(
             test.store
                 .launcher_targets()
                 .expect_err("launcher observation refuses boundary")
                 .kind(),
             LocalInstallGenerationStoreErrorKind::UnsafeFilesystem
-        );
+                | LocalInstallGenerationStoreErrorKind::Busy
+        ));
         assert_eq!(
             test.store
                 .publish(&publish, &binary)

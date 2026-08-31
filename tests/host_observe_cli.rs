@@ -1,11 +1,15 @@
 #![cfg(target_os = "linux")]
 
+use std::path::Path;
 use std::process::Command;
 
 const BINARY: &str = env!("CARGO_BIN_EXE_glaeda-host-observe");
 
 #[test]
 fn live_json_observation_is_typed_and_path_private() {
+    if !live_host_surface_is_available() {
+        return;
+    }
     let output = Command::new(BINARY)
         .args(["--output", "json", "--port", "3000", "--port", "8080"])
         .output()
@@ -64,6 +68,9 @@ fn live_json_observation_is_typed_and_path_private() {
 
 #[test]
 fn human_output_is_derived_from_the_same_bounded_report() {
+    if !live_host_surface_is_available() {
+        return;
+    }
     let output = Command::new(BINARY)
         .args(["--output", "human", "--port", "3000"])
         .output()
@@ -103,4 +110,8 @@ fn invalid_port_fails_before_host_observation() {
     let stderr = String::from_utf8(output.stderr).expect("UTF-8 error");
     assert!(stderr.contains("invalid value"));
     assert!(!stderr.contains("/home/"));
+}
+
+fn live_host_surface_is_available() -> bool {
+    Path::new("/sys/devices/system/cpu/online").is_file()
 }

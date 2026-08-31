@@ -577,6 +577,10 @@ def materialize(repository_root: Path, task_root: Path, request: Request) -> Pat
     )
     if observed != [request.commit, request.tree] or status:
         raise Refusal("task-private source does not match the exact clean commit/tree")
+    # Bubblewrap cannot create a child mountpoint beneath a read-only bind. Create
+    # the ignored target mountpoint only after exact source admission; the tmpfs
+    # mounted over it remains the sole writable build surface seen by the recipe.
+    (source / "target").mkdir(mode=0o700)
     entries = 0
     bytes_seen = 0
     for parent, directories, files in os.walk(source, followlinks=False):
@@ -608,6 +612,41 @@ def public_crates_io_cache_arguments(cargo_root: Path) -> list[str]:
                     ]
                 )
     return arguments
+
+
+def required_host_plan_evidence_arguments(profile: Profile) -> list[str]:
+    if profile != REQUIRED_PROFILE:
+        return []
+    return [
+        "--ro-bind",
+        "/usr/lib/os-release",
+        "/etc/os-release",
+        "--ro-bind-try",
+        "/etc/nsswitch.conf",
+        "/etc/nsswitch.conf",
+        "--ro-bind-try",
+        "/etc/passwd",
+        "/etc/passwd",
+        "--ro-bind-try",
+        "/etc/group",
+        "/etc/group",
+        "--ro-bind-try",
+        "/etc/subuid",
+        "/etc/subuid",
+        "--ro-bind-try",
+        "/etc/subgid",
+        "/etc/subgid",
+        "--ro-bind-try",
+        "/etc/containers",
+        "/etc/containers",
+        "--dir",
+        "/var",
+        "--dir",
+        "/var/lib",
+        "--ro-bind",
+        "/var/lib/dpkg",
+        "/var/lib/dpkg",
+    ]
 
 
 def sandbox_command(
@@ -671,7 +710,7 @@ def sandbox_command(
         "--size",
         str(spec["build_tmpfs_bytes"]),
         "--tmpfs",
-        "/workspace/target",
+        "/workspace/source/target",
         "--size",
         str(CARGO_HOME_TMPFS_BYTES),
         "--tmpfs",
@@ -689,6 +728,7 @@ def sandbox_command(
         os.fspath(rustup_root),
         "/rustup",
     ]
+    bubblewrap.extend(required_host_plan_evidence_arguments(profile))
     bubblewrap.extend(public_crates_io_cache_arguments(cargo_root))
     bubblewrap.extend(
         [
@@ -706,7 +746,7 @@ def sandbox_command(
             "/cargo-home",
             "--setenv",
             "CARGO_TARGET_DIR",
-            "/workspace/target",
+            "/workspace/source/target",
             "--setenv",
             "CARGO_NET_OFFLINE",
             "true",

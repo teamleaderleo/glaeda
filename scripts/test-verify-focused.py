@@ -113,6 +113,14 @@ class VerifyFocusedTests(unittest.TestCase):
         self.assertNotIn("unrelated-project", joined)
         self.assertNotIn("SSH_AUTH_SOCK", joined)
         self.assertNotIn("GITHUB_TOKEN", joined)
+        for forbidden_host_state in (
+            "/etc/shadow",
+            "/etc/gshadow",
+            "/etc/ssh",
+            "/run",
+            "/var/run",
+        ):
+            self.assertNotIn(forbidden_host_state, command)
         self.assertEqual(
             [
                 argument.removeprefix("--property=")
@@ -138,12 +146,90 @@ class VerifyFocusedTests(unittest.TestCase):
             )
         joined = "\0".join(command)
         self.assertIn("/workspace/source/scripts/verify\0required", joined)
+        self.assertIn("--tmpfs\0/workspace/source/target", joined)
+        self.assertIn("CARGO_TARGET_DIR\0/workspace/source/target", joined)
+        self.assertNotIn("/workspace/target", command)
         self.assertNotIn("/workspace/source/scripts/verify\0focused", joined)
         self.assertIn("--property=RuntimeMaxSec=1200", command)
         self.assertIn("--property=MemoryHigh=10G", command)
         self.assertIn("--property=MemoryMax=12G", command)
         self.assertIn(str(MODULE.REQUIRED_TARGET_TMPFS_BYTES), command)
+        for safe_host_fact in (
+            "/etc/os-release",
+            "/etc/nsswitch.conf",
+            "/etc/passwd",
+            "/etc/group",
+            "/etc/subuid",
+            "/etc/subgid",
+            "/etc/containers",
+            "/var/lib/dpkg",
+        ):
+            self.assertIn(safe_host_fact, command)
 
+    def test_focused_sandbox_does_not_receive_required_host_plan_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in ("source", "cargo", "rustup"):
+                (root / name).mkdir()
+            (root / "cargo" / "bin").mkdir()
+            command = MODULE.sandbox_command(
+                root / "source",
+                root,
+                root / "cargo",
+                root / "rustup",
+                "exact.service",
+            )
+        for required_only_fact in ("/etc/os-release", "/etc/passwd", "/var/lib/dpkg"):
+            self.assertNotIn(required_only_fact, command)
+
+    def test_materialized_source_prepares_only_the_ignored_target_mountpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repository = root / "repository"
+            repository.mkdir()
+            subprocess.run(["git", "init", "--quiet"], cwd=repository, check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "verify@example.invalid"],
+                cwd=repository,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Verify Fixture"],
+                cwd=repository,
+                check=True,
+            )
+            (repository / ".gitignore").write_text("/target/\n", encoding="utf-8")
+            (repository / "tracked").write_text("exact\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=repository, check=True)
+            subprocess.run(["git", "commit", "--quiet", "-m", "fixture"], cwd=repository, check=True)
+            commit, tree = subprocess.run(
+                ["git", "rev-parse", "HEAD", "HEAD^{tree}"],
+                cwd=repository,
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+            ).stdout.splitlines()
+            request = MODULE.Request(
+                repository="teamleaderleo/glaeda",
+                commit=commit,
+                tree=tree,
+                profile_generation=MODULE.profile_generation(MODULE.REQUIRED_PROFILE),
+                command_fingerprint="sha256:" + "a" * 64,
+                profile=MODULE.REQUIRED_PROFILE,
+            )
+            task = root / "task"
+            task.mkdir()
+            source = MODULE.materialize(repository, task, request)
+            self.assertTrue((source / "target").is_dir())
+            self.assertEqual(
+                subprocess.run(
+                    ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+                    cwd=source,
+                    check=True,
+                    stdout=subprocess.PIPE,
+                ).stdout,
+                b"",
+            )
     def test_required_receipt_has_distinct_profile_identity(self) -> None:
         request = MODULE.Request(
             "teamleaderleo/glaeda",
