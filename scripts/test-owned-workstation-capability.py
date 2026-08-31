@@ -3,6 +3,8 @@
 import datetime as dt
 import importlib.util
 from pathlib import Path
+import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -55,6 +57,14 @@ class OwnedWorkstationCapabilityTests(unittest.TestCase):
         self.assertEqual(project, repo_query_project())
         self.assertNotIn("/home/leo/Projects/quarry", str(project))
 
+        cased = project_report()
+        cased["observation"]["primary_project"] = "github.com/TeamLeaderLeo/Quarry"
+        self.assertEqual(MODULE.repo_query_project_from_report(cased), repo_query_project())
+        self.assertEqual(
+            MODULE.normalize_repo_query_project(repo_query_project("TeamLeaderLeo/Quarry")),
+            repo_query_project(),
+        )
+
         ambiguous = project_report()
         ambiguous["observation"]["source_ambiguous"] = True
         with self.assertRaisesRegex(MODULE.SnapshotError, "identity is not canonical"):
@@ -65,9 +75,32 @@ class OwnedWorkstationCapabilityTests(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.SnapshotError, "contract changed"):
             MODULE.repo_query_project_from_report(wrong_authority)
 
+    def test_observer_output_limit_kills_producer_before_late_effect(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            marker = root / "late-effect"
+            observer = root / "observer.py"
+            observer.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys\n"
+                "from pathlib import Path\n"
+                "import time\n"
+                f"sys.stdout.buffer.write(b'x' * {MODULE.MAX_OBSERVATION_BYTES + 1})\n"
+                "sys.stdout.flush()\n"
+                "time.sleep(2)\n"
+                f"Path({str(marker)!r}).write_text('late', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            observer.chmod(0o755)
+            with self.assertRaisesRegex(MODULE.SnapshotError, "exceeded output limit"):
+                MODULE.repo_query_project_observation(observer, root)
+            self.assertFalse(marker.exists())
+
     def test_refuses_duplicate_and_over_ceiling_projects(self) -> None:
         with self.assertRaisesRegex(MODULE.SnapshotError, "duplicate projects"):
             build(repo_query_projects=[repo_query_project("teamleaderleo/glaeda")])
+        with self.assertRaisesRegex(MODULE.SnapshotError, "duplicate projects"):
+            build(repo_query_projects=[repo_query_project("TeamLeaderLeo/Glaeda")])
         with self.assertRaisesRegex(MODULE.SnapshotError, "too many projects"):
             build(repo_query_projects=[
                 repo_query_project(f"teamleaderleo/project-{index}")
