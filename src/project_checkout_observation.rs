@@ -36,9 +36,7 @@ impl ProjectCheckoutLocationIdentity {
         }
     }
 
-    /// Return whether opened directory metadata is the exact observed materialization.
-    #[must_use]
-    pub fn matches_metadata(&self, metadata: &std::fs::Metadata) -> bool {
+    fn matches(&self, metadata: &std::fs::Metadata) -> bool {
         metadata.is_dir()
             && metadata.dev() == self.device
             && metadata.ino() == self.inode
@@ -328,7 +326,7 @@ impl ProjectCheckoutObserver {
         let first = self.snapshot(&checkout, executor)?;
         let second = self.snapshot(&checkout, executor)?;
         let final_metadata = std::fs::metadata(&checkout).map_err(|_| source_changed())?;
-        if first != second || !location_identity.matches_metadata(&final_metadata) {
+        if first != second || !location_identity.matches(&final_metadata) {
             return Err(source_changed());
         }
 

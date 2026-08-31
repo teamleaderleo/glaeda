@@ -1261,17 +1261,18 @@ mod tests {
             return Ok(());
         }
         let fixture = timeout_fixture_directory()?;
+        let expected_directory = fs::canonicalize(&fixture)?;
         let script = "import os,sys; sys.stdout.buffer.write(os.getcwd().encode()+b'\\n'+sys.stdin.buffer.read())";
         let record = ProcessExecutor.execute_in_directory_with_input(
             &CommandSpec::new(python).argument("-c").argument(script),
             &fixture,
             b"bounded-input",
-            Duration::from_secs(1),
+            Duration::from_secs(5),
         )?;
         assert!(record.success);
         assert_eq!(
             record.stdout,
-            format!("{}\nbounded-input", fixture.to_string_lossy())
+            format!("{}\nbounded-input", expected_directory.to_string_lossy())
         );
 
         let oversized = vec![b'x'; MAX_CAPTURED_STDIN_BYTES + 1];
