@@ -27,6 +27,7 @@ from typing import BinaryIO
 SCHEMA_VERSION = 1
 RECEIPT_SCHEMA_VERSION = 1
 SUMMARY_FAILURE_TAIL_BYTES = 16 * 1024
+CHILD_FILE_CREATION_UMASK = 0o022
 
 
 @dataclass(frozen=True)
@@ -99,6 +100,7 @@ def execute_phase(
             argv,
             cwd=root,
             stdin=subprocess.DEVNULL,
+            umask=CHILD_FILE_CREATION_UMASK,
             check=False,
         )
         return result.returncode, None
@@ -110,6 +112,7 @@ def execute_phase(
             stdin=subprocess.DEVNULL,
             stdout=output,
             stderr=subprocess.STDOUT,
+            umask=CHILD_FILE_CREATION_UMASK,
             check=False,
         )
         return result.returncode, summarize_phase_output(output)
@@ -294,6 +297,7 @@ def plan(profile: str) -> dict[str, object]:
         ),
         "source_must_remain_unchanged": True,
         "retained_logs": False,
+        "execution_environment": {"file_creation_umask": "0022"},
         "phases": [
             {"name": phase.name, "argv": phase.public_argv()} for phase in phases
         ],
@@ -479,6 +483,7 @@ def execution_environment(root: Path) -> dict[str, object]:
     )
     return {
         "logical_cpu_count": os.cpu_count(),
+        "file_creation_umask": "0022",
         "cargo_build_jobs": {
             "source": "configured" if configured_jobs is not None else "cargo_default",
             "value": jobs,
