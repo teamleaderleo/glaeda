@@ -28,3 +28,24 @@ fn integration_surface_is_content_free_and_non_authorizing() {
     assert!(encoded.contains("\"authorizes_execution\":false"));
     assert!(!encoded.contains('/'));
 }
+
+#[test]
+fn moderate_pressure_remains_eligible_for_the_independent_capacity_gate() {
+    let result = compile_local_interference_admission(
+        LocalInterferenceRequest {
+            interference_class: LocalInterferenceClass::Coexist,
+            quiet_compatibility: QuietCompatibility::Conflicting,
+        },
+        LocalInterferenceObservation {
+            observed_at_unix_millis: 1_000,
+            node_control: NodeControlState::Available,
+            pressure: LocalPressureClass::Moderate,
+            quiet_lease: None,
+            active: ActiveInterferenceSummary::default(),
+        },
+    );
+    assert_eq!(
+        serde_json::to_value(result).expect("serializable decision")["disposition"],
+        "admit_now"
+    );
+}
