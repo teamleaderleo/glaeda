@@ -68,7 +68,8 @@ one stable, bounded, identity-bearing call that prevents repeated remote reads a
 rediscovery.
 
 Calibration source `b37a40482c09980b65b351bff79480ebefa680e1`, tree
-`9958ff360fe13ca89c32fc56b26acbb2ee6cd863`; path-free receipt digest
+`9958ff360fe13ca89c32fc56b26acbb2ee6cd863`; [path-free raw
+receipt](resident-repo-query-narrow-control-receipt.json) digest
 `sha256:33d75f3408faf0fa235a2969729631b0547d1381184e365cfd6b366c7d9755e3`.
 
 ## Ambient-context deletion
