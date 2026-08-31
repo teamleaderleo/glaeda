@@ -32,7 +32,7 @@ pub enum LocalPressureClass {
     Unknown,
 }
 
-/// Compatibility is local profile evidence, not a caller-selected promise.
+/// Compatibility is local profile evidence, never a caller-selected promise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QuietCompatibility {
@@ -58,7 +58,6 @@ pub struct ActiveInterferenceSummary {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct LocalInterferenceRequest {
     pub interference_class: LocalInterferenceClass,
-    pub quiet_compatibility: QuietCompatibility,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -66,6 +65,9 @@ pub struct LocalInterferenceObservation {
     pub observed_at_unix_millis: u64,
     pub node_control: NodeControlState,
     pub pressure: LocalPressureClass,
+    /// Locally derived compatibility between this candidate's reviewed resource/profile class and
+    /// the currently observed quiet window. The connected caller does not supply this fact.
+    pub candidate_quiet_compatibility: QuietCompatibility,
     pub quiet_lease: Option<QuietLeaseObservation>,
     pub active: ActiveInterferenceSummary,
 }
@@ -143,7 +145,7 @@ pub fn compile_local_interference_admission(
                 false,
             );
         }
-        match request.quiet_compatibility {
+        match observation.candidate_quiet_compatibility {
             QuietCompatibility::Compatible => {}
             QuietCompatibility::Conflicting => {
                 return decision(
@@ -257,16 +259,14 @@ mod tests {
             observed_at_unix_millis: 1_000,
             node_control: NodeControlState::Available,
             pressure: LocalPressureClass::Low,
+            candidate_quiet_compatibility: QuietCompatibility::Conflicting,
             quiet_lease: None,
             active: ActiveInterferenceSummary::default(),
         }
     }
 
-    fn request(interference_class: LocalInterferenceClass) -> LocalInterferenceRequest {
-        LocalInterferenceRequest {
-            interference_class,
-            quiet_compatibility: QuietCompatibility::Conflicting,
-        }
+    const fn request(interference_class: LocalInterferenceClass) -> LocalInterferenceRequest {
+        LocalInterferenceRequest { interference_class }
     }
 
     #[test]
@@ -309,18 +309,18 @@ mod tests {
     }
 
     #[test]
-    fn active_quiet_lease_fences_conflicting_or_unknown_new_work() {
+    fn active_quiet_lease_fences_conflicting_or_unknown_locally_observed_candidates() {
         for compatibility in [QuietCompatibility::Conflicting, QuietCompatibility::Unknown] {
             let mut observed = observation();
+            observed.candidate_quiet_compatibility = compatibility;
             observed.quiet_lease = Some(QuietLeaseObservation {
                 generation: 7,
                 expires_at_unix_millis: 2_000,
             });
-            let candidate = LocalInterferenceRequest {
-                interference_class: LocalInterferenceClass::Coexist,
-                quiet_compatibility: compatibility,
-            };
-            let result = compile_local_interference_admission(candidate, observed);
+            let result = compile_local_interference_admission(
+                request(LocalInterferenceClass::Coexist),
+                observed,
+            );
             assert_eq!(result.disposition, LocalAdmissionDisposition::Wait);
             assert_eq!(result.active_quiet_lease_generation, Some(7));
             assert!(!result.authorizes_preemption);
@@ -330,23 +330,22 @@ mod tests {
     #[test]
     fn active_quiet_lease_allows_only_locally_proven_compatible_non_measurement_work() {
         let mut observed = observation();
+        observed.candidate_quiet_compatibility = QuietCompatibility::Compatible;
         observed.quiet_lease = Some(QuietLeaseObservation {
             generation: 7,
             expires_at_unix_millis: 2_000,
         });
-        let compatible = LocalInterferenceRequest {
-            interference_class: LocalInterferenceClass::Coexist,
-            quiet_compatibility: QuietCompatibility::Compatible,
-        };
-        let result = compile_local_interference_admission(compatible, observed);
+        let result = compile_local_interference_admission(
+            request(LocalInterferenceClass::Coexist),
+            observed,
+        );
         assert_eq!(result.disposition, LocalAdmissionDisposition::AdmitNow);
         assert_eq!(result.active_quiet_lease_generation, Some(7));
 
-        let measurement = LocalInterferenceRequest {
-            interference_class: LocalInterferenceClass::QuietRequired,
-            quiet_compatibility: QuietCompatibility::Compatible,
-        };
-        let result = compile_local_interference_admission(measurement, observed);
+        let result = compile_local_interference_admission(
+            request(LocalInterferenceClass::QuietRequired),
+            observed,
+        );
         assert_eq!(result.disposition, LocalAdmissionDisposition::Wait);
         assert_eq!(result.reason, LocalAdmissionReason::QuietLeaseAlreadyActive);
     }
