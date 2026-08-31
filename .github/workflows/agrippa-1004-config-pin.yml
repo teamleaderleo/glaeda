@@ -37,12 +37,8 @@ jobs:
 
           path = Path('src/bin/glaeda-local-patch-check.rs')
           text = path.read_text()
-          old = '''    Ok(git_command(repository, index)?
-              .argument("apply")'''
-          new = '''    Ok(git_command(repository, index)?
-              .argument("-c")
-              .argument("apply.ignoreWhitespace=false")
-              .argument("apply")'''
+          old = '        .argument("apply")\n        .argument("--check")'
+          new = '        .argument("-c")\n        .argument("apply.ignoreWhitespace=false")\n        .argument("apply")\n        .argument("--check")'
           if text.count(old) != 1:
               raise SystemExit(f'applicability anchor count={text.count(old)}')
           path.write_text(text.replace(old, new, 1))
