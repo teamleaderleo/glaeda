@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Run Glaeda's fast/full-test developer feedback or exact required verification sequence.
 
-This is a repository-local development helper, not the product verification executor. It streams
-child output directly, retains no logs, grants no result-reuse or publication authority, and leaves
-the existing checked-in `glaeda.required` command semantics unchanged.
+This is a repository-local development helper, not the product verification executor. It can stream
+child output directly or reduce it to a bounded decision-focused summary, retains no logs, grants no
+result-reuse or publication authority, and leaves the existing checked-in `glaeda.required` command
+semantics unchanged.
 """
 
 from __future__ import annotations
@@ -20,10 +21,12 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import BinaryIO
 
 
 SCHEMA_VERSION = 1
 RECEIPT_SCHEMA_VERSION = 1
+SUMMARY_FAILURE_TAIL_BYTES = 16 * 1024
 
 
 @dataclass(frozen=True)
@@ -51,6 +54,81 @@ class PhaseObservation:
     exit_code: int
     elapsed_seconds: float
     child_resources: ChildResources
+
+
+@dataclass(frozen=True)
+class PhaseOutputSummary:
+    byte_count: int
+    line_count: int
+    digest: str
+    tail: bytes
+
+
+def summarize_phase_output(output: BinaryIO) -> PhaseOutputSummary:
+    digest = hashlib.sha256()
+    byte_count = 0
+    newline_count = 0
+    final_byte: int | None = None
+    tail = bytearray()
+    output.seek(0)
+    while chunk := output.read(64 * 1024):
+        digest.update(chunk)
+        byte_count += len(chunk)
+        newline_count += chunk.count(b"\n")
+        final_byte = chunk[-1]
+        tail.extend(chunk)
+        if len(tail) > SUMMARY_FAILURE_TAIL_BYTES:
+            del tail[:-SUMMARY_FAILURE_TAIL_BYTES]
+    return PhaseOutputSummary(
+        byte_count=byte_count,
+        line_count=newline_count + int(byte_count > 0 and final_byte != ord("\n")),
+        digest=f"sha256:{digest.hexdigest()}",
+        tail=bytes(tail),
+    )
+
+
+def execute_phase(
+    program: Path,
+    arguments: tuple[str, ...],
+    root: Path,
+    output_mode: str,
+) -> tuple[int, PhaseOutputSummary | None]:
+    argv = [os.fspath(program), *arguments]
+    if output_mode == "stream":
+        result = subprocess.run(
+            argv,
+            cwd=root,
+            stdin=subprocess.DEVNULL,
+            check=False,
+        )
+        return result.returncode, None
+
+    with tempfile.TemporaryFile() as output:
+        result = subprocess.run(
+            argv,
+            cwd=root,
+            stdin=subprocess.DEVNULL,
+            stdout=output,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        return result.returncode, summarize_phase_output(output)
+
+
+def print_failure_tail(summary: PhaseOutputSummary) -> None:
+    if not summary.tail:
+        return
+    omitted = summary.byte_count - len(summary.tail)
+    print(
+        f"captured failure output: tail_bytes={len(summary.tail)} "
+        f"omitted_bytes={omitted}",
+        file=sys.stderr,
+    )
+    sys.stderr.flush()
+    sys.stderr.buffer.write(summary.tail)
+    if not summary.tail.endswith(b"\n"):
+        sys.stderr.buffer.write(b"\n")
+    sys.stderr.buffer.flush()
 
 
 def required_phases() -> tuple[Phase, ...]:
@@ -528,7 +606,11 @@ def receipt_destination(root: Path, requested: Path) -> Path:
     raise RuntimeError("verification receipt must be outside the source worktree")
 
 
-def run(profile: str, receipt_path: Path | None = None) -> int:
+def run(
+    profile: str,
+    receipt_path: Path | None = None,
+    output_mode: str = "stream",
+) -> int:
     root = repository_root()
     if receipt_path is not None:
         receipt_path = receipt_destination(root, receipt_path)
@@ -557,18 +639,15 @@ def run(profile: str, receipt_path: Path | None = None) -> int:
             phase_started = time.monotonic()
             phase_resources_before = child_resources()
             print(f"[{index}/{len(phases)}] {phase.name}: start", file=sys.stderr)
-            result = subprocess.run(
-                [os.fspath(program), *phase.arguments],
-                cwd=root,
-                stdin=subprocess.DEVNULL,
-                check=False,
+            returncode, output = execute_phase(
+                program, phase.arguments, root, output_mode
             )
             elapsed = time.monotonic() - phase_started
             observations.append(
                 PhaseObservation(
                     name=phase.name,
                     argv=phase.public_argv(),
-                    exit_code=result.returncode,
+                    exit_code=returncode,
                     elapsed_seconds=elapsed,
                     child_resources=resource_delta(
                         phase_resources_before, child_resources()
@@ -576,11 +655,19 @@ def run(profile: str, receipt_path: Path | None = None) -> int:
                 )
             )
             print(
-                f"[{index}/{len(phases)}] {phase.name}: exit={result.returncode} elapsed={elapsed:.3f}s",
+                f"[{index}/{len(phases)}] {phase.name}: exit={returncode} elapsed={elapsed:.3f}s"
+                + (
+                    f" output_bytes={output.byte_count} output_lines={output.line_count} "
+                    f"output_digest={output.digest}"
+                    if output is not None
+                    else ""
+                ),
                 file=sys.stderr,
             )
-            if result.returncode != 0:
-                exit_code = result.returncode or 1
+            if returncode != 0:
+                if output is not None:
+                    print_failure_tail(output)
+                exit_code = returncode or 1
                 break
     except KeyboardInterrupt:
         exit_code = 130
@@ -650,13 +737,19 @@ def main() -> int:
         type=Path,
         help="atomically write a path-free performance receipt after execution",
     )
+    parser.add_argument(
+        "--output-mode",
+        choices=("stream", "summary"),
+        default="stream",
+        help="stream child output or emit one bounded summary per phase",
+    )
     args = parser.parse_args()
     if args.plan_json and args.receipt is not None:
         parser.error("--receipt cannot be combined with --plan-json")
     if args.plan_json:
         print(json.dumps(plan(args.profile), indent=2, sort_keys=True))
         return 0
-    return run(args.profile, args.receipt)
+    return run(args.profile, args.receipt, args.output_mode)
 
 
 if __name__ == "__main__":
