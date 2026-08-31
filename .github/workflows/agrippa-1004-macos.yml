@@ -28,29 +28,9 @@ jobs:
           --component rustfmt
           --no-self-update
 
-      - name: Canonicalize macOS test fixture root
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-
-          path = Path('src/bin/glaeda-local-patch-check.rs')
-          text = path.read_text()
-          old = '''        let root = std::env::temp_dir().join(format!(
-              "glaeda-local-patch-check-{}-{nonce}",
-              std::process::id()
-          ));'''
-          new = '''        let temp_root = fs::canonicalize(std::env::temp_dir()).expect("canonical temp root");
-          let root = temp_root.join(format!(
-              "glaeda-local-patch-check-{}-{nonce}",
-              std::process::id()
-          ));'''
-          if text.count(old) != 1:
-              raise SystemExit('fixture replacement anchor moved')
-          path.write_text(text.replace(old, new, 1))
-          PY
-          cargo +1.97.1 fmt --all
-
       - name: Prove descriptor-bound patch check on macOS
+        env:
+          TMPDIR: /private/tmp
         run: |
           cargo +1.97.1 fmt --all --check
           cargo +1.97.1 test --locked --bin glaeda-local-patch-check
