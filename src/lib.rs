@@ -415,6 +415,9 @@ pub mod unix_personal_worker_store;
 /// Unix descriptor-retained persistence for the empty protected cache-generation catalog.
 #[cfg(unix)]
 pub mod unix_protected_cache_generation_catalog_store;
+/// Linux descriptor-bound physical producer for protected cache replacement equivalence.
+#[cfg(target_os = "linux")]
+pub mod unix_protected_cache_replacement_equivalence_producer;
 /// Descriptor-bound private persistence for the resident-sandbox catalog.
 #[cfg(unix)]
 pub mod unix_resident_sandbox_store;
