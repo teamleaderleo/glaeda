@@ -1,14 +1,14 @@
 //! Read-only applicability check for one exact sandbox-authored patch.
 //!
-//! This front door intentionally stops before source mutation. It revalidates one exact clean
-//! checkout, revalidates the supplied patch content identity, asks fixed `/usr/bin/git apply
-//! --check --index` whether the patch is applicable, and then proves the checkout observation is
-//! unchanged. It performs no provider call, branch/commit creation, patch application, publication,
-//! cleanup, or authority grant.
+//! This front door stops before source mutation. It revalidates one exact clean checkout, verifies
+//! the supplied patch content identity, asks fixed `/usr/bin/git apply --check --index` whether the
+//! patch is applicable, and proves the checkout observation is unchanged afterward. It performs no
+//! provider call, branch/commit creation, patch application, publication, cleanup, or authority
+//! grant.
 
 use std::fmt;
 use std::io::{self, Read as _};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::Parser;
@@ -28,7 +28,6 @@ const GIT: &str = "/usr/bin/git";
 const CHECK_TIMEOUT: Duration = Duration::from_secs(15);
 const SHA1_HEX_BYTES: usize = 40;
 const SHA256_PREFIX: &str = "sha256:";
-const SHA256_HEX_BYTES: usize = 64;
 
 #[derive(Debug, Parser)]
 #[command(about = "Check one exact patch against an exact clean checkout without applying it")]
@@ -36,24 +35,19 @@ struct Args {
     /// Canonical absolute task-private Git checkout path. Never emitted in the public report.
     #[arg(long)]
     repository: PathBuf,
-
     /// Exact complete lowercase Git commit expected at HEAD.
     #[arg(long)]
     expected_head: String,
-
     /// Exact complete lowercase Git tree expected at HEAD^{tree}.
     #[arg(long)]
     expected_tree: String,
-
     /// Exact lowercase SHA-1 Git blob object ID expected for the patch bytes.
     #[arg(long)]
     git_blob_sha1: String,
-
     /// Exact canonical sha256:<hex> digest expected for the raw patch bytes.
     #[arg(long)]
     sha256: String,
-
-    /// Exact raw patch byte count. V1 is bounded by the existing reviewed process-input ceiling.
+    /// Exact raw patch byte count. V1 uses the existing reviewed process-input ceiling.
     #[arg(long)]
     bytes: usize,
 }
@@ -130,22 +124,11 @@ enum PatchCheckErrorKind {
     SourceChanged,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 struct PatchCheckError {
     kind: PatchCheckErrorKind,
     code: &'static str,
     problem: &'static str,
-}
-
-impl fmt::Debug for PatchCheckError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("PatchCheckError")
-            .field("kind", &self.kind)
-            .field("code", &self.code)
-            .field("problem", &self.problem)
-            .finish()
-    }
 }
 
 impl fmt::Display for PatchCheckError {
@@ -210,7 +193,7 @@ fn run(args: Args) -> Result<PatchApplicabilityReport, PatchCheckError> {
 }
 
 fn evaluate_patch(
-    repository: &std::path::Path,
+    repository: &Path,
     expectation: &PatchCheckExpectation,
     patch: &[u8],
     executor: &ProcessExecutor,
@@ -232,12 +215,10 @@ fn evaluate_patch(
     if record.argv != expected_argv || record.environment_keys != expected_environment_keys {
         return Err(check_unavailable());
     }
-    let applicable = if record.success && record.status == Some(0) {
-        true
-    } else if record.status == Some(1) {
-        false
-    } else {
-        return Err(check_unavailable());
+    let applicable = match (record.success, record.status) {
+        (true, Some(0)) => true,
+        (false, Some(1)) => false,
+        _ => return Err(check_unavailable()),
     };
 
     let after = observer
@@ -285,7 +266,7 @@ fn validate_base(
     Ok(())
 }
 
-fn applicability_command(repository: &std::path::Path) -> Result<CommandSpec, PatchCheckError> {
+fn applicability_command(repository: &Path) -> Result<CommandSpec, PatchCheckError> {
     let repository = repository.to_str().ok_or_else(checkout_unavailable)?;
     Ok(CommandSpec::new(GIT)
         .argument("--no-optional-locks")
@@ -338,14 +319,10 @@ fn validate_patch_identity(
     if patch.contains(&0) {
         return Err(contains_nul());
     }
-    validate_unified_diff(text)?;
-    Ok(())
+    validate_unified_diff(text)
 }
 
 fn validate_unified_diff(text: &str) -> Result<(), PatchCheckError> {
-    if text.is_empty() {
-        return Err(not_unified_diff());
-    }
     let mut old_header = false;
     let mut new_header = false;
     let mut hunk = false;
@@ -358,7 +335,7 @@ fn validate_unified_diff(text: &str) -> Result<(), PatchCheckError> {
             hunk = true;
         }
     }
-    if !old_header || !new_header || !hunk {
+    if text.is_empty() || !old_header || !new_header || !hunk {
         return Err(not_unified_diff());
     }
     Ok(())
@@ -394,7 +371,7 @@ fn is_lower_hex(value: &str, length: usize) -> bool {
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
-const fn error(
+const fn err(
     kind: PatchCheckErrorKind,
     code: &'static str,
     problem: &'static str,
@@ -403,121 +380,51 @@ const fn error(
 }
 
 const fn invalid_expectation() -> PatchCheckError {
-    error(
-        PatchCheckErrorKind::InvalidExpectation,
-        "patch_check_expectation_invalid",
-        "patch check expectation is outside the reviewed boundary",
-    )
+    err(PatchCheckErrorKind::InvalidExpectation, "patch_check_expectation_invalid", "patch check expectation is outside the reviewed boundary")
 }
-
 const fn input_too_large() -> PatchCheckError {
-    error(
-        PatchCheckErrorKind::InputTooLarge,
-        "patch_check_input_too_large",
-        "patch input exceeds the reviewed process-input limit",
-    )
+    err(PatchCheckErrorKind::InputTooLarge, "patch_check_input_too_large", "patch input exceeds the reviewed process-input limit")
 }
-
 const fn byte_count_mismatch() -> PatchCheckError {
-    error(
-        PatchCheckErrorKind::ByteCountMismatch,
-        "patch_check_byte_count_mismatch",
-        "patch byte count does not match the expected identity",
-    )
+    err(PatchCheckErrorKind::ByteCountMismatch, "patch_check_byte_count_mismatch", "patch byte count does not match the expected identity")
 }
-
 const fn sha256_mismatch() -> PatchCheckError {
-    error(
-        PatchCheckErrorKind::Sha256Mismatch,
-        "patch_check_sha256_mismatch",
-        "patch SHA-256 does not match the expected identity",
-    )
+    err(PatchCheckErrorKind::Sha256Mismatch, "patch_check_sha256_mismatch", "patch SHA-256 does not match the expected identity")
 }
-
 const fn git_blob_mismatch() -> PatchCheckError {
-    error(
-        PatchCheckErrorKind::GitBlobMismatch,
-        "patch_check_git_blob_mismatch",
-        "patch Git blob identity does not match the expected identity",
-    )
+    err(PatchCheckErrorKind::GitBlobMismatch, "patch_check_git_blob_mismatch", "patch Git blob identity does not match the expected identity")
 }
-
 const fn invalid_utf8() -> PatchCheckError {
-    error(
-        PatchCheckErrorKind::InvalidUtf8,
-        "patch_check_utf8_invalid",
-        "patch input is not valid UTF-8",
-    )
+    err(PatchCheckErrorKind::InvalidUtf8, "patch_check_utf8_invalid", "patch input is not valid UTF-8")
 }
-
 const fn contains_nul() -> PatchCheckError {
-    error(
-        PatchCheckErrorKind::ContainsNul,
-        "patch_check_nul_forbidden",
-        "patch input contains a NUL byte",
-    )
+    err(PatchCheckErrorKind::ContainsNul, "patch_check_nul_forbidden", "patch input contains a NUL byte")
 }
-
 const fn not_unified_diff() -> PatchCheckError {
-    error(
-        PatchCheckErrorKind::NotUnifiedDiff,
-        "patch_check_unified_diff_invalid",
-        "patch input is not an ordinary unified diff",
-    )
+    err(PatchCheckErrorKind::NotUnifiedDiff, "patch_check_unified_diff_invalid", "patch input is not an ordinary unified diff")
 }
-
 const fn input_unavailable() -> PatchCheckError {
-    error(
-        PatchCheckErrorKind::InputUnavailable,
-        "patch_check_input_unavailable",
-        "patch input could not be read",
-    )
+    err(PatchCheckErrorKind::InputUnavailable, "patch_check_input_unavailable", "patch input could not be read")
 }
-
 const fn checkout_unavailable() -> PatchCheckError {
-    error(
-        PatchCheckErrorKind::CheckoutUnavailable,
-        "patch_check_checkout_unavailable",
-        "exact checkout evidence is unavailable",
-    )
+    err(PatchCheckErrorKind::CheckoutUnavailable, "patch_check_checkout_unavailable", "exact checkout evidence is unavailable")
 }
-
 const fn base_mismatch() -> PatchCheckError {
-    error(
-        PatchCheckErrorKind::BaseMismatch,
-        "patch_check_base_mismatch",
-        "checkout commit or tree does not match the expected base",
-    )
+    err(PatchCheckErrorKind::BaseMismatch, "patch_check_base_mismatch", "checkout commit or tree does not match the expected base")
 }
-
 const fn checkout_dirty() -> PatchCheckError {
-    error(
-        PatchCheckErrorKind::CheckoutDirty,
-        "patch_check_checkout_dirty",
-        "checkout is not clean at the expected base",
-    )
+    err(PatchCheckErrorKind::CheckoutDirty, "patch_check_checkout_dirty", "checkout is not clean at the expected base")
 }
-
 const fn check_unavailable() -> PatchCheckError {
-    error(
-        PatchCheckErrorKind::CheckUnavailable,
-        "patch_check_unavailable",
-        "patch applicability could not be established",
-    )
+    err(PatchCheckErrorKind::CheckUnavailable, "patch_check_unavailable", "patch applicability could not be established")
 }
-
 const fn source_changed() -> PatchCheckError {
-    error(
-        PatchCheckErrorKind::SourceChanged,
-        "patch_check_source_changed",
-        "checkout changed during the applicability check",
-    )
+    err(PatchCheckErrorKind::SourceChanged, "patch_check_source_changed", "checkout changed during the applicability check")
 }
 
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -559,31 +466,26 @@ mod tests {
         Fixture { root, head, tree }
     }
 
-    fn run_git(root: &Path, args: &[&str]) {
-        let status = Command::new(GIT)
+    fn git(root: &Path, args: &[&str]) -> Command {
+        let mut command = Command::new(GIT);
+        command
             .env_clear()
             .env("HOME", root)
             .env("LANG", "C")
             .env("LC_ALL", "C")
             .arg("-C")
             .arg(root)
-            .args(args)
-            .status()
-            .expect("git process");
+            .args(args);
+        command
+    }
+
+    fn run_git(root: &Path, args: &[&str]) {
+        let status = git(root, args).status().expect("git process");
         assert!(status.success(), "git fixture command failed: {args:?}");
     }
 
     fn git_output(root: &Path, args: &[&str]) -> String {
-        let output = Command::new(GIT)
-            .env_clear()
-            .env("HOME", root)
-            .env("LANG", "C")
-            .env("LC_ALL", "C")
-            .arg("-C")
-            .arg(root)
-            .args(args)
-            .output()
-            .expect("git process");
+        let output = git(root, args).output().expect("git process");
         assert!(output.status.success(), "git fixture command failed: {args:?}");
         String::from_utf8(output.stdout)
             .expect("utf8")
@@ -605,13 +507,8 @@ mod tests {
     fn exact_applicable_patch_is_checked_without_mutating_source() {
         let fixture = fixture();
         let before_status = git_output(&fixture.root, &["status", "--porcelain=v1"]);
-        let report = evaluate_patch(
-            &fixture.root,
-            &expectation(&fixture, PATCH),
-            PATCH,
-            &ProcessExecutor,
-        )
-        .expect("applicability");
+        let report = evaluate_patch(&fixture.root, &expectation(&fixture, PATCH), PATCH, &ProcessExecutor)
+            .expect("applicability");
         assert!(report.applicable);
         assert!(report.source_unchanged);
         assert!(!report.contains_patch_content);
@@ -623,7 +520,7 @@ mod tests {
     }
 
     #[test]
-    fn context_mismatch_is_a_bounded_negative_result_and_source_stays_clean() {
+    fn context_mismatch_is_bounded_and_source_stays_clean() {
         let fixture = fixture();
         let report = evaluate_patch(
             &fixture.root,
@@ -638,18 +535,13 @@ mod tests {
     }
 
     #[test]
-    fn dirty_or_wrong_base_is_refused_before_git_apply_check() {
+    fn dirty_or_wrong_base_is_refused_before_check() {
         let fixture = fixture();
         fs::write(fixture.root.join("untracked.txt"), "foreign\n").expect("untracked");
         assert_eq!(
-            evaluate_patch(
-                &fixture.root,
-                &expectation(&fixture, PATCH),
-                PATCH,
-                &ProcessExecutor,
-            )
-            .expect_err("dirty refusal")
-            .kind,
+            evaluate_patch(&fixture.root, &expectation(&fixture, PATCH), PATCH, &ProcessExecutor)
+                .expect_err("dirty refusal")
+                .kind,
             PatchCheckErrorKind::CheckoutDirty
         );
         fs::remove_file(fixture.root.join("untracked.txt")).expect("remove untracked");
@@ -665,19 +557,18 @@ mod tests {
     }
 
     #[test]
-    fn patch_identity_and_v1_input_limit_fail_closed() {
+    fn identity_and_v1_input_limit_fail_closed() {
         let fixture = fixture();
         let expected = expectation(&fixture, PATCH);
-        let shorter = &PATCH[..PATCH.len() - 1];
         assert_eq!(
-            validate_patch_identity(&expected, shorter)
+            validate_patch_identity(&expected, &PATCH[..PATCH.len() - 1])
                 .expect_err("byte mismatch")
                 .kind,
             PatchCheckErrorKind::ByteCountMismatch
         );
 
         let oversized = vec![b'a'; MAX_CAPTURED_STDIN_BYTES + 1];
-        let mut oversized_expectation = expectation(&fixture, PATCH);
+        let mut oversized_expectation = expected;
         oversized_expectation.bytes = oversized.len();
         assert_eq!(
             validate_patch_identity(&oversized_expectation, &oversized)
@@ -688,27 +579,23 @@ mod tests {
     }
 
     #[test]
-    fn refusal_and_success_shapes_do_not_serialize_content_or_paths() {
+    fn report_and_refusal_are_content_and_path_free() {
         let fixture = fixture();
-        let report = evaluate_patch(
-            &fixture.root,
-            &expectation(&fixture, PATCH),
-            PATCH,
-            &ProcessExecutor,
-        )
-        .expect("applicability");
+        let report = evaluate_patch(&fixture.root, &expectation(&fixture, PATCH), PATCH, &ProcessExecutor)
+            .expect("applicability");
         let encoded = serde_json::to_string(&report).expect("json");
         assert!(!encoded.contains("example.txt"));
         assert!(!encoded.contains(fixture.root.to_string_lossy().as_ref()));
         assert!(!encoded.contains("before"));
         assert!(!encoded.contains("after"));
 
+        let error = checkout_unavailable();
         let refusal = RefusalReceipt {
             schema_version: SCHEMA_VERSION,
             document_type: "glaeda-local-patch-applicability-refusal",
             admitted: false,
-            code: checkout_unavailable().code,
-            problem: checkout_unavailable().problem,
+            code: error.code,
+            problem: error.problem,
             contains_patch_content: false,
             contains_private_path: false,
             authorizes_source_mutation: false,
