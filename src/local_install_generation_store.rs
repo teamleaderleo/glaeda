@@ -552,7 +552,6 @@ impl UnixLocalInstallGenerationStore {
         &self,
     ) -> Result<LockedLocalInstallLauncherTargets, LocalInstallGenerationStoreError> {
         let guard = self.acquire_lock(StoreLockMode::Shared)?;
-        self.verify_boundaries()?;
         self.verify_absolute_launcher_root()?;
         if self.has_recovery_debt()? {
             return Err(store_error(
@@ -655,7 +654,6 @@ impl UnixLocalInstallGenerationStore {
         &self,
     ) -> Result<LocalInstallGenerationStoreSnapshot, LocalInstallGenerationStoreError> {
         let _guard = self.acquire_lock(StoreLockMode::Shared)?;
-        self.verify_boundaries()?;
         if self.has_recovery_debt()? {
             return Err(store_error(
                 LocalInstallGenerationStoreErrorKind::RecoveryRequired,
@@ -674,7 +672,6 @@ impl UnixLocalInstallGenerationStore {
         &self,
     ) -> Result<LocalInstallGenerationRecoveryReceipt, LocalInstallGenerationStoreError> {
         let _guard = self.acquire_lock(StoreLockMode::Exclusive)?;
-        self.verify_boundaries()?;
         let disposition = self.recover_locked()?;
         Ok(LocalInstallGenerationRecoveryReceipt {
             disposition,
@@ -707,7 +704,6 @@ impl UnixLocalInstallGenerationStore {
         fault: Option<FaultBoundary>,
     ) -> Result<LocalInstallGenerationPublishReceipt, LocalInstallGenerationStoreError> {
         let _guard = self.acquire_lock(StoreLockMode::Exclusive)?;
-        self.verify_boundaries()?;
         self.recover_locked()?;
         let current = self.load_current_document_locked()?;
         if let Some((operation, request_digest)) = &current.operation
@@ -941,6 +937,7 @@ impl UnixLocalInstallGenerationStore {
         };
         match fs::flock(&lock, operation) {
             Ok(()) => {
+                // This is the single retained-boundary pass for every locked public operation.
                 self.verify_boundaries()?;
                 Ok(StoreLock { lock })
             }
@@ -4054,6 +4051,58 @@ mod tests {
                 .expect_err("incomplete debt is preserved")
                 .kind(),
             LocalInstallGenerationStoreErrorKind::RecoveryRequired
+        );
+    }
+
+    #[test]
+    fn every_public_operation_rejects_unsafe_boundaries_after_lock_acquisition() {
+        let test = TestStore::new("single-boundary-verification");
+        let bytes = b"#!/bin/false\nunsafe boundary candidate\n";
+        let binary = test.binary("candidate", bytes);
+        let generation = candidate(None, 'a', bytes);
+        let publish = request('1', None, generation);
+        std_fs::set_permissions(
+            test.root().join(GENERATIONS_DIRECTORY),
+            std_fs::Permissions::from_mode(0o755),
+        )
+        .expect("make generations boundary unsafe");
+
+        assert_eq!(
+            test.store.load().expect_err("load refuses boundary").kind(),
+            LocalInstallGenerationStoreErrorKind::UnsafeFilesystem
+        );
+        assert_eq!(
+            test.store
+                .recover()
+                .expect_err("recovery refuses boundary")
+                .kind(),
+            LocalInstallGenerationStoreErrorKind::UnsafeFilesystem
+        );
+        assert_eq!(
+            test.store
+                .launcher_targets()
+                .expect_err("launcher observation refuses boundary")
+                .kind(),
+            LocalInstallGenerationStoreErrorKind::UnsafeFilesystem
+        );
+        assert_eq!(
+            test.store
+                .publish(&publish, &binary)
+                .expect_err("publication refuses boundary")
+                .kind(),
+            LocalInstallGenerationStoreErrorKind::UnsafeFilesystem
+        );
+        assert!(
+            test.store
+                .generation_names()
+                .expect("inspect unchanged generations")
+                .is_empty()
+        );
+        assert!(
+            std_fs::read_dir(test.root().join(STAGED_DIRECTORY))
+                .expect("inspect unchanged staging")
+                .next()
+                .is_none()
         );
     }
 
