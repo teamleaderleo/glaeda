@@ -92,8 +92,11 @@ Cargo target/home identities and the build-job setting make cold/warm samples co
 publishing private paths. It retains no command output and grants no result-reuse or publication
 authority.
 
-`./scripts/verify required` runs the exact eight commands below in order and streams their output
-without retaining a log. The explicit commands remain listed as the canonical contract.
+`./scripts/verify required` runs the exact eight commands below in order, emits one
+byte/line/content-digest summary per phase, and retains no log. A failed phase also emits only its
+final 16 KiB as a diagnostic tail and declares the omitted byte count. Use `--output-mode stream`
+when live child output is useful; presentation does not change the phase argv or verification
+authority. The explicit commands remain listed as the canonical contract.
 
 Before declaring a code change ready:
 

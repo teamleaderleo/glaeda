@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import runpy
@@ -317,6 +318,34 @@ class VerifyPlanTests(unittest.TestCase):
             expected = Path(directory) / "verification-receipt.json"
             self.assertEqual(receipt_destination(ROOT, expected), expected)
 
+    def test_summary_mode_counts_and_hashes_combined_phase_output(self) -> None:
+        execute_phase = runpy.run_path(str(VERIFY), run_name="glaeda_verify_test")[
+            "execute_phase"
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            program = fixture / "producer"
+            program.write_text(
+                "#!/usr/bin/python3\n"
+                "import os\n"
+                "os.write(1, b'alpha\\n')\n"
+                "os.write(2, b'beta')\n",
+                encoding="utf-8",
+            )
+            program.chmod(0o755)
+
+            returncode, summary = execute_phase(program, (), fixture, "summary")
+            expected = b"alpha\nbeta"
+            self.assertEqual(returncode, 0)
+            self.assertIsNotNone(summary)
+            self.assertEqual(summary.byte_count, len(expected))
+            self.assertEqual(summary.line_count, 2)
+            self.assertEqual(
+                summary.digest,
+                f"sha256:{hashlib.sha256(expected).hexdigest()}",
+            )
+            self.assertEqual(summary.tail, expected)
+
     def test_failed_phase_still_writes_a_terminal_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = Path(directory)
@@ -352,6 +381,46 @@ class VerifyPlanTests(unittest.TestCase):
             self.assertEqual(receipt["phases"][0]["name"], "unit-and-binary-tests")
             self.assertEqual(receipt["phases"][0]["exit_code"], 7)
             self.assertTrue(receipt["source"]["unchanged"])
+
+    def test_summary_mode_prints_only_a_bounded_failure_tail(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            fake_cargo = fixture / "cargo"
+            fake_cargo.write_text(
+                "#!/usr/bin/python3\n"
+                "import sys\n"
+                "sys.stdout.write('EARLY_DIAGNOSTIC\\n' + 'x' * 20000 + "
+                "'\\nFINAL_DIAGNOSTIC\\n')\n"
+                "raise SystemExit(7)\n",
+                encoding="utf-8",
+            )
+            fake_cargo.chmod(0o755)
+            environment = os.environ.copy()
+            environment["PATH"] = f"{fixture}:/usr/bin:/bin"
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(VERIFY),
+                    "fast",
+                ],
+                cwd=ROOT,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 7)
+            self.assertNotIn("EARLY_DIAGNOSTIC", result.stderr)
+            self.assertIn("FINAL_DIAGNOSTIC", result.stderr)
+            self.assertIn("captured failure output: tail_bytes=16384", result.stderr)
+            self.assertRegex(result.stderr, r"output_bytes=2003[0-9]")
+            self.assertRegex(result.stderr, r"output_lines=3")
+            self.assertRegex(result.stderr, r"output_digest=sha256:[0-9a-f]{64}")
 
     def test_plan_only_mode_rejects_a_receipt_path(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
