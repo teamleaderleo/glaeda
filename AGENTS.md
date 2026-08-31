@@ -92,23 +92,17 @@ Cargo target/home identities and the build-job setting make cold/warm samples co
 publishing private paths. It retains no command output and grants no result-reuse or publication
 authority.
 
-`./scripts/verify required` runs the exact eight commands below in order, emits one
+`./scripts/verify required` runs the canonical repository-required profile, emits one
 byte/line/content-digest summary per phase, and retains no log. A failed phase also emits only its
 final 16 KiB as a diagnostic tail and declares the omitted byte count. Use `--output-mode stream`
 when live child output is useful; presentation does not change the phase argv or verification
-authority. The explicit commands remain listed as the canonical contract.
+authority. `./scripts/verify required --plan-json` is the machine-readable exact command and
+execution-environment contract; do not copy that generated procedure into agent context.
 
-Before declaring a code change ready:
+Before declaring a code change ready, run:
 
 ```bash
-./scripts/bootstrap --output json
-cargo fmt --all -- --check
-cargo clippy --locked --all-targets --all-features -- -D warnings
-cargo test --locked --all-targets --all-features
-cargo run --locked --quiet -- --output json doctor
-cargo run --locked --quiet -- plan --file examples/quarry.yml
-cargo run --locked --quiet -- --output json plan --file examples/glossless.yml
-cargo run --locked --quiet -- --output json host plan --file examples/quarry.yml
+./scripts/verify required
 ```
 
 A bootstrap result of `ready_with_declared_deviations` is acceptable when every deviation is recorded and irrelevant to the selected repository verification profile. `blocked` must be resolved before verification. A doctor warning is acceptable on a development machine that lacks Podman or systemd. A doctor failure must be understood and documented. Planning must never mutate the filesystem, users, services, containers, routes, leases, GitHub state, release state, incident stores, backup stores, or fleet policy.
