@@ -95,7 +95,7 @@ struct TemporaryGitIndex {
 
 impl TemporaryGitIndex {
     fn new() -> Result<Self, PatchCheckError> {
-        let root = fs::canonicalize(std::env::temp_dir()).map_err(|_| check_unavailable())?;
+        let root = fs::canonicalize("/tmp").map_err(|_| check_unavailable())?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|_| check_unavailable())?
