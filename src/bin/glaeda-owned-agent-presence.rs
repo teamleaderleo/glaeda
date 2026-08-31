@@ -225,11 +225,7 @@ struct ProjectionError {
 }
 
 impl ProjectionError {
-    const fn new(
-        kind: ProjectionErrorKind,
-        code: &'static str,
-        problem: &'static str,
-    ) -> Self {
+    const fn new(kind: ProjectionErrorKind, code: &'static str, problem: &'static str) -> Self {
         Self {
             kind,
             code,
@@ -387,11 +383,17 @@ fn normalize_worker(worker: &mut WorkerObservation) -> Result<(), ProjectionErro
         return Err(invalid_worker("result age exceeds the supported bound"));
     }
     if worker.process.process_count > MAX_PROCESS_COUNT
-        || worker.process.rss_bytes.is_some_and(|value| value > MAX_RSS_BYTES)
+        || worker
+            .process
+            .rss_bytes
+            .is_some_and(|value| value > MAX_RSS_BYTES)
     {
-        return Err(invalid_worker("process summary exceeds the supported bound"));
+        return Err(invalid_worker(
+            "process summary exceeds the supported bound",
+        ));
     }
-    if worker.process.process_count == 0 && worker.process.rss_bytes.is_some_and(|value| value != 0) {
+    if worker.process.process_count == 0 && worker.process.rss_bytes.is_some_and(|value| value != 0)
+    {
         return Err(invalid_worker("process count and memory evidence disagree"));
     }
 
@@ -432,13 +434,17 @@ fn normalize_worker(worker: &mut WorkerObservation) -> Result<(), ProjectionErro
 
 fn canonical_repository(value: &str) -> Result<String, ProjectionError> {
     if value.len() > MAX_REPOSITORY_BYTES {
-        return Err(invalid_worker("repository identity exceeds the supported bound"));
+        return Err(invalid_worker(
+            "repository identity exceeds the supported bound",
+        ));
     }
     let mut parts = value.split('/');
     let owner = parts.next().unwrap_or_default();
     let repository = parts.next().unwrap_or_default();
     if parts.next().is_some() || !valid_repo_component(owner) || !valid_repo_component(repository) {
-        return Err(invalid_worker("repository identity is not canonical owner/name"));
+        return Err(invalid_worker(
+            "repository identity is not canonical owner/name",
+        ));
     }
     Ok(format!(
         "{}/{}",
@@ -527,7 +533,8 @@ fn emit_report(output: OutputFormat, report: PresenceReport) -> ExitCode {
         OutputFormat::Human => {
             println!(
                 "owned agent presence: workers={} authority={}",
-                report.workers.len(), report.authority
+                report.workers.len(),
+                report.authority
             );
             for worker in &report.workers {
                 let work = match &worker.work {
@@ -712,8 +719,8 @@ mod tests {
 
     #[test]
     fn serialized_projection_has_no_transcript_process_or_path_fields() {
-        let report = project_presence(input(vec![managed_worker('a', "big-red")]))
-            .expect("projection");
+        let report =
+            project_presence(input(vec![managed_worker('a', "big-red")])).expect("projection");
         let json = serde_json::to_string(&report).expect("json");
         for forbidden in [
             "session_id",
@@ -725,7 +732,10 @@ mod tests {
             "/home/",
             "/Users/",
         ] {
-            assert!(!json.contains(forbidden), "unexpected private field: {forbidden}");
+            assert!(
+                !json.contains(forbidden),
+                "unexpected private field: {forbidden}"
+            );
         }
         assert!(json.contains("\"authority\":\"observation_only\""));
         assert!(json.contains("\"repository\":\"teamleaderleo/glaeda\""));
