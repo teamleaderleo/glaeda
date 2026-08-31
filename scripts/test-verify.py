@@ -403,8 +403,6 @@ class VerifyPlanTests(unittest.TestCase):
                     sys.executable,
                     str(VERIFY),
                     "fast",
-                    "--output-mode",
-                    "summary",
                 ],
                 cwd=ROOT,
                 env=environment,

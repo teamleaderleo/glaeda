@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Run Glaeda's fast/full-test developer feedback or exact required verification sequence.
 
-This is a repository-local development helper, not the product verification executor. It can stream
-child output directly or reduce it to a bounded decision-focused summary, retains no logs, grants no
-result-reuse or publication authority, and leaves the existing checked-in `glaeda.required` command
-semantics unchanged.
+This is a repository-local development helper, not the product verification executor. It reduces
+child output to a bounded decision-focused summary by default and can explicitly stream it live,
+retains no logs, grants no result-reuse or publication authority, and leaves the existing checked-in
+`glaeda.required` command semantics unchanged.
 """
 
 from __future__ import annotations
@@ -609,7 +609,7 @@ def receipt_destination(root: Path, requested: Path) -> Path:
 def run(
     profile: str,
     receipt_path: Path | None = None,
-    output_mode: str = "stream",
+    output_mode: str = "summary",
 ) -> int:
     root = repository_root()
     if receipt_path is not None:
@@ -740,8 +740,8 @@ def main() -> int:
     parser.add_argument(
         "--output-mode",
         choices=("stream", "summary"),
-        default="stream",
-        help="stream child output or emit one bounded summary per phase",
+        default="summary",
+        help="emit one bounded summary per phase (default) or stream all child output",
     )
     args = parser.parse_args()
     if args.plan_json and args.receipt is not None:

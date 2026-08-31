@@ -61,7 +61,7 @@ Run `./scripts/bootstrap` from the repository root before selecting a verificati
 For a quick non-authoritative edit/test loop, run:
 
 ```bash
-./scripts/verify fast --output-mode summary
+./scripts/verify fast
 ```
 
 This runs library/binary tests first, a fail-closed rustfmt check limited to changed/untracked Rust
@@ -74,7 +74,7 @@ When `cargo-nextest` is available, run the complete Rust test inventory with fas
 scheduling via:
 
 ```bash
-./scripts/verify full-tests --output-mode summary
+./scripts/verify full-tests
 ```
 
 This runs the same locked `--all-targets --all-features` scope as the required Cargo test phase,
@@ -92,11 +92,11 @@ Cargo target/home identities and the build-job setting make cold/warm samples co
 publishing private paths. It retains no command output and grants no result-reuse or publication
 authority.
 
-`./scripts/verify required --output-mode summary` runs the exact eight commands below in order,
-emits one byte/line/content-digest summary per phase, and retains no log. A failed phase also emits
-only its final 16 KiB as a diagnostic tail and declares the omitted byte count. Omit the flag when
-live streaming is useful; presentation does not change the phase argv or verification authority.
-The explicit commands remain listed as the canonical contract.
+`./scripts/verify required` runs the exact eight commands below in order, emits one
+byte/line/content-digest summary per phase, and retains no log. A failed phase also emits only its
+final 16 KiB as a diagnostic tail and declares the omitted byte count. Use `--output-mode stream`
+when live child output is useful; presentation does not change the phase argv or verification
+authority. The explicit commands remain listed as the canonical contract.
 
 Before declaring a code change ready:
 
