@@ -69,11 +69,12 @@ Host preparation is an explicit privileged path:
 ```bash
 cargo build --locked
 sudo ./target/debug/glaeda host prepare --file examples/quarry.yml
+sudo ./target/debug/glaeda host prepare --file examples/quarry.yml --confirm EXACT_CONFIRMATION
 ```
 
 Review the exact built binary and plan before granting privilege. Repository code, scripts, and ordinary agent work never gain privilege merely because Glaeda can prepare a host.
 
-Project manifests describe project identity and desired execution policy; they carry no executable shell surface. See [`docs/MANIFEST.md`](docs/MANIFEST.md) and [`examples/`](examples/) for the current schema and examples.
+Project manifests describe project identity and desired execution policy; project repositories retain executable verification and build behavior. See [`docs/MANIFEST.md`](docs/MANIFEST.md) and [`examples/`](examples/) for the current schema and examples.
 
 ## Design principles
 
