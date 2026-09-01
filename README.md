@@ -21,7 +21,7 @@ See [`docs/COMPUTE_RUNTIME.md`](docs/COMPUTE_RUNTIME.md) for the product model a
 
 ## Current status
 
-Glaeda is pre-alpha and already exercises real systems paths on operator-owned Apple silicon. Current `main` contains the durable disposable-worker/control foundations, GitHub Runner Scale Set integration, prepared Lima/VZ worker support, trusted resident-state primitives, hot-state admission, task/source-view work, and bounded verification/performance receipts.
+Glaeda is pre-alpha and already exercises real systems paths on operator-owned Apple silicon and Linux/x86-64 machines. Current dogfood includes resident repository-evidence execution on Linux; current `main` also contains the durable disposable-worker/control foundations, GitHub Runner Scale Set integration, prepared Lima/VZ worker support, trusted resident-state primitives, hot-state admission, task/source-view work, and bounded verification/performance receipts.
 
 The current production direction still has active gaps around complete hostile-work network/credential hardening and end-to-end composition of the trusted resident task path. Current issues, pull requests, Git history, and [`docs/ROADMAP.md`](docs/ROADMAP.md) own progression; this README describes the present product boundary.
 
