@@ -1,23 +1,44 @@
 # Glaeda
 
-**Blazingly hot, trust-tiered execution for compute workloads — from one machine to a fleet.**
+**Blazingly hot compute: start from the hottest state you can prove is valid.**
 
-Glaeda finds the quickest trustworthy path from declared work to useful compute results while preserving exact ownership, recovery, and reusable state. Coding agents and GitHub Actions are major current workloads, while the runtime boundary is broader: CI, batch compute, data work, rendering, model workloads, and future typed adapters can use the same execution core.
+Glaeda is a trust-tiered execution runtime that minimizes repeated setup on the path from declared work to a useful accepted result. It treats source trees, Git objects, dependency state, compiler outputs, indexes, prepared runtimes, resident services, and other expensive intermediates as typed reusable state whose identity, validity, ownership, and trust boundary must be proven for the workload that wants to consume them.
+
+**Warm means state survived. Hot means Glaeda can prove this workload may reuse it.**
+
+Coding agents and GitHub Actions are major current proving workloads, while the runtime boundary is broader: CI, batch compute, data work, rendering, model workloads, and future typed adapters can use the same execution core.
 
 > **Disposable is a capability. Trust decides residency.**
 
 ```text
 work becomes known
 -> identify exact workload, trust, inputs, and capabilities
--> select eligible compute and valid reusable state
+-> select eligible compute and the hottest valid reusable state
 -> admit capacity
+-> materialize only what must change
 -> execute
 -> return bounded outputs and evidence
 -> retain, reset, quarantine, migrate, or destroy physical state
 -> recover from durable truth after interruption
 ```
 
+Hot state is acceleration and working state, never independent authority. A surviving VM, cache, worktree, index, service, or build tree does not get to decide what source it belongs to, whether it is current, who may mutate it, or whether a derived result is acceptable. Ambiguous state is revalidated, reset, quarantined, rebuilt, or rejected.
+
 See [`docs/COMPUTE_RUNTIME.md`](docs/COMPUTE_RUNTIME.md) for the product model and [`docs/BLAZINGLY_HOT.md`](docs/BLAZINGLY_HOT.md) for the hot-execution programme.
+
+## What "blazingly hot" means
+
+Glaeda does not use one universal cache, worker lifetime, or filesystem treatment. It tries to remove the largest repeated cost while preserving the semantics of the state being reused.
+
+Current work follows a few rules:
+
+- **Keep valuable trusted state resident when that wins the complete loop.** Destroyability is a recovery property, not a requirement to throw useful state away after every task.
+- **Choose reuse by state family.** Mostly-read source can benefit from immutable resident generations and task-private views; write-heavy build state often wants private copy-on-write lineage; long-lived services need their own scoped lifecycle; hostile work may still be hottest when it starts fresh and isolated.
+- **Move small requests toward large state.** A repository, build tree, index, dataset, or model can stay resident while an exact bounded question travels to it instead of repeatedly transporting and reconstructing the state around the request.
+- **Prefer native mechanisms.** Linux scheduling, page cache, cgroups, filesystems, mounts, process primitives, Git, and service managers remain the baseline. Glaeda adds semantic identity, admission, validity, recovery, and evidence only where those primitives do not provide them.
+- **Keep the cold path complete.** Every promoted hot-state family needs a reset or reconstruction route from canonical inputs. Losing acceleration state may cost time and compute; it must not destroy execution truth.
+
+The optimization order is intentionally boring: avoid destroying valuable valid state; delete avoidable semantic work; reuse exact work; overlap independent preparation; share immutable inputs; parallelize only what is actually independent; optimize hot kernels; buy faster hardware last.
 
 ## Current status
 
