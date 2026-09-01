@@ -25,6 +25,29 @@ Glaeda is pre-alpha and already exercises real systems paths on operator-owned A
 
 The current production direction still has active gaps around complete hostile-work network/credential hardening and end-to-end composition of the trusted resident task path. Current issues, pull requests, Git history, and [`docs/ROADMAP.md`](docs/ROADMAP.md) own progression; this README describes the present product boundary.
 
+## Measured results
+
+Glaeda keeps performance claims tied to exact workloads and controls rather than treating one benchmark as a universal speed claim.
+
+### Resident repository evidence: about 114× faster
+
+A controlled Big Red dogfood run asked one real review-evidence question against an exact Glaeda candidate. The GitHub baseline needed five outer calls and a 4,444 ms median; the landed resident `repo-query/v1` path answered the registered next-action question in 39.008 ms internal / about 40 ms through the wrapper with one outer call.
+
+| Arm | Median | Outer calls | Worker-visible/result bytes |
+| --- | ---: | ---: | ---: |
+| GitHub baseline | 4,444 ms | 5 | 75,713 after optimistic projection; 227,827 transported |
+| Glaeda resident | 39.008 ms internal; ~40 ms wrapper | 1 | 21,452 |
+
+The landed path was **about 114× faster**, removed four remote calls, and produced a **71.7% smaller** worker-visible result than the optimistic GitHub projection. Internally it used 28 bounded local Git processes while keeping their intermediate output out of model context.
+
+A separate control kept the attribution honest: perfectly composed direct local Git took a 10.51 ms median, while a discarded narrow Glaeda wrapper took 16.58 ms. The product win is therefore the resident, bounded, identity-bearing operation replacing repeated remote reads and procedural rediscovery — not a claim that wrapping Git makes Git itself faster. See [`docs/experiments/resident-repo-query-big-red-2026-08-31.md`](docs/experiments/resident-repo-query-big-red-2026-08-31.md).
+
+### Resident developer loop: 3.95× versus fresh local
+
+On the frozen Big Red Rust edit-to-verification workload, fresh local execution took 43.67 s at the median while the Glaeda resident path took 11.06 s: **3.95× faster than fresh local**.
+
+The ordinary warm-worktree control took 10.31 s and still beat Glaeda by 0.75 s, or 7.3%, on that edit class. That result is retained as the current target: Glaeda is already near ordinary warm latency while adding private writable state and exact resident identity, but it has not yet beaten a normal warm Cargo worktree for this workload. See [`docs/DEVELOPER_LOOP_BENCHMARK.md`](docs/DEVELOPER_LOOP_BENCHMARK.md).
+
 ## Execution classes
 
 | Trust class | Normal execution posture |
