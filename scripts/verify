@@ -2,8 +2,9 @@
 """Run Glaeda's fast/full-test developer feedback or exact required verification sequence.
 
 This is a repository-local development helper, not the product verification executor. It reduces
-child output to a bounded decision-focused summary by default and can explicitly stream it live,
-retains no logs, grants no result-reuse or publication authority, and leaves the existing checked-in
+child output to a bounded decision-focused summary by default and can explicitly stream it live.
+Successful logs are discarded; failed raw output remains in a private temporary file at the reported
+path. The helper grants no result-reuse or publication authority and leaves the existing checked-in
 `glaeda.required` command semantics unchanged.
 """
 
@@ -26,7 +27,8 @@ from typing import BinaryIO
 
 SCHEMA_VERSION = 1
 RECEIPT_SCHEMA_VERSION = 1
-SUMMARY_FAILURE_TAIL_BYTES = 16 * 1024
+SUMMARY_FAILURE_VIEW_BYTES = 16 * 1024
+SUMMARY_FAILURE_EDGE_BYTES = SUMMARY_FAILURE_VIEW_BYTES // 2
 CHILD_FILE_CREATION_UMASK = 0o022
 
 
@@ -62,6 +64,7 @@ class PhaseOutputSummary:
     byte_count: int
     line_count: int
     digest: str
+    head: bytes
     tail: bytes
 
 
@@ -70,6 +73,7 @@ def summarize_phase_output(output: BinaryIO) -> PhaseOutputSummary:
     byte_count = 0
     newline_count = 0
     final_byte: int | None = None
+    head = bytearray()
     tail = bytearray()
     output.seek(0)
     while chunk := output.read(64 * 1024):
@@ -77,13 +81,17 @@ def summarize_phase_output(output: BinaryIO) -> PhaseOutputSummary:
         byte_count += len(chunk)
         newline_count += chunk.count(b"\n")
         final_byte = chunk[-1]
+        if len(head) < SUMMARY_FAILURE_VIEW_BYTES:
+            remaining = SUMMARY_FAILURE_VIEW_BYTES - len(head)
+            head.extend(chunk[:remaining])
         tail.extend(chunk)
-        if len(tail) > SUMMARY_FAILURE_TAIL_BYTES:
-            del tail[:-SUMMARY_FAILURE_TAIL_BYTES]
+        if len(tail) > SUMMARY_FAILURE_EDGE_BYTES:
+            del tail[:-SUMMARY_FAILURE_EDGE_BYTES]
     return PhaseOutputSummary(
         byte_count=byte_count,
         line_count=newline_count + int(byte_count > 0 and final_byte != ord("\n")),
         digest=f"sha256:{digest.hexdigest()}",
+        head=bytes(head),
         tail=bytes(tail),
     )
 
@@ -93,7 +101,7 @@ def execute_phase(
     arguments: tuple[str, ...],
     root: Path,
     output_mode: str,
-) -> tuple[int, PhaseOutputSummary | None]:
+) -> tuple[int, PhaseOutputSummary | None, Path | None]:
     argv = [os.fspath(program), *arguments]
     if output_mode == "stream":
         result = subprocess.run(
@@ -103,33 +111,61 @@ def execute_phase(
             umask=CHILD_FILE_CREATION_UMASK,
             check=False,
         )
-        return result.returncode, None
+        return result.returncode, None, None
 
-    with tempfile.TemporaryFile() as output:
-        result = subprocess.run(
-            argv,
-            cwd=root,
-            stdin=subprocess.DEVNULL,
-            stdout=output,
-            stderr=subprocess.STDOUT,
-            umask=CHILD_FILE_CREATION_UMASK,
-            check=False,
-        )
-        return result.returncode, summarize_phase_output(output)
+    output_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w+b",
+            prefix="glaeda-verify-failure-",
+            suffix=".log",
+            delete=False,
+        ) as output:
+            output_path = Path(output.name)
+            result = subprocess.run(
+                argv,
+                cwd=root,
+                stdin=subprocess.DEVNULL,
+                stdout=output,
+                stderr=subprocess.STDOUT,
+                umask=CHILD_FILE_CREATION_UMASK,
+                check=False,
+            )
+            summary = summarize_phase_output(output)
+        if result.returncode == 0 or summary.byte_count == 0:
+            output_path.unlink()
+            return result.returncode, summary, None
+        os.chmod(output_path, 0o600)
+        return result.returncode, summary, output_path
+    except BaseException:
+        if output_path is not None:
+            output_path.unlink(missing_ok=True)
+        raise
 
 
-def print_failure_tail(summary: PhaseOutputSummary) -> None:
-    if not summary.tail:
+def print_failure_output(summary: PhaseOutputSummary, raw_output: Path) -> None:
+    if not summary.head:
         return
-    omitted = summary.byte_count - len(summary.tail)
+    if summary.byte_count <= SUMMARY_FAILURE_VIEW_BYTES:
+        head = summary.head
+        tail = b""
+    else:
+        head = summary.head[:SUMMARY_FAILURE_EDGE_BYTES]
+        tail = summary.tail
+    omitted = summary.byte_count - len(head) - len(tail)
     print(
-        f"captured failure output: tail_bytes={len(summary.tail)} "
-        f"omitted_bytes={omitted}",
+        f"captured failure output: head_bytes={len(head)} tail_bytes={len(tail)} "
+        f"omitted_bytes={omitted} raw_output={raw_output}",
         file=sys.stderr,
     )
     sys.stderr.flush()
-    sys.stderr.buffer.write(summary.tail)
-    if not summary.tail.endswith(b"\n"):
+    sys.stderr.buffer.write(head)
+    if head and not head.endswith(b"\n"):
+        sys.stderr.buffer.write(b"\n")
+    if omitted:
+        sys.stderr.buffer.write(f"... omitted {omitted} bytes ...\n".encode())
+    sys.stderr.buffer.write(tail)
+    if tail and not tail.endswith(b"\n"):
         sys.stderr.buffer.write(b"\n")
     sys.stderr.buffer.flush()
 
@@ -665,7 +701,7 @@ def run(
             phase_started = time.monotonic()
             phase_resources_before = child_resources()
             print(f"[{index}/{len(phases)}] {phase.name}: start", file=sys.stderr)
-            returncode, output = execute_phase(
+            returncode, output, raw_output = execute_phase(
                 program, phase.arguments, root, output_mode
             )
             elapsed = time.monotonic() - phase_started
@@ -691,8 +727,8 @@ def run(
                 file=sys.stderr,
             )
             if returncode != 0:
-                if output is not None:
-                    print_failure_tail(output)
+                if output is not None and raw_output is not None:
+                    print_failure_output(output, raw_output)
                 exit_code = returncode or 1
                 break
     except KeyboardInterrupt:
