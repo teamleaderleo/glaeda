@@ -3,12 +3,14 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use glaeda::resident_repo_query::MAX_RESPONSE_BYTES;
 
 const BINARY: &str = env!("CARGO_BIN_EXE_glaeda-repo-query");
 const GIT: &str = "/usr/bin/git";
+static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
 
 struct Fixture {
     root: PathBuf,
@@ -20,12 +22,15 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("current time")
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "glaeda-repo-query-cli-{}-{nonce}",
+        let temporary_root =
+            fs::canonicalize(std::env::temp_dir()).expect("canonicalize test temporary directory");
+        let root = temporary_root.join(format!(
+            "glaeda-repo-query-cli-{}-{nonce}-{sequence}",
             std::process::id()
         ));
         let checkout = root.join("checkout");
@@ -81,7 +86,9 @@ impl Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        if self.root.starts_with(std::env::temp_dir()) {
+        let temporary_root =
+            fs::canonicalize(std::env::temp_dir()).expect("canonicalize test temporary directory");
+        if self.root.parent() == Some(temporary_root.as_path()) {
             fs::remove_dir_all(&self.root).expect("remove fixture")
         }
     }

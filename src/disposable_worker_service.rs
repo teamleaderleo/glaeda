@@ -16,6 +16,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::disposable_attempt_catalog::DisposableAttemptCatalog;
 use crate::disposable_clone_runtime::CloneRuntimeClock;
+#[cfg(test)]
 use crate::disposable_service_failure_receipt::{
     DisposableServiceFailureCode, DisposableServiceFailureKind, DisposableServiceFailureReceipt,
     DisposableServiceFailureReceiptError,
@@ -88,6 +89,7 @@ impl std::error::Error for DisposableWorkerServiceError {}
 /// Returns the receipt contract's fixed public error when a service machine code falls outside the
 /// closed v1 grammar or when the supplied failure time predates process start.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn build_disposable_worker_service_failure_receipt(
     error: DisposableWorkerServiceError,
     program_digest: crate::artifact::Sha256Digest,

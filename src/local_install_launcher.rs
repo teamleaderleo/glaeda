@@ -897,7 +897,9 @@ mod tests {
     impl World {
         fn new(label: &str) -> Self {
             let sequence = NEXT_TEST.fetch_add(1, Ordering::Relaxed);
-            let root = std::env::temp_dir().join(format!(
+            let temporary_root = std_fs::canonicalize(std::env::temp_dir())
+                .expect("canonicalize test temporary directory");
+            let root = temporary_root.join(format!(
                 "glaeda-local-launcher-{label}-{}-{sequence}",
                 std::process::id()
             ));
