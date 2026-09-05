@@ -25,6 +25,111 @@ SPEC.loader.exec_module(MODULE)
 
 
 class VerifyFocusedTests(unittest.TestCase):
+    def _execute_child(self, command, **arguments):
+        # Retain ownership of test children/pipes even if a discriminator fails.
+        children = []
+        real_popen = subprocess.Popen
+        def launch(*args, **kwargs):
+            child = real_popen(*args, **kwargs)
+            children.append(child)
+            return child
+        try:
+            with mock.patch.object(MODULE.owned_task.subprocess, "Popen", side_effect=launch):
+                result = MODULE.owned_task.execute(command, **arguments)
+            self.assertTrue(all(child.poll() is not None for child in children))
+            return result
+        finally:
+            for child in children:
+                if child.poll() is None:
+                    child.kill()
+                    child.wait()
+                child.stdout.close()
+
+    def test_extraction_preserves_baseline_profile_and_command_bytes(self) -> None:
+        # Captured from cc4674e before extraction, with no public cache mounts.
+        expected = [
+            (MODULE.FOCUSED_PROFILE,
+             "sha256:5c4664ac2da3dcc66826d111a5f82e5614b9589dbbbdcf4383b6a88cd38a1195",
+             "sha256:f65d46e0cb520c284f08452a028b7971f3340c9196a91511f1683359a6c2d2c3"),
+            (MODULE.REQUIRED_PROFILE,
+             "sha256:71c2064e99793aaf39b2b38ce4b4f3e8b570c75f0c854ec01ce9993d73ea717e",
+             "sha256:1f66b4a0089d55881c7cef592436af5bfa73915c7bc35f3b5432142c2f00b26f"),
+        ]
+        with mock.patch.object(MODULE, "public_crates_io_cache_arguments", return_value=[]):
+            for profile, generation, command_digest in expected:
+                with self.subTest(profile=profile.profile_id):
+                    command = MODULE.sandbox_command(
+                        Path("/source"), Path("/task"), Path("/cargo"), Path("/rustup"),
+                        "glaeda-parity.service", profile,
+                    )
+                    self.assertEqual(MODULE.profile_generation(profile), generation)
+                    self.assertEqual(MODULE.sha256(MODULE.canonical_bytes(command)), command_digest)
+
+    def test_internal_network_class_cannot_be_widened_by_a_string(self) -> None:
+        with self.assertRaisesRegex(MODULE.Refusal, "network class"):
+            MODULE.owned_task.sandbox_command(
+                Path("/source"), Path("/cargo"), Path("/rustup"), "test.service",
+                systemd_properties=[], build_tmpfs_bytes=1,
+                mount_arguments=[], recipe_arguments=[], network="none",
+            )
+
+    def test_extracted_capture_hashes_real_child_output(self) -> None:
+        task = MODULE.owned_task
+        payload = b"owned task output\n"
+        with (mock.patch.object(task, "unit_absent", return_value=True),
+              mock.patch.object(task, "stop_unit") as stop):
+            result = self._execute_child(
+                [sys.executable, "-c", "print('owned task output')"],
+                unit="fixture.service", deadline_seconds=10, label="fixture",
+            )
+        self.assertEqual(result[0:2], ("succeeded", 0))
+        self.assertTrue(result[3])
+        self.assertEqual(result[4:], (len(payload), MODULE.sha256(payload)))
+        stop.assert_not_called()
+
+    def test_extracted_overflow_stops_unit_and_retains_output_digest(self) -> None:
+        task = MODULE.owned_task
+        with (mock.patch.object(task, "MAX_SOURCE_OUTPUT_BYTES", 32),
+              mock.patch.object(task, "unit_absent", return_value=True),
+              mock.patch.object(task, "stop_unit") as stop,
+              mock.patch.object(task.sys, "stderr") as stderr):
+            result = self._execute_child(
+                [sys.executable, "-c", "import sys; sys.stdout.write('x' * 64)"],
+                unit="fixture.service", deadline_seconds=10, label="fixture",
+            )
+        self.assertEqual(result[0], "failed")
+        self.assertEqual(result[4:], (64, MODULE.sha256(b"x" * 64)))
+        stop.assert_called_once_with("fixture.service")
+        self.assertEqual(stderr.buffer.write.call_args_list, [mock.call(b"x" * 64), mock.call(b"\n")])
+
+    def test_extracted_timeout_settles_owned_child_group(self) -> None:
+        task = MODULE.owned_task
+        # Advance the controller clock past its deadline. The actual subprocess
+        # is a disposable test-owned child; systemd itself is replaced here.
+        with (mock.patch.object(task.time, "monotonic", side_effect=[0, 31, 32]),
+              mock.patch.object(task, "unit_absent", return_value=True),
+              mock.patch.object(task, "stop_unit") as stop):
+            result = self._execute_child(
+                [sys.executable, "-c", "import time; time.sleep(10)"],
+                unit="fixture.service", deadline_seconds=0, label="fixture",
+            )
+        self.assertEqual(result[0], "timed_out")
+        self.assertNotEqual(result[1], 0)
+        self.assertTrue(result[3])
+        stop.assert_called_once_with("fixture.service")
+
+    def test_extracted_unknown_unit_state_is_cleanup_incomplete(self) -> None:
+        task = MODULE.owned_task
+        with (mock.patch.object(task, "unit_absent", return_value=False),
+              mock.patch.object(task, "stop_unit") as stop):
+            result = self._execute_child(
+                [sys.executable, "-c", "pass"],
+                unit="fixture.service", deadline_seconds=10, label="fixture",
+            )
+        self.assertEqual(result[0], "cleanup_incomplete")
+        self.assertFalse(result[3])
+        stop.assert_called_once_with("fixture.service")
+
     def test_profile_is_fixed_compact_and_credentialless(self) -> None:
         completed = subprocess.run(
             [sys.executable, ROOT / "scripts" / "verify-focused", "profile"],
@@ -416,7 +521,7 @@ class VerifyFocusedTests(unittest.TestCase):
                     "execute_profile",
                     return_value=("succeeded", 0, 1.0, True, 0, MODULE.sha256(b"")),
                 ),
-                mock.patch.object(MODULE, "remove_task", side_effect=[None, OSError("busy")]),
+                mock.patch.object(MODULE, "remove_task", side_effect=OSError("busy")),
                 mock.patch.object(MODULE, "emit"),
             ):
                 self.assertEqual(MODULE.run(arguments), 0)
