@@ -2,7 +2,7 @@
 
 The local `verify-focused run --admission-root <installed-private-root>` path adds a physical
 launch gate to the existing verifier. An installed adapter supplies this root; a connected request
-must never select, override, or omit it. The dispatch capability bridge does not yet forward this
+must never select, override, or omit it. The dispatch v2 focused capability forwards this fixed local
 option. Ordinary local verification without the option retains its existing behavior.
 
 The gate admits only `verify-focused/v1`: four CPUs, 8 GiB MemoryMax, and the existing fixed
@@ -83,3 +83,19 @@ they do not prove systemd/bubblewrap verification or a regular ChatGPT journey.
 The next consumer change must pin this reviewed gate in the dispatch capability and resident
 adapter, then prove named physical verification, capability revocation, restart recovery, two
 requests, and timing. Service/capability installation requires its own concrete reviewed action.
+
+## Pending-before-launch observation
+
+`python3 scripts/owned-admission-observe --root <installed-private-root>` returns a bounded
+`glaeda-owned-admission-observation` v1 JSON snapshot. It creates no lock, reservation, journal
+or directory. All authority fields are false. A consumer may leave a request pending when
+`outcome` is `wait`: `node_held`, `node_draining`, `pressure_high`, `capacity_unavailable`, or
+`reserved`. A surviving reservation stays reserved; this observer never infers completion from
+PIDs, age or lock availability. Invalid or unavailable observations return `refused` with
+`observation_unavailable`, without exposing paths, host facts or exception text.
+
+`ready` / `compatible` is only a disposable scheduling hint. The consumer must still validate
+caller/source/profile/capability and the verifier must perform its fresh reservation and final
+physical launch check. A race after this observation can still refuse at that boundary. The
+observer does not schedule retries or publish a terminal result. Operator hold maps to pending
+for the consumer; it remains a refusal in the physical reducer and launch path.
