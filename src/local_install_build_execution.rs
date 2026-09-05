@@ -1075,10 +1075,7 @@ mod tests {
         assert!(receipt.codes().is_empty());
         let evidence = receipt.evidence().expect("built evidence");
         assert_eq!(evidence.binary_version, "glaeda 0.1.0");
-        assert_eq!(
-            evidence.binary_digest,
-            digest_bytes(b"\x7fELFfake-glaeda-binary")
-        );
+        assert_eq!(evidence.binary_digest, digest_bytes(fake_binary_bytes()));
         assert_eq!(executor.working_calls.get(), 2);
         assert!(executor.git.borrow().is_empty());
         let public = serde_json::to_string(&receipt).expect("receipt JSON");
@@ -1312,8 +1309,16 @@ mod tests {
     }
 
     fn write_fake_binary(path: &Path) {
-        fs::write(path, b"\x7fELFfake-glaeda-binary").expect("write fake binary");
+        fs::write(path, fake_binary_bytes()).expect("write fake binary");
         set_mode(path, 0o755);
+    }
+
+    fn fake_binary_bytes() -> &'static [u8] {
+        if cfg!(target_os = "linux") {
+            b"\x7fELFfake-glaeda-binary".as_slice()
+        } else {
+            b"\xfe\xed\xfa\xcffake-glaeda-binary".as_slice()
+        }
     }
 
     fn set_mode(path: &Path, mode: u32) {

@@ -23,8 +23,11 @@ const USERMOD: &str = "/usr/sbin/usermod";
 const INSTALL: &str = "/usr/bin/install";
 const MIN_SUBORDINATE_ID_COUNT: u64 = 65_536;
 const LOGINCTL: &str = "/usr/bin/loginctl";
+#[cfg(target_os = "linux")]
 const RUNUSER: &str = "/usr/sbin/runuser";
+#[cfg(target_os = "linux")]
 const PODMAN: &str = "/usr/bin/podman";
+#[cfg(target_os = "linux")]
 const GIT: &str = "/usr/bin/git";
 const NOLOGIN: &str = "/usr/sbin/nologin";
 
@@ -617,6 +620,7 @@ fn canonical_absolute_path(field: &str, value: &str) -> Result<String, LaneComma
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
     use std::path::Path;
 
     use crate::journal::{ExecutionLane, PlannedMutation, Preconditions, RollbackClass};
@@ -624,9 +628,11 @@ mod tests {
     use crate::process::CommandValue;
 
     use super::{
-        APT_GET, GIT, GROUPADD, INSTALL, LOGINCTL, LaneCommand, LaneCommandKind, LinuxAccountName,
-        NOLOGIN, PODMAN, PackageName, RUNUSER, RunnerUserContext, USERADD, USERMOD,
+        APT_GET, GROUPADD, INSTALL, LOGINCTL, LaneCommand, LaneCommandKind, LinuxAccountName,
+        NOLOGIN, PackageName, RunnerUserContext, USERADD, USERMOD,
     };
+    #[cfg(target_os = "linux")]
+    use super::{GIT, PODMAN, RUNUSER};
 
     fn action(lane: ExecutionLane) -> PlannedMutation {
         PlannedMutation::new(

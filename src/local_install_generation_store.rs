@@ -3767,7 +3767,9 @@ mod tests {
     impl TestParent {
         fn new(label: &str) -> Self {
             let sequence = NEXT_TEST.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
+            let temporary_root = std_fs::canonicalize(std::env::temp_dir())
+                .expect("canonicalize test temporary directory");
+            let path = temporary_root.join(format!(
                 "glaeda-local-generation-store-{label}-{}-{sequence}",
                 std::process::id()
             ));
@@ -4505,7 +4507,10 @@ mod tests {
 
     #[test]
     fn fixed_layout_has_no_legacy_namespace_or_caller_controlled_basename() {
+        #[cfg(target_os = "linux")]
         assert_eq!(GLAEDA_DIRECTORY, "glaeda");
+        #[cfg(target_os = "macos")]
+        assert_eq!(GLAEDA_DIRECTORY, "Glaeda");
         assert_eq!(LOCAL_INSTALL_DIRECTORY, "local-install");
         assert_eq!(STORE_IDENTITY_FILE, "store.identity.json");
         assert_eq!(BINARY_FILE, "glaeda");
