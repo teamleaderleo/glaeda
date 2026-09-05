@@ -5,9 +5,9 @@
 //! queue, acquires no lease, and performs no process/cgroup/filesystem mutation. Existing execution
 //! capacity/admission remains independently decisive.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LocalInterferenceClass {
     Coexist,
@@ -15,7 +15,7 @@ pub enum LocalInterferenceClass {
     QuietRequired,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeControlState {
     Available,
@@ -23,7 +23,7 @@ pub enum NodeControlState {
     Held,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LocalPressureClass {
     Low,
@@ -33,7 +33,7 @@ pub enum LocalPressureClass {
 }
 
 /// Compatibility is local profile evidence, never a caller-selected promise.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QuietCompatibility {
     Compatible,
@@ -41,13 +41,15 @@ pub enum QuietCompatibility {
     Unknown,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QuietLeaseObservation {
     pub generation: u64,
     pub expires_at_unix_millis: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ActiveInterferenceSummary {
     /// Active work that conflicts with a quiet window and is not declared yieldable.
     pub conflicting_non_yieldable: u32,
@@ -55,12 +57,14 @@ pub struct ActiveInterferenceSummary {
     pub conflicting_yieldable: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LocalInterferenceRequest {
     pub interference_class: LocalInterferenceClass,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LocalInterferenceObservation {
     pub observed_at_unix_millis: u64,
     pub node_control: NodeControlState,
