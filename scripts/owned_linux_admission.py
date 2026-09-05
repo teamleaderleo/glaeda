@@ -277,16 +277,17 @@ def check(current):
                                     reason=reason)
     if canonical(answer) != canonical(expected):
         raise Refusal("local interference admission refused")
-    if reason is not None:
-        raise Deferred(reason, "local interference admission refused")
     if time.monotonic() - started > FRESH_SECONDS:
         raise Refusal("local admission observation expired")
+    if reason is not None:
+        raise Deferred(reason, "local interference admission refused")
     return started + FRESH_SECONDS
 
 
 def observe(root):
     """Disposable advisory snapshot. Never creates locks, reservations or launch state."""
     outcome, reason = "ready", "compatible"
+    started = time.monotonic()
     store = None
     try:
         store = Store(root)
@@ -294,14 +295,17 @@ def observe(root):
         if store.read("reservation.json") is not None:
             outcome, reason = "wait", "reserved"
         else:
-            check(current)
+            try:
+                check(current)
+            except Deferred as error:
+                outcome, reason = "wait", error.reason
         # A changed policy/root invalidates this observation rather than adopting it.
         if policy(store) != current:
             raise Refusal("local admission policy changed during observation")
         store.verify_root()
-    except Deferred as error:
-        outcome, reason = "wait", error.reason
-    except (Refusal, OSError, ValueError):
+        if time.monotonic() - started > FRESH_SECONDS:
+            raise Refusal("local admission observation expired")
+    except (Refusal, OSError, ValueError, subprocess.SubprocessError, RecursionError):
         outcome, reason = "refused", "observation_unavailable"
     finally:
         if store is not None:

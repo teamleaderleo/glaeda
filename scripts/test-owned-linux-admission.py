@@ -104,6 +104,45 @@ class AdmissionTests(unittest.TestCase):
         self.query_mock.side_effect = changing
         self.assertEqual(gate.observe(self.admission)["outcome"], "refused")
 
+    def test_wait_observation_revalidates_policy_root_and_freshness(self):
+        self.pressure = 50_000_000
+        def changing(entry, arguments, raw=b""):
+            result = self.query(entry, arguments, raw)
+            if entry["path"] == "/policy":
+                self.policy["revision"] += 1
+                self.write_policy()
+            return result
+        self.query_mock.side_effect = changing
+        self.assertEqual(gate.observe(self.admission)["outcome"], "refused")
+        self.query_mock.side_effect = self.query
+        with mock.patch.object(gate.time, "monotonic", side_effect=[0, 0, 4]):
+            self.assertEqual(gate.observe(self.admission)["outcome"], "refused")
+        self.policy["memory_reserve_bytes"] = 32 * 1024**3
+        self.write_policy()
+        with mock.patch.object(gate.time, "monotonic", side_effect=[0, 0, 4]):
+            self.assertEqual(gate.observe(self.admission)["outcome"], "refused")
+
+    def test_wait_observation_rejects_replaced_root(self):
+        self.pressure = 50_000_000
+        def replaced(entry, arguments, raw=b""):
+            result = self.query(entry, arguments, raw)
+            if entry["path"] == "/policy":
+                self.admission.rename(self.root / "original-admission")
+                self.admission.mkdir(mode=0o700)
+                self.write_policy()
+            return result
+        self.query_mock.side_effect = replaced
+        self.assertEqual(gate.observe(self.admission)["outcome"], "refused")
+
+    def test_observation_closes_expected_helper_and_decoder_failures(self):
+        for error in (subprocess.TimeoutExpired("private command", 3), RecursionError("private data")):
+            with self.subTest(error=type(error).__name__):
+                self.query_mock.side_effect = error
+                answer = gate.observe(self.admission)
+                self.assertEqual((answer["outcome"], answer["reason"]),
+                                 ("refused", "observation_unavailable"))
+                self.assertNotIn(b"private", gate.canonical(answer))
+
     def test_observation_cli_missing_root_does_not_install(self):
         missing = self.root / "missing"
         completed = subprocess.run([sys.executable, str(Path(__file__).with_name("owned-admission-observe")),
