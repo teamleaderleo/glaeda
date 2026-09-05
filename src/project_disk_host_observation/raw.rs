@@ -27,7 +27,8 @@ use sha2::{Digest as _, Sha256};
 use crate::artifact::Sha256Digest;
 use crate::lima_host_identity::LimaHostIdentityObservation;
 use crate::lima_observation::{
-    LimaInstanceName, LimaObservationRequest, LimaObservationSourceIdentity,
+    LimaArchitecture, LimaInstanceName, LimaObservationRequest, LimaObservationSourceIdentity,
+    LimaVmType,
 };
 use crate::project_catalog::ProjectIdentity;
 
@@ -338,6 +339,33 @@ impl HeldLimaSource {
             return Err(changed());
         }
         self.directory.revalidate_stable_identity()
+    }
+
+    pub(super) fn resident_observation_request(
+        &self,
+        instance: LimaInstanceName,
+        guest_cache_path: &Path,
+        max_age_seconds: u64,
+    ) -> Result<LimaObservationRequest, ProjectDiskHostObservationError> {
+        self.confirm_path_binding()?;
+        LimaObservationRequest::new(
+            instance,
+            self.path.physical.clone(),
+            LimaVmType::Vz,
+            LimaArchitecture::Aarch64,
+            guest_cache_path,
+            max_age_seconds,
+        )
+        .map_err(|_| invalid_input())
+    }
+
+    pub(super) fn confirm_resident_instance_absent(
+        &self,
+        instance: &LimaInstanceName,
+    ) -> Result<(), ProjectDiskHostObservationError> {
+        self.confirm_path_binding()?;
+        require_entry_absent(&self.directory.fd, OsStr::new(instance.as_str()))?;
+        self.confirm_path_binding()
     }
 
     pub(super) fn into_planned_request(

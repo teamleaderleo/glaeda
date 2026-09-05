@@ -8,6 +8,7 @@ use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
 use crate::artifact::Sha256Digest;
+use crate::lima_observation::{LimaInstanceName, LimaObservationRequest};
 
 use super::raw::{
     HeldLimaSource as RawHeldLimaSource, LimaStandaloneDiskName,
@@ -128,6 +129,23 @@ impl HeldProjectDiskLimaSource {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn confirm_path_binding(&self) -> Result<(), ProjectDiskHostObservationError> {
         self.inner.confirm_path_binding()
+    }
+
+    pub(crate) fn resident_observation_request(
+        &self,
+        instance: LimaInstanceName,
+        guest_cache_path: &Path,
+        max_age_seconds: u64,
+    ) -> Result<LimaObservationRequest, ProjectDiskHostObservationError> {
+        self.inner
+            .resident_observation_request(instance, guest_cache_path, max_age_seconds)
+    }
+
+    pub(crate) fn confirm_resident_instance_absent(
+        &self,
+        instance: &LimaInstanceName,
+    ) -> Result<(), ProjectDiskHostObservationError> {
+        self.inner.confirm_resident_instance_absent(instance)
     }
 }
 
