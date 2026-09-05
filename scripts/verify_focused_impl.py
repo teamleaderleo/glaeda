@@ -8,6 +8,7 @@ Cargo, and rustup roots. Repository code runs only inside the closed bubblewrap/
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 import argparse
 import fcntl
 import hashlib
@@ -24,6 +25,7 @@ from pathlib import Path
 from typing import IO, NoReturn
 
 import owned_linux_task as owned_task
+import owned_linux_admission as owned_admission
 from owned_linux_task import (
     Refusal, closed_environment, run_control, remove_task,
     public_crates_io_cache_arguments, unit_absent, stop_unit,
@@ -596,18 +598,41 @@ def sandbox_command(
     )
 
 
+def admission_binding(request: Request, command_root: Path) -> str:
+    info = command_root.stat()
+    return sha256(canonical_bytes({
+        "command_root": os.fspath(command_root), "device": info.st_dev, "inode": info.st_ino,
+        "repository": request.repository, "commit": request.commit, "tree": request.tree,
+        "profile_id": request.profile.profile_id, "profile_generation": request.profile_generation,
+    }))
+
+
+def sync_directory(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def unit_name(request: Request) -> str:
+    return f"glaeda-{request.profile.document_slug}-{request.command_fingerprint[7:39]}.service"
+
+
 def execute_profile(
     source: Path,
     task_root: Path,
     cargo_root: Path,
     rustup_root: Path,
     request: Request,
+    admission=None,
 ) -> tuple[str, int, float, bool, int, str]:
     profile = request.profile
-    unit = f"glaeda-{profile.document_slug}-{request.command_fingerprint[7:39]}.service"
+    unit = unit_name(request)
     return owned_task.execute(
         sandbox_command(source, task_root, cargo_root, rustup_root, unit, profile),
         unit=unit, deadline_seconds=profile.deadline_seconds, label=profile.document_slug,
+        **({"launch_guard": admission.launch} if admission is not None else {}),
     )
 
 
@@ -684,6 +709,23 @@ def run(arguments: argparse.Namespace, profile: Profile = FOCUSED_PROFILE) -> in
         if existing is not None:
             if not valid_terminal_receipt(existing, request):
                 raise Refusal("durable receipt conflicts with the exact command")
+            admission_root = getattr(arguments, "admission_root", None)
+            if arguments.reconcile_only and admission_root is not None:
+                def observe_settled():
+                    if (not existing["result"]["task_cleanup_complete"]
+                            or not unit_absent(unit_name(request))
+                            or (command_root / "task").exists()
+                            or (command_root / "task").is_symlink()):
+                        raise Refusal("exact reservation cleanup is incomplete")
+                    old_intent = read_document(intent_path)
+                    if old_intent is not None:
+                        if not valid_intent(old_intent, request):
+                            raise Refusal("reservation recovery intent conflicts")
+                        intent_path.unlink()
+                        sync_directory(command_root)
+                owned_admission.recover(admission_root, request.command_fingerprint,
+                                        unit_name(request), admission_binding(request, command_root),
+                                        observe_settled)
             emit(existing)
             return 0
         intent = read_document(intent_path)
@@ -694,51 +736,75 @@ def run(arguments: argparse.Namespace, profile: Profile = FOCUSED_PROFILE) -> in
                 raise Refusal("durable intent conflicts with the exact command")
             raise Refusal("previous physical execution is ambiguous; redispatch refused")
 
-        task_root = command_root / "task"
-        owned_task.prepare_task(task_root)
-        source = materialize(repository_root, task_root, request)
-        base = {
-            "document_type": f"glaeda-{profile.document_slug}-intent",
-            "schema_version": SCHEMA_VERSION,
-            "command_fingerprint": request.command_fingerprint,
-            "source": {
-                "repository": request.repository,
-                "commit": request.commit,
-                "tree": request.tree,
-            },
-            "profile": {"id": profile.profile_id, "generation": request.profile_generation},
-        }
-        publish_document(intent_path, {**base, "phase": "prepared"}, replace=False)
-        publish_document(intent_path, {**base, "phase": "executing"}, replace=True)
-        started_at_ms = time.time_ns() // 1_000_000
-        terminal, exit_code, elapsed, settled, output_bytes, output_sha256 = execute_profile(
-            source, task_root, cargo_root, rustup_root, request
-        )
-        if not settled:
-            raise Refusal("physical process-tree settlement is incomplete; redispatch refused")
-        cleanup_complete = False
-        try:
-            remove_task(task_root)
-            cleanup_complete = True
-        except (Refusal, OSError):
-            terminal = "cleanup_incomplete"
-        settled_at_ms = time.time_ns() // 1_000_000
-        document = receipt(
-            request,
-            terminal,
-            exit_code,
-            elapsed,
-            settled,
-            cleanup_complete,
-            output_bytes,
-            output_sha256,
-            started_at_ms,
-            settled_at_ms,
-        )
-        publish_document(receipt_path, document, replace=False)
-        intent_path.unlink()
-        emit(document)
-        return 0
+        admission_root = getattr(arguments, "admission_root", None)
+        if admission_root is not None and profile != FOCUSED_PROFILE:
+            raise Refusal("local admission supports only verify-focused/v1")
+        unit = unit_name(request)
+        gate = (owned_admission.Reservation(admission_root, request.command_fingerprint, unit,
+                                            admission_binding(request, command_root))
+                if admission_root is not None else nullcontext())
+        with gate as admission:
+            try:
+                task_root = command_root / "task"
+                owned_task.prepare_task(task_root)
+                source = materialize(repository_root, task_root, request)
+                base = {
+                    "document_type": f"glaeda-{profile.document_slug}-intent",
+                    "schema_version": SCHEMA_VERSION,
+                    "command_fingerprint": request.command_fingerprint,
+                    "source": {
+                        "repository": request.repository,
+                        "commit": request.commit,
+                        "tree": request.tree,
+                    },
+                    "profile": {"id": profile.profile_id, "generation": request.profile_generation},
+                }
+                publish_document(intent_path, {**base, "phase": "prepared"}, replace=False)
+                publish_document(intent_path, {**base, "phase": "executing"}, replace=True)
+                started_at_ms = time.time_ns() // 1_000_000
+                terminal, exit_code, elapsed, settled, output_bytes, output_sha256 = execute_profile(
+                    source, task_root, cargo_root, rustup_root, request,
+                    **({"admission": admission} if admission is not None else {}),
+                )
+                if not settled:
+                    raise Refusal("physical process-tree settlement is incomplete; redispatch refused")
+                cleanup_complete = False
+                try:
+                    remove_task(task_root)
+                    cleanup_complete = True
+                except (Refusal, OSError):
+                    terminal = "cleanup_incomplete"
+                settled_at_ms = time.time_ns() // 1_000_000
+                document = receipt(
+                    request,
+                    terminal,
+                    exit_code,
+                    elapsed,
+                    settled,
+                    cleanup_complete,
+                    output_bytes,
+                    output_sha256,
+                    started_at_ms,
+                    settled_at_ms,
+                )
+                publish_document(receipt_path, document, replace=False)
+                intent_path.unlink()
+                if admission is not None and cleanup_complete:
+                    sync_directory(command_root)
+                    admission.release()
+                emit(document)
+                return 0
+            finally:
+                # A refused final check has never called Popen. Remove only this exact
+                # attempt's task/intent before freeing its reservation. Any cleanup
+                # error preserves the reservation; post-launch ambiguity always does.
+                if admission is not None and admission.owned and not admission.launch_attempted:
+                    remove_task(command_root / "task")
+                    if intent_path.exists():
+                        intent_path.unlink()
+                    sync_directory(command_root)
+                    admission.release()
+
 
 
 def parser() -> argparse.ArgumentParser:
@@ -756,6 +822,7 @@ def parser() -> argparse.ArgumentParser:
     execute.add_argument("--profile-generation", required=True)
     execute.add_argument("--command-fingerprint", required=True)
     execute.add_argument("--reconcile-only", action="store_true")
+    execute.add_argument("--admission-root", help="operator-installed focused launch gate; never caller-selected")
     return root
 
 

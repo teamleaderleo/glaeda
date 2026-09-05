@@ -6,6 +6,7 @@ consumer until physical parity is accepted.
 """
 from __future__ import annotations
 
+from contextlib import nullcontext
 from enum import Enum
 import hashlib
 import os
@@ -278,16 +279,18 @@ def stop_unit(unit_name: str) -> None:
 
 def execute(
     command: list[str], *, unit: str, deadline_seconds: int, label: str,
+    launch_guard=None,
 ) -> tuple[str, int, float, bool, int, str]:
     started = time.monotonic()
-    process = subprocess.Popen(
-        command,
-        env=closed_environment({"XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}"}),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
-    )
+    with launch_guard() if launch_guard is not None else nullcontext():
+        process = subprocess.Popen(
+            command,
+            env=closed_environment({"XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}"}),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
     assert process.stdout is not None
     selector = selectors.DefaultSelector()
     selector.register(process.stdout, selectors.EVENT_READ)
@@ -333,6 +336,7 @@ def execute(
             pass
         returncode = process.wait()
     selector.close()
+    process.stdout.close()
     elapsed = time.monotonic() - started
     settled = unit_absent(unit)
     if not settled:
