@@ -8,6 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const BINARY: &str = env!("CARGO_BIN_EXE_glaeda-project-observe");
 const GIT: &str = "/usr/bin/git";
+const FAILURE_STREAM_LIMIT: usize = 4_096;
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
 
 struct Fixture {
@@ -92,10 +93,30 @@ fn git(checkout: &Path, arguments: &[&str]) {
         .env("LC_ALL", "C")
         .output()
         .expect("run fixture Git");
+    assert_child_success("fixture Git", &output);
+}
+
+fn failure_stream(bytes: &[u8]) -> String {
+    if bytes.len() <= FAILURE_STREAM_LIMIT {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+
+    let half = FAILURE_STREAM_LIMIT / 2;
+    format!(
+        "{}\n[… {} bytes omitted …]\n{}",
+        String::from_utf8_lossy(&bytes[..half]),
+        bytes.len() - FAILURE_STREAM_LIMIT,
+        String::from_utf8_lossy(&bytes[bytes.len() - half..])
+    )
+}
+
+fn assert_child_success(operation: &str, output: &Output) {
     assert!(
         output.status.success(),
-        "fixture Git failed with status {:?}",
-        output.status.code()
+        "{operation} failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        failure_stream(&output.stdout),
+        failure_stream(&output.stderr)
     );
 }
 
@@ -106,7 +127,7 @@ fn json_observation_is_path_private_and_reports_dirty_recovery_state() {
     fs::write(fixture.checkout.join("untracked.txt"), "local\n").expect("write untracked file");
 
     let output = fixture.observe("json");
-    assert!(output.status.success());
+    assert_child_success("JSON project observation", &output);
     assert!(output.stderr.is_empty());
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON report");
     assert_eq!(report["document_type"], "glaeda-project-observation");
@@ -130,7 +151,7 @@ fn json_observation_is_path_private_and_reports_dirty_recovery_state() {
 fn human_observation_is_derived_from_the_same_typed_state_without_paths() {
     let fixture = Fixture::new();
     let output = fixture.observe("human");
-    assert!(output.status.success());
+    assert_child_success("human project observation", &output);
     assert!(output.stderr.is_empty());
     let stdout = String::from_utf8(output.stdout).expect("UTF-8 human output");
     assert!(stdout.contains("authority=observation_only"));
@@ -158,7 +179,7 @@ fn git_executable_is_fixed_instead_of_a_caller_selected_command_surface() {
         .arg("--help")
         .output()
         .expect("read project observer help");
-    assert!(help.status.success());
+    assert_child_success("project observer help", &help);
     assert!(help.stderr.is_empty());
     let stdout = String::from_utf8(help.stdout).expect("UTF-8 help");
     assert!(!stdout.contains("git-program"));
