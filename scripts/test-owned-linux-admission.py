@@ -48,14 +48,108 @@ class AdmissionTests(unittest.TestCase):
                     "pressure": {kind: {"avg10_micros": self.pressure}
                                  for kind in ("cpu", "memory", "io")}}
         observation = json.loads(raw)["observation"]
-        allowed = observation["node_control"] == "available" and observation["pressure"] == "low"
+        reason = {"held": "node_held", "draining": "node_draining"}.get(observation["node_control"])
+        reason = reason or ("pressure_high" if observation["pressure"] == "high" else "compatible")
+        disposition = {"node_held": "refuse", "compatible": "admit_now"}.get(reason, "wait")
         return {"document_type": "glaeda-local-admission-decision", "schema_version": 1,
                 "input_sha256": gate.digest(raw), "grants_authority": False, "authorizes_execution": False,
-                "decision": {"disposition": "admit_now" if allowed else "wait",
-                             "reason": "compatible" if allowed else "pressure_high",
+                "decision": {"disposition": disposition,
+                             "reason": reason,
                              "active_quiet_lease_generation": None, "requires_new_quiet_lease": False,
                              "requires_yieldable_drain": False, "grants_authority": False,
                              "authorizes_preemption": False, "authorizes_execution": False}}
+
+    def test_observation_has_no_persistent_effects(self):
+        def snapshot():
+            return {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in self.admission.iterdir()}
+        before = snapshot()
+        answer = gate.observe(self.admission)
+        self.assertEqual((answer["outcome"], answer["reason"]), ("ready", "compatible"))
+        self.assertFalse(answer["authorizes_execution"])
+        self.assertFalse(answer["grants_authority"])
+        self.assertFalse(answer["authorizes_redispatch"])
+        self.assertEqual(snapshot(), before)
+        for state, reason in (("held", "node_held"), ("draining", "node_draining")):
+            self.policy["node_control"] = state
+            self.write_policy()
+            before = snapshot()
+            answer = gate.observe(self.admission)
+            self.assertEqual((answer["outcome"], answer["reason"]), ("wait", reason))
+            self.assertEqual(snapshot(), before)
+
+    def test_observation_defers_pressure_capacity_and_owned_reservations(self):
+        self.pressure = 50_000_000
+        self.assertEqual(gate.observe(self.admission)["reason"], "pressure_high")
+        self.pressure = 0
+        self.policy["memory_reserve_bytes"] = 32 * 1024**3
+        self.write_policy()
+        self.assertEqual(gate.observe(self.admission)["reason"], "capacity_unavailable")
+        self.policy["memory_reserve_bytes"] = 4 * 1024**3
+        self.write_policy()
+        with self.reservation() as reservation:
+            raw = (self.admission / "reservation.json").read_bytes()
+            self.assertEqual(gate.observe(self.admission)["reason"], "reserved")
+            self.assertEqual((self.admission / "reservation.json").read_bytes(), raw)
+            reservation.release()
+
+    def test_observation_refuses_malformed_reducer_and_policy_change(self):
+        self.query_mock.side_effect = lambda *args: {}
+        self.assertEqual(gate.observe(self.admission)["outcome"], "refused")
+        def changing(entry, arguments, raw=b""):
+            result = self.query(entry, arguments, raw)
+            if entry["path"] == "/policy":
+                self.policy["revision"] += 1
+                self.write_policy()
+            return result
+        self.query_mock.side_effect = changing
+        self.assertEqual(gate.observe(self.admission)["outcome"], "refused")
+
+    def test_wait_observation_revalidates_policy_root_and_freshness(self):
+        self.pressure = 50_000_000
+        def changing(entry, arguments, raw=b""):
+            result = self.query(entry, arguments, raw)
+            if entry["path"] == "/policy":
+                self.policy["revision"] += 1
+                self.write_policy()
+            return result
+        self.query_mock.side_effect = changing
+        self.assertEqual(gate.observe(self.admission)["outcome"], "refused")
+        self.query_mock.side_effect = self.query
+        with mock.patch.object(gate.time, "monotonic", side_effect=[0, 0, 4]):
+            self.assertEqual(gate.observe(self.admission)["outcome"], "refused")
+        self.policy["memory_reserve_bytes"] = 32 * 1024**3
+        self.write_policy()
+        with mock.patch.object(gate.time, "monotonic", side_effect=[0, 0, 4]):
+            self.assertEqual(gate.observe(self.admission)["outcome"], "refused")
+
+    def test_wait_observation_rejects_replaced_root(self):
+        self.pressure = 50_000_000
+        def replaced(entry, arguments, raw=b""):
+            result = self.query(entry, arguments, raw)
+            if entry["path"] == "/policy":
+                self.admission.rename(self.root / "original-admission")
+                self.admission.mkdir(mode=0o700)
+                self.write_policy()
+            return result
+        self.query_mock.side_effect = replaced
+        self.assertEqual(gate.observe(self.admission)["outcome"], "refused")
+
+    def test_observation_closes_expected_helper_and_decoder_failures(self):
+        for error in (subprocess.TimeoutExpired("private command", 3), RecursionError("private data")):
+            with self.subTest(error=type(error).__name__):
+                self.query_mock.side_effect = error
+                answer = gate.observe(self.admission)
+                self.assertEqual((answer["outcome"], answer["reason"]),
+                                 ("refused", "observation_unavailable"))
+                self.assertNotIn(b"private", gate.canonical(answer))
+
+    def test_observation_cli_missing_root_does_not_install(self):
+        missing = self.root / "missing"
+        completed = subprocess.run([sys.executable, str(Path(__file__).with_name("owned-admission-observe")),
+                                    "--root", str(missing)], capture_output=True, check=True)
+        self.assertEqual(json.loads(completed.stdout)["reason"], "observation_unavailable")
+        self.assertFalse(missing.exists())
+        self.assertNotIn(str(missing).encode(), completed.stdout)
 
     def binding(self):
         command = self.root / "state" / ("d" * 64)

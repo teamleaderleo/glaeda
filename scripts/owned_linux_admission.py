@@ -50,6 +50,13 @@ def digest(value):
     return "sha256:" + hashlib.sha256(value).hexdigest()
 
 
+class Deferred(Refusal):
+    """A closed wait category; still a refusal at the physical launch boundary."""
+    def __init__(self, reason, message):
+        super().__init__(message)
+        self.reason = reason
+
+
 class Store:
     """All private state I/O stays relative to one held, verified directory descriptor."""
     def __init__(self, root):
@@ -247,7 +254,7 @@ def check(current):
     # Fixed verify-focused/v1: 8 GiB MemoryMax, four CPUs. Reserve at least four more
     # GiB and four CPUs for owner work. Unknown or unavailable facts never become zero.
     if memory < 8 * 1024**3 + current["memory_reserve_bytes"] or cpus < 8:
-        raise Refusal("local admission capacity unavailable")
+        raise Deferred("capacity_unavailable", "local admission capacity unavailable")
     high = any(p >= ceiling for p, ceiling in zip(pressure, (50_000_000, 1_000_000, 20_000_000)))
     raw = canonical({"schema_version": 1, "request": {"interference_class": "coexist"},
                      "observation": {"observed_at_unix_millis": time.time_ns() // 1_000_000,
@@ -262,11 +269,50 @@ def check(current):
                              "active_quiet_lease_generation": None, "requires_new_quiet_lease": False,
                              "requires_yieldable_drain": False, "grants_authority": False,
                              "authorizes_preemption": False, "authorizes_execution": False}}
+    reason = {"held": "node_held", "draining": "node_draining"}.get(current["node_control"])
+    if reason is None and high:
+        reason = "pressure_high"
+    if reason is not None:
+        expected["decision"].update(disposition="refuse" if reason == "node_held" else "wait",
+                                    reason=reason)
     if canonical(answer) != canonical(expected):
         raise Refusal("local interference admission refused")
     if time.monotonic() - started > FRESH_SECONDS:
         raise Refusal("local admission observation expired")
+    if reason is not None:
+        raise Deferred(reason, "local interference admission refused")
     return started + FRESH_SECONDS
+
+
+def observe(root):
+    """Disposable advisory snapshot. Never creates locks, reservations or launch state."""
+    outcome, reason = "ready", "compatible"
+    started = time.monotonic()
+    store = None
+    try:
+        store = Store(root)
+        current = policy(store)
+        if store.read("reservation.json") is not None:
+            outcome, reason = "wait", "reserved"
+        else:
+            try:
+                check(current)
+            except Deferred as error:
+                outcome, reason = "wait", error.reason
+        # A changed policy/root invalidates this observation rather than adopting it.
+        if policy(store) != current:
+            raise Refusal("local admission policy changed during observation")
+        store.verify_root()
+        if time.monotonic() - started > FRESH_SECONDS:
+            raise Refusal("local admission observation expired")
+    except (Refusal, OSError, ValueError, subprocess.SubprocessError, RecursionError):
+        outcome, reason = "refused", "observation_unavailable"
+    finally:
+        if store is not None:
+            store.close()
+    return {"document_type": "glaeda-owned-admission-observation", "schema_version": 1,
+            "outcome": outcome, "reason": reason, "grants_authority": False,
+            "authorizes_execution": False, "authorizes_redispatch": False}
 
 
 class Reservation:
