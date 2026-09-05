@@ -72,6 +72,9 @@ jobs:
               Path("scripts/verify-required"),
               Path("scripts/verify_focused_impl.py"),
               Path("scripts/owned_linux_task.py"),
+              Path("scripts/owned_linux_admission.py"),
+              Path("scripts/owned-admission-control"),
+              Path("scripts/test-owned-linux-admission.py"),
               Path("scripts/test-verify-focused.py"),
               Path("scripts/verify-changed-rustfmt"),
               Path("scripts/test-hot-run.py"),
@@ -101,6 +104,7 @@ jobs:
           python3 scripts/test-hot-pressure-shadow.py
           python3 scripts/test-hot-run.py
           python3 scripts/test-verify-focused.py
+          python3 scripts/test-owned-linux-admission.py
           python3 scripts/test-verify.py
           python3 scripts/test-verify-changed-rustfmt.py
           python3 scripts/test-front-door.py
