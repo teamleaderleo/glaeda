@@ -67,7 +67,8 @@ an explicit recovery case; no automatic stale-reservation deletion is provided.
 Normal exact replay reads the existing receipt without entering admission or changing identity.
 For recovery after terminal receipt publication but before slot release, call the same exact
 verifier request with both `--reconcile-only` and `--admission-root`. Recovery validates the
-existing receipt, matching reservation and installation generation, freshly observes exact unit
+existing receipt, matching reservation and installation generation, the digest binding the full
+source/profile identity and exact command-state directory path/device/inode, then freshly observes exact unit
 and task absence, and validates any remaining intent before releasing capacity. It does not run
 source or recreate a result. Unsettled or mismatched state stays reserved.
 

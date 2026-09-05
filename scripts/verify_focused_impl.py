@@ -598,6 +598,23 @@ def sandbox_command(
     )
 
 
+def admission_binding(request: Request, command_root: Path) -> str:
+    info = command_root.stat()
+    return sha256(canonical_bytes({
+        "command_root": os.fspath(command_root), "device": info.st_dev, "inode": info.st_ino,
+        "repository": request.repository, "commit": request.commit, "tree": request.tree,
+        "profile_id": request.profile.profile_id, "profile_generation": request.profile_generation,
+    }))
+
+
+def sync_directory(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def unit_name(request: Request) -> str:
     return f"glaeda-{request.profile.document_slug}-{request.command_fingerprint[7:39]}.service"
 
@@ -705,8 +722,10 @@ def run(arguments: argparse.Namespace, profile: Profile = FOCUSED_PROFILE) -> in
                         if not valid_intent(old_intent, request):
                             raise Refusal("reservation recovery intent conflicts")
                         intent_path.unlink()
+                        sync_directory(command_root)
                 owned_admission.recover(admission_root, request.command_fingerprint,
-                                        unit_name(request), observe_settled)
+                                        unit_name(request), admission_binding(request, command_root),
+                                        observe_settled)
             emit(existing)
             return 0
         intent = read_document(intent_path)
@@ -721,7 +740,8 @@ def run(arguments: argparse.Namespace, profile: Profile = FOCUSED_PROFILE) -> in
         if admission_root is not None and profile != FOCUSED_PROFILE:
             raise Refusal("local admission supports only verify-focused/v1")
         unit = unit_name(request)
-        gate = (owned_admission.Reservation(admission_root, request.command_fingerprint, unit)
+        gate = (owned_admission.Reservation(admission_root, request.command_fingerprint, unit,
+                                            admission_binding(request, command_root))
                 if admission_root is not None else nullcontext())
         with gate as admission:
             try:
@@ -770,6 +790,7 @@ def run(arguments: argparse.Namespace, profile: Profile = FOCUSED_PROFILE) -> in
                 publish_document(receipt_path, document, replace=False)
                 intent_path.unlink()
                 if admission is not None and cleanup_complete:
+                    sync_directory(command_root)
                     admission.release()
                 emit(document)
                 return 0
@@ -781,6 +802,7 @@ def run(arguments: argparse.Namespace, profile: Profile = FOCUSED_PROFILE) -> in
                     remove_task(command_root / "task")
                     if intent_path.exists():
                         intent_path.unlink()
+                    sync_directory(command_root)
                     admission.release()
 
 

@@ -270,9 +270,10 @@ def check(current):
 
 
 class Reservation:
-    def __init__(self, root, fingerprint, unit):
+    def __init__(self, root, fingerprint, unit, binding):
         self.store = Store(root)
-        self.identity = {"schema_version": 1, "command_fingerprint": fingerprint, "unit": unit}
+        self.identity = {"schema_version": 1, "command_fingerprint": fingerprint, "unit": unit,
+                         "binding_sha256": binding}
         self.launch_attempted = False
         self.owned = False
         self.phase = "preparing"
@@ -340,7 +341,7 @@ def set_control(root, state):
         store.close()
 
 
-def recover(root, fingerprint, unit, observe_settled):
+def recover(root, fingerprint, unit, binding, observe_settled):
     """Release only after the verifier has validated its exact terminal receipt.
 
     The callback re-observes exact unit/task absence and settles its matching intent.
@@ -354,7 +355,7 @@ def recover(root, fingerprint, unit, observe_settled):
             if reservation is None:
                 return
             expected = {"schema_version": 1, "command_fingerprint": fingerprint,
-                        "unit": unit, "generation": current["generation"]}
+                        "unit": unit, "generation": current["generation"], "binding_sha256": binding}
             if (reservation not in ({**expected, "phase": "preparing"},
                                     {**expected, "phase": "launching"})):
                 raise Refusal("reservation does not match exact terminal recovery")

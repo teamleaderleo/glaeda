@@ -57,8 +57,15 @@ class AdmissionTests(unittest.TestCase):
                              "requires_yieldable_drain": False, "grants_authority": False,
                              "authorizes_preemption": False, "authorizes_execution": False}}
 
+    def binding(self):
+        command = self.root / "state" / ("d" * 64)
+        if command.is_dir():
+            request = verifier.normalize_request(self.arguments())
+            return verifier.admission_binding(request, command)
+        return "sha256:" + "f" * 64
+
     def reservation(self):
-        return gate.Reservation(self.admission, self.fingerprint, self.unit)
+        return gate.Reservation(self.admission, self.fingerprint, self.unit, self.binding())
 
     def test_serial_slot_and_crash_reservation_are_not_reclaimed(self):
         with self.reservation() as first:
@@ -72,18 +79,30 @@ class AdmissionTests(unittest.TestCase):
                 self.fail("crash reservation was reclaimed")
         settled = mock.Mock()
         with self.assertRaisesRegex(task.Refusal, "exact terminal"):
-            gate.recover(self.admission, "sha256:" + "e" * 64, self.unit, settled)
+            gate.recover(self.admission, "sha256:" + "e" * 64, self.unit, self.binding(), settled)
         settled.assert_not_called()
-        gate.recover(self.admission, self.fingerprint, self.unit, settled)
+        gate.recover(self.admission, self.fingerprint, self.unit, self.binding(), settled)
         settled.assert_called_once_with()
         self.assertFalse((self.admission / "reservation.json").exists())
+
+    def test_recovery_refuses_another_source_or_state_binding(self):
+        with self.reservation() as first:
+            with first.launch():
+                pass
+        before = (self.admission / "reservation.json").read_bytes()
+        settled = mock.Mock()
+        with self.assertRaisesRegex(task.Refusal, "exact terminal"):
+            gate.recover(self.admission, self.fingerprint, self.unit,
+                         "sha256:" + "0" * 64, settled)
+        settled.assert_not_called()
+        self.assertEqual((self.admission / "reservation.json").read_bytes(), before)
 
     def test_recovery_does_not_release_unsettled_unit(self):
         with self.reservation() as first:
             with first.launch():
                 pass
         with self.assertRaisesRegex(task.Refusal, "still active"):
-            gate.recover(self.admission, self.fingerprint, self.unit,
+            gate.recover(self.admission, self.fingerprint, self.unit, self.binding(),
                          mock.Mock(side_effect=task.Refusal("still active")))
         self.assertTrue((self.admission / "reservation.json").exists())
 
