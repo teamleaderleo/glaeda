@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-readonly runner_listener="/opt/smolrunner/actions-runner/bin/Runner.Listener"
+readonly runner_listener="/opt/glaeda/actions-runner/bin/Runner.Listener"
 readonly max_jit_bytes=65536
 
 umask 077
