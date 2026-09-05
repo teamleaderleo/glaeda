@@ -374,11 +374,38 @@ class VerifyFocusedTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve(strict=True)
             os.chmod(root, 0o700)
-            path = root / "receipt.json"
+            for name in ("repository", "cargo", "rustup", "state"):
+                (root / name).mkdir(mode=0o700)
+            command_root = root / "state" / ("c" * 64)
+            command_root.mkdir(mode=0o700)
+            path = command_root / "receipt.json"
             MODULE.publish_document(path, document, replace=False)
             self.assertEqual(MODULE.read_document(path), document)
             self.assertTrue(MODULE.matches_request(document, request))
             self.assertTrue(MODULE.valid_terminal_receipt(document, request))
+
+            original_bytes = path.read_bytes()
+            original_mtime = path.stat().st_mtime_ns
+            for reconcile_only in (False, True):
+                arguments = mock.Mock(
+                    repository_root=str(root / "repository"), state_root=str(root / "state"),
+                    cargo_root=str(root / "cargo"), rustup_root=str(root / "rustup"),
+                    repository=request.repository, commit=request.commit, tree=request.tree,
+                    profile_generation=request.profile_generation,
+                    command_fingerprint=request.command_fingerprint, reconcile_only=reconcile_only,
+                )
+                with (mock.patch.object(MODULE, "verify_resident_source"),
+                      mock.patch.object(MODULE.owned_task, "prepare_task") as prepare,
+                      mock.patch.object(MODULE, "materialize") as materialize,
+                      mock.patch.object(MODULE, "execute_profile") as execute,
+                      mock.patch.object(MODULE, "emit") as emit):
+                    self.assertEqual(MODULE.run(arguments), 0)
+                    emit.assert_called_once_with(document)
+                    prepare.assert_not_called()
+                    materialize.assert_not_called()
+                    execute.assert_not_called()
+                self.assertEqual(path.read_bytes(), original_bytes)
+                self.assertEqual(path.stat().st_mtime_ns, original_mtime)
 
     def test_receipt_replay_rejects_incomplete_security_claims(self) -> None:
         request = MODULE.Request(
