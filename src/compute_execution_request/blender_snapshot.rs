@@ -35,14 +35,11 @@ impl BlenderRuntimeId {
             .is_some_and(|(first, last)| {
                 first.is_ascii_alphanumeric() && last.is_ascii_alphanumeric()
             });
-        let valid_body = bytes.iter().copied().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
-        });
-        if value.is_empty()
-            || value.len() > MAX_RUNTIME_ID_BYTES
-            || !valid_edges
-            || !valid_body
-        {
+        let valid_body = bytes
+            .iter()
+            .copied()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
+        if value.is_empty() || value.len() > MAX_RUNTIME_ID_BYTES || !valid_edges || !valid_body {
             return Err(BlenderSnapshotError::new(
                 "runtime_id",
                 "invalid_blender_runtime_id",
@@ -373,12 +370,7 @@ impl BlenderTransferPlan {
     ) -> Result<Self, BlenderSnapshotError> {
         let mut required = BTreeMap::<Sha256Digest, u64>::new();
         for file in snapshot.files() {
-            insert_digest_size(
-                &mut required,
-                file.digest().clone(),
-                file.bytes(),
-                "files",
-            )?;
+            insert_digest_size(&mut required, file.digest().clone(), file.bytes(), "files")?;
         }
         let remote = remote
             .objects()
@@ -691,11 +683,9 @@ mod tests {
                 200,
             ),
         ]);
-        let plan = BlenderTransferPlan::new(
-            &project,
-            &BlenderRemoteInventory::new(vec![]).unwrap(),
-        )
-        .unwrap();
+        let plan =
+            BlenderTransferPlan::new(&project, &BlenderRemoteInventory::new(vec![]).unwrap())
+                .unwrap();
         assert_eq!(plan.required_objects().len(), 2);
         assert_eq!(plan.missing_objects().len(), 2);
         assert_eq!(plan.present_objects().len(), 0);
