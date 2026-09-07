@@ -9,5 +9,8 @@ fn blender_snapshot_exporter_contract_tests_pass() {
         .current_dir(&root)
         .status()
         .expect("python3 must be available in the verified Glaeda development environment");
-    assert!(status.success(), "Blender snapshot exporter contract tests failed");
+    assert!(
+        status.success(),
+        "Blender snapshot exporter contract tests failed"
+    );
 }
