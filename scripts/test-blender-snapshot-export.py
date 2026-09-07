@@ -41,6 +41,9 @@ class FakeBpy:
         dirty: bool = False,
         images: tuple[object, ...] = (),
         texts: tuple[object, ...] = (),
+        movieclips: tuple[object, ...] = (),
+        cache_files: tuple[object, ...] = (),
+        volumes: tuple[object, ...] = (),
     ) -> None:
         self.data = SimpleNamespace(
             filepath=str(main_scene) if saved else "",
@@ -48,6 +51,9 @@ class FakeBpy:
             is_dirty=dirty,
             images=images,
             texts=texts,
+            movieclips=movieclips,
+            cache_files=cache_files,
+            volumes=volumes,
         )
         self.app = SimpleNamespace(version=(5, 2, 0))
         self.utils = FakeUtils([str(path) for path in dependencies])
@@ -155,6 +161,57 @@ class BlenderSnapshotExportTests(unittest.TestCase):
                 packed_files=(),
             )
             document = export_from_bpy(FakeBpy(main_scene, [], images=(generated,)), root)
+            self.assertEqual(len(document["files"]), 1)
+
+    def test_multi_file_blender_sources_fail_closed_until_expanded_enumeration(self) -> None:
+        temporary, root, main_scene = self.fixture()
+        with temporary:
+            cases = [
+                {
+                    "images": (
+                        SimpleNamespace(
+                            source="SEQUENCE",
+                            packed_file=None,
+                            packed_files=(),
+                            filepath="//frames/frame_####.png",
+                            is_dirty=False,
+                        ),
+                    )
+                },
+                {
+                    "images": (
+                        SimpleNamespace(
+                            source="TILED",
+                            packed_file=None,
+                            packed_files=(),
+                            filepath="//textures/skin.<UDIM>.exr",
+                            is_dirty=False,
+                        ),
+                    )
+                },
+                {"movieclips": (SimpleNamespace(source="SEQUENCE"),)},
+                {"cache_files": (SimpleNamespace(is_sequence=True),)},
+                {"volumes": (SimpleNamespace(is_sequence=True),)},
+            ]
+            for kwargs in cases:
+                with self.subTest(kwargs=tuple(kwargs)):
+                    bpy = FakeBpy(main_scene, [], **kwargs)
+                    with self.assertRaises(SnapshotExportError) as refused:
+                        export_from_bpy(bpy, root)
+                    self.assertEqual(refused.exception.code, "unresolved_blender_dependency")
+                    self.assertEqual(bpy.utils.calls, [])
+
+            packed_tiled = SimpleNamespace(
+                source="TILED",
+                packed_file=object(),
+                packed_files=(),
+                filepath="//textures/skin.<UDIM>.exr",
+                is_dirty=False,
+            )
+            document = export_from_bpy(
+                FakeBpy(main_scene, [], images=(packed_tiled,)),
+                root,
+            )
             self.assertEqual(len(document["files"]), 1)
 
     def test_missing_outside_and_tokenized_dependencies_fail_closed(self) -> None:
