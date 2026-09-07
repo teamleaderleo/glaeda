@@ -7,6 +7,5 @@ mod request;
 
 pub use request::{COMPUTE_EXECUTION_REQUEST_SCHEMA_VERSION, ComputeExecutionRequest};
 
-#[path = "accelerator_burst.rs"]
 pub mod accelerator_burst;
 pub mod capacity_admission;
