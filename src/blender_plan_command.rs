@@ -56,7 +56,9 @@ pub fn build_blender_plan(
         intent,
         maximum_rtt_ms,
     )
-    .map_err(|error| BlenderPlanCommandError::new(error.code(), "accelerator requirement is invalid"))?;
+    .map_err(|error| {
+        BlenderPlanCommandError::new(error.code(), "accelerator requirement is invalid")
+    })?;
 
     BlenderBurstWorkPlan::new(&snapshot, &inventory, accelerator).map_err(plan_error)
 }
@@ -67,7 +69,8 @@ fn read_bounded_document(
     code: &'static str,
     message: &'static str,
 ) -> Result<Vec<u8>, BlenderPlanCommandError> {
-    let mut file = std::fs::File::open(path).map_err(|_| BlenderPlanCommandError::new(code, message))?;
+    let mut file =
+        std::fs::File::open(path).map_err(|_| BlenderPlanCommandError::new(code, message))?;
     let metadata = file
         .metadata()
         .map_err(|_| BlenderPlanCommandError::new(code, message))?;
@@ -177,14 +180,8 @@ mod tests {
               }]
             }"#,
         );
-        let plan = build_blender_plan(
-            &snapshot,
-            &inventory,
-            24,
-            AcceleratorIntent::Batch,
-            None,
-        )
-        .unwrap();
+        let plan =
+            build_blender_plan(&snapshot, &inventory, 24, AcceleratorIntent::Batch, None).unwrap();
         std::fs::remove_file(snapshot).unwrap();
         std::fs::remove_file(inventory).unwrap();
 
