@@ -385,10 +385,8 @@ fn plan_candidate(
             reasons: vec![AcceleratorRefusalReason::PredictionOverflow],
         };
     };
-    let estimated_cost_micro_usd = estimated_cost_micro_usd(
-        predicted_completion_ms,
-        target.hourly_price_micro_usd,
-    );
+    let estimated_cost_micro_usd =
+        estimated_cost_micro_usd(predicted_completion_ms, target.hourly_price_micro_usd);
     AcceleratorCandidatePlan::Eligible {
         target,
         predicted_completion_ms,
@@ -463,7 +461,11 @@ pub struct AcceleratorBurstError {
 
 impl AcceleratorBurstError {
     const fn new(field: &'static str, code: &'static str, message: &'static str) -> Self {
-        Self { field, code, message }
+        Self {
+            field,
+            code,
+            message,
+        }
     }
 
     #[must_use]
