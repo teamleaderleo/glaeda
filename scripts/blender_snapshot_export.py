@@ -36,6 +36,8 @@ CACHE_SUFFIXES = {
 }
 UNRESOLVED_TOKENS = ("<UDIM>", "<UVTILE>", "#", "{", "}")
 FILE_BACKED_IMAGE_SOURCES = {"FILE", "MOVIE", "SEQUENCE", "TILED"}
+MULTI_FILE_IMAGE_SOURCES = {"SEQUENCE", "TILED"}
+MULTI_FILE_MOVIE_CLIP_SOURCES = {"SEQUENCE"}
 
 
 class SnapshotExportError(RuntimeError):
@@ -247,6 +249,35 @@ def is_packed(data_block: Any) -> bool:
         return bool(tuple(packed_files))
 
 
+def refuse_unexpanded_multi_file_dependencies(bpy_module: Any) -> None:
+    data = bpy_module.data
+    for image in getattr(data, "images", ()):
+        source = str(getattr(image, "source", ""))
+        if source in MULTI_FILE_IMAGE_SOURCES and not is_packed(image):
+            raise refuse(
+                "unresolved_blender_dependency",
+                "Blender image sequence or tiled image requires exact expanded-member enumeration",
+            )
+    for movie_clip in getattr(data, "movieclips", ()):
+        if str(getattr(movie_clip, "source", "")) in MULTI_FILE_MOVIE_CLIP_SOURCES:
+            raise refuse(
+                "unresolved_blender_dependency",
+                "Blender movie-clip sequence requires exact expanded-member enumeration",
+            )
+    for cache_file in getattr(data, "cache_files", ()):
+        if bool(getattr(cache_file, "is_sequence", False)):
+            raise refuse(
+                "unresolved_blender_dependency",
+                "Blender cache-file sequence requires exact expanded-member enumeration",
+            )
+    for volume in getattr(data, "volumes", ()):
+        if bool(getattr(volume, "is_sequence", False)):
+            raise refuse(
+                "unresolved_blender_dependency",
+                "Blender volume sequence requires exact expanded-member enumeration",
+            )
+
+
 def refuse_dirty_external_data(bpy_module: Any) -> None:
     for image in getattr(bpy_module.data, "images", ()):
         source = str(getattr(image, "source", ""))
@@ -297,6 +328,7 @@ def export_from_bpy(bpy_module: Any, project_root: Path) -> dict[str, object]:
             "Blender project has unsaved edits and cannot be represented by current file bytes",
         )
 
+    refuse_unexpanded_multi_file_dependencies(bpy_module)
     refuse_dirty_external_data(bpy_module)
     try:
         external_paths = bpy_module.utils.blend_paths(
