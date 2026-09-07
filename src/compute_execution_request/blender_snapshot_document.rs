@@ -163,8 +163,14 @@ mod tests {
         assert_eq!(snapshot.runtime_id().as_str(), "blender-5.2.0");
         assert_eq!(snapshot.main_scene().as_str(), "scenes/main.blend");
         assert_eq!(snapshot.files().len(), 2);
-        assert_eq!(snapshot.files()[0].relative_path().as_str(), "scenes/main.blend");
-        assert_eq!(snapshot.files()[1].relative_path().as_str(), "textures/wood.exr");
+        assert_eq!(
+            snapshot.files()[0].relative_path().as_str(),
+            "scenes/main.blend"
+        );
+        assert_eq!(
+            snapshot.files()[1].relative_path().as_str(),
+            "textures/wood.exr"
+        );
         assert!(snapshot.snapshot_digest().as_str().starts_with("sha256:"));
     }
 
@@ -178,7 +184,9 @@ mod tests {
           "provider": "runpod"
         }"#;
         assert_eq!(
-            decode_blender_snapshot_document(unknown).unwrap_err().code(),
+            decode_blender_snapshot_document(unknown)
+                .unwrap_err()
+                .code(),
             "invalid_blender_snapshot_document"
         );
 
