@@ -28,7 +28,7 @@ It should express at least:
 - accelerator vendor/API class such as NVIDIA/CUDA;
 - minimum accelerator memory;
 - batch versus interactive intent;
-- optional maximum acceptable RTT for interactive work;
+- an explicit maximum acceptable RTT for interactive work;
 - expected useful-work duration when a workload adapter has a defensible estimate;
 - candidate accelerator memory, region class, observed RTT, startup-to-useful estimate, hourly price, and warm/cold lease state;
 - explicit eligibility/refusal reasons;
