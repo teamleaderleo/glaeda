@@ -9,4 +9,5 @@ pub use request::{COMPUTE_EXECUTION_REQUEST_SCHEMA_VERSION, ComputeExecutionRequ
 
 pub mod accelerator_burst;
 pub mod blender_snapshot;
+pub mod blender_snapshot_document;
 pub mod capacity_admission;
