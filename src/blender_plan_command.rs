@@ -69,7 +69,8 @@ fn read_bounded_document(
     code: &'static str,
     message: &'static str,
 ) -> Result<Vec<u8>, BlenderPlanCommandError> {
-    let file = std::fs::File::open(path).map_err(|_| BlenderPlanCommandError::new(code, message))?;
+    let file =
+        std::fs::File::open(path).map_err(|_| BlenderPlanCommandError::new(code, message))?;
     let metadata = file
         .metadata()
         .map_err(|_| BlenderPlanCommandError::new(code, message))?;
