@@ -1,7 +1,7 @@
 //! Pure Blender project execution snapshots and content-addressed transfer planning.
 //!
 //! The snapshot is portable execution identity only. It contains project-relative logical paths,
-//! content digests, file classes and byte lengths; it carries no host path, provider path,
+//! content digests, file classes, and byte lengths. It grants zero host-path, provider-path,
 //! credential, upload, execution, lease, billing, or mutation authority.
 
 use std::collections::BTreeMap;
@@ -19,6 +19,8 @@ const MAX_REMOTE_OBJECTS: usize = 8192;
 const MAX_RELATIVE_PATH_BYTES: usize = 512;
 const MAX_RUNTIME_ID_BYTES: usize = 96;
 const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024 * 1024 * 1024;
+const SHA256_PREFIX: &str = "sha256:";
+const HEX: &[u8; 16] = b"0123456789abcdef";
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
@@ -26,19 +28,21 @@ pub struct BlenderRuntimeId(String);
 
 impl BlenderRuntimeId {
     pub fn parse(value: &str) -> Result<Self, BlenderSnapshotError> {
-        let valid = !value.is_empty()
-            && value.len() <= MAX_RUNTIME_ID_BYTES
-            && value
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-            && value
-                .as_bytes()
-                .first()
-                .zip(value.as_bytes().last())
-                .is_some_and(|(first, last)| {
-                    first.is_ascii_alphanumeric() && last.is_ascii_alphanumeric()
-                });
-        if !valid {
+        let bytes = value.as_bytes();
+        let valid_edges = bytes
+            .first()
+            .zip(bytes.last())
+            .is_some_and(|(first, last)| {
+                first.is_ascii_alphanumeric() && last.is_ascii_alphanumeric()
+            });
+        let valid_body = bytes.iter().copied().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
+        });
+        if value.is_empty()
+            || value.len() > MAX_RUNTIME_ID_BYTES
+            || !valid_edges
+            || !valid_body
+        {
             return Err(BlenderSnapshotError::new(
                 "runtime_id",
                 "invalid_blender_runtime_id",
@@ -67,28 +71,18 @@ impl BlenderRelativePath {
             || value.contains('\\')
             || value.contains(':')
             || value.chars().any(|character| {
-                character.is_control()
-                    || matches!(character, '*' | '?' | '<' | '>' | '|' | '"')
+                character.is_control() || matches!(character, '*' | '?' | '<' | '>' | '|' | '"')
             })
+            || value
+                .split('/')
+                .any(|segment| segment.is_empty() || matches!(segment, "." | ".."))
         {
             return Err(BlenderSnapshotError::new(
                 "relative_path",
                 "invalid_blender_relative_path",
-                "Blender project paths must be bounded portable relative paths",
+                "Blender project paths must be bounded portable relative paths without host or traversal syntax",
             ));
         }
-
-        if value
-            .split('/')
-            .any(|segment| segment.is_empty() || matches!(segment, "." | ".."))
-        {
-            return Err(BlenderSnapshotError::new(
-                "relative_path",
-                "invalid_blender_relative_path",
-                "Blender project paths cannot contain empty, '.' or '..' segments",
-            ));
-        }
-
         Ok(Self(value.to_owned()))
     }
 
@@ -123,13 +117,7 @@ impl BlenderProjectFile {
         digest: Sha256Digest,
         bytes: u64,
     ) -> Result<Self, BlenderSnapshotError> {
-        if bytes > MAX_FILE_BYTES {
-            return Err(BlenderSnapshotError::new(
-                "bytes",
-                "blender_file_too_large",
-                "Blender project file exceeds the bounded byte limit",
-            ));
-        }
+        validate_object_size(bytes)?;
         Ok(Self {
             relative_path,
             class,
@@ -221,7 +209,6 @@ impl BlenderProjectSnapshot {
 
         validate_digest_sizes(files.iter().map(|file| (&file.digest, file.bytes)))?;
         let snapshot_digest = canonical_snapshot_digest(&runtime_id, &main_scene, &files)?;
-
         Ok(Self {
             schema_version: BLENDER_EXECUTION_SNAPSHOT_SCHEMA_VERSION,
             runtime_id,
@@ -294,15 +281,18 @@ fn canonical_snapshot_digest(
             "Blender snapshot canonicalization failed",
         )
     })?;
-    let digest = Sha256::digest(encoded);
-    let value = format!("sha256:{digest:x}");
-    Sha256Digest::parse(&value).map_err(|_| {
-        BlenderSnapshotError::new(
-            "snapshot_digest",
-            "blender_snapshot_digest_failed",
-            "Blender snapshot digest construction failed",
-        )
-    })
+    Ok(sha256_digest(&encoded))
+}
+
+fn sha256_digest(bytes: &[u8]) -> Sha256Digest {
+    let digest = Sha256::digest(bytes);
+    let mut value = String::with_capacity(SHA256_PREFIX.len() + digest.len() * 2);
+    value.push_str(SHA256_PREFIX);
+    for byte in digest {
+        value.push(HEX[(byte >> 4) as usize] as char);
+        value.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    Sha256Digest::parse(&value).expect("SHA-256 encoder must produce a canonical digest")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -313,13 +303,7 @@ pub struct BlenderContentObject {
 
 impl BlenderContentObject {
     pub fn new(digest: Sha256Digest, bytes: u64) -> Result<Self, BlenderSnapshotError> {
-        if bytes > MAX_FILE_BYTES {
-            return Err(BlenderSnapshotError::new(
-                "bytes",
-                "blender_content_object_too_large",
-                "Blender content object exceeds the bounded byte limit",
-            ));
-        }
+        validate_object_size(bytes)?;
         Ok(Self { digest, bytes })
     }
 
@@ -351,22 +335,9 @@ impl BlenderRemoteInventory {
         }
 
         let mut canonical = BTreeMap::<Sha256Digest, u64>::new();
-        for object in objects {
-            match canonical.get(object.digest()) {
-                Some(existing) if *existing != object.bytes() => {
-                    return Err(BlenderSnapshotError::new(
-                        "objects",
-                        "inconsistent_blender_digest_size",
-                        "the same Blender content digest cannot have conflicting byte lengths",
-                    ));
-                }
-                Some(_) => {}
-                None => {
-                    canonical.insert(object.digest, object.bytes);
-                }
-            }
+        for BlenderContentObject { digest, bytes } in objects {
+            insert_digest_size(&mut canonical, digest, bytes, "objects")?;
         }
-
         let objects = canonical
             .into_iter()
             .map(|(digest, bytes)| BlenderContentObject { digest, bytes })
@@ -402,22 +373,14 @@ impl BlenderTransferPlan {
     ) -> Result<Self, BlenderSnapshotError> {
         let mut required = BTreeMap::<Sha256Digest, u64>::new();
         for file in snapshot.files() {
-            match required.get(file.digest()) {
-                Some(existing) if *existing != file.bytes() => {
-                    return Err(BlenderSnapshotError::new(
-                        "files",
-                        "inconsistent_blender_digest_size",
-                        "the same Blender content digest cannot have conflicting byte lengths",
-                    ));
-                }
-                Some(_) => {}
-                None => {
-                    required.insert(file.digest().clone(), file.bytes());
-                }
-            }
+            insert_digest_size(
+                &mut required,
+                file.digest().clone(),
+                file.bytes(),
+                "files",
+            )?;
         }
-
-        let remote_by_digest = remote
+        let remote = remote
             .objects()
             .iter()
             .map(|object| (object.digest().clone(), object.bytes()))
@@ -437,7 +400,7 @@ impl BlenderTransferPlan {
                 bytes,
             };
             required_objects.push(object.clone());
-            match remote_by_digest.get(&digest) {
+            match remote.get(&digest) {
                 Some(remote_bytes) if *remote_bytes != bytes => {
                     return Err(BlenderSnapshotError::new(
                         "remote_inventory",
@@ -504,6 +467,47 @@ impl BlenderTransferPlan {
     }
 }
 
+fn validate_object_size(bytes: u64) -> Result<(), BlenderSnapshotError> {
+    if bytes > MAX_FILE_BYTES {
+        return Err(BlenderSnapshotError::new(
+            "bytes",
+            "blender_content_object_too_large",
+            "Blender content object exceeds the bounded byte limit",
+        ));
+    }
+    Ok(())
+}
+
+fn insert_digest_size(
+    sizes: &mut BTreeMap<Sha256Digest, u64>,
+    digest: Sha256Digest,
+    bytes: u64,
+    field: &'static str,
+) -> Result<(), BlenderSnapshotError> {
+    match sizes.get(&digest) {
+        Some(existing) if *existing != bytes => Err(BlenderSnapshotError::new(
+            field,
+            "inconsistent_blender_digest_size",
+            "the same Blender content digest cannot have conflicting byte lengths",
+        )),
+        Some(_) => Ok(()),
+        None => {
+            sizes.insert(digest, bytes);
+            Ok(())
+        }
+    }
+}
+
+fn validate_digest_sizes<'a>(
+    objects: impl Iterator<Item = (&'a Sha256Digest, u64)>,
+) -> Result<(), BlenderSnapshotError> {
+    let mut sizes = BTreeMap::<Sha256Digest, u64>::new();
+    for (digest, bytes) in objects {
+        insert_digest_size(&mut sizes, digest.clone(), bytes, "files")?;
+    }
+    Ok(())
+}
+
 fn checked_total(current: u64, value: u64) -> Result<u64, BlenderSnapshotError> {
     current.checked_add(value).ok_or_else(|| {
         BlenderSnapshotError::new(
@@ -512,28 +516,6 @@ fn checked_total(current: u64, value: u64) -> Result<u64, BlenderSnapshotError> 
             "Blender byte total overflowed the bounded integer representation",
         )
     })
-}
-
-fn validate_digest_sizes<'a>(
-    objects: impl Iterator<Item = (&'a Sha256Digest, u64)>,
-) -> Result<(), BlenderSnapshotError> {
-    let mut sizes = BTreeMap::<Sha256Digest, u64>::new();
-    for (digest, bytes) in objects {
-        match sizes.get(digest) {
-            Some(existing) if *existing != bytes => {
-                return Err(BlenderSnapshotError::new(
-                    "files",
-                    "inconsistent_blender_digest_size",
-                    "the same Blender content digest cannot have conflicting byte lengths",
-                ));
-            }
-            Some(_) => {}
-            None => {
-                sizes.insert(digest.clone(), bytes);
-            }
-        }
-    }
-    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -587,6 +569,15 @@ mod tests {
         BlenderProjectFile::new(path(relative_path), class, digest(digest_char), bytes).unwrap()
     }
 
+    fn scene(digest_char: char, bytes: u64) -> BlenderProjectFile {
+        file(
+            "scenes/main.blend",
+            BlenderProjectFileClass::Scene,
+            digest_char,
+            bytes,
+        )
+    }
+
     fn snapshot(files: Vec<BlenderProjectFile>) -> BlenderProjectSnapshot {
         BlenderProjectSnapshot::new(
             BlenderRuntimeId::parse("blender-4.5.3").unwrap(),
@@ -624,7 +615,7 @@ mod tests {
 
     #[test]
     fn snapshot_digest_is_independent_of_input_order() {
-        let scene = file("scenes/main.blend", BlenderProjectFileClass::Scene, 'a', 100);
+        let scene = scene('a', 100);
         let texture = file("assets/wood.exr", BlenderProjectFileClass::Asset, 'b', 200);
         let first = snapshot(vec![scene.clone(), texture.clone()]);
         let second = snapshot(vec![texture, scene]);
@@ -666,10 +657,7 @@ mod tests {
         let duplicate_path = BlenderProjectSnapshot::new(
             BlenderRuntimeId::parse("blender-4.5.3").unwrap(),
             path("scenes/main.blend"),
-            vec![
-                file("scenes/main.blend", BlenderProjectFileClass::Scene, 'a', 100),
-                file("scenes/main.blend", BlenderProjectFileClass::Scene, 'b', 100),
-            ],
+            vec![scene('a', 100), scene('b', 100)],
         )
         .unwrap_err();
         assert_eq!(duplicate_path.code(), "duplicate_blender_relative_path");
@@ -678,7 +666,7 @@ mod tests {
             BlenderRuntimeId::parse("blender-4.5.3").unwrap(),
             path("scenes/main.blend"),
             vec![
-                file("scenes/main.blend", BlenderProjectFileClass::Scene, 'a', 100),
+                scene('a', 100),
                 file("assets/copy.bin", BlenderProjectFileClass::Asset, 'a', 101),
             ],
         )
@@ -689,12 +677,25 @@ mod tests {
     #[test]
     fn empty_remote_inventory_requires_each_unique_content_object_once() {
         let project = snapshot(vec![
-            file("scenes/main.blend", BlenderProjectFileClass::Scene, 'a', 100),
-            file("assets/wood-a.exr", BlenderProjectFileClass::Asset, 'b', 200),
-            file("assets/wood-b.exr", BlenderProjectFileClass::Asset, 'b', 200),
+            scene('a', 100),
+            file(
+                "assets/wood-a.exr",
+                BlenderProjectFileClass::Asset,
+                'b',
+                200,
+            ),
+            file(
+                "assets/wood-b.exr",
+                BlenderProjectFileClass::Asset,
+                'b',
+                200,
+            ),
         ]);
-        let remote = BlenderRemoteInventory::new(vec![]).unwrap();
-        let plan = BlenderTransferPlan::new(&project, &remote).unwrap();
+        let plan = BlenderTransferPlan::new(
+            &project,
+            &BlenderRemoteInventory::new(vec![]).unwrap(),
+        )
+        .unwrap();
         assert_eq!(plan.required_objects().len(), 2);
         assert_eq!(plan.missing_objects().len(), 2);
         assert_eq!(plan.present_objects().len(), 0);
@@ -705,7 +706,7 @@ mod tests {
     #[test]
     fn fully_warm_inventory_requires_zero_transfer() {
         let project = snapshot(vec![
-            file("scenes/main.blend", BlenderProjectFileClass::Scene, 'a', 100),
+            scene('a', 100),
             file("assets/wood.exr", BlenderProjectFileClass::Asset, 'b', 200),
         ]);
         let remote = BlenderRemoteInventory::new(vec![
@@ -723,7 +724,7 @@ mod tests {
     #[test]
     fn one_scene_edit_transfers_only_the_new_scene_object() {
         let old = snapshot(vec![
-            file("scenes/main.blend", BlenderProjectFileClass::Scene, 'a', 100),
+            scene('a', 100),
             file("assets/wood.exr", BlenderProjectFileClass::Asset, 'b', 200),
         ]);
         let remote = BlenderRemoteInventory::new(
@@ -734,12 +735,15 @@ mod tests {
         )
         .unwrap();
         let edited = snapshot(vec![
-            file("scenes/main.blend", BlenderProjectFileClass::Scene, 'c', 120),
+            scene('c', 120),
             file("assets/wood.exr", BlenderProjectFileClass::Asset, 'b', 200),
         ]);
         let plan = BlenderTransferPlan::new(&edited, &remote).unwrap();
         assert_eq!(plan.missing_objects().len(), 1);
-        assert_eq!(plan.missing_objects()[0].digest().as_str(), digest('c').as_str());
+        assert_eq!(
+            plan.missing_objects()[0].digest().as_str(),
+            digest('c').as_str()
+        );
         assert_eq!(plan.missing_bytes(), 120);
         assert_eq!(plan.present_bytes(), 200);
     }
@@ -757,12 +761,14 @@ mod tests {
     #[test]
     fn public_json_contains_only_portable_project_identity() {
         let project = snapshot(vec![
-            file("scenes/main.blend", BlenderProjectFileClass::Scene, 'a', 100),
+            scene('a', 100),
             file("assets/wood.exr", BlenderProjectFileClass::Asset, 'b', 200),
         ]);
         let json = serde_json::to_string(&project).unwrap();
         assert!(json.contains("scenes/main.blend"));
-        for forbidden in ["/Users/", "/home/", "C:\\\\", "https://", "runpod", "vast.ai"] {
+        for forbidden in [
+            "/Users/", "/home/", "C:\\\\", "https://", "runpod", "vast.ai",
+        ] {
             assert!(!json.contains(forbidden));
         }
     }
