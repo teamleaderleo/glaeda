@@ -38,7 +38,8 @@ struct BlenderRemoteInventoryDocumentObject {
 pub fn decode_blender_remote_inventory_document(
     bytes: &[u8],
 ) -> Result<BlenderRemoteInventory, BlenderRemoteInventoryDocumentError> {
-    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_BLENDER_REMOTE_INVENTORY_DOCUMENT_BYTES {
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_BLENDER_REMOTE_INVENTORY_DOCUMENT_BYTES
+    {
         return Err(BlenderRemoteInventoryDocumentError::new(
             "blender_remote_inventory_document_too_large",
             "Blender remote inventory document exceeds the bounded maximum",
@@ -65,9 +66,7 @@ pub fn decode_blender_remote_inventory_document(
                 "Blender remote inventory content digest is invalid",
             )
         })?;
-        objects.push(
-            BlenderContentObject::new(digest, object.bytes).map_err(validation_error)?,
-        );
+        objects.push(BlenderContentObject::new(digest, object.bytes).map_err(validation_error)?);
     }
     BlenderRemoteInventory::new(objects).map_err(validation_error)
 }
@@ -110,10 +109,9 @@ mod tests {
 
     #[test]
     fn empty_and_populated_inventories_decode() {
-        let empty = decode_blender_remote_inventory_document(
-            br#"{"schema_version":1,"objects":[]}"#,
-        )
-        .unwrap();
+        let empty =
+            decode_blender_remote_inventory_document(br#"{"schema_version":1,"objects":[]}"#)
+                .unwrap();
         assert!(empty.objects().is_empty());
 
         let populated = decode_blender_remote_inventory_document(
