@@ -4,7 +4,7 @@ mod blender_plan_command;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use blender_plan_command::build_blender_plan;
+use blender_plan_command::{build_blender_plan, build_blender_plan_from_store};
 use clap::{Parser, Subcommand, ValueEnum};
 use glaeda::compute_execution_request::accelerator_burst::AcceleratorIntent;
 use glaeda::compute_execution_request::blender_burst_work_plan::render_blender_burst_work_plan_human;
@@ -32,14 +32,17 @@ enum OutputFormat {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Compose a portable Blender snapshot, remote content inventory, and accelerator requirement.
+    /// Compose a portable Blender snapshot, proven content inventory, and accelerator requirement.
     Plan {
         /// Private portable snapshot JSON emitted by the Blender exporter.
         #[arg(long)]
         snapshot: PathBuf,
         /// Provider-neutral remote content inventory JSON.
-        #[arg(long)]
-        inventory: PathBuf,
+        #[arg(long, conflicts_with = "content_store_root", required_unless_present = "content_store_root")]
+        inventory: Option<PathBuf>,
+        /// Local or mounted persistent content-store root; required objects are verified by bytes.
+        #[arg(long, conflicts_with = "inventory", required_unless_present = "inventory")]
+        content_store_root: Option<PathBuf>,
         /// Minimum NVIDIA VRAM in GiB.
         #[arg(long)]
         minimum_vram_gib: u64,
@@ -80,17 +83,29 @@ fn main() -> ExitCode {
         Command::Plan {
             snapshot,
             inventory,
+            content_store_root,
             minimum_vram_gib,
             intent,
             maximum_rtt_ms,
         } => {
-            let plan = match build_blender_plan(
-                &snapshot,
-                &inventory,
-                minimum_vram_gib,
-                intent.into(),
-                maximum_rtt_ms,
-            ) {
+            let plan = match (inventory, content_store_root) {
+                (Some(inventory), None) => build_blender_plan(
+                    &snapshot,
+                    &inventory,
+                    minimum_vram_gib,
+                    intent.into(),
+                    maximum_rtt_ms,
+                ),
+                (None, Some(content_store_root)) => build_blender_plan_from_store(
+                    &snapshot,
+                    &content_store_root,
+                    minimum_vram_gib,
+                    intent.into(),
+                    maximum_rtt_ms,
+                ),
+                _ => unreachable!("clap requires exactly one Blender inventory source"),
+            };
+            let plan = match plan {
                 Ok(plan) => plan,
                 Err(error) => {
                     return emit_error(cli.output, error.code(), error.to_string());
@@ -137,7 +152,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn plan_cli_requires_explicit_snapshot_inventory_and_accelerator_intent() {
+    fn plan_cli_accepts_manual_inventory() {
         let cli = Cli::try_parse_from([
             "glaeda-blender",
             "--output",
@@ -158,14 +173,70 @@ mod tests {
         let Command::Plan {
             snapshot,
             inventory,
+            content_store_root,
             minimum_vram_gib,
             intent,
             maximum_rtt_ms,
         } = cli.command;
         assert_eq!(snapshot, PathBuf::from("snapshot.json"));
-        assert_eq!(inventory, PathBuf::from("inventory.json"));
+        assert_eq!(inventory, Some(PathBuf::from("inventory.json")));
+        assert_eq!(content_store_root, None);
         assert_eq!(minimum_vram_gib, 24);
         assert!(matches!(intent, BlenderIntent::Interactive));
         assert_eq!(maximum_rtt_ms, Some(80));
+    }
+
+    #[test]
+    fn plan_cli_accepts_store_observation_instead_of_inventory() {
+        let cli = Cli::try_parse_from([
+            "glaeda-blender",
+            "plan",
+            "--snapshot",
+            "snapshot.json",
+            "--content-store-root",
+            "/store",
+            "--minimum-vram-gib",
+            "24",
+            "--intent",
+            "batch",
+        ])
+        .unwrap();
+        let Command::Plan {
+            inventory,
+            content_store_root,
+            ..
+        } = cli.command;
+        assert_eq!(inventory, None);
+        assert_eq!(content_store_root, Some(PathBuf::from("/store")));
+    }
+
+    #[test]
+    fn plan_cli_requires_exactly_one_inventory_source() {
+        let missing = Cli::try_parse_from([
+            "glaeda-blender",
+            "plan",
+            "--snapshot",
+            "snapshot.json",
+            "--minimum-vram-gib",
+            "24",
+            "--intent",
+            "batch",
+        ]);
+        assert!(missing.is_err());
+        let conflicting = Cli::try_parse_from([
+            "glaeda-blender",
+            "plan",
+            "--snapshot",
+            "snapshot.json",
+            "--inventory",
+            "inventory.json",
+            "--content-store-root",
+            "/store",
+            "--minimum-vram-gib",
+            "24",
+            "--intent",
+            "batch",
+        ]);
+        assert!(conflicting.is_err());
     }
 }
