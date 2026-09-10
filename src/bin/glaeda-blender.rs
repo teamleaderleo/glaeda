@@ -38,10 +38,18 @@ enum Command {
         #[arg(long)]
         snapshot: PathBuf,
         /// Provider-neutral remote content inventory JSON.
-        #[arg(long, conflicts_with = "content_store_root", required_unless_present = "content_store_root")]
+        #[arg(
+            long,
+            conflicts_with = "content_store_root",
+            required_unless_present = "content_store_root"
+        )]
         inventory: Option<PathBuf>,
         /// Local or mounted persistent content-store root; required objects are verified by bytes.
-        #[arg(long, conflicts_with = "inventory", required_unless_present = "inventory")]
+        #[arg(
+            long,
+            conflicts_with = "inventory",
+            required_unless_present = "inventory"
+        )]
         content_store_root: Option<PathBuf>,
         /// Minimum NVIDIA VRAM in GiB.
         #[arg(long)]
