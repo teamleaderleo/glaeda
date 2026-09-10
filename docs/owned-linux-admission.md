@@ -1,30 +1,61 @@
-# Focused owned-Linux admission
+# Owned-Linux admission
 
-The local `verify-focused run --admission-root <installed-private-root>` path adds a physical
-launch gate to the existing verifier. An installed adapter supplies this root; a connected request
-must never select, override, or omit it. The dispatch v2 focused capability forwards this fixed local
-option. Ordinary local verification without the option retains its existing behavior.
+The local admission gate is the shared physical launch boundary for reviewed owner-local workloads.
+`verify-focused run --admission-root <installed-private-root>` remains its first production consumer.
+An installed adapter supplies this root; a connected request must never select, override, or omit it.
+The dispatch v2 focused capability forwards this fixed local option. Ordinary local verification
+without the option retains its existing behavior.
 
-The gate admits only `verify-focused/v1`: four CPUs, 8 GiB MemoryMax, and the existing fixed
-TasksMax and deadline. It reserves one job in the installed root before source preparation and
-retains that slot through physical settlement, task cleanup, and terminal receipt publication.
-The slot is compute capacity state, not another work queue or execution/result identity.
+The gate admits one reviewed in-process `AdmissionDemand` at a time. A demand contains only the
+capacity facts the current host observer can enforce truthfully: candidate memory bytes and a
+minimum logical-CPU count. It is constructed by checked-in local adapter code and is never decoded
+from remote request bytes. The default `VERIFY_FOCUSED_DEMAND` exactly preserves the existing
+`verify-focused/v1` requirement: 8 GiB MemoryMax and an eight-logical-CPU host floor. Future
+reviewed action/profile adapters may supply another demand only after their semantic profile
+identity binds that mapping.
+
+The gate reserves one job in the installed root before source preparation and retains that slot
+through physical settlement, task cleanup, and terminal receipt publication. The slot is compute
+capacity state, not another work queue or execution/result identity.
 
 Immediately around the existing `Popen`, the gate locks local operator policy, observes the host
 through the pinned `glaeda-host-observe` binary, and calls the pinned `glaeda-local-admission`
-reducer. It requires at least eight logical CPUs and available memory covering the 8 GiB profile
-plus the configured owner reserve (minimum 4 GiB). CPU/memory/I/O PSI avg10 at or above
-50%/1%/20% respectively asks the reducer to wait. Missing, malformed, stale, oversized or
-unbound observations refuse. The combined observation/reduction must finish within three
-seconds, including the final durable launch intent. Binaries are SHA256-bound and executed
+reducer. Available memory must cover the reviewed candidate demand plus the configured owner
+reserve (minimum 4 GiB), and the host must meet the demand's logical-CPU floor. CPU/memory/I/O PSI
+avg10 at or above 50%/1%/20% respectively asks the reducer to wait. Missing, malformed, stale,
+oversized or unbound observations refuse. The combined observation/reduction must finish within
+three seconds, including the final durable launch intent. Binaries are SHA256-bound and executed
 through held file descriptors with a closed environment and bounded output.
 
 Only the compatible `admit_now` decision is accepted, including all its false authority fields.
 Caller/source/profile authorization remains in the existing adapters and verifier. This policy
-is a coexist profile with no quiet-window claim. The new root is not an observer of an external
-quiet-lease store, a scheduler of Windows work, a CPU affinity reservation, or a guarantee against
-new unrelated host load. Existing quiet-window owners must integrate before claiming that gate.
-No preemption, VM controls, network widening, or arbitrary commands are added.
+is a coexist profile with no quiet-window claim. The gate does not observe an external quiet-lease
+store, schedule Windows work, reserve CPU affinity, or guarantee against new unrelated host load.
+Existing quiet-window owners must integrate before claiming that gate. No preemption, VM controls,
+network widening, or arbitrary commands are added.
+
+## Reviewed demand boundary
+
+`AdmissionDemand` is intentionally an in-process type instead of a request/CLI document. Both
+fields must be positive bounded integers; booleans, zeroes, foreign objects, and oversized integers
+refuse before host observation or workload launch. `observe(root, demand)` and
+`Reservation(..., demand)` consume the same reviewed value.
+
+The demand does not grant execution, resource ownership, preemption, routing, queue, persistence,
+or result authority. A remote caller cannot lower its apparent memory/CPU need to bypass admission.
+The local adapter that already owns semantic profile authorization owns the mapping from that
+reviewed identity to one demand. The existing command/profile fingerprint remains the semantic
+binding used for durable reservation and recovery.
+
+Fresh host availability remains decisive at the final launch boundary. For example, owner-local
+coding-agent work that consumes memory after an advisory readiness check reduces the next fresh
+`available_bytes` observation; if candidate memory plus owner reserve no longer fits, launch waits.
+No process scan, prompt/session inspection, or semantic inference about the competing work is
+required.
+
+This first generalized slice preserves the installed policy schema and the coexist interference
+class. It does not add raw resource fields to Git/GitHub requests, an arbitrary-resource CLI,
+editable workspaces, multi-node placement, or GPU/provider acquisition.
 
 ## Operator control and installation boundary
 
@@ -57,45 +88,49 @@ refuses new admission. Installation replacement must drain and settle the previo
 
 ## Refusal and recovery
 
-A hold/drain/pressure change during materialization is checked again before process creation.
-A pre-launch refusal removes only that attempt's task and intent before releasing the slot. If
-cleanup fails, the slot remains. Once process creation may have occurred, exceptions and crashes
-retain the durable reservation. Dead PIDs, absent locks, age, and service restarts never authorize
-redispatch. A failure between preparing the reservation and acquiring a terminal receipt remains
-an explicit recovery case; no automatic stale-reservation deletion is provided.
+A hold/drain/pressure/headroom change during materialization is checked again before process
+creation. A pre-launch refusal removes only that attempt's task and intent before releasing the
+slot. If cleanup fails, the slot remains. Once process creation may have occurred, exceptions and
+crashes retain the durable reservation. Dead PIDs, absent locks, age, and service restarts never
+authorize redispatch. A failure between preparing the reservation and acquiring a terminal receipt
+remains an explicit recovery case; no automatic stale-reservation deletion is provided.
 
 Normal exact replay reads the existing receipt without entering admission or changing identity.
 For recovery after terminal receipt publication but before slot release, call the same exact
 verifier request with both `--reconcile-only` and `--admission-root`. Recovery validates the
 existing receipt, matching reservation and installation generation, the digest binding the full
-source/profile identity and exact command-state directory path/device/inode, then freshly observes exact unit
-and task absence, and validates any remaining intent before releasing capacity. It does not run
-source or recreate a result. Unsettled or mismatched state stays reserved.
+source/profile identity and exact command-state directory path/device/inode, then freshly observes
+exact unit and task absence, and validates any remaining intent before releasing capacity. It does
+not run source or recreate a result. Unsettled or mismatched state stays reserved.
 
 ## Evidence and next integration
 
-`python3 scripts/test-owned-linux-admission.py` covers durable contention, crash refusal, exact
-recovery, serialized control, a hold/drain/pressure change at the real child-launch boundary,
-pre-launch cleanup, real disposable child settlement, immutable replay, filesystem substitution,
-protocol binding, and bounded helper output. These are local child tests with fixture host facts;
-they do not prove systemd/bubblewrap verification or a regular ChatGPT journey.
+`python3 scripts/test-owned-linux-admission.py` covers reviewed demand validation, different memory
+and CPU requirements against fresh host headroom, final launch-boundary demand recheck, durable
+contention, crash refusal, exact recovery, serialized control, hold/drain/pressure changes at the
+real child-launch boundary, pre-launch cleanup, real disposable child settlement, immutable replay,
+filesystem substitution, protocol binding, and bounded helper output. These are local child tests
+with fixture host facts; they do not prove systemd/bubblewrap verification or a regular ChatGPT
+journey.
 
-The next consumer change must pin this reviewed gate in the dispatch capability and resident
-adapter, then prove named physical verification, capability revocation, restart recovery, two
-requests, and timing. Service/capability installation requires its own concrete reviewed action.
+The next consumer may map another reviewed semantic action/profile to an `AdmissionDemand`, then
+prove that exact profile through the same physical admission/receipt path. Service/capability
+installation still requires its own concrete reviewed action.
 
 ## Pending-before-launch observation
 
-`python3 scripts/owned-admission-observe --root <installed-private-root>` returns a bounded
-`glaeda-owned-admission-observation` v1 JSON snapshot. It creates no lock, reservation, journal
-or directory. All authority fields are false. A consumer may leave a request pending when
-`outcome` is `wait`: `node_held`, `node_draining`, `pressure_high`, `capacity_unavailable`, or
-`reserved`. A surviving reservation stays reserved; this observer never infers completion from
-PIDs, age or lock availability. Invalid or unavailable observations return `refused` with
-`observation_unavailable`, without exposing paths, host facts or exception text.
+`python3 scripts/owned-admission-observe --root <installed-private-root>` keeps the focused verifier
+demand for compatibility and returns a bounded `glaeda-owned-admission-observation` v1 JSON
+snapshot. It creates no lock, reservation, journal or directory. All authority fields are false.
+An in-process reviewed consumer may call `observe(root, demand)` for another already-authorized
+profile. A consumer may leave a request pending when `outcome` is `wait`: `node_held`,
+`node_draining`, `pressure_high`, `capacity_unavailable`, or `reserved`. A surviving reservation
+stays reserved; this observer never infers completion from PIDs, age or lock availability. Invalid
+or unavailable observations return `refused` with `observation_unavailable`, without exposing paths,
+host facts or exception text.
 
 `ready` / `compatible` is only a disposable scheduling hint. The consumer must still validate
-caller/source/profile/capability and the verifier must perform its fresh reservation and final
+caller/source/profile/capability and the executor must perform its fresh reservation and final
 physical launch check. A race after this observation can still refuse at that boundary. The
-observer does not schedule retries or publish a terminal result. Operator hold maps to pending
-for the consumer; it remains a refusal in the physical reducer and launch path.
+observer does not schedule retries or publish a terminal result. Operator hold maps to pending for
+the consumer; it remains a refusal in the physical reducer and launch path.
