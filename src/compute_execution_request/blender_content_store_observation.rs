@@ -350,9 +350,9 @@ fn directory_snapshot(
         return Err(unsafe_node());
     }
     Ok(DirectorySnapshot {
-        device: stat.st_dev,
+        device: u64::try_from(stat.st_dev).map_err(|_| unsafe_node())?,
         inode: stat.st_ino,
-        mode: stat.st_mode,
+        mode: u32::from(stat.st_mode),
         mtime: stat.st_mtime,
         mtime_nsec: i64::try_from(stat.st_mtime_nsec).map_err(|_| unsafe_node())?,
         ctime: stat.st_ctime,
@@ -385,9 +385,9 @@ fn file_snapshot(
 
 fn stat_snapshot(stat: &Stat) -> Result<FileSnapshot, BlenderContentStoreObservationError> {
     Ok(FileSnapshot {
-        device: stat.st_dev,
+        device: u64::try_from(stat.st_dev).map_err(|_| unsafe_node())?,
         inode: stat.st_ino,
-        mode: stat.st_mode,
+        mode: u32::from(stat.st_mode),
         links: u64::from(stat.st_nlink),
         bytes: u64::try_from(stat.st_size).map_err(|_| unsafe_node())?,
         mtime: stat.st_mtime,
