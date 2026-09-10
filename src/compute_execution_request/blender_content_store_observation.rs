@@ -350,9 +350,9 @@ fn directory_snapshot(
         return Err(unsafe_node());
     }
     Ok(DirectorySnapshot {
-        device: u64::try_from(stat.st_dev).map_err(|_| unsafe_node())?,
+        device: portable_device(&stat)?,
         inode: stat.st_ino,
-        mode: u32::from(stat.st_mode),
+        mode: portable_mode(&stat),
         mtime: stat.st_mtime,
         mtime_nsec: i64::try_from(stat.st_mtime_nsec).map_err(|_| unsafe_node())?,
         ctime: stat.st_ctime,
@@ -385,16 +385,46 @@ fn file_snapshot(
 
 fn stat_snapshot(stat: &Stat) -> Result<FileSnapshot, BlenderContentStoreObservationError> {
     Ok(FileSnapshot {
-        device: u64::try_from(stat.st_dev).map_err(|_| unsafe_node())?,
+        device: portable_device(stat)?,
         inode: stat.st_ino,
-        mode: u32::from(stat.st_mode),
-        links: u64::from(stat.st_nlink),
+        mode: portable_mode(stat),
+        links: portable_links(stat),
         bytes: u64::try_from(stat.st_size).map_err(|_| unsafe_node())?,
         mtime: stat.st_mtime,
         mtime_nsec: i64::try_from(stat.st_mtime_nsec).map_err(|_| unsafe_node())?,
         ctime: stat.st_ctime,
         ctime_nsec: i64::try_from(stat.st_ctime_nsec).map_err(|_| unsafe_node())?,
     })
+}
+
+#[cfg(target_os = "macos")]
+fn portable_device(stat: &Stat) -> Result<u64, BlenderContentStoreObservationError> {
+    u64::try_from(stat.st_dev).map_err(|_| unsafe_node())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn portable_device(stat: &Stat) -> Result<u64, BlenderContentStoreObservationError> {
+    Ok(stat.st_dev)
+}
+
+#[cfg(target_os = "macos")]
+fn portable_mode(stat: &Stat) -> u32 {
+    u32::from(stat.st_mode)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn portable_mode(stat: &Stat) -> u32 {
+    stat.st_mode
+}
+
+#[cfg(target_os = "macos")]
+fn portable_links(stat: &Stat) -> u64 {
+    u64::from(stat.st_nlink)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn portable_links(stat: &Stat) -> u64 {
+    stat.st_nlink
 }
 
 #[derive(Debug)]
