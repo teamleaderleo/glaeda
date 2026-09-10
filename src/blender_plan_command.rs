@@ -3,7 +3,7 @@ use std::io::Read as _;
 use std::path::Path;
 
 #[cfg(unix)]
-use glaeda::blender_content_store_observation::{
+use glaeda::compute_execution_request::blender_content_store_observation::{
     BlenderContentStoreObservationError, observe_blender_content_store,
 };
 use glaeda::compute_execution_request::accelerator_burst::{
