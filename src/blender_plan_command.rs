@@ -2,15 +2,15 @@ use std::fmt;
 use std::io::Read as _;
 use std::path::Path;
 
-#[cfg(unix)]
-use glaeda::compute_execution_request::blender_content_store_observation::{
-    BlenderContentStoreObservationError, observe_blender_content_store,
-};
 use glaeda::compute_execution_request::accelerator_burst::{
     AcceleratorApi, AcceleratorIntent, AcceleratorRequirement, AcceleratorVendor,
 };
 use glaeda::compute_execution_request::blender_burst_work_plan::{
     BlenderBurstWorkPlan, BlenderBurstWorkPlanError,
+};
+#[cfg(unix)]
+use glaeda::compute_execution_request::blender_content_store_observation::{
+    BlenderContentStoreObservationError, observe_blender_content_store,
 };
 use glaeda::compute_execution_request::blender_remote_inventory_document::{
     BlenderRemoteInventoryDocumentError, MAX_BLENDER_REMOTE_INVENTORY_DOCUMENT_BYTES,
@@ -288,14 +288,9 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, asset).unwrap();
 
-        let plan = build_blender_plan_from_store(
-            &snapshot,
-            &store,
-            24,
-            AcceleratorIntent::Batch,
-            None,
-        )
-        .unwrap();
+        let plan =
+            build_blender_plan_from_store(&snapshot, &store, 24, AcceleratorIntent::Batch, None)
+                .unwrap();
         std::fs::remove_file(snapshot).unwrap();
         std::fs::remove_dir_all(store).unwrap();
 
