@@ -1,8 +1,11 @@
-//! Canonical protocol-v2 transport frames for trusted guest-control transactions.
+//! Canonical protocol-v3 transport frames for trusted guest-control transactions.
 //!
 //! The common layer preserves exact nested JSON bodies without importing operation-specific Rust
 //! types. Typed operation codecs still own semantic decoding and request/result confirmation. This
 //! module performs no process execution, filesystem I/O, guest observation, or mutation.
+//!
+//! Protocol v3 is the Glaeda generation used for fresh transactions. Explicit legacy-v2 decoders
+//! retain exact SmolRunner interpretation for old-state inspection and retirement only.
 
 use std::fmt;
 
@@ -12,20 +15,31 @@ use sha2::{Digest as _, Sha256};
 
 use crate::artifact::Sha256Digest;
 use crate::trusted_guest_control_protocol::{
+    LegacySmolRunnerTrustedGuestControlReceiptV2, LegacySmolRunnerTrustedGuestControlRequestV2,
     TrustedGuestControlOperation, TrustedGuestControlOutcome, TrustedGuestControlReceipt,
-    TrustedGuestControlRequest, decode_trusted_guest_control_receipt_body,
-    decode_trusted_guest_control_request_body, encode_trusted_guest_control_receipt_body,
-    encode_trusted_guest_control_request_body,
+    TrustedGuestControlRequest, decode_legacy_smolrunner_trusted_guest_control_receipt_v2,
+    decode_legacy_smolrunner_trusted_guest_control_request_v2,
+    decode_trusted_guest_control_receipt_body, decode_trusted_guest_control_request_body,
+    encode_trusted_guest_control_receipt_body, encode_trusted_guest_control_request_body,
 };
 
-pub const TRUSTED_GUEST_CONTROL_TRANSACTION_SCHEMA_VERSION: u8 = 2;
+pub const TRUSTED_GUEST_CONTROL_TRANSACTION_SCHEMA_VERSION: u8 = 3;
+pub const LEGACY_SMOLRUNNER_TRUSTED_GUEST_CONTROL_TRANSACTION_SCHEMA_VERSION: u8 = 2;
 pub const MAX_TRUSTED_GUEST_CONTROL_TRANSACTION_BYTES: usize = 16 * 1024;
 pub const MAX_TRUSTED_GUEST_CONTROL_TRANSACTION_RECEIPT_BYTES: usize = 8 * 1024;
 
-const PAYLOAD_BODY_DIGEST_DOMAIN: &[u8] = b"smolrunner-trusted-guest-control-payload-body-v2\0";
-const RESULT_BODY_DIGEST_DOMAIN: &[u8] = b"smolrunner-trusted-guest-control-result-body-v2\0";
-const TRANSACTION_DIGEST_DOMAIN: &[u8] = b"smolrunner-trusted-guest-control-transaction-v2\0";
+const PAYLOAD_BODY_DIGEST_DOMAIN: &[u8] = b"glaeda-trusted-guest-control-payload-body-v3\0";
+const RESULT_BODY_DIGEST_DOMAIN: &[u8] = b"glaeda-trusted-guest-control-result-body-v3\0";
+const TRANSACTION_DIGEST_DOMAIN: &[u8] = b"glaeda-trusted-guest-control-transaction-v3\0";
 const TRANSACTION_RECEIPT_DIGEST_DOMAIN: &[u8] =
+    b"glaeda-trusted-guest-control-transaction-receipt-v3\0";
+const LEGACY_SMOLRUNNER_PAYLOAD_BODY_DIGEST_DOMAIN: &[u8] =
+    b"smolrunner-trusted-guest-control-payload-body-v2\0";
+const LEGACY_SMOLRUNNER_RESULT_BODY_DIGEST_DOMAIN: &[u8] =
+    b"smolrunner-trusted-guest-control-result-body-v2\0";
+const LEGACY_SMOLRUNNER_TRANSACTION_DIGEST_DOMAIN: &[u8] =
+    b"smolrunner-trusted-guest-control-transaction-v2\0";
+const LEGACY_SMOLRUNNER_TRANSACTION_RECEIPT_DIGEST_DOMAIN: &[u8] =
     b"smolrunner-trusted-guest-control-transaction-receipt-v2\0";
 const SHA256_PREFIX: &str = "sha256:";
 const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -42,7 +56,7 @@ impl TrustedGuestControlTransaction {
     /// # Errors
     ///
     /// Returns a bounded error unless the payload is one JSON object, its standardized digest
-    /// equals the request payload digest, and the complete canonical frame fits the v2 ceiling.
+    /// equals the request payload digest, and the complete canonical frame fits the v3 ceiling.
     pub fn new(
         request: TrustedGuestControlRequest,
         payload_body: Vec<u8>,
@@ -78,6 +92,42 @@ impl fmt::Debug for TrustedGuestControlTransaction {
             .debug_struct("TrustedGuestControlTransaction")
             .field("request", &self.request)
             .field("payload_body", &"<bounded-canonical-operation-payload>")
+            .finish()
+    }
+}
+
+/// Canonically decoded SmolRunner transaction-v2 frame retained for inspection only.
+#[derive(Clone, PartialEq, Eq)]
+pub struct LegacySmolRunnerTrustedGuestControlTransactionV2 {
+    request: LegacySmolRunnerTrustedGuestControlRequestV2,
+    payload_body: Vec<u8>,
+    canonical: Vec<u8>,
+}
+
+impl LegacySmolRunnerTrustedGuestControlTransactionV2 {
+    #[must_use]
+    pub const fn request(&self) -> &LegacySmolRunnerTrustedGuestControlRequestV2 {
+        &self.request
+    }
+
+    #[must_use]
+    pub fn payload_body(&self) -> &[u8] {
+        &self.payload_body
+    }
+
+    #[must_use]
+    pub fn canonical_bytes(&self) -> &[u8] {
+        &self.canonical
+    }
+}
+
+impl fmt::Debug for LegacySmolRunnerTrustedGuestControlTransactionV2 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LegacySmolRunnerTrustedGuestControlTransactionV2")
+            .field("request", &self.request)
+            .field("payload_body", &"<bounded-canonical-operation-payload>")
+            .field("canonical", &"<exact-smolrunner-v2-frame>")
             .finish()
     }
 }
@@ -139,6 +189,48 @@ impl fmt::Debug for TrustedGuestControlTransactionReceipt {
                     .as_ref()
                     .map(|_| "<bounded-canonical-operation-result>"),
             )
+            .finish()
+    }
+}
+
+/// Canonically decoded SmolRunner transaction-receipt-v2 frame retained for inspection only.
+#[derive(Clone, PartialEq, Eq)]
+pub struct LegacySmolRunnerTrustedGuestControlTransactionReceiptV2 {
+    receipt: LegacySmolRunnerTrustedGuestControlReceiptV2,
+    result_body: Option<Vec<u8>>,
+    canonical: Vec<u8>,
+}
+
+impl LegacySmolRunnerTrustedGuestControlTransactionReceiptV2 {
+    #[must_use]
+    pub const fn receipt(&self) -> &LegacySmolRunnerTrustedGuestControlReceiptV2 {
+        &self.receipt
+    }
+
+    #[must_use]
+    pub fn result_body(&self) -> Option<&[u8]> {
+        self.result_body.as_deref()
+    }
+
+    #[must_use]
+    pub fn canonical_bytes(&self) -> &[u8] {
+        &self.canonical
+    }
+}
+
+impl fmt::Debug for LegacySmolRunnerTrustedGuestControlTransactionReceiptV2 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LegacySmolRunnerTrustedGuestControlTransactionReceiptV2")
+            .field("receipt", &self.receipt)
+            .field(
+                "result_body",
+                &self
+                    .result_body
+                    .as_ref()
+                    .map(|_| "<bounded-canonical-operation-result>"),
+            )
+            .field("canonical", &"<exact-smolrunner-v2-frame>")
             .finish()
     }
 }
@@ -228,12 +320,66 @@ pub fn decode_trusted_guest_control_transaction(
     Ok(transaction)
 }
 
+/// Decode one exact canonical SmolRunner v2 transaction for inspection or retirement planning.
+pub fn decode_legacy_smolrunner_trusted_guest_control_transaction_v2(
+    bytes: &[u8],
+) -> Result<LegacySmolRunnerTrustedGuestControlTransactionV2, TrustedGuestControlTransactionError> {
+    require_frame_size(bytes, MAX_TRUSTED_GUEST_CONTROL_TRANSACTION_BYTES)?;
+    let wire: TransactionDecodeWire = serde_json::from_slice(bytes).map_err(|_| malformed())?;
+    if wire.schema_version != LEGACY_SMOLRUNNER_TRUSTED_GUEST_CONTROL_TRANSACTION_SCHEMA_VERSION {
+        return Err(version_incompatible());
+    }
+    let request_raw = wire.request.get().as_bytes();
+    let payload_raw = wire.payload.get().as_bytes();
+    validate_json_object(payload_raw, MAX_TRUSTED_GUEST_CONTROL_TRANSACTION_BYTES)?;
+    let mut request_bytes = request_raw.to_vec();
+    request_bytes.push(b'\n');
+    let request = decode_legacy_smolrunner_trusted_guest_control_request_v2(&request_bytes)
+        .map_err(|_| protocol_error())?;
+    let payload_body = payload_raw.to_vec();
+    if request.request().payload_digest()
+        != &legacy_smolrunner_trusted_guest_control_payload_body_v2_digest(
+            request.request().operation(),
+            &payload_body,
+        )?
+    {
+        return Err(digest_mismatch());
+    }
+    let request_value = raw_json_object(request_raw)?;
+    let payload_value = raw_json_object(&payload_body)?;
+    let canonical = canonical_frame(
+        &TransactionEncodeWire {
+            schema_version: LEGACY_SMOLRUNNER_TRUSTED_GUEST_CONTROL_TRANSACTION_SCHEMA_VERSION,
+            request: &request_value,
+            payload: &payload_value,
+        },
+        MAX_TRUSTED_GUEST_CONTROL_TRANSACTION_BYTES,
+    )?;
+    if canonical != bytes {
+        return Err(noncanonical());
+    }
+    Ok(LegacySmolRunnerTrustedGuestControlTransactionV2 {
+        request,
+        payload_body,
+        canonical,
+    })
+}
+
 pub fn trusted_guest_control_transaction_digest(
     transaction: &TrustedGuestControlTransaction,
 ) -> Result<Sha256Digest, TrustedGuestControlTransactionError> {
     domain_digest(
         TRANSACTION_DIGEST_DOMAIN,
         &encode_trusted_guest_control_transaction(transaction)?,
+    )
+}
+
+pub fn legacy_smolrunner_trusted_guest_control_transaction_v2_digest(
+    transaction: &LegacySmolRunnerTrustedGuestControlTransactionV2,
+) -> Result<Sha256Digest, TrustedGuestControlTransactionError> {
+    domain_digest(
+        LEGACY_SMOLRUNNER_TRANSACTION_DIGEST_DOMAIN,
+        transaction.canonical_bytes(),
     )
 }
 
@@ -286,12 +432,71 @@ pub fn decode_trusted_guest_control_transaction_receipt(
     Ok(transaction_receipt)
 }
 
+/// Decode one exact canonical SmolRunner v2 transaction receipt for inspection only.
+pub fn decode_legacy_smolrunner_trusted_guest_control_transaction_receipt_v2(
+    bytes: &[u8],
+    expected_transaction: &LegacySmolRunnerTrustedGuestControlTransactionV2,
+) -> Result<LegacySmolRunnerTrustedGuestControlTransactionReceiptV2, TrustedGuestControlTransactionError>
+{
+    require_frame_size(bytes, MAX_TRUSTED_GUEST_CONTROL_TRANSACTION_RECEIPT_BYTES)?;
+    let wire: TransactionReceiptDecodeWire =
+        serde_json::from_slice(bytes).map_err(|_| malformed())?;
+    if wire.schema_version != LEGACY_SMOLRUNNER_TRUSTED_GUEST_CONTROL_TRANSACTION_SCHEMA_VERSION {
+        return Err(version_incompatible());
+    }
+    let receipt_raw = wire.receipt.get().as_bytes();
+    let mut receipt_bytes = receipt_raw.to_vec();
+    receipt_bytes.push(b'\n');
+    let receipt = decode_legacy_smolrunner_trusted_guest_control_receipt_v2(
+        &receipt_bytes,
+        expected_transaction.request(),
+    )
+    .map_err(|_| protocol_error())?;
+    let result_body = wire.result.map(|result| result.get().as_bytes().to_vec());
+    validate_outcome_result_with_domain(
+        LEGACY_SMOLRUNNER_RESULT_BODY_DIGEST_DOMAIN,
+        expected_transaction.request().request().operation(),
+        receipt.receipt().outcome(),
+        result_body.as_deref(),
+    )?;
+    let receipt_value = raw_json_object(receipt_raw)?;
+    let result_value = result_body
+        .as_deref()
+        .map(raw_json_object)
+        .transpose()?;
+    let canonical = canonical_frame(
+        &TransactionReceiptEncodeWire {
+            schema_version: LEGACY_SMOLRUNNER_TRUSTED_GUEST_CONTROL_TRANSACTION_SCHEMA_VERSION,
+            receipt: &receipt_value,
+            result: result_value.as_deref(),
+        },
+        MAX_TRUSTED_GUEST_CONTROL_TRANSACTION_RECEIPT_BYTES,
+    )?;
+    if canonical != bytes {
+        return Err(noncanonical());
+    }
+    Ok(LegacySmolRunnerTrustedGuestControlTransactionReceiptV2 {
+        receipt,
+        result_body,
+        canonical,
+    })
+}
+
 pub fn trusted_guest_control_transaction_receipt_digest(
     transaction_receipt: &TrustedGuestControlTransactionReceipt,
 ) -> Result<Sha256Digest, TrustedGuestControlTransactionError> {
     domain_digest(
         TRANSACTION_RECEIPT_DIGEST_DOMAIN,
         &encode_trusted_guest_control_transaction_receipt(transaction_receipt)?,
+    )
+}
+
+pub fn legacy_smolrunner_trusted_guest_control_transaction_receipt_v2_digest(
+    transaction_receipt: &LegacySmolRunnerTrustedGuestControlTransactionReceiptV2,
+) -> Result<Sha256Digest, TrustedGuestControlTransactionError> {
+    domain_digest(
+        LEGACY_SMOLRUNNER_TRANSACTION_RECEIPT_DIGEST_DOMAIN,
+        transaction_receipt.canonical_bytes(),
     )
 }
 
@@ -302,6 +507,17 @@ pub fn trusted_guest_control_payload_body_digest(
     operation_body_digest(PAYLOAD_BODY_DIGEST_DOMAIN, operation, body)
 }
 
+pub fn legacy_smolrunner_trusted_guest_control_payload_body_v2_digest(
+    operation: TrustedGuestControlOperation,
+    body: &[u8],
+) -> Result<Sha256Digest, TrustedGuestControlTransactionError> {
+    operation_body_digest(
+        LEGACY_SMOLRUNNER_PAYLOAD_BODY_DIGEST_DOMAIN,
+        operation,
+        body,
+    )
+}
+
 pub fn trusted_guest_control_result_body_digest(
     operation: TrustedGuestControlOperation,
     body: &[u8],
@@ -309,7 +525,27 @@ pub fn trusted_guest_control_result_body_digest(
     operation_body_digest(RESULT_BODY_DIGEST_DOMAIN, operation, body)
 }
 
+pub fn legacy_smolrunner_trusted_guest_control_result_body_v2_digest(
+    operation: TrustedGuestControlOperation,
+    body: &[u8],
+) -> Result<Sha256Digest, TrustedGuestControlTransactionError> {
+    operation_body_digest(
+        LEGACY_SMOLRUNNER_RESULT_BODY_DIGEST_DOMAIN,
+        operation,
+        body,
+    )
+}
+
 fn validate_outcome_result(
+    operation: TrustedGuestControlOperation,
+    outcome: &TrustedGuestControlOutcome,
+    result_body: Option<&[u8]>,
+) -> Result<(), TrustedGuestControlTransactionError> {
+    validate_outcome_result_with_domain(RESULT_BODY_DIGEST_DOMAIN, operation, outcome, result_body)
+}
+
+fn validate_outcome_result_with_domain(
+    result_domain: &[u8],
     operation: TrustedGuestControlOperation,
     outcome: &TrustedGuestControlOutcome,
     result_body: Option<&[u8]>,
@@ -317,7 +553,7 @@ fn validate_outcome_result(
     match (outcome, result_body) {
         (TrustedGuestControlOutcome::Succeeded { result_digest }, Some(body)) => {
             validate_json_object(body, MAX_TRUSTED_GUEST_CONTROL_TRANSACTION_RECEIPT_BYTES)?;
-            if &trusted_guest_control_result_body_digest(operation, body)? != result_digest {
+            if &operation_body_digest(result_domain, operation, body)? != result_digest {
                 return Err(digest_mismatch());
             }
             Ok(())
@@ -584,6 +820,7 @@ mod tests {
         let transaction = TrustedGuestControlTransaction::new(request.clone(), body).unwrap();
         let bytes = encode_trusted_guest_control_transaction(&transaction).unwrap();
         let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(text.contains("\"schema_version\":3"));
         assert!(text.contains("\"payload\":{\"schema_version\":1"));
         assert!(!text.contains("\"payload\":\""));
         assert!(bytes.ends_with(b"\n"));
@@ -595,6 +832,71 @@ mod tests {
             decode_trusted_guest_control_probe_payload_body(decoded.payload_body()).unwrap();
         assert_eq!(typed, payload);
         typed.confirm_common_request(decoded.request()).unwrap();
+    }
+
+    #[test]
+    fn legacy_v2_transaction_is_inspection_only_and_has_distinct_domains() {
+        let (_, payload, body) = fixture("probe-legacy");
+        let authority = authority();
+        let binary = binary();
+        let request = TrustedGuestControlRequest::new(
+            TrustedGuestControlRequestId::parse("probe-legacy").unwrap(),
+            binary,
+            authority,
+            TrustedGuestControlOperation::ProbeGuestControl,
+            legacy_smolrunner_trusted_guest_control_payload_body_v2_digest(
+                TrustedGuestControlOperation::ProbeGuestControl,
+                &body,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let current_request_body = encode_trusted_guest_control_request_body(&request).unwrap();
+        let legacy_request_body = std::str::from_utf8(&current_request_body)
+            .unwrap()
+            .replacen("\"schema_version\":3", "\"schema_version\":2", 1)
+            .into_bytes();
+        let request_value = raw_json_object(&legacy_request_body).unwrap();
+        let payload_value = raw_json_object(&body).unwrap();
+        let legacy_bytes = canonical_frame(
+            &TransactionEncodeWire {
+                schema_version: 2,
+                request: &request_value,
+                payload: &payload_value,
+            },
+            MAX_TRUSTED_GUEST_CONTROL_TRANSACTION_BYTES,
+        )
+        .unwrap();
+        assert_eq!(
+            decode_trusted_guest_control_transaction(&legacy_bytes)
+                .unwrap_err()
+                .kind(),
+            TrustedGuestControlTransactionErrorKind::VersionIncompatible
+        );
+        let legacy =
+            decode_legacy_smolrunner_trusted_guest_control_transaction_v2(&legacy_bytes).unwrap();
+        assert_eq!(legacy.payload_body(), body.as_slice());
+        assert_eq!(legacy.request().request().operation(), request.operation());
+        assert_ne!(
+            legacy_smolrunner_trusted_guest_control_transaction_v2_digest(&legacy).unwrap(),
+            domain_digest(TRANSACTION_DIGEST_DOMAIN, legacy.canonical_bytes()).unwrap()
+        );
+        assert_ne!(
+            legacy_smolrunner_trusted_guest_control_payload_body_v2_digest(
+                TrustedGuestControlOperation::ProbeGuestControl,
+                &body,
+            )
+            .unwrap(),
+            trusted_guest_control_payload_body_digest(
+                TrustedGuestControlOperation::ProbeGuestControl,
+                &body,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            payload,
+            decode_trusted_guest_control_probe_payload_body(legacy.payload_body()).unwrap()
+        );
     }
 
     #[test]
@@ -781,7 +1083,7 @@ mod tests {
                 Some(result_body.clone()),
             )
             .unwrap_err()
-            .kind(),
+                .kind(),
             TrustedGuestControlTransactionErrorKind::OutcomeMismatch
         );
 

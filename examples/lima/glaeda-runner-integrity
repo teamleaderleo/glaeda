@@ -3,14 +3,14 @@ set -euo pipefail
 
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
-readonly install_dir="/opt/smolrunner/actions-runner"
-readonly entries="/etc/smolrunner/actions-runner.entries"
-readonly checksums="/etc/smolrunner/actions-runner.sha256"
+readonly install_dir="/opt/glaeda/actions-runner"
+readonly entries="/etc/glaeda/actions-runner.entries"
+readonly checksums="/etc/glaeda/actions-runner.sha256"
 readonly runner_work="${install_dir}/_work"
-readonly runner_guard_group="smolrunner-runner-guard"
+readonly runner_guard_group="glaeda-runner-guard"
 readonly runner_diag="${install_dir}/_diag"
-readonly jit_launcher="/opt/smolrunner/bin/smolrunner-jit-launcher"
-readonly jit_launcher_sha256="6f096fb518b6d40d45ca1a9923e423da436b6269fceec5a5989566abbc93a76a"
+readonly jit_launcher="/opt/glaeda/bin/glaeda-jit-launcher"
+readonly jit_launcher_sha256="2553d9346ea569cb23f393a928238cc4fd7c7b486e32be6a6e2f484c963689f4"
 
 [[ "$(/usr/bin/id -u)" == "0" ]]
 [[ "$(/usr/sbin/sysctl -n fs.suid_dumpable)" == "0" ]]
@@ -19,12 +19,12 @@ readonly listener_mount_options
 [[ -n "${listener_mount_options}" ]]
 ! /usr/bin/grep --quiet --word-regexp nosuid <<<"${listener_mount_options}"
 [[ "$(/usr/bin/stat --format=%U:%G:%a "${install_dir}/bin/Runner.Listener")" == "root:${runner_guard_group}:2755" ]]
-[[ "$(/usr/bin/stat --format=%U:%G:%a:%F "${install_dir}")" == "root:smolrunner-runner:1775:directory" ]]
+[[ "$(/usr/bin/stat --format=%U:%G:%a:%F "${install_dir}")" == "root:glaeda-runner:1775:directory" ]]
 [[ "$(/usr/bin/stat --format=%U:%G:%a:%F "${entries}")" == "root:root:444:regular file" ]]
 [[ "$(/usr/bin/stat --format=%U:%G:%a:%F "${checksums}")" == "root:root:444:regular file" ]]
 [[ "$(/usr/bin/stat --format=%U:%G:%a:%F "${jit_launcher}")" == "root:root:755:regular file" ]]
-[[ "$(/usr/bin/stat --format=%U:%G:%a:%F "${runner_work}")" == "smolrunner-runner:smolrunner-runner:750:directory" ]]
-[[ "$(/usr/bin/stat --format=%U:%G:%a:%F "${runner_diag}")" == "smolrunner-runner:smolrunner-runner:750:directory" ]]
+[[ "$(/usr/bin/stat --format=%U:%G:%a:%F "${runner_work}")" == "glaeda-runner:glaeda-runner:750:directory" ]]
+[[ "$(/usr/bin/stat --format=%U:%G:%a:%F "${runner_diag}")" == "glaeda-runner:glaeda-runner:750:directory" ]]
 
 if /usr/bin/find -P "${install_dir}" -xdev -mindepth 1 \
   \( -path "${runner_work}" -o -path "${runner_diag}" \) -prune -o \
@@ -47,4 +47,4 @@ fi
 )
 /usr/bin/printf '%s\n' "${jit_launcher_sha256}  ${jit_launcher}" | /usr/bin/sha256sum --check --status
 
-/usr/bin/printf '%s\n' 'smolrunner-runner-integrity-ok'
+/usr/bin/printf '%s\n' 'glaeda-runner-integrity-ok'
