@@ -1,18 +1,21 @@
 # Owned-Linux admission
 
 The local admission gate is the shared physical launch boundary for reviewed owner-local workloads.
-`verify-focused run --admission-root <installed-private-root>` remains its first production consumer.
-An installed adapter supplies this root; a connected request must never select, override, or omit it.
-The dispatch v2 focused capability forwards this fixed local option. Ordinary local verification
-without the option retains its existing behavior.
+`verify-focused run --admission-root <installed-private-root>` was its first production consumer;
+`verify-required/v1` now uses the same boundary with its own checked-in demand. An installed adapter
+supplies this root; a connected request must never select, override, or omit it. The dispatch v2
+focused capability forwards this fixed local option. Ordinary local verification without the option
+retains its existing behavior.
 
 The gate admits one reviewed in-process `AdmissionDemand` at a time. A demand contains only the
 capacity facts the current host observer can enforce truthfully: candidate memory bytes and a
 minimum logical-CPU count. It is constructed by checked-in local adapter code and is never decoded
 from remote request bytes. The default `VERIFY_FOCUSED_DEMAND` exactly preserves the existing
-`verify-focused/v1` requirement: 8 GiB MemoryMax and an eight-logical-CPU host floor. Future
-reviewed action/profile adapters may supply another demand only after their semantic profile
-identity binds that mapping.
+`verify-focused/v1` requirement: 8 GiB MemoryMax and an eight-logical-CPU host floor. The
+verification adapter maps `verify-required/v1` to 12 GiB candidate memory and the same reviewed
+eight-logical-CPU floor, matching its existing `MemoryMax=12G` execution profile without changing
+either profile generation. Future reviewed action/profile adapters may supply another demand only
+after their semantic profile identity binds that mapping.
 
 The gate reserves one job in the installed root before source preparation and retains that slot
 through physical settlement, task cleanup, and terminal receipt publication. The slot is compute
@@ -47,15 +50,21 @@ The local adapter that already owns semantic profile authorization owns the mapp
 reviewed identity to one demand. The existing command/profile fingerprint remains the semantic
 binding used for durable reservation and recovery.
 
+For verification, the adapter mapping is deliberately closed: `verify-focused/v1` selects the
+existing 8 GiB demand, `verify-required/v1` selects 12 GiB, and any other profile refuses until a
+reviewed mapping is checked in. Memory strings or raw CPU numbers are never parsed from a request.
+The profile's existing command fingerprint and generation continue to bind its executable recipe,
+resource class, systemd properties, source identity, and durable recovery state.
+
 Fresh host availability remains decisive at the final launch boundary. For example, owner-local
 coding-agent work that consumes memory after an advisory readiness check reduces the next fresh
 `available_bytes` observation; if candidate memory plus owner reserve no longer fits, launch waits.
 No process scan, prompt/session inspection, or semantic inference about the competing work is
 required.
 
-This first generalized slice preserves the installed policy schema and the coexist interference
-class. It does not add raw resource fields to Git/GitHub requests, an arbitrary-resource CLI,
-editable workspaces, multi-node placement, or GPU/provider acquisition.
+These generalized slices preserve the installed policy schema and the coexist interference class.
+They do not add raw resource fields to Git/GitHub requests, an arbitrary-resource CLI, editable
+workspaces, multi-node placement, or GPU/provider acquisition.
 
 ## Operator control and installation boundary
 
@@ -101,7 +110,9 @@ verifier request with both `--reconcile-only` and `--admission-root`. Recovery v
 existing receipt, matching reservation and installation generation, the digest binding the full
 source/profile identity and exact command-state directory path/device/inode, then freshly observes
 exact unit and task absence, and validates any remaining intent before releasing capacity. It does
-not run source or recreate a result. Unsettled or mismatched state stays reserved.
+not run source or recreate a result. Unsettled or mismatched state stays reserved. The profile is
+already part of that binding, so focused and required recovery cannot alias one another even though
+they share the same installed admission root.
 
 ## Evidence and next integration
 
@@ -109,13 +120,16 @@ not run source or recreate a result. Unsettled or mismatched state stays reserve
 and CPU requirements against fresh host headroom, final launch-boundary demand recheck, durable
 contention, crash refusal, exact recovery, serialized control, hold/drain/pressure changes at the
 real child-launch boundary, pre-launch cleanup, real disposable child settlement, immutable replay,
-filesystem substitution, protocol binding, and bounded helper output. These are local child tests
-with fixture host facts; they do not prove systemd/bubblewrap verification or a regular ChatGPT
-journey.
+filesystem substitution, protocol binding, and bounded helper output. `python3
+scripts/test-verify-focused.py` additionally keeps both verification profile generations and command
+bytes pinned, proves the closed profile-to-demand mapping, and proves the required demand reaches
+the shared reservation. These are local child tests with fixture host facts; they do not prove
+systemd/bubblewrap required verification or a regular ChatGPT journey.
 
 The next consumer may map another reviewed semantic action/profile to an `AdmissionDemand`, then
-prove that exact profile through the same physical admission/receipt path. Service/capability
-installation still requires its own concrete reviewed action.
+prove that exact profile through the same physical admission/receipt path. A generic project-worker
+or source-development profile should remain a separate adapter with its own semantic authority and
+recovery contract. Service/capability installation still requires its own concrete reviewed action.
 
 ## Pending-before-launch observation
 

@@ -169,6 +169,60 @@ class VerifyFocusedTests(unittest.TestCase):
         )
         self.assertLess(len(completed.stdout), 2_000)
 
+    def test_reviewed_admission_demand_maps_existing_profiles_only(self) -> None:
+        focused = MODULE.admission_demand(MODULE.FOCUSED_PROFILE)
+        required = MODULE.admission_demand(MODULE.REQUIRED_PROFILE)
+        self.assertEqual(focused.memory_bytes, 8 * 1024**3)
+        self.assertEqual(focused.minimum_logical_cpus, 8)
+        self.assertEqual(required.memory_bytes, 12 * 1024**3)
+        self.assertEqual(required.minimum_logical_cpus, 8)
+        unknown = MODULE.fixed_profile(
+            "verify-unknown/v1", "unknown", "unknown", 60, "focused", "unknown",
+            MODULE.TARGET_TMPFS_BYTES, "1G", "1G",
+        )
+        with self.assertRaisesRegex(MODULE.Refusal, "no reviewed local admission demand"):
+            MODULE.admission_demand(unknown)
+
+    def test_required_run_supplies_required_demand_to_reservation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve(strict=True)
+            os.chmod(root, 0o700)
+            for name in ("repository", "cargo", "rustup", "state"):
+                (root / name).mkdir(mode=0o700)
+            arguments = mock.Mock(
+                admission_root=str(root / "admission"),
+                repository_root=str(root / "repository"),
+                state_root=str(root / "state"),
+                cargo_root=str(root / "cargo"),
+                rustup_root=str(root / "rustup"),
+                repository="teamleaderleo/glaeda",
+                commit="a" * 40,
+                tree="b" * 40,
+                profile_generation=MODULE.profile_generation(MODULE.REQUIRED_PROFILE),
+                command_fingerprint="sha256:" + "d" * 64,
+                reconcile_only=False,
+            )
+            admission = mock.Mock(owned=False, launch_attempted=True)
+            gate = mock.MagicMock()
+            gate.__enter__.return_value = admission
+            gate.__exit__.return_value = False
+            with (
+                mock.patch.object(MODULE, "verify_resident_source"),
+                mock.patch.object(MODULE.owned_task, "prepare_task"),
+                mock.patch.object(MODULE, "materialize", return_value=root / "source"),
+                mock.patch.object(
+                    MODULE,
+                    "execute_profile",
+                    return_value=("succeeded", 0, 1.0, True, 0, MODULE.sha256(b"")),
+                ),
+                mock.patch.object(MODULE.owned_admission, "Reservation", return_value=gate) as reserve,
+                mock.patch.object(MODULE, "emit"),
+            ):
+                self.assertEqual(MODULE.run(arguments, MODULE.REQUIRED_PROFILE), 0)
+            self.assertEqual(reserve.call_count, 1)
+            self.assertEqual(reserve.call_args.args[4], MODULE.REQUIRED_ADMISSION_DEMAND)
+            admission.release.assert_called_once_with()
+
     def test_cli_has_no_remote_command_environment_or_url(self) -> None:
         help_text = subprocess.run(
             [sys.executable, ROOT / "scripts" / "verify-focused", "run", "--help"],
