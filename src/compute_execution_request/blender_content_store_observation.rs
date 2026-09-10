@@ -2,8 +2,9 @@
 //!
 //! The observer never enumerates the store. It derives canonical object keys only from one exact
 //! Blender snapshot, opens those paths beneath a held store-root descriptor without following
-//! symlinks, verifies size and SHA-256 from the held regular file, and rebinds the path afterward.
-//! It grants zero publication, repair, deletion, provider, network, lease, or execution authority.
+//! symlinks, verifies size and SHA-256 from held regular files, and rebinds the complete observed
+//! path before returning. It grants zero publication, repair, deletion, provider, network, lease,
+//! or execution authority.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -26,7 +27,9 @@ const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::DIRECTORY)
     .union(OFlags::NOFOLLOW)
     .union(OFlags::CLOEXEC);
-const FILE_FLAGS: OFlags = OFlags::RDONLY.union(OFlags::NOFOLLOW).union(OFlags::CLOEXEC);
+const FILE_FLAGS: OFlags = OFlags::RDONLY
+    .union(OFlags::NOFOLLOW)
+    .union(OFlags::CLOEXEC);
 const SHA256_PREFIX: &str = "sha256:";
 const READ_BUFFER_BYTES: usize = 1024 * 1024;
 
@@ -39,58 +42,92 @@ const READ_BUFFER_BYTES: usize = 1024 * 1024;
 /// # Errors
 ///
 /// Returns a bounded, path-private error for an unsafe root, unsafe filesystem node, size/content
-/// mismatch, filesystem drift, unreadable object, or invalid typed inventory construction.
+/// mismatch, filesystem drift, hardlink ambiguity, unreadable object, or invalid typed inventory
+/// construction.
 pub fn observe_blender_content_store(
     root: &Path,
     snapshot: &BlenderProjectSnapshot,
 ) -> Result<BlenderRemoteInventory, BlenderContentStoreObservationError> {
-    let root = BoundStoreRoot::open(root)?;
-    let Some(objects_directory) = open_directory(&root.fd, "objects")? else {
-        root.revalidate()?;
+    observe_with_hook(root, snapshot, |_| {})
+}
+
+fn observe_with_hook<F>(
+    root_path: &Path,
+    snapshot: &BlenderProjectSnapshot,
+    mut before_object_revalidation: F,
+) -> Result<BlenderRemoteInventory, BlenderContentStoreObservationError>
+where
+    F: FnMut(&Sha256Digest),
+{
+    let root = BoundStoreRoot::open(root_path)?;
+    let Some(objects_directory) = root.directory.open_optional_child("objects")? else {
+        root.confirm_child_absent("objects")?;
         return empty_inventory();
     };
-    let Some(version_directory) = open_directory(&objects_directory, "v1")? else {
+    let Some(version_directory) = objects_directory.open_optional_child("v1")? else {
         root.revalidate()?;
+        objects_directory.confirm_child_absent("v1")?;
         return empty_inventory();
     };
-    let Some(digest_directory) = open_directory(&version_directory, "sha256")? else {
+    let Some(digest_directory) = version_directory.open_optional_child("sha256")? else {
         root.revalidate()?;
+        version_directory.confirm_child_absent("sha256")?;
         return empty_inventory();
     };
 
     let required = required_objects(snapshot)?;
+    let mut observed_buckets = BTreeMap::<String, ObservedBucket>::new();
     let mut present = Vec::new();
     for (digest, expected_bytes) in required {
         let key = BlenderContentObjectKey::from_digest(&digest);
-        let (bucket, object_name) = object_key_components(&key)?;
-        let Some(bucket_directory) = open_directory(&digest_directory, bucket)? else {
+        let (bucket_name, object_name) = object_key_components(&key)?;
+        let Some(bucket_directory) = digest_directory.open_optional_child(bucket_name)? else {
             continue;
         };
-        let Some(mut object) = open_object(&bucket_directory, object_name)? else {
+        match observed_buckets.get(bucket_name) {
+            Some(existing) if existing.snapshot != bucket_directory.snapshot => {
+                return Err(changed());
+            }
+            _ => {}
+        }
+        let Some(mut object) = BoundObject::open_optional(&bucket_directory, object_name)? else {
             continue;
         };
-        let before = file_snapshot(object.as_fd())?;
-        if before.bytes != expected_bytes {
+        if object.snapshot.links != 1 {
+            return Err(hardlink_ambiguous());
+        }
+        if object.snapshot.bytes != expected_bytes {
             return Err(size_mismatch());
         }
-        let observed_digest = hash_held_file(&mut object, expected_bytes)?;
+        let observed_digest = hash_held_file(&mut object.file, expected_bytes)?;
         if observed_digest != digest {
             return Err(content_mismatch());
         }
-        let after = file_snapshot(object.as_fd())?;
-        if before != after {
-            return Err(changed());
-        }
-        let rebound = open_object_required(&bucket_directory, object_name)?;
-        let rebound_snapshot = file_snapshot(rebound.as_fd())?;
-        if rebound_snapshot != before {
-            return Err(changed());
-        }
+
+        before_object_revalidation(&digest);
+        object.revalidate(&bucket_directory, object_name)?;
+        observed_buckets
+            .entry(bucket_name.to_owned())
+            .or_insert_with(|| ObservedBucket {
+                snapshot: bucket_directory.snapshot,
+                objects: Vec::new(),
+            })
+            .objects
+            .push(ObservedObject {
+                name: object_name.to_owned(),
+                snapshot: object.snapshot,
+            });
         present.push(
             BlenderContentObject::new(digest, expected_bytes).map_err(|_| invalid_inventory())?,
         );
     }
-    root.revalidate()?;
+
+    root.revalidate_complete_path(
+        &objects_directory,
+        &version_directory,
+        &digest_directory,
+        &observed_buckets,
+    )?;
     BlenderRemoteInventory::new(present).map_err(|_| invalid_inventory())
 }
 
@@ -125,72 +162,202 @@ fn object_key_components(
     Ok((bucket, object_name))
 }
 
-fn open_directory(
-    parent: &OwnedFd,
-    name: &str,
-) -> Result<Option<OwnedFd>, BlenderContentStoreObservationError> {
-    match rustix_fs::openat(parent.as_fd(), name, DIRECTORY_FLAGS, Mode::empty()) {
-        Ok(directory) => {
-            let stat = rustix_fs::fstat(directory.as_fd()).map_err(|_| unreadable())?;
-            if !FileType::from_raw_mode(stat.st_mode).is_dir() {
-                return Err(unsafe_node());
+#[derive(Debug)]
+struct BoundStoreRoot<'a> {
+    path: &'a Path,
+    directory: BoundDirectory,
+}
+
+impl<'a> BoundStoreRoot<'a> {
+    fn open(path: &'a Path) -> Result<Self, BlenderContentStoreObservationError> {
+        if !path.is_absolute() || std::fs::canonicalize(path).map_err(|_| unsafe_root())? != path {
+            return Err(unsafe_root());
+        }
+        let fd =
+            rustix_fs::open(path, DIRECTORY_FLAGS, Mode::empty()).map_err(|_| unsafe_root())?;
+        let directory = BoundDirectory::from_fd(fd).map_err(|_| unsafe_root())?;
+        Ok(Self { path, directory })
+    }
+
+    fn revalidate(&self) -> Result<(), BlenderContentStoreObservationError> {
+        self.directory.revalidate_held()?;
+        let fd =
+            rustix_fs::open(self.path, DIRECTORY_FLAGS, Mode::empty()).map_err(|_| changed())?;
+        let rebound = BoundDirectory::from_fd(fd).map_err(|_| changed())?;
+        if rebound.snapshot != self.directory.snapshot {
+            return Err(changed());
+        }
+        Ok(())
+    }
+
+    fn confirm_child_absent(&self, name: &str) -> Result<(), BlenderContentStoreObservationError> {
+        self.revalidate()?;
+        self.directory.confirm_child_absent(name)
+    }
+
+    fn revalidate_complete_path(
+        &self,
+        objects: &BoundDirectory,
+        version: &BoundDirectory,
+        digest_directory: &BoundDirectory,
+        observed_buckets: &BTreeMap<String, ObservedBucket>,
+    ) -> Result<(), BlenderContentStoreObservationError> {
+        self.revalidate()?;
+        let current_objects = self
+            .directory
+            .reopen_bound_child("objects", objects.snapshot)?;
+        let current_version = current_objects.reopen_bound_child("v1", version.snapshot)?;
+        let current_digest =
+            current_version.reopen_bound_child("sha256", digest_directory.snapshot)?;
+
+        for (bucket_name, observed_bucket) in observed_buckets {
+            let current_bucket =
+                current_digest.reopen_bound_child(bucket_name, observed_bucket.snapshot)?;
+            for observed_object in &observed_bucket.objects {
+                BoundObject::revalidate_current(
+                    &current_bucket,
+                    &observed_object.name,
+                    observed_object.snapshot,
+                )?;
             }
-            Ok(Some(directory))
         }
-        Err(Errno::NOENT) => Ok(None),
-        Err(_) => Err(unsafe_node()),
+        Ok(())
     }
 }
 
-fn open_object(
-    parent: &OwnedFd,
-    name: &str,
-) -> Result<Option<File>, BlenderContentStoreObservationError> {
-    match rustix_fs::openat(parent.as_fd(), name, FILE_FLAGS, Mode::empty()) {
-        Ok(fd) => {
-            let stat = rustix_fs::fstat(fd.as_fd()).map_err(|_| unreadable())?;
-            if !FileType::from_raw_mode(stat.st_mode).is_file() {
-                return Err(unsafe_node());
+#[derive(Debug)]
+struct BoundDirectory {
+    fd: OwnedFd,
+    snapshot: DirectorySnapshot,
+}
+
+impl BoundDirectory {
+    fn from_fd(fd: OwnedFd) -> Result<Self, BlenderContentStoreObservationError> {
+        let snapshot = directory_snapshot(fd.as_fd())?;
+        Ok(Self { fd, snapshot })
+    }
+
+    fn open_optional_child(
+        &self,
+        name: &str,
+    ) -> Result<Option<Self>, BlenderContentStoreObservationError> {
+        match rustix_fs::openat(self.fd.as_fd(), name, DIRECTORY_FLAGS, Mode::empty()) {
+            Ok(fd) => Self::from_fd(fd).map(Some),
+            Err(Errno::NOENT) => Ok(None),
+            Err(_) => Err(unsafe_node()),
+        }
+    }
+
+    fn confirm_child_absent(&self, name: &str) -> Result<(), BlenderContentStoreObservationError> {
+        self.revalidate_held()?;
+        match rustix_fs::openat(self.fd.as_fd(), name, DIRECTORY_FLAGS, Mode::empty()) {
+            Err(Errno::NOENT) => Ok(()),
+            _ => Err(changed()),
+        }
+    }
+
+    fn reopen_bound_child(
+        &self,
+        name: &str,
+        expected: DirectorySnapshot,
+    ) -> Result<Self, BlenderContentStoreObservationError> {
+        self.revalidate_held()?;
+        let fd = rustix_fs::openat(self.fd.as_fd(), name, DIRECTORY_FLAGS, Mode::empty())
+            .map_err(|_| changed())?;
+        let current = Self::from_fd(fd).map_err(|_| changed())?;
+        if current.snapshot != expected {
+            return Err(changed());
+        }
+        Ok(current)
+    }
+
+    fn revalidate_held(&self) -> Result<(), BlenderContentStoreObservationError> {
+        if directory_snapshot(self.fd.as_fd())? != self.snapshot {
+            return Err(changed());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct BoundObject {
+    file: File,
+    snapshot: FileSnapshot,
+}
+
+impl BoundObject {
+    fn open_optional(
+        parent: &BoundDirectory,
+        name: &str,
+    ) -> Result<Option<Self>, BlenderContentStoreObservationError> {
+        match rustix_fs::openat(parent.fd.as_fd(), name, FILE_FLAGS, Mode::empty()) {
+            Ok(fd) => {
+                let snapshot = file_snapshot(fd.as_fd())?;
+                Ok(Some(Self {
+                    file: File::from(fd),
+                    snapshot,
+                }))
             }
-            Ok(Some(File::from(fd)))
+            Err(Errno::NOENT) => Ok(None),
+            Err(_) => Err(unsafe_node()),
         }
-        Err(Errno::NOENT) => Ok(None),
-        Err(_) => Err(unsafe_node()),
+    }
+
+    fn revalidate(
+        &self,
+        parent: &BoundDirectory,
+        name: &str,
+    ) -> Result<(), BlenderContentStoreObservationError> {
+        let held = file_snapshot(self.file.as_fd())?;
+        if held != self.snapshot {
+            return Err(changed());
+        }
+        Self::revalidate_current(parent, name, self.snapshot)
+    }
+
+    fn revalidate_current(
+        parent: &BoundDirectory,
+        name: &str,
+        expected: FileSnapshot,
+    ) -> Result<(), BlenderContentStoreObservationError> {
+        parent.revalidate_held()?;
+        let fd = rustix_fs::openat(parent.fd.as_fd(), name, FILE_FLAGS, Mode::empty())
+            .map_err(|_| changed())?;
+        let current = file_snapshot(fd.as_fd()).map_err(|_| changed())?;
+        if current != expected || current.links != 1 {
+            return Err(changed());
+        }
+        Ok(())
     }
 }
 
-fn open_object_required(
-    parent: &OwnedFd,
-    name: &str,
-) -> Result<File, BlenderContentStoreObservationError> {
-    open_object(parent, name)?.ok_or_else(changed)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DirectorySnapshot {
+    device: u64,
+    inode: u64,
+    mode: u32,
+    mtime: i64,
+    mtime_nsec: i64,
+    ctime: i64,
+    ctime_nsec: i64,
 }
 
-fn hash_held_file(
-    file: &mut File,
-    expected_bytes: u64,
-) -> Result<Sha256Digest, BlenderContentStoreObservationError> {
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0_u8; READ_BUFFER_BYTES];
-    let mut observed_bytes = 0_u64;
-    loop {
-        let read = file.read(&mut buffer).map_err(|_| unreadable())?;
-        if read == 0 {
-            break;
-        }
-        observed_bytes = observed_bytes
-            .checked_add(u64::try_from(read).map_err(|_| unreadable())?)
-            .ok_or_else(unreadable)?;
-        if observed_bytes > expected_bytes {
-            return Err(size_mismatch());
-        }
-        hasher.update(&buffer[..read]);
+fn directory_snapshot(
+    descriptor: impl std::os::fd::AsFd,
+) -> Result<DirectorySnapshot, BlenderContentStoreObservationError> {
+    let stat = rustix_fs::fstat(descriptor).map_err(|_| unreadable())?;
+    if !FileType::from_raw_mode(stat.st_mode).is_dir() {
+        return Err(unsafe_node());
     }
-    if observed_bytes != expected_bytes {
-        return Err(size_mismatch());
-    }
-    let encoded = format!("{SHA256_PREFIX}{:x}", hasher.finalize());
-    Sha256Digest::parse(&encoded).map_err(|_| invalid_inventory())
+    Ok(DirectorySnapshot {
+        device: stat.st_dev,
+        inode: stat.st_ino,
+        mode: stat.st_mode,
+        mtime: stat.st_mtime,
+        mtime_nsec: i64::try_from(stat.st_mtime_nsec).map_err(|_| unsafe_node())?,
+        ctime: stat.st_ctime,
+        ctime_nsec: i64::try_from(stat.st_ctime_nsec).map_err(|_| unsafe_node())?,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -230,48 +397,43 @@ fn stat_snapshot(stat: &Stat) -> Result<FileSnapshot, BlenderContentStoreObserva
     })
 }
 
-struct BoundStoreRoot<'a> {
-    path: &'a Path,
-    fd: OwnedFd,
-    device: u64,
-    inode: u64,
+#[derive(Debug)]
+struct ObservedBucket {
+    snapshot: DirectorySnapshot,
+    objects: Vec<ObservedObject>,
 }
 
-impl<'a> BoundStoreRoot<'a> {
-    fn open(path: &'a Path) -> Result<Self, BlenderContentStoreObservationError> {
-        if !path.is_absolute()
-            || std::fs::canonicalize(path).map_err(|_| unsafe_root())? != path
-        {
-            return Err(unsafe_root());
-        }
-        let fd = rustix_fs::open(path, DIRECTORY_FLAGS, Mode::empty()).map_err(|_| unsafe_root())?;
-        let stat = rustix_fs::fstat(fd.as_fd()).map_err(|_| unsafe_root())?;
-        if !FileType::from_raw_mode(stat.st_mode).is_dir() {
-            return Err(unsafe_root());
-        }
-        Ok(Self {
-            path,
-            fd,
-            device: stat.st_dev,
-            inode: stat.st_ino,
-        })
-    }
+#[derive(Debug)]
+struct ObservedObject {
+    name: String,
+    snapshot: FileSnapshot,
+}
 
-    fn revalidate(&self) -> Result<(), BlenderContentStoreObservationError> {
-        let held = rustix_fs::fstat(self.fd.as_fd()).map_err(|_| changed())?;
-        let rebound = rustix_fs::open(self.path, DIRECTORY_FLAGS, Mode::empty()).map_err(|_| changed())?;
-        let current = rustix_fs::fstat(rebound.as_fd()).map_err(|_| changed())?;
-        if !FileType::from_raw_mode(held.st_mode).is_dir()
-            || !FileType::from_raw_mode(current.st_mode).is_dir()
-            || held.st_dev != self.device
-            || held.st_ino != self.inode
-            || current.st_dev != self.device
-            || current.st_ino != self.inode
-        {
-            return Err(changed());
+fn hash_held_file(
+    file: &mut File,
+    expected_bytes: u64,
+) -> Result<Sha256Digest, BlenderContentStoreObservationError> {
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; READ_BUFFER_BYTES];
+    let mut observed_bytes = 0_u64;
+    loop {
+        let read = file.read(&mut buffer).map_err(|_| unreadable())?;
+        if read == 0 {
+            break;
         }
-        Ok(())
+        observed_bytes = observed_bytes
+            .checked_add(u64::try_from(read).map_err(|_| unreadable())?)
+            .ok_or_else(unreadable)?;
+        if observed_bytes > expected_bytes {
+            return Err(size_mismatch());
+        }
+        hasher.update(&buffer[..read]);
     }
+    if observed_bytes != expected_bytes {
+        return Err(size_mismatch());
+    }
+    let encoded = format!("{SHA256_PREFIX}{:x}", hasher.finalize());
+    Sha256Digest::parse(&encoded).map_err(|_| invalid_inventory())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -317,6 +479,13 @@ const fn unreadable() -> BlenderContentStoreObservationError {
     BlenderContentStoreObservationError::new(
         "blender_content_store_object_unreadable",
         "Blender content-store object could not be read completely",
+    )
+}
+
+const fn hardlink_ambiguous() -> BlenderContentStoreObservationError {
+    BlenderContentStoreObservationError::new(
+        "blender_content_store_hardlink_ambiguous",
+        "Blender content-store object has ambiguous hardlink aliases",
     )
 }
 
@@ -379,8 +548,7 @@ mod tests {
 
         fn publish(&self, bytes: &[u8]) -> Sha256Digest {
             let digest = digest(bytes);
-            let key = BlenderContentObjectKey::from_digest(&digest);
-            let path = self.root.join(key.as_str());
+            let path = self.object_path(&digest);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, bytes).unwrap();
             digest
@@ -506,6 +674,76 @@ mod tests {
 
         let error = observe_blender_content_store(&fixture.root, &project).unwrap_err();
         assert_eq!(error.code(), "blender_content_store_object_unsafe");
+    }
+
+    #[test]
+    fn hardlinked_required_object_refuses() {
+        let fixture = Fixture::new();
+        let expected = b"expected";
+        let project = snapshot(vec![(
+            "scenes/main.blend",
+            BlenderProjectFileClass::Scene,
+            expected,
+        )]);
+        let source = fixture.root.join("hardlink-source");
+        std::fs::write(&source, expected).unwrap();
+        let path = fixture.object_path(&digest(expected));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::hard_link(source, path).unwrap();
+
+        let error = observe_blender_content_store(&fixture.root, &project).unwrap_err();
+        assert_eq!(error.code(), "blender_content_store_hardlink_ambiguous");
+    }
+
+    #[test]
+    fn object_replacement_after_hash_refuses() {
+        let fixture = Fixture::new();
+        let expected = b"expected";
+        let expected_digest = fixture.publish(expected);
+        let object_path = fixture.object_path(&expected_digest);
+        let replaced = fixture.root.join("replaced-object");
+        let project = snapshot(vec![(
+            "scenes/main.blend",
+            BlenderProjectFileClass::Scene,
+            expected,
+        )]);
+        let mut replaced_once = false;
+        let error = observe_with_hook(&fixture.root, &project, |_| {
+            if replaced_once {
+                return;
+            }
+            replaced_once = true;
+            std::fs::rename(&object_path, &replaced).unwrap();
+            std::fs::write(&object_path, expected).unwrap();
+        })
+        .unwrap_err();
+        assert_eq!(error.code(), "blender_content_store_changed");
+    }
+
+    #[test]
+    fn bucket_replacement_after_hash_refuses() {
+        let fixture = Fixture::new();
+        let expected = b"expected";
+        let expected_digest = fixture.publish(expected);
+        let object_path = fixture.object_path(&expected_digest);
+        let bucket = object_path.parent().unwrap().to_path_buf();
+        let displaced = bucket.with_extension("displaced");
+        let project = snapshot(vec![(
+            "scenes/main.blend",
+            BlenderProjectFileClass::Scene,
+            expected,
+        )]);
+        let mut replaced_once = false;
+        let error = observe_with_hook(&fixture.root, &project, |_| {
+            if replaced_once {
+                return;
+            }
+            replaced_once = true;
+            std::fs::rename(&bucket, &displaced).unwrap();
+            std::fs::create_dir(&bucket).unwrap();
+        })
+        .unwrap_err();
+        assert_eq!(error.code(), "blender_content_store_changed");
     }
 
     #[test]
