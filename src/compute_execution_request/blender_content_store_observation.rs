@@ -388,7 +388,7 @@ fn stat_snapshot(stat: &Stat) -> Result<FileSnapshot, BlenderContentStoreObserva
         device: stat.st_dev,
         inode: stat.st_ino,
         mode: stat.st_mode,
-        links: stat.st_nlink,
+        links: u64::from(stat.st_nlink),
         bytes: u64::try_from(stat.st_size).map_err(|_| unsafe_node())?,
         mtime: stat.st_mtime,
         mtime_nsec: i64::try_from(stat.st_mtime_nsec).map_err(|_| unsafe_node())?,
