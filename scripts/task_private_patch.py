@@ -18,7 +18,7 @@ import re
 import shutil
 import stat
 import subprocess
-from typing import Callable, IO
+from typing import Callable, IO, NoReturn
 
 import owned_linux_task as owned_task
 
@@ -336,7 +336,7 @@ def parse_header_path(raw: str, prefix: str) -> str | None:
         or len(path.encode("utf-8")) > MAX_CHANGED_PATH_BYTES
         or path.startswith("/")
         or "\\" in path
-        or any(character.is_control() for character in path)
+        or any(ord(character) < 32 or ord(character) == 127 for character in path)
     ):
         raise Refusal("patch path is unsafe")
     components = path.split("/")
@@ -847,6 +847,10 @@ def sha256_bytes(value: bytes) -> str:
     return f"sha256:{hashlib.sha256(value).hexdigest()}"
 
 
+def reject_json_constant(value: str) -> NoReturn:
+    raise ValueError(f"non-finite JSON number: {value}")
+
+
 def read_document(path: Path) -> dict[str, object] | None:
     try:
         metadata = path.lstat()
@@ -863,7 +867,7 @@ def read_document(path: Path) -> dict[str, object] | None:
         raise Refusal("task patch state contains an unsafe document")
     raw = path.read_bytes()
     try:
-        value = json.loads(raw)
+        value = json.loads(raw, parse_constant=reject_json_constant)
     except (UnicodeError, ValueError) as error:
         raise Refusal("task patch state document is corrupt") from error
     if not isinstance(value, dict) or canonical_bytes(value) + b"\n" != raw:
