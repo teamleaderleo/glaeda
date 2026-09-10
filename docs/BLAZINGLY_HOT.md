@@ -708,6 +708,18 @@ or run the development binary with extra privilege to fill it in. Root unavailab
 top-level state shape, drift or rebinding, cross-state physical attribution, bounds, and arithmetic
 failure remain hard errors.
 
+Linux also builds a separate `glaeda-protected-cache-observe` front door for a narrowly installed
+complete-byte observer. A mutable checkout build always refuses. Its only accepted runtime is a
+single-link root-owned mode-0755 file at the fixed libexec path that retains one non-root caller UID
+and has exactly `CAP_DAC_READ_SEARCH` effective/permitted with no inheritable or extra capability.
+That path additionally requires every cache object to remain caller-owned and can metadata-account
+stable special inodes without opening their contents or endpoints. The outer report binds the held
+executable SHA-256, capability/install contract, nested schema-v2 observation, and
+`mutation_performed: false`. See
+[`PROTECTED_HOT_RUN_CACHE_OBSERVER.md`](PROTECTED_HOT_RUN_CACHE_OBSERVER.md). Repository code does
+not install the file capability; host installation and its physical canary remain separately
+authorized.
+
 Every state in a complete observation remains `ownership_unknown` with generation, worktree,
 reconstruction, lease, lock, mount, open-file, process, cleanup, and quarantine evidence unknown.
 A complete observation therefore reports disk occupancy but cannot make any state reclaimable. A
