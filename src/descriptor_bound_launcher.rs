@@ -2,9 +2,11 @@ use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 
 use serde::Serialize;
 
+use crate::artifact::Sha256Digest;
 use crate::process::MAX_CAPTURED_STREAM_BYTES;
 
 pub const DESCRIPTOR_BOUND_LAUNCH_SCHEMA_VERSION: u8 = 1;
@@ -14,9 +16,10 @@ pub(super) const CAPTURE_BUFFER_BYTES: usize = 8_192;
 const MAX_COMMAND_ID_BYTES: usize = 128;
 const MAX_ARGUMENTS: usize = 64;
 const MAX_ENVIRONMENT_ENTRIES: usize = 64;
-const MAX_VALUE_BYTES: usize = 8_192;
+pub(crate) const MAX_LAUNCH_VALUE_BYTES: usize = 8_192;
 const MAX_TOTAL_VALUE_BYTES: usize = 65_536;
-const MAX_PATH_BYTES: usize = 4_096;
+pub(crate) const MAX_LAUNCH_PATH_BYTES: usize = 4_096;
+const MAX_LAUNCH_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct ReviewedFilesystemIdentity {
@@ -61,7 +64,7 @@ impl ReviewedFilesystemIdentity {
         })
     }
 
-    fn exact_match(&self, other: &Self) -> bool {
+    pub(crate) fn exact_match(&self, other: &Self) -> bool {
         self.device == other.device
             && self.inode == other.inode
             && self.owner_uid == other.owner_uid
@@ -142,7 +145,7 @@ impl ReviewedLaunchValue {
         Self::Secret(value.into())
     }
 
-    fn exposed(&self) -> &str {
+    pub(crate) fn exposed(&self) -> &str {
         match self {
             Self::Plain(value) | Self::Secret(value) => value,
         }
@@ -183,6 +186,7 @@ pub struct ReviewedLinuxLaunchPlan {
     schema_version: u8,
     command_id: String,
     executable: ReviewedLaunchObject,
+    executable_content_digest: Option<Sha256Digest>,
     working_directory: ReviewedLaunchObject,
     arguments: Vec<ReviewedLaunchValue>,
     environment: BTreeMap<String, ReviewedLaunchValue>,
@@ -227,6 +231,7 @@ impl ReviewedLinuxLaunchPlan {
                 logical_path: executable_path,
                 identity: executable_identity,
             },
+            executable_content_digest: None,
             working_directory: ReviewedLaunchObject {
                 logical_path: working_directory,
                 identity: working_directory_identity,
@@ -256,6 +261,13 @@ impl ReviewedLinuxLaunchPlan {
     pub const fn credentials(&self) -> ReviewedLaunchCredentials {
         self.credentials
     }
+
+    /// Require the executor to hash the held executable descriptor immediately before spawn.
+    #[must_use]
+    pub fn with_executable_content_digest(mut self, digest: Sha256Digest) -> Self {
+        self.executable_content_digest = Some(digest);
+        self
+    }
 }
 
 impl fmt::Debug for ReviewedLinuxLaunchPlan {
@@ -265,6 +277,10 @@ impl fmt::Debug for ReviewedLinuxLaunchPlan {
             .field("schema_version", &self.schema_version)
             .field("command_id", &self.command_id)
             .field("executable", &"<private descriptor-bound executable>")
+            .field(
+                "executable_content_bound",
+                &self.executable_content_digest.is_some(),
+            )
             .field("working_directory", &"<private descriptor-bound cwd>")
             .field("argument_count", &self.arguments.len())
             .field(
@@ -411,11 +427,13 @@ pub enum DescriptorBoundLaunchErrorKind {
     Plan,
     FilesystemIdentity,
     UnsupportedExecutable,
+    ExecutableContent,
     Credentials,
     DescriptorAlias,
     Spawn,
     OutputCapture,
     OutputLimit,
+    Timeout,
     Status,
 }
 
@@ -474,6 +492,14 @@ impl DescriptorBoundLaunchError {
         )
     }
 
+    fn executable_content(message: impl Into<String>) -> Self {
+        Self::new(
+            DescriptorBoundLaunchErrorKind::ExecutableContent,
+            "executable",
+            message,
+        )
+    }
+
     fn credentials(message: impl Into<String>) -> Self {
         Self::new(
             DescriptorBoundLaunchErrorKind::Credentials,
@@ -507,6 +533,14 @@ impl DescriptorBoundLaunchError {
             DescriptorBoundLaunchErrorKind::OutputLimit,
             stage,
             format!("child {stage} exceeded the {MAX_CAPTURED_STREAM_BYTES}-byte capture limit"),
+        )
+    }
+
+    fn timeout() -> Self {
+        Self::new(
+            DescriptorBoundLaunchErrorKind::Timeout,
+            "timeout",
+            "descriptor-bound process exceeded the reviewed wall-clock limit",
         )
     }
 
@@ -571,7 +605,7 @@ fn validate_absolute_path(
     };
     if value.is_empty()
         || value == "/"
-        || value.len() > MAX_PATH_BYTES
+        || value.len() > MAX_LAUNCH_PATH_BYTES
         || value.ends_with('/')
         || value.contains("//")
         || value.chars().any(char::is_control)
@@ -620,7 +654,7 @@ fn validate_values(
     let mut total = 0_usize;
     for value in values {
         let exposed = value.exposed();
-        if exposed.len() > MAX_VALUE_BYTES || exposed.as_bytes().contains(&0) {
+        if exposed.len() > MAX_LAUNCH_VALUE_BYTES || exposed.as_bytes().contains(&0) {
             return Err(DescriptorBoundLaunchError::plan(
                 stage,
                 format!("reviewed {stage} contain an invalid or oversized value"),
@@ -681,8 +715,40 @@ mod executor;
 pub fn execute_reviewed_linux_launch(
     plan: &ReviewedLinuxLaunchPlan,
 ) -> Result<DescriptorBoundLaunchReceipt, DescriptorBoundLaunchError> {
+    execute_reviewed_linux_launch_inner(plan, None)
+}
+
+/// Execute one exact descriptor-bound Linux launch with a fixed wall-clock limit.
+///
+/// The timeout covers descriptor acquisition, spawn, execution, and output capture after the
+/// caller has supplied a valid plan. On expiry the executor kills the child's process group,
+/// reaps the direct child, drains the bounded capture workers, and returns a redacted typed error.
+///
+/// # Errors
+///
+/// Returns a plan error for a zero or greater-than-24-hour limit, or the same typed execution
+/// errors as [`execute_reviewed_linux_launch`], including `Timeout` on expiry.
+pub fn execute_reviewed_linux_launch_with_timeout(
+    plan: &ReviewedLinuxLaunchPlan,
+    timeout: Duration,
+) -> Result<DescriptorBoundLaunchReceipt, DescriptorBoundLaunchError> {
+    if timeout.is_zero() || timeout > MAX_LAUNCH_TIMEOUT {
+        return Err(DescriptorBoundLaunchError::plan(
+            "timeout",
+            "reviewed launch timeout must be between one nanosecond and 24 hours",
+        ));
+    }
+    execute_reviewed_linux_launch_inner(plan, Some(timeout))
+}
+
+fn execute_reviewed_linux_launch_inner(
+    plan: &ReviewedLinuxLaunchPlan,
+    timeout: Option<Duration>,
+) -> Result<DescriptorBoundLaunchReceipt, DescriptorBoundLaunchError> {
     match plan.credentials() {
-        ReviewedLaunchCredentials::Inherit { .. } => executor::execute_reviewed_linux_launch(plan),
+        ReviewedLaunchCredentials::Inherit { .. } => {
+            executor::execute_reviewed_linux_launch(plan, timeout)
+        }
         ReviewedLaunchCredentials::DropPrivileges { .. } => {
             let plan = plan.clone();
             std::thread::Builder::new()
@@ -693,7 +759,7 @@ pub fn execute_reviewed_linux_launch(
                             "could not clear supplementary groups for the reviewed launch",
                         )
                     })?;
-                    executor::execute_reviewed_linux_launch(&plan)
+                    executor::execute_reviewed_linux_launch(&plan, timeout)
                 })
                 .map_err(|_| {
                     DescriptorBoundLaunchError::spawn(

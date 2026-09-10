@@ -174,6 +174,16 @@ pub struct ProtectedCacheReplacementEquivalenceReceipt {
 }
 
 impl ProtectedCacheReplacementEquivalenceReceipt {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn from_physical_production(
+        production: &crate::unix_protected_cache_replacement_equivalence_producer::ProtectedCacheReplacementProductionSeal,
+    ) -> Self {
+        Self {
+            schema_version: PROTECTED_CACHE_REPLACEMENT_EQUIVALENCE_SCHEMA_VERSION,
+            binding: production.binding().clone(),
+        }
+    }
+
     #[must_use]
     pub const fn schema_version(&self) -> u8 {
         self.schema_version
