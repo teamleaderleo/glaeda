@@ -397,34 +397,19 @@ fn stat_snapshot(stat: &Stat) -> Result<FileSnapshot, BlenderContentStoreObserva
     })
 }
 
-#[cfg(target_os = "macos")]
+#[allow(clippy::useless_conversion)]
 fn portable_device(stat: &Stat) -> Result<u64, BlenderContentStoreObservationError> {
     u64::try_from(stat.st_dev).map_err(|_| unsafe_node())
 }
 
-#[cfg(not(target_os = "macos"))]
-fn portable_device(stat: &Stat) -> Result<u64, BlenderContentStoreObservationError> {
-    Ok(stat.st_dev)
-}
-
-#[cfg(target_os = "macos")]
+#[allow(clippy::useless_conversion)]
 fn portable_mode(stat: &Stat) -> u32 {
     u32::from(stat.st_mode)
 }
 
-#[cfg(not(target_os = "macos"))]
-fn portable_mode(stat: &Stat) -> u32 {
-    stat.st_mode
-}
-
-#[cfg(target_os = "macos")]
+#[allow(clippy::useless_conversion)]
 fn portable_links(stat: &Stat) -> u64 {
     u64::from(stat.st_nlink)
-}
-
-#[cfg(not(target_os = "macos"))]
-fn portable_links(stat: &Stat) -> u64 {
-    stat.st_nlink
 }
 
 #[derive(Debug)]
