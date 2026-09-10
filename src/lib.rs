@@ -1,6 +1,9 @@
 /// Read-only observation of one configured official Actions runner.
 pub mod actions_runner_readiness;
 pub mod artifact;
+/// Read-only byte proof for snapshot-required objects in one persistent Blender content store.
+#[cfg(unix)]
+pub mod blender_content_store_observation;
 /// Pure, path-free classification of explicit hot-state inventory observations.
 pub mod cache_inventory;
 /// Positive-only Linux process and mount reference observation for one Cargo target.
@@ -99,7 +102,7 @@ pub(crate) mod github_scale_set_delivery_state;
 pub mod github_scale_set_protocol;
 /// Pure, fail-closed mapping of reviewed GitHub workflow-job evidence into typed broker intents.
 pub mod github_workflow_job_mapper;
-/// Pure, bounded normalization of complete GitHub workflow-job reconciliation snapshots.
+/// Pure bounded normalization of complete GitHub workflow-job reconciliation snapshots.
 pub mod github_workflow_job_reconciliation;
 pub mod host;
 #[cfg(target_os = "linux")]
@@ -112,7 +115,6 @@ pub mod host_preparation_execution;
 pub mod host_preparation_plan;
 #[cfg(target_os = "linux")]
 pub mod host_preparation_receipt;
-#[cfg(target_os = "linux")]
 pub mod host_preparation_receipt_binding;
 #[cfg(target_os = "linux")]
 pub mod host_readiness;
@@ -222,311 +224,94 @@ pub mod linux_state;
 pub mod linux_state_prepare;
 #[cfg(target_os = "linux")]
 pub mod linux_state_recovery;
-/// Pure fixed offline Cargo command policy for exact local self-builds.
-pub mod local_install_build_command;
-/// Bounded exact-source local self-build execution and artifact evidence.
+/// Pure child-process and downstream-project match aggregation for local agent presence.
+pub mod local_agent_presence;
+/// Pure fixed-command planning for source read/edit/verification actions on one local installation.
+pub mod local_install_action_plan;
+/// Local process-bound execution adapter for one sealed project action plan.
 #[cfg(unix)]
-pub mod local_install_build_execution;
-/// Read-only, path-private proof that the isolated self-build Cargo lookup path is config-free.
-pub mod local_install_cargo_config_preflight;
-/// Crash-safe private per-user publication of verified Glaeda binary generations.
+pub mod local_install_action_runtime;
+/// Read-only operator-local manifest for explicit executable admission.
 #[cfg(unix)]
-pub mod local_install_generation_store;
-/// Descriptor-bound observation and publication of the canonical local `glaeda` launcher.
+pub mod local_install_executable_manifest;
+/// Bound launch adapter for one locally admitted execution plan.
 #[cfg(unix)]
 pub mod local_install_launcher;
-/// Pure exact-source local binary generation and stable launcher planning.
-pub mod local_install_plan;
-/// Read-only exact checkout and Cargo.lock proof for local self-builds.
+/// Canonical generation-aware local install identity and marker codec.
+pub mod local_install_generation;
+/// Descriptor-bound generation loading with explicit runtime handoff.
 #[cfg(unix)]
-pub mod local_install_source_preflight;
-/// Pure interference policy shared by local owned-execution adapters.
-pub mod local_interference_admission;
-pub mod mac_availability;
-pub mod macos_resource_observation;
-pub mod manifest;
-/// Pure schema-versioned personal-worker operator configuration and public identity.
-pub mod operator_config;
-/// Private-path-safe discovery and atomic persistence of operator configuration.
-pub mod operator_config_store;
-/// Closed public operator error, retry, remediation, dependency, approval, and command vocabulary.
-pub mod operator_error;
-/// Pure non-authorizing remediation applicability, safety, and confidence vocabulary.
-pub mod operator_remediation;
-/// Pure unified personal-worker operator status report and human renderer.
-pub mod operator_status;
-/// Typed, read-only aggregation of one coherent operator status evidence bundle.
-pub mod operator_status_service;
-pub mod ownership;
-/// Pure composition of durable queue, Lima lifecycle, and runner-readiness evidence.
-pub mod personal_worker_host_broker;
-/// Same-lock durable execution of one exact personal-worker Lima lifecycle tick.
-pub mod personal_worker_lima_adapter;
-/// Pure, path-private durable ownership and crash-phase authority for personal-worker Lima.
-pub mod personal_worker_lima_authority;
-/// Read-only Mac/Lima observation composed for personal-worker planning.
-pub mod personal_worker_mac_observation;
-/// Config-bound ergonomic submission and queued cancellation.
-pub mod personal_worker_operator_mutation;
-/// Config-bound, current-snapshot status, queue, and job reads.
-pub mod personal_worker_operator_read;
-/// Config-bound read-only discovery and explicit first initialization of durable worker state.
-pub mod personal_worker_operator_store;
-pub mod personal_worker_queue;
-/// Pure bounded projection of durable personal-worker status, queue pages, and job state.
-pub mod personal_worker_read_model;
-/// Pure binding of one repository-owned parallel verifier to one personal-worker attempt/result.
-pub mod personal_worker_repository_result;
-/// Read-only official-runner readiness composed with exact personal-worker evidence.
-pub mod personal_worker_runner_readiness;
-/// Pure sealed authority for the exact personal-worker Linux verification-runtime closure.
-pub mod personal_worker_runtime_contract;
-/// Strict canonical declaration of one installed personal-worker runtime closure.
-pub mod personal_worker_runtime_manifest;
-pub mod personal_worker_store;
-pub mod personal_worker_store_transaction;
-/// Pure, one-action personal-worker planning over accepted queue and host evidence.
-pub mod personal_worker_tick;
-/// Pure immutable verification authorization planning from sealed personal-worker evidence.
+pub mod local_install_generation_store;
+/// Pure exact plan and receipt for one owned local patch applicability check.
+pub mod local_patch_check;
+/// Process-backed execution of the fixed local patch applicability check.
+#[cfg(unix)]
+pub mod local_patch_check_runtime;
+/// Pure local-action intent and command fingerprint for approved local project operations.
+pub mod local_action_intent;
+/// Direct read-only observation of one owned local agent process tree.
 #[cfg(target_os = "linux")]
-pub mod personal_worker_verification_plan;
-pub mod plan;
-pub mod process;
-/// Pure, strict logical project catalog identities and alias resolution.
-pub mod project_catalog;
-/// Read-only, credentialless observation of one developer Git checkout on Unix hosts.
+pub mod local_agent_process_observation;
+/// Local project worker durable state and exact identity.
+pub mod local_project_worker_state;
+/// Read-only local project worker state observation and bounded report.
 #[cfg(unix)]
-pub mod project_checkout_observation;
-/// Read-only, bounded immediate-child discovery beneath one explicit project root.
+pub mod local_project_worker_observation;
+/// Read-only report composition for local project worker state and process evidence.
+pub mod local_project_worker_report;
+/// Pure bounded local project worker admission and resource planning.
+pub mod local_project_worker_admission;
+/// Descriptor-bound local project worker launch and settlement.
 #[cfg(unix)]
-pub mod project_discovery;
-/// Pure no-replay lifecycle for one exact formatted project-disk attachment.
-pub mod project_disk_attachment_state;
-/// Pure identity vocabulary for one formatted project-disk filesystem generation.
-pub mod project_disk_filesystem;
-/// Descriptor-bound read-only observation of Lima standalone project disks.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod local_project_worker_execution;
+/// Pure local project worker launch-plan derivation.
+pub mod local_project_worker_launch_plan;
+/// Exact resource observation for one local project worker process tree.
+#[cfg(target_os = "linux")]
+pub mod local_project_worker_resource_observation;
+/// Bounded owner-local workload observation for one project worker.
+#[cfg(unix)]
+pub mod local_project_worker_workload_observation;
+/// Pure bounded project worker supervision policy.
+pub mod local_project_worker_supervision;
+/// Pure proof-bearing project workspace reference.
+pub mod project_workspace;
+/// Pure capacity reservation decision for one project workspace.
+pub mod project_workspace_admission;
+/// Read-only descriptor-bound project workspace observation.
+#[cfg(unix)]
+pub mod project_workspace_observation;
+/// Pure project workspace readiness and exact source identity.
+pub mod project_workspace_readiness;
+/// Immutable project workspace registration and bounded catalog.
+pub mod project_workspace_registry;
+/// Pure project-disk attachment state and transition vocabulary.
+pub mod project_disk;
+/// Exact host-side project-disk observation and correlation.
+#[cfg(unix)]
 pub mod project_disk_host_observation;
-/// Pure crash-safe single-writer lease planning for resident trusted project disks.
-pub mod project_disk_lease;
-/// Pure bounded validator for the final #628 full project-filesystem correlation receipt.
-pub mod project_filesystem_correlation_receipt;
-pub mod project_workspace_identity;
-/// Pure path-free catalog-wide authority vocabulary for protected cache generations.
-pub mod protected_cache_generation_catalog;
-/// Conservative namespace-wide lease visibility from personal-worker durable state.
-pub mod protected_cache_namespace_lease_visibility;
-/// Strict path-free replacement-equivalence receipt vocabulary for protected cache generations.
-pub mod protected_cache_replacement_equivalence;
-pub mod quarry_parallel_verification_adapter;
-/// Bounded exact-byte capture from one already-open Quarry verification receipt channel.
-pub mod quarry_parallel_verification_capture;
-/// Strict supplied-receipt-only decoder for Quarry parallel verification receipt v2.
-pub mod quarry_parallel_verification_receipt;
-pub mod renderprove_artifact_binding;
-pub mod renderprove_execution;
+/// Pure bounded model from host and guest evidence into project-disk attachment truth.
+pub mod project_disk_observation;
+/// Provider-neutral read-only project-disk attach planning.
+pub mod project_disk_attach_plan;
+/// Pure bounded project-disk attach receipt and settlement model.
+pub mod project_disk_attach_receipt;
+/// Pure project-disk lifecycle and capacity classification.
+pub mod project_disk_lifecycle;
+/// Pure project-disk persistent state and identity.
+pub mod project_disk_state;
+/// Pure bounded project-disk workload affinity and routing hint.
+pub mod project_disk_workload_affinity;
+/// Pure bounded resident project-state valuation.
+pub mod resident_project_value;
+/// Pure bounded trusted overlay task-view lifecycle.
+pub mod trusted_overlay_task_view;
+/// Pure descriptor-bound trusted overlay mount planning.
 #[cfg(target_os = "linux")]
-pub mod renderprove_native_probe;
-/// Descriptor-bound protected project/evidence mount lease for native Renderprove probes.
+pub mod trusted_overlay_mount_plan;
+/// Direct descriptor-bound trusted OverlayFS mount execution.
 #[cfg(target_os = "linux")]
-pub mod renderprove_protected_mount;
-pub mod renderprove_verification;
-pub mod renderprove_vision_profile;
-pub mod renderprove_vision_result;
-/// Credentialless, bounded observation of one immutable reviewed repository source.
-pub mod repository_source_observation;
-/// Pure frozen preregistration and sample binding for resident backend comparisons.
-pub mod resident_backend_comparison;
-/// Bounded exact-OID repository evidence for resident trusted-agent work.
-#[cfg(unix)]
-pub mod resident_repo_query;
-/// Pure, authority-free resident-sandbox generation/config/locator catalog and strict codec.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-pub mod resident_sandbox_catalog;
-pub mod resource;
-#[cfg(target_os = "linux")]
-pub mod rootless_podman_config;
-/// Strict, bounded, nonblocking, descriptor-relative, identity-bound observation of reviewed Podman sources.
-#[cfg(target_os = "linux")]
-pub mod rootless_podman_config_observation;
-/// Pure, bounded, fail-closed precedence resolution and static-preflight assessment of Podman config.
-#[cfg(target_os = "linux")]
-pub mod rootless_podman_config_resolution;
-#[cfg(target_os = "linux")]
-pub mod rootless_podman_preflight;
-#[cfg(target_os = "linux")]
-pub mod runner_account_observation;
-#[cfg(target_os = "linux")]
-pub mod runner_account_plan;
-#[cfg(target_os = "linux")]
-pub mod runner_user;
-#[cfg(target_os = "linux")]
-pub mod runner_user_observation;
-/// Pure classification of trusted bounded Rust memory-pressure observations.
-pub mod rust_memory_diagnostic;
-/// Pure repository-declared Rust build-scope and bounded resource-envelope contracts.
-pub mod rust_verification_envelope;
-/// Canonical digest binding for reviewed Rust verification envelopes.
-pub mod rust_verification_envelope_digest;
-pub mod state;
-pub mod state_document;
-/// Closed current/legacy selection for Glaeda's fixed Linux durable-state roots.
-pub mod state_root_generation;
-pub mod state_store;
-#[cfg(target_os = "linux")]
-pub mod subordinate_id;
-/// Pure sealed task-private Git clone planning from exact hot-path leases.
+pub mod trusted_overlay_mount_execution;
+/// Pure exact task-private Git clone planning from immutable object-pool generations.
 #[cfg(target_os = "linux")]
 pub mod task_private_git_clone_plan;
-/// Pure reviewed identity for one resident Linux guest-control executable generation.
-pub mod trusted_guest_control_binary_generation;
-/// Root-only, closed, one-transaction Linux guest-control dispatcher.
-#[cfg(unix)]
-pub mod trusted_guest_control_dispatcher;
-/// Pure sealed one-shot invocation plan for purpose-typed Linux guest-control transactions.
-pub mod trusted_guest_control_invocation_plan;
-/// Mutation-free resident guest-control transport probe protocol.
-pub mod trusted_guest_control_probe_protocol;
-/// Pure canonical one-shot protocol envelope for purpose-typed Linux guest-control transactions.
-pub mod trusted_guest_control_protocol;
-/// Pure canonical request+payload and receipt+result guest-control transport frames.
-pub mod trusted_guest_control_transaction;
-#[cfg(target_os = "linux")]
-/// Sealed all-FD trusted OverlayFS mount transaction behind exact correlation evidence.
-pub mod trusted_overlay_mount_execution;
-#[cfg(target_os = "linux")]
-/// Read-only exact prerequisite observation and sealed intent for trusted OverlayFS mounts.
-pub mod trusted_overlay_mount_plan;
-/// Pure authority and lifecycle core for trusted resident OverlayFS task views.
-pub mod trusted_overlay_task_view;
-/// Read-only exact whole-block-device correlation for the mounted project filesystem.
-pub mod trusted_project_block_device_correlation;
-/// Opaque project-disk/filesystem correlation gate for trusted resident Linux mutation.
-pub mod trusted_project_filesystem_correlation;
-/// Opaque composition of exact guest filesystem + whole-block-device evidence.
-pub mod trusted_project_filesystem_full_guest_correlation;
-/// Read-only guest correlation of one held project-filesystem device with exact mountinfo evidence.
-pub mod trusted_project_filesystem_guest_observation;
-/// Canonical path-free payload/result for the guest project-filesystem observation operation.
-pub mod trusted_project_filesystem_guest_protocol;
-/// Descriptor-relative trusted producer for runner workspace and cache identity receipts.
-#[cfg(target_os = "linux")]
-pub mod trusted_workspace_receipt;
-#[cfg(unix)]
-pub mod unix_personal_worker_store;
-/// Unix descriptor-retained persistence for the empty protected cache-generation catalog.
-#[cfg(unix)]
-pub mod unix_protected_cache_generation_catalog_store;
-/// Descriptor-bound private persistence for the resident-sandbox catalog.
-#[cfg(unix)]
-pub mod unix_resident_sandbox_store;
-/// Pure fixed repository verification command meanings for identity derivation and later execution.
-pub mod verification_command_semantics;
-/// Pure sealed cross-attempt verification-isolation compatibility.
-pub mod verification_isolation_referee;
-pub mod verification_profile;
-pub mod verification_profile_preflight_adapter;
-pub mod verification_profile_registry;
-
-use serde::Serialize;
-
-pub const REPORT_SCHEMA_VERSION: u8 = 1;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CheckStatus {
-    Pass,
-    Warn,
-    Fail,
-}
-
-impl CheckStatus {
-    #[must_use]
-    pub const fn rank(self) -> u8 {
-        match self {
-            Self::Pass => 0,
-            Self::Warn => 1,
-            Self::Fail => 2,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct Check {
-    pub id: String,
-    pub status: CheckStatus,
-    pub summary: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub detail: Option<String>,
-}
-
-impl Check {
-    #[must_use]
-    pub fn new(
-        id: impl Into<String>,
-        status: CheckStatus,
-        summary: impl Into<String>,
-        detail: Option<String>,
-    ) -> Self {
-        Self {
-            id: id.into(),
-            status,
-            summary: summary.into(),
-            detail,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct DoctorReport {
-    pub schema_version: u8,
-    pub overall: CheckStatus,
-    pub checks: Vec<Check>,
-}
-
-impl DoctorReport {
-    #[must_use]
-    pub fn from_checks(checks: Vec<Check>) -> Self {
-        let overall = checks
-            .iter()
-            .map(|check| check.status)
-            .max_by_key(|status| status.rank())
-            .unwrap_or(CheckStatus::Pass);
-
-        Self {
-            schema_version: REPORT_SCHEMA_VERSION,
-            overall,
-            checks,
-        }
-    }
-
-    #[must_use]
-    pub fn has_failures(&self) -> bool {
-        self.overall == CheckStatus::Fail
-    }
-
-    #[must_use]
-    pub fn has_warnings(&self) -> bool {
-        self.checks
-            .iter()
-            .any(|check| check.status == CheckStatus::Warn)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{Check, CheckStatus, DoctorReport};
-
-    #[test]
-    fn report_uses_most_severe_status() {
-        let report = DoctorReport::from_checks(vec![
-            Check::new("ok", CheckStatus::Pass, "ok", None),
-            Check::new("warning", CheckStatus::Warn, "warning", None),
-            Check::new("failure", CheckStatus::Fail, "failure", None),
-        ]);
-
-        assert_eq!(report.overall, CheckStatus::Fail);
-        assert!(report.has_failures());
-        assert!(report.has_warnings());
-    }
-}
