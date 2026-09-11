@@ -148,13 +148,22 @@ deliberately does not invent.
   workload-identity unit name that refuses on collision.
 - No production admission-root installation or machine mutation.
 
-## Proposed next workload
+## Proposed next workload: DONE — live composition through the adapter
 
-Bind one managed receipt to one Glaeda attempt through the
-already-landed Rust adapter: the toolchain closure is now defined
-from both sides (structural mirror + executable precondition), the
-managed batch is green with semantic equality proven, and every
-other piece of the #1011 physical producer is on Big Red. The
-missing piece is the personal-worker attempt machinery
-(reservations, bindings, generations) — that composition is the
-next slice.
+`tests/quarry_parallel_live_producer_composition.rs` (+ fixture
+`tests/fixtures/quarry_parallel_live_receipt_468ccc44.json`, the exact
+8,049 producer bytes) feeds the live Big Red capture plus the real
+managed-run outer facts (exit 0, start/end millis, complete cleanup)
+through the unchanged `quarry_parallel_verification_adapter` into a
+`PersonalWorkerRepositoryCompletionInput` with terminal `Passed` and
+the receipt digest bound to the live bytes. A second test proves
+toolchain drift fails closed as `BindingMismatch`. #1011 items 2-4
+are now physical; items 6-10 were already covered by the adapter
+contract suite.
+
+Attempt, reservation, and store identity in that test stay
+experiment-scoped: it proves live-bytes composition, not queue
+authority. The remaining program is the worker loop (reservation
+issuance through the reconciler) and B07 durable publication — the
+personal-worker attempt machinery that must not be inferred from
+test ids.
