@@ -292,13 +292,14 @@ class SkeletonBinaryTests(unittest.TestCase):
             source.mkdir(parents=True)
             resident_python = str(root / "bin" / "python")
             (source / "ruff").write_bytes(b"\x7fELFfake-native-binary")
+            (source / "ruff").chmod(0o755)
             (source / "pytest").write_bytes(
                 f"#!{resident_python}\nimport sys\n".encode()
             )
             (source / "quarry").write_bytes(
                 f"#!{resident_python} -E\nimport sys\n".encode()
             )
-            (source / "system-tool").write_bytes(b"#!/usr/bin/env bash\necho hi\n")
+            (source / "system-tool").symlink_to("/bin/true")
             (source / "python3").symlink_to("/usr/bin/python3")
             (source / "Activate.ps1").write_text("echo hi")
             (source / "activate").write_text("echo hi")
@@ -307,8 +308,11 @@ class SkeletonBinaryTests(unittest.TestCase):
             mirrored = mirror_venv_binaries(venv, source)
             self.assertEqual(mirrored, ["pytest", "quarry", "ruff", "system-tool"])
             ruff = venv / "bin" / "ruff"
-            self.assertTrue(ruff.is_symlink())
+            # Inside the resident venv: copied, never symlinked (a symlink
+            # would dangle inside the task boundary).
+            self.assertFalse(ruff.is_symlink())
             self.assertEqual(ruff.read_bytes(), b"\x7fELFfake-native-binary")
+            self.assertTrue(os.access(ruff, os.X_OK))
             pytest = venv / "bin" / "pytest"
             self.assertFalse(pytest.is_symlink())
             first = pytest.read_bytes().split(b"\n", 1)[0]
@@ -318,7 +322,9 @@ class SkeletonBinaryTests(unittest.TestCase):
             first = quarry.read_bytes().split(b"\n", 1)[0]
             self.assertEqual(first, b"#!/venv/bin/python -E")
             system = venv / "bin" / "system-tool"
+            # Outside the venv (system path, visible in the boundary): linked.
             self.assertTrue(system.is_symlink())
+            self.assertEqual(system.resolve(), Path("/bin/true").resolve())
             self.assertFalse((venv / "bin" / "python3").exists())
             self.assertFalse((venv / "bin" / "Activate.ps1").exists())
             self.assertFalse((venv / "bin" / "activate").exists())
