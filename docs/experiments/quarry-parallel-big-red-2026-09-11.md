@@ -1,12 +1,14 @@
 # Quarry parallel-full: Big Red triangulated batch result
 
-Status: experiment adapter landed as `scripts/quarry_parallel_impl.py` with
-unit gate `scripts/test-quarry-parallel.py` (20 tests), plus a bounded
-channel extension to the shared task primitive
+Status: GREEN. One Glaeda-managed batch runs Quarry's exact
+repository-owned `parallel-full` verifier to completion (15/15 shards
+passed, including `verifier`) with a truthful canonical receipt, at
+Quarry `468ccc44` / tree `9316a33c`. Landed as
+`scripts/quarry_parallel_impl.py` with unit gate
+`scripts/test-quarry-parallel.py` (21 tests), plus a bounded channel
+extension to the shared task primitive
 (`execute_capturing`/`execute_capturing_split` in
-`scripts/owned_linux_task.py`). The measurements are performance
-observations, not source-validity, publication, merge, or result-reuse
-authority.
+`scripts/owned_linux_task.py`).
 
 ## Landed slice
 
@@ -51,20 +53,26 @@ observed and recorded before/after every attempt rather than required.
 
 ## Complete comparable loop
 
-Exact workload: Quarry `74eb66ee` / tree `6cecb3f9`, workers 4,
-`--receipt-stdout`, pytest 9.1.1 on CPython 3.14.4, closure
-`sha256:6dd40c9d…` (full value in the receipt).
+Exact workload: Quarry `468ccc44` / tree `9316a33c`, workers 4,
+`--receipt-stdout`, pytest 9.1.1 on CPython 3.14.4.
 
-| Arm | Result | Wall | Worker-visible bytes | Notes |
-| --- | --- | ---: | ---: | --- |
-| Cold direct (n=2) | completed, 15/15 passed | 86.1 s / 85.4 s | 8,049 receipt | resident venv, host /tmp |
-| Glaeda managed (n=3) | shard_failure (see below) | 64.7–71.2 s | ~7,000 receipt + ~28k stderr digest | task boundary, 400%/8G grant |
+| Arm | Result | Wall | Worker-visible bytes |
+| --- | --- | ---: | --- |
+| Cold direct | completed, 15/15 passed, cleanup passed | 84.1 s | 8,049 receipt |
+| Glaeda managed | completed, 15/15 passed, cleanup passed | 87.8 s | 8,049 receipt |
 
-No speedup is claimed. The managed wall is shorter here only because
-failing shards cancel their siblings early — comparing a failed run
-against a passed run proves nothing about speed. The product win is
-admission, isolation, and bounded identity-bearing evidence for an
-external workload that previously had none.
+No speedup is claimed and none is expected: the managed arm adds
+one full-clone materialization plus the sandbox boundary for ~4 s
+(4.4%) over cold. The product win is admission, isolation, and
+bounded identity-bearing evidence for an external workload that
+previously had none.
+
+On digests: the v2 canonical receipt embeds per-shard `wall_millis`,
+so byte-identical output digests across runs are not expected and
+not the bar. Semantic equality is proven instead: same termination
+(`completed`), same per-shard states (15/15 `passed`, same names),
+same cleanup (`passed`), same receipt size (8,049 bytes), same
+bound source (`468ccc44`/`9316a33c`).
 
 ## What the failures taught (the actual findings)
 
@@ -101,22 +109,33 @@ Three sandbox-shaped failures, each diagnosed to a root cause:
 
 ## Open gap: the accepted toolchain closure
 
-One shard (`verifier`, 10 tests) fails only in the sandbox: nested
-isolated-verifier subprocesses misbehave under the inferred venv
-skeleton, leak a generated `tests/test_ambient.py` into the worktree,
-and the outer collection then correctly refuses the ambient plugin
-declaration. The sandbox faithfully executes 3066/3067 tests with
-truthful receipts; the failure is real behavior divergence, not harness
-noise.
+RESOLVED during this session, from both sides:
 
-The right fix is not more sandbox tricks. Quarry's own
-`verification_toolchain.py` owns toolchain identity, and #1011 calls
-for an "accepted Quarry verifier/toolchain generation". The closure
-must be defined with the quarry lane against that contract (what makes
-a rebased Python closure the accepted generation, and what identity it
-carries), not inferred by the executor. Until then, this adapter is an
-experiment harness with a known one-shard divergence, and its receipts
-must not feed the Rust adapter's success path.
+- **Executor side (this repo):** the venv skeleton now mirrors the
+  resident venv's console binaries — in-venv entries are copied
+  (symlinks would dangle; resident paths are unmounted), venv-shebang
+  scripts are copied with the shebang rewritten to `/venv/bin/python`,
+  system-path entries are symlinked. The previously failing profile
+  file passes 6/6 under the rebased interpreter.
+- **Workload side (quarry #1136, merged as `468ccc44`):**
+  `require_profile_binaries()` probes the exact ruff invocation shape
+  at `_run_profile` entry and `parallel-full` startup, so a
+  non-conforming interpreter is refused by name in ~1 s instead of
+  failing one shard after a full batch. No receipt-schema change.
+- **Ruled out with evidence:** toolchain identity was never the gap —
+  `capture_verifier_toolchain()` yields the identical id under
+  `TZ=UTC` and host CST.
+
+The probe paid for itself immediately: it caught the first version
+of the skeleton fix (dangling symlinks) in 1 second with a named
+refusal, before a full batch was burned. Fail-fast preconditions
+compose across the executor/workload boundary: the workload names
+its invariant executably, the executor satisfies it structurally.
+
+With the closure question closed, the remaining step toward feeding
+the Rust adapter's success path is the personal-worker attempt
+machinery (reservations, bindings, generations) that this slice
+deliberately does not invent.
 
 ## What this does not do
 
@@ -131,8 +150,11 @@ must not feed the Rust adapter's success path.
 
 ## Proposed next workload
 
-Close the toolchain-closure question with the quarry lane (their
-`verification_toolchain.py` is the owning contract), then bind one
-managed receipt to one Glaeda attempt through the already-landed Rust
-adapter — that composition is the missing #1011 physical producer, and
-every piece except the accepted closure is now proven on Big Red.
+Bind one managed receipt to one Glaeda attempt through the
+already-landed Rust adapter: the toolchain closure is now defined
+from both sides (structural mirror + executable precondition), the
+managed batch is green with semantic equality proven, and every
+other piece of the #1011 physical producer is on Big Red. The
+missing piece is the personal-worker attempt machinery
+(reservations, bindings, generations) — that composition is the
+next slice.
