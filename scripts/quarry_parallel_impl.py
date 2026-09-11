@@ -247,6 +247,80 @@ def verify_resident_source(repository_root: Path, commit: str, tree: str) -> Non
         raise Refusal("resident Quarry checkout is not clean")
 
 
+def resident_venv_bin() -> Path:
+    return Path(VENV_SITE_PACKAGES).parents[2] / "bin"
+
+
+# Never mirrored into the task prefix: interpreters (bound explicitly),
+# shell activation scripts (resident paths), directories.
+_SKIPPED_BIN_NAMES = ("python", "activate")
+_SKIPPED_BIN_SUFFIXES = (".csh", ".fish", ".ps1", ".bat")
+
+
+def mirror_venv_binaries(venv: Path, source_bin: Path) -> list[str]:
+    """Mirror the resident venv's console scripts into the skeleton prefix.
+
+    Profile commands resolve native binaries (ruff) under the executing
+    interpreter's prefix. The skeleton prefix (/venv) must provide the
+    same binaries or nested profile runs fail with a short receipt far
+    from the cause (quarry #1136): entries living inside the resident
+    venv are COPIED (a symlink would dangle — resident paths are not
+    mounted in the task boundary), scripts whose shebang points into the
+    resident venv are copied with the shebang rewritten to
+    /venv/bin/python, and entries resolving outside the venv (system
+    paths, visible in the boundary) are symlinked. Activation scripts
+    and interpreters are never mirrored. Returns the sorted mirrored
+    names (deterministic, receipt-safe).
+    """
+    bin_dir = venv / "bin"
+    venv_root = source_bin.parent
+    venv_root_bytes = os.fsencode(str(venv_root))
+    mirrored: list[str] = []
+    for entry in sorted(source_bin.iterdir(), key=lambda candidate: candidate.name):
+        name = entry.name
+        lowered = name.lower()
+        if (
+            lowered.startswith(_SKIPPED_BIN_NAMES)
+            or lowered.endswith(_SKIPPED_BIN_SUFFIXES)
+            or not entry.is_file()
+        ):
+            continue
+        target = bin_dir / name
+        try:
+            content = entry.read_bytes()
+            mode = entry.stat().st_mode
+            try:
+                inside = entry.resolve().is_relative_to(venv_root)
+            except (OSError, RuntimeError):
+                inside = True
+        except OSError:
+            continue
+        first = content.split(b"\n", 1)[0]
+        if first.startswith(b"#!") and venv_root_bytes in first:
+            # Preserve a shebang argument vector if present (#!/x/python -E).
+            pieces = first[2:].split()
+            arguments = b" ".join(pieces[1:]) if len(pieces) > 1 else b""
+            rewritten = b"#!/venv/bin/python" + (b" " + arguments if arguments else b"")
+            target.write_bytes(rewritten + b"\n" + content[len(first) + 1 :])
+            try:
+                target.chmod(0o755)
+            except OSError:
+                pass
+        elif inside:
+            target.write_bytes(content)
+            try:
+                target.chmod(stat.S_IMODE(mode))
+            except OSError:
+                pass
+        else:
+            try:
+                os.symlink(entry.resolve(), target)
+            except OSError:
+                continue
+        mirrored.append(name)
+    return mirrored
+
+
 def build_venv_skeleton(task_root: Path) -> Path:
     """Materialize the fixed task-private venv skeleton (no resident writes).
 
@@ -264,6 +338,7 @@ def build_venv_skeleton(task_root: Path) -> Path:
     os.symlink("/usr/bin/python3", bin_dir / "python3")
     os.symlink("/usr/bin/python3", bin_dir / "python3.14")
     os.symlink("/quarry-venv", site_parent / "site-packages")
+    mirror_venv_binaries(venv, resident_venv_bin())
     return venv
 
 

@@ -21,6 +21,7 @@ from quarry_parallel_impl import (  # noqa: E402
     RECEIPT_SCHEMA_VERSION,
     WORKERS,
     command_fingerprint,
+    mirror_venv_binaries,
     receipt as make_receipt,
     settle_producer_output,
     summarize_receipt,
@@ -277,6 +278,57 @@ class OuterReceiptTests(unittest.TestCase):
     def test_rejects_wrong_fingerprint(self):
         fingerprint = command_fingerprint("a" * 40, "b" * 40, toolchain())
         self.assertFalse(valid_receipt(self.make(fingerprint), "sha256:" + "00" * 32))
+
+
+class SkeletonBinaryTests(unittest.TestCase):
+    def test_mirror_rewrites_resident_shebangs_and_links_natives(self):
+        import os
+        import stat
+        import tempfile
+
+        with tempfile.TemporaryDirectory(prefix="quarry-skel-test-") as tmp:
+            root = Path(tmp)
+            source = root / "source-bin"
+            source.mkdir(parents=True)
+            resident_python = str(root / "bin" / "python")
+            (source / "ruff").write_bytes(b"\x7fELFfake-native-binary")
+            (source / "ruff").chmod(0o755)
+            (source / "pytest").write_bytes(
+                f"#!{resident_python}\nimport sys\n".encode()
+            )
+            (source / "quarry").write_bytes(
+                f"#!{resident_python} -E\nimport sys\n".encode()
+            )
+            (source / "system-tool").symlink_to("/bin/true")
+            (source / "python3").symlink_to("/usr/bin/python3")
+            (source / "Activate.ps1").write_text("echo hi")
+            (source / "activate").write_text("echo hi")
+            venv = root / "venv"
+            (venv / "bin").mkdir(parents=True)
+            mirrored = mirror_venv_binaries(venv, source)
+            self.assertEqual(mirrored, ["pytest", "quarry", "ruff", "system-tool"])
+            ruff = venv / "bin" / "ruff"
+            # Inside the resident venv: copied, never symlinked (a symlink
+            # would dangle inside the task boundary).
+            self.assertFalse(ruff.is_symlink())
+            self.assertEqual(ruff.read_bytes(), b"\x7fELFfake-native-binary")
+            self.assertTrue(os.access(ruff, os.X_OK))
+            pytest = venv / "bin" / "pytest"
+            self.assertFalse(pytest.is_symlink())
+            first = pytest.read_bytes().split(b"\n", 1)[0]
+            self.assertEqual(first, b"#!/venv/bin/python")
+            self.assertTrue(pytest.stat().st_mode & stat.S_IXUSR)
+            quarry = venv / "bin" / "quarry"
+            first = quarry.read_bytes().split(b"\n", 1)[0]
+            self.assertEqual(first, b"#!/venv/bin/python -E")
+            system = venv / "bin" / "system-tool"
+            # Outside the venv (system path, visible in the boundary): linked.
+            self.assertTrue(system.is_symlink())
+            self.assertEqual(system.resolve(), Path("/bin/true").resolve())
+            self.assertFalse((venv / "bin" / "python3").exists())
+            self.assertFalse((venv / "bin" / "Activate.ps1").exists())
+            self.assertFalse((venv / "bin" / "activate").exists())
+            self.assertTrue(os.access(venv / "bin" / "pytest", os.X_OK))
 
 
 if __name__ == "__main__":
