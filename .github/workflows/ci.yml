@@ -87,6 +87,8 @@ jobs:
               Path("scripts/test-front-door.py"),
               Path("scripts/project_disk_physical_receipt.py"),
               Path("scripts/test_project_disk_physical_receipt.py"),
+              Path("scripts/quarry_sweep_impl.py"),
+              Path("scripts/test-quarry-sweep.py"),
               *Path("scripts/workspace_bootstrap").glob("*.py"),
           ]
           for path in paths:
@@ -108,6 +110,7 @@ jobs:
           python3 scripts/test-verify.py
           python3 scripts/test-verify-changed-rustfmt.py
           python3 scripts/test-front-door.py
+          python3 scripts/test-quarry-sweep.py
 
           first_receipt=$(mktemp)
           second_receipt=$(mktemp)
