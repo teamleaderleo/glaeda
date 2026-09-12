@@ -79,6 +79,36 @@ class AppleBuildTests(unittest.TestCase):
             apple.write_json(state, "last-run.json", receipt)
         self.assertEqual(apple.explain(plan)["last_build_timings_seconds"], {})
 
+    def test_check_uses_build_cache_but_keeps_evidence_and_recovery_separate(self):
+        baseline = self.plan()
+        build = self.run_plan(baseline)
+        checker = self.root / "check.sh"
+        checker.write_text('#!/bin/sh\nprintf checked\n')
+        checker.chmod(0o755)
+        config = {"schema_version": 1, "profiles": {"app": self.profile},
+                  "checks": {"app": {"engine": "script", "executable": "check.sh"}}}
+        (self.root / "glaeda.apple.json").write_text(json.dumps(config))
+        def prepare_again(project, name, generation, **options):
+            return apple.prepare(project, name, generation, lambda *args: self.tools, **options)
+        plan = prepare_again(self.root, "app", "default", operation="check")
+        self.assertEqual(plan["key"], baseline["key"])
+        check = apple.execute(plan, prepare_again)
+        self.assertEqual(check["operation"], "check")
+        with apple.store(plan) as state:
+            self.assertEqual(apple.read_json(state, "last-run.json"), build)
+            self.assertEqual(apple.read_json(state, "last-check.json"), check)
+        checker.write_text(checker.read_text() + '# changed helper\n')
+        with self.assertRaisesRegex(apple.Refusal, "changed during admission"):
+            apple.execute(plan, prepare_again)
+        with apple.store(plan) as state:
+            apple.write_json(state, "inflight.json", {"run_id": "check", "operation": "check",
+                             "cache_key": plan["key"], "pgid": None})
+        with patch.object(apple, "group_absent", return_value=True):
+            recovered = apple.recover(plan, "check")
+        with apple.store(plan) as state:
+            self.assertEqual(apple.read_json(state, "last-run.json"), build)
+            self.assertEqual(apple.read_json(state, "last-check.json"), recovered)
+
     def test_optional_preparation_reuse_rechecks_inputs_outputs_and_lock(self):
         (self.root / "Package.swift").write_text("// manifest")
         self.tools["swift"] = str(self.script)

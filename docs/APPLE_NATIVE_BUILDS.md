@@ -45,6 +45,32 @@ the next improvement belongs in Glaeda admission or the native workflow.
 
 ## Profile format
 
+### Check code without assembling a launchable app
+
+`check` runs an explicitly declared project helper; `plan-check` is read-only.
+Use a top-level `checks` map, keyed by build profile, with a script recipe:
+
+```json
+"checks": {
+  "app": {
+    "engine": "script",
+    "executable": "scripts/check-native.sh",
+    "arguments": ["{derived_data}", "{source_packages}"]
+  }
+}
+```
+
+The check inherits the build profile's toolchain, environment and cache paths.
+It always runs under the same lock and interrupted-state rules. Its helper bytes
+and declaration are revalidated after admission. It records `last-check.json`,
+including recovery, and never replaces app-build evidence. Adding a check does
+not reset the build generation. Native compilers remain responsible for input
+validity. A check helper must use native incremental behavior compatible with the
+shared build caches; it is trusted project code, not a sandboxed validation service.
+Its scope is project-defined: compilation success is not evidence that packaging,
+signing, installation, runtime checks, or the test suite passed. Use `warm`/`run`
+for the original complete app-build flow.
+
 ### Separate dependency preparation
 
 `ensure-dependencies` optionally reuses preparation after a successful resolver

@@ -23,6 +23,7 @@ import uuid
 LIMIT = 65536
 ENV_NAMES = ("HOME", "USER", "LOGNAME", "PATH", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE")
 CACHE_NAMES = ("derived_data", "source_packages", "scratch", "module_cache", "products", "extensions")
+RECEIPTS = {"build": "last-run.json", "dependencies": "last-dependencies.json", "check": "last-check.json"}
 XCODE_SETTINGS = {
     "ARCHS", "ONLY_ACTIVE_ARCH", "CODE_SIGNING_ALLOWED", "CODE_SIGNING_REQUIRED", "CODE_SIGN_IDENTITY",
     "DEVELOPMENT_TEAM", "CODE_SIGN_STYLE", "PRODUCT_BUNDLE_IDENTIFIER", "MACOSX_DEPLOYMENT_TARGET",
@@ -98,7 +99,7 @@ def configuration(project, name):
     path = project_file(project, "glaeda.apple.json")
     with path.open("rb") as stream:
         config = bounded_json(stream.read(LIMIT + 1))
-    if not isinstance(config, dict) or not {"schema_version", "profiles"} <= set(config) or set(config) - {"schema_version", "profiles", "preparations"} or config["schema_version"] != 1:
+    if not isinstance(config, dict) or not {"schema_version", "profiles"} <= set(config) or set(config) - {"schema_version", "profiles", "preparations", "checks"} or config["schema_version"] != 1:
         raise Refusal("expected Apple build configuration schema 1")
     profiles = config["profiles"]
     if not isinstance(profiles, dict) or name not in profiles or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", name):
@@ -266,6 +267,19 @@ def dependency_observation(project, paths, declaration):
     return {"inputs": inputs, "outputs": digest(observed)}
 
 
+def check_command(project, name, tools, paths):
+    with project_file(project, "glaeda.apple.json").open("rb") as stream:
+        config = bounded_json(stream.read(LIMIT + 1))
+    checks = config.get("checks", {})
+    recipe = checks.get(name) if isinstance(checks, dict) else None
+    if (not isinstance(recipe, dict) or recipe.get("engine") != "script"
+            or set(recipe) - {"engine", "executable", "arguments"}):
+        raise Refusal("profile needs a declared check helper")
+    argv = command_for(project, recipe, tools, paths)
+    identity = digest([recipe, hashlib.sha256(Path(argv[0]).read_bytes()).hexdigest()])
+    return argv, identity
+
+
 def prepare(project, name, generation="default", toolchain_probe=apple_toolchain, operation="build"):
     project = Path(project).resolve(strict=True)
     environment = base_environment()
@@ -289,12 +303,14 @@ def prepare(project, name, generation="default", toolchain_probe=apple_toolchain
     cache = project / ".glaeda/apple-build/cache" / key
     paths = {name: str(cache / name) for name in CACHE_NAMES}
     argv = command_for(project, profile, tools, paths)
-    if operation not in ("build", "dependencies"):
+    if operation not in RECEIPTS:
         raise Refusal("unknown native operation")
     operation_identity = None
     dependency_state = None
     if operation == "dependencies":
         argv, operation_identity, dependency_state = dependency_command(project, name, tools, paths)
+    elif operation == "check":
+        argv, operation_identity = check_command(project, name, tools, paths)
     configured = profile.get("environment", {})
     if not isinstance(configured, dict) or len(configured) > 32:
         raise Refusal("invalid build environment")
@@ -470,7 +486,7 @@ def execute(plan, prepare_again=prepare, reuse_dependencies=False):
         else:
             raise Refusal("unfinished build recorded; use plan, then recover its exact run id")
         # Repeat admission after acquiring the project lock, before creating reusable state.
-        options = {"operation": "dependencies"} if plan.get("operation") == "dependencies" else {}
+        options = {"operation": plan["operation"]} if plan.get("operation", "build") != "build" else {}
         fresh = prepare_again(plan["project"], plan["profile"], plan["generation"], **options)
         if fresh["key"] != plan["key"] or fresh.get("operation_identity") != plan.get("operation_identity"):
             raise Refusal("build configuration or toolchain changed during admission")
@@ -545,7 +561,7 @@ def execute(plan, prepare_again=prepare, reuse_dependencies=False):
                 "native_command": round(native_finished - started, 6),
                 "completion_observation": round(time.monotonic() - native_finished, 6),
             }
-            receipt_name = "last-dependencies.json" if plan.get("operation") == "dependencies" else "last-run.json"
+            receipt_name = RECEIPTS[plan.get("operation", "build")]
             if plan.get("operation") == "dependencies" and dependency_state:
                 receipt["preparation_status"] = "observation_unavailable"
                 try:
@@ -590,11 +606,11 @@ def recover(plan, run_id):
         if not isinstance(key, str) or not re.fullmatch(r"[a-f0-9]{64}", key):
             raise Refusal("interrupted cache identity is invalid")
         operation = active.get("operation", "build")
-        if operation not in ("build", "dependencies"):
+        if operation not in RECEIPTS:
             raise Refusal("interrupted operation is invalid")
         receipt = {"schema_version": 1, "state": "interruption_recovered", "run_id": run_id,
                    "authority": "developer_observation_only", "result_reuse": False, "operation": operation}
-        write_json(state, "last-dependencies.json" if operation == "dependencies" else "last-run.json", receipt)
+        write_json(state, RECEIPTS[operation], receipt)
         write_json(state, "quarantine-" + key + ".json", receipt)
         os.unlink("inflight.json", dir_fd=state)
         os.fsync(state)
@@ -642,7 +658,7 @@ def explain(plan):
 
 def main():
     parser = argparse.ArgumentParser(description="Prepare and run trusted native Apple builds with persistent project caches")
-    parser.add_argument("action", choices=("plan", "plan-dependencies", "dependencies", "ensure-dependencies", "explain", "run", "warm", "recover"))
+    parser.add_argument("action", choices=("plan", "plan-check", "check", "plan-dependencies", "dependencies", "ensure-dependencies", "explain", "run", "warm", "recover"))
     parser.add_argument("--project", type=Path, default=Path.cwd())
     parser.add_argument("--profile", default="app")
     parser.add_argument("--generation", default="default", help="stable label; use a new label for a cold rebuild without deleting old caches")
@@ -652,10 +668,10 @@ def main():
         if (args.action == "recover") != bool(args.run_id):
             raise Refusal("--run-id is required only for recover")
         preparing = time.monotonic()
-        operation = "dependencies" if args.action in ("dependencies", "ensure-dependencies", "plan-dependencies") else "build"
+        operation = "dependencies" if args.action in ("dependencies", "ensure-dependencies", "plan-dependencies") else "check" if args.action in ("check", "plan-check") else "build"
         plan = prepare(args.project, args.profile, args.generation, operation=operation)
         preparation_seconds = round(time.monotonic() - preparing, 6)
-        result = explain(plan) if args.action == "explain" else inspect(plan) if args.action in ("plan", "plan-dependencies") else recover(plan, args.run_id) if args.action == "recover" else execute(plan, reuse_dependencies=args.action == "ensure-dependencies")
+        result = explain(plan) if args.action == "explain" else inspect(plan) if args.action in ("plan", "plan-dependencies", "plan-check") else recover(plan, args.run_id) if args.action == "recover" else execute(plan, reuse_dependencies=args.action == "ensure-dependencies")
         result["toolchain_and_profile_probe_seconds"] = preparation_seconds
         print(json.dumps(result, sort_keys=True))
         return result.get("exit_code", 0)
