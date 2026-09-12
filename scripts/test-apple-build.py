@@ -135,6 +135,32 @@ class AppleBuildTests(unittest.TestCase):
         self.assertEqual(apple.explain(self.plan())["explanation"]["source_observation"], "commit_changed")
         self.assertEqual(apple.explain(self.plan("new"))["explanation"]["source_observation"], "no_comparable_build")
 
+    def test_native_work_reports_only_bounded_known_task_values(self):
+        self.script.write_text("#!/bin/sh\ncat <<'EOF'\nBuild Timing Summary\nSwiftCompile (2 tasks) | 99 seconds\n"
+                               "Build Timing Summary\nSwiftEmitModule (1 task) | 12.853 seconds\n"
+                               "PrivateSourceName (1 task) | 5 seconds\nLd (9999999 tasks) | 2 seconds\n"
+                               "SwiftCompile (1 task) | -2 seconds\nnote: 2 hits / 2 cacheable tasks (100%)\nEOF\n")
+        result = self.run_plan(self.plan())["native_work"]
+        self.assertEqual(result["last_reported_task_timings"], {"SwiftEmitModule": {"tasks": 1, "seconds": 12.853}})
+        self.assertEqual(result["last_reported_compilation_cache"], {"hits": 2, "cacheable_tasks": 2})
+        self.assertEqual(result["timing_summaries"], 2)
+        self.assertTrue(result["task_times_may_overlap"])
+        self.assertNotIn("PrivateSourceName", json.dumps(result))
+
+    def test_native_work_telemetry_failure_does_not_strand_completed_build(self):
+        plan = self.plan()
+        with patch.object(apple, "native_work_summary", side_effect=OSError("telemetry unavailable")):
+            result = self.run_plan(plan)
+        self.assertEqual(result["exit_code"], 0)
+        self.assertEqual(result["native_work"], {"state": "unavailable"})
+        self.assertFalse((self.root / ".glaeda/apple-build/inflight.json").exists())
+        with apple.store(plan) as state:
+            name = "run-" + result["run_id"] + ".log"
+            fd = os.open(name, os.O_WRONLY, dir_fd=state)
+            os.ftruncate(fd, 64 * 1024 * 1024 + 1)
+            os.close(fd)
+            self.assertEqual(apple.native_work_summary(state, result["run_id"]), {"state": "unavailable"})
+
     def test_explanation_filters_untrusted_timing_fields(self):
         plan = self.plan()
         self.run_plan(plan)

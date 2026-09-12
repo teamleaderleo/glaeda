@@ -24,6 +24,9 @@ LIMIT = 65536
 ENV_NAMES = ("HOME", "USER", "LOGNAME", "PATH", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE")
 CACHE_NAMES = ("derived_data", "source_packages", "scratch", "module_cache", "products", "extensions")
 RECEIPTS = {"build": "last-run.json", "dependencies": "last-dependencies.json", "check": "last-check.json"}
+NATIVE_PHASES = {"SwiftEmitModule", "SwiftDriver", "SwiftDriver Compilation", "SwiftCompile",
+                 "CompileC", "Ld", "PhaseScriptExecution", "CompileXCStrings", "CopyStringsFile",
+                 "CodeSign", "SwiftGeneratePch", "CpResource", "CopySwiftLibs"}
 XCODE_SETTINGS = {
     "ARCHS", "ONLY_ACTIVE_ARCH", "CODE_SIGNING_ALLOWED", "CODE_SIGNING_REQUIRED", "CODE_SIGN_IDENTITY",
     "DEVELOPMENT_TEAM", "CODE_SIGN_STYLE", "PRODUCT_BUNDLE_IDENTIFIER", "MACOSX_DEPLOYMENT_TARGET",
@@ -510,6 +513,46 @@ def source_snapshot(plan):
     return {"commit": commit, "clean": not bool(probe([*git, "status", "--porcelain"], environment))}
 
 
+def native_work_summary(state, run_id):
+    """Bounded, content-minimised advice; never used for admission or reuse."""
+    if not re.fullmatch(r"[0-9a-f]{32}", run_id):
+        return {"state": "unavailable"}
+    fd = os.open("run-" + run_id + ".log", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=state)
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 64 * 1024 * 1024:
+            return {"state": "unavailable"}
+        phases = {}
+        cache = None
+        summaries = 0
+        remaining = info.st_size
+        while remaining > 0:
+            line = stream.readline(min(remaining, 65536))
+            if not line:
+                break
+            remaining -= len(line)
+            if len(line) == 65536 and not line.endswith(b"\n"):
+                return {"state": "unavailable"}
+            text = line.decode("utf-8", errors="replace").strip()
+            if text == "Build Timing Summary":
+                phases = {}
+                summaries += 1
+            timing = re.fullmatch(r"([A-Za-z ]+) \(([0-9]+) tasks?\) \| ([0-9]+(?:\.[0-9]+)?) seconds", text)
+            if summaries and timing and timing[1] in NATIVE_PHASES:
+                count, seconds = int(timing[2]), float(timing[3])
+                if count <= 1000000 and seconds <= 1e9:
+                    phases[timing[1]] = {"tasks": count, "seconds": seconds}
+            hits = re.fullmatch(r"note: ([0-9]+) hits / ([0-9]+) cacheable tasks \([0-9]+%\)", text)
+            if hits and 0 <= int(hits[1]) <= int(hits[2]) <= 1000000:
+                cache = {"hits": int(hits[1]), "cacheable_tasks": int(hits[2])}
+        result = {"state": "reported" if phases or cache else "not_reported",
+                  "authority": "advisory_only", "task_times_may_overlap": True,
+                  "timing_summaries": summaries, "last_reported_task_timings": phases}
+        if cache is not None:
+            result["last_reported_compilation_cache"] = cache
+        return result
+
+
 def execute(plan, prepare_again=prepare, reuse_dependencies=False):
     entered = time.monotonic()
     inspect(plan)
@@ -626,6 +669,10 @@ def execute(plan, prepare_again=prepare, reuse_dependencies=False):
                     pass
                 if code == 0 and receipt["preparation_status"] != "declared_files_observed":
                     receipt["exit_code"] = 1
+            try:
+                receipt["native_work"] = native_work_summary(state, run_id)
+            except (OSError, ValueError, OverflowError):
+                receipt["native_work"] = {"state": "unavailable"}
             write_json(state, receipt_name, receipt)
             if code < 0:
                 write_json(state, "quarantine-" + plan["key"] + ".json", receipt)

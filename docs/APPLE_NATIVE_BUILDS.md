@@ -283,6 +283,14 @@ back to `recipe` uses the current recipe's original cache calculation.
 
 ## Compiler experiments and repeatable measurements
 
+Completed receipts include bounded `native_work` advice when the native log
+reports Xcode task timings or compilation-cache totals. Only known task names
+and numeric values are retained; source paths and raw log text are excluded.
+The last reported timing summary and last reported cache total are labelled
+separately, rather than added across nested builds. Task timings may overlap.
+Unsupported, oversized, or unavailable logs do not fail an otherwise completed
+build. None of these reported values grants reuse or execution authority.
+
 SwiftPM profiles accept optional Boolean `incremental_file_hashing` and
 `incremental_diagnostics` fields. The former explicitly enables or disables
 Swift's file-content hashing; omission preserves the compiler default. Diagnostics
