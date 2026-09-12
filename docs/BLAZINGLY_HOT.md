@@ -240,7 +240,7 @@ standard cache is ignored by Git, is invalidated by Python's source/cache-tag co
 no state, execution, or result authority; deleting it merely makes the next fallback invocation
 compile the module again.
 
-`glaeda-hot-run` is the compiled Linux front door for the equally common measured direct case:
+`glaeda-hot-run` is the compiled Linux and macOS front door for the equally common measured direct case:
 
 ```bash
 glaeda-hot-run \
@@ -249,7 +249,30 @@ glaeda-hot-run \
   -- cargo check --locked
 ```
 
-It preserves the schema-v6 measurement shape, workload-scoped GNU-time CPU/RSS boundary, aggregate
+On macOS, it executes directly inside the existing project checkout, retains native build caches
+between invocations, and records schema-v6 wall time plus the command's exit or signal. For a Mac
+project such as cmux, keep one canonical checkout and invoke the normal native build tool there:
+
+```bash
+glaeda-hot-run \
+  --resident /path/to/cmux --task /path/to/cmux/cmux-tui \
+  --cache cmux-tui/target:native --measurement /private/cmux-warm.json \
+  -- cargo test --locked -p cmux-tui-core --lib
+```
+
+The first invocation warms the tool's ordinary cache; repeated invocations reuse whatever the
+tool validates. Cargo, SwiftPM, Xcode or Zig still owns dependency and source invalidation. A
+cache miss follows the native build tool's cold rebuild path. No result is skipped based on a
+Glaeda receipt. This is ultra-trusted host execution with the caller's environment and terminal,
+not a sandbox or a managed resident lease. It creates no duplicate checkout or background daemon.
+Use the project's existing tagged build helper for Xcode builds.
+
+The Mac path rejects `--timeout`, `--resource-profile`, and `--cpu-set` before running anything.
+CPU/RSS accounting and native-target snapshots are unavailable (`null`); the Linux `/proc`
+machine probes are unavailable on macOS too. Wall time remains measured. Cross-worktree and
+private-cache requests remain unsupported rather than falling back to shared mutable state.
+
+On Linux, it preserves the schema-v6 measurement shape, workload-scoped GNU-time CPU/RSS boundary, aggregate
 machine-pressure envelope, exit-versus-signal distinction, atomic receipt publication, caller
 environment and terminal, optional comparison key, runtime executable digest, and optional
 descendant-bin binding without starting Python. The binary accepts only a task directory inside the
@@ -269,7 +292,7 @@ requests remain on `scripts/hot-run` rather than being silently weakened. This i
 observation-only ultra-trusted execution path. It grants no lease, cache, residency, validation,
 publication, or cleanup authority.
 
-When the compiled front door records an exact `target:native` declaration, its schema-v6 receipt
+On Linux, when the compiled front door records an exact `target:native` declaration, its schema-v6 receipt
 also carries a path-private `native_target_observation`. Sequential pre-command observations bind
 the checkout commit/tree/materialization and checkout-local Cargo target generation; an
 unavailable pre-command observation refuses to run an unbound measurement. After the command,
