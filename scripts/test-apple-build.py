@@ -3,6 +3,7 @@
 
 import importlib.util
 import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -171,6 +172,18 @@ class AppleBuildTests(unittest.TestCase):
         with self.assertRaises(apple.Refusal):
             self.plan()
         self.assertFalse((self.root / ".glaeda").exists())
+
+    def test_malformed_interruption_record_has_a_bounded_public_refusal(self):
+        plan = self.plan()
+        with apple.store(plan, True) as state:
+            apple.write_json(state, "inflight.json", {})
+        output = io.StringIO()
+        with patch.object(apple, "prepare", return_value=plan), patch("sys.argv", ["apple-build", "plan"]), contextlib.redirect_stderr(output):
+            self.assertEqual(apple.main(), 2)
+        refusal = json.loads(output.getvalue())
+        self.assertEqual(refusal["state"], "refused")
+        self.assertNotIn(str(self.root), output.getvalue())
+        self.assertFalse(Path(plan["paths"]["products"]).exists())
 
 
 if __name__ == "__main__":

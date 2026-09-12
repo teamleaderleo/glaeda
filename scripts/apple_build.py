@@ -473,7 +473,7 @@ def main():
         result = inspect(plan) if args.action == "plan" else recover(plan, args.run_id) if args.action == "recover" else execute(plan)
         print(json.dumps(result, sort_keys=True))
         return result.get("exit_code", 0)
-    except (Refusal, OSError, ValueError, subprocess.SubprocessError) as error:
+    except (Refusal, OSError, ValueError, KeyError, TypeError, AttributeError, subprocess.SubprocessError) as error:
         # Exception paths may contain private project/toolchain paths; public failures do not.
         message = str(error) if isinstance(error, Refusal) else "native Apple build observation or execution failed"
         print(json.dumps({"schema_version": 1, "state": "refused", "reason": message}), file=sys.stderr)
