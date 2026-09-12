@@ -190,6 +190,13 @@ class AppleBuildTests(unittest.TestCase):
             return apple.execute(plan(), prepare_again, reuse_dependencies=True)
         self.assertEqual(run()["state"], "completed")
         self.assertEqual(run()["state"], "preparation_reused")
+        # Opting in on a readiness hit must bind the existing cache too.
+        original_key = plan()["key"]
+        self.native_policy()
+        self.assertEqual(run()["state"], "preparation_reused")
+        binding = plan()["lineage"]
+        self.assertTrue((self.root / ".glaeda/apple-build" / ("lineage-" + binding["lineage"] + ".json")).exists())
+        self.assertEqual(plan()["key"], original_key)
         (self.root / "Source.swift").write_text("// unrelated edit")
         reused = run()
         self.assertEqual(reused["state"], "preparation_reused")

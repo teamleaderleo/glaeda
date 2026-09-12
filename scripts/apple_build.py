@@ -542,6 +542,8 @@ def execute(plan, prepare_again=prepare, reuse_dependencies=False):
                     and previous.get("invocation_identity") == plan.get("invocation_identity")
                     and previous.get("preparation_identity") == plan["operation_identity"]
                     and previous.get("dependency_state") == dependency_state):
+                if plan.get("lineage"):
+                    write_json(state, "lineage-" + plan["lineage"]["lineage"] + ".json", plan["lineage"])
                 return {**inspect(plan), "state": "preparation_reused", "exit_code": 0,
                         "validation": "declared_inputs_and_files_match", "native_build_validation_required": True,
                         "elapsed_seconds": round(time.monotonic() - entered, 6)}
