@@ -431,7 +431,8 @@ def execute(plan, prepare_again=prepare):
             os.close(caches)
         run_id = uuid.uuid4().hex
         source_before = source_snapshot(plan)
-        active = {"schema_version": 1, "run_id": run_id, "cache_key": plan["key"], "pgid": None}
+        active = {"schema_version": 1, "run_id": run_id, "cache_key": plan["key"], "pgid": None,
+                  "operation": plan.get("operation", "build")}
         write_json(state, "inflight.json", active)
         started = time.monotonic()
         child = None
@@ -496,9 +497,12 @@ def recover(plan, run_id):
         key = active.get("cache_key")
         if not isinstance(key, str) or not re.fullmatch(r"[a-f0-9]{64}", key):
             raise Refusal("interrupted cache identity is invalid")
+        operation = active.get("operation", "build")
+        if operation not in ("build", "dependencies"):
+            raise Refusal("interrupted operation is invalid")
         receipt = {"schema_version": 1, "state": "interruption_recovered", "run_id": run_id,
-                   "authority": "developer_observation_only", "result_reuse": False}
-        write_json(state, "last-run.json", receipt)
+                   "authority": "developer_observation_only", "result_reuse": False, "operation": operation}
+        write_json(state, "last-dependencies.json" if operation == "dependencies" else "last-run.json", receipt)
         write_json(state, "quarantine-" + key + ".json", receipt)
         os.unlink("inflight.json", dir_fd=state)
         os.fsync(state)

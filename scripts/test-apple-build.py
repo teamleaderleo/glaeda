@@ -214,6 +214,21 @@ class AppleBuildTests(unittest.TestCase):
             self.run_plan(plan)
         self.assertEqual(self.run_plan(self.plan("rebuild"))["exit_code"], 0)
 
+    def test_dependency_recovery_preserves_build_receipt(self):
+        plan = self.plan()
+        build = self.run_plan(plan)
+        with apple.store(plan) as state:
+            apple.write_json(state, "inflight.json", {"run_id": "deps", "pgid": None,
+                             "cache_key": plan["key"], "operation": "dependencies"})
+        with patch.object(apple, "group_absent", return_value=True):
+            recovered = apple.recover(plan, "deps")
+        self.assertEqual(recovered["operation"], "dependencies")
+        with apple.store(plan) as state:
+            self.assertEqual(apple.read_json(state, "last-run.json"), build)
+            self.assertEqual(apple.read_json(state, "last-dependencies.json"), recovered)
+        with self.assertRaisesRegex(apple.Refusal, "interrupted"):
+            apple.inspect(plan)
+
     def test_recovery_does_not_release_a_present_process_group(self):
         plan = self.plan()
         with apple.store(plan, True) as state:
