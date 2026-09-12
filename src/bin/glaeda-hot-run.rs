@@ -18,7 +18,7 @@ use std::os::unix::fs::{
 use std::os::unix::net::UnixStream;
 #[cfg(target_os = "linux")]
 use std::os::unix::process::CommandExt as _;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Component, Path, PathBuf};
 #[cfg(target_os = "linux")]
@@ -708,8 +708,16 @@ fn cpu_grant_scope_is_populated(cgroup_fd: i32) -> Result<bool, String> {
 }
 
 fn run(cli: Cli) -> Result<i32, String> {
-    if !cfg!(target_os = "linux") {
-        return Err("native hot-run execution currently requires Linux".into());
+    if !cfg!(any(target_os = "linux", target_os = "macos")) {
+        return Err("native hot-run execution requires Linux or macOS".into());
+    }
+    if cfg!(target_os = "macos")
+        && (cli.timeout.is_some() || cli.resource_profile.is_some() || cli.cpu_set.is_some())
+    {
+        return Err(
+            "macOS native hot-run does not support --timeout, --resource-profile or --cpu-set"
+                .into(),
+        );
     }
     if cli.comparison_key.is_some() && cli.measurement.is_none() {
         return Err("--comparison-key requires --measurement".into());
@@ -2352,9 +2360,54 @@ fn execute_command(execution: CommandExecution<'_>) -> Result<CommandResult, Str
     })
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+fn execute_command(execution: CommandExecution<'_>) -> Result<CommandResult, String> {
+    // The same-worktree path deliberately leaves native cache validity to the build tool.
+    // It neither materializes a task view nor claims Linux process/resource controls.
+    if execution.timeout.is_some()
+        || execution.resource_profile.is_some()
+        || execution.cpu_set.is_some()
+    {
+        return Err("macOS native hot-run does not support process/resource controls".into());
+    }
+    let mut command = Command::new(&execution.command[0]);
+    command
+        .args(&execution.command[1..])
+        .current_dir(execution.cwd);
+    if let Some(path) = execution.environment_path {
+        command.env("PATH", path);
+    }
+    let started = Instant::now();
+    let status = command
+        .status()
+        .map_err(|error| format!("cannot execute command: {error}"))?;
+    let signal = status.signal();
+    Ok(CommandResult {
+        elapsed: started.elapsed(),
+        timeout_seconds: None,
+        resource_profile: None,
+        cpu_set: None,
+        user_cpu_seconds: None,
+        system_cpu_seconds: None,
+        max_rss_kib: None,
+        resource_accounting: if execution.measured {
+            "unavailable_for_measured_command"
+        } else {
+            "not_measured"
+        },
+        exit_code: status.code().unwrap_or_else(|| 128 + signal.unwrap_or(0)),
+        signal,
+        completion_reason: if signal.is_some() {
+            "signaled"
+        } else {
+            "exited"
+        },
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn execute_command(_execution: CommandExecution<'_>) -> Result<CommandResult, String> {
-    Err("native hot-run execution currently requires Linux".into())
+    Err("native hot-run execution requires Linux or macOS".into())
 }
 
 #[cfg(target_os = "linux")]
@@ -2853,7 +2906,7 @@ mod tests {
         );
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     #[test]
     fn native_execution_refuses_unsupported_platform_before_observation() {
         let error = run(Cli {
@@ -2871,7 +2924,7 @@ mod tests {
             command: vec![OsString::from("/bin/true")],
         })
         .unwrap_err();
-        assert_eq!(error, "native hot-run execution currently requires Linux");
+        assert_eq!(error, "native hot-run execution requires Linux or macOS");
     }
 
     #[test]
