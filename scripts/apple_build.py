@@ -198,7 +198,8 @@ def dependency_command(project, name, tools, paths):
     preparations = config.get("preparations", {})
     if not isinstance(preparations, dict) or not isinstance(preparations.get(name), dict):
         raise Refusal("profile has no declared dependency preparation")
-    recipe = preparations[name]
+    recipe = dict(preparations[name])
+    reuse = recipe.pop("reuse", None)
     kind = recipe.get("engine")
     if kind == "swiftpm" and set(recipe) <= {"engine", "package"}:
         package = project_file(project, recipe["package"]) if "package" in recipe else project
@@ -216,7 +217,53 @@ def dependency_command(project, name, tools, paths):
                 "-clonedSourcePackagesDirPath", paths["source_packages"], "-resolvePackageDependencies"]
     else:
         raise Refusal("invalid native dependency preparation recipe")
-    return argv, digest(recipe)
+    observation = dependency_observation(project, paths, reuse) if reuse is not None else None
+    return argv, digest(preparations[name]), observation
+
+
+def dependency_observation(project, paths, declaration):
+    """Bounded hints for skipping optional resolution, never native validation."""
+    if not isinstance(declaration, dict) or set(declaration) != {"inputs", "required_files"}:
+        raise Refusal("dependency reuse requires inputs and required_files")
+    patterns, outputs = declaration["inputs"], declaration["required_files"]
+    if not isinstance(patterns, list) or not 1 <= len(patterns) <= 32 or not isinstance(outputs, list) or not 1 <= len(outputs) <= 32:
+        raise Refusal("dependency reuse declarations exceed bounds")
+    files = set()
+    for pattern in patterns:
+        relative_path(pattern)
+        for path in project.glob(pattern):
+            files.add(str(path.relative_to(project)))
+            if len(files) > 512:
+                raise Refusal("too many dependency inputs")
+    if not files:
+        raise Refusal("dependency reuse matched no input files")
+    total = 0
+    def content(path):
+        nonlocal total
+        with path.open("rb") as stream:
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                raise Refusal("dependency observation requires regular files")
+            data = stream.read(16 * 1024 * 1024 + 1)
+        total += len(data)
+        if total > 16 * 1024 * 1024:
+            raise Refusal("dependency observation exceeds byte limit")
+        return hashlib.sha256(data).hexdigest()
+    inputs = digest([(name, content(project_file(project, name))) for name in sorted(files)])
+    observed = []
+    for item in outputs:
+        if not isinstance(item, dict) or set(item) != {"cache", "path"} or item["cache"] not in CACHE_NAMES:
+            raise Refusal("invalid required dependency file")
+        relative = relative_path(item["path"])
+        base = Path(paths[item["cache"]])
+        candidate = base / relative
+        try:
+            resolved = candidate.resolve(strict=True)
+            if not resolved.is_relative_to(base):
+                raise Refusal("dependency file escapes its cache")
+            observed.append(content(resolved))
+        except FileNotFoundError:
+            return {"inputs": inputs, "outputs": None}
+    return {"inputs": inputs, "outputs": digest(observed)}
 
 
 def prepare(project, name, generation="default", toolchain_probe=apple_toolchain, operation="build"):
@@ -245,8 +292,9 @@ def prepare(project, name, generation="default", toolchain_probe=apple_toolchain
     if operation not in ("build", "dependencies"):
         raise Refusal("unknown native operation")
     operation_identity = None
+    dependency_state = None
     if operation == "dependencies":
-        argv, operation_identity = dependency_command(project, name, tools, paths)
+        argv, operation_identity, dependency_state = dependency_command(project, name, tools, paths)
     configured = profile.get("environment", {})
     if not isinstance(configured, dict) or len(configured) > 32:
         raise Refusal("invalid build environment")
@@ -258,7 +306,7 @@ def prepare(project, name, generation="default", toolchain_probe=apple_toolchain
     environment["CLANG_MODULE_CACHE_PATH"] = paths["module_cache"]
     return {"project": project, "profile": name, "owner": owner, "key": key, "paths": paths,
             "argv": argv, "environment": environment, "engine": profile["engine"], "generation": generation,
-            "operation": operation, "operation_identity": operation_identity}
+            "operation": operation, "operation_identity": operation_identity, "dependency_state": dependency_state}
 
 
 def directory(parent, name, create=False):
@@ -407,7 +455,7 @@ def source_snapshot(plan):
     return {"commit": commit, "clean": not bool(probe([*git, "status", "--porcelain"], environment))}
 
 
-def execute(plan, prepare_again=prepare):
+def execute(plan, prepare_again=prepare, reuse_dependencies=False):
     entered = time.monotonic()
     inspect(plan)
     waiting = time.monotonic()
@@ -426,6 +474,19 @@ def execute(plan, prepare_again=prepare):
         fresh = prepare_again(plan["project"], plan["profile"], plan["generation"], **options)
         if fresh["key"] != plan["key"] or fresh.get("operation_identity") != plan.get("operation_identity"):
             raise Refusal("build configuration or toolchain changed during admission")
+        dependency_state = fresh.get("dependency_state")
+        if reuse_dependencies and plan.get("operation") == "dependencies" and dependency_state and dependency_state["outputs"]:
+            try:
+                previous = read_json(state, "last-dependencies.json")
+            except FileNotFoundError:
+                previous = {}
+            if (isinstance(previous, dict) and previous.get("exit_code") == 0
+                    and previous.get("cache_key") == plan["key"]
+                    and previous.get("preparation_identity") == plan["operation_identity"]
+                    and previous.get("dependency_state") == dependency_state):
+                return {**inspect(plan), "state": "preparation_reused", "exit_code": 0,
+                        "validation": "declared_inputs_and_files_match", "native_build_validation_required": True,
+                        "elapsed_seconds": round(time.monotonic() - entered, 6)}
         caches, _ = directory(state, "cache", True)
         try:
             cache, made = directory(caches, plan["key"], True)
@@ -485,6 +546,13 @@ def execute(plan, prepare_again=prepare):
                 "completion_observation": round(time.monotonic() - native_finished, 6),
             }
             receipt_name = "last-dependencies.json" if plan.get("operation") == "dependencies" else "last-run.json"
+            if plan.get("operation") == "dependencies":
+                after = prepare_again(plan["project"], plan["profile"], plan["generation"], operation="dependencies")
+                after_state = after.get("dependency_state")
+                if (after["key"] == plan["key"] and after.get("operation_identity") == plan["operation_identity"]
+                        and dependency_state and after_state and dependency_state["inputs"] == after_state["inputs"]):
+                    receipt["dependency_state"] = after_state
+                    receipt["preparation_identity"] = plan["operation_identity"]
             write_json(state, receipt_name, receipt)
             if code < 0:
                 write_json(state, "quarantine-" + plan["key"] + ".json", receipt)
@@ -563,7 +631,7 @@ def explain(plan):
 
 def main():
     parser = argparse.ArgumentParser(description="Prepare and run trusted native Apple builds with persistent project caches")
-    parser.add_argument("action", choices=("plan", "plan-dependencies", "dependencies", "explain", "run", "warm", "recover"))
+    parser.add_argument("action", choices=("plan", "plan-dependencies", "dependencies", "ensure-dependencies", "explain", "run", "warm", "recover"))
     parser.add_argument("--project", type=Path, default=Path.cwd())
     parser.add_argument("--profile", default="app")
     parser.add_argument("--generation", default="default", help="stable label; use a new label for a cold rebuild without deleting old caches")
@@ -573,10 +641,10 @@ def main():
         if (args.action == "recover") != bool(args.run_id):
             raise Refusal("--run-id is required only for recover")
         preparing = time.monotonic()
-        operation = "dependencies" if args.action in ("dependencies", "plan-dependencies") else "build"
+        operation = "dependencies" if args.action in ("dependencies", "ensure-dependencies", "plan-dependencies") else "build"
         plan = prepare(args.project, args.profile, args.generation, operation=operation)
         preparation_seconds = round(time.monotonic() - preparing, 6)
-        result = explain(plan) if args.action == "explain" else inspect(plan) if args.action in ("plan", "plan-dependencies") else recover(plan, args.run_id) if args.action == "recover" else execute(plan)
+        result = explain(plan) if args.action == "explain" else inspect(plan) if args.action in ("plan", "plan-dependencies") else recover(plan, args.run_id) if args.action == "recover" else execute(plan, reuse_dependencies=args.action == "ensure-dependencies")
         result["toolchain_and_profile_probe_seconds"] = preparation_seconds
         print(json.dumps(result, sort_keys=True))
         return result.get("exit_code", 0)

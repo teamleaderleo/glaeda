@@ -47,6 +47,34 @@ the next improvement belongs in Glaeda admission or the native workflow.
 
 ### Separate dependency preparation
 
+`ensure-dependencies` optionally reuses preparation after a successful resolver
+run. A preparation recipe may declare:
+
+```json
+"reuse": {
+  "inputs": ["Package.swift", "Package.resolved", "Packages/**/Package.swift"],
+  "required_files": [{"cache": "source_packages", "path": "artifacts/example/Info.plist"}]
+}
+```
+
+Input globs are project-relative; their matched names and file contents are
+hashed. Required files are relative to a named existing cache category, must
+resolve inside it, and are also content-hashed. Observations are bounded to 32
+patterns, 512 input files, 32 required files and 16 MiB of total file content.
+No matched inputs is an error. Globs observe additions and removals; select all
+manifests and configuration files that affect dependency preparation, including
+local package manifests. Source code generally does not belong in this set.
+
+Under the normal project lock, an unchanged generation, recipe, input fingerprint
+and required-file fingerprint may return `preparation_reused`. Missing files,
+changed bytes, absent/failed/legacy receipts or an undeclared reuse policy run the
+resolver. Input changes during resolution prevent publication of reusable evidence.
+`dependencies` always forces the resolver. Neither action skips app builds,
+disables automatic package validation, or certifies the entire artifact tree:
+required files are a declared preparation check, not a substitute for compiler
+validation. The reusable observation never overwrites the prior dependency run
+receipt or the app-build receipt. Active/quarantined/foreign state is never reused.
+
 `dependencies` runs a declared native resolver without building or launching the
 app. `plan-dependencies` checks the declaration without creating state. Add an
 optional top-level `preparations` map alongside `profiles`, keyed by build profile:

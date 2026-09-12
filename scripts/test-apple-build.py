@@ -79,6 +79,38 @@ class AppleBuildTests(unittest.TestCase):
             apple.write_json(state, "last-run.json", receipt)
         self.assertEqual(apple.explain(plan)["last_build_timings_seconds"], {})
 
+    def test_optional_preparation_reuse_rechecks_inputs_outputs_and_lock(self):
+        (self.root / "Package.swift").write_text("// manifest")
+        self.tools["swift"] = str(self.script)
+        config = {"schema_version": 1, "profiles": {"app": self.profile},
+                  "preparations": {"app": {"engine": "swiftpm", "reuse": {
+                      "inputs": ["Package.swift", "Package.resolved"],
+                      "required_files": [{"cache": "products", "path": "result"}]}}}}
+        (self.root / "glaeda.apple.json").write_text(json.dumps(config))
+        def prepare_again(project, name, generation, **options):
+            return apple.prepare(project, name, generation, lambda *args: self.tools, **options)
+        def plan():
+            return prepare_again(self.root, "app", "default", operation="dependencies")
+        def run():
+            return apple.execute(plan(), prepare_again, reuse_dependencies=True)
+        self.assertEqual(run()["state"], "completed")
+        self.assertEqual(run()["state"], "preparation_reused")
+        (self.root / "Source.swift").write_text("// unrelated edit")
+        reused = run()
+        self.assertEqual(reused["state"], "preparation_reused")
+        self.assertFalse(reused["result_reuse"])
+        self.assertTrue(reused["native_build_validation_required"])
+        (self.root / "Package.resolved").write_text("changed dependency input")
+        self.assertEqual(run()["state"], "completed")
+        artifact = Path(plan()["paths"]["products"]) / "result"
+        artifact.write_text("damaged")
+        self.assertEqual(run()["state"], "completed")
+        artifact.unlink()
+        self.assertEqual(run()["state"], "completed")
+        with apple.store(plan()) as state, apple.lock(state):
+            with self.assertRaises(apple.Refusal):
+                run()
+
     def test_swift_driver_keeps_dispatch_name_and_checks_toolchain_identity(self):
         frontend = self.root / "swift-frontend"
         frontend.write_text("fixture")
