@@ -45,6 +45,36 @@ the next improvement belongs in Glaeda admission or the native workflow.
 
 ## Profile format
 
+### Separate dependency preparation
+
+`dependencies` runs a declared native resolver without building or launching the
+app. `plan-dependencies` checks the declaration without creating state. Add an
+optional top-level `preparations` map alongside `profiles`, keyed by build profile:
+
+```json
+"preparations": {
+  "app": {"engine": "xcode", "project": "cmux.xcodeproj", "scheme": "cmux"}
+}
+```
+
+For SwiftPM use `{"engine":"swiftpm"}` (or add a relative `package` path).
+Xcode requires exactly one `project` or `workspace` and a scheme. Preparation
+uses the build profile's existing cache generation, toolchain and environment.
+Changing this resolver declaration does not invalidate build caches, because it
+does not change the build command; its identity is revalidated under the project
+lock before execution. The native resolver always runs and validates dependency
+inputs. There is no readiness shortcut based on a prior receipt.
+
+Preparation shares the normal lock, process tracking and interrupted-generation
+quarantine. Failure never triggers automatic deletion. Its receipt is private
+`last-dependencies.json`, separate from `last-run.json`, so resolving packages
+cannot replace evidence of an app build. Resolver commands may update lockfiles;
+before/after source observations report this, and callers should review changes.
+Dependency preparation does not disable resolution in subsequent builds, verify
+every package's binary artifacts, or prepare non-package dependencies such as
+Ghostty/Zig/Rust. Those are separate measured follow-up stages, not implied by a
+successful resolver exit.
+
 Add `glaeda.apple.json` to the project and ignore `.glaeda/apple-build/`:
 
 ```json

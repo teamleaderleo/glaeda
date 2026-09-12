@@ -79,6 +79,49 @@ class AppleBuildTests(unittest.TestCase):
             apple.write_json(state, "last-run.json", receipt)
         self.assertEqual(apple.explain(plan)["last_build_timings_seconds"], {})
 
+    def test_dependencies_reuse_paths_and_keep_build_receipt_separate(self):
+        build_plan = self.plan()
+        build = self.run_plan(build_plan)
+        (self.root / "Package.swift").write_text("// fixture")
+        self.tools["swift"] = str(self.script)
+        self.write_config()
+        config_path = self.root / "glaeda.apple.json"
+        config = json.loads(config_path.read_text())
+        config["preparations"] = {"app": {"engine": "swiftpm"}}
+        config_path.write_text(json.dumps(config))
+        def prepare_again(project, name, generation, **options):
+            return apple.prepare(project, name, generation, lambda *args: self.tools, **options)
+        normal = prepare_again(self.root, "app", "default")
+        plan = prepare_again(self.root, "app", "default", operation="dependencies")
+        self.assertEqual(normal["key"], plan["key"])
+        self.assertEqual(normal["paths"], plan["paths"])
+        self.assertEqual(plan["argv"][-1], "resolve")
+        receipt = apple.execute(plan, prepare_again)
+        self.assertEqual(receipt["operation"], "dependencies")
+        with apple.store(plan) as state:
+            self.assertEqual(apple.read_json(state, "last-run.json")["run_id"], build["run_id"])
+            self.assertEqual(apple.read_json(state, "last-dependencies.json")["run_id"], receipt["run_id"])
+        config["preparations"]["app"]["package"] = "missing"
+        config_path.write_text(json.dumps(config))
+        with self.assertRaises((apple.Refusal, FileNotFoundError)):
+            apple.execute(plan, prepare_again)
+
+    def test_xcode_dependency_plan_is_read_only_and_recipe_changes_revalidate(self):
+        (self.root / "App.xcodeproj").mkdir()
+        config = {"schema_version": 1, "profiles": {"app": self.profile},
+                  "preparations": {"app": {"engine": "xcode", "project": "App.xcodeproj", "scheme": "App"}}}
+        (self.root / "glaeda.apple.json").write_text(json.dumps(config))
+        def prepare_again(project, name, generation, **options):
+            return apple.prepare(project, name, generation, lambda *args: self.tools, **options)
+        plan = prepare_again(self.root, "app", "default", operation="dependencies")
+        self.assertEqual(plan["argv"][-1], "-resolvePackageDependencies")
+        self.assertEqual(apple.inspect(plan)["state"], "cold")
+        self.assertFalse((self.root / ".glaeda").exists())
+        config["preparations"]["app"]["scheme"] = "Other"
+        (self.root / "glaeda.apple.json").write_text(json.dumps(config))
+        with self.assertRaisesRegex(apple.Refusal, "changed during admission"):
+            apple.execute(plan, prepare_again)
+
     def test_settings_sdk_toolchain_and_recipe_separate_generations(self):
         key = self.plan()["key"]
         self.tools["sdk_build"] = "test2"

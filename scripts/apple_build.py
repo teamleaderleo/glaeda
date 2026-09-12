@@ -98,7 +98,7 @@ def configuration(project, name):
     path = project_file(project, "glaeda.apple.json")
     with path.open("rb") as stream:
         config = bounded_json(stream.read(LIMIT + 1))
-    if not isinstance(config, dict) or set(config) != {"schema_version", "profiles"} or config["schema_version"] != 1:
+    if not isinstance(config, dict) or not {"schema_version", "profiles"} <= set(config) or set(config) - {"schema_version", "profiles", "preparations"} or config["schema_version"] != 1:
         raise Refusal("expected Apple build configuration schema 1")
     profiles = config["profiles"]
     if not isinstance(profiles, dict) or name not in profiles or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", name):
@@ -179,7 +179,34 @@ def command_for(project, profile, toolchain, paths):
     return argv
 
 
-def prepare(project, name, generation="default", toolchain_probe=apple_toolchain):
+def dependency_command(project, name, tools, paths):
+    with project_file(project, "glaeda.apple.json").open("rb") as stream:
+        config = bounded_json(stream.read(LIMIT + 1))
+    preparations = config.get("preparations", {})
+    if not isinstance(preparations, dict) or not isinstance(preparations.get(name), dict):
+        raise Refusal("profile has no declared dependency preparation")
+    recipe = preparations[name]
+    kind = recipe.get("engine")
+    if kind == "swiftpm" and set(recipe) <= {"engine", "package"}:
+        package = project_file(project, recipe["package"]) if "package" in recipe else project
+        project_file(project, str((package / "Package.swift").relative_to(project)))
+        argv = [tools["swift"], "package", "--package-path", str(package), "--scratch-path", paths["scratch"],
+                "--cache-path", paths["source_packages"], "resolve"]
+    elif kind == "xcode" and set(recipe) <= {"engine", "project", "workspace", "scheme"}:
+        containers = [key for key in ("project", "workspace") if key in recipe]
+        scheme = recipe.get("scheme")
+        if len(containers) != 1 or not isinstance(scheme, str) or not scheme or scheme.startswith("-"):
+            raise Refusal("dependency preparation needs one Xcode container and scheme")
+        container = containers[0]
+        argv = [tools["xcodebuild"], "-" + container, str(project_file(project, recipe[container])),
+                "-scheme", expand(scheme, {}), "-derivedDataPath", paths["derived_data"],
+                "-clonedSourcePackagesDirPath", paths["source_packages"], "-resolvePackageDependencies"]
+    else:
+        raise Refusal("invalid native dependency preparation recipe")
+    return argv, digest(recipe)
+
+
+def prepare(project, name, generation="default", toolchain_probe=apple_toolchain, operation="build"):
     project = Path(project).resolve(strict=True)
     environment = base_environment()
     root = Path(probe(["/usr/bin/git", "-C", str(project), "rev-parse", "--show-toplevel"], environment)).resolve(strict=True)
@@ -202,6 +229,11 @@ def prepare(project, name, generation="default", toolchain_probe=apple_toolchain
     cache = project / ".glaeda/apple-build/cache" / key
     paths = {name: str(cache / name) for name in CACHE_NAMES}
     argv = command_for(project, profile, tools, paths)
+    if operation not in ("build", "dependencies"):
+        raise Refusal("unknown native operation")
+    operation_identity = None
+    if operation == "dependencies":
+        argv, operation_identity = dependency_command(project, name, tools, paths)
     configured = profile.get("environment", {})
     if not isinstance(configured, dict) or len(configured) > 32:
         raise Refusal("invalid build environment")
@@ -212,7 +244,8 @@ def prepare(project, name, generation="default", toolchain_probe=apple_toolchain
     environment["DEVELOPER_DIR"] = tools["developer"]
     environment["CLANG_MODULE_CACHE_PATH"] = paths["module_cache"]
     return {"project": project, "profile": name, "owner": owner, "key": key, "paths": paths,
-            "argv": argv, "environment": environment, "engine": profile["engine"], "generation": generation}
+            "argv": argv, "environment": environment, "engine": profile["engine"], "generation": generation,
+            "operation": operation, "operation_identity": operation_identity}
 
 
 def directory(parent, name, create=False):
@@ -322,7 +355,8 @@ def inspect(plan):
             raise Refusal("existing Apple state is incomplete; refusing implicit adoption")
     return {"schema_version": 1, "authority": "developer_observation_only", "profile": plan["profile"],
             "engine": plan["engine"], "cache_key": plan["key"], "generation": plan["generation"],
-            "state": status, "active_run": active, "isolation": "trusted_native_host", "result_reuse": False}
+            "state": status, "active_run": active, "isolation": "trusted_native_host", "result_reuse": False,
+            "operation": plan.get("operation", "build")}
 
 
 @contextlib.contextmanager
@@ -375,8 +409,9 @@ def execute(plan, prepare_again=prepare):
         else:
             raise Refusal("unfinished build recorded; use plan, then recover its exact run id")
         # Repeat admission after acquiring the project lock, before creating reusable state.
-        fresh = prepare_again(plan["project"], plan["profile"], plan["generation"])
-        if fresh["key"] != plan["key"]:
+        options = {"operation": "dependencies"} if plan.get("operation") == "dependencies" else {}
+        fresh = prepare_again(plan["project"], plan["profile"], plan["generation"], **options)
+        if fresh["key"] != plan["key"] or fresh.get("operation_identity") != plan.get("operation_identity"):
             raise Refusal("build configuration or toolchain changed during admission")
         caches, _ = directory(state, "cache", True)
         try:
@@ -435,7 +470,8 @@ def execute(plan, prepare_again=prepare):
                 "native_command": round(native_finished - started, 6),
                 "completion_observation": round(time.monotonic() - native_finished, 6),
             }
-            write_json(state, "last-run.json", receipt)
+            receipt_name = "last-dependencies.json" if plan.get("operation") == "dependencies" else "last-run.json"
+            write_json(state, receipt_name, receipt)
             if code < 0:
                 write_json(state, "quarantine-" + plan["key"] + ".json", receipt)
             os.unlink("inflight.json", dir_fd=state)
@@ -510,7 +546,7 @@ def explain(plan):
 
 def main():
     parser = argparse.ArgumentParser(description="Prepare and run trusted native Apple builds with persistent project caches")
-    parser.add_argument("action", choices=("plan", "explain", "run", "warm", "recover"))
+    parser.add_argument("action", choices=("plan", "plan-dependencies", "dependencies", "explain", "run", "warm", "recover"))
     parser.add_argument("--project", type=Path, default=Path.cwd())
     parser.add_argument("--profile", default="app")
     parser.add_argument("--generation", default="default", help="stable label; use a new label for a cold rebuild without deleting old caches")
@@ -520,9 +556,10 @@ def main():
         if (args.action == "recover") != bool(args.run_id):
             raise Refusal("--run-id is required only for recover")
         preparing = time.monotonic()
-        plan = prepare(args.project, args.profile, args.generation)
+        operation = "dependencies" if args.action in ("dependencies", "plan-dependencies") else "build"
+        plan = prepare(args.project, args.profile, args.generation, operation=operation)
         preparation_seconds = round(time.monotonic() - preparing, 6)
-        result = explain(plan) if args.action == "explain" else inspect(plan) if args.action == "plan" else recover(plan, args.run_id) if args.action == "recover" else execute(plan)
+        result = explain(plan) if args.action == "explain" else inspect(plan) if args.action in ("plan", "plan-dependencies") else recover(plan, args.run_id) if args.action == "recover" else execute(plan)
         result["toolchain_and_profile_probe_seconds"] = preparation_seconds
         print(json.dumps(result, sort_keys=True))
         return result.get("exit_code", 0)
