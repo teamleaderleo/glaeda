@@ -198,6 +198,12 @@ Do not promote a filesystem primitive because its microbenchmark is attractive. 
 
 ### Ultra-trusted local hot-run prototype
 
+For native SwiftPM, Xcode, and Apple app build helpers, use the
+[native Apple build workflow](APPLE_NATIVE_BUILDS.md). It preserves one checkout
+and gives native cache families stable, toolchain-keyed paths with project locking
+and explicit interrupted-build recovery. Linux filesystem views below remain a
+separate backend.
+
 `scripts/hot-run` is a deliberately small Linux developer-loop prototype. It binds a task Git
 worktree onto the pathname of a warmed resident worktree. Explicit path-class policies can expose
 resident dependencies read-only, give a short-lived task a private OverlayFS upper over warmed
