@@ -2,6 +2,7 @@
 """Native Apple build policy tests; no Xcode, signing, or external services required."""
 
 import importlib.util
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -97,6 +98,21 @@ class AppleBuildTests(unittest.TestCase):
         self.tools["swift_version"] = "changed"
         with self.assertRaisesRegex(apple.Refusal, "changed during admission"):
             self.run_plan(plan)
+        self.assertFalse(Path(plan["paths"]["products"]).exists())
+
+    def test_quarantine_published_before_lock_admission_prevents_execution(self):
+        plan = self.plan()
+        original_lock = apple.lock
+
+        @contextlib.contextmanager
+        def prior_owner_quarantines(state):
+            with original_lock(state):
+                apple.write_json(state, "quarantine-" + plan["key"] + ".json", {"state": "interrupted"})
+                yield
+
+        with patch.object(apple, "lock", prior_owner_quarantines):
+            with self.assertRaisesRegex(apple.Refusal, "interrupted"):
+                self.run_plan(plan)
         self.assertFalse(Path(plan["paths"]["products"]).exists())
 
     def test_unmarked_state_and_symlinks_are_not_adopted(self):

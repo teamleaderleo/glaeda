@@ -363,6 +363,8 @@ def source_snapshot(plan):
 def execute(plan, prepare_again=prepare):
     inspect(plan)
     with store(plan, create=True) as state, lock(state):
+        # A previous owner can quarantine this generation between the first probe and lock.
+        inspect(plan)
         try:
             read_json(state, "inflight.json")
         except FileNotFoundError:
