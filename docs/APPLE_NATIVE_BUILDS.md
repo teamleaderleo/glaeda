@@ -89,6 +89,46 @@ build subprocesses finish and must not detach build work into another session.
 
 ## Cache validity and concurrency
 
+### Editing, pulling, and warm latency
+
+Finish an active build before editing or pulling, then run `glaeda-apple warm`
+again. A normal source edit or fast-forward pull keeps the cache location; the
+native build system checks what needs rebuilding. Dependency changes still go
+through SwiftPM/Xcode resolution. Warm never means returning an old success
+without running the build.
+
+A changed profile, direct build helper, Xcode/Swift/SDK, or generation label
+selects a new cache. Moving or replacing the physical checkout requires explicit
+ownership reconciliation; copying `.glaeda` into another checkout is not cache
+adoption. An interrupted build requires the recovery procedure below.
+
+The build lock coordinates Glaeda builds, not editors or Git. Before/after source
+observations do not prove that a build saw one consistent revision, especially
+for dirty files. If a pull or edit overlaps a build, run another build after it
+settles before relying on the result.
+
+Glaeda owns cache placement, toolchain identity, admission, recovery and timing.
+Projects own their dependency graph, incremental compiler settings, bundle
+assembly, signing and launch behavior. Keep those in their existing helpers;
+sharing an Xcode build directory between unrelated projects is not an
+optimization.
+
+On one arm64 Mac (24 GiB, macOS 26.6.2), sequential September 12, 2026 trials
+measured an Idlesse fresh build at 50.0 seconds and unchanged warm builds at a
+2.4-second median. A shared Swift source edit took 19.9 seconds. The paired
+controller overhead was approximately 0.42 seconds. The older cmux fork's three
+warm runs had a 31.9-second median; an extra resource-measured run took 46.6
+seconds. These are local observations, not guarantees or current-upstream cmux
+results. OS caches and background activity were not controlled.
+
+Optimize in measured order: inspect native build timing and always-run script
+phases; avoid repeated setup/network work on the build path; improve incremental
+extension compilation and bundle copying; then reduce controller probe overhead.
+Benchmark unchanged, implementation edit, shared-interface edit, dependency
+update and toolchain reset separately. Keep signing and dependency validation
+correct. A resident process may reduce launch latency, but it needs a separate
+lifecycle contract and is not implemented by this build helper.
+
 Each generation binds the physical checkout's path/device/inode, full profile,
 selected developer directory, Xcode build, Swift version, requested SDK path/build,
 host architecture, generation label, and direct helper content digest. Source
