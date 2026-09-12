@@ -124,6 +124,19 @@ def expand(value, paths):
         raise Refusal("unknown cache placeholder") from error
 
 
+def swift_driver(toolchain):
+    # Apple's swift symlink selects driver mode through argv[0]. Toolchain
+    # identity resolves it to swift-frontend, which must not be invoked directly
+    # for SwiftPM commands. Preserve identity while restoring the driver name.
+    binary = Path(toolchain["swift"])
+    if binary.name == "swift-frontend":
+        driver = binary.with_name("swift")
+        if driver.resolve(strict=True) != binary:
+            raise Refusal("Swift driver no longer matches the observed toolchain")
+        return str(driver)
+    return str(binary)
+
+
 def command_for(project, profile, toolchain, paths):
     kind = profile["engine"]
     if kind == "script":
@@ -143,7 +156,7 @@ def command_for(project, profile, toolchain, paths):
         config = profile.get("configuration", "debug")
         if config not in ("debug", "release"):
             raise Refusal("invalid SwiftPM configuration")
-        argv = [toolchain["swift"], action, "--package-path", str(package), "--scratch-path", paths["scratch"],
+        argv = [swift_driver(toolchain), action, "--package-path", str(package), "--scratch-path", paths["scratch"],
                 "--cache-path", paths["source_packages"], "--sdk", toolchain["sdk"], "--configuration", config]
         for key, option in (("product", "--product"), ("triple", "--triple")):
             if key in profile:
@@ -190,7 +203,7 @@ def dependency_command(project, name, tools, paths):
     if kind == "swiftpm" and set(recipe) <= {"engine", "package"}:
         package = project_file(project, recipe["package"]) if "package" in recipe else project
         project_file(project, str((package / "Package.swift").relative_to(project)))
-        argv = [tools["swift"], "package", "--package-path", str(package), "--scratch-path", paths["scratch"],
+        argv = [swift_driver(tools), "package", "--package-path", str(package), "--scratch-path", paths["scratch"],
                 "--cache-path", paths["source_packages"], "resolve"]
     elif kind == "xcode" and set(recipe) <= {"engine", "project", "workspace", "scheme"}:
         containers = [key for key in ("project", "workspace") if key in recipe]

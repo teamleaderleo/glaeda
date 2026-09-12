@@ -79,6 +79,17 @@ class AppleBuildTests(unittest.TestCase):
             apple.write_json(state, "last-run.json", receipt)
         self.assertEqual(apple.explain(plan)["last_build_timings_seconds"], {})
 
+    def test_swift_driver_keeps_dispatch_name_and_checks_toolchain_identity(self):
+        frontend = self.root / "swift-frontend"
+        frontend.write_text("fixture")
+        driver = self.root / "swift"
+        driver.symlink_to(frontend)
+        self.assertEqual(apple.swift_driver({"swift": str(frontend)}), str(driver))
+        driver.unlink()
+        driver.symlink_to(self.script)
+        with self.assertRaisesRegex(apple.Refusal, "no longer matches"):
+            apple.swift_driver({"swift": str(frontend)})
+
     def test_dependencies_reuse_paths_and_keep_build_receipt_separate(self):
         build_plan = self.plan()
         build = self.run_plan(build_plan)
