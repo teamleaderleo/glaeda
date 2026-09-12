@@ -546,13 +546,24 @@ def execute(plan, prepare_again=prepare, reuse_dependencies=False):
                 "completion_observation": round(time.monotonic() - native_finished, 6),
             }
             receipt_name = "last-dependencies.json" if plan.get("operation") == "dependencies" else "last-run.json"
-            if plan.get("operation") == "dependencies":
-                after = prepare_again(plan["project"], plan["profile"], plan["generation"], operation="dependencies")
-                after_state = after.get("dependency_state")
-                if (after["key"] == plan["key"] and after.get("operation_identity") == plan["operation_identity"]
-                        and dependency_state and after_state and dependency_state["inputs"] == after_state["inputs"]):
-                    receipt["dependency_state"] = after_state
-                    receipt["preparation_identity"] = plan["operation_identity"]
+            if plan.get("operation") == "dependencies" and dependency_state:
+                receipt["preparation_status"] = "observation_unavailable"
+                try:
+                    after = prepare_again(plan["project"], plan["profile"], plan["generation"], operation="dependencies")
+                    after_state = after.get("dependency_state")
+                    if (after["key"] == plan["key"] and after.get("operation_identity") == plan["operation_identity"]
+                            and after_state and dependency_state["inputs"] == after_state["inputs"]):
+                        receipt["dependency_state"] = after_state
+                        receipt["preparation_identity"] = plan["operation_identity"]
+                        receipt["preparation_status"] = "declared_files_observed" if after_state["outputs"] else "required_files_missing"
+                    else:
+                        receipt["preparation_status"] = "inputs_changed"
+                except (Refusal, OSError, ValueError, KeyError, TypeError, AttributeError, subprocess.SubprocessError):
+                    # The child is gone. A changed/deleted manifest means a miss,
+                    # not a live or interrupted build requiring recovery.
+                    pass
+                if code == 0 and receipt["preparation_status"] != "declared_files_observed":
+                    receipt["exit_code"] = 1
             write_json(state, receipt_name, receipt)
             if code < 0:
                 write_json(state, "quarantine-" + plan["key"] + ".json", receipt)

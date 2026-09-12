@@ -110,6 +110,16 @@ class AppleBuildTests(unittest.TestCase):
         with apple.store(plan()) as state, apple.lock(state):
             with self.assertRaises(apple.Refusal):
                 run()
+        # A resolver can finish while inputs disappear. Complete without reuse
+        # evidence, rather than retaining an inflight marker for a dead child.
+        self.script.write_text(self.script.read_text() + '\nrm -f Package.swift\n')
+        changed = plan()
+        receipt = apple.execute(changed, prepare_again)
+        self.assertEqual(receipt["state"], "completed")
+        self.assertEqual(receipt["exit_code"], 1)
+        self.assertEqual(receipt["preparation_status"], "observation_unavailable")
+        self.assertNotIn("dependency_state", receipt)
+        self.assertFalse((self.root / ".glaeda/apple-build/inflight.json").exists())
 
     def test_swift_driver_keeps_dispatch_name_and_checks_toolchain_identity(self):
         frontend = self.root / "swift-frontend"
