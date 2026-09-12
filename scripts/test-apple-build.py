@@ -52,6 +52,71 @@ class AppleBuildTests(unittest.TestCase):
         self.assertEqual(plan["key"], self.plan()["key"])
         self.assertNotEqual(plan["key"], self.plan("cold-reset")["key"])
 
+    def native_policy(self):
+        path = self.root / "glaeda.apple.json"
+        config = json.loads(path.read_text())
+        config["cache_policies"] = {"app": "native"}
+        path.write_text(json.dumps(config))
+
+    def test_native_lineage_retains_existing_cache_and_executes_changed_recipe(self):
+        original = self.plan()
+        self.run_plan(original)
+        self.native_policy()
+        plan = self.plan()
+        self.assertEqual(original["key"], plan["key"])
+        self.assertFalse(list((self.root / ".glaeda/apple-build").glob("lineage-*")))
+        self.run_plan(plan)
+        self.script.write_text(self.script.read_text().replace("printf ok", "printf changed"))
+        changed = self.plan()
+        self.assertEqual(plan["key"], changed["key"])
+        self.assertNotEqual(plan["invocation_identity"], changed["invocation_identity"])
+        receipt = self.run_plan(changed)
+        self.assertEqual(receipt["exit_code"], 0)
+        self.assertEqual((Path(changed["paths"]["products"]) / "result").read_text(), "changed")
+        self.assertNotEqual(changed["key"], self.plan("cold-reset")["key"])
+        self.tools["sdk_build"] = "new-sdk"
+        self.assertNotEqual(changed["key"], self.plan()["key"])
+
+    def test_native_lineage_refuses_recipe_race_and_quarantine(self):
+        self.native_policy()
+        plan = self.plan()
+        self.run_plan(plan)
+        self.script.write_text(self.script.read_text() + "# new helper\n")
+        with self.assertRaisesRegex(apple.Refusal, "changed during admission"):
+            self.run_plan(plan)
+        fresh = self.plan()
+        with apple.store(fresh) as state:
+            apple.write_json(state, "quarantine-" + fresh["key"] + ".json", {})
+        with self.assertRaisesRegex(apple.Refusal, "interrupted"):
+            self.run_plan(fresh)
+
+    def test_native_lineage_rejects_corruption_and_cross_lineage_binding(self):
+        self.native_policy()
+        plan = self.plan()
+        self.run_plan(plan)
+        name = "lineage-" + plan["lineage"]["lineage"] + ".json"
+        for bad in ({**plan["lineage"], "cache_key": "../foreign"},
+                    {**plan["lineage"], "lineage": "0" * 64}):
+            with apple.store(plan) as state:
+                apple.write_json(state, name, bad)
+            with self.assertRaisesRegex(apple.Refusal, "lineage identity"):
+                self.plan()
+
+    def test_swift_incremental_options_are_explicit_and_typed(self):
+        (self.root / "Package.swift").write_text("// fixture\n")
+        self.profile = {"engine": "swiftpm", "incremental_file_hashing": True, "incremental_diagnostics": True}
+        self.write_config()
+        argv = self.plan()["argv"]
+        self.assertIn("-enable-incremental-file-hashing", argv)
+        self.assertIn("-driver-show-incremental", argv)
+        self.profile["incremental_file_hashing"] = False
+        self.write_config()
+        self.assertIn("-disable-incremental-file-hashing", self.plan()["argv"])
+        self.profile["incremental_file_hashing"] = "yes"
+        self.write_config()
+        with self.assertRaisesRegex(apple.Refusal, "must be a boolean"):
+            self.plan()
+
     def test_explanation_is_read_only_and_tracks_source_without_skipping_work(self):
         plan = self.plan()
         self.assertEqual(apple.explain(plan)["explanation"]["source_observation"], "no_comparable_build")

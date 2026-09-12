@@ -30,6 +30,8 @@ XCODE_SETTINGS = {
     "IPHONEOS_DEPLOYMENT_TARGET", "TVOS_DEPLOYMENT_TARGET", "WATCHOS_DEPLOYMENT_TARGET", "XROS_DEPLOYMENT_TARGET",
     "SWIFT_VERSION", "SWIFT_OPTIMIZATION_LEVEL", "GCC_OPTIMIZATION_LEVEL", "ENABLE_TESTABILITY",
     "SWIFT_ACTIVE_COMPILATION_CONDITIONS", "DEBUG_INFORMATION_FORMAT",
+    "COMPILATION_CACHE_ENABLE_CACHING", "COMPILATION_CACHE_ENABLE_DIAGNOSTIC_REMARKS",
+    "COMPILATION_CACHE_LIMIT_SIZE",
 }
 
 
@@ -99,7 +101,7 @@ def configuration(project, name):
     path = project_file(project, "glaeda.apple.json")
     with path.open("rb") as stream:
         config = bounded_json(stream.read(LIMIT + 1))
-    if not isinstance(config, dict) or not {"schema_version", "profiles"} <= set(config) or set(config) - {"schema_version", "profiles", "preparations", "checks"} or config["schema_version"] != 1:
+    if not isinstance(config, dict) or not {"schema_version", "profiles"} <= set(config) or set(config) - {"schema_version", "profiles", "preparations", "checks", "cache_policies"} or config["schema_version"] != 1:
         raise Refusal("expected Apple build configuration schema 1")
     profiles = config["profiles"]
     if not isinstance(profiles, dict) or name not in profiles or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", name):
@@ -107,13 +109,39 @@ def configuration(project, name):
     profile = profiles[name]
     common = {"engine", "environment", "sdk"}
     allowed = {
-        "swiftpm": common | {"configuration", "product", "action", "triple", "jobs", "package"},
+        "swiftpm": common | {"configuration", "product", "action", "triple", "jobs", "package", "incremental_file_hashing", "incremental_diagnostics"},
         "xcode": common | {"project", "workspace", "scheme", "configuration", "destination", "settings", "action"},
         "script": common | {"executable", "arguments"},
     }
     if not isinstance(profile, dict) or profile.get("engine") not in allowed or set(profile) - allowed[profile["engine"]]:
         raise Refusal("unknown engine or profile fields")
     return profile
+
+
+def cache_lineage(project, name, owner, tools, engine, generation, initial_key):
+    with project_file(project, "glaeda.apple.json").open("rb") as stream:
+        policies = bounded_json(stream.read(LIMIT + 1)).get("cache_policies", {})
+    if not isinstance(policies, dict) or len(policies) > 64 or any(
+            not isinstance(key, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", key)
+            or value not in ("recipe", "native") for key, value in policies.items()):
+        raise Refusal("cache policies must map profiles to recipe or native")
+    if policies.get(name, "recipe") == "recipe":
+        return initial_key, None
+    # Native tools own input invalidation. This opt-in changes storage lifetime,
+    # never command/result reuse. The first binding retains the existing cache.
+    identity = digest([owner, name, tools, engine, generation])
+    binding = {"schema_version": 1, "lineage": identity, "cache_key": initial_key}
+    try:
+        with store({"project": project, "owner": owner}) as state:
+            binding = read_json(state, "lineage-" + identity + ".json")
+    except FileNotFoundError:
+        pass
+    if (not isinstance(binding, dict) or set(binding) != {"schema_version", "lineage", "cache_key"}
+            or binding["schema_version"] != 1 or binding["lineage"] != identity
+            or not isinstance(binding["cache_key"], str)
+            or not re.fullmatch(r"[0-9a-f]{64}", binding["cache_key"])):
+        raise Refusal("native cache lineage identity mismatch")
+    return binding["cache_key"], binding
 
 
 def expand(value, paths):
@@ -169,6 +197,14 @@ def command_for(project, profile, toolchain, paths):
             if type(jobs) is not int or not 1 <= jobs <= 64:
                 raise Refusal("jobs must be an integer between 1 and 64")
             argv.extend(["--jobs", str(jobs)])
+        for key in ("incremental_file_hashing", "incremental_diagnostics"):
+            if key in profile and type(profile[key]) is not bool:
+                raise Refusal(key + " must be a boolean")
+        if "incremental_file_hashing" in profile:
+            flag = "-enable-incremental-file-hashing" if profile["incremental_file_hashing"] else "-disable-incremental-file-hashing"
+            argv.extend(["-Xswiftc", flag])
+        if profile.get("incremental_diagnostics"):
+            argv.extend(["-Xswiftc", "-driver-show-incremental", "-Xswiftc", "-driver-show-job-lifecycle"])
         return argv
     containers = [key for key in ("project", "workspace") if key in profile]
     if len(containers) != 1:
@@ -300,6 +336,8 @@ def prepare(project, name, generation="default", toolchain_probe=apple_toolchain
         recipe_path = project_file(project, profile.get("executable"))
         recipe = hashlib.sha256(recipe_path.read_bytes()).hexdigest()
     key = digest([owner, profile, tools, generation, recipe])
+    invocation_identity = key
+    key, lineage = cache_lineage(project, name, owner, tools, profile["engine"], generation, key)
     cache = project / ".glaeda/apple-build/cache" / key
     paths = {name: str(cache / name) for name in CACHE_NAMES}
     argv = command_for(project, profile, tools, paths)
@@ -322,7 +360,8 @@ def prepare(project, name, generation="default", toolchain_probe=apple_toolchain
     environment["CLANG_MODULE_CACHE_PATH"] = paths["module_cache"]
     return {"project": project, "profile": name, "owner": owner, "key": key, "paths": paths,
             "argv": argv, "environment": environment, "engine": profile["engine"], "generation": generation,
-            "operation": operation, "operation_identity": operation_identity, "dependency_state": dependency_state}
+            "operation": operation, "operation_identity": operation_identity, "dependency_state": dependency_state,
+            "invocation_identity": invocation_identity, "lineage": lineage}
 
 
 def directory(parent, name, create=False):
@@ -433,7 +472,7 @@ def inspect(plan):
     return {"schema_version": 1, "authority": "developer_observation_only", "profile": plan["profile"],
             "engine": plan["engine"], "cache_key": plan["key"], "generation": plan["generation"],
             "state": status, "active_run": active, "isolation": "trusted_native_host", "result_reuse": False,
-            "operation": plan.get("operation", "build")}
+            "operation": plan.get("operation", "build"), "invocation_identity": plan.get("invocation_identity")}
 
 
 @contextlib.contextmanager
@@ -488,7 +527,9 @@ def execute(plan, prepare_again=prepare, reuse_dependencies=False):
         # Repeat admission after acquiring the project lock, before creating reusable state.
         options = {"operation": plan["operation"]} if plan.get("operation", "build") != "build" else {}
         fresh = prepare_again(plan["project"], plan["profile"], plan["generation"], **options)
-        if fresh["key"] != plan["key"] or fresh.get("operation_identity") != plan.get("operation_identity"):
+        if (fresh["key"] != plan["key"] or fresh.get("operation_identity") != plan.get("operation_identity")
+                or fresh.get("invocation_identity") != plan.get("invocation_identity")
+                or fresh.get("lineage") != plan.get("lineage")):
             raise Refusal("build configuration or toolchain changed during admission")
         dependency_state = fresh.get("dependency_state")
         if reuse_dependencies and plan.get("operation") == "dependencies" and dependency_state and dependency_state["outputs"]:
@@ -498,6 +539,7 @@ def execute(plan, prepare_again=prepare, reuse_dependencies=False):
                 previous = {}
             if (isinstance(previous, dict) and previous.get("exit_code") == 0
                     and previous.get("cache_key") == plan["key"]
+                    and previous.get("invocation_identity") == plan.get("invocation_identity")
                     and previous.get("preparation_identity") == plan["operation_identity"]
                     and previous.get("dependency_state") == dependency_state):
                 return {**inspect(plan), "state": "preparation_reused", "exit_code": 0,
@@ -519,6 +561,8 @@ def execute(plan, prepare_again=prepare, reuse_dependencies=False):
                 os.close(cache)
         finally:
             os.close(caches)
+        if plan.get("lineage"):
+            write_json(state, "lineage-" + plan["lineage"]["lineage"] + ".json", plan["lineage"])
         run_id = uuid.uuid4().hex
         source_before = source_snapshot(plan)
         active = {"schema_version": 1, "run_id": run_id, "cache_key": plan["key"], "pgid": None,
@@ -642,7 +686,9 @@ def explain(plan):
         "cache_observation": "matching_generation_exists" if result["state"] == "prepared" else result["state"],
         "source_edits": "retain_paths_native_build_validates_inputs",
         "dependency_changes": "retain_paths_native_package_manager_resolves_inputs",
-        "generation_inputs": ["physical_checkout", "profile", "toolchain_sdk_architecture", "direct_build_helper", "generation_label"],
+        "generation_inputs": (["physical_checkout", "profile_name", "engine", "toolchain_sdk_architecture", "generation_label"]
+                              if plan.get("lineage") else ["physical_checkout", "profile", "toolchain_sdk_architecture", "direct_build_helper", "generation_label"]),
+        "cache_policy": "native" if plan.get("lineage") else "recipe",
         "next_action": "resolve_active_state" if result["active_run"] else "run_native_build",
         "native_phases": "package_resolution_compilation_packaging_not_separately_instrumented",
     }

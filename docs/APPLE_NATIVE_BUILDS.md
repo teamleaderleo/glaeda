@@ -244,7 +244,7 @@ source snapshots report commit and cleanliness before/after; they are not an
 atomic source transaction or a complete identity for a dirty checkout.
 
 DerivedData, source packages, SwiftPM scratch, module cache, products, and extension
-state live under `.glaeda/apple-build/cache/<key>/`. New settings/toolchains get
+state live under `.glaeda/apple-build/cache/<key>/`. By default, new settings/toolchains get
 separate cold generations. Existing unmarked directories and symlinks are not
 adopted. Previously unmanaged `.build` and DerivedData are left intact.
 
@@ -252,6 +252,63 @@ A nonblocking project lock serializes Glaeda Apple commands across every profile
 and generation, including project helpers that write shared app bundles. Other
 build entrypoints do not participate in this lock: coordinate them explicitly.
 This is cooperative single-user development, not hostile-workload isolation.
+
+## Native cache lifetime across pulls and recipe changes
+
+Projects whose builder validates all source, dependency, and compiler inputs can
+explicitly opt into native cache lifetime:
+
+```json
+"cache_policies": {"app": "native"}
+```
+
+The first executed operation binds the existing recipe cache to the physical
+checkout, profile name, engine, toolchain/SDK/architecture, and generation label.
+This binding is private, atomic, and written under the project lock. Planning
+does not create it. Bind the policy before editing a recipe to retain its current
+cache; otherwise the first operation binds the new recipe's cache.
+
+Later settings, helper, and profile changes keep these paths. Their exact current
+invocation identity is checked again under the lock; the native build still runs
+every time. Dependency readiness also binds that invocation identity. This does
+not restore an old successful result or certify arbitrary script outputs. Script
+profiles should opt in only when their helpers invoke a native builder that owns
+input invalidation. Keep the default `recipe` policy for helpers needing clean
+outputs after recipe changes.
+
+Toolchain, engine, physical checkout, or generation-label changes start a new
+lineage. Quarantine still refuses reuse. `--generation diagnostic-1` remains the
+cold fallback; no cache is copied, shared across projects, or deleted. Changing
+back to `recipe` uses the current recipe's original cache calculation.
+
+## Compiler experiments and repeatable measurements
+
+SwiftPM profiles accept optional Boolean `incremental_file_hashing` and
+`incremental_diagnostics` fields. The former explicitly enables or disables
+Swift's file-content hashing; omission preserves the compiler default. Diagnostics
+report the native driver's scheduling decisions. Unsupported toolchains fail
+through the compiler rather than silently ignoring the option.
+
+Xcode profiles accept `COMPILATION_CACHE_ENABLE_CACHING`,
+`COMPILATION_CACHE_ENABLE_DIAGNOSTIC_REMARKS`, and
+`COMPILATION_CACHE_LIMIT_SIZE` in their settings. These are opt-in native settings;
+Glaeda does not implement a second compiler cache or share writable compiler
+state across projects. First enabling an option may require substantial warming.
+
+Run the physical, local-only benchmark on a Mac:
+
+```sh
+python3 scripts/benchmark-apple-incremental.py --output /path/to/new-private-report
+```
+
+It creates its own fixture under `target`, compares hashing off/on, and exercises
+unchanged builds, timestamp-only changes, implementation edits, reverts, branch
+returns, public API changes, a real fast-forward Git pull, and a real local Git
+dependency-version update. Every resulting executable must return the expected
+value. The fixture and builds are removed; private logs, timing summaries, and
+toolchain metadata remain in the specified new report directory. These small
+fixture timings are not application latency claims. Application benchmarks must
+also account for linking, build scripts, signing, and packaging.
 
 ## Failure, recovery, and cold rebuilding
 
