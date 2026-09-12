@@ -361,8 +361,11 @@ def source_snapshot(plan):
 
 
 def execute(plan, prepare_again=prepare):
+    entered = time.monotonic()
     inspect(plan)
+    waiting = time.monotonic()
     with store(plan, create=True) as state, lock(state):
+        admitted = time.monotonic()
         # A previous owner can quarantine this generation between the first probe and lock.
         inspect(plan)
         try:
@@ -413,6 +416,7 @@ def execute(plan, prepare_again=prepare):
             for signum in (signal.SIGINT, signal.SIGTERM):
                 handlers[signum] = signal.signal(signum, forward)
             code = child.wait()
+            native_finished = time.monotonic()
             deadline = time.monotonic() + 2
             while not group_absent(child.pid) and time.monotonic() < deadline:
                 time.sleep(0.05)
@@ -424,6 +428,13 @@ def execute(plan, prepare_again=prepare):
                        "exit_code": code if code >= 0 else 128 - code, "signal": -code if code < 0 else None,
                        "elapsed_seconds": round(time.monotonic() - started, 6), "validation": "native_command_ran",
                        "source_before": source_before, "source_after": source_snapshot(plan)}
+            receipt["timings_seconds"] = {
+                "initial_observation": round(waiting - entered, 6),
+                "store_and_lock": round(admitted - waiting, 6),
+                "admission_and_preparation": round(started - admitted, 6),
+                "native_command": round(native_finished - started, 6),
+                "completion_observation": round(time.monotonic() - native_finished, 6),
+            }
             write_json(state, "last-run.json", receipt)
             if code < 0:
                 write_json(state, "quarantine-" + plan["key"] + ".json", receipt)
@@ -458,9 +469,48 @@ def recover(plan, run_id):
         return receipt
 
 
+def explain(plan):
+    """Read-only advice; never used to admit work or skip the native command."""
+    result = inspect(plan)
+    current = source_snapshot(plan)
+    previous = None
+    try:
+        with store(plan) as state:
+            previous = read_json(state, "last-run.json")
+    except FileNotFoundError:
+        pass
+    comparable = isinstance(previous, dict) and previous.get("cache_key") == plan["key"]
+    before = previous.get("source_after") if comparable else None
+    if not isinstance(before, dict):
+        change = "no_comparable_build"
+    elif before.get("commit") != current["commit"]:
+        change = "commit_changed"
+    elif not before.get("clean") or not current["clean"]:
+        change = "working_tree_requires_native_validation"
+    else:
+        change = "same_clean_commit"
+    result["explanation"] = {
+        "source_observation": change,
+        "cache_observation": "matching_generation_exists" if result["state"] == "prepared" else result["state"],
+        "source_edits": "retain_paths_native_build_validates_inputs",
+        "dependency_changes": "retain_paths_native_package_manager_resolves_inputs",
+        "generation_inputs": ["physical_checkout", "profile", "toolchain_sdk_architecture", "direct_build_helper", "generation_label"],
+        "next_action": "resolve_active_state" if result["active_run"] else "run_native_build",
+        "native_phases": "package_resolution_compilation_packaging_not_separately_instrumented",
+    }
+    if comparable:
+        timings = previous.get("timings_seconds", {})
+        names = ("initial_observation", "store_and_lock", "admission_and_preparation", "native_command", "completion_observation")
+        result["last_build_timings_seconds"] = {
+            name: timings[name] for name in names
+            if isinstance(timings, dict) and type(timings.get(name)) in (int, float) and 0 <= timings[name] <= 1e9
+        }
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description="Prepare and run trusted native Apple builds with persistent project caches")
-    parser.add_argument("action", choices=("plan", "run", "warm", "recover"))
+    parser.add_argument("action", choices=("plan", "explain", "run", "warm", "recover"))
     parser.add_argument("--project", type=Path, default=Path.cwd())
     parser.add_argument("--profile", default="app")
     parser.add_argument("--generation", default="default", help="stable label; use a new label for a cold rebuild without deleting old caches")
@@ -469,8 +519,11 @@ def main():
     try:
         if (args.action == "recover") != bool(args.run_id):
             raise Refusal("--run-id is required only for recover")
+        preparing = time.monotonic()
         plan = prepare(args.project, args.profile, args.generation)
-        result = inspect(plan) if args.action == "plan" else recover(plan, args.run_id) if args.action == "recover" else execute(plan)
+        preparation_seconds = round(time.monotonic() - preparing, 6)
+        result = explain(plan) if args.action == "explain" else inspect(plan) if args.action == "plan" else recover(plan, args.run_id) if args.action == "recover" else execute(plan)
+        result["toolchain_and_profile_probe_seconds"] = preparation_seconds
         print(json.dumps(result, sort_keys=True))
         return result.get("exit_code", 0)
     except (Refusal, OSError, ValueError, KeyError, TypeError, AttributeError, subprocess.SubprocessError) as error:

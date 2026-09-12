@@ -52,6 +52,33 @@ class AppleBuildTests(unittest.TestCase):
         self.assertEqual(plan["key"], self.plan()["key"])
         self.assertNotEqual(plan["key"], self.plan("cold-reset")["key"])
 
+    def test_explanation_is_read_only_and_tracks_source_without_skipping_work(self):
+        plan = self.plan()
+        self.assertEqual(apple.explain(plan)["explanation"]["source_observation"], "no_comparable_build")
+        self.assertFalse((self.root / ".glaeda").exists())
+        receipt = self.run_plan(plan)
+        self.assertTrue(all(value >= 0 for value in receipt["timings_seconds"].values()))
+        advice = apple.explain(plan)
+        self.assertEqual(advice["last_build_timings_seconds"], receipt["timings_seconds"])
+        self.assertEqual(advice["explanation"]["source_observation"], "working_tree_requires_native_validation")
+        self.assertFalse(advice["result_reuse"])
+        (self.root / "Feature.swift").write_text("// edited\n")
+        self.assertEqual(self.plan()["key"], plan["key"])
+        self.assertEqual(apple.explain(self.plan())["explanation"]["next_action"], "run_native_build")
+        subprocess.run(["/usr/bin/git", "-C", str(self.root), "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                        "commit", "--quiet", "--allow-empty", "-m", "new revision"], check=True)
+        self.assertEqual(apple.explain(self.plan())["explanation"]["source_observation"], "commit_changed")
+        self.assertEqual(apple.explain(self.plan("new"))["explanation"]["source_observation"], "no_comparable_build")
+
+    def test_explanation_filters_untrusted_timing_fields(self):
+        plan = self.plan()
+        self.run_plan(plan)
+        with apple.store(plan) as state:
+            receipt = apple.read_json(state, "last-run.json")
+            receipt["timings_seconds"] = {"native_command": "private path", "store_and_lock": -1, "unexpected": "secret"}
+            apple.write_json(state, "last-run.json", receipt)
+        self.assertEqual(apple.explain(plan)["last_build_timings_seconds"], {})
+
     def test_settings_sdk_toolchain_and_recipe_separate_generations(self):
         key = self.plan()["key"]
         self.tools["sdk_build"] = "test2"

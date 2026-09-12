@@ -10,6 +10,7 @@ From a configured project:
 
 ```sh
 /path/to/glaeda/scripts/apple-build plan
+/path/to/glaeda/scripts/apple-build explain
 /path/to/glaeda/scripts/apple-build warm
 /path/to/glaeda/scripts/apple-build run --profile app
 ```
@@ -20,6 +21,27 @@ checkout and selected Apple toolchain and creates no project state. JSON receipt
 contain opaque cache identities and no project paths or raw build output. Private
 logs are `.glaeda/apple-build/run-<run-id>.log`; the most recent receipt is
 `.glaeda/apple-build/last-run.json`.
+
+`explain` is also read-only. It compares the current checkout with the last build
+in the same cache generation, distinguishes a changed commit from an uncommitted
+working tree, and reports the last build's measured phases when available. It
+does not treat two dirty working trees as identical. A matching generation means
+the owned cache directory exists, not that all dependencies or outputs are ready.
+Source edits and dependency lockfile changes retain cache paths; the compiler and
+package manager validate the changed inputs. Toolchain, SDK, profile, direct build
+helper, checkout identity, or generation-label changes select another generation.
+No explanation grants result reuse or bypasses active/quarantined state checks.
+
+New build receipts include `timings_seconds`: initial observation, store/lock
+acquisition, admission/preparation, native command, and completion observation.
+The native interval includes spawning and recording the child. These are elapsed
+wall times, not CPU times; store/lock includes filesystem work and contention.
+CLI output additionally reports `toolchain_and_profile_probe_seconds` for the
+initial probe (outside the durable build receipt). Final receipt publication and
+printing are not included. Legacy receipts remain readable without timing fields.
+Package resolution, compilation, bundling, and signing inside a project helper
+are not yet separately instrumented. Use these measurements to establish whether
+the next improvement belongs in Glaeda admission or the native workflow.
 
 ## Profile format
 
