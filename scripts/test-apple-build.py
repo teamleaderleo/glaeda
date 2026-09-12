@@ -139,10 +139,11 @@ class AppleBuildTests(unittest.TestCase):
         self.script.write_text("#!/bin/sh\ncat <<'EOF'\nBuild Timing Summary\nSwiftCompile (2 tasks) | 99 seconds\n"
                                "Build Timing Summary\nSwiftEmitModule (1 task) | 12.853 seconds\n"
                                "PrivateSourceName (1 task) | 5 seconds\nLd (9999999 tasks) | 2 seconds\n"
-                               "SwiftCompile (1 task) | -2 seconds\nnote: 2 hits / 2 cacheable tasks (100%)\nEOF\n")
+                               "SwiftCompile (1 task) | -2 seconds\nnote: 2 hits / 2 cacheable tasks (100%)\n"
+                               "note: 1 hit / 3 cacheable tasks (33%)\nEOF\n")
         result = self.run_plan(self.plan())["native_work"]
         self.assertEqual(result["last_reported_task_timings"], {"SwiftEmitModule": {"tasks": 1, "seconds": 12.853}})
-        self.assertEqual(result["last_reported_compilation_cache"], {"hits": 2, "cacheable_tasks": 2})
+        self.assertEqual(result["last_reported_compilation_cache"], {"hits": 1, "cacheable_tasks": 3})
         self.assertEqual(result["timing_summaries"], 2)
         self.assertTrue(result["task_times_may_overlap"])
         self.assertNotIn("PrivateSourceName", json.dumps(result))

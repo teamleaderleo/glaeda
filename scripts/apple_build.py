@@ -542,7 +542,7 @@ def native_work_summary(state, run_id):
                 count, seconds = int(timing[2]), float(timing[3])
                 if count <= 1000000 and seconds <= 1e9:
                     phases[timing[1]] = {"tasks": count, "seconds": seconds}
-            hits = re.fullmatch(r"note: ([0-9]+) hits / ([0-9]+) cacheable tasks \([0-9]+%\)", text)
+            hits = re.fullmatch(r"note: ([0-9]+) hits? / ([0-9]+) cacheable tasks \([0-9]+%\)", text)
             if hits and 0 <= int(hits[1]) <= int(hits[2]) <= 1000000:
                 cache = {"hits": int(hits[1]), "cacheable_tasks": int(hits[2])}
         result = {"state": "reported" if phases or cache else "not_reported",
