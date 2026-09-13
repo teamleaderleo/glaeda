@@ -3,6 +3,9 @@
 //! This module does not download, provision, inspect, or mutate a VM. It gives the future template
 //! builder and live mutation boundary one closed identity that changes whenever the admitted guest
 //! image, official Actions runner archive, provisioning recipe, or isolation policy changes.
+//!
+//! Schema 4 is the Glaeda generation used for every new prepared template. Schema 3 is retained as
+//! an exact SmolRunner interpretation surface for old local-template inspection and retirement.
 
 use std::fmt;
 
@@ -11,16 +14,47 @@ use sha2::{Digest, Sha256};
 
 use crate::artifact::Sha256Digest;
 
-pub const DISPOSABLE_PREPARED_TEMPLATE_SCHEMA_VERSION: u8 = 3;
+pub const DISPOSABLE_PREPARED_TEMPLATE_SCHEMA_VERSION: u8 = 4;
+pub const LEGACY_SMOLRUNNER_PREPARED_TEMPLATE_SCHEMA_VERSION: u8 = 3;
 pub const MAX_DISPOSABLE_PREPARED_TEMPLATE_BYTES: usize = 16_384;
 pub const MAX_DISPOSABLE_LIMA_TEMPLATE_BYTES: usize = 64 * 1_024;
-const IDENTITY_DOMAIN: &[u8] = b"smolrunner.disposable-prepared-template.v3\0";
+const CURRENT_IDENTITY_DOMAIN: &[u8] = b"glaeda.disposable-prepared-template.v4\0";
+const LEGACY_SMOLRUNNER_IDENTITY_DOMAIN: &[u8] = b"smolrunner.disposable-prepared-template.v3\0";
 const CURRENT_MANIFEST_BYTES: &[u8] =
     include_bytes!("../examples/lima/glaeda-prepared-template.json");
 const CURRENT_LIMA_TEMPLATE_BYTES: &[u8] =
     include_bytes!("../examples/lima/glaeda-prepared-template.yaml");
+const LEGACY_SMOLRUNNER_MANIFEST_BYTES: &[u8] =
+    include_bytes!("../examples/lima/smolrunner-prepared-template.json");
+const LEGACY_SMOLRUNNER_LIMA_TEMPLATE_BYTES: &[u8] =
+    include_bytes!("../examples/lima/smolrunner-prepared-template.yaml");
 const MAX_DOWNLOAD_LOCATION_BYTES: usize = 512;
 const MAX_RUNNER_ARCHIVE_BYTES: u64 = 1 << 30;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreparedTemplateGeneration {
+    LegacySmolRunnerV3,
+    GlaedaV4,
+}
+
+impl PreparedTemplateGeneration {
+    fn from_schema_version(
+        schema_version: u8,
+    ) -> Result<Self, DisposablePreparedTemplateError> {
+        match schema_version {
+            LEGACY_SMOLRUNNER_PREPARED_TEMPLATE_SCHEMA_VERSION => Ok(Self::LegacySmolRunnerV3),
+            DISPOSABLE_PREPARED_TEMPLATE_SCHEMA_VERSION => Ok(Self::GlaedaV4),
+            _ => Err(version_incompatible()),
+        }
+    }
+
+    const fn identity_domain(self) -> &'static [u8] {
+        match self {
+            Self::LegacySmolRunnerV3 => LEGACY_SMOLRUNNER_IDENTITY_DOMAIN,
+            Self::GlaedaV4 => CURRENT_IDENTITY_DOMAIN,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
@@ -147,10 +181,7 @@ impl DisposablePreparedTemplateManifest {
         &self.wire.provisioning.ready_marker_path
     }
 
-    /// Check that one Lima template is the exact controller-owned construction input.
-    ///
-    /// This deliberately binds bytes rather than attempting to reimplement Lima or cloud-init
-    /// semantics. Lima owns parsing and provisioning after this boundary.
+    /// Check that one Lima template is the exact construction input for this generation.
     ///
     /// # Errors
     ///
@@ -177,7 +208,7 @@ impl DisposablePreparedTemplateManifest {
         &self.wire.isolation.vm_type
     }
 
-    /// Derive the domain-separated identity of every canonical manifest field.
+    /// Derive the generation-specific domain-separated identity of every canonical manifest field.
     ///
     /// # Errors
     ///
@@ -185,9 +216,10 @@ impl DisposablePreparedTemplateManifest {
     pub fn identity(
         &self,
     ) -> Result<DisposablePreparedTemplateIdentity, DisposablePreparedTemplateError> {
+        let generation = PreparedTemplateGeneration::from_schema_version(self.schema_version())?;
         let canonical = encode_disposable_prepared_template(self)?;
         let mut hasher = Sha256::new();
-        hasher.update(IDENTITY_DOMAIN);
+        hasher.update(generation.identity_domain());
         hasher.update(
             u64::try_from(canonical.len())
                 .unwrap_or(u64::MAX)
@@ -334,7 +366,7 @@ struct IsolationWire {
     display: bool,
 }
 
-/// Load the single checked-in production prepared-template declaration.
+/// Load the single checked-in production Glaeda prepared-template declaration.
 ///
 /// # Errors
 ///
@@ -342,17 +374,43 @@ struct IsolationWire {
 pub fn current_disposable_prepared_template()
 -> Result<DisposablePreparedTemplateManifest, DisposablePreparedTemplateError> {
     let manifest = decode_disposable_prepared_template(CURRENT_MANIFEST_BYTES)?;
+    if manifest.schema_version() != DISPOSABLE_PREPARED_TEMPLATE_SCHEMA_VERSION {
+        return Err(version_incompatible());
+    }
     manifest.validate_lima_template(CURRENT_LIMA_TEMPLATE_BYTES)?;
     Ok(manifest)
 }
 
-/// Return the exact checked-in Lima input whose digest is bound by the current manifest.
+/// Load the retained exact SmolRunner schema-3 declaration for inspection or retirement planning.
+///
+/// This never authorizes construction of a new old-generation VM.
+///
+/// # Errors
+///
+/// Returns an error if the retained declaration has drifted from its historical contract.
+pub fn legacy_smolrunner_disposable_prepared_template_v3()
+-> Result<DisposablePreparedTemplateManifest, DisposablePreparedTemplateError> {
+    let manifest = decode_disposable_prepared_template(LEGACY_SMOLRUNNER_MANIFEST_BYTES)?;
+    if manifest.schema_version() != LEGACY_SMOLRUNNER_PREPARED_TEMPLATE_SCHEMA_VERSION {
+        return Err(version_incompatible());
+    }
+    manifest.validate_lima_template(LEGACY_SMOLRUNNER_LIMA_TEMPLATE_BYTES)?;
+    Ok(manifest)
+}
+
+/// Return the exact checked-in Glaeda Lima input whose digest is bound by the current manifest.
 #[must_use]
 pub const fn current_disposable_lima_template_bytes() -> &'static [u8] {
     CURRENT_LIMA_TEMPLATE_BYTES
 }
 
-/// Strictly decode one canonical prepared-template declaration.
+/// Return the retained exact SmolRunner Lima input for old-generation inspection.
+#[must_use]
+pub const fn legacy_smolrunner_disposable_lima_template_v3_bytes() -> &'static [u8] {
+    LEGACY_SMOLRUNNER_LIMA_TEMPLATE_BYTES
+}
+
+/// Strictly decode one canonical supported prepared-template declaration.
 ///
 /// # Errors
 ///
@@ -367,12 +425,7 @@ pub fn decode_disposable_prepared_template(
         ));
     }
     let version: VersionWire = serde_json::from_slice(bytes).map_err(|_| invalid_document())?;
-    if version.schema_version != DISPOSABLE_PREPARED_TEMPLATE_SCHEMA_VERSION {
-        return Err(template_error(
-            DisposablePreparedTemplateErrorKind::VersionIncompatible,
-            "prepared-template schema version is unsupported",
-        ));
-    }
+    PreparedTemplateGeneration::from_schema_version(version.schema_version)?;
     let wire: PreparedTemplateWire =
         serde_json::from_slice(bytes).map_err(|_| invalid_document())?;
     let (guest_image_digest, actions_runner_digest, lima_template_digest) = validate_wire(&wire)?;
@@ -407,6 +460,7 @@ pub fn encode_disposable_prepared_template(
 fn validate_wire(
     wire: &PreparedTemplateWire,
 ) -> Result<(Sha256Digest, Sha256Digest, Sha256Digest), DisposablePreparedTemplateError> {
+    let generation = PreparedTemplateGeneration::from_schema_version(wire.schema_version)?;
     let guest_image_digest =
         Sha256Digest::parse(&wire.guest_image.digest).map_err(|_| invalid_document())?;
     let actions_runner_digest =
@@ -434,20 +488,48 @@ fn validate_wire(
     {
         return Err(unsafe_policy());
     }
-    let provisioning = &wire.provisioning;
+    validate_provisioning(&wire.provisioning, generation)?;
+    validate_isolation(&wire.isolation)?;
+    Ok((
+        guest_image_digest,
+        actions_runner_digest,
+        lima_template_digest,
+    ))
+}
+
+fn validate_provisioning(
+    provisioning: &ProvisioningWire,
+    generation: PreparedTemplateGeneration,
+) -> Result<(), DisposablePreparedTemplateError> {
+    let generation_matches = match generation {
+        PreparedTemplateGeneration::LegacySmolRunnerV3 => {
+            provisioning.admin_user == "smolrunner-admin"
+                && provisioning.admin_comment == "SmolRunner controller"
+                && provisioning.workload_user == "smolrunner-runner"
+                && provisioning.runner_install_directory == "/opt/smolrunner/actions-runner"
+                && provisioning.runner_work_directory == "/opt/smolrunner/actions-runner/_work"
+                && provisioning.jit_launcher_path == "/opt/smolrunner/bin/smolrunner-jit-launcher"
+                && provisioning.jit_launcher_digest
+                    == "sha256:6f096fb518b6d40d45ca1a9923e423da436b6269fceec5a5989566abbc93a76a"
+                && provisioning.ready_marker_path == "/etc/smolrunner/prepared-template.json"
+        }
+        PreparedTemplateGeneration::GlaedaV4 => {
+            provisioning.admin_user == "glaeda-admin"
+                && provisioning.admin_comment == "Glaeda controller"
+                && provisioning.workload_user == "glaeda-runner"
+                && provisioning.runner_install_directory == "/opt/glaeda/actions-runner"
+                && provisioning.runner_work_directory == "/opt/glaeda/actions-runner/_work"
+                && provisioning.jit_launcher_path == "/opt/glaeda/bin/glaeda-jit-launcher"
+                && provisioning.jit_launcher_digest
+                    == "sha256:2553d9346ea569cb23f393a928238cc4fd7c7b486e32be6a6e2f484c963689f4"
+                && provisioning.ready_marker_path == "/etc/glaeda/prepared-template.json"
+        }
+    };
     if provisioning.recipe_revision == 0
-        || provisioning.admin_user != "smolrunner-admin"
+        || !generation_matches
         || provisioning.admin_uid != 1000
-        || provisioning.admin_comment != "SmolRunner controller"
         || !provisioning.admin_passwordless_sudo
-        || provisioning.workload_user != "smolrunner-runner"
         || provisioning.admin_user == provisioning.workload_user
-        || provisioning.runner_install_directory != "/opt/smolrunner/actions-runner"
-        || provisioning.runner_work_directory != "/opt/smolrunner/actions-runner/_work"
-        || provisioning.jit_launcher_path != "/opt/smolrunner/bin/smolrunner-jit-launcher"
-        || provisioning.jit_launcher_digest
-            != "sha256:6f096fb518b6d40d45ca1a9923e423da436b6269fceec5a5989566abbc93a76a"
-        || provisioning.ready_marker_path != "/etc/smolrunner/prepared-template.json"
         || provisioning.runner_dependency_install != "official_archive_script"
         || provisioning.os_package_source != "ubuntu_noble_signed_repositories_at_build"
         || provisioning.automatic_os_updates_after_readiness
@@ -457,7 +539,10 @@ fn validate_wire(
     {
         return Err(unsafe_policy());
     }
-    let isolation = &wire.isolation;
+    Ok(())
+}
+
+fn validate_isolation(isolation: &IsolationWire) -> Result<(), DisposablePreparedTemplateError> {
     if isolation.lima_version != "2.2.0"
         || isolation.vm_type != "vz"
         || !isolation.plain_mode
@@ -479,11 +564,7 @@ fn validate_wire(
     {
         return Err(unsafe_policy());
     }
-    Ok((
-        guest_image_digest,
-        actions_runner_digest,
-        lima_template_digest,
-    ))
+    Ok(())
 }
 
 fn digest_bytes(bytes: &[u8]) -> Result<Sha256Digest, DisposablePreparedTemplateError> {
@@ -536,6 +617,13 @@ const fn invalid_document() -> DisposablePreparedTemplateError {
     )
 }
 
+const fn version_incompatible() -> DisposablePreparedTemplateError {
+    template_error(
+        DisposablePreparedTemplateErrorKind::VersionIncompatible,
+        "prepared-template schema version is unsupported",
+    )
+}
+
 const fn unsafe_policy() -> DisposablePreparedTemplateError {
     template_error(
         DisposablePreparedTemplateErrorKind::UnsafePolicy,
@@ -567,9 +655,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn checked_in_manifest_is_canonical_pinned_and_domain_bound() {
+    fn checked_in_glaeda_manifest_is_canonical_pinned_and_domain_bound() {
         let manifest = current_disposable_prepared_template().unwrap();
-        assert_eq!(manifest.schema_version(), 3);
+        assert_eq!(manifest.schema_version(), 4);
         assert_eq!(manifest.actions_runner_version(), "2.336.0");
         assert_eq!(manifest.lima_version(), "2.2.0");
         assert_eq!(manifest.actions_runner_archive_bytes(), 138_824_064);
@@ -586,12 +674,9 @@ mod tests {
         );
         assert_eq!(
             manifest.lima_template_digest().as_str(),
-            "sha256:7051a881544cc083677a569c1f1d69c027accd2b64c2b6577c4d3a53b5f661a2"
+            "sha256:1d1b74e9d17d2dcb6fdc5b85b0d14e5cc2cb99c9bb0f182124655fa6661da5b3"
         );
-        assert_eq!(
-            manifest.ready_marker_path(),
-            "/etc/smolrunner/prepared-template.json"
-        );
+        assert_eq!(manifest.ready_marker_path(), "/etc/glaeda/prepared-template.json");
         manifest
             .validate_lima_template(current_disposable_lima_template_bytes())
             .unwrap();
@@ -601,13 +686,45 @@ mod tests {
         );
         assert_eq!(
             manifest.identity().unwrap().as_str(),
-            "sha256:6a47d79a6a66e0e267104c39b8de7b818aaaffd691c653013a4cce907ae87a15"
+            "sha256:e31fe4698fb461098184f018fe30bc8faeb51fd64c8f7b1d7492b97a3cbfe6ef"
         );
     }
 
     #[test]
-    fn version_precedes_new_fields_and_unknown_or_noncanonical_input_fails_closed() {
-        for version in [1, 2, 4] {
+    fn retained_smolrunner_v3_manifest_keeps_its_exact_identity_and_bytes() {
+        let manifest = legacy_smolrunner_disposable_prepared_template_v3().unwrap();
+        assert_eq!(manifest.schema_version(), 3);
+        assert_eq!(
+            manifest.lima_template_digest().as_str(),
+            "sha256:7051a881544cc083677a569c1f1d69c027accd2b64c2b6577c4d3a53b5f661a2"
+        );
+        assert_eq!(
+            manifest.ready_marker_path(),
+            "/etc/smolrunner/prepared-template.json"
+        );
+        assert_eq!(
+            encode_disposable_prepared_template(&manifest).unwrap(),
+            LEGACY_SMOLRUNNER_MANIFEST_BYTES
+        );
+        assert_eq!(
+            manifest.identity().unwrap().as_str(),
+            "sha256:6a47d79a6a66e0e267104c39b8de7b818aaaffd691c653013a4cce907ae87a15"
+        );
+        manifest
+            .validate_lima_template(legacy_smolrunner_disposable_lima_template_v3_bytes())
+            .unwrap();
+        assert_eq!(
+            manifest
+                .validate_lima_template(current_disposable_lima_template_bytes())
+                .unwrap_err()
+                .kind(),
+            DisposablePreparedTemplateErrorKind::UnsafePolicy
+        );
+    }
+
+    #[test]
+    fn unsupported_versions_precede_new_fields_and_noncanonical_input_fails_closed() {
+        for version in [1, 2, 5] {
             let mut value: serde_json::Value =
                 serde_json::from_slice(CURRENT_MANIFEST_BYTES).unwrap();
             value["schema_version"] = serde_json::json!(version);
@@ -628,7 +745,7 @@ mod tests {
                 .kind(),
             DisposablePreparedTemplateErrorKind::InvalidDocument
         );
-        let compact: Vec<u8> = serde_json::to_vec(&value_without_extra()).unwrap();
+        let compact = serde_json::to_vec(&current_value()).unwrap();
         assert_eq!(
             decode_disposable_prepared_template(&compact)
                 .unwrap_err()
@@ -638,7 +755,29 @@ mod tests {
     }
 
     #[test]
-    fn moving_or_digestless_inputs_and_isolation_widening_are_refused() {
+    fn generation_identity_and_policy_cannot_be_cross_reinterpreted() {
+        let mut current = current_value();
+        current["schema_version"] = serde_json::json!(3);
+        assert_eq!(
+            decode_disposable_prepared_template(&pretty(&current))
+                .unwrap_err()
+                .kind(),
+            DisposablePreparedTemplateErrorKind::UnsafePolicy
+        );
+
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(LEGACY_SMOLRUNNER_MANIFEST_BYTES).unwrap();
+        legacy["schema_version"] = serde_json::json!(4);
+        assert_eq!(
+            decode_disposable_prepared_template(&pretty(&legacy))
+                .unwrap_err()
+                .kind(),
+            DisposablePreparedTemplateErrorKind::UnsafePolicy
+        );
+    }
+
+    #[test]
+    fn moving_inputs_and_isolation_widening_are_refused() {
         for (path, changed) in [
             (
                 &["guest_image", "location"][..],
@@ -650,12 +789,6 @@ mod tests {
                 &["guest_image", "location"][..],
                 serde_json::json!(
                     "https://cloud-images.ubuntu.com/releases/noble/release-current/ubuntu-24.04-server-cloudimg-arm64.img"
-                ),
-            ),
-            (
-                &["guest_image", "location"][..],
-                serde_json::json!(
-                    "https://cloud-images.ubuntu.com/releases/noble/release-20260705/ubuntu-24.04-server-cloudimg-arm64.img\u{7f}"
                 ),
             ),
             (
@@ -674,33 +807,16 @@ mod tests {
                 &["provisioning", "workload_sudo"][..],
                 serde_json::json!(true),
             ),
-            (
-                &["provisioning", "runner_dependency_install"][..],
-                serde_json::json!("repository_script"),
-            ),
         ] {
-            let mut value = value_without_extra();
+            let mut value = current_value();
             value[path[0]][path[1]] = changed;
-            let bytes = pretty(&value);
             assert_eq!(
-                decode_disposable_prepared_template(&bytes)
+                decode_disposable_prepared_template(&pretty(&value))
                     .unwrap_err()
                     .kind(),
                 DisposablePreparedTemplateErrorKind::UnsafePolicy
             );
         }
-
-        let mut missing_digest = value_without_extra();
-        missing_digest["actions_runner"]
-            .as_object_mut()
-            .unwrap()
-            .remove("digest");
-        assert_eq!(
-            decode_disposable_prepared_template(&pretty(&missing_digest))
-                .unwrap_err()
-                .kind(),
-            DisposablePreparedTemplateErrorKind::InvalidDocument
-        );
     }
 
     #[test]
@@ -724,6 +840,13 @@ mod tests {
         for changed_manifest in changed_manifests {
             assert_ne!(changed_manifest.identity().unwrap(), baseline_identity);
         }
+        assert_ne!(
+            legacy_smolrunner_disposable_prepared_template_v3()
+                .unwrap()
+                .identity()
+                .unwrap(),
+            baseline_identity
+        );
     }
 
     #[test]
@@ -756,7 +879,7 @@ mod tests {
             .unwrap()
     }
 
-    fn value_without_extra() -> serde_json::Value {
+    fn current_value() -> serde_json::Value {
         serde_json::from_slice(CURRENT_MANIFEST_BYTES).unwrap()
     }
 
