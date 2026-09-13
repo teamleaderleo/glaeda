@@ -278,11 +278,13 @@ def dependency_observation(project, paths, declaration):
     if not files:
         raise Refusal("dependency reuse matched no input files")
     total = 0
-    def content(path):
+    def content(path, match="content"):
         nonlocal total
         with path.open("rb") as stream:
             if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
                 raise Refusal("dependency observation requires regular files")
+            if match == "exists":
+                return "regular_file_present"
             data = stream.read(16 * 1024 * 1024 + 1)
         total += len(data)
         if total > 16 * 1024 * 1024:
@@ -291,7 +293,8 @@ def dependency_observation(project, paths, declaration):
     inputs = digest([(name, content(project_file(project, name))) for name in sorted(files)])
     observed = []
     for item in outputs:
-        if not isinstance(item, dict) or set(item) != {"cache", "path"} or item["cache"] not in CACHE_NAMES:
+        if (not isinstance(item, dict) or not {"cache", "path"} <= set(item) or set(item) - {"cache", "path", "match"}
+                or item["cache"] not in CACHE_NAMES or item.get("match", "content") not in ("content", "exists")):
             raise Refusal("invalid required dependency file")
         relative = relative_path(item["path"])
         base = Path(paths[item["cache"]])
@@ -300,7 +303,7 @@ def dependency_observation(project, paths, declaration):
             resolved = candidate.resolve(strict=True)
             if not resolved.is_relative_to(base):
                 raise Refusal("dependency file escapes its cache")
-            observed.append(content(resolved))
+            observed.append(content(resolved, item.get("match", "content")))
         except FileNotFoundError:
             return {"inputs": inputs, "outputs": None}
     return {"inputs": inputs, "outputs": digest(observed)}

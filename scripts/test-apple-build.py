@@ -308,6 +308,37 @@ class AppleBuildTests(unittest.TestCase):
         with self.assertRaisesRegex(apple.Refusal, "changed during admission"):
             apple.execute(plan, prepare_again)
 
+    def test_dependency_presence_sentinel_ignores_bytes_but_detects_missing_files(self):
+        plan = self.plan()
+        (self.root / "Package.swift").write_text("// inputs")
+        cache = Path(plan["paths"]["source_packages"])
+        cache.mkdir(parents=True)
+        sentinel = cache / "workspace-state.json"
+        artifact = cache / "artifact.plist"
+        sentinel.write_text('{"artifacts":[1,2]}')
+        artifact.write_text("artifact-v1")
+        declaration = {"inputs": ["Package.swift"], "required_files": [
+            {"cache": "source_packages", "path": "workspace-state.json", "match": "exists"},
+            {"cache": "source_packages", "path": "artifact.plist"}]}
+        observe = lambda: apple.dependency_observation(self.root, plan["paths"], declaration)
+        first = observe()
+        sentinel.write_text('{"artifacts":[2,1]}')
+        self.assertEqual(first, observe())
+        artifact.write_text("artifact-v2")
+        self.assertNotEqual(first, observe())
+        sentinel.unlink()
+        self.assertIsNone(observe()["outputs"])
+        sentinel.mkdir()
+        with self.assertRaises((apple.Refusal, OSError)):
+            observe()
+        sentinel.rmdir()
+        sentinel.symlink_to(self.script)
+        with self.assertRaisesRegex(apple.Refusal, "escapes"):
+            observe()
+        declaration["required_files"][0]["match"] = "unknown"
+        with self.assertRaises(apple.Refusal):
+            observe()
+
     def test_settings_sdk_toolchain_and_recipe_separate_generations(self):
         key = self.plan()["key"]
         self.tools["sdk_build"] = "test2"

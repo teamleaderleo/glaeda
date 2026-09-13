@@ -226,6 +226,14 @@ Input globs are project-relative; their matched names and file contents are
 hashed. Required files are relative to a named existing cache category, must
 resolve inside it, and are also content-hashed. Observations are bounded to 32
 patterns, 512 input files, 32 required files and 16 MiB of total file content.
+A required-file entry may explicitly set `"match": "exists"` for mutable metadata
+whose byte representation is not a readiness condition (for example SwiftPM's
+`workspace-state.json`, whose artifact array may reorder). It must still resolve
+inside the owned cache and be a regular file; missing files trigger preparation.
+The default `"content"` mode retains byte hashing. Presence checks do not validate
+metadata or artifact correctness and are suitable only for optional preparation;
+the subsequent native build must keep its own dependency validation enabled.
+
 No matched inputs is an error. Globs observe additions and removals; select all
 manifests and configuration files that affect dependency preparation, including
 local package manifests. Source code generally does not belong in this set.
