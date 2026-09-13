@@ -45,7 +45,8 @@ the next improvement belongs in Glaeda admission or the native workflow.
 
 ## Multiple agents in one checkout
 
-Agents can wait for the current native operation instead of repeatedly retrying:
+After a first managed run has initialized project state, agents can wait for the
+current native operation instead of repeatedly retrying:
 
 ```sh
 glaeda-apple ensure-dependencies --wait-seconds 300
