@@ -10,6 +10,8 @@ pub use request::{COMPUTE_EXECUTION_REQUEST_SCHEMA_VERSION, ComputeExecutionRequ
 pub mod accelerator_burst;
 pub mod blender_burst_work_plan;
 pub mod blender_content_store;
+#[cfg(unix)]
+pub mod blender_content_store_observation;
 pub mod blender_remote_inventory_document;
 pub mod blender_snapshot;
 pub mod blender_snapshot_document;
