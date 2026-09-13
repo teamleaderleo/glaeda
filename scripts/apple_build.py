@@ -765,12 +765,14 @@ def explain(plan):
 
 def main():
     parser = argparse.ArgumentParser(description="Prepare and run trusted native Apple builds with persistent project caches")
-    parser.add_argument("action", choices=("plan", "plan-check", "check", "plan-dependencies", "dependencies", "ensure-dependencies", "explain", "run", "warm", "recover"))
+    parser.add_argument("action", choices=("plan", "plan-check", "check", "plan-dependencies", "dependencies", "ensure-dependencies", "explain", "run", "warm", "recover", "submit", "request-status", "forget-request", "requests", "wake"))
     parser.add_argument("--project", type=Path, default=Path.cwd())
     parser.add_argument("--profile", default="app")
     parser.add_argument("--generation", default="default", help="stable label; use a new label for a cold rebuild without deleting old caches")
     parser.add_argument("--run-id", help="exact interrupted run id, only for recover")
     parser.add_argument("--wait-seconds", type=int, default=0, help="wait up to 3600 seconds for native execution admission; default refuses contention")
+    parser.add_argument("--operation", choices=("check", "build", "dependencies"), help="operation for submit; default check")
+    parser.add_argument("--request-id", help="exact id for request-status or forget-request")
     args = parser.parse_args()
     try:
         if (args.action == "recover") != bool(args.run_id):
@@ -779,6 +781,22 @@ def main():
             raise Refusal("wait seconds must be an integer from 0 to 3600")
         if args.wait_seconds and args.action not in ("check", "dependencies", "ensure-dependencies", "run", "warm"):
             raise Refusal("--wait-seconds applies only to native execution")
+        if (args.action in ("request-status", "forget-request")) != bool(args.request_id):
+            raise Refusal("--request-id is required only for request-status or forget-request")
+        if args.operation is not None and args.action != "submit":
+            raise Refusal("--operation applies only to submit")
+        if args.action in ("submit", "request-status", "forget-request", "requests", "wake"):
+            import apple_queue
+            if args.action == "submit":
+                result = apple_queue.submit(prepare(args.project, args.profile, args.generation, operation=args.operation or "check"))
+            elif args.action == "wake":
+                result = apple_queue.wake(args.project)
+            elif args.action == "requests":
+                result = apple_queue.list_requests(args.project)
+            else:
+                result = apple_queue.status(args.project, args.request_id, forget=args.action == "forget-request")
+            print(json.dumps(result, sort_keys=True))
+            return 0
         preparing = time.monotonic()
         operation = "dependencies" if args.action in ("dependencies", "ensure-dependencies", "plan-dependencies") else "check" if args.action in ("check", "plan-check") else "build"
         plan = prepare(args.project, args.profile, args.generation, operation=operation)
@@ -798,4 +816,7 @@ def main():
 
 
 if __name__ == "__main__":
+    # Installed snapshots execute this file directly; queue imports must share
+    # the same exception classes and loaded engine rather than importing twice.
+    sys.modules.setdefault("apple_build", sys.modules[__name__])
     raise SystemExit(main())

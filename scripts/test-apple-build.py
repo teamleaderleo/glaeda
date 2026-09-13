@@ -8,13 +8,17 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location("apple_build", Path(__file__).with_name("apple_build.py"))
 apple = importlib.util.module_from_spec(spec)
+sys.modules["apple_build"] = apple
 spec.loader.exec_module(apple)
+import apple_queue as queue
 
 
 class AppleBuildTests(unittest.TestCase):
@@ -510,6 +514,204 @@ class AppleBuildTests(unittest.TestCase):
         self.assertEqual(refusal["state"], "refused")
         self.assertNotIn(str(self.root), output.getvalue())
         self.assertFalse(Path(plan["paths"]["products"]).exists())
+
+
+class AppleQueueTests(unittest.TestCase):
+    setUp = AppleBuildTests.setUp
+    tearDown = AppleBuildTests.tearDown
+    write_config = AppleBuildTests.write_config
+    plan = AppleBuildTests.plan
+
+    def initialized(self):
+        plan = self.plan()
+        with apple.store(plan, True):
+            pass
+        return plan
+
+    def prepare(self, project, name, generation, **options):
+        return apple.prepare(project, name, generation, lambda *args: self.tools, **options)
+
+    def submit(self):
+        return queue.submit(self.plan(), lambda project: {"wake": "deferred_for_test"})
+
+    def work(self, execute=apple.execute):
+        queue.worker(self.root, self.prepare, execute, debounce=0)
+
+    def test_pending_requests_share_one_native_run(self):
+        self.initialized()
+        requests = [self.submit() for _ in range(3)]
+        self.work()
+        results = [queue.status(self.root, r["request_id"]) for r in requests]
+        self.assertEqual({r["state"] for r in results}, {"completed"})
+        self.assertEqual(len({r["result"]["run_id"] for r in results}), 1)
+        self.assertFalse(results[0]["result"]["source_before"]["clean"])
+        self.assertEqual(len(list((self.root / ".glaeda/apple-build").glob("run-*.log"))), 1)
+
+    def test_arrival_during_execution_gets_another_batch(self):
+        self.initialized()
+        first = self.submit()
+        later = []
+        def execute(plan, prepare, **options):
+            if not later:
+                later.append(self.submit())
+            return apple.execute(plan, prepare, **options)
+        self.work(execute)
+        a = queue.status(self.root, first["request_id"])
+        b = queue.status(self.root, later[0]["request_id"])
+        self.assertNotEqual(a["batch_id"], b["batch_id"])
+        self.assertNotEqual(a["result"]["run_id"], b["result"]["run_id"])
+
+    def test_drift_refuses_without_native_execution(self):
+        plan = self.initialized()
+        request = self.submit()
+        self.script.write_text("#!/bin/sh\necho changed\n")
+        self.work()
+        result = queue.status(self.root, request["request_id"])
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(result["result"]["reason"], "configuration_changed")
+        self.assertFalse(Path(plan["paths"]["products"]).exists())
+
+    def test_spawn_failure_preserves_request_for_explicit_wake(self):
+        plan = self.initialized()
+        with patch.object(queue.subprocess, "Popen", side_effect=OSError):
+            request = queue.submit(plan)
+        self.assertEqual(request["wake"], "failed")
+        self.assertEqual(queue.status(self.root, request["request_id"])["state"], "pending")
+        self.work()
+        self.assertEqual(queue.status(self.root, request["request_id"])["state"], "completed")
+
+    def test_abandoned_batch_is_not_replayed_or_claimed_successful(self):
+        self.initialized()
+        request = self.submit()
+        with self.assertRaises(SystemExit):
+            self.work(lambda *args, **options: (_ for _ in ()).throw(SystemExit()))
+        self.assertEqual(queue.status(self.root, request["request_id"])["state"], "running")
+        self.work()
+        result = queue.status(self.root, request["request_id"])
+        self.assertEqual(result["state"], "interrupted")
+        self.assertEqual(result["result"]["reason"], "worker_interrupted")
+        self.assertFalse(list((self.root / ".glaeda/apple-build").glob("run-*.log")))
+
+    def test_crash_after_native_completion_never_infers_queue_success(self):
+        self.initialized()
+        request = self.submit()
+        def execute(plan, prepare, **options):
+            apple.execute(plan, prepare, **options)
+            raise SystemExit()
+        with self.assertRaises(SystemExit):
+            self.work(execute)
+        self.assertTrue((self.root / ".glaeda/apple-build/last-run.json").exists())
+        self.work()
+        result = queue.status(self.root, request["request_id"])
+        self.assertEqual(result["state"], "interrupted")
+        self.assertIsNone(result["result"]["run_id"])
+        self.assertEqual(len(list((self.root / ".glaeda/apple-build").glob("run-*.log"))), 1)
+
+    def test_enqueue_at_idle_exit_receives_a_worker(self):
+        plan = self.initialized()
+        original_flock = queue.fcntl.flock
+        entered = threading.Event()
+        finished = threading.Event()
+        requests, errors, threads = [], [], []
+        receipt = {"run_id": "a" * 32, "exit_code": 0,
+                   "source_before": {"commit": "b" * 40, "clean": True},
+                   "source_after": {"commit": "b" * 40, "clean": True}}
+        def enqueue():
+            entered.set()
+            try:
+                def wake(project):
+                    queue.worker(project, self.prepare, lambda *args, **kwargs: receipt, debounce=0)
+                    return {"wake": "requested"}
+                requests.append(queue.submit(plan, wake))
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                finished.set()
+        def flock(fd, operation):
+            original_flock(fd, operation)
+            if operation == queue.fcntl.LOCK_UN and not threads:
+                # Idle release must occur before the enqueue critical section ends.
+                with apple.store(plan) as state:
+                    probe = os.open("requests.lock", os.O_RDWR, dir_fd=state)
+                    try:
+                        with self.assertRaises(BlockingIOError):
+                            original_flock(probe, queue.fcntl.LOCK_EX | queue.fcntl.LOCK_NB)
+                    finally:
+                        os.close(probe)
+                thread = threading.Thread(target=enqueue)
+                threads.append(thread)
+                thread.start()
+                self.assertTrue(entered.wait(1))
+        with patch.object(queue.fcntl, "flock", flock):
+            self.work()
+            self.assertTrue(finished.wait(5))
+            for thread in threads:
+                thread.join(timeout=1)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(queue.status(self.root, requests[0]["request_id"])["state"], "completed")
+
+    def test_existing_worker_does_not_reclassify_running_records(self):
+        plan = self.initialized()
+        request = self.submit()
+        with apple.store(plan) as state, queue.mutex(state, "request-worker.lock", False):
+            self.work()
+        self.assertEqual(queue.status(self.root, request["request_id"])["state"], "pending")
+
+    def test_status_is_read_only_and_forget_requires_terminal(self):
+        plan = self.initialized()
+        with apple.store(plan) as state:
+            self.assertEqual(queue.read_queue(state), [])
+        self.assertFalse((self.root / ".glaeda/apple-build/requests.json").exists())
+        request = self.submit()
+        ledger = self.root / ".glaeda/apple-build/requests.json"
+        before = ledger.stat().st_mtime_ns
+        queue.status(self.root, request["request_id"])
+        self.assertEqual(ledger.stat().st_mtime_ns, before)
+        with self.assertRaises(apple.Refusal):
+            queue.status(self.root, request["request_id"], forget=True)
+        self.work()
+        self.assertEqual(queue.status(self.root, request["request_id"], forget=True)["state"], "forgotten")
+        with self.assertRaises(apple.Refusal):
+            queue.status(self.root, request["request_id"])
+
+    def test_history_bound_requires_explicit_collection(self):
+        self.initialized()
+        with patch.object(queue, "MAX_REQUESTS", 2):
+            self.submit()
+            self.submit()
+            with self.assertRaisesRegex(apple.Refusal, "history full"):
+                self.submit()
+
+    def test_unsafe_ledger_is_refused_without_mutation(self):
+        plan = self.initialized()
+        ledger = self.root / ".glaeda/apple-build/requests.json"
+        ledger.symlink_to(self.script)
+        original = self.script.read_bytes()
+        with self.assertRaises(OSError):
+            self.submit()
+        self.assertEqual(self.script.read_bytes(), original)
+        ledger.unlink()
+        ledger.write_text('{"schema_version":1,"requests":[{"id":"bad"}]}')
+        ledger.chmod(0o600)
+        with self.assertRaises(apple.Refusal):
+            self.submit()
+
+    def test_direct_snapshot_entrypoint_has_bounded_queue_refusals(self):
+        self.initialized()
+        run = subprocess.run([sys.executable, apple.__file__, "request-status", "--project", str(self.root),
+                              "--request-id", "a" * 32], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 2)
+        self.assertEqual(json.loads(run.stderr)["reason"], "request not found")
+        self.assertNotIn("Traceback", run.stderr)
+
+    def test_changed_worker_generation_does_not_execute(self):
+        self.initialized()
+        request = self.submit()
+        with patch.object(queue, "RUNTIME", "0" * 64):
+            self.work()
+        result = queue.status(self.root, request["request_id"])
+        self.assertEqual(result["result"]["reason"], "runtime_changed")
 
 
 if __name__ == "__main__":

@@ -57,13 +57,17 @@ Product details live in `README.md` and `docs/COMPUTE_RUNTIME.md`.
 
 ## Native Apple agent builds
 
-For configured projects, use `glaeda-apple ensure-dependencies --wait-seconds 300`
-for preparation and `glaeda-apple check --wait-seconds 300` for declared code checks.
-Use `warm --wait-seconds 300` when a complete app build is required. Preserve each
-project’s launch rules. The wait deadline covers admission only; a timeout does
-not authorize killing another builder or deleting its state. Coordinate source
-and branch edits separately, and never run direct and managed builds concurrently.
-See `docs/APPLE_NATIVE_BUILDS.md` for receipt scope and source-observation limits.
+For initialized native projects, prefer `glaeda-apple submit --operation check`.
+Save the returned request id; collect it with `request-status --request-id <id>`
+and explicitly `forget-request --request-id <id>` after consuming a terminal result.
+Use operation `dependencies` for preparation and `build` for a complete app build.
+The worker starts on demand and exits when idle; `wake` resumes pending work after
+interruption. Submission targets latest source at execution, not a pinned revision.
+Preserve each project's launch rules and coordinate source/branch edits separately.
+Never run direct and managed builds concurrently. Foreground callers can still use
+`check --wait-seconds 300`; timeout never authorizes killing another builder or
+removing its state. See `docs/APPLE_NATIVE_BUILDS.md` for recovery, receipt scope,
+source-observation limits and the bounded request history.
 
 ## Verify
 

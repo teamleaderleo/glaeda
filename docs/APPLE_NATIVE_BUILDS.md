@@ -43,6 +43,61 @@ Package resolution, compilation, bundling, and signing inside a project helper
 are not yet separately instrumented. Use these measurements to establish whether
 the next improvement belongs in Glaeda admission or the native workflow.
 
+## Submit work and wake a worker
+
+After a first managed run has initialized the project’s owned state:
+
+```sh
+glaeda-apple submit --operation check
+# List durable requests, including after an ambiguous submitter exit:
+glaeda-apple requests
+# Save the returned request_id, then collect it later:
+glaeda-apple request-status --request-id <id>
+# After consuming a terminal result:
+glaeda-apple forget-request --request-id <id>
+```
+
+`submit` accepts `check` (default), `dependencies`, or `build`, plus the usual
+project/profile/generation options. Submission prepares and binds the current
+recipe/toolchain identity, atomically records the request, and starts a detached,
+on-demand worker. It returns without waiting for the native command. An existing
+worker owns its project through a separate lock; additional wake processes exit.
+The worker retains the normal native build lock, admission checks and recovery
+rules. It exits when the queue is empty. No launch service, timer, network endpoint
+or always-running daemon is installed.
+
+Requests mean **latest checkout at execution**, not an immutable source revision.
+After a 0.3-second batching delay, equivalent pending operation/profile/recipe
+requests share one native execution. Requests submitted during a running batch
+stay pending for another execution, even when their recipe matches. A changed
+recipe/toolchain or worker-code generation fails the old request instead of
+silently adopting new instructions. Dependency requests may use the existing
+validated preparation reuse; checks and builds execute native validation.
+
+Status returns pending/running/completed/failed/interrupted, an opaque batch/run
+identity, exit status and available before/after source observations. Dirty source
+observations do not establish exact source identity. A completed dependency request
+is not a compiled-app result. Source and branch edits remain cooperative; the worker
+does not watch files, lock editors, pin a commit or launch the resulting app.
+Result collection is pull-based; no editor/agent messaging integration is installed.
+
+Requests survive submitter exit and wake-spawn failure. `glaeda-apple wake` explicitly
+resumes pending work after a worker failure or missed wake. After acquiring the worker
+lock, a replacement marks abandoned running requests interrupted; it never infers
+success from unrelated native receipts or blindly replays those requests. Inspect
+`plan` and use exact-run native recovery when native work is unfinished; then submit
+a fresh request. A terminal result remains terminal. New launcher generations refuse
+older pending requests, so collect/forget and resubmit those explicitly.
+
+The project-private ledger is atomic, permission checked, bounded to 32 requests and
+64 KiB. Collect and explicitly forget terminal records to free capacity; active
+requests cannot be forgotten. Native build receipts and caches remain intact. Status
+is read-only and does not start workers or repair state. Enqueue/transition locks
+have a five-second contention deadline; a worker can wait up to 300 seconds for the
+native build lock. Native command duration remains governed by the existing helper.
+The worker releases its ownership lock while holding the enqueue lock when idle,
+so an enqueue at normal worker exit cannot lose its wake.
+
 ## Multiple agents in one checkout
 
 After a first managed run has initialized project state, agents can wait for the
