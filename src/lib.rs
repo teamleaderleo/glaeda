@@ -302,6 +302,12 @@ pub mod project_checkout_observation;
 pub mod project_discovery;
 /// Pure no-replay lifecycle for one exact formatted project-disk attachment.
 pub mod project_disk_attachment_state;
+/// Crate-private #700 create-durability acknowledgement seam. The #697 durable
+/// `CreatedRawBound` orchestrator consumes this typed surface next; until then its API is
+/// intentionally retained without a production caller.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(dead_code)]
+mod project_disk_create_durability;
 /// Pure identity vocabulary for one formatted project-disk filesystem generation.
 pub mod project_disk_filesystem;
 /// Descriptor-bound read-only observation of Lima standalone project disks.
