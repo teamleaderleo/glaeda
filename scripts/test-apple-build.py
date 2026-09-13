@@ -621,6 +621,29 @@ class AppleQueueTests(unittest.TestCase):
         self.assertEqual((result["state"], result["wait"]), ("pending", "deadline"))
         self.assertEqual(ledger.read_bytes(), before)
 
+    def test_ledger_replacement_between_open_and_fstat_retries(self):
+        plan = self.initialized()
+        request = self.submit()
+        ledger = self.root / ".glaeda/apple-build/requests.json"
+        inode = ledger.stat().st_ino
+        original_fstat = os.fstat
+        replaced = []
+        def fstat(fd):
+            info = original_fstat(fd)
+            if info.st_ino == inode and not replaced:
+                replaced.append(True)
+                replacement = ledger.with_suffix(".replacement")
+                replacement.write_bytes(ledger.read_bytes())
+                replacement.chmod(0o600)
+                replacement.replace(ledger)
+                info = original_fstat(fd)
+                self.assertEqual(info.st_nlink, 0)
+            return info
+        with patch.object(queue.os, "fstat", fstat):
+            result = queue.status(self.root, request["request_id"])
+        self.assertTrue(replaced)
+        self.assertEqual(result["state"], "pending")
+
     def test_wait_deadline_preserves_pending_request(self):
         self.initialized()
         request = self.submit()

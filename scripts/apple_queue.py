@@ -65,15 +65,23 @@ def mutex(state, name, blocking=True):
 
 
 def read_queue(state):
-    try:
-        fd = os.open("requests.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=state)
-    except FileNotFoundError:
-        return []
-    with os.fdopen(fd, "rb") as stream:
-        info = os.fstat(stream.fileno())
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1 or info.st_mode & 0o077:
-            raise native.Refusal("unsafe request ledger")
-        ledger = native.bounded_json(stream.read(native.LIMIT + 1))
+    for attempt in range(4):
+        try:
+            fd = os.open("requests.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=state)
+        except FileNotFoundError:
+            return []
+        with os.fdopen(fd, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink > 1 or info.st_mode & 0o077:
+                raise native.Refusal("unsafe request ledger")
+            if info.st_nlink == 0:
+                # Atomic publication may unlink the opened version before fstat.
+                # Retry the canonical name; never adopt the detached inode.
+                continue
+            ledger = native.bounded_json(stream.read(native.LIMIT + 1))
+            break
+    else:
+        raise native.Refusal("request ledger changed repeatedly; retry observation")
     if not isinstance(ledger, dict) or set(ledger) != {"schema_version", "requests"} or type(ledger["schema_version"]) is not int or ledger["schema_version"] != 1:
         raise native.Refusal("invalid request ledger")
     rows = ledger["requests"]
