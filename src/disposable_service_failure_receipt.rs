@@ -12,7 +12,7 @@ use crate::artifact::Sha256Digest;
 
 pub const DISPOSABLE_SERVICE_FAILURE_RECEIPT_SCHEMA_VERSION: u8 = 1;
 const MAX_FAILURE_CODE_BYTES: usize = 96;
-const MAX_RECEIPT_DOCUMENT_BYTES: usize = 4 * 1024;
+pub(crate) const MAX_RECEIPT_DOCUMENT_BYTES: usize = 4 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
