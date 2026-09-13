@@ -1,11 +1,13 @@
-"""Private, focused-only launch admission. No queue or caller authority.
+"""Private reviewed-workload launch admission. No queue or caller authority.
 
-Only an installed local adapter supplies this root; remote requests never choose it.
-An uncompleted reservation is deliberately not reclaimed from a dead PID or absent lock.
+Only an installed local adapter supplies this root and an in-process reviewed demand; remote
+requests never choose either. An uncompleted reservation is deliberately not reclaimed from a
+dead PID or absent lock.
 """
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import dataclass
 import fcntl
 import hashlib
 import json
@@ -55,6 +57,33 @@ class Deferred(Refusal):
     def __init__(self, reason, message):
         super().__init__(message)
         self.reason = reason
+
+
+@dataclass(frozen=True, slots=True)
+class AdmissionDemand:
+    """Reviewed in-process capacity demand; never decoded from a remote request."""
+
+    memory_bytes: int
+    minimum_logical_cpus: int
+
+    def __post_init__(self):
+        if (not integer(self.memory_bytes, 1)
+                or not integer(self.minimum_logical_cpus, 1)):
+            raise Refusal("invalid local admission demand")
+
+
+# Exact existing verify-focused/v1 behavior: 8 GiB MemoryMax and a host with at least eight
+# logical CPUs (four for the workload plus the existing fixed owner headroom assumption).
+VERIFY_FOCUSED_DEMAND = AdmissionDemand(
+    memory_bytes=8 * 1024**3,
+    minimum_logical_cpus=8,
+)
+
+
+def validated_demand(value):
+    if type(value) is not AdmissionDemand:
+        raise Refusal("invalid local admission demand")
+    return value
 
 
 class Store:
@@ -232,7 +261,8 @@ def query(entry, arguments, raw=b""):
         os.close(fd)
 
 
-def check(current):
+def check(current, demand=VERIFY_FOCUSED_DEMAND):
+    demand = validated_demand(demand)
     started = time.monotonic()
     host = query(current["host_executable"], ["--output", "json"])
     try:
@@ -251,9 +281,10 @@ def check(current):
             raise ValueError()
     except (KeyError, TypeError, ValueError) as error:
         raise Refusal("incomplete local admission observation") from error
-    # Fixed verify-focused/v1: 8 GiB MemoryMax, four CPUs. Reserve at least four more
-    # GiB and four CPUs for owner work. Unknown or unavailable facts never become zero.
-    if memory < 8 * 1024**3 + current["memory_reserve_bytes"] or cpus < 8:
+    # The reviewed demand is local adapter code, never remote request data. The operator reserve
+    # remains installation policy. Unknown or unavailable host facts never become zero.
+    if (memory < demand.memory_bytes + current["memory_reserve_bytes"]
+            or cpus < demand.minimum_logical_cpus):
         raise Deferred("capacity_unavailable", "local admission capacity unavailable")
     high = any(p >= ceiling for p, ceiling in zip(pressure, (50_000_000, 1_000_000, 20_000_000)))
     raw = canonical({"schema_version": 1, "request": {"interference_class": "coexist"},
@@ -284,19 +315,20 @@ def check(current):
     return started + FRESH_SECONDS
 
 
-def observe(root):
+def observe(root, demand=VERIFY_FOCUSED_DEMAND):
     """Disposable advisory snapshot. Never creates locks, reservations or launch state."""
     outcome, reason = "ready", "compatible"
     started = time.monotonic()
     store = None
     try:
+        demand = validated_demand(demand)
         store = Store(root)
         current = policy(store)
         if store.read("reservation.json") is not None:
             outcome, reason = "wait", "reserved"
         else:
             try:
-                check(current)
+                check(current, demand)
             except Deferred as error:
                 outcome, reason = "wait", error.reason
         # A changed policy/root invalidates this observation rather than adopting it.
@@ -316,7 +348,8 @@ def observe(root):
 
 
 class Reservation:
-    def __init__(self, root, fingerprint, unit, binding):
+    def __init__(self, root, fingerprint, unit, binding, demand=VERIFY_FOCUSED_DEMAND):
+        self.demand = validated_demand(demand)
         self.store = Store(root)
         self.identity = {"schema_version": 1, "command_fingerprint": fingerprint, "unit": unit,
                          "binding_sha256": binding}
@@ -332,7 +365,7 @@ class Reservation:
                 raise Refusal("previous local reservation requires exact recovery")
             with self.store.lock("policy.lock"):
                 current = policy(self.store)
-                check(current)
+                check(current, self.demand)
                 self.identity["generation"] = current["generation"]
                 self.store.write("reservation.json", {**self.identity, "phase": "preparing"})
                 self.owned = True
@@ -350,7 +383,7 @@ class Reservation:
                 raise Refusal("local admission installation changed")
             if self.store.read("reservation.json") != {**self.identity, "phase": "preparing"}:
                 raise Refusal("local admission reservation changed")
-            deadline = check(current)
+            deadline = check(current, self.demand)
             self.store.write("reservation.json", {**self.identity, "phase": "launching"})
             self.phase = "launching"
             self.store.verify_root()
