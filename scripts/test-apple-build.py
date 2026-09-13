@@ -346,6 +346,65 @@ class AppleBuildTests(unittest.TestCase):
                 self.run_plan(plan)
         self.assertFalse(Path(plan["paths"]["products"]).exists())
 
+    def test_waiting_builder_runs_after_owner_releases(self):
+        plan = self.plan()
+        with apple.store(plan, True) as state:
+            fd = os.open("build.lock", os.O_RDWR | os.O_CREAT, 0o600, dir_fd=state)
+            try:
+                apple.fcntl.flock(fd, apple.fcntl.LOCK_EX)
+                with patch.object(apple.time, "sleep", lambda seconds: apple.fcntl.flock(fd, apple.fcntl.LOCK_UN)):
+                    result = apple.execute(plan, lambda *args: self.plan(), wait_seconds=1)
+                self.assertEqual(result["exit_code"], 0)
+                self.assertEqual(Path(plan["paths"]["products"]).joinpath("result").read_text(), "ok")
+            finally:
+                os.close(fd)
+
+    def test_wait_timeout_preserves_owner_and_creates_no_run(self):
+        plan = self.plan()
+        with apple.store(plan, True) as state, apple.lock(state):
+            with self.assertRaisesRegex(apple.Refusal, "wait deadline"):
+                apple.execute(plan, wait_seconds=1)
+            with self.assertRaisesRegex(apple.Refusal, "another Glaeda"):
+                self.run_plan(plan)
+            self.assertFalse(Path(plan["paths"]["products"]).exists())
+            with self.assertRaises(FileNotFoundError):
+                apple.read_json(state, "inflight.json")
+
+    def test_waiting_builder_revalidates_changed_recipe(self):
+        plan = self.plan()
+        with apple.store(plan, True) as state:
+            fd = os.open("build.lock", os.O_RDWR | os.O_CREAT, 0o600, dir_fd=state)
+            def release(seconds):
+                self.script.write_text("#!/bin/sh\necho changed\n")
+                apple.fcntl.flock(fd, apple.fcntl.LOCK_UN)
+            try:
+                apple.fcntl.flock(fd, apple.fcntl.LOCK_EX)
+                with patch.object(apple.time, "sleep", release):
+                    with self.assertRaisesRegex(apple.Refusal, "changed during admission"):
+                        apple.execute(plan, lambda *args: self.plan(), wait_seconds=1)
+                self.assertFalse(Path(plan["paths"]["products"]).exists())
+            finally:
+                os.close(fd)
+
+    def test_cancelled_waiter_returns_bounded_output_without_disturbing_owner(self):
+        plan = self.plan()
+        with apple.store(plan, True) as state, apple.lock(state):
+            output = io.StringIO()
+            with patch.object(apple, "prepare", return_value=plan), patch.object(apple.sys, "argv", ["apple-build", "warm", "--wait-seconds", "1"]), patch.object(apple.time, "sleep", side_effect=KeyboardInterrupt), contextlib.redirect_stderr(output):
+                self.assertEqual(apple.main(), 130)
+            self.assertEqual(json.loads(output.getvalue())["state"], "cancelled")
+            self.assertNotIn(str(self.root), output.getvalue())
+            with self.assertRaisesRegex(apple.Refusal, "another Glaeda"):
+                self.run_plan(plan)
+            with self.assertRaises(FileNotFoundError):
+                apple.read_json(state, "inflight.json")
+
+    def test_invalid_wait_refused_before_store_creation(self):
+        for value in (-1, 3601, True, 1.5):
+            with self.subTest(value=value), self.assertRaises(apple.Refusal):
+                apple.execute(self.plan(), wait_seconds=value)
+        self.assertFalse((self.root / ".glaeda").exists())
+
     def test_revalidation_precedes_cache_mutation(self):
         plan = self.plan()
         self.tools["swift_version"] = "changed"

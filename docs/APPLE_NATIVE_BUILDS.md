@@ -43,6 +43,40 @@ Package resolution, compilation, bundling, and signing inside a project helper
 are not yet separately instrumented. Use these measurements to establish whether
 the next improvement belongs in Glaeda admission or the native workflow.
 
+## Multiple agents in one checkout
+
+Agents can wait for the current native operation instead of repeatedly retrying:
+
+```sh
+glaeda-apple ensure-dependencies --wait-seconds 300
+glaeda-apple check --wait-seconds 300
+# When a complete app build is needed:
+glaeda-apple warm --wait-seconds 300
+```
+
+`--wait-seconds` accepts an integer from 0 to 3600. Zero (the default) preserves
+immediate contention refusal. The deadline covers waiting for the project build
+lock, not compiler execution. Timeout never signals the active owner. Interrupting
+a waiter releases its waiting descriptor; Ctrl-C returns bounded JSON and status
+130. Waiting is cooperative admission, not a durable FIFO queue or a scheduler.
+A waiting process that exits leaves no queued request or background worker.
+
+After admission, Glaeda rechecks recovery/quarantine state, the current recipe and
+toolchain before running or creating cache state. A changed recipe is refused;
+request a new plan instead of treating an old request as permission for a different
+command. Source is observed at execution time, not pinned when waiting starts.
+`ensure-dependencies` can reuse the owner’s completed preparation only after its
+existing input/output checks pass under the lock. Checks and full builds still run
+native validation; they do not share a previous build’s success receipt.
+
+Use the separate operation receipts when agents report results: a code check is
+not an assembled app. The native build lock does not lock source editing, Git
+operations, direct builds or other tools. Agents still coordinate source/branch
+changes, avoid direct and managed builds concurrently, and assess source-before/
+after observations before claiming validation. Two dirty snapshots are not proof
+of identical source. No automatic pull watcher, prioritization, stale-build
+cancellation or native result coalescing is introduced by bounded admission.
+
 ## Profile format
 
 ### Check code without assembling a launchable app

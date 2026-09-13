@@ -55,6 +55,16 @@ Product details live in `README.md` and `docs/COMPUTE_RUNTIME.md`.
   raw logs, repository contents, environment dumps, and private paths out of
   public evidence.
 
+## Native Apple agent builds
+
+For configured projects, use `glaeda-apple ensure-dependencies --wait-seconds 300`
+for preparation and `glaeda-apple check --wait-seconds 300` for declared code checks.
+Use `warm --wait-seconds 300` when a complete app build is required. Preserve each
+project’s launch rules. The wait deadline covers admission only; a timeout does
+not authorize killing another builder or deleting its state. Coordinate source
+and branch edits separately, and never run direct and managed builds concurrently.
+See `docs/APPLE_NATIVE_BUILDS.md` for receipt scope and source-observation limits.
+
 ## Verify
 
 Use the repository profiles:

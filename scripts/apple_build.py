@@ -479,16 +479,26 @@ def inspect(plan):
 
 
 @contextlib.contextmanager
-def lock(state):
+def lock(state, wait_seconds=0):
     fd = os.open("build.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=state)
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1 or info.st_mode & 0o077:
             raise Refusal("build lock is unsafe")
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as error:
-            raise Refusal("another Glaeda Apple build owns this checkout") from error
+        deadline = time.monotonic() + wait_seconds
+        while True:
+            if wait_seconds and time.monotonic() >= deadline:
+                raise Refusal("Apple build wait deadline expired; active owner was not interrupted")
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError as error:
+                if not wait_seconds:
+                    raise Refusal("another Glaeda Apple build owns this checkout") from error
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise Refusal("Apple build wait deadline expired; active owner was not interrupted") from error
+                time.sleep(min(0.1, remaining))
         yield
     finally:
         os.close(fd)
@@ -553,11 +563,13 @@ def native_work_summary(state, run_id):
         return result
 
 
-def execute(plan, prepare_again=prepare, reuse_dependencies=False):
+def execute(plan, prepare_again=prepare, reuse_dependencies=False, wait_seconds=0):
+    if type(wait_seconds) is not int or not 0 <= wait_seconds <= 3600:
+        raise Refusal("wait seconds must be an integer from 0 to 3600")
     entered = time.monotonic()
     inspect(plan)
     waiting = time.monotonic()
-    with store(plan, create=True) as state, lock(state):
+    with store(plan, create=True) as state, (lock(state, wait_seconds) if wait_seconds else lock(state)):
         admitted = time.monotonic()
         # A previous owner can quarantine this generation between the first probe and lock.
         inspect(plan)
@@ -758,18 +770,26 @@ def main():
     parser.add_argument("--profile", default="app")
     parser.add_argument("--generation", default="default", help="stable label; use a new label for a cold rebuild without deleting old caches")
     parser.add_argument("--run-id", help="exact interrupted run id, only for recover")
+    parser.add_argument("--wait-seconds", type=int, default=0, help="wait up to 3600 seconds for native execution admission; default refuses contention")
     args = parser.parse_args()
     try:
         if (args.action == "recover") != bool(args.run_id):
             raise Refusal("--run-id is required only for recover")
+        if not 0 <= args.wait_seconds <= 3600:
+            raise Refusal("wait seconds must be an integer from 0 to 3600")
+        if args.wait_seconds and args.action not in ("check", "dependencies", "ensure-dependencies", "run", "warm"):
+            raise Refusal("--wait-seconds applies only to native execution")
         preparing = time.monotonic()
         operation = "dependencies" if args.action in ("dependencies", "ensure-dependencies", "plan-dependencies") else "check" if args.action in ("check", "plan-check") else "build"
         plan = prepare(args.project, args.profile, args.generation, operation=operation)
         preparation_seconds = round(time.monotonic() - preparing, 6)
-        result = explain(plan) if args.action == "explain" else inspect(plan) if args.action in ("plan", "plan-dependencies", "plan-check") else recover(plan, args.run_id) if args.action == "recover" else execute(plan, reuse_dependencies=args.action == "ensure-dependencies")
+        result = explain(plan) if args.action == "explain" else inspect(plan) if args.action in ("plan", "plan-dependencies", "plan-check") else recover(plan, args.run_id) if args.action == "recover" else execute(plan, reuse_dependencies=args.action == "ensure-dependencies", wait_seconds=args.wait_seconds)
         result["toolchain_and_profile_probe_seconds"] = preparation_seconds
         print(json.dumps(result, sort_keys=True))
         return result.get("exit_code", 0)
+    except KeyboardInterrupt:
+        print(json.dumps({"schema_version": 1, "state": "cancelled", "reason": "native Apple request interrupted"}), file=sys.stderr)
+        return 130
     except (Refusal, OSError, ValueError, KeyError, TypeError, AttributeError, subprocess.SubprocessError) as error:
         # Exception paths may contain private project/toolchain paths; public failures do not.
         message = str(error) if isinstance(error, Refusal) else "native Apple build observation or execution failed"
