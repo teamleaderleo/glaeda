@@ -279,6 +279,56 @@ fn exact_lima_2_2_named_absence_is_missing_evidence() {
 }
 
 #[test]
+fn named_absence_requires_two_exact_missing_observations() {
+    let executor = ScriptedExecutor::new([missing_instance_step(), missing_instance_step()]);
+    let absence = adapter()
+        .observe_named_absence(&request(30), &executor, &FakeClock::new([100, 104]))
+        .expect("strict named absence");
+
+    assert_eq!(absence.timing().duration_seconds, 4);
+    assert_eq!(executor.seen().len(), 2);
+    assert_eq!(executor.remaining(), 0);
+}
+
+#[test]
+fn named_absence_refuses_presence_and_absent_to_present_transition() {
+    let present = adapter()
+        .observe_named_absence(
+            &request(30),
+            &ScriptedExecutor::new([ScriptedStep::Output(ScriptedOutput::success(
+                instance_json("Stopped", INSTANCE_DIRECTORY, "vz", "aarch64", 4),
+            ))]),
+            &FakeClock::new([100]),
+        )
+        .expect_err("present instance");
+    assert_eq!(
+        present.code,
+        LimaObservationRefusalCode::UnexpectedInstanceEvidence
+    );
+
+    let transitioned = adapter()
+        .observe_named_absence(
+            &request(30),
+            &ScriptedExecutor::new([
+                missing_instance_step(),
+                ScriptedStep::Output(ScriptedOutput::success(instance_json(
+                    "Stopped",
+                    INSTANCE_DIRECTORY,
+                    "vz",
+                    "aarch64",
+                    4,
+                ))),
+            ]),
+            &FakeClock::new([100]),
+        )
+        .expect_err("absence changed to presence");
+    assert_eq!(
+        transitioned.code,
+        LimaObservationRefusalCode::UnexpectedInstanceEvidence
+    );
+}
+
+#[test]
 fn near_miss_absence_diagnostics_remain_command_failures() {
     for stderr in [
         concat!(
@@ -708,6 +758,21 @@ fn stopped_steps() -> Vec<ScriptedStep> {
             4,
         ))),
     ]
+}
+
+fn missing_instance_step() -> ScriptedStep {
+    ScriptedStep::Output(ScriptedOutput {
+        stdout: String::new(),
+        stderr: concat!(
+            "time=\"2026-08-16T14:39:23+08:00\" level=warning msg=\"No instance matching smolrunner found.\"\n",
+            "time=\"2026-08-16T14:39:23+08:00\" level=fatal msg=\"unmatched instances\"\n",
+        )
+        .to_owned(),
+        status: Some(1),
+        success: false,
+        argv_override: None,
+        environment_override: None,
+    })
 }
 
 fn running_failure_with_override(guest_step: usize, stdout: &str) -> LimaObservationFailure {
