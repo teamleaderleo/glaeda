@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import select
 import stat
 import subprocess
 import sys
@@ -82,7 +83,7 @@ def read_queue(state):
     for row in rows:
         if (not isinstance(row, dict) or set(row) != FIELDS or not valid_id(row["id"]) or row["id"] in ids
                 or row["state"] not in TERMINAL | {"pending", "running"}
-                or row["operation"] not in {"build", "check", "dependencies"}
+                or row["operation"] not in {"build", "check", "dependencies", "refresh"}
                 or not isinstance(row["profile"], str) or not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", row["profile"])
                 or not isinstance(row["generation"], str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", row["generation"])
                 or any(not isinstance(row[k], str) or not re.fullmatch(r"[a-f0-9]{64}", row[k]) for k in ("configuration", "runtime"))
@@ -105,7 +106,7 @@ def validate_result(result):
         return
     if not isinstance(result, dict) or set(result) != {"reason", "run_id", "exit_code", "source_before", "source_after"}:
         raise native.Refusal("invalid request result")
-    if result["reason"] not in (None, "worker_interrupted", "configuration_changed", "native_refused", "runtime_changed"):
+    if result["reason"] not in (None, "worker_interrupted", "configuration_changed", "native_refused", "runtime_changed", "dependency_preparation_failed"):
         raise native.Refusal("invalid request outcome")
     if result["run_id"] is not None and not valid_id(result["run_id"]):
         raise native.Refusal("invalid native run identity")
@@ -126,8 +127,67 @@ def write_queue(state, rows):
     native.write_json(state, "requests.json", ledger)
 
 
+def request_plan(project, profile, generation, operation, prepare=native.prepare):
+    if operation != "refresh":
+        return prepare(project, profile, generation, operation=operation)
+    check = prepare(project, profile, generation, operation="check")
+    dependencies = prepare(project, profile, generation, operation="dependencies")
+    if check["key"] != dependencies["key"]:
+        raise native.Refusal("refresh plans have different cache generations")
+    return {**check, "operation": "refresh", "refresh_dependencies": dependencies}
+
+
 def configuration(plan):
-    return native.digest([plan["key"], plan.get("invocation_identity"), plan.get("operation_identity"), plan.get("lineage")])
+    identity = [plan["key"], plan.get("invocation_identity"), plan.get("operation_identity"), plan.get("lineage")]
+    if plan["operation"] == "refresh":
+        identity.append(configuration(plan["refresh_dependencies"]))
+    return native.digest(identity)
+
+
+def execute_request(plan, prepare, execute):
+    if plan["operation"] == "refresh":
+        dependency_result = execute(plan["refresh_dependencies"], prepare, reuse_dependencies=True, wait_seconds=300)
+        if dependency_result.get("exit_code") != 0:
+            return "dependency_preparation_failed", dependency_result
+        check = {k: v for k, v in plan.items() if k != "refresh_dependencies"}
+        check["operation"] = "check"
+        return None, execute(check, prepare, wait_seconds=300)
+    return None, execute(plan, prepare, reuse_dependencies=plan["operation"] == "dependencies", wait_seconds=300)
+
+
+@contextlib.contextmanager
+def request_events(state):
+    if not hasattr(select, "kqueue"):
+        raise native.Refusal("request event waiting requires macOS or BSD kqueue")
+    # Watch the directory because the ledger is replaced atomically. Arm before
+    # reading status so completion between the read and sleep cannot be lost.
+    with contextlib.closing(select.kqueue()) as events:
+        event = select.kevent(state, filter=select.KQ_FILTER_VNODE,
+                             flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR,
+                             fflags=select.KQ_NOTE_WRITE | select.KQ_NOTE_RENAME | select.KQ_NOTE_DELETE)
+        events.control([event], 0, 0)
+        yield lambda seconds: events.control(None, 1, seconds)
+
+
+def wait_request(project, request_id, seconds, events=request_events):
+    if not valid_id(request_id) or type(seconds) is not int or not 0 <= seconds <= 3600:
+        raise native.Refusal("request wait requires an exact id and a deadline from 0 to 3600 seconds")
+    deadline = time.monotonic() + seconds
+    # Immediate/terminal reads need no platform-specific event facility.
+    result = status(project, request_id)
+    if result["state"] in TERMINAL or seconds == 0:
+        return {**result, "wait": "terminal" if result["state"] in TERMINAL else "deadline"}
+    with native.store(storage_plan(project)) as state, events(state) as changed:
+        while True:
+            # Reopen and validate the canonical store each time; an event itself
+            # never grants authority to a replaced path or proves completion.
+            result = status(project, request_id)
+            if result["state"] in TERMINAL:
+                return {**result, "wait": "terminal"}
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return {**result, "wait": "deadline"}
+            changed(remaining)
 
 
 def public(row):
@@ -230,11 +290,11 @@ def worker(project, prepare=native.prepare, execute=native.execute, debounce=0.3
                         if first["runtime"] != RUNTIME or runtime_identity() != RUNTIME:
                             reason = "runtime_changed"
                         else:
-                            plan = prepare(project, first["profile"], first["generation"], operation=first["operation"])
+                            plan = request_plan(project, first["profile"], first["generation"], first["operation"], prepare)
                             if configuration(plan) != first["configuration"]:
                                 reason = "configuration_changed"
                             else:
-                                receipt = execute(plan, prepare, reuse_dependencies=first["operation"] == "dependencies", wait_seconds=300)
+                                reason, receipt = execute_request(plan, prepare, execute)
                     except (native.Refusal, OSError, ValueError, KeyError, TypeError, AttributeError, subprocess.SubprocessError):
                         reason = "native_refused"
                     result = outcome(reason, receipt)

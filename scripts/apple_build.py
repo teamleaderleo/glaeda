@@ -765,7 +765,7 @@ def explain(plan):
 
 def main():
     parser = argparse.ArgumentParser(description="Prepare and run trusted native Apple builds with persistent project caches")
-    parser.add_argument("action", choices=("plan", "plan-check", "check", "plan-dependencies", "dependencies", "ensure-dependencies", "explain", "run", "warm", "recover", "submit", "request-status", "forget-request", "requests", "wake"))
+    parser.add_argument("action", choices=("plan", "plan-check", "check", "plan-dependencies", "dependencies", "ensure-dependencies", "explain", "run", "warm", "recover", "submit", "request-status", "forget-request", "requests", "wake", "wait-request", "plan-refresh", "refresh"))
     parser.add_argument("--project", type=Path, default=Path.cwd())
     parser.add_argument("--profile", default="app")
     parser.add_argument("--generation", default="default", help="stable label; use a new label for a cold rebuild without deleting old caches")
@@ -779,15 +779,25 @@ def main():
             raise Refusal("--run-id is required only for recover")
         if not 0 <= args.wait_seconds <= 3600:
             raise Refusal("wait seconds must be an integer from 0 to 3600")
-        if args.wait_seconds and args.action not in ("check", "dependencies", "ensure-dependencies", "run", "warm"):
+        if args.wait_seconds and args.action not in ("check", "dependencies", "ensure-dependencies", "run", "warm", "wait-request"):
             raise Refusal("--wait-seconds applies only to native execution")
-        if (args.action in ("request-status", "forget-request")) != bool(args.request_id):
-            raise Refusal("--request-id is required only for request-status or forget-request")
+        if (args.action in ("request-status", "forget-request", "wait-request")) != bool(args.request_id):
+            raise Refusal("--request-id is required only for request-status, forget-request or wait-request")
         if args.operation is not None and args.action != "submit":
             raise Refusal("--operation applies only to submit")
-        if args.action in ("submit", "request-status", "forget-request", "requests", "wake"):
+        if args.action in ("submit", "request-status", "forget-request", "requests", "wake", "wait-request", "plan-refresh", "refresh"):
             import apple_queue
-            if args.action == "submit":
+            if args.action in ("plan-refresh", "refresh"):
+                plan = apple_queue.request_plan(args.project, args.profile, args.generation, "refresh")
+                result = ({"check": inspect({**plan, "operation": "check"}),
+                           "dependencies": inspect(plan["refresh_dependencies"]),
+                           "policy": "reuse_declared_dependency_readiness_then_native_incremental_check"}
+                          if args.action == "plan-refresh" else apple_queue.submit(plan))
+            elif args.action == "wait-request":
+                result = apple_queue.wait_request(args.project, args.request_id, args.wait_seconds)
+                print(json.dumps(result, sort_keys=True))
+                return 124 if result["wait"] == "deadline" else 0 if result["state"] == "completed" else 1
+            elif args.action == "submit":
                 result = apple_queue.submit(prepare(args.project, args.profile, args.generation, operation=args.operation or "check"))
             elif args.action == "wake":
                 result = apple_queue.wake(args.project)

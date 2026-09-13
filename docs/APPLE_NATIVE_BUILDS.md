@@ -98,6 +98,55 @@ native build lock. Native command duration remains governed by the existing help
 The worker releases its ownership lock while holding the enqueue lock when idle,
 so an enqueue at normal worker exit cannot lose its wake.
 
+## Event-based result collection
+
+An active agent runner can start this bounded wait in its asynchronous process
+facility, continue independent work, and consume the process result on completion:
+
+```sh
+glaeda-apple wait-request --request-id <id> --wait-seconds 300
+```
+
+The wait registers a native directory event before re-reading the atomic ledger.
+Completion during registration is therefore observed without repeated polling.
+Every event triggers a fresh validated read of the exact request; unrelated events
+are not completion evidence. Already-terminal requests return immediately. Exit
+codes are 0 for completed, 1 for failed/interrupted, 124 for a deadline, 130 for
+caller interruption, and 2 for invalid/unavailable observations. Zero seconds
+performs one immediate observation. The maximum deadline is 3600 seconds.
+
+Waiting never wakes, cancels, forgets, or otherwise mutates the request or worker.
+A timeout leaves the durable request available for later collection. Positive
+pending waits require macOS/BSD kqueue; unsupported platforms refuse explicitly.
+This is an event interface for an active runner, not a mechanism for reopening a
+closed Codex task or sending it a message. That requires an app-side adapter.
+
+## Refresh after pulling or changing branches
+
+```sh
+glaeda-apple plan-refresh
+glaeda-apple refresh
+# Save request_id and collect it with wait-request or request-status.
+```
+
+`plan-refresh` is read-only. `refresh` queues one dependency-preparation-plus-check
+request using the project's declared preparation and check recipes. Both must
+exist, and both recipe identities are bound at submission. Equivalent pending
+refreshes share both stages. Preparation uses the existing declared input and
+required-file fingerprints: unchanged readiness skips the resolver; changed or
+missing evidence runs it. A failed preparation stops the refresh before the check.
+The native check always runs and decides which compiler work remains incremental.
+A successful refresh returns the check's receipt, not an app packaging result.
+
+The two stages independently acquire the ordinary native lock and revalidate their
+plans. Other managed work can run between them; this is not a source transaction.
+A crash leaves the request interrupted on the next explicit worker wake, including
+when preparation finished but the check did not. The normal exact-run recovery
+rules still apply. There are no automatic Git hooks, pulls, watchers, branch changes
+or cache deletion. Invoke refresh after your coordinated source change; matching
+native-policy cache generations survive it. This does not skip checks based on
+filename guesses or reuse a historical compilation-success result.
+
 ## Multiple agents in one checkout
 
 After a first managed run has initialized project state, agents can wait for the

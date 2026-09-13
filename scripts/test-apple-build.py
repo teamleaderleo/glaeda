@@ -537,6 +537,154 @@ class AppleQueueTests(unittest.TestCase):
     def work(self, execute=apple.execute):
         queue.worker(self.root, self.prepare, execute, debounce=0)
 
+    def refresh_plan(self):
+        (self.root / "Package.swift").write_text("// fixture")
+        config = json.loads((self.root / "glaeda.apple.json").read_text())
+        config["preparations"] = {"app": {"engine": "swiftpm"}}
+        config["checks"] = {"app": {"engine": "script", "executable": "build.sh"}}
+        (self.root / "glaeda.apple.json").write_text(json.dumps(config))
+        return queue.request_plan(self.root, "app", "default", "refresh", self.prepare)
+
+    def test_refresh_batches_preparation_and_check(self):
+        self.initialized()
+        plan = self.refresh_plan()
+        requests = [queue.submit(plan, lambda p: {}) for _ in range(2)]
+        operations = []
+        def execute(plan, prepare, **options):
+            operations.append((plan["operation"], options.get("reuse_dependencies", False)))
+            if plan["operation"] == "dependencies":
+                return {"exit_code": 0, "state": "preparation_reused"}
+            return apple.execute(plan, prepare)
+        self.work(execute)
+        self.assertEqual(operations, [("dependencies", True), ("check", False)])
+        results = [queue.status(self.root, r["request_id"]) for r in requests]
+        self.assertEqual({r["state"] for r in results}, {"completed"})
+        self.assertEqual(len({r["result"]["run_id"] for r in results}), 1)
+
+    def test_refresh_failure_stops_before_check(self):
+        self.initialized()
+        request = queue.submit(self.refresh_plan(), lambda p: {})
+        operations = []
+        def execute(plan, prepare, **options):
+            operations.append(plan["operation"])
+            return {"exit_code": 7}
+        self.work(execute)
+        result = queue.status(self.root, request["request_id"])
+        self.assertEqual(operations, ["dependencies"])
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(result["result"]["reason"], "dependency_preparation_failed")
+
+    def test_refresh_recipe_change_refuses_before_preparation(self):
+        self.initialized()
+        request = queue.submit(self.refresh_plan(), lambda p: {})
+        config = json.loads((self.root / "glaeda.apple.json").read_text())
+        config["preparations"]["app"]["package"] = "sub"
+        (self.root / "sub").mkdir()
+        (self.root / "sub/Package.swift").write_text("// fixture")
+        (self.root / "glaeda.apple.json").write_text(json.dumps(config))
+        self.work(lambda *args, **kwargs: self.fail("must refuse before execution"))
+        self.assertEqual(queue.status(self.root, request["request_id"])["result"]["reason"], "configuration_changed")
+
+    def test_refresh_revalidates_check_after_preparation(self):
+        self.initialized()
+        request = queue.submit(self.refresh_plan(), lambda p: {})
+        def execute(plan, prepare, **options):
+            if plan["operation"] == "dependencies":
+                self.script.write_text(self.script.read_text() + "# changed during preparation\n")
+                return {"exit_code": 0}
+            return apple.execute(plan, prepare)
+        self.work(execute)
+        result = queue.status(self.root, request["request_id"])
+        self.assertEqual((result["state"], result["result"]["reason"]), ("failed", "native_refused"))
+        self.assertFalse(list((self.root / ".glaeda/apple-build").glob("run-*.log")))
+
+    def test_wait_cli_deadline_and_terminal_exit_codes(self):
+        self.initialized()
+        request = self.submit()
+        argv = [sys.executable, str(Path(apple.__file__).resolve()), "wait-request",
+                "--project", str(self.root), "--request-id", request["request_id"]]
+        pending = subprocess.run(argv, capture_output=True, text=True, timeout=5)
+        self.assertEqual(pending.returncode, 124)
+        self.assertEqual(json.loads(pending.stdout)["wait"], "deadline")
+        self.work()
+        completed = subprocess.run(argv, capture_output=True, text=True, timeout=5)
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(json.loads(completed.stdout)["state"], "completed")
+
+    @unittest.skipUnless(hasattr(queue.select, "kqueue"), "requires native kqueue")
+    def test_real_wait_deadline_without_worker_does_not_mutate(self):
+        self.initialized()
+        request = self.submit()
+        ledger = self.root / ".glaeda/apple-build/requests.json"
+        before = ledger.read_bytes()
+        result = queue.wait_request(self.root, request["request_id"], 1)
+        self.assertEqual((result["state"], result["wait"]), ("pending", "deadline"))
+        self.assertEqual(ledger.read_bytes(), before)
+
+    def test_wait_deadline_preserves_pending_request(self):
+        self.initialized()
+        request = self.submit()
+        result = queue.wait_request(self.root, request["request_id"], 0)
+        self.assertEqual((result["state"], result["wait"]), ("pending", "deadline"))
+        self.assertEqual(queue.status(self.root, request["request_id"])["state"], "pending")
+        with self.assertRaises(apple.Refusal):
+            queue.wait_request(self.root, request["request_id"], 3601)
+
+    def test_wait_completion_during_event_registration_is_not_lost(self):
+        self.initialized()
+        request = self.submit()
+        @contextlib.contextmanager
+        def events(state):
+            self.work()
+            yield lambda seconds: self.fail("already completed before second read")
+        result = queue.wait_request(self.root, request["request_id"], 2, events)
+        self.assertEqual((result["state"], result["wait"]), ("completed", "terminal"))
+
+    def test_wait_ignores_unrelated_event_and_revalidates_ledger(self):
+        self.initialized()
+        request = self.submit()
+        ledger = self.root / ".glaeda/apple-build/requests.json"
+        @contextlib.contextmanager
+        def events(state):
+            def changed(seconds):
+                ledger.write_text("invalid")
+            yield changed
+        with self.assertRaises(apple.Refusal):
+            queue.wait_request(self.root, request["request_id"], 2, events)
+
+    @unittest.skipUnless(hasattr(queue.select, "kqueue"), "requires native kqueue")
+    def test_real_event_wait_observes_atomic_completion(self):
+        self.initialized()
+        request = self.submit()
+        ready = threading.Event()
+        errors = []
+        receipt = {"run_id": "a" * 32, "exit_code": 0,
+                   "source_before": {"commit": "b" * 40, "clean": True},
+                   "source_after": {"commit": "b" * 40, "clean": True}}
+        def complete():
+            try:
+                if not ready.wait(2):
+                    raise RuntimeError("waiter did not arm")
+                self.work(lambda *args, **kwargs: receipt)
+            except BaseException as error:
+                errors.append(error)
+        @contextlib.contextmanager
+        def events(state):
+            with queue.request_events(state) as changed:
+                def wait(seconds):
+                    ready.set()
+                    return changed(seconds)
+                yield wait
+        thread = threading.Thread(target=complete)
+        thread.start()
+        try:
+            result = queue.wait_request(self.root, request["request_id"], 3, events)
+        finally:
+            thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(result["state"], "completed")
+
     def test_pending_requests_share_one_native_run(self):
         self.initialized()
         requests = [self.submit() for _ in range(3)]
