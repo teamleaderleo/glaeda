@@ -748,7 +748,7 @@ def run(arguments: argparse.Namespace, profile: Profile = FOCUSED_PROFILE) -> in
     cargo_root = exact_directory(arguments.cargo_root, "Cargo root")
     rustup_root = exact_directory(arguments.rustup_root, "rustup root")
     state_root = private_state_directory(arguments.state_root)
-    semantic_request_id = getattr(arguments, "semantic_request_id", None)
+    semantic_request_id = vars(arguments).get("semantic_request_id")
     if semantic_request_id is not None:
         bind_semantic_request(state_root, semantic_request_id, request)
     verify_resident_source(repository_root, request)
