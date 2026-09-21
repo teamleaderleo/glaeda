@@ -1690,14 +1690,16 @@ def validate_hot_state_value_record_fields(
         or set(record) != record_keys
     ):
         raise RuntimeError("hot-state value record is invalid")
-    for key in (
+    integer_keys = [
         "manifest_device",
         "manifest_inode",
         "manifest_creation_witness_ns",
         "last_successful_use_sequence",
         "successful_use_count",
-        *("value_ticket_sequence",) if value_ticket_required else (),
-    ):
+    ]
+    if value_ticket_required:
+        integer_keys.append("value_ticket_sequence")
+    for key in integer_keys:
         value = record[key]
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise RuntimeError("hot-state value record is invalid")
