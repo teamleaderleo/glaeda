@@ -125,6 +125,14 @@ semantic_mismatches
 The reusable-state record has no field for paths, source contents, credentials, environment values,
 command output, or arbitrary logs.
 
+## Metric range
+
+Reusable-state counters, durations, and byte totals use their native integer type ranges. The policy
+does not impose lifecycle cutoffs such as "one trillion observations", "one year of accumulated
+duration", or "one TiB of state". Validation checks relationships between facts; derived reports
+return an explicit arithmetic-overflow error only when a requested calculation cannot be
+represented truthfully.
+
 ## Utility
 
 Utility is explicit and inspectable:
