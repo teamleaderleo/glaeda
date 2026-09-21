@@ -368,6 +368,46 @@ class AppleBuildTests(unittest.TestCase):
         self.assertNotIn(str(self.root), json.dumps(second))
         self.assertEqual(log.stat().st_mode & 0o777, 0o600)
 
+    def test_exact_source_contract_binds_commit_tree_and_clean_worktree(self):
+        (self.root / ".gitignore").write_text(".glaeda/\n")
+        subprocess.run(["/usr/bin/git", "-C", str(self.root), "add", ".gitignore", "build.sh", "glaeda.apple.json"], check=True)
+        subprocess.run(["/usr/bin/git", "-C", str(self.root), "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                        "commit", "--quiet", "-m", "bind fixture source"], check=True)
+        plan = self.plan()
+        expected = apple.source_snapshot(plan)
+        self.assertTrue(expected["clean"])
+        self.assertRegex(expected["tree"], r"^[a-f0-9]{40,64}$")
+        receipt = apple.execute(
+            plan, lambda *args: self.plan(args[2]),
+            expected_commit=expected["commit"], expected_tree=expected["tree"], require_clean_source=True)
+        self.assertEqual(receipt["source_validation"], "exact_commit_tree_clean")
+        self.assertEqual(receipt["source_before"], expected)
+        self.assertEqual(receipt["source_after"], expected)
+
+        product = Path(plan["paths"]["products"]) / "result"
+        product.unlink()
+        (self.root / "untracked.swift").write_text("// dirty\n")
+        with self.assertRaisesRegex(apple.Refusal, "clean-source"):
+            apple.execute(
+                self.plan(), lambda *args: self.plan(args[2]),
+                expected_commit=expected["commit"], expected_tree=expected["tree"], require_clean_source=True)
+        self.assertFalse(product.exists())
+
+        (self.root / "untracked.swift").unlink()
+        (self.root / "Tracked.swift").write_text("// next revision\n")
+        subprocess.run(["/usr/bin/git", "-C", str(self.root), "add", "Tracked.swift"], check=True)
+        subprocess.run(["/usr/bin/git", "-C", str(self.root), "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                        "commit", "--quiet", "-m", "next fixture source"], check=True)
+        current = apple.source_snapshot(self.plan())
+        with self.assertRaisesRegex(apple.Refusal, "expected source commit"):
+            apple.execute(
+                self.plan(), lambda *args: self.plan(args[2]),
+                expected_commit=expected["commit"], expected_tree=current["tree"], require_clean_source=True)
+        with self.assertRaisesRegex(apple.Refusal, "expected source tree"):
+            apple.execute(
+                self.plan(), lambda *args: self.plan(args[2]),
+                expected_commit=current["commit"], expected_tree=expected["tree"], require_clean_source=True)
+
     def test_parent_secrets_and_build_overrides_do_not_leak(self):
         with patch.dict(os.environ, {"SECRET_TOKEN": "secret", "CONFIG": "ambient-release", "SDKROOT": "/wrong"}):
             plan = self.plan()
