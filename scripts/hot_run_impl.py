@@ -1208,12 +1208,6 @@ def publish_implicit_state_base(
             expected_manifest, observed_manifest
         ):
             raise RuntimeError("hot-state producer manifest conflicts with this generation")
-        enqueue_hot_state_reconcile_ticket(
-            state_base.parent,
-            "state",
-            state_base.name,
-            state_base.name,
-        )
         return "reused"
 
     namespace_root = state_base.parent
@@ -3248,6 +3242,26 @@ def collect_one_unreachable_state(
             break
 
         if kind == "retired":
+            retired_path = namespace_root / name
+            retirement_record = namespace_root / retirement_record_name(
+                name, state_identity
+            )
+            try:
+                retired_exists = retired_path.lstat() is not None
+            except FileNotFoundError:
+                retired_exists = False
+            try:
+                record_exists = retirement_record.lstat() is not None
+            except FileNotFoundError:
+                record_exists = False
+            if not retired_exists and not record_exists:
+                try:
+                    remove_hot_state_reconcile_ticket(
+                        namespace_root, ticket_sequence
+                    )
+                except (OSError, RuntimeError):
+                    pass
+                continue
             complete = delete_retired_state_bounded(
                 namespace_root, name, state_identity
             )
