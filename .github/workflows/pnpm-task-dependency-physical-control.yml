@@ -271,7 +271,7 @@ jobs:
               widths: [1, 8, 32]
             }' > "$RECEIPTS/host.json"
 
-          install -m 0755 scripts/benchmark-pnpm-task-dependencies "$RUNNER_TEMP/benchmark-pnpm-task-dependencies"
+          sudo install -D -o root -g root -m 0755 scripts/benchmark-pnpm-task-dependencies "$MOUNT/bin/benchmark-pnpm-task-dependencies"
 
           for width in 1 8 32; do
             output="$RESULTS/${IMPORT_METHOD}-width-${width}.json"
@@ -290,7 +290,7 @@ jobs:
             fi
 
             set +e
-            sudo -u "$BENCH_USER" env -i               HOME="$BENCH_HOME"               PATH="$NODE_BIN:/usr/bin:/bin"               LANG=C.UTF-8               LC_ALL=C.UTF-8               CI=1               "$RUNNER_TEMP/benchmark-pnpm-task-dependencies" "${args[@]}"
+            sudo -u "$BENCH_USER" env -i               HOME="$BENCH_HOME"               PATH="$NODE_BIN:/usr/bin:/bin"               LANG=C.UTF-8               LC_ALL=C.UTF-8               CI=1               "$MOUNT/bin/benchmark-pnpm-task-dependencies" "${args[@]}"
             benchmark_rc=$?
             set -e
 
