@@ -334,13 +334,12 @@ impl ReusableStateMetrics {
 
     #[must_use]
     pub fn hit_rate_basis_points(&self) -> u16 {
-        u16::try_from(
-            self.hits
-                .saturating_mul(10_000)
-                .checked_div(self.lookups)
-                .unwrap_or(0),
-        )
-        .unwrap_or(10_000)
+        if self.lookups == 0 {
+            return 0;
+        }
+        let basis_points =
+            (u128::from(self.hits) * 10_000) / u128::from(self.lookups);
+        u16::try_from(basis_points).unwrap_or(10_000)
     }
 }
 
@@ -694,11 +693,15 @@ impl ReusableStatePromotionPolicy {
             return Err(ReusableStatePolicyError::InvalidPromotionPolicy);
         }
         let metrics = &generation.metrics;
-        let reset_rate = metrics
-            .reset_invalidation_count
-            .saturating_mul(1_000)
-            .checked_div(metrics.lookups)
-            .unwrap_or(u64::MAX);
+        let reset_rate = if metrics.lookups == 0 {
+            u64::MAX
+        } else {
+            u64::try_from(
+                (u128::from(metrics.reset_invalidation_count) * 1_000)
+                    / u128::from(metrics.lookups),
+            )
+            .unwrap_or(u64::MAX)
+        };
         Ok(
             generation.publication == ReusableStatePublicationState::Complete
                 && generation.integrity == ReusableStateIntegrityState::Verified
@@ -1514,6 +1517,7 @@ mod tests {
             semantic_mismatches: u64::MAX,
         };
         metrics.validate().expect("full u64 metric range is valid");
+        assert_eq!(metrics.hit_rate_basis_points(), 10_000);
         assert_eq!(
             metrics.utility().unwrap_err(),
             ReusableStatePolicyError::UtilityOverflow
