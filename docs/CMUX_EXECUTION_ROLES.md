@@ -43,15 +43,17 @@ A node is eligible for a role only when all of these agree:
 4. required node capabilities are present;
 5. a current accepted role canary exists;
 6. the canary matches the current #1056 enrollment generation;
-7. the canary matches the current execution capability generation;
-8. the canary accepted every capability needed by the role;
-9. toolchain-bound roles have a current immutable toolchain profile accepted by the canary.
+7. the canary matches the current Glaeda generation;
+8. the canary matches the current #1056 per-role acceptance-workload generation;
+9. the canary matches the current execution capability generation;
+10. the canary accepted every capability needed by the role;
+11. toolchain-bound roles bind a semantic profile to the exact accepted #1056 toolchain generation.
 
 Enrollment alone yields zero role eligibility.
 
-The node capability projection carries `enrollmentGeneration` from #1056 plus a separate `capabilityGeneration`. Any acceptance-relevant OS, hardware-class, Glaeda, toolchain, SDK, or capability change advances the appropriate generation and makes old role canaries stale. #1058 then drives the node through canary before routing resumes.
+The node capability projection carries `enrollmentGeneration`, exact `glaedaGeneration`, and `roleWorkloadGenerations` from #1056 plus a separate `capabilityGeneration`. Any acceptance-relevant OS, hardware-class, Glaeda, toolchain, SDK, workload, or capability change makes the affected role canary stale. #1058 then drives the node through canary before routing resumes.
 
-Toolchain profile IDs are immutable semantic names such as `apple-xcode-26-sdk-26`. Publishing one requires exact #1056 toolchain acceptance for the installed generation. A toolchain update publishes a new profile or capability generation; an old canary cannot silently authorize it.
+`toolchainProfiles` maps an immutable semantic name such as `apple-xcode-26-sdk-26` to the exact accepted #1056 toolchain-generation digest. A toolchain update changes that digest or publishes a new profile; the previous canary cannot authorize the changed toolchain.
 
 ## Machine capability classes
 
@@ -114,7 +116,8 @@ Every accepted role/profile pair requires current capacity evidence. Profiles wi
 
 A `glaeda-cmux-role-capacity/v1` receipt binds:
 
-- node, enrollment generation, capability generation, role, and resource profile;
+- node, enrollment generation, Glaeda generation, capability generation, role, and resource profile;
+- exact role-workload generation plus toolchain profile/generation context;
 - one local slot class and measured maximum concurrency;
 - `contentionEvidenceGeneration`, an immutable digest of the reviewed #760-style evidence;
 - validated completions;
@@ -192,6 +195,8 @@ Internal enrollment/capability/workload generation objects stay out of the human
 - insufficient CPU and memory classes;
 - failed role canary;
 - stale role canary after re-enrollment;
+- stale role canary after Glaeda or reviewed workload generation changes;
+- exact toolchain-generation change behind the same semantic profile;
 - draining node;
 - role invalidation after capability/toolchain upgrade;
 - multiple roles sharing a scarce physical lane;
@@ -199,6 +204,7 @@ Internal enrollment/capability/workload generation objects stay out of the human
 - external scheduler request for an ineligible role;
 - pressure changing between selection and local admission;
 - unmeasured resource profile refusal, including background work;
+- stale #760 capacity evidence after an acceptance-workload generation change;
 - #760-style capacity evidence fields;
 - one synthetic Mac with two roles;
 - one synthetic Linux node with two roles;
