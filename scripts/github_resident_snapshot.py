@@ -648,9 +648,12 @@ def sign_snapshot(
     )
     if public.returncode != 0:
         raise SnapshotError("snapshot signing key could not be read")
-    observed_public = public.stdout.decode("ascii", errors="strict").strip()
-    expected_public = reviewed["ssh_public_key"].split(" ", 2)
-    expected_public = " ".join(expected_public[:2])
+    observed_public_fields = public.stdout.decode("ascii", errors="strict").strip().split()
+    expected_public_fields = reviewed["ssh_public_key"].split()
+    if len(observed_public_fields) < 2 or len(expected_public_fields) < 2:
+        raise SnapshotError("snapshot signing public key is invalid")
+    observed_public = " ".join(observed_public_fields[:2])
+    expected_public = " ".join(expected_public_fields[:2])
     if observed_public != expected_public:
         raise SnapshotError("snapshot signing key disagrees with reviewed trust")
 
