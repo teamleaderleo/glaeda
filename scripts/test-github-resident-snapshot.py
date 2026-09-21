@@ -592,6 +592,7 @@ class ResidentSnapshotSigningAndTransportTests(unittest.TestCase):
             new_b,
             current_trust,
             now=update_time,
+            refresh_interval_seconds=30,
             ssh_keygen=SSH_KEYGEN,
         )
 
@@ -672,6 +673,7 @@ class ResidentSnapshotSigningAndTransportTests(unittest.TestCase):
             new_b,
             current_trust,
             now=update_time,
+            refresh_interval_seconds=30,
             ssh_keygen=SSH_KEYGEN,
         )
         interim = MODULE.consume_fleet(
