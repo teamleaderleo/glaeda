@@ -2500,9 +2500,16 @@ def retire_one_low_value_state(
                     state_descriptor, state_identity
                 )
             )
+            if not manifest_has_full_execution_namespace_lease(manifest):
+                try:
+                    remove_hot_state_value_ticket(
+                        namespace_root, ticket_sequence
+                    )
+                except (OSError, RuntimeError):
+                    pass
+                continue
             if (
-                not manifest_has_full_execution_namespace_lease(manifest)
-                or manifest_generation_reachable(manifest) is not True
+                manifest_generation_reachable(manifest) is not True
                 or record["manifest_device"] != manifest_identity.device
                 or record["manifest_inode"] != manifest_identity.inode
                 or record["manifest_creation_witness_ns"]
