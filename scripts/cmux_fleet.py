@@ -63,7 +63,8 @@ TRANSITIONS = {
 }
 ENROLLMENT_KEYS = {
     "schema", "nodeId", "architecture", "os", "hardwareCapabilityClass",
-    "supportedToolchainGenerations", "allowedExecutionRoles", "operatorFleetScope",
+    "supportedToolchainGenerations", "roleWorkloadGenerations",
+    "allowedExecutionRoles", "operatorFleetScope",
     "enrollmentGeneration", "glaedaGeneration", "state", "quarantineReason",
 }
 ACCEPTANCE_EVIDENCE_KEYS = {
@@ -141,6 +142,16 @@ def validate_enrollment(value: object) -> dict[str, Any]:
     roles = sorted_unique_strings(doc["allowedExecutionRoles"], "allowed execution roles", allowed=set(ROLES))
     if not roles:
         raise FleetError("at least one execution role is required")
+    workload_generations = doc["roleWorkloadGenerations"]
+    if (
+        not isinstance(workload_generations, dict)
+        or set(workload_generations) != set(roles)
+        or any(
+            not isinstance(value, str) or SHA256_RE.fullmatch(value) is None
+            for value in workload_generations.values()
+        )
+    ):
+        raise FleetError("role workload generations must exactly cover allowed roles")
     unreviewed = [role for role in roles if role not in ENROLLABLE_ROLES]
     if unreviewed:
         raise FleetError(
@@ -192,6 +203,7 @@ def enrollment_from_bootstrap(
         "supportedToolchainGenerations": [
             bootstrap_value.get("toolchainGeneration")
         ],
+        "roleWorkloadGenerations": bootstrap_value.get("roleWorkloadGenerations"),
         "allowedExecutionRoles": bootstrap_value.get("roles"),
         "operatorFleetScope": operator_fleet_scope,
         "enrollmentGeneration": enrollment_generation,
@@ -299,6 +311,8 @@ def acceptance_matches_enrollment(enrollment: dict[str, Any], receipt: dict[str,
         return False, "acceptance_glaeda_stale"
     if receipt.get("toolchainGeneration") not in enrollment["supportedToolchainGenerations"]:
         return False, "acceptance_toolchain_stale"
+    if receipt.get("workloadGeneration") != enrollment["roleWorkloadGenerations"].get(role):
+        return False, "acceptance_workload_stale"
     return True, "accepted"
 
 
@@ -315,6 +329,8 @@ def finalize_acceptance(enrollment_value: object, evidence_value: object) -> dic
         raise FleetError("acceptance toolchain generation is outside the enrollment allowlist")
     if evidence["glaedaGeneration"] != enrollment["glaedaGeneration"]:
         raise FleetError("acceptance Glaeda generation differs from current enrollment")
+    if evidence["workloadGeneration"] != enrollment["roleWorkloadGenerations"].get(evidence["role"]):
+        raise FleetError("acceptance workload generation differs from current enrollment")
     result = "accepted" if all(v == "pass" for v in evidence["checks"].values()) else "rejected"
     receipt = {
         "schema": ACCEPTANCE_SCHEMA,
@@ -368,6 +384,7 @@ def node_status(enrollment_value: object, acceptance_values: list[object]) -> di
             "supportedToolchainGenerations": enrollment[
                 "supportedToolchainGenerations"
             ],
+            "roleWorkloadGenerations": enrollment["roleWorkloadGenerations"],
             "glaedaGeneration": enrollment["glaedaGeneration"],
             "operatorFleetScope": enrollment["operatorFleetScope"],
         },
