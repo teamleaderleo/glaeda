@@ -93,6 +93,27 @@ The benchmark binds the full scratch mount identity before materialization. At t
 
 Summary distributions publish p50/p90/p99 over successful samples. Explicit `clone` requires every sampled non-empty package-payload regular file to have observable shared FIEMAP extents in every task, while the exhaustive link-count scan must remain free of hardlinks. Explicit `hardlink` requires shared-inode evidence in every task. Any multiply-linked regular dependency file makes the task hardlink-observed and blocks repository probe execution. `auto` reports the observed physical mechanism without granting it policy authority.
 
+## Hosted Linux physical control
+
+`.github/workflows/pnpm-task-dependency-physical-control.yml` supplies a disposable GitHub-hosted Linux control for this benchmark. It is a control plane for physical evidence, not the resident-project promotion environment.
+
+The workflow pins:
+
+- benchmark code to the pull-request head or dispatched commit;
+- Node 22.19.0 and pnpm 12.5.1;
+- the real `APIDevTools/swagger-parser` repository at commit `b86714364809f4806728d80c24771859e3224a4e`;
+- 32 GiB sparse loop images with either ext4 or XFS `reflink=1`;
+- one benchmark user whose home, resident pnpm store, source, scratch, and results live on the selected filesystem;
+- no package-manager network access during measured installs.
+
+The full matrix runs `auto`, `hardlink`, and `clone` at widths 1/8/32 with 20 repetitions. The explicit XFS clone arm must prove reflink in every successful task; hardlink controls must prove shared inodes. The ext4 clone arm may produce a failed treatment receipt when the filesystem cannot satisfy explicit clone semantics.
+
+A second real-repository composition makes the prehydrated resident store root-owned and read-only. With Linux protected-hardlink policy recorded, it compares ext4 `auto` expected to fall through to private copies against XFS explicit `clone`, then runs the same `test:node` repository probe at widths 1/8/32 for 10 repetitions. This supplies task-ready, first-command, first-test, FIEMAP/nlink, filesystem free-space, visible `st_blocks`, backing-allocation, and cleanup receipts in one bounded path.
+
+Every job records kernel/tool/filesystem/source identities, syncs the mounted filesystem before backing-file allocation measurement, unmounts the loop filesystem, detaches the loop device, deletes the sparse image, and removes the benchmark user. The workflow installs no filesystem packages; missing ext4/XFS tooling is an explicit control failure.
+
+GitHub-hosted results remain a platform control. Product promotion still requires the reviewed resident-Linux project-disk path, including the existing project ownership/recovery gates.
+
 ## Interruption boundary
 
 The live benchmark generation owns only materialization attempts it actually starts. A partial `git worktree add` attempt enters cleanup ownership before the Git command is invoked, so an error after registration can still be checked against Git's worktree registry and cleaned exactly. Dependency/command cohorts run in owned process groups with deadline TERM/KILL cleanup.

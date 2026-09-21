@@ -1,0 +1,383 @@
+name: pnpm task dependency physical control
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/pnpm-task-dependency-physical-control.yml"
+      - "scripts/benchmark-pnpm-task-dependencies"
+      - "scripts/test-benchmark-pnpm-task-dependencies.py"
+      - "docs/PNPM_TASK_DEPENDENCY_BENCHMARK.md"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pnpm-task-dependency-physical-control-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SOURCE_REPOSITORY: APIDevTools/swagger-parser
+  SOURCE_COMMIT: b86714364809f4806728d80c24771859e3224a4e
+  NODE_VERSION: 22.19.0
+  PNPM_VERSION: 12.5.1
+  LOOP_IMAGE_BYTES: "34359738368"
+
+jobs:
+  physical:
+    name: ${{ matrix.mode }} / ${{ matrix.filesystem }} / ${{ matrix.method }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - mode: matrix
+            filesystem: ext4
+            method: auto
+            repetitions: 20
+            store_policy: user
+            probe_script: ""
+            expected_mechanism: ""
+            must_succeed: "true"
+          - mode: matrix
+            filesystem: ext4
+            method: hardlink
+            repetitions: 20
+            store_policy: user
+            probe_script: ""
+            expected_mechanism: hardlink_observed
+            must_succeed: "true"
+          - mode: matrix
+            filesystem: ext4
+            method: clone
+            repetitions: 20
+            store_policy: user
+            probe_script: ""
+            expected_mechanism: ""
+            must_succeed: "false"
+          - mode: matrix
+            filesystem: xfs
+            method: auto
+            repetitions: 20
+            store_policy: user
+            probe_script: ""
+            expected_mechanism: ""
+            must_succeed: "true"
+          - mode: matrix
+            filesystem: xfs
+            method: hardlink
+            repetitions: 20
+            store_policy: user
+            probe_script: ""
+            expected_mechanism: hardlink_observed
+            must_succeed: "true"
+          - mode: matrix
+            filesystem: xfs
+            method: clone
+            repetitions: 20
+            store_policy: user
+            probe_script: ""
+            expected_mechanism: reflink_observed
+            must_succeed: "true"
+          - mode: composed
+            filesystem: ext4
+            method: auto
+            repetitions: 10
+            store_policy: readonly
+            probe_script: test:node
+            expected_mechanism: copy_observed
+            must_succeed: "true"
+          - mode: composed
+            filesystem: xfs
+            method: clone
+            repetitions: 10
+            store_policy: readonly
+            probe_script: test:node
+            expected_mechanism: reflink_observed
+            must_succeed: "true"
+
+    steps:
+      - name: Check out exact benchmark head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+          show-progress: false
+
+      - name: Install exact Node runtime
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Activate exact pnpm
+        run: |
+          corepack enable
+          corepack prepare "pnpm@${PNPM_VERSION}" --activate
+          test "$(node --version)" = "v${NODE_VERSION}"
+          test "$(pnpm --version)" = "${PNPM_VERSION}"
+          printf 'NODE_BIN=%s\n' "$(dirname "$(command -v node)")" >> "$GITHUB_ENV"
+          printf 'PNPM_BIN=%s\n' "$(command -v pnpm)" >> "$GITHUB_ENV"
+
+      - name: Validate benchmark contract
+        run: python3 scripts/test-benchmark-pnpm-task-dependencies.py
+
+      - name: Run physical control
+        env:
+          MODE: ${{ matrix.mode }}
+          FILESYSTEM: ${{ matrix.filesystem }}
+          IMPORT_METHOD: ${{ matrix.method }}
+          REPETITIONS: ${{ matrix.repetitions }}
+          STORE_POLICY: ${{ matrix.store_policy }}
+          PROBE_SCRIPT: ${{ matrix.probe_script }}
+          EXPECTED_MECHANISM: ${{ matrix.expected_mechanism }}
+          MUST_SUCCEED: ${{ matrix.must_succeed }}
+          BENCHMARK_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -Eeuo pipefail
+
+          for command in git jq losetup mount umount mountpoint findmnt truncate mkfs.ext4 sync sha256sum; do
+            command -v "$command" >/dev/null
+          done
+          if test "$FILESYSTEM" = xfs; then
+            command -v mkfs.xfs >/dev/null
+            command -v xfs_info >/dev/null
+          fi
+
+          RECEIPTS="$RUNNER_TEMP/pnpm-${MODE}-${FILESYSTEM}-${IMPORT_METHOD}"
+          IMAGE="$RUNNER_TEMP/pnpm-${MODE}-${FILESYSTEM}-${IMPORT_METHOD}.img"
+          MOUNT="/mnt/glaeda-pnpm-${MODE}-${FILESYSTEM}-${IMPORT_METHOD}"
+          BENCH_USER="glaeda-pnpm-bench"
+          BENCH_HOME="$MOUNT/home"
+          SOURCE="$MOUNT/source"
+          SCRATCH="$MOUNT/scratch"
+          RESULTS="$MOUNT/results"
+          LOOP=""
+
+          mkdir -p "$RECEIPTS"
+
+          cleanup() {
+            set +e
+            unmounted=true
+            loop_detached=true
+            image_removed=true
+            user_removed=true
+
+            if mountpoint -q "$MOUNT"; then
+              sudo umount "$MOUNT" || unmounted=false
+            fi
+            if test -n "$LOOP" && sudo losetup "$LOOP" >/dev/null 2>&1; then
+              sudo losetup -d "$LOOP" || loop_detached=false
+            fi
+            if test -e "$IMAGE"; then
+              rm -f "$IMAGE" || image_removed=false
+            fi
+            if id "$BENCH_USER" >/dev/null 2>&1; then
+              sudo userdel "$BENCH_USER" >/dev/null 2>&1 || user_removed=false
+            fi
+            sudo rmdir "$MOUNT" >/dev/null 2>&1 || true
+
+            jq -n               --argjson unmounted "$unmounted"               --argjson loop_detached "$loop_detached"               --argjson image_removed "$image_removed"               --argjson user_removed "$user_removed"               '{
+                unmounted: $unmounted,
+                loop_detached: $loop_detached,
+                image_removed: $image_removed,
+                benchmark_user_removed: $user_removed
+              }' > "$RECEIPTS/cleanup.json"
+            set -e
+          }
+          trap cleanup EXIT
+
+          truncate -s "$LOOP_IMAGE_BYTES" "$IMAGE"
+          LOOP="$(sudo losetup --find --show "$IMAGE")"
+          if test "$FILESYSTEM" = xfs; then
+            sudo mkfs.xfs -f -m reflink=1 "$LOOP" >/dev/null
+            MKFS_VERSION="$(mkfs.xfs -V 2>&1 | head -n 1)"
+          else
+            sudo mkfs.ext4 -F -q "$LOOP"
+            MKFS_VERSION="$(mke2fs -V 2>&1 | head -n 1)"
+          fi
+
+          sudo mkdir -p "$MOUNT"
+          sudo mount -o noatime "$LOOP" "$MOUNT"
+          test "$(findmnt -n -o FSTYPE --target "$MOUNT")" = "$FILESYSTEM"
+
+          sudo useradd --home-dir "$BENCH_HOME" --no-create-home --shell /bin/bash "$BENCH_USER"
+          BENCH_UID="$(id -u "$BENCH_USER")"
+          BENCH_GID="$(id -g "$BENCH_USER")"
+          sudo install -d -o "$BENCH_UID" -g "$BENCH_GID" -m 0700             "$BENCH_HOME" "$SOURCE" "$SCRATCH" "$RESULTS"
+
+          sudo -u "$BENCH_USER" env HOME="$BENCH_HOME" PATH="$NODE_BIN:/usr/bin:/bin" git -C "$SOURCE" init -q
+          sudo -u "$BENCH_USER" env HOME="$BENCH_HOME" PATH="$NODE_BIN:/usr/bin:/bin" git -C "$SOURCE" remote add origin "https://github.com/${SOURCE_REPOSITORY}.git"
+          sudo -u "$BENCH_USER" env HOME="$BENCH_HOME" PATH="$NODE_BIN:/usr/bin:/bin" git -C "$SOURCE" fetch -q --depth=1 origin "$SOURCE_COMMIT"
+          sudo -u "$BENCH_USER" env HOME="$BENCH_HOME" PATH="$NODE_BIN:/usr/bin:/bin" git -C "$SOURCE" checkout -q --detach FETCH_HEAD
+          test "$(sudo -u "$BENCH_USER" git -C "$SOURCE" rev-parse HEAD)" = "$SOURCE_COMMIT"
+
+          sudo -u "$BENCH_USER" env             HOME="$BENCH_HOME"             PATH="$NODE_BIN:/usr/bin:/bin"             NPM_CONFIG_USERCONFIG=/dev/null             PNPM_CONFIG_VIRTUAL_STORE_TYPE=project             bash -c 'cd "$1" && exec "$2" install --frozen-lockfile --ignore-scripts --virtual-store-dir=node_modules/.pnpm'             bash "$SOURCE" "$PNPM_BIN"
+
+          STORE="$(sudo -u "$BENCH_USER" env             HOME="$BENCH_HOME"             PATH="$NODE_BIN:/usr/bin:/bin"             NPM_CONFIG_USERCONFIG=/dev/null             PNPM_CONFIG_VIRTUAL_STORE_TYPE=project             bash -c 'cd "$1" && exec "$2" store path --silent'             bash "$SOURCE" "$PNPM_BIN")"
+          test -d "$STORE"
+
+          if test "$STORE_POLICY" = readonly; then
+            sudo chown -R root:root "$STORE"
+            sudo find "$STORE" -xdev -type d -exec chmod 0555 {} +
+            sudo find "$STORE" -xdev -type f -exec chmod 0444 {} +
+          fi
+
+          SOURCE_TREE="$(sudo -u "$BENCH_USER" git -C "$SOURCE" rev-parse 'HEAD^{tree}')"
+          MOUNT_INFO="$(findmnt -n -o ID,MAJ:MIN,FSTYPE,OPTIONS --target "$MOUNT")"
+          if test "$FILESYSTEM" = xfs; then
+            FS_DETAIL="$(sudo xfs_info "$MOUNT")"
+            printf '%s\n' "$FS_DETAIL" | grep -Eq 'reflink=1'
+          else
+            FS_DETAIL="$(sudo tune2fs -l "$LOOP" 2>/dev/null | grep -E 'Filesystem features:|Block size:|Filesystem state:')"
+          fi
+          STORE_STAT="$(sudo stat -c 'uid=%u gid=%g mode=%a device=%d inode=%i' "$STORE")"
+
+          jq -n             --arg benchmark_head "$BENCHMARK_HEAD"             --arg source_repository "$SOURCE_REPOSITORY"             --arg source_commit "$SOURCE_COMMIT"             --arg source_tree "$SOURCE_TREE"             --arg mode "$MODE"             --arg filesystem "$FILESYSTEM"             --arg import_method "$IMPORT_METHOD"             --arg probe_script "$PROBE_SCRIPT"             --arg expected_mechanism "$EXPECTED_MECHANISM"             --arg store_policy "$STORE_POLICY"             --arg kernel "$(uname -srvm)"             --arg runner_image "${ImageOS:-unknown}"             --arg node "$(node --version)"             --arg pnpm "$(pnpm --version)"             --arg git "$(git --version)"             --arg mkfs_version "$MKFS_VERSION"             --arg mount_info "$MOUNT_INFO"             --arg fs_detail "$FS_DETAIL"             --arg store_stat "$STORE_STAT"             --arg protected_hardlinks "$(sysctl -n fs.protected_hardlinks 2>/dev/null || printf unknown)"             --argjson loop_image_bytes "$LOOP_IMAGE_BYTES"             --argjson repetitions "$REPETITIONS"             '{
+              schema_version: 1,
+              document_type: "glaeda-pnpm-hosted-physical-control",
+              authority: "performance_observation_only",
+              benchmark_head: $benchmark_head,
+              mode: $mode,
+              source: {
+                repository: $source_repository,
+                commit: $source_commit,
+                tree: $source_tree,
+                probe_script: $probe_script
+              },
+              toolchain: {
+                node: $node,
+                pnpm: $pnpm,
+                git: $git
+              },
+              filesystem: {
+                type: $filesystem,
+                mkfs_version: $mkfs_version,
+                mount_info: $mount_info,
+                detail: $fs_detail,
+                loop_image_logical_bytes: $loop_image_bytes
+              },
+              store: {
+                policy: $store_policy,
+                stat: $store_stat
+              },
+              kernel: $kernel,
+              runner_image: $runner_image,
+              protected_hardlinks: $protected_hardlinks,
+              import_method: $import_method,
+              expected_mechanism: $expected_mechanism,
+              repetitions: $repetitions,
+              widths: [1, 8, 32]
+            }' > "$RECEIPTS/host.json"
+
+          install -m 0755 scripts/benchmark-pnpm-task-dependencies "$RUNNER_TEMP/benchmark-pnpm-task-dependencies"
+
+          for width in 1 8 32; do
+            output="$RESULTS/${IMPORT_METHOD}-width-${width}.json"
+            receipt="$RECEIPTS/${IMPORT_METHOD}-width-${width}.json"
+            args=(
+              --source "$SOURCE"
+              --scratch-root "$SCRATCH"
+              --pnpm "$PNPM_BIN"
+              --fanout "$width"
+              --import-method "$IMPORT_METHOD"
+              --repetitions "$REPETITIONS"
+              --output "$output"
+            )
+            if test -n "$PROBE_SCRIPT"; then
+              args+=(--probe-script "$PROBE_SCRIPT")
+            fi
+
+            set +e
+            sudo -u "$BENCH_USER" env               HOME="$BENCH_HOME"               PATH="$NODE_BIN:/usr/bin:/bin"               "$RUNNER_TEMP/benchmark-pnpm-task-dependencies" "${args[@]}"
+            benchmark_rc=$?
+            set -e
+
+            if ! sudo test -f "$output"; then
+              printf 'error: benchmark failed before writing width %s receipt (rc=%s)\n' "$width" "$benchmark_rc" >&2
+              exit 1
+            fi
+            sudo -u "$BENCH_USER" cat "$output" > "$receipt"
+            printf '%s\n' "$benchmark_rc" > "$RECEIPTS/${IMPORT_METHOD}-width-${width}.rc"
+
+            jq -e               --arg fs "$FILESYSTEM"               --arg commit "$SOURCE_COMMIT"               --arg pnpm "$PNPM_VERSION"               --argjson repetitions "$REPETITIONS"               '.source.commit == $commit and
+               .pnpm.version == $pnpm and
+               .pnpm.virtual_store_type == "project" and
+               .filesystem_before.filesystem_type == $fs and
+               (.samples | length) == $repetitions'               "$receipt" >/dev/null
+
+            if test "$MUST_SUCCEED" = true; then
+              jq -e --argjson repetitions "$REPETITIONS" '
+                .result == "succeeded" and
+                .summary.successful_samples == $repetitions
+              ' "$receipt" >/dev/null
+            fi
+            if test -n "$EXPECTED_MECHANISM"; then
+              jq -e                 --arg mechanism "$EXPECTED_MECHANISM"                 --argjson repetitions "$REPETITIONS"                 '.result == "succeeded" and
+                 .summary.successful_samples == $repetitions and
+                 all(.samples[];
+                   .result == "succeeded" and
+                   (.observed_import_mechanisms == [$mechanism]))
+                ' "$receipt" >/dev/null
+            fi
+            if test -n "$PROBE_SCRIPT"; then
+              jq -e '
+                all(.samples[];
+                  .result == "succeeded" and
+                  (.task_known_to_first_relevant_script_complete_seconds != null))
+              ' "$receipt" >/dev/null
+            fi
+          done
+
+          sync -f "$MOUNT"
+          IMAGE_ALLOCATED_BYTES="$(du -B1 "$IMAGE" | awk '{print $1}')"
+          jq -n             --argjson logical_bytes "$LOOP_IMAGE_BYTES"             --argjson allocated_bytes "$IMAGE_ALLOCATED_BYTES"             '{
+              sync_boundary: "sync -f mounted project filesystem",
+              loop_image_logical_bytes: $logical_bytes,
+              loop_image_allocated_bytes_before_cleanup: $allocated_bytes
+            }' > "$RECEIPTS/backing.json"
+
+          cleanup
+          trap - EXIT
+          jq -e '.unmounted and .loop_detached and .image_removed and .benchmark_user_removed'             "$RECEIPTS/cleanup.json" >/dev/null
+
+          python3 - "$RECEIPTS" <<'PY'
+          import json
+          import os
+          import pathlib
+          import sys
+
+          root = pathlib.Path(sys.argv[1])
+          rows = []
+          for path in sorted(root.glob("*-width-*.json")):
+              report = json.loads(path.read_text())
+              rows.append({
+                  "receipt": path.name,
+                  "result": report["result"],
+                  "successful_samples": report["summary"]["successful_samples"],
+                  "failed_samples": report["summary"]["failed_samples"],
+                  "mechanisms": report["summary"]["observed_import_mechanism_sample_counts"],
+                  "distributions": report["summary"]["distributions"],
+              })
+          (root / "summary.json").write_text(
+              json.dumps({"rows": rows}, indent=2, sort_keys=True) + "\n"
+          )
+          with open(pathlib.Path(os.environ["GITHUB_STEP_SUMMARY"]), "a") as summary:
+              summary.write("| receipt | result | successful | mechanisms |\n")
+              summary.write("|---|---|---:|---|\n")
+              for row in rows:
+                  summary.write(
+                      f"| {row['receipt']} | {row['result']} | "
+                      f"{row['successful_samples']} | "
+                      f"{json.dumps(row['mechanisms'], sort_keys=True)} |\n"
+                  )
+          PY
+
+      - name: Upload physical receipts
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: pnpm-${{ matrix.mode }}-${{ matrix.filesystem }}-${{ matrix.method }}
+          path: ${{ runner.temp }}/pnpm-${{ matrix.mode }}-${{ matrix.filesystem }}-${{ matrix.method }}
+          if-no-files-found: error
