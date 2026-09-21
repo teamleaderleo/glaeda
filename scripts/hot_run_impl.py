@@ -2457,6 +2457,48 @@ def hot_state_filesystem_used_percent(namespace_root: Path) -> tuple[int, int]:
     return blocks - available, blocks
 
 
+def requeue_hot_state_value_ticket(
+    namespace_root: Path,
+    catalog: dict[str, object],
+    record: dict[str, object],
+    old_ticket_sequence: int,
+) -> dict[str, object]:
+    state_identity = record["state_identity"]
+    last_use = record["last_successful_use_sequence"]
+    assert isinstance(state_identity, str)
+    assert isinstance(last_use, int)
+    next_ticket = int(catalog["next_value_ticket_sequence"]) + 1
+    updated_catalog = {
+        **catalog,
+        "next_value_ticket_sequence": next_ticket,
+    }
+    write_hot_state_value_catalog(namespace_root, updated_catalog)
+    write_hot_state_value_ticket(
+        namespace_root,
+        next_ticket,
+        state_identity,
+        last_use,
+    )
+    fields = {
+        key: value
+        for key, value in record.items()
+        if key not in {"schema_version", "producer", "state_identity"}
+    }
+    fields["value_ticket_sequence"] = next_ticket
+    write_hot_state_value_record(
+        namespace_root,
+        state_identity,
+        fields,
+    )
+    try:
+        remove_hot_state_value_ticket(
+            namespace_root, old_ticket_sequence
+        )
+    except (OSError, RuntimeError):
+        pass
+    return updated_catalog
+
+
 def retire_one_low_value_state(
     namespace_root: Path, current_state_identity: str
 ) -> str:
@@ -2483,39 +2525,66 @@ def retire_one_low_value_state(
             else "ordinary_free_space"
         )
 
-    sequence = catalog["next_use_sequence"]
-    assert isinstance(sequence, int)
-    candidates: list[tuple[int, str, dict[str, object]]] = []
-    for record in read_all_hot_state_value_records(namespace_root, sequence):
-        state_identity = record["state_identity"]
-        assert isinstance(state_identity, str)
-        if state_identity == current_state_identity:
-            continue
-        state = namespace_root / state_identity
+    cursor = int(catalog["value_cursor_ticket_sequence"])
+    initial_next_ticket = int(catalog["next_value_ticket_sequence"])
+    namespace_details = namespace_root.stat(follow_symlinks=False)
+    processed = 0
+    retired = False
+
+    while (
+        processed < HOT_STATE_VALUE_TICKETS_PER_PASS
+        and cursor < initial_next_ticket
+    ):
+        ticket_sequence = cursor + 1
+        cursor = ticket_sequence
+        processed += 1
         try:
-            state.lstat()
-        except FileNotFoundError:
+            ticket = read_hot_state_value_ticket(
+                namespace_root, ticket_sequence
+            )
+        except (OSError, RuntimeError):
+            ticket = None
+        if ticket is None:
+            continue
+
+        state_identity = ticket["state_identity"]
+        assert isinstance(state_identity, str)
+        try:
+            record = read_hot_state_value_record(
+                namespace_root, state_identity
+            )
+        except (OSError, RuntimeError):
+            record = None
+        if (
+            record is None
+            or record["value_ticket_sequence"] != ticket_sequence
+            or record["last_successful_use_sequence"]
+            != ticket["last_successful_use_sequence"]
+        ):
             try:
-                remove_hot_state_value_record(namespace_root, state_identity)
-            except OSError:
+                remove_hot_state_value_ticket(
+                    namespace_root, ticket_sequence
+                )
+            except (OSError, RuntimeError):
                 pass
             continue
-        except OSError:
-            continue
-        candidates.append(
-            (
-                int(record["last_successful_use_sequence"]),
-                state_identity,
-                record,
-            )
-        )
-    candidates.sort(key=lambda item: (item[0], item[1]))
 
-    namespace_details = namespace_root.stat(follow_symlinks=False)
-    for _, state_identity, record in candidates:
+        if state_identity == current_state_identity:
+            catalog = {
+                **catalog,
+                "value_cursor_ticket_sequence": cursor,
+            }
+            write_hot_state_value_catalog(namespace_root, catalog)
+            catalog = requeue_hot_state_value_ticket(
+                namespace_root,
+                catalog,
+                record,
+                ticket_sequence,
+            )
+            continue
+
         state = namespace_root / state_identity
         state_descriptor: int | None = None
-        locks: list[RetirementLock] | None = None
         renamed = False
         try:
             details = state.stat(follow_symlinks=False)
@@ -2526,10 +2595,16 @@ def retire_one_low_value_state(
                 or stat.S_IMODE(details.st_mode) != 0o700
                 or details.st_dev != namespace_details.st_dev
             ):
+                remove_hot_state_value_ticket(
+                    namespace_root, ticket_sequence
+                )
                 continue
             state_descriptor = os.open(
                 state,
-                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                os.O_RDONLY
+                | os.O_DIRECTORY
+                | os.O_CLOEXEC
+                | os.O_NOFOLLOW,
             )
             pinned_state = os.fstat(state_descriptor)
             manifest, encoded_before, manifest_identity = (
@@ -2538,16 +2613,26 @@ def retire_one_low_value_state(
                 )
             )
             if (
-                manifest_generation_reachable(manifest) is not True
+                not manifest_has_full_execution_namespace_lease(manifest)
+                or manifest_generation_reachable(manifest) is not True
                 or record["manifest_device"] != manifest_identity.device
                 or record["manifest_inode"] != manifest_identity.inode
                 or record["manifest_creation_witness_ns"]
                 != manifest_identity.creation_witness_ns
             ):
+                catalog = {
+                    **catalog,
+                    "value_cursor_ticket_sequence": cursor,
+                }
+                write_hot_state_value_catalog(namespace_root, catalog)
+                catalog = requeue_hot_state_value_ticket(
+                    namespace_root,
+                    catalog,
+                    record,
+                    ticket_sequence,
+                )
                 continue
-            locks = acquire_retirement_locks(state)
-            if not locks:
-                continue
+
             manifest_after, encoded_after, identity_after = (
                 read_producer_manifest_with_identity(
                     state_descriptor, state_identity
@@ -2558,37 +2643,89 @@ def retire_one_low_value_state(
                 encoded_after != encoded_before
                 or identity_after != manifest_identity
                 or manifest_generation_reachable(manifest_after) is not True
-                or not retirement_locks_unchanged(locks)
+                or not manifest_has_full_execution_namespace_lease(
+                    manifest_after
+                )
                 or named_state.st_dev != pinned_state.st_dev
                 or named_state.st_ino != pinned_state.st_ino
             ):
+                catalog = {
+                    **catalog,
+                    "value_cursor_ticket_sequence": cursor,
+                }
+                write_hot_state_value_catalog(namespace_root, catalog)
+                catalog = requeue_hot_state_value_ticket(
+                    namespace_root,
+                    catalog,
+                    record,
+                    ticket_sequence,
+                )
                 continue
+
             retired_name = f"{HOT_STATE_RETIRED_PREFIX}{state_identity}"
             try:
                 rename_noreplace(state, namespace_root / retired_name)
             except (FileExistsError, OSError):
+                catalog = {
+                    **catalog,
+                    "value_cursor_ticket_sequence": cursor,
+                }
+                write_hot_state_value_catalog(namespace_root, catalog)
+                catalog = requeue_hot_state_value_ticket(
+                    namespace_root,
+                    catalog,
+                    record,
+                    ticket_sequence,
+                )
                 continue
             renamed = True
             fsync_directory(namespace_root)
-            close_retirement_locks(locks)
-            locks = None
             try:
-                remove_hot_state_value_record(namespace_root, state_identity)
+                remove_hot_state_value_ticket(
+                    namespace_root, ticket_sequence
+                )
+                remove_hot_state_value_record(
+                    namespace_root, state_identity
+                )
             except (OSError, RuntimeError):
                 return "retired_low_value_catalog_deferred"
             delete_retired_state_bounded(
                 namespace_root, retired_name, state_identity
             )
-            return "retired_low_value"
+            retired = True
+            break
         except (OSError, RuntimeError):
             if renamed:
                 return "retired_low_value_recovery_deferred"
-            continue
+            try:
+                catalog = {
+                    **catalog,
+                    "value_cursor_ticket_sequence": cursor,
+                }
+                write_hot_state_value_catalog(namespace_root, catalog)
+                catalog = requeue_hot_state_value_ticket(
+                    namespace_root,
+                    catalog,
+                    record,
+                    ticket_sequence,
+                )
+            except (OSError, RuntimeError):
+                pass
         finally:
-            close_retirement_locks(locks)
             if state_descriptor is not None:
                 os.close(state_descriptor)
+
+    catalog = {
+        **catalog,
+        "value_cursor_ticket_sequence": cursor,
+    }
+    write_hot_state_value_catalog(namespace_root, catalog)
+    if retired:
+        return "retired_low_value"
+    if cursor < initial_next_ticket:
+        return "pressure_scan_deferred"
     return "pressure_no_eligible_state"
+
 
 def ensure_retirement_record(
     namespace_root: Path, retired_name: str, state_identity: str
