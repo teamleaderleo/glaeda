@@ -585,14 +585,18 @@ def validate_post_acceptance_bootstrap(
         operator_fleet_scope=enrollment["operatorFleetScope"],
         enrollment_generation=enrollment["enrollmentGeneration"],
     )
-    stable_fields = ENROLLMENT_KEYS - {"state", "quarantineReason"}
+    stable_fields = ENROLLMENT_KEYS - {
+        "state",
+        "quarantineReason",
+        "supportedToolchainGenerations",
+    }
     expected_stable = {name: enrollment[name] for name in stable_fields}
     observed_stable = {name: observed[name] for name in stable_fields}
     if observed_stable != expected_stable:
         raise FleetError(
             "post-acceptance bootstrap differs from enrolled machine capability"
         )
-    if toolchain_generation not in observed["supportedToolchainGenerations"]:
+    if observed["supportedToolchainGenerations"] != [toolchain_generation]:
         raise FleetError(
             "post-acceptance bootstrap toolchain differs from acceptance"
         )
