@@ -257,6 +257,19 @@ class ProviderNeutralRequestTests(unittest.TestCase):
         with self.assertRaisesRegex(module.ContractRefusal, "result digest"):
             module.inspect_receipt(module.canonical_bytes(tampered) + b"\n")
 
+        typed_tamper = copy.deepcopy(receipt)
+        typed_tamper["result"]["command_argv"]["available"] = True
+        typed_tamper["result_sha256"] = module.sha256(
+            module.canonical_bytes(typed_tamper["result"]) + b"\n"
+        )
+        with self.assertRaisesRegex(module.ContractRefusal, "capabilities result"):
+            module.inspect_receipt(module.canonical_bytes(typed_tamper) + b"\n")
+
+        digest_tamper = copy.deepcopy(receipt)
+        digest_tamper["request_sha256"] = "sha256:" + "f" * 64
+        with self.assertRaisesRegex(module.ContractRefusal, "does not match its request"):
+            module.inspect_receipt(module.canonical_bytes(digest_tamper) + b"\n")
+
         drifted_resolution = copy.deepcopy(receipt)
         drifted_resolution["resolved_operation"]["kind"] = "status"
         with self.assertRaisesRegex(module.ContractRefusal, "resolution"):
@@ -268,6 +281,19 @@ class ProviderNeutralRequestTests(unittest.TestCase):
         drifted_source["source"] = SOURCE
         with self.assertRaisesRegex(module.ContractRefusal, "unexpected source"):
             module.inspect_receipt(module.canonical_bytes(drifted_source) + b"\n")
+
+    def test_receipt_inspection_rejects_rehashed_invalid_verify_projection(self) -> None:
+        receipt = module.terminal_verify_receipt(
+            compiled_verify(),
+            internal_receipt(compiled_verify()),
+        )
+        tampered = copy.deepcopy(receipt)
+        tampered["result"]["process_tree_settled"] = False
+        tampered["result_sha256"] = module.sha256(
+            module.canonical_bytes(tampered["result"]) + b"\n"
+        )
+        with self.assertRaisesRegex(module.ContractRefusal, "verification result"):
+            module.inspect_receipt(module.canonical_bytes(tampered) + b"\n")
 
     def test_noncanonical_request_is_refused(self) -> None:
         value = document()
