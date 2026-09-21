@@ -44,17 +44,29 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          corepack enable
-          corepack prepare pnpm@12.5.1 --activate
-          pnpm --version
+          archive="$RUNNER_TEMP/pnpm-linux-arm64.tar.gz"
+          tool_root="$RUNNER_TEMP/pnpm-12.5.1"
+          curl --fail --location --retry 3 \
+            --output "$archive" \
+            https://github.com/pnpm/pnpm/releases/download/v12.5.1/pnpm-linux-arm64.tar.gz
+          echo "84e1290e82c800acd406b6db27e9650e15db3c2344d12162cc305ea1f942c6ff  $archive" |
+            sha256sum -c -
+          mkdir -p "$tool_root"
+          tar -xzf "$archive" -C "$tool_root"
+          PNPM_BIN="$(find "$tool_root" -type f -name pnpm -print -quit)"
+          test -n "$PNPM_BIN"
+          chmod u+x "$PNPM_BIN"
+          test "$("$PNPM_BIN" --version)" = "12.5.1"
+          "$PNPM_BIN" --version
           node --version
-          echo "PNPM=$(command -v pnpm)" >> "$GITHUB_ENV"
+          echo "PNPM=$PNPM_BIN" >> "$GITHUB_ENV"
+          echo "PNPM_ARCHIVE_SHA256=sha256:84e1290e82c800acd406b6db27e9650e15db3c2344d12162cc305ea1f942c6ff" >> "$GITHUB_ENV"
 
       - name: Verify physical lab prerequisites
         shell: bash
         run: |
           set -euo pipefail
-          for tool in git findmnt losetup mkfs.ext4 mkfs.xfs xfs_info filefrag sha256sum; do
+          for tool in git findmnt losetup mkfs.ext4 mkfs.xfs xfs_info filefrag sha256sum curl tar; do
             command -v "$tool"
           done
           uname -a
@@ -64,6 +76,27 @@ jobs:
           test "$(git -C target-src rev-parse HEAD)" = "4babfd97df26089186538479b02c994fcad73635"
           test -z "$(git -C target-src status --porcelain=v1 --untracked-files=all)"
 
+      - name: Freeze pnpm 12.5.1 experiment source
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -c 'import json, pathlib; p=pathlib.Path("target-src/package.json"); d=json.loads(p.read_text()); d["packageManager"]="pnpm@12.5.1"; p.write_text(json.dumps(d, indent=2) + "\n")'
+          git -C target-src diff --check
+          test "$(git -C target-src diff -- package.json | grep -c '^[-+]  "packageManager"')" = "2"
+          git -C target-src config user.name "Glaeda physical benchmark"
+          git -C target-src config user.email "benchmark@invalid"
+          git -C target-src add package.json
+          patch_sha="sha256:$(git -C target-src diff --cached --binary | sha256sum | awk '{print $1}')"
+          git -C target-src commit --no-gpg-sign -m "benchmark: pin pnpm 12.5.1"
+          source_commit="$(git -C target-src rev-parse HEAD)"
+          source_tree="$(git -C target-src rev-parse HEAD^{tree})"
+          test "$(git -C target-src rev-parse HEAD^)" = "4babfd97df26089186538479b02c994fcad73635"
+          test -z "$(git -C target-src status --porcelain=v1 --untracked-files=all)"
+          echo "SOURCE_BASE_COMMIT=4babfd97df26089186538479b02c994fcad73635" >> "$GITHUB_ENV"
+          echo "SOURCE_COMMIT=$source_commit" >> "$GITHUB_ENV"
+          echo "SOURCE_TREE=$source_tree" >> "$GITHUB_ENV"
+          echo "SOURCE_TOOLCHAIN_PATCH_SHA256=$patch_sha" >> "$GITHUB_ENV"
+
       - name: Run ext4 and XFS pnpm matrix
         shell: bash
         run: |
@@ -71,7 +104,7 @@ jobs:
           mkdir -p receipts
           BENCH="$GITHUB_WORKSPACE/scripts/benchmark-pnpm-task-dependencies"
           SOURCE="$GITHUB_WORKSPACE/target-src"
-          SOURCE_COMMIT="4babfd97df26089186538479b02c994fcad73635"
+          SOURCE_COMMIT="${SOURCE_COMMIT:?}"
           REPS=6
           DEADLINE=300
           IMAGE_BYTES=$((28 * 1024 * 1024 * 1024))
