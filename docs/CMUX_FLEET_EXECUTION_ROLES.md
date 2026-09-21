@@ -91,7 +91,7 @@ current #1056 role acceptance identities (profile + receipt digest)
 fresh pressure classes
 ```
 
-The CPU, memory, and disk values are reviewed symbolic classes. They are node evidence, not caller-selected raw resource values. The compact role-acceptance identities are projected with `fleet_acceptance_binding()` from a receipt that first passes #1056's closed `validate_acceptance_receipt()`; callers do not supply acceptance digests or role profiles.
+The CPU, memory, and disk values are reviewed symbolic classes. They are node evidence, not caller-selected raw resource values. The compact role-acceptance identities are projected with `fleet_role_acceptances()` from receipts that first pass #1056's closed `validate_acceptance_receipt()` and match the exact node/enrollment generation; callers do not supply acceptance digests or role profiles.
 
 A role becomes eligible only when:
 
