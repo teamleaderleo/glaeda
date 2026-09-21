@@ -42,8 +42,6 @@ use glaeda::disposable_worker_enrollment::{
 use glaeda::disposable_worker_service::serve_disposable_worker;
 #[cfg(target_os = "linux")]
 use glaeda::disposable_worker_service::serve_owned_linux_jit_worker;
-#[cfg(target_os = "linux")]
-use glaeda::owned_linux_jit_enrollment::decode_owned_linux_jit_enrollment;
 use glaeda::doctor::{inspect_host, render_human as render_doctor};
 #[cfg(target_os = "linux")]
 use glaeda::durable_journal::StateStoreJournalCheckpoint;
@@ -79,6 +77,8 @@ use glaeda::linux_installation_catalog::{InstallationLookup, find_default_instal
 #[cfg(target_os = "linux")]
 use glaeda::linux_state::LinuxStateRoot;
 use glaeda::manifest::{ManifestError, load};
+#[cfg(target_os = "linux")]
+use glaeda::owned_linux_jit_enrollment::decode_owned_linux_jit_enrollment;
 #[cfg(target_os = "linux")]
 use glaeda::ownership::ProjectIdentity;
 use glaeda::plan::{build, render_human as render_plan};
