@@ -362,7 +362,12 @@ def node_status(enrollment_value: object, acceptance_values: list[object]) -> di
     return status
 
 
-def transition(enrollment_value: object, target: str, reason: str | None) -> dict[str, Any]:
+def transition(
+    enrollment_value: object,
+    target: str,
+    reason: str | None,
+    acceptance_values: list[object] | None = None,
+) -> dict[str, Any]:
     enrollment = dict(validate_enrollment(enrollment_value))
     current = enrollment["state"]
     if target not in STATES or target not in TRANSITIONS[current]:
@@ -380,7 +385,14 @@ def transition(enrollment_value: object, target: str, reason: str | None) -> dic
             raise FleetError("enrollment generation is exhausted")
         enrollment["enrollmentGeneration"] += 1
     enrollment["state"] = target
-    return validate_enrollment(enrollment)
+    enrollment = validate_enrollment(enrollment)
+    if target == "eligible":
+        status = node_status(enrollment, acceptance_values or [])
+        if not status["automaticRoutingEligible"]:
+            raise FleetError(
+                "eligible transition requires a current accepted role receipt"
+            )
+    return enrollment
 
 
 def load(path: Path) -> object:
@@ -417,6 +429,7 @@ def parser() -> argparse.ArgumentParser:
     t.add_argument("enrollment", type=Path)
     t.add_argument("--to", required=True, choices=STATES)
     t.add_argument("--reason", choices=QUARANTINE_REASONS)
+    t.add_argument("--acceptance", action="append", type=Path, default=[])
     a = sub.add_parser("finalize-acceptance")
     a.add_argument("enrollment", type=Path)
     a.add_argument("evidence", type=Path)
@@ -444,7 +457,14 @@ def main() -> int:
         elif args.command == "status":
             emit(node_status(enrollment, [load(path) for path in args.acceptance]))
         elif args.command == "transition":
-            emit(transition(enrollment, args.to, args.reason))
+            emit(
+                transition(
+                    enrollment,
+                    args.to,
+                    args.reason,
+                    [load(path) for path in args.acceptance],
+                )
+            )
         elif args.command == "finalize-acceptance":
             emit(finalize_acceptance(enrollment, load(args.evidence)))
         else:
