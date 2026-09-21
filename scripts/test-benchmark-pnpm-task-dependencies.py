@@ -62,6 +62,30 @@ class PnpmTaskDependencyBenchmarkTests(unittest.TestCase):
             )
             self.assertFalse(document['workspace_policy']['shared_task_workspace'])
             self.assertFalse(document['workspace_policy']['directory_presence_grants_task_authority'])
+            self.assertEqual(document['network_policy']['dependency_install'], 'pnpm_offline')
+            self.assertEqual(
+                document['network_policy']['first_read_only_command'],
+                'local_installed_dependency_graph',
+            )
+            self.assertEqual(
+                document['network_policy']['repository_probe'],
+                'inherits_trusted_host_network',
+            )
+            self.assertEqual(
+                self.plan(probe_script=None).to_json()['network_policy']['repository_probe'],
+                'absent',
+            )
+            self.assertEqual(
+                document['storage_accounting']['filesystem_available_space'],
+                'statvfs_f_bavail',
+            )
+            self.assertEqual(
+                document['storage_accounting']['node_modules_allocated_blocks'],
+                'sum_st_blocks_times_512',
+            )
+            self.assertFalse(
+                document['storage_accounting']['reflink_exclusive_ownership_inferred']
+            )
             self.assertNotIn('/source', json.dumps(document))
             self.assertNotIn('/scratch', json.dumps(document))
 
@@ -155,14 +179,56 @@ class PnpmTaskDependencyBenchmarkTests(unittest.TestCase):
         self.assertIn('--store-dir=/store', command)
         self.assertIn('--package-import-method=clone', command)
 
+    def test_first_read_only_command_uses_local_dependency_state(self) -> None:
+        command = NAMESPACE['first_read_only_command'](Path('/pnpm'))
+        self.assertEqual(command, ['/pnpm', 'list', '--depth=0'])
+        self.assertNotIn('--offline', command)
+
     def test_physical_mechanism_classifier_keeps_clone_hardlink_and_copy_distinct(self) -> None:
         classify = NAMESPACE['classify_mechanism']
         self.assertEqual(classify(10, 4, 10, 0), 'hardlink_observed')
-        self.assertEqual(classify(10, 0, 10, 3), 'reflink_observed')
+        self.assertEqual(classify(10, 0, 10, 10), 'reflink_observed')
+        self.assertEqual(
+            classify(10, 0, 10, 3),
+            'mixed_private_copy_and_reflink_observed',
+        )
         self.assertEqual(classify(10, 0, 10, 0), 'copy_observed')
-        self.assertEqual(classify(10, 0, 0, 0), 'physical_mechanism_unproven')
+        self.assertEqual(classify(10, 0, 9, 9), 'physical_mechanism_unproven')
         with self.assertRaises(NAMESPACE['BenchmarkError']):
             classify(0, 0, 0, 0)
+
+    def test_physical_sample_targets_virtual_store_package_payloads(self) -> None:
+        sample = NAMESPACE['sample_physical_mechanism']
+        with tempfile.TemporaryDirectory() as root_text:
+            node_modules = Path(root_text) / 'node_modules'
+            payload = (
+                node_modules
+                / '.pnpm'
+                / 'pkg@1.0.0'
+                / 'node_modules'
+                / 'pkg'
+                / 'index.js'
+            )
+            payload.parent.mkdir(parents=True)
+            payload.write_bytes(b'payload')
+            (node_modules / '.modules.yaml').write_text('layoutVersion: 5\n', encoding='utf-8')
+            (node_modules / 'top-level-metadata').write_bytes(b'metadata')
+            empty_payload = payload.with_name('empty.js')
+            empty_payload.write_bytes(b'')
+            with mock.patch.dict(
+                sample.__globals__,
+                {'fiemap_has_shared_extent': lambda path: path == payload},
+            ):
+                evidence = sample(node_modules)
+
+        self.assertEqual(
+            evidence['sample_scope'],
+            'pnpm_virtual_store_nonempty_package_payload_regular_files',
+        )
+        self.assertEqual(evidence['sampled_regular_files'], 1)
+        self.assertEqual(evidence['fiemap_observed_files'], 1)
+        self.assertEqual(evidence['shared_extent_files'], 1)
+        self.assertEqual(evidence['mechanism'], 'reflink_observed')
 
     def test_explicit_import_methods_require_per_task_physical_proof(self) -> None:
         validate = NAMESPACE['validate_mechanisms']
@@ -305,6 +371,10 @@ class PnpmTaskDependencyBenchmarkTests(unittest.TestCase):
             sample['workspace_ready_seconds'],
             sample['task_known_to_first_command_start_seconds'],
         )
+        self.assertIn('filesystem_available_space_delta_at_ready_bytes', sample)
+        self.assertIn('filesystem_available_space_delta_during_cleanup_bytes', sample)
+        self.assertEqual(sample['node_modules_st_blocks_bytes'], 4096)
+        self.assertNotIn('physical_byte_delta_at_ready', sample)
 
     def test_partial_worktree_registration_attempt_is_cleanup_owned(self) -> None:
         measure_once = NAMESPACE['measure_once']
