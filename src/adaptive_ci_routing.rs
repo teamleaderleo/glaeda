@@ -6,6 +6,7 @@
 //! persistence, or lifecycle mutation.
 
 use std::cmp::Ordering;
+use std::collections::BTreeSet;
 use std::fmt;
 
 use serde::Serialize;
@@ -15,6 +16,7 @@ use crate::compute_workload::ComputeTrustClass;
 pub const ADAPTIVE_CI_ROUTING_SCHEMA_VERSION: u8 = 1;
 pub const MAX_ROUTING_ID_BYTES: usize = 96;
 pub const MAX_ROUTING_CAPABILITIES: usize = 32;
+pub const MAX_ROUTING_POOLS: usize = 32;
 pub const MAX_ROUTING_OBSERVATIONS: usize = 256;
 pub const MAX_ROUTING_PHASE_MILLIS: u64 = 24 * 60 * 60 * 1_000;
 pub const MAX_ROUTING_AGE_MILLIS: u64 = 180 * 24 * 60 * 60 * 1_000;
@@ -401,6 +403,7 @@ pub struct ResourceEnvelopeV1 {
 pub struct RoutingObservationV1 {
     pub workload: WorkloadClassV1,
     pub pool_id: RoutingId,
+    pub execution_class: RoutingId,
     pub observed_at_millis: u64,
     pub hot_state: HotStateClass,
     pub timing: ObservationTimingV1,
@@ -456,6 +459,8 @@ pub struct PoolPredictionV1 {
     pub fallback_permille: u16,
     pub semantic_mismatch_count: u16,
     pub pressure_after_admission: HostPressureClass,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowance: Option<AllowanceBudgetV1>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub projected_allowance_remaining_ppm: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -612,6 +617,7 @@ pub enum PoolExclusionReason {
     PressureAbovePolicy,
     SpendCeiling,
     AllowanceReserve,
+    AllowanceExpired,
     InvalidAllowance,
     InvalidContentionEvidence,
 }
@@ -641,22 +647,22 @@ impl RoutingRecommendationV1 {
     #[must_use]
     pub fn render_human(&self) -> String {
         let mut out = format!(
-            "workload: {} / {}\\npolicy: {:?}\\nauthority: recommendation_only\\nautomatic routing: disabled\\n",
+            "workload: {} / {}\npolicy: {:?}\nauthority: recommendation_only\nautomatic routing: disabled\n",
             self.workload.project.as_str(),
             self.workload.profile.as_str(),
             self.policy.mode
         );
         match &self.choice {
             Some(choice) => {
-                out.push_str(&format!("choice: {}\\n", choice.as_str()));
+                out.push_str(&format!("choice: {}\n", choice.as_str()));
                 if let Some(prediction) = self
                     .predictions
                     .iter()
                     .find(|prediction| &prediction.pool_id == choice)
                 {
-                    out.push_str("basis:\\n");
+                    out.push_str("basis:\n");
                     out.push_str(&format!(
-                        "  compatible hot state: {:?}\\n  predicted completion: {}-{} ms\\n  queue: {}-{} ms\\n  preparation: {}-{} ms\\n  execution: {}-{} ms\\n  settlement: {}-{} ms\\n  comparable validated runs: {}\\n  marginal money cost: {}-{} microUSD\\n  allowance consumption: {}-{} units\\n  pressure after admission: {:?}\\n  failure rate: {}/1000\\n  fallback rate: {}/1000\\n",
+                        "  compatible hot state: {:?}\n  predicted completion: {}-{} ms\n  queue: {}-{} ms\n  preparation: {}-{} ms\n  execution: {}-{} ms\n  settlement: {}-{} ms\n  comparable validated runs: {}\n  marginal money cost: {}-{} microUSD\n  allowance consumption: {}-{} units\n  pressure after admission: {:?}\n  failure rate: {}/1000\n  fallback rate: {}/1000\n",
                         prediction.hot_state.class,
                         prediction.completion.total.p50,
                         prediction.completion.total.p90,
@@ -679,17 +685,27 @@ impl RoutingRecommendationV1 {
                     ));
                     if prediction.hot_state.source == LocalityEvidenceSource::RemoteAdvisory {
                         out.push_str(
-                            "  locality source: remote advisory; pool eligibility remains independently declared\\n",
+                            "  locality source: remote advisory; pool eligibility remains independently declared\n",
                         );
+                    }
+                    if let Some(allowance) = &prediction.allowance {
+                        out.push_str(&format!(
+                            "  allowance period: {}\n  included/remaining/observed: {}/{}/{} units\n  allowance reset: {}\n",
+                            allowance.period_id.as_str(),
+                            allowance.included_budget_units,
+                            allowance.remaining_estimate_units,
+                            allowance.observed_consumption_units,
+                            allowance.reset_at_millis,
+                        ));
                     }
                     if let Some(remaining) = prediction.projected_allowance_remaining_ppm {
                         out.push_str(&format!(
-                            "  projected allowance remaining: {remaining}/1000000\\n"
+                            "  projected allowance remaining: {remaining}/1000000\n"
                         ));
                     }
                     if let Some(contention) = &prediction.contention {
                         out.push_str(&format!(
-                            "  contention: {}/{} validated in {} ms; p90 {} ms; pressure {:?}\\n",
+                            "  contention: {}/{} validated in {} ms; p90 {} ms; pressure {:?}\n",
                             contention.validated_completions,
                             contention.offered_tasks,
                             contention.elapsed_millis,
@@ -699,16 +715,16 @@ impl RoutingRecommendationV1 {
                     }
                 }
             }
-            None => out.push_str("choice: abstained\\n"),
+            None => out.push_str("choice: abstained\n"),
         }
         if self.predictions.len() > 1 {
-            out.push_str("alternatives:\\n");
+            out.push_str("alternatives:\n");
             for prediction in &self.predictions {
                 if self.choice.as_ref() == Some(&prediction.pool_id) {
                     continue;
                 }
                 out.push_str(&format!(
-                    "  {}: {}-{} ms, {}-{} microUSD, {:?}\\n",
+                    "  {}: {}-{} ms, {}-{} microUSD, {:?}\n",
                     prediction.pool_id.as_str(),
                     prediction.completion.total.p50,
                     prediction.completion.total.p90,
@@ -719,10 +735,10 @@ impl RoutingRecommendationV1 {
             }
         }
         if !self.exclusions.is_empty() {
-            out.push_str("excluded:\\n");
+            out.push_str("excluded:\n");
             for exclusion in &self.exclusions {
                 out.push_str(&format!(
-                    "  {}: {:?}\\n",
+                    "  {}: {:?}\n",
                     exclusion.pool_id.as_str(),
                     exclusion.reason
                 ));
@@ -759,6 +775,23 @@ pub fn recommend_ci_pool(
 ) -> Result<RoutingRecommendationV1, RoutingError> {
     prediction_config.validate()?;
     policy.validate()?;
+    if candidates.len() > MAX_ROUTING_POOLS {
+        return Err(error(
+            "candidates",
+            "routing_too_many_pools",
+            "routing candidate input exceeds the bounded maximum",
+        ));
+    }
+    let mut candidate_ids = BTreeSet::new();
+    for candidate in candidates {
+        if !candidate_ids.insert(candidate.pool.pool_id.as_str()) {
+            return Err(error(
+                "candidates.pool_id",
+                "routing_duplicate_pool_id",
+                "routing candidates require unique pool identities",
+            ));
+        }
+    }
     if observations.len() > MAX_ROUTING_OBSERVATIONS {
         return Err(error(
             "observations",
@@ -789,14 +822,21 @@ pub fn recommend_ci_pool(
             continue;
         }
 
-        if let Some(allowance) = &candidate.allowance
-            && allowance.validate().is_err()
-        {
-            exclusions.push(PoolExclusionV1 {
-                pool_id,
-                reason: PoolExclusionReason::InvalidAllowance,
-            });
-            continue;
+        if let Some(allowance) = &candidate.allowance {
+            if allowance.validate().is_err() {
+                exclusions.push(PoolExclusionV1 {
+                    pool_id,
+                    reason: PoolExclusionReason::InvalidAllowance,
+                });
+                continue;
+            }
+            if allowance.reset_at_millis <= now_millis {
+                exclusions.push(PoolExclusionV1 {
+                    pool_id,
+                    reason: PoolExclusionReason::AllowanceExpired,
+                });
+                continue;
+            }
         }
         if let Some(contention) = &candidate.contention
             && contention.validate().is_err()
@@ -894,6 +934,7 @@ fn predict_pool(
         .filter(|observation| {
             observation.workload == *workload
                 && observation.pool_id == candidate.pool.pool_id
+                && observation.execution_class == candidate.pool.execution_class
                 && observation.hot_state == candidate.hot_state.class
         })
         .collect();
@@ -948,48 +989,40 @@ fn predict_pool(
             .iter()
             .map(|observation| observation.timing.settlement_millis),
     );
-    let total = QuantilesU64 {
-        p50: sum_components([
-            queue.p50,
-            start.p50,
-            preparation.p50,
-            execution.p50,
-            settlement.p50,
-        ]),
-        p90: sum_components([
-            queue.p90,
-            start.p90,
-            preparation.p90,
-            execution.p90,
-            settlement.p90,
-        ]),
-    };
+    let total = quantiles(successes.iter().map(|observation| {
+        sum_components([
+            observation.timing.queue_millis,
+            observation.timing.start_millis,
+            observation.timing.preparation_millis,
+            observation.timing.execution_millis,
+            observation.timing.settlement_millis,
+        ])
+    }));
 
+    // Cost, allowance, and resource consumption occur on failed/fallback attempts too.
     let marginal_cost_microusd = quantiles(
-        successes
+        fresh
             .iter()
             .map(|observation| observation.marginal_cost_microusd),
     );
     let allowance_units = quantiles(
-        successes
-            .iter()
-            .map(|observation| observation.allowance_units),
+        fresh.iter().map(|observation| observation.allowance_units),
     );
     let resource = ResourcePredictionV1 {
         cpu_millicores_p90: quantiles(
-            successes
+            fresh
                 .iter()
                 .map(|observation| u64::from(observation.resource.cpu_millicores)),
         )
         .p90,
         memory_bytes_p90: quantiles(
-            successes
+            fresh
                 .iter()
                 .map(|observation| observation.resource.memory_bytes),
         )
         .p90,
         disk_bytes_p90: quantiles(
-            successes
+            fresh
                 .iter()
                 .map(|observation| observation.resource.disk_bytes),
         )
@@ -1052,6 +1085,7 @@ fn predict_pool(
         fallback_permille,
         semantic_mismatch_count: u16::try_from(semantic_mismatches).unwrap_or(u16::MAX),
         pressure_after_admission: candidate.pressure_after_admission,
+        allowance: candidate.allowance.clone(),
         projected_allowance_remaining_ppm,
         contention: candidate.contention.clone(),
     })
@@ -1074,10 +1108,9 @@ fn policy_exclusion(
         return Some(PoolExclusionReason::ReliabilityAbovePolicy);
     }
     if prediction.pressure_after_admission.policy_rank() > policy.max_pressure.policy_rank()
-        || candidate
-            .contention
-            .as_ref()
-            .is_some_and(|contention| contention.peak_pressure == HostPressureClass::Critical)
+        || candidate.contention.as_ref().is_some_and(|contention| {
+            contention.peak_pressure.policy_rank() > policy.max_pressure.policy_rank()
+        })
     {
         return Some(PoolExclusionReason::PressureAbovePolicy);
     }
@@ -1174,6 +1207,11 @@ fn economy_cmp(left: &EvaluatedCandidate, right: &EvaluatedCandidate) -> Orderin
         })
         .then_with(|| {
             left.prediction
+                .fallback_permille
+                .cmp(&right.prediction.fallback_permille)
+        })
+        .then_with(|| {
+            left.prediction
                 .completion
                 .total
                 .p50
@@ -1207,6 +1245,11 @@ fn latency_cmp(left: &EvaluatedCandidate, right: &EvaluatedCandidate) -> Orderin
             left.prediction
                 .failure_permille
                 .cmp(&right.prediction.failure_permille)
+        })
+        .then_with(|| {
+            left.prediction
+                .fallback_permille
+                .cmp(&right.prediction.fallback_permille)
         })
         .then_with(|| contention_cmp(left, right))
         .then_with(|| {
@@ -1348,6 +1391,7 @@ mod tests {
         RoutingObservationV1 {
             workload: workload.clone(),
             pool_id: id(pool_id),
+            execution_class: id("macos-arm64"),
             observed_at_millis: NOW - age_millis,
             hot_state: heat,
             timing: ObservationTimingV1 {
@@ -1728,7 +1772,7 @@ mod tests {
                 peak_pressure: HostPressureClass::Moderate,
             }),
         };
-        let observations = three_successes(
+        let mut observations = three_successes(
             &workload,
             "owned-native-linux",
             HotStateClass::Warm,
@@ -1736,6 +1780,9 @@ mod tests {
             0,
             0,
         );
+        for observation in &mut observations {
+            observation.execution_class = id("native-linux-x86_64");
+        }
 
         let report = recommend_ci_pool(
             &workload,
