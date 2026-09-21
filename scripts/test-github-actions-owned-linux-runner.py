@@ -199,27 +199,34 @@ class OwnedLinuxJitRunnerTests(unittest.TestCase):
             reservation.assert_not_called()
             execute.assert_not_called()
 
-    def test_admission_refusal_launches_nothing(self):
+    def test_hold_drain_pressure_and_capacity_refusals_launch_nothing(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
-            args = arguments(root)
-
-            class Refusing:
-                def __enter__(self):
-                    raise Refusal("node is held")
-
-                def __exit__(self, *_):
-                    return False
-
-            with mock.patch.object(
-                runner.owned_admission, "Reservation", return_value=Refusing()
+            for reason in (
+                "node_held",
+                "node_draining",
+                "pressure_high",
+                "capacity_unavailable",
             ):
-                with mock.patch.object(
-                    runner.owned_task, "execute_secret_stdin"
-                ) as execute:
-                    with self.assertRaisesRegex(Refusal, "held"):
-                        runner.run_once(args)
-            execute.assert_not_called()
+                with self.subTest(reason=reason):
+                    args = arguments(root / reason)
+
+                    class Refusing:
+                        def __enter__(self):
+                            raise Refusal(reason)
+
+                        def __exit__(self, *_):
+                            return False
+
+                    with mock.patch.object(
+                        runner.owned_admission, "Reservation", return_value=Refusing()
+                    ):
+                        with mock.patch.object(
+                            runner.owned_task, "execute_secret_stdin"
+                        ) as execute:
+                            with self.assertRaisesRegex(Refusal, reason):
+                                runner.run_once(args)
+                    execute.assert_not_called()
 
     def _run_injected_exit(
         self,
