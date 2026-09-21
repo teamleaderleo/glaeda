@@ -763,6 +763,7 @@ class RoleModelTests(unittest.TestCase):
             4,
         )
         receipt['measurement']['settledTasks'] = 7
+        receipt['measurement']['validatedCompletions'] = 7
         with self.assertRaisesRegex(
             m.RoleModelError,
             'unfinished work disagrees',
