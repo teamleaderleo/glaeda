@@ -187,6 +187,7 @@ def sandbox_command(
             "--ro-bind-try", "/etc/resolv.conf", "/etc/resolv.conf",
             "--ro-bind-try", "/etc/hosts", "/etc/hosts",
             "--ro-bind-try", "/etc/nsswitch.conf", "/etc/nsswitch.conf",
+            "--dir", "/etc/ssl",
             "--ro-bind-try", "/etc/ssl/certs", "/etc/ssl/certs",
             "--ro-bind-try", "/etc/ca-certificates.conf", "/etc/ca-certificates.conf",
         ]
