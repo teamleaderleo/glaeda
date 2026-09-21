@@ -23,6 +23,11 @@ class AdmissionTests(unittest.TestCase):
         self.root = Path(self.temporary.name).resolve()
         self.admission = self.root / "admission"
         self.admission.mkdir(mode=0o700)
+        self.canonical_root_patch = mock.patch.object(
+            gate, "CANONICAL_ROOT", self.admission
+        )
+        self.canonical_root_patch.start()
+        self.addCleanup(self.canonical_root_patch.stop)
         self.policy = {"schema_version": 1, "generation": "a" * 64, "revision": 1,
                        "node_control": "available", "memory_reserve_bytes": 4 * 1024**3,
                        "host_executable": {"path": "/host", "sha256": "sha256:" + "b" * 64},
@@ -240,6 +245,16 @@ class AdmissionTests(unittest.TestCase):
               mock.patch.object(task, "unit_absent", return_value=True),
               mock.patch.object(verifier, "emit")):
             return verifier.run(arguments)
+
+    def test_verifier_refuses_noncanonical_physical_slot_owner(self):
+        arguments = self.arguments()
+        alternate = self.root / "alternate-admission"
+        alternate.mkdir(mode=0o700)
+        arguments.admission_root = str(alternate)
+        with self.assertRaisesRegex(task.Refusal, "canonical shared owner"):
+            self.run_verifier(arguments)
+        self.assertFalse((self.root / "child-started").exists())
+        self.assertFalse((alternate / "reservation.json").exists())
 
     def test_fresh_hold_drain_pressure_refuse_actual_popen_and_clean_attempt(self):
         arguments = self.arguments()
