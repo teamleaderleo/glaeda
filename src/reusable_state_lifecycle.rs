@@ -997,7 +997,8 @@ pub struct ReusableStateUtilityReport {
     pub publication_duration_millis: u64,
     pub net_time_saved_millis: i64,
     pub last_useful_hit_epoch_millis: Option<u64>,
-    pub recommendation: ReusableStateRecommendation,}
+    pub recommendation: ReusableStateRecommendation,
+}
 
 impl ReusableStateUtilityReport {
     /// # Errors
