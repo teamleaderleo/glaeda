@@ -16,8 +16,6 @@ use sha2::{Digest, Sha256};
 use crate::artifact::{RepositoryRef, Sha256Digest};
 
 pub const REUSABLE_STATE_LIFECYCLE_SCHEMA_VERSION: u8 = 1;
-const MAX_METRIC: u64 = 1_000_000_000_000;
-const MAX_DURATION_MILLIS: u64 = 365 * 24 * 60 * 60 * 1_000;
 const HOUR_MILLIS: u64 = 60 * 60 * 1_000;
 const DAY_MILLIS: u64 = 24 * HOUR_MILLIS;
 const WEEK_MILLIS: u64 = 7 * DAY_MILLIS;
@@ -285,37 +283,12 @@ pub struct ReusableStateMetrics {
 impl ReusableStateMetrics {
     /// # Errors
     ///
-    /// Returns an error when counts disagree or any observation exceeds its reviewed bound.
+    /// Returns an error when counts disagree.
     pub fn validate(&self) -> Result<(), ReusableStatePolicyError> {
-        for count in [
-            self.lookups,
-            self.hits,
-            self.misses,
-            self.validation_failures,
-            self.reset_invalidation_count,
-            self.producer_successes,
-            self.successful_consumers,
-            self.semantic_mismatches,
-        ] {
-            if count > MAX_METRIC {
-                return Err(ReusableStatePolicyError::MetricOutOfRange);
-            }
-        }
         if self.hits.checked_add(self.misses) != Some(self.lookups)
             || self.successful_consumers > self.hits
         {
             return Err(ReusableStatePolicyError::InconsistentMetrics);
-        }
-        for duration in [
-            self.restore_duration_millis,
-            self.publication_duration_millis,
-            self.estimated_cold_work_millis,
-            self.estimated_warm_work_millis,
-            self.reset_invalidation_overhead_millis,
-        ] {
-            if duration > MAX_DURATION_MILLIS {
-                return Err(ReusableStatePolicyError::MetricOutOfRange);
-            }
         }
         Ok(())
     }
@@ -1516,6 +1489,34 @@ mod tests {
                 .unwrap()
                 .lifecycle,
             ReusableStateLifecycle::Preferred
+        );
+    }
+
+    #[test]
+    fn metric_validation_uses_type_range_without_policy_cutoffs() {
+        let metrics = ReusableStateMetrics {
+            lookups: u64::MAX,
+            hits: u64::MAX,
+            misses: 0,
+            restore_duration_millis: u64::MAX,
+            publication_duration_millis: u64::MAX,
+            bytes_read: u64::MAX,
+            bytes_written: u64::MAX,
+            storage_size_bytes: u64::MAX,
+            estimated_cold_work_millis: u64::MAX,
+            estimated_warm_work_millis: u64::MAX,
+            last_useful_hit_epoch_millis: Some(u64::MAX),
+            validation_failures: u64::MAX,
+            reset_invalidation_count: u64::MAX,
+            reset_invalidation_overhead_millis: u64::MAX,
+            producer_successes: u64::MAX,
+            successful_consumers: u64::MAX,
+            semantic_mismatches: u64::MAX,
+        };
+        metrics.validate().expect("full u64 metric range is valid");
+        assert_eq!(
+            metrics.utility().unwrap_err(),
+            ReusableStatePolicyError::UtilityOverflow
         );
     }
 
