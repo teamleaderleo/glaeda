@@ -73,7 +73,7 @@ It then projects the CMUX terminal vocabulary without redefining profile semanti
 - `timed_out` -> `timed_out`;
 - `ambiguous` -> `ambiguous`.
 
-The outer observation stores the exact CMUX result digest. Fleet acceptance uses `glaeda-cmux-fleet-acceptance/v2`: after the CMUX workload finishes, Glaeda requires a fresh read-only bootstrap observation matching the enrolled capability/toolchain and durably records that bootstrap digest together with the CMUX environment class/toolchain identity.
+The outer observation stores the exact CMUX result digest. Fleet acceptance uses `glaeda-cmux-fleet-acceptance/v2` through `cmux_fleet.py accept-local`: Glaeda owns the local CMUX runner process, captures its result in a private attempt directory, then performs a fresh read-only bootstrap observation on the same node. The durable receipt binds that fresh-bootstrap digest, CMUX environment class/toolchain identity, and an opaque Glaeda-local attempt digest. Externally supplied semantic results can be validated, but they cannot mint an accepted fleet receipt.
 
 ## Fleet roles and routing
 
