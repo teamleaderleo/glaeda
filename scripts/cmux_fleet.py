@@ -350,6 +350,17 @@ def node_status(enrollment_value: object, acceptance_values: list[object]) -> di
         "enrollmentGeneration": enrollment["enrollmentGeneration"],
         "state": enrollment["state"],
         "automaticRoutingEligible": any(r["eligible"] for r in role_status),
+        "capability": {
+            "architecture": enrollment["architecture"],
+            "osFamily": enrollment["os"]["family"],
+            "osVersionClass": enrollment["os"]["versionClass"],
+            "hardwareCapabilityClass": enrollment["hardwareCapabilityClass"],
+            "supportedToolchainGenerations": enrollment[
+                "supportedToolchainGenerations"
+            ],
+            "glaedaGeneration": enrollment["glaedaGeneration"],
+            "operatorFleetScope": enrollment["operatorFleetScope"],
+        },
         "roles": role_status,
         "privacy": {
             "containsSerialNumber": False,
