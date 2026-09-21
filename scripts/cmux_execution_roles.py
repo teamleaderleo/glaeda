@@ -355,6 +355,8 @@ def fleet_role_acceptances(
         if role in projected:
             raise RoleModelError("duplicate fleet acceptance role")
         projected[role] = {
+            "nodeId": binding["nodeId"],
+            "enrollmentGeneration": binding["enrollmentGeneration"],
             "profile": binding["profile"],
             "receiptSha256": binding["receiptSha256"],
         }
@@ -416,9 +418,13 @@ def validate_node(value: object) -> dict[str, Any]:
             raise RoleModelError("role acceptance is not reviewed by fleet enrollment")
         entry = _exact(
             acceptance,
-            {"profile", "receiptSha256"},
+            {"nodeId", "enrollmentGeneration", "profile", "receiptSha256"},
             "role acceptance",
         )
+        if entry["nodeId"] != doc["nodeId"]:
+            raise RoleModelError("role acceptance belongs to a different node")
+        if entry["enrollmentGeneration"] != doc["enrollmentGeneration"]:
+            raise RoleModelError("role acceptance enrollment generation is stale")
         profile = _exact(entry["profile"], {"id", "generation"}, "role acceptance profile")
         _token(profile["id"], "role acceptance profile id")
         _positive_int(profile["generation"], "role acceptance profile generation")
