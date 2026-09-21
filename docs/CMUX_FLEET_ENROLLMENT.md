@@ -2,7 +2,7 @@
 
 Tracking issue: #1056.
 
-This path turns a CMUX-controlled Mac or Linux host into a reviewed fleet node without making Glaeda the host's sole manager. GitHub Actions, CMUX's controller, direct SSH, MDM/configuration management, hosted runners, and future schedulers can continue to manage the parts they already own. Glaeda owns the bounded enrollment record, role acceptance binding, lifecycle state, and the machine-status projection used for automatic routing.
+This path turns a CMUX-controlled Mac or Linux host into a reviewed fleet node while the existing owners keep their responsibilities. GitHub Actions, CMUX's controller, direct SSH, MDM/configuration management, hosted runners, and future schedulers continue to manage the parts they already own. Glaeda owns the bounded enrollment record, role acceptance binding, lifecycle state, and a machine-status projection that reports role/candidate eligibility.
 
 ## Supported v1 bootstrap classes
 
@@ -27,7 +27,7 @@ The role vocabulary is stable enough to name future work:
 | `background_replay` | reserved | acceptance workload must land first |
 | `benchmark` | reserved | acceptance workload must land first |
 
-The v1 enrollment validator and bootstrap refuse reserved roles. A role becomes enrolable only when an exact reviewed workload exists; this keeps "advertised" equivalent to "can be proven." For supported roles, eligibility then requires node state `eligible` plus a current accepted receipt matching node ID, enrollment generation, Glaeda generation, and an enrolled toolchain generation.
+The v1 enrollment validator and bootstrap refuse reserved roles. A role becomes enrolable only when an exact reviewed workload exists; this keeps "advertised" equivalent to "can be proven." For supported roles, eligibility then requires node state `eligible` plus a current accepted receipt matching node ID, enrollment generation, Glaeda generation, enrolled toolchain generation, and the role's current reviewed workload generation.
 
 The versioned schema carries the full role vocabulary in `$defs.knownRole` while `allowedExecutionRoles` accepts only the v1 supported subset.
 
@@ -40,6 +40,7 @@ The versioned schema carries the full role vocabulary in `$defs.knownRole` while
 - OS family and version class;
 - hardware capability class;
 - accepted toolchain generations;
+- current reviewed workload generation for every allowed role;
 - allowed roles;
 - operator/fleet ownership scope;
 - enrollment generation;
@@ -56,7 +57,7 @@ States are:
 
 Supported recovery paths also include `draining -> eligible` and `quarantined -> enrolling`. Every transition into `eligible` requires at least one current accepted role receipt. Leaving quarantine advances the enrollment generation, so every pre-quarantine acceptance receipt becomes stale immediately.
 
-Automatic routing reads `scripts/cmux-fleet status`. The status projection includes only bounded architecture, OS class, hardware class, accepted toolchain generations, Glaeda generation, fleet scope, lifecycle state, and per-role eligibility. A node in `draining`, `quarantined`, or `retired` produces zero eligible roles even when an older acceptance receipt exists. An `eligible` node still produces zero eligible roles when its acceptance evidence is absent, rejected, or stale. Live pressure/heat remains a separate fresh local admission veto: #970 may publish advisory bounded snapshots, while #546/local execution admission re-observes the machine before dispatch. A fleet status record never overrides disk, memory, pressure, service, or operator holds observed locally.
+`scripts/cmux-fleet status` reports role/candidate eligibility only. Its `routingCandidateEligible` field means the enrollment and current acceptance receipt satisfy this contract; `automaticDispatchAuthorized` stays `false`. #546 or another separately approved routing-promotion gate owns queue selection and dispatch, including queue/start prediction, hot locality, pressure, allowance scarcity, workload-class evidence, and operator policy. The status projection includes only bounded architecture, OS class, hardware class, accepted toolchain generations, role workload generations, Glaeda generation, fleet scope, lifecycle state, and per-role eligibility. A node in `draining`, `quarantined`, or `retired` produces zero eligible roles even when an older acceptance receipt exists. An `eligible` node still produces zero eligible roles when its acceptance evidence is absent, rejected, or stale. Live pressure/heat remains a fresh local admission veto: #970 may publish advisory bounded snapshots, while #546/local execution admission re-observes the machine before dispatch.
 
 Reviewed quarantine reasons are:
 
@@ -251,7 +252,7 @@ mv "$ENROLLMENT_NEXT" "$ENROLLMENT"
 
 After a toolchain, OS, hardware class, or Glaeda update, rerun bootstrap and create a fresh enrollment with generation N+1. Old acceptance receipts then become stale by construction.
 
-Rollback an onboarding before routing, or retire an active node, by preserving the record in the terminal `retired` state:
+Rollback an onboarding before candidate promotion, or retire an active node, by preserving the record in the terminal `retired` state:
 
 ```bash
 ENROLLMENT_NEXT="$(mktemp "$FLEET_ROOT/.enrollment.XXXXXX")"
@@ -262,7 +263,7 @@ mv "$ENROLLMENT_NEXT" "$ENROLLMENT"
 bash scripts/cmux-fleet status "$ENROLLMENT"
 ```
 
-This leaves an auditable local tombstone and zero routable roles.
+This leaves an auditable local tombstone and zero candidate-eligible roles.
 
 ## Operator-owned prerequisite changes
 
@@ -287,7 +288,7 @@ test -f "$GLAEDA_INSTALL_ROOT/glaeda.rollback"
 mv "$GLAEDA_INSTALL_ROOT/glaeda.rollback" "$GLAEDA_BIN"
 ```
 
-After any install, update, or rollback, rerun bootstrap and advance the enrollment generation before automatic routing resumes. Once the new generation is accepted, remove the one-step rollback copy:
+After any install, update, or rollback, rerun bootstrap and advance the enrollment generation before candidate eligibility resumes. Once the new generation is accepted, remove the one-step rollback copy:
 
 ```bash
 rm -f "$GLAEDA_INSTALL_ROOT/glaeda.rollback"
