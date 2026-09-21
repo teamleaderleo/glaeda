@@ -45,7 +45,7 @@ def enrollment(os_family="macos", state="eligible", roles=None):
             "cmux-mac-build-large" if os_family == "macos" else "cmux-linux-ci-medium"
         ),
         "supportedToolchainGenerations": [A, B],
-        "roleWorkloadGenerations": {role: B for role in sorted(roles)},
+        "roleProfiles": {role: dict(f.ROLE_PROFILES[role]) for role in sorted(roles)},
         "allowedExecutionRoles": sorted(roles),
         "operatorFleetScope": "cmux-founders",
         "enrollmentGeneration": 3,
@@ -55,29 +55,55 @@ def enrollment(os_family="macos", state="eligible", roles=None):
     }
 
 
-def evidence(role="cmux_macos_native_build", toolchain=A, checks=None):
+def cmux_result(
+    role="cmux_macos_native_build",
+    *,
+    state="passed",
+    cleanup_state="complete",
+    process_group_settled=True,
+    profile=None,
+):
+    chosen_profile = dict(profile or f.ROLE_PROFILES[role])
     return {
-        "schema": f.ACCEPTANCE_EVIDENCE_SCHEMA,
-        "nodeId": "cmux-fixture-001",
-        "enrollmentGeneration": 3,
-        "role": role,
-        "source": {"repository": "manaflow-ai/cmux", "commit": COMMIT},
-        "toolchainGeneration": toolchain,
-        "glaedaGeneration": C,
-        "workloadGeneration": B,
-        "checks": checks or {
-            "workload": "pass",
-            "semanticVerifier": "pass",
-            "artifact": "pass",
-            "processSettlement": "pass",
+        "document_type": f.CMUX_RESULT_DOCUMENT_TYPE,
+        "schema_version": f.CMUX_RESULT_SCHEMA_VERSION,
+        "source": {
+            "repository": f.CMUX_REPOSITORY,
+            "commit": COMMIT,
+            "tree": "2" * 40,
+        },
+        "profile": chosen_profile,
+        "semantic_validator": "cmux.fixture/v1",
+        "expected_result_class": "cmux.fixture-result/v1",
+        "result": state,
+        "parameters": {},
+        "artifact_identities": [],
+        "benchmark": {
+            "state_class": "cold",
+            "semantic_comparison_key": A,
+            "comparison_context_key": B,
+        },
+        "cleanup": {
+            "state": cleanup_state,
+            "process_group_settled": process_group_settled,
         },
     }
+
+
+def finalized(enrollment_value, role=None, *, result=None, toolchain=A):
+    role = role or enrollment_value["allowedExecutionRoles"][0]
+    return f.finalize_acceptance(
+        enrollment_value,
+        role,
+        toolchain,
+        result or cmux_result(role),
+    )
 
 
 class FleetTests(unittest.TestCase):
     def test_current_accepted_role_is_eligible(self):
         e = enrollment()
-        r = f.finalize_acceptance(e, evidence())
+        r = finalized(e)
         status = f.node_status(e, [r])
         by_role = {v["role"]: v for v in status["roles"]}
         self.assertTrue(by_role["cmux_macos_native_build"]["eligible"])
@@ -96,9 +122,8 @@ class FleetTests(unittest.TestCase):
                 e = enrollment(state=state)
                 if state == "quarantined":
                     e["quarantineReason"] = "disk_pressure"
-                receipt = f.finalize_acceptance(
-                    {**e, "state": "eligible", "quarantineReason": None},
-                    evidence(),
+                receipt = finalized(
+                    {**e, "state": "eligible", "quarantineReason": None}
                 )
                 status = f.node_status(e, [receipt])
                 self.assertFalse(status["routingCandidateEligible"])
@@ -112,12 +137,7 @@ class FleetTests(unittest.TestCase):
         with self.assertRaisesRegex(f.FleetError, "Glaeda generation is invalid"):
             f.validate_enrollment(e)
 
-        bad_evidence = evidence()
-        bad_evidence["glaedaGeneration"] = None
-        with self.assertRaisesRegex(f.FleetError, "acceptance Glaeda generation is invalid"):
-            f.validate_acceptance_evidence(bad_evidence)
-
-        receipt = f.finalize_acceptance(enrollment(), evidence())
+        receipt = finalized(enrollment())
         receipt["glaedaGeneration"] = None
         with self.assertRaisesRegex(
             f.FleetError, "acceptance receipt Glaeda generation is invalid"
@@ -126,7 +146,7 @@ class FleetTests(unittest.TestCase):
 
     def test_stale_acceptance_generation_is_ineligible(self):
         e = enrollment()
-        r = f.finalize_acceptance(e, evidence())
+        r = finalized(e)
         r["enrollmentGeneration"] = 2
         status = f.node_status(e, [r])
         native = next(
@@ -134,16 +154,22 @@ class FleetTests(unittest.TestCase):
         )
         self.assertEqual(native["reason"], "acceptance_enrollment_stale")
 
-    def test_stale_acceptance_workload_generation_is_ineligible(self):
+    def test_profile_policy_change_requires_fresh_enrollment(self):
         e = enrollment()
-        r = f.finalize_acceptance(e, evidence())
-        e["roleWorkloadGenerations"]["cmux_macos_native_build"] = D
-        status = f.node_status(e, [r])
-        native = next(
-            v for v in status["roles"] if v["role"] == "cmux_macos_native_build"
-        )
-        self.assertFalse(native["eligible"])
-        self.assertEqual(native["reason"], "acceptance_workload_stale")
+        receipt = finalized(e)
+        with mock.patch.dict(
+            f.ROLE_PROFILES,
+            {
+                "cmux_macos_native_build": {
+                    "id": "cmux.macos.dev-check",
+                    "generation": 2,
+                },
+                "cmux_linux_ci": dict(f.ROLE_PROFILES["cmux_linux_ci"]),
+            },
+            clear=True,
+        ):
+            with self.assertRaisesRegex(f.FleetError, "not the reviewed v1 profile"):
+                f.node_status(e, [receipt])
 
     def test_private_identity_fields_are_rejected(self):
         for field in ("hostname", "serialNumber", "privateIp", "username"):
@@ -169,7 +195,7 @@ class FleetTests(unittest.TestCase):
         e = enrollment(state="enrolling")
         with self.assertRaisesRegex(f.FleetError, "accepted role receipt"):
             f.transition(e, "eligible", None)
-        receipt = f.finalize_acceptance(e, evidence())
+        receipt = finalized(e)
         eligible = f.transition(e, "eligible", None, [receipt])
         self.assertEqual(eligible["state"], "eligible")
 
@@ -187,55 +213,59 @@ class FleetTests(unittest.TestCase):
 
     def test_acceptance_binds_current_identity(self):
         e = enrollment()
-        bad = evidence(toolchain="sha256:" + "d" * 64)
         with self.assertRaisesRegex(f.FleetError, "toolchain generation"):
-            f.finalize_acceptance(e, bad)
-        bad = evidence()
-        bad["glaedaGeneration"] = "sha256:" + "d" * 64
-        with self.assertRaisesRegex(f.FleetError, "Glaeda generation"):
-            f.finalize_acceptance(e, bad)
-        bad = evidence()
-        bad["enrollmentGeneration"] = 4
-        with self.assertRaisesRegex(f.FleetError, "enrollment generation"):
-            f.finalize_acceptance(e, bad)
-        bad = evidence()
-        bad["workloadGeneration"] = D
-        with self.assertRaisesRegex(f.FleetError, "workload generation"):
-            f.finalize_acceptance(e, bad)
+            f.finalize_acceptance(e, "cmux_macos_native_build", D, cmux_result())
+
+        wrong_profile = {
+            "id": "cmux.macos.dev-check",
+            "generation": 2,
+        }
+        with self.assertRaisesRegex(f.FleetError, "differs from enrolled role profile"):
+            finalized(e, result=cmux_result(profile=wrong_profile))
 
     def test_failed_settlement_rejects_role(self):
-        checks = {
-            "workload": "pass",
-            "semanticVerifier": "pass",
-            "artifact": "pass",
-            "processSettlement": "fail",
-        }
         e = enrollment()
-        r = f.finalize_acceptance(e, evidence(checks=checks))
-        self.assertEqual(r["result"], "rejected")
-        status = f.node_status(e, [r])
+        receipt = finalized(
+            e,
+            result=cmux_result(
+                cleanup_state="forced",
+                process_group_settled=False,
+            ),
+        )
+        self.assertEqual(receipt["result"], "rejected")
+        self.assertEqual(receipt["processSettlement"], "incomplete")
+        status = f.node_status(e, [receipt])
         native = next(
             v for v in status["roles"] if v["role"] == "cmux_macos_native_build"
         )
         self.assertFalse(native["eligible"])
 
+    def test_cmux_semantic_failure_never_accepts_role(self):
+        for state in ("failed", "timed_out", "ambiguous"):
+            with self.subTest(state=state):
+                e = enrollment()
+                receipt = finalized(e, result=cmux_result(state=state))
+                self.assertEqual(receipt["result"], "rejected")
+                self.assertEqual(receipt["cmuxSemanticResultState"], state)
+                self.assertFalse(f.node_status(e, [receipt])["routingCandidateEligible"])
+
     def test_linux_fixture_can_be_eligible(self):
         e = enrollment("linux")
-        r = f.finalize_acceptance(e, evidence(role="cmux_linux_ci"))
+        r = finalized(e, "cmux_linux_ci")
         status = f.node_status(e, [r])
         linux = next(v for v in status["roles"] if v["role"] == "cmux_linux_ci")
         self.assertTrue(linux["eligible"])
 
     def test_status_rejects_forged_acceptance_receipt(self):
         e = enrollment()
-        forged = f.finalize_acceptance(e, evidence())
+        forged = finalized(e)
         forged["checks"]["processSettlement"] = "fail"
         with self.assertRaisesRegex(f.FleetError, "disagrees"):
             f.node_status(e, [forged])
 
     def test_status_rejects_unknown_acceptance_fields(self):
         e = enrollment()
-        receipt = f.finalize_acceptance(e, evidence())
+        receipt = finalized(e)
         receipt["hostname"] = "hidden-host"
         with self.assertRaisesRegex(f.FleetError, "unknown or missing"):
             f.node_status(e, [receipt])
@@ -250,7 +280,7 @@ class FleetTests(unittest.TestCase):
             "roles": ["cmux_macos_native_build"],
             "glaedaGeneration": C,
             "toolchainGeneration": A,
-            "roleWorkloadGenerations": {"cmux_macos_native_build": B},
+            "roleProfiles": {"cmux_macos_native_build": dict(f.ROLE_PROFILES["cmux_macos_native_build"])},
             "checks": {"ready": True},
             "observed": {},
             "eligibleForEnrollment": True,
@@ -266,8 +296,8 @@ class FleetTests(unittest.TestCase):
         self.assertEqual(result["state"], "enrolling")
         self.assertEqual(result["supportedToolchainGenerations"], [A])
         self.assertEqual(
-            result["roleWorkloadGenerations"],
-            {"cmux_macos_native_build": B},
+            result["roleProfiles"],
+            {"cmux_macos_native_build": dict(f.ROLE_PROFILES["cmux_macos_native_build"])},
         )
 
     def test_blocked_bootstrap_cannot_enroll(self):
