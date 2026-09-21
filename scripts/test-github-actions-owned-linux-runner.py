@@ -152,6 +152,8 @@ class OwnedLinuxJitRunnerTests(unittest.TestCase):
         self.assertIn("/opt/smolrunner/actions-runner", command)
         self.assertIn("/opt/smolrunner/bin/smolrunner-jit-launcher", command)
         self.assertIn("--clearenv", command)
+        self.assertIn("/etc/passwd", command)
+        self.assertIn("/etc/group", command)
         self.assertNotIn("SSH_AUTH_SOCK", joined)
         self.assertNotIn("/var/run/docker.sock", joined)
         self.assertNotIn("/run/podman", joined)
@@ -250,7 +252,7 @@ class OwnedLinuxJitRunnerTests(unittest.TestCase):
             self.assertTrue(admission.launch_attempted)
             self.assertFalse(admission.released)
             command_root = (
-                Path(args.state_root) / runner.normalize(args).fingerprint()[7:]
+                Path(args.state_root) / runner.normalize(args).assignment_fingerprint()[7:]
             )
             receipt = runner.read_document(command_root / "runner-exit.json")
             self.assertIsNotNone(receipt)
@@ -260,6 +262,26 @@ class OwnedLinuxJitRunnerTests(unittest.TestCase):
 
             with self.assertRaisesRegex(Refusal, "redispatch refused"):
                 runner.run_once(args)
+
+    def test_duplicate_assignment_with_new_local_attempt_cannot_launch_twice(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            args, _ = self._run_injected_exit(root)
+            duplicate = arguments(root, attempt_id="attempt-1010-retry")
+            self.assertEqual(
+                runner.normalize(args).assignment_fingerprint(),
+                runner.normalize(duplicate).assignment_fingerprint(),
+            )
+            self.assertNotEqual(
+                runner.normalize(args).fingerprint(),
+                runner.normalize(duplicate).fingerprint(),
+            )
+            with mock.patch.object(
+                runner.owned_task, "execute_secret_stdin"
+            ) as execute:
+                with self.assertRaisesRegex(Refusal, "conflicts with exact attempt"):
+                    runner.run_once(duplicate)
+            execute.assert_not_called()
 
     def test_wrong_runner_generation_cannot_settle_existing_attempt(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -289,7 +311,7 @@ class OwnedLinuxJitRunnerTests(unittest.TestCase):
                 self.assertEqual(runner.settle(args), 0)
             self.assertEqual(len(recovered), 1)
             command_root = (
-                Path(args.state_root) / runner.normalize(args).fingerprint()[7:]
+                Path(args.state_root) / runner.normalize(args).assignment_fingerprint()[7:]
             )
             final = runner.read_document(command_root / "receipt.json")
             self.assertTrue(final["result"]["github_terminal_observed"])
