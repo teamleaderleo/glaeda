@@ -1990,14 +1990,19 @@ fn estimate_utility(
     let hit_count = relevant_for_hit
         .iter()
         .filter(|observation| observation.reuse_class == VerificationReuseClass::Reuse)
-        .count();
-    let hit_frequency_basis_points = if relevant_for_hit.is_empty() {
+        .map(|observation| usize::from(observation.sample_count))
+        .sum::<usize>();
+    let lookup_count = relevant_for_hit
+        .iter()
+        .map(|observation| usize::from(observation.sample_count))
+        .sum::<usize>();
+    let hit_frequency_basis_points = if lookup_count == 0 {
         0
     } else {
         u16::try_from(
             hit_count
                 .saturating_mul(10_000)
-                .checked_div(relevant_for_hit.len())
+                .checked_div(lookup_count)
                 .unwrap_or(0),
         )
         .unwrap_or(10_000)
@@ -2733,7 +2738,7 @@ mod tests {
                 "cmux-ci",
                 "macos-full",
                 OptimizationClass::ReuseExactCompiledProduct,
-                Some("tree-a"),
+                Some("app-host-v2"),
                 120_000,
                 40_000,
                 8_000,
@@ -2753,7 +2758,7 @@ mod tests {
                 "cmux-ci",
                 "macos-full",
                 OptimizationClass::ReuseExactCompiledProduct,
-                Some("tree-a"),
+                Some("app-host-v2"),
                 118_000,
                 42_000,
                 8_000,
