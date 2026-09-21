@@ -1987,8 +1987,14 @@ mod tests {
             Some(NOW),
         )
         .unwrap();
-        let observations =
-            three_successes(&workload, "remote", HotStateClass::HotExact, 30_000, 10_000, 0);
+        let observations = three_successes(
+            &workload,
+            "remote",
+            HotStateClass::HotExact,
+            30_000,
+            10_000,
+            0,
+        );
 
         let report = recommend_ci_pool(
             &workload,
