@@ -28,6 +28,7 @@ INTERNAL_BINDING_DOMAIN = "glaeda-external-verify-focused-binding-v1"
 OPERATION_VERIFY_FOCUSED = "verify_focused"
 REUSE_HINTS = {"no_preference", "prefer_valid_reuse"}
 TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}$")
+SEMANTIC_REQUEST_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{7,63}$")
 REPOSITORY_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 OID_PATTERN = re.compile(r"^[a-f0-9]{40}$")
 SHA256_PATTERN = re.compile(r"^sha256:[a-f0-9]{64}$")
@@ -200,7 +201,11 @@ def request_sha256(request: ExternalRequest) -> str:
     return sha256(canonical_bytes(request_document(request)))
 
 
-def _internal_fingerprint(request: ExternalRequest, profile_generation: str) -> str:
+def _internal_fingerprint(
+    request: ExternalRequest,
+    profile_generation: str,
+    semantic_request_id: str | None = None,
+) -> str:
     # Caller refs, correlation, and reuse hints are deliberately absent: they cannot mint
     # physical execution identity.
     binding = {
@@ -217,10 +222,24 @@ def _internal_fingerprint(request: ExternalRequest, profile_generation: str) -> 
             "generation": profile_generation,
         },
     }
+    if semantic_request_id is not None:
+        binding["semantic_request_id"] = semantic_request_id
     return sha256(canonical_bytes(binding))
 
 
-def compile_request(request: ExternalRequest) -> CompiledRequest:
+def compile_request(
+    request: ExternalRequest,
+    *,
+    semantic_request_id: str | None = None,
+) -> CompiledRequest:
+    if semantic_request_id is not None and (
+        not isinstance(semantic_request_id, str)
+        or SEMANTIC_REQUEST_ID_PATTERN.fullmatch(semantic_request_id) is None
+    ):
+        raise ContractRefusal(
+            "invalid_request",
+            "accepted semantic request identity is invalid",
+        )
     if request.operation != OPERATION_VERIFY_FOCUSED:
         raise ContractRefusal(
             "unsupported_operation", "operation is not admitted by this adapter"
@@ -240,7 +259,11 @@ def compile_request(request: ExternalRequest) -> CompiledRequest:
         commit=request.commit,
         tree=request.tree,
         profile_generation=generation,
-        command_fingerprint=_internal_fingerprint(request, generation),
+        command_fingerprint=_internal_fingerprint(
+            request,
+            generation,
+            semantic_request_id,
+        ),
         profile=profile,
     )
     return CompiledRequest(request, request_sha256(request), internal)
