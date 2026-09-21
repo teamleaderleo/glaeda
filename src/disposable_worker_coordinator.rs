@@ -861,7 +861,9 @@ mod tests {
     use crate::github_scale_set_bridge::{
         ScaleSetBridgeEvent, ScaleSetBridgeJobEvidence, ScaleSetBridgePoll, ScaleSetStatistics,
     };
-    use crate::github_scale_set_protocol::{ScaleSetJobId, ScaleSetRunnerRequestId};
+    use crate::github_scale_set_protocol::{
+        ScaleSetJobId, ScaleSetRunnerId, ScaleSetRunnerRequestId,
+    };
     use crate::lima_observation::LimaObservationClock;
 
     const GIB: u64 = 1 << 30;
@@ -953,6 +955,42 @@ mod tests {
             .reserve(reservation())
             .unwrap()
     }
+    fn runner_started_reservation() -> DisposableAttemptReservation {
+        let reserved = reservation();
+        let runner = ScaleSetRunnerReference::new(
+            ScaleSetRunnerId::new(77).unwrap(),
+            reserved.attempt().runner_name().clone(),
+        );
+        let attempt = reserved
+            .attempt()
+            .authorize_clone()
+            .unwrap()
+            .record_clone_started()
+            .unwrap()
+            .bind_vm_identity_after_clone(
+                crate::disposable_worker_reconciler::DisposableVmIdentity::parse(&format!(
+                    "sha256:{}",
+                    "55".repeat(32)
+                ))
+                .unwrap(),
+            )
+            .unwrap()
+            .begin_registration()
+            .unwrap()
+            .record_jit_generation_started()
+            .unwrap()
+            .record_registration(&runner)
+            .unwrap()
+            .record_runner_start_started()
+            .unwrap();
+        DisposableAttemptReservation::new(
+            attempt,
+            reserved.resources(),
+            reserved.prepared_template_identity().clone(),
+        )
+        .unwrap()
+    }
+
 
     fn unavailable_storage_error() -> crate::disposable_host_storage::DisposableHostStorageError {
         crate::disposable_host_storage::DisposableHostStorage::new(
@@ -973,6 +1011,24 @@ mod tests {
             busy_runners: 0,
             idle_runners: 0,
         }
+    }
+
+    #[test]
+    fn runner_exit_before_terminal_waits_until_deadline_then_forces_cleanup() {
+        let reservation = runner_started_reservation();
+        assert_eq!(
+            operation_for(&reservation).unwrap(),
+            CoordinatorOperation::Wait
+        );
+        let not_after = reservation.attempt().not_after();
+        assert!(!requires_post_start_deadline_cleanup(
+            &reservation,
+            not_after
+        ));
+        assert!(requires_post_start_deadline_cleanup(
+            &reservation,
+            EpochMillis::new(not_after.get() + 1).unwrap()
+        ));
     }
 
     #[test]
