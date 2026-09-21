@@ -565,6 +565,63 @@ def terminal_verify_receipt(
     )
 
 
+def _inspect_source(operation: str, value: object) -> None:
+    if operation in {OP_CAPABILITIES, OP_STATUS}:
+        if value is not None:
+            raise ContractRefusal("invalid_receipt", "node receipt carries an unexpected source")
+        return
+    try:
+        _source(value)
+    except ContractRefusal as error:
+        raise ContractRefusal("invalid_receipt", "semantic receipt source is invalid") from error
+
+
+def _inspect_state(value: dict[str, object]) -> None:
+    operation = value["operation"]
+    state = value["state"]
+    result = value["result"]
+    refusal = value["refusal_code"]
+    resolved = value["resolved_operation"]
+
+    if state == "refused":
+        if resolved is not None or result is not None or not isinstance(refusal, str):
+            raise ContractRefusal("invalid_receipt", "refused semantic receipt is inconsistent")
+        return
+
+    if not isinstance(resolved, dict) or resolved.get("kind") != operation:
+        raise ContractRefusal("invalid_receipt", "semantic receipt resolution is inconsistent")
+    if state == "planned":
+        if result is not None or refusal is not None:
+            raise ContractRefusal("invalid_receipt", "planned semantic receipt is inconsistent")
+        return
+    if state == "waiting":
+        if (
+            not isinstance(result, dict)
+            or set(result) != {"reason"}
+            or not isinstance(result.get("reason"), str)
+            or not REASON_PATTERN.fullmatch(result["reason"])
+            or refusal is not None
+        ):
+            raise ContractRefusal("invalid_receipt", "waiting semantic receipt is inconsistent")
+        return
+    if state == "ambiguous":
+        if result is not None or refusal != "ambiguous_execution":
+            raise ContractRefusal("invalid_receipt", "ambiguous semantic receipt is inconsistent")
+        return
+
+    if refusal is not None or result is None:
+        raise ContractRefusal("invalid_receipt", "terminal semantic receipt is inconsistent")
+    if operation in {OP_CAPABILITIES, OP_STATUS, OP_REPO_QUERY} and state != "succeeded":
+        raise ContractRefusal("invalid_receipt", "read-only semantic receipt has an invalid terminal state")
+    if operation == OP_VERIFY_NAMED and state not in {
+        "succeeded",
+        "failed",
+        "timed_out",
+        "cleanup_incomplete",
+    }:
+        raise ContractRefusal("invalid_receipt", "verification semantic receipt has an invalid terminal state")
+
+
 def inspect_receipt(raw: bytes) -> dict[str, object]:
     if len(raw) > MAX_RECEIPT_BYTES:
         raise ContractRefusal("invalid_receipt", "semantic receipt exceeds its fixed ceiling")
@@ -581,9 +638,12 @@ def inspect_receipt(raw: bytes) -> dict[str, object]:
         or value.get("schema_version") != RECEIPT_SCHEMA_VERSION
         or value.get("authority") != AUTHORITY
         or value.get("state") not in RECEIPT_STATES
+        or value.get("operation") not in OPERATIONS
     ):
         raise ContractRefusal("invalid_receipt", "semantic receipt is outside the closed schema")
     parse_request_id(value.get("request_id"))
+    _inspect_source(value["operation"], value["source"])
+    _inspect_state(value)
     digest = value.get("request_sha256")
     if not isinstance(digest, str) or not SHA256_PATTERN.fullmatch(digest):
         raise ContractRefusal("invalid_receipt", "semantic receipt request digest is invalid")
