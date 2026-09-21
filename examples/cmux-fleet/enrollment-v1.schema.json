@@ -11,7 +11,7 @@
     "os",
     "hardwareCapabilityClass",
     "supportedToolchainGenerations",
-    "roleWorkloadGenerations",
+    "roleProfiles",
     "allowedExecutionRoles",
     "operatorFleetScope",
     "enrollmentGeneration",
@@ -121,17 +121,41 @@
         }
       ]
     },
-    "roleWorkloadGenerations": {
+    "roleProfiles": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
         "cmux_macos_native_build": {
-          "type": "string",
-          "pattern": "^sha256:[0-9a-f]{64}$"
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "id",
+            "generation"
+          ],
+          "properties": {
+            "id": {
+              "const": "cmux.macos.dev-check"
+            },
+            "generation": {
+              "const": 1
+            }
+          }
         },
         "cmux_linux_ci": {
-          "type": "string",
-          "pattern": "^sha256:[0-9a-f]{64}$"
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "id",
+            "generation"
+          ],
+          "properties": {
+            "id": {
+              "const": "cmux.ci.guard"
+            },
+            "generation": {
+              "const": 1
+            }
+          }
         }
       },
       "minProperties": 1,
@@ -185,6 +209,9 @@
                 ]
               }
             }
+          },
+          "architecture": {
+            "const": "arm64"
           }
         }
       }
@@ -230,7 +257,7 @@
       },
       "then": {
         "properties": {
-          "roleWorkloadGenerations": {
+          "roleProfiles": {
             "required": [
               "cmux_macos_native_build"
             ],
@@ -239,6 +266,9 @@
                 "cmux_linux_ci"
               ]
             }
+          },
+          "architecture": {
+            "const": "arm64"
           }
         }
       }
@@ -257,7 +287,7 @@
       },
       "then": {
         "properties": {
-          "roleWorkloadGenerations": {
+          "roleProfiles": {
             "required": [
               "cmux_linux_ci"
             ],
