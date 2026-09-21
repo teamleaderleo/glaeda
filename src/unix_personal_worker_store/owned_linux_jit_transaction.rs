@@ -372,9 +372,13 @@ impl UnixPersonalWorkerStore {
             }
             DisposableAttemptPhase::Deregistering => {
                 runtime.cleanup(reservation, executor)?;
-                Ok(DisposableCleanupTransactionOutcome::VmDestroyed {
-                    attempt_id: attempt_id.as_str().to_owned(),
-                })
+                self.publish_owned_linux_cleanup_action(
+                    &current,
+                    attempt_id,
+                    DisposableAttemptCatalogAction::AdvanceCleanup(
+                        DisposableAttemptPhase::Releasing,
+                    ),
+                )
             }
             DisposableAttemptPhase::Releasing => {
                 if !matches!(
