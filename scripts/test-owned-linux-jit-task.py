@@ -38,6 +38,11 @@ class OwnedLinuxJitTaskTests(unittest.TestCase):
                      self.payload / "_diag", self.payload / "target"):
             path.chmod(0o555)
         self.launcher = Path(__file__).with_name("owned_linux_jit_launcher").resolve()
+        self.egress_guard = self.root / "egress-authority.json"
+        self.egress_guard_digest = "sha256:" + "7" * 64
+        self.egress_patch = mock.patch.object(jit, "_verify_egress_guard", return_value=None)
+        self.egress_patch.start()
+        self.addCleanup(self.egress_patch.stop)
         self.unit = "glaeda-gha-" + "a" * 32 + ".service"
         self.task_root = self.tasks / ("a" * 32)
         self.fingerprint = "sha256:" + "b" * 64
@@ -103,6 +108,8 @@ class OwnedLinuxJitTaskTests(unittest.TestCase):
             payload_root=str(self.payload),
             payload_tree_sha256=self.payload_digest,
             launcher=str(self.launcher),
+            egress_guard=str(self.egress_guard),
+            egress_guard_sha256=self.egress_guard_digest,
             command_fingerprint=self.fingerprint,
             unit=self.unit,
             binding_sha256=self.binding,
@@ -142,6 +149,28 @@ class OwnedLinuxJitTaskTests(unittest.TestCase):
         env_index = command.index("/usr/bin/env")
         self.assertEqual(command[env_index + 1], "-i")
         return ("succeeded", 0, 1.25, True, 731, "sha256:" + "1" * 64)
+
+    def test_egress_authority_document_is_closed_and_canonical(self):
+        expected = {
+            "class": jit.NETWORK.value,
+            "document_type": jit.EGRESS_GUARD_DOCUMENT_TYPE,
+            "enforcement": jit.EGRESS_GUARD_ENFORCEMENT,
+            "private_or_link_local_egress": False,
+            "schema_version": jit.SCHEMA_VERSION,
+        }
+        raw = jit.canonical(expected)
+        self.assertEqual(jit._validate_egress_guard_document(raw), expected)
+        for changed in (
+            {**expected, "private_or_link_local_egress": True},
+            {**expected, "enforcement": "controller_assertion_only"},
+            {**expected, "class": "host_network"},
+            {**expected, "extra": True},
+        ):
+            with self.subTest(changed=changed):
+                with self.assertRaises(task.Refusal):
+                    jit._validate_egress_guard_document(jit.canonical(changed))
+        with self.assertRaises(task.Refusal):
+            jit._validate_egress_guard_document(json.dumps(expected).encode() + b"\n")
 
     def test_prepare_is_private_and_exact_restart_is_idempotent(self):
         receipt = self.prepare()
