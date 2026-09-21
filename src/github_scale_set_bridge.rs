@@ -237,7 +237,9 @@ fn load_private_key_file(
     expected_digest: &Sha256Digest,
 ) -> Result<GitHubAppPrivateKey, ScaleSetBridgeError> {
     if !canonical_absolute_path(path) {
-        return Err(ScaleSetBridgeError::new("invalid_github_app_private_key_path"));
+        return Err(ScaleSetBridgeError::new(
+            "invalid_github_app_private_key_path",
+        ));
     }
     let path_before = std::fs::symlink_metadata(path)
         .map_err(|_| ScaleSetBridgeError::new("github_app_private_key_unavailable"))?;
@@ -260,12 +262,16 @@ fn load_private_key_file(
     let mut bytes = Vec::with_capacity(before.len() as usize);
     if file.read_to_end(&mut bytes).is_err() || bytes.len() as u64 != before.len() {
         bytes.zeroize();
-        return Err(ScaleSetBridgeError::new("github_app_private_key_unavailable"));
+        return Err(ScaleSetBridgeError::new(
+            "github_app_private_key_unavailable",
+        ));
     }
     let observed = format!("sha256:{:x}", Sha256::digest(&bytes));
     if observed != expected_digest.as_str() {
         bytes.zeroize();
-        return Err(ScaleSetBridgeError::new("github_app_private_key_digest_mismatch"));
+        return Err(ScaleSetBridgeError::new(
+            "github_app_private_key_digest_mismatch",
+        ));
     }
     let after = file
         .metadata()
@@ -282,9 +288,7 @@ fn load_private_key_file(
 }
 
 #[cfg(target_os = "linux")]
-fn validate_private_key_metadata(
-    metadata: &std::fs::Metadata,
-) -> Result<(), ScaleSetBridgeError> {
+fn validate_private_key_metadata(metadata: &std::fs::Metadata) -> Result<(), ScaleSetBridgeError> {
     let mode = metadata.mode();
     if !metadata.file_type().is_file()
         || metadata.uid() != rustix::process::geteuid().as_raw()
@@ -300,10 +304,7 @@ fn validate_private_key_metadata(
 }
 
 #[cfg(target_os = "linux")]
-fn same_private_key_metadata(
-    left: &std::fs::Metadata,
-    right: &std::fs::Metadata,
-) -> bool {
+fn same_private_key_metadata(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
     left.dev() == right.dev()
         && left.ino() == right.ino()
         && left.uid() == right.uid()
